@@ -1,0 +1,6 @@
+# 锁文件生成、契约测试和 protobuf 代码生成工具。
+pip-tools==7.4.1
+pytest==8.3.5
+grpcio-tools==1.70.0
+ruff==0.9.10
+PyYAML==6.0.2

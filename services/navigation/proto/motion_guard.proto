@@ -1,0 +1,356 @@
+syntax = "proto3";
+
+package nuwax.motion_guard.v2;
+
+// Authoritative command/control contract for the private motion-guard UDS.
+// The socket transport is a four-byte big-endian length followed by exactly
+// one MotionGuardRequest or MotionGuardResponse protobuf message.
+
+enum AckCode {
+  ACK_CODE_UNSPECIFIED = 0;
+  ACK_CODE_RECEIVED = 1;
+  ACK_CODE_APPLIED = 2;
+  ACK_CODE_ZEROED = 3;
+  ACK_CODE_RESOURCE_FENCED = 4;
+  reserved 5;
+  reserved "ACK_CODE_SAFETY_LATCHED";
+}
+
+enum LeaseState {
+  LEASE_STATE_UNSPECIFIED = 0;
+  LEASE_STATE_IDLE = 1;
+  LEASE_STATE_ACTIVE = 2;
+  LEASE_STATE_PAUSING = 3;
+  LEASE_STATE_REVOKING = 4;
+}
+
+enum GuardSource {
+  GUARD_SOURCE_UNSPECIFIED = 0;
+  GUARD_SOURCE_NAV = 1;
+  GUARD_SOURCE_GATEWAY_MANUAL = 2;
+  GUARD_SOURCE_GATEWAY_FOLLOW = 3;
+  GUARD_SOURCE_GATEWAY_RELATIVE = 4;
+  GUARD_SOURCE_GATEWAY_SPORT = 5;
+  reserved 6;
+  reserved "GUARD_SOURCE_ADMIN";
+}
+
+enum GuardAction {
+  GUARD_ACTION_UNSPECIFIED = 0;
+  GUARD_ACTION_TWIST = 1;
+  GUARD_ACTION_STOP = 2;
+  GUARD_ACTION_BODY_POSE = 3;
+  GUARD_ACTION_SPEED_LEVEL = 4;
+  GUARD_ACTION_OBSTACLE_POLICY = 5;
+  GUARD_ACTION_MODE_SWITCH = 6;
+  GUARD_ACTION_SPORT_ACTION = 7;
+}
+
+enum SportAction {
+  SPORT_ACTION_UNSPECIFIED = 0;
+  SPORT_ACTION_DAMP = 1;
+  SPORT_ACTION_BALANCE_STAND = 2;
+  SPORT_ACTION_STOP_MOVE = 3;
+  SPORT_ACTION_STAND_UP = 4;
+  SPORT_ACTION_STAND_DOWN = 5;
+  SPORT_ACTION_RECOVERY_STAND = 6;
+  SPORT_ACTION_SIT = 7;
+  SPORT_ACTION_RISE_SIT = 8;
+  SPORT_ACTION_HELLO = 9;
+  SPORT_ACTION_STRETCH = 10;
+  SPORT_ACTION_DANCE_1 = 11;
+  SPORT_ACTION_DANCE_2 = 12;
+  SPORT_ACTION_FRONT_FLIP = 13;
+  SPORT_ACTION_FRONT_JUMP = 14;
+  SPORT_ACTION_FRONT_POUNCE = 15;
+  SPORT_ACTION_LEFT_FLIP = 16;
+  SPORT_ACTION_BACK_FLIP = 17;
+  SPORT_ACTION_FREE_WALK = 18;
+  SPORT_ACTION_HAND_STAND = 19;
+  SPORT_ACTION_FREE_JUMP = 20;
+  SPORT_ACTION_FREE_BOUND = 21;
+  SPORT_ACTION_WALK_UPRIGHT = 22;
+  SPORT_ACTION_CROSS_STEP = 23;
+  SPORT_ACTION_SWITCH_JOYSTICK = 24;
+  SPORT_ACTION_POSE = 25;
+  SPORT_ACTION_CLASSIC_WALK = 26;
+}
+
+enum ControlMode {
+  CONTROL_MODE_UNSPECIFIED = 0;
+  CONTROL_MODE_HIGH_LEVEL = 1;
+  CONTROL_MODE_LOW_LEVEL = 2;
+}
+
+enum OperationNamespace {
+  OPERATION_NAMESPACE_UNSPECIFIED = 0;
+  OPERATION_NAMESPACE_ACQUIRE = 1;
+  OPERATION_NAMESPACE_LEASE = 2;
+  OPERATION_NAMESPACE_GLOBAL_STOP = 3;
+}
+
+enum GlobalStopMode {
+  GLOBAL_STOP_MODE_ORDINARY = 0;
+  GLOBAL_STOP_MODE_HOLD_RECOVERY_FENCE = 1;
+  GLOBAL_STOP_MODE_RELEASE_RECOVERY_FENCE = 2;
+}
+
+message LeaseTuple {
+  uint64 generation = 1;
+  bytes boot_nonce = 2; // Exactly 16 bytes.
+  uint64 lease_id = 3;  // Zero only before AcquireLease.
+}
+
+message RequestEnvelope {
+  LeaseTuple tuple = 1;
+  GuardSource source = 2;
+  GuardAction action = 3;
+  string operation_id = 4;
+  bytes payload_sha256 = 5; // Exactly 32 bytes for mutation requests.
+  uint64 sequence = 6;
+  uint64 issued_monotonic_ns = 7;
+  uint64 deadline_monotonic_ns = 8;
+  // Guard-owned barrier sampled by readiness and checked atomically on acquire.
+  uint64 motion_stop_generation = 9;
+}
+
+message GlobalStopEnvelope {
+  GuardSource source = 1;
+  string operation_id = 2;
+  bytes payload_sha256 = 3; // Exactly 32 bytes for the typed stop payload.
+  uint64 issued_monotonic_ns = 4;
+  uint64 deadline_monotonic_ns = 5;
+}
+
+message ErrorDetail {
+  string code = 1;
+  string message = 2;
+  bool retryable = 3;
+}
+
+message GuardResult {
+  AckCode ack = 1;
+  reserved 2;
+  reserved "gate";
+  LeaseState lease = 3;
+  ErrorDetail error = 4;
+}
+
+message TwistCommand {
+  double linear_x_mps = 1;
+  double linear_y_mps = 2;
+  double angular_z_rps = 3;
+}
+
+message StopCommand {}
+
+message BodyPoseCommand {
+  double roll_rad = 1;
+  double pitch_rad = 2;
+  double yaw_rad = 3;
+}
+
+message SpeedLevelCommand {
+  uint32 level = 1; // Closed interval [1, 3].
+}
+
+message ObstaclePolicyCommand {
+  bool enabled = 1;
+}
+
+message SportActionCommand {
+  SportAction action = 1;
+  // Used only by toggle actions. Receivers reject false for one-shot actions.
+  bool enabled = 2;
+}
+
+message ModeSwitchCommand {
+  ControlMode target_mode = 1;
+}
+
+message ZeroAck {
+  string zero_ack_id = 1;
+  uint64 applied_monotonic_ns = 2;
+  // 命令被接纳与实际停稳分别记录；旧执行端缺失字段时保持未知。
+  bool stationary_confirmed = 3;
+  string confirmation_kind = 4;
+  uint64 feedback_source_timestamp_ns = 5;
+  uint64 stationary_deadline_monotonic_ns = 6;
+}
+
+message AcquireLeaseRequest {
+  RequestEnvelope envelope = 1;
+}
+
+message RenewLeaseRequest {
+  RequestEnvelope envelope = 1;
+}
+
+message SubmitMotionCommandRequest {
+  RequestEnvelope envelope = 1;
+  oneof command {
+    TwistCommand twist = 10;
+    StopCommand stop = 11;
+    BodyPoseCommand body_pose = 12;
+    SpeedLevelCommand speed_level = 13;
+    ObstaclePolicyCommand obstacle_policy = 14;
+  }
+}
+
+message ExecuteSportCommandRequest {
+  RequestEnvelope envelope = 1;
+  SportActionCommand command = 2;
+}
+
+message RevokeZeroAndSwitchModeRequest {
+  RequestEnvelope envelope = 1;
+  ModeSwitchCommand command = 2;
+}
+
+message RevokeAndZeroRequest {
+  RequestEnvelope envelope = 1;
+}
+
+message StopAllMotionRequest {
+  GlobalStopEnvelope envelope = 1;
+  string reason = 2;
+  GlobalStopMode mode = 3;
+  string recovery_correlation = 4;
+  bytes recovery_fence_token = 5;
+}
+
+message GetReadinessRequest {
+  GuardSource source = 1;
+}
+
+message GetGuardStateRequest {
+  GuardSource source = 1;
+}
+
+message GetOperationResultRequest {
+  GuardSource source = 1;
+  string operation_id = 2;
+  OperationNamespace operation_namespace = 3;
+}
+
+message AcquireLeaseResponse {
+  GuardResult result = 1;
+  LeaseTuple lease_tuple = 2;
+  uint64 lease_deadline_monotonic_ns = 3;
+  uint64 owner_deadline_monotonic_ns = 4;
+}
+
+message RenewLeaseResponse {
+  GuardResult result = 1;
+  uint64 lease_deadline_monotonic_ns = 2;
+  uint64 owner_deadline_monotonic_ns = 3;
+}
+
+message SubmitMotionCommandResponse {
+  GuardResult result = 1;
+  uint64 applied_monotonic_ns = 2;
+  ZeroAck zero_ack = 3; // Present only for StopCommand.
+}
+
+message ExecuteSportCommandResponse {
+  GuardResult result = 1;
+  uint64 applied_monotonic_ns = 2;
+  ZeroAck zero_ack = 3; // Present only for SPORT_ACTION_STOP_MOVE.
+}
+
+message RevokeZeroAndSwitchModeResponse {
+  GuardResult result = 1;
+  ZeroAck zero_ack = 2;
+  ControlMode active_mode = 3;
+}
+
+message RevokeAndZeroResponse {
+  GuardResult result = 1;
+  ZeroAck zero_ack = 2;
+}
+
+message StopAllMotionResponse {
+  GuardResult result = 1;
+  ZeroAck zero_ack = 2;
+  bool lease_revoked = 3;
+  uint64 motion_stop_generation = 4;
+  bytes recovery_fence_token = 5;
+  bool recovery_fence_held = 6;
+}
+
+message GetReadinessResponse {
+  GuardResult result = 1;
+  bool ready = 2;
+  bool actuator_configured = 3;
+  bool epoch_durable = 4;
+  string reason = 5;
+  uint64 generation = 6;
+  bytes boot_nonce = 7;
+  bool startup_zero_confirmed = 8;
+  uint64 motion_stop_generation = 9;
+  bool recovery_fence_held = 10;
+}
+
+message GetGuardStateResponse {
+  GuardResult result = 1;
+  uint64 generation = 2;
+  bytes boot_nonce = 3;
+  string last_zero_ack_id = 4;
+  bool fenced = 5;
+  uint64 active_lease_id = 6;
+  uint64 motion_stop_generation = 7;
+  bool recovery_fence_held = 8;
+  bytes recovery_fence_token_sha256 = 9;
+  bytes recovery_fence_correlation_sha256 = 10;
+  ZeroAck last_zero_confirmation = 11;
+}
+
+message GetOperationResultResponse {
+  GuardResult result = 1;
+  string target_operation_id = 2;
+  AckCode target_ack = 3;
+  bool resolved = 4;
+  ZeroAck zero_ack = 5;
+  // Exact guard barrier associated with a resolved global-stop operation.
+  uint64 motion_stop_generation = 6;
+  bytes recovery_fence_token = 7;
+  bool recovery_fence_held = 8;
+}
+
+message MotionGuardRequest {
+  uint32 api_version = 1;
+  string request_id = 2;
+  oneof operation {
+    AcquireLeaseRequest acquire_lease = 10;
+    RenewLeaseRequest renew_lease = 11;
+    SubmitMotionCommandRequest submit_motion_command = 12;
+    ExecuteSportCommandRequest execute_sport_command = 13;
+    RevokeZeroAndSwitchModeRequest revoke_zero_and_switch_mode = 14;
+    RevokeAndZeroRequest revoke_and_zero = 15;
+    GetReadinessRequest get_readiness = 17;
+    GetOperationResultRequest get_operation_result = 20;
+    StopAllMotionRequest stop_all_motion = 21;
+    GetGuardStateRequest get_guard_state = 22;
+  }
+  reserved 16, 18, 19;
+  reserved "latch_safety_stop", "get_safety_state", "reset_safe_stop";
+}
+
+message MotionGuardResponse {
+  uint32 api_version = 1;
+  string request_id = 2;
+  oneof outcome {
+    AcquireLeaseResponse acquire_lease = 10;
+    RenewLeaseResponse renew_lease = 11;
+    SubmitMotionCommandResponse submit_motion_command = 12;
+    ExecuteSportCommandResponse execute_sport_command = 13;
+    RevokeZeroAndSwitchModeResponse revoke_zero_and_switch_mode = 14;
+    RevokeAndZeroResponse revoke_and_zero = 15;
+    GetReadinessResponse get_readiness = 17;
+    GetOperationResultResponse get_operation_result = 20;
+    StopAllMotionResponse stop_all_motion = 21;
+    GetGuardStateResponse get_guard_state = 22;
+  }
+  reserved 16, 18, 19;
+  reserved "latch_safety_stop", "get_safety_state", "reset_safe_stop";
+}

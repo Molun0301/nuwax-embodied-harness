@@ -1,0 +1,31 @@
+[package]
+name = "nuwax-lcm-sys"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "nuwax real-LCM 系统的 liblcm C FFI 绑定，由 nuwax-transport 唯一启用。"
+
+[features]
+# build.rs 默认探测系统 liblcm 并 fail-fast。
+# 镜像必须装 liblcm-dev 1.3~1.5(版本锁 build.rs `MAX_LCM_VERSION` = "1.6")。
+link-liblcm = []
+
+[dependencies]
+libc = { workspace = true }
+thiserror = { workspace = true }
+
+[build-dependencies]
+# 注意:build.rs 用 std::process::Command 直跑 `pkg-config`(无 crate 依赖);
+# 这样 offline mirror 缺失 `pkg-config` crate 时 build.rs 仍可工作。
+
+[[bin]]
+name = "nuwax-lcm-memq-probe"
+path = "src/bin/nuwax_lcm_memq_probe.rs"
+required-features = ["link-liblcm"]
+
+# 重要:本 crate **不** 通过 cargo:rustc-link-lib 强加 liblcm 依赖;
+# build.rs 用 pkg-config 探测,失败 → 标准错误 + std::process::exit(2) + `LCM_VERSION_UNSUPPORTED`。
+# 版本锁 `>= 1.3, < 1.6`（MAX_LCM_VERSION）；1.6+ wire format
+# 不兼容，镜像必须保持 1.3~1.5。

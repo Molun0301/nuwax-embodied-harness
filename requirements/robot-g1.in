@@ -1,0 +1,3 @@
+# G1 当前为预览 profile；版本范围沿用已有机器人 manifest，待实机验收后生成锁。
+aiortc>=1.6
+aiohttp>=3.9

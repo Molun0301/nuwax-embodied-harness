@@ -1,0 +1,2144 @@
+{
+  "scope": "Seven fresh candidate processes; same adapter per case, two warmup pairs then balanced alternating16 FailClosed or4 rectangle measured pairs. Fixed Geometry mainopt0 test profile with MLS/runtimeopt3, not release. Timed Result/Some success checks and map destruction included. Setup/input checks/exact outputs excluded. Whole-process CPU/RSS includes BOTH implementations and fixture copies; cannot attribute savings per implementation. Pooled operation quantiles are finite observed samples across processes, not a realtime guarantee.",
+  "binary_identity": {
+    "path": "/workspace/shared/neh-virtual-mask-copy-20261006/candidate/nuwax-geometry-runtime-test",
+    "cargo_path": "/workspace/shared/neh-native-20261006/cargo-target/debug/deps/nuwax_geometry_runtime-edd133c562540c52",
+    "sha256": "31c2fbfdc364500b4bb52896c964bd4ba46353c6dce4eab5ef591ca713af27f4",
+    "bytes": 124399320,
+    "features": [
+      "default",
+      "real-lcm-bridge"
+    ],
+    "profile": {
+      "opt_level": "0",
+      "debuginfo": 0,
+      "debug_assertions": true,
+      "overflow_checks": true,
+      "test": true
+    },
+    "source_hashes": "a47da168db294ff75b1c43eef0198c51ba129b16a32f70865a6f16aaf9831032  src/mapping_adapter.rs\nf71fe19a45e5394f66db2b651aea5f30ff973a764cfe6804bd6fdebfee5afc96  src/forbidden_zones.rs\n426bf0c68aaf7fe4701582dfb70ec05d06832796a0ee8c87897bd9b4cdcb6911  src/mapping_adapter_virtual_mask_tests.rs\n1a6393b4c01d8e380d6c06756554e4c727d786a9656d6415ba91b35256376da1  src/forbidden_zones_copy_trial_reference.rs\nc71c6ea19ef5fa2ba75e29f10425ab62bbaaf94cab7bdca3b09431f472bdab90  src/lcm_runtime.rs\n9d0be2a30be10ef941bd8fd82045c9a48be8a4c9f1a48007abc1b0a3912c2401  Cargo.lock\na0ecb96b0a4b77e4a7c03d953a90483b702c6bdcdaef781bded063ec5711acdf  ../../nuwax-workspace/crates/nuwax-nav-pct/src/tomogram.rs\n",
+    "scope": "Normal cached Geometry mainopt0 test profile; MLS/runtimeopt3. Same-adapter alternating frozen/current pure virtual-mask creation; result drop included. No session/socket startup; not release."
+  },
+  "runs": [
+    {
+      "run": 1,
+      "command": [
+        "/workspace/shared/neh-virtual-mask-copy-20261006/candidate/nuwax-geometry-runtime-test",
+        "mapping_adapter::tests::virtual_mask_copy_trial::copy_cost_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "timeout": false,
+      "process_wall_sec": 11.922103082004469,
+      "process_user_cpu_sec": 11.490428,
+      "process_system_cpu_sec": 0.40698,
+      "launch_peak_rss_kib": 134656,
+      "voluntary_context_switches": 2,
+      "involuntary_context_switches": 114,
+      "log": "/workspace/shared/neh-virtual-mask-copy-20261006/matched/01.log",
+      "log_sha256": "b3651f5e356b470417bbb94c79c2fcaa45869eade2742db8394fbf487ed4aead",
+      "cases": [
+        {
+          "side": 512,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                928782,
+                821824,
+                799924,
+                856565,
+                766488,
+                829293,
+                708263,
+                667151,
+                1050904,
+                1446165,
+                1142643,
+                812990,
+                748297,
+                741715,
+                932112,
+                856284
+              ],
+              "total_ns": 14109400,
+              "mean_ms": 0.8818375
+            },
+            "frozen": {
+              "samples_ns": [
+                1880236,
+                1885566,
+                1705968,
+                1813116,
+                2027318,
+                2312310,
+                1702421,
+                1863638,
+                2356660,
+                1950395,
+                2010150,
+                2433747,
+                2044477,
+                1622248,
+                2000356,
+                1790274
+              ],
+              "total_ns": 31398880,
+              "mean_ms": 1.96243
+            }
+          },
+          "ratio": 0.4493599771711602
+        },
+        {
+          "side": 512,
+          "mode": "inside_rectangle",
+          "warmup_pairs": 2,
+          "measured_pairs": 4,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                16577942,
+                16216106,
+                22190444,
+                15918411
+              ],
+              "total_ns": 70902903,
+              "mean_ms": 17.72572575
+            },
+            "frozen": {
+              "samples_ns": [
+                18642705,
+                17411619,
+                16769213,
+                17655127
+              ],
+              "total_ns": 70478664,
+              "mean_ms": 17.619666
+            }
+          },
+          "ratio": 1.0060193961678956
+        },
+        {
+          "side": 2048,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                18609852,
+                17763919,
+                19515430,
+                16370620,
+                15439612,
+                19097246,
+                15224471,
+                14764626,
+                13692321,
+                13752935,
+                15021168,
+                21838496,
+                16158834,
+                13941408,
+                26059318,
+                16372860
+              ],
+              "total_ns": 273623116,
+              "mean_ms": 17.10144475
+            },
+            "frozen": {
+              "samples_ns": [
+                36145696,
+                40122247,
+                37136597,
+                31854482,
+                33166132,
+                35307541,
+                34448510,
+                34433209,
+                31275179,
+                51401961,
+                33758768,
+                35969462,
+                34155410,
+                34683434,
+                36487170,
+                38529505
+              ],
+              "total_ns": 578875303,
+              "mean_ms": 36.1797064375
+            }
+          },
+          "ratio": 0.4726805835072912
+        },
+        {
+          "side": 2048,
+          "mode": "inside_rectangle",
+          "warmup_pairs": 2,
+          "measured_pairs": 4,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                265648299,
+                281409128,
+                266104117,
+                277891246
+              ],
+              "total_ns": 1091052790,
+              "mean_ms": 272.7631975
+            },
+            "frozen": {
+              "samples_ns": [
+                290529011,
+                310638192,
+                291074487,
+                317618413
+              ],
+              "total_ns": 1209860103,
+              "mean_ms": 302.46502575
+            }
+          },
+          "ratio": 0.9018007844829312
+        },
+        {
+          "side": 4096,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                76202269,
+                64127573,
+                62665233,
+                66736863,
+                66861482,
+                71323218,
+                65055909,
+                80477509,
+                70691233,
+                88791107,
+                73278847,
+                125205890,
+                107088405,
+                74682215,
+                84560053,
+                114323806
+              ],
+              "total_ns": 1292071612,
+              "mean_ms": 80.75447575
+            },
+            "frozen": {
+              "samples_ns": [
+                139201237,
+                145848340,
+                155885750,
+                169210078,
+                158728975,
+                142710733,
+                143742657,
+                197765709,
+                143644416,
+                186761466,
+                150683843,
+                182846599,
+                165109987,
+                145177292,
+                175384180,
+                166542749
+              ],
+              "total_ns": 2569244011,
+              "mean_ms": 160.5777506875
+            }
+          },
+          "ratio": 0.5028995324959814
+        }
+      ]
+    },
+    {
+      "run": 2,
+      "command": [
+        "/workspace/shared/neh-virtual-mask-copy-20261006/candidate/nuwax-geometry-runtime-test",
+        "mapping_adapter::tests::virtual_mask_copy_trial::copy_cost_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "timeout": false,
+      "process_wall_sec": 15.9267171360043,
+      "process_user_cpu_sec": 15.479264,
+      "process_system_cpu_sec": 0.431482,
+      "launch_peak_rss_kib": 134656,
+      "voluntary_context_switches": 3,
+      "involuntary_context_switches": 48,
+      "log": "/workspace/shared/neh-virtual-mask-copy-20261006/matched/02.log",
+      "log_sha256": "9898cdedb25796ca275f0014193b12a5915f3ac06b08e745edf50aa47f0aa255",
+      "cases": [
+        {
+          "side": 512,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                6937769,
+                966710,
+                1169569,
+                6213299,
+                4222749,
+                8185366,
+                6483073,
+                12785349,
+                667638,
+                5098642,
+                7453703,
+                5663684,
+                4398296,
+                20727241,
+                4265867,
+                8613612
+              ],
+              "total_ns": 103852567,
+              "mean_ms": 6.4907854375
+            },
+            "frozen": {
+              "samples_ns": [
+                9967254,
+                21264928,
+                25803453,
+                7938650,
+                7792810,
+                16733557,
+                9992229,
+                5503905,
+                1624297,
+                29655885,
+                16020067,
+                12078579,
+                2873078,
+                11416953,
+                19911351,
+                9945595
+              ],
+              "total_ns": 208522591,
+              "mean_ms": 13.0326619375
+            }
+          },
+          "ratio": 0.49803988384165054
+        },
+        {
+          "side": 512,
+          "mode": "inside_rectangle",
+          "warmup_pairs": 2,
+          "measured_pairs": 4,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                72046477,
+                81383376,
+                117212252,
+                78613209
+              ],
+              "total_ns": 349255314,
+              "mean_ms": 87.3138285
+            },
+            "frozen": {
+              "samples_ns": [
+                69597292,
+                60247239,
+                96342505,
+                82333616
+              ],
+              "total_ns": 308520652,
+              "mean_ms": 77.130163
+            }
+          },
+          "ratio": 1.1320322050920597
+        },
+        {
+          "side": 2048,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                38528785,
+                39256207,
+                40377859,
+                60883927,
+                71893227,
+                39296955,
+                28422599,
+                36404077,
+                40663908,
+                30437567,
+                35003565,
+                38714429,
+                34371065,
+                74242452,
+                71203882,
+                15305032
+              ],
+              "total_ns": 695005536,
+              "mean_ms": 43.437846
+            },
+            "frozen": {
+              "samples_ns": [
+                83730211,
+                86507214,
+                99492863,
+                119806769,
+                151881626,
+                95069189,
+                64013215,
+                78845989,
+                68257419,
+                69429681,
+                60668842,
+                66613870,
+                72461542,
+                110975559,
+                144132733,
+                39253110
+              ],
+              "total_ns": 1411139832,
+              "mean_ms": 88.1962395
+            }
+          },
+          "ratio": 0.49251358386997895
+        },
+        {
+          "side": 2048,
+          "mode": "inside_rectangle",
+          "warmup_pairs": 2,
+          "measured_pairs": 4,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                311206398,
+                296290184,
+                285766278,
+                288951366
+              ],
+              "total_ns": 1182214226,
+              "mean_ms": 295.5535565
+            },
+            "frozen": {
+              "samples_ns": [
+                324282180,
+                299502224,
+                332243772,
+                302958827
+              ],
+              "total_ns": 1258987003,
+              "mean_ms": 314.74675075
+            }
+          },
+          "ratio": 0.9390201989241663
+        },
+        {
+          "side": 4096,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                66376397,
+                76581369,
+                84513424,
+                78375286,
+                69086876,
+                83476185,
+                78150328,
+                89902107,
+                73004239,
+                75567265,
+                67994523,
+                85236710,
+                81961574,
+                67755103,
+                76851576,
+                66419927
+              ],
+              "total_ns": 1221252889,
+              "mean_ms": 76.3283055625
+            },
+            "frozen": {
+              "samples_ns": [
+                173989396,
+                164063263,
+                148975959,
+                159867045,
+                182849241,
+                146225844,
+                157968984,
+                169365387,
+                166466464,
+                155180724,
+                148910909,
+                152031942,
+                164233439,
+                150957199,
+                170169105,
+                152601344
+              ],
+              "total_ns": 2563856245,
+              "mean_ms": 160.2410153125
+            }
+          },
+          "ratio": 0.4763343855107602
+        }
+      ]
+    },
+    {
+      "run": 3,
+      "command": [
+        "/workspace/shared/neh-virtual-mask-copy-20261006/candidate/nuwax-geometry-runtime-test",
+        "mapping_adapter::tests::virtual_mask_copy_trial::copy_cost_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "timeout": false,
+      "process_wall_sec": 12.526772839999467,
+      "process_user_cpu_sec": 12.103903,
+      "process_system_cpu_sec": 0.400646,
+      "launch_peak_rss_kib": 134656,
+      "voluntary_context_switches": 3,
+      "involuntary_context_switches": 86,
+      "log": "/workspace/shared/neh-virtual-mask-copy-20261006/matched/03.log",
+      "log_sha256": "7c982189581b748a83f54e2e86c4b8d88303a06faf44fb7dce4c76d960853fb6",
+      "cases": [
+        {
+          "side": 512,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                1903634,
+                1199826,
+                1406334,
+                1702095,
+                878129,
+                1013849,
+                730004,
+                903247,
+                767645,
+                684383,
+                907599,
+                1168749,
+                895126,
+                941582,
+                1016264,
+                995527
+              ],
+              "total_ns": 17113993,
+              "mean_ms": 1.0696245625
+            },
+            "frozen": {
+              "samples_ns": [
+                4317979,
+                2159998,
+                1671283,
+                1938595,
+                1913591,
+                1713925,
+                2985148,
+                3612084,
+                1826286,
+                1701755,
+                2583151,
+                2413424,
+                2256541,
+                1751383,
+                1755362,
+                1713480
+              ],
+              "total_ns": 36313985,
+              "mean_ms": 2.2696240625
+            }
+          },
+          "ratio": 0.4712782967773986
+        },
+        {
+          "side": 512,
+          "mode": "inside_rectangle",
+          "warmup_pairs": 2,
+          "measured_pairs": 4,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                16640803,
+                34587564,
+                48919654,
+                16763981
+              ],
+              "total_ns": 116912002,
+              "mean_ms": 29.2280005
+            },
+            "frozen": {
+              "samples_ns": [
+                39495956,
+                41578149,
+                17365504,
+                23182021
+              ],
+              "total_ns": 121621630,
+              "mean_ms": 30.4054075
+            }
+          },
+          "ratio": 0.9612763946676262
+        },
+        {
+          "side": 2048,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                14259926,
+                15343265,
+                15602381,
+                15093493,
+                20237114,
+                19126854,
+                16773216,
+                17905788,
+                15835728,
+                18746106,
+                37346179,
+                18059375,
+                15702751,
+                20142633,
+                19695297,
+                15469359
+              ],
+              "total_ns": 295339465,
+              "mean_ms": 18.4587165625
+            },
+            "frozen": {
+              "samples_ns": [
+                43410200,
+                41242401,
+                33776658,
+                33240754,
+                36519273,
+                36994135,
+                34426563,
+                31299446,
+                32053116,
+                34761279,
+                46681706,
+                42006707,
+                33186554,
+                31964637,
+                45832219,
+                37091329
+              ],
+              "total_ns": 594486977,
+              "mean_ms": 37.1554360625
+            }
+          },
+          "ratio": 0.49679719897379687
+        },
+        {
+          "side": 2048,
+          "mode": "inside_rectangle",
+          "warmup_pairs": 2,
+          "measured_pairs": 4,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                319107305,
+                293542155,
+                279376285,
+                302921113
+              ],
+              "total_ns": 1194946858,
+              "mean_ms": 298.7367145
+            },
+            "frozen": {
+              "samples_ns": [
+                404337987,
+                311731732,
+                310525599,
+                310212757
+              ],
+              "total_ns": 1336808075,
+              "mean_ms": 334.20201875
+            }
+          },
+          "ratio": 0.8938806402706686
+        },
+        {
+          "side": 4096,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                73891430,
+                108788292,
+                81428974,
+                69231221,
+                71696592,
+                68241384,
+                67941803,
+                71082419,
+                66748987,
+                260521760,
+                88747020,
+                87826223,
+                84814445,
+                66053902,
+                76405591,
+                84432634
+              ],
+              "total_ns": 1427852677,
+              "mean_ms": 89.2407923125
+            },
+            "frozen": {
+              "samples_ns": [
+                163032268,
+                168151035,
+                152972538,
+                174859316,
+                173012337,
+                218319384,
+                148589982,
+                163212940,
+                158526513,
+                183052677,
+                154073437,
+                150885570,
+                140565100,
+                158948562,
+                239269954,
+                210069945
+              ],
+              "total_ns": 2757541558,
+              "mean_ms": 172.346347375
+            }
+          },
+          "ratio": 0.5177991507898065
+        }
+      ]
+    },
+    {
+      "run": 4,
+      "command": [
+        "/workspace/shared/neh-virtual-mask-copy-20261006/candidate/nuwax-geometry-runtime-test",
+        "mapping_adapter::tests::virtual_mask_copy_trial::copy_cost_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "timeout": false,
+      "process_wall_sec": 12.258485512000334,
+      "process_user_cpu_sec": 11.750383,
+      "process_system_cpu_sec": 0.49173,
+      "launch_peak_rss_kib": 134656,
+      "voluntary_context_switches": 3,
+      "involuntary_context_switches": 88,
+      "log": "/workspace/shared/neh-virtual-mask-copy-20261006/matched/04.log",
+      "log_sha256": "fbd5091a065bdbf14971c1973271e7752fdeee4d9e5c729e549ac7383d76e8b7",
+      "cases": [
+        {
+          "side": 512,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                976063,
+                901244,
+                896861,
+                2821096,
+                974003,
+                903796,
+                671359,
+                2424832,
+                1766940,
+                959577,
+                1071003,
+                985743,
+                1134883,
+                1406853,
+                872398,
+                865992
+              ],
+              "total_ns": 19632643,
+              "mean_ms": 1.2270401875
+            },
+            "frozen": {
+              "samples_ns": [
+                1583619,
+                1577818,
+                2100543,
+                3754872,
+                2617836,
+                2545910,
+                3099427,
+                2671593,
+                4431776,
+                2659144,
+                1805149,
+                1648617,
+                2415744,
+                1740435,
+                1624193,
+                1696627
+              ],
+              "total_ns": 37973303,
+              "mean_ms": 2.3733314375
+            }
+          },
+          "ratio": 0.5170117279500285
+        },
+        {
+          "side": 512,
+          "mode": "inside_rectangle",
+          "warmup_pairs": 2,
+          "measured_pairs": 4,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                26171528,
+                21132132,
+                16574591,
+                16675579
+              ],
+              "total_ns": 80553830,
+              "mean_ms": 20.1384575
+            },
+            "frozen": {
+              "samples_ns": [
+                24816681,
+                25515254,
+                16826998,
+                18024386
+              ],
+              "total_ns": 85183319,
+              "mean_ms": 21.29582975
+            }
+          },
+          "ratio": 0.9456526341735991
+        },
+        {
+          "side": 2048,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                15445191,
+                21077899,
+                15023908,
+                16541994,
+                16849730,
+                19413048,
+                21005778,
+                15033843,
+                16562693,
+                18632440,
+                19909248,
+                16551736,
+                26739733,
+                16415013,
+                19891686,
+                13879643
+              ],
+              "total_ns": 288973583,
+              "mean_ms": 18.0608489375
+            },
+            "frozen": {
+              "samples_ns": [
+                38642374,
+                42464834,
+                34547920,
+                44615925,
+                62382834,
+                37138252,
+                36894396,
+                34252800,
+                35835061,
+                34284912,
+                42506273,
+                39313621,
+                40103831,
+                36801886,
+                36365417,
+                35799273
+              ],
+              "total_ns": 631949609,
+              "mean_ms": 39.4968505625
+            }
+          },
+          "ratio": 0.45727314153619486
+        },
+        {
+          "side": 2048,
+          "mode": "inside_rectangle",
+          "warmup_pairs": 2,
+          "measured_pairs": 4,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                283488963,
+                398264070,
+                333967622,
+                284302502
+              ],
+              "total_ns": 1300023157,
+              "mean_ms": 325.00578925
+            },
+            "frozen": {
+              "samples_ns": [
+                296964435,
+                323007926,
+                327107546,
+                326745292
+              ],
+              "total_ns": 1273825199,
+              "mean_ms": 318.45629975
+            }
+          },
+          "ratio": 1.0205663681489159
+        },
+        {
+          "side": 4096,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                75884503,
+                80500275,
+                65430265,
+                69267648,
+                75040036,
+                70455687,
+                75604245,
+                74138086,
+                88863443,
+                71608158,
+                98673156,
+                76832277,
+                79573573,
+                68318887,
+                92529122,
+                79001675
+              ],
+              "total_ns": 1241721036,
+              "mean_ms": 77.60756475
+            },
+            "frozen": {
+              "samples_ns": [
+                179081394,
+                164039638,
+                154820824,
+                160577203,
+                168678142,
+                174590312,
+                166099631,
+                153087828,
+                149405213,
+                165659408,
+                172137923,
+                219833816,
+                155298443,
+                150123481,
+                151536975,
+                165038163
+              ],
+              "total_ns": 2650008394,
+              "mean_ms": 165.625524625
+            }
+          },
+          "ratio": 0.4685724916235869
+        }
+      ]
+    },
+    {
+      "run": 5,
+      "command": [
+        "/workspace/shared/neh-virtual-mask-copy-20261006/candidate/nuwax-geometry-runtime-test",
+        "mapping_adapter::tests::virtual_mask_copy_trial::copy_cost_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "timeout": false,
+      "process_wall_sec": 12.372533708999981,
+      "process_user_cpu_sec": 12.046543,
+      "process_system_cpu_sec": 0.27382999999999996,
+      "launch_peak_rss_kib": 134656,
+      "voluntary_context_switches": 2,
+      "involuntary_context_switches": 101,
+      "log": "/workspace/shared/neh-virtual-mask-copy-20261006/matched/05.log",
+      "log_sha256": "c97606a9115422677858cfca1e1240a80316fe87dbd043059748ed7bc2e0489e",
+      "cases": [
+        {
+          "side": 512,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                1231737,
+                1024913,
+                1803398,
+                1482873,
+                1153540,
+                1019035,
+                1828086,
+                878843,
+                1423284,
+                1118398,
+                650518,
+                914229,
+                804313,
+                1238826,
+                1203902,
+                761957
+              ],
+              "total_ns": 18537852,
+              "mean_ms": 1.15861575
+            },
+            "frozen": {
+              "samples_ns": [
+                3385203,
+                3843816,
+                2191482,
+                2300837,
+                2753254,
+                2580520,
+                1866690,
+                2537027,
+                2902266,
+                3450957,
+                1733692,
+                1619080,
+                1540202,
+                2188357,
+                3100665,
+                1973239
+              ],
+              "total_ns": 39967287,
+              "mean_ms": 2.4979554375
+            }
+          },
+          "ratio": 0.46382562819437806
+        },
+        {
+          "side": 512,
+          "mode": "inside_rectangle",
+          "warmup_pairs": 2,
+          "measured_pairs": 4,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                19610931,
+                20405601,
+                18068779,
+                16744600
+              ],
+              "total_ns": 74829911,
+              "mean_ms": 18.70747775
+            },
+            "frozen": {
+              "samples_ns": [
+                20864959,
+                23842965,
+                20536768,
+                21258119
+              ],
+              "total_ns": 86502811,
+              "mean_ms": 21.62570275
+            }
+          },
+          "ratio": 0.8650575644299004
+        },
+        {
+          "side": 2048,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                19634450,
+                23569508,
+                18587440,
+                19996870,
+                18470600,
+                23378037,
+                19939257,
+                20014781,
+                17471057,
+                19294744,
+                20625735,
+                16343390,
+                19659124,
+                16584335,
+                15966760,
+                16674521
+              ],
+              "total_ns": 306210609,
+              "mean_ms": 19.1381630625
+            },
+            "frozen": {
+              "samples_ns": [
+                38742130,
+                42100303,
+                37395039,
+                36859862,
+                43210429,
+                37607150,
+                39581713,
+                43640588,
+                40723618,
+                37722124,
+                37507334,
+                37200746,
+                41334144,
+                36610090,
+                42752494,
+                36455413
+              ],
+              "total_ns": 629443177,
+              "mean_ms": 39.3401985625
+            }
+          },
+          "ratio": 0.4864785578571773
+        },
+        {
+          "side": 2048,
+          "mode": "inside_rectangle",
+          "warmup_pairs": 2,
+          "measured_pairs": 4,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                340455003,
+                330620361,
+                322993832,
+                319512176
+              ],
+              "total_ns": 1313581372,
+              "mean_ms": 328.395343
+            },
+            "frozen": {
+              "samples_ns": [
+                355106709,
+                337970231,
+                332680493,
+                376034764
+              ],
+              "total_ns": 1401792197,
+              "mean_ms": 350.44804925
+            }
+          },
+          "ratio": 0.9370728234978184
+        },
+        {
+          "side": 4096,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                71823752,
+                80923980,
+                73151087,
+                70034632,
+                73518285,
+                69749912,
+                70950468,
+                75560267,
+                65618840,
+                72432731,
+                73692262,
+                85853024,
+                75068446,
+                79567600,
+                68497278,
+                74283773
+              ],
+              "total_ns": 1180726337,
+              "mean_ms": 73.7953960625
+            },
+            "frozen": {
+              "samples_ns": [
+                163903548,
+                165492389,
+                164974137,
+                155567262,
+                154658211,
+                161606087,
+                153347773,
+                170749610,
+                148344748,
+                155124955,
+                155393645,
+                158715159,
+                156647206,
+                149178327,
+                177268052,
+                149952105
+              ],
+              "total_ns": 2540923214,
+              "mean_ms": 158.807700875
+            }
+          },
+          "ratio": 0.46468398985629483
+        }
+      ]
+    },
+    {
+      "run": 6,
+      "command": [
+        "/workspace/shared/neh-virtual-mask-copy-20261006/candidate/nuwax-geometry-runtime-test",
+        "mapping_adapter::tests::virtual_mask_copy_trial::copy_cost_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "timeout": false,
+      "process_wall_sec": 13.284775776002789,
+      "process_user_cpu_sec": 13.037044,
+      "process_system_cpu_sec": 0.195537,
+      "launch_peak_rss_kib": 134656,
+      "voluntary_context_switches": 2,
+      "involuntary_context_switches": 42,
+      "log": "/workspace/shared/neh-virtual-mask-copy-20261006/matched/06.log",
+      "log_sha256": "376bbe2de39ee0d277aa8c7a48bef41117ac5994634106bad731c9a06fca8321",
+      "cases": [
+        {
+          "side": 512,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                838565,
+                1218859,
+                850816,
+                1240895,
+                1093171,
+                2144337,
+                699337,
+                661206,
+                939505,
+                919931,
+                798272,
+                1007704,
+                1227375,
+                1287103,
+                819694,
+                851341
+              ],
+              "total_ns": 16598111,
+              "mean_ms": 1.0373819375
+            },
+            "frozen": {
+              "samples_ns": [
+                1804833,
+                2687668,
+                1875426,
+                1881540,
+                2012690,
+                2261182,
+                2611165,
+                1948270,
+                1811370,
+                1674995,
+                1887826,
+                1918648,
+                1809096,
+                1885226,
+                2172295,
+                3314249
+              ],
+              "total_ns": 33556479,
+              "mean_ms": 2.0972799375
+            }
+          },
+          "ratio": 0.49463207984365704
+        },
+        {
+          "side": 512,
+          "mode": "inside_rectangle",
+          "warmup_pairs": 2,
+          "measured_pairs": 4,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                20496465,
+                17673478,
+                16882838,
+                16337872
+              ],
+              "total_ns": 71390653,
+              "mean_ms": 17.84766325
+            },
+            "frozen": {
+              "samples_ns": [
+                20702325,
+                16092286,
+                16629870,
+                19052232
+              ],
+              "total_ns": 72476713,
+              "mean_ms": 18.11917825
+            }
+          },
+          "ratio": 0.9850150489026731
+        },
+        {
+          "side": 2048,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                23030335,
+                22187408,
+                16203571,
+                17830435,
+                14865499,
+                25172703,
+                20497594,
+                17637072,
+                16812767,
+                21015196,
+                38543436,
+                14600592,
+                15518022,
+                15210938,
+                15746053,
+                14061373
+              ],
+              "total_ns": 308932994,
+              "mean_ms": 19.308312125
+            },
+            "frozen": {
+              "samples_ns": [
+                56162681,
+                49890835,
+                35864927,
+                43547266,
+                36815773,
+                50640583,
+                44369790,
+                43280094,
+                36319357,
+                42438289,
+                54993433,
+                39629384,
+                33923820,
+                43968989,
+                31813862,
+                36303018
+              ],
+              "total_ns": 679962101,
+              "mean_ms": 42.4976313125
+            }
+          },
+          "ratio": 0.45433854849507266
+        },
+        {
+          "side": 2048,
+          "mode": "inside_rectangle",
+          "warmup_pairs": 2,
+          "measured_pairs": 4,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                279151349,
+                289355954,
+                278786817,
+                282615969
+              ],
+              "total_ns": 1129910089,
+              "mean_ms": 282.47752225
+            },
+            "frozen": {
+              "samples_ns": [
+                309660322,
+                299880913,
+                313044209,
+                333552147
+              ],
+              "total_ns": 1256137591,
+              "mean_ms": 314.03439775
+            }
+          },
+          "ratio": 0.8995114047184024
+        },
+        {
+          "side": 4096,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                89781913,
+                72618209,
+                78769448,
+                68496406,
+                78378885,
+                83603837,
+                77026036,
+                79521174,
+                80799330,
+                121160892,
+                160553850,
+                74493084,
+                86378551,
+                90525009,
+                87125016,
+                81851673
+              ],
+              "total_ns": 1411083313,
+              "mean_ms": 88.1927070625
+            },
+            "frozen": {
+              "samples_ns": [
+                159314382,
+                160946140,
+                165817740,
+                172372738,
+                178936591,
+                242256793,
+                156821451,
+                150783679,
+                391234722,
+                304075964,
+                821294932,
+                182198726,
+                165678160,
+                223741872,
+                193680218,
+                205926772
+              ],
+              "total_ns": 3875080880,
+              "mean_ms": 242.192555
+            }
+          },
+          "ratio": 0.36414293190184976
+        }
+      ]
+    },
+    {
+      "run": 7,
+      "command": [
+        "/workspace/shared/neh-virtual-mask-copy-20261006/candidate/nuwax-geometry-runtime-test",
+        "mapping_adapter::tests::virtual_mask_copy_trial::copy_cost_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "timeout": false,
+      "process_wall_sec": 19.434021369997936,
+      "process_user_cpu_sec": 18.732934,
+      "process_system_cpu_sec": 0.63494,
+      "launch_peak_rss_kib": 134656,
+      "voluntary_context_switches": 3,
+      "involuntary_context_switches": 155,
+      "log": "/workspace/shared/neh-virtual-mask-copy-20261006/matched/07.log",
+      "log_sha256": "26fdc03bf5e8b508ccdcbb4a3a8cce382c24f216740ea68b618e3c8790b63f5f",
+      "cases": [
+        {
+          "side": 512,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                725297,
+                790716,
+                1147851,
+                884087,
+                1382713,
+                4678885,
+                972621,
+                1266596,
+                2914025,
+                658092,
+                2164760,
+                840397,
+                2223686,
+                4878865,
+                875744,
+                3235228
+              ],
+              "total_ns": 29639563,
+              "mean_ms": 1.8524726875
+            },
+            "frozen": {
+              "samples_ns": [
+                1696011,
+                3848427,
+                2552774,
+                6708305,
+                2063259,
+                3744735,
+                3189755,
+                3778182,
+                4727916,
+                2598591,
+                2812018,
+                4489750,
+                2126472,
+                4268216,
+                3067454,
+                1973176
+              ],
+              "total_ns": 53645041,
+              "mean_ms": 3.3528150625
+            }
+          },
+          "ratio": 0.5525126357905105
+        },
+        {
+          "side": 512,
+          "mode": "inside_rectangle",
+          "warmup_pairs": 2,
+          "measured_pairs": 4,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                20858265,
+                20109895,
+                26265118,
+                18445915
+              ],
+              "total_ns": 85679193,
+              "mean_ms": 21.41979825
+            },
+            "frozen": {
+              "samples_ns": [
+                23887996,
+                22088154,
+                27373750,
+                19509062
+              ],
+              "total_ns": 92858962,
+              "mean_ms": 23.2147405
+            }
+          },
+          "ratio": 0.9226809255093763
+        },
+        {
+          "side": 2048,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                43919080,
+                61958831,
+                50363762,
+                14891897,
+                14373034,
+                13989796,
+                13126514,
+                13877025,
+                27702154,
+                19467578,
+                14352414,
+                13904834,
+                13506706,
+                17793880,
+                17794583,
+                18232812
+              ],
+              "total_ns": 369254900,
+              "mean_ms": 23.07843125
+            },
+            "frozen": {
+              "samples_ns": [
+                154725590,
+                109624249,
+                113691457,
+                69105107,
+                33705753,
+                32171575,
+                39320939,
+                32329785,
+                48532556,
+                35285046,
+                34704097,
+                32073809,
+                35423890,
+                33688279,
+                41132398,
+                34165230
+              ],
+              "total_ns": 879679760,
+              "mean_ms": 54.979985
+            }
+          },
+          "ratio": 0.4197605956058373
+        },
+        {
+          "side": 2048,
+          "mode": "inside_rectangle",
+          "warmup_pairs": 2,
+          "measured_pairs": 4,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                601784076,
+                298180290,
+                428728446,
+                439981282
+              ],
+              "total_ns": 1768674094,
+              "mean_ms": 442.1685235
+            },
+            "frozen": {
+              "samples_ns": [
+                381240238,
+                415550211,
+                341382239,
+                1514289339
+              ],
+              "total_ns": 2652462027,
+              "mean_ms": 663.11550675
+            }
+          },
+          "ratio": 0.666804680329548
+        },
+        {
+          "side": 4096,
+          "mode": "fail_closed",
+          "warmup_pairs": 2,
+          "measured_pairs": 16,
+          "arms": {
+            "production": {
+              "samples_ns": [
+                141619551,
+                194849007,
+                151833449,
+                110352080,
+                100479703,
+                89907788,
+                95667284,
+                83811851,
+                94492782,
+                132641274,
+                182956990,
+                92976867,
+                78687285,
+                65881352,
+                91602373,
+                65795381
+              ],
+              "total_ns": 1773555017,
+              "mean_ms": 110.8471885625
+            },
+            "frozen": {
+              "samples_ns": [
+                282100976,
+                236498659,
+                293755007,
+                243356219,
+                217926442,
+                250948811,
+                193099732,
+                180502392,
+                181732808,
+                172653462,
+                262240052,
+                187135831,
+                236834872,
+                169544895,
+                142294814,
+                146931269
+              ],
+              "total_ns": 3397556241,
+              "mean_ms": 212.3472650625
+            }
+          },
+          "ratio": 0.5220090238971264
+        }
+      ]
+    }
+  ],
+  "summary": {
+    "512/fail_closed": {
+      "frozen_median_batch_mean_ms": 2.3733314375,
+      "production_median_batch_mean_ms": 1.15861575,
+      "ratio_of_medians": 0.4881811835014721,
+      "paired_median_ratio": 0.49463207984365704,
+      "production_wins": 7,
+      "frozen_batch_mean_range_ms": [
+        1.96243,
+        13.0326619375
+      ],
+      "production_batch_mean_range_ms": [
+        0.8818375,
+        6.4907854375
+      ],
+      "paired_ratios": [
+        0.4493599771711602,
+        0.49803988384165054,
+        0.4712782967773986,
+        0.5170117279500285,
+        0.46382562819437806,
+        0.49463207984365704,
+        0.5525126357905105
+      ],
+      "pooled_operation_samples": {
+        "frozen": {
+          "count": 112,
+          "median_ms": 2.2588615,
+          "p95_nearest_rank_ms": 16.020067,
+          "max_ms": 29.655885,
+          "min_ms": 1.540202
+        },
+        "production": {
+          "count": 112,
+          "median_ms": 1.0107765,
+          "p95_nearest_rank_ms": 6.937769,
+          "max_ms": 20.727241,
+          "min_ms": 0.650518
+        }
+      }
+    },
+    "512/inside_rectangle": {
+      "frozen_median_batch_mean_ms": 21.62570275,
+      "production_median_batch_mean_ms": 20.1384575,
+      "ratio_of_medians": 0.9312278880740651,
+      "paired_median_ratio": 0.9612763946676262,
+      "production_wins": 5,
+      "frozen_batch_mean_range_ms": [
+        17.619666,
+        77.130163
+      ],
+      "production_batch_mean_range_ms": [
+        17.72572575,
+        87.3138285
+      ],
+      "paired_ratios": [
+        1.0060193961678956,
+        1.1320322050920597,
+        0.9612763946676262,
+        0.9456526341735991,
+        0.8650575644299004,
+        0.9850150489026731,
+        0.9226809255093763
+      ],
+      "pooled_operation_samples": {
+        "frozen": {
+          "count": 28,
+          "median_ms": 21.061539,
+          "p95_nearest_rank_ms": 82.333616,
+          "max_ms": 96.342505,
+          "min_ms": 16.092286
+        },
+        "production": {
+          "count": 28,
+          "median_ms": 19.860413,
+          "p95_nearest_rank_ms": 81.383376,
+          "max_ms": 117.212252,
+          "min_ms": 15.918411
+        }
+      }
+    },
+    "2048/fail_closed": {
+      "frozen_median_batch_mean_ms": 39.4968505625,
+      "production_median_batch_mean_ms": 19.1381630625,
+      "ratio_of_medians": 0.48454909163493126,
+      "paired_median_ratio": 0.4726805835072912,
+      "production_wins": 7,
+      "frozen_batch_mean_range_ms": [
+        36.1797064375,
+        88.1962395
+      ],
+      "production_batch_mean_range_ms": [
+        17.10144475,
+        43.437846
+      ],
+      "paired_ratios": [
+        0.4726805835072912,
+        0.49251358386997895,
+        0.49679719897379687,
+        0.45727314153619486,
+        0.4864785578571773,
+        0.45433854849507266,
+        0.4197605956058373
+      ],
+      "pooled_operation_samples": {
+        "frozen": {
+          "count": 112,
+          "median_ms": 38.125814500000004,
+          "p95_nearest_rank_ms": 110.975559,
+          "max_ms": 154.72559,
+          "min_ms": 31.275179
+        },
+        "production": {
+          "count": 112,
+          "median_ms": 18.1460935,
+          "p95_nearest_rank_ms": 50.363762,
+          "max_ms": 74.242452,
+          "min_ms": 13.126514
+        }
+      }
+    },
+    "2048/inside_rectangle": {
+      "frozen_median_batch_mean_ms": 318.45629975,
+      "production_median_batch_mean_ms": 298.7367145,
+      "ratio_of_medians": 0.9380775784134884,
+      "paired_median_ratio": 0.9018007844829312,
+      "production_wins": 6,
+      "frozen_batch_mean_range_ms": [
+        302.46502575,
+        663.11550675
+      ],
+      "production_batch_mean_range_ms": [
+        272.7631975,
+        442.1685235
+      ],
+      "paired_ratios": [
+        0.9018007844829312,
+        0.9390201989241663,
+        0.8938806402706686,
+        1.0205663681489159,
+        0.9370728234978184,
+        0.8995114047184024,
+        0.666804680329548
+      ],
+      "pooled_operation_samples": {
+        "frozen": {
+          "count": 28,
+          "median_ms": 323.64505299999996,
+          "p95_nearest_rank_ms": 415.550211,
+          "max_ms": 1514.289339,
+          "min_ms": 290.529011
+        },
+        "production": {
+          "count": 28,
+          "median_ms": 294.9161695,
+          "p95_nearest_rank_ms": 439.981282,
+          "max_ms": 601.784076,
+          "min_ms": 265.648299
+        }
+      }
+    },
+    "4096/fail_closed": {
+      "frozen_median_batch_mean_ms": 165.625524625,
+      "production_median_batch_mean_ms": 80.75447575,
+      "ratio_of_medians": 0.4875726487981834,
+      "paired_median_ratio": 0.4763343855107602,
+      "production_wins": 7,
+      "frozen_batch_mean_range_ms": [
+        158.807700875,
+        242.192555
+      ],
+      "production_batch_mean_range_ms": [
+        73.7953960625,
+        110.8471885625
+      ],
+      "paired_ratios": [
+        0.5028995324959814,
+        0.4763343855107602,
+        0.5177991507898065,
+        0.4685724916235869,
+        0.46468398985629483,
+        0.36414293190184976,
+        0.5220090238971264
+      ],
+      "pooled_operation_samples": {
+        "frozen": {
+          "count": 112,
+          "median_ms": 165.00615,
+          "p95_nearest_rank_ms": 262.240052,
+          "max_ms": 821.294932,
+          "min_ms": 139.201237
+        },
+        "production": {
+          "count": 112,
+          "median_ms": 76.938806,
+          "p95_nearest_rank_ms": 141.619551,
+          "max_ms": 260.52176,
+          "min_ms": 62.665233
+        }
+      }
+    }
+  },
+  "disposition": {
+    "status": "retained_after_independent_source_and_results_review",
+    "mapping_adapter_sha256": "a47da168db294ff75b1c43eef0198c51ba129b16a32f70865a6f16aaf9831032",
+    "forbidden_zones_sha256": "f71fe19a45e5394f66db2b651aea5f30ff973a764cfe6804bd6fdebfee5afc96",
+    "fixture_sha256": "426bf0c68aaf7fe4701582dfb70ec05d06832796a0ee8c87897bd9b4cdcb6911",
+    "frozen_reference_sha256": "1a6393b4c01d8e380d6c06756554e4c727d786a9656d6415ba91b35256376da1",
+    "scope": "Copy-only virtual mask ownership refactor. Same gates, exact validation/error ordering, headers, bitmap/raster semantics, metadata captures/equality checks and lock scope. Source-level2N payload clone bytes removed per materialization; not measured allocator/bandwidth/RSS savings. Rectangle slower samples and adverse tails retained."
+  },
+  "initial_runs": {
+    "baseline": {
+      "command": [
+        "/workspace/shared/neh-virtual-mask-copy-20261006/baseline/nuwax-geometry-runtime-test",
+        "mapping_adapter::tests::virtual_mask_copy_trial::copy_cost_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "timeout": false,
+      "wall_seconds": 17.237927932001185,
+      "user_cpu_seconds": 16.677812,
+      "system_cpu_seconds": 0.507508,
+      "launch_peak_rss_kib": 134264,
+      "voluntary_context_switches": 2,
+      "involuntary_context_switches": 88
+    },
+    "candidate": {
+      "command": [
+        "/workspace/shared/neh-virtual-mask-copy-20261006/candidate/nuwax-geometry-runtime-test",
+        "mapping_adapter::tests::virtual_mask_copy_trial::copy_cost_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "timeout": false,
+      "wall_seconds": 11.25773122600367,
+      "user_cpu_seconds": 10.931487,
+      "system_cpu_seconds": 0.27119499999999996,
+      "launch_peak_rss_kib": 134396,
+      "voluntary_context_switches": 3,
+      "involuntary_context_switches": 69
+    }
+  },
+  "baseline_tests": {
+    "command": [
+      "/workspace/shared/neh-virtual-mask-copy-20261006/baseline/nuwax-geometry-runtime-test",
+      "mapping_adapter::tests::virtual_mask_copy_trial::",
+      "--nocapture",
+      "--test-threads=1"
+    ],
+    "exit_code": 0,
+    "passed": 3,
+    "failed": 0,
+    "ignored": 1
+  },
+  "candidate_tests": {
+    "unique_passed": 12,
+    "failed": 0,
+    "records": [
+      {
+        "selector": "mapping_adapter::tests::virtual_mask_copy_trial::parity_headers_payload_and_isolation",
+        "command": [
+          "/workspace/shared/neh-virtual-mask-copy-20261006/candidate/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::virtual_mask_copy_trial::parity_headers_payload_and_isolation",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "wall_seconds": 0.014822470002400223,
+        "log": "/workspace/shared/neh-virtual-mask-copy-20261006/candidate/focused-01.log",
+        "log_sha256": "008f20a95fbf9fb4517c4358266885881b4e43dee7c7fd49592ec31d9a6ae951"
+      },
+      {
+        "selector": "mapping_adapter::tests::virtual_mask_copy_trial::gates_and_layout_errors_match_frozen",
+        "command": [
+          "/workspace/shared/neh-virtual-mask-copy-20261006/candidate/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::virtual_mask_copy_trial::gates_and_layout_errors_match_frozen",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "wall_seconds": 0.015393626999866683,
+        "log": "/workspace/shared/neh-virtual-mask-copy-20261006/candidate/focused-02.log",
+        "log_sha256": "49207fd56d62712f685835c85e63ed11179e7ce313fe5660f0d5287fa2341cac"
+      },
+      {
+        "selector": "mapping_adapter::tests::virtual_mask_copy_trial::borrowed_compose_preserves_physical_cells",
+        "command": [
+          "/workspace/shared/neh-virtual-mask-copy-20261006/candidate/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::virtual_mask_copy_trial::borrowed_compose_preserves_physical_cells",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "wall_seconds": 0.010322165995603427,
+        "log": "/workspace/shared/neh-virtual-mask-copy-20261006/candidate/focused-03.log",
+        "log_sha256": "24777018312975e808d666337d3c8a23f07a80c46c1023d9cf51b96280518c7c"
+      },
+      {
+        "selector": "forbidden_zones::tests::diagonal_line_uses_conservative_supercover_cells",
+        "command": [
+          "/workspace/shared/neh-virtual-mask-copy-20261006/candidate/nuwax-geometry-runtime-test",
+          "forbidden_zones::tests::diagonal_line_uses_conservative_supercover_cells",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "wall_seconds": 0.012140507002186496,
+        "log": "/workspace/shared/neh-virtual-mask-copy-20261006/candidate/focused-04.log",
+        "log_sha256": "6c811ae008114298571f79197ee0d1c2e4f23eb95229fab6959b2c4d8860cb4c"
+      },
+      {
+        "selector": "forbidden_zones::tests::rectangle_inside_marks_interior_and_boundary",
+        "command": [
+          "/workspace/shared/neh-virtual-mask-copy-20261006/candidate/nuwax-geometry-runtime-test",
+          "forbidden_zones::tests::rectangle_inside_marks_interior_and_boundary",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "wall_seconds": 0.012001800001598895,
+        "log": "/workspace/shared/neh-virtual-mask-copy-20261006/candidate/focused-05.log",
+        "log_sha256": "050511698a07ac28d6aaf3b545af307df9302a1bf619fa5283e0cae90a298f8b"
+      },
+      {
+        "selector": "forbidden_zones::tests::outside_zones_intersect_their_allowed_interiors",
+        "command": [
+          "/workspace/shared/neh-virtual-mask-copy-20261006/candidate/nuwax-geometry-runtime-test",
+          "forbidden_zones::tests::outside_zones_intersect_their_allowed_interiors",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "wall_seconds": 0.011621486002695747,
+        "log": "/workspace/shared/neh-virtual-mask-copy-20261006/candidate/focused-06.log",
+        "log_sha256": "c8d109491a410b7b1d344595b4c99e122a56d2e7b0d7809794b95ce4ba05ab92"
+      },
+      {
+        "selector": "forbidden_zones::tests::circle_outside_keeps_only_cells_fully_inside",
+        "command": [
+          "/workspace/shared/neh-virtual-mask-copy-20261006/candidate/nuwax-geometry-runtime-test",
+          "forbidden_zones::tests::circle_outside_keeps_only_cells_fully_inside",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "wall_seconds": 0.01045191000594059,
+        "log": "/workspace/shared/neh-virtual-mask-copy-20261006/candidate/focused-07.log",
+        "log_sha256": "612a58e43e7bfad63ba36a7ffa1f30ef7aad27e35b1214d9c9f6cf27d26fccc3"
+      },
+      {
+        "selector": "forbidden_zones::tests::concave_polygon_inside_is_rasterized_without_filling_the_notch",
+        "command": [
+          "/workspace/shared/neh-virtual-mask-copy-20261006/candidate/nuwax-geometry-runtime-test",
+          "forbidden_zones::tests::concave_polygon_inside_is_rasterized_without_filling_the_notch",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "wall_seconds": 0.014974546000303235,
+        "log": "/workspace/shared/neh-virtual-mask-copy-20261006/candidate/focused-08.log",
+        "log_sha256": "8d665e9fd27d1c6a60c5d72c24f94e1d72e7e04ab41a887f648e8902bdd7335b"
+      },
+      {
+        "selector": "forbidden_zones::tests::malformed_document_fails_closed",
+        "command": [
+          "/workspace/shared/neh-virtual-mask-copy-20261006/candidate/nuwax-geometry-runtime-test",
+          "forbidden_zones::tests::malformed_document_fails_closed",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "wall_seconds": 0.019107705003989395,
+        "log": "/workspace/shared/neh-virtual-mask-copy-20261006/candidate/focused-09.log",
+        "log_sha256": "0bf4adcbb94a83a43c29f934644c129ff1050377b5239ab7530ca66dcbc595d2"
+      },
+      {
+        "selector": "mapping_adapter::tests::virtual_obstacles_use_applied_snapshot_without_physical_projection_or_future_file",
+        "command": [
+          "/workspace/shared/neh-virtual-mask-copy-20261006/candidate/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::virtual_obstacles_use_applied_snapshot_without_physical_projection_or_future_file",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "wall_seconds": 0.013858637001249008,
+        "log": "/workspace/shared/neh-virtual-mask-copy-20261006/candidate/focused-10.log",
+        "log_sha256": "2c422e440312c9c7e047622e1e75d312188ec623f9763982480712b69e6b14e4"
+      },
+      {
+        "selector": "lcm_runtime::mapping_feed_tests::navigation_map_3d_virtual_obstacles_keep_commit_identity_and_block_both_floors",
+        "command": [
+          "/workspace/shared/neh-virtual-mask-copy-20261006/candidate/nuwax-geometry-runtime-test",
+          "lcm_runtime::mapping_feed_tests::navigation_map_3d_virtual_obstacles_keep_commit_identity_and_block_both_floors",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "wall_seconds": 0.5562031529989326,
+        "log": "/workspace/shared/neh-virtual-mask-copy-20261006/candidate/focused-11.log",
+        "log_sha256": "15e7ec37776a36540469bb0e62a679a1dccd48d7d887addf4fbefc33f6f1e645"
+      },
+      {
+        "selector": "lcm_runtime::mapping_feed_tests::retained_cloud_metadata_rejects_forged_receipt_root_and_frame",
+        "command": [
+          "/workspace/shared/neh-virtual-mask-copy-20261006/candidate/nuwax-geometry-runtime-test",
+          "lcm_runtime::mapping_feed_tests::retained_cloud_metadata_rejects_forged_receipt_root_and_frame",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "wall_seconds": 0.01532726200093748,
+        "log": "/workspace/shared/neh-virtual-mask-copy-20261006/candidate/focused-12.log",
+        "log_sha256": "a8f910cc12becf736e55a707f7bae89cbab576b7fbd4a03cfe165299da00c637"
+      }
+    ]
+  },
+  "mapping": {
+    "local_base": "2bf54cc108a63dfa728a486fefd4de8ce8331620",
+    "base_tree": "1fabe2eac417c4fecde21552148f22b2b93dbe72",
+    "mapped_remote_base": "410290dbc45c20db10bf2782556b555a0175bcc4",
+    "committed": false
+  }
+}

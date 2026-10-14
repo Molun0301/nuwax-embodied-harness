@@ -3,12 +3,10 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 import base64
 from io import BytesIO
-import hashlib
 import json
 import logging
 from pathlib import Path
-import re
-from typing import Iterable, List, Optional
+from typing import List, Optional
 
 import httpx
 import numpy as np
@@ -73,59 +71,6 @@ class VisionLanguageEmbedder(VectorCodecMixin, ABC):
     @abstractmethod
     def embed_text(self, text: str) -> np.ndarray:
         """把文本编码到与图像同构的空间。"""
-
-
-class HashingTextEmbedder(TextEmbedder):
-    """无外部依赖的文本向量化器。"""
-
-    def __init__(self, *, model_name: str = "hashing-v1", dimension: int = 256) -> None:
-        if dimension <= 0:
-            raise ValueError("向量维度必须为正整数。")
-        self.model_name = model_name
-        self.dimension = dimension
-
-    def embed_text(self, text: str) -> np.ndarray:
-        features = self._build_features(text)
-        vector = np.zeros(self.dimension, dtype=np.float32)
-        if not features:
-            return vector
-
-        for feature in features:
-            digest = hashlib.blake2b(feature.encode("utf-8"), digest_size=8).digest()
-            feature_hash = int.from_bytes(digest, byteorder="big", signed=False)
-            bucket = feature_hash % self.dimension
-            sign = 1.0 if ((feature_hash >> 1) & 1) == 0 else -1.0
-            vector[bucket] += sign
-
-        return self._normalize_vector(vector)
-
-    def _build_features(self, text: str) -> List[str]:
-        normalized = self._normalize_text(text)
-        if not normalized:
-            return []
-
-        base_tokens = normalized.split()
-        condensed = normalized.replace(" ", "")
-        features = list(base_tokens)
-        if condensed:
-            features.append(condensed)
-            features.extend(self._iter_char_ngrams(condensed, 2))
-            features.extend(self._iter_char_ngrams(condensed, 3))
-        return list(dict.fromkeys(item for item in features if item))
-
-    def _normalize_text(self, text: str) -> str:
-        raw = str(text or "").strip().lower()
-        if not raw:
-            return ""
-        normalized = re.sub(r"[^0-9a-z\u4e00-\u9fff]+", " ", raw)
-        return " ".join(part for part in normalized.split() if part)
-
-    def _iter_char_ngrams(self, text: str, size: int) -> Iterable[str]:
-        if size <= 1:
-            return []
-        if len(text) <= size:
-            return [text]
-        return [text[index : index + size] for index in range(0, len(text) - size + 1)]
 
 
 def _strip_backend_prefix(model_name: str, prefix: str) -> str:
@@ -555,13 +500,13 @@ def build_text_embedder(
     api_key: str = "",
     base_url: str = "https://dashscope.aliyuncs.com/api/v1",
     timeout_sec: float = 20.0,
-) -> TextEmbedder:
-    """按配置构造文本向量化器。"""
+) -> Optional[TextEmbedder]:
+    """按配置构造文本向量化器；纯词法模式不创建向量器。"""
 
     normalized = str(model_name or "").strip()
     spec = resolve_text_embedding_provider_spec(normalized)
-    if spec.provider_name == "hashing":
-        return HashingTextEmbedder(model_name=spec.model_name or "hashing-v1", dimension=dimension)
+    if not spec.is_enabled():
+        return None
     if spec.provider_name == "dashscope":
         return DashScopeTextEmbedder(
             model_name=spec.model_name,

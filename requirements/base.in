@@ -1,0 +1,33 @@
+# 通用 Python 运行时直接依赖。版本沿用仓库已批准的 Python 3.8 基线。
+websockets==10.4
+numpy==1.24.4
+opencv-python==4.10.0.84
+pydantic==2.10.6
+typing_extensions==4.13.2
+# 通用智能体接口输入结构校验；4.19.2支持Python 3.8，MIT许可证。
+jsonschema==4.19.2
+fastapi==0.115.14
+# 代码直接导入 starlette；0.44.0 仍支持 Python 3.8，并满足 FastAPI 的范围。
+starlette==0.44.0
+uvicorn==0.30.6
+# 原生事件循环减少实时连接的解释器调度开销，仍兼容设备 Python 3.8。
+uvloop==0.21.0; sys_platform != "win32"
+httpx==0.27.2
+openai==1.60.2
+grpcio==1.70.0
+protobuf==5.29.6
+Pillow==10.4.0
+
+# 感知直接依赖。torch/torchvision/tensorrt 故意不在此声明公共索引版本；
+# Jetson profile 要求它们由 NVIDIA 制品提供，并在安装前通过 import/version gate。
+polars==1.8.2
+# CLIP 由 third_party/python-source-artifacts.json 的已批准 wheel 提供，
+# 禁止把同名公共 PyPI distribution 写进可直接安装的 requirements。
+onnx==1.17.0
+onnxslim==0.1.93
+ultralytics==8.4.33
+psutil==7.2.2
+
+# Focal/aarch64 does not provide python3-lcm; build the pinned binding in the
+# release venv against the system liblcm-dev package.
+lcm==1.5.2

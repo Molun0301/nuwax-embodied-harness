@@ -6,13 +6,11 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from gateways.app import create_gateway_app, create_gateway_app_from_env, create_relay_app_from_env
-    from gateways.artifacts import LocalArtifactStore
-    from gateways.auth import AccessContext, AccessRole, GatewayAccessManager
+    from services.artifact_store import LocalArtifactStore
+    from gateways.auth import GatewayAccessManager
     from gateways.runtime import GatewayRuntime, create_default_gateway_runtime
 
 __all__ = [
-    "AccessContext",
-    "AccessRole",
     "GatewayAccessManager",
     "GatewayRuntime",
     "LocalArtifactStore",
@@ -26,16 +24,12 @@ __all__ = [
 def __getattr__(name: str):
     """按需导出网关对象，避免包初始化循环依赖。"""
 
-    if name in {"AccessContext", "AccessRole", "GatewayAccessManager"}:
-        from gateways.auth import AccessContext, AccessRole, GatewayAccessManager
+    if name == "GatewayAccessManager":
+        from gateways.auth import GatewayAccessManager
 
-        return {
-            "AccessContext": AccessContext,
-            "AccessRole": AccessRole,
-            "GatewayAccessManager": GatewayAccessManager,
-        }[name]
+        return GatewayAccessManager
     if name == "LocalArtifactStore":
-        from gateways.artifacts import LocalArtifactStore
+        from services.artifact_store import LocalArtifactStore
 
         return LocalArtifactStore
     if name in {"GatewayRuntime", "create_default_gateway_runtime"}:

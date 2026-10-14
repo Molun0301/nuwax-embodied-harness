@@ -1,0 +1,14 @@
+初始化均值只统计每个扫描新消费的惯性样本，避免跨扫描重复累计。
+
+--- a/src/laserMapping.hpp
++++ b/src/laserMapping.hpp
+@@ -340,7 +340,8 @@
+     /*** push imu data, and pop from imu buffer ***/
+     if (p_imu->imu_need_init_) {
+         double imu_time = get_time_sec(imu_deque.front()->header.stamp);
+-        meas.imu.shrink_to_fit();
++        // 初始化统计只消费本扫描的新样本，不重复加权先前扫描的历史。
++        meas.imu.clear();
+         while ((!imu_deque.empty()) && (imu_time < lidar_end_time)) {
+             imu_time = get_time_sec(imu_deque.front()->header.stamp);
+             if (imu_time > lidar_end_time) break;

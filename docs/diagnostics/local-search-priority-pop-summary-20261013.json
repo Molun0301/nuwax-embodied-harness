@@ -1,0 +1,34 @@
+[
+  {
+    "mode": "a-oracle-pop.log",
+    "pops": 7,
+    "max_abs_yaw": 1.6500000000000006,
+    "max_lateral": 0.36694389532238825,
+    "max_progress": 0.017286917996451212,
+    "max_priority": 61.01592653589793
+  },
+  {
+    "mode": "a-baseline-pop.log",
+    "pops": 257,
+    "max_abs_yaw": 0.18,
+    "max_lateral": 0.00548662827978863,
+    "max_progress": 0.10000000000000009,
+    "max_priority": 21.04351883448689
+  },
+  {
+    "mode": "a-relaxed-pop.log",
+    "pops": 257,
+    "max_abs_yaw": 0.42000000000000015,
+    "max_lateral": 0.01807323888506629,
+    "max_progress": 0.10000000000000009,
+    "max_priority": 4.781193580933898
+  },
+  {
+    "mode": "a-weighted_relaxed-pop.log",
+    "pops": 257,
+    "max_abs_yaw": 0.49999999999999994,
+    "max_lateral": 0.01291656998154389,
+    "max_progress": 0.10000000000000009,
+    "max_priority": 17.440684616677462
+  }
+]

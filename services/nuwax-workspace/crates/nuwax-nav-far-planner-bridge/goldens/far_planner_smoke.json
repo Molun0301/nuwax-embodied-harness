@@ -1,0 +1,38 @@
+{
+  "name": "far_planner_smoke",
+  "bridge": "far_planner",
+  "topics": {
+    "contour_polygons": "/contour",
+    "goal": "/goal",
+    "goal_path": "/goal_path",
+    "graph_edges": "/graph_edges",
+    "graph_nodes": "/graph_nodes",
+    "nav_boundary": "/nav_boundary",
+    "odometry": "/odom",
+    "registered_scan": "/scan",
+    "stop_movement": "/stop_movement",
+    "terrain_map": "/terrain",
+    "terrain_map_ext": "/terrain_ext",
+    "way_point": "/way_point"
+  },
+  "config_overrides": {
+    "robot_dimension": 0.5,
+    "update_rate": 5.0,
+    "world_frame": "map"
+  },
+  "expected_argv_contains": [
+    "/odom",
+    "/scan",
+    "/goal",
+    "/way_point",
+    "--robot_dim",
+    "--world_frame",
+    "map"
+  ],
+  "expected_argv_pairs": [
+    ["--robot_dim", "0.5"],
+    ["--update_rate", "5"],
+    ["--world_frame", "map"]
+  ],
+  "expected_topics_count": 12
+}

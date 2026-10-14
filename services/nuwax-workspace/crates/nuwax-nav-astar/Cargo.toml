@@ -1,0 +1,47 @@
+[package]
+name = "nuwax-nav-astar"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "nuwax 纯 Rust replanning A* 导航核心（min-cost 8 邻接 A*、safe goal、replan limiter、局部跟随与全局编排）"
+
+[dependencies]
+nuwax-nav-control = { path = "../nuwax-nav-control" }
+# 共享数值与栅格基础
+nuwax-numeric = { path = "../nuwax-numeric" }
+
+# Foundation 类型与基础(Phase7 type-convergence 收敛)
+nuwax-nav-types-messages = { path = "../nuwax-nav-types-messages" }
+nuwax-nav-base = { path = "../nuwax-nav-base" }
+
+# Foundation 交付后切换为 workspace 路径依赖；当前先用 workspace 依赖以便本地编译
+thiserror = { workspace = true }
+serde = { workspace = true }
+ndarray = { workspace = true }
+nalgebra = { workspace = true }
+glam = { workspace = true }
+tracing = { workspace = true }
+
+# rework22 P0-11:module feature 下启用 nuwax-core 以提供 In/Out 端口工厂
+nuwax-core = { path = "../nuwax-core", optional = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+proptest = { workspace = true }
+approx = { workspace = true }
+criterion = { workspace = true }
+# rework22 P0-11:dev test 需要 module feature 下的 nuwax-core
+nuwax-core = { path = "../nuwax-core" }
+
+[[bench]]
+name = "astar_bench"
+harness = false
+required-features = ["bench"]
+
+[features]
+default = ["module"]
+# rework22 P0-11:stream/RPC 适配层(module.rs) + nuwax-core In/Out 端口
+module = ["dep:nuwax-core"]
+bench = []                 # 启用 benchmark

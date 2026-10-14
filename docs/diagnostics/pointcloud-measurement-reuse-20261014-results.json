@@ -1,0 +1,3041 @@
+{
+  "method": "Three independent Node processes; actual full _preparePointCloud; fresh processor per operation; 10 warmups per arm/cohort; 30 alternating AB/BA pairs; counting separate from timing.",
+  "source_window": "Measured pre-edit source plus one-expression in-memory candidate. Final actual source exactly reconstructs that candidate; final contracts only, no paired-timing rerun.",
+  "final_contracts": {
+    "node": "v24.19.0",
+    "checks": 114,
+    "source_window": "Final production candidate; baseline reconstructed by reversing exactly one measurement expression",
+    "config_source": "Actual pointcloud3d.js default normalized presets/colors",
+    "scope": "Full synchronous _preparePointCloud with new processor per call, excluding worker serialization, viewer admission, GPU, network and browser",
+    "cohorts": []
+  },
+  "existing_regression_results": {
+    "voxel_identity": 27,
+    "incremental_pages": 21,
+    "assigned_pairing": 22,
+    "configuration_ui": 4,
+    "js_syntax_checks": 3,
+    "note": "Scopes overlap; do not sum into whole-frontend coverage. Page-store suite emits incidental timings, not matched A/B findings.",
+    "logs": {
+      "voxel": "PASS \u751f\u4ea7\u4f53\u7d20\u8def\u5f84\u6ca1\u6709\u663e\u5f0f\u4e58\u6cd5\u54c8\u5e0c\u621632\u4f4d\u622a\u65ad\nPASS \u540c\u4f53\u7d20\u5408\u5e76\u3001\u4e0d\u540c\u4f53\u7d20\u4fdd\u7559\u5e76\u8f93\u51fa\u4e2d\u5fc3\nPASS \u9996\u6b21\u9047\u5230\u4f53\u7d20\u7684\u987a\u5e8f\u4fdd\u6301\nPASS \u8d1f\u5750\u6807\u3001\u6574\u683c\u8fb9\u754c\u548c\u8d1f\u96f6\u6cbf\u7528floor\u8bed\u4e49\nPASS \u4e09\u4e2a\u8f74\u5747\u4fdd\u7559\u72ec\u7acb\u8eab\u4efd\uff0c\u5750\u6807\u4e32\u4e0d\u6df7\u6dc6\u5206\u9694\u4f4d\u7f6e\nPASS \u76f8\u5dee2^32\u7684\u771f\u4f53\u7d20\u4e0d\u518d\u56e032\u4f4d\u622a\u65ad\u4e22\u5931\nPASS \u975e\u6709\u9650XYZ\u548c\u4e0d\u5b8c\u6574\u672b\u70b9\u4e0d\u8fdb\u5165\u8f93\u51fa\nPASS \u7a7a\u8f93\u5165\u53ca\u975e\u6cd5\u95f4\u9694\u4fdd\u6301\u539f\u5bf9\u8c61\u76f4\u901a\nPASS \u53ef\u8f6c\u6362\u95f4\u9694\u548c\u975e\u6574\u6570\u95f4\u9694\u4fdd\u6301\u6570\u503c\u8bed\u4e49\nPASS \u591a\u95f4\u9694\u771f\u5b9e\u5750\u6807\u771f\u503c\u548c\u91cd\u590d\u8c03\u7528\u786e\u5b9a\u6027\nPASS \u6781\u5c0f\u95f4\u9694\u4fdd\u7559\u5df2\u6709IEEE\u6570\u503c\u8fb9\u754c\uff0c\u4e0d\u65b0\u8bbe\u62d2\u7edd\u9608\u503c\nPASS \u539f\u59cb\u6765\u6e90\u5206\u652f\u4fdd\u7559\u6240\u6709\u70b9\u548c\u5750\u6807\uff0c\u7ed5\u8fc7\u4f53\u7d20\u62bd\u6837\nPASS \u5b9e\u65f6\u5206\u652f\u4e0d\u53d7LOD\u6b65\u957f\u5f71\u54cd\u5e76\u4fdd\u7559\u4e2d\u5fc3\u3001\u989c\u8272\u4e0e\u6d4b\u91cf\nPASS \u65e0\u5b9e\u65f6\u4f53\u7d20\u95f4\u9694\u7684\u5206\u652f\u7ee7\u7eed\u76f4\u63a5\u663e\u793a\u6765\u6e90\nPASS \u5b9e\u9645\u697c\u5c42\u8fc7\u6ee4\u4ecd\u5148\u4e8e\u5b9e\u65f6\u4f53\u7d20\u62bd\u6837\nPASS \u79bb\u7ebf\u5c0f\u8f93\u5165\u4e0d\u5e94\u7528\u9884\u89c8\u6b65\u957f\nPASS \u79bb\u7ebf\u5927\u8f93\u5165\u4fdd\u7559\u9884\u89c8\u6b65\u957f\u4e0e\u987a\u5e8f\nPASS \u79bb\u7ebf32MiB\u70b9\u9884\u7b97\u4e0e\u5b9e\u65f6\u539f\u6709\u65e0\u8be5\u4e0a\u9650\u5206\u652f\u4fdd\u6301\nPASS \u5b8c\u6574\u626b\u63cf\u4e13\u7528\u6837\u5f0f\u7ee7\u7eed\u62d2\u7edd\u9884\u89c8\u6765\u6e90\nPASS \u4f53\u7d20\u4e34\u65f6\u96c6\u5408\u4e0d\u4f1a\u6302\u5230processor\u5f62\u6210\u8de8\u8c03\u7528\u7f13\u5b58\nPASS \u5df2\u77e5\u5b89\u5168\u8fb9\u754c\u5b9e\u9645\u4f7f\u7528\u6570\u5b57key\u5e76\u4e0e\u72ec\u7acb\u771f\u503c\u4e00\u81f4\nPASS \u672a\u77e5\u6216\u8d85\u5b89\u5168\u8303\u56f4\u8fb9\u754c\u56de\u9000\u7cbe\u786e\u5750\u6807\u4e32\nPASS \u6709\u9650\u957f\u65b9\u4f53\u6570\u5b57\u7d22\u5f15\u53ef\u9010\u8f74\u9006\u89e3\u4e14\u8986\u76d6\u6bcf\u4e2a\u4f53\u7d20\u4e00\u6b21\nPASS \u8fb9\u754c\u4e4b\u5916\u7684\u70b9\u56de\u9000\u5b57\u7b26\u4e32\u4e0d\u4e0e\u5185\u90e8\u6570\u5b57\u7d22\u5f15\u522b\u540d\nPASS \u590d\u7528\u8fb9\u754c\u7684\u591a\u7ef4\u591a\u95f4\u9694\u8f93\u5165\u4e0e\u771f\u503c\u4e00\u81f4\nPASS \u5927\u7edd\u5bf9\u5750\u6807\u5148\u4f5c\u76f8\u5bf9\u5dee\u907f\u514d\u4e2d\u95f4\u548c\u8d8a\u8fc7\u5b89\u5168\u6574\u6570\nPASS \u6b63\u8d1f\u6781\u5927\u5750\u6807\u53ca\u4f53\u79ef\u8fb9\u754c\u4fdd\u6301\u65e0\u635ffallback\n{\"checks\":27,\"status\":\"passed\",\"forbidden_hash_calls\":0}\n",
+      "pages": "PASS persistent source pages copy and dirty only replaced page\nPASS point_count-only truncation uses drawRange without coordinate upload\nPASS deleting sole global z extrema changes bounds/uniforms without touching unchanged slabs\nPASS append and producer dense-slot swap removal preserve exact source\nPASS all validation is atomic including missing growth, duplicates and bad last coordinate\nPASS prepared transactions commit once and stale preparations are revalidated\nPASS pending GPU update ranges survive multiple transactions before rendering\nPASS floor/ground/structure golden matches existing live transforms and RGB\nPASS floor constructor, negative voxels and huge tuple coordinates match legacy\nPASS coarse cells use exact pre-sampling eligibility rather than centroid or min/max guesses\nPASS dirty floor pages update voxel and structure metadata without source rebuild\nPASS height peak changes reclassify metadata boundaries without scanning unmodified source XYZ\nPASS explicit spacing rebuilds once, colors and height/mono changes upload no coordinates\nPASS all-point histogram remains exact beyond old 200000 analysis sampling cap\nPASS shader uses global height/colors and structure flags instead of RGB attributes\nPASS actual Three r170 shader chunks preserve legacy normalized-byte and output-sRGB semantics\nPASS picking rejects hidden source pages and disposed layers release geometry/material\nPASS empty reset and truncation dispose pages and clear bounds/derived state\nPASS randomized append, replacement, swap-remove and floor switches match fresh transforms\nPASS dense single-voxel updates query aggregate bounds instead of rescanning raw XYZ\n{\"points\":1398101,\"sourcePages\":1366,\"sourceDrawCalls\":86,\"allocatedSourcePoints\":1409024,\"bootstrapMs\":51.775,\"dirtyPageMedianMs\":0.051,\"dirtyPageP95Ms\":0.114,\"steadyCopiedCoordinates\":92160,\"steadyGpuDirtyBytes\":368640,\"steadyGpuUploadCount\":30,\"gpuMeasurement\":\"scheduled BufferAttribute bytes/ranges; no WebGL driver timing\"}\nPASS large canonical map stays in 86 stable slabs and one dirty page schedules 12KiB\nPASS 21 incremental page-store/transform checks (Three r170, CPU attribute inspection; no GPU render)\n",
+      "pairing": "PASS assigned identity is exact schema 2, nonzero lowercase IDs and strict positive uint64\nPASS assigned page metadata and epoch must agree; explicit legacy remains supported\nPASS schema-2 map ownership uses installation identity rather than saved recording session\nPASS assigned saved pages assemble atomically across bounded packets without XYZ flattening\nPASS assigned map context rejects unpaired legacy pages and wrong installation without changing its base\nPASS dense first chunk requires matching asset, checkpoint, installation, display epoch and frame\nPASS dense polling binds even epoch-empty first request and rejects the first wrong owner\nPASS new installation fences late fetch and late arrayBuffer before they touch dense resources\nPASS late non-OK JSON body cannot clear a newer successful dense installation\nPASS dense 409, repeat reset, hidden stop and dispose preserve owner and fence responses\nPASS assigned metadata arriving before first page fences in-flight generic loading and new raw fallback\nPASS binary-v1 rejects assigned ownership and cannot bypass pre-page assigned map context\nPASS clear before first page discards staging and blocks delayed assigned packets and raw fallback\nPASS actual viewer installs assigned saved pages atomically with no cumulative legacy XYZ buffer\nPASS assigned viewer visibility, styles and robot floor changes keep canonical resource ownership\nPASS assigned owner rejects unpaired raw load, append and direct page entrypoints\nPASS same asset new installation and repeated reset replace only owned page resources\nPASS viewer full style pairs captured display identity and visibility fences dense responses\nPASS viewer disconnect, interrupted packets, reconnect and resync cannot revive stale dense work\nPASS clear active assigned display survives reconnect and delayed packets until a new map is selected\nPASS explicit legacy saved remains separate and later assigned pages reclaim ownership\nPASS map invalidation and viewer dispose clear ownership, abort fetch and dispose actual Three resources\n{\"checks\":22,\"failures\":0,\"fixtures\":\"generated entirely in JavaScript\",\"scope\":\"CPU module integration; no browser or WebGL validation\"}\n",
+      "ui": "4 real-renderer status cases passed\n"
+    }
+  },
+  "fixture_history": [
+    "Initial non-finite height fixture assumed every equal result contains a value; both arms actually throw the same original color error. Ownership assertion now runs only after successful results; error parity remains required.",
+    "Final regression command completed all tests; its tail -2 log-display helper failed. Logs were then read with tail -n 3. No application test failed in that reporting step."
+  ],
+  "summary": [
+    {
+      "count": 4096,
+      "style": "height",
+      "live": false,
+      "input_bytes": 49152,
+      "calls": [
+        {
+          "calls": 2,
+          "scanned_coordinates": 24576,
+          "output_points": 4096
+        },
+        {
+          "calls": 1,
+          "scanned_coordinates": 12288,
+          "output_points": 4096
+        }
+      ],
+      "median_of_process_medians_ms": [
+        0.261145,
+        0.251679
+      ]
+    },
+    {
+      "count": 4096,
+      "style": "mono",
+      "live": false,
+      "input_bytes": 49152,
+      "calls": [
+        {
+          "calls": 2,
+          "scanned_coordinates": 24576,
+          "output_points": 4096
+        },
+        {
+          "calls": 1,
+          "scanned_coordinates": 12288,
+          "output_points": 4096
+        }
+      ],
+      "median_of_process_medians_ms": [
+        0.136536,
+        0.12598
+      ]
+    },
+    {
+      "count": 100000,
+      "style": "height",
+      "live": false,
+      "input_bytes": 1200000,
+      "calls": [
+        {
+          "calls": 2,
+          "scanned_coordinates": 600000,
+          "output_points": 100000
+        },
+        {
+          "calls": 1,
+          "scanned_coordinates": 300000,
+          "output_points": 100000
+        }
+      ],
+      "median_of_process_medians_ms": [
+        6.607134,
+        6.25337
+      ]
+    },
+    {
+      "count": 100000,
+      "style": "mono",
+      "live": false,
+      "input_bytes": 1200000,
+      "calls": [
+        {
+          "calls": 2,
+          "scanned_coordinates": 600000,
+          "output_points": 4167
+        },
+        {
+          "calls": 1,
+          "scanned_coordinates": 300000,
+          "output_points": 4167
+        }
+      ],
+      "median_of_process_medians_ms": [
+        0.642891,
+        0.374866
+      ]
+    },
+    {
+      "count": 1000000,
+      "style": "height",
+      "live": false,
+      "input_bytes": 12000000,
+      "calls": [
+        {
+          "calls": 2,
+          "scanned_coordinates": 6000000,
+          "output_points": 1000000
+        },
+        {
+          "calls": 1,
+          "scanned_coordinates": 3000000,
+          "output_points": 1000000
+        }
+      ],
+      "median_of_process_medians_ms": [
+        65.921241,
+        63.454588
+      ]
+    },
+    {
+      "count": 1000000,
+      "style": "mono",
+      "live": false,
+      "input_bytes": 12000000,
+      "calls": [
+        {
+          "calls": 2,
+          "scanned_coordinates": 6000000,
+          "output_points": 41667
+        },
+        {
+          "calls": 1,
+          "scanned_coordinates": 3000000,
+          "output_points": 41667
+        }
+      ],
+      "median_of_process_medians_ms": [
+        6.556628,
+        3.72992
+      ]
+    },
+    {
+      "count": 100000,
+      "style": "singleFloor",
+      "live": false,
+      "input_bytes": 1200000,
+      "calls": [
+        {
+          "calls": 2,
+          "scanned_coordinates": 510000,
+          "output_points": 8750
+        },
+        {
+          "calls": 2,
+          "scanned_coordinates": 510000,
+          "output_points": 8750
+        }
+      ],
+      "median_of_process_medians_ms": [
+        3.422056,
+        3.492712
+      ]
+    },
+    {
+      "count": 100000,
+      "style": "ground",
+      "live": false,
+      "input_bytes": 1200000,
+      "calls": [
+        {
+          "calls": 2,
+          "scanned_coordinates": 481698,
+          "output_points": 7571
+        },
+        {
+          "calls": 2,
+          "scanned_coordinates": 481698,
+          "output_points": 7571
+        }
+      ],
+      "median_of_process_medians_ms": [
+        3.300122,
+        3.245339
+      ]
+    },
+    {
+      "count": 100000,
+      "style": "structure",
+      "live": false,
+      "input_bytes": 1200000,
+      "calls": [
+        {
+          "calls": 2,
+          "scanned_coordinates": 510000,
+          "output_points": 8750
+        },
+        {
+          "calls": 2,
+          "scanned_coordinates": 510000,
+          "output_points": 8750
+        }
+      ],
+      "median_of_process_medians_ms": [
+        3.414685,
+        3.344729
+      ]
+    },
+    {
+      "count": 0,
+      "style": "height",
+      "live": false,
+      "input_bytes": 0,
+      "calls": [
+        {
+          "calls": 0,
+          "scanned_coordinates": 0,
+          "output_points": 0
+        },
+        {
+          "calls": 0,
+          "scanned_coordinates": 0,
+          "output_points": 0
+        }
+      ],
+      "median_of_process_medians_ms": [
+        0.000671,
+        0.000681
+      ]
+    }
+  ],
+  "runs": [
+    {
+      "node": "v24.19.0",
+      "checks": 114,
+      "production_modified": false,
+      "config_source": "Actual pointcloud3d.js default normalized presets/colors",
+      "scope": "Full synchronous _preparePointCloud with new processor per call, excluding worker serialization, viewer admission, GPU, network and browser",
+      "cohorts": [
+        {
+          "count": 4096,
+          "style": "height",
+          "live": false,
+          "input_bytes": 49152,
+          "calls": [
+            {
+              "calls": 2,
+              "scanned_coordinates": 24576,
+              "output_points": 4096
+            },
+            {
+              "calls": 1,
+              "scanned_coordinates": 12288,
+              "output_points": 4096
+            }
+          ],
+          "median_ms": [
+            0.266091,
+            0.253843
+          ],
+          "p95_ms": [
+            0.286162,
+            0.286012
+          ],
+          "samples_ms": [
+            [
+              0.275616,
+              0.286162,
+              0.256527,
+              0.268696,
+              0.407335,
+              0.255615,
+              0.254634,
+              0.31094,
+              0.281355,
+              0.255095,
+              0.254815,
+              0.255065,
+              0.253492,
+              0.25818,
+              0.273252,
+              0.273413,
+              0.270348,
+              0.254835,
+              0.266943,
+              0.254864,
+              0.268245,
+              0.254384,
+              0.267874,
+              0.253973,
+              0.267344,
+              0.266091,
+              0.253113,
+              0.266442,
+              0.253533,
+              0.270659
+            ],
+            [
+              0.255456,
+              0.299292,
+              0.255005,
+              0.252531,
+              0.257008,
+              0.286012,
+              0.254354,
+              0.268936,
+              0.287584,
+              0.253693,
+              0.269507,
+              0.26514,
+              0.268926,
+              0.252652,
+              0.253763,
+              0.252792,
+              0.254434,
+              0.25223,
+              0.253372,
+              0.25171,
+              0.253843,
+              0.253493,
+              0.25175,
+              0.269236,
+              0.253143,
+              0.252251,
+              0.253403,
+              0.25181,
+              0.253973,
+              0.258149
+            ]
+          ]
+        },
+        {
+          "count": 4096,
+          "style": "mono",
+          "live": false,
+          "input_bytes": 49152,
+          "calls": [
+            {
+              "calls": 2,
+              "scanned_coordinates": 24576,
+              "output_points": 4096
+            },
+            {
+              "calls": 1,
+              "scanned_coordinates": 12288,
+              "output_points": 4096
+            }
+          ],
+          "median_ms": [
+            0.136536,
+            0.12598
+          ],
+          "p95_ms": [
+            0.184138,
+            0.167873
+          ],
+          "samples_ms": [
+            [
+              0.141093,
+              0.175715,
+              0.140051,
+              0.136516,
+              0.136536,
+              0.136265,
+              0.136055,
+              0.184138,
+              0.13925,
+              0.139731,
+              0.138208,
+              0.23192,
+              0.137167,
+              0.137348,
+              0.135916,
+              0.159821,
+              0.136696,
+              0.122836,
+              0.11898,
+              0.493505,
+              0.143908,
+              0.160422,
+              0.11886,
+              0.120381,
+              0.121514,
+              0.133581,
+              0.1194,
+              0.123676,
+              0.123737,
+              0.136405
+            ],
+            [
+              0.127613,
+              0.124098,
+              0.126721,
+              0.17284,
+              0.127032,
+              0.127953,
+              0.12629,
+              0.12598,
+              0.167873,
+              0.126531,
+              0.127833,
+              0.125659,
+              0.126902,
+              0.1258,
+              0.127643,
+              0.12587,
+              0.126831,
+              0.20508,
+              0.127323,
+              0.154303,
+              0.108293,
+              0.108083,
+              0.109185,
+              0.108744,
+              0.107112,
+              0.109425,
+              0.107362,
+              0.110437,
+              0.111499,
+              0.113662
+            ]
+          ]
+        },
+        {
+          "count": 100000,
+          "style": "height",
+          "live": false,
+          "input_bytes": 1200000,
+          "calls": [
+            {
+              "calls": 2,
+              "scanned_coordinates": 600000,
+              "output_points": 100000
+            },
+            {
+              "calls": 1,
+              "scanned_coordinates": 300000,
+              "output_points": 100000
+            }
+          ],
+          "median_ms": [
+            6.607134,
+            6.35929
+          ],
+          "p95_ms": [
+            7.89666,
+            7.566291
+          ],
+          "samples_ms": [
+            [
+              6.367152,
+              6.933767,
+              6.607134,
+              6.428654,
+              6.566232,
+              6.912765,
+              6.453031,
+              6.328023,
+              6.83592,
+              6.695988,
+              6.854968,
+              6.529076,
+              6.476486,
+              6.454193,
+              6.589888,
+              6.800134,
+              7.070713,
+              7.89666,
+              6.561966,
+              8.006026,
+              6.755538,
+              7.407112,
+              6.885013,
+              6.467493,
+              7.965695,
+              6.519471,
+              6.396016,
+              6.817371,
+              6.513863,
+              6.686814
+            ],
+            [
+              6.435524,
+              6.720535,
+              6.574805,
+              6.100298,
+              6.225388,
+              6.092948,
+              6.266199,
+              6.35929,
+              6.083423,
+              6.721747,
+              7.566291,
+              6.318548,
+              6.263725,
+              6.362675,
+              6.358148,
+              6.452821,
+              6.129173,
+              6.174782,
+              6.189754,
+              6.23378,
+              6.542215,
+              6.844072,
+              8.445749,
+              7.298067,
+              6.294763,
+              7.74473,
+              6.470117,
+              6.387523,
+              6.4256,
+              6.334643
+            ]
+          ]
+        },
+        {
+          "count": 100000,
+          "style": "mono",
+          "live": false,
+          "input_bytes": 1200000,
+          "calls": [
+            {
+              "calls": 2,
+              "scanned_coordinates": 600000,
+              "output_points": 4167
+            },
+            {
+              "calls": 1,
+              "scanned_coordinates": 300000,
+              "output_points": 4167
+            }
+          ],
+          "median_ms": [
+            0.641719,
+            0.374866
+          ],
+          "p95_ms": [
+            0.720438,
+            0.504422
+          ],
+          "samples_ms": [
+            [
+              0.643091,
+              0.630022,
+              0.642881,
+              0.701349,
+              0.665985,
+              0.630662,
+              0.641719,
+              0.629179,
+              0.643371,
+              0.624914,
+              0.645525,
+              0.664292,
+              2.847098,
+              0.625364,
+              0.643862,
+              0.720438,
+              0.656741,
+              0.612985,
+              0.69563,
+              0.656221,
+              0.61614,
+              0.626536,
+              0.825676,
+              0.652676,
+              0.631754,
+              0.627577,
+              0.62899,
+              0.630452,
+              0.612845,
+              0.633446
+            ],
+            [
+              0.373534,
+              0.382818,
+              0.387966,
+              0.385552,
+              0.369318,
+              0.382467,
+              0.39089,
+              0.383249,
+              0.366713,
+              0.38424,
+              0.524993,
+              0.373614,
+              0.504422,
+              0.578623,
+              0.355086,
+              0.369007,
+              0.439023,
+              0.389157,
+              0.381175,
+              0.363238,
+              0.45023,
+              0.353203,
+              0.43711,
+              0.374866,
+              0.353875,
+              0.353944,
+              0.354215,
+              0.371581,
+              0.369387,
+              0.354175
+            ]
+          ]
+        },
+        {
+          "count": 1000000,
+          "style": "height",
+          "live": false,
+          "input_bytes": 12000000,
+          "calls": [
+            {
+              "calls": 2,
+              "scanned_coordinates": 6000000,
+              "output_points": 1000000
+            },
+            {
+              "calls": 1,
+              "scanned_coordinates": 3000000,
+              "output_points": 1000000
+            }
+          ],
+          "median_ms": [
+            65.921241,
+            63.454588
+          ],
+          "p95_ms": [
+            77.761846,
+            70.604652
+          ],
+          "samples_ms": [
+            [
+              66.605525,
+              65.274145,
+              68.827078,
+              65.237119,
+              65.852368,
+              64.665697,
+              66.155465,
+              67.689551,
+              76.564498,
+              77.761846,
+              82.176791,
+              65.663623,
+              64.713819,
+              65.581579,
+              64.457242,
+              65.327726,
+              65.002054,
+              65.538354,
+              66.127584,
+              65.806659,
+              65.921241,
+              69.751384,
+              69.877294,
+              64.25715,
+              65.947712,
+              66.575769,
+              82.82144,
+              69.117173,
+              65.980878,
+              64.640995
+            ],
+            [
+              63.348278,
+              64.179523,
+              63.006022,
+              62.615232,
+              62.792238,
+              64.36334,
+              63.454588,
+              65.285232,
+              72.133069,
+              70.604652,
+              73.48525,
+              64.22821,
+              65.689342,
+              61.909857,
+              61.992151,
+              63.345144,
+              62.102286,
+              62.518155,
+              63.070478,
+              63.796604,
+              63.088636,
+              62.837237,
+              66.261826,
+              63.069337,
+              63.862644,
+              64.93988,
+              65.232309,
+              62.991657,
+              64.246089,
+              64.887097
+            ]
+          ]
+        },
+        {
+          "count": 1000000,
+          "style": "mono",
+          "live": false,
+          "input_bytes": 12000000,
+          "calls": [
+            {
+              "calls": 2,
+              "scanned_coordinates": 6000000,
+              "output_points": 41667
+            },
+            {
+              "calls": 1,
+              "scanned_coordinates": 3000000,
+              "output_points": 41667
+            }
+          ],
+          "median_ms": [
+            6.50549,
+            3.700215
+          ],
+          "p95_ms": [
+            6.88972,
+            3.94861
+          ],
+          "samples_ms": [
+            [
+              6.88972,
+              6.696208,
+              6.669137,
+              6.48609,
+              6.946156,
+              6.669017,
+              6.362936,
+              6.49231,
+              6.281522,
+              6.65761,
+              6.684901,
+              6.586833,
+              6.879374,
+              6.682066,
+              6.640583,
+              6.560263,
+              6.328703,
+              6.238798,
+              6.50549,
+              6.98919,
+              6.32637,
+              6.440943,
+              6.213629,
+              6.782448,
+              6.344657,
+              6.478409,
+              6.271877,
+              6.355914,
+              6.453231,
+              6.735938
+            ],
+            [
+              3.827387,
+              3.880197,
+              3.786946,
+              3.760206,
+              3.859676,
+              3.658743,
+              3.817443,
+              3.647375,
+              3.64371,
+              3.691763,
+              3.839235,
+              3.836592,
+              3.661307,
+              3.7296,
+              3.658313,
+              3.690631,
+              3.645022,
+              3.613775,
+              3.663991,
+              3.593534,
+              3.645593,
+              4.300652,
+              3.697251,
+              3.618942,
+              3.94861,
+              3.877113,
+              4.31967,
+              3.94177,
+              3.700215,
+              3.743871
+            ]
+          ]
+        },
+        {
+          "count": 100000,
+          "style": "singleFloor",
+          "live": false,
+          "input_bytes": 1200000,
+          "calls": [
+            {
+              "calls": 2,
+              "scanned_coordinates": 510000,
+              "output_points": 8750
+            },
+            {
+              "calls": 2,
+              "scanned_coordinates": 510000,
+              "output_points": 8750
+            }
+          ],
+          "median_ms": [
+            3.243467,
+            3.302435
+          ],
+          "p95_ms": [
+            3.526383,
+            3.687386
+          ],
+          "samples_ms": [
+            [
+              3.191718,
+              3.21285,
+              3.234953,
+              3.163074,
+              3.526383,
+              3.491831,
+              3.510048,
+              3.401384,
+              3.519843,
+              3.484821,
+              3.85557,
+              3.600164,
+              3.39835,
+              3.411169,
+              3.349987,
+              3.14014,
+              3.520625,
+              3.121051,
+              3.165598,
+              3.148762,
+              3.13994,
+              3.171447,
+              3.487664,
+              3.361935,
+              3.235314,
+              3.276896,
+              3.169524,
+              3.243467,
+              3.192029,
+              3.190846
+            ],
+            [
+              3.155193,
+              3.372371,
+              3.17995,
+              3.294634,
+              3.365901,
+              4.256545,
+              3.220702,
+              3.164767,
+              3.41819,
+              3.687386,
+              3.266681,
+              3.306983,
+              3.42525,
+              3.45178,
+              3.292721,
+              3.179009,
+              3.361664,
+              3.230687,
+              3.430438,
+              3.259891,
+              3.369476,
+              3.758153,
+              3.158407,
+              3.56384,
+              3.233932,
+              3.293422,
+              3.327513,
+              3.302435,
+              3.169675,
+              3.563449
+            ]
+          ]
+        },
+        {
+          "count": 100000,
+          "style": "ground",
+          "live": false,
+          "input_bytes": 1200000,
+          "calls": [
+            {
+              "calls": 2,
+              "scanned_coordinates": 481698,
+              "output_points": 7571
+            },
+            {
+              "calls": 2,
+              "scanned_coordinates": 481698,
+              "output_points": 7571
+            }
+          ],
+          "median_ms": [
+            3.300122,
+            3.227412
+          ],
+          "p95_ms": [
+            3.656559,
+            3.977945
+          ],
+          "samples_ms": [
+            [
+              3.136714,
+              3.301353,
+              3.466603,
+              3.640486,
+              3.269155,
+              3.289546,
+              3.298029,
+              3.165368,
+              3.103905,
+              3.405611,
+              3.237577,
+              3.719955,
+              3.518301,
+              3.171547,
+              3.124987,
+              3.509147,
+              3.344359,
+              3.402055,
+              3.218338,
+              3.312781,
+              3.301283,
+              3.081982,
+              3.082653,
+              3.67666,
+              3.163415,
+              3.32525,
+              3.300122,
+              3.507665,
+              3.656559,
+              3.198778
+            ],
+            [
+              3.263617,
+              3.345149,
+              3.232951,
+              3.104747,
+              3.165688,
+              3.189685,
+              3.213031,
+              3.167071,
+              3.182914,
+              3.977945,
+              3.86884,
+              3.281413,
+              3.136805,
+              3.076464,
+              3.399401,
+              3.333933,
+              3.226591,
+              3.772003,
+              3.121181,
+              3.227412,
+              3.165739,
+              3.214984,
+              6.412831,
+              4.368183,
+              3.130476,
+              3.366882,
+              3.280642,
+              3.349786,
+              3.310828,
+              3.103375
+            ]
+          ]
+        },
+        {
+          "count": 100000,
+          "style": "structure",
+          "live": false,
+          "input_bytes": 1200000,
+          "calls": [
+            {
+              "calls": 2,
+              "scanned_coordinates": 510000,
+              "output_points": 8750
+            },
+            {
+              "calls": 2,
+              "scanned_coordinates": 510000,
+              "output_points": 8750
+            }
+          ],
+          "median_ms": [
+            3.414685,
+            3.344729
+          ],
+          "p95_ms": [
+            3.629018,
+            3.622348
+          ],
+          "samples_ms": [
+            [
+              3.500414,
+              3.331309,
+              3.761207,
+              3.176605,
+              3.449557,
+              3.226601,
+              3.575882,
+              3.224697,
+              3.414685,
+              3.302856,
+              3.4377,
+              3.362066,
+              3.483438,
+              3.300052,
+              3.520875,
+              3.579403,
+              3.581376,
+              3.195934,
+              3.528396,
+              3.414725,
+              3.43146,
+              3.180732,
+              3.629018,
+              3.311679,
+              3.40493,
+              3.45743,
+              3.742409,
+              3.271308,
+              3.38474,
+              3.360052
+            ],
+            [
+              3.547905,
+              3.409517,
+              3.190737,
+              3.203636,
+              3.341193,
+              3.599454,
+              3.367163,
+              3.207913,
+              3.622348,
+              3.183485,
+              3.353271,
+              3.400082,
+              3.751262,
+              3.209645,
+              3.483479,
+              3.526253,
+              3.384119,
+              3.336166,
+              3.290988,
+              3.347733,
+              3.342896,
+              3.196835,
+              3.425401,
+              3.329166,
+              3.275534,
+              3.190556,
+              3.344729,
+              3.693085,
+              3.269646,
+              3.556028
+            ]
+          ]
+        },
+        {
+          "count": 0,
+          "style": "height",
+          "live": false,
+          "input_bytes": 0,
+          "calls": [
+            {
+              "calls": 0,
+              "scanned_coordinates": 0,
+              "output_points": 0
+            },
+            {
+              "calls": 0,
+              "scanned_coordinates": 0,
+              "output_points": 0
+            }
+          ],
+          "median_ms": [
+            0.000701,
+            0.000681
+          ],
+          "p95_ms": [
+            0.001071,
+            0.000872
+          ],
+          "samples_ms": [
+            [
+              0.001071,
+              0.000761,
+              0.000741,
+              0.000792,
+              0.000831,
+              0.000721,
+              0.000811,
+              0.000691,
+              0.000671,
+              0.000701,
+              0.000661,
+              0.000731,
+              0.000671,
+              0.000681,
+              0.000661,
+              0.000701,
+              0.000671,
+              0.000701,
+              0.000671,
+              0.000711,
+              0.000671,
+              0.002845,
+              0.041673,
+              0.000691,
+              0.000721,
+              0.000821,
+              0.000681,
+              0.000711,
+              0.000651,
+              0.000681
+            ],
+            [
+              0.000961,
+              0.000711,
+              0.000872,
+              0.000721,
+              0.000761,
+              0.000671,
+              0.000711,
+              0.000651,
+              0.000671,
+              0.000651,
+              0.000721,
+              0.000681,
+              0.000681,
+              0.000671,
+              0.000681,
+              0.000681,
+              0.000681,
+              0.000782,
+              0.000661,
+              0.000922,
+              0.000671,
+              0.000671,
+              0.000741,
+              0.000681,
+              0.000671,
+              0.000671,
+              0.000661,
+              0.000671,
+              0.000671,
+              0.000671
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "node": "v24.19.0",
+      "checks": 114,
+      "production_modified": false,
+      "config_source": "Actual pointcloud3d.js default normalized presets/colors",
+      "scope": "Full synchronous _preparePointCloud with new processor per call, excluding worker serialization, viewer admission, GPU, network and browser",
+      "cohorts": [
+        {
+          "count": 4096,
+          "style": "height",
+          "live": false,
+          "input_bytes": 49152,
+          "calls": [
+            {
+              "calls": 2,
+              "scanned_coordinates": 24576,
+              "output_points": 4096
+            },
+            {
+              "calls": 1,
+              "scanned_coordinates": 12288,
+              "output_points": 4096
+            }
+          ],
+          "median_ms": [
+            0.25869,
+            0.246432
+          ],
+          "p95_ms": [
+            0.28516,
+            0.351931
+          ],
+          "samples_ms": [
+            [
+              0.299482,
+              0.25805,
+              0.28516,
+              0.315417,
+              0.272291,
+              0.255145,
+              0.269277,
+              0.25869,
+              0.269166,
+              0.273643,
+              0.268205,
+              0.256557,
+              0.270899,
+              0.25854,
+              0.273933,
+              0.259371,
+              0.268055,
+              0.255966,
+              0.266993,
+              0.270558,
+              0.256777,
+              0.267213,
+              0.255967,
+              0.25795,
+              0.254955,
+              0.255426,
+              0.255195,
+              0.256768,
+              0.255626,
+              0.257459
+            ],
+            [
+              0.288475,
+              0.329778,
+              0.305481,
+              0.287874,
+              0.24542,
+              0.246432,
+              0.24522,
+              0.24526,
+              0.245961,
+              0.24505,
+              0.246202,
+              0.244098,
+              0.244489,
+              0.244169,
+              0.246432,
+              0.2452,
+              0.244799,
+              0.267043,
+              0.24575,
+              0.248014,
+              0.247063,
+              0.243898,
+              0.42359,
+              0.351931,
+              0.264319,
+              0.257358,
+              0.364861,
+              0.295746,
+              0.25864,
+              0.300584
+            ]
+          ]
+        },
+        {
+          "count": 4096,
+          "style": "mono",
+          "live": false,
+          "input_bytes": 49152,
+          "calls": [
+            {
+              "calls": 2,
+              "scanned_coordinates": 24576,
+              "output_points": 4096
+            },
+            {
+              "calls": 1,
+              "scanned_coordinates": 12288,
+              "output_points": 4096
+            }
+          ],
+          "median_ms": [
+            0.136356,
+            0.125039
+          ],
+          "p95_ms": [
+            0.160612,
+            0.141343
+          ],
+          "samples_ms": [
+            [
+              0.160612,
+              0.123356,
+              0.124057,
+              0.123056,
+              0.139241,
+              0.123526,
+              0.123817,
+              0.124088,
+              0.138859,
+              0.123346,
+              0.122234,
+              0.150668,
+              0.135234,
+              0.136145,
+              0.136306,
+              0.155766,
+              0.137218,
+              0.137037,
+              0.155024,
+              0.13905,
+              0.136967,
+              0.136717,
+              0.134713,
+              0.137708,
+              0.136356,
+              0.137488,
+              0.241655,
+              0.271199,
+              0.120973,
+              0.119861
+            ],
+            [
+              0.113762,
+              0.114843,
+              0.133962,
+              0.113111,
+              0.11226,
+              0.115144,
+              0.110867,
+              0.113332,
+              0.114593,
+              0.11312,
+              0.16557,
+              0.154774,
+              0.12639,
+              0.126011,
+              0.126491,
+              0.126041,
+              0.126511,
+              0.12522,
+              0.127512,
+              0.141253,
+              0.126581,
+              0.125039,
+              0.126831,
+              0.141343,
+              0.124838,
+              0.126902,
+              0.113902,
+              0.108033,
+              0.108163,
+              0.110887
+            ]
+          ]
+        },
+        {
+          "count": 100000,
+          "style": "height",
+          "live": false,
+          "input_bytes": 1200000,
+          "calls": [
+            {
+              "calls": 2,
+              "scanned_coordinates": 600000,
+              "output_points": 100000
+            },
+            {
+              "calls": 1,
+              "scanned_coordinates": 300000,
+              "output_points": 100000
+            }
+          ],
+          "median_ms": [
+            6.636769,
+            6.25337
+          ],
+          "p95_ms": [
+            7.146708,
+            6.854938
+          ],
+          "samples_ms": [
+            [
+              7.123042,
+              6.825724,
+              7.146708,
+              6.931724,
+              6.420562,
+              6.391608,
+              6.660114,
+              6.636769,
+              6.340091,
+              6.327031,
+              6.744721,
+              6.329905,
+              6.415695,
+              7.466952,
+              6.461965,
+              6.713694,
+              6.826685,
+              6.706915,
+              6.506952,
+              7.223965,
+              6.732573,
+              6.650559,
+              6.327812,
+              6.584379,
+              6.384738,
+              6.582817,
+              6.77722,
+              6.588646,
+              6.991214,
+              6.35248
+            ],
+            [
+              6.355063,
+              6.25337,
+              6.605721,
+              6.475746,
+              6.158357,
+              6.364568,
+              6.091545,
+              6.063763,
+              6.553323,
+              6.093709,
+              6.854938,
+              6.211577,
+              6.112998,
+              6.145057,
+              6.267111,
+              7.06819,
+              6.414623,
+              6.268042,
+              7.196414,
+              6.238788,
+              6.052827,
+              6.432381,
+              6.645612,
+              6.258137,
+              6.067008,
+              6.105136,
+              6.360141,
+              6.214041,
+              6.083824,
+              6.126769
+            ]
+          ]
+        },
+        {
+          "count": 100000,
+          "style": "mono",
+          "live": false,
+          "input_bytes": 1200000,
+          "calls": [
+            {
+              "calls": 2,
+              "scanned_coordinates": 600000,
+              "output_points": 4167
+            },
+            {
+              "calls": 1,
+              "scanned_coordinates": 300000,
+              "output_points": 4167
+            }
+          ],
+          "median_ms": [
+            0.643221,
+            0.370249
+          ],
+          "p95_ms": [
+            0.703973,
+            0.403519
+          ],
+          "samples_ms": [
+            [
+              0.643371,
+              0.626505,
+              0.703973,
+              0.649,
+              0.641298,
+              0.626446,
+              0.644573,
+              0.661018,
+              0.625304,
+              0.643902,
+              0.624864,
+              0.664343,
+              0.635659,
+              0.643581,
+              0.620737,
+              0.665334,
+              0.726116,
+              0.643221,
+              0.642019,
+              0.646255,
+              0.641829,
+              0.715701,
+              0.670262,
+              0.627647,
+              0.644302,
+              0.628058,
+              0.64254,
+              0.627658,
+              0.647317,
+              0.626987
+            ],
+            [
+              0.368316,
+              0.385492,
+              0.366654,
+              0.403519,
+              0.370249,
+              0.383329,
+              0.368586,
+              0.380905,
+              0.385352,
+              0.365652,
+              0.449128,
+              0.367495,
+              0.386653,
+              0.410519,
+              0.39089,
+              0.366023,
+              0.367515,
+              0.367815,
+              0.366624,
+              0.395197,
+              0.368175,
+              0.366092,
+              0.366774,
+              0.402528,
+              0.368837,
+              0.382166,
+              0.38388,
+              0.387856,
+              0.366023,
+              0.382037
+            ]
+          ]
+        },
+        {
+          "count": 1000000,
+          "style": "height",
+          "live": false,
+          "input_bytes": 12000000,
+          "calls": [
+            {
+              "calls": 2,
+              "scanned_coordinates": 6000000,
+              "output_points": 1000000
+            },
+            {
+              "calls": 1,
+              "scanned_coordinates": 3000000,
+              "output_points": 1000000
+            }
+          ],
+          "median_ms": [
+            67.610432,
+            65.273163
+          ],
+          "p95_ms": [
+            76.007829,
+            72.723531
+          ],
+          "samples_ms": [
+            [
+              64.397853,
+              64.934723,
+              64.714681,
+              68.972698,
+              64.077369,
+              68.547566,
+              70.726906,
+              67.258561,
+              79.249481,
+              68.930194,
+              76.358317,
+              67.65554,
+              71.558351,
+              67.610432,
+              67.919548,
+              69.301435,
+              67.827359,
+              67.18482,
+              65.068205,
+              66.925097,
+              76.007829,
+              66.990596,
+              68.319193,
+              66.716984,
+              65.802152,
+              66.082897,
+              66.103997,
+              66.880501,
+              74.519076,
+              69.476199
+            ],
+            [
+              61.826591,
+              61.081086,
+              62.577314,
+              70.890092,
+              62.049408,
+              60.708973,
+              63.811678,
+              65.273163,
+              75.568887,
+              67.261295,
+              66.245442,
+              66.591453,
+              65.468879,
+              65.043177,
+              67.260645,
+              72.723531,
+              64.174966,
+              63.805408,
+              64.308347,
+              65.626307,
+              65.651885,
+              65.608139,
+              64.209889,
+              63.971068,
+              64.26407,
+              63.529471,
+              79.638098,
+              68.577081,
+              65.552666,
+              67.489589
+            ]
+          ]
+        },
+        {
+          "count": 1000000,
+          "style": "mono",
+          "live": false,
+          "input_bytes": 12000000,
+          "calls": [
+            {
+              "calls": 2,
+              "scanned_coordinates": 6000000,
+              "output_points": 41667
+            },
+            {
+              "calls": 1,
+              "scanned_coordinates": 3000000,
+              "output_points": 41667
+            }
+          ],
+          "median_ms": [
+            6.933666,
+            4.012236
+          ],
+          "p95_ms": [
+            7.502215,
+            4.522748
+          ],
+          "samples_ms": [
+            [
+              6.622256,
+              6.340371,
+              6.762639,
+              6.850911,
+              6.641426,
+              6.713905,
+              6.963582,
+              7.184776,
+              6.952566,
+              6.864312,
+              7.41276,
+              7.088771,
+              6.653834,
+              7.502215,
+              7.177735,
+              6.933666,
+              7.138425,
+              6.788308,
+              7.328472,
+              7.811471,
+              7.395293,
+              7.029642,
+              7.022101,
+              6.888849,
+              6.541706,
+              7.00826,
+              7.826295,
+              6.468805,
+              6.588856,
+              6.530338
+            ],
+            [
+              3.806686,
+              3.652634,
+              3.897954,
+              3.832055,
+              4.281624,
+              4.110314,
+              4.018085,
+              4.383797,
+              3.82254,
+              4.368654,
+              3.890673,
+              4.187471,
+              3.999508,
+              4.13407,
+              4.114331,
+              4.070925,
+              4.535277,
+              3.902241,
+              5.581175,
+              4.012236,
+              4.522748,
+              3.978216,
+              4.488576,
+              3.797612,
+              3.976783,
+              4.396006,
+              4.342636,
+              3.884534,
+              3.734347,
+              3.884534
+            ]
+          ]
+        },
+        {
+          "count": 100000,
+          "style": "singleFloor",
+          "live": false,
+          "input_bytes": 1200000,
+          "calls": [
+            {
+              "calls": 2,
+              "scanned_coordinates": 510000,
+              "output_points": 8750
+            },
+            {
+              "calls": 2,
+              "scanned_coordinates": 510000,
+              "output_points": 8750
+            }
+          ],
+          "median_ms": [
+            3.640165,
+            3.559513
+          ],
+          "p95_ms": [
+            5.791563,
+            5.210475
+          ],
+          "samples_ms": [
+            [
+              3.25943,
+              3.804383,
+              3.677251,
+              3.284098,
+              4.362325,
+              3.61634,
+              3.502848,
+              3.283937,
+              5.790611,
+              3.564811,
+              6.607734,
+              3.561967,
+              5.003894,
+              3.675779,
+              5.791563,
+              8.754175,
+              4.566945,
+              3.859637,
+              3.443168,
+              3.435586,
+              3.258439,
+              3.184477,
+              3.280553,
+              3.790933,
+              3.581917,
+              3.435506,
+              3.745124,
+              4.546193,
+              3.640165,
+              3.922722
+            ],
+            [
+              3.509498,
+              3.487665,
+              3.400703,
+              3.333082,
+              4.275394,
+              3.502757,
+              4.695999,
+              3.303787,
+              3.527274,
+              3.559513,
+              3.923583,
+              3.57674,
+              4.656619,
+              3.708999,
+              4.349316,
+              4.705793,
+              8.915499,
+              5.210475,
+              6.760446,
+              3.708688,
+              4.357888,
+              2.991836,
+              3.129914,
+              4.454735,
+              3.25964,
+              4.714246,
+              3.324308,
+              3.192699,
+              3.159209,
+              3.248684
+            ]
+          ]
+        },
+        {
+          "count": 100000,
+          "style": "ground",
+          "live": false,
+          "input_bytes": 1200000,
+          "calls": [
+            {
+              "calls": 2,
+              "scanned_coordinates": 481698,
+              "output_points": 7571
+            },
+            {
+              "calls": 2,
+              "scanned_coordinates": 481698,
+              "output_points": 7571
+            }
+          ],
+          "median_ms": [
+            3.20624,
+            3.249966
+          ],
+          "p95_ms": [
+            3.806085,
+            3.565673
+          ],
+          "samples_ms": [
+            [
+              3.499232,
+              3.302426,
+              3.175814,
+              3.327813,
+              3.474569,
+              3.619724,
+              3.296056,
+              3.235514,
+              3.353803,
+              3.806085,
+              3.20624,
+              3.121742,
+              3.193451,
+              3.230897,
+              3.103845,
+              3.276766,
+              3.101672,
+              3.197676,
+              3.110325,
+              3.101371,
+              3.399361,
+              3.098988,
+              3.107541,
+              3.176816,
+              3.285038,
+              3.12049,
+              3.121141,
+              3.133991,
+              5.291207,
+              3.862781
+            ],
+            [
+              3.201483,
+              3.244648,
+              3.191348,
+              3.321043,
+              3.565673,
+              3.249966,
+              3.270918,
+              3.339702,
+              3.358099,
+              3.20013,
+              3.386462,
+              3.249355,
+              3.416407,
+              3.135743,
+              3.087241,
+              3.177967,
+              3.313703,
+              3.25921,
+              3.084376,
+              3.130855,
+              3.075372,
+              3.087009,
+              3.197386,
+              3.273981,
+              3.360713,
+              3.269145,
+              3.41829,
+              3.201813,
+              5.50489,
+              4.301012
+            ]
+          ]
+        },
+        {
+          "count": 100000,
+          "style": "structure",
+          "live": false,
+          "input_bytes": 1200000,
+          "calls": [
+            {
+              "calls": 2,
+              "scanned_coordinates": 510000,
+              "output_points": 8750
+            },
+            {
+              "calls": 2,
+              "scanned_coordinates": 510000,
+              "output_points": 8750
+            }
+          ],
+          "median_ms": [
+            3.409857,
+            3.328625
+          ],
+          "p95_ms": [
+            3.975661,
+            3.90843
+          ],
+          "samples_ms": [
+            [
+              3.919477,
+              3.232519,
+              3.409857,
+              3.489628,
+              3.553294,
+              3.317548,
+              3.400653,
+              3.975661,
+              3.639023,
+              3.22593,
+              3.883292,
+              3.243055,
+              4.367743,
+              3.415075,
+              3.527004,
+              3.619714,
+              3.423718,
+              3.230316,
+              3.981751,
+              3.264037,
+              3.426262,
+              3.235785,
+              3.494635,
+              3.276847,
+              3.807767,
+              3.276936,
+              3.40487,
+              3.209435,
+              3.373923,
+              3.282806
+            ],
+            [
+              3.328625,
+              3.361334,
+              3.772936,
+              3.26573,
+              3.386201,
+              3.918705,
+              3.322175,
+              3.225409,
+              3.235304,
+              3.383748,
+              3.41848,
+              3.400613,
+              3.322675,
+              3.32551,
+              3.90843,
+              3.300712,
+              3.222765,
+              3.936242,
+              3.305149,
+              3.762459,
+              3.229124,
+              3.300572,
+              3.624141,
+              3.227752,
+              3.593023,
+              3.317368,
+              3.793506,
+              3.317528,
+              3.349697,
+              3.865686
+            ]
+          ]
+        },
+        {
+          "count": 0,
+          "style": "height",
+          "live": false,
+          "input_bytes": 0,
+          "calls": [
+            {
+              "calls": 0,
+              "scanned_coordinates": 0,
+              "output_points": 0
+            },
+            {
+              "calls": 0,
+              "scanned_coordinates": 0,
+              "output_points": 0
+            }
+          ],
+          "median_ms": [
+            0.000671,
+            0.000661
+          ],
+          "p95_ms": [
+            0.000752,
+            0.000711
+          ],
+          "samples_ms": [
+            [
+              0.000811,
+              0.000752,
+              0.000721,
+              0.000701,
+              0.000641,
+              0.000651,
+              0.000661,
+              0.000661,
+              0.000641,
+              0.000651,
+              0.000631,
+              0.000671,
+              0.000641,
+              0.000691,
+              0.00065,
+              0.000691,
+              0.000631,
+              0.000671,
+              0.000701,
+              0.000681,
+              0.000701,
+              0.000761,
+              0.000671,
+              0.000691,
+              0.000661,
+              0.000691,
+              0.000661,
+              0.000711,
+              0.000651,
+              0.000661
+            ],
+            [
+              0.000711,
+              0.000741,
+              0.000681,
+              0.000691,
+              0.000661,
+              0.000641,
+              0.000661,
+              0.000661,
+              0.000671,
+              0.000661,
+              0.000691,
+              0.000651,
+              0.000682,
+              0.000661,
+              0.000671,
+              0.000661,
+              0.000681,
+              0.000641,
+              0.000671,
+              0.000671,
+              0.000881,
+              0.000711,
+              0.000691,
+              0.000651,
+              0.000671,
+              0.000651,
+              0.000661,
+              0.000651,
+              0.000661,
+              0.000641
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "node": "v24.19.0",
+      "checks": 114,
+      "production_modified": false,
+      "config_source": "Actual pointcloud3d.js default normalized presets/colors",
+      "scope": "Full synchronous _preparePointCloud with new processor per call, excluding worker serialization, viewer admission, GPU, network and browser",
+      "cohorts": [
+        {
+          "count": 4096,
+          "style": "height",
+          "live": false,
+          "input_bytes": 49152,
+          "calls": [
+            {
+              "calls": 2,
+              "scanned_coordinates": 24576,
+              "output_points": 4096
+            },
+            {
+              "calls": 1,
+              "scanned_coordinates": 12288,
+              "output_points": 4096
+            }
+          ],
+          "median_ms": [
+            0.261145,
+            0.251679
+          ],
+          "p95_ms": [
+            0.303899,
+            0.364941
+          ],
+          "samples_ms": [
+            [
+              0.295637,
+              0.260974,
+              0.262146,
+              0.257639,
+              0.253963,
+              0.254905,
+              0.254504,
+              0.255696,
+              0.281525,
+              0.254845,
+              0.253793,
+              0.255135,
+              0.254183,
+              0.349518,
+              0.261115,
+              0.303899,
+              0.29812,
+              0.26494,
+              0.279382,
+              0.361336,
+              0.262015,
+              0.274945,
+              0.261145,
+              0.266813,
+              0.259742,
+              0.263768,
+              0.262126,
+              0.25842,
+              0.25847,
+              0.278411
+            ],
+            [
+              0.381235,
+              0.364941,
+              0.247694,
+              0.267684,
+              0.256287,
+              0.260633,
+              0.245661,
+              0.255817,
+              0.257739,
+              0.245321,
+              0.260333,
+              0.244058,
+              0.259371,
+              0.244749,
+              0.294685,
+              0.341856,
+              0.250428,
+              0.251029,
+              0.25163,
+              0.250018,
+              0.251679,
+              0.250459,
+              0.249877,
+              0.66275,
+              0.279412,
+              0.246191,
+              0.269106,
+              0.246422,
+              0.263567,
+              0.247264
+            ]
+          ]
+        },
+        {
+          "count": 4096,
+          "style": "mono",
+          "live": false,
+          "input_bytes": 49152,
+          "calls": [
+            {
+              "calls": 2,
+              "scanned_coordinates": 24576,
+              "output_points": 4096
+            },
+            {
+              "calls": 1,
+              "scanned_coordinates": 12288,
+              "output_points": 4096
+            }
+          ],
+          "median_ms": [
+            0.137798,
+            0.126721
+          ],
+          "p95_ms": [
+            0.386373,
+            0.320984
+          ],
+          "samples_ms": [
+            [
+              0.462638,
+              0.364079,
+              0.37093,
+              0.357219,
+              0.386373,
+              0.150467,
+              0.140412,
+              0.174764,
+              0.138008,
+              0.13864,
+              0.136166,
+              0.137868,
+              0.135154,
+              0.183267,
+              0.142095,
+              0.137798,
+              0.135043,
+              0.15215,
+              0.417189,
+              0.11932,
+              0.117458,
+              0.136106,
+              0.118869,
+              0.118789,
+              0.119501,
+              0.132911,
+              0.118338,
+              0.117607,
+              0.11976,
+              0.11941
+            ],
+            [
+              0.31799,
+              0.287724,
+              0.320984,
+              0.339653,
+              0.351481,
+              0.157397,
+              0.128093,
+              0.12556,
+              0.141814,
+              0.129045,
+              0.126721,
+              0.140432,
+              0.126812,
+              0.12593,
+              0.157328,
+              0.128454,
+              0.126802,
+              0.12587,
+              0.102856,
+              0.10619,
+              0.106401,
+              0.107533,
+              0.109706,
+              0.109886,
+              0.106912,
+              0.10653,
+              0.106261,
+              0.111027,
+              0.129966,
+              0.109355
+            ]
+          ]
+        },
+        {
+          "count": 100000,
+          "style": "height",
+          "live": false,
+          "input_bytes": 1200000,
+          "calls": [
+            {
+              "calls": 2,
+              "scanned_coordinates": 600000,
+              "output_points": 100000
+            },
+            {
+              "calls": 1,
+              "scanned_coordinates": 300000,
+              "output_points": 100000
+            }
+          ],
+          "median_ms": [
+            6.490361,
+            6.11905
+          ],
+          "p95_ms": [
+            8.865324,
+            6.344241
+          ],
+          "samples_ms": [
+            [
+              6.37232,
+              8.865324,
+              6.814381,
+              6.490361,
+              11.568379,
+              7.522269,
+              6.731986,
+              6.592425,
+              8.58894,
+              9.791225,
+              6.796173,
+              6.404702,
+              6.342238,
+              6.536541,
+              6.415798,
+              6.332022,
+              6.352903,
+              6.620819,
+              6.343469,
+              6.862894,
+              6.383369,
+              6.318351,
+              6.362017,
+              6.839188,
+              6.380094,
+              6.465324,
+              6.43651,
+              6.75402,
+              6.42982,
+              6.670734
+            ],
+            [
+              6.083643,
+              6.387702,
+              6.101905,
+              6.212341,
+              6.21755,
+              6.344241,
+              6.089576,
+              6.116947,
+              6.303679,
+              6.14545,
+              7.621159,
+              6.117768,
+              6.092591,
+              6.102686,
+              6.199362,
+              6.108835,
+              6.102836,
+              6.076857,
+              6.11905,
+              6.094664,
+              6.265051,
+              6.133713,
+              6.094443,
+              6.302227,
+              6.116036,
+              6.333915,
+              6.075615,
+              6.12509,
+              6.133292,
+              6.301946
+            ]
+          ]
+        },
+        {
+          "count": 100000,
+          "style": "mono",
+          "live": false,
+          "input_bytes": 1200000,
+          "calls": [
+            {
+              "calls": 2,
+              "scanned_coordinates": 600000,
+              "output_points": 4167
+            },
+            {
+              "calls": 1,
+              "scanned_coordinates": 300000,
+              "output_points": 4167
+            }
+          ],
+          "median_ms": [
+            0.642891,
+            0.383148
+          ],
+          "p95_ms": [
+            0.675901,
+            0.47669
+          ],
+          "samples_ms": [
+            [
+              0.647558,
+              0.663122,
+              0.644333,
+              0.629721,
+              0.641639,
+              0.648479,
+              0.642891,
+              0.646316,
+              0.626586,
+              0.747419,
+              0.628679,
+              0.672436,
+              0.766968,
+              0.626116,
+              0.643072,
+              0.627318,
+              0.644914,
+              0.662871,
+              0.662291,
+              0.628269,
+              0.639226,
+              0.625705,
+              0.628539,
+              0.639586,
+              0.626587,
+              0.64266,
+              0.626436,
+              0.675901,
+              0.668599,
+              0.644463
+            ],
+            [
+              0.378923,
+              0.388026,
+              0.367525,
+              0.388787,
+              0.368977,
+              0.381326,
+              0.603942,
+              0.373264,
+              0.386724,
+              0.366984,
+              0.47669,
+              0.373634,
+              0.369348,
+              0.510701,
+              0.368096,
+              0.383509,
+              0.385953,
+              0.388396,
+              0.36419,
+              0.383148,
+              0.419213,
+              0.427286,
+              0.38426,
+              0.368336,
+              0.40431,
+              0.367004,
+              0.380615,
+              0.409408,
+              0.405853,
+              0.366713
+            ]
+          ]
+        },
+        {
+          "count": 1000000,
+          "style": "height",
+          "live": false,
+          "input_bytes": 12000000,
+          "calls": [
+            {
+              "calls": 2,
+              "scanned_coordinates": 6000000,
+              "output_points": 1000000
+            },
+            {
+              "calls": 1,
+              "scanned_coordinates": 3000000,
+              "output_points": 1000000
+            }
+          ],
+          "median_ms": [
+            65.635396,
+            63.150545
+          ],
+          "p95_ms": [
+            71.53284,
+            70.402142
+          ],
+          "samples_ms": [
+            [
+              67.137936,
+              66.849931,
+              65.635396,
+              72.252489,
+              64.716779,
+              65.753165,
+              65.258688,
+              65.309014,
+              67.66394,
+              64.576969,
+              64.960127,
+              63.45259,
+              64.967578,
+              65.300852,
+              65.371137,
+              68.745866,
+              65.460003,
+              64.105468,
+              64.660276,
+              64.566774,
+              64.500074,
+              69.49294,
+              69.196337,
+              67.615657,
+              66.345189,
+              71.53284,
+              68.802689,
+              70.818201,
+              71.199026,
+              78.955335
+            ],
+            [
+              64.369745,
+              71.455816,
+              64.586983,
+              71.356916,
+              62.913396,
+              62.84321,
+              62.518399,
+              62.454694,
+              63.337266,
+              63.150545,
+              63.578121,
+              62.910867,
+              62.945575,
+              61.742137,
+              63.613133,
+              66.454113,
+              61.999109,
+              60.656462,
+              61.594077,
+              62.878966,
+              62.075864,
+              61.511824,
+              66.245124,
+              65.135933,
+              62.229687,
+              64.375125,
+              66.945705,
+              70.402142,
+              69.39979,
+              68.645576
+            ]
+          ]
+        },
+        {
+          "count": 1000000,
+          "style": "mono",
+          "live": false,
+          "input_bytes": 12000000,
+          "calls": [
+            {
+              "calls": 2,
+              "scanned_coordinates": 6000000,
+              "output_points": 41667
+            },
+            {
+              "calls": 1,
+              "scanned_coordinates": 3000000,
+              "output_points": 41667
+            }
+          ],
+          "median_ms": [
+            6.556628,
+            3.72992
+          ],
+          "p95_ms": [
+            6.994207,
+            4.236395
+          ],
+          "samples_ms": [
+            [
+              6.488655,
+              6.742838,
+              6.493993,
+              9.206848,
+              6.542786,
+              6.543938,
+              6.994207,
+              6.481353,
+              6.700685,
+              6.394613,
+              6.382014,
+              6.692723,
+              6.724771,
+              6.457858,
+              6.321122,
+              6.509977,
+              6.430948,
+              6.861828,
+              6.770841,
+              6.556628,
+              6.957612,
+              11.424335,
+              6.61834,
+              6.940537,
+              6.812493,
+              6.47268,
+              6.345629,
+              6.712943,
+              6.981549,
+              6.513802
+            ],
+            [
+              3.725193,
+              4.115823,
+              4.264057,
+              3.9484,
+              3.737602,
+              3.623299,
+              3.745704,
+              3.669439,
+              3.604631,
+              3.64329,
+              3.715398,
+              3.782609,
+              3.697101,
+              3.721498,
+              3.705964,
+              3.614056,
+              3.920468,
+              3.739114,
+              3.856612,
+              3.696329,
+              3.813707,
+              5.095983,
+              3.775359,
+              3.72992,
+              3.666064,
+              3.661097,
+              3.954329,
+              3.625603,
+              4.236395,
+              4.083444
+            ]
+          ]
+        },
+        {
+          "count": 100000,
+          "style": "singleFloor",
+          "live": false,
+          "input_bytes": 1200000,
+          "calls": [
+            {
+              "calls": 2,
+              "scanned_coordinates": 510000,
+              "output_points": 8750
+            },
+            {
+              "calls": 2,
+              "scanned_coordinates": 510000,
+              "output_points": 8750
+            }
+          ],
+          "median_ms": [
+            3.422056,
+            3.492712
+          ],
+          "p95_ms": [
+            4.094361,
+            4.164547
+          ],
+          "samples_ms": [
+            [
+              3.184647,
+              3.422056,
+              3.61672,
+              3.495481,
+              3.842801,
+              3.350848,
+              3.257577,
+              3.176695,
+              3.692885,
+              3.21943,
+              3.229986,
+              3.554846,
+              3.886928,
+              3.812124,
+              3.66328,
+              3.421655,
+              3.357919,
+              3.309716,
+              3.45783,
+              3.679815,
+              3.701938,
+              5.505901,
+              4.094361,
+              3.198929,
+              3.258609,
+              3.269596,
+              3.144837,
+              3.449186,
+              3.177266,
+              4.202453
+            ],
+            [
+              3.215274,
+              3.492712,
+              3.226832,
+              3.256025,
+              3.595567,
+              3.411169,
+              3.420052,
+              3.335845,
+              3.354313,
+              3.278599,
+              3.535096,
+              3.328304,
+              3.586745,
+              3.44495,
+              3.846296,
+              3.477459,
+              4.158587,
+              3.322876,
+              4.070033,
+              3.751624,
+              3.426643,
+              3.593845,
+              5.924933,
+              3.973698,
+              4.164547,
+              3.911776,
+              3.561376,
+              3.619614,
+              4.359981,
+              3.06059
+            ]
+          ]
+        },
+        {
+          "count": 100000,
+          "style": "ground",
+          "live": false,
+          "input_bytes": 1200000,
+          "calls": [
+            {
+              "calls": 2,
+              "scanned_coordinates": 481698,
+              "output_points": 7571
+            },
+            {
+              "calls": 2,
+              "scanned_coordinates": 481698,
+              "output_points": 7571
+            }
+          ],
+          "median_ms": [
+            3.366782,
+            3.245339
+          ],
+          "p95_ms": [
+            4.300181,
+            4.425881
+          ],
+          "samples_ms": [
+            [
+              3.489478,
+              3.248844,
+              3.216645,
+              3.37188,
+              3.261473,
+              3.149183,
+              3.160221,
+              3.38525,
+              3.861579,
+              3.287302,
+              3.11378,
+              3.230176,
+              3.109063,
+              3.410949,
+              3.213862,
+              3.251148,
+              3.380042,
+              3.249486,
+              3.264789,
+              3.116695,
+              3.366782,
+              6.627844,
+              4.867288,
+              4.300181,
+              4.031766,
+              4.155283,
+              3.948711,
+              3.400223,
+              3.611392,
+              3.936161
+            ],
+            [
+              3.298649,
+              3.447475,
+              3.120551,
+              3.336326,
+              3.430368,
+              3.19906,
+              3.12014,
+              3.280082,
+              3.301864,
+              3.770031,
+              3.075733,
+              3.074801,
+              3.08685,
+              3.174892,
+              3.083034,
+              3.245339,
+              3.131436,
+              3.222153,
+              3.170325,
+              3.099319,
+              4.163284,
+              4.954338,
+              5.673164,
+              4.425881,
+              3.600325,
+              3.737442,
+              3.968972,
+              3.246641,
+              2.920148,
+              3.217367
+            ]
+          ]
+        },
+        {
+          "count": 100000,
+          "style": "structure",
+          "live": false,
+          "input_bytes": 1200000,
+          "calls": [
+            {
+              "calls": 2,
+              "scanned_coordinates": 510000,
+              "output_points": 8750
+            },
+            {
+              "calls": 2,
+              "scanned_coordinates": 510000,
+              "output_points": 8750
+            }
+          ],
+          "median_ms": [
+            3.53753,
+            3.391179
+          ],
+          "p95_ms": [
+            4.08101,
+            3.810252
+          ],
+          "samples_ms": [
+            [
+              3.71649,
+              3.613254,
+              3.477609,
+              3.67665,
+              3.414744,
+              3.409186,
+              3.598703,
+              3.542017,
+              3.496308,
+              3.522858,
+              3.417639,
+              3.395816,
+              3.53753,
+              3.51808,
+              3.514945,
+              3.72962,
+              3.746145,
+              3.602448,
+              3.481455,
+              3.410408,
+              3.887579,
+              3.56351,
+              3.612112,
+              3.572032,
+              3.514314,
+              3.498281,
+              3.423628,
+              4.42871,
+              4.112277,
+              4.08101
+            ],
+            [
+              3.810252,
+              3.337038,
+              3.487064,
+              3.334353,
+              3.666124,
+              3.212689,
+              3.515286,
+              3.483458,
+              3.433022,
+              3.317127,
+              3.493674,
+              3.209735,
+              3.368224,
+              3.383147,
+              3.391179,
+              3.203066,
+              3.47719,
+              3.600565,
+              3.894098,
+              3.229445,
+              3.523308,
+              3.327863,
+              3.480184,
+              3.213351,
+              3.529779,
+              3.203977,
+              3.389026,
+              3.317117,
+              4.016152,
+              3.615647
+            ]
+          ]
+        },
+        {
+          "count": 0,
+          "style": "height",
+          "live": false,
+          "input_bytes": 0,
+          "calls": [
+            {
+              "calls": 0,
+              "scanned_coordinates": 0,
+              "output_points": 0
+            },
+            {
+              "calls": 0,
+              "scanned_coordinates": 0,
+              "output_points": 0
+            }
+          ],
+          "median_ms": [
+            0.000671,
+            0.000681
+          ],
+          "p95_ms": [
+            0.000731,
+            0.000911
+          ],
+          "samples_ms": [
+            [
+              0.000841,
+              0.000811,
+              0.000701,
+              0.000671,
+              0.000671,
+              0.000671,
+              0.000692,
+              0.000661,
+              0.000651,
+              0.000731,
+              0.000641,
+              0.000631,
+              0.000651,
+              0.000671,
+              0.000641,
+              0.000651,
+              0.000651,
+              0.000671,
+              0.000631,
+              0.000651,
+              0.000671,
+              0.000691,
+              0.000671,
+              0.000721,
+              0.000651,
+              0.000661,
+              0.000691,
+              0.000651,
+              0.000661,
+              0.000691
+            ],
+            [
+              0.000751,
+              0.000691,
+              0.000701,
+              0.000631,
+              0.000681,
+              0.000661,
+              0.000701,
+              0.000651,
+              0.000701,
+              0.000891,
+              0.000691,
+              0.000681,
+              0.000791,
+              0.000651,
+              0.000661,
+              0.000651,
+              0.000741,
+              0.000641,
+              0.000832,
+              0.000671,
+              0.000911,
+              0.002243,
+              0.043716,
+              0.000871,
+              0.000691,
+              0.000681,
+              0.000671,
+              0.000681,
+              0.000661,
+              0.000671
+            ]
+          ]
+        }
+      ]
+    }
+  ]
+}

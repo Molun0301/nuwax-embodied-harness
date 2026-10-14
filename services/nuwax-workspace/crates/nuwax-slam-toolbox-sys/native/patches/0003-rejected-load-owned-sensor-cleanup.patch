@@ -1,0 +1,36 @@
+--- a/upstream/karto/include/karto_sdk/Karto.h
++++ b/upstream/karto/include/karto_sdk/Karto.h
+@@ -3720,6 +3720,16 @@
+     } else {
+       throw Exception(
+               "Cannot unregister sensor: not registered: [" + pSensor->GetName().ToString() + "]");
++    }
++  }
++
++  // 归档可能在完成注册前被拒绝；清理只撤销同一对象拥有的注册项。
++  void UnregisterSensorIfOwned(Sensor * pSensor) noexcept
++  {
++    if (!pSensor) { return; }
++    auto entry = m_Sensors.find(pSensor->GetName());
++    if (entry != m_Sensors.end() && entry->second == pSensor) {
++      m_Sensors.erase(entry);
+     }
+   }
+ 
+@@ -6545,7 +6555,7 @@
+     for (std::map<Name, Sensor *>::iterator iter = m_SensorNameLookup.begin();
+       iter != m_SensorNameLookup.end(); ++iter)
+     {
+-      karto::SensorManager::GetInstance()->UnregisterSensor(iter->second);
++      karto::SensorManager::GetInstance()->UnregisterSensorIfOwned(iter->second);
+     }
+ 
+     forEach(ObjectVector, &m_Lasers)
+@@ -6563,6 +6573,7 @@
+       }
+     }
+ 
++    m_SensorNameLookup.clear();
+     m_Lasers.clear();
+     m_Data.clear();
+ 

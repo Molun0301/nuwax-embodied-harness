@@ -1,0 +1,15 @@
+# Generated / vendored artifact whitespace policy
+# ----------------------------------------------------------------------------
+# Phase 6 (codex-round3 R3-3)：services/geometry/proto_gen/* 是 protoc 生成的
+# Python stub，protoc-gen-python 会在 ValidateProtobufRuntimeVersion(...) 调用的
+# 第二个参数（sdk_version 行）输出一个仅包含空格的空行（geometry_runtime_pb2.py:14），
+# 这是 protoc 工具链的固定行为，无法通过改 .proto 源消除。`git diff --check`
+# 会把它报成 trailing whitespace 警告。
+#
+# 业务代码（手写的 .py / .sh / .rs）继续走默认 diff.check=trailing-space 检测。
+# ----------------------------------------------------------------------------
+services/geometry/proto_gen/** whitespace=fix,-trailing-space,-indent-with-non-tab,-tab-in-indent,-cr-at-eol
+
+# lcm-gen 1.5.2 emits one intentional blank line after generated C sources.
+# Keep byte-for-byte regeneration checks while retaining other whitespace rules.
+services/nuwax-workspace/lcmtypes/generated/c/*.c whitespace=-blank-at-eof

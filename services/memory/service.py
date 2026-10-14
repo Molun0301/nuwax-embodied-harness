@@ -1,23 +1,34 @@
 from __future__ import annotations
 
+from core.config_values import runtime_value
+from core.source_time import SourceTimeError, source_age_ns, acquired_unix_ns
+
 from collections import deque
-import hashlib
+from contextlib import contextmanager
+import uuid
 import json
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 import logging
-import queue
+import math
+import heapq
+import inspect
+import os
 import re
 import threading
+import time
+from types import SimpleNamespace
 from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple, Union
 
 import numpy as np
 
 from contracts.base import utc_now
+from services.memory.object_extent import object_extent_payload
 from contracts.events import RuntimeEventCategory
 from contracts.geometry import Pose, Quaternion, Vector3
-from contracts.maps import SemanticMap, SemanticRegion
+from contracts.geometry_runtime import DEFAULT_MAP_FRAME
+from contracts.maps import SemanticMap
 from contracts.memory import (
     GoalCandidateScoreBreakdown,
     GoalConstraint,
@@ -37,11 +48,12 @@ from contracts.memory import (
 from contracts.navigation import NavigationGoal
 from contracts.naming import build_location_id, build_memory_id, build_observation_event_id, build_scene_space_id
 from contracts.perception import Detection2D
-from contracts.runtime_views import LocalizationSnapshot, NavigationSemanticContext, TopologyNodeSummary
+from contracts.runtime_views import LocalizationSnapshot, MapSnapshot, NavigationSemanticContext, TopologyNodeSummary, PerceptionContext
 from contracts.spatial_memory import (
     GroundingQueryPlan,
     InstanceDynamicState,
     InstanceLifecycleState,
+    InstanceMovability,
     NavigationCandidate,
     NavigationTrajectoryEvent,
     NavigationTrajectoryEventKind,
@@ -57,17 +69,20 @@ from contracts.spatial_memory import (
     SemanticSummaryNode,
     SpatialAnchor,
     SpatialAnchorKind,
-    VerificationResult,
 )
 from core import EventBus, StateNamespace, StateStore
-from gateways.artifacts import LocalArtifactStore
-from gateways.errors import GatewayError
+from services.artifact_store import LocalArtifactStore
+from core.errors import GatewayError
 from services.localization import LocalizationService
 from services.mapping.service import MappingService
 from services.memory.grounding_query_planner import GroundingQueryPlanner
 from services.memory.instance_association_service import AssociationOutcome, InstanceAssociationService
+from services.memory.instance_stream import SemanticInstancePublisher
+from services.memory.scene_mapping_state import MANAGED_KEY, SceneMappingMemoryMixin
 from services.memory.inspection_pose_planner import InspectionPosePlanner
 from services.memory.repository import MemoryRepository
+from services.memory.artifact_references import MemoryArtifactReferences
+from services.memory.durable_index import DurableMemoryIndex, SOURCES, TOKEN, MemoryPayloadMatcher
 from services.memory.scene_space_sampler import SceneSpaceSampler
 from services.memory.scene_space_understanding import SceneSpaceUnderstandingAdapter
 from services.memory.semantic_map_builder import SemanticMapBuildResult, SemanticMapBuilder
@@ -80,7 +95,6 @@ from services.memory.vector_store import (
     NamedVector,
     SQLiteNamedVectorStore,
     VectorPoint,
-    VectorSearchHit,
 )
 from services.model_providers import (
     resolve_grounding_provider_spec,
@@ -88,15 +102,19 @@ from services.model_providers import (
     resolve_vision_language_provider_spec,
 )
 from services.memory.vectorizer import (
-    HashingTextEmbedder,
     TextEmbedder,
     VisionLanguageEmbedder,
     build_text_embedder,
     build_vision_language_embedder,
 )
-from services.memory.vision_to_map_projection_service import ProjectedObservation, VisionToMapProjectionService
+from services.memory.vision_to_map_projection_service import (
+    InstanceCacheRayHistoryProvider,
+    ProjectedObservation,
+    VisionToMapProjectionService,
+)
 from services.observation_service import ObservationService
 from services.perception import PerceptionService
+from services.perception.deferred_pointcloud_projection import project_cone
 
 LOGGER = logging.getLogger(__name__)
 
@@ -144,12 +162,22 @@ class _MemoryLibraryStats:
     last_updated_at: Optional[datetime] = None
 
 
-class MemoryService:
+@dataclass(frozen=True)
+class _RecallRank:
+    key: Tuple[str, str]
+    final_score: float
+    dedup_key: Tuple[object, ...]
+    instance_id: Optional[str] = None
+    linked_instance_ids: Tuple[str, ...] = ()
+    source_version: object = None
+
+
+class MemoryService(SceneMappingMemoryMixin):
     """统一地点记忆、语义记忆与多模态向量检索服务。"""
 
     _SEGMENTATION_LOW_SIGNAL_THRESHOLD = 0.25
     _SEGMENTATION_REPROJECTION_ERROR_GATE = 2.0
-    _NAVIGATION_QUALITY_SCHEMA_VERSION = "4.4-v1"
+    _NAVIGATION_QUALITY_SCHEMA_VERSION = "4.4-v2"
     _NAVIGATION_DIRECT_CANDIDATE_SCORE_MIN = 0.55
     _NAVIGATION_CONTINUE_EXPLORATION_SCORE_MAX_EXCLUSIVE = 0.35
     _NAVIGATION_PROJECTION_CONFIDENCE_HARD_MIN = 0.20
@@ -181,6 +209,10 @@ class MemoryService:
         vision_language_embedder: Optional[VisionLanguageEmbedder] = None,
         vector_store: Optional[SQLiteNamedVectorStore] = None,
         evaluation_service: Optional[Any] = None,
+        deferred_projection_config: Optional[Any] = None,
+        accumulated_cloud_provider: Optional[Any] = None,
+        live_pose_provider: Optional[Any] = None,
+        stream_bus=None,
     ) -> None:
         self._localization_service = localization_service
         self._mapping_service = mapping_service
@@ -189,8 +221,30 @@ class MemoryService:
         self._state_store = state_store
         self._event_bus = event_bus
         self._artifact_store = artifact_store
-        self._repository = MemoryRepository(memory_db_path)
-        self._vector_store = vector_store or SQLiteNamedVectorStore(memory_db_path)
+        memory_db_path = str(memory_db_path).strip() or ":memory:"
+        injected_storage = getattr(vector_store, "storage", None)
+        injected_path = getattr(vector_store, "db_path", None)
+        same_database = (injected_storage is not None and (
+            (memory_db_path == ":memory:" and injected_path == ":memory:") or
+            (memory_db_path != ":memory:" and injected_path != ":memory:" and injected_path is not None
+             and os.path.realpath(memory_db_path) == os.path.realpath(injected_path))))
+        if not same_database and injected_storage is not None and memory_db_path != ":memory:" and injected_path not in (None, ":memory:"):
+            try:
+                same_database = os.path.samefile(memory_db_path, injected_path)
+            except OSError:
+                pass
+        self._repository = MemoryRepository(memory_db_path, storage=injected_storage if same_database else None)
+        self._vector_store = vector_store if vector_store is not None else SQLiteNamedVectorStore(storage=self._repository.storage, preserve_legacy=True)
+        self._owns_vector_store = vector_store is None
+        self._closed = False
+        # Independent owners belong to served slots/history entries, never to
+        # model fields (model_copy must not duplicate an ownership handle).
+        self._artifact_cache_holds = {}
+        self._artifact_history_holds = {}
+        self._artifact_history_holder_count = 0
+        self._artifact_lifetime_lock = threading.RLock()
+        self._artifact_operations = {}
+        self._artifact_references = None
         self._embedding_api_key = str(embedding_api_key or "").strip()
         self._embedding_base_url = str(embedding_base_url or "").strip() or "https://dashscope.aliyuncs.com/api/v1"
         self._embedding_timeout_sec = max(1.0, float(embedding_timeout_sec))
@@ -211,7 +265,12 @@ class MemoryService:
         self._image_embedding_provider_metadata = resolve_vision_language_provider_spec(
             vision_language_embedder.model_name if vision_language_embedder is not None else self._configured_image_model
         ).to_metadata()
-        self._text_embedder_ready = text_embedder is not None
+        # First use is single-flight per feature; these locks never wrap inference
+        # or the shared instance/association transaction.
+        self._text_embedder_init_lock = threading.Lock()
+        self._image_embedder_init_lock = threading.Lock()
+        self._text_embedder_ready = (text_embedder is not None or
+                                     resolve_text_embedding_provider_spec(self._configured_text_model).provider_kind == "disabled")
         self._image_embedder_ready = (
             vision_language_embedder is not None or self._configured_image_model.lower() == "disabled"
         )
@@ -223,7 +282,24 @@ class MemoryService:
         )
         self._scene_space_sampler = SceneSpaceSampler()
         self._scene_space_understanding_adapter = SceneSpaceUnderstandingAdapter()
-        self._vision_projection_service = VisionToMapProjectionService()
+        self._deferred_projection_config = deferred_projection_config
+        self._accumulated_cloud_provider = accumulated_cloud_provider
+        # 05-P0-1：探索期实时位姿门面（鸭子类型，与 PerceptionService._read_live_pose 同源）。
+        # 网关已在 gateways/runtime.py:464 构造 MemoryService 时同源注入；未注入时默认 None 向后兼容。
+        self._live_pose_provider = live_pose_provider
+        _triangulation_enabled = bool(
+            getattr(deferred_projection_config, "triangulation_enabled", False)
+        )
+        self._vision_projection_service = VisionToMapProjectionService(
+            triangulation_enabled=_triangulation_enabled,
+            triangulation_min_rays=int(getattr(deferred_projection_config, "triangulation_min_rays", 2)),
+            triangulation_min_parallax_deg=float(
+                getattr(deferred_projection_config, "triangulation_min_parallax_deg", 5.0)
+            ),
+            triangulation_max_residual_m=float(
+                getattr(deferred_projection_config, "triangulation_max_residual_m", 0.5)
+            ),
+        )
         self._instance_association_service = InstanceAssociationService(
             text_embedder=self._text_embedder,
             inspection_pose_planner=self._inspection_pose_planner,
@@ -236,17 +312,26 @@ class MemoryService:
         self._semantic_instances_by_id: Dict[str, SemanticInstance] = {}
         self._observation_events_by_id: Dict[str, ObservationEvent] = {}
         self._scene_spaces_by_id: Dict[str, SceneSpace] = {}
+        self._scene_graph_live_generation = 0
+        self._scene_graph_geometry_visibility_generation = 0
+        self._scene_identity_diagnostics = {"map": [], "samples": []}
+        self._semantic_map_identity_plan = None
+        self._semantic_map_identity_publication = None
+        self._semantic_map_request = 0
+        self._semantic_map_published_request = -1
         self._navigation_trajectory_events_by_id: Dict[str, NavigationTrajectoryEvent] = {}
         self._semantic_graph_relations_by_id: Dict[str, SemanticGraphRelation] = {}
         self._semantic_summary_nodes_by_id: Dict[str, SemanticSummaryNode] = {}
         self._latest_semantic_map_context = SemanticMapBuildResult(
-            map_version_id=None,
-            frame_id="map",
+            map_name=None,
+            frame_id=DEFAULT_MAP_FRAME,
             semantic_regions=(),
             anchors_by_id={},
             topology_nodes_by_id={},
         )
-        self._latest_semantic_map_context_localization_session_id: Optional[str] = None
+        self._latest_semantic_map_context_identity: Optional[
+            Tuple[Optional[str], Optional[str], str, str, str, int]
+        ] = None
         self._tagged_location_history: Deque[TaggedLocation] = deque(maxlen=max(1, history_limit))
         self._semantic_history: Deque[SemanticMemoryEntry] = deque(maxlen=max(1, history_limit))
         self._semantic_instance_history: Deque[SemanticInstance] = deque(maxlen=max(1, history_limit))
@@ -256,15 +341,282 @@ class MemoryService:
         self._semantic_graph_relation_history: Deque[SemanticGraphRelation] = deque(maxlen=max(1, history_limit))
         self._semantic_summary_history: Deque[SemanticSummaryNode] = deque(maxlen=max(1, history_limit))
 
-        # 后台向量化队列：先写 SQLite 记录，worker 线程异步补充向量
-        self._vectorization_queue: queue.Queue = queue.Queue(maxsize=2000)
+        # Durable SQL is the backlog. Events carry wake hints only.
         self._vectorization_worker: Optional[threading.Thread] = None
         self._vectorization_stop_event = threading.Event()
-        # 队列满时的溢出缓冲区：worker 空闲时自动补充执行
-        self._pending_vectorization: deque = deque(maxlen=2000)
-        self._pending_lock = threading.Lock()
+        self._vectorization_worker_lock = threading.Lock()
+        self._vectorization_worker_token = None
         # ObservationEvent TTL 清理计数器：每 100 次写入触发一次过期清理
         self._observation_event_write_count: int = 0
+
+        # 延迟点云重投影精化 worker：低频扫描 pending 实例，用累积点云锥内取点精化坐标。
+        self._deferred_refine_worker: Optional[threading.Thread] = None
+        self._deferred_refine_stop_event = threading.Event()
+        self._instances_lock = threading.RLock()
+        self._association_compute_lock = threading.RLock()
+        # Distinct text/image handles have independent inference owners. Passing
+        # the same handle deliberately shares the text owner for both modalities.
+        self._image_inference_lock = threading.RLock()
+        self._index_binding_lock = threading.Lock()
+        self._index_binding_serial = 0
+        self._index_binding_handles = {}
+        # 只限定当前关键帧结构提交；向量任务在释放结构锁后再执行。
+        self._observation_write_state = threading.local()
+        self._query_score_state = threading.local()
+        self._instance_publisher = SemanticInstancePublisher(stream_bus, self.get_semantic_instances_snapshot)
+        self._durable_index = DurableMemoryIndex(self)
+        self._repository.attach_index(self._durable_index)
+        # Register strong root callbacks only once construction has succeeded;
+        # schema/index setup above does not publish any source records.
+        if artifact_store is not None:
+            self._artifact_references = MemoryArtifactReferences(self._repository, artifact_store)
+
+    def _index_model_binding(self):
+        """Cheap declared intent only; no provider getters or model initialization."""
+        def declared(role, provider, configured, dimension):
+            values = {}
+            for key in ("model_name", "dimension", "model_revision", "revision", "version", "cache_revision"):
+                value = inspect.getattr_static(provider, key, None) if provider is not None else None
+                values[key] = value if value is None or type(value) in (str, int, float, bool) else "undeclared"
+            specification = {"configured": configured, "dimension": dimension, "declarations": values,
+                             "available": provider is not None, "initialized": getattr(self, "_" + role + "_embedder_ready")}
+            with self._index_binding_lock:
+                previous = self._index_binding_handles.get(role)
+                if previous is None or previous[0] is not provider or previous[1] != specification:
+                    self._index_binding_serial += 1
+                    previous = (provider, specification, self._index_binding_serial)
+                    self._index_binding_handles[role] = previous
+                # A controlled generation, not id(provider), prevents address
+                # reuse from reviving vectors produced by an older model object.
+                return {**specification, "binding_generation": previous[2]}
+        return {"process": self._durable_index.process_binding,
+                "text": declared("text", self._text_embedder, self._configured_text_model, self._configured_text_dimension),
+                "image": declared("image", self._image_embedder, self._configured_image_model, self._configured_image_dimension)}
+
+    def _prepare_index_projection(self, kind, record, *, dependency_value=None, binding=None):
+        """Render exact immutable indexing inputs without I/O or model work."""
+        if kind == "location":
+            payload = self._build_location_payload(record)
+            artifacts = dependency_value or []
+            collection = PLACE_NODES_COLLECTION
+        elif kind == "memory":
+            payload = self._build_memory_payload(record, linked_location_name=dependency_value or "")
+            artifacts = list(record.artifact_ids)
+            collection = EPISODIC_OBSERVATIONS_COLLECTION
+        elif kind == "instance":
+            payload = self._build_instance_payload(record)
+            artifacts = list(record.artifact_ids)
+            collection = OBJECT_INSTANCES_COLLECTION
+        elif kind == "event":
+            payload = self._build_observation_event_payload(record)
+            artifacts = list(record.artifact_ids)
+            collection = EPISODIC_OBSERVATIONS_COLLECTION
+        else:
+            payload = self._build_scene_space_payload(record)
+            artifacts = self._scene_space_artifact_ids(record)
+            collection = SCENE_SPACES_COLLECTION
+        payload[MEMORY_LIBRARY_METADATA_KEY] = self._record_library_name(record)
+        return {"payload": payload, "text": str(payload["retrieval_text"]), "artifacts": artifacts,
+                "binding": self._index_model_binding() if binding is None else binding, "collection": collection,
+                "record_kind": payload["record_kind"],
+                "eligible": kind != "instance" or self._is_long_term_static_instance(record)}
+
+    def _artifact_record_cache(self, kind):
+        return {
+            "location": (self._tagged_locations_by_id, self._tagged_location_history),
+            "memory": (self._semantic_entries_by_id, self._semantic_history),
+            "instance": (self._semantic_instances_by_id, self._semantic_instance_history),
+            "event": (self._observation_events_by_id, self._observation_event_history),
+            "scene": (self._scene_spaces_by_id, self._scene_space_history),
+        }[kind]
+
+    def _hold_artifact_record(self, kind, record, *, owner):
+        if self._artifact_store is None:
+            return None
+        ids = self._scene_space_artifact_ids(record) if kind == "scene" else getattr(record, "artifact_ids", ())
+        return self._artifact_store.hold_proven_artifacts(ids, owner=owner) if ids else None
+
+    def _cache_artifact_record(self, kind, record, *, append_history=True):
+        """Caller holds the instance lock; adoption performs no file/SQL I/O."""
+        cache, history = self._artifact_record_cache(kind)
+        point_id = getattr(record, SOURCES[kind][1])
+        hold = self._hold_artifact_record(kind, record, owner="memory.cache." + kind)
+        history_hold = hold.retain(owner="memory.history." + kind) if hold is not None and append_history else None
+        slot_key = (kind, point_id)
+        previous_hold = self._artifact_cache_holds.pop(slot_key, None)
+        if kind == "scene":
+            if hasattr(record, "_scene_graph_source_revision"):
+                object.__setattr__(record, "_scene_expected_source_revision", record._scene_graph_source_revision)
+            if point_id not in cache:
+                self._scene_graph_geometry_visibility_generation += 1
+        cache[point_id] = record
+        if kind in ("scene", "memory", "instance"):
+            self._scene_graph_live_generation += 1
+        if hold is not None:
+            self._artifact_cache_holds[slot_key] = hold
+        if append_history:
+            # Empty paths allocate no holders or parallel history. Placeholders
+            # appear only once a history actually contains artifact ownership.
+            owners = self._artifact_history_holds.get(kind)
+            if owners is None and history_hold is not None:
+                owners = deque([None] * len(history), maxlen=history.maxlen)
+                self._artifact_history_holds[kind] = owners
+            evicted_hold = None
+            if owners is not None:
+                evicted_hold = owners[0] if len(owners) == owners.maxlen else None
+                owners.append(history_hold)
+                if history_hold is not None:
+                    self._artifact_history_holder_count += 1
+            history.append(record)
+            if evicted_hold is not None:
+                evicted_hold.release()
+                self._artifact_history_holder_count -= 1
+        if previous_hold is not None:
+            previous_hold.release()
+
+    def _remove_artifact_record(self, kind, point_id):
+        """Remove one served slot and its bounded history without scanning caches."""
+        cache, history = self._artifact_record_cache(kind)
+        if kind == "scene" and point_id in cache:
+            self._scene_graph_geometry_visibility_generation += 1
+        cache.pop(point_id, None)
+        if kind in ("scene", "memory", "instance"):
+            self._scene_graph_live_generation += 1
+        previous_hold = self._artifact_cache_holds.pop((kind, point_id), None)
+        if previous_hold is not None:
+            previous_hold.release()
+        owners = self._artifact_history_holds.get(kind)
+        retained = []
+        retained_holds = []
+        removed_holds = []
+        for index, record in enumerate(history):
+            hold = owners[index] if owners is not None and index < len(owners) else None
+            if getattr(record, SOURCES[kind][1]) == point_id:
+                if hold is not None:
+                    removed_holds.append(hold)
+            else:
+                retained.append(record)
+                retained_holds.append(hold)
+        history.clear()
+        history.extend(retained)
+        if owners is not None:
+            owners.clear()
+            owners.extend(retained_holds)
+        for hold in removed_holds:
+            hold.release()
+            self._artifact_history_holder_count -= 1
+
+    @contextmanager
+    def _artifact_evidence_scope(self, *contexts):
+        """Retain exact introduced context evidence before any slow preparation."""
+        ids = []
+        for context in contexts:
+            if context is None:
+                continue
+            image = getattr(context, "image_artifact", None)
+            if image is not None:
+                ids.append(image.artifact_id)
+            observation = getattr(context, "observation", None)
+            ids.extend(getattr(observation, "artifact_ids", ()))
+        ids = tuple(dict.fromkeys(str(value).strip() for value in ids if str(value).strip()))
+        if self._artifact_store is None or not ids:
+            yield
+            return
+        # Acquire outside both SQL and instance locks. Proven missing local
+        # inputs fail before admission; external/opaque IDs remain usable.
+        hold = self._artifact_store.acquire_artifacts(ids, owner="memory.prepare")
+        token = object()
+        try:
+            hold.validate_introduced()
+            with self._artifact_lifetime_lock:
+                if self._closed:
+                    raise GatewayError("记忆服务已关闭。", error_code="memory_closed", http_status=503)
+                self._artifact_operations[token] = hold
+            yield
+        finally:
+            hold.release()
+            with self._artifact_lifetime_lock:
+                self._artifact_operations.pop(token, None)
+
+    def get_artifact_lifetime_status(self):
+        """Bounded cached diagnostics only; never build a source/file index."""
+        with self._instances_lock:
+            cache_holders = len(self._artifact_cache_holds)
+            history_holders = self._artifact_history_holder_count
+        with self._artifact_lifetime_lock:
+            active_operations = len(self._artifact_operations)
+        return {"configured": self._artifact_references is not None,
+                "cache_holders": cache_holders, "history_holders": history_holders,
+                "active_operations": active_operations,
+                "references": self._artifact_references.status() if self._artifact_references is not None else None}
+
+    def artifact_dependencies_quiesced(self):
+        """Runtime may close artifact dependencies only after all owners stop."""
+        with self._artifact_lifetime_lock:
+            if self._artifact_operations:
+                return False
+        for worker in (self._vectorization_worker, self._deferred_refine_worker):
+            if worker is not None and worker.is_alive():
+                return False
+        if self._artifact_references is not None:
+            status = self._artifact_references.status()
+            if any(status[name] for name in ("pending_transactions", "pending_completions", "unresolved_transactions")):
+                return False
+        return True
+
+    def _publish_index_record(self, kind, record, token) -> None:
+        with self._instances_lock:
+            if not self.is_enabled() or self._record_library_name(record) != self._active_library_name:
+                return
+            point_id = getattr(record, SOURCES[kind][1])
+            adoption = self._hold_artifact_record(kind, record, owner="memory.adopt." + kind)
+            try:
+                with self._repository.storage.read_snapshot() as tx:
+                    current = self._durable_index._state(tx, kind, point_id)
+                    if self._durable_index.business_token(current) != token:
+                        return
+                    write_state = {
+                        "location": self._write_tagged_location_state,
+                        "memory": self._write_semantic_memory_state,
+                        "instance": self._write_semantic_instance_state,
+                        "event": self._write_observation_event_state,
+                        "scene": self._write_scene_space_state,
+                    }[kind]
+                    self._cache_artifact_record(kind, record)
+                # Serialize state publication with cache/token validation, after
+                # releasing SQLite. A late callback cannot overwrite newer state.
+                write_state(record)
+            finally:
+                if adoption is not None:
+                    adoption.release()
+
+    def _remove_index_record(self, kind, point_id):
+        with self._instances_lock:
+            with self._repository.storage.read_snapshot() as tx:
+                if self._durable_index._raw(tx, kind, point_id) is not None:
+                    return
+            cache, _history = self._artifact_record_cache(kind)
+            if kind == "instance" and point_id in cache and not self._is_long_term_static_instance(cache[point_id]):
+                object.__setattr__(cache[point_id], "_memory_source_deleted", True)
+                return
+            self._remove_artifact_record(kind, point_id)
+
+    def _publish_live_instance(self, instance, *, expected):
+        """An ephemeral refinement never manufactures an embedding requirement."""
+        with self._instances_lock:
+            if (not self.is_enabled() or self._record_library_name(instance) != self._active_library_name
+                    or self._semantic_instances_by_id.get(instance.instance_id) is not expected):
+                return False
+            object.__setattr__(instance, "_memory_live_only", True)
+            self._cache_artifact_record("instance", instance)
+            self._write_semantic_instance_state(instance)
+            return True
+
+    def start_instance_stream(self) -> None:
+        self._instance_publisher.start()
+
+    def stop_instance_stream(self) -> None:
+        self._instance_publisher.stop()
 
     def is_enabled(self) -> bool:
         """返回记忆库当前是否已启用。"""
@@ -303,8 +655,19 @@ class MemoryService:
         library_name: str,
         load_history: bool = True,
         reset_library: bool = False,
+        expected_library_name: Optional[str] = None,
     ) -> Dict[str, object]:
-        """启用指定命名记忆库，并按需加载历史。"""
+        """启用指定命名记忆库，并按需加载历史。
+
+        参数:
+            library_name: 目标库名。
+            load_history: 是否加载历史记录。
+            reset_library: 是否在启用前清空该库记录。
+            expected_library_name: 当调用方（如 `MapWorkspaceService.activate_map`）要求
+                "激活的库名必须等于预期值"时传入；与 ``library_name`` 不一致时抛
+                ``memory_library_map_mismatch`` 错误。默认 None 表示不校验，
+                沿用旧行为（无激活态时允许任意库）。
+        """
 
         resolved_name = str(library_name or "").strip()
         if not resolved_name:
@@ -315,15 +678,39 @@ class MemoryService:
                 jsonrpc_code=-32602,
             )
 
+        if expected_library_name is not None:
+            expected = str(expected_library_name).strip()
+            if expected and expected != resolved_name:
+                raise GatewayError(
+                    "激活记忆库 %s 与预期库 %s 不一致，禁止跨图串库。"
+                    % (resolved_name, expected),
+                    error_code="memory_library_map_mismatch",
+                    http_status=409,
+                    jsonrpc_code=-32000,
+                    details={
+                        "expected_library_name": expected,
+                        "requested_library_name": resolved_name,
+                    },
+                )
+
+        with self._instances_lock:
+            self._durable_index.activate(None)
+            self._memory_enabled = False
+            self._active_library_name = None
         self._repository.upsert_memory_library(resolved_name)
         if reset_library:
             self._delete_memory_library_records(resolved_name)
-        self._ensure_embedders_initialized()
-        self._clear_active_memory_state()
-        self._memory_enabled = True
-        self._active_library_name = resolved_name
+        with self._instances_lock:
+            self._durable_index.activate(resolved_name, load_history=load_history)
+            self._durable_index.reset_reconciliation(resolved_name)
+            self._clear_active_memory_state()
+            self._memory_enabled = True
+            self._active_library_name = resolved_name
         if load_history:
             self._load_persisted_memory(library_name=resolved_name)
+        self._instance_publisher.notify()
+        self._start_vectorization_worker()
+        self._start_deferred_refine_worker()
         summary = self.get_summary()
         self._publish_memory_event(
             "memory.library_enabled",
@@ -387,9 +774,12 @@ class MemoryService:
         """停用当前记忆库，并清空激活态缓存。"""
 
         previous_name = self._active_library_name
-        self._clear_active_memory_state()
-        self._memory_enabled = False
-        self._active_library_name = None
+        self._durable_index.activate(None)
+        with self._instances_lock:
+            self._clear_active_memory_state()
+            self._memory_enabled = False
+            self._active_library_name = None
+        self._instance_publisher.notify()
         summary = self.get_summary()
         if previous_name:
             self._publish_memory_event(
@@ -448,7 +838,7 @@ class MemoryService:
         return index
 
     def build_memory_checkpoint(self, *, library_name: Optional[str] = None) -> Dict[str, object]:
-        """构建可写入地图版本 manifest 的记忆检查点。"""
+        """构建可写入地图资产包 manifest 的记忆检查点。"""
 
         target_library = str(library_name or "").strip() or self._active_library_name
 
@@ -464,23 +854,9 @@ class MemoryService:
         graph_relations = [item for item in self._repository.load_semantic_graph_relations() if _matches(item)]
         summary_nodes = [item for item in self._repository.load_semantic_summary_nodes() if _matches(item)]
         artifact_index = self.build_artifact_reference_index(library_name=target_library)
-        payload = {
-            "library_name": target_library,
-            "active": bool(target_library and target_library == self._active_library_name),
-            "tagged_location_ids": sorted(item.location_id for item in tagged_locations),
-            "semantic_memory_ids": sorted(item.memory_id for item in semantic_memories),
-            "semantic_instance_ids": sorted(item.instance_id for item in semantic_instances),
-            "observation_event_ids": sorted(item.event_id for item in observation_events),
-            "scene_space_ids": sorted(item.scene_space_id for item in scene_spaces),
-            "navigation_trajectory_event_ids": sorted(item.trajectory_event_id for item in trajectory_events),
-            "semantic_graph_relation_ids": sorted(item.relation_id for item in graph_relations),
-            "semantic_summary_node_ids": sorted(item.summary_id for item in summary_nodes),
-            "artifact_ids": sorted(artifact_index),
-        }
-        checkpoint_hash = hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
         return {
             "library_name": target_library,
-            "active": payload["active"],
+            "active": bool(target_library and target_library == self._active_library_name),
             "tagged_location_count": len(tagged_locations),
             "semantic_memory_count": len(semantic_memories),
             "semantic_instance_count": len(semantic_instances),
@@ -489,9 +865,9 @@ class MemoryService:
             "navigation_trajectory_count": len(trajectory_events),
             "semantic_graph_relation_count": len(graph_relations),
             "semantic_summary_count": len(summary_nodes),
-            "artifact_count": len(payload["artifact_ids"]),
-            "artifact_ids": payload["artifact_ids"],
-            "checkpoint_hash": checkpoint_hash,
+            "artifact_count": len(artifact_index),
+            "artifact_ids": sorted(artifact_index),
+            "checkpoint_id": "mcp_" + uuid.uuid4().hex,
         }
 
     def diagnose_artifact_links(self, artifact_store: Optional[LocalArtifactStore] = None, *, library_name: Optional[str] = None) -> Dict[str, object]:
@@ -531,9 +907,11 @@ class MemoryService:
 
         was_active = resolved_name == self._active_library_name
         if was_active:
-            self._clear_active_memory_state()
-            self._memory_enabled = False
-            self._active_library_name = None
+            with self._instances_lock:
+                self._clear_active_memory_state()
+                self._memory_enabled = False
+                self._active_library_name = None
+            self._instance_publisher.notify()
 
         deleted_counts = self._delete_memory_library_records(resolved_name)
         deleted_directory = self._repository.delete_memory_library(resolved_name)
@@ -558,7 +936,100 @@ class MemoryService:
         }
 
     def list_memory_libraries(self) -> Tuple[Dict[str, object], ...]:
-        """列出当前仓库内可见的命名记忆库。"""
+        """列出当前仓库内可见的命名记忆库。
+
+        —— speed-up-list-maps-summary ——
+        默认走轻量快路径：仅依赖 SQL GROUP BY 聚合，不反序列化 payload。
+        - 当 8 张记忆表的 library_name 列均已就绪（has_library_name_columns()）时走轻量路径；
+        - 否则回退到原全量反序列化实现（_list_memory_libraries_legacy）；
+        - 通过环境变量 NX_MEMORY_LIGHTWEIGHT_LIBRARY_STATS=0 可强制回退到旧实现。
+        """
+
+        if self._use_lightweight_library_stats() and self._repository.has_library_name_columns():
+            return self._list_memory_libraries_lightweight()
+        return self._list_memory_libraries_legacy()
+
+    @staticmethod
+    def _use_lightweight_library_stats() -> bool:
+        """轻量快路径开关；HIL 验证前默认开启，回退开关 NX_MEMORY_LIGHTWEIGHT_LIBRARY_STATS=0。"""
+
+        import os
+        flag = runtime_value("NX_MEMORY_LIGHTWEIGHT_LIBRARY_STATS", "1").strip().lower()
+        return flag not in ("0", "false", "no", "off")
+
+    def _list_memory_libraries_lightweight(self) -> Tuple[Dict[str, object], ...]:
+        """轻量快路径：仅 SQL GROUP BY 聚合，不反序列化 payload。"""
+
+        counts_by_library = self._repository.count_records_by_library()
+        last_updated_by_library = self._repository.library_last_updated_at()
+        # 与旧实现一致：以 memory_libraries 登记表为基底（保证 active 字段正确判定）。
+        stats_by_name: Dict[str, _MemoryLibraryStats] = {}
+        for item in self._repository.load_memory_libraries():
+            stats_by_name[item.library_name] = _MemoryLibraryStats(
+                library_name=item.library_name,
+                last_updated_at=datetime.fromisoformat(item.updated_at),
+            )
+        for library_name, kind_counts in counts_by_library.items():
+            current = stats_by_name.get(library_name)
+            if current is None:
+                current = _MemoryLibraryStats(library_name=library_name)
+            stats_by_name[library_name] = _MemoryLibraryStats(
+                library_name=library_name,
+                tagged_location_count=int(kind_counts.get("tagged_location", 0)),
+                semantic_memory_count=int(kind_counts.get("semantic_memory", 0)),
+                semantic_instance_count=int(kind_counts.get("semantic_instance", 0)),
+                observation_event_count=int(kind_counts.get("observation_event", 0)),
+                scene_space_count=int(kind_counts.get("scene_space", 0)),
+                navigation_trajectory_count=int(kind_counts.get("navigation_trajectory", 0)),
+                semantic_graph_relation_count=int(kind_counts.get("semantic_graph_relation", 0)),
+                semantic_summary_count=int(kind_counts.get("semantic_summary", 0)),
+                last_updated_at=current.last_updated_at,
+            )
+        # 用 library_last_updated_at 覆盖/补充 last_updated_at（与旧实现一致取最大 updated_at）。
+        for library_name, last_ts in last_updated_by_library.items():
+            current = stats_by_name.get(library_name)
+            try:
+                last_dt = datetime.fromisoformat(last_ts)
+            except ValueError:
+                continue
+            if current is None:
+                stats_by_name[library_name] = _MemoryLibraryStats(
+                    library_name=library_name, last_updated_at=last_dt,
+                )
+            elif current.last_updated_at is None or last_dt > current.last_updated_at:
+                stats_by_name[library_name] = _MemoryLibraryStats(
+                    library_name=library_name,
+                    tagged_location_count=current.tagged_location_count,
+                    semantic_memory_count=current.semantic_memory_count,
+                    semantic_instance_count=current.semantic_instance_count,
+                    observation_event_count=current.observation_event_count,
+                    scene_space_count=current.scene_space_count,
+                    navigation_trajectory_count=current.navigation_trajectory_count,
+                    semantic_graph_relation_count=current.semantic_graph_relation_count,
+                    semantic_summary_count=current.semantic_summary_count,
+                    last_updated_at=last_dt,
+                )
+        libraries: List[Dict[str, object]] = []
+        for stats in sorted(stats_by_name.values(), key=lambda item: (item.library_name.lower(), item.library_name)):
+            libraries.append(
+                {
+                    "library_name": stats.library_name,
+                    "active": stats.library_name == self._active_library_name,
+                    "tagged_location_count": stats.tagged_location_count,
+                    "semantic_memory_count": stats.semantic_memory_count,
+                    "semantic_instance_count": stats.semantic_instance_count,
+                    "observation_event_count": stats.observation_event_count,
+                    "scene_space_count": stats.scene_space_count,
+                    "navigation_trajectory_count": stats.navigation_trajectory_count,
+                    "semantic_graph_relation_count": stats.semantic_graph_relation_count,
+                    "semantic_summary_count": stats.semantic_summary_count,
+                    "last_updated_at": stats.last_updated_at.isoformat() if stats.last_updated_at is not None else None,
+                }
+            )
+        return tuple(libraries)
+
+    def _list_memory_libraries_legacy(self) -> Tuple[Dict[str, object], ...]:
+        """旧全量实现：逐行 model_validate_json 反序列化 payload；保留作为回退路径。"""
 
         stats_by_name: Dict[str, _MemoryLibraryStats] = {
             item.library_name: _MemoryLibraryStats(
@@ -656,23 +1127,40 @@ class MemoryService:
             )
         return tuple(libraries)
 
-    def _ensure_embedders_initialized(self) -> None:
-        if not self._text_embedder_ready:
-            self._text_embedder = self._build_text_embedder_with_fallback(
-                self._configured_text_model,
-                self._configured_text_dimension,
-            )
-            self._text_embedder_ready = True
-        if self._text_embedder is not None:
-            self._instance_association_service.set_text_embedder(self._text_embedder)
-        if not self._image_embedder_ready:
-            self._image_embedder = self._build_image_embedder_with_fallback(
-                self._configured_image_model,
-                self._configured_image_dimension,
-            )
-            self._image_embedder_ready = True
+    def _ensure_embedders_initialized(self, *, nonblocking=False) -> None:
+        """Single-flight construction; queries may skip an occupied provider."""
+        if not self._text_embedder_ready and self._text_embedder_init_lock.acquire(blocking=not nonblocking):
+            try:
+                if not self._text_embedder_ready:
+                    self._text_embedder = self._build_text_embedder_with_fallback(self._configured_text_model, self._configured_text_dimension)
+                    self._text_embedder_ready = True
+            finally:
+                self._text_embedder_init_lock.release()
+        association = self._instance_association_service
+        identity = association._embedder_cache_identity(self._text_embedder)
+        unchanged = association._text_embedder is self._text_embedder and identity is not None and identity == association._text_embedder_cache_identity
+        if not unchanged and self._association_compute_lock.acquire(blocking=not nonblocking):
+            try:
+                with self._instances_lock:
+                    association.set_text_embedder(self._text_embedder, force_refresh=False)
+            finally:
+                self._association_compute_lock.release()
+        if not self._image_embedder_ready and self._image_embedder_init_lock.acquire(blocking=not nonblocking):
+            try:
+                if not self._image_embedder_ready:
+                    self._image_embedder = self._build_image_embedder_with_fallback(self._configured_image_model, self._configured_image_dimension)
+                    self._image_embedder_ready = True
+            finally:
+                self._image_embedder_init_lock.release()
+        if hasattr(self, "_durable_index"):
+            binding = self._index_model_binding()
+            if getattr(self, "_last_index_binding", None) != binding:
+                self._last_index_binding = binding
+                if self._durable_index.active_library:
+                    self._durable_index.reset_reconciliation(self._durable_index.active_library)
 
-    def _require_memory_enabled(self) -> str:
+
+    def _require_memory_enabled(self, *, initialize_embedders=True) -> str:
         if not self.is_enabled():
             raise GatewayError(
                 MEMORY_DISABLED_MESSAGE,
@@ -680,11 +1168,14 @@ class MemoryService:
                 http_status=409,
                 jsonrpc_code=-32000,
             )
-        self._ensure_embedders_initialized()
+        if initialize_embedders:
+            self._ensure_embedders_initialized()
         assert self._active_library_name is not None
         return self._active_library_name
 
     def _clear_active_memory_state(self) -> None:
+        self._scene_scope_generation = getattr(self, "_scene_scope_generation", 0) + 1
+        self._scene_graph_live_generation += 1
         self._tagged_locations_by_id.clear()
         self._semantic_entries_by_id.clear()
         self._semantic_instances_by_id.clear()
@@ -701,21 +1192,66 @@ class MemoryService:
         self._navigation_trajectory_history.clear()
         self._semantic_graph_relation_history.clear()
         self._semantic_summary_history.clear()
+        for hold in self._artifact_cache_holds.values():
+            hold.release()
+        self._artifact_cache_holds.clear()
+        for owners in self._artifact_history_holds.values():
+            for hold in owners:
+                if hold is not None:
+                    hold.release()
+        self._artifact_history_holds.clear()
+        self._artifact_history_holder_count = 0
         self._latest_semantic_map_context = SemanticMapBuildResult(
-            map_version_id=None,
-            frame_id="map",
+            map_name=None,
+            frame_id=DEFAULT_MAP_FRAME,
             semantic_regions=(),
             anchors_by_id={},
             topology_nodes_by_id={},
         )
-        self._latest_semantic_map_context_localization_session_id = None
-        self._vector_store.clear_all()
+        self._latest_semantic_map_context_identity = None
+        self._semantic_map_identity_plan = None
+        self._semantic_map_identity_publication = None
+        self._semantic_map_request += 1
 
     def _attach_library_metadata(self, metadata: Optional[Dict[str, object]]) -> Dict[str, object]:
         merged = dict(metadata or {})
-        if self._active_library_name:
-            merged[MEMORY_LIBRARY_METADATA_KEY] = self._active_library_name
+        scope = self._observation_write_scope()
+        library_name = scope["library_name"] if scope is not None else self._active_library_name
+        if library_name:
+            merged[MEMORY_LIBRARY_METADATA_KEY] = library_name
         return merged
+
+    def _observation_write_scope(self):
+        return getattr(getattr(self, "_observation_write_state", None), "scope", None)
+
+    def _assert_observation_library(self, expected_library_name: str, expected_generation=None) -> None:
+        """调用方持有实例锁，在结构或向量提交前复核捕获的库身份。"""
+        if (not self.is_enabled() or self._active_library_name != expected_library_name
+                or (expected_generation is not None and self._durable_index.activation_generation != expected_generation)):
+            raise GatewayError(
+                "观察处理期间记忆库已切换，拒绝将旧观察写入当前库。",
+                error_code="memory_library_changed", http_status=409,
+                details={"expected_library_name": expected_library_name, "active_library_name": self._active_library_name},
+            )
+
+    def _observation_localization_session(self):
+        """显式关键帧只使用捕获快照中的会话身份，不借用当前定位会话。"""
+        scope = self._observation_write_scope()
+        if scope is None or not scope["use_spatial_snapshot"]:
+            return self._localization_service.get_active_session()
+        snapshot = scope["localization_snapshot"]
+        metadata = dict(snapshot.metadata or {}) if snapshot is not None else {}
+        session_id = metadata.get("session_id") or metadata.get("localization_session_id")
+        if not session_id:
+            return None
+        map_snapshot = scope["map_snapshot"]
+        return SimpleNamespace(
+            session_id=session_id,
+            map_name=metadata.get("map_name") or (map_snapshot.map_name if map_snapshot is not None else scope["library_name"]),
+            status=SimpleNamespace(value=metadata.get("session_status") or metadata.get("localization_session_status")),
+            asset_identity=SimpleNamespace(asset_id=metadata["asset_identity"].get("asset_id"))
+                if isinstance(metadata.get("asset_identity"), dict) else None,
+        )
 
     def _record_library_name(self, record: object) -> str:
         metadata = getattr(record, "metadata", {}) or {}
@@ -726,38 +1262,33 @@ class MemoryService:
         return LEGACY_MEMORY_LIBRARY_NAME
 
     def _delete_memory_library_records(self, library_name: str) -> Dict[str, int]:
-        tagged_locations = [item for item in self._repository.load_tagged_locations() if self._record_library_name(item) == library_name]
-        semantic_memories = [item for item in self._repository.load_semantic_memories() if self._record_library_name(item) == library_name]
-        semantic_instances = [item for item in self._repository.load_semantic_instances() if self._record_library_name(item) == library_name]
-        observation_events = [item for item in self._repository.load_observation_events() if self._record_library_name(item) == library_name]
-        scene_spaces = [item for item in self._repository.load_scene_spaces() if self._record_library_name(item) == library_name]
-        trajectory_events = [item for item in self._repository.load_navigation_trajectory_events() if self._record_library_name(item) == library_name]
-        graph_relations = [item for item in self._repository.load_semantic_graph_relations() if self._record_library_name(item) == library_name]
-        summary_nodes = [item for item in self._repository.load_semantic_summary_nodes() if self._record_library_name(item) == library_name]
+        with self._repository.storage.transaction():
+            tagged_locations = [item for item in self._repository.load_tagged_locations() if self._record_library_name(item) == library_name]
+            semantic_memories = [item for item in self._repository.load_semantic_memories() if self._record_library_name(item) == library_name]
+            semantic_instances = [item for item in self._repository.load_semantic_instances() if self._record_library_name(item) == library_name]
+            observation_events = [item for item in self._repository.load_observation_events() if self._record_library_name(item) == library_name]
+            scene_spaces = [item for item in self._repository.load_scene_spaces() if self._record_library_name(item) == library_name]
+            trajectory_events = [item for item in self._repository.load_navigation_trajectory_events() if self._record_library_name(item) == library_name]
+            graph_relations = [item for item in self._repository.load_semantic_graph_relations() if self._record_library_name(item) == library_name]
+            summary_nodes = [item for item in self._repository.load_semantic_summary_nodes() if self._record_library_name(item) == library_name]
 
-        artifact_ids = set()
-        for item in semantic_memories:
-            artifact_ids.update(item.artifact_ids)
-        for item in semantic_instances:
-            artifact_ids.update(item.artifact_ids)
-        for item in observation_events:
-            artifact_ids.update(item.artifact_ids)
+            artifact_ids = set()
+            for item in semantic_memories:
+                artifact_ids.update(item.artifact_ids)
+            for item in semantic_instances:
+                artifact_ids.update(item.artifact_ids)
+            for item in observation_events:
+                artifact_ids.update(item.artifact_ids)
 
-        self._repository.delete_tagged_locations([item.location_id for item in tagged_locations])
-        self._repository.delete_semantic_memories([item.memory_id for item in semantic_memories])
-        self._repository.delete_semantic_instances([item.instance_id for item in semantic_instances])
-        self._repository.delete_observation_events([item.event_id for item in observation_events])
-        self._repository.delete_scene_spaces([item.scene_space_id for item in scene_spaces])
-        self._repository.delete_navigation_trajectory_events([item.trajectory_event_id for item in trajectory_events])
-        self._repository.delete_semantic_graph_relations([item.relation_id for item in graph_relations])
-        self._repository.delete_semantic_summary_nodes([item.summary_id for item in summary_nodes])
-        self._vector_store.delete_points(
-            [item.location_id for item in tagged_locations]
-            + [item.memory_id for item in semantic_memories]
-            + [item.instance_id for item in semantic_instances]
-            + [item.event_id for item in observation_events]
-            + [item.scene_space_id for item in scene_spaces]
-        )
+            self._repository.delete_tagged_locations([item.location_id for item in tagged_locations])
+            self._repository.delete_semantic_memories([item.memory_id for item in semantic_memories])
+            self._repository.delete_semantic_instances([item.instance_id for item in semantic_instances])
+            self._repository.delete_observation_events([item.event_id for item in observation_events])
+            self._repository.delete_scene_spaces([item.scene_space_id for item in scene_spaces])
+            self._repository.delete_navigation_trajectory_events([item.trajectory_event_id for item in trajectory_events])
+            self._repository.delete_semantic_graph_relations([item.relation_id for item in graph_relations])
+            self._repository.delete_semantic_summary_nodes([item.summary_id for item in summary_nodes])
+            self._durable_index.retire_library(library_name)
         if self._artifact_store is not None:
             for artifact_id in sorted(artifact_ids):
                 try:
@@ -789,6 +1320,8 @@ class MemoryService:
         resolved_provider = resolve_text_embedding_provider_spec(resolved_model_name).to_metadata()
         return {
             **resolved_provider,
+            "requested_model_name": str(requested_model_name),
+            "resolved_model_name": str(resolved_model_name),
             "availability": availability,
             "fallback_used": bool(fallback_used),
             "fallback_reason": str(fallback_reason or ""),
@@ -856,42 +1389,27 @@ class MemoryService:
         self,
         model_name: str,
         dimension: int,
-    ) -> TextEmbedder:
-        """优先构造配置指定的文本向量器，失败时回退到 hashing。"""
-
+    ) -> Optional[TextEmbedder]:
+        """保留显式模型配置；无需模型或初始化失败时使用词法检索。"""
         try:
             embedder = build_text_embedder(
-                model_name,
-                dimension,
-                api_key=self._embedding_api_key,
-                base_url=self._embedding_base_url,
-                timeout_sec=self._embedding_timeout_sec,
-            )
+                model_name, dimension, api_key=self._embedding_api_key,
+                base_url=self._embedding_base_url, timeout_sec=self._embedding_timeout_sec)
+            requested = resolve_text_embedding_provider_spec(model_name).to_metadata()
             self._text_embedding_provider_metadata = self._build_text_provider_metadata(
                 requested_model_name=model_name,
-                resolved_model_name=embedder.model_name,
-            )
+                resolved_model_name=embedder.model_name if embedder is not None else "lexical-only",
+                fallback_used=bool(requested.get("fallback_used")) if embedder is None else False,
+                fallback_reason=str(requested.get("fallback_reason") or "") if embedder is None else "",
+                availability="available" if embedder is not None else "disabled")
             return embedder
         except Exception as exc:
-            LOGGER.warning(
-                "文本向量模型初始化失败，已回退到 hashing-v1。requested=%s error=%s",
-                model_name,
-                exc,
-            )
-            fallback_dimension = dimension if dimension > 0 else 256
-            embedder = HashingTextEmbedder(
-                model_name="hashing-v1",
-                dimension=fallback_dimension,
-            )
+            LOGGER.warning("文本向量模型初始化失败，改用词法检索。requested=%s error=%s", model_name, exc)
             self._text_embedding_provider_metadata = self._build_text_provider_metadata(
-                requested_model_name=model_name,
-                resolved_model_name=embedder.model_name,
-                fallback_used=True,
-                fallback_reason="provider_initialization_failed",
-                availability="available",
-            )
+                requested_model_name=model_name, resolved_model_name="lexical-only",
+                fallback_used=True, fallback_reason="provider_initialization_failed", availability="unavailable")
             self._text_embedding_provider_metadata["error_category"] = "model_provider"
-            return embedder
+            return None
 
     def _build_image_embedder_with_fallback(
         self,
@@ -950,7 +1468,8 @@ class MemoryService:
     ) -> Tuple[TaggedLocation, Optional[SemanticMemoryEntry]]:
         """把当前位置写成带空间锚点的命名地点。"""
 
-        self._require_memory_enabled()
+        expected_library = self._require_memory_enabled()
+        expected_generation = self._durable_index.activation_generation
         normalized_name = self._normalize_text(name)
         if not normalized_name:
             raise GatewayError(
@@ -967,10 +1486,24 @@ class MemoryService:
         map_snapshot = self._get_map_snapshot()
         observation_context = None
         perception_context = None
-        if attach_latest_observation:
-            observation_context = self._observation_service.get_latest_observation(camera_id)
         if attach_latest_perception:
-            perception_context = self._perception_service.get_latest_perception(camera_id)
+            perception_context = self._latest_complete_perception(camera_id)
+        if attach_latest_observation and perception_context is None:
+            observation_context = self._observation_service.get_latest_observation(camera_id)
+        if camera_id is None:
+            camera_id = (perception_context.camera_id if perception_context is not None
+                         else observation_context.camera_id if observation_context is not None else None)
+        captured = self._observation_spatial_capture(perception_context, expected_library, expected_generation)
+        observation_pose = captured.get("observation_pose") if captured is not None else None
+        observation_map = captured.get("map_snapshot") if captured is not None else map_snapshot
+        observation_localization = captured.get("localization_snapshot") if captured is not None else localization_snapshot
+        if (observation_map is not None and map_snapshot is not None
+                and observation_map.source_name and observation_map.source_epoch
+                and map_snapshot.source_name and map_snapshot.source_epoch
+                and any(getattr(observation_map, key) != getattr(map_snapshot, key)
+                        for key in ("map_name", "source_name", "source_epoch", "frame_id"))):
+            raise GatewayError("完整观察来自另一地图来源，不能关联到当前地点。",
+                               error_code="memory_map_source_changed", http_status=409)
 
         semantic_region_id, semantic_labels = self._resolve_semantic_region(
             localization_snapshot.current_pose,
@@ -981,7 +1514,11 @@ class MemoryService:
             map_snapshot.metadata if map_snapshot is not None else {},
             metadata,
         )
-        self._refresh_semantic_map_context(map_snapshot)
+        resolved_map_name = self._resolve_stable_map_name(
+            map_snapshot=map_snapshot,
+            localization_snapshot=localization_snapshot,
+        )
+        self._refresh_semantic_map_context(map_snapshot, map_name=resolved_map_name, expected_generation=expected_generation)
         anchor_id = self._resolve_anchor_id_for_pose(
             localization_snapshot.current_pose,
             semantic_region_id=semantic_region_id,
@@ -1001,20 +1538,22 @@ class MemoryService:
         )
         if perception_context is not None:
             merged_metadata.update(self._build_scene_memory_metadata(perception_context))
+        merged_metadata["map_name"] = resolved_map_name
         tagged_location = TaggedLocation(
             location_id=build_location_id("tag"),
             name=name.strip(),
             normalized_name=normalized_name,
             aliases=self._normalize_aliases(aliases),
             pose=localization_snapshot.current_pose,
-            map_version_id=map_snapshot.version_id if map_snapshot is not None else None,
+            map_name=resolved_map_name,
             localization_session_id=str(merged_metadata.get("localization_session_id") or "") or None,
             localization_source_name=localization_snapshot.source_name,
             topo_node_id=topo_node_id,
             semantic_region_id=semantic_region_id,
             semantic_labels=semantic_labels,
             observation_id=(
-                observation_context.observation.observation_id if observation_context is not None else None
+                perception_context.observation.observation_id if perception_context is not None
+                else observation_context.observation.observation_id if observation_context is not None else None
             ),
             perception_headline=(
                 perception_context.scene_summary.headline if perception_context is not None else description
@@ -1044,6 +1583,7 @@ class MemoryService:
                 or "记录了一个可导航地点。"
             )
             memory_entry = self._create_scene_memory_entry(
+                expected_library_name=expected_library, expected_activation_generation=expected_generation,
                 title="地点记忆：" + tagged_location.name,
                 summary=scene_summary,
                 tags=[
@@ -1056,15 +1596,20 @@ class MemoryService:
                 linked_location=tagged_location,
                 camera_id=camera_id,
                 metadata={"source": "tag_location", **dict(merged_metadata)},
+                perception_context=perception_context,
+                observation_context=observation_context,
+                use_observation_snapshot=True,
+                observation_pose=observation_pose,
+                use_spatial_snapshot=True,
+                map_snapshot=observation_map,
+                localization_snapshot=observation_localization,
             )
             tagged_location = tagged_location.model_copy(
                 update={"memory_id": memory_entry.memory_id},
                 deep=True,
             )
 
-        self._tagged_locations_by_id[tagged_location.location_id] = tagged_location
-        self._tagged_location_history.append(tagged_location)
-        self._write_tagged_location_state(tagged_location)
+        self._assert_observation_library(expected_library, expected_generation)
         self._repository.upsert_tagged_location(tagged_location)
         self._upsert_vector_point_for_location(tagged_location)
         self._publish_memory_event(
@@ -1115,7 +1660,7 @@ class MemoryService:
             scene_space = self._build_semantic_exploration_scene_space(
                 query=query,
                 pose=current_pose,
-                map_version_id=entry.map_version_id,
+                map_name=entry.map_name,
                 localization_session_id=entry.localization_session_id,
                 reason=reason,
                 memory_id=entry.memory_id,
@@ -1125,10 +1670,8 @@ class MemoryService:
             scene_space = self._upsert_scene_space(scene_space)
             scene_space_id = scene_space.scene_space_id
             entry = entry.model_copy(update={"scene_space_id": scene_space.scene_space_id}, deep=True)
-            self._semantic_entries_by_id[entry.memory_id] = entry
             self._repository.upsert_semantic_memory(entry)
             self._upsert_vector_point_for_memory(entry)
-            self._write_semantic_memory_state(entry)
         return {
             "memory_enabled": True,
             "memory_written": True,
@@ -1144,7 +1687,7 @@ class MemoryService:
         *,
         query: str,
         pose: Pose,
-        map_version_id: Optional[str],
+        map_name: Optional[str],
         localization_session_id: Optional[str],
         reason: str,
         memory_id: str,
@@ -1169,7 +1712,7 @@ class MemoryService:
         )
         return SceneSpace(
             scene_space_id=build_scene_space_id("semantic_exploration"),
-            map_version_id=map_version_id,
+            map_name=map_name,
             localization_session_id=localization_session_id,
             frame_id=pose.frame_id,
             boundary=boundary,
@@ -1196,6 +1739,73 @@ class MemoryService:
             ),
         )
 
+    def capture_observation_spatial_context(self):
+        """捕获库激活代际和观察空间；读取期间切库则拒绝这次捕获。"""
+        with self._instances_lock:
+            library_name = self._active_library_name
+            generation = self._durable_index.activation_generation
+        localization = self._get_or_refresh_localization(allow_missing=True, prefer_live=True)
+        snapshot = self._get_map_snapshot()
+        with self._instances_lock:
+            if (library_name != self._active_library_name
+                    or generation != self._durable_index.activation_generation):
+                raise GatewayError("观察采集期间记忆库已切换。", error_code="memory_library_changed", http_status=409)
+        return {"library_name": library_name, "activation_generation": generation,
+                "observation_pose": localization.current_pose if localization is not None else None,
+                "localization_snapshot": localization, "map_snapshot": snapshot}
+
+    def _latest_complete_perception(self, camera_id):
+        """照片记忆只消费完整观察，兼容未提供完整缓存接口的旧提供器。"""
+        getter = getattr(self._perception_service, "get_latest_full_perception", None)
+        if not callable(getter):
+            getter = self._perception_service.get_latest_perception
+        return getter(camera_id)
+
+    def _observation_spatial_capture(self, perception_context, expected_library, expected_generation):
+        if perception_context is None:
+            return None
+        getter = getattr(self._perception_service, "get_observation_spatial_context", None)
+        captured = getter(perception_context.observation.observation_id) if callable(getter) else None
+        if captured and (captured.get("library_name") != expected_library
+                         or captured.get("activation_generation") != expected_generation):
+            raise GatewayError("观察采集后记忆库已切换，请重新观察当前场景。",
+                               error_code="memory_library_changed", http_status=409)
+        return captured
+
+    def _location_linked_to_observation(self, perception_context, snapshot, expected_library, expected_generation):
+        """只复用同一原始观察已明确关联的唯一地点，不按距离或名称猜测。"""
+        if (perception_context is None or snapshot is None
+                or not snapshot.source_name or not snapshot.source_epoch or not snapshot.frame_id):
+            return None
+        observation_id = perception_context.observation.observation_id
+        with self._instances_lock:
+            self._assert_observation_library(expected_library, expected_generation)
+            candidates = [location for location in self._tagged_locations_by_id.values()
+                if location.observation_id == observation_id
+                and self._record_library_name(location) == expected_library
+                and location.map_name == snapshot.map_name and location.pose.frame_id == snapshot.frame_id
+                and location.metadata.get("map_source_name") == snapshot.source_name
+                and location.metadata.get("map_source_epoch") == snapshot.source_epoch]
+        return candidates[0] if len(candidates) == 1 else None
+
+    def _attach_location_photo_memory(self, location, entry, expected_library, expected_generation):
+        """仅更新照片关联，沿既有仓储/outbox提交后发布缓存，地点位置保持不变。"""
+        if location is None or not entry.artifact_ids:
+            return
+        with self._instances_lock:
+            self._assert_observation_library(expected_library, expected_generation)
+            current = self._tagged_locations_by_id.get(location.location_id)
+            if current is not location:
+                raise GatewayError("照片关联期间地点已变化。", error_code="memory_location_changed", http_status=409)
+            updated = current.model_copy(update={"memory_id": entry.memory_id}, deep=True)
+        previous_scope = self._observation_write_scope()
+        self._observation_write_state.scope = {"library_name": expected_library,
+                                              "activation_generation": expected_generation}
+        try:
+            self._repository.upsert_tagged_location(updated)
+        finally:
+            self._observation_write_state.scope = previous_scope
+
     def remember_current_scene(
         self,
         *,
@@ -1205,20 +1815,61 @@ class MemoryService:
         tags: Union[List[str], Tuple[str, ...], None] = None,
         linked_location_id: Optional[str] = None,
         metadata: Optional[Dict[str, object]] = None,
+        perception_context: Optional[PerceptionContext] = None,
+        observation_pose: Optional[Pose] = None,
+        map_snapshot: Optional[MapSnapshot] = None,
+        localization_snapshot: Optional[LocalizationSnapshot] = None,
+        expected_library_name: Optional[str] = None,
     ) -> SemanticMemoryEntry:
         """把当前观察或感知结果写入语义记忆。"""
 
-        self._require_memory_enabled()
+        active_library = self._require_memory_enabled()
+        expected_generation = self._durable_index.activation_generation
+        expected_library = active_library if expected_library_name is None else str(expected_library_name).strip()
+        with self._instances_lock:
+            self._assert_observation_library(expected_library)
         linked_location = None
         if linked_location_id:
             linked_location = self._tagged_locations_by_id.get(linked_location_id)
             if linked_location is None:
                 raise GatewayError("未找到地点记忆：%s" % linked_location_id)
 
-        perception_context = self._perception_service.get_latest_perception(camera_id)
-        observation_context = self._observation_service.get_latest_observation(camera_id)
+        explicit_context = perception_context is not None
+        if explicit_context and camera_id is not None and perception_context.camera_id != camera_id:
+            raise GatewayError("关键帧观察与请求相机不一致。", error_code="perception_camera_mismatch", http_status=409)
+        if perception_context is None:
+            # 快速检测只用于即时框显示；记忆须消费仍带同帧图像与空间依据的完整分析。
+            perception_context = self._latest_complete_perception(camera_id)
+        use_spatial_snapshot = explicit_context
+        if not explicit_context:
+            captured = self._observation_spatial_capture(perception_context, expected_library, expected_generation)
+            if captured is not None:
+                observation_pose = captured.get("observation_pose")
+                map_snapshot = captured.get("map_snapshot")
+                localization_snapshot = captured.get("localization_snapshot")
+                use_spatial_snapshot = True
+        if linked_location is None:
+            linked_location = self._location_linked_to_observation(perception_context, map_snapshot, expected_library, expected_generation)
+        if linked_location is not None:
+            if self._record_library_name(linked_location) != expected_library:
+                raise GatewayError("地点已不属于当前记忆库。", error_code="memory_library_changed", http_status=409)
+            if map_snapshot is not None and (
+                linked_location.map_name != map_snapshot.map_name
+                or linked_location.pose.frame_id != map_snapshot.frame_id
+                or any(linked_location.metadata.get(key) is not None and getattr(map_snapshot, field) is not None
+                       and linked_location.metadata[key] != getattr(map_snapshot, field)
+                       for key, field in (("map_source_name", "source_name"), ("map_source_epoch", "source_epoch")))
+            ):
+                raise GatewayError("照片与地点不属于同一地图来源。", error_code="memory_map_source_changed", http_status=409)
+        # 有感知时只使用其同帧制品，不能合并另一次抓拍的观察与图像。
+        observation_context = (
+            None if perception_context is not None
+            else self._observation_service.get_latest_observation(camera_id)
+        )
         if perception_context is None and observation_context is None:
             raise GatewayError("当前没有可写入记忆的观察或感知结果。")
+        if camera_id is None:
+            camera_id = perception_context.camera_id if perception_context is not None else observation_context.camera_id
 
         if title is None:
             title = (
@@ -1244,14 +1895,26 @@ class MemoryService:
         if perception_context is not None:
             merged_metadata.update(self._build_scene_memory_metadata(perception_context))
 
-        return self._create_scene_memory_entry(
+        entry = self._create_scene_memory_entry(
             title=title,
             summary=summary,
             tags=collected_tags,
             linked_location=linked_location,
             camera_id=camera_id,
             metadata=merged_metadata,
+            perception_context=perception_context,
+            observation_context=observation_context,
+            use_observation_snapshot=True,
+            observation_pose=observation_pose,
+            use_spatial_snapshot=use_spatial_snapshot,
+            map_snapshot=map_snapshot,
+            localization_snapshot=localization_snapshot,
+            expected_library_name=expected_library,
+            expected_activation_generation=expected_generation,
         )
+
+        self._attach_location_photo_memory(linked_location, entry, expected_library, expected_generation)
+        return entry
 
     def query_location(
         self,
@@ -1268,7 +1931,7 @@ class MemoryService:
     ) -> MemoryQueryResult:
         """查询命名地点。"""
 
-        self._require_memory_enabled()
+        self._require_memory_enabled(initialize_embedders=False)
         resolved_filter = self._merge_payload_filter(
             payload_filter,
             record_kinds=[MemoryRecordKind.TAGGED_LOCATION],
@@ -1307,7 +1970,7 @@ class MemoryService:
     ) -> MemoryQueryResult:
         """查询语义记忆。"""
 
-        self._require_memory_enabled()
+        self._require_memory_enabled(initialize_embedders=False)
         resolved_filter = self._merge_payload_filter(
             payload_filter,
             record_kinds=[
@@ -1346,21 +2009,24 @@ class MemoryService:
         query: str,
         *,
         similarity_threshold: float = 0.55,
-        map_version_id: Optional[str] = None,
+        map_name: Optional[str] = None,
         localization_session_id: Optional[str] = None,
     ) -> Optional[TaggedLocation]:
         """返回最优地点命中。"""
 
         if not self.is_enabled():
             return None
+        with self._instances_lock:
+            captured_library = self._active_library_name
+            captured_generation = self._durable_index.activation_generation
         resolved_localization_session_id = str(localization_session_id or "").strip() or None
         payload_filter = (
             MemoryPayloadFilter(
                 record_kinds=[MemoryRecordKind.TAGGED_LOCATION],
-                map_version_id=map_version_id,
+                map_name=map_name,
                 localization_session_id=resolved_localization_session_id,
             )
-            if map_version_id or resolved_localization_session_id
+            if map_name or resolved_localization_session_id
             else None
         )
         result = self.query_location(
@@ -1369,9 +2035,40 @@ class MemoryService:
             limit=1,
             payload_filter=payload_filter,
         )
-        if not result.matches:
+        if result.matches:
+            return result.matches[0].tagged_location
+        # 地点属于规范地图；同一地图的精确名称不应随临时定位会话换代失效。
+        snapshot = self._get_map_snapshot() if map_name else None
+        if (snapshot is None or snapshot.map_name != map_name
+                or not snapshot.source_name or not snapshot.source_epoch or not snapshot.frame_id):
             return None
-        return result.matches[0].tagged_location
+        with self._instances_lock:
+            if (not self._memory_enabled or self._active_library_name != captured_library
+                    or self._durable_index.activation_generation != captured_generation):
+                return None
+            locations = tuple(self._tagged_locations_by_id.values())
+        normalized_query = self._normalize_text(query)
+        matches = []
+        for location in locations:
+            if (self._record_library_name(location) != captured_library
+                    or location.map_name != map_name
+                    or location.pose.frame_id != snapshot.frame_id
+                    or location.metadata.get("map_source_name") != snapshot.source_name
+                    or location.metadata.get("map_source_epoch") != snapshot.source_epoch):
+                continue
+            names = {self._normalize_text(name) for name in (location.name, *location.aliases)}
+            if normalized_query and normalized_query in names:
+                matches.append(location)
+        # 模糊命中或同名歧义继续按原检索处理，不猜测目标，不改写原采集会话。
+        if len(matches) != 1:
+            return None
+        selected = matches[0]
+        with self._instances_lock:
+            if (not self._memory_enabled or self._active_library_name != captured_library
+                    or self._durable_index.activation_generation != captured_generation
+                    or self._tagged_locations_by_id.get(selected.location_id) is not selected):
+                return None
+        return selected
 
     def _build_goal_spec_from_grounding_plan(self, grounding_plan: GroundingQueryPlan) -> GoalSpec:
         metadata = dict(grounding_plan.metadata or {})
@@ -1555,16 +2252,23 @@ class MemoryService:
         new_value = min(0.6, previous + amount)
         decay_state[key] = new_value
         if record_kind in {MemoryRecordKind.OBJECT_INSTANCE.value, "object_instance"} and record_id_str:
-            instance = self._semantic_instances_by_id.get(record_id_str)
-            if instance is not None:
-                merged_metadata = dict(instance.metadata or {})
-                merged_metadata["arrival_failure_decay"] = round(new_value, 6)
-                merged_metadata["arrival_failure_reason_code"] = reason_code
-                merged_metadata["arrival_failure_last_candidate_id"] = candidate_id_str
-                updated = instance.model_copy(update={"metadata": merged_metadata}, deep=True)
-                self._semantic_instances_by_id[record_id_str] = updated
+            # P0-3：读改写必须整体持锁，与精化 worker 写回串行。
+            with self._instances_lock:
+                instance = self._semantic_instances_by_id.get(record_id_str)
+                if instance is not None:
+                    merged_metadata = dict(instance.metadata or {})
+                    merged_metadata["arrival_failure_decay"] = round(new_value, 6)
+                    merged_metadata["arrival_failure_reason_code"] = reason_code
+                    merged_metadata["arrival_failure_last_candidate_id"] = candidate_id_str
+                    updated = instance.model_copy(update={"metadata": merged_metadata}, deep=True)
+                else:
+                    updated = None
+            if updated is not None:
                 try:
-                    self._repository.upsert_semantic_instance(updated)
+                    if self._is_long_term_static_instance(updated):
+                        self._repository.upsert_semantic_instance(updated)
+                    else:
+                        self._publish_live_instance(updated, expected=instance)
                 except Exception:
                     LOGGER.exception("写回实例衰减失败 instance_id=%s", record_id_str)
         return new_value
@@ -1573,8 +2277,9 @@ class MemoryService:
         self,
         candidate: MemoryNavigationCandidate,
         *,
-        expected_map_version_id: Optional[str],
+        expected_map_name: Optional[str],
         expected_localization_session_id: Optional[str],
+        goal_spec: Optional[GoalSpec] = None,
     ) -> GoalCandidateScoreBreakdown:
         metadata = dict(candidate.metadata or {})
         navigation_quality = metadata.get("navigation_quality") if isinstance(metadata.get("navigation_quality"), dict) else {}
@@ -1603,7 +2308,7 @@ class MemoryService:
         )
         failure_evidence = self._navigation_candidate_failure_evidence(candidate)
         failure_penalty = float(failure_evidence.get("penalty") or 0.0)
-        map_mismatch = bool(expected_map_version_id and candidate.map_version_id and candidate.map_version_id != expected_map_version_id)
+        map_mismatch = bool(expected_map_name and candidate.map_name and candidate.map_name != expected_map_name)
         localization_session_id = str(metadata.get("localization_session_id") or "") or None
         localization_mismatch = bool(
             expected_localization_session_id
@@ -1611,6 +2316,8 @@ class MemoryService:
             and localization_session_id != expected_localization_session_id
         )
         safety_score = 0.0 if quality_level == "not_navigable" or map_mismatch or localization_mismatch else 0.65 if quality_level == "needs_review" else 1.0
+        attribute_bonus = self._compute_attribute_bonus(candidate, goal_spec)
+        semantic_score = self._clamp_score(semantic_score + attribute_bonus)
         total_score = self._clamp_score(
             (0.32 * semantic_score)
             + (0.16 * spatial_score)
@@ -1636,10 +2343,41 @@ class MemoryService:
                 "failure_reason_codes": failure_evidence.get("reason_codes") or [],
                 "failure_count_since_success": failure_evidence.get("failure_count") or 0,
                 "failure_trajectory_event_ids": failure_evidence.get("trajectory_event_ids") or [],
-                "map_version_valid": not map_mismatch,
+                "map_binding_valid": not map_mismatch,
                 "localization_session_valid": not localization_mismatch,
+                "attribute_bonus": round(attribute_bonus, 6),
             },
         )
+
+    def _compute_attribute_bonus(
+        self,
+        candidate: MemoryNavigationCandidate,
+        goal_spec: Optional[GoalSpec],
+    ) -> float:
+        """计算属性匹配加成分（≤0.15），以 target_class 命中为门控。"""
+        if goal_spec is None or not goal_spec.attributes:
+            return 0.0
+        target_class = self._normalize_text(goal_spec.target_category or "")
+        metadata = dict(candidate.metadata or {})
+        candidate_text = self._normalize_text(" ".join(filter(None, [
+            str(metadata.get("label") or ""),
+            " ".join(metadata.get("semantic_labels") or []),
+            " ".join(metadata.get("visual_labels") or []),
+            " ".join(metadata.get("vision_tags") or []),
+            str(metadata.get("verification_text") or ""),
+        ])))
+        if target_class and target_class not in candidate_text:
+            return 0.0
+        matched = sum(
+            1 for attr in goal_spec.attributes
+            if not attr.hard_filter
+            and attr.operator != "not_match"
+            and attr.value
+            and self._normalize_text(attr.value) in candidate_text
+        )
+        if matched == 0:
+            return 0.0
+        return min(0.15, 0.08 * matched)
 
     def _navigation_candidate_decision(
         self,
@@ -1651,8 +2389,8 @@ class MemoryService:
         quality_level = str(navigation_quality.get("level") or metadata.get("navigation_quality_level") or "")
         reason_codes = [str(item) for item in navigation_quality.get("reason_codes") or [] if str(item)]
         reasons: List[str] = []
-        if score_breakdown.metadata.get("map_version_valid") is False:
-            reasons.append("map_version_mismatch")
+        if score_breakdown.metadata.get("map_binding_valid") is False:
+            reasons.append("map_binding_mismatch")
         if score_breakdown.metadata.get("localization_session_valid") is False:
             reasons.append("localization_session_mismatch")
         if score_breakdown.failure_penalty > 0.0:
@@ -1662,7 +2400,7 @@ class MemoryService:
         for reason in reason_codes:
             if reason not in reasons:
                 reasons.append(reason)
-        if reasons and any(reason in {"map_version_mismatch", "localization_session_mismatch", "projection_geometry_missing"} for reason in reasons):
+        if reasons and any(reason in {"map_binding_mismatch", "localization_session_mismatch", "projection_geometry_missing"} for reason in reasons):
             return "reject", reasons, False
         if quality_level == "not_navigable":
             return "reject", reasons or ["candidate_not_navigable"], False
@@ -1748,7 +2486,7 @@ class MemoryService:
         camera_id: Optional[str] = None,
         similarity_threshold: float = 0.25,
         max_age_sec: Optional[float] = None,
-        map_version_id: Optional[str] = None,
+        map_name: Optional[str] = None,
         localization_session_id: Optional[str] = None,
         goal_id: Optional[str] = None,
     ) -> Optional[MemoryNavigationCandidate]:
@@ -1759,7 +2497,7 @@ class MemoryService:
             camera_id=camera_id,
             similarity_threshold=similarity_threshold,
             max_age_sec=max_age_sec,
-            map_version_id=map_version_id,
+            map_name=map_name,
             localization_session_id=localization_session_id,
             limit=1,
             goal_id=goal_id,
@@ -1783,7 +2521,7 @@ class MemoryService:
         camera_id: Optional[str] = None,
         similarity_threshold: float = 0.25,
         max_age_sec: Optional[float] = None,
-        map_version_id: Optional[str] = None,
+        map_name: Optional[str] = None,
         localization_session_id: Optional[str] = None,
         limit: int = 5,
         goal_id: Optional[str] = None,
@@ -1798,11 +2536,8 @@ class MemoryService:
         match_limit = candidate_pool_limit
         current_pose = self._get_current_pose()
         map_snapshot = self._get_map_snapshot()
-        self._refresh_semantic_map_context(map_snapshot)
         semantic_context = self.get_navigation_semantic_context()
-        effective_map_version_id = str(
-            map_version_id or (map_snapshot.version_id if map_snapshot is not None else "")
-        ).strip() or None
+        effective_map_name = str(map_name or semantic_context.map_name or "").strip() or None
         active_localization_session_id = str(semantic_context.localization_session_id or "").strip() or None
         effective_localization_session_id = str(
             localization_session_id or active_localization_session_id or ""
@@ -1816,7 +2551,7 @@ class MemoryService:
         )
         payload_filter = self._grounding_query_planner.build_payload_filter(
             grounding_plan,
-            map_version_id=effective_map_version_id,
+            map_name=effective_map_name,
             localization_session_id=effective_localization_session_id,
         )
         if MemoryRecordKind.SCENE_SPACE not in payload_filter.record_kinds:
@@ -1887,7 +2622,7 @@ class MemoryService:
                 limit=max(requested_limit, match_limit),
                 payload_filter=MemoryPayloadFilter(
                     record_kinds=[MemoryRecordKind.TAGGED_LOCATION],
-                    map_version_id=effective_map_version_id,
+                    map_name=effective_map_name,
                     localization_session_id=effective_localization_session_id,
                 ),
                 grounding_plan=grounding_plan,
@@ -1916,17 +2651,17 @@ class MemoryService:
             "returned_candidate_count": 0,
             "fallback_used": fallback_used,
             "fallback_reason": fallback_reason,
-            "map_version_id": effective_map_version_id or "",
+            "map_name": effective_map_name or "",
             "localization_session_id": effective_localization_session_id or "",
-            "map_name": semantic_context.map_name or "",
             "camera_id": camera_id or "",
         }
         decorated_pool: List[MemoryNavigationCandidate] = []
         for candidate in candidates:
             score_breakdown = self._build_candidate_score_breakdown(
                 candidate,
-                expected_map_version_id=effective_map_version_id,
+                expected_map_name=effective_map_name,
                 expected_localization_session_id=effective_localization_session_id,
+                goal_spec=goal_spec,
             )
             decision, reasons, allowed_for_navigation = self._navigation_candidate_decision(candidate, score_breakdown)
             decorated_pool.append(
@@ -2016,16 +2751,18 @@ class MemoryService:
             candidates = {self._normalize_text(item) for item in candidate_labels if self._normalize_text(item)}
             if normalized_target not in candidates:
                 continue
-            target_pose = self._scene_space_navigation_pose(scene_space)
+            # 明确请求该区域时，候选位姿交给实时规划判断通行性。
+            target_pose = next(iter([*scene_space.inspection_poses, *scene_space.entry_poses]), None)
             if target_pose is None:
                 raise GatewayError("场景空间 %s 没有可导航的巡检或入口位姿。" % target_name)
             return NavigationGoal(
                 goal_id="nav_scene_space_%s" % self._normalize_text(target_name),
+                require_goal_orientation=False,
                 target_pose=target_pose,
                 target_name=target_name,
                 metadata={
                     "resolved_scene_space_id": scene_space.scene_space_id,
-                    "map_version_id": semantic_context.map_version_id,
+                    "map_name": semantic_context.map_name,
                     "localization_session_id": semantic_context.localization_session_id,
                     "source": "platform_navigation_scene_space",
                 },
@@ -2053,12 +2790,45 @@ class MemoryService:
                 target_name=target_name,
                 metadata={
                     "resolved_region_id": region.region_id,
-                    "map_version_id": semantic_context.map_version_id,
+                    "map_name": semantic_context.map_name,
                     "localization_session_id": semantic_context.localization_session_id,
                     "source": "platform_navigation_semantics",
                 },
             )
         raise GatewayError("未在平台语义区域中找到命名位置：%s" % target_name)
+
+    def resolve_navigation_region(self, goal: NavigationGoal) -> Optional[SceneSpace]:
+        """为明确的语义目标或区域内选点捕获对应区域。"""
+        from services.memory.room_segmentation import pose_in_scene_space
+        snapshot = self._get_map_snapshot()
+        if snapshot is None or (goal.map_name and goal.map_name != snapshot.map_name):
+            return None
+        spaces = self.current_managed_scene_spaces(snapshot, copy_records=False)
+        identifier = goal.metadata.get("resolved_scene_space_id")
+        matches = [space for space in spaces if (
+            space.scene_space_id == identifier if identifier else
+            goal.target_pose is not None and pose_in_scene_space(goal.target_pose, space))]
+        return matches[0].model_copy(deep=True) if len(matches) == 1 else None
+
+    def navigation_region_contains(self, region: SceneSpace, pose: Optional[Pose]) -> bool:
+        """使用当前地图的真实区域轮廓确认到区，不扩大目标圆容差。"""
+        from services.memory.room_segmentation import pose_in_scene_space
+        snapshot = self._get_map_snapshot()
+        if snapshot is None or pose is None or region.map_name != snapshot.map_name:
+            return False
+        try:
+            age = source_age_ns(round(pose.timestamp.timestamp()*1e9)) / 1e9 if pose.timestamp.tzinfo is not None else None
+        except SourceTimeError:
+            return False
+        if age is None or not -1 <= age <= 2:
+            return False
+        binding = region.metadata.get("map_binding", {})
+        if any(binding.get(key) != getattr(snapshot, key) for key in (
+            "map_name", "source_name", "source_epoch", "frame_id")):
+            return False
+        if binding.get("update_sequence") is None or str(binding["update_sequence"]) != str(snapshot.update_sequence):
+            return False
+        return pose_in_scene_space(pose, region)
 
     def verify_arrival(
         self,
@@ -2067,7 +2837,7 @@ class MemoryService:
         navigation_candidate: Optional[Union[MemoryNavigationCandidate, NavigationCandidate]] = None,
         camera_id: Optional[str] = None,
         similarity_threshold: float = 0.55,
-        expected_map_version_id: Optional[str] = None,
+        expected_map_name: Optional[str] = None,
         localization_session_id: Optional[str] = None,
         goal_id: Optional[str] = None,
     ) -> MemoryArrivalVerification:
@@ -2091,7 +2861,7 @@ class MemoryService:
                         "arrival_score": 0.0,
                         "arrival_reason_code": "memory_disabled",
                         "camera_id": camera_id or "",
-                        "map_version_id": expected_map_version_id or "",
+                        "map_name": expected_map_name or "",
                         "localization_session_id": localization_session_id or "",
                         "goal_id": resolved_goal_id or "",
                     },
@@ -2106,13 +2876,13 @@ class MemoryService:
             metadata_goal_id = str(legacy_candidate.metadata.get("goal_id") or "").strip()
             if metadata_goal_id:
                 resolved_goal_id = metadata_goal_id
-        effective_map_version_id = str(
-            expected_map_version_id
-            or (legacy_candidate.map_version_id if legacy_candidate is not None else "")
+        effective_map_name = str(
+            expected_map_name
+            or (legacy_candidate.map_name if legacy_candidate is not None else "")
         ).strip() or None
         semantic_context = self.get_navigation_semantic_context()
         active_localization_session_id = str(semantic_context.localization_session_id or "").strip() or None
-        if effective_map_version_id and semantic_context.map_version_id not in {None, effective_map_version_id}:
+        if effective_map_name and semantic_context.map_name not in {None, effective_map_name}:
             return self._record_arrival_verification(
                 MemoryArrivalVerification(
                     query=query,
@@ -2120,15 +2890,14 @@ class MemoryService:
                     score=0.0,
                     matched_labels=[],
                     matched_memory_id=None,
-                    reason="当前平台地图版本与导航候选版本不一致，已拒绝到点复核。",
+                    reason="当前地图与导航候选所属地图不一致，已拒绝到点复核。",
                     goal_id=resolved_goal_id,
                     candidate_id=candidate_id_from_metadata,
                     metadata={
-                        "expected_map_version_id": effective_map_version_id,
-                        "active_map_version_id": semantic_context.map_version_id,
-                        "map_version_id": semantic_context.map_version_id or "",
+                        "expected_map_name": effective_map_name,
+                        "active_map_name": semantic_context.map_name,
+                        "map_name": semantic_context.map_name or "",
                         "localization_session_id": localization_session_id or active_localization_session_id or "",
-                        "map_name": semantic_context.map_name,
                         "camera_id": camera_id or "",
                         "arrival_verified": False,
                         "arrival_score": 0.0,
@@ -2150,13 +2919,12 @@ class MemoryService:
                     goal_id=resolved_goal_id,
                     candidate_id=candidate_id_from_metadata,
                     metadata={
-                        "expected_map_version_id": effective_map_version_id,
-                        "active_map_version_id": semantic_context.map_version_id,
-                        "map_version_id": semantic_context.map_version_id or "",
+                        "expected_map_name": effective_map_name,
+                        "active_map_name": semantic_context.map_name,
+                        "map_name": semantic_context.map_name or "",
                         "expected_localization_session_id": localization_session_id,
                         "active_localization_session_id": active_localization_session_id,
                         "localization_session_id": active_localization_session_id or "",
-                        "map_name": semantic_context.map_name,
                         "camera_id": camera_id or "",
                         "arrival_verified": False,
                         "arrival_score": 0.0,
@@ -2213,7 +2981,7 @@ class MemoryService:
         image_score = 0.0
         target_point = None
         if legacy_candidate is not None:
-            target_point = self._vector_store.get_point(legacy_candidate.record_id)
+            target_point = self._durable_index.validated_point(legacy_candidate.record_id)
         if self._image_embedder is not None and perception_context.image_artifact is not None:
             current_image_bytes = self._load_image_bytes(perception_context.image_artifact.artifact_id)
             if current_image_bytes is not None:
@@ -2278,8 +3046,7 @@ class MemoryService:
                 "record_kind": legacy_candidate.record_kind.value if legacy_candidate is not None else "",
                 "candidate_id": candidate_id_from_metadata or "",
                 "goal_id": resolved_goal_id or "",
-                "map_name": semantic_context.map_name,
-                "map_version_id": effective_map_version_id or semantic_context.map_version_id,
+                "map_name": effective_map_name or semantic_context.map_name,
                 "localization_session_id": localization_session_id or active_localization_session_id,
                 "arrival_verified": verified,
                 "arrival_score": round(score, 6),
@@ -2294,7 +3061,21 @@ class MemoryService:
 
         last_location = self._tagged_location_history[-1] if self._tagged_location_history else None
         last_memory = self._semantic_history[-1] if self._semantic_history else None
-        vector_counts = self._vector_store.count_vectors_by_name()
+        visible = [(kind, record) for kind, records in (
+            ("location", self._tagged_locations_by_id), ("memory", self._semantic_entries_by_id),
+            ("instance", self._semantic_instances_by_id), ("event", self._observation_events_by_id),
+            ("scene", self._scene_spaces_by_id)) for record in list(records.values())]
+        provenance_counts, vector_counts, collection_counts = {}, {}, {}
+        point_count = 0
+        for offset in range(0, len(visible), 128):
+            page, counts = self._durable_index.query_snapshot(visible[offset:offset + 128], include_readiness=False)
+            for key, value in counts.items():
+                provenance_counts[key] = provenance_counts.get(key, 0) + value
+            point_count += len(page)
+            for _, _, point, _ in page:
+                collection_counts[point.collection_name] = collection_counts.get(point.collection_name, 0) + 1
+                for name in point.vectors:
+                    vector_counts[name] = vector_counts.get(name, 0) + 1
         text_model = self._text_embedder.model_name if self._text_embedder is not None else "disabled"
         text_dimension = self._text_embedder.dimension if self._text_embedder is not None else 0
         grounding_provider = resolve_grounding_provider_spec()
@@ -2323,9 +3104,12 @@ class MemoryService:
                 "image_embedding_dimension": self._image_embedder.dimension if self._image_embedder is not None else 0,
                 "image_embedding_provider": dict(self._image_embedding_provider_metadata),
                 "grounding_provider": grounding_provider.to_metadata(),
-                "vector_point_count": self._vector_store.count_points(),
-                "collection_counts": self._vector_store.count_points_by_collection(),
+                "vector_point_count": point_count,
+                "collection_counts": collection_counts,
                 "named_vector_counts": vector_counts,
+                "vector_provenance_counts": provenance_counts,
+                "indexing": self._durable_index.scoped_status(),
+                "scene_identity": {key: list(values) for key, values in self._scene_identity_diagnostics.items()},
                 "semantic_instance_count": len(self._semantic_instances_by_id),
                 "observation_event_count": len(self._observation_events_by_id),
                 "scene_space_count": len(self._scene_spaces_by_id),
@@ -2340,32 +3124,30 @@ class MemoryService:
         *,
         map_name: Optional[str] = None,
     ) -> NavigationSemanticContext:
-        """返回当前平台地图版本绑定的语义导航上下文。"""
+        """返回当前命名地图绑定的语义导航上下文。"""
 
-        map_snapshot = self._get_map_snapshot()
-        map_context = self._refresh_semantic_map_context(map_snapshot)
+        map_snapshot, map_context = self._capture_current_semantic_map_context(map_name=map_name)
         active_session = self._localization_service.get_active_session()
-        resolved_map_name = (
-            str(map_name or "").strip()
-            or (active_session.map_name if active_session is not None else "")
-            or str(self._active_library_name or "").strip()
-            or None
+        resolved_map_name = self._resolve_stable_map_name(
+            map_name=map_name,
+            map_snapshot=map_snapshot,
         )
         localization_session_id = None
         localization_ready = False
         if active_session is not None and (
-            map_context.map_version_id is None or active_session.map_version_id == map_context.map_version_id
+            map_context.map_name is None or active_session.map_name == map_context.map_name
         ):
             localization_session_id = active_session.session_id
             localization_ready = bool(active_session.pose_available)
         dynamic_anchors = self._build_dynamic_instance_anchors()
+        managed_spaces = self.current_managed_scene_spaces(map_snapshot)
+        current_scene_spaces = [*map_context.scene_spaces, *managed_spaces]
         context = NavigationSemanticContext(
             map_name=resolved_map_name,
-            map_version_id=map_context.map_version_id,
             localization_session_id=localization_session_id,
             localization_ready=localization_ready,
             semantic_regions=[item.model_copy(deep=True) for item in map_context.semantic_regions],
-            scene_spaces=[item.model_copy(deep=True) for item in map_context.scene_spaces],
+            scene_spaces=[item.model_copy(deep=True) for item in current_scene_spaces],
             topology_nodes=self._build_topology_node_summaries(map_context),
             anchors=[
                 *[item.model_copy(deep=True) for item in map_context.anchors_by_id.values()],
@@ -2375,9 +3157,9 @@ class MemoryService:
                 "active_library_name": self._active_library_name,
                 "frame_id": map_context.frame_id,
                 "semantic_region_count": len(map_context.semantic_regions),
-                "scene_space_count": len(map_context.scene_spaces),
-                "scene_space_candidates": [self._scene_space_context_summary(item) for item in map_context.scene_spaces[:12]],
-                "scene_space_evidence_summary": self._summarize_scene_space_evidence(map_context.scene_spaces),
+                "scene_space_count": len(current_scene_spaces),
+                "scene_space_candidates": [self._scene_space_context_summary(item) for item in current_scene_spaces[:12]],
+                "scene_space_evidence_summary": self._summarize_scene_space_evidence(current_scene_spaces),
                 "topology_node_count": len(map_context.topology_nodes_by_id),
                 "anchor_count": len(map_context.anchors_by_id) + len(dynamic_anchors),
                 "localization_session_status": active_session.status.value if active_session is not None else None,
@@ -2390,8 +3172,7 @@ class MemoryService:
             source="memory_service",
             metadata={
                 "kind": "navigation_semantic_context",
-                "map_name": resolved_map_name,
-                "map_version_id": context.map_version_id,
+                "map_name": context.map_name,
             },
         )
         return context
@@ -2408,7 +3189,7 @@ class MemoryService:
                     node_id=node_id,
                     label=label,
                     frame_id=map_context.frame_id,
-                    map_version_id=map_context.map_version_id,
+                    map_name=map_context.map_name,
                     anchor_id=str(node.get("anchor_id") or "") or None,
                     pose=self._build_topology_node_pose(node, frame_id=map_context.frame_id),
                     aliases=self._normalize_aliases([*(node.get("aliases") or []), *(node.get("labels") or [])]),
@@ -2426,27 +3207,80 @@ class MemoryService:
         *,
         map_snapshot=None,
         localization_snapshot=None,
-        map_version_id: Optional[str] = None,
+        map_name: Optional[str] = None,
     ) -> Dict[str, object]:
-        active_session = self._localization_service.get_active_session()
-        resolved_map_version_id = str(
-            map_version_id
-            or (map_snapshot.version_id if map_snapshot is not None else "")
-            or (active_session.map_version_id if active_session is not None else "")
-        ).strip() or None
-        resolved_map_name = str(
-            (active_session.map_name if active_session is not None else "")
-            or (self._active_library_name or "")
-        ).strip() or None
+        active_session = self._observation_localization_session()
+        resolved_map_name = self._resolve_stable_map_name(
+            map_name=map_name,
+            map_snapshot=map_snapshot,
+            localization_snapshot=localization_snapshot,
+        )
+        session_matches_map = bool(
+            active_session is not None
+            and (
+                resolved_map_name is None
+                or str(active_session.map_name or "").strip() == resolved_map_name
+            )
+        )
+        asset_id = (getattr(getattr(active_session, "asset_identity", None), "asset_id", None)
+                    if session_matches_map else None)
         return {
             "map_name": resolved_map_name,
-            "map_version_id": resolved_map_version_id,
-            "localization_session_id": active_session.session_id if active_session is not None else None,
-            "localization_session_status": active_session.status.value if active_session is not None else None,
+            **({"map_asset_id": asset_id} if asset_id else {}),
+            "map_source_name": getattr(map_snapshot, "source_name", None),
+            "map_source_epoch": getattr(map_snapshot, "source_epoch", None),
+            "map_update_sequence": (str(map_snapshot.update_sequence)
+                                    if getattr(map_snapshot, "update_sequence", None) is not None else None),
+            "localization_session_id": active_session.session_id if session_matches_map else None,
+            "localization_session_status": active_session.status.value if session_matches_map else None,
             "localization_source_name": (
                 localization_snapshot.source_name if localization_snapshot is not None else None
             ),
         }
+
+    def _resolve_stable_map_name(
+        self,
+        *,
+        map_name: Optional[str] = None,
+        map_snapshot=None,
+        localization_snapshot: Optional[LocalizationSnapshot] = None,
+    ) -> Optional[str]:
+        active_session = self._observation_localization_session()
+        map_metadata = dict(getattr(map_snapshot, "metadata", {}) or {})
+        localization_metadata = dict(
+            getattr(localization_snapshot, "metadata", {}) or {}
+        )
+        explicit_name = str(map_name or "").strip() or None
+        session_name = (
+            str(active_session.map_name or "").strip() or None
+            if active_session is not None
+            else None
+        )
+        snapshot_name = (
+            str(getattr(map_snapshot, "map_name", "") or "").strip() or None
+        )
+        authoritative_names = [
+            candidate
+            for candidate in (explicit_name, session_name, snapshot_name)
+            if candidate is not None
+        ]
+        if len(set(authoritative_names)) > 1:
+            raise GatewayError(
+                "地图名称与当前定位会话或地图快照不一致。",
+                error_code="map_snapshot_name_mismatch",
+            )
+        for candidate in (
+            explicit_name,
+            session_name,
+            snapshot_name,
+            map_metadata.get("map_name"),
+            localization_metadata.get("map_name"),
+            self._active_library_name,
+        ):
+            resolved = str(candidate or "").strip()
+            if resolved:
+                return resolved
+        return None
 
     def _build_topology_node_pose(self, node: Dict[str, object], *, frame_id: str) -> Optional[Pose]:
         try:
@@ -2461,21 +3295,208 @@ class MemoryService:
             orientation=Quaternion(w=1.0),
         )
 
-    def list_tagged_locations(self, *, limit: Optional[int] = None) -> Tuple[TaggedLocation, ...]:
-        """列出地点记忆。"""
+    def list_tagged_locations(
+        self,
+        *,
+        limit: Optional[int] = None,
+        library_name: Optional[str] = None,
+    ) -> Tuple[TaggedLocation, ...]:
+        """列出地点记忆。
 
-        items = list(self._tagged_location_history)
+        参数:
+            limit: 返回的最大条数（按写入顺序倒序截取最近 N 条）。
+            library_name: 若指定则仅返回该记忆库的地点；未指定时按当前激活库
+                ``_active_library_name`` 自动过滤；激活库未启用时返回空 tuple。
+                显式传 ``library_name=""`` 视为"未启用"语义，返回空 tuple。
+        """
+
+        target_library = library_name if library_name is not None else self._active_library_name
+        if not target_library:
+            return tuple()
+        items = [
+            item
+            for item in self._tagged_location_history
+            if self._record_library_name(item) == target_library
+        ]
         if limit is not None:
             items = items[-max(0, limit) :]
         return tuple(items)
 
-    def list_semantic_memories(self, *, limit: Optional[int] = None) -> Tuple[SemanticMemoryEntry, ...]:
-        """列出语义记忆。"""
+    def list_semantic_memories(
+        self,
+        *,
+        limit: Optional[int] = None,
+        library_name: Optional[str] = None,
+    ) -> Tuple[SemanticMemoryEntry, ...]:
+        """列出语义记忆。
 
-        items = list(self._semantic_history)
+        参数:
+            limit: 返回的最大条数（按写入顺序倒序截取最近 N 条）。
+            library_name: 若指定则仅返回该记忆库的语义记忆；未指定时按当前激活库
+                自动过滤；激活库未启用时返回空 tuple。
+        """
+
+        target_library = library_name if library_name is not None else self._active_library_name
+        if not target_library:
+            return tuple()
+        items = [
+            item
+            for item in self._semantic_history
+            if self._record_library_name(item) == target_library
+        ]
         if limit is not None:
             items = items[-max(0, limit) :]
         return tuple(items)
+
+    def list_semantic_instances(
+        self,
+        *,
+        library_name: Optional[str] = None,
+        label: Optional[str] = None,
+    ) -> List[Dict[str, object]]:
+        """列出指定库的实例及真实空间证据；无激活库时返回空列表。
+
+        观察者位置与物体位置通过 observation_only 区分；is_fallback 表示
+        尚无可展示的地图物体位置，不再用识别置信度猜测几何是否成立。
+        navigable 仅保留明确通过质量判断且当前仍有效的结果。
+        """
+        target_library = (
+            str(library_name).strip() if library_name is not None else self._active_library_name
+        )
+        if not target_library:
+            return []
+        resolved_now = utc_now()
+        stored = self._repository.load_semantic_instances(library_name=target_library)
+        by_id = {item.instance_id: item for item in stored}
+        # 当前库连续感知的坐标比关键帧持久记录更新，不能让磁盘快照遮蔽它。
+        with self._instances_lock:
+            if target_library == self._active_library_name:
+                by_id.update({key: item for key, item in self._semantic_instances_by_id.items()
+                              if self._record_library_name(item) == target_library})
+        instances = sorted(by_id.values(), key=self._instance_view_order, reverse=True)
+        return self._semantic_instance_rows(instances, target_library, resolved_now, label=label)
+
+    @staticmethod
+    def _instance_view_order(item):
+        timestamp = item.last_seen_ts
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=utc_now().tzinfo)
+        return timestamp, item.instance_id
+
+    def get_semantic_instances_snapshot(self, *, limit: int = 500) -> Dict[str, object]:
+        """实时视图只读取当前库内存；限量后才投影轻量字段，不读取数据库。"""
+        limit = max(1, min(1000, int(limit)))
+        now = utc_now()
+        with self._instances_lock:
+            library = self._active_library_name if self._memory_enabled else None
+            instances = tuple(item for item in self._semantic_instances_by_id.values()
+                              if library and self._record_library_name(item) == library)
+        selected = heapq.nlargest(limit, instances, key=self._instance_view_order)
+        rows = self._semantic_instance_rows(selected, library or "", now)
+        # 无新观察时只在下一个生命周期边界唤醒一次，避免定频扫库。
+        deadlines = []
+        policy = self._instance_association_service
+        for item in selected:
+            timestamp = self._instance_view_order(item)[0].timestamp()
+            for durations in (policy._UNCERTAIN_AFTER_SEC, policy._STALE_AFTER_SEC, policy._REMOVED_AFTER_SEC):
+                deadline = timestamp + durations[item.movability]
+                if deadline > now.timestamp():
+                    deadlines.append(deadline)
+        return {
+            "instances": rows, "library_name": library, "active_library_name": library,
+            "total": len(instances), "limit": limit, "truncated": len(instances) > limit,
+            "_next_update_at": min(deadlines) if deadlines else None,
+        }
+
+    def _semantic_instance_rows(self, instances, target_library, resolved_now, *, label=None):
+        label_lower = str(label).lower().strip() if label else None
+        lifecycle_order = {
+            InstanceLifecycleState.ACTIVE: 0,
+            InstanceLifecycleState.UNCERTAIN: 1,
+            InstanceLifecycleState.STALE: 2,
+            InstanceLifecycleState.REMOVED: 3,
+        }
+        result: List[Dict[str, object]] = []
+        for inst in instances:
+            if label_lower is not None and str(inst.label).lower().strip() != label_lower:
+                continue
+            pose = inst.pose
+            frame_id = pose.frame_id if pose else ""
+            pos = pose.position if pose else None
+            valid_position = pos is not None and all(math.isfinite(value) for value in (pos.x, pos.y, pos.z))
+            map_matches_library = str(inst.map_name or "").strip() == target_library
+            metadata = dict(inst.metadata or {})
+            projection_method = str(metadata.get("projection_method") or "").strip()
+            observation_only = (
+                self._coerce_optional_bool(metadata.get("observation_only")) is True
+                or projection_method == "current_pose_fallback"
+            )
+            is_fallback = (
+                observation_only or not valid_position or frame_id != DEFAULT_MAP_FRAME
+                or projection_method.lower() in {"", "unknown", "none"} or not map_matches_library
+            )
+            projection_confidence = self._coerce_optional_float(metadata.get("projection_confidence"))
+            if projection_confidence is not None and not math.isfinite(projection_confidence):
+                projection_confidence = None
+            dynamic_state = self._instance_dynamic_state(inst)
+            lifecycle_source = inst
+            if inst.last_seen_ts.tzinfo is None:
+                lifecycle_source = inst.model_copy(
+                    update={"last_seen_ts": inst.last_seen_ts.replace(tzinfo=resolved_now.tzinfo)},
+                )
+            aged_state = self._instance_association_service._lifecycle_values(lifecycle_source, now=resolved_now)[0]
+            # 展示时复用关联老化规则，只读派生；不能重新激活已明确失效的记录。
+            lifecycle_state = max(
+                (inst.lifecycle_state, aged_state), key=lifecycle_order.__getitem__,
+            ).value
+            navigable = (
+                self._coerce_optional_bool(metadata.get("navigable")) is True
+                and not is_fallback
+                and lifecycle_state == InstanceLifecycleState.ACTIVE.value
+                and self._is_long_term_static_instance(inst)
+            )
+            non_navigable_reason = str(metadata.get("non_navigable_reason") or "")
+            if not navigable and not non_navigable_reason:
+                if not valid_position:
+                    non_navigable_reason = "invalid_object_position"
+                elif not map_matches_library:
+                    non_navigable_reason = "map_binding_mismatch"
+                elif observation_only:
+                    non_navigable_reason = "observation_only"
+                elif is_fallback:
+                    non_navigable_reason = "object_position_unverified"
+                elif lifecycle_state != InstanceLifecycleState.ACTIVE.value:
+                    non_navigable_reason = "instance_not_active"
+                elif not self._is_long_term_static_instance(inst):
+                    non_navigable_reason = "not_long_term_static_target"
+                else:
+                    non_navigable_reason = "navigation_unverified"
+            result.append(
+                {
+                    "instance_id": inst.instance_id,
+                    "label": inst.label,
+                    "display_name": inst.display_name or inst.label,
+                    "pose": {"x": pos.x, "y": pos.y, "z": pos.z} if valid_position else None,
+                    "object_extent": object_extent_payload(inst) if valid_position else None,
+                    "frame_id": frame_id,
+                    "confidence": inst.confidence if math.isfinite(inst.confidence) else None,
+                    "instance_type": inst.instance_type,
+                    "last_seen_ts": lifecycle_source.last_seen_ts.isoformat(),
+                    "is_fallback": is_fallback,
+                    "map_name": inst.map_name,
+                    "library_name": target_library,
+                    "observation_only": observation_only,
+                    "navigable": navigable,
+                    "non_navigable_reason": non_navigable_reason if not navigable else "",
+                    "projection_method": projection_method,
+                    "projection_confidence": projection_confidence,
+                    "support_point_count": self._coerce_optional_int(metadata.get("support_point_count")) or 0,
+                    "observation_count": inst.observation_count,
+                    "lifecycle_state": lifecycle_state,
+                    "dynamic_state": dynamic_state.value,
+                }
+            )
+        return result
 
     def list_scene_spaces(
         self,
@@ -2483,17 +3504,18 @@ class MemoryService:
         limit: Optional[int] = None,
         payload_filter: Optional[MemoryPayloadFilter] = None,
         scene_space_ids: Optional[List[str]] = None,
-        map_version_id: Optional[str] = None,
+        map_name: Optional[str] = None,
         localization_session_id: Optional[str] = None,
         review_statuses: Optional[List[Union[SceneSpaceReviewStatus, str]]] = None,
     ) -> Tuple[SceneSpace, ...]:
         """列出当前记忆库内的场景空间。"""
 
-        active_library = self._require_memory_enabled()
+        active_library = self._require_memory_enabled(initialize_embedders=False)
         if payload_filter is None:
             spaces = self._repository.list_scene_spaces(
+                library_name=active_library,
                 scene_space_ids=scene_space_ids,
-                map_version_id=map_version_id,
+                map_name=map_name,
                 localization_session_id=localization_session_id,
                 review_statuses=review_statuses,
                 limit=limit,
@@ -2502,8 +3524,8 @@ class MemoryService:
             resolved_filter = payload_filter.model_copy(deep=True)
             if scene_space_ids is not None:
                 resolved_filter.scene_space_ids = list(scene_space_ids)
-            if map_version_id is not None:
-                resolved_filter.map_version_id = map_version_id
+            if map_name is not None:
+                resolved_filter.map_name = map_name
             if localization_session_id is not None:
                 resolved_filter.localization_session_id = localization_session_id
             if review_statuses is not None:
@@ -2512,11 +3534,11 @@ class MemoryService:
                     for item in review_statuses
                 ]
             resolved_filter.record_kinds = [MemoryRecordKind.SCENE_SPACE]
-            spaces = self._repository.query_scene_spaces(resolved_filter, limit=limit)
-        visible_spaces = [space for space in spaces if self._record_library_name(space) == active_library]
-        for space in visible_spaces:
-            self._cache_scene_space(space)
-        return tuple(visible_spaces)
+            spaces = self._repository.query_scene_spaces(
+                resolved_filter, library_name=active_library, limit=limit,
+            )
+        # 查询只返回已按库筛选的快照；缓存由激活与写入维护，避免迟到读取污染新库。
+        return tuple(spaces)
 
     def query_scene_spaces(
         self,
@@ -2533,7 +3555,7 @@ class MemoryService:
     ) -> MemoryQueryResult:
         """查询场景空间。"""
 
-        self._require_memory_enabled()
+        active_library = self._require_memory_enabled(initialize_embedders=False)
         resolved_filter = self._merge_payload_filter(
             payload_filter,
             record_kinds=[MemoryRecordKind.SCENE_SPACE],
@@ -2550,12 +3572,11 @@ class MemoryService:
                 payload_filter=resolved_filter,
                 grounding_plan=grounding_plan,
                 include_non_direct_navigation_candidates=include_non_direct_navigation_candidates,
+                default_query_scope="scene_space",
             )
-        spaces = [
-            space
-            for space in self._repository.query_scene_spaces(resolved_filter, limit=limit)
-            if self._record_library_name(space) == self._active_library_name
-        ]
+        spaces = self._repository.query_scene_spaces(
+            resolved_filter, library_name=active_library, limit=limit,
+        )
         current_pose = self._get_current_pose()
         matches = [
             self._build_scene_space_filter_match(space, current_pose=current_pose)
@@ -2581,7 +3602,7 @@ class MemoryService:
     def upsert_scene_space(self, scene_space: Union[SceneSpace, Dict[str, object]]) -> SceneSpace:
         """写入或更新场景空间。"""
 
-        self._require_memory_enabled()
+        self._require_memory_enabled(initialize_embedders=False)
         space = scene_space if isinstance(scene_space, SceneSpace) else SceneSpace.model_validate(scene_space)
         return self._upsert_scene_space(space)
 
@@ -2633,6 +3654,8 @@ class MemoryService:
                 ) from exc
         if attributes is not None:
             updates["attributes"] = {**dict(current.attributes), **dict(attributes)}
+        if current.metadata.get(MANAGED_KEY) and (primary_label is not None or human_aliases is not None):
+            updates["metadata"].update({"label_locked": True, "label_source": "explicit_review"})
         return self._upsert_scene_space(current.model_copy(update=updates, deep=True))
 
     def delete_scene_spaces(self, scene_space_ids: List[str]) -> int:
@@ -2643,21 +3666,15 @@ class MemoryService:
         if not normalized_ids:
             return 0
         allowed_ids: List[str] = []
+        expected_tokens = {}
         for scene_space_id in normalized_ids:
             space = self._scene_spaces_by_id.get(scene_space_id) or self._repository.load_scene_space(scene_space_id)
             if space is not None and self._record_library_name(space) == active_library:
                 allowed_ids.append(scene_space_id)
+                expected_tokens[scene_space_id] = getattr(space, TOKEN, None)
         if not allowed_ids:
             return 0
-        deleted = self._repository.delete_scene_spaces(allowed_ids)
-        self._vector_store.delete_points(allowed_ids)
-        for scene_space_id in allowed_ids:
-            self._scene_spaces_by_id.pop(scene_space_id, None)
-        self._scene_space_history = deque(
-            [space for space in self._scene_space_history if space.scene_space_id not in set(allowed_ids)],
-            maxlen=self._scene_space_history.maxlen,
-        )
-        return deleted
+        return self._repository.delete_scene_spaces(allowed_ids, expected_tokens=expected_tokens)
 
     def _create_scene_memory_entry(
         self,
@@ -2668,11 +3685,77 @@ class MemoryService:
         linked_location: Optional[TaggedLocation],
         camera_id: Optional[str],
         metadata: Optional[Dict[str, object]],
+        perception_context: Optional[PerceptionContext] = None,
+        observation_context=None,
+        use_observation_snapshot: bool = False,
+        observation_pose: Optional[Pose] = None,
+        use_spatial_snapshot: bool = False,
+        map_snapshot: Optional[MapSnapshot] = None,
+        localization_snapshot: Optional[LocalizationSnapshot] = None,
+        expected_library_name: Optional[str] = None,
+        expected_activation_generation: Optional[int] = None,
     ) -> SemanticMemoryEntry:
-        localization_snapshot = self._get_or_refresh_localization(allow_missing=True, prefer_live=True)
-        map_snapshot = self._get_map_snapshot()
-        observation_context = self._observation_service.get_latest_observation(camera_id)
-        perception_context = self._perception_service.get_latest_perception(camera_id)
+        expected_library = (
+            self._require_memory_enabled(initialize_embedders=False) if expected_library_name is None else expected_library_name
+        )
+        expected_generation = self._durable_index.activation_generation if expected_activation_generation is None else expected_activation_generation
+        if not use_observation_snapshot:
+            observation_context = self._observation_service.get_latest_observation(camera_id)
+            perception_context = self._perception_service.get_latest_perception(camera_id)
+        with self._artifact_evidence_scope(observation_context, perception_context):
+            self._ensure_embedders_initialized()
+            if not use_spatial_snapshot:
+                localization_snapshot = self._get_or_refresh_localization(allow_missing=True, prefer_live=True)
+                map_snapshot = self._get_map_snapshot()
+            vector_tasks = []
+            with self._instances_lock:
+                self._assert_observation_library(expected_library, expected_generation)
+            previous_scope = self._observation_write_scope()
+            self._observation_write_state.scope = {
+                "library_name": expected_library,
+                "activation_generation": expected_generation,
+                "use_spatial_snapshot": use_spatial_snapshot,
+                "map_snapshot": map_snapshot,
+                "localization_snapshot": localization_snapshot,
+                "vector_tasks": vector_tasks,
+            }
+            try:
+                entry = self._commit_scene_memory_entry(
+                    title=title, summary=summary, tags=tags, linked_location=linked_location,
+                    camera_id=camera_id, metadata=metadata, perception_context=perception_context,
+                    observation_context=observation_context, observation_pose=observation_pose,
+                    map_snapshot=map_snapshot, localization_snapshot=localization_snapshot,
+                )
+            finally:
+                self._observation_write_state.scope = previous_scope
+            # 远端图文向量计算和队列投递不持有结构提交锁。
+            for task in vector_tasks:
+                self._dispatch_vectorization_task(task)
+            with self._instances_lock:
+                self._assert_observation_library(expected_library, expected_generation)
+            self._publish_memory_event(
+                "memory.entry_created",
+                "语义记忆 %s 已写入。" % entry.title,
+                payload={"memory_id": entry.memory_id, "title": entry.title},
+            )
+            return entry
+
+    def _commit_scene_memory_entry(
+        self,
+        *,
+        title: str,
+        summary: Optional[str],
+        tags: Union[List[str], Tuple[str, ...], None],
+        linked_location: Optional[TaggedLocation],
+        camera_id: Optional[str],
+        metadata: Optional[Dict[str, object]],
+        perception_context: Optional[PerceptionContext],
+        observation_context,
+        observation_pose: Optional[Pose],
+        map_snapshot: Optional[MapSnapshot],
+        localization_snapshot: Optional[LocalizationSnapshot],
+    ) -> SemanticMemoryEntry:
+        """在固定库的结构临界区内提交观察及其派生结构，向量暂存到当前任务。"""
         artifact_ids: List[str] = []
         if observation_context is not None and observation_context.image_artifact is not None:
             artifact_ids.append(observation_context.image_artifact.artifact_id)
@@ -2680,19 +3763,16 @@ class MemoryService:
             if perception_context.image_artifact.artifact_id not in artifact_ids:
                 artifact_ids.append(perception_context.image_artifact.artifact_id)
 
-        pose = None
-        if linked_location is not None:
-            pose = linked_location.pose
-        elif localization_snapshot is not None:
+        # 地点关联不是观察坐标的替代品；照片保留其采集时位姿和时间。
+        pose = observation_pose
+        if pose is None and localization_snapshot is not None:
             pose = localization_snapshot.current_pose
+        if pose is None and linked_location is not None and perception_context is None and observation_context is None:
+            pose = linked_location.pose
         semantic_region_id = None
         semantic_labels: List[str] = []
         topo_node_id = None
-        if linked_location is not None:
-            semantic_region_id = linked_location.semantic_region_id
-            semantic_labels = list(linked_location.semantic_labels)
-            topo_node_id = linked_location.topo_node_id
-        elif pose is not None:
+        if pose is not None:
             semantic_region_id, semantic_labels = self._resolve_semantic_region(
                 pose,
                 map_snapshot.semantic_map if map_snapshot is not None else None,
@@ -2716,6 +3796,20 @@ class MemoryService:
         if perception_context is not None:
             merged_metadata.update(self._build_scene_memory_metadata(perception_context))
 
+        resolved_map_name = (
+            linked_location.map_name
+            if linked_location is not None
+            else str(merged_metadata.get("map_name") or "").strip() or None
+        )
+        merged_metadata["map_name"] = resolved_map_name
+        # 观察来源以捕获快照为准，调用方注释不能伪造跨地图证据。
+        merged_metadata.update({
+            "map_source_name": getattr(map_snapshot, "source_name", None),
+            "map_source_epoch": getattr(map_snapshot, "source_epoch", None),
+            "map_update_sequence": (str(map_snapshot.update_sequence)
+                                    if getattr(map_snapshot, "update_sequence", None) is not None else None),
+        })
+
         entry = SemanticMemoryEntry(
             memory_id=build_memory_id("scene"),
             kind=MemoryRecordKind.SCENE if linked_location is None else MemoryRecordKind.NOTE,
@@ -2724,17 +3818,14 @@ class MemoryService:
             tags=self._normalize_tags(tags),
             linked_location_id=linked_location.location_id if linked_location is not None else None,
             pose=pose,
-            map_version_id=(
-                linked_location.map_version_id
-                if linked_location is not None
-                else map_snapshot.version_id if map_snapshot is not None else None
-            ),
+            map_name=resolved_map_name,
             localization_session_id=str(merged_metadata.get("localization_session_id") or "") or None,
             topo_node_id=topo_node_id,
             semantic_region_id=semantic_region_id,
             semantic_labels=semantic_labels,
             observation_id=(
-                observation_context.observation.observation_id if observation_context is not None else None
+                observation_context.observation.observation_id if observation_context is not None
+                else perception_context.observation.observation_id if perception_context is not None else None
             ),
             perception_headline=(
                 perception_context.scene_summary.headline if perception_context is not None else None
@@ -2742,9 +3833,6 @@ class MemoryService:
             artifact_ids=artifact_ids,
             metadata=merged_metadata,
         )
-        self._semantic_entries_by_id[entry.memory_id] = entry
-        self._semantic_history.append(entry)
-        self._write_semantic_memory_state(entry)
         self._repository.upsert_semantic_memory(entry)
         self._upsert_vector_point_for_memory(entry)
         self._ingest_spatial_semantic_observation(
@@ -2756,14 +3844,24 @@ class MemoryService:
             current_pose=pose,
             camera_id=camera_id,
         )
-        self._publish_memory_event(
-            "memory.entry_created",
-            "语义记忆 %s 已写入。" % entry.title,
-            payload={"memory_id": entry.memory_id, "title": entry.title},
-        )
         return entry
 
-    def _query_records(
+    def _query_records(self, query: str, **kwargs) -> MemoryQueryResult:
+        """Reuse exact lexical/fuzzy scores within this query and its retries."""
+        previous = getattr(self._query_score_state, "cache", None)
+        if previous is None:
+            self._query_score_state.cache = {}
+            self._query_score_state.fuzzy_cache = {}
+        try:
+            return self._query_records_impl(query, **kwargs)
+        finally:
+            if previous is None:
+                del self._query_score_state.cache
+                del self._query_score_state.fuzzy_cache
+                if hasattr(self._query_score_state, "lexical_query"):
+                    del self._query_score_state.lexical_query
+
+    def _query_records_impl(
         self,
         query: str,
         *,
@@ -2773,9 +3871,15 @@ class MemoryService:
         payload_filter: Optional[MemoryPayloadFilter],
         grounding_plan: Optional[GroundingQueryPlan] = None,
         include_non_direct_navigation_candidates: bool = False,
+        default_query_scope: str = "mixed",
+        _snapshot_retry: int = 0,
     ) -> MemoryQueryResult:
         normalized_query = self._normalize_text(query)
-        query_scope = str(((grounding_plan.metadata if grounding_plan is not None else {}) or {}).get("query_scope") or "mixed").strip() or "mixed"
+        query_scope = str(
+            ((grounding_plan.metadata if grounding_plan is not None else {}) or {}).get("query_scope")
+            or default_query_scope
+            or "mixed"
+        ).strip() or "mixed"
         if not normalized_query:
             raise GatewayError(
                 "查询文本不能为空。",
@@ -2784,71 +3888,174 @@ class MemoryService:
                 jsonrpc_code=-32602,
             )
         current_pose = self._get_current_pose()
-        query_text_vector = self._text_embedder.embed_text(query)
-        query_image_vector = None
-        if self._image_embedder is not None:
-            if (
-                self._image_embedder.model_name == self._text_embedder.model_name
-                and self._image_embedder.dimension == self._text_embedder.dimension
-            ):
-                query_image_vector = query_text_vector
-            else:
-                query_image_vector = self._image_embedder.embed_text(query)
-        recall_limit = max(limit * 12, 20)
-        vector_hits = self._vector_store.query(
-            vector_name=TEXT_VECTOR_NAME,
-            query_vector=query_text_vector,
-            limit=recall_limit,
-            payload_filter=payload_filter,
-            collection_names=self._collections_for_record_kinds(allowed_record_kinds),
-        )
-        recall_by_id = {hit.point.point_id: hit.score for hit in vector_hits}
-        # 多模态检索增强：image_dense 双路召回取并集（最高分优先）
-        if query_image_vector is not None and self._image_embedder is not None:
+        self._ensure_embedders_initialized(nonblocking=True)
+        query_binding = self._index_model_binding()
+        query_vectors = {}
+        embedding_errors = {}
+        text_provider, image_provider = self._text_embedder, self._image_embedder
+        for name, provider in ((TEXT_VECTOR_NAME, text_provider), (IMAGE_VECTOR_NAME, image_provider)):
+            if provider is None:
+                lexical_only = (name == TEXT_VECTOR_NAME and self._text_embedder_ready
+                                and self._text_embedding_provider_metadata.get("availability") == "disabled")
+                if not lexical_only and (name == TEXT_VECTOR_NAME or self._configured_image_model.lower() != "disabled"):
+                    embedding_errors[name] = "provider_unavailable"
+                continue
+            owner = self._association_compute_lock if name == TEXT_VECTOR_NAME or provider is text_provider else self._image_inference_lock
+            if not owner.acquire(blocking=False):
+                embedding_errors[name] = "model_busy"
+                continue
             try:
-                image_hits = self._vector_store.query(
-                    vector_name=IMAGE_VECTOR_NAME,
-                    query_vector=query_image_vector,
-                    limit=recall_limit,
-                    payload_filter=payload_filter,
-                    collection_names=self._collections_for_record_kinds(allowed_record_kinds),
-                )
-                for hit in image_hits:
-                    existing_score = recall_by_id.get(hit.point.point_id, 0.0)
-                    if hit.score > existing_score:
-                        recall_by_id[hit.point.point_id] = hit.score
-            except Exception:
-                pass  # image 检索失败不影响主链路
-        candidate_ids = set(recall_by_id.keys())
-        for record_kind in allowed_record_kinds:
-            for candidate_id, lexical_score in self._iter_lexical_candidate_ids(normalized_query, record_kind):
-                if lexical_score >= max(0.18, similarity_threshold * 0.5):
-                    candidate_ids.add(candidate_id)
-
-        scored_candidates: List[_ScoredCandidate] = []
-        for candidate_id in sorted(candidate_ids):
-            point = self._vector_store.get_point(candidate_id)
-            if point is None:
-                continue
-            if payload_filter is not None and not self._point_matches_filter(point, payload_filter):
-                continue
-            candidate = self._score_candidate(
-                query=query,
-                normalized_query=normalized_query,
-                point=point,
-                allowed_record_kinds=allowed_record_kinds,
-                current_pose=current_pose,
-                text_recall_score=recall_by_id.get(candidate_id, 0.0),
-                query_image_vector=query_image_vector,
-                query_scope=query_scope,
-            )
-            if candidate is None:
-                continue
-            if candidate.final_score < similarity_threshold:
-                continue
-            scored_candidates.append(candidate)
-
-        scored_candidates.sort(key=lambda item: item.final_score, reverse=True)
+                if name == IMAGE_VECTOR_NAME and provider is text_provider and TEXT_VECTOR_NAME in query_vectors:
+                    query_vectors[name] = query_vectors[TEXT_VECTOR_NAME]
+                else:
+                    query_vectors[name] = provider.embed_text(query)
+                vector = np.asarray(query_vectors[name])
+                if vector.ndim != 1 or vector.size != provider.dimension or not np.isfinite(vector).all():
+                    query_vectors.pop(name, None)
+                    raise ValueError("invalid_query_vector")
+            except Exception as exc:
+                embedding_errors[name] = type(exc).__name__
+            finally:
+                owner.release()
+        query_image_vector = query_vectors.get(IMAGE_VECTOR_NAME)
+        with self._instances_lock:
+            generation = self._durable_index.activation_generation
+            visible = [(kind, record) for kind, records in (
+                ("location", self._tagged_locations_by_id), ("memory", self._semantic_entries_by_id),
+                ("instance", self._semantic_instances_by_id), ("event", self._observation_events_by_id),
+                ("scene", self._scene_spaces_by_id)) for record in records.values()]
+        # Validate before recall truncation. Each page captures source, desired
+        # versions, acknowledgements and shared vectors in one short snapshot.
+        # Weak lexical candidates retain the original per-modality top-k rule;
+        # current lexical/live-only candidates remain independently reachable.
+        recall_limit = max(limit * 12, 20)
+        recall_heaps = {name: [] for name in query_vectors}
+        lexical_ranks = {}
+        provenance_counts = {}
+        allowed_values = {item.value for item in allowed_record_kinds}
+        visible_by_key = {(kind, getattr(record, SOURCES[kind][1])): record for kind, record in visible}
+        sequence = 0
+        lexical_cutoff = max(0.18, similarity_threshold * 0.5)
+        query_norms = {name: np.linalg.norm(vector) for name, vector in query_vectors.items()}
+        def vector_scores(point):
+            scores = {}
+            for name, vector in point.vectors.items():
+                query_vector = query_vectors.get(name)
+                if query_vector is not None and query_vector.size == vector.dimension:
+                    denominator = float(query_norms[name] * np.linalg.norm(vector.vector))
+                    scores[name] = float(np.dot(query_vector, vector.vector) / denominator) if denominator else 0.0
+            return scores
+        def score_with_lexical(candidate, value):
+            return self._combine_candidate_scores(
+                record_kind=candidate.record_kind, lexical_score=value,
+                text_recall_score=candidate.text_recall_score, image_score=candidate.image_score,
+                spatial_score=candidate.spatial_score, recency_score=candidate.recency_score,
+                query_scope=candidate.query_scope)
+        for offset in range(0, len(visible), 128):
+            page, page_counts = self._durable_index.query_snapshot(visible[offset:offset + 128], include_readiness=False)
+            for key, value in page_counts.items():
+                provenance_counts[key] = provenance_counts.get(key, 0) + value
+            for kind, source, point, version in page:
+                if point.record_kind not in allowed_values:
+                    continue
+                if payload_filter is not None and not self._point_matches_filter(point, payload_filter):
+                    continue
+                if kind == "memory":
+                    # Preserve eager text construction, including metadata normalization.
+                    texts = self._semantic_entry_texts(source)
+                    scores = vector_scores(point)
+                    lexical = (1.0, "") if scores else self._score_text_candidates(
+                        normalized_query, texts, fallback_reason="与语义记忆内容相似。")
+                else:
+                    texts = None
+                    lexical = {"location": self._score_location,
+                        "instance": self._score_semantic_instance, "event": self._score_observation_event,
+                        "scene": self._score_scene_space}[kind](normalized_query, source)
+                    scores = vector_scores(point)
+                candidate = self._score_candidate(query=query, normalized_query=normalized_query, point=point,
+                    allowed_record_kinds=allowed_record_kinds, current_pose=current_pose,
+                    text_recall_score=max(scores.values(), default=0.0), query_image_vector=query_image_vector,
+                    query_scope=query_scope, source_snapshot=(kind, source), lexical_override=lexical,
+                    semantic_available=bool(scores))
+                if candidate is None:
+                    continue
+                if texts is not None and scores:
+                    # Nonempty scores exclude the lexical-only fallback. Equal endpoints
+                    # make the final score independent of lexical score in [0, 1].
+                    if score_with_lexical(candidate, 0.0) == candidate.final_score:
+                        # A qualifying final score is <=1, so cutoff<=0.5. A later
+                        # exact-text return of 0.99 cannot undo an earlier admission.
+                        lexical_eligible = candidate.final_score >= similarity_threshold and any(
+                            self._score_text_candidates(normalized_query, [text], fallback_reason="")[0]
+                            >= lexical_cutoff for text in texts if text)
+                    else:
+                        lexical = self._score_text_candidates(
+                            normalized_query, texts, fallback_reason="与语义记忆内容相似。")
+                        candidate.lexical_score, candidate.lexical_reason = lexical
+                        candidate.final_score = score_with_lexical(candidate, lexical[0])
+                        lexical_eligible = lexical[0] >= lexical_cutoff and candidate.final_score >= similarity_threshold
+                else:
+                    lexical_eligible = lexical[0] >= lexical_cutoff and candidate.final_score >= similarity_threshold
+                key = (kind, point.point_id)
+                rank = _RecallRank(key, candidate.final_score, self._candidate_dedup_key(candidate),
+                    (source.anchor_id or source.instance_id) if kind == "instance" else None,
+                    tuple(source.linked_instance_ids) if kind == "event" else (), version)
+                if lexical_eligible:
+                    lexical_ranks[key] = rank
+                for name, score in scores.items():
+                    heap = recall_heaps[name]
+                    item = (score, -sequence, key, rank)
+                    if len(heap) < recall_limit:
+                        heapq.heappush(heap, item)
+                    elif item[:2] > heap[0][:2]:
+                        heapq.heapreplace(heap, item)
+                sequence += 1
+        ranks = lexical_ranks
+        for heap in recall_heaps.values():
+            for _, _, key, rank in heap:
+                if rank.final_score >= similarity_threshold:
+                    ranks[key] = rank
+        remaining = sorted(ranks.values(), key=lambda item: (-item.final_score, item.key[1], item.key[0]))
+        scored_candidates = []
+        selected_snapshots = []
+        input_race = False
+        # Rehydrate only ranked survivors, then recompute every contribution from
+        # their current validated vectors. No score crosses the two read phases.
+        while remaining:
+            selected_ranks = self._select_ranked_candidates(remaining, limit=max(1, limit * 2))
+            phase_ranks = {rank.key: rank for rank in selected_ranks}
+            keys = set(phase_ranks)
+            seen_current = set()
+            remaining = [rank for rank in remaining if rank.key not in keys]
+            current_page, _ = self._durable_index.query_snapshot([(kind, visible_by_key[(kind, point_id)]) for kind, point_id in keys])
+            for snapshot in current_page:
+                kind, source, point, version = snapshot
+                key = (kind, point.point_id)
+                seen_current.add(key)
+                if version != phase_ranks[key].source_version:
+                    input_race = True
+                    break
+                if payload_filter is not None and not self._point_matches_filter(point, payload_filter):
+                    continue
+                scores = vector_scores(point)
+                point.payload["query_vector_contributions"] = sorted(scores)
+                candidate = self._score_candidate(query=query, normalized_query=normalized_query, point=point,
+                    allowed_record_kinds=allowed_record_kinds, current_pose=current_pose,
+                    text_recall_score=max(scores.values(), default=0.0), query_image_vector=query_image_vector,
+                    query_scope=query_scope, source_snapshot=(kind, source), semantic_available=bool(scores))
+                if candidate is not None and candidate.final_score >= similarity_threshold:
+                    scored_candidates.append(candidate)
+                    selected_snapshots.append(snapshot)
+            if input_race or keys - seen_current:
+                input_race = True
+                scored_candidates = []
+                selected_snapshots = []
+                break
+            scored_candidates.sort(key=lambda item: (-item.final_score, item.point.point_id))
+            selected_candidates = self._select_ranked_candidates(scored_candidates, limit=max(1, limit))
+            if len(selected_candidates) >= max(1, limit) and (not remaining or remaining[0].final_score <= selected_candidates[-1].final_score):
+                break
+        scored_candidates.sort(key=lambda item: (-item.final_score, item.point.point_id))
         selected_candidates = self._select_ranked_candidates(scored_candidates, limit=max(1, limit))
         matches = [
             self._build_query_match(
@@ -2856,7 +4063,7 @@ class MemoryService:
                 item,
                 current_pose,
                 grounding_plan=grounding_plan,
-                expected_map_version_id=payload_filter.map_version_id if payload_filter is not None else None,
+                expected_map_name=payload_filter.map_name if payload_filter is not None else None,
                 expected_localization_session_id=(
                     payload_filter.localization_session_id if payload_filter is not None else None
                 ),
@@ -2864,22 +4071,46 @@ class MemoryService:
             )
             for item in selected_candidates
         ]
+        if generation != self._durable_index.activation_generation or not self.is_enabled():
+            return MemoryQueryResult(query=query, similarity_threshold=similarity_threshold, matches=[],
+                                     metadata={"scope_changed": True, "indexing": self._durable_index.scoped_status()})
+        selected_ids = {item.point.point_id for item in selected_candidates}
+        selected_snapshots = [snapshot for snapshot in selected_snapshots if snapshot[2].point_id in selected_ids]
+        if input_race or query_binding != self._index_model_binding() or not self._durable_index.query_versions_current(selected_snapshots):
+            if _snapshot_retry < 2:
+                return self._query_records(query, allowed_record_kinds=allowed_record_kinds,
+                    similarity_threshold=similarity_threshold, limit=limit, payload_filter=payload_filter,
+                    grounding_plan=grounding_plan, include_non_direct_navigation_candidates=include_non_direct_navigation_candidates,
+                    default_query_scope=default_query_scope, _snapshot_retry=_snapshot_retry + 1)
+            return MemoryQueryResult(query=query, similarity_threshold=similarity_threshold, matches=[],
+                                     metadata={"input_changed_during_query": True, "indexing": self._durable_index.scoped_status()})
+        for match, candidate in zip(matches, selected_candidates):
+            match.metadata["vector_provenance"] = candidate.point.payload.get("vector_provenance", {})
+            match.metadata["modality_readiness"] = candidate.point.payload.get("modality_readiness", {})
+            match.metadata["query_vector_contributions"] = candidate.point.payload.get("query_vector_contributions", [])
         return MemoryQueryResult(
             query=query,
             similarity_threshold=similarity_threshold,
             matches=matches,
             metadata={
+                "vector_provenance_counts": provenance_counts,
+                "includes_unverified_legacy_scores": any(
+                    evidence.get("status") == "legacy_unverified" for item in selected_candidates
+                    for evidence in item.point.payload.get("vector_provenance", {}).values()),
+                "query_embedding_errors": embedding_errors,
+                "indexing": self._durable_index.scoped_status(),
                 "query_text_preview": self._preview_text(query),
                 "query_scope": query_scope,
                 "match_limit": max(1, int(limit)),
-                "candidate_count": len(scored_candidates),
+                "candidate_count": len(ranks),
                 "returned_candidate_count": len(selected_candidates),
-                "fallback_used": False,
-                "fallback_reason": "",
-                "retrieval_mode": "text_recall_then_filter_then_multimodal_rerank",
+                "fallback_used": bool(embedding_errors) or (not query_vectors and bool(self._text_embedding_provider_metadata.get("fallback_used"))),
+                "fallback_reason": ("query_modality_unavailable" if embedding_errors else
+                                    str(self._text_embedding_provider_metadata.get("fallback_reason") or "") if not query_vectors else ""),
+                "retrieval_mode": "text_recall_then_filter_then_multimodal_rerank" if query_vectors else "lexical_only",
                 "vector_store_backend": self._vector_store.backend_name,
-                "text_embedding_model": self._text_embedder.model_name,
-                "text_embedding_dimension": self._text_embedder.dimension,
+                "text_embedding_model": self._text_embedder.model_name if self._text_embedder is not None else "unavailable",
+                "text_embedding_dimension": self._text_embedder.dimension if self._text_embedder is not None else 0,
                 "text_embedding_provider": dict(self._text_embedding_provider_metadata),
                 "image_embedding_model": self._image_embedder.model_name if self._image_embedder is not None else "disabled",
                 "image_embedding_dimension": self._image_embedder.dimension if self._image_embedder is not None else 0,
@@ -2900,14 +4131,18 @@ class MemoryService:
         text_recall_score: float,
         query_image_vector: Optional[np.ndarray],
         query_scope: str,
+        source_snapshot=None,
+        lexical_override=None,
+        semantic_available=True,
     ) -> Optional[_ScoredCandidate]:
         if point.record_kind not in {item.value for item in allowed_record_kinds}:
             return None
-        tagged_location = self._tagged_locations_by_id.get(point.point_id)
-        semantic_memory = self._semantic_entries_by_id.get(point.point_id)
-        semantic_instance = self._semantic_instances_by_id.get(point.point_id)
-        observation_event = self._observation_events_by_id.get(point.point_id)
-        scene_space = self._scene_spaces_by_id.get(point.point_id)
+        source_kind, source = source_snapshot if source_snapshot is not None else (None, None)
+        tagged_location = source if source_kind == "location" else (self._tagged_locations_by_id.get(point.point_id) if source_snapshot is None else None)
+        semantic_memory = source if source_kind == "memory" else (self._semantic_entries_by_id.get(point.point_id) if source_snapshot is None else None)
+        semantic_instance = source if source_kind == "instance" else (self._semantic_instances_by_id.get(point.point_id) if source_snapshot is None else None)
+        observation_event = source if source_kind == "event" else (self._observation_events_by_id.get(point.point_id) if source_snapshot is None else None)
+        scene_space = source if source_kind == "scene" else (self._scene_spaces_by_id.get(point.point_id) if source_snapshot is None else None)
         if (
             tagged_location is None
             and semantic_memory is None
@@ -2918,28 +4153,28 @@ class MemoryService:
             return None
         if tagged_location is not None:
             record_kind = MemoryRecordKind.TAGGED_LOCATION
-            lexical_score, lexical_reason = self._score_location(normalized_query, tagged_location)
+            lexical_score, lexical_reason = lexical_override if lexical_override is not None else self._score_location(normalized_query, tagged_location)
             location_or_memory_pose = tagged_location.pose
             timestamp = tagged_location.timestamp
         elif semantic_instance is not None:
             record_kind = MemoryRecordKind.OBJECT_INSTANCE
-            lexical_score, lexical_reason = self._score_semantic_instance(normalized_query, semantic_instance)
+            lexical_score, lexical_reason = lexical_override if lexical_override is not None else self._score_semantic_instance(normalized_query, semantic_instance)
             location_or_memory_pose = semantic_instance.pose
             timestamp = semantic_instance.last_seen_ts
         elif observation_event is not None:
             record_kind = MemoryRecordKind.OBSERVATION_EVENT
-            lexical_score, lexical_reason = self._score_observation_event(normalized_query, observation_event)
+            lexical_score, lexical_reason = lexical_override if lexical_override is not None else self._score_observation_event(normalized_query, observation_event)
             location_or_memory_pose = observation_event.pose
             timestamp = observation_event.timestamp
         elif scene_space is not None:
             record_kind = MemoryRecordKind.SCENE_SPACE
-            lexical_score, lexical_reason = self._score_scene_space(normalized_query, scene_space)
+            lexical_score, lexical_reason = lexical_override if lexical_override is not None else self._score_scene_space(normalized_query, scene_space)
             location_or_memory_pose = self._scene_space_navigation_pose(scene_space)
             timestamp = scene_space.semantic_updated_at or scene_space.timestamp
         else:
             assert semantic_memory is not None
             record_kind = semantic_memory.kind
-            lexical_score, lexical_reason = self._score_semantic_entry(normalized_query, semantic_memory)
+            lexical_score, lexical_reason = lexical_override if lexical_override is not None else self._score_semantic_entry(normalized_query, semantic_memory)
             location_or_memory_pose = semantic_memory.pose
             timestamp = semantic_memory.timestamp
 
@@ -2948,6 +4183,8 @@ class MemoryService:
             query_image_vector is not None
             and IMAGE_VECTOR_NAME in point.vectors
             and self._image_embedder is not None
+            and point.vectors[IMAGE_VECTOR_NAME].model_name == self._image_embedder.model_name
+            and point.vectors[IMAGE_VECTOR_NAME].dimension == self._image_embedder.dimension
         ):
             image_score = max(
                 0.0,
@@ -2967,6 +4204,8 @@ class MemoryService:
             recency_score=recency_score,
             query_scope=query_scope,
         )
+        if not point.vectors or not semantic_available:
+            final_score = max(final_score, lexical_score)
         return _ScoredCandidate(
             point=point,
             record_kind=record_kind,
@@ -2996,22 +4235,22 @@ class MemoryService:
         seen_keys = set()
         seen_instance_ids: set[str] = set()
         for candidate in candidates:
-            # 跨类型去重：同一 instance_id 只保留分数最高的候选（列表已按 final_score 降序排列）
-            if candidate.semantic_instance is not None:
-                instance_id = (
-                    candidate.semantic_instance.anchor_id
-                    or candidate.semantic_instance.instance_id
-                )
-                if instance_id and instance_id in seen_instance_ids:
+            if isinstance(candidate, _RecallRank):
+                instance_id = candidate.instance_id
+                linked_ids = candidate.linked_instance_ids
+                dedup_key = candidate.dedup_key
+            else:
+                instance_id = (candidate.semantic_instance.anchor_id or candidate.semantic_instance.instance_id) if candidate.semantic_instance is not None else None
+                linked_ids = candidate.observation_event.linked_instance_ids if candidate.observation_event is not None else ()
+                dedup_key = self._candidate_dedup_key(candidate)
+            if instance_id:
+                if instance_id in seen_instance_ids:
                     continue
-                if instance_id:
-                    seen_instance_ids.add(instance_id)
-            elif candidate.observation_event is not None and candidate.observation_event.linked_instance_ids:
-                linked_ids = candidate.observation_event.linked_instance_ids
+                seen_instance_ids.add(instance_id)
+            elif linked_ids:
                 if seen_instance_ids.intersection(linked_ids):
                     continue
                 seen_instance_ids.update(linked_ids)
-            dedup_key = self._candidate_dedup_key(candidate)
             if dedup_key in seen_keys:
                 continue
             seen_keys.add(dedup_key)
@@ -3084,8 +4323,8 @@ class MemoryService:
         backend_name: str,
         candidate_score: Optional[float] = None,
         grounding_plan: Optional[GroundingQueryPlan] = None,
-        map_version_id: Optional[str] = None,
-        expected_map_version_id: Optional[str] = None,
+        map_name: Optional[str] = None,
+        expected_map_name: Optional[str] = None,
         localization_session_id: Optional[str] = None,
         expected_localization_session_id: Optional[str] = None,
     ) -> Dict[str, object]:
@@ -3100,8 +4339,8 @@ class MemoryService:
         resolved_candidate_score = self._coerce_optional_float(
             candidate_score if candidate_score is not None else resolved_metadata.get("candidate_score")
         )
-        resolved_map_version_id = str(map_version_id or resolved_metadata.get("map_version_id") or "").strip() or None
-        resolved_expected_map_version_id = str(expected_map_version_id or "").strip() or None
+        resolved_map_name = str(map_name or resolved_metadata.get("map_name") or "").strip() or None
+        resolved_expected_map_name = str(expected_map_name or "").strip() or None
         resolved_localization_session_id = str(
             localization_session_id or resolved_metadata.get("localization_session_id") or ""
         ).strip() or None
@@ -3118,8 +4357,8 @@ class MemoryService:
             segmentation_projection_status=segmentation_projection_status,
             segmentation_summary=segmentation_summary,
             grounding_plan=grounding_plan,
-            map_version_id=resolved_map_version_id,
-            expected_map_version_id=resolved_expected_map_version_id,
+            map_name=resolved_map_name,
+            expected_map_name=resolved_expected_map_name,
             localization_session_id=resolved_localization_session_id,
             expected_localization_session_id=resolved_expected_localization_session_id,
         )
@@ -3166,8 +4405,8 @@ class MemoryService:
         segmentation_projection_status: str,
         segmentation_summary: Dict[str, object],
         grounding_plan: Optional[GroundingQueryPlan],
-        map_version_id: Optional[str],
-        expected_map_version_id: Optional[str],
+        map_name: Optional[str],
+        expected_map_name: Optional[str],
         localization_session_id: Optional[str],
         expected_localization_session_id: Optional[str],
     ) -> Dict[str, object]:
@@ -3184,8 +4423,8 @@ class MemoryService:
             if code not in reason_codes:
                 reason_codes.append(code)
 
-        if expected_map_version_id and map_version_id and map_version_id != expected_map_version_id:
-            add_reason("map_version_mismatch")
+        if expected_map_name and map_name and map_name != expected_map_name:
+            add_reason("map_binding_mismatch")
         if (
             expected_localization_session_id
             and localization_session_id
@@ -3293,8 +4532,8 @@ class MemoryService:
                 "planner_ambiguity_count": ambiguity_count,
                 "planner_negative_constraint_count": negative_constraint_count,
                 "candidate_ranking_hints_present": candidate_ranking_hints_present,
-                "map_version_id": map_version_id,
-                "expected_map_version_id": expected_map_version_id,
+                "map_name": map_name,
+                "expected_map_name": expected_map_name,
                 "localization_session_id": localization_session_id,
                 "expected_localization_session_id": expected_localization_session_id,
                 "dynamic_state": str(metadata.get("dynamic_state") or "") or None,
@@ -3371,7 +4610,7 @@ class MemoryService:
             "not_navigable": "候选存在明确不可导航风险，已拒绝直接导航。",
         }
         reason_explanations = {
-            "map_version_mismatch": "地图版本不一致。",
+            "map_binding_mismatch": "地图绑定不一致。",
             "localization_session_mismatch": "定位会话不一致。",
             "current_pose_fallback": "候选使用当前位置回退投影。",
             "candidate_score_low": "候选召回分偏低。",
@@ -3431,13 +4670,14 @@ class MemoryService:
                 segmentation_score,
                 segmentation_quality_score,
                 stability_score,
-                coverage,
-                map_projection_coverage,
-                depth_coverage,
-                reprojection_error,
-                segmentation_support_point_count,
             )
-        ) or bool(occlusion_flags or truncation_flags)
+        ) or bool(
+            occlusion_flags or truncation_flags
+            or metadata.get("segmentation_bbox_xyxy") or metadata.get("mask_polygon_px")
+            or metadata.get("segmentation_polygon_px") or metadata.get("mask_center_px")
+            or metadata.get("segmentation_source")
+            or (segmentation_support_point_count is not None and segmentation_support_point_count > 0)
+        )
         risk_factors: List[str] = []
         if segmentation_support_point_count is not None and segmentation_support_point_count <= 0:
             risk_factors.append("segmentation_support_points_missing")
@@ -3464,6 +4704,8 @@ class MemoryService:
         for item in risk_factors:
             if item not in unique_risks:
                 unique_risks.append(item)
+        if not has_structured_segmentation:
+            unique_risks = []
         quality_signals = [
             value
             for value in (
@@ -3476,7 +4718,9 @@ class MemoryService:
             )
             if value is not None
         ]
-        if unique_risks:
+        if not has_structured_segmentation:
+            segmentation_quality = "unknown"
+        elif unique_risks:
             segmentation_quality = "low"
         elif quality_signals and min(quality_signals) >= 0.65:
             segmentation_quality = "high"
@@ -3591,7 +4835,7 @@ class MemoryService:
             {**dict(scene_space.metadata), **self._build_scene_space_payload(scene_space)},
             backend_name=str(scene_space.metadata.get("backend") or "memory_service.scene_space"),
             candidate_score=1.0,
-            map_version_id=scene_space.map_version_id,
+            map_name=scene_space.map_name,
             localization_session_id=scene_space.localization_session_id
             or str(scene_space.metadata.get("localization_session_id") or "")
             or None,
@@ -3606,7 +4850,7 @@ class MemoryService:
                 anchor_pose=scene_space.boundary.centroid if scene_space.boundary is not None else navigation_pose,
                 target_name=scene_space.primary_label or scene_space.scene_space_id,
                 linked_location_id=None,
-                map_version_id=scene_space.map_version_id,
+                map_name=scene_space.map_name,
                 topo_node_id=scene_space.linked_topology_node_ids[0] if scene_space.linked_topology_node_ids else None,
                 semantic_region_id=scene_space.linked_semantic_region_ids[0] if scene_space.linked_semantic_region_ids else None,
                 artifact_ids=self._scene_space_artifact_ids(scene_space),
@@ -3646,23 +4890,35 @@ class MemoryService:
         current_pose: Optional[Pose],
         *,
         grounding_plan: Optional[GroundingQueryPlan] = None,
-        expected_map_version_id: Optional[str] = None,
+        expected_map_name: Optional[str] = None,
         expected_localization_session_id: Optional[str] = None,
         include_non_direct_navigation_candidate: bool = False,
     ) -> MemoryQueryMatch:
         candidate_localization_session_id = str(candidate.point.payload.get("localization_session_id") or "").strip() or None
         navigation_candidate = None
+        linked_photo = None
         navigation_metadata = self._evaluate_navigation_metadata(
             dict(candidate.point.payload),
             backend_name=str(candidate.point.payload.get("backend") or candidate.point.payload.get("backend_type") or "memory_service"),
             candidate_score=candidate.final_score,
             grounding_plan=grounding_plan,
-            map_version_id=str(candidate.point.payload.get("map_version_id") or "").strip() or None,
-            expected_map_version_id=expected_map_version_id,
+            map_name=str(candidate.point.payload.get("map_name") or "").strip() or None,
+            expected_map_name=expected_map_name,
             localization_session_id=candidate_localization_session_id,
             expected_localization_session_id=expected_localization_session_id,
         )
         if candidate.tagged_location is not None:
+            location = candidate.tagged_location
+            photo = self._semantic_entries_by_id.get(location.memory_id) if location.memory_id else None
+            if (photo is not None and photo.artifact_ids and photo.linked_location_id == location.location_id
+                    and photo.map_name == location.map_name
+                    and self._record_library_name(photo) == self._record_library_name(location)
+                    and all(photo.metadata.get(key) == location.metadata.get(key)
+                            for key in ("map_source_name", "map_source_epoch"))):
+                linked_photo = {"memory_id": photo.memory_id, "artifact_ids": list(photo.artifact_ids),
+                    "observation_id": photo.observation_id, "camera_id": photo.metadata.get("camera_id"),
+                    "frame_timestamp": photo.metadata.get("frame_timestamp"),
+                    "observation_pose": photo.pose.model_dump(mode="json") if photo.pose is not None else None}
             source_metadata = {**dict(candidate.tagged_location.metadata), **dict(candidate.point.payload)}
             backend_name = "memory_service.tagged_location"
             navigation_metadata = self._evaluate_navigation_metadata(
@@ -3670,8 +4926,8 @@ class MemoryService:
                 backend_name=backend_name,
                 candidate_score=candidate.final_score,
                 grounding_plan=grounding_plan,
-                map_version_id=candidate.tagged_location.map_version_id,
-                expected_map_version_id=expected_map_version_id,
+                map_name=candidate.tagged_location.map_name,
+                expected_map_name=expected_map_name,
                 localization_session_id=candidate_localization_session_id,
                 expected_localization_session_id=expected_localization_session_id,
             )
@@ -3685,14 +4941,14 @@ class MemoryService:
                     anchor_pose=candidate.tagged_location.pose,
                     target_name=candidate.tagged_location.name,
                     linked_location_id=candidate.tagged_location.location_id,
-                    map_version_id=candidate.tagged_location.map_version_id,
+                    map_name=candidate.tagged_location.map_name,
                     topo_node_id=candidate.tagged_location.topo_node_id,
                     semantic_region_id=candidate.tagged_location.semantic_region_id,
-                    artifact_ids=[],
+                    artifact_ids=list(linked_photo["artifact_ids"]) if linked_photo else [],
                     current_pose=current_pose,
                     verification_memory_id=candidate.tagged_location.memory_id,
                     verification_text=candidate.tagged_location.perception_headline or query,
-                    camera_id=None,
+                    camera_id=linked_photo.get("camera_id") if linked_photo else None,
                     localization_session_id=candidate_localization_session_id,
                     source_metadata=source_metadata,
                     backend_name=backend_name,
@@ -3707,8 +4963,8 @@ class MemoryService:
                 backend_name=backend_name,
                 candidate_score=candidate.final_score,
                 grounding_plan=grounding_plan,
-                map_version_id=candidate.semantic_memory.map_version_id,
-                expected_map_version_id=expected_map_version_id,
+                map_name=candidate.semantic_memory.map_name,
+                expected_map_name=expected_map_name,
                 localization_session_id=candidate_localization_session_id,
                 expected_localization_session_id=expected_localization_session_id,
             )
@@ -3725,7 +4981,7 @@ class MemoryService:
                     anchor_pose=candidate.semantic_memory.pose,
                     target_name=candidate.semantic_memory.title,
                     linked_location_id=candidate.semantic_memory.linked_location_id,
-                    map_version_id=candidate.semantic_memory.map_version_id,
+                    map_name=candidate.semantic_memory.map_name,
                     topo_node_id=candidate.semantic_memory.topo_node_id,
                     semantic_region_id=candidate.semantic_memory.semantic_region_id,
                     artifact_ids=candidate.semantic_memory.artifact_ids,
@@ -3751,8 +5007,8 @@ class MemoryService:
                 backend_name=backend_name,
                 candidate_score=candidate.final_score,
                 grounding_plan=grounding_plan,
-                map_version_id=candidate.semantic_instance.map_version_id,
-                expected_map_version_id=expected_map_version_id,
+                map_name=candidate.semantic_instance.map_name,
+                expected_map_name=expected_map_name,
                 localization_session_id=candidate_localization_session_id,
                 expected_localization_session_id=expected_localization_session_id,
             )
@@ -3770,7 +5026,7 @@ class MemoryService:
                     anchor_pose=candidate.semantic_instance.pose,
                     target_name=candidate.semantic_instance.display_name or candidate.semantic_instance.label,
                     linked_location_id=None,
-                    map_version_id=candidate.semantic_instance.map_version_id,
+                    map_name=candidate.semantic_instance.map_name,
                     topo_node_id=candidate.semantic_instance.topo_node_id,
                     semantic_region_id=candidate.semantic_instance.semantic_region_id,
                     artifact_ids=candidate.semantic_instance.artifact_ids,
@@ -3799,8 +5055,8 @@ class MemoryService:
                 backend_name=backend_name,
                 candidate_score=candidate.final_score,
                 grounding_plan=grounding_plan,
-                map_version_id=candidate.observation_event.map_version_id,
-                expected_map_version_id=expected_map_version_id,
+                map_name=candidate.observation_event.map_name,
+                expected_map_name=expected_map_name,
                 localization_session_id=candidate_localization_session_id,
                 expected_localization_session_id=expected_localization_session_id,
             )
@@ -3821,7 +5077,7 @@ class MemoryService:
                     anchor_pose=candidate.observation_event.pose,
                     target_name=candidate.observation_event.title,
                     linked_location_id=None,
-                    map_version_id=candidate.observation_event.map_version_id,
+                    map_name=candidate.observation_event.map_name,
                     topo_node_id=candidate.observation_event.topo_node_id,
                     semantic_region_id=candidate.observation_event.semantic_region_id,
                     artifact_ids=candidate.observation_event.artifact_ids,
@@ -3845,8 +5101,8 @@ class MemoryService:
                     backend_name=backend_name,
                     candidate_score=candidate.final_score,
                     grounding_plan=grounding_plan,
-                    map_version_id=candidate.scene_space.map_version_id,
-                    expected_map_version_id=expected_map_version_id,
+                    map_name=candidate.scene_space.map_name,
+                    expected_map_name=expected_map_name,
                     localization_session_id=candidate_localization_session_id,
                     expected_localization_session_id=expected_localization_session_id,
                 )
@@ -3860,7 +5116,7 @@ class MemoryService:
                         anchor_pose=candidate.scene_space.boundary.centroid if candidate.scene_space.boundary is not None else navigation_pose,
                         target_name=candidate.scene_space.primary_label or candidate.scene_space.scene_space_id,
                         linked_location_id=None,
-                        map_version_id=candidate.scene_space.map_version_id,
+                        map_name=candidate.scene_space.map_name,
                         topo_node_id=candidate.scene_space.linked_topology_node_ids[0] if candidate.scene_space.linked_topology_node_ids else None,
                         semantic_region_id=candidate.scene_space.linked_semantic_region_ids[0] if candidate.scene_space.linked_semantic_region_ids else None,
                         artifact_ids=self._scene_space_artifact_ids(candidate.scene_space),
@@ -3888,7 +5144,9 @@ class MemoryService:
             scene_space=candidate.scene_space,
             navigation_candidate=navigation_candidate,
             metadata={
-                "retrieval_mode": "text_recall_then_filter_then_multimodal_rerank",
+                "retrieval_mode": ("text_recall_then_filter_then_multimodal_rerank"
+                                   if candidate.point.payload.get("query_vector_contributions") else "lexical_only"),
+                **({"linked_photo": linked_photo} if linked_photo is not None else {}),
                 "text_recall_score": round(candidate.text_recall_score, 6),
                 "lexical_score": round(candidate.lexical_score, 6),
                 "image_score": round(candidate.image_score, 6),
@@ -3913,7 +5171,7 @@ class MemoryService:
         anchor_pose: Optional[Pose],
         target_name: str,
         linked_location_id: Optional[str],
-        map_version_id: Optional[str],
+        map_name: Optional[str],
         topo_node_id: Optional[str],
         semantic_region_id: Optional[str],
         artifact_ids: List[str],
@@ -3929,14 +5187,15 @@ class MemoryService:
     ) -> NavigationCandidate:
         _, distance_m = self._compute_spatial_score(current_pose, inspection_pose)
         verification_artifact_id = artifact_ids[0] if artifact_ids else None
-        platform_binding = self._build_platform_semantic_metadata(map_version_id=map_version_id)
+        platform_binding = self._build_platform_semantic_metadata(map_name=map_name)
+        resolved_map_name = str(platform_binding.get("map_name") or "").strip() or None
         clamped_score = self._clamp_score(candidate_score)
         if navigation_metadata is None:
             navigation_metadata = self._evaluate_navigation_metadata(
                 source_metadata,
                 backend_name=backend_name,
                 candidate_score=clamped_score,
-                map_version_id=map_version_id,
+                map_name=resolved_map_name,
                 localization_session_id=str(
                     localization_session_id
                     or platform_binding.get("localization_session_id")
@@ -3954,7 +5213,7 @@ class MemoryService:
             target_name=target_name,
             inspection_pose=inspection_pose,
             anchor_pose=anchor_pose,
-            map_version_id=map_version_id,
+            map_name=resolved_map_name,
             localization_session_id=str(
                 localization_session_id
                 or platform_binding.get("localization_session_id")
@@ -3974,8 +5233,7 @@ class MemoryService:
                 "scene_space_id": str((source_metadata or {}).get("scene_space_id") or ""),
                 "linked_object_instance_ids": list((source_metadata or {}).get("linked_instance_ids") or []),
                 "verification_memory_id": verification_memory_id or "",
-                "map_name": str(platform_binding.get("map_name") or "") or "",
-                "map_version_id": str(map_version_id or "") or "",
+                "map_name": resolved_map_name or "",
                 "localization_session_id": str(
                     localization_session_id
                     or platform_binding.get("localization_session_id")
@@ -4019,99 +5277,54 @@ class MemoryService:
         target_library = str(library_name or self._active_library_name or "").strip()
         if not target_library:
             return
-
-        persisted_locations = [
-            item for item in self._repository.load_tagged_locations() if self._record_library_name(item) == target_library
-        ]
-        persisted_memories = [
-            item for item in self._repository.load_semantic_memories() if self._record_library_name(item) == target_library
-        ]
-        persisted_instances = [
-            item for item in self._repository.load_semantic_instances() if self._record_library_name(item) == target_library
-        ]
-        persisted_events = [
-            item for item in self._repository.load_observation_events() if self._record_library_name(item) == target_library
-        ]
-        persisted_scene_spaces = [
-            item for item in self._repository.load_scene_spaces() if self._record_library_name(item) == target_library
-        ]
-        persisted_trajectory_events = [
-            item for item in self._repository.load_navigation_trajectory_events() if self._record_library_name(item) == target_library
-        ]
-        persisted_graph_relations = [
-            item for item in self._repository.load_semantic_graph_relations() if self._record_library_name(item) == target_library
-        ]
-        persisted_summary_nodes = [
-            item for item in self._repository.load_semantic_summary_nodes() if self._record_library_name(item) == target_library
-        ]
-
-        for location in persisted_locations:
-            self._tagged_locations_by_id[location.location_id] = location
-            self._tagged_location_history.append(location)
-            self._write_tagged_location_state(location)
-
-        for entry in persisted_memories:
-            self._semantic_entries_by_id[entry.memory_id] = entry
-            self._semantic_history.append(entry)
-            self._write_semantic_memory_state(entry)
-
-        for instance in persisted_instances:
-            self._semantic_instances_by_id[instance.instance_id] = instance
-            self._semantic_instance_history.append(instance)
-            self._write_semantic_instance_state(instance)
-
-        for event in persisted_events:
-            self._observation_events_by_id[event.event_id] = event
-            self._observation_event_history.append(event)
-            self._write_observation_event_state(event)
-
-        for scene_space in persisted_scene_spaces:
-            self._cache_scene_space(scene_space)
-            self._write_scene_space_state(scene_space)
-
-        for trajectory_event in persisted_trajectory_events:
-            self._navigation_trajectory_events_by_id[trajectory_event.trajectory_event_id] = trajectory_event
-            self._navigation_trajectory_history.append(trajectory_event)
-            self._write_navigation_trajectory_event_state(trajectory_event)
-
-        for relation in persisted_graph_relations:
-            self._semantic_graph_relations_by_id[relation.relation_id] = relation
-            self._semantic_graph_relation_history.append(relation)
-            self._write_semantic_graph_relation_state(relation)
-
-        for summary_node in persisted_summary_nodes:
-            self._semantic_summary_nodes_by_id[summary_node.summary_id] = summary_node
-            self._semantic_summary_history.append(summary_node)
-            self._write_semantic_summary_node_state(summary_node)
-
-        for location in persisted_locations:
-            self._safe_upsert_persisted_vector(
-                record_id=location.location_id,
-                action=lambda current=location: self._upsert_vector_point_for_location(current),
-            )
-        for entry in persisted_memories:
-            self._safe_upsert_persisted_vector(
-                record_id=entry.memory_id,
-                action=lambda current=entry: self._upsert_vector_point_for_memory(current),
-            )
-        for instance in persisted_instances:
-            if self._is_long_term_static_instance(instance):
-                self._safe_upsert_persisted_vector(
-                    record_id=instance.instance_id,
-                    action=lambda current=instance: self._upsert_vector_point_for_instance(current),
-                )
-            else:
-                self._vector_store.delete_points([instance.instance_id])
-        for event in persisted_events:
-            self._safe_upsert_persisted_vector(
-                record_id=event.event_id,
-                action=lambda current=event: self._upsert_vector_point_for_observation_event(current),
-            )
-        for scene_space in persisted_scene_spaces:
-            self._safe_upsert_persisted_vector(
-                record_id=scene_space.scene_space_id,
-                action=lambda current=scene_space: self._upsert_vector_point_for_scene_space(current),
-            )
+        with self._instances_lock:
+            while self.is_enabled() and self._active_library_name == target_library and not self._closed:
+                epoch = self._artifact_store.reference_epoch() if self._artifact_store is not None else None
+                with self._repository.storage.read_snapshot():
+                    groups = [
+                        ("location", self._repository.load_tagged_locations(library_name=target_library), self._write_tagged_location_state),
+                        ("memory", self._repository.load_semantic_memories(library_name=target_library), self._write_semantic_memory_state),
+                        ("instance", self._repository.load_semantic_instances(library_name=target_library), self._write_semantic_instance_state),
+                        ("event", self._repository.load_observation_events(library_name=target_library), self._write_observation_event_state),
+                        ("scene", self._repository.load_scene_spaces(library_name=target_library), self._write_scene_space_state),
+                    ]
+                    trajectories = self._repository.load_navigation_trajectory_events(library_name=target_library)
+                    relations = self._repository.load_semantic_graph_relations(library_name=target_library)
+                    summaries = self._repository.load_semantic_summary_nodes(library_name=target_library)
+                adoption = []
+                try:
+                    for kind, records, _write_state in groups:
+                        for record in records:
+                            hold = self._hold_artifact_record(kind, record, owner="memory.load." + kind)
+                            if hold is not None:
+                                adoption.append(hold)
+                    if self._artifact_store is not None:
+                        # No SQL or provider call enters this short fence. Once
+                        # validated, provisional holders keep this snapshot safe
+                        # even if a newer source revision commits during adoption.
+                        with self._artifact_store.maintenance_fence():
+                            if self._artifact_store.reference_epoch() != epoch:
+                                continue
+                    for kind, records, write_state in groups:
+                        for record in records:
+                            self._cache_artifact_record(kind, record)
+                            write_state(record)
+                    for event in trajectories:
+                        self._navigation_trajectory_events_by_id[event.trajectory_event_id] = event
+                        self._navigation_trajectory_history.append(event)
+                        self._write_navigation_trajectory_event_state(event)
+                    for relation in relations:
+                        self._semantic_graph_relations_by_id[relation.relation_id] = relation
+                        self._semantic_graph_relation_history.append(relation)
+                        self._write_semantic_graph_relation_state(relation)
+                    for summary in summaries:
+                        self._semantic_summary_nodes_by_id[summary.summary_id] = summary
+                        self._semantic_summary_history.append(summary)
+                        self._write_semantic_summary_node_state(summary)
+                    return
+                finally:
+                    for hold in adoption:
+                        hold.release()
 
     def _safe_upsert_persisted_vector(self, *, record_id: str, action) -> None:
         try:
@@ -4120,233 +5333,537 @@ class MemoryService:
             LOGGER.warning("历史记忆向量重建失败，已跳过。record_id=%s error=%s", record_id, exc)
 
     def _upsert_vector_point_for_location(self, location: TaggedLocation) -> None:
-        payload = self._build_location_payload(location)
-        image_bytes = self._load_primary_image_bytes([])
-        if location.memory_id is not None:
-            linked_memory = self._semantic_entries_by_id.get(location.memory_id)
-            if linked_memory is not None:
-                image_bytes = self._load_primary_image_bytes(linked_memory.artifact_ids) or image_bytes
-        vectors = self._build_named_vectors(
-            retrieval_text=str(payload["retrieval_text"]),
-            image_bytes=image_bytes,
-        )
-        self._vector_store.upsert_point(
-            point_id=location.location_id,
-            collection_name=PLACE_NODES_COLLECTION,
-            record_kind=MemoryRecordKind.TAGGED_LOCATION.value,
-            payload=payload,
-            vectors=vectors,
-            updated_at=location.timestamp.isoformat(),
-        )
+        self._durable_index.wake.set()
 
     def _upsert_vector_point_for_memory(self, entry: SemanticMemoryEntry) -> None:
-        payload = self._build_memory_payload(entry)
-        image_bytes = self._load_primary_image_bytes(entry.artifact_ids)
-        vectors = self._build_named_vectors(
-            retrieval_text=str(payload["retrieval_text"]),
-            image_bytes=image_bytes,
-        )
-        self._vector_store.upsert_point(
-            point_id=entry.memory_id,
-            collection_name=EPISODIC_OBSERVATIONS_COLLECTION,
-            record_kind=entry.kind.value,
-            payload=payload,
-            vectors=vectors,
-            updated_at=entry.timestamp.isoformat(),
-        )
+        self._durable_index.wake.set()
 
     def _upsert_vector_point_for_instance(self, instance: SemanticInstance) -> None:
-        payload = self._build_instance_payload(instance)
-        # 先写入不含向量的记录，降低主链路延迟
-        self._vector_store.upsert_point(
-            point_id=instance.instance_id,
-            collection_name=OBJECT_INSTANCES_COLLECTION,
-            record_kind=MemoryRecordKind.OBJECT_INSTANCE.value,
-            payload=payload,
-            vectors={},
-            updated_at=instance.last_seen_ts.isoformat(),
-        )
-        # 异步补充向量
-        self._enqueue_vectorization(
-            point_id=instance.instance_id,
-            collection_name=OBJECT_INSTANCES_COLLECTION,
-            record_kind=MemoryRecordKind.OBJECT_INSTANCE.value,
-            retrieval_text=str(payload["retrieval_text"]),
-            artifact_ids=list(instance.artifact_ids),
-            updated_at=instance.last_seen_ts.isoformat(),
-            payload=payload,
-        )
+        self._durable_index.wake.set()
 
     def _upsert_vector_point_for_observation_event(self, event: ObservationEvent) -> None:
-        payload = self._build_observation_event_payload(event)
-        # 先写入不含向量的记录，降低主链路延迟
-        self._vector_store.upsert_point(
-            point_id=event.event_id,
-            collection_name=EPISODIC_OBSERVATIONS_COLLECTION,
-            record_kind=MemoryRecordKind.OBSERVATION_EVENT.value,
-            payload=payload,
-            vectors={},
-            updated_at=event.timestamp.isoformat(),
-        )
-        # 异步补充向量
-        self._enqueue_vectorization(
-            point_id=event.event_id,
-            collection_name=EPISODIC_OBSERVATIONS_COLLECTION,
-            record_kind=MemoryRecordKind.OBSERVATION_EVENT.value,
-            retrieval_text=str(payload["retrieval_text"]),
-            artifact_ids=list(event.artifact_ids),
-            updated_at=event.timestamp.isoformat(),
-            payload=payload,
-        )
-
-    # ------------------------------------------------------------------
-    # 后台向量化 worker
-    # ------------------------------------------------------------------
+        self._durable_index.wake.set()
 
     def _start_vectorization_worker(self) -> None:
-        """启动后台向量化 worker 线程。"""
-        if self._vectorization_worker is not None and self._vectorization_worker.is_alive():
+        """Keep one physical model worker, including across blocked-provider switches."""
+        with self._vectorization_worker_lock:
+            if self._closed:
+                raise RuntimeError("Memory service is closed")
+            if self._vectorization_worker is not None and self._vectorization_worker.is_alive():
+                self._durable_index.wake.set()
+                return
+            stop = threading.Event()
+            self._vectorization_stop_event = stop
+            self._durable_index.acquire_worker()
+            try:
+                token = self._durable_index.outbox.start_worker(recover=self._repository.db_path != ":memory:")
+            except BaseException:
+                self._durable_index.release_worker()
+                raise
+            self._vectorization_worker_token = token
+            worker = threading.Thread(target=self._vectorization_worker_loop, args=(stop, token),
+                                      name="memory-vectorization-worker", daemon=True)
+            self._vectorization_worker = worker
+            worker.start()
+
+    def _stop_vectorization_worker(self, timeout=2.0) -> bool:
+        self._vectorization_stop_event.set()
+        self._durable_index.wake.set()
+        token = self._vectorization_worker_token
+        if token:
+            self._durable_index.outbox.stop_worker(token)
+        worker = self._vectorization_worker
+        if worker is not None and worker is not threading.current_thread():
+            worker.join(timeout=max(0.0, timeout))
+        # Never forget an uncooperative physical worker or close its storage.
+        return worker is None or not worker.is_alive()
+
+    def close(self, *, timeout=2.0) -> bool:
+        """Terminal shutdown. False means a provider still owns retained storage.
+
+        A later close retries quiescence. Borrowed stores always remain open.
+        Ordinary disable is reusable and only suspends/fences indexing.
+        """
+        if getattr(self, "_storage_closed", False):
+            return True
+        if getattr(self, "_memory_backends_closed", False):
+            complete = self._artifact_references is None or self._artifact_references.close()
+            self._storage_closed = complete
+            return complete
+        with self._artifact_lifetime_lock:
+            self._closed = True
+        self._durable_index.closed = True
+        self._memory_enabled = False
+        self._active_library_name = None
+        self._instance_publisher.stop()
+        self._deferred_refine_stop_event.set()
+        self._vectorization_stop_event.set()
+        self._durable_index.wake.set()
+        references = None
+        if self._artifact_references is not None:
+            self._artifact_references.retry_completed_holds()
+            references = self._artifact_references.status()
+            if references["pending_transactions"]:
+                return False
+        if references is not None and references["unresolved_transactions"]:
+            # A failed rollback may leave this connection in SQL. Do not open a
+            # new outbox transaction before owned storage closure settles it.
+            worker = self._vectorization_worker
+            if worker is not None and worker is not threading.current_thread():
+                worker.join(timeout=max(0.0, timeout))
+            vector_stopped = worker is None or not worker.is_alive()
+        else:
+            self._durable_index.activate(None)
+            vector_stopped = self._stop_vectorization_worker(timeout=timeout)
+        refine = self._deferred_refine_worker
+        if refine is not None and refine is not threading.current_thread():
+            refine.join(timeout=max(0.0, timeout))
+        if self._artifact_references is not None:
+            self._artifact_references.retry_completed_holds()
+        with self._artifact_lifetime_lock:
+            preparing = bool(self._artifact_operations)
+        if not vector_stopped or (refine is not None and refine.is_alive()) or preparing:
+            return False
+        if self._artifact_references is not None and self._artifact_references.status()["pending_transactions"]:
+            return False
+        with self._instances_lock:
+            self._clear_active_memory_state()
+        if self._owns_vector_store:
+            self._vector_store.close()
+        # Owned connection closure settles even a failed-rollback completion
+        # proof. Keep its source registration until that proof releases holds.
+        self._repository.close()
+        self._memory_backends_closed = True
+        complete = self._artifact_references is None or self._artifact_references.close()
+        self._storage_closed = complete
+        return complete
+
+    # ------------------------------------------------------------------
+    # 延迟点云重投影精化 worker（阶段2）
+    # ------------------------------------------------------------------
+
+    def _delayed_pointcloud_enabled(self) -> bool:
+        """延迟点云策略是否开启（delayed_pointcloud / triangulation_first）。"""
+
+        return bool(getattr(self._deferred_projection_config, "delayed_pointcloud_enabled", False))
+
+    def _start_deferred_refine_worker(self) -> None:
+        """启动延迟点云精化 worker（仅 delayed_pointcloud 策略 + 点云源就绪时）。"""
+
+        if not self._delayed_pointcloud_enabled():
             return
-        self._vectorization_stop_event.clear()
-        self._vectorization_worker = threading.Thread(
-            target=self._vectorization_worker_loop,
-            name="memory-vectorization-worker",
+        if self._accumulated_cloud_provider is None:
+            LOGGER.warning(
+                "NUWAX_PERCEPTION_DEFERRED_STRATEGY 含延迟点云，但未注入累积点云源；"
+                "延迟点云精化降级为仅三角化（不启动精化线程）。"
+            )
+            return
+        if self._deferred_refine_worker is not None and self._deferred_refine_worker.is_alive():
+            return
+        self._deferred_refine_stop_event.clear()
+        self._deferred_refine_worker = threading.Thread(
+            target=self._deferred_refine_worker_loop,
+            name="memory-deferred-refine-worker",
             daemon=True,
         )
-        self._vectorization_worker.start()
-        logger.info("后台向量化 worker 已启动")
+        self._deferred_refine_worker.start()
+        LOGGER.info("延迟点云精化 worker 已启动")
 
-    def _stop_vectorization_worker(self) -> None:
-        """停止后台向量化 worker 线程。"""
-        if self._vectorization_worker is None or not self._vectorization_worker.is_alive():
+    def _stop_deferred_refine_worker(self) -> None:
+        """停止延迟点云精化 worker。"""
+
+        if self._deferred_refine_worker is None or not self._deferred_refine_worker.is_alive():
+            self._deferred_refine_worker = None
             return
-        self._vectorization_stop_event.set()
-        try:
-            self._vectorization_queue.put_nowait(None)
-        except queue.Full:
-            pass
-        self._vectorization_worker.join(timeout=10.0)
-        self._vectorization_worker = None
-        logger.info("后台向量化 worker 已停止")
+        self._deferred_refine_stop_event.set()
+        self._deferred_refine_worker.join(timeout=2.0)
+        if not self._deferred_refine_worker.is_alive():
+            self._deferred_refine_worker = None
+        LOGGER.info("延迟点云精化 worker 已停止")
 
-    def _vectorization_worker_loop(self) -> None:
-        """worker 主循环：从队列取任务，生成向量后写入 vector_store。"""
-        while not self._vectorization_stop_event.is_set():
-            try:
-                task = self._vectorization_queue.get(timeout=1.0)
-            except queue.Empty:
-                # 队列空闲时，从 pending 缓冲区补充任务
-                self._drain_pending_vectorization()
+    def _deferred_refine_worker_loop(self) -> None:
+        """精化主循环：低频扫描 pending 实例，用累积点云锥内取点精化坐标。
+
+        仅 pending（navigable=False 待定位）且非动态、movability∈{STATIC,MOVABLE}
+        的实例才进入精化；空闲不拉点云。
+        """
+
+        interval = float(getattr(self._deferred_projection_config, "delayed_pc_refine_interval_sec", 6.0))
+        max_concurrency = int(getattr(self._deferred_projection_config, "delayed_pc_max_concurrency", 2))
+        while not self._deferred_refine_stop_event.is_set():
+            # 用 Event.wait 实现可中断 sleep；停用时立即返回。
+            if self._deferred_refine_stop_event.wait(timeout=max(1.0, interval)):
+                break
+            if not self._memory_enabled:
                 continue
-            if task is None:
-                break
             try:
-                image_bytes = self._load_primary_image_bytes(task["artifact_ids"])  # type: ignore[arg-type]
-                vectors = self._build_named_vectors(
-                    retrieval_text=str(task["retrieval_text"]),
-                    image_bytes=image_bytes,
-                )
-                self._vector_store.upsert_point(
-                    point_id=str(task["point_id"]),
-                    collection_name=str(task["collection_name"]),
-                    record_kind=str(task["record_kind"]),
-                    payload=task["payload"],  # type: ignore[arg-type]
-                    vectors=vectors,
-                    updated_at=str(task["updated_at"]),
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("后台向量化任务失败，已跳过 point_id=%s: %s", task.get("point_id"), exc)
-            finally:
-                self._vectorization_queue.task_done()
+                self._run_deferred_refine_pass(max_targets=max(1, max_concurrency))
+            except Exception:  # noqa: BLE001 - 精化线程不得因单轮异常退出
+                LOGGER.exception("延迟点云精化轮次异常，跳过本轮")
 
-    def _drain_pending_vectorization(self) -> None:
-        """从 pending 缓冲区取出任务重新入队，每次最多补充 50 个避免阻塞。"""
-        drained = 0
-        while drained < 50:
-            with self._pending_lock:
-                if not self._pending_vectorization:
-                    break
-                task = self._pending_vectorization.popleft()
-            try:
-                self._vectorization_queue.put_nowait(task)
-                drained += 1
-            except queue.Full:
-                # 队列又满了，放回 pending
-                with self._pending_lock:
-                    self._pending_vectorization.appendleft(task)
+    def _select_deferred_refine_targets(self, *, max_targets: int) -> List[str]:
+        """挑选待精化实例 id：pending 待定位 + 非动态 + 有延迟投影缓存。
+
+        基于现有有界实例条目快照选择目标，在快照上锁外筛选；不直接遍历
+        原字典，以保持并发写入时的访问边界。
+        """
+
+        targets: List[str] = []
+        with self._instances_lock:
+            snapshot = list(self._semantic_instances_by_id.items())
+        for instance_id, instance in snapshot:
+            metadata = instance.metadata or {}
+            if metadata.get("pending_localization") is not True:
+                continue
+            if not (instance.deferred_projection_cache or []):
+                continue
+            retry_count = self._coerce_optional_int(metadata.get("deferred_pc_retry_count")) or 0
+            max_retry = int(getattr(self._deferred_projection_config, "delayed_pc_max_retry", 3))
+            if retry_count > max_retry:
+                continue
+            # 动态守卫：DYNAMIC/QUASI_STATIC 不精化（位置无长期意义）。
+            if self._instance_dynamic_state(instance) in {
+                InstanceDynamicState.DYNAMIC,
+                InstanceDynamicState.QUASI_STATIC,
+            }:
+                continue
+            if instance.movability == InstanceMovability.TRANSIENT:
+                continue
+            targets.append(instance_id)
+            if len(targets) >= max_targets:
                 break
+        return targets
 
-    def _enqueue_vectorization(
-        self,
-        *,
-        point_id: str,
-        collection_name: str,
-        record_kind: str,
-        retrieval_text: str,
-        artifact_ids: List[str],
-        updated_at: str,
-        payload: Dict[str, object],
-    ) -> None:
-        """将向量化任务入队；队满或 worker 未启动时降级为同步执行。"""
-        task: Dict[str, object] = {
-            "point_id": point_id,
-            "collection_name": collection_name,
-            "record_kind": record_kind,
-            "retrieval_text": retrieval_text,
-            "artifact_ids": artifact_ids,
-            "updated_at": updated_at,
-            "payload": payload,
-        }
-        if self._vectorization_worker is None or not self._vectorization_worker.is_alive():
-            self._run_vectorization_task_sync(task)
+    def _run_deferred_refine_pass(self, *, max_targets: int) -> None:
+        """单轮精化：仅 pending 非空时才拉取累积点云（空闲零开销）。"""
+
+        scope_generation = self._durable_index.activation_generation
+        target_ids = self._select_deferred_refine_targets(max_targets=max_targets)
+        if not target_ids:
             return
         try:
-            self._vectorization_queue.put_nowait(task)
-        except queue.Full:
-            logger.warning("向量化队列已满，标记待处理 point_id=%s", point_id)
-            # 标记为 pending，后续 worker 空闲时补充
-            self._mark_pending_vectorization(point_id, task)
-            return  # 不阻塞调用方
-
-    def _mark_pending_vectorization(self, point_id: str, task: Dict[str, object]) -> None:
-        """将溢出任务存入 pending 缓冲区，worker 空闲时自动补充执行。"""
-        with self._pending_lock:
-            self._pending_vectorization.append(task)
-
-    def _run_vectorization_task_sync(self, task: Dict[str, object]) -> None:
-        """同步执行单个向量化任务（fallback 路径）。"""
+            cloud_xyz = self._accumulated_cloud_provider()
+        except Exception:  # noqa: BLE001
+            LOGGER.exception("拉取累积点云失败，本轮精化跳过")
+            return
+        if cloud_xyz is None or getattr(cloud_xyz, "shape", (0,))[0] == 0:
+            return
+        # 同轮共享原始数组；投影内部按块转换，避免整图扩大为双精度副本。
         try:
-            image_bytes = self._load_primary_image_bytes(task["artifact_ids"])  # type: ignore[arg-type]
-            vectors = self._build_named_vectors(
-                retrieval_text=str(task["retrieval_text"]),
-                image_bytes=image_bytes,
+            cloud_xyz = np.asarray(cloud_xyz)
+        except (TypeError, ValueError):
+            return
+        if cloud_xyz.ndim != 2 or cloud_xyz.shape[1] != 3 or cloud_xyz.shape[0] == 0:
+            return
+        for instance_id in target_ids:
+            if self._deferred_refine_stop_event.is_set() or self._durable_index.activation_generation != scope_generation:
+                break
+            try:
+                self._refine_instance_with_pointcloud(instance_id, cloud_xyz, expected_generation=scope_generation)
+            except Exception:  # noqa: BLE001
+                LOGGER.exception("实例 %s 延迟点云精化异常", instance_id)
+
+    def _refine_instance_with_pointcloud(self, instance_id: str, cloud_xyz, *, expected_generation=None) -> None:
+        """对单个实例用最近一条缓存视锥做锥内取点；成功则覆盖坐标转 ACTIVE。"""
+
+        with self._instances_lock:
+            if expected_generation is not None and expected_generation != self._durable_index.activation_generation:
+                return
+            instance = self._semantic_instances_by_id.get(instance_id)
+            if instance is None:
+                return
+            # 仅反向遍历寻找最近有效射线，不复制整个有界缓存。
+            entry = None
+            for candidate in reversed(instance.deferred_projection_cache or ()):
+                if (
+                    candidate.ray_origin_map
+                    and candidate.ray_dir_map
+                    and candidate.cone_half_angle_rad is not None
+                ):
+                    entry = candidate
+                    break
+        # 取最近一条带射线 + 半角的缓存条目。
+        if entry is None:
+            return
+        min_points = int(getattr(self._deferred_projection_config, "delayed_pc_min_points", 5))
+        max_range = float(getattr(self._deferred_projection_config, "delayed_pc_max_range_m", 8.0))
+        result, count = project_cone(
+            cloud_xyz,
+            origin=(float(entry.ray_origin_map[0]), float(entry.ray_origin_map[1]), float(entry.ray_origin_map[2])),
+            direction=(float(entry.ray_dir_map[0]), float(entry.ray_dir_map[1]), float(entry.ray_dir_map[2])),
+            half_angle_rad=float(entry.cone_half_angle_rad),
+            min_points=min_points,
+            max_range_m=max_range,
+        )
+        if result is None:
+            self._record_deferred_refine_failure(instance_id, in_cone_count=count, expected_instance=instance)
+            return
+        self._apply_deferred_refine_success(instance_id, result=result, expected_instance=instance)
+
+    def _record_deferred_refine_failure(self, instance_id: str, *, in_cone_count: int, expected_instance=None) -> None:
+        """记录一次 fast-fail：retry 计数 +1，超限标 exhausted。"""
+
+        with self._instances_lock:
+            instance = self._semantic_instances_by_id.get(instance_id)
+            if instance is None or (expected_instance is not None and instance is not expected_instance):
+                return
+            metadata = dict(instance.metadata or {})
+            retry_count = (self._coerce_optional_int(metadata.get("deferred_pc_retry_count")) or 0) + 1
+            max_retry = int(getattr(self._deferred_projection_config, "delayed_pc_max_retry", 3))
+            metadata["deferred_pc_retry_count"] = retry_count
+            metadata["deferred_pc_last_in_cone_count"] = int(in_cone_count)
+            metadata["deferred_pc_status"] = (
+                "deferred_projection_exhausted" if retry_count > max_retry else "deferred_pointcloud_insufficient"
             )
-            self._vector_store.upsert_point(
-                point_id=str(task["point_id"]),
-                collection_name=str(task["collection_name"]),
-                record_kind=str(task["record_kind"]),
-                payload=task["payload"],  # type: ignore[arg-type]
-                vectors=vectors,
-                updated_at=str(task["updated_at"]),
+            updated = instance.model_copy(update={"metadata": metadata}, deep=True)
+            object.__setattr__(updated, "_memory_live_only", True)
+            self._cache_artifact_record("instance", updated, append_history=False)
+
+    def _apply_deferred_refine_success(self, instance_id: str, *, result, expected_instance=None) -> None:
+        """精化成功：覆盖坐标、清 pending、恢复 navigable；triangulation_first 做 cross-validation。"""
+
+        with self._instances_lock:
+            instance = self._semantic_instances_by_id.get(instance_id)
+            if instance is None:
+                return
+            if expected_instance is not None and instance is not expected_instance:
+                return
+            if self._record_library_name(instance) != self._active_library_name or not self._memory_enabled:
+                return
+            metadata = dict(instance.metadata or {})
+            centroid = result.centroid
+            pc_pose = Pose(
+                frame_id=str(instance.pose.frame_id or DEFAULT_MAP_FRAME),
+                position=Vector3(x=float(centroid[0]), y=float(centroid[1]), z=float(centroid[2])),
+                orientation=instance.pose.orientation,
             )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("同步向量化任务失败，已跳过 point_id=%s: %s", task.get("point_id"), exc)
+            strategy = str(getattr(self._deferred_projection_config, "strategy", "") or "")
+            confidence = 0.85
+            projection_method = "delayed_pointcloud_projection"
+            xval_meta: Dict[str, object] = {}
+            # triangulation_first：与现存三角化坐标 cross-validation。
+            if strategy == "triangulation_first" and not bool(metadata.get("pending_localization")):
+                prev_method = str(metadata.get("projection_method") or "")
+                if prev_method == "ray_triangulation":
+                    dist = self._euclidean_distance(instance.pose, pc_pose)
+                    threshold = float(getattr(self._deferred_projection_config, "xval_threshold_m", 0.3))
+                    xval_meta["deferred_pc_xval_distance_m"] = round(float(dist), 4)
+                    if dist > threshold:
+                        # 分歧大：标 uncertain、降置信，仍采用点云坐标（更稠密）。
+                        confidence = 0.85 * 0.5
+                        xval_meta["deferred_pc_xval_agreement"] = False
+                    else:
+                        xval_meta["deferred_pc_xval_agreement"] = True
+            metadata.pop("pending_localization", None)
+            metadata["observation_only"] = False
+            metadata["pose_quality_level"] = "high"
+            metadata["projection_degradation_reason"] = ""
+            metadata["position_observation_count"] = max(1, int(metadata.get("position_observation_count") or 0))
+            metadata["projection_method"] = projection_method
+            metadata["projection_confidence"] = float(confidence)
+            metadata["support_point_count"] = int(result.point_count)
+            metadata["deferred_pc_status"] = "deferred_pointcloud_projected"
+            metadata["deferred_pc_point_count"] = int(result.point_count)
+            metadata["deferred_pc_mean_range_m"] = round(float(result.mean_range_m), 4)
+            metadata.update(xval_meta)
+            lifecycle = instance.lifecycle_state
+            if lifecycle == InstanceLifecycleState.UNCERTAIN:
+                lifecycle = InstanceLifecycleState.ACTIVE
+            if xval_meta.get("deferred_pc_xval_agreement") is False:
+                lifecycle = InstanceLifecycleState.UNCERTAIN
+            metadata.update(self._evaluate_navigation_metadata(
+                metadata, backend_name=str(metadata.get("backend") or "memory_service.semantic_instance"),
+                map_name=instance.map_name, localization_session_id=instance.localization_session_id,
+            ))
+            if lifecycle != InstanceLifecycleState.ACTIVE or not self._is_long_term_static_instance(instance):
+                metadata["navigable"] = False
+                metadata["non_navigable_reason"] = "instance_not_active_or_static"
+            updated = instance.model_copy(
+                update={"pose": pc_pose, "metadata": metadata, "lifecycle_state": lifecycle},
+                deep=True,
+            )
+        # 锁外做持久化（避免长时间持锁）。
+        if self._is_long_term_static_instance(updated):
+            self._repository.upsert_semantic_instance(updated)
+            self._upsert_vector_point_for_instance(updated)
+        else:
+            self._publish_live_instance(updated, expected=instance)
+        LOGGER.info(
+            "实例 %s 延迟点云精化成功：%d 点，坐标=(%.3f, %.3f, %.3f)",
+            instance_id,
+            result.point_count,
+            result.centroid[0],
+            result.centroid[1],
+            result.centroid[2],
+        )
+
+    @staticmethod
+    def _euclidean_distance(pose_a: Pose, pose_b: Pose) -> float:
+        return float(
+            (
+                (float(pose_a.position.x) - float(pose_b.position.x)) ** 2
+                + (float(pose_a.position.y) - float(pose_b.position.y)) ** 2
+                + (float(pose_a.position.z) - float(pose_b.position.z)) ** 2
+            )
+            ** 0.5
+        )
+
+    def _vectorization_worker_loop(self, stop, token) -> None:
+        index = self._durable_index
+        try:
+            while not stop.is_set():
+                index.wake.clear()
+                index.cleanup_cache_page()
+                if index.active_library is not None:
+                    index.reconcile_page(page_size=8)
+                    index.rebind_page(page_size=4)
+                try:
+                    claim = index.outbox.claim_next(token, lease_seconds=3600.0)
+                except Exception:
+                    if stop.is_set() or self._closed:
+                        break
+                    raise
+                if claim is None:
+                    try:
+                        deadline = index.outbox.next_wakeup_at(token)
+                    except Exception:
+                        if stop.is_set() or self._closed:
+                            break
+                        raise
+                    timeout = 0.25 if index.active_library else 30.0
+                    if deadline is not None:
+                        timeout = min(timeout, max(0.01, deadline - time.time()))
+                    index.wake.wait(timeout)
+                    continue
+                try:
+                    # Only admitted work initializes providers; empty activation stays cheap.
+                    self._ensure_embedders_initialized()
+                    self._run_durable_vectorization(claim)
+                except Exception as exc:
+                    index.outbox.fail(claim, category=type(exc).__name__, message=type(exc).__name__)
+        except Exception:
+            if not stop.is_set() and not self._closed:
+                raise
+        finally:
+            index.outbox.stop_worker(token)
+            index.release_worker()
+
+    def _run_durable_vectorization(self, claim) -> None:
+        self._compute_durable_vectorization(claim)
+
+    def _compute_durable_vectorization(self, claim) -> None:
+        index = self._durable_index
+        snapshot = index.source_for_claim(claim)
+        if snapshot is None:
+            index.outbox.complete(claim, publish=lambda tx, current: None)
+            return
+        row, projection = snapshot
+        if projection["binding"] != self._index_model_binding():
+            record = index.load(row["source_kind"], row["external_id"])
+            if record is not None:
+                index.ensure(row["source_kind"], record)
+            refreshed = index.source_for_claim(claim)
+            if refreshed is None:
+                index.outbox.complete(claim, publish=lambda tx, current: None)
+                return
+            row, projection = refreshed
+            if projection["binding"] != self._index_model_binding():
+                index.outbox.fail(claim, category="model_binding_changed", message="Binding changed during refresh")
+                return
+        if not projection["eligible"]:
+            index.outbox.complete(claim, publish=lambda tx, current: None)
+            return
+        text_provider, image_provider = self._text_embedder, self._image_embedder
+        applicable = index.applicable_modalities(projection)
+        if not applicable:
+            index.outbox.complete(claim, publish=lambda tx, current: None)
+            return
+        text_identity = (text_provider.model_name, text_provider.dimension) if text_provider is not None else None
+        image_identity = (image_provider.model_name, image_provider.dimension) if image_provider is not None else None
+        existing = index.current_vectors(claim)
+        image_bytes, image_artifact_id, image_error = self._load_index_image(projection["artifacts"])
+        failures = []
+        if TEXT_VECTOR_NAME in applicable and text_provider is None:
+            failures.append("text_provider_unavailable")
+        if TEXT_VECTOR_NAME in applicable and text_provider is not None and TEXT_VECTOR_NAME not in existing:
+            try:
+                route, fallback = "text_only", None
+                with self._association_compute_lock:
+                    if image_bytes is not None:
+                        try:
+                            text_vector = text_provider.embed_fused_text_image(text=projection["text"], image_bytes=image_bytes)
+                            route = "fused_text_image"
+                        except Exception as exc:
+                            fallback = type(exc).__name__
+                            text_vector = text_provider.embed_text(projection["text"])
+                            route = "text_only_fallback"
+                    else:
+                        text_vector = text_provider.embed_text(projection["text"])
+                        if projection["artifacts"]:
+                            route, fallback = "text_only_fallback", image_error
+                named = NamedVector(TEXT_VECTOR_NAME, text_identity[0], text_identity[1], text_vector)
+                if projection["binding"] != self._index_model_binding():
+                    raise RuntimeError("model_binding_changed")
+                index.publish(claim, named, actual={"route": route, "fallback_reason": fallback,
+                    "image_artifact_id": image_artifact_id if route == "fused_text_image" else None,
+                    "binding": projection["binding"]})
+            except Exception as exc:
+                failures.append("text:" + type(exc).__name__)
+        if IMAGE_VECTOR_NAME in applicable and IMAGE_VECTOR_NAME not in existing:
+            if image_bytes is None:
+                failures.append(image_error or "image_missing")
+            elif image_provider is None:
+                failures.append("image_provider_unavailable")
+            else:
+                try:
+                    owner = self._association_compute_lock if image_provider is text_provider else self._image_inference_lock
+                    with owner:
+                        image_vector = image_provider.embed_image_bytes(image_bytes)
+                    named = NamedVector(IMAGE_VECTOR_NAME, image_identity[0], image_identity[1], image_vector)
+                    if projection["binding"] != self._index_model_binding():
+                        raise RuntimeError("model_binding_changed")
+                    index.publish(claim, named, actual={"route": "image_only", "image_artifact_id": image_artifact_id,
+                                                        "binding": projection["binding"]})
+                except Exception as exc:
+                    failures.append("image:" + type(exc).__name__)
+        if failures:
+            index.outbox.fail(claim, category="legacy_archive_capability_required" if any("DerivedCacheCapabilityError" in item for item in failures) else "modality_unavailable", message=",".join(failures),
+                              permanent=any("DerivedCacheCapabilityError" in item for item in failures))
+        else:
+            index.outbox.complete(claim, publish=lambda tx, current: None)
+
+    def _load_index_image(self, artifact_ids):
+        """在既有制品读取租约内读取有界图像，使用所有者提供的制品身份。"""
+        if not artifact_ids:
+            return None, None, None
+        if self._artifact_store is None:
+            return None, None, "artifact_store_unavailable"
+        reason = "image_missing"
+        for artifact_id in artifact_ids:
+            try:
+                with self._artifact_store.read_artifact(artifact_id) as (ref, stream):
+                    if ref.size_bytes is not None and ref.size_bytes > 32 * 1024 * 1024:
+                        reason = "image_too_large"
+                        continue
+                    data = stream.read(32 * 1024 * 1024 + 1)
+                if len(data) > 32 * 1024 * 1024:
+                    reason = "image_too_large"
+                    continue
+                return data, ref.artifact_id, None
+            except Exception as exc:
+                reason = "image_" + type(exc).__name__
+        return None, None, reason
+
+    def _dispatch_vectorization_task(self, task: Dict[str, object]) -> None:
+        # Compatibility wake for observation scopes; source acceptance already
+        # committed work atomically. No payload queue or synchronous fallback.
+        self._durable_index.wake.set()
+
+    def _enqueue_vectorization(self, **task) -> None:
+        self._durable_index.wake.set()
 
     def _upsert_vector_point_for_scene_space(self, scene_space: SceneSpace) -> None:
-        payload = self._build_scene_space_payload(scene_space)
-        image_bytes = self._load_primary_image_bytes(self._scene_space_artifact_ids(scene_space))
-        vectors = self._build_named_vectors(
-            retrieval_text=str(payload["retrieval_text"]),
-            image_bytes=image_bytes,
-        )
-        self._vector_store.upsert_point(
-            point_id=scene_space.scene_space_id,
-            collection_name=SCENE_SPACES_COLLECTION,
-            record_kind=MemoryRecordKind.SCENE_SPACE.value,
-            payload=payload,
-            vectors=vectors,
-            updated_at=(scene_space.semantic_updated_at or scene_space.timestamp).isoformat(),
-        )
+        self._durable_index.wake.set()
 
     def _build_named_vectors(
         self,
@@ -4354,14 +5871,14 @@ class MemoryService:
         retrieval_text: str,
         image_bytes: Optional[bytes],
     ) -> Dict[str, NamedVector]:
-        vectors = {
-            TEXT_VECTOR_NAME: NamedVector(
+        vectors = {}
+        if self._text_embedder is not None:
+            vectors[TEXT_VECTOR_NAME] = NamedVector(
                 vector_name=TEXT_VECTOR_NAME,
                 model_name=self._text_embedder.model_name,
                 dimension=self._text_embedder.dimension,
                 vector=self._embed_retrieval_text(retrieval_text, image_bytes=image_bytes),
             )
-        }
         if image_bytes is not None and self._image_embedder is not None:
             vectors[IMAGE_VECTOR_NAME] = NamedVector(
                 vector_name=IMAGE_VECTOR_NAME,
@@ -4377,6 +5894,8 @@ class MemoryService:
         *,
         image_bytes: Optional[bytes],
     ) -> np.ndarray:
+        if self._text_embedder is None:
+            raise RuntimeError("词法检索模式不生成文本向量。")
         if image_bytes is not None:
             try:
                 return self._text_embedder.embed_fused_text_image(
@@ -4405,7 +5924,7 @@ class MemoryService:
             "normalized_name": location.normalized_name,
             "aliases": list(location.aliases),
             "linked_location_id": location.location_id,
-            "map_version_id": location.map_version_id,
+            "map_name": location.map_name,
             "localization_session_id": location.localization_session_id or str(location.metadata.get("localization_session_id", "") or "") or None,
             "localization_source_name": location.localization_source_name,
             "topo_node_id": location.topo_node_id,
@@ -4427,9 +5946,10 @@ class MemoryService:
             "retrieval_text": retrieval_text,
         }
 
-    def _build_memory_payload(self, entry: SemanticMemoryEntry) -> Dict[str, object]:
-        linked_location_name = ""
-        if entry.linked_location_id:
+    def _build_memory_payload(self, entry: SemanticMemoryEntry, *, linked_location_name=None) -> Dict[str, object]:
+        supplied_linked_name = linked_location_name
+        linked_location_name = linked_location_name or ""
+        if supplied_linked_name is None and entry.linked_location_id:
             linked_location = self._tagged_locations_by_id.get(entry.linked_location_id)
             if linked_location is not None:
                 linked_location_name = linked_location.name
@@ -4439,7 +5959,7 @@ class MemoryService:
         pose_x = float(entry.pose.position.x) if entry.pose is not None else None
         pose_y = float(entry.pose.position.y) if entry.pose is not None else None
         pose_z = float(entry.pose.position.z) if entry.pose is not None else None
-        retrieval_text = self._build_semantic_search_text(entry)
+        retrieval_text = self._build_semantic_search_text(entry, linked_location_name=linked_location_name)
         return {
             "record_id": entry.memory_id,
             "record_kind": entry.kind.value,
@@ -4448,7 +5968,7 @@ class MemoryService:
             "tags": list(entry.tags),
             "linked_location_id": entry.linked_location_id,
             "linked_location_name": linked_location_name,
-            "map_version_id": entry.map_version_id,
+            "map_name": entry.map_name,
             "localization_session_id": entry.localization_session_id or str(entry.metadata.get("localization_session_id", "") or "") or None,
             "scene_space_id": entry.scene_space_id or str(entry.metadata.get("scene_space_id", "") or "") or None,
             "topo_node_id": entry.topo_node_id,
@@ -4495,7 +6015,7 @@ class MemoryService:
             "dynamic_short_term_obstacle_context": bool(instance.metadata.get("dynamic_short_term_obstacle_context")),
             "long_term_static_target_eligible": bool(instance.metadata.get("long_term_static_target_eligible")),
             "observation_window": list(instance.metadata.get("observation_window") or []),
-            "map_version_id": instance.map_version_id,
+            "map_name": instance.map_name,
             "localization_session_id": instance.localization_session_id or str(instance.metadata.get("localization_session_id", "") or "") or None,
             "scene_space_id": instance.scene_space_id or str(instance.metadata.get("scene_space_id", "") or "") or None,
             "topo_node_id": instance.topo_node_id,
@@ -4536,7 +6056,7 @@ class MemoryService:
             "title": event.title,
             "summary": event.summary,
             "camera_id": event.camera_id or "",
-            "map_version_id": event.map_version_id,
+            "map_name": event.map_name,
             "localization_session_id": event.localization_session_id or str(event.metadata.get("localization_session_id", "") or "") or None,
             "scene_space_id": event.scene_space_id or str(event.metadata.get("scene_space_id", "") or "") or None,
             "frame_id": event.frame_id or (event.pose.frame_id if event.pose is not None else None),
@@ -4585,7 +6105,7 @@ class MemoryService:
             "name": scene_space.primary_label or scene_space.scene_space_id,
             "primary_label": scene_space.primary_label or "",
             "aliases": list(scene_space.human_aliases),
-            "map_version_id": scene_space.map_version_id,
+            "map_name": scene_space.map_name,
             "localization_session_id": scene_space.localization_session_id or str(scene_space.metadata.get("localization_session_id", "") or "") or None,
             "topo_node_id": topo_node_id,
             "semantic_region_id": semantic_region_id,
@@ -4624,6 +6144,8 @@ class MemoryService:
         }
 
     def _scene_space_navigation_pose(self, scene_space: SceneSpace) -> Optional[Pose]:
+        if scene_space.metadata.get(MANAGED_KEY) and not scene_space.metadata.get("navigable", False):
+            return None
         if scene_space.inspection_poses:
             return scene_space.inspection_poses[0]
         if scene_space.entry_poses:
@@ -4746,7 +6268,7 @@ class MemoryService:
             "primary_label": scene_space.primary_label or "",
             "candidate_labels": [item.label for item in scene_space.candidate_labels[:5]],
             "review_status": scene_space.review_status.value,
-            "map_version_id": scene_space.map_version_id,
+            "map_name": scene_space.map_name,
             "localization_session_id": scene_space.localization_session_id,
             "linked_object_instance_ids": list(scene_space.linked_object_instance_ids),
             "linked_topology_node_ids": list(scene_space.linked_topology_node_ids),
@@ -4778,9 +6300,10 @@ class MemoryService:
         ]
         return " ".join(segment for segment in segments if segment).strip()
 
-    def _build_semantic_search_text(self, entry: SemanticMemoryEntry) -> str:
-        linked_location_name = ""
-        if entry.linked_location_id:
+    def _build_semantic_search_text(self, entry: SemanticMemoryEntry, *, linked_location_name=None) -> str:
+        supplied_linked_name = linked_location_name
+        linked_location_name = linked_location_name or ""
+        if supplied_linked_name is None and entry.linked_location_id:
             linked_location = self._tagged_locations_by_id.get(entry.linked_location_id)
             if linked_location is not None:
                 linked_location_name = linked_location.name
@@ -4878,7 +6401,11 @@ class MemoryService:
         return self._score_text_candidates(normalized_query, texts, fallback_reason="与地点描述或空间标签相似。")
 
     def _score_semantic_entry(self, normalized_query: str, entry: SemanticMemoryEntry) -> Tuple[float, str]:
-        texts = [
+        return self._score_text_candidates(normalized_query, self._semantic_entry_texts(entry),
+                                          fallback_reason="与语义记忆内容相似。")
+
+    def _semantic_entry_texts(self, entry: SemanticMemoryEntry) -> List[str]:
+        return [
             entry.title,
             entry.summary,
             *entry.tags,
@@ -4889,7 +6416,6 @@ class MemoryService:
             entry.semantic_region_id or "",
             entry.topo_node_id or "",
         ]
-        return self._score_text_candidates(normalized_query, texts, fallback_reason="与语义记忆内容相似。")
 
     def _score_semantic_instance(self, normalized_query: str, instance: SemanticInstance) -> Tuple[float, str]:
         texts = [
@@ -4938,7 +6464,22 @@ class MemoryService:
 
     def _build_scene_memory_metadata(self, perception_context) -> Dict[str, object]:
         scene_summary = perception_context.scene_summary
+        frame_timestamp = perception_context.metadata.get("frame_timestamp")
+        frame_acquired_timestamp = perception_context.metadata.get("frame_acquired_timestamp")
+        if frame_timestamp and not frame_acquired_timestamp:
+            timestamp = datetime.fromisoformat(str(frame_timestamp).replace("Z", "+00:00"))
+            if timestamp.tzinfo is not None:
+                source_ns = perception_context.metadata.get("source_timestamp_ns") or round(timestamp.timestamp()*1e9)
+                try:
+                    real_ns = acquired_unix_ns(source_ns)
+                except SourceTimeError as exc:
+                    raise GatewayError("图像真实采集时间不可用：" + str(exc),
+                        error_code="frame_source_time_unavailable", http_status=409) from exc
+                frame_acquired_timestamp = datetime.fromtimestamp(real_ns/1e9, timezone.utc).isoformat()
         return {
+            "frame_timestamp": frame_timestamp,
+            "frame_acquired_timestamp": frame_acquired_timestamp,
+            "frame_timestamp_source": perception_context.metadata.get("frame_timestamp_source"),
             "visual_labels": self._collect_scene_visual_labels(scene_summary),
             "vision_tags": self._collect_scene_vision_tags(scene_summary),
             "semantic_relations": self._normalize_aliases(scene_summary.metadata.get("semantic_relations")),
@@ -4974,18 +6515,46 @@ class MemoryService:
     ) -> Tuple[float, str]:
         if not normalized_query:
             return 0.0, fallback_reason
-        query_tokens = self._tokenize(normalized_query)
         best_score = 0.0
+        state = getattr(self, "_query_score_state", None)
+        cache = getattr(state, "cache", None)
+        fuzzy_cache = getattr(state, "fuzzy_cache", None)
+        lexical_query = getattr(state, "lexical_query", None)
+        if fuzzy_cache is not None:
+            if lexical_query is None or lexical_query[0] != normalized_query:
+                lexical_query = (normalized_query, self._tokenize(normalized_query),
+                    re.compile("[^" + re.escape("".join(sorted(set(normalized_query)))) + "]"))
+                state.lexical_query = lexical_query
+            query_tokens = lexical_query[1]
+        else:
+            query_tokens = self._tokenize(normalized_query)
         for text in texts:
             normalized_text = self._normalize_text(text)
             if not normalized_text:
                 continue
             if normalized_query == normalized_text:
                 return 0.99, "文本完全匹配。"
-            text_tokens = self._tokenize(normalized_text)
-            overlap_score = self._token_overlap_score(query_tokens, text_tokens)
-            fuzzy_score = SequenceMatcher(None, normalized_query, normalized_text).ratio()
-            score = max(fuzzy_score, overlap_score, (0.6 * fuzzy_score) + (0.4 * overlap_score))
+            key = (normalized_query, normalized_text)
+            score = cache.get(key) if cache is not None else None
+            if score is None:
+                text_tokens = self._tokenize(normalized_text)
+                overlap_score = self._token_overlap_score(query_tokens, text_tokens)
+                # Characters absent from the query cannot match any position in
+                # SequenceMatcher's first sequence. Masking only those characters
+                # preserves positions, length, matching-character frequencies and
+                # autojunk behavior, hence the exact ratio (including asymmetry).
+                # Token overlap still uses the original text: masked tokens may
+                # have different identities or multiplicities. Both caches are
+                # bounded and die with this query, including exceptional exits.
+                fuzzy_key = (normalized_query, lexical_query[2].sub("\x00", normalized_text)) if fuzzy_cache is not None else None
+                fuzzy_score = fuzzy_cache.get(fuzzy_key) if fuzzy_cache is not None else None
+                if fuzzy_score is None:
+                    fuzzy_score = SequenceMatcher(None, normalized_query, normalized_text).ratio()
+                    if fuzzy_cache is not None and len(fuzzy_cache) < 2048:
+                        fuzzy_cache[fuzzy_key] = fuzzy_score
+                score = max(fuzzy_score, overlap_score, (0.6 * fuzzy_score) + (0.4 * overlap_score))
+                if cache is not None and len(cache) < 2048:
+                    cache[key] = score
             best_score = max(best_score, score)
         return best_score, fallback_reason
 
@@ -5133,8 +6702,8 @@ class MemoryService:
         record_kinds = {item.value if hasattr(item, "value") else str(item) for item in payload_filter.record_kinds}
         if record_kinds and point.record_kind not in record_kinds:
             return False
-        if payload_filter.map_version_id:
-            if str(point.payload.get("map_version_id") or "").strip() != str(payload_filter.map_version_id).strip():
+        if payload_filter.map_name:
+            if str(point.payload.get("map_name") or "").strip() != str(payload_filter.map_name).strip():
                 return False
         if payload_filter.localization_session_id:
             if str(point.payload.get("localization_session_id") or "").strip() != str(payload_filter.localization_session_id).strip():
@@ -5171,8 +6740,7 @@ class MemoryService:
         if payload_filter.movabilities:
             if str(point.payload.get("movability") or "").strip() not in {str(item).strip() for item in payload_filter.movabilities}:
                 return False
-        shadow_store = self._vector_store
-        return shadow_store._payload_matches(point.payload, payload_filter)  # type: ignore[attr-defined]
+        return MemoryPayloadMatcher().matches(point.payload, payload_filter)
 
     def _merge_payload_filter(
         self,
@@ -5200,53 +6768,234 @@ class MemoryService:
             merged.max_distance_m = max_distance_m
         return merged
 
-    def _refresh_semantic_map_context(self, map_snapshot) -> SemanticMapBuildResult:
-        active_session = self._localization_service.get_active_session()
-        active_session_id = active_session.session_id if active_session is not None else None
-        if map_snapshot is None:
-            self._latest_semantic_map_context = self._semantic_map_builder.build(None)
-            self._latest_semantic_map_context_localization_session_id = active_session_id
-            return self._latest_semantic_map_context
-        if (
-            self._latest_semantic_map_context.map_version_id == map_snapshot.version_id
-            and self._latest_semantic_map_context_localization_session_id == active_session_id
-        ):
-            return self._latest_semantic_map_context
-        built_context = self._semantic_map_builder.build(map_snapshot)
-        scene_spaces = tuple(self._prepare_built_scene_space(item, active_session_id) for item in built_context.scene_spaces)
-        self._latest_semantic_map_context = SemanticMapBuildResult(
-            map_version_id=built_context.map_version_id,
-            frame_id=built_context.frame_id,
-            semantic_regions=built_context.semantic_regions,
-            anchors_by_id=built_context.anchors_by_id,
-            topology_nodes_by_id=built_context.topology_nodes_by_id,
-            scene_spaces=scene_spaces,
-        )
-        self._latest_semantic_map_context_localization_session_id = active_session_id
-        if self.is_enabled():
-            self._ensure_embedders_initialized()
-            for scene_space in scene_spaces:
-                self._upsert_scene_space(scene_space, publish_event=False)
-        else:
-            for scene_space in scene_spaces:
-                self._cache_scene_space(scene_space)
-                self._write_scene_space_state(scene_space)
-        self._state_store.write(
-            StateNamespace.MEMORY,
-            "semantic_map_context",
-            self._latest_semantic_map_context,
-            source="memory_service",
-            metadata={"kind": "semantic_map_context", "map_version_id": map_snapshot.version_id},
-        )
-        return self._latest_semantic_map_context
+    @staticmethod
+    def _remap_built_scene_identities(built, remap):
+        if not remap:
+            return built
+        def identifier(value):
+            return remap.get(value, value)
+        anchors = {identifier(key): anchor.model_copy(update={"anchor_id": identifier(anchor.anchor_id)})
+                   for key, anchor in built.anchors_by_id.items()}
+        regions = tuple(region.model_copy(update={"anchor_id": identifier(region.anchor_id)})
+                        for region in built.semantic_regions)
+        nodes = {key: {**node, "anchor_id": identifier(node.get("anchor_id"))}
+                 for key, node in built.topology_nodes_by_id.items()}
+        scenes = []
+        for scene in built.scene_spaces:
+            metadata = dict(scene.metadata)
+            if "anchor_sources" in metadata:
+                metadata["anchor_sources"] = [{**item, "anchor_id": identifier(item.get("anchor_id"))}
+                                              for item in metadata["anchor_sources"]]
+            scenes.append(scene.model_copy(update={"scene_space_id": identifier(scene.scene_space_id),
+                "linked_anchor_ids": [identifier(value) for value in scene.linked_anchor_ids], "metadata": metadata}))
+        return SemanticMapBuildResult(map_name=built.map_name, frame_id=built.frame_id,
+            semantic_regions=regions, anchors_by_id=anchors, topology_nodes_by_id=nodes, scene_spaces=tuple(scenes))
 
-    def _prepare_built_scene_space(self, scene_space: SceneSpace, localization_session_id: Optional[str]) -> SceneSpace:
-        existing = self._scene_spaces_by_id.get(scene_space.scene_space_id)
+    def _pending_scene_context(self, transaction, *, entries=None):
+        """Read only transaction-visible context plans, including savepoints.
+
+        A rolled-back savepoint also rolls back its publication token. The
+        existing owner token therefore selects the surviving plan without a
+        second savepoint/state protocol or any source-content comparison.
+        """
+        if transaction is None:
+            return None
+        entries = entries if entries is not None else getattr(self._observation_write_state, "scene_contexts", [])
+        related = [entry for entry in entries if entry[0] is transaction.completion]
+        if not related or self._semantic_map_request not in {entry[1] for entry in related}:
+            return None
+        for entry in reversed(related):
+            _, request, context, identity, plan, publication, generation, _ = entry
+            if (generation == self._durable_index.activation_generation and plan.library_name == self._active_library_name
+                    and plan.is_current(publication) and self._scene_map_owner_matches(identity)):
+                self._semantic_map_request = request
+                return request, context, identity
+        # No uncommitted plan survived. Existing published state remains owned
+        # by its old token; only restore it when it still belongs to this map.
+        if (self._semantic_map_identity_plan is not None
+                and self._semantic_map_identity_plan.is_current(self._semantic_map_identity_publication)
+                and self._scene_map_owner_matches(self._latest_semantic_map_context_identity)):
+            self._semantic_map_request = self._semantic_map_published_request
+        return None
+
+    def _remember_pending_scene_context(self, transaction, request, context, identity, plan, publication):
+        entries = getattr(self._observation_write_state, "scene_contexts", None)
+        if entries is None:
+            entries = self._observation_write_state.scene_contexts = []
+        entry = (transaction.completion, request, context, identity, plan, publication,
+                 self._durable_index.activation_generation, [False])
+        entries.append(entry)
+        def completed(committed):
+            with self._instances_lock:
+                if not committed:
+                    self._pending_scene_context(transaction, entries=entries)
+                entry[-1][0] = True
+                related = [value for value in entries if value[0] is transaction.completion]
+                if all(value[-1][0] for value in related):
+                    entries[:] = [value for value in entries if value[0] is not transaction.completion]
+        transaction.after_completion(completed)
+
+    def _transaction_scene_context(self, context):
+        """Return caller-owned rows from the active writer without publishing."""
+        scenes = [self._repository.load_scene_space(scene.scene_space_id) for scene in context.scene_spaces]
+        return SemanticMapBuildResult(map_name=context.map_name, frame_id=context.frame_id,
+            semantic_regions=context.semantic_regions, anchors_by_id=context.anchors_by_id,
+            topology_nodes_by_id=context.topology_nodes_by_id,
+            scene_spaces=tuple(scene for scene in scenes if scene is not None))
+
+    def _scene_map_owner_matches(self, snapshot_identity):
+        # Mapping snapshots are owner-published immutable handles. Comparing
+        # these scalar fields never scans or copies map content.
+        owner = self._mapping_service
+        getter = getattr(owner, "get_semantic_snapshot", None) or getattr(owner, "get_latest_snapshot", None)
+        if getter is None:
+            return True  # Explicit snapshot callers without a mapping owner.
+        current = getter()
+        if snapshot_identity is None:
+            return current is None
+        if current is None:
+            return False
+        return (str(current.map_name), str(current.source_name), str(current.source_epoch),
+                str(current.frame_id), int(current.update_sequence)) == (
+                    snapshot_identity[0], *snapshot_identity[2:])
+
+    def _publish_built_scene_context(self, context, plan, publication, *, generation, library, snapshot_identity, request):
+        with self._instances_lock:
+            if (self._closed or generation != self._durable_index.activation_generation
+                    or library != self._active_library_name or request != self._semantic_map_request
+                    or not self._scene_map_owner_matches(snapshot_identity)):
+                return
+            if plan is not None and (not self.is_enabled() or not plan.is_current(publication)):
+                return
+            # An outer transaction can already contain a later sample write.
+            # Its source callback may follow this map callback, so an older
+            # cached/built scene is never a valid fallback for derived writes.
+            current_scenes = []
+            for scene in context.scene_spaces:
+                current = self._repository.load_scene_space(scene.scene_space_id) if plan is not None else scene
+                if current is None or (plan is not None and self._repository._resolve_record_library_name(current) != library):
+                    continue
+                if plan is not None:
+                    cached = self._scene_spaces_by_id.get(current.scene_space_id)
+                    if cached is None or getattr(cached, "_scene_graph_source_revision", None) != getattr(current, "_scene_graph_source_revision", None):
+                        self._cache_artifact_record("scene", current, append_history=False)
+                    else:
+                        current = cached
+                    self._record_scene_space_graph(current)
+                    current = self._scene_spaces_by_id.get(current.scene_space_id, current)
+                current_scenes.append(current.model_copy(deep=True))
+            finalized = SemanticMapBuildResult(map_name=context.map_name, frame_id=context.frame_id,
+                semantic_regions=context.semantic_regions, anchors_by_id=context.anchors_by_id,
+                topology_nodes_by_id=context.topology_nodes_by_id, scene_spaces=tuple(current_scenes))
+            self._latest_semantic_map_context = finalized
+            self._latest_semantic_map_context_identity = snapshot_identity
+            self._semantic_map_published_request = request
+            self._semantic_map_identity_plan = plan
+            self._semantic_map_identity_publication = publication
+            self._scene_identity_diagnostics["map"] = list(plan.diagnostics) if plan is not None else []
+            self._state_store.write(StateNamespace.MEMORY, "semantic_map_context", finalized,
+                source="memory_service", metadata={"kind": "semantic_map_context", "map_name": context.map_name,
+                    "identity_diagnostics": list(self._scene_identity_diagnostics["map"])})
+
+    def _refresh_semantic_map_context(
+        self, map_snapshot, *, map_name: Optional[str] = None, expected_generation=None,
+    ) -> SemanticMapBuildResult:
+        from services.memory.scene_identity import IdentityPlanChanged, IdentityScopeChanged
+        from services.memory.scene_mapping_state import bound_to_semantic_reference, snapshot_binding
+        reference_getter = getattr(self._mapping_service, "get_semantic_snapshot", None)
+        reference = reference_getter() if reference_getter is not None else None
+        if map_snapshot is not None and reference is not None and bound_to_semantic_reference(map_snapshot, snapshot_binding(reference)):
+            # 区域上下文消费封存资产；观察写入仍保留其原运行期快照和采集来源。
+            map_snapshot = reference
+        caller_transaction = self._repository.storage.current_transaction
+        scope = self._observation_write_scope()
+        captured_generation = (scope.get("activation_generation") if scope and "activation_generation" in scope
+                               else self._durable_index.activation_generation) if expected_generation is None else expected_generation
+        captured_library = scope["library_name"] if scope else self._active_library_name
+        active_session = self._observation_localization_session()
+        active_session_id = active_session.session_id if active_session is not None else None
+        resolved_map_name = self._resolve_stable_map_name(map_name=map_name, map_snapshot=map_snapshot)
+        snapshot_identity = None if map_snapshot is None else (
+            resolved_map_name, active_session_id, str(map_snapshot.source_name), str(map_snapshot.source_epoch),
+            str(map_snapshot.frame_id), int(map_snapshot.update_sequence))
+        with self._instances_lock:
+            if captured_generation != self._durable_index.activation_generation or captured_library != self._active_library_name:
+                raise GatewayError("语义地图构建期间记忆库已切换。", error_code="memory_library_changed", http_status=409)
+            if not self._scene_map_owner_matches(snapshot_identity):
+                raise GatewayError("语义地图来源已改变，请重新读取。", error_code="scene_map_changed", http_status=409)
+            pending = self._pending_scene_context(caller_transaction)
+            if pending is not None and pending[2] == snapshot_identity:
+                return self._transaction_scene_context(pending[1])
+            if (map_snapshot is not None and self._latest_semantic_map_context.map_name == resolved_map_name
+                    and self._latest_semantic_map_context_identity == snapshot_identity
+                    and (self._semantic_map_identity_plan is None or self._semantic_map_identity_plan.is_current(
+                        self._semantic_map_identity_publication))):
+                return (self._transaction_scene_context(self._latest_semantic_map_context)
+                        if caller_transaction is not None else self._latest_semantic_map_context)
+            self._semantic_map_request += 1
+            request = self._semantic_map_request
+        plan = (self._repository.prepare_scene_identities(captured_library, snapshot=map_snapshot)
+                if captured_library and self.is_enabled() and map_snapshot is not None else None)
+        built = self._semantic_map_builder.build(map_snapshot, map_name=resolved_map_name,
+            identity_resolver=plan.resolve if plan is not None else None)
+        for attempt in range(3):
+            # Geometry is built once. Winner reconciliation only remaps IDs and
+            # re-prepares owned source rows outside the writer/publication locks.
+            previous_scope = self._observation_write_scope()
+            self._observation_write_state.scope = previous_scope or {
+                "library_name": captured_library, "activation_generation": captured_generation,
+                "use_spatial_snapshot": False, "vector_tasks": []}
+            try:
+                scenes = []
+                for item in built.scene_spaces:
+                    if plan is not None:
+                        item = item.model_copy(update={"metadata": {**item.metadata, "scene_identity_scope": dict(plan.scope_metadata)}})
+                    scenes.append(self._prepare_built_scene_space(item, active_session_id, owned_identity=plan is not None))
+                prepared = [self._repository._prepare_scene_space_write(scene) for scene in scenes] if plan is not None else []
+                context = SemanticMapBuildResult(map_name=built.map_name, frame_id=built.frame_id,
+                    semantic_regions=built.semantic_regions, anchors_by_id=built.anchors_by_id,
+                    topology_nodes_by_id=built.topology_nodes_by_id, scene_spaces=tuple(scenes))
+                with self._instances_lock:
+                    if (captured_generation != self._durable_index.activation_generation
+                            or captured_library != self._active_library_name):
+                        raise GatewayError("语义地图构建期间记忆库已切换。", error_code="memory_library_changed", http_status=409)
+                    if request != self._semantic_map_request or not self._scene_map_owner_matches(snapshot_identity):
+                        raise GatewayError("语义地图来源已改变，请重新读取。", error_code="scene_map_changed", http_status=409)
+                    if plan is None:
+                        self._publish_built_scene_context(context,None,None,generation=captured_generation,
+                            library=captured_library,snapshot_identity=snapshot_identity,request=request)
+                    else:
+                        with self._repository.storage.transaction() as transaction:
+                            publication = plan.admit(transaction)
+                            written = [self._repository._commit_prepared_scene_space(value) for value in prepared]
+                            context = SemanticMapBuildResult(map_name=built.map_name,frame_id=built.frame_id,
+                                semantic_regions=built.semantic_regions,anchors_by_id=built.anchors_by_id,
+                                topology_nodes_by_id=built.topology_nodes_by_id,
+                                scene_spaces=tuple(scene.model_copy(deep=True) for scene in written))
+                            transaction.after_commit(lambda context=context, publication=publication:
+                                self._publish_built_scene_context(context,plan,publication,generation=captured_generation,
+                                    library=captured_library,snapshot_identity=snapshot_identity,request=request))
+                if caller_transaction is not None and plan is not None:
+                    self._remember_pending_scene_context(caller_transaction, request, context, snapshot_identity, plan, publication)
+                return self._latest_semantic_map_context if self._semantic_map_published_request == request else context
+            except IdentityPlanChanged as exc:
+                if attempt == 2:
+                    raise GatewayError("场景身份在并发更新中改变，请重试。",error_code="scene_identity_conflict",http_status=409) from exc
+                plan.refresh(exc.remap)
+                built = self._remap_built_scene_identities(built,exc.remap)
+            except IdentityScopeChanged as exc:
+                raise GatewayError("场景身份来源已改变，请重新读取。",error_code="scene_identity_scope_changed",http_status=409) from exc
+            finally:
+                self._observation_write_state.scope = previous_scope
+        raise RuntimeError("Scene identity admission did not return")
+
+    def _prepare_built_scene_space(self, scene_space: SceneSpace, localization_session_id: Optional[str], *, owned_identity=False) -> SceneSpace:
+        existing = (self._repository.load_scene_space(scene_space.scene_space_id) if owned_identity
+                    else self._scene_spaces_by_id.get(scene_space.scene_space_id))
         same_binding = (
-            existing is not None
-            and existing.map_version_id == scene_space.map_version_id
-            and (existing.localization_session_id or str(existing.metadata.get("localization_session_id") or "") or None)
-            == (localization_session_id or None)
+            existing is not None and existing.map_name == scene_space.map_name
+            and (owned_identity or (existing.localization_session_id or str(existing.metadata.get("localization_session_id") or "") or None)
+                 == (localization_session_id or None))
         )
         human_aliases = self._normalize_aliases(scene_space.human_aliases)
         attributes = dict(scene_space.attributes)
@@ -5284,9 +7033,17 @@ class MemoryService:
                     "semantic_updated_at": existing.semantic_updated_at,
                     "linked_object_instance_ids": list(existing.linked_object_instance_ids),
                     "linked_observation_event_ids": list(existing.linked_observation_event_ids),
+                    "graph_relation_ids": list(existing.graph_relation_ids),
+                    "summary_node_ids": list(existing.summary_node_ids),
+                    "metadata": {**existing.metadata, **prepared.metadata} if owned_identity else prepared.metadata,
+                    "attributes": {**existing.attributes, **prepared.attributes} if owned_identity else prepared.attributes,
                 },
                 deep=True,
             )
+        if same_binding and existing is not None and getattr(existing, TOKEN, None) is not None:
+            object.__setattr__(prepared, TOKEN, getattr(existing, TOKEN))
+        if owned_identity:
+            object.__setattr__(prepared, "_scene_expected_source_revision", getattr(existing, "_scene_graph_source_revision", None) if existing is not None else None)
         if prepared.model_summary is not None or prepared.candidate_labels:
             return prepared
         return self._apply_scene_space_understanding(
@@ -5386,84 +7143,332 @@ class MemoryService:
             metadata["model_name"] = model_name
         return metadata
 
+    @staticmethod
+    def _remap_scene_sample_identities(scene, remap):
+        """Reconcile only this plan's provisional IDs and their local evidence."""
+        def ids(values):
+            return [remap.get(value, value) for value in values]
+        metadata = dict(scene.metadata)
+        understanding = metadata.get("scene_space_understanding")
+        if isinstance(understanding, dict):
+            metadata["scene_space_understanding"] = {
+                **understanding, "evidence_sample_ids": ids(understanding.get("evidence_sample_ids", []))}
+        summary = scene.model_summary
+        if summary is not None:
+            summary = summary.model_copy(update={"evidence_observation_sample_ids": ids(summary.evidence_observation_sample_ids)})
+        return scene.model_copy(update={
+            "observation_sample_ids": ids(scene.observation_sample_ids),
+            "observation_samples": [sample.model_copy(update={"sample_id": remap.get(sample.sample_id, sample.sample_id)})
+                                    for sample in scene.observation_samples],
+            "candidate_labels": [label.model_copy(update={"evidence_observation_sample_ids": ids(label.evidence_observation_sample_ids)})
+                                 for label in scene.candidate_labels],
+            "model_summary": summary, "metadata": metadata}, deep=True)
+
+    def _publish_sampled_scene_context(self, records, plans, *, context, request, generation, library, snapshot_identity):
+        with self._instances_lock:
+            if (self._closed or generation != self._durable_index.activation_generation
+                    or library != self._active_library_name or request != self._semantic_map_request
+                    or self._semantic_map_published_request != request
+                    or snapshot_identity != self._latest_semantic_map_context_identity
+                    or not self._scene_map_owner_matches(snapshot_identity)):
+                return
+            context = self._latest_semantic_map_context
+            updated = {}
+            for record in records:
+                current = self._scene_spaces_by_id.get(record.scene_space_id)
+                if current is None or getattr(current, "_scene_graph_source_revision", None) != getattr(record, "_scene_graph_source_revision", None):
+                    continue
+                self._record_scene_space_graph(current)
+                updated[record.scene_space_id] = self._scene_spaces_by_id.get(record.scene_space_id, current).model_copy(deep=True)
+            if not updated:
+                return
+            self._scene_identity_diagnostics["samples"] = [item for plan in plans for item in plan.diagnostics]
+            self._latest_semantic_map_context = SemanticMapBuildResult(
+                map_name=context.map_name, frame_id=context.frame_id, semantic_regions=context.semantic_regions,
+                anchors_by_id=context.anchors_by_id, topology_nodes_by_id=context.topology_nodes_by_id,
+                scene_spaces=tuple(updated.get(scene.scene_space_id, scene) for scene in context.scene_spaces))
+            self._state_store.write(StateNamespace.MEMORY, "semantic_map_context", self._latest_semantic_map_context,
+                source="memory_service", metadata={"kind": "semantic_map_context", "map_name": context.map_name,
+                    "identity_diagnostics": list(self._scene_identity_diagnostics["samples"])})
+
     def _refresh_scene_spaces_from_observations(
-        self,
-        *,
-        perception_context,
-        observation_events: Tuple[ObservationEvent, ...],
+        self, *, perception_context, observation_events: Tuple[ObservationEvent, ...],
     ) -> None:
+        from services.memory.scene_identity import IdentityPlanChanged, IdentityScopeChanged
         scene_summary = getattr(perception_context, "scene_summary", None)
         if scene_summary is None or not observation_events:
             return
+        with self._instances_lock:
+            context = self._latest_semantic_map_context
+            request = self._semantic_map_request
+            snapshot_identity = self._latest_semantic_map_context_identity
+            caller_transaction = self._repository.storage.current_transaction
+            pending = self._pending_scene_context(caller_transaction)
+            if pending is not None:
+                request, context, snapshot_identity = pending
+            library = self._active_library_name
+            generation = self._durable_index.activation_generation
+            events_by_id = dict(self._observation_events_by_id)
+            # These source writes may still belong to the caller's outer
+            # transaction, before cache publication callbacks have fired.
+            events_by_id.update((value.event_id, value) for value in observation_events)
+            instances_by_id = dict(self._semantic_instances_by_id)
+        if caller_transaction is not None:
+            # Only the newly supplied evidence and its linked instances need
+            # transaction-local overlays; ordinary sampling retains its cache
+            # path and never reloads a whole library.
+            for value in observation_events:
+                row = caller_transaction.execute("SELECT payload_json,map_name,library_name FROM observation_events WHERE event_id=? AND library_name=?",
+                                                 (value.event_id, library)).fetchone()
+                if row is not None:
+                    events_by_id[value.event_id] = self._repository._load_record(ObservationEvent, row)
+                else:
+                    events_by_id.pop(value.event_id, None)
+            linked_ids = {identifier for value in observation_events if value.event_id in events_by_id
+                          for identifier in events_by_id[value.event_id].linked_instance_ids}
+            for identifier in linked_ids:
+                row = caller_transaction.execute("SELECT payload_json,map_name,library_name,graph_source_revision FROM semantic_instances WHERE instance_id=? AND library_name=?",
+                                                 (identifier, library)).fetchone()
+                if row is not None:
+                    instances_by_id[identifier] = self._repository._load_record(SemanticInstance, row)
+                elif not getattr(instances_by_id.get(identifier), "_memory_live_only", False):
+                    instances_by_id.pop(identifier, None)
+        events = tuple(events_by_id.values())
+        instances = tuple(instances_by_id.values())
+        if not library or not self.is_enabled():
+            return
         new_event_ids = {event.event_id for event in observation_events}
-        updated_spaces: Dict[str, SceneSpace] = {}
         provider_metadata = self._scene_space_understanding_provider_metadata(perception_context)
         availability = str(provider_metadata.get("availability") or "available")
         fallback_reason = str(provider_metadata.get("fallback_reason") or provider_metadata.get("reason") or "")
-        for scene_space in self._latest_semantic_map_context.scene_spaces:
-            current_space = self._scene_spaces_by_id.get(scene_space.scene_space_id, scene_space)
-            sampling = self._scene_space_sampler.sample(
-                current_space,
-                observation_events=self._observation_events_by_id.values(),
-                semantic_instances=self._semantic_instances_by_id.values(),
-            )
-            if not sampling.samples:
-                continue
-            if not any(sample.observation_event_id in new_event_ids for sample in sampling.samples if sample.observation_event_id):
-                continue
-            updated_space = self._apply_scene_space_understanding(
-                sampling.scene_space,
-                model_output=scene_summary,
-                observation_samples=sampling.samples,
-                scene_summaries=(scene_summary,),
-                provider_metadata=provider_metadata,
-                availability=availability,
-                fallback_reason=fallback_reason,
-            )
-            self._upsert_scene_space(updated_space, publish_event=False)
-            updated_spaces[updated_space.scene_space_id] = updated_space
-        if not updated_spaces:
+        plans, updated = [], []
+        try:
+            for scene in context.scene_spaces:
+                current = self._repository.load_scene_space(scene.scene_space_id)
+                if current is None or self._repository._resolve_record_library_name(current) != library:
+                    continue
+                plan = self._repository.prepare_scene_identities(library, scene=current)
+                sampling = self._scene_space_sampler.sample(current, observation_events=events,
+                    semantic_instances=instances, identity_resolver=plan.resolve_sample)
+                if not sampling.samples or not any(sample.observation_event_id in new_event_ids
+                        for sample in sampling.samples if sample.observation_event_id):
+                    continue
+                value = self._apply_scene_space_understanding(sampling.scene_space, model_output=scene_summary,
+                    observation_samples=sampling.samples, scene_summaries=(scene_summary,),
+                    provider_metadata=provider_metadata, availability=availability, fallback_reason=fallback_reason)
+                object.__setattr__(value, "_scene_expected_source_revision", getattr(current, "_scene_graph_source_revision", None))
+                plans.append(plan)
+                updated.append(value)
+            if not updated:
+                return
+            for attempt in range(3):
+                prepared = [self._repository._prepare_scene_space_write(value) for value in updated]
+                try:
+                    with self._instances_lock:
+                        if (generation != self._durable_index.activation_generation or library != self._active_library_name
+                                or request != self._semantic_map_request
+                                or not self._scene_map_owner_matches(snapshot_identity)):
+                            return
+                        with self._repository.storage.transaction() as transaction:
+                            for plan in plans:
+                                plan.admit(transaction)
+                            records = [self._repository._commit_prepared_scene_space(value) for value in prepared]
+                            transaction.after_commit(lambda records=records:
+                                self._publish_sampled_scene_context(records, plans, context=context, request=request,
+                                    generation=generation, library=library, snapshot_identity=snapshot_identity))
+                    return
+                except IdentityPlanChanged as exc:
+                    if attempt == 2:
+                        raise
+                    for plan in plans:
+                        plan.refresh(exc.remap)
+                    updated = [self._remap_scene_sample_identities(value, exc.remap) for value in updated]
+        except IdentityScopeChanged:
+            # The authoritative owner has moved on; keep the newer source and
+            # its samples. The next observation can prepare against that owner.
             return
-        self._latest_semantic_map_context = SemanticMapBuildResult(
-            map_version_id=self._latest_semantic_map_context.map_version_id,
-            frame_id=self._latest_semantic_map_context.frame_id,
-            semantic_regions=self._latest_semantic_map_context.semantic_regions,
-            anchors_by_id=self._latest_semantic_map_context.anchors_by_id,
-            topology_nodes_by_id=self._latest_semantic_map_context.topology_nodes_by_id,
-            scene_spaces=tuple(
-                updated_spaces.get(space.scene_space_id, space)
-                for space in self._latest_semantic_map_context.scene_spaces
-            ),
-        )
-        self._state_store.write(
-            StateNamespace.MEMORY,
-            "semantic_map_context",
-            self._latest_semantic_map_context,
-            source="memory_service",
-            metadata={"kind": "semantic_map_context", "map_version_id": self._latest_semantic_map_context.map_version_id},
-        )
 
     def _upsert_scene_space(self, scene_space: SceneSpace, *, publish_event: bool = True) -> SceneSpace:
+        if scene_space.metadata.get(MANAGED_KEY):
+            with self._instances_lock:
+                return self._persist_managed_scene_space(
+                    scene_space, expected_revision=int(scene_space.metadata.get("scene_revision", 0))
+                )
         metadata = self._attach_library_metadata(dict(scene_space.metadata))
         if scene_space.localization_session_id and not metadata.get("localization_session_id"):
             metadata["localization_session_id"] = scene_space.localization_session_id
         updated = scene_space.model_copy(update={"metadata": metadata}, deep=True)
-        self._cache_scene_space(updated)
         self._repository.upsert_scene_space(updated)
         self._upsert_vector_point_for_scene_space(updated)
-        self._write_scene_space_state(updated)
         self._record_scene_space_graph(updated)
+        finalized = self._scene_spaces_by_id.get(updated.scene_space_id, updated)
         if publish_event:
             self._publish_memory_event(
                 "memory.scene_space_upserted",
-                "场景空间 %s 已写入。" % (updated.primary_label or updated.scene_space_id),
-                payload={"scene_space_id": updated.scene_space_id, "primary_label": updated.primary_label or ""},
+                "场景空间 %s 已写入。" % (finalized.primary_label or finalized.scene_space_id),
+                payload={
+                    "scene_space_id": finalized.scene_space_id,
+                    "primary_label": finalized.primary_label or "",
+                },
             )
-        return updated
+        return finalized
 
     def _cache_scene_space(self, scene_space: SceneSpace) -> None:
-        self._scene_spaces_by_id[scene_space.scene_space_id] = scene_space
-        self._scene_space_history.append(scene_space)
+        with self._instances_lock:
+            self._cache_artifact_record("scene", scene_space)
+
+    def ingest_perception_observation(
+        self,
+        *,
+        perception_context,
+        map_snapshot,
+        localization_snapshot: Optional[LocalizationSnapshot],
+        current_pose: Optional[Pose],
+        camera_id: Optional[str] = None,
+        map_name: Optional[str] = None,
+        localization_session_id: Optional[str] = None,
+        now: Optional[datetime] = None,
+        persist: bool = True,
+    ):
+        """感知摄入（连续路径）：投影 + 关联 + 射线累积，独立于记忆写入。
+
+        方案 B 解耦：本方法可在每个感知 tick 调用（不依赖 SemanticMemoryEntry），
+        让 track_id 帧间连续、射线累积进同一实例的 deferred_projection_cache，
+        三角化得以获得多视角输入。
+
+        persist=False（连续 tick）：只更新实例内存 + state 快照，**不**落盘 repository、
+        **不**向量化（避免向量化队列在 2Hz 下被同一实例反复入队，徒增 embedding 成本）。
+        persist=True（关键帧记忆写入路径）：完整落盘 + 向量化，与改动前行为一致。
+
+        返回 (projected, outcomes, linked_instance_ids)；无投影时返回 (None, None, [])。
+        """
+        if perception_context is None or current_pose is None:
+            return None, None, []
+        with self._artifact_evidence_scope(perception_context):
+            expected_library = self._active_library_name
+            expected_generation = self._durable_index.activation_generation
+            resolved_now = now or utc_now()
+            resolved_map_name = self._resolve_stable_map_name(
+                map_name=map_name,
+                map_snapshot=map_snapshot,
+                localization_snapshot=localization_snapshot,
+            )
+            map_context = self._refresh_semantic_map_context(
+                map_snapshot,
+                map_name=resolved_map_name, expected_generation=expected_generation,
+            )
+            ray_history = None
+            if getattr(self._deferred_projection_config, "triangulation_enabled", False):
+                ray_history = InstanceCacheRayHistoryProvider(self._semantic_instances_by_id.values())
+            projected = self._vision_projection_service.project(
+                perception_context,
+                current_pose=current_pose,
+                map_context=map_context,
+                localization_snapshot=localization_snapshot,
+                ray_history=ray_history,
+            )
+            if not projected:
+                return None, None, []
+            resolved_session_id = localization_session_id or (
+                str((localization_snapshot.metadata or {}).get("session_id") or "") if localization_snapshot else None
+            ) or None
+            # P0-3：实例字典的「读快照→关联→整体替换」必须相对延迟精化 worker 原子，
+            # 否则 worker 刚写回的精化坐标会被本路径的旧快照整体覆盖（静默回退 fallback）。
+            with self._instances_lock:
+                base_instances = dict(self._semantic_instances_by_id)
+            # Untagged service snapshots are explicitly not-yet-persisted. Never
+            # borrow a later first writer's business token after this live snapshot.
+            base_tokens = {point_id: (("raw", None) if getattr(prior, "_memory_source_deleted", False)
+                                     else getattr(prior, TOKEN, ("raw", None)))
+                           for point_id, prior in base_instances.items()} if persist else {}
+            platform_metadata = self._build_platform_semantic_metadata(
+                map_snapshot=map_snapshot, localization_snapshot=localization_snapshot,
+                map_name=resolved_map_name)
+            # Association may encode an unseen label. It cannot hold the structural
+            # lock while doing model work; source CAS fences the captured snapshots.
+            with self._association_compute_lock:
+                updated_instances, outcomes = self._instance_association_service.associate(
+                    projected, existing_instances=base_instances, map_name=resolved_map_name,
+                    localization_session_id=resolved_session_id,
+                    map_asset_id=platform_metadata.get("map_asset_id"),
+                    occupancy_grid=map_snapshot.occupancy_grid if map_snapshot is not None else None,
+                    cost_map=map_snapshot.cost_map if map_snapshot is not None else None, now=resolved_now)
+            linked_instance_ids: List[str] = []
+            published_instance_ids = set()
+            for _projected_item, outcome in zip(projected, outcomes):
+                instance_id = outcome.instance.instance_id
+                if instance_id in published_instance_ids:
+                    linked_instance_ids.append(instance_id)
+                    continue
+                # 多个来源观察可关联同一 ID；提交该批最后的完整证据一次。
+                accepted_instance = updated_instances[instance_id]
+                projection_metadata = dict(accepted_instance.metadata)
+                # 关联可能保留历史可靠坐标，其质量证据必须与最终坐标保持一致。
+                # 当前帧退化信息由观察事件单独保存，不能覆盖实例已选中的投影证据。
+                projection_metadata.update(platform_metadata)
+                projection_metadata.update(
+                    self._evaluate_navigation_metadata(
+                        projection_metadata,
+                        backend_name=str(
+                            projection_metadata.get("backend")
+                            or projection_metadata.get("backend_type")
+                            or "memory_service.semantic_instance"
+                        ),
+                        map_name=str(platform_metadata.get("map_name") or "").strip() or None,
+                        localization_session_id=str(platform_metadata.get("localization_session_id") or "").strip() or None,
+                    )
+                )
+                instance = accepted_instance.model_copy(
+                    update={
+                        "metadata": self._attach_library_metadata(
+                            {
+                                **projection_metadata,
+                                **platform_metadata,
+                            }
+                        )
+                    },
+                    deep=True,
+                )
+                if persist and (getattr(instance, TOKEN, None) is None or getattr(instance, "_memory_source_deleted", False)):
+                    instance = instance.model_copy(deep=False)
+                    object.__setattr__(instance, TOKEN, base_tokens.get(instance.instance_id, ("raw", None)))
+                with self._instances_lock:
+                    self._assert_observation_library(expected_library, expected_generation)
+                    current = self._semantic_instances_by_id.get(instance.instance_id)
+                    original = base_instances.get(instance.instance_id)
+                    if current is not original:
+                        if current is None:
+                            continue
+                        instance = current
+                    checked_current = current
+                if persist and self._is_long_term_static_instance(instance):
+                    self._repository.upsert_semantic_instance(instance)
+                else:
+                    if persist:
+                        self._repository.delete_semantic_instances([instance.instance_id],
+                            expected_tokens={instance.instance_id: getattr(instance, TOKEN, None)})
+                        instance = instance.model_copy(deep=False)
+                        object.__setattr__(instance, TOKEN, ("raw", None))
+                        object.__setattr__(instance, "_memory_source_deleted", True)
+                    with self._instances_lock:
+                        self._assert_observation_library(expected_library, expected_generation)
+                        latest = self._semantic_instances_by_id.get(instance.instance_id)
+                        if (not persist and latest is not checked_current) or (persist and latest is not None and latest is not checked_current):
+                            continue
+                        if persist:
+                            with self._repository.storage.read_snapshot() as tx:
+                                if self._durable_index._raw(tx, "instance", instance.instance_id) is not None:
+                                    continue
+                        object.__setattr__(instance, "_memory_live_only", True)
+                        self._cache_artifact_record("instance", instance)
+                        self._write_semantic_instance_state(instance)
+                published_instance_ids.add(instance.instance_id)
+                linked_instance_ids.append(instance.instance_id)
+            matched_ids = {outcome.instance.instance_id for outcome in outcomes}
+            for point_id, aged in updated_instances.items():
+                if point_id not in matched_ids and point_id in base_instances and aged is not base_instances[point_id]:
+                    self._publish_live_instance(aged, expected=base_instances[point_id])
+            return projected, outcomes, linked_instance_ids
 
     def _ingest_spatial_semantic_observation(
         self,
@@ -5476,83 +7481,22 @@ class MemoryService:
         current_pose: Optional[Pose],
         camera_id: Optional[str],
     ) -> None:
-        if perception_context is None or current_pose is None:
-            return
-        map_context = self._refresh_semantic_map_context(map_snapshot)
-        projected = self._vision_projection_service.project(
-            perception_context,
-            current_pose=current_pose,
-            map_context=map_context,
+        # 记忆写入路径（低频）：完整感知摄入（persist=True）+ ObservationEvent 绑定。
+        projected, outcomes, linked_instance_ids = self.ingest_perception_observation(
+            perception_context=perception_context,
+            map_snapshot=map_snapshot,
             localization_snapshot=localization_snapshot,
-        )
-        if not projected:
-            return
-        updated_instances, outcomes = self._instance_association_service.associate(
-            projected,
-            existing_instances=self._semantic_instances_by_id,
-            map_version_id=memory_entry.map_version_id,
+            current_pose=current_pose,
+            camera_id=camera_id,
+            map_name=memory_entry.map_name,
             localization_session_id=memory_entry.localization_session_id
             or str(memory_entry.metadata.get("localization_session_id") or "")
             or None,
-            occupancy_grid=map_snapshot.occupancy_grid if map_snapshot is not None else None,
-            cost_map=map_snapshot.cost_map if map_snapshot is not None else None,
             now=memory_entry.timestamp,
+            persist=True,
         )
-        self._semantic_instances_by_id = dict(updated_instances)
-        linked_instance_ids: List[str] = []
-        for projected_item, outcome in zip(projected, outcomes):
-            projection_metadata = dict(outcome.instance.metadata)
-            projection_metadata.update(
-                {
-                    "projection_method": str(projected_item.attributes.get("projection_method") or ""),
-                    "projection_confidence": self._coerce_optional_float(
-                        projected_item.attributes.get("projection_confidence")
-                    ),
-                    "support_point_count": self._coerce_optional_int(
-                        projected_item.attributes.get("support_point_count")
-                    )
-                    or 0,
-                }
-            )
-            platform_metadata = self._build_platform_semantic_metadata(
-                map_snapshot=map_snapshot,
-                localization_snapshot=localization_snapshot,
-                map_version_id=outcome.instance.map_version_id,
-            )
-            projection_metadata.update(platform_metadata)
-            projection_metadata.update(
-                self._evaluate_navigation_metadata(
-                    projection_metadata,
-                    backend_name=str(
-                        projection_metadata.get("backend")
-                        or projection_metadata.get("backend_type")
-                        or "memory_service.semantic_instance"
-                    ),
-                    map_version_id=str(platform_metadata.get("map_version_id") or "").strip() or None,
-                    localization_session_id=str(platform_metadata.get("localization_session_id") or "").strip() or None,
-                )
-            )
-            instance = outcome.instance.model_copy(
-                update={
-                    "metadata": self._attach_library_metadata(
-                        {
-                            **projection_metadata,
-                            **platform_metadata,
-                        }
-                    )
-                },
-                deep=True,
-            )
-            self._semantic_instances_by_id[instance.instance_id] = instance
-            linked_instance_ids.append(instance.instance_id)
-            self._semantic_instance_history.append(instance)
-            self._write_semantic_instance_state(instance)
-            if self._is_long_term_static_instance(instance):
-                self._repository.upsert_semantic_instance(instance)
-                self._upsert_vector_point_for_instance(instance)
-            else:
-                self._repository.delete_semantic_instances([instance.instance_id])
-                self._vector_store.delete_points([instance.instance_id])
+        if not projected:
+            return
 
         observation_events = self._build_projected_observation_events(
             memory_entry=memory_entry,
@@ -5565,9 +7509,6 @@ class MemoryService:
             current_pose=current_pose,
         )
         for observation_event in observation_events:
-            self._observation_events_by_id[observation_event.event_id] = observation_event
-            self._observation_event_history.append(observation_event)
-            self._write_observation_event_state(observation_event)
             self._repository.upsert_observation_event(observation_event)
             self._upsert_vector_point_for_observation_event(observation_event)
 
@@ -5577,30 +7518,31 @@ class MemoryService:
                 linked_events_by_instance_id.setdefault(instance_id, []).append(observation_event.event_id)
 
         for instance_id in linked_instance_ids:
-            current_instance = self._semantic_instances_by_id.get(instance_id)
-            if current_instance is None:
-                continue
-            new_event_ids = linked_events_by_instance_id.get(instance_id, [])
-            if not new_event_ids:
-                continue
-            updated_instance = current_instance.model_copy(
-                update={
-                    "last_observation_event_id": new_event_ids[-1],
-                    "supporting_observation_event_ids": self._normalize_aliases(
-                        [*current_instance.supporting_observation_event_ids, *new_event_ids]
-                    ),
-                },
-                deep=True,
-            )
-            self._semantic_instances_by_id[instance_id] = updated_instance
-            self._semantic_instance_history.append(updated_instance)
-            self._write_semantic_instance_state(updated_instance)
+            # P0-3：get→copy→set 的读改写必须整体持锁，否则与精化 worker 的
+            # 并发写回互相覆盖；I/O（state/repository/vector）留在锁外。
+            with self._instances_lock:
+                current_instance = self._semantic_instances_by_id.get(instance_id)
+                if current_instance is None:
+                    continue
+                new_event_ids = linked_events_by_instance_id.get(instance_id, [])
+                if not new_event_ids:
+                    continue
+                updated_instance = current_instance.model_copy(
+                    update={
+                        "last_observation_event_id": new_event_ids[-1],
+                        "supporting_observation_event_ids": self._normalize_aliases(
+                            [*current_instance.supporting_observation_event_ids, *new_event_ids]
+                        ),
+                    },
+                    deep=True,
+                )
             if self._is_long_term_static_instance(updated_instance):
                 self._repository.upsert_semantic_instance(updated_instance)
                 self._upsert_vector_point_for_instance(updated_instance)
             else:
-                self._repository.delete_semantic_instances([updated_instance.instance_id])
-                self._vector_store.delete_points([updated_instance.instance_id])
+                self._repository.delete_semantic_instances([updated_instance.instance_id],
+                    expected_tokens={updated_instance.instance_id: getattr(updated_instance, TOKEN, None)})
+                self._publish_live_instance(updated_instance, expected=current_instance)
 
         self._record_observation_graph_relations(
             observation_events=observation_events,
@@ -5623,39 +7565,19 @@ class MemoryService:
         遍历内存索引，找出 timestamp 超过 max_age_sec 的事件，从内存、历史队列、
         持久化仓库和向量库中一并删除。返回清理的事件数量。
         """
-        import logging
         from datetime import timezone
 
-        logger = logging.getLogger(__name__)
-        now = __import__("datetime").datetime.now(tz=timezone.utc)
-        expired_ids = [
-            event_id
-            for event_id, event in list(self._observation_events_by_id.items())
-            if (now - event.timestamp.replace(tzinfo=timezone.utc)
-                if event.timestamp.tzinfo is None
-                else now - event.timestamp).total_seconds() > max_age_sec
-        ]
+        now = datetime.now(tz=timezone.utc)
+        with self._instances_lock:
+            expired = {event_id: event for event_id, event in self._observation_events_by_id.items()
+                       if (now - event.timestamp.replace(tzinfo=timezone.utc)
+                           if event.timestamp.tzinfo is None else now - event.timestamp).total_seconds() > max_age_sec}
+        expired_ids = list(expired)
         if not expired_ids:
             return 0
-
-        expired_set = set(expired_ids)
-        # 从内存索引中删除
-        for event_id in expired_ids:
-            self._observation_events_by_id.pop(event_id, None)
-        # 从历史队列中删除（重建队列，保留未过期项）
-        surviving = [e for e in self._observation_event_history if e.event_id not in expired_set]
-        self._observation_event_history.clear()
-        for e in surviving:
-            self._observation_event_history.append(e)
-        # 从持久化仓库中删除
-        try:
-            self._repository.delete_observation_events(expired_ids)
-        except AttributeError:
-            pass
-        # 从向量库中删除
-        self._vector_store.delete_points(expired_ids)
-
-        logger.info("ObservationEvent TTL 清理：已删除 %d 条过期事件（max_age_sec=%.0f）", len(expired_ids), max_age_sec)
+        self._repository.delete_observation_events(expired_ids,
+            expected_tokens={key: getattr(record, TOKEN, None) for key, record in expired.items()})
+        LOGGER.info("ObservationEvent TTL 清理：已删除 %d 条过期事件（max_age_sec=%.0f）", len(expired_ids), max_age_sec)
         return len(expired_ids)
 
     def _is_long_term_static_instance(self, instance: SemanticInstance) -> bool:
@@ -5867,7 +7789,7 @@ class MemoryService:
                     summary=event_summary,
                     camera_id=item.camera_id or camera_id or str(memory_entry.metadata.get("camera_id", "") or "") or None,
                     pose=item.pose,
-                    map_version_id=memory_entry.map_version_id,
+                    map_name=memory_entry.map_name,
                     localization_session_id=memory_entry.localization_session_id
                     or str(memory_entry.metadata.get("localization_session_id") or "")
                     or None,
@@ -5928,7 +7850,7 @@ class MemoryService:
                 summary=memory_entry.summary,
                 camera_id=camera_id or str(memory_entry.metadata.get("camera_id", "") or "") or None,
                 pose=current_pose,
-                map_version_id=memory_entry.map_version_id,
+                map_name=memory_entry.map_name,
                 localization_session_id=memory_entry.localization_session_id
                 or str(memory_entry.metadata.get("localization_session_id") or "")
                 or None,
@@ -5968,7 +7890,7 @@ class MemoryService:
                     anchor_kind=SpatialAnchorKind.OBJECT_INSTANCE,
                     name=instance.display_name or instance.label,
                     pose=instance.pose,
-                    map_version_id=instance.map_version_id,
+                    map_name=instance.map_name,
                     topo_node_id=instance.topo_node_id,
                     semantic_region_id=instance.semantic_region_id,
                     semantic_labels=self._normalize_tags(
@@ -6013,7 +7935,7 @@ class MemoryService:
             target_pose=candidate.inspection_pose,
             target_name=candidate.target_name,
             linked_location_id=str(candidate.metadata.get("linked_location_id") or "") or None,
-            map_version_id=candidate.map_version_id,
+            map_name=candidate.map_name,
             topo_node_id=candidate.topo_node_id,
             semantic_region_id=candidate.semantic_region_id,
             scene_space_id=str(candidate.metadata.get("scene_space_id") or "") or None,
@@ -6086,6 +8008,7 @@ class MemoryService:
             source="memory_service",
             metadata={"kind": "semantic_instance"},
         )
+        self._instance_publisher.notify()
 
     def _write_observation_event_state(self, event: ObservationEvent) -> None:
         self._state_store.write(
@@ -6132,32 +8055,56 @@ class MemoryService:
             metadata={"kind": "semantic_summary"},
         )
 
+    def _publish_auxiliary_record(self, kind, record, generation):
+        caches = {
+            "trajectory": (self._navigation_trajectory_events_by_id, self._navigation_trajectory_history,
+                           "trajectory_event_id", self._write_navigation_trajectory_event_state),
+            "relation": (self._semantic_graph_relations_by_id, self._semantic_graph_relation_history,
+                         "relation_id", self._write_semantic_graph_relation_state),
+            "summary": (self._semantic_summary_nodes_by_id, self._semantic_summary_history,
+                        "summary_id", self._write_semantic_summary_node_state),
+        }
+        cache, history, column, write_state = caches[kind]
+        library = self._record_library_name(record)
+        with self._instances_lock:
+            if (self._closed or not self.is_enabled() or library != self._active_library_name
+                    or generation != self._durable_index.activation_generation):
+                return
+            record_id = getattr(record, column)
+            if not self._repository.auxiliary_record_current(kind, record_id, record._memory_publication_revision, library):
+                return
+            cache[record_id] = record
+            history.append(record)
+            write_state(record)
+
     def _upsert_navigation_trajectory_event(self, event: NavigationTrajectoryEvent) -> NavigationTrajectoryEvent:
         metadata = self._attach_library_metadata(dict(event.metadata))
         updated = event.model_copy(update={"metadata": metadata}, deep=True)
-        self._navigation_trajectory_events_by_id[updated.trajectory_event_id] = updated
-        self._navigation_trajectory_history.append(updated)
-        self._repository.upsert_navigation_trajectory_event(updated)
-        self._write_navigation_trajectory_event_state(updated)
-        return updated
+        generation = self._durable_index.activation_generation
+        with self._repository.storage.transaction() as transaction:
+            updated = self._repository.upsert_navigation_trajectory_event(updated)
+            transaction.after_commit(lambda: self._publish_auxiliary_record("trajectory", updated, generation))
+        return updated.model_copy(deep=True)
 
     def _upsert_semantic_graph_relation(self, relation: SemanticGraphRelation) -> SemanticGraphRelation:
         metadata = self._attach_library_metadata(dict(relation.metadata))
         updated = relation.model_copy(update={"metadata": metadata}, deep=True)
-        self._semantic_graph_relations_by_id[updated.relation_id] = updated
-        self._semantic_graph_relation_history.append(updated)
-        self._repository.upsert_semantic_graph_relation(updated)
-        self._write_semantic_graph_relation_state(updated)
-        return updated
+        generation = self._durable_index.activation_generation
+        with self._repository.storage.transaction() as transaction:
+            identity = self._durable_index.library_identity(self._record_library_name(updated))
+            updated = self._repository.upsert_semantic_graph_relation(updated, natural_identity=identity.incarnation)
+            transaction.after_commit(lambda: self._publish_auxiliary_record("relation", updated, generation))
+        return updated.model_copy(deep=True)
 
     def _upsert_semantic_summary_node(self, summary_node: SemanticSummaryNode) -> SemanticSummaryNode:
         metadata = self._attach_library_metadata(dict(summary_node.metadata))
         updated = summary_node.model_copy(update={"metadata": metadata}, deep=True)
-        self._semantic_summary_nodes_by_id[updated.summary_id] = updated
-        self._semantic_summary_history.append(updated)
-        self._repository.upsert_semantic_summary_node(updated)
-        self._write_semantic_summary_node_state(updated)
-        return updated
+        generation = self._durable_index.activation_generation
+        with self._repository.storage.transaction() as transaction:
+            identity = self._durable_index.library_identity(self._record_library_name(updated))
+            updated = self._repository.upsert_semantic_summary_node(updated, natural_identity=identity.incarnation)
+            transaction.after_commit(lambda: self._publish_auxiliary_record("summary", updated, generation))
+        return updated.model_copy(deep=True)
 
     def _build_semantic_graph_relation_id(
         self,
@@ -6167,17 +8114,8 @@ class MemoryService:
         target_node_kind: str,
         target_node_id: str,
     ) -> str:
-        raw = "%s:%s:%s:%s:%s" % (
-            relation_kind.value,
-            source_node_kind,
-            source_node_id,
-            target_node_kind,
-            target_node_id,
-        )
-        digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
-        safe_source = re.sub(r"[^0-9a-z]+", "_", str(source_node_id).lower()).strip("_") or "source"
-        safe_target = re.sub(r"[^0-9a-z]+", "_", str(target_node_id).lower()).strip("_") or "target"
-        return "sgr_%s_%s_%s" % (relation_kind.value, safe_source[:18], digest or safe_target[:12])
+        del source_node_kind, source_node_id, target_node_kind, target_node_id
+        return "sgr_%s_%s" % (relation_kind.value, uuid.uuid4().hex)
 
     def _build_semantic_summary_id(
         self,
@@ -6186,10 +8124,8 @@ class MemoryService:
         scene_space_id: Optional[str] = None,
         semantic_region_id: Optional[str] = None,
     ) -> str:
-        raw = "%s:%s:%s:%s" % (summary_kind.value, label or "", scene_space_id or "", semantic_region_id or "")
-        digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
-        safe_label = re.sub(r"[^0-9a-z]+", "_", str(label or scene_space_id or semantic_region_id or summary_kind.value).lower()).strip("_") or summary_kind.value
-        return "ssn_%s_%s_%s" % (summary_kind.value, safe_label[:24], digest)
+        del label, scene_space_id, semantic_region_id
+        return "ssn_%s_%s" % (summary_kind.value, uuid.uuid4().hex)
 
     def _build_navigation_trajectory_event_id(
         self,
@@ -6198,10 +8134,9 @@ class MemoryService:
         source_record_id: Optional[str],
         reason_code: Optional[str] = None,
     ) -> str:
-        raw = "%s:%s:%s:%s:%s" % (event_kind.value, candidate_id or "", source_record_id or "", reason_code or "", utc_now().isoformat())
-        digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+        del reason_code
         safe_source = re.sub(r"[^0-9a-z]+", "_", str(candidate_id or source_record_id or "trajectory").lower()).strip("_") or "trajectory"
-        return "nte_%s_%s_%s" % (event_kind.value, safe_source[:24], digest)
+        return "nte_%s_%s_%s" % (event_kind.value, safe_source[:24], uuid.uuid4().hex)
 
     def _record_semantic_graph_relation(
         self,
@@ -6211,7 +8146,7 @@ class MemoryService:
         target_node_kind: str,
         target_node_id: Optional[str],
         *,
-        map_version_id: Optional[str],
+        map_name: Optional[str],
         localization_session_id: Optional[str],
         confidence: float = 1.0,
         evidence_observation_event_ids: Optional[List[str]] = None,
@@ -6235,7 +8170,7 @@ class MemoryService:
             source_node_id=source_id,
             target_node_kind=target_node_kind,
             target_node_id=target_id,
-            map_version_id=map_version_id,
+            map_name=map_name,
             localization_session_id=localization_session_id,
             confidence=self._clamp_score(confidence),
             evidence_observation_event_ids=self._normalize_aliases(evidence_observation_event_ids or []),
@@ -6257,17 +8192,19 @@ class MemoryService:
         if not relation_id:
             return
         if node_kind in {MemoryRecordKind.OBJECT_INSTANCE.value, "object_instance", "semantic_instance"}:
-            instance = self._semantic_instances_by_id.get(node_id)
-            if instance is None or relation_id in instance.graph_relation_ids:
-                return
-            updated = instance.model_copy(
-                update={"graph_relation_ids": self._normalize_aliases([*instance.graph_relation_ids, relation_id])},
-                deep=True,
-            )
-            self._semantic_instances_by_id[updated.instance_id] = updated
-            self._semantic_instance_history.append(updated)
-            self._write_semantic_instance_state(updated)
-            self._repository.upsert_semantic_instance(updated)
+            # P0-3：读改写必须整体持锁，与精化 worker 写回串行；I/O 留在锁外。
+            with self._instances_lock:
+                instance = self._semantic_instances_by_id.get(node_id)
+                if instance is None or relation_id in instance.graph_relation_ids:
+                    return
+                updated = instance.model_copy(
+                    update={"graph_relation_ids": self._normalize_aliases([*instance.graph_relation_ids, relation_id])},
+                    deep=True,
+                )
+            if self._is_long_term_static_instance(updated):
+                self._repository.upsert_semantic_instance(updated)
+            else:
+                self._publish_live_instance(updated, expected=instance)
             return
         if node_kind in {MemoryRecordKind.OBSERVATION_EVENT.value, "observation_event"}:
             event = self._observation_events_by_id.get(node_id)
@@ -6277,9 +8214,6 @@ class MemoryService:
                 update={"graph_relation_ids": self._normalize_aliases([*event.graph_relation_ids, relation_id])},
                 deep=True,
             )
-            self._observation_events_by_id[updated.event_id] = updated
-            self._observation_event_history.append(updated)
-            self._write_observation_event_state(updated)
             self._repository.upsert_observation_event(updated)
             return
         if node_kind in {MemoryRecordKind.SCENE_SPACE.value, "scene_space"}:
@@ -6290,8 +8224,6 @@ class MemoryService:
                 update={"graph_relation_ids": self._normalize_aliases([*scene_space.graph_relation_ids, relation_id])},
                 deep=True,
             )
-            self._cache_scene_space(updated)
-            self._write_scene_space_state(updated)
             self._repository.upsert_scene_space(updated)
 
     def _record_observation_graph_relations(
@@ -6310,7 +8242,7 @@ class MemoryService:
                     scene_space_id,
                     MemoryRecordKind.OBSERVATION_EVENT.value,
                     event.event_id,
-                    map_version_id=event.map_version_id,
+                    map_name=event.map_name,
                     localization_session_id=event.localization_session_id,
                     evidence_observation_event_ids=[event.event_id],
                     metadata={"source": "observation_ingest"},
@@ -6322,7 +8254,7 @@ class MemoryService:
                     source_region_id,
                     MemoryRecordKind.OBSERVATION_EVENT.value,
                     event.event_id,
-                    map_version_id=event.map_version_id,
+                    map_name=event.map_name,
                     localization_session_id=event.localization_session_id,
                     evidence_observation_event_ids=[event.event_id],
                     metadata={"source": "observation_ingest"},
@@ -6330,7 +8262,7 @@ class MemoryService:
             outcome = association_outcomes[event_index] if event_index < len(association_outcomes) else None
             for instance_id in event.linked_instance_ids:
                 instance = self._semantic_instances_by_id.get(instance_id)
-                instance_map_version_id = instance.map_version_id if instance is not None else event.map_version_id
+                instance_map_name = instance.map_name if instance is not None else event.map_name
                 instance_session_id = instance.localization_session_id if instance is not None else event.localization_session_id
                 self._record_semantic_graph_relation(
                     SemanticGraphRelationKind.OBSERVED_FROM,
@@ -6338,7 +8270,7 @@ class MemoryService:
                     instance_id,
                     MemoryRecordKind.OBSERVATION_EVENT.value,
                     event.event_id,
-                    map_version_id=instance_map_version_id,
+                    map_name=instance_map_name,
                     localization_session_id=instance_session_id,
                     confidence=instance.confidence if instance is not None else 1.0,
                     evidence_observation_event_ids=[event.event_id],
@@ -6351,7 +8283,7 @@ class MemoryService:
                         event.event_id,
                         MemoryRecordKind.OBJECT_INSTANCE.value,
                         instance_id,
-                        map_version_id=instance_map_version_id,
+                        map_name=instance_map_name,
                         localization_session_id=instance_session_id,
                         confidence=outcome.matched_score,
                         evidence_observation_event_ids=[event.event_id],
@@ -6364,7 +8296,7 @@ class MemoryService:
                         scene_space_id,
                         MemoryRecordKind.OBJECT_INSTANCE.value,
                         instance_id,
-                        map_version_id=instance_map_version_id,
+                        map_name=instance_map_name,
                         localization_session_id=instance_session_id,
                         evidence_observation_event_ids=[event.event_id],
                         metadata={"source": "observation_ingest"},
@@ -6376,7 +8308,7 @@ class MemoryService:
                         source_region_id,
                         MemoryRecordKind.OBJECT_INSTANCE.value,
                         instance_id,
-                        map_version_id=instance_map_version_id,
+                        map_name=instance_map_name,
                         localization_session_id=instance_session_id,
                         evidence_observation_event_ids=[event.event_id],
                         metadata={"source": "observation_ingest"},
@@ -6391,7 +8323,7 @@ class MemoryService:
                 scene_space.scene_space_id,
                 MemoryRecordKind.OBSERVATION_EVENT.value,
                 event_id,
-                map_version_id=scene_space.map_version_id,
+                map_name=scene_space.map_name,
                 localization_session_id=scene_space.localization_session_id,
                 evidence_observation_event_ids=[event_id],
                 metadata={"source": "scene_space_aggregation"},
@@ -6403,7 +8335,7 @@ class MemoryService:
                 scene_space.scene_space_id,
                 MemoryRecordKind.OBJECT_INSTANCE.value,
                 instance_id,
-                map_version_id=scene_space.map_version_id,
+                map_name=scene_space.map_name,
                 localization_session_id=scene_space.localization_session_id,
                 evidence_observation_event_ids=evidence_event_ids,
                 metadata={"source": "scene_space_aggregation"},
@@ -6415,7 +8347,7 @@ class MemoryService:
                 region_id,
                 MemoryRecordKind.SCENE_SPACE.value,
                 scene_space.scene_space_id,
-                map_version_id=scene_space.map_version_id,
+                map_name=scene_space.map_name,
                 localization_session_id=scene_space.localization_session_id,
                 evidence_observation_event_ids=evidence_event_ids,
                 metadata={"source": "scene_space_aggregation"},
@@ -6433,7 +8365,7 @@ class MemoryService:
                     left_id,
                     MemoryRecordKind.OBJECT_INSTANCE.value,
                     right_id,
-                    map_version_id=scene_space.map_version_id or left.map_version_id or right.map_version_id,
+                    map_name=scene_space.map_name or left.map_name or right.map_name,
                     localization_session_id=scene_space.localization_session_id or left.localization_session_id or right.localization_session_id,
                     evidence_observation_event_ids=evidence_event_ids,
                     metadata={"source": "scene_space_aggregation", "distance_m": round(self._distance_between_poses(left.pose, right.pose), 4)},
@@ -6453,7 +8385,7 @@ class MemoryService:
             summary_kind=SemanticSummaryKind.REGION,
             title="区域摘要：%s" % region_label,
             summary=self._build_scene_space_search_text(scene_space),
-            map_version_id=scene_space.map_version_id,
+            map_name=scene_space.map_name,
             localization_session_id=scene_space.localization_session_id,
             scene_space_id=scene_space.scene_space_id,
             semantic_region_id=scene_space.linked_semantic_region_ids[0] if scene_space.linked_semantic_region_ids else None,
@@ -6482,7 +8414,7 @@ class MemoryService:
                 summary_kind=SemanticSummaryKind.OBJECT_CLUSTER,
                 title="对象簇摘要：%s" % region_label,
                 summary="%s 内包含对象：%s。" % (region_label, "、".join(labels) if labels else "未知对象"),
-                map_version_id=scene_space.map_version_id,
+                map_name=scene_space.map_name,
                 localization_session_id=scene_space.localization_session_id,
                 scene_space_id=scene_space.scene_space_id,
                 semantic_region_id=scene_space.linked_semantic_region_ids[0] if scene_space.linked_semantic_region_ids else None,
@@ -6499,7 +8431,7 @@ class MemoryService:
                     item.instance_id
                     for item in self._semantic_instances_by_id.values()
                     if item.label == label
-                    and item.map_version_id == scene_space.map_version_id
+                    and item.map_name == scene_space.map_name
                     and (not scene_space.localization_session_id or item.localization_session_id == scene_space.localization_session_id)
                 ]
                 category_summary = SemanticSummaryNode(
@@ -6507,7 +8439,7 @@ class MemoryService:
                     summary_kind=SemanticSummaryKind.TARGET_CATEGORY_CLUSTER,
                     title="目标类别簇摘要：%s" % label,
                     summary="类别 %s 在当前地图中累计实例 %d 个。" % (label, len(members)),
-                    map_version_id=scene_space.map_version_id,
+                    map_name=scene_space.map_name,
                     localization_session_id=scene_space.localization_session_id,
                     scene_space_id=scene_space.scene_space_id,
                     semantic_region_id=scene_space.linked_semantic_region_ids[0] if scene_space.linked_semantic_region_ids else None,
@@ -6520,12 +8452,11 @@ class MemoryService:
                 )
                 summary_ids.append(self._upsert_semantic_summary_node(category_summary).summary_id)
         if summary_ids:
-            updated = self._scene_spaces_by_id.get(scene_space.scene_space_id, scene_space).model_copy(
-                update={"summary_node_ids": self._normalize_aliases([*scene_space.summary_node_ids, *summary_ids])},
+            current_scene = self._scene_spaces_by_id.get(scene_space.scene_space_id, scene_space)
+            updated = current_scene.model_copy(
+                update={"summary_node_ids": self._normalize_aliases([*current_scene.summary_node_ids, *summary_ids])},
                 deep=True,
             )
-            self._cache_scene_space(updated)
-            self._write_scene_space_state(updated)
             self._repository.upsert_scene_space(updated)
 
     def _record_navigation_candidate_graph(self, candidate: MemoryNavigationCandidate) -> MemoryNavigationCandidate:
@@ -6540,7 +8471,7 @@ class MemoryService:
             event_kind=NavigationTrajectoryEventKind.REACHABLE_POSE,
             pose=self._get_current_pose(),
             target_pose=candidate.target_pose,
-            map_version_id=candidate.map_version_id,
+            map_name=candidate.map_name,
             localization_session_id=str(metadata.get("localization_session_id") or "") or None,
             navigation_candidate_id=candidate_id,
             source_record_kind=candidate.record_kind.value,
@@ -6557,7 +8488,7 @@ class MemoryService:
             candidate.record_id,
             MemoryRecordKind.NAVIGATION_TRAJECTORY.value,
             stored_event.trajectory_event_id,
-            map_version_id=candidate.map_version_id,
+            map_name=candidate.map_name,
             localization_session_id=stored_event.localization_session_id,
             evidence_trajectory_event_ids=[stored_event.trajectory_event_id],
             metadata={"source": "navigation_candidate_resolution", "candidate_id": candidate_id},
@@ -6591,7 +8522,7 @@ class MemoryService:
             event_kind=event_kind,
             pose=self._get_current_pose(),
             target_pose=None,
-            map_version_id=str(metadata.get("map_version_id") or metadata.get("active_map_version_id") or "") or None,
+            map_name=str(metadata.get("map_name") or metadata.get("active_map_name") or "") or None,
             localization_session_id=str(metadata.get("localization_session_id") or metadata.get("active_localization_session_id") or "") or None,
             navigation_candidate_id=candidate_id,
             source_record_kind=record_kind,
@@ -6609,7 +8540,7 @@ class MemoryService:
                 record_id,
                 MemoryRecordKind.NAVIGATION_TRAJECTORY.value,
                 stored_event.trajectory_event_id,
-                map_version_id=stored_event.map_version_id,
+                map_name=stored_event.map_name,
                 localization_session_id=stored_event.localization_session_id,
                 evidence_trajectory_event_ids=[stored_event.trajectory_event_id],
                 metadata={"source": "arrival_verification", "candidate_id": candidate_id},
@@ -6621,7 +8552,7 @@ class MemoryService:
             record_id,
             MemoryRecordKind.NAVIGATION_TRAJECTORY.value,
             stored_event.trajectory_event_id,
-            map_version_id=stored_event.map_version_id,
+            map_name=stored_event.map_name,
             localization_session_id=stored_event.localization_session_id,
             evidence_trajectory_event_ids=[stored_event.trajectory_event_id],
             metadata={"source": "arrival_verification", "candidate_id": candidate_id, "reason_code": reason_code},
@@ -6632,7 +8563,7 @@ class MemoryService:
             record_id,
             "navigation_failure",
             reason_code,
-            map_version_id=stored_event.map_version_id,
+            map_name=stored_event.map_name,
             localization_session_id=stored_event.localization_session_id,
             evidence_trajectory_event_ids=[stored_event.trajectory_event_id],
             metadata={"source": "arrival_verification", "candidate_id": candidate_id, "reason": result.reason or ""},
@@ -6719,9 +8650,33 @@ class MemoryService:
         return best_node_id
 
     def _get_current_pose(self) -> Optional[Pose]:
-        snapshot = self._get_or_refresh_localization(allow_missing=True)
+        # 05-P0-1：ingest 主链经此取 pose，探索期定位会话 current_pose 恒 None 会致入库跳过；
+        # prefer_live=True 让其在 live provider 就绪时用实时位姿补齐（provider 为 None 时行为不变）。
+        snapshot = self._get_or_refresh_localization(allow_missing=True, prefer_live=True)
         if snapshot is not None and snapshot.current_pose is not None:
             return snapshot.current_pose
+        return None
+
+    def _read_live_pose(self) -> Optional[Pose]:
+        """从实时位姿门面取探索期实时位姿（鸭子类型，与 PerceptionService._read_live_pose 同源）。
+
+        优先 get_exploration_pose()（探索建图时导航后端 map→base 实时 TF），回退
+        get_current_pose()（定位会话后端，仅重定位就绪后有值）。任一失败返回 None，禁兜底假位姿。
+        """
+
+        provider = self._live_pose_provider
+        if provider is None:
+            return None
+        for getter_name in ("get_exploration_pose", "get_current_pose"):
+            getter = getattr(provider, getter_name, None)
+            if not callable(getter):
+                continue
+            try:
+                candidate = getter()
+            except Exception:
+                continue
+            if isinstance(candidate, Pose):
+                return candidate
         return None
 
     def _get_or_refresh_localization(
@@ -6731,6 +8686,20 @@ class MemoryService:
         prefer_live: bool = False,
     ):
         snapshot = self._localization_service.get_latest_snapshot()
+        # 05-P0-1：探索期重定位未就绪时定位会话 current_pose 恒 None，导致 memory 入库被跳过。
+        # prefer_live=True 且 live provider 可用时，用实时位姿补齐快照的 current_pose。
+        if prefer_live and self._live_pose_provider is not None:
+            live_pose = self._read_live_pose()
+            if live_pose is not None:
+                if snapshot is not None:
+                    if snapshot.current_pose is None:
+                        return snapshot.model_copy(update={"current_pose": live_pose}, deep=True)
+                    return snapshot
+                return LocalizationSnapshot(
+                    source_name="memory_live_pose_provider",
+                    current_pose=live_pose,
+                    metadata={"pose_source": "live_pose_provider"},
+                )
         if snapshot is not None:
             return snapshot
         if allow_missing:
@@ -6738,12 +8707,32 @@ class MemoryService:
         raise GatewayError("当前没有可用定位流帧。")
 
     def _get_map_snapshot(self):
-        snapshot = self._mapping_service.get_latest_snapshot()
-        if snapshot is not None:
-            self._refresh_semantic_map_context(snapshot)
-            return snapshot
-        self._refresh_semantic_map_context(None)
-        return None
+        return self._capture_current_semantic_map_context()[0]
+
+    def _capture_current_semantic_map_context(self, *, map_name=None):
+        """当前查询重取同来源增量快照；显式历史证据仍走原精确修订围栏。"""
+        from services.memory.scene_mapping_state import same_scope, snapshot_binding
+        generation = self._durable_index.activation_generation
+        getter = getattr(self._mapping_service, "get_semantic_snapshot", self._mapping_service.get_latest_snapshot)
+        snapshot = getter()
+        for attempt in range(3):
+            try:
+                context = self._refresh_semantic_map_context(snapshot, map_name=map_name, expected_generation=generation)
+                return snapshot, context
+            except GatewayError as exc:
+                if exc.error_code != "scene_map_changed":
+                    raise
+                latest = getter()
+                if (snapshot is None or latest is None
+                        or not same_scope(snapshot_binding(snapshot), snapshot_binding(latest))
+                        or snapshot.schema_version != latest.schema_version
+                        or latest.update_sequence < snapshot.update_sequence):
+                    raise
+                if attempt == 2:
+                    raise GatewayError("同一地图仍在增量更新，等待下一轮重读目标证据。",
+                        error_code="scene_map_updating", http_status=409,
+                        details={"retryable": True, "map_binding": snapshot_binding(latest)}) from exc
+                snapshot = latest
 
     def _load_primary_image_bytes(self, artifact_ids: List[str]) -> Optional[bytes]:
         if self._artifact_store is None:
@@ -6758,7 +8747,7 @@ class MemoryService:
         if self._artifact_store is None or not artifact_id:
             return None
         try:
-            return self._artifact_store.get_file_path(artifact_id).read_bytes()
+            return self._artifact_store.read_bytes(artifact_id)
         except Exception:
             return None
 
@@ -6830,9 +8819,9 @@ class MemoryService:
         )
         current_pose = self._get_current_pose()
         target_pose = legacy_candidate.target_pose if legacy_candidate is not None else getattr(navigation_goal, "target_pose", None)
-        map_version_id = str(
-            (verification.metadata or {}).get("map_version_id") if verification is not None else ""
-        ) or (legacy_candidate.map_version_id if legacy_candidate is not None else None)
+        map_name = str(
+            (verification.metadata or {}).get("map_name") if verification is not None else ""
+        ) or (legacy_candidate.map_name if legacy_candidate is not None else None)
         localization_session_id = str(
             (verification.metadata or {}).get("localization_session_id") if verification is not None else ""
         ) or str(candidate_metadata.get("localization_session_id") or "") or None
@@ -6852,7 +8841,7 @@ class MemoryService:
                 event_kind=event_kind,
                 pose=current_pose,
                 target_pose=target_pose,
-                map_version_id=map_version_id,
+                map_name=map_name,
                 localization_session_id=localization_session_id,
                 navigation_candidate_id=candidate_id or None,
                 source_record_kind=record_kind,
@@ -6883,7 +8872,7 @@ class MemoryService:
                 record_id,
                 MemoryRecordKind.NAVIGATION_TRAJECTORY.value,
                 stored_event.trajectory_event_id,
-                map_version_id=stored_event.map_version_id,
+                map_name=stored_event.map_name,
                 localization_session_id=stored_event.localization_session_id,
                 confidence=verification.score if verification is not None else (1.0 if verified else 0.6),
                 evidence_observation_event_ids=observation_event_ids,
@@ -6904,7 +8893,7 @@ class MemoryService:
                     record_id,
                     "navigation_failure",
                     reason_code,
-                    map_version_id=stored_event.map_version_id,
+                    map_name=stored_event.map_name,
                     localization_session_id=stored_event.localization_session_id,
                     confidence=1.0,
                     evidence_observation_event_ids=observation_event_ids,
@@ -6920,31 +8909,35 @@ class MemoryService:
         if verified and legacy_candidate is not None:
             observation_ids = self._normalize_aliases(observation_event_ids)
             if legacy_candidate.record_kind == MemoryRecordKind.OBJECT_INSTANCE:
-                instance = self._semantic_instances_by_id.get(legacy_candidate.record_id)
-                if instance is not None:
-                    updated_instance = instance.model_copy(
-                        update={
-                            "confidence": self._clamp_score(max(instance.confidence, verification.score if verification is not None else instance.confidence)),
-                            "observation_count": instance.observation_count + 1,
-                            "last_seen_ts": utc_now(),
-                            "supporting_observation_event_ids": self._normalize_aliases([*instance.supporting_observation_event_ids, *observation_ids]),
-                            "metadata": self._attach_library_metadata(
-                                {
-                                    **dict(instance.metadata),
-                                    "last_navigation_verified_at": utc_now().isoformat(),
-                                    "last_navigation_candidate_id": candidate_id,
-                                    "last_navigation_trajectory_event_ids": trajectory_event_ids,
-                                    "last_navigation_verification_policy": dict(verification_policy or {}),
-                                }
-                            ),
-                        },
-                        deep=True,
-                    )
-                    self._semantic_instances_by_id[updated_instance.instance_id] = updated_instance
-                    self._semantic_instance_history.append(updated_instance)
-                    self._write_semantic_instance_state(updated_instance)
-                    self._repository.upsert_semantic_instance(updated_instance)
-                    self._upsert_vector_point_for_instance(updated_instance)
+                # P0-3：读改写必须整体持锁，与精化 worker 写回串行；I/O 留在锁外。
+                with self._instances_lock:
+                    instance = self._semantic_instances_by_id.get(legacy_candidate.record_id)
+                    if instance is not None:
+                        updated_instance = instance.model_copy(
+                            update={
+                                "confidence": self._clamp_score(max(instance.confidence, verification.score if verification is not None else instance.confidence)),
+                                "observation_count": instance.observation_count + 1,
+                                "last_seen_ts": utc_now(),
+                                "supporting_observation_event_ids": self._normalize_aliases([*instance.supporting_observation_event_ids, *observation_ids]),
+                                "metadata": self._attach_library_metadata(
+                                    {
+                                        **dict(instance.metadata),
+                                        "last_navigation_verified_at": utc_now().isoformat(),
+                                        "last_navigation_candidate_id": candidate_id,
+                                        "last_navigation_trajectory_event_ids": trajectory_event_ids,
+                                        "last_navigation_verification_policy": dict(verification_policy or {}),
+                                    }
+                                ),
+                            },
+                            deep=True,
+                        )
+                    else:
+                        updated_instance = None
+                if updated_instance is not None:
+                    if self._is_long_term_static_instance(updated_instance):
+                        self._repository.upsert_semantic_instance(updated_instance)
+                    else:
+                        self._publish_live_instance(updated_instance, expected=instance)
             scene_space_id = (
                 legacy_candidate.scene_space_id
                 or (legacy_candidate.record_id if legacy_candidate.record_kind == MemoryRecordKind.SCENE_SPACE else "")
@@ -6968,8 +8961,6 @@ class MemoryService:
                     },
                     deep=True,
                 )
-                self._cache_scene_space(updated_space)
-                self._write_scene_space_state(updated_space)
                 self._repository.upsert_scene_space(updated_space)
                 self._upsert_vector_point_for_scene_space(updated_space)
         evidence = {
@@ -7015,7 +9006,7 @@ class MemoryService:
                 "arrival_score": round(result.score, 6),
                 "arrival_reason_code": metadata.get("arrival_reason_code") or "unknown",
                 "camera_id": metadata.get("camera_id") or "",
-                "map_version_id": metadata.get("map_version_id") or metadata.get("active_map_version_id") or "",
+                "map_name": metadata.get("map_name") or metadata.get("active_map_name") or "",
                 "localization_session_id": metadata.get("localization_session_id") or metadata.get("active_localization_session_id") or "",
             },
         )

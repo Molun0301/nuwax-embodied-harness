@@ -1,0 +1,246 @@
+{
+  "before": [
+    {
+      "n": 10000,
+      "filter": "broad",
+      "limit": 5,
+      "returned": 5,
+      "ms": 433.618,
+      "models": 10000,
+      "scene_rows": 10000,
+      "token_rows": 10000
+    },
+    {
+      "n": 10000,
+      "filter": "broad",
+      "limit": 20,
+      "returned": 20,
+      "ms": 379.855,
+      "models": 10000,
+      "scene_rows": 10000,
+      "token_rows": 10000
+    },
+    {
+      "n": 10000,
+      "filter": "selective",
+      "limit": 5,
+      "returned": 5,
+      "ms": 422.975,
+      "models": 10000,
+      "scene_rows": 10000,
+      "token_rows": 10000
+    },
+    {
+      "n": 10000,
+      "filter": "selective",
+      "limit": 20,
+      "returned": 20,
+      "ms": 415.093,
+      "models": 10000,
+      "scene_rows": 10000,
+      "token_rows": 10000
+    },
+    {
+      "n": 10000,
+      "filter": "none",
+      "limit": 5,
+      "returned": 0,
+      "ms": 402.086,
+      "models": 10000,
+      "scene_rows": 10000,
+      "token_rows": 10000
+    },
+    {
+      "n": 10000,
+      "filter": "none",
+      "limit": 20,
+      "returned": 0,
+      "ms": 439.345,
+      "models": 10000,
+      "scene_rows": 10000,
+      "token_rows": 10000
+    },
+    {
+      "n": 1000,
+      "filter": "broad",
+      "limit": 5,
+      "returned": 5,
+      "ms": 25.275,
+      "models": 1000,
+      "scene_rows": 1000,
+      "token_rows": 1000
+    },
+    {
+      "n": 1000,
+      "filter": "broad",
+      "limit": 20,
+      "returned": 20,
+      "ms": 26.417,
+      "models": 1000,
+      "scene_rows": 1000,
+      "token_rows": 1000
+    },
+    {
+      "n": 1000,
+      "filter": "selective",
+      "limit": 5,
+      "returned": 5,
+      "ms": 26.326,
+      "models": 1000,
+      "scene_rows": 1000,
+      "token_rows": 1000
+    },
+    {
+      "n": 1000,
+      "filter": "selective",
+      "limit": 20,
+      "returned": 10,
+      "ms": 25.143,
+      "models": 1000,
+      "scene_rows": 1000,
+      "token_rows": 1000
+    },
+    {
+      "n": 1000,
+      "filter": "none",
+      "limit": 5,
+      "returned": 0,
+      "ms": 25.668,
+      "models": 1000,
+      "scene_rows": 1000,
+      "token_rows": 1000
+    },
+    {
+      "n": 1000,
+      "filter": "none",
+      "limit": 20,
+      "returned": 0,
+      "ms": 24.982,
+      "models": 1000,
+      "scene_rows": 1000,
+      "token_rows": 1000
+    }
+  ],
+  "after": [
+    {
+      "n": 10000,
+      "filter": "broad",
+      "limit": 5,
+      "returned": 5,
+      "ms": 10.845,
+      "models": 5,
+      "scene_rows": 5,
+      "token_rows": 5
+    },
+    {
+      "n": 10000,
+      "filter": "broad",
+      "limit": 20,
+      "returned": 20,
+      "ms": 10.07,
+      "models": 20,
+      "scene_rows": 20,
+      "token_rows": 20
+    },
+    {
+      "n": 10000,
+      "filter": "selective",
+      "limit": 5,
+      "returned": 5,
+      "ms": 19.134,
+      "models": 500,
+      "scene_rows": 500,
+      "token_rows": 5
+    },
+    {
+      "n": 10000,
+      "filter": "selective",
+      "limit": 20,
+      "returned": 20,
+      "ms": 44.749,
+      "models": 2000,
+      "scene_rows": 2000,
+      "token_rows": 20
+    },
+    {
+      "n": 10000,
+      "filter": "none",
+      "limit": 5,
+      "returned": 0,
+      "ms": 175.1,
+      "models": 10000,
+      "scene_rows": 10000,
+      "token_rows": 0
+    },
+    {
+      "n": 10000,
+      "filter": "none",
+      "limit": 20,
+      "returned": 0,
+      "ms": 174.279,
+      "models": 10000,
+      "scene_rows": 10000,
+      "token_rows": 0
+    },
+    {
+      "n": 1000,
+      "filter": "broad",
+      "limit": 5,
+      "returned": 5,
+      "ms": 1.102,
+      "models": 5,
+      "scene_rows": 5,
+      "token_rows": 5
+    },
+    {
+      "n": 1000,
+      "filter": "broad",
+      "limit": 20,
+      "returned": 20,
+      "ms": 1.088,
+      "models": 20,
+      "scene_rows": 20,
+      "token_rows": 20
+    },
+    {
+      "n": 1000,
+      "filter": "selective",
+      "limit": 5,
+      "returned": 5,
+      "ms": 9.299,
+      "models": 500,
+      "scene_rows": 500,
+      "token_rows": 5
+    },
+    {
+      "n": 1000,
+      "filter": "selective",
+      "limit": 20,
+      "returned": 10,
+      "ms": 17.986,
+      "models": 1000,
+      "scene_rows": 1000,
+      "token_rows": 10
+    },
+    {
+      "n": 1000,
+      "filter": "none",
+      "limit": 5,
+      "returned": 0,
+      "ms": 16.785,
+      "models": 1000,
+      "scene_rows": 1000,
+      "token_rows": 0
+    },
+    {
+      "n": 1000,
+      "filter": "none",
+      "limit": 20,
+      "returned": 0,
+      "ms": 18.049,
+      "models": 1000,
+      "scene_rows": 1000,
+      "token_rows": 0
+    }
+  ]
+}

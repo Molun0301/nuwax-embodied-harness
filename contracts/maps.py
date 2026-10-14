@@ -1,23 +1,53 @@
 from __future__ import annotations
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, WithJsonSchema, field_validator, model_validator
+from typing_extensions import Annotated
 
 from contracts.base import MetadataDict, TimestampedContract
 from contracts.geometry import Pose, Vector3
 from contracts.naming import validate_frame_id
-from typing import List, Optional
+from contracts.occupancy_cells import PackedOccupancyCells
+from typing import List, Optional, Union
 
 
 class OccupancyGrid(TimestampedContract):
     """占据栅格地图。"""
 
-    map_id: str = Field(description="地图标识。")
+    map_id: str = Field(description="用户选择的地图名称。")
     frame_id: str = Field(description="地图坐标系。")
     width: int = Field(ge=1, description="地图宽度，单位格。")
     height: int = Field(ge=1, description="地图高度，单位格。")
     resolution_m: float = Field(gt=0.0, description="每格分辨率，单位米。")
     origin: Pose = Field(description="地图原点位姿。")
-    data: List[int] = Field(default_factory=list, description="一维行优先栅格数据，范围为 -1 到 100。")
+    metadata: MetadataDict = Field(default_factory=dict, description="Source-owned map provenance and presentation metadata.")
+    data: Annotated[
+        Union[PackedOccupancyCells, List[int]],
+        WithJsonSchema({"type": "array", "items": {"type": "integer"}}),
+    ] = Field(default_factory=list, description="一维行优先栅格数据，范围为 -1 到 100。")
+
+    def __deepcopy__(self, memo: Optional[dict] = None) -> "OccupancyGrid":
+        """复制整数栅格时免去逐格递归，其它字段仍沿模型完整深复制。"""
+
+        if memo is None:
+            memo = {}
+        if type(self) is OccupancyGrid:
+            data = getattr(self, "data", None)
+            if type(data) is list and id(data) not in memo:
+                # 先捕获独立列表再检查，源列表在检查期间变化也不会带入可变别名。
+                copied_data = data.copy()
+                if all(type(value) is int for value in copied_data):
+                    memo[id(data)] = copied_data
+                    # 与标准深复制一样保活原对象，复用备忘表时不能把复用的对象编号误认成旧列表。
+                    memo.setdefault(id(memo), []).append(data)
+        return super().__deepcopy__(memo=memo)
+
+    @field_validator("map_id")
+    @classmethod
+    def _validate_map_id(cls, value: str) -> str:
+        resolved = str(value or "").strip()
+        if not resolved:
+            raise ValueError("map_id 不能为空。")
+        return resolved
 
     @field_validator("frame_id")
     @classmethod
@@ -28,7 +58,9 @@ class OccupancyGrid(TimestampedContract):
     def _validate_grid(self) -> "OccupancyGrid":
         if len(self.data) != self.width * self.height:
             raise ValueError("OccupancyGrid 的 data 长度必须等于 width * height。")
-        if any(value < -1 or value > 100 for value in self.data):
+        if type(self.data) is not PackedOccupancyCells and (
+            min(self.data, default=0) < -1 or max(self.data, default=0) > 100
+        ):
             raise ValueError("OccupancyGrid 的栅格取值必须在 -1 到 100 之间。")
         return self
 
@@ -36,13 +68,21 @@ class OccupancyGrid(TimestampedContract):
 class CostMap(TimestampedContract):
     """代价地图。"""
 
-    map_id: str = Field(description="地图标识。")
+    map_id: str = Field(description="用户选择的地图名称。")
     frame_id: str = Field(description="地图坐标系。")
     width: int = Field(ge=1, description="地图宽度，单位格。")
     height: int = Field(ge=1, description="地图高度，单位格。")
     resolution_m: float = Field(gt=0.0, description="每格分辨率，单位米。")
     origin: Pose = Field(description="地图原点位姿。")
     data: List[float] = Field(default_factory=list, description="一维行优先代价值。")
+
+    @field_validator("map_id")
+    @classmethod
+    def _validate_map_id(cls, value: str) -> str:
+        resolved = str(value or "").strip()
+        if not resolved:
+            raise ValueError("map_id 不能为空。")
+        return resolved
 
     @field_validator("frame_id")
     @classmethod
@@ -69,10 +109,18 @@ class SemanticRegion(TimestampedContract):
 class SemanticMap(TimestampedContract):
     """语义地图。"""
 
-    map_id: str = Field(description="地图标识。")
+    map_id: str = Field(description="用户选择的地图名称。")
     frame_id: str = Field(description="地图坐标系。")
     regions: List[SemanticRegion] = Field(default_factory=list, description="语义区域集合。")
     metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")
+
+    @field_validator("map_id")
+    @classmethod
+    def _validate_map_id(cls, value: str) -> str:
+        resolved = str(value or "").strip()
+        if not resolved:
+            raise ValueError("map_id 不能为空。")
+        return resolved
 
     @field_validator("frame_id")
     @classmethod

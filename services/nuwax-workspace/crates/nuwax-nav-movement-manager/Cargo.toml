@@ -1,0 +1,22 @@
+[package]
+name = "nuwax-nav-movement-manager"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "MovementManager: 点击目标转发 + teleop/nav velocity mux + 接管取消导航"
+
+[dependencies]
+# Foundation 共享类型 — 接入后允许跨 crate 共享 PointStamped / Twist 协议语义
+nuwax-nav-types-messages = { path = "../nuwax-nav-types-messages" }
+nuwax-nav-base = { path = "../nuwax-nav-base" }
+
+nuwax-numeric = { path = "../nuwax-numeric" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time", "macros", "sync"] }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time", "macros", "sync", "test-util"] }

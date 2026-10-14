@@ -1,0 +1,62 @@
+package nuwax_msgs;
+
+struct CorrectionCandidate {
+    const int32_t SCHEMA_VERSION_V3 = 3;
+    const int32_t BACKEND_LIBRARY_PGO = 1;
+    const int32_t BACKEND_NATIVE_PGO = 2;
+    const int32_t BACKEND_RELOCALIZATION = 3;
+    // Full SE(3) C applied on the left: corrected_pose = C * odom_pose.
+    // C is neither a canonical map<-odom transform nor an incremental delta.
+    const int32_t TRANSFORM_ABSOLUTE_LEFT_CORRECTION_SE3 = 1;
+
+    int32_t schema_version;
+    int32_t backend;
+    int32_t transform_semantics;
+    int64_t runtime_generation;
+    int64_t backend_generation;
+    int64_t candidate_sequence;
+    string mapping_session_id;
+    int64_t mapping_session_generation;
+    // Actual occupancy-owner domain; distinct from correction backend_generation.
+    string mapping_backend_kind;
+    int64_t mapping_backend_generation;
+    int64_t map_frame_generation;
+    byte mapping_commit_boot_nonce[16];
+    int64_t mapping_commit_sequence;
+    int64_t occupancy_revision;
+    // Independent cumulative cloud-map revision; it is not occupancy_revision.
+    int64_t cloud_revision;
+    int64_t committed_map_source_timestamp_ns;
+    // Existing admitted LIO source domain, not the correction backend.
+    int32_t registered_cloud_backend;
+    int64_t registered_cloud_runtime_generation;
+    int64_t registered_cloud_source_sequence;
+    int64_t registered_cloud_source_timestamp_ns;
+    int64_t registered_cloud_point_count;
+    int64_t correlated_odom_source_sequence;
+    int64_t correlated_odom_source_timestamp_ns;
+    // Exact frozen odom<-body pose; quaternion order is x, y, z, w.
+    double correlated_odom_translation_m[3];
+    double correlated_odom_rotation_xyzw[4];
+    int64_t committed_map_width;
+    int64_t committed_map_height;
+    double committed_map_resolution_m;
+    double committed_map_origin_x_m;
+    double committed_map_origin_y_m;
+    // Zero is a valid present source timestamp, never an absence sentinel.
+    int64_t source_timestamp_ns;
+    string map_frame_id;
+    string odom_frame_id;
+    string body_frame_id;
+    string points_frame_id;
+    byte correction_lease_boot_nonce[16];
+    int64_t correction_lease_generation;
+    double translation_m[3];
+    // Quaternion component order is x, y, z, w.
+    double rotation_xyzw[4];
+    // 完整优化关键帧，时间精确保留源纳秒，位姿属于优化后的里程计世界坐标。
+    int32_t trajectory_count;
+    int64_t trajectory_timestamp_ns[trajectory_count];
+    double trajectory_translation_m[trajectory_count][3];
+    double trajectory_rotation_xyzw[trajectory_count][4];
+}

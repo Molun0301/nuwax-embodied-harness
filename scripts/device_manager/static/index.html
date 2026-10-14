@@ -1,0 +1,607 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NEH 设备管理</title>
+  <meta name="description" content="Nuwax Embodied Harness（NEH）端侧设备管理与版本控制">
+  <link rel="icon" href="/static/neh-icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/manager-assets/app.css">
+</head>
+<body>
+<div class="manager-app" id="app">
+  <header class="manager-header">
+    <div class="manager-brand">
+      <span class="brand-mark"></span>
+      <div class="brand-text">
+        <div class="brand-title">NEH 设备管理</div>
+        <div class="brand-subtitle">Nuwax Embodied Harness</div>
+      </div>
+    </div>
+    <div class="manager-meta">
+      <span id="platformInfo" class="meta-chip">检测中</span>
+      <span id="managerVersion" class="meta-chip">管理器 --</span>
+    </div>
+    <button id="themeToggle" type="button" title="切换主题" aria-label="切换亮色或暗色主题">🌙</button>
+  </header>
+
+  <div id="viewHost" class="manager-views">
+
+    <!-- 首屏加载态：设备状态读回前只显示这一屏，避免空数据被当成已安装结果。 -->
+    <div id="bootView" class="manager-view active">
+      <div class="boot-panel">
+        <div class="status-icon spinner"></div>
+        <p class="boot-text" id="bootText">正在读取设备状态…</p>
+        <div class="boot-actions" id="bootActions" hidden>
+          <button class="btn primary" type="button" id="bootRetry">重新连接</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== 首次安装向导 ===== -->
+    <div id="setupView" class="manager-view">
+      <div class="setup-wizard">
+        <div class="wizard-progress" id="wizardProgress" aria-label="安装步骤">
+          <span class="wizard-progress-item active" data-step-mark="hardware">硬件检查</span>
+          <span class="wizard-progress-item" data-step-mark="modules">功能模块</span>
+          <span class="wizard-progress-item" data-step-mark="plan">安装计划</span>
+          <span class="wizard-progress-item" data-step-mark="install">执行安装</span>
+        </div>
+
+        <div class="wizard-content">
+          <div class="wizard-header">
+            <h1>欢迎使用 NEH</h1>
+            <p>按当前硬件推荐功能模块，确认计划后完成首次安装，随后即可使用机器人控制台与智能体接入。</p>
+          </div>
+
+          <div id="setupSteps" class="wizard-steps">
+
+            <!-- 步骤 1：硬件检查 -->
+            <section id="stepHardware" class="wizard-step" data-step="hardware">
+              <div class="step-indicator">
+                <span class="step-num">1</span>
+                <div class="step-label">
+                  <h2>硬件检查</h2>
+                  <p>分析系统环境并给出适配判断</p>
+                </div>
+              </div>
+              <div class="step-content">
+                <div id="migrationPanel" class="migration-panel" hidden>
+                  <div class="migration-header">
+                    <h3>检测到已有安装</h3>
+                    <p>可选择迁移已有配置与数据，或执行全新安装</p>
+                  </div>
+                  <div id="migrationSources" class="migration-sources"></div>
+                  <div class="migration-actions">
+                    <button id="migrateFresh" class="btn" type="button">全新安装</button>
+                    <button id="migrateFrom" class="btn primary" type="button" disabled>迁移配置</button>
+                  </div>
+                </div>
+                <div id="hardwareStatus" class="status-card checking">
+                  <div class="status-icon spinner"></div>
+                  <div class="status-text" id="hardwareStatusText">正在检测硬件与系统环境…</div>
+                </div>
+                <div id="hardwareDetails" class="hardware-grid" hidden></div>
+                <div id="hardwareReasons" class="reason-block" hidden></div>
+                <div id="hardwareEvidence" class="evidence-block" hidden></div>
+                <div id="hardwareIssues" class="issue-list" hidden></div>
+                <div class="step-actions">
+                  <button id="retryHardware" class="btn" type="button" hidden>重新检测</button>
+                  <button id="nextToModules" class="btn primary" type="button" disabled>下一步：选择模块</button>
+                </div>
+              </div>
+            </section>
+
+            <!-- 步骤 2：模块选择 -->
+            <section id="stepModules" class="wizard-step" data-step="modules" hidden>
+              <div class="step-indicator">
+                <span class="step-num">2</span>
+                <div class="step-label">
+                  <h2>功能模块</h2>
+                  <p>已按硬件预选，可自行调整</p>
+                </div>
+              </div>
+              <div class="step-content">
+                <div id="modulesHint" class="hint-block" hidden></div>
+
+                <!-- 版本源：全新设备即使没有可用版本，也必须能在这里配置来源，避免卡住。 -->
+                <details id="wizardSource" class="source-panel">
+                  <summary>
+                    <span>更新来源设置</span>
+                    <span id="wizardSourceSummary" class="source-summary">未配置</span>
+                  </summary>
+                  <div class="source-body">
+                    <div class="config-row">
+                      <label>
+                        <span class="config-label">更新通道</span>
+                        <select id="wizardChannel" class="field">
+                          <option value="stable">稳定版</option>
+                          <option value="preview">预览版</option>
+                        </select>
+                      </label>
+                      <label class="config-row-wide">
+                        <span class="config-label">版本源地址</span>
+                        <input id="wizardFeedUrl" class="field" type="text" placeholder="https://…">
+                      </label>
+                    </div>
+                    <div class="config-row">
+                      <label class="config-row-wide">
+                        <span class="config-label">私有源访问令牌（可选）</span>
+                        <input id="wizardToken" class="field" type="password" autocomplete="off"
+                               placeholder="留空表示保持现有令牌">
+                      </label>
+                    </div>
+                    <div class="source-actions">
+                      <button id="wizardSaveSource" class="btn primary" type="button">保存来源设置</button>
+                      <button id="wizardClearToken" class="btn" type="button">清除已存令牌</button>
+                      <span id="wizardTokenState" class="source-token-state"></span>
+                    </div>
+                    <div id="wizardSourceMessage" class="inline-message" hidden></div>
+                  </div>
+                </details>
+
+                <div id="wizardModules" class="modules-grid"></div>
+                <div id="robotSelectRow" class="robot-select-row" hidden>
+                  <label for="robotSelect">
+                    <span class="config-label">机器人型号</span>
+                    <select id="robotSelect" class="field"></select>
+                  </label>
+                </div>
+                <div class="step-actions">
+                  <button id="backToHardware" class="btn" type="button">上一步</button>
+                  <button id="nextToPlan" class="btn primary" type="button">下一步：生成计划</button>
+                </div>
+              </div>
+            </section>
+
+            <!-- 步骤 3：安装计划 -->
+            <section id="stepPlan" class="wizard-step" data-step="plan" hidden>
+              <div class="step-indicator">
+                <span class="step-num">3</span>
+                <div class="step-label">
+                  <h2>安装计划</h2>
+                  <p>确认安装内容与资源需求</p>
+                </div>
+              </div>
+              <div class="step-content">
+                <div id="planStatus" class="status-card" hidden>
+                  <div class="status-icon spinner"></div>
+                  <div class="status-text" id="planStatusText">正在生成计划…</div>
+                </div>
+                <div id="planDetails" class="plan-summary" hidden></div>
+                <div id="planSteps" class="plan-steps" hidden></div>
+                <div id="planWarnings" class="warning-list" hidden></div>
+                <div id="planBlockers" class="blocker-list" hidden></div>
+                <div class="step-actions">
+                  <button id="backToModules" class="btn" type="button">上一步</button>
+                  <button id="regeneratePlan" class="btn" type="button" hidden>重新生成</button>
+                  <button id="startInstall" class="btn primary" type="button" disabled>开始安装</button>
+                </div>
+              </div>
+            </section>
+
+            <!-- 步骤 4：执行安装 -->
+            <section id="stepInstall" class="wizard-step" data-step="install" hidden>
+              <div class="step-indicator">
+                <span class="step-num">4</span>
+                <div class="step-label">
+                  <h2 id="installTitle">正在安装</h2>
+                  <p id="installSubtitle">准备安装环境…</p>
+                </div>
+              </div>
+              <div class="step-content">
+                <div class="install-progress">
+                  <div class="progress-bar">
+                    <div id="installProgressBar" class="progress-fill"></div>
+                  </div>
+                  <div class="progress-head">
+                    <span id="installStage" class="progress-stage">准备中…</span>
+                    <span id="installPercent" class="progress-percent mono">0%</span>
+                  </div>
+                  <div id="installMessage" class="progress-message"></div>
+                </div>
+                <details id="installLog" class="install-log">
+                  <summary>查看详细日志</summary>
+                  <div id="installLogContent" class="log-content">暂无日志输出。</div>
+                </details>
+                <div id="installResult" class="result-card" hidden></div>
+                <div class="step-actions">
+                  <button id="cancelInstall" class="btn" type="button">取消安装</button>
+                  <button id="retrySetup" class="btn" type="button" hidden>重新开始</button>
+                  <button id="finishSetup" class="btn primary" type="button" hidden>进入管理界面</button>
+                </div>
+              </div>
+            </section>
+
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== 主管理界面（首屏状态读回前保持隐藏，避免闪过空数据）===== -->
+    <div id="mainView" class="manager-view">
+      <nav class="manager-nav" aria-label="管理功能">
+        <button class="nav-item active" data-view="overview" type="button">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
+          <span>概览</span>
+        </button>
+        <button class="nav-item" data-view="modules" type="button">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 3 7.5l9 4.5 9-4.5L12 3Z"/><path d="M3 12.5 12 17l9-4.5M3 16.5 12 21l9-4.5"/></svg>
+          <span>功能模块</span>
+        </button>
+        <button class="nav-item" data-view="updates" type="button">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20V6"/><path d="m6 12 6-6 6 6"/><path d="M4 21h16"/></svg>
+          <span>版本更新</span>
+        </button>
+        <button class="nav-item" data-view="jobs" type="button">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7.5V12l3 2"/></svg>
+          <span>任务记录</span>
+        </button>
+        <button class="nav-item" data-view="config" type="button">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/><circle cx="9" cy="7" r="2"/><circle cx="15" cy="12" r="2"/><circle cx="8" cy="17" r="2"/></svg>
+          <span>设备配置</span>
+        </button>
+        <button class="nav-item" data-view="settings" type="button">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3.2"/><path d="M19.4 14.5a1.6 1.6 0 0 0 .32 1.77l.06.06a1.9 1.9 0 1 1-2.69 2.69l-.06-.06a1.6 1.6 0 0 0-1.77-.32 1.6 1.6 0 0 0-1 1.47V21a1.9 1.9 0 1 1-3.8 0v-.1a1.6 1.6 0 0 0-1.05-1.47 1.6 1.6 0 0 0-1.77.32l-.06.06a1.9 1.9 0 1 1-2.69-2.69l.06-.06a1.6 1.6 0 0 0 .32-1.77 1.6 1.6 0 0 0-1.47-1H3a1.9 1.9 0 1 1 0-3.8h.1a1.6 1.6 0 0 0 1.47-1.05 1.6 1.6 0 0 0-.32-1.77l-.06-.06a1.9 1.9 0 1 1 2.69-2.69l.06.06a1.6 1.6 0 0 0 1.77.32H9a1.6 1.6 0 0 0 1-1.47V3a1.9 1.9 0 1 1 3.8 0v.1a1.6 1.6 0 0 0 1 1.47 1.6 1.6 0 0 0 1.77-.32l.06-.06a1.9 1.9 0 1 1 2.69 2.69l-.06.06a1.6 1.6 0 0 0-.32 1.77V9a1.6 1.6 0 0 0 1.47 1H21a1.9 1.9 0 1 1 0 3.8h-.1a1.6 1.6 0 0 0-1.5 1Z"/></svg>
+          <span>设置</span>
+        </button>
+      </nav>
+
+      <main class="manager-main">
+
+        <!-- 概览 -->
+        <div id="overviewPane" class="main-pane active">
+          <div class="pane-header">
+            <div>
+              <h1>设备概览</h1>
+              <p class="pane-desc">当前安装状态与运行概况</p>
+            </div>
+            <div class="pane-actions">
+              <a href="/console" class="btn primary" id="openConsole">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M8 10h8M8 14h5"/></svg>
+                打开控制台
+              </a>
+            </div>
+          </div>
+
+          <div id="overviewLoadError" class="status-message error" hidden></div>
+
+          <div class="overview-grid">
+            <div class="overview-card card-primary">
+              <div class="card-header">
+                <h2>安装信息</h2>
+                <span id="installStatus" class="status-badge">--</span>
+              </div>
+              <div class="card-content">
+                <div class="info-row">
+                  <span class="info-label">当前版本</span>
+                  <span id="currentVersion" class="info-value">--</span>
+                </div>
+                <div class="info-row">
+                  <span class="info-label">机器人型号</span>
+                  <span id="robotModel" class="info-value">--</span>
+                </div>
+                <div class="info-row">
+                  <span class="info-label">功能模块</span>
+                  <span id="installedModules" class="info-value">--</span>
+                </div>
+                <div class="info-row" id="previousVersionRow" hidden>
+                  <span class="info-label">可回退版本</span>
+                  <span id="previousVersion" class="info-value">--</span>
+                </div>
+                <div id="installSourceRow" class="info-row" hidden>
+                  <span class="info-label">安装来源</span>
+                  <span id="installSource" class="info-value">--</span>
+                </div>
+              </div>
+            </div>
+
+            <div class="overview-card">
+              <div class="card-header">
+                <h2>运行状态</h2>
+                <span id="runtimeStatus" class="status-badge">--</span>
+              </div>
+              <div class="card-content">
+                <div class="info-row">
+                  <span class="info-label">业务服务</span>
+                  <span id="servicesState" class="info-value">--</span>
+                </div>
+                <div id="runtimeError" class="error-message" hidden></div>
+                <div class="runtime-actions">
+                  <button id="startRuntime" class="btn" type="button" hidden>启动服务</button>
+                  <button id="stopRuntime" class="btn" type="button" hidden>停止服务</button>
+                  <button id="restartRuntime" class="btn" type="button" hidden>重启服务</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="overview-card" id="updateCard">
+              <div class="card-header">
+                <h2>版本更新</h2>
+                <span id="updateStatus" class="status-badge">--</span>
+              </div>
+              <div class="card-content">
+                <div id="updateAvailable" hidden>
+                  <div class="info-row">
+                    <span class="info-label">可用版本</span>
+                    <span id="availableVersion" class="info-value">--</span>
+                  </div>
+                  <div class="runtime-actions">
+                    <button id="checkUpdates" class="btn" type="button">检查更新</button>
+                    <button id="goToUpdates" class="btn primary" type="button">前往更新</button>
+                  </div>
+                </div>
+                <div id="updateNone" hidden>
+                  <p class="info-text">当前已是最新版本。</p>
+                  <div class="runtime-actions">
+                    <button id="checkUpdatesAlt" class="btn" type="button">检查更新</button>
+                  </div>
+                </div>
+                <div id="updateError" hidden>
+                  <div class="error-message" id="updateErrorText"></div>
+                  <div class="runtime-actions">
+                    <button id="retryUpdateCheck" class="btn" type="button">重试</button>
+                  </div>
+                </div>
+                <p id="managerUpdateHint" class="info-text" hidden></p>
+              </div>
+            </div>
+
+            <div class="overview-card" id="activeJobCard" hidden>
+              <div class="card-header">
+                <h2>进行中任务</h2>
+                <span id="activeJobStatus" class="status-badge">--</span>
+              </div>
+              <div id="activeJobInfo" class="card-content"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 功能模块 -->
+        <div id="modulesPane" class="main-pane">
+          <div class="pane-header">
+            <div>
+              <h1>功能模块</h1>
+              <p class="pane-desc">调整已安装的功能模块，变更通过安装任务执行</p>
+            </div>
+            <div class="pane-actions">
+              <button id="refreshModules" class="btn" type="button">刷新</button>
+              <button id="applyModules" class="btn primary" type="button" disabled>应用变更</button>
+            </div>
+          </div>
+          <div id="modulesMessage" class="status-message" hidden></div>
+          <div id="modulesContent" class="modules-list"></div>
+        </div>
+
+        <!-- 版本更新 -->
+        <div id="updatesPane" class="main-pane">
+          <div class="pane-header">
+            <div>
+              <h1>版本更新</h1>
+              <p class="pane-desc">更新、回退或切换业务版本</p>
+            </div>
+            <div class="pane-actions">
+              <button id="refreshReleases" class="btn" type="button">刷新版本列表</button>
+            </div>
+          </div>
+
+          <div class="update-config">
+            <h3>更新来源</h3>
+            <div class="config-row">
+              <label>
+                <span class="config-label">更新通道</span>
+                <select id="updateChannel" class="field">
+                  <option value="stable">稳定版</option>
+                  <option value="preview">预览版</option>
+                </select>
+              </label>
+              <label class="config-row-wide">
+                <span class="config-label">版本源地址</span>
+                <input id="feedUrl" class="field" type="text" placeholder="https://…">
+              </label>
+            </div>
+            <div class="config-row">
+              <label class="config-row-wide">
+                <span class="config-label">私有源访问令牌（可选）</span>
+                <input id="sourceToken" class="field" type="password" autocomplete="off"
+                       placeholder="留空表示保持现有令牌">
+              </label>
+            </div>
+            <div class="source-actions">
+              <button id="saveUpdateConfig" class="btn primary" type="button">保存来源设置</button>
+              <button id="clearSourceToken" class="btn" type="button">清除已存令牌</button>
+              <span id="tokenState" class="source-token-state"></span>
+            </div>
+            <div id="updateConfigMessage" class="inline-message" hidden></div>
+          </div>
+
+          <!-- 管理程序自身版本：与业务版本分开，更新后管理服务会短暂重启。 -->
+          <div class="manager-update-block" id="managerUpdateBlock">
+            <div class="manager-update-info">
+              <div class="setting-label">管理程序版本</div>
+              <div class="setting-desc">
+                当前 <span id="managerCurrentVersion" class="mono">--</span>
+                <span id="managerLatestVersion"></span>
+              </div>
+              <div id="managerUpdateNote" class="setting-desc muted"></div>
+            </div>
+            <div class="manager-update-actions">
+              <button id="updateManagerButton" class="btn" type="button" hidden>更新管理程序</button>
+              <span id="managerUpdateState" class="status-text"></span>
+            </div>
+          </div>
+
+          <div id="releasesStatus" class="status-message" hidden></div>
+
+          <div class="rollback-block" id="rollbackBlock" hidden>
+            <div class="rollback-info">
+              <div class="setting-label">回退到上一版本</div>
+              <div class="setting-desc">
+                当前保留的可回退版本：<span id="rollbackVersion" class="mono">--</span>。
+                回退使用设备上已有的版本包，不会重新下载。
+              </div>
+            </div>
+            <button id="rollbackButton" class="btn" type="button">回退</button>
+          </div>
+
+          <div id="releasesList" class="releases-list"></div>
+        </div>
+
+        <!-- 任务记录 -->
+        <div id="jobsPane" class="main-pane">
+          <div class="pane-header">
+            <div>
+              <h1>任务记录</h1>
+              <p class="pane-desc">安装、更新、回退与启停任务的历史与日志</p>
+            </div>
+            <div class="pane-actions">
+              <button id="refreshJobs" class="btn" type="button">刷新</button>
+            </div>
+          </div>
+          <div id="jobsMessage" class="status-message" hidden></div>
+          <div id="jobsList" class="jobs-list"></div>
+        </div>
+
+        <!-- 设备配置 -->
+        <div id="configPane" class="main-pane">
+          <div class="pane-header">
+            <div>
+              <h1>设备配置</h1>
+              <p class="pane-desc">当前运行版本的机器人配置与功能参数</p>
+            </div>
+            <div class="pane-actions">
+              <button id="configReload" class="btn" type="button">重新读取</button>
+              <button id="configSave" class="btn primary" type="button" disabled>保存改动</button>
+            </div>
+          </div>
+
+          <div id="configMessage" class="status-message" hidden></div>
+
+          <div class="config-workspace">
+            <nav id="configGroups" class="config-groups" aria-label="配置分组"></nav>
+            <div class="config-body">
+              <div id="configSections" class="config-sections"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 设置 -->
+        <div id="settingsPane" class="main-pane">
+          <div class="pane-header">
+            <div>
+              <h1>管理设置</h1>
+              <p class="pane-desc">管理服务的行为与访问控制</p>
+            </div>
+          </div>
+
+          <div id="settingsMessage" class="status-message" hidden></div>
+
+          <section class="settings-section">
+            <h3>访问控制</h3>
+            <div class="setting-row">
+              <div class="setting-info">
+                <div class="setting-label">密码保护</div>
+                <div class="setting-desc">默认不需要密码。启用后，修改配置、执行任务等操作需要先验证密码。</div>
+              </div>
+              <div class="setting-control">
+                <span id="passwordStatusText" class="status-text">--</span>
+                <button id="setPassword" class="btn" type="button" hidden>设置密码</button>
+                <button id="changePassword" class="btn" type="button" hidden>修改密码</button>
+                <button id="removePassword" class="btn" type="button" hidden>移除密码</button>
+              </div>
+            </div>
+          </section>
+
+          <section class="settings-section">
+            <h3>启动行为</h3>
+            <div class="setting-row">
+              <div class="setting-info">
+                <div class="setting-label">开机自动启动</div>
+                <div class="setting-desc">系统启动后自动运行 NEH 业务服务。</div>
+              </div>
+              <div class="setting-control">
+                <label class="toggle-switch">
+                  <input id="autoStart" type="checkbox">
+                  <span class="toggle-slider"></span>
+                </label>
+              </div>
+            </div>
+          </section>
+
+          <section class="settings-section">
+            <h3>设备信息</h3>
+            <div id="settingsHardware" class="hardware-grid"></div>
+          </section>
+
+          <section class="settings-section">
+            <h3>控制台入口</h3>
+            <p class="section-desc">机器人控制台提供地图、感知、空间记忆与任务状态，业务服务运行时可用。</p>
+            <div class="runtime-actions">
+              <a href="/console" class="btn">打开控制台</a>
+            </div>
+          </section>
+        </div>
+
+      </main>
+    </div>
+  </div>
+
+  <!-- 密码对话框 -->
+  <dialog id="passwordDialog" class="modal-dialog">
+    <form id="passwordForm" method="dialog">
+      <h2 id="passwordDialogTitle">设置密码</h2>
+      <p id="passwordDialogDesc" class="modal-desc">设置密码后，修改配置和执行任务需要先验证密码。</p>
+      <div class="form-field" id="currentPasswordField" hidden>
+        <label for="currentPasswordInput">当前密码</label>
+        <input id="currentPasswordInput" class="field" type="password" autocomplete="current-password">
+      </div>
+      <div class="form-field">
+        <label for="newPasswordInput">新密码</label>
+        <input id="newPasswordInput" class="field" type="password" autocomplete="new-password">
+      </div>
+      <div class="form-field">
+        <label for="confirmPasswordInput">确认密码</label>
+        <input id="confirmPasswordInput" class="field" type="password" autocomplete="new-password">
+      </div>
+      <div id="passwordError" class="error-message" hidden></div>
+      <div class="modal-actions">
+        <button type="button" class="btn" id="cancelPassword">取消</button>
+        <button type="submit" class="btn primary" id="submitPassword">确认</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- 登录对话框 -->
+  <dialog id="loginDialog" class="modal-dialog">
+    <form id="loginForm" method="dialog">
+      <h2>需要验证</h2>
+      <p class="modal-desc">该操作需要密码，请输入后继续。</p>
+      <div class="form-field">
+        <label for="loginPasswordInput">密码</label>
+        <input id="loginPasswordInput" class="field" type="password" autocomplete="current-password">
+      </div>
+      <div id="loginError" class="error-message" hidden></div>
+      <div class="modal-actions">
+        <button type="button" class="btn" id="cancelLogin">取消</button>
+        <button type="submit" class="btn primary">登录</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- 操作确认对话框 -->
+  <dialog id="confirmDialog" class="modal-dialog">
+    <form method="dialog">
+      <h2 id="confirmTitle">确认操作</h2>
+      <p id="confirmText" class="modal-desc"></p>
+      <div id="confirmExtra" class="confirm-extra" hidden></div>
+      <div class="modal-actions">
+        <button type="button" class="btn" id="confirmCancel">取消</button>
+        <button type="button" class="btn primary" id="confirmOk">确认</button>
+      </div>
+    </form>
+  </dialog>
+</div>
+
+<script src="/manager-assets/app.js"></script>
+</body>
+</html>

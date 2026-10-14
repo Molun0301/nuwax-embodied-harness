@@ -1,0 +1,478 @@
+{
+  "measurement_date": "2026-10-13",
+  "scope": "YOLO result normalization only; no inference, GPU, network, or pipeline throughput measurement",
+  "baseline_commit": "0e59001cf8f3ff529d5bfc873fec9901ab74f5eb",
+  "environment": {
+    "python": "3.8.10",
+    "pydantic": "2.10.6",
+    "numpy": "1.24.4",
+    "opencv": "4.10.0",
+    "platform": "Linux x86_64"
+  },
+  "fixture": {
+    "backend": "services.perception.detectors.YoloWorldDetectorBackend(use_worker_process=False)",
+    "result_adapter": "services.perception.detectors._WorkerResult",
+    "contracts": "Production Pydantic models, validation enabled",
+    "frame": {
+      "width_px": 640,
+      "height_px": 480,
+      "encoding": "bgr8",
+      "camera_id": "front",
+      "frame_id": "camera/front"
+    },
+    "box_xyxy": [
+      70.0,
+      70.0,
+      130.0,
+      130.0
+    ],
+    "confidence": 0.8,
+    "class_id": 0,
+    "names": {
+      "0": "chair"
+    },
+    "polygon": {
+      "center_px": [
+        100.0,
+        100.0
+      ],
+      "radius_px": 30.0,
+      "construction": "numpy.linspace(0, 2*numpy.pi, points, endpoint=False); column_stack(center_x+radius*cos(theta), center_y+radius*sin(theta))",
+      "input_ownership": "Independent NumPy polygon copy for each detection"
+    },
+    "scenarios": [
+      [
+        1,
+        4
+      ],
+      [
+        20,
+        128
+      ],
+      [
+        64,
+        512
+      ],
+      [
+        64,
+        0
+      ]
+    ]
+  },
+  "method": {
+    "independent_processes": 3,
+    "timing_blocks_per_implementation_per_scenario": 7,
+    "calls_per_block": 3,
+    "timer": "time.perf_counter",
+    "gc_collect_before_each_block": true,
+    "gc_during_timing": "enabled, default thresholds",
+    "pair_order": "before/after for even zero-based trial; after/before for odd trial",
+    "reported_samples": "milliseconds per call: block elapsed time divided by 3",
+    "median": "median of seven block samples separately for each implementation",
+    "baseline": "Four methods extracted from baseline source AST and bound to a normally constructed backend: _extract_mask_polygons, _build_mask_segmentation, _polygon_signed_area, _polygon_centroid",
+    "candidate": "Normally imported modified production backend",
+    "correctness": "Full model_dump comparison per fixture, recursively excluding timestamp keys",
+    "memory": "Separate single normalization call per implementation/scenario after gc.collect; tracemalloc peak bytes; excluded from timings"
+  },
+  "processes": [
+    {
+      "process_index": 1,
+      "results": [
+        {
+          "detections": 1,
+          "points": 4,
+          "median_ms": {
+            "before": 0.13944699943143254,
+            "after": 0.13971100027750558
+          },
+          "times_ms": {
+            "before": [
+              0.13674966612597927,
+              0.15202633342899693,
+              0.13944699943143254,
+              0.13822866579478918,
+              0.1446183329486909,
+              0.14383733287104405,
+              0.13058366675977595
+            ],
+            "after": [
+              0.13610866638676575,
+              0.19637666628113948,
+              0.1382956664504794,
+              0.13425266661215574,
+              0.13971100027750558,
+              0.14449133353385454,
+              0.13995799963595346
+            ]
+          },
+          "peak_bytes": {
+            "before": 16806,
+            "after": 16470
+          }
+        },
+        {
+          "detections": 20,
+          "points": 128,
+          "median_ms": {
+            "before": 6.390290332395428,
+            "after": 5.421531333316428
+          },
+          "times_ms": {
+            "before": [
+              6.3370099996973295,
+              7.076719998925303,
+              6.217305999598466,
+              6.034670001099585,
+              6.390290332395428,
+              6.686003666497224,
+              6.9869579989851145
+            ],
+            "after": [
+              5.421531333316428,
+              5.491426666897799,
+              5.352383333956823,
+              5.106893000629498,
+              6.18596533240634,
+              5.270303000240044,
+              6.279933666519355
+            ]
+          },
+          "peak_bytes": {
+            "before": 1067080,
+            "after": 1018904
+          }
+        },
+        {
+          "detections": 64,
+          "points": 512,
+          "median_ms": {
+            "before": 156.35304666648153,
+            "after": 134.90841800012277
+          },
+          "times_ms": {
+            "before": [
+              152.9724559998916,
+              153.09996499975873,
+              169.2330463338294,
+              156.35304666648153,
+              162.11790299954978,
+              157.20492899951446,
+              155.5250696656003
+            ],
+            "after": [
+              137.39960533348494,
+              134.90841800012277,
+              133.4158446661604,
+              136.35836466710316,
+              127.95939100033138,
+              129.46361866731118,
+              154.72888466683798
+            ]
+          },
+          "peak_bytes": {
+            "before": 12047712,
+            "after": 11494704
+          }
+        },
+        {
+          "detections": 64,
+          "points": 0,
+          "median_ms": {
+            "before": 1.345297666072535,
+            "after": 1.4662870004637323
+          },
+          "times_ms": {
+            "before": [
+              1.5717529992495354,
+              1.6218216660490725,
+              1.2571580009534955,
+              1.3093166659624937,
+              1.2666023333925598,
+              1.4941689999735293,
+              1.345297666072535
+            ],
+            "after": [
+              1.4987093333426553,
+              1.3706793336799212,
+              1.4662870004637323,
+              1.569068666867679,
+              1.250925333200333,
+              3.5633696667597783,
+              1.263373999487764
+            ]
+          },
+          "peak_bytes": {
+            "before": 188728,
+            "after": 188728
+          }
+        }
+      ]
+    },
+    {
+      "process_index": 2,
+      "results": [
+        {
+          "detections": 1,
+          "points": 4,
+          "median_ms": {
+            "before": 0.15177266686805524,
+            "after": 0.14282233314588666
+          },
+          "times_ms": {
+            "before": [
+              0.13681633330027884,
+              0.1573110009000326,
+              0.2594216663662034,
+              0.14132666668350188,
+              0.14792000001762062,
+              0.15177266686805524,
+              0.25395333432243206
+            ],
+            "after": [
+              0.18510600057197735,
+              0.14024833338529183,
+              0.13861233310308307,
+              0.14282233314588666,
+              0.13322433248201074,
+              0.16192766634048894,
+              0.21731466767960228
+            ]
+          },
+          "peak_bytes": {
+            "before": 16806,
+            "after": 16470
+          }
+        },
+        {
+          "detections": 20,
+          "points": 128,
+          "median_ms": {
+            "before": 6.990199666082238,
+            "after": 6.804561333410675
+          },
+          "times_ms": {
+            "before": [
+              7.564419999350018,
+              8.717117000439126,
+              7.187374000447259,
+              6.780693332984811,
+              6.4540539994292585,
+              6.990199666082238,
+              6.344795333764826
+            ],
+            "after": [
+              5.994042333137865,
+              7.045376666307372,
+              7.304837999981828,
+              6.92815933264986,
+              5.711573000250307,
+              5.732173999907293,
+              6.804561333410675
+            ]
+          },
+          "peak_bytes": {
+            "before": 1067080,
+            "after": 1018904
+          }
+        },
+        {
+          "detections": 64,
+          "points": 512,
+          "median_ms": {
+            "before": 156.36329033441143,
+            "after": 145.3632003334254
+          },
+          "times_ms": {
+            "before": [
+              166.61023300063485,
+              162.9801629993987,
+              152.12501533339187,
+              156.36329033441143,
+              152.4413459992502,
+              159.60012233335874,
+              142.34280733338286
+            ],
+            "after": [
+              154.63862199976575,
+              159.23331000036947,
+              145.3632003334254,
+              131.64324399986072,
+              134.05251133372076,
+              152.8668653324227,
+              120.91353533348108
+            ]
+          },
+          "peak_bytes": {
+            "before": 12047712,
+            "after": 11494704
+          }
+        },
+        {
+          "detections": 64,
+          "points": 0,
+          "median_ms": {
+            "before": 1.436308333116661,
+            "after": 1.357446000232206
+          },
+          "times_ms": {
+            "before": [
+              1.2775853332035088,
+              1.5235836666154985,
+              1.436308333116661,
+              1.4786756667793572,
+              1.3010776662364758,
+              1.5698936658736784,
+              1.3979973336972762
+            ],
+            "after": [
+              1.3334296660711213,
+              1.2894133336279385,
+              1.357446000232206,
+              1.42901733367277,
+              1.392585666811404,
+              1.2641616667679045,
+              1.8807359992933925
+            ]
+          },
+          "peak_bytes": {
+            "before": 188728,
+            "after": 188728
+          }
+        }
+      ]
+    },
+    {
+      "process_index": 3,
+      "results": [
+        {
+          "detections": 1,
+          "points": 4,
+          "median_ms": {
+            "before": 0.1431996667330774,
+            "after": 0.14109633411862887
+          },
+          "times_ms": {
+            "before": [
+              0.13873266652808525,
+              0.14079266596430293,
+              0.40005066693993285,
+              0.1431996667330774,
+              0.1651760006401067,
+              0.2578893339280815,
+              0.1393336666903148
+            ],
+            "after": [
+              0.13340133227757178,
+              0.1453326670646978,
+              0.12748899947231015,
+              0.17045766677862653,
+              0.14109633411862887,
+              0.13140166629455052,
+              0.15413933336579552
+            ]
+          },
+          "peak_bytes": {
+            "before": 16806,
+            "after": 16470
+          }
+        },
+        {
+          "detections": 20,
+          "points": 128,
+          "median_ms": {
+            "before": 6.696152666942605,
+            "after": 5.5441466671860935
+          },
+          "times_ms": {
+            "before": [
+              6.7822389998279204,
+              6.696152666942605,
+              6.348808000135857,
+              7.085219667108807,
+              7.128506999530752,
+              6.390080667188158,
+              6.054650333680911
+            ],
+            "after": [
+              5.049496665985013,
+              6.318509000266204,
+              5.748598666590017,
+              6.655687999833996,
+              5.5441466671860935,
+              5.145300999477816,
+              5.14780799979538
+            ]
+          },
+          "peak_bytes": {
+            "before": 1067080,
+            "after": 1018904
+          }
+        },
+        {
+          "detections": 64,
+          "points": 512,
+          "median_ms": {
+            "before": 151.34032366646957,
+            "after": 138.7607303331606
+          },
+          "times_ms": {
+            "before": [
+              140.46078566631573,
+              160.48445666577513,
+              151.34032366646957,
+              156.51666266664202,
+              149.75702133354693,
+              153.08489700085678,
+              151.02461833278844
+            ],
+            "after": [
+              126.37180533298913,
+              149.8294426673965,
+              141.6544543329413,
+              139.28379166585123,
+              134.69113833343727,
+              135.00801833409545,
+              138.7607303331606
+            ]
+          },
+          "peak_bytes": {
+            "before": 12047712,
+            "after": 11494704
+          }
+        },
+        {
+          "detections": 64,
+          "points": 0,
+          "median_ms": {
+            "before": 1.4122856664471328,
+            "after": 1.5209729996665071
+          },
+          "times_ms": {
+            "before": [
+              1.6085283338422112,
+              1.6189639997416332,
+              1.408623333797247,
+              1.6197786668878205,
+              1.390375667445672,
+              1.3130356661955982,
+              1.4122856664471328
+            ],
+            "after": [
+              2.1519119994385014,
+              1.5209729996665071,
+              1.3701150007060885,
+              1.4550666661913663,
+              1.5373373328960345,
+              1.7956343326659407,
+              1.3805876660626382
+            ]
+          },
+          "peak_bytes": {
+            "before": 188728,
+            "after": 188728
+          }
+        }
+      ]
+    }
+  ]
+}

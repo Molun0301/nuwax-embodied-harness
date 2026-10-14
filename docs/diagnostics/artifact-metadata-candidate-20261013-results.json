@@ -1,0 +1,241 @@
+{
+  "python": "3.8.10 (default, Oct 13 2026, 08:57:26) \n[GCC 14.2.0]",
+  "scope": "Unmodified production methods; synthetic temporary artifacts; warm OS page cache; shared host. Raw response construction excludes file transfer.",
+  "candidate_is_test_only": true,
+  "rows": [
+    {
+      "artifact_count": 100,
+      "payload_bytes_each": 7,
+      "paths": {
+        "metadata_only": {
+          "cold": {
+            "samples_ms": [
+              0.345612
+            ],
+            "median_ms": 0.345612
+          },
+          "warm": {
+            "samples_ms": [
+              0.143437,
+              0.142515,
+              0.109886,
+              0.098158,
+              0.096576,
+              0.097277,
+              0.095595
+            ],
+            "median_ms": 0.098158
+          },
+          "warm_scandir_calls": 2,
+          "warm_directory_entries_visited": 201,
+          "warm_sidecars_parsed": 0,
+          "payload_path_cached": false
+        },
+        "raw_response_construction": {
+          "cold": {
+            "samples_ms": [
+              0.593687
+            ],
+            "median_ms": 0.593687
+          },
+          "warm": {
+            "samples_ms": [
+              0.09952,
+              0.122525,
+              0.084437,
+              0.081363,
+              0.07918,
+              0.078589,
+              0.076776
+            ],
+            "median_ms": 0.081363
+          },
+          "warm_scandir_calls": 0,
+          "warm_directory_entries_visited": 0,
+          "warm_sidecars_parsed": 0,
+          "payload_path_cached": true
+        },
+        "metadata_only_candidate": {
+          "cold": {
+            "samples_ms": [
+              0.298551
+            ],
+            "median_ms": 0.298551
+          },
+          "warm": {
+            "samples_ms": [
+              0.040451,
+              0.032669,
+              0.030316,
+              0.030226,
+              0.028804,
+              0.028684,
+              0.028633
+            ],
+            "median_ms": 0.030226
+          },
+          "warm_scandir_calls": 0,
+          "warm_directory_entries_visited": 0,
+          "warm_sidecars_parsed": 0,
+          "payload_path_cached": true
+        }
+      }
+    },
+    {
+      "artifact_count": 1000,
+      "payload_bytes_each": 7,
+      "paths": {
+        "metadata_only": {
+          "cold": {
+            "samples_ms": [
+              1.5373
+            ],
+            "median_ms": 1.5373
+          },
+          "warm": {
+            "samples_ms": [
+              1.255225,
+              1.110366,
+              0.891916,
+              0.901971,
+              0.856233,
+              0.851316,
+              0.860329
+            ],
+            "median_ms": 0.891916
+          },
+          "warm_scandir_calls": 2,
+          "warm_directory_entries_visited": 2001,
+          "warm_sidecars_parsed": 0,
+          "payload_path_cached": false
+        },
+        "raw_response_construction": {
+          "cold": {
+            "samples_ms": [
+              2.847238
+            ],
+            "median_ms": 2.847238
+          },
+          "warm": {
+            "samples_ms": [
+              0.150858,
+              0.090106,
+              0.367264,
+              0.17835,
+              0.101583,
+              0.087342,
+              0.128184
+            ],
+            "median_ms": 0.128184
+          },
+          "warm_scandir_calls": 0,
+          "warm_directory_entries_visited": 0,
+          "warm_sidecars_parsed": 0,
+          "payload_path_cached": true
+        },
+        "metadata_only_candidate": {
+          "cold": {
+            "samples_ms": [
+              1.442938
+            ],
+            "median_ms": 1.442938
+          },
+          "warm": {
+            "samples_ms": [
+              0.050737,
+              0.033881,
+              0.030656,
+              0.029284,
+              0.029114,
+              0.028813,
+              0.029084
+            ],
+            "median_ms": 0.029284
+          },
+          "warm_scandir_calls": 0,
+          "warm_directory_entries_visited": 0,
+          "warm_sidecars_parsed": 0,
+          "payload_path_cached": true
+        }
+      }
+    },
+    {
+      "artifact_count": 10000,
+      "payload_bytes_each": 7,
+      "paths": {
+        "metadata_only": {
+          "cold": {
+            "samples_ms": [
+              13.870369
+            ],
+            "median_ms": 13.870369
+          },
+          "warm": {
+            "samples_ms": [
+              14.280508,
+              12.939614,
+              13.074137,
+              12.872292,
+              12.055319,
+              13.01618,
+              12.103501
+            ],
+            "median_ms": 12.939614
+          },
+          "warm_scandir_calls": 2,
+          "warm_directory_entries_visited": 20001,
+          "warm_sidecars_parsed": 0,
+          "payload_path_cached": false
+        },
+        "raw_response_construction": {
+          "cold": {
+            "samples_ms": [
+              23.949775
+            ],
+            "median_ms": 23.949775
+          },
+          "warm": {
+            "samples_ms": [
+              0.114433,
+              0.089094,
+              0.109986,
+              0.081613,
+              0.079119,
+              0.077126,
+              0.077827
+            ],
+            "median_ms": 0.081613
+          },
+          "warm_scandir_calls": 0,
+          "warm_directory_entries_visited": 0,
+          "warm_sidecars_parsed": 0,
+          "payload_path_cached": true
+        },
+        "metadata_only_candidate": {
+          "cold": {
+            "samples_ms": [
+              25.147612
+            ],
+            "median_ms": 25.147612
+          },
+          "warm": {
+            "samples_ms": [
+              0.164969,
+              0.043326,
+              0.036035,
+              0.032599,
+              0.030115,
+              0.029134,
+              0.029244
+            ],
+            "median_ms": 0.032599
+          },
+          "warm_scandir_calls": 0,
+          "warm_directory_entries_visited": 0,
+          "warm_sidecars_parsed": 0,
+          "payload_path_cached": true
+        }
+      }
+    }
+  ]
+}

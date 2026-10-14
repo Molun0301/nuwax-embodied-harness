@@ -1,0 +1,36 @@
+[package]
+name = "nuwax-nav-test-fixtures"
+version = "0.1.0"
+description = "导航板块共享测试夹具(JSON fixture + mock native binary 工具脚本)"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "mock-native"
+path = "src/bin/mock_native.rs"
+
+[dependencies]
+nuwax-nav-types-messages = { path = "../nuwax-nav-types-messages" }
+nuwax-nav-base = { path = "../nuwax-nav-base" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# mock_native binary 需要 `libc::signal` 来忽略 SIGTERM（见 integration_mock.rs::stop_kills_long_sleeping_child）
+libc = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+# 4 个 bridge crate 作为 dev-dependencies,目的是把"启动 mock-native binary 的
+# lifecycle / failed_exit 集成测试"迁移到本 crate 自身的 tests/ 目录 —
+# 这样 cargo test 编译本 crate 的 [[bin]] mock-native 时会同时构建产物,并通过
+# env!("CARGO_BIN_EXE_mock-native") 注入精确路径,使 bridge lifecycle 集成测试
+# 在任意 CARGO_TARGET_DIR 下都能直接跑通(无需先 cargo build -p ... --bin mock-native)。
+# Bridge crate 的 dev-deps 仍然引用本 crate,形成 dev-dep 互相依赖 —
+# 这是 cargo 允许的模式(dev-deps 不会传递,仅在当前包直接构建时生效)。
+nuwax-nav-far-planner-bridge = { path = "../nuwax-nav-far-planner-bridge" }
+nuwax-nav-local-planner-bridge = { path = "../nuwax-nav-local-planner-bridge" }
+nuwax-nav-path-follower-bridge = { path = "../nuwax-nav-path-follower-bridge" }
+nuwax-nav-pgo-bridge = { path = "../nuwax-nav-pgo-bridge" }
+nuwax-nav-native-runner = { path = "../nuwax-nav-native-runner" }
+tokio = { workspace = true }

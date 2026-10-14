@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from compat import StrEnum
+from contracts.compat import StrEnum
 import threading
 from typing import Dict, Optional, Tuple, Any
 
@@ -72,7 +72,29 @@ class StateStore:
             latest = self._latest_by_namespace[namespace]
             if latest is None or entry.updated_at >= latest.updated_at:
                 self._latest_by_namespace[namespace] = entry
+            elif latest.key == key:
+                # Replacing the cached entry with an older timestamp invalidates
+                # that entry. Scan only this exceptional path; prefer the new
+                # write on an equal timestamp, as on the normal path above.
+                self._latest_by_namespace[namespace] = max(
+                    self._store[namespace].values(),
+                    key=lambda candidate: (candidate.updated_at, candidate is entry),
+                )
         return entry
+
+    def discard_if_value(self, namespace: StateNamespace, key: str, expected_value: Any) -> bool:
+        """仅撤销已被后继拥有方取代的原对象；不递归触发 write 扩展回调。"""
+        with self._locks[namespace]:
+            current = self._store[namespace].get(key)
+            if current is None or current.value is not expected_value:
+                return False
+            remaining = dict(self._store[namespace])
+            del remaining[key]
+            self._store[namespace] = remaining
+            if self._latest_by_namespace[namespace] is current:
+                self._latest_by_namespace[namespace] = max(
+                    remaining.values(), key=lambda entry: entry.updated_at, default=None)
+            return True
 
     def write_from_provider(
         self,

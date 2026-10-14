@@ -1,0 +1,20 @@
+{
+  "repository": "https://github.com/SteveMacenski/slam_toolbox",
+  "commit": "6953058b8994c7e750277fd8f39b984453abf63c",
+  "tag": "2.10.0",
+  "unmodified_files_sha256": {
+    "LICENSE.karto": "da7eabb7bafdf7d3ae5e9f223aa5bdc1eece45ac569dc21b3b037520b4464768",
+    "AUTHORS.karto": "0c7d16a4d44266cb635c7ae7b80cc9d2f487061ae668404bf278e2e8a4398014",
+    "LICENSE.slam_toolbox": "20c17d8b8c48a600800dfd14f95d5cb9ff47066a9641ddeab48dc54aec96e331",
+    "upstream/solvers/ceres_utils.h": "ed56f5d2a9843b3029ed85fa46db44de024e3c2a16036774a3c4dc73d0fde08a",
+    "upstream/karto/src/Karto.cpp": "8bce628575e23279d7771e69cb382b3f3e1cdcf2a02198c7d60807fa71c5657d",
+    "upstream/karto/src/Mapper.cpp": "0e274f891e8e724b824c80f14aeb40c18879dfe4a79613068d7b02d88e6344aa",
+    "upstream/karto/include/karto_sdk/Macros.h": "a3c9276c53b633989d2f84621eabcfd6c31cceebfdbcf7dc4bc78ad963d7d9a1",
+    "upstream/karto/include/karto_sdk/Karto.h": "0bdd7ea5181c233b8caa60d87dd41e2aefdc51d81a1fe52ee334792fc966caec",
+    "upstream/karto/include/karto_sdk/nanoflann_adaptors.h": "91085bd7e3a47f9a4674a1e4f89d7b6ebcc0779d4b231266cd653f181f9c5200",
+    "upstream/karto/include/karto_sdk/Math.h": "16c2fe87fe999c50b9470f0a1c39647e83cf258006f42eb016a7715e35005eea",
+    "upstream/karto/include/karto_sdk/Mapper.h": "0d2fce322150eeaf374f26e3021dd0b11c68fc6e525c85d9a9f5bb2e6b3e41e5",
+    "upstream/karto/include/karto_sdk/nanoflann.hpp": "b720aef9c469da0f281f01fff65f57f3c4ac80b828dfff0947d2d2f16324249f",
+    "upstream/karto/include/karto_sdk/Types.h": "3c35323ffb4fc170218649a7f85c062ed6ab7912b4e644a8721937be143fc391"
+  }
+}

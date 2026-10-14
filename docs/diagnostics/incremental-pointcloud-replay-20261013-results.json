@@ -1,0 +1,21 @@
+{
+  "seed": "0x19a742d",
+  "acceptedTransactions": 230,
+  "expectedResyncs": 24,
+  "reconnects": 12,
+  "maxPoints": 36878,
+  "maxPages": 37,
+  "maxSlabs": 3,
+  "maxPendingBytes": 393216,
+  "maxPendingChunks": 32,
+  "copiedCoordinates": 3322224,
+  "scannedCoordinates": 3483399,
+  "scheduledUploadBytes": 21020052,
+  "maxAllocatedSourceBytes": 589824,
+  "geometryCreated": 97,
+  "geometryDisposed": 97,
+  "retainedSourceSlabsAfterDispose": 0,
+  "scope": "Deterministic CPU protocol and source-page storage properties; no browser/GPU timing or heap/GC proof",
+  "command": "node scripts/check_incremental_pointcloud_replay.mjs",
+  "exitCode": 0
+}

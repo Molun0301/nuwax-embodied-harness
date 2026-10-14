@@ -1,0 +1,977 @@
+{
+  "local_base": "2bf54cc108a63dfa728a486fefd4de8ce8331620",
+  "base_tree": "1fabe2eac417c4fecde21552148f22b2b93dbe72",
+  "mapped_remote_base": "410290dbc45c20db10bf2782556b555a0175bcc4",
+  "source_review": "Shared private parser preserves exact validation and error precedence; cache reuse and benchmark unchanged. Independent source/result audit recommends retaining with narrow warmcomponent scope.",
+  "qualification_first_run": {
+    "identity": {
+      "local_base_commit": "2bf54cc108a63dfa728a486fefd4de8ce8331620",
+      "is_uncommitted_candidate": true,
+      "source_before_build": "e70a4dc7cf467816b75a1f78caab0371951034749c75bc0c8a000ca675465adb  crates/nuwax-codec/src/lcm/schema.rs\n074ccc3910fed71e0aeea3c1da56e6db1f2eb613b7b6c24c1dbd8aa2f66b5b64  crates/nuwax-map-chunks/src/lib.rs\n6342318d7a358e5147c16c4f9651702eaca6f3f1eaa0158fb197414d0f3ece91  crates/nuwax-map-chunks/src/tests.rs\n",
+      "base_tree": "1fabe2eac417c4fecde21552148f22b2b93dbe72",
+      "remote_commit": "410290dbc45c20db10bf2782556b555a0175bcc4",
+      "profile": "ordinary test opt0 for codec/map-chunks; debug0; no profiling feature; MLS/runtime opt3 configuration is not involved in timed crates",
+      "binaries": {
+        "nuwax_map_chunks": {
+          "path": "/workspace/shared/neh-codec-validation-20261006/candidate/binaries/nuwax_map_chunks",
+          "cargo_path": "/workspace/shared/neh-native-20261006/cargo-target/debug/deps/nuwax_map_chunks-1836e1a543cf6c09",
+          "sha256": "37ea9f297d9718f800f2a6da589b6dc0a261b737388e5995b4a4d567a4da9cbd",
+          "bytes": 5333112,
+          "listed_tests": 47,
+          "features": [],
+          "profile": {
+            "opt_level": "0",
+            "debuginfo": 0,
+            "debug_assertions": true,
+            "overflow_checks": true,
+            "test": true
+          }
+        },
+        "nuwax_codec": {
+          "path": "/workspace/shared/neh-codec-validation-20261006/candidate/binaries/nuwax_codec",
+          "cargo_path": "/workspace/shared/neh-native-20261006/cargo-target/debug/deps/nuwax_codec-44d8407f0cbd5fbf",
+          "sha256": "bf4b61cfee05d690bb37cccd6e9648a6fc9e6b8bf650395ce3d318217c93b758",
+          "bytes": 4578288,
+          "listed_tests": 102,
+          "features": [],
+          "profile": {
+            "opt_level": "0",
+            "debuginfo": 0,
+            "debug_assertions": true,
+            "overflow_checks": true,
+            "test": true
+          }
+        }
+      }
+    },
+    "results": [
+      {
+        "label": "frozen-parser-corpus",
+        "package": "nuwax_map_chunks",
+        "selector": "tests::block_summary_",
+        "selected_names": [
+          "tests::block_summary_matches_frozen_header_count_and_error_precedence",
+          "tests::block_summary_matches_frozen_maximum_valid_block",
+          "tests::block_summary_matches_frozen_record_corpus"
+        ],
+        "command": [
+          "/workspace/shared/neh-codec-validation-20261006/candidate/binaries/nuwax_map_chunks",
+          "tests::block_summary_",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "started_at_utc": "2026-10-06T18:29:17.933349+00:00",
+        "wall_seconds": 0.15221104500233196,
+        "exit_code": 0,
+        "timed_out": false,
+        "process_user_cpu_seconds": 0.096895,
+        "process_system_cpu_seconds": 0.017769999999999998,
+        "process_peak_rss_kib": 16180,
+        "voluntary_context_switches": 7,
+        "involuntary_context_switches": 13,
+        "summary": {
+          "status": "ok",
+          "passed": 3,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 44
+        },
+        "log": "/workspace/shared/neh-codec-validation-20261006/candidate/frozen-parser-corpus.log"
+      },
+      {
+        "label": "block-roundtrip",
+        "package": "nuwax_map_chunks",
+        "selector": "tests::block_roundtrip_negative_coordinates_and_evidence",
+        "selected_names": [
+          "tests::block_roundtrip_negative_coordinates_and_evidence"
+        ],
+        "command": [
+          "/workspace/shared/neh-codec-validation-20261006/candidate/binaries/nuwax_map_chunks",
+          "tests::block_roundtrip_negative_coordinates_and_evidence",
+          "--nocapture",
+          "--test-threads=1",
+          "--exact"
+        ],
+        "started_at_utc": "2026-10-06T18:29:18.087349+00:00",
+        "wall_seconds": 0.05194987799768569,
+        "exit_code": 0,
+        "timed_out": false,
+        "process_user_cpu_seconds": 0.0,
+        "process_system_cpu_seconds": 0.003186,
+        "process_peak_rss_kib": 16180,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 0,
+        "summary": {
+          "status": "ok",
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 46
+        },
+        "log": "/workspace/shared/neh-codec-validation-20261006/candidate/block-roundtrip.log"
+      },
+      {
+        "label": "archive-malformed",
+        "package": "nuwax_map_chunks",
+        "selector": "tests::both_archive_versions_reject_truncation_trailing_counts_and_evidence",
+        "selected_names": [
+          "tests::both_archive_versions_reject_truncation_trailing_counts_and_evidence"
+        ],
+        "command": [
+          "/workspace/shared/neh-codec-validation-20261006/candidate/binaries/nuwax_map_chunks",
+          "tests::both_archive_versions_reject_truncation_trailing_counts_and_evidence",
+          "--nocapture",
+          "--test-threads=1",
+          "--exact"
+        ],
+        "started_at_utc": "2026-10-06T18:29:18.140122+00:00",
+        "wall_seconds": 0.05094460500549758,
+        "exit_code": 0,
+        "timed_out": false,
+        "process_user_cpu_seconds": 0.0,
+        "process_system_cpu_seconds": 0.00247,
+        "process_peak_rss_kib": 16180,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 0,
+        "summary": {
+          "status": "ok",
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 46
+        },
+        "log": "/workspace/shared/neh-codec-validation-20261006/candidate/archive-malformed.log"
+      },
+      {
+        "label": "archive-conflict",
+        "package": "nuwax_map_chunks",
+        "selector": "tests::both_archive_versions_reject_shared_id_different_same_length_bytes",
+        "selected_names": [
+          "tests::both_archive_versions_reject_shared_id_different_same_length_bytes"
+        ],
+        "command": [
+          "/workspace/shared/neh-codec-validation-20261006/candidate/binaries/nuwax_map_chunks",
+          "tests::both_archive_versions_reject_shared_id_different_same_length_bytes",
+          "--nocapture",
+          "--test-threads=1",
+          "--exact"
+        ],
+        "started_at_utc": "2026-10-06T18:29:18.192311+00:00",
+        "wall_seconds": 0.06117554999946151,
+        "exit_code": 0,
+        "timed_out": false,
+        "process_user_cpu_seconds": 0.0012879999999999999,
+        "process_system_cpu_seconds": 0.008893,
+        "process_peak_rss_kib": 16180,
+        "voluntary_context_switches": 2,
+        "involuntary_context_switches": 22,
+        "summary": {
+          "status": "ok",
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 46
+        },
+        "log": "/workspace/shared/neh-codec-validation-20261006/candidate/archive-conflict.log"
+      },
+      {
+        "label": "archive-v2-binding",
+        "package": "nuwax_map_chunks",
+        "selector": "tests::archive_ar2_stream_roundtrip_and_exact_reference_binding",
+        "selected_names": [
+          "tests::archive_ar2_stream_roundtrip_and_exact_reference_binding"
+        ],
+        "command": [
+          "/workspace/shared/neh-codec-validation-20261006/candidate/binaries/nuwax_map_chunks",
+          "tests::archive_ar2_stream_roundtrip_and_exact_reference_binding",
+          "--nocapture",
+          "--test-threads=1",
+          "--exact"
+        ],
+        "started_at_utc": "2026-10-06T18:29:18.259104+00:00",
+        "wall_seconds": 0.05089862699969672,
+        "exit_code": 0,
+        "timed_out": false,
+        "process_user_cpu_seconds": 0.003463,
+        "process_system_cpu_seconds": 0.0,
+        "process_peak_rss_kib": 16180,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 1,
+        "summary": {
+          "status": "ok",
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 46
+        },
+        "log": "/workspace/shared/neh-codec-validation-20261006/candidate/archive-v2-binding.log"
+      },
+      {
+        "label": "archive-legacy-alias",
+        "package": "nuwax_map_chunks",
+        "selector": "tests::archive_ar1_preserves_literal_json_and_opaque_aliases",
+        "selected_names": [
+          "tests::archive_ar1_preserves_literal_json_and_opaque_aliases"
+        ],
+        "command": [
+          "/workspace/shared/neh-codec-validation-20261006/candidate/binaries/nuwax_map_chunks",
+          "tests::archive_ar1_preserves_literal_json_and_opaque_aliases",
+          "--nocapture",
+          "--test-threads=1",
+          "--exact"
+        ],
+        "started_at_utc": "2026-10-06T18:29:18.311128+00:00",
+        "wall_seconds": 0.05089524700451875,
+        "exit_code": 0,
+        "timed_out": false,
+        "process_user_cpu_seconds": 0.005469,
+        "process_system_cpu_seconds": 0.0,
+        "process_peak_rss_kib": 16180,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 0,
+        "summary": {
+          "status": "ok",
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 46
+        },
+        "log": "/workspace/shared/neh-codec-validation-20261006/candidate/archive-legacy-alias.log"
+      },
+      {
+        "label": "navigation-map-codec",
+        "package": "nuwax_codec",
+        "selector": "lcm::schema::navigation_map_3d_tests::",
+        "selected_names": [
+          "lcm::schema::navigation_map_3d_tests::c1_object_tags_reject_mixed_zero_unknown_and_truncated_identities",
+          "lcm::schema::navigation_map_3d_tests::c1_wire_rejects_old_version_duplicate_inclusions_and_hidden_fine_data",
+          "lcm::schema::navigation_map_3d_tests::clear_is_explicit_absence_and_partial_occupancy_receipts_are_rejected",
+          "lcm::schema::navigation_map_3d_tests::composite_receipt_keeps_retained_cloud_time_and_current_mask_time_distinct",
+          "lcm::schema::navigation_map_3d_tests::fine_block_summary_preserves_bounds_and_full_parse_error_precedence",
+          "lcm::schema::navigation_map_3d_tests::fine_inclusion_budgets_precede_membership_and_body_errors",
+          "lcm::schema::navigation_map_3d_tests::fine_root_round_trip_and_commit_binding_rejects_mixed_source",
+          "lcm::schema::navigation_map_3d_tests::float64_big_endian_and_padded_rows_are_supported",
+          "lcm::schema::navigation_map_3d_tests::fresh_generated_c_and_python_interoperate_with_rust_and_committed_bindings",
+          "lcm::schema::navigation_map_3d_tests::invalid_identities_and_cloud_headers_are_rejected",
+          "lcm::schema::navigation_map_3d_tests::invalid_layout_and_nonfinite_coordinates_are_rejected",
+          "lcm::schema::navigation_map_3d_tests::live_and_clear_round_trip_and_protocol_fingerprint",
+          "lcm::schema::navigation_map_3d_tests::truncated_trailing_and_invalid_clear_flag_wires_are_rejected",
+          "lcm::schema::navigation_map_3d_tests::virtual_obstacles_round_trip_and_reject_mismatched_or_unsafe_masks",
+          "lcm::schema::navigation_map_3d_tests::warmed_fine_map_codec_baseline"
+        ],
+        "command": [
+          "/workspace/shared/neh-codec-validation-20261006/candidate/binaries/nuwax_codec",
+          "lcm::schema::navigation_map_3d_tests::",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "started_at_utc": "2026-10-06T18:29:18.363986+00:00",
+        "wall_seconds": 0.5569924049996189,
+        "exit_code": 101,
+        "timed_out": false,
+        "process_user_cpu_seconds": 0.344616,
+        "process_system_cpu_seconds": 0.191167,
+        "process_peak_rss_kib": 16180,
+        "voluntary_context_switches": 98,
+        "involuntary_context_switches": 21,
+        "summary": {
+          "status": "FAILED",
+          "passed": 13,
+          "failed": 1,
+          "ignored": 1,
+          "measured": 0,
+          "filtered_out": 87
+        },
+        "log": "/workspace/shared/neh-codec-validation-20261006/candidate/navigation-map-codec.log"
+      }
+    ]
+  },
+  "interop_retry": {
+    "command_script": "candidate/interop-retry.sh",
+    "exit_code": 0,
+    "log": "\nrunning 1 test\ntest lcm::schema::navigation_map_3d_tests::fresh_generated_c_and_python_interoperate_with_rust_and_committed_bindings ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 101 filtered out; finished in 3.53s\n\n",
+    "environment": "C_INCLUDE_PATH=/workspace/scratch/71cdb9d17732/nuwax-embodied-harness/.nuwax-test-env/lib/python3.12/site-packages/include\nLIBRARY_PATH=/workspace/scratch/71cdb9d17732/nuwax-embodied-harness/.nuwax-test-env/lib/python3.12/site-packages/lib:/workspace/shared/neh-native-20261006/sdk/lib:/workspace/shared/neh-native-20261006/sdk/libjpeg-package/opt/libjpeg-turbo/lib64\n",
+    "note": "First C/Python interop failed because existing cc invocation lacked installed LCM header/library paths; exact retry passed with scoped environment and no source/SDK change."
+  },
+  "unique_qualified_tests": 22,
+  "new_tests": 5,
+  "matched": {
+    "scope": "Seven alternating fresh-process pairs, eachstage8warmups128operations; ordinarytestopt0, warmcodec only, no transport or allocation-free wholepipeline claim; direct4-blockmaterialization regressionguard",
+    "identities": {
+      "baseline": {
+        "path": "/workspace/shared/neh-codec-validation-20261006/baseline/nuwax-codec-test",
+        "cargo_path": "/workspace/shared/neh-native-20261006/cargo-target/debug/deps/nuwax_codec-44d8407f0cbd5fbf",
+        "sha256": "aa630ace6439853924c8013adf74980654378c5f5beef974cc7229dcbcb487cc",
+        "bytes": 4482448,
+        "features": [],
+        "profile": {
+          "opt_level": "0",
+          "debuginfo": 0,
+          "debug_assertions": true,
+          "overflow_checks": true,
+          "test": true
+        },
+        "source_hashes": "5eaf1916664049c96d8cf3545fea55807948c40099c184f9966656e76ce65cc9  crates/nuwax-codec/src/lcm/schema.rs\n2e08aaf4cbd10dba820eddabce7d86769e41d8527cf457d5d6dac91708d8cb17  crates/nuwax-map-chunks/src/lib.rs\nb2705f0cf16675e2829f28685174478c000657355314c74786ba4d629c369c54  crates/nuwax-map-chunks/src/tests.rs\n",
+        "scope": "codec baseline, ordinarytestopt0/debug0; MLS/runtime opt3 config not involved in timed code; warm component throughput only"
+      },
+      "candidate": {
+        "path": "/workspace/shared/neh-codec-validation-20261006/candidate/nuwax-codec-test",
+        "cargo_path": "/workspace/shared/neh-native-20261006/cargo-target/debug/deps/nuwax_codec-44d8407f0cbd5fbf",
+        "sha256": "bf4b61cfee05d690bb37cccd6e9648a6fc9e6b8bf650395ce3d318217c93b758",
+        "bytes": 4578288,
+        "features": [],
+        "profile": {
+          "opt_level": "0",
+          "debuginfo": 0,
+          "debug_assertions": true,
+          "overflow_checks": true,
+          "test": true
+        },
+        "source_hashes": "e70a4dc7cf467816b75a1f78caab0371951034749c75bc0c8a000ca675465adb  crates/nuwax-codec/src/lcm/schema.rs\n074ccc3910fed71e0aeea3c1da56e6db1f2eb613b7b6c24c1dbd8aa2f66b5b64  crates/nuwax-map-chunks/src/lib.rs\n6342318d7a358e5147c16c4f9651702eaca6f3f1eaa0158fb197414d0f3ece91  crates/nuwax-map-chunks/src/tests.rs\n",
+        "scope": "codec candidate, ordinarytestopt0/debug0; MLS/runtime opt3 config not involved in timed code; warm component throughput only"
+      }
+    },
+    "wire_equal": true,
+    "wire_bytes": 50574,
+    "records": [
+      {
+        "pair": 1,
+        "kind": "baseline",
+        "command": [
+          "/workspace/shared/neh-codec-validation-20261006/baseline/nuwax-codec-test",
+          "lcm::schema::navigation_map_3d_tests::warmed_fine_map_codec_baseline",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "log": "/workspace/shared/neh-codec-validation-20261006/matched/01-baseline.log",
+        "exit_code": 0,
+        "signature": {
+          "warmups": "8",
+          "iterations": "128",
+          "stages": "4",
+          "debug_assertions": "true",
+          "blocks": "4",
+          "unique_objects": "4",
+          "included_blocks": "4",
+          "points": "4096",
+          "included_bytes": "49216",
+          "wire_bytes": "50574",
+          "direct_decode_blocks_per_iteration": "4"
+        },
+        "ms_per_operation": {
+          "validate": 3.94233178125,
+          "encode": 4.0756012265625,
+          "decode": 4.668106,
+          "direct_decode_4blocks": 8.588926921875
+        },
+        "process_wall_s": 2.9027026149997255,
+        "user_cpu_s": 2.86029,
+        "system_cpu_s": 0.011321999999999999,
+        "launch_peak_rss_kib": 16960,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 78
+      },
+      {
+        "pair": 1,
+        "kind": "candidate",
+        "command": [
+          "/workspace/shared/neh-codec-validation-20261006/candidate/nuwax-codec-test",
+          "lcm::schema::navigation_map_3d_tests::warmed_fine_map_codec_baseline",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "log": "/workspace/shared/neh-codec-validation-20261006/matched/01-candidate.log",
+        "exit_code": 0,
+        "signature": {
+          "warmups": "8",
+          "iterations": "128",
+          "stages": "4",
+          "debug_assertions": "true",
+          "blocks": "4",
+          "unique_objects": "4",
+          "included_blocks": "4",
+          "points": "4096",
+          "included_bytes": "49216",
+          "wire_bytes": "50574",
+          "direct_decode_blocks_per_iteration": "4"
+        },
+        "ms_per_operation": {
+          "validate": 4.420294453125,
+          "encode": 1.7804118359375,
+          "decode": 2.113094171875,
+          "direct_decode_4blocks": 8.962153625
+        },
+        "process_wall_s": 2.4118456970027182,
+        "user_cpu_s": 2.392782,
+        "system_cpu_s": 0.012424,
+        "launch_peak_rss_kib": 16960,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 10
+      },
+      {
+        "pair": 2,
+        "kind": "candidate",
+        "command": [
+          "/workspace/shared/neh-codec-validation-20261006/candidate/nuwax-codec-test",
+          "lcm::schema::navigation_map_3d_tests::warmed_fine_map_codec_baseline",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "log": "/workspace/shared/neh-codec-validation-20261006/matched/02-candidate.log",
+        "exit_code": 0,
+        "signature": {
+          "warmups": "8",
+          "iterations": "128",
+          "stages": "4",
+          "debug_assertions": "true",
+          "blocks": "4",
+          "unique_objects": "4",
+          "included_blocks": "4",
+          "points": "4096",
+          "included_bytes": "49216",
+          "wire_bytes": "50574",
+          "direct_decode_blocks_per_iteration": "4"
+        },
+        "ms_per_operation": {
+          "validate": 0.9352175234375,
+          "encode": 1.12474634375,
+          "decode": 1.2950558203125,
+          "direct_decode_4blocks": 4.272487484375
+        },
+        "process_wall_s": 1.0745623740003794,
+        "user_cpu_s": 1.047993,
+        "system_cpu_s": 0.008646,
+        "launch_peak_rss_kib": 16960,
+        "voluntary_context_switches": 2,
+        "involuntary_context_switches": 58
+      },
+      {
+        "pair": 2,
+        "kind": "baseline",
+        "command": [
+          "/workspace/shared/neh-codec-validation-20261006/baseline/nuwax-codec-test",
+          "lcm::schema::navigation_map_3d_tests::warmed_fine_map_codec_baseline",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "log": "/workspace/shared/neh-codec-validation-20261006/matched/02-baseline.log",
+        "exit_code": 0,
+        "signature": {
+          "warmups": "8",
+          "iterations": "128",
+          "stages": "4",
+          "debug_assertions": "true",
+          "blocks": "4",
+          "unique_objects": "4",
+          "included_blocks": "4",
+          "points": "4096",
+          "included_bytes": "49216",
+          "wire_bytes": "50574",
+          "direct_decode_blocks_per_iteration": "4"
+        },
+        "ms_per_operation": {
+          "validate": 4.0554299375,
+          "encode": 4.7552191796875,
+          "decode": 4.5947986796875,
+          "direct_decode_4blocks": 4.47626084375
+        },
+        "process_wall_s": 2.500029203001759,
+        "user_cpu_s": 2.45164,
+        "system_cpu_s": 0.024364,
+        "launch_peak_rss_kib": 16960,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 80
+      },
+      {
+        "pair": 3,
+        "kind": "baseline",
+        "command": [
+          "/workspace/shared/neh-codec-validation-20261006/baseline/nuwax-codec-test",
+          "lcm::schema::navigation_map_3d_tests::warmed_fine_map_codec_baseline",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "log": "/workspace/shared/neh-codec-validation-20261006/matched/03-baseline.log",
+        "exit_code": 0,
+        "signature": {
+          "warmups": "8",
+          "iterations": "128",
+          "stages": "4",
+          "debug_assertions": "true",
+          "blocks": "4",
+          "unique_objects": "4",
+          "included_blocks": "4",
+          "points": "4096",
+          "included_bytes": "49216",
+          "wire_bytes": "50574",
+          "direct_decode_blocks_per_iteration": "4"
+        },
+        "ms_per_operation": {
+          "validate": 4.723544453125,
+          "encode": 7.0875753671875,
+          "decode": 5.3116036015625,
+          "direct_decode_4blocks": 9.208855421875
+        },
+        "process_wall_s": 3.7332504099977086,
+        "user_cpu_s": 3.688764,
+        "system_cpu_s": 0.026914999999999998,
+        "launch_peak_rss_kib": 16960,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 56
+      },
+      {
+        "pair": 3,
+        "kind": "candidate",
+        "command": [
+          "/workspace/shared/neh-codec-validation-20261006/candidate/nuwax-codec-test",
+          "lcm::schema::navigation_map_3d_tests::warmed_fine_map_codec_baseline",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "log": "/workspace/shared/neh-codec-validation-20261006/matched/03-candidate.log",
+        "exit_code": 0,
+        "signature": {
+          "warmups": "8",
+          "iterations": "128",
+          "stages": "4",
+          "debug_assertions": "true",
+          "blocks": "4",
+          "unique_objects": "4",
+          "included_blocks": "4",
+          "points": "4096",
+          "included_bytes": "49216",
+          "wire_bytes": "50574",
+          "direct_decode_blocks_per_iteration": "4"
+        },
+        "ms_per_operation": {
+          "validate": 2.3619979609375,
+          "encode": 1.2806157265625,
+          "decode": 1.1510961015625,
+          "direct_decode_4blocks": 4.3982029609375
+        },
+        "process_wall_s": 1.2948743619999732,
+        "user_cpu_s": 1.257577,
+        "system_cpu_s": 0.026261,
+        "launch_peak_rss_kib": 16960,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 34
+      },
+      {
+        "pair": 4,
+        "kind": "candidate",
+        "command": [
+          "/workspace/shared/neh-codec-validation-20261006/candidate/nuwax-codec-test",
+          "lcm::schema::navigation_map_3d_tests::warmed_fine_map_codec_baseline",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "log": "/workspace/shared/neh-codec-validation-20261006/matched/04-candidate.log",
+        "exit_code": 0,
+        "signature": {
+          "warmups": "8",
+          "iterations": "128",
+          "stages": "4",
+          "debug_assertions": "true",
+          "blocks": "4",
+          "unique_objects": "4",
+          "included_blocks": "4",
+          "points": "4096",
+          "included_bytes": "49216",
+          "wire_bytes": "50574",
+          "direct_decode_blocks_per_iteration": "4"
+        },
+        "ms_per_operation": {
+          "validate": 1.0702531796875,
+          "encode": 0.8933889296875,
+          "decode": 0.981643140625,
+          "direct_decode_4blocks": 3.7242206640625
+        },
+        "process_wall_s": 0.9404647449991899,
+        "user_cpu_s": 0.920647,
+        "system_cpu_s": 0.009883999999999999,
+        "launch_peak_rss_kib": 16960,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 6
+      },
+      {
+        "pair": 4,
+        "kind": "baseline",
+        "command": [
+          "/workspace/shared/neh-codec-validation-20261006/baseline/nuwax-codec-test",
+          "lcm::schema::navigation_map_3d_tests::warmed_fine_map_codec_baseline",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "log": "/workspace/shared/neh-codec-validation-20261006/matched/04-baseline.log",
+        "exit_code": 0,
+        "signature": {
+          "warmups": "8",
+          "iterations": "128",
+          "stages": "4",
+          "debug_assertions": "true",
+          "blocks": "4",
+          "unique_objects": "4",
+          "included_blocks": "4",
+          "points": "4096",
+          "included_bytes": "49216",
+          "wire_bytes": "50574",
+          "direct_decode_blocks_per_iteration": "4"
+        },
+        "ms_per_operation": {
+          "validate": 5.1799961953125,
+          "encode": 5.0408789921875,
+          "decode": 4.285528984375,
+          "direct_decode_4blocks": 7.4947230546875
+        },
+        "process_wall_s": 3.0336333619998186,
+        "user_cpu_s": 2.989881,
+        "system_cpu_s": 0.024598,
+        "launch_peak_rss_kib": 16960,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 35
+      },
+      {
+        "pair": 5,
+        "kind": "baseline",
+        "command": [
+          "/workspace/shared/neh-codec-validation-20261006/baseline/nuwax-codec-test",
+          "lcm::schema::navigation_map_3d_tests::warmed_fine_map_codec_baseline",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "log": "/workspace/shared/neh-codec-validation-20261006/matched/05-baseline.log",
+        "exit_code": 0,
+        "signature": {
+          "warmups": "8",
+          "iterations": "128",
+          "stages": "4",
+          "debug_assertions": "true",
+          "blocks": "4",
+          "unique_objects": "4",
+          "included_blocks": "4",
+          "points": "4096",
+          "included_bytes": "49216",
+          "wire_bytes": "50574",
+          "direct_decode_blocks_per_iteration": "4"
+        },
+        "ms_per_operation": {
+          "validate": 5.4706461875,
+          "encode": 5.215277515625,
+          "decode": 6.393334796875,
+          "direct_decode_4blocks": 5.6315236328125
+        },
+        "process_wall_s": 3.124368155004049,
+        "user_cpu_s": 3.062874,
+        "system_cpu_s": 0.021332999999999998,
+        "launch_peak_rss_kib": 16960,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 857
+      },
+      {
+        "pair": 5,
+        "kind": "candidate",
+        "command": [
+          "/workspace/shared/neh-codec-validation-20261006/candidate/nuwax-codec-test",
+          "lcm::schema::navigation_map_3d_tests::warmed_fine_map_codec_baseline",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "log": "/workspace/shared/neh-codec-validation-20261006/matched/05-candidate.log",
+        "exit_code": 0,
+        "signature": {
+          "warmups": "8",
+          "iterations": "128",
+          "stages": "4",
+          "debug_assertions": "true",
+          "blocks": "4",
+          "unique_objects": "4",
+          "included_blocks": "4",
+          "points": "4096",
+          "included_bytes": "49216",
+          "wire_bytes": "50574",
+          "direct_decode_blocks_per_iteration": "4"
+        },
+        "ms_per_operation": {
+          "validate": 1.2259378046875,
+          "encode": 1.225517,
+          "decode": 1.1886183359375,
+          "direct_decode_4blocks": 3.9500196015625
+        },
+        "process_wall_s": 1.059357247002481,
+        "user_cpu_s": 1.04295,
+        "system_cpu_s": 0.007402,
+        "launch_peak_rss_kib": 16960,
+        "voluntary_context_switches": 2,
+        "involuntary_context_switches": 48
+      },
+      {
+        "pair": 6,
+        "kind": "candidate",
+        "command": [
+          "/workspace/shared/neh-codec-validation-20261006/candidate/nuwax-codec-test",
+          "lcm::schema::navigation_map_3d_tests::warmed_fine_map_codec_baseline",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "log": "/workspace/shared/neh-codec-validation-20261006/matched/06-candidate.log",
+        "exit_code": 0,
+        "signature": {
+          "warmups": "8",
+          "iterations": "128",
+          "stages": "4",
+          "debug_assertions": "true",
+          "blocks": "4",
+          "unique_objects": "4",
+          "included_blocks": "4",
+          "points": "4096",
+          "included_bytes": "49216",
+          "wire_bytes": "50574",
+          "direct_decode_blocks_per_iteration": "4"
+        },
+        "ms_per_operation": {
+          "validate": 1.3902728203125,
+          "encode": 1.38996446875,
+          "decode": 1.04611334375,
+          "direct_decode_4blocks": 5.6615583359375
+        },
+        "process_wall_s": 1.3167051810014527,
+        "user_cpu_s": 1.292276,
+        "system_cpu_s": 0.016295,
+        "launch_peak_rss_kib": 16960,
+        "voluntary_context_switches": 2,
+        "involuntary_context_switches": 6
+      },
+      {
+        "pair": 6,
+        "kind": "baseline",
+        "command": [
+          "/workspace/shared/neh-codec-validation-20261006/baseline/nuwax-codec-test",
+          "lcm::schema::navigation_map_3d_tests::warmed_fine_map_codec_baseline",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "log": "/workspace/shared/neh-codec-validation-20261006/matched/06-baseline.log",
+        "exit_code": 0,
+        "signature": {
+          "warmups": "8",
+          "iterations": "128",
+          "stages": "4",
+          "debug_assertions": "true",
+          "blocks": "4",
+          "unique_objects": "4",
+          "included_blocks": "4",
+          "points": "4096",
+          "included_bytes": "49216",
+          "wire_bytes": "50574",
+          "direct_decode_blocks_per_iteration": "4"
+        },
+        "ms_per_operation": {
+          "validate": 5.572946453125,
+          "encode": 7.9871806953125,
+          "decode": 5.999537,
+          "direct_decode_4blocks": 4.04772375
+        },
+        "process_wall_s": 3.3140146489968174,
+        "user_cpu_s": 3.258801,
+        "system_cpu_s": 0.038888,
+        "launch_peak_rss_kib": 16960,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 5
+      },
+      {
+        "pair": 7,
+        "kind": "baseline",
+        "command": [
+          "/workspace/shared/neh-codec-validation-20261006/baseline/nuwax-codec-test",
+          "lcm::schema::navigation_map_3d_tests::warmed_fine_map_codec_baseline",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "log": "/workspace/shared/neh-codec-validation-20261006/matched/07-baseline.log",
+        "exit_code": 0,
+        "signature": {
+          "warmups": "8",
+          "iterations": "128",
+          "stages": "4",
+          "debug_assertions": "true",
+          "blocks": "4",
+          "unique_objects": "4",
+          "included_blocks": "4",
+          "points": "4096",
+          "included_bytes": "49216",
+          "wire_bytes": "50574",
+          "direct_decode_blocks_per_iteration": "4"
+        },
+        "ms_per_operation": {
+          "validate": 4.72611609375,
+          "encode": 4.0709907109375,
+          "decode": 3.8904221171875,
+          "direct_decode_4blocks": 4.051662984375
+        },
+        "process_wall_s": 2.335891258000629,
+        "user_cpu_s": 2.307893,
+        "system_cpu_s": 0.014164,
+        "launch_peak_rss_kib": 16960,
+        "voluntary_context_switches": 1,
+        "involuntary_context_switches": 30
+      },
+      {
+        "pair": 7,
+        "kind": "candidate",
+        "command": [
+          "/workspace/shared/neh-codec-validation-20261006/candidate/nuwax-codec-test",
+          "lcm::schema::navigation_map_3d_tests::warmed_fine_map_codec_baseline",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "log": "/workspace/shared/neh-codec-validation-20261006/matched/07-candidate.log",
+        "exit_code": 0,
+        "signature": {
+          "warmups": "8",
+          "iterations": "128",
+          "stages": "4",
+          "debug_assertions": "true",
+          "blocks": "4",
+          "unique_objects": "4",
+          "included_blocks": "4",
+          "points": "4096",
+          "included_bytes": "49216",
+          "wire_bytes": "50574",
+          "direct_decode_blocks_per_iteration": "4"
+        },
+        "ms_per_operation": {
+          "validate": 0.8864004765625,
+          "encode": 0.98052703125,
+          "decode": 0.9452668203125,
+          "direct_decode_4blocks": 3.77989684375
+        },
+        "process_wall_s": 0.9201882620036486,
+        "user_cpu_s": 0.9102,
+        "system_cpu_s": 0.006938,
+        "launch_peak_rss_kib": 16960,
+        "voluntary_context_switches": 3,
+        "involuntary_context_switches": 5
+      }
+    ],
+    "summary": {
+      "baseline": {
+        "ms_per_operation": {
+          "validate": {
+            "median": 4.72611609375,
+            "min": 3.94233178125,
+            "max": 5.572946453125
+          },
+          "encode": {
+            "median": 5.0408789921875,
+            "min": 4.0709907109375,
+            "max": 7.9871806953125
+          },
+          "decode": {
+            "median": 4.668106,
+            "min": 3.8904221171875,
+            "max": 6.393334796875
+          },
+          "direct_decode_4blocks": {
+            "median": 5.6315236328125,
+            "min": 4.04772375,
+            "max": 9.208855421875
+          }
+        },
+        "process_cpu_s": {
+          "median": 3.014479,
+          "min": 2.322057,
+          "max": 3.7156789999999997
+        },
+        "process_wall_s": {
+          "median": 3.0336333619998186,
+          "min": 2.335891258000629,
+          "max": 3.7332504099977086
+        },
+        "launch_peak_rss_kib": {
+          "median": 16960,
+          "min": 16960,
+          "max": 16960
+        }
+      },
+      "candidate": {
+        "ms_per_operation": {
+          "validate": {
+            "median": 1.2259378046875,
+            "min": 0.8864004765625,
+            "max": 4.420294453125
+          },
+          "encode": {
+            "median": 1.225517,
+            "min": 0.8933889296875,
+            "max": 1.7804118359375
+          },
+          "decode": {
+            "median": 1.1510961015625,
+            "min": 0.9452668203125,
+            "max": 2.113094171875
+          },
+          "direct_decode_4blocks": {
+            "median": 4.272487484375,
+            "min": 3.7242206640625,
+            "max": 8.962153625
+          }
+        },
+        "process_cpu_s": {
+          "median": 1.0566389999999999,
+          "min": 0.917138,
+          "max": 2.405206
+        },
+        "process_wall_s": {
+          "median": 1.0745623740003794,
+          "min": 0.9201882620036486,
+          "max": 2.4118456970027182
+        },
+        "launch_peak_rss_kib": {
+          "median": 16960,
+          "min": 16960,
+          "max": 16960
+        }
+      }
+    }
+  },
+  "wire": {
+    "bytes": 50574,
+    "sha256": "14177aa0a919f17f2c29d3aeccf2c7a23ce96c87eae1a972c8aabe90d04d0a2e",
+    "byte_identical": true
+  },
+  "limits": "Ordinaryopt0 warmedcodec only. Directmaterialization has no aggregate median regression but loses2/7pairs; initialstandalonecandidate slower~36%. No allocator-count/RSS/release/transport/realtime claim."
+}

@@ -1,0 +1,29 @@
+[package]
+name = "nuwax-codec"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "nuwax 序列化编解码(LCM-first;protobuf 仅作 compat 边界)"
+
+[dependencies]
+nuwax-map-chunks = { path = "../nuwax-map-chunks" }
+nuwax-types = { path = "../nuwax-types" }
+# 默认协议层 = LCM（不依赖 nuwax-protocol,以打破 codec ↔ protocol 循环）
+# LCM frame 常量与字节布局在 `lcm` 模块内部直接定义;高层 crate 通过
+# `nuwax-protocol` 暴露的 `LcmFrameHeader` / `RawLcmFrame` 走强类型封装。
+lz4_flex = { workspace = true }
+turbojpeg = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+# protobuf compat deps（仅在显式启用 compat feature 时存在,默认不编译）
+# 当前 P0 foundation 阶段:protobuf 兼容层只用到 4 字节 length-prefix helper,
+# 不引入 prost;若后续在 `compat::*` 子模块启用 protobuf 编码再补。
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+# `tests/lcm_cross_module_consistency.rs` 需要 nuwax-protocol 验证跨模块字节一致性
+nuwax-protocol = { path = "../nuwax-protocol" }

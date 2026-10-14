@@ -1,0 +1,359 @@
+{
+  "python": "3.8.10",
+  "fixture_vector_dimension": 16,
+  "timing_repeats": 5,
+  "tracemalloc_separate_pass": true,
+  "independently_sized_fixtures": true,
+  "full_output_fixed_timestamp_equivalent": true,
+  "actual_repair_arguments_equivalent": true,
+  "rows": [
+    {
+      "phase": "first",
+      "n": 100,
+      "disabled": false,
+      "readiness": true,
+      "repairs": 42,
+      "counts": {
+        "validated_current": 23,
+        "legacy_unverified": 29,
+        "known_stale_or_incompatible": 56,
+        "missing": 63,
+        "pending": 77,
+        "failed": 0,
+        "disabled": 0,
+        "not_applicable": 71,
+        "unavailable": 0
+      }
+    },
+    {
+      "phase": "first",
+      "n": 100,
+      "disabled": false,
+      "readiness": false,
+      "repairs": 42,
+      "counts": {
+        "validated_current": 23,
+        "legacy_unverified": 29,
+        "known_stale_or_incompatible": 56,
+        "missing": 63,
+        "pending": 77,
+        "failed": 0,
+        "disabled": 0,
+        "not_applicable": 71,
+        "unavailable": 0
+      }
+    },
+    {
+      "phase": "measure",
+      "n": 100,
+      "disabled": false,
+      "readiness": false,
+      "median_ms": 11.953187000472099,
+      "peak_bytes": 1072488,
+      "blob_rows": 108,
+      "blob_bytes": 6912,
+      "repairs": 0
+    },
+    {
+      "phase": "measure",
+      "n": 100,
+      "disabled": false,
+      "readiness": true,
+      "median_ms": 11.429264999605948,
+      "peak_bytes": 1144452,
+      "blob_rows": 108,
+      "blob_bytes": 6912,
+      "repairs": 0
+    },
+    {
+      "phase": "first",
+      "n": 100,
+      "disabled": true,
+      "readiness": true,
+      "repairs": 0,
+      "counts": {
+        "validated_current": 15,
+        "legacy_unverified": 15,
+        "known_stale_or_incompatible": 78,
+        "missing": 70,
+        "pending": 56,
+        "failed": 0,
+        "disabled": 100,
+        "not_applicable": 14,
+        "unavailable": 0
+      }
+    },
+    {
+      "phase": "first",
+      "n": 100,
+      "disabled": true,
+      "readiness": false,
+      "repairs": 0,
+      "counts": {
+        "validated_current": 15,
+        "legacy_unverified": 15,
+        "known_stale_or_incompatible": 78,
+        "missing": 70,
+        "pending": 56,
+        "failed": 0,
+        "disabled": 100,
+        "not_applicable": 14,
+        "unavailable": 0
+      }
+    },
+    {
+      "phase": "measure",
+      "n": 100,
+      "disabled": true,
+      "readiness": false,
+      "median_ms": 11.715888000253472,
+      "peak_bytes": 1058567,
+      "blob_rows": 108,
+      "blob_bytes": 6912,
+      "repairs": 0
+    },
+    {
+      "phase": "measure",
+      "n": 100,
+      "disabled": true,
+      "readiness": true,
+      "median_ms": 12.018354999781877,
+      "peak_bytes": 1128784,
+      "blob_rows": 108,
+      "blob_bytes": 6912,
+      "repairs": 0
+    },
+    {
+      "phase": "first",
+      "n": 1000,
+      "disabled": false,
+      "readiness": true,
+      "repairs": 429,
+      "counts": {
+        "validated_current": 215,
+        "legacy_unverified": 285,
+        "known_stale_or_incompatible": 572,
+        "missing": 643,
+        "pending": 787,
+        "failed": 0,
+        "disabled": 0,
+        "not_applicable": 713,
+        "unavailable": 0
+      }
+    },
+    {
+      "phase": "first",
+      "n": 1000,
+      "disabled": false,
+      "readiness": false,
+      "repairs": 429,
+      "counts": {
+        "validated_current": 215,
+        "legacy_unverified": 285,
+        "known_stale_or_incompatible": 572,
+        "missing": 643,
+        "pending": 787,
+        "failed": 0,
+        "disabled": 0,
+        "not_applicable": 713,
+        "unavailable": 0
+      }
+    },
+    {
+      "phase": "measure",
+      "n": 1000,
+      "disabled": false,
+      "readiness": false,
+      "median_ms": 95.69811599976674,
+      "peak_bytes": 2523857,
+      "blob_rows": 1072,
+      "blob_bytes": 68608,
+      "repairs": 0
+    },
+    {
+      "phase": "measure",
+      "n": 1000,
+      "disabled": false,
+      "readiness": true,
+      "median_ms": 101.80476499954239,
+      "peak_bytes": 2709265,
+      "blob_rows": 1072,
+      "blob_bytes": 68608,
+      "repairs": 0
+    },
+    {
+      "phase": "first",
+      "n": 1000,
+      "disabled": true,
+      "readiness": true,
+      "repairs": 0,
+      "counts": {
+        "validated_current": 143,
+        "legacy_unverified": 143,
+        "known_stale_or_incompatible": 786,
+        "missing": 714,
+        "pending": 572,
+        "failed": 0,
+        "disabled": 1000,
+        "not_applicable": 142,
+        "unavailable": 0
+      }
+    },
+    {
+      "phase": "first",
+      "n": 1000,
+      "disabled": true,
+      "readiness": false,
+      "repairs": 0,
+      "counts": {
+        "validated_current": 143,
+        "legacy_unverified": 143,
+        "known_stale_or_incompatible": 786,
+        "missing": 714,
+        "pending": 572,
+        "failed": 0,
+        "disabled": 1000,
+        "not_applicable": 142,
+        "unavailable": 0
+      }
+    },
+    {
+      "phase": "measure",
+      "n": 1000,
+      "disabled": true,
+      "readiness": false,
+      "median_ms": 106.80125200087787,
+      "peak_bytes": 2482530,
+      "blob_rows": 1072,
+      "blob_bytes": 68608,
+      "repairs": 0
+    },
+    {
+      "phase": "measure",
+      "n": 1000,
+      "disabled": true,
+      "readiness": true,
+      "median_ms": 105.875324000408,
+      "peak_bytes": 2670274,
+      "blob_rows": 1072,
+      "blob_bytes": 68608,
+      "repairs": 0
+    },
+    {
+      "phase": "first",
+      "n": 10000,
+      "disabled": false,
+      "readiness": true,
+      "repairs": 4285,
+      "counts": {
+        "validated_current": 2144,
+        "legacy_unverified": 2857,
+        "known_stale_or_incompatible": 5713,
+        "missing": 6428,
+        "pending": 7857,
+        "failed": 0,
+        "disabled": 0,
+        "not_applicable": 7142,
+        "unavailable": 0
+      }
+    },
+    {
+      "phase": "first",
+      "n": 10000,
+      "disabled": false,
+      "readiness": false,
+      "repairs": 4285,
+      "counts": {
+        "validated_current": 2144,
+        "legacy_unverified": 2857,
+        "known_stale_or_incompatible": 5713,
+        "missing": 6428,
+        "pending": 7857,
+        "failed": 0,
+        "disabled": 0,
+        "not_applicable": 7142,
+        "unavailable": 0
+      }
+    },
+    {
+      "phase": "measure",
+      "n": 10000,
+      "disabled": false,
+      "readiness": false,
+      "median_ms": 1431.6454789995987,
+      "peak_bytes": 3136627,
+      "blob_rows": 10714,
+      "blob_bytes": 685696,
+      "repairs": 0
+    },
+    {
+      "phase": "measure",
+      "n": 10000,
+      "disabled": false,
+      "readiness": true,
+      "median_ms": 1430.936450000445,
+      "peak_bytes": 3322676,
+      "blob_rows": 10714,
+      "blob_bytes": 685696,
+      "repairs": 0
+    },
+    {
+      "phase": "first",
+      "n": 10000,
+      "disabled": true,
+      "readiness": true,
+      "repairs": 0,
+      "counts": {
+        "validated_current": 1429,
+        "legacy_unverified": 1429,
+        "known_stale_or_incompatible": 7856,
+        "missing": 7142,
+        "pending": 5714,
+        "failed": 0,
+        "disabled": 10000,
+        "not_applicable": 1428,
+        "unavailable": 0
+      }
+    },
+    {
+      "phase": "first",
+      "n": 10000,
+      "disabled": true,
+      "readiness": false,
+      "repairs": 0,
+      "counts": {
+        "validated_current": 1429,
+        "legacy_unverified": 1429,
+        "known_stale_or_incompatible": 7856,
+        "missing": 7142,
+        "pending": 5714,
+        "failed": 0,
+        "disabled": 10000,
+        "not_applicable": 1428,
+        "unavailable": 0
+      }
+    },
+    {
+      "phase": "measure",
+      "n": 10000,
+      "disabled": true,
+      "readiness": false,
+      "median_ms": 1395.9821929993268,
+      "peak_bytes": 3098020,
+      "blob_rows": 10714,
+      "blob_bytes": 685696,
+      "repairs": 0
+    },
+    {
+      "phase": "measure",
+      "n": 10000,
+      "disabled": true,
+      "readiness": true,
+      "median_ms": 1507.552277999821,
+      "peak_bytes": 3282020,
+      "blob_rows": 10714,
+      "blob_bytes": 685696,
+      "repairs": 0
+    }
+  ]
+}

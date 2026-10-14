@@ -1,0 +1,8 @@
+package nuwax_msgs;
+
+// 一次扫描及其完整惯性窗口一起重组，避免多条独立报文发生部分交付。
+struct LioInputFrame {
+    int32_t imu_count;
+    sensor_msgs.Imu imu_samples[imu_count];
+    sensor_msgs.PointCloud2 cloud;
+}

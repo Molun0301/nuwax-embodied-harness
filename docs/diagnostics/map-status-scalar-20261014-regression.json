@@ -1,0 +1,926 @@
+{
+  "python": "3.8.10 (default, Oct 13 2026, 08:57:26) \n[GCC 14.2.0]",
+  "args": [
+    "-q",
+    "-p",
+    "no:cacheprovider",
+    "tests/test_map_status_scalar.py",
+    "scripts/check_memory_summary_projection.py",
+    "scripts/check_memory_durable_integration.py",
+    "tests/test_assigned_workspace_activation.py",
+    "tests/test_activation_retained_read.py",
+    "tests/test_planar_workspace_load.py",
+    "tests/test_legacy_cloud_import.py"
+  ],
+  "selected_nodes": [
+    "tests/test_map_status_scalar.py::MapStatusScalarChecks::test_callback_order_and_captured_identity",
+    "tests/test_map_status_scalar.py::MapStatusScalarChecks::test_malformed_projection_does_not_block_status_but_summary_raises",
+    "tests/test_map_status_scalar.py::MapStatusScalarChecks::test_none_equality_and_inactive_short_circuit",
+    "tests/test_map_status_scalar.py::MapStatusScalarChecks::test_real_handler_retains_one_full_summary",
+    "tests/test_map_status_scalar.py::MapStatusScalarChecks::test_recovery_status_and_no_save",
+    "tests/test_map_status_scalar.py::MapStatusScalarChecks::test_scalar_failure_propagates_before_readiness_and_save",
+    "tests/test_map_status_scalar.py::MapStatusScalarChecks::test_schema2_delegates_without_legacy_reads",
+    "tests/test_map_status_scalar.py::MapStatusScalarChecks::test_status_does_not_repair_but_full_summary_does",
+    "tests/test_map_status_scalar.py::MapStatusScalarChecks::test_status_matrix_and_no_summary",
+    "tests/test_map_status_scalar.py::MapStatusScalarChecks::test_summary_only_errors_still_reach_full_workspace",
+    "scripts/check_memory_summary_projection.py::SummaryProjectionChecks::test_all_source_kinds_and_empty_summary",
+    "scripts/check_memory_summary_projection.py::SummaryProjectionChecks::test_mixed_vectors_preserve_full_summary_and_repairs",
+    "scripts/check_memory_durable_integration.py::IntegrationChecks::test_4101_jobs_are_not_silently_evicted",
+    "scripts/check_memory_durable_integration.py::IntegrationChecks::test_acceptance_atomic_and_private_token",
+    "scripts/check_memory_durable_integration.py::IntegrationChecks::test_all_five_sources_are_durable",
+    "scripts/check_memory_durable_integration.py::IntegrationChecks::test_close_retains_storage_while_provider_is_uncooperative",
+    "scripts/check_memory_durable_integration.py::IntegrationChecks::test_completed_missing_image_repairs_without_hiding_or_reembedding_text",
+    "scripts/check_memory_durable_integration.py::IntegrationChecks::test_dependency_changes_are_value_specific_and_atomic",
+    "scripts/check_memory_durable_integration.py::IntegrationChecks::test_disable_activate_preserves_vectors_and_history_false_visibility",
+    "scripts/check_memory_durable_integration.py::IntegrationChecks::test_dynamic_live_record_does_not_block_unrelated_query",
+    "scripts/check_memory_durable_integration.py::IntegrationChecks::test_filter_and_arrival_lookup_use_current_eligibility",
+    "scripts/check_memory_durable_integration.py::IntegrationChecks::test_hot_migration_row_does_not_starve_later_legacy_rows",
+    "scripts/check_memory_durable_integration.py::IntegrationChecks::test_hydration_aba_keeps_snapshot_business_identity",
+    "scripts/check_memory_durable_integration.py::IntegrationChecks::test_input_change_fences_slow_result_and_source_aba",
+    "scripts/check_memory_durable_integration.py::IntegrationChecks::test_legacy_positive_and_lexical_without_vectors",
+    "scripts/check_memory_durable_integration.py::IntegrationChecks::test_metadata_does_not_supersede_and_stale_rmw_conflicts",
+    "scripts/check_memory_durable_integration.py::IntegrationChecks::test_partial_image_failure_preserves_text_through_retry_and_exhaustion",
+    "scripts/check_memory_durable_integration.py::IntegrationChecks::test_partial_publish_cannot_relabel_known_stale_legacy_other_modality",
+    "scripts/check_memory_durable_integration.py::IntegrationChecks::test_query_race_does_not_transfer_old_similarity",
+    "scripts/check_memory_durable_integration.py::IntegrationChecks::test_reset_new_library_incarnation_and_long_aliases",
+    "scripts/check_memory_durable_integration.py::IntegrationChecks::test_separate_cache_rejected_aba_publication_stays_invisible",
+    "scripts/check_memory_durable_integration.py::IntegrationChecks::test_separate_injected_store_and_borrowed_ownership",
+    "scripts/check_memory_durable_integration.py::IntegrationChecks::test_slow_inference_finishes_during_continuous_metadata_writes",
+    "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_active_workspace_callback_switch_cannot_make_outer_activation_return_stale_workspace",
+    "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_cold_restore_reconstructs_runtime_mapping_and_session_from_actual_sealed_owner_without_dispatch",
+    "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_complete_original_request_is_durable_before_any_native_mutation",
+    "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_completed_restart_restore_observes_state_but_never_dispatches",
+    "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_constructor_preserves_assigned_relocalization_intent_without_legacy_abort_or_rpc",
+    "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_dispatch_phase_rename_requires_successful_directory_fsync_on_every_explicit_retry",
+    "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_durable_receipt_failure_retains_journal_fence_and_original_owner_for_restore",
+    "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_failure_to_clear_runtime_fence_retains_durable_journal",
+    "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_journal_clear_cancellation_rearms_retained_fence_outside_guards_and_propagates_original",
+    "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_journal_clear_failure_retains_fence_and_releases_session_publication_outside_guards",
+    "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_journal_write_failure_prevents_all_native_mutations",
+    "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_localization_callback_can_activate_successor_and_old_call_never_returns_stale_workspace",
+    "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_localization_preparation_supersession_loses_cas_and_retains_recovery",
+    "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_map_asset_reads_and_checkpoint_preparation_run_outside_runtime_catalog_executor_locks",
+    "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_mapping_callback_supersession_is_detected_and_cannot_publish_success",
+    "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_mapping_clear_during_summary_prevents_workspace_publication_and_stale_return",
+    "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_mapping_clear_during_workspace_publication_invalidates_just_written_workspace",
+    "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_pending_original_map_blocks_different_target_before_any_native_rpc",
+    "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_postdispatch_mapping_failure_keeps_exact_request_and_fence_then_reconciles_without_dispatch",
+    "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_public_activation_installs_real_runtime_catalog_mapping_and_localizing_session_without_old_pose",
+    "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_public_explicit_a_to_b_stops_exact_predecessor_before_dispatch",
+    "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_public_getters_never_dispatch_refresh_or_use_legacy_session_cas",
+    "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_repeat_same_owner_preserves_installation_session_epoch_and_map_snapshot",
+    "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_restore_without_current_sealed_evidence_never_dispatches_or_rewrites_request",
+    "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_rpc_map_and_state_publication_callbacks_run_without_runtime_catalog_executor_guards",
+    "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_same_asset_fresh_native_installation_updates_mapping_receipt_instead_of_deduplicating_old_owner",
+    "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_sealed_actual_state_can_restore_unknown_without_native_reexecution",
+    "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_sealed_unknown_reconciliation_does_not_leave_provider_attempt_blocking_next_map",
+    "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_successor_before_underlying_workspace_write_cannot_leave_stale_cache_or_return",
+    "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_unknown_is_retained_until_explicit_exact_retry_and_never_reexecutes_in_exception",
+    "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_unknown_predecessor_stop_never_activates_until_explicit_retry_of_exact_journal",
+    "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_workspace_write_failure_or_cancellation_discards_stale_value_and_preserves_original_error",
+    "tests/test_activation_retained_read.py::RetainedActivationReadTests::test_cold_restore_cancellation_after_read_does_not_cache_body_for_retry",
+    "tests/test_activation_retained_read.py::RetainedActivationReadTests::test_cold_restore_directory_replacement_after_load_rejected",
+    "tests/test_activation_retained_read.py::RetainedActivationReadTests::test_cold_restore_directory_replacement_before_load_rejected",
+    "tests/test_activation_retained_read.py::RetainedActivationReadTests::test_cold_restore_load_cancellation_releases_tree_and_never_dispatches",
+    "tests/test_activation_retained_read.py::RetainedActivationReadTests::test_cold_restore_member_replacement_after_load_rejected",
+    "tests/test_activation_retained_read.py::RetainedActivationReadTests::test_cold_restore_member_replacement_before_load_rejected",
+    "tests/test_activation_retained_read.py::RetainedActivationReadTests::test_cold_restore_one_owned_validation_after_tree_closes_without_dispatch",
+    "tests/test_activation_retained_read.py::RetainedActivationReadTests::test_directory_replacement_between_load_and_verify_rejected",
+    "tests/test_activation_retained_read.py::RetainedActivationReadTests::test_directory_replacement_between_metadata_and_load_rejected",
+    "tests/test_activation_retained_read.py::RetainedActivationReadTests::test_load_failure_releases_tree_and_locks",
+    "tests/test_activation_retained_read.py::RetainedActivationReadTests::test_member_replacement_between_load_and_verify_rejected",
+    "tests/test_activation_retained_read.py::RetainedActivationReadTests::test_member_replacement_between_metadata_and_load_rejected",
+    "tests/test_activation_retained_read.py::RetainedActivationReadTests::test_ordinary_getter_still_borrowed_without_freeze_or_load",
+    "tests/test_activation_retained_read.py::RetainedActivationReadTests::test_original_direct_prepare_still_loads",
+    "tests/test_activation_retained_read.py::RetainedActivationReadTests::test_owner_root_bundle_mismatch_and_token_reconstruction_rejected",
+    "tests/test_activation_retained_read.py::RetainedActivationReadTests::test_parent_component_catalog_preserves_direct_prepare_semantics",
+    "tests/test_activation_retained_read.py::RetainedActivationReadTests::test_public_activation_one_owned_validation_no_borrowed_pass",
+    "tests/test_activation_retained_read.py::RetainedActivationReadTests::test_symlink_ancestor_catalog_preserves_direct_prepare_semantics",
+    "tests/test_activation_retained_read.py::RetainedActivationReadTests::test_tree_closed_owners_retained_for_canonical_view_and_upload",
+    "tests/test_planar_workspace_load.py::WorkspaceLoadTests::test_finalize_existing_planar_dispatches_new_operation_continuation",
+    "tests/test_planar_workspace_load.py::WorkspaceLoadTests::test_finalize_new_planar_dispatches_assigned_entry",
+    "tests/test_planar_workspace_load.py::WorkspaceLoadTests::test_finalize_no_operation_id_keeps_planar_continuation",
+    "tests/test_planar_workspace_load.py::WorkspaceLoadTests::test_finalize_same_operation_returns_existing_identity",
+    "tests/test_planar_workspace_load.py::WorkspaceLoadTests::test_legacy_import_selection_and_independent_continuation",
+    "tests/test_planar_workspace_load.py::WorkspaceLoadTests::test_new_assigned_save_and_existing_current_exchange",
+    "tests/test_planar_workspace_load.py::WorkspaceLoadTests::test_normal_workspace_load_imports_once_and_persists_selection",
+    "tests/test_planar_workspace_load.py::WorkspaceLoadTests::test_workspace_reconciles_independent_planar_continuation",
+    "tests/test_planar_workspace_load.py::WorkspaceLoadTests::test_workspace_reconciles_new_current_and_exchange",
+    "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_catalog_creation_owner_change_is_not_overwritten_or_fallback",
+    "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_catalog_failure_leaves_published_source_for_next_explicit_retry",
+    "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_changed_source_observation_allocates_a_distinct_import",
+    "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_cloud_xyz_above_one_chunk_uses_existing_frozen_payload",
+    "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_cloud_xyz_at_one_aligned_chunk_stays_bytes",
+    "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_discovery_reads_no_unrelated_sibling_bundle_body",
+    "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_ensure_workspace_pending_and_ordinary_paths_do_not_import",
+    "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_explicit_activation_adopts_then_releases_executor_before_assigned_dispatch",
+    "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_fine_import_ar1_preserves_existing_fallback_without_allocation",
+    "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_fine_import_ar2_ar3_preserves_members_and_builds_normal_v2_request",
+    "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_fine_import_catalog_failure_reuses_publication_before_assigned_dispatch",
+    "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_fine_import_converter_rejects_missing_extra_invalid_or_reused_ids",
+    "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_fine_import_duplicate_object_with_changed_body_is_rejected",
+    "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_fine_import_rejects_malformed_and_mismatched_archives_before_allocation",
+    "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_fine_import_same_length_source_edit_is_a_distinct_owned_import",
+    "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_fine_root_helper_preserves_validator_results_and_error_order",
+    "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_fine_root_refactor_keeps_ar3_layer_json_rejections",
+    "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_frozen_xyz_temporary_write_failure_keeps_source_and_catalog",
+    "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_getter_has_no_new_cloud_import_side_effect",
+    "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_large_cloud_xyz_crosses_parser_blocks_without_join",
+    "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_missing_receipts_and_optional_frame_take_legacy_fallback",
+    "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_missing_stored_top_alias_remains_absent_in_provenance",
+    "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_multiple_matching_published_imports_preserve_fallback",
+    "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_no_dense_archive_is_preserved_as_absent",
+    "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_normal_assigned_manifest_does_not_copy_whole_metadata_or_opt_in",
+    "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_optional_manifest_provenance_is_bound_to_selected_bundle",
+    "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_original_planar_exchange_failure_precedes_new_allocation",
+    "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_pending_old_transaction_skips_new_import",
+    "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_publication_before_catalog_failure_is_reused",
+    "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_real_voxel_and_ray_store_publication_preserves_source_members",
+    "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_restore_chain_keeps_legacy_dispatch_without_import",
+    "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_restore_stale_retry_keeps_import_disabled_through_real_dispatcher",
+    "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_retry_reuses_published_identity_before_parsing_or_allocating",
+    "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_small_cloud_xyz_stays_bytes",
+    "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_unrelated_incomplete_sibling_does_not_block",
+    "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_unsupported_current_without_checkpoint_and_fine_archives_fall_back"
+  ],
+  "reports": [
+    {
+      "nodeid": "tests/test_map_status_scalar.py::MapStatusScalarChecks::test_callback_order_and_captured_identity",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_map_status_scalar.py::MapStatusScalarChecks::test_malformed_projection_does_not_block_status_but_summary_raises",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_map_status_scalar.py::MapStatusScalarChecks::test_none_equality_and_inactive_short_circuit",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_map_status_scalar.py::MapStatusScalarChecks::test_real_handler_retains_one_full_summary",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_map_status_scalar.py::MapStatusScalarChecks::test_recovery_status_and_no_save",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_map_status_scalar.py::MapStatusScalarChecks::test_scalar_failure_propagates_before_readiness_and_save",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_map_status_scalar.py::MapStatusScalarChecks::test_schema2_delegates_without_legacy_reads",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_map_status_scalar.py::MapStatusScalarChecks::test_status_does_not_repair_but_full_summary_does",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_map_status_scalar.py::MapStatusScalarChecks::test_status_matrix_and_no_summary",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_map_status_scalar.py::MapStatusScalarChecks::test_summary_only_errors_still_reach_full_workspace",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "scripts/check_memory_summary_projection.py::SummaryProjectionChecks::test_all_source_kinds_and_empty_summary",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "scripts/check_memory_summary_projection.py::SummaryProjectionChecks::test_mixed_vectors_preserve_full_summary_and_repairs",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "scripts/check_memory_durable_integration.py::IntegrationChecks::test_4101_jobs_are_not_silently_evicted",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "scripts/check_memory_durable_integration.py::IntegrationChecks::test_acceptance_atomic_and_private_token",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "scripts/check_memory_durable_integration.py::IntegrationChecks::test_all_five_sources_are_durable",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "scripts/check_memory_durable_integration.py::IntegrationChecks::test_close_retains_storage_while_provider_is_uncooperative",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "scripts/check_memory_durable_integration.py::IntegrationChecks::test_completed_missing_image_repairs_without_hiding_or_reembedding_text",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "scripts/check_memory_durable_integration.py::IntegrationChecks::test_dependency_changes_are_value_specific_and_atomic",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "scripts/check_memory_durable_integration.py::IntegrationChecks::test_disable_activate_preserves_vectors_and_history_false_visibility",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "scripts/check_memory_durable_integration.py::IntegrationChecks::test_dynamic_live_record_does_not_block_unrelated_query",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "scripts/check_memory_durable_integration.py::IntegrationChecks::test_filter_and_arrival_lookup_use_current_eligibility",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "scripts/check_memory_durable_integration.py::IntegrationChecks::test_hot_migration_row_does_not_starve_later_legacy_rows",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "scripts/check_memory_durable_integration.py::IntegrationChecks::test_hydration_aba_keeps_snapshot_business_identity",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "scripts/check_memory_durable_integration.py::IntegrationChecks::test_input_change_fences_slow_result_and_source_aba",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "scripts/check_memory_durable_integration.py::IntegrationChecks::test_legacy_positive_and_lexical_without_vectors",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "scripts/check_memory_durable_integration.py::IntegrationChecks::test_metadata_does_not_supersede_and_stale_rmw_conflicts",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "scripts/check_memory_durable_integration.py::IntegrationChecks::test_partial_image_failure_preserves_text_through_retry_and_exhaustion",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "scripts/check_memory_durable_integration.py::IntegrationChecks::test_partial_publish_cannot_relabel_known_stale_legacy_other_modality",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "scripts/check_memory_durable_integration.py::IntegrationChecks::test_query_race_does_not_transfer_old_similarity",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "scripts/check_memory_durable_integration.py::IntegrationChecks::test_reset_new_library_incarnation_and_long_aliases",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "scripts/check_memory_durable_integration.py::IntegrationChecks::test_separate_cache_rejected_aba_publication_stays_invisible",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "scripts/check_memory_durable_integration.py::IntegrationChecks::test_separate_injected_store_and_borrowed_ownership",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "scripts/check_memory_durable_integration.py::IntegrationChecks::test_slow_inference_finishes_during_continuous_metadata_writes",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_active_workspace_callback_switch_cannot_make_outer_activation_return_stale_workspace",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_cold_restore_reconstructs_runtime_mapping_and_session_from_actual_sealed_owner_without_dispatch",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_complete_original_request_is_durable_before_any_native_mutation",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_completed_restart_restore_observes_state_but_never_dispatches",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_constructor_preserves_assigned_relocalization_intent_without_legacy_abort_or_rpc",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_dispatch_phase_rename_requires_successful_directory_fsync_on_every_explicit_retry",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_durable_receipt_failure_retains_journal_fence_and_original_owner_for_restore",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_failure_to_clear_runtime_fence_retains_durable_journal",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_journal_clear_cancellation_rearms_retained_fence_outside_guards_and_propagates_original",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_journal_clear_failure_retains_fence_and_releases_session_publication_outside_guards",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_journal_write_failure_prevents_all_native_mutations",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_localization_callback_can_activate_successor_and_old_call_never_returns_stale_workspace",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_localization_preparation_supersession_loses_cas_and_retains_recovery",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_map_asset_reads_and_checkpoint_preparation_run_outside_runtime_catalog_executor_locks",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_mapping_callback_supersession_is_detected_and_cannot_publish_success",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_mapping_clear_during_summary_prevents_workspace_publication_and_stale_return",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_mapping_clear_during_workspace_publication_invalidates_just_written_workspace",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_pending_original_map_blocks_different_target_before_any_native_rpc",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_postdispatch_mapping_failure_keeps_exact_request_and_fence_then_reconciles_without_dispatch",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_public_activation_installs_real_runtime_catalog_mapping_and_localizing_session_without_old_pose",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_public_explicit_a_to_b_stops_exact_predecessor_before_dispatch",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_public_getters_never_dispatch_refresh_or_use_legacy_session_cas",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_repeat_same_owner_preserves_installation_session_epoch_and_map_snapshot",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_restore_without_current_sealed_evidence_never_dispatches_or_rewrites_request",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_rpc_map_and_state_publication_callbacks_run_without_runtime_catalog_executor_guards",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_same_asset_fresh_native_installation_updates_mapping_receipt_instead_of_deduplicating_old_owner",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_sealed_actual_state_can_restore_unknown_without_native_reexecution",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_sealed_unknown_reconciliation_does_not_leave_provider_attempt_blocking_next_map",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_successor_before_underlying_workspace_write_cannot_leave_stale_cache_or_return",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_unknown_is_retained_until_explicit_exact_retry_and_never_reexecutes_in_exception",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_unknown_predecessor_stop_never_activates_until_explicit_retry_of_exact_journal",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_assigned_workspace_activation.py::AssignedWorkspaceActivationTests::test_workspace_write_failure_or_cancellation_discards_stale_value_and_preserves_original_error",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_activation_retained_read.py::RetainedActivationReadTests::test_cold_restore_cancellation_after_read_does_not_cache_body_for_retry",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_activation_retained_read.py::RetainedActivationReadTests::test_cold_restore_directory_replacement_after_load_rejected",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_activation_retained_read.py::RetainedActivationReadTests::test_cold_restore_directory_replacement_before_load_rejected",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_activation_retained_read.py::RetainedActivationReadTests::test_cold_restore_load_cancellation_releases_tree_and_never_dispatches",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_activation_retained_read.py::RetainedActivationReadTests::test_cold_restore_member_replacement_after_load_rejected",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_activation_retained_read.py::RetainedActivationReadTests::test_cold_restore_member_replacement_before_load_rejected",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_activation_retained_read.py::RetainedActivationReadTests::test_cold_restore_one_owned_validation_after_tree_closes_without_dispatch",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_activation_retained_read.py::RetainedActivationReadTests::test_directory_replacement_between_load_and_verify_rejected",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_activation_retained_read.py::RetainedActivationReadTests::test_directory_replacement_between_metadata_and_load_rejected",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_activation_retained_read.py::RetainedActivationReadTests::test_load_failure_releases_tree_and_locks",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_activation_retained_read.py::RetainedActivationReadTests::test_member_replacement_between_load_and_verify_rejected",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_activation_retained_read.py::RetainedActivationReadTests::test_member_replacement_between_metadata_and_load_rejected",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_activation_retained_read.py::RetainedActivationReadTests::test_ordinary_getter_still_borrowed_without_freeze_or_load",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_activation_retained_read.py::RetainedActivationReadTests::test_original_direct_prepare_still_loads",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_activation_retained_read.py::RetainedActivationReadTests::test_owner_root_bundle_mismatch_and_token_reconstruction_rejected",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_activation_retained_read.py::RetainedActivationReadTests::test_parent_component_catalog_preserves_direct_prepare_semantics",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_activation_retained_read.py::RetainedActivationReadTests::test_public_activation_one_owned_validation_no_borrowed_pass",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_activation_retained_read.py::RetainedActivationReadTests::test_symlink_ancestor_catalog_preserves_direct_prepare_semantics",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_activation_retained_read.py::RetainedActivationReadTests::test_tree_closed_owners_retained_for_canonical_view_and_upload",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_planar_workspace_load.py::WorkspaceLoadTests::test_finalize_existing_planar_dispatches_new_operation_continuation",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_planar_workspace_load.py::WorkspaceLoadTests::test_finalize_new_planar_dispatches_assigned_entry",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_planar_workspace_load.py::WorkspaceLoadTests::test_finalize_no_operation_id_keeps_planar_continuation",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_planar_workspace_load.py::WorkspaceLoadTests::test_finalize_same_operation_returns_existing_identity",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_planar_workspace_load.py::WorkspaceLoadTests::test_legacy_import_selection_and_independent_continuation",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_planar_workspace_load.py::WorkspaceLoadTests::test_new_assigned_save_and_existing_current_exchange",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_planar_workspace_load.py::WorkspaceLoadTests::test_normal_workspace_load_imports_once_and_persists_selection",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_planar_workspace_load.py::WorkspaceLoadTests::test_workspace_reconciles_independent_planar_continuation",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_planar_workspace_load.py::WorkspaceLoadTests::test_workspace_reconciles_new_current_and_exchange",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_catalog_creation_owner_change_is_not_overwritten_or_fallback",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_catalog_failure_leaves_published_source_for_next_explicit_retry",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_changed_source_observation_allocates_a_distinct_import",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_cloud_xyz_above_one_chunk_uses_existing_frozen_payload",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_cloud_xyz_at_one_aligned_chunk_stays_bytes",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_discovery_reads_no_unrelated_sibling_bundle_body",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_ensure_workspace_pending_and_ordinary_paths_do_not_import",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_explicit_activation_adopts_then_releases_executor_before_assigned_dispatch",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_fine_import_ar1_preserves_existing_fallback_without_allocation",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_fine_import_ar2_ar3_preserves_members_and_builds_normal_v2_request",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_fine_import_catalog_failure_reuses_publication_before_assigned_dispatch",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_fine_import_converter_rejects_missing_extra_invalid_or_reused_ids",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_fine_import_duplicate_object_with_changed_body_is_rejected",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_fine_import_rejects_malformed_and_mismatched_archives_before_allocation",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_fine_import_same_length_source_edit_is_a_distinct_owned_import",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_fine_root_helper_preserves_validator_results_and_error_order",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_fine_root_refactor_keeps_ar3_layer_json_rejections",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_frozen_xyz_temporary_write_failure_keeps_source_and_catalog",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_getter_has_no_new_cloud_import_side_effect",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_large_cloud_xyz_crosses_parser_blocks_without_join",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_missing_receipts_and_optional_frame_take_legacy_fallback",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_missing_stored_top_alias_remains_absent_in_provenance",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_multiple_matching_published_imports_preserve_fallback",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_no_dense_archive_is_preserved_as_absent",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_normal_assigned_manifest_does_not_copy_whole_metadata_or_opt_in",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_optional_manifest_provenance_is_bound_to_selected_bundle",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_original_planar_exchange_failure_precedes_new_allocation",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_pending_old_transaction_skips_new_import",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_publication_before_catalog_failure_is_reused",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_real_voxel_and_ray_store_publication_preserves_source_members",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_restore_chain_keeps_legacy_dispatch_without_import",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_restore_stale_retry_keeps_import_disabled_through_real_dispatcher",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_retry_reuses_published_identity_before_parsing_or_allocating",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_small_cloud_xyz_stays_bytes",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_unrelated_incomplete_sibling_does_not_block",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    },
+    {
+      "nodeid": "tests/test_legacy_cloud_import.py::LegacyCloudImportTests::test_unsupported_current_without_checkpoint_and_fine_archives_fall_back",
+      "phase": "call",
+      "outcome": "passed",
+      "detail": ""
+    }
+  ],
+  "returncode": 0,
+  "elapsed_seconds": 22.890762358001666,
+  "application_hash_attempts": [],
+  "framework_metadata_etag_calls": 0
+}

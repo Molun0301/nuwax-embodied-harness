@@ -1,0 +1,430 @@
+{
+  "python": "3.8.10",
+  "repeats": 11,
+  "baseline_source": "task-active-scalar-results-20261013.json",
+  "indexed": [
+    {
+      "terminal": 200,
+      "active": 0,
+      "active_position": "after_terminal",
+      "methods": {
+        "list_active_tasks": {
+          "record_visits": 0,
+          "record_lookups": 0,
+          "history_visits": 0,
+          "active_index_visits": 0,
+          "median_ms": 0.002334,
+          "median_lock_ms": 0.000631
+        },
+        "capture_task_list": {
+          "record_visits": 0,
+          "record_lookups": 20,
+          "history_visits": 20,
+          "active_index_visits": 0,
+          "median_ms": 0.838116,
+          "median_lock_ms": 0.009405
+        },
+        "capture_status_only": {
+          "record_visits": 0,
+          "record_lookups": 20,
+          "history_visits": 20,
+          "active_index_visits": 0,
+          "median_ms": 0.269487,
+          "median_lock_ms": 0.005027
+        },
+        "count_active_tasks": {
+          "record_visits": 0,
+          "record_lookups": 0,
+          "history_visits": 0,
+          "active_index_visits": 0,
+          "median_ms": 0.000811,
+          "median_lock_ms": 0.00027
+        },
+        "has_active_tasks": {
+          "record_visits": 0,
+          "record_lookups": 0,
+          "history_visits": 0,
+          "active_index_visits": 0,
+          "median_ms": 0.000871,
+          "median_lock_ms": 0.000301
+        }
+      }
+    },
+    {
+      "terminal": 200,
+      "active": 5,
+      "active_position": "after_terminal",
+      "methods": {
+        "list_active_tasks": {
+          "record_visits": 0,
+          "record_lookups": 0,
+          "history_visits": 0,
+          "active_index_visits": 5,
+          "median_ms": 0.070166,
+          "median_lock_ms": 0.000981
+        },
+        "capture_task_list": {
+          "record_visits": 0,
+          "record_lookups": 20,
+          "history_visits": 20,
+          "active_index_visits": 5,
+          "median_ms": 1.006489,
+          "median_lock_ms": 0.009234
+        },
+        "capture_status_only": {
+          "record_visits": 0,
+          "record_lookups": 20,
+          "history_visits": 20,
+          "active_index_visits": 5,
+          "median_ms": 0.326193,
+          "median_lock_ms": 0.005509
+        },
+        "count_active_tasks": {
+          "record_visits": 0,
+          "record_lookups": 0,
+          "history_visits": 0,
+          "active_index_visits": 0,
+          "median_ms": 0.000831,
+          "median_lock_ms": 0.000271
+        },
+        "has_active_tasks": {
+          "record_visits": 0,
+          "record_lookups": 0,
+          "history_visits": 0,
+          "active_index_visits": 0,
+          "median_ms": 0.000852,
+          "median_lock_ms": 0.000301
+        }
+      }
+    },
+    {
+      "terminal": 200,
+      "active": 50,
+      "active_position": "after_terminal",
+      "methods": {
+        "list_active_tasks": {
+          "record_visits": 0,
+          "record_lookups": 0,
+          "history_visits": 0,
+          "active_index_visits": 50,
+          "median_ms": 0.628739,
+          "median_lock_ms": 0.003605
+        },
+        "capture_task_list": {
+          "record_visits": 0,
+          "record_lookups": 20,
+          "history_visits": 20,
+          "active_index_visits": 50,
+          "median_ms": 2.82875,
+          "median_lock_ms": 0.019469
+        },
+        "capture_status_only": {
+          "record_visits": 0,
+          "record_lookups": 20,
+          "history_visits": 20,
+          "active_index_visits": 50,
+          "median_ms": 0.865437,
+          "median_lock_ms": 0.010236
+        },
+        "count_active_tasks": {
+          "record_visits": 0,
+          "record_lookups": 0,
+          "history_visits": 0,
+          "active_index_visits": 0,
+          "median_ms": 0.000821,
+          "median_lock_ms": 0.00027
+        },
+        "has_active_tasks": {
+          "record_visits": 0,
+          "record_lookups": 0,
+          "history_visits": 0,
+          "active_index_visits": 0,
+          "median_ms": 0.000861,
+          "median_lock_ms": 0.00031
+        }
+      }
+    },
+    {
+      "terminal": 5000,
+      "active": 0,
+      "active_position": "after_terminal",
+      "methods": {
+        "list_active_tasks": {
+          "record_visits": 0,
+          "record_lookups": 0,
+          "history_visits": 0,
+          "active_index_visits": 0,
+          "median_ms": 0.002253,
+          "median_lock_ms": 0.000631
+        },
+        "capture_task_list": {
+          "record_visits": 0,
+          "record_lookups": 20,
+          "history_visits": 20,
+          "active_index_visits": 0,
+          "median_ms": 0.804444,
+          "median_lock_ms": 0.009134
+        },
+        "capture_status_only": {
+          "record_visits": 0,
+          "record_lookups": 20,
+          "history_visits": 20,
+          "active_index_visits": 0,
+          "median_ms": 0.260834,
+          "median_lock_ms": 0.005238
+        },
+        "count_active_tasks": {
+          "record_visits": 0,
+          "record_lookups": 0,
+          "history_visits": 0,
+          "active_index_visits": 0,
+          "median_ms": 0.000832,
+          "median_lock_ms": 0.000261
+        },
+        "has_active_tasks": {
+          "record_visits": 0,
+          "record_lookups": 0,
+          "history_visits": 0,
+          "active_index_visits": 0,
+          "median_ms": 0.000852,
+          "median_lock_ms": 0.0003
+        }
+      }
+    },
+    {
+      "terminal": 5000,
+      "active": 5,
+      "active_position": "after_terminal",
+      "methods": {
+        "list_active_tasks": {
+          "record_visits": 0,
+          "record_lookups": 0,
+          "history_visits": 0,
+          "active_index_visits": 5,
+          "median_ms": 0.069976,
+          "median_lock_ms": 0.001002
+        },
+        "capture_task_list": {
+          "record_visits": 0,
+          "record_lookups": 20,
+          "history_visits": 20,
+          "active_index_visits": 5,
+          "median_ms": 0.998137,
+          "median_lock_ms": 0.009564
+        },
+        "capture_status_only": {
+          "record_visits": 0,
+          "record_lookups": 20,
+          "history_visits": 20,
+          "active_index_visits": 5,
+          "median_ms": 0.324029,
+          "median_lock_ms": 0.006039
+        },
+        "count_active_tasks": {
+          "record_visits": 0,
+          "record_lookups": 0,
+          "history_visits": 0,
+          "active_index_visits": 0,
+          "median_ms": 0.000821,
+          "median_lock_ms": 0.00027
+        },
+        "has_active_tasks": {
+          "record_visits": 0,
+          "record_lookups": 0,
+          "history_visits": 0,
+          "active_index_visits": 0,
+          "median_ms": 0.000851,
+          "median_lock_ms": 0.00031
+        }
+      }
+    },
+    {
+      "terminal": 5000,
+      "active": 50,
+      "active_position": "after_terminal",
+      "methods": {
+        "list_active_tasks": {
+          "record_visits": 0,
+          "record_lookups": 0,
+          "history_visits": 0,
+          "active_index_visits": 50,
+          "median_ms": 0.613677,
+          "median_lock_ms": 0.003465
+        },
+        "capture_task_list": {
+          "record_visits": 0,
+          "record_lookups": 20,
+          "history_visits": 20,
+          "active_index_visits": 50,
+          "median_ms": 2.835772,
+          "median_lock_ms": 0.01952
+        },
+        "capture_status_only": {
+          "record_visits": 0,
+          "record_lookups": 20,
+          "history_visits": 20,
+          "active_index_visits": 50,
+          "median_ms": 0.863163,
+          "median_lock_ms": 0.009624
+        },
+        "count_active_tasks": {
+          "record_visits": 0,
+          "record_lookups": 0,
+          "history_visits": 0,
+          "active_index_visits": 0,
+          "median_ms": 0.000821,
+          "median_lock_ms": 0.000271
+        },
+        "has_active_tasks": {
+          "record_visits": 0,
+          "record_lookups": 0,
+          "history_visits": 0,
+          "active_index_visits": 0,
+          "median_ms": 0.000851,
+          "median_lock_ms": 0.000311
+        }
+      }
+    },
+    {
+      "terminal": 50000,
+      "active": 0,
+      "active_position": "after_terminal",
+      "methods": {
+        "list_active_tasks": {
+          "record_visits": 0,
+          "record_lookups": 0,
+          "history_visits": 0,
+          "active_index_visits": 0,
+          "median_ms": 0.002423,
+          "median_lock_ms": 0.000621
+        },
+        "capture_task_list": {
+          "record_visits": 0,
+          "record_lookups": 20,
+          "history_visits": 20,
+          "active_index_visits": 0,
+          "median_ms": 0.89394,
+          "median_lock_ms": 0.011267
+        },
+        "capture_status_only": {
+          "record_visits": 0,
+          "record_lookups": 20,
+          "history_visits": 20,
+          "active_index_visits": 0,
+          "median_ms": 0.259993,
+          "median_lock_ms": 0.005618
+        },
+        "count_active_tasks": {
+          "record_visits": 0,
+          "record_lookups": 0,
+          "history_visits": 0,
+          "active_index_visits": 0,
+          "median_ms": 0.000892,
+          "median_lock_ms": 0.000301
+        },
+        "has_active_tasks": {
+          "record_visits": 0,
+          "record_lookups": 0,
+          "history_visits": 0,
+          "active_index_visits": 0,
+          "median_ms": 0.000831,
+          "median_lock_ms": 0.0003
+        }
+      }
+    },
+    {
+      "terminal": 50000,
+      "active": 5,
+      "active_position": "after_terminal",
+      "methods": {
+        "list_active_tasks": {
+          "record_visits": 0,
+          "record_lookups": 0,
+          "history_visits": 0,
+          "active_index_visits": 5,
+          "median_ms": 0.070416,
+          "median_lock_ms": 0.000992
+        },
+        "capture_task_list": {
+          "record_visits": 0,
+          "record_lookups": 20,
+          "history_visits": 20,
+          "active_index_visits": 5,
+          "median_ms": 1.023615,
+          "median_lock_ms": 0.011958
+        },
+        "capture_status_only": {
+          "record_visits": 0,
+          "record_lookups": 20,
+          "history_visits": 20,
+          "active_index_visits": 5,
+          "median_ms": 0.35076,
+          "median_lock_ms": 0.0068
+        },
+        "count_active_tasks": {
+          "record_visits": 0,
+          "record_lookups": 0,
+          "history_visits": 0,
+          "active_index_visits": 0,
+          "median_ms": 0.000842,
+          "median_lock_ms": 0.000271
+        },
+        "has_active_tasks": {
+          "record_visits": 0,
+          "record_lookups": 0,
+          "history_visits": 0,
+          "active_index_visits": 0,
+          "median_ms": 0.000861,
+          "median_lock_ms": 0.000311
+        }
+      }
+    },
+    {
+      "terminal": 50000,
+      "active": 50,
+      "active_position": "after_terminal",
+      "methods": {
+        "list_active_tasks": {
+          "record_visits": 0,
+          "record_lookups": 0,
+          "history_visits": 0,
+          "active_index_visits": 50,
+          "median_ms": 0.664483,
+          "median_lock_ms": 0.004046
+        },
+        "capture_task_list": {
+          "record_visits": 0,
+          "record_lookups": 20,
+          "history_visits": 20,
+          "active_index_visits": 50,
+          "median_ms": 3.105688,
+          "median_lock_ms": 0.023305
+        },
+        "capture_status_only": {
+          "record_visits": 0,
+          "record_lookups": 20,
+          "history_visits": 20,
+          "active_index_visits": 50,
+          "median_ms": 0.88775,
+          "median_lock_ms": 0.011527
+        },
+        "count_active_tasks": {
+          "record_visits": 0,
+          "record_lookups": 0,
+          "history_visits": 0,
+          "active_index_visits": 0,
+          "median_ms": 0.000811,
+          "median_lock_ms": 0.00026
+        },
+        "has_active_tasks": {
+          "record_visits": 0,
+          "record_lookups": 0,
+          "history_visits": 0,
+          "active_index_visits": 0,
+          "median_ms": 0.000811,
+          "median_lock_ms": 0.00029
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,130 @@
+密集扫描按逐点估计轨迹补偿到同源输出参考，保留点数及原滤波状态。
+
+--- a/src/laserMapping.hpp
++++ b/src/laserMapping.hpp
+@@ -17,6 +17,7 @@
+ #include "parameters.h"
+ #include "Estimator.h"
+ #include "native_lio_arguments.hpp"
++#include "pointlio_scan_output.hpp"
+ 
+ inline const bool time_list(PointType &x, PointType &y) {return (x.curvature < y.curvature);}
+ 
+@@ -57,6 +58,10 @@
+     // 仅统计本实例初图阶段实际获得的非空扫描，不把惯性初始化空输出算作一帧。
+     int initial_map_frames_ = 1;
+     std::size_t initial_map_frame_count_ = 0;
++    // 与最近一次成功发布的位姿共同冻结，空转或初始化不能覆盖输出点云。
++    nuwax_lio::PointLioScanOutput scan_output_;
++    void record_output_pose(double timestamp);
++    bool finish_output_scan(const custom_messages::Odometry& odometry);
+ };
+ 
+ 
+@@ -686,6 +691,7 @@
+                 crossmat_list[i] = point_crossmat;
+             }
+ 
++            scan_output_.begin_scan();
+             if (!use_imu_as_input) {
+                 bool imu_upda_cov = false;
+                 effct_feat_num = 0;
+@@ -780,7 +786,10 @@
+                         idx += time_seq[k];
+                         continue;
+                     }
+-                    if (!kf_output.update_iterated_dyn_share_modified()) {
++                    const bool measurement_updated = kf_output.update_iterated_dyn_share_modified();
++                    // 匹配不足时仍保留真实预测状态，不能跳过这段扫描运动。
++                    record_output_pose(time_current);
++                    if (!measurement_updated) {
+                         idx = idx + time_seq[k];
+                         continue;
+                     }
+@@ -930,7 +939,10 @@
+                         idx += time_seq[k];
+                         continue;
+                     }
+-                    if (!kf_input.update_iterated_dyn_share_modified()) {
++                    const bool measurement_updated = kf_input.update_iterated_dyn_share_modified();
++                    // 匹配不足时仍保留真实预测状态，不能跳过这段扫描运动。
++                    record_output_pose(time_current);
++                    if (!measurement_updated) {
+                         idx = idx + time_seq[k];
+                         continue;
+                     }
+@@ -1029,6 +1041,7 @@
+                 }
+                 dump_lio_state_to_log(fp);
+             }
++        if (!finish_output_scan(odomAftMapped)) return false;
+         odom_out = odomAftMapped;
+         return true;
+     }
+@@ -1046,24 +1059,51 @@
+     custom_messages::Odometry o;
+     if (run_once(o)) { *msg_in = o; }
+ }
++void LaserMapping::record_output_pose(double timestamp) {
++    const auto append = [&](const auto& state, const V3D& omega, const V3D& acceleration) {
++        nuwax_lio::PointLioScanOutput::Pose pose;
++        pose.timestamp = timestamp;
++        pose.position = state.pos;
++        pose.rotation = Eigen::Quaterniond(M3D(state.rot)).normalized();
++        pose.velocity = state.vel;
++        pose.acceleration = acceleration;
++        pose.omega = omega;
++        if (extrinsic_est_en) {
++            pose.body_from_sensor_rotation = Eigen::Quaterniond(M3D(state.offset_R_L_I)).normalized();
++            pose.body_from_sensor_translation = state.offset_T_L_I;
++        } else {
++            pose.body_from_sensor_rotation = Eigen::Quaterniond(Lidar_R_wrt_IMU).normalized();
++            pose.body_from_sensor_translation = Lidar_T_wrt_IMU;
++        }
++        scan_output_.record(pose);
++    };
++    if (use_imu_as_input) {
++        const auto& state = kf_input.x_;
++        append(state, input_in.gyro - state.bg,
++               state.rot * (input_in.acc - state.ba) + state.gravity);
++    } else {
++        const auto& state = kf_output.x_;
++        append(state, state.omg, state.rot * state.acc + state.gravity);
++    }
++}
++
++bool LaserMapping::finish_output_scan(const custom_messages::Odometry& odometry) {
++    const auto& pose = odometry.pose.pose;
++    const auto& q = pose.orientation;
++    const Eigen::Quaterniond rotation(q.w, q.x, q.y, q.z);
++    Eigen::Isometry3d world_from_sensor = Eigen::Isometry3d::Identity();
++    // 下游沿固定配置外参注册，输出参考必须与同源已发布机体位姿组成同一变换。
++    world_from_sensor.linear() = rotation.toRotationMatrix() * Lidar_R_wrt_IMU;
++    world_from_sensor.translation() = Eigen::Vector3d(
++        pose.position.x, pose.position.y, pose.position.z) + rotation * Lidar_T_wrt_IMU;
++    return scan_output_.finish_scan(feats_undistort, Measures.lidar_beg_time, world_from_sensor);
++}
++
+ PointCloudXYZI::Ptr LaserMapping::get_world_cloud() const {
+-    if (!feats_undistort || feats_undistort->empty()) return nullptr;
+-    int n = feats_undistort->points.size();
+-    PointCloudXYZI::Ptr cloud(new PointCloudXYZI(n, 1));
+-    auto &x = kf_output.x_;
+-    for (int i = 0; i < n; i++) {
+-        const PointType &pi = feats_undistort->points[i];
+-        V3D pb(pi.x, pi.y, pi.z);
+-        V3D pw(x.rot * (x.offset_R_L_I * pb + x.offset_T_L_I) + x.pos);
+-        PointType &po = cloud->points[i];
+-        po.x = pw(0); po.y = pw(1); po.z = pw(2); po.intensity = pi.intensity;
+-    }
+-    return cloud;
++    return scan_output_.world_cloud();
+ }
+ PointCloudXYZI::Ptr LaserMapping::get_body_cloud() const {
+-    if (!feats_undistort || feats_undistort->empty()) return nullptr;
+-    // Undistorted points in the LiDAR/sensor frame — no world registration.
+-    return PointCloudXYZI::Ptr(new PointCloudXYZI(*feats_undistort));
++    return scan_output_.sensor_cloud();
+ }
+ std::vector<double> LaserMapping::get_world_quat() const {
+     Eigen::Quaterniond q(kf_output.x_.rot);

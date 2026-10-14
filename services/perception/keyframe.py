@@ -3,10 +3,9 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 from contracts.geometry import Pose
-from services.memory.semantic_map_builder import SemanticMapBuildResult
 
 
 @dataclass(frozen=True)
@@ -19,106 +18,73 @@ class KeyframeDecision:
 
 
 class PerceptionKeyframeSelector:
-    """关键帧选择器。
+    """关键帧选择器：启动记录一帧，之后位姿平移或旋转超阈值再记录一帧。
 
-    默认规则采用“时间 + 位姿 + 区域/拓扑变化”的组合触发：
-    1. 首帧直接进入关键帧；
-    2. 位姿平移或朝向变化达到阈值时触发；
-    3. 进入新的语义区域或拓扑节点时，仅在缺少稳定位姿上下文时作为补充触发；
-    4. 如果位姿几乎不变，则区域/拓扑变化和最大间隔都会继续被抑制，避免静止时重复调用视觉 API；
-    5. 只有在缺少位姿上下文时，才回退使用最大间隔兜底触发。
+    规则：
+    1. 首帧（尚无任何关键帧）直接触发，reason=bootstrap；
+    2. 距上次关键帧不足 min_interval_sec 时抑制，避免高频重复触发；
+    3. 已有基准位姿时，平移 >= translation_threshold_m 触发 pose_translation，
+       朝向变化 >= yaw_threshold_deg 触发 pose_rotation；
+    4. 还没有基准位姿（首帧触发时 SLAM 尚未给出坐标），一旦拿到首个有效位姿
+       立即触发 pose_baseline_acquired 并登记为基准，之后转入规则 3。
+
+    与启动时机无关：无论谁先就绪，只要 SLAM 后续给出坐标，就按坐标变化更新；
+    位姿始终不可用时只在首帧出一帧，不再有其它兜底触发。
     """
 
     def __init__(
         self,
         *,
         min_interval_sec: float,
-        max_interval_sec: float,
         translation_threshold_m: float,
         yaw_threshold_deg: float,
     ) -> None:
         self._min_interval_sec = max(0.05, float(min_interval_sec))
-        self._max_interval_sec = max(self._min_interval_sec, float(max_interval_sec))
         self._translation_threshold_m = max(0.0, float(translation_threshold_m))
         self._yaw_threshold_rad = math.radians(max(0.0, float(yaw_threshold_deg)))
         self._last_keyframe_at = None
         self._last_keyframe_pose = None
-        self._last_semantic_region_id = None
-        self._last_topo_node_id = None
+
+    def update_thresholds(self, *, min_interval_sec, translation_threshold_m, yaw_threshold_deg) -> None:
+        """由感知运行锁保护，保留上一关键帧及位姿基准。"""
+        self._min_interval_sec = max(0.05, float(min_interval_sec))
+        self._translation_threshold_m = max(0.0, float(translation_threshold_m))
+        self._yaw_threshold_rad = math.radians(max(0.0, float(yaw_threshold_deg)))
 
     def decide(
         self,
         *,
         now: datetime,
         current_pose: Optional[Pose],
-        map_context: Optional[SemanticMapBuildResult],
     ) -> KeyframeDecision:
-        anchor_metadata = self._resolve_anchor_metadata(current_pose=current_pose, map_context=map_context)
         if self._last_keyframe_at is None:
-            return KeyframeDecision(True, "bootstrap", anchor_metadata)
+            return KeyframeDecision(True, "bootstrap", {})
 
         elapsed_sec = max(0.0, (now - self._last_keyframe_at).total_seconds())
-        metadata = {
-            **anchor_metadata,
-            "elapsed_sec": round(elapsed_sec, 6),
-        }
+        metadata: Dict[str, object] = {"elapsed_sec": round(elapsed_sec, 6)}
         if elapsed_sec < self._min_interval_sec:
             return KeyframeDecision(False, "below_min_interval", metadata)
 
-        has_pose_context = current_pose is not None and self._last_keyframe_pose is not None
-        pose_is_static = False
-        if current_pose is not None and self._last_keyframe_pose is not None:
-            translation_m = self._distance(current_pose, self._last_keyframe_pose)
-            yaw_delta_rad = self._yaw_delta(current_pose, self._last_keyframe_pose)
-            metadata.update(
-                {
-                    "translation_m": round(translation_m, 6),
-                    "yaw_delta_deg": round(math.degrees(yaw_delta_rad), 6),
-                }
-            )
-            if translation_m >= self._translation_threshold_m:
-                return KeyframeDecision(True, "pose_translation", metadata)
-            if yaw_delta_rad >= self._yaw_threshold_rad:
-                return KeyframeDecision(True, "pose_rotation", metadata)
-            pose_is_static = True
+        # 还没有有效位姿，无从判定移动，等待 SLAM 给出坐标。
+        if current_pose is None:
+            return KeyframeDecision(False, "pose_unavailable", metadata)
 
-        semantic_region_id = anchor_metadata.get("semantic_region_id")
-        topo_node_id = anchor_metadata.get("topo_node_id")
-        if semantic_region_id and semantic_region_id != self._last_semantic_region_id:
-            metadata.update(
-                {
-                    "anchor_change_kind": "semantic_region",
-                    "anchor_change_from": self._last_semantic_region_id,
-                    "anchor_change_to": semantic_region_id,
-                }
-            )
-            if has_pose_context and pose_is_static:
-                metadata["stationary_suppressed"] = True
-                return KeyframeDecision(False, "stationary_anchor_hold", metadata)
-            return KeyframeDecision(True, "semantic_region_changed", metadata)
-        if topo_node_id and topo_node_id != self._last_topo_node_id:
-            metadata.update(
-                {
-                    "anchor_change_kind": "topology_node",
-                    "anchor_change_from": self._last_topo_node_id,
-                    "anchor_change_to": topo_node_id,
-                }
-            )
-            if has_pose_context and pose_is_static:
-                metadata["stationary_suppressed"] = True
-                return KeyframeDecision(False, "stationary_anchor_hold", metadata)
-            return KeyframeDecision(True, "topology_node_changed", metadata)
+        # 首帧触发时 SLAM 尚未就绪、基准位姿为空；拿到首个有效位姿即登记为基准。
+        if self._last_keyframe_pose is None:
+            return KeyframeDecision(True, "pose_baseline_acquired", metadata)
 
-        if elapsed_sec >= self._max_interval_sec:
-            metadata.update(
-                {
-                    "max_interval_elapsed": True,
-                    "stationary_suppressed": has_pose_context,
-                }
-            )
-            if has_pose_context:
-                return KeyframeDecision(False, "stationary_pose_hold", metadata)
-            return KeyframeDecision(True, "max_interval", metadata)
+        translation_m = self._distance(current_pose, self._last_keyframe_pose)
+        yaw_delta_rad = self._yaw_delta(current_pose, self._last_keyframe_pose)
+        metadata.update(
+            {
+                "translation_m": round(translation_m, 6),
+                "yaw_delta_deg": round(math.degrees(yaw_delta_rad), 6),
+            }
+        )
+        if translation_m >= self._translation_threshold_m:
+            return KeyframeDecision(True, "pose_translation", metadata)
+        if yaw_delta_rad >= self._yaw_threshold_rad:
+            return KeyframeDecision(True, "pose_rotation", metadata)
         return KeyframeDecision(False, "no_significant_change", metadata)
 
     def mark_processed(
@@ -126,60 +92,16 @@ class PerceptionKeyframeSelector:
         *,
         timestamp: datetime,
         current_pose: Optional[Pose],
-        map_context: Optional[SemanticMapBuildResult],
     ) -> None:
-        """记录最近一次关键帧。"""
+        """记录最近一次关键帧。
 
-        anchor_metadata = self._resolve_anchor_metadata(current_pose=current_pose, map_context=map_context)
+        基准位姿仅在拿到有效位姿时更新，避免首帧 SLAM 未就绪时把基准闩成 None
+        而导致后续移动判定永远进不去。
+        """
+
         self._last_keyframe_at = timestamp
-        self._last_keyframe_pose = current_pose
-        self._last_semantic_region_id = str(anchor_metadata.get("semantic_region_id") or "") or None
-        self._last_topo_node_id = str(anchor_metadata.get("topo_node_id") or "") or None
-
-    def _resolve_anchor_metadata(
-        self,
-        *,
-        current_pose: Optional[Pose],
-        map_context: Optional[SemanticMapBuildResult],
-    ) -> Dict[str, object]:
-        metadata: Dict[str, object] = {
-            "semantic_region_id": None,
-            "topo_node_id": None,
-            "map_version_id": map_context.map_version_id if map_context is not None else None,
-        }
-        if current_pose is None or map_context is None:
-            return metadata
-
-        best_region_id = None
-        best_region_distance = None
-        for region in map_context.semantic_regions:
-            if region.centroid is None:
-                continue
-            distance_m = self._distance(current_pose, region.centroid)
-            if best_region_distance is None or distance_m < best_region_distance:
-                best_region_distance = distance_m
-                best_region_id = region.region_id
-
-        best_topo_node_id = None
-        best_topo_distance = None
-        for node_id, node in map_context.topology_nodes_by_id.items():
-            try:
-                node_x = float(node.get("x"))
-                node_y = float(node.get("y"))
-                node_z = float(node.get("z", 0.0))
-            except (TypeError, ValueError):
-                continue
-            dx = float(current_pose.position.x) - node_x
-            dy = float(current_pose.position.y) - node_y
-            dz = float(current_pose.position.z) - node_z
-            distance_m = math.sqrt((dx * dx) + (dy * dy) + (dz * dz))
-            if best_topo_distance is None or distance_m < best_topo_distance:
-                best_topo_distance = distance_m
-                best_topo_node_id = node_id
-
-        metadata["semantic_region_id"] = best_region_id
-        metadata["topo_node_id"] = best_topo_node_id
-        return metadata
+        if current_pose is not None:
+            self._last_keyframe_pose = current_pose
 
     def _distance(self, left: Pose, right: Pose) -> float:
         dx = float(left.position.x) - float(right.position.x)

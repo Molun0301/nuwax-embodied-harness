@@ -1,0 +1,302 @@
+{
+  "schema_version": 1,
+  "date_utc": "2026-10-13",
+  "source": {
+    "starting_revision_from_parent": "8949d9d0919a4eb72609161e7a18af35de816754",
+    "runtime_owner_source_freeze_released_utc": "2026-10-13T23:25:06Z",
+    "head_observed_during_report_materialization": "79bb33f97f16f8395436ca8ec3b53ca91bef6edc",
+    "head_observed_utc": "2026-10-13T23:34:48Z",
+    "changed_paths_from_starting_revision": [
+      "docs/diagnostics/navigation-recovery-robustness-20261013.json",
+      "docs/diagnostics/navigation-recovery-robustness-20261013.md",
+      "docs/diagnostics/python-guarded-integration-20261013-results.json",
+      "docs/diagnostics/python-guarded-integration-20261013.md",
+      "docs/performance-artifact-metadata-access.md",
+      "scripts/diagnostics/artifact_payload_lookup_boundary.py",
+      "scripts/diagnostics/python-guarded-integration-20261013-targets.txt",
+      "scripts/diagnostics/verify_python_guarded_integration.py",
+      "services/nuwax-workspace/crates/nuwax-nav-runtime/src/scheduler_detour_cancellation_tests.rs"
+    ],
+    "qualification_revision_caveat": "No Git revision was sampled at build time. Starting revision plus the explicitly frozen uncommitted scheduler fixture defines tested source; later commits must not be represented as the build-time HEAD. Current HEAD changes from start comprise that test fixture and documentation/diagnostic scripts, with no production-source changes."
+  },
+  "environment": {
+    "rust": "1.88.0",
+    "cargo": "1.88.0",
+    "offline": true,
+    "locked": true,
+    "cargo_jobs": 2,
+    "release_profiles_unchanged": true,
+    "target_caches_preserved": true
+  },
+  "evidence_directory_relative_to_checkout": "../neh-evidence/final-native-integration-20261013",
+  "production_checks": [
+    {
+      "manifest": "services/nuwax-workspace/Cargo.toml",
+      "package": "nuwax-nav-stack",
+      "binary": "nuwax-nav-stack",
+      "features": [
+        "simple-2d",
+        "replanning-astar",
+        "mls"
+      ],
+      "reported_seconds": 7.21,
+      "exit": 0,
+      "log_file": "stack-production-check.log"
+    },
+    {
+      "manifest": "services/geometry/nuwax_geometry_runtime/Cargo.toml",
+      "binary": "nuwax-geometry-runtime",
+      "features": [
+        "real-lcm-bridge (default)"
+      ],
+      "reported_seconds": 81,
+      "exit": 0,
+      "log_file": "geometry-production-check.log"
+    }
+  ],
+  "stack_build": {
+    "exit": 0,
+    "reported_seconds": 94,
+    "executable": "services/nuwax-workspace/target/release/deps/nuwax_nav_stack-c6fb4d4186a44e7e",
+    "features": [
+      "click-goal",
+      "default",
+      "foundation",
+      "guard-runtime",
+      "lcm-runtime",
+      "mls",
+      "surface-recovery-qualification"
+    ],
+    "profile": {
+      "opt_level": "3",
+      "debuginfo": 0,
+      "debug_assertions": false,
+      "overflow_checks": false,
+      "test": true
+    },
+    "fresh": false,
+    "log_files": [
+      "stack-build.jsonl",
+      "stack-build.log",
+      "stack-provenance.json"
+    ]
+  },
+  "ordinary_qualification": {
+    "selector": "qualification",
+    "args": [
+      "--nocapture",
+      "--test-threads=1"
+    ],
+    "passed": 15,
+    "failed": 0,
+    "ignored": 8,
+    "filtered": 282,
+    "seconds": 0.1,
+    "exit": 0,
+    "log_file": "qualification-ordinary.log"
+  },
+  "exact_tests": [
+    {
+      "selector": "lcm_dataflow::surface_dataflow::tests::support_recovery_qualification::live_source_is_required_before_goal_admission",
+      "command": [
+        "services/nuwax-workspace/target/release/deps/nuwax_nav_stack-c6fb4d4186a44e7e",
+        "lcm_dataflow::surface_dataflow::tests::support_recovery_qualification::live_source_is_required_before_goal_admission",
+        "--ignored",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit": 0,
+      "exact_one_passed": true,
+      "wall_seconds": 1.1931225679982163,
+      "log_file": "live_source_is_required_before_goal_admission.log",
+      "test_result": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0,
+        "filtered": 304,
+        "seconds": 1.19
+      }
+    },
+    {
+      "selector": "lcm_dataflow::surface_dataflow::tests::dynamic_occupancy_qualification::original_codec_geometry_and_body_witness_preflight",
+      "command": [
+        "services/nuwax-workspace/target/release/deps/nuwax_nav_stack-c6fb4d4186a44e7e",
+        "lcm_dataflow::surface_dataflow::tests::dynamic_occupancy_qualification::original_codec_geometry_and_body_witness_preflight",
+        "--ignored",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit": 0,
+      "exact_one_passed": true,
+      "wall_seconds": 0.8758947080023063,
+      "log_file": "original_codec_geometry_and_body_witness_preflight.log",
+      "test_result": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0,
+        "filtered": 304,
+        "seconds": 0.87
+      }
+    },
+    {
+      "selector": "lcm_dataflow::surface_dataflow::tests::support_recovery_qualification::original_goal_known_drop_recovers_and_arrives_local_planning_off",
+      "command": [
+        "services/nuwax-workspace/target/release/deps/nuwax_nav_stack-c6fb4d4186a44e7e",
+        "lcm_dataflow::surface_dataflow::tests::support_recovery_qualification::original_goal_known_drop_recovers_and_arrives_local_planning_off",
+        "--ignored",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit": 0,
+      "exact_one_passed": true,
+      "wall_seconds": 6.955889559998468,
+      "log_file": "original_goal_known_drop_recovers_and_arrives_local_planning_off.log",
+      "test_result": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0,
+        "filtered": 304,
+        "seconds": 6.95
+      }
+    },
+    {
+      "selector": "lcm_dataflow::surface_dataflow::tests::support_recovery_qualification::original_goal_known_drop_recovers_and_arrives_local_planning_on",
+      "command": [
+        "services/nuwax-workspace/target/release/deps/nuwax_nav_stack-c6fb4d4186a44e7e",
+        "lcm_dataflow::surface_dataflow::tests::support_recovery_qualification::original_goal_known_drop_recovers_and_arrives_local_planning_on",
+        "--ignored",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit": 0,
+      "exact_one_passed": true,
+      "wall_seconds": 8.967661800001224,
+      "log_file": "original_goal_known_drop_recovers_and_arrives_local_planning_on.log",
+      "test_result": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0,
+        "filtered": 304,
+        "seconds": 8.95
+      }
+    },
+    {
+      "selector": "lcm_dataflow::surface_dataflow::tests::dynamic_occupancy_qualification::dynamic_box_local_planning_off",
+      "command": [
+        "services/nuwax-workspace/target/release/deps/nuwax_nav_stack-c6fb4d4186a44e7e",
+        "lcm_dataflow::surface_dataflow::tests::dynamic_occupancy_qualification::dynamic_box_local_planning_off",
+        "--ignored",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit": 0,
+      "exact_one_passed": true,
+      "wall_seconds": 17.266751253999246,
+      "log_file": "dynamic_box_local_planning_off.log",
+      "test_result": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0,
+        "filtered": 304,
+        "seconds": 17.25
+      }
+    },
+    {
+      "selector": "lcm_dataflow::surface_dataflow::tests::dynamic_occupancy_qualification::dynamic_box_local_planning_on",
+      "command": [
+        "services/nuwax-workspace/target/release/deps/nuwax_nav_stack-c6fb4d4186a44e7e",
+        "lcm_dataflow::surface_dataflow::tests::dynamic_occupancy_qualification::dynamic_box_local_planning_on",
+        "--ignored",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit": 0,
+      "exact_one_passed": true,
+      "wall_seconds": 13.321186721997947,
+      "log_file": "dynamic_box_local_planning_on.log",
+      "test_result": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0,
+        "filtered": 304,
+        "seconds": 13.27
+      }
+    },
+    {
+      "selector": "lcm_dataflow::surface_dataflow::tests::dynamic_occupancy_qualification::dynamic_wall_local_planning_off",
+      "command": [
+        "services/nuwax-workspace/target/release/deps/nuwax_nav_stack-c6fb4d4186a44e7e",
+        "lcm_dataflow::surface_dataflow::tests::dynamic_occupancy_qualification::dynamic_wall_local_planning_off",
+        "--ignored",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit": 0,
+      "exact_one_passed": true,
+      "wall_seconds": 9.130383916002756,
+      "log_file": "dynamic_wall_local_planning_off.log",
+      "test_result": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0,
+        "filtered": 304,
+        "seconds": 9.12
+      }
+    },
+    {
+      "selector": "lcm_dataflow::surface_dataflow::tests::dynamic_occupancy_qualification::dynamic_wall_local_planning_on",
+      "command": [
+        "services/nuwax-workspace/target/release/deps/nuwax_nav_stack-c6fb4d4186a44e7e",
+        "lcm_dataflow::surface_dataflow::tests::dynamic_occupancy_qualification::dynamic_wall_local_planning_on",
+        "--ignored",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit": 0,
+      "exact_one_passed": true,
+      "wall_seconds": 7.881970974998694,
+      "log_file": "dynamic_wall_local_planning_on.log",
+      "test_result": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0,
+        "filtered": 304,
+        "seconds": 7.87
+      }
+    }
+  ],
+  "separate_runtime_owner_result": {
+    "performed_by_this_worker": false,
+    "passed": 236,
+    "failed": 0,
+    "ignored": 58,
+    "filtered_real_uds": 5,
+    "seconds": 56.45,
+    "report": "docs/diagnostics/navigation-recovery-robustness-20261013.md"
+  },
+  "limitations": [
+    "Production cargo check is not a linked deployment build",
+    "Cloud synthetic integration only, no robot or hardware SDK qualification",
+    "No real UDS qualification; existing AF_UNIX environment denial remains",
+    "No full geometry or workspace suite",
+    "No hardware CPU, peak memory or hard real-time claim",
+    "Scenario durations are not paired optimization measurements",
+    "No tests rerun during report materialization"
+  ]
+}

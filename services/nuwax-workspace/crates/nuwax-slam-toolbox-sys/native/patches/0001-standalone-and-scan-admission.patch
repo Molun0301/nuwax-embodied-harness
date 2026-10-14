@@ -1,0 +1,108 @@
+--- a/upstream/karto/include/karto_sdk/Mapper.h
++++ b/upstream/karto/include/karto_sdk/Mapper.h
+@@ -32,7 +32,6 @@
+ #include "tbb/blocked_range.h"
+ 
+ #include "Eigen/Core"
+-#include "rclcpp_lifecycle/lifecycle_node.hpp"
+ #include "Karto.h"  // NOLINT
+ #include "nanoflann_adaptors.h"  // NOLINT
+ 
+@@ -979,7 +978,6 @@
+    */
+   virtual void Compute() = 0;
+ 
+-  virtual void Configure(rclcpp_lifecycle::LifecycleNode::SharedPtr node) = 0;
+ 
+   /**
+    * Get corrected poses after optimization
+@@ -2156,6 +2154,12 @@
+ 
+ public:
+   void SetUseScanMatching(kt_bool val) {m_pUseScanMatching->SetValue(val);}
++
++  // 平台只读诊断和准入门限；不进入上游归档格式。
++  double lastScanResponse() const { return m_LastScanResponse; }
++  void setMinimumScanResponse(double value) { m_MinimumScanResponse = value; }
++  double m_LastScanResponse = -1.0;
++  double m_MinimumScanResponse = 0.0;
+ 
+ protected:
+   kt_bool m_Initialized;
+--- a/upstream/karto/src/Mapper.cpp
++++ b/upstream/karto/src/Mapper.cpp
+@@ -2730,6 +2730,7 @@
+ 
+ kt_bool Mapper::Process(LocalizedRangeScan * pScan, Matrix3 * covariance)
+ {
++  m_LastScanResponse = -1.0;
+   if (pScan != NULL) {
+     karto::LaserRangeFinder * pLaserRangeFinder = pScan->GetLaserRangeFinder();
+ 
+@@ -2763,11 +2764,12 @@
+     // correct scan (if not first scan)
+     if (m_pUseScanMatching->GetValue() && pLastScan != NULL) {
+       Pose2 bestPose;
+-      m_pSequentialScanMatcher->MatchScan(pScan,
++      m_LastScanResponse = m_pSequentialScanMatcher->MatchScan(pScan,
+         m_pMapperSensorManager->GetRunningScans(pScan->GetSensorName()),
+         bestPose,
+         cov);
+-      pScan->SetSensorPose(bestPose);
++      if (!std::isfinite(m_LastScanResponse) || m_LastScanResponse < m_MinimumScanResponse) { return false; }
++    pScan->SetSensorPose(bestPose);
+       if (covariance) {
+         *covariance = cov;
+       }
+@@ -2802,6 +2804,7 @@
+ 
+ kt_bool Mapper::ProcessAgainstNodesNearBy(LocalizedRangeScan * pScan, kt_bool addScanToLocalizationBuffer, Matrix3 * covariance)
+ {
++  m_LastScanResponse = -1.0;
+   if (pScan != NULL) {
+     karto::LaserRangeFinder * pLaserRangeFinder = pScan->GetLaserRangeFinder();
+ 
+@@ -2828,17 +2831,20 @@
+       m_pMapperSensorManager->SetLastScan(pLastScan);
+     }
+ 
++    if (pLastScan == NULL) { return false; }
++
+     Matrix3 cov;
+     cov.SetToIdentity();
+ 
+     // correct scan (if not first scan)
+     if (m_pUseScanMatching->GetValue() && pLastScan != NULL) {
+       Pose2 bestPose;
+-      m_pSequentialScanMatcher->MatchScan(pScan,
++      m_LastScanResponse = m_pSequentialScanMatcher->MatchScan(pScan,
+         m_pMapperSensorManager->GetRunningScans(pScan->GetSensorName()),
+         bestPose,
+         cov);
+-      pScan->SetSensorPose(bestPose);
++      if (!std::isfinite(m_LastScanResponse) || m_LastScanResponse < m_MinimumScanResponse) { return false; }
++    pScan->SetSensorPose(bestPose);
+     }
+ 
+     pScan->SetOdometricPose(pScan->GetCorrectedPose());
+@@ -2882,6 +2888,7 @@
+ 
+ kt_bool Mapper::ProcessLocalization(LocalizedRangeScan * pScan, Matrix3 * covariance)
+ {
++  m_LastScanResponse = -1.0;
+   if (pScan == NULL) {
+     return false;
+   }
+@@ -2924,10 +2931,11 @@
+   // correct scan (if not first scan)
+   if (m_pUseScanMatching->GetValue() && pLastScan != NULL) {
+     Pose2 bestPose;
+-    m_pSequentialScanMatcher->MatchScan(pScan,
++    m_LastScanResponse = m_pSequentialScanMatcher->MatchScan(pScan,
+       m_pMapperSensorManager->GetRunningScans(pScan->GetSensorName()),
+       bestPose,
+       cov);
++    if (!std::isfinite(m_LastScanResponse) || m_LastScanResponse < m_MinimumScanResponse) { return false; }
+     pScan->SetSensorPose(bestPose);
+     if (covariance) {
+       *covariance = cov;

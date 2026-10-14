@@ -1,0 +1,19 @@
+# 基础网关沿用已批准版本，不包含 torch、视觉模型或本地语义模型依赖。
+websockets==10.4
+numpy==1.24.4; python_version < "3.12"
+# Ubuntu 24.04 的系统解释器需要支持 Python 3.12 的同主版本数组库。
+numpy==1.26.4; python_version >= "3.12"
+opencv-python==4.10.0.84
+pydantic==2.10.6
+typing_extensions==4.13.2
+jsonschema==4.19.2
+fastapi==0.115.14
+starlette==0.44.0
+uvicorn==0.30.6
+httpx==0.27.2
+openai==1.60.2
+grpcio==1.70.0
+protobuf==5.29.6
+Pillow==10.4.0
+psutil==7.2.2
+lcm==1.5.2

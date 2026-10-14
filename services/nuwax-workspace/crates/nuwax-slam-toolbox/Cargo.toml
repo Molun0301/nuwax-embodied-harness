@@ -1,0 +1,12 @@
+[package]
+name = "nuwax-slam-toolbox"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "二维扫描建图、局部里程计与图定位的受控Rust接口"
+[dependencies]
+nuwax-slam-toolbox-sys = { path = "../nuwax-slam-toolbox-sys" }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, features = ["float_roundtrip"] }

@@ -1,0 +1,98 @@
+//! nuwax 地图云服务
+//!
+//! The default `cloud-enabled` feature exposes explicit live HTTP clients and
+//! offline raster utilities. Google requests require `GOOGLE_MAPS_API_KEY`;
+//! OSM endpoints and user-agent values can be overridden with `NUWAX_OSM_*`
+//! environment variables. Offline mode never fabricates network results.
+//!
+//! 模块：
+//! - `google_maps`: `geocode` / `places_nearby` / `GoogleMapsClient`
+//! - `osm`: `nominatim_search` / `download_tile` / `stitch_tiles` / `OsmClient`
+//! - `coords`: WGS84 ↔ Web Mercator ↔ slippy tile 坐标转换
+//! - `georeference`: immutable georeference-v1 validation and metric conversion
+//! - `goal_adapter`: pure backend-local goal intent construction
+//!
+//! 错误类型：
+//! - `CloudError`: 统一 cloud 错误（含 `ApiKeyMissing` / `Http` / `Parse` / `Disabled`）
+//! - `CloudMode`: explicit offline/live network policy
+//! - `CloudMapError`: feature-off compatibility error (`Disabled`)
+
+#![deny(unsafe_code)]
+#![warn(missing_docs)]
+
+use thiserror::Error;
+
+#[cfg(feature = "cloud-enabled")]
+pub mod coords;
+#[cfg(feature = "cloud-enabled")]
+pub mod current_location;
+#[cfg(feature = "cloud-enabled")]
+pub mod georeference;
+#[cfg(feature = "cloud-enabled")]
+pub mod goal_adapter;
+#[cfg(feature = "cloud-enabled")]
+pub mod google_maps;
+#[cfg(feature = "cloud-enabled")]
+pub mod osm;
+#[cfg(feature = "cloud-enabled")]
+pub mod owner;
+
+#[cfg(all(test, feature = "cloud-enabled"))]
+mod assigned_test_support;
+
+#[cfg(feature = "cloud-enabled")]
+pub use coords::{web_mercator_to_wgs84, wgs84_to_tile, wgs84_to_web_mercator};
+#[cfg(feature = "cloud-enabled")]
+pub use current_location::{
+    CurrentLocationConfig, CurrentLocationMap, MapImage, MapImageQuery, MapPixelMatch,
+    MapPositionMatch,
+};
+#[cfg(feature = "cloud-enabled")]
+pub use georeference::{
+    AssignedGeoreferenceV3, DigestError, GeoreferenceBindingV1, GeoreferenceError, GeoreferenceV1, MapMetricPosition,
+    Sha256Digest, VerifiedGeoreferenceV1, GEOREFERENCE_ALTITUDE_POLICY,
+    GEOREFERENCE_AXIS_CONVENTION, GEOREFERENCE_CANONICAL_PATH, GEOREFERENCE_PROJECTED_CRS,
+    GEOREFERENCE_SCHEMA_VERSION, GEOREFERENCE_SOURCE_CRS, MAX_ABSOLUTE_MAP_COORDINATE_M,
+    MAX_LOCAL_GOAL_OFFSET_M, WEB_MERCATOR_MAX_LATITUDE_DEG,
+};
+#[cfg(feature = "cloud-enabled")]
+pub use goal_adapter::{
+    adapt_assigned_wgs84_goal_intent, adapt_wgs84_goal_intent, ActiveMapIdentityV2,
+    AssignedMapIdentityV3, AssignedMappingCloudGoalIntentV3, CloudQueryIdentityV1, GoalAdapterError,
+    MappingCloudGoalIntentV2, TerminalHeadingPolicy, MAPPING_CLOUD_GOAL_INTENT_SCHEMA_VERSION,
+    ASSIGNED_MAPPING_CLOUD_GOAL_INTENT_SCHEMA_VERSION,
+};
+#[cfg(feature = "cloud-enabled")]
+pub use google_maps::{
+    geocode, places_nearby, CloudError, CloudMode, GeocodeComponents, GeocodeResult,
+    GoogleMapsClient, LatLng, Place,
+};
+#[cfg(feature = "cloud-enabled")]
+pub use osm::{
+    download_tile, nominatim_search, stitch_tiles, OsmClient, OsmPlace, OsmTile, OsmTileServer,
+};
+#[cfg(feature = "cloud-enabled")]
+pub use owner::{
+    MappingCloudOwner, MappingCloudOwnerError, MappingCloudProvider, MappingCloudRequest,
+    MappingCloudShutdown, MappingCloudSubmit, MappingCloudTerminal,
+};
+
+/// Cloud map 错误（始终可用，feature off 时返 `Disabled`）
+#[derive(Debug, Error)]
+pub enum CloudMapError {
+    /// Feature 关闭时所有 cloud map 操作返此错误
+    #[error("cloud map disabled (compile with --features cloud-enabled)")]
+    Disabled,
+}
+
+/// 返回 `Err(CloudMapError::Disabled)`（feature off 时）
+#[cfg(not(feature = "cloud-enabled"))]
+pub fn google_maps_search(_query: &str) -> Result<(), CloudMapError> {
+    Err(CloudMapError::Disabled)
+}
+
+/// 返回 `Err(CloudMapError::Disabled)`（feature off 时）
+#[cfg(not(feature = "cloud-enabled"))]
+pub fn osm_fetch_tile(_z: u8, _x: u32, _y: u32) -> Result<(), CloudMapError> {
+    Err(CloudMapError::Disabled)
+}

@@ -1,0 +1,2 @@
+# raspi_lidar_robot 当前为预览 profile；系统侧还需要 V4L2 与串口设备权限。
+pyserial>=3.5

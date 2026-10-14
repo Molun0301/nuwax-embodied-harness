@@ -1,0 +1,1396 @@
+{
+  "base_local": "914014667eea78f3bfdc1169b47d1e282ede7209",
+  "base_remote": "baa93057e005132b6326fdb6338a3ada68289bb0",
+  "base_tree": "c9d7bea863ff94258901dbdaba699412c4963218",
+  "qualification": "Retain canonical admitted producer-key path only.47distinctfocusedpasses/0fail/1ignored;7matchedprepare-onlypairswin. Generic/rawlegacycontentfingerprintremains. ExistingLIOwireequality and lifecyclefences retained. Notallapplicationhashesremoved; notrelease,contention,backendcompute,endtoendnavigation or realtimequalification.",
+  "source_manifest": "c7fed8437fa72b037e99558187f2aa515ca20a835cba2eeb4fa485326c45ff13  src/mapping_adapter.rs\n482e4d7bf16b7cfc4c15f42b67b30ec3e507ecb59529ddf52d9480973277184c  src/mapping_ingest_hash_benchmark_tests.rs\nc4fac67dd03f5afefb753d767287fd46a115a1038bf168d7375021bb313be67d  src/mapping_admitted_frame_tests.rs\n16465c27fbfa045088d71d10f32da866fffa7aa62ee93b2c2175d5aa5507407a  src/lio_ingress.rs\n7c52003abd5cf3b231261c43992c15d3848897e5465b2b4c5f89cf98d24ec83b  src/lcm_runtime.rs\na180d2366e9ed9cbbbd1cc228f90a10398568e90431d3187fcddba265fd169fa  ../../nuwax-workspace/crates/nuwax-mapping/src/mapping_session.rs\n923d4c724c541b1db6bfac0ab09fb23bd13e96e23dd3713fdf7dba943a10c69f  ../../nuwax-workspace/crates/nuwax-mapping/src/mapping_session_hash_baseline_tests.rs\ne006b3e76a4a2b35b1280abb0f9fd211dab3bb03617a5652ef5302883d798ac4  ../../nuwax-workspace/crates/nuwax-mapping/src/mapping_session_admitted_dedup_tests.rs\n9d0be2a30be10ef941bd8fd82045c9a48be8a4c9f1a48007abc1b0a3912c2401  Cargo.lock\n",
+  "source_after_check": "src/mapping_adapter.rs: OK\nsrc/mapping_ingest_hash_benchmark_tests.rs: OK\nsrc/mapping_admitted_frame_tests.rs: OK\nsrc/lio_ingress.rs: OK\nsrc/lcm_runtime.rs: OK\n../../nuwax-workspace/crates/nuwax-mapping/src/mapping_session.rs: OK\n../../nuwax-workspace/crates/nuwax-mapping/src/mapping_session_hash_baseline_tests.rs: OK\n../../nuwax-workspace/crates/nuwax-mapping/src/mapping_session_admitted_dedup_tests.rs: OK\nCargo.lock: OK\n",
+  "build_history": {
+    "baseline_geometry": "exit0,1m00s",
+    "baseline_mapping_offline": "exit101,missingofficialregistryanes0.1.6",
+    "baseline_mapping_locked_registry_retry": "exit0,51.90s,lockunchanged",
+    "registry_growth_bytes": 7405832,
+    "candidate_first": "exit101,twoexistingownedtestcallsmissingbool-to-enummigration",
+    "candidate_r2": {
+      "observed_utc": "2026-10-07T01:46:19.701148+00:00",
+      "session_result": "Unknown process id6321",
+      "build_exit_file_exists": false,
+      "source_hashes_unchanged": true,
+      "last_records": [
+        [
+          "compiler-message",
+          null,
+          "nuwax_geometry_runtime"
+        ],
+        [
+          "compiler-artifact",
+          null,
+          "nuwax_geometry_runtime"
+        ],
+        [
+          "compiler-message",
+          null,
+          "nuwax-geometry-runtime"
+        ],
+        [
+          "compiler-message",
+          null,
+          "nuwax-geometry-runtime"
+        ]
+      ],
+      "compiler_errors": [],
+      "executable_artifacts": [],
+      "status": "interrupted_outcome_unverified_no_success_claim"
+    },
+    "candidate_r3_geometry": "exit0,2m14s",
+    "candidate_r3_mapping": "exit0,5.38s"
+  },
+  "baseline_initial": [
+    {
+      "label": "prepare",
+      "command": [
+        "/workspace/shared/neh-canonical-ingest-20261007/baseline/nuwax-geometry-runtime-test",
+        "mapping_adapter::tests::canonical_ingest_cost_trial::canonical_prepare_lock_cost",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "wall_sec": 0.7860070669994457,
+      "user_cpu_sec": 0.771544,
+      "system_cpu_sec": 0.012118,
+      "launch_peak_rss_kib": 133632,
+      "log": "/workspace/shared/neh-canonical-ingest-20261007/baseline/prepare-attempt1.log",
+      "sha256": "2c2b3599cc21c3d9520a4085ac40757c0e3990ccb3f76cc5a00730511b3ac9fe"
+    },
+    {
+      "label": "fingerprint",
+      "command": [
+        "/workspace/shared/neh-canonical-ingest-20261007/baseline/nuwax-mapping-test",
+        "mapping_session::legacy_fingerprint_cost_trial::measure_legacy_fingerprint_cost",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "wall_sec": 0.21609145498950966,
+      "user_cpu_sec": 0.21384699999999998,
+      "system_cpu_sec": 0.0,
+      "launch_peak_rss_kib": 133632,
+      "log": "/workspace/shared/neh-canonical-ingest-20261007/baseline/fingerprint-attempt1.log",
+      "sha256": "2b769a1057a9d2bb50983dd1af349d488abbf0edb24075f1cae08dafefa50f0d"
+    }
+  ],
+  "focused": {
+    "identities": {
+      "geometry": {
+        "path": "/workspace/shared/neh-canonical-ingest-20261007/candidate-r3/nuwax-geometry-runtime-test",
+        "sha256": "e9a1f72a5049c841f7ba63c14582d688a34e76e614309d64d1b1d54f1b86228e",
+        "bytes": 124630232,
+        "profile": {
+          "opt_level": "0",
+          "debuginfo": 0,
+          "debug_assertions": true,
+          "overflow_checks": true,
+          "test": true
+        },
+        "features": [
+          "default",
+          "real-lcm-bridge"
+        ]
+      },
+      "mapping": {
+        "path": "/workspace/shared/neh-canonical-ingest-20261007/candidate-r3/nuwax-mapping-test",
+        "sha256": "d1e7e2c16d3f2fda0ecd5e52f9a8da77650b4e86402bff038b4dbcb6edaa8e20",
+        "bytes": 10792280,
+        "profile": {
+          "opt_level": "0",
+          "debuginfo": 0,
+          "debug_assertions": true,
+          "overflow_checks": true,
+          "test": true
+        },
+        "features": []
+      }
+    },
+    "runs": [
+      {
+        "label": "mapping-session",
+        "kind": "mapping",
+        "selector": "mapping_session::",
+        "selected_names": [
+          "mapping_session::admitted_dedup_tests::admitted_and_legacy_keys_have_separate_tags_in_the_same_history",
+          "mapping_session::admitted_dedup_tests::admitted_feeds_retain_rolling_tail_and_do_not_reapply_replay_evictions",
+          "mapping_session::admitted_dedup_tests::admitted_feeds_share_existing_freshness_tolerance_and_zero_timestamp_rules",
+          "mapping_session::admitted_dedup_tests::admitted_key_requires_positive_backend_generation_and_sequence",
+          "mapping_session::admitted_dedup_tests::admitted_path_never_fingerprints_and_each_fresh_legacy_attempt_does_once",
+          "mapping_session::admitted_dedup_tests::admitted_replay_changes_no_points_generation_evictions_or_watermark",
+          "mapping_session::admitted_dedup_tests::admitted_session_trusts_identity_without_revalidating_frame_content",
+          "mapping_session::admitted_dedup_tests::capacity_failure_remembers_no_admitted_key_or_freshness",
+          "mapping_session::admitted_dedup_tests::disabling_history_disables_both_feed_paths_deduplication",
+          "mapping_session::admitted_dedup_tests::each_admitted_identity_component_distinguishes_identical_geometry",
+          "mapping_session::admitted_dedup_tests::empty_admitted_feed_preserves_legacy_acceptance_semantics_at_zero_capacity",
+          "mapping_session::admitted_dedup_tests::legacy_same_timestamp_content_pose_step_and_timestamp_identity_is_unchanged",
+          "mapping_session::admitted_dedup_tests::mixed_history_shares_fifo_expiry_without_refreshing_duplicate_keys",
+          "mapping_session::admitted_dedup_tests::reset_clears_both_identity_tags_and_preserves_session_configuration",
+          "mapping_session::admitted_dedup_tests::stale_admitted_replay_is_rejected_before_deduplication",
+          "mapping_session::admitted_dedup_tests::stale_inputs_skip_fingerprinting_and_precede_zero_capacity_errors",
+          "mapping_session::legacy_fingerprint_cost_trial::measure_legacy_fingerprint_cost",
+          "mapping_session::tests::capacity_rolls_forward_and_keeps_newest_points",
+          "mapping_session::tests::clone_points_does_not_consume_session",
+          "mapping_session::tests::dedup_history_is_bounded_and_expired_replays_can_be_reprocessed",
+          "mapping_session::tests::dedup_key_quantizes_odom_to_mm",
+          "mapping_session::tests::different_point_step_is_not_dedup",
+          "mapping_session::tests::feed_pointcloud_accepts_batch_ending_exactly_at_capacity",
+          "mapping_session::tests::feed_pointcloud_dedup_same_odom_step_keeps_first",
+          "mapping_session::tests::feed_pointcloud_new_revision_after_long_gap_is_accepted",
+          "mapping_session::tests::feed_pointcloud_rolls_when_capacity_is_full",
+          "mapping_session::tests::low_frequency_new_frames_are_not_stale",
+          "mapping_session::tests::now_ns_zero_skips_freshness_check",
+          "mapping_session::tests::out_of_order_message_older_than_tolerance_is_rejected",
+          "mapping_session::tests::point_cloud_accumulator_trait_feed_works",
+          "mapping_session::tests::snapshot_stats_reflects_current_state",
+          "mapping_session::tests::stale_out_of_order_frame_does_not_move_freshness_watermark",
+          "mapping_session::tests::stationary_robot_accepts_new_samples_with_new_message_timestamps",
+          "mapping_session::tests::zero_capacity_returns_resource_exhausted_without_mutation"
+        ],
+        "command": [
+          "/workspace/shared/neh-canonical-ingest-20261007/candidate-r3/nuwax-mapping-test",
+          "mapping_session::",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "wall_sec": 0.05168476099788677,
+        "user_cpu_sec": 0.006481,
+        "system_cpu_sec": 0.0032979999999999997,
+        "launch_peak_rss_kib": 131968,
+        "log": "/workspace/shared/neh-canonical-ingest-20261007/candidate-r3/focused/mapping-session.log",
+        "sha256": "bcabb3f6c22b8cc8139131127ba7d20d8a0aa42f359430c66c2ec994ee6fb62e",
+        "summary": "test result: ok. 33 passed; 0 failed; 1 ignored; 0 measured; 147 filtered out"
+      },
+      {
+        "label": "canonical-adapter",
+        "kind": "geometry",
+        "selector": "mapping_adapter::tests::admitted_mapping_frame_tests::",
+        "selected_names": [
+          "mapping_adapter::tests::admitted_mapping_frame_tests::accepted_frame_replay_after_backend_failure_does_not_append_or_allocate_token",
+          "mapping_adapter::tests::admitted_mapping_frame_tests::coalesced_frame_key_remains_eligible_and_distinct_identical_geometry_is_accepted",
+          "mapping_adapter::tests::admitted_mapping_frame_tests::invalid_frame_does_not_remember_canonical_key_and_old_receipt_stays_stale"
+        ],
+        "command": [
+          "/workspace/shared/neh-canonical-ingest-20261007/candidate-r3/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::admitted_mapping_frame_tests::",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "wall_sec": 0.05086612100421917,
+        "user_cpu_sec": 0.003754,
+        "system_cpu_sec": 0.0073019999999999995,
+        "launch_peak_rss_kib": 131968,
+        "log": "/workspace/shared/neh-canonical-ingest-20261007/candidate-r3/focused/canonical-adapter.log",
+        "sha256": "5ca1bfb09e67ec4d63af7021c03db6e5b942b6de32566cb999305d2ef1c6cd83",
+        "summary": "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 1232 filtered out"
+      },
+      {
+        "label": "session_freshness_uses_source_message_time_not_receive_time",
+        "kind": "geometry",
+        "selector": "mapping_adapter::tests::session_freshness_uses_source_message_time_not_receive_time",
+        "selected_names": [
+          "mapping_adapter::tests::session_freshness_uses_source_message_time_not_receive_time"
+        ],
+        "command": [
+          "/workspace/shared/neh-canonical-ingest-20261007/candidate-r3/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::session_freshness_uses_source_message_time_not_receive_time",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "wall_sec": 0.05065882300550584,
+        "user_cpu_sec": 0.0,
+        "system_cpu_sec": 0.009675,
+        "launch_peak_rss_kib": 131968,
+        "log": "/workspace/shared/neh-canonical-ingest-20261007/candidate-r3/focused/session_freshness_uses_source_message_time_not_receive_time.log",
+        "sha256": "119d4ab8b175b9a727aca5739f8eb078a85f25060590fafd92eff2afe8d7f944",
+        "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1234 filtered out"
+      },
+      {
+        "label": "source_fenced_zero_timestamp_uses_receipt_freshness_and_preserves_metadata",
+        "kind": "geometry",
+        "selector": "mapping_adapter::tests::source_fenced_zero_timestamp_uses_receipt_freshness_and_preserves_metadata",
+        "selected_names": [
+          "mapping_adapter::tests::source_fenced_zero_timestamp_uses_receipt_freshness_and_preserves_metadata"
+        ],
+        "command": [
+          "/workspace/shared/neh-canonical-ingest-20261007/candidate-r3/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::source_fenced_zero_timestamp_uses_receipt_freshness_and_preserves_metadata",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "wall_sec": 0.050826167993363924,
+        "user_cpu_sec": 0.007685,
+        "system_cpu_sec": 0.004791,
+        "launch_peak_rss_kib": 131968,
+        "log": "/workspace/shared/neh-canonical-ingest-20261007/candidate-r3/focused/source_fenced_zero_timestamp_uses_receipt_freshness_and_preserves_metadata.log",
+        "sha256": "221280b6a9f9e47abc3399b2b401790e73a7bb7cb5a83b9605c6b7f761080c4e",
+        "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1234 filtered out"
+      },
+      {
+        "label": "rebuild_cadence_uses_receive_time_when_source_timestamp_is_frozen",
+        "kind": "geometry",
+        "selector": "mapping_adapter::tests::rebuild_cadence_uses_receive_time_when_source_timestamp_is_frozen",
+        "selected_names": [
+          "mapping_adapter::tests::rebuild_cadence_uses_receive_time_when_source_timestamp_is_frozen"
+        ],
+        "command": [
+          "/workspace/shared/neh-canonical-ingest-20261007/candidate-r3/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::rebuild_cadence_uses_receive_time_when_source_timestamp_is_frozen",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "wall_sec": 0.05080430400266778,
+        "user_cpu_sec": 0.004443,
+        "system_cpu_sec": 0.005340999999999999,
+        "launch_peak_rss_kib": 131968,
+        "log": "/workspace/shared/neh-canonical-ingest-20261007/candidate-r3/focused/rebuild_cadence_uses_receive_time_when_source_timestamp_is_frozen.log",
+        "sha256": "35f4e51c0763cf00a861875c90743d0c1ed1e5c0223478f1d0f7c7043f3f7098",
+        "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1234 filtered out"
+      },
+      {
+        "label": "backend_protocol_coalesces_one_in_flight_and_rejects_duplicate_completion",
+        "kind": "geometry",
+        "selector": "mapping_adapter::tests::backend_protocol_coalesces_one_in_flight_and_rejects_duplicate_completion",
+        "selected_names": [
+          "mapping_adapter::tests::backend_protocol_coalesces_one_in_flight_and_rejects_duplicate_completion"
+        ],
+        "command": [
+          "/workspace/shared/neh-canonical-ingest-20261007/candidate-r3/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::backend_protocol_coalesces_one_in_flight_and_rejects_duplicate_completion",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "wall_sec": 0.05074278000392951,
+        "user_cpu_sec": 0.004161,
+        "system_cpu_sec": 0.006908999999999999,
+        "launch_peak_rss_kib": 131968,
+        "log": "/workspace/shared/neh-canonical-ingest-20261007/candidate-r3/focused/backend_protocol_coalesces_one_in_flight_and_rejects_duplicate_completion.log",
+        "sha256": "2e84c163a0c355aafb60cc7591ecfc4ab4c05b98b165a96094c1205274e43f4a",
+        "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1234 filtered out"
+      },
+      {
+        "label": "backend_generation_sequence_and_time_are_fenced",
+        "kind": "geometry",
+        "selector": "lio_ingress::tests::backend_generation_sequence_and_time_are_fenced",
+        "selected_names": [
+          "lio_ingress::tests::backend_generation_sequence_and_time_are_fenced"
+        ],
+        "command": [
+          "/workspace/shared/neh-canonical-ingest-20261007/candidate-r3/nuwax-geometry-runtime-test",
+          "lio_ingress::tests::backend_generation_sequence_and_time_are_fenced",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "wall_sec": 0.05076379800448194,
+        "user_cpu_sec": 0.008999,
+        "system_cpu_sec": 0.0,
+        "launch_peak_rss_kib": 131968,
+        "log": "/workspace/shared/neh-canonical-ingest-20261007/candidate-r3/focused/backend_generation_sequence_and_time_are_fenced.log",
+        "sha256": "01de41411622553795417a8306d7e903769a1ef2ba7e91377ed4c43d4bac4775",
+        "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1234 filtered out"
+      },
+      {
+        "label": "restarted_generation_rejects_old_envelope_before_cursor_mutation",
+        "kind": "geometry",
+        "selector": "lio_ingress::tests::restarted_generation_rejects_old_envelope_before_cursor_mutation",
+        "selected_names": [
+          "lio_ingress::tests::restarted_generation_rejects_old_envelope_before_cursor_mutation"
+        ],
+        "command": [
+          "/workspace/shared/neh-canonical-ingest-20261007/candidate-r3/nuwax-geometry-runtime-test",
+          "lio_ingress::tests::restarted_generation_rejects_old_envelope_before_cursor_mutation",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "wall_sec": 0.05088765500113368,
+        "user_cpu_sec": 0.009967,
+        "system_cpu_sec": 0.0,
+        "launch_peak_rss_kib": 131968,
+        "log": "/workspace/shared/neh-canonical-ingest-20261007/candidate-r3/focused/restarted_generation_rejects_old_envelope_before_cursor_mutation.log",
+        "sha256": "48893619a4e9c0834908974800d5711a392609b2b495cf5572e310259e6002b9",
+        "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1234 filtered out"
+      },
+      {
+        "label": "exact_wire_admission_rejects_changed_body_or_metadata_without_consuming_the_permit",
+        "kind": "geometry",
+        "selector": "lio_ingress::tests::exact_wire_admission_rejects_changed_body_or_metadata_without_consuming_the_permit",
+        "selected_names": [
+          "lio_ingress::tests::exact_wire_admission_rejects_changed_body_or_metadata_without_consuming_the_permit"
+        ],
+        "command": [
+          "/workspace/shared/neh-canonical-ingest-20261007/candidate-r3/nuwax-geometry-runtime-test",
+          "lio_ingress::tests::exact_wire_admission_rejects_changed_body_or_metadata_without_consuming_the_permit",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "wall_sec": 0.05108407000079751,
+        "user_cpu_sec": 0.007758999999999999,
+        "system_cpu_sec": 0.002438,
+        "launch_peak_rss_kib": 131968,
+        "log": "/workspace/shared/neh-canonical-ingest-20261007/candidate-r3/focused/exact_wire_admission_rejects_changed_body_or_metadata_without_consuming_the_permit.log",
+        "sha256": "d4fd66c9c637ef3de35e406aa22c8b28545a75aec812e896ffc86adb57e84472",
+        "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1234 filtered out"
+      },
+      {
+        "label": "real_registration_produces_one_shot_zero_timestamp_permit",
+        "kind": "geometry",
+        "selector": "lio_ingress::tests::real_registration_produces_one_shot_zero_timestamp_permit",
+        "selected_names": [
+          "lio_ingress::tests::real_registration_produces_one_shot_zero_timestamp_permit"
+        ],
+        "command": [
+          "/workspace/shared/neh-canonical-ingest-20261007/candidate-r3/nuwax-geometry-runtime-test",
+          "lio_ingress::tests::real_registration_produces_one_shot_zero_timestamp_permit",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "wall_sec": 0.05076796900539193,
+        "user_cpu_sec": 0.007509,
+        "system_cpu_sec": 0.001557,
+        "launch_peak_rss_kib": 131968,
+        "log": "/workspace/shared/neh-canonical-ingest-20261007/candidate-r3/focused/real_registration_produces_one_shot_zero_timestamp_permit.log",
+        "sha256": "03937326bc534a242fd6592c08d82e5d6b95e45bdca81fad77895efae3773683",
+        "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1234 filtered out"
+      },
+      {
+        "label": "configured_map_frame_survives_registration_and_public_acceptance",
+        "kind": "geometry",
+        "selector": "lio_ingress::tests::configured_map_frame_survives_registration_and_public_acceptance",
+        "selected_names": [
+          "lio_ingress::tests::configured_map_frame_survives_registration_and_public_acceptance"
+        ],
+        "command": [
+          "/workspace/shared/neh-canonical-ingest-20261007/candidate-r3/nuwax-geometry-runtime-test",
+          "lio_ingress::tests::configured_map_frame_survives_registration_and_public_acceptance",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "wall_sec": 0.05098395100503694,
+        "user_cpu_sec": 0.0,
+        "system_cpu_sec": 0.010373,
+        "launch_peak_rss_kib": 131968,
+        "log": "/workspace/shared/neh-canonical-ingest-20261007/candidate-r3/focused/configured_map_frame_survives_registration_and_public_acceptance.log",
+        "sha256": "5cc1ffcba53e950e703400439ab399f794f2e8ac9d8b4b26c2993f5c69125d58",
+        "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1234 filtered out"
+      },
+      {
+        "label": "rejected_registrations_do_not_mutate_mapping_adapter_or_create_permits",
+        "kind": "geometry",
+        "selector": "lio_ingress::tests::rejected_registrations_do_not_mutate_mapping_adapter_or_create_permits",
+        "selected_names": [
+          "lio_ingress::tests::rejected_registrations_do_not_mutate_mapping_adapter_or_create_permits"
+        ],
+        "command": [
+          "/workspace/shared/neh-canonical-ingest-20261007/candidate-r3/nuwax-geometry-runtime-test",
+          "lio_ingress::tests::rejected_registrations_do_not_mutate_mapping_adapter_or_create_permits",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "wall_sec": 0.05083578699850477,
+        "user_cpu_sec": 0.007623,
+        "system_cpu_sec": 0.0021019999999999997,
+        "launch_peak_rss_kib": 131968,
+        "log": "/workspace/shared/neh-canonical-ingest-20261007/candidate-r3/focused/rejected_registrations_do_not_mutate_mapping_adapter_or_create_permits.log",
+        "sha256": "cf1f9253b09c13d0d117e7d685bdd3b45c231b8d3e6815792d20679c4d45b8ab",
+        "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1234 filtered out"
+      },
+      {
+        "label": "lazy-source-key",
+        "kind": "geometry",
+        "selector": "lio_ingress::registered_scan_ownership_tests::accepted_metadata_and_non_correction_mapping_access_are_lazy_and_capture_once",
+        "selected_names": [
+          "lio_ingress::registered_scan_ownership_tests::accepted_metadata_and_non_correction_mapping_access_are_lazy_and_capture_once"
+        ],
+        "command": [
+          "/workspace/shared/neh-canonical-ingest-20261007/candidate-r3/nuwax-geometry-runtime-test",
+          "lio_ingress::registered_scan_ownership_tests::accepted_metadata_and_non_correction_mapping_access_are_lazy_and_capture_once",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "wall_sec": 0.050768873988999985,
+        "user_cpu_sec": 0.008158,
+        "system_cpu_sec": 0.002421,
+        "launch_peak_rss_kib": 131968,
+        "log": "/workspace/shared/neh-canonical-ingest-20261007/candidate-r3/focused/lazy-source-key.log",
+        "sha256": "08b1e2ef2ce224a71a2f2c5bab0463d7fbd53801729d9cf25e766eeb774969ef",
+        "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1234 filtered out"
+      }
+    ]
+  },
+  "matched": {
+    "scope": "Seven alternating fresh-process pairs, actual adapter prepare of identical fixed synthetic100kpointmapframes;4warmups16newframes; existing mutex wait and heldprepare measured separately, unlock excluded. Same framebytes/clocks/pose/capacity; setup/assertions/outputdrop/tokenretirement outside timing. Candidate includes tiny scalar keyconstruction inside argumentevaluation; production extracts key before mapping lock. No backend submit/commit/publication, contention, stageCPU or endtoend claim. Generic/rawlegacy fingerprints remain.",
+    "identities": {
+      "baseline": {
+        "path": "/workspace/shared/neh-canonical-ingest-20261007/baseline/nuwax-geometry-runtime-test",
+        "sha256": "83027c0740ba7fac21c8455e961bad642441dd5dfb5fd8d862a134fa72edef28",
+        "bytes": 124595880,
+        "profile": {
+          "opt_level": "0",
+          "debuginfo": 0,
+          "debug_assertions": true,
+          "overflow_checks": true,
+          "test": true
+        },
+        "features": [
+          "default",
+          "real-lcm-bridge"
+        ]
+      },
+      "candidate": {
+        "path": "/workspace/shared/neh-canonical-ingest-20261007/candidate-r3/nuwax-geometry-runtime-test",
+        "sha256": "e9a1f72a5049c841f7ba63c14582d688a34e76e614309d64d1b1d54f1b86228e",
+        "bytes": 124630232,
+        "profile": {
+          "opt_level": "0",
+          "debuginfo": 0,
+          "debug_assertions": true,
+          "overflow_checks": true,
+          "test": true
+        },
+        "features": [
+          "default",
+          "real-lcm-bridge"
+        ]
+      }
+    },
+    "runs": [
+      {
+        "pair": 1,
+        "stage": "baseline",
+        "command": [
+          "/workspace/shared/neh-canonical-ingest-20261007/baseline/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::canonical_ingest_cost_trial::canonical_prepare_lock_cost",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "process_wall_sec": 0.8043817939906148,
+        "process_user_cpu_sec": 0.757458,
+        "process_system_cpu_sec": 0.008645,
+        "launch_peak_rss_kib": 134784,
+        "log": "/workspace/shared/neh-canonical-ingest-20261007/matched/01-baseline.log",
+        "log_sha256": "8bdff10c2f243acc8488d4f08967b1b0ebaef175be312fbf301b31c8a31a3d9b",
+        "wait_ns": [
+          173,
+          151,
+          88,
+          113,
+          104,
+          134,
+          106,
+          172,
+          123,
+          185,
+          307,
+          114,
+          140,
+          108,
+          115,
+          217
+        ],
+        "held_ns": [
+          16499962,
+          13777796,
+          14172140,
+          14953351,
+          15156377,
+          14614357,
+          15991330,
+          15982835,
+          16616692,
+          14856198,
+          14060779,
+          14523162,
+          14004197,
+          13995414,
+          22043263,
+          15477810
+        ],
+        "wait_total_ns": 2350,
+        "held_total_ns": 246725663,
+        "held_mean_ms": 15.4203539375
+      },
+      {
+        "pair": 1,
+        "stage": "candidate",
+        "command": [
+          "/workspace/shared/neh-canonical-ingest-20261007/candidate-r3/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::canonical_ingest_cost_trial::canonical_prepare_lock_cost",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "process_wall_sec": 0.603765044012107,
+        "process_user_cpu_sec": 0.549982,
+        "process_system_cpu_sec": 0.008195,
+        "launch_peak_rss_kib": 134784,
+        "log": "/workspace/shared/neh-canonical-ingest-20261007/matched/01-candidate.log",
+        "log_sha256": "b46f49ab34c19d1a2cc1180a03ed74fd599468cb858c91270c734b7c2371b572",
+        "wait_ns": [
+          137,
+          97,
+          92,
+          96,
+          76,
+          86,
+          96,
+          118,
+          117,
+          114,
+          131,
+          103,
+          100,
+          183,
+          156,
+          132
+        ],
+        "held_ns": [
+          5308262,
+          4344529,
+          4900188,
+          4927956,
+          4217630,
+          4726037,
+          4445416,
+          4977420,
+          4310016,
+          4982200,
+          5668192,
+          5574376,
+          4339855,
+          4792269,
+          4273612,
+          5200849
+        ],
+        "wait_total_ns": 1834,
+        "held_total_ns": 76988807,
+        "held_mean_ms": 4.8118004375
+      },
+      {
+        "pair": 2,
+        "stage": "candidate",
+        "command": [
+          "/workspace/shared/neh-canonical-ingest-20261007/candidate-r3/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::canonical_ingest_cost_trial::canonical_prepare_lock_cost",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "process_wall_sec": 0.6025873799953843,
+        "process_user_cpu_sec": 0.5744779999999999,
+        "process_system_cpu_sec": 0.004639,
+        "launch_peak_rss_kib": 134784,
+        "log": "/workspace/shared/neh-canonical-ingest-20261007/matched/02-candidate.log",
+        "log_sha256": "0c12bfb19cc274ef14d62e3d10aa6fabcd77e9e6c75679b7c9485b0e6fdf8a5f",
+        "wait_ns": [
+          112,
+          124,
+          118,
+          95,
+          119,
+          152,
+          82,
+          123,
+          133,
+          174,
+          137,
+          90,
+          86,
+          121,
+          142,
+          120
+        ],
+        "held_ns": [
+          4424691,
+          4445344,
+          6267532,
+          6962341,
+          4321460,
+          7674753,
+          4606102,
+          5236139,
+          4457057,
+          5714827,
+          4292530,
+          4595013,
+          4295544,
+          5069648,
+          4749843,
+          4330280
+        ],
+        "wait_total_ns": 1928,
+        "held_total_ns": 81443104,
+        "held_mean_ms": 5.090194
+      },
+      {
+        "pair": 2,
+        "stage": "baseline",
+        "command": [
+          "/workspace/shared/neh-canonical-ingest-20261007/baseline/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::canonical_ingest_cost_trial::canonical_prepare_lock_cost",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "process_wall_sec": 0.8033332810009597,
+        "process_user_cpu_sec": 0.7692249999999999,
+        "process_system_cpu_sec": 0.0033079999999999997,
+        "launch_peak_rss_kib": 134784,
+        "log": "/workspace/shared/neh-canonical-ingest-20261007/matched/02-baseline.log",
+        "log_sha256": "4a01f1c7a488391037feff10cdeae7e87bd0cebb72b6f26754a8165400f4a4a0",
+        "wait_ns": [
+          119,
+          154,
+          129,
+          109,
+          907,
+          153,
+          138,
+          194,
+          167,
+          92,
+          63,
+          91,
+          137,
+          100,
+          122,
+          142
+        ],
+        "held_ns": [
+          19535138,
+          13880420,
+          14510975,
+          14774180,
+          15886489,
+          15457247,
+          15219635,
+          15747516,
+          15456936,
+          13978755,
+          15106797,
+          14844690,
+          15072888,
+          15515219,
+          15245466,
+          14328925
+        ],
+        "wait_total_ns": 2817,
+        "held_total_ns": 244561276,
+        "held_mean_ms": 15.28507975
+      },
+      {
+        "pair": 3,
+        "stage": "baseline",
+        "command": [
+          "/workspace/shared/neh-canonical-ingest-20261007/baseline/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::canonical_ingest_cost_trial::canonical_prepare_lock_cost",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "process_wall_sec": 0.8536690940090921,
+        "process_user_cpu_sec": 0.819349,
+        "process_system_cpu_sec": 0.013293,
+        "launch_peak_rss_kib": 134784,
+        "log": "/workspace/shared/neh-canonical-ingest-20261007/matched/03-baseline.log",
+        "log_sha256": "d146a00ed84237a1c332a91e85533fd4412f872a751ef72108e54832bcbc9057",
+        "wait_ns": [
+          124,
+          142,
+          116,
+          123,
+          117,
+          103,
+          196,
+          125,
+          148,
+          117,
+          126,
+          102,
+          143,
+          116,
+          1073,
+          128
+        ],
+        "held_ns": [
+          14879054,
+          16518287,
+          15310617,
+          14893548,
+          14838185,
+          15579622,
+          15212400,
+          14976908,
+          15614513,
+          15666163,
+          14757510,
+          15163050,
+          15850233,
+          13743547,
+          43604922,
+          24620829
+        ],
+        "wait_total_ns": 2999,
+        "held_total_ns": 281229388,
+        "held_mean_ms": 17.57683675
+      },
+      {
+        "pair": 3,
+        "stage": "candidate",
+        "command": [
+          "/workspace/shared/neh-canonical-ingest-20261007/candidate-r3/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::canonical_ingest_cost_trial::canonical_prepare_lock_cost",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "process_wall_sec": 0.6043510509916814,
+        "process_user_cpu_sec": 0.55943,
+        "process_system_cpu_sec": 0.008513,
+        "launch_peak_rss_kib": 134784,
+        "log": "/workspace/shared/neh-canonical-ingest-20261007/matched/03-candidate.log",
+        "log_sha256": "fa99084df887b2ff13a63534393a277a1446388ed8e6dd225da3fc03c9558b4e",
+        "wait_ns": [
+          92,
+          165,
+          79,
+          77,
+          106,
+          124,
+          104,
+          120,
+          115,
+          101,
+          154,
+          139,
+          101,
+          95,
+          102,
+          187
+        ],
+        "held_ns": [
+          5054632,
+          4300269,
+          5239187,
+          4642945,
+          4544592,
+          5288924,
+          4959522,
+          4902204,
+          4663648,
+          4386775,
+          4975032,
+          5264089,
+          4625374,
+          4610225,
+          5466308,
+          5637079
+        ],
+        "wait_total_ns": 1861,
+        "held_total_ns": 78560805,
+        "held_mean_ms": 4.9100503125
+      },
+      {
+        "pair": 4,
+        "stage": "candidate",
+        "command": [
+          "/workspace/shared/neh-canonical-ingest-20261007/candidate-r3/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::canonical_ingest_cost_trial::canonical_prepare_lock_cost",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "process_wall_sec": 0.6039673889899859,
+        "process_user_cpu_sec": 0.584905,
+        "process_system_cpu_sec": 0.009557,
+        "launch_peak_rss_kib": 134784,
+        "log": "/workspace/shared/neh-canonical-ingest-20261007/matched/04-candidate.log",
+        "log_sha256": "a52325607756c79ea1f0de5dc022677b1be5ab1b3609b1743ef350bd2c8ee007",
+        "wait_ns": [
+          94,
+          93,
+          150,
+          111,
+          89,
+          114,
+          100,
+          92,
+          136,
+          127,
+          93,
+          90,
+          108,
+          138,
+          113,
+          783
+        ],
+        "held_ns": [
+          5248316,
+          6277922,
+          6191232,
+          5394835,
+          4361465,
+          4387717,
+          4371934,
+          5109949,
+          4434250,
+          7798899,
+          4422341,
+          5467324,
+          5365931,
+          4571784,
+          4321332,
+          12913210
+        ],
+        "wait_total_ns": 2431,
+        "held_total_ns": 90638441,
+        "held_mean_ms": 5.6649025625
+      },
+      {
+        "pair": 4,
+        "stage": "baseline",
+        "command": [
+          "/workspace/shared/neh-canonical-ingest-20261007/baseline/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::canonical_ingest_cost_trial::canonical_prepare_lock_cost",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "process_wall_sec": 0.8036577750026481,
+        "process_user_cpu_sec": 0.783786,
+        "process_system_cpu_sec": 0.004841,
+        "launch_peak_rss_kib": 134784,
+        "log": "/workspace/shared/neh-canonical-ingest-20261007/matched/04-baseline.log",
+        "log_sha256": "2759a862019dbcfdf77d3799f4a3a88b56360abf218232345f3febfb29548fd0",
+        "wait_ns": [
+          219,
+          181,
+          104,
+          182,
+          203,
+          163,
+          245,
+          96,
+          105,
+          241,
+          95,
+          96,
+          110,
+          132,
+          119,
+          109
+        ],
+        "held_ns": [
+          14999831,
+          15557477,
+          15684196,
+          14745059,
+          15445833,
+          15193964,
+          21250223,
+          15743438,
+          14971689,
+          13968749,
+          19402307,
+          13377389,
+          15115699,
+          20442537,
+          14822666,
+          15310778
+        ],
+        "wait_total_ns": 2400,
+        "held_total_ns": 256031835,
+        "held_mean_ms": 16.0019896875
+      },
+      {
+        "pair": 5,
+        "stage": "baseline",
+        "command": [
+          "/workspace/shared/neh-canonical-ingest-20261007/baseline/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::canonical_ingest_cost_trial::canonical_prepare_lock_cost",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "process_wall_sec": 0.803876562989899,
+        "process_user_cpu_sec": 0.736441,
+        "process_system_cpu_sec": 0.019326,
+        "launch_peak_rss_kib": 134784,
+        "log": "/workspace/shared/neh-canonical-ingest-20261007/matched/05-baseline.log",
+        "log_sha256": "60ad9445e74b6445fcbcda3b090c10c0b7700946e2921ebe7ad40d29e8790a27",
+        "wait_ns": [
+          94,
+          118,
+          134,
+          103,
+          136,
+          119,
+          167,
+          142,
+          107,
+          72,
+          97,
+          114,
+          92,
+          193,
+          87,
+          124
+        ],
+        "held_ns": [
+          14213689,
+          15013598,
+          15433412,
+          14981196,
+          14729747,
+          14059974,
+          14316863,
+          14277075,
+          14170720,
+          16177037,
+          15119708,
+          13897023,
+          14394755,
+          15665242,
+          14332981,
+          19186707
+        ],
+        "wait_total_ns": 1899,
+        "held_total_ns": 239969727,
+        "held_mean_ms": 14.9981079375
+      },
+      {
+        "pair": 5,
+        "stage": "candidate",
+        "command": [
+          "/workspace/shared/neh-canonical-ingest-20261007/candidate-r3/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::canonical_ingest_cost_trial::canonical_prepare_lock_cost",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "process_wall_sec": 0.6033325080061331,
+        "process_user_cpu_sec": 0.5396409999999999,
+        "process_system_cpu_sec": 0.016777,
+        "launch_peak_rss_kib": 134784,
+        "log": "/workspace/shared/neh-canonical-ingest-20261007/matched/05-candidate.log",
+        "log_sha256": "1b94882a8ce12d2ea5d2a2409452574c3c42dcf31a5398052317f761c708b1d5",
+        "wait_ns": [
+          88,
+          117,
+          109,
+          94,
+          90,
+          135,
+          127,
+          93,
+          123,
+          89,
+          134,
+          112,
+          79,
+          179,
+          88,
+          126
+        ],
+        "held_ns": [
+          5118746,
+          4269595,
+          4715289,
+          5042794,
+          5270889,
+          4520921,
+          4622232,
+          4568335,
+          4801227,
+          4475120,
+          4151979,
+          5074636,
+          5911583,
+          4758496,
+          4899729,
+          4889950
+        ],
+        "wait_total_ns": 1783,
+        "held_total_ns": 77091521,
+        "held_mean_ms": 4.8182200625
+      },
+      {
+        "pair": 6,
+        "stage": "candidate",
+        "command": [
+          "/workspace/shared/neh-canonical-ingest-20261007/candidate-r3/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::canonical_ingest_cost_trial::canonical_prepare_lock_cost",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "process_wall_sec": 0.6027309420023812,
+        "process_user_cpu_sec": 0.57152,
+        "process_system_cpu_sec": 0.008725,
+        "launch_peak_rss_kib": 134784,
+        "log": "/workspace/shared/neh-canonical-ingest-20261007/matched/06-candidate.log",
+        "log_sha256": "3a57bbb16e89906db6d626e3fdf3f9ffb3d2ee694d3034b409c2acd22b5710a4",
+        "wait_ns": [
+          120,
+          136,
+          127,
+          171,
+          94,
+          77,
+          80,
+          137,
+          100,
+          121,
+          1966,
+          99,
+          144,
+          133,
+          102,
+          99
+        ],
+        "held_ns": [
+          5215930,
+          4860870,
+          5434761,
+          4990930,
+          4438739,
+          5058258,
+          4587396,
+          4591825,
+          7363888,
+          4363024,
+          4672628,
+          4951145,
+          4830195,
+          4964132,
+          6211334,
+          4653535
+        ],
+        "wait_total_ns": 3706,
+        "held_total_ns": 81188590,
+        "held_mean_ms": 5.074286875
+      },
+      {
+        "pair": 6,
+        "stage": "baseline",
+        "command": [
+          "/workspace/shared/neh-canonical-ingest-20261007/baseline/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::canonical_ingest_cost_trial::canonical_prepare_lock_cost",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "process_wall_sec": 0.8687758029991528,
+        "process_user_cpu_sec": 0.828927,
+        "process_system_cpu_sec": 0.014237999999999999,
+        "launch_peak_rss_kib": 134784,
+        "log": "/workspace/shared/neh-canonical-ingest-20261007/matched/06-baseline.log",
+        "log_sha256": "3ebd3ac78b427923bfcdb5aaceb5bb7284fddb6372fad92493e4ebd00775460a",
+        "wait_ns": [
+          118,
+          119,
+          259,
+          192,
+          64,
+          430,
+          106,
+          93,
+          135,
+          147,
+          150,
+          116,
+          99,
+          95,
+          111,
+          113
+        ],
+        "held_ns": [
+          14129835,
+          16393191,
+          18403177,
+          14119776,
+          15265622,
+          13447181,
+          14523538,
+          14963147,
+          16880880,
+          16218512,
+          20167008,
+          17543498,
+          15422662,
+          13935883,
+          13168493,
+          15128082
+        ],
+        "wait_total_ns": 2347,
+        "held_total_ns": 249710485,
+        "held_mean_ms": 15.6069053125
+      },
+      {
+        "pair": 7,
+        "stage": "baseline",
+        "command": [
+          "/workspace/shared/neh-canonical-ingest-20261007/baseline/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::canonical_ingest_cost_trial::canonical_prepare_lock_cost",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "process_wall_sec": 1.3081472460035002,
+        "process_user_cpu_sec": 1.2268029999999999,
+        "process_system_cpu_sec": 0.031762,
+        "launch_peak_rss_kib": 134784,
+        "log": "/workspace/shared/neh-canonical-ingest-20261007/matched/07-baseline.log",
+        "log_sha256": "3bcbf20485f3350400871bb19973fe16f2f752930c81dcd9b805777a1cebc1c0",
+        "wait_ns": [
+          114,
+          207,
+          117,
+          139,
+          102,
+          114,
+          78,
+          1322,
+          210,
+          222,
+          91,
+          159,
+          120,
+          119,
+          122,
+          98
+        ],
+        "held_ns": [
+          13888375,
+          14232904,
+          14354580,
+          41708524,
+          42969853,
+          13505168,
+          28485449,
+          14807993,
+          14604118,
+          16956295,
+          14255241,
+          13837662,
+          13136037,
+          15012836,
+          13802622,
+          34609635
+        ],
+        "wait_total_ns": 3334,
+        "held_total_ns": 320167292,
+        "held_mean_ms": 20.01045575
+      },
+      {
+        "pair": 7,
+        "stage": "candidate",
+        "command": [
+          "/workspace/shared/neh-canonical-ingest-20261007/candidate-r3/nuwax-geometry-runtime-test",
+          "mapping_adapter::tests::canonical_ingest_cost_trial::canonical_prepare_lock_cost",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "timeout": false,
+        "process_wall_sec": 0.6039259930112166,
+        "process_user_cpu_sec": 0.545518,
+        "process_system_cpu_sec": 0.008244999999999999,
+        "launch_peak_rss_kib": 134784,
+        "log": "/workspace/shared/neh-canonical-ingest-20261007/matched/07-candidate.log",
+        "log_sha256": "b3220c1db1347fc316ba5967f0f74443cf04010ca2be5e47c9f5cedd362024f9",
+        "wait_ns": [
+          179,
+          124,
+          80,
+          138,
+          119,
+          102,
+          180,
+          304,
+          92,
+          149,
+          78,
+          113,
+          103,
+          139,
+          80,
+          138
+        ],
+        "held_ns": [
+          4621870,
+          4629453,
+          5140406,
+          4689485,
+          5013504,
+          4776079,
+          4710831,
+          4459285,
+          8354370,
+          4353051,
+          4611398,
+          4742372,
+          5230337,
+          4357750,
+          5000363,
+          4273877
+        ],
+        "wait_total_ns": 2118,
+        "held_total_ns": 78964431,
+        "held_mean_ms": 4.9352769375
+      }
+    ],
+    "summary": {
+      "baseline_median_batch_mean_ms": 15.6069053125,
+      "candidate_median_batch_mean_ms": 4.9352769375,
+      "paired_ratios": [
+        0.31204215266411095,
+        0.33301716989733077,
+        0.27934777925840387,
+        0.3540123867799487,
+        0.3212551931602606,
+        0.32513088106812976,
+        0.2466349092273923
+      ],
+      "paired_median_ratio": 0.3212551931602606,
+      "candidate_wins": 7,
+      "pooled": {
+        "baseline": {
+          "lock_held_prepare": {
+            "n": 112,
+            "median_ms": 15.043243,
+            "p95_nearest_rank_ms": 24.620829,
+            "max_ms": 43.604922,
+            "min_ms": 13.136037
+          },
+          "uncontended_lock_wait": {
+            "n": 112,
+            "median_ms": 0.000121,
+            "p95_nearest_rank_ms": 0.000259,
+            "max_ms": 0.001322,
+            "min_ms": 6.3e-05
+          }
+        },
+        "candidate": {
+          "lock_held_prepare": {
+            "n": 112,
+            "median_ms": 4.784174,
+            "p95_nearest_rank_ms": 6.962341,
+            "max_ms": 12.91321,
+            "min_ms": 4.151979
+          },
+          "uncontended_lock_wait": {
+            "n": 112,
+            "median_ms": 0.000114,
+            "p95_nearest_rank_ms": 0.00018,
+            "max_ms": 0.001966,
+            "min_ms": 7.6e-05
+          }
+        }
+      },
+      "whole_process": {
+        "baseline": {
+          "cpu_median_sec": 0.788627,
+          "rss_kib_min_max": [
+            134784,
+            134784
+          ]
+        },
+        "candidate": {
+          "cpu_median_sec": 0.567943,
+          "rss_kib_min_max": [
+            134784,
+            134784
+          ]
+        }
+      }
+    }
+  }
+}

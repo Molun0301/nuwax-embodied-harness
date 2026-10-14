@@ -8,6 +8,7 @@ CUSTOMROBOT_CAPABILITY_MATRIX = CapabilityMatrix(
     capabilities=[],
     metadata={
         "entrypoint": "drivers/customrobot",
-        "implemented": False,
+        "implemented": True,
+        "input_mode": "standard_frames",
     },
 )

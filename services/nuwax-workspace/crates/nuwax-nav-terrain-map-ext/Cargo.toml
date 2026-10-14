@@ -1,0 +1,26 @@
+[package]
+name = "nuwax-nav-terrain-map-ext"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Pure-Rust extended terrain map processor with voxel rolling grid, decay and connectivity (Phase 3 migration of terrain_map_ext.py)."
+
+[features]
+default = ["module"]
+module = []
+
+[dependencies]
+# Foundation 类型与错误统一来源
+nuwax-nav-types-messages = { path = "../nuwax-nav-types-messages" }
+nuwax-nav-base = { path = "../nuwax-nav-base" }
+
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+approx = { workspace = true }

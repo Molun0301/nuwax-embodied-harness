@@ -1,0 +1,494 @@
+{
+  "python": "3.8.10",
+  "repeats": 11,
+  "baseline": [
+    {
+      "terminal": 200,
+      "active": 0,
+      "active_position": "after_terminal",
+      "methods": {
+        "list_active_tasks": {
+          "record_visits": 200,
+          "median_ms": 0.014682,
+          "median_lock_ms": 0.01299
+        },
+        "capture_task_list": {
+          "record_visits": 200,
+          "median_ms": 0.852727,
+          "median_lock_ms": 0.02647
+        },
+        "capture_status_only": {
+          "record_visits": 200,
+          "median_ms": 0.312802,
+          "median_lock_ms": 0.0199
+        }
+      }
+    },
+    {
+      "terminal": 200,
+      "active": 5,
+      "active_position": "after_terminal",
+      "methods": {
+        "list_active_tasks": {
+          "record_visits": 205,
+          "median_ms": 0.086401,
+          "median_lock_ms": 0.014132
+        },
+        "capture_task_list": {
+          "record_visits": 205,
+          "median_ms": 1.115054,
+          "median_lock_ms": 0.028934
+        },
+        "capture_status_only": {
+          "record_visits": 205,
+          "median_ms": 0.343058,
+          "median_lock_ms": 0.020431
+        }
+      }
+    },
+    {
+      "terminal": 200,
+      "active": 50,
+      "active_position": "after_terminal",
+      "methods": {
+        "list_active_tasks": {
+          "record_visits": 250,
+          "median_ms": 0.711704,
+          "median_lock_ms": 0.025668
+        },
+        "capture_task_list": {
+          "record_visits": 250,
+          "median_ms": 3.209465,
+          "median_lock_ms": 0.05275
+        },
+        "capture_status_only": {
+          "record_visits": 250,
+          "median_ms": 0.995223,
+          "median_lock_ms": 0.033441
+        }
+      }
+    },
+    {
+      "terminal": 5000,
+      "active": 0,
+      "active_position": "after_terminal",
+      "methods": {
+        "list_active_tasks": {
+          "record_visits": 5000,
+          "median_ms": 0.610201,
+          "median_lock_ms": 0.603451
+        },
+        "capture_task_list": {
+          "record_visits": 5000,
+          "median_ms": 1.539934,
+          "median_lock_ms": 0.636471
+        },
+        "capture_status_only": {
+          "record_visits": 5000,
+          "median_ms": 0.823623,
+          "median_lock_ms": 0.528648
+        }
+      }
+    },
+    {
+      "terminal": 5000,
+      "active": 5,
+      "active_position": "after_terminal",
+      "methods": {
+        "list_active_tasks": {
+          "record_visits": 5005,
+          "median_ms": 0.571093,
+          "median_lock_ms": 0.487316
+        },
+        "capture_task_list": {
+          "record_visits": 5005,
+          "median_ms": 1.705565,
+          "median_lock_ms": 0.565183
+        },
+        "capture_status_only": {
+          "record_visits": 5005,
+          "median_ms": 0.970125,
+          "median_lock_ms": 0.573025
+        }
+      }
+    },
+    {
+      "terminal": 5000,
+      "active": 50,
+      "active_position": "after_terminal",
+      "methods": {
+        "list_active_tasks": {
+          "record_visits": 5050,
+          "median_ms": 1.197658,
+          "median_lock_ms": 0.508638
+        },
+        "capture_task_list": {
+          "record_visits": 5050,
+          "median_ms": 3.68323,
+          "median_lock_ms": 0.719156
+        },
+        "capture_status_only": {
+          "record_visits": 5050,
+          "median_ms": 1.451652,
+          "median_lock_ms": 0.554587
+        }
+      }
+    },
+    {
+      "terminal": 50000,
+      "active": 0,
+      "active_position": "after_terminal",
+      "methods": {
+        "list_active_tasks": {
+          "record_visits": 50000,
+          "median_ms": 19.550554,
+          "median_lock_ms": 19.507989
+        },
+        "capture_task_list": {
+          "record_visits": 50000,
+          "median_ms": 23.461366,
+          "median_lock_ms": 22.352382
+        },
+        "capture_status_only": {
+          "record_visits": 50000,
+          "median_ms": 22.584864,
+          "median_lock_ms": 22.183438
+        }
+      }
+    },
+    {
+      "terminal": 50000,
+      "active": 5,
+      "active_position": "after_terminal",
+      "methods": {
+        "list_active_tasks": {
+          "record_visits": 50005,
+          "median_ms": 20.351512,
+          "median_lock_ms": 20.135015
+        },
+        "capture_task_list": {
+          "record_visits": 50005,
+          "median_ms": 27.119539,
+          "median_lock_ms": 24.851656
+        },
+        "capture_status_only": {
+          "record_visits": 50005,
+          "median_ms": 24.172681,
+          "median_lock_ms": 23.618364
+        }
+      }
+    },
+    {
+      "terminal": 50000,
+      "active": 50,
+      "active_position": "after_terminal",
+      "methods": {
+        "list_active_tasks": {
+          "record_visits": 50050,
+          "median_ms": 22.45048,
+          "median_lock_ms": 21.291861
+        },
+        "capture_task_list": {
+          "record_visits": 50050,
+          "median_ms": 25.560515,
+          "median_lock_ms": 22.164669
+        },
+        "capture_status_only": {
+          "record_visits": 50050,
+          "median_ms": 24.465983,
+          "median_lock_ms": 23.364009
+        }
+      }
+    }
+  ],
+  "scalar_helpers": [
+    {
+      "terminal": 200,
+      "active": 0,
+      "active_position": "after_terminal",
+      "methods": {
+        "list_active_tasks": {
+          "record_visits": 200,
+          "median_ms": 0.014792,
+          "median_lock_ms": 0.01292
+        },
+        "capture_task_list": {
+          "record_visits": 200,
+          "median_ms": 0.831785,
+          "median_lock_ms": 0.023395
+        },
+        "capture_status_only": {
+          "record_visits": 200,
+          "median_ms": 0.283988,
+          "median_lock_ms": 0.018368
+        },
+        "count_active_tasks": {
+          "record_visits": 200,
+          "median_ms": 0.013651,
+          "median_lock_ms": 0.01297
+        },
+        "has_active_tasks": {
+          "record_visits": 200,
+          "median_ms": 0.015653,
+          "median_lock_ms": 0.015073
+        }
+      }
+    },
+    {
+      "terminal": 200,
+      "active": 5,
+      "active_position": "after_terminal",
+      "methods": {
+        "list_active_tasks": {
+          "record_visits": 205,
+          "median_ms": 0.08568,
+          "median_lock_ms": 0.014461
+        },
+        "capture_task_list": {
+          "record_visits": 205,
+          "median_ms": 1.036414,
+          "median_lock_ms": 0.02653
+        },
+        "capture_status_only": {
+          "record_visits": 205,
+          "median_ms": 0.368085,
+          "median_lock_ms": 0.020882
+        },
+        "count_active_tasks": {
+          "record_visits": 205,
+          "median_ms": 0.014171,
+          "median_lock_ms": 0.013561
+        },
+        "has_active_tasks": {
+          "record_visits": 201,
+          "median_ms": 0.017076,
+          "median_lock_ms": 0.016274
+        }
+      }
+    },
+    {
+      "terminal": 200,
+      "active": 50,
+      "active_position": "after_terminal",
+      "methods": {
+        "list_active_tasks": {
+          "record_visits": 250,
+          "median_ms": 0.671624,
+          "median_lock_ms": 0.022954
+        },
+        "capture_task_list": {
+          "record_visits": 250,
+          "median_ms": 3.009663,
+          "median_lock_ms": 0.054102
+        },
+        "capture_status_only": {
+          "record_visits": 250,
+          "median_ms": 0.883514,
+          "median_lock_ms": 0.030777
+        },
+        "count_active_tasks": {
+          "record_visits": 250,
+          "median_ms": 0.017987,
+          "median_lock_ms": 0.017346
+        },
+        "has_active_tasks": {
+          "record_visits": 201,
+          "median_ms": 0.015824,
+          "median_lock_ms": 0.015203
+        }
+      }
+    },
+    {
+      "terminal": 5000,
+      "active": 0,
+      "active_position": "after_terminal",
+      "methods": {
+        "list_active_tasks": {
+          "record_visits": 5000,
+          "median_ms": 0.506925,
+          "median_lock_ms": 0.501657
+        },
+        "capture_task_list": {
+          "record_visits": 5000,
+          "median_ms": 1.301905,
+          "median_lock_ms": 0.487475
+        },
+        "capture_status_only": {
+          "record_visits": 5000,
+          "median_ms": 0.734278,
+          "median_lock_ms": 0.462879
+        },
+        "count_active_tasks": {
+          "record_visits": 5000,
+          "median_ms": 0.466785,
+          "median_lock_ms": 0.46412
+        },
+        "has_active_tasks": {
+          "record_visits": 5000,
+          "median_ms": 0.527537,
+          "median_lock_ms": 0.525573
+        }
+      }
+    },
+    {
+      "terminal": 5000,
+      "active": 5,
+      "active_position": "after_terminal",
+      "methods": {
+        "list_active_tasks": {
+          "record_visits": 5005,
+          "median_ms": 0.564552,
+          "median_lock_ms": 0.469368
+        },
+        "capture_task_list": {
+          "record_visits": 5005,
+          "median_ms": 1.55077,
+          "median_lock_ms": 0.495148
+        },
+        "capture_status_only": {
+          "record_visits": 5005,
+          "median_ms": 0.830403,
+          "median_lock_ms": 0.470901
+        },
+        "count_active_tasks": {
+          "record_visits": 5005,
+          "median_ms": 0.459454,
+          "median_lock_ms": 0.457911
+        },
+        "has_active_tasks": {
+          "record_visits": 5001,
+          "median_ms": 0.506194,
+          "median_lock_ms": 0.504031
+        }
+      }
+    },
+    {
+      "terminal": 5000,
+      "active": 50,
+      "active_position": "after_terminal",
+      "methods": {
+        "list_active_tasks": {
+          "record_visits": 5050,
+          "median_ms": 1.660026,
+          "median_lock_ms": 0.689441
+        },
+        "capture_task_list": {
+          "record_visits": 5050,
+          "median_ms": 3.722449,
+          "median_lock_ms": 0.633757
+        },
+        "capture_status_only": {
+          "record_visits": 5050,
+          "median_ms": 1.983644,
+          "median_lock_ms": 0.841811
+        },
+        "count_active_tasks": {
+          "record_visits": 5050,
+          "median_ms": 0.542119,
+          "median_lock_ms": 0.539184
+        },
+        "has_active_tasks": {
+          "record_visits": 5001,
+          "median_ms": 0.535969,
+          "median_lock_ms": 0.533375
+        }
+      }
+    },
+    {
+      "terminal": 50000,
+      "active": 0,
+      "active_position": "after_terminal",
+      "methods": {
+        "list_active_tasks": {
+          "record_visits": 50000,
+          "median_ms": 18.766325,
+          "median_lock_ms": 18.723931
+        },
+        "capture_task_list": {
+          "record_visits": 50000,
+          "median_ms": 25.610065,
+          "median_lock_ms": 24.543595
+        },
+        "capture_status_only": {
+          "record_visits": 50000,
+          "median_ms": 23.125465,
+          "median_lock_ms": 22.539691
+        },
+        "count_active_tasks": {
+          "record_visits": 50000,
+          "median_ms": 19.848199,
+          "median_lock_ms": 19.827557
+        },
+        "has_active_tasks": {
+          "record_visits": 50000,
+          "median_ms": 20.580113,
+          "median_lock_ms": 20.558942
+        }
+      }
+    },
+    {
+      "terminal": 50000,
+      "active": 5,
+      "active_position": "after_terminal",
+      "methods": {
+        "list_active_tasks": {
+          "record_visits": 50005,
+          "median_ms": 20.065626,
+          "median_lock_ms": 19.841648
+        },
+        "capture_task_list": {
+          "record_visits": 50005,
+          "median_ms": 23.920054,
+          "median_lock_ms": 22.708535
+        },
+        "capture_status_only": {
+          "record_visits": 50005,
+          "median_ms": 23.372368,
+          "median_lock_ms": 22.885452
+        },
+        "count_active_tasks": {
+          "record_visits": 50005,
+          "median_ms": 20.329965,
+          "median_lock_ms": 20.308604
+        },
+        "has_active_tasks": {
+          "record_visits": 50001,
+          "median_ms": 19.891664,
+          "median_lock_ms": 19.848629
+        }
+      }
+    },
+    {
+      "terminal": 50000,
+      "active": 50,
+      "active_position": "after_terminal",
+      "methods": {
+        "list_active_tasks": {
+          "record_visits": 50050,
+          "median_ms": 20.106698,
+          "median_lock_ms": 19.29978
+        },
+        "capture_task_list": {
+          "record_visits": 50050,
+          "median_ms": 26.690741,
+          "median_lock_ms": 22.919899
+        },
+        "capture_status_only": {
+          "record_visits": 50050,
+          "median_ms": 24.098728,
+          "median_lock_ms": 22.824695
+        },
+        "count_active_tasks": {
+          "record_visits": 50050,
+          "median_ms": 19.735812,
+          "median_lock_ms": 19.717324
+        },
+        "has_active_tasks": {
+          "record_visits": 50001,
+          "median_ms": 21.30408,
+          "median_lock_ms": 21.281766
+        }
+      }
+    }
+  ]
+}

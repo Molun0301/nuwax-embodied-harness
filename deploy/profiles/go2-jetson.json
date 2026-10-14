@@ -1,0 +1,209 @@
+{
+  "schema_version": 1,
+  "name": "go2-jetson",
+  "robot": "go2",
+  "production": true,
+  "supported_os": {
+    "ubuntu": [
+      "20.04"
+    ]
+  },
+  "architectures": [
+    "aarch64"
+  ],
+  "python": {
+    "version": "3.8",
+    "requirements": [
+      "requirements/base.in",
+      "requirements/robot-go2.in"
+    ],
+    "constraints": "requirements/constraints/go2-jetson-py38-aarch64.txt",
+    "lock_status": "pending",
+    "required_imports": [
+      "fastapi",
+      "grpc",
+      "google.protobuf",
+      "cv2",
+      "lcm",
+      "ultralytics",
+      "unitree_webrtc_connect"
+    ],
+    "source_artifact_manifest": "third_party/python-source-artifacts.json",
+    "index_policy": {
+      "default_index": "https://pypi.org/simple",
+      "deny_distributions": [
+        "torch",
+        "torchvision",
+        "tensorrt",
+        "clip",
+        "unitree-sdk2py",
+        "cyclonedds"
+      ],
+      "deny_transitive_replacement": true
+    },
+    "vendor_packages": [
+      {
+        "distribution": "torch",
+        "version": null,
+        "import_modules": [
+          "torch"
+        ],
+        "provider": "nvidia-jetpack",
+        "install_from_index": false,
+        "required": true
+      },
+      {
+        "distribution": "torchvision",
+        "version": null,
+        "import_modules": [
+          "torchvision"
+        ],
+        "provider": "nvidia-jetpack",
+        "install_from_index": false,
+        "required": true
+      },
+      {
+        "distribution": "tensorrt",
+        "version": null,
+        "import_modules": [
+          "tensorrt"
+        ],
+        "provider": "nvidia-jetpack",
+        "install_from_index": false,
+        "required": true
+      }
+    ],
+    "system_modules": []
+  },
+  "system_packages": [
+    "ca-certificates",
+    "curl",
+    "git",
+    "jq",
+    "iproute2",
+    "util-linux",
+    "file",
+    "openssl",
+    "build-essential",
+    "cmake",
+    "pkg-config",
+    "protobuf-compiler",
+    "python3-pip",
+    "python3-venv",
+    "python3-dev",
+    "python3-pyaudio",
+    "portaudio19-dev",
+    "liblcm-dev"
+  ],
+  "rust": {
+    "toolchain": "1.88.0",
+    "bootstrap": {
+      "url": "https://static.rust-lang.org/rustup/dist/aarch64-unknown-linux-gnu/rustup-init",
+      "sha256": null
+    },
+    "builds": [
+      {
+        "name": "nuwax-nav-stack",
+        "manifest": "services/nuwax-workspace/Cargo.toml",
+        "package": "nuwax-nav-stack",
+        "bin": "nuwax-nav-stack",
+        "features": [
+          "simple-2d",
+          "replanning-astar",
+          "mls"
+        ],
+        "output": "services/nuwax-workspace/target/release/nuwax-nav-stack"
+      },
+      {
+        "name": "nuwax-person-follow",
+        "manifest": "services/nuwax-workspace/Cargo.toml",
+        "package": "nuwax-nav-visual-servoing",
+        "bin": "nuwax-person-follow",
+        "features": [
+          "link-liblcm"
+        ],
+        "output": "services/nuwax-workspace/target/release/nuwax-person-follow"
+      },
+      {
+        "name": "nuwax-geometry-runtime",
+        "manifest": "services/geometry/nuwax_geometry_runtime/Cargo.toml",
+        "package": null,
+        "bin": "nuwax-geometry-runtime",
+        "features": [],
+        "output": "services/geometry/nuwax_geometry_runtime/target/release/nuwax-geometry-runtime"
+      }
+    ]
+  },
+  "services": [
+    "nuwax-motion-safety-guard.service",
+    "nuwax-nav-stack.service",
+    "nuwax-geometry-runtime.service",
+    "nuwax-person-follow.service",
+    "nuwax-runtime-activation.service",
+    "nuwax-runtime-activation.path",
+    "nuwax-host-gateway.service",
+    "nuwax-go2-video-streamer.service",
+    "nuwax-settings-apply.service",
+    "nuwax-settings-apply.path"
+  ],
+  "models": {
+    "prepare_yolo": true,
+    "prepare_memory": false,
+    "export_yolo_engine_default": true,
+    "yolo_weights": {
+      "url": "https://github.com/ultralytics/assets/releases/download/v8.4.0/yolov8s-worldv2.pt",
+      "sha256": null
+    }
+  },
+  "metadata": {
+    "always_on_services": [
+      "nuwax-runtime-activation.path",
+      "nuwax-host-gateway.service",
+      "nuwax-go2-video-streamer.service",
+      "nuwax-settings-apply.path"
+    ],
+    "on_demand_services": [
+      "nuwax-motion-safety-guard.service",
+      "nuwax-nav-stack.service",
+      "nuwax-geometry-runtime.service",
+      "nuwax-person-follow.service",
+      "nuwax-runtime-activation.service",
+      "nuwax-settings-apply.service"
+    ],
+    "minimum_free_gb": 40,
+    "required_dds_interface": "eth0",
+    "lock_status": "pending",
+    "deployable": false,
+    "lock_format": "pip-tools-sha256",
+    "lock_target": "requirements/locks/go2-jetson-py38-aarch64.txt",
+    "bundle_public_key_sha256": null,
+    "jetson_compatibility": {
+      "status": "pending"
+    },
+    "blockers": [
+      "Unitree SDK production source approval and artifact hashes are unresolved.",
+      "CycloneDDS source commit, native linkage and artifact hashes are unresolved.",
+      "Ultralytics CLIP source and wheel hashes are unresolved.",
+      "JetPack-compatible torch, torchvision and TensorRT artifact versions and hashes are unresolved.",
+      "The pinned aarch64 rustup-init SHA-256 is unresolved.",
+      "The approved offline bundle public-key SHA-256 is unresolved.",
+      "The approved JetPack/L4T/CUDA/TensorRT package compatibility matrix is unresolved.",
+      "The approved YOLO-World weights SHA-256 is unresolved.",
+      "The approved exact apt and NVIDIA Python package versions are unresolved."
+    ],
+    "geometry_release": {
+      "source_manifest": "services/geometry/nuwax_geometry_runtime/target/release/nuwax-geometry-release/manifest.json",
+      "installed_manifest": "services/geometry/nuwax_geometry_runtime/target/release/nuwax-geometry-release/manifest.json",
+      "native_lio_payloads": [
+        {
+          "role": "fastlio2",
+          "source": "fastlio2_native"
+        },
+        {
+          "role": "pointlio",
+          "source": "pointlio_native"
+        }
+      ]
+    }
+  }
+}

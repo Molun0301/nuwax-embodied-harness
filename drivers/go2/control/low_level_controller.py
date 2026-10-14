@@ -10,7 +10,7 @@ import logging
 import sys
 import time
 
-from settings import APP_CONFIG
+from core.settings import APP_CONFIG
 
 from drivers.go2.control.joint_config import (
     DEFAULT_KD,

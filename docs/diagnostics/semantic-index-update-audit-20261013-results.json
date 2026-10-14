@@ -1,0 +1,1965 @@
+{
+  "counter_probe": [
+    {
+      "instances": 1,
+      "stage": "observation_graph",
+      "writes": 9,
+      "by_kind": {
+        "semantic_graph_relation": 3,
+        "scene_space": 2,
+        "observation_event": 2,
+        "instance": 2
+      },
+      "namespace_before": 3,
+      "namespace_after": 6,
+      "copied_entries": 42,
+      "trajectory": [
+        [
+          "semantic_graph_relation",
+          3,
+          4
+        ],
+        [
+          "scene_space",
+          4,
+          4
+        ],
+        [
+          "observation_event",
+          4,
+          4
+        ],
+        [
+          "semantic_graph_relation",
+          4,
+          5
+        ],
+        [
+          "instance",
+          5,
+          5
+        ],
+        [
+          "observation_event",
+          5,
+          5
+        ],
+        [
+          "semantic_graph_relation",
+          5,
+          6
+        ],
+        [
+          "scene_space",
+          6,
+          6
+        ],
+        [
+          "instance",
+          6,
+          6
+        ]
+      ]
+    },
+    {
+      "instances": 1,
+      "stage": "scene_graph",
+      "writes": 6,
+      "by_kind": {
+        "semantic_graph_relation": 2,
+        "semantic_summary": 3,
+        "scene_space": 1
+      },
+      "namespace_before": 6,
+      "namespace_after": 9,
+      "copied_entries": 42,
+      "trajectory": [
+        [
+          "semantic_graph_relation",
+          6,
+          6
+        ],
+        [
+          "semantic_graph_relation",
+          6,
+          6
+        ],
+        [
+          "semantic_summary",
+          6,
+          7
+        ],
+        [
+          "semantic_summary",
+          7,
+          8
+        ],
+        [
+          "semantic_summary",
+          8,
+          9
+        ],
+        [
+          "scene_space",
+          9,
+          9
+        ]
+      ],
+      "retained_snapshot_unchanged": true
+    },
+    {
+      "instances": 4,
+      "stage": "observation_graph",
+      "writes": 27,
+      "by_kind": {
+        "semantic_graph_relation": 9,
+        "scene_space": 5,
+        "observation_event": 5,
+        "instance": 8
+      },
+      "namespace_before": 6,
+      "namespace_after": 15,
+      "copied_entries": 288,
+      "trajectory": [
+        [
+          "semantic_graph_relation",
+          6,
+          7
+        ],
+        [
+          "scene_space",
+          7,
+          7
+        ],
+        [
+          "observation_event",
+          7,
+          7
+        ],
+        [
+          "semantic_graph_relation",
+          7,
+          8
+        ],
+        [
+          "instance",
+          8,
+          8
+        ],
+        [
+          "observation_event",
+          8,
+          8
+        ],
+        [
+          "semantic_graph_relation",
+          8,
+          9
+        ],
+        [
+          "scene_space",
+          9,
+          9
+        ],
+        [
+          "instance",
+          9,
+          9
+        ],
+        [
+          "semantic_graph_relation",
+          9,
+          10
+        ],
+        [
+          "instance",
+          10,
+          10
+        ],
+        [
+          "observation_event",
+          10,
+          10
+        ],
+        [
+          "semantic_graph_relation",
+          10,
+          11
+        ],
+        [
+          "scene_space",
+          11,
+          11
+        ],
+        [
+          "instance",
+          11,
+          11
+        ],
+        [
+          "semantic_graph_relation",
+          11,
+          12
+        ],
+        [
+          "instance",
+          12,
+          12
+        ],
+        [
+          "observation_event",
+          12,
+          12
+        ],
+        [
+          "semantic_graph_relation",
+          12,
+          13
+        ],
+        [
+          "scene_space",
+          13,
+          13
+        ],
+        [
+          "instance",
+          13,
+          13
+        ],
+        [
+          "semantic_graph_relation",
+          13,
+          14
+        ],
+        [
+          "instance",
+          14,
+          14
+        ],
+        [
+          "observation_event",
+          14,
+          14
+        ],
+        [
+          "semantic_graph_relation",
+          14,
+          15
+        ],
+        [
+          "scene_space",
+          15,
+          15
+        ],
+        [
+          "instance",
+          15,
+          15
+        ]
+      ]
+    },
+    {
+      "instances": 4,
+      "stage": "scene_graph",
+      "writes": 27,
+      "by_kind": {
+        "semantic_graph_relation": 11,
+        "instance": 12,
+        "semantic_summary": 3,
+        "scene_space": 1
+      },
+      "namespace_before": 15,
+      "namespace_after": 24,
+      "copied_entries": 492,
+      "trajectory": [
+        [
+          "semantic_graph_relation",
+          15,
+          15
+        ],
+        [
+          "semantic_graph_relation",
+          15,
+          15
+        ],
+        [
+          "semantic_graph_relation",
+          15,
+          15
+        ],
+        [
+          "semantic_graph_relation",
+          15,
+          15
+        ],
+        [
+          "semantic_graph_relation",
+          15,
+          15
+        ],
+        [
+          "semantic_graph_relation",
+          15,
+          16
+        ],
+        [
+          "instance",
+          16,
+          16
+        ],
+        [
+          "instance",
+          16,
+          16
+        ],
+        [
+          "semantic_graph_relation",
+          16,
+          17
+        ],
+        [
+          "instance",
+          17,
+          17
+        ],
+        [
+          "instance",
+          17,
+          17
+        ],
+        [
+          "semantic_graph_relation",
+          17,
+          18
+        ],
+        [
+          "instance",
+          18,
+          18
+        ],
+        [
+          "instance",
+          18,
+          18
+        ],
+        [
+          "semantic_graph_relation",
+          18,
+          19
+        ],
+        [
+          "instance",
+          19,
+          19
+        ],
+        [
+          "instance",
+          19,
+          19
+        ],
+        [
+          "semantic_graph_relation",
+          19,
+          20
+        ],
+        [
+          "instance",
+          20,
+          20
+        ],
+        [
+          "instance",
+          20,
+          20
+        ],
+        [
+          "semantic_graph_relation",
+          20,
+          21
+        ],
+        [
+          "instance",
+          21,
+          21
+        ],
+        [
+          "instance",
+          21,
+          21
+        ],
+        [
+          "semantic_summary",
+          21,
+          22
+        ],
+        [
+          "semantic_summary",
+          22,
+          23
+        ],
+        [
+          "semantic_summary",
+          23,
+          24
+        ],
+        [
+          "scene_space",
+          24,
+          24
+        ]
+      ],
+      "retained_snapshot_unchanged": true
+    },
+    {
+      "instances": 8,
+      "stage": "observation_graph",
+      "writes": 51,
+      "by_kind": {
+        "semantic_graph_relation": 17,
+        "scene_space": 9,
+        "observation_event": 9,
+        "instance": 16
+      },
+      "namespace_before": 10,
+      "namespace_after": 27,
+      "copied_entries": 952,
+      "trajectory": [
+        [
+          "semantic_graph_relation",
+          10,
+          11
+        ],
+        [
+          "scene_space",
+          11,
+          11
+        ],
+        [
+          "observation_event",
+          11,
+          11
+        ],
+        [
+          "semantic_graph_relation",
+          11,
+          12
+        ],
+        [
+          "instance",
+          12,
+          12
+        ],
+        [
+          "observation_event",
+          12,
+          12
+        ],
+        [
+          "semantic_graph_relation",
+          12,
+          13
+        ],
+        [
+          "scene_space",
+          13,
+          13
+        ],
+        [
+          "instance",
+          13,
+          13
+        ],
+        [
+          "semantic_graph_relation",
+          13,
+          14
+        ],
+        [
+          "instance",
+          14,
+          14
+        ],
+        [
+          "observation_event",
+          14,
+          14
+        ],
+        [
+          "semantic_graph_relation",
+          14,
+          15
+        ],
+        [
+          "scene_space",
+          15,
+          15
+        ],
+        [
+          "instance",
+          15,
+          15
+        ],
+        [
+          "semantic_graph_relation",
+          15,
+          16
+        ],
+        [
+          "instance",
+          16,
+          16
+        ],
+        [
+          "observation_event",
+          16,
+          16
+        ],
+        [
+          "semantic_graph_relation",
+          16,
+          17
+        ],
+        [
+          "scene_space",
+          17,
+          17
+        ],
+        [
+          "instance",
+          17,
+          17
+        ],
+        [
+          "semantic_graph_relation",
+          17,
+          18
+        ],
+        [
+          "instance",
+          18,
+          18
+        ],
+        [
+          "observation_event",
+          18,
+          18
+        ],
+        [
+          "semantic_graph_relation",
+          18,
+          19
+        ],
+        [
+          "scene_space",
+          19,
+          19
+        ],
+        [
+          "instance",
+          19,
+          19
+        ],
+        [
+          "semantic_graph_relation",
+          19,
+          20
+        ],
+        [
+          "instance",
+          20,
+          20
+        ],
+        [
+          "observation_event",
+          20,
+          20
+        ],
+        [
+          "semantic_graph_relation",
+          20,
+          21
+        ],
+        [
+          "scene_space",
+          21,
+          21
+        ],
+        [
+          "instance",
+          21,
+          21
+        ],
+        [
+          "semantic_graph_relation",
+          21,
+          22
+        ],
+        [
+          "instance",
+          22,
+          22
+        ],
+        [
+          "observation_event",
+          22,
+          22
+        ],
+        [
+          "semantic_graph_relation",
+          22,
+          23
+        ],
+        [
+          "scene_space",
+          23,
+          23
+        ],
+        [
+          "instance",
+          23,
+          23
+        ],
+        [
+          "semantic_graph_relation",
+          23,
+          24
+        ],
+        [
+          "instance",
+          24,
+          24
+        ],
+        [
+          "observation_event",
+          24,
+          24
+        ],
+        [
+          "semantic_graph_relation",
+          24,
+          25
+        ],
+        [
+          "scene_space",
+          25,
+          25
+        ],
+        [
+          "instance",
+          25,
+          25
+        ],
+        [
+          "semantic_graph_relation",
+          25,
+          26
+        ],
+        [
+          "instance",
+          26,
+          26
+        ],
+        [
+          "observation_event",
+          26,
+          26
+        ],
+        [
+          "semantic_graph_relation",
+          26,
+          27
+        ],
+        [
+          "scene_space",
+          27,
+          27
+        ],
+        [
+          "instance",
+          27,
+          27
+        ]
+      ]
+    },
+    {
+      "instances": 8,
+      "stage": "scene_graph",
+      "writes": 97,
+      "by_kind": {
+        "semantic_graph_relation": 37,
+        "instance": 56,
+        "semantic_summary": 3,
+        "scene_space": 1
+      },
+      "namespace_before": 27,
+      "namespace_after": 58,
+      "copied_entries": 3927,
+      "trajectory": [
+        [
+          "semantic_graph_relation",
+          27,
+          27
+        ],
+        [
+          "semantic_graph_relation",
+          27,
+          27
+        ],
+        [
+          "semantic_graph_relation",
+          27,
+          27
+        ],
+        [
+          "semantic_graph_relation",
+          27,
+          27
+        ],
+        [
+          "semantic_graph_relation",
+          27,
+          27
+        ],
+        [
+          "semantic_graph_relation",
+          27,
+          27
+        ],
+        [
+          "semantic_graph_relation",
+          27,
+          27
+        ],
+        [
+          "semantic_graph_relation",
+          27,
+          27
+        ],
+        [
+          "semantic_graph_relation",
+          27,
+          27
+        ],
+        [
+          "semantic_graph_relation",
+          27,
+          28
+        ],
+        [
+          "instance",
+          28,
+          28
+        ],
+        [
+          "instance",
+          28,
+          28
+        ],
+        [
+          "semantic_graph_relation",
+          28,
+          29
+        ],
+        [
+          "instance",
+          29,
+          29
+        ],
+        [
+          "instance",
+          29,
+          29
+        ],
+        [
+          "semantic_graph_relation",
+          29,
+          30
+        ],
+        [
+          "instance",
+          30,
+          30
+        ],
+        [
+          "instance",
+          30,
+          30
+        ],
+        [
+          "semantic_graph_relation",
+          30,
+          31
+        ],
+        [
+          "instance",
+          31,
+          31
+        ],
+        [
+          "instance",
+          31,
+          31
+        ],
+        [
+          "semantic_graph_relation",
+          31,
+          32
+        ],
+        [
+          "instance",
+          32,
+          32
+        ],
+        [
+          "instance",
+          32,
+          32
+        ],
+        [
+          "semantic_graph_relation",
+          32,
+          33
+        ],
+        [
+          "instance",
+          33,
+          33
+        ],
+        [
+          "instance",
+          33,
+          33
+        ],
+        [
+          "semantic_graph_relation",
+          33,
+          34
+        ],
+        [
+          "instance",
+          34,
+          34
+        ],
+        [
+          "instance",
+          34,
+          34
+        ],
+        [
+          "semantic_graph_relation",
+          34,
+          35
+        ],
+        [
+          "instance",
+          35,
+          35
+        ],
+        [
+          "instance",
+          35,
+          35
+        ],
+        [
+          "semantic_graph_relation",
+          35,
+          36
+        ],
+        [
+          "instance",
+          36,
+          36
+        ],
+        [
+          "instance",
+          36,
+          36
+        ],
+        [
+          "semantic_graph_relation",
+          36,
+          37
+        ],
+        [
+          "instance",
+          37,
+          37
+        ],
+        [
+          "instance",
+          37,
+          37
+        ],
+        [
+          "semantic_graph_relation",
+          37,
+          38
+        ],
+        [
+          "instance",
+          38,
+          38
+        ],
+        [
+          "instance",
+          38,
+          38
+        ],
+        [
+          "semantic_graph_relation",
+          38,
+          39
+        ],
+        [
+          "instance",
+          39,
+          39
+        ],
+        [
+          "instance",
+          39,
+          39
+        ],
+        [
+          "semantic_graph_relation",
+          39,
+          40
+        ],
+        [
+          "instance",
+          40,
+          40
+        ],
+        [
+          "instance",
+          40,
+          40
+        ],
+        [
+          "semantic_graph_relation",
+          40,
+          41
+        ],
+        [
+          "instance",
+          41,
+          41
+        ],
+        [
+          "instance",
+          41,
+          41
+        ],
+        [
+          "semantic_graph_relation",
+          41,
+          42
+        ],
+        [
+          "instance",
+          42,
+          42
+        ],
+        [
+          "instance",
+          42,
+          42
+        ],
+        [
+          "semantic_graph_relation",
+          42,
+          43
+        ],
+        [
+          "instance",
+          43,
+          43
+        ],
+        [
+          "instance",
+          43,
+          43
+        ],
+        [
+          "semantic_graph_relation",
+          43,
+          44
+        ],
+        [
+          "instance",
+          44,
+          44
+        ],
+        [
+          "instance",
+          44,
+          44
+        ],
+        [
+          "semantic_graph_relation",
+          44,
+          45
+        ],
+        [
+          "instance",
+          45,
+          45
+        ],
+        [
+          "instance",
+          45,
+          45
+        ],
+        [
+          "semantic_graph_relation",
+          45,
+          46
+        ],
+        [
+          "instance",
+          46,
+          46
+        ],
+        [
+          "instance",
+          46,
+          46
+        ],
+        [
+          "semantic_graph_relation",
+          46,
+          47
+        ],
+        [
+          "instance",
+          47,
+          47
+        ],
+        [
+          "instance",
+          47,
+          47
+        ],
+        [
+          "semantic_graph_relation",
+          47,
+          48
+        ],
+        [
+          "instance",
+          48,
+          48
+        ],
+        [
+          "instance",
+          48,
+          48
+        ],
+        [
+          "semantic_graph_relation",
+          48,
+          49
+        ],
+        [
+          "instance",
+          49,
+          49
+        ],
+        [
+          "instance",
+          49,
+          49
+        ],
+        [
+          "semantic_graph_relation",
+          49,
+          50
+        ],
+        [
+          "instance",
+          50,
+          50
+        ],
+        [
+          "instance",
+          50,
+          50
+        ],
+        [
+          "semantic_graph_relation",
+          50,
+          51
+        ],
+        [
+          "instance",
+          51,
+          51
+        ],
+        [
+          "instance",
+          51,
+          51
+        ],
+        [
+          "semantic_graph_relation",
+          51,
+          52
+        ],
+        [
+          "instance",
+          52,
+          52
+        ],
+        [
+          "instance",
+          52,
+          52
+        ],
+        [
+          "semantic_graph_relation",
+          52,
+          53
+        ],
+        [
+          "instance",
+          53,
+          53
+        ],
+        [
+          "instance",
+          53,
+          53
+        ],
+        [
+          "semantic_graph_relation",
+          53,
+          54
+        ],
+        [
+          "instance",
+          54,
+          54
+        ],
+        [
+          "instance",
+          54,
+          54
+        ],
+        [
+          "semantic_graph_relation",
+          54,
+          55
+        ],
+        [
+          "instance",
+          55,
+          55
+        ],
+        [
+          "instance",
+          55,
+          55
+        ],
+        [
+          "semantic_summary",
+          55,
+          56
+        ],
+        [
+          "semantic_summary",
+          56,
+          57
+        ],
+        [
+          "semantic_summary",
+          57,
+          58
+        ],
+        [
+          "scene_space",
+          58,
+          58
+        ]
+      ],
+      "retained_snapshot_unchanged": true
+    }
+  ],
+  "timing_probe": {
+    "python": "3.8.10 (default, Oct 13 2026, 08:57:26) \n[GCC 14.2.0]",
+    "rounds": 5,
+    "scope": "Synthetic offline real graph write helpers; original callbacks and StateStore; no models. StateStore cost includes StateEntry construction, shallow namespace copy, existing lock, and latest pointer maintenance, not only dict copy. Instrumentation overhead remains in total wall; setup and retained snapshot checks excluded. Background counts are scale controls, not production prevalence.",
+    "retained_snapshots_unchanged": true,
+    "summary": [
+      {
+        "instances": 4,
+        "background_keys": 0,
+        "stage": "observation_graph",
+        "writes": 27,
+        "median_total_wall_ms": 15.664107999327825,
+        "median_state_write_wall_ms": 0.24891299472074024,
+        "median_state_write_share_pct": 1.5890658742356827
+      },
+      {
+        "instances": 4,
+        "background_keys": 0,
+        "stage": "scene_graph",
+        "writes": 27,
+        "median_total_wall_ms": 9.923351000907132,
+        "median_state_write_wall_ms": 0.1665610179770738,
+        "median_state_write_share_pct": 1.7059258059612323
+      },
+      {
+        "instances": 4,
+        "background_keys": 100,
+        "stage": "observation_graph",
+        "writes": 27,
+        "median_total_wall_ms": 15.04545399802737,
+        "median_state_write_wall_ms": 0.24812299670884386,
+        "median_state_write_share_pct": 1.6420102325058872
+      },
+      {
+        "instances": 4,
+        "background_keys": 100,
+        "stage": "scene_graph",
+        "writes": 27,
+        "median_total_wall_ms": 10.089531999255996,
+        "median_state_write_wall_ms": 0.23055000565364026,
+        "median_state_write_share_pct": 2.214174226346665
+      },
+      {
+        "instances": 4,
+        "background_keys": 1000,
+        "stage": "observation_graph",
+        "writes": 27,
+        "median_total_wall_ms": 16.376422998291673,
+        "median_state_write_wall_ms": 0.7367129946942441,
+        "median_state_write_share_pct": 4.516501305460563
+      },
+      {
+        "instances": 4,
+        "background_keys": 1000,
+        "stage": "scene_graph",
+        "writes": 27,
+        "median_total_wall_ms": 10.878943001443986,
+        "median_state_write_wall_ms": 0.7039150041237008,
+        "median_state_write_share_pct": 6.476359605354884
+      },
+      {
+        "instances": 8,
+        "background_keys": 0,
+        "stage": "observation_graph",
+        "writes": 51,
+        "median_total_wall_ms": 27.84812299796613,
+        "median_state_write_wall_ms": 0.36919600097462535,
+        "median_state_write_share_pct": 1.3128029964395196
+      },
+      {
+        "instances": 8,
+        "background_keys": 0,
+        "stage": "scene_graph",
+        "writes": 97,
+        "median_total_wall_ms": 28.01964199898066,
+        "median_state_write_wall_ms": 0.6972989940550178,
+        "median_state_write_share_pct": 2.4886077919210576
+      },
+      {
+        "instances": 8,
+        "background_keys": 100,
+        "stage": "observation_graph",
+        "writes": 51,
+        "median_total_wall_ms": 29.023858001892222,
+        "median_state_write_wall_ms": 0.4913690027024131,
+        "median_state_write_share_pct": 1.6478924876045458
+      },
+      {
+        "instances": 8,
+        "background_keys": 100,
+        "stage": "scene_graph",
+        "writes": 97,
+        "median_total_wall_ms": 30.32567099944572,
+        "median_state_write_wall_ms": 0.8406129782088101,
+        "median_state_write_share_pct": 2.793781278306026
+      },
+      {
+        "instances": 8,
+        "background_keys": 1000,
+        "stage": "observation_graph",
+        "writes": 51,
+        "median_total_wall_ms": 30.49391700187698,
+        "median_state_write_wall_ms": 1.409545999194961,
+        "median_state_write_share_pct": 4.593904438895907
+      },
+      {
+        "instances": 8,
+        "background_keys": 1000,
+        "stage": "scene_graph",
+        "writes": 97,
+        "median_total_wall_ms": 31.094682999537326,
+        "median_state_write_wall_ms": 2.4041070391831454,
+        "median_state_write_share_pct": 7.738221154607578
+      }
+    ],
+    "samples": [
+      {
+        "round": 0,
+        "instances": 4,
+        "background_keys": 0,
+        "stage": "observation_graph",
+        "writes": 27,
+        "copied_entries": 288,
+        "total_wall_sec": 0.018183271000452805,
+        "total_cpu_sec": 0.017939788000000068,
+        "state_write_wall_sec": 0.00019578399223973975
+      },
+      {
+        "round": 0,
+        "instances": 4,
+        "background_keys": 0,
+        "stage": "scene_graph",
+        "writes": 27,
+        "copied_entries": 492,
+        "total_wall_sec": 0.010040357999969274,
+        "total_cpu_sec": 0.010043739999999968,
+        "state_write_wall_sec": 0.0001665610179770738
+      },
+      {
+        "round": 0,
+        "instances": 4,
+        "background_keys": 100,
+        "stage": "observation_graph",
+        "writes": 27,
+        "copied_entries": 2988,
+        "total_wall_sec": 0.01504545399802737,
+        "total_cpu_sec": 0.015071779999999979,
+        "state_write_wall_sec": 0.00024630999178043567
+      },
+      {
+        "round": 0,
+        "instances": 4,
+        "background_keys": 100,
+        "stage": "scene_graph",
+        "writes": 27,
+        "copied_entries": 3192,
+        "total_wall_sec": 0.010089531999255996,
+        "total_cpu_sec": 0.00985602200000002,
+        "state_write_wall_sec": 0.00023361299827229232
+      },
+      {
+        "round": 0,
+        "instances": 4,
+        "background_keys": 1000,
+        "stage": "observation_graph",
+        "writes": 27,
+        "copied_entries": 27288,
+        "total_wall_sec": 0.016376422998291673,
+        "total_cpu_sec": 0.01635546099999996,
+        "state_write_wall_sec": 0.0006742930017935578
+      },
+      {
+        "round": 0,
+        "instances": 4,
+        "background_keys": 1000,
+        "stage": "scene_graph",
+        "writes": 27,
+        "copied_entries": 27492,
+        "total_wall_sec": 0.012315272997511784,
+        "total_cpu_sec": 0.012318630999999969,
+        "state_write_wall_sec": 0.0008339079795405269
+      },
+      {
+        "round": 0,
+        "instances": 8,
+        "background_keys": 0,
+        "stage": "observation_graph",
+        "writes": 51,
+        "copied_entries": 952,
+        "total_wall_sec": 0.029198231000918895,
+        "total_cpu_sec": 0.029172650000000022,
+        "state_write_wall_sec": 0.00036919600097462535
+      },
+      {
+        "round": 0,
+        "instances": 8,
+        "background_keys": 0,
+        "stage": "scene_graph",
+        "writes": 97,
+        "copied_entries": 3927,
+        "total_wall_sec": 0.027550722999876598,
+        "total_cpu_sec": 0.027547301999999885,
+        "state_write_wall_sec": 0.0007347569662670139
+      },
+      {
+        "round": 0,
+        "instances": 8,
+        "background_keys": 100,
+        "stage": "observation_graph",
+        "writes": 51,
+        "copied_entries": 6052,
+        "total_wall_sec": 0.033855000998300966,
+        "total_cpu_sec": 0.033714309999999914,
+        "state_write_wall_sec": 0.0005578940181294456
+      },
+      {
+        "round": 0,
+        "instances": 8,
+        "background_keys": 100,
+        "stage": "scene_graph",
+        "writes": 97,
+        "copied_entries": 13627,
+        "total_wall_sec": 0.03120119500090368,
+        "total_cpu_sec": 0.03120499100000007,
+        "state_write_wall_sec": 0.0008683889791427646
+      },
+      {
+        "round": 0,
+        "instances": 8,
+        "background_keys": 1000,
+        "stage": "observation_graph",
+        "writes": 51,
+        "copied_entries": 51952,
+        "total_wall_sec": 0.03049391700187698,
+        "total_cpu_sec": 0.030381001000000074,
+        "state_write_wall_sec": 0.0013980719959363341
+      },
+      {
+        "round": 0,
+        "instances": 8,
+        "background_keys": 1000,
+        "stage": "scene_graph",
+        "writes": 97,
+        "copied_entries": 100927,
+        "total_wall_sec": 0.030364692000148352,
+        "total_cpu_sec": 0.030368882000000097,
+        "state_write_wall_sec": 0.0023496870198869146
+      },
+      {
+        "round": 1,
+        "instances": 4,
+        "background_keys": 1000,
+        "stage": "observation_graph",
+        "writes": 27,
+        "copied_entries": 27288,
+        "total_wall_sec": 0.017085914998460794,
+        "total_cpu_sec": 0.017090300000000003,
+        "state_write_wall_sec": 0.0007578440017823596
+      },
+      {
+        "round": 1,
+        "instances": 4,
+        "background_keys": 1000,
+        "stage": "scene_graph",
+        "writes": 27,
+        "copied_entries": 27492,
+        "total_wall_sec": 0.01061937199847307,
+        "total_cpu_sec": 0.010579915000000106,
+        "state_write_wall_sec": 0.0006354190009005833
+      },
+      {
+        "round": 1,
+        "instances": 4,
+        "background_keys": 100,
+        "stage": "observation_graph",
+        "writes": 27,
+        "copied_entries": 2988,
+        "total_wall_sec": 0.01749291899977834,
+        "total_cpu_sec": 0.01749872500000005,
+        "state_write_wall_sec": 0.00024812299670884386
+      },
+      {
+        "round": 1,
+        "instances": 4,
+        "background_keys": 100,
+        "stage": "scene_graph",
+        "writes": 27,
+        "copied_entries": 3192,
+        "total_wall_sec": 0.010201771998254117,
+        "total_cpu_sec": 0.010205259000000133,
+        "state_write_wall_sec": 0.0002254859973618295
+      },
+      {
+        "round": 1,
+        "instances": 4,
+        "background_keys": 0,
+        "stage": "observation_graph",
+        "writes": 27,
+        "copied_entries": 288,
+        "total_wall_sec": 0.015919223002129,
+        "total_cpu_sec": 0.015900055999999996,
+        "state_write_wall_sec": 0.00033920900386874564
+      },
+      {
+        "round": 1,
+        "instances": 4,
+        "background_keys": 0,
+        "stage": "scene_graph",
+        "writes": 27,
+        "copied_entries": 492,
+        "total_wall_sec": 0.012100948999432148,
+        "total_cpu_sec": 0.012030763000000055,
+        "state_write_wall_sec": 0.0001813449925975874
+      },
+      {
+        "round": 1,
+        "instances": 8,
+        "background_keys": 1000,
+        "stage": "observation_graph",
+        "writes": 51,
+        "copied_entries": 51952,
+        "total_wall_sec": 0.030682962998980656,
+        "total_cpu_sec": 0.030632563999999807,
+        "state_write_wall_sec": 0.001409545999194961
+      },
+      {
+        "round": 1,
+        "instances": 8,
+        "background_keys": 1000,
+        "stage": "scene_graph",
+        "writes": 97,
+        "copied_entries": 100927,
+        "total_wall_sec": 0.031094682999537326,
+        "total_cpu_sec": 0.03105183399999989,
+        "state_write_wall_sec": 0.002386310981819406
+      },
+      {
+        "round": 1,
+        "instances": 8,
+        "background_keys": 100,
+        "stage": "observation_graph",
+        "writes": 51,
+        "copied_entries": 6052,
+        "total_wall_sec": 0.02821928299817955,
+        "total_cpu_sec": 0.028217135000000004,
+        "state_write_wall_sec": 0.00046448500143014826
+      },
+      {
+        "round": 1,
+        "instances": 8,
+        "background_keys": 100,
+        "stage": "scene_graph",
+        "writes": 97,
+        "copied_entries": 13627,
+        "total_wall_sec": 0.028376881000440335,
+        "total_cpu_sec": 0.028353325999999957,
+        "state_write_wall_sec": 0.0007927879887574818
+      },
+      {
+        "round": 1,
+        "instances": 8,
+        "background_keys": 0,
+        "stage": "observation_graph",
+        "writes": 51,
+        "copied_entries": 952,
+        "total_wall_sec": 0.02784812299796613,
+        "total_cpu_sec": 0.027811794,
+        "state_write_wall_sec": 0.0003655909931694623
+      },
+      {
+        "round": 1,
+        "instances": 8,
+        "background_keys": 0,
+        "stage": "scene_graph",
+        "writes": 97,
+        "copied_entries": 3927,
+        "total_wall_sec": 0.028503993002232164,
+        "total_cpu_sec": 0.028485212000000093,
+        "state_write_wall_sec": 0.0006137600030342583
+      },
+      {
+        "round": 2,
+        "instances": 4,
+        "background_keys": 0,
+        "stage": "observation_graph",
+        "writes": 27,
+        "copied_entries": 288,
+        "total_wall_sec": 0.015433550001034746,
+        "total_cpu_sec": 0.01536115799999993,
+        "state_write_wall_sec": 0.00018719798754318617
+      },
+      {
+        "round": 2,
+        "instances": 4,
+        "background_keys": 0,
+        "stage": "scene_graph",
+        "writes": 27,
+        "copied_entries": 492,
+        "total_wall_sec": 0.009923351000907132,
+        "total_cpu_sec": 0.009884083999999849,
+        "state_write_wall_sec": 0.000169285005540587
+      },
+      {
+        "round": 2,
+        "instances": 4,
+        "background_keys": 100,
+        "stage": "observation_graph",
+        "writes": 27,
+        "copied_entries": 2988,
+        "total_wall_sec": 0.015509154000028502,
+        "total_cpu_sec": 0.015515105999999834,
+        "state_write_wall_sec": 0.0003070410057262052
+      },
+      {
+        "round": 2,
+        "instances": 4,
+        "background_keys": 100,
+        "stage": "scene_graph",
+        "writes": 27,
+        "copied_entries": 3192,
+        "total_wall_sec": 0.01041246000022511,
+        "total_cpu_sec": 0.010415661000000132,
+        "state_write_wall_sec": 0.00023055000565364026
+      },
+      {
+        "round": 2,
+        "instances": 4,
+        "background_keys": 1000,
+        "stage": "observation_graph",
+        "writes": 27,
+        "copied_entries": 27288,
+        "total_wall_sec": 0.016311586001393152,
+        "total_cpu_sec": 0.0162287430000001,
+        "state_write_wall_sec": 0.0007367129946942441
+      },
+      {
+        "round": 2,
+        "instances": 4,
+        "background_keys": 1000,
+        "stage": "scene_graph",
+        "writes": 27,
+        "copied_entries": 27492,
+        "total_wall_sec": 0.010545060002186801,
+        "total_cpu_sec": 0.010549158999999975,
+        "state_write_wall_sec": 0.0006829360063420609
+      },
+      {
+        "round": 2,
+        "instances": 8,
+        "background_keys": 0,
+        "stage": "observation_graph",
+        "writes": 51,
+        "copied_entries": 952,
+        "total_wall_sec": 0.02779568299956736,
+        "total_cpu_sec": 0.027775298999999976,
+        "state_write_wall_sec": 0.0003902349963027518
+      },
+      {
+        "round": 2,
+        "instances": 8,
+        "background_keys": 0,
+        "stage": "scene_graph",
+        "writes": 97,
+        "copied_entries": 3927,
+        "total_wall_sec": 0.02801964199898066,
+        "total_cpu_sec": 0.027932773000000077,
+        "state_write_wall_sec": 0.0006972989940550178
+      },
+      {
+        "round": 2,
+        "instances": 8,
+        "background_keys": 100,
+        "stage": "observation_graph",
+        "writes": 51,
+        "copied_entries": 6052,
+        "total_wall_sec": 0.029023858001892222,
+        "total_cpu_sec": 0.029003751000000078,
+        "state_write_wall_sec": 0.0005127039803483058
+      },
+      {
+        "round": 2,
+        "instances": 8,
+        "background_keys": 100,
+        "stage": "scene_graph",
+        "writes": 97,
+        "copied_entries": 13627,
+        "total_wall_sec": 0.028050928998709423,
+        "total_cpu_sec": 0.028028946000000055,
+        "state_write_wall_sec": 0.0007982459756021854
+      },
+      {
+        "round": 2,
+        "instances": 8,
+        "background_keys": 1000,
+        "stage": "observation_graph",
+        "writes": 51,
+        "copied_entries": 51952,
+        "total_wall_sec": 0.030901991998689482,
+        "total_cpu_sec": 0.030899248999999962,
+        "state_write_wall_sec": 0.0014810769898758736
+      },
+      {
+        "round": 2,
+        "instances": 8,
+        "background_keys": 1000,
+        "stage": "scene_graph",
+        "writes": 97,
+        "copied_entries": 100927,
+        "total_wall_sec": 0.02976792100162129,
+        "total_cpu_sec": 0.029745289000000064,
+        "state_write_wall_sec": 0.002515179010515567
+      },
+      {
+        "round": 3,
+        "instances": 4,
+        "background_keys": 1000,
+        "stage": "observation_graph",
+        "writes": 27,
+        "copied_entries": 27288,
+        "total_wall_sec": 0.015317235000111395,
+        "total_cpu_sec": 0.015321479999999887,
+        "state_write_wall_sec": 0.0007072580046951771
+      },
+      {
+        "round": 3,
+        "instances": 4,
+        "background_keys": 1000,
+        "stage": "scene_graph",
+        "writes": 27,
+        "copied_entries": 27492,
+        "total_wall_sec": 0.010878943001443986,
+        "total_cpu_sec": 0.010881711000000127,
+        "state_write_wall_sec": 0.0007317259914998431
+      },
+      {
+        "round": 3,
+        "instances": 4,
+        "background_keys": 100,
+        "stage": "observation_graph",
+        "writes": 27,
+        "copied_entries": 2988,
+        "total_wall_sec": 0.014606060001824517,
+        "total_cpu_sec": 0.014610676000000211,
+        "state_write_wall_sec": 0.0002398329997959081
+      },
+      {
+        "round": 3,
+        "instances": 4,
+        "background_keys": 100,
+        "stage": "scene_graph",
+        "writes": 27,
+        "copied_entries": 3192,
+        "total_wall_sec": 0.00988681599847041,
+        "total_cpu_sec": 0.0098898919999999,
+        "state_write_wall_sec": 0.00021415098308352754
+      },
+      {
+        "round": 3,
+        "instances": 4,
+        "background_keys": 0,
+        "stage": "observation_graph",
+        "writes": 27,
+        "copied_entries": 288,
+        "total_wall_sec": 0.015664107999327825,
+        "total_cpu_sec": 0.01562756299999979,
+        "state_write_wall_sec": 0.00024891299472074024
+      },
+      {
+        "round": 3,
+        "instances": 4,
+        "background_keys": 0,
+        "stage": "scene_graph",
+        "writes": 27,
+        "copied_entries": 492,
+        "total_wall_sec": 0.009343935998913366,
+        "total_cpu_sec": 0.009347167999999684,
+        "state_write_wall_sec": 0.00016428800881840289
+      },
+      {
+        "round": 3,
+        "instances": 8,
+        "background_keys": 1000,
+        "stage": "observation_graph",
+        "writes": 51,
+        "copied_entries": 51952,
+        "total_wall_sec": 0.029797385999700055,
+        "total_cpu_sec": 0.029776865999999735,
+        "state_write_wall_sec": 0.0013034040021011606
+      },
+      {
+        "round": 3,
+        "instances": 8,
+        "background_keys": 1000,
+        "stage": "scene_graph",
+        "writes": 97,
+        "copied_entries": 100927,
+        "total_wall_sec": 0.03135884299990721,
+        "total_cpu_sec": 0.03127324300000023,
+        "state_write_wall_sec": 0.002440811993437819
+      },
+      {
+        "round": 3,
+        "instances": 8,
+        "background_keys": 100,
+        "stage": "observation_graph",
+        "writes": 51,
+        "copied_entries": 6052,
+        "total_wall_sec": 0.027447147000202676,
+        "total_cpu_sec": 0.027451981000000014,
+        "state_write_wall_sec": 0.0004913690027024131
+      },
+      {
+        "round": 3,
+        "instances": 8,
+        "background_keys": 100,
+        "stage": "scene_graph",
+        "writes": 97,
+        "copied_entries": 13627,
+        "total_wall_sec": 0.03032567099944572,
+        "total_cpu_sec": 0.030265438999999894,
+        "state_write_wall_sec": 0.0008406129782088101
+      },
+      {
+        "round": 3,
+        "instances": 8,
+        "background_keys": 0,
+        "stage": "observation_graph",
+        "writes": 51,
+        "copied_entries": 952,
+        "total_wall_sec": 0.028687388003163505,
+        "total_cpu_sec": 0.028657077000000086,
+        "state_write_wall_sec": 0.0003898389950336423
+      },
+      {
+        "round": 3,
+        "instances": 8,
+        "background_keys": 0,
+        "stage": "scene_graph",
+        "writes": 97,
+        "copied_entries": 3927,
+        "total_wall_sec": 0.0801879659993574,
+        "total_cpu_sec": 0.08007191899999988,
+        "state_write_wall_sec": 0.0006882330417283811
+      },
+      {
+        "round": 4,
+        "instances": 4,
+        "background_keys": 0,
+        "stage": "observation_graph",
+        "writes": 27,
+        "copied_entries": 288,
+        "total_wall_sec": 0.01507914499961771,
+        "total_cpu_sec": 0.015083306999999824,
+        "state_write_wall_sec": 0.0003171390089846682
+      },
+      {
+        "round": 4,
+        "instances": 4,
+        "background_keys": 0,
+        "stage": "scene_graph",
+        "writes": 27,
+        "copied_entries": 492,
+        "total_wall_sec": 0.00941092699940782,
+        "total_cpu_sec": 0.009390811999999915,
+        "state_write_wall_sec": 0.0001635999979043845
+      },
+      {
+        "round": 4,
+        "instances": 4,
+        "background_keys": 100,
+        "stage": "observation_graph",
+        "writes": 27,
+        "copied_entries": 2988,
+        "total_wall_sec": 0.014814976002526237,
+        "total_cpu_sec": 0.014781510000000164,
+        "state_write_wall_sec": 0.0002628079855639953
+      },
+      {
+        "round": 4,
+        "instances": 4,
+        "background_keys": 100,
+        "stage": "scene_graph",
+        "writes": 27,
+        "copied_entries": 3192,
+        "total_wall_sec": 0.010045375001936918,
+        "total_cpu_sec": 0.01004802600000021,
+        "state_write_wall_sec": 0.0002632689975143876
+      },
+      {
+        "round": 4,
+        "instances": 4,
+        "background_keys": 1000,
+        "stage": "observation_graph",
+        "writes": 27,
+        "copied_entries": 27288,
+        "total_wall_sec": 0.017003709999698913,
+        "total_cpu_sec": 0.016979715000000173,
+        "state_write_wall_sec": 0.0007858849967306014
+      },
+      {
+        "round": 4,
+        "instances": 4,
+        "background_keys": 1000,
+        "stage": "scene_graph",
+        "writes": 27,
+        "copied_entries": 27492,
+        "total_wall_sec": 0.012048969998431858,
+        "total_cpu_sec": 0.012052245000000017,
+        "state_write_wall_sec": 0.0007039150041237008
+      },
+      {
+        "round": 4,
+        "instances": 8,
+        "background_keys": 0,
+        "stage": "observation_graph",
+        "writes": 51,
+        "copied_entries": 952,
+        "total_wall_sec": 0.02748503199836705,
+        "total_cpu_sec": 0.027490597999999977,
+        "state_write_wall_sec": 0.0003604700141295325
+      },
+      {
+        "round": 4,
+        "instances": 8,
+        "background_keys": 0,
+        "stage": "scene_graph",
+        "writes": 97,
+        "copied_entries": 3927,
+        "total_wall_sec": 0.027646155998809263,
+        "total_cpu_sec": 0.02765045499999985,
+        "state_write_wall_sec": 0.0007726180047029629
+      },
+      {
+        "round": 4,
+        "instances": 8,
+        "background_keys": 100,
+        "stage": "observation_graph",
+        "writes": 51,
+        "copied_entries": 6052,
+        "total_wall_sec": 0.030437830999289872,
+        "total_cpu_sec": 0.030052352000000226,
+        "state_write_wall_sec": 0.0004830690013477579
+      },
+      {
+        "round": 4,
+        "instances": 8,
+        "background_keys": 100,
+        "stage": "scene_graph",
+        "writes": 97,
+        "copied_entries": 13627,
+        "total_wall_sec": 0.03097422000064398,
+        "total_cpu_sec": 0.03095161599999985,
+        "state_write_wall_sec": 0.00106311602939968
+      },
+      {
+        "round": 4,
+        "instances": 8,
+        "background_keys": 1000,
+        "stage": "observation_graph",
+        "writes": 51,
+        "copied_entries": 51952,
+        "total_wall_sec": 0.030350598997756606,
+        "total_cpu_sec": 0.030262625999999848,
+        "state_write_wall_sec": 0.0014199819997884333
+      },
+      {
+        "round": 4,
+        "instances": 8,
+        "background_keys": 1000,
+        "stage": "scene_graph",
+        "writes": 97,
+        "copied_entries": 100927,
+        "total_wall_sec": 0.033519713000714546,
+        "total_cpu_sec": 0.03352354699999971,
+        "state_write_wall_sec": 0.0024041070391831454
+      }
+    ]
+  }
+}

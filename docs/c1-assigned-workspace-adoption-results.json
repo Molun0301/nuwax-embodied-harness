@@ -1,0 +1,376 @@
+{
+  "schema_version": 1,
+  "date_utc": "2026-10-06",
+  "scope": "public assigned workspace/session adoption; focused Python behavior only",
+  "base_integrated_remote_commit": "08988099e2140fcca1521d7597e687ecb38380cb",
+  "base_source_tree": "0046774e1220deec04dbc767dc3a8372a7dd26e3",
+  "local_synthetic_base": "b7c4175cdd436c186f6b202d6a69f632c9e238f6",
+  "local_base_is_not_remote_ancestry": true,
+  "source_sha256": {
+    "core/state_store.py": "fcc1f804c3c9f2285c2f7eb418226823feb51fc3771adfd6859d013c5ac86b58",
+    "services/geometry/geometry_runtime_provider.py": "cf3088efb655c06e83ce2f43001b89f28ea73406a3c0c123e9938fb42faea2eb",
+    "services/geometry/runtime.py": "fb61d58e7e80aafbac32f87b96f1d28c46e08986f1721d255ca3a910cac68e4a",
+    "services/mapping/catalog.py": "b9d79427b823000ac692d0a63540d40c2ce6b82453c94df4749231ae6bba0f2e",
+    "services/mapping/service.py": "a3185acb20d73ea8d7a827f1aa408fb43fecec10f1876d69b15cb3605e4defba",
+    "skills/map_workspace.py": "89a75050ad1de5e30afc7e61de825f66ab13bd9b8cd9ad08e6cd67e234188aad",
+    "skills/assigned_map_activation.py": "ed4ab53c88c5d11d0a707a532601ab1afd28ddbb32984642f46414690eaf8a20"
+  },
+  "test_sha256": {
+    "tests/test_assigned_workspace_activation.py": "39b6c7a10c52811b1f27829493c62807a8290189c52af46b092b358c25800909",
+    "tests/test_assigned_workspace_journal.py": "a305e6180f1bfa5f8afb61b3e5e047aa0a9659cf805d178bf6f7f6bdfe0dd432",
+    "tests/test_assigned_runtime_adoption.py": "563366ec428e5ac563a3670650d63f70e7fea5430def74b5f7e54030261ec4f2"
+  },
+  "focused_passed": 77,
+  "focused_failed": 0,
+  "focused_ignored": 0,
+  "results": [
+    {
+      "file": "public-workspace-32.log",
+      "passed": 32,
+      "cases": [
+        {
+          "test": "test_active_workspace_callback_switch_cannot_make_outer_activation_return_stale_workspace (test_assigned_workspace_activation.AssignedWorkspaceActivationTests.test_active_workspace_callback_switch_cannot_make_outer_activation_return_stale_workspace)",
+          "result": "ok"
+        },
+        {
+          "test": "test_cold_restore_reconstructs_runtime_mapping_and_session_from_actual_sealed_owner_without_dispatch (test_assigned_workspace_activation.AssignedWorkspaceActivationTests.test_cold_restore_reconstructs_runtime_mapping_and_session_from_actual_sealed_owner_without_dispatch)",
+          "result": "ok"
+        },
+        {
+          "test": "test_complete_original_request_is_durable_before_any_native_mutation (test_assigned_workspace_activation.AssignedWorkspaceActivationTests.test_complete_original_request_is_durable_before_any_native_mutation)",
+          "result": "ok"
+        },
+        {
+          "test": "test_completed_restart_restore_observes_state_but_never_dispatches (test_assigned_workspace_activation.AssignedWorkspaceActivationTests.test_completed_restart_restore_observes_state_but_never_dispatches)",
+          "result": "ok"
+        },
+        {
+          "test": "test_constructor_preserves_assigned_relocalization_intent_without_legacy_abort_or_rpc (test_assigned_workspace_activation.AssignedWorkspaceActivationTests.test_constructor_preserves_assigned_relocalization_intent_without_legacy_abort_or_rpc)",
+          "result": "ok"
+        },
+        {
+          "test": "test_dispatch_phase_rename_requires_successful_directory_fsync_on_every_explicit_retry (test_assigned_workspace_activation.AssignedWorkspaceActivationTests.test_dispatch_phase_rename_requires_successful_directory_fsync_on_every_explicit_retry)",
+          "result": "ok"
+        },
+        {
+          "test": "test_durable_receipt_failure_retains_journal_fence_and_original_owner_for_restore (test_assigned_workspace_activation.AssignedWorkspaceActivationTests.test_durable_receipt_failure_retains_journal_fence_and_original_owner_for_restore)",
+          "result": "ok"
+        },
+        {
+          "test": "test_failure_to_clear_runtime_fence_retains_durable_journal (test_assigned_workspace_activation.AssignedWorkspaceActivationTests.test_failure_to_clear_runtime_fence_retains_durable_journal)",
+          "result": "ok"
+        },
+        {
+          "test": "test_journal_clear_cancellation_rearms_retained_fence_outside_guards_and_propagates_original (test_assigned_workspace_activation.AssignedWorkspaceActivationTests.test_journal_clear_cancellation_rearms_retained_fence_outside_guards_and_propagates_original)",
+          "result": "ok"
+        },
+        {
+          "test": "test_journal_clear_failure_retains_fence_and_releases_session_publication_outside_guards (test_assigned_workspace_activation.AssignedWorkspaceActivationTests.test_journal_clear_failure_retains_fence_and_releases_session_publication_outside_guards)",
+          "result": "ok"
+        },
+        {
+          "test": "test_journal_write_failure_prevents_all_native_mutations (test_assigned_workspace_activation.AssignedWorkspaceActivationTests.test_journal_write_failure_prevents_all_native_mutations)",
+          "result": "ok"
+        },
+        {
+          "test": "test_localization_callback_can_activate_successor_and_old_call_never_returns_stale_workspace (test_assigned_workspace_activation.AssignedWorkspaceActivationTests.test_localization_callback_can_activate_successor_and_old_call_never_returns_stale_workspace)",
+          "result": "ok"
+        },
+        {
+          "test": "test_localization_preparation_supersession_loses_cas_and_retains_recovery (test_assigned_workspace_activation.AssignedWorkspaceActivationTests.test_localization_preparation_supersession_loses_cas_and_retains_recovery)",
+          "result": "ok"
+        },
+        {
+          "test": "test_map_asset_reads_and_checkpoint_preparation_run_outside_runtime_catalog_executor_locks (test_assigned_workspace_activation.AssignedWorkspaceActivationTests.test_map_asset_reads_and_checkpoint_preparation_run_outside_runtime_catalog_executor_locks)",
+          "result": "ok"
+        },
+        {
+          "test": "test_mapping_callback_supersession_is_detected_and_cannot_publish_success (test_assigned_workspace_activation.AssignedWorkspaceActivationTests.test_mapping_callback_supersession_is_detected_and_cannot_publish_success)",
+          "result": "ok"
+        },
+        {
+          "test": "test_mapping_clear_during_summary_prevents_workspace_publication_and_stale_return (test_assigned_workspace_activation.AssignedWorkspaceActivationTests.test_mapping_clear_during_summary_prevents_workspace_publication_and_stale_return)",
+          "result": "ok"
+        },
+        {
+          "test": "test_mapping_clear_during_workspace_publication_invalidates_just_written_workspace (test_assigned_workspace_activation.AssignedWorkspaceActivationTests.test_mapping_clear_during_workspace_publication_invalidates_just_written_workspace)",
+          "result": "ok"
+        },
+        {
+          "test": "test_pending_original_map_blocks_different_target_before_any_native_rpc (test_assigned_workspace_activation.AssignedWorkspaceActivationTests.test_pending_original_map_blocks_different_target_before_any_native_rpc)",
+          "result": "ok"
+        },
+        {
+          "test": "test_postdispatch_mapping_failure_keeps_exact_request_and_fence_then_reconciles_without_dispatch (test_assigned_workspace_activation.AssignedWorkspaceActivationTests.test_postdispatch_mapping_failure_keeps_exact_request_and_fence_then_reconciles_without_dispatch)",
+          "result": "ok"
+        },
+        {
+          "test": "test_public_activation_installs_real_runtime_catalog_mapping_and_localizing_session_without_old_pose (test_assigned_workspace_activation.AssignedWorkspaceActivationTests.test_public_activation_installs_real_runtime_catalog_mapping_and_localizing_session_without_old_pose)",
+          "result": "ok"
+        },
+        {
+          "test": "test_public_explicit_a_to_b_stops_exact_predecessor_before_dispatch (test_assigned_workspace_activation.AssignedWorkspaceActivationTests.test_public_explicit_a_to_b_stops_exact_predecessor_before_dispatch)",
+          "result": "ok"
+        },
+        {
+          "test": "test_public_getters_never_dispatch_refresh_or_use_legacy_session_cas (test_assigned_workspace_activation.AssignedWorkspaceActivationTests.test_public_getters_never_dispatch_refresh_or_use_legacy_session_cas)",
+          "result": "ok"
+        },
+        {
+          "test": "test_repeat_same_owner_preserves_installation_session_epoch_and_map_snapshot (test_assigned_workspace_activation.AssignedWorkspaceActivationTests.test_repeat_same_owner_preserves_installation_session_epoch_and_map_snapshot)",
+          "result": "ok"
+        },
+        {
+          "test": "test_restore_without_current_sealed_evidence_never_dispatches_or_rewrites_request (test_assigned_workspace_activation.AssignedWorkspaceActivationTests.test_restore_without_current_sealed_evidence_never_dispatches_or_rewrites_request)",
+          "result": "ok"
+        },
+        {
+          "test": "test_rpc_map_and_state_publication_callbacks_run_without_runtime_catalog_executor_guards (test_assigned_workspace_activation.AssignedWorkspaceActivationTests.test_rpc_map_and_state_publication_callbacks_run_without_runtime_catalog_executor_guards)",
+          "result": "ok"
+        },
+        {
+          "test": "test_same_asset_fresh_native_installation_updates_mapping_receipt_instead_of_deduplicating_old_owner (test_assigned_workspace_activation.AssignedWorkspaceActivationTests.test_same_asset_fresh_native_installation_updates_mapping_receipt_instead_of_deduplicating_old_owner)",
+          "result": "ok"
+        },
+        {
+          "test": "test_sealed_actual_state_can_restore_unknown_without_native_reexecution (test_assigned_workspace_activation.AssignedWorkspaceActivationTests.test_sealed_actual_state_can_restore_unknown_without_native_reexecution)",
+          "result": "ok"
+        },
+        {
+          "test": "test_sealed_unknown_reconciliation_does_not_leave_provider_attempt_blocking_next_map (test_assigned_workspace_activation.AssignedWorkspaceActivationTests.test_sealed_unknown_reconciliation_does_not_leave_provider_attempt_blocking_next_map)",
+          "result": "ok"
+        },
+        {
+          "test": "test_successor_before_underlying_workspace_write_cannot_leave_stale_cache_or_return (test_assigned_workspace_activation.AssignedWorkspaceActivationTests.test_successor_before_underlying_workspace_write_cannot_leave_stale_cache_or_return)",
+          "result": "ok"
+        },
+        {
+          "test": "test_unknown_is_retained_until_explicit_exact_retry_and_never_reexecutes_in_exception (test_assigned_workspace_activation.AssignedWorkspaceActivationTests.test_unknown_is_retained_until_explicit_exact_retry_and_never_reexecutes_in_exception)",
+          "result": "ok"
+        },
+        {
+          "test": "test_unknown_predecessor_stop_never_activates_until_explicit_retry_of_exact_journal (test_assigned_workspace_activation.AssignedWorkspaceActivationTests.test_unknown_predecessor_stop_never_activates_until_explicit_retry_of_exact_journal)",
+          "result": "ok"
+        },
+        {
+          "test": "test_workspace_write_failure_or_cancellation_discards_stale_value_and_preserves_original_error (test_assigned_workspace_activation.AssignedWorkspaceActivationTests.test_workspace_write_failure_or_cancellation_discards_stale_value_and_preserves_original_error)",
+          "result": "ok"
+        }
+      ],
+      "log_sha256": "2326b773fc4a484b6459cafa8db0f43fc1c1fcdbe57f361a1074525dc2a70c35"
+    },
+    {
+      "file": "journal-17.log",
+      "passed": 17,
+      "cases": [
+        {
+          "test": "test_assigned_predecessor_phases_do_not_expand_legacy_phase_schema (test_assigned_workspace_journal.AssignedWorkspaceJournalTests.test_assigned_predecessor_phases_do_not_expand_legacy_phase_schema)",
+          "result": "ok"
+        },
+        {
+          "test": "test_changed_receipt_policy_availability_or_mixed_fields_fail_without_rewrite (test_assigned_workspace_journal.AssignedWorkspaceJournalTests.test_changed_receipt_policy_availability_or_mixed_fields_fail_without_rewrite)",
+          "result": "ok"
+        },
+        {
+          "test": "test_exact_backend_evidence_survives_reopen_and_ack_replay_label (test_assigned_workspace_journal.AssignedWorkspaceJournalTests.test_exact_backend_evidence_survives_reopen_and_ack_replay_label)",
+          "result": "ok"
+        },
+        {
+          "test": "test_exact_evidence_retry_settles_failed_directory_fsync_before_adoption (test_assigned_workspace_journal.AssignedWorkspaceJournalTests.test_exact_evidence_retry_settles_failed_directory_fsync_before_adoption)",
+          "result": "ok"
+        },
+        {
+          "test": "test_failed_admission_fsync_prevents_caller_dispatch (test_assigned_workspace_journal.AssignedWorkspaceJournalTests.test_failed_admission_fsync_prevents_caller_dispatch)",
+          "result": "ok"
+        },
+        {
+          "test": "test_failed_evidence_persistence_leaves_original_dispatch_fence (test_assigned_workspace_journal.AssignedWorkspaceJournalTests.test_failed_evidence_persistence_leaves_original_dispatch_fence)",
+          "result": "ok"
+        },
+        {
+          "test": "test_full_completion_and_clear_cannot_discard_unresolved_or_changed_ownership (test_assigned_workspace_journal.AssignedWorkspaceJournalTests.test_full_completion_and_clear_cannot_discard_unresolved_or_changed_ownership)",
+          "result": "ok"
+        },
+        {
+          "test": "test_full_receipt_mismatched_request_is_not_trusted_and_old_receipt_has_no_inference (test_assigned_workspace_journal.AssignedWorkspaceJournalTests.test_full_receipt_mismatched_request_is_not_trusted_and_old_receipt_has_no_inference)",
+          "result": "ok"
+        },
+        {
+          "test": "test_full_request_reopen_changed_fields_and_distinct_native_ids (test_assigned_workspace_journal.AssignedWorkspaceJournalTests.test_full_request_reopen_changed_fields_and_distinct_native_ids)",
+          "result": "ok"
+        },
+        {
+          "test": "test_metadata_only_schema3_stays_readable_but_cannot_supply_missing_request (test_assigned_workspace_journal.AssignedWorkspaceJournalTests.test_metadata_only_schema3_stays_readable_but_cannot_supply_missing_request)",
+          "result": "ok"
+        },
+        {
+          "test": "test_native_source_session_does_not_gain_new_journal_length_or_alphabet_cap (test_assigned_workspace_journal.AssignedWorkspaceJournalTests.test_native_source_session_does_not_gain_new_journal_length_or_alphabet_cap)",
+          "result": "ok"
+        },
+        {
+          "test": "test_original_request_is_fsynced_before_dispatch_and_never_generated (test_assigned_workspace_journal.AssignedWorkspaceJournalTests.test_original_request_is_fsynced_before_dispatch_and_never_generated)",
+          "result": "ok"
+        },
+        {
+          "test": "test_predecessor_descriptor_rejects_mutable_revisions_and_bad_generations (test_assigned_workspace_journal.AssignedWorkspaceJournalTests.test_predecessor_descriptor_rejects_mutable_revisions_and_bad_generations)",
+          "result": "ok"
+        },
+        {
+          "test": "test_predecessor_is_exact_and_stop_phases_have_expected_phase_cas (test_assigned_workspace_journal.AssignedWorkspaceJournalTests.test_predecessor_is_exact_and_stop_phases_have_expected_phase_cas)",
+          "result": "ok"
+        },
+        {
+          "test": "test_receipt_directory_fsync_failure_keeps_recoverable_journal_and_receipt (test_assigned_workspace_journal.AssignedWorkspaceJournalTests.test_receipt_directory_fsync_failure_keeps_recoverable_journal_and_receipt)",
+          "result": "ok"
+        },
+        {
+          "test": "test_receipt_failure_retains_full_journal_then_explicit_clear_completes (test_assigned_workspace_journal.AssignedWorkspaceJournalTests.test_receipt_failure_retains_full_journal_then_explicit_clear_completes)",
+          "result": "ok"
+        },
+        {
+          "test": "test_whole_request_is_required_for_every_full_journal_mutation (test_assigned_workspace_journal.AssignedWorkspaceJournalTests.test_whole_request_is_required_for_every_full_journal_mutation)",
+          "result": "ok"
+        }
+      ],
+      "log_sha256": "8726d3b142f585be652f7dcbca5cbb990e3acfa11721b8baf010d1bbe03971bc"
+    },
+    {
+      "file": "runtime-adoption-28.log",
+      "passed": 28,
+      "cases": [
+        {
+          "test": "test_availability_replacement_cas_rejects_older_prepared_evidence (test_assigned_runtime_adoption.AssignedRuntimeAdoptionTests.test_availability_replacement_cas_rejects_older_prepared_evidence)",
+          "result": "ok"
+        },
+        {
+          "test": "test_changed_native_availability_updates_all_immutable_snapshot_consumers (test_assigned_runtime_adoption.AssignedRuntimeAdoptionTests.test_changed_native_availability_updates_all_immutable_snapshot_consumers)",
+          "result": "ok"
+        },
+        {
+          "test": "test_current_nonmatching_or_partial_state_never_retires_pending_attempt (test_assigned_runtime_adoption.AssignedRuntimeAdoptionTests.test_current_nonmatching_or_partial_state_never_retires_pending_attempt)",
+          "result": "ok"
+        },
+        {
+          "test": "test_dispatch_origin_change_preserves_valid_ack_evidence (test_assigned_runtime_adoption.AssignedRuntimeAdoptionTests.test_dispatch_origin_change_preserves_valid_ack_evidence)",
+          "result": "ok"
+        },
+        {
+          "test": "test_dispatch_preserves_six_fields_and_original_stored_owner (test_assigned_runtime_adoption.AssignedRuntimeAdoptionTests.test_dispatch_preserves_six_fields_and_original_stored_owner)",
+          "result": "ok"
+        },
+        {
+          "test": "test_dispatch_unknown_is_not_retried_or_adopted (test_assigned_runtime_adoption.AssignedRuntimeAdoptionTests.test_dispatch_unknown_is_not_retried_or_adopted)",
+          "result": "ok"
+        },
+        {
+          "test": "test_exact_predecessor_stop_preserves_stable_descriptor (test_assigned_runtime_adoption.AssignedRuntimeAdoptionTests.test_exact_predecessor_stop_preserves_stable_descriptor)",
+          "result": "ok"
+        },
+        {
+          "test": "test_exact_stop_and_adoption_replace_cached_mapping_owner (test_assigned_runtime_adoption.AssignedRuntimeAdoptionTests.test_exact_stop_and_adoption_replace_cached_mapping_owner)",
+          "result": "ok"
+        },
+        {
+          "test": "test_existing_assigned_fence_blocks_ordinary_start_and_stop_only (test_assigned_runtime_adoption.AssignedRuntimeAdoptionTests.test_existing_assigned_fence_blocks_ordinary_start_and_stop_only)",
+          "result": "ok"
+        },
+        {
+          "test": "test_fence_uses_whole_request_and_existing_delivery_gate (test_assigned_runtime_adoption.AssignedRuntimeAdoptionTests.test_fence_uses_whole_request_and_existing_delivery_gate)",
+          "result": "ok"
+        },
+        {
+          "test": "test_guard_and_fence_release_reject_old_installation_token (test_assigned_runtime_adoption.AssignedRuntimeAdoptionTests.test_guard_and_fence_release_reject_old_installation_token)",
+          "result": "ok"
+        },
+        {
+          "test": "test_install_cas_rejects_changed_installation (test_assigned_runtime_adoption.AssignedRuntimeAdoptionTests.test_install_cas_rejects_changed_installation)",
+          "result": "ok"
+        },
+        {
+          "test": "test_install_reconcile_preserves_token_generation_and_source_content (test_assigned_runtime_adoption.AssignedRuntimeAdoptionTests.test_install_reconcile_preserves_token_generation_and_source_content)",
+          "result": "ok"
+        },
+        {
+          "test": "test_install_rejects_receipt_only_or_policy_source_request_mismatch (test_assigned_runtime_adoption.AssignedRuntimeAdoptionTests.test_install_rejects_receipt_only_or_policy_source_request_mismatch)",
+          "result": "ok"
+        },
+        {
+          "test": "test_installation_guard_fences_actual_provider_disconnect_metadata (test_assigned_runtime_adoption.AssignedRuntimeAdoptionTests.test_installation_guard_fences_actual_provider_disconnect_metadata)",
+          "result": "ok"
+        },
+        {
+          "test": "test_installation_guard_rejects_lost_origin_and_current_state_reconciles_token (test_assigned_runtime_adoption.AssignedRuntimeAdoptionTests.test_installation_guard_rejects_lost_origin_and_current_state_reconciles_token)",
+          "result": "ok"
+        },
+        {
+          "test": "test_native_unavailable_is_not_promoted (test_assigned_runtime_adoption.AssignedRuntimeAdoptionTests.test_native_unavailable_is_not_promoted)",
+          "result": "ok"
+        },
+        {
+          "test": "test_pending_retirement_rechecks_transition_and_exact_attempt_cas (test_assigned_runtime_adoption.AssignedRuntimeAdoptionTests.test_pending_retirement_rechecks_transition_and_exact_attempt_cas)",
+          "result": "ok"
+        },
+        {
+          "test": "test_predecessor_change_never_dispatches_stop (test_assigned_runtime_adoption.AssignedRuntimeAdoptionTests.test_predecessor_change_never_dispatches_stop)",
+          "result": "ok"
+        },
+        {
+          "test": "test_preparation_is_opaque_immutable_and_store_loaded_once (test_assigned_runtime_adoption.AssignedRuntimeAdoptionTests.test_preparation_is_opaque_immutable_and_store_loaded_once)",
+          "result": "ok"
+        },
+        {
+          "test": "test_preparation_rechecks_origin_after_storage_io (test_assigned_runtime_adoption.AssignedRuntimeAdoptionTests.test_preparation_rechecks_origin_after_storage_io)",
+          "result": "ok"
+        },
+        {
+          "test": "test_reject_candidate_and_noncloud_before_storage (test_assigned_runtime_adoption.AssignedRuntimeAdoptionTests.test_reject_candidate_and_noncloud_before_storage)",
+          "result": "ok"
+        },
+        {
+          "test": "test_runtime_attach_swap_waits_for_existing_installation_guard (test_assigned_runtime_adoption.AssignedRuntimeAdoptionTests.test_runtime_attach_swap_waits_for_existing_installation_guard)",
+          "result": "ok"
+        },
+        {
+          "test": "test_state_capture_detects_attach_replacement_without_lock_over_rpc (test_assigned_runtime_adoption.AssignedRuntimeAdoptionTests.test_state_capture_detects_attach_replacement_without_lock_over_rpc)",
+          "result": "ok"
+        },
+        {
+          "test": "test_state_capture_detects_connection_replacement (test_assigned_runtime_adoption.AssignedRuntimeAdoptionTests.test_state_capture_detects_connection_replacement)",
+          "result": "ok"
+        },
+        {
+          "test": "test_stop_lost_reply_and_postdispatch_mismatch_are_unknown (test_assigned_runtime_adoption.AssignedRuntimeAdoptionTests.test_stop_lost_reply_and_postdispatch_mismatch_are_unknown)",
+          "result": "ok"
+        },
+        {
+          "test": "test_unknown_current_sealed_read_settles_pending_then_next_activation (test_assigned_runtime_adoption.AssignedRuntimeAdoptionTests.test_unknown_current_sealed_read_settles_pending_then_next_activation)",
+          "result": "ok"
+        },
+        {
+          "test": "test_validation_admits_exact_receipt_without_install_or_origin_mutation (test_assigned_runtime_adoption.AssignedRuntimeAdoptionTests.test_validation_admits_exact_receipt_without_install_or_origin_mutation)",
+          "result": "ok"
+        }
+      ],
+      "log_sha256": "1dc277aa6d9ddfc97404e3b788eae439127bcd1e22bc5fb037e47412fadeb0f3"
+    }
+  ],
+  "checks": {
+    "new_files_ruff": true,
+    "modified_source_pep604": true,
+    "layering_hard_rules": true,
+    "diff_check": true,
+    "independent_source_review": "cleared"
+  },
+  "logs_root": "/workspace/shared/neh-assigned-workspace-qualification-20261006",
+  "native_build_or_test_in_this_stage": false,
+  "functional_tests_for_branch_cleanup": false,
+  "limitations": [
+    "No full-suite or robot/live-network qualification",
+    "Default schema1 save unchanged",
+    "Assigned READY/relocalization public progression not enabled",
+    "Persisted evidence alone is not current native authority",
+    "No guessed redispatch across restart or changed runtime generation"
+  ],
+  "publication_parent_remote_commit": "f5ce23d4ba8f6e714828cb2a33014816f6853a6b",
+  "publication_parent_is_history_only_same_tree": true
+}

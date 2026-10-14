@@ -1,0 +1,33 @@
+# 对已有女娲执行端的增量配置，不是可独立启动的服务定义。
+# 官方基础部署：https://nuwax.com/docker-client-deploy.html
+# 保留原有官方镜像、启动命令、NUWAX_SAVED_KEY 和 /home/user 持久卷。
+# 服务键 nuwax-client 是示例：先用 docker compose config --services 核对并替换成现有服务名。
+# 设置 NUWAX_ROBOT_SOURCE_DIR 为本仓库绝对路径；仅挂载轻量客户端和安装器。
+# 本示例不修改旧中继配置，也不启动额外机器人/模型/代理服务。
+services:
+  nuwax-client:
+    # Linux 桥接网络需要显式配置宿主地址。宿主网关还须监听容器可达的接口。
+    # Docker依据：https://docs.docker.com/reference/cli/docker/container/run/#add-host
+    # 如果原服务使用 host 网络或网关在另一台设备，请按实际网络直接指定可达地址。
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - type: bind
+        source: ${NUWAX_ROBOT_SOURCE_DIR:?请设置机器人平台源码的绝对路径}/clients
+        target: /opt/nuwax-robot-tools/clients
+        read_only: true
+      - type: bind
+        source: ${NUWAX_ROBOT_SOURCE_DIR:?请设置机器人平台源码的绝对路径}/scripts/nuwaclaw_robot_setup.py
+        target: /opt/nuwax-robot-tools/scripts/nuwaclaw_robot_setup.py
+        read_only: true
+
+# 只在现有服务获准更新后使用该增量配置；此文件不建议重启正在工作的执行端。
+# 从女娲的实际任务信息确认容器内工作区，不能把工作区根设置当成具体任务目录。
+# 以下命令中的“容器内实际工作区”须替换成已确认的绝对路径，优先使用专用工作区。
+# docker exec nuwax-client python3 /opt/nuwax-robot-tools/scripts/nuwaclaw_robot_setup.py install \
+#   --workspace /home/user/容器内实际工作区 --url http://host.docker.internal:8766
+# docker exec nuwax-client python3 /opt/nuwax-robot-tools/scripts/nuwaclaw_robot_setup.py doctor \
+#   --workspace /home/user/容器内实际工作区 --url http://host.docker.internal:8766
+# 如技能目录指向智能体共享存储，安装器保留它并报错，应走女娲已有技能分发接口。
+# 包可在容器内用 package --output-dir 生成，再经女娲分发；无需安装整套机器人依赖。
+# artifact --output 的路径必须在容器内实际工作区及其持久卷下，不是宿主机路径。

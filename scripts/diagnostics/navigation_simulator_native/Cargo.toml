@@ -1,0 +1,20 @@
+[package]
+name = "nuwax-navigation-simulator"
+default-run = "nuwax-navigation-simulator"
+version = "0.1.0"
+edition = "2021"
+[workspace]
+[dependencies]
+nuwax-core = { path = "../../../services/nuwax-workspace/crates/nuwax-core" }
+nuwax-nav-scan = { path = "../../../services/nuwax-workspace/crates/nuwax-nav-scan", features = ["profile"] }
+serde_json = "1"
+libc = "0.2"
+nuwax-nav-stack = { path = "../../../services/nuwax-workspace/crates/nuwax-nav-stack", features = ["mls"] }
+nuwax-nav-runtime = { path = "../../../services/nuwax-workspace/crates/nuwax-nav-runtime" }
+nuwax-nav-mls-planner = { path = "../../../services/nuwax-workspace/crates/nuwax-nav-mls-planner" }
+nuwax-nav-types-messages = { path = "../../../services/nuwax-workspace/crates/nuwax-nav-types-messages" }
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

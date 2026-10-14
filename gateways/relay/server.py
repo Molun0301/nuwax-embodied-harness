@@ -15,16 +15,52 @@ from fastapi.responses import JSONResponse
 from fastapi.responses import Response
 from fastapi.responses import StreamingResponse
 import httpx
+import anyio
 import websockets
 
-from logging_utils import LogRateLimiter
+from core.logging_utils import LogRateLimiter
 from gateways.request_context import REQUEST_ID_HEADER, error_category_from_status, normalize_request_id
-from settings import RelayServerConfig
+from core.settings import RelayServerConfig
 
 
 RELAY_LOGGER = logging.getLogger("nuwax_robot_bridge.relay")
-_LOW_VALUE_RELAY_PATHS = frozenset(("/relay/health", "/events/stream", "/streams/sse", "/streams/video.mjpeg"))
+
+
+class RelayStreamingResponse(StreamingResponse):
+    """主动监听下游断开，避免日志中间件屏蔽发送端断连后遗留上游流。"""
+
+    async def __call__(self, scope, receive, send):
+        async with anyio.create_task_group() as group:
+            async def stream():
+                await self.stream_response(send)
+                group.cancel_scope.cancel()
+
+            group.start_soon(stream)
+            await self.listen_for_disconnect(receive)
+            group.cancel_scope.cancel()
+        if self.background is not None:
+            await self.background()
+_LOW_VALUE_RELAY_PATHS = frozenset(
+    (
+        "/relay/health",
+        "/api/health",
+        "/api/tasks",
+        "/api/memory/instances",
+        "/mcp",
+        "/console",
+        "/console/",
+        "/api/logs",
+        "/events/stream",
+        "/streams/sse",
+        "/streams/video.mjpeg",
+        "/debug",
+        "/debug/",
+    )
+)
+_LOW_VALUE_RELAY_PREFIXES = ("/static/",)
 _RELAY_REQUEST_LOG_RATE_LIMIT_SEC = 30.0
+_RELAY_SLOW_REQUEST_THRESHOLD_MS = 1000.0
+_STREAM_WEBSOCKET_MAX_MESSAGE_BYTES = 16 * 1024 * 1024
 
 
 def _resolve_client_host(request: Request) -> str:
@@ -36,10 +72,12 @@ def _resolve_client_host(request: Request) -> str:
     return "-"
 
 
-def _should_rate_limit_relay_request(path: str, status_code: int) -> bool:
+def _should_rate_limit_relay_request(path: str, status_code: int, duration_ms: float) -> bool:
     if status_code >= 400:
         return False
-    return path in _LOW_VALUE_RELAY_PATHS
+    if duration_ms >= _RELAY_SLOW_REQUEST_THRESHOLD_MS:
+        return False
+    return path in _LOW_VALUE_RELAY_PATHS or any(path.startswith(prefix) for prefix in _LOW_VALUE_RELAY_PREFIXES)
 
 
 def create_relay_app(
@@ -49,7 +87,7 @@ def create_relay_app(
 ) -> FastAPI:
     """创建容器内边车转发器。"""
 
-    app = FastAPI(title="nuwax_robot_bridge_relay")
+    app = FastAPI(title="Nuwax Embodied Harness（NEH）中继")
     app.state.relay_config = relay_config
     app.state.http_transport = transport
     request_log_limiter = LogRateLimiter()
@@ -130,10 +168,17 @@ def create_relay_app(
             extra["upstream_status_code"] = upstream_status_code
         if upstream_duration_ms is not None:
             extra["upstream_duration_ms"] = upstream_duration_ms
-        if _should_rate_limit_relay_request(path, response.status_code):
+        if duration_ms >= _RELAY_SLOW_REQUEST_THRESHOLD_MS:
+            if level < logging.WARNING:
+                level = logging.WARNING
+            extra["slow_request"] = True
+            extra["slow_request_threshold_ms"] = _RELAY_SLOW_REQUEST_THRESHOLD_MS
+        if _should_rate_limit_relay_request(path, response.status_code, duration_ms):
+            extra["low_value_request"] = True
+            extra["slow_request_threshold_ms"] = _RELAY_SLOW_REQUEST_THRESHOLD_MS
             request_log_limiter.log(
                 RELAY_LOGGER,
-                level,
+                logging.DEBUG,
                 "Relay 请求完成",
                 key=("relay_request", method, path, response.status_code),
                 interval_sec=_RELAY_REQUEST_LOG_RATE_LIMIT_SEC,
@@ -157,7 +202,8 @@ def create_relay_app(
 
     @app.api_route("/api/{path:path}", methods=["GET", "POST"])
     async def relay_api(path: str, request: Request) -> Response:
-        return await _forward_request(app, request, f"/api/{path}")
+        return await _forward_request(app, request, f"/api/{path}",
+                                      stream=request.method == "GET" and path == "feedback/stream")
 
     @app.get("/artifacts/{path:path}")
     async def relay_artifacts(path: str, request: Request) -> Response:
@@ -208,8 +254,10 @@ async def _forward_request(
                     content=content,
                 )
                 upstream_response = await client.send(upstream_request, stream=True)
-            except Exception:
-                await client.aclose()
+            except BaseException:
+                # 下游断开会取消当前作用域，清理必须仍能关闭真实上游连接。
+                with anyio.CancelScope(shield=True):
+                    await client.aclose()
                 raise
             _record_upstream_observation(request, upstream_response.status_code, upstream_start_at)
 
@@ -233,10 +281,13 @@ async def _forward_request(
                     )
                     raise
                 finally:
-                    await upstream_response.aclose()
-                    await client.aclose()
+                    with anyio.CancelScope(shield=True):
+                        try:
+                            await upstream_response.aclose()
+                        finally:
+                            await client.aclose()
 
-            return StreamingResponse(
+            return RelayStreamingResponse(
                 _iter_bytes(),
                 status_code=upstream_response.status_code,
                 headers=_filter_response_headers(upstream_response.headers),
@@ -295,7 +346,11 @@ async def _forward_websocket(app: FastAPI, websocket: WebSocket, path: str) -> N
     upstream_start_at = time.perf_counter()
 
     try:
-        async with websockets.connect(upstream_url, extra_headers=headers) as upstream:
+        async with websockets.connect(
+            upstream_url,
+            extra_headers=headers,
+            max_size=_STREAM_WEBSOCKET_MAX_MESSAGE_BYTES,
+        ) as upstream:
             _record_upstream_observation(websocket, 101, upstream_start_at)
             await websocket.accept()
 

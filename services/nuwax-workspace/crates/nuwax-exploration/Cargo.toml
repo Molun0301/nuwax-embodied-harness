@@ -1,0 +1,45 @@
+[package]
+name = "nuwax-exploration"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Exploration orchestration facade, goal-source arbitration, and navigation conversions."
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+wavefront = ["dep:nuwax-explore-wavefront"]
+surface = ["dep:nuwax-nav-mls-planner", "dep:nuwax-nav-pct"]
+tare = ["dep:nuwax-explore-tare-bridge"]
+terrain-map-ext = ["dep:nuwax-explore-terrain-map-bridge"]
+runtime = ["dep:tokio"]
+patrolling-conversions = ["dep:nuwax-nav-patrolling"]
+# Phase E6 板块 3 整合点:暴露 typed native spec summary
+spec-summary = [
+    "dep:nuwax-nav-native-runner",
+    "terrain-map-ext",
+    "tare",
+]
+
+[dependencies]
+serde_json = { workspace = true }
+nuwax-explore-routing = { path = "../nuwax-explore-routing" }
+nuwax-explore-wavefront = { path = "../nuwax-explore-wavefront", optional = true }
+nuwax-nav-mls-planner = { path = "../nuwax-nav-mls-planner", optional = true }
+nuwax-nav-pct = { path = "../nuwax-nav-pct", optional = true }
+nuwax-explore-tare-bridge = { path = "../nuwax-explore-tare-bridge", optional = true }
+nuwax-explore-terrain-map-bridge = { path = "../nuwax-explore-terrain-map-bridge", optional = true }
+nuwax-nav-native-runner = { path = "../nuwax-nav-native-runner", optional = true }
+nuwax-nav-types-messages = { path = "../nuwax-nav-types-messages" }
+nuwax-nav-patrolling = { path = "../nuwax-nav-patrolling", optional = true }
+nuwax-nav-base = { path = "../nuwax-nav-base" }
+tokio = { workspace = true, optional = true, features = ["time"] }
+serde = { workspace = true, features = ["derive"] }
+thiserror = { workspace = true }
+tracing = { workspace = true }

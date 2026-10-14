@@ -1,0 +1,101 @@
+package nuwax_msgs;
+
+struct NativePgoStatus {
+    const int32_t SCHEMA_VERSION_V3 = 3;
+    const int32_t BACKEND_NATIVE_PGO = 2;
+
+    const int32_t EVENT_STARTING = 1;
+    const int32_t EVENT_READY = 2;
+    const int32_t EVENT_HEALTH = 3;
+    const int32_t EVENT_REQUEST_ACCEPTED = 4;
+    const int32_t EVENT_RUNNING = 5;
+    const int32_t EVENT_TERMINAL = 6;
+    const int32_t EVENT_CANCEL_REQUESTED = 7;
+    const int32_t EVENT_CANCEL_ACKNOWLEDGED = 8;
+    const int32_t EVENT_PROTOCOL_ERROR = 9;
+    const int32_t EVENT_STOPPING = 10;
+    const int32_t EVENT_STOPPED = 11;
+
+    const int32_t HEALTH_UNKNOWN = 0;
+    const int32_t HEALTH_HEALTHY = 1;
+    const int32_t HEALTH_DEGRADED = 2;
+    const int32_t HEALTH_UNHEALTHY = 3;
+
+    const int32_t TERMINAL_NONE = 0;
+    const int32_t TERMINAL_SUCCEEDED = 1;
+    const int32_t TERMINAL_FAILED = 2;
+    const int32_t TERMINAL_REJECTED = 3;
+    const int32_t TERMINAL_CANCELLED = 4;
+
+    const int32_t CANCEL_NONE = 0;
+    const int32_t CANCEL_REQUESTED = 1;
+    const int32_t CANCEL_ACKNOWLEDGED = 2;
+    const int32_t CANCEL_TOO_LATE = 3;
+
+    const int32_t REASON_NONE = 0;
+    const int32_t REASON_STARTUP_TIMEOUT = 1;
+    const int32_t REASON_PREFLIGHT_FAILED = 2;
+    const int32_t REASON_TRANSPORT_ERROR = 3;
+    const int32_t REASON_PROTOCOL_DECODE_FAILED = 4;
+    const int32_t REASON_PROTOCOL_IDENTITY_MISMATCH = 5;
+    const int32_t REASON_PROTOCOL_RECEIPT_MISMATCH = 6;
+    const int32_t REASON_INVALID_REQUEST = 7;
+    const int32_t REASON_OPTIMIZATION_FAILED = 8;
+    const int32_t REASON_SHUTDOWN_REQUESTED = 9;
+    const int32_t REASON_CANCEL_REQUESTED = 10;
+    const int32_t REASON_CANCELLED = 11;
+    const int32_t REASON_CANCEL_TOO_LATE = 12;
+    const int32_t REASON_CHILD_EXITED = 13;
+    const int32_t REASON_CHILD_CRASHED = 14;
+
+    int32_t schema_version;
+    int32_t backend;
+    int64_t runtime_generation;
+    int64_t backend_generation;
+    int64_t status_sequence;
+    int64_t status_timestamp_ns;
+    // Owner lifecycle events use zero. Request/cancel/terminal events use one.
+    int8_t identity_present;
+    int64_t request_sequence;
+    string mapping_session_id;
+    int64_t mapping_session_generation;
+    // Actual occupancy-owner domain; distinct from correction backend_generation.
+    string mapping_backend_kind;
+    int64_t mapping_backend_generation;
+    int64_t map_frame_generation;
+    byte mapping_commit_boot_nonce[16];
+    int64_t mapping_commit_sequence;
+    int64_t occupancy_revision;
+    int64_t cloud_revision;
+    int64_t committed_map_source_timestamp_ns;
+    // Existing admitted LIO source domain, not the correction backend.
+    int32_t registered_cloud_backend;
+    int64_t registered_cloud_runtime_generation;
+    int64_t registered_cloud_source_sequence;
+    int64_t registered_cloud_source_timestamp_ns;
+    // Original admitted scan count; the selected body payload may be smaller.
+    int64_t registered_cloud_point_count;
+    int64_t registered_body_point_count;
+    int64_t correlated_odom_source_sequence;
+    int64_t correlated_odom_source_timestamp_ns;
+    double frozen_odom_translation_m[3];
+    double frozen_odom_rotation_xyzw[4];
+    int64_t committed_map_width;
+    int64_t committed_map_height;
+    double committed_map_resolution_m;
+    double committed_map_origin_x_m;
+    double committed_map_origin_y_m;
+    int64_t source_timestamp_ns;
+    string map_frame_id;
+    string odom_frame_id;
+    string body_frame_id;
+    string points_frame_id;
+    byte correction_lease_boot_nonce[16];
+    int64_t correction_lease_generation;
+    int32_t event_kind;
+    int32_t health_state;
+    int32_t terminal_state;
+    int32_t cancel_state;
+    int32_t reason_code;
+    string reason;
+}

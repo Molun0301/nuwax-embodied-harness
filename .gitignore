@@ -1,41 +1,269 @@
 .env
 drivers/go2/data_plane.env
+# Web 配置面板写回产生的锁与备份（紧邻真实 env，不入库）
+.env.lock
+.env.bak
+.env.bak.*
+drivers/go2/data_plane.env.lock
+drivers/go2/data_plane.env.bak
+drivers/go2/data_plane.env.bak.*
 go2_proxy.log
 nuwax_robot_bridge.log
+nuwax_robot_bridge.log.lock
 __pycache__/
 *.pyc
 .omc/
 .omx/
+.claude-hud/
 .claude/
-docs/内部开发文档/
-docs/开发文档/
+openspec/
+.codex/
 GO2_inner_slam/
-runtime_data/**/*.db
 artifacts/
+# 默认 Agent 调用账本属于运行时数据，保留原路径以兼容既有记录。
+/agent_calls.sqlite3
+/agent_calls.sqlite3-journal
+/agent_calls.sqlite3-wal
+/agent_calls.sqlite3-shm
+/agent_calls.terminals.sqlite3
+/agent_calls.terminals.sqlite3-journal
+/agent_calls.terminals.sqlite3-wal
+/agent_calls.terminals.sqlite3-shm
 .venv_model_download/
-memory_models_20260402.tar.zst
-runtime_data/models/
-tests/
-.vscode/
-drivers/go2/ros2_ws/
-nuwax_robot_bridge.log.lock
-runtime_data/
 .venv/
+.nuwax-test-env/
+memory_models_20260402.tar.zst
+runtime_data/
+
+/tests/deployment/__pycache__/
+/tests/deployment/**/*.pyc
+scripts/ci/*
+# 已跟踪的工作流依赖这些检查入口，不能随本地试验脚本一起忽略。
+!scripts/ci/no_ros2_residual.sh
+!scripts/ci/check_pep604.py
+!scripts/ci/check_deployment_installer.sh
+!scripts/ci/release_gates/
+scripts/ci/release_gates/*
+!scripts/ci/release_gates/common.py
+!scripts/ci/release_gates/static_neg_gate.py
+
+# 开发文档与测试默认仅留本地；具名回归例外见下方。
+/docs/开发文档/
+/tests/
+/requirements/README.md
+**/tests/
+**/integration-tests/
+**/benches/
+# 占据栅格算法基准需要入库，目录内其他基准仍忽略。
+!/services/nuwax-workspace/crates/nuwax-mapping/benches/
+/services/nuwax-workspace/crates/nuwax-mapping/benches/*
+!/services/nuwax-workspace/crates/nuwax-mapping/benches/occupancy_algorithms.rs
+**/test_*.py
+**/*_test.py
+**/tests.cpp
+**/fixtures/
+**/goldens/
+**/recordings/
+*.md
+# 公开使用文档随代码维护，开发文档仍由上方目录规则排除。
+!/docs/公开文档/阅读指南.md
+!/docs/公开文档/快速上手.md
+!/docs/公开文档/功能列表.md
+!/docs/公开文档/项目功能与实现情况清单.md
+!/docs/公开文档/部署文档.md
+!/docs/公开文档/智能体接入.md
+!/docs/公开文档/架构与机器人接入.md
+!/docs/公开文档/Go2提示词示例.md
+!/docs/公开文档/机器人智能体提示词.md
+!/docs/公开文档/双LIO建图与回环纠偏.md
+services/geometry/nuwax_geometry_runtime/src/bin/nuwax-lio-test-child.rs
+
+# 本轮本地 release gate 与格式说明不入库。
+.github/workflows/release-gates.yml
+services/nuwax-workspace/crates/nuwax-mapping-cli/FORMAT.md
+.vscode/
 .pytest_cache
 .playwright-mcp
-功能列表.md
-.env
+drivers/go2/ros2_ws/
+/功能列表.md
 AGENTS.md
 CLAUDE.md
 services/geometry/nuwax_ros_bridge/Cargo.lock
 services/geometry/nuwax_ros_bridge/target/
 
+# === bootstrap 生成物（含 token，禁止入库；保留 *.example） ===
+deploy/systemd/nuwax-host-gateway.service
+deploy/nuwaclaw/*.host_gateway.json
+
 # === 未提交文档/日志/地图/杂项 忽略 (2026-06-03) ===
-/1.md
-/huang1.md
 /UDS
 /nuwax_robot_bridge技术手册5.25.md
 /nuwax_robot_bridge技术手册5.19(1).md
 /2026-05-25_RTAB-MAP+Nav2平台接入评测与交接文档.md
 /log/
 /maps/
+
+# === 本地产物/备份/启动日志 忽略 (2026-06-15) ===
+*.bak_*
+.env copy
+.env.copy
+/docs/内部开发文档/
+/1.md
+/huang1.md
+
+
+# === 本地 OpenSpec 工作区（不上传 GitHub） ===
+scripts/check_openspec.sh
+temp_docs
+
+# === installer verification 工具（按 memory feedback_no_test_commits.md，不入仓） ===
+
+# === 本地 dev-only 文档/撤销日志/feedback 报告（rework17 共识：开发文档不进仓库） ===
+# 这些文件本地保留作为开发 lane 的 evidence / 决策痕迹，但不入 git 跟踪：
+# - REVERT_NOTES.md         : lane-15 撤销 docs(lcm) commit 的撤销日志
+# - feedback_rework*.md     : 各 rework lane 的 feedback 报告
+# - docs/开发文档/          : 任务执行方案的 PDR/feedback/验收报告（已由 .gitignore line 20 排除）
+# 清理原则：未来 lane 决定要入仓时再单独 commit
+REVERT_NOTES.md
+feedback_rework*.md
+
+# === installer 运行时产物（plan 4.2 / RK11 / RK18 / D4） ===
+# 状态文件 + installer 隔离 venv 入仓均不入仓；lock 由 _lock.py 共享
+# scripts/start_gateway.sh:86-96 flock 协议，统一走 runtime_data/gateway/start_gateway.lock，
+# 不再单独列 .installer.lock（D4 已废弃 .installer.lock 路径）。
+runtime_data/installer_state.json
+runtime_data/.venv-installer/
+
+# === dimos crates 本地 vendor（vendor_dimos_crates.sh 产物，不入 git） ===
+# Phase 1 (2026-07-07) 起弃用：vendor_dimos_crates.sh 已被
+# scripts/import_nuwax_workspace_snapshot.sh 取代，13 个 nuwax-* crate
+# 不再走 vendor/ 兜底，而是直接通过 repo-local path dep 指向
+# services/nuwax-workspace/crates/<name>。下方 vendor 行保留为安全网
+# （万一遗留旧 vendor 目录残留不入仓），但实际不会再生成。
+services/geometry/nuwax_geometry_runtime/vendor/
+services/geometry/nuwax_geometry_runtime/vendor-config.json
+
+# === services/nuwax-workspace 本地产物（入仓 tracked snapshot，但产物忽略） ===
+# Phase 1 (2026-07-07):整个 nuwax-workspace 50 个 crate + Cargo.toml/lock
+# 都入仓,但 build 产物 / runtime state / 临时 lock 仍不入仓:
+# - target/    : cargo build 产物(aarch64 + x86_64 都很大)
+# - .omc/      : omc agent runtime state
+# - .omx/      : omx runtime state
+# - *.lock.tmp : import_nuwax_workspace_snapshot.sh 中途产物
+services/nuwax-workspace/target/
+services/nuwax-workspace/.omc/
+services/nuwax-workspace/.omx/
+services/nuwax-workspace/*.lock.tmp
+
+# === 通用构建、测试与分析产物 ===
+# `src/bin/` 是真实可执行源码，不能按目录名 `bin` 泛化忽略。
+**/target/
+**/build/
+**/dist/
+**/out/
+**/CMakeFiles/
+**/cmake-build-*/
+**/.pytest_cache/
+**/.ruff_cache/
+**/.mypy_cache/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+build.ninja
+.ninja_*
+.coverage
+coverage/
+htmlcov/
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.pdb
+*.profraw
+*.profdata
+*.gcda
+*.gcno
+*.rrd
+*.snap
+
+# 原生定位本机构建产物；源代码与公共转换头文件仍进入仓库。
+services/nuwax-workspace/crates/nuwax-lio-backends/native/*/cpp/result/
+
+# 机器人现场配置与活动选择包含私有参数，不随源码发布。
+drivers/*/configs/
+drivers/*/.active_config
+drivers/.active_robot
+drivers/.settings.lock
+drivers/*/.active_config.lock
+drivers/.active_robot.lock
+
+# NEH 产品使用与维护文档；开发记录和未明确放行的测试继续只留本地。
+!/docs/公开文档/安装前准备.md
+!/docs/公开文档/配置说明.md
+!/docs/公开文档/控制台使用指南.md
+!/docs/公开文档/升级与恢复.md
+!/docs/公开文档/常见问题与排障.md
+!/docs/公开文档/安全与数据说明.md
+!/docs/公开文档/贡献指南.md
+!/docs/公开文档/发布与兼容性.md
+
+# 完整合并候选的具名回归；仅开放下列目录与文件，其他本地测试仍忽略。
+!/tests/
+/tests/*
+!/tests/fixtures/
+/tests/fixtures/*
+!/tests/fixtures/assigned_quaternion_norm_nalgebra033.json
+!/tests/fixtures/assigned_quaternion_norm_nalgebra033.rs
+!/tests/fixtures/assigned_recomposition_nalgebra033.json
+!/tests/fixtures/assigned_recomposition_nalgebra033.rs
+!/tests/fixtures/checkpoint-v2-166380-member-inventory.json
+!/tests/fixtures/relocalization_policy_algorithm2_0276.json
+!/tests/integration/
+/tests/integration/*
+!/tests/unit/
+/tests/unit/*
+!/services/geometry/nuwax_geometry_runtime/tests/
+/services/geometry/nuwax_geometry_runtime/tests/*
+!/services/nuwax-workspace/crates/nuwax-numeric/tests/
+/services/nuwax-workspace/crates/nuwax-numeric/tests/*
+!/services/nuwax-workspace/crates/nuwax-slam-2d-runtime/tests/
+/services/nuwax-workspace/crates/nuwax-slam-2d-runtime/tests/*
+!/services/nuwax-workspace/crates/nuwax-slam-2d-runtime/tests/assigned_archive/
+/services/nuwax-workspace/crates/nuwax-slam-2d-runtime/tests/assigned_archive/*
+!/services/nuwax-workspace/crates/nuwax-slam-2d-runtime/tests/assigned_protocol/
+/services/nuwax-workspace/crates/nuwax-slam-2d-runtime/tests/assigned_protocol/*
+!/services/nuwax-workspace/crates/nuwax-slam-2d-runtime/tests/assigned_supervisor/
+/services/nuwax-workspace/crates/nuwax-slam-2d-runtime/tests/assigned_supervisor/*
+!/services/geometry/nuwax_geometry_runtime/tests/lcm_backend_fail_closed.rs
+!/services/nuwax-workspace/crates/nuwax-numeric/tests/occupancy_compatibility.rs
+!/services/nuwax-workspace/crates/nuwax-slam-2d-runtime/tests/assigned_archive/mod.rs
+!/services/nuwax-workspace/crates/nuwax-slam-2d-runtime/tests/assigned_protocol/mod.rs
+!/services/nuwax-workspace/crates/nuwax-slam-2d-runtime/tests/assigned_supervisor/mod.rs
+!/tests/integration/test_runtime_input_bridge.py
+!/tests/test_catalog_optional_alias.py
+!/tests/test_dense_legacy_epoch.py
+!/tests/test_legacy_cloud_import.py
+!/tests/test_observation_photo_v18.py
+!/tests/test_offline_cli_identity_v4.py
+!/tests/test_perception_snapshot_v18.py
+!/tests/test_planar_asset_catalog.py
+!/tests/test_planar_catalog_evidence.py
+!/tests/test_planar_workspace_load.py
+!/tests/unit/test_config_registry.py
+!/tests/unit/test_g1_sim_gateway.py
+!/tests/unit/test_geometry_runtime_attach_only.py
+!/tests/unit/test_geometry_runtime_ready_minimal.py
+!/tests/unit/test_geometry_same_owner_health_recovery.py
+!/tests/unit/test_manipulation_http_tasks.py
+!/tests/unit/test_memory_motion_reliability.py
+!/tests/unit/test_navigation_pipeline.py
+!/tests/unit/test_navigation_startup_lightweight.py
+!/tests/unit/test_scene_mapping_service.py
+!/tests/unit/test_yolo_detection_contract.py
+!/tests/conftest.py
+
+# 正式安装和自动发布的公开使用入口。
+!/docs/公开文档/轻量安装与自动发布.md

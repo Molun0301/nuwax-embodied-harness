@@ -1,19 +1,80 @@
 [Unit]
+Requires=nuwax-lcm-network.service
+After=nuwax-lcm-network.service
+# Template: install with scripts/install_motion_guard_deployment.sh.
 Description=nuwax_robot_bridge 宿主机网关
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=unitree
-Group=unitree
-WorkingDirectory=/home/unitree/nuwax-robot-bridge
+ProtectHome=read-only
+User=nuwax
+Group=nuwax
+SupplementaryGroups=video render
+WorkingDirectory=@NUWAX_REPO_ROOT@
+RuntimeDirectory=nuwax/gateway
+RuntimeDirectoryMode=0750
+StateDirectory=nuwax/gateway
+StateDirectoryMode=0750
+LogsDirectory=nuwax/gateway
+LogsDirectoryMode=0750
+UMask=0007
+# 服务默认值；用户配置文件覆盖同名业务设置。
+Environment=NUWAX_GEOMETRY_WEB_CONFIG_ENV_FILE=/var/lib/nuwax_robot_bridge/geometry-owner.env
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/bin/bash /home/unitree/nuwax-robot-bridge/scripts/start_gateway.sh
-Restart=always
+Environment=NUWAX_BOOTSTRAP_ENV_FILE=@NUWAX_CONFIG_DIR@/nuwax.env
+Environment=GO2_DATA_PLANE_ENV_FILE=@NUWAX_CONFIG_DIR@/go2-data-plane.env
+Environment=NUWAX_LCM_BACKEND=real-lcm
+Environment=NUWAX_REAL_LCM_REQUIRED=true
+Environment=NUWAX_LCM_URL=udpm://239.255.76.67:7667?ttl=0
+Environment=NUWAX_MOTION_GUARD_SOCKET=/run/nuwax/motion-guard.sock
+Environment=NUWAX_NAV_STACK_MANAGED_BY_SYSTEMD=true
+Environment=NUWAX_NAV_STACK_READY_FILE=/run/nuwax/navigation/nuwax_nav_stack.ready
+Environment=NUWAX_GEOMETRY_RUNTIME_MANAGED_BY_SYSTEMD=true
+Environment=NUWAX_GEOMETRY_RUNTIME_READY_FILE=/run/nuwax/geometry/nuwax_geometry_runtime.ready
+Environment=NUWAX_GEOMETRY_RUNTIME_BINARY=@NUWAX_BIN_DIR@/nuwax-geometry-runtime
+Environment=NUWAX_GEOMETRY_RUNTIME_PORT=50051
+Environment=NUWAX_GEOMETRY_RUNTIME_HEALTH_TIMEOUT=30
+Environment=NUWAX_FORBIDDEN_ZONES_PATH=/var/lib/nuwax_robot_bridge/forbidden_zones.json
+Environment=NUWAX_PERSON_FOLLOW_MANAGED_BY_SYSTEMD=true
+Environment=NUWAX_GO2_VIDEO_STREAMER_MANAGED_BY_SYSTEMD=true
+Environment=NUWAX_RUNTIME_ACTIVATION_REQUEST=/run/nuwax/gateway/geometry.request
+Environment=NUWAX_RUNTIME_ACTIVATION_RESULT=/run/nuwax/gateway/geometry.result.json
+Environment=NUWAX_RUNTIME_ACTIVATION_TIMEOUT_SEC=95
+Environment=NUWAX_PERSON_FOLLOW_TARGET_CHANNEL=/person_follow_target
+Environment=NUWAX_PERSON_FOLLOW_POINTCLOUD_CHANNEL=/global_map
+Environment=NUWAX_PERSON_FOLLOW_TF_CHANNEL=/tf
+Environment=NUWAX_PERSON_FOLLOW_COMMAND_CHANNEL=/gateway/person_follow_cmd_vel
+Environment="NUWAX_LCM_CHANNEL_GOAL_POSE=/nav/goal#nuwax_msgs.GoalEnvelope"
+Environment="NUWAX_LCM_CHANNEL_NAV_PATH=/nav/path#nuwax_msgs.PathEnvelope"
+Environment=NUWAX_GATEWAY_CLEANUP_EXTERNAL_GEOMETRY=false
+Environment=NUWAX_GATEWAY_RESTART=never
+Environment=NUWAX_GATEWAY_PID_FILE=/run/nuwax/gateway/gateway.pid
+Environment=NUWAX_GATEWAY_LOCK_FILE=/run/nuwax/gateway/start_gateway.lock
+Environment=NUWAX_LOG_DIR=/var/log/nuwax/gateway
+EnvironmentFile=-@NUWAX_CONFIG_DIR@/nuwax.env
+EnvironmentFile=-@NUWAX_CONFIG_DIR@/go2-data-plane.env
+# 旧几何选择仅作迁移兼容；活动机器人方案在文件链末尾加载。
+EnvironmentFile=-/var/lib/nuwax_robot_bridge/geometry-owner.env
+Environment=NUWAX_USER_CONFIG_ENV_FILE=/var/lib/nuwax_robot_bridge/settings.env
+EnvironmentFile=-/var/lib/nuwax/gateway/pointcloud3d.env
+EnvironmentFile=-/var/lib/nuwax_robot_bridge/settings.env
+# 活动方案最后加载；物化的业务值可由共同加载器和热加载入口更新。
+Environment=NUWAX_ROBOT_PROFILE_MODE=1
+Environment=NUWAX_CONFIG_FROM_SYSTEMD_FILES=1
+EnvironmentFile=-@NUWAX_REPO_ROOT@/runtime_data/settings/active.env
+# 统一启动入口会按 .env 中的 NUWAX_ACTIVE_ROBOT 与 NUWAX_GEOMETRY_ENABLED 加载运行环境。
+# 平台文件日志路径由 .env 中的 NUWAX_LOG_* 控制。
+ExecStart=/usr/bin/env NUWAX_NAV_STACK_MANAGED_BY_SYSTEMD=true NUWAX_GEOMETRY_RUNTIME_MANAGED_BY_SYSTEMD=true NUWAX_PERSON_FOLLOW_MANAGED_BY_SYSTEMD=true NUWAX_GO2_VIDEO_STREAMER_MANAGED_BY_SYSTEMD=true NUWAX_RUNTIME_ACTIVATION_REQUEST=/run/nuwax/gateway/geometry.request NUWAX_RUNTIME_ACTIVATION_RESULT=/run/nuwax/gateway/geometry.result.json NUWAX_GATEWAY_CLEANUP_EXTERNAL_GEOMETRY=false NUWAX_GATEWAY_PID_FILE=/run/nuwax/gateway/gateway.pid NUWAX_GATEWAY_LOCK_FILE=/run/nuwax/gateway/start_gateway.lock /bin/bash @NUWAX_REPO_ROOT@/scripts/start_gateway.sh
+Restart=on-failure
 RestartSec=3
 TimeoutStopSec=20
-ReadWritePaths=/var/log/nuwax_robot_bridge /var/lib/nuwax_robot_bridge
+SuccessExitStatus=0
 
+# 建议通过宿主机目录持久化日志和制品
+ReadWritePaths=/run/nuwax/gateway /var/log/nuwax/gateway /var/lib/nuwax/gateway /var/lib/nuwax_robot_bridge /tmp
+
+ReadWritePaths=@NUWAX_REPO_ROOT@/runtime_data/settings @NUWAX_REPO_ROOT@/drivers/go2/configs @NUWAX_REPO_ROOT@/drivers/g1/configs @NUWAX_REPO_ROOT@/drivers/customrobot/configs @NUWAX_REPO_ROOT@/drivers/raspi_lidar_robot/configs
 [Install]
 WantedBy=multi-user.target

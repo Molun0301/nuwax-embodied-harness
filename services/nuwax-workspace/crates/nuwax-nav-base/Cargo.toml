@@ -1,0 +1,19 @@
+[package]
+name = "nuwax-nav-base"
+version = "0.1.0"
+description = "导航板块协议面:核心 trait、错误、生命周期、诊断、可插拔接口"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+nuwax-nav-types-messages = { path = "../nuwax-nav-types-messages" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+indexmap = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }

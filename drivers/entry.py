@@ -42,3 +42,9 @@ def load_active_robot_private_capability_specs(config):
     module = import_module(registration.private_capabilities_module)
     specs = getattr(module, "ROBOT_PRIVATE_CAPABILITY_SPECS", ())
     return tuple(specs)
+
+
+def create_planar_sensor_source(config_text: str, session: dict):
+    """由驱动装配入口创建独占二维传感器来源。"""
+    from drivers.common.planar_source import create_planar_sensor_source as create_source
+    return create_source(config_text, session)

@@ -1,0 +1,679 @@
+{
+  "schema_version": 1,
+  "date_utc": "2026-10-06",
+  "scope": "bounded explicit schema-2 backend loader; in-process native handlers, no hardware/network/default-workspace enablement",
+  "base_local_commit": "6d93b7fcb9babdbee5baa98ae487c45f4a6b8ff0",
+  "base_local_tree": "10e6c7d3af0666b792cc102ae618451c8f7b3329",
+  "production_changes_after_base": false,
+  "qualified_server_sha256": "6f3b59a1502a4726a2c669419ddd0a3cc98ae4e1f7e6ed1e61b8a7e1ef6eb9f8",
+  "assertion_fix_patch_sha256": "ed737bd1a54dd3e26bbc9cb8068f7512f34bc5e64240283da691eda4fb2c69e7",
+  "python": {
+    "initial_full_suite_passed": 298,
+    "final_full_suite_passed": 299,
+    "new_provider_cases": 28,
+    "new_runtime_cases": 14,
+    "unchanged_after_native_assertion_fix": true
+  },
+  "toolchain": {
+    "rust": "1.88.0",
+    "cargo_jobs": 2,
+    "cmake_jobs": 1,
+    "dev_test_debug_info": false,
+    "registry_fetch": "locked official registry; subsequent offline metadata and compilation",
+    "cargo_cache_after_fetch_mib": 710,
+    "sdk_preflight": "both consumers selected installed libgtsam.a/libmetis-gtsam.a/libcephes-gtsam.a; no _deps fallback",
+    "sdk_unchanged_checked_files": 11
+  },
+  "round_1": {
+    "compiled": true,
+    "compile_seconds_reported": 325,
+    "passed": 26,
+    "failed": 1,
+    "tests": [
+      {
+        "selector": "server::lifecycle_tests::assigned_v2_voxel_export_transfer_activate_replay_and_conflicts",
+        "exit_code": 0,
+        "passed": true,
+        "timeout": false,
+        "seconds": 0.069,
+        "log": "01-server__lifecycle_tests__assigned_v2_voxel_export_transfer_activate_replay_and_conflicts.log"
+      },
+      {
+        "selector": "server::lifecycle_tests::assigned_v2_ray_export_transfer_activate_replay_and_conflicts",
+        "exit_code": 101,
+        "passed": false,
+        "timeout": false,
+        "seconds": 0.068,
+        "log": "02-server__lifecycle_tests__assigned_v2_ray_export_transfer_activate_replay_and_conflicts.log"
+      },
+      {
+        "selector": "lcm_runtime::tf_tree_tests::canonical_localization_reset_clears_pose_full_history_and_mirror",
+        "exit_code": 0,
+        "passed": true,
+        "timeout": false,
+        "seconds": 0.011,
+        "log": "03-lcm_runtime__tf_tree_tests__canonical_localization_reset_clears_pose_full_history_and_mirror.log"
+      },
+      {
+        "selector": "lcm_runtime::tf_tree_tests::canonical_localization_reset_notifies_even_when_pose_is_already_missing",
+        "exit_code": 0,
+        "passed": true,
+        "timeout": false,
+        "seconds": 0.009,
+        "log": "04-lcm_runtime__tf_tree_tests__canonical_localization_reset_notifies_even_when_pose_is_already_missing.log"
+      },
+      {
+        "selector": "lcm_runtime::tf_tree_tests::canonical_localization_reset_reinstalls_only_explicit_sensor_descriptor",
+        "exit_code": 0,
+        "passed": true,
+        "timeout": false,
+        "seconds": 0.01,
+        "log": "05-lcm_runtime__tf_tree_tests__canonical_localization_reset_reinstalls_only_explicit_sensor_descriptor.log"
+      },
+      {
+        "selector": "lcm_runtime::tf_tree_tests::canonical_localization_reset_accepts_new_canonical_observation",
+        "exit_code": 0,
+        "passed": true,
+        "timeout": false,
+        "seconds": 0.011,
+        "log": "06-lcm_runtime__tf_tree_tests__canonical_localization_reset_accepts_new_canonical_observation.log"
+      },
+      {
+        "selector": "lcm_runtime::tf_tree_tests::canonical_tree_retains_history_and_drives_latest_inventory",
+        "exit_code": 0,
+        "passed": true,
+        "timeout": false,
+        "seconds": 0.011,
+        "log": "07-lcm_runtime__tf_tree_tests__canonical_tree_retains_history_and_drives_latest_inventory.log"
+      },
+      {
+        "selector": "lcm_runtime::tf_tree_tests::canonical_tree_resolves_base_to_map_and_rejects_invalid_quaternion",
+        "exit_code": 0,
+        "passed": true,
+        "timeout": false,
+        "seconds": 0.012,
+        "log": "08-lcm_runtime__tf_tree_tests__canonical_tree_resolves_base_to_map_and_rejects_invalid_quaternion.log"
+      },
+      {
+        "selector": "lcm_runtime::tf_tree_tests::semantic_base_candidates_accept_aliases_and_reject_foreign_namespaces",
+        "exit_code": 0,
+        "passed": true,
+        "timeout": false,
+        "seconds": 0.008,
+        "log": "09-lcm_runtime__tf_tree_tests__semantic_base_candidates_accept_aliases_and_reject_foreign_namespaces.log"
+      },
+      {
+        "selector": "server::lifecycle_tests::canonical_reset_new_start_clears_pose_but_replay_and_rejection_preserve_it",
+        "exit_code": 0,
+        "passed": true,
+        "timeout": false,
+        "seconds": 0.044,
+        "log": "10-server__lifecycle_tests__canonical_reset_new_start_clears_pose_but_replay_and_rejection_preserve_it.log"
+      },
+      {
+        "selector": "server::lifecycle_tests::canonical_reset_cloud_activation_clears_pose_but_replay_and_rejection_preserve_it",
+        "exit_code": 0,
+        "passed": true,
+        "timeout": false,
+        "seconds": 0.03,
+        "log": "11-server__lifecycle_tests__canonical_reset_cloud_activation_clears_pose_but_replay_and_rejection_preserve_it.log"
+      },
+      {
+        "selector": "server::lifecycle_tests::canonical_reset_start_retains_lifecycle_until_reset_after_caller_cancel",
+        "exit_code": 0,
+        "passed": true,
+        "timeout": false,
+        "seconds": 0.027,
+        "log": "12-server__lifecycle_tests__canonical_reset_start_retains_lifecycle_until_reset_after_caller_cancel.log"
+      },
+      {
+        "selector": "server::lifecycle_tests::canonical_reset_activation_retains_lifecycle_until_reset_after_caller_cancel",
+        "exit_code": 0,
+        "passed": true,
+        "timeout": false,
+        "seconds": 0.029,
+        "log": "13-server__lifecycle_tests__canonical_reset_activation_retains_lifecycle_until_reset_after_caller_cancel.log"
+      },
+      {
+        "selector": "lio_ingress::tests::in_process_deferred_replay_rechecks_admission_after_lifecycle_wait",
+        "exit_code": 0,
+        "passed": true,
+        "timeout": false,
+        "seconds": 0.118,
+        "log": "14-lio_ingress__tests__in_process_deferred_replay_rechecks_admission_after_lifecycle_wait.log"
+      },
+      {
+        "selector": "lio_ingress::tests::in_process_deferred_replay_checks_each_exact_claim_component",
+        "exit_code": 0,
+        "passed": true,
+        "timeout": false,
+        "seconds": 0.068,
+        "log": "15-lio_ingress__tests__in_process_deferred_replay_checks_each_exact_claim_component.log"
+      },
+      {
+        "selector": "lio_ingress::tests::in_process_deferred_replay_holds_lifecycle_through_odometry_handoff",
+        "exit_code": 0,
+        "passed": true,
+        "timeout": false,
+        "seconds": 0.03,
+        "log": "16-lio_ingress__tests__in_process_deferred_replay_holds_lifecycle_through_odometry_handoff.log"
+      },
+      {
+        "selector": "server::lifecycle_tests::legacy_cloud_seals_unbound_and_replays_without_republication",
+        "exit_code": 0,
+        "passed": true,
+        "timeout": false,
+        "seconds": 0.032,
+        "log": "17-server__lifecycle_tests__legacy_cloud_seals_unbound_and_replays_without_republication.log"
+      },
+      {
+        "selector": "server::lifecycle_tests::legacy_cloud_resumes_exact_retained_publication_unbound",
+        "exit_code": 0,
+        "passed": true,
+        "timeout": false,
+        "seconds": 0.029,
+        "log": "18-server__lifecycle_tests__legacy_cloud_resumes_exact_retained_publication_unbound.log"
+      },
+      {
+        "selector": "correction_coordinator::preflight_only_contract::tests::activation_ledger_legacy_cloud_seals_exact_proof_without_public_binding",
+        "exit_code": 0,
+        "passed": true,
+        "timeout": false,
+        "seconds": 0.01,
+        "log": "19-correction_coordinator__preflight_only_contract__tests__activation_ledger_legacy_cloud_seals_exact_proof_without_public_binding.log"
+      },
+      {
+        "selector": "correction_coordinator::preflight_only_contract::tests::activation_ledger_legacy_cloud_rejects_missing_changed_and_cross_schema_receipts",
+        "exit_code": 0,
+        "passed": true,
+        "timeout": false,
+        "seconds": 0.011,
+        "log": "20-correction_coordinator__preflight_only_contract__tests__activation_ledger_legacy_cloud_rejects_missing_changed_and_cross_schema_receipts.log"
+      },
+      {
+        "selector": "correction_coordinator::preflight_only_contract::tests::activation_ledger_seals_replays_conflicts_and_permanently_retires",
+        "exit_code": 0,
+        "passed": true,
+        "timeout": false,
+        "seconds": 0.011,
+        "log": "21-correction_coordinator__preflight_only_contract__tests__activation_ledger_seals_replays_conflicts_and_permanently_retires.log"
+      },
+      {
+        "selector": "correction_coordinator::preflight_only_contract::tests::activation_ledger_distinguishes_2d_from_lost_3d_target",
+        "exit_code": 0,
+        "passed": true,
+        "timeout": false,
+        "seconds": 0.01,
+        "log": "22-correction_coordinator__preflight_only_contract__tests__activation_ledger_distinguishes_2d_from_lost_3d_target.log"
+      },
+      {
+        "selector": "correction_coordinator::preflight_only_contract::tests::assigned_ledger_sealed_replay_retains_one_owner_and_rejects_altered_source",
+        "exit_code": 0,
+        "passed": true,
+        "timeout": false,
+        "seconds": 0.01,
+        "log": "23-correction_coordinator__preflight_only_contract__tests__assigned_ledger_sealed_replay_retains_one_owner_and_rejects_altered_source.log"
+      },
+      {
+        "selector": "correction_coordinator::preflight_only_contract::tests::assigned_ledger_rejects_cross_schema_proof_and_installed_receipt_mismatch",
+        "exit_code": 0,
+        "passed": true,
+        "timeout": false,
+        "seconds": 0.011,
+        "log": "24-correction_coordinator__preflight_only_contract__tests__assigned_ledger_rejects_cross_schema_proof_and_installed_receipt_mismatch.log"
+      },
+      {
+        "selector": "pointcloud::tests::materialized_snapshot_retains_existing_payload_without_exporting_and_commit_invalidates_cache",
+        "exit_code": 0,
+        "passed": true,
+        "timeout": false,
+        "seconds": 0.009,
+        "log": "25-pointcloud__tests__materialized_snapshot_retains_existing_payload_without_exporting_and_commit_invalidates_cache.log"
+      },
+      {
+        "selector": "server::lifecycle_tests::retained_legacy_frame_checks_current_receipt_and_never_replaces_capture",
+        "exit_code": 0,
+        "passed": true,
+        "timeout": false,
+        "seconds": 0.031,
+        "log": "26-server__lifecycle_tests__retained_legacy_frame_checks_current_receipt_and_never_replaces_capture.log"
+      },
+      {
+        "selector": "server::assigned_activation_boundary_tests::assigned_publication_fence_retains_no_legacy_cloud_frame",
+        "exit_code": 0,
+        "passed": true,
+        "timeout": false,
+        "seconds": 0.011,
+        "log": "27-server__assigned_activation_boundary_tests__assigned_publication_fence_retains_no_legacy_cloud_frame.log"
+      }
+    ],
+    "failure_diagnostic": "\nrunning 1 test\ntest server::lifecycle_tests::assigned_v2_ray_export_transfer_activate_replay_and_conflicts ... FAILED\n\nfailures:\n\nfailures:\n    server::lifecycle_tests::assigned_v2_ray_export_transfer_activate_replay_and_conflicts\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1165 filtered out; finished in 0.06s\n\n\nthread 'server::lifecycle_tests::assigned_v2_ray_export_transfer_activate_replay_and_conflicts' panicked at src/server.rs:11839:17:\nassertion `left == right` failed\n  left: [103, 102, 102, 62, 103, 102, 102, 62, 51, 51, 243, 62, 205, 204, 140, 62, 205, 204, 140, 62, 103, 102, 6, 63, 205, 204, 156, 63, 51, 51, 243, 62, 154, 153, 121, 63]\n right: [205, 204, 156, 63, 51, 51, 243, 62, 154, 153, 121, 63, 205, 204, 140, 62, 205, 204, 140, 62, 103, 102, 6, 63, 103, 102, 102, 62, 103, 102, 102, 62, 51, 51, 243, 62]\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n",
+    "failure_analysis": {
+      "exact_record_multisets_equal": true,
+      "record_counts": [
+        3,
+        3
+      ],
+      "installed_xyz": [
+        [
+          0.22500000894069672,
+          0.22500000894069672,
+          0.4749999940395355
+        ],
+        [
+          0.2750000059604645,
+          0.2750000059604645,
+          0.5250000357627869
+        ],
+        [
+          1.225000023841858,
+          0.4749999940395355,
+          0.9750000238418579
+        ]
+      ],
+      "source_xyz": [
+        [
+          1.225000023841858,
+          0.4749999940395355,
+          0.9750000238418579
+        ],
+        [
+          0.2750000059604645,
+          0.2750000059604645,
+          0.5250000357627869
+        ],
+        [
+          0.22500000894069672,
+          0.22500000894069672,
+          0.4749999940395355
+        ]
+      ]
+    }
+  },
+  "round_2": {
+    "compiled": true,
+    "compile_seconds_reported": 35.61,
+    "passed": 27,
+    "failed": 0,
+    "ignored": 0,
+    "tests": [
+      {
+        "selector": "server::lifecycle_tests::assigned_v2_voxel_export_transfer_activate_replay_and_conflicts",
+        "exit_code": 0,
+        "passed": true,
+        "timeout": false,
+        "seconds": 0.281,
+        "log": "01-server__lifecycle_tests__assigned_v2_voxel_export_transfer_activate_replay_and_conflicts.log"
+      },
+      {
+        "selector": "server::lifecycle_tests::assigned_v2_ray_export_transfer_activate_replay_and_conflicts",
+        "exit_code": 0,
+        "passed": true,
+        "timeout": false,
+        "seconds": 0.207,
+        "log": "02-server__lifecycle_tests__assigned_v2_ray_export_transfer_activate_replay_and_conflicts.log"
+      },
+      {
+        "selector": "lcm_runtime::tf_tree_tests::canonical_localization_reset_clears_pose_full_history_and_mirror",
+        "exit_code": 0,
+        "passed": true,
+        "timeout": false,
+        "seconds": 0.02,
+        "log": "03-lcm_runtime__tf_tree_tests__canonical_localization_reset_clears_pose_full_history_and_mirror.log"
+      },
+      {
+        "selector": "lcm_runtime::tf_tree_tests::canonical_localization_reset_notifies_even_when_pose_is_already_missing",
+        "exit_code": 0,
+        "passed": true,
+        "timeout": false,
+        "seconds": 0.016,
+        "log": "04-lcm_runtime__tf_tree_tests__canonical_localization_reset_notifies_even_when_pose_is_already_missing.log"
+      },
+      {
+        "selector": "lcm_runtime::tf_tree_tests::canonical_localization_reset_reinstalls_only_explicit_sensor_descriptor",
+        "exit_code": 0,
+        "passed": true,
+        "timeout": false,
+        "seconds": 0.02,
+        "log": "05-lcm_runtime__tf_tree_tests__canonical_localization_reset_reinstalls_only_explicit_sensor_descriptor.log"
+      },
+      {
+        "selector": "lcm_runtime::tf_tree_tests::canonical_localization_reset_accepts_new_canonical_observation",
+        "exit_code": 0,
+        "passed": true,
+        "timeout": false,
+        "seconds": 0.015,
+        "log": "06-lcm_runtime__tf_tree_tests__canonical_localization_reset_accepts_new_canonical_observation.log"
+      },
+      {
+        "selector": "lcm_runtime::tf_tree_tests::canonical_tree_retains_history_and_drives_latest_inventory",
+        "exit_code": 0,
+        "passed": true,
+        "timeout": false,
+        "seconds": 0.014,
+        "log": "07-lcm_runtime__tf_tree_tests__canonical_tree_retains_history_and_drives_latest_inventory.log"
+      },
+      {
+        "selector": "lcm_runtime::tf_tree_tests::canonical_tree_resolves_base_to_map_and_rejects_invalid_quaternion",
+        "exit_code": 0,
+        "passed": true,
+        "timeout": false,
+        "seconds": 0.014,
+        "log": "08-lcm_runtime__tf_tree_tests__canonical_tree_resolves_base_to_map_and_rejects_invalid_quaternion.log"
+      },
+      {
+        "selector": "lcm_runtime::tf_tree_tests::semantic_base_candidates_accept_aliases_and_reject_foreign_namespaces",
+        "exit_code": 0,
+        "passed": true,
+        "timeout": false,
+        "seconds": 0.017,
+        "log": "09-lcm_runtime__tf_tree_tests__semantic_base_candidates_accept_aliases_and_reject_foreign_namespaces.log"
+      },
+      {
+        "selector": "server::lifecycle_tests::canonical_reset_new_start_clears_pose_but_replay_and_rejection_preserve_it",
+        "exit_code": 0,
+        "passed": true,
+        "timeout": false,
+        "seconds": 0.046,
+        "log": "10-server__lifecycle_tests__canonical_reset_new_start_clears_pose_but_replay_and_rejection_preserve_it.log"
+      },
+      {
+        "selector": "server::lifecycle_tests::canonical_reset_cloud_activation_clears_pose_but_replay_and_rejection_preserve_it",
+        "exit_code": 0,
+        "passed": true,
+        "timeout": false,
+        "seconds": 0.041,
+        "log": "11-server__lifecycle_tests__canonical_reset_cloud_activation_clears_pose_but_replay_and_rejection_preserve_it.log"
+      },
+      {
+        "selector": "server::lifecycle_tests::canonical_reset_start_retains_lifecycle_until_reset_after_caller_cancel",
+        "exit_code": 0,
+        "passed": true,
+        "timeout": false,
+        "seconds": 0.037,
+        "log": "12-server__lifecycle_tests__canonical_reset_start_retains_lifecycle_until_reset_after_caller_cancel.log"
+      },
+      {
+        "selector": "server::lifecycle_tests::canonical_reset_activation_retains_lifecycle_until_reset_after_caller_cancel",
+        "exit_code": 0,
+        "passed": true,
+        "timeout": false,
+        "seconds": 0.046,
+        "log": "13-server__lifecycle_tests__canonical_reset_activation_retains_lifecycle_until_reset_after_caller_cancel.log"
+      },
+      {
+        "selector": "lio_ingress::tests::in_process_deferred_replay_rechecks_admission_after_lifecycle_wait",
+        "exit_code": 0,
+        "passed": true,
+        "timeout": false,
+        "seconds": 0.158,
+        "log": "14-lio_ingress__tests__in_process_deferred_replay_rechecks_admission_after_lifecycle_wait.log"
+      },
+      {
+        "selector": "lio_ingress::tests::in_process_deferred_replay_checks_each_exact_claim_component",
+        "exit_code": 0,
+        "passed": true,
+        "timeout": false,
+        "seconds": 0.082,
+        "log": "15-lio_ingress__tests__in_process_deferred_replay_checks_each_exact_claim_component.log"
+      },
+      {
+        "selector": "lio_ingress::tests::in_process_deferred_replay_holds_lifecycle_through_odometry_handoff",
+        "exit_code": 0,
+        "passed": true,
+        "timeout": false,
+        "seconds": 0.05,
+        "log": "16-lio_ingress__tests__in_process_deferred_replay_holds_lifecycle_through_odometry_handoff.log"
+      },
+      {
+        "selector": "server::lifecycle_tests::legacy_cloud_seals_unbound_and_replays_without_republication",
+        "exit_code": 0,
+        "passed": true,
+        "timeout": false,
+        "seconds": 0.039,
+        "log": "17-server__lifecycle_tests__legacy_cloud_seals_unbound_and_replays_without_republication.log"
+      },
+      {
+        "selector": "server::lifecycle_tests::legacy_cloud_resumes_exact_retained_publication_unbound",
+        "exit_code": 0,
+        "passed": true,
+        "timeout": false,
+        "seconds": 0.046,
+        "log": "18-server__lifecycle_tests__legacy_cloud_resumes_exact_retained_publication_unbound.log"
+      },
+      {
+        "selector": "correction_coordinator::preflight_only_contract::tests::activation_ledger_legacy_cloud_seals_exact_proof_without_public_binding",
+        "exit_code": 0,
+        "passed": true,
+        "timeout": false,
+        "seconds": 0.018,
+        "log": "19-correction_coordinator__preflight_only_contract__tests__activation_ledger_legacy_cloud_seals_exact_proof_without_public_binding.log"
+      },
+      {
+        "selector": "correction_coordinator::preflight_only_contract::tests::activation_ledger_legacy_cloud_rejects_missing_changed_and_cross_schema_receipts",
+        "exit_code": 0,
+        "passed": true,
+        "timeout": false,
+        "seconds": 0.021,
+        "log": "20-correction_coordinator__preflight_only_contract__tests__activation_ledger_legacy_cloud_rejects_missing_changed_and_cross_schema_receipts.log"
+      },
+      {
+        "selector": "correction_coordinator::preflight_only_contract::tests::activation_ledger_seals_replays_conflicts_and_permanently_retires",
+        "exit_code": 0,
+        "passed": true,
+        "timeout": false,
+        "seconds": 0.038,
+        "log": "21-correction_coordinator__preflight_only_contract__tests__activation_ledger_seals_replays_conflicts_and_permanently_retires.log"
+      },
+      {
+        "selector": "correction_coordinator::preflight_only_contract::tests::activation_ledger_distinguishes_2d_from_lost_3d_target",
+        "exit_code": 0,
+        "passed": true,
+        "timeout": false,
+        "seconds": 0.018,
+        "log": "22-correction_coordinator__preflight_only_contract__tests__activation_ledger_distinguishes_2d_from_lost_3d_target.log"
+      },
+      {
+        "selector": "correction_coordinator::preflight_only_contract::tests::assigned_ledger_sealed_replay_retains_one_owner_and_rejects_altered_source",
+        "exit_code": 0,
+        "passed": true,
+        "timeout": false,
+        "seconds": 0.018,
+        "log": "23-correction_coordinator__preflight_only_contract__tests__assigned_ledger_sealed_replay_retains_one_owner_and_rejects_altered_source.log"
+      },
+      {
+        "selector": "correction_coordinator::preflight_only_contract::tests::assigned_ledger_rejects_cross_schema_proof_and_installed_receipt_mismatch",
+        "exit_code": 0,
+        "passed": true,
+        "timeout": false,
+        "seconds": 0.018,
+        "log": "24-correction_coordinator__preflight_only_contract__tests__assigned_ledger_rejects_cross_schema_proof_and_installed_receipt_mismatch.log"
+      },
+      {
+        "selector": "pointcloud::tests::materialized_snapshot_retains_existing_payload_without_exporting_and_commit_invalidates_cache",
+        "exit_code": 0,
+        "passed": true,
+        "timeout": false,
+        "seconds": 0.034,
+        "log": "25-pointcloud__tests__materialized_snapshot_retains_existing_payload_without_exporting_and_commit_invalidates_cache.log"
+      },
+      {
+        "selector": "server::lifecycle_tests::retained_legacy_frame_checks_current_receipt_and_never_replaces_capture",
+        "exit_code": 0,
+        "passed": true,
+        "timeout": false,
+        "seconds": 0.048,
+        "log": "26-server__lifecycle_tests__retained_legacy_frame_checks_current_receipt_and_never_replaces_capture.log"
+      },
+      {
+        "selector": "server::assigned_activation_boundary_tests::assigned_publication_fence_retains_no_legacy_cloud_frame",
+        "exit_code": 0,
+        "passed": true,
+        "timeout": false,
+        "seconds": 0.024,
+        "log": "27-server__assigned_activation_boundary_tests__assigned_publication_fence_retains_no_legacy_cloud_frame.log"
+      }
+    ],
+    "executable": {
+      "path": "/workspace/shared/neh-native-20261006/cargo-target/debug/deps/nuwax_geometry_runtime-2edf19100d795ffa",
+      "sha256": "e2a3d3fcdc2bc9712f7a0d8e3283fdc0efa6e86598fc5d51b8f5fbfc8e376000",
+      "size": 105973440
+    }
+  },
+  "new_pair_repeats": {
+    "tests": [
+      {
+        "iteration": 1,
+        "selector": "server::lifecycle_tests::assigned_v2_voxel_export_transfer_activate_replay_and_conflicts",
+        "passed": true,
+        "exit_code": 0,
+        "seconds": 0.061
+      },
+      {
+        "iteration": 1,
+        "selector": "server::lifecycle_tests::assigned_v2_ray_export_transfer_activate_replay_and_conflicts",
+        "passed": true,
+        "exit_code": 0,
+        "seconds": 0.063
+      },
+      {
+        "iteration": 2,
+        "selector": "server::lifecycle_tests::assigned_v2_voxel_export_transfer_activate_replay_and_conflicts",
+        "passed": true,
+        "exit_code": 0,
+        "seconds": 0.053
+      },
+      {
+        "iteration": 2,
+        "selector": "server::lifecycle_tests::assigned_v2_ray_export_transfer_activate_replay_and_conflicts",
+        "passed": true,
+        "exit_code": 0,
+        "seconds": 0.062
+      },
+      {
+        "iteration": 3,
+        "selector": "server::lifecycle_tests::assigned_v2_voxel_export_transfer_activate_replay_and_conflicts",
+        "passed": true,
+        "exit_code": 0,
+        "seconds": 0.052
+      },
+      {
+        "iteration": 3,
+        "selector": "server::lifecycle_tests::assigned_v2_ray_export_transfer_activate_replay_and_conflicts",
+        "passed": true,
+        "exit_code": 0,
+        "seconds": 0.058
+      },
+      {
+        "iteration": 4,
+        "selector": "server::lifecycle_tests::assigned_v2_voxel_export_transfer_activate_replay_and_conflicts",
+        "passed": true,
+        "exit_code": 0,
+        "seconds": 0.062
+      },
+      {
+        "iteration": 4,
+        "selector": "server::lifecycle_tests::assigned_v2_ray_export_transfer_activate_replay_and_conflicts",
+        "passed": true,
+        "exit_code": 0,
+        "seconds": 0.056
+      },
+      {
+        "iteration": 5,
+        "selector": "server::lifecycle_tests::assigned_v2_voxel_export_transfer_activate_replay_and_conflicts",
+        "passed": true,
+        "exit_code": 0,
+        "seconds": 0.064
+      },
+      {
+        "iteration": 5,
+        "selector": "server::lifecycle_tests::assigned_v2_ray_export_transfer_activate_replay_and_conflicts",
+        "passed": true,
+        "exit_code": 0,
+        "seconds": 0.059
+      },
+      {
+        "iteration": 6,
+        "selector": "server::lifecycle_tests::assigned_v2_voxel_export_transfer_activate_replay_and_conflicts",
+        "passed": true,
+        "exit_code": 0,
+        "seconds": 0.072
+      },
+      {
+        "iteration": 6,
+        "selector": "server::lifecycle_tests::assigned_v2_ray_export_transfer_activate_replay_and_conflicts",
+        "passed": true,
+        "exit_code": 0,
+        "seconds": 0.06
+      },
+      {
+        "iteration": 7,
+        "selector": "server::lifecycle_tests::assigned_v2_voxel_export_transfer_activate_replay_and_conflicts",
+        "passed": true,
+        "exit_code": 0,
+        "seconds": 0.057
+      },
+      {
+        "iteration": 7,
+        "selector": "server::lifecycle_tests::assigned_v2_ray_export_transfer_activate_replay_and_conflicts",
+        "passed": true,
+        "exit_code": 0,
+        "seconds": 0.06
+      },
+      {
+        "iteration": 8,
+        "selector": "server::lifecycle_tests::assigned_v2_voxel_export_transfer_activate_replay_and_conflicts",
+        "passed": true,
+        "exit_code": 0,
+        "seconds": 0.052
+      },
+      {
+        "iteration": 8,
+        "selector": "server::lifecycle_tests::assigned_v2_ray_export_transfer_activate_replay_and_conflicts",
+        "passed": true,
+        "exit_code": 0,
+        "seconds": 0.069
+      },
+      {
+        "iteration": 9,
+        "selector": "server::lifecycle_tests::assigned_v2_voxel_export_transfer_activate_replay_and_conflicts",
+        "passed": true,
+        "exit_code": 0,
+        "seconds": 0.063
+      },
+      {
+        "iteration": 9,
+        "selector": "server::lifecycle_tests::assigned_v2_ray_export_transfer_activate_replay_and_conflicts",
+        "passed": true,
+        "exit_code": 0,
+        "seconds": 0.053
+      },
+      {
+        "iteration": 10,
+        "selector": "server::lifecycle_tests::assigned_v2_voxel_export_transfer_activate_replay_and_conflicts",
+        "passed": true,
+        "exit_code": 0,
+        "seconds": 0.068
+      },
+      {
+        "iteration": 10,
+        "selector": "server::lifecycle_tests::assigned_v2_ray_export_transfer_activate_replay_and_conflicts",
+        "passed": true,
+        "exit_code": 0,
+        "seconds": 0.058
+      }
+    ],
+    "passed": 20,
+    "total": 20
+  },
+  "exact_allowlist_sha256": "dc29cefeae5077e2dd4e64ad28916cdeddd22a8fc9989c41df18fd0d9c7c3000",
+  "logs_root": "/workspace/shared/neh-explicit-loader-qualification-20261006",
+  "limitations": [
+    "No full Rust-suite result",
+    "No robot/sensor/actuator or live gRPC-network qualification",
+    "Default save/load and workspace activation remain gated",
+    "Assigned relocalization availability remains false",
+    "Different active owner requires caller explicit StopMapping",
+    "Retained UNKNOWN retry evidence is same-provider/same-connection only; no restart recovery claim"
+  ]
+}

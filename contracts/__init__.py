@@ -8,20 +8,7 @@ from contracts.artifacts import (
     ArtifactStorageSummary,
 )
 from contracts.base import ContractModel, MetadataDict, TimestampedContract, utc_now
-from contracts.debug_views import (
-    DebugDataStatus,
-    DebugEnvelope,
-    DebugError,
-    DebugLocalizationView,
-    DebugLogEntry,
-    DebugLogsTailView,
-    DebugMapView,
-    DebugNavigationView,
-    DebugOverviewView,
-    DebugPointCloudMapView,
-    DebugPointCloudView,
-    DebugSourceSummary,
-)
+
 from contracts.capabilities import (
     CapabilityAvailability,
     CapabilityDescriptor,
@@ -46,7 +33,7 @@ from contracts.events import RuntimeEvent, RuntimeEventCategory, RuntimeEventSev
 from contracts.geometry import FrameTree, Pose, Quaternion, Transform, Twist, Vector3
 from contracts.image import CameraInfo, ImageEncoding, ImageFrame
 from contracts.maps import CostMap, OccupancyGrid, SemanticMap, SemanticRegion
-from contracts.map_workspace import MapAsset, MapAssetStatus, MapGeometryAssetBinding, MapVersion, MapWorkspace
+from contracts.map_workspace import MapAsset, MapAssetBundle, MapAssetStatus, MapGeometryAssetBinding, MapWorkspace
 from contracts.memory import (
     GoalCandidateScoreBreakdown,
     GoalConstraint,
@@ -99,6 +86,20 @@ from contracts.navigation import (
 )
 from contracts.perception import BoundingBox2D, Detection2D, Detection3D, Observation, Track, TrackState
 from contracts.pointcloud import LaserScanFrame, PointCloudFrame, PointField, PointFieldDataType
+from contracts.sensors import (
+    CanonicalImuSample,
+    CanonicalLaserScan,
+    CanonicalLidarFrame,
+    CanonicalLioMeasurement,
+    PayloadOwnership,
+    RegistrationState,
+    SensorCapabilities,
+    SensorClockDomain,
+    SensorDescriptor,
+    SensorErrorCode,
+    SensorKind,
+    SensorSample,
+)
 from contracts.robot_state import (
     BatteryState,
     IMUState,
@@ -117,6 +118,9 @@ from contracts.runtime_views import (
     NavigationSemanticContext,
     LocalizationSession,
     RuntimeGovernanceSummary,
+    ServiceHealthEntry,
+    ServiceHealthStatus,
+    ServiceHealthSummary,
     LocalizationSessionStatus,
     LocalizationSnapshot,
     MapSnapshot,
@@ -144,20 +148,12 @@ __all__ = [
     "CapabilityExecutionMode",
     "CapabilityMatrix",
     "CapabilityRiskLevel",
+    "CanonicalImuSample",
+    "CanonicalLaserScan",
+    "CanonicalLidarFrame",
+    "CanonicalLioMeasurement",
     "ContractModel",
     "CostMap",
-    "DebugDataStatus",
-    "DebugEnvelope",
-    "DebugError",
-    "DebugLocalizationView",
-    "DebugLogEntry",
-    "DebugLogsTailView",
-    "DebugMapView",
-    "DebugNavigationView",
-    "DebugOverviewView",
-    "DebugPointCloudMapView",
-    "DebugPointCloudView",
-    "DebugSourceSummary",
     "EvaluationGateResult",
     "EvaluationRunSummary",
     "EvaluationSliceKey",
@@ -195,10 +191,10 @@ __all__ = [
     "LocalizationSessionStatus",
     "LocalizationSnapshot",
     "MapAsset",
+    "MapAssetBundle",
     "MapAssetStatus",
     "MapGeometryAssetBinding",
     "MapSnapshot",
-    "MapVersion",
     "MapWorkspace",
     "MemoryQueryMatch",
     "MemoryQueryResult",
@@ -216,16 +212,27 @@ __all__ = [
     "Observation",
     "ObservationContext",
     "OccupancyGrid",
+    "PayloadOwnership",
     "PerceptionContext",
     "PointCloudFrame",
     "PointField",
     "PointFieldDataType",
     "Pose",
     "Quaternion",
+    "RegistrationState",
     "RobotControlMode",
     "RobotState",
     "RobotStatusSnapshot",
     "RuntimeGovernanceSummary",
+    "SensorCapabilities",
+    "SensorClockDomain",
+    "SensorDescriptor",
+    "SensorErrorCode",
+    "SensorKind",
+    "SensorSample",
+    "ServiceHealthEntry",
+    "ServiceHealthStatus",
+    "ServiceHealthSummary",
     "RuntimeEvent",
     "RuntimeEventCategory",
     "RuntimeEventSeverity",

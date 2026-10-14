@@ -1,15 +1,16 @@
 from __future__ import annotations
 
-from typing import Dict, Iterable, Optional, Tuple
+from datetime import timezone
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 
 from contracts.frame_semantics import frame_ids_semantically_equal
-from contracts.geometry import FrameTree, Pose, Vector3
+from contracts.geometry import FrameTree, Pose
 from contracts.image import CameraInfo, ImageFrame
 from contracts.perception import Detection2D
 from contracts.pointcloud import PointCloudFrame
-from services.localization.frame_tree_ops import transform_points_to_frame
+from services.localization.frame_tree_ops import resolve_frame_transform
 
 
 class DetectionGeometryAugmentor:
@@ -46,11 +47,27 @@ class DetectionGeometryAugmentor:
             image_width_px=int(image_frame.width_px),
             image_height_px=int(image_frame.height_px),
         )
+        metadata = {
+            "geometry_segmentation_enriched_count": segmentation_enriched_count,
+            "geometry_image_timestamp": image_frame.timestamp.isoformat(),
+        }
+        calibration_reason = self._camera_geometry_error(image_frame, camera_info)
+        if calibration_reason:
+            return detections_2d, {**metadata, "geometry_projection_degradation_reason": calibration_reason}
         if point_cloud is None or (not point_cloud.points and point_cloud.points_xyz_array is None):
-            metadata = {}
-            if segmentation_enriched_count:
-                metadata["geometry_segmentation_enriched_count"] = segmentation_enriched_count
-            return detections_2d, metadata
+            return detections_2d, {**metadata, "geometry_projection_degradation_reason": "point_cloud_unavailable"}
+
+        image_ts = image_frame.timestamp
+        cloud_ts = point_cloud.timestamp
+        if image_ts.tzinfo is None:
+            image_ts = image_ts.replace(tzinfo=timezone.utc)
+        if cloud_ts.tzinfo is None:
+            cloud_ts = cloud_ts.replace(tzinfo=timezone.utc)
+        metadata.update({
+            "geometry_point_cloud_timestamp": point_cloud.timestamp.isoformat(),
+            "geometry_image_point_cloud_delta_sec": round((image_ts - cloud_ts).total_seconds(), 6),
+            "geometry_synchronization": "latest_available_not_strictly_synchronized",
+        })
 
         prepared = self._prepare_projectable_points(
             image_frame=image_frame,
@@ -60,16 +77,17 @@ class DetectionGeometryAugmentor:
             map_frame_id=str(current_pose.frame_id or "").strip() or None if current_pose is not None else None,
         )
         if prepared is None:
-            metadata = {}
-            if segmentation_enriched_count:
-                metadata["geometry_segmentation_enriched_count"] = segmentation_enriched_count
-            return detections_2d, metadata
+            return detections_2d, {**metadata, "geometry_projection_degradation_reason": "no_projectable_points"}
 
         projected_pixels, camera_points, map_points, map_frame_id = prepared
         augmented = []
         augmented_count = 0
         support_point_total = 0
         for detection in detections_2d:
+            if detection.camera_id not in (None, image_frame.camera_id):
+                augmented.append(detection)
+                metadata["geometry_camera_mismatch_count"] = int(metadata.get("geometry_camera_mismatch_count") or 0) + 1
+                continue
             updated_detection, support_count = self._augment_single_detection(
                 detection=detection,
                 camera_info=camera_info,
@@ -84,13 +102,41 @@ class DetectionGeometryAugmentor:
             augmented.append(updated_detection)
 
         return tuple(augmented), {
+            **metadata,
             "geometry_augmented_count": augmented_count,
             "geometry_segmentation_enriched_count": segmentation_enriched_count,
             "geometry_support_point_total": support_point_total,
             "geometry_point_cloud_frame_id": point_cloud.frame_id,
             "geometry_point_cloud_point_count": int(point_cloud.point_count),
             "geometry_point_cloud_source_topic": point_cloud.metadata.get("source_topic"),
+            "geometry_camera_distortion_model": camera_info.distortion_model or "pinhole",
         }
+
+    @staticmethod
+    def _camera_geometry_error(image_frame: ImageFrame, camera_info: CameraInfo) -> Optional[str]:
+        if image_frame.camera_id != camera_info.camera_id:
+            return "camera_id_mismatch"
+        if not frame_ids_semantically_equal(image_frame.frame_id, camera_info.frame_id):
+            return "camera_frame_mismatch"
+        if (image_frame.width_px, image_frame.height_px) != (camera_info.width_px, camera_info.height_px):
+            return "camera_image_size_mismatch"
+        intrinsics = np.asarray([camera_info.fx, camera_info.fy, camera_info.cx, camera_info.cy], dtype=np.float64)
+        if not np.all(np.isfinite(intrinsics)) or camera_info.fx <= 0.0 or camera_info.fy <= 0.0:
+            return "invalid_camera_intrinsics"
+        coefficients = camera_info.distortion_coefficients
+        if not np.all(np.isfinite(coefficients)):
+            return "invalid_distortion_coefficients"
+        model = (camera_info.distortion_model or "").strip().lower()
+        allowed_lengths = {
+            "": (0,), "none": (0,), "pinhole": (0,),
+            "plumb_bob": (0, 4, 5), "rational_polynomial": (0, 8),
+            "fisheye": (0, 4), "equidistant": (0, 4), "kannala_brandt": (0, 4), "kb": (0, 4),
+        }
+        if model not in allowed_lengths:
+            return "unsupported_distortion_model"
+        if len(coefficients) not in allowed_lengths[model]:
+            return "invalid_distortion_coefficients"
+        return None
 
     def _prepare_projectable_points(
         self,
@@ -101,43 +147,37 @@ class DetectionGeometryAugmentor:
         frame_tree: Optional[FrameTree],
         map_frame_id: Optional[str],
     ) -> Optional[Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], Optional[str]]]:
-        point_samples = tuple(point_cloud.points) if point_cloud.points else ()
-        if not point_samples and point_cloud.points_xyz_array is not None:
-            # 从 ndarray 高性能路径构造 Vector3 元组（感知模块需要逐点访问）
-            arr = point_cloud.points_xyz_array
-            point_samples = tuple(
-                Vector3(x=float(arr[i, 0]), y=float(arr[i, 1]), z=float(arr[i, 2]))
-                for i in range(arr.shape[0])
-            )
-        if not point_samples:
+        source_array = None
+        if point_cloud.points_xyz_array is not None:
+            # ndarray 是契约里的高性能表示，优先直连投影路径。
+            candidate = np.asarray(point_cloud.points_xyz_array)
+            if candidate.ndim == 2 and candidate.shape[1] >= 3 and candidate.shape[0] > 0:
+                source_array = np.asarray(candidate[:, :3], dtype=np.float64)
+        if source_array is None and point_cloud.points:
+            source_array = np.asarray([[item.x, item.y, item.z] for item in point_cloud.points], dtype=np.float64)
+        if source_array is None:
             return None
-
-        camera_points = self._resolve_points_to_frame(
-            points=point_samples,
+        source_array = source_array[np.all(np.isfinite(source_array), axis=1)]
+        camera_array = self._resolve_array_to_frame(
+            points_xyz=source_array,
             source_frame_id=point_cloud.frame_id,
             target_frame_id=camera_info.frame_id,
             frame_tree=frame_tree,
         )
-        if camera_points is None:
+        if camera_array is None or camera_array.size == 0:
             return None
-
-        camera_array = np.asarray([[float(item.x), float(item.y), float(item.z)] for item in camera_points], dtype=np.float64)
-        if camera_array.size == 0:
-            return None
-
-        valid_depth_mask = camera_array[:, 2] > float(self._min_depth_m)
+        valid_depth_mask = np.all(np.isfinite(camera_array), axis=1) & (camera_array[:, 2] > self._min_depth_m)
         if not np.any(valid_depth_mask):
             return None
         camera_array = camera_array[valid_depth_mask]
-
-        pixel_u = (camera_array[:, 0] * float(camera_info.fx) / camera_array[:, 2]) + float(camera_info.cx)
-        pixel_v = (camera_array[:, 1] * float(camera_info.fy) / camera_array[:, 2]) + float(camera_info.cy)
-        projected_pixels = np.stack((pixel_u, pixel_v), axis=1)
+        source_array = source_array[valid_depth_mask]
+        projected_pixels = self._project_camera_points(camera_array, camera_info)
 
         width_px = int(image_frame.width_px)
         height_px = int(image_frame.height_px)
         in_view_mask = (
-            (projected_pixels[:, 0] >= 0.0)
+            np.all(np.isfinite(projected_pixels), axis=1)
+            & (projected_pixels[:, 0] >= 0.0)
             & (projected_pixels[:, 0] < float(width_px))
             & (projected_pixels[:, 1] >= 0.0)
             & (projected_pixels[:, 1] < float(height_px))
@@ -150,18 +190,42 @@ class DetectionGeometryAugmentor:
 
         map_array = None
         if map_frame_id:
-            resolved_map_points = self._resolve_points_to_frame(
-                points=point_samples,
+            # 只变换已经可见的源点，保持相机/像素/地图索引逐点对齐。
+            map_array = self._resolve_array_to_frame(
+                points_xyz=source_array[in_view_mask],
                 source_frame_id=point_cloud.frame_id,
                 target_frame_id=map_frame_id,
                 frame_tree=frame_tree,
             )
-            if resolved_map_points is not None:
-                map_array = np.asarray(
-                    [[float(item.x), float(item.y), float(item.z)] for item in resolved_map_points],
-                    dtype=np.float64,
-                )[valid_depth_mask][in_view_mask]
         return projected_pixels, camera_array, map_array, map_frame_id
+
+    @staticmethod
+    def _project_camera_points(camera_array: np.ndarray, camera_info: CameraInfo) -> np.ndarray:
+        """按已声明标定正投影；公式与标准径向切向及等距鱼眼模型一致。"""
+
+        x, y = camera_array[:, 0] / camera_array[:, 2], camera_array[:, 1] / camera_array[:, 2]
+        model = (camera_info.distortion_model or "").strip().lower()
+        coefficients = camera_info.distortion_coefficients
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            if model in {"fisheye", "equidistant", "kannala_brandt", "kb"}:
+                k1, k2, k3, k4 = [*coefficients, *([0.0] * (4 - len(coefficients)))]
+                radius = np.hypot(x, y)
+                theta = np.arctan(radius)
+                theta2 = theta * theta
+                theta_distorted = theta * (1.0 + theta2 * (k1 + theta2 * (k2 + theta2 * (k3 + theta2 * k4))))
+                scale = np.divide(theta_distorted, radius, out=np.ones_like(radius), where=radius > 0.0)
+                x, y = x * scale, y * scale
+            elif coefficients:
+                k1, k2, p1, p2, k3, k4, k5, k6 = [*coefficients, *([0.0] * (8 - len(coefficients)))]
+                radius2 = x * x + y * y
+                radial = (1.0 + radius2 * (k1 + radius2 * (k2 + radius2 * k3))) / (
+                    1.0 + radius2 * (k4 + radius2 * (k5 + radius2 * k6))
+                )
+                x, y = (
+                    x * radial + 2.0 * p1 * x * y + p2 * (radius2 + 2.0 * x * x),
+                    y * radial + p1 * (radius2 + 2.0 * y * y) + 2.0 * p2 * x * y,
+                )
+            return np.column_stack((x * camera_info.fx + camera_info.cx, y * camera_info.fy + camera_info.cy))
 
     def _augment_segmentation_attributes(
         self,
@@ -304,30 +368,31 @@ class DetectionGeometryAugmentor:
             & (projected_pixels[:, 1] >= y_min)
             & (projected_pixels[:, 1] <= y_max)
         )
-        bbox_support_count = int(np.count_nonzero(bbox_mask))
+        bbox_indices = np.flatnonzero(bbox_mask)
+        bbox_support_count = int(bbox_indices.size)
         polygon = self._segmentation_polygon(detection)
-        support_mask = bbox_mask
+        support_indices = bbox_indices
         projection_method = "pointcloud_bbox_projection"
         projection_status = "bbox_depth_support" if bbox_support_count else "bbox_no_depth_support"
         polygon_support_count = 0
         if polygon:
-            polygon_mask = np.asarray([self._point_in_polygon(float(x), float(y), polygon) for x, y in projected_pixels], dtype=bool)
-            polygon_support_count = int(np.count_nonzero(polygon_mask))
+            polygon_mask = self._points_in_polygon(projected_pixels[bbox_indices], polygon)
+            polygon_indices = bbox_indices[polygon_mask]
+            polygon_support_count = int(polygon_indices.size)
             if polygon_support_count:
-                support_mask = polygon_mask
+                support_indices = polygon_indices
                 projection_method = "pointcloud_mask_projection"
                 projection_status = "mask_depth_support"
             elif bbox_support_count:
-                support_mask = bbox_mask
+                support_indices = bbox_indices
                 projection_status = "mask_no_depth_support_bbox_fallback"
             else:
-                support_mask = polygon_mask
+                support_indices = polygon_indices
                 projection_method = "pointcloud_mask_projection"
                 projection_status = "mask_no_depth_support"
         elif not bbox_support_count:
             projection_status = "segmentation_absent_no_depth_support"
 
-        support_indices = np.flatnonzero(support_mask)
         attributes = dict(detection.attributes or {})
         attributes["geometry_bbox_support_point_count"] = bbox_support_count
         attributes["geometry_projection_method"] = projection_method
@@ -348,8 +413,15 @@ class DetectionGeometryAugmentor:
                 attributes["segmentation_projection_status"] = projection_status
             return detection.model_copy(update={"attributes": attributes}, deep=False), 0
 
-        ordered_indices = support_indices[np.argsort(camera_points[support_indices, 2])]
-        selected_indices = ordered_indices[: self._max_points_per_detection]
+        depths = camera_points[support_indices, 2]
+        if support_indices.size > self._max_points_per_detection:
+            cutoff = np.partition(depths, self._max_points_per_detection - 1)[self._max_points_per_detection - 1]
+            nearest = np.flatnonzero(depths < cutoff)
+            tied = np.flatnonzero(depths == cutoff)[: self._max_points_per_detection - nearest.size]
+            nearest = np.concatenate((nearest, tied))
+            selected_indices = support_indices[nearest[np.argsort(depths[nearest], kind="stable")]]
+        else:
+            selected_indices = support_indices[np.argsort(depths, kind="stable")]
         selected_camera = camera_points[selected_indices]
         selected_map = map_points[selected_indices] if map_points is not None else None
         selected_pixels = projected_pixels[selected_indices]
@@ -404,31 +476,28 @@ class DetectionGeometryAugmentor:
 
         return detection.model_copy(update={"attributes": attributes}, deep=False), support_count
 
-    def _resolve_points_to_frame(
+    def _resolve_array_to_frame(
         self,
         *,
-        points: Iterable[Vector3],
+        points_xyz: np.ndarray,
         source_frame_id: str,
         target_frame_id: str,
         frame_tree: Optional[FrameTree],
-    ) -> Optional[Tuple[Vector3, ...]]:
+    ) -> Optional[np.ndarray]:
+        """用一次矩阵运算变换 ndarray 点集，保持点顺序和坐标语义。"""
+
         if frame_ids_semantically_equal(source_frame_id, target_frame_id):
-            if source_frame_id == target_frame_id:
-                return tuple(points)
-            return tuple(
-                Vector3(
-                    x=float(item.x),
-                    y=float(item.y),
-                    z=float(item.z),
-                )
-                for item in points
-            )
-        return transform_points_to_frame(
+            return points_xyz
+        resolved = resolve_frame_transform(
             frame_tree,
-            points,
             source_frame_id=source_frame_id,
             target_frame_id=target_frame_id,
         )
+        if resolved is None:
+            return None
+        rotation = resolved.matrix[:3, :3]
+        translation = resolved.matrix[:3, 3]
+        return points_xyz @ rotation.T + translation
 
     def _serialize_points(self, points: np.ndarray) -> Tuple[Dict[str, float], ...]:
         return tuple(
@@ -516,18 +585,28 @@ class DetectionGeometryAugmentor:
                 continue
         return tuple(points)
 
-    def _point_in_polygon(self, x_px: float, y_px: float, polygon: Tuple[Tuple[float, float], ...]) -> bool:
-        inside = False
-        count = len(polygon)
-        if count < 3:
-            return False
+    def _points_in_polygon(
+        self,
+        projected_pixels: np.ndarray,
+        polygon: Tuple[Tuple[float, float], ...],
+    ) -> np.ndarray:
+        """批量执行射线法多边形判断，只按多边形边数迭代。"""
+
+        if len(polygon) < 3 or projected_pixels.size == 0:
+            return np.zeros(projected_pixels.shape[0], dtype=bool)
+        x_px = projected_pixels[:, 0]
+        y_px = projected_pixels[:, 1]
+        inside = np.zeros(projected_pixels.shape[0], dtype=bool)
         previous_x, previous_y = polygon[-1]
         for current_x, current_y in polygon:
-            intersects = ((current_y > y_px) != (previous_y > y_px)) and (
-                x_px < (previous_x - current_x) * (y_px - current_y) / ((previous_y - current_y) or 1e-9) + current_x
+            intersects = ((current_y > y_px) != (previous_y > y_px)) & (
+                x_px
+                < (previous_x - current_x)
+                * (y_px - current_y)
+                / ((previous_y - current_y) or 1e-9)
+                + current_x
             )
-            if intersects:
-                inside = not inside
+            inside ^= intersects
             previous_x, previous_y = current_x, current_y
         return inside
 
@@ -535,6 +614,7 @@ class DetectionGeometryAugmentor:
         try:
             if value is None:
                 return None
-            return float(value)
+            result = float(value)
+            return result if np.isfinite(result) else None
         except (TypeError, ValueError):
             return None

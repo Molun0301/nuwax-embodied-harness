@@ -1,0 +1,28 @@
+[package]
+name = "nuwax-mapping-cloud"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "nuwax 地图云服务"
+
+[dependencies]
+nuwax-types = { path = "../nuwax-types" }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
+osmpbf = { workspace = true }
+image = { workspace = true, features = ["png"] }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+
+# The default exposes real HTTP clients plus offline coordinate/raster helpers.
+# Disabling the feature leaves only explicit `CloudMapError::Disabled` fallbacks.
+[features]
+default = ["cloud-enabled"]
+cloud-enabled = []

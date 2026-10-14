@@ -1,0 +1,369 @@
+{
+  "status": "component-qualified",
+  "date_utc": "2026-10-06",
+  "local_base_commit": "7472c7e4ae11362deb6b535699628989e9eb3ea3",
+  "base_tree": "689777564b098164910a981cae376ed75564b194",
+  "verified_remote_base_commit": "e7d97fe5c1af0d6e11f090f37f35da3492588c67",
+  "source_files_sha256": {
+    "services/geometry/nuwax_geometry_runtime/src/correction_coordinator.rs": "a0e9d90fe2658a37e283fe0e0c16c24ade4d79830da40eba4c68c8cf6b85d67a",
+    "services/geometry/nuwax_geometry_runtime/src/server.rs": "19a5cd221a36c92f5e5c6d122bde39abee507bec8588fa2666fbf4dc9ed80b57",
+    "services/geometry/nuwax_geometry_runtime/src/pointcloud.rs": "6adbb3c1209478aca2efbb054d5b79b39c8d8f82325c673344acba62aca45475"
+  },
+  "overlay_files_sha256": {
+    "services/geometry/nuwax_geometry_runtime/src/lcm_runtime.rs": "7ec60f6145a25cdceea92af493a5d3d450855f2409a4e2093c39509b37ce82de",
+    "services/geometry/nuwax_geometry_runtime/src/lio_ingress.rs": "a6ee07731629d40ac387a0a8fbb644b18a94875fab93bd388f04c7d041465b98",
+    "services/geometry/nuwax_geometry_runtime/src/correction_coordinator.rs": "a0e9d90fe2658a37e283fe0e0c16c24ade4d79830da40eba4c68c8cf6b85d67a",
+    "services/geometry/nuwax_geometry_runtime/src/server.rs": "19a5cd221a36c92f5e5c6d122bde39abee507bec8588fa2666fbf4dc9ed80b57",
+    "services/geometry/nuwax_geometry_runtime/src/pointcloud.rs": "6adbb3c1209478aca2efbb054d5b79b39c8d8f82325c673344acba62aca45475"
+  },
+  "source_patch_sha256": "b0483ae7ed3dc8dc010baa7ec0cb38b000f80756df0d60ab01e6595155e02092",
+  "exact25_sha256": "6e5bed1c2ae5da1bb858fd0fd5bb3cf1e1d5fcedb990b144fbce85bd2153534e",
+  "rounds": [
+    {
+      "round": 1,
+      "compile_exit": 0,
+      "compile_elapsed_sec": 43.6900591779995,
+      "tested_overlay_tree": "3c1e9dcc8a48e646a604c2326fdf0be97ea3ef48",
+      "binary_sha256": "8454b6c3b027b24bf7c2bccc1c5a275af940fcfcc087c1e5b40111f2d44736b1",
+      "baseline_restored_bytes": true,
+      "baseline_git_status": "",
+      "baseline_tree": "fa4c24311a5d87bf09cd103ff66d3f4f2edf8269",
+      "native_cmake_caches_unchanged": true,
+      "tests_executed": 22,
+      "tests_passed": 21,
+      "tests": [
+        {
+          "name": "lcm_runtime::tf_tree_tests::canonical_localization_reset_clears_pose_full_history_and_mirror",
+          "passed": true,
+          "exit_code": 0,
+          "elapsed_sec": 0.00762899099936476
+        },
+        {
+          "name": "lcm_runtime::tf_tree_tests::canonical_localization_reset_notifies_even_when_pose_is_already_missing",
+          "passed": true,
+          "exit_code": 0,
+          "elapsed_sec": 0.0075811489987245295
+        },
+        {
+          "name": "lcm_runtime::tf_tree_tests::canonical_localization_reset_reinstalls_only_explicit_sensor_descriptor",
+          "passed": true,
+          "exit_code": 0,
+          "elapsed_sec": 0.007757404000585666
+        },
+        {
+          "name": "lcm_runtime::tf_tree_tests::canonical_localization_reset_accepts_new_canonical_observation",
+          "passed": true,
+          "exit_code": 0,
+          "elapsed_sec": 0.00763861499945051
+        },
+        {
+          "name": "lcm_runtime::tf_tree_tests::canonical_tree_retains_history_and_drives_latest_inventory",
+          "passed": true,
+          "exit_code": 0,
+          "elapsed_sec": 0.007592975998704787
+        },
+        {
+          "name": "lcm_runtime::tf_tree_tests::canonical_tree_resolves_base_to_map_and_rejects_invalid_quaternion",
+          "passed": true,
+          "exit_code": 0,
+          "elapsed_sec": 0.015793366997968405
+        },
+        {
+          "name": "lcm_runtime::tf_tree_tests::semantic_base_candidates_accept_aliases_and_reject_foreign_namespaces",
+          "passed": true,
+          "exit_code": 0,
+          "elapsed_sec": 0.007603152000228874
+        },
+        {
+          "name": "server::lifecycle_tests::canonical_reset_new_start_clears_pose_but_replay_and_rejection_preserve_it",
+          "passed": true,
+          "exit_code": 0,
+          "elapsed_sec": 0.031798991996765835
+        },
+        {
+          "name": "server::lifecycle_tests::canonical_reset_cloud_activation_clears_pose_but_replay_and_rejection_preserve_it",
+          "passed": true,
+          "exit_code": 0,
+          "elapsed_sec": 0.031807715000468306
+        },
+        {
+          "name": "server::lifecycle_tests::canonical_reset_start_retains_lifecycle_until_reset_after_caller_cancel",
+          "passed": true,
+          "exit_code": 0,
+          "elapsed_sec": 0.032125153000379214
+        },
+        {
+          "name": "server::lifecycle_tests::canonical_reset_activation_retains_lifecycle_until_reset_after_caller_cancel",
+          "passed": true,
+          "exit_code": 0,
+          "elapsed_sec": 0.03213462699932279
+        },
+        {
+          "name": "lio_ingress::tests::in_process_deferred_replay_rechecks_admission_after_lifecycle_wait",
+          "passed": true,
+          "exit_code": 0,
+          "elapsed_sec": 0.06403014399984386
+        },
+        {
+          "name": "lio_ingress::tests::in_process_deferred_replay_checks_each_exact_claim_component",
+          "passed": true,
+          "exit_code": 0,
+          "elapsed_sec": 0.06415548299992224
+        },
+        {
+          "name": "lio_ingress::tests::in_process_deferred_replay_holds_lifecycle_through_odometry_handoff",
+          "passed": true,
+          "exit_code": 0,
+          "elapsed_sec": 0.031958796997059835
+        },
+        {
+          "name": "server::lifecycle_tests::legacy_cloud_seals_unbound_and_replays_without_republication",
+          "passed": true,
+          "exit_code": 0,
+          "elapsed_sec": 0.03187470700140693
+        },
+        {
+          "name": "server::lifecycle_tests::legacy_cloud_resumes_exact_retained_publication_unbound",
+          "passed": false,
+          "exit_code": 101,
+          "elapsed_sec": 0.03194389100099215
+        },
+        {
+          "name": "correction_coordinator::preflight_only_contract::tests::activation_ledger_legacy_cloud_seals_exact_proof_without_public_binding",
+          "passed": true,
+          "exit_code": 0,
+          "elapsed_sec": 0.015766365999297705
+        },
+        {
+          "name": "correction_coordinator::preflight_only_contract::tests::activation_ledger_legacy_cloud_rejects_missing_changed_and_cross_schema_receipts",
+          "passed": true,
+          "exit_code": 0,
+          "elapsed_sec": 0.0077007590007269755
+        },
+        {
+          "name": "correction_coordinator::preflight_only_contract::tests::activation_ledger_seals_replays_conflicts_and_permanently_retires",
+          "passed": true,
+          "exit_code": 0,
+          "elapsed_sec": 0.00764144899949315
+        },
+        {
+          "name": "correction_coordinator::preflight_only_contract::tests::activation_ledger_distinguishes_2d_from_lost_3d_target",
+          "passed": true,
+          "exit_code": 0,
+          "elapsed_sec": 0.0075926570025330875
+        },
+        {
+          "name": "correction_coordinator::preflight_only_contract::tests::assigned_ledger_sealed_replay_retains_one_owner_and_rejects_altered_source",
+          "passed": true,
+          "exit_code": 0,
+          "elapsed_sec": 0.007586723000713391
+        },
+        {
+          "name": "correction_coordinator::preflight_only_contract::tests::assigned_ledger_rejects_cross_schema_proof_and_installed_receipt_mismatch",
+          "passed": true,
+          "exit_code": 0,
+          "elapsed_sec": 0.007558746001450345
+        }
+      ],
+      "test_failures": [
+        {
+          "name": "server::lifecycle_tests::legacy_cloud_resumes_exact_retained_publication_unbound",
+          "output": "\nrunning 1 test\ntest server::lifecycle_tests::legacy_cloud_resumes_exact_retained_publication_unbound ... \nthread 'server::lifecycle_tests::legacy_cloud_resumes_exact_retained_publication_unbound' panicked at src/server.rs:11690:13:\nassertion `left == right` failed\n  left: [0, 0, 0, 3, 0, 0, 0, 24, 0, 0, 0, 1, 101, 83, 241, 0, 0, 0, 0, 0, 0, 0, 0, 4, 109, 97, 112, 0, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 2, 120, 0, 0, 0, 0, 0, 7, 0, 0, 0, 1, 0, 0, 0, 2, 121, 0, 0, 0, 0, 4, 7, 0, 0, 0, 1, 0, 0, 0, 2, 122, 0, 0, 0, 0, 8, 7, 0, 0, 0, 1, 0, 0, 0, 0, 12, 0, 0, 0, 24, 154, 153, 121, 63, 205, 204, 252, 63, 103, 102, 62, 64, 103, 102, 126, 64, 51, 51, 159, 64, 51, 51, 191, 64, 1]\n right: [0, 0, 0, 3, 0, 0, 0, 24, 0, 0, 0, 1, 101, 83, 241, 0, 0, 0, 0, 0, 0, 0, 0, 4, 109, 97, 112, 0, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 2, 120, 0, 0, 0, 0, 0, 7, 0, 0, 0, 1, 0, 0, 0, 2, 121, 0, 0, 0, 0, 4, 7, 0, 0, 0, 1, 0, 0, 0, 2, 122, 0, 0, 0, 0, 8, 7, 0, 0, 0, 1, 0, 0, 0, 0, 12, 0, 0, 0, 24, 0, 0, 128, 63, 0, 0, 0, 64, 0, 0, 64, 64, 0, 0, 128, 64, 0, 0, 160, 64, 0, 0, 192, 64, 1]\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\nFAILED\n\nfailures:\n\nfailures:\n    server::lifecycle_tests::legacy_cloud_resumes_exact_retained_publication_unbound\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1161 filtered out; finished in 0.01s\n\n"
+        }
+      ],
+      "compile_errors": []
+    },
+    {
+      "round": 2,
+      "compile_exit": 101,
+      "compile_elapsed_sec": 37.25917350999953,
+      "tested_overlay_tree": "24af70e54752174ce5ac3a36aaec1fc227818e68",
+      "binary_sha256": null,
+      "baseline_restored_bytes": true,
+      "baseline_git_status": "",
+      "baseline_tree": "fa4c24311a5d87bf09cd103ff66d3f4f2edf8269",
+      "native_cmake_caches_unchanged": true,
+      "tests_executed": 0,
+      "tests_passed": 0,
+      "tests": [],
+      "test_failures": [],
+      "compile_errors": [
+        "error[E0425]: cannot find value `target` in this scope\n    --> src/server.rs:2743:96\n     |\n2619 |         let _target = match service.activation_receipts.target_source(&token) {\n     |             ------- `_target` defined here\n...\n2743 |                     ActivationRequestKey::LegacyDigest(_) => crate::map_checksum::sha256_bytes(target.xyz_f32_le()).into(),\n     |                                                                                                ^^^^^^\n     |\nhelp: the leading underscore in `_target` marks it as unused, consider renaming it to `target`\n     |\n2619 -         let _target = match service.activation_receipts.target_source(&token) {\n2619 +         let target = match service.activation_receipts.target_source(&token) {\n     |"
+      ]
+    },
+    {
+      "round": 3,
+      "compile_exit": 0,
+      "compile_elapsed_sec": 35.72108617300182,
+      "tested_overlay_tree": "db20d039a8da94e523a9a398e3e537f3eef98c2f",
+      "binary_sha256": "54ca676f6ac45525f101a9ad65ff7783dcf84e505babd081308fabbc0b640c42",
+      "baseline_restored_bytes": true,
+      "baseline_git_status": "",
+      "baseline_tree": "fa4c24311a5d87bf09cd103ff66d3f4f2edf8269",
+      "native_cmake_caches_unchanged": true,
+      "tests_executed": 25,
+      "tests_passed": 25,
+      "tests": [
+        {
+          "name": "lcm_runtime::tf_tree_tests::canonical_localization_reset_clears_pose_full_history_and_mirror",
+          "passed": true,
+          "exit_code": 0,
+          "elapsed_sec": 0.015740041999379173
+        },
+        {
+          "name": "lcm_runtime::tf_tree_tests::canonical_localization_reset_notifies_even_when_pose_is_already_missing",
+          "passed": true,
+          "exit_code": 0,
+          "elapsed_sec": 0.007571602996904403
+        },
+        {
+          "name": "lcm_runtime::tf_tree_tests::canonical_localization_reset_reinstalls_only_explicit_sensor_descriptor",
+          "passed": true,
+          "exit_code": 0,
+          "elapsed_sec": 0.007658423000975745
+        },
+        {
+          "name": "lcm_runtime::tf_tree_tests::canonical_localization_reset_accepts_new_canonical_observation",
+          "passed": true,
+          "exit_code": 0,
+          "elapsed_sec": 0.007588187996589113
+        },
+        {
+          "name": "lcm_runtime::tf_tree_tests::canonical_tree_retains_history_and_drives_latest_inventory",
+          "passed": true,
+          "exit_code": 0,
+          "elapsed_sec": 0.007709229001193307
+        },
+        {
+          "name": "lcm_runtime::tf_tree_tests::canonical_tree_resolves_base_to_map_and_rejects_invalid_quaternion",
+          "passed": true,
+          "exit_code": 0,
+          "elapsed_sec": 0.007675108001421904
+        },
+        {
+          "name": "lcm_runtime::tf_tree_tests::semantic_base_candidates_accept_aliases_and_reject_foreign_namespaces",
+          "passed": true,
+          "exit_code": 0,
+          "elapsed_sec": 0.0077158599997346755
+        },
+        {
+          "name": "server::lifecycle_tests::canonical_reset_new_start_clears_pose_but_replay_and_rejection_preserve_it",
+          "passed": true,
+          "exit_code": 0,
+          "elapsed_sec": 0.031821036001929315
+        },
+        {
+          "name": "server::lifecycle_tests::canonical_reset_cloud_activation_clears_pose_but_replay_and_rejection_preserve_it",
+          "passed": true,
+          "exit_code": 0,
+          "elapsed_sec": 0.03194655499828514
+        },
+        {
+          "name": "server::lifecycle_tests::canonical_reset_start_retains_lifecycle_until_reset_after_caller_cancel",
+          "passed": true,
+          "exit_code": 0,
+          "elapsed_sec": 0.032071233003080124
+        },
+        {
+          "name": "server::lifecycle_tests::canonical_reset_activation_retains_lifecycle_until_reset_after_caller_cancel",
+          "passed": true,
+          "exit_code": 0,
+          "elapsed_sec": 0.03195910399881541
+        },
+        {
+          "name": "lio_ingress::tests::in_process_deferred_replay_rechecks_admission_after_lifecycle_wait",
+          "passed": true,
+          "exit_code": 0,
+          "elapsed_sec": 0.06410202499682782
+        },
+        {
+          "name": "lio_ingress::tests::in_process_deferred_replay_checks_each_exact_claim_component",
+          "passed": true,
+          "exit_code": 0,
+          "elapsed_sec": 0.0641016839981603
+        },
+        {
+          "name": "lio_ingress::tests::in_process_deferred_replay_holds_lifecycle_through_odometry_handoff",
+          "passed": true,
+          "exit_code": 0,
+          "elapsed_sec": 0.031986574998882134
+        },
+        {
+          "name": "server::lifecycle_tests::legacy_cloud_seals_unbound_and_replays_without_republication",
+          "passed": true,
+          "exit_code": 0,
+          "elapsed_sec": 0.03195136300200829
+        },
+        {
+          "name": "server::lifecycle_tests::legacy_cloud_resumes_exact_retained_publication_unbound",
+          "passed": true,
+          "exit_code": 0,
+          "elapsed_sec": 0.031981547002942534
+        },
+        {
+          "name": "correction_coordinator::preflight_only_contract::tests::activation_ledger_legacy_cloud_seals_exact_proof_without_public_binding",
+          "passed": true,
+          "exit_code": 0,
+          "elapsed_sec": 0.01590181600113283
+        },
+        {
+          "name": "correction_coordinator::preflight_only_contract::tests::activation_ledger_legacy_cloud_rejects_missing_changed_and_cross_schema_receipts",
+          "passed": true,
+          "exit_code": 0,
+          "elapsed_sec": 0.01581992200226523
+        },
+        {
+          "name": "correction_coordinator::preflight_only_contract::tests::activation_ledger_seals_replays_conflicts_and_permanently_retires",
+          "passed": true,
+          "exit_code": 0,
+          "elapsed_sec": 0.008187969000573503
+        },
+        {
+          "name": "correction_coordinator::preflight_only_contract::tests::activation_ledger_distinguishes_2d_from_lost_3d_target",
+          "passed": true,
+          "exit_code": 0,
+          "elapsed_sec": 0.0076517230008903425
+        },
+        {
+          "name": "correction_coordinator::preflight_only_contract::tests::assigned_ledger_sealed_replay_retains_one_owner_and_rejects_altered_source",
+          "passed": true,
+          "exit_code": 0,
+          "elapsed_sec": 0.007583220001833979
+        },
+        {
+          "name": "correction_coordinator::preflight_only_contract::tests::assigned_ledger_rejects_cross_schema_proof_and_installed_receipt_mismatch",
+          "passed": true,
+          "exit_code": 0,
+          "elapsed_sec": 0.007708949000516441
+        },
+        {
+          "name": "pointcloud::tests::materialized_snapshot_retains_existing_payload_without_exporting_and_commit_invalidates_cache",
+          "passed": true,
+          "exit_code": 0,
+          "elapsed_sec": 0.007678882997424807
+        },
+        {
+          "name": "server::lifecycle_tests::retained_legacy_frame_checks_current_receipt_and_never_replaces_capture",
+          "passed": true,
+          "exit_code": 0,
+          "elapsed_sec": 0.03190834199995152
+        },
+        {
+          "name": "server::assigned_activation_boundary_tests::assigned_publication_fence_retains_no_legacy_cloud_frame",
+          "passed": true,
+          "exit_code": 0,
+          "elapsed_sec": 0.015834334000828676
+        }
+      ],
+      "test_failures": [],
+      "compile_errors": []
+    }
+  ],
+  "limits": [
+    "No real network/LCM/hardware/sidecar execution",
+    "Default AR2 schema2 cloud save/load pairing remains incomplete and gated",
+    "No new application hash, cloud materialization, runtime cap or obstacle-check change",
+    "Legacy-unbound activation remains permanently ineligible for relocalization",
+    "Native pose midtransition and earlier startup readiness limitations remain"
+  ]
+}

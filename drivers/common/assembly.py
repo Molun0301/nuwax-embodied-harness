@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple, Any
+from typing import Any, Dict, Optional, Tuple
 
 from adapters.base import AdapterBase, AdapterConfig, AdapterHealthStatus
 from drivers.common.manifest import RobotDefaults, RobotManifest
@@ -87,6 +87,14 @@ class RobotAssemblyBase(ABC):
         """汇总全部适配器健康状态。"""
 
         return tuple(adapter.health_check() for adapter in self._adapter_registry.values())
+
+    def has_motion_actuator(self) -> Optional[bool]:
+        """Declare physical motion ownership: True, False, or unknown (None).
+
+        Availability and readiness are not evidence that an actuator is absent.
+        Assemblies must explicitly override this contract to prove absence.
+        """
+        return None
 
     @abstractmethod
     def start(self) -> None:

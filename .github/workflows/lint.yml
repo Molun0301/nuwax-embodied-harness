@@ -1,0 +1,107 @@
+name: lint
+
+# 平台分层、设备 Python 兼容与真实部署构建检查。
+#
+# 业务代码和配置的旧运行时残留统一由 scripts/ci/no_ros2_residual.sh
+# 与 scripts/check_layering.sh 检查。
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - 'feature/**'
+
+jobs:
+  guardrails:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # (a) 旧运行时残留守门
+      - name: 业务代码旧运行时残留守门
+        run: bash scripts/ci/no_ros2_residual.sh
+
+      # (b) 平台分层守门：services 顶层禁 import drivers（驱动实现与平台业务物理隔离）。
+      - name: 分层守门
+        run: bash scripts/check_layering.sh
+
+      # (c) PEP 604 union ast 检测
+      # 只扫本 change 新增 + 顶层 platform 代码；要求兼容实机 Py3.8.10，禁止 X | Y 写法。
+      - name: PEP 604 union 检测（实机 Py3.8.10 兼容）
+        run: python3 scripts/ci/check_pep604.py services/geometry/__init__.py services/geometry/loop_closure_state.py services/geometry/runtime.py services/geometry/external_debug_observer.py gateways scripts/deploy_installer install.py
+
+      # (d) 仅允许 .gitignore 明确放行的 fixture / mock / integration 回归文件。
+      - name: 测试文件入仓范围
+        run: |
+          check_dir=$(mktemp -d)
+          trap 'rm -rf -- "$check_dir"' EXIT
+          git ls-files -z -- tests/fixtures/ tests/mocks/ tests/integration/ > "$check_dir/tracked" || {
+            status=$?
+            echo "无法枚举已跟踪测试文件"
+            exit "$status"
+          }
+          if git check-ignore --no-index -z --stdin < "$check_dir/tracked" > "$check_dir/ignored"; then
+            status=0
+          else
+            status=$?
+          fi
+          case "$status" in
+            0)
+              echo "测试文件入仓拦截：以下文件仍被 .gitignore 忽略"
+              while IFS= read -r -d '' path; do
+                printf '%s\n' "$path"
+              done < "$check_dir/ignored"
+              exit 1
+              ;;
+            1) ;; # 无忽略命中：现有路径均获准入仓。
+            *)
+              echo "测试文件忽略规则检查失败（退出码：$status）"
+              exit "$status"
+              ;;
+          esac
+
+  deployment-installer:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.8'
+
+      - name: 安装部署检查工具
+        run: |
+          python3 -m pip install 'pip==25.0.1'
+          python3 -m pip install 'ruff==0.9.10' 'pydantic==2.10.6' 'lcm==1.5.2'
+          lcm-gen --version
+          python3 - <<'PY'
+          import os, shutil
+          with open(os.environ['GITHUB_ENV'], 'a') as output:
+              output.write('LCM_GEN_EXECUTABLE=' + shutil.which('lcm-gen') + '\n')
+          PY
+
+      - name: 安装 native build 前置依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends liblcm-dev pkg-config protobuf-compiler libboost-all-dev libeigen3-dev libpcl-dev
+
+      - name: 安装 Rust 1.88.0
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal
+          rustup default 1.88.0
+
+      - name: 一键部署契约
+        run: bash scripts/ci/check_deployment_installer.sh
+
+      - name: Rust production build contracts
+        run: |
+          cargo +1.88.0 check --locked --manifest-path services/nuwax-workspace/Cargo.toml \
+            --package nuwax-nav-stack --bin nuwax-nav-stack \
+            --features simple-2d,replanning-astar
+          cargo +1.88.0 check --locked --manifest-path services/nuwax-workspace/Cargo.toml \
+            --package nuwax-nav-visual-servoing --bin nuwax-person-follow \
+            --features link-liblcm
+          cargo +1.88.0 check --locked \
+            --manifest-path services/geometry/nuwax_geometry_runtime/Cargo.toml \
+            --bin nuwax-geometry-runtime

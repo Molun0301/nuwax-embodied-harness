@@ -1,0 +1,9 @@
+[package]
+name = "nuwax-slam-toolbox-sys"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+links = "nuwax_slam_toolbox"
+license-file = "native/NOTICE"
+description = "独立二维扫描匹配与图优化的原生接口"

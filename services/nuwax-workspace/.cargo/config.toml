@@ -1,0 +1,26 @@
+# nuwax-workspace cargo 配置
+# 选型依据：docs/开发文档/Ralplan/2026-07-01_彻底去ROS2化-执行方案/00b_开源库选型对比矩阵.md §0.4
+
+# aarch64-unknown-linux-gnu 交叉编译（C3）
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+ar = "aarch64-linux-gnu-ar"
+
+# 共享构建优化
+[build]
+# 启用增量编译加速本地 dev
+incremental = true
+
+# 全 workspace Lint 配置（C7 RMW 独立性 + 全 lint 通过）
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# 禁用 clippy 误报项
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"

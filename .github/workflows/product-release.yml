@@ -1,0 +1,192 @@
+name: NEH正式构建与发布
+
+on:
+  push:
+    branches: [main]
+    tags: ['v[0-9]*']
+    paths: ['.github/release.json']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 留空使用.github/release.json中的版本
+        type: string
+        required: false
+      targets:
+        description: 留空使用完整配置；覆盖时为逗号分隔目标:预设
+        type: string
+        required: false
+      channel:
+        description: 发布渠道
+        type: choice
+        options: [configured, stable, preview]
+        default: configured
+      publish:
+        description: 所有目标通过后正式公开完整版本
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: neh-product-release
+  cancel-in-progress: false
+
+env:
+  PYTHONPATH: ''
+  PYTHONHOME: ''
+  PYTHONNOUSERSITE: '1'
+  LD_LIBRARY_PATH: ''
+  PKG_CONFIG_PATH: ''
+  CMAKE_PREFIX_PATH: ''
+  PIP_CONFIG_FILE: /dev/null
+  PIP_INDEX_URL: https://pypi.org/simple
+  PIP_EXTRA_INDEX_URL: ''
+  GIT_OPTIONAL_LOCKS: '0'
+  NEH_RELEASE_STREAM_LOG: '1'
+
+jobs:
+  select:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      version: ${{ steps.plan.outputs.version }}
+      publish: ${{ steps.plan.outputs.publish }}
+      already_published: ${{ steps.plan.outputs.already_published }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - id: plan
+        name: 固定版本和全部发布目标
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: /usr/bin/python3 -m scripts.product_release.ci select --output "$RUNNER_TEMP/neh-plan/request.json"
+      - name: 源码准入检查
+        if: steps.plan.outputs.already_published != 'true'
+        run: |
+          bash scripts/ci/no_ros2_residual.sh
+          bash scripts/check_layering.sh
+          /usr/bin/python3 scripts/ci/check_pep604.py scripts/product_release scripts/device_manager scripts/neh_bootstrap.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: neh-release-request
+          path: ${{ runner.temp }}/neh-plan/request.json
+          if-no-files-found: error
+
+  build:
+    needs: select
+    if: needs.select.outputs.already_published != 'true'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.select.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: neh-release-request
+          path: ${{ runner.temp }}/neh-plan
+      - name: 为原生构建释放托管执行器空间
+        run: |
+          # 仅作用于本次临时执行器；这些预装工具不参与NEH构建。
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+          df -h "$RUNNER_TEMP"
+      - name: 安装目标系统构建依赖
+        if: matrix.container == ''
+        env:
+          NEH_BUILD_GROUP: ${{ matrix.id }}
+        run: |
+          /usr/bin/python3 -m scripts.product_release.ci packages --request "$RUNNER_TEMP/neh-plan/request.json" --group "$NEH_BUILD_GROUP" > "$RUNNER_TEMP/neh-packages.txt"
+          sudo apt-get update
+          /usr/bin/python3 - <<'PY'
+          import os, pathlib, subprocess
+          packages = (pathlib.Path(os.environ['RUNNER_TEMP']) / 'neh-packages.txt').read_text().split()
+          subprocess.run(['sudo', 'apt-get', 'install', '-y', '--no-install-recommends', *packages], check=True)
+          PY
+          /usr/bin/python3 --version
+          /usr/bin/python3 -m pip --version
+          rustup toolchain install 1.88.0 --profile minimal
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ${{ runner.temp }}/neh-cache/${{ matrix.id }}
+          key: neh-${{ runner.os }}-${{ runner.arch }}-${{ matrix.id }}-${{ hashFiles('requirements/**/*.in', 'services/**/Cargo.lock', 'services/**/flake.lock', 'scripts/module_installer/builds.py') }}
+          restore-keys: |
+            neh-${{ runner.os }}-${{ runner.arch }}-${{ matrix.id }}-
+      - id: compile
+        name: 在真实目标用户态编译程序并生成轻量包
+        env:
+          NEH_BUILD_GROUP: ${{ matrix.id }}
+          NEH_BUILD_CONTAINER: ${{ matrix.container }}
+        run: |
+          if [[ -n "$NEH_BUILD_CONTAINER" ]]; then
+            /usr/bin/python3 -m scripts.product_release.ci container --request "$RUNNER_TEMP/neh-plan/request.json" --group "$NEH_BUILD_GROUP" --output "$RUNNER_TEMP/neh-build-$NEH_BUILD_GROUP" --cache "$RUNNER_TEMP/neh-cache/$NEH_BUILD_GROUP"
+          else
+            /usr/bin/python3 -m scripts.product_release.ci build --request "$RUNNER_TEMP/neh-plan/request.json" --group "$NEH_BUILD_GROUP" --output "$RUNNER_TEMP/neh-build-$NEH_BUILD_GROUP" --cache "$RUNNER_TEMP/neh-cache/$NEH_BUILD_GROUP"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: neh-build-${{ matrix.id }}
+          path: |
+            ${{ steps.compile.outputs.files }}
+            ${{ runner.temp }}/neh-build-${{ matrix.id }}.work/build.log
+            ${{ runner.temp }}/neh-build-${{ matrix.id }}.work/result.json
+            ${{ runner.temp }}/neh-build-${{ matrix.id }}.work/smoke/离线验证结果.json
+            ${{ runner.temp }}/neh-build-${{ matrix.id }}.work/go2-cache/verification.json
+          if-no-files-found: warn
+
+  assemble:
+    needs: [select, build]
+    if: needs.select.outputs.already_published != 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: neh-release-request
+          path: ${{ runner.temp }}/neh-plan
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: neh-build-*
+          path: ${{ runner.temp }}/neh-downloads
+          merge-multiple: false
+      - name: 核对全部目标、独立依赖并合并历史目录
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: /usr/bin/python3 -m scripts.product_release.ci assemble --request "$RUNNER_TEMP/neh-plan/request.json" --downloads "$RUNNER_TEMP/neh-downloads" --output "$RUNNER_TEMP/neh-release"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: neh-release-${{ needs.select.outputs.version }}
+          path: ${{ runner.temp }}/neh-release/*
+          if-no-files-found: error
+
+  publish:
+    needs: [select, assemble]
+    if: needs.select.outputs.publish == 'true' && needs.select.outputs.already_published != 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: neh-release-request
+          path: ${{ runner.temp }}/neh-plan
+      - uses: actions/download-artifact@v4
+        with:
+          name: neh-release-${{ needs.select.outputs.version }}
+          path: ${{ runner.temp }}/neh-release
+      - name: 先完整上传并校验草稿，再公开正式版本
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: /usr/bin/python3 -m scripts.product_release.ci publish --request "$RUNNER_TEMP/neh-plan/request.json" --directory "$RUNNER_TEMP/neh-release"

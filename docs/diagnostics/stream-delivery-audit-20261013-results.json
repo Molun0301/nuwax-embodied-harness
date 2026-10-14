@@ -1,0 +1,145 @@
+{
+  "python": "3.8.10",
+  "fixture_trajectory_poses": 100,
+  "results": [
+    {
+      "case": "trajectory",
+      "mode": "direct_cpu",
+      "clients": 1,
+      "calls_per_publication": 1,
+      "wire_bytes": 15106,
+      "median_ms": 0.2185199991799891,
+      "p95_ms": 0.3568780011846684,
+      "max_ms": 0.41574799979571253
+    },
+    {
+      "case": "trajectory",
+      "mode": "direct_cpu",
+      "clients": 4,
+      "calls_per_publication": 4,
+      "wire_bytes": 15106,
+      "median_ms": 0.8574745006626472,
+      "p95_ms": 1.0169149973080494,
+      "max_ms": 1.1687840014928952
+    },
+    {
+      "case": "trajectory",
+      "mode": "direct_cpu",
+      "clients": 8,
+      "calls_per_publication": 8,
+      "wire_bytes": 15106,
+      "median_ms": 1.7166715006169397,
+      "p95_ms": 2.054241002042545,
+      "max_ms": 3.3157090001623146
+    },
+    {
+      "case": "task_progress",
+      "mode": "direct_cpu",
+      "clients": 1,
+      "calls_per_publication": 1,
+      "wire_bytes": 653,
+      "median_ms": 0.35725949965126347,
+      "p95_ms": 0.4205350014672149,
+      "max_ms": 0.5182919994695112
+    },
+    {
+      "case": "task_progress",
+      "mode": "direct_cpu",
+      "clients": 4,
+      "calls_per_publication": 4,
+      "wire_bytes": 653,
+      "median_ms": 1.3886010001442628,
+      "p95_ms": 1.9184860029781703,
+      "max_ms": 2.2105070020188577
+    },
+    {
+      "case": "task_progress",
+      "mode": "direct_cpu",
+      "clients": 8,
+      "calls_per_publication": 8,
+      "wire_bytes": 653,
+      "median_ms": 2.9429425012494903,
+      "p95_ms": 4.949460999341682,
+      "max_ms": 7.983981999132084
+    },
+    {
+      "case": "robot_32_items",
+      "mode": "direct_cpu",
+      "clients": 1,
+      "calls_per_publication": 1,
+      "wire_bytes": 1483,
+      "median_ms": 2.1704509999835864,
+      "p95_ms": 2.516768996429164,
+      "max_ms": 3.836541000055149
+    },
+    {
+      "case": "robot_32_items",
+      "mode": "direct_cpu",
+      "clients": 4,
+      "calls_per_publication": 4,
+      "wire_bytes": 1483,
+      "median_ms": 8.994732501378166,
+      "p95_ms": 10.331395002140198,
+      "max_ms": 14.173383999150246
+    },
+    {
+      "case": "robot_32_items",
+      "mode": "direct_cpu",
+      "clients": 8,
+      "calls_per_publication": 8,
+      "wire_bytes": 1483,
+      "median_ms": 17.788366500099073,
+      "p95_ms": 19.34695400268538,
+      "max_ms": 21.026850001362618
+    },
+    {
+      "case": "task_progress",
+      "mode": "gateway_threadpool_fanout",
+      "clients": 1,
+      "median_ms": 0.6529610000143293,
+      "p95_ms": 1.0220879994449206,
+      "max_ms": 5.974687999696471
+    },
+    {
+      "case": "task_progress",
+      "mode": "gateway_threadpool_fanout",
+      "clients": 4,
+      "median_ms": 2.5712014994496712,
+      "p95_ms": 2.9581749986391515,
+      "max_ms": 3.2111569998960476
+    },
+    {
+      "case": "task_progress",
+      "mode": "gateway_threadpool_fanout",
+      "clients": 8,
+      "median_ms": 5.030149000958772,
+      "p95_ms": 5.996480998874176,
+      "max_ms": 7.377987996733282
+    },
+    {
+      "case": "robot_32_items",
+      "mode": "gateway_threadpool_fanout",
+      "clients": 1,
+      "median_ms": 2.6437814995006192,
+      "p95_ms": 3.0023630024516024,
+      "max_ms": 3.4055059986712877
+    },
+    {
+      "case": "robot_32_items",
+      "mode": "gateway_threadpool_fanout",
+      "clients": 4,
+      "median_ms": 10.798120498293429,
+      "p95_ms": 12.077693001629086,
+      "max_ms": 12.7807640019455
+    },
+    {
+      "case": "robot_32_items",
+      "mode": "gateway_threadpool_fanout",
+      "clients": 8,
+      "median_ms": 21.502680001503904,
+      "p95_ms": 26.588366999931168,
+      "max_ms": 28.295454998442437
+    }
+  ],
+  "mutable_input_regressions": "trajectory nested pose and RuntimeEvent payload changes are visible on next encoding"
+}

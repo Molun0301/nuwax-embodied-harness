@@ -1,0 +1,9 @@
+[Unit]
+Description=NuwaX 设置重启请求
+
+[Path]
+PathExists=@NUWAX_REPO_ROOT@/runtime_data/settings/restart.request
+Unit=nuwax-settings-apply.service
+
+[Install]
+WantedBy=multi-user.target

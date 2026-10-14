@@ -1,0 +1,2677 @@
+{
+  "NUWAX_PERSON_FOLLOW_AUTOSTART": {
+    "zh_name": "自动启动 person-follow",
+    "type": "bool",
+    "default": true,
+    "section_id": "nav_stack",
+    "target_file": "core_env",
+    "consumers": [
+      "gateways/person_follow.py",
+      "scripts/install_motion_guard_deployment.sh",
+      "scripts/start_gateway.sh"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "是否由 gateway 启动 person-follow 独立进程。"
+  },
+  "NUWAX_PERSON_FOLLOW_READY_FILE": {
+    "zh_name": "person-follow ready 文件",
+    "type": "str",
+    "default": "runtime_data/person-follow/nuwax_person_follow.ready",
+    "section_id": "nav_stack",
+    "target_file": "core_env",
+    "consumers": [
+      "gateways/person_follow.py",
+      "scripts/install_motion_guard_deployment.sh",
+      "scripts/start_gateway.sh",
+      "scripts/systemd/activate_geometry_runtime.sh",
+      "scripts/systemd/start_person_follow.sh",
+      "scripts/systemd/wait_for_person_follow_ready.sh"
+    ],
+    "apply_scope": "重启网关、人物跟随后端后生效",
+    "description": "person-follow typed subscription readiness marker；production systemd 固定 /run/nuwax/person-follow/nuwax_person_follow.ready。"
+  },
+  "NUWAX_PERSON_FOLLOW_START_TIMEOUT_SEC": {
+    "zh_name": "person-follow 启动超时（秒）",
+    "type": "int",
+    "default": 15,
+    "section_id": "nav_stack",
+    "target_file": "core_env",
+    "consumers": [
+      "scripts/systemd/activate_geometry_runtime.sh",
+      "scripts/systemd/wait_for_person_follow_ready.sh"
+    ],
+    "apply_scope": "重启相关服务后生效",
+    "description": "等待 person-follow typed subscription readiness 的最大秒数（默认 15）。"
+  },
+  "NUWAX_PERSON_FOLLOW_WARMUP_STEPS": {
+    "zh_name": "人物跟随订阅准备检查次数",
+    "type": "int",
+    "default": 150,
+    "section_id": "nav_stack",
+    "target_file": "core_env",
+    "consumers": [
+      "scripts/systemd/start_person_follow.sh"
+    ],
+    "apply_scope": "重启人物跟随后端后生效",
+    "description": "person-follow binary 发布内部 subscription-ready marker 的最大 100ms 检查次数（默认 150）。"
+  },
+  "NUWAX_GEOMETRY_POSE_TOPIC": {
+    "zh_name": "几何位姿话题",
+    "type": "str",
+    "default": "/go2/pose_map",
+    "section_id": "geometry_topics",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/external_debug_observer.py"
+    ],
+    "apply_scope": "重启相关服务后生效",
+    "description": ""
+  },
+  "NUWAX_GEOMETRY_RUNTIME_HEALTH_TIMEOUT": {
+    "zh_name": "几何健康检查超时（秒）",
+    "type": "int",
+    "default": 30,
+    "section_id": "geometry_runtime",
+    "target_file": "core_env",
+    "consumers": [
+      "scripts/bootstrap.py",
+      "scripts/systemd/activate_geometry_runtime.sh",
+      "scripts/systemd/start_geometry_runtime.sh",
+      "scripts/systemd/wait_for_geometry_runtime_ready.sh",
+      "services/geometry/nuwax_geometry_runtime/src/main.rs"
+    ],
+    "apply_scope": "重启几何运行时后生效",
+    "description": "几何 runtime·健康超时秒数（默认 30,real-lcm fail-fast 等待 ready_file 的最大秒数）"
+  },
+  "NUWAX_MAPPING_HEIGHT_CELLS": {
+    "zh_name": "栅格高度（格）",
+    "type": "int",
+    "default": 200,
+    "section_id": "mapping",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/nuwax_geometry_runtime/src/mapping_adapter.rs"
+    ],
+    "apply_scope": "重启几何运行时后生效",
+    "description": "nuwax-mapping 适配器·栅格高度(像素,默认 200)"
+  },
+  "NUWAX_MAPPING_INITIAL_SAFE_RADIUS_METERS": {
+    "zh_name": "初始安全半径（米）",
+    "type": "float",
+    "default": 0.0,
+    "section_id": "mapping",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/nuwax_geometry_runtime/src/mapping_adapter.rs"
+    ],
+    "apply_scope": "重启几何运行时后生效",
+    "description": ""
+  },
+  "NUWAX_MAPPING_ORIGIN_X": {
+    "zh_name": "栅格原点 X（米）",
+    "type": "float",
+    "default": -5.0,
+    "section_id": "mapping",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/nuwax_geometry_runtime/src/mapping_adapter.rs"
+    ],
+    "apply_scope": "重启几何运行时后生效",
+    "description": "nuwax-mapping 适配器·栅格原点 X(米,默认 -5.0)"
+  },
+  "NUWAX_MAPPING_ORIGIN_Y": {
+    "zh_name": "栅格原点 Y（米）",
+    "type": "float",
+    "default": -5.0,
+    "section_id": "mapping",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/nuwax_geometry_runtime/src/mapping_adapter.rs"
+    ],
+    "apply_scope": "重启几何运行时后生效",
+    "description": "nuwax-mapping 适配器·栅格原点 Y(米,默认 -5.0)"
+  },
+  "NUWAX_MAPPING_RESOLUTION": {
+    "zh_name": "栅格分辨率（米）",
+    "type": "float",
+    "default": 0.05,
+    "section_id": "mapping",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/nuwax_geometry_runtime/src/mapping_adapter.rs"
+    ],
+    "apply_scope": "重启几何运行时后生效",
+    "description": "nuwax-mapping 适配器·栅格分辨率(米/像素,默认 0.05)"
+  },
+  "NUWAX_MAPPING_VOXEL_SIZE": {
+    "zh_name": "旧建图适配器体素声明",
+    "type": "float",
+    "default": 0.05,
+    "section_id": "mapping",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/nuwax_geometry_runtime/src/mapping_adapter.rs"
+    ],
+    "apply_scope": "仅兼容保存，当前内置执行链不使用",
+    "description": "保留旧配置导入导出；当前内置点云执行链不消费此值，重启也不会启用。实际精细地图分辨率以当前地图元数据为准。",
+    "effective_value_scope": "inactive"
+  },
+  "NUWAX_MAPPING_WIDTH_CELLS": {
+    "zh_name": "栅格宽度（格）",
+    "type": "int",
+    "default": 200,
+    "section_id": "mapping",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/nuwax_geometry_runtime/src/mapping_adapter.rs"
+    ],
+    "apply_scope": "重启几何运行时后生效",
+    "description": "nuwax-mapping 适配器·栅格宽度(像素,默认 200)"
+  },
+  "NUWAX_NAV_STACK_READY_FILE": {
+    "zh_name": "导航栈 ready 文件",
+    "type": "str",
+    "default": "runtime_data/navigation/nuwax_nav_stack.ready",
+    "section_id": "nav_stack",
+    "target_file": "core_env",
+    "consumers": [
+      "scripts/bootstrap.py",
+      "scripts/diagnostics/check_nuwax_runtime.sh",
+      "scripts/install_motion_guard_deployment.sh",
+      "scripts/start_gateway.sh",
+      "scripts/systemd/activate_geometry_runtime.sh",
+      "scripts/systemd/start_nav_stack.sh",
+      "scripts/systemd/wait_for_nav_stack_ready.sh"
+    ],
+    "apply_scope": "重启导航后端后生效",
+    "description": ""
+  },
+  "NUWAX_NAV_STACK_START_TIMEOUT_SEC": {
+    "zh_name": "导航栈启动超时（秒）",
+    "type": "int",
+    "default": 15,
+    "section_id": "nav_stack",
+    "target_file": "core_env",
+    "consumers": [
+      "scripts/systemd/activate_geometry_runtime.sh",
+      "scripts/systemd/wait_for_nav_stack_ready.sh"
+    ],
+    "apply_scope": "重启相关服务后生效",
+    "description": ""
+  },
+  "NUWAX_FORBIDDEN_ZONES_PATH": {
+    "zh_name": "禁行区数据文件",
+    "type": "str",
+    "default": "runtime_data/navigation/forbidden_zones.json",
+    "section_id": "shm_uds",
+    "target_file": "core_env",
+    "consumers": [
+      "scripts/bootstrap.py",
+      "scripts/deploy_installer/operations.py",
+      "services/geometry/nuwax_geometry_runtime/src/forbidden_zones.rs",
+      "services/geometry/nuwax_geometry_runtime/src/lcm_runtime.rs",
+      "services/navigation/forbidden_zones.py"
+    ],
+    "apply_scope": "重启网关、几何运行时后生效",
+    "description": "地图级禁行区 JSON 文件路径（Gateway 原子写，Geometry Runtime 监听）"
+  },
+  "NUWAX_VIDEO_SHM_PATH": {
+    "zh_name": "视频共享内存路径",
+    "type": "str",
+    "default": "/tmp/nuwax_video.shm",
+    "section_id": "shm_uds",
+    "target_file": "core_env",
+    "consumers": [
+      "gateways/runtime.py",
+      "gateways/ws/data_streams.py",
+      "services/geometry/geometry_runtime_client.py",
+      "services/geometry/nuwax_geometry_runtime/src/main.rs"
+    ],
+    "apply_scope": "重启网关、几何运行时后生效",
+    "description": "视频接收方与几何运行时共用的共享内存文件路径。"
+  },
+  "NUWAX_VIDEO_UDS_PATH": {
+    "zh_name": "视频本地套接字路径",
+    "type": "str",
+    "default": "/tmp/nuwax_video.sock",
+    "section_id": "shm_uds",
+    "target_file": "core_env",
+    "consumers": [
+      "drivers/go2/video_streamer.py",
+      "scripts/install_motion_guard_deployment.sh",
+      "services/geometry/geometry_runtime_client.py",
+      "services/geometry/nuwax_geometry_runtime/src/main.rs"
+    ],
+    "apply_scope": "重启网关、几何运行时、Go2 视频进程后生效",
+    "description": "视频发送方连接几何运行时的本地套接字路径。"
+  },
+  "NUWAX_OSM_TILE_URL_TEMPLATE": {
+    "zh_name": "OpenStreetMap 瓦片地址模板",
+    "type": "str",
+    "default": "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+    "section_id": "mapping",
+    "target_file": "core_env",
+    "consumers": [
+      "services/nuwax-workspace/crates/nuwax-mapping-cloud/src/osm.rs"
+    ],
+    "apply_scope": "重启相关服务后生效",
+    "description": "OpenStreetMap 瓦片 URL 模板；由 nuwax-mapping-cloud 直接读取。"
+  },
+  "NUWAX_NOMINATIM_URL": {
+    "zh_name": "Nominatim 检索地址",
+    "type": "str",
+    "default": "https://nominatim.openstreetmap.org/search",
+    "section_id": "mapping",
+    "target_file": "core_env",
+    "consumers": [
+      "services/nuwax-workspace/crates/nuwax-mapping-cloud/src/osm.rs"
+    ],
+    "apply_scope": "重启相关服务后生效",
+    "description": "Nominatim 搜索端点；由 nuwax-mapping-cloud 直接读取。"
+  },
+  "NUWAX_OSM_USER_AGENT": {
+    "zh_name": "开放地图请求标识",
+    "type": "str",
+    "default": "nuwax-mapping-cloud/0.1",
+    "section_id": "mapping",
+    "target_file": "core_env",
+    "consumers": [
+      "services/nuwax-workspace/crates/nuwax-mapping-cloud/src/osm.rs"
+    ],
+    "apply_scope": "重启相关服务后生效",
+    "description": "OpenStreetMap/Nominatim 请求 User-Agent。"
+  },
+  "NUWAX_GOOGLE_MAPS_API_KEY": {
+    "zh_name": "Google Maps API 密钥",
+    "type": "str",
+    "default": "",
+    "section_id": "mapping",
+    "target_file": "core_env",
+    "consumers": [
+      "services/nuwax-workspace/crates/nuwax-mapping-cloud/src/google_maps.rs"
+    ],
+    "apply_scope": "重启相关服务后生效",
+    "description": "地图云·Google Maps API Key（Rust crate 自管,Python 端不消费；空值禁用云端瓦片）",
+    "aliases": [
+      "GOOGLE_MAPS_API_KEY"
+    ]
+  },
+  "NUWAX_GEOMETRY_GRPC_READ_DEADLINE_SEC": {
+    "zh_name": "几何查询超时（秒）",
+    "type": "float",
+    "default": 2.0,
+    "section_id": "geometry_runtime",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/geometry_runtime_provider.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": ""
+  },
+  "NUWAX_GEOMETRY_GRPC_POSE_DEADLINE_SEC": {
+    "zh_name": "位姿查询超时（秒）",
+    "type": "float",
+    "default": 5.0,
+    "section_id": "geometry_runtime",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/geometry_runtime_provider.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": ""
+  },
+  "NUWAX_GEOMETRY_GRPC_HEAVY_DEADLINE_SEC": {
+    "zh_name": "大地图查询超时（秒）",
+    "type": "float",
+    "default": 10.0,
+    "section_id": "geometry_runtime",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/geometry_runtime_provider.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": ""
+  },
+  "NUWAX_GEOMETRY_GRPC_MAX_MESSAGE_BYTES": {
+    "zh_name": "几何通信最大消息（字节）",
+    "type": "int",
+    "default": 134217728,
+    "section_id": "geometry_runtime",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/geometry_runtime_provider.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": ""
+  },
+  "NUWAX_GEOMETRY_GRPC_STREAM_RETRY_SEC": {
+    "zh_name": "几何数据流重连间隔（秒）",
+    "type": "float",
+    "default": 1.0,
+    "section_id": "geometry_runtime",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/geometry_runtime_provider.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": ""
+  },
+  "NUWAX_GEOMETRY_GRPC_STREAM_RETRY_MAX_SEC": {
+    "zh_name": "几何数据流最大重连间隔（秒）",
+    "type": "float",
+    "default": 8.0,
+    "section_id": "geometry_runtime",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/geometry_runtime_provider.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": ""
+  },
+  "NUWAX_GEOMETRY_EXPLORATION_POLL_SEC": {
+    "zh_name": "探索状态查询间隔（秒）",
+    "type": "float",
+    "default": 0.5,
+    "section_id": "geometry_runtime",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/geometry_runtime_provider.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": ""
+  },
+  "NUWAX_GEOMETRY_RUNTIME_ATTACH_HEALTH_TIMEOUT_SEC": {
+    "zh_name": "连接运行时健康检查超时（秒）",
+    "type": "float",
+    "default": 2.0,
+    "section_id": "geometry_runtime",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/geometry_runtime_client.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": ""
+  },
+  "NUWAX_GEOMETRY_NATIVE_LIO_FIRST_PAIR_TIMEOUT_MS": {
+    "zh_name": "原生定位首对数据等待时间（毫秒）",
+    "type": "int",
+    "default": 10000,
+    "section_id": "geometry_runtime",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/nuwax_geometry_runtime/src/native_lio_owner.rs"
+    ],
+    "apply_scope": "重启几何运行时后生效",
+    "description": ""
+  },
+  "NUWAX_GEOMETRY_NATIVE_LIO_PAIR_MAX_SKEW_MS": {
+    "zh_name": "原生定位输出位姿与点云配对时间差（毫秒）",
+    "type": "int",
+    "default": 100,
+    "section_id": "geometry_runtime",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/nuwax_geometry_runtime/src/native_lio_owner.rs"
+    ],
+    "apply_scope": "重启几何运行时后生效",
+    "description": "约束原生输出位姿与点云的关联；不是输入IMU与雷达的时间偏移，也不改变惯性积分。"
+  },
+  "NUWAX_GEOMETRY_LIO_SCAN_VOXEL_SIZE_M": {
+    "zh_name": "原生定位扫描体素边长（米）",
+    "type": "float",
+    "default": "",
+    "section_id": "localization",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/nuwax_geometry_runtime/src/native_lio_owner.rs",
+      "services/nuwax-workspace/crates/nuwax-lio-backends/src/native.rs"
+    ],
+    "apply_scope": "重启几何运行时及其原生定位进程后生效；停止建图不会重载",
+    "description": "原生激光惯性算法的扫描下采样体素边长，以米填写正数；留空保留所选后端默认值。不是平台点云或地图栅格分辨率。"
+  },
+  "NUWAX_GEOMETRY_LIO_MAP_VOXEL_SIZE_M": {
+    "zh_name": "原生定位地图插入体素边长（米）",
+    "type": "float",
+    "default": "",
+    "section_id": "localization",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/nuwax_geometry_runtime/src/native_lio_owner.rs",
+      "services/nuwax-workspace/crates/nuwax-lio-backends/src/native.rs"
+    ],
+    "apply_scope": "重启几何运行时及其原生定位进程后生效；停止建图不会重载",
+    "description": "原生算法的地图点插入筛选尺度，以米填写正数；留空保留后端默认值。PointLIO（逐点激光惯性里程计）中不改变iVox（增量体素地图）的索引格大小，也不是平台地图体素。"
+  },
+  "NUWAX_GEOMETRY_LIO_INITIAL_MAP_FRAMES": {
+    "zh_name": "原生定位初图最少有效扫描数（帧）",
+    "type": "int",
+    "default": "",
+    "section_id": "localization",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/nuwax_geometry_runtime/src/native_lio_owner.rs",
+      "services/nuwax-workspace/crates/nuwax-lio-backends/src/native.rs"
+    ],
+    "apply_scope": "重启几何运行时及其原生定位进程后生效；停止建图不会重载",
+    "description": "初始匹配地图至少累计的有效扫描数，填写正整数；增大会延长首次位姿等待，留空保留后端默认策略。PointLIO（逐点激光惯性里程计）还须满足原有初图点数下限，其多帧积累以静止初始化为前提。"
+  },
+  "NUWAX_GEOMETRY_LIO_BODY_FROM_SENSOR": {
+    "zh_name": "激光雷达到机体外参",
+    "type": "str",
+    "default": "",
+    "section_id": "geometry_runtime",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/nuwax_geometry_runtime/src/native_lio_owner.rs",
+      "drivers/go2/settings.py",
+      "drivers/go2/data_plane.py"
+    ],
+    "apply_scope": "重启机器人数据面及几何运行时后生效；停止建图或数据断线重连不会重载",
+    "description": "仅对FastLIO2（快速激光惯性定位）和PointLIO（逐点激光惯性定位）生效，设备自带建图不使用此覆盖。单行 JSON（结构化文本），必须完整包含 translation_m（三维平移，米）和 rotation_row_major（按行排列的九个正交旋转矩阵元素），将雷达坐标转换到机体，来自实际标定。Go2数据面创建时与惯性外参共同捕获；数据面留空沿用模型默认，原生定位仍要求明确提供有效外参。"
+  },
+  "NUWAX_GEOMETRY_LIO_BODY_FROM_IMU": {
+    "zh_name": "惯性传感器到机体外参",
+    "type": "str",
+    "default": "",
+    "section_id": "geometry_runtime",
+    "target_file": "core_env",
+    "consumers": [
+      "drivers/go2/settings.py",
+      "drivers/go2/data_plane.py"
+    ],
+    "apply_scope": "重启机器人数据面及几何运行时后生效；停止建图或数据断线重连不会重载",
+    "description": "仅对FastLIO2（快速激光惯性定位）和PointLIO（逐点激光惯性定位）生效，设备自带建图不使用此覆盖。单行 JSON（结构化文本），必须完整包含 translation_m（三维平移，米）和 rotation_row_major（按行排列的九个正交旋转矩阵元素），将惯性传感器坐标转换到机体，来自实际标定。Go2数据面与雷达外参共同捕获，留空沿用模型默认；加速度和角速度只应用旋转，平移不作用于向量。 Point原生后端要求显式提供此标定：平移用于估计参考原点及机体位姿/速度换算，不能以雷达安装位置代替。"
+  },
+  "NUWAX_GEOMETRY_NATIVE_LIO_EXECUTABLE": {
+    "zh_name": "原生定位后端程序",
+    "type": "str",
+    "default": "",
+    "section_id": "geometry_runtime",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/nuwax_geometry_runtime/src/native_lio_owner.rs",
+      "services/geometry/release_manifest.py"
+    ],
+    "apply_scope": "重启几何运行时后生效",
+    "description": ""
+  },
+  "NUWAX_GEOMETRY_RELEASE_MANIFEST": {
+    "zh_name": "可选几何发布清单",
+    "type": "str",
+    "default": "",
+    "section_id": "geometry_runtime",
+    "target_file": "core_env",
+    "consumers": [
+      "scripts/systemd/start_geometry_runtime.sh",
+      "services/geometry/nuwax_geometry_runtime/src/main.rs",
+      "services/geometry/release_manifest.py"
+    ],
+    "apply_scope": "重启几何运行时后生效",
+    "description": ""
+  },
+  "NUWAX_GEOMETRY_RELEASE_NATIVE_PGO_EXECUTABLE": {
+    "zh_name": "原生位姿图优化程序",
+    "type": "str",
+    "default": "",
+    "section_id": "geometry_runtime",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/release_manifest.py",
+      "services/nuwax-workspace/crates/nuwax-nav-pgo-bridge/src/lib.rs"
+    ],
+    "apply_scope": "重启相关服务后生效",
+    "description": ""
+  },
+  "NUWAX_MAPPING_RAYTRACING_VOXEL_SIZE": {
+    "zh_name": "射线建图体素大小（米）",
+    "type": "float",
+    "default": 0.1,
+    "section_id": "mapping",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/nuwax_geometry_runtime/src/mapping_backend.rs"
+    ],
+    "apply_scope": "重启几何运行时后生效",
+    "description": "",
+    "effective_value_scope": "external_process"
+  },
+  "NUWAX_MAPPING_RAYTRACING_MAX_RANGE": {
+    "zh_name": "射线建图最大射线距离（米）",
+    "type": "float",
+    "default": 50.0,
+    "section_id": "mapping",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/nuwax_geometry_runtime/src/mapping_backend.rs"
+    ],
+    "apply_scope": "重启几何运行时后生效",
+    "description": ""
+  },
+  "NUWAX_MAPPING_RAYTRACING_RAY_SUBSAMPLE": {
+    "zh_name": "射线建图射线采样步长",
+    "type": "int",
+    "default": 1,
+    "section_id": "mapping",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/nuwax_geometry_runtime/src/mapping_backend.rs"
+    ],
+    "apply_scope": "重启几何运行时后生效",
+    "description": ""
+  },
+  "NUWAX_MAPPING_RAYTRACING_SHADOW_DEPTH": {
+    "zh_name": "射线建图遮挡深度（米）",
+    "type": "float",
+    "default": 0.2,
+    "section_id": "mapping",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/nuwax_geometry_runtime/src/mapping_backend.rs"
+    ],
+    "apply_scope": "重启几何运行时后生效",
+    "description": ""
+  },
+  "NUWAX_MAPPING_RAYTRACING_GRACE_DEPTH": {
+    "zh_name": "射线建图深度容差（米）",
+    "type": "float",
+    "default": 0.2,
+    "section_id": "mapping",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/nuwax_geometry_runtime/src/mapping_backend.rs"
+    ],
+    "apply_scope": "重启几何运行时后生效",
+    "description": ""
+  },
+  "NUWAX_MAPPING_RAYTRACING_MIN_HEALTH": {
+    "zh_name": "射线建图最低占据证据",
+    "type": "int",
+    "default": -2,
+    "section_id": "mapping",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/nuwax_geometry_runtime/src/mapping_backend.rs"
+    ],
+    "apply_scope": "重启几何运行时后生效",
+    "description": ""
+  },
+  "NUWAX_MAPPING_RAYTRACING_MAX_HEALTH": {
+    "zh_name": "射线建图最高占据证据",
+    "type": "int",
+    "default": 1,
+    "section_id": "mapping",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/nuwax_geometry_runtime/src/mapping_backend.rs"
+    ],
+    "apply_scope": "重启几何运行时后生效",
+    "description": ""
+  },
+  "NUWAX_MAPPING_RAYTRACING_GRAZE_COS": {
+    "zh_name": "射线建图掠射角余弦阈值",
+    "type": "float",
+    "default": 0.7,
+    "section_id": "mapping",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/nuwax_geometry_runtime/src/mapping_backend.rs"
+    ],
+    "apply_scope": "重启几何运行时后生效",
+    "description": ""
+  },
+  "NUWAX_MAPPING_RAYTRACING_RECENCY_WINDOW": {
+    "zh_name": "射线建图近期观测窗口（帧）",
+    "type": "int",
+    "default": 15,
+    "section_id": "mapping",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/nuwax_geometry_runtime/src/mapping_backend.rs"
+    ],
+    "apply_scope": "重启几何运行时后生效",
+    "description": ""
+  },
+  "NUWAX_NAV_LOCAL_PLANNING_ENABLED": {
+    "zh_name": "启用局部规划",
+    "type": "bool",
+    "default": true,
+    "section_id": "nav_stack",
+    "advanced": false,
+    "target_file": "core_env",
+    "consumers": [
+      "services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_config.rs"
+    ],
+    "apply_scope": "保存后重启导航后端生效",
+    "effective_value_scope": "external_process",
+    "description": "仅用于三维导航，默认开启；二维链路不使用此项。关闭后沿全局路径执行，跳过局部规划；地图、新鲜度、运动守卫及停车约束仍然有效。空值使用默认开启。此处显示启动配置，不能据此确认导航后端已经采用；修改后需重启导航后端。"
+  },
+  "NUWAX_NAV_STACK_STATE_TTL_MS": {
+    "zh_name": "导航状态有效时间（毫秒）",
+    "type": "int",
+    "default": 2000,
+    "section_id": "nav_stack",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/nuwax_geometry_runtime/src/nav_runtime.rs"
+    ],
+    "apply_scope": "重启几何运行时后生效",
+    "description": ""
+  },
+  "NUWAX_NAV_TF_TTL_MS": {
+    "zh_name": "导航坐标变换有效时间（毫秒）",
+    "type": "int",
+    "default": 2000,
+    "section_id": "nav_stack",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/nuwax_geometry_runtime/src/nav_runtime.rs",
+      "services/geometry/nuwax_geometry_runtime/src/vertical_v2_canary.rs"
+    ],
+    "apply_scope": "重启几何运行时后生效",
+    "description": ""
+  },
+  "NUWAX_NAV_PLANNER_INPUT_TTL_MS": {
+    "zh_name": "规划输入有效时间（毫秒）",
+    "type": "int",
+    "default": 2000,
+    "section_id": "nav_stack",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/nuwax_geometry_runtime/src/nav_runtime.rs"
+    ],
+    "apply_scope": "重启几何运行时后生效",
+    "description": ""
+  },
+  "NUWAX_NAV_MOTION_SINK_TTL_MS": {
+    "zh_name": "运动执行端有效时间（毫秒）",
+    "type": "int",
+    "default": 1000,
+    "section_id": "nav_stack",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/nuwax_geometry_runtime/src/nav_runtime.rs"
+    ],
+    "apply_scope": "重启几何运行时后生效",
+    "description": ""
+  },
+  "NUWAX_NAV_CANCEL_TIMEOUT_MS": {
+    "zh_name": "导航取消等待时间（毫秒）",
+    "type": "int",
+    "default": 5000,
+    "section_id": "nav_stack",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/nuwax_geometry_runtime/src/nav_runtime.rs"
+    ],
+    "apply_scope": "重启几何运行时后生效",
+    "description": ""
+  },
+  "NUWAX_EXPLORE_SCHEDULER_PERIOD_MS": {
+    "zh_name": "探索调度间隔（毫秒）",
+    "type": "int",
+    "default": 200,
+    "section_id": "nav_stack",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/nuwax_geometry_runtime/src/lcm_runtime.rs"
+    ],
+    "apply_scope": "重启几何运行时后生效",
+    "description": ""
+  },
+  "NUWAX_EXPLORE_POSE_TTL_MS": {
+    "zh_name": "探索位姿有效时间（毫秒）",
+    "type": "int",
+    "default": 1000,
+    "section_id": "nav_stack",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/nuwax_geometry_runtime/src/lcm_runtime.rs"
+    ],
+    "apply_scope": "重启几何运行时后生效",
+    "description": ""
+  },
+  "NUWAX_EXPLORE_FINALIZE_DELAY_SEC": {
+    "zh_name": "探索结束保存等待时间（秒）",
+    "type": "float",
+    "default": 8.0,
+    "section_id": "nav_stack",
+    "target_file": "core_env",
+    "consumers": [
+      "gateways/runtime.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": ""
+  },
+  "NUWAX_FORBIDDEN_ZONES_POLL_INTERVAL_MS": {
+    "zh_name": "禁行区文件读取间隔（毫秒）",
+    "type": "int",
+    "default": 250,
+    "section_id": "nav_stack",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/nuwax_geometry_runtime/src/lcm_runtime.rs"
+    ],
+    "apply_scope": "重启几何运行时后生效",
+    "description": ""
+  },
+  "NUWAX_NAV_STACK_BINARY": {
+    "zh_name": "导航后端程序",
+    "type": "str",
+    "default": "",
+    "section_id": "nav_stack",
+    "target_file": "core_env",
+    "consumers": [
+      "scripts/install_motion_guard_deployment.sh",
+      "scripts/start_gateway.sh",
+      "scripts/systemd/start_nav_stack.sh"
+    ],
+    "apply_scope": "重启导航后端后生效",
+    "description": ""
+  },
+  "NUWAX_NAV_STACK_WARMUP_STEPS": {
+    "zh_name": "导航订阅准备检查次数",
+    "type": "int",
+    "default": 150,
+    "section_id": "nav_stack",
+    "target_file": "core_env",
+    "consumers": [
+      "scripts/systemd/start_nav_stack.sh"
+    ],
+    "apply_scope": "重启导航后端后生效",
+    "description": ""
+  },
+  "NUWAX_PERSON_FOLLOW_BINARY": {
+    "zh_name": "人物跟随后端程序",
+    "type": "str",
+    "default": "",
+    "section_id": "nav_stack",
+    "target_file": "core_env",
+    "consumers": [
+      "scripts/install_motion_guard_deployment.sh",
+      "scripts/start_gateway.sh",
+      "scripts/systemd/start_person_follow.sh"
+    ],
+    "apply_scope": "重启人物跟随后端后生效",
+    "description": ""
+  },
+  "NUWAX_PERSON_FOLLOW_MONITOR_INTERVAL_SEC": {
+    "zh_name": "人物跟随健康检查间隔（秒）",
+    "type": "float",
+    "default": 0.5,
+    "section_id": "nav_stack",
+    "target_file": "core_env",
+    "consumers": [
+      "scripts/start_gateway.sh"
+    ],
+    "apply_scope": "重启网关启动脚本后生效",
+    "description": ""
+  },
+  "NUWAX_PERSON_FOLLOW_TARGET_CHANNEL": {
+    "zh_name": "人物跟随目标通道",
+    "type": "str",
+    "default": "/person_follow_target",
+    "section_id": "nav_stack",
+    "target_file": "core_env",
+    "consumers": [
+      "gateways/person_follow.py",
+      "scripts/bootstrap.py",
+      "scripts/start_gateway.sh",
+      "services/nuwax-workspace/crates/nuwax-nav-visual-servoing/src/bin/nuwax-person-follow.rs"
+    ],
+    "apply_scope": "重启网关、人物跟随后端后生效",
+    "description": ""
+  },
+  "NUWAX_PERSON_FOLLOW_POINTCLOUD_CHANNEL": {
+    "zh_name": "人物跟随点云通道",
+    "type": "str",
+    "default": "/global_map",
+    "section_id": "nav_stack",
+    "target_file": "core_env",
+    "consumers": [
+      "scripts/bootstrap.py",
+      "scripts/start_gateway.sh",
+      "services/nuwax-workspace/crates/nuwax-nav-visual-servoing/src/bin/nuwax-person-follow.rs"
+    ],
+    "apply_scope": "重启人物跟随后端后生效",
+    "description": ""
+  },
+  "NUWAX_PERSON_FOLLOW_TF_CHANNEL": {
+    "zh_name": "人物跟随坐标变换通道",
+    "type": "str",
+    "default": "/tf",
+    "section_id": "nav_stack",
+    "target_file": "core_env",
+    "consumers": [
+      "scripts/bootstrap.py",
+      "scripts/start_gateway.sh",
+      "services/nuwax-workspace/crates/nuwax-nav-visual-servoing/src/bin/nuwax-person-follow.rs"
+    ],
+    "apply_scope": "重启人物跟随后端后生效",
+    "description": ""
+  },
+  "NUWAX_PERSON_FOLLOW_COMMAND_CHANNEL": {
+    "zh_name": "人物跟随速度请求通道",
+    "type": "str",
+    "default": "/gateway/person_follow_cmd_vel",
+    "section_id": "nav_stack",
+    "target_file": "core_env",
+    "consumers": [
+      "gateways/person_follow.py",
+      "scripts/bootstrap.py",
+      "scripts/start_gateway.sh",
+      "services/nuwax-workspace/crates/nuwax-nav-visual-servoing/src/bin/nuwax-person-follow.rs"
+    ],
+    "apply_scope": "重启网关、人物跟随后端后生效",
+    "description": ""
+  },
+  "NUWAX_WAVEFRONT_GOAL_TIMEOUT_MS": {
+    "zh_name": "波前探索单目标超时（毫秒）",
+    "type": "int",
+    "default": 15000,
+    "section_id": "nav_stack",
+    "target_file": "core_env",
+    "consumers": [
+      "services/nuwax-workspace/crates/nuwax-nav-stack/src/lcm_dataflow.rs"
+    ],
+    "apply_scope": "重启导航后端后生效",
+    "description": ""
+  },
+  "NUWAX_MOTION_GUARD_BACKEND": {
+    "zh_name": "运动控制后端",
+    "type": "str",
+    "default": "",
+    "section_id": "robot",
+    "target_file": "core_env",
+    "consumers": [
+      "scripts/provision_motion_guard.py",
+      "services/navigation/motion_safety_guard/__main__.py",
+      "services/navigation/motion_safety_guard/go2_actuator.py"
+    ],
+    "apply_scope": "重启运动控制进程后生效",
+    "choices": [
+      "",
+      "unitree_sdk2py",
+      "motion_control"
+    ],
+    "choice_labels": [
+      "尚未配置",
+      "Go2 官方控制",
+      "标准机器人运动提供者"
+    ],
+    "description": ""
+  },
+  "NUWAX_MOTION_CONTROL_FACTORY": {
+    "zh_name": "标准运动提供者工厂",
+    "type": "str",
+    "default": "",
+    "section_id": "robot",
+    "target_file": "core_env",
+    "consumers": [
+      "services/navigation/motion_safety_guard/motion_control_actuator.py"
+    ],
+    "apply_scope": "重启运动控制进程后生效",
+    "description": "Python 工厂入口，格式 package.module:create_provider；返回实现统一运动接口的机器人提供者。"
+  },
+  "NUWAX_MOTION_GUARD_SOCKET": {
+    "zh_name": "运动控制通信套接字",
+    "type": "str",
+    "default": "/run/nuwax/motion-guard.sock",
+    "section_id": "robot",
+    "target_file": "core_env",
+    "consumers": [
+      "gateways/motion_guard.py",
+      "scripts/bootstrap.py",
+      "scripts/diagnostics/check_nuwax_runtime.sh",
+      "scripts/install_motion_guard_deployment.sh",
+      "scripts/start_gateway.sh",
+      "scripts/systemd/activate_geometry_runtime.sh",
+      "scripts/systemd/start_nav_stack.sh",
+      "scripts/systemd/wait_for_motion_guard_socket.sh",
+      "services/geometry/nuwax_geometry_runtime/src/server.rs",
+      "services/geometry/nuwax_geometry_runtime/src/vertical_v2_canary.rs",
+      "services/navigation/motion_safety_guard/__main__.py",
+      "services/nuwax-workspace/crates/nuwax-nav-stack/src/lcm_dataflow.rs"
+    ],
+    "apply_scope": "重启网关、几何运行时、导航后端、运动控制进程后生效",
+    "description": "网关、几何、导航和运动守卫共用的通信地址；修改后需同步重启这些进程。"
+  },
+  "NUWAX_MOTION_GUARD_START_TIMEOUT_SEC": {
+    "zh_name": "运动控制启动等待时间（秒）",
+    "type": "int",
+    "default": 15,
+    "section_id": "robot",
+    "target_file": "core_env",
+    "consumers": [
+      "scripts/bootstrap.py",
+      "scripts/start_gateway.sh",
+      "scripts/systemd/activate_geometry_runtime.sh",
+      "scripts/systemd/wait_for_motion_guard_socket.sh"
+    ],
+    "apply_scope": "重启网关启动脚本后生效",
+    "description": ""
+  },
+  "NUWAX_GATEWAY_RESTART": {
+    "zh_name": "网关自动重启策略",
+    "type": "str",
+    "default": "on-failure",
+    "section_id": "gateway",
+    "target_file": "core_env",
+    "consumers": [
+      "scripts/bootstrap.py",
+      "scripts/start_gateway.sh"
+    ],
+    "apply_scope": "重启网关启动脚本后生效",
+    "description": ""
+  },
+  "NUWAX_GATEWAY_RESTART_SEC": {
+    "zh_name": "网关重启间隔（秒）",
+    "type": "int",
+    "default": 3,
+    "section_id": "gateway",
+    "target_file": "core_env",
+    "consumers": [
+      "scripts/start_gateway.sh"
+    ],
+    "apply_scope": "重启网关启动脚本后生效",
+    "description": ""
+  },
+  "NUWAX_GATEWAY_RESTART_MAX_ATTEMPTS": {
+    "zh_name": "网关重启次数上限（零为不限）",
+    "type": "int",
+    "default": 0,
+    "section_id": "gateway",
+    "target_file": "core_env",
+    "consumers": [
+      "scripts/start_gateway.sh"
+    ],
+    "apply_scope": "重启网关启动脚本后生效",
+    "description": ""
+  },
+  "NUWAX_GATEWAY_STOP_TIMEOUT_SEC": {
+    "zh_name": "网关正常退出等待时间（秒）",
+    "type": "int",
+    "default": 20,
+    "section_id": "gateway",
+    "target_file": "core_env",
+    "consumers": [
+      "scripts/start_gateway.sh"
+    ],
+    "apply_scope": "重启网关启动脚本后生效",
+    "description": ""
+  },
+  "NUWAX_GATEWAY_KILL_TIMEOUT_SEC": {
+    "zh_name": "网关退出补充等待时间（秒）",
+    "type": "int",
+    "default": 5,
+    "section_id": "gateway",
+    "target_file": "core_env",
+    "consumers": [
+      "scripts/start_gateway.sh"
+    ],
+    "apply_scope": "重启网关启动脚本后生效",
+    "description": ""
+  },
+  "NUWAX_RUNTIME_ACTIVATION_TIMEOUT_SEC": {
+    "zh_name": "运行时激活等待时间（秒）",
+    "type": "float",
+    "default": 95.0,
+    "section_id": "gateway",
+    "target_file": "core_env",
+    "consumers": [
+      "gateways/runtime.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": ""
+  },
+  "NUWAX_LOG_FORMAT": {
+    "zh_name": "终端日志格式",
+    "type": "str",
+    "default": "text",
+    "section_id": "logging",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "只控制终端显示；日志文件始终保存结构化事件。",
+    "choices": [
+      "text",
+      "json"
+    ],
+    "choice_labels": [
+      "普通文本",
+      "结构化文本"
+    ]
+  },
+  "NUWAX_LOG_MAX_BYTES": {
+    "zh_name": "单个日志文件容量（字节）",
+    "type": "int",
+    "default": 20971520,
+    "section_id": "logging",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py"
+    ],
+    "apply_scope": "重启网关及各独立运行进程后生效",
+    "description": ""
+  },
+  "NUWAX_LOG_BACKUP_COUNT": {
+    "zh_name": "保留的历史日志文件数",
+    "type": "int",
+    "default": 5,
+    "section_id": "logging",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py"
+    ],
+    "apply_scope": "重启网关及各独立运行进程后生效",
+    "description": ""
+  },
+  "NUWAX_LOG_LEVEL_GEOMETRY": {
+    "zh_name": "几何日志级别（空为继承）",
+    "type": "str",
+    "default": "",
+    "section_id": "logging",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "choices": [
+      "",
+      "DEBUG",
+      "INFO",
+      "WARNING",
+      "ERROR",
+      "CRITICAL"
+    ],
+    "description": "空值继承全局日志级别；保存后在网关内热加载。",
+    "choice_labels": [
+      "继承全局设置",
+      "调试",
+      "信息",
+      "警告",
+      "错误",
+      "严重错误"
+    ]
+  },
+  "NUWAX_LOG_LEVEL_NAVIGATION": {
+    "zh_name": "导航日志级别（空为继承）",
+    "type": "str",
+    "default": "",
+    "section_id": "logging",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "choices": [
+      "",
+      "DEBUG",
+      "INFO",
+      "WARNING",
+      "ERROR",
+      "CRITICAL"
+    ],
+    "description": "空值继承全局日志级别；保存后在网关内热加载。",
+    "choice_labels": [
+      "继承全局设置",
+      "调试",
+      "信息",
+      "警告",
+      "错误",
+      "严重错误"
+    ]
+  },
+  "NUWAX_LOG_LEVEL_PERCEPTION": {
+    "zh_name": "感知日志级别（空为继承）",
+    "type": "str",
+    "default": "",
+    "section_id": "logging",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "choices": [
+      "",
+      "DEBUG",
+      "INFO",
+      "WARNING",
+      "ERROR",
+      "CRITICAL"
+    ],
+    "description": "空值继承全局日志级别；保存后在网关内热加载。",
+    "choice_labels": [
+      "继承全局设置",
+      "调试",
+      "信息",
+      "警告",
+      "错误",
+      "严重错误"
+    ]
+  },
+  "NUWAX_LOG_LEVEL_GATEWAY": {
+    "zh_name": "网关日志级别（空为继承）",
+    "type": "str",
+    "default": "",
+    "section_id": "logging",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "choices": [
+      "",
+      "DEBUG",
+      "INFO",
+      "WARNING",
+      "ERROR",
+      "CRITICAL"
+    ],
+    "description": "空值继承全局日志级别；保存后在网关内热加载。",
+    "choice_labels": [
+      "继承全局设置",
+      "调试",
+      "信息",
+      "警告",
+      "错误",
+      "严重错误"
+    ]
+  },
+  "NUWAX_LOG_LEVEL_RUNTIME": {
+    "zh_name": "运行时日志级别（空为继承）",
+    "type": "str",
+    "default": "",
+    "section_id": "logging",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "choices": [
+      "",
+      "DEBUG",
+      "INFO",
+      "WARNING",
+      "ERROR",
+      "CRITICAL"
+    ],
+    "description": "空值继承全局日志级别；保存后在网关内热加载。",
+    "choice_labels": [
+      "继承全局设置",
+      "调试",
+      "信息",
+      "警告",
+      "错误",
+      "严重错误"
+    ]
+  },
+  "NUWAX_LOG_LEVEL_CONFIG": {
+    "zh_name": "配置读写日志级别（空为继承）",
+    "type": "str",
+    "default": "",
+    "section_id": "logging",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "choices": [
+      "",
+      "DEBUG",
+      "INFO",
+      "WARNING",
+      "ERROR",
+      "CRITICAL"
+    ],
+    "description": "空值继承全局日志级别；保存后在网关内热加载。",
+    "choice_labels": [
+      "继承全局设置",
+      "调试",
+      "信息",
+      "警告",
+      "错误",
+      "严重错误"
+    ]
+  },
+  "NUWAX_LOG_LEVEL_SETTINGS": {
+    "zh_name": "配置解析日志级别（空为继承）",
+    "type": "str",
+    "default": "",
+    "section_id": "logging",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "choices": [
+      "",
+      "DEBUG",
+      "INFO",
+      "WARNING",
+      "ERROR",
+      "CRITICAL"
+    ],
+    "description": "空值继承全局日志级别；保存后在网关内热加载。",
+    "choice_labels": [
+      "继承全局设置",
+      "调试",
+      "信息",
+      "警告",
+      "错误",
+      "严重错误"
+    ]
+  },
+  "NUWAX_LOG_LEVEL_SKILLS": {
+    "zh_name": "技能日志级别（空为继承）",
+    "type": "str",
+    "default": "",
+    "section_id": "logging",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "choices": [
+      "",
+      "DEBUG",
+      "INFO",
+      "WARNING",
+      "ERROR",
+      "CRITICAL"
+    ],
+    "description": "空值继承全局日志级别；保存后在网关内热加载。",
+    "choice_labels": [
+      "继承全局设置",
+      "调试",
+      "信息",
+      "警告",
+      "错误",
+      "严重错误"
+    ]
+  },
+  "NUWAX_LOG_LEVEL_DRIVER": {
+    "zh_name": "机器人驱动日志级别（空为继承）",
+    "type": "str",
+    "default": "",
+    "section_id": "logging",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "choices": [
+      "",
+      "DEBUG",
+      "INFO",
+      "WARNING",
+      "ERROR",
+      "CRITICAL"
+    ],
+    "description": "空值继承全局日志级别；保存后在网关内热加载。",
+    "choice_labels": [
+      "继承全局设置",
+      "调试",
+      "信息",
+      "警告",
+      "错误",
+      "严重错误"
+    ]
+  },
+  "GO2_VIDEO_STREAM_LOG_LEVEL": {
+    "zh_name": "Go2 视频日志级别",
+    "type": "str",
+    "default": "INFO",
+    "section_id": "logging",
+    "target_file": "go2_data_plane_env",
+    "consumers": [
+      "drivers/go2/video_streamer.py"
+    ],
+    "apply_scope": "重启Go2 视频进程后生效",
+    "description": ""
+  },
+  "NUWAX_GOOGLE_MAPS_BASE_URL": {
+    "zh_name": "谷歌地图服务地址",
+    "type": "str",
+    "default": "https://maps.googleapis.com/maps/api",
+    "section_id": "mapping",
+    "target_file": "core_env",
+    "consumers": [
+      "services/nuwax-workspace/crates/nuwax-mapping-cloud/src/google_maps.rs"
+    ],
+    "apply_scope": "重启相关服务后生效",
+    "description": ""
+  },
+  "NX_MEMORY_LIGHTWEIGHT_LIBRARY_STATS": {
+    "zh_name": "启用记忆库轻量统计",
+    "type": "bool",
+    "default": true,
+    "section_id": "runtime_data",
+    "target_file": "core_env",
+    "consumers": [
+      "services/memory/service.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": ""
+  },
+  "NUWAX_PCD_MIN_POINTS": {
+    "zh_name": "保存点云地图的最少点数",
+    "type": "int",
+    "default": 500,
+    "section_id": "mapping",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/cloud_map_fetcher.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "导出点云地图时要求的最少点数。"
+  },
+  "NUWAX_LCM_CHANNEL_IMU": {
+    "zh_name": "惯性测量数据通道",
+    "type": "str",
+    "default": "/imu/data#sensor_msgs.Imu",
+    "section_id": "lcm",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/nuwax_geometry_runtime/src/channel_registry.rs"
+    ],
+    "apply_scope": "重启几何运行时后生效",
+    "aliases": [
+      "NUWAX_GEOMETRY_RUNTIME_IMU_CHANNEL"
+    ],
+    "description": "设置惯性测量数据通道，可使用“/话题#消息类型”形式；各运行进程共用同一规范通道。"
+  },
+  "NUWAX_CLOUDMAP_SHM_PATH": {
+    "zh_name": "点云地图共享内存文件",
+    "type": "str",
+    "default": "/tmp/nuwax_cloudmap.mmap",
+    "section_id": "shm_uds",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/nuwax_geometry_runtime/src/lcm_runtime.rs"
+    ],
+    "apply_scope": "重启网关和几何运行时后生效",
+    "description": "点云地图共享内存文件，供几何运行时写入、网关读取。"
+  },
+  "NUWAX_OCCUPANCY_SHM_PATH": {
+    "zh_name": "占据栅格共享内存文件",
+    "type": "str",
+    "default": "/tmp/nuwax_occupancy.mmap",
+    "section_id": "shm_uds",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/nuwax_geometry_runtime/src/lcm_runtime.rs"
+    ],
+    "apply_scope": "重启网关和几何运行时后生效",
+    "description": "占据栅格共享内存文件，供几何运行时写入、网关读取。"
+  },
+  "NUWAX_LCM_CHANNEL_ODOM": {
+    "zh_name": "里程计通道",
+    "type": "str",
+    "default": "/odom#nav_msgs.Odometry",
+    "section_id": "lcm",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/geometry/nuwax_geometry_runtime/src/channel_registry.rs",
+      "services/nuwax-workspace/crates/nuwax-nav-stack/src/topics.rs"
+    ],
+    "apply_scope": "重启网关、几何运行时及导航后端后生效",
+    "aliases": [
+      "NUWAX_GEOMETRY_RUNTIME_ODOMETRY_CHANNEL"
+    ],
+    "description": "设置里程计通道，可使用“/话题#消息类型”形式；各运行进程共用同一规范通道。"
+  },
+  "NUWAX_LCM_CHANNEL_TF": {
+    "zh_name": "坐标变换通道",
+    "type": "str",
+    "default": "/tf#tf2_msgs.TFMessage",
+    "section_id": "lcm",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/geometry/nuwax_geometry_runtime/src/channel_registry.rs",
+      "services/nuwax-workspace/crates/nuwax-nav-stack/src/topics.rs"
+    ],
+    "apply_scope": "重启网关、几何运行时及导航后端后生效",
+    "aliases": [
+      "NUWAX_GEOMETRY_RUNTIME_TF_CHANNEL"
+    ],
+    "description": "设置坐标变换通道，可使用“/话题#消息类型”形式；各运行进程共用同一规范通道。"
+  },
+  "NUWAX_LCM_CHANNEL_POINTCLOUD": {
+    "zh_name": "原始点云通道",
+    "type": "str",
+    "default": "/go2/lidar/points#sensor_msgs.PointCloud2",
+    "section_id": "lcm",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/geometry/nuwax_geometry_runtime/src/channel_registry.rs",
+      "services/nuwax-workspace/crates/nuwax-nav-stack/src/topics.rs"
+    ],
+    "apply_scope": "重启网关、几何运行时及导航后端后生效",
+    "aliases": [
+      "NUWAX_GEOMETRY_RUNTIME_POINTCLOUD_CHANNEL"
+    ],
+    "description": "设置原始点云通道，可使用“/话题#消息类型”形式；各运行进程共用同一规范通道。"
+  },
+  "NUWAX_LCM_CHANNEL_CLOUD_MAP": {
+    "zh_name": "点云地图通道",
+    "type": "str",
+    "default": "/cloud_map#sensor_msgs.PointCloud2",
+    "section_id": "lcm",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/geometry/nuwax_geometry_runtime/src/channel_registry.rs",
+      "services/nuwax-workspace/crates/nuwax-nav-stack/src/topics.rs"
+    ],
+    "apply_scope": "重启网关、几何运行时及导航后端后生效",
+    "aliases": [
+      "NUWAX_GEOMETRY_RUNTIME_CLOUDMAP_CHANNEL"
+    ],
+    "description": "设置点云地图通道，可使用“/话题#消息类型”形式；各运行进程共用同一规范通道。"
+  },
+  "NUWAX_LCM_CHANNEL_OCCUPANCY": {
+    "zh_name": "占据栅格通道",
+    "type": "str",
+    "default": "/map/occupancy#nav_msgs.OccupancyGrid",
+    "section_id": "lcm",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/geometry/nuwax_geometry_runtime/src/channel_registry.rs",
+      "services/nuwax-workspace/crates/nuwax-nav-stack/src/topics.rs"
+    ],
+    "apply_scope": "重启网关、几何运行时及导航后端后生效",
+    "aliases": [
+      "NUWAX_GEOMETRY_RUNTIME_OCCUPANCY_CHANNEL"
+    ],
+    "description": "设置占据栅格通道，可使用“/话题#消息类型”形式；各运行进程共用同一规范通道。"
+  },
+  "NUWAX_LCM_CHANNEL_CMD_VEL": {
+    "zh_name": "运动速度指令通道",
+    "type": "str",
+    "default": "/cmd_vel#geometry_msgs.Twist",
+    "section_id": "lcm",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/geometry/nuwax_geometry_runtime/src/channel_registry.rs",
+      "services/nuwax-workspace/crates/nuwax-nav-stack/src/topics.rs"
+    ],
+    "apply_scope": "重启网关、几何运行时及导航后端后生效",
+    "aliases": [
+      "NUWAX_GEOMETRY_RUNTIME_CMD_VEL_CHANNEL"
+    ],
+    "description": "设置运动速度指令通道，可使用“/话题#消息类型”形式；各运行进程共用同一规范通道。"
+  },
+  "NUWAX_LCM_CHANNEL_NAV_STATE": {
+    "zh_name": "导航状态通道",
+    "type": "str",
+    "default": "/nav/state#nuwax_msgs.NavigationState",
+    "section_id": "lcm",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/geometry/nuwax_geometry_runtime/src/channel_registry.rs",
+      "services/nuwax-workspace/crates/nuwax-nav-stack/src/topics.rs"
+    ],
+    "apply_scope": "重启网关、几何运行时及导航后端后生效",
+    "aliases": [
+      "NUWAX_GEOMETRY_RUNTIME_NAV_STATE_CHANNEL"
+    ],
+    "description": "设置导航状态通道，可使用“/话题#消息类型”形式；各运行进程共用同一规范通道。"
+  },
+  "NUWAX_LCM_CHANNEL_FRONTIER": {
+    "zh_name": "探索边界通道",
+    "type": "str",
+    "default": "/explore/frontiers#nuwax_msgs.FrontierList",
+    "section_id": "lcm",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/geometry/nuwax_geometry_runtime/src/channel_registry.rs",
+      "services/nuwax-workspace/crates/nuwax-nav-stack/src/topics.rs"
+    ],
+    "apply_scope": "重启网关、几何运行时及导航后端后生效",
+    "aliases": [
+      "NUWAX_GEOMETRY_RUNTIME_FRONTIERS_CHANNEL"
+    ],
+    "description": "设置探索边界通道，可使用“/话题#消息类型”形式；各运行进程共用同一规范通道。"
+  },
+  "NUWAX_LCM_CHANNEL_NAV_CANCEL": {
+    "zh_name": "导航取消通道",
+    "type": "str",
+    "default": "/nav/cancel#nuwax_msgs.CancelNavigation",
+    "section_id": "lcm",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/geometry/nuwax_geometry_runtime/src/channel_registry.rs",
+      "services/nuwax-workspace/crates/nuwax-nav-stack/src/topics.rs"
+    ],
+    "apply_scope": "重启网关、几何运行时及导航后端后生效",
+    "aliases": [
+      "NUWAX_GEOMETRY_RUNTIME_NAV_CANCEL_CHANNEL"
+    ],
+    "description": "设置导航取消通道，可使用“/话题#消息类型”形式；各运行进程共用同一规范通道。"
+  },
+  "RUST_LOG": {
+    "zh_name": "Rust（系统编程语言）运行时日志过滤",
+    "type": "str",
+    "default": "info",
+    "section_id": "logging",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/nuwax_geometry_runtime/src/main.rs",
+      "services/nuwax-workspace/crates/nuwax-nav-stack/src/bin_support.rs"
+    ],
+    "apply_scope": "重启几何运行时、导航后端后生效",
+    "description": "支持 tracing（事件记录库）过滤表达式，例如 info,nuwax_nav_stack=debug。"
+  },
+  "NUWAX_RUNTIME_DATA_DIR": {
+    "zh_name": "原生运行时数据目录",
+    "type": "str",
+    "default": "runtime_data",
+    "section_id": "runtime_data",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/nuwax_geometry_runtime/src/main.rs"
+    ],
+    "apply_scope": "重启几何运行时后生效",
+    "description": ""
+  },
+  "NUWAX_RUNTIME_ACTIVATION_ACK_TIMEOUT_SEC": {
+    "zh_name": "运行时激活确认等待时间（秒）",
+    "type": "int",
+    "default": 10,
+    "section_id": "gateway",
+    "target_file": "core_env",
+    "consumers": [
+      "scripts/systemd/activate_geometry_runtime.sh"
+    ],
+    "apply_scope": "重启相关服务后生效",
+    "description": ""
+  },
+  "NUWAX_RUNTIME_ACTIVATION_COMMIT_TIMEOUT_SEC": {
+    "zh_name": "运行时激活提交等待时间（秒）",
+    "type": "int",
+    "default": 10,
+    "section_id": "gateway",
+    "target_file": "core_env",
+    "consumers": [
+      "scripts/systemd/activate_geometry_runtime.sh"
+    ],
+    "apply_scope": "重启相关服务后生效",
+    "description": ""
+  },
+  "NUWAX_LCM_CHANNEL_GOAL_POSE": {
+    "zh_name": "导航目标通道",
+    "type": "str",
+    "default": "/nav/goal#nuwax_msgs.GoalEnvelope",
+    "section_id": "lcm",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/nuwax_geometry_runtime/src/nav_runtime.rs"
+    ],
+    "apply_scope": "重启几何运行时后生效",
+    "aliases": [
+      "NUWAX_GEOMETRY_RUNTIME_NAV_GOAL_CHANNEL"
+    ],
+    "description": "设置导航目标通道，可使用“/话题#消息类型”形式；各运行进程共用同一规范通道。"
+  },
+  "NUWAX_LCM_CHANNEL_NAV_PATH": {
+    "zh_name": "导航路线通道",
+    "type": "str",
+    "default": "/nav/path#nuwax_msgs.PathEnvelope",
+    "section_id": "lcm",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/nuwax_geometry_runtime/src/nav_runtime.rs"
+    ],
+    "apply_scope": "重启几何运行时后生效",
+    "aliases": [
+      "NUWAX_GEOMETRY_RUNTIME_NAV_PATH_CHANNEL"
+    ],
+    "description": "设置导航路线通道，可使用“/话题#消息类型”形式；各运行进程共用同一规范通道。"
+  },
+  "NUWAX_LCM_CHANNEL_LIO_ODOMETRY": {
+    "zh_name": "激光惯性里程计通道",
+    "type": "str",
+    "default": "/geometry/lio/odometry#nuwax_msgs.LioOdometryEnvelope",
+    "section_id": "lcm",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/nuwax_geometry_runtime/src/lio_owner.rs"
+    ],
+    "apply_scope": "重启几何运行时后生效",
+    "aliases": [
+      "NUWAX_GEOMETRY_RUNTIME_LIO_ODOMETRY_CHANNEL"
+    ],
+    "description": "设置激光惯性里程计通道，可使用“/话题#消息类型”形式；各运行进程共用同一规范通道。"
+  },
+  "NUWAX_LCM_CHANNEL_LIO_CLOUD": {
+    "zh_name": "激光惯性定位点云通道",
+    "type": "str",
+    "default": "/geometry/lio/cloud#nuwax_msgs.LioCloudEnvelope",
+    "section_id": "lcm",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/nuwax_geometry_runtime/src/lio_owner.rs"
+    ],
+    "apply_scope": "重启几何运行时后生效",
+    "aliases": [
+      "NUWAX_GEOMETRY_RUNTIME_LIO_CLOUD_CHANNEL"
+    ],
+    "description": "设置激光惯性定位点云通道，可使用“/话题#消息类型”形式；各运行进程共用同一规范通道。"
+  },
+  "NUWAX_LCM_CHANNEL_LIO_STATUS": {
+    "zh_name": "激光惯性定位状态通道",
+    "type": "str",
+    "default": "/geometry/lio/status#nuwax_msgs.LioStatus",
+    "section_id": "lcm",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/nuwax_geometry_runtime/src/lio_owner.rs"
+    ],
+    "apply_scope": "重启几何运行时后生效",
+    "aliases": [
+      "NUWAX_GEOMETRY_RUNTIME_LIO_STATUS_CHANNEL"
+    ],
+    "description": "设置激光惯性定位状态通道，可使用“/话题#消息类型”形式；各运行进程共用同一规范通道。"
+  },
+  "NUWAX_LOG_DIR": {
+    "zh_name": "项目日志目录",
+    "type": "str",
+    "default": "runtime_data/logs",
+    "section_id": "logging",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py"
+    ],
+    "apply_scope": "重启网关及各独立运行进程后生效",
+    "aliases": [
+      "GO2_PROXY_LOG_DIR"
+    ],
+    "description": "所有进程日志的共同目录；网关、几何运行时、导航、人物跟随、视频和运动控制分别写入自身文件，控制台统一查询。"
+  },
+  "NUWAX_LOG_FILE": {
+    "zh_name": "项目日志文件",
+    "type": "str",
+    "default": "runtime_data/logs/nuwax_robot_bridge.log",
+    "section_id": "logging",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "aliases": [
+      "GO2_PROXY_LOG_FILE"
+    ]
+  },
+  "NUWAX_LOG_LEVEL": {
+    "zh_name": "日志级别",
+    "type": "str",
+    "default": "INFO",
+    "section_id": "logging",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "aliases": [
+      "GO2_PROXY_LOG_LEVEL"
+    ]
+  },
+  "NUWAX_MAP_FRAME": {
+    "zh_name": "地图坐标系",
+    "type": "str",
+    "default": "map",
+    "section_id": "geometry_topics",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/geometry/nuwax_geometry_runtime/src/channel_registry.rs"
+    ],
+    "apply_scope": "重启网关、几何运行时及导航后端后生效",
+    "aliases": [
+      "NUWAX_GEOMETRY_MAP_FRAME"
+    ]
+  },
+  "NUWAX_BASE_FRAME": {
+    "zh_name": "机器人基座坐标系",
+    "type": "str",
+    "default": "base_link",
+    "section_id": "geometry_topics",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/geometry/nuwax_geometry_runtime/src/channel_registry.rs"
+    ],
+    "apply_scope": "重启网关、几何运行时及导航后端后生效",
+    "aliases": [
+      "NUWAX_GEOMETRY_BASE_FRAME"
+    ]
+  },
+  "NUWAX_GEOMETRY_ODOM_FRAME": {
+    "zh_name": "里程计坐标系",
+    "type": "str",
+    "default": "odom",
+    "section_id": "geometry_topics",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/geometry/nuwax_geometry_runtime/src/lcm_runtime.rs"
+    ],
+    "apply_scope": "重启网关、几何运行时及导航后端后生效",
+    "aliases": [
+      "NUWAX_ODOM_FRAME"
+    ]
+  },
+  "NUWAX_NAV_BODY_TO_SUPPORT_Z_M": {
+    "zh_name": "机体到支撑面距离（米）",
+    "type": "str",
+    "default": "",
+    "section_id": "nav_stack",
+    "target_file": "core_env",
+    "consumers": [
+      "services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_config.rs",
+      "gateways/runtime.py",
+      "gateways/http/console.py"
+    ],
+    "apply_scope": "重启网关、导航栈与几何运行时后生效；网页刷新后更新选点换算",
+    "description": "三维导航必需的实际标定距离，沿机体负Z轴；留空时不启用三维运动，不使用机器人净空高度猜测。"
+  },
+  "NUWAX_NAV_ROBOT_WIDTH_M": {
+    "zh_name": "导航机器人宽度（米）",
+    "type": "float",
+    "default": 0.3,
+    "section_id": "nav_stack",
+    "target_file": "core_env",
+    "consumers": [
+      "services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_config.rs"
+    ],
+    "apply_scope": "重启导航栈与几何运行时后生效",
+    "description": "三维全局规划与局部执行共用的实际机器人宽度。"
+  },
+  "NUWAX_NAV_ROBOT_HEIGHT_M": {
+    "zh_name": "导航机器人净空高度（米）",
+    "type": "float",
+    "default": 0.6,
+    "section_id": "nav_stack",
+    "target_file": "core_env",
+    "consumers": [
+      "services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_config.rs"
+    ],
+    "apply_scope": "重启导航栈与几何运行时后生效",
+    "description": "支撑面至机器人最高点所需净空，与机体到支撑面标定距离不同。"
+  },
+  "NUWAX_NAV_SURFACE_VOXEL_SIZE_M": {
+    "zh_name": "三维几何索引体素（米）",
+    "type": "float",
+    "default": 0.1,
+    "section_id": "nav_stack",
+    "target_file": "core_env",
+    "consumers": [
+      "services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_config.rs"
+    ],
+    "apply_scope": "重启导航栈与几何运行时后生效",
+    "description": "共享地形索引的分辨率；PCT有完整精细源时使用原始精度。来源点云不能比索引更粗。",
+    "effective_value_scope": "external_process"
+  },
+  "NUWAX_NAV_MIN_STAIR_TREAD_M": {
+    "zh_name": "楼梯最小踏面深度（米）",
+    "type": "float",
+    "default": 0.2,
+    "section_id": "nav_stack",
+    "target_file": "core_env",
+    "consumers": [
+      "services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_config.rs"
+    ],
+    "apply_scope": "重启导航栈与几何运行时后生效",
+    "description": "离散台阶两侧所需连续踏面深度，配合最大台阶高度和坡度使用。"
+  },
+  "NUWAX_NAV_LOCAL_HORIZON_M": {
+    "zh_name": "近场轨迹视距（米）",
+    "type": "float",
+    "default": 5.0,
+    "section_id": "nav_stack",
+    "target_file": "core_env",
+    "consumers": [
+      "services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_config.rs"
+    ],
+    "apply_scope": "重启导航栈后生效",
+    "description": "沿PCT全局路线选取前方参考的长度；实际窗口至少覆盖机体尺寸、控制前瞻和声明的转弯尺度。",
+    "minimum": 0.01
+  },
+  "NUWAX_NAV_LOCAL_REFRESH_DISTANCE_M": {
+    "zh_name": "近场轨迹更新距离（米）",
+    "type": "float",
+    "default": 1.0,
+    "section_id": "nav_stack",
+    "target_file": "core_env",
+    "consumers": [
+      "services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_config.rs"
+    ],
+    "apply_scope": "重启导航栈后生效",
+    "description": "沿路前进此距离后更新近场轨迹，复用余下全局路线；实际更新同时受剩余窗口长度约束，无需与视距手工配对。",
+    "minimum": 0.01
+  },
+  "NUWAX_NAV_SPLINE_ITERATIONS": {
+    "zh_name": "近场样条优化次数",
+    "type": "int",
+    "default": 12,
+    "section_id": "nav_stack",
+    "target_file": "core_env",
+    "consumers": [
+      "services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_config.rs"
+    ],
+    "apply_scope": "重启导航栈后生效",
+    "description": "局部三次样条的优化迭代上限，0—100；不增加全局搜索维度。",
+    "minimum": 0,
+    "maximum": 100
+  },
+  "NUWAX_GEOMETRY_TRAVERSABILITY_MAX_STEP_HEIGHT_M": {
+    "zh_name": "可通行最大台阶高度（米）",
+    "type": "float",
+    "default": 0.15,
+    "section_id": "nav_stack",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_config.rs"
+    ],
+    "apply_scope": "重启导航栈与几何运行时后生效",
+    "description": "未分别设置上、下台阶高度且未声明完整地形能力时的共同默认值；默认0.15米。不同机器人的越障能力应按实际能力配置，仍需满足踏面、坡度及机体净空。"
+  },
+  "NUWAX_NAV_MAX_STEP_UP_M": {
+    "zh_name": "机器人最大上台阶高度（米）",
+    "type": "float",
+    "default": "",
+    "section_id": "nav_stack",
+    "target_file": "core_env",
+    "consumers": [
+      "services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_config.rs"
+    ],
+    "apply_scope": "重启导航栈与几何运行时后生效",
+    "description": "可自定义0—1米，0表示不允许上台阶；例如0.20表示允许20厘米内的真实上阶，仍需满足踏面和机体净空。留空继承完整地形能力或共同台阶高度；显式值不能超过完整机器人能力标定声明的上限。"
+  },
+  "NUWAX_NAV_MAX_STEP_DOWN_M": {
+    "zh_name": "机器人最大下台阶高度（米）",
+    "type": "float",
+    "default": "",
+    "section_id": "nav_stack",
+    "target_file": "core_env",
+    "consumers": [
+      "services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_config.rs"
+    ],
+    "apply_scope": "重启导航栈与几何运行时后生效",
+    "description": "可自定义0—1米，0表示不允许下台阶；与上台阶独立，不能据上阶能力推断下阶能力。留空继承完整地形能力或共同台阶高度；显式值不能超过完整机器人能力标定声明的上限。"
+  },
+  "NUWAX_GEOMETRY_TRAVERSABILITY_MAX_SLOPE_DEG": {
+    "zh_name": "可通行最大坡度（度）",
+    "type": "float",
+    "default": 18.0,
+    "section_id": "nav_stack",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_config.rs"
+    ],
+    "apply_scope": "重启导航栈与几何运行时后生效",
+    "description": "MLS连续坡道的坡度上限；楼梯还要独立核对离散高度与踏面。"
+  },
+  "NUWAX_ROBOT_MODEL_PATH": {
+    "zh_name": "机器人外形模型路径",
+    "type": "str",
+    "default": "",
+    "section_id": "robot",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "core/robot_geometry.py"
+    ],
+    "apply_scope": "重启网关、几何运行时及导航后端后生效",
+    "description": "本地URDF（统一机器人描述格式）模型路径，相对路径按项目根解析。碰撞几何优先，整个模型没有碰撞几何时才使用显示几何并标明来源；完整手填长宽高时不依赖模型。留空使用驱动自带默认模型或兼容默认。"
+  },
+  "NUWAX_ROBOT_MODEL_BASE_LINK": {
+    "zh_name": "模型机体基准连杆",
+    "type": "str",
+    "default": "",
+    "section_id": "robot",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "core/robot_geometry.py"
+    ],
+    "apply_scope": "重启网关、几何运行时及导航后端后生效",
+    "description": "模型外形转换到此连杆坐标。留空依次选择base_link、base、trunk或模型根连杆；偏移、轮廓和高度均相对此基准，不是世界坐标。"
+  },
+  "NUWAX_ROBOT_MODEL_JOINT_POSITIONS_JSON": {
+    "zh_name": "模型静态参考关节位置",
+    "type": "str",
+    "default": "",
+    "section_id": "robot",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "core/robot_geometry.py"
+    ],
+    "apply_scope": "重启网关、几何运行时及导航后端后生效",
+    "description": "填写关节名到数字的JSON（结构化文本格式）对象；转动关节用弧度，移动关节用米。未填写使用模型零位，仅表示静态参考外包，不是实时腿部姿态；显式值超出关节限位会报错。"
+  },
+  "NUWAX_ROBOT_LENGTH_M": {
+    "zh_name": "机器人外包长度（米）",
+    "type": "str",
+    "default": "",
+    "section_id": "robot",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "core/robot_geometry.py"
+    ],
+    "apply_scope": "重启网关、几何运行时及导航后端后生效",
+    "description": "沿机体X轴的外包长度，必须大于0；手填优先，留空从模型或现有默认取得。完整手填长宽高时直接采用盒外包，不读取模型。"
+  },
+  "NUWAX_ROBOT_WIDTH_M": {
+    "zh_name": "机器人外包宽度（米）",
+    "type": "str",
+    "default": "",
+    "section_id": "robot",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "core/robot_geometry.py"
+    ],
+    "apply_scope": "重启网关、几何运行时及导航后端后生效",
+    "description": "沿机体Y轴的外包宽度，必须大于0；手填优先，留空从模型或现有默认取得。无显式模型且本项为空时兼容确实配置的旧导航宽度，不反向改写旧设置。"
+  },
+  "NUWAX_ROBOT_HEIGHT_M": {
+    "zh_name": "机器人外包高度（米）",
+    "type": "str",
+    "default": "",
+    "section_id": "robot",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "core/robot_geometry.py"
+    ],
+    "apply_scope": "重启网关、几何运行时及导航后端后生效",
+    "description": "沿机体Z轴的外包总高度，必须大于0；手填优先，留空从模型或现有默认取得。本项不是三维导航支撑面净空，也不代替机体到支撑面的标定距离。"
+  },
+  "NUWAX_ROBOT_CENTER_X_M": {
+    "zh_name": "外包中心X偏移（米）",
+    "type": "str",
+    "default": "",
+    "section_id": "robot",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "core/robot_geometry.py"
+    ],
+    "apply_scope": "重启网关、几何运行时及导航后端后生效",
+    "description": "外包中心相对机体基准的X坐标；留空保留模型偏移，完整手填长宽高时默认为0。"
+  },
+  "NUWAX_ROBOT_CENTER_Y_M": {
+    "zh_name": "外包中心Y偏移（米）",
+    "type": "str",
+    "default": "",
+    "section_id": "robot",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "core/robot_geometry.py"
+    ],
+    "apply_scope": "重启网关、几何运行时及导航后端后生效",
+    "description": "外包中心相对机体基准的Y坐标；留空保留模型偏移，完整手填长宽高时默认为0。"
+  },
+  "NUWAX_ROBOT_CENTER_Z_M": {
+    "zh_name": "外包中心Z偏移（米）",
+    "type": "str",
+    "default": "",
+    "section_id": "robot",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "core/robot_geometry.py"
+    ],
+    "apply_scope": "重启网关、几何运行时及导航后端后生效",
+    "description": "外包中心相对机体基准的Z坐标；留空保留模型偏移，完整手填长宽高时默认为0。高度上下界由中心加减半高确定，不从地面高度猜测。"
+  },
+  "NUWAX_GEOMETRY_PIPELINE": {
+    "zh_name": "建图、探索与导航执行链",
+    "type": "str",
+    "default": "lio_3d",
+    "section_id": "localization",
+    "target_file": "core_env",
+    "consumers": [
+      "contracts/navigation_pipeline.py",
+      "services/nuwax-workspace/crates/nuwax-nav-stack/src/production_pipeline.rs",
+      "services/geometry/nuwax_geometry_runtime/src/slam2d_owner.rs",
+      "services/geometry/planar_input_bridge.py"
+    ],
+    "apply_scope": "重启网关、几何运行时与导航栈后生效",
+    "description": "两条互斥完整链：三维激光惯性建图、三维表面探索及地形导航；二维激光建图、波前探索及平面导航。导航方案随执行链确定，保存后重启网关、几何与导航。"
+  },
+  "NUWAX_GEOMETRY_SLAM2D_CONFIG": {
+    "zh_name": "二维扫描与算法配置",
+    "type": "str",
+    "default": "",
+    "section_id": "localization",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/nuwax_geometry_runtime/src/slam2d_owner.rs",
+      "services/geometry/planar_input_bridge.py"
+    ],
+    "apply_scope": "重启Geometry与网关后生效",
+    "description": "JSON（结构化数据）对象，明确sensor_id、frame_id、map_frame_id、odom_frame_id、body_frame_id、clock_domain、clock_id、calibration_ref、odometry_source及core_config；core_config.base_from_laser必须为真实平面外参。core_config.scan_input_mode选择uniform（默认等角度归并）或raw（保留每束真实角度和距离，允许变化束数）；uniform的scan_count与angle_increment须成对设置，raw不使用这两项归并扫描。更换输入模式应新建地图。monotonic_ns时clock_id可写local_boot，由拥有方在启动时解析为真实boot_id。"
+  },
+  "NUWAX_GEOMETRY_SLAM2D_DEVICE": {
+    "zh_name": "二维雷达连接配置",
+    "type": "str",
+    "default": "",
+    "section_id": "localization",
+    "target_file": "core_env",
+    "consumers": [
+      "gateways/runtime.py",
+      "drivers/entry.py",
+      "drivers/common/planar_source.py"
+    ],
+    "apply_scope": "重启Geometry与网关后生效",
+    "description": "可选JSON对象，包含思岚雷达port、baudrate、scan_mode等；为空时消费机器人标准二维扫描提供器。"
+  },
+  "NUWAX_GEOMETRY_SLAM2D_BINARY": {
+    "zh_name": "二维算法程序路径",
+    "type": "str",
+    "default": "",
+    "section_id": "geometry_runtime",
+    "target_file": "core_env",
+    "consumers": [
+      "scripts/systemd/start_geometry_runtime.sh",
+      "services/geometry/nuwax_geometry_runtime/src/slam2d_owner.rs"
+    ],
+    "apply_scope": "重启Geometry与网关后生效",
+    "description": "可选显式程序路径，未配置时使用公共工作区release目录的nuwax-slam-2d-worker。"
+  },
+  "NUWAX_LCM_CHANNEL_PLANAR_NAVIGATION": {
+    "zh_name": "二维导航实时观测通道",
+    "type": "str",
+    "default": "/nav/planar_occupancy#nuwax_msgs.PlanarNavigationMap",
+    "section_id": "lcm",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/geometry/nuwax_geometry_runtime/src/channel_registry.rs",
+      "services/nuwax-workspace/crates/nuwax-nav-stack/src/topics.rs"
+    ],
+    "apply_scope": "重启网关、Geometry及导航后端后生效",
+    "aliases": [
+      "NUWAX_GEOMETRY_RUNTIME_PLANAR_NAVIGATION_CHANNEL"
+    ],
+    "description": "二维执行链专用派生观测，携带规范地图身份和新鲜扫描时间；不得与规范占据栅格通道重合。"
+  },
+  "NUWAX_NAV_CAPABILITIES_JSON": {
+    "zh_name": "导航与探索能力标定",
+    "type": "str",
+    "default": "",
+    "section_id": "nav_stack",
+    "target_file": "core_env",
+    "consumers": [
+      "contracts/navigation_capabilities.py",
+      "services/nuwax-workspace/crates/nuwax-nav-types-messages/src/navigation_capabilities.rs",
+      "services/navigation/motion_safety_guard/stop_confirmation.py",
+      "services/navigation/motion_safety_guard/mode_confirmation.py"
+    ],
+    "apply_scope": "重启运动守卫、几何运行时与导航栈后生效",
+    "description": "填写版本1的导航标定JSON（结构化文本），包含标定标识和实际速度、加减速、保证制动与转向能力，可附传感器视域及地形限制。停止命令先确认，停稳另按真实速度或保证制动上界确认；要求专门步态时用terrain.required_locomotion_mode指定提供器的命名模式，并核对实际反馈。留空不声明高级能力；实机值来自设备配置与测量。"
+  },
+  "NUWAX_FACILITY_PROVIDERS_JSON": {
+    "zh_name": "跨楼层设施提供器",
+    "type": "str",
+    "default": "{}",
+    "section_id": "nav_stack",
+    "target_file": "core_env",
+    "consumers": [
+      "services/navigation/facilities/http_provider.py",
+      "gateways/runtime.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "填写提供器标识到标准设施HTTP（超文本传输协议）桥接配置的映射。每项包含type=http、base_url及可选authorization_env（认证环境变量名）。空对象表示没有设施控制能力；楼层和入口出口通过建筑目录登记。"
+  },
+  "NUWAX_GEOMETRY_POINTLIO_OPTIONS": {
+    "zh_name": "逐点激光惯性定位参数",
+    "type": "str",
+    "default": "",
+    "section_id": "localization",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/nuwax_geometry_runtime/src/native_lio_owner.rs",
+      "services/nuwax-workspace/crates/nuwax-lio-backends/src/pointlio_options.rs"
+    ],
+    "apply_scope": "重启几何运行时及Point原生进程后生效；停止建图不会重载",
+    "description": "填写参数对象，例如 {\"point_filter_num\":1,\"lidar_meas_cov\":0.001,\"use_imu_as_input\":true,\"publish_odometry_without_downsample\":true}。支持惯性模式、噪声、盲区/量程、抽点、索引、初始化及逐点输出；字段和类型严格校验，未知或当前不支持的键会拒绝。扫描/地图体素、初图扫描数和外参仍使用各自设置，避免重复来源。留空沿用程序缺省值。",
+    "advanced": false
+  },
+  "NUWAX_GEOMETRY_PGO_OPTIONS": {
+    "zh_name": "扫描上下文、回环与位姿图参数",
+    "type": "str",
+    "default": "",
+    "section_id": "loop_closure",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/nuwax_geometry_runtime/src/correction_coordinator.rs",
+      "services/nuwax-workspace/crates/nuwax-mapping/src/loop_closure/options.rs"
+    ],
+    "apply_scope": "重启几何运行时后生效，无需重新构建；停止建图不会重载",
+    "description": "按参数覆盖扫描上下文检索、回环配准与确认、图约束和优化预算；空白项使用所选定位后端默认。修改后重启几何运行时，无需重新构建。",
+    "advanced": false
+  },
+  "NUWAX_SCENE_MAPPING_ENABLED": {
+    "zh_name": "启用语义地图",
+    "type": "bool",
+    "default": false,
+    "section_id": "runtime_data",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/memory/scene_mapping.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "启用语义地图能力；保存配置不启动模型服务。",
+    "advanced": false
+  },
+  "NUWAX_SCENE_MAPPING_AUTO_START": {
+    "zh_name": "自动启动语义处理",
+    "type": "bool",
+    "default": false,
+    "section_id": "runtime_data",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/memory/scene_mapping.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "网关启动后自动开始语义处理；须同时启用语义地图。",
+    "advanced": true
+  },
+  "NUWAX_SCENE_MAPPING_BACKEND": {
+    "zh_name": "语义决策后端",
+    "type": "str",
+    "default": "openjev_http",
+    "section_id": "runtime_data",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/memory/scene_mapping.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "选择本地OpenJev服务或Jev远程接口。",
+    "advanced": false,
+    "choices": [
+      "openjev_http",
+      "jev_api"
+    ],
+    "choice_labels": [
+      "本地OpenJev服务",
+      "Jev远程接口"
+    ]
+  },
+  "NUWAX_SCENE_MAPPING_BASE_URL": {
+    "zh_name": "语义决策服务地址",
+    "type": "str",
+    "default": "http://127.0.0.1:8791",
+    "section_id": "runtime_data",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/memory/scene_mapping.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "留空或未配置时按后端取默认值：本地http://127.0.0.1:8791，Jev为https://api.typesafe.ai/v1。填写服务根地址或/v1，不填写完整决策端点。",
+    "advanced": false
+  },
+  "NUWAX_SCENE_MAPPING_MODEL": {
+    "zh_name": "语义决策模型",
+    "type": "str",
+    "default": "AlexWortega/openjev:qwen3.5-4b-nli-v2",
+    "section_id": "runtime_data",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/memory/scene_mapping.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "留空或未配置时本地使用AlexWortega/openjev:qwen3.5-4b-nli-v2，Jev使用jev-1.13.0；显式值优先。",
+    "advanced": false
+  },
+  "NUWAX_SCENE_MAPPING_API_KEY": {
+    "zh_name": "语义决策服务密钥",
+    "type": "str",
+    "default": "",
+    "section_id": "runtime_data",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/memory/scene_mapping.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "Jev远程接口的访问密钥；查询脱敏，留空保存保留原值。",
+    "advanced": false,
+    "sensitive": true
+  },
+  "NUWAX_SCENE_MAPPING_TIMEOUT_SEC": {
+    "zh_name": "语义请求超时（秒）",
+    "type": "float",
+    "default": 30.0,
+    "section_id": "runtime_data",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/memory/scene_mapping.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "单次模型请求的最长等待时间。",
+    "advanced": true,
+    "minimum": 0.1,
+    "maximum": 600.0
+  },
+  "NUWAX_SCENE_MAPPING_INTERVAL_SEC": {
+    "zh_name": "语义处理间隔（秒）",
+    "type": "float",
+    "default": 10.0,
+    "section_id": "runtime_data",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/memory/scene_mapping.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "后台语义处理两轮之间的等待时间。",
+    "advanced": true,
+    "minimum": 0.1,
+    "maximum": 3600.0
+  },
+  "NUWAX_SCENE_MAPPING_MIN_AREA_M2": {
+    "zh_name": "房间最小面积（平方米）",
+    "type": "float",
+    "default": 2.0,
+    "section_id": "runtime_data",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/memory/scene_mapping.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "过滤小于该面积的几何房间候选。",
+    "advanced": true,
+    "minimum": 0.01,
+    "maximum": 1000000.0
+  },
+  "NUWAX_SCENE_MAPPING_DOORWAY_WIDTH_M": {
+    "zh_name": "门口分割宽度（米）",
+    "type": "float",
+    "default": 1.2,
+    "section_id": "runtime_data",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/memory/scene_mapping.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "房间分割识别狭窄通道的几何宽度。",
+    "advanced": true,
+    "minimum": 0.05,
+    "maximum": 20.0
+  },
+  "NUWAX_SCENE_MAPPING_MAX_CELLS": {
+    "zh_name": "语义分割最大栅格数",
+    "type": "int",
+    "default": 2000000,
+    "section_id": "runtime_data",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/memory/scene_mapping.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "限制单次房间分割的地图栅格总量。",
+    "advanced": true,
+    "minimum": 1,
+    "maximum": 16000000
+  },
+  "NUWAX_SCENE_MAPPING_MIN_EVIDENCE_VIEWS": {
+    "zh_name": "标注最少证据视角数",
+    "type": "int",
+    "default": 2,
+    "section_id": "runtime_data",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/memory/scene_mapping.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "自动采纳候选标签所需的最少有效视角。",
+    "advanced": true,
+    "minimum": 1,
+    "maximum": 100
+  },
+  "NUWAX_SCENE_MAPPING_MIN_LABEL_SCORE": {
+    "zh_name": "标注最低支持分数",
+    "type": "float",
+    "default": 0.85,
+    "section_id": "runtime_data",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/memory/scene_mapping.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "候选标签采纳策略的最低支持分数；未经现场概率校准。",
+    "advanced": true,
+    "minimum": 0.0,
+    "maximum": 1.0
+  },
+  "NUWAX_SCENE_MAPPING_MIN_LABEL_MARGIN": {
+    "zh_name": "标注最低分数差",
+    "type": "float",
+    "default": 0.15,
+    "section_id": "runtime_data",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/memory/scene_mapping.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "首选与次选标签的最低分数差；不是概率或精度保证。",
+    "advanced": true,
+    "minimum": 0.0,
+    "maximum": 1.0
+  },
+  "NUWAX_SCENE_MAPPING_MAX_REGIONS_PER_CYCLE": {
+    "zh_name": "每轮最多分析区域数",
+    "type": "int",
+    "default": 4,
+    "section_id": "runtime_data",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/memory/scene_mapping.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "限制单轮模型请求区域数。",
+    "advanced": true,
+    "minimum": 1,
+    "maximum": 100
+  },
+  "NUWAX_SCENE_MAPPING_MAX_EVIDENCE_AGE_SEC": {
+    "zh_name": "证据最长年龄（秒）",
+    "type": "float",
+    "default": 300.0,
+    "section_id": "runtime_data",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/memory/scene_mapping.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "超龄证据不参与当前语义决策。",
+    "advanced": true,
+    "minimum": 0.1,
+    "maximum": 86400.0
+  },
+  "NUWAX_SCENE_MAPPING_MAX_IMAGES": {
+    "zh_name": "单次决策最多图片数",
+    "type": "int",
+    "default": 3,
+    "section_id": "runtime_data",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/memory/scene_mapping.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "单次模型请求最多传入三张有效证据图片。",
+    "advanced": true,
+    "minimum": 1,
+    "maximum": 3
+  },
+  "NUWAX_SCENE_MAPPING_AUTO_APPLY": {
+    "zh_name": "自动采纳语义标签",
+    "type": "bool",
+    "default": true,
+    "section_id": "runtime_data",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/memory/scene_mapping.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "语义建图启用后默认自动填写有充分观察依据的区域名称；关闭则仅保留候选。用户或智能体显式命名优先。",
+    "advanced": false
+  },
+  "NUWAX_GEOMETRY_POINT_CLOUD_PREPROCESS_ENABLED": {
+    "zh_name": "旧点云预处理开关",
+    "effective_value_scope": "inactive",
+    "apply_scope": "仅兼容保存，当前内置执行链不使用",
+    "description": "保留旧配置导入导出；当前内置点云执行链不消费此值，重启也不会启用。实际精细地图分辨率以当前地图元数据为准。",
+    "type": "bool",
+    "default": true,
+    "target_file": "core_env"
+  },
+  "NUWAX_GEOMETRY_POINT_CLOUD_VOXEL_SIZE_M": {
+    "zh_name": "旧点云预处理体素",
+    "effective_value_scope": "inactive",
+    "apply_scope": "仅兼容保存，当前内置执行链不使用",
+    "description": "保留旧配置导入导出；当前内置点云执行链不消费此值，重启也不会启用。实际精细地图分辨率以当前地图元数据为准。",
+    "type": "float",
+    "default": 0.05,
+    "target_file": "core_env"
+  },
+  "NUWAX_GEOMETRY_POINT_CLOUD_MIN_RANGE_M": {
+    "zh_name": "旧点云最小距离",
+    "effective_value_scope": "inactive",
+    "apply_scope": "仅兼容保存，当前内置执行链不使用",
+    "description": "保留旧配置导入导出；当前内置点云执行链不消费此值，重启也不会启用。实际精细地图分辨率以当前地图元数据为准。",
+    "type": "float",
+    "default": 0.15,
+    "target_file": "core_env"
+  },
+  "NUWAX_GEOMETRY_POINT_CLOUD_MAX_RANGE_M": {
+    "zh_name": "旧点云最大距离",
+    "effective_value_scope": "inactive",
+    "apply_scope": "仅兼容保存，当前内置执行链不使用",
+    "description": "保留旧配置导入导出；当前内置点云执行链不消费此值，重启也不会启用。实际精细地图分辨率以当前地图元数据为准。",
+    "type": "float",
+    "default": 8.0,
+    "target_file": "core_env"
+  },
+  "NUWAX_GEOMETRY_POINT_CLOUD_MAX_POINTS": {
+    "zh_name": "旧点云最大点数",
+    "effective_value_scope": "inactive",
+    "apply_scope": "仅兼容保存，当前内置执行链不使用",
+    "description": "保留旧配置导入导出；当前内置点云执行链不消费此值，重启也不会启用。实际精细地图分辨率以当前地图元数据为准。",
+    "type": "int",
+    "default": 1200,
+    "target_file": "core_env"
+  },
+  "NUWAX_GEOMETRY_POINT_CLOUD_CROP_MIN_Z_M": {
+    "zh_name": "旧点云裁剪最低高度",
+    "effective_value_scope": "inactive",
+    "apply_scope": "仅兼容保存，当前内置执行链不使用",
+    "description": "保留旧配置导入导出；当前内置点云执行链不消费此值，重启也不会启用。实际精细地图分辨率以当前地图元数据为准。",
+    "type": "float",
+    "default": -0.6,
+    "target_file": "core_env"
+  },
+  "NUWAX_GEOMETRY_POINT_CLOUD_CROP_MAX_Z_M": {
+    "zh_name": "旧点云裁剪最高高度",
+    "effective_value_scope": "inactive",
+    "apply_scope": "仅兼容保存，当前内置执行链不使用",
+    "description": "保留旧配置导入导出；当前内置点云执行链不消费此值，重启也不会启用。实际精细地图分辨率以当前地图元数据为准。",
+    "type": "float",
+    "default": 1.6,
+    "target_file": "core_env"
+  },
+  "NUWAX_GEOMETRY_POINT_CLOUD_CROP_FORWARD_MIN_M": {
+    "zh_name": "旧点云裁剪前向起点",
+    "effective_value_scope": "inactive",
+    "apply_scope": "仅兼容保存，当前内置执行链不使用",
+    "description": "保留旧配置导入导出；当前内置点云执行链不消费此值，重启也不会启用。实际精细地图分辨率以当前地图元数据为准。",
+    "type": "float",
+    "default": -0.5,
+    "target_file": "core_env"
+  },
+  "NUWAX_GEOMETRY_POINT_CLOUD_CROP_FORWARD_MAX_M": {
+    "zh_name": "旧点云裁剪前向终点",
+    "effective_value_scope": "inactive",
+    "apply_scope": "仅兼容保存，当前内置执行链不使用",
+    "description": "保留旧配置导入导出；当前内置点云执行链不消费此值，重启也不会启用。实际精细地图分辨率以当前地图元数据为准。",
+    "type": "float",
+    "default": 6.0,
+    "target_file": "core_env"
+  },
+  "NUWAX_GEOMETRY_POINT_CLOUD_CROP_LATERAL_M": {
+    "zh_name": "旧点云裁剪侧向范围",
+    "effective_value_scope": "inactive",
+    "apply_scope": "仅兼容保存，当前内置执行链不使用",
+    "description": "保留旧配置导入导出；当前内置点云执行链不消费此值，重启也不会启用。实际精细地图分辨率以当前地图元数据为准。",
+    "type": "float",
+    "default": 3.0,
+    "target_file": "core_env"
+  },
+  "NUWAX_NAV_ACTUATOR_MOTION_MODEL": {
+    "type": "str",
+    "default": "",
+    "section_id": "nav_stack",
+    "target_file": "core_env",
+    "consumers": [
+      "scripts/resolve_navigation_pipeline.py",
+      "services/geometry/source_runtime_env.sh",
+      "services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_config.rs"
+    ],
+    "apply_scope": "重启网关、几何运行时及导航栈后生效",
+    "zh_name": "执行器基本运动形式",
+    "choices": [
+      "",
+      "omnidirectional"
+    ],
+    "choice_labels": [
+      "未显式声明",
+      "前后左右移动及原地转向"
+    ],
+    "description": "通用适配的显式运动学声明。与两项速度上限成组填写；当前只接入现有全向平面通道，空值不推断通用机器人的能力。仅声明通道，不提供保证制动或台阶能力；三维链消费。"
+  },
+  "NUWAX_NAV_ACTUATOR_MAX_LINEAR_MPS": {
+    "type": "str",
+    "default": "",
+    "section_id": "nav_stack",
+    "target_file": "core_env",
+    "consumers": [
+      "scripts/resolve_navigation_pipeline.py",
+      "services/geometry/source_runtime_env.sh",
+      "services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_config.rs"
+    ],
+    "apply_scope": "重启网关、几何运行时及导航栈后生效",
+    "zh_name": "执行器基本平面速度上限（米/秒）",
+    "description": "与基本运动形式、偏航速度成组填写，有限正数且不大于5。对前后左右采用相同保守命令上限，必须由实际适配通道支持；不表示已达到该速度。全组留空时沿现有设备缺省声明。"
+  },
+  "NUWAX_NAV_ACTUATOR_MAX_YAW_RPS": {
+    "type": "str",
+    "default": "",
+    "section_id": "nav_stack",
+    "target_file": "core_env",
+    "consumers": [
+      "scripts/resolve_navigation_pipeline.py",
+      "services/geometry/source_runtime_env.sh",
+      "services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_config.rs"
+    ],
+    "apply_scope": "重启网关、几何运行时及导航栈后生效",
+    "zh_name": "执行器基本偏航速度上限（弧度/秒）",
+    "description": "与基本运动形式、平面速度成组填写，有限正数且不大于4π。需要实际支持原地转向，不据此推测制动能力。非法或缺半组配置在业务进程启动前拒绝。"
+  },
+  "NUWAX_MANIPULATION_ENABLED": {
+    "zh_name": "外部物体操作任务",
+    "type": "bool",
+    "default": false,
+    "section_id": "gateway",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/manipulation/http_backend.py",
+      "gateways/manipulation.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "显式启用配置的外部操作设备；未发现实际任务能力时不公开工具。"
+  },
+  "NUWAX_MANIPULATION_BASE_URL": {
+    "zh_name": "操作设备HTTP地址",
+    "type": "str",
+    "default": "",
+    "section_id": "gateway",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/manipulation/http_backend.py",
+      "gateways/manipulation.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "本机或远端设备基础地址；NEH不加载设备动作模型。"
+  },
+  "NUWAX_MANIPULATION_HTTP_TIMEOUT_SEC": {
+    "zh_name": "操作设备请求期限",
+    "type": "float",
+    "default": 3.0,
+    "section_id": "gateway",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/manipulation/http_backend.py",
+      "gateways/manipulation.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "每次HTTP请求最长等待秒数。"
+  },
+  "NUWAX_MANIPULATION_STOP_TIMEOUT_SEC": {
+    "zh_name": "操作任务停止确认期限",
+    "type": "float",
+    "default": 10.0,
+    "section_id": "gateway",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/manipulation/http_backend.py",
+      "gateways/manipulation.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "取消后等待匹配任务终态及physics_paused的最长秒数。"
+  },
+  "NUWAX_MANIPULATION_POLL_INTERVAL_SEC": {
+    "zh_name": "操作任务状态查询间隔",
+    "type": "float",
+    "default": 0.2,
+    "section_id": "gateway",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/manipulation/http_backend.py",
+      "gateways/manipulation.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "查询同一设备任务状态的间隔秒数。"
+  },
+  "NUWAX_MOTION_STOP_FEEDBACK_TIMEOUT_SEC": {
+    "zh_name": "实测反馈停车等待上限",
+    "type": "float",
+    "default": 1.0,
+    "section_id": "nav_stack",
+    "target_file": "core_env",
+    "consumers": [
+      "services/navigation/motion_safety_guard/stop_confirmation.py"
+    ],
+    "apply_scope": "重启运动守卫后生效",
+    "description": "仅在未配置完整MotionLimits且提供真实执行反馈时使用的停车等待秒数，范围大于0且不超过30。不是保证制动标定；超时仍失败，速度与连续停稳判据不变。完整MotionLimits仍使用标定制动上界。"
+  }
+}

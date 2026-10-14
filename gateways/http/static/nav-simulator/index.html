@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NEH 导航实验台 · 开发机模拟</title>
+  <link rel="stylesheet" href="./simulator.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand" title="Nuwax Embodied Harness（NEH，具身运行框架）"><span class="brand-mark" aria-hidden="true">⌁</span><div><h1>NEH 导航实验台</h1><p>选一个目标，看清每一步。</p></div></div>
+    <div class="top-actions"><span class="environment"><i></i>开发机模拟</span><button id="export" class="button quiet" disabled>导出结果 <span aria-hidden="true">↗</span></button></div>
+  </header>
+  <div class="workspace">
+    <aside class="sidebar" aria-label="模拟设置">
+      <section class="section scene-section"><div class="section-heading"><h2>01 <span>场景与样本</span></h2><span id="cloud-count" class="small">等待地图</span></div>
+        <label class="field-label" for="scene">选择场景</label><select id="scene" disabled><option>正在读取场景…</option></select>
+        <p id="scene-description" class="description">加载真实地图点云与可复现的导航样本。</p>
+        <label class="field-label" for="case">预设样本</label><select id="case" disabled><option value="">自定义起点与目标</option></select>
+        <button id="fit" class="text-button">适配完整地图 <span aria-hidden="true">↗</span></button>
+      </section>
+      <section class="section"><div class="section-heading"><h2>02 <span>起点与目标</span></h2><span class="small">米 / 度</span></div>
+        <div class="pose-card"><div class="pose-heading"><span><i class="dot start"></i>起点</span><button id="pick-start" class="text-button" data-pick="start">在图上选点</button></div><div class="coordinate-grid" data-pose="start"><label>X<input id="start-x" type="number" step="0.05" value="0"></label><label>Y<input id="start-y" type="number" step="0.05" value="0"></label><label>机体 Z<input id="start-z" type="number" step="0.05" value="0.4"></label><label>朝向<input id="start-yaw" type="number" step="5" value="0"></label></div></div>
+        <div class="pose-card"><div class="pose-heading"><span><i class="dot goal"></i>目标</span><button id="pick-goal" class="text-button" data-pick="goal">在图上选点</button></div><div class="coordinate-grid" data-pose="goal"><label>X<input id="goal-x" type="number" step="0.05" value="7"></label><label>Y<input id="goal-y" type="number" step="0.05" value="0"></label><label>机体 Z<input id="goal-z" type="number" step="0.05" value="0.4"></label><label><span id="goal-yaw-label">参考朝向</span><input id="goal-yaw" type="number" step="5" value="0" disabled></label></div><label class="orientation-option"><input id="requires-orientation" type="checkbox">到达后对齐朝向</label></div>
+        <p class="hint" id="height-hint">地图选点使用实际地面点，自动换算机体高度。</p>
+      </section>
+      <section class="section"><div class="section-heading"><h2>03 <span>速度与干扰</span></h2></div>
+        <div class="speed-heading"><label for="speed">目标速度</label><output id="speed-value" for="speed">1.0 <small>米/秒</small></output></div>
+        <input id="speed" type="range" min="0.1" max="1.5" step="0.1" value="1"><div class="range-labels"><span>0.1</span><span>1.5 米/秒</span></div>
+        <div class="obstacle-fields"><label>障碍半径<input id="obstacle-radius" type="number" min="0.1" max="3" step="0.05" value="0.35"></label><label>障碍高度<input id="obstacle-height" type="number" min="0.1" max="3" step="0.1" value="1.2"></label></div>
+        <div class="button-row"><button id="pick-obstacle" class="button secondary" data-pick="obstacle">＋ 点击添加障碍</button><button id="clear-obstacles" class="button quiet" title="移除本轮添加的动态障碍">清除</button></div>
+        <p class="hint">运行中也可插入障碍，观察真实重规划与绕行。</p>
+      </section>
+      <div class="run-controls"><button id="run" class="button primary" disabled><span aria-hidden="true">▶</span> 开始模拟</button><div class="button-row"><button id="pause" class="button secondary" disabled>暂停</button><button id="reset" class="button quiet">重置</button></div></div>
+    </aside>
+    <main class="main">
+      <section class="viewport-card" aria-label="三维导航场景">
+        <div class="viewport-top"><div class="state-heading"><span id="status" class="status" data-status="ready"><i></i>准备就绪</span><span id="scene-name">导航场景</span></div><div class="segmented" aria-label="地图视角"><button id="view-perspective" aria-pressed="true">三维</button><button id="view-top" aria-pressed="false">俯视</button></div></div>
+        <div id="viewport"><div id="viewport-empty" class="empty"><span class="loading-ring"></span><strong>正在读取场景</strong><span>点云与路线来自本机算法服务</span></div><div id="pick-hint" class="pick-hint" hidden></div><span id="start-label" class="map-label start" hidden>起点</span><span id="goal-label" class="map-label goal" hidden>目标</span><span id="robot-label" class="map-label robot" hidden>机器人</span><div id="replay-badge" class="replay-badge" hidden>历史回放</div></div>
+        <div class="viewport-bottom"><div class="legend"><span><i class="line global"></i>全局路线</span><span title="当前真实速度命令的近场预测"><i class="line local"></i>局部预测</span><span><i class="line traveled"></i>真实轨迹</span><span><i class="dot obstacle"></i>动态障碍</span></div><span class="camera-hint">拖动旋转 · 滚轮缩放 · 右键平移</span></div>
+      </section>
+      <section class="metrics" aria-label="实时模拟指标"><article><span>实际速度</span><strong id="metric-speed">—</strong><small>米/秒</small></article><article><span>目标剩余距离</span><strong id="metric-distance">—</strong><small>米</small></article><article><span>模拟时间</span><strong id="metric-time">0.0</strong><small>秒</small></article><article><span>全局规划次数</span><strong id="metric-plans">0</strong><small>次</small></article></section>
+      <section class="playback-card" aria-label="轨迹回放"><div class="playback-top"><div class="playback-title"><span class="eyebrow">回看每一步</span><strong id="replay-time">0.0 / 0.0 秒</strong></div><div class="playback-actions"><button id="playback-play" class="button quiet compact" disabled>播放回放</button><select id="playback-speed" aria-label="回放倍速"><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option><option value="4">4×</option></select><button id="live" class="button quiet compact" disabled>回到实时</button></div></div><input id="timeline" type="range" min="0" max="0" step="0.02" value="0" disabled aria-label="回放进度"><div class="playback-footer"><span id="frame-count">等待轨迹帧</span><span>播放倍率只改变回放，不改变机器人速度</span></div></section>
+      <section class="diagnostics" aria-label="算法状态与诊断"><div class="diagnostic-message"><span class="eyebrow">算法反馈</span><p id="message" role="status">选择场景和目标后，开始一轮模拟。</p><p id="history-note" class="hint" hidden></p></div><dl><div><dt title="包括规划与计算等待的实际经过时间">实际用时</dt><dd id="wall-sec">—</dd></div><div><dt>运动复核拒绝</dt><dd id="validation-failures">0 次</dd></div><div><dt>规划耗时</dt><dd id="plan-ms">—</dd></div><div><dt>控制耗时</dt><dd id="control-ms">—</dd></div><div><dt title="MiB（二进制兆字节）；仅统计原生模拟进程">原生进程峰值内存</dt><dd id="memory-mb">—</dd></div><div><dt>原生模拟进程<br>处理器平均（单核100%）</dt><dd id="native-cpu-percent">—</dd></div><div><dt>原生模拟进程<br>累计处理器秒</dt><dd id="native-cpu-seconds">—</dd></div></dl></section>
+    </main>
+  </div>
+  <script type="module" src="./simulator.js"></script>
+</body>
+</html>

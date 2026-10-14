@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from compat import StrEnum
+from contracts.compat import StrEnum
 
 from pydantic import Field, field_validator
 
@@ -60,10 +60,41 @@ class InstanceObservationWindowSample(TimestampedContract):
     """实例短时观测窗口样本。"""
 
     pose: Pose = Field(description="观察到的对象位姿，统一使用 map frame。")
+    observer_pose: Optional[Pose] = Field(
+        default=None,
+        description="观测时相机/机器人位姿(map frame)，区别于对象位姿，供射线三角化与延迟点云重投影使用。",
+    )
     bbox_xyxy: List[float] = Field(default_factory=list, description="观察时二维包围盒。")
     confidence: float = Field(default=0.0, ge=0.0, le=1.0, description="观察置信度。")
     track_id: Optional[str] = Field(default=None, description="观察关联的跟踪标识。")
     metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")
+
+
+class DeferredProjectionInput(ContractModel):
+    """延迟投影(射线三角化 / 点云重投影)所需的单次观测输入缓存。
+
+    独立于 observation_window 滚动窗口，不被 8 样本上限驱逐，
+    供 pending 实例在累积点云稠密后重投影时使用。
+    """
+
+    observer_pose: Pose = Field(description="观测时相机/机器人位姿(map frame)。")
+    bbox_xyxy: List[float] = Field(default_factory=list, description="观测时二维包围盒。")
+    track_id: Optional[str] = Field(default=None, description="观测关联的跟踪标识(三角化主键)。")
+    camera_frame_id: Optional[str] = Field(default=None, description="相机坐标系标识。")
+    fx: Optional[float] = Field(default=None, description="相机内参 fx。")
+    fy: Optional[float] = Field(default=None, description="相机内参 fy。")
+    cx: Optional[float] = Field(default=None, description="相机内参 cx。")
+    cy: Optional[float] = Field(default=None, description="相机内参 cy。")
+    image_width_px: Optional[int] = Field(default=None, description="图像宽度像素。")
+    image_height_px: Optional[int] = Field(default=None, description="图像高度像素。")
+    ray_origin_map: Optional[List[float]] = Field(default=None, description="射线光心(map frame, [x,y,z])。")
+    ray_dir_map: Optional[List[float]] = Field(default=None, description="射线方向单位向量(map frame, [x,y,z])。")
+    cone_half_angle_rad: Optional[float] = Field(
+        default=None,
+        description="bbox 角张成的视锥半角(弧度)，供延迟点云锥内取点。",
+    )
+    source_observation_id: Optional[str] = Field(default=None, description="来源观测事件标识。")
+    timestamp: Optional[datetime] = Field(default=None, description="观测时间。")
 
 
 class SpatialAnchor(TimestampedContract):
@@ -73,7 +104,7 @@ class SpatialAnchor(TimestampedContract):
     anchor_kind: SpatialAnchorKind = Field(description="锚点类型。")
     name: str = Field(description="锚点名称。")
     pose: Pose = Field(description="锚点位姿，统一使用 map frame。")
-    map_version_id: Optional[str] = Field(default=None, description="关联地图版本。")
+    map_name: Optional[str] = Field(default=None, description="关联地图名称。")
     localization_session_id: Optional[str] = Field(default=None, description="关联定位会话。")
     topo_node_id: Optional[str] = Field(default=None, description="关联拓扑节点。")
     semantic_region_id: Optional[str] = Field(default=None, description="关联语义区域。")
@@ -92,7 +123,7 @@ class SemanticRegion(TimestampedContract):
 
     region_id: str = Field(description="区域标识。")
     anchor_id: str = Field(description="区域锚点标识。")
-    map_version_id: Optional[str] = Field(default=None, description="关联地图版本。")
+    map_name: Optional[str] = Field(default=None, description="关联地图名称。")
     localization_session_id: Optional[str] = Field(default=None, description="关联定位会话。")
     frame_id: str = Field(description="区域坐标系，统一应为 map。")
     label: str = Field(description="区域主标签。")
@@ -231,7 +262,7 @@ class SceneSpace(TimestampedContract):
     """面向语义导航和记忆检索的场景空间。"""
 
     scene_space_id: str = Field(description="场景空间标识。")
-    map_version_id: Optional[str] = Field(default=None, description="关联地图版本。")
+    map_name: Optional[str] = Field(default=None, description="关联地图名称。")
     localization_session_id: Optional[str] = Field(default=None, description="关联定位会话。")
     frame_id: str = Field(description="场景空间统一坐标系。")
     boundary: Optional[SceneSpaceBoundary] = Field(default=None, description="场景空间边界。")
@@ -292,7 +323,7 @@ class SemanticInstance(TimestampedContract):
     label: str = Field(description="实例主标签。")
     display_name: Optional[str] = Field(default=None, description="展示名称。")
     pose: Pose = Field(description="实例位姿，统一使用 map frame。")
-    map_version_id: Optional[str] = Field(default=None, description="关联地图版本。")
+    map_name: Optional[str] = Field(default=None, description="关联地图名称。")
     localization_session_id: Optional[str] = Field(default=None, description="关联定位会话。")
     topo_node_id: Optional[str] = Field(default=None, description="关联拓扑节点。")
     semantic_region_id: Optional[str] = Field(default=None, description="关联语义区域。")
@@ -306,6 +337,10 @@ class SemanticInstance(TimestampedContract):
     observation_window: List[InstanceObservationWindowSample] = Field(
         default_factory=list,
         description="用于动态实体隔离的短时观测窗口。",
+    )
+    deferred_projection_cache: List[DeferredProjectionInput] = Field(
+        default_factory=list,
+        description="延迟投影(射线三角化/点云重投影)输入缓存，独立于 observation_window，不被 8 样本上限驱逐。",
     )
     lifecycle_state: InstanceLifecycleState = Field(
         default=InstanceLifecycleState.ACTIVE,
@@ -354,7 +389,7 @@ class ObservationEvent(TimestampedContract):
     camera_id: Optional[str] = Field(default=None, description="来源相机。")
     pose: Optional[Pose] = Field(default=None, description="事件发生位姿。")
     frame_id: Optional[str] = Field(default=None, description="事件证据坐标系。")
-    map_version_id: Optional[str] = Field(default=None, description="关联地图版本。")
+    map_name: Optional[str] = Field(default=None, description="关联地图名称。")
     localization_session_id: Optional[str] = Field(default=None, description="关联定位会话。")
     topo_node_id: Optional[str] = Field(default=None, description="关联拓扑节点。")
     semantic_region_id: Optional[str] = Field(default=None, description="关联语义区域。")
@@ -400,7 +435,7 @@ class NavigationCandidate(TimestampedContract):
     target_name: str = Field(description="导航目标名称。")
     inspection_pose: Pose = Field(description="建议用于导航的巡检位姿。")
     anchor_pose: Optional[Pose] = Field(default=None, description="锚点中心位姿。")
-    map_version_id: Optional[str] = Field(default=None, description="关联地图版本。")
+    map_name: Optional[str] = Field(default=None, description="关联地图名称。")
     localization_session_id: Optional[str] = Field(default=None, description="关联定位会话。")
     topo_node_id: Optional[str] = Field(default=None, description="关联拓扑节点。")
     semantic_region_id: Optional[str] = Field(default=None, description="关联语义区域。")
@@ -437,7 +472,7 @@ class NavigationTrajectoryEvent(TimestampedContract):
     event_kind: NavigationTrajectoryEventKind = Field(description="轨迹事件类型。")
     pose: Optional[Pose] = Field(default=None, description="机器人历史位姿。")
     target_pose: Optional[Pose] = Field(default=None, description="关联候选目标位姿。")
-    map_version_id: Optional[str] = Field(default=None, description="关联地图版本。")
+    map_name: Optional[str] = Field(default=None, description="关联地图名称。")
     localization_session_id: Optional[str] = Field(default=None, description="关联定位会话。")
     navigation_candidate_id: Optional[str] = Field(default=None, description="关联导航候选标识。")
     source_record_kind: Optional[str] = Field(default=None, description="关联候选来源记录类型。")
@@ -469,7 +504,7 @@ class SemanticGraphRelation(TimestampedContract):
     source_node_id: str = Field(description="源节点标识。")
     target_node_kind: str = Field(description="目标节点类型。")
     target_node_id: str = Field(description="目标节点标识。")
-    map_version_id: Optional[str] = Field(default=None, description="关联地图版本。")
+    map_name: Optional[str] = Field(default=None, description="关联地图名称。")
     localization_session_id: Optional[str] = Field(default=None, description="关联定位会话。")
     confidence: float = Field(default=1.0, ge=0.0, le=1.0, description="关系置信度。")
     evidence_observation_event_ids: List[str] = Field(default_factory=list, description="支撑观察事件集合。")
@@ -489,7 +524,7 @@ class SemanticSummaryNode(TimestampedContract):
     summary_kind: SemanticSummaryKind = Field(description="摘要类型。")
     title: str = Field(description="摘要标题。")
     summary: str = Field(description="结构化摘要文本。")
-    map_version_id: Optional[str] = Field(default=None, description="关联地图版本。")
+    map_name: Optional[str] = Field(default=None, description="关联地图名称。")
     localization_session_id: Optional[str] = Field(default=None, description="关联定位会话。")
     scene_space_id: Optional[str] = Field(default=None, description="关联场景空间。")
     semantic_region_id: Optional[str] = Field(default=None, description="关联语义区域。")

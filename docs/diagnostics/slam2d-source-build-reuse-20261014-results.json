@@ -1,0 +1,222 @@
+{
+  "date_utc": "2026-10-14",
+  "source_baseline": "44ca07d685096eda5013da95dbff38b08989dc77",
+  "python": "3.8.10",
+  "cmake": "3.31.6",
+  "compiler": "Debian GCC 14.2.0",
+  "scope": "Actual build_dependencies; synthetic admitted sources and Boost stand-in; real CMake and tiny shared libraries; application hash guard active",
+  "installer_identity_tests": 57,
+  "stages": [
+    {
+      "stage": "baseline-a",
+      "changed_objects": [
+        "build/oneTBB/CMakeFiles/fixture_onetbb.dir/library.cpp.o",
+        "build/ceres/CMakeFiles/fixture_ceres.dir/library.cpp.o"
+      ],
+      "success": true,
+      "runtime_values": {
+        "onetbb": "1",
+        "ceres": "1"
+      },
+      "cmake_call_count": 6,
+      "command_exit_codes": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "configured_build_directories": [
+        "cache/build/oneTBB",
+        "cache/build/ceres"
+      ]
+    },
+    {
+      "stage": "candidate-a-repeat",
+      "changed_objects": [],
+      "success": true,
+      "runtime_values": {
+        "onetbb": "1",
+        "ceres": "1"
+      },
+      "cmake_call_count": 6,
+      "command_exit_codes": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "configured_build_directories": [
+        "cache/build/oneTBB",
+        "cache/build/ceres"
+      ]
+    },
+    {
+      "stage": "baseline-pin-change-fails",
+      "changed_objects": [],
+      "success": false,
+      "cmake_call_count": 4,
+      "command_exit_codes": [
+        0,
+        0,
+        0,
+        1
+      ],
+      "configured_build_directories": [
+        "cache/build/oneTBB",
+        "cache/build/ceres"
+      ]
+    },
+    {
+      "stage": "candidate-b-first",
+      "changed_objects": [
+        "build/slam2d-ceres-b/CMakeFiles/fixture_ceres.dir/library.cpp.o"
+      ],
+      "success": true,
+      "runtime_values": {
+        "onetbb": "1",
+        "ceres": "2"
+      },
+      "cmake_call_count": 6,
+      "command_exit_codes": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "configured_build_directories": [
+        "cache/build/oneTBB",
+        "cache/build/slam2d-ceres-b"
+      ]
+    },
+    {
+      "stage": "candidate-b-repeat",
+      "changed_objects": [],
+      "success": true,
+      "runtime_values": {
+        "onetbb": "1",
+        "ceres": "2"
+      },
+      "cmake_call_count": 6,
+      "command_exit_codes": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "configured_build_directories": [
+        "cache/build/oneTBB",
+        "cache/build/slam2d-ceres-b"
+      ]
+    },
+    {
+      "stage": "candidate-rollback-a",
+      "changed_objects": [],
+      "success": true,
+      "runtime_values": {
+        "onetbb": "1",
+        "ceres": "1"
+      },
+      "cmake_call_count": 6,
+      "command_exit_codes": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "configured_build_directories": [
+        "cache/build/oneTBB",
+        "cache/build/ceres"
+      ]
+    },
+    {
+      "stage": "candidate-configure-failure",
+      "changed_objects": [],
+      "success": false,
+      "cmake_call_count": 4,
+      "command_exit_codes": [
+        0,
+        0,
+        0,
+        1
+      ],
+      "configured_build_directories": [
+        "cache/build/oneTBB",
+        "cache/build/slam2d-ceres-b"
+      ]
+    },
+    {
+      "stage": "candidate-configure-retry",
+      "changed_objects": [],
+      "success": true,
+      "runtime_values": {
+        "onetbb": "1",
+        "ceres": "2"
+      },
+      "cmake_call_count": 6,
+      "command_exit_codes": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "configured_build_directories": [
+        "cache/build/oneTBB",
+        "cache/build/slam2d-ceres-b"
+      ]
+    },
+    {
+      "stage": "candidate-build-failure",
+      "changed_objects": [],
+      "success": false,
+      "cmake_call_count": 5,
+      "command_exit_codes": [
+        0,
+        0,
+        0,
+        0,
+        2
+      ],
+      "configured_build_directories": [
+        "cache/build/oneTBB",
+        "cache/build/slam2d-ceres-b"
+      ]
+    },
+    {
+      "stage": "candidate-build-retry",
+      "changed_objects": [
+        "build/slam2d-ceres-b/CMakeFiles/fixture_ceres.dir/library.cpp.o"
+      ],
+      "success": true,
+      "runtime_values": {
+        "onetbb": "1",
+        "ceres": "2"
+      },
+      "cmake_call_count": 6,
+      "command_exit_codes": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "configured_build_directories": [
+        "cache/build/oneTBB",
+        "cache/build/slam2d-ceres-b"
+      ]
+    }
+  ],
+  "final_contract_note": "Includes coupled managed-prefix environment-isolation test"
+}

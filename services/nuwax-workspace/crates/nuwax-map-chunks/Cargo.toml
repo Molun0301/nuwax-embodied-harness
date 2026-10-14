@@ -1,0 +1,12 @@
+[package]
+name = "nuwax-map-chunks"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+getrandom = "0.3"
+libc = "0.2"
+tempfile = "3"

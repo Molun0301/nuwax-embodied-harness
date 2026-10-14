@@ -1,0 +1,18 @@
+[package]
+name = "nuwax-protocol"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "nuwax 消息协议层：消息类型、主题和LCM（轻量通信与编组）帧"
+
+[dependencies]
+nuwax-types = { path = "../nuwax-types" }
+nuwax-codec = { path = "../nuwax-codec" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }

@@ -1,0 +1,9 @@
+package nuwax_msgs;
+
+struct FrontierList {
+    int64_t stamp_sec;
+    int32_t stamp_nsec;
+    string frame_id;
+    int32_t frontiers_length;
+    Frontier frontiers[256];
+}

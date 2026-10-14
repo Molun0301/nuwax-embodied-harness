@@ -1,15 +1,112 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Tuple
+import math
+from typing import Dict, Iterable, List, Optional, Protocol, Sequence, Tuple
 
 import numpy as np
 
-from contracts.frame_semantics import frame_ids_semantically_equal
+from contracts.frame_semantics import frame_ids_semantically_equal, infer_frame_role
 from contracts.geometry import Pose, Quaternion, Vector3
 from contracts.runtime_views import LocalizationSnapshot, PerceptionContext
 from services.localization.frame_tree_ops import transform_points_to_frame, transform_pose_to_frame
 from services.memory.semantic_map_builder import SemanticMapBuildResult
+from services.perception.ray_triangulation import triangulate_rays, triangulation_confidence
+
+
+@dataclass(frozen=True)
+class RaySample:
+    """单条 map frame 观测射线(光心 + 单位方向)。"""
+
+    origin: Tuple[float, float, float]
+    direction: Tuple[float, float, float]
+    half_angle_rad: float = 0.0  # bbox 角张成的视锥半角，供延迟点云锥内取点
+
+
+class RayHistoryProvider(Protocol):
+    """历史观测射线查询接口(依赖注入，避免投影层持有可变状态)。
+
+    主键 track_id，回退键 instance_id(track 断裂时同一实例的射线不丢)。
+    """
+
+    def get_rays(
+        self,
+        *,
+        track_id: Optional[str],
+        instance_id: Optional[str],
+    ) -> List[RaySample]:
+        ...
+
+
+class InstanceCacheRayHistoryProvider:
+    """从已有实例的 deferred_projection_cache 读取历史射线。
+
+    投影层无状态：本 provider 由 service 层在每次投影前用当前实例快照构造，
+    按 track_id(主键)/ instance_id(回退键)双索引返回历史射线。
+    """
+
+    def __init__(self, instances: Iterable[object]) -> None:
+        self._rays_by_track: Dict[str, List[RaySample]] = {}
+        self._rays_by_instance: Dict[str, List[RaySample]] = {}
+        track_owner: Dict[str, str] = {}
+        ambiguous_tracks: set[str] = set()
+        for instance in instances:
+            instance_id = str(getattr(instance, "instance_id", "") or "")
+            cache = getattr(instance, "deferred_projection_cache", None) or []
+            collected: List[RaySample] = []
+            samples_by_track: Dict[str, List[RaySample]] = {}
+            for entry in cache:
+                origin = getattr(entry, "ray_origin_map", None)
+                direction = getattr(entry, "ray_dir_map", None)
+                if not origin or not direction or len(origin) < 3 or len(direction) < 3:
+                    continue
+                try:
+                    sample = RaySample(
+                        origin=(float(origin[0]), float(origin[1]), float(origin[2])),
+                        direction=(float(direction[0]), float(direction[1]), float(direction[2])),
+                    )
+                except (TypeError, ValueError):
+                    continue
+                if not all(math.isfinite(value) for value in (*sample.origin, *sample.direction)):
+                    continue
+                if sum(value * value for value in sample.direction) <= 0.0:
+                    continue
+                collected.append(sample)
+                window_track = self._extract_track_id(entry)
+                if window_track:
+                    samples_by_track.setdefault(window_track, []).append(sample)
+            if not collected:
+                continue
+            if instance_id:
+                self._rays_by_instance[instance_id] = collected
+            for track_id, samples in samples_by_track.items():
+                if track_id in track_owner and track_owner[track_id] != instance_id:
+                    ambiguous_tracks.add(track_id)
+                    continue
+                track_owner[track_id] = instance_id
+                self._rays_by_track.setdefault(track_id, []).extend(samples)
+        # 跟踪号可被相机或重启后的跟踪器复用，归属不唯一时禁止混合射线三角化。
+        for track_id in ambiguous_tracks:
+            self._rays_by_track.pop(track_id, None)
+
+    @staticmethod
+    def _extract_track_id(entry: object) -> Optional[str]:
+        track_id = getattr(entry, "track_id", None)
+        if track_id:
+            return str(track_id)
+        return None
+
+    def get_rays(
+        self,
+        *,
+        track_id: Optional[str],
+        instance_id: Optional[str],
+    ) -> List[RaySample]:
+        if track_id and track_id in self._rays_by_track:
+            return list(self._rays_by_track[track_id])
+        if instance_id and instance_id in self._rays_by_instance:
+            return list(self._rays_by_instance[instance_id])
+        return []
 
 
 @dataclass(frozen=True)
@@ -30,6 +127,7 @@ class ProjectedObservation:
     visual_labels: Tuple[str, ...]
     attributes: Dict[str, object]
     pose_quality_level: str = "low"  # "high", "medium", "low", "fallback"
+    observer_body_pose: Optional[Pose] = None
 
 
 class VisionToMapProjectionService:
@@ -40,6 +138,20 @@ class VisionToMapProjectionService:
     _MAP_POINT_KEYS = ("map_points", "support_points_map", "point_samples_map", "map_point", "point_sample_map")
     _CAMERA_POINT_KEYS = ("camera_points", "support_points_3d", "point_samples_camera", "camera_point", "point_sample_camera")
 
+    def __init__(
+        self,
+        *,
+        triangulation_enabled: bool = False,
+        triangulation_min_rays: int = 2,
+        triangulation_min_parallax_deg: float = 5.0,
+        triangulation_max_residual_m: float = 0.5,
+    ) -> None:
+        # 三角化默认关闭(disabled 策略=现状，向后兼容)；由 strategy 配置开启。
+        self._triangulation_enabled = bool(triangulation_enabled)
+        self._triangulation_min_rays = max(2, int(triangulation_min_rays))
+        self._triangulation_min_parallax_deg = float(triangulation_min_parallax_deg)
+        self._triangulation_max_residual_m = float(triangulation_max_residual_m)
+
     def project(
         self,
         perception_context: PerceptionContext,
@@ -47,6 +159,7 @@ class VisionToMapProjectionService:
         current_pose: Optional[Pose],
         map_context: SemanticMapBuildResult,
         localization_snapshot: Optional[LocalizationSnapshot] = None,
+        ray_history: Optional[RayHistoryProvider] = None,
     ) -> Tuple[ProjectedObservation, ...]:
         effective_pose = current_pose or (
             localization_snapshot.current_pose if localization_snapshot is not None else None
@@ -54,28 +167,58 @@ class VisionToMapProjectionService:
         if effective_pose is None:
             return ()
         frame_tree = localization_snapshot.frame_tree if localization_snapshot is not None else None
+        observer_body_pose = effective_pose
+        if not frame_ids_semantically_equal(effective_pose.frame_id, map_context.frame_id):
+            observer_body_pose = transform_pose_to_frame(
+                frame_tree, effective_pose, target_frame_id=map_context.frame_id)
+        if observer_body_pose is not None:
+            observer_body_pose = observer_body_pose.model_copy(update={
+                "frame_id": map_context.frame_id, "timestamp": effective_pose.timestamp})
         projected: List[ProjectedObservation] = []
         track_pose_by_id = self._build_track_pose_index(perception_context)
         for detection in perception_context.observation.detections_3d:
-            projected_pose = self._resolve_pose_to_map(
-                detection.pose,
-                current_pose=effective_pose,
-                map_frame=map_context.frame_id,
-                frame_tree=frame_tree,
-            )
+            if frame_ids_semantically_equal(detection.pose.frame_id, map_context.frame_id):
+                projected_pose = self._resolve_pose_to_map(
+                    detection.pose, current_pose=effective_pose, map_frame=map_context.frame_id, frame_tree=frame_tree,
+                )
+                extent_orientation = projected_pose.orientation
+            else:
+                transformed_pose = transform_pose_to_frame(
+                    frame_tree, detection.pose, target_frame_id=map_context.frame_id,
+                )
+                projected_pose = transformed_pose or self._relative_pose_to_map(
+                    detection.pose, current_pose=effective_pose, map_frame=map_context.frame_id,
+                )
+                extent_orientation = transformed_pose.orientation if transformed_pose is not None else None
+            if (extent_orientation is None and infer_frame_role(detection.pose.frame_id) == "base"
+                    and frame_ids_semantically_equal(effective_pose.frame_id, map_context.frame_id)):
+                # Existing relative-position fallback is valid for body-frame data.
+                # Compose the box's orientation too, without changing nav pose semantics.
+                a, b = effective_pose.orientation, detection.pose.orientation
+                extent_orientation = Quaternion(
+                    x=a.w*b.x + a.x*b.w + a.y*b.z - a.z*b.y,
+                    y=a.w*b.y - a.x*b.z + a.y*b.w + a.z*b.x,
+                    z=a.w*b.z + a.x*b.y - a.y*b.x + a.z*b.w,
+                    w=a.w*b.w - a.x*b.x - a.y*b.y - a.z*b.z,
+                )
             if projected_pose is None:
                 continue
+            # Only explicit detector identity can bridge simultaneous 2D/3D
+            # observations. The context camera need not own a fused 3D detection.
+            camera_id = detection.attributes.get("camera_id")
+            track_id = detection.attributes.get("track_id")
             projected.append(
                 self._build_projected_observation(
                     label=detection.label,
                     score=detection.score,
                     pose=projected_pose,
-                    camera_id=None,
-                    track_id=None,
+                    camera_id=(camera_id.strip() or None) if isinstance(camera_id, str) else None,
+                    track_id=(track_id.strip() or None) if isinstance(track_id, str) else None,
                     instance_type=str(detection.attributes.get("instance_type") or "object"),
                     source_observation_id=perception_context.observation.observation_id,
                     source_artifact_ids=tuple(perception_context.observation.artifact_ids),
                     map_context=map_context,
+                    observer_body_pose=observer_body_pose,
                     attributes={
                         **dict(detection.attributes),
                         "projection_method": str(detection.attributes.get("projection_method") or "detection3d_pose"),
@@ -84,6 +227,15 @@ class VisionToMapProjectionService:
                         "size_x_m": detection.size_x_m,
                         "size_y_m": detection.size_y_m,
                         "size_z_m": detection.size_z_m,
+                        "extent_projection_status": "projected" if extent_orientation is not None else "frame_transform_unverified",
+                        "object_extent": {
+                            "frame_id": map_context.frame_id,
+                            "center_offset_m": {"x": 0.0, "y": 0.0, "z": 0.0},
+                            "size_m": {"x": detection.size_x_m, "y": detection.size_y_m, "z": detection.size_z_m},
+                            "orientation": extent_orientation.model_dump() if extent_orientation is not None else None,
+                            "source": "detection3d",
+                            "source_observation_id": perception_context.observation.observation_id,
+                        },
                     },
                 )
             )
@@ -96,6 +248,7 @@ class VisionToMapProjectionService:
                 track_pose_by_id=track_pose_by_id,
                 map_frame=map_context.frame_id,
                 frame_tree=frame_tree,
+                ray_history=ray_history,
             )
             if projected_pose is None:
                 continue
@@ -110,6 +263,7 @@ class VisionToMapProjectionService:
                     source_observation_id=perception_context.observation.observation_id,
                     source_artifact_ids=tuple(perception_context.observation.artifact_ids),
                     map_context=map_context,
+                    observer_body_pose=observer_body_pose,
                     attributes=projection_attributes,
                 )
             )
@@ -131,8 +285,20 @@ class VisionToMapProjectionService:
         track_pose_by_id: Dict[str, Pose],
         map_frame: str,
         frame_tree,
+        ray_history: Optional[RayHistoryProvider] = None,
     ) -> Tuple[Optional[Pose], Dict[str, object]]:
         base_attributes = self._detection_attributes_with_segmentation(detection)
+        # 计算本次检测射线(光心+bbox中心方向，map frame)，写入 attributes 供下游缓存/三角化。
+        current_ray = self._compute_detection_ray(
+            detection=detection,
+            perception_context=perception_context,
+            map_frame=map_frame,
+            frame_tree=frame_tree,
+        )
+        if current_ray is not None:
+            base_attributes["ray_origin_map"] = list(current_ray.origin)
+            base_attributes["ray_dir_map"] = list(current_ray.direction)
+            base_attributes["ray_cone_half_angle_rad"] = float(current_ray.half_angle_rad)
         explicit_pose = self._pose_from_attributes(base_attributes, map_frame=map_frame)
         if explicit_pose is not None:
             projected_pose = self._resolve_pose_to_map(
@@ -192,6 +358,18 @@ class VisionToMapProjectionService:
         if depth_pose is not None:
             return depth_pose, self._merge_projection_attributes(base_attributes, **depth_attributes)
 
+        # 路径T：多视角射线三角化(depth 之后、fallback 之前)。不依赖点云，绕开 L2 稀疏。
+        if self._triangulation_enabled and ray_history is not None and current_ray is not None:
+            tri_pose, tri_attributes = self._pose_from_ray_triangulation(
+                detection=detection,
+                current_ray=current_ray,
+                current_pose=current_pose,
+                map_frame=map_frame,
+                ray_history=ray_history,
+            )
+            if tri_pose is not None:
+                return tri_pose, self._merge_projection_attributes(base_attributes, **tri_attributes)
+
         return (
             Pose(
                 frame_id=map_frame,
@@ -216,6 +394,175 @@ class VisionToMapProjectionService:
                 observation_only=True,
             ),
         )
+
+    def _compute_detection_ray(
+        self,
+        *,
+        detection,
+        perception_context: PerceptionContext,
+        map_frame: str,
+        frame_tree,
+    ) -> Optional[RaySample]:
+        """计算本次检测的 map frame 射线(相机光心 + bbox 中心反投影方向)。
+
+        光心 = 相机系原点变换到 map；方向 = bbox 中心像素反投影的单位向量(相机系)
+        变换到 map 后减光心并归一化。复用与点云投影相同的 frame_tree 路径。
+        """
+
+        camera_info = perception_context.camera_info
+        if camera_info is None:
+            return None
+        camera_frame_id = camera_info.frame_id or detection.camera_id or perception_context.camera_id
+        if not camera_frame_id:
+            return None
+        pixel_u, pixel_v, _pixel_source = self._resolve_projection_pixel(
+            detection=detection,
+            image_width_px=perception_context.observation.metadata.get("width_px") or camera_info.width_px,
+            image_height_px=perception_context.observation.metadata.get("height_px") or camera_info.height_px,
+        )
+        # 单位深度反投影方向 + 相机光心(0,0,0)，一并变换到 map。
+        direction_camera = self._backproject_pixel_with_depth(
+            pixel_u=pixel_u,
+            pixel_v=pixel_v,
+            depth_m=1.0,
+            camera_info=camera_info,
+        )
+        origin_camera = Vector3(x=0.0, y=0.0, z=0.0)
+        transformed = transform_points_to_frame(
+            frame_tree,
+            [origin_camera, direction_camera],
+            source_frame_id=camera_frame_id,
+            target_frame_id=map_frame,
+        )
+        if transformed is None or len(transformed) < 2:
+            return None
+        origin = np.asarray([float(transformed[0].x), float(transformed[0].y), float(transformed[0].z)], dtype=np.float64)
+        far = np.asarray([float(transformed[1].x), float(transformed[1].y), float(transformed[1].z)], dtype=np.float64)
+        direction = far - origin
+        norm = float(np.linalg.norm(direction))
+        if norm < 1e-9:
+            return None
+        direction = direction / norm
+        # 视锥半角：bbox 角点相对中心方向的最大夹角(相机系内计算，夹角对刚体变换不变)。
+        half_angle_rad = self._bbox_cone_half_angle_rad(
+            detection=detection,
+            center_dir_camera=direction_camera,
+            camera_info=camera_info,
+        )
+        return RaySample(
+            origin=(float(origin[0]), float(origin[1]), float(origin[2])),
+            direction=(float(direction[0]), float(direction[1]), float(direction[2])),
+            half_angle_rad=float(half_angle_rad),
+        )
+
+    def _bbox_cone_half_angle_rad(self, *, detection, center_dir_camera: Vector3, camera_info) -> float:
+        """bbox 四角反投影方向相对中心方向的最大夹角(弧度)。
+
+        角度对相机→map 刚体变换不变，故直接在相机系计算。bbox 缺失时回退一个
+        保守半角(约 3°)，避免锥退化为零。
+        """
+
+        bbox = getattr(detection, "bbox", None)
+        if bbox is None:
+            return math.radians(3.0)
+        try:
+            left = float(bbox.x_px)
+            top = float(bbox.y_px)
+            right = left + float(bbox.width_px)
+            bottom = top + float(bbox.height_px)
+        except (TypeError, ValueError):
+            return math.radians(3.0)
+        center = np.asarray(
+            [float(center_dir_camera.x), float(center_dir_camera.y), float(center_dir_camera.z)],
+            dtype=np.float64,
+        )
+        center_norm = float(np.linalg.norm(center))
+        if center_norm < 1e-9:
+            return math.radians(3.0)
+        center = center / center_norm
+        max_angle = 0.0
+        for corner_u, corner_v in ((left, top), (right, top), (left, bottom), (right, bottom)):
+            corner_vec = self._backproject_pixel_with_depth(
+                pixel_u=corner_u,
+                pixel_v=corner_v,
+                depth_m=1.0,
+                camera_info=camera_info,
+            )
+            corner = np.asarray([float(corner_vec.x), float(corner_vec.y), float(corner_vec.z)], dtype=np.float64)
+            corner_norm = float(np.linalg.norm(corner))
+            if corner_norm < 1e-9:
+                continue
+            corner = corner / corner_norm
+            dot = float(np.clip(np.dot(center, corner), -1.0, 1.0))
+            max_angle = max(max_angle, float(np.arccos(dot)))
+        # 加 10% 余量并钳制到合理范围，避免锥过窄漏点或过宽纳入背景。
+        half_angle = max_angle * 1.1
+        return float(min(max(half_angle, math.radians(1.0)), math.radians(30.0)))
+
+    def _pose_from_ray_triangulation(
+        self,
+        *,
+        detection,
+        current_ray: RaySample,
+        current_pose: Pose,
+        map_frame: str,
+        ray_history: RayHistoryProvider,
+    ) -> Tuple[Optional[Pose], Dict[str, object]]:
+        """用历史射线 + 本次射线做多视角三角化(异常安全，失败降级 fallback)。"""
+
+        try:
+            history = ray_history.get_rays(
+                track_id=detection.track_id,
+                instance_id=str(detection.attributes.get("instance_id") or "") or None,
+            )
+        except Exception:
+            history = []
+        samples: List[RaySample] = list(history) + [current_ray]
+        if len(samples) < self._triangulation_min_rays:
+            return None, {}
+        origins = [s.origin for s in samples]
+        directions = [s.direction for s in samples]
+        try:
+            result = triangulate_rays(
+                origins,
+                directions,
+                min_rays=self._triangulation_min_rays,
+                min_parallax_deg=self._triangulation_min_parallax_deg,
+                max_residual_m=self._triangulation_max_residual_m,
+            )
+        except Exception:
+            return None, {}
+        if result is None:
+            return None, {}
+        confidence = triangulation_confidence(
+            ray_count=result.ray_count,
+            residual_m=result.residual_m,
+            max_residual_m=self._triangulation_max_residual_m,
+        )
+        pose = Pose(
+            frame_id=map_frame,
+            position=Vector3(x=result.point[0], y=result.point[1], z=result.point[2]),
+            orientation=current_pose.orientation,
+        )
+        return pose, {
+            "projection_method": "ray_triangulation",
+            "projection_confidence": float(confidence),
+            "support_point_count": int(result.ray_count),
+            "coverage": 1.0,
+            "depth_coverage": 0.0,
+            "map_projection_coverage": 1.0,
+            "reprojection_error": round(float(result.residual_m), 6),
+            "projection_degradation_reason": "",
+            "triangulation_ray_count": int(result.ray_count),
+            "triangulation_parallax_deg": round(float(result.parallax_deg), 4),
+            "triangulation_residual_m": round(float(result.residual_m), 6),
+            "centroid_map": {
+                "x": round(float(result.point[0]), 6),
+                "y": round(float(result.point[1]), 6),
+                "z": round(float(result.point[2]), 6),
+            },
+            "navigable": True,
+        }
 
     def _resolve_pose_to_map(
         self,
@@ -249,7 +596,7 @@ class VisionToMapProjectionService:
     ) -> Tuple[Optional[Pose], Dict[str, object]]:
         map_points = self._extract_points(attributes, keys=self._MAP_POINT_KEYS, default_frame_id=map_frame)
         if map_points is not None:
-            return self._pose_from_resolved_points(
+            pose, evidence = self._pose_from_resolved_points(
                 map_points[0],
                 current_pose=current_pose,
                 map_frame=map_frame,
@@ -257,6 +604,13 @@ class VisionToMapProjectionService:
                 projection_confidence=0.97,
                 map_projection_coverage=1.0,
             )
+            try:
+                extent_frame_matches = frame_ids_semantically_equal(map_points[1], map_frame)
+            except ValueError:
+                extent_frame_matches = False
+            if not extent_frame_matches:
+                evidence["extent_projection_status"] = "frame_transform_unverified"
+            return pose, evidence
 
         camera_points = self._extract_points(
             attributes,
@@ -412,16 +766,77 @@ class VisionToMapProjectionService:
         return center_u, center_v, "bbox_center"
 
     def _backproject_pixel_with_depth(self, *, pixel_u: float, pixel_v: float, depth_m: float, camera_info) -> Vector3:
-        centered_x = (float(pixel_u) - float(camera_info.cx)) * float(depth_m) / max(1e-6, float(camera_info.fx))
-        centered_y = (float(pixel_v) - float(camera_info.cy)) * float(depth_m) / max(1e-6, float(camera_info.fy))
+        """像素 + 深度 → 相机光学系 3D 点，按 camera_info.distortion_model 反畸变。
+
+        归一化坐标 (x_n, y_n) 先按畸变模型反畸变，再乘深度得相机系坐标
+        （光学系：+X 右、+Y 下、+Z 前）。畸变系数全 0 时严格退化为针孔。
+        不预设鱼眼——模型由 Phase0 实机棋盘格残差裁定并写入 camera_info。
+        """
+        fx = max(1e-6, float(camera_info.fx))
+        fy = max(1e-6, float(camera_info.fy))
+        # 畸变像素 → 归一化坐标（含畸变）
+        x_d = (float(pixel_u) - float(camera_info.cx)) / fx
+        y_d = (float(pixel_v) - float(camera_info.cy)) / fy
+        x_n, y_n = self._undistort_normalized(x_d, y_d, camera_info)
         return Vector3(
-            x=float(centered_x),
-            y=float(centered_y),
+            x=float(x_n * float(depth_m)),
+            y=float(y_n * float(depth_m)),
             z=float(depth_m),
         )
 
+    @staticmethod
+    def _undistort_normalized(x_d: float, y_d: float, camera_info) -> Tuple[float, float]:
+        """把含畸变的归一化坐标反算为无畸变归一化坐标。
+
+        - plumb_bob / rational_polynomial：径向切向 (k1,k2,p1,p2[,k3]) 迭代反解。
+        - fisheye / equidistant（Kannala-Brandt）：等距角度模型 (k1..k4) 反解。
+        - 其他/无系数：原样返回（针孔）。
+        """
+        model = (getattr(camera_info, "distortion_model", None) or "").strip().lower()
+        coeffs = [float(c) for c in (getattr(camera_info, "distortion_coefficients", None) or [])]
+        if not coeffs or not any(abs(c) > 1e-12 for c in coeffs):
+            return x_d, y_d
+
+        if model in ("fisheye", "equidistant", "kannala_brandt", "kb"):
+            k1 = coeffs[0] if len(coeffs) > 0 else 0.0
+            k2 = coeffs[1] if len(coeffs) > 1 else 0.0
+            k3 = coeffs[2] if len(coeffs) > 2 else 0.0
+            k4 = coeffs[3] if len(coeffs) > 3 else 0.0
+            theta_d = float((x_d * x_d + y_d * y_d) ** 0.5)
+            if theta_d < 1e-9:
+                return x_d, y_d
+            theta = theta_d
+            for _ in range(10):  # 牛顿迭代解 theta_d = theta(1+k1θ²+k2θ⁴+k3θ⁶+k4θ⁸)
+                t2 = theta * theta
+                poly = 1.0 + t2 * (k1 + t2 * (k2 + t2 * (k3 + t2 * k4)))
+                d_poly = 1.0 + t2 * (3 * k1 + t2 * (5 * k2 + t2 * (7 * k3 + t2 * 9 * k4)))
+                f = theta * poly - theta_d
+                theta -= f / max(1e-9, d_poly)
+            scale = float(np.tan(theta) / theta_d) if theta_d > 1e-9 else 1.0
+            return x_d * scale, y_d * scale
+
+        # 默认 plumb_bob（径向切向），迭代反解
+        k1 = coeffs[0] if len(coeffs) > 0 else 0.0
+        k2 = coeffs[1] if len(coeffs) > 1 else 0.0
+        p1 = coeffs[2] if len(coeffs) > 2 else 0.0
+        p2 = coeffs[3] if len(coeffs) > 3 else 0.0
+        k3 = coeffs[4] if len(coeffs) > 4 else 0.0
+        x, y = x_d, y_d
+        for _ in range(10):
+            r2 = x * x + y * y
+            radial = 1.0 + r2 * (k1 + r2 * (k2 + r2 * k3))
+            dx = 2 * p1 * x * y + p2 * (r2 + 2 * x * x)
+            dy = p1 * (r2 + 2 * y * y) + 2 * p2 * x * y
+            radial = radial if abs(radial) > 1e-9 else 1e-9
+            x = (x_d - dx) / radial
+            y = (y_d - dy) / radial
+        return x, y
+
     def _lateral_offset_from_pixel(self, *, pixel_u: float, depth_m: float, camera_info) -> float:
-        return (float(pixel_u) - float(camera_info.cx)) * float(depth_m) / max(1e-6, float(camera_info.fx))
+        x_d = (float(pixel_u) - float(camera_info.cx)) / max(1e-6, float(camera_info.fx))
+        y_d = 0.0
+        x_n, _ = self._undistort_normalized(x_d, y_d, camera_info)
+        return float(x_n * float(depth_m))
 
     def _extract_points(
         self,
@@ -513,12 +928,15 @@ class VisionToMapProjectionService:
         )
         min_values = array.min(axis=0)
         max_values = array.max(axis=0)
+        # Mean support location remains the instance/navigation pose; box center
+        # is the midpoint of extrema and can differ with unevenly sampled surfaces.
+        box_center = (min_values + max_values) * 0.5
         bbox_3d_map = {
             "frame_id": map_frame,
             "center": {
-                "x": round(float(centroid[0]), 6),
-                "y": round(float(centroid[1]), 6),
-                "z": round(float(centroid[2]), 6),
+                "x": round(float(box_center[0]), 6),
+                "y": round(float(box_center[1]), 6),
+                "z": round(float(box_center[2]), 6),
             },
             "extent_m": {
                 "x": round(float(extent[0]), 6),
@@ -546,7 +964,7 @@ class VisionToMapProjectionService:
             },
             "map_projection_coverage": round(max(0.0, min(1.0, float(map_projection_coverage))), 6),
             "projection_degradation_reason": projection_degradation_reason,
-            "centroid_map": bbox_3d_map["center"],
+            "centroid_map": {axis: round(float(centroid[index]), 6) for index, axis in enumerate(("x", "y", "z"))},
             "bbox_3d_map": bbox_3d_map,
             "object_3d_bbox": bbox_3d_map,
             "centroid_map_x": round(float(centroid[0]), 6),
@@ -715,9 +1133,12 @@ class VisionToMapProjectionService:
         source_artifact_ids: Tuple[str, ...],
         map_context: SemanticMapBuildResult,
         attributes: Dict[str, object],
+        observer_body_pose: Optional[Pose] = None,
     ) -> ProjectedObservation:
         semantic_region_id, topo_node_id, semantic_labels = self._resolve_semantic_anchor(pose, map_context=map_context)
         merged_attributes = dict(attributes)
+        if observer_body_pose is not None:
+            merged_attributes["observer_body_pose"] = observer_body_pose.model_dump(mode="json")
         merged_attributes.setdefault("semantic_region_id", semantic_region_id or "")
         merged_attributes.setdefault("topo_node_id", topo_node_id or "")
         merged_attributes.setdefault("semantic_labels", list(semantic_labels))
@@ -740,6 +1161,7 @@ class VisionToMapProjectionService:
             visual_labels=(str(label).strip().lower(),),
             attributes=merged_attributes,
             pose_quality_level=pose_quality_level,
+            observer_body_pose=observer_body_pose,
         )
 
     def _resolve_semantic_anchor(

@@ -1,0 +1,1226 @@
+syntax = "proto3";
+package nuwax.geometry;
+
+// ============================================================================
+// 目标态 GeometryRuntime gRPC facade
+// - 内部数据协议走 nuwax-workspace LCM typed channels；
+// - 该 proto 仅作为 Python 网关 ↔ Rust runtime 之间的 gRPC 控制面兼容边界；
+// - 数据面依赖保持在 LCM 边界内。
+// ============================================================================
+
+message Empty {}
+// C1 reliable recovery is scoped to a retained root and an exact member reference.
+// Legacy aliases are opaque historical identifiers, never content-checked hashes.
+message NavigationMapDomain {
+  string session = 1;
+  uint64 generation = 2;
+  uint64 frame_generation = 3;
+  uint64 producer_generation = 4;
+}
+message NavigationMapRootIdentity {
+  NavigationMapDomain domain = 1;
+  uint64 revision = 2;
+}
+message NavigationMapObjectIdentity {
+  // 1 = assigned (16 bytes), 2 = legacy alias (32 bytes); inactive bytes must be empty.
+  uint32 kind = 1;
+  bytes object_id = 2;
+  bytes legacy_alias = 3;
+}
+message NavigationMapBlockRef {
+  // Exactly three coordinates in X, Y, Z order.
+  repeated sint32 key = 1;
+  NavigationMapObjectIdentity object = 2;
+  uint64 block_revision = 3;
+  uint64 geometry_revision = 4;
+  uint32 points = 5;
+}
+message NavigationMapBlockRequest {
+  reserved 1;
+  reserved "sha256_hex";
+  // Required value 2; unversioned/hash-only requests are rejected.
+  uint32 schema_version = 2;
+  NavigationMapRootIdentity root = 3;
+  NavigationMapBlockRef block = 4;
+}
+message NavigationMapBlockResponse {
+  reserved 1;
+  reserved "data_hex";
+  uint32 schema_version = 2;
+  // Echo the admitted request binding; clients compare both before consuming data.
+  NavigationMapRootIdentity root = 3;
+  NavigationMapBlockRef block = 4;
+  bytes data = 5;
+}
+message Vec3 { double x = 1; double y = 2; double z = 3; }
+message Quat { double x = 1; double y = 2; double z = 3; double w = 4; }
+message Pose {
+  Vec3 position = 1;
+  Quat orientation = 2;
+  string frame_id = 3;
+  uint64 timestamp_ns = 4;
+}
+message Transform {
+  string parent_frame = 1;
+  string child_frame = 2;
+  Vec3 translation = 3;
+  Quat rotation = 4;
+  uint64 timestamp_ns = 5;
+}
+message FrameTree { repeated Transform transforms = 1; }
+message ShmRef {
+  string key = 1;
+  uint64 size = 2;
+  uint64 revision = 3;
+  uint32 layout_version = 4;
+  uint32 payload_schema_version = 5;
+  uint64 generation = 6;
+  uint32 active_slot = 7;
+  uint64 payload_size = 8;
+}
+
+// === 控制面 ===
+message StartRequest { string config_json = 1; }
+message StartResult { bool success = 1; string message = 2; }
+message StopRequest {}
+message StopResult { bool success = 1; }
+message RuntimeStatus {
+  string phase = 1;
+  string message = 2;
+  uint64 uptime_ms = 3;
+  uint32 rss_kb = 4;
+  string lcm_backend = 5;
+  // Empty on older servers: assigned fine payloads remain AR2/AR3 only.
+  // AR1 support means unchanged legacy source bytes under assigned ownership.
+  // AR4 source provenance requires explicit advertisement; old readers reject it.
+  repeated uint32 supported_assigned_fine_archive_versions = 6;
+}
+
+// === 定位 ===
+message PoseRequest { string target_frame = 1; string source_frame = 2; }
+message PoseUpdate { Pose pose = 1; uint64 sequence = 2; }
+
+// === 地图 ===
+message OccupancyGridMeta {
+  uint32 width = 1;
+  uint32 height = 2;
+  float resolution = 3;
+  double origin_x = 4;
+  double origin_y = 5;
+  string frame_id = 6;
+  uint64 revision = 7;
+  uint64 timestamp_ns = 8;
+}
+enum RawMapRepresentation {
+  RAW_MAP_REPRESENTATION_UNSPECIFIED = 0;
+  RAW_MAP_REPRESENTATION_SAME_AS_EFFECTIVE = 1;
+  RAW_MAP_REPRESENTATION_SEPARATE_RAW = 2;
+  RAW_MAP_REPRESENTATION_EFFECTIVE_FALLBACK = 3;
+}
+message MapUpdateNotification {
+  reserved 6, 12;
+  reserved "checksum", "raw_checksum";
+  reserved 9;
+  reserved "map_version_id";
+  OccupancyGridMeta meta = 1;
+  ShmRef shm_ref = 2;
+  bytes data = 3;
+  uint64 size = 4;
+  uint32 schema_version = 5;
+  int64 last_seen_ms = 7;
+  string session_id = 8;
+  uint64 session_generation = 10;
+  // Physical occupancy from the same committed revision. The explicit
+  // representation distinguishes shared data from unavailable raw occupancy.
+  bytes raw_data = 11;
+  string map_name = 13;
+  CanonicalOccupancyCommitReceipt occupancy_receipt = 14;
+  RawMapRepresentation raw_representation = 15;
+}
+message OccupancyGridData {
+  OccupancyGridMeta meta = 1;
+  bytes data = 2;
+}
+
+message StartMappingRequest {
+  reserved 3;
+  reserved "map_version_id";
+  string session_id = 1;
+  string map_name = 2;
+}
+
+message StopMappingRequest {
+  string session_id = 1;
+  string reason = 2;
+}
+
+enum ActivationReceiptDisposition {
+  ACTIVATION_RECEIPT_DISPOSITION_UNSPECIFIED = 0;
+  ACTIVATION_RECEIPT_DISPOSITION_STAGED = 1;
+  ACTIVATION_RECEIPT_DISPOSITION_SEALED = 2;
+  ACTIVATION_RECEIPT_DISPOSITION_SEALED_REPLAY = 3;
+  ACTIVATION_RECEIPT_DISPOSITION_LEGACY_UNBOUND = 4;
+  ACTIVATION_RECEIPT_DISPOSITION_RETIRED = 5;
+  ACTIVATION_RECEIPT_DISPOSITION_CONFLICT = 6;
+  ACTIVATION_RECEIPT_DISPOSITION_INVALIDATED_PRECOMMIT = 7;
+  ACTIVATION_RECEIPT_DISPOSITION_INVALIDATED_POSTCOMMIT = 8;
+  ACTIVATION_RECEIPT_DISPOSITION_OUTCOME_UNKNOWN = 9;
+}
+
+message MappingSessionState {
+  reserved 6;
+  reserved "map_version_id";
+  bool success = 1;
+  string phase = 2;
+  string message = 3;
+  string session_id = 4;
+  string map_name = 5;
+  uint64 session_generation = 7;
+  uint64 revision = 8;
+  bool active = 9;
+  bool idempotent_replay = 10;
+  bool legacy_checkpoint_reconstructed = 11;
+  string mapping_backend_kind = 12;
+  uint32 activation_receipt_schema_version = 13;
+  ActivationReceiptDisposition activation_receipt_disposition = 14;
+  uint64 runtime_generation = 15;
+  uint64 backend_generation = 16;
+  string activation_request_id = 17;
+  bytes activation_request_identity_sha256 = 18;
+  bytes activation_identity_sha256 = 19;
+  bytes target_receipt_sha256 = 20;
+  bytes asset_manifest_sha256 = 21;
+  bytes asset_bundle_sha256 = 22;
+  bool relocalization_target_available = 23;
+  uint32 source_policy_version = 24;
+  bytes source_policy_sha256 = 25;
+  uint32 deadline_policy_version = 26;
+  bytes deadline_policy_sha256 = 27;
+  uint32 algorithm_options_version = 28;
+  bytes algorithm_options_sha256 = 29;
+  string target_kind = 30;
+  bytes target_graph_sha256 = 31;
+  string planar_mode = 32;
+  ActivationReceiptV2 activation_receipt_v2 = 33;
+  RelocalizationPolicyDescriptorV2 relocalization_policy_v2 = 34;
+}
+
+message CloudMapCheckpoint {
+  string frame_id = 1;
+  uint64 source_revision = 2;
+  uint32 point_count = 3;
+  float voxel_size = 4;
+  bytes xyz_f32_le = 5;
+  string xyz_sha256 = 6;
+  uint32 payload_schema_version = 7;
+  CheckpointMemberIdentity member_identity = 8;
+}
+
+message MappingCommitIdentity {
+  bytes boot_nonce = 1;
+  uint64 sequence = 2;
+}
+
+message CanonicalOccupancyCommitReceipt {
+  MappingCommitIdentity commit_id = 1;
+  string session_id = 2;
+  uint64 session_generation = 3;
+  uint64 occupancy_revision = 4;
+  uint64 source_timestamp_ns = 5;
+  string backend_kind = 6;
+  uint64 backend_generation = 7;
+}
+
+message CanonicalCloudCommitReceipt {
+  MappingCommitIdentity commit_id = 1;
+  uint64 session_generation = 2;
+  uint64 occupancy_revision = 3;
+  uint64 cloud_revision = 4;
+  uint64 source_timestamp_ns = 5;
+  uint32 point_count = 6;
+}
+
+// Assigned identity of one immutable member of a frozen checkpoint export.
+enum CheckpointMemberRole {
+  CHECKPOINT_MEMBER_ROLE_UNSPECIFIED = 0;
+  CHECKPOINT_MEMBER_ROLE_BACKEND_STATE = 1;
+  CHECKPOINT_MEMBER_ROLE_CANONICAL_OCCUPANCY = 2;
+  CHECKPOINT_MEMBER_ROLE_CANONICAL_CLOUD = 3;
+  CHECKPOINT_MEMBER_ROLE_FINE_MAP = 4;
+  CHECKPOINT_MEMBER_ROLE_DENSE_CLOUD = 5;
+  CHECKPOINT_MEMBER_ROLE_PLANAR_GRAPH = 6;
+}
+message CheckpointMemberIdentity {
+  string checkpoint_id = 1;
+  CheckpointMemberRole role = 2;
+  CanonicalOccupancyCommitReceipt occupancy_receipt = 3;
+  CanonicalCloudCommitReceipt cloud_receipt = 4;
+  string frame_id = 5;
+  uint64 frame_generation = 6;
+  uint64 producer_generation = 7;
+}
+message ExportMappingBackendCheckpointRequest {
+  // 0/1 retain the staged legacy envelope; 2 explicitly requests assigned identity.
+  uint32 checkpoint_schema_version = 1;
+}
+message GraphArtifactRef {
+  string id = 1;
+  uint64 size = 2;
+  bytes sha256 = 3; // Legacy-only; empty in identity schema 2.
+  uint32 identity_schema_version = 4;
+  CheckpointMemberIdentity member_identity = 5;
+}
+
+message GraphArtifactTransferRequest {
+  // 1初始化，2写入，3封存，4读取，5释放；初始化身份由上传方随机生成。
+  uint32 action = 1;
+  GraphArtifactRef artifact = 2;
+  uint64 offset = 3;
+  bytes data = 4;
+}
+message GraphArtifactTransferResponse {
+  GraphArtifactRef artifact = 1;
+  uint64 offset = 2;
+  bool sealed = 3;
+  bytes data = 4;
+}
+
+// One assigned ID owns one immutable finalized asset; replacement assigns a new ID.
+message AssetIdentityV2 { string asset_id = 1; }
+
+message ActivationRequestMetadataV2 {
+  string activation_request_id = 1;
+  string session_id = 2;
+  string map_name = 3;
+  AssetIdentityV2 asset_identity = 4;
+  string checkpoint_id = 5;
+  uint64 expected_runtime_generation = 6;
+}
+message InstalledActivationIdentityV2 {
+  ActivationRequestMetadataV2 request = 1;
+  uint64 runtime_generation = 2;
+  uint64 lifecycle_epoch = 3;
+  uint64 session_generation = 4;
+  string backend_kind = 5;
+  uint64 backend_generation = 6;
+}
+message InstalledTargetReceiptV2 {
+  InstalledActivationIdentityV2 activation = 1;
+  CheckpointMemberIdentity source_cloud_member = 2;
+  CanonicalOccupancyCommitReceipt occupancy_receipt = 3;
+  CanonicalCloudCommitReceipt cloud_receipt = 4;
+  CheckpointMemberIdentity source_graph_member = 5;
+}
+message ActivationReceiptV2 {
+  ActivationRequestMetadataV2 request = 1;
+  InstalledActivationIdentityV2 activation = 2;
+  InstalledTargetReceiptV2 target = 3;
+}
+
+message MappingBackendCheckpoint {
+  uint32 schema_version = 1;
+  string backend_kind = 2;
+  uint64 source_session_generation = 3;
+  bytes content_sha256 = 4;
+  uint64 payload_size = 5;
+  uint64 created_at_ns = 6;
+  bytes payload = 7;
+  string source_session_id = 8;
+  CanonicalOccupancyCommitReceipt occupancy_receipt = 9;
+  CanonicalCloudCommitReceipt cloud_receipt = 10;
+  OccupancyGridData canonical_occupancy_checkpoint = 11;
+  CloudMapCheckpoint canonical_cloud_checkpoint = 12;
+  GraphArtifactRef graph_artifact = 13;
+  string target_kind = 14;
+  GraphArtifactRef fine_map_artifact = 15;
+  GraphArtifactRef dense_cloud_artifact = 16;
+  string checkpoint_id = 17;
+  uint32 backend_payload_schema_version = 18;
+  CheckpointMemberIdentity backend_identity = 19;
+  CheckpointMemberIdentity occupancy_identity = 20;
+}
+
+message ActivateMapRequest {
+  reserved 3;
+  reserved "map_version_id";
+  string session_id = 1;
+  string map_name = 2;
+  OccupancyGridData checkpoint = 4;
+  CloudMapCheckpoint cloud_checkpoint = 5;
+  MappingBackendCheckpoint mapping_backend_checkpoint = 6;
+  string activation_request_id = 7;
+  bytes asset_manifest_sha256 = 8;
+  bytes asset_bundle_sha256 = 9;
+  uint64 expected_runtime_generation = 10;
+  uint32 activation_contract_version = 11;
+  // Contract 2 uses only mapping_backend_checkpoint for canonical member bytes.
+  // Legacy digests and duplicate top-level checkpoint/cloud_checkpoint are absent.
+  AssetIdentityV2 asset_identity = 12;
+}
+
+enum RelocalizeDisposition {
+  RELOCALIZE_DISPOSITION_UNSPECIFIED = 0;
+  RELOCALIZE_DISPOSITION_APPLIED = 1;
+  RELOCALIZE_DISPOSITION_ALREADY_APPLIED = 2;
+  RELOCALIZE_DISPOSITION_REJECTED = 3;
+  RELOCALIZE_DISPOSITION_TARGET_UNAVAILABLE = 4;
+  RELOCALIZE_DISPOSITION_STALE_SESSION = 5;
+  RELOCALIZE_DISPOSITION_SESSION_INVALIDATED = 6;
+  RELOCALIZE_DISPOSITION_TARGET_INVALIDATED = 7;
+  RELOCALIZE_DISPOSITION_REPLAY_CONFLICT = 8;
+  RELOCALIZE_DISPOSITION_BUSY = 9;
+  RELOCALIZE_DISPOSITION_CANCELLED = 10;
+  RELOCALIZE_DISPOSITION_DEADLINE_EXCEEDED = 11;
+  RELOCALIZE_DISPOSITION_INSUFFICIENT_SOURCE = 12;
+  RELOCALIZE_DISPOSITION_ALGORITHM_REJECTED = 13;
+  RELOCALIZE_DISPOSITION_OWNER_FAILED = 14;
+  RELOCALIZE_DISPOSITION_OWNER_STOPPED = 15;
+}
+
+message PlanarSeed { double x = 1; double y = 2; double yaw = 3; }
+
+// Exact small canonical policy parameters, not a hash or content-derived ID.
+// Policy versions and limits retain the existing production definitions.
+message RelocalizationPolicyDescriptorV2 {
+  uint32 schema_version = 1;
+  uint32 source_policy_version = 2;
+  bytes source_parameters = 3;
+  uint32 deadline_policy_version = 4;
+  bytes deadline_parameters = 5;
+  uint32 algorithm_options_version = 6;
+  bytes algorithm_parameters = 7;
+}
+
+// Cloud-specific assigned target. Planar activation requires its own genuine
+// target branch; it cannot populate an invented cloud receipt.
+message AssignedCloudRelocalizeRequestV2 {
+  InstalledTargetReceiptV2 target = 1;
+  RelocalizationPolicyDescriptorV2 policy = 2;
+  uint64 logical_timeout_ms = 3;
+}
+
+message AssignedPlanarRelocalizeRequestV2 {
+  InstalledTargetReceiptV2 target = 1;
+  RelocalizationPolicyDescriptorV2 policy = 2;
+  uint64 logical_timeout_ms = 3;
+  PlanarSeed seed = 4;
+}
+
+message RelocalizeRequest {
+  uint32 schema_version = 1;
+  string request_id = 2;
+  uint64 runtime_generation = 3;
+  string session_id = 4;
+  string map_name = 5;
+  uint64 session_generation = 6;
+  uint64 backend_generation = 7;
+  bytes activation_identity_sha256 = 8;
+  bytes target_receipt_sha256 = 9;
+  uint64 target_cloud_revision = 10;
+  bytes target_cloud_sha256 = 11;
+  bytes asset_manifest_sha256 = 12;
+  bytes asset_bundle_sha256 = 13;
+  uint32 source_policy_version = 14;
+  bytes source_policy_sha256 = 15;
+  uint32 deadline_policy_version = 16;
+  bytes deadline_policy_sha256 = 17;
+  uint64 logical_timeout_ms = 18;
+  uint32 algorithm_options_version = 19;
+  bytes algorithm_options_sha256 = 20;
+  string target_kind = 21;
+  bytes target_graph_sha256 = 22;
+  PlanarSeed planar_seed = 23;
+  // Schema 2 uses request_id plus this body only; all legacy fields are absent.
+  oneof assigned_target {
+    AssignedCloudRelocalizeRequestV2 assigned_cloud_v2 = 24;
+    AssignedPlanarRelocalizeRequestV2 assigned_planar_v2 = 25;
+  }
+}
+
+enum RelocalizationTerminalStatus {
+  RELOCALIZATION_TERMINAL_STATUS_UNSPECIFIED = 0;
+  RELOCALIZATION_TERMINAL_STATUS_TERMINAL = 1;
+  RELOCALIZATION_TERMINAL_STATUS_PENDING = 2;
+  RELOCALIZATION_TERMINAL_STATUS_NOT_FOUND = 3;
+  RELOCALIZATION_TERMINAL_STATUS_IDENTITY_CONFLICT = 4;
+}
+
+message GetRelocalizationTerminalRequest {
+  uint32 schema_version = 1;
+  string request_id = 2;
+  bytes request_identity_sha256 = 3;
+  bytes activation_identity_sha256 = 4;
+  // Schema 2 binds the complete assigned request. Legacy digests are absent.
+  RelocalizeRequest assigned_request_v2 = 5;
+}
+
+message RelocalizationLedgerObservation {
+  uint32 observation_schema_version = 1;
+  uint64 admitted_command_count = 2;
+  uint64 claimed_command_count = 3;
+  uint64 terminal_record_count = 4;
+  uint64 pending_record_count = 5;
+  uint64 active_waiter_count = 6;
+  uint64 observation_epoch = 7;
+}
+
+message GetRelocalizationTerminalResponse {
+  uint32 schema_version = 1;
+  string request_id = 2;
+  bytes request_identity_sha256 = 3;
+  bytes activation_identity_sha256 = 4;
+  RelocalizationTerminalStatus status = 5;
+  optional RelocalizeResult terminal = 6;
+  optional RelocalizationLedgerObservation ledger_observation = 7;
+  // The normalized exact request queried, including when no terminal exists.
+  RelocalizeRequest assigned_request_v2 = 8;
+}
+
+// IEEE-754 bits, not numeric protobuf equality: signed zero is significant.
+message RelocalizationPoseBitsV2 {
+  repeated fixed64 translation_m_bits = 1; // exactly 3
+  repeated fixed64 rotation_xyzw_bits = 2; // exactly 4
+}
+
+// Existing correction-owner identity. No new generation or lease is allocated.
+message RelocalizationOwnerReceiptV2 {
+  uint64 runtime_generation = 1;
+  uint64 correction_backend_generation = 2;
+  bytes correction_lease_boot_nonce = 3; // exactly 16 bytes
+  uint64 correction_lease_generation = 4;
+  string map_frame_id = 5;
+  string odom_frame_id = 6;
+  string body_frame_id = 7;
+  optional uint64 relocalization_epoch = 8;
+}
+
+message RelocalizationMapGeometryV2 {
+  uint64 width = 1;
+  uint64 height = 2;
+  fixed64 resolution_m_bits = 3;
+  fixed64 origin_x_m_bits = 4;
+  fixed64 origin_y_m_bits = 5;
+}
+
+// Lineage of an actually admitted frame. This is not content attestation:
+// source XYZ and occupancy bytes have been released and are not reproduced.
+// The actual cloud receipt can lag the occupancy receipt. Do not fabricate a
+// same-commit cloud receipt or require installed-target same-commit coupling.
+message RelocalizationSourceReceiptV2 {
+  CanonicalOccupancyCommitReceipt occupancy_receipt = 1;
+  uint64 cloud_revision = 2;
+  uint64 map_frame_generation = 3;
+  int32 lio_backend = 4;
+  uint64 runtime_generation = 5;
+  uint64 source_sequence = 6;
+  uint64 source_timestamp_ns = 7;
+  uint64 admitted_point_count = 8;
+  uint64 correlated_odom_source_sequence = 9;
+  uint64 correlated_odom_source_timestamp_ns = 10;
+  RelocalizationPoseBitsV2 odom_from_body = 11;
+  RelocalizationMapGeometryV2 map_geometry = 12;
+  RelocalizationPoseBitsV2 base_anchor_map_from_odom = 13;
+  string map_frame_id = 14;
+  string odom_frame_id = 15;
+  string body_frame_id = 16;
+  string points_frame_id = 17;
+  uint64 registration_correction_revision = 18;
+  uint64 frame_capture_relocalization_epoch = 19;
+  optional uint64 relocalization_mode_epoch = 20;
+  CanonicalCloudCommitReceipt cloud_receipt = 21;
+  RelocalizationPoseBitsV2 registration_map_from_odom = 22;
+}
+
+message RelocalizationAlgorithmReceiptV2 {
+  bool converged = 1;
+  bool accepted = 2;
+  fixed64 mse_bits = 3;
+  fixed64 fitness_bits = 4;
+  uint64 iterations = 5;
+  uint64 feature_matches = 6;
+  uint64 ransac_inliers = 7;
+  RelocalizationPoseBitsV2 estimated_transform = 8;
+  RelocalizationPoseBitsV2 proposed_correction = 9;
+}
+
+enum AssignedRelocalizationEvidencePhaseV2 {
+  ASSIGNED_RELOCALIZATION_EVIDENCE_PHASE_V2_UNSPECIFIED = 0;
+  ASSIGNED_RELOCALIZATION_EVIDENCE_PHASE_V2_PRE_ADMISSION = 1;
+  ASSIGNED_RELOCALIZATION_EVIDENCE_PHASE_V2_ADMITTED = 2;
+  ASSIGNED_RELOCALIZATION_EVIDENCE_PHASE_V2_SOURCE_SELECTED = 3;
+  ASSIGNED_RELOCALIZATION_EVIDENCE_PHASE_V2_ALGORITHM_COMPLETED = 4;
+  ASSIGNED_RELOCALIZATION_EVIDENCE_PHASE_V2_FINALIZED = 5;
+}
+
+// Bounded typed lineage/outcome only, never a proof of source-elided content.
+// Production capture validates these fields against retained source owners;
+// durable reopening validates canonical shape and all retained exact bindings.
+message AssignedRelocalizationEvidenceV2 {
+  uint32 schema_version = 1;
+  AssignedRelocalizationEvidencePhaseV2 phase = 2;
+  optional uint64 admission_ordinal = 3;
+  RelocalizationOwnerReceiptV2 owner = 4;
+  repeated RelocalizationSourceReceiptV2 source_frames = 5;
+  RelocalizationAlgorithmReceiptV2 algorithm = 6;
+}
+
+message AssignedCloudRelocalizeResultV2 {
+  RelocalizeRequest request = 1;
+  RelocalizeDisposition disposition = 2;
+  uint64 correction_revision = 3;
+  string detail = 4;
+  // Full canonical V3 LCM body without its fingerprint; bounded at 4096 bytes.
+  // A real V3 candidate validator must bind it to the request and evidence.
+  bytes candidate_payload_v3 = 5;
+  AssignedRelocalizationEvidenceV2 evidence = 6;
+}
+
+// Existing armed process/session/epoch and input sequence, never a new scan ticket.
+message PlanarRelocalizationScanV2 {
+  string process_owner = 1;
+  uint64 session_generation = 2;
+  uint64 mode_epoch = 3;
+  uint64 source_sequence = 4;
+  uint64 source_timestamp_ns = 5;
+  uint64 source_unix_ns = 6;
+  fixed64 matching_response_bits = 7;
+}
+message PlanarRelocalizationEstimateV2 {
+  uint64 source_timestamp_ns = 1;
+  string clock_domain = 2;
+  string clock_id = 3;
+  uint64 source_sequence = 4;
+  uint64 graph_revision = 5;
+  uint64 optimizations = 6;
+  repeated fixed64 anchor_odom_from_base_bits = 7;
+  repeated fixed64 odom_from_base_bits = 8;
+  repeated fixed64 map_from_base_bits = 9;
+  repeated fixed64 map_from_odom_bits = 10;
+  repeated fixed64 covariance_bits = 11;
+  fixed64 matching_response_bits = 12;
+  fixed64 local_response_bits = 13;
+  string disposition = 14;
+  uint32 node_count = 15;
+  uint32 edge_count = 16;
+}
+message AssignedPlanarRelocalizationEvidenceV2 {
+  uint32 schema_version = 1;
+  AssignedRelocalizationEvidencePhaseV2 phase = 2;
+  optional uint64 admission_ordinal = 3;
+  RelocalizationOwnerReceiptV2 owner = 4;
+  string previous_process = 5;
+  string committed_process = 6;
+  uint64 mode_epoch = 7;
+  repeated PlanarRelocalizationScanV2 accepted_scans = 8;
+  PlanarRelocalizationEstimateV2 estimate = 9;
+  uint64 frame_generation = 10;
+  uint64 source_unix_ns = 11;
+  uint64 committed_unix_ns = 12;
+}
+message AssignedPlanarRelocalizeResultV2 {
+  RelocalizeRequest request = 1;
+  RelocalizeDisposition disposition = 2;
+  uint64 correction_revision = 3;
+  string detail = 4;
+  AssignedPlanarRelocalizationEvidenceV2 evidence = 5;
+}
+
+message RelocalizeResult {
+  uint32 schema_version = 1;
+  string request_id = 2;
+  bytes request_identity_sha256 = 3;
+  uint64 runtime_generation = 4;
+  string session_id = 5;
+  string map_name = 6;
+  uint64 session_generation = 7;
+  uint64 backend_generation = 8;
+  bytes activation_identity_sha256 = 9;
+  bytes target_receipt_sha256 = 10;
+  uint64 target_cloud_revision = 11;
+  bytes target_cloud_sha256 = 12;
+  bytes asset_manifest_sha256 = 13;
+  bytes asset_bundle_sha256 = 14;
+  uint32 source_policy_version = 15;
+  bytes source_policy_sha256 = 16;
+  uint32 deadline_policy_version = 17;
+  bytes deadline_policy_sha256 = 18;
+  uint64 logical_timeout_ms = 19;
+  uint32 algorithm_options_version = 20;
+  bytes algorithm_options_sha256 = 21;
+  RelocalizeDisposition disposition = 22;
+  uint64 candidate_sequence = 23;
+  bytes candidate_payload_sha256 = 24;
+  bytes evidence_sha256 = 25;
+  uint64 correction_revision = 26;
+  bytes terminal_proof_sha256 = 27;
+  string detail = 28;
+  // Exact CorrectionCandidate LCM body prefix hashed by field 24; max 4096 bytes.
+  bytes candidate_payload_preimage_v1 = 29;
+  // Bounded evidence transcript, all integers big-endian:
+  // domain "nuwax.geometry.relocalize.evidence-disclosure.v1\0", u32 version,
+  // u8 mode. Mode 0 is u64 length + the complete small evidence preimage.
+  // Mode 1 is four u64 lengths (full/prefix/source/suffix), prefix bytes,
+  // SHA-256(source), then suffix bytes. Prefix ends in the canonical
+  // "nuwax.geometry.relocalize.source-commitment.v1\0" record containing the
+  // independently checked source length and digest. Field 25 is SHA-256 of
+  // domain "nuwax.geometry.relocalize.evidence-composite.v1\0", u32 version,
+  // and tagged 0..3 full/prefix/source/suffix length-bound components; source
+  // contributes its anchored digest instead of an unverifiable SHA midstate.
+  // Prefix/source/suffix remain bounded by 16384/2400008/4096 bytes and the
+  // retained disclosure by 20736 bytes.
+  // Fields 29 and 30 are deliberately excluded from the frozen v1 terminal-
+  // proof preimage, which remains protobuf fields 1 through 28 only.
+  bytes evidence_disclosure_v1 = 30;
+  string target_kind = 31;
+  bytes target_graph_sha256 = 32;
+  // Schema 2 uses schema_version, request_id and this body exclusively.
+  // Every legacy field 3..32 is empty/zero, including legacy dispositions.
+  AssignedCloudRelocalizeResultV2 assigned_cloud_v2 = 33;
+  AssignedPlanarRelocalizeResultV2 assigned_planar_v2 = 34;
+}
+
+// A live canonical observation bound to the exact retained applied command.
+// All three timestamps come from the same current odometry observation; source
+// payloads and new identity domains are deliberately absent.
+message AssignedLocalizationSampleV2 {
+  uint32 schema_version = 1;
+  RelocalizeResult terminal = 2;
+  Pose pose = 3;
+  Transform map_from_odom = 4;
+  Transform odom_from_body = 5;
+  RelocalizationOwnerReceiptV2 correction_owner = 6;
+  uint64 correction_revision = 7;
+  uint64 map_frame_generation = 8;
+}
+
+// === 视频帧共享内存 ===
+message VideoFrameShmRef {
+  string shm_path = 1;
+  string uds_path = 2;
+  uint64 sequence = 3;
+  uint32 frame_size = 4;
+  uint64 timestamp_ns = 5;
+}
+
+// === 健康检查 ===
+message HealthCheckRequest {}
+message HealthCheckResponse {
+  bool healthy = 1;
+  string phase = 2;
+  uint64 uptime_ms = 3;
+  uint32 rss_kb = 4;
+  uint64 video_frame_sequence = 5;
+  uint32 video_fps_estimate = 6;
+  string lcm_backend = 7;
+  string geometry_pipeline = 8;
+  uint64 runtime_generation = 9;
+  string planar_input_config = 10;
+  int64 planar_unix_offset_ns = 11;
+}
+
+// === 累积地图共享内存引用 ===
+message CloudMapShmRef {
+  ShmRef shm_ref = 1;
+  uint32 point_count = 2;
+  float voxel_size = 3;
+}
+
+// 全部有效扫描点按原坐标分块读取；epoch变化时旧偏移不可续传。
+message DenseCloudChunkRequest {
+  string expected_epoch = 1;
+  uint64 offset_points = 2;
+  uint32 max_points = 3;
+  bool allow_delta = 4;
+}
+message DenseCloudChunk {
+  string epoch = 1;
+  uint64 revision = 2;
+  uint64 source_timestamp_ns = 3;
+  string frame_id = 4;
+  string session_id = 5;
+  uint64 session_generation = 6;
+  uint64 total_points = 7;
+  uint64 offset_points = 8;
+  bytes xyz_f32_le = 9;
+  repeated float bounds_min = 10;
+  repeated float bounds_max = 11;
+  // 增量基于请求已安装前缀；删除区间为旧前缀中的起点和长度。
+  string base_epoch = 12;
+  uint64 base_offset_points = 13;
+  repeated uint64 removed_ranges = 14;
+}
+
+// === 导航兼容 ===
+enum NavigationOwnerKind {
+  NAVIGATION_OWNER_KIND_UNSPECIFIED = 0;
+  NAVIGATION_OWNER_KIND_PUBLIC_NAV = 1;
+  NAVIGATION_OWNER_KIND_EXPLORATION_CHILD = 2;
+}
+
+message NavigationGoal {
+  reserved 4, 5;
+  reserved "map_revision", "map_version_id";
+  Pose pose = 1;
+  string frame_id = 2;
+  string goal_id = 3;
+  string parent_request_id = 6;
+  uint64 goal_generation = 7;
+  NavigationOwnerKind owner_kind = 8;
+  uint64 motion_guard_generation = 9;
+  bytes motion_guard_boot_nonce = 10;
+  uint64 motion_stop_generation = 11;
+  bool allow_reverse = 12;
+  optional double position_tolerance_m = 13;
+  optional double yaw_tolerance_rad = 14;
+}
+message CancelNavigationRequest {
+  string goal_id = 1;
+  NavigationOwnerKind owner_kind = 2;
+  string parent_request_id = 3;
+  uint64 goal_generation = 4;
+  uint64 producer_runtime_generation = 5;
+}
+message NavigationState {
+  reserved 13, 22, 23, 24;
+  reserved "planner_map_revision", "map_version_id", "goal_payload_sha256", "path_payload_sha256";
+  string status = 1;
+  string message = 2;
+  string goal_id = 3;
+  float distance_remaining = 4;
+  uint64 timestamp_ns = 5;
+  string cancel_phase = 6;
+  uint64 cancel_generation = 7;
+  bool actuator_zeroed = 8;
+  string reason_code = 9;
+  uint64 runtime_generation = 10;
+  uint64 guard_generation = 11;
+  bool sink_ready = 12;
+  string planner_map_frame = 14;
+  string planner_pose_frame = 15;
+  string zero_ack_id = 16;
+  uint64 zero_applied_monotonic_ns = 17;
+  NavigationOwnerKind owner_kind = 18;
+  string parent_request_id = 19;
+  uint64 goal_generation = 20;
+  uint64 path_revision = 21;
+  uint64 producer_runtime_generation = 25;
+  // 当前目标已计算路径；终态为空，点采用planner_map_frame坐标。
+  repeated Vec3 planned_path = 26;
+  // 同一目标与全局路径修订下的局部规划展示；缺失或终态为空。
+  repeated Vec3 local_path = 27;
+  uint64 planner_runtime_generation = 28;
+}
+message NavigationReadiness {
+  reserved 10;
+  reserved "forbidden_zone_map_version_id";
+  bool ready = 1;
+  string reason = 2;
+  string reason_code = 3;
+  repeated string blockers = 4;
+  uint64 tf_generation = 5;
+  uint64 planner_generation = 6;
+  uint64 motion_sink_generation = 7;
+  string map_frame = 8;
+  string pose_frame = 9;
+  uint64 forbidden_zone_generation = 11;
+  string forbidden_zone_signature = 12;
+  uint64 forbidden_zone_applied_revision = 13;
+  uint64 planner_costmap_revision = 14;
+  string forbidden_zone_map_name = 15;
+}
+
+// Phase 7: 三套 readiness 字段打包 message(JSON 字符串给 Python 解析)。
+// 与 `NavigationReadiness.reason` 同模式:把综合判定 + 各子项字段 JSON 化
+// 塞进 message,Python 端用 dict 解码对应字段。
+message MappingReadiness {
+  bool ready = 1;
+  string message = 2;  // JSON: {lcm_backend, adapter_present, odom_count,
+                       //      pointcloud_count, last_occupancy_revision,
+                       //      accumulated_point_count, last_error}
+}
+message ExplorationReadiness {
+  bool ready = 1;
+  string message = 2;  // JSON: {backend_available, controller_active,
+                        //      source_count, frontier_source_ready,
+                        //      costmap_input_ready, active_source, arbitration}
+}
+
+// === legacy cmd_vel sink readiness compatibility ===
+// Motion guard UDS owner 的 typed generation/ack 是 authoritative source。
+// 本兼容请求的 ready=true 只有在 generation 非零且匹配当前 sink generation
+// 时才可接受；不得由无 generation 的旧调用方制造 ready。
+message CmdVelSinkReadyRequest {
+  option deprecated = true;
+  bool ready = 1;
+  uint64 generation = 2;
+}
+message CmdVelSinkReadyResponse { bool success = 1; }
+
+// === 探索 ===
+message Frontier {
+  Pose pose = 1;
+  uint32 size_cells = 2;
+  float heading = 3;
+}
+message FrontierList {
+  reserved 3, 4;
+  reserved "map_revision", "map_version_id";
+  repeated Frontier frontiers = 1;
+  uint64 revision = 2;       // frontier snapshot revision
+}
+
+message ExplorationBoundarySegment {
+  double start_x = 1;
+  double start_y = 2;
+  double end_x = 3;
+  double end_y = 4;
+}
+
+message ExplorationStopConditions {
+  reserved 5;
+  reserved "stop_on_map_revision_change";
+  optional double max_coverage_pct = 1;
+  optional uint64 no_frontier_timeout_ms = 2;
+  optional uint64 max_duration_ms = 3;
+  optional uint32 max_goals = 4;
+}
+
+// 探索启动/停止/状态/诊断 — Phase 5 additive
+// 字段命名与执行方案 §3 Phase 5 + dimos `nuwax-exploration` facade 对齐。
+// strategy 取值:`"wavefront"` / `"tare"` / `"highest_score"` / `"first_available"`
+// （与 dimos `ExplorationArbitrationPolicy` enum 字符串名一致）。
+message ExploreRequest {
+  reserved 3, 5;
+  reserved "map_version_id", "map_revision";
+  string strategy = 1;
+  string arbitration = 2;
+  string request_id = 4;
+  // Ordered, continuous, closed polygon edges. The server validates topology.
+  repeated ExplorationBoundarySegment boundary_line_segments = 6;
+  ExplorationStopConditions stop_conditions = 7;
+  uint32 max_navigation_retries = 8;
+  double blacklist_radius_m = 9;
+  // A request has one authoritative boundary frame; production accepts map.
+  string boundary_frame_id = 10;
+  uint64 motion_guard_generation = 11;
+  bytes motion_guard_boot_nonce = 12;
+  uint64 motion_stop_generation = 13;
+  // 总行程是路径预算，不能换算为未标定电池能耗；缺省保持原探索行为。
+  ExplorationReturnPolicy return_policy = 14;
+  // 只接入已由地图资产拥有方核对、激活并定位的冻结进度；空值表示新任务。
+  string resume_progress_json = 15;
+}
+message ExplorationReturnPolicy {
+  optional double maximum_distance_m = 1;
+  double reserve_distance_m = 2;
+  bool return_on_completion = 3;
+}
+message StopExplorationRequest {
+  string request_id = 1;
+}
+message ExplorationProgressRequest { string request_id = 1; }
+message ExplorationProgressResponse { string checkpoint_json = 1; }
+message ExplorationChildLease {
+  string session_id = 1;
+  NavigationOwnerKind owner_kind = 2;
+  string parent_request_id = 3;
+  uint64 goal_generation = 4;
+  uint64 producer_runtime_generation = 5;
+  reserved 6;
+  reserved "goal_payload_sha256";
+}
+message ExplorationRecoveryGuardProof {
+  string stop_operation_id = 1;
+  uint64 guard_generation = 2;
+  bytes guard_boot_nonce = 3;
+  uint64 motion_stop_generation = 4;
+  string zero_ack_id = 5;
+  uint64 zero_applied_monotonic_ns = 6;
+  bytes recovery_fence_token = 7;
+  string recovery_correlation = 8;
+}
+message RecoverExplorationAfterNavigationRolloverRequest {
+  string request_id = 1;
+  uint64 exploration_generation = 2;
+  ExplorationChildLease child_lease = 3;
+  uint64 expected_navigation_runtime_generation = 4;
+  uint64 observed_navigation_runtime_generation = 5;
+  ExplorationRecoveryGuardProof guard_proof = 6;
+}
+message ReconcileExplorationAfterGlobalStopRequest {
+  string request_id = 1;
+  uint64 exploration_generation = 2;
+  ExplorationChildLease child_lease = 3;
+  uint64 cancel_generation = 4;
+  string recovery_correlation = 5;
+  uint64 admission_guard_generation = 6;
+  bytes admission_guard_boot_nonce = 7;
+  uint64 admission_motion_stop_generation = 8;
+  ExplorationRecoveryGuardProof held_guard_proof = 9;
+}
+message ExplorationGlobalStopReconciliation {
+  bool eligible = 1;
+  uint64 cancel_generation = 2;
+  string recovery_correlation = 3;
+  uint64 admission_guard_generation = 4;
+  bytes admission_guard_boot_nonce = 5;
+  uint64 admission_motion_stop_generation = 6;
+}
+message ExplorationOwnershipReconciliationReceipt {
+  string cause = 1;
+  string recovery_correlation = 2;
+  string parent_request_id = 3;
+  uint64 exploration_generation = 4;
+  // Legacy committed receipt only. New receipts use child_lease exclusively.
+  string child_lease_fingerprint = 5;
+  uint64 cancel_generation = 6;
+  string commit_disposition = 7;
+  ExplorationChildLease child_lease = 8;
+}
+message AcknowledgeExplorationOwnershipReconciliationRequest {
+  string recovery_correlation = 1;
+  // Legacy opaque acknowledgement only; never combine with child_lease.
+  string child_lease_fingerprint = 2;
+  ExplorationChildLease child_lease = 3;
+}
+message AcknowledgeExplorationOwnershipReconciliationResult {
+  bool acknowledged = 1;
+}
+message ExplorationState {
+  reserved 10, 11;
+  reserved "map_version_id", "map_revision";
+  string status = 1;
+  string message = 2;
+  string request_id = 3;
+  string selected_source = 4;
+  string last_stop_reason = 5;
+  uint32 frontier_count = 6;
+  uint64 revision = 7;
+  uint64 timestamp_ns = 8;
+  string child_task_id = 9;
+  uint64 exploration_generation = 12;
+  ExplorationChildLease child_lease = 13;
+  bool rollover_recovery_eligible = 14;
+  ExplorationGlobalStopReconciliation global_stop_reconciliation = 15;
+  ExplorationOwnershipReconciliationReceipt ownership_reconciliation_receipt = 16;
+  // 只读版本化采样行程、原起点和返航阶段；没有启用策略时为空。
+  string mission_progress_json = 17;
+}
+message ExplorationSourceDiag {
+  string source_name = 1;
+  bool is_active = 2;
+  string last_goal_id = 3;
+  string last_error = 4;
+}
+message ExplorationDiagnostics {
+  bool active = 1;
+  string arbitration = 2;
+  string selected_source = 3;
+  string last_stop_reason = 4;
+  repeated ExplorationSourceDiag sources = 5;
+  uint32 frontier_count = 6;
+  uint64 revision = 7;
+  uint64 timestamp_ns = 8;
+}
+
+// === 输入发布兼容（用于调试/自检/preview，区别于 nav2_action_provider）===
+message PublishOdomRequest {
+  Pose pose = 1;
+  string clock_domain = 2;
+  string clock_id = 3;
+  string session_id = 4;
+  uint64 session_generation = 5;
+  uint64 runtime_generation = 6;
+}
+message PublishLaserScanRequest {
+  bytes payload = 1;
+  string session_id = 2;
+  uint64 session_generation = 3;
+}
+message PointCloudField {
+  string name = 1;
+  uint32 offset = 2;
+  uint32 datatype = 3;      // sensor_msgs/PointField numeric datatype
+  uint32 count = 4;
+}
+message LioImuSample {
+  uint64 timestamp_ns = 1;
+  string frame_id = 2;
+  double accel_mps2_x = 3;
+  double accel_mps2_y = 4;
+  double accel_mps2_z = 5;
+  double gyro_rps_x = 6;
+  double gyro_rps_y = 7;
+  double gyro_rps_z = 8;
+  // 姿态不是所有 IMU 源都提供；false 时必须按 unknown 处理，禁止伪造单位四元数。
+  bool orientation_valid = 9;
+  double orientation_x = 10;
+  double orientation_y = 11;
+  double orientation_z = 12;
+  double orientation_w = 13;
+}
+message PublishPointCloudRequest {
+  bytes points = 1;          // canonical PointCloud2 data bytes（保留 field tag 兼容旧 client）
+  uint32 point_step = 2;
+  string frame_id = 3;
+  uint64 timestamp_ns = 4;
+  repeated PointCloudField fields = 5;
+  uint32 point_count = 6;
+  bool is_dense = 7;
+  repeated LioImuSample imu_samples = 8;
+  // 辅助观测使用已估计位姿更新同一地图，不进入激光惯性前端。
+  bool mapping_only = 9;
+  repeated double sensor_origin_xyz = 10;
+  string sensor_id = 11;
+  uint64 source_sequence = 12;
+  string clock_id = 13;
+  string calibration_ref = 14;
+}
+message PublishResult { bool success = 1; string message = 2; }
+// 生产者报告已经破坏本代输入连续性；几何重启前禁止接纳更晚扫描。
+message NativeInputFailureRequest {
+  string reason = 1;
+  uint64 first_missing_source_timestamp_ns = 2;
+}
+
+message MappingCloudAuthority {
+  string map_name = 1;
+  string map_frame_id = 2;
+  bytes asset_manifest_sha256 = 3;
+  bytes asset_bundle_sha256 = 4;
+  string activation_request_id = 5;
+  bytes activation_request_identity_sha256 = 6;
+  bytes activation_identity_sha256 = 7;
+  bytes target_receipt_sha256 = 8;
+  uint64 runtime_generation = 9;
+  uint64 lifecycle_epoch = 10;
+  string mapping_session_id = 11;
+  uint64 mapping_session_generation = 12;
+  string backend_kind = 13;
+  uint64 backend_generation = 14;
+  uint64 committed_occupancy_revision = 15;
+  reserved 16;
+  reserved "committed_occupancy_sha256";
+  uint64 owner_epoch = 17;
+  uint32 schema_version = 18;
+  MappingCommitIdentity committed_occupancy_commit_id = 19;
+  uint64 committed_occupancy_source_timestamp_ns = 20;
+  // Schema 3: the original assigned activation receipt is the sole asset authority.
+  ActivationReceiptV2 activation_receipt_v2 = 21;
+}
+
+message MappingCloudGoalRequest {
+  string query_request_id = 1;
+  string query_text = 2;
+  uint64 caller_timeout_ms = 3;
+  uint64 provider_timeout_ms = 4;
+  string map_name = 5;
+  string map_frame_id = 6;
+  bytes asset_manifest_sha256 = 7;
+  bytes asset_bundle_sha256 = 8;
+  bytes georeference_json = 9;
+  bytes activation_identity_sha256 = 10;
+  uint64 runtime_generation = 11;
+  string mapping_session_id = 12;
+  uint64 mapping_session_generation = 13;
+  uint64 committed_occupancy_revision = 14;
+  reserved 15;
+  reserved "committed_occupancy_sha256";
+  uint64 motion_guard_generation = 16;
+  bytes motion_guard_boot_nonce = 17;
+  uint64 motion_stop_generation = 18;
+  uint32 schema_version = 19;
+  MappingCommitIdentity committed_occupancy_commit_id = 20;
+  uint64 committed_occupancy_source_timestamp_ns = 21;
+  // Schema 3: copied from the original assigned authority response.
+  ActivationReceiptV2 activation_receipt_v2 = 22;
+}
+
+message MappingCloudGoalTerminal {
+  string status = 1;
+  string message = 2;
+  string query_request_id = 3;
+  NavigationState navigation = 4;
+}
+
+// ============================================================================
+// 服务定义：GeometryRuntime gRPC facade
+// ============================================================================
+service GeometryRuntime {
+  // 控制面
+  rpc Start(StartRequest) returns (StartResult);
+  rpc Stop(StopRequest) returns (StopResult);
+  rpc GetStatus(Empty) returns (RuntimeStatus);
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+
+  // 定位
+  rpc GetCurrentPose(PoseRequest) returns (Pose);
+  rpc SubscribePose(PoseRequest) returns (stream PoseUpdate);
+  rpc GetFrameTree(Empty) returns (FrameTree);
+
+  // 地图
+  rpc GetOccupancyGrid(Empty) returns (OccupancyGridMeta);
+  rpc GetOccupancyGridData(Empty) returns (OccupancyGridData);
+  // Physical occupancy before virtual forbidden zones are composed.  Map
+  // asset persistence must use this getter to avoid baking keepouts into a
+  // checkpoint permanently.
+  rpc GetRawOccupancyGridData(Empty) returns (OccupancyGridData);
+  rpc GetOccupancyGridShm(Empty) returns (ShmRef);
+  rpc SubscribeMapUpdates(Empty) returns (stream MapUpdateNotification);
+  rpc SubscribeCloudMapUpdates(Empty) returns (stream CloudMapShmRef);
+  rpc GetDenseCloudChunk(DenseCloudChunkRequest) returns (DenseCloudChunk);
+  rpc StartMapping(StartMappingRequest) returns (MappingSessionState);
+  rpc StopMapping(StopMappingRequest) returns (MappingSessionState);
+  rpc GetMappingState(Empty) returns (MappingSessionState);
+  rpc TransferGraphArtifact(GraphArtifactTransferRequest) returns (GraphArtifactTransferResponse);
+  rpc ExportMappingBackendCheckpoint(ExportMappingBackendCheckpointRequest) returns (MappingBackendCheckpoint);
+  rpc ActivateMap(ActivateMapRequest) returns (MappingSessionState);
+  rpc Relocalize(RelocalizeRequest) returns (RelocalizeResult);
+  rpc GetRelocalizationTerminal(GetRelocalizationTerminalRequest) returns (GetRelocalizationTerminalResponse);
+  rpc GetAssignedLocalizationSample(RelocalizeRequest) returns (AssignedLocalizationSampleV2);
+
+  // 导航兼容（与 nuwax-nav-stack LCM channel 接口对应）
+  rpc SetNavigationGoal(NavigationGoal) returns (NavigationState);
+  rpc GetMappingCloudAuthority(Empty) returns (MappingCloudAuthority);
+  rpc GetNavigationMapBlock(NavigationMapBlockRequest) returns (NavigationMapBlockResponse);
+  rpc SubmitMappingCloudGoal(MappingCloudGoalRequest) returns (MappingCloudGoalTerminal);
+  rpc CancelNavigation(CancelNavigationRequest) returns (NavigationState);
+  rpc SubscribeNavigationState(Empty) returns (stream NavigationState);
+  rpc GetNavigationReadiness(Empty) returns (NavigationReadiness);
+
+  // Phase 7: mapping + exploration readiness(各板块独立 RPC,message JSON 解析)。
+  // 详见 `mapping_adapter::MappingReadiness` / `explore_runtime::ExplorationReadinessDetail`。
+  rpc GetMappingReadiness(Empty) returns (MappingReadiness);
+  rpc GetExplorationReadiness(Empty) returns (ExplorationReadiness);
+
+  // Legacy compatibility only; authoritative readiness comes from the
+  // generation-fenced motion guard owner.
+  rpc SetCmdVelSinkReady(CmdVelSinkReadyRequest) returns (CmdVelSinkReadyResponse) {
+    option deprecated = true;
+  }
+
+  // 探索（与 nuwax-exploration LCM channel 接口对应）
+  rpc GetFrontiers(Empty) returns (FrontierList);
+  rpc SubscribeFrontiers(Empty) returns (stream FrontierList);
+  // Phase 5 additive: 探索 start/stop/state/diagnostics。
+  // 返回 ExplorationState.status 取值：
+  //   "ACCEPTED"   — controller 已 begin，调用方进入 active 状态
+  //   "REJECTED"   — request 被拒绝（NoSources / AlreadyActive / etc.）
+  //   "PENDING"    — controller 暂时没有可用 goal（wavefront / source pending）
+  //   "STOPPED"    — 已 stop，message 含 stop reason
+  //   "UNIMPLEMENTED" — Phase 5 stub 暂未接通 nuwax-exploration crate
+  rpc StartExploration(ExploreRequest) returns (ExplorationState);
+  rpc StopExploration(StopExplorationRequest) returns (ExplorationState);
+  rpc RecoverExplorationAfterNavigationRollover(RecoverExplorationAfterNavigationRolloverRequest) returns (ExplorationState);
+  rpc ReconcileExplorationAfterGlobalStop(ReconcileExplorationAfterGlobalStopRequest) returns (ExplorationState);
+  rpc AcknowledgeExplorationOwnershipReconciliation(AcknowledgeExplorationOwnershipReconciliationRequest) returns (AcknowledgeExplorationOwnershipReconciliationResult);
+  rpc GetExplorationState(Empty) returns (ExplorationState);
+  rpc GetExplorationProgress(ExplorationProgressRequest) returns (ExplorationProgressResponse);
+  rpc GetExplorationDiagnostics(Empty) returns (ExplorationDiagnostics);
+
+  // 输入发布兼容
+  rpc PublishLaserScan(PublishLaserScanRequest) returns (PublishResult);
+  rpc PublishOdom(PublishOdomRequest) returns (PublishResult);
+  rpc PublishPointCloud(PublishPointCloudRequest) returns (PublishResult);
+  rpc ReportNativeInputFailure(NativeInputFailureRequest) returns (PublishResult);
+}

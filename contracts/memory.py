@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from compat import StrEnum
+from contracts.compat import StrEnum
 
 from pydantic import Field, field_validator, model_validator
 
@@ -40,7 +40,7 @@ class TaggedLocation(TimestampedContract):
     normalized_name: str = Field(description="归一化名称。")
     aliases: List[str] = Field(default_factory=list, description="地点别名列表。")
     pose: Pose = Field(description="记录时的机器人位姿。")
-    map_version_id: Optional[str] = Field(default=None, description="关联地图版本。")
+    map_name: Optional[str] = Field(default=None, description="关联地图名称。")
     localization_session_id: Optional[str] = Field(default=None, description="关联定位会话。")
     localization_source_name: Optional[str] = Field(default=None, description="定位来源名称。")
     topo_node_id: Optional[str] = Field(default=None, description="关联拓扑节点标识。")
@@ -82,7 +82,15 @@ class SemanticMemoryEntry(TimestampedContract):
     tags: List[str] = Field(default_factory=list, description="检索标签。")
     linked_location_id: Optional[str] = Field(default=None, description="关联地点标识。")
     pose: Optional[Pose] = Field(default=None, description="关联位姿。")
-    map_version_id: Optional[str] = Field(default=None, description="关联地图版本。")
+    last_observed_at: Optional[datetime] = Field(
+        default=None,
+        description=(
+            "最近一次观测时间（UTC）；机器人通过 navigate_to_pose 到达物品坐标 1m 内时刷新。"
+            "spec 记忆库与地图绑定 §到达物品坐标 场景依赖此字段。"
+        ),
+    )
+    observation_count: int = Field(default=0, ge=0, description="累计观测次数。")
+    map_name: Optional[str] = Field(default=None, description="关联地图名称。")
     localization_session_id: Optional[str] = Field(default=None, description="关联定位会话。")
     topo_node_id: Optional[str] = Field(default=None, description="关联拓扑节点标识。")
     semantic_region_id: Optional[str] = Field(default=None, description="关联语义区域标识。")
@@ -241,7 +249,7 @@ class MemoryPayloadFilter(ContractModel):
     """记忆检索过滤条件。"""
 
     record_kinds: List[MemoryRecordKind] = Field(default_factory=list, description="限制检索的记录类型。")
-    map_version_id: Optional[str] = Field(default=None, description="限定地图版本。")
+    map_name: Optional[str] = Field(default=None, description="限定地图名称。")
     localization_session_id: Optional[str] = Field(default=None, description="限定定位会话。")
     linked_location_id: Optional[str] = Field(default=None, description="限定关联地点标识。")
     camera_ids: List[str] = Field(default_factory=list, description="限定相机标识列表。")
@@ -276,7 +284,7 @@ class MemoryNavigationCandidate(TimestampedContract):
     target_pose: Pose = Field(description="推荐导航目标位姿。")
     target_name: str = Field(description="候选目标名称。")
     linked_location_id: Optional[str] = Field(default=None, description="关联地点标识。")
-    map_version_id: Optional[str] = Field(default=None, description="候选所在地图版本。")
+    map_name: Optional[str] = Field(default=None, description="候选所在地图名称。")
     topo_node_id: Optional[str] = Field(default=None, description="候选拓扑节点标识。")
     semantic_region_id: Optional[str] = Field(default=None, description="候选语义区域标识。")
     scene_space_id: Optional[str] = Field(default=None, description="候选场景空间标识。")

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from datetime import datetime
-from compat import StrEnum
+from contracts.compat import StrEnum
 from typing import Dict, Optional, Any, Generic, TypeVar
 
 from pydantic import Field
@@ -38,7 +38,7 @@ class AdapterConfig(ContractModel):
 
     name: str = Field(description="适配器名称。")
     category: AdapterCategory = Field(description="适配器类别。")
-    source_kind: str = Field(description="外部来源类型，例如 ros2、nav2、webrtc。")
+    source_kind: str = Field(description="外部来源类型，例如 native_runtime、webrtc。")
     contract_type: str = Field(description="输出契约类型。")
     enabled: bool = Field(default=True, description="是否启用。")
     source_ref: Optional[str] = Field(default=None, description="外部来源引用，例如 topic、流地址或服务名。")

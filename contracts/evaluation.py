@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from compat import StrEnum
+from contracts.compat import StrEnum
 from pydantic import Field, model_validator
 
 from contracts.base import ContractModel, MetadataDict, TimestampedContract
@@ -37,7 +37,7 @@ class EvaluationTraceStatus(StrEnum):
 class EvaluationSliceKey(ContractModel):
     """评估聚合切分维度。"""
 
-    map_version_id: str = Field(default="unknown", description="地图版本。")
+    map_name: str = Field(default="unknown", description="地图名称。")
     perception_provider: str = Field(default="unknown", description="感知 provider（提供方）。")
     navigation_profile: str = Field(default="unknown", description="导航 profile（配置档）。")
     target_category: str = Field(default="unknown", description="目标类别。")
@@ -46,7 +46,7 @@ class EvaluationSliceKey(ContractModel):
     def as_key(self) -> str:
         return "|".join(
             [
-                self.map_version_id,
+                self.map_name,
                 self.perception_provider,
                 self.navigation_profile,
                 self.target_category,
@@ -89,7 +89,6 @@ class SafetyEvaluationMetrics(ContractModel):
     """安全指标。"""
 
     collision_count: int = Field(default=0, ge=0, description="碰撞次数。")
-    emergency_stop_count: int = Field(default=0, ge=0, description="急停次数。")
     official_obstacle_avoidance_trigger_count: int = Field(default=0, ge=0, description="官方避障触发次数。")
     near_miss_count: int = Field(default=0, ge=0, description="近距离风险次数。")
     cancel_count: int = Field(default=0, ge=0, description="取消次数。")
@@ -146,7 +145,6 @@ class EvaluationSliceSummary(ContractModel):
     topk_hit_rate: Optional[float] = Field(default=None, ge=0.0, le=1.0, description="top-k 命中率。")
     wrong_candidate_rate: Optional[float] = Field(default=None, ge=0.0, le=1.0, description="错误候选率。")
     collision_count: int = Field(default=0, ge=0, description="碰撞次数。")
-    emergency_stop_count: int = Field(default=0, ge=0, description="急停次数。")
     cancel_count: int = Field(default=0, ge=0, description="取消次数。")
     timeout_count: int = Field(default=0, ge=0, description="超时次数。")
     memory_write_success_rate: Optional[float] = Field(default=None, ge=0.0, le=1.0, description="记忆写入成功率。")

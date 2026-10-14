@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from compat import StrEnum
+from contracts.compat import StrEnum
 import threading
 
 from pydantic import Field
@@ -16,6 +16,12 @@ class RuntimeResource(StrEnum):
     NAVIGATION = "navigation"
     AUDIO_OUT = "audio_out"
     CAMERA_OBSERVATION = "camera_observation"
+    # 地图工作区互斥：activate_map / relocalize_active_map 异步化后不再天然串行，
+    # 两者并发会竞态改写 workspace/记忆库/会话绑定。
+    # 共用此资源令牌使它们互斥（冲突即 ResourceConflictError 快速失败，非排队）。
+    MAP_WORKSPACE = "map_workspace"
+    # 逐层编排只持此资源，实际导航/地图资源由原子任务持有。
+    BUILDING_WORKFLOW = "building_workflow"
 
 
 class ResourceLease(ContractModel):

@@ -1,0 +1,87 @@
+{
+  "detail": null,
+  "failure": null,
+  "fallback_entered": true,
+  "path_samples": 119,
+  "success": true,
+  "work": {
+    "expanded": 3,
+    "frontier_peak": 12,
+    "nodes": 15
+  },
+  "witness": {
+    "samples": 208,
+    "independent_body_resweep": "passed",
+    "exact_departure_m": 0.01
+  },
+  "reference": [
+    [
+      0.011,
+      0.0,
+      0.0
+    ],
+    [
+      -0.12499999720603228,
+      0.46499998960644007,
+      0.0
+    ],
+    [
+      -0.6249999860301614,
+      0.6949999844655395,
+      0.0
+    ],
+    [
+      -0.6249999860301614,
+      1.3149999706074595,
+      0.0
+    ],
+    [
+      0.021,
+      1.8,
+      0.0
+    ]
+  ],
+  "static_reference": [
+    [
+      0.011,
+      0.0,
+      0.0
+    ],
+    [
+      0.021,
+      1.8,
+      0.0
+    ]
+  ],
+  "recent_hints": 7,
+  "body": {
+    "length_m": 0.6,
+    "width_m": 0.1198,
+    "support_offset_m": 0.4
+  },
+  "goal": {
+    "position": [
+      0.021,
+      1.8,
+      0.4
+    ],
+    "tolerance_m": 0.015,
+    "final_yaw": null
+  },
+  "queue_priority": "unchanged production baseline; no oracle or relaxed override",
+  "scope": "single synthetic exported-Scan positive fallback regression; not general or robot qualification",
+  "qualification": {
+    "default_features": {
+      "passed": 50,
+      "failed": 0,
+      "ignored": 1
+    },
+    "profile_features": {
+      "passed": 52,
+      "failed": 0,
+      "ignored": 4
+    },
+    "non_test_scan_check": "passed",
+    "initial_default_feature_failure": "Optional serde_json in priority diagnostic module; preserved and corrected with profile gate, then retested"
+  }
+}

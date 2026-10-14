@@ -4,6 +4,7 @@ from math import atan2, cos, radians, sin
 from typing import Iterable, List, Optional, Sequence, Tuple
 
 from contracts.geometry import Pose, Quaternion, Vector3
+from contracts.frame_semantics import frame_ids_semantically_equal
 from contracts.maps import CostMap, OccupancyGrid
 
 
@@ -31,6 +32,7 @@ class InspectionPosePlanner:
         self,
         *,
         target_pose: Pose,
+        observer_body_pose: Optional[Pose] = None,
         occupancy_grid: Optional[OccupancyGrid] = None,
         cost_map: Optional[CostMap] = None,
         existing_poses: Optional[Iterable[Pose]] = None,
@@ -38,15 +40,21 @@ class InspectionPosePlanner:
     ) -> List[Pose]:
         """根据目标中心位姿生成一组巡检位姿。"""
 
-        if existing_poses:
+        if observer_body_pose is not None and not frame_ids_semantically_equal(observer_body_pose.frame_id, target_pose.frame_id):
+            raise ValueError("观察机体位姿与目标必须使用同一地图坐标系")
+        if existing_poses and observer_body_pose is None:
             deduplicated = self._deduplicate(existing_poses, max_candidates=max_candidates)
             if deduplicated:
                 return deduplicated
 
         candidates: List[Tuple[float, Pose]] = []
+        if observer_body_pose is not None:
+            # 先回到已实际观察目标的机体位姿；其它候选仍由导航验证地面与可达性。
+            candidates.append((-1.0, observer_body_pose))
         for radius_m in self._candidate_radii_m:
             for angle_deg in self._candidate_angles_deg:
-                pose = self._build_candidate_pose(target_pose, radius_m=radius_m, angle_deg=angle_deg)
+                pose = self._build_candidate_pose(target_pose, radius_m=radius_m, angle_deg=angle_deg,
+                                                  observer_body_pose=observer_body_pose)
                 traversable, penalty = self._evaluate_pose(
                     pose,
                     occupancy_grid=occupancy_grid,
@@ -64,7 +72,8 @@ class InspectionPosePlanner:
             return self._deduplicate(resolved, max_candidates=max_candidates)
         return [target_pose]
 
-    def _build_candidate_pose(self, target_pose: Pose, *, radius_m: float, angle_deg: float) -> Pose:
+    def _build_candidate_pose(self, target_pose: Pose, *, radius_m: float, angle_deg: float,
+                              observer_body_pose: Optional[Pose] = None) -> Pose:
         angle_rad = radians(angle_deg)
         candidate_x = float(target_pose.position.x) + (radius_m * cos(angle_rad))
         candidate_y = float(target_pose.position.y) + (radius_m * sin(angle_rad))
@@ -74,7 +83,8 @@ class InspectionPosePlanner:
         )
         return Pose(
             frame_id=target_pose.frame_id,
-            position=Vector3(x=candidate_x, y=candidate_y, z=float(target_pose.position.z)),
+            position=Vector3(x=candidate_x, y=candidate_y, z=float(
+                observer_body_pose.position.z if observer_body_pose is not None else target_pose.position.z)),
             orientation=self._yaw_to_quaternion(yaw),
         )
 

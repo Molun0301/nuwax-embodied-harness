@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from datetime import datetime
-from compat import StrEnum
+from contracts.compat import StrEnum
 
 from pydantic import Field, model_validator
 
 from contracts.base import MetadataDict, TimestampedContract, utc_now
 from contracts.geometry import Pose
-from typing import Optional
+from contracts.exploration_mission import ExplorationReturnPolicy
+from typing import List, Optional, Tuple
 
 
 class NavigationStatus(StrEnum):
@@ -29,8 +30,9 @@ class NavigationGoal(TimestampedContract):
     map_name: Optional[str] = Field(default=None, description="目标所属地图名称。")
     target_pose: Optional[Pose] = Field(default=None, description="目标位姿。")
     target_name: Optional[str] = Field(default=None, description="命名目标。")
-    tolerance_position_m: float = Field(default=0.3, ge=0.0, description="位置容差。")
+    tolerance_position_m: float = Field(default=0.35, ge=0.0, description="位置容差。")
     tolerance_yaw_rad: float = Field(default=0.3, ge=0.0, description="朝向容差。")
+    require_goal_orientation: bool = Field(default=True, description="是否要求最终朝向；仅位置选点为否。")
     allow_reverse: bool = Field(default=False, description="是否允许倒车。")
     metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")
 
@@ -79,7 +81,12 @@ class ExplorationStatus(StrEnum):
 
 
 class ExploreAreaRequest(TimestampedContract):
-    """探索任务请求。"""
+    """探索任务请求。
+
+    V2 扩展：
+    - ``boundary_line_segments``: 多段线段，每段 ``(Pose2D, Pose2D)``。
+      旧字段 ``boundary_line_segment`` 标记 deprecated 1 个 release，自动包成单元素 list 兼容。
+    """
 
     request_id: str = Field(description="探索请求标识。")
     map_name: Optional[str] = Field(default=None, description="探索所属地图名称。")
@@ -89,7 +96,36 @@ class ExploreAreaRequest(TimestampedContract):
     strategy: str = Field(default="frontier", description="探索策略，例如 frontier 或 coverage。")
     max_duration_sec: Optional[float] = Field(default=None, gt=0.0, description="探索最大时长。")
     stop_conditions: MetadataDict = Field(default_factory=dict, description="停止条件。")
+    return_policy: Optional[ExplorationReturnPolicy] = Field(default=None, description="可选行程预算与结束返航策略。")
+    resume_progress_json: Optional[str] = Field(default=None, max_length=2_097_152, exclude=True, repr=False, description="经地图资产拥有方核对的内部恢复载荷。")
+    # —— V2 新增（手划探索范围） ——
+    boundary_line_segments: List[Tuple[Pose, Pose]] = Field(
+        default_factory=list,
+        description="手划多段线段，每段 (Pose2D, Pose2D)。空列表表示不限定范围。",
+    )
+    # —— V1 deprecated 字段（1 个 release 周期保留） ——
+    boundary_line_segment: Optional[Tuple[Pose, Pose]] = Field(
+        default=None,
+        description="[deprecated] 单段线段；提交时自动包成单元素 list 写入 boundary_line_segments。",
+    )
     metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _wrap_legacy_single_segment(cls, data):
+        """旧字段 ``boundary_line_segment`` 自动包成单元素 list 兼容。"""
+        if not isinstance(data, dict):
+            return data
+        legacy = data.get("boundary_line_segment")
+        if legacy is None:
+            return data
+        normalized = dict(data)
+        segments = list(normalized.get("boundary_line_segments") or [])
+        if legacy not in segments:
+            segments.append(legacy)
+        normalized["boundary_line_segments"] = segments
+        # 旧字段保留以便上游排障，但下游只读 boundary_line_segments。
+        return normalized
 
 
 class ExplorationState(TimestampedContract):

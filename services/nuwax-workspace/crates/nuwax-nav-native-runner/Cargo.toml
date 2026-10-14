@@ -1,0 +1,23 @@
+[package]
+name = "nuwax-nav-native-runner"
+version = "0.1.0"
+description = "native C++ 模块进程生命周期管理(启动/停止/轮询/构建策略/CLI 渲染)"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+nuwax-nav-base = { path = "../nuwax-nav-base" }
+nuwax-nav-types-messages = { path = "../nuwax-nav-types-messages" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rustix = { version = "1.1.4", features = ["process"] }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "process", "io-util", "time"] }

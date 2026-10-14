@@ -1,0 +1,629 @@
+{
+  "date_utc": "2026-10-14",
+  "python": "3.8.10",
+  "cmake": "3.31.6",
+  "compiler": "Debian GCC 14.2.0",
+  "scope": "Actual native CMake dependency-discovery fragment with literal same-version ABI-incompatible packages; no SDK build",
+  "installer_identity_and_env_contract_tests": 57,
+  "cases": [
+    {
+      "stage": "baseline-a",
+      "variant": "baseline",
+      "configure_exit": 0,
+      "build_exit": 0,
+      "objects_changed": [
+        "CMakeFiles/consumer.dir/main.cpp.o",
+        "CMakeFiles/consumer.dir/helper.cpp.o"
+      ],
+      "runtime_exit": 0,
+      "runtime_output": "18",
+      "runtime_error": "",
+      "bindings": "Ceres=baseline-generations/a/lib/cmake/Ceres\nTBB=baseline-generations/a/lib/cmake/TBB\nBoost=baseline-generations/a/lib/cmake/Boost\nceres_library=baseline-generations/a/lib/libfixture_ceres.so\ntbb_library=baseline-generations/a/lib/libfixture_tbb.so\nboost_library=baseline-generations/a/lib/libfixture_boost.so\n"
+    },
+    {
+      "stage": "baseline-same-version-b",
+      "variant": "baseline",
+      "configure_exit": 0,
+      "build_exit": 0,
+      "objects_changed": [],
+      "runtime_exit": 127,
+      "runtime_output": "",
+      "runtime_error": "/workspace/scratch/71cdb9d17732/slam2d-managed-binding-audit-20261014/production-binding-evidence/baseline-generations/b/bin/consumer: symbol lookup error: /workspace/scratch/71cdb9d17732/slam2d-managed-binding-audit-20261014/production-binding-evidence/baseline-generations/b/bin/consumer: undefined symbol: fixture_ceres_a",
+      "bindings": "Ceres=baseline-generations/a/lib/cmake/Ceres\nTBB=baseline-generations/a/lib/cmake/TBB\nBoost=baseline-generations/a/lib/cmake/Boost\nceres_library=baseline-generations/a/lib/libfixture_ceres.so\ntbb_library=baseline-generations/a/lib/libfixture_tbb.so\nboost_library=baseline-generations/a/lib/libfixture_boost.so\n"
+    },
+    {
+      "stage": "managed-a",
+      "variant": "managed",
+      "configure_exit": 0,
+      "build_exit": 0,
+      "objects_changed": [
+        "CMakeFiles/consumer.dir/main.cpp.o",
+        "CMakeFiles/consumer.dir/helper.cpp.o"
+      ],
+      "runtime_exit": 0,
+      "runtime_output": "18",
+      "runtime_error": "",
+      "bindings": "Ceres=managed-generations/a/lib/cmake/Ceres\nTBB=managed-generations/a/lib/cmake/TBB\nBoost=managed-generations/a/lib/cmake/Boost\nceres_library=managed-generations/a/lib/libfixture_ceres.so\ntbb_library=managed-generations/a/lib/libfixture_tbb.so\nboost_library=managed-generations/a/lib/libfixture_boost.so\n"
+    },
+    {
+      "stage": "managed-same-version-b",
+      "variant": "managed",
+      "configure_exit": 0,
+      "build_exit": 0,
+      "objects_changed": [
+        "CMakeFiles/consumer.dir/main.cpp.o",
+        "CMakeFiles/consumer.dir/helper.cpp.o"
+      ],
+      "runtime_exit": 0,
+      "runtime_output": "29",
+      "runtime_error": "",
+      "bindings": "Ceres=managed-generations/b/lib/cmake/Ceres\nTBB=managed-generations/b/lib/cmake/TBB\nBoost=managed-generations/a/lib/cmake/Boost\nceres_library=managed-generations/b/lib/libfixture_ceres.so\ntbb_library=managed-generations/b/lib/libfixture_tbb.so\nboost_library=managed-generations/a/lib/libfixture_boost.so\n"
+    },
+    {
+      "stage": "managed-b-repeat",
+      "variant": "managed",
+      "configure_exit": 0,
+      "build_exit": 0,
+      "objects_changed": [],
+      "runtime_exit": 0,
+      "runtime_output": "29",
+      "runtime_error": "",
+      "bindings": "Ceres=managed-generations/b/lib/cmake/Ceres\nTBB=managed-generations/b/lib/cmake/TBB\nBoost=managed-generations/a/lib/cmake/Boost\nceres_library=managed-generations/b/lib/libfixture_ceres.so\ntbb_library=managed-generations/b/lib/libfixture_tbb.so\nboost_library=managed-generations/a/lib/libfixture_boost.so\n"
+    },
+    {
+      "stage": "managed-missing-ceres",
+      "variant": "managed",
+      "configure_exit": 1,
+      "configure_error_mentions_selected_ceres": true
+    },
+    {
+      "stage": "managed-configure-retry",
+      "variant": "managed",
+      "configure_exit": 0,
+      "build_exit": 0,
+      "objects_changed": [],
+      "runtime_exit": 0,
+      "runtime_output": "29",
+      "runtime_error": "",
+      "bindings": "Ceres=managed-generations/b/lib/cmake/Ceres\nTBB=managed-generations/b/lib/cmake/TBB\nBoost=managed-generations/a/lib/cmake/Boost\nceres_library=managed-generations/b/lib/libfixture_ceres.so\ntbb_library=managed-generations/b/lib/libfixture_tbb.so\nboost_library=managed-generations/a/lib/libfixture_boost.so\n"
+    },
+    {
+      "stage": "managed-compile-failure",
+      "variant": "managed",
+      "configure_exit": 0,
+      "build_exit": 2,
+      "objects_changed": [
+        "CMakeFiles/consumer.dir/helper.cpp.o"
+      ],
+      "bindings": "Ceres=managed-generations/b/lib/cmake/Ceres\nTBB=managed-generations/b/lib/cmake/TBB\nBoost=managed-generations/a/lib/cmake/Boost\nceres_library=managed-generations/b/lib/libfixture_ceres.so\ntbb_library=managed-generations/b/lib/libfixture_tbb.so\nboost_library=managed-generations/a/lib/libfixture_boost.so\n"
+    },
+    {
+      "stage": "managed-build-retry",
+      "variant": "managed",
+      "configure_exit": 0,
+      "build_exit": 0,
+      "objects_changed": [
+        "CMakeFiles/consumer.dir/main.cpp.o",
+        "CMakeFiles/consumer.dir/helper.cpp.o"
+      ],
+      "runtime_exit": 0,
+      "runtime_output": "29",
+      "runtime_error": "",
+      "bindings": "Ceres=managed-generations/b/lib/cmake/Ceres\nTBB=managed-generations/b/lib/cmake/TBB\nBoost=managed-generations/a/lib/cmake/Boost\nceres_library=managed-generations/b/lib/libfixture_ceres.so\ntbb_library=managed-generations/b/lib/libfixture_tbb.so\nboost_library=managed-generations/a/lib/libfixture_boost.so\n"
+    },
+    {
+      "stage": "managed-rollback-a",
+      "variant": "managed",
+      "configure_exit": 0,
+      "build_exit": 0,
+      "objects_changed": [
+        "CMakeFiles/consumer.dir/main.cpp.o",
+        "CMakeFiles/consumer.dir/helper.cpp.o"
+      ],
+      "runtime_exit": 0,
+      "runtime_output": "18",
+      "runtime_error": "",
+      "bindings": "Ceres=managed-generations/a/lib/cmake/Ceres\nTBB=managed-generations/a/lib/cmake/TBB\nBoost=managed-generations/a/lib/cmake/Boost\nceres_library=managed-generations/a/lib/libfixture_ceres.so\ntbb_library=managed-generations/a/lib/libfixture_tbb.so\nboost_library=managed-generations/a/lib/libfixture_boost.so\n"
+    },
+    {
+      "stage": "unmanaged-explicit-custom",
+      "variant": "managed",
+      "configure_exit": 0,
+      "build_exit": 0,
+      "objects_changed": [
+        "CMakeFiles/consumer.dir/main.cpp.o",
+        "CMakeFiles/consumer.dir/helper.cpp.o"
+      ],
+      "runtime_exit": 0,
+      "runtime_output": "40",
+      "runtime_error": "",
+      "bindings": "Ceres=managed-generations/custom/lib/cmake/Ceres\nTBB=managed-generations/custom/lib/cmake/TBB\nBoost=managed-generations/a/lib/cmake/Boost\nceres_library=managed-generations/custom/lib/libfixture_ceres.so\ntbb_library=managed-generations/custom/lib/libfixture_tbb.so\nboost_library=managed-generations/a/lib/libfixture_boost.so\n"
+    },
+    {
+      "stage": "unmanaged-custom-repeat",
+      "variant": "managed",
+      "configure_exit": 0,
+      "build_exit": 0,
+      "objects_changed": [],
+      "runtime_exit": 0,
+      "runtime_output": "40",
+      "runtime_error": "",
+      "bindings": "Ceres=managed-generations/custom/lib/cmake/Ceres\nTBB=managed-generations/custom/lib/cmake/TBB\nBoost=managed-generations/a/lib/cmake/Boost\nceres_library=managed-generations/custom/lib/libfixture_ceres.so\ntbb_library=managed-generations/custom/lib/libfixture_tbb.so\nboost_library=managed-generations/a/lib/libfixture_boost.so\n"
+    },
+    {
+      "stage": "return-to-managed-b",
+      "variant": "managed",
+      "configure_exit": 0,
+      "build_exit": 0,
+      "objects_changed": [
+        "CMakeFiles/consumer.dir/main.cpp.o",
+        "CMakeFiles/consumer.dir/helper.cpp.o"
+      ],
+      "runtime_exit": 0,
+      "runtime_output": "29",
+      "runtime_error": "",
+      "bindings": "Ceres=managed-generations/b/lib/cmake/Ceres\nTBB=managed-generations/b/lib/cmake/TBB\nBoost=managed-generations/a/lib/cmake/Boost\nceres_library=managed-generations/b/lib/libfixture_ceres.so\ntbb_library=managed-generations/b/lib/libfixture_tbb.so\nboost_library=managed-generations/a/lib/libfixture_boost.so\n"
+    }
+  ],
+  "actual_build_script_regression": {
+    "cargo": "1.88.0",
+    "rustc": "1.88.0",
+    "invocations": 64,
+    "scope": "Real Cargo, actual copied build.rs, fake CMake; no native compilation",
+    "cases": [
+      {
+        "crate": "slam",
+        "variant": "baseline",
+        "stage": "01-first",
+        "exit_code": 0,
+        "cmake_calls": 2
+      },
+      {
+        "crate": "slam",
+        "variant": "baseline",
+        "stage": "02-unchanged",
+        "exit_code": 0,
+        "cmake_calls": 0
+      },
+      {
+        "crate": "slam",
+        "variant": "baseline",
+        "stage": "03-jobs-only",
+        "exit_code": 0,
+        "cmake_calls": 2
+      },
+      {
+        "crate": "slam",
+        "variant": "baseline",
+        "stage": "04-native-source",
+        "exit_code": 0,
+        "cmake_calls": 2
+      },
+      {
+        "crate": "slam",
+        "variant": "baseline",
+        "stage": "05-source-repeat",
+        "exit_code": 0,
+        "cmake_calls": 0
+      },
+      {
+        "crate": "slam",
+        "variant": "baseline",
+        "stage": "06-prefix",
+        "exit_code": 0,
+        "cmake_calls": 2
+      },
+      {
+        "crate": "slam",
+        "variant": "baseline",
+        "stage": "07-prefix-repeat",
+        "exit_code": 0,
+        "cmake_calls": 0
+      },
+      {
+        "crate": "slam",
+        "variant": "baseline",
+        "stage": "08-toolchain",
+        "exit_code": 0,
+        "cmake_calls": 2
+      },
+      {
+        "crate": "slam",
+        "variant": "baseline",
+        "stage": "09-toolchain-repeat",
+        "exit_code": 0,
+        "cmake_calls": 0
+      },
+      {
+        "crate": "slam",
+        "variant": "baseline",
+        "stage": "10-configure-failure",
+        "exit_code": 101,
+        "cmake_calls": 1
+      },
+      {
+        "crate": "slam",
+        "variant": "baseline",
+        "stage": "11-configure-retry",
+        "exit_code": 0,
+        "cmake_calls": 2
+      },
+      {
+        "crate": "slam",
+        "variant": "baseline",
+        "stage": "12-build-failure",
+        "exit_code": 101,
+        "cmake_calls": 2
+      },
+      {
+        "crate": "slam",
+        "variant": "baseline",
+        "stage": "13-build-retry",
+        "exit_code": 0,
+        "cmake_calls": 2
+      },
+      {
+        "crate": "slam",
+        "variant": "baseline",
+        "stage": "14-final-repeat",
+        "exit_code": 0,
+        "cmake_calls": 0
+      },
+      {
+        "crate": "slam",
+        "variant": "baseline",
+        "stage": "15-managed-prefix",
+        "exit_code": 0,
+        "cmake_calls": 2
+      },
+      {
+        "crate": "slam",
+        "variant": "baseline",
+        "stage": "16-managed-repeat",
+        "exit_code": 0,
+        "cmake_calls": 0
+      },
+      {
+        "crate": "slam",
+        "variant": "baseline",
+        "stage": "17-unmanaged-transition",
+        "exit_code": 0,
+        "cmake_calls": 2
+      },
+      {
+        "crate": "slam",
+        "variant": "baseline",
+        "stage": "18-unmanaged-repeat",
+        "exit_code": 0,
+        "cmake_calls": 0
+      },
+      {
+        "crate": "slam",
+        "variant": "candidate",
+        "stage": "01-first",
+        "exit_code": 0,
+        "cmake_calls": 2
+      },
+      {
+        "crate": "slam",
+        "variant": "candidate",
+        "stage": "02-unchanged",
+        "exit_code": 0,
+        "cmake_calls": 0
+      },
+      {
+        "crate": "slam",
+        "variant": "candidate",
+        "stage": "03-jobs-only",
+        "exit_code": 0,
+        "cmake_calls": 0
+      },
+      {
+        "crate": "slam",
+        "variant": "candidate",
+        "stage": "04-native-source",
+        "exit_code": 0,
+        "cmake_calls": 2
+      },
+      {
+        "crate": "slam",
+        "variant": "candidate",
+        "stage": "05-source-repeat",
+        "exit_code": 0,
+        "cmake_calls": 0
+      },
+      {
+        "crate": "slam",
+        "variant": "candidate",
+        "stage": "06-prefix",
+        "exit_code": 0,
+        "cmake_calls": 2
+      },
+      {
+        "crate": "slam",
+        "variant": "candidate",
+        "stage": "07-prefix-repeat",
+        "exit_code": 0,
+        "cmake_calls": 0
+      },
+      {
+        "crate": "slam",
+        "variant": "candidate",
+        "stage": "08-toolchain",
+        "exit_code": 0,
+        "cmake_calls": 2
+      },
+      {
+        "crate": "slam",
+        "variant": "candidate",
+        "stage": "09-toolchain-repeat",
+        "exit_code": 0,
+        "cmake_calls": 0
+      },
+      {
+        "crate": "slam",
+        "variant": "candidate",
+        "stage": "10-configure-failure",
+        "exit_code": 101,
+        "cmake_calls": 1
+      },
+      {
+        "crate": "slam",
+        "variant": "candidate",
+        "stage": "11-configure-retry",
+        "exit_code": 0,
+        "cmake_calls": 2
+      },
+      {
+        "crate": "slam",
+        "variant": "candidate",
+        "stage": "12-build-failure",
+        "exit_code": 101,
+        "cmake_calls": 2
+      },
+      {
+        "crate": "slam",
+        "variant": "candidate",
+        "stage": "13-build-retry",
+        "exit_code": 0,
+        "cmake_calls": 2
+      },
+      {
+        "crate": "slam",
+        "variant": "candidate",
+        "stage": "14-final-repeat",
+        "exit_code": 0,
+        "cmake_calls": 0
+      },
+      {
+        "crate": "slam",
+        "variant": "candidate",
+        "stage": "15-managed-prefix",
+        "exit_code": 0,
+        "cmake_calls": 2
+      },
+      {
+        "crate": "slam",
+        "variant": "candidate",
+        "stage": "16-managed-repeat",
+        "exit_code": 0,
+        "cmake_calls": 0
+      },
+      {
+        "crate": "slam",
+        "variant": "candidate",
+        "stage": "17-unmanaged-transition",
+        "exit_code": 0,
+        "cmake_calls": 2
+      },
+      {
+        "crate": "slam",
+        "variant": "candidate",
+        "stage": "18-unmanaged-repeat",
+        "exit_code": 0,
+        "cmake_calls": 0
+      },
+      {
+        "crate": "gtsam",
+        "variant": "baseline",
+        "stage": "01-first",
+        "exit_code": 0,
+        "cmake_calls": 2
+      },
+      {
+        "crate": "gtsam",
+        "variant": "baseline",
+        "stage": "02-unchanged",
+        "exit_code": 0,
+        "cmake_calls": 0
+      },
+      {
+        "crate": "gtsam",
+        "variant": "baseline",
+        "stage": "03-jobs-only",
+        "exit_code": 0,
+        "cmake_calls": 2
+      },
+      {
+        "crate": "gtsam",
+        "variant": "baseline",
+        "stage": "04-native-source",
+        "exit_code": 0,
+        "cmake_calls": 2
+      },
+      {
+        "crate": "gtsam",
+        "variant": "baseline",
+        "stage": "05-source-repeat",
+        "exit_code": 0,
+        "cmake_calls": 0
+      },
+      {
+        "crate": "gtsam",
+        "variant": "baseline",
+        "stage": "06-prefix",
+        "exit_code": 0,
+        "cmake_calls": 2
+      },
+      {
+        "crate": "gtsam",
+        "variant": "baseline",
+        "stage": "07-prefix-repeat",
+        "exit_code": 0,
+        "cmake_calls": 0
+      },
+      {
+        "crate": "gtsam",
+        "variant": "baseline",
+        "stage": "08-toolchain",
+        "exit_code": 0,
+        "cmake_calls": 2
+      },
+      {
+        "crate": "gtsam",
+        "variant": "baseline",
+        "stage": "09-toolchain-repeat",
+        "exit_code": 0,
+        "cmake_calls": 0
+      },
+      {
+        "crate": "gtsam",
+        "variant": "baseline",
+        "stage": "10-configure-failure",
+        "exit_code": 101,
+        "cmake_calls": 1
+      },
+      {
+        "crate": "gtsam",
+        "variant": "baseline",
+        "stage": "11-configure-retry",
+        "exit_code": 0,
+        "cmake_calls": 2
+      },
+      {
+        "crate": "gtsam",
+        "variant": "baseline",
+        "stage": "12-build-failure",
+        "exit_code": 101,
+        "cmake_calls": 2
+      },
+      {
+        "crate": "gtsam",
+        "variant": "baseline",
+        "stage": "13-build-retry",
+        "exit_code": 0,
+        "cmake_calls": 2
+      },
+      {
+        "crate": "gtsam",
+        "variant": "baseline",
+        "stage": "14-final-repeat",
+        "exit_code": 0,
+        "cmake_calls": 0
+      },
+      {
+        "crate": "gtsam",
+        "variant": "candidate",
+        "stage": "01-first",
+        "exit_code": 0,
+        "cmake_calls": 2
+      },
+      {
+        "crate": "gtsam",
+        "variant": "candidate",
+        "stage": "02-unchanged",
+        "exit_code": 0,
+        "cmake_calls": 0
+      },
+      {
+        "crate": "gtsam",
+        "variant": "candidate",
+        "stage": "03-jobs-only",
+        "exit_code": 0,
+        "cmake_calls": 0
+      },
+      {
+        "crate": "gtsam",
+        "variant": "candidate",
+        "stage": "04-native-source",
+        "exit_code": 0,
+        "cmake_calls": 2
+      },
+      {
+        "crate": "gtsam",
+        "variant": "candidate",
+        "stage": "05-source-repeat",
+        "exit_code": 0,
+        "cmake_calls": 0
+      },
+      {
+        "crate": "gtsam",
+        "variant": "candidate",
+        "stage": "06-prefix",
+        "exit_code": 0,
+        "cmake_calls": 2
+      },
+      {
+        "crate": "gtsam",
+        "variant": "candidate",
+        "stage": "07-prefix-repeat",
+        "exit_code": 0,
+        "cmake_calls": 0
+      },
+      {
+        "crate": "gtsam",
+        "variant": "candidate",
+        "stage": "08-toolchain",
+        "exit_code": 0,
+        "cmake_calls": 2
+      },
+      {
+        "crate": "gtsam",
+        "variant": "candidate",
+        "stage": "09-toolchain-repeat",
+        "exit_code": 0,
+        "cmake_calls": 0
+      },
+      {
+        "crate": "gtsam",
+        "variant": "candidate",
+        "stage": "10-configure-failure",
+        "exit_code": 101,
+        "cmake_calls": 1
+      },
+      {
+        "crate": "gtsam",
+        "variant": "candidate",
+        "stage": "11-configure-retry",
+        "exit_code": 0,
+        "cmake_calls": 2
+      },
+      {
+        "crate": "gtsam",
+        "variant": "candidate",
+        "stage": "12-build-failure",
+        "exit_code": 101,
+        "cmake_calls": 2
+      },
+      {
+        "crate": "gtsam",
+        "variant": "candidate",
+        "stage": "13-build-retry",
+        "exit_code": 0,
+        "cmake_calls": 2
+      },
+      {
+        "crate": "gtsam",
+        "variant": "candidate",
+        "stage": "14-final-repeat",
+        "exit_code": 0,
+        "cmake_calls": 0
+      }
+    ]
+  },
+  "additional_real_package_configure": {
+    "results_file": "slam2d-real-package-discovery-20261014-results.json",
+    "configure_passes": 2,
+    "scope": "Actual full production native CMakeLists.txt, existing real installed packages, isolated initial/reuse configure only; no native target build/install."
+  }
+}

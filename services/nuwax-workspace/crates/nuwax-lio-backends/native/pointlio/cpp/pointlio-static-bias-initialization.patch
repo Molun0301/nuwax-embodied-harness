@@ -1,0 +1,31 @@
+静止初始化时使加速度、重力、角速度和惯性偏置满足同一观测均值；运动启动保持原行为。
+
+--- a/src/laserMapping.hpp
++++ b/src/laserMapping.hpp
+@@ -599,6 +599,14 @@
+                         // is already orthonormal (from Set_init's Exp), so no normalize is needed.
+                         // hku-mars master keeps these two lines commented out for the same reason.
+                         state_out.acc = -rot_init.transpose() * state_out.gravity;
++                    }
++                    // 静止初值同时满足重力平衡和惯性观测，避免零偏差额进入运动状态。
++                    if (!non_station_start) {
++                        const V3D measured_acc = p_imu->mean_acc * G_m_s2 / acc_norm;
++                        state_in.ba = measured_acc + state_in.rot.transpose() * state_in.gravity;
++                        state_out.ba = measured_acc - state_out.acc;
++                        state_in.bg = state_out.bg = p_imu->mean_gyro();
++                        state_out.omg.setZero();
+                     }
+                     kf_input.change_x(state_in);
+                     kf_output.change_x(state_out);
+--- a/src/IMU_Processing.hpp
++++ b/src/IMU_Processing.hpp
+@@ -44,6 +44,9 @@
+     bool imu_need_init_ = true;
+     bool b_first_frame_ = true;
+     bool gravity_align_ = false;
++
++    // 只读取得同一初始化窗口累计的陀螺均值。
++    const V3D& mean_gyro() const { return mean_gyr; }
+ 
+ private:
+     void IMU_init(const MeasureGroup &meas, int &N);

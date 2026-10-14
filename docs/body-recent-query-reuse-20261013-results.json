@@ -1,0 +1,754 @@
+{
+  "reference_commit": "bb1a14ffb24a91aeda1811a2b7332544df757bee",
+  "source_resolution_m": 0.05,
+  "profile": "release, thin LTO, codegen-units=1, body-query-profile disabled",
+  "timing_scope": "full pose-result-cache-miss query, warm source/ground caches, result/witness assertion and temporary destruction included",
+  "affinity_cpu": 0,
+  "rayon_threads": 1,
+  "poses_per_case": 16,
+  "calls_per_pair_arm": 512,
+  "final_pairs": 9,
+  "baseline_aa_pairs": 7,
+  "final": [
+    {
+      "coarse": 0.05,
+      "kind": "no_recent",
+      "frames": 1,
+      "pairs": 9,
+      "old_us": 22.69486328125,
+      "new_us": 23.335734375,
+      "saving_pct": -2.823859680527241,
+      "wins": 2
+    },
+    {
+      "coarse": 0.05,
+      "kind": "no_recent",
+      "frames": 8,
+      "pairs": 9,
+      "old_us": 23.79108984375,
+      "new_us": 22.8983359375,
+      "saving_pct": 3.75247166949155,
+      "wins": 5
+    },
+    {
+      "coarse": 0.05,
+      "kind": "clear",
+      "frames": 1,
+      "pairs": 9,
+      "old_us": 41.2195859375,
+      "new_us": 40.32194140625,
+      "saving_pct": 2.17771360588404,
+      "wins": 4
+    },
+    {
+      "coarse": 0.05,
+      "kind": "clear",
+      "frames": 8,
+      "pairs": 9,
+      "old_us": 172.23925,
+      "new_us": 169.943568359375,
+      "saving_pct": 1.3328446568508578,
+      "wins": 6
+    },
+    {
+      "coarse": 0.05,
+      "kind": "fallback",
+      "frames": 1,
+      "pairs": 9,
+      "old_us": 1.23258203125,
+      "new_us": 1.338134765625,
+      "saving_pct": -8.563546417105862,
+      "wins": 4
+    },
+    {
+      "coarse": 0.05,
+      "kind": "fallback",
+      "frames": 8,
+      "pairs": 9,
+      "old_us": 1.266755859375,
+      "new_us": 1.33598046875,
+      "saving_pct": -5.464715940540798,
+      "wins": 2
+    },
+    {
+      "coarse": 0.05,
+      "kind": "door",
+      "frames": 1,
+      "pairs": 9,
+      "old_us": 38.28660546875,
+      "new_us": 37.61911328125,
+      "saving_pct": 1.743409161840714,
+      "wins": 5
+    },
+    {
+      "coarse": 0.05,
+      "kind": "door",
+      "frames": 8,
+      "pairs": 9,
+      "old_us": 161.09426171875,
+      "new_us": 156.24355859375,
+      "saving_pct": 3.011096157769234,
+      "wins": 7
+    },
+    {
+      "coarse": 0.05,
+      "kind": "obstacle",
+      "frames": 1,
+      "pairs": 9,
+      "old_us": 9.257353515625,
+      "new_us": 9.6092734375,
+      "saving_pct": -3.8015175857874803,
+      "wins": 3
+    },
+    {
+      "coarse": 0.05,
+      "kind": "obstacle",
+      "frames": 8,
+      "pairs": 9,
+      "old_us": 9.777203125,
+      "new_us": 9.469216796875,
+      "saving_pct": 3.1500453062848752,
+      "wins": 4
+    },
+    {
+      "coarse": 0.05,
+      "kind": "coarse_only",
+      "frames": 1,
+      "pairs": 9,
+      "old_us": 12.4923359375,
+      "new_us": 12.868646484375,
+      "saving_pct": -3.0123313106348375,
+      "wins": 3
+    },
+    {
+      "coarse": 0.05,
+      "kind": "coarse_only",
+      "frames": 8,
+      "pairs": 9,
+      "old_us": 40.753044921875,
+      "new_us": 42.741884765625,
+      "saving_pct": -4.880223913483459,
+      "wins": 0
+    },
+    {
+      "coarse": 0.075,
+      "kind": "no_recent",
+      "frames": 1,
+      "pairs": 9,
+      "old_us": 32.666265625,
+      "new_us": 32.44802734375,
+      "saving_pct": 0.6680845731046196,
+      "wins": 6
+    },
+    {
+      "coarse": 0.075,
+      "kind": "no_recent",
+      "frames": 8,
+      "pairs": 9,
+      "old_us": 32.224896484375,
+      "new_us": 33.64680859375,
+      "saving_pct": -4.412464474678601,
+      "wins": 3
+    },
+    {
+      "coarse": 0.075,
+      "kind": "clear",
+      "frames": 1,
+      "pairs": 9,
+      "old_us": 76.74278515625,
+      "new_us": 65.10901171875,
+      "saving_pct": 15.159436048370384,
+      "wins": 9
+    },
+    {
+      "coarse": 0.075,
+      "kind": "clear",
+      "frames": 8,
+      "pairs": 9,
+      "old_us": 370.317244140625,
+      "new_us": 267.23329296875,
+      "saving_pct": 27.836659729712643,
+      "wins": 9
+    },
+    {
+      "coarse": 0.075,
+      "kind": "fallback",
+      "frames": 1,
+      "pairs": 9,
+      "old_us": 60.58434765625,
+      "new_us": 60.5555546875,
+      "saving_pct": 0.04752542507079975,
+      "wins": 5
+    },
+    {
+      "coarse": 0.075,
+      "kind": "fallback",
+      "frames": 8,
+      "pairs": 9,
+      "old_us": 66.933912109375,
+      "new_us": 70.402666015625,
+      "saving_pct": -5.182356442249779,
+      "wins": 4
+    },
+    {
+      "coarse": 0.075,
+      "kind": "door",
+      "frames": 1,
+      "pairs": 9,
+      "old_us": 100.2659296875,
+      "new_us": 91.76733984375,
+      "saving_pct": 8.476049511771013,
+      "wins": 9
+    },
+    {
+      "coarse": 0.075,
+      "kind": "door",
+      "frames": 8,
+      "pairs": 9,
+      "old_us": 408.438431640625,
+      "new_us": 298.98269140625,
+      "saving_pct": 26.798589886537034,
+      "wins": 9
+    },
+    {
+      "coarse": 0.075,
+      "kind": "obstacle",
+      "frames": 1,
+      "pairs": 9,
+      "old_us": 21.729306640625,
+      "new_us": 15.9404296875,
+      "saving_pct": 26.640872849123248,
+      "wins": 9
+    },
+    {
+      "coarse": 0.075,
+      "kind": "obstacle",
+      "frames": 8,
+      "pairs": 9,
+      "old_us": 21.411384765625,
+      "new_us": 15.840298828125,
+      "saving_pct": 26.01926964781897,
+      "wins": 9
+    },
+    {
+      "coarse": 0.075,
+      "kind": "coarse_only",
+      "frames": 1,
+      "pairs": 9,
+      "old_us": 11.31397265625,
+      "new_us": 11.167072265625,
+      "saving_pct": 1.2983979640771857,
+      "wins": 5
+    },
+    {
+      "coarse": 0.075,
+      "kind": "coarse_only",
+      "frames": 8,
+      "pairs": 9,
+      "old_us": 48.919572265625,
+      "new_us": 49.367337890625,
+      "saving_pct": -0.9153097712480207,
+      "wins": 4
+    },
+    {
+      "coarse": 0.1,
+      "kind": "no_recent",
+      "frames": 1,
+      "pairs": 9,
+      "old_us": 13.969486328125,
+      "new_us": 14.315283203125,
+      "saving_pct": -2.4753728725429287,
+      "wins": 2
+    },
+    {
+      "coarse": 0.1,
+      "kind": "no_recent",
+      "frames": 8,
+      "pairs": 9,
+      "old_us": 14.02932421875,
+      "new_us": 14.400546875,
+      "saving_pct": -2.646048023851823,
+      "wins": 4
+    },
+    {
+      "coarse": 0.1,
+      "kind": "clear",
+      "frames": 1,
+      "pairs": 9,
+      "old_us": 47.8801328125,
+      "new_us": 31.240109375,
+      "saving_pct": 34.75350309211301,
+      "wins": 9
+    },
+    {
+      "coarse": 0.1,
+      "kind": "clear",
+      "frames": 8,
+      "pairs": 9,
+      "old_us": 294.080408203125,
+      "new_us": 159.644025390625,
+      "saving_pct": 45.71415812223816,
+      "wins": 9
+    },
+    {
+      "coarse": 0.1,
+      "kind": "fallback",
+      "frames": 1,
+      "pairs": 9,
+      "old_us": 27.7879453125,
+      "new_us": 27.566986328125,
+      "saving_pct": 0.7951612898691134,
+      "wins": 6
+    },
+    {
+      "coarse": 0.1,
+      "kind": "fallback",
+      "frames": 8,
+      "pairs": 9,
+      "old_us": 26.619423828125,
+      "new_us": 26.653244140625,
+      "saving_pct": -0.1270512567002471,
+      "wins": 5
+    },
+    {
+      "coarse": 0.1,
+      "kind": "door",
+      "frames": 1,
+      "pairs": 9,
+      "old_us": 50.892060546875,
+      "new_us": 33.4166953125,
+      "saving_pct": 34.33809723282675,
+      "wins": 9
+    },
+    {
+      "coarse": 0.1,
+      "kind": "door",
+      "frames": 8,
+      "pairs": 9,
+      "old_us": 297.47864453125,
+      "new_us": 156.81755078125,
+      "saving_pct": 47.28443413867432,
+      "wins": 9
+    },
+    {
+      "coarse": 0.1,
+      "kind": "obstacle",
+      "frames": 1,
+      "pairs": 9,
+      "old_us": 17.1791171875,
+      "new_us": 9.46000390625,
+      "saving_pct": 44.93311965335821,
+      "wins": 9
+    },
+    {
+      "coarse": 0.1,
+      "kind": "obstacle",
+      "frames": 8,
+      "pairs": 9,
+      "old_us": 16.849439453125,
+      "new_us": 9.603482421875,
+      "saving_pct": 43.004142965160305,
+      "wins": 9
+    },
+    {
+      "coarse": 0.1,
+      "kind": "coarse_only",
+      "frames": 1,
+      "pairs": 9,
+      "old_us": 8.0937421875,
+      "new_us": 8.03132421875,
+      "saving_pct": 0.771188003077236,
+      "wins": 5
+    },
+    {
+      "coarse": 0.1,
+      "kind": "coarse_only",
+      "frames": 8,
+      "pairs": 9,
+      "old_us": 42.486638671875,
+      "new_us": 40.882125,
+      "saving_pct": 3.776513562926647,
+      "wins": 8
+    }
+  ],
+  "baseline_aa": [
+    {
+      "coarse": 0.05,
+      "kind": "no_recent",
+      "frames": 1,
+      "pairs": 7,
+      "old_us": 21.35323046875,
+      "new_us": 22.375810546875,
+      "saving_pct": -4.788877634330446,
+      "wins": 2
+    },
+    {
+      "coarse": 0.05,
+      "kind": "no_recent",
+      "frames": 8,
+      "pairs": 7,
+      "old_us": 22.417044921875,
+      "new_us": 22.6513828125,
+      "saving_pct": -1.045355850611371,
+      "wins": 4
+    },
+    {
+      "coarse": 0.05,
+      "kind": "clear",
+      "frames": 1,
+      "pairs": 7,
+      "old_us": 37.88946484375,
+      "new_us": 37.5959921875,
+      "saving_pct": 0.774549488783306,
+      "wins": 4
+    },
+    {
+      "coarse": 0.05,
+      "kind": "clear",
+      "frames": 8,
+      "pairs": 7,
+      "old_us": 147.5354609375,
+      "new_us": 147.668072265625,
+      "saving_pct": -0.08988437578486455,
+      "wins": 3
+    },
+    {
+      "coarse": 0.05,
+      "kind": "fallback",
+      "frames": 1,
+      "pairs": 7,
+      "old_us": 1.189080078125,
+      "new_us": 1.191095703125,
+      "saving_pct": -0.16951129171875567,
+      "wins": 4
+    },
+    {
+      "coarse": 0.05,
+      "kind": "fallback",
+      "frames": 8,
+      "pairs": 7,
+      "old_us": 1.15934765625,
+      "new_us": 1.18323046875,
+      "saving_pct": -2.0600216312379254,
+      "wins": 2
+    },
+    {
+      "coarse": 0.05,
+      "kind": "door",
+      "frames": 1,
+      "pairs": 7,
+      "old_us": 37.224927734375,
+      "new_us": 38.311998046875,
+      "saving_pct": -2.920275145346089,
+      "wins": 3
+    },
+    {
+      "coarse": 0.05,
+      "kind": "door",
+      "frames": 8,
+      "pairs": 7,
+      "old_us": 146.64671484375,
+      "new_us": 148.9962578125,
+      "saving_pct": -1.6021790677366385,
+      "wins": 2
+    },
+    {
+      "coarse": 0.05,
+      "kind": "obstacle",
+      "frames": 1,
+      "pairs": 7,
+      "old_us": 9.387509765625,
+      "new_us": 9.494234375,
+      "saving_pct": -1.1368788106703458,
+      "wins": 3
+    },
+    {
+      "coarse": 0.05,
+      "kind": "obstacle",
+      "frames": 8,
+      "pairs": 7,
+      "old_us": 9.191140625,
+      "new_us": 9.246732421875,
+      "saving_pct": -0.6048411088803385,
+      "wins": 3
+    },
+    {
+      "coarse": 0.05,
+      "kind": "coarse_only",
+      "frames": 1,
+      "pairs": 7,
+      "old_us": 12.1894765625,
+      "new_us": 12.48552734375,
+      "saving_pct": -2.4287407234596,
+      "wins": 2
+    },
+    {
+      "coarse": 0.05,
+      "kind": "coarse_only",
+      "frames": 8,
+      "pairs": 7,
+      "old_us": 45.804892578125,
+      "new_us": 45.736037109375,
+      "saving_pct": 0.15032339314530963,
+      "wins": 4
+    },
+    {
+      "coarse": 0.075,
+      "kind": "no_recent",
+      "frames": 1,
+      "pairs": 7,
+      "old_us": 30.199220703125,
+      "new_us": 30.012318359375,
+      "saving_pct": 0.6188979033179438,
+      "wins": 4
+    },
+    {
+      "coarse": 0.075,
+      "kind": "no_recent",
+      "frames": 8,
+      "pairs": 7,
+      "old_us": 34.742251953125,
+      "new_us": 33.38684765625,
+      "saving_pct": 3.901313877706437,
+      "wins": 4
+    },
+    {
+      "coarse": 0.075,
+      "kind": "clear",
+      "frames": 1,
+      "pairs": 7,
+      "old_us": 75.892126953125,
+      "new_us": 75.83221484375,
+      "saving_pct": 0.07894377424948253,
+      "wins": 4
+    },
+    {
+      "coarse": 0.075,
+      "kind": "clear",
+      "frames": 8,
+      "pairs": 7,
+      "old_us": 362.07528515625,
+      "new_us": 361.602802734375,
+      "saving_pct": 0.1304928674353155,
+      "wins": 4
+    },
+    {
+      "coarse": 0.075,
+      "kind": "fallback",
+      "frames": 1,
+      "pairs": 7,
+      "old_us": 63.548939453125,
+      "new_us": 65.5146796875,
+      "saving_pct": -3.0932699291149857,
+      "wins": 2
+    },
+    {
+      "coarse": 0.075,
+      "kind": "fallback",
+      "frames": 8,
+      "pairs": 7,
+      "old_us": 67.9739765625,
+      "new_us": 61.289591796875,
+      "saving_pct": 9.83374094566751,
+      "wins": 4
+    },
+    {
+      "coarse": 0.075,
+      "kind": "door",
+      "frames": 1,
+      "pairs": 7,
+      "old_us": 109.32119921875,
+      "new_us": 110.98639453125,
+      "saving_pct": -1.5232135435762775,
+      "wins": 5
+    },
+    {
+      "coarse": 0.075,
+      "kind": "door",
+      "frames": 8,
+      "pairs": 7,
+      "old_us": 416.941033203125,
+      "new_us": 397.167958984375,
+      "saving_pct": 4.742415028534022,
+      "wins": 5
+    },
+    {
+      "coarse": 0.075,
+      "kind": "obstacle",
+      "frames": 1,
+      "pairs": 7,
+      "old_us": 21.377548828125,
+      "new_us": 22.0412265625,
+      "saving_pct": -3.1045548753552312,
+      "wins": 3
+    },
+    {
+      "coarse": 0.075,
+      "kind": "obstacle",
+      "frames": 8,
+      "pairs": 7,
+      "old_us": 22.680962890625,
+      "new_us": 23.0540234375,
+      "saving_pct": -1.644817941257692,
+      "wins": 3
+    },
+    {
+      "coarse": 0.075,
+      "kind": "coarse_only",
+      "frames": 1,
+      "pairs": 7,
+      "old_us": 12.23298046875,
+      "new_us": 11.86954296875,
+      "saving_pct": 2.970964442626441,
+      "wins": 3
+    },
+    {
+      "coarse": 0.075,
+      "kind": "coarse_only",
+      "frames": 8,
+      "pairs": 7,
+      "old_us": 44.579375,
+      "new_us": 45.829857421875,
+      "saving_pct": -2.805069433734768,
+      "wins": 2
+    },
+    {
+      "coarse": 0.1,
+      "kind": "no_recent",
+      "frames": 1,
+      "pairs": 7,
+      "old_us": 13.426404296875,
+      "new_us": 13.4180703125,
+      "saving_pct": 0.062071603019888,
+      "wins": 4
+    },
+    {
+      "coarse": 0.1,
+      "kind": "no_recent",
+      "frames": 8,
+      "pairs": 7,
+      "old_us": 13.465193359375,
+      "new_us": 13.361951171875,
+      "saving_pct": 0.7667337909270947,
+      "wins": 4
+    },
+    {
+      "coarse": 0.1,
+      "kind": "clear",
+      "frames": 1,
+      "pairs": 7,
+      "old_us": 45.579888671875,
+      "new_us": 45.746646484375,
+      "saving_pct": -0.3658583146187008,
+      "wins": 3
+    },
+    {
+      "coarse": 0.1,
+      "kind": "clear",
+      "frames": 8,
+      "pairs": 7,
+      "old_us": 280.1102109375,
+      "new_us": 269.17116015625,
+      "saving_pct": 3.9052666965042686,
+      "wins": 5
+    },
+    {
+      "coarse": 0.1,
+      "kind": "fallback",
+      "frames": 1,
+      "pairs": 7,
+      "old_us": 27.6985703125,
+      "new_us": 27.550689453125,
+      "saving_pct": 0.5338934743078186,
+      "wins": 2
+    },
+    {
+      "coarse": 0.1,
+      "kind": "fallback",
+      "frames": 8,
+      "pairs": 7,
+      "old_us": 31.644224609375,
+      "new_us": 30.44066015625,
+      "saving_pct": 3.8034253263656512,
+      "wins": 5
+    },
+    {
+      "coarse": 0.1,
+      "kind": "door",
+      "frames": 1,
+      "pairs": 7,
+      "old_us": 50.067591796875,
+      "new_us": 47.140791015625,
+      "saving_pct": 5.845699136327703,
+      "wins": 5
+    },
+    {
+      "coarse": 0.1,
+      "kind": "door",
+      "frames": 8,
+      "pairs": 7,
+      "old_us": 330.749544921875,
+      "new_us": 334.8825625,
+      "saving_pct": -1.2495913120912272,
+      "wins": 1
+    },
+    {
+      "coarse": 0.1,
+      "kind": "obstacle",
+      "frames": 1,
+      "pairs": 7,
+      "old_us": 20.187505859375,
+      "new_us": 21.62921484375,
+      "saving_pct": -7.141590419430013,
+      "wins": 2
+    },
+    {
+      "coarse": 0.1,
+      "kind": "obstacle",
+      "frames": 8,
+      "pairs": 7,
+      "old_us": 18.071970703125,
+      "new_us": 18.43871484375,
+      "saving_pct": -2.0293533375504045,
+      "wins": 2
+    },
+    {
+      "coarse": 0.1,
+      "kind": "coarse_only",
+      "frames": 1,
+      "pairs": 7,
+      "old_us": 8.430970703125,
+      "new_us": 8.7013984375,
+      "saving_pct": -3.207551584478448,
+      "wins": 3
+    },
+    {
+      "coarse": 0.1,
+      "kind": "coarse_only",
+      "frames": 8,
+      "pairs": 7,
+      "old_us": 44.4231953125,
+      "new_us": 44.11577734375,
+      "saving_pct": 0.6920212888501953,
+      "wins": 4
+    }
+  ],
+  "qualification": {
+    "baseline_mls": {
+      "passed": 316,
+      "failed": 0,
+      "ignored": 16
+    },
+    "final_mls": {
+      "passed": 320,
+      "failed": 0,
+      "ignored": 16
+    },
+    "new_semantic_tests": 5,
+    "runtime_latest_recent_selection": 6,
+    "runtime_current_recheck_selection": 4,
+    "runtime_overlap": 1,
+    "runtime_distinct_passed": 9,
+    "independent_source_review": "no correctness blocker; four requested coverage improvements applied"
+  }
+}

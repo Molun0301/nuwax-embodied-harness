@@ -1,0 +1,37 @@
+package nuwax_msgs;
+
+// 规范二维扫描；数组中的距离、角度、状态和时间使用同一束索引。
+struct PlanarScan {
+    int32_t schema_version;
+    int64_t runtime_generation;
+    string sensor_id;
+    int64_t source_sequence;
+    int64_t timestamp_ns;
+    string clock_domain;
+    string clock_id;
+    string frame_id;
+    string calibration_ref;
+    int32_t beam_count;
+    // 1为等角布局，2为显式角度数组。
+    int8_t angular_layout;
+    double angle_min_rad;
+    double angle_increment_rad;
+    double range_min_m;
+    double range_max_m;
+    int64_t scan_duration_ns;
+    // 时间质量：1硬件、2估算、3接收；逐束质量0表示未提供。
+    int8_t timestamp_quality;
+    int8_t time_offsets_quality;
+    int64_t timing_uncertainty_ns;
+    int8_t motion_compensated;
+    int32_t ranges_size;
+    byte ranges_f32_le[ranges_size];
+    int32_t angles_size;
+    byte angles_f32_le[angles_size];
+    int32_t states_size;
+    byte beam_states_u8[states_size];
+    int32_t intensities_size;
+    byte intensities_f32_le[intensities_size];
+    int32_t offsets_size;
+    byte time_offsets_ns_le[offsets_size];
+}

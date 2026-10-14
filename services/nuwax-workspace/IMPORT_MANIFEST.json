@@ -1,0 +1,139 @@
+{
+  "snapshotted_at_utc": "2026-07-07T05:55:46Z",
+  "source_git_commit": "cc730ac82aec1f267b754e51f182ce16203d2041",
+  "crate_count_on_disk": 50,
+  "crate_count_in_workspace_members": 39,
+  "crate_count": 50,
+  "excludes": [
+    "target/",
+    ".omc/",
+    ".omx/",
+    "generated/c/",
+    "*.lock.tmp",
+    ".cargo/config.toml (如含机器私有路径)"
+  ],
+  "members": [
+    "nuwax-codec",
+    "nuwax-core",
+    "nuwax-exploration",
+    "nuwax-explore-tare-bridge",
+    "nuwax-explore-terrain-bridge",
+    "nuwax-explore-terrain-map-bridge",
+    "nuwax-explore-wavefront",
+    "nuwax-lcm",
+    "nuwax-lcm-sys",
+    "nuwax-mapping",
+    "nuwax-mapping-cli",
+    "nuwax-mapping-cloud",
+    "nuwax-nav-astar",
+    "nuwax-nav-base",
+    "nuwax-nav-basic-path-follower",
+    "nuwax-nav-bbox-tracker",
+    "nuwax-nav-click-goal-bridge",
+    "nuwax-nav-far-planner-bridge",
+    "nuwax-nav-local-planner-bridge",
+    "nuwax-nav-mls-planner",
+    "nuwax-nav-movement-manager",
+    "nuwax-nav-native-runner",
+    "nuwax-nav-path-follower-bridge",
+    "nuwax-nav-patrolling",
+    "nuwax-nav-pgo-bridge",
+    "nuwax-nav-simple-planner",
+    "nuwax-nav-stack",
+    "nuwax-nav-terrain-map-ext",
+    "nuwax-nav-test-fixtures",
+    "nuwax-nav-types-messages",
+    "nuwax-nav-visual-query",
+    "nuwax-nav-visual-servoing",
+    "nuwax-numeric",
+    "nuwax-protocol",
+    "nuwax-rpc",
+    "nuwax-stream",
+    "nuwax-tf",
+    "nuwax-transport",
+    "nuwax-types"
+  ],
+  "on_disk_but_not_in_members": [
+    "nuwax-mapping-raytracing",
+    "nuwax-slam-fastlio2-bridge",
+    "nuwax-vision-clip",
+    "nuwax-vision-detect-2d",
+    "nuwax-vision-detect-3d",
+    "nuwax-vision-embedding",
+    "nuwax-vision-fiducial",
+    "nuwax-vision-reid",
+    "nuwax-vision-spatial",
+    "nuwax-vision-tracker"
+  ],
+  "in_members_but_not_on_disk": [],
+  "deferred": [],
+  "w1_ledger_reconciliation": {
+    "revised_at_utc": "2026-07-11T00:00:00Z",
+    "ledger_source": ".omx/plans/inventory_workspace_disposition.json",
+    "totals": {
+      "verified_on_disk": 41,
+      "verified_removed": 9,
+      "disposition_required_now": 22,
+      "disposition_qualified": 13,
+      "disposition_unsupported_gated": 4,
+      "disposition_intentional_change": 2,
+      "disposition_removed": 9
+    },
+    "removed_crates_physically_absent": [
+      "nuwax-slam-fastlio2-bridge",
+      "nuwax-vision-clip",
+      "nuwax-vision-detect-2d",
+      "nuwax-vision-detect-3d",
+      "nuwax-vision-embedding",
+      "nuwax-vision-fiducial",
+      "nuwax-vision-reid",
+      "nuwax-vision-spatial",
+      "nuwax-vision-tracker"
+    ],
+    "removed_note": "Native mapping is active; nuwax-vision-* board not implemented (model deferred).",
+    "intentional_change_crates": [
+      {
+        "crate": "nuwax-mapping-raytracing",
+        "notes": "Standalone crate; Cargo.toml declares own [workspace] block. 1320 lines voxel_ray_tracer.rs + migration/ holds stage-0 shim assets. Awaiting dimos-module shim (post-M) before member re-entry."
+      },
+      {
+        "crate": "nuwax-nav-visual-servoing",
+        "notes": "2D bbox visual servoing + 3D detection navigation (TF trait). 11 pub fns but no vision model - pure transform math. Awaiting vision crate re-introduction (post-N1)."
+      }
+    ],
+    "unsupported_gated_crates": [
+      {
+        "crate": "nuwax-nav-far-planner-bridge",
+        "notes": "C++ far_planner_native wrapper; default features=[]. PreferWavefront policy binds disabled-at-runtime. Wavefront is first-release explorer."
+      },
+      {
+        "crate": "nuwax-nav-local-planner-bridge",
+        "notes": "C++ local planner wrapper; gated behind native-local feature. Wavefront-priority path uses no separate local planner at first release."
+      },
+      {
+        "crate": "nuwax-nav-path-follower-bridge",
+        "notes": "C++ pure pursuit path_follower; gated behind native-path-follower feature. First-release uses pure-Rust nuwax-nav-basic-path-follower fallback."
+      },
+      {
+        "crate": "nuwax-nav-pgo-bridge",
+        "notes": "C++ PGO + map->odom TF helper; gated behind native-pgo feature. Wavefront path does not require PGO at first release."
+      }
+    ],
+    "first_release_priority": {
+      "explorer": "wavefront",
+      "planner": "simple-2d",
+      "path_follower": "nuwax-nav-basic-path-follower (pure Rust fallback)"
+    }
+  },
+  "lockfile_sha256": {
+    "Cargo.toml": "e8c3a71f1db0a259034a05539010ae35afaae59a72916b6a452c8e966dcc45ec",
+    "Cargo.lock": "ab8f74f9f587e6c56e40b9894e9f4d762c8b6a1c09fe5ec6f32e5d670112170e"
+  },
+  "refresh_command": "bash scripts/import_nuwax_workspace_snapshot.sh --source <path>",
+  "snapshot_script": "scripts/import_nuwax_workspace_snapshot.sh",
+  "manifest_files": [
+    "services/nuwax-workspace/IMPORT_MANIFEST.md",
+    "services/nuwax-workspace/IMPORT_MANIFEST.json",
+    "services/nuwax-workspace/IMPORT_MANIFEST.sha256"
+  ]
+}

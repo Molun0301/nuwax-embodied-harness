@@ -1,35 +1,68 @@
-# `nuwax_robot_bridge` 的 Python 运行时依赖
+# `nuwax_robot_bridge` 的 Python 运行时依赖（机器人无关基础层）
 #
 # 本文件只记录 Python 包层面的依赖。
-# 宿主机仍然需要自行准备 pip 无法提供的系统依赖，包括：
-# - 供 `cyclonedds` / `unitree_sdk2py` 使用的 CycloneDDS 原生动态库
-# - 供本地播放和音量回退链路使用的 ALSA / Pulse / PipeWire 命令
+# 宿主机仍然需要自行准备 pip 无法提供的系统依赖。
 #
 # 当前主线已回收到 Python 3.8.10 兼容。
 # Jetson + JetPack 场景建议优先使用系统自带的 Python 3.8.10，
 # 避免破坏 CUDA / TensorRT / NVIDIA 相关预编译环境。
 #
-# 如果通过 `GO2_SDK_PATH` 使用本地 Unitree SDK，请保持这些依赖已安装，
-# 并确保当前解释器可以直接导入 `unitree_sdk2py`。
+# 【机器人专属依赖】见 requirements-<robot>.txt，由 installer 按 robot profile 自动选装：
+#   - requirements-go2.txt   Go2 专属（unitree_sdk2py + cyclonedds）
+#   - requirements-g1.txt    G1 专属（aiortc + aiohttp）
+#   - requirements-raspi.txt raspi_lidar_robot 专属（pyserial）
+#
+# 跨机器人变更记录：cross-robot-generalization-foundations（G2）
 
 websockets==10.4
-unitree_sdk2py==1.0.1
-cyclonedds==0.10.2
 numpy==1.24.4
 opencv-python==4.10.0.84
-unitree_webrtc_connect_leshy==2.0.7
 pydantic==2.10.6
+typing_extensions==4.13.2
+# 智能体接口按真实能力结构校验输入，保持Python 3.8兼容。
+jsonschema==4.19.2
 fastapi==0.115.14
 uvicorn==0.30.6
+uvloop==0.21.0; sys_platform != "win32"
 httpx==0.27.2
 openai==1.60.2
+# Rust 桥（geometry 主链）gRPC 客户端依赖：
+# - services/geometry/remote_provider.py:12 顶层 `import grpc`（无守护）
+# - services/geometry/proto_gen/geometry_runtime_pb2.py 依赖 `google.protobuf`
+#
+# 【版本约束硬证据】geometry_runtime_pb2.py 头部声明 "Protobuf Python Version: 5.29.0"，
+# 且运行时执行 `_runtime_version.ValidateProtobufRuntimeVersion(PUBLIC, 5, 29, 0, ...)`，
+# 即要求安装的 protobuf 主版本==5 且 >=5.29.0，否则导入即抛 VersionError。
+# 对应 grpcio 需 1.68.x 一线（同期 protobuf 5.29 生态）。
+#
+# 【Py3.8 兼容性——实机实证已确认无冲突】
+# 锁定依据（2026-06-12 CX-08 实机复核）：实机 192.168.31.245(unitree@) 已恢复，SSH 实证：
+#   $ python3 --version            -> Python 3.8.10
+#   $ pip show grpcio protobuf     -> grpcio 1.70.0 / protobuf 5.29.6
+# 即实机 Py3.8.10 上 protobuf 5.29.6 + grpcio 1.70.0 正在正常运行（虽官方无 cp38 wheel，
+# 实机已成功安装，Jetson 侧由源码/第三方 wheel 满足），与 geometry_runtime_pb2.py:5/12
+# 运行时断言（protobuf 主版本==5 且 >=5.29.0）一致。此前"5.29 无 cp38 → 须降版重生成 pb2"
+# 的顾虑经实机实证证伪，无需改 pb2。按实机实装精确版本锁定：
+grpcio==1.70.0
+protobuf==5.29.6
 # `ultralytics` 会依赖 `polars>=0.20.0`。
 # Jetson + Python 3.8 场景建议固定到已验证的 wheel 版本，
 # 避免解析到源码包后触发上游 `puccinialin` 构建依赖问题。
 polars==1.8.2
 # YOLO-World 的 set_classes() 需要 ultralytics CLIP 模块。
-git+https://github.com/ultralytics/CLIP.git
+# 锁定依据（2026-06-12 CX-08 实机复核）：实机已装 ultralytics CLIP（clip==1.0，
+# /home/unitree/.local/lib/python3.8/site-packages/clip，pip 元数据无 direct_url.json，
+# 无法读出实装 git commit）。故仍以上游 git ls-remote HEAD 锁定，消除"跟随 default 分支漂移"：
+#   $ git ls-remote https://github.com/ultralytics/CLIP.git HEAD
+#   577b3cfa75f072c20a3f02b44ffde111d93eb3be
+# 注意：此为上游 HEAD，实机 pip 元数据未保留精确 commit，无法逐字节核对；功能版本一致（clip 1.0）。
+git+https://github.com/ultralytics/CLIP.git@577b3cfa75f072c20a3f02b44ffde111d93eb3be
 # TensorRT 导出会先经过 ONNX；Jetson aarch64 不安装 PyPI 上缺失的 onnxruntime-gpu。
 onnx==1.17.0
 onnxslim==0.1.93
 ultralytics==8.4.33
+# 性能监控（CPU/内存/进程）采集库，平台侧 services/telemetry 使用。
+# 选型依据：psutil 纯读 /proc、/sys、syscall，与 SoC/厂商无关，
+# 在 Jetson(L4T) / 树莓派 / 香橙派(Armbian) 的 aarch64 与 x86 上行为一致；
+# PyPI 提供 cp36-abi3 预编译 wheel，命中实机 Python 3.8.10，无需现场编译。
+psutil==7.2.2

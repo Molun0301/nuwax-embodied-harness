@@ -6,16 +6,14 @@ from drivers.common.data_plane import (
     DataPlaneStatusReporter,
     ExplorationDataPlane,
     LocalizationDataPlane,
-    ManagedRobotDataPlane,
     ManagedRobotDeviceDataPlane,
     MappingDataPlane,
     MotionCommandDataPlane,
     NavigationDataPlane,
     ObstacleAvoidanceControlDataPlane,
-    RobotDataPlane,
     RobotStateSensorDataPlane,
 )
-from drivers.common.manifest import ComponentBinding, RobotDefaults, RobotManifest
+from drivers.common.manifest import ComponentBinding, RobotDefaults, RobotManifest, RobotProfile
 
 __all__ = [
     "ComponentBinding",
@@ -23,16 +21,15 @@ __all__ = [
     "DataPlaneStatusReporter",
     "ExplorationDataPlane",
     "LocalizationDataPlane",
-    "ManagedRobotDataPlane",
     "ManagedRobotDeviceDataPlane",
     "MappingDataPlane",
     "MotionCommandDataPlane",
     "NavigationDataPlane",
     "ObstacleAvoidanceControlDataPlane",
-    "RobotDataPlane",
     "RobotAssemblyBase",
     "RobotAssemblyStatus",
     "RobotDefaults",
     "RobotManifest",
+    "RobotProfile",
     "RobotStateSensorDataPlane",
 ]

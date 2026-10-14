@@ -1,0 +1,26 @@
+[package]
+name = "nuwax-nav-types-messages"
+version = "0.1.0"
+description = "导航板块共享强类型消息与几何/网格/路径/视觉/diagnostics 类型"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+nuwax-codec = { path = "../nuwax-codec" }
+nuwax-types = { path = "../nuwax-types" }
+nuwax-protocol = { path = "../nuwax-protocol" }
+serde = { workspace = true }
+# 配置摘要跨独立进程使用；长小数须得到相同的二进制浮点值。
+serde_json = { workspace = true, features = ["float_roundtrip"] }
+thiserror = { workspace = true }
+indexmap = { workspace = true }
+uuid = { workspace = true }
+approx = { workspace = true }
+nalgebra = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+proptest = { workspace = true }
+approx = { workspace = true }

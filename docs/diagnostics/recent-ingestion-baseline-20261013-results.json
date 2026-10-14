@@ -1,0 +1,483 @@
+{
+  "kind": "baseline_only_no_production_change",
+  "date_utc": "2026-10-13",
+  "assignment_source": "79bb33f (parent-supplied; no independent Git read)",
+  "toolchain": "Rust 1.88.0, workspace release, locked/offline -j2",
+  "features": [
+    "mls",
+    "guard-runtime",
+    "surface-recovery-qualification"
+  ],
+  "warmups_per_cohort": 8,
+  "samples_per_cohort": 7,
+  "contracts": {
+    "passed": 3,
+    "failed": 0,
+    "ignored_diagnostic": 1
+  },
+  "diagnostic": {
+    "passed": 1,
+    "wall_seconds": 2.79
+  },
+  "scope": "Production RecentSourceState::consume through real NavScheduler ACK; SurfaceFollower, RecordingMotion, no active goal, no PlannerWorker, no LCM or physical plant",
+  "stage_scope": "Separate executions; nonoverlapping decode, XYZ materialization, finite scan, frame construction. Excludes old stage-map retirement and scheduler handoff; never subtract from full call to assign costs.",
+  "raw_logs": "Workspace recent-ingestion-audit-20261013; not a remote or durable evidence URL",
+  "results": [
+    {
+      "points": 1000,
+      "dispersed": false,
+      "retained_frame_target": 1,
+      "xyz_temporary_payload_bytes": 24000,
+      "full_consume": {
+        "median_us": 60.872,
+        "min_us": 57.637,
+        "max_us": 122.09499999999998,
+        "samples": 7
+      },
+      "separate_stages": {
+        "codec_decode": {
+          "median_us": 3.425,
+          "min_us": 1.362,
+          "max_us": 3.545,
+          "samples": 7
+        },
+        "xyz_materialize": {
+          "median_us": 8.002,
+          "min_us": 7.9719999999999995,
+          "max_us": 8.073,
+          "samples": 7
+        },
+        "finite_scan": {
+          "median_us": 1.392,
+          "min_us": 1.383,
+          "max_us": 1.4929999999999999,
+          "samples": 7
+        },
+        "recent_frame_build": {
+          "median_us": 46.830999999999996,
+          "min_us": 45.759,
+          "max_us": 76.52600000000001,
+          "samples": 7
+        }
+      }
+    },
+    {
+      "points": 1000,
+      "dispersed": false,
+      "retained_frame_target": 8,
+      "xyz_temporary_payload_bytes": 24000,
+      "full_consume": {
+        "median_us": 60.832,
+        "min_us": 57.317,
+        "max_us": 68.303,
+        "samples": 7
+      },
+      "separate_stages": {
+        "codec_decode": {
+          "median_us": 2.785,
+          "min_us": 1.342,
+          "max_us": 3.465,
+          "samples": 7
+        },
+        "xyz_materialize": {
+          "median_us": 8.002,
+          "min_us": 7.9719999999999995,
+          "max_us": 14.841999999999999,
+          "samples": 7
+        },
+        "finite_scan": {
+          "median_us": 1.392,
+          "min_us": 1.3820000000000001,
+          "max_us": 1.452,
+          "samples": 7
+        },
+        "recent_frame_build": {
+          "median_us": 46.480000000000004,
+          "min_us": 44.376999999999995,
+          "max_us": 80.50099999999999,
+          "samples": 7
+        }
+      }
+    },
+    {
+      "points": 1000,
+      "dispersed": true,
+      "retained_frame_target": 1,
+      "xyz_temporary_payload_bytes": 24000,
+      "full_consume": {
+        "median_us": 164.959,
+        "min_us": 150.207,
+        "max_us": 244.89,
+        "samples": 7
+      },
+      "separate_stages": {
+        "codec_decode": {
+          "median_us": 13.621,
+          "min_us": 1.4529999999999998,
+          "max_us": 13.911,
+          "samples": 7
+        },
+        "xyz_materialize": {
+          "median_us": 8.152,
+          "min_us": 8.132,
+          "max_us": 8.333,
+          "samples": 7
+        },
+        "finite_scan": {
+          "median_us": 1.392,
+          "min_us": 1.3820000000000001,
+          "max_us": 1.403,
+          "samples": 7
+        },
+        "recent_frame_build": {
+          "median_us": 127.212,
+          "min_us": 122.455,
+          "max_us": 285.521,
+          "samples": 7
+        }
+      }
+    },
+    {
+      "points": 1000,
+      "dispersed": true,
+      "retained_frame_target": 8,
+      "xyz_temporary_payload_bytes": 24000,
+      "full_consume": {
+        "median_us": 171.359,
+        "min_us": 160.072,
+        "max_us": 264.59,
+        "samples": 7
+      },
+      "separate_stages": {
+        "codec_decode": {
+          "median_us": 12.748999999999999,
+          "min_us": 1.5319999999999998,
+          "max_us": 35.994,
+          "samples": 7
+        },
+        "xyz_materialize": {
+          "median_us": 8.232,
+          "min_us": 8.042,
+          "max_us": 56.466,
+          "samples": 7
+        },
+        "finite_scan": {
+          "median_us": 1.422,
+          "min_us": 1.3820000000000001,
+          "max_us": 50.547000000000004,
+          "samples": 7
+        },
+        "recent_frame_build": {
+          "median_us": 123.38599999999998,
+          "min_us": 118.90899999999999,
+          "max_us": 132.18,
+          "samples": 7
+        }
+      }
+    },
+    {
+      "points": 10000,
+      "dispersed": false,
+      "retained_frame_target": 1,
+      "xyz_temporary_payload_bytes": 240000,
+      "full_consume": {
+        "median_us": 542.179,
+        "min_us": 497.63100000000003,
+        "max_us": 611.804,
+        "samples": 7
+      },
+      "separate_stages": {
+        "codec_decode": {
+          "median_us": 11.366999999999999,
+          "min_us": 10.436,
+          "max_us": 12.719,
+          "samples": 7
+        },
+        "xyz_materialize": {
+          "median_us": 91.668,
+          "min_us": 79.13,
+          "max_us": 267.479,
+          "samples": 7
+        },
+        "finite_scan": {
+          "median_us": 13.6,
+          "min_us": 13.59,
+          "max_us": 14.602,
+          "samples": 7
+        },
+        "recent_frame_build": {
+          "median_us": 413.675,
+          "min_us": 392.733,
+          "max_us": 580.496,
+          "samples": 7
+        }
+      }
+    },
+    {
+      "points": 10000,
+      "dispersed": false,
+      "retained_frame_target": 8,
+      "xyz_temporary_payload_bytes": 240000,
+      "full_consume": {
+        "median_us": 539.294,
+        "min_us": 508.21700000000004,
+        "max_us": 559.094,
+        "samples": 7
+      },
+      "separate_stages": {
+        "codec_decode": {
+          "median_us": 11.137,
+          "min_us": 10.536,
+          "max_us": 11.507,
+          "samples": 7
+        },
+        "xyz_materialize": {
+          "median_us": 84.798,
+          "min_us": 79.801,
+          "max_us": 109.62599999999999,
+          "samples": 7
+        },
+        "finite_scan": {
+          "median_us": 13.651,
+          "min_us": 13.591000000000001,
+          "max_us": 14.201,
+          "samples": 7
+        },
+        "recent_frame_build": {
+          "median_us": 408.737,
+          "min_us": 402.88800000000003,
+          "max_us": 514.156,
+          "samples": 7
+        }
+      }
+    },
+    {
+      "points": 10000,
+      "dispersed": true,
+      "retained_frame_target": 1,
+      "xyz_temporary_payload_bytes": 240000,
+      "full_consume": {
+        "median_us": 1957.354,
+        "min_us": 1879.4969999999998,
+        "max_us": 2229.366,
+        "samples": 7
+      },
+      "separate_stages": {
+        "codec_decode": {
+          "median_us": 12.758999999999999,
+          "min_us": 10.975999999999999,
+          "max_us": 68.343,
+          "samples": 7
+        },
+        "xyz_materialize": {
+          "median_us": 79.22,
+          "min_us": 78.979,
+          "max_us": 82.605,
+          "samples": 7
+        },
+        "finite_scan": {
+          "median_us": 13.631,
+          "min_us": 13.591000000000001,
+          "max_us": 13.821,
+          "samples": 7
+        },
+        "recent_frame_build": {
+          "median_us": 1514.196,
+          "min_us": 1452.0620000000001,
+          "max_us": 1671.133,
+          "samples": 7
+        }
+      }
+    },
+    {
+      "points": 10000,
+      "dispersed": true,
+      "retained_frame_target": 8,
+      "xyz_temporary_payload_bytes": 240000,
+      "full_consume": {
+        "median_us": 2230.577,
+        "min_us": 2169.945,
+        "max_us": 2756.912,
+        "samples": 7
+      },
+      "separate_stages": {
+        "codec_decode": {
+          "median_us": 12.879,
+          "min_us": 10.937000000000001,
+          "max_us": 15.193,
+          "samples": 7
+        },
+        "xyz_materialize": {
+          "median_us": 78.939,
+          "min_us": 78.51899999999999,
+          "max_us": 94.79299999999999,
+          "samples": 7
+        },
+        "finite_scan": {
+          "median_us": 13.601,
+          "min_us": 13.591000000000001,
+          "max_us": 13.711,
+          "samples": 7
+        },
+        "recent_frame_build": {
+          "median_us": 1445.6619999999998,
+          "min_us": 1423.599,
+          "max_us": 1587.176,
+          "samples": 7
+        }
+      }
+    },
+    {
+      "points": 100000,
+      "dispersed": false,
+      "retained_frame_target": 1,
+      "xyz_temporary_payload_bytes": 2400000,
+      "full_consume": {
+        "median_us": 5571.590999999999,
+        "min_us": 5350.006,
+        "max_us": 6949.211,
+        "samples": 7
+      },
+      "separate_stages": {
+        "codec_decode": {
+          "median_us": 125.93,
+          "min_us": 117.187,
+          "max_us": 166.93200000000002,
+          "samples": 7
+        },
+        "xyz_materialize": {
+          "median_us": 820.318,
+          "min_us": 803.1419999999999,
+          "max_us": 895.8320000000001,
+          "samples": 7
+        },
+        "finite_scan": {
+          "median_us": 143.326,
+          "min_us": 137.187,
+          "max_us": 145.269,
+          "samples": 7
+        },
+        "recent_frame_build": {
+          "median_us": 4503.959,
+          "min_us": 4337.018,
+          "max_us": 4947.559,
+          "samples": 7
+        }
+      }
+    },
+    {
+      "points": 100000,
+      "dispersed": false,
+      "retained_frame_target": 8,
+      "xyz_temporary_payload_bytes": 2400000,
+      "full_consume": {
+        "median_us": 6000.939,
+        "min_us": 5610.8099999999995,
+        "max_us": 6988.49,
+        "samples": 7
+      },
+      "separate_stages": {
+        "codec_decode": {
+          "median_us": 136.61700000000002,
+          "min_us": 126.52099999999999,
+          "max_us": 165.47,
+          "samples": 7
+        },
+        "xyz_materialize": {
+          "median_us": 845.506,
+          "min_us": 827.3589999999999,
+          "max_us": 1015.2920000000001,
+          "samples": 7
+        },
+        "finite_scan": {
+          "median_us": 143.347,
+          "min_us": 139.901,
+          "max_us": 197.858,
+          "samples": 7
+        },
+        "recent_frame_build": {
+          "median_us": 4757.011,
+          "min_us": 4505.031,
+          "max_us": 5481.114,
+          "samples": 7
+        }
+      }
+    },
+    {
+      "points": 100000,
+      "dispersed": true,
+      "retained_frame_target": 1,
+      "xyz_temporary_payload_bytes": 2400000,
+      "full_consume": {
+        "median_us": 35058.696,
+        "min_us": 32588.827,
+        "max_us": 36785.031,
+        "samples": 7
+      },
+      "separate_stages": {
+        "codec_decode": {
+          "median_us": 174.022,
+          "min_us": 125.089,
+          "max_us": 243.338,
+          "samples": 7
+        },
+        "xyz_materialize": {
+          "median_us": 829.592,
+          "min_us": 810.533,
+          "max_us": 875.232,
+          "samples": 7
+        },
+        "finite_scan": {
+          "median_us": 147.843,
+          "min_us": 140.522,
+          "max_us": 191.22799999999998,
+          "samples": 7
+        },
+        "recent_frame_build": {
+          "median_us": 20565.536,
+          "min_us": 19773.13,
+          "max_us": 23890.306,
+          "samples": 7
+        }
+      }
+    },
+    {
+      "points": 100000,
+      "dispersed": true,
+      "retained_frame_target": 8,
+      "xyz_temporary_payload_bytes": 2400000,
+      "full_consume": {
+        "median_us": 35867.276,
+        "min_us": 32857.743,
+        "max_us": 48587.479,
+        "samples": 7
+      },
+      "separate_stages": {
+        "codec_decode": {
+          "median_us": 181.844,
+          "min_us": 128.684,
+          "max_us": 214.914,
+          "samples": 7
+        },
+        "xyz_materialize": {
+          "median_us": 841.47,
+          "min_us": 792.135,
+          "max_us": 1426.303,
+          "samples": 7
+        },
+        "finite_scan": {
+          "median_us": 155.35399999999998,
+          "min_us": 138.73,
+          "max_us": 219.351,
+          "samples": 7
+        },
+        "recent_frame_build": {
+          "median_us": 20662.263,
+          "min_us": 19856.316,
+          "max_us": 21174.446,
+          "samples": 7
+        }
+      }
+    }
+  ]
+}

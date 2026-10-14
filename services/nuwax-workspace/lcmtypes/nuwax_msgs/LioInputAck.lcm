@@ -1,0 +1,12 @@
+package nuwax_msgs;
+
+// 私有原生代际内，一次完整扫描的处理回执；初始化尚无位姿时也须确认。
+struct LioInputAck {
+    const int32_t VERSION = 1;
+    int32_t schema_version;
+    int32_t sequence;
+    int64_t scan_begin_timestamp_ns;
+    int64_t scan_end_timestamp_ns;
+    int8_t success;
+    string message;
+}

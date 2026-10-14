@@ -1,0 +1,11 @@
+package nuwax_msgs;
+
+struct Frontier {
+    int64_t id;
+    double cx;
+    double cy;
+    double radius;
+    double score;
+    int32_t cell_count;
+    string note;
+}

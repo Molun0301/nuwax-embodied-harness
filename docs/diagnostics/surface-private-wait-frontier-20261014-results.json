@@ -1,0 +1,1421 @@
+{
+  "samples": [
+    {
+      "blind": false,
+      "evaluated_cells": 400,
+      "mode": 0,
+      "outcome": "Ok(Pending)",
+      "sample": 0,
+      "us": 485.373,
+      "width": 20,
+      "pair": 0,
+      "arm": "baseline"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 400,
+      "mode": 0,
+      "outcome": "Ok(Pending)",
+      "sample": 1,
+      "us": 474.235,
+      "width": 20,
+      "pair": 0,
+      "arm": "baseline"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 6400,
+      "mode": 0,
+      "outcome": "Ok(Pending)",
+      "sample": 0,
+      "us": 12066.725,
+      "width": 80,
+      "pair": 0,
+      "arm": "baseline"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 6400,
+      "mode": 0,
+      "outcome": "Ok(Pending)",
+      "sample": 1,
+      "us": 12263.932999999999,
+      "width": 80,
+      "pair": 0,
+      "arm": "baseline"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 25600,
+      "mode": 0,
+      "outcome": "Ok(Pending)",
+      "sample": 0,
+      "us": 101307.867,
+      "width": 160,
+      "pair": 0,
+      "arm": "baseline"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 25600,
+      "mode": 0,
+      "outcome": "Ok(Pending)",
+      "sample": 1,
+      "us": 102687.40699999999,
+      "width": 160,
+      "pair": 0,
+      "arm": "baseline"
+    },
+    {
+      "blind": true,
+      "evaluated_cells": 385,
+      "mode": 0,
+      "outcome": "Ok(Pending)",
+      "sample": 0,
+      "us": 2929.717,
+      "width": 20,
+      "pair": 0,
+      "arm": "baseline"
+    },
+    {
+      "blind": true,
+      "evaluated_cells": 385,
+      "mode": 0,
+      "outcome": "Ok(Pending)",
+      "sample": 1,
+      "us": 2787.9379999999996,
+      "width": 20,
+      "pair": 0,
+      "arm": "baseline"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 6400,
+      "mode": 1,
+      "outcome": "Ok(Goal(FrontierGoal { id: \"surface-surface-0000000077359400-2\", pose: PoseStamped { frame_id: Map, stamp: Timestamp { nanos: 2000000000, clock: Unix }, pose: Pose3 { position: Point3 { x: 7.450000286102295, y: 0.550000011920929, z: 0.4000000014901161 }, orientation: Quaternion { w: 0.9202179540323133, x: 0.0, y: -0.0, z: -0.39140633244313155 } } }, score: 0.002522068, information_gain: Some(0.020000001), distance_cost: Some(6.93), frontier_area_m2: Some(0.020000001), producer: \"nuwax-exploration/surface\", stamp: Timestamp { nanos: 2000000000, clock: Unix }, metadata: {\"admissible_candidate_count\": \"4\", \"available_regions\": \"4\", \"evaluated_candidate_count\": \"4\", \"geometric_candidate_count\": \"1460\", \"goal_orientation_required\": \"false\", \"region_wait_rounds\": \"0\", \"route_cost_m\": \"28.030000226498256\", \"route_regions\": \"4\", \"selection_method\": \"regional_route\"} }))",
+      "sample": 0,
+      "us": 22936.695,
+      "width": 80,
+      "pair": 0,
+      "arm": "baseline"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 6400,
+      "mode": 1,
+      "outcome": "Ok(Goal(FrontierGoal { id: \"surface-surface-0000000077359400-2\", pose: PoseStamped { frame_id: Map, stamp: Timestamp { nanos: 2000000000, clock: Unix }, pose: Pose3 { position: Point3 { x: 7.450000286102295, y: 0.550000011920929, z: 0.4000000014901161 }, orientation: Quaternion { w: 0.9202179540323133, x: 0.0, y: -0.0, z: -0.39140633244313155 } } }, score: 0.002522068, information_gain: Some(0.020000001), distance_cost: Some(6.93), frontier_area_m2: Some(0.020000001), producer: \"nuwax-exploration/surface\", stamp: Timestamp { nanos: 2000000000, clock: Unix }, metadata: {\"admissible_candidate_count\": \"4\", \"available_regions\": \"4\", \"evaluated_candidate_count\": \"4\", \"geometric_candidate_count\": \"1460\", \"goal_orientation_required\": \"false\", \"region_wait_rounds\": \"0\", \"route_cost_m\": \"28.030000226498256\", \"route_regions\": \"4\", \"selection_method\": \"regional_route\"} }))",
+      "sample": 1,
+      "us": 16140.265000000001,
+      "width": 80,
+      "pair": 0,
+      "arm": "baseline"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 400,
+      "mode": 2,
+      "outcome": "Ok(Goal(FrontierGoal { id: \"surface-surface-0000000077359400-2\", pose: PoseStamped { frame_id: Map, stamp: Timestamp { nanos: 2000000000, clock: Unix }, pose: Pose3 { position: Point3 { x: 1.4500000476837158, y: 1.4500000476837158, z: 0.4000000014901161 }, orientation: Quaternion { w: 0.9162537817532964, x: 0.0, y: -0.0, z: 0.4005983118072051 } } }, score: 0.010928962, information_gain: Some(0.020000001), distance_cost: Some(0.8299999), frontier_area_m2: Some(0.020000001), producer: \"nuwax-exploration/surface\", stamp: Timestamp { nanos: 2000000000, clock: Unix }, metadata: {\"admissible_candidate_count\": \"1\", \"evaluated_candidate_count\": \"1\", \"geometric_candidate_count\": \"260\", \"goal_orientation_required\": \"false\", \"selection_method\": \"navigation_retry\"} }))",
+      "sample": 0,
+      "us": 666.316,
+      "width": 20,
+      "pair": 0,
+      "arm": "baseline"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 400,
+      "mode": 2,
+      "outcome": "Ok(Goal(FrontierGoal { id: \"surface-surface-0000000077359400-2\", pose: PoseStamped { frame_id: Map, stamp: Timestamp { nanos: 2000000000, clock: Unix }, pose: Pose3 { position: Point3 { x: 1.4500000476837158, y: 1.4500000476837158, z: 0.4000000014901161 }, orientation: Quaternion { w: 0.9162537817532964, x: 0.0, y: -0.0, z: 0.4005983118072051 } } }, score: 0.010928962, information_gain: Some(0.020000001), distance_cost: Some(0.8299999), frontier_area_m2: Some(0.020000001), producer: \"nuwax-exploration/surface\", stamp: Timestamp { nanos: 2000000000, clock: Unix }, metadata: {\"admissible_candidate_count\": \"1\", \"evaluated_candidate_count\": \"1\", \"geometric_candidate_count\": \"260\", \"goal_orientation_required\": \"false\", \"selection_method\": \"navigation_retry\"} }))",
+      "sample": 1,
+      "us": 671.284,
+      "width": 20,
+      "pair": 0,
+      "arm": "baseline"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 0,
+      "mode": 3,
+      "outcome": "Ok(Pending)",
+      "sample": 0,
+      "us": 1.081,
+      "width": 20,
+      "pair": 0,
+      "arm": "baseline"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 0,
+      "mode": 3,
+      "outcome": "Ok(Pending)",
+      "sample": 1,
+      "us": 0.301,
+      "width": 20,
+      "pair": 0,
+      "arm": "baseline"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 0,
+      "mode": 0,
+      "outcome": "Ok(Pending)",
+      "sample": 0,
+      "us": 44.888,
+      "width": 20,
+      "pair": 0,
+      "arm": "candidate"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 0,
+      "mode": 0,
+      "outcome": "Ok(Pending)",
+      "sample": 1,
+      "us": 39.028,
+      "width": 20,
+      "pair": 0,
+      "arm": "candidate"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 0,
+      "mode": 0,
+      "outcome": "Ok(Pending)",
+      "sample": 0,
+      "us": 73.35,
+      "width": 80,
+      "pair": 0,
+      "arm": "candidate"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 0,
+      "mode": 0,
+      "outcome": "Ok(Pending)",
+      "sample": 1,
+      "us": 45.579,
+      "width": 80,
+      "pair": 0,
+      "arm": "candidate"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 0,
+      "mode": 0,
+      "outcome": "Ok(Pending)",
+      "sample": 0,
+      "us": 214.203,
+      "width": 160,
+      "pair": 0,
+      "arm": "candidate"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 0,
+      "mode": 0,
+      "outcome": "Ok(Pending)",
+      "sample": 1,
+      "us": 52.209,
+      "width": 160,
+      "pair": 0,
+      "arm": "candidate"
+    },
+    {
+      "blind": true,
+      "evaluated_cells": 0,
+      "mode": 0,
+      "outcome": "Ok(Pending)",
+      "sample": 0,
+      "us": 2691.6240000000003,
+      "width": 20,
+      "pair": 0,
+      "arm": "candidate"
+    },
+    {
+      "blind": true,
+      "evaluated_cells": 0,
+      "mode": 0,
+      "outcome": "Ok(Pending)",
+      "sample": 1,
+      "us": 2552.2819999999997,
+      "width": 20,
+      "pair": 0,
+      "arm": "candidate"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 6400,
+      "mode": 1,
+      "outcome": "Ok(Goal(FrontierGoal { id: \"surface-surface-0000000077359400-2\", pose: PoseStamped { frame_id: Map, stamp: Timestamp { nanos: 2000000000, clock: Unix }, pose: Pose3 { position: Point3 { x: 7.450000286102295, y: 0.550000011920929, z: 0.4000000014901161 }, orientation: Quaternion { w: 0.9202179540323133, x: 0.0, y: -0.0, z: -0.39140633244313155 } } }, score: 0.002522068, information_gain: Some(0.020000001), distance_cost: Some(6.93), frontier_area_m2: Some(0.020000001), producer: \"nuwax-exploration/surface\", stamp: Timestamp { nanos: 2000000000, clock: Unix }, metadata: {\"admissible_candidate_count\": \"4\", \"available_regions\": \"4\", \"evaluated_candidate_count\": \"4\", \"geometric_candidate_count\": \"1460\", \"goal_orientation_required\": \"false\", \"region_wait_rounds\": \"0\", \"route_cost_m\": \"28.030000226498256\", \"route_regions\": \"4\", \"selection_method\": \"regional_route\"} }))",
+      "sample": 0,
+      "us": 14184.042,
+      "width": 80,
+      "pair": 0,
+      "arm": "candidate"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 6400,
+      "mode": 1,
+      "outcome": "Ok(Goal(FrontierGoal { id: \"surface-surface-0000000077359400-2\", pose: PoseStamped { frame_id: Map, stamp: Timestamp { nanos: 2000000000, clock: Unix }, pose: Pose3 { position: Point3 { x: 7.450000286102295, y: 0.550000011920929, z: 0.4000000014901161 }, orientation: Quaternion { w: 0.9202179540323133, x: 0.0, y: -0.0, z: -0.39140633244313155 } } }, score: 0.002522068, information_gain: Some(0.020000001), distance_cost: Some(6.93), frontier_area_m2: Some(0.020000001), producer: \"nuwax-exploration/surface\", stamp: Timestamp { nanos: 2000000000, clock: Unix }, metadata: {\"admissible_candidate_count\": \"4\", \"available_regions\": \"4\", \"evaluated_candidate_count\": \"4\", \"geometric_candidate_count\": \"1460\", \"goal_orientation_required\": \"false\", \"region_wait_rounds\": \"0\", \"route_cost_m\": \"28.030000226498256\", \"route_regions\": \"4\", \"selection_method\": \"regional_route\"} }))",
+      "sample": 1,
+      "us": 15358.044,
+      "width": 80,
+      "pair": 0,
+      "arm": "candidate"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 400,
+      "mode": 2,
+      "outcome": "Ok(Goal(FrontierGoal { id: \"surface-surface-0000000077359400-2\", pose: PoseStamped { frame_id: Map, stamp: Timestamp { nanos: 2000000000, clock: Unix }, pose: Pose3 { position: Point3 { x: 1.4500000476837158, y: 1.4500000476837158, z: 0.4000000014901161 }, orientation: Quaternion { w: 0.9162537817532964, x: 0.0, y: -0.0, z: 0.4005983118072051 } } }, score: 0.010928962, information_gain: Some(0.020000001), distance_cost: Some(0.8299999), frontier_area_m2: Some(0.020000001), producer: \"nuwax-exploration/surface\", stamp: Timestamp { nanos: 2000000000, clock: Unix }, metadata: {\"admissible_candidate_count\": \"1\", \"evaluated_candidate_count\": \"1\", \"geometric_candidate_count\": \"260\", \"goal_orientation_required\": \"false\", \"selection_method\": \"navigation_retry\"} }))",
+      "sample": 0,
+      "us": 726.6370000000001,
+      "width": 20,
+      "pair": 0,
+      "arm": "candidate"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 400,
+      "mode": 2,
+      "outcome": "Ok(Goal(FrontierGoal { id: \"surface-surface-0000000077359400-2\", pose: PoseStamped { frame_id: Map, stamp: Timestamp { nanos: 2000000000, clock: Unix }, pose: Pose3 { position: Point3 { x: 1.4500000476837158, y: 1.4500000476837158, z: 0.4000000014901161 }, orientation: Quaternion { w: 0.9162537817532964, x: 0.0, y: -0.0, z: 0.4005983118072051 } } }, score: 0.010928962, information_gain: Some(0.020000001), distance_cost: Some(0.8299999), frontier_area_m2: Some(0.020000001), producer: \"nuwax-exploration/surface\", stamp: Timestamp { nanos: 2000000000, clock: Unix }, metadata: {\"admissible_candidate_count\": \"1\", \"evaluated_candidate_count\": \"1\", \"geometric_candidate_count\": \"260\", \"goal_orientation_required\": \"false\", \"selection_method\": \"navigation_retry\"} }))",
+      "sample": 1,
+      "us": 563.01,
+      "width": 20,
+      "pair": 0,
+      "arm": "candidate"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 0,
+      "mode": 3,
+      "outcome": "Ok(Pending)",
+      "sample": 0,
+      "us": 1.071,
+      "width": 20,
+      "pair": 0,
+      "arm": "candidate"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 0,
+      "mode": 3,
+      "outcome": "Ok(Pending)",
+      "sample": 1,
+      "us": 0.501,
+      "width": 20,
+      "pair": 0,
+      "arm": "candidate"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 0,
+      "mode": 0,
+      "outcome": "Ok(Pending)",
+      "sample": 0,
+      "us": 45.398999999999994,
+      "width": 20,
+      "pair": 1,
+      "arm": "candidate"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 0,
+      "mode": 0,
+      "outcome": "Ok(Pending)",
+      "sample": 1,
+      "us": 38.346999999999994,
+      "width": 20,
+      "pair": 1,
+      "arm": "candidate"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 0,
+      "mode": 0,
+      "outcome": "Ok(Pending)",
+      "sample": 0,
+      "us": 83.015,
+      "width": 80,
+      "pair": 1,
+      "arm": "candidate"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 0,
+      "mode": 0,
+      "outcome": "Ok(Pending)",
+      "sample": 1,
+      "us": 73.361,
+      "width": 80,
+      "pair": 1,
+      "arm": "candidate"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 0,
+      "mode": 0,
+      "outcome": "Ok(Pending)",
+      "sample": 0,
+      "us": 212.711,
+      "width": 160,
+      "pair": 1,
+      "arm": "candidate"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 0,
+      "mode": 0,
+      "outcome": "Ok(Pending)",
+      "sample": 1,
+      "us": 54.993,
+      "width": 160,
+      "pair": 1,
+      "arm": "candidate"
+    },
+    {
+      "blind": true,
+      "evaluated_cells": 0,
+      "mode": 0,
+      "outcome": "Ok(Pending)",
+      "sample": 0,
+      "us": 2456.6879999999996,
+      "width": 20,
+      "pair": 1,
+      "arm": "candidate"
+    },
+    {
+      "blind": true,
+      "evaluated_cells": 0,
+      "mode": 0,
+      "outcome": "Ok(Pending)",
+      "sample": 1,
+      "us": 2986.9390000000003,
+      "width": 20,
+      "pair": 1,
+      "arm": "candidate"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 6400,
+      "mode": 1,
+      "outcome": "Ok(Goal(FrontierGoal { id: \"surface-surface-0000000077359400-2\", pose: PoseStamped { frame_id: Map, stamp: Timestamp { nanos: 2000000000, clock: Unix }, pose: Pose3 { position: Point3 { x: 7.450000286102295, y: 0.550000011920929, z: 0.4000000014901161 }, orientation: Quaternion { w: 0.9202179540323133, x: 0.0, y: -0.0, z: -0.39140633244313155 } } }, score: 0.002522068, information_gain: Some(0.020000001), distance_cost: Some(6.93), frontier_area_m2: Some(0.020000001), producer: \"nuwax-exploration/surface\", stamp: Timestamp { nanos: 2000000000, clock: Unix }, metadata: {\"admissible_candidate_count\": \"4\", \"available_regions\": \"4\", \"evaluated_candidate_count\": \"4\", \"geometric_candidate_count\": \"1460\", \"goal_orientation_required\": \"false\", \"region_wait_rounds\": \"0\", \"route_cost_m\": \"28.030000226498256\", \"route_regions\": \"4\", \"selection_method\": \"regional_route\"} }))",
+      "sample": 0,
+      "us": 17326.476,
+      "width": 80,
+      "pair": 1,
+      "arm": "candidate"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 6400,
+      "mode": 1,
+      "outcome": "Ok(Goal(FrontierGoal { id: \"surface-surface-0000000077359400-2\", pose: PoseStamped { frame_id: Map, stamp: Timestamp { nanos: 2000000000, clock: Unix }, pose: Pose3 { position: Point3 { x: 7.450000286102295, y: 0.550000011920929, z: 0.4000000014901161 }, orientation: Quaternion { w: 0.9202179540323133, x: 0.0, y: -0.0, z: -0.39140633244313155 } } }, score: 0.002522068, information_gain: Some(0.020000001), distance_cost: Some(6.93), frontier_area_m2: Some(0.020000001), producer: \"nuwax-exploration/surface\", stamp: Timestamp { nanos: 2000000000, clock: Unix }, metadata: {\"admissible_candidate_count\": \"4\", \"available_regions\": \"4\", \"evaluated_candidate_count\": \"4\", \"geometric_candidate_count\": \"1460\", \"goal_orientation_required\": \"false\", \"region_wait_rounds\": \"0\", \"route_cost_m\": \"28.030000226498256\", \"route_regions\": \"4\", \"selection_method\": \"regional_route\"} }))",
+      "sample": 1,
+      "us": 17354.928,
+      "width": 80,
+      "pair": 1,
+      "arm": "candidate"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 400,
+      "mode": 2,
+      "outcome": "Ok(Goal(FrontierGoal { id: \"surface-surface-0000000077359400-2\", pose: PoseStamped { frame_id: Map, stamp: Timestamp { nanos: 2000000000, clock: Unix }, pose: Pose3 { position: Point3 { x: 1.4500000476837158, y: 1.4500000476837158, z: 0.4000000014901161 }, orientation: Quaternion { w: 0.9162537817532964, x: 0.0, y: -0.0, z: 0.4005983118072051 } } }, score: 0.010928962, information_gain: Some(0.020000001), distance_cost: Some(0.8299999), frontier_area_m2: Some(0.020000001), producer: \"nuwax-exploration/surface\", stamp: Timestamp { nanos: 2000000000, clock: Unix }, metadata: {\"admissible_candidate_count\": \"1\", \"evaluated_candidate_count\": \"1\", \"geometric_candidate_count\": \"260\", \"goal_orientation_required\": \"false\", \"selection_method\": \"navigation_retry\"} }))",
+      "sample": 0,
+      "us": 809.772,
+      "width": 20,
+      "pair": 1,
+      "arm": "candidate"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 400,
+      "mode": 2,
+      "outcome": "Ok(Goal(FrontierGoal { id: \"surface-surface-0000000077359400-2\", pose: PoseStamped { frame_id: Map, stamp: Timestamp { nanos: 2000000000, clock: Unix }, pose: Pose3 { position: Point3 { x: 1.4500000476837158, y: 1.4500000476837158, z: 0.4000000014901161 }, orientation: Quaternion { w: 0.9162537817532964, x: 0.0, y: -0.0, z: 0.4005983118072051 } } }, score: 0.010928962, information_gain: Some(0.020000001), distance_cost: Some(0.8299999), frontier_area_m2: Some(0.020000001), producer: \"nuwax-exploration/surface\", stamp: Timestamp { nanos: 2000000000, clock: Unix }, metadata: {\"admissible_candidate_count\": \"1\", \"evaluated_candidate_count\": \"1\", \"geometric_candidate_count\": \"260\", \"goal_orientation_required\": \"false\", \"selection_method\": \"navigation_retry\"} }))",
+      "sample": 1,
+      "us": 677.7429999999999,
+      "width": 20,
+      "pair": 1,
+      "arm": "candidate"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 0,
+      "mode": 3,
+      "outcome": "Ok(Pending)",
+      "sample": 0,
+      "us": 0.801,
+      "width": 20,
+      "pair": 1,
+      "arm": "candidate"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 0,
+      "mode": 3,
+      "outcome": "Ok(Pending)",
+      "sample": 1,
+      "us": 0.31,
+      "width": 20,
+      "pair": 1,
+      "arm": "candidate"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 400,
+      "mode": 0,
+      "outcome": "Ok(Pending)",
+      "sample": 0,
+      "us": 936.033,
+      "width": 20,
+      "pair": 1,
+      "arm": "baseline"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 400,
+      "mode": 0,
+      "outcome": "Ok(Pending)",
+      "sample": 1,
+      "us": 433.354,
+      "width": 20,
+      "pair": 1,
+      "arm": "baseline"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 6400,
+      "mode": 0,
+      "outcome": "Ok(Pending)",
+      "sample": 0,
+      "us": 13031.021,
+      "width": 80,
+      "pair": 1,
+      "arm": "baseline"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 6400,
+      "mode": 0,
+      "outcome": "Ok(Pending)",
+      "sample": 1,
+      "us": 11735.686,
+      "width": 80,
+      "pair": 1,
+      "arm": "baseline"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 25600,
+      "mode": 0,
+      "outcome": "Ok(Pending)",
+      "sample": 0,
+      "us": 79737.638,
+      "width": 160,
+      "pair": 1,
+      "arm": "baseline"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 25600,
+      "mode": 0,
+      "outcome": "Ok(Pending)",
+      "sample": 1,
+      "us": 79362.922,
+      "width": 160,
+      "pair": 1,
+      "arm": "baseline"
+    },
+    {
+      "blind": true,
+      "evaluated_cells": 385,
+      "mode": 0,
+      "outcome": "Ok(Pending)",
+      "sample": 0,
+      "us": 2963.513,
+      "width": 20,
+      "pair": 1,
+      "arm": "baseline"
+    },
+    {
+      "blind": true,
+      "evaluated_cells": 385,
+      "mode": 0,
+      "outcome": "Ok(Pending)",
+      "sample": 1,
+      "us": 3523.889,
+      "width": 20,
+      "pair": 1,
+      "arm": "baseline"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 6400,
+      "mode": 1,
+      "outcome": "Ok(Goal(FrontierGoal { id: \"surface-surface-0000000077359400-2\", pose: PoseStamped { frame_id: Map, stamp: Timestamp { nanos: 2000000000, clock: Unix }, pose: Pose3 { position: Point3 { x: 7.450000286102295, y: 0.550000011920929, z: 0.4000000014901161 }, orientation: Quaternion { w: 0.9202179540323133, x: 0.0, y: -0.0, z: -0.39140633244313155 } } }, score: 0.002522068, information_gain: Some(0.020000001), distance_cost: Some(6.93), frontier_area_m2: Some(0.020000001), producer: \"nuwax-exploration/surface\", stamp: Timestamp { nanos: 2000000000, clock: Unix }, metadata: {\"admissible_candidate_count\": \"4\", \"available_regions\": \"4\", \"evaluated_candidate_count\": \"4\", \"geometric_candidate_count\": \"1460\", \"goal_orientation_required\": \"false\", \"region_wait_rounds\": \"0\", \"route_cost_m\": \"28.030000226498256\", \"route_regions\": \"4\", \"selection_method\": \"regional_route\"} }))",
+      "sample": 0,
+      "us": 13978.491,
+      "width": 80,
+      "pair": 1,
+      "arm": "baseline"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 6400,
+      "mode": 1,
+      "outcome": "Ok(Goal(FrontierGoal { id: \"surface-surface-0000000077359400-2\", pose: PoseStamped { frame_id: Map, stamp: Timestamp { nanos: 2000000000, clock: Unix }, pose: Pose3 { position: Point3 { x: 7.450000286102295, y: 0.550000011920929, z: 0.4000000014901161 }, orientation: Quaternion { w: 0.9202179540323133, x: 0.0, y: -0.0, z: -0.39140633244313155 } } }, score: 0.002522068, information_gain: Some(0.020000001), distance_cost: Some(6.93), frontier_area_m2: Some(0.020000001), producer: \"nuwax-exploration/surface\", stamp: Timestamp { nanos: 2000000000, clock: Unix }, metadata: {\"admissible_candidate_count\": \"4\", \"available_regions\": \"4\", \"evaluated_candidate_count\": \"4\", \"geometric_candidate_count\": \"1460\", \"goal_orientation_required\": \"false\", \"region_wait_rounds\": \"0\", \"route_cost_m\": \"28.030000226498256\", \"route_regions\": \"4\", \"selection_method\": \"regional_route\"} }))",
+      "sample": 1,
+      "us": 14400.207999999999,
+      "width": 80,
+      "pair": 1,
+      "arm": "baseline"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 400,
+      "mode": 2,
+      "outcome": "Ok(Goal(FrontierGoal { id: \"surface-surface-0000000077359400-2\", pose: PoseStamped { frame_id: Map, stamp: Timestamp { nanos: 2000000000, clock: Unix }, pose: Pose3 { position: Point3 { x: 1.4500000476837158, y: 1.4500000476837158, z: 0.4000000014901161 }, orientation: Quaternion { w: 0.9162537817532964, x: 0.0, y: -0.0, z: 0.4005983118072051 } } }, score: 0.010928962, information_gain: Some(0.020000001), distance_cost: Some(0.8299999), frontier_area_m2: Some(0.020000001), producer: \"nuwax-exploration/surface\", stamp: Timestamp { nanos: 2000000000, clock: Unix }, metadata: {\"admissible_candidate_count\": \"1\", \"evaluated_candidate_count\": \"1\", \"geometric_candidate_count\": \"260\", \"goal_orientation_required\": \"false\", \"selection_method\": \"navigation_retry\"} }))",
+      "sample": 0,
+      "us": 827.64,
+      "width": 20,
+      "pair": 1,
+      "arm": "baseline"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 400,
+      "mode": 2,
+      "outcome": "Ok(Goal(FrontierGoal { id: \"surface-surface-0000000077359400-2\", pose: PoseStamped { frame_id: Map, stamp: Timestamp { nanos: 2000000000, clock: Unix }, pose: Pose3 { position: Point3 { x: 1.4500000476837158, y: 1.4500000476837158, z: 0.4000000014901161 }, orientation: Quaternion { w: 0.9162537817532964, x: 0.0, y: -0.0, z: 0.4005983118072051 } } }, score: 0.010928962, information_gain: Some(0.020000001), distance_cost: Some(0.8299999), frontier_area_m2: Some(0.020000001), producer: \"nuwax-exploration/surface\", stamp: Timestamp { nanos: 2000000000, clock: Unix }, metadata: {\"admissible_candidate_count\": \"1\", \"evaluated_candidate_count\": \"1\", \"geometric_candidate_count\": \"260\", \"goal_orientation_required\": \"false\", \"selection_method\": \"navigation_retry\"} }))",
+      "sample": 1,
+      "us": 727.1279999999999,
+      "width": 20,
+      "pair": 1,
+      "arm": "baseline"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 0,
+      "mode": 3,
+      "outcome": "Ok(Pending)",
+      "sample": 0,
+      "us": 0.651,
+      "width": 20,
+      "pair": 1,
+      "arm": "baseline"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 0,
+      "mode": 3,
+      "outcome": "Ok(Pending)",
+      "sample": 1,
+      "us": 0.3,
+      "width": 20,
+      "pair": 1,
+      "arm": "baseline"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 400,
+      "mode": 0,
+      "outcome": "Ok(Pending)",
+      "sample": 0,
+      "us": 445.352,
+      "width": 20,
+      "pair": 2,
+      "arm": "baseline"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 400,
+      "mode": 0,
+      "outcome": "Ok(Pending)",
+      "sample": 1,
+      "us": 477.481,
+      "width": 20,
+      "pair": 2,
+      "arm": "baseline"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 6400,
+      "mode": 0,
+      "outcome": "Ok(Pending)",
+      "sample": 0,
+      "us": 12015.628,
+      "width": 80,
+      "pair": 2,
+      "arm": "baseline"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 6400,
+      "mode": 0,
+      "outcome": "Ok(Pending)",
+      "sample": 1,
+      "us": 11465.708,
+      "width": 80,
+      "pair": 2,
+      "arm": "baseline"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 25600,
+      "mode": 0,
+      "outcome": "Ok(Pending)",
+      "sample": 0,
+      "us": 84226.774,
+      "width": 160,
+      "pair": 2,
+      "arm": "baseline"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 25600,
+      "mode": 0,
+      "outcome": "Ok(Pending)",
+      "sample": 1,
+      "us": 84809.63399999999,
+      "width": 160,
+      "pair": 2,
+      "arm": "baseline"
+    },
+    {
+      "blind": true,
+      "evaluated_cells": 385,
+      "mode": 0,
+      "outcome": "Ok(Pending)",
+      "sample": 0,
+      "us": 3657.771,
+      "width": 20,
+      "pair": 2,
+      "arm": "baseline"
+    },
+    {
+      "blind": true,
+      "evaluated_cells": 385,
+      "mode": 0,
+      "outcome": "Ok(Pending)",
+      "sample": 1,
+      "us": 6235.697999999999,
+      "width": 20,
+      "pair": 2,
+      "arm": "baseline"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 6400,
+      "mode": 1,
+      "outcome": "Ok(Goal(FrontierGoal { id: \"surface-surface-0000000077359400-2\", pose: PoseStamped { frame_id: Map, stamp: Timestamp { nanos: 2000000000, clock: Unix }, pose: Pose3 { position: Point3 { x: 7.450000286102295, y: 0.550000011920929, z: 0.4000000014901161 }, orientation: Quaternion { w: 0.9202179540323133, x: 0.0, y: -0.0, z: -0.39140633244313155 } } }, score: 0.002522068, information_gain: Some(0.020000001), distance_cost: Some(6.93), frontier_area_m2: Some(0.020000001), producer: \"nuwax-exploration/surface\", stamp: Timestamp { nanos: 2000000000, clock: Unix }, metadata: {\"admissible_candidate_count\": \"4\", \"available_regions\": \"4\", \"evaluated_candidate_count\": \"4\", \"geometric_candidate_count\": \"1460\", \"goal_orientation_required\": \"false\", \"region_wait_rounds\": \"0\", \"route_cost_m\": \"28.030000226498256\", \"route_regions\": \"4\", \"selection_method\": \"regional_route\"} }))",
+      "sample": 0,
+      "us": 15966.353,
+      "width": 80,
+      "pair": 2,
+      "arm": "baseline"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 6400,
+      "mode": 1,
+      "outcome": "Ok(Goal(FrontierGoal { id: \"surface-surface-0000000077359400-2\", pose: PoseStamped { frame_id: Map, stamp: Timestamp { nanos: 2000000000, clock: Unix }, pose: Pose3 { position: Point3 { x: 7.450000286102295, y: 0.550000011920929, z: 0.4000000014901161 }, orientation: Quaternion { w: 0.9202179540323133, x: 0.0, y: -0.0, z: -0.39140633244313155 } } }, score: 0.002522068, information_gain: Some(0.020000001), distance_cost: Some(6.93), frontier_area_m2: Some(0.020000001), producer: \"nuwax-exploration/surface\", stamp: Timestamp { nanos: 2000000000, clock: Unix }, metadata: {\"admissible_candidate_count\": \"4\", \"available_regions\": \"4\", \"evaluated_candidate_count\": \"4\", \"geometric_candidate_count\": \"1460\", \"goal_orientation_required\": \"false\", \"region_wait_rounds\": \"0\", \"route_cost_m\": \"28.030000226498256\", \"route_regions\": \"4\", \"selection_method\": \"regional_route\"} }))",
+      "sample": 1,
+      "us": 15887.152000000002,
+      "width": 80,
+      "pair": 2,
+      "arm": "baseline"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 400,
+      "mode": 2,
+      "outcome": "Ok(Goal(FrontierGoal { id: \"surface-surface-0000000077359400-2\", pose: PoseStamped { frame_id: Map, stamp: Timestamp { nanos: 2000000000, clock: Unix }, pose: Pose3 { position: Point3 { x: 1.4500000476837158, y: 1.4500000476837158, z: 0.4000000014901161 }, orientation: Quaternion { w: 0.9162537817532964, x: 0.0, y: -0.0, z: 0.4005983118072051 } } }, score: 0.010928962, information_gain: Some(0.020000001), distance_cost: Some(0.8299999), frontier_area_m2: Some(0.020000001), producer: \"nuwax-exploration/surface\", stamp: Timestamp { nanos: 2000000000, clock: Unix }, metadata: {\"admissible_candidate_count\": \"1\", \"evaluated_candidate_count\": \"1\", \"geometric_candidate_count\": \"260\", \"goal_orientation_required\": \"false\", \"selection_method\": \"navigation_retry\"} }))",
+      "sample": 0,
+      "us": 622.409,
+      "width": 20,
+      "pair": 2,
+      "arm": "baseline"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 400,
+      "mode": 2,
+      "outcome": "Ok(Goal(FrontierGoal { id: \"surface-surface-0000000077359400-2\", pose: PoseStamped { frame_id: Map, stamp: Timestamp { nanos: 2000000000, clock: Unix }, pose: Pose3 { position: Point3 { x: 1.4500000476837158, y: 1.4500000476837158, z: 0.4000000014901161 }, orientation: Quaternion { w: 0.9162537817532964, x: 0.0, y: -0.0, z: 0.4005983118072051 } } }, score: 0.010928962, information_gain: Some(0.020000001), distance_cost: Some(0.8299999), frontier_area_m2: Some(0.020000001), producer: \"nuwax-exploration/surface\", stamp: Timestamp { nanos: 2000000000, clock: Unix }, metadata: {\"admissible_candidate_count\": \"1\", \"evaluated_candidate_count\": \"1\", \"geometric_candidate_count\": \"260\", \"goal_orientation_required\": \"false\", \"selection_method\": \"navigation_retry\"} }))",
+      "sample": 1,
+      "us": 702.3100000000001,
+      "width": 20,
+      "pair": 2,
+      "arm": "baseline"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 0,
+      "mode": 3,
+      "outcome": "Ok(Pending)",
+      "sample": 0,
+      "us": 1.232,
+      "width": 20,
+      "pair": 2,
+      "arm": "baseline"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 0,
+      "mode": 3,
+      "outcome": "Ok(Pending)",
+      "sample": 1,
+      "us": 0.33099999999999996,
+      "width": 20,
+      "pair": 2,
+      "arm": "baseline"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 0,
+      "mode": 0,
+      "outcome": "Ok(Pending)",
+      "sample": 0,
+      "us": 47.330999999999996,
+      "width": 20,
+      "pair": 2,
+      "arm": "candidate"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 0,
+      "mode": 0,
+      "outcome": "Ok(Pending)",
+      "sample": 1,
+      "us": 40.381,
+      "width": 20,
+      "pair": 2,
+      "arm": "candidate"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 0,
+      "mode": 0,
+      "outcome": "Ok(Pending)",
+      "sample": 0,
+      "us": 79.43,
+      "width": 80,
+      "pair": 2,
+      "arm": "candidate"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 0,
+      "mode": 0,
+      "outcome": "Ok(Pending)",
+      "sample": 1,
+      "us": 44.988,
+      "width": 80,
+      "pair": 2,
+      "arm": "candidate"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 0,
+      "mode": 0,
+      "outcome": "Ok(Pending)",
+      "sample": 0,
+      "us": 242.46599999999998,
+      "width": 160,
+      "pair": 2,
+      "arm": "candidate"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 0,
+      "mode": 0,
+      "outcome": "Ok(Pending)",
+      "sample": 1,
+      "us": 53.39,
+      "width": 160,
+      "pair": 2,
+      "arm": "candidate"
+    },
+    {
+      "blind": true,
+      "evaluated_cells": 0,
+      "mode": 0,
+      "outcome": "Ok(Pending)",
+      "sample": 0,
+      "us": 2398.271,
+      "width": 20,
+      "pair": 2,
+      "arm": "candidate"
+    },
+    {
+      "blind": true,
+      "evaluated_cells": 0,
+      "mode": 0,
+      "outcome": "Ok(Pending)",
+      "sample": 1,
+      "us": 4321.2429999999995,
+      "width": 20,
+      "pair": 2,
+      "arm": "candidate"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 6400,
+      "mode": 1,
+      "outcome": "Ok(Goal(FrontierGoal { id: \"surface-surface-0000000077359400-2\", pose: PoseStamped { frame_id: Map, stamp: Timestamp { nanos: 2000000000, clock: Unix }, pose: Pose3 { position: Point3 { x: 7.450000286102295, y: 0.550000011920929, z: 0.4000000014901161 }, orientation: Quaternion { w: 0.9202179540323133, x: 0.0, y: -0.0, z: -0.39140633244313155 } } }, score: 0.002522068, information_gain: Some(0.020000001), distance_cost: Some(6.93), frontier_area_m2: Some(0.020000001), producer: \"nuwax-exploration/surface\", stamp: Timestamp { nanos: 2000000000, clock: Unix }, metadata: {\"admissible_candidate_count\": \"4\", \"available_regions\": \"4\", \"evaluated_candidate_count\": \"4\", \"geometric_candidate_count\": \"1460\", \"goal_orientation_required\": \"false\", \"region_wait_rounds\": \"0\", \"route_cost_m\": \"28.030000226498256\", \"route_regions\": \"4\", \"selection_method\": \"regional_route\"} }))",
+      "sample": 0,
+      "us": 15463.895,
+      "width": 80,
+      "pair": 2,
+      "arm": "candidate"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 6400,
+      "mode": 1,
+      "outcome": "Ok(Goal(FrontierGoal { id: \"surface-surface-0000000077359400-2\", pose: PoseStamped { frame_id: Map, stamp: Timestamp { nanos: 2000000000, clock: Unix }, pose: Pose3 { position: Point3 { x: 7.450000286102295, y: 0.550000011920929, z: 0.4000000014901161 }, orientation: Quaternion { w: 0.9202179540323133, x: 0.0, y: -0.0, z: -0.39140633244313155 } } }, score: 0.002522068, information_gain: Some(0.020000001), distance_cost: Some(6.93), frontier_area_m2: Some(0.020000001), producer: \"nuwax-exploration/surface\", stamp: Timestamp { nanos: 2000000000, clock: Unix }, metadata: {\"admissible_candidate_count\": \"4\", \"available_regions\": \"4\", \"evaluated_candidate_count\": \"4\", \"geometric_candidate_count\": \"1460\", \"goal_orientation_required\": \"false\", \"region_wait_rounds\": \"0\", \"route_cost_m\": \"28.030000226498256\", \"route_regions\": \"4\", \"selection_method\": \"regional_route\"} }))",
+      "sample": 1,
+      "us": 16630.336,
+      "width": 80,
+      "pair": 2,
+      "arm": "candidate"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 400,
+      "mode": 2,
+      "outcome": "Ok(Goal(FrontierGoal { id: \"surface-surface-0000000077359400-2\", pose: PoseStamped { frame_id: Map, stamp: Timestamp { nanos: 2000000000, clock: Unix }, pose: Pose3 { position: Point3 { x: 1.4500000476837158, y: 1.4500000476837158, z: 0.4000000014901161 }, orientation: Quaternion { w: 0.9162537817532964, x: 0.0, y: -0.0, z: 0.4005983118072051 } } }, score: 0.010928962, information_gain: Some(0.020000001), distance_cost: Some(0.8299999), frontier_area_m2: Some(0.020000001), producer: \"nuwax-exploration/surface\", stamp: Timestamp { nanos: 2000000000, clock: Unix }, metadata: {\"admissible_candidate_count\": \"1\", \"evaluated_candidate_count\": \"1\", \"geometric_candidate_count\": \"260\", \"goal_orientation_required\": \"false\", \"selection_method\": \"navigation_retry\"} }))",
+      "sample": 0,
+      "us": 568.6690000000001,
+      "width": 20,
+      "pair": 2,
+      "arm": "candidate"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 400,
+      "mode": 2,
+      "outcome": "Ok(Goal(FrontierGoal { id: \"surface-surface-0000000077359400-2\", pose: PoseStamped { frame_id: Map, stamp: Timestamp { nanos: 2000000000, clock: Unix }, pose: Pose3 { position: Point3 { x: 1.4500000476837158, y: 1.4500000476837158, z: 0.4000000014901161 }, orientation: Quaternion { w: 0.9162537817532964, x: 0.0, y: -0.0, z: 0.4005983118072051 } } }, score: 0.010928962, information_gain: Some(0.020000001), distance_cost: Some(0.8299999), frontier_area_m2: Some(0.020000001), producer: \"nuwax-exploration/surface\", stamp: Timestamp { nanos: 2000000000, clock: Unix }, metadata: {\"admissible_candidate_count\": \"1\", \"evaluated_candidate_count\": \"1\", \"geometric_candidate_count\": \"260\", \"goal_orientation_required\": \"false\", \"selection_method\": \"navigation_retry\"} }))",
+      "sample": 1,
+      "us": 566.355,
+      "width": 20,
+      "pair": 2,
+      "arm": "candidate"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 0,
+      "mode": 3,
+      "outcome": "Ok(Pending)",
+      "sample": 0,
+      "us": 0.961,
+      "width": 20,
+      "pair": 2,
+      "arm": "candidate"
+    },
+    {
+      "blind": false,
+      "evaluated_cells": 0,
+      "mode": 3,
+      "outcome": "Ok(Pending)",
+      "sample": 1,
+      "us": 0.33099999999999996,
+      "width": 20,
+      "pair": 2,
+      "arm": "candidate"
+    }
+  ],
+  "summary": [
+    {
+      "width": 20,
+      "blind": false,
+      "mode": 0,
+      "baseline_median_us": 475.858,
+      "candidate_median_us": 42.6345,
+      "paired_ratios": [
+        0.08744820801827413,
+        0.061155831039727986,
+        0.09504644935757606
+      ],
+      "baseline_evaluated_cells": [
+        400
+      ],
+      "candidate_evaluated_cells": [
+        0
+      ]
+    },
+    {
+      "width": 80,
+      "blind": false,
+      "mode": 0,
+      "baseline_median_us": 12041.176500000001,
+      "candidate_median_us": 73.3555,
+      "paired_ratios": [
+        0.004888030566209923,
+        0.006313960107817321,
+        0.005298591187486095
+      ],
+      "baseline_evaluated_cells": [
+        6400
+      ],
+      "candidate_evaluated_cells": [
+        0
+      ]
+    },
+    {
+      "width": 160,
+      "blind": false,
+      "mode": 0,
+      "baseline_median_us": 84518.204,
+      "candidate_median_us": 133.852,
+      "paired_ratios": [
+        0.0013059714314754176,
+        0.0016826087852864881,
+        0.0017502501591254826
+      ],
+      "baseline_evaluated_cells": [
+        25600
+      ],
+      "candidate_evaluated_cells": [
+        0
+      ]
+    },
+    {
+      "width": 20,
+      "blind": true,
+      "mode": 0,
+      "baseline_median_us": 3243.701,
+      "candidate_median_us": 2621.953,
+      "paired_ratios": [
+        0.9171427796885262,
+        0.8391073961502618,
+        0.6791868453825448
+      ],
+      "baseline_evaluated_cells": [
+        385
+      ],
+      "candidate_evaluated_cells": [
+        0
+      ]
+    },
+    {
+      "width": 80,
+      "blind": false,
+      "mode": 1,
+      "baseline_median_us": 15926.7525,
+      "candidate_median_us": 16047.1155,
+      "paired_ratios": [
+        0.7559975494511344,
+        1.2220928098219017,
+        1.0075572845123322
+      ],
+      "baseline_evaluated_cells": [
+        6400
+      ],
+      "candidate_evaluated_cells": [
+        6400
+      ]
+    },
+    {
+      "width": 20,
+      "blind": false,
+      "mode": 2,
+      "baseline_median_us": 686.797,
+      "candidate_median_us": 623.206,
+      "paired_ratios": [
+        0.9641499700956938,
+        0.9567440286910972,
+        0.8568035938187646
+      ],
+      "baseline_evaluated_cells": [
+        400
+      ],
+      "candidate_evaluated_cells": [
+        400
+      ]
+    },
+    {
+      "width": 20,
+      "blind": false,
+      "mode": 3,
+      "baseline_median_us": 0.491,
+      "candidate_median_us": 0.651,
+      "paired_ratios": [
+        1.137481910274964,
+        1.1682439537329126,
+        0.8266154830454254
+      ],
+      "baseline_evaluated_cells": [
+        0
+      ],
+      "candidate_evaluated_cells": [
+        0
+      ]
+    }
+  ],
+  "cross_binary_outcome_comparisons": 42,
+  "date": "2026-10-14",
+  "decision": "retain approved private unchanged-input wait work elision",
+  "production_source": "services/nuwax-workspace/crates/nuwax-exploration/src/surface_adapter.rs",
+  "test_source": "services/nuwax-workspace/crates/nuwax-exploration/src/surface_wait_frontier_tests.rs",
+  "evidence_directory": "/workspace/scratch/71cdb9d17732/neh-evidence/surface-private-wait-20261014",
+  "condition": "query_view.is_none() || new_snapshot || self.retry_support.is_some()",
+  "guarded_call": "prepare_frontier_geometry",
+  "body_and_support_calls_unchanged": true,
+  "build_cwd": "services/nuwax-workspace",
+  "build_command": "cargo test --offline --locked --release -j2 -p nuwax-exploration --features surface --lib --no-run --message-format=json",
+  "release_profile": {
+    "opt_level": 3,
+    "lto": "thin",
+    "codegen_units": 1,
+    "profile_overrides": false
+  },
+  "fixed_schedule": {
+    "process_pairs": 3,
+    "orders": [
+      "AB",
+      "BA",
+      "AB"
+    ],
+    "cohorts": 7,
+    "samples_per_cohort_per_process": 2,
+    "total_samples": 84,
+    "cross_binary_outcome_comparisons": 42
+  },
+  "timed_scope": [
+    "private fork creation",
+    "production prepared poll",
+    "discard"
+  ],
+  "untimed_scope": [
+    "source construction",
+    "initial real goal and feedback",
+    "freeze original input",
+    "outcome/state comparisons",
+    "printing"
+  ],
+  "mode_names": {
+    "0": "same-source changed-pose wait",
+    "1": "new-observation actual selection",
+    "2": "same-source retry actual selection",
+    "3": "same-pose wait"
+  },
+  "baseline_suite": {
+    "passed": 60,
+    "failed": 0,
+    "ignored": 4
+  },
+  "candidate_suite": {
+    "passed": 60,
+    "failed": 0,
+    "ignored": 4
+  },
+  "new_equivalence_test": {
+    "passed": 1,
+    "case_count": 10,
+    "included_in_full_suite": true,
+    "cases": [
+      "changed pose",
+      "same pose",
+      "missing support",
+      "invalid rotation",
+      "absent input",
+      "new admitted observation",
+      "retry",
+      "valid constraint replacement",
+      "malformed constraint replacement",
+      "blind footprint"
+    ]
+  },
+  "existing_adapter_contract_filters": {
+    "private_query_fork": 1,
+    "controller_prepare": 2,
+    "frozen_": 7,
+    "prepared_": 13
+  },
+  "adapter_contract_counts_overlap_full_suite": true,
+  "mls_planning_fork": {
+    "passed": 4,
+    "failed": 0,
+    "ignored": 0,
+    "filtered": 335,
+    "command": "cargo test --offline --locked --release -j2 -p nuwax-nav-mls-planner --lib planning_fork -- --test-threads=1",
+    "log": "mls-private-fork-contracts.log"
+  },
+  "initial_test_only_diagnostic": {
+    "samples": [
+      {
+        "width": 20,
+        "blind": false,
+        "pair": 0,
+        "candidate": false,
+        "us": 672.485,
+        "evaluated_cells": 400
+      },
+      {
+        "width": 20,
+        "blind": false,
+        "pair": 0,
+        "candidate": true,
+        "us": 44.077,
+        "evaluated_cells": 0
+      },
+      {
+        "width": 20,
+        "blind": false,
+        "pair": 1,
+        "candidate": true,
+        "us": 39.53,
+        "evaluated_cells": 0
+      },
+      {
+        "width": 20,
+        "blind": false,
+        "pair": 1,
+        "candidate": false,
+        "us": 519.625,
+        "evaluated_cells": 400
+      },
+      {
+        "width": 20,
+        "blind": false,
+        "pair": 2,
+        "candidate": false,
+        "us": 618.474,
+        "evaluated_cells": 400
+      },
+      {
+        "width": 20,
+        "blind": false,
+        "pair": 2,
+        "candidate": true,
+        "us": 40.040000000000006,
+        "evaluated_cells": 0
+      },
+      {
+        "width": 80,
+        "blind": false,
+        "pair": 0,
+        "candidate": false,
+        "us": 12652.688,
+        "evaluated_cells": 6400
+      },
+      {
+        "width": 80,
+        "blind": false,
+        "pair": 0,
+        "candidate": true,
+        "us": 48.924,
+        "evaluated_cells": 0
+      },
+      {
+        "width": 80,
+        "blind": false,
+        "pair": 1,
+        "candidate": true,
+        "us": 42.233,
+        "evaluated_cells": 0
+      },
+      {
+        "width": 80,
+        "blind": false,
+        "pair": 1,
+        "candidate": false,
+        "us": 10990.299,
+        "evaluated_cells": 6400
+      },
+      {
+        "width": 80,
+        "blind": false,
+        "pair": 2,
+        "candidate": false,
+        "us": 10687.552,
+        "evaluated_cells": 6400
+      },
+      {
+        "width": 80,
+        "blind": false,
+        "pair": 2,
+        "candidate": true,
+        "us": 48.604,
+        "evaluated_cells": 0
+      },
+      {
+        "width": 160,
+        "blind": false,
+        "pair": 0,
+        "candidate": false,
+        "us": 130322.169,
+        "evaluated_cells": 25600
+      },
+      {
+        "width": 160,
+        "blind": false,
+        "pair": 0,
+        "candidate": true,
+        "us": 101.272,
+        "evaluated_cells": 0
+      },
+      {
+        "width": 160,
+        "blind": false,
+        "pair": 1,
+        "candidate": true,
+        "us": 52.459,
+        "evaluated_cells": 0
+      },
+      {
+        "width": 160,
+        "blind": false,
+        "pair": 1,
+        "candidate": false,
+        "us": 86133.57,
+        "evaluated_cells": 25600
+      },
+      {
+        "width": 160,
+        "blind": false,
+        "pair": 2,
+        "candidate": false,
+        "us": 85709.911,
+        "evaluated_cells": 25600
+      },
+      {
+        "width": 160,
+        "blind": false,
+        "pair": 2,
+        "candidate": true,
+        "us": 58.829,
+        "evaluated_cells": 0
+      },
+      {
+        "width": 20,
+        "blind": true,
+        "pair": 0,
+        "candidate": false,
+        "us": 3429.196,
+        "evaluated_cells": 385
+      },
+      {
+        "width": 20,
+        "blind": true,
+        "pair": 0,
+        "candidate": true,
+        "us": 2435.176,
+        "evaluated_cells": 0
+      },
+      {
+        "width": 20,
+        "blind": true,
+        "pair": 1,
+        "candidate": true,
+        "us": 2559.243,
+        "evaluated_cells": 0
+      },
+      {
+        "width": 20,
+        "blind": true,
+        "pair": 1,
+        "candidate": false,
+        "us": 2826.846,
+        "evaluated_cells": 385
+      },
+      {
+        "width": 20,
+        "blind": true,
+        "pair": 2,
+        "candidate": false,
+        "us": 2782.92,
+        "evaluated_cells": 385
+      },
+      {
+        "width": 20,
+        "blind": true,
+        "pair": 2,
+        "candidate": true,
+        "us": 4510.158,
+        "evaluated_cells": 0
+      }
+    ],
+    "summary": [
+      {
+        "width": 20,
+        "blind": false,
+        "baseline_median_us": 618.474,
+        "candidate_median_us": 40.040000000000006,
+        "paired_ratios": [
+          0.06554346937106403,
+          0.07607409189319221,
+          0.06473998906987198
+        ]
+      },
+      {
+        "width": 80,
+        "blind": false,
+        "baseline_median_us": 10990.299,
+        "candidate_median_us": 48.604,
+        "paired_ratios": [
+          0.003866688248378526,
+          0.003842752594811114,
+          0.004547720563137377
+        ]
+      },
+      {
+        "width": 160,
+        "blind": false,
+        "baseline_median_us": 86133.57,
+        "candidate_median_us": 58.829,
+        "paired_ratios": [
+          0.0007770895832772705,
+          0.0006090424441945225,
+          0.0006863733646859113
+        ]
+      },
+      {
+        "width": 20,
+        "blind": true,
+        "baseline_median_us": 2826.846,
+        "candidate_median_us": 2559.243,
+        "paired_ratios": [
+          0.7101303045961794,
+          0.9053351332191425,
+          1.6206567202794189
+        ]
+      }
+    ]
+  },
+  "limitations": [
+    "Only private consumed-input/no-retry wait path skips work; result remains Pending or the same SourceUnavailable",
+    "No actual frontier-selection or robot-motion speedup claim",
+    "No measured deployment frequency; active child and same-pose shortcuts usually avoid selection",
+    "Blind-footprint body work remains; original test-only blind pair includes regression1.62, no general blind-case benefit claim",
+    "New-input and retry controls retain frontier work; no general performance claim",
+    "No Geometry runtime full-LTO rebuild or fresh worker-runtime integration test",
+    "No full workspace, real sensor replay, source-health integration, physical robot or hardware CPU measurement"
+  ],
+  "original_side_effects_preserved": [
+    "source notification and identity",
+    "history and retry semantics",
+    "prepared-poll settlement",
+    "synchronous source cache behavior",
+    "new-input/config/retry boundary errors",
+    "body/support checks"
+  ],
+  "source_invariant": "Same original Arc and consumed notification imply a prior successful boundary-validated query; configure_constraints clears source/notification/query stamps, observation-model changes clear source anchor",
+  "final_production_check": {
+    "command": "cargo check --offline --locked --release -j2 -p nuwax-exploration --features surface --lib",
+    "cwd": "services/nuwax-workspace",
+    "exit_code": 0,
+    "elapsed_seconds": 1.35,
+    "cfg_test": false,
+    "full_link": false,
+    "features": [
+      "surface"
+    ],
+    "default_features": [],
+    "dependency": "local ../nuwax-nav-mls-planner plus unconditional local explore-routing/types/base",
+    "profile": "workspace release opt3/thin-LTO/codegen-units=1; nested incremental=true",
+    "warnings": "existing missing documentation",
+    "log": "/workspace/scratch/71cdb9d17732/neh-evidence/surface-private-wait-20261014/production-check.log"
+  }
+}

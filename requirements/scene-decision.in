@@ -1,0 +1,15 @@
+# 独立开发机模型服务环境；不加入平台或Go2依赖。
+# 先从PyTorch官方cu128索引安装torch==2.8.0与torchvision==0.23.0。
+transformers==5.15.0
+huggingface-hub>=1.0,<2
+pydantic==2.10.6
+fastapi==0.115.14
+uvicorn==0.30.6
+pillow>=11.0,<13
+numpy>=1.26,<3
+# 现有services包导出感知模块时需要图像解码库，不安装机器人驱动。
+opencv-python-headless>=4.10,<5
+grpcio>=1.76,<2
+protobuf>=6.31,<7
+pytest>=8,<9
+httpx>=0.27,<1

@@ -1,0 +1,26 @@
+[Unit]
+Description=NuwaX 本机LCM通信网络准备
+Before=nuwax-host-gateway.service nuwax-geometry-runtime.service nuwax-nav-stack.service nuwax-person-follow.service
+
+[Service]
+Type=oneshot
+# 仅宿主机网络准备需要特权，实际消息消费者仍使用各自普通账号。
+User=root
+Group=nuwax
+ProtectHome=read-only
+ProtectSystem=strict
+# 目标系统的命令解释器通过临时文件传递内嵌脚本，使用服务私有临时目录。
+PrivateTmp=yes
+NoNewPrivileges=yes
+# 配置可由普通服务账号以0600保存，准备进程需要读取该账号的受限文件。
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_DAC_READ_SEARCH
+WorkingDirectory=@NUWAX_REPO_ROOT@
+# 只把解析后的总线地址交给特权准备，不导入用户文件中的其它进程环境。
+ExecStart=/usr/bin/env /usr/bin/python3 -I -S @NUWAX_REPO_ROOT@/scripts/systemd/prepare_lcm_network.py --config-dir @NUWAX_CONFIG_DIR@
+RemainAfterExit=yes
+KillMode=control-group
+TimeoutStartSec=35
+TimeoutStopSec=5
+
+[Install]
+WantedBy=multi-user.target

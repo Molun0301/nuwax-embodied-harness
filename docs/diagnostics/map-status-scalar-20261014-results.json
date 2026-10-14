@@ -1,0 +1,137 @@
+{
+  "python": "3.8.10 (default, Oct 13 2026, 08:57:26) \n[GCC 14.2.0]",
+  "rows": 1000,
+  "assets": 8,
+  "active_schema": 1,
+  "setup_seconds": 3.246088410000084,
+  "sqlite_synchronous": 2,
+  "baseline_source": "/workspace/scratch/71cdb9d17732/map-status-scalar-20261014/baseline-map_workspace.py",
+  "complete_output_equal": true,
+  "clocks": "Only generated MemoryStoreSummary and MapWorkspace timestamps fixed to existing NOW fixture",
+  "runs": [
+    {
+      "scope": "list_maps",
+      "arm": "baseline",
+      "wall_seconds": 0.12783564500205102,
+      "cpu_seconds": 0.12771642199999977,
+      "summary": 1,
+      "snapshot_rows": 1000,
+      "snapshot_pages": 8,
+      "library_list": 1
+    },
+    {
+      "scope": "list_maps",
+      "arm": "candidate",
+      "wall_seconds": 0.0023495770001318306,
+      "cpu_seconds": 0.002347687999999515,
+      "summary": 0,
+      "snapshot_rows": 0,
+      "snapshot_pages": 0,
+      "library_list": 0
+    },
+    {
+      "scope": "list_maps",
+      "arm": "candidate",
+      "wall_seconds": 0.0021557350009970833,
+      "cpu_seconds": 0.00215427200000029,
+      "summary": 0,
+      "snapshot_rows": 0,
+      "snapshot_pages": 0,
+      "library_list": 0
+    },
+    {
+      "scope": "list_maps",
+      "arm": "baseline",
+      "wall_seconds": 0.11792328600131441,
+      "cpu_seconds": 0.11776008699999974,
+      "summary": 1,
+      "snapshot_rows": 1000,
+      "snapshot_pages": 8,
+      "library_list": 1
+    },
+    {
+      "scope": "list_maps",
+      "arm": "baseline",
+      "wall_seconds": 0.21775302900277893,
+      "cpu_seconds": 0.217478893,
+      "summary": 1,
+      "snapshot_rows": 1000,
+      "snapshot_pages": 8,
+      "library_list": 1
+    },
+    {
+      "scope": "list_maps",
+      "arm": "candidate",
+      "wall_seconds": 0.002449428000545595,
+      "cpu_seconds": 0.002446946000000061,
+      "summary": 0,
+      "snapshot_rows": 0,
+      "snapshot_pages": 0,
+      "library_list": 0
+    },
+    {
+      "scope": "handle_list_maps",
+      "arm": "baseline",
+      "wall_seconds": 0.4120066709983803,
+      "cpu_seconds": 0.4114971089999999,
+      "summary": 3,
+      "snapshot_rows": 3000,
+      "snapshot_pages": 24,
+      "library_list": 3
+    },
+    {
+      "scope": "handle_list_maps",
+      "arm": "candidate",
+      "wall_seconds": 0.12653874199895654,
+      "cpu_seconds": 0.12549983300000012,
+      "summary": 1,
+      "snapshot_rows": 1000,
+      "snapshot_pages": 8,
+      "library_list": 1
+    },
+    {
+      "scope": "handle_list_maps",
+      "arm": "candidate",
+      "wall_seconds": 0.18609381599890185,
+      "cpu_seconds": 0.18583905900000008,
+      "summary": 1,
+      "snapshot_rows": 1000,
+      "snapshot_pages": 8,
+      "library_list": 1
+    },
+    {
+      "scope": "handle_list_maps",
+      "arm": "baseline",
+      "wall_seconds": 0.3529460649988323,
+      "cpu_seconds": 0.352613131,
+      "summary": 3,
+      "snapshot_rows": 3000,
+      "snapshot_pages": 24,
+      "library_list": 3
+    },
+    {
+      "scope": "handle_list_maps",
+      "arm": "baseline",
+      "wall_seconds": 0.4356988569998066,
+      "cpu_seconds": 0.43518534499999983,
+      "summary": 3,
+      "snapshot_rows": 3000,
+      "snapshot_pages": 24,
+      "library_list": 3
+    },
+    {
+      "scope": "handle_list_maps",
+      "arm": "candidate",
+      "wall_seconds": 0.14114993899784167,
+      "cpu_seconds": 0.14089421899999977,
+      "summary": 1,
+      "snapshot_rows": 1000,
+      "snapshot_pages": 8,
+      "library_list": 1
+    }
+  ],
+  "guard": {
+    "application_hash_attempts": [],
+    "framework_metadata_etag_calls": 0
+  }
+}

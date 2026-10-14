@@ -9,11 +9,12 @@ from services.perception.base import (
     DisabledSegmentationBackend,
 )
 from services.perception.detectors import DetectorPipeline, MetadataDrivenDetectorBackend, YoloWorldDetectorBackend
+from services.perception.postprocess import ClassAgnosticNmsPostProcessor
 from services.perception.scene import HybridSceneDescriptionBackend, OpenAICompatibleVisionSceneDescriptionBackend, SimpleSceneDescriptionBackend
 from services.perception.trackers import Basic2DTrackerBackend, ByteTrackTrackerBackend
 
 if TYPE_CHECKING:
-    from settings import NuwaxRobotBridgeConfig
+    from core.settings import NuwaxRobotBridgeConfig
 
 
 def build_platform_perception_components(config: "NuwaxRobotBridgeConfig") -> Dict[str, Any]:
@@ -27,11 +28,7 @@ def build_platform_perception_components(config: "NuwaxRobotBridgeConfig") -> Di
             YoloWorldDetectorBackend(
                 name=config.perception.yolo_world.backend_name,
                 weights=config.perception.yolo_world.model_name,
-                runtime_preference=config.perception.yolo_world.runtime_preference,
-                engine_path=config.perception.yolo_world.engine_path,
                 device=config.perception.yolo_world.device,
-                half=config.perception.yolo_world.half,
-                int8=config.perception.yolo_world.int8,
                 confidence_threshold=config.perception.yolo_world.confidence_threshold,
                 iou_threshold=config.perception.yolo_world.iou_threshold,
                 image_size=config.perception.yolo_world.image_size,
@@ -39,6 +36,8 @@ def build_platform_perception_components(config: "NuwaxRobotBridgeConfig") -> Di
                 class_names=config.perception.yolo_world.class_names,
                 class_aliases=config.perception.yolo_world.class_aliases,
                 dynamic_class_metadata_keys=config.perception.yolo_world.dynamic_class_metadata_keys,
+                use_worker_process=config.perception.yolo_world.use_worker_process,
+                worker_retry_backoff_sec=config.perception.stream_runtime.failure_backoff_sec,
             ),
         )
 
@@ -138,7 +137,14 @@ def build_platform_perception_components(config: "NuwaxRobotBridgeConfig") -> Di
 
     return {
         "pipeline_name": "platform_perception_pipeline",
-        "detector_pipeline": DetectorPipeline(tuple(detector_backends), default_backend_name=default_detector_name),
+        "detector_pipeline": DetectorPipeline(
+            tuple(detector_backends),
+            default_backend_name=default_detector_name,
+            post_processor=ClassAgnosticNmsPostProcessor(
+                iou_threshold=config.perception.postprocess.iou_threshold,
+                enabled=config.perception.postprocess.enabled,
+            ),
+        ),
         "tracker_backend": tracker_backend,
         "scene_description_backend": scene_backend,
         "segmentation_backend": segmentation_backend,

@@ -3,7 +3,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import re
 import secrets
-from typing import Optional
+import unicodedata
+from typing import List, Optional
 
 FRAME_ID_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_]*(/[A-Za-z][A-Za-z0-9_]*)*$")
 TOPIC_NAME_PATTERN = re.compile(
@@ -16,12 +17,12 @@ ARTIFACT_ID_PATTERN = re.compile(r"^art_[a-z0-9_]+_[0-9]{8}T[0-9]{6}Z_[a-f0-9]{8
 OBSERVATION_ID_PATTERN = re.compile(r"^obs_[a-z0-9_]+_[0-9]{8}T[0-9]{6}Z_[a-f0-9]{8}$")
 MEMORY_ID_PATTERN = re.compile(r"^mem_[a-z0-9_]+_[0-9]{8}T[0-9]{6}Z_[a-f0-9]{8}$")
 LOCATION_ID_PATTERN = re.compile(r"^loc_[a-z0-9_]+_[0-9]{8}T[0-9]{6}Z_[a-f0-9]{8}$")
-ANCHOR_ID_PATTERN = re.compile(r"^anc_[a-z0-9_]+_[0-9]{8}T[0-9]{6}Z_[a-f0-9]{8}$")
+ANCHOR_ID_PATTERN = re.compile(r"^anc_[a-z0-9_]+_[0-9]{8}T[0-9]{6}Z_(?:[a-f0-9]{8}|[a-f0-9]{32})$")
 INSTANCE_ID_PATTERN = re.compile(r"^ins_[a-z0-9_]+_[0-9]{8}T[0-9]{6}Z_[a-f0-9]{8}$")
 OBSERVATION_EVENT_ID_PATTERN = re.compile(r"^oev_[a-z0-9_]+_[0-9]{8}T[0-9]{6}Z_[a-f0-9]{8}$")
 NAVIGATION_CANDIDATE_ID_PATTERN = re.compile(r"^navc_[a-z0-9_]+_[0-9]{8}T[0-9]{6}Z_[a-f0-9]{8}$")
-SCENE_SPACE_ID_PATTERN = re.compile(r"^ssp_[a-z0-9_]+_[0-9]{8}T[0-9]{6}Z_[a-f0-9]{8}$")
-NAVIGATION_TRAJECTORY_EVENT_ID_PATTERN = re.compile(r"^nte_[a-z0-9_]+_[a-f0-9]{12}$")
+SCENE_SPACE_ID_PATTERN = re.compile(r"^ssp_[a-z0-9_]+_[0-9]{8}T[0-9]{6}Z_(?:[a-f0-9]{8}|[a-f0-9]{32})$")
+NAVIGATION_TRAJECTORY_EVENT_ID_PATTERN = re.compile(r"^nte_[a-z0-9_]+_(?:[a-f0-9]{12}|[a-f0-9]{32})$")
 
 
 def _ensure_match(value: str, pattern: re.Pattern[str], field_name: str) -> str:
@@ -262,3 +263,42 @@ def build_scene_space_id(
     return validate_scene_space_id(
         f"ssp_{source}_{current_time.strftime('%Y%m%dT%H%M%SZ')}_{suffix}"
     )
+
+
+# 文件系统中不允许出现的字符（POSIX/常见 FS 取交集，再补常规危险符号），
+# 用单字符 `_` 替换；保留中文/Unicode 字母数字，避免 URL 编码导致的 sqlite 路径
+# 避免数据库路径不可达。
+_FORBIDDEN_DIR_CHARS = set('/\\\x00:*?"<>|')
+
+
+def build_safe_dir_segment(raw_name: str) -> str:
+    """把任意资产标识规整成单层安全目录名。
+
+    命名规则属平台契约层，原私有实现 `_to_safe_dir_segment` 长在
+    services/mapping/catalog.py，被 geometry 跨模块导入（违反治理规则 R7：
+    禁止跨模块导入下划线私有符号），现公开化并上移至契约层。
+
+    规则：
+    - strip + NFC 归一化，避免 macOS NFD 与 Linux NFC 不一致；
+    - 控制字符与文件系统保留符号 → `_`；
+    - 不做 URL/percent 编码，保留中文等 Unicode 字母数字，让 SQLite
+      在该路径上直接 open 而不会因为 `%XX` 解释歧义打不开数据库；
+    - 整段去重连续 `_`，避免污染显示。
+    """
+
+    candidate = unicodedata.normalize("NFC", str(raw_name or "").strip())
+    if not candidate:
+        raise ValueError("资产标识不能为空。")
+    chars: List[str] = []
+    for ch in candidate:
+        if ch in _FORBIDDEN_DIR_CHARS or unicodedata.category(ch).startswith("C"):
+            chars.append("_")
+        else:
+            chars.append(ch)
+    normalized = "".join(chars)
+    while "__" in normalized:
+        normalized = normalized.replace("__", "_")
+    segment = normalized.strip("_") or "_"
+    if segment in {".", ".."}:
+        raise ValueError("资产标识不能解析为当前目录或父目录。")
+    return segment

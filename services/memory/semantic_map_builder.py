@@ -1,13 +1,13 @@
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-import hashlib
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
-from contracts.base import utc_now
 from contracts.geometry import Pose, Quaternion, Vector3
+from contracts.geometry_runtime import DEFAULT_MAP_FRAME
 from contracts.maps import SemanticMap
+from contracts.naming import build_anchor_id, build_scene_space_id
 from contracts.runtime_views import MapSnapshot
 from contracts.spatial_memory import (
     SceneSpace,
@@ -19,12 +19,14 @@ from contracts.spatial_memory import (
 )
 from services.memory.inspection_pose_planner import InspectionPosePlanner
 
+MapIdentityResolver = Callable[[str, str, str], str]
+
 
 @dataclass(frozen=True)
 class SemanticMapBuildResult:
     """语义地图构建结果。"""
 
-    map_version_id: Optional[str]
+    map_name: Optional[str]
     frame_id: str
     semantic_regions: Tuple[SemanticRegion, ...]
     anchors_by_id: Dict[str, SpatialAnchor]
@@ -38,19 +40,40 @@ class SemanticMapBuilder:
     def __init__(self, *, inspection_pose_planner: Optional[InspectionPosePlanner] = None) -> None:
         self._inspection_pose_planner = inspection_pose_planner or InspectionPosePlanner()
 
-    def build(self, snapshot: Optional[MapSnapshot]) -> SemanticMapBuildResult:
+    def build(
+        self,
+        snapshot: Optional[MapSnapshot],
+        *,
+        map_name: Optional[str] = None,
+        identity_resolver: Optional[MapIdentityResolver] = None,
+    ) -> SemanticMapBuildResult:
+        resolved_map_name = str(map_name or "").strip() or None
         if snapshot is None:
             return SemanticMapBuildResult(
-                map_version_id=None,
-                frame_id="map",
+                map_name=resolved_map_name,
+                frame_id=DEFAULT_MAP_FRAME,
                 semantic_regions=(),
                 scene_spaces=(),
                 anchors_by_id={},
                 topology_nodes_by_id={},
             )
 
+        # This local resolver also memoizes injected callbacks: a repeated key
+        # must have one identity throughout a build, including concurrent builds.
+        identities = {}
+        def resolve_identity(entity_kind, source_kind, source_key):
+            key = (entity_kind, source_kind, source_key)
+            if key not in identities:
+                if identity_resolver is not None:
+                    identities[key] = identity_resolver(*key)
+                else:
+                    factory = build_anchor_id if entity_kind == "anchor" else build_scene_space_id
+                    identities[key] = factory(source_kind, suffix=uuid.uuid4().hex)
+            return identities[key]
+
         frame_id = self._resolve_frame_id(snapshot)
-        topology_nodes_by_id = self._extract_topology_nodes(snapshot.metadata, frame_id=frame_id)
+        topology_nodes_by_id = self._extract_topology_nodes(snapshot.metadata, frame_id=frame_id,
+                                                           identity_resolver=resolve_identity)
         anchors_by_id: Dict[str, SpatialAnchor] = {}
         semantic_regions: List[SemanticRegion] = []
 
@@ -59,14 +82,17 @@ class SemanticMapBuilder:
                 self._build_from_semantic_map(
                     snapshot.semantic_map,
                     snapshot=snapshot,
+                    map_name=resolved_map_name,
                     topology_nodes_by_id=topology_nodes_by_id,
                     anchors_by_id=anchors_by_id,
+                    identity_resolver=resolve_identity,
                 )
             )
         else:
             semantic_regions.extend(
                 self._build_coarse_regions_from_topology(
                     snapshot=snapshot,
+                    map_name=resolved_map_name,
                     topology_nodes_by_id=topology_nodes_by_id,
                     anchors_by_id=anchors_by_id,
                     frame_id=frame_id,
@@ -91,7 +117,7 @@ class SemanticMapBuilder:
                 anchor_kind=SpatialAnchorKind.TOPOLOGY_NODE,
                 name=label,
                 pose=node_pose,
-                map_version_id=snapshot.version_id,
+                map_name=resolved_map_name,
                 topo_node_id=node_id,
                 semantic_labels=self._normalize_labels(
                     [label, *(node.get("aliases") or []), *(node.get("labels") or [])]
@@ -106,13 +132,15 @@ class SemanticMapBuilder:
         scene_spaces = self._build_scene_spaces(
             semantic_regions=semantic_regions,
             snapshot=snapshot,
+            map_name=resolved_map_name,
             topology_nodes_by_id=topology_nodes_by_id,
             anchors_by_id=anchors_by_id,
             frame_id=frame_id,
+            identity_resolver=resolve_identity,
         )
 
         return SemanticMapBuildResult(
-            map_version_id=snapshot.version_id,
+            map_name=resolved_map_name,
             frame_id=frame_id,
             semantic_regions=tuple(semantic_regions),
             scene_spaces=tuple(scene_spaces),
@@ -125,13 +153,15 @@ class SemanticMapBuilder:
         semantic_map: SemanticMap,
         *,
         snapshot: MapSnapshot,
+        map_name: Optional[str],
         topology_nodes_by_id: Dict[str, Dict[str, object]],
         anchors_by_id: Dict[str, SpatialAnchor],
+        identity_resolver: MapIdentityResolver,
     ) -> List[SemanticRegion]:
         regions: List[SemanticRegion] = []
         for region in semantic_map.regions:
             region_id = region.region_id
-            anchor_id = self._stable_anchor_id("region", region_id)
+            anchor_id = identity_resolver("anchor", "region", region_id)
             aliases = self._extract_aliases(region.attributes)
             topo_node_ids = self._resolve_region_topology_nodes(region, topology_nodes_by_id)
             centroid = region.centroid
@@ -152,7 +182,7 @@ class SemanticMapBuilder:
             semantic_region = SemanticRegion(
                 region_id=region_id,
                 anchor_id=anchor_id,
-                map_version_id=snapshot.version_id,
+                map_name=map_name,
                 frame_id=semantic_map.frame_id,
                 label=region.label,
                 aliases=aliases,
@@ -170,7 +200,7 @@ class SemanticMapBuilder:
                 anchor_kind=SpatialAnchorKind.SEMANTIC_REGION,
                 name=region.label,
                 pose=centroid,
-                map_version_id=snapshot.version_id,
+                map_name=map_name,
                 topo_node_id=topo_node_ids[0] if topo_node_ids else None,
                 semantic_region_id=region_id,
                 semantic_labels=self._normalize_labels([region.label, *aliases]),
@@ -183,6 +213,7 @@ class SemanticMapBuilder:
         self,
         *,
         snapshot: MapSnapshot,
+        map_name: Optional[str],
         topology_nodes_by_id: Dict[str, Dict[str, object]],
         anchors_by_id: Dict[str, SpatialAnchor],
         frame_id: str,
@@ -202,12 +233,12 @@ class SemanticMapBuilder:
                 occupancy_grid=snapshot.occupancy_grid,
                 cost_map=snapshot.cost_map,
             )
-            region_id = "coarse_%s" % node_id
+            region_id = f"coarse_{node_id}"
             regions.append(
                 SemanticRegion(
                     region_id=region_id,
                     anchor_id=anchor_id,
-                    map_version_id=snapshot.version_id,
+                    map_name=map_name,
                     frame_id=frame_id,
                     label=label,
                     aliases=aliases,
@@ -223,7 +254,7 @@ class SemanticMapBuilder:
                 anchor_kind=SpatialAnchorKind.SEMANTIC_REGION,
                 name=label,
                 pose=node_pose,
-                map_version_id=snapshot.version_id,
+                map_name=map_name,
                 topo_node_id=node_id,
                 semantic_region_id=region_id,
                 semantic_labels=self._normalize_labels([label, *aliases]),
@@ -237,9 +268,11 @@ class SemanticMapBuilder:
         *,
         semantic_regions: List[SemanticRegion],
         snapshot: MapSnapshot,
+        map_name: Optional[str],
         topology_nodes_by_id: Dict[str, Dict[str, object]],
         anchors_by_id: Dict[str, SpatialAnchor],
         frame_id: str,
+        identity_resolver: MapIdentityResolver,
     ) -> List[SceneSpace]:
         scene_spaces: List[SceneSpace] = []
         seen_ids = set()
@@ -249,8 +282,10 @@ class SemanticMapBuilder:
             scene_space = self._scene_space_from_region(
                 region,
                 snapshot=snapshot,
+                map_name=map_name,
                 topology_nodes_by_id=topology_nodes_by_id,
                 anchors_by_id=anchors_by_id,
+                identity_resolver=identity_resolver,
             )
             if scene_space.scene_space_id in seen_ids:
                 continue
@@ -273,7 +308,9 @@ class SemanticMapBuilder:
                 node,
                 node_pose=node_pose,
                 snapshot=snapshot,
+                map_name=map_name,
                 anchors_by_id=anchors_by_id,
+                identity_resolver=identity_resolver,
             )
             if scene_space.scene_space_id in seen_ids:
                 continue
@@ -286,8 +323,10 @@ class SemanticMapBuilder:
         region: SemanticRegion,
         *,
         snapshot: MapSnapshot,
+        map_name: Optional[str],
         topology_nodes_by_id: Dict[str, Dict[str, object]],
         anchors_by_id: Dict[str, SpatialAnchor],
+        identity_resolver: MapIdentityResolver,
     ) -> SceneSpace:
         boundary = self._boundary_from_points(
             frame_id=region.frame_id,
@@ -317,8 +356,8 @@ class SemanticMapBuilder:
             else []
         )
         return SceneSpace(
-            scene_space_id=self._stable_scene_space_id("region", region.region_id),
-            map_version_id=snapshot.version_id,
+            scene_space_id=identity_resolver("scene", "region", region.region_id),
+            map_name=map_name,
             frame_id=region.frame_id,
             boundary=boundary,
             entry_poses=entry_poses,
@@ -350,7 +389,9 @@ class SemanticMapBuilder:
         *,
         node_pose: Pose,
         snapshot: MapSnapshot,
+        map_name: Optional[str],
         anchors_by_id: Dict[str, SpatialAnchor],
+        identity_resolver: MapIdentityResolver,
     ) -> SceneSpace:
         label = str(node.get("label") or node.get("name") or node_id).strip()
         aliases = self._normalize_labels([*(node.get("aliases") or []), *(node.get("labels") or [])])
@@ -374,8 +415,8 @@ class SemanticMapBuilder:
             snapshot=snapshot,
         )
         return SceneSpace(
-            scene_space_id=self._stable_scene_space_id("topo", node_id),
-            map_version_id=snapshot.version_id,
+            scene_space_id=identity_resolver("scene", "topo", node_id),
+            map_name=map_name,
             frame_id=node_pose.frame_id,
             boundary=boundary,
             entry_poses=entry_poses,
@@ -531,7 +572,8 @@ class SemanticMapBuilder:
             )
         return sources
 
-    def _extract_topology_nodes(self, metadata: Dict[str, object], *, frame_id: str) -> Dict[str, Dict[str, object]]:
+    def _extract_topology_nodes(self, metadata: Dict[str, object], *, frame_id: str,
+                                identity_resolver: MapIdentityResolver) -> Dict[str, Dict[str, object]]:
         raw_nodes = metadata.get("topology_nodes")
         if not isinstance(raw_nodes, list):
             return {}
@@ -544,7 +586,7 @@ class SemanticMapBuilder:
                 continue
             result[node_id] = {
                 **item,
-                "anchor_id": str(item.get("anchor_id") or self._stable_anchor_id("topo", node_id)),
+                "anchor_id": str(item.get("anchor_id") or identity_resolver("anchor", "topo", node_id)),
                 "frame_id": str(item.get("frame_id") or frame_id),
             }
         return result
@@ -597,13 +639,15 @@ class SemanticMapBuilder:
         )
 
     def _resolve_frame_id(self, snapshot: MapSnapshot) -> str:
+        if snapshot.frame_id:
+            return snapshot.frame_id
         if snapshot.semantic_map is not None:
             return snapshot.semantic_map.frame_id
         if snapshot.occupancy_grid is not None:
             return snapshot.occupancy_grid.frame_id
         if snapshot.cost_map is not None:
             return snapshot.cost_map.frame_id
-        return "map"
+        return DEFAULT_MAP_FRAME
 
     def _extract_aliases(self, attributes: Dict[str, object]) -> List[str]:
         aliases: List[str] = []
@@ -631,20 +675,12 @@ class SemanticMapBuilder:
                 result.append(normalized)
         return result
 
-    def _stable_scene_space_id(self, kind: str, source_key: str) -> str:
-        digest = hashlib.blake2b(str(source_key).encode("utf-8"), digest_size=4).hexdigest()
-        return "ssp_%s_19700101T000000Z_%s" % (kind, digest)
-
     def _coerce_positive_float(self, value: object) -> Optional[float]:
         try:
             number = float(value)
         except (TypeError, ValueError):
             return None
         return number if number > 0.0 else None
-
-    def _stable_anchor_id(self, kind: str, source_key: str) -> str:
-        digest = hashlib.blake2b(str(source_key).encode("utf-8"), digest_size=4).hexdigest()
-        return "anc_%s_19700101T000000Z_%s" % (kind, digest)
 
     def _distance(self, left: Pose, right: Pose) -> float:
         delta_x = float(left.position.x) - float(right.position.x)

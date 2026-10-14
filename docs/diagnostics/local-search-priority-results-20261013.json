@@ -1,0 +1,694 @@
+[
+  {
+    "case": "static_a",
+    "closest": [
+      [
+        0.6000000000000001,
+        1.0,
+        0.5
+      ],
+      [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    ],
+    "failure": "BudgetExhausted",
+    "mode": "baseline",
+    "path_samples": null,
+    "success": false,
+    "work": {
+      "expanded": 256,
+      "frontier_peak": 384,
+      "nodes": 642
+    }
+  },
+  {
+    "case": "static_a",
+    "closest": [
+      [
+        0.6000000000000001,
+        1.0,
+        0.5
+      ],
+      [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    ],
+    "failure": "BudgetExhausted",
+    "mode": "relaxed",
+    "path_samples": null,
+    "success": false,
+    "work": {
+      "expanded": 256,
+      "frontier_peak": 565,
+      "nodes": 808
+    }
+  },
+  {
+    "case": "static_a",
+    "closest": [
+      [
+        0.6000000000000001,
+        1.0,
+        0.5
+      ],
+      [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    ],
+    "failure": "BudgetExhausted",
+    "mode": "weighted_relaxed",
+    "path_samples": null,
+    "success": false,
+    "work": {
+      "expanded": 256,
+      "frontier_peak": 464,
+      "nodes": 720
+    }
+  },
+  {
+    "case": "static_a",
+    "closest": null,
+    "failure": null,
+    "mode": "oracle",
+    "path_samples": 140,
+    "success": true,
+    "work": {
+      "expanded": 6,
+      "frontier_peak": 50,
+      "nodes": 56
+    }
+  },
+  {
+    "case": "shift_upper",
+    "closest": [
+      [
+        0.6000000000000001,
+        1.0,
+        0.5
+      ],
+      [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    ],
+    "failure": "BudgetExhausted",
+    "mode": "baseline",
+    "path_samples": null,
+    "success": false,
+    "work": {
+      "expanded": 256,
+      "frontier_peak": 384,
+      "nodes": 642
+    }
+  },
+  {
+    "case": "shift_upper",
+    "closest": [
+      [
+        0.6000000000000001,
+        1.0,
+        0.5
+      ],
+      [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    ],
+    "failure": "BudgetExhausted",
+    "mode": "relaxed",
+    "path_samples": null,
+    "success": false,
+    "work": {
+      "expanded": 256,
+      "frontier_peak": 565,
+      "nodes": 808
+    }
+  },
+  {
+    "case": "shift_upper",
+    "closest": [
+      [
+        0.6000000000000001,
+        1.0,
+        0.5
+      ],
+      [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    ],
+    "failure": "BudgetExhausted",
+    "mode": "weighted_relaxed",
+    "path_samples": null,
+    "success": false,
+    "work": {
+      "expanded": 256,
+      "frontier_peak": 464,
+      "nodes": 720
+    }
+  },
+  {
+    "case": "shift_upper",
+    "closest": null,
+    "failure": null,
+    "mode": "oracle",
+    "path_samples": 140,
+    "success": true,
+    "work": {
+      "expanded": 6,
+      "frontier_peak": 52,
+      "nodes": 58
+    }
+  },
+  {
+    "case": "shift_lower",
+    "closest": [
+      [
+        0.6000000000000001,
+        1.0,
+        0.5
+      ],
+      [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    ],
+    "failure": "BudgetExhausted",
+    "mode": "baseline",
+    "path_samples": null,
+    "success": false,
+    "work": {
+      "expanded": 256,
+      "frontier_peak": 384,
+      "nodes": 642
+    }
+  },
+  {
+    "case": "shift_lower",
+    "closest": [
+      [
+        0.6000000000000001,
+        1.0,
+        0.5
+      ],
+      [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    ],
+    "failure": "BudgetExhausted",
+    "mode": "relaxed",
+    "path_samples": null,
+    "success": false,
+    "work": {
+      "expanded": 256,
+      "frontier_peak": 565,
+      "nodes": 808
+    }
+  },
+  {
+    "case": "shift_lower",
+    "closest": [
+      [
+        0.6000000000000001,
+        1.0,
+        0.5
+      ],
+      [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    ],
+    "failure": "BudgetExhausted",
+    "mode": "weighted_relaxed",
+    "path_samples": null,
+    "success": false,
+    "work": {
+      "expanded": 256,
+      "frontier_peak": 464,
+      "nodes": 720
+    }
+  },
+  {
+    "case": "shift_lower",
+    "closest": null,
+    "failure": null,
+    "mode": "oracle",
+    "path_samples": 149,
+    "success": true,
+    "work": {
+      "expanded": 4,
+      "frontier_peak": 28,
+      "nodes": 32
+    }
+  },
+  {
+    "case": "reversed",
+    "closest": [
+      [
+        0.599825811935555,
+        0.9993407283303589,
+        0.5
+      ],
+      [
+        -0.0,
+        0.0,
+        -0.0007963267107337781,
+        0.9999996829318346
+      ]
+    ],
+    "failure": "BudgetExhausted",
+    "mode": "baseline",
+    "path_samples": null,
+    "success": false,
+    "work": {
+      "expanded": 256,
+      "frontier_peak": 470,
+      "nodes": 728
+    }
+  },
+  {
+    "case": "reversed",
+    "closest": [
+      [
+        0.5,
+        1.0,
+        0.5
+      ],
+      [
+        0.0,
+        0.0,
+        1.0,
+        6.123233995736766e-17
+      ]
+    ],
+    "failure": "BudgetExhausted",
+    "mode": "relaxed",
+    "path_samples": null,
+    "success": false,
+    "work": {
+      "expanded": 256,
+      "frontier_peak": 2876,
+      "nodes": 3132
+    }
+  },
+  {
+    "case": "reversed",
+    "closest": [
+      [
+        0.5,
+        1.0,
+        0.5
+      ],
+      [
+        0.0,
+        0.0,
+        1.0,
+        6.123233995736766e-17
+      ]
+    ],
+    "failure": "BudgetExhausted",
+    "mode": "weighted_relaxed",
+    "path_samples": null,
+    "success": false,
+    "work": {
+      "expanded": 256,
+      "frontier_peak": 2665,
+      "nodes": 2921
+    }
+  },
+  {
+    "case": "reversed",
+    "closest": null,
+    "failure": null,
+    "mode": "oracle",
+    "path_samples": 192,
+    "success": true,
+    "work": {
+      "expanded": 5,
+      "frontier_peak": 63,
+      "nodes": 68
+    }
+  },
+  {
+    "case": "farther_wall",
+    "closest": [
+      [
+        0.9000000000000001,
+        1.0,
+        0.5
+      ],
+      [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    ],
+    "failure": "BudgetExhausted",
+    "mode": "baseline",
+    "path_samples": null,
+    "success": false,
+    "work": {
+      "expanded": 256,
+      "frontier_peak": 489,
+      "nodes": 745
+    }
+  },
+  {
+    "case": "farther_wall",
+    "closest": [
+      [
+        0.9000000000000001,
+        1.0,
+        0.5
+      ],
+      [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    ],
+    "failure": "BudgetExhausted",
+    "mode": "relaxed",
+    "path_samples": null,
+    "success": false,
+    "work": {
+      "expanded": 256,
+      "frontier_peak": 2099,
+      "nodes": 2357
+    }
+  },
+  {
+    "case": "farther_wall",
+    "closest": [
+      [
+        0.9000000000000001,
+        1.0,
+        0.5
+      ],
+      [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    ],
+    "failure": "BudgetExhausted",
+    "mode": "weighted_relaxed",
+    "path_samples": null,
+    "success": false,
+    "work": {
+      "expanded": 256,
+      "frontier_peak": 562,
+      "nodes": 818
+    }
+  },
+  {
+    "case": "farther_wall",
+    "closest": null,
+    "failure": null,
+    "mode": "oracle",
+    "path_samples": 127,
+    "success": true,
+    "work": {
+      "expanded": 3,
+      "frontier_peak": 39,
+      "nodes": 42
+    }
+  },
+  {
+    "case": "clear",
+    "closest": null,
+    "failure": null,
+    "mode": "baseline",
+    "path_samples": 88,
+    "success": true,
+    "work": {
+      "expanded": 0,
+      "frontier_peak": 1,
+      "nodes": 1
+    }
+  },
+  {
+    "case": "clear",
+    "closest": null,
+    "failure": null,
+    "mode": "relaxed",
+    "path_samples": 88,
+    "success": true,
+    "work": {
+      "expanded": 0,
+      "frontier_peak": 1,
+      "nodes": 1
+    }
+  },
+  {
+    "case": "clear",
+    "closest": null,
+    "failure": null,
+    "mode": "weighted_relaxed",
+    "path_samples": 88,
+    "success": true,
+    "work": {
+      "expanded": 0,
+      "frontier_peak": 1,
+      "nodes": 1
+    }
+  },
+  {
+    "case": "clear",
+    "closest": null,
+    "failure": null,
+    "mode": "oracle",
+    "path_samples": 88,
+    "success": true,
+    "work": {
+      "expanded": 0,
+      "frontier_peak": 1,
+      "nodes": 1
+    }
+  },
+  {
+    "case": "unreachable_height",
+    "closest": [
+      [
+        3.0,
+        1.0,
+        0.5
+      ],
+      [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    ],
+    "failure": "BudgetExhausted",
+    "mode": "baseline",
+    "path_samples": null,
+    "success": false,
+    "work": {
+      "expanded": 256,
+      "frontier_peak": 2163,
+      "nodes": 2419
+    }
+  },
+  {
+    "case": "unreachable_height",
+    "closest": [
+      [
+        0.9500000000000002,
+        1.0,
+        0.5
+      ],
+      [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    ],
+    "failure": "BudgetExhausted",
+    "mode": "relaxed",
+    "path_samples": null,
+    "success": false,
+    "work": {
+      "expanded": 256,
+      "frontier_peak": 3260,
+      "nodes": 3518
+    }
+  },
+  {
+    "case": "unreachable_height",
+    "closest": [
+      [
+        2.8499999999999996,
+        1.0,
+        0.5
+      ],
+      [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    ],
+    "failure": "BudgetExhausted",
+    "mode": "weighted_relaxed",
+    "path_samples": null,
+    "success": false,
+    "work": {
+      "expanded": 256,
+      "frontier_peak": 3070,
+      "nodes": 3328
+    }
+  },
+  {
+    "case": "unreachable_height",
+    "closest": [
+      [
+        3.0,
+        1.0,
+        0.5
+      ],
+      [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    ],
+    "failure": "BudgetExhausted",
+    "mode": "oracle",
+    "path_samples": null,
+    "success": false,
+    "work": {
+      "expanded": 256,
+      "frontier_peak": 2163,
+      "nodes": 2419
+    }
+  },
+  {
+    "case": "excluded_boundary",
+    "closest": [
+      [
+        0.5,
+        1.0,
+        0.5
+      ],
+      [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    ],
+    "failure": "SearchExhausted",
+    "mode": "baseline",
+    "path_samples": null,
+    "success": false,
+    "work": {
+      "expanded": 1,
+      "frontier_peak": 1,
+      "nodes": 1
+    }
+  },
+  {
+    "case": "excluded_boundary",
+    "closest": [
+      [
+        0.5,
+        1.0,
+        0.5
+      ],
+      [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    ],
+    "failure": "SearchExhausted",
+    "mode": "relaxed",
+    "path_samples": null,
+    "success": false,
+    "work": {
+      "expanded": 1,
+      "frontier_peak": 1,
+      "nodes": 1
+    }
+  },
+  {
+    "case": "excluded_boundary",
+    "closest": [
+      [
+        0.5,
+        1.0,
+        0.5
+      ],
+      [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    ],
+    "failure": "SearchExhausted",
+    "mode": "weighted_relaxed",
+    "path_samples": null,
+    "success": false,
+    "work": {
+      "expanded": 1,
+      "frontier_peak": 1,
+      "nodes": 1
+    }
+  },
+  {
+    "case": "excluded_boundary",
+    "closest": [
+      [
+        0.5,
+        1.0,
+        0.5
+      ],
+      [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    ],
+    "failure": "SearchExhausted",
+    "mode": "oracle",
+    "path_samples": null,
+    "success": false,
+    "work": {
+      "expanded": 1,
+      "frontier_peak": 1,
+      "nodes": 1
+    }
+  }
+]

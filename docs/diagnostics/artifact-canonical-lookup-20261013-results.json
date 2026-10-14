@@ -1,0 +1,478 @@
+{
+  "python": "3.8.10 (default, Oct 13 2026, 08:57:26) \n[GCC 14.2.0]",
+  "candidate_is_test_only": true,
+  "scope": "Same-fixture alternating implementation order; distinct IDs per timed call; warm OS cache; fresh per-flow lookup caches unless already_indexed. Raw response construction excludes HTTP transfer. Separate untimed operation counts.",
+  "results": [
+    {
+      "artifact_count": 100,
+      "rows": [
+        {
+          "flow": "metadata_only",
+          "already_indexed": false,
+          "implementations": {
+            "baseline": {
+              "samples_ms": [
+                0.337139,
+                0.162776,
+                0.164599,
+                0.155895,
+                0.184388,
+                0.169786,
+                0.163397
+              ],
+              "median_ms": 0.164599,
+              "scandir_calls": 2,
+              "directory_entries_visited": 201,
+              "sidecars_parsed": 1,
+              "remaining_holders": 0
+            },
+            "candidate": {
+              "samples_ms": [
+                0.077507,
+                0.062064,
+                0.060331,
+                0.055313,
+                0.062304,
+                0.115395,
+                0.057998
+              ],
+              "median_ms": 0.062064,
+              "scandir_calls": 0,
+              "directory_entries_visited": 0,
+              "sidecars_parsed": 1,
+              "remaining_holders": 0
+            }
+          }
+        },
+        {
+          "flow": "metadata_only",
+          "already_indexed": true,
+          "implementations": {
+            "baseline": {
+              "samples_ms": [
+                0.056866,
+                0.029305,
+                0.027631,
+                0.027963,
+                0.028203,
+                0.026049,
+                0.02703
+              ],
+              "median_ms": 0.027963,
+              "scandir_calls": 0,
+              "directory_entries_visited": 0,
+              "sidecars_parsed": 0,
+              "remaining_holders": 0
+            },
+            "candidate": {
+              "samples_ms": [
+                0.035684,
+                0.03313,
+                0.027451,
+                0.028032,
+                0.026861,
+                0.02697,
+                0.026359
+              ],
+              "median_ms": 0.027451,
+              "scandir_calls": 0,
+              "directory_entries_visited": 0,
+              "sidecars_parsed": 0,
+              "remaining_holders": 0
+            }
+          }
+        },
+        {
+          "flow": "client_metadata_then_raw",
+          "already_indexed": false,
+          "implementations": {
+            "baseline": {
+              "samples_ms": [
+                0.870243,
+                0.399634,
+                0.538032,
+                0.431922,
+                0.49677,
+                0.385682,
+                0.532123
+              ],
+              "median_ms": 0.49677,
+              "scandir_calls": 7,
+              "directory_entries_visited": 604,
+              "sidecars_parsed": 1,
+              "remaining_holders": 0
+            },
+            "candidate": {
+              "samples_ms": [
+                0.287093,
+                0.421776,
+                0.249036,
+                0.560026,
+                0.289136,
+                0.401866,
+                0.237729
+              ],
+              "median_ms": 0.289136,
+              "scandir_calls": 3,
+              "directory_entries_visited": 202,
+              "sidecars_parsed": 1,
+              "remaining_holders": 0
+            }
+          }
+        },
+        {
+          "flow": "client_metadata_then_raw",
+          "already_indexed": true,
+          "implementations": {
+            "baseline": {
+              "samples_ms": [
+                0.18534,
+                0.110317,
+                0.203036,
+                0.105039,
+                0.100742,
+                0.098388,
+                0.099961
+              ],
+              "median_ms": 0.105039,
+              "scandir_calls": 0,
+              "directory_entries_visited": 0,
+              "sidecars_parsed": 0,
+              "remaining_holders": 0
+            },
+            "candidate": {
+              "samples_ms": [
+                0.128765,
+                0.114783,
+                0.133442,
+                0.107442,
+                0.100773,
+                0.102595,
+                0.152691
+              ],
+              "median_ms": 0.114783,
+              "scandir_calls": 0,
+              "directory_entries_visited": 0,
+              "sidecars_parsed": 0,
+              "remaining_holders": 0
+            }
+          }
+        }
+      ]
+    },
+    {
+      "artifact_count": 1000,
+      "rows": [
+        {
+          "flow": "metadata_only",
+          "already_indexed": false,
+          "implementations": {
+            "baseline": {
+              "samples_ms": [
+                2.34463,
+                0.949915,
+                0.792656,
+                0.764103,
+                0.775311,
+                0.802191,
+                0.752126
+              ],
+              "median_ms": 0.792656,
+              "scandir_calls": 2,
+              "directory_entries_visited": 2001,
+              "sidecars_parsed": 1,
+              "remaining_holders": 0
+            },
+            "candidate": {
+              "samples_ms": [
+                0.097196,
+                0.065119,
+                0.071618,
+                0.059229,
+                0.332091,
+                0.091799,
+                0.067032
+              ],
+              "median_ms": 0.071618,
+              "scandir_calls": 0,
+              "directory_entries_visited": 0,
+              "sidecars_parsed": 1,
+              "remaining_holders": 0
+            }
+          }
+        },
+        {
+          "flow": "metadata_only",
+          "already_indexed": true,
+          "implementations": {
+            "baseline": {
+              "samples_ms": [
+                0.130907,
+                0.033601,
+                0.032469,
+                0.027672,
+                0.028363,
+                0.029124,
+                0.030706
+              ],
+              "median_ms": 0.030706,
+              "scandir_calls": 0,
+              "directory_entries_visited": 0,
+              "sidecars_parsed": 0,
+              "remaining_holders": 0
+            },
+            "candidate": {
+              "samples_ms": [
+                0.043335,
+                0.051828,
+                0.030075,
+                0.029665,
+                0.027201,
+                0.028443,
+                0.02664
+              ],
+              "median_ms": 0.029665,
+              "scandir_calls": 0,
+              "directory_entries_visited": 0,
+              "sidecars_parsed": 0,
+              "remaining_holders": 0
+            }
+          }
+        },
+        {
+          "flow": "client_metadata_then_raw",
+          "already_indexed": false,
+          "implementations": {
+            "baseline": {
+              "samples_ms": [
+                3.347132,
+                2.00021,
+                5.214862,
+                2.282065,
+                2.144227,
+                1.994652,
+                2.538121
+              ],
+              "median_ms": 2.282065,
+              "scandir_calls": 7,
+              "directory_entries_visited": 6004,
+              "sidecars_parsed": 1,
+              "remaining_holders": 0
+            },
+            "candidate": {
+              "samples_ms": [
+                1.018798,
+                0.994742,
+                0.934741,
+                1.02653,
+                0.713507,
+                0.84156,
+                0.780618
+              ],
+              "median_ms": 0.934741,
+              "scandir_calls": 3,
+              "directory_entries_visited": 2002,
+              "sidecars_parsed": 1,
+              "remaining_holders": 0
+            }
+          }
+        },
+        {
+          "flow": "client_metadata_then_raw",
+          "already_indexed": true,
+          "implementations": {
+            "baseline": {
+              "samples_ms": [
+                0.367625,
+                0.153422,
+                0.121544,
+                0.108233,
+                0.109215,
+                0.14574,
+                0.111859
+              ],
+              "median_ms": 0.121544,
+              "scandir_calls": 0,
+              "directory_entries_visited": 0,
+              "sidecars_parsed": 0,
+              "remaining_holders": 0
+            },
+            "candidate": {
+              "samples_ms": [
+                0.173451,
+                0.122956,
+                0.210097,
+                0.11904,
+                0.109856,
+                0.106721,
+                0.104978
+              ],
+              "median_ms": 0.11904,
+              "scandir_calls": 0,
+              "directory_entries_visited": 0,
+              "sidecars_parsed": 0,
+              "remaining_holders": 0
+            }
+          }
+        }
+      ]
+    },
+    {
+      "artifact_count": 10000,
+      "rows": [
+        {
+          "flow": "metadata_only",
+          "already_indexed": false,
+          "implementations": {
+            "baseline": {
+              "samples_ms": [
+                13.544987,
+                12.4138,
+                13.175389,
+                13.296732,
+                22.604499,
+                13.483875,
+                12.647262
+              ],
+              "median_ms": 13.296732,
+              "scandir_calls": 2,
+              "directory_entries_visited": 20001,
+              "sidecars_parsed": 1,
+              "remaining_holders": 0
+            },
+            "candidate": {
+              "samples_ms": [
+                0.119681,
+                0.0668,
+                0.130527,
+                0.070937,
+                0.262176,
+                0.087162,
+                0.126721
+              ],
+              "median_ms": 0.119681,
+              "scandir_calls": 0,
+              "directory_entries_visited": 0,
+              "sidecars_parsed": 1,
+              "remaining_holders": 0
+            }
+          }
+        },
+        {
+          "flow": "metadata_only",
+          "already_indexed": true,
+          "implementations": {
+            "baseline": {
+              "samples_ms": [
+                0.27164,
+                0.035664,
+                0.037607,
+                0.031157,
+                0.034162,
+                0.031016,
+                0.033551
+              ],
+              "median_ms": 0.034162,
+              "scandir_calls": 0,
+              "directory_entries_visited": 0,
+              "sidecars_parsed": 0,
+              "remaining_holders": 0
+            },
+            "candidate": {
+              "samples_ms": [
+                0.051598,
+                0.03969,
+                0.031278,
+                0.033771,
+                0.031017,
+                0.036034,
+                0.030736
+              ],
+              "median_ms": 0.033771,
+              "scandir_calls": 0,
+              "directory_entries_visited": 0,
+              "sidecars_parsed": 0,
+              "remaining_holders": 0
+            }
+          }
+        },
+        {
+          "flow": "client_metadata_then_raw",
+          "already_indexed": false,
+          "implementations": {
+            "baseline": {
+              "samples_ms": [
+                33.76378,
+                29.800387,
+                33.922139,
+                39.591106,
+                30.821208,
+                43.419812,
+                41.528962
+              ],
+              "median_ms": 33.922139,
+              "scandir_calls": 7,
+              "directory_entries_visited": 60004,
+              "sidecars_parsed": 1,
+              "remaining_holders": 0
+            },
+            "candidate": {
+              "samples_ms": [
+                10.109981,
+                11.087007,
+                11.464286,
+                12.629967,
+                8.335743,
+                8.397988,
+                11.438929
+              ],
+              "median_ms": 11.087007,
+              "scandir_calls": 3,
+              "directory_entries_visited": 20002,
+              "sidecars_parsed": 1,
+              "remaining_holders": 0
+            }
+          }
+        },
+        {
+          "flow": "client_metadata_then_raw",
+          "already_indexed": true,
+          "implementations": {
+            "baseline": {
+              "samples_ms": [
+                0.519274,
+                0.235886,
+                0.128304,
+                0.23859,
+                0.127282,
+                0.11258,
+                0.11276
+              ],
+              "median_ms": 0.128304,
+              "scandir_calls": 0,
+              "directory_entries_visited": 0,
+              "sidecars_parsed": 0,
+              "remaining_holders": 0
+            },
+            "candidate": {
+              "samples_ms": [
+                0.153201,
+                0.132,
+                0.153462,
+                0.11928,
+                0.114453,
+                0.114523,
+                0.107262
+              ],
+              "median_ms": 0.11928,
+              "scandir_calls": 0,
+              "directory_entries_visited": 0,
+              "sidecars_parsed": 0,
+              "remaining_holders": 0
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

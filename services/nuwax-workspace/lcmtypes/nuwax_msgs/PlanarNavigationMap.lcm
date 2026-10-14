@@ -1,0 +1,19 @@
+package nuwax_msgs;
+
+// 规范地图与本次新鲜扫描合成的二维导航观测；不会成为规范地图写入端。
+struct PlanarNavigationMap {
+    int32_t schema_version;
+    int64_t runtime_generation;
+    string session_id;
+    int64_t session_generation;
+    int64_t map_frame_generation;
+    int64_t map_revision;
+    byte map_boot_nonce[16];
+    int64_t map_commit_sequence;
+    int64_t map_source_timestamp_ns;
+    int64_t observation_revision;
+    int64_t source_sequence;
+    int64_t source_timestamp_ns;
+    int8_t cleared;
+    nav_msgs.OccupancyGrid grid;
+}

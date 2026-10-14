@@ -1,0 +1,36 @@
+package nuwax_msgs;
+
+struct GoalEnvelope {
+    int32_t schema_version;
+    string session_id;
+    int32_t owner_kind;
+    string parent_request_id;
+    int64_t goal_generation;
+    string producer;
+    int64_t producer_epoch;
+    int64_t producer_runtime_generation;
+    string committed_map_session_id;
+    int64_t committed_map_session_generation;
+    int64_t committed_map_revision;
+    byte committed_map_boot_nonce[16];
+    int64_t committed_map_commit_sequence;
+    int64_t committed_map_source_timestamp_ns;
+    string committed_map_frame_id;
+    int64_t source_timestamp_ns;
+    string boundary_id;
+    string boundary_frame_id;
+    int32_t boundary_points_length;
+    geometry_msgs.Point boundary_points[boundary_points_length];
+    int64_t motion_guard_generation;
+    byte motion_guard_boot_nonce[16];
+    int64_t motion_stop_generation;
+    int8_t allow_reverse;
+    double position_tolerance_m;
+    double yaw_tolerance_rad;
+    string body_reference_frame_id;
+    int8_t has_body_to_support_z;
+    double body_to_support_z_m;
+    // 目标产生时的规范地图坐标代际。
+    int64_t map_frame_generation;
+    geometry_msgs.PoseStamped goal;
+}

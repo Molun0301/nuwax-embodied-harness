@@ -1,0 +1,22 @@
+[package]
+name = "nuwax-nav-patrolling"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "巡逻路由：random / coverage / frontier。完整 wavefront frontier 算法归 nuwax-explore-wavefront"
+
+[dependencies]
+# Foundation 共享类型 — 接入后允许跨 crate 共享 FrontierGoal / PoseStamped / OccupancyGrid2D
+nuwax-nav-types-messages = { path = "../nuwax-nav-types-messages" }
+nuwax-nav-base = { path = "../nuwax-nav-base" }
+
+nuwax-numeric = { path = "../nuwax-numeric" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+rand = "0.8"
+tokio = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }

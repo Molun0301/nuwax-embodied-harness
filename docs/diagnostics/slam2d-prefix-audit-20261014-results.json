@@ -1,0 +1,238 @@
+{
+  "date_utc": "2026-10-14",
+  "scope": "Tiny real CMake imported shared library and two-object consumer, no SDK or deployment benchmark",
+  "initial_subsecond_stages": [
+    {
+      "variant": "generation",
+      "stage": "first",
+      "objects_changed": [
+        "CMakeFiles/consumer.dir/main.cpp.o",
+        "CMakeFiles/consumer.dir/helper.cpp.o"
+      ],
+      "object_count": 2,
+      "package_cache": [
+        "TinyDep_DIR:PATH=/workspace/scratch/71cdb9d17732/slam2d-prefix-audit-20261014/generation/generations/one/lib/cmake/TinyDep"
+      ],
+      "build_succeeded": true,
+      "runtime_output": "2"
+    },
+    {
+      "variant": "generation",
+      "stage": "new-generation-old-package-present",
+      "objects_changed": [],
+      "object_count": 2,
+      "package_cache": [
+        "TinyDep_DIR:PATH=/workspace/scratch/71cdb9d17732/slam2d-prefix-audit-20261014/generation/generations/one/lib/cmake/TinyDep"
+      ],
+      "build_succeeded": true,
+      "runtime_output": "2"
+    },
+    {
+      "variant": "generation",
+      "stage": "old-package-path-unavailable",
+      "objects_changed": [
+        "CMakeFiles/consumer.dir/main.cpp.o",
+        "CMakeFiles/consumer.dir/helper.cpp.o"
+      ],
+      "object_count": 2,
+      "package_cache": [
+        "TinyDep_DIR:PATH=/workspace/scratch/71cdb9d17732/slam2d-prefix-audit-20261014/generation/generations/three/lib/cmake/TinyDep"
+      ],
+      "build_succeeded": true,
+      "runtime_output": "2"
+    },
+    {
+      "variant": "stable",
+      "stage": "first",
+      "objects_changed": [
+        "CMakeFiles/consumer.dir/main.cpp.o",
+        "CMakeFiles/consumer.dir/helper.cpp.o"
+      ],
+      "object_count": 2,
+      "package_cache": [
+        "TinyDep_DIR:PATH=/workspace/scratch/71cdb9d17732/slam2d-prefix-audit-20261014/stable/stable-install/lib/cmake/TinyDep"
+      ],
+      "build_succeeded": true,
+      "runtime_output": "2"
+    },
+    {
+      "variant": "stable",
+      "stage": "new-generation-stable-package",
+      "objects_changed": [],
+      "object_count": 2,
+      "package_cache": [
+        "TinyDep_DIR:PATH=/workspace/scratch/71cdb9d17732/slam2d-prefix-audit-20261014/stable/stable-install/lib/cmake/TinyDep"
+      ],
+      "build_succeeded": true,
+      "runtime_output": "2"
+    },
+    {
+      "variant": "stable",
+      "stage": "dependency-header-library-changed",
+      "objects_changed": [],
+      "object_count": 2,
+      "package_cache": [
+        "TinyDep_DIR:PATH=/workspace/scratch/71cdb9d17732/slam2d-prefix-audit-20261014/stable/stable-install/lib/cmake/TinyDep"
+      ],
+      "build_succeeded": true
+    }
+  ],
+  "subsecond_failure": {
+    "files": [
+      {
+        "path": "dependency/dep.hpp",
+        "mtime_ns": 1791936697413459327,
+        "content": "#define DEP_HEADER_VALUE 2\nint dep_value();\n"
+      },
+      {
+        "path": "stable-install/include/dep.hpp",
+        "mtime_ns": 1791936697000000000,
+        "content": "#define DEP_HEADER_VALUE 2\nint dep_value();\n"
+      },
+      {
+        "path": "consumer-build/CMakeFiles/consumer.dir/main.cpp.o",
+        "mtime_ns": 1791936697259770072,
+        "content": null
+      }
+    ],
+    "consumer_output": "2",
+    "old_generation_output": "2",
+    "library_values": {
+      "stable/dependency-build/libtinydep.so": {
+        "value": "2",
+        "mtime_ns": 1791936697482479341
+      },
+      "stable/stable-install/lib/libtinydep.so": {
+        "value": "1",
+        "mtime_ns": 1791936697000000000
+      },
+      "stable/generations/one/lib/libtinydep.so": {
+        "value": "1",
+        "mtime_ns": 1791936697000000000
+      }
+    }
+  },
+  "separated_timestamp_stages": [
+    {
+      "variant": "generation",
+      "stage": "first",
+      "objects_changed": [
+        "CMakeFiles/consumer.dir/main.cpp.o",
+        "CMakeFiles/consumer.dir/helper.cpp.o"
+      ],
+      "object_count": 2,
+      "package_cache": [
+        "TinyDep_DIR:PATH=/workspace/scratch/71cdb9d17732/slam2d-prefix-audit-20261014-separated/generation/generations/one/lib/cmake/TinyDep"
+      ],
+      "build_succeeded": true,
+      "runtime_output": "2"
+    },
+    {
+      "variant": "generation",
+      "stage": "new-generation-old-package-present",
+      "objects_changed": [],
+      "object_count": 2,
+      "package_cache": [
+        "TinyDep_DIR:PATH=/workspace/scratch/71cdb9d17732/slam2d-prefix-audit-20261014-separated/generation/generations/one/lib/cmake/TinyDep"
+      ],
+      "build_succeeded": true,
+      "runtime_output": "2"
+    },
+    {
+      "variant": "generation",
+      "stage": "old-package-path-unavailable",
+      "objects_changed": [
+        "CMakeFiles/consumer.dir/main.cpp.o",
+        "CMakeFiles/consumer.dir/helper.cpp.o"
+      ],
+      "object_count": 2,
+      "package_cache": [
+        "TinyDep_DIR:PATH=/workspace/scratch/71cdb9d17732/slam2d-prefix-audit-20261014-separated/generation/generations/three/lib/cmake/TinyDep"
+      ],
+      "build_succeeded": true,
+      "runtime_output": "2"
+    },
+    {
+      "variant": "stable",
+      "stage": "first",
+      "objects_changed": [
+        "CMakeFiles/consumer.dir/main.cpp.o",
+        "CMakeFiles/consumer.dir/helper.cpp.o"
+      ],
+      "object_count": 2,
+      "package_cache": [
+        "TinyDep_DIR:PATH=/workspace/scratch/71cdb9d17732/slam2d-prefix-audit-20261014-separated/stable/stable-install/lib/cmake/TinyDep"
+      ],
+      "build_succeeded": true,
+      "runtime_output": "2"
+    },
+    {
+      "variant": "stable",
+      "stage": "new-generation-stable-package",
+      "objects_changed": [],
+      "object_count": 2,
+      "package_cache": [
+        "TinyDep_DIR:PATH=/workspace/scratch/71cdb9d17732/slam2d-prefix-audit-20261014-separated/stable/stable-install/lib/cmake/TinyDep"
+      ],
+      "build_succeeded": true,
+      "runtime_output": "2"
+    },
+    {
+      "variant": "stable",
+      "stage": "dependency-header-library-changed",
+      "objects_changed": [
+        "CMakeFiles/consumer.dir/main.cpp.o"
+      ],
+      "object_count": 2,
+      "package_cache": [
+        "TinyDep_DIR:PATH=/workspace/scratch/71cdb9d17732/slam2d-prefix-audit-20261014-separated/stable/stable-install/lib/cmake/TinyDep"
+      ],
+      "build_succeeded": true,
+      "runtime_output": "4"
+    },
+    {
+      "variant": "stable",
+      "stage": "compile-failure",
+      "objects_changed": [],
+      "object_count": 2,
+      "package_cache": [
+        "TinyDep_DIR:PATH=/workspace/scratch/71cdb9d17732/slam2d-prefix-audit-20261014-separated/stable/stable-install/lib/cmake/TinyDep"
+      ],
+      "build_succeeded": false
+    },
+    {
+      "variant": "stable",
+      "stage": "repair-retry",
+      "objects_changed": [
+        "CMakeFiles/consumer.dir/main.cpp.o"
+      ],
+      "object_count": 2,
+      "package_cache": [
+        "TinyDep_DIR:PATH=/workspace/scratch/71cdb9d17732/slam2d-prefix-audit-20261014-separated/stable/stable-install/lib/cmake/TinyDep"
+      ],
+      "build_succeeded": true,
+      "runtime_output": "4"
+    }
+  ],
+  "archived_timestamp_and_source_migration": {
+    "archived_header_previous_content": "#define DEP_HEADER_VALUE 2\nint dep_value();\n",
+    "archived_header_new_content": "#define DEP_HEADER_VALUE 3\nint dep_value();\n",
+    "archived_header_mtime_ns": 1791936730372419799,
+    "stable_installed_header_mtime_ns": 1791936730000000000,
+    "objects_before": {
+      "CMakeFiles/consumer.dir/main.cpp.o": 1791936741887956359,
+      "CMakeFiles/consumer.dir/helper.cpp.o": 1791936740372419799
+    },
+    "stable_changed_objects": [],
+    "stable_runtime_output": "4",
+    "fresh_changed_objects": [
+      "CMakeFiles/consumer.dir/main.cpp.o",
+      "CMakeFiles/consumer.dir/helper.cpp.o"
+    ],
+    "fresh_runtime_output": "5",
+    "expected_new_output": "5",
+    "old_generation_runtime_output": "2",
+    "source_path_migration_exit": 1
+  },
+  "decision": "Do not introduce a stable dependency installation prefix without independent source/version invalidation proof"
+}

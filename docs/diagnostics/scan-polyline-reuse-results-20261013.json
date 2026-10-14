@@ -1,0 +1,126 @@
+{
+  "real_guide_nonarrival": [
+    {
+      "arrival": false,
+      "calls": [
+        124,
+        124,
+        67
+      ],
+      "detail": null,
+      "failure": null,
+      "fallback_entered": true,
+      "path_samples": 68,
+      "replay_original": true,
+      "success": true,
+      "work": {
+        "expanded": 1,
+        "frontier_peak": 1,
+        "nodes": 2
+      }
+    },
+    {
+      "arrival": false,
+      "calls": [
+        122,
+        122,
+        67
+      ],
+      "detail": null,
+      "failure": null,
+      "fallback_entered": true,
+      "path_samples": 68,
+      "replay_original": false,
+      "success": true,
+      "work": {
+        "expanded": 1,
+        "frontier_peak": 1,
+        "nodes": 2
+      }
+    }
+  ],
+  "boundary": {
+    "nonarrival": {
+      "original": [
+        81,
+        81,
+        19
+      ],
+      "reuse": [
+        80,
+        80,
+        18
+      ]
+    },
+    "arrival": {
+      "original": [
+        84,
+        84,
+        22
+      ],
+      "reuse": [
+        84,
+        84,
+        22
+      ]
+    }
+  },
+  "real_guide_arrival": [
+    {
+      "arrival": true,
+      "calls": [
+        341,
+        341,
+        172
+      ],
+      "detail": null,
+      "failure": null,
+      "fallback_entered": true,
+      "path_samples": 119,
+      "replay_original": true,
+      "success": true,
+      "work": {
+        "expanded": 3,
+        "frontier_peak": 12,
+        "nodes": 15
+      }
+    },
+    {
+      "arrival": true,
+      "calls": [
+        341,
+        341,
+        172
+      ],
+      "detail": null,
+      "failure": null,
+      "fallback_entered": true,
+      "path_samples": 119,
+      "replay_original": false,
+      "success": true,
+      "work": {
+        "expanded": 3,
+        "frontier_peak": 12,
+        "nodes": 15
+      }
+    }
+  ],
+  "counter_order": [
+    "body_query_view",
+    "projected_endpoint",
+    "swept_motion"
+  ],
+  "qualification": {
+    "default": {
+      "passed": 53,
+      "failed": 0,
+      "ignored": 1
+    },
+    "profile": {
+      "passed": 56,
+      "failed": 0,
+      "ignored": 5
+    },
+    "ordinary_release_check": "passed"
+  }
+}

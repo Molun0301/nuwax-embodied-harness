@@ -1,0 +1,40 @@
+{
+  "binary": {
+    "path": "/workspace/shared/neh-wall-turn-20261006/nuwax-nav-stack-test",
+    "cargo_path": "/workspace/shared/neh-native-20261006/cargo-target/debug/deps/nuwax_nav_stack-9de63e8f646d88ed",
+    "sha256": "a039e8dbad25f3c1dcdd0e5217af6ff5fc9c9a3df1715c63616b0f9a3a652be9",
+    "bytes": 28062608,
+    "features": [
+      "click-goal",
+      "default",
+      "foundation",
+      "guard-runtime",
+      "lcm-runtime",
+      "mls"
+    ],
+    "profile": {
+      "opt_level": "0",
+      "debuginfo": 0,
+      "debug_assertions": true,
+      "overflow_checks": true,
+      "test": true
+    },
+    "source_hashes": "0452362cfc31d109525397bf22f1b632b52381ce7fedd5161bbf8020b98a63e0  crates/nuwax-nav-stack/src/surface_oriented.rs\n83f3fa2fc8f83f33295f539cb33fa6e0a74db7c0d02daa8c6e1ddde15c61eeea  crates/nuwax-nav-stack/src/surface_config.rs\n894a21d5e12723aa9413d454c14dcee6524deb6f2e7af2c1875484a600aa5862  crates/nuwax-nav-runtime/src/surface_follower.rs\n5c1622546dc922566197b72797c8271029d6c31144836b629e17363bd6be2305  crates/nuwax-nav-mls-planner/src/surface/body.rs\n",
+    "scope": "Fixed mixed test profile; MLS/runtime opt3; stack and other crates ordinarytest; debug0; static simulated geometry and calibrated execution, not realtime or hardware"
+  },
+  "command": [
+    "/workspace/shared/neh-wall-turn-20261006/nuwax-nav-stack-test",
+    "surface_oriented::tests::calibrated_body_plans_and_closes_wall_bounded_ninety_degree_turn",
+    "--exact",
+    "--nocapture",
+    "--test-threads=1"
+  ],
+  "exit_code": 0,
+  "timeout": false,
+  "wall_seconds": 0.8028416489978554,
+  "user_cpu_seconds": 0.7532369999999999,
+  "system_cpu_seconds": 0.037583,
+  "launch_peak_rss_kib": 39628,
+  "voluntary_context_switches": 41,
+  "involuntary_context_switches": 179
+}

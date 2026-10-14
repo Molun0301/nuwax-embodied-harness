@@ -1,0 +1,29 @@
+--- a/src/laserMapping.hpp
++++ b/src/laserMapping.hpp
+@@ -398,14 +398,20 @@
+         if (!Nearest_Points[i].empty()) {
+             const PointVector &points_near = Nearest_Points[i];
+ 
+-            Eigen::Vector3f center =
+-                ((point_world.getVector3fMap() / filter_size_map_min).array().floor() + 0.5) * filter_size_map_min;
++            // 归属使用同一离散体素坐标，面/棱/角上的已有点也必须被识别。
++            // 到中心的严格半宽比较会漏掉边界点，导致重复插入和邻域持续膨胀。
++            // 两侧沿用地图的单精度分辨率与同一标量除法，统一负坐标边界归属。
++            const auto voxel_cell = [](const PointType& point) {
++                return Eigen::Array3f(
++                    std::floor(point.x / static_cast<float>(filter_size_map_min)),
++                    std::floor(point.y / static_cast<float>(filter_size_map_min)),
++                    std::floor(point.z / static_cast<float>(filter_size_map_min)));
++            };
++            const Eigen::Array3f cell = voxel_cell(point_world);
+             bool need_add = true;
+             for (int readd_i = 0; readd_i < points_near.size(); readd_i++) {
+-                Eigen::Vector3f dis_2_center = points_near[readd_i].getVector3fMap() - center;
+-                if (fabs(dis_2_center.x()) < 0.5 * filter_size_map_min &&
+-                    fabs(dis_2_center.y()) < 0.5 * filter_size_map_min &&
+-                    fabs(dis_2_center.z()) < 0.5 * filter_size_map_min) {
++                const Eigen::Array3f neighbor_cell = voxel_cell(points_near[readd_i]);
++                if ((neighbor_cell == cell).all()) {
+                     need_add = false;
+                     break;
+                 }

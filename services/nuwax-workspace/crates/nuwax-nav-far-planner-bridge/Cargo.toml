@@ -1,0 +1,37 @@
+[package]
+name = "nuwax-nav-far-planner-bridge"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+description = "FAR Planner typed liblcm worker and native bridge"
+
+[dependencies]
+nuwax-nav-native-runner = { path = "../nuwax-nav-native-runner" }
+nuwax-nav-base = { path = "../nuwax-nav-base" }
+nuwax-nav-types-messages = { path = "../nuwax-nav-types-messages" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+nuwax-codec = { path = "../nuwax-codec" }
+nuwax-protocol = { path = "../nuwax-protocol" }
+nuwax-transport = { path = "../nuwax-transport", features = ["real-lcm"] }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+nuwax-nav-test-fixtures = { path = "../nuwax-nav-test-fixtures" }
+nuwax-nav-native-runner = { path = "../nuwax-nav-native-runner" }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+
+[[bin]]
+name = "nuwax-far-planner-core"
+path = "src/bin/nuwax-far-planner-core.rs"
+
+[[bin]]
+name = "nuwax-far-planner-worker"
+path = "src/bin/nuwax-far-planner-worker.rs"

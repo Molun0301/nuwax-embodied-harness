@@ -1,0 +1,36 @@
+package nuwax_msgs;
+
+struct NavigationMap3D {
+    const int32_t SCHEMA_VERSION_V4 = 4;
+
+    int32_t schema_version;
+    int64_t producer_runtime_generation;
+    string map_session_id;
+    int64_t map_session_generation;
+    int64_t occupancy_revision;
+    byte occupancy_commit_boot_nonce[16];
+    int64_t occupancy_commit_sequence;
+    int64_t occupancy_source_timestamp_ns;
+    string frame_id;
+    int64_t map_frame_generation;
+    int64_t cloud_revision;
+    // The occupancy baseline retained in the original cloud receipt.
+    int64_t cloud_occupancy_revision;
+    int64_t source_timestamp_ns;
+    float source_voxel_size;
+    byte commit_boot_nonce[16];
+    int64_t commit_sequence;
+    // 0为生效地图，1为显式清空。
+    int8_t cleared;
+    // 仅表示同次提交的虚拟禁区，不包含二维物理投影。
+    int8_t has_virtual_obstacles;
+    nav_msgs.OccupancyGrid virtual_obstacles;
+    // Manifest v2 完整根清单加有界变动块；身份由域、修订和分配对象标识组成。
+    // 缺片只能携带完整根身份及精确块引用，通过可靠请求通道补取。
+    int8_t has_fine_map;
+    int32_t fine_manifest_length;
+    byte fine_manifest[fine_manifest_length];
+    int32_t fine_blocks_length;
+    NavigationMapBlock fine_blocks[fine_blocks_length];
+    sensor_msgs.PointCloud2 cloud;
+}

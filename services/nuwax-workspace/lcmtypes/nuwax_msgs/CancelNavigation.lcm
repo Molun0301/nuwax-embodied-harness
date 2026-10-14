@@ -1,0 +1,11 @@
+package nuwax_msgs;
+
+struct CancelNavigation {
+    string session_id;
+    int32_t reason;
+    int64_t cancel_generation;
+    int32_t owner_kind;
+    string parent_request_id;
+    int64_t goal_generation;
+    int64_t producer_runtime_generation;
+}

@@ -1,0 +1,466 @@
+{
+  "samples": [
+    {
+      "kind": 0,
+      "targets": 1024,
+      "views": 16,
+      "pair": 0,
+      "candidate": false,
+      "us": 138405.567,
+      "rays": 2048,
+      "cells": 516
+    },
+    {
+      "kind": 0,
+      "targets": 1024,
+      "views": 16,
+      "pair": 0,
+      "candidate": true,
+      "us": 139666.822,
+      "rays": 2048,
+      "cells": 516
+    },
+    {
+      "kind": 0,
+      "targets": 1024,
+      "views": 16,
+      "pair": 1,
+      "candidate": true,
+      "us": 147513.853,
+      "rays": 2048,
+      "cells": 516
+    },
+    {
+      "kind": 0,
+      "targets": 1024,
+      "views": 16,
+      "pair": 1,
+      "candidate": false,
+      "us": 138165.429,
+      "rays": 2048,
+      "cells": 516
+    },
+    {
+      "kind": 0,
+      "targets": 1024,
+      "views": 16,
+      "pair": 2,
+      "candidate": false,
+      "us": 144852.30299999999,
+      "rays": 2048,
+      "cells": 516
+    },
+    {
+      "kind": 0,
+      "targets": 1024,
+      "views": 16,
+      "pair": 2,
+      "candidate": true,
+      "us": 140128.213,
+      "rays": 2048,
+      "cells": 516
+    },
+    {
+      "kind": 1,
+      "targets": 4096,
+      "views": 16,
+      "pair": 0,
+      "candidate": false,
+      "us": 266682.555,
+      "rays": 2048,
+      "cells": 1302
+    },
+    {
+      "kind": 1,
+      "targets": 4096,
+      "views": 16,
+      "pair": 0,
+      "candidate": true,
+      "us": 266039.47,
+      "rays": 2048,
+      "cells": 1302
+    },
+    {
+      "kind": 1,
+      "targets": 4096,
+      "views": 16,
+      "pair": 1,
+      "candidate": true,
+      "us": 249825.671,
+      "rays": 2048,
+      "cells": 1302
+    },
+    {
+      "kind": 1,
+      "targets": 4096,
+      "views": 16,
+      "pair": 1,
+      "candidate": false,
+      "us": 248807.86899999998,
+      "rays": 2048,
+      "cells": 1302
+    },
+    {
+      "kind": 1,
+      "targets": 4096,
+      "views": 16,
+      "pair": 2,
+      "candidate": false,
+      "us": 249989.603,
+      "rays": 2048,
+      "cells": 1302
+    },
+    {
+      "kind": 1,
+      "targets": 4096,
+      "views": 16,
+      "pair": 2,
+      "candidate": true,
+      "us": 261916.11599999998,
+      "rays": 2048,
+      "cells": 1302
+    },
+    {
+      "kind": 2,
+      "targets": 16384,
+      "views": 16,
+      "pair": 0,
+      "candidate": false,
+      "us": 319134.855,
+      "rays": 2048,
+      "cells": 1302
+    },
+    {
+      "kind": 2,
+      "targets": 16384,
+      "views": 16,
+      "pair": 0,
+      "candidate": true,
+      "us": 307183.538,
+      "rays": 2048,
+      "cells": 1302
+    },
+    {
+      "kind": 2,
+      "targets": 16384,
+      "views": 16,
+      "pair": 1,
+      "candidate": true,
+      "us": 319527.957,
+      "rays": 2048,
+      "cells": 1302
+    },
+    {
+      "kind": 2,
+      "targets": 16384,
+      "views": 16,
+      "pair": 1,
+      "candidate": false,
+      "us": 307010.572,
+      "rays": 2048,
+      "cells": 1302
+    },
+    {
+      "kind": 2,
+      "targets": 16384,
+      "views": 16,
+      "pair": 2,
+      "candidate": false,
+      "us": 305319.64499999996,
+      "rays": 2048,
+      "cells": 1302
+    },
+    {
+      "kind": 2,
+      "targets": 16384,
+      "views": 16,
+      "pair": 2,
+      "candidate": true,
+      "us": 282941.775,
+      "rays": 2048,
+      "cells": 1302
+    },
+    {
+      "kind": 3,
+      "targets": 4096,
+      "views": 16,
+      "pair": 0,
+      "candidate": false,
+      "us": 62332.382,
+      "rays": 2048,
+      "cells": 1543
+    },
+    {
+      "kind": 3,
+      "targets": 4096,
+      "views": 16,
+      "pair": 0,
+      "candidate": true,
+      "us": 62931.69699999999,
+      "rays": 2048,
+      "cells": 1543
+    },
+    {
+      "kind": 3,
+      "targets": 4096,
+      "views": 16,
+      "pair": 1,
+      "candidate": true,
+      "us": 59783.102999999996,
+      "rays": 2048,
+      "cells": 1543
+    },
+    {
+      "kind": 3,
+      "targets": 4096,
+      "views": 16,
+      "pair": 1,
+      "candidate": false,
+      "us": 57105.452,
+      "rays": 2048,
+      "cells": 1543
+    },
+    {
+      "kind": 3,
+      "targets": 4096,
+      "views": 16,
+      "pair": 2,
+      "candidate": false,
+      "us": 57375.708999999995,
+      "rays": 2048,
+      "cells": 1543
+    },
+    {
+      "kind": 3,
+      "targets": 4096,
+      "views": 16,
+      "pair": 2,
+      "candidate": true,
+      "us": 57560.759000000005,
+      "rays": 2048,
+      "cells": 1543
+    },
+    {
+      "kind": 4,
+      "targets": 4096,
+      "views": 16,
+      "pair": 0,
+      "candidate": false,
+      "us": 8627.363000000001,
+      "rays": 0,
+      "cells": 0
+    },
+    {
+      "kind": 4,
+      "targets": 4096,
+      "views": 16,
+      "pair": 0,
+      "candidate": true,
+      "us": 6772.643,
+      "rays": 0,
+      "cells": 0
+    },
+    {
+      "kind": 4,
+      "targets": 4096,
+      "views": 16,
+      "pair": 1,
+      "candidate": true,
+      "us": 7660.283,
+      "rays": 0,
+      "cells": 0
+    },
+    {
+      "kind": 4,
+      "targets": 4096,
+      "views": 16,
+      "pair": 1,
+      "candidate": false,
+      "us": 7686.7339999999995,
+      "rays": 0,
+      "cells": 0
+    },
+    {
+      "kind": 4,
+      "targets": 4096,
+      "views": 16,
+      "pair": 2,
+      "candidate": false,
+      "us": 7528.465,
+      "rays": 0,
+      "cells": 0
+    },
+    {
+      "kind": 4,
+      "targets": 4096,
+      "views": 16,
+      "pair": 2,
+      "candidate": true,
+      "us": 7667.525,
+      "rays": 0,
+      "cells": 0
+    },
+    {
+      "kind": 5,
+      "targets": 16384,
+      "views": 16,
+      "pair": 0,
+      "candidate": false,
+      "us": 29815.336000000003,
+      "rays": 0,
+      "cells": 0
+    },
+    {
+      "kind": 5,
+      "targets": 16384,
+      "views": 16,
+      "pair": 0,
+      "candidate": true,
+      "us": 25633.574999999997,
+      "rays": 0,
+      "cells": 0
+    },
+    {
+      "kind": 5,
+      "targets": 16384,
+      "views": 16,
+      "pair": 1,
+      "candidate": true,
+      "us": 26417.247000000003,
+      "rays": 0,
+      "cells": 0
+    },
+    {
+      "kind": 5,
+      "targets": 16384,
+      "views": 16,
+      "pair": 1,
+      "candidate": false,
+      "us": 31566.460999999996,
+      "rays": 0,
+      "cells": 0
+    },
+    {
+      "kind": 5,
+      "targets": 16384,
+      "views": 16,
+      "pair": 2,
+      "candidate": false,
+      "us": 29583.286,
+      "rays": 0,
+      "cells": 0
+    },
+    {
+      "kind": 5,
+      "targets": 16384,
+      "views": 16,
+      "pair": 2,
+      "candidate": true,
+      "us": 24533.754,
+      "rays": 0,
+      "cells": 0
+    }
+  ],
+  "summary": [
+    {
+      "kind": 0,
+      "baseline_median_us": 138405.567,
+      "candidate_median_us": 140128.213,
+      "paired_ratios": [
+        1.009112747610795,
+        1.067661093427358,
+        0.9673868492101227
+      ],
+      "median_ratio": 1.009112747610795
+    },
+    {
+      "kind": 1,
+      "baseline_median_us": 249989.603,
+      "candidate_median_us": 261916.11599999998,
+      "paired_ratios": [
+        0.9975885749257202,
+        1.0040907146710862,
+        1.0477080360818045
+      ],
+      "median_ratio": 1.0040907146710862
+    },
+    {
+      "kind": 2,
+      "baseline_median_us": 307010.572,
+      "candidate_median_us": 307183.538,
+      "paired_ratios": [
+        0.9625508877743862,
+        1.0407718370037107,
+        0.9267067469569475
+      ],
+      "median_ratio": 0.9625508877743862
+    },
+    {
+      "kind": 3,
+      "baseline_median_us": 57375.708999999995,
+      "candidate_median_us": 59783.102999999996,
+      "paired_ratios": [
+        1.0096148258861661,
+        1.0468895859540697,
+        1.0032252324759945
+      ],
+      "median_ratio": 1.0096148258861661
+    },
+    {
+      "kind": 4,
+      "baseline_median_us": 7686.7339999999995,
+      "candidate_median_us": 7660.283,
+      "paired_ratios": [
+        0.7850188985904498,
+        0.9965588766308293,
+        1.018471228862723
+      ],
+      "median_ratio": 0.9965588766308293
+    },
+    {
+      "kind": 5,
+      "baseline_median_us": 29815.336000000003,
+      "candidate_median_us": 25633.574999999997,
+      "paired_ratios": [
+        0.8597446294081674,
+        0.8368770575833637,
+        0.8293113212643113
+      ],
+      "median_ratio": 0.8368770575833637
+    }
+  ],
+  "date": "2026-10-14",
+  "decision": "reject production filter-order change",
+  "production_changed": false,
+  "evidence_directory": "/workspace/scratch/71cdb9d17732/neh-evidence/observation-filter-order-20261014",
+  "source": "services/nuwax-workspace/crates/nuwax-explore-routing/src/observation_filter_tests.rs",
+  "build_cwd": "services/nuwax-workspace",
+  "build_command": "cargo test --offline --locked --release -j2 -p nuwax-explore-routing --lib --no-run --message-format=json",
+  "ordinary_routing_suite": {
+    "passed": 14,
+    "failed": 0,
+    "ignored": 1
+  },
+  "equivalence_test": {
+    "passed": 1,
+    "failed": 0
+  },
+  "fixed_pairs_per_cohort": 3,
+  "views_per_sample": 16,
+  "timing_unit": "microseconds",
+  "cohort_labels": [
+    "in-range 1024 targets",
+    "16m spatial grid 4096 targets",
+    "32m spatial grid 16384 targets",
+    "planar16m grid4096",
+    "vertical-rejected4096",
+    "all-out-of-range16384 capacity-only"
+  ],
+  "limitations": [
+    "Synthetic target sets, not captured robot maps",
+    "Full estimate_view includes actual voxel ray callback but is not full exploration selection",
+    "Single process three fixed alternating pairs; no adaptive reruns",
+    "Coordinates include voxel-boundary targets in this rejected filter diagnostic; not a throughput claim for cell-center-only production map targets",
+    "No allocator instrumentation or real robot CPU measurement"
+  ]
+}

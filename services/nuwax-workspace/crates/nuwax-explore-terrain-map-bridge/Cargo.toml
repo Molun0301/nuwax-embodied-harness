@@ -1,0 +1,17 @@
+[package]
+name = "nuwax-explore-terrain-map-bridge"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Thin exploration-side adapter/profile for nuwax-nav-terrain-map-ext."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+nuwax-nav-terrain-map-ext = { path = "../nuwax-nav-terrain-map-ext" }
+serde = { workspace = true, features = ["derive"] }

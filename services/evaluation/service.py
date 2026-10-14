@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections import deque
-from datetime import datetime
 import math
 import time
 from typing import Deque, Dict, Iterable, List, Optional, Sequence
@@ -249,7 +248,7 @@ class EvaluationService:
             latest_trace_id=traces[-1].trace_id if traces else None,
             metadata={
                 "task_sets": [item.value for item in EvaluationTaskKind],
-                "slice_dimensions": ["map_version_id", "perception_provider", "navigation_profile", "target_category", "distance_bucket"],
+                "slice_dimensions": ["map_name", "perception_provider", "navigation_profile", "target_category", "distance_bucket"],
                 "stage9_completion_criteria": stage9_summary,
             },
         )
@@ -331,7 +330,7 @@ class EvaluationService:
             "score": self._coerce_float(metadata.get("ranking_total_score") or getattr(candidate, "score", None)),
             "ranking_total_score": self._coerce_float(metadata.get("ranking_total_score") or getattr(candidate, "score", None)),
             "distance_m": self._coerce_float(getattr(candidate, "distance_m", None) or metadata.get("distance_m")),
-            "map_version_id": str(getattr(candidate, "map_version_id", "") or metadata.get("map_version_id") or ""),
+            "map_name": str(getattr(candidate, "map_name", "") or metadata.get("map_name") or ""),
             "localization_session_id": str(getattr(candidate, "localization_session_id", "") or metadata.get("localization_session_id") or ""),
             "scene_space_id": str(getattr(candidate, "scene_space_id", "") or metadata.get("scene_space_id") or ""),
             "semantic_region_id": str(getattr(candidate, "semantic_region_id", "") or metadata.get("semantic_region_id") or ""),
@@ -488,13 +487,11 @@ class EvaluationService:
         )
 
     def _safety_metrics(self, status_text: str, safety_snapshot: MetadataDict) -> SafetyEvaluationMetrics:
-        safe_stop = safety_snapshot.get("safe_stop") if isinstance(safety_snapshot.get("safe_stop"), dict) else {}
         obstacle = safety_snapshot.get("official_obstacle_avoidance") if isinstance(safety_snapshot.get("official_obstacle_avoidance"), dict) else {}
         terminal = safety_snapshot.get("terminal_feedback") if isinstance(safety_snapshot.get("terminal_feedback"), dict) else {}
         recoveries = int(terminal.get("number_of_recoveries") or 0) if isinstance(terminal, dict) else 0
         return SafetyEvaluationMetrics(
             collision_count=int(safety_snapshot.get("collision_count") or terminal.get("collision_count") or 0),
-            emergency_stop_count=1 if bool(safe_stop.get("safe_stop_active") or safe_stop.get("is_estopped")) else 0,
             official_obstacle_avoidance_trigger_count=1 if bool(obstacle.get("obstacle_avoidance_enabled") and recoveries > 0) else 0,
             near_miss_count=int(safety_snapshot.get("near_miss_count") or safety_snapshot.get("near_distance_risk_count") or 0),
             cancel_count=1 if status_text == "cancelled" else 0,
@@ -534,7 +531,7 @@ class EvaluationService:
         candidate_metadata = candidate.get("metadata") if isinstance(candidate.get("metadata"), dict) else {}
         distance = self._coerce_float(metadata.get("distance_m") or candidate.get("distance_m"))
         return EvaluationSliceKey(
-            map_version_id=str(metadata.get("map_version_id") or candidate.get("map_version_id") or candidate_metadata.get("map_version_id") or "unknown") or "unknown",
+            map_name=str(metadata.get("map_name") or candidate.get("map_name") or candidate_metadata.get("map_name") or "unknown") or "unknown",
             perception_provider=str(metadata.get("perception_provider") or metadata.get("detector_backend") or candidate_metadata.get("perception_provider") or "unknown") or "unknown",
             navigation_profile=str(metadata.get("navigation_profile") or metadata.get("geometry_profile") or candidate_metadata.get("navigation_profile") or "unknown") or "unknown",
             target_category=str(metadata.get("target_category") or candidate_metadata.get("target_category") or metadata.get("query_scope") or "unknown") or "unknown",
@@ -551,7 +548,7 @@ class EvaluationService:
         if current is None:
             return incoming
         return EvaluationSliceKey(
-            map_version_id=self._prefer_known(current.map_version_id, incoming.map_version_id),
+            map_name=self._prefer_known(current.map_name, incoming.map_name),
             perception_provider=self._prefer_known(current.perception_provider, incoming.perception_provider),
             navigation_profile=self._prefer_known(current.navigation_profile, incoming.navigation_profile),
             target_category=self._prefer_known(current.target_category, incoming.target_category),
@@ -629,7 +626,6 @@ class EvaluationService:
             topk_hit_rate=self._bool_mean([item.topk_hit for item in retrieval_metrics]),
             wrong_candidate_rate=self._mean([item.wrong_candidate_rate for item in retrieval_metrics]),
             collision_count=sum(item.collision_count for item in safety_metrics),
-            emergency_stop_count=sum(item.emergency_stop_count for item in safety_metrics),
             cancel_count=sum(item.cancel_count for item in safety_metrics),
             timeout_count=sum(item.timeout_count for item in safety_metrics),
             memory_write_success_rate=self._mean([item.new_observation_write_success_rate for item in memory_metrics]),

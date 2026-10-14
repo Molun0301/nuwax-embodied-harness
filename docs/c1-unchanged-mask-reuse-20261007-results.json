@@ -1,0 +1,2916 @@
+{
+  "status": "qualified bounded local cache contract; real-LCM global integration blocked before test logic",
+  "baseline_commit": "537ed937b02541abdb7a61ca703963d872e147bc",
+  "scope": "Reuse existing virtual-mask derivation only for strictly newer same-domain/boot-nonce occupancy revisions, same physical Arc and bit-exact layout/cells; preserve observations, source authority/receipts and map-version fences.",
+  "application_hashes_added": false,
+  "production_files": [
+    "services/nuwax-workspace/crates/nuwax-nav-mls-planner/src/surface.rs",
+    "services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_map.rs"
+  ],
+  "regular_passed_distinct": 95,
+  "regular_test_names": [
+    "cancellation::tests::cancellation_scopes_restore_after_nested_calls_and_unwind",
+    "cancellation::tests::checkpoint_actions_restore_after_nested_unwind_and_allow_reentry",
+    "lcm_dataflow::surface_dataflow::tests::committed_occupancy_revision_reuses_only_exact_virtual_mask_geometry",
+    "lcm_dataflow::surface_dataflow::tests::fullcloud_publication_reuses_only_after_exact_builder_change_detection",
+    "lcm_dataflow::surface_dataflow::tests::map_order_and_geometry_reuse_preserve_input_identity_and_receipt_age",
+    "lcm_dataflow::surface_dataflow::tests::mask_only_claim_cannot_change_cloud_and_scan_only_claim_cannot_change_mask",
+    "lcm_dataflow::surface_dataflow::tests::mask_reuse_tests::changed_mask_and_removal_restore_current_routes_without_mutating_retained_snapshots",
+    "lcm_dataflow::surface_dataflow::tests::mask_reuse_tests::fine_geometry_change_inside_one_coarse_cell_invalidates_pct_despite_mask_reuse",
+    "lcm_dataflow::surface_dataflow::tests::mask_reuse_tests::fine_mask_reuse_keeps_original_evidence_and_refresh_retires_only_body_query_view",
+    "lcm_dataflow::surface_dataflow::tests::mask_reuse_tests::mask_cells_presence_extent_and_layout_bits_use_cold_current_message_geometry",
+    "lcm_dataflow::surface_dataflow::tests::mask_reuse_tests::occupancy_only_same_mask_reuses_surface_and_pct_with_current_receipt",
+    "lcm_dataflow::surface_dataflow::tests::mask_reuse_tests::reset_clear_and_domain_changes_discard_derived_mask_reuse",
+    "lcm_dataflow::surface_dataflow::tests::mask_work_tests::invalid_new_mask_never_reuses_or_replaces_the_complete_baseline",
+    "lcm_dataflow::surface_dataflow::tests::mask_work_tests::unchanged_mask_work_counts_preserve_revision_fast_path_and_skip_derived_maps",
+    "lcm_dataflow::surface_dataflow::tests::production_derived_surface_carries_deferred_frontier_updates",
+    "lcm_dataflow::surface_dataflow::tests::production_fine_columns_survive_geometry_changes_and_failed_transfer",
+    "lcm_dataflow::surface_dataflow::tests::production_surface_cache_applies_column_changes_and_clear_discards_baseline",
+    "lcm_dataflow::surface_dataflow::tests::publication_order_accepts_monotone_scan_and_mask_components_and_rejects_rollback",
+    "lcm_dataflow::surface_dataflow::tests::virtual_mask_is_applied_to_the_surface_and_cache_ignores_only_its_clock",
+    "planner_worker::tests::arrival_event_requalification_preserves_strict_region_and_lifecycle_fences",
+    "planner_worker::tests::arrival_is_rechecked_when_pose_changes_after_computation",
+    "planner_worker::tests::autonomous_worker_delivers_forward_only_goal_options",
+    "planner_worker::tests::blocked_geometry_does_not_block_stop_and_late_velocity_is_retired",
+    "planner_worker::tests::both_route_modes_reject_stored_positive_commands_after_map_or_boundary_changes",
+    "planner_worker::tests::both_route_modes_retire_inflight_commands_on_cancel_without_replacement",
+    "planner_worker::tests::both_route_modes_retire_inflight_commands_on_same_goal_path_replacement",
+    "planner_worker::tests::both_route_modes_retire_inflight_results_after_map_or_boundary_changes",
+    "planner_worker::tests::boundary_replacement_retires_inflight_result_without_goal_change",
+    "planner_worker::tests::dispatch_bound_rejects_delayed_first_retrieval_without_extending_hold_lease",
+    "planner_worker::tests::dispatch_expiry_during_compute_becomes_pending_without_route_penalty",
+    "planner_worker::tests::dispatch_taken_result_metadata_is_retired_by_input_and_lifecycle_changes",
+    "planner_worker::tests::exact_proof_follows_stored_result_once_and_never_same_valued_next_result",
+    "planner_worker::tests::identical_surface_arc_still_fences_stored_and_inflight_commands",
+    "planner_worker::tests::lifecycle_stop_reaches_inner_owner_without_another_control_tick",
+    "planner_worker::tests::local_display_drops_late_worker_results_after_stop",
+    "planner_worker::tests::map_replacement_retires_inflight_result_and_wakes_without_control_tick",
+    "planner_worker::tests::pending_next_computation_preserves_continuous_velocity_only_inside_verified_horizon",
+    "planner_worker::tests::pose_only_motion_preserves_first_velocity_delivery_but_cannot_replay_it",
+    "planner_worker::tests::pose_only_update_retires_inflight_negative_and_accepts_current_failure",
+    "planner_worker::tests::positive_result_is_consumed_once_and_fresh_same_value_requires_new_compute",
+    "planner_worker::tests::real_computed_arrival_survives_in_tolerance_pose_jitter",
+    "planner_worker::tests::repeated_identical_invalid_pose_preserves_current_failure",
+    "planner_worker::tests::replacement_path_preserves_goal_and_applied_control_state",
+    "planner_worker::tests::slow_planner_outcomes_are_not_lost_to_velocity_expiry",
+    "planner_worker::tests::source_fence_expiry_and_zero_never_deliver_stored_diagnostic_proof",
+    "planner_worker::tests::stationary_geometry_wait_reason_crosses_the_compute_thread",
+    "planner_worker::tests::stop_then_new_goal_and_path_before_old_compute_returns_installs_latest_inputs",
+    "planner_worker::tests::stored_negative_requires_exact_pose_but_not_same_timestamp",
+    "planner_worker::tests::stored_outcomes_require_current_map_and_boundary_at_retrieval",
+    "planner_worker::tests::stored_positive_command_is_rejected_after_blocking_map_update",
+    "planner_worker::tests::stored_terminal_results_require_current_applied_state_but_commands_do_not",
+    "route_follower::tests::exact_mask_reuse_preserves_held_local_work_but_mask_fine_and_owner_changes_cancel",
+    "route_follower::tests::lifecycle_invalidations_discard_held_late_completions",
+    "route_follower::tests::metadata_refresh_does_not_cancel_or_restart_a_held_candidate",
+    "route_planning::tests::cache_key_preserves_signed_zero_and_quaternion_antipodes",
+    "route_planning::tests::exact_failed_attempt_cache_requires_owner_pose_boundary_source_and_semantics",
+    "route_planning::tests::lifecycle_epoch_retires_exact_failures",
+    "route_planning::tests::local_tomogram_reuse_keeps_its_original_construction_center",
+    "sampling_tests::boundary_sampled_missing_columns_stay_disconnected_while_complete_centres_connect",
+    "search::tests::epoch_cancellation_interrupts_search_and_reduction_without_changing_the_map",
+    "search::tests::explicit_occupied_volume_stairs_keep_the_exposed_step_heights",
+    "search::tests::insufficient_ceiling_and_one_way_steps",
+    "search::tests::missing_ground_is_not_interpolated_and_cancellation_is_observed",
+    "search::tests::overlapping_floors_do_not_connect",
+    "search::tests::reference_shortcuts_keep_a_concave_task_boundary",
+    "search::tests::rough_edge_prefers_body_room_without_blocking_a_required_step",
+    "search::tests::sloping_ground_crosses_slice_boundaries",
+    "surface::body::tests::observed_motion_expiry_does_not_turn_clock_saturation_into_a_finite_bound",
+    "surface::body::tests::observed_motion_expiry_rechecks_cached_footprint_at_exact_expiry_and_one_ns_later",
+    "surface::body::tests::observed_motion_expiry_returns_no_certificate_for_failure_and_keeps_first_error",
+    "surface::body::tests::observed_motion_expiry_uses_only_checked_nonexempt_cells_and_resets_each_sweep",
+    "surface::body::tests::observed_motion_expiry_without_nonexempt_cells_still_checks_geometry_and_source",
+    "surface::body::tests::planning_fork_preserves_body_observation_obstacle_and_boundary_decisions",
+    "surface::body::tests::planning_fork_preserves_query_only_and_occupied_volume_flags",
+    "surface::body::tests::planning_fork_shares_payloads_but_isolates_every_surface_cache_and_rebase",
+    "surface::observations::snapshot_cache_tests::identical_observation_owner_preserves_queries_but_replacement_retires_them",
+    "surface::observations::tests::planning_fork_shares_observation_roots_without_sharing_obstacle_cache",
+    "surface::tests::virtual_obstacles_preserve_detours_and_robot_clearance_without_double_inflation",
+    "surface::virtual_mask_match_tests::mask_match_checks_every_cell_without_allocating_a_second_mask",
+    "surface::virtual_mask_match_tests::mask_match_rejects_incorrect_exact_iterator_prefix_or_trailer",
+    "surface::virtual_mask_match_tests::mask_match_validates_retained_layout_before_reading_cells",
+    "surface_adapter::body_route_cancellation_tests::already_cancelled_near_and_distant_goals_do_not_build_or_replace_cache",
+    "surface_adapter::body_route_cancellation_tests::flag_cancelled_during_build_rejects_route_after_preserving_complete_cache",
+    "tests::fine_obstacle_moves_inside_one_coarse_cell_but_time_updates_reuse_tomogram",
+    "tests::ground_evidence_changes_invalidate_the_same_occupancy_cache",
+    "tests::local_feedback_changes_preference_without_erasing_a_passage",
+    "tomogram::cancellation_tests::cancellation_abandons_connect_and_cost_passes_without_returning_a_partial_map",
+    "tomogram::cancellation_tests::cancellation_stops_column_input_before_collecting_the_whole_map",
+    "tomogram::connect_trial_tests::cardinal_reuse_keeps_tie_identity_and_shared_ceiling_rejection",
+    "tomogram::connect_trial_tests::cardinal_reuse_preserves_cancellation_checkpoints_and_partial_state",
+    "tomogram::connect_trial_tests::cardinal_reuse_preserves_corner_missing_mask_layers_and_direction",
+    "tomogram::connect_trial_tests::cardinal_reuse_preserves_mixed_graph_and_routes",
+    "tomogram::masked_surface_tests::exact_mask_reuse_matches_cold_global_and_local_fields_edges_and_routes",
+    "tomogram::masked_surface_tests::masked_surface_cancellation_uses_real_epoch",
+    "tomogram::masked_surface_tests::masked_surface_matches_frozen_wrapper_exactly"
+  ],
+  "network_blocker": {
+    "test": "held_global_owner_keeps_unchanged_mask_work_but_changed_mask_retires_it",
+    "exit_code": 101,
+    "phase": "LcmTransport initialization before assertions",
+    "reason": "connect: Network is unreachable; liblcm requires a multicast route",
+    "log": "/workspace/shared/neh-mask-reuse-20261007/candidate/final-stack-focused/13.log",
+    "network_settings_changed": false,
+    "integration_pass_claimed": false
+  },
+  "build_history": {
+    "initial_build_exit": 101,
+    "initial_error": "new test wrapped an existing Arc<SurfaceSnapshot> in another Arc; three mismatched-type diagnostics",
+    "initial_log": "/workspace/shared/neh-mask-reuse-20261007/candidate/attempt-1/build.jsonl",
+    "corrected_four_crate_build_exit": 0,
+    "final_stack_build_exit": 0,
+    "baseline_build_exit": 0
+  },
+  "counts": {
+    "fixture_mask_cells": 1200,
+    "same_revision_updates": 8,
+    "same_revision_extra_cell_comparisons": 0,
+    "newer_identical_mask_updates": 8,
+    "extra_cell_comparisons": 9600,
+    "total_derived_builds_including_initial": 1,
+    "total_pct_builds_including_initial": 1,
+    "changed_first_cell_comparisons": 1,
+    "changed_mask_added_derivations": 1,
+    "log": "/workspace/shared/neh-mask-reuse-20261007/candidate/final-stack-focused/02.log"
+  },
+  "profile_comparison": {
+    "baseline_records": 278,
+    "candidate_records": 278,
+    "exact_match": true,
+    "baseline_only": [],
+    "candidate_only": []
+  },
+  "candidate_source_manifest": [
+    {
+      "path": "services/nuwax-workspace/crates/nuwax-nav-mls-planner/src/surface.rs",
+      "bytes": 84232,
+      "sha256": "d1356f5c4bae3101fefbdd0bbd9158435f1958ee723bd36f489efb439e61dce6"
+    },
+    {
+      "path": "services/nuwax-workspace/crates/nuwax-nav-pct/src/tomogram_masked_tests.rs",
+      "bytes": 14798,
+      "sha256": "c667465cde6d133b9a3d99a11562bba5818ec5fb2fb5ff9257faf82a74645ca2"
+    },
+    {
+      "path": "services/nuwax-workspace/crates/nuwax-nav-runtime/src/planner_worker.rs",
+      "bytes": 99940,
+      "sha256": "3f4f94d6f2631a60d8968f05aab212ff8344b3cdd040f0301c7c68cfb97b5ace"
+    },
+    {
+      "path": "services/nuwax-workspace/crates/nuwax-nav-runtime/src/route_follower.rs",
+      "bytes": 71958,
+      "sha256": "91c9309f935c507f4bd30241c454f46a9ff93f4c05a29776769f7ac434362150"
+    },
+    {
+      "path": "services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_dataflow.rs",
+      "bytes": 149929,
+      "sha256": "24629fe7409db0fdf7b2792f980e70baa41a42c9d7fe56247cc286d44aff881d"
+    },
+    {
+      "path": "services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_map.rs",
+      "bytes": 12582,
+      "sha256": "a1d39b5d10c781c79e1c9e70628999d816dc3befcd9d5a3d2e59e4e32efd9d41"
+    },
+    {
+      "path": "services/nuwax-workspace/crates/nuwax-nav-mls-planner/src/surface/virtual_mask_match_tests.rs",
+      "bytes": 2594,
+      "sha256": "3872b272be1eed14aec165ca437ebb55c367a661c9b08ac62cf3b4ce69c0faa4"
+    },
+    {
+      "path": "services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_mask_reuse_tests.rs",
+      "bytes": 26278,
+      "sha256": "af3738b44a7476b63cb0b0dcc5cf7f1cecf555973224d959f8c60666eb1f7a44"
+    },
+    {
+      "path": "services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_mask_work_tests.rs",
+      "bytes": 6804,
+      "sha256": "305e331650b987673c71c4a32db5c3bec3d307b0baab225a59a1804ec437eb6a"
+    }
+  ],
+  "candidate_binary_identities": [
+    {
+      "path": "/workspace/shared/neh-mask-reuse-20261007/candidate/nuwax-nav-stack-test",
+      "bytes": 28705672,
+      "sha256": "e9786c24b0a434cb0b283eea9f33add76b1de75d65072a6d29981c2015049c47"
+    },
+    {
+      "path": "/workspace/shared/neh-mask-reuse-20261007/candidate/nuwax-nav-pct-test",
+      "bytes": 4654272,
+      "sha256": "f9a05c8ee2c3837c598567ae5d94bc31d368e7ea896066fd3ab9a1f06da04ec0"
+    },
+    {
+      "path": "/workspace/shared/neh-mask-reuse-20261007/candidate/nuwax-nav-mls-planner-test",
+      "bytes": 8641088,
+      "sha256": "564b6518c5b240fa51c0239fe470c3c4ae529d278451030568c3f7fb2bd7d307"
+    },
+    {
+      "path": "/workspace/shared/neh-mask-reuse-20261007/candidate/nuwax-nav-runtime-test",
+      "bytes": 12814272,
+      "sha256": "24ac518f456a5950f0d25cc92a21f7086cb04ed089d19fb8b0f6eff84811908a"
+    }
+  ],
+  "baseline_binary_identity": {
+    "path": "/workspace/shared/neh-mask-reuse-20261007/baseline/nuwax-nav-stack-test",
+    "bytes": 28636872,
+    "sha256": "93f4a01eddab2cba3c8832c92a06df72e73a48c9f164d4278e7f99b9f5db0e74"
+  },
+  "candidate_restoration": [
+    {
+      "path": "services/nuwax-workspace/crates/nuwax-nav-mls-planner/src/surface.rs",
+      "restored_exact": true
+    },
+    {
+      "path": "services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_map.rs",
+      "restored_exact": true
+    },
+    {
+      "path": "services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_dataflow.rs",
+      "restored_exact": true
+    }
+  ],
+  "focused_runs": [
+    {
+      "name": "cache",
+      "command": [
+        "/workspace/shared/neh-mask-reuse-20261007/candidate/nuwax-nav-stack-test",
+        "mask_reuse_tests::",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "wall_s": 2.9721172459976515,
+      "user_s": 2.904413,
+      "system_s": 0.170516,
+      "maxrss_kib": 32260,
+      "summary": [
+        "test result: ok. 6 passed; 0 failed; 1 ignored; 0 measured; 236 filtered out; finished in 2.95s"
+      ]
+    },
+    {
+      "name": "work-count",
+      "command": [
+        "/workspace/shared/neh-mask-reuse-20261007/candidate/nuwax-nav-stack-test",
+        "unchanged_mask_work_counts_",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "wall_s": 0.07646309399569873,
+      "user_s": 0.050386999999999994,
+      "system_s": 0.021387,
+      "maxrss_kib": 19448,
+      "summary": [
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 242 filtered out; finished in 0.07s"
+      ]
+    },
+    {
+      "name": "invalid-mask",
+      "command": [
+        "/workspace/shared/neh-mask-reuse-20261007/candidate/nuwax-nav-stack-test",
+        "invalid_new_mask_",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "wall_s": 0.09813476000272203,
+      "user_s": 0.097289,
+      "system_s": 0.011625,
+      "maxrss_kib": 16724,
+      "summary": [
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 242 filtered out; finished in 0.09s"
+      ]
+    },
+    {
+      "name": "matcher",
+      "command": [
+        "/workspace/shared/neh-mask-reuse-20261007/candidate/nuwax-nav-mls-planner-test",
+        "virtual_mask_match_tests::",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "wall_s": 0.007668876001844183,
+      "user_s": 0.0,
+      "system_s": 0.004541,
+      "maxrss_kib": 9472,
+      "summary": [
+        "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 250 filtered out; finished in 0.00s"
+      ]
+    },
+    {
+      "name": "pct-all",
+      "command": [
+        "/workspace/shared/neh-mask-reuse-20261007/candidate/nuwax-nav-pct-test",
+        "",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "wall_s": 1.5709290399972815,
+      "user_s": 1.481507,
+      "system_s": 0.066676,
+      "maxrss_kib": 12952,
+      "summary": [
+        "test result: ok. 25 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 1.57s"
+      ]
+    },
+    {
+      "name": "held-local",
+      "command": [
+        "/workspace/shared/neh-mask-reuse-20261007/candidate/nuwax-nav-runtime-test",
+        "route_follower::tests::exact_mask_reuse_",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "wall_s": 0.3654435649950756,
+      "user_s": 0.34757499999999997,
+      "system_s": 0.035903,
+      "maxrss_kib": 20448,
+      "summary": [
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 237 filtered out; finished in 0.36s"
+      ]
+    },
+    {
+      "name": "same-arc-fence",
+      "command": [
+        "/workspace/shared/neh-mask-reuse-20261007/candidate/nuwax-nav-runtime-test",
+        "planner_worker::tests::identical_surface_arc_",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "wall_s": 0.08004939700185787,
+      "user_s": 0.06734899999999999,
+      "system_s": 0.014414999999999999,
+      "maxrss_kib": 13884,
+      "summary": [
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 237 filtered out; finished in 0.07s"
+      ]
+    },
+    {
+      "name": "metadata-held",
+      "command": [
+        "/workspace/shared/neh-mask-reuse-20261007/candidate/nuwax-nav-runtime-test",
+        "route_follower::tests::metadata_refresh_does_not_cancel_or_restart_a_held_candidate",
+        "--nocapture",
+        "--test-threads=1",
+        "--exact"
+      ],
+      "exit_code": 0,
+      "wall_s": 0.07891445999848656,
+      "user_s": 0.070945,
+      "system_s": 0.013692999999999999,
+      "maxrss_kib": 15464,
+      "summary": [
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 237 filtered out; finished in 0.07s"
+      ]
+    },
+    {
+      "name": "lifecycle-held",
+      "command": [
+        "/workspace/shared/neh-mask-reuse-20261007/candidate/nuwax-nav-runtime-test",
+        "route_follower::tests::lifecycle_invalidations_discard_held_late_completions",
+        "--nocapture",
+        "--test-threads=1",
+        "--exact"
+      ],
+      "exit_code": 0,
+      "wall_s": 0.85112901199318,
+      "user_s": 0.8575119999999999,
+      "system_s": 0.0377,
+      "maxrss_kib": 17792,
+      "summary": [
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 237 filtered out; finished in 0.84s"
+      ]
+    },
+    {
+      "name": "runtime-plan",
+      "command": [
+        "/workspace/shared/neh-mask-reuse-20261007/candidate/nuwax-nav-runtime-test",
+        "route_planning::tests::",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "wall_s": 1.448255037990748,
+      "user_s": 1.4727459999999999,
+      "system_s": 0.02323,
+      "maxrss_kib": 19980,
+      "summary": [
+        "test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 234 filtered out; finished in 1.44s"
+      ]
+    },
+    {
+      "name": "worker-all",
+      "command": [
+        "/workspace/shared/neh-mask-reuse-20261007/candidate/nuwax-nav-runtime-test",
+        "planner_worker::tests::",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "wall_s": 21.640159237998887,
+      "user_s": 1.55771,
+      "system_s": 0.166925,
+      "maxrss_kib": 17496,
+      "summary": [
+        "test result: ok. 32 passed; 0 failed; 2 ignored; 0 measured; 204 filtered out; finished in 21.63s"
+      ]
+    },
+    {
+      "name": "expiry",
+      "command": [
+        "/workspace/shared/neh-mask-reuse-20261007/candidate/nuwax-nav-mls-planner-test",
+        "observed_motion_expiry_",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "wall_s": 0.2558609650004655,
+      "user_s": 0.245443,
+      "system_s": 0.022185,
+      "maxrss_kib": 12404,
+      "summary": [
+        "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 248 filtered out; finished in 0.25s"
+      ]
+    },
+    {
+      "name": "observation-owner",
+      "command": [
+        "/workspace/shared/neh-mask-reuse-20261007/candidate/nuwax-nav-mls-planner-test",
+        "snapshot_cache_tests::",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "wall_s": 0.008800319003057666,
+      "user_s": 0.005123,
+      "system_s": 0.004528,
+      "maxrss_kib": 9600,
+      "summary": [
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 252 filtered out; finished in 0.00s"
+      ]
+    },
+    {
+      "name": "fork-isolation",
+      "command": [
+        "/workspace/shared/neh-mask-reuse-20261007/candidate/nuwax-nav-mls-planner-test",
+        "planning_fork_",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "wall_s": 0.1997467289911583,
+      "user_s": 0.190959,
+      "system_s": 0.018112,
+      "maxrss_kib": 14792,
+      "summary": [
+        "test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 249 filtered out; finished in 0.20s"
+      ]
+    },
+    {
+      "name": "virtual-mask-old",
+      "command": [
+        "/workspace/shared/neh-mask-reuse-20261007/candidate/nuwax-nav-mls-planner-test",
+        "virtual_obstacles_",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "wall_s": 0.25519638900004793,
+      "user_s": 0.245001,
+      "system_s": 0.013193999999999999,
+      "maxrss_kib": 13160,
+      "summary": [
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 252 filtered out; finished in 0.25s"
+      ]
+    }
+  ],
+  "final_stack_runs": [
+    {
+      "selector": "mask_reuse_tests::",
+      "command": [
+        "/workspace/shared/neh-mask-reuse-20261007/candidate/nuwax-nav-stack-test",
+        "mask_reuse_tests::",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "log": "/workspace/shared/neh-mask-reuse-20261007/candidate/final-stack-focused/01.log",
+      "exit_code": 0,
+      "wall_s": 2.540905449001002,
+      "user_s": 2.538145,
+      "system_s": 0.121418,
+      "maxrss_kib": 40728,
+      "summary": [
+        "test result: ok. 6 passed; 0 failed; 1 ignored; 0 measured; 236 filtered out; finished in 2.52s"
+      ]
+    },
+    {
+      "selector": "unchanged_mask_work_counts_",
+      "command": [
+        "/workspace/shared/neh-mask-reuse-20261007/candidate/nuwax-nav-stack-test",
+        "unchanged_mask_work_counts_",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "log": "/workspace/shared/neh-mask-reuse-20261007/candidate/final-stack-focused/02.log",
+      "exit_code": 0,
+      "wall_s": 0.06809988799795974,
+      "user_s": 0.059573999999999995,
+      "system_s": 0.008799999999999999,
+      "maxrss_kib": 40728,
+      "summary": [
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 242 filtered out; finished in 0.05s"
+      ]
+    },
+    {
+      "selector": "invalid_new_mask_",
+      "command": [
+        "/workspace/shared/neh-mask-reuse-20261007/candidate/nuwax-nav-stack-test",
+        "invalid_new_mask_",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "log": "/workspace/shared/neh-mask-reuse-20261007/candidate/final-stack-focused/03.log",
+      "exit_code": 0,
+      "wall_s": 0.09404775699658785,
+      "user_s": 0.083193,
+      "system_s": 0.019549999999999998,
+      "maxrss_kib": 40728,
+      "summary": [
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 242 filtered out; finished in 0.08s"
+      ]
+    },
+    {
+      "selector": "production_fine_columns_survive_geometry_changes_and_failed_transfer",
+      "command": [
+        "/workspace/shared/neh-mask-reuse-20261007/candidate/nuwax-nav-stack-test",
+        "production_fine_columns_survive_geometry_changes_and_failed_transfer",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "log": "/workspace/shared/neh-mask-reuse-20261007/candidate/final-stack-focused/04.log",
+      "exit_code": 0,
+      "wall_s": 0.29476964300556574,
+      "user_s": 0.282533,
+      "system_s": 0.021445,
+      "maxrss_kib": 40728,
+      "summary": [
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 242 filtered out; finished in 0.29s"
+      ]
+    },
+    {
+      "selector": "production_surface_cache_applies_column_changes_and_clear_discards_baseline",
+      "command": [
+        "/workspace/shared/neh-mask-reuse-20261007/candidate/nuwax-nav-stack-test",
+        "production_surface_cache_applies_column_changes_and_clear_discards_baseline",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "log": "/workspace/shared/neh-mask-reuse-20261007/candidate/final-stack-focused/05.log",
+      "exit_code": 0,
+      "wall_s": 0.054087963013444096,
+      "user_s": 0.042869,
+      "system_s": 0.013491,
+      "maxrss_kib": 40728,
+      "summary": [
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 242 filtered out; finished in 0.05s"
+      ]
+    },
+    {
+      "selector": "production_derived_surface_carries_deferred_frontier_updates",
+      "command": [
+        "/workspace/shared/neh-mask-reuse-20261007/candidate/nuwax-nav-stack-test",
+        "production_derived_surface_carries_deferred_frontier_updates",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "log": "/workspace/shared/neh-mask-reuse-20261007/candidate/final-stack-focused/06.log",
+      "exit_code": 0,
+      "wall_s": 0.0656512860005023,
+      "user_s": 0.059939,
+      "system_s": 0.009819999999999999,
+      "maxrss_kib": 40728,
+      "summary": [
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 242 filtered out; finished in 0.05s"
+      ]
+    },
+    {
+      "selector": "virtual_mask_is_applied_to_the_surface_and_cache_ignores_only_its_clock",
+      "command": [
+        "/workspace/shared/neh-mask-reuse-20261007/candidate/nuwax-nav-stack-test",
+        "virtual_mask_is_applied_to_the_surface_and_cache_ignores_only_its_clock",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "log": "/workspace/shared/neh-mask-reuse-20261007/candidate/final-stack-focused/07.log",
+      "exit_code": 0,
+      "wall_s": 0.0382882740086643,
+      "user_s": 0.030898,
+      "system_s": 0.008816,
+      "maxrss_kib": 40728,
+      "summary": [
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 242 filtered out; finished in 0.03s"
+      ]
+    },
+    {
+      "selector": "committed_occupancy_revision_reuses_only_exact_virtual_mask_geometry",
+      "command": [
+        "/workspace/shared/neh-mask-reuse-20261007/candidate/nuwax-nav-stack-test",
+        "committed_occupancy_revision_reuses_only_exact_virtual_mask_geometry",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "log": "/workspace/shared/neh-mask-reuse-20261007/candidate/final-stack-focused/08.log",
+      "exit_code": 0,
+      "wall_s": 0.03741266600263771,
+      "user_s": 0.032278999999999995,
+      "system_s": 0.004378,
+      "maxrss_kib": 40728,
+      "summary": [
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 242 filtered out; finished in 0.03s"
+      ]
+    },
+    {
+      "selector": "fullcloud_publication_reuses_only_after_exact_builder_change_detection",
+      "command": [
+        "/workspace/shared/neh-mask-reuse-20261007/candidate/nuwax-nav-stack-test",
+        "fullcloud_publication_reuses_only_after_exact_builder_change_detection",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "log": "/workspace/shared/neh-mask-reuse-20261007/candidate/final-stack-focused/09.log",
+      "exit_code": 0,
+      "wall_s": 0.030351734996656887,
+      "user_s": 0.031710999999999996,
+      "system_s": 0.0,
+      "maxrss_kib": 40728,
+      "summary": [
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 242 filtered out; finished in 0.02s"
+      ]
+    },
+    {
+      "selector": "map_order_and_geometry_reuse_preserve_input_identity_and_receipt_age",
+      "command": [
+        "/workspace/shared/neh-mask-reuse-20261007/candidate/nuwax-nav-stack-test",
+        "map_order_and_geometry_reuse_preserve_input_identity_and_receipt_age",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "log": "/workspace/shared/neh-mask-reuse-20261007/candidate/final-stack-focused/10.log",
+      "exit_code": 0,
+      "wall_s": 0.03759362400160171,
+      "user_s": 0.03312,
+      "system_s": 0.005651,
+      "maxrss_kib": 40728,
+      "summary": [
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 242 filtered out; finished in 0.03s"
+      ]
+    },
+    {
+      "selector": "publication_order_accepts_monotone_scan_and_mask_components_and_rejects_rollback",
+      "command": [
+        "/workspace/shared/neh-mask-reuse-20261007/candidate/nuwax-nav-stack-test",
+        "publication_order_accepts_monotone_scan_and_mask_components_and_rejects_rollback",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "log": "/workspace/shared/neh-mask-reuse-20261007/candidate/final-stack-focused/11.log",
+      "exit_code": 0,
+      "wall_s": 0.011870754999108613,
+      "user_s": 0.007344,
+      "system_s": 0.00358,
+      "maxrss_kib": 40728,
+      "summary": [
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 242 filtered out; finished in 0.00s"
+      ]
+    },
+    {
+      "selector": "mask_only_claim_cannot_change_cloud_and_scan_only_claim_cannot_change_mask",
+      "command": [
+        "/workspace/shared/neh-mask-reuse-20261007/candidate/nuwax-nav-stack-test",
+        "mask_only_claim_cannot_change_cloud_and_scan_only_claim_cannot_change_mask",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "log": "/workspace/shared/neh-mask-reuse-20261007/candidate/final-stack-focused/12.log",
+      "exit_code": 0,
+      "wall_s": 0.010817069007316604,
+      "user_s": 0.003629,
+      "system_s": 0.004652,
+      "maxrss_kib": 40728,
+      "summary": [
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 242 filtered out; finished in 0.00s"
+      ]
+    },
+    {
+      "selector": "held_global_owner_keeps_unchanged_mask_work_but_changed_mask_retires_it",
+      "command": [
+        "/workspace/shared/neh-mask-reuse-20261007/candidate/nuwax-nav-stack-test",
+        "held_global_owner_keeps_unchanged_mask_work_but_changed_mask_retires_it",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "log": "/workspace/shared/neh-mask-reuse-20261007/candidate/final-stack-focused/13.log",
+      "exit_code": 101,
+      "wall_s": 0.009159822002402507,
+      "user_s": 0.007481,
+      "system_s": 0.0,
+      "maxrss_kib": 40728,
+      "summary": [
+        "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 242 filtered out; finished in 0.00s"
+      ]
+    }
+  ],
+  "matched_runs": [
+    {
+      "pair": 1,
+      "arm": "baseline",
+      "command": [
+        "/workspace/shared/neh-mask-reuse-20261007/baseline/nuwax-nav-stack-test",
+        "lcm_dataflow::surface_dataflow::tests::mask_reuse_tests::calibrated_repeated_occupancy_mask_reuse_cost_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "log": "/workspace/shared/neh-mask-reuse-20261007/matched/pair-1-baseline.log",
+      "exit_code": 0,
+      "wall_s": 3.6651629169937223,
+      "user_s": 3.588092,
+      "system_s": 0.101783,
+      "maxrss_kib": 40576,
+      "records": [
+        {
+          "body_path_bits": [
+            [
+              [
+                4607182418800017408,
+                4613937818241073152,
+                4602678819172646912
+              ],
+              [
+                0,
+                0,
+                0,
+                4607182418800017408
+              ]
+            ],
+            [
+              [
+                4616077028196614144,
+                4613825228349374464,
+                4602678819186068685
+              ],
+              [
+                0,
+                0,
+                13794948934602576637,
+                4607182336555781494
+              ]
+            ],
+            [
+              [
+                4619398432904183808,
+                4613825228349374464,
+                4602678819186068685
+              ],
+              [
+                0,
+                0,
+                4575878229744226399,
+                4607182116276504527
+              ]
+            ],
+            [
+              [
+                4619567317775286272,
+                4613937818241073152,
+                4602678819186068685
+              ],
+              [
+                0,
+                0,
+                4594939192749997974,
+                4607066113001071677
+              ]
+            ]
+          ],
+          "case": "unchanged",
+          "cold_pct_ns": 58687601,
+          "cold_surface_ns": 140035543,
+          "fixture": "80x60 flat 0.1m; calibrated square 0.3m; static cloud revision 1",
+          "measured_updates": 16,
+          "pct_arc_rebuilds": 16,
+          "pct_cells": 4800,
+          "pct_path_bits": [
+            [
+              4607182418800017408,
+              4613937818241073152,
+              4591870180066957720
+            ],
+            [
+              4616077028196614144,
+              4613825228349374464,
+              4591870180174331904
+            ],
+            [
+              4619398432904183808,
+              4613825228349374464,
+              4591870180174331904
+            ],
+            [
+              4619567317775286272,
+              4613937818241073152,
+              4591870180174331904
+            ]
+          ],
+          "quality": {
+            "endpoint_error_m": 1.4901161415892261e-09,
+            "length_m": 6.008537571978574,
+            "poses": 4
+          },
+          "surface_arc_replacements": 16,
+          "updates": [
+            {
+              "pct_ns": 67870891,
+              "surface_ns": 9504574
+            },
+            {
+              "pct_ns": 39274585,
+              "surface_ns": 6419240
+            },
+            {
+              "pct_ns": 101430509,
+              "surface_ns": 26342935
+            },
+            {
+              "pct_ns": 79061390,
+              "surface_ns": 7515798
+            },
+            {
+              "pct_ns": 134445535,
+              "surface_ns": 6970752
+            },
+            {
+              "pct_ns": 53758670,
+              "surface_ns": 16467532
+            },
+            {
+              "pct_ns": 47968969,
+              "surface_ns": 8666597
+            },
+            {
+              "pct_ns": 39698182,
+              "surface_ns": 6452927
+            },
+            {
+              "pct_ns": 168489694,
+              "surface_ns": 8146509
+            },
+            {
+              "pct_ns": 44923667,
+              "surface_ns": 7814011
+            },
+            {
+              "pct_ns": 287654444,
+              "surface_ns": 7494561
+            },
+            {
+              "pct_ns": 51767675,
+              "surface_ns": 6422971
+            },
+            {
+              "pct_ns": 54503130,
+              "surface_ns": 9920584
+            },
+            {
+              "pct_ns": 45525758,
+              "surface_ns": 13722370
+            },
+            {
+              "pct_ns": 46914610,
+              "surface_ns": 9961915
+            },
+            {
+              "pct_ns": 69927761,
+              "surface_ns": 8072446
+            }
+          ],
+          "warmup_updates": 3
+        },
+        {
+          "body_path_bits": [
+            [
+              [
+                4607182418800017408,
+                4613937818241073152,
+                4602678819172646912
+              ],
+              [
+                0,
+                0,
+                0,
+                4607182418800017408
+              ]
+            ],
+            [
+              [
+                4616077028196614144,
+                4613825228349374464,
+                4602678819186068685
+              ],
+              [
+                0,
+                0,
+                13794948934602576637,
+                4607182336555781494
+              ]
+            ],
+            [
+              [
+                4619398432904183808,
+                4613825228349374464,
+                4602678819186068685
+              ],
+              [
+                0,
+                0,
+                4575878229744226399,
+                4607182116276504527
+              ]
+            ],
+            [
+              [
+                4619567317775286272,
+                4613937818241073152,
+                4602678819186068685
+              ],
+              [
+                0,
+                0,
+                4594939192749997974,
+                4607066113001071677
+              ]
+            ]
+          ],
+          "case": "changed",
+          "cold_pct_ns": 35078373,
+          "cold_surface_ns": 115337119,
+          "fixture": "80x60 flat 0.1m; calibrated square 0.3m; static cloud revision 1",
+          "measured_updates": 16,
+          "pct_arc_rebuilds": 16,
+          "pct_cells": 4792,
+          "pct_path_bits": [
+            [
+              4607182418800017408,
+              4613937818241073152,
+              4591870180066957720
+            ],
+            [
+              4616077028196614144,
+              4613825228349374464,
+              4591870180174331904
+            ],
+            [
+              4619398432904183808,
+              4613825228349374464,
+              4591870180174331904
+            ],
+            [
+              4619567317775286272,
+              4613937818241073152,
+              4591870180174331904
+            ]
+          ],
+          "quality": {
+            "endpoint_error_m": 1.4901161415892261e-09,
+            "length_m": 6.008537571978574,
+            "poses": 4
+          },
+          "surface_arc_replacements": 16,
+          "updates": [
+            {
+              "pct_ns": 43796576,
+              "surface_ns": 5697077
+            },
+            {
+              "pct_ns": 50338490,
+              "surface_ns": 6819720
+            },
+            {
+              "pct_ns": 39611724,
+              "surface_ns": 5911059
+            },
+            {
+              "pct_ns": 35682833,
+              "surface_ns": 6118092
+            },
+            {
+              "pct_ns": 42915963,
+              "surface_ns": 5778889
+            },
+            {
+              "pct_ns": 42521489,
+              "surface_ns": 8050025
+            },
+            {
+              "pct_ns": 45484616,
+              "surface_ns": 6306829
+            },
+            {
+              "pct_ns": 38347887,
+              "surface_ns": 6579999
+            },
+            {
+              "pct_ns": 38805489,
+              "surface_ns": 6703153
+            },
+            {
+              "pct_ns": 34058997,
+              "surface_ns": 6838367
+            },
+            {
+              "pct_ns": 34190249,
+              "surface_ns": 5588953
+            },
+            {
+              "pct_ns": 40103224,
+              "surface_ns": 6963361
+            },
+            {
+              "pct_ns": 46775796,
+              "surface_ns": 5722812
+            },
+            {
+              "pct_ns": 43490409,
+              "surface_ns": 9421878
+            },
+            {
+              "pct_ns": 34809831,
+              "surface_ns": 6197856
+            },
+            {
+              "pct_ns": 37961007,
+              "surface_ns": 7416398
+            }
+          ],
+          "warmup_updates": 3
+        }
+      ]
+    },
+    {
+      "pair": 1,
+      "arm": "candidate",
+      "command": [
+        "/workspace/shared/neh-mask-reuse-20261007/candidate/nuwax-nav-stack-test",
+        "lcm_dataflow::surface_dataflow::tests::mask_reuse_tests::calibrated_repeated_occupancy_mask_reuse_cost_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "log": "/workspace/shared/neh-mask-reuse-20261007/matched/pair-1-candidate.log",
+      "exit_code": 0,
+      "wall_s": 2.161429011001019,
+      "user_s": 2.132315,
+      "system_s": 0.047951999999999995,
+      "maxrss_kib": 40880,
+      "records": [
+        {
+          "body_path_bits": [
+            [
+              [
+                4607182418800017408,
+                4613937818241073152,
+                4602678819172646912
+              ],
+              [
+                0,
+                0,
+                0,
+                4607182418800017408
+              ]
+            ],
+            [
+              [
+                4616077028196614144,
+                4613825228349374464,
+                4602678819186068685
+              ],
+              [
+                0,
+                0,
+                13794948934602576637,
+                4607182336555781494
+              ]
+            ],
+            [
+              [
+                4619398432904183808,
+                4613825228349374464,
+                4602678819186068685
+              ],
+              [
+                0,
+                0,
+                4575878229744226399,
+                4607182116276504527
+              ]
+            ],
+            [
+              [
+                4619567317775286272,
+                4613937818241073152,
+                4602678819186068685
+              ],
+              [
+                0,
+                0,
+                4594939192749997974,
+                4607066113001071677
+              ]
+            ]
+          ],
+          "case": "unchanged",
+          "cold_pct_ns": 51488197,
+          "cold_surface_ns": 141292298,
+          "fixture": "80x60 flat 0.1m; calibrated square 0.3m; static cloud revision 1",
+          "measured_updates": 16,
+          "pct_arc_rebuilds": 0,
+          "pct_cells": 4800,
+          "pct_path_bits": [
+            [
+              4607182418800017408,
+              4613937818241073152,
+              4591870180066957720
+            ],
+            [
+              4616077028196614144,
+              4613825228349374464,
+              4591870180174331904
+            ],
+            [
+              4619398432904183808,
+              4613825228349374464,
+              4591870180174331904
+            ],
+            [
+              4619567317775286272,
+              4613937818241073152,
+              4591870180174331904
+            ]
+          ],
+          "quality": {
+            "endpoint_error_m": 1.4901161415892261e-09,
+            "length_m": 6.008537571978574,
+            "poses": 4
+          },
+          "surface_arc_replacements": 0,
+          "updates": [
+            {
+              "pct_ns": 1278,
+              "surface_ns": 1465319
+            },
+            {
+              "pct_ns": 1723,
+              "surface_ns": 1567257
+            },
+            {
+              "pct_ns": 1791,
+              "surface_ns": 1628237
+            },
+            {
+              "pct_ns": 1609,
+              "surface_ns": 1490783
+            },
+            {
+              "pct_ns": 8801,
+              "surface_ns": 3560632
+            },
+            {
+              "pct_ns": 4233,
+              "surface_ns": 1964948
+            },
+            {
+              "pct_ns": 4103,
+              "surface_ns": 2266679
+            },
+            {
+              "pct_ns": 2640,
+              "surface_ns": 1829190
+            },
+            {
+              "pct_ns": 2223,
+              "surface_ns": 1756187
+            },
+            {
+              "pct_ns": 1717,
+              "surface_ns": 1541084
+            },
+            {
+              "pct_ns": 1746,
+              "surface_ns": 1657042
+            },
+            {
+              "pct_ns": 1507,
+              "surface_ns": 1517134
+            },
+            {
+              "pct_ns": 2263,
+              "surface_ns": 1875600
+            },
+            {
+              "pct_ns": 2332,
+              "surface_ns": 2074117
+            },
+            {
+              "pct_ns": 4630,
+              "surface_ns": 2817919
+            },
+            {
+              "pct_ns": 1708,
+              "surface_ns": 1547170
+            }
+          ],
+          "warmup_updates": 3
+        },
+        {
+          "body_path_bits": [
+            [
+              [
+                4607182418800017408,
+                4613937818241073152,
+                4602678819172646912
+              ],
+              [
+                0,
+                0,
+                0,
+                4607182418800017408
+              ]
+            ],
+            [
+              [
+                4616077028196614144,
+                4613825228349374464,
+                4602678819186068685
+              ],
+              [
+                0,
+                0,
+                13794948934602576637,
+                4607182336555781494
+              ]
+            ],
+            [
+              [
+                4619398432904183808,
+                4613825228349374464,
+                4602678819186068685
+              ],
+              [
+                0,
+                0,
+                4575878229744226399,
+                4607182116276504527
+              ]
+            ],
+            [
+              [
+                4619567317775286272,
+                4613937818241073152,
+                4602678819186068685
+              ],
+              [
+                0,
+                0,
+                4594939192749997974,
+                4607066113001071677
+              ]
+            ]
+          ],
+          "case": "changed",
+          "cold_pct_ns": 56743624,
+          "cold_surface_ns": 133923377,
+          "fixture": "80x60 flat 0.1m; calibrated square 0.3m; static cloud revision 1",
+          "measured_updates": 16,
+          "pct_arc_rebuilds": 16,
+          "pct_cells": 4792,
+          "pct_path_bits": [
+            [
+              4607182418800017408,
+              4613937818241073152,
+              4591870180066957720
+            ],
+            [
+              4616077028196614144,
+              4613825228349374464,
+              4591870180174331904
+            ],
+            [
+              4619398432904183808,
+              4613825228349374464,
+              4591870180174331904
+            ],
+            [
+              4619567317775286272,
+              4613937818241073152,
+              4591870180174331904
+            ]
+          ],
+          "quality": {
+            "endpoint_error_m": 1.4901161415892261e-09,
+            "length_m": 6.008537571978574,
+            "poses": 4
+          },
+          "surface_arc_replacements": 16,
+          "updates": [
+            {
+              "pct_ns": 49463884,
+              "surface_ns": 6787334
+            },
+            {
+              "pct_ns": 39539852,
+              "surface_ns": 7231458
+            },
+            {
+              "pct_ns": 41196336,
+              "surface_ns": 5806319
+            },
+            {
+              "pct_ns": 37628067,
+              "surface_ns": 6508110
+            },
+            {
+              "pct_ns": 45840506,
+              "surface_ns": 7524432
+            },
+            {
+              "pct_ns": 51303186,
+              "surface_ns": 6546857
+            },
+            {
+              "pct_ns": 57489799,
+              "surface_ns": 6512920
+            },
+            {
+              "pct_ns": 43447232,
+              "surface_ns": 9937829
+            },
+            {
+              "pct_ns": 37771207,
+              "surface_ns": 7565460
+            },
+            {
+              "pct_ns": 38477553,
+              "surface_ns": 9986006
+            },
+            {
+              "pct_ns": 46105910,
+              "surface_ns": 6150323
+            },
+            {
+              "pct_ns": 42953423,
+              "surface_ns": 10039228
+            },
+            {
+              "pct_ns": 34695288,
+              "surface_ns": 7042067
+            },
+            {
+              "pct_ns": 146640654,
+              "surface_ns": 16964184
+            },
+            {
+              "pct_ns": 42279503,
+              "surface_ns": 5977619
+            },
+            {
+              "pct_ns": 39693151,
+              "surface_ns": 6883258
+            }
+          ],
+          "warmup_updates": 3
+        }
+      ]
+    },
+    {
+      "pair": 2,
+      "arm": "candidate",
+      "command": [
+        "/workspace/shared/neh-mask-reuse-20261007/candidate/nuwax-nav-stack-test",
+        "lcm_dataflow::surface_dataflow::tests::mask_reuse_tests::calibrated_repeated_occupancy_mask_reuse_cost_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "log": "/workspace/shared/neh-mask-reuse-20261007/matched/pair-2-candidate.log",
+      "exit_code": 0,
+      "wall_s": 1.9862586689996533,
+      "user_s": 1.953735,
+      "system_s": 0.047744999999999996,
+      "maxrss_kib": 40880,
+      "records": [
+        {
+          "body_path_bits": [
+            [
+              [
+                4607182418800017408,
+                4613937818241073152,
+                4602678819172646912
+              ],
+              [
+                0,
+                0,
+                0,
+                4607182418800017408
+              ]
+            ],
+            [
+              [
+                4616077028196614144,
+                4613825228349374464,
+                4602678819186068685
+              ],
+              [
+                0,
+                0,
+                13794948934602576637,
+                4607182336555781494
+              ]
+            ],
+            [
+              [
+                4619398432904183808,
+                4613825228349374464,
+                4602678819186068685
+              ],
+              [
+                0,
+                0,
+                4575878229744226399,
+                4607182116276504527
+              ]
+            ],
+            [
+              [
+                4619567317775286272,
+                4613937818241073152,
+                4602678819186068685
+              ],
+              [
+                0,
+                0,
+                4594939192749997974,
+                4607066113001071677
+              ]
+            ]
+          ],
+          "case": "unchanged",
+          "cold_pct_ns": 45604965,
+          "cold_surface_ns": 124872464,
+          "fixture": "80x60 flat 0.1m; calibrated square 0.3m; static cloud revision 1",
+          "measured_updates": 16,
+          "pct_arc_rebuilds": 0,
+          "pct_cells": 4800,
+          "pct_path_bits": [
+            [
+              4607182418800017408,
+              4613937818241073152,
+              4591870180066957720
+            ],
+            [
+              4616077028196614144,
+              4613825228349374464,
+              4591870180174331904
+            ],
+            [
+              4619398432904183808,
+              4613825228349374464,
+              4591870180174331904
+            ],
+            [
+              4619567317775286272,
+              4613937818241073152,
+              4591870180174331904
+            ]
+          ],
+          "quality": {
+            "endpoint_error_m": 1.4901161415892261e-09,
+            "length_m": 6.008537571978574,
+            "poses": 4
+          },
+          "surface_arc_replacements": 0,
+          "updates": [
+            {
+              "pct_ns": 5534,
+              "surface_ns": 2702828
+            },
+            {
+              "pct_ns": 5238,
+              "surface_ns": 2553316
+            },
+            {
+              "pct_ns": 1753,
+              "surface_ns": 1571789
+            },
+            {
+              "pct_ns": 4662,
+              "surface_ns": 2606324
+            },
+            {
+              "pct_ns": 2647,
+              "surface_ns": 1876044
+            },
+            {
+              "pct_ns": 3680,
+              "surface_ns": 2335592
+            },
+            {
+              "pct_ns": 5227,
+              "surface_ns": 2012804
+            },
+            {
+              "pct_ns": 2017,
+              "surface_ns": 1568833
+            },
+            {
+              "pct_ns": 4211,
+              "surface_ns": 2207243
+            },
+            {
+              "pct_ns": 2909,
+              "surface_ns": 1804988
+            },
+            {
+              "pct_ns": 1644,
+              "surface_ns": 1483833
+            },
+            {
+              "pct_ns": 967,
+              "surface_ns": 1391436
+            },
+            {
+              "pct_ns": 1038,
+              "surface_ns": 1439041
+            },
+            {
+              "pct_ns": 1595,
+              "surface_ns": 1506542
+            },
+            {
+              "pct_ns": 1536,
+              "surface_ns": 1598184
+            },
+            {
+              "pct_ns": 1200,
+              "surface_ns": 1523430
+            }
+          ],
+          "warmup_updates": 3
+        },
+        {
+          "body_path_bits": [
+            [
+              [
+                4607182418800017408,
+                4613937818241073152,
+                4602678819172646912
+              ],
+              [
+                0,
+                0,
+                0,
+                4607182418800017408
+              ]
+            ],
+            [
+              [
+                4616077028196614144,
+                4613825228349374464,
+                4602678819186068685
+              ],
+              [
+                0,
+                0,
+                13794948934602576637,
+                4607182336555781494
+              ]
+            ],
+            [
+              [
+                4619398432904183808,
+                4613825228349374464,
+                4602678819186068685
+              ],
+              [
+                0,
+                0,
+                4575878229744226399,
+                4607182116276504527
+              ]
+            ],
+            [
+              [
+                4619567317775286272,
+                4613937818241073152,
+                4602678819186068685
+              ],
+              [
+                0,
+                0,
+                4594939192749997974,
+                4607066113001071677
+              ]
+            ]
+          ],
+          "case": "changed",
+          "cold_pct_ns": 41571311,
+          "cold_surface_ns": 108406098,
+          "fixture": "80x60 flat 0.1m; calibrated square 0.3m; static cloud revision 1",
+          "measured_updates": 16,
+          "pct_arc_rebuilds": 16,
+          "pct_cells": 4792,
+          "pct_path_bits": [
+            [
+              4607182418800017408,
+              4613937818241073152,
+              4591870180066957720
+            ],
+            [
+              4616077028196614144,
+              4613825228349374464,
+              4591870180174331904
+            ],
+            [
+              4619398432904183808,
+              4613825228349374464,
+              4591870180174331904
+            ],
+            [
+              4619567317775286272,
+              4613937818241073152,
+              4591870180174331904
+            ]
+          ],
+          "quality": {
+            "endpoint_error_m": 1.4901161415892261e-09,
+            "length_m": 6.008537571978574,
+            "poses": 4
+          },
+          "surface_arc_replacements": 16,
+          "updates": [
+            {
+              "pct_ns": 39974922,
+              "surface_ns": 9378826
+            },
+            {
+              "pct_ns": 42073237,
+              "surface_ns": 9762187
+            },
+            {
+              "pct_ns": 43955108,
+              "surface_ns": 5839812
+            },
+            {
+              "pct_ns": 43756354,
+              "surface_ns": 8982245
+            },
+            {
+              "pct_ns": 58280914,
+              "surface_ns": 6376878
+            },
+            {
+              "pct_ns": 49205035,
+              "surface_ns": 7481648
+            },
+            {
+              "pct_ns": 46186919,
+              "surface_ns": 8037915
+            },
+            {
+              "pct_ns": 33577256,
+              "surface_ns": 6541790
+            },
+            {
+              "pct_ns": 40479561,
+              "surface_ns": 6214905
+            },
+            {
+              "pct_ns": 44147228,
+              "surface_ns": 5911090
+            },
+            {
+              "pct_ns": 54987260,
+              "surface_ns": 5804134
+            },
+            {
+              "pct_ns": 35009522,
+              "surface_ns": 7083949
+            },
+            {
+              "pct_ns": 49928192,
+              "surface_ns": 7108779
+            },
+            {
+              "pct_ns": 71260614,
+              "surface_ns": 12131679
+            },
+            {
+              "pct_ns": 103542384,
+              "surface_ns": 6810509
+            },
+            {
+              "pct_ns": 35423002,
+              "surface_ns": 8755725
+            }
+          ],
+          "warmup_updates": 3
+        }
+      ]
+    },
+    {
+      "pair": 2,
+      "arm": "baseline",
+      "command": [
+        "/workspace/shared/neh-mask-reuse-20261007/baseline/nuwax-nav-stack-test",
+        "lcm_dataflow::surface_dataflow::tests::mask_reuse_tests::calibrated_repeated_occupancy_mask_reuse_cost_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "log": "/workspace/shared/neh-mask-reuse-20261007/matched/pair-2-baseline.log",
+      "exit_code": 0,
+      "wall_s": 3.1447671089990763,
+      "user_s": 3.098792,
+      "system_s": 0.054366,
+      "maxrss_kib": 40880,
+      "records": [
+        {
+          "body_path_bits": [
+            [
+              [
+                4607182418800017408,
+                4613937818241073152,
+                4602678819172646912
+              ],
+              [
+                0,
+                0,
+                0,
+                4607182418800017408
+              ]
+            ],
+            [
+              [
+                4616077028196614144,
+                4613825228349374464,
+                4602678819186068685
+              ],
+              [
+                0,
+                0,
+                13794948934602576637,
+                4607182336555781494
+              ]
+            ],
+            [
+              [
+                4619398432904183808,
+                4613825228349374464,
+                4602678819186068685
+              ],
+              [
+                0,
+                0,
+                4575878229744226399,
+                4607182116276504527
+              ]
+            ],
+            [
+              [
+                4619567317775286272,
+                4613937818241073152,
+                4602678819186068685
+              ],
+              [
+                0,
+                0,
+                4594939192749997974,
+                4607066113001071677
+              ]
+            ]
+          ],
+          "case": "unchanged",
+          "cold_pct_ns": 39578306,
+          "cold_surface_ns": 114521888,
+          "fixture": "80x60 flat 0.1m; calibrated square 0.3m; static cloud revision 1",
+          "measured_updates": 16,
+          "pct_arc_rebuilds": 16,
+          "pct_cells": 4800,
+          "pct_path_bits": [
+            [
+              4607182418800017408,
+              4613937818241073152,
+              4591870180066957720
+            ],
+            [
+              4616077028196614144,
+              4613825228349374464,
+              4591870180174331904
+            ],
+            [
+              4619398432904183808,
+              4613825228349374464,
+              4591870180174331904
+            ],
+            [
+              4619567317775286272,
+              4613937818241073152,
+              4591870180174331904
+            ]
+          ],
+          "quality": {
+            "endpoint_error_m": 1.4901161415892261e-09,
+            "length_m": 6.008537571978574,
+            "poses": 4
+          },
+          "surface_arc_replacements": 16,
+          "updates": [
+            {
+              "pct_ns": 41068546,
+              "surface_ns": 6636052
+            },
+            {
+              "pct_ns": 36425983,
+              "surface_ns": 5700081
+            },
+            {
+              "pct_ns": 66393157,
+              "surface_ns": 6999612
+            },
+            {
+              "pct_ns": 40080477,
+              "surface_ns": 7694467
+            },
+            {
+              "pct_ns": 40182597,
+              "surface_ns": 10053936
+            },
+            {
+              "pct_ns": 52985828,
+              "surface_ns": 8996160
+            },
+            {
+              "pct_ns": 62595215,
+              "surface_ns": 10600801
+            },
+            {
+              "pct_ns": 52312434,
+              "surface_ns": 8045760
+            },
+            {
+              "pct_ns": 41041037,
+              "surface_ns": 8977054
+            },
+            {
+              "pct_ns": 53173423,
+              "surface_ns": 8546210
+            },
+            {
+              "pct_ns": 57462692,
+              "surface_ns": 6821704
+            },
+            {
+              "pct_ns": 58612273,
+              "surface_ns": 7718475
+            },
+            {
+              "pct_ns": 52080452,
+              "surface_ns": 19575167
+            },
+            {
+              "pct_ns": 45547981,
+              "surface_ns": 5858760
+            },
+            {
+              "pct_ns": 46121864,
+              "surface_ns": 5694717
+            },
+            {
+              "pct_ns": 42671743,
+              "surface_ns": 9263398
+            }
+          ],
+          "warmup_updates": 3
+        },
+        {
+          "body_path_bits": [
+            [
+              [
+                4607182418800017408,
+                4613937818241073152,
+                4602678819172646912
+              ],
+              [
+                0,
+                0,
+                0,
+                4607182418800017408
+              ]
+            ],
+            [
+              [
+                4616077028196614144,
+                4613825228349374464,
+                4602678819186068685
+              ],
+              [
+                0,
+                0,
+                13794948934602576637,
+                4607182336555781494
+              ]
+            ],
+            [
+              [
+                4619398432904183808,
+                4613825228349374464,
+                4602678819186068685
+              ],
+              [
+                0,
+                0,
+                4575878229744226399,
+                4607182116276504527
+              ]
+            ],
+            [
+              [
+                4619567317775286272,
+                4613937818241073152,
+                4602678819186068685
+              ],
+              [
+                0,
+                0,
+                4594939192749997974,
+                4607066113001071677
+              ]
+            ]
+          ],
+          "case": "changed",
+          "cold_pct_ns": 45029569,
+          "cold_surface_ns": 204969702,
+          "fixture": "80x60 flat 0.1m; calibrated square 0.3m; static cloud revision 1",
+          "measured_updates": 16,
+          "pct_arc_rebuilds": 16,
+          "pct_cells": 4792,
+          "pct_path_bits": [
+            [
+              4607182418800017408,
+              4613937818241073152,
+              4591870180066957720
+            ],
+            [
+              4616077028196614144,
+              4613825228349374464,
+              4591870180174331904
+            ],
+            [
+              4619398432904183808,
+              4613825228349374464,
+              4591870180174331904
+            ],
+            [
+              4619567317775286272,
+              4613937818241073152,
+              4591870180174331904
+            ]
+          ],
+          "quality": {
+            "endpoint_error_m": 1.4901161415892261e-09,
+            "length_m": 6.008537571978574,
+            "poses": 4
+          },
+          "surface_arc_replacements": 16,
+          "updates": [
+            {
+              "pct_ns": 49240415,
+              "surface_ns": 10091541
+            },
+            {
+              "pct_ns": 67475128,
+              "surface_ns": 9892435
+            },
+            {
+              "pct_ns": 49298128,
+              "surface_ns": 7786371
+            },
+            {
+              "pct_ns": 43753975,
+              "surface_ns": 7294557
+            },
+            {
+              "pct_ns": 49047112,
+              "surface_ns": 10295431
+            },
+            {
+              "pct_ns": 46486308,
+              "surface_ns": 7902362
+            },
+            {
+              "pct_ns": 37418585,
+              "surface_ns": 6539061
+            },
+            {
+              "pct_ns": 41766296,
+              "surface_ns": 6078766
+            },
+            {
+              "pct_ns": 45572396,
+              "surface_ns": 7196147
+            },
+            {
+              "pct_ns": 50174644,
+              "surface_ns": 9089098
+            },
+            {
+              "pct_ns": 46348222,
+              "surface_ns": 5840999
+            },
+            {
+              "pct_ns": 41669436,
+              "surface_ns": 7175269
+            },
+            {
+              "pct_ns": 44367655,
+              "surface_ns": 7375369
+            },
+            {
+              "pct_ns": 53661696,
+              "surface_ns": 9314335
+            },
+            {
+              "pct_ns": 44405154,
+              "surface_ns": 6250048
+            },
+            {
+              "pct_ns": 42268484,
+              "surface_ns": 5853860
+            }
+          ],
+          "warmup_updates": 3
+        }
+      ]
+    },
+    {
+      "pair": 3,
+      "arm": "baseline",
+      "command": [
+        "/workspace/shared/neh-mask-reuse-20261007/baseline/nuwax-nav-stack-test",
+        "lcm_dataflow::surface_dataflow::tests::mask_reuse_tests::calibrated_repeated_occupancy_mask_reuse_cost_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "log": "/workspace/shared/neh-mask-reuse-20261007/matched/pair-3-baseline.log",
+      "exit_code": 0,
+      "wall_s": 3.0649352249893127,
+      "user_s": 3.0601,
+      "system_s": 0.027867,
+      "maxrss_kib": 40880,
+      "records": [
+        {
+          "body_path_bits": [
+            [
+              [
+                4607182418800017408,
+                4613937818241073152,
+                4602678819172646912
+              ],
+              [
+                0,
+                0,
+                0,
+                4607182418800017408
+              ]
+            ],
+            [
+              [
+                4616077028196614144,
+                4613825228349374464,
+                4602678819186068685
+              ],
+              [
+                0,
+                0,
+                13794948934602576637,
+                4607182336555781494
+              ]
+            ],
+            [
+              [
+                4619398432904183808,
+                4613825228349374464,
+                4602678819186068685
+              ],
+              [
+                0,
+                0,
+                4575878229744226399,
+                4607182116276504527
+              ]
+            ],
+            [
+              [
+                4619567317775286272,
+                4613937818241073152,
+                4602678819186068685
+              ],
+              [
+                0,
+                0,
+                4594939192749997974,
+                4607066113001071677
+              ]
+            ]
+          ],
+          "case": "unchanged",
+          "cold_pct_ns": 39309030,
+          "cold_surface_ns": 130552170,
+          "fixture": "80x60 flat 0.1m; calibrated square 0.3m; static cloud revision 1",
+          "measured_updates": 16,
+          "pct_arc_rebuilds": 16,
+          "pct_cells": 4800,
+          "pct_path_bits": [
+            [
+              4607182418800017408,
+              4613937818241073152,
+              4591870180066957720
+            ],
+            [
+              4616077028196614144,
+              4613825228349374464,
+              4591870180174331904
+            ],
+            [
+              4619398432904183808,
+              4613825228349374464,
+              4591870180174331904
+            ],
+            [
+              4619567317775286272,
+              4613937818241073152,
+              4591870180174331904
+            ]
+          ],
+          "quality": {
+            "endpoint_error_m": 1.4901161415892261e-09,
+            "length_m": 6.008537571978574,
+            "poses": 4
+          },
+          "surface_arc_replacements": 16,
+          "updates": [
+            {
+              "pct_ns": 42709943,
+              "surface_ns": 8299341
+            },
+            {
+              "pct_ns": 40765036,
+              "surface_ns": 6390481
+            },
+            {
+              "pct_ns": 41937337,
+              "surface_ns": 6449818
+            },
+            {
+              "pct_ns": 54055558,
+              "surface_ns": 9126688
+            },
+            {
+              "pct_ns": 91458807,
+              "surface_ns": 9376121
+            },
+            {
+              "pct_ns": 58922108,
+              "surface_ns": 22747035
+            },
+            {
+              "pct_ns": 35743714,
+              "surface_ns": 7540482
+            },
+            {
+              "pct_ns": 51009307,
+              "surface_ns": 8657559
+            },
+            {
+              "pct_ns": 50023116,
+              "surface_ns": 9541086
+            },
+            {
+              "pct_ns": 44258511,
+              "surface_ns": 10852768
+            },
+            {
+              "pct_ns": 52257035,
+              "surface_ns": 5729877
+            },
+            {
+              "pct_ns": 65116042,
+              "surface_ns": 12585148
+            },
+            {
+              "pct_ns": 44523314,
+              "surface_ns": 8405433
+            },
+            {
+              "pct_ns": 45387234,
+              "surface_ns": 6853538
+            },
+            {
+              "pct_ns": 40045722,
+              "surface_ns": 7847514
+            },
+            {
+              "pct_ns": 51410253,
+              "surface_ns": 5801543
+            }
+          ],
+          "warmup_updates": 3
+        },
+        {
+          "body_path_bits": [
+            [
+              [
+                4607182418800017408,
+                4613937818241073152,
+                4602678819172646912
+              ],
+              [
+                0,
+                0,
+                0,
+                4607182418800017408
+              ]
+            ],
+            [
+              [
+                4616077028196614144,
+                4613825228349374464,
+                4602678819186068685
+              ],
+              [
+                0,
+                0,
+                13794948934602576637,
+                4607182336555781494
+              ]
+            ],
+            [
+              [
+                4619398432904183808,
+                4613825228349374464,
+                4602678819186068685
+              ],
+              [
+                0,
+                0,
+                4575878229744226399,
+                4607182116276504527
+              ]
+            ],
+            [
+              [
+                4619567317775286272,
+                4613937818241073152,
+                4602678819186068685
+              ],
+              [
+                0,
+                0,
+                4594939192749997974,
+                4607066113001071677
+              ]
+            ]
+          ],
+          "case": "changed",
+          "cold_pct_ns": 50607214,
+          "cold_surface_ns": 115474497,
+          "fixture": "80x60 flat 0.1m; calibrated square 0.3m; static cloud revision 1",
+          "measured_updates": 16,
+          "pct_arc_rebuilds": 16,
+          "pct_cells": 4792,
+          "pct_path_bits": [
+            [
+              4607182418800017408,
+              4613937818241073152,
+              4591870180066957720
+            ],
+            [
+              4616077028196614144,
+              4613825228349374464,
+              4591870180174331904
+            ],
+            [
+              4619398432904183808,
+              4613825228349374464,
+              4591870180174331904
+            ],
+            [
+              4619567317775286272,
+              4613937818241073152,
+              4591870180174331904
+            ]
+          ],
+          "quality": {
+            "endpoint_error_m": 1.4901161415892261e-09,
+            "length_m": 6.008537571978574,
+            "poses": 4
+          },
+          "surface_arc_replacements": 16,
+          "updates": [
+            {
+              "pct_ns": 47368369,
+              "surface_ns": 8469501
+            },
+            {
+              "pct_ns": 40330084,
+              "surface_ns": 5788813
+            },
+            {
+              "pct_ns": 52789174,
+              "surface_ns": 7031366
+            },
+            {
+              "pct_ns": 50982535,
+              "surface_ns": 12419784
+            },
+            {
+              "pct_ns": 36088444,
+              "surface_ns": 7691775
+            },
+            {
+              "pct_ns": 43340437,
+              "surface_ns": 5881042
+            },
+            {
+              "pct_ns": 41712353,
+              "surface_ns": 7184087
+            },
+            {
+              "pct_ns": 63040037,
+              "surface_ns": 6277370
+            },
+            {
+              "pct_ns": 42250362,
+              "surface_ns": 6783217
+            },
+            {
+              "pct_ns": 45574788,
+              "surface_ns": 7959373
+            },
+            {
+              "pct_ns": 40226349,
+              "surface_ns": 7487743
+            },
+            {
+              "pct_ns": 60772871,
+              "surface_ns": 10010423
+            },
+            {
+              "pct_ns": 46995051,
+              "surface_ns": 11098489
+            },
+            {
+              "pct_ns": 36602733,
+              "surface_ns": 8064829
+            },
+            {
+              "pct_ns": 43566826,
+              "surface_ns": 6359733
+            },
+            {
+              "pct_ns": 48424663,
+              "surface_ns": 11556362
+            }
+          ],
+          "warmup_updates": 3
+        }
+      ]
+    },
+    {
+      "pair": 3,
+      "arm": "candidate",
+      "command": [
+        "/workspace/shared/neh-mask-reuse-20261007/candidate/nuwax-nav-stack-test",
+        "lcm_dataflow::surface_dataflow::tests::mask_reuse_tests::calibrated_repeated_occupancy_mask_reuse_cost_baseline",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "log": "/workspace/shared/neh-mask-reuse-20261007/matched/pair-3-candidate.log",
+      "exit_code": 0,
+      "wall_s": 2.0700432069861563,
+      "user_s": 2.031725,
+      "system_s": 0.064913,
+      "maxrss_kib": 40880,
+      "records": [
+        {
+          "body_path_bits": [
+            [
+              [
+                4607182418800017408,
+                4613937818241073152,
+                4602678819172646912
+              ],
+              [
+                0,
+                0,
+                0,
+                4607182418800017408
+              ]
+            ],
+            [
+              [
+                4616077028196614144,
+                4613825228349374464,
+                4602678819186068685
+              ],
+              [
+                0,
+                0,
+                13794948934602576637,
+                4607182336555781494
+              ]
+            ],
+            [
+              [
+                4619398432904183808,
+                4613825228349374464,
+                4602678819186068685
+              ],
+              [
+                0,
+                0,
+                4575878229744226399,
+                4607182116276504527
+              ]
+            ],
+            [
+              [
+                4619567317775286272,
+                4613937818241073152,
+                4602678819186068685
+              ],
+              [
+                0,
+                0,
+                4594939192749997974,
+                4607066113001071677
+              ]
+            ]
+          ],
+          "case": "unchanged",
+          "cold_pct_ns": 190349954,
+          "cold_surface_ns": 134994893,
+          "fixture": "80x60 flat 0.1m; calibrated square 0.3m; static cloud revision 1",
+          "measured_updates": 16,
+          "pct_arc_rebuilds": 0,
+          "pct_cells": 4800,
+          "pct_path_bits": [
+            [
+              4607182418800017408,
+              4613937818241073152,
+              4591870180066957720
+            ],
+            [
+              4616077028196614144,
+              4613825228349374464,
+              4591870180174331904
+            ],
+            [
+              4619398432904183808,
+              4613825228349374464,
+              4591870180174331904
+            ],
+            [
+              4619567317775286272,
+              4613937818241073152,
+              4591870180174331904
+            ]
+          ],
+          "quality": {
+            "endpoint_error_m": 1.4901161415892261e-09,
+            "length_m": 6.008537571978574,
+            "poses": 4
+          },
+          "surface_arc_replacements": 0,
+          "updates": [
+            {
+              "pct_ns": 6301,
+              "surface_ns": 5147014
+            },
+            {
+              "pct_ns": 6087,
+              "surface_ns": 6923602
+            },
+            {
+              "pct_ns": 6943,
+              "surface_ns": 8774398
+            },
+            {
+              "pct_ns": 5513,
+              "surface_ns": 4300514
+            },
+            {
+              "pct_ns": 6578,
+              "surface_ns": 6843548
+            },
+            {
+              "pct_ns": 5139,
+              "surface_ns": 9503199
+            },
+            {
+              "pct_ns": 4975,
+              "surface_ns": 6070263
+            },
+            {
+              "pct_ns": 5050,
+              "surface_ns": 4934073
+            },
+            {
+              "pct_ns": 5423,
+              "surface_ns": 10908410
+            },
+            {
+              "pct_ns": 4641,
+              "surface_ns": 5681279
+            },
+            {
+              "pct_ns": 4548,
+              "surface_ns": 5640150
+            },
+            {
+              "pct_ns": 7593,
+              "surface_ns": 11965783
+            },
+            {
+              "pct_ns": 4499,
+              "surface_ns": 5199147
+            },
+            {
+              "pct_ns": 5632,
+              "surface_ns": 9408297
+            },
+            {
+              "pct_ns": 488185,
+              "surface_ns": 2905622
+            },
+            {
+              "pct_ns": 3237,
+              "surface_ns": 1945410
+            }
+          ],
+          "warmup_updates": 3
+        },
+        {
+          "body_path_bits": [
+            [
+              [
+                4607182418800017408,
+                4613937818241073152,
+                4602678819172646912
+              ],
+              [
+                0,
+                0,
+                0,
+                4607182418800017408
+              ]
+            ],
+            [
+              [
+                4616077028196614144,
+                4613825228349374464,
+                4602678819186068685
+              ],
+              [
+                0,
+                0,
+                13794948934602576637,
+                4607182336555781494
+              ]
+            ],
+            [
+              [
+                4619398432904183808,
+                4613825228349374464,
+                4602678819186068685
+              ],
+              [
+                0,
+                0,
+                4575878229744226399,
+                4607182116276504527
+              ]
+            ],
+            [
+              [
+                4619567317775286272,
+                4613937818241073152,
+                4602678819186068685
+              ],
+              [
+                0,
+                0,
+                4594939192749997974,
+                4607066113001071677
+              ]
+            ]
+          ],
+          "case": "changed",
+          "cold_pct_ns": 42329405,
+          "cold_surface_ns": 118797628,
+          "fixture": "80x60 flat 0.1m; calibrated square 0.3m; static cloud revision 1",
+          "measured_updates": 16,
+          "pct_arc_rebuilds": 16,
+          "pct_cells": 4792,
+          "pct_path_bits": [
+            [
+              4607182418800017408,
+              4613937818241073152,
+              4591870180066957720
+            ],
+            [
+              4616077028196614144,
+              4613825228349374464,
+              4591870180174331904
+            ],
+            [
+              4619398432904183808,
+              4613825228349374464,
+              4591870180174331904
+            ],
+            [
+              4619567317775286272,
+              4613937818241073152,
+              4591870180174331904
+            ]
+          ],
+          "quality": {
+            "endpoint_error_m": 1.4901161415892261e-09,
+            "length_m": 6.008537571978574,
+            "poses": 4
+          },
+          "surface_arc_replacements": 16,
+          "updates": [
+            {
+              "pct_ns": 39507900,
+              "surface_ns": 8152799
+            },
+            {
+              "pct_ns": 34038867,
+              "surface_ns": 5798507
+            },
+            {
+              "pct_ns": 41154823,
+              "surface_ns": 7120510
+            },
+            {
+              "pct_ns": 36242028,
+              "surface_ns": 6167583
+            },
+            {
+              "pct_ns": 58567398,
+              "surface_ns": 7258798
+            },
+            {
+              "pct_ns": 34980139,
+              "surface_ns": 6461884
+            },
+            {
+              "pct_ns": 41077647,
+              "surface_ns": 7646894
+            },
+            {
+              "pct_ns": 35176565,
+              "surface_ns": 7046834
+            },
+            {
+              "pct_ns": 49351761,
+              "surface_ns": 5826027
+            },
+            {
+              "pct_ns": 45935154,
+              "surface_ns": 7596506
+            },
+            {
+              "pct_ns": 42015518,
+              "surface_ns": 8311814
+            },
+            {
+              "pct_ns": 34775030,
+              "surface_ns": 6000736
+            },
+            {
+              "pct_ns": 47064304,
+              "surface_ns": 7452659
+            },
+            {
+              "pct_ns": 38284679,
+              "surface_ns": 8130586
+            },
+            {
+              "pct_ns": 48063652,
+              "surface_ns": 9839832
+            },
+            {
+              "pct_ns": 37175038,
+              "surface_ns": 7011715
+            }
+          ],
+          "warmup_updates": 3
+        }
+      ]
+    }
+  ],
+  "summary": {
+    "unchanged": {
+      "baseline": {
+        "surface_ns": {
+          "pooled_median_ms": 8.1094775,
+          "process_medians_ms": [
+            8.1094775,
+            7.8821175,
+            8.352387
+          ],
+          "sample_count": 48
+        },
+        "pct_ns": {
+          "pooled_median_ms": 51.20978,
+          "process_medians_ms": [
+            54.1309,
+            49.101158,
+            47.705175
+          ],
+          "sample_count": 48
+        },
+        "combined_ns": {
+          "pooled_median_ms": 58.719387,
+          "process_medians_ms": [
+            67.324958,
+            56.1466675,
+            56.1615375
+          ],
+          "sample_count": 48
+        },
+        "pct_arc_rebuilds": [
+          16,
+          16,
+          16
+        ],
+        "surface_arc_replacements": [
+          16,
+          16,
+          16
+        ]
+      },
+      "candidate": {
+        "surface_ns": {
+          "pooled_median_ms": 2.0434605,
+          "process_medians_ms": [
+            1.7066145,
+            1.701586,
+            5.875771
+          ],
+          "sample_count": 48
+        },
+        "pct_ns": {
+          "pooled_median_ms": 0.0038915,
+          "process_medians_ms": [
+            0.002007,
+            0.002332,
+            0.005468
+          ],
+          "sample_count": 48
+        },
+        "combined_ns": {
+          "pooled_median_ms": 2.04724,
+          "process_medians_ms": [
+            1.708599,
+            1.7038085,
+            5.880579
+          ],
+          "sample_count": 48
+        },
+        "pct_arc_rebuilds": [
+          0,
+          0,
+          0
+        ],
+        "surface_arc_replacements": [
+          0,
+          0,
+          0
+        ]
+      }
+    },
+    "changed": {
+      "baseline": {
+        "surface_ns": {
+          "pooled_median_ms": 7.1033175,
+          "process_medians_ms": [
+            6.443414,
+            7.334963,
+            7.589759
+          ],
+          "sample_count": 48
+        },
+        "pct_ns": {
+          "pooled_median_ms": 43.6604005,
+          "process_medians_ms": [
+            39.857474,
+            45.960309,
+            44.570807
+          ],
+          "sample_count": 48
+        },
+        "combined_ns": {
+          "pooled_median_ms": 50.613358,
+          "process_medians_ms": [
+            46.294684,
+            52.478882,
+            51.73036
+          ],
+          "sample_count": 48
+        },
+        "pct_arc_rebuilds": [
+          16,
+          16,
+          16
+        ],
+        "surface_arc_replacements": [
+          16,
+          16,
+          16
+        ]
+      },
+      "candidate": {
+        "surface_ns": {
+          "pooled_median_ms": 7.096364,
+          "process_medians_ms": [
+            6.9626625,
+            7.096364,
+            7.189654
+          ],
+          "sample_count": 48
+        },
+        "pct_ns": {
+          "pooled_median_ms": 42.17637,
+          "process_medians_ms": [
+            42.616463,
+            44.051168,
+            40.2927735
+          ],
+          "sample_count": 48
+        },
+        "combined_ns": {
+          "pooled_median_ms": 49.926619,
+          "process_medians_ms": [
+            50.359896,
+            52.2870115,
+            47.968016
+          ],
+          "sample_count": 48
+        },
+        "pct_arc_rebuilds": [
+          16,
+          16,
+          16
+        ],
+        "surface_arc_replacements": [
+          16,
+          16,
+          16
+        ]
+      }
+    }
+  },
+  "measurement_limits": [
+    "3 process pairs; 16 update samples per case/process are correlated, not 48 independent processes",
+    "Mixed test profile: MLS/runtime opt3, stack/PCT opt0; no release or robot latency claim",
+    "Stage timers are wall time; process CPU/RSS include both cases, fixtures, cold builds, assertions, oracles and teardown",
+    "launch RSS has an inherited process-envelope floor; no memory-saving claim",
+    "Actual changed geometry still rebuilds full/global or local-window PCT; unchanged-mask frequency in live deployment unmeasured",
+    "Existing MotionGuard AF_UNIX and cadence limitations remain open",
+    "Changed masks can pay a full extra O(M) equality pass before rebuilding; measured off-route patch is not a last-cell-mismatch worst-case timing test"
+  ]
+}

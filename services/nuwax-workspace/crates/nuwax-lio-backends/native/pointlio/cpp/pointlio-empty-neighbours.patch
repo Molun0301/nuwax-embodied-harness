@@ -1,0 +1,26 @@
+--- a/src/Estimator.cpp
++++ b/src/Estimator.cpp
+@@ -127,7 +127,10 @@
+ 		p_world << point_world_j.x, point_world_j.y, point_world_j.z;
+ 		{
+ 			auto &points_near = Nearest_Points[idx+j+1];
+-            ivox_->GetClosestPoint(point_world_j, points_near, NUM_MATCH_POINTS); // 
++            if (!ivox_->GetClosestPoint(point_world_j, points_near, NUM_MATCH_POINTS)) {
++                // 新查询失败时清空旧邻域，避免旧对应进入观测和地图维护。
++                points_near.clear();
++            }
+ 			if ((points_near.size() < NUM_MATCH_POINTS)) // || pointSearchSqDis[NUM_MATCH_POINTS - 1] > 5) // 5)
+ 			{
+ 				point_selected_surf[idx+j+1] = false;
+@@ -234,7 +237,10 @@
+ 		{
+ 			auto &points_near = Nearest_Points[idx+j+1];
+ 			
+-            ivox_->GetClosestPoint(point_world_j, points_near, NUM_MATCH_POINTS); // 
++            if (!ivox_->GetClosestPoint(point_world_j, points_near, NUM_MATCH_POINTS)) {
++                // 新查询失败时清空旧邻域，避免旧对应进入观测和地图维护。
++                points_near.clear();
++            }
+ 			
+ 			if ((points_near.size() < NUM_MATCH_POINTS)) // || pointSearchSqDis[NUM_MATCH_POINTS - 1] > 5)
+ 			{

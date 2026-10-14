@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "version": "0.1.0",
+  "channel": "stable",
+  "build_jobs": 2,
+  "targets": [
+    "ubuntu24-x86_64:core",
+    "ubuntu24-x86_64:geometry",
+    "ubuntu24-x86_64:navigation",
+    "ubuntu24-x86_64:fastlio2",
+    "ubuntu24-x86_64:pointlio",
+    "ubuntu24-x86_64:fastlio2-navigation",
+    "ubuntu24-x86_64:pointlio-navigation",
+    "ubuntu24-aarch64:core",
+    "ubuntu24-aarch64:geometry",
+    "ubuntu24-aarch64:navigation",
+    "ubuntu24-aarch64:fastlio2",
+    "ubuntu24-aarch64:pointlio",
+    "ubuntu24-aarch64:fastlio2-navigation",
+    "ubuntu24-aarch64:pointlio-navigation",
+    "go2-jetson:core",
+    "go2-jetson:geometry",
+    "go2-jetson:navigation",
+    "go2-jetson:fastlio2",
+    "go2-jetson:pointlio",
+    "go2-jetson:fastlio2-navigation",
+    "go2-jetson:pointlio-navigation"
+  ],
+  "notes": "NEH轻量安装与在线更新；提供Ubuntu24.04双架构及Go2 Ubuntu20.04 ARM64的基础、几何、双LIO及导航模块组合，共21个业务包。模型和第三方依赖按固定来源单独下载。感知、记忆、跟随及全模块组合尚未纳入首发，详见公开使用文档。"
+}

@@ -1,0 +1,20 @@
+--- services/artifact_store.py
++++ services/artifact_store.py
+@@ -514,7 +514,16 @@
+             meta_path = self._find_meta_path(artifact_id)
+             if meta_path is None:
+                 raise ArtifactNotFoundError(artifact_id)
+-            return self._read_entry(meta_path, None).ref.model_copy(deep=True)
++            ref = self._read_entry(meta_path, None).ref.model_copy(deep=True)
++            cached = self._paths.get(artifact_id)
++            if cached is None or cached.parent != meta_path.parent:
++                try:
++                    payload = self._find_file_path(artifact_id)
++                except OSError:
++                    payload = None
++                if payload is not None and payload.parent == meta_path.parent:
++                    self._paths[artifact_id] = payload
++            return ref
+ 
+     def get_file_path(self, artifact_id: str) -> Path:
+         """解析当前制品文件路径，缓存命中也验证文件仍存在。"""

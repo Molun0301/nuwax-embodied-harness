@@ -1,0 +1,59 @@
+package nuwax_msgs;
+
+struct NativePgoRequest {
+    const int32_t SCHEMA_VERSION_V3 = 3;
+    const int32_t BACKEND_NATIVE_PGO = 2;
+    const int64_t MAX_REGISTERED_BODY_POINT_COUNT = 100000;
+    const int32_t MAX_REGISTERED_BODY_COORDINATE_COUNT = 300000;
+    // Existing geometry bound; occupancy payload is not consumed by native PGO.
+    const int32_t MAX_COMMITTED_MAP_CELL_COUNT = 67108864;
+
+    int32_t schema_version;
+    int32_t backend;
+    int64_t runtime_generation;
+    int64_t backend_generation;
+    int64_t request_sequence;
+    string mapping_session_id;
+    int64_t mapping_session_generation;
+    // Actual occupancy-owner domain; distinct from correction backend_generation.
+    string mapping_backend_kind;
+    int64_t mapping_backend_generation;
+    int64_t map_frame_generation;
+    byte mapping_commit_boot_nonce[16];
+    int64_t mapping_commit_sequence;
+    int64_t occupancy_revision;
+    int64_t cloud_revision;
+    // Zero is a valid present source timestamp, never an absence sentinel.
+    int64_t committed_map_source_timestamp_ns;
+    // Existing admitted LIO source domain, not the correction backend.
+    int32_t registered_cloud_backend;
+    int64_t registered_cloud_runtime_generation;
+    int64_t registered_cloud_source_sequence;
+    // Zero is valid when registered_cloud_source_sequence is positive.
+    int64_t registered_cloud_source_timestamp_ns;
+    // Original admitted scan count; the selected body payload may be smaller.
+    int64_t registered_cloud_point_count;
+    int64_t registered_body_point_count;
+    int32_t registered_body_coordinate_count;
+    // Exact selected x/y/z triples in points_frame_id, which equals body_frame_id.
+    double registered_body_points_xyz[registered_body_coordinate_count];
+    int64_t correlated_odom_source_sequence;
+    // Zero is valid when correlated_odom_source_sequence is positive.
+    int64_t correlated_odom_source_timestamp_ns;
+    // Frozen absolute odom<-body pose correlated to the registered cloud.
+    double frozen_odom_translation_m[3];
+    // Quaternion component order is x, y, z, w.
+    double frozen_odom_rotation_xyzw[4];
+    int64_t committed_map_width;
+    int64_t committed_map_height;
+    double committed_map_resolution_m;
+    double committed_map_origin_x_m;
+    double committed_map_origin_y_m;
+    int64_t source_timestamp_ns;
+    string map_frame_id;
+    string odom_frame_id;
+    string body_frame_id;
+    string points_frame_id;
+    byte correction_lease_boot_nonce[16];
+    int64_t correction_lease_generation;
+}

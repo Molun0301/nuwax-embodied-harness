@@ -1,0 +1,116 @@
+{
+  "baseline_commit": "66176b86a82ffa272a427cd73cfffc121702b100",
+  "scope": "Actual SemanticRegionLayer and bundled Three CPU objects; 3 synthetic square regions and stub Canvas2D. Allocation/disposal counts only; no browser, WebGL, network or GPU timing.",
+  "baseline": [
+    {
+      "name": "bootstrap",
+      "canvasesCreated": 3,
+      "resourcesDisposed": 0,
+      "priorResourcesRetained": 0,
+      "priorResourceCount": 0,
+      "currentResourceCount": 18
+    },
+    {
+      "name": "selection-only",
+      "canvasesCreated": 0,
+      "resourcesDisposed": 0,
+      "priorResourcesRetained": 18,
+      "priorResourceCount": 18,
+      "currentResourceCount": 18
+    },
+    {
+      "name": "one-region-revision-only",
+      "canvasesCreated": 3,
+      "resourcesDisposed": 18,
+      "priorResourcesRetained": 0,
+      "priorResourceCount": 18,
+      "currentResourceCount": 18
+    },
+    {
+      "name": "one-region-label",
+      "canvasesCreated": 3,
+      "resourcesDisposed": 18,
+      "priorResourcesRetained": 0,
+      "priorResourceCount": 18,
+      "currentResourceCount": 18
+    },
+    {
+      "name": "one-region-polygon",
+      "canvasesCreated": 3,
+      "resourcesDisposed": 18,
+      "priorResourcesRetained": 0,
+      "priorResourceCount": 18,
+      "currentResourceCount": 18
+    },
+    {
+      "name": "binding-only-revision",
+      "canvasesCreated": 3,
+      "resourcesDisposed": 18,
+      "priorResourcesRetained": 0,
+      "priorResourceCount": 18,
+      "currentResourceCount": 18
+    },
+    {
+      "scope": "Actual SemanticRegionLayer + bundled Three CPU objects; synthetic regions, stub Canvas2D, no browser or GPU measurement",
+      "allResourcesDisposedExactlyOnce": true,
+      "canvasesTotal": 15,
+      "totalResources": 90
+    }
+  ],
+  "candidate": [
+    {
+      "name": "bootstrap",
+      "canvasesCreated": 3,
+      "resourcesDisposed": 0,
+      "priorResourcesRetained": 0,
+      "priorResourceCount": 0,
+      "currentResourceCount": 18
+    },
+    {
+      "name": "selection-only",
+      "canvasesCreated": 0,
+      "resourcesDisposed": 0,
+      "priorResourcesRetained": 18,
+      "priorResourceCount": 18,
+      "currentResourceCount": 18
+    },
+    {
+      "name": "one-region-revision-only",
+      "canvasesCreated": 0,
+      "resourcesDisposed": 0,
+      "priorResourcesRetained": 18,
+      "priorResourceCount": 18,
+      "currentResourceCount": 18
+    },
+    {
+      "name": "one-region-label",
+      "canvasesCreated": 1,
+      "resourcesDisposed": 2,
+      "priorResourcesRetained": 16,
+      "priorResourceCount": 18,
+      "currentResourceCount": 18
+    },
+    {
+      "name": "one-region-polygon",
+      "canvasesCreated": 0,
+      "resourcesDisposed": 2,
+      "priorResourcesRetained": 16,
+      "priorResourceCount": 18,
+      "currentResourceCount": 18
+    },
+    {
+      "name": "binding-only-revision",
+      "canvasesCreated": 3,
+      "resourcesDisposed": 18,
+      "priorResourcesRetained": 0,
+      "priorResourceCount": 18,
+      "currentResourceCount": 18
+    },
+    {
+      "scope": "Actual SemanticRegionLayer + bundled Three CPU objects; synthetic regions, stub Canvas2D, no browser or GPU measurement",
+      "allResourcesDisposedExactlyOnce": true,
+      "canvasesTotal": 7,
+      "totalResources": 40
+    }
+  ]
+}

@@ -2,15 +2,15 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import asdict, is_dataclass
-import hashlib
 import json
+from uuid import uuid4
 
 from contracts.runtime_views import DiagnosticItem, DiagnosticLevel, DiagnosticSnapshot, RobotStatusSnapshot
 from contracts.events import RuntimeEventCategory
 from core import EventBus, StateNamespace, StateStore, StreamBus
-from drivers.common.assembly import RobotAssemblyBase
-from gateways.errors import GatewayError
+from core.errors import GatewayError
 from providers import SafetyProvider, StateProvider
+from providers.data_plane import RobotAssemblyProtocol
 from typing import Deque, List, Optional, Tuple
 
 
@@ -19,7 +19,7 @@ class RobotStateService:
 
     def __init__(
         self,
-        robot: RobotAssemblyBase,
+        robot: RobotAssemblyProtocol,
         *,
         state_store: StateStore,
         event_bus: Optional[EventBus] = None,
@@ -35,6 +35,7 @@ class RobotStateService:
         self._diagnostic_history: Deque[DiagnosticSnapshot] = deque(maxlen=max(1, diagnostic_history_limit))
         self._latest_snapshot: Optional[RobotStatusSnapshot] = None
         self._last_web_state_signature: Optional[str] = None
+        self._web_state_source_epoch = uuid4().hex
         self._web_state_revision = 0
 
     def refresh(self) -> RobotStatusSnapshot:
@@ -114,14 +115,12 @@ class RobotStateService:
             return snapshot
         self._last_web_state_signature = web_state_signature
         self._web_state_revision += 1
-        content_hash = hashlib.sha256(web_state_signature.encode("utf-8")).hexdigest()
         web_state_metadata = {
             "robot_name": self._robot.manifest.robot_name,
             "mode": getattr(getattr(robot_state, "mode", None), "value", None),
             "diagnostic_count": len(diagnostics),
             "revision": self._web_state_revision,
-            "content_hash": content_hash,
-            "signature": content_hash,
+            "source_epoch": self._web_state_source_epoch,
             "change_policy": "web_semantic_fields",
         }
 
@@ -137,7 +136,7 @@ class RobotStateService:
                         "mode": robot_state.mode.value,
                         "diagnostic_count": len(diagnostics),
                         "revision": self._web_state_revision,
-                        "content_hash": content_hash,
+                        "source_epoch": self._web_state_source_epoch,
                     },
                 )
             )
@@ -147,7 +146,8 @@ class RobotStateService:
                 source="robot_state_service",
                 payload=snapshot,
                 frame_id=getattr(robot_state, "frame_id", None),
-                revision=str(self._web_state_revision),
+                # 旧控制台只读取信封 revision，也必须识别服务重启后的新生命周期。
+                revision=f"robot-state:{self._web_state_source_epoch}:{self._web_state_revision}",
                 status="available",
                 metadata=web_state_metadata,
             )
@@ -212,6 +212,10 @@ class RobotStateService:
             "twist",
             "joints",
             "imu",
+            # 高频惯性载荷与姿态派生数值只更新完整快照，不驱动网页语义修订。
+            "canonical_imu_sample",
+            "orientation_yaw_rate_rps",
+            "yaw_stabilization_offset_rad",
             "timestamp",
             "updated_at",
             "source_timestamp",
@@ -291,20 +295,16 @@ class RobotStateService:
                         message=item.message or "适配器健康检查失败。",
                     )
                 )
-        if not safety_state.can_move:
+        if safety_state.can_move is not True:
             diagnostics.append(
                 DiagnosticItem(
                     component="safety",
                     level=DiagnosticLevel.WARNING,
-                    message=safety_state.warning_message or "当前机器人不允许移动。",
-                )
-            )
-        if safety_state.is_estopped:
-            diagnostics.append(
-                DiagnosticItem(
-                    component="safety",
-                    level=DiagnosticLevel.ERROR,
-                    message="机器人处于急停状态。",
+                    message=safety_state.warning_message or (
+                        "当前机器人运动状态尚未确认。"
+                        if safety_state.can_move is None
+                        else "当前机器人运动执行链不可用。"
+                    ),
                 )
             )
         return diagnostics

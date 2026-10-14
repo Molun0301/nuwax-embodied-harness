@@ -1,0 +1,2385 @@
+{
+  "python": "3.8.10 (default, Oct 13 2026, 08:57:26) \n[GCC 14.2.0]",
+  "capacity_fixtures_only": true,
+  "rows": [
+    {
+      "handler_ms": 1.6196950018638745,
+      "bytes": 2340,
+      "max_heartbeat_gap_ms": 1.71943599707447,
+      "max_initialize_handler_ms": 0.6906830021762289,
+      "max_initialize_scheduled_ms": 0.9125470023718663,
+      "renders": [
+        {
+          "ms": 0.028602997190319,
+          "on_loop": true,
+          "context": "context-preserved"
+        }
+      ],
+      "heartbeat_gaps_ms": [
+        1.1140920032630675,
+        1.2057909989380278,
+        1.4097379971644841,
+        1.1968469989369623,
+        1.1017830038326792,
+        1.71943599707447,
+        1.5551380056422204,
+        1.1858299985760823,
+        1.6210479952860624,
+        1.244588005647529
+      ],
+      "initialize_samples": [
+        {
+          "handler_ms": 0.38949800364207476,
+          "scheduled_ms": 0.6139469987829216
+        },
+        {
+          "handler_ms": 0.6906830021762289,
+          "scheduled_ms": 0.9125470023718663
+        },
+        {
+          "handler_ms": 0.4303289970266633,
+          "scheduled_ms": 0.6541469992953353
+        },
+        {
+          "handler_ms": 0.5766610047430731,
+          "scheduled_ms": 0.8015400017029606
+        },
+        {
+          "handler_ms": 0.3204740060027689,
+          "scheduled_ms": 0.6070759991416708
+        }
+      ],
+      "target_wire_bytes": 2048,
+      "arm": "baseline",
+      "pair": 0,
+      "exact_response_equal": true
+    },
+    {
+      "handler_ms": 1.5680769938626327,
+      "bytes": 2340,
+      "max_heartbeat_gap_ms": 1.58867899881443,
+      "max_initialize_handler_ms": 0.582929998927284,
+      "max_initialize_scheduled_ms": 0.8510339976055548,
+      "renders": [
+        {
+          "ms": 0.018318001821171492,
+          "on_loop": false,
+          "context": "context-preserved"
+        }
+      ],
+      "heartbeat_gaps_ms": [
+        1.358601999527309,
+        1.2285339980735444,
+        1.3895480005885474,
+        1.177898004243616,
+        1.098788998206146,
+        1.58867899881443,
+        1.4445210035773925,
+        1.2210329950903542,
+        1.361075002932921,
+        1.2805129954358563
+      ],
+      "initialize_samples": [
+        {
+          "handler_ms": 0.360744001227431,
+          "scheduled_ms": 0.8510339976055548
+        },
+        {
+          "handler_ms": 0.582929998927284,
+          "scheduled_ms": 0.8057160011958331
+        },
+        {
+          "handler_ms": 0.32492099853698164,
+          "scheduled_ms": 0.5123029986862093
+        },
+        {
+          "handler_ms": 0.3505389977362938,
+          "scheduled_ms": 0.5757289982284419
+        },
+        {
+          "handler_ms": 0.5218580045038834,
+          "scheduled_ms": 0.7841230035410263
+        }
+      ],
+      "target_wire_bytes": 2048,
+      "arm": "candidate",
+      "pair": 0,
+      "exact_response_equal": true
+    },
+    {
+      "handler_ms": 1.7612590017961338,
+      "bytes": 2340,
+      "max_heartbeat_gap_ms": 1.6797159987618215,
+      "max_initialize_handler_ms": 0.948791996052023,
+      "max_initialize_scheduled_ms": 1.1850589944515377,
+      "renders": [
+        {
+          "ms": 0.018848004401661456,
+          "on_loop": false,
+          "context": "context-preserved"
+        }
+      ],
+      "heartbeat_gaps_ms": [
+        1.120601998991333,
+        1.1920700053451583,
+        1.53832199430326,
+        1.310058003582526,
+        1.2896269981865771,
+        1.6797159987618215,
+        1.479574006225448,
+        1.1804819951066747,
+        1.4061629990465008,
+        1.212560004205443
+      ],
+      "initialize_samples": [
+        {
+          "handler_ms": 0.5170109943719581,
+          "scheduled_ms": 0.7350489977397956
+        },
+        {
+          "handler_ms": 0.948791996052023,
+          "scheduled_ms": 1.1850589944515377
+        },
+        {
+          "handler_ms": 0.3524920030031353,
+          "scheduled_ms": 0.567486000363715
+        },
+        {
+          "handler_ms": 0.36486000317381695,
+          "scheduled_ms": 0.5843210019520484
+        },
+        {
+          "handler_ms": 0.3184309971402399,
+          "scheduled_ms": 0.57027000002563
+        }
+      ],
+      "target_wire_bytes": 2048,
+      "arm": "candidate",
+      "pair": 1,
+      "exact_response_equal": true
+    },
+    {
+      "handler_ms": 3.596944996388629,
+      "bytes": 2340,
+      "max_heartbeat_gap_ms": 2.3527860030299053,
+      "max_initialize_handler_ms": 2.309682000486646,
+      "max_initialize_scheduled_ms": 2.5267390010412782,
+      "renders": [
+        {
+          "ms": 0.031117000617086887,
+          "on_loop": true,
+          "context": "context-preserved"
+        }
+      ],
+      "heartbeat_gaps_ms": [
+        1.1877329961862415,
+        1.2322200054768473,
+        1.4740049955435097,
+        1.1857810022775084,
+        2.3527860030299053,
+        1.3015549993724562,
+        1.2357960004010238,
+        1.6265609956462868,
+        1.334544002020266,
+        1.4727439993293956
+      ],
+      "initialize_samples": [
+        {
+          "handler_ms": 0.47466599789913744,
+          "scheduled_ms": 0.7751090015517548
+        },
+        {
+          "handler_ms": 2.309682000486646,
+          "scheduled_ms": 2.5267390010412782
+        },
+        {
+          "handler_ms": 0.6114580028224736,
+          "scheduled_ms": 1.1399459981475957
+        },
+        {
+          "handler_ms": 0.46866699995007366,
+          "scheduled_ms": 0.7817689984221943
+        },
+        {
+          "handler_ms": 0.34936799784190953,
+          "scheduled_ms": 0.6253939936868846
+        }
+      ],
+      "target_wire_bytes": 2048,
+      "arm": "baseline",
+      "pair": 1,
+      "exact_response_equal": true
+    },
+    {
+      "handler_ms": 1.3038390025030822,
+      "bytes": 2340,
+      "max_heartbeat_gap_ms": 1.4698900049552321,
+      "max_initialize_handler_ms": 0.6513629996334203,
+      "max_initialize_scheduled_ms": 1.3282950021675788,
+      "renders": [
+        {
+          "ms": 0.023015003534965217,
+          "on_loop": true,
+          "context": "context-preserved"
+        }
+      ],
+      "heartbeat_gaps_ms": [
+        1.1454990017227829,
+        1.2973690027138218,
+        1.4637999993283302,
+        1.2111479954910465,
+        1.3279650011099875,
+        1.1101960044470616,
+        1.2249989958945662,
+        1.3269740011310205,
+        1.2033559978590347,
+        1.4698900049552321
+      ],
+      "initialize_samples": [
+        {
+          "handler_ms": 0.4326630005380139,
+          "scheduled_ms": 0.7455949962604791
+        },
+        {
+          "handler_ms": 0.6513629996334203,
+          "scheduled_ms": 0.8960919949458912
+        },
+        {
+          "handler_ms": 0.3066729987040162,
+          "scheduled_ms": 1.3282950021675788
+        },
+        {
+          "handler_ms": 0.39368999568978325,
+          "scheduled_ms": 0.6111170005169697
+        },
+        {
+          "handler_ms": 0.3071530009037815,
+          "scheduled_ms": 0.5898349991184659
+        }
+      ],
+      "target_wire_bytes": 2048,
+      "arm": "baseline",
+      "pair": 2,
+      "exact_response_equal": true
+    },
+    {
+      "handler_ms": 0.9696330016595311,
+      "bytes": 2340,
+      "max_heartbeat_gap_ms": 1.43566799670225,
+      "max_initialize_handler_ms": 0.5511019990080968,
+      "max_initialize_scheduled_ms": 1.2206630053697154,
+      "renders": [
+        {
+          "ms": 0.013249999028630555,
+          "on_loop": false,
+          "context": "context-preserved"
+        }
+      ],
+      "heartbeat_gaps_ms": [
+        1.1139909984194674,
+        1.195445001940243,
+        1.43566799670225,
+        1.1829860013676807,
+        1.0869210018427111,
+        1.1137209949083626,
+        1.2010229984298348,
+        1.4023770054336637,
+        1.1798220002674498,
+        1.3290360002429225
+      ],
+      "initialize_samples": [
+        {
+          "handler_ms": 0.4105789994355291,
+          "scheduled_ms": 0.6290290039032698
+        },
+        {
+          "handler_ms": 0.5511019990080968,
+          "scheduled_ms": 0.7676179957343265
+        },
+        {
+          "handler_ms": 0.3889979998348281,
+          "scheduled_ms": 1.2206630053697154
+        },
+        {
+          "handler_ms": 0.27009799669031054,
+          "scheduled_ms": 0.48710499686421826
+        },
+        {
+          "handler_ms": 0.27840099937748164,
+          "scheduled_ms": 0.506373995449394
+        }
+      ],
+      "target_wire_bytes": 2048,
+      "arm": "candidate",
+      "pair": 2,
+      "exact_response_equal": true
+    },
+    {
+      "handler_ms": 0.8749410044401884,
+      "bytes": 2340,
+      "max_heartbeat_gap_ms": 1.4461739992839284,
+      "max_initialize_handler_ms": 0.3212349984096363,
+      "max_initialize_scheduled_ms": 0.5455830032587983,
+      "renders": [
+        {
+          "ms": 0.01290000363951549,
+          "on_loop": false,
+          "context": "context-preserved"
+        }
+      ],
+      "heartbeat_gaps_ms": [
+        1.1243870030739345,
+        1.1752349964808673,
+        1.3366679995669983,
+        1.1759949993574992,
+        1.104317001590971,
+        1.0989290021825582,
+        1.4461739992839284,
+        1.1649989974102937,
+        1.3159060035832226,
+        1.2327509975875728
+      ],
+      "initialize_samples": [
+        {
+          "handler_ms": 0.30149499798426405,
+          "scheduled_ms": 0.5044110002927482
+        },
+        {
+          "handler_ms": 0.2671530019142665,
+          "scheduled_ms": 0.48353899910580367
+        },
+        {
+          "handler_ms": 0.3212349984096363,
+          "scheduled_ms": 0.3437889972701669
+        },
+        {
+          "handler_ms": 0.272431003395468,
+          "scheduled_ms": 0.4792629988514818
+        },
+        {
+          "handler_ms": 0.28426900098565966,
+          "scheduled_ms": 0.5455830032587983
+        }
+      ],
+      "target_wire_bytes": 2048,
+      "arm": "candidate",
+      "pair": 3,
+      "exact_response_equal": true
+    },
+    {
+      "handler_ms": 1.3060369965387508,
+      "bytes": 2340,
+      "max_heartbeat_gap_ms": 1.4206299965735525,
+      "max_initialize_handler_ms": 0.6677080018562265,
+      "max_initialize_scheduled_ms": 1.3435630025924183,
+      "renders": [
+        {
+          "ms": 0.021593004930764437,
+          "on_loop": true,
+          "context": "context-preserved"
+        }
+      ],
+      "heartbeat_gaps_ms": [
+        1.1411180021241307,
+        1.216265998664312,
+        1.4206299965735525,
+        1.2263210010132752,
+        1.4010710001457483,
+        1.1041870020562783,
+        1.1762049980461597,
+        1.3298980047693476,
+        1.1971979984082282,
+        1.366161995974835
+      ],
+      "initialize_samples": [
+        {
+          "handler_ms": 0.4148310035816394,
+          "scheduled_ms": 0.6633110024267808
+        },
+        {
+          "handler_ms": 0.6677080018562265,
+          "scheduled_ms": 0.8941699998104014
+        },
+        {
+          "handler_ms": 0.299352002912201,
+          "scheduled_ms": 1.3435630025924183
+        },
+        {
+          "handler_ms": 0.3082859984715469,
+          "scheduled_ms": 0.5317329996614717
+        },
+        {
+          "handler_ms": 0.24791400210233405,
+          "scheduled_ms": 0.4888769981334917
+        }
+      ],
+      "target_wire_bytes": 2048,
+      "arm": "baseline",
+      "pair": 3,
+      "exact_response_equal": true
+    },
+    {
+      "handler_ms": 1.1857099962071516,
+      "bytes": 2340,
+      "max_heartbeat_gap_ms": 1.4898240042384714,
+      "max_initialize_handler_ms": 0.674367998726666,
+      "max_initialize_scheduled_ms": 1.2175680021755397,
+      "renders": [
+        {
+          "ms": 0.11906900181202218,
+          "on_loop": true,
+          "context": "context-preserved"
+        }
+      ],
+      "heartbeat_gaps_ms": [
+        1.1183580063516274,
+        1.2247989943716675,
+        1.4898240042384714,
+        1.1985899982391857,
+        1.2999419996049255,
+        1.1087040038546547,
+        1.1764159935410134,
+        1.367520002531819,
+        1.1797609986388125,
+        1.3593120020232163
+      ],
+      "initialize_samples": [
+        {
+          "handler_ms": 0.44517200149130076,
+          "scheduled_ms": 0.6970519971218891
+        },
+        {
+          "handler_ms": 0.674367998726666,
+          "scheduled_ms": 0.9161769994534552
+        },
+        {
+          "handler_ms": 0.2938739999081008,
+          "scheduled_ms": 1.2175680021755397
+        },
+        {
+          "handler_ms": 0.3102689952356741,
+          "scheduled_ms": 0.561613000172656
+        },
+        {
+          "handler_ms": 0.2497770037734881,
+          "scheduled_ms": 0.4692069996963255
+        }
+      ],
+      "target_wire_bytes": 2048,
+      "arm": "baseline",
+      "pair": 4,
+      "exact_response_equal": true
+    },
+    {
+      "handler_ms": 1.1615439943852834,
+      "bytes": 2340,
+      "max_heartbeat_gap_ms": 1.5086179992067628,
+      "max_initialize_handler_ms": 0.5602060045930557,
+      "max_initialize_scheduled_ms": 0.7771029995637946,
+      "renders": [
+        {
+          "ms": 0.013629993190988898,
+          "on_loop": false,
+          "context": "context-preserved"
+        }
+      ],
+      "heartbeat_gaps_ms": [
+        1.1248890004935674,
+        1.1871519964188337,
+        1.5086179992067628,
+        1.1836170015158132,
+        1.246271000127308,
+        1.3452709972625598,
+        1.399553002556786,
+        1.1665209967759438,
+        1.3093970046611503,
+        1.3226969967945479
+      ],
+      "initialize_samples": [
+        {
+          "handler_ms": 0.48012499610194936,
+          "scheduled_ms": 0.7063259981805459
+        },
+        {
+          "handler_ms": 0.5602060045930557,
+          "scheduled_ms": 0.7771029995637946
+        },
+        {
+          "handler_ms": 0.27731899899663404,
+          "scheduled_ms": 0.3995529987150803
+        },
+        {
+          "handler_ms": 0.25622700195526704,
+          "scheduled_ms": 0.46356899838428944
+        },
+        {
+          "handler_ms": 0.37863200122956187,
+          "scheduled_ms": 0.6320739994407631
+        }
+      ],
+      "target_wire_bytes": 2048,
+      "arm": "candidate",
+      "pair": 4,
+      "exact_response_equal": true
+    },
+    {
+      "handler_ms": 57.361664999916684,
+      "bytes": 1048868,
+      "max_heartbeat_gap_ms": 48.06720199849224,
+      "max_initialize_handler_ms": 9.60626299638534,
+      "max_initialize_scheduled_ms": 55.50980799307581,
+      "renders": [
+        {
+          "ms": 3.2301770042977296,
+          "on_loop": true,
+          "context": "context-preserved"
+        }
+      ],
+      "heartbeat_gaps_ms": [
+        1.128643998526968,
+        1.2083440014976077,
+        1.3717209949390963,
+        1.180793005914893,
+        48.06720199849224,
+        5.92101999791339,
+        3.768709000723902,
+        1.1389400024199858,
+        1.2481739977374673,
+        1.3909900008002296,
+        1.1927609957638197,
+        1.4015360065968707
+      ],
+      "initialize_samples": [
+        {
+          "handler_ms": 0.34076500014634803,
+          "scheduled_ms": 0.5854940027347766
+        },
+        {
+          "handler_ms": 0.26480999804334715,
+          "scheduled_ms": 0.49419599963584915
+        },
+        {
+          "handler_ms": 9.60626299638534,
+          "scheduled_ms": 55.50980799307581
+        },
+        {
+          "handler_ms": 0.4360290040494874,
+          "scheduled_ms": 0.7239730039145797
+        },
+        {
+          "handler_ms": 0.39146099879872054,
+          "scheduled_ms": 0.5912420019740239
+        }
+      ],
+      "target_wire_bytes": 1048576,
+      "arm": "baseline",
+      "pair": 0,
+      "exact_response_equal": true
+    },
+    {
+      "handler_ms": 53.67200999899069,
+      "bytes": 1048868,
+      "max_heartbeat_gap_ms": 45.57554700295441,
+      "max_initialize_handler_ms": 8.862360002240166,
+      "max_initialize_scheduled_ms": 52.249963002395816,
+      "renders": [
+        {
+          "ms": 2.1913780001341365,
+          "on_loop": false,
+          "context": "context-preserved"
+        }
+      ],
+      "heartbeat_gaps_ms": [
+        1.1058989985031076,
+        1.1913889975403436,
+        1.3639790049637668,
+        1.2029859935864806,
+        45.57554700295441,
+        5.842651000421029,
+        2.499342997907661,
+        1.6626600045128725,
+        1.278730997000821,
+        1.4446310015046038,
+        1.2716889978037216
+      ],
+      "initialize_samples": [
+        {
+          "handler_ms": 0.35928199940826744,
+          "scheduled_ms": 0.5589930005953647
+        },
+        {
+          "handler_ms": 0.31292200583266094,
+          "scheduled_ms": 0.5161380031495355
+        },
+        {
+          "handler_ms": 8.862360002240166,
+          "scheduled_ms": 52.249963002395816
+        },
+        {
+          "handler_ms": 0.48420099483337253,
+          "scheduled_ms": 0.7292199952644296
+        },
+        {
+          "handler_ms": 0.36630299291573465,
+          "scheduled_ms": 0.6377919926308095
+        }
+      ],
+      "target_wire_bytes": 1048576,
+      "arm": "candidate",
+      "pair": 0,
+      "exact_response_equal": true
+    },
+    {
+      "handler_ms": 58.45569200027967,
+      "bytes": 1048868,
+      "max_heartbeat_gap_ms": 49.52181400585687,
+      "max_initialize_handler_ms": 9.248472997569479,
+      "max_initialize_scheduled_ms": 56.17622999852756,
+      "renders": [
+        {
+          "ms": 2.2316789982141927,
+          "on_loop": false,
+          "context": "context-preserved"
+        }
+      ],
+      "heartbeat_gaps_ms": [
+        1.1121189963887446,
+        1.2096659993403591,
+        1.3995730041642673,
+        1.1958459945162758,
+        49.52181400585687,
+        6.095942997490056,
+        2.9431029979605228,
+        1.3643900019815192,
+        1.2226960025145672,
+        1.4313709980342537,
+        1.2449589994503185
+      ],
+      "initialize_samples": [
+        {
+          "handler_ms": 0.39181199826998636,
+          "scheduled_ms": 0.6105020001996309
+        },
+        {
+          "handler_ms": 0.7199969986686483,
+          "scheduled_ms": 0.924654996197205
+        },
+        {
+          "handler_ms": 9.248472997569479,
+          "scheduled_ms": 56.17622999852756
+        },
+        {
+          "handler_ms": 0.4250409983796999,
+          "scheduled_ms": 0.6450930013670586
+        },
+        {
+          "handler_ms": 0.4661839993786998,
+          "scheduled_ms": 0.709170002664905
+        }
+      ],
+      "target_wire_bytes": 1048576,
+      "arm": "candidate",
+      "pair": 1,
+      "exact_response_equal": true
+    },
+    {
+      "handler_ms": 54.02902900095796,
+      "bytes": 1048868,
+      "max_heartbeat_gap_ms": 46.177414995327126,
+      "max_initialize_handler_ms": 8.254582004155964,
+      "max_initialize_scheduled_ms": 52.017391004483216,
+      "renders": [
+        {
+          "ms": 2.653446004842408,
+          "on_loop": true,
+          "context": "context-preserved"
+        }
+      ],
+      "heartbeat_gaps_ms": [
+        1.1106659949291497,
+        1.2271230007172562,
+        1.4312310013337992,
+        1.1872320028487593,
+        46.177414995327126,
+        7.9682799987494946,
+        1.427375005732756,
+        1.2509789958130568,
+        1.3605240019387566,
+        1.2320599998929538
+      ],
+      "initialize_samples": [
+        {
+          "handler_ms": 0.41531700117047876,
+          "scheduled_ms": 0.6537459994433448
+        },
+        {
+          "handler_ms": 0.5212969990679994,
+          "scheduled_ms": 0.7410389953292906
+        },
+        {
+          "handler_ms": 8.254582004155964,
+          "scheduled_ms": 52.017391004483216
+        },
+        {
+          "handler_ms": 0.3884760008077137,
+          "scheduled_ms": 0.6155079972813837
+        },
+        {
+          "handler_ms": 0.5509220063686371,
+          "scheduled_ms": 0.7674780063098297
+        }
+      ],
+      "target_wire_bytes": 1048576,
+      "arm": "baseline",
+      "pair": 1,
+      "exact_response_equal": true
+    },
+    {
+      "handler_ms": 55.00217699591303,
+      "bytes": 1048868,
+      "max_heartbeat_gap_ms": 45.75279300479451,
+      "max_initialize_handler_ms": 9.383246004290413,
+      "max_initialize_scheduled_ms": 52.72996600251645,
+      "renders": [
+        {
+          "ms": 2.529618999687955,
+          "on_loop": true,
+          "context": "context-preserved"
+        }
+      ],
+      "heartbeat_gaps_ms": [
+        1.1109379993285984,
+        1.368516001093667,
+        1.4199330034898594,
+        1.1672729960992,
+        45.75279300479451,
+        5.725473994971253,
+        3.7390950019471347,
+        1.1160450012539513,
+        1.2745639978675172,
+        1.4874960033921525,
+        1.234192997799255
+      ],
+      "initialize_samples": [
+        {
+          "handler_ms": 0.5581529985647649,
+          "scheduled_ms": 0.7824909989722073
+        },
+        {
+          "handler_ms": 0.5135050014359877,
+          "scheduled_ms": 0.7218190003186464
+        },
+        {
+          "handler_ms": 9.383246004290413,
+          "scheduled_ms": 52.72996600251645
+        },
+        {
+          "handler_ms": 0.5330350031726994,
+          "scheduled_ms": 0.8066770024015568
+        },
+        {
+          "handler_ms": 0.4260829955455847,
+          "scheduled_ms": 0.6325950016616844
+        }
+      ],
+      "target_wire_bytes": 1048576,
+      "arm": "baseline",
+      "pair": 2,
+      "exact_response_equal": true
+    },
+    {
+      "handler_ms": 53.461817995412275,
+      "bytes": 1048868,
+      "max_heartbeat_gap_ms": 44.22236399841495,
+      "max_initialize_handler_ms": 9.495981998043135,
+      "max_initialize_scheduled_ms": 51.58493399358122,
+      "renders": [
+        {
+          "ms": 2.444880003167782,
+          "on_loop": false,
+          "context": "context-preserved"
+        }
+      ],
+      "heartbeat_gaps_ms": [
+        1.1092349959653802,
+        1.21149900223827,
+        1.403488997311797,
+        1.1865510023199022,
+        44.22236399841495,
+        5.844300998433027,
+        3.7571800057776272,
+        1.171126998087857,
+        1.2677240010816604,
+        1.4153359952615574,
+        1.2353640049695969,
+        1.4063729977351613
+      ],
+      "initialize_samples": [
+        {
+          "handler_ms": 0.4057120022480376,
+          "scheduled_ms": 0.6138460012152791
+        },
+        {
+          "handler_ms": 0.3026470003533177,
+          "scheduled_ms": 0.5107809993205592
+        },
+        {
+          "handler_ms": 9.495981998043135,
+          "scheduled_ms": 51.58493399358122
+        },
+        {
+          "handler_ms": 0.4651220006053336,
+          "scheduled_ms": 0.7575609997729771
+        },
+        {
+          "handler_ms": 0.4357070065452717,
+          "scheduled_ms": 0.6556580046890303
+        }
+      ],
+      "target_wire_bytes": 1048576,
+      "arm": "candidate",
+      "pair": 2,
+      "exact_response_equal": true
+    },
+    {
+      "handler_ms": 54.86157999985153,
+      "bytes": 1048868,
+      "max_heartbeat_gap_ms": 46.40466599812498,
+      "max_initialize_handler_ms": 8.686068998940755,
+      "max_initialize_scheduled_ms": 52.83564000274055,
+      "renders": [
+        {
+          "ms": 2.595988000393845,
+          "on_loop": false,
+          "context": "context-preserved"
+        }
+      ],
+      "heartbeat_gaps_ms": [
+        1.1108970065834,
+        1.2044979957863688,
+        1.3950549982837401,
+        1.1801210057456046,
+        46.40466599812498,
+        8.775695001531858,
+        1.1354239977663383,
+        1.2797210001735948,
+        1.4773599978070706,
+        1.2725800042971969,
+        1.472582996939309
+      ],
+      "initialize_samples": [
+        {
+          "handler_ms": 0.3997730018454604,
+          "scheduled_ms": 0.6048110008123331
+        },
+        {
+          "handler_ms": 0.3735140053322539,
+          "scheduled_ms": 0.5726130038965493
+        },
+        {
+          "handler_ms": 8.686068998940755,
+          "scheduled_ms": 52.83564000274055
+        },
+        {
+          "handler_ms": 0.5060839976067655,
+          "scheduled_ms": 0.8281379996333271
+        },
+        {
+          "handler_ms": 0.4387220033095218,
+          "scheduled_ms": 0.7024880032986403
+        }
+      ],
+      "target_wire_bytes": 1048576,
+      "arm": "candidate",
+      "pair": 3,
+      "exact_response_equal": true
+    },
+    {
+      "handler_ms": 53.30080399289727,
+      "bytes": 1048868,
+      "max_heartbeat_gap_ms": 43.07252700527897,
+      "max_initialize_handler_ms": 9.40817900118418,
+      "max_initialize_scheduled_ms": 50.87552199984202,
+      "renders": [
+        {
+          "ms": 2.390818997810129,
+          "on_loop": true,
+          "context": "context-preserved"
+        }
+      ],
+      "heartbeat_gaps_ms": [
+        1.1568859990802594,
+        1.2320189998717979,
+        1.4549759944202378,
+        1.1819339997600764,
+        1.0753530004876666,
+        43.07252700527897,
+        5.800383994937874,
+        3.67223300418118,
+        1.1186580013600178,
+        1.2796609953511506,
+        1.5526140050496906,
+        1.4352159996633418
+      ],
+      "initialize_samples": [
+        {
+          "handler_ms": 0.45795099867973477,
+          "scheduled_ms": 0.7316129995160736
+        },
+        {
+          "handler_ms": 0.793596998846624,
+          "scheduled_ms": 1.0017999957199208
+        },
+        {
+          "handler_ms": 9.40817900118418,
+          "scheduled_ms": 50.87552199984202
+        },
+        {
+          "handler_ms": 0.5853629991179332,
+          "scheduled_ms": 0.849190000735689
+        },
+        {
+          "handler_ms": 0.6503319964394905,
+          "scheduled_ms": 0.9220099964295514
+        }
+      ],
+      "target_wire_bytes": 1048576,
+      "arm": "baseline",
+      "pair": 3,
+      "exact_response_equal": true
+    },
+    {
+      "handler_ms": 54.985456001304556,
+      "bytes": 1048868,
+      "max_heartbeat_gap_ms": 45.447021002473775,
+      "max_initialize_handler_ms": 8.600509994721506,
+      "max_initialize_scheduled_ms": 52.463658998021856,
+      "renders": [
+        {
+          "ms": 2.166990998375695,
+          "on_loop": true,
+          "context": "context-preserved"
+        }
+      ],
+      "heartbeat_gaps_ms": [
+        1.1133809966850094,
+        1.2523000041255727,
+        1.4021960014360957,
+        1.1828649949165992,
+        1.1151130020152777,
+        45.447021002473775,
+        5.877339994185604,
+        2.801779002766125,
+        1.1138609988847747,
+        1.2370559998089448,
+        1.3778600041405298,
+        1.2490049994084984,
+        1.4233280016924255
+      ],
+      "initialize_samples": [
+        {
+          "handler_ms": 0.4371289978735149,
+          "scheduled_ms": 0.6565189978573471
+        },
+        {
+          "handler_ms": 0.8124670057441108,
+          "scheduled_ms": 1.0206690058112144
+        },
+        {
+          "handler_ms": 8.600509994721506,
+          "scheduled_ms": 52.463658998021856
+        },
+        {
+          "handler_ms": 0.4068240014021285,
+          "scheduled_ms": 0.6655030010733753
+        },
+        {
+          "handler_ms": 0.42168700019828975,
+          "scheduled_ms": 0.6651930016232654
+        }
+      ],
+      "target_wire_bytes": 1048576,
+      "arm": "baseline",
+      "pair": 4,
+      "exact_response_equal": true
+    },
+    {
+      "handler_ms": 56.4055200011353,
+      "bytes": 1048868,
+      "max_heartbeat_gap_ms": 47.1075870009372,
+      "max_initialize_handler_ms": 10.063397996418644,
+      "max_initialize_scheduled_ms": 54.99987599614542,
+      "renders": [
+        {
+          "ms": 2.289094998559449,
+          "on_loop": false,
+          "context": "context-preserved"
+        }
+      ],
+      "heartbeat_gaps_ms": [
+        1.112579004256986,
+        1.18267499783542,
+        1.4155570024740882,
+        1.1640969969448633,
+        47.1075870009372,
+        6.257934001041576,
+        3.2726700010243803,
+        1.6889489997993223,
+        1.3033069990342483,
+        1.4342439972097054,
+        1.2367570016067475
+      ],
+      "initialize_samples": [
+        {
+          "handler_ms": 0.4172200060565956,
+          "scheduled_ms": 0.6034990001353435
+        },
+        {
+          "handler_ms": 0.27537599817151204,
+          "scheduled_ms": 0.46913699770811945
+        },
+        {
+          "handler_ms": 10.063397996418644,
+          "scheduled_ms": 54.99987599614542
+        },
+        {
+          "handler_ms": 0.5084970034658909,
+          "scheduled_ms": 0.7532450035796501
+        },
+        {
+          "handler_ms": 0.32888600253500044,
+          "scheduled_ms": 0.5683859999408014
+        }
+      ],
+      "target_wire_bytes": 1048576,
+      "arm": "candidate",
+      "pair": 4,
+      "exact_response_equal": true
+    },
+    {
+      "handler_ms": 226.1811030039098,
+      "bytes": 4194596,
+      "max_heartbeat_gap_ms": 189.25706500158412,
+      "max_initialize_handler_ms": 189.1726780013414,
+      "max_initialize_scheduled_ms": 206.21878300153185,
+      "renders": [
+        {
+          "ms": 15.2564359959797,
+          "on_loop": true,
+          "context": "context-preserved"
+        }
+      ],
+      "heartbeat_gaps_ms": [
+        1.1202310051885433,
+        1.1889239976881072,
+        1.4038340013939887,
+        1.2454149982659146,
+        1.2256199988769367,
+        18.25294800073607,
+        189.25706500158412,
+        17.605232002097182,
+        1.9417999938013963,
+        1.223086001118645,
+        1.3755859981756657,
+        1.2836380046792328
+      ],
+      "initialize_samples": [
+        {
+          "handler_ms": 0.3569679975043982,
+          "scheduled_ms": 0.5784210006822832
+        },
+        {
+          "handler_ms": 0.5578119962592609,
+          "scheduled_ms": 0.848478994157631
+        },
+        {
+          "handler_ms": 189.1726780013414,
+          "scheduled_ms": 206.21878300153185
+        },
+        {
+          "handler_ms": 0.8025809947866946,
+          "scheduled_ms": 16.46088299457915
+        },
+        {
+          "handler_ms": 0.32548200397286564,
+          "scheduled_ms": 0.5992630030959845
+        },
+        {
+          "handler_ms": 0.42381000093882903,
+          "scheduled_ms": 0.6970709946472198
+        }
+      ],
+      "target_wire_bytes": 4194304,
+      "arm": "baseline",
+      "pair": 0,
+      "exact_response_equal": true
+    },
+    {
+      "handler_ms": 211.6109519993188,
+      "bytes": 4194596,
+      "max_heartbeat_gap_ms": 175.86874900007388,
+      "max_initialize_handler_ms": 175.80859799636528,
+      "max_initialize_scheduled_ms": 193.9462399968761,
+      "renders": [
+        {
+          "ms": 12.88746899808757,
+          "on_loop": false,
+          "context": "context-preserved"
+        }
+      ],
+      "heartbeat_gaps_ms": [
+        1.1136009998153895,
+        1.182073996460531,
+        1.4092670026002452,
+        1.176394995127339,
+        20.351124003354926,
+        175.86874900007388,
+        12.986620000447147,
+        2.6717020009527914,
+        1.3686559977941215,
+        1.260611999896355,
+        1.4266939979279414,
+        1.2436070028343238
+      ],
+      "initialize_samples": [
+        {
+          "handler_ms": 0.3722219989867881,
+          "scheduled_ms": 0.5836889977217652
+        },
+        {
+          "handler_ms": 0.31283299904316664,
+          "scheduled_ms": 0.529618002474308
+        },
+        {
+          "handler_ms": 175.80859799636528,
+          "scheduled_ms": 193.9462399968761
+        },
+        {
+          "handler_ms": 2.901369000028353,
+          "scheduled_ms": 13.947088002169039
+        },
+        {
+          "handler_ms": 0.4455029993550852,
+          "scheduled_ms": 0.6947869987925515
+        },
+        {
+          "handler_ms": 0.39646799996262416,
+          "scheduled_ms": 0.6125630025053397
+        }
+      ],
+      "target_wire_bytes": 4194304,
+      "arm": "candidate",
+      "pair": 0,
+      "exact_response_equal": true
+    },
+    {
+      "handler_ms": 224.378822997096,
+      "bytes": 4194596,
+      "max_heartbeat_gap_ms": 202.19960800022818,
+      "max_initialize_handler_ms": 202.11927800119156,
+      "max_initialize_scheduled_ms": 220.39619099814445,
+      "renders": [
+        {
+          "ms": 13.618002994917333,
+          "on_loop": false,
+          "context": "context-preserved"
+        }
+      ],
+      "heartbeat_gaps_ms": [
+        1.1105559970019385,
+        1.1977579997619614,
+        1.3832570039085113,
+        1.1831860028905794,
+        20.481992993154563,
+        202.19960800022818,
+        1.9689420005306602,
+        1.6370810044463724,
+        1.173339995148126,
+        1.430319003702607,
+        1.2949939991813153
+      ],
+      "initialize_samples": [
+        {
+          "handler_ms": 0.3757269951165654,
+          "scheduled_ms": 0.5827079949085601
+        },
+        {
+          "handler_ms": 0.3075439963140525,
+          "scheduled_ms": 0.5213359982008114
+        },
+        {
+          "handler_ms": 202.11927800119156,
+          "scheduled_ms": 220.39619099814445
+        },
+        {
+          "handler_ms": 0.47794099373277277,
+          "scheduled_ms": 0.5343149969121441
+        },
+        {
+          "handler_ms": 0.3940250026062131,
+          "scheduled_ms": 0.611411000136286
+        },
+        {
+          "handler_ms": 2.387632994214073,
+          "scheduled_ms": 2.7074339959654026
+        }
+      ],
+      "target_wire_bytes": 4194304,
+      "arm": "candidate",
+      "pair": 1,
+      "exact_response_equal": true
+    },
+    {
+      "handler_ms": 211.88735999749042,
+      "bytes": 4194596,
+      "max_heartbeat_gap_ms": 178.8050100003602,
+      "max_initialize_handler_ms": 179.20716699882178,
+      "max_initialize_scheduled_ms": 197.81286599754822,
+      "renders": [
+        {
+          "ms": 10.990256996592507,
+          "on_loop": true,
+          "context": "context-preserved"
+        }
+      ],
+      "heartbeat_gaps_ms": [
+        1.1384679964976385,
+        2.766846002487,
+        1.4172590017551556,
+        19.934325995563995,
+        178.8050100003602,
+        13.218000000051688,
+        1.8211380011052825,
+        1.1737419990822673,
+        1.410267999744974,
+        1.2360460023046471
+      ],
+      "initialize_samples": [
+        {
+          "handler_ms": 1.949812998645939,
+          "scheduled_ms": 2.1985060011502355
+        },
+        {
+          "handler_ms": 179.20716699882178,
+          "scheduled_ms": 197.81286599754822
+        },
+        {
+          "handler_ms": 0.6894899997860193,
+          "scheduled_ms": 11.961291005718522
+        },
+        {
+          "handler_ms": 0.38093500188551843,
+          "scheduled_ms": 0.5928729951847345
+        },
+        {
+          "handler_ms": 0.3233579991501756,
+          "scheduled_ms": 0.5696789958165027
+        }
+      ],
+      "target_wire_bytes": 4194304,
+      "arm": "baseline",
+      "pair": 1,
+      "exact_response_equal": true
+    },
+    {
+      "handler_ms": 210.77730500110192,
+      "bytes": 4194596,
+      "max_heartbeat_gap_ms": 160.41832100017928,
+      "max_initialize_handler_ms": 160.35100900626276,
+      "max_initialize_scheduled_ms": 178.42308200488333,
+      "renders": [
+        {
+          "ms": 10.18602400290547,
+          "on_loop": true,
+          "context": "context-preserved"
+        }
+      ],
+      "heartbeat_gaps_ms": [
+        1.1224639965803362,
+        1.2302469986025244,
+        1.463649001379963,
+        1.1830660005216487,
+        20.701793000625912,
+        160.41832100017928,
+        15.59147200168809,
+        14.197406999301165,
+        1.3447899982566014,
+        1.2715690027107485,
+        1.519972996902652,
+        1.5929590008454397
+      ],
+      "initialize_samples": [
+        {
+          "handler_ms": 0.4421580015332438,
+          "scheduled_ms": 0.6949380040168762
+        },
+        {
+          "handler_ms": 0.744443001167383,
+          "scheduled_ms": 0.9563519997755066
+        },
+        {
+          "handler_ms": 160.35100900626276,
+          "scheduled_ms": 178.42308200488333
+        },
+        {
+          "handler_ms": 14.35361300536897,
+          "scheduled_ms": 28.014349001750816
+        },
+        {
+          "handler_ms": 0.4710909997811541,
+          "scheduled_ms": 0.7350070009124465
+        },
+        {
+          "handler_ms": 0.7364009943557903,
+          "scheduled_ms": 1.1501689950819127
+        }
+      ],
+      "target_wire_bytes": 4194304,
+      "arm": "baseline",
+      "pair": 2,
+      "exact_response_equal": true
+    },
+    {
+      "handler_ms": 207.2376619980787,
+      "bytes": 4194596,
+      "max_heartbeat_gap_ms": 172.89523599902168,
+      "max_initialize_handler_ms": 172.8326320007909,
+      "max_initialize_scheduled_ms": 190.54314000095474,
+      "renders": [
+        {
+          "ms": 11.73884700256167,
+          "on_loop": false,
+          "context": "context-preserved"
+        }
+      ],
+      "heartbeat_gaps_ms": [
+        1.135088001319673,
+        1.3125309997121803,
+        1.4781809950363822,
+        1.1823040040326305,
+        1.0802809993037954,
+        19.02323099784553,
+        172.89523599902168,
+        14.277763999416493,
+        1.5975710048223846,
+        1.2309579979046248,
+        1.36409900005674,
+        1.2250689978827722
+      ],
+      "initialize_samples": [
+        {
+          "handler_ms": 0.524590999702923,
+          "scheduled_ms": 0.7711869984632358
+        },
+        {
+          "handler_ms": 0.49251300515607,
+          "scheduled_ms": 0.7504509994760156
+        },
+        {
+          "handler_ms": 172.8326320007909,
+          "scheduled_ms": 190.54314000095474
+        },
+        {
+          "handler_ms": 0.43689900485333055,
+          "scheduled_ms": 12.75834900297923
+        },
+        {
+          "handler_ms": 0.3790620030486025,
+          "scheduled_ms": 0.6359179969877005
+        },
+        {
+          "handler_ms": 0.3286259961896576,
+          "scheduled_ms": 0.5741450004279613
+        }
+      ],
+      "target_wire_bytes": 4194304,
+      "arm": "candidate",
+      "pair": 2,
+      "exact_response_equal": true
+    },
+    {
+      "handler_ms": 226.99478499998804,
+      "bytes": 4194596,
+      "max_heartbeat_gap_ms": 203.57265500206267,
+      "max_initialize_handler_ms": 203.5028699974646,
+      "max_initialize_scheduled_ms": 222.55054699780885,
+      "renders": [
+        {
+          "ms": 12.520454998593777,
+          "on_loop": false,
+          "context": "context-preserved"
+        }
+      ],
+      "heartbeat_gaps_ms": [
+        1.1160040012327954,
+        1.4656970015494153,
+        1.4786620013182983,
+        1.2346829971647821,
+        21.378655997978058,
+        203.57265500206267,
+        2.0258279982954264,
+        1.6356280029867776,
+        1.2283940013730898,
+        1.3786409981548786,
+        1.2346229996182956
+      ],
+      "initialize_samples": [
+        {
+          "handler_ms": 0.65986600384349,
+          "scheduled_ms": 0.9421360009582713
+        },
+        {
+          "handler_ms": 0.49362499703420326,
+          "scheduled_ms": 0.7012569985818118
+        },
+        {
+          "handler_ms": 203.5028699974646,
+          "scheduled_ms": 222.55054699780885
+        },
+        {
+          "handler_ms": 0.5224279957474209,
+          "scheduled_ms": 0.6302499969024211
+        },
+        {
+          "handler_ms": 0.4031690041301772,
+          "scheduled_ms": 0.577630999032408
+        },
+        {
+          "handler_ms": 0.7331870001507923,
+          "scheduled_ms": 0.9968229933292605
+        }
+      ],
+      "target_wire_bytes": 4194304,
+      "arm": "candidate",
+      "pair": 3,
+      "exact_response_equal": true
+    },
+    {
+      "handler_ms": 211.48258000175701,
+      "bytes": 4194596,
+      "max_heartbeat_gap_ms": 179.71861900150543,
+      "max_initialize_handler_ms": 179.66083200008143,
+      "max_initialize_scheduled_ms": 198.5415470044245,
+      "renders": [
+        {
+          "ms": 10.403081003460102,
+          "on_loop": true,
+          "context": "context-preserved"
+        }
+      ],
+      "heartbeat_gaps_ms": [
+        1.1128389960504137,
+        1.244589002453722,
+        1.3972989981994033,
+        1.2080730011803098,
+        21.323642999050207,
+        179.71861900150543,
+        10.609222001221497,
+        1.7487689983681776,
+        1.2512289977166802,
+        1.4036480060894974,
+        1.2341029942035675
+      ],
+      "initialize_samples": [
+        {
+          "handler_ms": 0.36539100256050006,
+          "scheduled_ms": 0.6206749967532232
+        },
+        {
+          "handler_ms": 0.5449220043374225,
+          "scheduled_ms": 0.8018590015126392
+        },
+        {
+          "handler_ms": 179.66083200008143,
+          "scheduled_ms": 198.5415470044245
+        },
+        {
+          "handler_ms": 0.6175319940666668,
+          "scheduled_ms": 9.268656998756342
+        },
+        {
+          "handler_ms": 0.4257930049789138,
+          "scheduled_ms": 0.6685780026600696
+        },
+        {
+          "handler_ms": 0.3086659999098629,
+          "scheduled_ms": 0.5579400021815673
+        }
+      ],
+      "target_wire_bytes": 4194304,
+      "arm": "baseline",
+      "pair": 3,
+      "exact_response_equal": true
+    },
+    {
+      "handler_ms": 200.2929709997261,
+      "bytes": 4194596,
+      "max_heartbeat_gap_ms": 144.79775999643607,
+      "max_initialize_handler_ms": 144.7389720051433,
+      "max_initialize_scheduled_ms": 163.67074300069362,
+      "renders": [
+        {
+          "ms": 10.619546999805607,
+          "on_loop": true,
+          "context": "context-preserved"
+        }
+      ],
+      "heartbeat_gaps_ms": [
+        1.1124790034955367,
+        1.2456199983716942,
+        1.3850399991497397,
+        1.2288150028325617,
+        1.0520979994907975,
+        20.525236999674235,
+        144.79775999643607,
+        10.159508005017415,
+        10.833365995495114,
+        13.185735006118193,
+        1.1597709963098168,
+        1.2566660006996244,
+        1.4191619993653148,
+        1.2208530024508946
+      ],
+      "initialize_samples": [
+        {
+          "handler_ms": 0.41393499850528315,
+          "scheduled_ms": 0.6292079997365363
+        },
+        {
+          "handler_ms": 0.7884500009822659,
+          "scheduled_ms": 1.006667996989563
+        },
+        {
+          "handler_ms": 144.7389720051433,
+          "scheduled_ms": 163.67074300069362
+        },
+        {
+          "handler_ms": 23.976987999049015,
+          "scheduled_ms": 32.19106799951987
+        },
+        {
+          "handler_ms": 0.4436189992702566,
+          "scheduled_ms": 0.7207860035123304
+        },
+        {
+          "handler_ms": 0.34788499760907143,
+          "scheduled_ms": 0.5918419992667623
+        }
+      ],
+      "target_wire_bytes": 4194304,
+      "arm": "baseline",
+      "pair": 4,
+      "exact_response_equal": true
+    },
+    {
+      "handler_ms": 209.29774599790107,
+      "bytes": 4194596,
+      "max_heartbeat_gap_ms": 174.5781809950131,
+      "max_initialize_handler_ms": 174.52299800061155,
+      "max_initialize_scheduled_ms": 192.69178800459486,
+      "renders": [
+        {
+          "ms": 11.697713998728432,
+          "on_loop": false,
+          "context": "context-preserved"
+        }
+      ],
+      "heartbeat_gaps_ms": [
+        1.142289002018515,
+        1.196666002215352,
+        1.379201996314805,
+        1.2602610004250892,
+        20.70853500481462,
+        174.5781809950131,
+        11.77556200127583,
+        2.329922004719265,
+        1.4089159958530217,
+        1.2398609978845343,
+        1.3999380025779828,
+        1.2344729984761216
+      ],
+      "initialize_samples": [
+        {
+          "handler_ms": 0.3530019967001863,
+          "scheduled_ms": 0.5925269942963496
+        },
+        {
+          "handler_ms": 0.6329059979179874,
+          "scheduled_ms": 0.9386950041516684
+        },
+        {
+          "handler_ms": 174.52299800061155,
+          "scheduled_ms": 192.69178800459486
+        },
+        {
+          "handler_ms": 2.564836002420634,
+          "scheduled_ms": 12.398505998135079
+        },
+        {
+          "handler_ms": 0.39990399818634614,
+          "scheduled_ms": 0.6585320006706752
+        },
+        {
+          "handler_ms": 0.3456510021351278,
+          "scheduled_ms": 0.5927480015088804
+        }
+      ],
+      "target_wire_bytes": 4194304,
+      "arm": "candidate",
+      "pair": 4,
+      "exact_response_equal": true
+    },
+    {
+      "handler_ms": 401.75151100265794,
+      "bytes": 8388900,
+      "max_heartbeat_gap_ms": 330.4296739952406,
+      "max_initialize_handler_ms": 330.3514150029514,
+      "max_initialize_scheduled_ms": 370.0538500052062,
+      "renders": [
+        {
+          "ms": 24.756474005698692,
+          "on_loop": true,
+          "context": "context-preserved"
+        }
+      ],
+      "heartbeat_gaps_ms": [
+        1.1163949966430664,
+        1.206009997986257,
+        1.4249200030462816,
+        1.166780995845329,
+        42.167577004875056,
+        330.4296739952406,
+        29.319209003006108,
+        1.8928970021079294,
+        1.237317999766674,
+        1.5078249998623505,
+        1.244337996467948
+      ],
+      "initialize_samples": [
+        {
+          "handler_ms": 0.4162090044701472,
+          "scheduled_ms": 0.6374709992087446
+        },
+        {
+          "handler_ms": 0.5670860045938753,
+          "scheduled_ms": 0.7668559992453083
+        },
+        {
+          "handler_ms": 330.3514150029514,
+          "scheduled_ms": 370.0538500052062
+        },
+        {
+          "handler_ms": 0.7592159963678569,
+          "scheduled_ms": 28.135290995123796
+        },
+        {
+          "handler_ms": 0.5234300042502582,
+          "scheduled_ms": 0.7539560028817505
+        },
+        {
+          "handler_ms": 0.39862100675236434,
+          "scheduled_ms": 0.6524430064018816
+        }
+      ],
+      "target_wire_bytes": 8388608,
+      "arm": "baseline",
+      "pair": 0,
+      "exact_response_equal": true
+    },
+    {
+      "handler_ms": 403.785019996576,
+      "bytes": 8388900,
+      "max_heartbeat_gap_ms": 317.0355840047705,
+      "max_initialize_handler_ms": 316.97297999926377,
+      "max_initialize_scheduled_ms": 350.7952639993164,
+      "renders": [
+        {
+          "ms": 23.89968999341363,
+          "on_loop": false,
+          "context": "context-preserved"
+        }
+      ],
+      "heartbeat_gaps_ms": [
+        1.1074510039179586,
+        1.348164994851686,
+        1.4027470024302602,
+        1.1926000006496906,
+        1.1658700022962876,
+        35.355529995285906,
+        317.0355840047705,
+        19.946273998357356,
+        5.823118997795973,
+        24.573907001467887,
+        1.14545899850782,
+        1.2683439999818802,
+        1.453354001569096,
+        1.4261219985201024,
+        1.5855230012675747
+      ],
+      "initialize_samples": [
+        {
+          "handler_ms": 0.5838009965373203,
+          "scheduled_ms": 0.8023889968171716
+        },
+        {
+          "handler_ms": 0.8128970002871938,
+          "scheduled_ms": 0.9670990039012395
+        },
+        {
+          "handler_ms": 316.97297999926377,
+          "scheduled_ms": 350.7952639993164
+        },
+        {
+          "handler_ms": 30.305848995340057,
+          "scheduled_ms": 48.316509994037915
+        },
+        {
+          "handler_ms": 0.5055029978393577,
+          "scheduled_ms": 0.8140379941323772
+        },
+        {
+          "handler_ms": 0.7326150007429533,
+          "scheduled_ms": 0.97224599448964
+        }
+      ],
+      "target_wire_bytes": 8388608,
+      "arm": "candidate",
+      "pair": 0,
+      "exact_response_equal": true
+    },
+    {
+      "handler_ms": 420.09142500319285,
+      "bytes": 8388900,
+      "max_heartbeat_gap_ms": 330.7891870063031,
+      "max_initialize_handler_ms": 330.71909099817276,
+      "max_initialize_scheduled_ms": 365.7804960021167,
+      "renders": [
+        {
+          "ms": 24.467787996400148,
+          "on_loop": false,
+          "context": "context-preserved"
+        }
+      ],
+      "heartbeat_gaps_ms": [
+        1.115913997637108,
+        1.2545130011858419,
+        1.4766490057809278,
+        1.200831997266505,
+        1.0313969978597015,
+        36.631645998568274,
+        330.7891870063031,
+        21.79786799388239,
+        29.945025002234615,
+        1.1226040005567484,
+        1.3223549976828508,
+        1.5314359989133663,
+        1.2072830068063922,
+        1.4675239945063367
+      ],
+      "initialize_samples": [
+        {
+          "handler_ms": 0.5092990031698719,
+          "scheduled_ms": 0.7323840036406182
+        },
+        {
+          "handler_ms": 0.7318440038943663,
+          "scheduled_ms": 0.9457859996473417
+        },
+        {
+          "handler_ms": 330.71909099817276,
+          "scheduled_ms": 365.7804960021167
+        },
+        {
+          "handler_ms": 29.85506899858592,
+          "scheduled_ms": 49.713688997144345
+        },
+        {
+          "handler_ms": 0.6293840051512234,
+          "scheduled_ms": 0.9228760027326643
+        },
+        {
+          "handler_ms": 0.4250510028214194,
+          "scheduled_ms": 0.6627990005654283
+        }
+      ],
+      "target_wire_bytes": 8388608,
+      "arm": "candidate",
+      "pair": 1,
+      "exact_response_equal": true
+    },
+    {
+      "handler_ms": 424.2089049948845,
+      "bytes": 8388900,
+      "max_heartbeat_gap_ms": 312.48107999999775,
+      "max_initialize_handler_ms": 335.585661996447,
+      "max_initialize_scheduled_ms": 372.702152999409,
+      "renders": [
+        {
+          "ms": 21.579459003987722,
+          "on_loop": true,
+          "context": "context-preserved"
+        }
+      ],
+      "heartbeat_gaps_ms": [
+        1.1123479998786934,
+        1.2084940026397817,
+        1.5095889975782484,
+        1.1637360003078356,
+        39.550387002236675,
+        312.48107999999775,
+        23.191932996269315,
+        21.94311200582888,
+        27.192028996068984,
+        1.402606998453848,
+        1.2746140055241995,
+        1.4281859985203482,
+        1.219820995174814
+      ],
+      "initialize_samples": [
+        {
+          "handler_ms": 0.5075959998066537,
+          "scheduled_ms": 0.7136759959394112
+        },
+        {
+          "handler_ms": 0.5595740003627725,
+          "scheduled_ms": 0.7664250006200746
+        },
+        {
+          "handler_ms": 335.585661996447,
+          "scheduled_ms": 372.702152999409
+        },
+        {
+          "handler_ms": 27.44782600348117,
+          "scheduled_ms": 47.44391799613368
+        },
+        {
+          "handler_ms": 0.4828689998248592,
+          "scheduled_ms": 0.7136460044421256
+        },
+        {
+          "handler_ms": 0.2918899990618229,
+          "scheduled_ms": 0.551090000953991
+        }
+      ],
+      "target_wire_bytes": 8388608,
+      "arm": "baseline",
+      "pair": 1,
+      "exact_response_equal": true
+    },
+    {
+      "handler_ms": 408.39059699646896,
+      "bytes": 8388900,
+      "max_heartbeat_gap_ms": 337.177123001311,
+      "max_initialize_handler_ms": 337.10026599874254,
+      "max_initialize_scheduled_ms": 375.972167996224,
+      "renders": [
+        {
+          "ms": 25.341316002595704,
+          "on_loop": true,
+          "context": "context-preserved"
+        }
+      ],
+      "heartbeat_gaps_ms": [
+        1.1217830033274367,
+        1.1932909983443096,
+        1.463658998545725,
+        1.212330003909301,
+        1.0433349962113425,
+        40.325116002350114,
+        337.177123001311,
+        30.00160899682669,
+        1.8648440018296242,
+        1.2189499975647777,
+        1.4251309985411353,
+        1.2282540046726353
+      ],
+      "initialize_samples": [
+        {
+          "handler_ms": 0.4431490015122108,
+          "scheduled_ms": 0.6587629977730103
+        },
+        {
+          "handler_ms": 0.6007069969200529,
+          "scheduled_ms": 0.8522549978806637
+        },
+        {
+          "handler_ms": 337.10026599874254,
+          "scheduled_ms": 375.972167996224
+        },
+        {
+          "handler_ms": 0.7117440036381595,
+          "scheduled_ms": 28.772202000254765
+        },
+        {
+          "handler_ms": 0.41308400250272825,
+          "scheduled_ms": 0.6615270031034015
+        },
+        {
+          "handler_ms": 0.362086997483857,
+          "scheduled_ms": 0.6275459963944741
+        }
+      ],
+      "target_wire_bytes": 8388608,
+      "arm": "baseline",
+      "pair": 2,
+      "exact_response_equal": true
+    },
+    {
+      "handler_ms": 423.86180000175955,
+      "bytes": 8388900,
+      "max_heartbeat_gap_ms": 310.43032000161475,
+      "max_initialize_handler_ms": 320.585586996458,
+      "max_initialize_scheduled_ms": 357.5204989974736,
+      "renders": [
+        {
+          "ms": 24.20237699698191,
+          "on_loop": false,
+          "context": "context-preserved"
+        }
+      ],
+      "heartbeat_gaps_ms": [
+        1.1142820003442466,
+        1.2067719944752753,
+        1.6515220049768686,
+        1.2209029955556616,
+        1.070876001904253,
+        38.690604000294115,
+        310.43032000161475,
+        10.272032995999325,
+        11.225662005017512,
+        52.08532399410615,
+        1.2117290025344118,
+        1.3047489992459305,
+        1.5085920022102073,
+        1.213450996147003,
+        1.420865002728533
+      ],
+      "initialize_samples": [
+        {
+          "handler_ms": 0.571832999412436,
+          "scheduled_ms": 0.792334001744166
+        },
+        {
+          "handler_ms": 0.9475999977439642,
+          "scheduled_ms": 1.2499959993874654
+        },
+        {
+          "handler_ms": 320.585586996458,
+          "scheduled_ms": 357.5204989974736
+        },
+        {
+          "handler_ms": 51.717829002882354,
+          "scheduled_ms": 61.05643200135091
+        },
+        {
+          "handler_ms": 0.5537710021599196,
+          "scheduled_ms": 1.2400650011841208
+        },
+        {
+          "handler_ms": 0.35217099502915516,
+          "scheduled_ms": 0.5986819960526191
+        }
+      ],
+      "target_wire_bytes": 8388608,
+      "arm": "candidate",
+      "pair": 2,
+      "exact_response_equal": true
+    },
+    {
+      "handler_ms": 413.4379550014273,
+      "bytes": 8388900,
+      "max_heartbeat_gap_ms": 325.25605100090615,
+      "max_initialize_handler_ms": 325.18904100288637,
+      "max_initialize_scheduled_ms": 362.27552199852653,
+      "renders": [
+        {
+          "ms": 23.70554699882632,
+          "on_loop": false,
+          "context": "context-preserved"
+        }
+      ],
+      "heartbeat_gaps_ms": [
+        1.1125789969810285,
+        1.1931909975828603,
+        1.4250360036385246,
+        1.3355449991649948,
+        39.54807799891569,
+        325.25605100090615,
+        48.75241500121774,
+        2.0735590005642734,
+        1.2363060013740323,
+        1.4047499935259111,
+        1.235435003763996
+      ],
+      "initialize_samples": [
+        {
+          "handler_ms": 0.37752900243503973,
+          "scheduled_ms": 0.5857319993083365
+        },
+        {
+          "handler_ms": 0.7121750022633933,
+          "scheduled_ms": 0.9673930035205558
+        },
+        {
+          "handler_ms": 325.18904100288637,
+          "scheduled_ms": 362.27552199852653
+        },
+        {
+          "handler_ms": 0.9166939998976886,
+          "scheduled_ms": 47.713374995510094
+        },
+        {
+          "handler_ms": 0.42069399933097884,
+          "scheduled_ms": 0.6735649949405342
+        },
+        {
+          "handler_ms": 0.32870600261958316,
+          "scheduled_ms": 0.5766190006397665
+        }
+      ],
+      "target_wire_bytes": 8388608,
+      "arm": "candidate",
+      "pair": 3,
+      "exact_response_equal": true
+    },
+    {
+      "handler_ms": 410.4630440051551,
+      "bytes": 8388900,
+      "max_heartbeat_gap_ms": 317.2143749980023,
+      "max_initialize_handler_ms": 317.1515299982275,
+      "max_initialize_scheduled_ms": 350.09492300014244,
+      "renders": [
+        {
+          "ms": 21.212625004409347,
+          "on_loop": true,
+          "context": "context-preserved"
+        }
+      ],
+      "heartbeat_gaps_ms": [
+        1.1283030034974217,
+        1.290436994167976,
+        1.4338140026666224,
+        1.2311480022617616,
+        35.5125220012269,
+        317.2143749980023,
+        8.390652998059522,
+        49.46747799840523,
+        1.0316170009900816,
+        1.1117079993709922,
+        1.180832005047705,
+        1.3808539952151477,
+        1.2022950031678192
+      ],
+      "initialize_samples": [
+        {
+          "handler_ms": 0.454435998108238,
+          "scheduled_ms": 0.7293399976333603
+        },
+        {
+          "handler_ms": 0.6921650056028739,
+          "scheduled_ms": 0.9425309981452301
+        },
+        {
+          "handler_ms": 317.1515299982275,
+          "scheduled_ms": 350.09492300014244
+        },
+        {
+          "handler_ms": 28.047259998857044,
+          "scheduled_ms": 34.504274000937585
+        },
+        {
+          "handler_ms": 0.9195179954986088,
+          "scheduled_ms": 20.391783997183666
+        },
+        {
+          "handler_ms": 0.34229700395371765,
+          "scheduled_ms": 0.581335996685084
+        },
+        {
+          "handler_ms": 0.29189100314397365,
+          "scheduled_ms": 0.5430980017990805
+        }
+      ],
+      "target_wire_bytes": 8388608,
+      "arm": "baseline",
+      "pair": 3,
+      "exact_response_equal": true
+    },
+    {
+      "handler_ms": 403.30899199761916,
+      "bytes": 8388900,
+      "max_heartbeat_gap_ms": 319.1334299990558,
+      "max_initialize_handler_ms": 319.0558330024942,
+      "max_initialize_scheduled_ms": 355.0052770006005,
+      "renders": [
+        {
+          "ms": 19.547440999303944,
+          "on_loop": true,
+          "context": "context-preserved"
+        }
+      ],
+      "heartbeat_gaps_ms": [
+        1.109534001443535,
+        1.3386310019996017,
+        1.4157059995341115,
+        1.1658299990813248,
+        1.0556130000622943,
+        37.403251000796445,
+        319.1334299990558,
+        25.79015400260687,
+        20.259805998648517,
+        1.47117099550087,
+        1.2817640017601661,
+        1.4026770004420541,
+        1.2265109980944544
+      ],
+      "initialize_samples": [
+        {
+          "handler_ms": 0.5503809952642769,
+          "scheduled_ms": 0.7501309955841862
+        },
+        {
+          "handler_ms": 0.6143369973869994,
+          "scheduled_ms": 0.8207069986383431
+        },
+        {
+          "handler_ms": 319.0558330024942,
+          "scheduled_ms": 355.0052770006005
+        },
+        {
+          "handler_ms": 20.570634995237924,
+          "scheduled_ms": 44.4341100010206
+        },
+        {
+          "handler_ms": 0.4169290041318163,
+          "scheduled_ms": 0.6628190021729097
+        },
+        {
+          "handler_ms": 0.3256719937780872,
+          "scheduled_ms": 0.6016169936629012
+        }
+      ],
+      "target_wire_bytes": 8388608,
+      "arm": "baseline",
+      "pair": 4,
+      "exact_response_equal": true
+    },
+    {
+      "handler_ms": 443.36827599909157,
+      "bytes": 8388900,
+      "max_heartbeat_gap_ms": 329.59808899613563,
+      "max_initialize_handler_ms": 329.53572499536676,
+      "max_initialize_scheduled_ms": 367.64922099973774,
+      "renders": [
+        {
+          "ms": 26.729911005531903,
+          "on_loop": false,
+          "context": "context-preserved"
+        }
+      ],
+      "heartbeat_gaps_ms": [
+        1.1126890021841973,
+        1.2105569985578768,
+        1.3914099981775507,
+        1.2107970032957383,
+        40.60137300257338,
+        329.59808899613563,
+        9.41533999866806,
+        32.04163400368998,
+        27.794734000053722,
+        4.025670001283288,
+        1.4030879974598065,
+        1.284814003156498,
+        1.4331329948618077,
+        1.3255310041131452
+      ],
+      "initialize_samples": [
+        {
+          "handler_ms": 0.37898200389463454,
+          "scheduled_ms": 0.5900289979763329
+        },
+        {
+          "handler_ms": 0.6105520005803555,
+          "scheduled_ms": 0.8471270048175938
+        },
+        {
+          "handler_ms": 329.53572499536676,
+          "scheduled_ms": 367.64922099973774
+        },
+        {
+          "handler_ms": 31.978077997337095,
+          "scheduled_ms": 39.44674800004577
+        },
+        {
+          "handler_ms": 4.265693001798354,
+          "scheduled_ms": 30.12969100382179
+        },
+        {
+          "handler_ms": 0.4574000049615279,
+          "scheduled_ms": 0.7158640000852756
+        },
+        {
+          "handler_ms": 0.44558300578501076,
+          "scheduled_ms": 0.7406160002574325
+        }
+      ],
+      "target_wire_bytes": 8388608,
+      "arm": "candidate",
+      "pair": 4,
+      "exact_response_equal": true
+    }
+  ],
+  "cancellation": {
+    "baseline": {
+      "cancelled": true,
+      "done_before_release": true,
+      "projection_finished": true,
+      "contexts": [
+        "context-preserved"
+      ]
+    },
+    "candidate": {
+      "cancelled": true,
+      "done_before_release": true,
+      "projection_finished": true,
+      "contexts": [
+        "context-preserved"
+      ]
+    }
+  },
+  "serialization_counts": [
+    {
+      "target_wire_bytes": 2048,
+      "response_bytes": 2340,
+      "calls": [
+        {
+          "category": "rpc_empty_budget",
+          "utf8_bytes": 46,
+          "on_loop": true
+        },
+        {
+          "category": "scalar_or_key_size_check",
+          "utf8_bytes": 4,
+          "on_loop": true
+        },
+        {
+          "category": "scalar_or_key_size_check",
+          "utf8_bytes": 8,
+          "on_loop": false
+        },
+        {
+          "category": "scalar_or_key_size_check",
+          "utf8_bytes": 21,
+          "on_loop": false
+        },
+        {
+          "category": "scalar_or_key_size_check",
+          "utf8_bytes": 11,
+          "on_loop": false
+        },
+        {
+          "category": "scalar_or_key_size_check",
+          "utf8_bytes": 7,
+          "on_loop": false
+        },
+        {
+          "category": "scalar_or_key_size_check",
+          "utf8_bytes": 10,
+          "on_loop": false
+        },
+        {
+          "category": "scalar_or_key_size_check",
+          "utf8_bytes": 7,
+          "on_loop": false
+        },
+        {
+          "category": "scalar_or_key_size_check",
+          "utf8_bytes": 1026,
+          "on_loop": false
+        },
+        {
+          "category": "public_data_text",
+          "utf8_bytes": 1104,
+          "on_loop": false
+        },
+        {
+          "category": "tool_envelope_size_check",
+          "utf8_bytes": 2298,
+          "on_loop": false
+        },
+        {
+          "category": "rpc_final",
+          "utf8_bytes": 2340,
+          "on_loop": true
+        }
+      ]
+    },
+    {
+      "target_wire_bytes": 1048576,
+      "response_bytes": 1048868,
+      "calls": [
+        {
+          "category": "rpc_empty_budget",
+          "utf8_bytes": 46,
+          "on_loop": true
+        },
+        {
+          "category": "scalar_or_key_size_check",
+          "utf8_bytes": 4,
+          "on_loop": true
+        },
+        {
+          "category": "scalar_or_key_size_check",
+          "utf8_bytes": 8,
+          "on_loop": false
+        },
+        {
+          "category": "scalar_or_key_size_check",
+          "utf8_bytes": 21,
+          "on_loop": false
+        },
+        {
+          "category": "scalar_or_key_size_check",
+          "utf8_bytes": 11,
+          "on_loop": false
+        },
+        {
+          "category": "scalar_or_key_size_check",
+          "utf8_bytes": 7,
+          "on_loop": false
+        },
+        {
+          "category": "scalar_or_key_size_check",
+          "utf8_bytes": 10,
+          "on_loop": false
+        },
+        {
+          "category": "scalar_or_key_size_check",
+          "utf8_bytes": 7,
+          "on_loop": false
+        },
+        {
+          "category": "scalar_or_key_size_check",
+          "utf8_bytes": 524290,
+          "on_loop": false
+        },
+        {
+          "category": "public_data_text",
+          "utf8_bytes": 524368,
+          "on_loop": false
+        },
+        {
+          "category": "tool_envelope_size_check",
+          "utf8_bytes": 1048826,
+          "on_loop": false
+        },
+        {
+          "category": "rpc_final",
+          "utf8_bytes": 1048868,
+          "on_loop": true
+        }
+      ]
+    }
+  ],
+  "contract_tests_per_arm": 9
+}

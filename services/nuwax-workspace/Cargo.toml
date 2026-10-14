@@ -1,0 +1,140 @@
+[workspace]
+resolver = "2"
+# 工作区最低 Rust 版本由 workspace.package 统一声明。
+# 算法与原生依赖是否启用由各组件的特性配置决定；成员存在不代表部署已启用。
+members = [
+    # 共享消息、编码、传输与运行基础
+    "crates/nuwax-types",
+    "crates/nuwax-numeric",
+    "crates/nuwax-codec",
+    "crates/nuwax-protocol",
+    "crates/nuwax-transport",
+    "crates/nuwax-lcm-sys",
+    "crates/nuwax-lcm",
+    "crates/nuwax-core",
+    "crates/nuwax-rpc",
+    "crates/nuwax-stream",
+    "crates/nuwax-tf",
+    # 建图、点云与激光惯性里程计
+    "crates/nuwax-mapping",
+    "crates/nuwax-map-chunks",
+    "crates/nuwax-gtsam",
+    "crates/nuwax-mapping-cloud",
+    "crates/nuwax-mapping-cli",
+    "crates/nuwax-lio-backends",
+    "crates/nuwax-slam-toolbox-sys",
+    "crates/nuwax-slam-toolbox",
+    "crates/nuwax-slam-2d-runtime",
+    # 导航编排与探索
+    "crates/nuwax-nav-stack",
+    "crates/nuwax-exploration",
+    "crates/nuwax-explore-routing",
+    "crates/nuwax-explore-wavefront",
+    "crates/nuwax-explore-tare-bridge",
+    "crates/nuwax-explore-terrain-bridge",
+    "crates/nuwax-explore-terrain-map-bridge",
+    # 导航协议、原生进程运行器与测试夹具
+    "crates/nuwax-nav-types-messages",
+    "crates/nuwax-nav-base",
+    "crates/nuwax-nav-native-runner",
+    "crates/nuwax-nav-test-fixtures",
+    # 路径规划与原生算法桥接
+    "crates/nuwax-nav-astar",
+    "crates/nuwax-nav-far-planner-bridge",
+    "crates/nuwax-nav-local-planner-bridge",
+    "crates/nuwax-nav-path-follower-bridge",
+    "crates/nuwax-nav-pgo-bridge",
+    "crates/nuwax-nav-simple-planner",
+    "crates/nuwax-nav-terrain-map-ext",
+    # 路径跟随、任务行为与视觉导航
+    "crates/nuwax-nav-basic-path-follower",
+    "crates/nuwax-nav-movement-manager",
+    "crates/nuwax-nav-click-goal-bridge",
+    "crates/nuwax-nav-patrolling",
+    "crates/nuwax-nav-visual-servoing",
+    "crates/nuwax-nav-visual-query",
+    "crates/nuwax-nav-bbox-tracker",
+    # 多层表面规划与运动运行时
+    "crates/nuwax-nav-mls-planner",
+    "crates/nuwax-nav-pct",
+    "crates/nuwax-nav-scan",
+    "crates/nuwax-nav-voxel",
+    "crates/nuwax-motion-safety-guard",
+    "crates/nuwax-nav-runtime",
+    "crates/nuwax-nav-control",
+]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.88"
+license = "Apache-2.0"
+authors = ["Nuwax Team <build@nuwax.dev>"]
+repository = "https://github.com/nuwax-org/nuwax"
+publish = false
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+futures = "0.3"
+tokio-stream = { version = "0.1", features = ["sync"] }
+
+nalgebra = { version = "0.33", features = ["serde-serialize"] }
+ndarray = { version = "0.15", features = ["rayon", "serde"] }
+ndarray-linalg = "0.16"
+glam = "0.29"
+kiddo = "=4.2.0"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+prost = "0.13"
+tonic = "0.12"
+tonic-build = "0.12"
+prost-types = "0.13"
+
+lz4_flex = "0.11"
+turbojpeg = "0.4"
+
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+osmpbf = "0.1"
+image = { version = "0.25", default-features = false }
+imageproc = { version = "0.25", default-features = false }
+
+ort = { version = "2", default-features = false }
+candle-core = "0.8"
+candle-nn = "0.8"
+candle-transformers = "0.8"
+
+apriltag-rs = { version = "0.3", default-features = false }
+printpdf = "0.7"
+
+memmap2 = "0.9"
+parking_lot = "0.12"
+
+anyhow = "1"
+thiserror = "1"
+bytes = "1"
+libc = { version = "0.2", default-features = false }
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+indexmap = { version = "2", features = ["serde"] }
+once_cell = "1"
+rayon = "1"
+bitflags = { version = "2", features = ["serde"] }
+validator = { version = "0.20", features = ["derive"] }
+
+proptest = "1"
+pretty_assertions = "1"
+approx = "0.5"
+criterion = { version = "0.5", features = ["html_reports"] }
+mockall = "0.13"
+ahash = "0.8"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

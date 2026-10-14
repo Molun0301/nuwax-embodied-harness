@@ -1,6 +1,6 @@
 # NEH 云端夜间开发进度（持续更新）
 
-更新时间：2026-10-14 08:44 北京时间（2026-10-14 00:44 UTC）。本轮仍在进行，计划继续至北京时间 2026-10-14 11:00；本文不是收尾或整机验收声明。
+更新时间：2026-10-14 09:23 北京时间（2026-10-14 01:23 UTC）。本轮仍在进行，计划继续至北京时间 2026-10-14 11:00；本文不是收尾或整机验收声明。
 
 ## 当前结论与交付状态
 
@@ -8,14 +8,14 @@
 
 - 仓库：`Molun0301/nuwax-embodied-harness`
 - 工作分支：`fix/v3-legacy-cloud-seal-20261006`
-- 已确认的远端基线：`65d15c5262af71ee0ab532133bd0afdcb5e75911`；最近一次只读核对为2026-10-14 00:17 UTC，远端仍停在该提交
-- 当前本地代码状态：`041b6f1`，相对远端基线新增 **65 个本地提交**；生产代码最新变更仍为`35ac900`；本次报告更新不包含在此计数中
-- 最新已确认的 Library 检查点为 **v32，3,324,225 bytes**，覆盖截至 `afcd7a6` 的61个提交；覆盖63提交（截至`2a12db8`）的本地检查点已核对为 **3,389,375 bytes**，但尚未上传Library；第64–65提交也尚无已上传检查点凭据。另有约15.458 MB原始日志只在本地，不能称已远端备份
-- 00:17 UTC检查仍缺CLI登录；00:19 UTC的Git远端读取已到达认证步骤，因禁止交互而无法读取Username。当前阻塞是认证，**没有证据称网络被封锁**；本地提交、测试和Library备份均不等于GitHub已更新
+- 已确认的远端基线：`65d15c5262af71ee0ab532133bd0afdcb5e75911`；最近一次只读核对为2026-10-14 01:17 UTC，远端仍停在该提交
+- 当前本地代码状态：`6eec75e`，相对远端基线新增 **69 个本地提交**；本次报告更新不包含在此计数中
+- 同一 Library 检查点 **v34，4,547,697 bytes** 已确认覆盖全部69个提交。高密度recent的完整纯文本原始日志也已单独保存到Library；不再是仅本地文件
+- 01:17 UTC仍未登录GitHub CLI；Git远端读取仍在认证步骤因禁止交互而无法读取Username。**没有推送**，也没有网络封锁证据；Library保存不代表GitHub分支已经更新
 
 **最新导航结果：** 完整 `NavScheduler` 局部恢复修复已提交为 `0eed9d2`，固定持续障碍的原目标在 **13.32秒**完成，仅2次规划/2次准入，232条完整停车尾迹和715条实际运动边全部通过。早期60秒失败与两次短程停车尾迹失败仍保留；独立调查发现采样位姿到实际应用间的转动差异，当前只是合同诊断，没有生产修复或真实50 ms执行器hold证明。不能据此称现场机器人卡住或安全时序问题全部解决。
 
-**最新集成与归因：** Python3.8.10最新59目标去重选集 **1227项通过**，涵盖地图状态10项与完整installer57项；唯一排除仍为明确执行legacy内容哈希的pred1 fixture。它取代“待合并回归”状态，但仍是有界离线选择，不是全仓测试。Runtime适用范围236项通过但仍排除5项真实UDS。新RSS诊断支持allocator/free-page retention是复现晚窗增长的主要原因，剩余约43/114 KiB未归因；没有修改生产allocator或宣称无泄漏。
+**最新集成与归因：** Python3.8.10最新59目标去重选集 **1227项通过**，涵盖地图状态10项与完整installer57项；唯一排除仍为明确执行legacy内容哈希的pred1 fixture。后续改动仅涉及Rust/JS及诊断，未改这份已验证的Python生产状态；不能把它说成最终HEAD所有语言/模块全通过。Runtime适用范围236项通过但仍排除5项真实UDS。新RSS诊断支持allocator/free-page retention是复现晚窗增长的主要原因，剩余约43/114 KiB未归因；没有修改生产allocator或宣称无泄漏。
 
 下面的“旧 → 新”均采用各专项报告的匹配基线，不意味着统一对比上述远端版本。局部连续优化的收益也不相加。
 
@@ -119,6 +119,20 @@
 
 状态读取不再顺带执行摘要专属修复或遇到摘要专属错误，这是明确的范围变化，不声称副作用完全相同。直接summary/query及完整workspace继续保留验证、repair和错误；标量异常不吞掉，定位/readiness顺序不变。相关 **129项测试通过，零失败/跳过/排除，application hash attempts=0，framework ETag=0**；包括真实summary后续仍会修复的控制。早期1160项属于该改动前；后续最新1227项合并选择已覆盖这次地图状态改动。[报告](diagnostics/map-status-scalar-20261014.md)
 
+### 重定位准备：实测基线与目标所有权交接优化
+
+第67阶段直接测量真实私有source-sealing helper，确认大target在送入既有 `spawn_blocking` 之前有同步准备成本。4M点合成target在三个source规模下的完整准备中位数约 **95.93–100.13 ms**；这只是声明的容量夹具，不是用户地图大小或实机典型延迟。原调查没有改并发、lease或actor状态；独立decode/Arc阶段计时不能相加或从总耗时相减。[基线](diagnostics/relocalization-preparation-audit-20261014.md)
+
+第69阶段 `6eec75e`只改两行生产代码：私有sealed target从 `Arc<[Point3<f64>]>` 改为 `Arc<Vec<Point3<f64>>>`，并用 `Arc::new`接住原decoded Vec，避免再复制所有坐标。source仍用原Arc slice，compute仍读同一slice；没有新缓存、额外寿命、并发/worker、lease释放、scoring、heading或取消规则变化。
+
+- 实际完整helper配对：**1M target / 100k source，6.079899→2.737593 ms**；**4M / 100k，99.732179→38.283897 ms**，三个进程对均改善
+- 小target聚合负对照：100k target / 250k source **1.976584→1.996333 ms**，约增加19.749 µs；三对中一对退化15.6%、另两对略改善，不宣称普遍提速或抹去退化
+- 18个固定AB/BA/AB诊断进程、**270个记录样本（每臂135）**全部保留；这是重复诊断采样，不是270项独立测试
+- 100k/1M/4M target原Vec容量为2.4/24/96 MB；新owner保留该坐标allocation，去掉全尺寸交接副本及其瞬时重叠。最终坐标payload不变。诊断两臂仍独立跑旧Arc-slice stage，**不能用其RSS/HWM证明候选进程省了多少内存**
+- **19项精确功能测试通过**，含pointer/capacity/signed-zero、最后读者释放、source/checkpoint owner、lease、边界错误、actor取消/重复/回滚与已有heading规则；非cfg生产binary-target `cargo check`通过（30.952秒），不是链接好的部署程序或全native suite
+
+基线报告中的“仅proposal”是先前状态，现已完成这项窄改动及资格。actor仍同步封口并保留原生命周期lease；没有测实际排队延迟，也没有证明提前解锁map activation。通过已有wrong-heading回归只说明保留所覆盖行为，**不是现场朝向反转问题的诊断或修复**。[配对结果及所有权资格](diagnostics/relocalization-target-handoff-qualification-20261014.md)
+
 ## 三、任务、日志与兼容性
 
 - TaskManager 在原 RLock 下维护活动记录索引，count/bool 不复制状态、不扫描历史，列表只访问活动项。50,000 个 terminal＋50 个 active：list **22.4505 → 0.6645 ms**，锁内 **0.004046 ms**；count **0.000811 ms**。任务列表＋20 条历史摘要 **25.56 → 3.11 ms**。保留终态、隔离、回执和历史所有权；标量读取早期阶段仍有约 20 ms 扫描成本，后续索引才解决它。[最终索引](task-active-index-20261013.md)、[前一阶段](task-active-scalar-reads-20261013.md)
@@ -167,6 +181,14 @@
 - 新增实时v2增量点云确定性回放（`e3ce1d6`，仅测试）：**230次接受事务、12次重连、24次预期故障/resync**；最大36,878点、37来源页、3render slabs。真实连接/parser/assembler/Three资源对照独立数组oracle，97个geometry全部恰好释放一次；最终无保留slab、pending、accepted base或timer。复制、扫描及scheduled upload计数有精确断言，但不是实测GPU流量、GC、FPS或网络性能；生产代码未改。[证据](diagnostics/incremental-pointcloud-replay-20261013.md)
 - scene graph相机更新把本帧不变量移出节点循环（`6cc8a3a`）：500节点×20帧，clientHeight读取 **10,020→20**，FOV读取和tan各 **10,000→20**；每个scale值严格相等、资源身份不变。500为API上限，不使用超界1000节点探索样本宣传；这是运算计数减少，没有计时或浏览器layout/FPS测量。[证据](diagnostics/scene-graph-camera-invariants-20261013.md)
 
+### MJPEG浏览器解析：只复制最后选中的一帧
+
+第68阶段仅改两处：parser返回同步使用的临时subarray，consumer选出批次最后完整frame后、进入异步render前才做独立slice。临时view仍可变，依据是私有同步所有权窗口，不把它包装成“不可变快照”；不完整tail复制继续保留，避免小tail牵住整块输入。server共享multipart、SHM独立snapshot、decode admission及生命周期未改。
+
+三独立Node进程、固定synthetic JPEG批次中，256 KiB×8帧的slice-copy字节 **9,443,360→7,608,352**，parser/append/selection中位数 **0.960510→0.758195 ms**；64 KiB×4帧 **0.076956→0.058889 ms**。少复制的量恰为 `(frames−1)×JPEG bytes`。单帧复制数量不变，微小时延方向混合，**不声称单帧加速**。
+
+最终实际生产源通过 **29项Node合同测试**，包含分片/metadata/error/tail等价、async前独立复制、取消和generation变化、真实render-admission函数的fake display/URL清理。初始26项不与最终29相加。计时不含fetch、Blob、真实解码、DOM/GPU、网络或消费者async调度；**仍无实际浏览器验证、FPS/机器人CPU或持续内存结论**。[完整报告](diagnostics/mjpeg-parser-owned-selection-20261014.md)
+
 ## 六、没有贸然改动的路径
 
 - 传感器进程快照已有 unchanged 省略与 pending 合并；250k 点合成 native-LIO 快照实际投递中位数 **13.318 ms**，短样本维持约20 Hz。暂停接收100 ms会阻塞共用通道中的错误发送，属于已记录限制。没有砍 metadata、限点或增加新通道。[审计](performance-sensor-snapshot-audit.md)
@@ -185,11 +207,14 @@
 - assigned activation确有同一immutable canonical target在preflight与install各解码构造一次HashSet。1M点单decode诊断约65–76 ms、validate＋decode约137–148 ms，但**未采用保留set方案**：每个大请求多保留约26 MiB（实测27,267,072 mapped bytes），准备发生在transition锁前，缺少server-wide pending-task数量上限；50个set约1.27 GiB仅为并发风险示例，不是实际负载。18个进程是重复诊断、非18独立测试；它未实现完整activation、writer-lock时延或真实peak比较。没有移动准入次序、增加信号量/缓存或声称激活加速。[负面审计](diagnostics/activation-decode-audit-20261013.md)
 - recent ingestion初始基线的100k点XYZ materialization **0.820–0.846 ms**、finite scan **0.143–0.155 ms**，未支持扩大iterator/error-drain重构；两遍parser还会重复decode。保留原接口/错误/格式范围，三个ordinary contracts通过。之后较大的column构造热点才推进上述独立优化，不能把基线归因冒充同一A/B结果。[基线](diagnostics/recent-ingestion-baseline-20261013.md)
 
-- 重定位candidate-pair索引复用的小型离线夹具没有测出实质、可重复的完整计算收益；未修改生产索引或定位阈值/heading规则。同步准备阶段仍另行调查，不把这些小夹具外推为实机地图代表负载。[负面审计](diagnostics/relocalization-pair-reuse-audit-20261014.md)
+- 重定位candidate-pair索引复用的小型离线夹具没有测出实质、可重复的完整计算收益；未修改生产索引或定位阈值/heading规则。后续同步准备基线与两行target交接优化已独立完成，未采纳该pair-index方案；不把小夹具外推为实机地图代表负载。[负面审计](diagnostics/relocalization-pair-reuse-audit-20261014.md)
 
 ## 七、验证状态与未完成边界
 
 以下按实际版本和范围分别报告，重叠测试数不相加，也不把历史通过等同最终 HEAD 全通过：
+
+- 最新target交接为19项精确功能通过、18个诊断进程/270样本及非cfg Geometry binary-target check；MJPEG为最终29项Node合同通过。两者是Rust/JS各自窄资格，不与既有Python1227或Runtime236混成“全HEAD通过”
+
 
 - **最新recent-column冻结窗口**：MLS **322 passed / 0 failed / 17 ignored，20.22秒**；Stack ingestion contracts **3通过**、原qualification **15通过/8 ignored**、source-health/preflight两个exact通过、六项原live分别通过；Runtime **236通过 / 58 ignored / 5 UDS filtered，56.50秒**。新增focused MLS含在322中，不另加；各轮重复qualification不累计
 - 这一轮六live的OFF/ON耗时分别为known-drop **7.08/6.93秒**、box **10.95/12.71秒**、wall **10.51/7.69秒**，只是原fixture资格，不是速度对照。原60秒窗口、1秒source TTL、容差及collision/braking oracle不变
@@ -220,10 +245,9 @@
 
 ## 八、正在继续的工作（未计为成果）
 
-- SDK源码目录复用与受管理依赖绑定已成对接受并提交35ac900，移入已完成的局部成果；完整SDK/部署资格仍未声称
-- 最新1227项合并Python资格已通过并纳入结果；重定位同步准备路径仍在调查，未形成新的生产索引优化
-- 63提交本地检查点尚未上传，第64–65提交也待新检查点；Library仍只确认v32的61提交
-- 本轮云端工作继续至北京时间11:00（03:00 UTC）；后续结果、最终备份和远端状态届时再更新，当前不宣称全部完成
+- 最新重定位准备基线、两行target交接、MJPEG选帧复制优化均已归入结果，分别保留其资格边界与负对照，不再称待研究或待提交
+- Library v34已覆盖69提交，完整dense日志也已单独保存；之后本报告及新增工作还需下一次检查点。GitHub CLI认证仍阻止推送
+- 本轮云端工作继续至北京时间11:00（03:00 UTC）；继续核对后续源码变化、相关回归与交付状态，当前不宣称全部完成。实机、UDS、真实浏览器和dispatch时序边界仍如上保留
 
 ## 附：证据阅读顺序
 
@@ -248,3 +272,5 @@
 - 第64阶段：[source-cache真实编排结果](diagnostics/slam2d-source-build-reuse-20261014-results.json)、[managed-binding与64-case结果](diagnostics/slam2d-managed-binding-20261014-results.json)
 
 - 最新Python：[2026-10-14合并资格](diagnostics/python-guarded-integration-20261014.md)、[1227个唯一node结果与原始guard记录](diagnostics/python-guarded-integration-20261014-results.json)
+
+- 第67–69阶段：[真实重定位准备基线](diagnostics/relocalization-preparation-audit-20261014.md)、[基线45样本](diagnostics/relocalization-preparation-audit-20261014-results.json)、[MJPEG选帧29项及三进程配对](diagnostics/mjpeg-parser-owned-selection-20261014-results.json)、[target交接270样本与19项资格](diagnostics/relocalization-target-handoff-qualification-20261014-results.json)

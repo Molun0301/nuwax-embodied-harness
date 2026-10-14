@@ -12,6 +12,8 @@ use nuwax_nav_runtime::{AppliedProof, BoundedTwistOutcome, CommandDispatchBound,
 use nuwax_nav_types_messages::{MotionLimits, MotionModel, NavigationCapabilities,
     RobotGeometry, TerrainLimits};
 
+mod dense_recent { include!("surface_dense_recent_qualification.rs"); }
+
 const SAMPLE_PERIOD: Duration = Duration::from_millis(200);
 const QUALIFICATION_WINDOW: Duration = Duration::from_secs(60);
 const RESOLUTION: f32 = 0.05;
@@ -994,6 +996,11 @@ struct OccupancyHarness {
 }
 impl OccupancyHarness {
     async fn start(local_planning_enabled: bool,scene:Scene) -> Self {
+        Self::start_with_dense_recent(local_planning_enabled,scene,None).await
+    }
+    // An explicit new load case; original entry points always select None.
+    async fn start_with_dense_recent(local_planning_enabled: bool,scene:Scene,
+        dense_log:Option<Arc<Mutex<Vec<dense_recent::PublishedDenseScan>>>>) -> Self {
         let started=Instant::now();
         use crate::topics::{NavTopicConfig,TopicName};
         let config=calibrated_config(local_planning_enabled);
@@ -1106,9 +1113,15 @@ impl OccupancyHarness {
                 }
                 publish_body(&feed_transport,&feed_node.inputs[0],"nuwax_msgs.NavigationMap3D",
                     payload).await.unwrap();
-                super::support_recovery_qualification::publish_sampled_recent(
-                    &feed_transport,&map,sequence,stamp,pose_stamp,
-                    retained.iter().copied().map(|key|(key,key[2]==1))).await;
+                if let Some(log)=&dense_log {
+                    let record=dense_recent::publish(&feed_transport,&map,sequence,stamp,pose_stamp,
+                        control.scene,control.stage).await;
+                    log.lock().unwrap().push(record);
+                } else {
+                    super::support_recovery_qualification::publish_sampled_recent(
+                        &feed_transport,&map,sequence,stamp,pose_stamp,
+                        retained.iter().copied().map(|key|(key,key[2]==1))).await;
+                }
                 // Only a successfully encoded and published source enters the ledger.
                 { let mut evidence=feed_evidence.lock().unwrap();
                     evidence.maps.insert(stamp,record); evidence.latest_map=Some(map); }

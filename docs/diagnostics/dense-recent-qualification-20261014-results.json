@@ -1,0 +1,916 @@
+{
+  "plan": {
+    "scope": "One new candidate-only dense recent-cloud box/local-planning-ON case, after one saved scene/wire preflight",
+    "scan_period_ms": 200,
+    "pose_period_ms": 25,
+    "source_max_age_sec": 1,
+    "qualification_window_sec": 60,
+    "clear_points": 96000,
+    "inserted_points": 97824,
+    "ground_points": 96000,
+    "xy_columns": 6000,
+    "maximum_admitted_points": 100000,
+    "change": "16 distinct interior XY points per original ground voxel at the original z; all original box voxel-center returns retained",
+    "preflight": "dense_box_scene_wire_preflight",
+    "live": "dense_recent_box_local_planning_on",
+    "stop": "Do not run live if preflight fails. Run the new live case exactly once; retain any failure without threshold changes or a retry for favorable output.",
+    "original_tests": "Six original live entry points, original exercise, audits, limits, deadlines and original publisher remain unchanged; originals are not rerun in this task.",
+    "limitations": "Synthetic high-density ground scan, no hardware scan fidelity claim; no physical braking, transport UDS, speedup, strict cycle deadline, RSS or individual recent-frame ACK count claim",
+    "build": "cargo test --release --locked --offline -j2 -p nuwax-nav-stack --lib --features mls,guard-runtime,surface-recovery-qualification --no-run --message-format=json",
+    "compiler": "rustc 1.88.0 (6b00bc388 2025-06-23)",
+    "git_operations": false,
+    "hashes_computed": false
+  },
+  "compiler_artifact": {
+    "reason": "compiler-artifact",
+    "package_id": "path+file:///workspace/scratch/71cdb9d17732/neh-cloud-3d1901d/services/nuwax-workspace/crates/nuwax-nav-stack#0.1.0",
+    "manifest_path": "/workspace/scratch/71cdb9d17732/neh-cloud-3d1901d/services/nuwax-workspace/crates/nuwax-nav-stack/Cargo.toml",
+    "target": {
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ],
+      "name": "nuwax_nav_stack",
+      "src_path": "/workspace/scratch/71cdb9d17732/neh-cloud-3d1901d/services/nuwax-workspace/crates/nuwax-nav-stack/src/lib.rs",
+      "edition": "2021",
+      "doc": true,
+      "doctest": true,
+      "test": true
+    },
+    "profile": {
+      "opt_level": "3",
+      "debuginfo": 0,
+      "debug_assertions": false,
+      "overflow_checks": false,
+      "test": true
+    },
+    "features": [
+      "click-goal",
+      "default",
+      "foundation",
+      "guard-runtime",
+      "lcm-runtime",
+      "mls",
+      "surface-recovery-qualification"
+    ],
+    "filenames": [
+      "/workspace/scratch/71cdb9d17732/neh-cloud-3d1901d/services/nuwax-workspace/target/release/deps/nuwax_nav_stack-c811430ee2fa13e5"
+    ],
+    "executable": "/workspace/scratch/71cdb9d17732/neh-cloud-3d1901d/services/nuwax-workspace/target/release/deps/nuwax_nav_stack-c811430ee2fa13e5",
+    "fresh": false
+  },
+  "frozen_binary": "/workspace/scratch/71cdb9d17732/dense-recent-qualification-20261014/dense-candidate-stack",
+  "byte_equal_copy_verified": true,
+  "runs": [
+    {
+      "name": "dense_box_scene_wire_preflight",
+      "command": [
+        "/workspace/scratch/71cdb9d17732/dense-recent-qualification-20261014/dense-candidate-stack",
+        "lcm_dataflow::surface_dataflow::tests::dynamic_occupancy_qualification::dense_recent::dense_box_scene_wire_preflight",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "started_utc": "2026-10-14T00:30:54.392380+00:00",
+      "wall_seconds": 0.32528823999746237,
+      "exit_code": 0,
+      "log": "/workspace/scratch/71cdb9d17732/dense-recent-qualification-20261014/dense_box_scene_wire_preflight.log"
+    },
+    {
+      "name": "dense_recent_box_local_planning_on",
+      "command": [
+        "/workspace/scratch/71cdb9d17732/dense-recent-qualification-20261014/dense-candidate-stack",
+        "lcm_dataflow::surface_dataflow::tests::dynamic_occupancy_qualification::dense_recent::dense_recent_box_local_planning_on",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "started_utc": "2026-10-14T00:30:54.718621+00:00",
+      "wall_seconds": 18.945703867000702,
+      "exit_code": 0,
+      "log": "/workspace/scratch/71cdb9d17732/dense-recent-qualification-20261014/dense_recent_box_local_planning_on.log"
+    }
+  ],
+  "summary": {
+    "build_exit_code": 0,
+    "build_profile": "release opt3 / thin LTO / one codegen unit",
+    "build_reported_seconds": 101,
+    "preflight_passed": true,
+    "single_live_run_passed": true,
+    "strict_arrival": {
+      "elapsed_seconds": 16.768247633,
+      "xyz_error_m": 0.07232560674839322,
+      "yaw_error_rad": 0.10752299087939965,
+      "fence_seq": 398
+    },
+    "oracle_segments": 1162,
+    "oracle_nodes": 1162,
+    "unbounded_nonzero_commands": 0,
+    "published_dense_scans": 79,
+    "published_between_first_last_nonzero": 77,
+    "first_last_nonzero_span_seconds": 16.349871107,
+    "publication_window_caveat": "May include stationary gaps; not a per-frame nonzero-motion assertion",
+    "source_intervals_ms": {
+      "min": 200.013368,
+      "median": 223.3937785,
+      "max": 225.660563,
+      "mean": 213.14158015384615,
+      "all": [
+        200.827093,
+        224.198145,
+        200.916694,
+        224.585626,
+        200.445521,
+        224.456972,
+        200.273021,
+        202.402602,
+        222.582542,
+        225.395674,
+        224.054284,
+        200.737092,
+        224.86312,
+        224.353721,
+        200.497691,
+        200.060029,
+        200.17969,
+        224.766965,
+        200.43401,
+        224.679904,
+        224.369945,
+        201.095247,
+        224.49812,
+        200.029628,
+        224.661636,
+        224.754591,
+        200.623605,
+        224.962095,
+        224.29327,
+        200.889803,
+        224.49221,
+        200.53359,
+        224.216093,
+        200.267573,
+        201.784191,
+        222.733273,
+        200.561265,
+        200.015771,
+        224.709462,
+        200.417107,
+        200.083257,
+        200.127996,
+        200.027703,
+        224.492691,
+        200.691351,
+        224.722811,
+        224.371878,
+        200.193089,
+        224.939811,
+        225.660563,
+        224.576971,
+        200.100714,
+        224.429955,
+        200.318428,
+        200.13425,
+        224.707409,
+        200.397658,
+        200.038417,
+        224.542751,
+        225.46618,
+        224.770815,
+        200.518612,
+        224.400691,
+        224.630829,
+        200.089664,
+        225.645936,
+        224.531179,
+        200.098652,
+        200.013368,
+        225.411303,
+        224.341187,
+        200.927211,
+        224.254523,
+        200.634466,
+        224.150232,
+        200.589118,
+        225.046469,
+        224.346243
+      ]
+    },
+    "effective_source_hz": 4.691717117224135,
+    "recent_ack_count": null,
+    "original_tests_preserved": true,
+    "original_tests_rerun": false,
+    "production_telemetry_changes": false,
+    "measurement_claim": "One synthetic integration pass, not a speedup measurement"
+  },
+  "published_scans": [
+    {
+      "source_ns": 1791937854731500307,
+      "stage": "Clear",
+      "points": 96000,
+      "ground": 96000,
+      "bytes": 1536303,
+      "encode_publish_ms": 4.840354
+    },
+    {
+      "source_ns": 1791937854932327400,
+      "stage": "Clear",
+      "points": 96000,
+      "ground": 96000,
+      "bytes": 1536303,
+      "encode_publish_ms": 6.685465
+    },
+    {
+      "source_ns": 1791937855156525545,
+      "stage": "Clear",
+      "points": 96000,
+      "ground": 96000,
+      "bytes": 1536303,
+      "encode_publish_ms": 3.102325
+    },
+    {
+      "source_ns": 1791937855357442239,
+      "stage": "Clear",
+      "points": 96000,
+      "ground": 96000,
+      "bytes": 1536303,
+      "encode_publish_ms": 2.806407
+    },
+    {
+      "source_ns": 1791937855582027865,
+      "stage": "Clear",
+      "points": 96000,
+      "ground": 96000,
+      "bytes": 1536303,
+      "encode_publish_ms": 2.821109
+    },
+    {
+      "source_ns": 1791937855782473386,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 2.859979
+    },
+    {
+      "source_ns": 1791937856006930358,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 3.2323310000000003
+    },
+    {
+      "source_ns": 1791937856207203379,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 3.361867
+    },
+    {
+      "source_ns": 1791937856409605981,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 3.255255
+    },
+    {
+      "source_ns": 1791937856632188523,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 2.640146
+    },
+    {
+      "source_ns": 1791937856857584197,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 2.7916149999999997
+    },
+    {
+      "source_ns": 1791937857081638481,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 3.08626
+    },
+    {
+      "source_ns": 1791937857282375573,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 3.049986
+    },
+    {
+      "source_ns": 1791937857507238693,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 3.733887
+    },
+    {
+      "source_ns": 1791937857731592414,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 2.926669
+    },
+    {
+      "source_ns": 1791937857932090105,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 3.8773340000000003
+    },
+    {
+      "source_ns": 1791937858132150134,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 2.901466
+    },
+    {
+      "source_ns": 1791937858332329824,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 3.274855
+    },
+    {
+      "source_ns": 1791937858557096789,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 2.589069
+    },
+    {
+      "source_ns": 1791937858757530799,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 2.6970319999999997
+    },
+    {
+      "source_ns": 1791937858982210703,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 3.068112
+    },
+    {
+      "source_ns": 1791937859206580648,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 3.22541
+    },
+    {
+      "source_ns": 1791937859407675895,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 2.657462
+    },
+    {
+      "source_ns": 1791937859632174015,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 2.651474
+    },
+    {
+      "source_ns": 1791937859832203643,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 3.592615
+    },
+    {
+      "source_ns": 1791937860056865279,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 3.193712
+    },
+    {
+      "source_ns": 1791937860281619870,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 2.640727
+    },
+    {
+      "source_ns": 1791937860482243475,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 2.698995
+    },
+    {
+      "source_ns": 1791937860707205570,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 3.7153400000000003
+    },
+    {
+      "source_ns": 1791937860931498840,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 2.359522
+    },
+    {
+      "source_ns": 1791937861132388643,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 2.723222
+    },
+    {
+      "source_ns": 1791937861356880853,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 3.288035
+    },
+    {
+      "source_ns": 1791937861557414443,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 2.400335
+    },
+    {
+      "source_ns": 1791937861781630536,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 3.179851
+    },
+    {
+      "source_ns": 1791937861981898109,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 5.065748
+    },
+    {
+      "source_ns": 1791937862183682300,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 3.04767
+    },
+    {
+      "source_ns": 1791937862406415573,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 2.300292
+    },
+    {
+      "source_ns": 1791937862606976838,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 1.2920399999999999
+    },
+    {
+      "source_ns": 1791937862806992609,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 3.083114
+    },
+    {
+      "source_ns": 1791937863031702071,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 1.098568
+    },
+    {
+      "source_ns": 1791937863232119178,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 1.1163150000000002
+    },
+    {
+      "source_ns": 1791937863432202435,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 3.151217
+    },
+    {
+      "source_ns": 1791937863632330431,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 1.1101450000000002
+    },
+    {
+      "source_ns": 1791937863832358134,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 2.06675
+    },
+    {
+      "source_ns": 1791937864056850825,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 2.545944
+    },
+    {
+      "source_ns": 1791937864257542176,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 2.723241
+    },
+    {
+      "source_ns": 1791937864482264987,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 1.628248
+    },
+    {
+      "source_ns": 1791937864706636865,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 2.697782
+    },
+    {
+      "source_ns": 1791937864906829954,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 2.5435499999999998
+    },
+    {
+      "source_ns": 1791937865131769765,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 2.6141609999999997
+    },
+    {
+      "source_ns": 1791937865357430328,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 3.035151
+    },
+    {
+      "source_ns": 1791937865582007299,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 1.1705070000000002
+    },
+    {
+      "source_ns": 1791937865782108013,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 1.1674719999999998
+    },
+    {
+      "source_ns": 1791937866006537968,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 1.716892
+    },
+    {
+      "source_ns": 1791937866206856396,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 2.495246
+    },
+    {
+      "source_ns": 1791937866406990646,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 2.502608
+    },
+    {
+      "source_ns": 1791937866631698055,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 1.195325
+    },
+    {
+      "source_ns": 1791937866832095713,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 1.112599
+    },
+    {
+      "source_ns": 1791937867032134130,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 2.5864149999999997
+    },
+    {
+      "source_ns": 1791937867256676881,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 2.130246
+    },
+    {
+      "source_ns": 1791937867482143061,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 2.791745
+    },
+    {
+      "source_ns": 1791937867706913876,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 2.780278
+    },
+    {
+      "source_ns": 1791937867907432488,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 2.668709
+    },
+    {
+      "source_ns": 1791937868131833179,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 3.470911
+    },
+    {
+      "source_ns": 1791937868356464008,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 2.254995
+    },
+    {
+      "source_ns": 1791937868556553672,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 2.267013
+    },
+    {
+      "source_ns": 1791937868782199608,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 2.912618
+    },
+    {
+      "source_ns": 1791937869006730787,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 2.704955
+    },
+    {
+      "source_ns": 1791937869206829439,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 2.906329
+    },
+    {
+      "source_ns": 1791937869406842807,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 2.506845
+    },
+    {
+      "source_ns": 1791937869632254110,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 2.256947
+    },
+    {
+      "source_ns": 1791937869856595297,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 2.8103339999999997
+    },
+    {
+      "source_ns": 1791937870057522508,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 2.6502689999999998
+    },
+    {
+      "source_ns": 1791937870281777031,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 2.746554
+    },
+    {
+      "source_ns": 1791937870482411497,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 2.8873480000000002
+    },
+    {
+      "source_ns": 1791937870706561729,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 1.96167
+    },
+    {
+      "source_ns": 1791937870907150847,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 1.170536
+    },
+    {
+      "source_ns": 1791937871132197316,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 1.104848
+    },
+    {
+      "source_ns": 1791937871356543559,
+      "stage": "Inserted",
+      "points": 97824,
+      "ground": 96000,
+      "bytes": 1558191,
+      "encode_publish_ms": 2.545901
+    }
+  ],
+  "preflight_output": [
+    "",
+    "running 1 test",
+    "test lcm_dataflow::surface_dataflow::tests::dynamic_occupancy_qualification::dense_recent::dense_box_scene_wire_preflight ... PREFLIGHT_BODY scene=Box stage=Clear at=start result=Ok(()) witness=None",
+    "PREFLIGHT_BODY scene=Box stage=Clear at=goal result=Ok(()) witness=None",
+    "PREFLIGHT_STRAIGHT scene=Box stage=Clear result=Ok(()) first_witness=None",
+    "PREFLIGHT_WITNESS stage=Clear edge=0 from=([1.0, 1.5, 0.5], [0.0, 0.0, 0.0, 1.0]) to=([1.0, 1.5, 0.5], [0.0, 0.0, 0.0, 1.0]) result=Ok(()) first_witness=None",
+    "PREFLIGHT_WITNESS stage=Clear edge=1 from=([1.0, 1.5, 0.5], [0.0, 0.0, 0.0, 1.0]) to=([1.5, 1.5, 0.5], [0.0, 0.0, 0.0, 1.0]) result=Ok(()) first_witness=None",
+    "PREFLIGHT_WITNESS stage=Clear edge=2 from=([1.5, 1.5, 0.5], [0.0, 0.0, 0.0, 1.0]) to=([1.5, 1.5, 0.5], [0.0, 0.0, -0.7071067811865475, 0.7071067811865476]) result=Ok(()) first_witness=None",
+    "PREFLIGHT_WITNESS stage=Clear edge=3 from=([1.5, 1.5, 0.5], [0.0, 0.0, -0.7071067811865475, 0.7071067811865476]) to=([1.5, 0.6, 0.5], [0.0, 0.0, -0.7071067811865475, 0.7071067811865476]) result=Ok(()) first_witness=None",
+    "PREFLIGHT_WITNESS stage=Clear edge=4 from=([1.5, 0.6, 0.5], [0.0, 0.0, -0.7071067811865475, 0.7071067811865476]) to=([1.5, 0.6, 0.5], [0.0, 0.0, 0.0, 1.0]) result=Ok(()) first_witness=None",
+    "PREFLIGHT_WITNESS stage=Clear edge=5 from=([1.5, 0.6, 0.5], [0.0, 0.0, 0.0, 1.0]) to=([2.9, 0.6, 0.5], [0.0, 0.0, 0.0, 1.0]) result=Ok(()) first_witness=None",
+    "PREFLIGHT_WITNESS stage=Clear edge=6 from=([2.9, 0.6, 0.5], [0.0, 0.0, 0.0, 1.0]) to=([2.9, 0.6, 0.5], [0.0, 0.0, 0.7071067811865475, 0.7071067811865476]) result=Ok(()) first_witness=None",
+    "PREFLIGHT_WITNESS stage=Clear edge=7 from=([2.9, 0.6, 0.5], [0.0, 0.0, 0.7071067811865475, 0.7071067811865476]) to=([2.9, 1.5, 0.5], [0.0, 0.0, 0.7071067811865475, 0.7071067811865476]) result=Ok(()) first_witness=None",
+    "PREFLIGHT_WITNESS stage=Clear edge=8 from=([2.9, 1.5, 0.5], [0.0, 0.0, 0.7071067811865475, 0.7071067811865476]) to=([2.9, 1.5, 0.5], [0.0, 0.0, 0.0, 1.0]) result=Ok(()) first_witness=None",
+    "PREFLIGHT_WITNESS stage=Clear edge=9 from=([2.9, 1.5, 0.5], [0.0, 0.0, 0.0, 1.0]) to=([3.5, 1.5, 0.5], [0.0, 0.0, 0.0, 1.0]) result=Ok(()) first_witness=None",
+    "PREFLIGHT_WITNESS stage=Clear edge=10 from=([3.5, 1.5, 0.5], [0.0, 0.0, 0.0, 1.0]) to=([3.5, 1.5, 0.5], [0.0, 0.0, 0.0, 1.0]) result=Ok(()) first_witness=None",
+    "DENSE_PREFLIGHT stage=Clear points=96000 ground=96000 bytes=1536296 columns=6000 exact_scene_keys=true distinct_points=true original_geometry_queries=passed",
+    "PREFLIGHT_BODY scene=Box stage=Inserted at=start result=Ok(()) witness=None",
+    "PREFLIGHT_BODY scene=Box stage=Inserted at=goal result=Ok(()) witness=None",
+    "PREFLIGHT_STRAIGHT scene=Box stage=Inserted result=Err(UntraversableSegment) first_witness=None",
+    "PREFLIGHT_ACTUAL_START_OVERLAY scene=Box result=Err(UntraversableSegment) witness=None",
+    "PREFLIGHT_WITNESS stage=Inserted edge=0 from=([1.0, 1.5, 0.5], [0.0, 0.0, 0.0, 1.0]) to=([1.0, 1.5, 0.5], [0.0, 0.0, 0.0, 1.0]) result=Ok(()) first_witness=None",
+    "PREFLIGHT_WITNESS stage=Inserted edge=1 from=([1.0, 1.5, 0.5], [0.0, 0.0, 0.0, 1.0]) to=([1.5, 1.5, 0.5], [0.0, 0.0, 0.0, 1.0]) result=Ok(()) first_witness=None",
+    "PREFLIGHT_WITNESS stage=Inserted edge=2 from=([1.5, 1.5, 0.5], [0.0, 0.0, 0.0, 1.0]) to=([1.5, 1.5, 0.5], [0.0, 0.0, -0.7071067811865475, 0.7071067811865476]) result=Ok(()) first_witness=None",
+    "PREFLIGHT_WITNESS stage=Inserted edge=3 from=([1.5, 1.5, 0.5], [0.0, 0.0, -0.7071067811865475, 0.7071067811865476]) to=([1.5, 0.6, 0.5], [0.0, 0.0, -0.7071067811865475, 0.7071067811865476]) result=Ok(()) first_witness=None",
+    "PREFLIGHT_WITNESS stage=Inserted edge=4 from=([1.5, 0.6, 0.5], [0.0, 0.0, -0.7071067811865475, 0.7071067811865476]) to=([1.5, 0.6, 0.5], [0.0, 0.0, 0.0, 1.0]) result=Ok(()) first_witness=None",
+    "PREFLIGHT_WITNESS stage=Inserted edge=5 from=([1.5, 0.6, 0.5], [0.0, 0.0, 0.0, 1.0]) to=([2.9, 0.6, 0.5], [0.0, 0.0, 0.0, 1.0]) result=Ok(()) first_witness=None",
+    "PREFLIGHT_WITNESS stage=Inserted edge=6 from=([2.9, 0.6, 0.5], [0.0, 0.0, 0.0, 1.0]) to=([2.9, 0.6, 0.5], [0.0, 0.0, 0.7071067811865475, 0.7071067811865476]) result=Ok(()) first_witness=None",
+    "PREFLIGHT_WITNESS stage=Inserted edge=7 from=([2.9, 0.6, 0.5], [0.0, 0.0, 0.7071067811865475, 0.7071067811865476]) to=([2.9, 1.5, 0.5], [0.0, 0.0, 0.7071067811865475, 0.7071067811865476]) result=Ok(()) first_witness=None",
+    "PREFLIGHT_WITNESS stage=Inserted edge=8 from=([2.9, 1.5, 0.5], [0.0, 0.0, 0.7071067811865475, 0.7071067811865476]) to=([2.9, 1.5, 0.5], [0.0, 0.0, 0.0, 1.0]) result=Ok(()) first_witness=None",
+    "PREFLIGHT_WITNESS stage=Inserted edge=9 from=([2.9, 1.5, 0.5], [0.0, 0.0, 0.0, 1.0]) to=([3.5, 1.5, 0.5], [0.0, 0.0, 0.0, 1.0]) result=Ok(()) first_witness=None",
+    "PREFLIGHT_WITNESS stage=Inserted edge=10 from=([3.5, 1.5, 0.5], [0.0, 0.0, 0.0, 1.0]) to=([3.5, 1.5, 0.5], [0.0, 0.0, 0.0, 1.0]) result=Ok(()) first_witness=None",
+    "DENSE_PREFLIGHT stage=Inserted points=97824 ground=96000 bytes=1558184 columns=6000 exact_scene_keys=true distinct_points=true original_geometry_queries=passed",
+    "STABLE_PLANT_REGRESSION preserved_v1_old_max_error_m=0.000017207714600 equivalent_cases=198 numerical_switch_cases=4 oracle_epsilon_unchanged=0.00000001",
+    "PREFLIGHT_GEOMETRY resolution=0.05000000074505806 ground=6000 box_added=1824 wall_added=9120 box_gap=0.28786792988124876 support_gap=0.38786796564403569 wall_cut_x=2.20000003278255463 wall_domain_y=[0,3.00000004470348358] fixed_body_z=[0.45,0.70]",
+    "DENSE_PREFLIGHT_PASS new_load_only=true original_oracles_unchanged=true live_runs=0",
+    "ok",
+    "",
+    "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 310 filtered out; finished in 0.32s",
+    ""
+  ],
+  "key_live_output": [
+    "STRICT_ARRIVAL xyz=0.07232560674839322 yaw=0.10752299087939965 fence_seq=398 elapsed_s=16.768247633",
+    "OFFLINE_ORACLE_PASS segments=1162 nodes=1162 exact_insertion=Instant { tv_sec: 31958, tv_nsec: 946570563 } support_domain=full_footprint collision=strict_contact outcome=continuous_se2_only",
+    "MOTION_ADMISSION_AUDIT bounded_deadlines=checked unbounded_nonzero=0 original_current_footprint_exemption=unchanged",
+    "EVIDENCE_AUDIT scene=Box local_planning_enabled=true classification=on_continuous_trace_same_global_revision initial_revision=1 inserted_source=1791937855782473386 built_consumed=74 inserted_published=Some((Instant { tv_sec: 31959, tv_nsec: 17800870 }, 1791937855782473386)) soft_global_execution=None natural_zero=Some(MotionEvent { seq: 23, at: Instant { tv_sec: 31959, tv_nsec: 65370561 }, unix_ns: 1791937855832371383, monotonic_ns: 1104765796, kind: \"applied\", operation: \"nav:surface-goal-1:twist:23\", twist: Twist2 { linear: Point2 { x: 0.0, y: 0.0 }, angular_z: 0.0 }, deadline: None, source: 1791937855782473386, session: Some(\"surface-goal-1\"), revision: 1, body: ([1.1625925500999998, 1.5, 0.5], [0.0, 0.0, -5.37326122984511e-19, 1.0]), ack: None }) global_resume=None same_global_revision=true local_display=true actual_detour=true precise_new_global_input_identity=not_independently_proven selected_command_proof_cells=not_recorded physical_braking=not_proven uds=not_covered",
+    "DENSE_LOAD_AUDIT published=79 concurrent_with_movement=77 moving_span=Some(16.349871107s) load_ok=true source_ttl_s=1 scan_period_ms=200 per_frame_ack_count=not_recorded",
+    "DENSE_FINAL result=Ok(()) status=SchedulerStatus { phase: Idle, session_id: None, path_revision: 0, applied_commands: 330, last_applied_twist: Some(Twist2 { linear: Point2 { x: 0.0, y: 0.0 }, angular_z: 0.0 }), motion_sink_ready: true, guard_generation: 7, planner_inputs_fresh: true, pose_source_timestamp_ns: 1791937871482130807, costmap_source_timestamp_ns: 1791937871356543559, pose_receipt_age_ms: 0, costmap_receipt_age_ms: 120, last_terminal: Some(Succeeded), last_zero_ack_id: Some(\"memq-fence-398\"), last_fence_monotonic_ns: 16754289710, message: \"Succeeded after verified fence\", local_path: [] } cleanup=Ok(()) audit=Ok(()) load_ok=true",
+    "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 310 filtered out; finished in 18.94s"
+  ],
+  "fixture_diff": "--- original-dynamic-fixture.rs\n+++ services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_dynamic_occupancy_qualification.rs\n@@ -11,6 +11,8 @@\n     NavMotionPort, SchedulerConfig, SchedulerStatus};\n use nuwax_nav_types_messages::{MotionLimits, MotionModel, NavigationCapabilities,\n     RobotGeometry, TerrainLimits};\n+\n+mod dense_recent { include!(\"surface_dense_recent_qualification.rs\"); }\n \n const SAMPLE_PERIOD: Duration = Duration::from_millis(200);\n const QUALIFICATION_WINDOW: Duration = Duration::from_secs(60);\n@@ -994,6 +996,11 @@\n }\n impl OccupancyHarness {\n     async fn start(local_planning_enabled: bool,scene:Scene) -> Self {\n+        Self::start_with_dense_recent(local_planning_enabled,scene,None).await\n+    }\n+    // An explicit new load case; original entry points always select None.\n+    async fn start_with_dense_recent(local_planning_enabled: bool,scene:Scene,\n+        dense_log:Option<Arc<Mutex<Vec<dense_recent::PublishedDenseScan>>>>) -> Self {\n         let started=Instant::now();\n         use crate::topics::{NavTopicConfig,TopicName};\n         let config=calibrated_config(local_planning_enabled);\n@@ -1106,9 +1113,15 @@\n                 }\n                 publish_body(&feed_transport,&feed_node.inputs[0],\"nuwax_msgs.NavigationMap3D\",\n                     payload).await.unwrap();\n-                super::support_recovery_qualification::publish_sampled_recent(\n-                    &feed_transport,&map,sequence,stamp,pose_stamp,\n-                    retained.iter().copied().map(|key|(key,key[2]==1))).await;\n+                if let Some(log)=&dense_log {\n+                    let record=dense_recent::publish(&feed_transport,&map,sequence,stamp,pose_stamp,\n+                        control.scene,control.stage).await;\n+                    log.lock().unwrap().push(record);\n+                } else {\n+                    super::support_recovery_qualification::publish_sampled_recent(\n+                        &feed_transport,&map,sequence,stamp,pose_stamp,\n+                        retained.iter().copied().map(|key|(key,key[2]==1))).await;\n+                }\n                 // Only a successfully encoded and published source enters the ledger.\n                 { let mut evidence=feed_evidence.lock().unwrap();\n                     evidence.maps.insert(stamp,record); evidence.latest_map=Some(map); }\n",
+  "preservation_checks": [
+    "Entire support recovery fixture byte-equal to pre-edit copy",
+    "Occupancy exercise and audit_after_cleanup byte-equal",
+    "Original qualify and four occupancy tests byte-equal",
+    "Original 200ms schedule, 25ms pose ticker, 1s source TTL, 60s window unchanged",
+    "Only original constructor delegation and explicit Some(log) dense publisher branch added"
+  ],
+  "review": "Independent read-only reviewer found no blocking issue; nominal cadence and first/last motion-window caveats retained.",
+  "source_provenance": "Built from current cloud working tree on the assigned branch after the new test-only extension. No independent Git read, Git writes or content hashes. Cargo compiler artifact records actual features/profile/executable; frozen byte-equal copy was run.",
+  "external_plain_raw_evidence": {
+    "workspace_directory": "/workspace/scratch/71cdb9d17732/dense-recent-qualification-20261014",
+    "files": [
+      "/workspace/scratch/71cdb9d17732/dense-recent-qualification-20261014/build.log",
+      "/workspace/scratch/71cdb9d17732/dense-recent-qualification-20261014/dense_box_scene_wire_preflight.log",
+      "/workspace/scratch/71cdb9d17732/dense-recent-qualification-20261014/dense_recent_box_local_planning_on.log"
+    ],
+    "inside_repository": false,
+    "included_in_git": false,
+    "originals_preserved_and_verified": true
+  }
+}

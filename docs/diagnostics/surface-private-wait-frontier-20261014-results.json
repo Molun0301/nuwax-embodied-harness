@@ -1401,5 +1401,21 @@
     "new-input/config/retry boundary errors",
     "body/support checks"
   ],
-  "source_invariant": "Same original Arc and consumed notification imply a prior successful boundary-validated query; configure_constraints clears source/notification/query stamps, observation-model changes clear source anchor"
+  "source_invariant": "Same original Arc and consumed notification imply a prior successful boundary-validated query; configure_constraints clears source/notification/query stamps, observation-model changes clear source anchor",
+  "final_production_check": {
+    "command": "cargo check --offline --locked --release -j2 -p nuwax-exploration --features surface --lib",
+    "cwd": "services/nuwax-workspace",
+    "exit_code": 0,
+    "elapsed_seconds": 1.35,
+    "cfg_test": false,
+    "full_link": false,
+    "features": [
+      "surface"
+    ],
+    "default_features": [],
+    "dependency": "local ../nuwax-nav-mls-planner plus unconditional local explore-routing/types/base",
+    "profile": "workspace release opt3/thin-LTO/codegen-units=1; nested incremental=true",
+    "warnings": "existing missing documentation",
+    "log": "/workspace/scratch/71cdb9d17732/neh-evidence/surface-private-wait-20261014/production-check.log"
+  }
 }

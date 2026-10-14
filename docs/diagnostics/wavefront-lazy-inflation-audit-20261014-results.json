@@ -1,0 +1,1358 @@
+{
+  "summary": {
+    "free101": {
+      "processes": [
+        {
+          "process": "profile-1.log",
+          "baseline_ns": 1766256,
+          "candidate_ns": 1886638,
+          "ratio": 1.0681565979110617
+        },
+        {
+          "process": "profile-2.log",
+          "baseline_ns": 1790432,
+          "candidate_ns": 1733897,
+          "ratio": 0.9684238217368769
+        },
+        {
+          "process": "profile-3.log",
+          "baseline_ns": 1925165,
+          "candidate_ns": 1917094,
+          "ratio": 0.9958076320730951
+        }
+      ],
+      "median_ratio": 0.9958076320730951,
+      "baseline_inflations": 1,
+      "candidate_inflations": 0
+    },
+    "free401": {
+      "processes": [
+        {
+          "process": "profile-1.log",
+          "baseline_ns": 36075710,
+          "candidate_ns": 34777326,
+          "ratio": 0.9640094678663289
+        },
+        {
+          "process": "profile-2.log",
+          "baseline_ns": 33460229,
+          "candidate_ns": 33512068,
+          "ratio": 1.0015492721224353
+        },
+        {
+          "process": "profile-3.log",
+          "baseline_ns": 35209990,
+          "candidate_ns": 34369571,
+          "ratio": 0.976131234345707
+        }
+      ],
+      "median_ratio": 0.976131234345707,
+      "baseline_inflations": 1,
+      "candidate_inflations": 0
+    },
+    "blocked401": {
+      "processes": [
+        {
+          "process": "profile-1.log",
+          "baseline_ns": 2727947,
+          "candidate_ns": 134813,
+          "ratio": 0.04941921525601487
+        },
+        {
+          "process": "profile-2.log",
+          "baseline_ns": 2523879,
+          "candidate_ns": 134954,
+          "ratio": 0.053470867660454405
+        },
+        {
+          "process": "profile-3.log",
+          "baseline_ns": 2478962,
+          "candidate_ns": 135014,
+          "ratio": 0.054463924820146496
+        }
+      ],
+      "median_ratio": 0.053470867660454405,
+      "baseline_inflations": 1,
+      "candidate_inflations": 0
+    },
+    "filtered401": {
+      "processes": [
+        {
+          "process": "profile-1.log",
+          "baseline_ns": 34997859,
+          "candidate_ns": 37115024,
+          "ratio": 1.0604941290837249
+        },
+        {
+          "process": "profile-2.log",
+          "baseline_ns": 33779691,
+          "candidate_ns": 33493969,
+          "ratio": 0.9915416040957864
+        },
+        {
+          "process": "profile-3.log",
+          "baseline_ns": 33241860,
+          "candidate_ns": 32740032,
+          "ratio": 0.9849037328236145
+        }
+      ],
+      "median_ratio": 0.9915416040957864,
+      "baseline_inflations": 1,
+      "candidate_inflations": 0
+    },
+    "normal101": {
+      "processes": [
+        {
+          "process": "profile-1.log",
+          "baseline_ns": 4194910,
+          "candidate_ns": 4250174,
+          "ratio": 1.0131740609452884
+        },
+        {
+          "process": "profile-2.log",
+          "baseline_ns": 4200810,
+          "candidate_ns": 4085666,
+          "ratio": 0.9725900481097693
+        },
+        {
+          "process": "profile-3.log",
+          "baseline_ns": 4162883,
+          "candidate_ns": 4066768,
+          "ratio": 0.9769114337347459
+        }
+      ],
+      "median_ratio": 0.9769114337347459,
+      "baseline_inflations": 1,
+      "candidate_inflations": 1
+    },
+    "normal401": {
+      "processes": [
+        {
+          "process": "profile-1.log",
+          "baseline_ns": 85518065,
+          "candidate_ns": 82233648,
+          "ratio": 0.9615938807782893
+        },
+        {
+          "process": "profile-2.log",
+          "baseline_ns": 78152859,
+          "candidate_ns": 78185629,
+          "ratio": 1.0004193064773228
+        },
+        {
+          "process": "profile-3.log",
+          "baseline_ns": 80697931,
+          "candidate_ns": 85485716,
+          "ratio": 1.0593297119352416
+        }
+      ],
+      "median_ratio": 1.0004193064773228,
+      "baseline_inflations": 1,
+      "candidate_inflations": 1
+    },
+    "calibrated101": {
+      "processes": [
+        {
+          "process": "profile-1.log",
+          "baseline_ns": 4597970,
+          "candidate_ns": 4299338,
+          "ratio": 0.9350513378730179
+        },
+        {
+          "process": "profile-2.log",
+          "baseline_ns": 4190114,
+          "candidate_ns": 4096061,
+          "ratio": 0.9775535940072275
+        },
+        {
+          "process": "profile-3.log",
+          "baseline_ns": 4167029,
+          "candidate_ns": 4324546,
+          "ratio": 1.0378007928430544
+        }
+      ],
+      "median_ratio": 0.9775535940072275,
+      "baseline_inflations": 1,
+      "candidate_inflations": 1
+    },
+    "none_free401": {
+      "processes": [
+        {
+          "process": "profile-1.log",
+          "baseline_ns": 34901163,
+          "candidate_ns": 34959081,
+          "ratio": 1.0016594862469197
+        },
+        {
+          "process": "profile-2.log",
+          "baseline_ns": 33774964,
+          "candidate_ns": 33499688,
+          "ratio": 0.991849702637729
+        },
+        {
+          "process": "profile-3.log",
+          "baseline_ns": 36292794,
+          "candidate_ns": 37737104,
+          "ratio": 1.0397960542800866
+        }
+      ],
+      "median_ratio": 1.0016594862469197,
+      "baseline_inflations": 1,
+      "candidate_inflations": 1
+    }
+  },
+  "samples": {
+    "free101": [
+      {
+        "name": "free101",
+        "sample": 0,
+        "baseline_ns": 1897083,
+        "candidate_ns": 1737473,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-1.log"
+      },
+      {
+        "name": "free101",
+        "sample": 1,
+        "baseline_ns": 1961300,
+        "candidate_ns": 1886638,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-1.log"
+      },
+      {
+        "name": "free101",
+        "sample": 2,
+        "baseline_ns": 1729851,
+        "candidate_ns": 1708438,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-1.log"
+      },
+      {
+        "name": "free101",
+        "sample": 3,
+        "baseline_ns": 1670641,
+        "candidate_ns": 2023744,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-1.log"
+      },
+      {
+        "name": "free101",
+        "sample": 4,
+        "baseline_ns": 1766256,
+        "candidate_ns": 2867979,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-1.log"
+      },
+      {
+        "name": "free101",
+        "sample": 0,
+        "baseline_ns": 1965546,
+        "candidate_ns": 1999738,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-2.log"
+      },
+      {
+        "name": "free101",
+        "sample": 1,
+        "baseline_ns": 1652654,
+        "candidate_ns": 1717422,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-2.log"
+      },
+      {
+        "name": "free101",
+        "sample": 2,
+        "baseline_ns": 1708959,
+        "candidate_ns": 1662970,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-2.log"
+      },
+      {
+        "name": "free101",
+        "sample": 3,
+        "baseline_ns": 1790432,
+        "candidate_ns": 1745895,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-2.log"
+      },
+      {
+        "name": "free101",
+        "sample": 4,
+        "baseline_ns": 1841940,
+        "candidate_ns": 1733897,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-2.log"
+      },
+      {
+        "name": "free101",
+        "sample": 0,
+        "baseline_ns": 1764483,
+        "candidate_ns": 1917094,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-3.log"
+      },
+      {
+        "name": "free101",
+        "sample": 1,
+        "baseline_ns": 1773927,
+        "candidate_ns": 1882211,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-3.log"
+      },
+      {
+        "name": "free101",
+        "sample": 2,
+        "baseline_ns": 2155794,
+        "candidate_ns": 1736921,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-3.log"
+      },
+      {
+        "name": "free101",
+        "sample": 3,
+        "baseline_ns": 1925165,
+        "candidate_ns": 2082934,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-3.log"
+      },
+      {
+        "name": "free101",
+        "sample": 4,
+        "baseline_ns": 2017185,
+        "candidate_ns": 1925075,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-3.log"
+      }
+    ],
+    "free401": [
+      {
+        "name": "free401",
+        "sample": 0,
+        "baseline_ns": 34929486,
+        "candidate_ns": 35192653,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-1.log"
+      },
+      {
+        "name": "free401",
+        "sample": 1,
+        "baseline_ns": 36199794,
+        "candidate_ns": 34777326,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-1.log"
+      },
+      {
+        "name": "free401",
+        "sample": 2,
+        "baseline_ns": 36075710,
+        "candidate_ns": 34296921,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-1.log"
+      },
+      {
+        "name": "free401",
+        "sample": 3,
+        "baseline_ns": 33848205,
+        "candidate_ns": 33518547,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-1.log"
+      },
+      {
+        "name": "free401",
+        "sample": 4,
+        "baseline_ns": 36368793,
+        "candidate_ns": 35708582,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-1.log"
+      },
+      {
+        "name": "free401",
+        "sample": 0,
+        "baseline_ns": 32947114,
+        "candidate_ns": 33512068,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-2.log"
+      },
+      {
+        "name": "free401",
+        "sample": 1,
+        "baseline_ns": 32889468,
+        "candidate_ns": 35012802,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-2.log"
+      },
+      {
+        "name": "free401",
+        "sample": 2,
+        "baseline_ns": 33460229,
+        "candidate_ns": 32762236,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-2.log"
+      },
+      {
+        "name": "free401",
+        "sample": 3,
+        "baseline_ns": 33544647,
+        "candidate_ns": 33703275,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-2.log"
+      },
+      {
+        "name": "free401",
+        "sample": 4,
+        "baseline_ns": 33817458,
+        "candidate_ns": 32832902,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-2.log"
+      },
+      {
+        "name": "free401",
+        "sample": 0,
+        "baseline_ns": 35718687,
+        "candidate_ns": 34422360,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-3.log"
+      },
+      {
+        "name": "free401",
+        "sample": 1,
+        "baseline_ns": 35739178,
+        "candidate_ns": 35051330,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-3.log"
+      },
+      {
+        "name": "free401",
+        "sample": 2,
+        "baseline_ns": 34669974,
+        "candidate_ns": 34369571,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-3.log"
+      },
+      {
+        "name": "free401",
+        "sample": 3,
+        "baseline_ns": 32714282,
+        "candidate_ns": 32667192,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-3.log"
+      },
+      {
+        "name": "free401",
+        "sample": 4,
+        "baseline_ns": 35209990,
+        "candidate_ns": 34363231,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-3.log"
+      }
+    ],
+    "blocked401": [
+      {
+        "name": "blocked401",
+        "sample": 0,
+        "baseline_ns": 2727947,
+        "candidate_ns": 228535,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-1.log"
+      },
+      {
+        "name": "blocked401",
+        "sample": 1,
+        "baseline_ns": 2783291,
+        "candidate_ns": 134813,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-1.log"
+      },
+      {
+        "name": "blocked401",
+        "sample": 2,
+        "baseline_ns": 2588146,
+        "candidate_ns": 133692,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-1.log"
+      },
+      {
+        "name": "blocked401",
+        "sample": 3,
+        "baseline_ns": 2912155,
+        "candidate_ns": 174954,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-1.log"
+      },
+      {
+        "name": "blocked401",
+        "sample": 4,
+        "baseline_ns": 2505913,
+        "candidate_ns": 134372,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-1.log"
+      },
+      {
+        "name": "blocked401",
+        "sample": 0,
+        "baseline_ns": 2523879,
+        "candidate_ns": 134954,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-2.log"
+      },
+      {
+        "name": "blocked401",
+        "sample": 1,
+        "baseline_ns": 2274233,
+        "candidate_ns": 137437,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-2.log"
+      },
+      {
+        "name": "blocked401",
+        "sample": 2,
+        "baseline_ns": 2331929,
+        "candidate_ns": 133712,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-2.log"
+      },
+      {
+        "name": "blocked401",
+        "sample": 3,
+        "baseline_ns": 2576358,
+        "candidate_ns": 133492,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-2.log"
+      },
+      {
+        "name": "blocked401",
+        "sample": 4,
+        "baseline_ns": 3474203,
+        "candidate_ns": 163907,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-2.log"
+      },
+      {
+        "name": "blocked401",
+        "sample": 0,
+        "baseline_ns": 2709950,
+        "candidate_ns": 135014,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-3.log"
+      },
+      {
+        "name": "blocked401",
+        "sample": 1,
+        "baseline_ns": 2743390,
+        "candidate_ns": 133392,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-3.log"
+      },
+      {
+        "name": "blocked401",
+        "sample": 2,
+        "baseline_ns": 2434704,
+        "candidate_ns": 217018,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-3.log"
+      },
+      {
+        "name": "blocked401",
+        "sample": 3,
+        "baseline_ns": 2391429,
+        "candidate_ns": 134103,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-3.log"
+      },
+      {
+        "name": "blocked401",
+        "sample": 4,
+        "baseline_ns": 2478962,
+        "candidate_ns": 193402,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-3.log"
+      }
+    ],
+    "filtered401": [
+      {
+        "name": "filtered401",
+        "sample": 0,
+        "baseline_ns": 34568692,
+        "candidate_ns": 39832527,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-1.log"
+      },
+      {
+        "name": "filtered401",
+        "sample": 1,
+        "baseline_ns": 34262179,
+        "candidate_ns": 38110277,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-1.log"
+      },
+      {
+        "name": "filtered401",
+        "sample": 2,
+        "baseline_ns": 34997859,
+        "candidate_ns": 32845311,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-1.log"
+      },
+      {
+        "name": "filtered401",
+        "sample": 3,
+        "baseline_ns": 35900802,
+        "candidate_ns": 37115024,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-1.log"
+      },
+      {
+        "name": "filtered401",
+        "sample": 4,
+        "baseline_ns": 37569931,
+        "candidate_ns": 35508175,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-1.log"
+      },
+      {
+        "name": "filtered401",
+        "sample": 0,
+        "baseline_ns": 33935486,
+        "candidate_ns": 33493969,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-2.log"
+      },
+      {
+        "name": "filtered401",
+        "sample": 1,
+        "baseline_ns": 32834184,
+        "candidate_ns": 34700830,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-2.log"
+      },
+      {
+        "name": "filtered401",
+        "sample": 2,
+        "baseline_ns": 33779691,
+        "candidate_ns": 32515002,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-2.log"
+      },
+      {
+        "name": "filtered401",
+        "sample": 3,
+        "baseline_ns": 33164463,
+        "candidate_ns": 34833481,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-2.log"
+      },
+      {
+        "name": "filtered401",
+        "sample": 4,
+        "baseline_ns": 36250150,
+        "candidate_ns": 32509554,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-2.log"
+      },
+      {
+        "name": "filtered401",
+        "sample": 0,
+        "baseline_ns": 32691198,
+        "candidate_ns": 32740032,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-3.log"
+      },
+      {
+        "name": "filtered401",
+        "sample": 1,
+        "baseline_ns": 32893834,
+        "candidate_ns": 33233356,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-3.log"
+      },
+      {
+        "name": "filtered401",
+        "sample": 2,
+        "baseline_ns": 33741834,
+        "candidate_ns": 32605578,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-3.log"
+      },
+      {
+        "name": "filtered401",
+        "sample": 3,
+        "baseline_ns": 34026324,
+        "candidate_ns": 33084291,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-3.log"
+      },
+      {
+        "name": "filtered401",
+        "sample": 4,
+        "baseline_ns": 33241860,
+        "candidate_ns": 32444926,
+        "baseline_inflations": 1,
+        "candidate_inflations": 0,
+        "process": "profile-3.log"
+      }
+    ],
+    "normal101": [
+      {
+        "name": "normal101",
+        "sample": 0,
+        "baseline_ns": 4194910,
+        "candidate_ns": 4011474,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-1.log"
+      },
+      {
+        "name": "normal101",
+        "sample": 1,
+        "baseline_ns": 4397277,
+        "candidate_ns": 4958353,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-1.log"
+      },
+      {
+        "name": "normal101",
+        "sample": 2,
+        "baseline_ns": 4200019,
+        "candidate_ns": 4334141,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-1.log"
+      },
+      {
+        "name": "normal101",
+        "sample": 3,
+        "baseline_ns": 3968088,
+        "candidate_ns": 4119687,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-1.log"
+      },
+      {
+        "name": "normal101",
+        "sample": 4,
+        "baseline_ns": 3989902,
+        "candidate_ns": 4250174,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-1.log"
+      },
+      {
+        "name": "normal101",
+        "sample": 0,
+        "baseline_ns": 4200810,
+        "candidate_ns": 4490687,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-2.log"
+      },
+      {
+        "name": "normal101",
+        "sample": 1,
+        "baseline_ns": 3888950,
+        "candidate_ns": 4092301,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-2.log"
+      },
+      {
+        "name": "normal101",
+        "sample": 2,
+        "baseline_ns": 3970582,
+        "candidate_ns": 3877762,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-2.log"
+      },
+      {
+        "name": "normal101",
+        "sample": 3,
+        "baseline_ns": 4244205,
+        "candidate_ns": 4085666,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-2.log"
+      },
+      {
+        "name": "normal101",
+        "sample": 4,
+        "baseline_ns": 4322244,
+        "candidate_ns": 4024524,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-2.log"
+      },
+      {
+        "name": "normal101",
+        "sample": 0,
+        "baseline_ns": 4162883,
+        "candidate_ns": 4173328,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-3.log"
+      },
+      {
+        "name": "normal101",
+        "sample": 1,
+        "baseline_ns": 4692242,
+        "candidate_ns": 4050313,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-3.log"
+      },
+      {
+        "name": "normal101",
+        "sample": 2,
+        "baseline_ns": 4132887,
+        "candidate_ns": 4023162,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-3.log"
+      },
+      {
+        "name": "normal101",
+        "sample": 3,
+        "baseline_ns": 4201721,
+        "candidate_ns": 4066768,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-3.log"
+      },
+      {
+        "name": "normal101",
+        "sample": 4,
+        "baseline_ns": 4041380,
+        "candidate_ns": 4299769,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-3.log"
+      }
+    ],
+    "normal401": [
+      {
+        "name": "normal401",
+        "sample": 0,
+        "baseline_ns": 88107312,
+        "candidate_ns": 80481723,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-1.log"
+      },
+      {
+        "name": "normal401",
+        "sample": 1,
+        "baseline_ns": 83343724,
+        "candidate_ns": 82233648,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-1.log"
+      },
+      {
+        "name": "normal401",
+        "sample": 2,
+        "baseline_ns": 87707594,
+        "candidate_ns": 86446856,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-1.log"
+      },
+      {
+        "name": "normal401",
+        "sample": 3,
+        "baseline_ns": 85518065,
+        "candidate_ns": 77959537,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-1.log"
+      },
+      {
+        "name": "normal401",
+        "sample": 4,
+        "baseline_ns": 80748927,
+        "candidate_ns": 82412914,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-1.log"
+      },
+      {
+        "name": "normal401",
+        "sample": 0,
+        "baseline_ns": 77909572,
+        "candidate_ns": 76100962,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-2.log"
+      },
+      {
+        "name": "normal401",
+        "sample": 1,
+        "baseline_ns": 78866822,
+        "candidate_ns": 76685244,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-2.log"
+      },
+      {
+        "name": "normal401",
+        "sample": 2,
+        "baseline_ns": 80338347,
+        "candidate_ns": 79931904,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-2.log"
+      },
+      {
+        "name": "normal401",
+        "sample": 3,
+        "baseline_ns": 78152859,
+        "candidate_ns": 80657949,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-2.log"
+      },
+      {
+        "name": "normal401",
+        "sample": 4,
+        "baseline_ns": 77398300,
+        "candidate_ns": 78185629,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-2.log"
+      },
+      {
+        "name": "normal401",
+        "sample": 0,
+        "baseline_ns": 80697931,
+        "candidate_ns": 86752774,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-3.log"
+      },
+      {
+        "name": "normal401",
+        "sample": 1,
+        "baseline_ns": 79150905,
+        "candidate_ns": 77269265,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-3.log"
+      },
+      {
+        "name": "normal401",
+        "sample": 2,
+        "baseline_ns": 78118517,
+        "candidate_ns": 84287603,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-3.log"
+      },
+      {
+        "name": "normal401",
+        "sample": 3,
+        "baseline_ns": 90190467,
+        "candidate_ns": 90678803,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-3.log"
+      },
+      {
+        "name": "normal401",
+        "sample": 4,
+        "baseline_ns": 112560932,
+        "candidate_ns": 85485716,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-3.log"
+      }
+    ],
+    "calibrated101": [
+      {
+        "name": "calibrated101",
+        "sample": 0,
+        "baseline_ns": 4597970,
+        "candidate_ns": 3986746,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-1.log"
+      },
+      {
+        "name": "calibrated101",
+        "sample": 1,
+        "baseline_ns": 3897382,
+        "candidate_ns": 5833424,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-1.log"
+      },
+      {
+        "name": "calibrated101",
+        "sample": 2,
+        "baseline_ns": 4653793,
+        "candidate_ns": 4048491,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-1.log"
+      },
+      {
+        "name": "calibrated101",
+        "sample": 3,
+        "baseline_ns": 4426070,
+        "candidate_ns": 4476706,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-1.log"
+      },
+      {
+        "name": "calibrated101",
+        "sample": 4,
+        "baseline_ns": 4719682,
+        "candidate_ns": 4299338,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-1.log"
+      },
+      {
+        "name": "calibrated101",
+        "sample": 0,
+        "baseline_ns": 4503887,
+        "candidate_ns": 4420972,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-2.log"
+      },
+      {
+        "name": "calibrated101",
+        "sample": 1,
+        "baseline_ns": 3982341,
+        "candidate_ns": 4015039,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-2.log"
+      },
+      {
+        "name": "calibrated101",
+        "sample": 2,
+        "baseline_ns": 4306730,
+        "candidate_ns": 4143734,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-2.log"
+      },
+      {
+        "name": "calibrated101",
+        "sample": 3,
+        "baseline_ns": 3984354,
+        "candidate_ns": 4096061,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-2.log"
+      },
+      {
+        "name": "calibrated101",
+        "sample": 4,
+        "baseline_ns": 4190114,
+        "candidate_ns": 4077704,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-2.log"
+      },
+      {
+        "name": "calibrated101",
+        "sample": 0,
+        "baseline_ns": 4302262,
+        "candidate_ns": 4663990,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-3.log"
+      },
+      {
+        "name": "calibrated101",
+        "sample": 1,
+        "baseline_ns": 3997432,
+        "candidate_ns": 4324546,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-3.log"
+      },
+      {
+        "name": "calibrated101",
+        "sample": 2,
+        "baseline_ns": 4078345,
+        "candidate_ns": 4284025,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-3.log"
+      },
+      {
+        "name": "calibrated101",
+        "sample": 3,
+        "baseline_ns": 4661876,
+        "candidate_ns": 4165717,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-3.log"
+      },
+      {
+        "name": "calibrated101",
+        "sample": 4,
+        "baseline_ns": 4167029,
+        "candidate_ns": 4891763,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-3.log"
+      }
+    ],
+    "none_free401": [
+      {
+        "name": "none_free401",
+        "sample": 0,
+        "baseline_ns": 35259364,
+        "candidate_ns": 35977417,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-1.log"
+      },
+      {
+        "name": "none_free401",
+        "sample": 1,
+        "baseline_ns": 34901163,
+        "candidate_ns": 36974763,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-1.log"
+      },
+      {
+        "name": "none_free401",
+        "sample": 2,
+        "baseline_ns": 37832762,
+        "candidate_ns": 34029167,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-1.log"
+      },
+      {
+        "name": "none_free401",
+        "sample": 3,
+        "baseline_ns": 34076759,
+        "candidate_ns": 34323011,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-1.log"
+      },
+      {
+        "name": "none_free401",
+        "sample": 4,
+        "baseline_ns": 33375080,
+        "candidate_ns": 34959081,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-1.log"
+      },
+      {
+        "name": "none_free401",
+        "sample": 0,
+        "baseline_ns": 33774964,
+        "candidate_ns": 33499688,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-2.log"
+      },
+      {
+        "name": "none_free401",
+        "sample": 1,
+        "baseline_ns": 32997009,
+        "candidate_ns": 33168589,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-2.log"
+      },
+      {
+        "name": "none_free401",
+        "sample": 2,
+        "baseline_ns": 33350332,
+        "candidate_ns": 34347517,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-2.log"
+      },
+      {
+        "name": "none_free401",
+        "sample": 3,
+        "baseline_ns": 34351504,
+        "candidate_ns": 33299716,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-2.log"
+      },
+      {
+        "name": "none_free401",
+        "sample": 4,
+        "baseline_ns": 33999062,
+        "candidate_ns": 33799871,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-2.log"
+      },
+      {
+        "name": "none_free401",
+        "sample": 0,
+        "baseline_ns": 34523243,
+        "candidate_ns": 39139640,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-3.log"
+      },
+      {
+        "name": "none_free401",
+        "sample": 1,
+        "baseline_ns": 35732333,
+        "candidate_ns": 39417410,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-3.log"
+      },
+      {
+        "name": "none_free401",
+        "sample": 2,
+        "baseline_ns": 41090123,
+        "candidate_ns": 37737104,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-3.log"
+      },
+      {
+        "name": "none_free401",
+        "sample": 3,
+        "baseline_ns": 36292794,
+        "candidate_ns": 35323240,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-3.log"
+      },
+      {
+        "name": "none_free401",
+        "sample": 4,
+        "baseline_ns": 36878367,
+        "candidate_ns": 35667480,
+        "baseline_inflations": 1,
+        "candidate_inflations": 1,
+        "process": "profile-3.log"
+      }
+    ]
+  },
+  "decision": "rejected; test-only evidence retained; production selector unchanged",
+  "production_source_check": "selector.rs byte-identical to saved original plus cfg(test) include only",
+  "date_utc": "2026-10-14",
+  "timing": {
+    "operation": "full warmed selector preparation, including detector, scoring, view and regional selection; setup and output formatting outside timer",
+    "process_order": [
+      "AB",
+      "BA",
+      "AB"
+    ],
+    "processes": 3,
+    "cohorts": 8,
+    "pairs_per_cohort_per_process": 5,
+    "adaptive_repetitions": false
+  },
+  "equivalence": {
+    "full_selector_comparisons": 96,
+    "cases": 8,
+    "observations_modes": [
+      "Some physical observations",
+      "None legacy inflated observations"
+    ],
+    "calibrations": [
+      false,
+      true
+    ],
+    "polls": 3,
+    "compared": [
+      "current production vs frozen eager vs test-only lazy prepared result and deltas",
+      "exact goal/error/stop outcome",
+      "ID callback seeds and ordering",
+      "resolved session JSON",
+      "detector diagnostics including incremental counters",
+      "preparation leaves session unchanged"
+    ],
+    "suite": {
+      "passed": 63,
+      "failed": 0,
+      "ignored": 1
+    }
+  },
+  "build": {
+    "cwd": "/workspace/scratch/71cdb9d17732/neh-cloud-3d1901d/services/nuwax-workspace",
+    "command": "cargo test --offline --locked --release -j2 -p nuwax-explore-wavefront --lib --no-run --message-format=json",
+    "profile": "unchanged workspace release: opt3, thin LTO, codegen-units=1; nested incremental=true",
+    "test_executable": "Cargo JSON executable copied to evidence/probe-test"
+  },
+  "evidence_directory": "/workspace/scratch/71cdb9d17732/neh-evidence/wavefront-lazy-inflation-20261014",
+  "limitations": [
+    "No deployment frequency measured",
+    "All-occupied immediate-stop map is synthetic and not evidence of useful navigation acceleration",
+    "Normal/free/filtered realistic cohorts show small inconsistent differences",
+    "No physical robot or sensor replay",
+    "Malformed unbounded public config/grid panic behavior was not qualified; no production change applied",
+    "No deferred body-support-view production change"
+  ]
+}

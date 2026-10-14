@@ -72,3 +72,7 @@ Production scope: `services/nuwax-workspace/crates/nuwax-exploration/src/surface
 Evidence directory: `/workspace/scratch/71cdb9d17732/neh-evidence/surface-private-wait-20261014/`. It retains `test-only-summary.json`, initial logs/binary, baseline/candidate build JSON/logs, both saved binaries and source snapshots, `production.patch`, `baseline-suite.log`, `candidate-suite.log`, `candidate-equivalence.log`, the four existing-contract logs, `mls-private-fork-contracts.log`, all six `actual-pair-*.log` files, `actual-summary.json` and `run_actual_pairs.py`.
 
 Separate negative experiments remain documented in [filter order](observation-filter-order-audit-20261014.md) and [stack axes](observation-stack-axes-audit-20261014.md); neither rejected production change was applied.
+
+## Final non-test production check
+
+`cargo check --offline --locked --release -j2 -p nuwax-exploration --features surface --lib` completed from `services/nuwax-workspace`, exit **0**, 1.35 s, with only existing missing-documentation warnings. This checks the actual non-cfg(test) surface adapter and current local MLS dependency (`default=[]`, `surface=[dep:nuwax-nav-mls-planner]`), not merely the test build. It uses the same nested incremental/release configuration; it does not link or claim a Geometry-runtime integration run. Evidence: `production-check.log` in the retained evidence directory above. See the [remaining hotspot audit](exploration-remaining-hotspots-20261014.md) for the read-only follow-up.

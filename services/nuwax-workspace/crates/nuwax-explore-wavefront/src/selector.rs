@@ -1221,3 +1221,6 @@ mod tests {
         assert_eq!(inflated.get(12, 1), Some(OccupancyCell::Free));
     }
 }
+
+#[cfg(test)]
+include!("selector_lazy_inflation_tests.rs");

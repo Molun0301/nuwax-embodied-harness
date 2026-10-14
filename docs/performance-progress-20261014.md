@@ -1,6 +1,6 @@
 # NEH 云端夜间开发进度（持续更新）
 
-更新时间：2026-10-14 10:15 北京时间（2026-10-14 02:15 UTC）。本轮仍在进行，计划继续至北京时间 2026-10-14 11:00；本文不是收尾或整机验收声明。
+更新时间：2026-10-14 10:46 北京时间（2026-10-14 02:46 UTC）。本轮仍在进行，计划继续至北京时间 2026-10-14 11:00；本文不是收尾或整机验收声明。
 
 ## 当前结论与交付状态
 
@@ -9,8 +9,8 @@
 - 仓库：`Molun0301/nuwax-embodied-harness`
 - 工作分支：`fix/v3-legacy-cloud-seal-20261006`
 - 本轮起始远端基线：`65d15c5262af71ee0ab532133bd0afdcb5e75911`，已确认是当前提交的祖先
-- **77个新增提交已通过普通Git CLI推送**。远端`fix/v3-legacy-cloud-seal-20261006`于2026-10-14 **02:13:35 UTC** 经`ls-remote`核对为 `51c929c9346d2eb9cf3b1a3e42b9151f1114236f`，与当时本地一致；不是强制推送。随后第78个仅诊断提交`1b8a9d1`于02:14:20 UTC推送命令exit0，但独立远端核对尚待完成。本报告当前未提交更新在这些提交之外
-- 同一 Library 检查点 **v38，5,145,353 bytes** 已确认覆盖全部77个提交。高密度recent的完整纯文本原始日志也已单独保存
+- **85个新增提交已通过普通Git CLI推送并独立核对**。远端`fix/v3-legacy-cloud-seal-20261006`于2026-10-14 **02:46:32 UTC** 经`ls-remote`核对为 `0c1b8020eac7451e54abdabcd90fb75e2d2cb3a2`，与当时本地一致；不是强制推送。本报告当前未提交更新在这些提交之外
+- 同一 Library 检查点 **v42，5,483,893 bytes** 已确认覆盖全部84个提交；第85阶段备份尚待确认。高密度recent的完整纯文本原始日志也已单独保存
 - 新设备登录已认证账号Molun0301。全局Git配置因只读写入失败，随后使用单次命令credential helper完成推送；此前认证阻塞已解除，没有网络封锁证据。推送成功不等于部署、CI通过或实机验收
 
 **最新导航结果：** 完整 `NavScheduler` 局部恢复修复已提交为 `0eed9d2`，固定持续障碍的原目标在 **13.32秒**完成，仅2次规划/2次准入，232条完整停车尾迹和715条实际运动边全部通过。早期60秒失败与两次短程停车尾迹失败仍保留；独立调查发现采样位姿到实际应用间的转动差异，当前只是合同诊断，没有生产修复或真实50 ms执行器hold证明。不能据此称现场机器人卡住或安全时序问题全部解决。
@@ -99,6 +99,8 @@
 
 后续只读核对还从保留的第二次失败记录算出：采样位姿到实际receipt仅 **1.132700 ms**，其中结果发布到取走 **0.405146 ms**，完整receipt停车尾迹仍失败。因此“完成就立即唤醒”单独不能保证receipt状态安全；它还会触及原20 Hz每步可达速度的语义。这里只分析原记录，没有新benchmark或生产改动，也未另做第二例几何重建。[新增时序核对](diagnostics/navigation-dispatch-drift-contract-20261013.md#2026-10-14-read-only-review-dispatch-ownership-and-latency)
 
+后续只读复核进一步明确：理想plant在到期或fence时瞬间归零，合法已执行边不能替代包含有限减速/反应延迟的**必需receipt完整停车尾迹**；该尾迹失败也不等于已记录物理碰撞。最后一次replay的Unix计算时间会刷新，而原worker monotonic lease起点保留，不能把两者当作同一时钟对或用最终计算间隔推断原lease年龄。原失败判决不变，尚无新生产修复或新实验；下一步建议是固定几何的成对时间线诊断，并显式记录失败分支与实际生效deadline。[第85阶段复核与最小后续oracle](diagnostics/navigation-dispatch-next-oracle-20261014.md)
+
 ### 探索所有权负结果与旧测试合同修正
 
 移走本次决策私有的observation-cell sets，确实可少复制64个局部BTreeSet；但三对固定进程没有证明完整selection稳定提速，大夹具配对中位数反而退化约5–6%。因此**该性能candidate已撤回，生产仍保留原deep-copy路径**；只保留测试计数和诊断，不把复制字节减少当作实际加速。[负面审计](diagnostics/exploration-view-ownership-audit-20261014.md)
@@ -109,6 +111,14 @@
 - 两个长机体heading fixture把原 **324个frontier全部标为reached并排除**，所以NoFrontier是夹具结果。修正加入真实未分类recent occupied ring；原static frontier向量不变，独立side-pose先证明radial碰撞、tangential clear。两个sensor模式各80个visited、244个radial碰撞，返回goal全身clear且其radial pose必须精确报InsufficientClearance
 
 最终原workspace release范围 **59 passed / 0 failed / 2 ignored**；原324/324/324/324 diagnostic显式通过，旧失败日志保留。ignored不计入59通过，性能profile没有重跑。生产代码、碰撞/支撑责任、live-source健康和命令时复核均未改变。**这是测试合同修正，不是实机导航拒绝或机器人移动问题修复**。[准确资格](diagnostics/exploration-fixture-contract-20261014.md)
+
+### 私有等待路径省去未使用的frontier扫描（第81阶段）
+
+仅当本次poll使用私有planning view、同一原始source/notification已消费且没有retry时，跳过随后不会使用的frontier几何准备。当前body/support验证及原Pending/SourceUnavailable仍照常执行；新source、retry、约束重配和实际selection保留原路径。此前被否决的set-move候选仍未采用。
+
+三个独立配对release进程中，20/80/160格宽合成changed-pose等待夹具的**完整private fork＋prepared poll＋discard**中位数分别 **475.858→42.635 µs、12,041.177→73.356 µs、84,518.204→133.852 µs**，扫描单元400/6400/25600→0。实际selection控制没有稳定收益，same-pose本来已短路；blind-footprint仍受body重建主导，历史慢样本保留。没有测得线上触发频率，不能据此说每秒5次完整扫描被消除或真实目标选择更快。
+
+基线和候选surface范围各 **60通过、0失败、4 ignored**；新10场景生命周期/精确错误测试已包含在60项内，其他adapter/controller选集也重叠，不累加。独立MLS planning-fork合同 **4通过**。后续当前生产非cfg(test)的surface library release `cargo check` **exit0、1.35秒**，检查当前本地MLS/routing/types/base依赖；默认feature为空，此次未启用wavefront/runtime，没有link。未重跑Geometry全量LTO或worker-runtime集成，也不构成实机导航修复。[资格与原始范围](diagnostics/surface-private-wait-frontier-20261014.md)
 
 ## 二、地图、接纳、保存与身份
 
@@ -224,6 +234,18 @@
 
 最终实际源 **114项合同通过**，含完整position/color/bounds/floor输出、same-length独立过滤、非有限值既有错误与下次调用重新计算所有权；相邻27/21/22/4项suite分开记录，不累加总数。计时不含worker序列化/transfer、viewer admission、rendering、browser/GPU或network，因此不是FPS或机器人CPU收益。[准确范围与结果](diagnostics/pointcloud-measurement-reuse-20261014.md)
 
+### 点云颜色由单一消费者接管（第82阶段）
+
+私有prepared-result的颜色已是独立Uint8Array，viewer改用普通`THREE.BufferAttribute`接管，省去专用`Uint8BufferAttribute`构造器的再次复制。这**明确收窄了旧别名隔离合同**：调用后再修改result.colors会修改geometry，将同一result交给多个viewer会共享颜色；这些直接复用方式不受支持，不能宣称完全等价。已审计当前同步及worker调用链均单次消费，worker transfer令producer buffer脱离，过期/重复响应被拒绝，没有活动调用方保留颜色再修改；属性子类型也改变，已检查实际renderer依赖数组类型。
+
+三进程固定配对测量完整`_applyPreparedPointCloud`，1M点initial **0.481236→0.142065 ms**，replacement **0.441967→0.104348 ms**，约省 **0.34 ms**及每次3,000,000逻辑复制字节。计时不含processor准备/transfer，不是allocator、RSS、browser、GPU或增量live/page收益；空输入控制的混合微小退化保留，不与前阶段收益累加。
+
+最终 **30项合同通过**，覆盖真实worker handler的Node transfer语义、admission、alias变化、颜色值及资源释放；另外pairing22项和相机/overlay合同分别通过。缺少fixture的native-wire viewer脚本未运行，真实浏览器/WebGL仍未验证。[所有权边界、配对和资格](diagnostics/pointcloud-owned-colors-20261014.md)
+
+### 前端交付引用核对（第83阶段）
+
+六条HTML/viewer/worker/processor/scene-graph引用均通过本地精确URL唯一性与文件存在检查。发现console.js仍沿用旧查询版本，现仅更新HTML引用为`20261014-mjpeg-owned-tail`；颜色viewer及processor/worker引用保留各自新版本。该改动补上资源URL版本差异，不代表观察到用户旧页面或测得浏览器/proxy缓存行为；已打开的页面仍需正常reload。静态服务的mtime-size ETag机制只作源码检查，没有计算ETag、发网络请求或新跑browser/GPU；这是交付引用资格，不是完整前端重新验收。[六条引用与缓存范围](diagnostics/frontend-delivery-checklist-20261014.md)
+
 ## 六、没有贸然改动的路径
 
 - 传感器进程快照已有 unchanged 省略与 pending 合并；250k 点合成 native-LIO 快照实际投递中位数 **13.318 ms**，短样本维持约20 Hz。暂停接收100 ms会阻塞共用通道中的错误发送，属于已记录限制。没有砍 metadata、限点或增加新通道。[审计](performance-sensor-snapshot-audit.md)
@@ -250,6 +272,9 @@
 - ray traversal用stack `[usize;3]`替代临时axis Vec也未采纳：完整directional view批次 **17.688→19.163 ms**；10k条长三轴tie ray批次 **26.566→35.766 ms**，三对均退化。8,600组顺序callback/结果等价通过，最终routing **15 passed / 0 failed / 3 ignored**，两个axis诊断另显式通过。源码里少一个Vec不证明实际allocator次数减少；没有采纳生产射线优化，也不是完整探索/实机导航资格。[报告](diagnostics/observation-stack-axes-audit-20261014.md)
 
 - 第78阶段incremental pointcloud有限值检查候选未采纳：把数组 `.every(Number.isFinite)`替为同顺序scalar检查，113项合同通过，但完整apply结果混合。1M height reset **53.773272→48.711075 ms**，ground8192点reset **24.889073→26.246019 ms**，三进程有两次退化且一次显著，不能用height收益抵消。没有生产改动、额外分支或allocator/RSS结论，数组语法不证明V8真分配heap对象。[负面审计](diagnostics/pointcloud-finite-scalar-audit-20261014.md)
+
+- 第84阶段wavefront lazy-inflation候选未采纳：只在首个实际评分候选出现时构造膨胀图，96次精确对照通过，但三固定进程的完整selector结果不支持普遍收益。free401 **35.210→34.370 ms**、filtered401 **33.780→33.494 ms**方向混合，normal401 **80.698→82.234 ms**；明显收益仅见all-occupied立即停止合成控制 **2.524→0.135 ms**。该crate **63通过、0失败、1 ignored**，profile另显式执行；只保留cfg(test)诊断，生产selector未改，不与surface60项累加。[负面审计](diagnostics/wavefront-lazy-inflation-audit-20261014.md)
+- 后续源码审计未发现大规模selected-goal拷贝；有序mission各leg输入和取消/错误短路不同，不能直接并行。body-support重建确有更深成本，但仅部分connector/rounding路径存在局部复用机会，需要真实branch频率与严格witness合同；没有新改动或计时。[剩余热点与生产check范围](diagnostics/exploration-remaining-hotspots-20261014.md)
 
 ## 七、验证状态与未完成边界
 
@@ -286,12 +311,21 @@
 3. **实机未验证**：未运行真实传感器/执行器闭环、机器人CPU/RSS、真实网络/刹车或硬实时验收；没有将合成动力学、模型外归一化、暖缓存测量外推到硬件
 4. **legacy哈希与兼容仍在**：已去掉受审重复工作，并成对扩展受支持保存源的assigned迁移；其他仍承担接纳验证的legacy导出/激活接口没有整体移除。不得外推为全仓或所有外部客户端无哈希
 5. **局部修复通过不等于全部边界完成**：完整NavScheduler固定障碍恢复已通过并提交；原60秒失败、两次短程停车尾迹失败保留。独立dispatch漂移诊断未作生产修复，真实执行器50 ms hold/expiry未获证明。AR1成对扩展已资格验证，不等于完整激活RPC或实机部署
-6. **最终交付仍在进行**：77提交已推送并验证，仍有后续工作与本报告更新待提交/备份；截止前还需核对最新状态。不能把阶段推送说成整轮全部完成
+6. **最终交付仍在进行**：85提交已推送并独立核对远端，仍有最终核对与本报告更新待提交/备份；截止前还需核对最新状态。不能把阶段推送说成整轮全部完成
+
+### 后续验证优先顺序
+
+1. **真实负载与CPU**：先在物理机器人、真实source和持续任务下分项测量CPU/RSS与调度负载，确认本轮局部收益是否覆盖现场热点
+2. **dispatch制动证明**：补齐实际receipt状态、已应用转移历史与hold/expiry合同，证明延迟后的完整停车尾迹，而非仅依赖采样时guard；保留原receipt失败，先区分理想执行和必需停车包络。[诊断范围](diagnostics/navigation-dispatch-next-oracle-20261014.md)
+3. **环境资格补齐**：在允许AF_UNIX的环境复验5项UDS；真实浏览器验证MJPEG解码、Worker/页面生命周期及WebGL资源
+4. **legacy迁移**：逐接口保留接纳/兼容证据后再移除剩余内容哈希，不把当前成对导入能力外推为全部legacy路径完成
+
+这是剩余工作优先级，不表示已安排实机执行或新增交付承诺。
 
 ## 八、正在继续的工作（未计为成果）
 
-- 探索私有wait-path的frontier扫描候选正在测试，尚未实施生产修改，不能列为已实现性能收益
-- 77提交已普通推送、独立核对且Library v38覆盖；第78仅诊断提交推送exit0，待独立远端核对及新备份。本报告及之后新增工作仍需下一提交与检查点，认证阻塞已解除
+- 私有wait-path与颜色接管已按上文资格落地，lazy-inflation已否决；独立dispatch只读复查已形成第85阶段文档，没有新增生产修复。目前进入最终报告与交付状态核对，未把剩余验证边界记为完成
+- 85提交已普通推送并独立核对，Library v42覆盖84提交；第85阶段备份待确认。本报告及之后新增工作仍需下一提交与检查点，认证阻塞已解除
 - 本轮云端工作继续至北京时间11:00（03:00 UTC）；实机、UDS、实际浏览器和dispatch时序边界仍保留，不因Git推送成功而改变
 
 ## 附：证据阅读顺序
@@ -325,3 +359,7 @@
 - 第76–77阶段：[snapshot测量复用配对及114合同](diagnostics/pointcloud-measurement-reuse-20261014-results.json)、[过滤顺序负面结果](diagnostics/observation-filter-order-audit-20261014-results.json)、[stack-axis负面结果与routing资格](diagnostics/observation-stack-axes-audit-20261014-results.json)
 
 - 第78阶段：[scalar finite-check完整apply负面样本](diagnostics/pointcloud-finite-scalar-audit-20261014-results.json)
+
+- 第81–82阶段：[私有等待84个计时与42个精确跨binary对照](diagnostics/surface-private-wait-frontier-20261014-results.json)、[颜色接管30项合同及三进程配对](diagnostics/pointcloud-owned-colors-20261014-results.json)
+
+- 第84阶段：[wavefront 96对照及三进程负面样本](diagnostics/wavefront-lazy-inflation-audit-20261014-results.json)

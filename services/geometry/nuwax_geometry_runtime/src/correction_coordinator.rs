@@ -10137,7 +10137,7 @@ mod preflight_only_contract {
         snapshot: SealedAssignedActivatedTargetSnapshot,
         frames: Vec<AccumulatedRelocalizationFrame>,
         source_points: Arc<[Point3<f64>]>,
-        target_points: Arc<[Point3<f64>]>,
+        target_points: Arc<Vec<Point3<f64>>>,
     }
 
     fn seal_relocalization_source(
@@ -10201,7 +10201,7 @@ mod preflight_only_contract {
         let target_points = decode_relocalization_target(accumulation.snapshot.checkpoint_owner.cloud())?;
         Ok(SealedRelocalizationSource {
             boundary_input, boundary_lease, snapshot: accumulation.snapshot,
-            frames: accumulation.accepted, source_points: Arc::from(source_points), target_points: Arc::from(target_points),
+            frames: accumulation.accepted, source_points: Arc::from(source_points), target_points: Arc::new(target_points),
         })
     }
 
@@ -11846,6 +11846,7 @@ mod preflight_only_contract {
         use super::*;
 
         include!("relocalization_preparation_probe.rs");
+        include!("relocalization_target_handoff_tests.rs");
 
         fn local_consensus_source() -> Vec<Point3<f64>> {
             let mut source = Vec::new();

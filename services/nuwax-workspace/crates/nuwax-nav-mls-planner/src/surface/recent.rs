@@ -2,6 +2,10 @@
 use super::*;
 use std::collections::BTreeMap;
 
+#[cfg(test)]
+#[path = "recent_columns_diagnostics.rs"]
+mod columns_diagnostics;
+
 pub(super) struct RecentFrame {
     pub sequence:u64,
     pub timestamp:u64,
@@ -29,7 +33,7 @@ impl SurfaceSnapshot {
             }
         }
         let ground:AHashSet<u32>=ground_point_indices.iter().copied().collect();
-        let mut columns:BTreeMap<[i32;2],Vec<i32>>=BTreeMap::new();
+        let mut voxel_keys=Vec::new();
         let mut surface_points:AHashMap<[i32;3],Vec<[f64;3]>>=AHashMap::new();
         let mut obstacles=AHashSet::new();
         for (index,point) in points {
@@ -39,12 +43,23 @@ impl SurfaceSnapshot {
                 return Err(SurfaceError::InvalidConfig("recent point exceeds voxel range".into()));
             }
             let [x,y,z]=scaled.map(|x|x as i32);
-            columns.entry([x,y]).or_default().push(z);
+            voxel_keys.push([x,y,z]);
             if ground.contains(&index) {surface_points.entry([x,y,z]).or_default().push(point);}
             else {obstacles.insert([x,y,z]);}
         }
         surface_points.retain(|key,_|!obstacles.contains(key));
-        for zs in columns.values_mut() {zs.sort_unstable();zs.dedup();}
+        // Sort only integer occupancy keys. Ground-return point order stays unchanged.
+        voxel_keys.sort_unstable();
+        voxel_keys.dedup();
+        let mut groups=Vec::new();
+        for column in voxel_keys.chunk_by(|a,b|a[..2]==b[..2]) {
+            let [x,y,_]=column[0];
+            let heights:Vec<i32>=column.iter().map(|key|key[2]).collect();
+            groups.push(([x,y],heights));
+        }
+        // Retire flat scratch before the final tree's bulk construction.
+        drop(voxel_keys);
+        let columns:BTreeMap<[i32;2],Vec<i32>>=groups.into_iter().collect();
         let mut frames=Vec::new();
         if retention_ns>0 {
             if let Some(previous)=&self.recent_obstacles {

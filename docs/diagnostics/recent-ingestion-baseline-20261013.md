@@ -67,8 +67,8 @@ cargo test --manifest-path services/nuwax-workspace/Cargo.toml \
   --exact --ignored --nocapture --test-threads=1
 ```
 
-## Open construction lead, not implemented
+## Subsequent construction lead (separate qualification)
 
 The original `surface/recent.rs` inserts every voxel into `BTreeMap<XY, Vec<Z>>`, records ground/obstacle membership in original input order, then sorts/deduplicates each column. A possible test-only candidate is to collect owned voxel keys, sort/deduplicate them, group by XY, and construct the same BTreeMap while leaving ground point ordering, errors and retention unchanged.
 
-This still needs one Vec per distinct XY, adds a flat 12N-byte voxel buffer, and can regress short or highly repeated inputs. Rust 1.88 `BTreeMap::from_iter` also collects and stable-sorts grouped entries before bulk construction; see the [pinned official source](https://github.com/rust-lang/rust/blob/1.88.0/library/alloc/src/collections/btree/map.rs#L2157-L2170). No internal allocation count or speedup is claimed. Any candidate needs exact internal-column/ground-point equality, malformed-input ordering checks and paired repeated/dispersed comparisons before production consideration.
+This still needs one Vec per distinct XY, adds a flat 12N-byte voxel buffer, and can regress short or highly repeated inputs. Rust 1.88 `BTreeMap::from_iter` also collects and stable-sorts grouped entries before bulk construction; see the [pinned official source](https://github.com/rust-lang/rust/blob/1.88.0/library/alloc/src/collections/btree/map.rs#L2157-L2170). The subsequent test-only trial is recorded separately in [trial results](recent-column-build-trial-20261013-results.json). It passed exact frame and malformed-input comparisons and showed dispersed-builder improvement, with added transient capacity. Production qualification began afterward and is not part of the baseline measurements above. No allocator/RSS reduction is claimed.

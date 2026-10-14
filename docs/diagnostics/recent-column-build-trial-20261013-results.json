@@ -1,0 +1,231 @@
+{
+  "phase": "initial test-only candidate; precedes production qualification",
+  "contract_tests": {
+    "passed": 2,
+    "failed": 0,
+    "exact_frame_comparisons": 900
+  },
+  "diagnostic_seconds": 3.47,
+  "warmup_pairs": 8,
+  "measured_pairs": 9,
+  "timing_scope": "Full original versus copied test-only candidate builder; capacity instrumentation inside candidate timing, exact comparison and replaced owner destruction outside both timers. Not complete ingestion.",
+  "memory_scope": "Known explicit Vec capacities, not allocator/RSS/process peak; includes flat-key and grouped-entry buffers simultaneously before flat-key retirement; excludes maps and std internals.",
+  "cases": [
+    {
+      "points": 1000,
+      "dispersed": false,
+      "frames": 1,
+      "capacities": {
+        "candidate_final_height_capacity_bytes": 256,
+        "candidate_group_buffer_capacity_bytes": 2048,
+        "candidate_voxel_buffer_capacity_bytes": 12288,
+        "columns": 64,
+        "known_overlap_payload_bytes": 14592,
+        "original_final_height_capacity_bytes": 4096
+      },
+      "original_median_us": 48.423,
+      "candidate_median_us": 45.639,
+      "paired_ratio_median": 0.9625567322239031,
+      "paired_delta_median_us": -1.6829999999999998,
+      "pairs": 9
+    },
+    {
+      "points": 1000,
+      "dispersed": false,
+      "frames": 8,
+      "capacities": {
+        "candidate_final_height_capacity_bytes": 256,
+        "candidate_group_buffer_capacity_bytes": 2048,
+        "candidate_voxel_buffer_capacity_bytes": 12288,
+        "columns": 64,
+        "known_overlap_payload_bytes": 14592,
+        "original_final_height_capacity_bytes": 4096
+      },
+      "original_median_us": 47.592,
+      "candidate_median_us": 44.626999999999995,
+      "paired_ratio_median": 0.956485084306096,
+      "paired_delta_median_us": -2.012999999999998,
+      "pairs": 9
+    },
+    {
+      "points": 1000,
+      "dispersed": true,
+      "frames": 1,
+      "capacities": {
+        "candidate_final_height_capacity_bytes": 4000,
+        "candidate_group_buffer_capacity_bytes": 32768,
+        "candidate_voxel_buffer_capacity_bytes": 12288,
+        "columns": 1000,
+        "known_overlap_payload_bytes": 49056,
+        "original_final_height_capacity_bytes": 16000
+      },
+      "original_median_us": 144.077,
+      "candidate_median_us": 91.167,
+      "paired_ratio_median": 0.7184067733506161,
+      "paired_delta_median_us": -40.841999999999985,
+      "pairs": 9
+    },
+    {
+      "points": 1000,
+      "dispersed": true,
+      "frames": 8,
+      "capacities": {
+        "candidate_final_height_capacity_bytes": 4000,
+        "candidate_group_buffer_capacity_bytes": 32768,
+        "candidate_voxel_buffer_capacity_bytes": 12288,
+        "columns": 1000,
+        "known_overlap_payload_bytes": 49056,
+        "original_final_height_capacity_bytes": 16000
+      },
+      "original_median_us": 143.93800000000002,
+      "candidate_median_us": 109.946,
+      "paired_ratio_median": 0.7010135211599137,
+      "paired_delta_median_us": -45.98900000000002,
+      "pairs": 9
+    },
+    {
+      "points": 10000,
+      "dispersed": false,
+      "frames": 1,
+      "capacities": {
+        "candidate_final_height_capacity_bytes": 256,
+        "candidate_group_buffer_capacity_bytes": 2048,
+        "candidate_voxel_buffer_capacity_bytes": 196608,
+        "columns": 64,
+        "known_overlap_payload_bytes": 198912,
+        "original_final_height_capacity_bytes": 65536
+      },
+      "original_median_us": 415.117,
+      "candidate_median_us": 431.11100000000005,
+      "paired_ratio_median": 0.9675670479182953,
+      "paired_delta_median_us": -12.819999999999993,
+      "pairs": 9
+    },
+    {
+      "points": 10000,
+      "dispersed": false,
+      "frames": 8,
+      "capacities": {
+        "candidate_final_height_capacity_bytes": 256,
+        "candidate_group_buffer_capacity_bytes": 2048,
+        "candidate_voxel_buffer_capacity_bytes": 196608,
+        "columns": 64,
+        "known_overlap_payload_bytes": 198912,
+        "original_final_height_capacity_bytes": 65536
+      },
+      "original_median_us": 437.34999999999997,
+      "candidate_median_us": 435.397,
+      "paired_ratio_median": 1.0184580593791066,
+      "paired_delta_median_us": 8.553999999999974,
+      "pairs": 9
+    },
+    {
+      "points": 10000,
+      "dispersed": true,
+      "frames": 1,
+      "capacities": {
+        "candidate_final_height_capacity_bytes": 40000,
+        "candidate_group_buffer_capacity_bytes": 524288,
+        "candidate_voxel_buffer_capacity_bytes": 196608,
+        "columns": 10000,
+        "known_overlap_payload_bytes": 760896,
+        "original_final_height_capacity_bytes": 160000
+      },
+      "original_median_us": 1520.0739999999998,
+      "candidate_median_us": 1183.577,
+      "paired_ratio_median": 0.7874974941648781,
+      "paired_delta_median_us": -329.8380000000002,
+      "pairs": 9
+    },
+    {
+      "points": 10000,
+      "dispersed": true,
+      "frames": 8,
+      "capacities": {
+        "candidate_final_height_capacity_bytes": 40000,
+        "candidate_group_buffer_capacity_bytes": 524288,
+        "candidate_voxel_buffer_capacity_bytes": 196608,
+        "columns": 10000,
+        "known_overlap_payload_bytes": 760896,
+        "original_final_height_capacity_bytes": 160000
+      },
+      "original_median_us": 1685.7350000000001,
+      "candidate_median_us": 1516.1779999999999,
+      "paired_ratio_median": 0.880444862806675,
+      "paired_delta_median_us": -205.88100000000009,
+      "pairs": 9
+    },
+    {
+      "points": 100000,
+      "dispersed": false,
+      "frames": 1,
+      "capacities": {
+        "candidate_final_height_capacity_bytes": 256,
+        "candidate_group_buffer_capacity_bytes": 2048,
+        "candidate_voxel_buffer_capacity_bytes": 1572864,
+        "columns": 64,
+        "known_overlap_payload_bytes": 1575168,
+        "original_final_height_capacity_bytes": 524288
+      },
+      "original_median_us": 4395.576,
+      "candidate_median_us": 4474.324,
+      "paired_ratio_median": 0.9988501089634736,
+      "paired_delta_median_us": -5.267000000000735,
+      "pairs": 9
+    },
+    {
+      "points": 100000,
+      "dispersed": false,
+      "frames": 8,
+      "capacities": {
+        "candidate_final_height_capacity_bytes": 256,
+        "candidate_group_buffer_capacity_bytes": 2048,
+        "candidate_voxel_buffer_capacity_bytes": 1572864,
+        "columns": 64,
+        "known_overlap_payload_bytes": 1575168,
+        "original_final_height_capacity_bytes": 524288
+      },
+      "original_median_us": 4342.8460000000005,
+      "candidate_median_us": 4392.41,
+      "paired_ratio_median": 0.9910270100167357,
+      "paired_delta_median_us": -39.52000000000044,
+      "pairs": 9
+    },
+    {
+      "points": 100000,
+      "dispersed": true,
+      "frames": 1,
+      "capacities": {
+        "candidate_final_height_capacity_bytes": 400000,
+        "candidate_group_buffer_capacity_bytes": 4194304,
+        "candidate_voxel_buffer_capacity_bytes": 1572864,
+        "columns": 100000,
+        "known_overlap_payload_bytes": 6167168,
+        "original_final_height_capacity_bytes": 1600000
+      },
+      "original_median_us": 19698.716,
+      "candidate_median_us": 13413.729,
+      "paired_ratio_median": 0.6868031419937589,
+      "paired_delta_median_us": -6092.937,
+      "pairs": 9
+    },
+    {
+      "points": 100000,
+      "dispersed": true,
+      "frames": 8,
+      "capacities": {
+        "candidate_final_height_capacity_bytes": 400000,
+        "candidate_group_buffer_capacity_bytes": 4194304,
+        "candidate_voxel_buffer_capacity_bytes": 1572864,
+        "columns": 100000,
+        "known_overlap_payload_bytes": 6167168,
+        "original_final_height_capacity_bytes": 1600000
+      },
+      "original_median_us": 22259.125,
+      "candidate_median_us": 13484.988,
+      "paired_ratio_median": 0.633717745651286,
+      "paired_delta_median_us": -7394.683999999999,
+      "pairs": 9
+    }
+  ]
+}

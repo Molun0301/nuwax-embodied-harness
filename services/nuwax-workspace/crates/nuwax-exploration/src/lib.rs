@@ -113,6 +113,9 @@ pub enum ExplorationStopReason {
     NoInformationGain,
     /// 机器人起点没有可通行的自由区域，属于输入或通行条件失败。
     NoReachableFreeSpace,
+    /// Planning exhausted its bounded resources without establishing reachability.
+    /// This is a computation failure, not evidence of a physical obstacle.
+    PlanningResourceLimited,
     /// 连续失败次数超限
     ConsecutiveFailuresExceeded,
     /// 主动取消(用户 / stack / 用户命令)
@@ -155,6 +158,7 @@ impl ExplorationStopReason {
             | Self::DistanceBudgetReached => ExplorationTerminalKind::Succeeded,
             Self::UserCancelled => ExplorationTerminalKind::Cancelled,
             Self::NoReachableFreeSpace
+            | Self::PlanningResourceLimited
             | Self::ConsecutiveFailuresExceeded
             | Self::MapRevisionChanged => ExplorationTerminalKind::Failed,
         }
@@ -1457,6 +1461,8 @@ mod tests {
             ExplorationStopReason::NoReachableFreeSpace.terminal_kind(),
             ExplorationTerminalKind::Failed
         );
+        assert_eq!(ExplorationStopReason::PlanningResourceLimited.terminal_kind(),
+            ExplorationTerminalKind::Failed);
     }
 
     #[test]

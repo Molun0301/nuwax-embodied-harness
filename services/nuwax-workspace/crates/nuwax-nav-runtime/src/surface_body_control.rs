@@ -832,7 +832,7 @@ impl SurfaceFollower {
         }
         if preferred.linear.x.hypot(preferred.linear.y)<=1e-9 && preferred.angular_z.abs()<=1e-9 {
             return PlannerStep::ReplanRequired(format!(
-                "局部路径点{}仅剩不可执行的支撑差异（高度差{:.3}米），需要从实际位姿重新规划",
+                "局部路径点{}仅剩平面速度无法消除的高度差（{:.3}米），需要从实际位姿重新规划",
                 self.path_index,target.pose.position.z-position.z));
         }
         self.bounded_command_with_speed_limit(preferred,speed_limit)
@@ -854,10 +854,8 @@ impl SurfaceFollower {
         #[cfg(test)] proof_scope.record_basis(pose,self.last_command,None);
         let proof=ObservationProofAccumulator::new(None);
         let last_failure = std::cell::RefCell::new(None);
-        let source_map=self.source_map.as_ref().unwrap_or(map);
         let motion_queries = std::cell::RefCell::new(std::collections::HashMap::new());
         let period_queries = std::cell::RefCell::new(std::collections::HashMap::new());
-        let future_views = std::cell::RefCell::new(std::collections::HashMap::<[u64;7],Result<Arc<nuwax_nav_mls_planner::SurfaceBodyQueryView>,BodyMotionFailure>>::new());
         let boundary=&self.boundary;
         let make_check = |rebase:bool| {
             let mut previous_body=body(pose);
@@ -868,9 +866,8 @@ impl SurfaceFollower {
             // Same full-body prism/turning sweep; no occupied-footprint freshness
             // exemption, hits threshold or earliest-ground-expiry dependency.
             let mut geometry_motion=map.geometry_body_motion_checker_with_witness(boundary);
-            // 两种回调的地形依据不同，不能共用运动许可；视图按精确站姿在本次选择内复用。
+            // 两种回调的轨迹独立积累高度；共享不变几何，但分别缓存实际运动。
             let motion_queries=if rebase {&period_queries}else{&motion_queries};
-            let future_views=&future_views;
             move |from:PlanarPose,to:PlanarPose,elapsed:f64| {
                 // 每类独立轨迹从实际机体重置，不能把几何细分引入的高度带变化带入整拍预测。
                 if elapsed == 0.0 || (from.x - previous_xy[0]).hypot(from.y - previous_xy[1]) > 1e-5
@@ -881,50 +878,19 @@ impl SurfaceFollower {
                 let preserve_height = (to.x-from.x).hypot(to.y-from.y)<1e-9;
                 let b=match memoized_body_motion_impl(motion_queries,proof,a,to,preserve_height,None,|| -> Result<BodyMotionSuccess,BodyMotionFailure> {
                     let mut witness=None;
-                    let future=if rebase && a!=body(pose) {
-                        let key=[a.0[0],a.0[1],a.0[2],a.1[0],a.1[1],a.1[2],a.1[3]].map(f64::to_bits);
-                        let cached=future_views.borrow().get(&key).cloned();
-                        Some(match cached {
-                            Some(view)=>{
-                                #[cfg(test)] crate::control_profile::count(crate::control_profile::Counter::FutureViewHits);
-                                view?
-                            },
-                            None=>{
-                                #[cfg(test)] crate::control_profile::count(crate::control_profile::Counter::FutureViewBuilds);
-                                // 从同一环境源派生机体查询视图，旧足迹不会累积，也不重建全局路由。
-                                let view={
-                                    #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::FutureViewConstruction);
-                                    {let result=source_map.body_query_with_current_support_and_witness(a.0,a.1,&mut witness);
-                                    motion_failure(result,witness).map(Arc::new)}
-                                };
-                                future_views.borrow_mut().insert(key,view.clone());view?
-                            }
-                        })
-                    }else{None};
                     #[cfg(test)] crate::control_profile::count(crate::control_profile::Counter::BodyProjectionCalls);
                     let mut b={
                         #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::GuardProjection);
-                        match &future {
-                            Some(view)=>{let result=view.body_pose_after_motion_with_witness(a,[to.x,to.y],to.yaw,&mut witness);motion_failure(result,witness)?},
-                            None=>{let result=map.body_pose_after_motion_with_witness(a,[to.x,to.y],to.yaw,&mut witness);motion_failure(result,witness)?},
-                        }
+                        let result=map.body_pose_after_motion_with_witness(a,[to.x,to.y],to.yaw,&mut witness);
+                        motion_failure(result,witness)?
                     };
                     if preserve_height {b.0[2]=a.0[2];}
-                    // 未来足迹不能自行授予新区域许可，始终保留本拍初始视图的完整检查。
+                    // 始终以同一真实来源核验本拍运动及完整外部边界。
                     {
                         #[cfg(test)] crate::control_profile::count(crate::control_profile::Counter::GeometrySweeps);
                         #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::GuardGeometrySweep);
                         let result=geometry_motion(a,b,&mut witness);
                         motion_failure(result,witness)?;
-                    }
-                    if let Some(view)=future {
-                        // 完全同源同足迹的视图可复用刚通过的同一扫掠；其它视图独立核验。
-                        if !view.same_body_query_view(map) {
-                            #[cfg(test)] crate::control_profile::count(crate::control_profile::Counter::FutureGeometrySweeps);
-                            #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::GuardGeometrySweep);
-                            let result=view.validate_body_motion_with_witness(a,b,boundary,&mut witness);
-                            motion_failure(result,witness)?;
-                        }
                     }
                     Ok(BodyMotionSuccess {pose:b,latest_start_ns:None})
                 }) {
@@ -946,7 +912,7 @@ impl SurfaceFollower {
         #[cfg(test)] {
             let _profile=crate::control_profile::guard(crate::control_profile::Stage::GuardCleanup);
             drop(period_check);drop(geometric_check);
-            drop(future_views);drop(period_queries);drop(motion_queries);
+            drop(period_queries);drop(motion_queries);
             drop(last_failure);
         }
         Ok(result)
@@ -1685,8 +1651,8 @@ mod query_reuse_tests {
             stamp:Timestamp::from_unix(1,0),pose:Pose3 {
                 position:Point3::new(x,y,0.4),orientation:Quaternion::from_yaw(yaw)}};
         let clear_source=Arc::new(map(0.0));
-        let blocked_source=Arc::new(super::super::test_snapshot(0.0,true)
-            .with_body_envelope(clear_source.body_envelope().unwrap().clone()).unwrap());
+        let blocked_source=Arc::new(clear_source.with_recent_obstacle_points(
+            1,1,0,&[],(0..35).map(|y|(0,[1.25,(f64::from(y)+0.5)*0.1,0.4]))).unwrap());
         let mut saved=0;
         for model in [MotionModel::Differential,MotionModel::Omnidirectional,MotionModel::Ackermann] {
             for (x,turn,aligned,restricted,blocked) in [(0.75,false,false,false,false),(1.04,false,false,false,false),
@@ -1733,7 +1699,7 @@ mod query_reuse_tests {
                 let before=old_profile.calls[stage];let after=new_profile.calls[stage];
                 assert!(after<=before&&before-after<=1);
                 if aligned||turn||blocked {assert_eq!(before,after,"no successful lookahead probe to reuse");}
-                if blocked {assert!(before>0,"missing-ground case must exercise the required fallback probe");}
+                if blocked {assert!(before>0,"real-obstacle case must exercise the required fallback probe");}
                 for counter in [crate::control_profile::Counter::CandidateEligibility,
                     crate::control_profile::Counter::TrackingScores,crate::control_profile::Counter::MotionMemoHits,
                     crate::control_profile::Counter::MotionMemoMisses] {

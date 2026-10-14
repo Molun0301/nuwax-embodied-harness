@@ -24,7 +24,9 @@ fn current_view_fixture(
         })
         .collect();
     if fallback {
-        points.push((0.55, 0.55, 0.45));
+        // A real unobserved patch exercises carried-reference motion; it does
+        // not contain a self-echo that could be silently removed.
+        points.retain(|&(x,y,_)| !(x>0.3 && x<0.8 && y>0.3 && y<0.8));
     }
     let source = Arc::new(
         SurfaceSnapshot::from_points(
@@ -67,10 +69,7 @@ fn current_view_fixture(
         .unwrap();
     follower.update_odometry(recheck_pose(0.55));
     follower.refresh_current_body_view();
-    assert_eq!(
-        !follower.map.as_ref().unwrap().same_body_query_view(&source),
-        fallback
-    );
+    assert!(follower.map.as_ref().unwrap().same_body_query_view(&source));
     follower.control_target = Some(PlanarPose {
         x: 0.85,
         y: 0.55,
@@ -134,15 +133,15 @@ fn current_pose_recheck_then_view_refresh_cost() {
             assert_eq!(
                 source
                     .validate_body_pose([0.55, 0.55, 0.4], [0.0, 0.0, 0.0, 1.0])
-                    .is_err(),
-                fallback
+                    .is_ok(),
+                true
             );
         }
     }
 }
 
 #[test]
-fn current_recheck_keeps_actual_view_but_old_pose_replay_restores_owner_view() {
+fn current_recheck_keeps_source_geometry_and_old_pose_replay_restores_actual_pose() {
     let (mut follower, source, command) = current_view_fixture(40, true);
     let original_view = follower.map.clone().unwrap();
     follower.update_odometry(recheck_pose(0.551));
@@ -153,19 +152,17 @@ fn current_recheck_keeps_actual_view_but_old_pose_replay_restores_owner_view() {
     );
     assert!(!follower.body_view_dirty);
     let checked_view = follower.map.clone().unwrap();
-    assert!(!Arc::ptr_eq(&original_view, &checked_view));
+    assert!(Arc::ptr_eq(&original_view, &checked_view),"pose changes share immutable source geometry");
     follower.refresh_current_body_view();
     assert!(Arc::ptr_eq(&checked_view, follower.map.as_ref().unwrap()));
     assert!(Arc::ptr_eq(&source, follower.source_map.as_ref().unwrap()));
-    assert!(source
-        .validate_body_pose(body(&recheck_pose(0.55)).0, body(&recheck_pose(0.55)).1)
-        .is_err());
+    source.validate_body_pose(body(&recheck_pose(0.55)).0, body(&recheck_pose(0.55)).1).unwrap();
     original_view
         .validate_body_pose(body(&recheck_pose(0.55)).0, body(&recheck_pose(0.55)).1)
         .unwrap();
 
     // Old selection replay is allowed to query the selected pose temporarily,
-    // but must restore the latest owner's independently derived view afterward.
+    // but must restore the latest owner's actual pose afterward.
     let latest = recheck_pose(1.55);
     follower.update_odometry(latest.clone());
     follower.refresh_current_body_view();
@@ -182,8 +179,8 @@ fn current_recheck_keeps_actual_view_but_old_pose_replay_restores_owner_view() {
             .as_ref()
             .unwrap()
             .validate_body_pose(body(&recheck_pose(0.55)).0, body(&recheck_pose(0.55)).1)
-            .is_err(),
-        "old inferred footprint cannot accumulate"
+            .is_ok(),
+        "unknown ground remains unknown without changing the source"
     );
     assert!(
         matches!(follower.recheck_selected_body_command_at_current_state(command),
@@ -258,7 +255,7 @@ fn current_recheck_without_map_cannot_restore_an_old_view() {
 }
 
 #[test]
-fn current_recheck_still_forces_refresh_for_signed_zero_pose_change() {
+fn current_recheck_preserves_exact_signed_zero_pose_on_shared_geometry() {
     let (mut follower, _, command) = current_view_fixture(40, false);
     let old_view = follower.map.clone().unwrap();
     let mut latest = recheck_pose(0.55);
@@ -272,7 +269,7 @@ fn current_recheck_still_forces_refresh_for_signed_zero_pose_change() {
         matches!(follower.recheck_selected_body_command_at_current_state(command),
         Some(PlannerStep::Command(c)) if c == command)
     );
-    assert!(!Arc::ptr_eq(&old_view, follower.map.as_ref().unwrap()));
+    assert!(Arc::ptr_eq(&old_view, follower.map.as_ref().unwrap()));
     assert_eq!(
         follower
             .selected_body_command

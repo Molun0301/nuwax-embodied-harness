@@ -133,6 +133,8 @@ impl SurfaceMapBuilder {
 
     /// 适配由同一完整根导出的脏列。重置用于首次输入、切域和精度变化。
     /// 校验和候选构建失败均不推进基线；调用者只在成功后记录根。
+    /// 空的完整根或删除最后一列是有效的未知地图。调用者必须先验证根的完整性与域；
+    /// 这不把缺帧、清空事件或损坏点云转成有效输入。
     pub fn build_column_updates(
         &mut self,
         updates: &[SurfaceColumnUpdate],
@@ -204,7 +206,7 @@ impl SurfaceMapBuilder {
             }
             changes.push(key);
         }
-        if columns.is_empty() || count > MAX_SOURCE_POINTS {
+        if count > MAX_SOURCE_POINTS {
             return Err(SurfaceError::InvalidPointCloud);
         }
         if reset {
@@ -423,10 +425,6 @@ fn refresh_heights(graph: &mut PlannerGraph, bounds: &HeightBounds, size: f32) {
     }
 }
 
-fn refresh_costs(graph: &mut PlannerGraph, config: &Config) {
-    wall::full(graph, config);
-}
-
 pub(super) fn from_columns(
     columns: ColumnIz,
     heights: HeightBounds,
@@ -466,7 +464,7 @@ pub(super) fn from_columns(
         });
     }
     refresh_heights(&mut graph, &heights, config.voxel_size);
-    refresh_costs(&mut graph, &config);
+    wall::full(&mut graph,&config,&columns,&heights);
     if let Some(model) = model {
         model.validate()?;
         let ids = graph.cells.ids().collect::<Vec<_>>();
@@ -486,10 +484,8 @@ pub(super) fn from_columns(
         ground_evidence:GroundEvidence::MeasuredSurface,
         recent_obstacles:None,
         observations: None,
-        current_body_support: None,
         body_query_cache: Default::default(),
         data: Arc::new(SurfaceData {
-            body_query_only: false,
             frontier_cache: Default::default(),
             body_cache: Default::default(),
             routing_cache: Default::default(),
@@ -558,7 +554,15 @@ fn update_columns(
     });
     let mut regions = Arc::clone(&previous.data.regions);
     let mut global_refresh = false;
-    let graph = if changed_cells == 0 && !changed_heights {
+    let changed_wall_geometry=changes.iter().any(|&(x,y)|DIRECTIONS.iter().any(|&(dx,dy)| {
+        old_graph.surface_lookup.get(&(x+dx,y+dy)).into_iter().flatten().any(|&z| {
+            let cell=(x+dx,y+dy,z);
+            let ground=heights.get(&cell).map_or((z as f32+1.0)*config.voxel_size,|b|b[1]);
+            wall::column_obstructs(&previous.data.occupied_columns,&previous.data.height_bounds,(x,y),ground,config)
+                != wall::column_obstructs(&columns,&heights,(x,y),ground,config)
+        })
+    }));
+    let graph = if changed_cells == 0 && !changed_heights && !changed_wall_geometry {
         // 占据列变化也要交付新快照，前沿可见性不能继续读旧占据证据。
         Arc::clone(old_graph)
     } else {
@@ -652,7 +656,7 @@ fn update_columns(
             let c = graph.cells.coord(id);
             affected_columns.insert((c.0, c.1));
         }
-        let (cost_columns, global) = wall::update(&mut graph, config, &affected_columns);
+        let (cost_columns, global) = wall::update(&mut graph, config, &affected_columns,&columns,&heights);
         global_refresh = global;
         if let Some(model) = previous.data.body_envelope.as_deref() {
             let mut ids = Vec::new();
@@ -687,10 +691,8 @@ fn update_columns(
         ground_evidence:previous.ground_evidence,
         recent_obstacles:previous.recent_obstacles.clone(),
         observations: None,
-        current_body_support: None,
         body_query_cache: Default::default(),
         data: Arc::new(SurfaceData {
-            body_query_only: false,
             frontier_cache: Default::default(),
             body_cache: Default::default(),
             routing_cache: Default::default(),
@@ -866,16 +868,13 @@ mod tests {
             // 用场景的真实矩形边界作为独立真值，不再与旧的边界格中心距离对账。
             let expected = |id: CellId| {
                 let (x,y,z)=graph.cells.coord(id);
-                let px=(x as f32+0.5)*SIZE;
-                let py=(y as f32+0.5)*SIZE;
-                if z==4 {return SIZE*0.5;}
-                let mut distance=px.min(6.0-px).min(py).min(3.2-py).min(0.4);
+                let mut distance=0.4_f32;
                 if z==0 {
                     for (bx,by) in [(25,16),(26,16),(31,16)] {
-                        if cells.contains(&(bx,by,0)) && !cells.contains(&(bx,by,4)) {continue;}
-                        let dx=(bx as f32*SIZE-px).max(px-(bx+1) as f32*SIZE).max(0.0);
-                        let dy=(by as f32*SIZE-py).max(py-(by+1) as f32*SIZE).max(0.0);
-                        distance=distance.min(dx.hypot(dy));
+                        if !cells.contains(&(bx,by,4)) {continue;}
+                        let dx=((x-bx) as f32).abs().mul_add(1.0,-0.5).max(0.0);
+                        let dy=((y-by) as f32).abs().mul_add(1.0,-0.5).max(0.0);
+                        distance=distance.min(dx.hypot(dy)*SIZE);
                     }
                 }
                 distance
@@ -886,10 +885,42 @@ mod tests {
                 let penalty=|id| penalty_of(expected(id),0.1,0.3,2.0);
                 for edge in graph.cells.neighbors(id) {
                     let expected_cost=edge.base_cost*(penalty(id)+penalty(edge.dest))/2.0+edge.rise;
-                    assert!(edge.cost==expected_cost || (edge.cost-expected_cost).abs()<1e-5);
+                    assert!(edge.cost==expected_cost || (edge.cost-expected_cost).abs()<1e-5,
+                        "edge {:?}->{:?}: actual={} expected={}, dist=({},{}), rectangle=({},{})",
+                        graph.cells.coord(id),graph.cells.coord(edge.dest),edge.cost,expected_cost,
+                        graph.wall_state.dist[id as usize],graph.wall_state.dist[edge.dest as usize],
+                        expected(id),expected(edge.dest));
                 }
             }
         }
+    }
+
+    #[test]
+    fn wall_distance_reads_real_occupied_height_even_without_surface_changes() {
+        let mut cells=scene();
+        cells.remove(&(25,16,0));
+        cells.insert((25,16,10));
+        let mut builder=SurfaceMapBuilder::new(config());
+        let open=builder.build(&points(&cells),SIZE).unwrap().snapshot;
+        let at=|map:&SurfaceSnapshot| {
+            let id=map.data.graph.cells.id((24,16,0)).unwrap();
+            map.data.graph.wall_state.dist[id as usize]
+        };
+        assert_eq!(at(&open),0.4,"separate upper floors and missing lower floor are not walls");
+        cells.insert((25,16,6));
+        let low=builder.build(&points(&cells),SIZE).unwrap().snapshot;
+        assert_eq!(open.data.graph.surface_lookup,low.data.graph.surface_lookup,
+            "the added body-height return has no newly standable top");
+        assert!((at(&low)-SIZE*0.5).abs()<1e-6,"real low-top occupancy seeds a wall");
+        let reference=SurfaceSnapshot::from_points(&points(&cells),config(),SIZE).unwrap();
+        assert_equivalent(&low,&reference);
+        cells.remove(&(25,16,6));
+        let restored=builder.build(&points(&cells),SIZE).unwrap().snapshot;
+        assert_eq!(at(&restored),0.4);
+        for z in 1..20 {cells.insert((25,16,z));}
+        let tall=builder.build(&points(&cells),SIZE).unwrap().snapshot;
+        assert!((at(&tall)-SIZE*0.5).abs()<1e-6,
+            "a wall with its exposed top above robot height still blocks at body height");
     }
 
     #[test]
@@ -969,6 +1000,32 @@ mod tests {
                     .snapshot
             ));
         }
+    }
+
+    #[test]
+    fn authoritative_column_updates_can_remove_last_column_without_mutating_old_snapshot() {
+        let mut builder=SurfaceMapBuilder::new(config());
+        let original=builder.build_column_updates(&[SurfaceColumnUpdate {
+            column:[0,0],cells:vec![(0,[0.0,SIZE])],
+        }],SIZE,true,1).unwrap().snapshot;
+        let empty=builder.build_column_updates(&[SurfaceColumnUpdate {
+            column:[0,0],cells:vec![],
+        }],SIZE,false,0).unwrap();
+        assert_eq!(empty.changed_columns,vec![[0,0]]);
+        assert_eq!(empty.snapshot.data.occupied_voxels,0);
+        assert_eq!(empty.snapshot.cell_keys().count(),0);
+        assert_eq!(empty.snapshot.query_ground([0.05,0.05],0.1).height,None);
+        assert_eq!(original.data.occupied_voxels,1);
+        assert!(Arc::ptr_eq(&empty.snapshot,&builder.build_column_updates(&[],SIZE,false,0).unwrap().snapshot));
+        // The authoritative column API accepts a complete first empty root too.
+        let mut fresh=SurfaceMapBuilder::new(config());
+        assert_eq!(fresh.build_column_updates(&[],SIZE,true,0).unwrap().snapshot.cell_keys().count(),0);
+        // Unverified raw point-cloud input retains its original validity contract.
+        assert!(builder.build(&[],SIZE).is_err());
+        assert!(builder.build_column_updates(&[SurfaceColumnUpdate {
+            column:[0,0],cells:vec![(0,[f32::NAN,SIZE])],
+        }],SIZE,true,1).is_err());
+        assert!(Arc::ptr_eq(&empty.snapshot,&builder.build_column_updates(&[],SIZE,false,0).unwrap().snapshot));
     }
 
     #[test]
@@ -1260,24 +1317,5 @@ mod replay_diagnostics {
                 );
             }
         }
-    }
-}
-
-impl SurfaceSnapshot {
-    /// 当前占据区的列派生沿原增量构建，不写回环境图或刷新观测时间。
-    pub(super) fn with_current_body_columns(
-        &self,
-        columns: &[SurfaceColumnUpdate],
-    ) -> Result<Self, SurfaceError> {
-        let mut builder =
-            SurfaceMapBuilder::configured(self.config().clone(), self.body_envelope().cloned());
-        builder.current = Some(Arc::new(self.clone()));
-        let built = builder.build_column_updates(columns, self.source_voxel_size_m(), false, 0)?;
-        let mut view = built.snapshot.as_ref().clone();
-        if let Some(mask) = &self.data.virtual_obstacles {
-            view = view.with_virtual_mask(Arc::clone(mask))?;
-        }
-        view.observations = self.observations.clone();
-        Ok(view)
     }
 }

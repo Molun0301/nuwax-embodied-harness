@@ -88,7 +88,7 @@ fn dense_treads_production_pct_reference_and_actual_continuation_are_checked_sep
 }
 
 #[test]
-fn dense_treads_fine_column_deletion_retires_pct_connectivity_even_when_coarse_graph_is_reused() {
+fn dense_treads_fine_column_deletion_retires_observed_geometry_without_blocking_unknown() {
     let complete=ground(Terrain::Rough);let mut missing=complete.clone();missing.retain(|key|key[0]!=4);
     let config=build_map(&complete,true).config().clone();
     let mut builder=SurfaceMapBuilder::configured(config,Some(envelope(true)));
@@ -110,7 +110,9 @@ fn dense_treads_fine_column_deletion_retires_pct_connectivity_even_when_coarse_g
         }
         let start=body(0.025,0.025,0.4);let goal=body(0.425,0.025,0.5);
         let route=planner.body_route(&source,start,goal,options,&[],None);
-        assert_eq!(route.is_ok(),index!=1,"完整、缺列、恢复的路线必须跟随细源");
+        assert!(route.is_ok(),"缺测条带允许参考接续，但不能复活细源地面: {route:?}");
+        assert_eq!(map.cells.iter().any(|cell|cell.column[0]==4),index!=1,
+            "完整、缺列、恢复的实际地面证据必须跟随细源");
         let cold=PctPlanner::default().body_route(&cold_source,start,goal,options,&[],None);
         assert_eq!(route.is_ok(),cold.is_ok(),"已有拥有方和冷构建须保持相同可达性");
         previous_source=Some(source);previous_map=Some(map);

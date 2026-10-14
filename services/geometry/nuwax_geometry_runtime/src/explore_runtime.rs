@@ -128,6 +128,7 @@ pub fn stop_reason_str(r: ExplorationStopReason) -> &'static str {
     match r {
         ExplorationStopReason::NoInformationGain => "no_information_gain",
         ExplorationStopReason::NoReachableFreeSpace => "no_reachable_free_space",
+        ExplorationStopReason::PlanningResourceLimited => "planning_resource_limited",
         ExplorationStopReason::ConsecutiveFailuresExceeded => "consecutive_failures_exceeded",
         ExplorationStopReason::UserCancelled => "user_cancelled",
         ExplorationStopReason::CoverageReached => "coverage_reached",
@@ -137,6 +138,14 @@ pub fn stop_reason_str(r: ExplorationStopReason) -> &'static str {
         ExplorationStopReason::DistanceBudgetReached => "distance_budget_reached",
         ExplorationStopReason::MapRevisionChanged => "map_revision_changed",
         _ => "unsupported_stop_reason",
+    }
+}
+
+fn exploration_stop_message(reason: ExplorationStopReason) -> String {
+    if reason == ExplorationStopReason::PlanningResourceLimited {
+        "ResourceLimited: exploration planning exhausted its bounded resources; reachability remains inconclusive".into()
+    } else {
+        format!("exploration completed: {}", stop_reason_str(reason))
     }
 }
 
@@ -3535,8 +3544,12 @@ impl ExploreRuntimeHandle {
             if !route_ticket.current(&guard) { return self.snapshot(); }
             return_balance_reached = match query {
                 Ok(value) => value,
-                Err(error) => { drop(guard); return self.finish_session(None, ExplorationStopReason::ConsecutiveFailuresExceeded,
-                    format!("活动探索返航路线核验失败：{error}")).await; }
+                Err(error) => {
+                    let reason = if error.is_inconclusive() { ExplorationStopReason::PlanningResourceLimited }
+                        else { ExplorationStopReason::ConsecutiveFailuresExceeded };
+                    drop(guard); return self.finish_session(None, reason,
+                        format!("活动探索返航路线核验失败：{error}")).await;
+                }
             };
         }
         // Preserve duration -> max-goals -> coverage ordering. Coverage is the
@@ -3735,14 +3748,26 @@ impl ExploreRuntimeHandle {
                 let parent_id = guard.last_request_id.clone();
                 let advice = match selection.mission {
                     Some(Ok(advice)) => advice,
-                    Some(Err(error)) => { drop(guard); self.publish_frontiers(frontier_update);
-                        return self.finish_session(None, ExplorationStopReason::ConsecutiveFailuresExceeded, format!("返航路线核验失败：{error}")).await; }
+                    Some(Err(error)) => {
+                        let reason = if error.is_inconclusive() { ExplorationStopReason::PlanningResourceLimited }
+                            else { ExplorationStopReason::ConsecutiveFailuresExceeded };
+                        drop(guard); self.publish_frontiers(frontier_update);
+                        return self.finish_session(None, reason, format!("返航路线核验失败：{error}")).await;
+                    }
                     None => { drop(guard); return self.finish_session(None, ExplorationStopReason::ConsecutiveFailuresExceeded, "missing mission route advice".into()).await; }
                 };
                 let homeward = advice.homeward;
                 let can_visit = match advice.can_visit {
                     Ok(value) => value,
                     Err(error) => {
+                        if error.is_inconclusive() {
+                            // Resource limits cannot count as failed navigation,
+                            // blacklist this candidate, or trigger return success.
+                            selection_ticket.finish(&mut guard);
+                            drop(guard); self.publish_frontiers(frontier_update);
+                            return self.finish_session(None, ExplorationStopReason::PlanningResourceLimited,
+                                format!("ResourceLimited: candidate mission route remains inconclusive: {error}")).await;
+                        }
                         let goal = candidate.as_ref().expect("仅候选路线查询会失败");
                         let feedback = ExplorationGoalFeedback::Failed(format!("候选往返路线不可通行：{error}"));
                         let ticket = match self.admit_feedback_locked(&mut guard,
@@ -3935,7 +3960,7 @@ impl ExploreRuntimeHandle {
                 self.finish_session(
                     None,
                     reason,
-                    format!("exploration completed: {}", stop_reason_str(reason)),
+                    exploration_stop_message(reason),
                 )
                 .await
             }
@@ -6331,6 +6356,8 @@ mod tests {
             status_for_stop_reason(ExplorationStopReason::ConsecutiveFailuresExceeded),
             STATUS_FAILED
         );
+        assert_eq!(status_for_stop_reason(ExplorationStopReason::PlanningResourceLimited), STATUS_FAILED);
+        assert_eq!(stop_reason_str(ExplorationStopReason::PlanningResourceLimited), "planning_resource_limited");
     }
 
     #[tokio::test]
@@ -9017,6 +9044,119 @@ mod tests {
         Arc::make_mut(guard.active_config.as_mut().unwrap()).return_policy=ReturnPolicy {maximum_distance_m:limit,reserve_distance_m:0.0,return_on_completion:true};
         guard.mission_calibration=Some(crate::explore_mission::tests::calibration());
         guard.costmap_frame_generation=1;
+    }
+
+    #[tokio::test]
+    async fn planning_resource_limit_fails_without_return_on_completion() {
+        use nuwax_exploration::{ExplorationGoalSource, ExplorationSourceDiagnostics, ExploreResult};
+        struct LimitedSource(Option<ExplorationPoll>);
+        impl ExplorationGoalSource for LimitedSource {
+            fn source_name(&self) -> std::borrow::Cow<'static, str> { "wavefront".into() }
+            fn begin(&mut self) -> ExploreResult<()> { Ok(()) }
+            fn end(&mut self) -> ExploreResult<()> { Ok(()) }
+            fn poll_goal(&mut self, _: &ExplorationStateSnapshot<'_>) -> ExploreResult<ExplorationPoll> {
+                Ok(ExplorationPoll::Stop(ExplorationStopReason::PlanningResourceLimited))
+            }
+            fn supports_prepared_poll(&self) -> bool { true }
+            fn prepare_poll(&mut self, state: &ExplorationStateSnapshot<'_>)
+                -> ExploreResult<nuwax_exploration::PreparedExplorationPoll> {
+                let outcome=self.poll_goal(state);self.0=outcome.as_ref().ok().cloned();
+                Ok(nuwax_exploration::PreparedExplorationPoll::new(outcome))
+            }
+            fn commit_prepared_poll(&mut self) -> ExploreResult<ExplorationPoll> {
+                self.0.take().ok_or(nuwax_exploration::ExploreError::NoPreparedPoll)
+            }
+            fn discard_prepared_poll(&mut self) -> ExploreResult<()> { self.0=None;Ok(()) }
+            fn diagnostics(&self) -> ExplorationSourceDiagnostics {
+                ExplorationSourceDiagnostics { source_name:"wavefront".into(),is_active:true,
+                    last_goal_id:None,last_error:Some("ResourceLimited: route remains inconclusive".into()) }
+            }
+        }
+        for return_on_completion in [false,true] {
+            let (handle,sink)=configured_handle();
+            ingest_committed_costmap_fixture(&handle,frontier_costmap(1),1).await.unwrap();
+            handle.start("resource-limited","prefer_wavefront").await;
+            if return_on_completion { enable_test_mission(&handle,None).await; }
+            let mut controller=ExplorationController::new(ExplorationArbitrationPolicy::FirstAvailable);
+            controller.add_source(LimitedSource(None));controller.begin_exploration().unwrap();
+            handle.install_compute_controller(controller).await.unwrap();
+            let stopped=handle.tick((2.0,2.0)).await;
+            assert_eq!(stopped.status,STATUS_FAILED,"{}",stopped.message);
+            assert_eq!(stopped.last_stop_reason,"planning_resource_limited");
+            assert!(stopped.message.contains("inconclusive"));
+            assert!(sink.submitted.lock().unwrap().is_empty(),"a resource failure must not dispatch return motion");
+            let guard=handle.inner.lock().await;
+            assert!(guard.return_reason.is_none());
+            assert!(guard.mission.as_ref().is_none_or(|mission|!mission.returning));
+        }
+    }
+
+    #[tokio::test]
+    async fn mission_inconclusive_candidate_does_not_blacklist_or_return() {
+        use nuwax_exploration::{ExplorationGoalSource, ExplorationSourceDiagnostics, ExploreResult};
+        struct CandidateSource(Arc<StdMutex<Vec<ExplorationGoalFeedback>>>, Option<ExplorationPoll>);
+        impl ExplorationGoalSource for CandidateSource {
+            fn source_name(&self)->std::borrow::Cow<'static,str>{"surface".into()}
+            fn begin(&mut self)->ExploreResult<()>{Ok(())}
+            fn end(&mut self)->ExploreResult<()>{Ok(())}
+            fn poll_goal(&mut self,state:&ExplorationStateSnapshot<'_>)->ExploreResult<ExplorationPoll>{
+                let mut pose=state.robot_pose.clone();
+                pose.pose.orientation=Quaternion::from_yaw(std::f64::consts::FRAC_PI_2);
+                Ok(ExplorationPoll::Goal(FrontierGoal::new("resource-candidate",pose,1.0)))
+            }
+            fn supports_prepared_poll(&self)->bool{true}
+            fn prepare_poll(&mut self,state:&ExplorationStateSnapshot<'_>)->ExploreResult<nuwax_exploration::PreparedExplorationPoll>{
+                let result=self.poll_goal(state);self.1=result.as_ref().ok().cloned();
+                Ok(nuwax_exploration::PreparedExplorationPoll::new(result))
+            }
+            fn commit_prepared_poll(&mut self)->ExploreResult<ExplorationPoll>{
+                self.1.take().ok_or(nuwax_exploration::ExploreError::NoPreparedPoll)
+            }
+            fn discard_prepared_poll(&mut self)->ExploreResult<()>{self.1=None;Ok(())}
+            fn report_goal_feedback(&mut self,_:&str,feedback:ExplorationGoalFeedback)->ExploreResult<()>{
+                self.0.lock().unwrap().push(feedback);Ok(())
+            }
+            fn diagnostics(&self)->ExplorationSourceDiagnostics{
+                ExplorationSourceDiagnostics{source_name:"surface".into(),is_active:true,last_goal_id:None,last_error:None}
+            }
+        }
+        let handle=ExploreRuntimeHandle::with_wavefront_map_frame("map").unwrap();
+        let sink=Arc::new(RecordingNavSink::default());handle.set_navigation_sink(sink.clone());
+        let mut config=surface_config("map");
+        config.apply_calibration(Some(nuwax_nav_types_messages::RobotGeometry {
+            footprint_xy_m:vec![[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],
+            z_min_m:-0.05,z_max_m:0.2,source:"resource-limited mission fixture".into(),
+        }),None).unwrap();
+        config.follower.motion_limits=Some(nuwax_nav_types_messages::MotionLimits {
+            model:nuwax_nav_types_messages::MotionModel::Differential,
+            max_forward_mps:0.5,max_reverse_mps:0.0,max_lateral_mps:0.0,max_angular_rps:1.0,
+            linear_acceleration_mps2:1.0,guaranteed_braking_mps2:1.0,
+            angular_acceleration_rps2:2.0,guaranteed_angular_braking_rps2:2.0,
+            reaction_time_sec:0.05,minimum_turning_radius_m:0.5,can_rotate_in_place:false,
+        });
+        handle.configure_surface_source(Ok(config.clone()),37,[7;16]).await.unwrap();
+        let message=surface_message("map",1);
+        let ticket=handle.begin_surface_map_update(&message,now_monotonic_nanos()).await.unwrap().unwrap();
+        let snapshot=Arc::new(SurfaceSnapshot::from_points(&schema::navigation_map_3d_points(&message).unwrap(),
+            config.geometry.clone(),message.source_voxel_size).unwrap()
+            .with_body_envelope(config.body_envelope.clone().unwrap()).unwrap());
+        assert!(handle.finish_surface_map_update(ticket,Ok(snapshot.clone())).await);
+        let accepted=handle.start_with_config("mission-resource-limit",ExploreStartConfig {
+            motion_admission:crate::nav_runtime::test_motion_admission(),..Default::default()
+        }).await;
+        assert_eq!(accepted.status,STATUS_ACCEPTED,"{}",accepted.message);
+        enable_test_mission(&handle,None).await;
+        let feedback=Arc::new(StdMutex::new(Vec::new()));
+        let mut controller=ExplorationController::new(ExplorationArbitrationPolicy::FirstAvailable);
+        controller.add_source(CandidateSource(feedback.clone(),None));controller.begin_exploration().unwrap();
+        handle.install_compute_controller(controller).await.unwrap();
+        let stopped=handle.tick_with_pose(surface_pose(&snapshot,0.0,Quaternion::IDENTITY)).await;
+        assert_eq!(stopped.status,STATUS_FAILED,"{}",stopped.message);
+        assert_eq!(stopped.last_stop_reason,"planning_resource_limited","{}",stopped.message);
+        assert!(stopped.message.contains("inconclusive"));
+        assert!(feedback.lock().unwrap().is_empty(),"inconclusive planning must not poison failure history");
+        assert!(sink.submitted.lock().unwrap().is_empty());
+        assert!(handle.inner.lock().await.return_reason.is_none());
     }
 
     #[tokio::test]

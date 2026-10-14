@@ -205,7 +205,7 @@ async fn baseline_layouts_and_original_member_indices() {
         .enumerate()
     {
         let mut state = RecentSourceState::new(None);
-        state.attach_terrain(terrain.clone());
+        state.attach_terrain(terrain.clone(), None);
         let mut p = packet(&points, index as i64 + 1, mixed, big);
         p.ground_point_indices = vec![0, 2];
         if mixed {
@@ -267,7 +267,7 @@ async fn baseline_rejection_precedence_and_atomic_state() {
     let (config, authority, terrain) = fixture();
     let (handle, task, calls) = scheduler(&config);
     let mut state = RecentSourceState::new(None);
-    state.attach_terrain(terrain);
+    state.attach_terrain(terrain, None);
     let base = packet(&[[0.5, 0.5, 0.55]], 1, false, false);
     let accepted = recent_cloud::encode_body(&base).unwrap();
     state
@@ -396,7 +396,7 @@ async fn baseline_retention_and_generation_reset() {
     let (handle, task, calls) = scheduler(&config);
     for retain in [false, true] {
         let mut state = RecentSourceState::new(retain.then_some(Duration::from_secs(5)));
-        state.attach_terrain(terrain.clone());
+        state.attach_terrain(terrain.clone(), None);
         for sequence in 1..=9 {
             let mut p = packet(&[[0.5, 0.5, 0.55]], sequence, false, false);
             p.ground_point_indices.clear();
@@ -493,7 +493,7 @@ async fn baseline_complete_recent_ingestion_cost() {
             for retain in [false, true] {
                 let (handle, task, calls) = scheduler(&config);
                 let mut state = RecentSourceState::new(retain.then_some(Duration::from_secs(5)));
-                state.attach_terrain(terrain.clone());
+                state.attach_terrain(terrain.clone(), None);
                 let mut stage_map = terrain.clone();
                 let points: Vec<_> = (0..count)
                     .map(|i| {

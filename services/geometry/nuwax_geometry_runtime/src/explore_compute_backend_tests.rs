@@ -403,7 +403,7 @@ fn mission_queries_preserve_homeward_first_and_candidate_error_nesting() {
             |from, to, _options| {
                 calls.push((from.position[0], to.position[0]));
                 if calls.len() == failing_call {
-                    Err(format!("route-{failing_call}"))
+                    Err(format!("route-{failing_call}").into())
                 } else {
                     Ok(MissionRoute { length: 1.0, end: to.clone() })
                 }
@@ -424,7 +424,7 @@ fn mission_queries_preserve_homeward_first_and_candidate_error_nesting() {
             n => {
                 let advice = result.unwrap();
                 assert_eq!(advice.homeward, 1.0);
-                assert_eq!(advice.can_visit, Err(format!("route-{n}")));
+                assert_eq!(advice.can_visit, Err(format!("route-{n}").into()));
             }
         }
     }
@@ -971,7 +971,7 @@ fn single_surface_query_observes_same_flag_after_backend_prechecks() {
             assert!(!result.cancelled, "the real query error retains its existing nesting");
         } else {
             assert!(matches!(projection, ComputeProjection::HomewardBudget(Err(ref error))
-                if error == "三维规划已取消"));
+                if error.to_string() == "三维规划已取消"));
         }
         assert!(!backend.prepared.as_ref().unwrap().controller_prepared);
         assert!(matches!(backend.resolve(Decision::Discard), Settlement::Discarded));
@@ -1022,9 +1022,9 @@ fn surface_motion_limits_error_precedes_cancel_without_changing_route_nesting() 
             panic!("a real validation error must not be replaced by cancellation")
         };
         if failing_query == 1 {
-            assert_eq!(result, Err(expected.clone()));
+            assert_eq!(result, Err(expected.clone().into()));
         } else {
-            assert_eq!(result.unwrap().can_visit, Err(expected.clone()));
+            assert_eq!(result.unwrap().can_visit, Err(expected.clone().into()));
         }
     }
 }
@@ -1093,7 +1093,7 @@ fn mission_surface_route_carries_real_projected_endpoint_into_home_query() {
     let options = frontier_goal_options(&goal, true, Some(config));
     let candidate = mission_pose_from_stamped(&goal.pose);
     let MissionRoutes::Surface { map, config, boundary } = &routes else { unreachable!() };
-    let path = nuwax_nav_stack::surface_oriented::plan_cancellable(map,
+    let path = nuwax_nav_stack::surface_oriented::plan_reference_cancellable(map, &config.follower.pct,
         (start.position, start.orientation_xyzw), (candidate.position, candidate.orientation_xyzw),
         options, config.follower.motion_limits.as_ref(), boundary, 30_000, None).unwrap();
     let expected_end = path.last().unwrap();
@@ -1131,4 +1131,64 @@ fn mission_zero_length_surface_query_still_requires_complete_body_model() {
     };
     let start = MissionPose { position: [1.05, 1.05, 0.4], orientation_xyzw: [0.0, 0.0, 0.0, 1.0] };
     assert!(routes.query(&start, &start, home_goal_options(), None).is_err());
+}
+
+#[test]
+fn mission_surface_unknown_query_keeps_requested_home_yaw_and_real_endpoint() {
+    let context = cancellable_surface_context();
+    let planning = context.input.fork_for_planning();
+    let routes = context.routes(planning.as_ref()).unwrap();
+    let mut start = mission_pose_from_stamped(&context.robot_pose);
+    start.position[0] = -10.0; start.position[1] = -10.0;
+    let mut goal = start.clone(); goal.position[0] += 0.5;
+    let q = Quaternion::from_yaw(std::f64::consts::FRAC_PI_2);
+    goal.orientation_xyzw = [q.x,q.y,q.z,q.w];
+    let MissionRoutes::Surface {map,config,..} = &routes else {unreachable!()};
+    assert!(map.locate_support_from_body(start.position,start.orientation_xyzw,
+        config.follower.body_to_support_z_m).is_err());
+    let options = home_goal_options();
+    let route = routes.query(&start,&goal,options,None).unwrap();
+    assert!(route.length >= 0.4);
+    let distance=route.end.position.iter().zip(goal.position).map(|(a,b)|(a-b).powi(2)).sum::<f64>().sqrt();
+    assert!(distance <= options.position_tolerance_m);
+    let [x,y,z,w]=route.end.orientation_xyzw;
+    let yaw=(2.0*(x*y+w*z)).atan2(1.0-2.0*(y*y+z*z));
+    assert!((yaw-std::f64::consts::FRAC_PI_2).abs() <= options.yaw_tolerance_rad);
+    let cancelled = std::sync::atomic::AtomicBool::new(true);
+    assert!(routes.query(&start,&goal,options,Some(&cancelled)).err().unwrap().contains("取消"));
+}
+
+#[test]
+fn mission_resource_error_keeps_typed_homeward_and_candidate_nesting() {
+    let context = cancellable_surface_context();
+    let start = mission_pose_from_stamped(&context.robot_pose);
+    let progress = MissionProgress::new(start.clone()).unwrap();
+    for fail_at in 1..=3 {
+        let mut calls = 0;
+        let result = ordered_mission_query(&start,&progress,&ReturnPolicy::default(),Some((&start,home_goal_options())),
+            |_,to,_| {
+                calls += 1;
+                if calls == fail_at { Err(MissionRouteError::Inconclusive("ResourceLimited: bounded primitive refinement is inconclusive".into())) }
+                else { Ok(MissionRoute {length:0.0,end:to.clone()}) }
+            }, &||false);
+        let RouteComputation::Complete(result) = result else { panic!("resource result is not cancellation") };
+        let error = if fail_at == 1 { result.unwrap_err() } else { result.unwrap().can_visit.unwrap_err() };
+        assert!(error.is_inconclusive());
+        assert_eq!(calls,fail_at);
+    }
+    let mut context = cancellable_surface_context();
+    let ComputeInput::Surface {config,..} = &mut context.input else { unreachable!() };
+    config.follower.motion_limits = Some(nuwax_nav_types_messages::MotionLimits {
+        model:nuwax_nav_types_messages::MotionModel::Differential,
+        max_forward_mps:0.5,max_reverse_mps:0.0,max_lateral_mps:0.0,max_angular_rps:1.0,
+        linear_acceleration_mps2:1.0,guaranteed_braking_mps2:1.0,
+        angular_acceleration_rps2:2.0,guaranteed_angular_braking_rps2:2.0,
+        reaction_time_sec:0.05,minimum_turning_radius_m:0.5,can_rotate_in_place:false,
+    });
+    let planning = context.input.fork_for_planning();
+    let routes = context.routes(planning.as_ref()).unwrap();
+    let mut goal = start.clone();
+    let q = Quaternion::from_yaw(std::f64::consts::FRAC_PI_2);
+    goal.orientation_xyzw = [q.x,q.y,q.z,q.w];
+    assert!(routes.query(&start,&goal,home_goal_options(),None).err().unwrap().is_inconclusive());
 }

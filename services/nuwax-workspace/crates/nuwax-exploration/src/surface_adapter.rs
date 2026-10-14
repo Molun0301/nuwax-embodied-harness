@@ -175,6 +175,9 @@ impl FrozenSurfacePlanningInput {
 #[derive(Default)]
 struct SurfacePollDelta {
     next_goal_id: Option<u64>,
+    route_cursor: Option<usize>,
+    route_inconclusive: Option<bool>,
+    deferred_route: Option<Option<DeferredFrontierRoute>>,
     selected: Option<Option<SelectedGoal>>,
     last_snapshot: Option<Option<Weak<SurfaceSnapshot>>>,
     last_notification: Option<Option<u64>>,
@@ -196,6 +199,9 @@ impl SurfacePollDelta {
     }
 
     fn commit(self, source: &mut SurfaceGoalSourceAdapter) {
+        if let Some(value) = self.route_cursor { source.route_cursor = value; }
+        if let Some(value) = self.route_inconclusive { source.route_inconclusive = value; }
+        if let Some(value) = self.deferred_route { source.deferred_route = value; }
         if let Some(value) = self.next_goal_id {
             source.next_goal_id = value;
         }
@@ -270,6 +276,9 @@ pub struct SurfaceGoalSourceAdapter {
     blacklist_radius_m: f64,
     active: bool,
     next_goal_id: u64,
+    route_cursor: usize,
+    route_inconclusive: bool,
+    deferred_route: Option<DeferredFrontierRoute>,
     selected: Option<SelectedGoal>,
     history: Vec<GoalHistory>,
     regional_schedule: nuwax_explore_routing::RegionalSchedule,
@@ -309,6 +318,9 @@ impl SurfaceGoalSourceAdapter {
             blacklist_radius_m: 0.5,
             active: false,
             next_goal_id: 0,
+            route_cursor: 0,
+            route_inconclusive: false,
+            deferred_route: None,
             selected: None,
             history: Vec::new(),
             regional_schedule: Default::default(),
@@ -334,6 +346,9 @@ impl SurfaceGoalSourceAdapter {
         if model.kind != nuwax_nav_types_messages::ObservationKind::Volume {
             return Err(ExploreError::SourceError("三维源要求空间观察标定".into()));
         }
+        self.route_cursor = 0;
+        self.route_inconclusive = false;
+        self.deferred_route = None;
         self.observation_model = Some(model);
         self.last_no_frontier = false;
         self.last_snapshot = None;
@@ -353,6 +368,9 @@ impl SurfaceGoalSourceAdapter {
                 "surface blacklist radius must be finite and nonnegative".into(),
             ));
         }
+        self.route_cursor = 0;
+        self.route_inconclusive = false;
+        self.deferred_route = None;
         self.boundary = boundary;
         self.max_navigation_retries = max_navigation_retries;
         self.blacklist_radius_m = blacklist_radius_m;
@@ -452,7 +470,16 @@ impl SurfaceGoalSourceAdapter {
             return Ok(ExplorationPoll::NoFrontier);
         }
         let new_snapshot = self.last_notification != Some(notification) || !same_geometry;
-        if !new_snapshot && same_query && self.retry_support.is_none() {
+        let deferred = self.deferred_route.as_ref().filter(|deferred| {
+            deferred.source.same_frontier_query_geometry(source_snapshot.as_ref())
+                && distance(deferred.start_body, [position.x, position.y, position.z])
+                    <= f64::from(source_snapshot.config().goal_tolerance.max(source_snapshot.config().voxel_size))
+        });
+        let active_deferred = deferred.filter(|route| !route.terminal);
+        let continuing = (!new_snapshot && same_query && self.route_cursor > 0)
+            || deferred.is_some_and(|route| route.terminal);
+        let selecting = new_snapshot || continuing || deferred.is_some();
+        if !selecting && same_query && self.retry_support.is_none() {
             return Ok(ExplorationPoll::Pending);
         }
         let boundary: Vec<_> = self.boundary.as_ref().map_or_else(Vec::new, |boundary| {
@@ -469,39 +496,48 @@ impl SurfaceGoalSourceAdapter {
         // An unchanged-input wait cannot select a frontier. Its private fork
         // will be discarded, so only retain the required body/support checks
         // below. Synchronous callers keep their original cache behavior.
-        if query_view.is_none() || new_snapshot || self.retry_support.is_some() {
+        if query_view.is_none() || selecting || self.retry_support.is_some() {
             snapshot.prepare_frontier_geometry(&boundary)
                 .map_err(|error| ExploreError::SourceError(error.to_string()))?;
         }
-        let snapshot = match snapshot.with_current_body_support(
-            [position.x, position.y, position.z], quaternion,
-        ) {
-            Ok(view) => Arc::new(view),
-            Err(error) => return Ok(delta.unavailable(format!("current body support evidence: {error}"))),
-        };
-        let robot = match snapshot.locate_support_from_body(
-            [position.x, position.y, position.z],
-            quaternion,
-            self.body_to_support_z_m,
-        ) {
-            Ok(location) => location,
-            Err(error) => {
-                return Ok(
-                    delta.unavailable(format!("body pose has no valid surface support: {error}"))
-                )
+        let current_body = ([position.x, position.y, position.z], quaternion);
+        if snapshot.body_envelope().is_some() {
+            if let Err(error) = snapshot.validate_body_pose(current_body.0, current_body.1) {
+                return Ok(delta.unavailable(format!("current body geometry: {error}")));
             }
+        }
+        // This is only a calibrated planning reference. It neither inserts a
+        // floor nor requires an observed support cell under the current body.
+        let robot_support = match snapshot.support_position_from_body(
+            current_body.0, current_body.1, self.body_to_support_z_m,
+        ) {
+            Ok(reference) => reference,
+            Err(error) => return Ok(delta.unavailable(format!("invalid body reference: {error}"))),
         };
-        if !new_snapshot && self.retry_support.is_none() {
+        if !nuwax_nav_pct::inside_boundary([robot_support[0], robot_support[1]], &boundary) {
+            return Ok(delta.unavailable("current body reference is outside exploration boundary"));
+        }
+        if !selecting && self.retry_support.is_none() {
             return Ok(ExplorationPoll::Pending);
         }
-        let mut candidates = match snapshot.reachable_frontiers(robot.support_xyz, &boundary) {
-            Ok(candidates) => candidates,
-            Err(error) => {
-                return Ok(
-                    delta.unavailable(format!("surface frontier query is unavailable: {error}"))
-                )
-            }
-        };
+        // Continue one coherent candidate ordering across receipt updates and
+        // small pose jitter; motion checks still use the actual current pose.
+        let sampling_reference = deferred.map_or(Ok(robot_support), |route|
+            snapshot.support_position_from_body(route.start_body, route.start_orientation,
+                self.body_to_support_z_m))
+            .map_err(|error| ExploreError::SourceError(error.to_string()))?;
+        let geometry = frontier_geometry(snapshot, sampling_reference, &boundary, self.observation_model.as_ref())
+            .map_err(|error| ExploreError::SourceError(error.to_string()))?;
+        let mut candidates = geometry.candidates;
+        let observation_targets = geometry.targets;
+        // One immutable PCT map serves every candidate and regional route query
+        // in this poll. Unknown states remain request-local inside PCT searches.
+        let tomogram = nuwax_nav_pct::Tomogram::from_surface(snapshot)
+            .map_err(ExploreError::SourceError)?;
+        let planar_bias = if snapshot.body_envelope().is_none() {
+            tomogram.calibrated_reference_height(robot_support)
+                .map(|height| robot_support[2] - height)
+        } else { None };
         delta.last_snapshot = Some(Some(Arc::downgrade(source_snapshot)));
         delta.last_notification = Some(Some(notification));
         delta.last_query_body = Some(Some([position.x, position.y, position.z]));
@@ -516,15 +552,8 @@ impl SurfaceGoalSourceAdapter {
         // 默认3米策略半径不能跨越另一楼层；高度只覆盖局部可跨台阶及量化差。
         let vertical_radius =
             f64::from(snapshot.config().step_threshold_m) + f64::from(snapshot.config().voxel_size);
-        let observation_targets = if self.observation_model.is_some() {
-            snapshot
-                .observation_targets(&boundary)
-                .map_err(|error| ExploreError::SourceError(error.to_string()))?
-        } else {
-            Vec::new()
-        };
         let geometric_candidate_count=candidates.len();
-        if !new_snapshot {
+        if !selecting {
             candidates.retain(|candidate|self.retry_support.is_some_and(|retry|
                 distance(retry,candidate.support_xyz)<=f64::from(snapshot.config().voxel_size)*0.25));
         }
@@ -537,12 +566,41 @@ impl SurfaceGoalSourceAdapter {
                 .then_with(||a.support_xyz[1].total_cmp(&b.support_xyz[1]))
                 .then_with(||a.support_xyz[2].total_cmp(&b.support_xyz[2]))
         });
+        if let Some(route) = active_deferred { candidates = vec![route.candidate.clone()]; }
         let mut admissible = Vec::new();
         let mut accepted_regions=std::collections::BTreeSet::new();
         let mut evaluated_candidate_count=0;
-        for mut candidate in candidates {
+        let mut route_query_count=0;
+        let state_limit = active_deferred.map_or(MAX_FRONTIER_ROUTE_STATES, |route| route.state_limit);
+        let route_budget = FrontierRouteBudget::with_states(MAX_FRONTIER_SEARCH_STATES.max(state_limit));
+        let mut next_deferred = None;
+        let mut route_budget_limited=false;
+        let mut next_route_cursor = active_deferred.map_or(0, |route| route.resume_cursor);
+        let cursor = if active_deferred.is_some() { 0 } else {
+            deferred.map_or(if continuing { self.route_cursor } else { 0 }, |route| route.resume_cursor)
+        };
+        let retrying_deferred = active_deferred.is_some();
+        let deferred_resume_cursor = active_deferred.map(|route| route.resume_cursor);
+        let previous_inconclusive = deferred.map_or(continuing && self.route_inconclusive,
+            |route| route.unresolved);
+        let deferred_start_body = deferred.map_or(current_body.0, |old| old.start_body);
+        let deferred_start_orientation = deferred.map_or(current_body.1, |old| old.start_orientation);
+        let continuation = |resume_cursor, unresolved| DeferredFrontierRoute {
+            source: source_snapshot.as_ref().clone(),
+            candidate: FrontierCandidate { support_xyz: robot_support, gain: 0.0, travel_cost: 0.0 },
+            start_body: deferred_start_body, start_orientation: deferred_start_orientation,
+            state_limit: nuwax_nav_pct::SearchLimits::default().max_states,
+            terminal: true, resume_cursor, unresolved,
+        };
+        delta.route_cursor = Some(0);
+        delta.route_inconclusive = Some(false);
+        delta.deferred_route = Some(None);
+        for (ordinal, mut candidate) in candidates.into_iter().enumerate().skip(cursor) {
+            if nuwax_nav_pct::planning_cancelled() {
+                return Err(ExploreError::SourceError("frontier planning cancelled".into()));
+            }
             if self.excluded(candidate.support_xyz, vertical_radius)
-                || distance(robot.support_xyz, candidate.support_xyz) <= minimum_distance
+                || distance(robot_support, candidate.support_xyz) <= minimum_distance
             {
                 continue;
             }
@@ -551,9 +609,20 @@ impl SurfaceGoalSourceAdapter {
             // 首个候选无效时继续检查下一项，不能把候选上限当作无前沿证明。
             if self.observation_model.is_none() && accepted_regions.contains(&region)
                 && !retry_matches(candidate.support_xyz) {continue;}
+            if self.observation_model.is_some() && !retry_matches(candidate.support_xyz)
+                && admissible.iter().filter(|(candidate, _, _): &&(FrontierCandidate, BodyPose,
+                    Option<nuwax_explore_routing::observation::ViewEstimate>)|
+                    nuwax_explore_routing::region_key(candidate.support_xyz) == region).count() >= 2 {
+                continue;
+            }
+            if evaluated_candidate_count == MAX_FRONTIER_CANDIDATE_EVALUATIONS {
+                route_budget_limited = true;
+                next_route_cursor = ordinal;
+                break;
+            }
             evaluated_candidate_count+=1;
-            let base_yaw = (candidate.support_xyz[1] - robot.support_xyz[1])
-                .atan2(candidate.support_xyz[0] - robot.support_xyz[0]);
+            let base_yaw = (candidate.support_xyz[1] - robot_support[1])
+                .atan2(candidate.support_xyz[0] - robot_support[0]);
             let directional_view = self.observation_model.as_ref().is_some_and(|model| {
                 model.horizontal_fov_rad < std::f64::consts::TAU - 1e-6
             });
@@ -562,31 +631,47 @@ impl SurfaceGoalSourceAdapter {
             let mut best = None;
             for i in 0..turns {
                 let yaw = base_yaw + i as f64 * std::f64::consts::FRAC_PI_2;
-                let candidate_quaternion = if snapshot.body_envelope().is_some() {
-                    match snapshot.body_orientation_at(candidate.support_xyz, yaw) {
-                        Ok(q) => q,
+                let (body, candidate_quaternion) = if snapshot.body_envelope().is_some() {
+                    match snapshot.body_pose_after_motion(current_body,
+                        [candidate.support_xyz[0], candidate.support_xyz[1]], yaw) {
+                        Ok(pose) => pose,
                         Err(_) => continue,
                     }
-                } else if self.observation_model.is_some() {
-                    [0.0, 0.0, (yaw * 0.5).sin(), (yaw * 0.5).cos()]
                 } else {
-                    quaternion
+                    let q = if self.observation_model.is_some() {
+                        [0.0, 0.0, (yaw * 0.5).sin(), (yaw * 0.5).cos()]
+                    } else {
+                        quaternion
+                    };
+                    let Some(bias) = planar_bias else { continue; };
+                    // Endpoint discovery must not demand a straight clear route.
+                    // Preserve the same calibration bias at known and unknown
+                    // candidates; the shared planner establishes their paths.
+                    let nominal_z = if tomogram.cell_at(candidate.support_xyz).is_none()
+                        && (candidate.support_xyz[2] - sampling_reference[2]).abs() <= vertical_radius {
+                        // Unknown edge seeds may use their observed neighbour's
+                        // height; the unobserved destination still carries the
+                        // current calibrated plane, including its actual bias.
+                        robot_support[2] - bias
+                    } else {
+                        candidate.support_xyz[2] + robot_support[2] - sampling_reference[2] - bias
+                    };
+                    let nominal = [candidate.support_xyz[0], candidate.support_xyz[1], nominal_z];
+                    let Some(height) = tomogram.calibrated_reference_height(nominal) else { continue; };
+                    let carried = [nominal[0], nominal[1], height + bias];
+                    let reference = match tomogram.project_reference_motion(carried,
+                        [carried[0], carried[1]], &boundary) {
+                        Ok(reference) => reference,
+                        Err(_) => continue,
+                    };
+                    if snapshot.validate_planar_recent_motion(reference, reference).is_err() { continue; }
+                    match snapshot.body_position_from_support(
+                        reference, q, self.body_to_support_z_m,
+                    ) {
+                        Ok(body) => (body, q),
+                        Err(_) => continue,
+                    }
                 };
-                let body = match snapshot.body_position_from_support(
-                    candidate.support_xyz,
-                    candidate_quaternion,
-                    self.body_to_support_z_m,
-                ) {
-                    Ok(p) => p,
-                    Err(_) => continue,
-                };
-                if snapshot.body_envelope().is_some()
-                    && snapshot
-                        .validate_body_pose(body, candidate_quaternion)
-                        .is_err()
-                {
-                    continue;
-                }
                 let view = self
                     .observation_model
                     .as_ref()
@@ -634,12 +719,55 @@ impl SurfaceGoalSourceAdapter {
             }) {
                 continue;
             }
+            // Projection must retain the candidate's layer. In particular, an
+            // upper-floor seed cannot silently turn into a visited lower-floor
+            // viewpoint and bypass the pre-projection history check.
+            let projected = snapshot.support_position_from_body(
+                body, candidate_quaternion, self.body_to_support_z_m,
+            ).map_err(|error| ExploreError::SourceError(error.to_string()))?;
+            if (projected[2] - candidate.support_xyz[2]).abs() > vertical_radius
+                || self.excluded(projected, vertical_radius)
+                || distance(robot_support, projected) <= minimum_distance {
+                continue;
+            }
+            candidate.support_xyz = projected;
+            if route_budget.exhausted() {
+                route_budget_limited = true;
+                next_route_cursor = ordinal;
+                break;
+            }
+            route_query_count += 1;
+            let Some(cost) = frontier_route_cost(
+                &tomogram, snapshot, robot_support, candidate.support_xyz,
+                current_body, (body, candidate_quaternion), self.body_to_support_z_m,
+                &boundary, geometry.lookahead_m, &route_budget, state_limit,
+            ) else {
+                if route_budget.last_inconclusive.get() && next_deferred.is_none() {
+                    let upper = nuwax_nav_pct::SearchLimits::default().max_states;
+                    let terminal = route_budget.last_domain_limited.get() || state_limit >= upper;
+                    next_deferred = Some(DeferredFrontierRoute {
+                        source: source_snapshot.as_ref().clone(),
+                        candidate: candidate.clone(), start_body: deferred_start_body,
+                        start_orientation: deferred_start_orientation,
+                        state_limit: if terminal { state_limit } else { state_limit.saturating_mul(2).min(upper) },
+                        terminal,
+                        resume_cursor: deferred_resume_cursor.unwrap_or(ordinal + 1),
+                        unresolved: previous_inconclusive || terminal,
+                    });
+                    // Do not consume other candidates while this one is
+                    // unresolved: its untouched suffix is resumed explicitly.
+                    break;
+                }
+                if retrying_deferred { break; }
+                continue;
+            };
+            candidate.travel_cost = cost;
             admissible.push((candidate, (body, candidate_quaternion), view));
             accepted_regions.insert(region);
-            if self.observation_model.is_some() && admissible.len()>=64 {break;}
+            if admissible.len() >= 8 { break; }
         }
         let retry = self.retry_support;
-        if !new_snapshot {
+        if !selecting {
             // 旧图只允许重试原视点，不能借失败反馈把其它旧候选算作新增益。
             admissible.retain(|(candidate, _, _)| {
                 retry.is_some_and(|retry| {
@@ -683,17 +811,14 @@ impl SurfaceGoalSourceAdapter {
                 &routing_candidates,
                 self.observation_model.as_ref().map(|_| observed.as_slice()),
                 |source, goals| {
-                    let targets: Vec<_> = goals
-                        .iter()
-                        .map(|&i| routing_candidates[i].position)
-                        .collect();
-                    snapshot
-                        .frontier_travel_costs(
-                            routing_candidates[source].position,
-                            &targets,
-                            &boundary,
-                        )
-                        .unwrap_or_else(|_| vec![f64::INFINITY; targets.len()])
+                    goals.iter().map(|&target| {
+                        frontier_route_cost(
+                            &tomogram, snapshot,
+                            routing_candidates[source].position, routing_candidates[target].position,
+                            admissible[source].1, admissible[target].1, self.body_to_support_z_m,
+                            &boundary, geometry.lookahead_m, &route_budget, MAX_FRONTIER_ROUTE_STATES,
+                        ).unwrap_or(f64::INFINITY)
+                    }).collect()
                 },
             );
             delta.regional = Some(regional_delta);
@@ -701,11 +826,56 @@ impl SurfaceGoalSourceAdapter {
         } else {
             None
         };
+        if nuwax_nav_pct::planning_cancelled() {
+            return Err(ExploreError::SourceError("frontier planning cancelled".into()));
+        }
+        // An exactly spent final reservation is complete, not unfinished work.
+        // The candidate loop already records a cursor when another query remains.
         let selected_index =
             retry_index.or_else(|| selection.as_ref().map(|selection| selection.index));
         let Some((candidate, (body, candidate_quaternion), view)) =
             selected_index.and_then(|index| admissible.get(index))
         else {
+            if let Some(deferred) = next_deferred {
+                let terminal = deferred.terminal;
+                let limit = deferred.state_limit;
+                let resume_cursor = deferred.resume_cursor;
+                let unresolved = deferred.unresolved;
+                delta.deferred_route = Some(Some(deferred));
+                delta.route_cursor = Some(resume_cursor);
+                delta.route_inconclusive = Some(unresolved);
+                delta.last_no_frontier = Some(false);
+                if terminal && resume_cursor >= geometric_candidate_count {
+                    delta.last_error = Some(Some(format!(
+                        "ResourceLimited: frontier route remains inconclusive within its bounded domain ({limit} state allowance)",
+                    )));
+                    return Ok(ExplorationPoll::Stop(crate::ExplorationStopReason::PlanningResourceLimited));
+                }
+                delta.last_error = Some(Some(if terminal {
+                    "frontier route remains inconclusive within its bounded domain; checking remaining candidates".into()
+                } else {
+                    format!("frontier route search is inconclusive; continuing the candidate with {limit} states")
+                }));
+                return Ok(ExplorationPoll::Pending);
+            }
+            let unresolved = previous_inconclusive || route_budget.inconclusive.get();
+            if next_route_cursor > 0 && next_route_cursor < geometric_candidate_count {
+                delta.deferred_route = Some(Some(continuation(next_route_cursor, unresolved)));
+                delta.route_cursor = Some(next_route_cursor);
+                delta.route_inconclusive = Some(unresolved);
+                delta.last_no_frontier = Some(false);
+                delta.last_error = Some(Some("frontier search is continuing the remaining candidates".into()));
+                return Ok(ExplorationPoll::Pending);
+            }
+            if unresolved {
+                delta.deferred_route = Some(Some(continuation(geometric_candidate_count, true)));
+                delta.route_cursor = Some(geometric_candidate_count);
+                delta.route_inconclusive = Some(true);
+                delta.last_no_frontier = Some(false);
+                delta.last_error = Some(Some(
+                    "ResourceLimited: candidate search is complete but at least one route remains inconclusive".into()));
+                return Ok(ExplorationPoll::Stop(crate::ExplorationStopReason::PlanningResourceLimited));
+            }
             delta.retry_support = Some(None);
             delta.last_no_frontier = Some(true);
             delta.last_error = Some(None);
@@ -753,6 +923,13 @@ impl SurfaceGoalSourceAdapter {
         goal.frontier_area_m2 = Some(candidate.gain as f32);
         goal.distance_cost = Some(travel as f32);
         goal.producer = "nuwax-exploration/surface".into();
+        goal.metadata.insert("ground_reference_policy".into(), "known_terrain_or_calibrated_current_layer".into());
+        goal.metadata.insert("route_query_count".into(), route_budget.queries.get().to_string());
+        goal.metadata.insert("candidate_route_query_count".into(), route_query_count.to_string());
+        goal.metadata.insert("route_state_budget_limit".into(), route_budget.total.to_string());
+        goal.metadata.insert("route_expanded_successes".into(), route_budget.expanded.get().to_string());
+        goal.metadata.insert("route_state_budget_charged".into(), (route_budget.total - route_budget.remaining.get()).to_string());
+        goal.metadata.insert("route_budget_limited".into(), route_budget_limited.to_string());
         goal.metadata.insert("geometric_candidate_count".into(),geometric_candidate_count.to_string());
         goal.metadata.insert("evaluated_candidate_count".into(),evaluated_candidate_count.to_string());
         goal.metadata.insert("admissible_candidate_count".into(),admissible.len().to_string());
@@ -842,7 +1019,7 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
         if version!=1 || history.len()>65536 || history.iter().any(|h|h.support_xyz.iter().any(|v|!v.is_finite() || v.abs()>1e9) || !h.vertical_radius_m.is_finite() || !(0.0..=1e6).contains(&h.vertical_radius_m)) {
             return Err(ExploreError::SourceError("三维探索进度无效或版本不支持".into()));
         }
-        self.history=history;self.regional_schedule=schedule;self.last_snapshot=None;self.last_notification=None;self.retry_support=None;self.last_frontiers.clear();Ok(())
+        self.route_cursor=0;self.route_inconclusive=false;self.deferred_route=None;self.history=history;self.regional_schedule=schedule;self.last_snapshot=None;self.last_notification=None;self.retry_support=None;self.last_frontiers.clear();Ok(())
     }
     fn restore_checkpoint_for_replan(&mut self, payload: &str) -> ExploreResult<()> {
         self.restore_checkpoint(payload)?;
@@ -862,6 +1039,9 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
 
     fn begin(&mut self) -> ExploreResult<()> {
         self.ensure_no_prepared_poll()?;
+        self.route_cursor = 0;
+        self.route_inconclusive = false;
+        self.deferred_route = None;
         self.active = true;
         self.selected = None;
         self.history.clear();
@@ -880,6 +1060,9 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
 
     fn end(&mut self) -> ExploreResult<()> {
         self.ensure_no_prepared_poll()?;
+        self.route_cursor = 0;
+        self.route_inconclusive = false;
+        self.deferred_route = None;
         self.active = false;
         self.selected = None;
         self.retry_support = None;
@@ -956,6 +1139,9 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
         {
             return Ok(());
         }
+        self.route_cursor = 0;
+        self.route_inconclusive = false;
+        self.deferred_route = None;
         let selected = self.selected.take().expect("goal identity was checked");
         self.retry_support = None;
         self.last_no_frontier = false;
@@ -1010,6 +1196,257 @@ fn distance(left: [f64; 3], right: [f64; 3]) -> f64 {
     (left[0] - right[0])
         .hypot(left[1] - right[1])
         .hypot(left[2] - right[2])
+}
+
+// A finite request-local candidate set and route budget. These references never
+// become map cells or sensor observations, including when the source has no floor.
+const MAX_FRONTIER_CANDIDATE_EVALUATIONS: usize = 128;
+const MAX_FRONTIER_ROUTE_QUERIES: usize = 64;
+const MAX_FRONTIER_SEARCH_STATES: usize = 8_192;
+const MAX_FRONTIER_ROUTE_STATES: usize = 2_048;
+
+struct FrontierRouteBudget {
+    total: usize,
+    last_inconclusive: std::cell::Cell<bool>,
+    last_domain_limited: std::cell::Cell<bool>,
+    remaining: std::cell::Cell<usize>,
+    queries: std::cell::Cell<usize>,
+    expanded: std::cell::Cell<usize>,
+    inconclusive: std::cell::Cell<bool>,
+}
+impl Default for FrontierRouteBudget {
+    fn default() -> Self { Self::with_states(MAX_FRONTIER_SEARCH_STATES) }
+}
+impl FrontierRouteBudget {
+    fn with_states(total: usize) -> Self {
+        Self { total, last_inconclusive: std::cell::Cell::new(false),
+            last_domain_limited: std::cell::Cell::new(false),
+            remaining: std::cell::Cell::new(total), queries: std::cell::Cell::new(0),
+            expanded: std::cell::Cell::new(0), inconclusive: std::cell::Cell::new(false) }
+    }
+    fn exhausted(&self) -> bool {
+        self.remaining.get() == 0 || self.queries.get() >= MAX_FRONTIER_ROUTE_QUERIES
+    }
+}
+const UNKNOWN_SAMPLE_DIRECTIONS: usize = 16;
+
+type BodyPose = ([f64; 3], [f64; 4]);
+
+#[derive(Clone, Debug)]
+struct FrontierCandidate {
+    support_xyz: [f64; 3],
+    gain: f64,
+    travel_cost: f64,
+}
+
+#[derive(Clone, Debug)]
+struct DeferredFrontierRoute {
+    // Cheap immutable source sharing, solely to retain the resource stage across
+    // receipt-time changes. This never caches or reuses a motion permission.
+    source: SurfaceSnapshot,
+    candidate: FrontierCandidate,
+    start_body: [f64; 3],
+    start_orientation: [f64; 4],
+    state_limit: usize,
+    // A completed retry becomes a light continuation anchor for its untouched
+    // candidate suffix, including metadata-only refreshes and small pose jitter.
+    terminal: bool,
+    resume_cursor: usize,
+    unresolved: bool,
+}
+
+struct FrontierGeometry {
+    candidates: Vec<FrontierCandidate>,
+    targets: Vec<nuwax_explore_routing::observation::ObservationTarget>,
+    lookahead_m: f64,
+}
+
+fn frontier_geometry(
+    snapshot: &SurfaceSnapshot,
+    reference: [f64; 3],
+    boundary: &[[f64; 2]],
+    model: Option<&nuwax_nav_types_messages::ObservationModel>,
+) -> Result<FrontierGeometry, nuwax_nav_mls_planner::SurfaceError> {
+    use nuwax_nav_mls_planner::surface::GroundQueryState;
+    use std::collections::BTreeMap;
+    let size = f64::from(snapshot.config().voxel_size);
+    if reference.iter().any(|value| !value.is_finite()
+        || (value / size).abs() >= f64::from(i32::MAX) * 0.5) {
+        return Err(nuwax_nav_mls_planner::SurfaceError::InvalidPose);
+    }
+    // Same footprint/clearance lookahead used by the source's geometric frontier
+    // index. A calibrated sensor can extend the finite observation horizon.
+    let radius = snapshot.body_envelope().map_or(
+        f64::from(snapshot.config().wall_clearance_m), |body| body.radius(),
+    ).max(f64::from(snapshot.config().wall_clearance_m));
+    let local_lookahead = ((radius / size).ceil() + 2.0).min(128.0) * size;
+    let lookahead_m = model.map_or(local_lookahead, |model| model.max_range_m.max(local_lookahead));
+    let key = |point: [f64; 3]| point.map(|value| (value / size).floor() as i32);
+    let mut candidates = BTreeMap::new();
+    for candidate in snapshot.frontier_candidates(boundary)? {
+        candidates.insert(key(candidate.support_xyz), FrontierCandidate {
+            support_xyz: candidate.support_xyz,
+            gain: candidate.gain,
+            travel_cost: distance(reference, candidate.support_xyz),
+        });
+    }
+    let mut targets: BTreeMap<_, _> = snapshot.observation_targets(boundary)?
+        .into_iter().map(|target| (target.cell, target)).collect();
+    // Real-map edge targets are valid unknown viewpoints too. Keep their layer
+    // height; PCT must establish an actual same-layer route to each candidate.
+    for target in targets.values() {
+        candidates.entry(target.cell).or_insert(FrontierCandidate {
+            support_xyz: target.position,
+            gain: size * size,
+            travel_cost: distance(reference, target.position),
+        });
+    }
+    // A blind current footprint or completely unmeasured layer has no observed
+    // graph edge to seed exploration. Keep near-footprint rings even when a
+    // sensor sees farther, so narrow boundaries do not lose all candidates.
+    // At most four finite rings use the calibrated plane without observing it.
+    let mut radii = vec![local_lookahead * 0.5, local_lookahead,
+        lookahead_m * 0.5, lookahead_m];
+    radii.sort_by(f64::total_cmp);
+    radii.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+    for radius in radii {
+        for direction in 0..UNKNOWN_SAMPLE_DIRECTIONS {
+            let angle = direction as f64 * std::f64::consts::TAU / UNKNOWN_SAMPLE_DIRECTIONS as f64;
+            let xy = [reference[0] + radius * angle.cos(), reference[1] + radius * angle.sin()];
+            if !nuwax_nav_pct::inside_boundary(xy, boundary) { continue; }
+            let ground = snapshot.query_ground(xy, reference[2]);
+            if !matches!(ground.state, GroundQueryState::Unknown | GroundQueryState::Estimated) { continue; }
+            let point = [xy[0], xy[1], ground.height.unwrap_or(reference[2])];
+            let cell = key(point);
+            if !snapshot.navigation_column_allowed([cell[0], cell[1]], size) { continue; }
+            candidates.entry(cell).or_insert(FrontierCandidate {
+                support_xyz: point,
+                gain: size * size,
+                travel_cost: distance(reference, point),
+            });
+            targets.entry(cell).or_insert(nuwax_explore_routing::observation::ObservationTarget {
+                cell, position: point,
+            });
+        }
+    }
+    if matches!(snapshot.query_ground([reference[0], reference[1]], reference[2]).state,
+        GroundQueryState::Unknown | GroundQueryState::Estimated) {
+        // Bootstrap a blind current layer inside its existing sensor/footprint
+        // horizon. A remote observed island must not trigger long searches before
+        // the nearby unknown reference has produced a useful next observation.
+        let local = |point: [f64; 3]| (point[0]-reference[0]).hypot(point[1]-reference[1])
+            <= lookahead_m + 1e-9;
+        candidates.retain(|_, candidate| local(candidate.support_xyz));
+        targets.retain(|_, target| local(target.position));
+    }
+    Ok(FrontierGeometry {
+        candidates: candidates.into_values().collect(),
+        targets: targets.into_values().collect(),
+        lookahead_m,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn frontier_route_cost(
+    tomogram: &nuwax_nav_pct::Tomogram,
+    snapshot: &SurfaceSnapshot,
+    start: [f64; 3],
+    goal: [f64; 3],
+    start_body: BodyPose,
+    goal_body: BodyPose,
+    offset: f64,
+    boundary: &[[f64; 2]],
+    lookahead_m: f64,
+    budget: &FrontierRouteBudget,
+    query_state_limit: usize,
+) -> Option<f64> {
+    budget.last_inconclusive.set(false);
+    budget.last_domain_limited.set(false);
+    if budget.exhausted() { return None; }
+    budget.queries.set(budget.queries.get() + 1);
+    let allowance = budget.remaining.get().min(query_state_limit);
+    // Failed searches conservatively consume their whole reservation. Successful
+    // direct routes return their unused reservation, so all queries together
+    // remain inside one poll-wide state bound, including regional route advice.
+    budget.remaining.set(budget.remaining.get() - allowance);
+    let has_body = snapshot.body_envelope().is_some();
+    // References carry calibration separately from factual terrain. The planar
+    // branch uses the same bias and projection as the no-envelope follower.
+    let bias = if has_body { 0.0 } else {
+        start[2] - tomogram.calibrated_reference_height(start)?
+    };
+    let reference_start = [start[0], start[1], start[2] - bias];
+    let reference_goal = [goal[0], goal[1], goal[2] - bias];
+    let tolerance = f64::from(snapshot.config().goal_tolerance);
+    let carried = |point: [f64; 3]| {
+        if distance(point, reference_start) < 1e-8 { return start; }
+        if distance(point, reference_goal) <= tolerance + 1e-6 { return goal; }
+        [point[0], point[1], point[2] + bias]
+    };
+    let pose = |point: [f64; 3]| {
+        let reference = carried(point);
+        if distance(reference, start) < 1e-8 { return Ok(start_body); }
+        if distance(reference, goal) < 1e-8 { return Ok(goal_body); }
+        snapshot.body_position_from_support(reference, goal_body.1, offset)
+            .map(|body| (body, goal_body.1))
+    };
+    let planar_accepts = |from: [f64;3], to: [f64;3]| {
+        tomogram.project_reference_motion(from,[to[0],to[1]],boundary)
+            .is_ok_and(|end| distance(end,to)<=1e-6
+                && snapshot.validate_planar_recent_motion(from,end).is_ok())
+    };
+    let accepts = |from: [f64; 3], to: [f64; 3]| {
+        if !has_body { return planar_accepts(carried(from), carried(to)); }
+        match (pose(from), pose(to)) {
+            (Ok(from), Ok(to)) => snapshot.validate_body_motion(from, to, boundary).is_ok(),
+            _ => false,
+        }
+    };
+    // Unknown expansion remains inside a finite endpoint-relative horizon, with
+    // the same PCT edge rules as ordinary navigation and exact body sweep checks.
+    let radius = (start[0] - goal[0]).hypot(start[1] - goal[1]) + lookahead_m;
+    let route = match tomogram.plan_bounded_with_segment_filter_and_limits_typed(
+        reference_start, reference_goal, tolerance, boundary, None, Some(radius), &[], &accepts,
+        nuwax_nav_pct::SearchLimits { max_states: allowance },
+    ) {
+        Ok(route) => route,
+        Err(error) => {
+            if matches!(error, nuwax_nav_pct::PlanningFailure::BudgetExhausted(_)
+                | nuwax_nav_pct::PlanningFailure::SearchDomainLimited(_)) {
+                budget.last_domain_limited.set(matches!(error,
+                    nuwax_nav_pct::PlanningFailure::SearchDomainLimited(_)));
+                budget.inconclusive.set(true);
+                budget.last_inconclusive.set(true);
+            }
+            return None;
+        }
+    };
+    budget.expanded.set(budget.expanded.get() + route.stats.expanded);
+    budget.remaining.set(budget.remaining.get() + allowance.saturating_sub(route.stats.expanded.max(1)));
+    if !has_body {
+        let mut previous = start;
+        let mut cost = 0.0;
+        for point in route.points {
+            let next = carried(point);
+            if !planar_accepts(previous, next) { return None; }
+            cost += distance(previous, next);
+            previous = next;
+        }
+        if !planar_accepts(previous, goal) { return None; }
+        return Some(cost + distance(previous, goal));
+    }
+    let mut previous = start_body;
+    let mut cost = 0.0;
+    for point in route.points {
+        let next = pose(point).ok()?;
+        cost += distance(previous.0, next.0);
+        previous = next;
+    }
+    // Also cover a single-point PCT arrival: tolerance must never skip the real
+    // endpoint's collision, rotation, boundary, or known-terrain connector.
+    snapshot.validate_body_motion(previous, goal_body, boundary).ok()?;
+    cost += distance(previous.0, goal_body.0);
+    Some(cost)
 }
 
 #[cfg(test)]
@@ -1105,6 +1542,9 @@ mod tests {
         checkpoint: String,
         diagnostics: ExplorationSourceDiagnostics,
         next_goal_id: u64,
+        route_cursor: usize,
+        route_inconclusive: bool,
+        deferred_route: Option<([f64; 3], [f64; 3], [f64; 4], usize, bool, usize, bool)>,
         selected: Option<(FrontierGoal, [f64; 3], f64)>,
         source_anchor: Option<*const SurfaceSnapshot>,
         notification: Option<u64>,
@@ -1120,6 +1560,11 @@ mod tests {
             checkpoint: source.checkpoint().unwrap(),
             diagnostics: source.diagnostics(),
             next_goal_id: source.next_goal_id,
+            route_cursor: source.route_cursor,
+            route_inconclusive: source.route_inconclusive,
+            deferred_route: source.deferred_route.as_ref().map(|deferred|
+                (deferred.candidate.support_xyz, deferred.start_body, deferred.start_orientation,
+                    deferred.state_limit, deferred.terminal, deferred.resume_cursor, deferred.unresolved)),
             selected: source.selected.as_ref().map(|selected| {
                 (
                     selected.goal.clone(),
@@ -1760,7 +2205,7 @@ mod tests {
     }
 
     #[test]
-    fn blind_start_selects_a_goal_on_observed_ground() {
+    fn blind_start_selects_a_goal_without_inserting_observed_ground() {
         let points: Vec<_> = (0..40).flat_map(|x| (0..40).map(move |y|
             ((x as f32+0.5)*0.05, (y as f32+0.5)*0.05, 0.075)))
             .filter(|&(x,y,_)| (f64::from(x)-1.05).abs() > 0.3
@@ -1775,14 +2220,15 @@ mod tests {
         let current = state(0.4,1);
         let start = [1.05, 1.05, 0.4];
         let orientation = [0.0, 0.0, 0.0, 1.0];
-        // Missing floor samples are not occupied body volume. The raw map still
-        // lacks a support anchor; the private current-body view must supply it.
+        // Missing floor samples are not occupied body volume. Planning retains
+        // the calibrated reference without inserting a support anchor.
         snapshot.validate_body_pose(start, orientation).unwrap();
         assert!(matches!(snapshot.locate_support_from_body(start, orientation, 0.3),
             Err(nuwax_nav_mls_planner::SurfaceError::MissingSupport)));
         assert!(snapshot.observations().is_none());
         let current_view = snapshot.with_current_body_support(start, orientation).unwrap();
-        current_view.locate_support_from_body(start, orientation, 0.3).unwrap();
+        assert!(matches!(current_view.locate_support_from_body(start, orientation, 0.3),
+            Err(nuwax_nav_mls_planner::SurfaceError::MissingSupport)));
         assert!(current_view.observations().is_none(), "private support must not fabricate observations");
         let receiver = SurfaceInputReceiver::new();
         receiver.observe(Arc::clone(&snapshot)).unwrap();
@@ -1792,7 +2238,7 @@ mod tests {
         let p = selected.pose.pose.position;
         let q = selected.pose.pose.orientation;
         snapshot.validate_body_pose([p.x,p.y,p.z],[q.x,q.y,q.z,q.w]).unwrap();
-        snapshot.locate_support_from_body([p.x,p.y,p.z],[q.x,q.y,q.z,q.w],0.3).unwrap();
+        snapshot.support_position_from_body([p.x,p.y,p.z],[q.x,q.y,q.z,q.w],0.3).unwrap();
         snapshot.validate_body_pose(start, orientation).unwrap();
         assert!(matches!(snapshot.locate_support_from_body(start, orientation, 0.3),
             Err(nuwax_nav_mls_planner::SurfaceError::MissingSupport)),
@@ -2408,9 +2854,9 @@ mod tests {
         let q = selected.pose.pose.orientation;
         let p = selected.pose.pose.position;
         let support = surface
-            .locate_support_from_body([p.x, p.y, p.z], [q.x, q.y, q.z, q.w], 0.3)
+            .support_position_from_body([p.x, p.y, p.z], [q.x, q.y, q.z, q.w], 0.3)
             .unwrap();
-        assert!(boundary.contains(Point2::new(support.support_xyz[0], support.support_xyz[1])));
+        assert!(boundary.contains(Point2::new(support[0], support[1])));
     }
 
     #[test]
@@ -2474,9 +2920,9 @@ mod tests {
         assert!(
             matches!(
                 controller.poll_next_goal(&state(1.4, 4)).unwrap(),
-                ExplorationPoll::SourceUnavailable(_)
+                ExplorationPoll::Pending
             ),
-            "缺少支撑不等于探索完成"
+            "unknown ground may wait for a new observation, but cannot masquerade as missing input or completion"
         );
         receiver.clear().unwrap();
         assert!(matches!(
@@ -2485,6 +2931,7 @@ mod tests {
         ));
     }
 
+    include!("surface_unknown_ground_tests.rs");
     include!("surface_prepared_reference_tests.rs");
     include!("surface_view_ownership_tests.rs");
     include!("surface_wait_frontier_tests.rs");

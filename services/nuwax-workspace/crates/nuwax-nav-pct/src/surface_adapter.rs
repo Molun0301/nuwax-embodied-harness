@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 pub struct PctPlanner {
     cached: Mutex<Option<(SurfaceSnapshot, Arc<Tomogram>)>>,
     local_costs: Mutex<Vec<RoutePenalty>>,
+    pub(crate) search_limits: crate::SearchLimits,
 }
 
 #[cfg(test)]
@@ -24,6 +25,61 @@ mod body_route_cancellation_tests {
             max_step_up_m: 0.15, max_step_down_m: 0.15,
             max_cross_slope_deg: 18.0, support_uncertainty_m: 0.0,
         }).unwrap()
+    }
+
+    #[test]
+    fn prepared_reference_identity_includes_geometry_config_and_materialization_domain() {
+        let source = source();
+        let map = Tomogram::from_surface(&source).unwrap();
+        assert!(map.matches_surface(&source.clone()));
+        let recent = source.with_recent_obstacle_points(1,100,0,&[],[(0,[0.0,0.0,0.6])]).unwrap();
+        assert!(map.matches_surface(&recent),"recent geometry is a separate live execution check");
+        let cropped = Tomogram::local_from_surface(&source,[0.0,0.0],1.0).unwrap();
+        assert!(!cropped.matches_surface(&source),"a crop cannot stand in for the full prepared source");
+        let mut model = source.body_envelope().unwrap().clone();model.max_step_up_m *= 0.5;
+        let changed = source.clone().with_body_envelope(model).unwrap();
+        assert!(!map.matches_surface(&changed),"immutable config/model identity is part of geometry admission");
+    }
+
+    #[test]
+    fn tilted_start_and_goal_use_one_body_center_guide_transform() {
+        let source = source();let planner = PctPlanner::default();
+        let start = ([-0.03,0.0,0.462],[(0.35_f64*0.5).sin(),0.0,0.0,(0.35_f64*0.5).cos()]);
+        let goal = ([0.03,0.0,0.462],[0.0,(-0.3_f64*0.5).sin(),0.0,(-0.3_f64*0.5).cos()]);
+        let options = GoalOptions {position_tolerance_m:0.001,..GoalOptions::default()};
+        let route = planner.body_route(&source,start,goal,options,&[],None).unwrap();
+        assert_eq!(route[0],start,"Scan receives the actual complete initial pose");
+        assert!(crate::distance(route.last().unwrap().0,goal.0)<=options.position_tolerance_m+1e-9);
+        assert!(route.iter().all(|p|p.0[0]>=start.0[0]-1e-9&&p.0[0]<=goal.0[0]+1e-9));
+        assert!(route.iter().all(|p|p.0[1].abs()<1e-9&&(p.0[2]-start.0[2]).abs()<1e-9));
+    }
+
+    #[test]
+    fn body_route_preserves_calibrated_bias_and_original_tight_goal_sphere() {
+        let source = source();
+        let planner = PctPlanner::default();
+        let start = ([-0.5,0.0,0.462],[0.0,0.0,0.0,1.0]);
+        let goal = ([0.5,0.0,0.462],start.1);
+        let options = GoalOptions { position_tolerance_m: 0.001, ..GoalOptions::default() };
+        let route = planner.body_route(&source,start,goal,options,&[],None).unwrap();
+        assert!(crate::distance(route.last().unwrap().0,goal.0)<=options.position_tolerance_m+1e-9);
+        assert!(route.iter().all(|pose|(pose.0[2]-start.0[2]).abs()<1e-9));
+        let wrong_layer = ([goal.0[0],goal.0[1],goal.0[2]+0.2],goal.1);
+        assert!(planner.body_route(&source,start,wrong_layer,options,&[],None).is_err(),
+            "calibration transport cannot widen the original 3D goal sphere");
+    }
+
+    #[test]
+    fn body_route_uses_configured_and_explicit_request_budgets() {
+        let source = source();
+        let planner = PctPlanner::default().with_search_limits(crate::SearchLimits { max_states: 1 });
+        planner.report_local_blockage([0.0,0.0,0.05],0.2);
+        let start = ([-0.5,0.0,0.45],[0.0,0.0,0.0,1.0]);
+        let goal = ([0.5,0.0,0.45],start.1);
+        let error = planner.body_route(&source,start,goal,GoalOptions::default(),&[],None).unwrap_err();
+        assert!(error.starts_with("BudgetExhausted:"),"{error}");
+        assert!(planner.body_route_with_limits(&source,start,goal,GoalOptions::default(),&[],None,
+            crate::SearchLimits { max_states: 4096 }).is_ok());
     }
 
     #[test]
@@ -163,6 +219,14 @@ pub fn same_source_geometry(a: &SurfaceSnapshot, b: &SurfaceSnapshot) -> bool {
         }
 }
 impl PctPlanner {
+    /// Configure the actual global body-route request budget. This bounds work,
+    /// not physical reachability; BudgetExhausted is safe to retry with more work.
+    pub fn with_search_limits(mut self, limits: crate::SearchLimits) -> Self {
+        self.search_limits = limits;
+        self
+    }
+    /// The configured per-query resource ceiling, independent of physical reachability.
+    pub fn search_limits(&self) -> crate::SearchLimits { self.search_limits }
     pub fn clear_local_costs(&self) {
         self.local_costs
             .lock()

@@ -445,12 +445,15 @@ impl NavPlanner for RouteFollower {
             ExecutionMap::SurfaceUpdate(update) => update,
             ExecutionMap::Surface(surface) => {
                 let same=self.map.as_ref().is_some_and(|old|nuwax_nav_pct::same_source_geometry(old,&surface));
-                SurfaceMapUpdate {snapshot:surface,change_basis:self.map.clone(),
+                SurfaceMapUpdate {planar_reference:None,snapshot:surface,change_basis:self.map.clone(),
                     changes:Arc::new(if same {SurfaceGeometryChanges::Empty} else {SurfaceGeometryChanges::Unknown})}
             }
             ExecutionMap::Planar(_) => return Err(error("三维路线执行缺少三维地图")),
         };
-        let surface=update.snapshot;
+        if update.planar_reference.as_ref().is_some_and(|prepared|!prepared.matches_surface(&update.snapshot)) {
+            return Err(error("后台平面查询地图与当前几何或配置不匹配"));
+        }
+        let surface=Arc::clone(&update.snapshot);
         if self.map.as_ref().is_none_or(|old|!old.same_body_query_view(&surface)) {self.qualified_failure=None;}
         for (_,ticket) in self.source_tickets.iter_mut().flatten() {
             ticket.observe(&surface,update.change_basis.as_deref(),&update.changes);
@@ -472,7 +475,7 @@ impl NavPlanner for RouteFollower {
             self.dirty = true;
         }
         self.controller
-            .update_execution_map(ExecutionMap::Surface(Arc::clone(&surface)))?;
+            .update_execution_map(ExecutionMap::SurfaceUpdate(update))?;
         self.map = Some(surface);
         Ok(())
     }
@@ -513,10 +516,10 @@ impl NavPlanner for RouteFollower {
             self.controller.current_body_error()
         };
         if let Some(reason) = body_error {
-            // 起点缺少合法支撑或净空时，重发同一全局路线只会造成规划忙循环。
+            // 当前实际机体碰撞或已知地形不相容时，重发同一全局路线只会造成规划忙循环。
             // 原实际速度回执、输入期限和取消仍由执行调度器处理。
             self.wait_reason = Some(format!(
-                "当前机体支撑或净空尚不可用，保持零速等待地图或位姿恢复：{reason}"
+                "当前机体几何检查未通过，保持零速等待地图或位姿恢复：{reason}"
             ));
             return PlannerStep::Pending(Vec::new());
         }
@@ -1267,7 +1270,7 @@ mod tests {
         follower.replace_execution_path(ExecutionPath::Surface(Path3D { poses: vec![start.clone(),goal.clone()] }), None, goal).unwrap();
         for _ in 0..3 {
             assert_eq!(follower.step(0.3), PlannerStep::Pending(Vec::new()));
-            assert!(follower.execution_wait_reason().unwrap().contains("支撑或净空"));
+            assert!(follower.execution_wait_reason().unwrap().contains("当前机体几何检查未通过"));
             assert_eq!(follower.local_plans(),0);
             assert!(follower.local_failures().is_empty());
         }

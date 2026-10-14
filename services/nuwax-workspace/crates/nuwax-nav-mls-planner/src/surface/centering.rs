@@ -38,14 +38,7 @@ fn build(map:&SurfaceSnapshot)->Vec<f64> {
     distances.truncate(root);distances
 }
 
-/// 当前足迹的私有支撑不重建全图，始终复用其稳定几何源的势场。
-fn stable_source(mut map:&SurfaceSnapshot)->&SurfaceSnapshot {
-    while let Some(current)=&map.current_body_support {map=&current.source;}
-    map
-}
-
 pub(super) fn distances(map:&SurfaceSnapshot)->Arc<Vec<f64>> {
-    let map=stable_source(map);
     let mut cache=map.data.routing_cache.lock().unwrap_or_else(|e|e.into_inner());
     if let Some(distances)=&cache.centering {return Arc::clone(distances);}
     let distances=Arc::new(build(map));cache.centering=Some(Arc::clone(&distances));
@@ -54,7 +47,7 @@ pub(super) fn distances(map:&SurfaceSnapshot)->Arc<Vec<f64>> {
 }
 
 pub(super) fn tail_multiplier(map:&SurfaceSnapshot,cell:VoxelKey)->f64 {
-    let source=stable_source(map);let config=source.config();
+    let source=map;let config=source.config();
     if config.wall_buffer_m<=0.0 || config.wall_buffer_weight<=0.0 {return 1.0;}
     // 私有新增支撑没有基础场单元时取有限中性值，仍受当前视图的近墙项与完整许可约束。
     let Some(id)=source.data.graph.cells.id(cell) else {return 1.0;};
@@ -146,12 +139,11 @@ mod tests {
             assert_eq!(refreshed.soft_traversal_multiplier(cell),first);
             assert!(Arc::ptr_eq(&field,&distances(&refreshed)));
             let private=map.with_current_body_support([0.05+time as f64*0.001,0.05,0.4],[0.0,0.0,0.0,1.0]).unwrap();
-            assert!(private.current_body_support.is_some());
             assert_eq!(private.soft_traversal_multiplier(cell),first);
-            let new_cell=private.locate_support([0.05,0.05,0.0]).unwrap().cell;
-            assert!(private.soft_traversal_multiplier(new_cell).is_finite());
+            assert_eq!(private.locate_support([0.05,0.05,0.0]),Err(SurfaceError::MissingSupport),
+                "query view cannot turn a missing column into observed ground");
             assert!(Arc::ptr_eq(&field,&distances(&private)));
-            assert_eq!(private.data.routing_cache.lock().unwrap().centering_builds,0);
+            assert_eq!(private.data.routing_cache.lock().unwrap().centering_builds,1);
         }
         assert_eq!(map.data.routing_cache.lock().unwrap().centering_builds,1,
             "重复查询、普通观察时刻和私有足迹都不得每拍全图构建");

@@ -68,7 +68,8 @@ fn half_meter_lidar_sphere_blind_start_has_bounded_ground_projection() {
     map.validate_body_motion(from,next,&[]).unwrap();
     let unknown=map.query_ground([5.,5.],0.05);
     assert_eq!(unknown.state,GroundQueryState::Unknown);
-    assert_eq!(map.body_pose_after_motion(([5.,5.,0.45],from.1),[5.01,5.],0.),Err(SurfaceError::UnknownGround));
+    assert_eq!(map.body_pose_after_motion(([5.,5.,0.45],from.1),[5.01,5.],0.).unwrap(),([5.01,5.,0.45],from.1));
+    assert_eq!(map.query_ground([5.01,5.],0.05).state,GroundQueryState::Unknown);
 }
 
 #[test]

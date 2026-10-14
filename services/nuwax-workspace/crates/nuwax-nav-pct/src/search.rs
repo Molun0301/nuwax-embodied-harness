@@ -1,4 +1,4 @@
-use crate::{distance, inside_boundary, Tomogram};
+use crate::{distance, inside_boundary, Tomogram, PlanningFailure};
 use std::{
     cmp::Ordering,
     collections::BinaryHeap,
@@ -34,6 +34,7 @@ impl Ord for Queue {
             .score
             .total_cmp(&self.score)
             .then_with(|| other.order.cmp(&self.order))
+            .then_with(|| other.id.cmp(&self.id))
     }
 }
 pub(crate) fn checkpoint(cancelled: Option<&AtomicBool>) -> Result<(), String> {
@@ -42,8 +43,67 @@ pub(crate) fn checkpoint(cancelled: Option<&AtomicBool>) -> Result<(), String> {
     }
     crate::cancellation::checkpoint()
 }
+/// A resource bound, not a terrain permission threshold. The default permits
+/// 65,536 lazily admitted states and expansions, including domain-edge revisits;
+/// callers may explicitly raise it and retry.
+/// Zero permits only a validated direct connection, with no A* state expansion.
+#[derive(Clone, Copy, Debug)]
+pub struct SearchLimits { pub max_states: usize }
+impl Default for SearchLimits { fn default() -> Self { Self { max_states: 65_536 } } }
+struct SearchState { reference: crate::reference::Reference, cost: f64, parent: usize }
+fn penalty_at(point: [f64; 3], p: &crate::RoutePenalty) -> f64 {
+    let d = distance(point, p.center);
+    if d < p.radius { p.weight * (1.0 - d / p.radius).powi(2) } else { 0.0 }
+}
+/// Finite initial domain with progressive growth; hard user/local boundaries do
+/// not grow. The padding is derived from the physical footprint, not resolution
+/// changes or an unrelated route-shortcut constant.
+struct SearchDomain { lo: [i32; 2], hi: [i32; 2], margin: i32, hard: bool, cropped: Option<[[i32; 2]; 2]> }
+impl SearchDomain {
+    fn new(map: &Tomogram, start: [f64; 3], goal: [f64; 3], boundary: &[[f64; 2]], radius: Option<f64>) -> Self {
+        let a = map.point_column(start); let b = map.point_column(goal);
+        let mut lo = [a[0].min(b[0]), a[1].min(b[1])];
+        let mut hi = [a[0].max(b[0]), a[1].max(b[1])];
+        if let Some([mlo, mhi]) = map.xy_bounds { for axis in 0..2 { lo[axis] = lo[axis].min(mlo[axis]); hi[axis] = hi[axis].max(mhi[axis]); } }
+        let margin = (map.clearance_radius.max(map.half_width).max(map.resolution) / map.resolution).ceil() as i32;
+        let mut result = Self { lo, hi, margin, hard: radius.is_some() || !boundary.is_empty(), cropped: None };
+        if !boundary.is_empty() {
+            for axis in 0..2 {
+                result.lo[axis] = (boundary.iter().map(|p|p[axis]).fold(f64::INFINITY,f64::min) / map.resolution).floor() as i32;
+                result.hi[axis] = (boundary.iter().map(|p|p[axis]).fold(f64::NEG_INFINITY,f64::max) / map.resolution).floor() as i32;
+            }
+        } else if let Some(radius) = radius {
+            for axis in 0..2 { result.lo[axis] = ((start[axis]-radius)/map.resolution).floor() as i32;
+                result.hi[axis] = ((start[axis]+radius)/map.resolution).floor() as i32; }
+        } else { result.expand(); }
+        if let Some((center, window_radius)) = map.window {
+            let usable = (window_radius - map.half_width - map.resolution * 0.5).max(0.0);
+            let lo = center.map(|v| ((v-usable)/map.resolution-0.5).ceil() as i32);
+            let hi = center.map(|v| ((v+usable)/map.resolution-0.5).floor() as i32);
+            if boundary.is_empty() && radius.is_none() {
+                result.lo = lo; result.hi = hi;
+            } else {
+                for axis in 0..2 { result.lo[axis] = result.lo[axis].max(lo[axis]); result.hi[axis] = result.hi[axis].min(hi[axis]); }
+            }
+            result.cropped = Some([lo,hi]); result.hard = true;
+        }
+        result
+    }
+    fn contains(&self, column: [i32; 2]) -> bool { (0..2).all(|i| column[i] >= self.lo[i] && column[i] <= self.hi[i]) }
+    fn inconclusive_edge(&self, column: [i32; 2]) -> bool {
+        !self.hard || self.cropped.is_some_and(|[lo,hi]|
+            (0..2).any(|axis| column[axis] < lo[axis] || column[axis] > hi[axis]))
+    }
+    fn expand(&mut self) { for axis in 0..2 { self.lo[axis] = self.lo[axis].saturating_sub(self.margin); self.hi[axis] = self.hi[axis].saturating_add(self.margin); } }
+    fn grow(&mut self) -> bool {
+        if self.hard { return false; }
+        let old = (self.lo, self.hi);
+        self.margin = self.margin.saturating_mul(2); self.expand();
+        old != (self.lo, self.hi)
+    }
+}
 impl Tomogram {
-    /// 起终点为支撑坐标；容差仅用于选择原目标球内的真实地面点。
+    /// 起终点为支撑参考坐标；缺测沿当前层参考延续，容差仍限定原三维目标。
     pub fn plan(
         &self,
         start: [f64; 3],
@@ -54,7 +114,7 @@ impl Tomogram {
     ) -> Result<Route, String> {
         self.plan_bounded(start, goal, tolerance, boundary, cancelled, None, &[])
     }
-    /// 局部绕障限制在机器人附近；全局调用不设置空间范围。
+    /// 局部绕障限制在机器人附近；全局请求使用渐进扩张的有限搜索域。
     pub fn plan_bounded(
         &self,
         start: [f64; 3],
@@ -66,9 +126,9 @@ impl Tomogram {
         penalties: &[crate::RoutePenalty],
     ) -> Result<Route, String> {
         checkpoint(cancelled)?;
-        let result = self.plan_bounded_impl(start, goal, tolerance, boundary, cancelled, radius, penalties, &|_, _| true);
+        let result = self.plan_bounded_impl(start, goal, tolerance, boundary, cancelled, radius, penalties, &|_, _| true, SearchLimits::default());
         checkpoint(cancelled)?;
-        result
+        result.map_err(|error|error.to_string())
     }
     /// Request-local guide restrictions without rebuilding or mutating the static tomogram.
     /// The predicate must also accept shortcuts and actual start/end connectors.
@@ -79,9 +139,23 @@ impl Tomogram {
         penalties: &[crate::RoutePenalty], accepts: &dyn Fn([f64; 3], [f64; 3]) -> bool,
     ) -> Result<Route, String> {
         checkpoint(cancelled)?;
-        let result = self.plan_bounded_impl(start, goal, tolerance, boundary, cancelled, radius, penalties, accepts);
+        let result = self.plan_bounded_impl(start, goal, tolerance, boundary, cancelled, radius, penalties, accepts, SearchLimits::default());
         checkpoint(cancelled)?;
-        result
+        result.map_err(|error|error.to_string())
+    }
+    /// Bounded filtered queries share the exact same admission as global routes.
+    /// Useful for candidate batches with a total owner-controlled work budget.
+    pub fn plan_bounded_with_segment_filter_and_limits(
+        &self, start: [f64; 3], goal: [f64; 3], tolerance: f64,
+        boundary: &[[f64; 2]], cancelled: Option<&AtomicBool>, radius: Option<f64>,
+        penalties: &[crate::RoutePenalty], accepts: &dyn Fn([f64; 3], [f64; 3]) -> bool,
+        limits: SearchLimits,
+    ) -> Result<Route, String> {
+        checkpoint(cancelled)?;
+        let result = self.plan_bounded_impl(start, goal, tolerance, boundary, cancelled, radius,
+            penalties, accepts, limits);
+        checkpoint(cancelled)?;
+        result.map_err(|error|error.to_string())
     }
     /// Explicit token convenience API; the legacy AtomicBool and scoped tokens both apply.
     pub fn plan_bounded_cancellable(
@@ -91,6 +165,41 @@ impl Tomogram {
     ) -> Result<Route, String> {
         crate::with_planning_cancellation(cancellation, ||
             self.plan_bounded(start, goal, tolerance, boundary, cancelled, radius, penalties))
+    }
+    /// Explicit per-request resource control. Exhaustion is inconclusive and
+    /// callers can retry with a larger budget; it never labels unknown as blocked.
+    pub fn plan_bounded_with_limits(
+        &self, start: [f64; 3], goal: [f64; 3], tolerance: f64,
+        boundary: &[[f64; 2]], cancelled: Option<&AtomicBool>, radius: Option<f64>,
+        penalties: &[crate::RoutePenalty], limits: SearchLimits,
+    ) -> Result<Route, String> {
+        checkpoint(cancelled)?;
+        let result = self.plan_bounded_impl(start, goal, tolerance, boundary, cancelled, radius,
+            penalties, &|_, _| true, limits);
+        checkpoint(cancelled)?;
+        result.map_err(|error|error.to_string())
+    }
+    /// Typed producer outcome for request owners that distinguish resource
+    /// limits from geometric/input failures without parsing diagnostic wording.
+    pub fn plan_bounded_with_limits_typed(
+        &self, start: [f64;3], goal: [f64;3], tolerance: f64,
+        boundary: &[[f64;2]], cancelled: Option<&AtomicBool>, radius: Option<f64>,
+        penalties: &[crate::RoutePenalty], limits: SearchLimits,
+    ) -> Result<Route,PlanningFailure> {
+        self.plan_bounded_with_segment_filter_and_limits_typed(start,goal,tolerance,boundary,
+            cancelled,radius,penalties,&|_,_|true,limits)
+    }
+    /// Typed equivalent of the filtered bounded compatibility query.
+    pub fn plan_bounded_with_segment_filter_and_limits_typed(
+        &self, start: [f64;3], goal: [f64;3], tolerance: f64,
+        boundary: &[[f64;2]], cancelled: Option<&AtomicBool>, radius: Option<f64>,
+        penalties: &[crate::RoutePenalty], accepts: &dyn Fn([f64;3],[f64;3])->bool,
+        limits: SearchLimits,
+    ) -> Result<Route,PlanningFailure> {
+        checkpoint(cancelled)?;
+        let result=self.plan_bounded_impl(start,goal,tolerance,boundary,cancelled,radius,penalties,accepts,limits);
+        checkpoint(cancelled)?;
+        result
     }
     fn plan_bounded_impl(
         &self,
@@ -102,148 +211,172 @@ impl Tomogram {
         radius: Option<f64>,
         penalties: &[crate::RoutePenalty],
         accepts: &dyn Fn([f64; 3], [f64; 3]) -> bool,
-    ) -> Result<Route, String> {
+        limits: SearchLimits,
+    ) -> Result<Route, PlanningFailure> {
         let began = std::time::Instant::now();
         if !start.into_iter().chain(goal).all(f64::is_finite)
-            || !tolerance.is_finite()
-            || tolerance < 0.0
-        {
-            return Err("层析起终点或到达容差无效".into());
+            || !tolerance.is_finite() || tolerance < 0.0
+            || radius.is_some_and(|r| !r.is_finite() || r <= 0.0)
+            || boundary.iter().flatten().any(|v| !v.is_finite()) {
+            return Err("层析起终点、范围或到达容差无效".into());
         }
         if !inside_boundary([start[0], start[1]], boundary) {
             return Err("层析起点不在任务边界内".into());
         }
-        let from = self
-            .cell_at(start)
-            .or_else(|| self.nearest(start, self.resolution * 2.0))
-            .ok_or("当前位姿附近没有层析地面")?;
-        let mut targets = Vec::new();
-        if let Some(id) = self.cell_at(goal) {
-            let point = [goal[0], goal[1], self.cells[id].ground];
-            if distance(point, goal) <= tolerance + 1e-6
-                && inside_boundary([point[0], point[1]], boundary)
-            {
-                targets.push((id, point));
-            }
+        if !self.reference_inside_window([start[0],start[1]]) {
+            return Err(PlanningFailure::SearchDomainLimited("起点超出本次地图物化范围；未证明物理无路".into()));
         }
-        let [gx, gy] = [
-            (goal[0] / self.resolution).floor() as i32,
-            (goal[1] / self.resolution).floor() as i32,
-        ];
-        let r = (tolerance / self.resolution).ceil() as i32;
-        for x in gx - r..=gx + r {
+        let initial = self.reference_start(start).ok_or("层析起点存在已知障碍或不兼容地形")?;
+        let goal_column = self.point_column(goal);
+        let initial_height = self.reference_position(initial)[2];
+        let [low, high] = self.ground_bounds.unwrap_or([initial_height; 2]);
+        if goal[2] + tolerance + 1e-6 < low.min(initial_height)
+            || goal[2] - tolerance - 1e-6 > high.max(initial_height) {
+            // Every reachable height is either an observed cell reference or
+            // inherited from one/start. No unknown node can invent a new height.
+            // A crop can conclude only that its own reference domain is limited.
+            return Err(if self.window.is_some() {
+                PlanningFailure::SearchDomainLimited("本次地图物化范围未覆盖目标高程参考；范围外地形尚未检查".into())
+            } else {
+                PlanningFailure::Other("UnsupportedReferenceHeight: 当前标定及已知地形没有覆盖目标高程；缺测不能生成新楼层".into())
+            });
+        }
+        // Unknown endpoints inherit the current reference. The requested goal z
+        // remains an arrival constraint, never evidence for a second floor.
+        let direct_height = self.cell_at(goal).map(|id| self.cells[id].ground).unwrap_or(initial_height);
+        let direct = [goal[0], goal[1], direct_height];
+        if distance(direct, goal) <= tolerance + 1e-6
+            && radius.is_none_or(|r| (direct[0] - start[0]).hypot(direct[1] - start[1]) <= r)
+            && penalties.is_empty() && accepts(start, direct)
+            && self.reference_segment_evidence(start, direct, boundary, cancelled)
+                .is_some_and(|(cost, observed)| limits.max_states == 0 || !observed || cost <= distance(start, direct) + 1e-6) {
             checkpoint(cancelled)?;
-            for y in gy - r..=gy + r {
-                checkpoint(cancelled)?;
-                if let Some(ids) = self.columns.get(&[x, y]) {
-                    for &id in ids {
-                        checkpoint(cancelled)?;
-                        let point = self.position(id);
-                        if distance(point, goal) <= tolerance + 1e-6
-                            && inside_boundary([point[0], point[1]], boundary)
-                        {
-                            targets.push((id, point));
-                        }
-                    }
-                }
-            }
+            return Ok(Route { points: if distance(start, direct) <= 1e-6 { vec![start] } else { vec![start, direct] },
+                stats: SearchStats { expanded: 0, elapsed_ms: began.elapsed().as_secs_f64() * 1000.0,
+                    cells: self.cells.len() } });
         }
-        checkpoint(cancelled)?;
-        targets.sort_unstable_by(|a, b| {
-            distance(a.1, goal)
-                .total_cmp(&distance(b.1, goal))
-                .then_with(|| a.0.cmp(&b.0))
-        });
-        checkpoint(cancelled)?;
-        if targets.is_empty() {
-            return Err("原目标到达范围内没有层析地面".into());
+        if limits.max_states == 0 {
+            return Err(PlanningFailure::BudgetExhausted("快速检查仅验证直连接续，绕行或局部代价需要完整搜索；未证明无路".into()));
         }
-        let mut ends = ahash::AHashMap::new();
-        for (id, p) in targets {
-            checkpoint(cancelled)?;
-            ends.entry(id).or_insert(p);
-        }
-        let heuristic = |id| (distance(self.position(id), goal) - tolerance).max(0.0);
-        let order = |id: usize| {
-            let cell = &self.cells[id];
-            [cell.column[0], cell.column[1], cell.layer]
+        let mut domain = SearchDomain::new(self, start, goal, boundary, radius);
+        let order = |reference| {
+            let column = self.reference_column(reference);
+            [column[0], column[1], (self.reference_position(reference)[2] / self.body_height.max(self.resolution)).floor() as i32]
         };
-        let mut costs = vec![f64::INFINITY; self.cells.len()];
-        let mut parents = vec![usize::MAX; self.cells.len()];
+        let heuristic = |reference| (distance(self.reference_position(reference), goal) - tolerance).max(0.0) * self.minimum_cost;
+        let mut states = vec![SearchState { reference: initial, cost: 0.0, parent: usize::MAX }];
+        let mut indexes = ahash::AHashMap::new();
+        indexes.insert(initial, 0);
         let mut queue = BinaryHeap::new();
-        costs[from] = 0.0;
-        queue.push(Queue {
-            score: heuristic(from),
-            cost: 0.0,
-            id: from,
-            order: order(from),
-        });
+        queue.push(Queue { score: heuristic(initial), cost: 0.0, id: 0, order: order(initial) });
+        let mut edge_states: ahash::AHashSet<usize> = ahash::AHashSet::new();
         let mut expanded = 0;
+        let mut radius_clipped = false;
         let mut best: Option<(usize, [f64; 3], f64)> = None;
-        while let Some(Queue {
-            cost, id, score, ..
-        }) = queue.pop()
-        {
+        'search: loop {
             checkpoint(cancelled)?;
-            if cost > costs[id] {
+            let Some(Queue { cost, id, score, .. }) = queue.pop() else {
+                if best.is_some() || edge_states.is_empty() || !domain.grow() { break; }
+                // Continue the same search, retaining every admitted state/cost.
+                // Only states clipped by the previous artificial edge are revisited.
+                for id in edge_states.drain() {
+                    let state = &states[id];
+                    queue.push(Queue { score: state.cost + heuristic(state.reference), cost: state.cost,
+                        id, order: order(state.reference) });
+                }
                 continue;
-            }
-            if best.is_some_and(|(_, _, total)| score >= total) {
-                break;
+            };
+            if cost > states[id].cost { continue; }
+            if best.is_some_and(|(_, _, total)| score >= total) { break; }
+            if expanded >= limits.max_states {
+                if best.is_some() { break; }
+                return Err(PlanningFailure::BudgetExhausted(format!("层析请求展开工作预算耗尽（展开{expanded}格，状态{}，上限{}）；未证明无路",
+                    states.len(), limits.max_states)));
             }
             expanded += 1;
-            if let Some(&endpoint) = ends.get(&id).filter(|&&endpoint|
-                accepts(if id == from { start } else { self.position(id) }, endpoint)) {
-                // 终端代价偏好到达区域内部，避免每次都停在容差球的数值边缘。
-                let total = cost + 2.0 * distance(endpoint, goal);
-                if best.is_none_or(|(_, _, old)| total < old) {
-                    best = Some((id, endpoint, total));
+            let from = states[id].reference;
+            let a = self.reference_position(from);
+            let actual_a = if id == 0 { start } else { a };
+            let precise = (self.reference_column(from) == goal_column)
+                .then_some([goal[0], goal[1], a[2]]);
+            // Keep the cell-center arrival candidate as well: the exact goal XY
+            // can be just outside a boundary while its arrival ball overlaps it.
+            let center = if precise.is_some_and(|p| distance(p,a) <= 1e-6) { None } else { Some(a) };
+            for candidate in [center, precise].into_iter().flatten() {
+                if distance(candidate, goal) <= tolerance + 1e-6
+                    && radius.is_none_or(|r| (candidate[0] - start[0]).hypot(candidate[1] - start[1]) <= r)
+                    && accepts(actual_a, candidate)
+                    && self.reference_segment(actual_a, candidate, boundary, cancelled).is_some() {
+                    let total = cost + 2.0 * distance(candidate, goal);
+                    if best.is_none_or(|(_, _, old)| total < old) { best = Some((id, candidate, total)); }
                 }
             }
-            let a = self.position(id);
-            for &next in &self.cells[id].neighbors {
+            let column = self.reference_column(from);
+            for dx in -1..=1 { for dy in -1..=1 {
                 checkpoint(cancelled)?;
-                let b = self.position(next);
-                if !crate::segment_inside_boundary([a[0], a[1]], [b[0], b[1]], boundary)
-                    || radius.is_some_and(|r| (b[0] - start[0]).hypot(b[1] - start[1]) > r)
-                    || !accepts(if id == from { start } else { a }, b)
-                {
-                    continue;
+                if dx == 0 && dy == 0 { continue; }
+                let Some(x) = column[0].checked_add(dx) else { continue; };
+                let Some(y) = column[1].checked_add(dy) else { continue; };
+                let xy = [x,y].map(|v|(f64::from(v)+0.5)*self.resolution);
+                if !crate::segment_inside_boundary([actual_a[0], actual_a[1]], xy, boundary) { continue; }
+                let outside_radius = radius.is_some_and(|r| (xy[0]-start[0]).hypot(xy[1]-start[1]) > r);
+                if !domain.contains([x,y]) {
+                    if domain.inconclusive_edge([x,y]) {
+                        // Unmaterialized cells remain uninspected, never unknown.
+                        edge_states.insert(id);continue;
+                    }
+                    if !outside_radius { continue; }
                 }
-                let local_cost = penalties
-                    .iter()
-                    .map(|p| {
-                        let d = distance(b, p.center);
-                        if d < p.radius {
-                            p.weight * (1.0 - d / p.radius).powi(2)
-                        } else {
-                            0.0
+                let Some(next) = self.reference_neighbor(from, [x, y]) else { continue; };
+                let b = self.reference_position(next);
+                if !accepts(actual_a, b) { continue; }
+                // The real start connector may cross more than one grid edge.
+                if id == 0 && self.reference_segment(start, b, boundary, cancelled).is_none() { continue; }
+                if outside_radius {
+                    // Only an otherwise admissible successor establishes an
+                    // artificial horizon cutoff. A wall/forbidden/physical-boundary
+                    // enclosure remains a geometric conclusion inside the disk.
+                    radius_clipped = true;continue;
+                }
+                let local_cost = penalties.iter().map(|p| penalty_at(b, p)).sum::<f64>();
+                let next_cost = cost + distance(a, b)
+                    * ((self.reference_cost(from) + self.reference_cost(next)) * 0.5 + local_cost);
+                let next_id = match indexes.get(&next).copied() {
+                    Some(id) => id,
+                    None => {
+                        if states.len() >= limits.max_states {
+                            if best.is_some() { break 'search; }
+                            return Err(PlanningFailure::BudgetExhausted(format!("层析请求状态预算耗尽（展开{expanded}格，状态{}，上限{}）；未证明无路",
+                                states.len(), limits.max_states)));
                         }
-                    })
-                    .sum::<f64>();
-                let next_cost = cost
-                    + distance(a, b)
-                        * ((self.cells[id].cost + self.cells[next].cost) * 0.5 + local_cost);
-                if next_cost < costs[next] {
-                    costs[next] = next_cost;
-                    parents[next] = id;
-                    queue.push(Queue {
-                        score: next_cost + heuristic(next),
-                        cost: next_cost,
-                        id: next,
-                        order: order(next),
-                    });
+                        let id = states.len();
+                        states.push(SearchState { reference: next, cost: f64::INFINITY, parent: usize::MAX });
+                        indexes.insert(next, id);
+                        id
+                    }
+                };
+                if next_cost < states[next_id].cost {
+                    states[next_id].cost = next_cost;
+                    states[next_id].parent = id;
+                    if queue.len() >= limits.max_states {
+                        queue.retain(|entry| entry.cost == states[entry.id].cost);
+                        checkpoint(cancelled)?;
+                    }
+                    queue.push(Queue { score: next_cost + heuristic(next), cost: next_cost,
+                        id: next_id, order: order(next) });
                 }
-            }
+            }}
         }
         let Some((id, endpoint, _)) = best else {
-            return Err(format!("层析地面之间没有可连接路线（展开{expanded}格）"));
+            return Err(if !edge_states.is_empty() || radius_clipped {
+                PlanningFailure::SearchDomainLimited(format!("层析搜索范围已耗尽（展开{expanded}格）；未证明物理无路"))
+            } else { PlanningFailure::Other(format!("层析参考在请求范围内没有可连接路线（展开{expanded}格）")) });
         };
         let mut ids = vec![id];
         let mut current = id;
-        while current != from {
+        while current != 0 {
             checkpoint(cancelled)?;
-            current = parents[current];
+            current = states[current].parent;
             ids.push(current);
         }
         ids.reverse();
@@ -251,22 +384,13 @@ impl Tomogram {
         points.push(start);
         for id in ids.into_iter().skip(1) {
             checkpoint(cancelled)?;
-            let p = self.position(id);
-            if distance(*points.last().unwrap(), p) > 1e-6 {
-                points.push(p);
-            }
+            let p = self.reference_position(states[id].reference);
+            if distance(*points.last().unwrap(), p) > 1e-6 { points.push(p); }
         }
-        if distance(*points.last().unwrap(), endpoint) > 1e-6 {
-            points.push(endpoint);
-        }
-        let mut stats = SearchStats {
-            expanded,
-            elapsed_ms: 0.0,
-            cells: self.cells.len(),
-        };
+        if distance(*points.last().unwrap(), endpoint) > 1e-6 { points.push(endpoint); }
         let points = self.reduce(points, boundary, penalties, cancelled, accepts)?;
-        stats.elapsed_ms = began.elapsed().as_secs_f64() * 1000.0;
-        Ok(Route { points, stats })
+        Ok(Route { points, stats: SearchStats { expanded,
+            elapsed_ms: began.elapsed().as_secs_f64() * 1000.0, cells: self.cells.len() } })
     }
 
     fn segment_cost(
@@ -279,33 +403,22 @@ impl Tomogram {
         accepts: &dyn Fn([f64; 3], [f64; 3]) -> bool,
     ) -> Option<f64> {
         if !accepts(a, b) || !crate::segment_inside_boundary([a[0], a[1]], [b[0], b[1]], boundary)
-            || !self.segment_clear_cancelled(a, b, boundary, cancelled)
         {
             return None;
         }
+        let base = self.reference_segment(a, b, boundary, cancelled)?;
         let length = distance(a, b);
         let n = (length / (self.resolution * 0.5)).ceil().max(1.0) as usize;
-        let mut sum = 0.0;
+        let mut extra = 0.0;
         for i in 0..n {
             checkpoint(cancelled).ok()?;
             let t = (i as f64 + 0.5) / n as f64;
             let point = std::array::from_fn(|j| a[j] + t * (b[j] - a[j]));
-            let id = self.cell_at(point)?;
-            let penalty = penalties
-                .iter()
-                .map(|p| {
-                    let d = distance(point, p.center);
-                    if d < p.radius {
-                        p.weight * (1.0 - d / p.radius).powi(2)
-                    } else {
-                        0.0
-                    }
-                })
-                .sum::<f64>();
-            sum += (self.cells[id].cost + penalty) * length / n as f64;
+            extra += penalties.iter().map(|p| penalty_at(point, p)).sum::<f64>() * length / n as f64;
         }
-        Some(sum)
+        Some(base + extra)
     }
+
     fn reduce(
         &self,
         points: Vec<[f64; 3]>,
@@ -321,9 +434,10 @@ impl Tomogram {
         let mut prefix = vec![0.0];
         for pair in points.windows(2) {
             checkpoint(cancelled)?;
-            let cost = self
-                .segment_cost(pair[0], pair[1], boundary, penalties, cancelled, accepts)
-                .unwrap_or_else(|| distance(pair[0], pair[1]));
+            let Some(cost) = self.segment_cost(pair[0], pair[1], boundary, penalties, cancelled, accepts) else {
+                checkpoint(cancelled)?;
+                return Err("层析参考相邻段未通过一致的障碍/地形验证".into());
+            };
             prefix.push(prefix.last().unwrap() + cost);
         }
         let mut output = vec![points[0]];
@@ -446,10 +560,10 @@ mod tests {
             .is_err());
     }
     #[test]
-    fn missing_ground_is_not_interpolated_and_cancellation_is_observed() {
+    fn missing_ground_uses_reference_without_map_interpolation_and_observes_cancellation() {
         assert!(map(true)
             .plan([0.05, 0.05, 0.0], [8.05, 0.05, 0.0], 0.05, &[], None)
-            .is_err());
+            .is_ok());
         assert!(map(false)
             .plan(
                 [0.05, 0.05, 0.0],
@@ -476,6 +590,9 @@ mod tests {
             .plan([0.05, 0.05, 0.0], [11.05, 0.05, 2.2], 0.05, &[], None)
             .unwrap();
         assert!(path.points.last().unwrap()[2] > 2.0);
+        eprintln!("ramp_reference expanded={} known_cells={} elapsed_ms={} points={} unknown_points={}",
+            path.stats.expanded,map.cells.len(),path.stats.elapsed_ms,path.points.len(),
+            path.points.iter().filter(|&&p|map.cell_at(p).is_none()).count());
         assert!(path.stats.expanded < map.cells.len());
     }
     #[test]

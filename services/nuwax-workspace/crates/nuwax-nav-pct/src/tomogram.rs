@@ -25,9 +25,18 @@ pub struct Cell {
 #[derive(Debug)]
 pub struct Tomogram {
     pub resolution: f64,
+    pub(crate) source_quantum: f64,
     pub cells: Vec<Cell>,
     pub(crate) columns: AHashMap<[i32; 2], Vec<usize>>,
     known_columns: AHashSet<[i32; 2]>,
+    /// Physical occupancy survives even when no walkable floor cell is produced.
+    pub(crate) occupancy: AHashMap<[i32; 2], Vec<[f64; 2]>>,
+    pub(crate) xy_bounds: Option<[[i32; 2]; 2]>,
+    pub(crate) ground_bounds: Option<[f64; 2]>,
+    pub(crate) minimum_cost: f64,
+    pub(crate) window: Option<([f64; 2], f64)>,
+    #[cfg(feature = "mls-adapter")]
+    pub(crate) source: Option<SurfaceSnapshot>,
     pub(crate) step_up: f64,
     pub(crate) step_down: f64,
     pub(crate) slope: f64,
@@ -36,6 +45,14 @@ pub struct Tomogram {
     pub(crate) clearance_radius: f64,
 }
 impl Tomogram {
+    /// Admit a background-prepared full static reference only for the exact
+    /// immutable geometry/configuration it represents. Receipt/recent occupancy
+    /// remain current-source execution checks, never cache permission.
+    #[cfg(feature = "mls-adapter")]
+    pub fn matches_surface(&self, source: &SurfaceSnapshot) -> bool {
+        self.window.is_none() && self.source.as_ref()
+            .is_some_and(|prepared|crate::same_source_geometry(prepared,source))
+    }
     #[cfg(feature = "mls-adapter")]
     pub fn from_surface(source: &SurfaceSnapshot) -> Result<Self, String> {
         Self::from_surface_window(source, None)
@@ -82,7 +99,7 @@ impl Tomogram {
         checkpoint()?;
         let (resolution, columns) = source.navigation_source_columns(window);
         checkpoint()?;
-        let result = Self::from_columns_with_layers(
+        let mut result = Self::from_columns_with_layers(
             resolution,
             f64::from(source.source_voxel_size_m()),
             columns.take_while(|_| !crate::planning_cancelled()).map(|(column, mut bands)| {
@@ -99,6 +116,10 @@ impl Tomogram {
             source.ground_evidence()==nuwax_nav_mls_planner::surface::GroundEvidence::OccupiedVolume,
             |column,bands|source.navigation_measured_ground_layers(column,resolution,bands),
         )?;
+        // Cheap immutable snapshot sharing also preserves masks in never-observed
+        // columns. Absence from the sparse cell graph is not mask permission.
+        result.source = Some(source.clone());
+        result.window = window;
         checkpoint()?;
         Ok(result)
     }
@@ -196,9 +217,17 @@ impl Tomogram {
         }
         let mut map = Self {
             resolution,
+            source_quantum,
             cells: Vec::new(),
             columns: AHashMap::new(),
             known_columns: AHashSet::new(),
+            occupancy: AHashMap::new(),
+            xy_bounds: None,
+            ground_bounds: None,
+            minimum_cost: crate::reference::UNKNOWN_COST,
+            window: None,
+            #[cfg(feature = "mls-adapter")]
+            source: None,
             step_up,
             step_down,
             slope: max_slope_deg.to_radians().tan(),
@@ -211,6 +240,13 @@ impl Tomogram {
         for (column, mut bands) in columns {
             checkpoint()?;
             map.known_columns.insert(column);
+            match &mut map.xy_bounds {
+                Some([lo, hi]) => for axis in 0..2 {
+                    lo[axis] = lo[axis].min(column[axis]);
+                    hi[axis] = hi[axis].max(column[axis]);
+                },
+                bounds @ None => *bounds = Some([column, column]),
+            }
             bands.retain(|b| b[0].is_finite() && b[1].is_finite() && b[0] < b[1]);
             bands.sort_unstable_by(|a, b| a[0].total_cmp(&b[0]));
             let mut merged: Vec<[f64; 2]> = Vec::new();
@@ -231,11 +267,16 @@ impl Tomogram {
                     (layer,ceiling)
                 }).collect()
             });
+            map.occupancy.insert(column, merged);
             for (layer,ceiling) in layers {
                 checkpoint()?;
                 let ground=layer.representative_z;
                 if ceiling - ground + 1e-6 < body_height {
                     continue;
+                }
+                match &mut map.ground_bounds {
+                    Some([lo, hi]) => { *lo = lo.min(ground); *hi = hi.max(ground); }
+                    bounds @ None => *bounds = Some([ground, ground]),
                 }
                 let id = map.cells.len();
                 map.cells.push(Cell {
@@ -254,9 +295,6 @@ impl Tomogram {
             }
         }
         checkpoint()?;
-        if map.cells.is_empty() {
-            return Err("层析地图没有可用地面".into());
-        }
         map.connect()?;
         map.compute_costs()?;
         checkpoint()?;
@@ -390,6 +428,7 @@ impl Tomogram {
         Ok(())
     }
     fn compute_costs(&mut self) -> Result<(), String> {
+        self.minimum_cost = crate::reference::UNKNOWN_COST;
         let mut walls = VecDeque::new();
         let mut unknown = VecDeque::new();
         for id in 0..self.cells.len() {
@@ -470,9 +509,10 @@ impl Tomogram {
             let c = &self.cells[id];
             let preferred = self.clearance_radius.max(self.half_width) + self.resolution;
             let wall = preferred / (c.clearance + self.resolution * 0.5);
-            // 未测列仍不能作为路径单元，但稀疏采样边缘不冒充实体墙做强膨胀。
+            // 缺测仅保留软偏好；搜索用请求局部参考穿越，不伪造地图地面。
             let unknown = ((preferred - c.support_clearance) / preferred).clamp(0.0, 1.0);
             self.cells[id].cost = 1.0 + wall * wall + 3.0 * unknown * unknown + terrain[id];
+            self.minimum_cost = self.minimum_cost.min(self.cells[id].cost);
         }
         checkpoint()?;
         Ok(())
@@ -485,31 +525,7 @@ impl Tomogram {
         &self, a: [f64; 3], b: [f64; 3], boundary: &[[f64; 2]],
         cancelled: Option<&std::sync::atomic::AtomicBool>,
     ) -> bool {
-        if !a.into_iter().chain(b).all(f64::is_finite) {
-            return false;
-        }
-        let n = ((a[0] - b[0]).hypot(a[1] - b[1]) / (self.resolution * 0.4))
-            .ceil()
-            .max(1.0) as usize;
-        let mut previous: Option<usize> = None;
-        for i in 0..=n {
-            if crate::planning_cancelled() || cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) { return false; }
-            let t = i as f64 / n as f64;
-            let p = std::array::from_fn(|j| a[j] + t * (b[j] - a[j]));
-            if !crate::inside_boundary([p[0], p[1]], boundary) {
-                return false;
-            }
-            let Some(id) = self.cell_at(p) else {
-                return false;
-            };
-            if let Some(old) = previous {
-                if old != id && !self.cells[old].neighbors.contains(&id) {
-                    return false;
-                }
-            }
-            previous = Some(id);
-        }
-        true
+        self.reference_segment(a, b, boundary, cancelled).is_some()
     }
 }
 
@@ -789,5 +805,34 @@ mod measured_layer_adapter_tests {
         let forbidden=measured.with_virtual_obstacles([-1.0,-1.0],0.05,40,40,&mask).unwrap();
         let masked=Tomogram::from_surface(&forbidden).unwrap();
         assert!(!masked.columns.contains_key(&[0,0]),"measured metadata cannot resurrect forbidden columns");
+    }
+}
+
+#[cfg(test)]
+mod unclassified_reference_tests {
+    use super::*;
+    #[test]
+    fn raw_below_body_occupancy_without_a_ground_candidate_is_not_known_drop() {
+        let build = |band| Tomogram::from_columns_with_layers(0.1,0.1,
+            [([1,0],vec![band])],0.4,0.0,0.1,0.1,20.0,0.0,false,
+            |_,_|Some(Vec::new())).unwrap();
+        let unclassified = build([-0.6,-0.5]);
+        assert!(unclassified.cells.is_empty());
+        assert!(unclassified.segment_clear([0.05,0.05,0.0],[0.25,0.05,0.0],&[]));
+        assert!(unclassified.cells.is_empty(),"reference must not create a GroundLayer");
+        let obstacle = build([0.1,0.3]);
+        assert!(!obstacle.segment_clear([0.05,0.05,0.0],[0.25,0.05,0.0],&[]));
+        let known_lower = Tomogram::from_columns(0.1,[([1,0],vec![[-0.6,-0.5]])],
+            0.4,0.0,0.1,0.1,20.0).unwrap();
+        assert!(!known_lower.segment_clear([0.05,0.05,0.0],[0.25,0.05,0.0],&[]));
+    }
+    #[test]
+    fn legacy_floor_without_measured_layer_metadata_remains_a_reference_only() {
+        let map = Tomogram::from_columns(0.1,[([1,0],vec![[-0.2,-0.1]])],
+            0.4,0.0,0.1,0.1,20.0).unwrap();
+        assert_eq!(map.cells[0].ground_approximation,GroundApproximation::LegacyContactInterval);
+        let route = map.plan([0.05,0.05,-0.1],[0.25,0.05,-0.1],0.0,&[],None).unwrap();
+        assert!(route.points.windows(2).all(|p|map.segment_clear(p[0],p[1],&[])));
+        assert_eq!(map.cells.len(),1);
     }
 }

@@ -502,7 +502,7 @@ mod scheduler_detour_cancellation {
         }
         handle
             .update_obstacle_source(
-                Some(ExecutionMap::SurfaceUpdate(SurfaceMapUpdate {
+                Some(ExecutionMap::SurfaceUpdate(SurfaceMapUpdate {planar_reference:None,
                     snapshot: next,
                     change_basis: Some(previous),
                     changes: Arc::new(SurfaceGeometryChanges::Empty),

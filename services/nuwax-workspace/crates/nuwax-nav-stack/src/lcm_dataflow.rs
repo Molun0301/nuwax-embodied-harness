@@ -1864,13 +1864,14 @@ where
                                 continue;
                             }
                         };
-                        let surface=recent_source.attach_terrain(surface);
+                        let surface=recent_source.attach_terrain(surface, update.planar_reference.clone());
                         (
                             OwnerInput::Accepted(GuardedCostmapInput {
                                 map_frame: update.authority.committed_map.frame_id.clone(),
                                 observation: nuwax_nav_runtime::CostmapObservation {
                                     costmap: nuwax_nav_runtime::ExecutionMap::SurfaceUpdate(nuwax_nav_runtime::surface_changes::SurfaceMapUpdate {
                                         snapshot: surface, change_basis: update.change_basis, changes: update.geometry_changes,
+                                        planar_reference: update.planar_reference,
                                     }),
                                     source_timestamp_ns: update.source_timestamp_ns,
                                 },

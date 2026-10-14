@@ -76,6 +76,40 @@ impl SurfaceSnapshot {
         Ok(self.frontier_index(boundary).stats)
     }
 
+    /// Exact planning inputs for retaining a frontier search's resource stage.
+    /// Observation receipt metadata alone does not restart work; terrain, body,
+    /// masks and the independently retained recent-obstacle view still do.
+    pub fn same_frontier_query_geometry(&self, other: &Self) -> bool {
+        self.same_geometry(other)
+            && match (&self.observations, &other.observations) {
+                (Some(a), Some(b)) => a.same_geometry(b),
+                (None, None) => true,
+                _ => false,
+            }
+            && match (&self.recent_obstacles, &other.recent_obstacles) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+
+    /// Geometric viewpoint seeds only. Reachability must be checked by the active
+    /// planner; absence of an observed start cell does not invalidate this query.
+    pub fn frontier_candidates(
+        &self,
+        boundary: &[[f64; 2]],
+    ) -> Result<Vec<SurfaceFrontier>, SurfaceError> {
+        validate_boundary(boundary)?;
+        Ok(self.frontier_index(boundary).gains.iter().map(|(&cell, &gain)| {
+            SurfaceFrontier {
+                support_xyz: self.cell_position(cell),
+                gain,
+                travel_cost: f64::INFINITY,
+                cell,
+            }
+        }).collect())
+    }
+
     /// 只读取已完成计算的统计；等待下一次查询的局部更新返回空。
     pub fn frontier_cache_stats(&self) -> Option<SurfaceFrontierCacheStats> {
         self.data
@@ -334,7 +368,11 @@ impl SurfaceSnapshot {
     fn frontier_unknown_cells(&self, cell: VoxelKey, boundary: &[[f64; 2]]) -> AHashSet<VoxelKey> {
         let lookahead = self.frontier_lookahead();
         let mut unknown = AHashSet::new();
-        if !self.cell_is_clear(cell) {
+        // Discovery records possible information gain, not graph-clearance
+        // permission. Consumers must establish an actual route/body sweep.
+        let origin = self.cell_position(cell);
+        if !inside_boundary([origin[0], origin[1]], boundary)
+            || !self.navigation_column_allowed([cell.0, cell.1], f64::from(self.config().voxel_size)) {
             return unknown;
         }
         for (dx, dy) in DIRECTIONS {
@@ -345,7 +383,7 @@ impl SurfaceSnapshot {
                     !mask.permits_cell(
                         (nx, ny, current.2),
                         f64::from(self.config().voxel_size),
-                        f64::from(self.config().wall_clearance_m),
+                        0.0,
                     )
                 }) {
                     break;

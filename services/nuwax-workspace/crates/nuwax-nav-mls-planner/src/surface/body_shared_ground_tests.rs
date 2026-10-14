@@ -132,3 +132,50 @@ fn partial_fine_cell_does_not_clear_unassigned_coarse_obstacle_height() {
     assert_eq!(map.check_unassigned_body_column(body,r,&polygon,&prism,0,0,&mut witness),Err(SurfaceError::InsufficientClearance));
     assert!(matches!(witness,Some(BodyRejection::Occupancy{source:OccupancySource::CoarseFallback,..})));
 }
+
+#[test]
+fn measured_contact_members_do_not_require_a_connected_ground_anchor() {
+    use nuwax_map_chunks::{LayerObservation, LayerObservations, LayerSample, block_key, local_key};
+    let floor=[5,0,-1];
+    let point=[0.275,0.025,-0.025];
+    let mut cfg=scene(&[],false).config().clone();cfg.wall_clearance_m=0.4;
+    let mut envelope=model();envelope.z_bounds_m=[-0.45,0.25];
+    let mut observations=SurfaceObservations::new(0.05,32).unwrap();
+    observations.replace_block(block_key(floor),std::collections::BTreeMap::from([
+        (floor,SurfaceObservation{observed_ns:100,hits:1})])).unwrap();
+    let local=local_key(floor);
+    let layers=LayerObservations::from([(local,LayerObservation {
+        members:vec![local],normal:[0.0,0.0,1.0],plane_origin:point,
+        samples:vec![LayerSample{point,source_sequence:1,source_timestamp_ns:100,point_index:0}],
+    })]);
+    observations.replace_ground_layers(block_key(floor),Arc::new(layers)).unwrap();
+    observations.mark_complete_geometry_source();
+    let points=[(point[0] as f32,point[1] as f32,point[2] as f32)];
+    let map=SurfaceSnapshot::from_points(&points,cfg,0.05).unwrap()
+        .with_body_envelope(envelope).unwrap().with_observations(Some(Arc::new(observations)));
+    let pose=([0.025,0.025,0.4],[0.0,0.0,0.0,1.0]);
+    assert_eq!(map.locate_support_from_body(pose.0,pose.1,0.4),Err(SurfaceError::MissingSupport));
+    map.validate_body_pose(pose.0,pose.1).unwrap();
+    let view=map.with_current_body_support(pose.0,pose.1).unwrap();
+    assert!(view.same_body_query_view(&map));
+    assert_eq!(view.query_ground([pose.0[0],pose.0[1]],0.0).state,GroundQueryState::Unknown);
+    assert!(view.observations.as_ref().unwrap().get(floor).is_some());
+    // The accepted floor does not grant contact to a new recent object in its column.
+    let blocked=map.with_recent_obstacle_points(1,100,0,&[],[(0,[point[0],point[1],0.35])]).unwrap();
+    assert_eq!(blocked.validate_body_pose(pose.0,pose.1),Err(SurfaceError::InsufficientClearance));
+}
+
+#[test]
+fn unknown_motion_keeps_current_reference_and_factual_unknown_state() {
+    let map=scene(&[],false);
+    let pose=([4.05,0.05,0.5],[0.0,0.0,0.0,1.0]);
+    assert_eq!(map.query_ground([4.05,0.05],0.1).state,GroundQueryState::Unknown);
+    let next=map.body_pose_after_motion(pose,[4.35,0.05],0.25).unwrap();
+    assert_eq!(next.0,[4.35,0.05,0.5]);
+    assert!((rotation(next.1).unwrap()[0][1].atan2(rotation(next.1).unwrap()[0][0])-0.25).abs()<1e-10);
+    map.validate_body_motion(pose,next,&[]).unwrap();
+    assert_eq!(map.query_ground([4.35,0.05],0.1).state,GroundQueryState::Unknown);
+    assert!(map.locate_support([4.35,0.05,0.1]).is_err());
+    let blocked=map.with_recent_obstacle_points(1,100,0,&[],[(0,[4.2,0.05,0.55])]).unwrap();
+    assert_eq!(blocked.validate_body_motion(pose,next,&[]),Err(SurfaceError::InsufficientClearance));
+}

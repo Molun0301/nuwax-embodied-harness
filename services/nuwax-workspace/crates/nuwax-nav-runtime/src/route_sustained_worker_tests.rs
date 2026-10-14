@@ -250,7 +250,7 @@ fn sustained(enabled:bool,short:bool) {
                     Arc::new(frame.map.with_recent_obstacle_points(u64::from(sequence),source_ns,0,&[],[(0,[4.5+sign*0.01,0.5,0.5])]).unwrap())
                 }else{frame.map};
                 assert!(nuwax_nav_pct::same_source_geometry(&map,&next));
-                worker.update_execution_map(ExecutionMap::SurfaceUpdate(SurfaceMapUpdate{snapshot:next.clone(),change_basis:Some(map.clone()),changes:Arc::new(SurfaceGeometryChanges::Empty)})).unwrap();
+                worker.update_execution_map(ExecutionMap::SurfaceUpdate(SurfaceMapUpdate{planar_reference:None,snapshot:next.clone(),change_basis:Some(map.clone()),changes:Arc::new(SurfaceGeometryChanges::Empty)})).unwrap();
                 map=next;
             }
             if now>=next_pose {

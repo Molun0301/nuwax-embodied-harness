@@ -7,6 +7,10 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 
 type BodyPose = ([f64; 3], [f64; 4]);
 
+#[path = "surface_oriented_reference.rs"]
+mod reference;
+pub use reference::{plan_reference_cancellable, plan_reference_typed, with_owner_cancellation, ReferencePlanningFailure};
+
 // 仅有墙弯道测试按单次调用启用；固定槽位，不复制地图、不在计时区间输出。
 #[cfg(test)]
 mod planning_diagnostic {
@@ -71,6 +75,7 @@ mod planning_diagnostic {
 }
 // 优先较快取得可执行路线；加权启发式不承诺最短路径，碰撞/支撑检查不变。
 const SEARCH_HEURISTIC_WEIGHT: f64 = 10.0;
+const MAX_ACTION_SAMPLES: usize = 1024;
 fn angle(v: f64) -> f64 {
     (v + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU) - std::f64::consts::PI
 }
@@ -117,15 +122,13 @@ struct Node {
     samples: Vec<BodyPose>,
 }
 
-// 沿途机体从同一环境源重新派生足迹，不能将起点足迹许可延用到整条路线。
-// 查询视图只参与机体动作，完整初始视图及边界许可仍保留。
+// Every primitive is checked against the immutable source; missing support
+// never grants collision permission or creates a second current-body view.
 fn validate_rebased_motion(map:&SurfaceSnapshot,from:BodyPose,to:BodyPose,boundary:&[[f64;2]])->bool {
-    if map.validate_body_motion(from,to,boundary).is_err() {return false;}
-    let Ok(view)=map.body_query_with_current_support(from.0,from.1) else {return false;};
-    view.same_body_query_view(map) || view.validate_body_motion(from,to,boundary).is_ok()
+    map.validate_body_motion(from,to,boundary).is_ok()
 }
 fn rebased_projection(map:&SurfaceSnapshot,from:BodyPose,xy:[f64;2],yaw:f64)->Option<BodyPose> {
-    map.body_query_with_current_support(from.0,from.1).ok()?.body_pose_after_motion(from,xy,yaw).ok()
+    map.body_pose_after_motion(from,xy,yaw).ok()
 }
 
 fn action(map: &SurfaceSnapshot, from: BodyPose, velocity: Twist2, duration: f64, boundary: &[[f64; 2]]) -> Option<Vec<BodyPose>> {
@@ -152,7 +155,7 @@ fn action_samples(
         .max(velocity.angular_z.abs() / 0.08);
     let step = if rate > 0.0 { 1.0 / rate } else { duration };
     let n = (duration / step).ceil().max(1.0) as usize;
-    if n > 1024 {
+    if n > MAX_ACTION_SAMPLES {
         return None;
     }
     let mut samples = Vec::with_capacity(n);
@@ -509,7 +512,8 @@ fn omnidirectional_connection(
     None
 }
 
-/// 复用生产机体规划查询；返回真实三维机体路径，不包含运动副作用。
+/// Legacy observed-support planner, retained for API compatibility and diagnostics.
+/// Active mission estimates use `plan_reference_cancellable` with their PCT owner.
 pub fn plan(
     map: &SurfaceSnapshot,
     start: BodyPose,
@@ -522,7 +526,7 @@ pub fn plan(
     plan_cancellable(map, start, goal, options, limits, boundary, budget, None)
 }
 
-/// 后台规划按明确取消退出，不用墙钟截止替代任务生命周期。
+/// Legacy observed-support query; cancellation does not use a wall-clock cutoff.
 /// Borrows the caller's existing cancellation flag throughout search and smoothing.
 #[allow(clippy::too_many_arguments)]
 pub fn plan_cancellable(
@@ -3441,4 +3445,23 @@ mod tests {
             assert!(reached, "下阶={descending},终态={current:?}");
         }
     }
+    #[test]
+    fn mission_reference_preserves_known_wall_bounded_turn() {
+        let map = wall_bounded_turn_scene();
+        let body = |x, y, yaw: f64| ([x,y,0.45], [0.0,0.0,(yaw*0.5).sin(),(yaw*0.5).cos()]);
+        let start = body(-1.6, 0.0, 0.0);
+        let goal = body(0.0, 1.6, std::f64::consts::FRAC_PI_2);
+        let options = GoalOptions {allow_reverse:false,position_tolerance_m:0.12,yaw_tolerance_rad:0.15};
+        let motion = limits();
+        let legacy = plan(&map,start,goal,options,Some(&motion),&[],8000).unwrap();
+        assert!(legacy.windows(2).all(|p|map.validate_body_motion(p[0],p[1],&[]).is_ok()));
+        let planner = nuwax_nav_pct::PctPlanner::default();
+        let path = plan_reference_cancellable(&map,&planner,start,goal,options,Some(&motion),&[],30_000,None)
+            .expect("a previously usable wall-bounded turn must remain mission-reachable");
+        assert!(path.windows(2).all(|p|map.validate_body_motion(p[0],p[1],&[]).is_ok()));
+        let end = *path.last().unwrap();
+        assert!(position_distance(end,goal)<=options.position_tolerance_m);
+        assert!(angle(planar(end).yaw-planar(goal).yaw).abs()<=options.yaw_tolerance_rad);
+    }
+
 }

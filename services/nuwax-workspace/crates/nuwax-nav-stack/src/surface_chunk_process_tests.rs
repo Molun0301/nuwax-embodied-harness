@@ -123,7 +123,7 @@ fn message(repository:&Repository,revision:u64,variant:u16)->schema::NavigationM
         cloud:schema::PointCloud2{header:schema::Header{seq:revision as i32,stamp_sec:(stamp/1_000_000_000) as i32,stamp_nsec:(stamp%1_000_000_000) as i32,frame_id:"map".into()},height:1,width:0,fields:["x","y","z"].iter().enumerate().map(|(i,name)|schema::PointField{name:(*name).into(),offset:(i*4) as i32,datatype:7,count:1}).collect(),is_bigendian:false,point_step:12,row_step:0,data:Vec::new(),is_dense:true},
     }
 }
-async fn receive(reader:FineMapReader,message:schema::NavigationMap3D)->(FineMapReader,Result<Arc<Manifest>,String>) {
+async fn receive(reader:FineMapReader,message:schema::NavigationMap3D)->(FineMapReader,Result<Arc<Manifest>,SurfaceMapBuildError>) {
     tokio::task::spawn_blocking(move||{let mut reader=reader;let result=reader.receive(&message);(reader,result)}).await.unwrap()
 }
 
@@ -148,16 +148,20 @@ async fn real_process_rpc_recovers_late_missing_and_corrupt_blocks_without_parti
     let current=reader.receiver.current().unwrap();
     std::fs::write(root.join("mode"),"corrupt").unwrap();
     let (reader,result)=receive(reader,message(&repository,2,2)).await;
-    assert!(result.unwrap_err().contains("格式"));assert_eq!(reader.receiver.current().unwrap(),current);
+    assert!(matches!(&result,Err(SurfaceMapBuildError::Invalid(_))));
+    assert!(result.unwrap_err().to_string().contains("格式"));assert_eq!(reader.receiver.current().unwrap(),current);
     std::fs::write(root.join("mode"),"missing").unwrap();
     let (reader,result)=receive(reader,message(&repository,3,3)).await;
-    assert!(result.is_err());assert_eq!(reader.receiver.current().unwrap().revision,1);
+    // Remote exceptions have no typed missing-vs-corrupt code; never guess from text.
+    assert!(matches!(result,Err(SurfaceMapBuildError::Invalid(_))));assert_eq!(reader.receiver.current().unwrap().revision,1);
     std::fs::write(root.join("mode"),"wrong-root").unwrap();
     let (reader,result)=receive(reader,message(&repository,4,4)).await;
-    assert!(result.unwrap_err().contains("身份"));assert_eq!(reader.receiver.current().unwrap().revision,1);
+    assert!(matches!(&result,Err(SurfaceMapBuildError::Invalid(_))));
+    assert!(result.unwrap_err().to_string().contains("身份"));assert_eq!(reader.receiver.current().unwrap().revision,1);
     std::fs::write(root.join("mode"),"wrong-block").unwrap();
     let (reader,result)=receive(reader,message(&repository,5,5)).await;
-    assert!(result.unwrap_err().contains("身份"));assert_eq!(reader.receiver.current().unwrap().revision,1);
+    assert!(matches!(&result,Err(SurfaceMapBuildError::Invalid(_))));
+    assert!(result.unwrap_err().to_string().contains("身份"));assert_eq!(reader.receiver.current().unwrap().revision,1);
     std::fs::write(root.join("mode"),"good").unwrap();
     let (mut reader,result)=receive(reader,message(&repository,6,6)).await;assert_eq!(result.unwrap().revision,6);
     // 慢读者持有的旧根仍可读，且读取的是消费者自己已验证的对象。

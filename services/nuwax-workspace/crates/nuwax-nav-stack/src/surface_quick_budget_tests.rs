@@ -79,7 +79,7 @@ fn owned_flag_body_path_binding_rejects_preinstall_and_preserves_prior_cache() {
 }
 
 #[test]
-fn owned_flag_preserves_uncancelled_direct_detour_and_penalty_path_bits() {
+fn owned_flag_preserves_full_paths_and_quick_zero_is_direct_only() {
     let mut paths = Vec::new();
     for (name, detour, penalty) in [("direct", false, false), ("detour", true, false), ("penalty", false, true)] {
         let (surface, start, goal) = fixture(detour);
@@ -95,10 +95,18 @@ fn owned_flag_preserves_uncancelled_direct_detour_and_penalty_path_bits() {
         for budget in [0, 30_000] {
             let mut configured = calibrated_config(penalty);
             configured.planning_cancelled = Some(Arc::new(AtomicBool::new(false)));
-            let cold = body_path_with_budget(&surface, &start, &goal, &configured, budget).unwrap();
-            let warm = body_path_with_budget(&surface, &start, &goal, &configured, budget).unwrap();
-            assert_eq!(bits(&cold), expected, "{name} cold budget {budget}");
-            assert_eq!(bits(&warm), expected, "{name} warm budget {budget}");
+            let cold = body_path_with_budget(&surface, &start, &goal, &configured, budget);
+            let warm = body_path_with_budget(&surface, &start, &goal, &configured, budget);
+            if budget == 0 && (detour || penalty) {
+                let cold = cold.unwrap_err().to_string();
+                assert!(cold.contains("BudgetExhausted"), "{name}: {cold}");
+                assert_eq!(cold, warm.unwrap_err().to_string());
+            } else {
+                let (cold, warm) = (cold.unwrap(), warm.unwrap());
+                assert_eq!(bits(&cold), bits(&warm), "{name} cold/warm budget {budget}");
+                if budget > 0 { assert_eq!(bits(&cold), expected, "{name} full budget"); }
+                else { assert_eq!(cold.poses.len(), 2, "zero only validates the direct chord"); }
+            }
             assert!(!nuwax_nav_pct::planning_cancelled());
         }
         let quality = metrics(&baseline, &goal);
@@ -177,20 +185,24 @@ fn calibrated_quick_and_full_budget_cost_baseline() {
     let budgets = if reverse { [30_000, 0] } else { [0, 30_000] };
     for (name, detour, penalty) in [("direct", false, false), ("detour", true, false), ("penalty", false, true)] {
         let (surface, start, goal) = fixture(detour);
-        let mut reference = None;
         for budget in budgets {
             let config = calibrated_config(penalty);
             let began = Instant::now();
             let cold = body_path_with_budget(&surface, &start, &goal, &config, budget);
             let cold_ns = began.elapsed().as_nanos();
-            let cold = cold.unwrap();
             let began = Instant::now();
             let warm = body_path_with_budget(&surface, &start, &goal, &config, budget);
             let warm_ns = began.elapsed().as_nanos();
-            let warm = warm.unwrap();
+            if budget == 0 && (detour || penalty) {
+                let reason = cold.unwrap_err().to_string();
+                assert!(reason.contains("BudgetExhausted"));
+                assert_eq!(reason, warm.unwrap_err().to_string());
+                eprintln!("QUICK_BUDGET {}", serde_json::json!({"case":name,"budget":budget,
+                    "cold_ns":cold_ns,"warm_ns":warm_ns,"inconclusive":reason}));
+                continue;
+            }
+            let (cold, warm) = (cold.unwrap(), warm.unwrap());
             assert_eq!(cold, warm);
-            if let Some(previous) = &reference { assert_eq!(&cold, previous); }
-            reference = Some(cold.clone());
             let quality = metrics(&cold, &goal);
             let path_evidence: Vec<_> = cold.poses.iter().map(|p| {
                 let b = p.pose.position;
@@ -237,4 +249,30 @@ fn calibrated_quick_and_full_budget_cost_baseline() {
         eprintln!("QUICK_BUDGET {}", serde_json::json!({"case":"pre_cancelled",
             "budget":budget,"cold_ns":cold_ns,"warm_ns":warm_ns}));
     }
+}
+
+#[test]
+fn mission_owner_flag_cancels_pct_construction_before_cache_install() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (surface, start, goal) = fixture(false);
+    let config = calibrated_config(false);
+    let flag = Arc::new(AtomicBool::new(false));
+    let builds = Arc::new(AtomicUsize::new(0));
+    let body = |pose: &PoseStamped| {
+        let p=pose.pose.position; let q=pose.pose.orientation;
+        ([p.x,p.y,p.z],[q.x,q.y,q.z,q.w])
+    };
+    let goal_pose=pose_from_schema(&goal.goal).unwrap();
+    let result = tracing::subscriber::with_default(MapBuiltObserver {
+        cancel:Some(flag.clone()), builds:builds.clone(),
+    }, || crate::surface_oriented::with_owner_cancellation(flag.clone(), ||
+        crate::surface_oriented::plan_reference_cancellable(&surface,&config.follower.pct,
+            body(&start),body(&goal_pose),goal.options,None,&[],30_000,None)));
+    assert_eq!(builds.load(Ordering::Relaxed),1);
+    assert!(result.unwrap_err().contains("取消"));
+    assert!(!nuwax_nav_pct::planning_cancelled());
+    tracing::subscriber::with_default(MapBuiltObserver {cancel:None,builds:builds.clone()}, || {
+        config.follower.pct.map(&surface).unwrap();
+    });
+    assert_eq!(builds.load(Ordering::Relaxed),2,"cancelled map construction must not be cached");
 }

@@ -11,6 +11,8 @@ fn distances(
     graph: &PlannerGraph,
     domain: &AHashSet<CellId>,
     config: &Config,
+    occupied: &ColumnIz,
+    heights: &HeightBounds,
 ) -> AHashMap<CellId, f32> {
     let cells = &graph.cells;
     let size = config.voxel_size;
@@ -58,7 +60,11 @@ fn distances(
                 }
             }
             for (index, &(dx, dy)) in DIRECTIONS.iter().enumerate() {
-                if directions[index] {
+                let height=heights.get(&cell).map_or((cell.2 as f32+1.0)*size,|b|b[1]);
+                if directions[index] || !column_obstructs(occupied,heights,
+                    (cell.0+dx,cell.1+dy),height,config) {
+                    // Unknown ground and a disconnected floor above/below the
+                    // declared body-height interval are not physical walls.
                     continue;
                 }
                 let x = (cell.0 - centre.0) as f32;
@@ -78,6 +84,16 @@ fn distances(
     }
     result
 }
+/// Original occupied heights, independent of terrain graph connectivity.
+pub(super) fn column_obstructs(occupied:&ColumnIz,heights:&HeightBounds,
+    column:(i32,i32),ground:f32,config:&Config)->bool {
+    occupied.get(&column).is_some_and(|levels|levels.iter().any(|&z| {
+        let [low,high]=heights.get(&(column.0,column.1,z)).copied()
+            .unwrap_or([z as f32*config.voxel_size,(z as f32+1.0)*config.voxel_size]);
+        high>ground+1e-6 && low<ground+config.robot_height-1e-6
+    }))
+}
+
 fn scale(graph: &mut PlannerGraph, config: &Config, ids: impl IntoIterator<Item = CellId>) {
     for id in ids {
         let source = penalty_of(
@@ -98,10 +114,10 @@ fn scale(graph: &mut PlannerGraph, config: &Config, ids: impl IntoIterator<Item 
         }
     }
 }
-pub(super) fn full(graph: &mut PlannerGraph, config: &Config) {
+pub(super) fn full(graph: &mut PlannerGraph, config: &Config,occupied:&ColumnIz,heights:&HeightBounds) {
     let cap = limit(config);
     let domain = graph.cells.ids().collect::<AHashSet<_>>();
-    let distances = distances(graph, &domain, config);
+    let distances = distances(graph, &domain, config,occupied,heights);
     graph.wall_state.dist = vec![cap; graph.cells.slot_capacity()];
     for (id, distance) in distances {
         graph.wall_state.dist[id as usize] = distance;
@@ -137,11 +153,13 @@ pub(super) fn update(
     graph: &mut PlannerGraph,
     config: &Config,
     changed: &AHashSet<(i32, i32)>,
+    occupied:&ColumnIz,
+    heights:&HeightBounds,
 ) -> (AHashSet<(i32, i32)>, bool) {
     let cap = limit(config);
     let radius_cells = (cap / config.voxel_size).ceil() + 1.0;
     if radius_cells > 128.0 {
-        full(graph, config);
+        full(graph, config,occupied,heights);
         return (graph.surface_lookup.keys().copied().collect(), true);
     }
     let radius = radius_cells as i32;
@@ -149,13 +167,13 @@ pub(super) fn update(
         .len()
         .saturating_mul((4 * radius as usize + 3).pow(2));
     if work > 500_000 {
-        full(graph, config);
+        full(graph, config,occupied,heights);
         return (graph.surface_lookup.keys().copied().collect(), true);
     }
     let inner = expand(changed, radius);
     let outer = expand(changed, radius * 2);
     let domain = ids(graph, &outer);
-    let distances = distances(graph, &domain, config);
+    let distances = distances(graph, &domain, config,occupied,heights);
     graph
         .wall_state
         .dist

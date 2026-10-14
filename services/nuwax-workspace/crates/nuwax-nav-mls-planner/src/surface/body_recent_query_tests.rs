@@ -1,4 +1,5 @@
-// Frozen complete pose query from bb1a14f, before recent height-only row reuse.
+// Uncached complete pose comparator for recent height-only row reuse.
+// Ground classification follows the current source-only contract.
 use super::*;
 
 impl SurfaceSnapshot {
@@ -65,7 +66,7 @@ impl SurfaceSnapshot {
                             let cx=(((f64::from(x)+0.5)*fine)/coarse).floor() as i32;
                             let cy=(((f64::from(y)+0.5)*fine)/coarse).floor() as i32;
                             let ground=patch.get(&(cx,cy)).copied();
-                            let selected=ground.and_then(|g|self.fine_ground_columns(Some(g),&polygon_query,&prism_query,body,r[2],cx,cy));
+                            let selected=self.fine_ground_columns(ground,&polygon_query,&prism_query,body,r[2],cx,cy);
                             let height=if let Some(rows)=&selected {rows.iter().find(|row|row.xy==[x,y]).and_then(|row|row.height)}
                                 else {ground.map(|g|self.cell_position(g)[2])};
                             for &z in zs {
@@ -175,8 +176,7 @@ impl SurfaceSnapshot {
                                         if !observations.get([ix,iy,iz]).is_some() {continue;}
                                         let contact=selected.is_none() && coarse_contact
                                             && fine_ground.is_some_and(|height|f64::from(iz+1)*fine<=height+1e-6);
-                                        if contact
-                                            || self.current_body_support.as_ref().is_some_and(|current|current.cleared_voxels.contains(&[ix,iy,iz])) {continue;}
+                                        if contact {continue;}
 
                                         let hit=prism_query.intersects(
                                             [f64::from(ix)*fine,f64::from(iy)*fine,f64::from(iz)*fine],
@@ -208,6 +208,9 @@ impl SurfaceSnapshot {
                 tracing::debug!(?body, cross_slope, limit=model.max_cross_slope_deg, "实际机体支撑横坡超限");
                 return Err(SurfaceError::UntraversableSegment);
             }
+        }
+        if self.body_ground_relation(body,quaternion)?==BodyGroundRelation::KnownIncompatible {
+            return Err(SurfaceError::UntraversableSegment);
         }
         Ok(())
     }
@@ -406,10 +409,9 @@ fn recent_query_preserves_real_current_overlay_and_cleared_voxels() {
     let source=SurfaceSnapshot::from_points(&points,cfg,0.05).unwrap().with_body_envelope(envelope).unwrap()
         .with_observations(Some(witnessed_observations(&points,0.05)));
     let body=[0.,0.,0.4];let q=[0.,0.,0.,1.];
-    let view=source.with_current_body_support(body,q).unwrap();
-    let current=view.current_body_support.as_ref().expect("fixture must construct real private support");
-    assert!(!current.cleared_voxels.is_empty());
-    assert!(current.cleared_voxels.contains(&[0,0,2]));
+    assert!(source.with_current_body_support(body,q).is_err(),"real obstacle is never cleared");
+    let view=source.clone();
+    assert!(view.observations.as_ref().unwrap().get([0,0,2]).is_some());
     for obstacle in [false,true] {
         let point=if obstacle{[0.025,0.025,0.325]}else{[0.025,0.025,0.025]};
         let map=view.with_recent_obstacle_points(1,100,0,if obstacle{&[]}else{&[0]},[(0,point)]).unwrap();

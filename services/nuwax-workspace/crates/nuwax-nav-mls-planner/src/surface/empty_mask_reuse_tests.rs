@@ -29,14 +29,13 @@ fn cold_reference(input: &SurfaceSnapshot, mask: Arc<VirtualObstacleMask>) -> Su
         edges.retain(|edge| !excluded.contains(&id) && !excluded.contains(&edge.dest));
     }
     let regions = Arc::new(regions::RegionGraph::full(&graph, input.config().voxel_size));
-    assert!(input.current_body_support.is_none(), "reference fixture must be a direct source");
     SurfaceSnapshot {
         recent_obstacles:input.recent_obstacles.clone(),
         ground_evidence: input.ground_evidence,
-        observations: input.observations.clone(), current_body_support: None,
+        observations: input.observations.clone(),
         body_query_cache: Default::default(),
         data: Arc::new(SurfaceData {
-            body_query_only: false, frontier_cache: Default::default(),
+            frontier_cache: Default::default(),
             body_cache: Default::default(), routing_cache: Default::default(),
             body_envelope: input.data.body_envelope.clone(),
             height_bounds: Arc::clone(&input.data.height_bounds),
@@ -123,19 +122,15 @@ fn empty_exclusion_after_masked_source_restores_physical_edges_and_rebuilds_regi
 }
 
 #[test]
-fn empty_exclusion_body_query_graph_does_not_reuse_inherited_regions() {
+fn empty_exclusion_body_query_shares_unchanged_geometry_and_regions() {
     let physical = scene(0.0);
-    let query = physical.with_body_query_columns(&[SurfaceColumnUpdate {
-        column: [12, 8], cells: Vec::new(),
-    }]).unwrap();
-    assert!(query.data.body_query_only);
-    assert!(Arc::ptr_eq(&query.data.graph, &query.data.physical_graph));
+    let query = physical.clone();
+    assert!(Arc::ptr_eq(&query.data.graph, &physical.data.graph));
     assert!(Arc::ptr_eq(&query.data.regions, &physical.data.regions));
-    assert!(query.data.graph.cells.id((12, 8, 0)).is_none());
     let mask = wide_mask(false); let actual = query.with_virtual_mask(mask.clone()).unwrap();
     assert!(actual.data.virtual_blocked_cells.is_empty());
     assert!(Arc::ptr_eq(&actual.data.graph, &query.data.physical_graph));
-    assert!(!Arc::ptr_eq(&actual.data.regions, &query.data.regions));
+    assert!(Arc::ptr_eq(&actual.data.regions, &query.data.regions));
     equivalent(&actual, &cold_reference(&query, mask));
 }
 

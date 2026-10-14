@@ -132,6 +132,7 @@ pub struct SurfaceFollower {
     controller: PController,
     map: Option<Arc<SurfaceSnapshot>>,
     source_map: Option<Arc<SurfaceSnapshot>>,
+    planar_reference: Option<Arc<nuwax_nav_pct::Tomogram>>,
     odometry: Option<PoseStamped>,
     path: Option<Path3D>,
     goal: Option<PoseStamped>,
@@ -164,6 +165,7 @@ impl SurfaceFollower {
             controller,
             map: None,
             source_map: None,
+            planar_reference: None,
             odometry: None,
             path: None,
             goal: None,
@@ -201,14 +203,7 @@ impl SurfaceFollower {
         if !self.body_view_dirty { return; }
         self.body_view_dirty = false;
         self.map = self.source_map.clone();
-        if let (Some(map), Some(pose)) = (self.source_map.as_ref(), self.odometry.as_ref()) {
-            let p = pose.pose.position;
-            let q = pose.pose.orientation;
-            // 每次从环境快照派生；旧足迹清除不能随实际运动累积到未知区域。
-            if let Ok(view) = map.with_current_body_support([p.x, p.y, p.z], [q.x, q.y, q.z, q.w]) {
-                self.map = Some(Arc::new(view));
-            }
-        }
+
     }
 
     /// 当前站姿自身被拒绝时，全局改道不能恢复运动；保留目标等待实际输入恢复。
@@ -219,13 +214,6 @@ impl SurfaceFollower {
         map.body_envelope()?;
         let pose = self.odometry.as_ref()?;
         let q = pose.pose.orientation;
-        // A measured ground/pose contradiction cannot be repaired by replanning.
-        // Unknown ground is not a collision or a per-cell support permission.
-        let source=self.source_map.as_ref().unwrap_or(map);
-        if matches!(source.body_ground_relation(xyz(pose.pose.position), [q.x,q.y,q.z,q.w]),
-            Ok(nuwax_nav_mls_planner::surface::BodyGroundRelation::KnownIncompatible)) {
-            return Some(nuwax_nav_mls_planner::surface::SurfaceError::MissingSupport.to_string());
-        }
         let mut witness=None;
         map.validate_body_pose_with_witness(xyz(pose.pose.position), [q.x, q.y, q.z, q.w], &mut witness)
             .err().map(|error| match witness {
@@ -234,11 +222,20 @@ impl SurfaceFollower {
             })
     }
 
-    fn support(map: &SurfaceSnapshot, pose: &PoseStamped, offset: f64) -> Result<[f64; 3], String> {
+    fn support_reference(map: &SurfaceSnapshot, pose: &PoseStamped, offset: f64) -> Result<[f64; 3], String> {
         let q = pose.pose.orientation;
-        map.locate_support_from_body(xyz(pose.pose.position), [q.x, q.y, q.z, q.w], offset)
-            .map(|location| location.support_xyz)
+        map.support_position_from_body(xyz(pose.pose.position), [q.x, q.y, q.z, q.w], offset)
             .map_err(|error| error.to_string())
+    }
+
+    // The legacy planar model uses only its existing configured radius/height.
+    // PCT checks persistent geometry/known terrain; recent occupancy always comes
+    // from the current source, never the static tomogram cache.
+    fn planar_reference_motion(map:&SurfaceSnapshot,tomogram:&nuwax_nav_pct::Tomogram,
+        from:[f64;3],to_xy:[f64;2],boundary:&[[f64;2]])->Result<[f64;3],String> {
+        let next=tomogram.project_reference_motion(from,to_xy,boundary)?;
+        map.validate_planar_recent_motion(from,next).map_err(|error|error.to_string())?;
+        Ok(next)
     }
 
     fn admit_path(&mut self, path: Path3D, goal: PoseStamped) -> Result<(), RuntimeError> {
@@ -284,12 +281,16 @@ impl SurfaceFollower {
                 return Err(rejected("新路径不能从实际机体站姿连续接续"));
             }
         } else {
-            let current_support = Self::support(map, odometry, self.config.body_to_support_z_m)
+            let current_support = Self::support_reference(map, odometry, self.config.body_to_support_z_m)
                 .map_err(rejected)?;
-            let projected_support = Self::support(map, &projected, self.config.body_to_support_z_m)
+            let projected_support = Self::support_reference(map, &projected, self.config.body_to_support_z_m)
                 .map_err(rejected)?;
-            map.validate_segment(current_support, projected_support)
-                .map_err(|error| rejected(error.to_string()))?;
+            let tomogram=self.planar_reference.as_ref().ok_or_else(||rejected("平面查询地图尚未由后台准备"))?;
+            let next=Self::planar_reference_motion(map,&tomogram,current_support,
+                [projected_support[0],projected_support[1]],&self.boundary).map_err(rejected)?;
+            if (next[2]-projected_support[2]).abs()>f64::from(map.source_voxel_size_m())+1e-6 {
+                return Err(rejected("新路径与当前标定高度不能连续接续"));
+            }
         }
         self.progress_m = progress;
         self.last_tracked_pose = Some(odometry.clone());
@@ -325,13 +326,18 @@ impl SurfaceFollower {
             || robot_width_m <= 0.0
             || f64::from(map.config().wall_clearance_m) + 1e-6 < robot_width_m * 0.5
         {
-            return PlannerStep::Failed("表面图硬净空小于当前机器人半宽".into());
+            return PlannerStep::Failed("平面碰撞模型半径小于当前机器人半宽".into());
         }
+        let Some(tomogram)=self.planar_reference.as_ref() else {
+            return PlannerStep::ReplanRequired("平面查询地图尚未由后台准备".into());
+        };
         let position = odometry.pose.position;
-        let current_support = match Self::support(map, odometry, self.config.body_to_support_z_m) {
+        let current_support = match Self::support_reference(map, odometry, self.config.body_to_support_z_m)
+            .and_then(|reference|Self::planar_reference_motion(map,&tomogram,reference,
+                [reference[0],reference[1]],&self.boundary)) {
             Ok(support) => support,
             Err(reason) => {
-                return PlannerStep::ReplanRequired(format!("当前机体没有有效支撑: {reason}"))
+                return PlannerStep::ReplanRequired(format!("当前平面机体未通过实际几何检查: {reason}"))
             }
         };
         let displacement = self
@@ -350,11 +356,13 @@ impl SurfaceFollower {
                 let step_limit = f64::from(map.config().step_threshold_m + map.config().voxel_size);
                 let supported_step = horizontal_delta <= plausible
                     && vertical_delta <= step_limit
-                    && Self::support(map, previous, self.config.body_to_support_z_m)
-                        .is_ok_and(|from| map.validate_segment(from, current_support).is_ok());
+                    && Self::support_reference(map, previous, self.config.body_to_support_z_m)
+                        .is_ok_and(|from|Self::planar_reference_motion(map,&tomogram,from,
+                            [current_support[0],current_support[1]],&self.boundary)
+                            .is_ok_and(|next|(next[2]-current_support[2]).abs()<=step_limit));
                 if !supported_step {
                     return PlannerStep::ReplanRequired(
-                        "三维位姿跳变没有可确认的连续支撑，需要重新接续路线".into(),
+                        "三维位姿跳变与已知地形或实际几何不连续，需要重新接续路线".into(),
                     );
                 }
             }
@@ -419,21 +427,23 @@ impl SurfaceFollower {
         } else {
             1.0
         };
-        let sampled = match map.sample_segment_support(current_support, end_reference, ratio) {
+        let target_reference=[current_support[0]+(end_reference[0]-current_support[0])*ratio,
+            current_support[1]+(end_reference[1]-current_support[1])*ratio];
+        let sampled = match Self::planar_reference_motion(map,&tomogram,current_support,target_reference,&self.boundary) {
             Ok(location) => location,
             Err(reason) => {
-                return PlannerStep::ReplanRequired(format!("前方表面连接失效: {reason}"))
+                return PlannerStep::ReplanRequired(format!("前方平面运动几何失效: {reason}"))
             }
         };
         let q = target.pose.orientation;
         let body_target = match map.body_position_from_support(
-            sampled.support_xyz,
+            sampled,
             [q.x, q.y, q.z, q.w],
             self.config.body_to_support_z_m,
         ) {
             Ok(point) => point,
             Err(reason) => {
-                return PlannerStep::ReplanRequired(format!("前方机体目标没有有效支撑: {reason}"))
+                return PlannerStep::ReplanRequired(format!("前方机体标定坐标无效: {reason}"))
             }
         };
         target.pose.position = Point3::new(body_target[0], body_target[1], body_target[2]);
@@ -516,7 +526,7 @@ impl SurfaceFollower {
             && rotation.angular_z.abs() > 1e-9 && self.motion_is_traversable(rotation) {
             return PlannerStep::Command(rotation);
         }
-        PlannerStep::ReplanRequired("短时速度轨迹没有连续支撑或足够净空".into())
+        PlannerStep::ReplanRequired("短时速度轨迹未通过实际几何或已知地形检查".into())
     }
 
     /// 微转向只有能恢复后续平移时才属于接续动作，避免在已对齐堵点渐近旋转。
@@ -555,6 +565,14 @@ impl SurfaceFollower {
         })
     }
 
+    fn recheck_planar_command(&mut self,command:Twist2)->PlannerStep {
+        self.refresh_current_body_view();
+        if self.motion_is_traversable(command) {PlannerStep::Command(command)} else {
+            self.begin_braking();
+            PlannerStep::ReplanRequired("当前位姿或最新障碍拒绝已选平面运动".into())
+        }
+    }
+
     fn motion_is_traversable(&self, command: Twist2) -> bool {
         let (Some(map), Some(pose)) = (self.map.as_ref(), self.odometry.as_ref()) else {
             return false;
@@ -568,9 +586,12 @@ impl SurfaceFollower {
         if map.body_envelope().is_some() {
             return self.predicted_body_motion_is_traversable(command,crate::DEFAULT_CONTROL_HORIZON.as_secs_f64());
         }
-        let Ok(initial_support) = Self::support(map, pose, self.config.body_to_support_z_m) else {
+        let Some(tomogram)=self.planar_reference.as_ref() else {return false;};
+        let Ok(initial_support) = Self::support_reference(map, pose, self.config.body_to_support_z_m) else {
             return false;
         };
+        if Self::planar_reference_motion(map,&tomogram,initial_support,
+            [initial_support[0],initial_support[1]],&self.boundary).is_err() {return false;}
         let yaw = pose.pose.orientation.yaw();
         let horizon = crate::DEFAULT_CONTROL_HORIZON.as_secs_f64();
         let offset = [
@@ -613,7 +634,8 @@ impl SurfaceFollower {
                 pose.pose.position.y + dy + offset[0] * angle.sin() + offset[1] * angle.cos(),
                 support[2],
             ];
-            let Ok(next) = map.sample_segment_support(support, desired, 1.0) else {
+            let Ok(next) = Self::planar_reference_motion(map,&tomogram,support,
+                [desired[0],desired[1]],&self.boundary) else {
                 return false;
             };
             // 不假定转向立即生效：同时检查保持当前航向的边界，以及两者间的支撑带。
@@ -624,17 +646,14 @@ impl SurfaceFollower {
                     + (command.linear.x * yaw.sin() + command.linear.y * yaw.cos()) * time,
                 delayed_support[2],
             ];
-            let Ok(next_delayed) = map.sample_segment_support(delayed_support, delayed, 1.0) else {
+            let Ok(next_delayed) = Self::planar_reference_motion(map,&tomogram,delayed_support,
+                [delayed[0],delayed[1]],&self.boundary) else {
                 return false;
             };
-            if map
-                .validate_segment(next.support_xyz, next_delayed.support_xyz)
-                .is_err()
-            {
-                return false;
-            }
-            support = next.support_xyz;
-            delayed_support = next_delayed.support_xyz;
+            if Self::planar_reference_motion(map,&tomogram,next,[next_delayed[0],next_delayed[1]],&self.boundary)
+                .map_or(true,|cross|(cross[2]-next_delayed[2]).abs()>f64::from(map.source_voxel_size_m())+1e-6) {return false;}
+            support = next;
+            delayed_support = next_delayed;
         }
         true
     }
@@ -642,9 +661,15 @@ impl SurfaceFollower {
 
 impl NavPlanner for SurfaceFollower {
     fn revalidate_selected_command(&mut self,command:Twist2)->Option<PlannerStep> {
+        if self.source_map.as_ref().is_some_and(|map|map.body_envelope().is_none()) {
+            return Some(self.recheck_planar_command(command));
+        }
         self.recheck_selected_body_command(command)
     }
     fn revalidate_selected_command_at_current_state(&mut self,command:Twist2)->Option<PlannerStep> {
+        if self.source_map.as_ref().is_some_and(|map|map.body_envelope().is_none()) {
+            return Some(self.recheck_planar_command(command));
+        }
         self.recheck_selected_body_command_at_current_state(command)
     }
     fn take_command_dispatch_bound(&mut self)->Option<crate::CommandDispatchBound> {SurfaceFollower::take_command_dispatch_bound(self)}
@@ -700,13 +725,21 @@ impl NavPlanner for SurfaceFollower {
         self.last_command_dispatch_bound = None;
         self.map = None;
         self.source_map = None;
+        self.planar_reference=None;
         self.invalid_input = Some("三维后端拒绝二维占据图".into());
     }
 
     fn update_execution_map(&mut self, map: ExecutionMap) -> Result<(), RuntimeError> {
         self.last_command_dispatch_bound = None;
-        match map {
-            ExecutionMap::Surface(map) | ExecutionMap::SurfaceUpdate(crate::surface_changes::SurfaceMapUpdate {snapshot:map,..}) => {
+        let (map,planar_reference)=match map {
+            ExecutionMap::Surface(map)=>(map,None),
+            ExecutionMap::SurfaceUpdate(update)=>(update.snapshot,update.planar_reference),
+            ExecutionMap::Planar(_)=>return Err(rejected("三维后端不能用二维占据图恢复就绪")),
+        };
+        if planar_reference.as_ref().is_some_and(|prepared|!prepared.matches_surface(&map)) {
+            return Err(rejected("后台平面查询地图与当前几何或配置不匹配"));
+        }
+        {
                 if map.config().world_frame != "map" {
                     return Err(rejected("三维表面快照必须使用当前机体路径的map坐标系"));
                 }
@@ -715,9 +748,8 @@ impl NavPlanner for SurfaceFollower {
                     self.body_view_dirty = true;
                 }
                 self.source_map = Some(map);
+                self.planar_reference=planar_reference;
                 Ok(())
-            }
-            ExecutionMap::Planar(_) => Err(rejected("三维后端不能用二维占据图恢复就绪")),
         }
     }
 
@@ -725,6 +757,7 @@ impl NavPlanner for SurfaceFollower {
         self.stop();
         self.map = None;
         self.source_map = None;
+        self.planar_reference=None;
     }
 
     fn observe_applied_command(&mut self, command:Twist2) {
@@ -914,6 +947,13 @@ pub(crate) fn test_snapshot(slope: f64, blocked_strip: bool) -> Arc<SurfaceSnaps
     Arc::new(SurfaceSnapshot::from_points(&points, config, 0.1).expect("真实合成表面"))
 }
 
+/// Explicit test/setup preparation, outside every timed controller operation.
+#[cfg(test)]
+pub(crate) fn prepared_test_surface(map:Arc<SurfaceSnapshot>)->ExecutionMap {
+    ExecutionMap::SurfaceUpdate(crate::surface_changes::SurfaceMapUpdate::prepare(
+        map,&nuwax_nav_pct::PctPlanner::default()).unwrap())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -940,7 +980,7 @@ mod tests {
         config.basic_kinematics=Some(limits.kinematics());
         if calibrated {config.motion_limits=Some(limits);}
         let mut follower=SurfaceFollower::new(config).unwrap();
-        follower.update_execution_map(ExecutionMap::Surface(Arc::clone(&map))).unwrap();
+        follower.update_execution_map(prepared_test_surface(Arc::clone(&map))).unwrap();
         follower.update_odometry(poses.first().unwrap().clone());
         let goal=poses.last().unwrap().clone();
         follower.configure_goal(&goal,GoalOptions {
@@ -968,7 +1008,7 @@ mod tests {
                 1=>{follower.configure_goal(&pose,GoalOptions::default()).unwrap();},
                 2=>follower.update_odometry(pose.clone()),
                 3=>follower.observe_applied_command(Twist2::ZERO),
-                4=>{follower.update_execution_map(ExecutionMap::Surface(test_snapshot(0.0,false))).unwrap();},
+                4=>{follower.update_execution_map(prepared_test_surface(test_snapshot(0.0,false))).unwrap();},
                 5=>{assert!(follower.replace_execution_path(ExecutionPath::Surface(Path3D {poses:vec![]}),None,pose.clone()).is_err());},
                 6=>follower.stop(),
                 _=>{let _=follower.step(0.2);},
@@ -1257,7 +1297,7 @@ mod tests {
     }
 
     #[test]
-    fn moving_current_body_view_does_not_accumulate_old_footprint_clearing() {
+    fn moving_body_queries_share_source_and_never_clear_intersecting_occupancy() {
         use nuwax_nav_mls_planner::SurfaceBodyEnvelope;
         let mut points: Vec<_> = (0..40).flat_map(|x| (0..20).map(move |y|
             ((x as f32+0.5)*0.1,(y as f32+0.5)*0.1,0.025))).collect();
@@ -1271,29 +1311,29 @@ mod tests {
             support_uncertainty_m:0.0,
         }).unwrap());
         let mut follower=SurfaceFollower::new(SurfaceFollowerConfig::new(0.3)).unwrap();
-        follower.update_execution_map(ExecutionMap::Surface(Arc::clone(&source))).unwrap();
+        follower.update_execution_map(prepared_test_surface(Arc::clone(&source))).unwrap();
         let first=[0.55,0.55,0.4];let next=[2.55,0.55,0.4];let q=[0.0,0.0,0.0,1.0];
         follower.update_odometry(body_pose(first,Quaternion::IDENTITY,1));
         follower.step(0.3);
-        follower.map.as_ref().unwrap().validate_body_pose(first,q).unwrap();
+        assert!(follower.map.as_ref().unwrap().validate_body_pose(first,q).is_err());
         let first_view = Arc::clone(follower.map.as_ref().unwrap());
         follower.update_odometry(body_pose(first,Quaternion::IDENTITY,2));
-        follower.update_execution_map(ExecutionMap::Surface(Arc::clone(&source))).unwrap();
+        follower.update_execution_map(prepared_test_surface(Arc::clone(&source))).unwrap();
         follower.step(0.3);
         assert!(Arc::ptr_eq(&first_view, follower.map.as_ref().unwrap()),
             "同站姿新时间戳及同源地图心跳应复用足迹，不能每拍重建");
         let observations = Arc::new(nuwax_nav_mls_planner::SurfaceObservations::new(0.1, 32).unwrap());
         let changed = Arc::new(source.with_observations(Some(observations)));
-        follower.update_execution_map(ExecutionMap::Surface(changed)).unwrap();
+        follower.update_execution_map(prepared_test_surface(changed)).unwrap();
         follower.step(0.3);
         assert!(!Arc::ptr_eq(&first_view, follower.map.as_ref().unwrap()),
             "新观察必须撤销旧查询视图，不能只比较粗图几何");
-        follower.update_execution_map(ExecutionMap::Surface(Arc::clone(&source))).unwrap();
+        follower.update_execution_map(prepared_test_surface(Arc::clone(&source))).unwrap();
         follower.update_odometry(body_pose(next,Quaternion::IDENTITY,2));
         follower.step(0.3);
         let view=follower.map.as_ref().unwrap();
-        view.validate_body_pose(next,q).unwrap();
-        assert!(view.validate_body_pose(first,q).is_err(),"旧足迹外障碍必须恢复");
+        assert!(view.validate_body_pose(next,q).is_err(),"the new pose does not erase its occupied voxel");
+        assert!(view.validate_body_pose(first,q).is_err(),"原位置的障碍始终保留");
         assert!(source.validate_body_pose(first,q).is_err(),"原始环境不能被改写");
         assert!(Arc::ptr_eq(follower.source_map.as_ref().unwrap(),&source));
     }
@@ -1309,7 +1349,7 @@ mod tests {
         let mut config=SurfaceFollowerConfig::new(0.3);
         config.controller.speed=0.05;config.max_angular_speed_rps=0.8;
         let mut follower=SurfaceFollower::new(config).unwrap();
-        follower.update_execution_map(ExecutionMap::Surface(map)).unwrap();
+        follower.update_execution_map(prepared_test_surface(map)).unwrap();
         let start=body_pose([1.55,0.55,0.4],Quaternion::IDENTITY,1);
         let turn=body_pose([1.55,0.55,0.4],Quaternion::from_yaw(std::f64::consts::PI),2);
         let goal=body_pose([0.55,0.55,0.4],turn.pose.orientation,3);
@@ -1335,7 +1375,7 @@ mod tests {
         let mut config = SurfaceFollowerConfig::new(0.3);
         config.controller.speed = 0.15;
         let mut follower = SurfaceFollower::new(config).unwrap();
-        follower.update_execution_map(ExecutionMap::Surface(map)).unwrap();
+        follower.update_execution_map(prepared_test_surface(map)).unwrap();
         // 没有发过运动命令；定位微小校正的差分却远大于旧静止阈值。
         for tick in 0..20 {
             follower.update_odometry(body_pose([1.0 + if tick%2==0 {0.004} else {-0.004},0.55,0.4],
@@ -1387,7 +1427,7 @@ mod tests {
             "粗格中心的台阶来自另一精细半列，不能否决实际经过的低平地面");
         map.validate_body_motion(from,to,&[]).unwrap();
         let mut follower=SurfaceFollower::new(SurfaceFollowerConfig::new(0.4)).unwrap();
-        follower.update_execution_map(ExecutionMap::Surface(map)).unwrap();
+        follower.update_execution_map(prepared_test_surface(map)).unwrap();
         follower.update_odometry(current);
         follower.replace_execution_path(ExecutionPath::Surface(Path3D {
             poses:vec![first.clone()],
@@ -1410,19 +1450,27 @@ mod tests {
         let start=body_pose([1.29,0.55,0.46],Quaternion::IDENTITY,1);
         let next=([1.415,0.55,0.46],[0.0,0.0,0.0,1.0]);
         map.validate_body_pose(xyz(start.pose.position),next.1).unwrap();
-        assert!(map.validate_body_motion((xyz(start.pose.position),next.1),next,&[]).is_err(),
+        let mut witness=None;
+        assert_eq!(map.validate_body_motion_with_witness((xyz(start.pose.position),next.1),next,&[],&mut witness),
+            Err(nuwax_nav_mls_planner::SurfaceError::InsufficientClearance),
             "实际恒高轨迹确实会碰到低障碍");
+        assert!(matches!(witness.map(|sample|sample.rejection),Some(nuwax_nav_mls_planner::surface::BodyRejection::Occupancy {
+            cell:[16,5,4],source:nuwax_nav_mls_planner::surface::OccupancySource::CoarseFallback,..
+        })),"the actual obstacle voxel must reject the constant-height sweep: {witness:?}");
         let support=map.locate_support_from_body(xyz(start.pose.position),next.1,0.4).unwrap();
         let raised=map.body_pose_on_surface([next.0[0],next.0[1]],0.0,support.support_xyz).unwrap();
         assert!(raised.0[2]>next.0[2]+0.05,"旧格顶投影会擅自抬高当前机体");
         let old_waypoint=body_pose([1.31,0.55,raised.0[2]],Quaternion::IDENTITY,1);
+        // Restore the baseline distinction: an explicitly supplied vertical lift
+        // can be collision-free, but a planar controller may not invent that lift.
+        // Switching a thick floor's mean/top inside one column is not a terrain step.
         assert!(map.validate_body_motion((xyz(start.pose.position),next.1),
             (xyz(old_waypoint.pose.position),next.1),&[]).is_ok(),
             "旧路径的抬高站姿可在几何上越过低障碍，必须独立验证实际地形接续");
         assert!(!body_control::translation_connects(&map,(xyz(start.pose.position),next.1),&old_waypoint),
             "局部不能提前消费逃逸点，再借旧路径末姿态抬高实际机体");
         let mut follower=SurfaceFollower::new(SurfaceFollowerConfig::new(0.4)).unwrap();
-        follower.update_execution_map(ExecutionMap::Surface(map)).unwrap();follower.update_odometry(start);
+        follower.update_execution_map(prepared_test_surface(map)).unwrap();follower.update_odometry(start);
         follower.refresh_current_body_view();
         assert!(!follower.motion_is_traversable(Twist2{linear:Point2::new(0.5,0.0),angular_z:0.0}),
             "基础短时预测不能凭空抬高机体获得通过");
@@ -1449,7 +1497,7 @@ mod tests {
         let mut follower=SurfaceFollower::new(config).unwrap();
         let start=body_pose([1.0,0.55,0.4],Quaternion::IDENTITY,1);
         let goal=body_pose([1.0,0.55,0.4],Quaternion::from_yaw(0.8),1);
-        follower.update_execution_map(ExecutionMap::Surface(map)).unwrap();
+        follower.update_execution_map(prepared_test_surface(map)).unwrap();
         follower.update_odometry(start.clone());
         follower.configure_goal(&goal,GoalOptions::default()).unwrap();
         follower.replace_execution_path(ExecutionPath::Surface(Path3D {poses:vec![start,goal.clone()]}),None,goal).unwrap();
@@ -1515,7 +1563,7 @@ mod tests {
             let mut follower=SurfaceFollower::new(config).unwrap();
             let start=body_pose([1.0,0.55,0.4],Quaternion::IDENTITY,1);
             let goal=body_pose([1.0,0.55,0.4],Quaternion::from_yaw(0.1),1);
-            follower.update_execution_map(ExecutionMap::Surface(Arc::clone(&map))).unwrap();
+            follower.update_execution_map(prepared_test_surface(Arc::clone(&map))).unwrap();
             follower.update_odometry(start.clone());
             follower.configure_goal(&goal,GoalOptions{yaw_tolerance_rad:0.01,..Default::default()}).unwrap();
             follower.replace_execution_path(ExecutionPath::Surface(Path3D{poses:vec![start,goal.clone()]}),None,goal).unwrap();
@@ -1528,7 +1576,7 @@ mod tests {
     }
 
     #[test]
-    fn old_ground_remains_usable_but_missing_support_brakes_the_complete_tail() {
+    fn old_and_unknown_ground_remain_usable_but_real_obstacles_brake_the_complete_tail() {
         use nuwax_nav_mls_planner::{SurfaceBodyEnvelope, SurfaceObservation, SurfaceObservations};
         use nuwax_nav_types_messages::{MotionLimits, MotionModel};
         use std::collections::BTreeMap;
@@ -1539,10 +1587,12 @@ mod tests {
             max_cross_slope_deg: 10.0, support_uncertainty_m: 0.0,
         }).unwrap();
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64;
-        for (fresh,missing_support,age) in [(true,false,Some(1.0)),(false,false,Some(1.0)),
-            (false,false,None),(false,true,Some(1.0)),(false,true,None)] {
+        for (fresh,missing_support,obstacle,age) in [(true,false,false,Some(1.0)),(false,false,false,Some(1.0)),
+            (false,false,false,None),(false,true,false,Some(1.0)),(false,true,false,None),
+            (false,true,true,Some(1.0)),(false,true,true,None)] {
             let mut blocks: BTreeMap<_, BTreeMap<_, _>> = BTreeMap::new();
             for (x,y,z) in base.cell_keys() {
+                if missing_support && (10..=13).contains(&x) {continue;}
                 let key = [x,y,z];
                 blocks.entry(key.map(|v|v.div_euclid(32))).or_default().insert(key,
                     SurfaceObservation { observed_ns: if fresh || x < 12 {now} else {1}, hits: 2 });
@@ -1552,7 +1602,10 @@ mod tests {
             let geometry=if missing_support {
                 test_snapshot(0.0,true).with_body_envelope(base.body_envelope().unwrap().clone()).unwrap()
             } else {base.clone()};
-            let map = Arc::new(geometry.with_observations(Some(Arc::new(observations))));
+            let geometry=geometry.with_observations(Some(Arc::new(observations)));
+            let geometry=if obstacle {geometry.with_recent_obstacle_points(
+                1,1,0,&[],[(0,[1.25,0.55,0.4])]).unwrap()}else{geometry};
+            let map = Arc::new(geometry);
             let mut config = SurfaceFollowerConfig::new(0.3);
             config.max_observation_age_sec = age;
             config.motion_limits = Some(MotionLimits {
@@ -1563,15 +1616,16 @@ mod tests {
                 minimum_turning_radius_m: 0.0, can_rotate_in_place: true,
             });
             let mut follower = SurfaceFollower::new(config).unwrap();
-            follower.update_execution_map(ExecutionMap::Surface(map)).unwrap();
+            follower.update_execution_map(prepared_test_surface(map)).unwrap();
             follower.update_odometry(body_pose([1.0, 0.55, 0.4], Quaternion::IDENTITY, 0));
             let speed = Twist2 { linear: Point2::new(0.5, 0.0), angular_z: 0.0 };
             follower.last_command = speed;
             follower.control_target = Some(nuwax_nav_control::PlanarPose { x: 2.0, y: 0.55, yaw: 0.0 });
             let result = follower.bounded_command(speed);
-            if !missing_support { assert!(matches!(result, PlannerStep::Command(v) if v.linear.x > 0.0), "old ground={}: {result:?}",!fresh); }
+            if !obstacle { assert!(matches!(result, PlannerStep::Command(v) if v.linear.x > 0.0),
+                "old ground={}, unknown={missing_support}: {result:?}",!fresh); }
             else {
-                // Missing support remains a geometric failure; the physical stop interval is retained.
+                // A real occupied stopping tail retains the physical stop interval.
                 assert!(matches!(result, PlannerStep::ReplanRequired(_)), "{result:?}");
                 assert_eq!(follower.last_command, Twist2::ZERO);
                 let deadline = follower.braking_deadline.expect("已运动后须保留制动上界");
@@ -1585,10 +1639,12 @@ mod tests {
     }
 
     #[test]
-    fn unsafe_turning_arc_is_limited_before_leaving_clear_surface() {
+    fn unsafe_turning_arc_is_limited_before_crossing_a_virtual_boundary() {
         let mut follower = SurfaceFollower::new(SurfaceFollowerConfig::new(0.3)).unwrap();
+        let source=Arc::new(test_snapshot(0.0,false).with_virtual_obstacles(
+            [0.0,0.0],0.1,65,35,&vec![false;65*35]).unwrap());
         follower
-            .update_execution_map(ExecutionMap::Surface(test_snapshot(0.0, false)))
+            .update_execution_map(prepared_test_surface(source))
             .unwrap();
         follower.update_odometry(body_pose(
             [2.0, 0.205, 0.4],
@@ -1612,12 +1668,13 @@ mod tests {
     fn near_edge_heading_change_closes_without_entering_unclear_cells() {
         let map = test_snapshot(0.0, false);
         let mut follower = SurfaceFollower::new(SurfaceFollowerConfig::new(0.3)).unwrap();
+        follower.configure_boundary(&[[0.0,0.0],[6.5,0.0],[6.5,3.5],[0.0,3.5]]);
         let mut position = [1.0, 0.25, 0.4];
         let mut yaw = -std::f64::consts::FRAC_PI_2;
         let start = body_pose(position, Quaternion::from_yaw(yaw), 0);
         let goal = body_pose([4.5, 0.25, 0.4], Quaternion::IDENTITY, 0);
         follower
-            .update_execution_map(ExecutionMap::Surface(Arc::clone(&map)))
+            .update_execution_map(prepared_test_surface(Arc::clone(&map)))
             .unwrap();
         follower.update_odometry(start.clone());
         follower
@@ -1738,7 +1795,7 @@ mod tests {
         );
         let mut follower = SurfaceFollower::new(follower_config()).unwrap();
         follower
-            .update_execution_map(ExecutionMap::Surface(Arc::clone(&map)))
+            .update_execution_map(prepared_test_surface(Arc::clone(&map)))
             .unwrap();
         follower.update_odometry(body_pose(start, orientation, 0));
         let goal = body_pose(end, orientation, 0);
@@ -1787,7 +1844,7 @@ mod tests {
         let mut current = poses.first().unwrap().clone();
         let mut follower = SurfaceFollower::new(follower_config()).unwrap();
         follower
-            .update_execution_map(ExecutionMap::Surface(Arc::clone(&map)))
+            .update_execution_map(prepared_test_surface(Arc::clone(&map)))
             .unwrap();
         follower.update_odometry(current.clone());
         follower
@@ -1902,7 +1959,7 @@ mod tests {
         config.motion_limits = Some(limits.clone());
         assert!(config.max_observation_age_sec.is_none());
         let mut follower = SurfaceFollower::new(config).unwrap();
-        follower.update_execution_map(ExecutionMap::Surface(Arc::clone(&map))).unwrap();
+        follower.update_execution_map(prepared_test_surface(Arc::clone(&map))).unwrap();
         follower.update_odometry(current.clone());
         follower.configure_goal(&goal, GoalOptions {
             position_tolerance_m: 0.12, yaw_tolerance_rad: 0.15, allow_reverse: false,
@@ -1996,13 +2053,76 @@ mod tests {
     }
 
     #[test]
+    fn planar_unknown_start_gap_and_end_use_prepared_map_without_fabricated_ground() {
+        let config=test_snapshot(0.0,false).config().clone();
+        for known in [0..0,0..5,8..12,15..20] {
+            let points:Vec<_>=known.flat_map(|x|(0..30).map(move|y|
+                ((x as f32+0.5)*0.1,(y as f32+0.5)*0.1,0.05)))
+                .chain([(10.05,10.05,0.05)]).collect();
+            let map=Arc::new(SurfaceSnapshot::from_points(&points,config.clone(),0.1).unwrap());
+            let original_cells=map.cell_keys().count();
+            let mut follower=SurfaceFollower::new(follower_config()).unwrap();
+            let publication=ExecutionMap::SurfaceUpdate(crate::surface_changes::SurfaceMapUpdate::prepare(
+                map.clone(),&follower.config.pct).unwrap());
+            let prepared=match &publication {ExecutionMap::SurfaceUpdate(u)=>u.planar_reference.clone().unwrap(),_=>unreachable!()};
+            follower.update_execution_map(publication).unwrap();
+            let start=body_pose([0.25,1.55,0.5],Quaternion::IDENTITY,0);
+            let goal=body_pose([2.25,1.55,0.5],Quaternion::IDENTITY,0);
+            follower.update_odometry(start.clone());
+            follower.replace_execution_path(ExecutionPath::Surface(Path3D{poses:vec![start,goal.clone()]}),None,goal).unwrap();
+            // Evict the shared planner cache with another source; the controller
+            // retains its exact prepared immutable artifact and never derives it.
+            follower.config.pct.map(&test_snapshot(0.0,false)).unwrap();
+            for tick in 1..=150 {
+                let x=0.25+0.01*(tick as f64-1.0);
+                follower.update_odometry(body_pose([x,1.55,0.5],Quaternion::IDENTITY,tick));
+                assert!(matches!(follower.step(0.3),PlannerStep::Command(t) if t.linear.x>0.0));
+                assert!(Arc::ptr_eq(follower.planar_reference.as_ref().unwrap(),&prepared));
+            }
+            assert_eq!(map.cell_keys().count(),original_cells);
+            assert!(map.body_envelope().is_none());
+        }
+    }
+
+    #[test]
+    fn planar_preparation_identity_and_current_recent_obstacles_are_independent() {
+        let map=test_snapshot(0.0,false);
+        let mut follower=SurfaceFollower::new(follower_config()).unwrap();
+        follower.update_execution_map(ExecutionMap::Surface(map.clone())).unwrap();
+        let pose=body_pose([0.55,1.55,0.5],Quaternion::IDENTITY,0);
+        follower.update_odometry(pose.clone());
+        let goal=body_pose([3.0,1.55,0.5],Quaternion::IDENTITY,0);
+        let path=Path3D {poses:vec![pose,goal.clone()]};
+        assert!(follower.replace_execution_path(ExecutionPath::Surface(path.clone()),None,goal.clone()).is_err());
+        let prepared=crate::surface_changes::SurfaceMapUpdate::prepare(map.clone(),&follower.config.pct).unwrap();
+        let mut mismatched=prepared.clone();mismatched.snapshot=test_snapshot(0.0,true);
+        assert!(follower.update_execution_map(ExecutionMap::SurfaceUpdate(mismatched)).is_err());
+        follower.update_execution_map(ExecutionMap::SurfaceUpdate(prepared.clone())).unwrap();
+        follower.replace_execution_path(ExecutionPath::Surface(path),None,goal).unwrap();
+        let command=Twist2 {linear:Point2::new(0.55,0.0),angular_z:0.0};
+        assert!(follower.motion_is_traversable(command));
+        for point in [[0.8,1.55,0.15],[0.8,1.55,0.65],[0.8,1.749,0.3]] {
+            let mut current=prepared.clone();
+            current.snapshot=Arc::new(map.with_recent_obstacle_points(1,1,0,&[],[(0,point)]).unwrap());
+            assert!(current.planar_reference.as_ref().unwrap().matches_surface(&current.snapshot));
+            follower.update_execution_map(ExecutionMap::SurfaceUpdate(current)).unwrap();
+            assert!(!follower.motion_is_traversable(command),"recent obstacle {point:?}");
+            assert!(matches!(follower.revalidate_selected_command(command),Some(PlannerStep::ReplanRequired(_))));
+            assert!(matches!(follower.revalidate_selected_command_at_current_state(command),Some(PlannerStep::ReplanRequired(_))));
+        }
+        follower.update_execution_map(ExecutionMap::SurfaceUpdate(prepared)).unwrap();
+        assert!(follower.motion_is_traversable(command));
+        assert_eq!(follower.revalidate_selected_command_at_current_state(command),Some(PlannerStep::Command(command)));
+    }
+
+    #[test]
     fn changed_surface_requests_replan_and_partial_endpoint_never_claims_the_goal() {
         let map = test_snapshot(0.0, false);
         let start = body_pose([0.55, 1.55, 0.5], Quaternion::IDENTITY, 0);
         let end = body_pose([4.55, 1.55, 0.5], Quaternion::IDENTITY, 0);
         let mut follower = SurfaceFollower::new(follower_config()).unwrap();
         follower
-            .update_execution_map(ExecutionMap::Surface(map))
+            .update_execution_map(prepared_test_surface(map))
             .unwrap();
         follower.update_odometry(start.clone());
         follower
@@ -2016,12 +2136,13 @@ mod tests {
             .unwrap();
         assert!(matches!(follower.step(0.3), PlannerStep::Command(_)));
         follower
-            .update_execution_map(ExecutionMap::Surface(test_snapshot(0.0, true)))
+            .update_execution_map(prepared_test_surface(Arc::new(test_snapshot(0.0, true)
+                .with_recent_obstacle_points(1,1,0,&[],[(0,[0.8,1.55,0.3])]).unwrap())))
             .unwrap();
         assert!(matches!(follower.step(0.3), PlannerStep::ReplanRequired(_)));
         follower.stop();
         follower
-            .update_execution_map(ExecutionMap::Surface(test_snapshot(0.0, false)))
+            .update_execution_map(prepared_test_surface(test_snapshot(0.0, false)))
             .unwrap();
         // 同一支撑点的单点安全截断路径可以停车，但原目标仍远在4.55米。
         follower
@@ -2131,7 +2252,7 @@ mod stair_tests {
             config.controller.goal_tolerance = 0.12;
             let mut follower = SurfaceFollower::new(config).unwrap();
             follower
-                .update_execution_map(ExecutionMap::Surface(Arc::clone(&map)))
+                .update_execution_map(prepared_test_surface(Arc::clone(&map)))
                 .unwrap();
             follower.update_odometry(pose.clone());
             follower

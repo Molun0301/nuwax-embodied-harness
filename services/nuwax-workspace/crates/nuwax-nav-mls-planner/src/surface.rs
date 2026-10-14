@@ -49,7 +49,7 @@ const MAX_VIRTUAL_MASK_CELLS: usize = 16 * 1024 * 1024;
 const MAX_VIRTUAL_MASK_DIMENSION: u32 = 65_536;
 const DIRECTIONS: [(i32, i32); 4] = [(-1, 0), (1, 0), (0, -1), (0, 1)];
 
-/// 共享几何拒绝原因；没有路径或支撑不能解释成成功到达。
+/// 共享几何查询与运动检查结果；地面未知不是障碍，也不表示已经到达。
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum SurfaceError {
     /// 配置或几何工作量不满足有界计算约束。
@@ -69,8 +69,8 @@ pub enum SurfaceError {
     /// 机体/支撑点、姿态或标定偏移非法。
     #[error("invalid body/support pose or calibrated offset")]
     InvalidPose,
-    /// 自身水平单元没有满足高度约束的真实支撑。
-    #[error("no observed support in the requested column")]
+    /// 当前列没有可返回的地面观测；事实查询结果，不是运动许可门槛。
+    #[error("no ground observation in the requested column")]
     MissingSupport,
     /// 新进入的精细位置缺少合格观察。
     #[error("近场支撑{cell:?}不可用：{reason}，采样={observed_ns}，检查={checked_ns}")]
@@ -85,16 +85,17 @@ pub enum SurfaceError {
         /// 包含制动到达时间的检查时刻。
         checked_ns: u64,
     },
-    /// 支撑点离墙或边缘太近。
-    #[error("surface does not satisfy the required clearance")]
+    /// 保留旧枚举名以兼容调用者；当前运动检查仅在实际占据与机体体积相交时返回。
+    #[error("occupied geometry intersects the configured body volume")]
     InsufficientClearance,
-    /// 虚拟禁区或其足迹余量禁止使用该支撑点。
-    #[error("support is blocked by the virtual navigation boundary")]
+    /// 参考位置或实际足迹与虚拟禁行几何相交。
+    #[error("position or footprint intersects the virtual navigation boundary")]
     VirtualObstacle,
-    /// No bounded same-layer estimate is available; this is not an obstacle claim.
+    /// Legacy descriptive result with no production motion-check emitter.
+    /// Missing ground estimates remain unknown and do not reject motion.
     #[error("ground geometry is unknown at the requested location")]
     UnknownGround,
-    /// 连接经过未知支撑、非法台阶、过陡坡道或受阻轮廓。
+    /// 运动与已知坡阶、层高或实际几何冲突；旧图查询也可用来表示没有连续图边。
     #[error("surface segment is not traversable")]
     UntraversableSegment,
     /// 轮廓/边界不是合法有限多边形。
@@ -145,8 +146,6 @@ pub struct SurfaceFrontier {
 type HeightBounds = im::HashMap<VoxelKey, [f32;2], ahash::RandomState>;
 
 struct SurfaceData {
-    // 仅由受限机体查询视图持有；邻接按请求核验，不向路由消费者公开。
-    body_query_only: bool,
     body_envelope: Option<Arc<SurfaceBodyEnvelope>>,
     height_bounds: Arc<HeightBounds>,
     frontier_cache: frontiers::CacheSlot,
@@ -289,7 +288,6 @@ pub struct SurfaceSnapshot {
     data: Arc<SurfaceData>,
     observations: Option<Arc<SurfaceObservations>>,
     recent_obstacles: Option<Arc<recent::RecentObstacles>>,
-    current_body_support: Option<Arc<body::CurrentBodySupport>>,
     /// 同一不可变快照与精确位姿的检查缓存；任何几何或观察替换均清空。
     body_query_cache: Arc<std::sync::Mutex<body::BodyQueryCache>>,
     ground_evidence:GroundEvidence,
@@ -313,12 +311,10 @@ impl SurfaceSnapshot {
     /// This does not preserve snapshot-owner identity: retain the original request
     /// source for result qualification. Ordinary `Clone` continues sharing caches.
     /// No source cache is locked or copied, and no geometry/observation payload is
-    /// traversed. Current-body evidence is retained, with its source privately forked
-    /// so rebasing a body view cannot reach the controller's cache owners.
+    /// traversed. Source observation payloads stay shared; query caches are local.
     pub fn fork_for_planning(&self) -> Self {
         Self {
             data: Arc::new(SurfaceData {
-                body_query_only: self.data.body_query_only,
                 body_envelope: self.data.body_envelope.clone(),
                 height_bounds: self.data.height_bounds.clone(),
                 frontier_cache: Default::default(),
@@ -338,8 +334,6 @@ impl SurfaceSnapshot {
             }),
             observations: self.observations.as_ref().map(|source|
                 Arc::new(source.fork_for_planning())),
-            current_body_support: self.current_body_support.as_ref().map(|current|
-                Arc::new(current.fork_for_planning())),
             body_query_cache: Default::default(),
             ground_evidence: self.ground_evidence,
             recent_obstacles:self.recent_obstacles.clone(),
@@ -349,9 +343,7 @@ impl SurfaceSnapshot {
     /// 声明来源的物理含义；改变后重新建立接触和规划缓存。
     pub fn with_ground_evidence(mut self,evidence:GroundEvidence)->Self {
         if self.ground_evidence==evidence {return self;}
-        if let Some(current)=self.current_body_support.take() {
-            self=current.source.with_observations(self.observations.clone());
-        }
+
         self.ground_evidence=evidence;
         self.body_query_cache=Default::default();
         self
@@ -492,10 +484,7 @@ impl SurfaceSnapshot {
     }
 
     fn with_virtual_mask(&self, mask: Arc<VirtualObstacleMask>) -> Result<Self, SurfaceError> {
-        if let Some(current) = &self.current_body_support {
-            return current.source.with_observations(self.observations.clone()).with_recent_obstacles_from(self)
-                .with_virtual_mask(mask)?.with_current_body_support(current.body, current.quaternion);
-        }
+
         let physical = Arc::clone(&self.data.physical_graph);
         let excluded: AHashSet<_> = physical
             .cells
@@ -510,9 +499,8 @@ impl SurfaceSnapshot {
             .collect();
         let (graph, regions) = if excluded.is_empty() {
             // The finite mask still applies to later body and boundary queries.
-            // A query-only graph may carry an inherited, stale routing index.
-            let regions = if !self.data.body_query_only
-                && Arc::ptr_eq(&self.data.graph, &physical)
+            // Reuse the region index only when the physical graph is unchanged.
+            let regions = if Arc::ptr_eq(&self.data.graph, &physical)
             {
                 Arc::clone(&self.data.regions)
             } else {
@@ -531,10 +519,8 @@ impl SurfaceSnapshot {
             ground_evidence:self.ground_evidence,
             recent_obstacles:self.recent_obstacles.clone(),
             observations: self.observations.clone(),
-            current_body_support: None,
             body_query_cache: Default::default(),
             data: Arc::new(SurfaceData {
-                body_query_only: false,
                 frontier_cache: Default::default(),
                 body_cache: Default::default(),
                 routing_cache: Default::default(),
@@ -636,7 +622,7 @@ impl SurfaceSnapshot {
         body_xyzw: [f64; 4],
         body_to_support_z_m: f64,
     ) -> Result<[f64; 3], SurfaceError> {
-        self.locate_support(support_xyz)?;
+        if !support_xyz.into_iter().all(f64::is_finite) { return Err(SurfaceError::InvalidPose); }
         let offset = rotated_support_offset(body_xyzw, body_to_support_z_m)?;
         Ok(std::array::from_fn(|index| {
             support_xyz[index] - offset[index]
@@ -1067,26 +1053,12 @@ impl SurfaceSnapshot {
         let cell = self
             .nearest_column_cell(ix, iy, support_xyz[2], tolerance)
             .ok_or(SurfaceError::MissingSupport)?;
-        if self.current_body_support.as_ref().is_some_and(|current| {
-            current.cells.contains(&cell)
-                && !inside_boundary([support_xyz[0], support_xyz[1]], &current.polygon)
-        }) {
-            return Err(SurfaceError::MissingSupport);
-        }
-        if self
-            .data
-            .graph
-            .cells
-            .id(cell)
-            .is_some_and(|id| self.data.virtual_blocked_cells.contains(&id))
-            || (self.data.body_query_only && self.data.virtual_obstacles.as_ref().is_some_and(|mask|
-                !mask.permits_cell(cell,size,0.0)))
-        {
+
+        if self.data.virtual_obstacles.as_ref().is_some_and(|mask| !mask.permits_cell(cell,size,0.0)) {
             return Err(SurfaceError::VirtualObstacle);
         }
-        if !self.cell_is_clear(cell) {
-            return Err(SurfaceError::InsufficientClearance);
-        }
+        // A terrain lookup identifies a measured layer; wall-distance penalties
+        // belong to route ranking, not an additional body-collision admission.
         Ok(SurfaceLocation {
             cell,
             support_xyz,
@@ -1125,7 +1097,6 @@ impl SurfaceSnapshot {
     }
 
     fn cell_is_clear(&self, cell: VoxelKey) -> bool {
-        if self.data.body_query_only {return self.body_query_cell_is_clear(cell);}
         self.data.graph.cells.id(cell).is_some_and(|id| {
             if self.data.virtual_blocked_cells.contains(&id) {
                 return false;
@@ -1149,7 +1120,6 @@ impl SurfaceSnapshot {
     }
 
     fn has_geometric_edge(&self, from: VoxelKey, to: VoxelKey) -> bool {
-        if self.data.body_query_only {return self.body_query_transition(from,to).is_some();}
         let (Some(from), Some(to)) = (self.data.graph.cells.id(from), self.data.graph.cells.id(to))
         else {
             return false;
@@ -1163,7 +1133,6 @@ impl SurfaceSnapshot {
     }
 
     fn has_edge(&self, from: VoxelKey, to: VoxelKey) -> bool {
-        if self.data.body_query_only {return self.body_query_edge_is_allowed(from,to);}
         let (Some(from), Some(to)) = (self.data.graph.cells.id(from), self.data.graph.cells.id(to))
         else {
             return false;
@@ -1792,10 +1761,8 @@ mod tests {
         let narrow =
             SurfaceSnapshot::from_points(&points_for_profile(&vec![0; 72], 3), config(), SIZE)
                 .unwrap();
-        assert!(matches!(
-            narrow.locate_support(support(20, 1, 0)),
-            Err(SurfaceError::InsufficientClearance)
-        ));
+        narrow.locate_support(support(20,1,0)).unwrap();
+        assert!(narrow.cell_is_clear((20,1,0)),"unobserved neighbouring columns are not walls");
 
         let mut points = points_for_profile(&vec![0; 72], 20);
         points.retain(|point| voxelize(*point, SIZE).0 != 36);
@@ -2061,7 +2028,9 @@ mod tests {
                 path.iter().any(|point| point[1] > 1.3),
                 "应沿虚拟线端部保留足迹余量绕行"
             );
-            assert!(constrained.locate_support(support(46, 12, z)).is_err());
+            constrained.locate_support(support(46, 12, z)).unwrap();
+            assert!(!constrained.cell_is_clear((46,12,z)),
+                "terrain lookup stays factual while graph routing retains configured mask clearance");
             constrained.locate_support(support(44, 12, z)).unwrap();
         }
     }
@@ -2074,10 +2043,9 @@ mod tests {
             .unwrap();
         for z in [0, 60] {
             assert!(limited.locate_support(support(10, 20, z)).is_err());
-            assert!(
-                limited.locate_support(support(20, 20, z)).is_err(),
-                "范围边缘也须留出机器人半宽"
-            );
+            limited.locate_support(support(20, 20, z)).unwrap();
+            assert!(!limited.cell_is_clear((20,20,z)),
+                "graph routing retains the configured robot half-width at the extent");
             limited.locate_support(support(24, 20, z)).unwrap();
         }
         let blocked = physical

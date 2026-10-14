@@ -64,6 +64,10 @@ impl Cancellation {
     pub(crate) fn flag(&self) -> &AtomicBool {
         self.0.as_ref()
     }
+    /// Share this same owner flag with synchronous map-construction checkpoints.
+    pub(crate) fn shared_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.0)
+    }
     fn new() -> Self {
         Self(Arc::new(AtomicBool::new(false)))
     }
@@ -885,6 +889,7 @@ mod tests {
         let cancellation = Cancellation::new();
         let same_token = cancellation.clone();
         assert!(std::ptr::eq(cancellation.flag(), same_token.flag()));
+        assert!(std::ptr::eq(cancellation.flag(), cancellation.shared_flag().as_ref()));
         assert!(!cancellation.flag().load(Ordering::Acquire));
         same_token.cancel();
         assert!(cancellation.flag().load(Ordering::Acquire));

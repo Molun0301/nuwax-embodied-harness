@@ -138,7 +138,6 @@ mod footprint_container_experiment {
         let map=scene(&[],true).with_observations(Some(observation_grid(|cells|{cells.remove(&[4,0,0]);})));
         let pose=([0.05,0.05,0.5],[0.0,0.0,0.0,1.0]);
         let view=map.with_current_body_support(pose.0,pose.1).unwrap();
-        assert!(view.current_body_support.is_none(),"缺测不是碰撞，不应为通过几何检查派生补地视图");
         assert_private_parity(&view,pose);
         assert_eq!(view.body_observation_footprint(pose),map.body_observation_footprint(pose));
         assert!(view.data.physical_graph.surface_lookup.get(&(4,0)).is_none(),"缺测列不能被补成地面");

@@ -4347,7 +4347,7 @@ mod tests {
 
         handle
             .update_costmap(CostmapObservation {
-                costmap: ExecutionMap::Surface(surface_follower::test_snapshot(0.0, false)),
+                costmap: surface_follower::prepared_test_surface(surface_follower::test_snapshot(0.0, false)),
                 source_timestamp_ns: 1_000_000_000,
             })
             .await
@@ -4368,7 +4368,8 @@ mod tests {
         assert!(handle.status().last_applied_twist.unwrap().linear.x > 0.0);
         handle
             .update_costmap(CostmapObservation {
-                costmap: ExecutionMap::Surface(surface_follower::test_snapshot(0.0, true)),
+                costmap: surface_follower::prepared_test_surface(Arc::new(surface_follower::test_snapshot(0.0, true)
+                    .with_recent_obstacle_points(1,1,0,&[],[(0,[0.8,1.55,0.3])]).unwrap())),
                 source_timestamp_ns: 2_000_000_000,
             })
             .await
@@ -4379,7 +4380,7 @@ mod tests {
         assert_eq!(handle.status().last_terminal, None);
         handle
             .update_costmap(CostmapObservation {
-                costmap: ExecutionMap::Surface(surface_follower::test_snapshot(0.0, false)),
+                costmap: surface_follower::prepared_test_surface(surface_follower::test_snapshot(0.0, false)),
                 source_timestamp_ns: 3_000_000_000,
             })
             .await

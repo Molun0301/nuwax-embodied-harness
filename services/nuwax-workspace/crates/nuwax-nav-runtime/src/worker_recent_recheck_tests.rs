@@ -59,7 +59,7 @@ fn recent_recheck_fixture()->(PlannerWorker,Arc<SurfaceSnapshot>,Arc<Mutex<Recen
 }
 fn publish_recent_for_recheck(worker:&mut PlannerWorker,previous:&Arc<SurfaceSnapshot>,sequence:u64,point:[f64;3])->Arc<SurfaceSnapshot> {
     let next=Arc::new(previous.with_recent_obstacle_points(sequence,sequence*1_000_000_000,0,&[0],[(0,point)]).unwrap());
-    worker.update_execution_map(ExecutionMap::SurfaceUpdate(surface_changes::SurfaceMapUpdate {
+    worker.update_execution_map(ExecutionMap::SurfaceUpdate(surface_changes::SurfaceMapUpdate {planar_reference:None,
         snapshot:next.clone(),change_basis:Some(previous.clone()),changes:Arc::new(surface_changes::SurfaceGeometryChanges::Empty),
     })).unwrap();next
 }

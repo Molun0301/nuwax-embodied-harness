@@ -56,20 +56,12 @@ fn occupied_volume_cleared_top_never_selects_an_internal_height() {
         let query=PolygonQuery::new(&polygon);
         let rows=raw.fine_ground_columns(None,&query,&prism,body,r[2],0,0).unwrap();
         assert_eq!(rows.iter().find(|c|c.xy==[0,0]).unwrap().height.map(f64::to_bits),Some((3.0*fine).to_bits()));
-        // Focused private-mask fixture: immutable source members remain intact;
-        // only its exposed top is excluded for this query's body view.
-        let mut view=raw.clone();view.body_query_cache=Default::default();
-        view.current_body_support=Some(Arc::new(CurrentBodySupport {
-            source:raw.clone(),body,quaternion:q,polygon:Arc::new(polygon.clone()),
-            cells:Arc::new(AHashSet::new()),cleared_voxels:Arc::new(AHashSet::from_iter([[0,0,2]])),
-        }));
+        // A query shares complete original bands and does not clear their top.
+        let view=raw.clone();
         let rows=view.fine_ground_columns(None,&query,&prism,body,r[2],0,0).unwrap();
-        let height=rows.iter().find(|c|c.xy==[0,0]).unwrap().height;
-        let expected=if evidence==GroundEvidence::OccupiedVolume {None}else{Some(2.0*fine)};
-        assert_eq!(height.map(f64::to_bits),expected.map(f64::to_bits),"{evidence:?}");
+        assert_eq!(rows.iter().find(|c|c.xy==[0,0]).unwrap().height.map(f64::to_bits),Some((3.0*fine).to_bits()));
         assert_eq!(view.fine_contact_bands(0,0)[0].run,[0,2]);
         for key in keys {assert!(view.observations.as_ref().unwrap().get(key).is_some());}
-        assert!(!view.current_body_support.as_ref().unwrap().cleared_voxels.contains(&[0,0,1]));
     }
 }
 
@@ -107,17 +99,13 @@ fn fine_contact_runs_only_authorize_supported_source_members_across_gaps_and_mas
     let body=[0.025,0.025,base.body_envelope().unwrap().body_to_support_z_m];
     let polygon=vec![[0.01,0.01],[0.04,0.01],[0.04,0.04],[0.01,0.04]];
     for evidence in [GroundEvidence::MeasuredSurface,GroundEvidence::OccupiedVolume] {
-        for masked in [false,true] {
+        for _repeat in [false,true] {
             let mut map=base.clone().with_ground_evidence(evidence);map.body_query_cache=Default::default();
-            if masked {map.current_body_support=Some(Arc::new(CurrentBodySupport {
-                source:map.clone(),body,quaternion:q,polygon:Arc::new(polygon.clone()),
-                cells:Arc::new(AHashSet::new()),cleared_voxels:Arc::new(AHashSet::from_iter([[0,0,-2],[0,0,2]])),
-            }));}
             let prism=PrismQuery::new(map.body_envelope().unwrap(),r,body);
             let rows=map.fine_ground_columns(None,&PolygonQuery::new(&polygon),&prism,body,r[2],0,0).unwrap();
             let row=rows.iter().find(|row|row.xy==[0,0]).unwrap();
             assert!(row.permits_contact(-3)&&row.permits_contact(-1),"selected original run");
-            assert_eq!(row.permits_contact(-2),!masked,"selected run cannot bridge a cleared member");
+            assert!(row.permits_contact(-2),"all original selected-band members remain available");
             assert!(row.permits_contact(1)&&row.permits_contact(2),"extra original run remains source-backed, including a privately cleared member");
             for z in -5..=5 {
                 assert!(!row.permits_contact(z)||keys.contains(&[0,0,z]),"cannot bridge a source gap");

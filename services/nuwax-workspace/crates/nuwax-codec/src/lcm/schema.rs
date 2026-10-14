@@ -792,7 +792,7 @@ pub fn validate_navigation_map_3d(message: &NavigationMap3D) -> Result<(), Strin
         if message.cleared || root.domain != navigation_map_3d_domain(message)
             || root.revision != message.cloud_revision as u64
             || root.source_timestamp_ns != message.source_timestamp_ns as u64
-            || root.voxel_size_m != message.source_voxel_size || root.blocks.is_empty() {
+            || root.voxel_size_m != message.source_voxel_size {
             return Err("精细根与三维规范提交不一致".into());
         }
         if fine.included.len() > NAVIGATION_MAP_MAX_INCLUDED_BLOCKS {
@@ -3016,6 +3016,32 @@ mod navigation_map_3d_tests {
     }
 
     #[test]
+    fn committed_empty_fine_root_is_valid_but_absent_corrupt_clear_and_foreign_roots_are_not() {
+        let mut message = live_map();
+        message.cloud.width = 0;
+        message.cloud.row_step = 0;
+        message.cloud.data.clear();
+        let root = nuwax_map_chunks::Manifest {
+            version: 2, domain: navigation_map_3d_domain(&message),
+            revision: message.cloud_revision as u64, geometry_revision: message.cloud_revision as u64,
+            source_timestamp_ns: message.source_timestamp_ns as u64,
+            voxel_size_m: message.source_voxel_size, blocks: Vec::new(),
+        };
+        message.fine = Some(nuwax_map_chunks::Transfer {root:root.encode().unwrap(),included:Default::default()});
+        assert!(validate_navigation_map_3d(&message).is_ok());
+        assert_eq!(decode_navigation_map_3d(&encode_navigation_map_3d(&message).unwrap()).unwrap(),message);
+        let mut absent = message.clone(); absent.fine = None;
+        assert!(validate_navigation_map_3d(&absent).is_err());
+        let mut corrupt = message.clone(); corrupt.fine.as_mut().unwrap().root.clear();
+        assert!(validate_navigation_map_3d(&corrupt).is_err());
+        let mut cleared = message.clone(); cleared.cleared = true;
+        assert!(validate_navigation_map_3d(&cleared).is_err());
+        let mut foreign = root; foreign.domain.generation += 1;
+        let mut wrong = message; wrong.fine.as_mut().unwrap().root = foreign.encode().unwrap();
+        assert!(validate_navigation_map_3d(&wrong).is_err());
+    }
+
+    #[test]
     fn clear_is_explicit_absence_and_partial_occupancy_receipts_are_rejected() {
         let cleared = cleared_map();
         assert!(validate_navigation_map_3d(&cleared).is_ok());
@@ -3359,7 +3385,6 @@ mod navigation_map_3d_tests {
                 |root| root.revision += 1,
                 |root| root.voxel_size_m *= 2.0,
                 |root| root.source_timestamp_ns += 1,
-                |root| root.blocks.clear(),
             ] {
                 let mut mismatched = compound.clone();
                 let fine = mismatched.fine.as_mut().unwrap();
@@ -3368,6 +3393,14 @@ mod navigation_map_3d_tests {
                 fine.root = root.encode().unwrap();
                 assert_fine_wire_error(&valid, &mismatched, "精细根与三维规范提交不一致");
             }
+
+            // A committed empty root is valid; carrying an orphan block is not.
+            let mut empty_with_inclusion = compound.clone();
+            let fine = empty_with_inclusion.fine.as_mut().unwrap();
+            let mut root = Manifest::decode(&fine.root).unwrap();
+            root.blocks.clear();
+            fine.root = root.encode().unwrap();
+            assert_fine_wire_error(&valid, &empty_with_inclusion, "携带精细块不属于根清单");
 
             let mut outside = compound;
             let fine = outside.fine.as_mut().unwrap();

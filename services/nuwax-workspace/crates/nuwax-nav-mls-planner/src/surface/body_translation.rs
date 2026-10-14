@@ -294,6 +294,25 @@ fn grid_interval_samples(mut times:Vec<f64>)->Vec<f64> {
     samples.push(1.0);samples
 }
 
+// All crossed source cells, including boundary and interior samples. The same
+// reference geometry is used with and without a calibrated body envelope.
+pub(super) fn reference_grid_fractions(a:[f64;3],b:[f64;3],size:f64)->Result<Vec<f64>,SurfaceError> {
+    if !a.into_iter().chain(b).all(|v|v.is_finite() && (v/size).abs()<f64::from(i32::MAX)*0.5) {
+        return Err(SurfaceError::InvalidPose);
+    }
+    let mut times=vec![0.0,1.0];
+    for axis in 0..3 {
+        let delta=b[axis]-a[axis];if delta==0.0 {continue;}
+        let first=(a[axis].min(b[axis])/size).floor() as i32+1;
+        let last=(a[axis].max(b[axis])/size).floor() as i32;
+        for index in first..=last {
+            let t=(f64::from(index)*size-a[axis])/delta;
+            if t>0.0 && t<1.0 {times.push(t);}
+        }
+    }
+    Ok(grid_interval_samples(times))
+}
+
 impl SurfaceSnapshot {
     /// 按实际四元数插值求足下参考穿过精细网格的全部时刻。
     pub(super) fn body_support_grid_fractions(&self,from:([f64;3],[f64;4]),to:([f64;3],[f64;4]),size:f64)
@@ -302,17 +321,7 @@ impl SurfaceSnapshot {
         if rotation(from.1)?==rotation(to.1)? {
             let a=self.support_position_from_body(from.0,from.1,model.body_to_support_z_m)?;
             let b=self.support_position_from_body(to.0,to.1,model.body_to_support_z_m)?;
-            let mut times=vec![0.0,1.0];
-            for axis in 0..3 {
-                let delta=b[axis]-a[axis];if delta==0.0 {continue;}
-                let first=(a[axis].min(b[axis])/size).floor() as i32+1;
-                let last=(a[axis].max(b[axis])/size).floor() as i32;
-                for index in first..=last {
-                    let t=(f64::from(index)*size-a[axis])/delta;
-                    if t>0.0 && t<1.0 {times.push(t);}
-                }
-            }
-            return Ok(grid_interval_samples(times));
+            return reference_grid_fractions(a,b,size);
         }
         let events=RotationEvents::new(model,from,to);
         let point=[0.0,0.0,-model.body_to_support_z_m];
@@ -486,8 +495,7 @@ impl SurfaceSnapshot {
                                     let key = [ix,iy,iz];
                                     if observations.get(key).is_none() { continue; }
                                     found_fine = true;
-                                    if f64::from(iz+1)*fine <= cutoff || !observations.get(key).is_some()
-                                        || self.current_body_support.as_ref().is_some_and(|c| c.cleared_voxels.contains(&key)) { continue; }
+                                    if f64::from(iz+1)*fine <= cutoff || !observations.get(key).is_some() { continue; }
                                     let low=key.map(|v|f64::from(v)*fine);let high=key.map(|v|f64::from(v+1)*fine);
                                     if let Some(interval) = prism.expanded_translated_interval(displacement,low,high,padding) {
                                         if let Some(events)=&events {for interval in events.contacts(model,low,high,interval,&changes) {record(interval)?;}}

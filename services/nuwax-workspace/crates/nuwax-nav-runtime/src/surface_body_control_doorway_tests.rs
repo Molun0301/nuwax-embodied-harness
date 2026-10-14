@@ -1112,10 +1112,8 @@ fn tga_limits(car: bool) -> MotionLimits {
 fn tga_map(missing_future_strip: bool, expired_future_strip: bool) -> Arc<SurfaceSnapshot> {
     let base = super::super::test_snapshot(0.0, false);
     let geometry = if missing_future_strip {
-        // The current footprint [0.9,1.1] and first 50-ms footprint through
-        // x=1.125 remain supported. The unavoidable stopping footprint enters
-        // the missing strip's existing clearance margin. The strip itself is
-        // [1.3,1.5); the stopping footprint need not enter it. Floor beyond remains real.
+        // The raw [1.3,1.5) strip is unknown. It is not an inflated wall;
+        // full body stopping checks still reject actual occupancy and boundaries.
         let points: Vec<_> = (0..65)
             .filter(|x| !(13..=14).contains(x))
             .flat_map(|x| (0..35).map(move |y| {
@@ -1299,27 +1297,23 @@ fn translation_advice_rejects_restrictive_boundary_in_stopping_tail() {
 }
 
 #[test]
-fn translation_advice_rejects_missing_future_support_in_stopping_tail() {
-    use nuwax_nav_mls_planner::surface::SurfaceError;
+fn translation_advice_keeps_unknown_future_ground_and_checks_the_complete_tail() {
     let mut follower = tga_straight(tga_map(false, false), false);
-    // Legitimate post-admission map change: the previously admitted forward
-    // route loses future support. Keep the route and actual pose unchanged.
-    follower.update_execution_map(ExecutionMap::Surface(tga_map(true, false))).unwrap();
-    assert!(follower.current_body_error().is_none(), "the actual body must remain valid");
+    let unknown=tga_map(true,false);
+    follower.update_execution_map(ExecutionMap::Surface(unknown.clone())).unwrap();
+    assert!(follower.current_body_error().is_none());
     follower.observe_applied_command(tga_speed());
     tga_assert_initial_period_valid(&follower);
-    let (safe, why) = tga_prove_command(&follower, tga_speed(), Twist2::ZERO);
-    assert!(!safe);
-    assert!(matches!(why, Some(SurfaceError::MissingSupport)
-        | Some(SurfaceError::UntraversableSegment)
-        | Some(SurfaceError::InsufficientClearance)),
-        "must be a geometric future-body failure, not expiry or bad current input: {why:?}");
-    let result = follower.follow_body_step_policy::<true,true,true,true>(0.3);
-    assert!(matches!(&result, PlannerStep::ReplanRequired(reason) if reason.contains("扫掠拒绝")), "{result:?}");
-    assert_eq!(follower.last_command, Twist2::ZERO);
-    assert!(follower.braking_deadline.is_some());
-    assert_eq!(follower.path_index, 1);
-    assert_eq!(follower.progress_m, 0.0);
+    let (safe,why)=tga_prove_command(&follower,tga_speed(),Twist2::ZERO);
+    assert!(safe,"missing terrain is not an occupied stopping-tail obstacle: {why:?}");
+    let result=follower.follow_body_step_policy::<true,true,true,true>(0.3);
+    let PlannerStep::Command(command)=result else {panic!("{result:?}")};
+    assert!(command.linear.x>0.0);
+    let (safe,why)=tga_prove_command(&follower,tga_speed(),command);
+    assert!(safe,"the advancing command still runs the complete stopping check: {why:?}");
+    assert!(follower.braking_deadline.is_none());
+    assert!(unknown.observations().unwrap().column_levels(13,5).is_none(),
+        "motion must not manufacture the missing source column");
 }
 
 #[test]
@@ -1746,7 +1740,8 @@ fn captured_legacy_step(follower: &mut SurfaceFollower) -> PlannerStep {
 #[test]
 fn translation_advice_approaches_blocked_future_then_replans_and_stops_safely() {
     use nuwax_nav_mls_planner::surface::SurfaceError;
-    let source = tga_map(true, false);
+    let source = Arc::new(tga_map(false,false).with_recent_obstacle_points(
+        1,1,0,&[],(0..35).map(|y|(0,[1.55,(f64::from(y)+0.5)*0.1,0.4]))).unwrap());
     let start = tga_pose(0.8, 0.55, 0.0);
     let goal = tga_pose(2.0, 0.55, 0.0);
     let initial = body(&start);
@@ -2528,7 +2523,7 @@ fn collinear_progress_retains_current_guard_after_consuming_a_reached_sample() {
         assert_eq!(record.calls[Stage::TranslationConnector as usize],0,"{case}: this must exercise the eligible bypass");
         assert_eq!(record.counters[Counter::ConnectionSubsteps as usize],0);
         assert!(record.calls[Stage::CandidateRankingSweeps as usize]>0,"{case}: the current guard must run");
-        if case=="fresh"||case=="expired_tail" {
+        if case=="fresh"||case=="expired_tail"||case=="missing_tail" {
             let PlannerStep::Command(command)=result else {panic!("{case}: {result:?}")};
             assert!(command.linear.x>0.0);
             let (safe,why)=tga_prove_command(&follower,tga_speed(),command);assert!(safe,"{why:?}");

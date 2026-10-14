@@ -654,7 +654,7 @@ mod tests {
         let _=harness.next_computation(); // Owner is now held after a real guarded step.
         let source=harness.clear.clone();
         for columns in [vec![[10,10]],vec![[100,100]],vec![[110,100]]] {
-            harness.worker.update_execution_map(ExecutionMap::SurfaceUpdate(SurfaceMapUpdate {
+            harness.worker.update_execution_map(ExecutionMap::SurfaceUpdate(SurfaceMapUpdate {planar_reference:None,
                 snapshot:source.clone(),change_basis:Some(source.clone()),
                 changes:Arc::new(SurfaceGeometryChanges::Columns {fine_size:source.source_voxel_size_m(),
                     fine:columns,planner_size:source.config().voxel_size,coarse:vec![]}),

@@ -49,12 +49,24 @@ pub(crate) fn same_query_semantics(a:&SurfaceSnapshot,b:&SurfaceSnapshot)->bool 
 pub struct SurfaceMapUpdate {
     /// Latest immutable source for the execution guard.
     pub snapshot: Arc<SurfaceSnapshot>,
+    /// Static planar query artifact prepared off the control thread for this exact source.
+    /// Recent obstacle frames are intentionally checked on the live snapshot separately.
+    pub planar_reference: Option<Arc<nuwax_nav_pct::Tomogram>>,
     /// Successful source immediately preceding these differences.
     pub change_basis: Option<Arc<SurfaceSnapshot>>,
     /// Complete geometry differences, never inferred from a revision number alone.
     pub changes: Arc<SurfaceGeometryChanges>,
 }
 impl SurfaceMapUpdate {
+    /// Prepare a raw immutable surface before handing it to an execution owner.
+    /// This can derive a tomogram and must run on the existing background map or
+    /// planning owner, never inside update_execution_map or a controller tick.
+    /// Callers with complete deltas may replace the default Unknown change proof.
+    pub fn prepare(snapshot:Arc<SurfaceSnapshot>,planner:&nuwax_nav_pct::PctPlanner)->Result<Self,String> {
+        let planar_reference=if snapshot.body_envelope().is_none() {Some(planner.map(&snapshot)?)} else {None};
+        Ok(Self {snapshot,planar_reference,change_basis:None,changes:Arc::new(SurfaceGeometryChanges::Unknown)})
+    }
+
     /// Coalesce undelivered publications without dropping intermediate deletions or additions.
     /// This only joins the existing bounded column sets; a gap remains Unknown.
     pub fn append(&mut self, next: Self) {
@@ -79,6 +91,7 @@ impl SurfaceMapUpdate {
             }
         };
         self.snapshot=next.snapshot;
+        self.planar_reference=next.planar_reference;
         self.changes=merged;
     }
 }

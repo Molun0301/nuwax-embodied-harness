@@ -19,6 +19,8 @@ pub struct SurfaceNavigationConfig {
     pub robot_width_m: f64,
     /// 当前后台搜索的取消信号；不进入机器人标定或地图身份。
     pub(crate) planning_cancelled: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Owner-local work budget for this attempt; never part of calibration/map identity.
+    pub(crate) planning_search_budget: Option<usize>,
 }
 
 impl SurfaceNavigationConfig {
@@ -224,6 +226,7 @@ impl SurfaceNavigationConfig {
             follower,
             robot_width_m,
             planning_cancelled: None,
+            planning_search_budget: None,
         })
     }
     /// 两端用同一已验证标定物化外形和运动约束。

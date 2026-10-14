@@ -99,6 +99,11 @@ pub enum NavStackError {
         reason: String,
     },
 
+    /// Producer-typed PCT outcome, preserving inconclusive resource/domain status.
+    #[cfg(feature = "mls")]
+    #[error("pct global planning: {0}")]
+    Planning(#[from] nuwax_nav_pct::PlanningFailure),
+
     /// 任意内部错误(不应当发生,如果发生请报告)。
     #[error("internal nav-stack error: {0}")]
     Internal(String),

@@ -64,6 +64,9 @@ impl FrozenSurfaceWindow for Tomogram {
             }
             result.compute_costs()?;
         }
+        // Retain identical mask provenance while comparing graph construction.
+        result.source = Some(source.clone());
+        result.window = window;
         checkpoint()?;
         Ok(result)
     }
@@ -212,10 +215,13 @@ fn masked_surface_matches_frozen_wrapper_exactly() {
         let blocked = source.with_virtual_obstacles([0.0, 0.0], f64::from(FINE),
             36, 26, &vec![true; 36 * 26]).unwrap();
         for window in [None, Some(LOCAL)] {
-            let old = <Tomogram as FrozenSurfaceWindow>::from_surface_window(&blocked, window).unwrap_err();
-            let new = current(&blocked, window).unwrap_err();
-            assert_eq!(old, "层析地图没有可用地面");
-            assert_eq!(old, new);
+            let old = <Tomogram as FrozenSurfaceWindow>::from_surface_window(&blocked, window).unwrap();
+            let new = current(&blocked, window).unwrap();
+            assert!(old.cells.is_empty() && new.cells.is_empty());
+            for map in [&old, &new] {
+                assert!(map.plan([0.275,0.425,0.05],[1.525,0.425,0.05],0.01,&[],None).is_err(),
+                    "an empty graph never erases a fully forbidden mask");
+            }
         }
     }
 }

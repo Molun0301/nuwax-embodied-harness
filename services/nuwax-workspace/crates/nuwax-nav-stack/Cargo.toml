@@ -225,6 +225,8 @@ futures = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["rt", "time", "macros", "process", "io-util", "signal"] }
 
 [dev-dependencies]
+# Offline frozen-source diagnostic; no runtime dependency or new external package.
+nuwax-nav-scan = { path = "../nuwax-nav-scan" }
 async-trait = { workspace = true }
 # 单元测试可读 fixture / JSON
 serde_json = { workspace = true }
@@ -240,3 +242,9 @@ nuwax-nav-test-fixtures = { path = "../nuwax-nav-test-fixtures" }
 name = "nuwax-nav-stack"
 path = "src/bin/nuwax_nav_stack.rs"
 required-features = []
+
+
+[[example]]
+name = "frozen_unknown_pipeline"
+path = "examples/frozen_unknown_pipeline.rs"
+required-features = ["mls"]

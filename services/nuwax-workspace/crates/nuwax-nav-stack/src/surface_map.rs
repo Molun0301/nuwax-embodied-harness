@@ -8,6 +8,24 @@ use std::sync::Arc;
 
 pub(crate) use nuwax_nav_runtime::surface_changes::SurfaceGeometryChanges;
 
+/// An unavailable candidate is not a revocation of the last complete map.
+/// Only missing immutable-object transport/deadline failures are retryable;
+/// malformed roots, objects, replies and geometry remain authoritative failures.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum SurfaceMapBuildError {
+    #[error("{0}")]
+    IncompleteFineSource(String),
+    #[error("{0}")]
+    Invalid(String),
+}
+
+impl From<String> for SurfaceMapBuildError {
+    fn from(reason: String) -> Self { Self::Invalid(reason) }
+}
+impl From<&str> for SurfaceMapBuildError {
+    fn from(reason: &str) -> Self { Self::Invalid(reason.into()) }
+}
+
 pub(crate) struct SurfaceMapUpdate {
     pub snapshot: Arc<SurfaceSnapshot>,
     pub change_basis: Option<Arc<SurfaceSnapshot>>,
@@ -162,13 +180,13 @@ impl SurfaceMapCache {
         &mut self,
         message: &schema::NavigationMap3D,
     ) -> Result<Arc<SurfaceSnapshot>, String> {
-        self.build_with_changes(message).map(|update| update.snapshot)
+        self.build_with_changes(message).map(|update| update.snapshot).map_err(|error| error.to_string())
     }
 
     pub(crate) fn build_with_changes(
         &mut self,
         message: &schema::NavigationMap3D,
-    ) -> Result<SurfaceMapUpdate, String> {
+    ) -> Result<SurfaceMapUpdate, SurfaceMapBuildError> {
         // A failed mask derivation may have advanced physical/builder state. Its
         // next local delta cannot be attached to the previous successful source.
         let change_basis = self.latest.as_ref().map(|old| Arc::clone(&old.snapshot));

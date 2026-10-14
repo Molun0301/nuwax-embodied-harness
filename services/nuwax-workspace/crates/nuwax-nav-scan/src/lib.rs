@@ -154,11 +154,10 @@ fn project_endpoint(
     let began=std::time::Instant::now();
     cancellation::checkpoint()?;
     let mut witness=None;
-    let view=map.body_query_with_current_support_and_witness(from.0,from.1,&mut witness);
+    let view=map.body_query();
     #[cfg(feature="profile")]
-    profile::record(0,began,view.is_err());
+    profile::record(0,began,false);
     cancellation::checkpoint()?;
-    let view=view.map_err(|e|LocalPlanError::from_surface(e,witness))?;
     #[cfg(feature="profile")]
     let began=std::time::Instant::now();
     let next=view.body_pose_after_motion_with_witness(from,xy,heading,&mut witness);
@@ -960,12 +959,14 @@ mod tests {
     }
 
     #[test]
-    fn body_witness_rotate_missing_support_uses_neutral_failure_text() {
+    fn rotation_over_unknown_ground_preserves_geometry_and_checks_every_sweep() {
         let map=scene(None);let start=([100.0,100.0,0.4],[0.0,0.0,0.0,1.0]);
-        let mut path=vec![start];let failure=rotate(&map,&mut path,0.5,&motion(),&[]).unwrap_err();
-        assert_eq!(path,vec![start]);
-        assert_eq!(failure.reason,"近场初始转向未通过机体/支撑检查");
-        assert!(!failure.to_string().contains("实际机体障碍阻断"));
+        let mut path=vec![start];rotate(&map,&mut path,0.5,&motion(),&[]).unwrap();
+        assert!(path.len()>1);
+        for pair in path.windows(2) {map.validate_body_motion(pair[0],pair[1],&[]).unwrap();}
+        assert_eq!(map.query_ground([100.0,100.0],0.0).state,
+            nuwax_nav_mls_planner::surface::GroundQueryState::Unknown);
+        assert!((yaw(path.last().unwrap().1)-0.5).abs()<1e-8);
     }
 
     #[test]

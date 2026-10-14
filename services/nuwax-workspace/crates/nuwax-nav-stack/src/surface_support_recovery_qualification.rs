@@ -17,7 +17,7 @@ use nuwax_nav_types_messages::{MotionLimits, MotionModel, NavigationCapabilities
 
 const SAMPLE_PERIOD: Duration = Duration::from_millis(200);
 const QUALIFICATION_WINDOW: Duration = Duration::from_secs(60);
-const SUPPORT_WAIT: &str = "当前机体支撑或净空尚不可用";
+const SUPPORT_WAIT: &str = "当前机体几何检查未通过";
 const RESOLUTION: f32 = 0.05;
 type BodyPose = ([f64; 3], [f64; 4]);
 

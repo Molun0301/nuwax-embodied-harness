@@ -1,14 +1,14 @@
-//! 未来足迹只需要运动许可；共享未变列，并在查询时核对原真实邻接规则。
+//! Immutable actual-body geometry queries; never synthesize or clear source cells.
 use super::*;
 
-/// 仅供实际机体地形推进及完整运动核验的私有足迹视图。
+/// 共享原始不可变几何的机体查询视图。
 /// 不提供路线、前沿或快照提取接口，不能作为全局规划地图使用。
 #[derive(Clone,Debug)]
 pub struct SurfaceBodyQueryView {
     snapshot: SurfaceSnapshot,
 }
 impl SurfaceBodyQueryView {
-    /// 与完整快照的几何、观察和当前足迹证明全部同一时，可复用同段许可。
+    /// 几何、原始观察和近期障碍同源时，可复用相同位姿的运动检查。
     pub fn same_body_query_view(&self,other:&SurfaceSnapshot)->bool {
         self.snapshot.same_body_query_view(other)
     }
@@ -34,26 +34,30 @@ impl SurfaceBodyQueryView {
     }
 }
 impl SurfaceSnapshot {
-    /// 派生未来真实站姿的机体查询视图；来源与当前足迹的权限仍逐姿态独立。
-    /// 硬墙距参与许可时沿原完整构建，其余情况只延后不影响许可的路由计算。
+    /// A zero-copy geometry query over the unchanged source. Ground evidence is
+    /// descriptive; actual pose and motion validation remain explicit operations.
+    pub fn body_query(&self) -> SurfaceBodyQueryView {
+        SurfaceBodyQueryView { snapshot: self.clone() }
+    }
+
+    /// Compatibility alias: validate the actual pose and share the unchanged source.
     pub fn body_query_with_current_support(&self,body:[f64;3],quaternion:[f64;4])
         ->Result<SurfaceBodyQueryView,SurfaceError> {
-        self.current_body_support_view(body,quaternion,true).map(|snapshot|SurfaceBodyQueryView{snapshot})
+        self.validated_body_snapshot(body,quaternion,&mut None).map(|snapshot|SurfaceBodyQueryView{snapshot})
     }
 
-    /// A successful support fallback discards its rejected initial-body probe.
+    /// Same geometry-only alias, preserving an actual collision witness.
     pub fn body_query_with_current_support_and_witness(&self,body:[f64;3],quaternion:[f64;4],
         slot:&mut Option<BodyFailureWitness>)->Result<SurfaceBodyQueryView,SurfaceError> {
-        self.current_body_support_view_with_witness(body,quaternion,true,slot).map(|snapshot|SurfaceBodyQueryView{snapshot})
+        self.validated_body_snapshot(body,quaternion,slot).map(|snapshot|SurfaceBodyQueryView{snapshot})
     }
 
-    /// 只有几何、实际观察和当前足迹证明三者同一，才能复用机体查询许可。
+    /// Geometry, observation and recent-obstacle identity for exact-pose query reuse.
     pub fn same_body_query_view(&self,other:&Self)->bool {
         fn same<T>(a:&Option<Arc<T>>,b:&Option<Arc<T>>)->bool {
             match(a,b){(None,None)=>true,(Some(a),Some(b))=>Arc::ptr_eq(a,b),_=>false}
         }
         self.ground_evidence==other.ground_evidence && Arc::ptr_eq(&self.data,&other.data)&&same(&self.observations,&other.observations)
-            &&same(&self.current_body_support,&other.current_body_support)
             &&same(&self.recent_obstacles,&other.recent_obstacles)
     }
 
@@ -106,71 +110,7 @@ impl SurfaceSnapshot {
         (radii.into_iter().all(|v|v.is_finite()&&v>=0.0)&&radius.is_finite()).then_some(radius)
     }
 
-    pub(super) fn with_body_query_columns(&self,updates:&[SurfaceColumnUpdate])->Result<Self,SurfaceError> {
-        debug_assert!(self.can_defer_body_query_edges());
-        let mut columns=(*self.data.occupied_columns).clone();
-        let mut heights=(*self.data.height_bounds).clone();
-        // 机体查询只读取单元身份及真实支撑层；不复制全图路由和墙距数组。
-        let mut graph=PlannerGraph {cells:self.data.physical_graph.cells.clone(),
-            surface_lookup:self.data.physical_graph.surface_lookup.clone(),..Default::default()};
-        let mut count=self.data.occupied_voxels;let mut seen=AHashSet::new();
-        for update in updates {
-            let (x,y)=(update.column[0],update.column[1]);
-            // 与完整列更新保持同一输入约束，极端坐标/高度也不能借查询视图绕过拒绝。
-            if !seen.insert((x,y)) || x.abs_diff(0)>i32::MAX as u32/2 || y.abs_diff(0)>i32::MAX as u32/2
-                || update.cells.iter().any(|&(z,b)|z.abs_diff(0)>i32::MAX as u32/2
-                    ||!b.iter().all(|v|v.is_finite())||b[0]>=b[1])
-                || update.cells.windows(2).any(|p|p[0].0>=p[1].0) {
-                return Err(SurfaceError::InvalidPointCloud);
-            }
-            if let Some(old)=columns.remove(&(x,y)) {
-                count-=old.len();for z in old {heights.remove(&(x,y,z));}
-            }
-            let zs:Vec<_>=update.cells.iter().map(|&(z,_)|z).collect();count+=zs.len();
-            if !zs.is_empty() {columns.insert((x,y),zs.clone());}
-            if self.config().voxel_size.to_bits()!=self.source_voxel_size_m().to_bits() {
-                for &(z,bounds) in &update.cells {heights.insert((x,y,z),bounds);}
-            }
-            let mut surface=Vec::new();update::column_supports(x,y,&zs,self.config(),&heights,&mut surface);
-            let next:Vec<_>=surface.iter().map(|p|p.2).collect();
-            if let Some(old)=graph.surface_lookup.remove(&(x,y)) {
-                for z in old {if next.binary_search(&z).is_err(){graph.cells.remove((x,y,z));}}
-            }
-            for &cell in &surface {graph.cells.insert(cell);}
-            if !next.is_empty(){graph.surface_lookup.insert((x,y),next);}
-        }
-        if columns.is_empty()||count>MAX_SOURCE_POINTS {return Err(SurfaceError::InvalidPointCloud);}
-        let graph=Arc::new(graph);
-        Ok(Self {ground_evidence:self.ground_evidence,recent_obstacles:self.recent_obstacles.clone(),observations:self.observations.clone(),current_body_support:None,body_query_cache:Default::default(),
-            data:Arc::new(SurfaceData {body_query_only:true,body_envelope:self.data.body_envelope.clone(),
-                height_bounds:Arc::new(heights),frontier_cache:Default::default(),body_cache:Default::default(),
-                routing_cache:Default::default(),physical_graph:graph.clone(),graph,
-                regions:self.data.regions.clone(),occupied_columns:Arc::new(columns),occupied_voxels:count,
-                virtual_obstacles:self.data.virtual_obstacles.clone(),virtual_blocked_cells:Arc::new(AHashSet::new()),
-                config:self.config().clone(),source_voxel_size_m:self.source_voxel_size_m(),
-                profile_cells:self.data.profile_cells,candidate_step_cells:self.data.candidate_step_cells})})
-    }
 
-    pub(super) fn body_query_cell_is_clear(&self,cell:VoxelKey)->bool {
-        self.data.graph.cells.id(cell).is_some()&&self.data.virtual_obstacles.as_ref().is_none_or(|mask|
-            mask.permits_cell(cell,f64::from(self.config().voxel_size),0.0))
-    }
-    pub(super) fn body_query_transition(&self,from:VoxelKey,to:VoxelKey)->Option<SurfaceTransition> {
-        if !self.body_query_cell_is_clear(from)||!self.body_query_cell_is_clear(to)
-            ||(from.2-to.2).abs()>self.data.candidate_step_cells {return None;}
-        classify_transition(&self.data.graph.surface_lookup,from,to,self.config(),&self.data.height_bounds,
-            self.source_voxel_size_m(),self.data.profile_cells,self.data.candidate_step_cells)
-    }
-    pub(super) fn body_query_edge_is_allowed(&self,from:VoxelKey,to:VoxelKey)->bool {
-        let transition=self.body_query_transition(from,to);
-        let Some(model)=self.body_envelope() else {return transition.is_some();};
-        let rise=self.cell_position(to)[2]-self.cell_position(from)[2];
-        match transition {
-            Some(SurfaceTransition::StepUp)=>rise+2.0*model.support_uncertainty_m<=model.max_step_up_m+1e-6,
-            Some(SurfaceTransition::StepDown)=>-rise+2.0*model.support_uncertainty_m<=model.max_step_down_m+1e-6,
-            Some(_)=>true,None=>false,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -205,7 +145,7 @@ mod tests {
             source.validate_body_pose(from.0,from.1).unwrap();
             let full=source.with_current_body_support(from.0,from.1).unwrap();
             let quick=source.body_query_with_current_support(from.0,from.1).unwrap();
-            assert_eq!(quick.snapshot.data.body_query_only,clearance==0.0);
+            assert!(quick.same_body_query_view(&source));
             assert_eq!(full.data.occupied_columns,quick.snapshot.data.occupied_columns);
             assert_eq!(full.data.height_bounds,quick.snapshot.data.height_bounds);
             assert_eq!(full.data.physical_graph.surface_lookup,quick.snapshot.data.physical_graph.surface_lookup);
@@ -228,7 +168,6 @@ mod tests {
                 assert_eq!(full.validate_body_motion(from,to,&boundary),quick.validate_body_motion(from,to,&boundary));
             }}
             source.validate_body_pose(from.0,from.1).unwrap();
-            assert!(source.current_body_support.is_none(),"future view cannot write inferred ground into the source");
         }}
     }
 
@@ -247,8 +186,8 @@ mod tests {
         let blind=scene(0.0,true);
         let a=blind.body_query_with_current_support(from.0,from.1).unwrap();
         let b=blind.body_query_with_current_support(from.0,from.1).unwrap();
-        assert!(!a.same_body_query_view(&b.snapshot),"不同派生足迹不能因几何相似复用最终许可");
-        assert!(!a.same_body_query_view(&blind));
+        assert!(a.same_body_query_view(&b.snapshot),"immutable queries share unchanged source identity");
+        assert!(a.same_body_query_view(&blind));
         assert!(a.same_body_query_view(&a.snapshot.clone()));
         let moved=([from.0[0]-0.1,from.0[1],from.0[2]],from.1);
         let next=a.snapshot.body_query_with_current_support(moved.0,moved.1).unwrap();

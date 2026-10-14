@@ -3,6 +3,7 @@ use nuwax_codec::lcm::schema;
 use nuwax_map_chunks::{Manifest, Receiver, Repository, MAX_BLOCK_BYTES};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use crate::surface_map::SurfaceMapBuildError;
 
 pub(super) struct FineMapReader {
     receiver: Receiver,
@@ -84,7 +85,7 @@ impl FineMapReader {
     pub(super) fn receive(
         &mut self,
         message: &schema::NavigationMap3D,
-    ) -> Result<Arc<Manifest>, String> {
+    ) -> Result<Arc<Manifest>, SurfaceMapBuildError> {
         let transfer = message.fine.as_ref().ok_or("消息缺少精细根")?;
         // Receiver must also inspect included bytes on duplicate publications:
         // an identical root cannot hide an immutable-object conflict.
@@ -93,7 +94,7 @@ impl FineMapReader {
         let client = &mut self.client;
         let url = &self.lcm_url;
         let mut fetched_blocks=0_usize;
-        let received=self.receiver.receive(transfer, &expected, |root, reference| {
+        let received=receive_with_fetch(&mut self.receiver, transfer, &expected, |root, reference| {
             fetched_blocks+=1;
             if client.is_none() {
                 *client = Some(nuwax_rpc::RpcClient::new(
@@ -109,12 +110,15 @@ impl FineMapReader {
                 let result = runtime.block_on(client.as_ref().unwrap().call_scoped((vec![request.clone()], Default::default()), remaining.min(Duration::from_millis(350))));
                 match result {
                     Ok(value) => {
-                        return block_response(&request, &value);
+                        return block_response(&request, &value).map_err(Into::into);
                     }
-                    Err(error) => last = error.to_string(),
+                    Err(error @ (nuwax_rpc::RpcError::Timeout { .. } | nuwax_rpc::RpcError::Transport(_))) => {
+                        last = error.to_string();
+                    }
+                    Err(error) => return Err(SurfaceMapBuildError::Invalid(error.to_string())),
                 }
             }
-            Err(last)
+            Err(SurfaceMapBuildError::IncompleteFineSource(last))
         })?;
         if fetched_blocks>0 {tracing::debug!(fetched_blocks,blocks=received.blocks.len(),revision=received.revision,"精细地图可靠补取完成");}
         Ok(received)
@@ -207,6 +211,24 @@ impl FineMapReader {
     }
 }
 
+/// Receiver commits only complete, verified roots. Preserve the fetch failure's
+/// type across its string-error API without classifying arbitrary error text.
+fn receive_with_fetch(
+    receiver: &mut Receiver,
+    transfer: &nuwax_map_chunks::Transfer,
+    expected: &nuwax_map_chunks::Domain,
+    mut fetch: impl FnMut(&Manifest, &nuwax_map_chunks::BlockRef) -> Result<Vec<u8>, SurfaceMapBuildError>,
+) -> Result<Arc<Manifest>, SurfaceMapBuildError> {
+    let mut fetch_error = None;
+    receiver.receive(transfer, expected, |root, reference| {
+        fetch(root, reference).map_err(|error| {
+            let reason = error.to_string();
+            fetch_error = Some(error);
+            reason
+        })
+    }).map_err(|reason| fetch_error.unwrap_or_else(|| SurfaceMapBuildError::Invalid(reason)))
+}
+
 /// The reliable fetch is scoped to a specific root and exact immutable reference.
 /// The RPC object representation intentionally does not reuse serde's archive enum.
 pub(super) fn block_request(root: &Manifest, reference: &nuwax_map_chunks::BlockRef) -> serde_json::Value {
@@ -273,6 +295,7 @@ mod tests {
     use nuwax_map_chunks::*;
     use std::collections::{BTreeMap, BTreeSet};
     include!("surface_layer_transfer_tests.rs");
+    include!("surface_chunk_retry_tests.rs");
 
     // Fresh-root compatibility for existing doorway diagnostic recipes.
     #[allow(dead_code)]
@@ -340,7 +363,7 @@ mod tests {
         let mut block = decode_block(bytes).unwrap();
         block.values_mut().next().unwrap().hits += 1;
         *bytes = encode_block(&block).unwrap();
-        assert!(receiver.receive(&conflicting).unwrap_err().contains("identity conflicts"));
+        assert!(receiver.receive(&conflicting).unwrap_err().to_string().contains("identity conflicts"));
         assert!(Arc::ptr_eq(&receiver.receiver.current().unwrap(), &committed));
         let observations = receiver.observations(&committed, None).unwrap();
         assert_eq!(observations.get([0, 0, 0]).unwrap().hits, 1);

@@ -252,7 +252,8 @@ impl SurfaceObservations {
         self.complete_geometry_source=true;
     }
 
-    pub(super) fn is_complete_geometry_source(&self)->bool {
+    /// Whether the admitted owner assembled every column from one complete source.
+    pub fn is_complete_geometry_source(&self)->bool {
         self.complete_geometry_source
     }
 
@@ -276,7 +277,8 @@ impl SurfaceObservations {
     }
 
     /// 同一原始细列的全部实测层号；稳定性由原占据证据判断继续核对。
-    pub(super) fn column_levels(&self,x:i32,y:i32)->Option<&[i32]> {
+    /// Borrow exact occupied levels from one indexed column, without a map scan.
+    pub fn column_levels(&self,x:i32,y:i32)->Option<&[i32]> {
         self.columns.get(&[x,y]).map(|levels|levels.as_slice())
     }
 
@@ -800,7 +802,6 @@ impl SurfaceSnapshot {
             ground_evidence:self.ground_evidence,recent_obstacles:self.recent_obstacles.clone(),
             data: Arc::clone(&self.data),
             observations,
-            current_body_support: self.current_body_support.clone(),
             body_query_cache: Default::default(),
         }
     }

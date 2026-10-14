@@ -167,6 +167,15 @@ pub(crate) fn exact_points<const N: usize>(a: &[[f64; N]], b: &[[f64; N]]) -> bo
 pub(crate) fn pose_bits(p: BodyPose) -> ([u64; 3], [u64; 4]) {
     (p.0.map(f64::to_bits), p.1.map(f64::to_bits))
 }
+const LOCAL_MAP_REUSE_DISTANCE_M: f64 = 0.25;
+fn local_map_radius(horizon: f64, source: &SurfaceSnapshot) -> f64 {
+    let (resolution, _) = source.navigation_source_columns(None);
+    let halo = source.body_envelope().map_or(f64::from(source.config().wall_clearance_m), |body| body.radius())
+        + resolution * 0.5;
+    // Reuse may shift the search center; keep the entire search disk and physical
+    // query halo inside the materialized source after that shift.
+    (horizon + 1.5).max(horizon * 1.5 + LOCAL_MAP_REUSE_DISTANCE_M + halo)
+}
 pub(crate) struct PlanKernel {
     config: SurfaceFollowerConfig,
     local_map: Option<(Arc<SurfaceSnapshot>, Point3, Arc<nuwax_nav_pct::Tomogram>)>,
@@ -230,7 +239,7 @@ impl PlanKernel {
             if let Some((_, center, local)) =
                 self.local_map.as_ref().filter(|(source, center, _)| {
                     nuwax_nav_pct::same_source_geometry(source, &r.source)
-                        && center.distance(r.pose.pose.position) < 0.25
+                        && center.distance(r.pose.pose.position) < LOCAL_MAP_REUSE_DISTANCE_M
                 })
             {
                 return Ok((local.clone(), *center));
@@ -239,7 +248,7 @@ impl PlanKernel {
                 Arc::new(nuwax_nav_pct::Tomogram::local_from_surface(
                     &map,
                     [r.pose.pose.position.x, r.pose.pose.position.y],
-                    r.scan.horizon_m + 1.5,
+                    local_map_radius(r.scan.horizon_m, &map),
                 )?),
                 r.pose.pose.position,
             ))
@@ -469,6 +478,17 @@ mod tests {
             expected: 1,
         };
         (PlanKernel::new(config), request, cancel)
+    }
+    #[test]
+    fn local_materialization_covers_detours_after_cached_center_drift() {
+        let (_, request, _) = fixture();
+        let horizon = 5.0;
+        let halo = request.source.body_envelope().unwrap().radius();
+        let radius = local_map_radius(horizon, &request.source);
+        assert!(radius > horizon + 1.5, "the old crop was smaller than the detour disk");
+        for drift in [0.0, 0.1, LOCAL_MAP_REUSE_DISTANCE_M - 1e-9] {
+            assert!(drift + horizon * 1.5 + halo <= radius);
+        }
     }
     fn seed_exact_failures(kernel: &mut PlanKernel, request: &PlanRequest) {
         let tomogram = Arc::new(

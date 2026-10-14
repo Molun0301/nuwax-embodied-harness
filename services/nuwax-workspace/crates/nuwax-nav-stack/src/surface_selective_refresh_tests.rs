@@ -42,8 +42,14 @@ fn configured(local: bool, full_body: bool) -> SurfaceNavigationConfig {
     configured
 }
 
+type Layers = Arc<Mutex<std::collections::BTreeMap<[i32; 3], nuwax_map_chunks::LayerObservations>>>;
 async fn start(normal: SurfacePathComputer, quick: SurfacePathComputer,
     local: bool, full_body: bool) -> (Harness, Cells)
+{
+    start_with_layers(normal, quick, local, full_body, Arc::default()).await
+}
+async fn start_with_layers(normal: SurfacePathComputer, quick: SurfacePathComputer,
+    local: bool, full_body: bool, layers: Layers) -> (Harness, Cells)
 {
     let harness = Harness::start_with_test_transport(normal, Duration::from_millis(25),
         configured(local, full_body), true, Some(quick)).await;
@@ -56,6 +62,9 @@ async fn start(normal: SurfacePathComputer, quick: SurfacePathComputer,
         let cells = observed.lock().unwrap().clone();
         writer.remove(previous.difference(&cells).copied()).unwrap();
         writer.observe(cells.iter().copied(),map.source_timestamp_ns as u64).unwrap();
+        for (block, records) in layers.lock().unwrap().iter() {
+            writer.replace_layer_observations(*block, records.clone()).unwrap();
+        }
         map.source_voxel_size = 0.05;
         map.cloud.width = 0; map.cloud.row_step = 0; map.cloud.data.clear();
         let root = writer.snapshot(schema::navigation_map_3d_domain(map),map.cloud_revision as u64,
@@ -804,3 +813,164 @@ async fn completion_epoch_boundary(clear: bool) {
 #[tokio::test] async fn completion_fence_disjoint_then_domain_switch_cannot_revive_goal() {completion_epoch_boundary(false).await;}
 
 #[tokio::test] async fn completion_fence_unknown_mask_then_disjoint_quick() {completion_quick_chain(false,false,true).await;}
+
+#[tokio::test]
+async fn quick_zero_budget_is_inconclusive_and_preserves_route_and_full_job() {
+    const DETOUR_DISJOINT: [i32;3] = [110,5,47];
+    let normal = Arc::new(AtomicUsize::new(0));
+    let quick = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(AtomicBool::new(false));
+    let full_flag: Arc<Mutex<Option<Arc<AtomicBool>>>> = Arc::new(Mutex::new(None));
+    let (n, r, flag) = (normal.clone(), release.clone(), full_flag.clone());
+    let computer: SurfacePathComputer = Arc::new(move |map, pose, goal, configured| {
+        let call = n.fetch_add(1, Ordering::SeqCst) + 1;
+        let result = body_path(map, pose, goal, configured);
+        assert!(result.is_ok(), "positive-budget fixture must find the real detour");
+        if call == 2 {
+            let corridor = reference_scope::ReferenceCorridor::new(map, result.as_ref().unwrap()).unwrap();
+            assert!(!corridor.intersects_columns(0.05, &[[DETOUR_DISJOINT[0],DETOUR_DISJOINT[1]]])
+                && !corridor.intersects_columns(0.1, &[[55,2]]),
+                "quick-probe refresh must be disjoint from the actual detour, not merely a straight-line fixture");
+            *flag.lock().unwrap() = configured.planning_cancelled.clone();
+            hold(&r);
+        }
+        result
+    });
+    let q = quick.clone();
+    let quick_computer: SurfacePathComputer = Arc::new(move |map, pose, goal, configured| {
+        let result = body_path_with_budget(map, pose, goal, configured, 0);
+        assert!(result.as_ref().err().is_some_and(|error|
+            error.to_string().contains("BudgetExhausted")), "quick fixture must require a detour");
+        q.fetch_add(1, Ordering::SeqCst);
+        result
+    });
+    let (mut harness, cells) = start(computer, quick_computer, false, true).await;
+    // Existing static obstacle forces an actual detour before either refresh.
+    // The later disjoint change then requests a quick probe of that same detour.
+    let obstacle = [40, 30, 51];
+    cells.lock().unwrap().insert(obstacle);
+    wait(|| latest(&harness).is_some_and(|surface| contains(&surface, obstacle))).await;
+    let (goal, initial) = active(&mut harness).await;
+    cells.lock().unwrap().insert(RELATED);
+    wait(|| full_flag.lock().unwrap().is_some()).await;
+    cells.lock().unwrap().insert(DETOUR_DISJOINT);
+    wait(|| quick.load(Ordering::SeqCst) > 0).await;
+    harness.freeze_map().await;
+    unchanged_path(&mut harness, initial.path_revision).await;
+    assert!(!full_flag.lock().unwrap().as_ref().unwrap().load(Ordering::Acquire),
+        "an inconclusive quick probe cannot cancel the full job");
+    assert_eq!(normal.load(Ordering::SeqCst), 2);
+    release.store(true, Ordering::Release);
+    let replacement = harness.path_for(&goal).await;
+    executed_revision(&harness, &goal, replacement.path_revision).await;
+    assert_eq!(replacement.path_revision, initial.path_revision + 1);
+    assert_eq!(normal.load(Ordering::SeqCst), 2, "the valid held full result must survive");
+    harness.cancel(&goal).await;
+    harness.terminal(TerminalOutcome::Cancelled).await;
+    harness.shutdown().await;
+}
+
+fn measured_flat_layer(cell: [i32; 3]) -> nuwax_map_chunks::LayerObservation {
+    let point = cell.map(|v| (f64::from(v) + 0.5) * f64::from(0.05_f32));
+    nuwax_map_chunks::LayerObservation {
+        members: vec![nuwax_map_chunks::local_key(cell)], plane_origin: point,
+        normal: [0.0, 0.0, 1.0], samples: vec![nuwax_map_chunks::LayerSample {
+            point, source_sequence: 1, source_timestamp_ns: 1, point_index: 0,
+        }],
+    }
+}
+
+#[tokio::test]
+async fn selective_refresh_added_ground_and_classification_keep_route_and_progress() {
+    compatible_ground_owner(0.0).await;
+}
+#[tokio::test]
+async fn selective_refresh_pitched_body_keeps_route_and_progress_on_ground_evidence() {
+    compatible_ground_owner(4.86_f64.to_radians()).await;
+}
+async fn compatible_ground_owner(pitch: f64) {
+    let normal = Arc::new(AtomicUsize::new(0));
+    let quick = Arc::new(AtomicUsize::new(0));
+    let layers: Layers = Arc::default();
+    let (mut harness, cells) = start_with_layers(counted(normal.clone(), false),
+        counted(quick.clone(), true), false, true, layers.clone()).await;
+    // The active reference crosses genuinely missing ground, while its endpoint
+    // remains on the same existing plane. This is not a timestamp-only update.
+    cells.lock().unwrap().retain(|c| !(25..=50).contains(&c[0]) || !(27..=35).contains(&c[1]));
+    wait(|| latest(&harness).is_some_and(|map| !contains(&map, [40,30,40]))).await;
+    harness.feed.lock().unwrap().pitch = pitch;
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    let (goal, initial) = active(&mut harness).await;
+    if pitch != 0.0 { assert!(initial.path.poses[0].pose.orientation_xyzw[1].abs() > 0.04); }
+    harness.feed.lock().unwrap().integrate = true;
+    let start_x = harness.feed.lock().unwrap().position[0];
+    wait(|| harness.feed.lock().unwrap().position[0] > start_x + 0.03).await;
+    let before_commands = harness.scheduler.status().applied_commands;
+    cells.lock().unwrap().insert([40,30,40]);
+    wait(|| latest(&harness).is_some_and(|map| contains(&map, [40,30,40]))).await;
+    evidence_updates(&harness, 2).await;
+    unchanged_path(&mut harness, initial.path_revision).await;
+    assert_eq!((normal.load(Ordering::SeqCst), quick.load(Ordering::SeqCst)), (1,0));
+    let after_ground_x = harness.feed.lock().unwrap().position[0];
+    assert!(after_ground_x > start_x + 0.03);
+    assert!(harness.scheduler.status().applied_commands > before_commands);
+
+    // Existing physical floor occupancy now acquires classified ground evidence.
+    // The source geometry identity changes, although its occupied cells do not.
+    let column = [20,30,40];
+    let before = latest(&harness).unwrap();
+    layers.lock().unwrap().entry(nuwax_map_chunks::block_key(column)).or_default()
+        .insert(nuwax_map_chunks::local_key(column), measured_flat_layer(column));
+    wait(|| latest(&harness).is_some_and(|map| map.observations().unwrap()
+        .ground_layers([20,30]).next().is_some())).await;
+    let classified = latest(&harness).unwrap();
+    assert!(before.same_geometry(&classified));
+    assert!(!nuwax_nav_pct::same_source_geometry(&before, &classified));
+    wait(|| harness.feed.lock().unwrap().position[0] > after_ground_x + 0.03).await;
+    evidence_updates(&harness, 2).await;
+    unchanged_path(&mut harness, initial.path_revision).await;
+    assert_eq!((normal.load(Ordering::SeqCst), quick.load(Ordering::SeqCst)), (1,0));
+
+    // A previously known plane changing is not covered by the additions proof.
+    layers.lock().unwrap().get_mut(&nuwax_map_chunks::block_key(column)).unwrap()
+        .get_mut(&nuwax_map_chunks::local_key(column)).unwrap().plane_origin[2] += 0.01;
+    let changed = harness.path_for(&goal).await;
+    assert_eq!(changed.path_revision, initial.path_revision + 1);
+    executed_revision(&harness, &goal, changed.path_revision).await;
+    assert_eq!(normal.load(Ordering::SeqCst), 2);
+    // Actual occupancy at body height on the remaining corridor still replans.
+    // This is stronger than the older RELATED advisory-only below-body fixture.
+    cells.lock().unwrap().insert([50,30,51]);
+    let obstacle = harness.path_for(&goal).await;
+    assert_eq!(obstacle.path_revision, changed.path_revision + 1);
+    executed_revision(&harness, &goal, obstacle.path_revision).await;
+    assert_eq!(normal.load(Ordering::SeqCst), 3);
+    harness.cancel(&goal).await;
+    harness.terminal(TerminalOutcome::Cancelled).await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn selective_refresh_committed_empty_fine_source_reaches_unknown_planner_and_execution() {
+    let normal = Arc::new(AtomicUsize::new(0));
+    let quick = Arc::new(AtomicUsize::new(0));
+    let (mut harness,cells) = start(counted(normal.clone(),false),counted(quick,true),false,true).await;
+    let original = harness.hub.latest.lock().unwrap().as_ref().unwrap().authority.clone();
+    cells.lock().unwrap().clear();
+    wait(|| latest(&harness).is_some_and(|map| {
+        let (_, mut columns) = map.navigation_source_columns(None);
+        columns.next().is_none()
+    })).await;
+    let map = harness.hub.latest.lock().unwrap().as_ref().unwrap().clone();
+    assert!(map.authority.same_domain(&original));
+    assert!(!map.awaiting_build && map.snapshot.is_ok());
+    let (goal,path) = active(&mut harness).await;
+    assert_eq!(normal.load(Ordering::SeqCst),1);
+    harness.feed.lock().unwrap().integrate = true;
+    let before = harness.feed.lock().unwrap().position[0];
+    wait(|| harness.feed.lock().unwrap().position[0] > before + 0.03).await;
+    unchanged_path(&mut harness,path.path_revision).await;
+    harness.cancel(&goal).await;
+    harness.terminal(TerminalOutcome::Cancelled).await;
+    harness.shutdown().await;
+}

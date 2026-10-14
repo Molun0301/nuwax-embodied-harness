@@ -9,9 +9,12 @@ mod surface_adapter;
 pub use surface_adapter::{PctPlanner, same_source_geometry};
 mod cancellation;
 pub use cancellation::{PlanningCancellation, planning_cancelled, with_planning_cancellation};
+mod failure;
+pub use failure::PlanningFailure;
+mod reference;
 mod search;
 mod tomogram;
-pub use search::{Route, SearchStats};
+pub use search::{Route, SearchLimits, SearchStats};
 pub use tomogram::{Cell, Tomogram};
 
 /// 仅当前目标使用的局部接续软代价，不修改原地图或宣称该处永久不可通行。
@@ -228,7 +231,7 @@ mod sampling_tests {
     }
 
     #[test]
-    fn boundary_sampled_missing_columns_stay_disconnected_while_complete_centres_connect() {
+    fn sparse_sampling_gaps_use_reference_without_fabricating_floor_layers() {
         let start = [0.0, 0.0, 0.05];
         let goal = [0.8, 0.8, 0.05];
         let boundary = sampled_room(false, false);
@@ -242,10 +245,9 @@ mod sampling_tests {
             map.cell_at(start).is_none(),
             "原点所在的fine列确实没有观测，不能由完整提交标记填出地面"
         );
-        assert_eq!(
-            map.plan(start, goal, 0.05, &[], None).unwrap_err(),
-            "层析地面之间没有可连接路线（展开4格）"
-        );
+        let sparse = map.plan(start, goal, 0.05, &[], None).unwrap();
+        assert!(sparse.points.windows(2).all(|p|map.segment_clear(p[0],p[1],&[])));
+        assert!(map.cell_at(start).is_none(), "route must not create a measured floor");
         let complete = Tomogram::from_surface(&sampled_room(true, false)).unwrap();
         let route = complete.plan(start, goal, 0.05, &[], None).unwrap();
         assert!(route
@@ -254,8 +256,8 @@ mod sampling_tests {
             .all(|p| complete.segment_clear(p[0], p[1], &[])));
         let gap = Tomogram::from_surface(&sampled_room(true, true)).unwrap();
         assert!(
-            gap.plan([-0.2, 0.0, 0.05], goal, 0.05, &[], None).is_err(),
-            "真实缺列不能被全局路线补桥"
+            gap.plan([-0.2, 0.0, 0.05], goal, 0.05, &[], None).is_ok(),
+            "缺测沿同层参考通过，但不会写入地图地面"
         );
         assert!(
             complete
@@ -268,3 +270,9 @@ mod sampling_tests {
 
 #[cfg(all(test, feature = "mls-adapter"))]
 mod dense_terrain_tests;
+
+#[cfg(test)]
+mod unknown_reference_tests;
+
+#[cfg(test)]
+mod reference_motion_tests;

@@ -323,6 +323,37 @@ pub(crate) struct MissionRoute {
 }
 
 /// 在原调度任务等待的阻塞计算内使用；结果只是本次已知地图的路线估计。
+/// Resource-limited reference/refinement is not evidence of an unreachable route.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum MissionRouteError {
+    Inconclusive(String),
+    Failed(String),
+}
+impl MissionRouteError {
+    pub(crate) fn is_inconclusive(&self) -> bool { matches!(self, Self::Inconclusive(_)) }
+}
+impl From<String> for MissionRouteError {
+    fn from(message: String) -> Self { Self::Failed(message) }
+}
+impl From<nuwax_nav_stack::surface_oriented::ReferencePlanningFailure> for MissionRouteError {
+    fn from(error:nuwax_nav_stack::surface_oriented::ReferencePlanningFailure) -> Self {
+        if error.is_inconclusive() { Self::Inconclusive(error.to_string()) }
+        else { Self::Failed(error.to_string()) }
+    }
+}
+impl From<&str> for MissionRouteError {
+    fn from(message: &str) -> Self { message.to_string().into() }
+}
+impl std::ops::Deref for MissionRouteError {
+    type Target = str;
+    fn deref(&self) -> &str { match self { Self::Inconclusive(message) | Self::Failed(message) => message } }
+}
+impl std::fmt::Display for MissionRouteError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self)
+    }
+}
+
 pub(crate) enum MissionRoutes {
     Planar {
         map: Costmap,
@@ -367,7 +398,7 @@ impl MissionRoutes {
         to: &MissionPose,
         options: GoalOptions,
         cancellation: Option<&std::sync::atomic::AtomicBool>,
-    ) -> Result<MissionRoute, String> {
+    ) -> Result<MissionRoute, MissionRouteError> {
         from.validate()?;
         to.validate()?;
         // 零距离仍运行真实可通行查询；直接累计原路径，不再复制位置数组。
@@ -389,8 +420,9 @@ impl MissionRoutes {
                 })
             }
             Self::Surface { map, config, boundary } => {
-                let path = nuwax_nav_stack::surface_oriented::plan_cancellable(
+                let path = nuwax_nav_stack::surface_oriented::plan_reference_typed(
                     map,
+                    &config.follower.pct,
                     (from.position, from.orientation_xyzw),
                     (to.position, to.orientation_xyzw),
                     options,

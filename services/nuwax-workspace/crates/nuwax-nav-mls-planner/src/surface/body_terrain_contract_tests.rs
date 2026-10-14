@@ -144,7 +144,6 @@ fn terrain_contract_flat_tile_and_tagged_echo_keep_the_original_source() {
     let expected_end=advance(&clean_map,from,0.425).unwrap();
     assert_eq!(expected_end,body(0.425,0.025,0.4));
     for map in [&raw,&view] {
-        assert!(map.current_body_support.is_none(),"既有接触许可不能依赖按自体身份清除源点");
         let centre=map.locate_near_support([from.0[0],from.0[1],0.0],0.3).unwrap();
         assert_eq!(map.body_contact_frame(centre,0.0,0.0).unwrap(),(0.0,from.1),
             "高带不能替代原平地支撑参考或制造倾斜");
@@ -178,12 +177,12 @@ fn terrain_contract_out_of_contact_band_preserves_source_through_private_overlay
     keys.extend(upper_keys);
     let raw=build_map_config(&keys,true,planner,0.2);let from=body(0.025,0.025,0.4);
     assert_eq!(raw.validate_body_pose(from.0,from.1),Err(SurfaceError::InsufficientClearance));
-    let view=raw.with_current_body_support(from.0,from.1).unwrap();
-    let overlay=view.current_body_support.as_ref().expect("必须实际派生私有 overlay");
-    assert!(!Arc::ptr_eq(&raw.body_query_cache,&view.body_query_cache));
+    assert!(raw.with_current_body_support(from.0,from.1).is_err(),
+        "current-pose queries must retain out-of-contact occupied volumes");
+    let view=raw.clone();
+    assert!(Arc::ptr_eq(&raw.body_query_cache,&view.body_query_cache));
     for key in upper_keys {assert_eq!(view.fine_contact_bands(key[0],key[1]).iter().map(|b|b.run).collect::<Vec<_>>(),vec![[-1,-1],[5,5]]);}
-    for key in upper_keys {assert!(overlay.cleared_voxels.contains(&key));}
-    view.validate_body_pose(from.0,from.1).unwrap();
+    assert_eq!(view.validate_body_pose(from.0,from.1),Err(SurfaceError::InsufficientClearance));
     for map in [&raw,&view] {
         let observations=map.observations.as_ref().unwrap();
         for &key in &keys {assert_eq!(observations.get(key),Some(SurfaceObservation{observed_ns:0,hits:0}));}
@@ -207,7 +206,6 @@ fn terrain_contract_real_uneven_ground_is_not_forced_to_a_horizontal_plane() {
         let end=advance(&map,from,0.525).unwrap();
         assert!(from.1[0].abs()>0.01 && end.1[0].abs()>0.01,"真实起伏应保留地形姿态响应");
         assert_eq!(end.0[0],0.525);
-        assert!(map.current_body_support.is_none(),"通行见证不依赖补平地面或自体清理");
     }
 }
 
@@ -219,8 +217,9 @@ fn terrain_contract_bounded_blind_gap_is_distinct_from_observed_pit_and_disconne
         let map=build_map(&keys,true);
         let from=body(-0.525,0.025,0.4);map.validate_body_pose(from.0,from.1).unwrap();
         let above_gap=body(0.025,0.025,0.4);
-        assert_eq!(map.validate_body_pose(above_gap.0,above_gap.1),Ok(()),
-            "缺地或下方深坑不是机体占据碰撞，纯姿态检查不承担落脚许可");
+        assert_eq!(map.validate_body_pose(above_gap.0,above_gap.1),
+            if observed_pit {Err(SurfaceError::UntraversableSegment)} else {Ok(())},
+            "known drop and missing ground remain different states");
         let projected=map.body_pose_after_motion(from,[above_gap.0[0],above_gap.0[1]],0.0);
         if observed_pit {
             assert!(advance(&map,from,0.525).is_err(),"已观测深坑不能按同层无回波盲区补平");
@@ -245,8 +244,9 @@ fn terrain_contract_bounded_blind_gap_is_distinct_from_observed_pit_and_disconne
     let unknown=strip.query_ground([above_strip.0[0],above_strip.0[1]],0.0);
     assert_eq!(unknown.state,GroundQueryState::Unknown,"贯穿地图的缺测带隔开两侧地面，没有连通插值依据");
     assert_eq!(unknown.height,None);assert_eq!(unknown.normal,None);
-    assert_eq!(strip.body_pose_after_motion(from,[above_strip.0[0],above_strip.0[1]],0.0),Err(SurfaceError::UnknownGround));
-    assert!(advance(&strip,from,0.525).is_err(),"纯几何无碰撞不能将不可估计断带补成floor");
+    assert_eq!(strip.body_pose_after_motion(from,[above_strip.0[0],above_strip.0[1]],0.0).unwrap(),above_strip);
+    advance(&strip,from,0.525).unwrap();
+    assert_eq!(strip.query_ground([above_strip.0[0],above_strip.0[1]],0.0).state,GroundQueryState::Unknown);
 }
 
 #[test]
@@ -269,7 +269,6 @@ fn terrain_contract_declared_ramp_and_stairs_keep_terrain_relative_motion() {
         let from=map.body_pose_on_surface([-0.525,0.025],0.0,[-0.525,0.025,reference]).unwrap();
         let to=advance(&map,from,0.525).unwrap();
         assert!(to.0[2]>from.0[2]+0.05,"坡阶不是只能在平砖上工作的特例");
-        assert!(map.current_body_support.is_none());
     }
 }
 
@@ -355,23 +354,23 @@ fn dense_rough_tread_proof_keeps_depth_step_and_complete_source_limits() {
         [0.016001586899234994,-0.011486490867544068,0.00018383775197955735,0.9998059691499831]);
     let to=([0.205,0.025,0.3950324446076362],
         [0.0208207767429179,-0.018617811932384785,0.00038778862668550933,0.9996097848433922]);
-    assert!(map.fine_observed_tread_support_samples(from,to).is_some());
+    assert!(map.known_tread_geometry_samples(from,to).is_some());
     let deeper=build_map_config(&keys,true,0.1,0.25);
-    assert!(deeper.fine_observed_tread_support_samples(from,to).is_none(),"20厘米实测踏面不满足25厘米明确要求");
-    assert_eq!(deeper.validate_body_motion(from,to,&[]),Ok(()),
-        "静态踏深证明不足不等于实际扫掠碰撞；上面的细踏面负例仍保留25厘米要求");
+    assert!(deeper.known_tread_geometry_samples(from,to).is_none(),"20厘米实测踏面不满足25厘米明确要求");
+    assert_eq!(deeper.validate_body_motion(from,to,&[]),Err(SurfaceError::UntraversableSegment),
+        "known 20cm terrain cannot satisfy the configured 25cm tread requirement");
     let mut model=map.body_envelope().unwrap().clone();model.max_step_up_m=0.025;
     let limited=map.with_body_envelope(model).unwrap();
-    assert!(limited.fine_observed_tread_support_samples(from,to).is_none(),"5厘米上阶不满足2.5厘米能力");
+    assert!(limited.known_tread_geometry_samples(from,to).is_none(),"5厘米上阶不满足2.5厘米能力");
     let mut model=map.body_envelope().unwrap().clone();model.max_step_down_m=0.025;
     let limited=map.with_body_envelope(model).unwrap();
-    assert!(limited.fine_observed_tread_support_samples(to,from).is_none(),"下阶独立检查，不能沿上阶许可反用");
+    assert!(limited.known_tread_geometry_samples(to,from).is_none(),"下阶独立检查，不能沿上阶许可反用");
     let mut incomplete=map.observations.as_ref().unwrap().as_ref().clone();
     incomplete.replace_block([100,100,100],BTreeMap::new()).unwrap();
-    assert!(map.with_observations(Some(Arc::new(incomplete))).fine_observed_tread_support_samples(from,to).is_none(),
+    assert!(map.with_observations(Some(Arc::new(incomplete))).known_tread_geometry_samples(from,to).is_none(),
         "部分更新不能继承完整来源事实");
     let mut missing=keys;missing.remove(&[4,0,0]);
-    assert!(build_map(&missing,true).fine_observed_tread_support_samples(from,to).is_none(),"踏面实际缺测不能用邻列填充");
+    assert!(build_map(&missing,true).known_tread_geometry_samples(from,to).is_none(),"踏面实际缺测不能用邻列填充");
     let boundary=[[-1.0,-1.0],[0.1,-1.0],[0.1,1.0],[-1.0,1.0]];
     assert_eq!(map.validate_body_motion(from,to,&boundary),Err(SurfaceError::InvalidBoundary));
 }
@@ -392,7 +391,7 @@ fn dense_rough_continuation_uses_observed_width_across_grid_resolution_and_phase
             let edge=f64::from(width+phase)*f64::from(FINE);
             let before=body(edge-0.5*f64::from(FINE),0.025,0.4);
             let after=body(edge+0.5*f64::from(FINE),0.025,0.4+f64::from(FINE));
-            assert!(map.fine_observed_tread_support_samples(before,after).is_none(),
+            assert!(map.known_tread_geometry_samples(before,after).is_none(),
                 "显式细踏面证明仍须拒绝15厘米宽度，不能仅靠前进错误类作代理");
         }
     }}}
@@ -404,7 +403,7 @@ fn dense_rough_diagonal_cannot_split_a_step_through_a_third_height() {
     let from=body(0.185,0.185,0.4);let to=body(0.205,0.205,0.5);
     let mut model=map.body_envelope().unwrap().clone();model.max_step_up_m=0.075;
     let map=map.with_body_envelope(model).unwrap();
-    assert!(map.fine_observed_tread_support_samples(from,to).is_none(),
+    assert!(map.known_tread_geometry_samples(from,to).is_none(),
         "10厘米对角阶差不能借两侧5厘米中间层绕过7.5厘米上阶能力");
 }
 
@@ -432,13 +431,13 @@ fn dense_tread_review_exact_f32_depth_does_not_require_an_extra_cell() {
         let (map,from,to)=exact_tread_source(source,width,0.2);
         eprintln!("TREAD_BOUNDARY source={source:?} requested={:?} promoted_ratio={} f32_ratio={}",
             0.2_f32,f64::from(0.2_f32)/f64::from(source),0.2_f32/source);
-        assert!(map.fine_observed_tread_support_samples(from,to).is_some(),
+        assert!(map.known_tread_geometry_samples(from,to).is_some(),
             "恰好20厘米踏面不能因f32提升后ceil被多算一格：source={source}");
         let (short,from,to)=exact_tread_source(source,width-1,0.2);
-        assert!(short.fine_observed_tread_support_samples(from,to).is_none(),"真实少一格仍不满足踏深");
+        assert!(short.known_tread_geometry_samples(from,to).is_none(),"真实少一格仍不满足踏深");
         let longer=f32::from_bits(0.2_f32.to_bits()+1);
         let (longer,from,to)=exact_tread_source(source,width,longer);
-        assert!(longer.fine_observed_tread_support_samples(from,to).is_none(),"明确增加到下一个f32值仍要求更多支撑");
+        assert!(longer.known_tread_geometry_samples(from,to).is_none(),"明确增加到下一个f32值仍要求更多支撑");
     }
 }
 
@@ -446,7 +445,7 @@ fn dense_tread_review_exact_f32_depth_does_not_require_an_extra_cell() {
 fn dense_tread_review_source_resolution_does_not_reinterpret_the_coarse_profile_limit() {
     for (source,width,tread) in [(0.001,200,0.2),(0.01,130,1.3)] {
         let (map,from,to)=exact_tread_source(source,width,tread);
-        assert!(map.fine_observed_tread_support_samples(from,to).is_some(),
+        assert!(map.known_tread_geometry_samples(from,to).is_some(),
             "合法粗格踏深不能因细分超过128格而变为不许可：source={source} tread={tread}");
     }
 }
@@ -464,7 +463,7 @@ fn dense_tread_review_long_reference_does_not_multiply_all_samples_by_tread_dept
     for &t in &samples {let p=interpolated_body_pose(from,to,t);
         map.locate_support_from_body(p.0,p.1,0.4).expect("长段夹具参考本身必须有支撑");}
     // 此处只验证支撑参考连接；完整足迹、碰撞与动作许可仍由外层核验。
-    assert!(map.fine_observed_tread_support_samples(from,to).is_some(),
+    assert!(map.known_tread_geometry_samples(from,to).is_some(),
         "长段只有三个阶差，不应按每个采样点扫描踏深的假定拒绝");
 }
 
@@ -481,14 +480,38 @@ fn dense_tread_review_selects_the_actual_fine_top_inside_the_chosen_support_band
     assert!((support.surface_xyz[2]-0.31).abs()<1e-6,
         "粗支撑顶必须来自旁边31厘米的细列，当前细列实际为30厘米");
     map.validate_body_pose(from.0,from.1).unwrap();map.validate_body_pose(to.0,to.1).unwrap();
-    assert!(map.fine_observed_tread_support_samples(from,to).is_some(),
+    assert!(map.known_tread_geometry_samples(from,to).is_some(),
         "不能在当前XY查询旁边细列的31厘米顶而漏掉同一支撑带内的30厘米真顶");
     map.validate_body_motion(from,to,&[]).unwrap();
     let mut missing=keys.clone();missing.remove(&[2,0,29]);
     let missing=build_map_source(&missing,false,0.1,0.2,0.01);
-    assert!(missing.fine_observed_tread_support_samples(from,to).is_none(),
+    assert!(missing.known_tread_geometry_samples(from,to).is_none(),
         "选定低层缺测后不能改选该细列上方独立楼层");
     let upper=body(from.0[0],from.0[1],1.7);
-    assert!(map.fine_observed_tread_support_samples(from,upper).is_none(),"独立楼层不能原地跨层连接");
+    assert!(map.known_tread_geometry_samples(from,upper).is_none(),"独立楼层不能原地跨层连接");
 }
 
+
+
+#[test]
+fn planar_known_terrain_is_lock_free_while_shared_body_cache_is_held() {
+    let with_body=build_map(&ground(Terrain::Flat),false);
+    let points:Vec<_>=ground(Terrain::Flat).iter().map(|k|
+        ((k[0] as f32+0.5)*FINE,(k[1] as f32+0.5)*FINE,(k[2] as f32+0.5)*FINE)).collect();
+    let coarse=SurfaceSnapshot::from_points(&points,with_body.config().clone(),FINE).unwrap();
+    for source in [coarse.clone(),coarse.with_observations(with_body.observations().cloned())] {
+        assert!(source.body_envelope().is_none());
+        let from=[-0.5,0.025,0.0];let to=[0.5,0.025,0.0];
+        let expected=source.validate_known_reference_motion(from,to);
+        let reader=source.clone();
+        assert!(source.same_geometry(&reader));
+        assert!(source.same_body_query_view(&reader));
+        assert!(Arc::ptr_eq(&source.body_query_cache,&reader.body_query_cache));
+        let held=source.body_query_cache.lock().unwrap();
+        let (send,receive)=std::sync::mpsc::channel();
+        let worker=std::thread::spawn(move||send.send(reader.validate_known_reference_motion(from,to)).unwrap());
+        let completed=receive.recv_timeout(std::time::Duration::from_secs(2));
+        drop(held);worker.join().unwrap();
+        assert_eq!(completed.unwrap(),expected,"known terrain must not wait on a planner's body cache");
+    }
+}

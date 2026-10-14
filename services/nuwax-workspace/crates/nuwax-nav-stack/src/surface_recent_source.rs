@@ -6,20 +6,23 @@ use nuwax_nav_runtime::surface_changes::SurfaceMapUpdate;
 pub(crate) struct RecentSourceState {
     max_age:Option<Duration>,
     snapshot:Option<Arc<SurfaceSnapshot>>,
+    planar_reference:Option<Arc<nuwax_nav_pct::Tomogram>>,
     watermark:Option<(i64,i64,i64)>,
     enabled:bool,
 }
 impl RecentSourceState {
     pub(crate) fn new(max_age:Option<Duration>)->Self {
-        Self {max_age,snapshot:None,watermark:None,enabled:max_age.is_some()}
+        Self {max_age,snapshot:None,planar_reference:None,watermark:None,enabled:max_age.is_some()}
     }
     pub(crate) async fn reset(&mut self,scheduler:&nuwax_nav_runtime::NavSchedulerHandle)
         ->Result<(),nuwax_nav_runtime::RuntimeError> {
         self.snapshot=None;
+        self.planar_reference=None;
         self.watermark=None;
         scheduler.update_obstacle_source(None,!self.enabled,None).await
     }
-    pub(crate) fn attach_terrain(&mut self,map:Arc<SurfaceSnapshot>)->Arc<SurfaceSnapshot> {
+    pub(crate) fn attach_terrain(&mut self,map:Arc<SurfaceSnapshot>, planar_reference:Option<Arc<nuwax_nav_pct::Tomogram>>)->Arc<SurfaceSnapshot> {
+        self.planar_reference=planar_reference;
         let map=if let Some(previous)=&self.snapshot {
             Arc::new(map.with_recent_obstacles_from(previous))
         } else {map};
@@ -41,7 +44,7 @@ impl RecentSourceState {
             self.enabled=true;
             let update=self.snapshot.as_ref().map(|basis| {
                 let snapshot=Arc::new(basis.clear_recent_obstacles());
-                SurfaceMapUpdate {snapshot,change_basis:Some(basis.clone()),changes:Arc::new(SurfaceGeometryChanges::Empty)}
+                SurfaceMapUpdate {planar_reference:self.planar_reference.clone(),snapshot,change_basis:Some(basis.clone()),changes:Arc::new(SurfaceGeometryChanges::Empty)}
             });
             if let Some(update)=&update {self.snapshot=Some(update.snapshot.clone());}
             scheduler.update_obstacle_source(update.map(ExecutionMap::SurfaceUpdate),false,None).await
@@ -80,7 +83,7 @@ impl RecentSourceState {
             points.points.into_iter().enumerate().map(|(index,p)|(index as u32,[p.x,p.y,p.z])))
             .map_err(|error|error.to_string())?);
         scheduler.update_obstacle_source(Some(ExecutionMap::SurfaceUpdate(SurfaceMapUpdate {
-            snapshot:snapshot.clone(),change_basis:Some(basis.clone()),changes:Arc::new(SurfaceGeometryChanges::Empty),
+            planar_reference:self.planar_reference.clone(),snapshot:snapshot.clone(),change_basis:Some(basis.clone()),changes:Arc::new(SurfaceGeometryChanges::Empty),
         })),true,bound).await.map_err(|error|error.to_string())?;
         self.enabled=true;
         self.snapshot=Some(snapshot);
@@ -132,7 +135,7 @@ mod tests {
             }),
         };
         let mut state=RecentSourceState::new(Some(Duration::from_secs(5)));
-        state.attach_terrain(map.clone());
+        state.attach_terrain(map.clone(), None);
         state.consume(&recent_cloud::encode_body(&packet).unwrap(),Some(&authority),&handle).await.unwrap();
         assert!(nuwax_nav_pct::same_source_geometry(&map,state.snapshot.as_ref().unwrap()));
         let accepted=state.watermark;
@@ -147,7 +150,7 @@ mod tests {
         assert!(state.consume(&recent_cloud::encode_body(&packet).unwrap(),Some(&authority),&handle).await.is_err());
         assert_eq!(state.watermark,accepted);
         // Updating static terrain neither changes the live watermark nor its deadline.
-        state.attach_terrain(map);
+        state.attach_terrain(map, None);
         assert_eq!(state.watermark,accepted);
         packet.commit_boot_nonce=[7;16];
         packet.cloud=None;

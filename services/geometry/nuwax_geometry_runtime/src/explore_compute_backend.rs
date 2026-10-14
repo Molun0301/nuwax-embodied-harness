@@ -7,7 +7,7 @@
 //! contains committed source IDs. No source history is exported during polling.
 
 use super::*;
-use crate::explore_mission::{frontier_goal_options, home_goal_options, MissionRoute};
+use crate::explore_mission::{frontier_goal_options, home_goal_options, MissionRoute, MissionRouteError};
 use nuwax_nav_types_messages::GoalOptions;
 use crate::explore_compute_owner::{self as owner, Backend, Cancellation, Decision, Settlement};
 use nuwax_exploration::mission::SourceCheckpoint;
@@ -75,13 +75,13 @@ pub(super) struct MissionRouteAdvice {
     pub homeward: f64,
     /// Homeward failure is the OUTER error; candidate outward/back failure stays
     /// here so the caller can apply the existing candidate-failure feedback.
-    pub can_visit: Result<bool, String>,
+    pub can_visit: Result<bool, MissionRouteError>,
 }
 
 #[derive(Clone, Debug)]
 pub(super) struct SelectionProjection {
     pub poll: ExploreResult<ExplorationPoll>,
-    pub mission: Option<Result<MissionRouteAdvice, String>>,
+    pub mission: Option<Result<MissionRouteAdvice, MissionRouteError>>,
     /// The pending delta still exists when preparation preceded cancellation.
     /// Resolve Discard; never treat omitted route work as a completed query.
     pub cancelled: bool,
@@ -90,7 +90,7 @@ pub(super) struct SelectionProjection {
 #[derive(Clone, Debug)]
 pub(super) enum ComputeProjection {
     Selection(SelectionProjection),
-    HomewardBudget(Result<bool, String>),
+    HomewardBudget(Result<bool, MissionRouteError>),
     Coverage(Option<f64>),
     #[cfg(test)]
     Checkpoint(ExploreResult<Vec<SourceCheckpoint>>),
@@ -342,7 +342,7 @@ impl ExploreComputeBackend {
                     context.routes(planning.as_ref())
                 };
                 match routes {
-                    Err(error) => output.mission = Some(Err(error)),
+                    Err(error) => output.mission = Some(Err(error.into())),
                     Ok(routes) => {
                         let start = mission_pose_from_stamped(&context.robot_pose);
                         let target = candidate.map(|goal| {
@@ -426,7 +426,8 @@ impl Backend for ExploreComputeBackend {
     type LifecycleAck = ComputeLifecycleAck;
 
     fn prepare(&mut self, request: Self::Request, cancellation: &Cancellation) -> Self::Projection {
-        self.prepare_request(Some(cancellation.flag()), request, || cancellation.is_cancelled())
+        nuwax_nav_stack::surface_oriented::with_owner_cancellation(cancellation.shared_flag(), ||
+            self.prepare_request(Some(cancellation.flag()), request, || cancellation.is_cancelled()))
     }
 
     fn resolve(&mut self, decision: Decision) -> Settlement<Self::Finalized> {
@@ -623,9 +624,9 @@ fn ordered_mission_query(
     progress: &MissionProgress,
     policy: &ReturnPolicy,
     candidate: Option<(&MissionPose, GoalOptions)>,
-    mut query: impl FnMut(&MissionPose, &MissionPose, GoalOptions) -> Result<MissionRoute, String>,
+    mut query: impl FnMut(&MissionPose, &MissionPose, GoalOptions) -> Result<MissionRoute, MissionRouteError>,
     cancelled: &impl Fn() -> bool,
-) -> RouteComputation<Result<MissionRouteAdvice, String>> {
+) -> RouteComputation<Result<MissionRouteAdvice, MissionRouteError>> {
     if cancelled() {
         return RouteComputation::Cancelled;
     }
@@ -682,7 +683,7 @@ fn prepare_homeward_budget(
     };
     let routes = match routes {
         Ok(routes) => routes,
-        Err(error) => return ComputeProjection::HomewardBudget(Err(error)),
+        Err(error) => return ComputeProjection::HomewardBudget(Err(error.into())),
     };
     if cancelled() {
         return ComputeProjection::Cancelled;
@@ -703,7 +704,7 @@ fn prepare_homeward_budget(
             context
                 .config
                 .return_policy
-                .should_return(progress.travelled_m, homeward.length)
+                .should_return(progress.travelled_m, homeward.length).map_err(MissionRouteError::from)
         });
     ComputeProjection::HomewardBudget(result)
 }

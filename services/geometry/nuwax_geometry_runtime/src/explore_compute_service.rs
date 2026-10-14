@@ -1685,7 +1685,7 @@ fn drain_locked(
                                 context.retain_stop(
                                     inner,
                                     *reason,
-                                    format!("exploration completed: {}", stop_reason_str(*reason)),
+                                    exploration_stop_message(*reason),
                                 )?;
                             }
                         }

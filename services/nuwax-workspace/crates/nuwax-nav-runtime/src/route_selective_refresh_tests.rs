@@ -9,7 +9,7 @@ fn selective_scene(extra: &[[i32;3]]) -> Arc<SurfaceSnapshot> {
         .with_body_envelope(base.body_envelope().unwrap().clone()).unwrap())
 }
 fn selective_update(old:&Arc<SurfaceSnapshot>, next:Arc<SurfaceSnapshot>, columns:&[[i32;2]])->SurfaceMapUpdate {
-    SurfaceMapUpdate {change_basis:Some(old.clone()),changes:Arc::new(SurfaceGeometryChanges::Columns {
+    SurfaceMapUpdate {planar_reference:None,change_basis:Some(old.clone()),changes:Arc::new(SurfaceGeometryChanges::Columns {
         fine_size:next.source_voxel_size_m(),fine:columns.to_vec(),
         planner_size:next.config().voxel_size,coarse:columns.to_vec(),
     }),snapshot:next}
@@ -187,7 +187,7 @@ fn recent_obstacle_updates_keep_terrain_and_trigger_bounded_detour_then_recover(
         [(0,[10.0,10.0,0.5])]).unwrap());
     let publish=|follower:&mut RouteFollower,previous:Arc<SurfaceSnapshot>,next:Arc<SurfaceSnapshot>| {
         assert!(nuwax_nav_pct::same_source_geometry(&previous,&next));
-        follower.update_execution_map(ExecutionMap::SurfaceUpdate(SurfaceMapUpdate {
+        follower.update_execution_map(ExecutionMap::SurfaceUpdate(SurfaceMapUpdate {planar_reference:None,
             snapshot:next,change_basis:Some(previous),changes:Arc::new(SurfaceGeometryChanges::Empty),
         })).unwrap();
     };
@@ -288,7 +288,7 @@ fn persistent_recent_single_obstacle_can_admit_a_short_local_detour() {
     let previous_plans=follower.local_plans();
     let obstacle=Arc::new(base.with_recent_obstacle_points(1,1_000_000_000,0,&[],[(0,[0.73,1.03,0.5])]).unwrap());
     assert!(nuwax_nav_pct::same_source_geometry(&base,&obstacle));
-    follower.update_execution_map(ExecutionMap::SurfaceUpdate(SurfaceMapUpdate {
+    follower.update_execution_map(ExecutionMap::SurfaceUpdate(SurfaceMapUpdate {planar_reference:None,
         snapshot:obstacle,change_basis:Some(base),changes:Arc::new(SurfaceGeometryChanges::Empty),
     })).unwrap();
     follower.controller.observe_applied_command(nuwax_nav_types_messages::Twist2 {
@@ -322,7 +322,7 @@ fn recent_wide_close_obstacle_admits_bounded_live_detour() {
         [(0,[10.0,10.0,0.5])]).unwrap());
     let publish=|follower:&mut RouteFollower,previous:Arc<SurfaceSnapshot>,next:Arc<SurfaceSnapshot>| {
         assert!(nuwax_nav_pct::same_source_geometry(&previous,&next));
-        follower.update_execution_map(ExecutionMap::SurfaceUpdate(SurfaceMapUpdate {
+        follower.update_execution_map(ExecutionMap::SurfaceUpdate(SurfaceMapUpdate {planar_reference:None,
             snapshot:next,change_basis:Some(previous),changes:Arc::new(SurfaceGeometryChanges::Empty),
         })).unwrap();
     };

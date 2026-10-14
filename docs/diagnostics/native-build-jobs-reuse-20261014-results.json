@@ -1,0 +1,518 @@
+{
+  "baseline_revision": "29591a15066de734c9f060daa1837bd8a0f5f61e",
+  "date_utc": "2026-10-14",
+  "cargo": "1.88.0",
+  "rustc": "1.88.0",
+  "fixture": "Actual copied build.rs; dependency-free cargo check with fake CMake; no native compilation",
+  "invocations": 56,
+  "cases": [
+    {
+      "crate": "slam",
+      "variant": "baseline",
+      "stage": "01-first",
+      "exit_code": 0,
+      "cmake_calls": 2,
+      "parallel_arguments": [
+        "2"
+      ]
+    },
+    {
+      "crate": "slam",
+      "variant": "baseline",
+      "stage": "02-unchanged",
+      "exit_code": 0,
+      "cmake_calls": 0,
+      "parallel_arguments": []
+    },
+    {
+      "crate": "slam",
+      "variant": "baseline",
+      "stage": "03-jobs-only",
+      "exit_code": 0,
+      "cmake_calls": 2,
+      "parallel_arguments": [
+        "3"
+      ]
+    },
+    {
+      "crate": "slam",
+      "variant": "baseline",
+      "stage": "04-native-source",
+      "exit_code": 0,
+      "cmake_calls": 2,
+      "parallel_arguments": [
+        "4"
+      ]
+    },
+    {
+      "crate": "slam",
+      "variant": "baseline",
+      "stage": "05-source-repeat",
+      "exit_code": 0,
+      "cmake_calls": 0,
+      "parallel_arguments": []
+    },
+    {
+      "crate": "slam",
+      "variant": "baseline",
+      "stage": "06-prefix",
+      "exit_code": 0,
+      "cmake_calls": 2,
+      "parallel_arguments": [
+        "5"
+      ]
+    },
+    {
+      "crate": "slam",
+      "variant": "baseline",
+      "stage": "07-prefix-repeat",
+      "exit_code": 0,
+      "cmake_calls": 0,
+      "parallel_arguments": []
+    },
+    {
+      "crate": "slam",
+      "variant": "baseline",
+      "stage": "08-toolchain",
+      "exit_code": 0,
+      "cmake_calls": 2,
+      "parallel_arguments": [
+        "6"
+      ]
+    },
+    {
+      "crate": "slam",
+      "variant": "baseline",
+      "stage": "09-toolchain-repeat",
+      "exit_code": 0,
+      "cmake_calls": 0,
+      "parallel_arguments": []
+    },
+    {
+      "crate": "slam",
+      "variant": "baseline",
+      "stage": "10-configure-failure",
+      "exit_code": 101,
+      "cmake_calls": 1,
+      "parallel_arguments": []
+    },
+    {
+      "crate": "slam",
+      "variant": "baseline",
+      "stage": "11-configure-retry",
+      "exit_code": 0,
+      "cmake_calls": 2,
+      "parallel_arguments": [
+        "7"
+      ]
+    },
+    {
+      "crate": "slam",
+      "variant": "baseline",
+      "stage": "12-build-failure",
+      "exit_code": 101,
+      "cmake_calls": 2,
+      "parallel_arguments": [
+        "8"
+      ]
+    },
+    {
+      "crate": "slam",
+      "variant": "baseline",
+      "stage": "13-build-retry",
+      "exit_code": 0,
+      "cmake_calls": 2,
+      "parallel_arguments": [
+        "8"
+      ]
+    },
+    {
+      "crate": "slam",
+      "variant": "baseline",
+      "stage": "14-final-repeat",
+      "exit_code": 0,
+      "cmake_calls": 0,
+      "parallel_arguments": []
+    },
+    {
+      "crate": "slam",
+      "variant": "candidate",
+      "stage": "01-first",
+      "exit_code": 0,
+      "cmake_calls": 2,
+      "parallel_arguments": [
+        "2"
+      ]
+    },
+    {
+      "crate": "slam",
+      "variant": "candidate",
+      "stage": "02-unchanged",
+      "exit_code": 0,
+      "cmake_calls": 0,
+      "parallel_arguments": []
+    },
+    {
+      "crate": "slam",
+      "variant": "candidate",
+      "stage": "03-jobs-only",
+      "exit_code": 0,
+      "cmake_calls": 0,
+      "parallel_arguments": []
+    },
+    {
+      "crate": "slam",
+      "variant": "candidate",
+      "stage": "04-native-source",
+      "exit_code": 0,
+      "cmake_calls": 2,
+      "parallel_arguments": [
+        "4"
+      ]
+    },
+    {
+      "crate": "slam",
+      "variant": "candidate",
+      "stage": "05-source-repeat",
+      "exit_code": 0,
+      "cmake_calls": 0,
+      "parallel_arguments": []
+    },
+    {
+      "crate": "slam",
+      "variant": "candidate",
+      "stage": "06-prefix",
+      "exit_code": 0,
+      "cmake_calls": 2,
+      "parallel_arguments": [
+        "5"
+      ]
+    },
+    {
+      "crate": "slam",
+      "variant": "candidate",
+      "stage": "07-prefix-repeat",
+      "exit_code": 0,
+      "cmake_calls": 0,
+      "parallel_arguments": []
+    },
+    {
+      "crate": "slam",
+      "variant": "candidate",
+      "stage": "08-toolchain",
+      "exit_code": 0,
+      "cmake_calls": 2,
+      "parallel_arguments": [
+        "6"
+      ]
+    },
+    {
+      "crate": "slam",
+      "variant": "candidate",
+      "stage": "09-toolchain-repeat",
+      "exit_code": 0,
+      "cmake_calls": 0,
+      "parallel_arguments": []
+    },
+    {
+      "crate": "slam",
+      "variant": "candidate",
+      "stage": "10-configure-failure",
+      "exit_code": 101,
+      "cmake_calls": 1,
+      "parallel_arguments": []
+    },
+    {
+      "crate": "slam",
+      "variant": "candidate",
+      "stage": "11-configure-retry",
+      "exit_code": 0,
+      "cmake_calls": 2,
+      "parallel_arguments": [
+        "7"
+      ]
+    },
+    {
+      "crate": "slam",
+      "variant": "candidate",
+      "stage": "12-build-failure",
+      "exit_code": 101,
+      "cmake_calls": 2,
+      "parallel_arguments": [
+        "8"
+      ]
+    },
+    {
+      "crate": "slam",
+      "variant": "candidate",
+      "stage": "13-build-retry",
+      "exit_code": 0,
+      "cmake_calls": 2,
+      "parallel_arguments": [
+        "8"
+      ]
+    },
+    {
+      "crate": "slam",
+      "variant": "candidate",
+      "stage": "14-final-repeat",
+      "exit_code": 0,
+      "cmake_calls": 0,
+      "parallel_arguments": []
+    },
+    {
+      "crate": "gtsam",
+      "variant": "baseline",
+      "stage": "01-first",
+      "exit_code": 0,
+      "cmake_calls": 2,
+      "parallel_arguments": [
+        "2"
+      ]
+    },
+    {
+      "crate": "gtsam",
+      "variant": "baseline",
+      "stage": "02-unchanged",
+      "exit_code": 0,
+      "cmake_calls": 0,
+      "parallel_arguments": []
+    },
+    {
+      "crate": "gtsam",
+      "variant": "baseline",
+      "stage": "03-jobs-only",
+      "exit_code": 0,
+      "cmake_calls": 2,
+      "parallel_arguments": [
+        "3"
+      ]
+    },
+    {
+      "crate": "gtsam",
+      "variant": "baseline",
+      "stage": "04-native-source",
+      "exit_code": 0,
+      "cmake_calls": 2,
+      "parallel_arguments": [
+        "4"
+      ]
+    },
+    {
+      "crate": "gtsam",
+      "variant": "baseline",
+      "stage": "05-source-repeat",
+      "exit_code": 0,
+      "cmake_calls": 0,
+      "parallel_arguments": []
+    },
+    {
+      "crate": "gtsam",
+      "variant": "baseline",
+      "stage": "06-prefix",
+      "exit_code": 0,
+      "cmake_calls": 2,
+      "parallel_arguments": [
+        "5"
+      ]
+    },
+    {
+      "crate": "gtsam",
+      "variant": "baseline",
+      "stage": "07-prefix-repeat",
+      "exit_code": 0,
+      "cmake_calls": 0,
+      "parallel_arguments": []
+    },
+    {
+      "crate": "gtsam",
+      "variant": "baseline",
+      "stage": "08-toolchain",
+      "exit_code": 0,
+      "cmake_calls": 2,
+      "parallel_arguments": [
+        "6"
+      ]
+    },
+    {
+      "crate": "gtsam",
+      "variant": "baseline",
+      "stage": "09-toolchain-repeat",
+      "exit_code": 0,
+      "cmake_calls": 0,
+      "parallel_arguments": []
+    },
+    {
+      "crate": "gtsam",
+      "variant": "baseline",
+      "stage": "10-configure-failure",
+      "exit_code": 101,
+      "cmake_calls": 1,
+      "parallel_arguments": []
+    },
+    {
+      "crate": "gtsam",
+      "variant": "baseline",
+      "stage": "11-configure-retry",
+      "exit_code": 0,
+      "cmake_calls": 2,
+      "parallel_arguments": [
+        "7"
+      ]
+    },
+    {
+      "crate": "gtsam",
+      "variant": "baseline",
+      "stage": "12-build-failure",
+      "exit_code": 101,
+      "cmake_calls": 2,
+      "parallel_arguments": [
+        "8"
+      ]
+    },
+    {
+      "crate": "gtsam",
+      "variant": "baseline",
+      "stage": "13-build-retry",
+      "exit_code": 0,
+      "cmake_calls": 2,
+      "parallel_arguments": [
+        "8"
+      ]
+    },
+    {
+      "crate": "gtsam",
+      "variant": "baseline",
+      "stage": "14-final-repeat",
+      "exit_code": 0,
+      "cmake_calls": 0,
+      "parallel_arguments": []
+    },
+    {
+      "crate": "gtsam",
+      "variant": "candidate",
+      "stage": "01-first",
+      "exit_code": 0,
+      "cmake_calls": 2,
+      "parallel_arguments": [
+        "2"
+      ]
+    },
+    {
+      "crate": "gtsam",
+      "variant": "candidate",
+      "stage": "02-unchanged",
+      "exit_code": 0,
+      "cmake_calls": 0,
+      "parallel_arguments": []
+    },
+    {
+      "crate": "gtsam",
+      "variant": "candidate",
+      "stage": "03-jobs-only",
+      "exit_code": 0,
+      "cmake_calls": 0,
+      "parallel_arguments": []
+    },
+    {
+      "crate": "gtsam",
+      "variant": "candidate",
+      "stage": "04-native-source",
+      "exit_code": 0,
+      "cmake_calls": 2,
+      "parallel_arguments": [
+        "4"
+      ]
+    },
+    {
+      "crate": "gtsam",
+      "variant": "candidate",
+      "stage": "05-source-repeat",
+      "exit_code": 0,
+      "cmake_calls": 0,
+      "parallel_arguments": []
+    },
+    {
+      "crate": "gtsam",
+      "variant": "candidate",
+      "stage": "06-prefix",
+      "exit_code": 0,
+      "cmake_calls": 2,
+      "parallel_arguments": [
+        "5"
+      ]
+    },
+    {
+      "crate": "gtsam",
+      "variant": "candidate",
+      "stage": "07-prefix-repeat",
+      "exit_code": 0,
+      "cmake_calls": 0,
+      "parallel_arguments": []
+    },
+    {
+      "crate": "gtsam",
+      "variant": "candidate",
+      "stage": "08-toolchain",
+      "exit_code": 0,
+      "cmake_calls": 2,
+      "parallel_arguments": [
+        "6"
+      ]
+    },
+    {
+      "crate": "gtsam",
+      "variant": "candidate",
+      "stage": "09-toolchain-repeat",
+      "exit_code": 0,
+      "cmake_calls": 0,
+      "parallel_arguments": []
+    },
+    {
+      "crate": "gtsam",
+      "variant": "candidate",
+      "stage": "10-configure-failure",
+      "exit_code": 101,
+      "cmake_calls": 1,
+      "parallel_arguments": []
+    },
+    {
+      "crate": "gtsam",
+      "variant": "candidate",
+      "stage": "11-configure-retry",
+      "exit_code": 0,
+      "cmake_calls": 2,
+      "parallel_arguments": [
+        "7"
+      ]
+    },
+    {
+      "crate": "gtsam",
+      "variant": "candidate",
+      "stage": "12-build-failure",
+      "exit_code": 101,
+      "cmake_calls": 2,
+      "parallel_arguments": [
+        "8"
+      ]
+    },
+    {
+      "crate": "gtsam",
+      "variant": "candidate",
+      "stage": "13-build-retry",
+      "exit_code": 0,
+      "cmake_calls": 2,
+      "parallel_arguments": [
+        "8"
+      ]
+    },
+    {
+      "crate": "gtsam",
+      "variant": "candidate",
+      "stage": "14-final-repeat",
+      "exit_code": 0,
+      "cmake_calls": 0,
+      "parallel_arguments": []
+    }
+  ]
+}

@@ -84,5 +84,4 @@ fn main() {
     println!("cargo:rerun-if-changed=native");
     println!("cargo:rerun-if-env-changed=CMAKE_PREFIX_PATH");
     println!("cargo:rerun-if-env-changed=CMAKE_TOOLCHAIN_FILE");
-    println!("cargo:rerun-if-env-changed=CMAKE_BUILD_PARALLEL_LEVEL");
 }

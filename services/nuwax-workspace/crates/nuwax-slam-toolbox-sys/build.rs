@@ -35,11 +35,7 @@ fn main() {
     // 开发构建可直接运行；发布安装器另以相对库目录打包，并携带所有动态依赖。
     println!("cargo:libdir={}", build.display());
     println!("cargo:rerun-if-changed=native");
-    for key in [
-        "CMAKE_PREFIX_PATH",
-        "CMAKE_TOOLCHAIN_FILE",
-        "CMAKE_BUILD_PARALLEL_LEVEL",
-    ] {
+    for key in ["CMAKE_PREFIX_PATH", "CMAKE_TOOLCHAIN_FILE"] {
         println!("cargo:rerun-if-env-changed={key}");
     }
 }

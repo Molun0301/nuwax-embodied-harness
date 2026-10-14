@@ -28,6 +28,12 @@ undefined-symbol error.
 - Unmanaged `find_package` behavior remains unchanged, including explicit
   developer `-DTBB_DIR` and `-DCeres_DIR` choices
 
+Leaving managed mode clears the managed-prefix argument, not ordinary CMake
+package caches. Without explicit new package-directory choices, unmanaged mode
+can retain the last discovered package paths; the qualified transition below
+supplies explicit custom directories and does not claim automatic restoration of
+earlier developer choices.
+
 Standard `CMAKE_PREFIX_PATH` alone cannot express this ownership distinction:
 CMake gives cached package directories precedence, and unmanaged cached paths can
 be intentional developer overrides. The one installer-owned input makes the

@@ -11845,6 +11845,8 @@ mod preflight_only_contract {
 
         use super::*;
 
+        include!("relocalization_preparation_probe.rs");
+
         fn local_consensus_source() -> Vec<Point3<f64>> {
             let mut source = Vec::new();
             for index in 0..8 {

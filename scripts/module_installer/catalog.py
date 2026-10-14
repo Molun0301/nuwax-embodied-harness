@@ -151,7 +151,7 @@ def module_system_packages(modules: Iterable[str], robot: str = "customrobot") -
     # lcm 的 Python 绑定需要编译；opencv-python 的桌面构建需要这些共享库。
     packages = ["ca-certificates", "python3-venv", "python3-dev", "python3-pip", "build-essential", "pkg-config", "liblcm-dev", "libgl1", "libglib2.0-0"]
     if "geometry" in selected:
-        packages.extend(("curl", "git", "cmake", "protobuf-compiler", "libssl-dev", "liblcm-bin", "libpcl-dev"))
+        packages.extend(("curl", "git", "cmake", "protobuf-compiler", "libssl-dev", "liblcm-bin", "libpcl-dev", "libglib2.0-dev"))
     if selected & {"fastlio2", "pointlio"}:
         packages.extend(("cmake", "git", "patch", "liblcm-bin", "libeigen3-dev", "libpcl-dev"))
     if "pointlio" in selected:

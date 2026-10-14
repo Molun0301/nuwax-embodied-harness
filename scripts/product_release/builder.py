@@ -189,7 +189,8 @@ def wheel_records(directory: Path) -> list:
                             machine = int.from_bytes(header[18:20], "little" if header[5] == 1 else "big") if len(header) >= 20 else 0
                             if header[4] != 2 or {62: "x86_64", 183: "aarch64"}.get(machine) != architecture or parts[-1] == "any":
                                 raise ReleaseError("轮子内原生文件架构或平台标记不符：" + name)
-                metadata_names = [name for name in names if name.endswith(".dist-info/METADATA")]
+                # setuptools等官方轮子带有内部依赖元数据；发行身份只来自根目录dist-info。
+                metadata_names = [name for name in names if name.count("/") == 1 and name.endswith(".dist-info/METADATA")]
                 if len(metadata_names) != 1:
                     raise ReleaseError("轮子缺少唯一元数据：" + path.name)
                 if wheel.getinfo(metadata_names[0]).file_size > 4 * 1024 ** 2:

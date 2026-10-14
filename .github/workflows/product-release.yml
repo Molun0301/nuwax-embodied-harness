@@ -110,13 +110,15 @@ jobs:
           /usr/bin/python3 --version
           /usr/bin/python3 -m pip --version
           rustup toolchain install 1.88.0 --profile minimal
-      - uses: actions/cache@v4
+      - uses: actions/cache/restore@v4
+        id: build-cache
         with:
           path: |
             ~/.cache/pip
             ${{ runner.temp }}/neh-cache/${{ matrix.id }}
-          key: neh-${{ runner.os }}-${{ runner.arch }}-${{ matrix.id }}-${{ hashFiles('requirements/**/*.in', 'services/**/Cargo.lock', 'services/**/flake.lock', 'scripts/module_installer/builds.py') }}
+          key: neh-${{ runner.os }}-${{ runner.arch }}-${{ matrix.id }}-${{ hashFiles('requirements/**/*.in', 'services/**/Cargo.lock', 'services/**/flake.lock', 'scripts/module_installer/builds.py') }}-${{ github.sha }}
           restore-keys: |
+            neh-${{ runner.os }}-${{ runner.arch }}-${{ matrix.id }}-${{ hashFiles('requirements/**/*.in', 'services/**/Cargo.lock', 'services/**/flake.lock', 'scripts/module_installer/builds.py') }}-
             neh-${{ runner.os }}-${{ runner.arch }}-${{ matrix.id }}-
       - id: compile
         name: 在真实目标用户态编译程序并生成轻量包
@@ -140,6 +142,14 @@ jobs:
             ${{ runner.temp }}/neh-build-${{ matrix.id }}.work/smoke/离线验证结果.json
             ${{ runner.temp }}/neh-build-${{ matrix.id }}.work/go2-cache/verification.json
           if-no-files-found: warn
+      - name: 保留已下载依赖与可恢复编译缓存
+        if: always() && steps.build-cache.outputs.cache-primary-key != '' && steps.build-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ${{ runner.temp }}/neh-cache/${{ matrix.id }}
+          key: ${{ steps.build-cache.outputs.cache-primary-key }}
 
   assemble:
     needs: [select, build]

@@ -709,7 +709,8 @@ class InstanceAssociationService:
             # 已关联的移动物体不能继续拖着全生命周期平均位置。
             blended_pose = observation.pose
         inspection_poses = self._inspection_pose_planner.plan_for_target(
-            target_pose=blended_pose, occupancy_grid=occupancy_grid, cost_map=cost_map,
+            target_pose=blended_pose, observer_body_pose=observation.observer_body_pose,
+            occupancy_grid=occupancy_grid, cost_map=cost_map,
             existing_poses=current.inspection_poses)
         metadata = self._build_instance_metadata(
             observation,
@@ -765,7 +766,9 @@ class InstanceAssociationService:
             "deferred_projection_cache": deferred_cache,
             "lifecycle_state": merged_lifecycle,
             "metadata": metadata,
-            "attributes": {**current.attributes, **observation.attributes},
+            "attributes": {**current.attributes, **observation.attributes, **({
+                "observer_body_pose": observation.observer_body_pose.model_dump(mode="json")
+            } if observation.observer_body_pose is not None else {})},
             "supporting_observation_event_ids": supporting_event_ids,
         }
         # 只复制本次生成的可变字段，避免每帧复制实例保留的完整射线历史。
@@ -787,6 +790,7 @@ class InstanceAssociationService:
         instance_id = build_instance_id(id_kind, timestamp=now)
         inspection_poses = self._inspection_pose_planner.plan_for_target(
             target_pose=observation.pose,
+            observer_body_pose=observation.observer_body_pose,
             occupancy_grid=occupancy_grid,
             cost_map=cost_map,
         )

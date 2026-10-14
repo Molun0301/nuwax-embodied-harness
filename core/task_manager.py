@@ -19,6 +19,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel
+from pydantic_core import TzInfo
 
 import contracts
 from contracts.base import MetadataDict, utc_now
@@ -154,9 +155,9 @@ def _receipt_issue(issues, reason):
 
 
 def _immutable_receipt_scalar(value):
-    # datetime 可包含可变用户 tzinfo；只共享标准无时区/固定偏移值。
+    # JSON契约还原使用Pydantic固定偏移时区；它与标准timezone一样不可变。
     if type(value) is datetime:
-        return value.tzinfo is None or type(value.tzinfo) is timezone
+        return value.tzinfo is None or type(value.tzinfo) in (timezone, TzInfo)
     return type(value) in (str, int, float, bool, bytes, type(None), date, Decimal,
                            Path, PosixPath, WindowsPath, PurePath, PurePosixPath, PureWindowsPath, UUID)
 

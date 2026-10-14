@@ -2047,6 +2047,7 @@ dependencies = [
  "bytes",
  "chrono",
  "indexmap 2.14.0",
+ "libc",
  "once_cell",
  "serde",
  "serde_json",

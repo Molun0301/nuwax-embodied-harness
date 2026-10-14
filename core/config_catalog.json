@@ -2661,5 +2661,17 @@
     ],
     "apply_scope": "重启网关后生效",
     "description": "查询同一设备任务状态的间隔秒数。"
+  },
+  "NUWAX_MOTION_STOP_FEEDBACK_TIMEOUT_SEC": {
+    "zh_name": "实测反馈停车等待上限",
+    "type": "float",
+    "default": 1.0,
+    "section_id": "nav_stack",
+    "target_file": "core_env",
+    "consumers": [
+      "services/navigation/motion_safety_guard/stop_confirmation.py"
+    ],
+    "apply_scope": "重启运动守卫后生效",
+    "description": "仅在未配置完整MotionLimits且提供真实执行反馈时使用的停车等待秒数，范围大于0且不超过30。不是保证制动标定；超时仍失败，速度与连续停稳判据不变。完整MotionLimits仍使用标定制动上界。"
   }
 }

@@ -818,7 +818,7 @@ def test_map_view_skips_decision_rows_without_initializing_or_publishing_context
     memory._durable_index.load_history = load_history
     complete = memory.capture_scene_mapping_state()
     assert complete['spaces'] and complete['entries']
-    assert set(complete) == {'snapshot', 'binding', 'library_name', 'generation', 'spaces', 'entries'}
+    assert set(complete) == {'snapshot', 'binding', 'library_name', 'generation', 'spaces', 'entries', 'evidence_bindings'}
     context = memory._latest_semantic_map_context
     identity = memory._latest_semantic_map_context_identity
     def forbidden(*args, **kwargs):

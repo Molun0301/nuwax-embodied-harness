@@ -34,7 +34,10 @@ impl CommandDispatchBound {
     /// A stale or invalid source produces an already-expired bound, never freshness.
     pub fn from_source_timestamp(source_timestamp_ns:u64,max_age:Duration)->Self {
         let age=max_age.as_nanos().min(u128::from(u64::MAX)) as u64;
-        Self::from_anchor(ObservationClockAnchor::capture(),source_timestamp_ns.saturating_add(age))
+        let anchor=ObservationClockAnchor::capture();
+        let latest=nuwax_nav_types_messages::source_time::comparison_timestamp_ns_at(
+            source_timestamp_ns,anchor.unix_ns).ok().map(|stamp|stamp.saturating_add(age)).unwrap_or(0);
+        Self::from_anchor(anchor,latest)
     }
     pub(crate) fn earliest(self,other:Self)->Self {
         Self {

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from core.source_time import SourceTimeError, source_age_ns
 import hashlib
 import json
 import logging
@@ -3334,7 +3335,10 @@ class PlatformGeometryRuntime:
         self._map_stream_tracker["last_costmap_count"] = int(live_map_status.get("cost_map_message_count") or 0)
         latest_age_sec = None
         if timestamp is not None:
-            latest_age_sec = max(0.0, (now - timestamp).total_seconds())
+            try:
+                latest_age_sec = max(0.0, source_age_ns(round(timestamp.timestamp()*1e9)) / 1e9)
+            except SourceTimeError:
+                latest_age_sec = None
         received_age_sec = None
         if received_at is not None:
             received_age_sec = max(0.0, (now - received_at).total_seconds())
@@ -4361,7 +4365,11 @@ class PlatformGeometryRuntime:
         if value is None:
             provider = self.get_geometry_runtime_provider()
             pose = provider.get_current_pose() if provider is not None else None
-            if pose is not None and 0 <= time.time() - pose.timestamp.timestamp() <= 1.0:
+            try:
+                pose_age_ns = source_age_ns(round(pose.timestamp.timestamp()*1e9)) if pose is not None else None
+            except SourceTimeError:
+                pose_age_ns = None
+            if pose_age_ns is not None and 0 <= pose_age_ns <= 1_000_000_000:
                 q = pose.orientation
                 value = [pose.position.x, pose.position.y, math.atan2(2 * (q.w*q.z+q.x*q.y), 1-2*(q.y*q.y+q.z*q.z))]
             else:

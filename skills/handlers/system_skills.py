@@ -37,6 +37,24 @@ def handle_get_robot_status(
         raise GatewayError("当前还没有可用的机器人状态流帧。")
     result = snapshot.model_dump(mode="json")
     result["perception_runtime"] = ctx.serialize(ctx.perception_video_runtime.get_status())
+    provider = getattr(getattr(ctx, "robot", None), "providers", None)
+    status_reader = getattr(provider, "status_snapshot", None)
+    camera_status = status_reader() if callable(status_reader) else {}
+    camera_ids = list(camera_status.get("camera_ids") or [])
+    result["camera_ids"] = camera_ids
+    result["cameras"] = []
+    if camera_status.get("default_camera_id") is not None:
+        result["default_camera_id"] = camera_status["default_camera_id"]
+    info_reader = getattr(provider, "get_camera_info", None)
+    image_reader = getattr(provider, "get_latest_image", None)
+    for camera_id in camera_ids:
+        info = info_reader(camera_id) if callable(info_reader) else None
+        image = image_reader(camera_id) if callable(image_reader) else None
+        metadata = image.metadata if image is not None else {}
+        result["cameras"].append({"camera_id": camera_id,
+            "camera_info": ctx.serialize(info) if info is not None else None,
+            "camera_role": metadata.get("camera_role"), "calibration_ref": metadata.get("calibration_ref"),
+            "calibration": metadata.get("calibration")})
     return result
 
 

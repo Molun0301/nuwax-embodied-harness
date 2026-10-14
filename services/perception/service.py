@@ -44,6 +44,7 @@ from services.perception.base import (
 )
 from services.perception.detectors import DetectorPipeline
 from services.perception.geometry import DetectionGeometryAugmentor
+from services.perception.observation_geometry import capture_geometry
 from services.perception.scene import SimpleSceneDescriptionBackend
 from services.perception.trackers import Basic2DTrackerBackend
 
@@ -786,11 +787,70 @@ class PerceptionService:
             context, image_frame=image_frame, source=source_name or detector_spec.name,
             kind="latest_perception_fast", hold=None, full=False,
         )
-        if cacheable and stage_status["detector"] in {"completed", "fallback"}:
-            self._fast_frame_cache[context.camera_id] = (source_frame, input_signature, cache_key, context)
+        if stage_status["detector"] in {"completed", "fallback"}:
+            self._fast_frame_cache[context.camera_id] = (
+                source_frame, input_signature if cacheable else None, cache_key, context,
+                image_frame.model_copy(deep=True), camera_info.model_copy(deep=True) if camera_info is not None else None)
             if len(self._fast_frame_cache) > 8:
                 self._fast_frame_cache.pop(next(iter(self._fast_frame_cache)))
         return context, self._prepare_detection_overlay_frame(context)
+
+    def get_fast_observation_input(self, context):
+        """将同一检测输入交给已有记忆任务，后续相机帧不会替换它。"""
+        with self._pipeline_lock:
+            cached = self._fast_frame_cache.get(context.camera_id)
+            if cached is not None and cached[3].observation.observation_id == context.observation.observation_id:
+                return cached[4], cached[5]
+        return None
+
+    @contextmanager
+    def complete_observation_geometry(self, context, inputs, *, store_artifact=False,
+                                      wait_sec=0.0, stop_event=None):
+        """沿新版制品拥有方保活至记忆事务结束，关闭会等待本次操作退出。"""
+        with self._operation():
+            scope = self._artifact_service.publication_scope(owner="perception.video_geometry") if store_artifact else nullcontext(None)
+            with scope:
+                yield self._complete_observation_geometry(
+                    context, inputs, store_artifact=store_artifact,
+                    wait_sec=wait_sec, stop_event=stop_event)
+
+    def _complete_observation_geometry(self, context, inputs, *, store_artifact=False,
+                                      wait_sec=0.0, stop_event=None):
+        """后台补几何与关键帧照片，复用本次检测结果，不再次抓拍或推理。"""
+        if inputs is None:
+            return context, None, None
+        image_frame, camera_info = inputs
+        deadline = perf_counter() + wait_sec
+        geometry = capture_geometry(self._stream_bus, image_frame)
+        while geometry.reason in {"capture_pose_unavailable", "capture_pointcloud_unavailable"} and perf_counter() < deadline:
+            if stop_event is None or stop_event.wait(min(0.02, max(0.0, deadline - perf_counter()))):
+                break
+            geometry = capture_geometry(self._stream_bus, image_frame)
+        if stop_event is not None and stop_event.is_set():
+            return context, None, None
+        detections, metadata = self._geometry_augmentor.augment_detections(
+            tuple(context.observation.detections_2d), image_frame=image_frame, camera_info=camera_info,
+            point_cloud=geometry.point_cloud, frame_tree=geometry.frame_tree, current_pose=geometry.pose)
+        metadata = {**metadata, "geometry_synchronization": "same_acquisition_time",
+                    "geometry_input_sources": list(geometry.sources)}
+        if geometry.reason:
+            metadata["geometry_projection_degradation_reason"] = geometry.reason
+            detections = tuple(item.model_copy(update={"attributes": {
+                **item.attributes, "geometry_projection_degradation_reason": geometry.reason}})
+                for item in detections)
+        artifact = context.image_artifact
+        if store_artifact and artifact is None:
+            artifact = self._artifact_service.save_image_frame(image_frame, metadata={
+                "requested_by": "perception_video_runtime", "observation_id": context.observation.observation_id})
+        def enriched(original):
+            return {**original, "detection_metadata": {**original.get("detection_metadata", {}), **metadata},
+                    **metadata, "geometry_stage_status": "completed"}
+        observation = context.observation.model_copy(update={
+            "detections_2d": list(detections), "metadata": enriched(context.observation.metadata),
+            "artifact_ids": [artifact.artifact_id] if artifact is not None else context.observation.artifact_ids})
+        return context.model_copy(update={"observation": observation, "image_artifact": artifact,
+                                         "metadata": {**enriched(context.metadata), "stage_status": {
+                                             **context.metadata.get("stage_status", {}), "geometry": "completed"}}}), geometry.pose, geometry.frame_tree
 
     @staticmethod
     def _fast_input_signature(image_frame, camera_info):
@@ -1439,6 +1499,10 @@ class PerceptionService:
     def _publish_video_frame(self, image_frame, *, source_name: str) -> None:
         if self._stream_bus is None:
             return
+        preview_camera_id = getattr(self._video_frame_sink, "camera_id", None)
+        if preview_camera_id and image_frame.camera_id != preview_camera_id:
+            # 单槽预览按绑定来源发布，另一相机不能清空已显示画面。
+            return
         input_signature = self._fast_input_signature(image_frame, None)
         previous = self._last_published_video_frames.get(image_frame.camera_id)
         if input_signature is not None and previous is not None and previous[0] is image_frame and previous[1] == input_signature:
@@ -1547,7 +1611,11 @@ class PerceptionService:
     def video_frame_source_status(self) -> Dict[str, Any]:
         """返回平台端侧推流接收状态，供持续感知运行时做实时性门禁。"""
 
-        return self._video_frame_source_status()
+        status = self._video_frame_source_status()
+        preview_camera_id = getattr(self._video_frame_sink, "camera_id", None)
+        if preview_camera_id:
+            status["camera_id"] = preview_camera_id
+        return status
 
     def _camera_info_from_video_frame(self, image_frame):
         from contracts.image import CameraInfo

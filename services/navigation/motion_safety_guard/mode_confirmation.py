@@ -1,6 +1,7 @@
 """启动时进入已配置步态，运行时只读核对实际模式，始终由原执行器写入。"""
 from __future__ import annotations
 import time
+from core.source_time import SourceTimeError, acquired_after
 from .go2_actuator import ActuatorError
 
 
@@ -46,6 +47,7 @@ class LocomotionModeRequirement:
             raise ActuatorError("LOCOMOTION_MODE_CANCELLED", "步态准备已取消。")
         before_switch()
         issued_ns = self._unix_ns()
+        issued_monotonic_ns = round(self._monotonic() * 1_000_000_000)
         try:
             setter(self.mode_id)
         except Exception as exc:
@@ -55,9 +57,9 @@ class LocomotionModeRequirement:
                 raise ActuatorError("LOCOMOTION_MODE_CANCELLED", "步态准备已取消。")
             try:
                 value = read_feedback()
-                if value is not None and value.source_timestamp_ns >= issued_ns and value.locomotion_mode_id == self.mode_id and value.locomotion_mode_ready is True:
+                if value is not None and acquired_after(value.source_timestamp_ns, issued_unix_ns=issued_ns, issued_monotonic_ns=issued_monotonic_ns) and value.locomotion_mode_id == self.mode_id and value.locomotion_mode_ready is True:
                     return True
-            except ActuatorError:
+            except (ActuatorError, SourceTimeError):
                 pass
             self._sleep(.01)
         raise ActuatorError("LOCOMOTION_MODE_UNCONFIRMED", "执行器未在期限内确认要求的步态：%s" % self.mode_id)

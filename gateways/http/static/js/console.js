@@ -3534,12 +3534,15 @@
           return;
         }
         // 总线信封时间是发布时间；这里只使用实际显示的位姿自身源时间。
-        const sourceTime = typeof pose.timestamp === "string" ? Date.parse(pose.timestamp) : NaN;
+        const receiptKey = JSON.stringify([state.poseMapIdentity?.key, pose.frame_id, pose.timestamp]);
+        const acquired = state.poseAcquisitions?.get(receiptKey);
+        const sourceTime = state.poseAcquisitions?.has(receiptKey)
+          ? (typeof acquired === "number" ? acquired / 1e6 : NaN)
+          : (typeof pose.timestamp === "string" ? Date.parse(pose.timestamp) : NaN);
         const rawAgeMs = displayedAt - sourceTime;
         const estimate = activeStreamClockEstimate();
         const age = rawAgeMs + (estimate?.offsetMs || 0);
-        // 轮询/轨迹更新可能重建同一位姿对象；以当前地图和真实采样时间关联接收诊断。
-        const receiptKey = JSON.stringify([state.poseMapIdentity?.key, pose.frame_id, pose.timestamp]);
+        // 轮询/轨迹更新可能重建同一位姿对象；继续以原采样时间关联接收诊断。
         const receiptMs = Number(state.poseReceipts?.get(receiptKey)) / 1e6;
         const softwareMs = displayedAt + (estimate?.offsetMs || 0) - receiptMs;
         state.displayedPoseMetrics[kind] = { pose, mapKey, rawAgeMs, calibrated: Boolean(estimate),
@@ -3576,7 +3579,7 @@
         if (!els.mapStreamStatus) return;
         const kind = state.mapViewMode === "3d" ? "map3d" : "map2d";
         setVisionText(els.mapStreamStatus, mediaMetricText(kind));
-        els.mapStreamStatus.title = "帧率仅统计接受的新地图内容，不是机器人移动或画布重画频率。位姿延迟使用通过当前地图身份校验且实际绘制的位姿自身时间至本次绘制时刻，每个新位姿更新；地图内容时间不参与。缺少有效位姿、源时间或页面隐藏时显示未知；≈表示已估算时钟偏差。" + clockCalibrationHint(state.displayedPoseMetrics?.[kind]?.rawAgeMs);
+        els.mapStreamStatus.title = "帧率仅统计接受的新地图内容，不是机器人移动或画布重画频率。位姿延迟使用通过当前地图身份校验且实际绘制的位姿采集时间至本次绘制时刻；仿真使用生产端记录的真实采集时间，每个新位姿更新；地图内容时间不参与。缺少有效位姿、源时间或页面隐藏时显示未知；≈表示已估算时钟偏差。" + clockCalibrationHint(state.displayedPoseMetrics?.[kind]?.rawAgeMs);
       }
       function updateMapHeartbeat(envelope) {
         const cursor = normalizedStreamCursor(envelope.cursor);
@@ -3647,6 +3650,12 @@
         const incomingPose = data.pose || (pointFromPose(data) ? data : null);
         if (pointFromPose(incomingPose)) state.latestPose = incomingPose;
         else if (envelope.type === "localization.pose") state.latestPose = null;
+        if (incomingPose && Object.hasOwn(envelope.metadata || {}, "source_acquired_unix_ns")) {
+          state.poseAcquisitions ||= new Map();
+          const key = JSON.stringify([state.poseMapIdentity?.key, incomingPose.frame_id, incomingPose.timestamp]);
+          state.poseAcquisitions.set(key, envelope.metadata.source_acquired_unix_ns);
+          if (state.poseAcquisitions.size > 256) state.poseAcquisitions.delete(state.poseAcquisitions.keys().next().value);
+        }
         if (incomingPose && envelope.metadata?.scan_received_unix_ns) {
           state.poseReceipts ||= new Map();
           const key = JSON.stringify([state.poseMapIdentity?.key, incomingPose.frame_id, incomingPose.timestamp]);

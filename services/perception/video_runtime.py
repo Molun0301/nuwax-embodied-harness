@@ -657,7 +657,9 @@ class PerceptionVideoRuntime:
         hold = self._perception_service.acquire_context_artifacts(
             context, owner="perception.video_queue",
         ) if ids else None
+        input_getter = getattr(self._perception_service, "get_fast_observation_input", None)
         job = {
+            "geometry_input": input_getter(context) if callable(input_getter) else None,
             "continuous": continuous,
             "artifact_hold": hold,
             "library_name": expected_library_name if expected_library_name is not None else current_library,
@@ -717,6 +719,7 @@ class PerceptionVideoRuntime:
                 try:
                     parameters = dict(job)
                     parameters.pop("artifact_hold", None)
+                    inputs = parameters.pop("geometry_input", None)
                     continuous = parameters.pop("continuous", False)
                     expected_library = parameters.pop("library_name", None)
                     parameters["expected_library_name"] = expected_library
@@ -726,12 +729,27 @@ class PerceptionVideoRuntime:
                     elif expected_library is not None and callable(library_getter) and library_getter() != expected_library:
                         error = "memory_library_changed"
                     else:
-                        if continuous:
-                            for key in ("reason", "force", "allow_memory_write"):
-                                parameters.pop(key)
-                            ok = self._ingest_continuous_observation(**parameters)
-                        else:
-                            ok = self._remember_from_keyframe(**parameters)
+                        completer = getattr(self._perception_service, "complete_observation_geometry", None)
+                        scope = completer(
+                            parameters["context"], inputs, store_artifact=not continuous,
+                            wait_sec=self._interval_sec, stop_event=self._stop_event
+                        ) if callable(completer) and inputs is not None else nullcontext(None)
+                        # 新制品的发布拥有方一直保留到记忆事务返回，再沿原队列finally释放旧拥有方。
+                        with scope as completed:
+                            if completed is not None:
+                                parameters["context"], parameters["current_pose"], capture_tree = completed
+                                snapshot = parameters.get("localization_snapshot")
+                                if snapshot is not None:
+                                    parameters["localization_snapshot"] = snapshot.model_copy(
+                                        update={"current_pose": parameters["current_pose"], "frame_tree": capture_tree})
+                            if self._stop_event.is_set():
+                                raise RuntimeError("memory_write_cancelled")
+                            if continuous:
+                                for key in ("reason", "force", "allow_memory_write"):
+                                    parameters.pop(key)
+                                ok = self._ingest_continuous_observation(**parameters)
+                            else:
+                                ok = self._remember_from_keyframe(**parameters)
                 except Exception as exc:
                     error = str(exc)
                     PERCEPTION_RUNTIME_LOGGER.debug("记忆后台写入失败 camera=%s error=%s", self._camera_id, exc, exc_info=True)

@@ -620,5 +620,10 @@
         "cmake_calls": 0
       }
     ]
+  },
+  "additional_real_package_configure": {
+    "results_file": "slam2d-real-package-discovery-20261014-results.json",
+    "configure_passes": 2,
+    "scope": "Actual full production native CMakeLists.txt, existing real installed packages, isolated initial/reuse configure only; no native target build/install."
   }
 }

@@ -148,3 +148,40 @@ configs, objects, installed runtime generations, and logs. The cloud task retain
 final `production-binding-evidence`, final `production-jobs-evidence`, and Python
 3.8.10 logs. Application hash guards are active in the real-CMake fixtures; Boost
 source preparation itself is never executed there.
+
+
+## Additional real installed-package discovery qualification
+
+The actual unchanged production `native/CMakeLists.txt` was configured and
+successfully generated twice: an initial configure and an identical reuse
+configure in one new, persistent, isolated build directory. These two passes
+are additional configure checks, not additional cases in the 13-stage synthetic
+ABI fixture or 64-case Cargo orchestration fixture.
+
+The selected managed prefix was the existing cloud toolchain's `debian/usr`.
+It provided TBB 2022.1.0, Ceres 2.2.0, Eigen 3.4.0, exact Boost 1.83.0,
+glog 0.6.0, gflags 2.2.2, and SuiteSparse 7.10.1. CMake file-api cache replies
+confirm that both managed package directories resolve under that prefix.
+Codemodel replies confirm the actual source/include directories and generated
+link inputs for TBB, Ceres, Boost serialization/filesystem/thread/atomic,
+glog, and gflags; each absolute library path exists under the selected prefix.
+
+Only ordinary configure-time compiler/dependency probes ran. The native target
+has no object files or produced library, and the unused install prefix does not
+exist. No native target build, installation, download, source change, or mutation
+of the pre-existing toolchain build caches was performed. The second configure
+reused only this new qualification directory.
+
+The existing CMP0167 developer warning and optional METIS-not-found diagnostic
+were retained; both configure/generate passes exited successfully. This real
+Debian Ceres package enables EigenSparse, LAPACK, SuiteSparse and
+SchurSpecializations, whereas the installer source recipe disables SuiteSparse
+and CXSPARSE. The result closes the real installed-package discovery and
+CMake-generation gap. It does not establish native target compile/link/runtime,
+a source-pin upgrade, the full installer transaction, or rollback qualification.
+
+[Compact real-package evidence](slam2d-real-package-discovery-20261014-results.json)
+contains the exact command and environment, package versions/directories,
+file-api include/link assertions, both exit statuses, and retained log locations.
+The persistent task evidence directory is
+`/workspace/scratch/71cdb9d17732/slam2d-real-package-discovery-20261014`.

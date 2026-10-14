@@ -1,0 +1,92 @@
+{
+  "scope": "Actual unchanged production native CMake configure/generate only; initial and identical reuse both exit 0. Compiler probes only, no target build/install.",
+  "command": {
+    "command": [
+      "/workspace/scratch/71cdb9d17732/neh-toolchain/buildtools/lib/python3.12/site-packages/cmake/data/bin/cmake",
+      "-S",
+      "/workspace/scratch/71cdb9d17732/neh-cloud-3d1901d/services/nuwax-workspace/crates/nuwax-slam-toolbox-sys/native",
+      "-B",
+      "/workspace/scratch/71cdb9d17732/slam2d-real-package-discovery-20261014/build",
+      "-DCMAKE_BUILD_TYPE=Release",
+      "-DCMAKE_CXX_COMPILER=/usr/bin/c++",
+      "-DNUWAX_SLAM2D_DEPENDENCY_PREFIX=/workspace/scratch/71cdb9d17732/neh-toolchain/debian/usr",
+      "-DCMAKE_INSTALL_PREFIX=/workspace/scratch/71cdb9d17732/slam2d-real-package-discovery-20261014/build/unused-install"
+    ],
+    "environment": {
+      "CMAKE_PREFIX_PATH": "/workspace/scratch/71cdb9d17732/neh-toolchain/debian/usr",
+      "LD_LIBRARY_PATH": "/workspace/scratch/71cdb9d17732/neh-toolchain/native/lib:/workspace/scratch/71cdb9d17732/neh-toolchain/debian/usr/lib/x86_64-linux-gnu",
+      "LIBRARY_PATH": "/workspace/scratch/71cdb9d17732/neh-toolchain/native/lib:/workspace/scratch/71cdb9d17732/neh-toolchain/debian/usr/lib/x86_64-linux-gnu"
+    }
+  },
+  "versions": {
+    "TBB": "2022.1.0",
+    "Ceres": "2.2.0",
+    "Eigen": "3.4.0",
+    "Boost": "1.83.0",
+    "glog": "0.6.0",
+    "gflags": "2.2.2",
+    "SuiteSparse": "7.10.1"
+  },
+  "package_dirs": {
+    "Boost_DIR": "/workspace/scratch/71cdb9d17732/neh-toolchain/debian/usr/lib/x86_64-linux-gnu/cmake/Boost-1.83.0",
+    "Boost_INCLUDE_DIR": "/workspace/scratch/71cdb9d17732/neh-toolchain/debian/usr/include",
+    "Ceres_DIR": "/workspace/scratch/71cdb9d17732/neh-toolchain/debian/usr/lib/x86_64-linux-gnu/cmake/Ceres",
+    "Eigen3_DIR": "/workspace/scratch/71cdb9d17732/neh-toolchain/debian/usr/share/eigen3/cmake",
+    "TBB_DIR": "/workspace/scratch/71cdb9d17732/neh-toolchain/debian/usr/lib/x86_64-linux-gnu/cmake/TBB",
+    "boost_atomic_DIR": "/workspace/scratch/71cdb9d17732/neh-toolchain/debian/usr/lib/x86_64-linux-gnu/cmake/boost_atomic-1.83.0",
+    "boost_filesystem_DIR": "/workspace/scratch/71cdb9d17732/neh-toolchain/debian/usr/lib/x86_64-linux-gnu/cmake/boost_filesystem-1.83.0",
+    "boost_headers_DIR": "/workspace/scratch/71cdb9d17732/neh-toolchain/debian/usr/lib/x86_64-linux-gnu/cmake/boost_headers-1.83.0",
+    "boost_serialization_DIR": "/workspace/scratch/71cdb9d17732/neh-toolchain/debian/usr/lib/x86_64-linux-gnu/cmake/boost_serialization-1.83.0",
+    "boost_thread_DIR": "/workspace/scratch/71cdb9d17732/neh-toolchain/debian/usr/lib/x86_64-linux-gnu/cmake/boost_thread-1.83.0",
+    "gflags_DIR": "/workspace/scratch/71cdb9d17732/neh-toolchain/debian/usr/lib/x86_64-linux-gnu/cmake/gflags",
+    "glog_DIR": "/workspace/scratch/71cdb9d17732/neh-toolchain/debian/usr/lib/x86_64-linux-gnu/cmake/glog"
+  },
+  "includes": [
+    "/workspace/scratch/71cdb9d17732/neh-cloud-3d1901d/services/nuwax-workspace/crates/nuwax-slam-toolbox-sys/native/upstream/karto/include",
+    "/workspace/scratch/71cdb9d17732/neh-cloud-3d1901d/services/nuwax-workspace/crates/nuwax-slam-toolbox-sys/native/upstream",
+    "/workspace/scratch/71cdb9d17732/neh-toolchain/debian/usr/include/eigen3",
+    "/workspace/scratch/71cdb9d17732/neh-toolchain/debian/usr/include"
+  ],
+  "link_libraries": [
+    "/workspace/scratch/71cdb9d17732/neh-toolchain/debian/usr/lib/x86_64-linux-gnu/libboost_serialization.so.1.83.0",
+    "/workspace/scratch/71cdb9d17732/neh-toolchain/debian/usr/lib/x86_64-linux-gnu/libboost_filesystem.so.1.83.0",
+    "/workspace/scratch/71cdb9d17732/neh-toolchain/debian/usr/lib/x86_64-linux-gnu/libboost_thread.so.1.83.0",
+    "/workspace/scratch/71cdb9d17732/neh-toolchain/debian/usr/lib/x86_64-linux-gnu/libtbb.so.12.15",
+    "/workspace/scratch/71cdb9d17732/neh-toolchain/debian/usr/lib/x86_64-linux-gnu/libceres.so.2.2.0",
+    "/workspace/scratch/71cdb9d17732/neh-toolchain/debian/usr/lib/x86_64-linux-gnu/libboost_atomic.so.1.83.0",
+    "/workspace/scratch/71cdb9d17732/neh-toolchain/debian/usr/lib/x86_64-linux-gnu/libglog.so.0.6.0",
+    "/workspace/scratch/71cdb9d17732/neh-toolchain/debian/usr/lib/x86_64-linux-gnu/libgflags.so.2.2.2"
+  ],
+  "limitations": [
+    "Debian Ceres includes EigenSparse, LAPACK, SuiteSparse, SchurSpecializations; installer pinned recipe disables SuiteSparse/CXSparse.",
+    "This confirms real-package managed discovery and generation, not source-pin upgrades, native target compilation/link/runtime, full installer or rollback.",
+    "Optional METIS not found and existing CMP0167 developer warning retained; configure succeeds."
+  ],
+  "checks": {
+    "managed_package_dirs_under_selected_prefix": true,
+    "all_generated_absolute_link_libraries_exist_under_selected_prefix": true,
+    "native_target_objects_absent": true,
+    "native_target_library_absent": true,
+    "install_prefix_absent": true
+  },
+  "passes": [
+    {
+      "stage": "initial",
+      "configure_exit": 0,
+      "generate_succeeded": true
+    },
+    {
+      "stage": "identical-reuse",
+      "configure_exit": 0,
+      "generate_succeeded": true
+    }
+  ],
+  "evidence_directory": "/workspace/scratch/71cdb9d17732/slam2d-real-package-discovery-20261014",
+  "file_api_reply_directory": "/workspace/scratch/71cdb9d17732/slam2d-real-package-discovery-20261014/build/.cmake/api/v1/reply",
+  "logs": [
+    "initial.log",
+    "reuse.log"
+  ],
+  "cmake": "3.31.6",
+  "date_utc": "2026-10-14"
+}

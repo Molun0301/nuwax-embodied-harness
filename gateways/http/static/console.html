@@ -15,6 +15,10 @@
       <span class="dot"></span>
       <div><div class="nm" title="Nuwax Embodied Harness（NEH，具身运行框架）">NEH 机器人控制台<button id="updateNewBadge" class="update-new-badge" type="button" title="发现新版本，打开更新设置" hidden>New！</button></div><div class="md"><span id="robotName">机器人未连接</span> · <span id="robotModel">型号 --</span></div></div>
     </div>
+    <a href="/" class="console-nav-link" id="deviceManagerLink" title="返回设备管理" hidden>
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12h18M3 12l6-6m-6 6 6 6"/></svg>
+      <span>管理</span>
+    </a>
     <div class="vstats">
       <div class="vstat"><div class="v" id="connectionText">缺失</div><div class="l">网关</div></div>
       <div class="vstat"><div class="v" id="runtimeMode">--</div><div class="l">运行模式</div></div>
@@ -562,6 +566,20 @@
           setActive(boundaryContainer && boundaryContainer.hidden ? 'boundary' : null);
         });
       }
+    })();
+  </script>
+  <script>
+    // 原业务网关的根地址是接口说明，只在独立管理服务代理下显示返回入口。
+    (function () {
+      const controller = new AbortController();
+      const timeout = setTimeout(function () { controller.abort(); }, 3000);
+      fetch('/api/manager/session', { credentials: 'same-origin', signal: controller.signal })
+        .then(function (response) { return response.ok ? response.json() : null; })
+        .then(function (session) {
+          if (session && session.instance_id) document.getElementById('deviceManagerLink').hidden = false;
+        })
+        .catch(function () {})
+        .finally(function () { clearTimeout(timeout); });
     })();
   </script>
 </body>

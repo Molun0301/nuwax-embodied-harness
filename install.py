@@ -26,6 +26,12 @@ def main() -> int:
     if len(sys.argv) > 1 and sys.argv[1] == "update":
         from scripts.update_client import main as update_main
         return int(update_main(sys.argv[2:]))
+    if len(sys.argv) > 1 and sys.argv[1] == "product":
+        from scripts.neh_bootstrap import main as product_main
+        return int(product_main(sys.argv[2:]))
+    if len(sys.argv) > 1 and sys.argv[1] == "manage-device":
+        from scripts.device_manager.cli import main as device_main
+        return int(device_main(sys.argv[2:]))
     legacy_commands = {"plan", "check", "deploy", "resume", "verify", "status", "rollback", "bundle"}
     if len(sys.argv) > 1 and sys.argv[1] in legacy_commands:
         from scripts.deploy_installer.cli import main as installer_main

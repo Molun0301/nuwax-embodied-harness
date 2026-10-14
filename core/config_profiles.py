@@ -334,14 +334,17 @@ def activate_profile(*, root, robot, profile, expected_revision=None, revision_o
         values = read_profile(location, root=root, snapshot=snapshot)
         # 手工编辑的方案仍须经过同一类型与算法契约校验；失效时不改活动选择。
         for key, value in values.items():
+            # 共同取值器将空值解释为默认值，安装模板中的空数值也应能激活。
+            if not value.strip():
+                continue
             field = io.R.get_field(key)
             if field is not None and (io._validate(key, value, field.type) is None
                                      or (field.choices and value.strip() not in field.choices)):
                 raise ValueError("方案中的配置无效：" + key)
-        if "NUWAX_GEOMETRY_PIPELINE" in values:
+        if values.get("NUWAX_GEOMETRY_PIPELINE", "").strip():
             from contracts.navigation_pipeline import resolve_navigation_profile
             expected = resolve_navigation_profile(values["NUWAX_GEOMETRY_PIPELINE"])
-            if values.get("NUWAX_NAV_PROFILE", expected) != expected:
+            if (values.get("NUWAX_NAV_PROFILE", "").strip() or expected) != expected:
                 raise ValueError("配置方案中的导航与建图执行链不一致")
         ensure_profile(location, root=root, snapshot=snapshot)
         io._atomic_write(location["selector"], profile + "\n")
@@ -349,7 +352,8 @@ def activate_profile(*, root, robot, profile, expected_revision=None, revision_o
         active.parent.mkdir(parents=True, exist_ok=True)
         temporary = active.with_name(".active-" + uuid.uuid4().hex)
         try:
-            temporary.symlink_to(os.path.relpath(location["path"], active.parent))
+            # 受管发布的runtime_data和configs可指向持久目录，链接按物理父目录计算。
+            temporary.symlink_to(os.path.relpath(location["path"].resolve(), active.parent.resolve()))
             os.replace(temporary, active)
         finally:
             if temporary.is_symlink():

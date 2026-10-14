@@ -72,12 +72,30 @@ def env_assignment(key: str, value: str) -> str:
     return f'{key}="{escaped}"'
 
 
+def _managed_profiles_root(root: Path, environment):
+    """受管发布只接受本安装根的固定配置目录，不放开任意外部链接。"""
+    value = environment.get("NUWAX_MANAGED_HOME", "").strip()
+    if not value:
+        return None
+    home = Path(value).expanduser()
+    if not home.is_absolute():
+        raise ValueError("受管安装目录必须为绝对路径")
+    home = home.resolve()
+    if root.name != "source" or root.parent.parent != home / "releases":
+        raise ValueError("受管源码必须位于本安装根的releases目录")
+    profiles = home / "config" / "profiles"
+    if profiles.resolve() != profiles or (home / "config").is_symlink():
+        raise ValueError("持久配置目录不能跳出本安装根")
+    return profiles
+
+
 def configuration_location(*, root: Optional[Path] = None, environment=None,
                            robot: Optional[str] = None, profile: Optional[str] = None):
     """解析机器人和方案身份；只读目录，不创建文件或导入设备驱动。"""
     root = Path(root or _PROJECT_ROOT).resolve()
     environment = os.environ if environment is None else environment
     drivers = root / "drivers"
+    managed_profiles = _managed_profiles_root(root, environment)
     active_file = root / "runtime_data" / "settings" / "active.env"
     # 显式文件入口保持可用；在控制台选择机器人方案后，由活动选择接管。
     if robot is None and profile is None and environment.get("NUWAX_ROBOT_PROFILE_MODE") != "1" and not active_file.is_symlink() and any(
@@ -89,14 +107,16 @@ def configuration_location(*, root: Optional[Path] = None, environment=None,
         robot = "" if "NUWAX_ACTIVE_ROBOT" in file_keys or environment.get("NUWAX_CONFIG_FROM_SYSTEMD_FILES") == "1" else environment.get("NUWAX_ACTIVE_ROBOT", "").strip()
         if not robot and active_file.is_symlink():
             try:
-                parts = active_file.resolve().relative_to(drivers.resolve()).parts
+                parts = active_file.resolve().relative_to(managed_profiles or drivers.resolve()).parts
             except ValueError as error:
                 raise ValueError("活动配置必须位于机器人配置目录") from error
-            if len(parts) != 3 or parts[1] != "configs" or not parts[2].endswith(".env"):
+            valid_parts = (len(parts) == 2 and parts[1].endswith(".env")) if managed_profiles else (
+                len(parts) == 3 and parts[1] == "configs" and parts[2].endswith(".env"))
+            if not valid_parts:
                 raise ValueError("活动配置路径无效")
             robot = parts[0]
             if profile is None:
-                profile = Path(parts[2]).stem
+                profile = Path(parts[-1]).stem
         if not robot:
             for path in (root / ".config", Path(environment.get("NUWAX_BOOTSTRAP_ENV_FILE") or root / ".env"),
                          Path(environment["NUWAX_USER_CONFIG_ENV_FILE"]) if environment.get("NUWAX_USER_CONFIG_ENV_FILE") else root / ".env"):
@@ -110,12 +130,20 @@ def configuration_location(*, root: Optional[Path] = None, environment=None,
     if not (directory / "manifest.py").is_file() or not (directory / "assembly.py").is_file() or directory.resolve().parent != drivers.resolve():
         raise ValueError("机器人驱动不存在：" + robot)
     selector = directory / "configs" / ".active"
+    if managed_profiles:
+        expected = managed_profiles / robot
+        if (not (directory / "configs").is_symlink() or (directory / "configs").resolve() != expected
+                or expected.resolve() != expected or selector.is_symlink()):
+            raise ValueError("受管方案必须指向本安装根中对应机器人的持久配置目录")
     if profile is None:
         profile = selector.read_text(encoding="utf-8").strip() if selector.is_file() else "默认"
     if not isinstance(profile, str) or not re.fullmatch(r"[\w\-\u4e00-\u9fff][\w\- \u4e00-\u9fff]{0,63}", profile) or profile != profile.strip():
         raise ValueError("配置名称限1—64个中文、字母、数字、空格、下划线或短横线")
     path = directory / "configs" / (profile + ".env")
-    if path.resolve().parent != (directory / "configs").absolute() or (directory / "configs").is_symlink() or selector.is_symlink():
+    if managed_profiles:
+        if path.is_symlink() or path.resolve().parent != managed_profiles / robot:
+            raise ValueError("受管配置文件不能通过链接跳出对应机器人目录")
+    elif path.resolve().parent != (directory / "configs").absolute() or (directory / "configs").is_symlink() or selector.is_symlink():
         raise ValueError("配置路径不能通过符号链接跳出机器人目录")
     return {"robot": robot, "profile": profile, "path": path, "selector": selector}
 

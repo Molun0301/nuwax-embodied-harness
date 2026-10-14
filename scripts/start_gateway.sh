@@ -18,6 +18,7 @@ ACTION="${1:-start}"
 PID_FILE=""
 LOCK_FILE=""
 LOCK_FD=""
+CONTROL_LOCK_FD=""
 GATEWAY_PID=""
 VIDEO_STREAMER_PID=""
 NAV_STACK_PID=""
@@ -187,6 +188,24 @@ acquire_script_lock() {
     echo "another start_gateway.sh instance is running (lock: ${lock_path})." >&2
     echo "please stop existing one before running '${ACTION}' again." >&2
     exit 1
+  fi
+}
+
+acquire_control_lock() {
+  local lock_path="${LOCK_FILE}.control"
+  mkdir -p "$(dirname "${lock_path}")"
+  exec {CONTROL_LOCK_FD}>"${lock_path}"
+  if ! flock -n "${CONTROL_LOCK_FD}"; then
+    echo "另一项网关启动或停止操作正在进行，请等待它完成。" >&2
+    exit 1
+  fi
+}
+
+release_control_lock() {
+  if [[ -n "${CONTROL_LOCK_FD}" ]]; then
+    flock -u "${CONTROL_LOCK_FD}"
+    exec {CONTROL_LOCK_FD}>&-
+    CONTROL_LOCK_FD=""
   fi
 }
 
@@ -560,12 +579,16 @@ stop_existing_gateway() {
   fi
 
   if ! process_belongs_to_instance "${pid}"; then
-    echo "refusing to stop pid ${pid}: PID file does not identify this installation; stop the legacy owner explicitly if unmarked, then retry" >&2
+    echo "拒绝停止不属于本安装的进程 ${pid}；请先通过原拥有方处理旧安装。" >&2
     return 1
   fi
-  terminate_process_scope "${pid}" "gateway supervisor"
+  # 先通知根拥有方，让其按原顺序关闭；超时后才使用原进程范围回收。
+  kill -TERM "${pid}" >/dev/null 2>&1 || true
+  if ! wait_for_pid_exit "${pid}" "${NUWAX_GATEWAY_STOP_TIMEOUT_SEC:-20}"; then
+    terminate_process_scope "${pid}" "gateway supervisor"
+  fi
   if is_pid_alive "${pid}"; then
-    echo "gateway pid ${pid} is still running; keeping PID file: ${PID_FILE}" >&2
+    echo "进程 ${pid} 仍在运行，保留本安装的PID文件：${PID_FILE}" >&2
     return 1
   fi
   rm -f "${PID_FILE}"
@@ -1291,8 +1314,11 @@ LOCK_FILE="${NUWAX_GATEWAY_LOCK_FILE:-$(default_gateway_lock_file)}"
 normalize_config_aliases
 HOST="${NUWAX_GATEWAY_HOST:-0.0.0.0}"
 PORT="${NUWAX_GATEWAY_PORT:-8766}"
-# The running supervisor holds this lock for its lifetime. Control actions must
-# reach it first; restart acquires the same lock only after the old owner exits.
+# 操作锁只串行化控制阶段；运行寿命锁不能阻断针对该拥有方的stop/status。
+if [[ "${ACTION}" == start || "${ACTION}" == stop || "${ACTION}" == restart ]]; then
+  acquire_control_lock
+fi
+
 case "${ACTION}" in
   start)
     acquire_script_lock "${LOCK_FILE}"
@@ -1355,6 +1381,7 @@ cd "${REPO_ROOT}"
 write_pid_file
 trap remove_pid_file EXIT
 trap stop_gateway INT TERM
+release_control_lock
 
 # 先有界排空HTTP长连接，再进入应用生命周期释放运行时资源；外层关闭预算保持不变。
 if ! is_restart_enabled "${RESTART_POLICY}"; then

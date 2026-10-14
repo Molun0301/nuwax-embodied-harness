@@ -1013,7 +1013,7 @@
   },
   "NUWAX_RUNTIME_ACTIVATION_TIMEOUT_SEC": {
     "zh_name": "运行时激活等待时间（秒）",
-    "type": "int",
+    "type": "float",
     "default": 95.0,
     "section_id": "gateway",
     "target_file": "core_env",

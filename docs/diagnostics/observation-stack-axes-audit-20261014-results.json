@@ -1,0 +1,761 @@
+{
+  "samples": [
+    {
+      "suite": "ray",
+      "kind": 0,
+      "pair": 0,
+      "candidate": false,
+      "us": 189.546,
+      "iterations": 10000,
+      "accepted": 10000
+    },
+    {
+      "suite": "ray",
+      "kind": 0,
+      "pair": 0,
+      "candidate": true,
+      "us": 181.75400000000002,
+      "iterations": 10000,
+      "accepted": 10000
+    },
+    {
+      "suite": "ray",
+      "kind": 0,
+      "pair": 1,
+      "candidate": true,
+      "us": 200.46300000000002,
+      "iterations": 10000,
+      "accepted": 10000
+    },
+    {
+      "suite": "ray",
+      "kind": 0,
+      "pair": 1,
+      "candidate": false,
+      "us": 275.285,
+      "iterations": 10000,
+      "accepted": 10000
+    },
+    {
+      "suite": "ray",
+      "kind": 0,
+      "pair": 2,
+      "candidate": false,
+      "us": 189.576,
+      "iterations": 10000,
+      "accepted": 10000
+    },
+    {
+      "suite": "ray",
+      "kind": 0,
+      "pair": 2,
+      "candidate": true,
+      "us": 215.645,
+      "iterations": 10000,
+      "accepted": 10000
+    },
+    {
+      "suite": "ray",
+      "kind": 1,
+      "pair": 0,
+      "candidate": false,
+      "us": 347.36400000000003,
+      "iterations": 10000,
+      "accepted": 10000
+    },
+    {
+      "suite": "ray",
+      "kind": 1,
+      "pair": 0,
+      "candidate": true,
+      "us": 268.285,
+      "iterations": 10000,
+      "accepted": 10000
+    },
+    {
+      "suite": "ray",
+      "kind": 1,
+      "pair": 1,
+      "candidate": true,
+      "us": 269.377,
+      "iterations": 10000,
+      "accepted": 10000
+    },
+    {
+      "suite": "ray",
+      "kind": 1,
+      "pair": 1,
+      "candidate": false,
+      "us": 331.98199999999997,
+      "iterations": 10000,
+      "accepted": 10000
+    },
+    {
+      "suite": "ray",
+      "kind": 1,
+      "pair": 2,
+      "candidate": false,
+      "us": 504.84200000000004,
+      "iterations": 10000,
+      "accepted": 10000
+    },
+    {
+      "suite": "ray",
+      "kind": 1,
+      "pair": 2,
+      "candidate": true,
+      "us": 281.96599999999995,
+      "iterations": 10000,
+      "accepted": 10000
+    },
+    {
+      "suite": "ray",
+      "kind": 2,
+      "pair": 0,
+      "candidate": false,
+      "us": 21233.254,
+      "iterations": 10000,
+      "accepted": 10000
+    },
+    {
+      "suite": "ray",
+      "kind": 2,
+      "pair": 0,
+      "candidate": true,
+      "us": 18103.258,
+      "iterations": 10000,
+      "accepted": 10000
+    },
+    {
+      "suite": "ray",
+      "kind": 2,
+      "pair": 1,
+      "candidate": true,
+      "us": 17367.618000000002,
+      "iterations": 10000,
+      "accepted": 10000
+    },
+    {
+      "suite": "ray",
+      "kind": 2,
+      "pair": 1,
+      "candidate": false,
+      "us": 15446.578000000001,
+      "iterations": 10000,
+      "accepted": 10000
+    },
+    {
+      "suite": "ray",
+      "kind": 2,
+      "pair": 2,
+      "candidate": false,
+      "us": 15654.612,
+      "iterations": 10000,
+      "accepted": 10000
+    },
+    {
+      "suite": "ray",
+      "kind": 2,
+      "pair": 2,
+      "candidate": true,
+      "us": 16996.067,
+      "iterations": 10000,
+      "accepted": 10000
+    },
+    {
+      "suite": "ray",
+      "kind": 3,
+      "pair": 0,
+      "candidate": false,
+      "us": 26566.054,
+      "iterations": 10000,
+      "accepted": 10000
+    },
+    {
+      "suite": "ray",
+      "kind": 3,
+      "pair": 0,
+      "candidate": true,
+      "us": 35292.017,
+      "iterations": 10000,
+      "accepted": 10000
+    },
+    {
+      "suite": "ray",
+      "kind": 3,
+      "pair": 1,
+      "candidate": true,
+      "us": 38069.459,
+      "iterations": 10000,
+      "accepted": 10000
+    },
+    {
+      "suite": "ray",
+      "kind": 3,
+      "pair": 1,
+      "candidate": false,
+      "us": 26653.626,
+      "iterations": 10000,
+      "accepted": 10000
+    },
+    {
+      "suite": "ray",
+      "kind": 3,
+      "pair": 2,
+      "candidate": false,
+      "us": 26065.248,
+      "iterations": 10000,
+      "accepted": 10000
+    },
+    {
+      "suite": "ray",
+      "kind": 3,
+      "pair": 2,
+      "candidate": true,
+      "us": 35766.242,
+      "iterations": 10000,
+      "accepted": 10000
+    },
+    {
+      "suite": "ray",
+      "kind": 4,
+      "pair": 0,
+      "candidate": false,
+      "us": 347.71500000000003,
+      "iterations": 10000,
+      "accepted": 0
+    },
+    {
+      "suite": "ray",
+      "kind": 4,
+      "pair": 0,
+      "candidate": true,
+      "us": 729.061,
+      "iterations": 10000,
+      "accepted": 0
+    },
+    {
+      "suite": "ray",
+      "kind": 4,
+      "pair": 1,
+      "candidate": true,
+      "us": 281.736,
+      "iterations": 10000,
+      "accepted": 0
+    },
+    {
+      "suite": "ray",
+      "kind": 4,
+      "pair": 1,
+      "candidate": false,
+      "us": 379.56300000000005,
+      "iterations": 10000,
+      "accepted": 0
+    },
+    {
+      "suite": "ray",
+      "kind": 4,
+      "pair": 2,
+      "candidate": false,
+      "us": 346.86400000000003,
+      "iterations": 10000,
+      "accepted": 0
+    },
+    {
+      "suite": "ray",
+      "kind": 4,
+      "pair": 2,
+      "candidate": true,
+      "us": 283.077,
+      "iterations": 10000,
+      "accepted": 0
+    },
+    {
+      "suite": "ray",
+      "kind": 5,
+      "pair": 0,
+      "candidate": false,
+      "us": 2990.324,
+      "iterations": 10000,
+      "accepted": 0
+    },
+    {
+      "suite": "ray",
+      "kind": 5,
+      "pair": 0,
+      "candidate": true,
+      "us": 4012.077,
+      "iterations": 10000,
+      "accepted": 0
+    },
+    {
+      "suite": "ray",
+      "kind": 5,
+      "pair": 1,
+      "candidate": true,
+      "us": 3859.7760000000003,
+      "iterations": 10000,
+      "accepted": 0
+    },
+    {
+      "suite": "ray",
+      "kind": 5,
+      "pair": 1,
+      "candidate": false,
+      "us": 3444.069,
+      "iterations": 10000,
+      "accepted": 0
+    },
+    {
+      "suite": "ray",
+      "kind": 5,
+      "pair": 2,
+      "candidate": false,
+      "us": 3144.197,
+      "iterations": 10000,
+      "accepted": 0
+    },
+    {
+      "suite": "ray",
+      "kind": 5,
+      "pair": 2,
+      "candidate": true,
+      "us": 4244.938,
+      "iterations": 10000,
+      "accepted": 0
+    },
+    {
+      "suite": "view",
+      "kind": 0,
+      "pair": 0,
+      "candidate": false,
+      "us": 1725.896,
+      "targets": 400,
+      "views": 16,
+      "rays": 2048,
+      "cells": 1768
+    },
+    {
+      "suite": "view",
+      "kind": 0,
+      "pair": 0,
+      "candidate": true,
+      "us": 1266.302,
+      "targets": 400,
+      "views": 16,
+      "rays": 2048,
+      "cells": 1768
+    },
+    {
+      "suite": "view",
+      "kind": 0,
+      "pair": 1,
+      "candidate": true,
+      "us": 1346.573,
+      "targets": 400,
+      "views": 16,
+      "rays": 2048,
+      "cells": 1768
+    },
+    {
+      "suite": "view",
+      "kind": 0,
+      "pair": 1,
+      "candidate": false,
+      "us": 1226.451,
+      "targets": 400,
+      "views": 16,
+      "rays": 2048,
+      "cells": 1768
+    },
+    {
+      "suite": "view",
+      "kind": 0,
+      "pair": 2,
+      "candidate": false,
+      "us": 1202.966,
+      "targets": 400,
+      "views": 16,
+      "rays": 2048,
+      "cells": 1768
+    },
+    {
+      "suite": "view",
+      "kind": 0,
+      "pair": 2,
+      "candidate": true,
+      "us": 1299.071,
+      "targets": 400,
+      "views": 16,
+      "rays": 2048,
+      "cells": 1768
+    },
+    {
+      "suite": "view",
+      "kind": 1,
+      "pair": 0,
+      "candidate": false,
+      "us": 18614.25,
+      "targets": 6400,
+      "views": 16,
+      "rays": 8192,
+      "cells": 6456
+    },
+    {
+      "suite": "view",
+      "kind": 1,
+      "pair": 0,
+      "candidate": true,
+      "us": 18432.435,
+      "targets": 6400,
+      "views": 16,
+      "rays": 8192,
+      "cells": 6456
+    },
+    {
+      "suite": "view",
+      "kind": 1,
+      "pair": 1,
+      "candidate": true,
+      "us": 18980.311999999998,
+      "targets": 6400,
+      "views": 16,
+      "rays": 8192,
+      "cells": 6456
+    },
+    {
+      "suite": "view",
+      "kind": 1,
+      "pair": 1,
+      "candidate": false,
+      "us": 18063.849,
+      "targets": 6400,
+      "views": 16,
+      "rays": 8192,
+      "cells": 6456
+    },
+    {
+      "suite": "view",
+      "kind": 1,
+      "pair": 2,
+      "candidate": false,
+      "us": 18350.331000000002,
+      "targets": 6400,
+      "views": 16,
+      "rays": 8192,
+      "cells": 6456
+    },
+    {
+      "suite": "view",
+      "kind": 1,
+      "pair": 2,
+      "candidate": true,
+      "us": 19022.406,
+      "targets": 6400,
+      "views": 16,
+      "rays": 8192,
+      "cells": 6456
+    },
+    {
+      "suite": "view",
+      "kind": 2,
+      "pair": 0,
+      "candidate": false,
+      "us": 17436.522,
+      "targets": 6400,
+      "views": 16,
+      "rays": 8192,
+      "cells": 5970
+    },
+    {
+      "suite": "view",
+      "kind": 2,
+      "pair": 0,
+      "candidate": true,
+      "us": 18442.882,
+      "targets": 6400,
+      "views": 16,
+      "rays": 8192,
+      "cells": 5970
+    },
+    {
+      "suite": "view",
+      "kind": 2,
+      "pair": 1,
+      "candidate": true,
+      "us": 19163.389,
+      "targets": 6400,
+      "views": 16,
+      "rays": 8192,
+      "cells": 5970
+    },
+    {
+      "suite": "view",
+      "kind": 2,
+      "pair": 1,
+      "candidate": false,
+      "us": 17688.222,
+      "targets": 6400,
+      "views": 16,
+      "rays": 8192,
+      "cells": 5970
+    },
+    {
+      "suite": "view",
+      "kind": 2,
+      "pair": 2,
+      "candidate": false,
+      "us": 18918.418999999998,
+      "targets": 6400,
+      "views": 16,
+      "rays": 8192,
+      "cells": 5970
+    },
+    {
+      "suite": "view",
+      "kind": 2,
+      "pair": 2,
+      "candidate": true,
+      "us": 19308.478,
+      "targets": 6400,
+      "views": 16,
+      "rays": 8192,
+      "cells": 5970
+    },
+    {
+      "suite": "view",
+      "kind": 3,
+      "pair": 0,
+      "candidate": false,
+      "us": 16509.332000000002,
+      "targets": 6400,
+      "views": 16,
+      "rays": 8192,
+      "cells": 6452
+    },
+    {
+      "suite": "view",
+      "kind": 3,
+      "pair": 0,
+      "candidate": true,
+      "us": 15322.872,
+      "targets": 6400,
+      "views": 16,
+      "rays": 8192,
+      "cells": 6452
+    },
+    {
+      "suite": "view",
+      "kind": 3,
+      "pair": 1,
+      "candidate": true,
+      "us": 15181.277,
+      "targets": 6400,
+      "views": 16,
+      "rays": 8192,
+      "cells": 6452
+    },
+    {
+      "suite": "view",
+      "kind": 3,
+      "pair": 1,
+      "candidate": false,
+      "us": 15395.601,
+      "targets": 6400,
+      "views": 16,
+      "rays": 8192,
+      "cells": 6452
+    },
+    {
+      "suite": "view",
+      "kind": 3,
+      "pair": 2,
+      "candidate": false,
+      "us": 15951.17,
+      "targets": 6400,
+      "views": 16,
+      "rays": 8192,
+      "cells": 6452
+    },
+    {
+      "suite": "view",
+      "kind": 3,
+      "pair": 2,
+      "candidate": true,
+      "us": 15643.274,
+      "targets": 6400,
+      "views": 16,
+      "rays": 8192,
+      "cells": 6452
+    }
+  ],
+  "summary": [
+    {
+      "suite": "ray",
+      "kind": 0,
+      "baseline_median_us": 189.576,
+      "candidate_median_us": 200.46300000000002,
+      "paired_ratios": [
+        0.9588912453968959,
+        0.7282016818933106,
+        1.1375121323374269
+      ],
+      "median_ratio": 0.9588912453968959
+    },
+    {
+      "suite": "ray",
+      "kind": 1,
+      "baseline_median_us": 347.36400000000003,
+      "candidate_median_us": 269.377,
+      "paired_ratios": [
+        0.7723454359116085,
+        0.8114204987017369,
+        0.558523260742965
+      ],
+      "median_ratio": 0.7723454359116085
+    },
+    {
+      "suite": "ray",
+      "kind": 2,
+      "baseline_median_us": 15654.612,
+      "candidate_median_us": 17367.618000000002,
+      "paired_ratios": [
+        0.8525899044960326,
+        1.1243667043923904,
+        1.0856907216863632
+      ],
+      "median_ratio": 1.0856907216863632
+    },
+    {
+      "suite": "ray",
+      "kind": 3,
+      "baseline_median_us": 26566.054,
+      "candidate_median_us": 35766.242,
+      "paired_ratios": [
+        1.328462894790472,
+        1.42830318846674,
+        1.3721811509332271
+      ],
+      "median_ratio": 1.3721811509332271
+    },
+    {
+      "suite": "ray",
+      "kind": 4,
+      "baseline_median_us": 347.71500000000003,
+      "candidate_median_us": 283.077,
+      "paired_ratios": [
+        2.096720014954776,
+        0.7422641300653645,
+        0.8161037178836661
+      ],
+      "median_ratio": 0.8161037178836661
+    },
+    {
+      "suite": "ray",
+      "kind": 5,
+      "baseline_median_us": 3144.197,
+      "candidate_median_us": 4012.077,
+      "paired_ratios": [
+        1.3416863858230748,
+        1.1207022855813866,
+        1.3500865244766789
+      ],
+      "median_ratio": 1.3416863858230748
+    },
+    {
+      "suite": "view",
+      "kind": 0,
+      "baseline_median_us": 1226.451,
+      "candidate_median_us": 1299.071,
+      "paired_ratios": [
+        0.7337070136323394,
+        1.0979427633064835,
+        1.0798900384549521
+      ],
+      "median_ratio": 1.0798900384549521
+    },
+    {
+      "suite": "view",
+      "kind": 1,
+      "baseline_median_us": 18350.331000000002,
+      "candidate_median_us": 18980.311999999998,
+      "paired_ratios": [
+        0.9902324831782103,
+        1.050734646862914,
+        1.036624679958089
+      ],
+      "median_ratio": 1.036624679958089
+    },
+    {
+      "suite": "view",
+      "kind": 2,
+      "baseline_median_us": 17688.222,
+      "candidate_median_us": 19163.389,
+      "paired_ratios": [
+        1.0577156384742326,
+        1.0833982635450865,
+        1.0206179491002922
+      ],
+      "median_ratio": 1.0577156384742326
+    },
+    {
+      "suite": "view",
+      "kind": 3,
+      "baseline_median_us": 15951.17,
+      "candidate_median_us": 15322.872,
+      "paired_ratios": [
+        0.9281339790125971,
+        0.9860788805841356,
+        0.9806975914619429
+      ],
+      "median_ratio": 0.9806975914619429
+    }
+  ],
+  "date": "2026-10-14",
+  "decision": "reject production stack-axis change",
+  "production_changed": false,
+  "evidence_directory": "/workspace/scratch/71cdb9d17732/neh-evidence/observation-filter-order-20261014",
+  "source": "services/nuwax-workspace/crates/nuwax-explore-routing/src/observation_axes_tests.rs",
+  "build_cwd": "services/nuwax-workspace",
+  "build_command": "cargo test --offline --locked --release -j2 -p nuwax-explore-routing --lib --no-run --message-format=json",
+  "ordinary_routing_suite": {
+    "passed": 15,
+    "failed": 0,
+    "ignored": 3
+  },
+  "equivalence_test": {
+    "passed": 1,
+    "failed": 0,
+    "input_limit_blocker_combinations": 8600
+  },
+  "fixed_pairs_per_cohort": 3,
+  "timing_unit": "microseconds",
+  "view_cohort_labels": [
+    "small400targets128rays",
+    "omni6400targets512rays",
+    "directional6400targets512rays",
+    "planar6400targets512rays"
+  ],
+  "ray_cohort_labels": [
+    "zero-length",
+    "one-axis tiny",
+    "long untied",
+    "long three-axis tie",
+    "early blocker",
+    "eight-step exhausted budget"
+  ],
+  "direct_ray_iterations_per_sample": 10000,
+  "views_per_view_sample": 16,
+  "limits_unchanged": {
+    "voxel_size_m": 0.2,
+    "full_view_max_steps": 65536,
+    "tie_epsilon": 1e-10
+  },
+  "limitations": [
+    "No allocator instrumentation: syntactic Vec removal is not a measured allocation count",
+    "Synthetic cell-center targets, not captured maps",
+    "Single process with three fixed alternating pairs per cohort; no adaptive repeats",
+    "Full view operation includes actual voxel rays, not full exploration selection",
+    "No production optimization applied; no performance or real robot CPU claim"
+  ]
+}

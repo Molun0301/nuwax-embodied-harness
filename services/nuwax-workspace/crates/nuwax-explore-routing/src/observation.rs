@@ -397,3 +397,11 @@ pub fn voxel_view_is_clear(
     }
     false
 }
+
+#[cfg(test)]
+#[path = "observation_filter_tests.rs"]
+mod filter_tests;
+
+#[cfg(test)]
+#[path = "observation_axes_tests.rs"]
+mod axes_tests;

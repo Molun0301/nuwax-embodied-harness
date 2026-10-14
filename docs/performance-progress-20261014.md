@@ -1,6 +1,6 @@
 # NEH 云端夜间开发进度（持续更新）
 
-更新时间：2026-10-14 09:59 北京时间（2026-10-14 01:59 UTC）。本轮仍在进行，计划继续至北京时间 2026-10-14 11:00；本文不是收尾或整机验收声明。
+更新时间：2026-10-14 10:15 北京时间（2026-10-14 02:15 UTC）。本轮仍在进行，计划继续至北京时间 2026-10-14 11:00；本文不是收尾或整机验收声明。
 
 ## 当前结论与交付状态
 
@@ -8,10 +8,10 @@
 
 - 仓库：`Molun0301/nuwax-embodied-harness`
 - 工作分支：`fix/v3-legacy-cloud-seal-20261006`
-- 已确认的远端基线：`65d15c5262af71ee0ab532133bd0afdcb5e75911`；最近一次只读核对为2026-10-14 01:17 UTC，远端仍停在该提交
-- 当前本地代码状态：`315caa4de5064fc345a30a579735f5cf0f372999`，相对远端基线新增 **74 个本地提交**；本次报告更新不包含在此计数中
-- 同一 Library 检查点 **v35，4,959,910 bytes** 已确认覆盖全部74个提交；顺序应用及最终tree一致性已核对，本报告当前未提交更新在该快照之外。高密度recent的完整纯文本原始日志也已单独保存到Library；不再是仅本地文件
-- 01:17 UTC远端认证核对仍未登录；01:31 UTC默认GitHub CLI认证也确认缺失，Git远端读取仍在认证步骤因禁止交互而无法读取Username。目前已启动一次新的GitHub设备登录，**尚未确认认证成功，也没有推送**；没有网络封锁证据。Library保存不代表GitHub分支已经更新
+- 本轮起始远端基线：`65d15c5262af71ee0ab532133bd0afdcb5e75911`，已确认是当前提交的祖先
+- **77个新增提交已通过普通Git CLI推送**。远端`fix/v3-legacy-cloud-seal-20261006`于2026-10-14 **02:13:35 UTC** 经`ls-remote`核对为 `51c929c9346d2eb9cf3b1a3e42b9151f1114236f`，与当时本地一致；不是强制推送。随后第78个仅诊断提交`1b8a9d1`于02:14:20 UTC推送命令exit0，但独立远端核对尚待完成。本报告当前未提交更新在这些提交之外
+- 同一 Library 检查点 **v38，5,145,353 bytes** 已确认覆盖全部77个提交。高密度recent的完整纯文本原始日志也已单独保存
+- 新设备登录已认证账号Molun0301。全局Git配置因只读写入失败，随后使用单次命令credential helper完成推送；此前认证阻塞已解除，没有网络封锁证据。推送成功不等于部署、CI通过或实机验收
 
 **最新导航结果：** 完整 `NavScheduler` 局部恢复修复已提交为 `0eed9d2`，固定持续障碍的原目标在 **13.32秒**完成，仅2次规划/2次准入，232条完整停车尾迹和715条实际运动边全部通过。早期60秒失败与两次短程停车尾迹失败仍保留；独立调查发现采样位姿到实际应用间的转动差异，当前只是合同诊断，没有生产修复或真实50 ms执行器hold证明。不能据此称现场机器人卡住或安全时序问题全部解决。
 
@@ -216,6 +216,14 @@
 
 此结果与早期在执行器启动原生Chromium154时的process-singleton socket **EPERM/exit134** 是两条独立路径，不应合并为“没有浏览器能力”。
 
+### 点云快照预处理：复用同一次边界测量（`a6fe715`）
+
+`_preparePointCloud`中，visibleSource与原src是同一对象时，复用本次已算出的bounds，不再扫描第二遍；不同过滤buffer即使长度相同也仍独立测量。只改一个表达式并更新正常/worker入口版本号，**没有跨调用缓存、不可变source声明或验证削减**。
+
+该调用链是artifact、legacy saved snapshot和旧snapshot fallback；**当前live/assigned增量page以及完整dense模式绕过此processor，不属于收益范围**。三独立Node进程的完整同步processor测量：1M点mono **6.556628→3.729920 ms**，height **65.921241→63.454588 ms**，bounds坐标访问 **6M→3M**。过滤对照扫描数不变，singleFloor等有小退化并保留，不宣称普遍不退化。
+
+最终实际源 **114项合同通过**，含完整position/color/bounds/floor输出、same-length独立过滤、非有限值既有错误与下次调用重新计算所有权；相邻27/21/22/4项suite分开记录，不累加总数。计时不含worker序列化/transfer、viewer admission、rendering、browser/GPU或network，因此不是FPS或机器人CPU收益。[准确范围与结果](diagnostics/pointcloud-measurement-reuse-20261014.md)
+
 ## 六、没有贸然改动的路径
 
 - 传感器进程快照已有 unchanged 省略与 pending 合并；250k 点合成 native-LIO 快照实际投递中位数 **13.318 ms**，短样本维持约20 Hz。暂停接收100 ms会阻塞共用通道中的错误发送，属于已记录限制。没有砍 metadata、限点或增加新通道。[审计](performance-sensor-snapshot-audit.md)
@@ -237,6 +245,11 @@
 - 重定位candidate-pair索引复用的小型离线夹具没有测出实质、可重复的完整计算收益；未修改生产索引或定位阈值/heading规则。后续同步准备基线与两行target交接优化已独立完成，未采纳该pair-index方案；不把小夹具外推为实机地图代表负载。[负面审计](diagnostics/relocalization-pair-reuse-audit-20261014.md)
 
 - MCP最终JSONResponse搬进已有projection worker的test-only方案已否决，没有生产改动。真实router/投影/字节预算＋同loop heartbeat与initialize请求显示大**合成容量**响应确会拖延loop，但小offload未实质改善：8 MiB fixture handler **408.391→420.091 ms**、每轮最大heartbeat gap的中位数 **319.133→325.256 ms**。2,340-byte小对照gap **1.490→1.509 ms**。没有把容量夹具当日常流量，GIL是可能机制而非每项延迟的唯一实证归因；不能说“放线程就不阻塞”或伪称整个系统已改善。九项原encoding合同各臂通过、计数/取消行为一致，18次执行不是18独立用例，也未新增广泛集成run。[审计](diagnostics/mcp-response-heartbeat-20261014.md)
+
+- observation过滤顺序候选未采纳：提早range/FOV判断在全out-of-range合成控制有效，但真实完整view操作的in-range/map-like/planar夹具无一致收益。16 m planar批次 **57.376→59.783 ms**，原ray预算、callback顺序、NaN/重复语义对比保留；没有生产过滤修改。[报告](diagnostics/observation-filter-order-audit-20261014.md)
+- ray traversal用stack `[usize;3]`替代临时axis Vec也未采纳：完整directional view批次 **17.688→19.163 ms**；10k条长三轴tie ray批次 **26.566→35.766 ms**，三对均退化。8,600组顺序callback/结果等价通过，最终routing **15 passed / 0 failed / 3 ignored**，两个axis诊断另显式通过。源码里少一个Vec不证明实际allocator次数减少；没有采纳生产射线优化，也不是完整探索/实机导航资格。[报告](diagnostics/observation-stack-axes-audit-20261014.md)
+
+- 第78阶段incremental pointcloud有限值检查候选未采纳：把数组 `.every(Number.isFinite)`替为同顺序scalar检查，113项合同通过，但完整apply结果混合。1M height reset **53.773272→48.711075 ms**，ground8192点reset **24.889073→26.246019 ms**，三进程有两次退化且一次显著，不能用height收益抵消。没有生产改动、额外分支或allocator/RSS结论，数组语法不证明V8真分配heap对象。[负面审计](diagnostics/pointcloud-finite-scalar-audit-20261014.md)
 
 ## 七、验证状态与未完成边界
 
@@ -273,13 +286,13 @@
 3. **实机未验证**：未运行真实传感器/执行器闭环、机器人CPU/RSS、真实网络/刹车或硬实时验收；没有将合成动力学、模型外归一化、暖缓存测量外推到硬件
 4. **legacy哈希与兼容仍在**：已去掉受审重复工作，并成对扩展受支持保存源的assigned迁移；其他仍承担接纳验证的legacy导出/激活接口没有整体移除。不得外推为全仓或所有外部客户端无哈希
 5. **局部修复通过不等于全部边界完成**：完整NavScheduler固定障碍恢复已通过并提交；原60秒失败、两次短程停车尾迹失败保留。独立dispatch漂移诊断未作生产修复，真实执行器50 ms hold/expiry未获证明。AR1成对扩展已资格验证，不等于完整激活RPC或实机部署
-6. **最终交付仍在进行**：剩余工作、后续回归、最终提交/备份和远端状态应在截止前更新本文。当前不能称全部完成或已推送
+6. **最终交付仍在进行**：77提交已推送并验证，仍有后续工作与本报告更新待提交/备份；截止前还需核对最新状态。不能把阶段推送说成整轮全部完成
 
 ## 八、正在继续的工作（未计为成果）
 
-- 两阶段MJPEG、探索fixture合同修正与真实SDK包发现已归入相应结果；MCP worker和探索set-move负面结论也已记录，不再列为待采纳优化
-- Library v35已覆盖74提交，完整dense日志也已单独保存；之后本报告及新增工作还需下一次检查点。新GitHub设备登录已启动但尚未确认成功，仍不能称已推送
-- 本轮云端工作继续至北京时间11:00（03:00 UTC）；继续核对后续源码变化、相关回归与交付状态，当前不宣称全部完成。实机、UDS、真实浏览器和dispatch时序边界仍如上保留
+- 探索私有wait-path的frontier扫描候选正在测试，尚未实施生产修改，不能列为已实现性能收益
+- 77提交已普通推送、独立核对且Library v38覆盖；第78仅诊断提交推送exit0，待独立远端核对及新备份。本报告及之后新增工作仍需下一提交与检查点，认证阻塞已解除
+- 本轮云端工作继续至北京时间11:00（03:00 UTC）；实机、UDS、实际浏览器和dispatch时序边界仍保留，不因Git推送成功而改变
 
 ## 附：证据阅读顺序
 
@@ -308,3 +321,7 @@
 - 第67–69阶段：[真实重定位准备基线](diagnostics/relocalization-preparation-audit-20261014.md)、[基线45样本](diagnostics/relocalization-preparation-audit-20261014-results.json)、[MJPEG选帧29项及三进程配对](diagnostics/mjpeg-parser-owned-selection-20261014-results.json)、[target交接270样本与19项资格](diagnostics/relocalization-target-handoff-qualification-20261014-results.json)
 
 - 最新独立调查与第二阶段：[MCP loop与编码结果](diagnostics/mcp-response-heartbeat-20261014-results.json)、[探索set所有权负面结果](diagnostics/exploration-view-ownership-audit-20261014-results.json)、[探索fixture合同59项结果](diagnostics/exploration-fixture-contract-20261014-results.json)、[MJPEG第二阶段48项及配对](diagnostics/mjpeg-parser-owned-tail-20261014-results.json)
+
+- 第76–77阶段：[snapshot测量复用配对及114合同](diagnostics/pointcloud-measurement-reuse-20261014-results.json)、[过滤顺序负面结果](diagnostics/observation-filter-order-audit-20261014-results.json)、[stack-axis负面结果与routing资格](diagnostics/observation-stack-axes-audit-20261014-results.json)
+
+- 第78阶段：[scalar finite-check完整apply负面样本](diagnostics/pointcloud-finite-scalar-audit-20261014-results.json)

@@ -466,8 +466,13 @@ impl SurfaceGoalSourceAdapter {
         // may supply private caches, but all identity tests and consumption stamps
         // still refer to the original frozen source, never its planning fork.
         let snapshot = query_view.unwrap_or(source_snapshot);
-        snapshot.prepare_frontier_geometry(&boundary)
-            .map_err(|error| ExploreError::SourceError(error.to_string()))?;
+        // An unchanged-input wait cannot select a frontier. Its private fork
+        // will be discarded, so only retain the required body/support checks
+        // below. Synchronous callers keep their original cache behavior.
+        if query_view.is_none() || new_snapshot || self.retry_support.is_some() {
+            snapshot.prepare_frontier_geometry(&boundary)
+                .map_err(|error| ExploreError::SourceError(error.to_string()))?;
+        }
         let snapshot = match snapshot.with_current_body_support(
             [position.x, position.y, position.z], quaternion,
         ) {
@@ -2482,4 +2487,5 @@ mod tests {
 
     include!("surface_prepared_reference_tests.rs");
     include!("surface_view_ownership_tests.rs");
+    include!("surface_wait_frontier_tests.rs");
 }

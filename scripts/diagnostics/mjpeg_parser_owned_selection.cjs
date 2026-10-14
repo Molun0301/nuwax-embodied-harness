@@ -2,7 +2,19 @@
 const fs = require('fs'), vm = require('vm'), assert = require('assert');
 const path = require('path');
 const sourcePath = path.resolve(__dirname, '../../gateways/http/static/js/console.js');
-const finalSource = fs.readFileSync(sourcePath, 'utf8');
+const currentSource = fs.readFileSync(sourcePath, 'utf8');
+const hasTailStage = currentSource.includes('const remaining = buffer.subarray(eoi + 2);');
+// Pin first-stage timing: explicitly remove the known later tail optimization.
+// --current-contracts separately exercises the actual current consumer/parser.
+let finalSource = currentSource;
+if (hasTailStage) {
+  assert.equal(currentSource.split('const remaining = buffer.subarray(eoi + 2);').length, 2);
+  assert.equal(currentSource.split('            if (parsedAny) buffer = buffer.slice();\n').length, 2);
+  finalSource = currentSource.replace('const remaining = buffer.subarray(eoi + 2);', 'const remaining = buffer.slice(eoi + 2);')
+    .replace('            if (parsedAny) buffer = buffer.slice();\n', '');
+  assert.equal(finalSource.replace('const remaining = buffer.slice(eoi + 2);', 'const remaining = buffer.subarray(eoi + 2);')
+    .replace('            if (latestFrameBytes) {', '            if (parsedAny) buffer = buffer.slice();\n            if (latestFrameBytes) {'), currentSource);
+}
 assert.equal(finalSource.split('const frame = buffer.subarray(soi, eoi + 2);').length, 2);
 assert.equal(finalSource.split('renderDecodedVideoFrame(latestFrameBytes.slice(), generation,').length, 2);
 // Reconstruct the two-line baseline. Candidate below must exactly reconstruct final source.
@@ -22,6 +34,12 @@ function makeArm(candidate) {
   const sandbox = {Uint8Array, TextDecoder, Number, Date, Error, decodeURIComponent,
     MJPEG_MAX_BUFFER_BYTES: 16*1024*1024, VIDEO_STREAM_INITIAL_RECONNECT_MS: 250};
   vm.createContext(sandbox);
+  if (candidate === 'current') {
+    const start = currentSource.indexOf('      async function consumeMjpegStream(');
+    const end = currentSource.indexOf('      async function renderDecodedVideoFrame(', start);
+    vm.runInContext(sourceTime + currentSource.slice(start, end), sandbox);
+    return sandbox;
+  }
   vm.runInContext(sourceTime + (candidate ? parser.replace('const frame = buffer.slice(soi, eoi + 2);','const frame = buffer.subarray(soi, eoi + 2);') : parser)
     + (candidate ? consume.replace('renderDecodedVideoFrame(latestFrameBytes, generation,','renderDecodedVideoFrame(latestFrameBytes.slice(), generation,') : consume), sandbox);
   return sandbox;
@@ -89,7 +107,7 @@ async function contracts(){
 function parseBatch(arm,input,candidate) {let buffer=arm.appendBytes(new Uint8Array(0),input),last=null,identity=null;while(true){const p=arm.extractNextJpeg(buffer);if(!p)break;if(!p.frame){buffer=p.remaining;break;}last=p.frame;identity=p.identity;buffer=p.remaining;}if(candidate&&last)last=last.slice();return {last,identity,buffer};}
 function countCopies(arm,input,candidate){const orig=Uint8Array.prototype.slice;let bytes=0,calls=0;Uint8Array.prototype.slice=function(...args){const out=orig.apply(this,args);bytes+=out.byteLength;calls++;return out;};try{parseBatch(arm,input,candidate);}finally{Uint8Array.prototype.slice=orig;}return {bytes,calls};}
 function quantile(v,q){const s=[...v].sort((a,b)=>a-b);return s[Math.floor((s.length-1)*q)];}
-async function main(){await contracts();await renderContracts();const output={source:sourcePath,source_window:'Final production source; baseline differs by exactly the two qualified replacements',checks,node:process.version,scope:'Real-source parser and mocked consumer contracts; timing excludes actual browser/Blob/GPU/network and async consumer',cohorts:[]};if(process.argv.includes('--contracts-only')){console.log(JSON.stringify(output,null,2));return;}
+async function main(){const currentContracts=process.argv.includes('--current-contracts');if(currentContracts)arms[1]=makeArm('current');await contracts();await renderContracts();const output={source:sourcePath,source_window:currentContracts?'Actual current-source contracts against first-stage historical baseline':'Historical first-stage reconstruction; known second-stage tail changes explicitly removed from both timing arms',known_tail_stage_removed_for_timing:hasTailStage,checks,node:process.version,scope:'Real-source parser and mocked consumer contracts; timing excludes actual browser/Blob/GPU/network and async consumer',cohorts:[]};if(currentContracts||process.argv.includes('--contracts-only')){console.log(JSON.stringify(output,null,2));return;}
  for(const size of [4096,65536,262144])for(const frames of [1,4,8]){const input=concat(Array.from({length:frames},(_,i)=>packet(jpeg(size,65+i),i+1)));const copies=arms.map((a,i)=>countCopies(a,input,!!i));assert.equal(copies[0].bytes-copies[1].bytes,(frames-1)*size);const samples=[[],[]];for(let i=0;i<20;i++)arms.forEach((a,n)=>parseBatch(a,input,!!n));for(let i=0;i<60;i++){const order=i%2?[1,0]:[0,1];for(const n of order){const start=process.hrtime.bigint();const r=parseBatch(arms[n],input,!!n);const elapsed=Number(process.hrtime.bigint()-start)/1e6;assert.equal(r.last.length,size);samples[n].push(elapsed);}}output.cohorts.push({jpeg_bytes:size,frames,input_bytes:input.length,copies,median_ms:samples.map(s=>quantile(s,.5)),p95_ms:samples.map(s=>quantile(s,.95)),samples_ms:samples});}
  console.log(JSON.stringify(output,null,2));}
 main().catch(e=>{console.error(e);process.exitCode=1;});

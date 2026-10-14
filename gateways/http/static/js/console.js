@@ -4306,6 +4306,7 @@
               latestFrameIdentity = parsed.identity;
               buffer = parsed.remaining;
             }
+            if (parsedAny) buffer = buffer.slice();
             if (latestFrameBytes) {
               try {
                 await renderDecodedVideoFrame(latestFrameBytes.slice(), generation, latestFrameIdentity || {});
@@ -4374,7 +4375,7 @@
           };
         }
         const frame = buffer.subarray(soi, eoi + 2);
-        const remaining = buffer.slice(eoi + 2);
+        const remaining = buffer.subarray(eoi + 2);
         if (!frame.byteLength) return null;
         const cameraValue = header.match(/^X-Camera-Id:\s*([^\r\n]*)/mi)?.[1] || "";
         let cameraId = "";

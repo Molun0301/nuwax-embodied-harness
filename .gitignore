@@ -264,3 +264,6 @@ drivers/.active_robot.lock
 !/tests/unit/test_scene_mapping_service.py
 !/tests/unit/test_yolo_detection_contract.py
 !/tests/conftest.py
+
+# 正式安装和自动发布的公开使用入口。
+!/docs/公开文档/轻量安装与自动发布.md

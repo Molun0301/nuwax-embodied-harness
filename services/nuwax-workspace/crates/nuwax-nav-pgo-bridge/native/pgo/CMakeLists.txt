@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.14)
-project(nuwax_pgo_core LANGUAGES CXX)
+# 发行版PCL配置会解析MPI的C接口，根工程需同时启用C语言探测。
+project(nuwax_pgo_core LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -9,7 +10,7 @@ find_package(PkgConfig REQUIRED)
 find_package(Threads REQUIRED)
 add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../../../nuwax-gtsam/native" "${CMAKE_CURRENT_BINARY_DIR}/gtsam-core")
 pkg_check_modules(LCM REQUIRED IMPORTED_TARGET lcm)
-pkg_check_modules(PCL REQUIRED IMPORTED_TARGET pcl_common pcl_filters pcl_kdtree pcl_registration)
+find_package(PCL 1.8 REQUIRED COMPONENTS common filters kdtree registration)
 find_program(LCM_GEN_EXECUTABLE lcm-gen)
 if(NOT LCM_GEN_EXECUTABLE)
   message(FATAL_ERROR "lcm-gen is required for the native PGO typed protocol")
@@ -59,7 +60,7 @@ add_executable(
 target_include_directories(pgo PRIVATE "${NATIVE_PGO_GENERATED_DIR}")
 target_link_libraries(
   pgo
-  PRIVATE PkgConfig::LCM PkgConfig::PCL Threads::Threads nuwax_gtsam
+  PRIVATE PkgConfig::LCM ${PCL_LIBRARIES} Threads::Threads nuwax_gtsam
 )
 target_compile_options(pgo PRIVATE -Wall -Wextra -Wpedantic -O2)
 
@@ -95,7 +96,7 @@ if(NUWAX_BUILD_PGO_OWNER_TESTS)
   target_include_directories(pgo_online_owner_tests PRIVATE "${NATIVE_PGO_GENERATED_DIR}")
   target_link_libraries(
     pgo_online_owner_tests
-    PRIVATE PkgConfig::LCM PkgConfig::PCL Threads::Threads nuwax_gtsam
+    PRIVATE PkgConfig::LCM ${PCL_LIBRARIES} Threads::Threads nuwax_gtsam
   )
   target_compile_options(pgo_online_owner_tests PRIVATE -Wall -Wextra -Wpedantic -O2)
   add_test(NAME pgo_online_owner_contract COMMAND pgo_online_owner_tests)

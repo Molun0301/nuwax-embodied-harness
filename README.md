@@ -4,9 +4,9 @@
 
 Nuwax Embodied Harness 面向机器人开发者，提供标准数据接入、建图、定位、导航、探索、视觉感知与空间记忆。你负责设备驱动、真实标定和运动执行；NEH 组织空间计算、任务状态和结果，让人通过网页、让上层智能体通过 MCP（模型上下文协议）调用同一组能力。
 
-[快速上手](docs/公开文档/快速上手.md) · [安装部署](docs/公开文档/部署文档.md) · [接入自己的机器人](docs/公开文档/架构与机器人接入.md) · [智能体接入](docs/公开文档/智能体接入.md) · [完整文档](docs/公开文档/阅读指南.md)
+[轻量安装与自动发布](docs/公开文档/轻量安装与自动发布.md) · [快速上手](docs/公开文档/快速上手.md) · [安装部署](docs/公开文档/部署文档.md) · [接入自己的机器人](docs/公开文档/架构与机器人接入.md) · [智能体接入](docs/公开文档/智能体接入.md) · [完整文档](docs/公开文档/阅读指南.md)
 
-> 当前为开发预览，适合设备接入与受控场景验证。仓库保持私有，项目许可证待定。当前开发分支为 `refactor/map-explore-nav`；默认分支 `main` 尚未同步这套安装与使用流程。支持范围见[发布与兼容性](docs/公开文档/发布与兼容性.md)。
+> 正式版本从 `main`（主分支）的固定修订自动构建并发布，设备通过独立管理页安装和更新。仓库保持私有，下载需要仓库读取权限；项目许可证待定。已发布平台、模块组合与设备验证范围见[发布与兼容性](docs/公开文档/发布与兼容性.md)。
 
 ## 从接入到任务
 
@@ -22,25 +22,17 @@ Nuwax Embodied Harness 面向机器人开发者，提供标准数据接入、建
 
 ## 开始使用
 
-在 Debian 或 Ubuntu（操作系统）系列的64位机器上，以普通用户打开终端。需要 Python（编程语言）3.8—3.12、Git（版本管理工具）及仓库读取权限；完整准备说明见[安装前准备](docs/公开文档/安装前准备.md)。
+在[最新发布页](https://github.com/Molun0301/nuwax-embodied-harness/releases/latest)下载 `get-neh.sh`，以普通用户执行。仓库保持私有，先按[安装说明](docs/公开文档/轻量安装与自动发布.md)准备仅能读取本仓库内容的下载凭据文件，再运行：
 
 ```bash
-git clone --branch refactor/map-explore-nav https://github.com/Molun0301/nuwax-embodied-harness.git
-cd nuwax-embodied-harness
-./install.sh
+bash ./get-neh.sh --token-file ~/.config/neh/github-token
 ```
 
-向导显示环境、每个模块的用途及安装内容。首次可以输入 `basic` 选择基础接入；使用二维雷达可选 `map2d`，使用三维雷达与惯性传感器可选 `map3d`。导航、视觉和本地记忆按需增加。
+引导程序安装管理服务并打开设备管理页。按页面选择机器人、模块和配置，查看实际下载量后开始安装；业务包保持轻量，第三方依赖和模型在安装时从固定来源下载并缓存。当前可选的正式包以发布目录为准。
 
-希望直接安装基础网关并体验界面，可以执行：
+管理页默认位于 `http://设备地址:8765/`，业务控制台通过管理页进入。没有桌面的设备会输出访问地址；需要纯命令行向导时加 `--cli`。默认免密码，可在管理页设置密码；本机使用可加 `--host 127.0.0.1`。
 
-```bash
-./install.sh doctor --preset basic --robot customrobot
-./install.sh install --preset basic --robot customrobot --yes
-./install.sh start
-```
-
-打开 [NEH 控制台](http://127.0.0.1:8766/console)。没有设备输入时会显示等待或缺项；安装成功不会产生模拟地图或自动完成设备接入。新安装默认供本机访问，远程使用见[安全与数据说明](docs/公开文档/安全与数据说明.md)。
+需要从源码开发时，克隆 `main` 并使用[源码模块安装入口](docs/公开文档/部署文档.md)。已克隆源码也可执行 `./install.sh product --token-file ~/.config/neh/github-token`，进入相同的正式版本安装流程。
 
 下一步：[完成第一次接入](docs/公开文档/快速上手.md) → [配置说明](docs/公开文档/配置说明.md) → [控制台使用](docs/公开文档/控制台使用指南.md)。
 
@@ -63,28 +55,20 @@ flowchart LR
 
 ## 安装后的常用操作
 
-```bash
-./install.sh list               # 查看模块与初始配置位置
-./install.sh doctor             # 检查安装前提及已有产物
-./install.sh stop               # 按已保存的运行模式停止当前安装
-./install.sh add navigation     # 增加导航与探索，自动补齐依赖
-./install.sh install --repair   # 修复当前选择的安装产物
-./install.sh update check       # 通过运行中的网关检查更新
-./install.sh update install --yes --wait  # 安全准入通过后更新并等待结果
-```
-
-模块变更前先停止网关。安装器将源码位置、模块集合、机器人适配器、监听地址和运行模式保存在安装描述中。网页与命令行读取同一份描述，执行同一更新事务，保留原来的模块选择与运行拥有方。
-
-默认使用普通进程模式（`foreground`）。在具有可用用户级 systemd 管理器的 Linux 主机上，也可选择用户服务模式；安装只记录选择，显式启动时才创建并启动该安装的用户服务：
+管理网页提供版本、模块、配置、启停、更新和回退入口。命令行调用同一个任务流程：
 
 ```bash
-./install.sh install --service-mode systemd-user --yes
-./install.sh start
+~/.local/share/neh/bin/neh status              # 查看真实安装及运行状态
+~/.local/share/neh/bin/neh releases --refresh # 查询正式版本
+~/.local/share/neh/bin/neh wizard             # 交互配置安装或更新
+~/.local/share/neh/bin/neh stop --wait         # 等待原拥有方停止
+~/.local/share/neh/bin/neh start --wait        # 启动并核对网关
+~/.local/share/neh/bin/neh config              # 查看当前配置项
 ```
 
-两种运行模式使用同一模块安装器。更新独立于网关进程执行，停止网关不会取消已受理的更新；用户服务模式通过独立的用户级更新服务执行，不把网关提升为 root。用户服务不会因安装而自动设置开机启动，其会话与退出行为受本机用户服务管理器配置影响。
+更新先准备并校验候选环境，再切换完整版本；配置、地图和用户数据保存在稳定目录。终端或网页断开不会取消已受理任务。需要回退时在管理页选择上一版本，或运行 `~/.local/share/neh/bin/neh rollback --stop-running --wait`。管理程序自身更新与业务更新分别提供入口。
 
-系统服务形式的运动守卫、设备网络准备等仍是可选设备能力的安全基础，不因统一更新入口而删除。未注册设备、未完成适配器、缺少设备依赖或不支持的操作系统会明确报错，不会因为选择通用平台就自动具备硬件能力。源码、数据备份和恢复规则见[升级与恢复](docs/公开文档/升级与恢复.md)。
+设备输入、标定、运动执行与现场验收仍由接入方负责。完整操作、凭据管理与恢复方法见[轻量安装与自动发布](docs/公开文档/轻量安装与自动发布.md)。
 
 ## 获取帮助与参与开发
 

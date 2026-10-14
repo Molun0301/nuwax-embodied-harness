@@ -25,11 +25,12 @@ if(NOT GTSAM_FOUND)
       -P "${CMAKE_CURRENT_SOURCE_DIR}/eigen_compat.cmake")
   FetchContent_MakeAvailable(gtsam_source)
 endif()
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(PGO_PCL REQUIRED IMPORTED_TARGET pcl_common pcl_kdtree pcl_registration)
+# Ubuntu20/22的pkg-config名称带版本后缀，使用PCL官方CMake配置统一解析依赖。
+find_package(PCL 1.8 REQUIRED COMPONENTS common kdtree registration)
 add_library(nuwax_gtsam STATIC solver.cpp registration.cpp)
-target_include_directories(nuwax_gtsam PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(nuwax_gtsam PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${PCL_INCLUDE_DIRS})
+target_compile_options(nuwax_gtsam PUBLIC ${PCL_DEFINITIONS})
 # GTSAM静态核心使用线程；由共享库声明，兼容pthread尚未并入libc的目标系统。
-target_link_libraries(nuwax_gtsam PUBLIC gtsam PkgConfig::PGO_PCL Threads::Threads)
+target_link_libraries(nuwax_gtsam PUBLIC gtsam ${PCL_LIBRARIES} Threads::Threads)
 # Rust调用方读取CMake实际选定的库位置；C++调用方直接复用目标传递依赖。
 file(GENERATE OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/gtsam-library.txt CONTENT "$<TARGET_FILE:gtsam>\n$<TARGET_FILE:metis-gtsam>\n$<TARGET_FILE:cephes-gtsam>\n")

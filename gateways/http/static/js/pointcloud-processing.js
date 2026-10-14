@@ -307,7 +307,8 @@ export class PointCloudProcessor {
     const visibleSource = floorContext
       ? this._filterPointCloudForFloor(src, floorContext, preset.floorFilter)
       : src;
-    const measurement = visibleSource.length ? this._measurePointCloud(visibleSource) : null;
+    const measurement = visibleSource === src ? sourceMeasurement
+      : visibleSource.length ? this._measurePointCloud(visibleSource) : null;
     this._activeFloorZ = floorContext?.floorZ ?? null;
     // 完整显示保留收到的每个点及原坐标，不应用显示间隔或细节级别抽样。
     if (preset.preserveSource) {

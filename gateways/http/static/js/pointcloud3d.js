@@ -2,7 +2,7 @@ import * as THREE from './three.module.min.js';
 import { SemanticRegionLayer } from './semantic-regions3d.js?v=20261013-region-reuse';
 import { SceneGraphLayer } from './scene-graph3d.js?v=20261013-graph-camera';
 import { OrbitControls } from './OrbitControls.js';
-import { PointCloudProcessor } from './pointcloud-processing.js?v=20260918-dense-pointcloud';
+import { PointCloudProcessor } from './pointcloud-processing.js?v=20261014-measure-reuse';
 import { IncrementalPointCloudConnection, mappingEpochFromMap, pointCloudAssignedSourceEpoch } from './pointcloud-incremental.js?v=20261006-assigned-pages';
 import { IncrementalPointCloudLayer } from './pointcloud-pages.js?v=20261002-pages';
 import { DensePointCloudLayer } from './dense-pointcloud.js?v=20261013-dense-saved-complete';
@@ -1211,7 +1211,7 @@ class PointCloud3DViewer extends PointCloudProcessor {
   _ensurePointCloudWorker() {
     if (this._cloudWorker || this._cloudWorkerFailed) return this._cloudWorker;
     try {
-      const worker = new Worker(new URL('./pointcloud-worker.js?v=20260918-dense-pointcloud', import.meta.url), {
+      const worker = new Worker(new URL('./pointcloud-worker.js?v=20261014-measure-reuse', import.meta.url), {
         type: 'module', name: 'nuwax-pointcloud-preprocess',
       });
       this._cloudWorker = worker;

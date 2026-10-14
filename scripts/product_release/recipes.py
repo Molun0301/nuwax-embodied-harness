@@ -162,7 +162,8 @@ def _official_wheel(record: dict) -> dict:
     if source is None:
         raise ReleaseError("上游没有目标轮子或固定源码，须提供已核准的独立下载配方：" + record["filename"])
     source_info = {"url": source["url"], "sha256": source["digests"]["sha256"]}
-    cached = subprocess.run([sys.executable, "-m", "pip", "cache", "list", record["name"], "--format=abspath"], capture_output=True, text=True, timeout=30)
+    # pip按文件名区分大小写匹配；PyAudio等发行名与实际轮子名大小写不同。
+    cached = subprocess.run([sys.executable, "-m", "pip", "cache", "list", record["filename"][:-4], "--format=abspath"], capture_output=True, text=True, timeout=30)
     for raw in cached.stdout.splitlines():
         wheel = Path(raw.strip())
         origin_path = wheel.parent / "origin.json"

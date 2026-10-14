@@ -1,6 +1,6 @@
 # NEH 云端夜间开发进度（持续更新）
 
-更新时间：2026-10-14 07:37 北京时间（2026-10-13 23:37 UTC）。本轮仍在进行，计划继续至北京时间 2026-10-14 11:00；本文不是收尾或整机验收声明。
+更新时间：2026-10-14 08:14 北京时间（2026-10-14 00:14 UTC）。本轮仍在进行，计划继续至北京时间 2026-10-14 11:00；本文不是收尾或整机验收声明。
 
 ## 当前结论与交付状态
 
@@ -9,8 +9,8 @@
 - 仓库：`Molun0301/nuwax-embodied-harness`
 - 工作分支：`fix/v3-legacy-cloud-seal-20261006`
 - 已确认的远端基线：`65d15c5262af71ee0ab532133bd0afdcb5e75911`；最近一次只读远端核对为2026-10-13 22:42 UTC，不能据此声称此后又核对过远端
-- 当前已提交本地代码状态：`79bb33f97f16f8395436ca8ec3b53ca91bef6edc`，相对上述基线新增 **54 个本地提交**；本次报告与随后未提交文档不包含在此计数中
-- 最新确认的同一 Library 检查点为 **v28，2,778,711 bytes**，覆盖截至 `f952800` 的53个提交；后续本地提交与本文更新待下一检查点。23:22 UTC再次确认CLI认证仍缺失，Git推送受阻；不能把本地提交或备份当作GitHub已更新
+- 当前已提交本地代码状态：`e5854d7`，相对上述基线新增 **59 个本地提交**；本次报告阶段更新不包含在此计数中
+- 最新确认的同一 Library 检查点为 **v30，2,986,272 bytes**，覆盖截至 `29591a1` 的57个提交；随后jobs watcher及recent-column两个本地提交待下一检查点。最近一次CLI认证检查仍为2026-10-13 23:22 UTC缺失，Git推送受阻；远端最近核对仍为22:42 UTC，不能把本地提交或备份当作GitHub已更新
 
 **最新导航结果：** 完整 `NavScheduler` 局部恢复修复已提交为 `0eed9d2`，固定持续障碍的原目标在 **13.32秒**完成，仅2次规划/2次准入，232条完整停车尾迹和715条实际运动边全部通过。早期60秒失败与两次短程停车尾迹失败仍保留；独立调查发现采样位姿到实际应用间的转动差异，当前只是合同诊断，没有生产修复或真实50 ms执行器hold证明。不能据此称现场机器人卡住或安全时序问题全部解决。
 
@@ -27,6 +27,19 @@
 - 近期障碍碰撞查询只构造需要的高度行，并在一次完整位姿查询内复用相邻细列所属的同一粗列。10 cm 粗网格 / 5 cm 来源、8 帧清空场景 **294.08 → 159.64 µs**，门洞 **297.48 → 156.82 µs**；1 帧障碍拒绝 **17.18 → 9.46 µs**。基线为 `bb1a14f` 完整查询，9 对交替测量，暖来源缓存、刻意绕过位姿结果缓存。等分辨率、无 recent、coarse-only 负对照没有实质收益；没有分配器/RSS或整机 CPU 测量。[证据与完整结果](body-recent-query-reuse-20261013.md)
 
 - Scan非arrival路线窗口复用第一次完全相同的polyline投影拒绝结果（`8949d9d`），保留原passage尝试、取消检查、失败优先级和witness。真实recent-guide fine-escape非arrival夹具的 `[body-view/endpoint/sweep]` 调用 **124/124/67 → 122/122/67**，结果仍68 poses、1 expansion；boundary-drained **81/81/19 → 80/80/18**。arrival对照完全不变（仍119 poses、3 expansions）。这是少做少量查询，不是延迟或新路径能力提升。[证据](diagnostics/scan-polyline-reuse-and-guide-eligibility-20261013.md)
+
+### 新增近期障碍列构造优化（`e5854d7`）
+
+只更改occupancy-column构造：有效整数voxel keys集中排序/去重后按XY分组，批量建立原BTreeMap；ground点保持原输入顺序和精确值，source identity/time、retention、错误/消费顺序和obstacle-overrides-ground不变，没有加缓存、锁、队列或分布阈值。
+
+三对独立进程固定AB/BA/AB，12 cohorts、各8次warmup/7次sample，完整真实 `RecentSourceState::consume → NavScheduler ACK`：
+
+- 100k分散点，1帧 **34.752052→19.448489 ms**；8帧 **35.248652→19.988084 ms**（三个进程中位数的中位数）
+- 重复列负对照保留：10k/8帧 **533.776→592.184 µs**，约增加58 µs；100k/1帧 **6.344087→6.710390 ms**、8帧 **6.048280→6.366792 ms**。100k各配对方向混合，不能仅凭总体中位数或单个配对挑选结论，也不把退化断言为噪声
+- 100k分散点的最终height Vec容量：1帧 **1,600,000→400,000 bytes**，8帧 **12,800,000→3,200,000 bytes**。这是capacity×元素大小，**不是RSS/allocator调用数**；每XY仍有一个height Vec
+- 初始等价candidate记录的瞬时已知重叠payload **6,167,168 bytes**（flat keys＋group entries＋height Vecs），**不含**原points、retained frames、ground/obstacle sets、BTreeMap节点、sort内部和allocator开销；flat keys在bulk tree前drop，最终容量变小不意味着所有峰值变小
+
+测量含真实codec、状态/watermark更新，但使用无active goal的SurfaceFollower＋RecordingMotion，没有PlannerWorker、LCM/transport或真实plant。独立stage测量不能从full consume相减推算析构/分配成本。900次初始test-only等价比较与最终生产/original oracle资格分别保留；第一次copied oracle的Self返回类型编译失败只改测试类型，没有放宽生产语义。详细结果及冻结binary边界见[报告](diagnostics/recent-column-build-qualification-20261014.md)和[原始结构化结果](diagnostics/recent-column-build-qualification-20261014-results.json)。报告/JSON中的“root commit pending”是提交前记录；现已本地提交e5854d7，不代表远端发布。
 
 ### 持续运行与搜索结论
 
@@ -95,6 +108,12 @@
 
 - artifact metadata以规范ID直接探测规范sidecar路径（`ad1f820`），先保留原payload-cache优先级，再回退原递归查找。10k artifacts、Python lookup冷缓存/OS暖缓存、七个不同ID配对：metadata **13.2967→0.1197 ms**，真实调用顺序metadata→raw响应构造 **33.9221→11.0870 ms**；目录项分别 **20,001→0**、**60,004→20,002**。原raw payload发现、hold/取消/range所有权未改，不含网络传输。已索引对照无收益宣称；非法重复ID且无缓存时会优先规范位置，库存仍拒绝重复，不能声称非法数据选择完全等价。最初预热payload-cache方案因冷成本与选择差异被否决。生产改动后**177项聚焦测试通过**。[完整证据](performance-artifact-metadata-access.md)
 
+### Native构建复用：只去掉jobs变化导致的失效
+
+`c5e2f43`仅移除slam-toolbox-sys与gtsam两个build.rs对 `CMAKE_BUILD_PARALLEL_LEVEL` 的rerun watcher；该变量只决定CMake `--parallel`，合法source/prefix/toolchain变化仍触发构建且使用当次jobs。实际Cargo/rustc1.88＋真实copied build scripts、fake CMake的**56次调用**均符合预期：jobs2→3时原版2次CMake、候选0次；源码、dependency prefix、toolchain变化仍各2次，configure/build故障及不改输入重试保留正确失败/恢复。注入故障的预期exit101不误报为Cargo全部exit0。
+
+这是避免重复build-script/CMake调度，不是实测SDK/native object编译或部署耗时收益；未链接SDK。generation-specific prefix仍是合法失效来源，**尚未采用稳定prefix生产修改**。便携脚本只验证语法/复现接口，不冒充另一次56-case执行。[证据](diagnostics/native-build-jobs-reuse-20261014.md)
+
 ## 四、感知与语义记忆
 
 - YOLO 输出归一化直接使用新建分割契约，去掉深复制：20 检测×128 点 **14.587 → 6.011 ms**；64×512 点 **281.206 → 153.505 ms**。后续在此基础上复用不可变坐标和有符号面积，三独立进程的 64×512 点为 **156.353/156.363/151.340 → 134.908/145.363/138.761 ms**。这是两个相继且不同基线的比较，收益不相加；不含模型推理或相机帧率。[证据](diagnostics/yolo-mask-normalization-copy.md)
@@ -127,13 +146,21 @@
 - provider pointcloud deep-copy只在full-perception有标定/检测但缓存无可用cloud时回退；video fast path、native LIO及recording走订阅。未找到固定高频polling，PointCloudFrame和ndarray仍可变，浅借用会削弱原隔离。保留getter，只有调用审计，没有额外timing或test结果。[后续传感器审计](performance-sensor-snapshot-audit.md#follow-on-provider-polling-and-ownership-audit)
 - 语义记忆完整查询的重复publication predicate审计：5k合法file-backed SQLite fixture，普通两次约 **1.107/1.153秒**；中间profile **1.599秒**，重复半段归因仅 **19.370 ms（约1.2%）**。三次完整输出一致、request-local状态清理、六表count及5000个completed_fresh保持；未实现candidate。重水合、source/provenance验证有各自权威边界，不能跨阶段复用模型/score冒充冗余。旧fuzzy-length候选继续撤回。这是负面归因，不是A/B收益，JSON累计调用时间互相包含不可相加。[新记忆审计](diagnostics/memory-query-owned-work-20261013.md)
 
+- assigned activation确有同一immutable canonical target在preflight与install各解码构造一次HashSet。1M点单decode诊断约65–76 ms、validate＋decode约137–148 ms，但**未采用保留set方案**：每个大请求多保留约26 MiB（实测27,267,072 mapped bytes），准备发生在transition锁前，缺少server-wide pending-task数量上限；50个set约1.27 GiB仅为并发风险示例，不是实际负载。18个进程是重复诊断、非18独立测试；它未实现完整activation、writer-lock时延或真实peak比较。没有移动准入次序、增加信号量/缓存或声称激活加速。[负面审计](diagnostics/activation-decode-audit-20261013.md)
+- recent ingestion初始基线的100k点XYZ materialization **0.820–0.846 ms**、finite scan **0.143–0.155 ms**，未支持扩大iterator/error-drain重构；两遍parser还会重复decode。保留原接口/错误/格式范围，三个ordinary contracts通过。之后较大的column构造热点才推进上述独立优化，不能把基线归因冒充同一A/B结果。[基线](diagnostics/recent-ingestion-baseline-20261013.md)
+
 ## 七、验证状态与未完成边界
 
 以下按实际版本和范围分别报告，重叠测试数不相加，也不把历史通过等同最终 HEAD 全通过：
 
+- **最新recent-column冻结窗口**：MLS **322 passed / 0 failed / 17 ignored，20.22秒**；Stack ingestion contracts **3通过**、原qualification **15通过/8 ignored**、source-health/preflight两个exact通过、六项原live分别通过；Runtime **236通过 / 58 ignored / 5 UDS filtered，56.50秒**。新增focused MLS含在322中，不另加；各轮重复qualification不累计
+- 这一轮六live的OFF/ON耗时分别为known-drop **7.08/6.93秒**、box **10.95/12.71秒**、wall **10.51/7.69秒**，只是原fixture资格，不是速度对照。原60秒窗口、1秒source TTL、容差及collision/braking oracle不变
+- Stack/Runtime binary均冻结于`c5e2f43` watcher变更前；这一轮结果不是“由后来的e5854d7 HEAD全量构建”的声明。watcher两文件另经56-case测试，不改navigation算法。后续所有报告保持各自source window；没有全仓、实机或未过滤UDS通过声明
+
+
 - 最新Python **3.8.10，1160 passed / 0 failed / 0 skipped / 1 deselected，62.13秒**，既有httpx warning1条，exit0。57-target去重并集实际收集1161项；唯一排除的是会执行legacy digest的literal pred1 manifest fixture。以前排除的abrupt-exit测试本次已包含并通过，不再把它列为当前环境阻塞。执行HEAD为`3073f85`前后不变，之后native/文档提交未改该Python生产代码；便携runner只重做collection确认1160节点，不把它称作再次执行。[集成报告](diagnostics/python-guarded-integration-20261013.md)
 - 该Python执行在application/test imports前安装guard，**application hash attempts=0**；Starlette原FileResponse的mtime-size metadata ETag有**4次精确限定框架例外**，不读文件payload。不能称零框架hash，也不与早期572/652/177/143相加
-- 最新Runtime普通范围：**236 passed / 0 failed / 58 ignored / 5 UDS excluded，56.45秒**，以及另外显式执行的两个moving恢复arm。233/235通过属于之前源状态，不重复累计。[范围](diagnostics/navigation-recovery-robustness-20261013.md)
+- 较早moving robustness阶段Runtime普通范围：**236 passed / 0 failed / 58 ignored / 5 UDS excluded，56.45秒**，以及另外显式执行的两个moving恢复arm。233/235通过属于之前源状态，不重复累计。[范围](diagnostics/navigation-recovery-robustness-20261013.md)
 - 历史近期碰撞优化MLS普通库 **320 passed / 16 ignored**；最终Scan default-feature **53 passed / 1 ignored**，profile **56 passed / 5 ignored**，non-test lib release check通过；两个Scan套件重叠不合并。五例current-guide和匹配复用diagnostic另外显式通过，不暗示其余ignored已运行
 - 新native集成基于冻结的`8949d9d`加scheduler test fixture；未在build时采样Git revision，23:34物化报告时的`79bb33f`不冒充build-time provenance。**两个非cfg(test) release cargo check通过**：Stack binary目标7.21秒、Geometry binary目标1分21秒；它们不是完整链接的部署binary或硬件SDK资格
 - 同轮Stack release测试构建1分34秒；普通资格 **15 passed / 0 failed / 8 ignored / 282 filtered**。源健康和codec/geometry/body preflight两个exact项、known-drop/box/wall各OFF/ON六个原live exact项逐进程显式运行，全部各1通过。原窗口/TTL/容差/oracle未改；场景耗时不是A/B加速。[最新native报告](diagnostics/final-native-integration-20261013.md)
@@ -154,9 +181,9 @@
 
 ## 八、正在继续的工作（未计为成果）
 
-- 已结束的RSS归因、Scan小幅复用与五例实际guide资格、Python与native聚焦集成已移入上述结果，不再列为待运行
-- 继续基于当前源码调查记忆JSON/模型边界和地图激活路径；只推进有调用与成本证据、保持权威校验/所有权的窄改动。已经否决的publication predicate、payload直达、provider借用方案不会当作已实现收益
-- 本轮继续至北京时间11:00（03:00 UTC）；后续结果、最终检查点、提交与远端状态仍待届时更新，当前不宣称全部完成
+- 已结束的RSS归因、Scan复用、Python/native聚焦集成、activation decode负面审计和recent列构造资格均已归入结果，不再列为待运行
+- 继续source-prefix增量构建的tiny fixture调查；稳定路径若触及复制/patch/generated header时间戳，可能错误重编译或漏失效，必须实证。**尚无stable-prefix生产变更或已实现编译耗时收益**，jobs-only watcher的已验证范围保持独立
+- 本轮云端工作继续至北京时间11:00（03:00 UTC）；后续结果、最终检查点、提交与远端状态仍待届时更新，当前不宣称全部完成
 
 ## 附：证据阅读顺序
 
@@ -173,3 +200,5 @@
 - 新增证据：[artifact canonical配对JSON](diagnostics/artifact-canonical-lookup-20261013-results.json)、[实时点云回放JSON](diagnostics/incremental-pointcloud-replay-20261013-results.json)、[相机运算JSON](diagnostics/scene-graph-camera-invariants-20261013-results.json)、[cache负面结果](diagnostics/navigation-cache-allocation-audit-20261013-results.json)、[stream结果](diagnostics/stream-delivery-audit-20261013-results.json)
 
 - 最新验证与负面调查：[RSS逐drain结果](diagnostics/navigation-rss-ownership-20261013-results.json)、[Scan复用结果](diagnostics/scan-polyline-reuse-results-20261013.json)、[五例真实guide](diagnostics/recent-guide-five-case-eligibility-results-20261013.json)、[Python逐node与guard](diagnostics/python-guarded-integration-20261013-results.json)、[moving恢复](diagnostics/navigation-recovery-robustness-20261013.json)、[native精确选择及provenance](diagnostics/final-native-integration-20261013-results.json)、[记忆query归因](diagnostics/memory-query-owned-work-20261013-results.json)
+
+- 最新阶段：[activation decode机会与保留风险](diagnostics/activation-decode-audit-20261013.md)、[recent ingestion原始基线](diagnostics/recent-ingestion-baseline-20261013.md)、[列构造资格及12-cohort样本](diagnostics/recent-column-build-qualification-20261014-results.json)、[jobs-only构建56-case](diagnostics/native-build-jobs-reuse-20261014-results.json)

@@ -661,6 +661,10 @@ impl SurfaceGoalSourceAdapter {
                     <= f64::from(snapshot.config().voxel_size) * 0.25
             })
         });
+        #[cfg(test)]
+        tests::VIEW_TRANSFER.with(|counts| counts.set((admissible.len(),
+            admissible.iter().filter(|(_, _, view)| view.as_ref().is_some_and(|v| !v.cells.is_empty())).count(),
+            admissible.iter().map(|(_, _, view)| view.as_ref().map_or(0, |v| v.cells.len())).sum())));
         let observed: Vec<_> = admissible
             .iter()
             .map(|(_, _, view)| {
@@ -1764,7 +1768,17 @@ mod tests {
                 support_uncertainty_m: 0.0,
             }).unwrap());
         let current = state(0.4,1);
-        assert!(snapshot.validate_body_pose([1.05,1.05,0.4],[0.0,0.0,0.0,1.0]).is_err());
+        let start = [1.05, 1.05, 0.4];
+        let orientation = [0.0, 0.0, 0.0, 1.0];
+        // Missing floor samples are not occupied body volume. The raw map still
+        // lacks a support anchor; the private current-body view must supply it.
+        snapshot.validate_body_pose(start, orientation).unwrap();
+        assert!(matches!(snapshot.locate_support_from_body(start, orientation, 0.3),
+            Err(nuwax_nav_mls_planner::SurfaceError::MissingSupport)));
+        assert!(snapshot.observations().is_none());
+        let current_view = snapshot.with_current_body_support(start, orientation).unwrap();
+        current_view.locate_support_from_body(start, orientation, 0.3).unwrap();
+        assert!(current_view.observations().is_none(), "private support must not fabricate observations");
         let receiver = SurfaceInputReceiver::new();
         receiver.observe(Arc::clone(&snapshot)).unwrap();
         let selected = goal(source(receiver,1).poll_goal(&current).unwrap());
@@ -1773,7 +1787,12 @@ mod tests {
         let p = selected.pose.pose.position;
         let q = selected.pose.pose.orientation;
         snapshot.validate_body_pose([p.x,p.y,p.z],[q.x,q.y,q.z,q.w]).unwrap();
-        assert!(snapshot.validate_body_pose([1.05,1.05,0.4],[0.0,0.0,0.0,1.0]).is_err());
+        snapshot.locate_support_from_body([p.x,p.y,p.z],[q.x,q.y,q.z,q.w],0.3).unwrap();
+        snapshot.validate_body_pose(start, orientation).unwrap();
+        assert!(matches!(snapshot.locate_support_from_body(start, orientation, 0.3),
+            Err(nuwax_nav_mls_planner::SurfaceError::MissingSupport)),
+            "private current-body support must not mutate the raw environment");
+        assert!(snapshot.observations().is_none());
     }
 
     #[test]
@@ -1784,6 +1803,46 @@ mod tests {
     #[test]
     fn long_body_uses_safe_frontier_heading_with_omnidirectional_sensor() {
         assert_long_body_frontier_heading(true);
+    }
+
+    #[test]
+    #[ignore = "baseline fixture contract diagnostic; original missing-floor scene"]
+    fn original_long_body_fixture_exhausts_radially_clear_frontiers() {
+        let snapshot = Arc::new(map().as_ref().clone().with_body_envelope(
+            nuwax_nav_mls_planner::SurfaceBodyEnvelope {
+                footprint_xy_m: vec![[-0.8, -0.12], [0.8, -0.12], [0.8, 0.12], [-0.8, 0.12]],
+                z_bounds_m: [-0.05, 0.2],
+                body_to_support_z_m: 0.3,
+                max_step_up_m: 0.2,
+                max_step_down_m: 0.2,
+                max_cross_slope_deg: 15.0,
+                support_uncertainty_m: 0.0,
+            },
+        ).unwrap());
+        let receiver = SurfaceInputReceiver::new();
+        receiver.observe(Arc::clone(&snapshot)).unwrap();
+        let mut adapter = source(receiver, 1);
+        adapter.configure_constraints(None, 1, 0.01).unwrap();
+        let frontiers = snapshot.reachable_frontiers([1.05, 1.05, 0.1], &[]).unwrap();
+        let mut radial_valid = 0;
+        for frontier in &frontiers {
+            let p = frontier.support_xyz;
+            let yaw = (p[1] - 1.05).atan2(p[0] - 1.05);
+            let q = snapshot.body_orientation_at(p, yaw).unwrap();
+            let body = snapshot.body_position_from_support(p, q, 0.3).unwrap();
+            if snapshot.validate_body_pose(body, q).is_ok() {
+                radial_valid += 1;
+                adapter.history.push(GoalHistory {
+                    support_xyz: p, vertical_radius_m: 0.3, reached: true, failures: 0,
+                });
+            }
+        }
+        let excluded = frontiers.iter().filter(|f| adapter.excluded(f.support_xyz, 0.3)).count();
+        eprintln!("original_long_body_fixture frontier_count={} radial_valid_count={} history_count={} excluded_count={}",
+            frontiers.len(), radial_valid, adapter.history.len(), excluded);
+        assert!(!frontiers.is_empty());
+        assert_eq!(radial_valid, frontiers.len());
+        assert_eq!(excluded, frontiers.len());
     }
 
     fn assert_long_body_frontier_heading(calibrated: bool) {
@@ -1798,6 +1857,28 @@ mod tests {
                 support_uncertainty_m: 0.0,
             },
         ).unwrap());
+        // Actual occupied volumes, rather than missing floor, distinguish a
+        // radial collision from a clear tangential long-body heading. Keeping
+        // these returns in the recent view leaves the static frontier graph intact.
+        let source_timestamp_ns = 1_000_000_000;
+        let ring = (-3..=22).flat_map(|i| {
+            let coordinate = (f64::from(i) + 0.5) * 0.1;
+            [[-0.25, coordinate, 0.45], [2.25, coordinate, 0.45],
+             [coordinate, -0.25, 0.45], [coordinate, 2.25, 0.45]]
+        });
+        let occupied = Arc::new(snapshot.with_recent_obstacle_points(1, source_timestamp_ns, 0, &[],
+            ring.enumerate().map(|(index, point)| (index as u32, point))).unwrap());
+        assert_eq!(snapshot.reachable_frontiers([1.05, 1.05, 0.1], &[]).unwrap(),
+            occupied.reachable_frontiers([1.05, 1.05, 0.1], &[]).unwrap(),
+            "recent collision evidence must not change static frontier data");
+        let snapshot = occupied;
+        let witness_support = [0.15, 1.05, 0.1];
+        let radial = snapshot.body_orientation_at(witness_support, std::f64::consts::PI).unwrap();
+        let tangent = snapshot.body_orientation_at(witness_support, std::f64::consts::FRAC_PI_2).unwrap();
+        let witness_body = snapshot.body_position_from_support(witness_support, radial, 0.3).unwrap();
+        assert_eq!(snapshot.validate_body_pose(witness_body, radial),
+            Err(nuwax_nav_mls_planner::SurfaceError::InsufficientClearance));
+        snapshot.validate_body_pose(witness_body, tangent).unwrap();
         let current = state(0.4, 1);
         snapshot.validate_body_pose([1.05, 1.05, 0.4], [0.0, 0.0, 0.0, 1.0]).unwrap();
         let receiver = SurfaceInputReceiver::new();
@@ -1805,7 +1886,9 @@ mod tests {
         let mut adapter = source(receiver, 1);
         adapter.configure_constraints(None, 1, 0.01).unwrap();
         // 中部可直指到达的视点已访问，剩余边缘视点需要沿边缘停留。
-        for frontier in snapshot.reachable_frontiers([1.05, 1.05, 0.1], &[]).unwrap() {
+        let frontiers = snapshot.reachable_frontiers([1.05, 1.05, 0.1], &[]).unwrap();
+        let mut radial_collisions = 0;
+        for frontier in &frontiers {
             let p = frontier.support_xyz;
             let yaw = (p[1] - 1.05).atan2(p[0] - 1.05);
             let q = snapshot.body_orientation_at(p, yaw).unwrap();
@@ -1814,8 +1897,15 @@ mod tests {
                 adapter.history.push(GoalHistory {
                     support_xyz: p, vertical_radius_m: 0.3, reached: true, failures: 0,
                 });
+            } else {
+                radial_collisions += 1;
             }
         }
+        assert!(radial_collisions > 0, "fixture must retain real radial collisions");
+        let excluded = frontiers.iter().filter(|f| adapter.excluded(f.support_xyz, 0.3)).count();
+        assert!(excluded < frontiers.len(), "visited history must leave collision-blocked radial candidates");
+        eprintln!("occupied_ring_fixture calibrated={calibrated} frontier_count={} radial_clear_history={} radial_collisions={radial_collisions} excluded_count={excluded}",
+            frontiers.len(), adapter.history.len());
         if calibrated {
             adapter.set_observation_model(nuwax_nav_types_messages::ObservationModel {
                 kind: nuwax_nav_types_messages::ObservationKind::Volume,
@@ -1835,8 +1925,9 @@ mod tests {
         snapshot.validate_body_pose([p.x, p.y, p.z], [q.x, q.y, q.z, q.w]).unwrap();
         let radial_yaw = (p.y - 1.05).atan2(p.x - 1.05);
         let radial = snapshot.body_orientation_at([p.x, p.y, p.z - 0.3], radial_yaw).unwrap();
-        assert!(snapshot.validate_body_pose([p.x, p.y, p.z], radial).is_err(),
-            "前沿直指方向必须缺少支撑，才能覆盖原单朝向误拒绝");
+        assert_eq!(snapshot.validate_body_pose([p.x, p.y, p.z], radial),
+            Err(nuwax_nav_mls_planner::SurfaceError::InsufficientClearance),
+            "前沿直指方向必须碰撞真实占据体，才能覆盖原单朝向误拒绝");
         if calibrated {
             assert!(selected.information_gain.unwrap() > 0.0);
         }
@@ -2390,4 +2481,5 @@ mod tests {
     }
 
     include!("surface_prepared_reference_tests.rs");
+    include!("surface_view_ownership_tests.rs");
 }

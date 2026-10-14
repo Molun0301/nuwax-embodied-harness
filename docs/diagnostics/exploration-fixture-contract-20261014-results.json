@@ -1,0 +1,119 @@
+{
+  "scope": "test-only fixture correction",
+  "production_changed": false,
+  "build_cwd": "services/nuwax-workspace",
+  "build_command": "cargo test --offline --locked --release -j2 -p nuwax-exploration --features surface --lib --no-run --message-format=json",
+  "results": {
+    "baseline-count": {
+      "exit_code": 0,
+      "log": "final-baseline-count.log"
+    },
+    "focused-blind": {
+      "exit_code": 0,
+      "log": "final-focused-blind.log"
+    },
+    "focused-heading": {
+      "exit_code": 0,
+      "log": "final-focused-heading.log"
+    },
+    "full-surface": {
+      "exit_code": 0,
+      "log": "final-full-surface.log"
+    }
+  },
+  "final_full_suite": {
+    "passed": 59,
+    "failed": 0,
+    "ignored": 2
+  },
+  "baseline_original": {
+    "passed": 56,
+    "failed": 3,
+    "ignored": 1
+  },
+  "baseline_long_body": {
+    "frontiers": 324,
+    "radial_valid": 324,
+    "history": 324,
+    "excluded": 324
+  },
+  "corrected_long_body_each_sensor_mode": {
+    "frontiers": 324,
+    "radial_valid_history": 80,
+    "radial_collisions": 244,
+    "excluded": 80
+  },
+  "not_validated": [
+    "full workspace",
+    "runtime live-source integration",
+    "real sensor replay",
+    "physical robot navigation"
+  ],
+  "initial_validation_caveat": "Initial --manifest-path run from repo root omitted workspace build.incremental=true; final runs use the original workspace working directory. Initial blind log retains zero-test short exact filter before corrected fully qualified run.",
+  "date": "2026-10-14",
+  "classification": "stale tests after documented ground/collision responsibility split; not evidence of a new production heading regression",
+  "repository_source": "services/nuwax-workspace/crates/nuwax-exploration/src/surface_adapter.rs",
+  "report": "exploration-fixture-contract-20261014.md",
+  "original_baseline_report": "exploration-view-ownership-audit-20261014.md",
+  "original_baseline_evidence_directory": "/workspace/scratch/71cdb9d17732/neh-evidence/exploration-view-ownership-20261014",
+  "original_baseline_artifacts": [
+    "baseline-tests.log",
+    "candidate-tests.log",
+    "surface_adapter.original.rs",
+    "surface_adapter.baseline.rs",
+    "surface_adapter.candidate.rs",
+    "baseline-test",
+    "candidate-test"
+  ],
+  "final_evidence_directory": "/workspace/scratch/71cdb9d17732/neh-evidence/exploration-fixture-contract-20261014",
+  "final_evidence_artifacts": [
+    "baseline-count.log",
+    "final-build.jsonl",
+    "final-build.log",
+    "final-executable-path.txt",
+    "final-test",
+    "final-baseline-count.log",
+    "final-focused-blind.log",
+    "final-focused-heading.log",
+    "final-full-surface.log",
+    "production-prefix-check.txt",
+    "surface_adapter.before.rs",
+    "surface_adapter.after.rs",
+    "test-fixture.patch"
+  ],
+  "release_profile": {
+    "opt_level": 3,
+    "lto": "thin",
+    "codegen_units": 1,
+    "final_workspace_config_incremental": true,
+    "overrides": false
+  },
+  "specific_radial_collision_result": "SurfaceError::InsufficientClearance",
+  "synthetic_recent_fixture": {
+    "source_sequence": 1,
+    "source_timestamp_ns": 1000000000,
+    "state_timestamp_ns": 1000000000,
+    "retention_ns": 0,
+    "ground_point_indices": [],
+    "ring_xy_lines_m": [
+      -0.25,
+      2.25
+    ],
+    "height_m": 0.45,
+    "point_spacing_m": 0.1,
+    "static_frontier_vector_equal": true
+  },
+  "test_source_only": true,
+  "full_suite_ignored": [
+    "surface_view_ownership_profile",
+    "original_long_body_fixture_exhausts_radially_clear_frontiers"
+  ],
+  "separately_passed_diagnostic": "original_long_body_fixture_exhausts_radially_clear_frontiers",
+  "production_prefix_verification": "Byte equality before #[cfg(test)] mod tests against released instrumented baseline; no hash used",
+  "limitations": [
+    "No claim of real robot movement-refusal resolution",
+    "No live-source gate bypass",
+    "No claim that unknown ground is observed or free",
+    "No new performance claim from fixture correction"
+  ]
+}

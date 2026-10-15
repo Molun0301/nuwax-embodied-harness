@@ -1,13 +1,14 @@
 """端侧源码构建薄桥：调用共同安装器，封存依赖并导出独立运行候选。"""
 from __future__ import annotations
 
-import hashlib
 import json
+import inspect
 import os
 import re
 import shutil
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 
 
@@ -45,46 +46,52 @@ def _runner(root, home, candidate, *, library_prefix=None):
 
 def _dependency_inputs(request, hardware, seed):
     from scripts.module_installer.catalog import module_requirements
+    from scripts.module_installer import manager
     files = list(module_requirements(request.modules, request.robot))
-    files.extend(("scripts/module_installer/manager.py", "scripts/module_installer/catalog.py"))
     if request.robot == "go2":
-        files.extend(("scripts/go2_dependencies.py", "third_party/go2-online-sources.json"))
+        files.append("third_party/go2-online-sources.json")
     records = []
     for name in sorted(set(files)):
         path = request.root / name
-        records.append({"path": name, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
+        records.append({"path": name, "content": path.read_text(encoding="utf-8")})
     interpreter = Path(seed).resolve()
     identity = subprocess.check_output([seed, "-c", "import sys,sysconfig,json; print(json.dumps({'python':list(sys.version_info[:3]),'platform':sysconfig.get_platform()}))"], text=True)
     vendor = {}
     if hardware.is_jetson and set(request.modules) & {"perception", "memory"}:
         code = "import importlib.metadata as m,json; print(json.dumps({name:m.version(name) for name in ('torch','torchvision')}))"
         vendor = json.loads(subprocess.check_output([seed, "-c", code], text=True))
-    return {"schema": 1, "files": records, "bridge_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(), "robot": request.robot, "interpreter": str(interpreter),
+    # The selected source owns dependency semantics, not the installed bridge.
+    return {"schema": 2, "recipe_version": getattr(manager, "DEPENDENCY_RECIPE_VERSION", 0), "files": records, "robot": request.robot, "interpreter": str(interpreter),
             "interpreter_size": interpreter.stat().st_size, "interpreter_mtime_ns": interpreter.stat().st_mtime_ns,
             "target": json.loads(identity), "is_jetson": hardware.is_jetson, "nvidia_gpu": hardware.nvidia_gpu, "vendor": vendor}
 
 
+def _check_prerequisites(request, hardware):
+    # The installed bridge also serves explicitly selected older source commits.
+    from scripts.module_installer.manager import check_prerequisites
+    if "system_packages_managed" in inspect.signature(check_prerequisites).parameters:
+        return check_prerequisites(request, hardware, system_packages_managed=True)
+    return check_prerequisites(request, hardware)
+
+
 def prepare_dependencies(request, hardware, candidate, run):
-    from scripts.module_installer.manager import _python_environment, check_prerequisites
-    seed = check_prerequisites(request, hardware)
+    from scripts.module_installer.manager import _python_environment
+    seed = _check_prerequisites(request, hardware)
     inputs = _dependency_inputs(request, hardware, seed)
-    key = hashlib.sha256(json.dumps(inputs, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-    prefix = request.home / "python-environments" / key
-    if prefix.is_symlink():
-        raise RuntimeError("依赖环境不能指向其它目录")
-    marker = prefix / "complete.json"
-    reused = _read_json(marker).get("inputs") == inputs and (prefix / "venv/bin/python").is_file()
+    environments = request.home / "python-environments"
+    environments.mkdir(parents=True, exist_ok=True)
+    prefix = next((item for item in sorted(environments.iterdir())
+                   if not item.is_symlink() and item.is_dir()
+                   and _read_json(item / "complete.json").get("inputs") == inputs
+                   and (item / "venv/bin/python").is_file()), None)
+    reused = prefix is not None
     if not reused:
-        # 只有未完成且从未发布的目录可清理；完整环境不会在更新时原地改写。
-        if marker.exists():
-            raise RuntimeError("已封存依赖环境不完整，请保留现场并使用新的依赖输入重新准备")
-        if prefix.exists():
-            shutil.rmtree(prefix)
-        prefix.mkdir(parents=True)
+        prefix = environments / uuid.uuid4().hex
+        prefix.mkdir()
         try:
             _python_environment(request, hardware, prefix, seed, run)
             frozen = subprocess.check_output([str(prefix / "venv/bin/python"), "-m", "pip", "freeze", "--all"], text=True)
-            _write_json(marker, {"inputs": inputs, "packages": frozen.splitlines()})
+            _write_json(prefix / "complete.json", {"inputs": inputs, "packages": frozen.splitlines()})
         except BaseException:
             shutil.rmtree(prefix)
             raise
@@ -92,7 +99,7 @@ def prepare_dependencies(request, hardware, candidate, run):
     if link.exists() or link.is_symlink():
         raise RuntimeError("候选Python环境入口已存在")
     link.symlink_to(prefix / "venv", target_is_directory=True)
-    return {"dependency_key": key, "dependency_environment": str(prefix), "dependencies_reused": reused}
+    return {"dependency_key": prefix.name, "dependency_environment": str(prefix), "dependencies_reused": reused}
 
 
 def _copy_runtime(prefix, candidate, binaries):

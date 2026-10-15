@@ -13,9 +13,10 @@ import time
 import uuid
 from pathlib import Path
 
-from scripts.module_installer.catalog import MODULES, ModuleError, resolve_modules
+from scripts.module_installer.catalog import MODULES, ModuleError, module_system_packages, resolve_modules
 from scripts.module_installer.hardware import detect_hardware, recommend_modules
-from scripts.module_installer.runtime import read_existing, read_settings, _VALUES
+from scripts.module_installer.manager import existing_config
+from scripts.module_installer.runtime import read_settings, _VALUES
 
 from . import MANAGER_DEVELOPMENT, MANAGER_REVISION, MANAGER_VERSION, PACKAGE_ROOT
 from .config_client import ConfigurationClient
@@ -284,6 +285,19 @@ class Engine:
         if plan["action"] == "update-manager":
             plan["steps"].extend([{"title": "在设备本地组装管理程序"}, {"title": "切换管理程序并重启网页进程"}])
         else:
+            # 与源码构建的metadata使用同一模块配方；仅查询本机包状态，不安装或提权。
+            from scripts.neh_system_helper import dependency_plan
+            try:
+                packages = list(module_system_packages(plan["modules"], plan["robot"]))
+                if set(plan["modules"]) & {"geometry", "slam2d", "fastlio2", "pointlio", "navigation", "follow"}:
+                    packages.append("patchelf")
+                dependencies = dependency_plan({"packages": list(dict.fromkeys(packages))})
+                plan["system_dependencies"] = dependencies
+                if dependencies["missing"] and not Path("/usr/local/libexec/neh-system-helper").is_file():
+                    plan["blockers"].append("缺少系统依赖（" + "、".join(dependencies["missing"]) +
+                        "），且系统助手尚未安装。请由设备管理员完成引导器的系统集成步骤，或按本机包管理器安装这些依赖后重新生成计划。")
+            except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
+                plan["blockers"].append("系统依赖无法预检：" + str(exc))
             plan["steps"].extend([{"title": "准备并复用所选模块依赖"}, {"title": "增量构建并验证独立候选版本"}, {"title": "保存配置并切换版本"}])
 
     def _fingerprint(self):
@@ -531,6 +545,15 @@ class Engine:
                                          {"recovery": getattr(recovery, "code", type(recovery).__name__)})
                 job.update(status="cancelled" if isinstance(exc, Cancelled) and error.code != "recovery_failed" else "failed", error=error.as_dict())
                 self._progress(job, "failed", job["progress"], error.message)
+            if (job["status"] == "succeeded" and job["action"] in {"install", "update", "modules", "migrate", "rollback", "update-manager"}
+                    and not job["result"].get("unchanged")):
+                # 安装已经提交；存储保留失败不能触发安装回滚。
+                try:
+                    from .storage import prune_storage
+                    job["result"]["storage"] = prune_storage(self.home)
+                except Exception as exc:
+                    job["result"]["storage"] = {"removed": [], "warnings": [{"error": type(exc).__name__}]}
+                atomic_json(self._job_path(job_id), job)
 
     def recover_if_needed(self):
         active = read_json(self.home / "config/active-job.json", {})
@@ -610,11 +633,14 @@ class Engine:
         previous = Path(journal["previous"]) if journal.get("previous") else None
         candidate = Path(journal["candidate"]) if journal.get("candidate") else None
         if journal.get("switch_intent"):
+            # 兼容中断的旧start日志：未停止过的既有拥有方不属于本次启动事务。
+            kept_owner = job.get("action") == "start" and candidate == previous and journal.get("was_running") and not journal.get("stop_intent")
             if candidate and self.runtime.status()["running"]:
                 runtime_record = read_json(self.home / "config/runtime.json", {})
                 owner = Path(runtime_record["prefix"]) if runtime_record.get("prefix") else candidate
                 if owner == candidate:
-                    self.runtime.stop(candidate)
+                    if not kept_owner:
+                        self.runtime.stop(candidate)
                 elif owner != previous:
                     raise ManagerError("owner_identity", "恢复时发现不属于本事务的业务拥有方，拒绝停止。", 409)
             self._restore_profiles(journal)
@@ -700,9 +726,15 @@ class Engine:
             self._journal(job, committed=True)
             return {"version": current.get("version"), "revision": current.get("revision"), "unchanged": True, "runtime": self.runtime.status()}
         previous = Path(current["prefix"]) if current else None
-        was_running = self.runtime.status()["running"]
+        runtime_state = self.runtime.status()
+        was_running = runtime_state["running"]
         self._journal(job, previous=str(previous) if previous else None, was_running=was_running)
         if action in ("start", "stop", "restart"):
+            if action == "start" and was_running:
+                if runtime_state["healthy"]:
+                    self._journal(job, committed=True)
+                    return {"version": current.get("version"), "unchanged": True, "runtime": runtime_state}
+                raise ManagerError("already_running", "业务拥有方已运行但健康接口尚未响应，请检查原服务；不会重复启动或停止。", 409)
             if action in ("stop", "restart"):
                 self._journal(job, stop_intent=True)
                 self._progress(job, "stopping", 25, "通过原拥有方停止业务")
@@ -776,7 +808,7 @@ class Engine:
         current = self.current()
         existing = self._existing(current)
         if plan.get("_migration"):
-            existing = read_existing(Path(plan["_migration"]["source"]))
+            existing = self._migration_configuration(Path(plan["_migration"]["source"]))
         from .downloads import MODEL_SETTINGS, prepare_dependencies, uses_default_model
         configuration = plan["_request"].get("configuration", {})
         if not isinstance(configuration, dict):
@@ -900,7 +932,7 @@ class Engine:
                     target = self.home / "config/profiles" / driver.name
                     target.mkdir(parents=True, exist_ok=True)
                     (driver / "configs").symlink_to(target, target_is_directory=True)
-            existing = read_existing(Path(plan["_migration"]["source"])) if plan.get("_migration") else self._existing(self.current())
+            existing = self._migration_configuration(Path(plan["_migration"]["source"])) if plan.get("_migration") else self._existing(self.current())
             self._configure_candidate(candidate, plan, existing, allow_pending_models=True)
             self._progress(job, "models", 65, "准备所选模型并复用已有模型文件")
             bridge(self, source, candidate, "models", job)
@@ -992,6 +1024,12 @@ class Engine:
                 continue
         return {"sources": sources, "message": "网页只迁入已识别的原安装；其它路径可在设备本地使用migrate明确指定。"}
 
+    @staticmethod
+    def _migration_configuration(source):
+        prefix = source / "runtime_data/installation/current"
+        current = {"prefix": str(prefix)} if (prefix / "settings.env").is_file() else {}
+        return existing_config(source, current)
+
     def _migration_info(self, source_path):
         if not source_path:
             raise ManagerError("source_missing", "迁入需要明确指定原项目目录。")
@@ -1000,7 +1038,7 @@ class Engine:
             raise ManagerError("source_invalid", "迁入源与管理安装目录不能互相包含。")
         if not (source / "scripts/start_gateway.sh").is_file():
             raise ManagerError("source_invalid", "迁入源缺少原统一启动器。")
-        values = read_existing(source)
+        values = self._migration_configuration(source)
         systemd = any(str(values.get(key, "")).lower() in ("true", "1") for key in ("NUWAX_GEOMETRY_RUNTIME_MANAGED_BY_SYSTEMD", "NUWAX_NAV_STACK_MANAGED_BY_SYSTEMD"))
         try:
             result = subprocess.run(["systemctl", "show", "nuwax-gateway.service", "--property=WorkingDirectory,ExecStart,ActiveState"],
@@ -1099,7 +1137,7 @@ class Engine:
             os.replace(str(temporary), str(target))
         # 原拥有方已停止后再次读取最终方案，避免准备期间用户的最后一次保存丢失。
         candidate = Path(job["_journal"]["candidate"])
-        values = read_existing(root)
+        values = self._migration_configuration(root)
         from .downloads import MODEL_SETTINGS
         prepared = read_settings(candidate / "settings.env")
         for key in MODEL_SETTINGS:
@@ -1124,7 +1162,7 @@ class Engine:
         with os.fdopen(log, "ab") as output:
             process = subprocess.Popen(["bash", launcher, "start"], cwd=source, stdin=subprocess.DEVNULL, stdout=output, stderr=output,
                                        env=clean_environment(), start_new_session=True)
-        values = read_existing(Path(source))
+        values = self._migration_configuration(Path(source))
         port = int(values.get("NUWAX_GATEWAY_PORT", "8766") or "8766")
         import urllib.request
         deadline = time.monotonic() + 90

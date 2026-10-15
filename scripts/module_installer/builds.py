@@ -10,9 +10,11 @@ import os
 import platform
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
+import urllib.parse
 import urllib.request
 import uuid
 import zipfile
@@ -272,7 +274,16 @@ def _checkout(cache: Path, source: tuple[str, str], run: Callable, *, role: str)
     return destination
 
 
-def _download(url: str, destination: Path) -> None:
+def _download(url: str, destination: Path, *, trusted_hosts: Sequence[str] = ()) -> None:
+    def trusted(address: str) -> bool:
+        parsed = urllib.parse.urlsplit(address)
+        return (
+            parsed.scheme == "https" and parsed.hostname in trusted_hosts and parsed.port in (None, 443)
+            and not parsed.username and not parsed.password
+        )
+
+    if trusted_hosts and not trusted(url):
+        raise RuntimeError("工具链下载地址不是受信任的官方地址")
     destination.parent.mkdir(parents=True, exist_ok=True)
     for attempt in range(3):
         fd, raw_path = tempfile.mkstemp(prefix=".download-", dir=str(destination.parent))
@@ -281,6 +292,8 @@ def _download(url: str, destination: Path) -> None:
             with os.fdopen(fd, "wb") as output, urllib.request.urlopen(url, timeout=60) as response:
                 if not response.geturl().startswith("https://"):
                     raise RuntimeError("工具链下载不能降级到未加密地址")
+                if trusted_hosts and not trusted(response.geturl()):
+                    raise RuntimeError("工具链下载跳转不是受信任的官方地址")
                 shutil.copyfileobj(response, output)
             temporary.replace(destination)
             return
@@ -307,41 +320,124 @@ def _protocol_compiler(cache: Path) -> dict[str, str]:
         if configured:
             raise RuntimeError("指定的PROTOC不可用或不支持当前协议的optional字段")
     architecture = {"arm64": "aarch64", "amd64": "x86_64"}.get(platform.machine().lower(), platform.machine().lower())
-    archives = {
-        "x86_64": ("x86_64", "f853e691868d0557425ea290bf7ba6384eef2fa9b04c323afab49a770ba9da80"),
-        "aarch64": ("aarch_64", "9eae1f20f70cccc912d1c318c3929b86aebf5afd4b0f32c196ef682c222ed5ae"),
-    }
-    if architecture not in archives:
+    archives = {"x86_64": "x86_64", "aarch64": "aarch_64"}
+    if platform.system() != "Linux" or architecture not in archives:
         raise RuntimeError("当前架构没有已验证的协议编译器")
-    name, expected = archives[architecture]
-    archive = cache / "downloads" / ("protoc-25.3-linux-" + name + ".zip")
-    if not archive.is_file() or hashlib.sha256(archive.read_bytes()).hexdigest() != expected:
-        _download("https://github.com/protocolbuffers/protobuf/releases/download/v25.3/" + archive.name, archive)
-    if hashlib.sha256(archive.read_bytes()).hexdigest() != expected:
-        raise RuntimeError("官方协议编译器下载摘要不符")
-    destination = cache / "tools" / ("protoc-25.3-" + architecture)
-    with zipfile.ZipFile(archive) as source:
-        for item in source.infolist():
-            path = PurePosixPath(item.filename)
-            if item.is_dir() or not (item.filename == "bin/protoc" or item.filename.startswith("include/")):
-                continue
-            if path.is_absolute() or ".." in path.parts or "\\" in item.filename:
-                raise RuntimeError("官方协议编译器包含越界路径")
-            target = destination.joinpath(*path.parts)
-            data = source.read(item)
-            if target.is_symlink():
-                raise RuntimeError("协议编译器缓存不接受链接文件")
-            if not target.is_file() or target.read_bytes() != data:
+    archive = cache / "downloads" / ("protoc-25.3-linux-" + archives[architecture] + ".zip")
+    url = "https://github.com/protocolbuffers/protobuf/releases/download/v25.3/" + archive.name
+    parent = _cache_parent(cache, "tools")
+    destination = _cache_destination(parent, "protoc-25.3-" + architecture)
+    marker_name = "neh-protoc-install.json"
+
+    def member_path(name: str) -> PurePosixPath:
+        path = PurePosixPath(name)
+        if not path.parts or path.is_absolute() or ".." in path.parts or "\\" in name or path.as_posix() != name.rstrip("/"):
+            raise RuntimeError("官方协议编译器包含越界路径")
+        return path
+
+    def file_state(path: Path, base: Path) -> list[int]:
+        # 用轻量文件元数据确认本机已完成的工作；缓存复用不读取内容或计算摘要。
+        relative = path.relative_to(base)
+        current = base
+        for part in relative.parts:
+            current = current / part
+            if current.is_symlink():
+                raise RuntimeError("协议编译器缓存不接受链接文件或目录")
+        info = path.stat()
+        if not stat.S_ISREG(info.st_mode):
+            raise RuntimeError("协议编译器缓存需要普通文件")
+        return [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_mode]
+
+    def read_record(path: Path) -> dict:
+        if path.is_symlink():
+            raise RuntimeError("协议编译器缓存记录不接受链接文件")
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            return value if isinstance(value, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def result(directory: Path) -> dict[str, str]:
+        program = directory / "bin/protoc"
+        _executable(program)
+        if subprocess.check_output([str(program), "--version"], text=True, timeout=30).strip() != "libprotoc 25.3":
+            raise RuntimeError("官方协议编译器版本不符")
+        return {"PROTOC": str(program), "PROTOC_INCLUDE": str(directory / "include")}
+
+    receipt = read_record(destination / marker_name)
+    files = receipt.get("files")
+    required = {"bin/protoc", "include/google/protobuf/descriptor.proto"}
+    if (
+        receipt.get("source") == url and type(receipt.get("recipe")) is int and receipt["recipe"] == 1
+        and isinstance(files, dict) and required.issubset(files)
+    ):
+        complete = True
+        for name, expected in files.items():
+            path = member_path(name)
+            try:
+                if file_state(destination.joinpath(*path.parts), destination) != expected:
+                    complete = False
+            except OSError:
+                complete = False
+        if complete:
+            return result(destination)
+
+    # 仅接受固定官方版本的 HTTPS 下载；记录保留已下载文件，供解压中断后离线重试。
+    # 未知或已改变的 ZIP 不能仅凭文件名相符就获得执行许可。
+    download_record = archive.with_suffix(".download.json")
+    saved = read_record(download_record)
+    try:
+        admitted = saved == {"source": url, "file": file_state(archive, archive.parent)}
+    except OSError:
+        admitted = False
+    if not admitted:
+        _download(url, archive, trusted_hosts=("github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"))
+        atomic_write(download_record, json.dumps({"source": url, "file": file_state(archive, archive.parent)}) + "\n", mode=0o600)
+
+    temporary = Path(tempfile.mkdtemp(prefix=".protoc-", dir=str(parent)))
+    previous = None
+    try:
+        files = {}
+        with zipfile.ZipFile(archive) as source:
+            for item in source.infolist():
+                path = member_path(item.filename)
+                mode = stat.S_IFMT(item.external_attr >> 16)
+                if mode not in (0, stat.S_IFREG, stat.S_IFDIR):
+                    raise RuntimeError("官方协议编译器包含链接或特殊文件")
+                if item.is_dir() or not (item.filename == "bin/protoc" or item.filename.startswith("include/")):
+                    continue
+                if item.filename in files:
+                    raise RuntimeError("官方协议编译器包含重复文件")
+                target = temporary.joinpath(*path.parts)
                 target.parent.mkdir(parents=True, exist_ok=True)
-                temporary = target.with_name(target.name + ".new")
-                temporary.write_bytes(data)
-                temporary.chmod(0o755 if item.filename == "bin/protoc" else 0o644)
-                temporary.replace(target)
-    program = destination / "bin/protoc"
-    _executable(program)
-    if subprocess.check_output([str(program), "--version"], text=True, timeout=30).strip() != "libprotoc 25.3":
-        raise RuntimeError("官方协议编译器版本不符")
-    return {"PROTOC": str(program), "PROTOC_INCLUDE": str(destination / "include")}
+                with source.open(item) as content, target.open("xb") as output:
+                    shutil.copyfileobj(content, output)
+                target.chmod(0o755 if item.filename == "bin/protoc" else 0o644)
+                files[item.filename] = file_state(target, temporary)
+        if not required.issubset(files):
+            raise RuntimeError("官方协议编译器缺少程序或协议头文件")
+        result(temporary)
+        atomic_write(temporary / marker_name, json.dumps({"source": url, "recipe": 1, "files": files}) + "\n", mode=0o600)
+        # 完整解压并核对版本后才发布；替换准备完成之前保留已有安装。
+        _cache_destination(parent, destination.name)
+        if destination.exists():
+            previous = parent / (".protoc-previous-" + uuid.uuid4().hex)
+            _publish_source_directory(destination, previous)
+        try:
+            _publish_source_directory(temporary, destination)
+        except BaseException:
+            if previous is not None and not destination.exists() and not destination.is_symlink():
+                _publish_source_directory(previous, destination)
+            raise
+        if previous is not None:
+            shutil.rmtree(previous)
+        return {"PROTOC": str(destination / "bin/protoc"), "PROTOC_INCLUDE": str(destination / "include")}
+    except (zipfile.BadZipFile, RuntimeError):
+        download_record.unlink(missing_ok=True)
+        raise
+    finally:
+        if temporary.exists():
+            shutil.rmtree(temporary)
 
 
 def _rust_toolchain(cache: Path, run: Callable) -> tuple[Path, dict[str, str]]:

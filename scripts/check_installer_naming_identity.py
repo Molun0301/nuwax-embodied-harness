@@ -46,10 +46,21 @@ class CacheIdentityChecks(unittest.TestCase):
             self.stack.enter_context(patch.object(uuid, name, side_effect=AssertionError("name UUID forbidden")))
         self.stack.enter_context(patch.object(subprocess, "run", side_effect=AssertionError("real command forbidden")))
         self.stack.enter_context(patch.object(subprocess, "Popen", side_effect=AssertionError("real process forbidden")))
+        self.protoc = self.root / "fixture-protoc"
+        self.protoc.write_bytes(b"\x7fELFfixture protoc")
+        self.protoc.chmod(0o755)
+        self.stack.enter_context(patch.dict(os.environ, {"PROTOC": ""}))
+        self.stack.enter_context(patch.object(builds.shutil, "which", side_effect=lambda name: str(self.protoc) if name in ("protoc", str(self.protoc)) else None))
+        self.protoc_queries = self.stack.enter_context(patch.object(subprocess, "check_output", side_effect=self.fake_protoc_version))
         self.stack.enter_context(patch.object(builds.urllib.request, "urlopen", side_effect=AssertionError("network forbidden")))
         self.capture = self.stack.enter_context(patch.object(builds, "_capture", side_effect=self.fake_capture))
         self.stack.enter_context(patch.object(builds.time, "sleep"))
         self.commands = []
+
+    def fake_protoc_version(self, argv, **kwargs):
+        self.assertEqual(argv, [str(self.protoc), "--version"])
+        self.assertEqual(kwargs, {"text": True, "timeout": 30})
+        return "libprotoc 25.3\n"
 
     def fake_capture(self, argv, **kwargs):
         self.assertEqual(argv[:2], ("git", "-C"))
@@ -507,6 +518,7 @@ class CacheIdentityChecks(unittest.TestCase):
         cargo = self.root / "cargo"
         seen = []
         def run(argv, **kwargs):
+            self.assertEqual(kwargs["env"]["PROTOC"], str(self.protoc))
             target = Path(argv[argv.index("--target-dir") + 1])
             record = json.loads((self.cache / "build/rust/target-paths-v1.json").read_text())["slots"]["nuwax-workspace"]
             self.assertEqual(target.name, record["path"])
@@ -520,6 +532,7 @@ class CacheIdentityChecks(unittest.TestCase):
             result = builds.build_modules(source, prefix, self.cache, ("navigation", "follow"), 2, run)
             self.assertEqual(set(result), {"nuwax-nav-stack", "nuwax-person-follow"})
             self.assertEqual(seen[0], seen[1])
+            self.protoc_queries.assert_called_once()
 
     def test_failed_fake_cargo_reuses_same_target(self):
         source = self.root / "source"
@@ -528,6 +541,7 @@ class CacheIdentityChecks(unittest.TestCase):
         manifest.with_name("Cargo.lock").write_text("fixture")
         seen = []
         def fail(argv, **kwargs):
+            self.assertEqual(kwargs["env"]["PROTOC"], str(self.protoc))
             seen.append(argv[argv.index("--target-dir") + 1])
             raise RuntimeError("fake cargo")
         with patch.object(builds.os, "geteuid", return_value=1000), patch.object(builds, "_rust_toolchain", return_value=(self.root / "cargo", {})):
@@ -535,6 +549,7 @@ class CacheIdentityChecks(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "fake cargo"):
                     builds.build_modules(source, self.root / "prefix", self.cache, ("navigation",), 2, fail)
         self.assertEqual(seen[0], seen[1])
+        self.assertEqual(self.protoc_queries.call_count, 2)
 
     def build_slam_fixture(self, prefix):
         cache = self.cache / "slam2d-dependencies"
@@ -690,6 +705,11 @@ class CacheIdentityChecks(unittest.TestCase):
             if argv[0] == "cmake":
                 self.assertNotIn("NUWAX_SLAM2D_DEPENDENCY_PREFIX", kwargs.get("env", {}))
                 return
+            if argv[0] == "patchelf":
+                self.assertEqual(tuple(argv[1:3]), ("--set-rpath", "$ORIGIN/../lib:$ORIGIN/../lib64"))
+                self.assertEqual(Path(argv[3]), prefix / "bin/nuwax-slam-2d-worker")
+                self.assertTrue(Path(argv[3]).is_file())
+                return
             self.assertEqual(argv[0], str(cargo))
             target = Path(argv[argv.index("--target-dir") + 1])
             binary = argv[argv.index("--bin") + 1]
@@ -707,6 +727,7 @@ class CacheIdentityChecks(unittest.TestCase):
         self.assertEqual(environments["nuwax-slam-2d-worker"]["NUWAX_SLAM2D_DEPENDENCY_PREFIX"], str(prefix))
         for name, environment in environments.items():
             self.assertEqual(environment["FIXTURE_BASE_ENV"], "retained")
+            self.assertEqual(environment["PROTOC"], str(self.protoc))
             if name != "nuwax-slam-2d-worker":
                 self.assertNotIn("NUWAX_SLAM2D_DEPENDENCY_PREFIX", environment)
         self.assertEqual(os.environ.get("NUWAX_SLAM2D_DEPENDENCY_PREFIX"), ambient)

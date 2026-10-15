@@ -10,7 +10,7 @@ from pathlib import Path
 from scripts.neh_bootstrap import MAX_MANAGER_BYTES, unpack_manager, switch_link, version_tuple
 
 from . import MANAGER_REVISION
-from .common import ManagerError, digest_file, identifier, read_json
+from .common import ManagerError, atomic_json, digest_file, identifier, read_json
 from .releases import download, validate_url
 from .runtime import clean_environment, run_command
 
@@ -97,6 +97,7 @@ def apply_manager(engine, job):
             path = target / entry["path"]
             if not path.is_file() or digest_file(path) != entry["sha256"]:
                 raise ManagerError("manager_state", "已有候选管理版本文件已改变。", 409)
+    atomic_json(target / "installed.json", {"complete": True, "product": "neh-manager", "version": manifest["version"]})
     engine._cancelled(job["id"])
     engine._journal(job, manager_previous=str(previous) if previous else None, manager_candidate=str(target), manager_switch=True)
     engine._progress(job, "manager_switch", 90, "切换管理程序，业务拥有方保持运行")

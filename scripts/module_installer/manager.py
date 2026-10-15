@@ -24,6 +24,9 @@ from .builds import build_modules, describe_builds, prune_build_cache
 from .catalog import ROBOT_REQUIREMENTS, module_imports, module_requirements, module_system_packages, resolve_modules
 from .runtime import read_existing, read_settings, write_runtime
 
+# Increment when dependency preparation changes without a requirements change.
+DEPENDENCY_RECIPE_VERSION = 1
+
 
 class InstallError(RuntimeError):
     """向使用者展示明确的安装失败原因。"""
@@ -359,6 +362,9 @@ def _prepare_models(request: InstallRequest, prefix: Path, run) -> None:
             if target.resolve() != (output / directory).resolve():
                 if not target.is_dir():
                     raise InstallError(f"自定义{kind}记忆模型目录不存在：{target}；安装器不会为它下载另一个默认模型。")
+                other_kind = "image" if kind == "text" else "text"
+                run([python, "scripts/prepare_memory_models.py", "--validate-only",
+                     "--" + kind + "-output-dir", str(target), "--skip-" + other_kind])
                 arguments.append("--skip-" + kind)
         if len(arguments) < 2:
             run([python, "scripts/prepare_memory_models.py", "--output-root", str(output)] + arguments)
@@ -380,9 +386,11 @@ def _verify_prefix(prefix: Path, modules: Sequence[str]) -> None:
         raise InstallError("安装产物不完整：" + ", ".join(missing))
 
 
-def check_prerequisites(request: InstallRequest, hardware) -> str:
+def check_prerequisites(request: InstallRequest, hardware, *, system_packages_managed: bool = False) -> str:
     """安装与只读诊断共用准入检查，返回实际可用的解释器。"""
-    if sys.platform != "linux" or hardware.os_id not in ("ubuntu", "debian", "raspbian", "linuxmint"):
+    if sys.platform != "linux":
+        raise InstallError("当前自动安装支持 Linux。")
+    if not system_packages_managed and hardware.os_id not in ("ubuntu", "debian", "raspbian", "linuxmint"):
         raise InstallError("当前自动安装支持 Debian（操作系统）及 Ubuntu（操作系统）系列；其它系统可以查看 --dry-run 计划。")
     if request.jobs < 1:
         raise InstallError("编译并行数必须大于零。")

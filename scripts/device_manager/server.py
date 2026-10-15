@@ -43,6 +43,7 @@ class ManagerServer(ThreadingHTTPServer):
     allow_reuse_address = True
 
     def __init__(self, address, engine, static_root=None):
+        self.address_family = socket.AF_INET6 if ":" in address[0] else socket.AF_INET
         self.engine = engine
         self.authentication = Authentication(engine)
         self.static_root = Path(static_root or Path(__file__).parent / "static").resolve()
@@ -462,9 +463,10 @@ def serve(engine, host="127.0.0.1", port=8765):
         # 业务记录或配置异常不能阻止独立管理页启动；接口继续提供实际诊断。
         print("业务自动启动预检失败，管理入口继续运行：" + getattr(exc, "code", type(exc).__name__), flush=True)
     server = ManagerServer((host, port), engine)
-    public_url = "http://{}:{}".format(host, server.server_port) if host not in ("0.0.0.0", "::") else ""
+    address = "[" + host + "]" if ":" in host else host
+    public_url = "http://{}:{}".format(address, server.server_port) if host not in ("0.0.0.0", "::") else ""
     atomic_json(engine.home / "config/server.json", {"process": process_identity(os.getpid()), "host": host, "port": server.server_port, "public_url": public_url})
-    print("NEH管理台：http://{}:{}".format(host, server.server_port), flush=True)
+    print("NEH管理台：http://{}:{}".format(address, server.server_port), flush=True)
     try:
         server.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:

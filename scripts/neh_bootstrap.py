@@ -254,7 +254,7 @@ def service_text(home, python, host, port, user=None):
 
 
 def manager_url(host, port):
-    local = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
+    local = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(host, host)
     return "http://%s:%s/" % ("[" + local + "]" if ":" in local else local, port)
 
 
@@ -406,15 +406,18 @@ def stop_local_manager(home):
     path = home / "manager/bootstrap.pid"
     if not path.is_file():
         return
+    stopped = None
     try:
         pid = int(path.read_text().strip())
         proc = Path("/proc") / str(pid)
         arguments = (proc / "cmdline").read_bytes().split(b"\0")
+        root = (proc / "cwd").resolve()
         if (pid <= 1 or proc.stat().st_uid != os.getuid() or b"scripts.device_manager" not in arguments
                 or b"--home" not in arguments or os.fsencode(str(home)) not in arguments
-                or home / "manager/versions" not in (proc / "cwd").resolve().parents):
+                or home / "manager/versions" not in root.parents):
             raise BootstrapError("既有后台进程身份不匹配，拒绝发送停止信号")
         os.kill(pid, signal.SIGTERM)
+        stopped = {"command": [os.fsdecode(value) for value in arguments if value], "cwd": root}
         deadline = time.monotonic() + 15
         while proc.exists() and time.monotonic() < deadline:
             try:
@@ -429,6 +432,17 @@ def stop_local_manager(home):
     except (FileNotFoundError, ProcessLookupError):
         pass
     path.unlink(missing_ok=True)
+    return stopped
+
+
+def start_local_manager(home, command, root):
+    log_path = home / "logs/manager.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("ab") as output:
+        process = subprocess.Popen(command, cwd=str(root), env=python_environment(), stdout=output,
+                                   stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
+    (home / "manager/bootstrap.pid").write_text(str(process.pid), encoding="utf-8")
+    return process
 
 
 def launch(args, python, instance_id, manager_version):
@@ -449,17 +463,12 @@ def launch(args, python, instance_id, manager_version):
         url = activate_service(args, python, units / "neh-manager.service", ["systemctl", "--user"], "neh-manager.service")
         print("用户服务已安装；开机无人登录运行需要系统管理员为该用户启用持续运行。")
         return url
-    stop_local_manager(home)
-    log_path = home / "logs/manager.log"
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("ab") as output:
-        process = subprocess.Popen(cli_command(home, python, "serve", "--host", args.host, "--port", str(args.port)),
-                                   cwd=str(root), env=python_environment(), stdout=output, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                                   start_new_session=True)
-    (home / "manager/bootstrap.pid").write_text(str(process.pid), encoding="utf-8")
+    args.stopped_local_manager = stop_local_manager(home)
+    process = start_local_manager(home, cli_command(home, python, "serve", "--host", args.host, "--port", str(args.port)), root)
     try:
         return wait_for_manager(args.host, args.port, instance_id, manager_version)
     except BaseException:
+        process.poll()
         stop_local_manager(home)
         raise
 
@@ -586,23 +595,39 @@ def install(args):
             else:
                 os.replace(str(unpacked), str(target))
             previous = (manager / "current").resolve() if (manager / "current").is_symlink() else None
+            previous_state = {}
             if previous:
                 state = subprocess.run(cli_command(home, python, "status"), cwd=str(previous), text=True,
                                        env=python_environment(), capture_output=True, check=True, timeout=30)
-                if json.loads(state.stdout).get("active_job"):
+                previous_state = json.loads(state.stdout)
+                if previous_state.get("active_job"):
                     raise BootstrapError("当前有管理任务正在执行，请完成后再更新管理程序")
             args.new_install = previous is None
             service_command = ["systemctl", "--user"] if args.service == "user" else ["systemctl"]
             service_name = "neh-manager.service" if args.service == "user" else "neh-manager-%s.service" % os.getuid()
             was_active = bool(previous and args.service != "none" and subprocess.run(
                 service_command + ["is-active", "--quiet", service_name], check=False).returncode == 0)
+            # 备份只存在于权限0700的准备目录内；保留文件权限及链接，不输出凭据。
+            saved_files = {}
+            for relative in ("config/settings.json", "config/credentials.json", "config/manager-listen.json", "bin/neh"):
+                path = home / relative
+                backup = stage / "rollback" / relative
+                if path.exists() or path.is_symlink():
+                    backup.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                    shutil.copy2(str(path), str(backup), follow_symlinks=False)
+                    saved_files[path] = backup
+                else:
+                    saved_files[path] = None
+            args.stopped_local_manager = None
             switch_link(manager / "current", target)
             binary = home / "bin/neh"
-            binary.parent.mkdir(parents=True, exist_ok=True)
-            binary.write_text("#!/bin/sh\nunset PYTHONHOME PYTHONPATH\nexport PYTHONNOUSERSITE=1\ncd " + shlex.quote(str(manager / "current")) + " || exit 1\nexec "
-                              + " ".join(shlex.quote(part) for part in cli_command(home, python)) + ' "$@"\n', encoding="utf-8")
-            binary.chmod(0o755)
             try:
+                binary.parent.mkdir(parents=True, exist_ok=True)
+                launcher = stage / "neh-launcher"
+                launcher.write_text("#!/bin/sh\nunset PYTHONHOME PYTHONPATH\nexport PYTHONNOUSERSITE=1\ncd " + shlex.quote(str(manager / "current")) + " || exit 1\nexec "
+                                    + " ".join(shlex.quote(part) for part in cli_command(home, python)) + ' "$@"\n', encoding="utf-8")
+                launcher.chmod(0o755)
+                os.replace(str(launcher), str(binary))
                 if not args.catalog and not args.manager_package:
                     settings = cli_command(home, python, "settings", "--source-repository", args.repository,
                                            "--source-branch", args.branch)
@@ -620,8 +645,19 @@ def install(args):
                 instance_id = json.loads(state.stdout).get("instance_id")
                 if not instance_id:
                     raise BootstrapError("管理包缺少受管实例身份，无法核对实际启动程序")
+                # 监听记录与设置、启动器一起提交；启动失败时恢复旧值。
+                listen_path = home / "config/manager-listen.json"
+                temporary = stage / "manager-listen.json"
+                temporary.write_text(json.dumps({"host": args.host, "port": args.port}) + "\n")
+                temporary.chmod(0o600)
+                os.replace(str(temporary), str(listen_path))
                 url = launch(args, python, instance_id, manifest["version"])
             except BaseException:
+                for path, backup in saved_files.items():
+                    if backup is None:
+                        path.unlink(missing_ok=True)
+                    else:
+                        os.replace(str(backup), str(path))
                 if previous:
                     switch_link(manager / "current", previous)
                     if was_active:
@@ -630,15 +666,35 @@ def install(args):
                         else:
                             subprocess.run(["sudo", "-n", "/usr/local/libexec/neh-system-helper", "restart-manager"],
                                            input="{}", text=True, check=True)
+                    elif args.stopped_local_manager:
+                        stopped = args.stopped_local_manager
+                        command = stopped["command"]
+                        start_local_manager(home, command, stopped["cwd"])
+                        wait_for_manager(command[command.index("--host") + 1], int(command[command.index("--port") + 1]),
+                                         previous_state["instance_id"], previous_state["manager_version"])
                 else:
                     (manager / "current").unlink()
                 raise
-            # 成功后记住端口，重跑安装仍打开同一设备地址。
-            listen_path = home / "config/manager-listen.json"
-            temporary = listen_path.with_suffix(".new")
-            temporary.write_text(json.dumps({"host": args.host, "port": args.port}) + "\n")
-            temporary.chmod(0o600)
-            os.replace(temporary, listen_path)
+            # 服务已通过核验才登记可清理版本。复用管理事务锁，清理失败不回退已启动服务。
+            try:
+                with (home / "config/transaction.lock").open("a") as state_lock:
+                    fcntl.flock(state_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    installed = stage / "installed.json"
+                    installed.write_text(json.dumps({"complete": True, "product": "neh-manager", "version": manifest["version"]}) + "\n")
+                    installed.chmod(0o600)
+                    os.replace(str(installed), str(target / "installed.json"))
+                    if previous and previous != target:
+                        switch_link(manager / "previous", previous)
+                    cleanup = subprocess.run([str(python), "-c",
+                        "import json, sys; from pathlib import Path; from scripts.device_manager.storage import prune_storage; "
+                        "print(json.dumps(prune_storage(Path(sys.argv[1]), package_root=Path.cwd())))", str(home)],
+                        cwd=str(target), env=python_environment(), capture_output=True, text=True, check=True)
+                    cleaned = json.loads(cleanup.stdout)
+                    print("旧版本与缓存清理：移除%s项。" % len(cleaned["removed"]), flush=True)
+                    for warning in cleaned["warnings"]:
+                        print("清理提示：" + warning["error"], flush=True)
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                print("管理服务已启动，旧版本与缓存清理未完成（%s）；可在空闲时重试。" % type(exc).__name__, flush=True)
     print("NEH管理服务已就绪：" + url)
     if args.host in {"0.0.0.0", "::"}:
         addresses = device_urls(args.port)

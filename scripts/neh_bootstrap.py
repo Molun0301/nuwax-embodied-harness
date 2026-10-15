@@ -13,6 +13,7 @@ import pwd
 import re
 import signal
 import shlex
+import socket
 import shutil
 import subprocess
 import sys
@@ -252,10 +253,98 @@ def service_text(home, python, host, port, user=None):
     return "\n".join(unit)
 
 
+def manager_url(host, port):
+    local = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
+    return "http://%s:%s/" % ("[" + local + "]" if ":" in local else local, port)
+
+
+def manager_session(host, port):
+    # 本机身份探测不经过用户代理，也不跟随其它服务的重定向。
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *arguments, **options):
+            return None
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+    with opener.open(manager_url(host, port) + "api/manager/session", timeout=1) as response:
+        return json.loads(response.read(64 * 1024))
+
+
+def choose_manager_port(home, host, requested=None):
+    """默认安装复用本安装端口，或选择空闲端口；不占用业务网关端口。"""
+    def saved(name):
+        path = home / "config" / name
+        try:
+            value = json.loads(path.read_text())
+            return value if isinstance(value, dict) else {}
+        except (OSError, ValueError):
+            return {}
+    gateway_port = saved("settings.json").get("gateway_port", 8766)
+    remembered = saved("manager-listen.json").get("port")
+    identity = home / "config/instance-id"
+    instance_id = identity.read_text().strip() if identity.is_file() else ""
+    candidates = [requested] if requested is not None else [remembered, *range(8765, 8866)]
+    for port in dict.fromkeys(candidates):
+        if type(port) is not int or not 1 <= port <= 65535 or port == gateway_port:
+            continue
+        try:
+            with socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET, socket.SOCK_STREAM) as listener:
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                listener.bind((host, port))
+            if requested is None and port != (remembered or 8765):
+                print("默认管理端口已被占用，自动使用端口%s。" % port, flush=True)
+            return port
+        except OSError:
+            if instance_id:
+                try:
+                    if manager_session(host, port).get("instance_id") == instance_id:
+                        return port
+                except (OSError, ValueError, AttributeError):
+                    pass
+    raise BootstrapError("指定管理端口不可用或与业务端口冲突；省略--port可自动选择空闲端口" if requested is not None
+                         else "未找到可用管理端口，请检查8765至8865的监听情况")
+
+
+def wait_for_manager(host, port, instance_id, manager_version):
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        try:
+            actual = manager_session(host, port)
+            if actual.get("instance_id") == instance_id and actual.get("manager_version") == manager_version:
+                return manager_url(host, port)
+        except (OSError, ValueError, AttributeError):
+            pass
+        time.sleep(0.2)
+    raise BootstrapError("管理服务未通过实例和版本核验；请查看logs/manager.log或系统服务日志")
+
+
+def activate_service(args, python, path, command, name, user=None):
+    """启动失败先停止新服务并恢复服务文件，外层随后回退管理程序链接。"""
+    previous = path.read_bytes() if path.is_file() and not args.new_install else None
+    enabled = subprocess.run(command + ["is-enabled", "--quiet", name], check=False).returncode == 0 if previous else False
+    try:
+        path.write_text(service_text(args.home, python, args.host, args.port, user), encoding="utf-8")
+        path.chmod(0o644)
+        subprocess.run(command + ["daemon-reload"], check=True)
+        subprocess.run(command + ["enable", name], check=True)
+        subprocess.run(command + ["restart", name], check=True)
+        return wait_for_manager(args.host, args.port, args.expected_instance, args.expected_version)
+    except BaseException:
+        subprocess.run(command + ["stop", name], check=True)
+        if previous is None:
+            subprocess.run(command + ["disable", name], check=True)
+            path.unlink(missing_ok=True)
+        else:
+            path.write_bytes(previous)
+            subprocess.run(command + ["enable" if enabled else "disable", name], check=True)
+        subprocess.run(command + ["daemon-reload"], check=True)
+        raise
+
+
 def provision_system(args):
     """此入口仅在终端明确安装时经sudo调用；网页无权调用本程序。"""
     if os.geteuid() != 0 or not args.user or not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_.-]*\$?", args.user):
         raise BootstrapError("系统服务安装需要有效普通用户及管理员权限")
+    if args.service == "system" and (args.port is None or not args.expected_instance or not args.expected_version):
+        raise BootstrapError("系统服务安装缺少已选择端口或待验证的管理身份")
     account = pwd.getpwnam(args.user)
     if account.pw_uid == 0:
         raise BootstrapError("管理服务必须使用普通用户")
@@ -296,11 +385,7 @@ def provision_system(args):
     if args.service == "system":
         name = "neh-manager-%s.service" % account.pw_uid
         target = Path("/etc/systemd/system") / name
-        target.write_text(service_text(home, args.python, args.host, args.port, args.user), encoding="utf-8")
-        target.chmod(0o644)
-        subprocess.run(["systemctl", "daemon-reload"], check=True)
-        subprocess.run(["systemctl", "enable", name], check=True)
-        subprocess.run(["systemctl", "restart", name], check=True)
+        activate_service(args, args.python, target, ["systemctl"], name, args.user)
     return 0
 
 
@@ -349,40 +434,34 @@ def stop_local_manager(home):
 def launch(args, python, instance_id, manager_version):
     home = args.home.resolve()
     root = home / "manager/current"
+    args.expected_instance, args.expected_version = instance_id, manager_version
     if args.service == "system":
         command = ["sudo", str(Path(sys.executable).resolve()), "-I", str(Path(__file__).resolve()), "--provision-system", "--user", pwd.getpwuid(os.getuid()).pw_name,
-                   "--home", str(home), "--python", str(python), "--host", args.host, "--port", str(args.port), "--service", "system"]
+                   "--home", str(home), "--python", str(python), "--host", args.host, "--port", str(args.port), "--service", "system",
+                   "--expected-instance", instance_id, "--expected-version", manager_version]
+        if args.new_install:
+            command.append("--new-install")
         subprocess.run(command, check=True)
-    elif args.service == "user":
+        return manager_url(args.host, args.port)
+    if args.service == "user":
         units = Path.home() / ".config/systemd/user"
         units.mkdir(parents=True, exist_ok=True)
-        (units / "neh-manager.service").write_text(service_text(home, python, args.host, args.port), encoding="utf-8")
-        subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
-        subprocess.run(["systemctl", "--user", "enable", "neh-manager.service"], check=True)
-        subprocess.run(["systemctl", "--user", "restart", "neh-manager.service"], check=True)
+        url = activate_service(args, python, units / "neh-manager.service", ["systemctl", "--user"], "neh-manager.service")
         print("用户服务已安装；开机无人登录运行需要系统管理员为该用户启用持续运行。")
-    else:
+        return url
+    stop_local_manager(home)
+    log_path = home / "logs/manager.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("ab") as output:
+        process = subprocess.Popen(cli_command(home, python, "serve", "--host", args.host, "--port", str(args.port)),
+                                   cwd=str(root), env=python_environment(), stdout=output, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                   start_new_session=True)
+    (home / "manager/bootstrap.pid").write_text(str(process.pid), encoding="utf-8")
+    try:
+        return wait_for_manager(args.host, args.port, instance_id, manager_version)
+    except BaseException:
         stop_local_manager(home)
-        log_path = home / "logs/manager.log"
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        with log_path.open("ab") as output:
-            process = subprocess.Popen(cli_command(home, python, "serve", "--host", args.host, "--port", str(args.port)),
-                                       cwd=str(root), env=python_environment(), stdout=output, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                                       start_new_session=True)
-        (home / "manager/bootstrap.pid").write_text(str(process.pid), encoding="utf-8")
-    local_host = "127.0.0.1" if args.host in {"0.0.0.0", "::"} else args.host
-    url = "http://%s:%s/" % ("[" + local_host + "]" if ":" in local_host else local_host, args.port)
-    deadline = time.monotonic() + 30
-    while time.monotonic() < deadline:
-        try:
-            with urllib.request.urlopen(url + "api/manager/session", timeout=1) as response:
-                actual = json.load(response)
-                if (response.status == 200 and actual.get("instance_id") == instance_id
-                        and actual.get("manager_version") == manager_version):
-                    return url
-        except (OSError, ValueError):
-            time.sleep(0.2)
-    raise BootstrapError("未找到本安装的管理服务，可能端口已被占用；请查看logs/manager.log或系统服务日志")
+        raise
 
 
 def read_token(path):
@@ -454,6 +533,7 @@ def install(args):
     token = read_token(args.token_file)
     with (manager / "bootstrap.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        args.port = choose_manager_port(home, args.host, args.port)
         with tempfile.TemporaryDirectory(prefix=".prepare-", dir=str(versions)) as temporary:
             stage = Path(temporary)
             metadata = None
@@ -511,6 +591,11 @@ def install(args):
                                        env=python_environment(), capture_output=True, check=True, timeout=30)
                 if json.loads(state.stdout).get("active_job"):
                     raise BootstrapError("当前有管理任务正在执行，请完成后再更新管理程序")
+            args.new_install = previous is None
+            service_command = ["systemctl", "--user"] if args.service == "user" else ["systemctl"]
+            service_name = "neh-manager.service" if args.service == "user" else "neh-manager-%s.service" % os.getuid()
+            was_active = bool(previous and args.service != "none" and subprocess.run(
+                service_command + ["is-active", "--quiet", service_name], check=False).returncode == 0)
             switch_link(manager / "current", target)
             binary = home / "bin/neh"
             binary.parent.mkdir(parents=True, exist_ok=True)
@@ -539,9 +624,21 @@ def install(args):
             except BaseException:
                 if previous:
                     switch_link(manager / "current", previous)
+                    if was_active:
+                        if args.service == "user":
+                            subprocess.run(service_command + ["restart", service_name], check=True)
+                        else:
+                            subprocess.run(["sudo", "-n", "/usr/local/libexec/neh-system-helper", "restart-manager"],
+                                           input="{}", text=True, check=True)
                 else:
                     (manager / "current").unlink()
                 raise
+            # 成功后记住端口，重跑安装仍打开同一设备地址。
+            listen_path = home / "config/manager-listen.json"
+            temporary = listen_path.with_suffix(".new")
+            temporary.write_text(json.dumps({"host": args.host, "port": args.port}) + "\n")
+            temporary.chmod(0o600)
+            os.replace(temporary, listen_path)
     print("NEH管理服务已就绪：" + url)
     if args.host in {"0.0.0.0", "::"}:
         addresses = device_urls(args.port)
@@ -574,7 +671,7 @@ def parser():
     result.add_argument("--sha256", help="本地管理包预期摘要")
     result.add_argument("--token-file", type=Path, help="私有下载凭据文件，权限0600")
     result.add_argument("--host", default="0.0.0.0")
-    result.add_argument("--port", type=int, default=8765)
+    result.add_argument("--port", type=int, help="管理端口；默认复用既有端口或自动选择空闲端口")
     result.add_argument("--channel", choices=("stable", "preview"), default="stable")
     result.add_argument("--service", choices=("system", "user", "none"), default="system",
                         help="默认安装普通用户运行的系统服务；none仅启动本次后台进程")
@@ -582,6 +679,9 @@ def parser():
     result.add_argument("--configure", type=Path, help="读取安装配置JSON并等待结果，适合预安装")
     result.add_argument("--no-browser", action="store_true")
     result.add_argument("--provision-system", action="store_true", help=argparse.SUPPRESS)
+    result.add_argument("--expected-instance", help=argparse.SUPPRESS)
+    result.add_argument("--expected-version", help=argparse.SUPPRESS)
+    result.add_argument("--new-install", action="store_true", help=argparse.SUPPRESS)
     result.add_argument("--user", help=argparse.SUPPRESS)
     result.add_argument("--python", default=sys.executable, help=argparse.SUPPRESS)
     return result
@@ -590,7 +690,7 @@ def parser():
 def main(argv=None):
     args = parser().parse_args(argv)
     try:
-        if not 1 <= args.port <= 65535:
+        if args.port is not None and not 1 <= args.port <= 65535:
             raise BootstrapError("端口必须在1至65535之间")
         if args.cli and args.configure:
             raise BootstrapError("交互向导与无人值守配置不能同时指定")

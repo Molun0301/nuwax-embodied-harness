@@ -2648,10 +2648,11 @@
       function publishSemanticMapInstances() {
         const mapName = activeMapName();
         const previous = state.semanticPublishedKey;
+        if (previous && previous.mapName !== mapName) closeSemanticOverlay();
         if (previous?.snapshot === state.semanticSnapshotKey && previous.mapName === mapName && previous.error === state.semanticError) return;
         state.semanticPublishedKey = { snapshot: state.semanticSnapshotKey, mapName, error: state.semanticError };
         window.dispatchEvent(new CustomEvent("pointcloud3d:semantic-instances", {
-          detail: { instances: semanticMapInstances() },
+          detail: { instances: semanticMapInstances(), selectedId: state.semanticSelectedId },
         }));
       }
       function renderSemanticMemoryStatus() {
@@ -2775,7 +2776,7 @@
           },
         }));
         window.dispatchEvent(new CustomEvent("pointcloud3d:semantic-instances", {
-          detail: { instances: semanticMapInstances() },
+          detail: { instances: semanticMapInstances(), selectedId: state.semanticSelectedId },
         }));
         window.dispatchEvent(new CustomEvent("pointcloud3d:semantic-visibility", {
           detail: { visible: state.showSemanticInstances },
@@ -2951,13 +2952,14 @@
           const points = semanticFootprint(inst, anchor, scale);
           if (points.length < 2) continue;
           const partial = inst.object_extent.source === "observed_points";
+          const selected = inst.instance_id === state.semanticSelectedId || inst.instance_id === state.highlightTarget?.record_id;
           ctx.beginPath();
           ctx.moveTo(points[0].x, points[0].y);
           for (const point of points.slice(1)) ctx.lineTo(point.x, point.y);
           if (points.length > 2) ctx.closePath();
-          ctx.fillStyle = "rgba(245,158,11,.18)";
-          ctx.strokeStyle = "#f59e0b";
-          ctx.lineWidth = 1.5;
+          ctx.fillStyle = selected ? "rgba(138,167,184,.22)" : "rgba(138,167,184,.10)";
+          ctx.strokeStyle = selected ? "rgba(106,150,177,.9)" : "rgba(138,167,184,.55)";
+          ctx.lineWidth = selected ? 2.5 : 1.5;
           ctx.setLineDash(partial ? [5, 3] : []);
           if (points.length > 2) ctx.fill();
           ctx.stroke();
@@ -3047,28 +3049,28 @@
         drawCanvasRoundedRectPath(ctx, left, top, marker.width, marker.height, marker.radius);
         if (fallback || unknownFrame) {
           ctx.setLineDash([4, 3]);
-          ctx.strokeStyle = highlighted ? "#fbbf24" : "#9ca3af";
+          ctx.strokeStyle = highlighted ? "rgba(189,215,229,.95)" : "rgba(148,163,184,.55)";
           ctx.lineWidth = 1.8;
           ctx.stroke();
           ctx.setLineDash([]);
-          ctx.fillStyle = "rgba(51,65,85,0.9)";
+          ctx.fillStyle = highlighted ? "rgba(51,65,85,.84)" : "rgba(51,65,85,.76)";
           ctx.fill();
         } else {
-          ctx.fillStyle = highlighted ? "#fbbf24" : semanticExtent(inst) ? "#f59e0b" : "#cbd5e1";
+          ctx.fillStyle = highlighted ? "rgba(38,55,70,.84)" : "rgba(38,55,70,.76)";
           ctx.fill();
-          ctx.strokeStyle = highlighted ? "#fff" : "#fef3c7";
+          ctx.strokeStyle = highlighted ? "rgba(189,215,229,.95)" : "rgba(151,177,194,.62)";
           ctx.lineWidth = highlighted ? 2.5 : 1.5;
           ctx.stroke();
         }
         if (highlighted) {
-          ctx.strokeStyle = "#fbbf24";
+          ctx.strokeStyle = "rgba(106,150,177,.85)";
           ctx.lineWidth = 2;
           ctx.setLineDash([]);
           drawCanvasRoundedRectPath(ctx, left - 5, top - 5, marker.width + 10, marker.height + 10, marker.radius + 2);
           ctx.stroke();
         }
         ctx.font = marker.font;
-        ctx.fillStyle = fallback || unknownFrame ? "#f8fafc" : "#111827";
+        ctx.fillStyle = highlighted ? "#f1f7fa" : "rgba(232,241,246,.96)";
         ctx.textAlign = "center";
         ctx.textBaseline = "middle";
         ctx.fillText(marker.label, x, y + 0.5);
@@ -3090,13 +3092,13 @@
         const preciseCount = cl.members.length - fallbackCount;
         if (allFallback) {
           ctx.setLineDash([4, 3]);
-          ctx.strokeStyle = highlighted ? "#fbbf24" : "#9ca3af";
+          ctx.strokeStyle = highlighted ? "rgba(189,215,229,.95)" : "rgba(148,163,184,.55)";
           ctx.lineWidth = 2;
-          ctx.fillStyle = "rgba(51,65,85,0.9)";
+          ctx.fillStyle = highlighted ? "rgba(51,65,85,.84)" : "rgba(51,65,85,.76)";
         } else {
           ctx.setLineDash([]);
-          ctx.fillStyle = highlighted ? "#fbbf24" : "#f59e0b";
-          ctx.strokeStyle = highlighted ? "#fbbf24" : "#f59e0b";
+          ctx.fillStyle = highlighted ? "rgba(38,55,70,.84)" : "rgba(38,55,70,.76)";
+          ctx.strokeStyle = highlighted ? "rgba(189,215,229,.95)" : "rgba(151,177,194,.62)";
           ctx.lineWidth = highlighted ? 2.5 : 2;
         }
         drawCanvasRoundedRectPath(ctx, left, top, marker.width, marker.height, marker.radius);
@@ -3108,26 +3110,26 @@
           const barY = top + marker.height + 4;
           ctx.lineCap = "butt";
           ctx.beginPath();
-          ctx.strokeStyle = "#f59e0b";
+          ctx.strokeStyle = "rgba(138,167,184,.65)";
           ctx.lineWidth = 3;
           ctx.moveTo(left, barY);
           ctx.lineTo(left + marker.width * ratio, barY);
           ctx.stroke();
           ctx.beginPath();
-          ctx.strokeStyle = "#6b7280";
+          ctx.strokeStyle = "rgba(148,163,184,.55)";
           ctx.lineWidth = 3;
           ctx.moveTo(left + marker.width * ratio, barY);
           ctx.lineTo(left + marker.width, barY);
           ctx.stroke();
         }
         if (highlighted) {
-          ctx.strokeStyle = "#fbbf24";
+          ctx.strokeStyle = "rgba(106,150,177,.85)";
           ctx.lineWidth = 2;
           drawCanvasRoundedRectPath(ctx, left - 5, top - 5, marker.width + 10, marker.height + 10, marker.radius + 2);
           ctx.stroke();
         }
         ctx.font = marker.font;
-        ctx.fillStyle = allFallback ? "#f8fafc" : "#111827";
+        ctx.fillStyle = highlighted ? "#f1f7fa" : "rgba(232,241,246,.96)";
         ctx.textAlign = "center";
         ctx.textBaseline = "middle";
         ctx.fillText(marker.label, x, y + 0.5);
@@ -3208,6 +3210,14 @@
       }
       function closeSemanticOverlay() {
         const el = document.getElementById("semanticOverlay");
+        const selectedId = state.semanticSelectedId ?? el?.dataset.instanceId;
+        state.semanticSelectedId = null;
+        window.pointcloud3d?.setSemanticSelectedId(null);
+        if (selectedId != null && state.highlightTarget?.record_id === selectedId && !state.highlightTarget.target_pose) {
+          state.highlightTarget = null;
+        }
+        for (const row of els.semanticMemoryList?.querySelectorAll?.(".semantic-memory-row") || []) row.setAttribute("aria-pressed", "false");
+        if (selectedId != null) requestMapDraw(false);
         if (el) {
           el.close();
           el.remove();
@@ -3393,6 +3403,7 @@
       function showSemanticInstanceDetail(inst) {
         closeSemanticOverlay();
         state.semanticSelectedId = inst.instance_id;
+        window.pointcloud3d?.setSemanticSelectedId(inst.instance_id);
         state.highlightTarget = { record_id: inst.instance_id, target_name: semanticInstanceName(inst) };
         for (const row of els.semanticMemoryList?.querySelectorAll?.(".semantic-memory-row") || []) {
           row.setAttribute("aria-pressed", String(row.dataset.instanceId === inst.instance_id));

@@ -15,7 +15,7 @@ const COLORS = {
   localPath: 0x69dedc,
   retainedPath: 0xffba78,
   navGoal: 0xa78bfa,
-  semantic: 0xf59e0b,
+  semantic: 0x8aa7b8,
   semanticFallback: 0x94a3b8,
   forbiddenInside: 0xef4444,
   forbiddenOutside: 0xa855f7,
@@ -443,6 +443,9 @@ class PointCloud3DViewer extends PointCloudProcessor {
     this._semanticMarkerGeometry = null;
     this._semanticPreciseMaterial = null;
     this._semanticFallbackMaterial = null;
+    this._semanticSelectedMaterial = null;
+    this._semanticSelectedFallbackMaterial = null;
+    this._semanticSelectedId = null;
     this._lod = 'preview';
     this._pointStyle = DEFAULT_POINT_STYLE;
     this._displayConfig = POINTCLOUD3D_CONFIG;
@@ -677,14 +680,21 @@ class PointCloud3DViewer extends PointCloudProcessor {
     this._scene.add(this._semanticGroup);
     this._semanticMarkerGeometry = new THREE.BoxGeometry(1, 1, 1);
     this._semanticPreciseMaterial = new THREE.MeshBasicMaterial({
-      color: COLORS.semantic, transparent: true, opacity: 0.32, side: THREE.DoubleSide,
+      color: COLORS.semantic, transparent: true, opacity: 0.12, side: THREE.DoubleSide, depthWrite: false,
     });
     this._semanticFallbackMaterial = new THREE.MeshBasicMaterial({
       color: COLORS.semanticFallback,
       transparent: true,
-      opacity: 0.62,
+      opacity: 0.42,
       wireframe: true,
+      depthWrite: false,
     });
+    this._semanticSelectedMaterial = this._semanticPreciseMaterial.clone();
+    this._semanticSelectedMaterial.color.set(0xbdd7e5);
+    this._semanticSelectedMaterial.opacity = 0.26;
+    this._semanticSelectedFallbackMaterial = this._semanticFallbackMaterial.clone();
+    this._semanticSelectedFallbackMaterial.color.set(0xbdd7e5);
+    this._semanticSelectedFallbackMaterial.opacity = 0.72;
     this._semanticRegionLayer = new SemanticRegionLayer(this._scene);
     this._sceneGraphLayer = new SceneGraphLayer(this._scene);
     this._setupSemanticInteraction();
@@ -1740,17 +1750,17 @@ class PointCloud3DViewer extends PointCloudProcessor {
     if (!ctx) return null;
     ctx.font = '600 24px system-ui, sans-serif';
     const textWidth = Math.ceil(ctx.measureText(label).width);
-    canvas.width = Math.max(180, Math.min(420, textWidth + 34));
-    canvas.height = 54;
-    const fontSize = Math.min(24, Math.floor(24 * (canvas.width - 34) / Math.max(1, textWidth)));
+    canvas.width = Math.max(64, Math.min(320, textWidth + 26));
+    canvas.height = 44;
+    const fontSize = Math.min(24, Math.floor(24 * (canvas.width - 26) / Math.max(1, textWidth)));
     ctx.font = `600 ${fontSize}px system-ui, sans-serif`;
-    ctx.fillStyle = fallback ? 'rgba(51,65,85,.86)' : 'rgba(120,53,15,.9)';
+    ctx.fillStyle = fallback ? 'rgba(51,65,85,.5)' : 'rgba(38,55,70,.58)';
     this._drawRoundedRect(ctx, 1, 1, canvas.width - 2, canvas.height - 2, 12);
     ctx.fill();
-    ctx.strokeStyle = fallback ? '#cbd5e1' : '#fde68a';
+    ctx.strokeStyle = fallback ? 'rgba(148,163,184,.55)' : 'rgba(151,177,194,.62)';
     ctx.lineWidth = 2;
     ctx.stroke();
-    ctx.fillStyle = '#ffffff';
+    ctx.fillStyle = 'rgba(232,241,246,.92)';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillText(label, canvas.width / 2, canvas.height / 2 + 1);
@@ -1761,10 +1771,11 @@ class PointCloud3DViewer extends PointCloudProcessor {
       map: texture,
       transparent: true,
       depthTest: false,
+      depthWrite: false,
+      opacity: 0.9,
     });
     const sprite = new THREE.Sprite(material);
-    const width = THREE.MathUtils.clamp(canvas.width / 150, 1.25, 2.8);
-    sprite.scale.set(width, 0.36, 1);
+    sprite.scale.set(canvas.width / 150, canvas.height / 150, 1);
     sprite.renderOrder = 20;
     return sprite;
   }
@@ -1834,8 +1845,8 @@ class PointCloud3DViewer extends PointCloudProcessor {
       const extent = this._semanticExtent(instance);
       const fallback = !extent || Boolean(instance.is_fallback) || String(instance.frame_id || 'map') !== 'map';
       const labelName = this._semanticLabelName(instance);
-      const sizeText = extent ? `${extent.source === 'observed_points' ? '可见范围' : '检测尺寸'} ${['x', 'y', 'z'].map(axis => extent.size_m[axis].toFixed(2)).join('×')}m` : '尺寸未知';
-      const labelText = `${labelName} · ${sizeText}`;
+      // 地图只显示名称；尺寸仍由真实几何和物品详情表达。
+      const labelText = labelName;
       const bucket = available.get(instance.instance_id);
       let record = bucket?.records[bucket.used++];
       if (!record) {
@@ -1888,6 +1899,7 @@ class PointCloud3DViewer extends PointCloudProcessor {
         record.extentSize = ['x', 'y', 'z'].map(axis => extent.size_m[axis]);
         record.extentOrientation = ['x', 'y', 'z', 'w'].map(axis => extent.orientation[axis]);
       }
+      this._applySemanticSelection(record);
       next.push(record);
     }
     for (const bucket of available.values()) {
@@ -1940,6 +1952,21 @@ class PointCloud3DViewer extends PointCloudProcessor {
   updateSemanticInstances(instances) {
     this._semanticInstances = Array.isArray(instances) ? instances.slice() : [];
     this._rebuildSemanticInstances();
+  }
+
+  _applySemanticSelection(record) {
+    const selected = this._semanticSelectedId != null && record.id === this._semanticSelectedId;
+    record.marker.material = selected
+      ? (record.fallback ? this._semanticSelectedFallbackMaterial : this._semanticSelectedMaterial)
+      : (record.fallback ? this._semanticFallbackMaterial : this._semanticPreciseMaterial);
+    if (record.label) record.label.material.opacity = selected ? 1 : 0.9;
+  }
+
+  setSemanticSelectedId(id) {
+    if (this._semanticSelectedId === (id ?? null)) return;
+    this._semanticSelectedId = id ?? null;
+    for (const record of this._semanticRecords) this._applySemanticSelection(record);
+    this._requestRender();
   }
 
   setSemanticInstancesVisible(visible) {
@@ -2513,9 +2540,13 @@ class PointCloud3DViewer extends PointCloudProcessor {
     this._semanticMarkerGeometry?.dispose();
     this._semanticPreciseMaterial?.dispose();
     this._semanticFallbackMaterial?.dispose();
+    this._semanticSelectedMaterial?.dispose();
+    this._semanticSelectedFallbackMaterial?.dispose();
     this._semanticMarkerGeometry = null;
     this._semanticPreciseMaterial = null;
     this._semanticFallbackMaterial = null;
+    this._semanticSelectedMaterial = null;
+    this._semanticSelectedFallbackMaterial = null;
     if (this._robotMesh) {
       for (const resource of this._robotMesh.userData.disposableResources || []) resource.dispose?.();
     }
@@ -2799,6 +2830,7 @@ window.addEventListener('stream:exploration.state', updateNavigationOverlayFromE
 window.addEventListener('pointcloud3d:semantic-instances', (e) => {
   const detail = e.detail;
   const instances = Array.isArray(detail) ? detail : detail?.instances;
+  if (detail && Object.hasOwn(detail, 'selectedId')) window.pointcloud3d.setSemanticSelectedId(detail.selectedId);
   window.pointcloud3d.updateSemanticInstances(instances || []);
 });
 

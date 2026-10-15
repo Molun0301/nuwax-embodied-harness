@@ -22,7 +22,7 @@ function baseline(camera, container) {
   }
 }
 assert.match(fs.readFileSync(`${js}/pointcloud3d.js`, 'utf8'), /scene-graph3d\.js\?v=20261013-graph-camera/);
-assert.match(fs.readFileSync(`${root}/gateways/http/static/console.html`, 'utf8'), /pointcloud3d\.js\?v=20261014-object-extents/);
+assert.match(fs.readFileSync(`${root}/gateways/http/static/console.html`, 'utf8'), /pointcloud3d\.js\?v=20261015-object-labels/);
 const results = [];
 for (const count of [100, 500]) {
   const layer = new SceneGraphLayer(new THREE.Scene());

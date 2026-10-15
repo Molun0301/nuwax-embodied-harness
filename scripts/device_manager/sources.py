@@ -32,7 +32,7 @@ def normalized_settings(stored):
 
 
 def credentials(engine):
-    values = read_json(engine.home / "config/credentials.json", {})
+    values = read_json(engine.manager_home / "config/credentials.json", {})
     origin = values.get("origin", "")
     # 只迁移本项目旧默认目录的同仓库授权，不扩大自定义源的凭据范围。
     if origin and is_project_default(origin):
@@ -45,7 +45,7 @@ def discover(engine, *, refresh=False, request=None, local_request=False):
     request = request or {}
     repository = request.get("source_repository", settings["source_repository"])
     branch = request.get("source_branch", settings["source_branch"])
-    allow_local = bool(local_request or read_json(engine.home / "config/settings.json", {}).get("_allow_local_source"))
+    allow_local = bool(local_request or read_json(engine.manager_home / "config/settings.json", {}).get("_allow_local_source"))
     if request.get("source_repository") and repository != settings["source_repository"] and not local_request:
         raise ManagerError("local_only", "临时源码仓库覆盖只能从设备命令行指定；网页请先保存源码设置。", 403)
     cache_path = engine.home / "cache/source-catalog.json"

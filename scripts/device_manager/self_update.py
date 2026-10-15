@@ -7,7 +7,8 @@ import sys
 import urllib.parse
 from pathlib import Path
 
-from scripts.neh_bootstrap import MAX_MANAGER_BYTES, unpack_manager, switch_link, version_tuple
+from scripts.neh_bootstrap import (MAX_MANAGER_BYTES, BootstrapError, require_install_layout,
+                                   unpack_manager, switch_link, version_tuple)
 
 from . import MANAGER_REVISION
 from .common import ManagerError, atomic_json, digest_file, identifier, read_json
@@ -60,7 +61,7 @@ def apply_manager(engine, job):
         metadata = {"version": source["version"], "revision": source["revision"], "sha256": digest_file(archive), "size": archive.stat().st_size}
     else:
         metadata = plan["_manager"]
-    root = engine.home / "manager"
+    root = engine.manager_home / "manager"
     versions = root / "versions"
     versions.mkdir(parents=True, exist_ok=True)
     if (root / "current").exists() and not (root / "current").is_symlink():
@@ -97,6 +98,10 @@ def apply_manager(engine, job):
             path = target / entry["path"]
             if not path.is_file() or digest_file(path) != entry["sha256"]:
                 raise ManagerError("manager_state", "已有候选管理版本文件已改变。", 409)
+    try:
+        require_install_layout(engine.manager_home, manifest)
+    except BootstrapError as exc:
+        raise ManagerError("manager_layout_unsupported", str(exc), 409) from exc
     atomic_json(target / "installed.json", {"complete": True, "product": "neh-manager", "version": manifest["version"]})
     engine._cancelled(job["id"])
     engine._journal(job, manager_previous=str(previous) if previous else None, manager_candidate=str(target), manager_switch=True)

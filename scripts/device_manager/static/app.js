@@ -21,6 +21,11 @@
     robot: '',
     plan: null,
     installJobId: null,
+    hardwareReady: false,
+    hardwareGeneration: 0,
+    locationSaving: false,
+    directoryGeneration: 0,
+    directory: null,
 
     // 配置
     config: null,
@@ -426,14 +431,31 @@
 
   // ===== 设备信息（平台）=====
   function applyStatus(status) {
+    const previousDir = state.status && state.status.installation && state.status.installation.install_dir;
     state.status = status;
     state.passwordEnabled = Boolean(status.password_enabled);
     state.platformSupported = status.platform_supported !== false;
 
     text($('managerVersion'), '管理器 ' + (status.manager_development ? '开发版本' : (status.manager_version || '--')));
     const installDir = status.installation && status.installation.install_dir;
+    if (previousDir && installDir !== previousDir) {
+      state.planGeneration += 1;
+      state.plan = null;
+      $('startInstall').disabled = true;
+      state.hardwareGeneration += 1;
+      state.hardwareReady = false;
+      state.hardware = null;
+      state.recommendation = null;
+      ['hardwareDetails', 'hardwareReasons', 'hardwareEvidence', 'hardwareIssues'].forEach(function (id) { show($(id), false); });
+      setClass($('hardwareStatus'), 'status-card');
+      $('hardwareStatus').querySelector('.status-icon').className = 'status-icon';
+      text($('hardwareStatusText'), '安装位置已变化，请重新检测硬件与可用磁盘空间。');
+      show($('hardwareStatus'), true);
+      show($('retryHardware'), true);
+    }
     text($('setupInstallDir'), installDir || '未知');
     text($('installDir'), installDir || '未知');
+    renderInstallLocation(status.installation || {});
 
     if (status.installation && status.installation.installed) {
       const robot = status.installation.robot ? status.installation.robot : '';
@@ -441,6 +463,164 @@
     } else {
       text($('platformInfo'), '未安装');
     }
+  }
+
+  // ===== 首次安装位置 =====
+  function installationLocationEditable() {
+    return Boolean(state.status && state.status.installation && state.status.installation.location_editable);
+  }
+
+  function installLocationDirty() {
+    const installation = state.status && state.status.installation;
+    return installationLocationEditable() && $('installDirInput').value.trim() !== (installation.install_dir || '');
+  }
+
+  function updateInstallLocationControls() {
+    const editable = installationLocationEditable();
+    const dirty = installLocationDirty();
+    $('installDirInput').disabled = !editable || state.locationSaving;
+    $('browseInstallDir').disabled = !editable || state.locationSaving;
+    $('saveInstallDir').disabled = !editable || state.locationSaving || !dirty || !$('installDirInput').value.trim();
+    $('resetInstallDir').disabled = !editable || state.locationSaving || !dirty;
+    $('nextToModules').disabled = !state.hardwareReady || state.locationSaving || dirty;
+  }
+
+  function renderInstallLocation(installation) {
+    const input = $('installDirInput');
+    // 状态刷新不能悄悄覆盖用户尚未保存的输入。
+    if (!input.dataset.edited || !installation.location_editable) {
+      input.value = installation.install_dir || '';
+      delete input.dataset.edited;
+    }
+    show($('installLocationEditor'), Boolean(installation.location_editable));
+    show($('installLocationReadonly'), !installation.location_editable);
+    text($('installLocationReadonly'), installation.location_reason || (installation.installed
+      ? '已有安装的位置为只读；这里不会搬迁已安装的程序与数据。'
+      : (state.status && state.status.active_job ? '任务执行期间不能修改安装位置。' : '当前安装位置暂时不能修改。')));
+    text($('setupManagerDir'), installation.manager_dir || '');
+    show($('setupManagerDirNote'), Boolean(installation.manager_dir && installation.manager_dir !== installation.install_dir));
+    if (!installation.location_editable && $('installDirectoryDialog').open) $('installDirectoryDialog').close();
+    updateInstallLocationControls();
+  }
+
+  function installLocationChanged() {
+    $('installDirInput').dataset.edited = 'true';
+    state.planGeneration += 1;
+    state.plan = null;
+    $('startInstall').disabled = true;
+    inlineMessage($('installLocationMessage'), installLocationDirty() ? '安装位置尚未保存。请保存，或放弃修改后继续。' : '', 'warning');
+    updateInstallLocationControls();
+  }
+
+  async function saveInstallLocation() {
+    if (state.locationSaving || !installationLocationEditable() || !installLocationDirty()) return;
+    const requested = $('installDirInput').value.trim();
+    if (!requested) return;
+    state.locationSaving = true;
+    updateInstallLocationControls();
+    inlineMessage($('installLocationMessage'), '正在检查并保存设备上的安装位置…');
+    try {
+      const saved = await apiCall('/api/manager/install-location', {
+        method: 'PUT', body: { install_dir: requested }
+      });
+      if (!saved || !saved.install_dir) throw new Error('服务未返回实际安装位置，请刷新后确认。');
+      state.planGeneration += 1;
+      state.plan = null;
+      delete $('installDirInput').dataset.edited;
+      applyStatus(Object.assign({}, state.status, { installation: Object.assign({}, state.status.installation, {
+        install_dir: saved.install_dir, manager_dir: saved.manager_dir,
+        location_editable: saved.editable, location_reason: saved.reason || ''
+      }) }));
+      inlineMessage($('installLocationMessage'), '安装位置已保存：' + saved.install_dir, 'good');
+      // 可用磁盘空间取决于保存后的实际设备目录，不能沿用旧磁盘的检测。
+      await loadHardware();
+    } catch (error) {
+      // 只有成功响应才能改变生效路径；错误保留输入供修正。
+      inlineMessage($('installLocationMessage'), '保存失败：' + error.message, 'bad');
+    } finally {
+      state.locationSaving = false;
+      updateInstallLocationControls();
+    }
+  }
+
+  async function loadInstallDirectories(path) {
+    const generation = ++state.directoryGeneration;
+    const dialog = $('installDirectoryDialog');
+    state.directory = null;
+    $('directorySelect').disabled = true;
+    $('directoryParent').disabled = true;
+    $('directoryList').replaceChildren();
+    text($('directoryCurrent'), '正在读取设备目录…');
+    inlineMessage($('directoryMessage'), '');
+    try {
+      const data = await apiCall('/api/manager/install-directories' + (path ? '?path=' + encodeURIComponent(path) : ''));
+      if (generation !== state.directoryGeneration || !dialog.open) return;
+      if (!data || !data.path || !Array.isArray(data.directories)) throw new Error('服务未返回有效的设备目录。');
+      state.directory = data;
+      $('directoryPathInput').value = data.path;
+      text($('directoryCurrent'), data.path);
+      $('directoryParent').disabled = !data.parent;
+      $('directorySelect').disabled = data.writable === false;
+      if (data.writable === false) inlineMessage($('directoryMessage'), '当前用户无法写入此目录。可继续浏览，选择可写的空目录。', 'warning');
+      const list = $('directoryList');
+      data.directories.forEach(function (directory) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'directory-entry';
+        button.textContent = directory.name;
+        button.addEventListener('click', function () { loadInstallDirectories(directory.path); });
+        list.appendChild(button);
+      });
+      if (!data.directories.length) {
+        const empty = document.createElement('p');
+        empty.className = 'info-text';
+        empty.textContent = '没有子目录';
+        list.appendChild(empty);
+      }
+    } catch (error) {
+      if (generation !== state.directoryGeneration || !dialog.open) return;
+      text($('directoryCurrent'), '未能读取目录');
+      inlineMessage($('directoryMessage'), '读取失败：' + error.message, 'bad');
+    }
+  }
+
+  function initInstallLocationEvents() {
+    $('installDirInput').addEventListener('input', installLocationChanged);
+    $('saveInstallDir').addEventListener('click', saveInstallLocation);
+    $('resetInstallDir').addEventListener('click', function () {
+      if (state.locationSaving) return;
+      delete $('installDirInput').dataset.edited;
+      renderInstallLocation(state.status.installation);
+      inlineMessage($('installLocationMessage'), '');
+    });
+    $('browseInstallDir').addEventListener('click', function () {
+      if (!installationLocationEditable() || state.locationSaving) return;
+      const dialog = $('installDirectoryDialog');
+      if (dialog.open) return;
+      $('directoryPathInput').value = '';
+      openModal(dialog);
+      loadInstallDirectories();
+    });
+    $('directoryPathForm').addEventListener('submit', function (event) {
+      event.preventDefault();
+      const path = $('directoryPathInput').value.trim();
+      if (path) loadInstallDirectories(path);
+    });
+    $('directoryParent').addEventListener('click', function () {
+      if (state.directory && state.directory.parent) loadInstallDirectories(state.directory.parent);
+    });
+    $('directorySelect').addEventListener('click', function () {
+      if (!state.directory || state.directory.writable === false || !installationLocationEditable()) return;
+      $('installDirInput').value = state.directory.path;
+      installLocationChanged();
+      $('installDirectoryDialog').close();
+      $('installDirInput').focus();
+    });
+    $('directoryCancel').addEventListener('click', function () { $('installDirectoryDialog').close(); });
+    $('installDirectoryDialog').addEventListener('close', function () {
+      state.directoryGeneration += 1;
+      state.directory = null;
+    });
   }
 
   // ===== 概览 =====
@@ -883,6 +1063,12 @@
   }
 
   async function loadHardware() {
+    const generation = ++state.hardwareGeneration;
+    const installDir = state.status && state.status.installation && state.status.installation.install_dir;
+    const isCurrent = function () {
+      return generation === state.hardwareGeneration && installDir === (state.status && state.status.installation && state.status.installation.install_dir);
+    };
+    state.hardwareReady = false;
     const statusCard = $('hardwareStatus');
     const statusText = $('hardwareStatusText');
     setClass(statusCard, 'status-card checking');
@@ -897,6 +1083,7 @@
 
     try {
       const data = await apiCall('/api/manager/hardware');
+      if (!isCurrent()) return;
       state.hardware = data.hardware || {};
       state.recommendation = data.recommendation || {};
       state.robot = state.recommendation.robot || '';
@@ -915,17 +1102,19 @@
         statusCard.querySelector('.status-icon').className = 'status-icon check';
         text(statusText, '硬件检查完成，已给出推荐配置。');
         show($('retryHardware'), true);
-        $('nextToModules').disabled = false;
+        state.hardwareReady = true;
       }
 
       renderHardware(data);
     } catch (error) {
+      if (!isCurrent()) return;
       setClass(statusCard, 'status-card error');
       statusCard.querySelector('.status-icon').className = 'status-icon error';
       text(statusText, '硬件检测失败：' + error.message);
       show($('retryHardware'), true);
       $('nextToModules').disabled = true;
     }
+    updateInstallLocationControls();
   }
 
   // 布尔量一律转成明确中文描述；未知（null/undefined）不当作“未检测到”。
@@ -1151,6 +1340,7 @@
   }
 
   async function generatePlan() {
+    if (state.locationSaving || installLocationDirty()) return;
     const generation = ++state.planGeneration;
     setWizardStep('plan');
     state.plan = null;
@@ -1237,6 +1427,7 @@
 
     const items = [
       ['操作', actionText(plan.action)],
+      ['安装位置', plan.install_dir || (state.status && state.status.installation && state.status.installation.install_dir) || '未知'],
       ['目标版本', plan.version || '当前版本源提供的版本'],
       ['机器人型号', robotLabel(plan.robot || state.robot)],
       ['模块', Array.isArray(plan.modules) && plan.modules.length ? plan.modules.map(moduleLabel).join('、') : '--'],
@@ -1288,7 +1479,7 @@
   }
 
   async function submitInstall() {
-    if (state.submitting || !state.plan) return;
+    if (state.submitting || !state.plan || state.locationSaving || installLocationDirty()) return;
     state.submitting = true;
     $('startInstall').disabled = true;
 
@@ -1443,8 +1634,10 @@
   }
 
   function initWizardEvents() {
+    initInstallLocationEvents();
     $('retryHardware').addEventListener('click', loadHardware);
     $('nextToModules').addEventListener('click', function () {
+      if (!state.hardwareReady || state.locationSaving || installLocationDirty()) return;
       setWizardStep('modules');
       loadWizardModules();
     });
@@ -2677,7 +2870,7 @@
         showMessage($('settingsMessage'), '启动行为已保存。', 'good');
       } catch (error) {
         target.checked = !target.checked;
-        showMessage($('settingsMessage'), '保存失败：' + error.message, 'error');
+        showMessage($('settingsMessage'), '保存失败：' + error.message, 'bad');
       }
     });
 

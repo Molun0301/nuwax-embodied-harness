@@ -600,6 +600,70 @@ textarea.field {
   white-space: pre-wrap;
 }
 
+.install-location-input {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-top: 6px;
+}
+
+.install-location-input .field {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--mono);
+}
+
+.install-location-input .btn {
+  flex-shrink: 0;
+}
+
+.modal-dialog.directory-dialog {
+  max-width: 640px;
+}
+
+.directory-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 16px 0 10px;
+}
+
+.directory-toolbar .btn {
+  flex-shrink: 0;
+}
+
+.directory-list {
+  max-height: min(40vh, 320px);
+  min-height: 80px;
+  overflow-y: auto;
+  margin-top: 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+}
+
+.directory-list > .info-text {
+  padding: 0 12px;
+}
+
+.directory-entry {
+  display: block;
+  width: 100%;
+  padding: 10px 12px;
+  text-align: left;
+  overflow-wrap: anywhere;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  color: var(--ink);
+  background: var(--surface);
+  cursor: pointer;
+  font: inherit;
+}
+
+.directory-entry:hover,
+.directory-entry:focus-visible {
+  background: var(--inset);
+}
+
 .error-message {
   font-size: 12px;
   color: var(--bad);
@@ -1820,6 +1884,11 @@ textarea.field {
   color: var(--bad);
 }
 
+.inline-message.warning {
+  background: var(--warn-w);
+  color: var(--warn);
+}
+
 /* ===== 安装进度补充 ===== */
 .progress-head {
   display: flex;
@@ -2321,6 +2390,13 @@ textarea.field {
 }
 
 @media (max-width: 640px) {
+  .install-location-input {
+    flex-wrap: wrap;
+  }
+
+  .install-location-input .field {
+    flex-basis: 100%;
+  }
   .manager-header {
     flex-wrap: wrap;
     padding: 10px 16px;

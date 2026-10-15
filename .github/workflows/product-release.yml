@@ -60,6 +60,7 @@ jobs:
       - name: 安装生命周期与增量缓存回归（离线）
         run: |
           python3 scripts/check_install_location.py
+          python3 scripts/check_web_install_location.py
           node scripts/check_install_location_ui.cjs
           python3 scripts/check_device_install_lifecycle.py
           python3 scripts/check_bootstrap_recovery.py

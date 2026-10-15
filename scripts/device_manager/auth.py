@@ -13,7 +13,7 @@ ITERATIONS = 310000
 class Authentication:
     def __init__(self, engine):
         self.engine = engine
-        self.path = engine.home / "config/password.json"
+        self.path = engine.manager_home / "config/password.json"
 
     def enabled(self):
         return bool(read_json(self.path, {}).get("digest"))

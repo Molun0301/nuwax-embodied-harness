@@ -335,7 +335,7 @@ class BootstrapRecoveryChecks(unittest.TestCase):
 class ManagerListenerChecks(unittest.TestCase):
     def test_ipv4_listener(self):
         with tempfile.TemporaryDirectory() as directory:
-            server = ManagerServer(("127.0.0.1", 0), SimpleNamespace(home=Path(directory)))
+            server = ManagerServer(("127.0.0.1", 0), Engine(Path(directory)))
             try:
                 self.assertEqual(server.address_family, socket.AF_INET)
             finally:

@@ -70,7 +70,7 @@ def _generations(root, *, include_links=False):
     return sorted(path for path in root.iterdir() if path.is_dir() and (include_links or not path.is_symlink()))
 
 
-def _references(home, roots, package_root):
+def _references(home, manager, roots, package_root):
     references = set()
 
     def keep(path):
@@ -85,13 +85,13 @@ def _references(home, roots, package_root):
                 if relative.parts:
                     references.add(root / relative.parts[0])
 
-    for link in (home / "current", home / "manager/current", home / "manager/previous"):
+    for link in (home / "current", manager / "manager/current", manager / "manager/previous"):
         keep(link)
     previous = read_json(home / "config/history.json", {}).get("previous")
     if isinstance(previous, str) and Path(previous).name == previous:
         keep(home / "releases" / previous)
     keep(package_root)
-    for path in (home / "jobs").glob("*.json"):
+    for path in (manager / "jobs").glob("*.json"):
         job = read_json(path, {})
         if job.get("status") not in TERMINAL or job.get("error", {}).get("code") == "recovery_failed":
             for reference in _paths(job):
@@ -100,7 +100,7 @@ def _references(home, roots, package_root):
             if isinstance(previous, str) and Path(previous).name == previous:
                 keep(home / "releases" / previous)
     for name in ("runtime.json", "profile-owner.json", "server.json"):
-        state = read_json(home / "config" / name, {})
+        state = read_json((manager if name == "server.json" else home) / "config" / name, {})
         if process_alive(state.get("process")):
             for reference in _paths(state):
                 keep(reference)
@@ -115,12 +115,14 @@ def storage_plan(home, *, package_root=PACKAGE_ROOT):
     Environment references include every remaining release, even incomplete or
     unknown directories. Pruning releases first may free more environments.
     """
-    home = Path(home).expanduser().resolve()
+    from .locations import installation_home, manager_home
+    manager = manager_home(home)
+    home = installation_home(manager)
     releases = home / "releases"
     environments = home / "python-environments"
-    managers = home / "manager/versions"
+    managers = manager / "manager/versions"
     roots = (releases, environments, managers)
-    retained = _references(home, roots, package_root)
+    retained = _references(home, manager, roots, package_root)
     release_paths = _generations(releases)
     for release in _generations(releases, include_links=True):
         record = _record(release / "installed.json")

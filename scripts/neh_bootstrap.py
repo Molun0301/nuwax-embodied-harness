@@ -526,6 +526,31 @@ def source_manager(args, destination, token):
         raise BootstrapError(str(exc)) from exc
 
 
+def resolve_manager_home(home):
+    """A Web-selected payload path remains an alias for its original manager entry."""
+    home = Path(home).expanduser().resolve()
+    marker = home / "config/manager-home.json"
+    if not marker.exists():
+        return home
+    try:
+        owner = json.loads(marker.read_text())
+        root = Path(owner["manager_dir"])
+        if not root.is_absolute() or (root / "config/instance-id").read_text().strip() != owner["instance_id"]:
+            raise ValueError()
+        return root.resolve()
+    except (OSError, KeyError, TypeError, ValueError) as exc:
+        raise BootstrapError("安装目录的管理入口记录不匹配，请使用原管理入口目录") from exc
+
+
+def require_install_layout(home, manifest):
+    """Old managers must not silently forget a separately selected payload root."""
+    location = home / "config/install-location.json"
+    if location.is_file():
+        selected = json.loads(location.read_text()).get("install_dir")
+        if selected and Path(selected).resolve() != home and manifest.get("installation_layout", 1) != 2:
+            raise BootstrapError("该管理版本不支持网页选择的独立安装目录，请选择支持此功能的版本")
+
+
 def install_home(args):
     """只在首次交互安装时询问；参数和环境变量仍使用同一安装根。"""
     home = args.home
@@ -538,7 +563,7 @@ def install_home(args):
                 raise BootstrapError("已取消安装位置选择，未创建安装目录") from exc
             if selected:
                 home = Path(selected)
-    return home.expanduser().resolve()
+    return resolve_manager_home(home)
 
 
 def install(args):
@@ -594,6 +619,7 @@ def install(args):
             unpacked = stage / "unpacked"
             unpacked.mkdir()
             manifest = unpack_manager(archive, unpacked)
+            require_install_layout(home, manifest)
             if metadata and manifest["version"] != metadata.get("version"):
                 raise BootstrapError("下载管理包与目录版本不一致")
             if metadata and metadata.get("revision") and manifest.get("revision") != metadata["revision"]:

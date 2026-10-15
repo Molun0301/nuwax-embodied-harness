@@ -36,13 +36,16 @@ class Cancelled(ManagerError):
 
 class Engine:
     def __init__(self, home):
-        self.home = Path(home).expanduser().resolve()
-        self.home.mkdir(parents=True, exist_ok=True, mode=0o700)
-        for directory in ("releases", "data", "config", "jobs", "plans", "logs", "cache"):
-            (self.home / directory).mkdir(exist_ok=True, mode=0o700)
-        self.lock_path = self.home / "config/transaction.lock"
-        self.runtime = Runtime(self.home)
-        identity = self.home / "config/instance-id"
+        from .locations import installation_home, manager_home
+        self.manager_home = manager_home(home)
+        self.home = installation_home(self.manager_home)
+        for root, directories in ((self.manager_home, ("config", "jobs", "plans", "logs")),
+                                  (self.home, ("releases", "data", "config", "logs", "cache"))):
+            for directory in directories:
+                (root / directory).mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.lock_path = self.manager_home / "config/transaction.lock"
+        self.runtime = Runtime(self.home, self.manager_home)
+        identity = self.manager_home / "config/instance-id"
         try:
             descriptor = os.open(str(identity), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(descriptor, "w") as handle:
@@ -54,11 +57,53 @@ class Engine:
         self.instance_id = identity.read_text().strip()
         self.configuration = ConfigurationClient(self.home, self.instance_id)
 
+    def selected(self):
+        """Return a fixed-root snapshot; never change paths under another request."""
+        from .locations import installation_home
+        return self if self.home == installation_home(self.manager_home) else Engine(self.manager_home)
+
+    def _assert_location(self):
+        from .locations import installation_home
+        if self.home != installation_home(self.manager_home):
+            raise ManagerError("install_location_changed", "安装位置已变化，请刷新页面并重新生成计划。", 409)
+
+    def install_location(self):
+        reason = ""
+        if self.current():
+            reason = "已安装业务版本，不能在网页中迁移安装目录。"
+        elif self.active_job():
+            reason = "管理任务正在执行，请等待任务结束后再选择目录。"
+        else:
+            active = read_json(self.manager_home / "config/active-job.json", {})
+            if active and self.job(active["id"]).get("error", {}).get("code") == "recovery_failed":
+                reason = "上次任务尚未完成安全恢复，请先处理恢复问题。"
+        return {"install_dir": str(self.home), "manager_dir": str(self.manager_home), "editable": not reason, "reason": reason}
+
+    def save_install_location(self, values):
+        from .locations import prepare_directory
+        if not isinstance(values, dict) or set(values) != {"install_dir"}:
+            raise ManagerError("invalid_install_dir", "请仅提交install_dir安装目录。")
+        with file_lock(self.lock_path):
+            self._assert_idle()
+            location = self.install_location()
+            if not location["editable"]:
+                raise ManagerError("install_location_locked", location["reason"], 409)
+            target = prepare_directory(self, values["install_dir"])
+            atomic_json(self.manager_home / "config/install-location.json", {"install_dir": str(target)})
+        result = self.selected().install_location()
+        if target != self.home:
+            result["previous_install_dir"] = str(self.home)
+        return result
+
+    def install_directories(self, path=None):
+        from .locations import browse_directories
+        return browse_directories(self, path)
+
     def settings(self):
         from .sources import normalized_settings, credentials
-        settings = normalized_settings(read_json(self.home / "config/settings.json", {}))
-        settings["password_enabled"] = bool(read_json(self.home / "config/password.json", {}).get("digest"))
-        access = credentials(self) if settings["source_mode"] == "git" else read_json(self.home / "config/credentials.json", {})
+        settings = normalized_settings(read_json(self.manager_home / "config/settings.json", {}))
+        settings["password_enabled"] = bool(read_json(self.manager_home / "config/password.json", {}).get("digest"))
+        access = credentials(self) if settings["source_mode"] == "git" else read_json(self.manager_home / "config/credentials.json", {})
         settings["has_download_token"] = bool(access.get("token") and access.get("token_origin", access.get("origin")) == settings["feed_url"])
         return {key: value for key, value in settings.items() if not key.startswith("_")}
 
@@ -102,21 +147,21 @@ class Engine:
         with file_lock(self.lock_path):
             self._assert_idle()
             result = self.settings()
-            result.update({key: value for key, value in read_json(self.home / "config/settings.json", {}).items() if key.startswith("_")})
+            result.update({key: value for key, value in read_json(self.manager_home / "config/settings.json", {}).items() if key.startswith("_")})
             result.update(values)
             result.pop("password_enabled", None)
             result.pop("has_download_token", None)
-            atomic_json(self.home / "config/settings.json", result)
+            atomic_json(self.manager_home / "config/settings.json", result)
         return self.settings()
 
     def set_token(self, value):
         with file_lock(self.lock_path):
             self._assert_idle()
-            atomic_json(self.home / "config/credentials.json", {"token": value.strip(), "origin": self.settings()["feed_url"]})
+            atomic_json(self.manager_home / "config/credentials.json", {"token": value.strip(), "origin": self.settings()["feed_url"]})
 
     def _source_options(self, catalog=None):
-        return {"allow_file": bool(catalog), "token": read_json(self.home / "config/credentials.json", {}).get("token", ""),
-                "token_origin": read_json(self.home / "config/credentials.json", {}).get("origin", "")}
+        return {"allow_file": bool(catalog), "token": read_json(self.manager_home / "config/credentials.json", {}).get("token", ""),
+                "token_origin": read_json(self.manager_home / "config/credentials.json", {}).get("origin", "")}
 
     def current(self):
         link = self.home / "current"
@@ -219,7 +264,7 @@ class Engine:
         return result
 
     def _job_path(self, job_id):
-        return self.home / "jobs" / (identifier(job_id) + ".json")
+        return self.manager_home / "jobs" / (identifier(job_id) + ".json")
 
     def job(self, job_id):
         job = read_json(self._job_path(job_id))
@@ -228,11 +273,11 @@ class Engine:
         return {key: value for key, value in job.items() if not key.startswith("_")}
 
     def jobs(self):
-        result = [self.job(path.stem) for path in (self.home / "jobs").glob("*.json")]
+        result = [self.job(path.stem) for path in (self.manager_home / "jobs").glob("*.json")]
         return sorted(result, key=lambda item: item["created_at"], reverse=True)[:200]
 
     def active_job(self):
-        active = read_json(self.home / "config/active-job.json", {})
+        active = read_json(self.manager_home / "config/active-job.json", {})
         if not active:
             return None
         job = self.job(active["id"])
@@ -259,6 +304,8 @@ class Engine:
             manager_relation = 0 if available.get("revision") == MANAGER_REVISION else 1
         installation = {"installed": bool(current), "install_dir": str(self.home), "version": current.get("version"), "modules": current.get("modules", []),
                         "robot": current.get("robot", "customrobot"), "previous_version": history.get("previous_version"), "source": current.get("source"), "revision": current.get("revision", "")}
+        location = self.install_location()
+        installation.update(manager_dir=location["manager_dir"], location_editable=location["editable"], location_reason=location["reason"])
         return {"product": "NEH", "manager_version": MANAGER_VERSION, "manager_revision": MANAGER_REVISION, "manager_development": MANAGER_DEVELOPMENT, "instance_id": self.instance_id, "installation": installation,
                 "runtime": self.runtime.status(), "active_job": self.active_job(),
                 "update": {"available": bool(available and current and relation == 1),
@@ -302,7 +349,7 @@ class Engine:
 
     def _fingerprint(self):
         current = self.current()
-        values = {"current": current.get("prefix"), "running": self.runtime.status()["running"], "settings": self.settings()}
+        values = {"install_dir": str(self.home), "current": current.get("prefix"), "running": self.runtime.status()["running"], "settings": self.settings()}
         active = self.home / "data/settings/active.env"
         if current and active.is_file():
             values["config"] = self.configuration.request(Path(current["prefix"]), "revision")
@@ -340,7 +387,7 @@ class Engine:
             if not isinstance(configuration, dict):
                 raise ManagerError("invalid_config", "预配置必须是对象。")
             if not configuration.get("NUWAX_GATEWAY_PUBLIC_BASE_URL"):
-                server = read_json(self.home / "config/server.json", {})
+                server = read_json(self.manager_home / "config/server.json", {})
                 if process_alive(server.get("process")) and server.get("public_url"):
                     request = dict(request, configuration=dict(configuration, NUWAX_GATEWAY_PUBLIC_BASE_URL=server["public_url"]))
                 warnings.append("命令行首次安装请确认公开制品地址；可通过configuration.NUWAX_GATEWAY_PUBLIC_BASE_URL指定远端可达的管理台地址。")
@@ -352,7 +399,7 @@ class Engine:
             blockers.append("已有管理任务尚未结束。")
         running = self.runtime.status()["running"]
         requires_stop = running and action not in ("start", "update-manager")
-        plan = {"id": uuid.uuid4().hex, "action": action, "version": request.get("version"), "modules": modules, "robot": robot,
+        plan = {"id": uuid.uuid4().hex, "action": action, "install_dir": str(self.home), "version": request.get("version"), "modules": modules, "robot": robot,
                 "steps": steps, "warnings": warnings, "blockers": blockers, "download_bytes": 0, "requires_stop": requires_stop,
                 "_fingerprint": self._fingerprint(), "_created": time.time(), "_request": request,
                 "_local_catalog": str(Path(local_catalog).resolve()) if local_catalog else None, "download_breakdown": {"application": 0, "dependencies": None, "models": None}}
@@ -441,7 +488,7 @@ class Engine:
         if not plan.get("_source_noop") and action not in ("stop", "update-manager") and (settings["auto_start"] or running or action in ("start", "restart")):
             steps.append({"title": "调用原启动器并验证网关健康接口"})
             warnings.append("启动会按机器人配置连接设备；网关健康不代表建图或运动功能已经就绪。")
-        atomic_json(self.home / "plans" / (plan["id"] + ".json"), plan)
+        atomic_json(self.manager_home / "plans" / (plan["id"] + ".json"), plan)
         return self._public_plan(plan)
 
     @staticmethod
@@ -449,13 +496,14 @@ class Engine:
         return {key: value for key, value in plan.items() if not key.startswith("_")}
 
     def _assert_idle(self):
+        self._assert_location()
         if self.active_job():
             raise ManagerError("busy", "已有管理任务正在执行。", 409)
 
     def submit(self, plan_id):
         with file_lock(self.lock_path):
             self._assert_idle()
-            plan = read_json(self.home / "plans" / (identifier(plan_id) + ".json"))
+            plan = read_json(self.manager_home / "plans" / (identifier(plan_id) + ".json"))
             if not plan:
                 raise ManagerError("plan_missing", "安装计划不存在，请重新生成。", 404)
             if plan["blockers"]:
@@ -467,14 +515,14 @@ class Engine:
                    "message": "任务已持久保存", "created_at": timestamp(), "updated_at": timestamp(), "log": [],
                    "_plan": plan, "_queued_at": time.time()}
             atomic_json(self._job_path(job_id), job)
-            atomic_json(self.home / "config/active-job.json", {"id": job_id})
+            atomic_json(self.manager_home / "config/active-job.json", {"id": job_id})
             package_root = PACKAGE_ROOT
             environment = clean_environment()
             environment["PYTHONPATH"] = str(package_root)
             try:
-                descriptor = os.open(str(self.home / "logs" / (job_id + ".log")), os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
+                descriptor = os.open(str(self.manager_home / "logs" / (job_id + ".log")), os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
                 with os.fdopen(descriptor, "ab") as log:
-                    process = subprocess.Popen([sys.executable, "-m", "scripts.device_manager", "--home", str(self.home), "_worker", job_id],
+                    process = subprocess.Popen([sys.executable, "-m", "scripts.device_manager", "--home", str(self.manager_home), "_worker", job_id],
                                                cwd=package_root, env=environment, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
                                                start_new_session=True)
                 job["_process"] = process_identity(process.pid)
@@ -489,11 +537,11 @@ class Engine:
         job = self.job(job_id)
         if job["status"] in TERMINAL:
             return job
-        atomic_write(self.home / "jobs" / (identifier(job_id) + ".cancel"), b"cancel\n")
+        atomic_write(self.manager_home / "jobs" / (identifier(job_id) + ".cancel"), b"cancel\n")
         return dict(job, message="已请求取消，后台正在等待安全恢复边界。")
 
     def _cancelled(self, job_id):
-        if (self.home / "jobs" / (job_id + ".cancel")).exists():
+        if (self.manager_home / "jobs" / (job_id + ".cancel")).exists():
             raise Cancelled()
 
     def _progress(self, job, stage, progress, message):
@@ -506,7 +554,7 @@ class Engine:
     def run_job(self, job_id):
         job_id = identifier(job_id)
         saved = {key: os.environ.get(key) for key in ("NEH_MANAGER_WORKER_HOME", "NEH_MANAGER_WORKER_JOB")}
-        os.environ["NEH_MANAGER_WORKER_HOME"] = str(self.home)
+        os.environ["NEH_MANAGER_WORKER_HOME"] = str(self.manager_home)
         os.environ["NEH_MANAGER_WORKER_JOB"] = job_id
         try:
             return self._run_job_locked(job_id)
@@ -526,17 +574,18 @@ class Engine:
             self._progress(job, "preflight", 2, "正在复核持久计划")
             try:
                 self._cancelled(job_id)
+                self._assert_location()
                 if job["_plan"]["_fingerprint"] != self._fingerprint():
                     raise ManagerError("plan_stale", "任务执行前设备状态已变化，请重新生成计划。", 409)
                 result = self._execute(job)
                 job.update(status="succeeded", result=result)
                 self._progress(job, "complete", 100, "管理操作完成")
                 if job["action"] == "update-manager" and result.get("restart_required", True):
-                    atomic_json(self.home / "config/restart-manager.json", {"instance_id": self.instance_id, "job_id": job["id"], "version": result["manager_version"]})
+                    atomic_json(self.manager_home / "config/restart-manager.json", {"instance_id": self.instance_id, "job_id": job["id"], "version": result["manager_version"]})
             except BaseException as exc:
                 if not isinstance(exc, ManagerError):
                     import traceback
-                    atomic_write(self.home / "logs" / (job_id + ".traceback.log"), traceback.format_exc().encode())
+                    atomic_write(self.manager_home / "logs" / (job_id + ".traceback.log"), traceback.format_exc().encode())
                 error = exc if isinstance(exc, ManagerError) else ManagerError("operation_failed", "管理操作失败：" + type(exc).__name__, 500)
                 try:
                     self._restore(job)
@@ -550,13 +599,16 @@ class Engine:
                 # 安装已经提交；存储保留失败不能触发安装回滚。
                 try:
                     from .storage import prune_storage
-                    job["result"]["storage"] = prune_storage(self.home)
+                    job["result"]["storage"] = prune_storage(self.manager_home)
                 except Exception as exc:
                     job["result"]["storage"] = {"removed": [], "warnings": [{"error": type(exc).__name__}]}
                 atomic_json(self._job_path(job_id), job)
 
     def recover_if_needed(self):
-        active = read_json(self.home / "config/active-job.json", {})
+        selected = self.selected()
+        if selected is not self:
+            return selected.recover_if_needed()
+        active = read_json(self.manager_home / "config/active-job.json", {})
         if not active:
             return
         job = read_json(self._job_path(active["id"]), {})
@@ -566,6 +618,7 @@ class Engine:
             return
         try:
             with file_lock(self.lock_path):
+                self._assert_location()
                 job = read_json(self._job_path(active["id"]), {})
                 if job.get("status") in TERMINAL or process_alive(job.get("_process")):
                     return
@@ -601,7 +654,10 @@ class Engine:
             temporary.unlink(missing_ok=True)
 
     def _restore(self, job):
-        command_state = self.home / "jobs" / (identifier(job["id"]) + ".command")
+        self._assert_location()
+        if job.get("_plan", {}).get("install_dir", str(self.home)) != str(self.home):
+            raise ManagerError("install_location_changed", "任务的安装位置与当前选择不一致，拒绝跨目录恢复。", 409)
+        command_state = self.manager_home / "jobs" / (identifier(job["id"]) + ".command")
         command = read_json(command_state)
         if process_alive(command):
             import signal
@@ -623,7 +679,7 @@ class Engine:
             return
         if journal.get("manager_switch"):
             from scripts.neh_bootstrap import switch_link
-            link = self.home / "manager/current"
+            link = self.manager_home / "manager/current"
             if journal.get("manager_previous"):
                 switch_link(link, Path(journal["manager_previous"]))
             else:

@@ -66,10 +66,25 @@
                 </div>
               </div>
               <div class="step-content">
-                <div class="reason-block">
-                  <span class="info-label">安装位置</span>
+                <div class="reason-block install-location">
+                  <span class="info-label">当前生效的安装位置</span>
                   <span id="setupInstallDir" class="info-value install-path">读取中…</span>
-                  <p class="info-text">程序、构建缓存、配置与数据保存在此目录。首次安装前可在终端为安装命令添加 --install-dir "目标目录"；纯命令行首次安装可用 --cli 选择位置。当前网页管理已选目录，不会移动已有安装。</p>
+                  <p class="info-text">业务程序、构建缓存、配置与数据保存在此目录。这里选择的是运行 NEH 的设备目录。</p>
+                  <div id="installLocationEditor" hidden>
+                    <label for="installDirInput" class="config-label">安装目录</label>
+                    <div class="install-location-input">
+                      <input id="installDirInput" class="field" type="text" autocomplete="off" spellcheck="false" placeholder="设备上的绝对路径，如 /mnt/data/neh" aria-describedby="installLocationHelp">
+                      <button id="browseInstallDir" class="btn" type="button">浏览设备目录</button>
+                    </div>
+                    <p id="installLocationHelp" class="info-text">可输入完整路径或浏览选择空目录。不存在的目录会在保存时创建；选好后先保存，再继续安装。</p>
+                    <div class="source-actions">
+                      <button id="saveInstallDir" class="btn primary" type="button" disabled>保存安装位置</button>
+                      <button id="resetInstallDir" class="btn" type="button" disabled>放弃修改</button>
+                    </div>
+                  </div>
+                  <p id="installLocationReadonly" class="info-text" hidden></p>
+                  <p id="setupManagerDirNote" class="info-text" hidden>网页管理程序保留在 <span id="setupManagerDir" class="install-path"></span>，持续管理上方选定的位置。</p>
+                  <div id="installLocationMessage" class="inline-message" role="status" aria-live="polite" hidden></div>
                 </div>
                 <div id="migrationPanel" class="migration-panel" hidden>
                   <div class="migration-header">
@@ -562,6 +577,27 @@
       </main>
     </div>
   </div>
+
+  <!-- 设备端目录浏览器：不使用访问浏览器所在电脑的本地文件 API。 -->
+  <dialog id="installDirectoryDialog" class="modal-dialog directory-dialog" aria-labelledby="installDirectoryTitle">
+    <h2 id="installDirectoryTitle">选择设备上的安装目录</h2>
+    <p class="modal-desc">浏览运行 NEH 的设备文件系统。选择空目录，或选好后在安装目录中补上要新建的文件夹名称。</p>
+    <form id="directoryPathForm" class="install-location-input">
+      <label hidden for="directoryPathInput">设备目录路径</label>
+      <input id="directoryPathInput" class="field" type="text" autocomplete="off" spellcheck="false" aria-label="设备目录路径">
+      <button id="directoryGo" class="btn" type="submit">打开</button>
+    </form>
+    <div class="directory-toolbar">
+      <button id="directoryParent" class="btn" type="button" disabled>上一级</button>
+      <span id="directoryCurrent" class="install-path"></span>
+    </div>
+    <div id="directoryMessage" class="inline-message" role="status" aria-live="polite" hidden></div>
+    <div id="directoryList" class="directory-list" aria-label="子目录"></div>
+    <div class="modal-actions">
+      <button id="directoryCancel" class="btn" type="button">取消</button>
+      <button id="directorySelect" class="btn primary" type="button" disabled>使用此目录</button>
+    </div>
+  </dialog>
 
   <!-- 密码对话框 -->
   <dialog id="passwordDialog" class="modal-dialog">

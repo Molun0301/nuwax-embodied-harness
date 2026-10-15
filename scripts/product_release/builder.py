@@ -671,7 +671,7 @@ def build_manager(root: Path, output: Path, *, version: str, workspace: bool = F
         if count != 1:
             raise ReleaseError("管理源码缺少唯一__version__赋值，无法写入发布版本")
         initializer.write_text(content, encoding="utf-8")
-        manifest = pack(stage, output, {"schema_version": 1, "product": "neh-manager", "kind": "manager", "version": version, "revision": revision, "source_mode": "workspace" if workspace else "git", "source_dirty": dirty, "python": {"minimum": "3.8", "maximum_exclusive": "3.13"}}, "manager-manifest.json")
+        manifest = pack(stage, output, {"schema_version": 1, "product": "neh-manager", "kind": "manager", "installation_layout": 2, "version": version, "revision": revision, "source_mode": "workspace" if workspace else "git", "source_dirty": dirty, "python": {"minimum": "3.8", "maximum_exclusive": "3.13"}}, "manager-manifest.json")
         write_json(output.with_name(output.name + ".manifest.json"), manifest)
         return manifest
 

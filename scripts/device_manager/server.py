@@ -44,7 +44,7 @@ class ManagerServer(ThreadingHTTPServer):
 
     def __init__(self, address, engine, static_root=None):
         self.address_family = socket.AF_INET6 if ":" in address[0] else socket.AF_INET
-        self.engine = engine
+        self._engine = engine
         self.authentication = Authentication(engine)
         self.static_root = Path(static_root or Path(__file__).parent / "static").resolve()
         self.sessions, self.attempts = {}, {}
@@ -68,6 +68,11 @@ class ManagerServer(ThreadingHTTPServer):
         self.recovery_thread = None
         super().__init__(address, Handler)
 
+    @property
+    def engine(self):
+        self._engine = self._engine.selected()
+        return self._engine
+
     def _recover_background(self):
         try:
             self.engine.recover_if_needed()
@@ -81,15 +86,16 @@ class ManagerServer(ThreadingHTTPServer):
             self.recovery_thread = threading.Thread(target=self._recover_background, daemon=True)
             self.recovery_thread.start()
         from .runtime import clean_environment
-        request_path = self.engine.home / "config/restart-manager.json"
+        engine = self.engine
+        request_path = engine.manager_home / "config/restart-manager.json"
         request = read_json(request_path, {})
-        if not request or request.get("instance_id") != self.engine.instance_id:
+        if not request or request.get("instance_id") != engine.instance_id:
             return
-        job = self.engine.job(request.get("job_id", ""))
+        job = engine.job(request.get("job_id", ""))
         if job["status"] != "succeeded":
             return
-        target = (self.engine.home / "manager/current").resolve()
-        if target.parent != self.engine.home / "manager/versions":
+        target = (engine.manager_home / "manager/current").resolve()
+        if target.parent != engine.manager_home / "manager/versions":
             return
         manifest = read_json(target / "manager-manifest.json", {})
         if manifest.get("version") != request.get("version"):
@@ -98,7 +104,7 @@ class ManagerServer(ThreadingHTTPServer):
         environment = clean_environment()
         environment["PYTHONPATH"] = str(target)
         import sys
-        arguments = [sys.executable, "-m", "scripts.device_manager", "--home", str(self.engine.home), "serve", "--host", self.server_address[0], "--port", str(self.server_port)]
+        arguments = [sys.executable, "-m", "scripts.device_manager", "--home", str(engine.manager_home), "serve", "--host", self.server_address[0], "--port", str(self.server_port)]
         self.server_close()
         os.chdir(str(target))
         os.execve(sys.executable, arguments, environment)
@@ -308,6 +314,12 @@ class Handler(BaseHTTPRequestHandler):
             result = {"authenticated": False}
         elif path == "status" and not mutation:
             result = engine.status()
+        elif path == "install-location" and self.command == "PUT":
+            result = engine.save_install_location(body)
+        elif path == "install-location" and not mutation:
+            result = engine.install_location()
+        elif path == "install-directories" and not mutation:
+            result = engine.install_directories(query.get("path", [None])[0])
         elif path == "hardware" and not mutation:
             result = engine.hardware()
         elif path == "migration-sources" and not mutation:
@@ -465,7 +477,7 @@ def serve(engine, host="127.0.0.1", port=8765):
     server = ManagerServer((host, port), engine)
     address = "[" + host + "]" if ":" in host else host
     public_url = "http://{}:{}".format(address, server.server_port) if host not in ("0.0.0.0", "::") else ""
-    atomic_json(engine.home / "config/server.json", {"process": process_identity(os.getpid()), "host": host, "port": server.server_port, "public_url": public_url})
+    atomic_json(engine.manager_home / "config/server.json", {"process": process_identity(os.getpid()), "host": host, "port": server.server_port, "public_url": public_url})
     print("NEH管理台：http://{}:{}".format(address, server.server_port), flush=True)
     try:
         server.serve_forever(poll_interval=0.5)

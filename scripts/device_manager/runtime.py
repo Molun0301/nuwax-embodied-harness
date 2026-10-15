@@ -81,7 +81,8 @@ def safe_diagnostic(text, home=None):
         for key, value in read_settings(active).items():
             if re.search(r"PASSWORD|TOKEN|SECRET|API_KEY|AUTHORIZATION", key, re.I) and len(value) >= 4:
                 text = text.replace(value, "[已隐藏]")
-        token = read_json(Path(home) / "config/credentials.json", {}).get("token", "")
+        from .locations import manager_home
+        token = read_json(manager_home(home) / "config/credentials.json", {}).get("token", "")
         if token:
             text = text.replace(token, "[已隐藏]")
     text = re.sub(r'(?i)Bearer\s+[^\s,;]+', 'Bearer [已隐藏]', text)
@@ -170,12 +171,13 @@ def system_helper(action, payload=None):
 
 
 class Runtime:
-    def __init__(self, home):
+    def __init__(self, home, manager_home=None):
         self.home = home
+        self.manager_home = manager_home or home
         self.state_path = home / "config/runtime.json"
 
     def port(self):
-        return read_json(self.home / "config/settings.json", {}).get("gateway_port", 8766)
+        return read_json(self.manager_home / "config/settings.json", {}).get("gateway_port", 8766)
 
     def _pid(self):
         try:

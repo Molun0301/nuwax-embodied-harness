@@ -573,7 +573,12 @@ def install(args):
         raise BootstrapError("请用普通用户运行引导安装，系统服务步骤会单独请求管理员权限")
     home = install_home(args)
     args.home = home
-    print("安装位置：" + str(home), flush=True)
+    location = home / "config/install-location.json"
+    selected = json.loads(location.read_text()).get("install_dir") if location.is_file() else None
+    install_dir = Path(selected).resolve() if selected else home
+    print("安装位置：" + str(install_dir), flush=True)
+    if install_dir != home:
+        print("管理入口目录：" + str(home), flush=True)
     home.mkdir(parents=True, exist_ok=True, mode=0o700)
     if home.stat().st_uid != os.getuid() or home.stat().st_mode & 0o022:
         raise BootstrapError("安装目录必须归当前用户持有且其它用户不可写")

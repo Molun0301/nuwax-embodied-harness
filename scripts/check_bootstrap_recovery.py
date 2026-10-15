@@ -315,6 +315,20 @@ class BootstrapRecoveryChecks(unittest.TestCase):
         self.assertEqual((self.home / "manager/current").resolve(), current)
         self.assertEqual((self.home / "manager/previous").resolve(), self.old)
 
+    def test_selected_payload_alias_reports_payload_and_stable_manager_separately(self):
+        payload = self.home.parent / "业务 数据盘"
+        self.engine.save_install_location({"install_dir": str(payload)})
+        self.engine = self.engine.selected()
+        self.args.home = payload
+        self.fail_launch = False
+        self.assertEqual(bootstrap.install(self.args), 0)
+        self.assertEqual(self.args.home, self.home)
+        self.assertIn("安装位置：" + str(payload), self.output.getvalue())
+        self.assertIn("管理入口目录：" + str(self.home), self.output.getvalue())
+        self.assertNotIn("安装位置：" + str(self.home), self.output.getvalue())
+        self.assertFalse((payload / "manager").exists())
+        self.assertEqual(Engine(self.home).home, payload)
+
     def test_generated_launcher_pins_custom_location_despite_environment_and_cwd(self):
         self.fail_launch = False
         self.assertEqual(bootstrap.install(self.args), 0)

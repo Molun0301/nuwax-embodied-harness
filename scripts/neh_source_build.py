@@ -151,19 +151,21 @@ def execute(payload):
     root, home, candidate = (Path(payload[name]).resolve() for name in ("root", "home", "candidate"))
     sys.path.insert(0, str(root))
     from scripts.module_installer.catalog import module_imports, module_system_packages, resolve_modules
-    from scripts.module_installer.hardware import detect_hardware
+    from scripts.module_installer import hardware as hardware_probe
     from scripts.module_installer.manager import InstallRequest, _prepare_models, _verify_prefix
     from scripts.module_installer.builds import build_modules
     modules = resolve_modules(payload["modules"])
-    hardware = detect_hardware(home)
-    request = InstallRequest(root=root, home=home, modules=modules, robot=payload["robot"], jobs=hardware.build_jobs, python=sys.executable)
+    hardware = hardware_probe.detect_hardware(home)
+    # The installed manager also builds older pinned source revisions.
+    resolve_jobs = getattr(hardware_probe, "resolve_build_jobs", lambda root, hardware: hardware.build_jobs)
+    request = InstallRequest(root=root, home=home, modules=modules, robot=payload["robot"], jobs=resolve_jobs(home, hardware=hardware), python=sys.executable)
     operation = payload["operation"]
     run = _runner(root, home, candidate, library_prefix=Path(payload["build_prefix"]) if operation == "build" else None)
     if operation == "metadata":
         packages = list(module_system_packages(modules, request.robot))
         if set(modules) & {"geometry", "slam2d", "fastlio2", "pointlio", "navigation", "follow"}:
             packages.append("patchelf")
-        return {"modules": list(modules), "system_packages": list(dict.fromkeys(packages)), "build_jobs": hardware.build_jobs}
+        return {"modules": list(modules), "system_packages": list(dict.fromkeys(packages)), "build_jobs": request.jobs}
     if operation == "dependencies":
         return prepare_dependencies(request, hardware, candidate, run)
     if operation == "build":

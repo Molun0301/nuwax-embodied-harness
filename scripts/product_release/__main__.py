@@ -26,7 +26,7 @@ def main(argv=None) -> int:
     build.add_argument("--payload", type=Path, help="已有bin/lib等原生产物，仍须校验架构和动态依赖")
     build.add_argument("--constraints", type=Path, help="自动解析模型依赖时须固定torch/torchvision；完整下载配方已固定版本时可省略")
     build.add_argument("--target", type=Path, help="目标平台JSON，必须与platform命令输出完全一致")
-    build.add_argument("--jobs", type=int, default=2)
+    build.add_argument("--jobs", type=int)
     build.add_argument("--install-recipe", type=Path, help="完整固定下载配方JSON，包含python/native/models")
     build.add_argument("--model-recipe", type=Path, help="固定模型修订/URL/摘要/大小的列表JSON，禁止传模型目录")
     build.add_argument("--local-dependencies", action="store_true", help="仅workspace验收：把已有依赖缓存复制为同级独立HTTP下载资产")

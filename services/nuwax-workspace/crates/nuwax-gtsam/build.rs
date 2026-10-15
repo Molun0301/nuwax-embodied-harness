@@ -1,3 +1,6 @@
+#[path = "../../build_support/native_build.rs"]
+mod native_build;
+
 use std::{
     env, fs,
     path::{Path, PathBuf},
@@ -5,6 +8,7 @@ use std::{
 };
 
 fn main() {
+    println!("cargo:rerun-if-changed=../../build_support/native_build.rs");
     let output = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
     let build = output.join("native");
     let mut configure = Command::new("cmake");
@@ -27,11 +31,8 @@ fn main() {
         "GTSAM配置失败"
     );
     assert!(
-        Command::new("cmake")
-            .arg("--build")
-            .arg(&build)
-            .args(["--target", "nuwax_gtsam", "--parallel"])
-            .arg(env::var("CMAKE_BUILD_PARALLEL_LEVEL").unwrap_or_else(|_| "2".into()))
+        native_build::command(&build)
+            .args(["--target", "nuwax_gtsam"])
             .status()
             .expect("启动GTSAM构建")
             .success(),

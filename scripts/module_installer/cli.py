@@ -16,7 +16,7 @@ from typing import Optional, Sequence
 
 from .catalog import MODULES, ROBOT_REQUIREMENTS, remove_modules, replace_lio, resolve_modules
 from .doctor import diagnose
-from .hardware import detect_hardware, recommend_modules
+from .hardware import detect_hardware, recommend_modules, resolve_build_jobs
 from .manager import InstallError, InstallRequest, apply, existing_config, make_plan, read_current
 from .runtime import read_settings
 
@@ -105,6 +105,7 @@ def _show_plan(plan: dict) -> None:
         print("模型：仅下载已选模块所需模型；已有模型继续保留。")
     if "navigation" in plan["modules"]:
         print("导航和跟随运行需要已配置的运动安全守卫与真实执行器；安装不会启动机器人。")
+    print("实际编译并行：{}（Cargo 与其原生子构建共享配额；单文件与链接阶段可能只使用一个核心）".format(plan["jobs"]))
     print("安装位置：" + plan["install_dir"])
 
 
@@ -238,9 +239,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         robot = args.robot if args.robot != "auto" else current.get("robot", recommendation.robot)
         if robot not in ROBOT_REQUIREMENTS:
             robot = "customrobot"
-        jobs = args.jobs if args.jobs is not None else hardware.build_jobs
-        if jobs < 1:
-            raise InstallError("--jobs 必须为正整数。")
+        jobs = resolve_build_jobs(home, args.jobs, hardware=hardware)
         wheel_dir = args.wheel_dir
         if wheel_dir is None:
             cached = home / "cache/device-wheels"

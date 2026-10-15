@@ -174,7 +174,9 @@ def update(args, cache):
     local = None
     try:
         # 独立协调锁覆盖源码同步、双端构建和安装；断线由远端监督进程收回其编译子树。
-        remote_command = ["flock", "-n", remote_base + "/coord.lock", "python3", "-m", "scripts.go2_update.build", "--root", remote_base + "/source", "--cache", remote_base + "/cache", "--components", ",".join(components), "--jobs", str(args.remote_jobs), "--supervise"]
+        remote_command = ["flock", "-n", remote_base + "/coord.lock", "python3", "-m", "scripts.go2_update.build", "--root", remote_base + "/source", "--cache", remote_base + "/cache", "--components", ",".join(components), "--supervise"]
+        if args.remote_jobs is not None:
+            remote_command += ["--jobs", str(args.remote_jobs)]
         shell = "cd " + shlex.quote(tool) + " && exec " + shlex.join(remote_command)
         coordinator = subprocess.Popen(connection.command(["bash", "-c", shell]), stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
         coordinator.messages = queue.Queue()
@@ -191,7 +193,9 @@ def update(args, cache):
         print("双端构建已启动；开发机构建日志：" + str(run_dir / "build.log"), flush=True)
         if not environment_file.is_file():
             raise RuntimeError("缺少交叉环境：" + str(environment_file))
-        command = [sys.executable, "-m", "scripts.go2_update.build", "--root", str(cache / "source"), "--cache", str(cache / "build"), "--components", ",".join(components), "--jobs", str(args.jobs), "--cross"]
+        command = [sys.executable, "-m", "scripts.go2_update.build", "--root", str(cache / "source"), "--cache", str(cache / "build"), "--components", ",".join(components), "--cross"]
+        if args.jobs is not None:
+            command += ["--jobs", str(args.jobs)]
         shell = "source " + shlex.quote(str(environment_file)) + " && exec " + shlex.join(command)
         with (run_dir / "build.log").open("w") as stream:
             local = subprocess.Popen(["bash", "-c", shell], cwd=str(ROOT), stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
@@ -269,14 +273,14 @@ def main(argv=None):
     parser.add_argument("--cache", type=Path, default=ROOT / "runtime_data/go2-update", help="持久源码与构建缓存")
     parser.add_argument("--cross-env", type=Path, default=ROOT / ".nuwax-test-env/env-arm64.sh")
     parser.add_argument("--password-file", type=Path, default=Path.home() / ".config/nuwax/go2.password", help="可选0600口令文件；不存在则使用SSH密钥与sudo免密")
-    parser.add_argument("--jobs", type=int, default=max(1, min(8, os.cpu_count() or 2)))
-    parser.add_argument("--remote-jobs", type=int, default=2)
+    parser.add_argument("--jobs", type=int, help="本机编译并行数；默认依据本机CPU和内存")
+    parser.add_argument("--remote-jobs", type=int, help="远端编译并行数；默认由远端依据其CPU和内存选择")
     parser.add_argument("--force", action="store_true", help="源码无变化时仍重装已校验产物")
     parser.add_argument("--rebuild", action="store_true", help="重新调用全部构建配方，保留编译缓存；升级外部工具链或系统库后使用")
     parser.add_argument("--dependencies-ready", action="store_true", help="依赖配方变化时，声明已另行安装并验证目标Python依赖")
     parser.add_argument("--expected-target", type=Path, help="已核对的实机源码清单，含host、root和完整files；用于首次迁移已有修改，任何漂移仍拒绝")
     args = parser.parse_args(argv)
-    if args.jobs < 1 or args.remote_jobs < 1 or not args.root.startswith("/") or args.root == "/":
+    if any(value is not None and value < 1 for value in (args.jobs, args.remote_jobs)) or not args.root.startswith("/") or args.root == "/":
         parser.error("构建并行数须为正整数，远端目录须为非根绝对路径")
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
     try:

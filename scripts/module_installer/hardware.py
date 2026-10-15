@@ -214,12 +214,35 @@ def detect_hardware(root: Path, *, filesystem_root: Path = Path("/"), run_comman
                 evidence.append("单卡最大显存 %.1f GiB；来源 nvidia-smi 只读查询。" % (gpu_memory / GIB))
         except (OSError, subprocess.SubprocessError):
             evidence.append("NVIDIA 显存查询不可用；未据此判定推理环境可用。")
-    cpu_jobs = max(1, min(cpu_count, int(cpu_limit) if cpu_limit is not None else cpu_count))
+    cpu_jobs = cpu_count
     # 依据当前可用内存收敛原生编译并发，未知资源时退到单进程。
     memory_jobs = max(1, available // (2 * GIB)) if effective_memory else 1
-    jobs = min(cpu_jobs, memory_jobs, 16)
+    jobs = min(cpu_jobs, memory_jobs)
+    evidence.append(f"自动编译并行 {jobs}：可用处理器 {cpu_jobs}，当前可用内存 {available / GIB:.1f} GiB（每任务预算 2 GiB）。")
     return HardwareInfo(os_id, version_id, architecture, cpu_count, cpu_limit, effective_memory,
                         available, total, free_disk, nvidia_gpu, gpu_memory, is_jetson, model, jobs, tuple(evidence), camera_detected)
+
+
+def resolve_build_jobs(root: Path, requested: Optional[int] = None, *,
+                       hardware: Optional[HardwareInfo] = None,
+                       environment: Optional[Mapping[str, str]] = None) -> int:
+    """One budget for standalone builders and Cargo's shared native jobserver."""
+    environment = os.environ if environment is None else environment
+    source = "--jobs"
+    if requested is None:
+        for source in ("CARGO_BUILD_JOBS", "CMAKE_BUILD_PARALLEL_LEVEL"):
+            value = environment.get(source, "").strip()
+            if value:
+                try:
+                    requested = int(value)
+                except ValueError as exc:
+                    raise ValueError(source + " 必须是正整数") from exc
+                break
+    if requested is not None:
+        if isinstance(requested, bool) or not isinstance(requested, int) or requested < 1:
+            raise ValueError(source + " 必须是正整数")
+        return requested
+    return (hardware or detect_hardware(root, run_commands=False)).build_jobs
 
 
 def _enabled(env: Mapping[str, str], key: str) -> bool:

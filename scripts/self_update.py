@@ -439,15 +439,16 @@ def execute(root, request_id):
             # 独立解释器读取新版本安装器。旧代际留到新进程验证通过后再回收。
             code = """from pathlib import Path
 from scripts.module_installer.manager import InstallRequest,apply,read_current
-from scripts.module_installer.hardware import detect_hardware
+from scripts.module_installer import hardware as hardware_probe
 import os, signal
 
 def cancel_install(signum, frame):
     raise KeyboardInterrupt
 signal.signal(signal.SIGTERM, cancel_install)
 root=Path(os.environ['NEH_UPDATE_ROOT']);home=Path(os.environ['NUWAX_UPDATE_INSTALL_DIR'])
-current=read_current(home);hardware=detect_hardware(root)
-request=InstallRequest(root,home,tuple(current['modules']),current['robot'],min(2,hardware.build_jobs),python=current['python'],wheel_dir=home/'cache/device-wheels',repair=True,keep_previous=True,noninteractive=True)
+current=read_current(home);hardware=hardware_probe.detect_hardware(root)
+resolve_jobs=getattr(hardware_probe,'resolve_build_jobs',lambda root,hardware: hardware.build_jobs)
+request=InstallRequest(root,home,tuple(current['modules']),current['robot'],resolve_jobs(root,hardware=hardware),python=current['python'],wheel_dir=home/'cache/device-wheels',repair=True,keep_previous=True,noninteractive=True)
 apply(request,hardware)
 """
             os.environ["NEH_UPDATE_ROOT"] = str(root)

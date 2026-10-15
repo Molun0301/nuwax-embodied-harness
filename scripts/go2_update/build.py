@@ -19,6 +19,14 @@ RECIPES = {
 
 def build(root, cache, components, jobs, cross):
     root, cache = Path(root).resolve(), Path(cache).resolve()
+    # The remote coordinator starts from a tools-only bundle before source sync.
+    # Import build policy only in the child, after the selected source is ready.
+    import scripts
+    scripts.__path__ = [str(root / "scripts"), *scripts.__path__]
+    from scripts.module_installer import hardware as hardware_probe
+    resolver = getattr(hardware_probe, "resolve_build_jobs", None)
+    jobs = resolver(cache, jobs) if resolver else jobs if jobs is not None else hardware_probe.detect_hardware(cache).build_jobs
+    print(f"构建并行预算：{jobs}；Cargo 原生构建共享任务池。", flush=True)
     output = cache / "payload"
     output.mkdir(parents=True, exist_ok=True)
     environment = dict(os.environ)
@@ -27,7 +35,7 @@ def build(root, cache, components, jobs, cross):
     # 工具链复用现有环境，输出独立持久化，避免与其它开发任务争用缓存。
     target = cache / "target"
     environment["CARGO_TARGET_DIR"] = str(target)
-    environment["CMAKE_BUILD_PARALLEL_LEVEL"] = str(jobs)
+    environment["CARGO_BUILD_JOBS"] = str(jobs)
     environment["PATH"] = str(Path.home() / ".cargo/bin") + os.pathsep + environment["PATH"] if not cross else environment["PATH"]
     if cross and environment.get("CARGO_BUILD_TARGET") != "aarch64-unknown-linux-gnu":
         raise RuntimeError("必须先加载项目现有 env-arm64.sh 交叉环境")
@@ -132,10 +140,12 @@ def main():
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--cache", type=Path, required=True)
     parser.add_argument("--components", default="")
-    parser.add_argument("--jobs", type=int, default=2)
+    parser.add_argument("--jobs", type=int)
     parser.add_argument("--cross", action="store_true")
     parser.add_argument("--supervise", action="store_true")
     args = parser.parse_args()
+    if args.jobs is not None and args.jobs < 1:
+        parser.error("构建并行数须为正整数")
     if args.supervise:
         args.cache.mkdir(parents=True, exist_ok=True)
         command = [sys.executable, "-m", "scripts.go2_update.build", *[v for v in sys.argv[1:] if v != "--supervise"]]

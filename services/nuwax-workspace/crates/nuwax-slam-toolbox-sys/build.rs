@@ -1,5 +1,9 @@
+#[path = "../../build_support/native_build.rs"]
+mod native_build;
+
 use std::{env, path::PathBuf, process::Command};
 fn main() {
+    println!("cargo:rerun-if-changed=../../build_support/native_build.rs");
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("缺少OUT_DIR"));
     let build = out.join("native");
     let dependency_prefix = env::var_os("NUWAX_SLAM2D_DEPENDENCY_PREFIX")
@@ -27,11 +31,7 @@ fn main() {
         "二维原生配置失败；安装Ceres 2.2、Eigen、Boost、TBB，或设置CMAKE_PREFIX_PATH"
     );
     assert!(
-        Command::new("cmake")
-            .arg("--build")
-            .arg(&build)
-            .args(["--parallel"])
-            .arg(env::var("CMAKE_BUILD_PARALLEL_LEVEL").unwrap_or_else(|_| "2".into()))
+        native_build::command(&build)
             .status()
             .expect("启动二维原生编译")
             .success(),

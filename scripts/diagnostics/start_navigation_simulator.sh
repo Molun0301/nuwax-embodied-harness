@@ -8,7 +8,8 @@ if [[ -f .nuwax-test-env/env.sh ]]; then
 else
   export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$simulator_root/runtime_data/navigation_simulator_build}"
 fi
-export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
+export CARGO_BUILD_JOBS="$(python3 "$simulator_root/scripts/build_jobs.py")"
+printf '构建并行预算：%s\n' "$CARGO_BUILD_JOBS"
 cargo build --release --locked --manifest-path scripts/diagnostics/navigation_simulator_native/Cargo.toml
 exec python3 scripts/diagnostics/navigation_simulator.py \
   --binary "$CARGO_TARGET_DIR/release/nuwax-navigation-simulator" "$@"

@@ -343,7 +343,7 @@ def native_runner(run: Runner, venv: Path, jobs: int):
         raise ReleaseError("发布构建需要lcm-gen 1.5.2，实际为：" + version)
 
     def invoke(argv, *, cwd=None, env=None):
-        run(argv, cwd=cwd, env={**(env or {}), "LCM_GEN_EXECUTABLE": str(generator), "CMAKE_BUILD_PARALLEL_LEVEL": str(jobs)})
+        run(argv, cwd=cwd, env={**(env or {}), "LCM_GEN_EXECUTABLE": str(generator), "CARGO_BUILD_JOBS": str(jobs)})
 
     return invoke
 
@@ -562,9 +562,11 @@ def _own_payload(source: Path, destination: Path, modules: tuple, architecture: 
     return inspected
 
 
-def build_runtime(root: Path, output: Path, *, version: str, modules, robot: str = "customrobot", workspace: bool = False, wheelhouse: Optional[Path] = None, payload: Optional[Path] = None, constraints: Optional[Path] = None, target: Optional[dict] = None, jobs: int = 2, install_recipe: Optional[Path] = None, model_recipe: Optional[Path] = None, local_dependencies: bool = False) -> dict:
+def build_runtime(root: Path, output: Path, *, version: str, modules, robot: str = "customrobot", workspace: bool = False, wheelhouse: Optional[Path] = None, payload: Optional[Path] = None, constraints: Optional[Path] = None, target: Optional[dict] = None, jobs: Optional[int] = None, install_recipe: Optional[Path] = None, model_recipe: Optional[Path] = None, local_dependencies: bool = False) -> dict:
     _version(version)
     root, output = root.resolve(), output.resolve()
+    from scripts.module_installer.hardware import resolve_build_jobs
+    jobs = resolve_build_jobs(root, jobs)
     target = target or host_platform()
     validate_platform(target)
     if robot not in ("customrobot", "go2"):

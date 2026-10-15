@@ -594,6 +594,7 @@ def build_modules(root: Path, prefix: Path, cache: Path, modules: Iterable[str],
     selected = set(modules)
     if not isinstance(jobs, int) or isinstance(jobs, bool) or jobs < 1:
         raise ValueError("编译并行数必须是正整数。")
+    print(f"构建并行预算：{jobs}；独立 CMake/Boost 使用此配额，Cargo 原生构建共享任务池。", flush=True)
     binaries = {}  # type: Dict[str, str]
     if not selected.intersection(set(_RUST_BUILDS) | {"fastlio2", "pointlio"}):
         return binaries
@@ -609,7 +610,7 @@ def build_modules(root: Path, prefix: Path, cache: Path, modules: Iterable[str],
     rust_modules = [name for name in _RUST_BUILDS if name in selected]
     if rust_modules:
         cargo, environment = _rust_toolchain(cache, run)
-        environment = {**environment, **_protocol_compiler(cache)}
+        environment = {**environment, **_protocol_compiler(cache), "CARGO_BUILD_JOBS": str(jobs)}
         if "slam2d" in selected:
             from scripts.prepare_slam2d_dependencies import build_dependencies
             build_dependencies(prefix, cache / "slam2d-dependencies", jobs=jobs, run=run)
@@ -631,7 +632,7 @@ def build_modules(root: Path, prefix: Path, cache: Path, modules: Iterable[str],
             build_environment = environment
             if binary_name == "nuwax-slam-2d-worker":
                 build_environment = {**environment, "NUWAX_SLAM2D_DEPENDENCY_PREFIX": str(prefix),
-                                     "CMAKE_PREFIX_PATH": str(prefix), "CMAKE_BUILD_PARALLEL_LEVEL": str(jobs)}
+                                     "CMAKE_PREFIX_PATH": str(prefix)}
             run(tuple(command), cwd=root, env=build_environment)
             built = target / "release" / binary_name
             _executable(built)

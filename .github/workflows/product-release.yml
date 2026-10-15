@@ -70,3 +70,4 @@ jobs:
           python3 scripts/check_source_dependency_reuse.py
           python3 scripts/check_installer_protocol_compiler.py
           python3 scripts/check_installer_naming_identity.py
+          python3 scripts/check_build_parallelism.py

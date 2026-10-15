@@ -1,8 +1,12 @@
+#[path = "../../build_support/native_build.rs"]
+mod native_build;
+
 use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
+    println!("cargo:rerun-if-changed=../../build_support/native_build.rs");
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
     let build = out.join("native-pgo-build");
     let source = PathBuf::from("native/pgo");
@@ -21,7 +25,10 @@ fn main() {
     // Pass an explicit override through to CMake so a stale cached PATH lookup
     // cannot silently select a different schema generator.
     if let Some(generator) = env::var_os("LCM_GEN_EXECUTABLE") {
-        configuration.arg(format!("-DLCM_GEN_EXECUTABLE={}", PathBuf::from(generator).display()));
+        configuration.arg(format!(
+            "-DLCM_GEN_EXECUTABLE={}",
+            PathBuf::from(generator).display()
+        ));
     }
     let configure = configuration
         .args([
@@ -33,15 +40,8 @@ fn main() {
         .status()
         .expect("run cmake configure for native PGO");
     assert!(configure.success(), "native PGO cmake configure failed");
-    let compile = Command::new("cmake")
-        .args([
-            "--build",
-            build.to_str().unwrap(),
-            "--config",
-            "Release",
-            "--parallel",
-        ])
-        .arg(env::var("CMAKE_BUILD_PARALLEL_LEVEL").unwrap_or_else(|_| "2".into()))
+    let compile = native_build::command(&build)
+        .args(["--config", "Release"])
         .status()
         .expect("build native PGO");
     assert!(compile.success(), "native PGO build failed");
@@ -55,7 +55,6 @@ fn main() {
         "LCM_GEN_EXECUTABLE",
         "CMAKE_PREFIX_PATH",
         "CMAKE_TOOLCHAIN_FILE",
-        "CMAKE_BUILD_PARALLEL_LEVEL",
     ] {
         println!("cargo:rerun-if-env-changed={name}");
     }

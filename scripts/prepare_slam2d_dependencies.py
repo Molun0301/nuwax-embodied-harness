@@ -15,6 +15,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from scripts.module_installer.builds import _checkout, _download
+from scripts.module_installer.hardware import resolve_build_jobs  # noqa: E402
 
 SOURCES = {
     "oneTBB": ("https://github.com/oneapi-src/oneTBB.git", "8b829acc65569019edb896c5150d427f288e8aba"),
@@ -79,8 +80,10 @@ def _build_directory(cache, name, source):
     return cache / "build" / source.name
 
 
-def build_dependencies(prefix, cache, *, jobs=2, toolchain=None, run=None):
+def build_dependencies(prefix, cache, *, jobs=None, toolchain=None, run=None):
     prefix, cache = Path(prefix).absolute(), Path(cache).absolute()
+    jobs = resolve_build_jobs(cache, jobs)
+    print(f"二维依赖构建并行预算：{jobs}（CMake 与 Boost）", flush=True)
     if prefix.is_symlink() or cache.is_symlink():
         raise ValueError("二维依赖目录不能是符号链接")
     if run is None:
@@ -123,9 +126,9 @@ def main():
     parser.add_argument("--prefix", type=Path, required=True)
     parser.add_argument("--cache", type=Path, required=True)
     parser.add_argument("--toolchain", type=Path)
-    parser.add_argument("--jobs", type=int, default=2)
+    parser.add_argument("--jobs", type=int)
     args = parser.parse_args()
-    if args.jobs < 1:
+    if args.jobs is not None and args.jobs < 1:
         parser.error("并行数必须为正整数")
     build_dependencies(args.prefix, args.cache, jobs=args.jobs, toolchain=args.toolchain)
 

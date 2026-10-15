@@ -1256,6 +1256,7 @@ def _build_parser():
     # type: () -> argparse.ArgumentParser
     parser = argparse.ArgumentParser(description="构建 Geometry immutable release artifact set")
     parser.add_argument("--cargo", default="cargo")
+    parser.add_argument("--jobs", type=int, help="编译并行数；默认依据CPU与可用内存")
     parser.add_argument("--profile", type=Path, default=_PROFILE_PATH)
     parser.add_argument("--native-lio", action="append", default=[], metavar="/ABS/PATH")
     parser.add_argument("--output-root", type=Path, default=None)
@@ -1299,6 +1300,11 @@ def _build_and_stage(args, native_lio, manifests, stage_parent):
     # type: (argparse.Namespace, Sequence[Tuple[str, Path]], Sequence[Path], Path) -> Path
     with tempfile.TemporaryDirectory(prefix="nuwax-geometry-release-target-") as isolated_target:
         build_env = dict(os.environ)
+        sys.path.insert(0, str(REPO_ROOT))
+        from scripts.module_installer.hardware import resolve_build_jobs
+        jobs = resolve_build_jobs(REPO_ROOT, getattr(args, "jobs", None), environment=build_env)
+        build_env["CARGO_BUILD_JOBS"] = str(jobs)
+        print(f"构建并行预算：{jobs}；Cargo 原生构建共享任务池。", flush=True)
         build_env["CARGO_TARGET_DIR"] = isolated_target
         before = _capture_build_input_closure(args.cargo, manifests, env=build_env)
         geometry_manifest, cli_manifest = manifests[:2]
@@ -1326,7 +1332,7 @@ def _build_and_stage(args, native_lio, manifests, stage_parent):
             if build_env.get("CMAKE_TOOLCHAIN_FILE"):
                 command.append("-DCMAKE_TOOLCHAIN_FILE=" + build_env["CMAKE_TOOLCHAIN_FILE"])
             _run(command, env=build_env)
-            _run(("cmake", "--build", str(driver_build), "--parallel", build_env.get("CMAKE_BUILD_PARALLEL_LEVEL", "2")), env=build_env)
+            _run(("cmake", "--build", str(driver_build), "--parallel", str(jobs)), env=build_env)
             planar_bundle = Path(isolated_target) / "planar-package"
             machine = (build_env.get("CARGO_BUILD_TARGET") or _rust_host(_command_evidence((build_env.get("RUSTC") or "rustc", "--version", "--verbose"), env=build_env))).split("-")[0]
             multiarch = "aarch64-linux-gnu" if machine == "aarch64" else "x86_64-linux-gnu"

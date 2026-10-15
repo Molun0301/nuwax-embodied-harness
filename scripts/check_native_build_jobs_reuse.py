@@ -26,27 +26,37 @@ args=sys.argv[1:]
 root=pathlib.Path.cwd()
 phase='configure' if '-S' in args else 'build'
 with pathlib.Path(os.environ['FIXTURE_COMMAND_LOG']).open('a') as f:
- f.write(json.dumps({'args':args,'phase':phase,'jobs_env':os.environ.get('CMAKE_BUILD_PARALLEL_LEVEL'),'prefix':os.environ.get('CMAKE_PREFIX_PATH'),'toolchain':os.environ.get('CMAKE_TOOLCHAIN_FILE')})+'\\n')
+ f.write(json.dumps({'args':args,'phase':phase,'jobs_env':os.environ.get('CMAKE_BUILD_PARALLEL_LEVEL'),'makeflags':os.environ.get('MAKEFLAGS'),'cargo_makeflags':os.environ.get('CARGO_MAKEFLAGS'),'prefix':os.environ.get('CMAKE_PREFIX_PATH'),'toolchain':os.environ.get('CMAKE_TOOLCHAIN_FILE')})+'\\n')
 if (root/'control'/('fail-'+phase)).exists():
  print('fixture injected '+phase+' failure',file=sys.stderr)
  sys.exit(29)
 if phase=='configure':
  build=pathlib.Path(args[args.index('-B')+1]); build.mkdir(parents=True,exist_ok=True)
  (build/'gtsam-library.txt').write_text(str(build/'libfixture_gtsam.a')+'\\n')
+ (build/'gtsam-openmp-libraries.txt').write_text('gomp=/fixture/libgomp.so\\n')
+ (build/'CMakeCache.txt').write_text('CMAKE_GENERATOR:INTERNAL=Unix Makefiles\\n')
+ (build/'pgo').write_text('fixture binary')
 ''')
 (FAKE/'cmake').chmod(0o755)
-SCRIPTS = {'slam': 'nuwax-slam-toolbox-sys', 'gtsam':'nuwax-gtsam'}
+SCRIPTS = {'slam': 'nuwax-slam-toolbox-sys', 'gtsam':'nuwax-gtsam', 'pgo':'nuwax-nav-pgo-bridge'}
 for name, crate in SCRIPTS.items():
- original = (REPO / 'services/nuwax-workspace/crates' / crate / 'build.rs').read_text()
+ original = (REPO / 'services/nuwax-workspace/crates' / crate / 'build.rs').read_text().replace('../../build_support/native_build.rs', 'native_build.rs')
  for version in ('baseline','candidate'):
   root=BASE/f'{name}-{version}'
   root.mkdir(exist_ok=True)
   for sub in ('src','native','control'): (root/sub).mkdir(exist_ok=True)
   (root/'Cargo.toml').write_text('[package]\nname = "jobs_fixture_'+name+'_'+version+'"\nversion = "0.1.0"\nedition = "2021"\n[workspace]\n')
+  shutil.copyfile(REPO/'services/nuwax-workspace/build_support/native_build.rs', root/'native_build.rs')
+  if name=='pgo':
+   (root/'native/pgo').mkdir()
+   (root/'shared-gtsam').mkdir()
+   (root/'lcmtypes/nuwax_msgs').mkdir(parents=True)
+   for message in ('NativePgoRequest', 'NativePgoResult', 'NativePgoStatus'):
+    (root/'lcmtypes/nuwax_msgs'/(message+'.lcm')).touch()
   (root/'src/lib.rs').write_text('pub fn fixture() -> u32 { 1 }\n')
-  (root/'native/input.cpp').write_text('// literal fixture; never compiled\n')
-  needle='        "CMAKE_BUILD_PARALLEL_LEVEL",\n' if name=='slam' else '    println!("cargo:rerun-if-env-changed=CMAKE_BUILD_PARALLEL_LEVEL");\n'
-  anchor='        "CMAKE_TOOLCHAIN_FILE",\n' if name=='slam' else '    println!("cargo:rerun-if-env-changed=CMAKE_TOOLCHAIN_FILE");\n'
+  (root/('native/pgo/input.cpp' if name=='pgo' else 'native/input.cpp')).write_text('// literal fixture; never compiled\n')
+  needle='        "CMAKE_BUILD_PARALLEL_LEVEL",\n' if name in ('slam','pgo') else '    println!("cargo:rerun-if-env-changed=CMAKE_BUILD_PARALLEL_LEVEL");\n'
+  anchor='        "CMAKE_TOOLCHAIN_FILE",\n' if name in ('slam','pgo') else '    println!("cargo:rerun-if-env-changed=CMAKE_TOOLCHAIN_FILE");\n'
   assert original.count(needle) in (0, 1)
   if needle in original:
    baseline=original
@@ -62,6 +72,7 @@ for name, crate in SCRIPTS.items():
     assert original.count(anchor)==1
     baseline=original.replace(anchor, anchor+needle)
   text=baseline if version=='baseline' else candidate
+  text=text.replace('../nuwax-gtsam/native', 'shared-gtsam').replace('../../lcmtypes/', 'lcmtypes/')
   (root/'build.rs').write_text(text)
   (root/'toolchain-a.cmake').write_text('# literal fixture; fake CMake does not read it\n')
   (root/'toolchain-b.cmake').write_text('# literal alternate toolchain\n')
@@ -90,10 +101,12 @@ for name in SCRIPTS:
    assert (p.returncode==0)==success,(row,p.stderr)
    assert len(calls)==expected,row
    for call in calls:
-    assert call['jobs_env']==env['CMAKE_BUILD_PARALLEL_LEVEL'],row
+    assert call['jobs_env']==(env['CMAKE_BUILD_PARALLEL_LEVEL'] if call['phase']=='configure' else None),row
     assert call['prefix']==env['CMAKE_PREFIX_PATH'],row
     assert call['toolchain']==env['CMAKE_TOOLCHAIN_FILE'],row
-    if call['phase']=='build': assert call['args'][-1]==env['CMAKE_BUILD_PARALLEL_LEVEL'],row
+    if call['phase']=='build':
+     assert '--parallel' not in call['args'],row
+     assert call['makeflags']==call['cargo_makeflags'],row
     if name=='slam' and call['phase']=='configure':
      assert '-DNUWAX_SLAM2D_DEPENDENCY_PREFIX='+env.get('NUWAX_SLAM2D_DEPENDENCY_PREFIX','') in call['args'],row
    if expected==2:
@@ -101,7 +114,7 @@ for name in SCRIPTS:
     assert '-DCMAKE_TOOLCHAIN_FILE='+env['CMAKE_TOOLCHAIN_FILE'] in calls[0]['args'],row
    print(name,version,label,'exit',p.returncode,'cmake_calls',len(calls),flush=True)
   def change_native(label):
-   p=root/'native/input.cpp'; p.write_text(p.read_text()+'// '+label+'\n')
+   p=root/('native/pgo/input.cpp' if name=='pgo' else 'native/input.cpp'); p.write_text(p.read_text()+'// '+label+'\n')
   run('01-first',2)
   run('02-unchanged',0)
   env['CMAKE_BUILD_PARALLEL_LEVEL']='3'

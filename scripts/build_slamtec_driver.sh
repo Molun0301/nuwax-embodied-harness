@@ -7,6 +7,8 @@ NUWAX_SLAMTEC_ARGS=()
 if [[ -n "${CMAKE_TOOLCHAIN_FILE:-}" ]]; then
   NUWAX_SLAMTEC_ARGS+=("-DCMAKE_TOOLCHAIN_FILE=$CMAKE_TOOLCHAIN_FILE")
 fi
+NUWAX_BUILD_JOBS="$(python3 "$NUWAX_SLAMTEC_REPO/scripts/build_jobs.py")"
+printf '构建并行预算：%s\n' "$NUWAX_BUILD_JOBS"
 cmake -S "$NUWAX_SLAMTEC_REPO/drivers/sensors/slamtec_native" -B "$NUWAX_SLAMTEC_BUILD" \
   -DCMAKE_BUILD_TYPE=Release "${NUWAX_SLAMTEC_ARGS[@]}" "$@"
-cmake --build "$NUWAX_SLAMTEC_BUILD" --parallel "${CMAKE_BUILD_PARALLEL_LEVEL:-2}"
+cmake --build "$NUWAX_SLAMTEC_BUILD" --parallel "$NUWAX_BUILD_JOBS"

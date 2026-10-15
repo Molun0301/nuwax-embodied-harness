@@ -66,7 +66,9 @@ def group_system_packages(plan: dict, group_id: str) -> list:
     return sorted("libglib2.0-0t64" if name == "libglib2.0-0" and group["platform"]["os_versions"] == ["24.04"] else name for name in packages)
 
 
-def build_group(plan: dict, group_id: str, root: Path, output: Path, *, jobs: int = 2, input_root: Optional[Path] = None, cache: Optional[Path] = None) -> list:
+def build_group(plan: dict, group_id: str, root: Path, output: Path, *, jobs: Optional[int] = None, input_root: Optional[Path] = None, cache: Optional[Path] = None) -> list:
+    from scripts.module_installer.hardware import resolve_build_jobs
+    jobs = resolve_build_jobs(root, jobs)
     group = next((item for item in plan["build_matrix"]["include"] if item["id"] == group_id), None)
     if group is None:
         raise ReleaseError("构建计划没有该组：" + group_id)
@@ -75,7 +77,7 @@ def build_group(plan: dict, group_id: str, root: Path, output: Path, *, jobs: in
         raise ReleaseError("真实系统/架构/解释器与构建组不符")
     entries = [entry for entry in plan["matrix"]["include"] if entry["id"] in group["entries"]]
     if not group["shared"]:
-        return [build_target(plan, entry["id"], root, output / entry["id"], input_root=input_root) for entry in entries]
+        return [build_target(plan, entry["id"], root, output / entry["id"], input_root=input_root, jobs=jobs) for entry in entries]
     work = output.with_name(output.name + ".work")
     if output.exists() or work.exists():
         raise ReleaseError("构建组输出已存在，禁止覆盖")
@@ -169,7 +171,7 @@ def load_plan(path: Path) -> dict:
     return plan
 
 
-def build_target(plan: dict, target_id: str, root: Path, output: Path, *, input_root: Optional[Path] = None) -> dict:
+def build_target(plan: dict, target_id: str, root: Path, output: Path, *, input_root: Optional[Path] = None, jobs: Optional[int] = None) -> dict:
     entries = [entry for entry in plan["matrix"]["include"] if entry["id"] == target_id]
     if len(entries) != 1:
         raise ReleaseError("本次计划没有唯一目标：" + target_id)
@@ -186,7 +188,7 @@ def build_target(plan: dict, target_id: str, root: Path, output: Path, *, input_
     models = inputs / "models.json" if inputs and (inputs / "models.json").is_file() else None
     output.mkdir(parents=True, exist_ok=True)
     archive = output / entry["filename"]
-    manifest = build_runtime(root, archive, version=plan["version"], modules=entry["modules"], robot=entry["robot"], wheelhouse=wheels, constraints=constraints, install_recipe=recipe, model_recipe=models)
+    manifest = build_runtime(root, archive, version=plan["version"], modules=entry["modules"], robot=entry["robot"], wheelhouse=wheels, constraints=constraints, install_recipe=recipe, model_recipe=models, jobs=jobs)
     receipt = {"schema_version": 1, "target_id": target_id, "version": manifest["version"], "revision": manifest["revision"], "filename": archive.name, "sha256": digest(archive), "size": archive.stat().st_size, "assets": relative_assets(manifest["install"])}
     write_json(output / "receipt.json", receipt)
     return receipt

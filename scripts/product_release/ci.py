@@ -40,9 +40,9 @@ def configured_request(config: dict, *, event: str, ref: str, inputs: dict) -> d
         raise ReleaseError("正式/预览渠道与版本号不一致")
     if not isinstance(targets, list) or not targets or any(not isinstance(value, str) for value in targets):
         raise ReleaseError("发布配置必须给出完整目标列表")
-    jobs = config.get("build_jobs", 2)
-    if not isinstance(jobs, int) or isinstance(jobs, bool) or not 1 <= jobs <= 8:
-        raise ReleaseError("构建并行数须为1—8")
+    jobs = config.get("build_jobs")
+    if jobs is not None and (not isinstance(jobs, int) or isinstance(jobs, bool) or jobs < 1):
+        raise ReleaseError("构建并行数须为正整数；省略时按构建机资源自动选择")
     input_root = config.get("input_root", ".github/release-inputs")
     safe_path(input_root)
     if not isinstance(config.get("notes", ""), str):

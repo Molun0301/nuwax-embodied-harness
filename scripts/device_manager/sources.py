@@ -72,8 +72,12 @@ def bridge(engine, source, candidate, operation, job, **values):
     payload = dict(values, operation=operation, root=str(source["root"]), candidate=str(candidate), home=str(engine.home),
                    build_prefix=str(source["build_prefix"]), build_cache=str(source["build_cache"]),
                    modules=job["_plan"]["modules"], robot=job["_plan"]["robot"], revision=source["revision"])
+    environment = clean_environment(candidate)
+    if operation == "build":
+        # 原生检查解析readelf/ldd的字段，固定工具语言而不修改设备或业务语言。
+        environment["LC_ALL"] = "C"
     output = run_command([sys.executable, str(PACKAGE_ROOT / "scripts/neh_source_build.py")],
-                         cwd=source["root"], environment=clean_environment(candidate), payload=json.dumps(payload),
+                         cwd=source["root"], environment=environment, payload=json.dumps(payload),
                          timeout=21600 if operation in ("dependencies", "build", "models") else 180,
                          cancelled=lambda: engine._cancelled(job["id"]))
     for line in reversed(output.splitlines()):

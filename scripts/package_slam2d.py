@@ -17,8 +17,13 @@ _SYSTEM_ABI = {"libc.so.6", "libm.so.6", "libpthread.so.0", "librt.so.1", "libdl
 
 
 def elf_info(path):
-    result = subprocess.run(["readelf", "-h", "-d", str(path)], check=True, text=True, capture_output=True).stdout
-    machine = re.search(r"Machine:\s*(.+)", result).group(1).strip()
+    # 工具输出参与结构解析，不能随设备桌面语言切换字段名称。
+    result = subprocess.run(["readelf", "-h", "-d", str(path)], check=True, text=True,
+                            capture_output=True, env={**os.environ, "LC_ALL": "C"}).stdout
+    header = re.search(r"^\s*Machine:[ \t]*(.+)$", result, re.MULTILINE)
+    if header is None:
+        raise RuntimeError("无法读取原生程序的目标架构：" + str(path))
+    machine = header.group(1).strip()
     needed = re.findall(r"\(NEEDED\).*\[([^\]]+)\]", result)
     search = []
     for value in re.findall(r"\((?:RUNPATH|RPATH)\).*\[([^\]]+)\]", result):

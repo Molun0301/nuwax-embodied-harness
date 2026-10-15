@@ -257,7 +257,7 @@ class Engine:
         manager_relation = None if MANAGER_DEVELOPMENT else compare_versions(latest_manager, installed_manager)
         if source_mode and available:
             manager_relation = 0 if available.get("revision") == MANAGER_REVISION else 1
-        installation = {"installed": bool(current), "version": current.get("version"), "modules": current.get("modules", []),
+        installation = {"installed": bool(current), "install_dir": str(self.home), "version": current.get("version"), "modules": current.get("modules", []),
                         "robot": current.get("robot", "customrobot"), "previous_version": history.get("previous_version"), "source": current.get("source"), "revision": current.get("revision", "")}
         return {"product": "NEH", "manager_version": MANAGER_VERSION, "manager_revision": MANAGER_REVISION, "manager_development": MANAGER_DEVELOPMENT, "instance_id": self.instance_id, "installation": installation,
                 "runtime": self.runtime.status(), "active_job": self.active_job(),

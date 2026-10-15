@@ -132,7 +132,7 @@ for relative in ("scripts/neh_bootstrap.py", "scripts/neh_source.py"):
 print("已固定安装源码：" + revision[:12], flush=True)
 PY
 NEH_BOOTSTRAP_FIXED_REVISION=$(cat "$NEH_BOOTSTRAP_TEMP/revision")
-if [[ " ${NEH_BOOTSTRAP_ARGS[*]} " == *' --cli '* && -r /dev/tty ]]; then
+if [[ " ${NEH_BOOTSTRAP_ARGS[*]} " == *' --cli '* ]] && ( : </dev/tty ) 2>/dev/null; then
   python3 "$NEH_BOOTSTRAP_TEMP/scripts/neh_bootstrap.py" "${NEH_BOOTSTRAP_ARGS[@]}" --revision "$NEH_BOOTSTRAP_FIXED_REVISION" </dev/tty
 else
   python3 "$NEH_BOOTSTRAP_TEMP/scripts/neh_bootstrap.py" "${NEH_BOOTSTRAP_ARGS[@]}" --revision "$NEH_BOOTSTRAP_FIXED_REVISION"

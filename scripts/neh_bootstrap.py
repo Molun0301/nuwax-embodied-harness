@@ -526,13 +526,29 @@ def source_manager(args, destination, token):
         raise BootstrapError(str(exc)) from exc
 
 
+def install_home(args):
+    """只在首次交互安装时询问；参数和环境变量仍使用同一安装根。"""
+    home = args.home
+    if home is None:
+        home = Path.home() / ".local/share/neh"
+        if args.cli and not args.configure and sys.stdin.isatty() and not home.exists():
+            try:
+                selected = input("安装位置 [%s]（回车使用默认目录）：" % home).strip()
+            except EOFError as exc:
+                raise BootstrapError("已取消安装位置选择，未创建安装目录") from exc
+            if selected:
+                home = Path(selected)
+    return home.expanduser().resolve()
+
+
 def install(args):
     if sys.platform != "linux":
         raise BootstrapError("当前端侧安装入口支持Linux；其它系统尚未完成验证")
     if os.geteuid() == 0:
         raise BootstrapError("请用普通用户运行引导安装，系统服务步骤会单独请求管理员权限")
-    home = args.home.expanduser().resolve()
+    home = install_home(args)
     args.home = home
+    print("安装位置：" + str(home), flush=True)
     home.mkdir(parents=True, exist_ok=True, mode=0o700)
     if home.stat().st_uid != os.getuid() or home.stat().st_mode & 0o022:
         raise BootstrapError("安装目录必须归当前用户持有且其它用户不可写")
@@ -702,7 +718,7 @@ def install(args):
             print("设备网络地址：" + address)
         if not addresses:
             print("未检测到外部网络地址；连接设备网络后使用该设备地址和端口%s访问。" % args.port)
-    print("命令行入口：" + str(binary))
+    print("命令行入口：" + shlex.quote(str(binary)))
     if args.configure:
         command = cli_command(home, python, "apply", "--file", str(args.configure.resolve()), "--wait")
         if args.catalog and not args.catalog.startswith(("https://", "http://")):
@@ -717,7 +733,9 @@ def install(args):
 
 def parser():
     result = argparse.ArgumentParser(description="NEH端侧安装：一条命令准备网页和命令行管理入口")
-    result.add_argument("--home", type=Path, default=Path.home() / ".local/share/neh")
+    result.add_argument("--install-dir", "--home", dest="home", type=Path,
+                        default=os.environ.get("NEH_HOME") or None, metavar="PATH",
+                        help="安装根目录（兼容--home）；默认NEH_HOME或~/.local/share/neh")
     result.add_argument("--repository", default=DEFAULT_REPOSITORY, help="源码仓库HTTPS地址")
     result.add_argument("--branch", default=DEFAULT_BRANCH, help="跟踪的源码分支")
     result.add_argument("--revision", help="固定完整源码提交；省略时查询分支当前提交")

@@ -431,6 +431,9 @@
     state.platformSupported = status.platform_supported !== false;
 
     text($('managerVersion'), '管理器 ' + (status.manager_development ? '开发版本' : (status.manager_version || '--')));
+    const installDir = status.installation && status.installation.install_dir;
+    text($('setupInstallDir'), installDir || '未知');
+    text($('installDir'), installDir || '未知');
 
     if (status.installation && status.installation.installed) {
       const robot = status.installation.robot ? status.installation.robot : '';

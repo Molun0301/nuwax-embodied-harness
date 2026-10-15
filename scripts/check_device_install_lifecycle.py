@@ -59,7 +59,7 @@ class Checks(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory(prefix="neh-device-lifecycle-")
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
-        self.engine = Engine(self.root / "managed")
+        self.engine = Engine(self.root / "NEH 安装 空间")
         self.engine.runtime = FakeRuntime()
         self.engine.hardware = Mock(return_value={
             "hardware": {"free_disk_bytes": 1024 ** 4}, "supported": True, "issues": [],
@@ -200,6 +200,36 @@ class OwnerChecks(Checks):
             self.engine._restore(job)
         self.assertEqual(error.exception.code, "owner_identity")
         self.assertEqual(self.engine.runtime.calls, [])
+
+
+class InstallLocationChecks(Checks):
+    def test_start_update_and_rollback_keep_custom_root_and_data(self):
+        original = self.install_current()
+        data = self.engine.home / "data/maps/user-map"
+        data.parent.mkdir(parents=True)
+        data.write_text("retained map")
+        candidate = self.engine.home / "releases/candidate"
+        candidate.mkdir()
+        atomic_json(candidate / "installed.json", {"complete": True, "version": "v2", "modules": ["core"], "robot": "customrobot"})
+        for prefix in (original, candidate):
+            (prefix / "settings.env").write_text("NUWAX_RUNTIME_DATA_DIR=" + str(self.engine.home / "data") + "\n")
+        started = []
+        start = self.engine.runtime.start
+        self.engine.runtime.start = lambda prefix: (started.append(prefix), start(prefix))[-1]
+        self.assertEqual(self.run_job(self.job("start"))["status"], "succeeded")
+        with patch.object(self.engine, "_prepare", return_value=candidate):
+            self.assertEqual(self.run_job(self.job("update"))["status"], "succeeded")
+        self.assertEqual(self.engine.current()["prefix"], str(candidate))
+        with patch.object(self.engine, "_existing", return_value={}), \
+                patch.object(self.engine, "_configure_candidate") as configure:
+            self.assertEqual(self.run_job(self.job("rollback", _previous=original.name))["status"], "succeeded")
+        self.assertEqual(configure.call_args.args[0], original)
+        self.assertEqual(self.engine.current()["prefix"], str(original))
+        self.assertEqual(started, [original, candidate, original])
+        self.assertEqual(data.read_text(), "retained map")
+        self.assertEqual(read_settings(self.engine.home / "data/settings/active.env")["NUWAX_RUNTIME_DATA_DIR"],
+                         str(self.engine.home / "data"))
+        self.assertEqual(len(list((self.engine.home / "jobs").glob("*.json"))), 3)
 
 
 class StorageHookChecks(Checks):

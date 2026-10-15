@@ -44,7 +44,7 @@ class BootstrapRecoveryChecks(unittest.TestCase):
     def setUp(self):
         directory = tempfile.TemporaryDirectory(prefix="neh-bootstrap-recovery-")
         self.addCleanup(directory.cleanup)
-        self.home = Path(directory.name)
+        self.home = Path(directory.name) / "NEH 安装 空间"
         self.old = self.home / "manager/versions/fixture-previous"
         self.old.mkdir(parents=True)
         (self.old / "manager-manifest.json").write_text(json.dumps({"version": "fixture-previous"}))
@@ -66,7 +66,7 @@ class BootstrapRecoveryChecks(unittest.TestCase):
         token.write_text("fixture-new-token-not-real")
         token.chmod(0o600)
         self.args = bootstrap.parser().parse_args([
-            "--home", str(self.home), "--repository", "https://github.com/example/candidate.git",
+            "--install-dir", str(self.home), "--repository", "https://github.com/example/candidate.git",
             "--branch", "candidate", "--token-file", str(token), "--service", "none",
             "--host", "127.0.0.1", "--port", "18767", "--no-browser"])
         self.events = []
@@ -314,6 +314,22 @@ class BootstrapRecoveryChecks(unittest.TestCase):
         self.assertEqual(bootstrap.install(self.args), 0)
         self.assertEqual((self.home / "manager/current").resolve(), current)
         self.assertEqual((self.home / "manager/previous").resolve(), self.old)
+
+    def test_generated_launcher_pins_custom_location_despite_environment_and_cwd(self):
+        self.fail_launch = False
+        self.assertEqual(bootstrap.install(self.args), 0)
+        self.engine.save_settings({"source_mode": "catalog", "feed_url": ""})
+        other_home = self.home.parent / "unrelated installation"
+        environment = dict(os.environ, NEH_HOME=str(other_home))
+        with patch.object(subprocess, "Popen", START_PROCESS):
+            result = RUN_PROCESS([str(self.binary), "status"], cwd=str(self.home.parent),
+                                 env=environment, text=True, capture_output=True, check=True)
+        status = json.loads(result.stdout)
+        self.assertEqual(status["installation"]["install_dir"], str(self.home))
+        self.assertEqual(status["instance_id"], self.engine.instance_id)
+        self.assertFalse(other_home.exists())
+        self.assertIn("安装位置：" + str(self.home), self.output.getvalue())
+        self.assertIn("命令行入口：'" + str(self.binary) + "'", self.output.getvalue())
 
 
 class ManagerListenerChecks(unittest.TestCase):

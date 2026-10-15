@@ -55,7 +55,8 @@ for ((neh_i=0; neh_i < ${#NEH_BOOTSTRAP_ARGS[@]}; neh_i++)); do
 unset PYTHONHOME PYTHONPATH
 export PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1
 python3 - <<'PY'
-import json, os, pathlib, re, subprocess, sys, urllib.error, urllib.parse, urllib.request
+import errno, http.client, json, os, pathlib, re, shutil, socket, ssl, subprocess, sys, tempfile, time
+import urllib.error, urllib.parse, urllib.request
 if not (3, 8) <= sys.version_info[:2] < (3, 13):
     raise SystemExit("引导安装需要Python 3.8至3.12")
 repository = os.environ["NEH_BOOTSTRAP_REPOSITORY"]
@@ -91,18 +92,110 @@ class Redirect(urllib.request.HTTPRedirectHandler):
         return result
 
 opener = urllib.request.build_opener(Redirect())
+MAX_DOWNLOAD = 2 * 1024 * 1024
+DOWNLOAD_ATTEMPTS = 3
+DOWNLOAD_TIMEOUT = 45
+RETRY_HTTP = {408, 429, 500, 502, 503, 504}
+# 私有入口已经用gh取得本脚本；直接复用相同传输及已有授权。
+# 不要求匿名入口安装gh，也不依赖用户持久保存的gh登录配置。
+gh = shutil.which("gh") if token else None
+
+class DownloadError(Exception):
+    def __init__(self, reason, retry=False):
+        self.reason, self.retry = reason, retry
+
+def http_failure(status):
+    if status in (401, 403, 404):
+        return DownloadError("HTTP %s；请核对仓库、分支及私有仓库访问权限" % status)
+    return DownloadError("HTTP %s" % status, status in RETRY_HTTP)
+
+def network_failure(exc):
+    reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+    if isinstance(reason, ssl.SSLCertVerificationError):
+        return DownloadError("TLS证书验证失败；请检查设备时间与CA证书，不要关闭证书验证")
+    transient = isinstance(reason, (ssl.SSLEOFError, TimeoutError, ConnectionError,
+                                   http.client.IncompleteRead, http.client.RemoteDisconnected))
+    transient = transient or (isinstance(reason, OSError) and reason.errno in
+                              (errno.ETIMEDOUT, errno.ECONNRESET, errno.ECONNABORTED,
+                               errno.ECONNREFUSED, errno.ENETUNREACH, errno.EHOSTUNREACH))
+    transient = transient or (isinstance(reason, socket.gaierror) and reason.errno == socket.EAI_AGAIN)
+    # 只显示已知类别，底层异常可能包含代理凭据、令牌或响应内容。
+    return DownloadError("TLS或网络连接中断" if transient else "TLS或网络请求失败", transient)
+
+def gh_download(url, accept):
+    if urllib.parse.urlsplit(url).netloc != "api.github.com" or not url.startswith("https://"):
+        raise DownloadError("拒绝非GitHub官方API下载地址")
+    gh_environment = dict(environment)
+    for key in ("GH_DEBUG", "DEBUG", "GH_FORCE_TTY", "CLICOLOR_FORCE", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"):
+        gh_environment.pop(key, None)
+    gh_environment.update(GH_TOKEN=token, GH_HOST="github.com", GH_PROMPT_DISABLED="1", GH_PAGER="cat", NO_COLOR="1", GH_NO_UPDATE_NOTIFIER="1")
+    # 令牌只放在本次子进程环境中，不进入参数、日志或新的登录配置。
+    with tempfile.TemporaryFile() as output:
+        try:
+            result = subprocess.run([gh, "api", "--hostname", "github.com", "--method", "GET", "--include",
+                                     "--header", "Accept: " + accept, url], env=gh_environment,
+                                    stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.PIPE,
+                                    timeout=DOWNLOAD_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            raise DownloadError("GitHub请求超时", True) from None
+        output.seek(0)
+        status_line = output.readline(8193)
+        status_match = re.match(br"HTTP/\S+ (\d{3})\b", status_line)
+        status = int(status_match.group(1)) if status_match else None
+        if status is not None and not 200 <= status < 300:
+            raise http_failure(status)
+        if result.returncode:
+            error = result.stderr.lower()
+            if b"certificate" in error or b"x509:" in error:
+                raise DownloadError("TLS证书验证失败；请检查设备时间与CA证书，不要关闭证书验证")
+            transient = result.returncode == 1 and any(part in error for part in (
+                b"eof", b"timeout", b"timed out", b"connection reset", b"connection refused",
+                b"error connecting to", b"temporary failure", b"network is unreachable",
+                b"context deadline exceeded", b"stream error", b"goaway"))
+            raise DownloadError("GitHub连接中断" if transient else "GitHub CLI请求失败；请检查已有登录与网络", transient)
+        if status is None:
+            raise DownloadError("GitHub API响应缺少有效状态")
+        header_bytes = len(status_line)
+        while True:
+            line = output.readline(8193)
+            header_bytes += len(line)
+            if not line or len(line) > 8192 or header_bytes > 65536:
+                raise DownloadError("GitHub API响应头无效")
+            if line in (b"\n", b"\r\n"):
+                break
+        return output.read(MAX_DOWNLOAD + 1)
+
 def download(url, accept):
     headers = {"User-Agent": "NEH-source-bootstrap/1", "Accept": accept}
     if token:
         headers["Authorization"] = "Bearer " + token
-    try:
-        with opener.open(urllib.request.Request(url, headers=headers), timeout=45) as response:
-            content = response.read(2 * 1024 * 1024 + 1)
-    except urllib.error.HTTPError as exc:
-        raise SystemExit("无法获取安装源码（HTTP %s）；请核对私有仓库访问权限" % exc.code) from exc
-    if len(content) > 2 * 1024 * 1024:
-        raise SystemExit("引导源码超过大小限制")
-    return content
+    for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+        try:
+            if gh:
+                content = gh_download(url, accept)
+            else:
+                with opener.open(urllib.request.Request(url, headers=headers), timeout=DOWNLOAD_TIMEOUT) as response:
+                    content = response.read(MAX_DOWNLOAD + 1)
+                    # read(limit)可能静默返回被截断的Content-Length响应。
+                    if len(content) <= MAX_DOWNLOAD and getattr(response, "length", 0):
+                        raise http.client.IncompleteRead(content)
+            if len(content) > MAX_DOWNLOAD:
+                raise DownloadError("引导源码超过大小限制")
+            return content
+        except urllib.error.HTTPError as exc:
+            failure = http_failure(exc.code)
+            if exc.fp is not None:
+                exc.close()
+        except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
+            failure = network_failure(exc)
+        except DownloadError as exc:
+            failure = exc
+        if not failure.retry or attempt == DOWNLOAD_ATTEMPTS:
+            raise SystemExit("无法获取安装源码（%s；尝试%d/%d次）。请确认网络后重新运行原安装命令。" %
+                             (failure.reason, attempt, DOWNLOAD_ATTEMPTS)) from None
+        print("安装源码下载暂时失败（%s）；%d秒后重试（%d/%d）" %
+              (failure.reason, attempt, attempt + 1, DOWNLOAD_ATTEMPTS), file=sys.stderr, flush=True)
+        time.sleep(attempt)
 
 local = os.environ["NEH_BOOTSTRAP_ALLOW_LOCAL"] == "1" and parsed.scheme in ("", "file")
 if local:

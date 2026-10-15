@@ -4,6 +4,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from scripts.neh_bootstrap import INSTALL_DIRECTORY_NAME
+
 from .common import ManagerError, atomic_json, read_json
 
 
@@ -36,6 +38,17 @@ def directory_path(value):
         raise ManagerError("invalid_install_dir", "请使用绝对路径或以~/开头的目录路径。") from exc
 
 
+def selected_directory(value):
+    """A Web folder selection is a parent; selecting the NEH folder itself reuses it."""
+    parent = directory_path(value)
+    if parent.exists() and not parent.is_dir():
+        raise ManagerError("invalid_install_dir", "所选路径不是目录。")
+    name = Path(os.path.normpath(value.strip())).name
+    if name == INSTALL_DIRECTORY_NAME or parent.name == INSTALL_DIRECTORY_NAME:
+        return parent
+    return directory_path(str(parent / INSTALL_DIRECTORY_NAME))
+
+
 def prepare_directory(engine, value):
     target = directory_path(value)
     manager = engine.manager_home
@@ -46,8 +59,9 @@ def prepare_directory(engine, value):
         if target.exists():
             if not target.is_dir():
                 raise ManagerError("invalid_install_dir", "所选路径不是目录。")
-            if target != manager and any(target.iterdir()) and read_json(target / "config/manager-home.json", {}) != owner:
-                raise ManagerError("install_dir_not_empty", "请选择空目录或新的子目录，避免覆盖已有文件。", 409)
+            marker = target / "config/manager-home.json"
+            if target != manager and any(target.iterdir()) and (not marker.is_file() or read_json(marker, {}) != owner):
+                raise ManagerError("install_dir_not_empty", "目标文件夹已包含其他内容，无法作为NEH安装目录：" + str(target) + "。请另选父目录，已有文件不会被修改。", 409)
             if target != engine.home and ((target / "current").exists() or (target / "current").is_symlink()):
                 raise ManagerError("install_dir_installed", "目标目录已有安装，不能通过选择位置接管或迁移。", 409)
         else:
@@ -62,7 +76,7 @@ def prepare_directory(engine, value):
 
 
 def browse_directories(engine, value=None):
-    path = directory_path(value) if value else engine.home
+    path = directory_path(value) if value else engine.home.parent
     if not value:
         while not path.exists() and path != path.parent:
             path = path.parent
@@ -73,6 +87,7 @@ def browse_directories(engine, value=None):
                        if not child.name.startswith(".") and child.is_dir() and os.access(str(child), os.R_OK | os.X_OK)]
     except OSError as exc:
         raise ManagerError("directory_unavailable", "当前设备用户无权浏览此目录。", 403) from exc
-    return {"path": str(path), "parent": str(path.parent) if path != path.parent else None,
+    selection = value if value else str(path)
+    return {"path": str(path), "selection_path": selection, "parent": str(path.parent) if path != path.parent else None,
             "directories": sorted(directories, key=lambda item: item["name"].casefold()),
-            "writable": os.access(str(path), os.W_OK | os.X_OK)}
+            "writable": os.access(str(path), os.W_OK | os.X_OK), "install_dir": str(selected_directory(selection))}

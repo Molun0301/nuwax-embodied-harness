@@ -30,6 +30,7 @@ import webbrowser
 DEFAULT_CATALOG = "https://github.com/Molun0301/nuwax-embodied-harness/releases/latest/download/catalog.json"
 DEFAULT_REPOSITORY = "https://github.com/Molun0301/nuwax-embodied-harness.git"
 DEFAULT_BRANCH = "main"
+INSTALL_DIRECTORY_NAME = "Nuwax-embodied-harness"
 MAX_MANAGER_BYTES = 128 * 1024 * 1024
 MAX_MANAGER_UNPACKED = 512 * 1024 * 1024
 
@@ -551,11 +552,26 @@ def require_install_layout(home, manifest):
             raise BootstrapError("该管理版本不支持网页选择的独立安装目录，请选择支持此功能的版本")
 
 
+def default_install_home():
+    """Prefer the visible default, but keep a recognized older installation in place."""
+    preferred = Path.home() / INSTALL_DIRECTORY_NAME
+    legacy = Path.home() / ".local/share/neh"
+    for home in (preferred, legacy):
+        try:
+            if (home / "config/instance-id").is_file() or (home / "bin/neh").is_file():
+                return home
+            if any((home / entry).exists() or (home / entry).is_symlink() for entry in ("current", "manager/current")):
+                return home
+        except OSError:
+            continue
+    return preferred
+
+
 def install_home(args):
     """只在首次交互安装时询问；参数和环境变量仍使用同一安装根。"""
     home = args.home
     if home is None:
-        home = Path.home() / ".local/share/neh"
+        home = default_install_home()
         if args.cli and not args.configure and sys.stdin.isatty() and not home.exists():
             try:
                 selected = input("安装位置 [%s]（回车使用默认目录）：" % home).strip()
@@ -766,7 +782,7 @@ def parser():
     result = argparse.ArgumentParser(description="NEH端侧安装：一条命令准备网页和命令行管理入口")
     result.add_argument("--install-dir", "--home", dest="home", type=Path,
                         default=os.environ.get("NEH_HOME") or None, metavar="PATH",
-                        help="安装根目录（兼容--home）；默认NEH_HOME或~/.local/share/neh")
+                        help="安装根目录（兼容--home）；默认NEH_HOME或~/Nuwax-embodied-harness；已有旧安装沿用原位置")
     result.add_argument("--repository", default=DEFAULT_REPOSITORY, help="源码仓库HTTPS地址")
     result.add_argument("--branch", default=DEFAULT_BRANCH, help="跟踪的源码分支")
     result.add_argument("--revision", help="固定完整源码提交；省略时查询分支当前提交")

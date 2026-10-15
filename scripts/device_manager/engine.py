@@ -77,18 +77,25 @@ class Engine:
             active = read_json(self.manager_home / "config/active-job.json", {})
             if active and self.job(active["id"]).get("error", {}).get("code") == "recovery_failed":
                 reason = "上次任务尚未完成安全恢复，请先处理恢复问题。"
-        return {"install_dir": str(self.home), "manager_dir": str(self.manager_home), "editable": not reason, "reason": reason}
+        return {"install_dir": str(self.home), "manager_dir": str(self.manager_home), "parent_dir": str(self.home.parent),
+                "user_home": str(Path.home()), "editable": not reason, "reason": reason}
+
+    def preview_install_location(self, parent):
+        from .locations import selected_directory
+        target = selected_directory(parent)
+        return {"install_dir": str(target), "parent_dir": str(target.parent), "user_home": str(Path.home())}
 
     def save_install_location(self, values):
-        from .locations import prepare_directory
-        if not isinstance(values, dict) or set(values) != {"install_dir"}:
-            raise ManagerError("invalid_install_dir", "请仅提交install_dir安装目录。")
+        from .locations import prepare_directory, selected_directory
+        if not isinstance(values, dict) or set(values) not in ({"install_dir"}, {"parent_dir"}):
+            raise ManagerError("invalid_install_dir", "请提交parent_dir父目录或install_dir完整安装目录。")
         with file_lock(self.lock_path):
             self._assert_idle()
             location = self.install_location()
             if not location["editable"]:
                 raise ManagerError("install_location_locked", location["reason"], 409)
-            target = prepare_directory(self, values["install_dir"])
+            value = str(selected_directory(values["parent_dir"])) if "parent_dir" in values else values["install_dir"]
+            target = prepare_directory(self, value)
             atomic_json(self.manager_home / "config/install-location.json", {"install_dir": str(target)})
         result = self.selected().install_location()
         if target != self.home:
@@ -305,7 +312,8 @@ class Engine:
         installation = {"installed": bool(current), "install_dir": str(self.home), "version": current.get("version"), "modules": current.get("modules", []),
                         "robot": current.get("robot", "customrobot"), "previous_version": history.get("previous_version"), "source": current.get("source"), "revision": current.get("revision", "")}
         location = self.install_location()
-        installation.update(manager_dir=location["manager_dir"], location_editable=location["editable"], location_reason=location["reason"])
+        installation.update(manager_dir=location["manager_dir"], parent_dir=location["parent_dir"], user_home=location["user_home"],
+                            location_editable=location["editable"], location_reason=location["reason"])
         return {"product": "NEH", "manager_version": MANAGER_VERSION, "manager_revision": MANAGER_REVISION, "manager_development": MANAGER_DEVELOPMENT, "instance_id": self.instance_id, "installation": installation,
                 "runtime": self.runtime.status(), "active_job": self.active_job(),
                 "update": {"available": bool(available and current and relation == 1),

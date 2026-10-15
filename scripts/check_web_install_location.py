@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.parse
 from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
@@ -64,6 +65,132 @@ class LocationChecks(unittest.TestCase):
         with self.assertRaises(ManagerError) as caught:
             original.save_install_location({"install_dir": str(self.root / "stale")})
         self.assertEqual(caught.exception.code, "install_location_changed")
+
+    def select_parent(self, parent):
+        result = self.engine.save_install_location({"parent_dir": str(parent)})
+        self.engine = self.engine.selected()
+        return result
+
+    def test_nonempty_parent_creates_named_child_and_preserves_unrelated_files(self):
+        parent = self.root / "数据盘"
+        parent.mkdir()
+        unrelated = parent / "user-file.txt"
+        unrelated.write_text("preserved")
+        result = self.select_parent(parent)
+        target = parent / "Nuwax-embodied-harness"
+        self.assertEqual(self.engine.home, target)
+        self.assertEqual(result["install_dir"], str(target))
+        self.assertEqual(result["parent_dir"], str(parent))
+        self.assertEqual(read_json(self.manager / "config/install-location.json"), {"install_dir": str(target)})
+        self.assertEqual(unrelated.read_text(), "preserved")
+        self.assertEqual(Engine(self.manager).home, target)
+        self.assertEqual(Engine(target).manager_home, self.manager)
+        self.assertEqual(self.engine.plan({"action": "stop"})["install_dir"], str(target))
+        self.assertFalse((parent / "config").exists())
+        self.assertFalse((target / "jobs").exists())
+
+    def test_new_parent_and_already_named_child_do_not_double_nest(self):
+        parent = self.root / "new" / "parent"
+        target = parent / "Nuwax-embodied-harness"
+        self.select_parent(parent)
+        (target / "cache/preserved").write_text("cache")
+        for selected in (target, parent, str(target) + "/", str(target) + "/."):
+            self.select_parent(selected)
+            self.assertEqual(self.engine.home, target)
+            self.assertEqual((target / "cache/preserved").read_text(), "cache")
+        self.assertFalse((target / "Nuwax-embodied-harness").exists())
+
+    def test_existing_empty_child_is_reused(self):
+        target = self.root / "disk" / "Nuwax-embodied-harness"
+        target.mkdir(parents=True)
+        self.select_parent(target.parent)
+        self.assertEqual(self.engine.home, target)
+
+    def test_named_child_collision_never_overwrites_existing_content(self):
+        target = self.root / "disk" / "Nuwax-embodied-harness"
+        target.mkdir(parents=True)
+        (target / "user-file.txt").write_text("preserved")
+        with self.assertRaises(ManagerError) as caught:
+            self.select_parent(target.parent)
+        self.assertEqual(caught.exception.code, "install_dir_not_empty")
+        self.assertIn(str(target), caught.exception.message)
+        self.assertNotIn("请选择空目录", caught.exception.message)
+        self.assertEqual((target / "user-file.txt").read_text(), "preserved")
+        self.assertEqual(Engine(self.manager).home, self.manager)
+        self.assertFalse((target / "config").exists())
+        (target / "config").write_text("unrelated configuration file")
+        with self.assertRaises(ManagerError) as caught:
+            self.select_parent(target.parent)
+        self.assertEqual(caught.exception.code, "install_dir_not_empty")
+        self.assertEqual((target / "config").read_text(), "unrelated configuration file")
+        (target / "config").unlink()
+        (target / "user-file.txt").unlink()
+        target.rmdir()
+        target.write_text("also preserved")
+        with self.assertRaises(ManagerError):
+            self.select_parent(target.parent)
+        self.assertEqual(target.read_text(), "also preserved")
+
+    def test_selected_named_symlink_reuses_target_and_preview_matches_save(self):
+        target = self.root / "real payload"
+        target.mkdir()
+        alias = self.root / "disk" / "Nuwax-embodied-harness"
+        alias.parent.mkdir()
+        alias.symlink_to(target, target_is_directory=True)
+        preview = self.engine.install_directories(str(alias.parent))
+        self.assertEqual(preview["install_dir"], str(target))
+        result = self.select_parent(alias.parent)
+        self.assertEqual(result["install_dir"], preview["install_dir"])
+        preview = self.engine.install_directories(str(alias))
+        self.assertEqual(preview["selection_path"], str(alias))
+        self.assertEqual(preview["install_dir"], str(target))
+        self.select_parent(preview["selection_path"])
+        self.assertEqual(self.engine.home, target)
+        self.assertFalse((target / "Nuwax-embodied-harness").exists())
+
+    def test_typed_parent_preview_resolves_symlink_before_dotdot_without_creating_directories(self):
+        real = self.root / "disk" / "folder"
+        real.mkdir(parents=True)
+        alias = self.root / "alias"
+        alias.symlink_to(real, target_is_directory=True)
+        selected = str(alias / ".." / "data")
+        preview = self.engine.preview_install_location(selected)
+        target = real.parent / "data" / "Nuwax-embodied-harness"
+        self.assertEqual(preview["install_dir"], str(target))
+        self.assertFalse(target.exists())
+        result = self.select_parent(selected)
+        self.assertEqual(result["install_dir"], preview["install_dir"])
+
+    def test_parent_selection_rejects_invalid_or_conflicting_directories(self):
+        for value in ("", "relative", "bad\npath", None, str(self.manager)):
+            with self.subTest(value=value), self.assertRaises(ManagerError):
+                self.engine.save_install_location({"parent_dir": value})
+        file_path = self.root / "file"
+        file_path.write_text("preserved")
+        with self.assertRaises(ManagerError):
+            self.select_parent(file_path)
+        self.assertEqual(file_path.read_text(), "preserved")
+        with self.assertRaises(ManagerError):
+            self.engine.save_install_location({"parent_dir": str(self.root), "install_dir": str(self.target)})
+
+    def test_default_named_manager_can_be_selected_again_without_nesting(self):
+        home = self.root / "Nuwax-embodied-harness"
+        engine = Engine(home)
+        for selected in (self.root, home):
+            result = engine.save_install_location({"parent_dir": str(selected)})
+            self.assertEqual(result["install_dir"], str(home))
+            self.assertEqual(Engine(home).home, home)
+        self.assertFalse((home / "Nuwax-embodied-harness").exists())
+
+    def test_parent_selection_supports_tilde_and_browser_shows_destination(self):
+        parent = self.root / "数据盘"
+        parent.mkdir()
+        with patch.dict(os.environ, {"HOME": str(self.root)}):
+            preview = self.engine.install_directories("~/数据盘")
+            result = self.engine.save_install_location({"parent_dir": "~/数据盘"})
+        self.assertEqual(preview["install_dir"], str(parent / "Nuwax-embodied-harness"))
+        self.assertEqual(result["install_dir"], preview["install_dir"])
+        self.assertEqual(result["user_home"], str(self.root))
 
     def test_auth_settings_token_and_runtime_port_remain_single_owner(self):
         self.engine.save_settings({"gateway_port": 19876, "auto_start": False})
@@ -199,9 +326,12 @@ class SelectedLifecycleChecks(Checks):
     def setUp(self):
         super().setUp()
         self.manager = self.engine.home
-        self.target = self.root / "业务 数据盘"
+        parent = self.root / "业务 数据盘"
+        parent.mkdir()
+        (parent / "user-file").write_text("preserved")
+        self.target = parent / "Nuwax-embodied-harness"
         hardware = self.engine.hardware
-        self.engine.save_install_location({"install_dir": str(self.target)})
+        self.engine.save_install_location({"parent_dir": str(parent)})
         self.engine = Engine(self.manager)
         self.engine.runtime = FakeRuntime()
         self.engine.hardware = hardware
@@ -247,6 +377,7 @@ class SelectedLifecycleChecks(Checks):
         self.assertFalse((self.manager / "current").exists())
         self.assertFalse((self.manager / "config/profiles").exists())
         self.assertEqual(storage_plan(self.manager)["releases"], [])
+        self.assertEqual((self.target.parent / "user-file").read_text(), "preserved")
 
     def test_failed_candidate_and_interrupted_recovery_stay_at_selected_root(self):
         previous = self.install_current()
@@ -337,13 +468,21 @@ class HTTPChecks(LocationChecks):
         self.csrf = session["csrf_token"]
 
     def test_http_save_reload_status_and_cross_origin_protection(self):
+        self.target.mkdir()
+        (self.target / "user-file").write_text("preserved")
+        parent = self.target
+        self.target = parent / "Nuwax-embodied-harness"
         self.login()
-        self.assertEqual(self.request("PUT", "install-location", {"install_dir": str(self.target)}, authorized=False)[0], 403)
-        self.assertEqual(self.request("PUT", "install-location", {"install_dir": str(self.target)}, origin="https://other.invalid")[0], 403)
-        status, result = self.request("PUT", "install-location", {"install_dir": str(self.target)})
+        preview_status, preview = self.request("GET", "install-location?parent_dir=" + urllib.parse.quote(str(parent)))
+        self.assertEqual(preview_status, 200, preview)
+        self.assertEqual(preview["install_dir"], str(self.target))
+        self.assertFalse(self.target.exists())
+        self.assertEqual(self.request("PUT", "install-location", {"parent_dir": str(parent)}, authorized=False)[0], 403)
+        self.assertEqual(self.request("PUT", "install-location", {"parent_dir": str(parent)}, origin="https://other.invalid")[0], 403)
+        status, result = self.request("PUT", "install-location", {"parent_dir": str(parent)})
         self.assertEqual(status, 200, result)
         self.assertEqual(self.request("GET", "install-location")[1]["install_dir"], str(self.target))
-        self.assertEqual(self.request("GET", "install-directories")[1]["path"], str(self.target))
+        self.assertEqual(self.request("GET", "install-directories")[1]["path"], str(self.target.parent))
         with patch.object(Engine, "releases", return_value={"releases": []}), \
                 patch.object(Engine, "catalog", return_value={}), patch.object(Engine, "hardware", return_value={"supported": True}):
             status, result = self.request("GET", "status")
@@ -352,6 +491,8 @@ class HTTPChecks(LocationChecks):
         self.assertTrue(result["installation"]["location_editable"])
         self.assertEqual(result["installation"]["manager_dir"], str(self.manager))
         self.assertEqual(self.server.authentication.path, self.manager / "config/password.json")
+        self.assertEqual((parent / "user-file").read_text(), "preserved")
+        self.assertEqual(result["installation"]["parent_dir"], str(parent))
 
     def test_password_protects_directory_browsing_and_selection(self):
         Authentication(self.engine).change("fixture-password")

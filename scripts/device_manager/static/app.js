@@ -24,6 +24,9 @@
     hardwareReady: false,
     hardwareGeneration: 0,
     locationSaving: false,
+    locationPreview: null,
+    locationPreviewGeneration: 0,
+    locationPreviewLoading: false,
     directoryGeneration: 0,
     directory: null,
 
@@ -470,9 +473,51 @@
     return Boolean(state.status && state.status.installation && state.status.installation.location_editable);
   }
 
+  const INSTALL_FOLDER_NAME = 'Nuwax-embodied-harness';
+
+  // 仅做路径语法规范化；符号链接由设备 API 解析，浏览器返回的预览优先。
+  function normalizeInstallPath(value, userHome) {
+    let path = (value || '').trim();
+    if (path === '~' || path.startsWith('~/')) {
+      if (!userHome) return '';
+      path = userHome.replace(/\/+$/, '') + path.slice(1);
+    }
+    if (!path.startsWith('/')) return '';
+    const parts = [];
+    path.split('/').forEach(function (part) {
+      if (!part || part === '.') return;
+      if (part === '..') parts.pop();
+      else parts.push(part);
+    });
+    return '/' + parts.join('/');
+  }
+
+  function proposedInstallDir(parentDir) {
+    const installation = state.status && state.status.installation || {};
+    const parent = normalizeInstallPath(parentDir, installation.user_home);
+    if (!parent) return '';
+    return parent.split('/').pop() === INSTALL_FOLDER_NAME
+      ? parent : parent.replace(/\/$/, '') + '/' + INSTALL_FOLDER_NAME;
+  }
+
+  function installLocationProposal() {
+    const input = $('installDirInput').value.trim();
+    return state.locationPreview && state.locationPreview.path === input && state.locationPreview.install_dir
+      ? state.locationPreview.install_dir : '';
+  }
+
+  function installLocationParent(installation) {
+    if (installation.parent_dir) return installation.parent_dir;
+    const root = normalizeInstallPath(installation.install_dir, installation.user_home);
+    return root ? root.slice(0, root.lastIndexOf('/')) || '/' : '';
+  }
+
   function installLocationDirty() {
     const installation = state.status && state.status.installation;
-    return installationLocationEditable() && $('installDirInput').value.trim() !== (installation.install_dir || '');
+    // 旧版本保存的自定义精确路径，在用户明确改动前继续原样使用。
+    return installationLocationEditable() && Boolean($('installDirInput').dataset.edited)
+      && (!installLocationProposal() || state.locationPreviewLoading
+        || installLocationProposal() !== normalizeInstallPath(installation.install_dir, installation.user_home));
   }
 
   function updateInstallLocationControls() {
@@ -480,17 +525,23 @@
     const dirty = installLocationDirty();
     $('installDirInput').disabled = !editable || state.locationSaving;
     $('browseInstallDir').disabled = !editable || state.locationSaving;
-    $('saveInstallDir').disabled = !editable || state.locationSaving || !dirty || !$('installDirInput').value.trim();
+    $('saveInstallDir').disabled = !editable || state.locationSaving || !dirty || !installLocationProposal();
     $('resetInstallDir').disabled = !editable || state.locationSaving || !dirty;
     $('nextToModules').disabled = !state.hardwareReady || state.locationSaving || dirty;
+    show($('installLocationPreview'), editable && Boolean($('installDirInput').dataset.edited));
+    text($('proposedInstallDir'), state.locationPreviewLoading ? '正在确认设备上的最终安装位置…'
+      : installLocationProposal() || '请输入有效的设备文件夹路径以预览安装位置。');
   }
 
   function renderInstallLocation(installation) {
     const input = $('installDirInput');
     // 状态刷新不能悄悄覆盖用户尚未保存的输入。
     if (!input.dataset.edited || !installation.location_editable) {
-      input.value = installation.install_dir || '';
+      input.value = installLocationParent(installation);
       delete input.dataset.edited;
+      state.locationPreview = null;
+      state.locationPreviewLoading = false;
+      state.locationPreviewGeneration += 1;
     }
     show($('installLocationEditor'), Boolean(installation.location_editable));
     show($('installLocationReadonly'), !installation.location_editable);
@@ -503,32 +554,66 @@
     updateInstallLocationControls();
   }
 
-  function installLocationChanged() {
+  async function installLocationChanged(directory) {
+    const generation = ++state.locationPreviewGeneration;
+    const requested = $('installDirInput').value.trim();
     $('installDirInput').dataset.edited = 'true';
+    state.locationPreview = directory && directory.install_dir
+      ? { path: directory.path, install_dir: directory.install_dir } : null;
+    state.locationPreviewLoading = false;
     state.planGeneration += 1;
     state.plan = null;
     $('startInstall').disabled = true;
-    inlineMessage($('installLocationMessage'), installLocationDirty() ? '安装位置尚未保存。请保存，或放弃修改后继续。' : '', 'warning');
+    if (state.locationPreview || !requested) {
+      inlineMessage($('installLocationMessage'), installLocationDirty() ? '安装位置尚未保存。请保存，或放弃修改后继续。' : '', 'warning');
+      updateInstallLocationControls();
+      return;
+    }
+    // 手输路径必须由设备解析：符号链接后的 .. 不能靠浏览器的字符串规范化判断。
+    state.locationPreviewLoading = true;
+    inlineMessage($('installLocationMessage'), '正在确认设备上的最终安装位置…');
     updateInstallLocationControls();
+    function current() {
+      return generation === state.locationPreviewGeneration && installationLocationEditable()
+        && $('installDirInput').value.trim() === requested && Boolean($('installDirInput').dataset.edited);
+    }
+    try {
+      const preview = await apiCall('/api/manager/install-location?parent_dir=' + encodeURIComponent(requested));
+      if (!current()) return;
+      if (!preview || !preview.install_dir) throw new Error('服务未返回实际安装位置。');
+      state.locationPreview = { path: requested, install_dir: preview.install_dir };
+      if (preview.user_home) state.status.installation.user_home = preview.user_home;
+      state.locationPreviewLoading = false;
+      inlineMessage($('installLocationMessage'), installLocationDirty() ? '安装位置尚未保存。请保存，或放弃修改后继续。' : '', 'warning');
+    } catch (error) {
+      if (!current()) return;
+      inlineMessage($('installLocationMessage'), '无法预览安装位置：' + error.message + ' 请修改路径重试，或放弃修改。', 'bad');
+    } finally {
+      if (current()) {
+        state.locationPreviewLoading = false;
+        updateInstallLocationControls();
+      }
+    }
   }
 
   async function saveInstallLocation() {
     if (state.locationSaving || !installationLocationEditable() || !installLocationDirty()) return;
     const requested = $('installDirInput').value.trim();
-    if (!requested) return;
+    if (!requested || !installLocationProposal()) return;
     state.locationSaving = true;
     updateInstallLocationControls();
     inlineMessage($('installLocationMessage'), '正在检查并保存设备上的安装位置…');
     try {
       const saved = await apiCall('/api/manager/install-location', {
-        method: 'PUT', body: { install_dir: requested }
+        method: 'PUT', body: { parent_dir: requested }
       });
       if (!saved || !saved.install_dir) throw new Error('服务未返回实际安装位置，请刷新后确认。');
       state.planGeneration += 1;
       state.plan = null;
       delete $('installDirInput').dataset.edited;
       applyStatus(Object.assign({}, state.status, { installation: Object.assign({}, state.status.installation, {
-        install_dir: saved.install_dir, manager_dir: saved.manager_dir,
+        install_dir: saved.install_dir, parent_dir: saved.parent_dir,
+        user_home: saved.user_home || state.status.installation.user_home, manager_dir: saved.manager_dir,
         location_editable: saved.editable, location_reason: saved.reason || ''
       }) }));
       inlineMessage($('installLocationMessage'), '安装位置已保存：' + saved.install_dir, 'good');
@@ -550,6 +635,8 @@
     $('directorySelect').disabled = true;
     $('directoryParent').disabled = true;
     $('directoryList').replaceChildren();
+    show($('directoryInstallPreview'), false);
+    text($('directoryInstallDir'), '');
     text($('directoryCurrent'), '正在读取设备目录…');
     inlineMessage($('directoryMessage'), '');
     try {
@@ -559,9 +646,11 @@
       state.directory = data;
       $('directoryPathInput').value = data.path;
       text($('directoryCurrent'), data.path);
+      text($('directoryInstallDir'), data.install_dir || proposedInstallDir(data.path));
+      show($('directoryInstallPreview'), Boolean(data.install_dir || proposedInstallDir(data.path)));
       $('directoryParent').disabled = !data.parent;
       $('directorySelect').disabled = data.writable === false;
-      if (data.writable === false) inlineMessage($('directoryMessage'), '当前用户无法写入此目录。可继续浏览，选择可写的空目录。', 'warning');
+      if (data.writable === false) inlineMessage($('directoryMessage'), '当前用户无法写入此目录。可继续浏览，选择可写的文件夹。', 'warning');
       const list = $('directoryList');
       data.directories.forEach(function (directory) {
         const button = document.createElement('button');
@@ -585,7 +674,7 @@
   }
 
   function initInstallLocationEvents() {
-    $('installDirInput').addEventListener('input', installLocationChanged);
+    $('installDirInput').addEventListener('input', function () { return installLocationChanged(); });
     $('saveInstallDir').addEventListener('click', saveInstallLocation);
     $('resetInstallDir').addEventListener('click', function () {
       if (state.locationSaving) return;
@@ -610,9 +699,10 @@
       if (state.directory && state.directory.parent) loadInstallDirectories(state.directory.parent);
     });
     $('directorySelect').addEventListener('click', function () {
-      if (!state.directory || state.directory.writable === false || !installationLocationEditable()) return;
-      $('installDirInput').value = state.directory.path;
-      installLocationChanged();
+      if (!state.directory || state.directory.writable === false || !installationLocationEditable() || state.locationSaving) return;
+      const selectedPath = state.directory.selection_path || state.directory.path;
+      $('installDirInput').value = selectedPath;
+      installLocationChanged(Object.assign({}, state.directory, { path: selectedPath }));
       $('installDirectoryDialog').close();
       $('installDirInput').focus();
     });
@@ -620,6 +710,7 @@
     $('installDirectoryDialog').addEventListener('close', function () {
       state.directoryGeneration += 1;
       state.directory = null;
+      show($('directoryInstallPreview'), false);
     });
   }
 

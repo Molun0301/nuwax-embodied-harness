@@ -317,7 +317,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "install-location" and self.command == "PUT":
             result = engine.save_install_location(body)
         elif path == "install-location" and not mutation:
-            result = engine.install_location()
+            result = engine.preview_install_location(query["parent_dir"][0]) if "parent_dir" in query else engine.install_location()
         elif path == "install-directories" and not mutation:
             result = engine.install_directories(query.get("path", [None])[0])
         elif path == "hardware" and not mutation:

@@ -71,12 +71,13 @@
                   <span id="setupInstallDir" class="info-value install-path">读取中…</span>
                   <p class="info-text">业务程序、构建缓存、配置与数据保存在此目录。这里选择的是运行 NEH 的设备目录。</p>
                   <div id="installLocationEditor" hidden>
-                    <label for="installDirInput" class="config-label">安装目录</label>
+                    <label for="installDirInput" class="config-label">选择存放安装的文件夹</label>
                     <div class="install-location-input">
-                      <input id="installDirInput" class="field" type="text" autocomplete="off" spellcheck="false" placeholder="设备上的绝对路径，如 /mnt/data/neh" aria-describedby="installLocationHelp">
+                      <input id="installDirInput" class="field" type="text" autocomplete="off" spellcheck="false" placeholder="设备上的文件夹，如 ~/ 或 /mnt/data" aria-describedby="installLocationHelp installLocationPreview">
                       <button id="browseInstallDir" class="btn" type="button">浏览设备目录</button>
                     </div>
-                    <p id="installLocationHelp" class="info-text">可输入完整路径或浏览选择空目录。不存在的目录会在保存时创建；选好后先保存，再继续安装。</p>
+                    <p id="installLocationHelp" class="info-text">默认安装到 ~/Nuwax-embodied-harness。选择的文件夹无需为空，会在其中创建 Nuwax-embodied-harness 子目录；若已选择同名目录，则直接使用。保存时会检查最终安装目录是否可用。选好后先保存，再继续安装。</p>
+                    <p id="installLocationPreview" class="info-text" aria-live="polite" hidden>安装目标预览：<span id="proposedInstallDir" class="install-path"></span></p>
                     <div class="source-actions">
                       <button id="saveInstallDir" class="btn primary" type="button" disabled>保存安装位置</button>
                       <button id="resetInstallDir" class="btn" type="button" disabled>放弃修改</button>
@@ -580,8 +581,8 @@
 
   <!-- 设备端目录浏览器：不使用访问浏览器所在电脑的本地文件 API。 -->
   <dialog id="installDirectoryDialog" class="modal-dialog directory-dialog" aria-labelledby="installDirectoryTitle">
-    <h2 id="installDirectoryTitle">选择设备上的安装目录</h2>
-    <p class="modal-desc">浏览运行 NEH 的设备文件系统。选择空目录，或选好后在安装目录中补上要新建的文件夹名称。</p>
+    <h2 id="installDirectoryTitle">选择设备上的存放文件夹</h2>
+    <p class="modal-desc">浏览运行 NEH 的设备文件系统。文件夹无需为空；将在其中创建 Nuwax-embodied-harness 子目录安装。选择同名目录时直接使用。</p>
     <form id="directoryPathForm" class="install-location-input">
       <label hidden for="directoryPathInput">设备目录路径</label>
       <input id="directoryPathInput" class="field" type="text" autocomplete="off" spellcheck="false" aria-label="设备目录路径">
@@ -592,10 +593,11 @@
       <span id="directoryCurrent" class="install-path"></span>
     </div>
     <div id="directoryMessage" class="inline-message" role="status" aria-live="polite" hidden></div>
+    <p id="directoryInstallPreview" class="info-text" aria-live="polite" hidden>安装目标预览：<span id="directoryInstallDir" class="install-path"></span></p>
     <div id="directoryList" class="directory-list" aria-label="子目录"></div>
     <div class="modal-actions">
       <button id="directoryCancel" class="btn" type="button">取消</button>
-      <button id="directorySelect" class="btn primary" type="button" disabled>使用此目录</button>
+      <button id="directorySelect" class="btn primary" type="button" disabled>选择此文件夹</button>
     </div>
   </dialog>
 

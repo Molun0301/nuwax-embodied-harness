@@ -9,6 +9,8 @@ import sys
 import time
 from pathlib import Path
 
+from scripts.neh_bootstrap import default_install_home
+
 from .auth import Authentication
 from .common import ManagerError
 from .engine import ACTIONS, TERMINAL, Engine
@@ -101,8 +103,8 @@ def wizard(engine, catalog=None):
 def parser():
     result = argparse.ArgumentParser(description="NEH端侧管理：安装、更新、运行、配置和恢复使用同一持久引擎。")
     result.add_argument("--install-dir", "--home", dest="home",
-                        default=os.environ.get("NEH_HOME") or "~/.local/share/neh", metavar="PATH",
-                        help="设备安装根目录（兼容--home）；默认NEH_HOME或~/.local/share/neh")
+                        default=os.environ.get("NEH_HOME") or str(default_install_home()), metavar="PATH",
+                        help="设备安装根目录（兼容--home）；默认NEH_HOME或~/Nuwax-embodied-harness；已有旧安装沿用原位置")
     sub = result.add_subparsers(dest="command", required=True)
     server = sub.add_parser("serve", help="提供独立设备网页")
     server.add_argument("--host", default="127.0.0.1")

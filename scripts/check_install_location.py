@@ -24,7 +24,8 @@ class LocationChecks(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory(prefix="neh-location-")
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
-        self.default = self.root / ".local/share/neh"
+        self.default = self.root / "Nuwax-embodied-harness"
+        self.legacy = self.root / ".local/share/neh"
         self.custom = self.root / "NEH 安装 空间"
         self.addCleanup(patch.stopall)
         patch.dict(os.environ, {"HOME": str(self.root), "NEH_HOME": ""}).start()
@@ -39,6 +40,52 @@ class LocationChecks(unittest.TestCase):
         self.assertEqual(home, self.default)
         self.assertEqual(Path(manager_parser().parse_args(["status"]).home).expanduser(), home)
         prompt.assert_not_called()
+
+    def test_legacy_installed_root_is_reused_without_moving_files(self):
+        identity = self.legacy / "config/instance-id"
+        identity.parent.mkdir(parents=True)
+        identity.write_text("existing-installation")
+        self.default.mkdir()
+        home, prompt = self.choose(["--cli"], tty=True)
+        self.assertEqual(home, self.legacy)
+        self.assertEqual(Path(manager_parser().parse_args(["status"]).home), self.legacy)
+        prompt.assert_not_called()
+        self.assertEqual(identity.read_text(), "existing-installation")
+
+    def test_empty_or_unrelated_legacy_directory_does_not_change_default(self):
+        self.legacy.mkdir(parents=True)
+        for marker in (None, "unrelated-note"):
+            if marker:
+                (self.legacy / marker).write_text("preserved")
+            home, _ = self.choose()
+            self.assertEqual(home, self.default)
+            self.assertEqual(Path(manager_parser().parse_args(["status"]).home), self.default)
+        self.assertEqual((self.legacy / "unrelated-note").read_text(), "preserved")
+
+    def test_default_recognizes_existing_and_interrupted_entry_links(self):
+        for relative in ("current", "manager/current"):
+            marker = self.legacy / relative
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.symlink_to(self.root / "missing-version")
+            home, prompt = self.choose(["--cli"], tty=True)
+            self.assertEqual(home, self.legacy)
+            prompt.assert_not_called()
+            marker.unlink()
+
+    def test_new_installed_default_wins_when_both_exist(self):
+        for home in (self.default, self.legacy):
+            (home / "config").mkdir(parents=True)
+            (home / "config/instance-id").write_text("installed")
+        self.assertEqual(self.choose()[0], self.default)
+
+    def test_inaccessible_default_candidates_do_not_block_explicit_cli_paths(self):
+        with patch.object(Path, "is_file", side_effect=PermissionError("cannot inspect old installation")):
+            self.assertEqual(Path(manager_parser().parse_args(["--home", str(self.custom), "status"]).home), self.custom)
+            self.assertEqual(self.choose()[0], self.default)
+
+    def test_explicit_legacy_and_other_exact_paths_are_not_renamed(self):
+        for target in (self.legacy, self.default, self.custom):
+            self.assertEqual(self.choose(["--install-dir", str(target)])[0], target)
 
     def test_both_aliases_override_environment_with_spaces_and_unicode(self):
         os.environ["NEH_HOME"] = str(self.root / "other")

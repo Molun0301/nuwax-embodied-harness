@@ -26,7 +26,7 @@ Nuwax Embodied Harness 面向机器人开发者，提供标准数据接入、建
 
 网页打开后先选择设备上的安装目录，再选择机器人与功能模块，安装器自动获取源码、下载依赖并在设备构建；后续更新复用构建缓存。后续配置、启动和更新均在同一管理页操作；无桌面设备会打印可访问的网址。
 
-安装位置默认 `~/.local/share/neh`。首次安装可在网页直接输入目录或点击“浏览设备目录”，保存后再继续；轻量管理程序保留原位置，业务程序、构建缓存、配置与数据使用网页所选目录。也支持 `--install-dir "目标目录"`、`NEH_HOME` 和终端交互 `--cli`。具体步骤见[自定义安装位置](docs/公开文档/轻量安装与自动发布.md#自定义安装位置)。
+新安装默认位于 `~/Nuwax-embodied-harness`。首次安装可在网页输入或浏览选择父目录，安装器在其中创建 `Nuwax-embodied-harness` 文件夹，并在保存前显示最终位置；父目录可以已有其他文件。轻量管理程序保留原位置，业务程序、构建缓存、配置与数据使用选定的安装文件夹。已有旧默认位置 `~/.local/share/neh` 的安装继续沿用原位置。也支持 `--install-dir "目标目录"`、`NEH_HOME` 和终端交互 `--cli`。具体步骤见[自定义安装位置](docs/公开文档/轻量安装与自动发布.md#自定义安装位置)。
 
 需要从源码开发时，使用[开发者部署说明](docs/公开文档/部署文档.md)；普通安装按上面的单命令入口进行。
 
@@ -51,18 +51,18 @@ flowchart LR
 
 管理网页提供版本、模块、配置、启停、更新和回退入口。命令行调用同一个任务流程：
 
-以下使用默认管理入口；如果通过安装命令更改了管理根目录，改用该目录下的 `bin/neh`。在网页选择业务安装目录后，原管理入口保持可用，后续命令会自动沿用网页保存的位置。
+以下使用新安装的默认管理入口；已有旧安装或通过安装命令指定了管理根目录时，改用原目录下的 `bin/neh`。在网页选择业务安装目录后，原管理入口保持可用，后续命令会自动沿用网页保存的位置。
 
 ```bash
-~/.local/share/neh/bin/neh status              # 查看真实安装及运行状态
-~/.local/share/neh/bin/neh releases --refresh # 查询正式版本
-~/.local/share/neh/bin/neh wizard             # 交互配置安装或更新
-~/.local/share/neh/bin/neh stop --wait         # 等待原拥有方停止
-~/.local/share/neh/bin/neh start --wait        # 启动并核对网关
-~/.local/share/neh/bin/neh config              # 查看当前配置项
+~/Nuwax-embodied-harness/bin/neh status              # 查看真实安装及运行状态
+~/Nuwax-embodied-harness/bin/neh releases --refresh # 查询正式版本
+~/Nuwax-embodied-harness/bin/neh wizard             # 交互配置安装或更新
+~/Nuwax-embodied-harness/bin/neh stop --wait         # 等待原拥有方停止
+~/Nuwax-embodied-harness/bin/neh start --wait        # 启动并核对网关
+~/Nuwax-embodied-harness/bin/neh config              # 查看当前配置项
 ```
 
-更新先准备并校验候选环境，再切换完整版本；配置、地图和用户数据保存在稳定目录。终端或网页断开不会取消已受理任务。需要回退时在管理页选择上一版本，或运行 `~/.local/share/neh/bin/neh rollback --stop-running --wait`。管理程序自身更新与业务更新分别提供入口。
+更新先准备并校验候选环境，再切换完整版本；配置、地图和用户数据保存在稳定目录。终端或网页断开不会取消已受理任务。需要回退时在管理页选择上一版本，或运行 `~/Nuwax-embodied-harness/bin/neh rollback --stop-running --wait`。管理程序自身更新与业务更新分别提供入口。
 
 设备输入、标定、运动执行与现场验收仍由接入方负责。完整操作、凭据管理与恢复方法见[轻量安装与自动发布](docs/公开文档/轻量安装与自动发布.md)。
 

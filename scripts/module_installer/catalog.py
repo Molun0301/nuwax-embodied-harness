@@ -31,15 +31,15 @@ MODULES: dict[str, ModuleSpec] = {
     ),
     "slam2d": ModuleSpec(
         "slam2d", "二维激光建图", "二维扫描建图、图定位与思岚雷达驱动；需要配置实际传感器与外参。",
-        ("geometry",), ("fastlio2", "pointlio"),
+        ("geometry",),
     ),
     "fastlio2": ModuleSpec(
         "fastlio2", "FastLIO2 激光惯性定位", "安装原生 FastLIO2，需要真实点云、惯性输入及标定。",
-        ("geometry",), ("pointlio", "slam2d"),
+        ("geometry",),
     ),
     "pointlio": ModuleSpec(
-        "pointlio", "PointLIO 激光惯性定位", "安装原生 PointLIO，与 FastLIO2 选择一个即可。",
-        ("geometry",), ("fastlio2", "slam2d"),
+        "pointlio", "PointLIO 激光惯性定位", "安装原生 PointLIO；可与二维建图和FastLIO2共同安装。",
+        ("geometry",),
     ),
     "navigation": ModuleSpec(
         "navigation", "导航探索", "导航独立程序与运动守卫；运行仍需要真实执行器及标定。", ("geometry",),
@@ -85,7 +85,7 @@ def _keys(values: Iterable[str]) -> tuple[str, ...]:
 
 
 def resolve_modules(selected: Iterable[str]) -> tuple[str, ...]:
-    """补齐依赖，按目录顺序返回；不会静默替换互斥后端。"""
+    """补齐依赖并保留用户选定的所有模块，按目录顺序返回。"""
     wanted = set(_keys(selected)) | {"core"}
     pending = list(wanted)
     while pending:
@@ -119,11 +119,11 @@ def remove_modules(installed: Iterable[str], removed: Iterable[str], *, cascade:
 
 
 def replace_lio(modules: Iterable[str], backend: str) -> tuple[str, ...]:
-    """明确切换定位后端；device 表示使用设备里程计，不安装原生算法。"""
+    """确保指定后端可用；运行后端切换不卸载其它已选算法。"""
     backend = str(backend).strip().lower()
     if backend not in ("fastlio2", "pointlio", "device"):
         raise ModuleError("定位后端只支持 fastlio2、pointlio 或 device（设备里程计）。")
-    selected = set(_keys(modules)) - {"fastlio2", "pointlio"}
+    selected = set(_keys(modules))
     if backend != "device":
         selected.add(backend)
     return resolve_modules(selected)
@@ -157,7 +157,7 @@ def module_system_packages(modules: Iterable[str], robot: str = "customrobot") -
     if "pointlio" in selected:
         packages.append("libgoogle-glog-dev")
     if "slam2d" in selected:
-        packages.extend(("libeigen3-dev", "libgoogle-glog-dev", "libgflags-dev", "libboost-dev", "libboost-serialization-dev", "libboost-filesystem-dev", "libboost-thread-dev", "libboost-system-dev", "libboost-chrono-dev", "libboost-atomic-dev"))
+        packages.extend(("patchelf", "libeigen3-dev", "libgoogle-glog-dev", "libgflags-dev", "libboost-dev", "libboost-serialization-dev", "libboost-filesystem-dev", "libboost-thread-dev", "libboost-system-dev", "libboost-chrono-dev", "libboost-atomic-dev"))
     if "perception" in selected:
         packages.append("git")
     if robot == "go2":

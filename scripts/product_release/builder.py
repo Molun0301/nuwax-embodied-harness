@@ -25,7 +25,6 @@ _REQUIRED_SOURCE = (
     "scripts/start_gateway.sh", "scripts/module_installer/runtime.py", "scripts/module_installer/catalog.py",
     "core/config_values.py", "core/settings.py", "gateways/runtime.py", ".env.example",
 )
-_EXCLUDED_DIRS = {".git", ".gitnexus", ".config", ".ssh", ".venv", "venv", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", "node_modules", "target", "build", "dist", "result", "runtime_data", "tests", "test-results", "configs", ".idea", ".vscode"}
 _NATIVE = {"geometry": "nuwax-geometry-runtime", "navigation": "nuwax-nav-stack", "follow": "nuwax-person-follow", "slam2d": "nuwax-slam-2d-worker", "fastlio2": "fastlio2_native", "pointlio": "pointlio_native"}
 _BASE_LIBRARIES = re.compile(r"^(ld-linux.*|lib(c|m|pthread|dl|rt|resolv|util|anl|nss_[^.]+)\.so(?:\..*)?)$")
 
@@ -82,26 +81,18 @@ class Runner:
 
 
 def _git(root: Path, *args: str) -> bytes:
-    result = subprocess.run(["git", "-C", str(root), *args], capture_output=True, check=False)
+    environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    environment.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull, GIT_TERMINAL_PROMPT="0")
+    result = subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-C", str(root), *args], env=environment, capture_output=True, check=False)
     if result.returncode:
         raise ReleaseError("无法读取Git源码：" + result.stderr.decode("utf-8", errors="replace"))
     return result.stdout
 
 
 def source_allowed(relative: str) -> bool:
-    path = safe_path(relative)
-    if any(part in _EXCLUDED_DIRS for part in path.parts):
-        return False
-    if relative.startswith(("docs/开发文档/", ".github/")) or path.name == "AGENTS.md":
-        return False
-    name = path.name.lower()
-    if name.endswith((".whl", ".download", ".deb", ".rpm", ".pt", ".pth", ".onnx", ".safetensors", ".gguf", ".ckpt", ".h5", ".hdf5", ".engine", ".trt", ".bin", ".dll", ".dylib", ".a", ".o")) or re.search(r"\.so(?:\.\d+)*$", name):
-        return False
-    if name.endswith((".pyc", ".pyo", ".pem", ".key", ".p12", ".pfx")) or name in ("credentials.json", "token.json", ".netrc", ".git-credentials", ".pypirc", ".npmrc", "pip.conf", "id_rsa", "id_ed25519"):
-        return False
-    if (name.startswith(".env") or name.endswith(".env")) and not name.endswith((".example", ".template")):
-        return False
-    return True
+    safe_path(relative)
+    from scripts.neh_source import source_allowed as allowed_source
+    return allowed_source(relative)
 
 
 def _copy_regular(source: Path, target: Path) -> None:
@@ -662,17 +653,17 @@ def build_manager(root: Path, output: Path, *, version: str, workspace: bool = F
         dirty = bool(_git(root, "status", "--porcelain", "--untracked-files=normal").strip())
         if not workspace and dirty:
             raise ReleaseError("管理包正式发布要求干净源码；本地验证可使用--source workspace")
-        for relative in ("scripts/device_manager",):
+        for relative in ("scripts/device_manager", "scripts/module_installer", "scripts/deploy_installer", "scripts/product_release"):
             source = root / relative
             if not source.is_dir():
                 raise ReleaseError("管理包缺少源码：" + relative)
             for path in sorted(source.rglob("*")):
                 if path.is_file() and source_allowed(path.relative_to(root).as_posix()):
                     _copy_regular(path, stage / path.relative_to(root))
-        for relative in ("scripts/module_installer/__init__.py", "scripts/module_installer/catalog.py", "scripts/module_installer/hardware.py", "scripts/module_installer/runtime.py", "scripts/__init__.py", "core/config_values.py", "core/config_catalog.json", "core/config_descriptions.json", "scripts/neh_bootstrap.py", "scripts/neh_system_helper.py", "scripts/go2_dependencies.py", "scripts/systemd/check_lcm_multicast.sh"):
+        for relative in ("scripts/__init__.py", "core/config_values.py", "core/config_catalog.json", "core/config_descriptions.json", "scripts/neh_bootstrap.py", "scripts/neh_system_helper.py", "scripts/neh_source.py", "scripts/neh_source_build.py", "scripts/go2_dependencies.py", "scripts/systemd/check_lcm_multicast.sh", "scripts/systemd/prepare_lcm_network.py"):
             if (root / relative).is_file():
                 _copy_regular(root / relative, stage / relative)
-        for relative in ("scripts/device_manager/__main__.py", "scripts/device_manager/static/index.html", "scripts/module_installer/catalog.py", "core/config_values.py", "scripts/neh_bootstrap.py", "scripts/neh_system_helper.py", "scripts/go2_dependencies.py", "scripts/systemd/check_lcm_multicast.sh"):
+        for relative in ("scripts/device_manager/__main__.py", "scripts/device_manager/static/index.html", "scripts/module_installer/catalog.py", "scripts/module_installer/builds.py", "scripts/module_installer/manager.py", "scripts/deploy_installer/config.py", "scripts/product_release/builder.py", "core/config_values.py", "scripts/neh_bootstrap.py", "scripts/neh_system_helper.py", "scripts/neh_source.py", "scripts/neh_source_build.py", "scripts/go2_dependencies.py", "scripts/systemd/check_lcm_multicast.sh", "scripts/systemd/prepare_lcm_network.py"):
             if not (stage / relative).is_file():
                 raise ReleaseError("管理包缺少运行文件：" + relative)
         initializer = stage / "scripts/device_manager/__init__.py"

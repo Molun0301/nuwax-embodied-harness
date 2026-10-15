@@ -260,3 +260,69 @@ def install(prefix, cache, recipe, *, fetch, run, environment, cancelled=lambda:
         run([interpreter, "-m", "pip", "--isolated", "install", "--no-index", "--no-deps", "--force-reinstall", *[str(wheel) for wheel in wheels]],
             environment=environment, timeout=600, cancelled=cancelled)
         return {"reused": reused, "python": target["python"], "architecture": architecture, "sources": [item["id"] for item in recipe["sources"]]}
+
+
+def install_online(root, prefix, cache):
+    """供本机源码安装调用同一官方适配流程，下载与编译结果保留在设备缓存。"""
+    import subprocess
+    import sys
+    import urllib.request
+
+    recipe = load_recipe(root)
+    cache = Path(cache)
+
+    def fetch(record):
+        directory = cache / "downloads" / record["sha256"]
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / record["filename"]
+        if path.is_file() and path.stat().st_size == record["size"] and digest(path) == record["sha256"]:
+            return path
+        temporary = path.with_name(path.name + ".part")
+        try:
+            request = urllib.request.Request(record["url"], headers={"User-Agent": "NEH-source-installer/1"})
+            with urllib.request.urlopen(request, timeout=60) as response, temporary.open("wb") as output:
+                if urllib.parse.urlsplit(response.geturl()).scheme != "https":
+                    raise ValueError("官方依赖下载不能降级为未加密地址")
+                received = 0
+                while True:
+                    block = response.read(1024 * 1024)
+                    if not block:
+                        break
+                    received += len(block)
+                    if received > record["size"]:
+                        raise ValueError("官方依赖下载超过登记大小")
+                    output.write(block)
+            if temporary.stat().st_size != record["size"] or digest(temporary) != record["sha256"]:
+                raise ValueError("官方依赖下载摘要或大小不符")
+            temporary.replace(path)
+            return path
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+
+    def run(argv, *, cwd=None, environment=None, timeout=1800, cancelled=None):
+        if cancelled:
+            cancelled()
+        result = subprocess.run(argv, cwd=cwd, env=environment, timeout=timeout,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        sys.stdout.write(result.stdout)
+        sys.stdout.flush()
+        if result.returncode:
+            raise RuntimeError("官方依赖适配失败，退出码：" + str(result.returncode))
+        return result.stdout
+
+    environment = {key: value for key, value in os.environ.items() if key not in ("PYTHONPATH", "PYTHONHOME")}
+    environment["PYTHONNOUSERSITE"] = "1"
+    return install(Path(prefix), cache / "adaptations", recipe, fetch=fetch, run=run,
+                   environment=environment, cancelled=lambda: None, progress=lambda message: print(message, flush=True))
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="从官方来源准备Go2接口并复用端侧缓存")
+    parser.add_argument("--root", type=Path, required=True)
+    parser.add_argument("--prefix", type=Path, required=True)
+    parser.add_argument("--cache", type=Path, required=True)
+    arguments = parser.parse_args()
+    print(json.dumps(install_online(arguments.root, arguments.prefix, arguments.cache), ensure_ascii=False))

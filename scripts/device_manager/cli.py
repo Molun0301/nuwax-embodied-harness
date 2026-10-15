@@ -46,7 +46,7 @@ def wait_job(engine, job_id):
 def request_from_args(args):
     request = load_file(args.file) if getattr(args, "file", None) else {}
     request.setdefault("action", getattr(args, "action", None) or "install")
-    for key in ("version", "robot", "source_path"):
+    for key in ("version", "robot", "source_path", "source_repository", "source_branch", "source_revision"):
         if getattr(args, key, None):
             request[key] = getattr(args, key)
     if getattr(args, "modules", None):
@@ -124,6 +124,9 @@ def parser():
         item.add_argument("--version")
         item.add_argument("--modules", help="逗号分隔的模块")
         item.add_argument("--robot", choices=("customrobot", "go2"))
+        item.add_argument("--source-repository", help="本次源码仓库；显式本机Git路径仅供设备本地验证")
+        item.add_argument("--source-branch", help="源码分支，默认main")
+        item.add_argument("--source-revision", help="固定完整源码提交")
         item.add_argument("--stop-running", action="store_true", help="明确允许通过原拥有方停止当前业务")
         if command != "plan":
             item.add_argument("--wait", action="store_true", help="等待结果；退出终端不会取消后台任务")
@@ -137,10 +140,14 @@ def parser():
     job.add_argument("--cancel", action="store_true")
     settings = sub.add_parser("settings")
     settings.add_argument("--feed-url")
+    settings.add_argument("--source-repository", help="HTTPS源码仓库")
+    settings.add_argument("--source-branch", help="源码分支，默认main")
+    settings.add_argument("--source-mode", choices=("git", "catalog"))
+    settings.add_argument("--allow-local-source", action="store_true", help="明确允许本机Git夹具；网页不能启用此选项")
     settings.add_argument("--gateway-port", type=int, help="首次安装前设定业务端口，默认8766")
     settings.add_argument("--channel", choices=("stable", "preview"))
     settings.add_argument("--auto-start", choices=("true", "false"))
-    settings.add_argument("--token-stdin", action="store_true", help="从标准输入保存私有发布源令牌，查询时不返回")
+    settings.add_argument("--token-stdin", action="store_true", help="从标准输入保存私有源码或旧目录访问令牌，查询时不返回")
     password = sub.add_parser("password")
     password.add_argument("--stdin", action="store_true", help="逐行读取当前密码和新密码；未设密码时只读新密码")
     password.add_argument("--disable", action="store_true")
@@ -176,12 +183,13 @@ def main(argv=None):
         elif command == "releases":
             result = engine.releases(args.refresh, args.catalog)
         elif command == "settings":
-            if args.token_stdin:
-                engine.set_token(sys.stdin.readline().rstrip("\r\n"))
-            values = {key: getattr(args, key) for key in ("feed_url", "channel", "gateway_port") if getattr(args, key) is not None}
+            values = {key: getattr(args, key) for key in ("feed_url", "source_repository", "source_branch", "source_mode", "channel", "gateway_port") if getattr(args, key) is not None}
             if args.auto_start is not None:
                 values["auto_start"] = args.auto_start == "true"
-            result = engine.save_settings(values) if values else engine.settings()
+            result = engine.save_settings(values, allow_local_source=args.allow_local_source) if values else engine.settings()
+            if args.token_stdin:
+                engine.set_token(sys.stdin.readline().rstrip("\r\n"))
+                result = engine.settings()
         elif command == "password":
             auth = Authentication(engine)
             current = (sys.stdin.readline().rstrip("\r\n") if args.stdin else getpass.getpass("当前密码：")) if auth.enabled() else ""

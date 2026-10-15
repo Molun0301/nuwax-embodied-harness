@@ -112,15 +112,19 @@
                   </summary>
                   <div class="source-body">
                     <div class="config-row">
-                      <label>
+                      <label hidden>
                         <span class="config-label">更新通道</span>
                         <select id="wizardChannel" class="field">
                           <option value="stable">稳定版</option>
                           <option value="preview">预览版</option>
                         </select>
                       </label>
+                      <label>
+                        <span class="config-label">源码分支</span>
+                        <input id="wizardSourceBranch" class="field" type="text" value="main" placeholder="main">
+                      </label>
                       <label class="config-row-wide">
-                        <span class="config-label">版本源地址</span>
+                        <span class="config-label">源码仓库地址</span>
                         <input id="wizardFeedUrl" class="field" type="text" placeholder="https://…">
                       </label>
                     </div>
@@ -388,15 +392,19 @@
           <div class="update-config">
             <h3>更新来源</h3>
             <div class="config-row">
-              <label>
+              <label hidden>
                 <span class="config-label">更新通道</span>
                 <select id="updateChannel" class="field">
                   <option value="stable">稳定版</option>
                   <option value="preview">预览版</option>
                 </select>
               </label>
+              <label>
+                <span class="config-label">源码分支</span>
+                <input id="sourceBranch" class="field" type="text" value="main" placeholder="main">
+              </label>
               <label class="config-row-wide">
-                <span class="config-label">版本源地址</span>
+                <span class="config-label">源码仓库地址</span>
                 <input id="feedUrl" class="field" type="text" placeholder="https://…">
               </label>
             </div>
@@ -438,7 +446,7 @@
               <div class="setting-label">回退到上一版本</div>
               <div class="setting-desc">
                 当前保留的可回退版本：<span id="rollbackVersion" class="mono">--</span>。
-                回退使用设备上已有的版本包，不会重新下载。
+                回退使用设备上保留的已验证版本，无需重新构建。
               </div>
             </div>
             <button id="rollbackButton" class="btn" type="button">回退</button>

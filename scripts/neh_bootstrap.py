@@ -27,6 +27,8 @@ import webbrowser
 
 
 DEFAULT_CATALOG = "https://github.com/Molun0301/nuwax-embodied-harness/releases/latest/download/catalog.json"
+DEFAULT_REPOSITORY = "https://github.com/Molun0301/nuwax-embodied-harness.git"
+DEFAULT_BRANCH = "main"
 MAX_MANAGER_BYTES = 128 * 1024 * 1024
 MAX_MANAGER_UNPACKED = 512 * 1024 * 1024
 
@@ -311,6 +313,7 @@ def python_environment():
     environment.pop("PYTHONHOME", None)
     environment.pop("PYTHONPATH", None)
     environment["PYTHONNOUSERSITE"] = "1"
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
     return environment
 
 
@@ -413,6 +416,28 @@ def device_urls(port):
     return list(dict.fromkeys(result))
 
 
+def source_manager(args, destination, token):
+    """在持久源码缓存锁内固定提交并组装管理源码，服务只运行独立版本目录。"""
+    root = str(Path(__file__).resolve().parents[1])
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from scripts.neh_source import SourceError, source_checkout
+    if not shutil.which("git"):
+        raise BootstrapError("源码安装需要git；请使用get-neh.sh自动准备，或先安装git")
+    try:
+        with source_checkout(args.home, args.repository, args.branch, args.revision, token=token,
+                             token_origin=args.repository, allow_local=args.allow_local_source,
+                             progress=lambda message: print(message, flush=True)) as source:
+            archive = destination / "manager.tar.gz"
+            print("从固定源码组装管理程序：" + source["version"], flush=True)
+            subprocess.run([sys.executable, "-B", "-m", "scripts.product_release", "manager",
+                            "--root", str(source["root"]), "--output", str(archive), "--version", source["version"]],
+                           cwd=str(source["root"]), env=python_environment(), check=True, timeout=180)
+            return archive, {"version": source["version"], "revision": source["revision"]}
+    except SourceError as exc:
+        raise BootstrapError(str(exc)) from exc
+
+
 def install(args):
     if sys.platform != "linux":
         raise BootstrapError("当前端侧安装入口支持Linux；其它系统尚未完成验证")
@@ -439,7 +464,7 @@ def install(args):
                 digest = digest_file(archive)
                 if args.sha256 and digest != args.sha256:
                     raise BootstrapError("本地管理包摘要不符")
-            else:
+            elif args.catalog:
                 catalog_path = stage / "catalog.json"
                 if args.catalog.startswith(("https://", "http://")):
                     fetch(args.catalog, catalog_path, token=token, limit=8 * 1024 * 1024)
@@ -458,11 +483,16 @@ def install(args):
                 digest = fetch(url, archive, token=matching_token(args.catalog, url, token), expected_size=metadata["size"])
                 if digest != metadata["sha256"]:
                     raise BootstrapError("管理包下载完整性校验失败")
+            else:
+                archive, metadata = source_manager(args, stage, token)
+                digest = digest_file(archive)
             unpacked = stage / "unpacked"
             unpacked.mkdir()
             manifest = unpack_manager(archive, unpacked)
             if metadata and manifest["version"] != metadata.get("version"):
                 raise BootstrapError("下载管理包与目录版本不一致")
+            if metadata and metadata.get("revision") and manifest.get("revision") != metadata["revision"]:
+                raise BootstrapError("管理包源码修订与本次固定提交不一致")
             python = Path(sys.executable).resolve()
             subprocess.run([str(python), "-m", "scripts.device_manager", "--help"], cwd=str(unpacked),
                            env=python_environment(), check=True, stdout=subprocess.DEVNULL, timeout=30)
@@ -488,7 +518,13 @@ def install(args):
                               + " ".join(shlex.quote(part) for part in cli_command(home, python)) + ' "$@"\n', encoding="utf-8")
             binary.chmod(0o755)
             try:
-                if args.catalog.startswith(("https://", "http://")):
+                if not args.catalog and not args.manager_package:
+                    settings = cli_command(home, python, "settings", "--source-repository", args.repository,
+                                           "--source-branch", args.branch)
+                    if args.allow_local_source:
+                        settings.append("--allow-local-source")
+                    subprocess.run(settings, cwd=str(target), env=python_environment(), check=True)
+                elif args.catalog and args.catalog.startswith(("https://", "http://")):
                     subprocess.run(cli_command(home, python, "settings", "--feed-url", args.catalog, "--channel", args.channel),
                                    cwd=str(target), env=python_environment(), check=True)
                 if token:
@@ -516,7 +552,7 @@ def install(args):
     print("命令行入口：" + str(binary))
     if args.configure:
         command = cli_command(home, python, "apply", "--file", str(args.configure.resolve()), "--wait")
-        if not args.catalog.startswith(("https://", "http://")):
+        if args.catalog and not args.catalog.startswith(("https://", "http://")):
             command.extend(["--catalog", str(Path(args.catalog).resolve())])
         subprocess.run(command, cwd=str(manager / "current"), env=python_environment(), check=True)
     elif args.cli:
@@ -529,7 +565,11 @@ def install(args):
 def parser():
     result = argparse.ArgumentParser(description="NEH端侧安装：一条命令准备网页和命令行管理入口")
     result.add_argument("--home", type=Path, default=Path.home() / ".local/share/neh")
-    result.add_argument("--catalog", default=DEFAULT_CATALOG, help="HTTPS版本目录，或明确指定的本地目录JSON")
+    result.add_argument("--repository", default=DEFAULT_REPOSITORY, help="源码仓库HTTPS地址")
+    result.add_argument("--branch", default=DEFAULT_BRANCH, help="跟踪的源码分支")
+    result.add_argument("--revision", help="固定完整源码提交；省略时查询分支当前提交")
+    result.add_argument("--allow-local-source", action="store_true", help=argparse.SUPPRESS)
+    result.add_argument("--catalog", help="显式兼容旧版本目录；默认直接从Git源码安装")
     result.add_argument("--manager-package", type=Path, help="使用本地管理包")
     result.add_argument("--sha256", help="本地管理包预期摘要")
     result.add_argument("--token-file", type=Path, help="私有下载凭据文件，权限0600")

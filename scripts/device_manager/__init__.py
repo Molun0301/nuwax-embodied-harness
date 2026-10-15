@@ -7,7 +7,10 @@ __version__ = "1.0.0"
 PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 try:
     MANAGER_DEVELOPMENT = False
-    MANAGER_VERSION = json.loads((PACKAGE_ROOT / "manager-manifest.json").read_text())["version"]
+    _MANIFEST = json.loads((PACKAGE_ROOT / "manager-manifest.json").read_text())
+    MANAGER_VERSION = _MANIFEST["version"]
+    MANAGER_REVISION = _MANIFEST.get("revision", "")
 except (OSError, ValueError, KeyError):
     MANAGER_VERSION = "development"
+    MANAGER_REVISION = ""
     MANAGER_DEVELOPMENT = True

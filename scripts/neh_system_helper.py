@@ -23,7 +23,7 @@ PACKAGES = frozenset({
     "libgflags-dev", "libboost-dev", "libboost-serialization-dev",
     "libboost-filesystem-dev", "libboost-thread-dev", "libboost-system-dev",
     "libboost-chrono-dev", "libboost-atomic-dev", "python3-pyaudio",
-    "portaudio19-dev", "patch", "iproute2", "util-linux", "openssl",
+    "portaudio19-dev", "patch", "patchelf", "iproute2", "util-linux", "openssl",
 })
 # 顺序对应原系统部署stop_stack，先撤销设置触发器，避免迁入期间重新拉起旧发布。
 UNITS = (
@@ -65,7 +65,7 @@ _ALPINE = {
     "libgflags-dev": ("gflags-dev",), "python3-pyaudio": ("py3-pyaudio",),
     "portaudio19-dev": ("portaudio-dev",), "protobuf-compiler": ("protobuf",),
 }
-_UNIVERSAL = frozenset({"ca-certificates", "curl", "git", "python3", "python3-pip", "cmake", "patch", "openssl", "util-linux", "iproute2", "protobuf-compiler", "python3-pyaudio"})
+_UNIVERSAL = frozenset({"ca-certificates", "curl", "git", "python3", "python3-pip", "cmake", "patch", "patchelf", "openssl", "util-linux", "iproute2", "protobuf-compiler", "python3-pyaudio"})
 
 
 def run(argv, *, check=True, timeout=1800):
@@ -125,6 +125,7 @@ def dependency_plan(payload):
         raise RuntimeError("此设备尚无匹配的系统依赖适配器；未执行包管理命令")
     packages = package_mapping(manager, logical)
     missing = []
+    resolved = []
     for package in packages:
         if manager == "apt-get":
             command = ["dpkg-query", "-W", "-f=${Status}", "--", package]
@@ -135,9 +136,18 @@ def dependency_plan(payload):
         else:
             command = ["apk", "info", "-e", "--", package]
         result = run(command, check=False, timeout=30)
-        if result.returncode or (manager == "apt-get" and result.stdout.strip() != "install ok installed"):
+        installed = not result.returncode and (manager != "apt-get" or result.stdout.strip() == "install ok installed")
+        if manager == "apt-get" and package == "libglib2.0-0" and not installed:
+            alias = "libglib2.0-0t64"
+            checked = run(["dpkg-query", "-W", "-f=${Status}", "--", alias], check=False, timeout=30)
+            alias_installed = not checked.returncode and checked.stdout.strip() == "install ok installed"
+            available = alias_installed or "Package: " + alias in run(["apt-cache", "show", "--", alias], check=False, timeout=30).stdout
+            if available:
+                package, installed = alias, alias_installed
+        resolved.append(package)
+        if not installed:
             missing.append(package)
-    return {"manager": manager, "packages": packages, "missing": missing}
+    return {"manager": manager, "packages": resolved, "missing": missing}
 
 
 def install_dependencies(payload):
@@ -146,6 +156,10 @@ def install_dependencies(payload):
     if missing:
         if manager == "apt-get":
             run([manager, "update"])
+            # 空镜像可能尚无包索引；刷新后重新解析t64等实际包名。
+            missing = dependency_plan(payload)["missing"]
+            if not missing:
+                return {"installed": [], "message": "系统依赖检查完成"}
             command = [manager, "install", "--yes", "--no-install-recommends", "--"]
         elif manager in {"dnf", "yum"}:
             command = [manager, "install", "--assumeyes", "--"]

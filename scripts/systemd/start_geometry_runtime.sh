@@ -130,6 +130,13 @@ case "${LIO_BACKEND}" in
   device|fastlio2|pointlio) ;;
   *) fail "NUWAX_GEOMETRY_LIO_BACKEND must be device, fastlio2, or pointlio" ;;
 esac
+# 多种算法可以共同安装；读取本次方案后再选择同一运行版本中的原生程序。
+if [[ -n "${NUWAX_INSTALL_HOME:-}" && "${GEOMETRY_PIPELINE}" == "lio_3d" \
+      && "${LIO_BACKEND}" != "device" && -z "${NUWAX_GEOMETRY_NATIVE_LIO_EXECUTABLE:-}" ]]; then
+  export NUWAX_GEOMETRY_NATIVE_LIO_EXECUTABLE="$(dirname "${RUNTIME_BINARY}")/${LIO_BACKEND}_native"
+  [[ -x "${NUWAX_GEOMETRY_NATIVE_LIO_EXECUTABLE}" ]] \
+    || fail "所选定位算法尚未安装：${LIO_BACKEND}"
+fi
 case "${MAPPING_BACKEND}" in
   voxel|raytracing) ;;
   *) fail "NUWAX_GEOMETRY_MAPPING_BACKEND must be voxel or raytracing" ;;

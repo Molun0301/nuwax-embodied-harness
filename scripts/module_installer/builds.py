@@ -15,7 +15,8 @@ import tempfile
 import time
 import urllib.request
 import uuid
-from pathlib import Path
+import zipfile
+from pathlib import Path, PurePosixPath
 from typing import Callable, Iterable, Mapping, Optional, Sequence
 
 from scripts.deploy_installer.config import atomic_write
@@ -291,6 +292,58 @@ def _download(url: str, destination: Path) -> None:
             temporary.unlink(missing_ok=True)
 
 
+def _protocol_compiler(cache: Path) -> dict[str, str]:
+    """复用支持optional的协议编译器；旧系统直接下载官方静态程序并缓存。"""
+    configured = os.environ.get("PROTOC", "").strip()
+    program = configured or shutil.which("protoc")
+    if program:
+        try:
+            version = subprocess.check_output([program, "--version"], text=True, timeout=30).strip()
+            match = re.fullmatch(r"libprotoc (\d+)\.(\d+)(?:\.\d+)?", version)
+            if match and tuple(map(int, match.groups())) >= (3, 15):
+                return {"PROTOC": str(Path(shutil.which(program) or program).resolve())}
+        except (OSError, subprocess.SubprocessError):
+            pass
+        if configured:
+            raise RuntimeError("指定的PROTOC不可用或不支持当前协议的optional字段")
+    architecture = {"arm64": "aarch64", "amd64": "x86_64"}.get(platform.machine().lower(), platform.machine().lower())
+    archives = {
+        "x86_64": ("x86_64", "f853e691868d0557425ea290bf7ba6384eef2fa9b04c323afab49a770ba9da80"),
+        "aarch64": ("aarch_64", "9eae1f20f70cccc912d1c318c3929b86aebf5afd4b0f32c196ef682c222ed5ae"),
+    }
+    if architecture not in archives:
+        raise RuntimeError("当前架构没有已验证的协议编译器")
+    name, expected = archives[architecture]
+    archive = cache / "downloads" / ("protoc-25.3-linux-" + name + ".zip")
+    if not archive.is_file() or hashlib.sha256(archive.read_bytes()).hexdigest() != expected:
+        _download("https://github.com/protocolbuffers/protobuf/releases/download/v25.3/" + archive.name, archive)
+    if hashlib.sha256(archive.read_bytes()).hexdigest() != expected:
+        raise RuntimeError("官方协议编译器下载摘要不符")
+    destination = cache / "tools" / ("protoc-25.3-" + architecture)
+    with zipfile.ZipFile(archive) as source:
+        for item in source.infolist():
+            path = PurePosixPath(item.filename)
+            if item.is_dir() or not (item.filename == "bin/protoc" or item.filename.startswith("include/")):
+                continue
+            if path.is_absolute() or ".." in path.parts or "\\" in item.filename:
+                raise RuntimeError("官方协议编译器包含越界路径")
+            target = destination.joinpath(*path.parts)
+            data = source.read(item)
+            if target.is_symlink():
+                raise RuntimeError("协议编译器缓存不接受链接文件")
+            if not target.is_file() or target.read_bytes() != data:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                temporary = target.with_name(target.name + ".new")
+                temporary.write_bytes(data)
+                temporary.chmod(0o755 if item.filename == "bin/protoc" else 0o644)
+                temporary.replace(target)
+    program = destination / "bin/protoc"
+    _executable(program)
+    if subprocess.check_output([str(program), "--version"], text=True, timeout=30).strip() != "libprotoc 25.3":
+        raise RuntimeError("官方协议编译器版本不符")
+    return {"PROTOC": str(program), "PROTOC_INCLUDE": str(destination / "include")}
+
+
 def _rust_toolchain(cache: Path, run: Callable) -> tuple[Path, dict[str, str]]:
     if os.geteuid() == 0:
         raise RuntimeError("请用普通用户运行安装器；构建工具链不应以管理员身份安装。")
@@ -445,10 +498,6 @@ def build_modules(root: Path, prefix: Path, cache: Path, modules: Iterable[str],
     selected = set(modules)
     if not isinstance(jobs, int) or isinstance(jobs, bool) or jobs < 1:
         raise ValueError("编译并行数必须是正整数。")
-    if "slam2d" in selected and selected.intersection({"fastlio2", "pointlio"}):
-        raise ValueError("二维算法与三维前端必须互斥选择")
-    if {"fastlio2", "pointlio"}.issubset(selected):
-        raise ValueError("FastLIO2 与 PointLIO 每次只能选择一种。")
     binaries = {}  # type: Dict[str, str]
     if not selected.intersection(set(_RUST_BUILDS) | {"fastlio2", "pointlio"}):
         return binaries
@@ -464,13 +513,13 @@ def build_modules(root: Path, prefix: Path, cache: Path, modules: Iterable[str],
     rust_modules = [name for name in _RUST_BUILDS if name in selected]
     if rust_modules:
         cargo, environment = _rust_toolchain(cache, run)
+        environment = {**environment, **_protocol_compiler(cache)}
         if "slam2d" in selected:
             from scripts.prepare_slam2d_dependencies import build_dependencies
             build_dependencies(prefix, cache / "slam2d-dependencies", jobs=jobs, run=run)
-            environment = {**environment, "CMAKE_PREFIX_PATH": str(prefix), "CMAKE_BUILD_PARALLEL_LEVEL": str(jobs)}
             _cmake(root / "drivers/sensors/slamtec_native", cache / "build/slamtec", prefix, jobs, run)
         recipes = [_RUST_BUILDS[name] for name in rust_modules]
-        if "geometry" in selected and "slam2d" not in selected:
+        if "geometry" in selected:
             recipes.append(_MAPPING_BUILD)
         for manifest, package, binary_name, features in recipes:
             if not (root / manifest).with_name("Cargo.lock").is_file():
@@ -485,7 +534,8 @@ def build_modules(root: Path, prefix: Path, cache: Path, modules: Iterable[str],
                 command.extend(("--features", ",".join(features)))
             build_environment = environment
             if binary_name == "nuwax-slam-2d-worker":
-                build_environment = {**environment, "NUWAX_SLAM2D_DEPENDENCY_PREFIX": str(prefix)}
+                build_environment = {**environment, "NUWAX_SLAM2D_DEPENDENCY_PREFIX": str(prefix),
+                                     "CMAKE_PREFIX_PATH": str(prefix), "CMAKE_BUILD_PARALLEL_LEVEL": str(jobs)}
             run(tuple(command), cwd=root, env=build_environment)
             built = target / "release" / binary_name
             _executable(built)
@@ -508,6 +558,8 @@ def build_modules(root: Path, prefix: Path, cache: Path, modules: Iterable[str],
                 if driver_sources.exists():
                     shutil.rmtree(driver_sources)
                 shutil.copytree(root / "drivers/sensors/slamtec_native", driver_sources)
+                # 运行版本不能回到可变编译缓存寻找二维动态库。
+                run(("patchelf", "--set-rpath", "$ORIGIN/../lib:$ORIGIN/../lib64", str(installed)))
     return binaries
 
 

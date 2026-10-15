@@ -156,10 +156,6 @@ def write_runtime(
     selected = set(modules)
     if selected - _MODULES:
         raise ValueError("安装配置包含未知模块")
-    if "slam2d" in selected and selected.intersection({"fastlio2", "pointlio"}):
-        raise ValueError("二维与三维执行链必须互斥")
-    if {"fastlio2", "pointlio"}.issubset(selected):
-        raise ValueError("FastLIO2 与 PointLIO 只能安装一种")
     if robot not in ROBOT_REQUIREMENTS:
         raise ValueError("不支持的机器人接入类型")
     if selected & {"fastlio2", "pointlio", "slam2d", "navigation"} and "geometry" not in selected:
@@ -189,7 +185,17 @@ def write_runtime(
     settings_path = prefix / "settings.env"
     binary_dir = prefix / "bin"
     python_bin = prefix / "venv/bin/python"
-    backend = next((name for name in ("fastlio2", "pointlio") if name in selected), "device")
+    available_lio = tuple(name for name in ("fastlio2", "pointlio") if name in selected)
+    configured_lio = existing.get("NUWAX_GEOMETRY_LIO_BACKEND", "").strip()
+    backend = configured_lio if configured_lio in ("device",) + available_lio else next(iter(available_lio), "device")
+    configured_pipeline = existing.get("NUWAX_GEOMETRY_PIPELINE", "").strip()
+    pipeline = configured_pipeline if configured_pipeline in ("lio_3d", "slam_2d") else ("slam_2d" if "slam2d" in selected and not available_lio else "lio_3d")
+    if pipeline == "slam_2d" and "slam2d" not in selected:
+        pipeline = "lio_3d"
+    values["NUWAX_GEOMETRY_LIO_BACKEND"] = backend
+    values["NUWAX_GEOMETRY_PIPELINE"] = pipeline
+    # 导航配置由当前执行链推导；旧安装遗留的常量不能锁死之后的网页选择。
+    values.pop("NUWAX_NAV_PROFILE", None)
     geometry = "geometry" in selected
     perception = "perception" in selected
     memory = "memory" in selected
@@ -209,10 +215,8 @@ def write_runtime(
         "NUWAX_GEOMETRY_RUNTIME_BINARY": str(binary_dir / "nuwax-geometry-runtime"),
         "NUWAX_NAV_STACK_BINARY": str(binary_dir / "nuwax-nav-stack"),
         "NUWAX_PERSON_FOLLOW_BINARY": str(binary_dir / "nuwax-person-follow"),
-        "NUWAX_GEOMETRY_NATIVE_LIO_EXECUTABLE": str(binary_dir / f"{backend}_native") if backend != "device" else "",
-        "NUWAX_GEOMETRY_LIO_BACKEND": backend,
-        "NUWAX_GEOMETRY_PIPELINE": "slam_2d" if "slam2d" in selected else "lio_3d",
-        "NUWAX_NAV_PROFILE": "simple-2d" if "slam2d" in selected else "pct-scan-3d",
+        # 启动器在读取用户方案后，按后端从本版本bin选择匹配的程序。
+        "NUWAX_GEOMETRY_NATIVE_LIO_EXECUTABLE": "",
         "NUWAX_GEOMETRY_SLAM2D_BINARY": str(binary_dir / "nuwax-slam-2d-worker") if "slam2d" in selected else "",
         "NUWAX_GEOMETRY_RELEASE_MANIFEST": "",
         "NUWAX_GEOMETRY_RELEASE_NATIVE_PGO_EXECUTABLE": "",
@@ -225,8 +229,6 @@ def write_runtime(
     })
     if "slam2d" in selected:
         fixed["LD_LIBRARY_PATH"] = str(prefix / "lib") + ":" + str(prefix / "lib64")
-        fixed["NUWAX_GEOMETRY_CORRECTION_BACKEND"] = "none"
-        fixed["NUWAX_GEOMETRY_MAPPING_BACKEND"] = "voxel"
         raw_device = values.get("NUWAX_GEOMETRY_SLAM2D_DEVICE", "").strip()
         if raw_device:
             device = json.loads(raw_device)

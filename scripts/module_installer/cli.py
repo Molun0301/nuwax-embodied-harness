@@ -134,8 +134,6 @@ def _wizard(selected: tuple, recommended: tuple) -> Optional[tuple]:
                 key = keys[number - 1]
                 if key in selected:
                     selected = remove_modules(selected, (key,), cascade=True)
-                elif key in ("fastlio2", "pointlio"):
-                    selected = replace_lio(selected, key)
                 else:
                     selected = resolve_modules(selected + (key,))
         except ValueError as exc:
@@ -228,11 +226,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             selected = resolve_modules(PRESETS[args.preset])
         if args.command == "add":
             names = _names(args.names)
-            if "fastlio2" in names and "pointlio" in names:
-                raise InstallError("一次只能选择一种激光惯性定位算法。")
             selected = tuple(current.get("modules", ("core",)))
             for name in names:
-                selected = replace_lio(selected, name) if name in ("fastlio2", "pointlio") else resolve_modules(selected + (name,))
+                selected = resolve_modules(selected + (name,))
         elif args.command == "remove":
             if not current:
                 raise InstallError("尚无受管安装可移除；现有开发环境不会被当作安装器产物删除。")
@@ -252,7 +248,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             wheel_dir = cached if cached.is_dir() else conventional if conventional.is_dir() else None
         request = InstallRequest(root, home, tuple(selected), robot, jobs,
                                  args.python or current.get("python", ""),
-                                 wheel_dir.expanduser().resolve() if wheel_dir else None, args.repair, service_mode=args.service_mode)
+                                 wheel_dir.expanduser().resolve() if wheel_dir else None, args.repair, service_mode=args.service_mode,
+                                 lio_backend=args.lio or "")
         preview = args.dry_run or args.json or args.command == "doctor"
         if not args.json:
             _show_hardware(hardware, recommendation, show_reasons=args.modules is None and not args.preset and args.command in ("manage", "install", "doctor"))

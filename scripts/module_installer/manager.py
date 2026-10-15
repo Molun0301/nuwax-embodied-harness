@@ -42,6 +42,7 @@ class InstallRequest:
     keep_previous: bool = False
     noninteractive: bool = False
     service_mode: str = ""
+    lio_backend: str = ""
 
 
 def read_current(home: Path) -> dict:
@@ -153,6 +154,7 @@ def installation_inputs(request: InstallRequest, python: str) -> dict:
         "modules": list(request.modules), "robot": request.robot,
         "python": [python, str(interpreter), *_file_metadata(interpreter)],
         "device_wheels": wheels,
+        "lio_backend": request.lio_backend,
     }
 
 
@@ -294,14 +296,14 @@ def _vendor_constraints(python: str, target: Path, names: Sequence[str]) -> None
 def _python_environment(request: InstallRequest, hardware, prefix: Path, seed: str, run) -> None:
     models = bool(set(request.modules) & {"perception", "memory"})
     vendor = hardware.is_jetson and models
-    device_system = request.robot == "go2" and _probe_imports(seed, ("unitree_sdk2py", "cyclonedds"))
     venv_args = [seed, "-m", "venv"]
-    if vendor or device_system:
+    if vendor:
         venv_args.append("--system-site-packages")
     run(venv_args + [str(prefix / "venv")])
     python = str(prefix / "venv/bin/python")
     pip = [python, "-m", "pip", "install"]
-    run(pip + ["--upgrade", "pip", "setuptools", "wheel"])
+    tools = ["pip==25.0.1", "setuptools==75.3.2", "wheel==0.45.1"] if request.robot == "go2" else ["pip", "setuptools", "wheel"]
+    run(pip + ["--upgrade"] + tools)
     constraints = prefix / "constraints.txt"
     if models:
         if not vendor:
@@ -311,7 +313,7 @@ def _python_environment(request: InstallRequest, hardware, prefix: Path, seed: s
             run(pip + torch_args)
         _vendor_constraints(python, constraints, ("torch", "torchvision"))
         pip += ["--constraint", str(constraints)]
-    if request.robot == "go2" and not device_system:
+    if request.robot == "go2" and request.wheel_dir is not None:
         cache = request.home / "cache/device-wheels"
         cache.mkdir(parents=True, exist_ok=True)
         for distribution in ("cyclonedds", "unitree_sdk2py"):
@@ -327,6 +329,9 @@ def _python_environment(request: InstallRequest, hardware, prefix: Path, seed: s
     for requirement in requirements:
         arguments += ["-r", str(request.root / requirement)]
     run(pip + arguments)
+    if request.robot == "go2" and request.wheel_dir is None:
+        run([python, str(request.root / "scripts/go2_dependencies.py"), "--root", str(request.root),
+             "--prefix", str(prefix), "--cache", str(request.home / "cache/go2")])
     run([python, "-m", "pip", "check"])
     run([python, "-c", "import importlib; [importlib.import_module(n) for n in " + repr(list(module_imports(request.modules, request.robot))) + "]"])
 
@@ -343,6 +348,9 @@ def _prepare_models(request: InstallRequest, prefix: Path, run) -> None:
                 raise InstallError(f"自定义视觉模型不存在：{target}；请准备该文件或在配置中使用默认模型。")
             run([python, "scripts/prepare_yolo_world_tensorrt.py", "--weights-output",
                  str(target), "--download-only"])
+        # YOLOWorld设置词表会使用OpenAI原生CLIP；安装时预取同一默认缓存，首次推理不再隐式下载。
+        run([python, "-c", "import os; from clip.clip import _download, _MODELS; "
+             "_download(_MODELS['ViT-B/32'], os.path.expanduser('~/.cache/clip'))"])
     if "memory" in request.modules:
         arguments = []
         for kind, directory in (("text", "BAAI__bge-m3"), ("image", "openai__clip-vit-base-patch32")):
@@ -359,9 +367,7 @@ def _prepare_models(request: InstallRequest, prefix: Path, run) -> None:
 def _verify_prefix(prefix: Path, modules: Sequence[str]) -> None:
     needed = ["venv/bin/python", "start.sh", "settings.env"]
     if "geometry" in modules:
-        needed += ["bin/nuwax-geometry-runtime"]
-        if "slam2d" not in modules:
-            needed += ["bin/nuwax-mapping-cli"]
+        needed += ["bin/nuwax-geometry-runtime", "bin/nuwax-mapping-cli"]
     if "navigation" in modules:
         needed += ["bin/nuwax-nav-stack"]
     if "follow" in modules:
@@ -395,11 +401,14 @@ def check_prerequisites(request: InstallRequest, hardware) -> str:
     models = bool(set(request.modules) & {"perception", "memory"})
     if hardware.is_jetson and models and not _probe_imports(seed, ("torch", "torchvision")):
         raise InstallError("检测到 Jetson（嵌入式计算平台）；本地模型需要已安装且可导入的厂商 torch/torchvision（张量与视觉库）。可先安装其它模块。")
-    if request.robot == "go2" and not _probe_imports(seed, ("unitree_sdk2py", "cyclonedds")):
+    if request.robot == "go2" and request.wheel_dir is not None:
         for name in ("unitree_sdk2py", "cyclonedds"):
             wheels = list(request.wheel_dir.glob(name + "-*.whl")) if request.wheel_dir else []
             if len(wheels) != 1:
-                raise InstallError(f"Go2 设备软件尚未就绪：需要 {name}；请通过 --wheel-dir 提供设备安装包，或用 --robot customrobot 安装标准接入。")
+                raise InstallError(f"显式指定的Go2设备轮子目录缺少唯一{name}；不指定该目录时自动使用官方来源。")
+    elif request.robot == "go2":
+        from scripts.go2_dependencies import load_recipe
+        load_recipe(request.root)
     return seed
 
 
@@ -448,7 +457,10 @@ def apply(request: InstallRequest, hardware) -> dict:
             print(f"[3/5] 构建所选组件（并行 {request.jobs}）", flush=True)
             binaries = build_modules(request.root, prefix, request.home / "cache", request.modules, request.jobs, run)
             print("[4/5] 准备所选模型和启动配置", flush=True)
-            write_runtime(request.root, prefix, request.modules, request.robot, existing_config(request.root, current),
+            configuration = existing_config(request.root, current)
+            if request.lio_backend:
+                configuration["NUWAX_GEOMETRY_LIO_BACKEND"] = request.lio_backend
+            write_runtime(request.root, prefix, request.modules, request.robot, configuration,
                           fresh_layout=terminal_policy["fresh_layout"])
             _prepare_models(request, prefix, run)
             _verify_prefix(prefix, request.modules)

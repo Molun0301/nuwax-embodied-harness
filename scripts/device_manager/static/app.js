@@ -71,7 +71,8 @@
       verifying:'校验程序',system_dependencies:'安装系统依赖',dependencies:'下载运行依赖',
       python_environment:'准备运行环境',runtime_files:'准备启动文件',stopping:'停止原服务',
       switching:'切换版本',starting:'启动服务',rollback:'恢复原版本',failed:'未完成',
-      manager_download:'下载管理程序',manager_verify:'校验管理程序',manager_switch:'切换管理程序'})[stage] || '正在处理';
+      source_download:'获取源码',native_build:'增量构建',source_verify:'验证候选版本',models:'准备模型',
+      manager_source:'从源码准备管理程序',manager_download:'下载管理程序',manager_verify:'校验管理程序',manager_switch:'切换管理程序'})[stage] || '正在处理';
   }
 
   function escapeHtml(value) {
@@ -475,7 +476,7 @@
       }
       if (installation.source) {
         show($('installSourceRow'), true);
-        text($('installSource'), ({release:'版本包',migrated:'已有安装迁入'})[installation.source] || installation.source);
+        text($('installSource'), ({git:'源码构建',release:'版本包',migrated:'已有安装迁入'})[installation.source] || installation.source);
       } else {
         show($('installSourceRow'), false);
       }
@@ -1210,12 +1211,12 @@
       const parts = [];
 
       function formatCategory(value, name) {
-        if (value === null) return name + '：读取清单后确定';
+        if (value === null) return name + '：暂无法预报';
         if (value === 0) return name + '：无需下载';
         return name + '：' + formatBytes(value);
       }
 
-      if ('application' in bd) parts.push(formatCategory(bd.application, '应用'));
+      if ('application' in bd) parts.push(formatCategory(bd.application, plan.source_revision ? '源码' : '应用'));
       if ('dependencies' in bd) parts.push(formatCategory(bd.dependencies, '依赖'));
       if ('models' in bd) parts.push(formatCategory(bd.models, '模型'));
 
@@ -1645,12 +1646,25 @@
   function applySourceSettings(settings, prefix) {
     const channelEl = $(prefix === 'wizard' ? 'wizardChannel' : 'updateChannel');
     const feedEl = $(prefix === 'wizard' ? 'wizardFeedUrl' : 'feedUrl');
-    if (channelEl) channelEl.value = settings.channel || 'stable';
-    if (feedEl) feedEl.value = settings.feed_url || '';
+    const branchEl = $(prefix === 'wizard' ? 'wizardSourceBranch' : 'sourceBranch');
+    const sourceMode = settings.source_mode || 'git';
+    if (channelEl) {
+      channelEl.value = settings.channel || 'stable';
+      show(channelEl.closest('label'), sourceMode === 'catalog');
+    }
+    if (branchEl) {
+      branchEl.value = settings.source_branch || 'main';
+      show(branchEl.closest('label'), sourceMode === 'git');
+    }
+    if (feedEl) {
+      feedEl.value = sourceMode === 'git' ? settings.source_repository : settings.feed_url;
+      feedEl.dataset.sourceMode = sourceMode;
+      text(feedEl.closest('label').querySelector('.config-label'), sourceMode === 'git' ? '源码仓库地址' : '版本目录地址');
+    }
     renderTokenState(prefix, Boolean(settings.has_download_token));
     const summary = $('wizardSourceSummary');
     if (summary) {
-      text(summary, settings.feed_url ? settings.feed_url : '未配置');
+      text(summary, settings.feed_url ? settings.feed_url + (sourceMode === 'git' ? ' · ' + (settings.source_branch || 'main') : '') : '未配置');
     }
   }
 
@@ -1661,6 +1675,8 @@
     const messageEl = $(prefix === 'wizard' ? 'wizardSourceMessage' : 'updateConfigMessage');
     const button = $(prefix === 'wizard' ? 'wizardSaveSource' : 'saveUpdateConfig');
 
+    const branchEl = $(prefix === 'wizard' ? 'wizardSourceBranch' : 'sourceBranch');
+    const sourceMode = feedEl ? feedEl.dataset.sourceMode || 'git' : 'git';
     const channel = channelEl ? channelEl.value : 'stable';
     const feedUrl = feedEl ? feedEl.value.trim() : '';
     const token = tokenEl ? tokenEl.value : '';
@@ -1670,7 +1686,9 @@
     try {
       const settings = await apiCall('/api/manager/settings', {
         method: 'PUT',
-        body: { channel: channel, feed_url: feedUrl }
+        body: sourceMode === 'git'
+          ? { source_mode: 'git', source_repository: feedUrl, source_branch: branchEl ? branchEl.value.trim() || 'main' : 'main' }
+          : { source_mode: 'catalog', channel: channel, feed_url: feedUrl }
       });
 
       // 只有用户实际填写时才提交令牌；留空保持原值。

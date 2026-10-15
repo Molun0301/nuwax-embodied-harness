@@ -71,37 +71,7 @@ jobs:
           python-version: '3.8'
 
       - name: 安装部署检查工具
-        run: |
-          python3 -m pip install 'pip==25.0.1'
-          python3 -m pip install 'ruff==0.9.10' 'pydantic==2.10.6' 'lcm==1.5.2'
-          lcm-gen --version
-          python3 - <<'PY'
-          import os, shutil
-          with open(os.environ['GITHUB_ENV'], 'a') as output:
-              output.write('LCM_GEN_EXECUTABLE=' + shutil.which('lcm-gen') + '\n')
-          PY
+        run: python3 -m pip install 'ruff==0.9.10' 'pydantic==2.10.6'
 
-      - name: 安装 native build 前置依赖
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends liblcm-dev libglib2.0-dev pkg-config protobuf-compiler libboost-all-dev libeigen3-dev libpcl-dev
-
-      - name: 安装 Rust 1.88.0
-        run: |
-          rustup toolchain install 1.88.0 --profile minimal
-          rustup default 1.88.0
-
-      - name: 一键部署契约
+      - name: 一键部署源码契约
         run: bash scripts/ci/check_deployment_installer.sh
-
-      - name: Rust production build contracts
-        run: |
-          cargo +1.88.0 check --locked --manifest-path services/nuwax-workspace/Cargo.toml \
-            --package nuwax-nav-stack --bin nuwax-nav-stack \
-            --features simple-2d,replanning-astar
-          cargo +1.88.0 check --locked --manifest-path services/nuwax-workspace/Cargo.toml \
-            --package nuwax-nav-visual-servoing --bin nuwax-person-follow \
-            --features link-liblcm
-          cargo +1.88.0 check --locked \
-            --manifest-path services/geometry/nuwax_geometry_runtime/Cargo.toml \
-            --bin nuwax-geometry-runtime

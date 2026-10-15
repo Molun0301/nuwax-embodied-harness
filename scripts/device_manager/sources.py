@@ -57,14 +57,14 @@ def discover(engine, *, refresh=False, request=None, local_request=False):
         info = remote_revision(repository, branch, run=run_command, allow_local=allow_local, **credentials(engine))
     except (SourceError, OSError) as exc:
         raise ManagerError("source_unavailable", "无法读取源码分支，请检查仓库、分支与私有访问授权。", 502) from exc
+    # 计划查询也刷新真实分支提交；显式固定旧提交只影响本次计划，不能覆盖分支目录。
+    info = dict(info, allow_local=allow_local)
+    atomic_json(cache_path, {"identity": identity, "source": info})
     revision = request.get("source_revision")
     if revision:
         if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision):
             raise ManagerError("source_revision", "源码修订必须是完整40位提交标识。")
         info = dict(info, revision=revision, version=source_version(revision))
-    info = dict(info, allow_local=allow_local)
-    if not request:
-        atomic_json(cache_path, {"identity": identity, "source": info})
     return info
 
 

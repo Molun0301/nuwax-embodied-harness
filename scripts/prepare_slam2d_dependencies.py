@@ -14,7 +14,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from scripts.module_installer.builds import _checkout, _download
+from scripts.module_installer.builds import _checkout, _download  # noqa: E402
 from scripts.module_installer.hardware import resolve_build_jobs  # noqa: E402
 
 SOURCES = {

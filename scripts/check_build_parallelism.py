@@ -206,6 +206,28 @@ fn main() {
     for source in (evidence / "crates").glob("*/native/*.cpp"):
         source.write_text(source.read_text() + "// rebuild for single-job qualification\n")
     run("explicit-one", 1, 16)
+    # Inspect the same production helper's fallback without installing Ninja.
+    probe = evidence / "helper-probe.rs"
+    probe.write_text('''#[path = "build_support/native_build.rs"]
+mod native_build;
+fn main() {
+    let command = native_build::command(std::path::Path::new("generator-cache"));
+    println!("args={:?}", command.get_args().collect::<Vec<_>>());
+    println!("env={:?}", command.get_envs().collect::<Vec<_>>());
+}
+''')
+    executable = evidence / "helper-probe"
+    subprocess.run([str(cargo.with_name("rustc")), "--edition", "2021", str(probe), "-o", str(executable)], check=True)
+    generator_cache = evidence / "generator-cache"
+    generator_cache.mkdir()
+    (generator_cache / "CMakeCache.txt").write_text("CMAKE_GENERATOR:INTERNAL=Ninja\n")
+    checked = subprocess.check_output([str(executable)], cwd=evidence,
+                                     env=dict(env, CARGO_MAKEFLAGS="fixture-jobserver", CMAKE_BUILD_PARALLEL_LEVEL="99"), text=True)
+    assert '"--parallel", "1"' in checked and "cargo:warning=" in checked, checked
+    checked = subprocess.check_output([str(executable)], cwd=evidence,
+                                     env=dict(env, CMAKE_BUILD_PARALLEL_LEVEL="7"), text=True)
+    assert '"--parallel", "7"' in checked, checked
+    (evidence / "fallback-checks.txt").write_text("PASS: non-Make Cargo fallback uses one slot; standalone CMake override uses seven.\n")
     (evidence / "results.json").write_text(json.dumps(results, indent=2) + "\n")
 
 

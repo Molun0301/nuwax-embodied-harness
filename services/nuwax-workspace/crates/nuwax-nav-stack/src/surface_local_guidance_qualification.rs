@@ -133,6 +133,6 @@ pub(super) fn dump_first_partial_branch(
     // have several revisions. Keep both as attribution evidence, not extra
     // gates on the captured fact's unique Inserted original-owner relationship.
     let qualified=owners_stopped && source_unique && source_inserted;
-    eprintln!("FIRST_PARTIAL_STATUS status={} reason={reason} branch_partial_observed=true current_compute_selects_any_ok=true nominal_partial_policy_would_trigger={} real_global_h_qualified=false whole_loop_success=reported_separately sampling=first_partial_result_conditioned no_replay=true",
+    eprintln!("FIRST_PARTIAL_STATUS status={} reason={reason} branch_partial_observed=true branch_result_selection=not_inferred controller_admission=reported_separately nominal_partial_deferral_eligible={} real_global_h_qualified=false whole_loop_success=reported_separately sampling=first_partial_result_conditioned no_replay=true",
         if qualified {"QUALIFIED_CAPTURED_FACT"}else{"NOT_QUALIFIED"},!c.request_detour && !c.branch_detour);
 }

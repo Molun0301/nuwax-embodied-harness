@@ -31,6 +31,7 @@ pub(crate) struct Branch {
     pub cached_negative: bool,
     pub wall: Duration,
     pub partial: Option<bool>,
+    pub reference_miss: bool,
     pub failure: Option<LocalPlanFailureKind>,
 }
 #[derive(Clone, Debug)]
@@ -157,6 +158,7 @@ pub(crate) fn branch_begin(
             cached_negative,
             wall: Duration::ZERO,
             partial: None,
+            reference_miss: false,
             failure: None,
         });
         Some(Instant::now())
@@ -175,6 +177,18 @@ pub(crate) fn branch_end(
                     Ok(path) => branch.partial = Some(path.partial),
                     Err(e) => branch.failure = Some(e.kind),
                 }
+            }
+        });
+    }
+}
+
+pub(crate) fn branch_reference_miss(at: Option<Instant>) {
+    if let Some(at) = at {
+        STATE.with(|s| {
+            if let Some(f) = s.borrow_mut().frame.as_mut() {
+                let branch = f.branches.last_mut().unwrap();
+                branch.wall = at.elapsed();
+                branch.reference_miss = true;
             }
         });
     }

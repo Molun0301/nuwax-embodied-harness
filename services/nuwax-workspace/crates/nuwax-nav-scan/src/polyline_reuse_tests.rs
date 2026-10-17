@@ -115,12 +115,22 @@ fn pending_cancellation_wins_over_retained_polyline_error() {
     struct Reset;
     impl Drop for Reset { fn drop(&mut self) { CANCEL_AT_REUSE.with(|slot|*slot.borrow_mut()=None); } }
     let _reset=Reset;
-    CANCEL_AT_REUSE.with(|slot|*slot.borrow_mut()=Some(epoch));
-    let error=with_original(false,||with_planning_cancellation(&token,||plan(&map,&tomo,
-        ([-1.0,0.2,0.4],[0.0,0.0,0.0,1.0]),&[[-1.0,0.2,0.0],[0.1,0.2,0.0]],
-        &crate::tests::motion(),&ScanConfig::default(),None,None,
-        &[[2.0,2.0],[3.0,2.0],[3.0,3.0],[2.0,3.0]],true,false))).unwrap_err();
+    for reference_only in [false,true] {
+    epoch.store(0,std::sync::atomic::Ordering::Release);
+    CANCEL_AT_REUSE.with(|slot|*slot.borrow_mut()=Some(epoch.clone()));
+    let error=with_original(false,||with_planning_cancellation(&token,|| {
+        let start=([-1.0,0.2,0.4],[0.0,0.0,0.0,1.0]);
+        let reference=[[-1.0,0.2,0.0],[0.1,0.2,0.0]];
+        let boundary=[[2.0,2.0],[3.0,2.0],[3.0,3.0],[2.0,3.0]];
+        if reference_only {
+            probe_reference_candidates(&map,&tomo,start,&reference,&crate::tests::motion(),
+                &ScanConfig::default(),None,None,&boundary,true,false,None)
+        } else {
+            plan(&map,&tomo,start,&reference,&crate::tests::motion(),&ScanConfig::default(),
+                None,None,&boundary,true,false).map(ReferenceCandidateOutcome::Complete)
+        } })).unwrap_err();
     assert!(CANCEL_AT_REUSE.with(|slot|slot.borrow().is_none()),"must reach reuse boundary");
     assert_eq!(error.kind,LocalPlanFailureKind::Cancelled);
     assert!(error.blocked.is_none() && error.closest_pose.is_none() && error.body_witness.is_none());
+    }
 }

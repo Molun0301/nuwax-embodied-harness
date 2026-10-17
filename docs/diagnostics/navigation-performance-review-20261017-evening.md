@@ -245,6 +245,23 @@ Scan 预算与 partial 首点/最小进度纳入真实资格；共享 PctPlanner
 
 增加仅显式诊断会话启用的定容、非等待标量记录，观察真实输入、状态输出ACK以及renew当时内部快照。原数据/线程/控制/TTL不变，默认不开启记录。6项控制和显式/默认增量类型检查通过；唯一flat Wall运行原到达与几何oracle通过，但42701条记录有91条竞争丢失，时间观察不完整，也没有复现旧失败。旧失败保留，不称为时序修复或性能收益。细节见 [真实owner资格记录](navigation-real-owner-qualification-20261017.md)。
 
+## 第十五阶段：保留 nominal partial，只探测快速完整绕行
+
+原实现遇到 nominal partial 即返回，未给已有 detour 参考候选一次完整接续机会。曾试验“保存 partial 后运行完整 detour”，但固定窄域反例额外执行一轮 256 展开仍只得 partial；这份中间策略没有单独发布。
+
+本阶段保留原 partial 的所有权，仅为此情况调用共享 Scan 的 reference-only 入口：复用原参考候选、几何、到达与取消逻辑，在 search_prepare 之前返回 Complete 或 Miss。Complete 优先；Miss/普通失败保留原 partial，不写入完整搜索失败缓存。取消仍丢弃过期结果。nominal full、nominal 真正失败及显式 detour 请求仍使用原完整路径。没有复制参考算法、增加搜索预算、改精度、放宽避障或延长超时。
+
+- Scan tests-only 旧 Full 适配器：3 控制通过、2 目标断言红；候选同 5 项绿。普通 Scan 79 通过/11 ignored，原 256-partial 资格用例另外通过；probe Miss 的 search_prepare/root/remaining 工作为零
+- runtime tests-only：7 控制通过、7 reference-only 选择断言红；候选 14 矩阵和 4 observer/fork 控制通过。route_planning 27、route_follower 46/9 ignored、planning_owner 4 通过；这些计数互有重叠，不相加为独立覆盖数
+- 独立 arrival=None 的参考交接断言通过。默认无 Scan/profile 的七包 tests 类型检查通过；诊断 feature 与默认配置的结果分开记录
+- 真实 wide/short 阶段均为 N256 partial→T quick_spline_reference full，无 T 剩余搜索；旧 N-only/noPCT 资格公式仍如实为 NOT_QUALIFIED。true-only full 仍为 QUALIFIED
+- bounded false 保留原 N256 partial，T 明确为 reference_miss，未进入 search_prepare/root/remaining。本次 T Scan 仍花 330.872ms，前置 PCT 52.485ms，不能称免费探测。bounded true 仍执行原完整 T256 partial
+- 机会损失反例保留：真实 Full 可经 1 次展开找到完整路径，而 reference-only 返回 Miss。Miss 不等于没有路径；这是仅在已有可用 partial 时采用的有限探测策略
+
+同原 A/D 配置的单次 fixedRecentBox 闭环使用 recovery-only、Scan=[]、trace=None：12.80s，原目标/停车 fence/cleanup/固定近期障碍测量与连续几何 oracle 均通过，728 段实际 SE2 运动检查通过。该运行没有分支观察器，不能证明 E 的可选探测实际被触发；A、D、E 各一次运行本来都成功，不构成原失败被修复或统计加速的证据。此为同实例真实 liblcm memq/codec 仿真，不是 UDP、ARM 或 Go2 实机资格。
+
+当前显式 profile 的 N remaining 仍分别约 17.385/16.883/7.769 秒，主要落在 project 与 sweep。它们是含调度影响的墙钟，不是 CPU 独占耗时；嵌套阶段不能重复相加，也不能和旧版本直接算倍数。此前完整 runtime 的一次 urgent cancellation 50.768ms 超过原 20ms 断言仍未解释，后续独立观察成功不撤销该失败。探索早终态交接另行修复和验证，不混入本阶段通过结论。
+
 ## 后续持续检查
 
 1. 墙前晚到路径的实际恢复与初始 full/partial/PCT 顺序，保留及时移动和真实避障

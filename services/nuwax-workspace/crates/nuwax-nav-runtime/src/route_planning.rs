@@ -154,6 +154,26 @@ pub(crate) struct Candidate {
     pub path: Path3D,
     pub elapsed_ms: f64,
 }
+fn candidate_from_trajectory(pose: &PoseStamped, trajectory: nuwax_nav_scan::LocalTrajectory) -> Candidate {
+    let path = Path3D {
+        poses: trajectory
+            .poses
+            .into_iter()
+            .map(|(p, q)| {
+                let mut pose = pose.clone();
+                pose.pose.position = Point3::new(p[0], p[1], p[2]);
+                pose.pose.orientation = Quaternion {
+                    x: q[0],
+                    y: q[1],
+                    z: q[2],
+                    w: q[3],
+                };
+                pose
+            })
+            .collect(),
+    };
+    Candidate { partial: trajectory.partial, path, elapsed_ms: trajectory.elapsed_ms }
+}
 pub(crate) struct PlanResult {
     pub request: PlanRequest,
     pub outcome: Result<Candidate, Vec<LocalPlanError>>,
@@ -217,6 +237,9 @@ pub(crate) struct PlanKernel {
     epoch: Option<u64>,
     #[cfg(test)]
     pub hook: Option<Box<dyn FnMut(&PlanRequest) + Send>>,
+    // Synthetic branch outcomes for selection/cache/cancellation unit tests only.
+    #[cfg(test)]
+    scan_hook: Option<Box<dyn FnMut(bool, bool) -> Result<Option<nuwax_nav_scan::LocalTrajectory>, LocalPlanError> + Send>>,
 }
 impl PlanKernel {
     pub fn new(config: SurfaceFollowerConfig) -> Self {
@@ -227,6 +250,8 @@ impl PlanKernel {
             epoch: None,
             #[cfg(test)]
             hook: None,
+            #[cfg(test)]
+            scan_hook: None,
         }
     }
     pub fn compute(&mut self, mut request: PlanRequest, cancel: &Cancellation) -> PlanResult {
@@ -331,18 +356,23 @@ impl PlanKernel {
         let start = body(&r.pose);
         #[cfg(test)] drop(policy_phase);
         let mut failures = Vec::new();
+        // Keep the original partial by move while detour reference candidates
+        // get one chance at a complete trajectory. Full nominal stays first.
+        let mut nominal_partial = None;
+        let superseded = || LocalPlanError {
+            body_witness: None,
+            kind: nuwax_nav_scan::LocalPlanFailureKind::Cancelled,
+            closest_pose: None,
+            blocked: None,
+            reason: "planning superseded".into(),
+        };
         for detour in if r.detour {
             &[true][..]
         } else {
             &[false, true][..]
         } {
             if cancel.cancelled() {
-                return Err(vec![LocalPlanError { body_witness: None,
-                    kind: nuwax_nav_scan::LocalPlanFailureKind::Cancelled,
-                    closest_pose: None,
-                    blocked: None,
-                    reason: "planning superseded".into(),
-                }]);
+                return Err(vec![superseded()]);
             }
             let cached = self.failed.iter().find(|f| {
                 Arc::ptr_eq(&f.tomogram, &tomogram)
@@ -402,27 +432,43 @@ impl PlanKernel {
                 }
             }
             let straight = r.straight && !follow_reference;
+            let reference_only = *detour && nominal_partial.is_some();
             #[cfg(test)] let branch_at=priority_probe::branch_begin(*detour,follow_reference,straight,
                 &r.reference,&reference,false);
             #[cfg(feature="local-guidance-qualification")]
             let qualification=crate::local_guidance_qualification::begin(r);
             let result = {
-                let result = nuwax_nav_scan::plan_with_progress(
-                    &map,
-                    &tomogram,
-                    start,
-                    &reference,
-                    &kinematics,
-                    &r.scan,
-                    r.final_yaw,
-                    r.arrival,
-                    &r.boundary,
-                    follow_reference,
-                    straight,
-                    progress_policy,
-                );
+                let scan = || {
+                    if reference_only {
+                        nuwax_nav_scan::probe_reference_candidates(&map,&tomogram,start,&reference,
+                            &kinematics,&r.scan,r.final_yaw,r.arrival,&r.boundary,
+                            follow_reference,straight,progress_policy).map(|outcome| match outcome {
+                                nuwax_nav_scan::ReferenceCandidateOutcome::Complete(path) => Some(path),
+                                nuwax_nav_scan::ReferenceCandidateOutcome::Miss => None,
+                            })
+                    } else {
+                        nuwax_nav_scan::plan_with_progress(&map,&tomogram,start,&reference,
+                            &kinematics,&r.scan,r.final_yaw,r.arrival,&r.boundary,
+                            follow_reference,straight,progress_policy).map(Some)
+                    }
+                };
+                #[cfg(not(test))]
+                let result = scan();
+                #[cfg(test)]
+                let result = self.scan_hook.as_mut().map_or_else(scan, |hook| hook(*detour, reference_only));
+                let result = match result {
+                    Ok(Some(path)) => Ok(path),
+                    Ok(None) => {
+                        // Miss is an untried-search outcome, not a complete failure.
+                        #[cfg(feature="local-guidance-qualification")]
+                        crate::local_guidance_qualification::finish_reference_miss(qualification);
+                        #[cfg(test)] priority_probe::branch_reference_miss(branch_at);
+                        continue;
+                    }
+                    Err(failure) => Err(failure),
+                };
                 if let Err(failure) = &result {
-                    if failure.kind != nuwax_nav_scan::LocalPlanFailureKind::Cancelled {
+                    if !reference_only && failure.kind != nuwax_nav_scan::LocalPlanFailureKind::Cancelled {
                         if self.failed.len() == 2 {
                             self.failed.remove(0);
                         }
@@ -451,33 +497,39 @@ impl PlanKernel {
                 &reference,&kinematics,*detour,follow_reference,straight,progress_policy,&result);
             #[cfg(test)] priority_probe::branch_end(branch_at,&result);
             match result {
-                Ok(trajectory) => {
-                    let path = Path3D {
-                        poses: trajectory
-                            .poses
-                            .into_iter()
-                            .map(|(p, q)| {
-                                let mut pose = r.pose.clone();
-                                pose.pose.position = Point3::new(p[0], p[1], p[2]);
-                                pose.pose.orientation = Quaternion {
-                                    x: q[0],
-                                    y: q[1],
-                                    z: q[2],
-                                    w: q[3],
-                                };
-                                pose
-                            })
-                            .collect(),
-                    };
-                    return Ok(Candidate { partial: trajectory.partial,
-                        path,
-                        elapsed_ms: trajectory.elapsed_ms,
-                    });
+                Ok(trajectory) if !*detour && trajectory.partial => {
+                    nominal_partial = Some(trajectory);
                 }
-                Err(failure) => failures.push(failure),
+                Ok(trajectory) => {
+                    if nominal_partial.is_some() && cancel.cancelled() {
+                        return Err(vec![superseded()]);
+                    }
+                    let selected = if trajectory.partial {
+                        nominal_partial.take().unwrap_or(trajectory)
+                    } else {
+                        trajectory
+                    };
+                    return Ok(candidate_from_trajectory(&r.pose, selected));
+                }
+                Err(failure) => {
+                    let cancelled = failure.kind == nuwax_nav_scan::LocalPlanFailureKind::Cancelled;
+                    failures.push(failure);
+                    if cancelled {
+                        return Err(failures);
+                    }
+                }
             }
         }
-        Err(failures)
+        if let Some(trajectory) = nominal_partial {
+            // The detour can finish with an ordinary error or a cache hit.
+            // Neither may publish the saved partial after cancellation.
+            if cancel.cancelled() {
+                return Err(vec![superseded()]);
+            }
+            Ok(candidate_from_trajectory(&r.pose, trajectory))
+        } else {
+            Err(failures)
+        }
     }
 }
 
@@ -486,6 +538,7 @@ mod tests {
     use super::*;
     include!("route_progress_policy_tests.rs");
     include!("route_repeated_detour_key_tests.rs");
+    include!("route_partial_choice_tests.rs");
     use nuwax_nav_mls_planner::{SurfaceBodyEnvelope, SurfaceObservation, SurfaceObservations};
     use nuwax_nav_types_messages::{MotionKinematics, MotionModel, NavFrameId, Pose3, Timestamp};
     use std::sync::atomic::AtomicU64;

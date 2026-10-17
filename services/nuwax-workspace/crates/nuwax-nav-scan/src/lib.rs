@@ -447,6 +447,27 @@ pub fn plan_with_progress(
     prefer_straight: bool,
     progress: Option<ProgressPrefixPolicy<'_>>,
 ) -> Result<LocalTrajectory, LocalPlanError> {
+    plan_with_extent(map, tomogram, start, reference, kinematics, config, final_yaw,
+        arrival, boundary, follow_reference, prefer_straight, progress, PlanExtent::Full).map(|outcome| match outcome {
+        PlanOutcome::Trajectory(path) => path,
+        PlanOutcome::ReferenceMiss => unreachable!("full Scan cannot return a reference miss"),
+    })
+}
+fn plan_with_extent(
+    map: &SurfaceSnapshot,
+    tomogram: &Tomogram,
+    start: BodyPose,
+    reference: &[[f64; 3]],
+    kinematics: &MotionKinematics,
+    config: &ScanConfig,
+    final_yaw: Option<f64>,
+    arrival: Option<([f64; 3], f64)>,
+    boundary: &[[f64; 2]],
+    follow_reference: bool,
+    prefer_straight: bool,
+    progress: Option<ProgressPrefixPolicy<'_>>,
+    extent: PlanExtent,
+) -> Result<PlanOutcome, LocalPlanError> {
     cancellation::checkpoint()?;
     if progress.is_some_and(|policy| !policy.minimum_distance_m.is_finite()
         || policy.minimum_distance_m<0.0 || policy.reference.is_empty()
@@ -454,7 +475,7 @@ pub fn plan_with_progress(
         return Err("有限进度策略缺少有效的原全局窗口或控制距离".into());
     }
     let result = plan_impl(map, tomogram, start, reference, kinematics, config, final_yaw,
-        arrival, boundary, follow_reference, prefer_straight,progress);
+        arrival, boundary, follow_reference, prefer_straight,progress,extent);
     cancellation::checkpoint()?;
     result.map_err(|mut failure| {
         if let Some(witness)=failure.body_witness.take() {
@@ -462,6 +483,44 @@ pub fn plan_with_progress(
             write!(&mut failure.reason,"；{witness}").expect("writing to String");
         }
         failure
+    })
+}
+
+/// Result of the existing reference candidate family, before local search.
+/// Miss is not an exhausted-search error or a partial trajectory.
+#[derive(Debug)]
+pub enum ReferenceCandidateOutcome {
+    /// Original full-window success, with unchanged body/motion/arrival checks.
+    Complete(LocalTrajectory),
+    /// All existing reference candidates missed; local search was not attempted.
+    Miss,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PlanExtent { Full, ReferenceOnly }
+enum PlanOutcome { Trajectory(LocalTrajectory), ReferenceMiss }
+
+/// Probe the unchanged reference candidates only; never prepare or enter search.
+/// Shares the normal input validation, cancellation and geometry implementation.
+pub fn probe_reference_candidates(
+    map: &SurfaceSnapshot,
+    tomogram: &Tomogram,
+    start: BodyPose,
+    reference: &[[f64; 3]],
+    kinematics: &MotionKinematics,
+    config: &ScanConfig,
+    final_yaw: Option<f64>,
+    arrival: Option<([f64; 3], f64)>,
+    boundary: &[[f64; 2]],
+    follow_reference: bool,
+    prefer_straight: bool,
+    progress: Option<ProgressPrefixPolicy<'_>>,
+) -> Result<ReferenceCandidateOutcome, LocalPlanError> {
+    plan_with_extent(map, tomogram, start, reference, kinematics, config, final_yaw,
+        arrival, boundary, follow_reference, prefer_straight, progress, PlanExtent::ReferenceOnly).map(|outcome| match outcome {
+        PlanOutcome::Trajectory(path) => {
+            ReferenceCandidateOutcome::Complete(path)
+        }
+        PlanOutcome::ReferenceMiss => ReferenceCandidateOutcome::Miss,
     })
 }
 
@@ -497,7 +556,8 @@ fn plan_impl(
     follow_reference: bool,
     prefer_straight: bool,
     progress: Option<ProgressPrefixPolicy<'_>>,
-) -> Result<LocalTrajectory, LocalPlanError> {
+    extent: PlanExtent,
+) -> Result<PlanOutcome, LocalPlanError> {
     #[cfg(feature="profile")]
     let _profile=profile::Scope::begin(start,reference,kinematics,config,final_yaw,arrival,follow_reference,prefer_straight);
     #[cfg(feature="profile")]
@@ -569,8 +629,8 @@ fn plan_impl(
                     if let Some(poses)=admit_candidate(project(map,start,&samples,kinematics,false,final_yaw,region,boundary,&blocked))? {
                         #[cfg(feature="profile")]
                         profile::success();
-                        return Ok(LocalTrajectory { partial: false,poses,smoothed:false,
-                            elapsed_ms:began.elapsed().as_secs_f64()*1000.0});
+                        return Ok(PlanOutcome::Trajectory(LocalTrajectory { partial: false,poses,smoothed:false,
+                            elapsed_ms:began.elapsed().as_secs_f64()*1000.0}));
                     }
                     if arrival.is_none(){break;}
                 }
@@ -595,8 +655,8 @@ fn plan_impl(
                 model.body_to_support_z_m, corridor, layer_tolerance, length, tangent) {
                 #[cfg(feature="profile")]
                 profile::success();
-                return Ok(LocalTrajectory { partial: false, poses, smoothed: false,
-                    elapsed_ms: began.elapsed().as_secs_f64() * 1000.0 });
+                return Ok(PlanOutcome::Trajectory(LocalTrajectory { partial: false, poses, smoothed: false,
+                    elapsed_ms: began.elapsed().as_secs_f64() * 1000.0 }));
             }
         }
     }
@@ -631,7 +691,7 @@ fn plan_impl(
         if let Some(poses) = admit_candidate(project(map, start, &samples, kinematics, true, final_yaw, interior, boundary, &shortcut_blocked))? {
             #[cfg(feature="profile")]
             profile::success();
-            return Ok(LocalTrajectory { partial: false, poses, smoothed: true, elapsed_ms: began.elapsed().as_secs_f64()*1000.0 });
+            return Ok(PlanOutcome::Trajectory(LocalTrajectory { partial: false, poses, smoothed: true, elapsed_ms: began.elapsed().as_secs_f64()*1000.0 }));
         }
     }
     // 首段方向属于全局路线的接续意图。固定该切向，先完成实际转向，
@@ -668,11 +728,11 @@ fn plan_impl(
                 Ok(poses) => {
                     #[cfg(feature="profile")]
                         profile::success();
-                        return Ok(LocalTrajectory { partial: false,
+                        return Ok(PlanOutcome::Trajectory(LocalTrajectory { partial: false,
                         poses,
                         smoothed: true,
                         elapsed_ms: began.elapsed().as_secs_f64() * 1000.0,
-                    })
+                    }))
                 }
                 Err(reason) => {
                     if matches!(reason.kind, LocalPlanFailureKind::Cancelled) { return Err(reason); }
@@ -697,11 +757,11 @@ fn plan_impl(
         Ok(poses) => {
             #[cfg(feature="profile")]
             profile::success();
-            return Ok(LocalTrajectory { partial: false,
+            return Ok(PlanOutcome::Trajectory(LocalTrajectory { partial: false,
                 poses,
                 smoothed: false,
                 elapsed_ms: began.elapsed().as_secs_f64() * 1000.0,
-            });
+            }));
         }
         Err(error) if matches!(error.kind, LocalPlanFailureKind::Cancelled) => return Err(error),
         Err(error) => error,
@@ -758,11 +818,11 @@ fn plan_impl(
                 ))? {
                     #[cfg(feature="profile")]
                         profile::success();
-                        return Ok(LocalTrajectory { partial: false,
+                        return Ok(PlanOutcome::Trajectory(LocalTrajectory { partial: false,
                         poses,
                         smoothed: false,
                         elapsed_ms: began.elapsed().as_secs_f64() * 1000.0,
-                    });
+                    }));
                 }
             }
         }
@@ -789,6 +849,10 @@ fn plan_impl(
         Err(polyline) => {
             if matches!(polyline.kind, LocalPlanFailureKind::Cancelled) { return Err(polyline); }
             cancellation::checkpoint()?;
+            if extent == PlanExtent::ReferenceOnly {
+                #[cfg(feature="profile")] phase.finish("reference_miss");
+                return Ok(PlanOutcome::ReferenceMiss);
+            }
             #[cfg(feature="profile")] phase.next("search_prepare");
             // 后备搜索也遵守起步方向：可原地完成后方转向时先对齐，
             // 不能因样条失败又把尚未完成的转向混进前进动作。
@@ -826,11 +890,11 @@ fn plan_impl(
     };
     #[cfg(feature="profile")]
     profile::success();
-    Ok(LocalTrajectory { partial,
+    Ok(PlanOutcome::Trajectory(LocalTrajectory { partial,
         poses,
         smoothed: false,
         elapsed_ms: began.elapsed().as_secs_f64() * 1000.0,
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -842,6 +906,7 @@ mod tests {
     use nuwax_nav_types_messages::MotionModel;
     use std::{collections::BTreeMap, sync::Arc};
     include!("progress_prefix_tests.rs");
+    include!("reference_probe_tests.rs");
     #[cfg(feature="profile")]
     include!("phase_qualification_tests.rs");
     pub(super) fn motion() -> MotionKinematics {

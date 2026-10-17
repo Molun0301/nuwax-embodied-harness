@@ -15,7 +15,7 @@ static ACTIVE:Mutex<Option<Weak<Mutex<State>>>>=Mutex::new(None);
 /// Counts stop when the first eligible snapshot is retained. No request history.
 pub struct Counts {
     pub target_calls:usize, pub nominal:usize, pub global_curved:usize,
-    pub remaining_search:usize, pub cancelled:usize, pub eligible:usize,
+    pub remaining_search:usize, pub cancelled:usize, pub eligible:usize, pub reference_misses:usize,
 }
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub enum CaptureWindow { CurvedNominalHeuristic, FirstPartialBranch }
@@ -97,6 +97,15 @@ pub(crate) fn finish(token:Option<Token>,r:&PlanRequest,map:&SurfaceSnapshot,tom
     let observation=scan_observation::take();
     finish_with_observation(token,r,map,tomogram,reference,motion,detour,follow_reference,
         prefer_straight,progress,result,observation);
+}
+// A probe Miss is neither a partial result nor a failed full search. Consume its
+// phase records without feeding either existing capture-admission transition.
+pub(crate) fn finish_reference_miss(token:Option<Token>) {
+    let Some(token)=token else {return;};
+    let _observation=scan_observation::take();
+    let mut state=token.state.lock().unwrap();
+    state.counts.target_calls+=1;
+    state.counts.reference_misses+=1;
 }
 // Production finish supplies only the actual Scan observation above. Keeping this
 // private transition separate lets unit tests exercise storage with explicitly
@@ -247,6 +256,67 @@ mod synthetic_capture_replay_seam_tests {
         // Do not register with ACTIVE or influence another test/real capture session.
         let token=Token {state:state.clone(),started:Instant::now()};
         (state,token)
+    }
+    #[test]
+    fn reference_miss_is_counted_without_capture_or_failure() {
+        let (request,_)=fixture();
+        for window in [CaptureWindow::CurvedNominalHeuristic,CaptureWindow::FirstPartialBranch] {
+            let (state,token)=local_token(&request);
+            state.lock().unwrap().window=window;
+            scan_observation::reset();
+            finish_reference_miss(Some(token));
+            let state=state.lock().unwrap();
+            assert_eq!(state.counts.target_calls,1);
+            assert_eq!(state.counts.reference_misses,1);
+            assert_eq!(state.counts.eligible,0);
+            assert_eq!(state.counts.cancelled,0);
+            assert_eq!(state.counts.remaining_search,0);
+            assert!(state.captured.is_none());
+        }
+    }
+    #[test]
+    fn real_begin_and_probe_miss_preserve_observation_ownership() {
+        // Reuse the existing clear fixture and the existing excluded-boundary
+        // drain setup. This is an observer lifecycle test, not a partial-route
+        // benefit witness or captured whole-kernel replay.
+        let (mut request,motion)=fixture();
+        request.boundary=Arc::new(vec![[2.0,2.0],[3.0,2.0],[3.0,3.0],[2.0,3.0]]);
+        let map=request.source.fork_for_planning();
+        let tomogram=Arc::new(Tomogram::local_from_surface(&map,
+            [request.pose.pose.position.x,request.pose.pose.position.y],request.scan.horizon_m+1.5).unwrap());
+        assert_eq!(request.scan.search_expansion_limit,nuwax_nav_scan::DEFAULT_SEARCH_EXPANSION_LIMIT);
+        let full=||nuwax_nav_scan::plan_with_progress(&map,&tomogram,body(&request.pose),
+            &request.reference,&motion,&request.scan,request.final_yaw,request.arrival,
+            &request.boundary,false,false,None);
+        scan_observation::reset();
+        assert_eq!(full().unwrap_err().kind,LocalPlanFailureKind::SearchExhausted);
+        // No ownership token: must leave another consumer's real observation.
+        finish_reference_miss(None);
+        let unrelated=scan_observation::take();
+        assert!(unrelated.work[0]>0,"seed must run real local search, not fabricate WORK");
+        assert!(unrelated.phases.iter().any(|phase|phase.phase=="search_remaining"));
+        // Seed once more so both nonzero WORK and real phases are pending when
+        // the actual begin path resets them. No diagnostic counter injection.
+        assert_eq!(full().unwrap_err().kind,LocalPlanFailureKind::SearchExhausted);
+        let goal=request.reference_source.as_ref().unwrap().goal.as_ref().unwrap().pose.position;
+        let session=CaptureSession::first_partial_branch([goal.x,goal.y,goal.z]);
+        let token=begin(&request).expect("same-goal real begin must own this call");
+        let cleared=scan_observation::take();
+        assert_eq!(cleared.work,[0;5]);
+        assert!(cleared.phases.is_empty(),"begin must clear prior phases before probe's own Scope");
+        let result=nuwax_nav_scan::probe_reference_candidates(&map,&tomogram,body(&request.pose),
+            &request.reference,&motion,&request.scan,request.final_yaw,request.arrival,
+            &request.boundary,true,false,None);
+        assert!(matches!(result,Ok(nuwax_nav_scan::ReferenceCandidateOutcome::Miss)),"{result:?}");
+        finish_reference_miss(Some(token));
+        let consumed=scan_observation::take();
+        assert_eq!(consumed.work,[0;5],"probe must not inherit previous N search work");
+        assert!(consumed.phases.is_empty(),"owned Miss finish must consume its real probe phases");
+        let (counts,captured)=session.finish();
+        assert_eq!(counts.target_calls,1);
+        assert_eq!(counts.reference_misses,1);
+        assert_eq!(counts.eligible,0);
+        assert!(captured.is_none(),"a real reference Miss is not a partial result");
     }
     fn synthetic_remaining_observation()->scan_observation::Observation {
         scan_observation::Observation {

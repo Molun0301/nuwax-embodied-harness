@@ -9955,12 +9955,15 @@ fn build_navigation_map_3d_publication_frame(
         publication, &prepared.metadata, prepared.mask_data.clone(), legacy_xyz_f32_le, None)
 }
 
+#[path = "navigation_map_transfer.rs"]
+mod navigation_map_transfer;
+
 fn build_navigation_map_3d_publication_frame_with_baseline(
     publication: &CanonicalCloudPublication,
     metadata: &NavigationMap3DPublicationMetadata,
     mask_data: Vec<i8>,
     legacy_xyz_f32_le: Option<&[u8]>,
-    published_root: Option<&nuwax_map_chunks::RootIdentity>,
+    published_root: Option<&nuwax_map_chunks::Manifest>,
 ) -> Result<RawLcmFrame, String> {
     let source_timestamp_ns = i64::try_from(publication.source_timestamp_ns)
         .map_err(|_| "NavigationMap3D source time exceeds i64".to_string())?;
@@ -10030,24 +10033,8 @@ fn build_navigation_map_3d_publication_frame_with_baseline(
         if root.domain != schema::navigation_map_3d_domain(&message) || root.revision != revision as u64 {
             return Err("sealed fine-map identity differs from the committed publication owner".into());
         }
-        let root_bytes = root.encode()?;
-        let mut included = std::collections::BTreeMap::new();
-        let mut included_bytes = 0;
-        // A mask-only update names the already-published immutable root. Do not
-        // read/re-encode unchanged objects; late readers use the retained-root RPC.
-        if published_root != Some(&root.identity()) {
-            for block in &root.blocks {
-                if included_bytes + 16 + block.points as usize * 12 > 128 * 1024 { continue; }
-                let bytes = fine.repository.read_object(block.object, nuwax_map_chunks::MAX_BLOCK_BYTES)?;
-                if included_bytes + bytes.len() > 128 * 1024 { continue; }
-                included_bytes += bytes.len();
-                included.insert(block.object, bytes);
-            }
-        }
         message.source_voxel_size = root.voxel_size_m;
-        message.fine = Some(nuwax_map_chunks::Transfer {
-            root: root_bytes, included,
-        });
+        message.fine = Some(navigation_map_transfer::prepare(fine, published_root)?);
     }
     let payload =
         schema::encode_navigation_map_3d_body(&message).map_err(|error| error.to_string())?;
@@ -10364,7 +10351,7 @@ type CanonicalPublicationIdentity = (u64, u64, [u8; 16], u64,
 struct CanonicalCloudPublicationInvalidation {
     identity_tx: watch::Sender<CanonicalPublicationIdentity>,
     canonical_metadata_published: parking_lot::Mutex<Option<(CommittedCloudMapMetadata,
-        Option<nuwax_map_chunks::RootIdentity>, Option<NavigationMap3DPublicationIdentity>,
+        Option<Arc<nuwax_map_chunks::Manifest>>, Option<NavigationMap3DPublicationIdentity>,
         Option<crate::mapping_commit::CloudCommitReceipt>)>>,
     navigation_identity_tx: watch::Sender<Option<NavigationMap3DPublicationIdentity>>,
     // Only the owned lifecycle watcher reads the marker/environment. Hot commits
@@ -10546,7 +10533,8 @@ fn canonical_fine_publication_pending(writer: &Arc<parking_lot::Mutex<Option<Clo
         .map(|fine| fine.manifest().identity());
     let Some(root) = root else { return false; };
     let published = invalidation.canonical_metadata_published.lock();
-    published.as_ref().is_none_or(|(_, previous, _, _)| previous.as_ref() != Some(&root))
+    published.as_ref().is_none_or(|(_, previous, _, _)|
+        previous.as_ref().map(|previous| previous.identity()).as_ref() != Some(&root))
 }
 
 async fn publish_latest_canonical_cloud_map_with_navigation(
@@ -10657,7 +10645,8 @@ async fn publish_latest_canonical_cloud_map_with_exposure(
             let canonical_already_published = publish_state.published_identity() == Some(identity)
                 && invalidation.canonical_metadata_published.lock().as_ref()
                     .is_some_and(|(metadata, root, occupancy, cloud)| same_cloud_metadata(metadata, &publication.metadata)
-                        && *root == publication.fine.as_ref().map(|fine| fine.manifest().identity())
+                        && root.as_ref().map(|root| root.identity())
+                            == publication.fine.as_ref().map(|fine| fine.manifest().identity())
                         && *occupancy == navigation_identity && *cloud == publication.receipt);
             if canonical_already_published && legacy_full_demand.is_none() {
                 if let Some(expected) = expected_exposure {
@@ -10703,7 +10692,7 @@ async fn publish_latest_canonical_cloud_map_with_exposure(
             let (navigation_metadata, navigation_frame) = match navigation_metadata {
                 Some(PreparedNavigationMap3DPublication { metadata, mask_data }) => {
                     let frame = build_navigation_map_3d_publication_frame_with_baseline(
-                        &publication, &metadata, mask_data, exported_xyz.as_deref(), published_root.as_ref())?;
+                        &publication, &metadata, mask_data, exported_xyz.as_deref(), published_root.as_deref())?;
                     (Some(metadata), Some(frame))
                 }
                 None => (None, None),
@@ -10848,7 +10837,7 @@ async fn publish_latest_canonical_cloud_map_with_exposure(
                 invalidation.mark_legacy_full_published(publication.metadata, demand);
             }
             *invalidation.canonical_metadata_published.lock() = Some((publication.metadata,
-                publication.fine.as_ref().map(|fine| fine.manifest().identity()), navigation_identity,
+                publication.fine.as_ref().map(|fine| Arc::clone(fine.manifest())), navigation_identity,
                 publication.receipt.clone()));
             publish_state.mark_published(identity);
             if shared.cloud_map_revision < publication.notification.revision {
@@ -14968,7 +14957,7 @@ mod mapping_feed_tests {
         }
         let (_, _, retained) = latest_canonical_cloud_publication(&fixture.writer).unwrap().unwrap();
         assert!(same_canonical_cloud_publication_identity(&publication, &retained));
-        let baseline = publication.fine.as_ref().unwrap().manifest().identity();
+        let baseline = Arc::clone(publication.fine.as_ref().unwrap().manifest());
         let metadata = navigation_map_3d_publication_metadata(
             &fixture.context,
             &publication,

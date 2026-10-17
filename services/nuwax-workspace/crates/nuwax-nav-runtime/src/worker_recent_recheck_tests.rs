@@ -32,13 +32,19 @@ impl NavPlanner for RecentRecheckProbe {
     fn take_command_dispatch_bound(&mut self)->Option<CommandDispatchBound>{self.inner.take_command_dispatch_bound()}
     fn stop(&mut self){self.inner.stop()}
 }
-fn recent_recheck_fixture()->(PlannerWorker,Arc<SurfaceSnapshot>,Arc<Mutex<RecentRecheckCounts>>,
-    std::sync::mpsc::Receiver<PlannerStep>,std::sync::mpsc::Sender<()>) {
-    let map=Arc::new(crate::surface_follower::test_snapshot(0.0,false).with_body_envelope(SurfaceBodyEnvelope {
+fn recent_recheck_source()->Arc<SurfaceSnapshot> {
+    Arc::new(crate::surface_follower::test_snapshot(0.0,false).with_body_envelope(SurfaceBodyEnvelope {
         footprint_xy_m:vec![[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],
         z_bounds_m:[-0.05,0.2],body_to_support_z_m:0.4,max_step_up_m:0.2,max_step_down_m:0.2,
         max_cross_slope_deg:18.0,support_uncertainty_m:0.0,
-    }).unwrap());
+    }).unwrap())
+}
+fn recent_recheck_fixture()->(PlannerWorker,Arc<SurfaceSnapshot>,Arc<Mutex<RecentRecheckCounts>>,
+    std::sync::mpsc::Receiver<PlannerStep>,std::sync::mpsc::Sender<()>) {
+    recent_recheck_fixture_with_map(recent_recheck_source())
+}
+fn recent_recheck_fixture_with_map(map:Arc<SurfaceSnapshot>)->(PlannerWorker,Arc<SurfaceSnapshot>,Arc<Mutex<RecentRecheckCounts>>,
+    std::sync::mpsc::Receiver<PlannerStep>,std::sync::mpsc::Sender<()>) {
     let mut config=crate::SurfaceFollowerConfig::new(0.4);
     config.motion_limits=Some(nuwax_nav_types_messages::MotionLimits {
         model:MotionModel::Differential,max_forward_mps:0.5,max_reverse_mps:0.0,max_lateral_mps:0.0,

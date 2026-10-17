@@ -1484,6 +1484,12 @@ pub(crate) struct SurfaceMapTicket {
 }
 
 impl SurfaceMapTicket {
+    // Compare only inside the same domain. A mask commit can advance while the
+    // cloud root stays unchanged; neither component is a new synthetic clock.
+    fn revision(&self) -> (i64, i64) {
+        (self.cloud_revision, self.committed_map.revision)
+    }
+
     fn same_domain(&self, other: &Self) -> bool {
         self.producer_runtime_generation == other.producer_runtime_generation
             && self.commit_boot_nonce == other.commit_boot_nonce
@@ -1500,7 +1506,7 @@ struct SurfaceExplorationMode {
     producer_runtime_generation: i64,
     commit_boot_nonce: [u8; 16],
     latest: Option<SurfaceMapTicket>,
-    installed_cloud_revision: Option<i64>,
+    installed_revision: Option<(i64, i64)>,
     minimum_eligible_cloud_revision: i64,
     input_ready: bool,
     input_error: Option<String>,
@@ -1983,7 +1989,7 @@ impl ExploreRuntimeHandle {
             producer_runtime_generation: producer_runtime_generation as i64,
             commit_boot_nonce,
             latest: None,
-            installed_cloud_revision: None,
+            installed_revision: None,
             minimum_eligible_cloud_revision: 0,
             input_ready: false,
             input_error: Some("surface map input is unavailable".into()),
@@ -2040,9 +2046,19 @@ impl ExploreRuntimeHandle {
             if mode
                 .latest
                 .as_ref()
-                .is_some_and(|previous| ticket.cloud_revision <= previous.cloud_revision)
+                .is_some_and(|previous| {
+                    ticket.cloud_revision < previous.cloud_revision
+                        || (ticket.cloud_revision == previous.cloud_revision
+                            && (message.cleared
+                                || !ticket.same_domain(previous)
+                                || ticket.committed_map.revision <= previous.committed_map.revision
+                                || ticket.committed_map.commit_sequence <= previous.committed_map.commit_sequence))
+                })
             {
-                return Err("surface cloud revision is duplicate or stale".into());
+                // Match navigation's composite receipt rule: a same-root mask
+                // revision must advance through a newer owner commit. Domain
+                // changes and clears still require the original cloud fence.
+                return Err("surface map revision is duplicate, stale, or lacks a new commit".into());
             }
             let invalidates = message.cleared
                 || mode
@@ -2051,7 +2067,7 @@ impl ExploreRuntimeHandle {
                     .is_some_and(|previous| !ticket.same_domain(previous));
             mode.latest = Some(ticket.clone());
             if invalidates {
-                mode.installed_cloud_revision = None;
+                mode.installed_revision = None;
                 mode.minimum_eligible_cloud_revision =
                     message.cloud_revision + i64::from(message.cleared);
                 mode.receiver.clear().map_err(|error| error.to_string())?;
@@ -2108,19 +2124,19 @@ impl ExploreRuntimeHandle {
             };
             if !mode.accepting
                 || mode.latest.as_ref().is_none_or(|latest| {
-                    !ticket.same_domain(latest) || ticket.cloud_revision > latest.cloud_revision
+                    !ticket.same_domain(latest) || ticket.revision() > latest.revision()
                 })
                 || ticket.cloud_revision < mode.minimum_eligible_cloud_revision
                 || mode
-                    .installed_cloud_revision
-                    .is_some_and(|revision| ticket.cloud_revision <= revision)
+                    .installed_revision
+                    .is_some_and(|revision| ticket.revision() <= revision)
             {
                 return false;
             }
             match result {
                 Ok(snapshot) => match mode.receiver.observe(snapshot) {
                     Ok(()) => {
-                        mode.installed_cloud_revision = Some(ticket.cloud_revision);
+                        mode.installed_revision = Some(ticket.revision());
                         mode.input_ready = true;
                         mode.input_error = None;
                         None
@@ -2170,7 +2186,7 @@ impl ExploreRuntimeHandle {
         if let Some(mode) = guard.surface_mode.as_mut() {
             mode.accepting = false;
             mode.latest = None;
-            mode.installed_cloud_revision = None;
+            mode.installed_revision = None;
             mode.input_ready = false;
             mode.input_error = Some("surface input owner stopped".into());
             let _ = mode.receiver.clear();
@@ -8657,6 +8673,7 @@ mod tests {
 
     include!("explore_compute_runtime_tests.rs");
     include!("explore_compute_surface_tests.rs");
+    include!("explore_composite_map_tests.rs");
 
     #[tokio::test]
     async fn compute_owner_surface_slow_prepare_keeps_result_but_rejects_stale_next_tick() {

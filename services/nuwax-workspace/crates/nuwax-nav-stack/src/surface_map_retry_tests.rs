@@ -423,14 +423,32 @@ async fn incomplete_refresh_changed_mask_and_invalid_source_still_revoke_route()
 }
 
 #[test]
-fn incomplete_refresh_mask_guard_ignores_only_receipt_header_changes() {
+fn incomplete_refresh_mask_guard_ignores_only_receipt_clocks() {
     let mut first = map_message(1, "same-mask");
     first.virtual_obstacles = Some(virtual_mask(&first, false));
     let mut next = map_message(2, "same-mask");
     next.virtual_obstacles = Some(virtual_mask(&next, false));
+    let old = first.virtual_obstacles.as_ref().unwrap();
+    let new = next.virtual_obstacles.as_ref().unwrap();
+    assert_ne!((old.info.map_load_time_sec, old.info.map_load_time_nsec),
+        (new.info.map_load_time_sec, new.info.map_load_time_nsec),
+        "fixture must reproduce Geometry's changing production load clock");
     assert!(same_retained_mask(&first, &next));
-    next.virtual_obstacles.as_mut().unwrap().data[0] = 100;
-    assert!(!same_retained_mask(&first, &next));
+    let mutations: [fn(&mut schema::OccupancyGrid); 8] = [
+        |mask| mask.header.frame_id = "foreign".into(),
+        |mask| mask.info.resolution *= 2.0,
+        |mask| mask.info.width += 1,
+        |mask| mask.info.height += 1,
+        |mask| mask.info.origin.position[0] += 1.0,
+        |mask| mask.info.origin.position[2] += 1.0,
+        |mask| mask.info.origin.orientation_xyzw = [0.0, 0.0, 1.0, 0.0],
+        |mask| mask.data[0] = 100,
+    ];
+    for mutate in mutations {
+        let mut changed = next.clone();
+        mutate(changed.virtual_obstacles.as_mut().unwrap());
+        assert!(!same_retained_mask(&first, &changed));
+    }
     next.virtual_obstacles = None;
     assert!(!same_retained_mask(&first, &next));
 }

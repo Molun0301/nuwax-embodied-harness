@@ -39,17 +39,22 @@ struct Inputs {
     lifecycle_update: bool,
 }
 
-// A soft view update may request an actual final-trajectory recheck. This is
-// never permission to reuse the old collision result or cross an Unknown gap.
+// A complete, continuous surface update can recheck the selected stopping
+// trajectory against its latest geometry instead of ranking every candidate
+// again. This never reuses an old collision answer or crosses an Unknown gap.
 fn recheckable_surface_update(previous:Option<&ExecutionMap>,next:&ExecutionMap)->bool {
     let Some(previous)=previous else {return false;};
     let previous=match previous {ExecutionMap::Surface(map)=>map,
         ExecutionMap::SurfaceUpdate(update)=>&update.snapshot,_=>return false};
     let ExecutionMap::SurfaceUpdate(update)=next else {return false;};
-    matches!(update.changes.as_ref(),surface_changes::SurfaceGeometryChanges::Empty)
-        && update.change_basis.as_ref().is_some_and(|basis|nuwax_nav_pct::same_source_geometry(previous,basis))
-        && nuwax_nav_pct::same_source_geometry(previous,&update.snapshot)
+    update.change_basis.as_ref().is_some_and(|basis|nuwax_nav_pct::same_source_geometry(previous,basis))
         && surface_changes::same_query_semantics(previous,&update.snapshot)
+        && match update.changes.as_ref() {
+            surface_changes::SurfaceGeometryChanges::Empty =>
+                nuwax_nav_pct::same_source_geometry(previous,&update.snapshot),
+            surface_changes::SurfaceGeometryChanges::Columns {..} => true,
+            surface_changes::SurfaceGeometryChanges::Unknown => false,
+        }
 }
 
 // Only timestamps may advance without changing pose-derived authority. Preserve
@@ -450,9 +455,7 @@ impl NavPlanner for PlannerWorker {
     fn update_execution_map(&mut self, map: ExecutionMap) -> Result<(), RuntimeError> {
         self.delivered_dispatch_bound=None;
         let mut input = self.shared.0.lock().unwrap();
-        if !recheckable_surface_update(input.map.as_ref(),&map) {
-            input.terrain_generation+=1;
-        }
+        let recheckable=recheckable_surface_update(input.map.as_ref(),&map);
         let map = match (input.map_pending, input.map.as_ref(), map) {
             (true, Some(ExecutionMap::SurfaceUpdate(previous)), ExecutionMap::SurfaceUpdate(next)) => {
                 let mut merged=previous.clone();merged.append(next);ExecutionMap::SurfaceUpdate(merged)
@@ -465,6 +468,13 @@ impl NavPlanner for PlannerWorker {
             }
             (_, _, map) => map,
         };
+        // Individually complete batches may coalesce beyond the existing delta
+        // budget, or span an unconsumed legacy snapshot. Fence that resulting
+        // Unknown too; the current check cannot inherit a lost source chain.
+        if !recheckable || matches!(&map,ExecutionMap::SurfaceUpdate(update)
+            if matches!(update.changes.as_ref(),surface_changes::SurfaceGeometryChanges::Unknown)) {
+            input.terrain_generation+=1;
+        }
         input.map = Some(map);
         input.map_pending = true;
         input.map_version += 1;
@@ -638,6 +648,7 @@ impl Drop for PlannerWorker {
 mod tests {
     use super::*;
     include!("worker_first_delivery_tests.rs");
+    include!("worker_geometry_recheck_tests.rs");
     mod snapshot_tests { use super::*; include!("worker_snapshot_tests.rs"); }
     include!("worker_recent_recheck_tests.rs");
     use nuwax_nav_mls_planner::SurfaceBodyEnvelope;

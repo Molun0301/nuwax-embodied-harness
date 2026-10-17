@@ -1508,6 +1508,7 @@ version = "0.1.0"
 dependencies = [
  "ahash",
  "async-trait",
+ "base64",
  "futures",
  "libc",
  "memmap2",
@@ -1854,6 +1855,7 @@ dependencies = [
 name = "nuwax-nav-stack"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "bitflags",
  "futures",
  "nuwax-codec",

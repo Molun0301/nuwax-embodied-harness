@@ -21,6 +21,8 @@ pub const BLOCK_SIDE: i32 = 32;
 pub const MAX_BLOCKS: usize = 131_072;
 pub const MAX_LEGACY_BLOCK_BYTES: usize = 16 + 32_768 * 12;
 pub const MAX_BLOCK_BYTES: usize = 4 * 1024 * 1024;
+/// 可靠补取单段上限；整块仍由原4MiB预算及完整校验约束。
+pub const MAX_BLOCK_TRANSFER_PART_BYTES: usize = 256 * 1024;
 pub const MAX_MANIFEST_BYTES: usize = 32 * 1024 * 1024;
 pub type Key = [i32; 3];
 

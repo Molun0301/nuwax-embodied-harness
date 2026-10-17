@@ -1,5 +1,6 @@
 //! 开发机导航模拟工作进程：复用生产规划与跟随，环境运动独立积分速度命令。
 mod scenarios;
+mod terrain_reference;
 use nuwax_nav_mls_planner::{
     SurfaceMapBuilder, SurfaceObservation, SurfaceObservations, SurfaceSnapshot,
 };
@@ -25,6 +26,8 @@ use std::{
 
 type Body = ([f64; 3], [f64; 4]);
 const DT: f64 = 0.05;
+const STOP_LINEAR_MPS: f64 = 0.005;
+const STOP_ANGULAR_RPS: f64 = 0.01;
 static CANCEL: AtomicBool = AtomicBool::new(false);
 extern "C" fn interrupt(_: i32) {
     CANCEL.store(true, Ordering::Relaxed);
@@ -236,6 +239,8 @@ struct Terrain {
     source_voxel_m: f64,
     response_radius_m: f64,
     step_m: [f64; 2],
+    physical_surface: Option<scenarios::PhysicalSurface>,
+    reference_field: std::sync::OnceLock<terrain_reference::ReferenceField>,
 }
 impl Terrain {
     fn new(
@@ -295,7 +300,38 @@ impl Terrain {
             source_voxel_m: source,
             response_radius_m,
             step_m,
+            physical_surface: None,
+            reference_field: Default::default(),
         }
+    }
+
+    fn physical_samples(&self, xy: [f64; 2], surface: scenarios::PhysicalSurface)
+        -> Result<Vec<(f64, f64, f64, f64, f64)>, String> {
+        let [x0, x1, y0, y1] = surface.bounds;
+        if !(x0..x1).contains(&xy[0]) || !(y0..y1).contains(&xy[1]) {
+            return Err("模拟机体已越出声明的物理地面范围".into());
+        }
+        let spacing = self.source_voxel_m;
+        let radius = self.response_radius_m;
+        let low = xy.map(|value| ((value - radius) / spacing).floor() as i32);
+        let high = xy.map(|value| ((value + radius) / spacing).ceil() as i32);
+        let mut samples = Vec::new();
+        for ix in low[0]..=high[0] {
+            for iy in low[1]..=high[1] {
+                let x = (f64::from(ix) + 0.5) * spacing;
+                let y = (f64::from(iy) + 0.5) * spacing;
+                if !(x0..x1).contains(&x) || !(y0..y1).contains(&y) { continue; }
+                let dx = x - xy[0];
+                let dy = y - xy[1];
+                let distance2 = dx * dx + dy * dy;
+                if distance2 >= radius * radius { continue; }
+                let z = (surface.height)(x, y);
+                let taper = 1.0 - distance2 / (radius * radius);
+                samples.push((dx, dy, z, z, taper * taper));
+            }
+        }
+        if samples.len() < 3 { return Err("声明物理面的足迹采样不足".into()); }
+        Ok(samples)
     }
 
     fn contact_samples(
@@ -399,7 +435,7 @@ impl Terrain {
         self.fit_body_at(xy, reference, heading, offset, false)
     }
 
-    /// 静态地面查询保持幂等；实际运动对有厚度的接触区间使用加权响应。
+    /// 已声明物理面独立驱动合成环境；未知真值的点云使用同层固定几何近似。
     fn response_at(&self, xy: [f64; 2], reference: f64, heading: f64, offset: f64)
         -> Result<Body, String> {
         self.fit_body_at(xy, reference, heading, offset, true)
@@ -416,7 +452,11 @@ impl Terrain {
         if self.flat {
             return Ok(([xy[0], xy[1], offset], quaternion(0., 0., heading)));
         }
-        let samples = self.contact_samples(xy, reference)?;
+        let samples = if let Some(surface) = self.physical_surface {
+            self.physical_samples(xy, surface)?
+        } else {
+            self.contact_samples(xy, reference)?
+        };
         let (mut sw, mut sx, mut sy, mut xx, mut yy, mut xy_sum) = (0., 0., 0., 0., 0., 0.);
         for &(x, y, _, _, w) in &samples {
             sw += w;
@@ -433,19 +473,56 @@ impl Terrain {
         if determinant <= 0.0 {
             return Err("模拟地面采样共线，无法确定支撑平面".into());
         }
+        if self.physical_surface.is_some() {
+            // 声明物理面只使用自身的独立样本，绝不读取导航预测或规划路径。
+            let (mut sz, mut xz, mut yz) = (0.0, 0.0, 0.0);
+            for &(x, y, low, high, weight) in &samples {
+                let z = (low + high) * 0.5;
+                sz += weight * z;
+                xz += weight * x * z;
+                yz += weight * y * z;
+            }
+            let d = xz - sx * sz / sw;
+            let e = yz - sy * sz / sw;
+            let gx = (d * b - e * c) / determinant;
+            let gy = (e * a - d * c) / determinant;
+            let z = (sz - gx * sx - gy * sy) / sw;
+            let pitch = -(gx * heading.cos() + gy * heading.sin()).atan();
+            let roll = ((-gx * heading.sin() + gy * heading.cos()) * pitch.cos()).atan();
+            return Ok(([xy[0], xy[1], z + offset], quaternion(roll, pitch, heading)));
+        }
+        if response && samples.iter().any(|s|s.2!=s.3) {
+            let field=self.reference_field.get_or_init(||terrain_reference::ReferenceField::new(
+                &self.columns,self.source_voxel_m,self.response_radius_m-self.source_voxel_m));
+            let mut origin=None;let(mut sz,mut xz,mut yz)=(0.0,0.0,0.0);
+            for &(x,y,low,high,w) in &samples {
+                let height=field.height([xy[0]+x,xy[1]+y],low,high)?;
+                let base=*origin.get_or_insert(height);let z=height-base;
+                sz+=w*z;xz+=w*x*z;yz+=w*y*z;
+            }
+            let d=xz-sx*sz/sw;let e=yz-sy*sz/sw;
+            let gx=(d*b-e*c)/determinant;let gy=(e*a-d*c)/determinant;
+            let reference=origin.unwrap()+(sz-gx*sx-gy*sy)/sw;
+            let [gx,gy,height]=terrain_reference::fit_intervals(&samples,reference)?;
+            let pitch=-(gx*heading.cos()+gy*heading.sin()).atan();
+            let roll=((-gx*heading.sin()+gy*heading.cos())*pitch.cos()).atan();
+            return Ok(([xy[0],xy[1],height+offset],quaternion(roll,pitch,heading)));
+        }
         // 直接最小化平面到观测区间的残差。每轮投影当前平面，不能把样本
         // 固定为每拍变化的实际参考；否则相对地形旋转会在台阶往返中累计漂移。
         // 单层等价于原加权最小二乘，共同可行的水平面无需反复求解。
         // 相同观测的地面必须可重复查询；实际高度不能决定一个新的斜面解。
         let lower=samples.iter().map(|s|s.2).fold(f64::NEG_INFINITY,f64::max);
         let upper=samples.iter().map(|s|s.3).fold(f64::INFINITY,f64::min);
+        // 动态锚点由同层观测固定，区间中点差异不能强制制造额外法向。
+        let origin=(samples[0].2+samples[0].3)*0.5;
+        let centre=origin+samples.iter().map(|s|((s.2+s.3)*0.5-origin)*s.4).sum::<f64>()/sw;
         if lower<=upper {
             let height = if response {
-                interval_height_response(&samples, reference, lower, upper)
+                interval_height_response(&samples, centre, lower, upper)
             } else { reference.clamp(lower, upper) };
             return Ok(([xy[0],xy[1],height+offset],quaternion(0.0,0.0,heading)));
         }
-        let centre=samples.iter().map(|s|(s.2+s.3)*0.5*s.4).sum::<f64>()/sw;
         let mut plane = [0.0, 0.0, centre];
         for _ in 0..128 {
             let (fx, fy, low, high, _) = samples[0];
@@ -478,8 +555,9 @@ impl Terrain {
     }
 }
 
-/// 独立最小化共同区间的加权残差与实际高度偏差，系数来自区间宽度和空间跨度。
-/// 用单调导数二分求根，与生产端的端点事件算法交叉核对，不读取规划预测或路线。
+
+/// 以固定几何锚点独立最小化共同区间残差；区间宽与跨度仅给几何正则。
+/// 单调导数二分与生产端端点事件算法交叉核对，不读取规划预测或路线。
 fn interval_height_response(samples: &[(f64, f64, f64, f64, f64)], reference: f64,
     lower: f64, upper: f64) -> f64 {
     let clamped = reference.clamp(lower, upper);
@@ -564,6 +642,7 @@ impl Scene {
             0.05,
             [body_model.max_step_up_m, body_model.max_step_down_m],
         );
+        terrain.physical_surface = scenarios::physical_surface(id);
         if ground_evidence==GroundEvidence::OccupiedVolume {
             for bands in terrain.columns.values_mut() {for band in bands {band.0=band.1;}}
         }
@@ -618,7 +697,14 @@ impl Scene {
             .cloned()
             .unwrap_or(json!({"start":[0.,0.,offset,0.],"goal":[7.,0.,offset,0.]}));
         let model = config.body_envelope.as_ref().unwrap();
-        let metadata = json!({"id":id,"name":name,"description":if id=="recorded"{"指定实录三维点云，独立体素地面运动模型"}else{"已知平面环境，独立速度积分与加减速响应"},"default_start":default["start"],"default_goal":default["goal"],"point_count":points.len(),"display_point_count":bytes.len()/12,"bounds":bounds,"body_to_support_z_m":offset,"robot":{"footprint_xy":model.footprint_xy_m,"z_bounds":model.z_bounds_m},"terrain_response":{"radius_m":terrain.response_radius_m,"source_voxel_m":terrain.source_voxel_m,"weight":"(1-r²/R²)²","calibration":"declared_footprint_plus_source_voxel","domain":"nearest_observed_columns_in_eight_directions","max_step_up_m":terrain.step_m[0],"max_step_down_m":terrain.step_m[1]},"world_model":if id=="recorded"{"pointcloud_terrain"}else{"flat"}});
+        let mut metadata = json!({"id":id,"name":name,"description":if id=="recorded"{"指定实录三维点云，独立体素地面运动模型"}else{"已知平面环境，独立速度积分与加减速响应"},"default_start":default["start"],"default_goal":default["goal"],"point_count":points.len(),"display_point_count":bytes.len()/12,"bounds":bounds,"body_to_support_z_m":offset,"robot":{"footprint_xy":model.footprint_xy_m,"z_bounds":model.z_bounds_m},"terrain_response":{"radius_m":terrain.response_radius_m,"source_voxel_m":terrain.source_voxel_m,"weight":"(1-r²/R²)²","calibration":"declared_footprint_plus_source_voxel","domain":"nearest_observed_columns_in_eight_directions","max_step_up_m":terrain.step_m[0],"max_step_down_m":terrain.step_m[1]},"world_model":if id=="recorded"{"pointcloud_terrain"}else{"flat"}});
+        metadata["terrain_response"]["reference_kind"] = json!(if terrain.physical_surface.is_some() {
+            "declared_physical_surface"
+        } else if flat { "known_flat_ground" } else { "fixed_connected_interval_family_approximation" });
+        metadata["terrain_response"]["physical_truth_available"] = json!(terrain.physical_surface.is_some() || flat);
+        if terrain.physical_surface.is_some() {
+            metadata["terrain_response"]["domain"] = json!("declared_physical_surface_at_source_spacing");
+        }
         Ok(Self {
             id: id.into(),
             points,
@@ -866,8 +952,10 @@ impl Simulation {
             max_lateral_command_mps: 0.0,
             pose_mode: if scene.terrain.flat {
                 "flat"
+            } else if scene.terrain.physical_surface.is_some() {
+                "declared_physical_surface"
             } else {
-                "pointcloud_terrain"
+                "pointcloud_terrain_approximation"
             }
             .into(),
             braking_for_replan: false,
@@ -1002,8 +1090,8 @@ impl Simulation {
         self.applied = applied;
         self.time += DT;
         if self.braking_for_replan
-            && self.applied[0].hypot(self.applied[1]) < 0.005
-            && self.applied[2].abs() < 0.01
+            && self.applied[0].hypot(self.applied[1]) < STOP_LINEAR_MPS
+            && self.applied[2].abs() < STOP_ANGULAR_RPS
         {
             self.braking_for_replan = false;
             self.need_plan = true;
@@ -1013,8 +1101,8 @@ impl Simulation {
         self.follower
             .update_odometry(stamped(self.current, self.time));
         if arriving
-            && self.applied[0].hypot(self.applied[1]) < 0.005
-            && self.applied[2].abs() < 0.01
+            && self.applied[0].hypot(self.applied[1]) < STOP_LINEAR_MPS
+            && self.applied[2].abs() < STOP_ANGULAR_RPS
         {
             let angle = (yaw(self.current) - yaw(self.goal) + std::f64::consts::PI)
                 .rem_euclid(std::f64::consts::TAU)
@@ -1035,7 +1123,7 @@ impl Simulation {
     fn state(&mut self, scene: &Scene) -> Value {
         let local:Vec<_>=self.follower.local_path().map_or_else(Vec::new,|path|path.poses.iter()
             .map(|pose|[pose.pose.position.x,pose.pose.position.y,pose.pose.position.z]).collect());
-        json!({"status":self.status,"sim_time_sec":self.time,"pose":pose4(self.current),"orientation":self.current.1,"goal":pose4(self.goal),"command":self.command,"velocity":self.applied,"global_path":self.path.iter().map(|p|p.0).collect::<Vec<_>>(),"path_revision":self.plans,"path_history":self.history,"local_path":local,"frames":std::mem::take(&mut self.pending_frames),"obstacles":scene.obstacles,"world_model":self.pose_mode,"terrain_response":scene.metadata["terrain_response"],"motion_failure":self.motion_failure,"metrics":{"speed_mps":self.applied[0].hypot(self.applied[1]),"configured_speed_mps":self.speed,"distance_remaining_m":distance(self.current,self.goal),"global_plans":self.plans,"local_plans":self.follower.local_plans(),"last_plan_ms":self.last_plan_ms,"last_control_ms":self.last_control_ms,"max_rss_mb":rss_mb(),"motion_validation_failures":self.motion_failures,"reverse_travel_m":self.reverse_travel_m,"lateral_travel_m":self.lateral_travel_m,"max_reverse_command_mps":self.max_reverse_command_mps,"max_lateral_command_mps":self.max_lateral_command_mps},"motion_policy":"forward_only","message":self.message})
+        json!({"status":self.status,"sim_time_sec":self.time,"pose":pose4(self.current),"orientation":self.current.1,"goal":pose4(self.goal),"goal_options":{"position_tolerance_m":self.options.position_tolerance_m,"yaw_tolerance_rad":self.options.yaw_tolerance_rad,"requires_orientation":self.options.requires_orientation()},"stopping_criteria":{"linear_speed_below_mps":STOP_LINEAR_MPS,"angular_speed_below_rps":STOP_ANGULAR_RPS,"comparison":"strictly_less"},"command":self.command,"velocity":self.applied,"global_path":self.path.iter().map(|p|p.0).collect::<Vec<_>>(),"path_revision":self.plans,"path_history":self.history,"local_path":local,"frames":std::mem::take(&mut self.pending_frames),"obstacles":scene.obstacles,"world_model":self.pose_mode,"terrain_response":scene.metadata["terrain_response"],"motion_failure":self.motion_failure,"metrics":{"speed_mps":self.applied[0].hypot(self.applied[1]),"configured_speed_mps":self.speed,"distance_remaining_m":distance(self.current,self.goal),"global_plans":self.plans,"local_plans":self.follower.local_plans(),"last_plan_ms":self.last_plan_ms,"last_control_ms":self.last_control_ms,"max_rss_mb":rss_mb(),"motion_validation_failures":self.motion_failures,"reverse_travel_m":self.reverse_travel_m,"lateral_travel_m":self.lateral_travel_m,"max_reverse_command_mps":self.max_reverse_command_mps,"max_lateral_command_mps":self.max_lateral_command_mps},"motion_policy":"forward_only","message":self.message})
     }
 }
 fn synthetic(blocked: bool) -> Vec<(f32, f32, f32)> {
@@ -1126,13 +1214,17 @@ fn run() -> Result<(), String> {
             .unwrap()
             .push(scene.metadata.clone());
     }
-    for specification in scenarios::multilevel() {
+    for specification in scenarios::multilevel().into_iter().chain(scenarios::complex_ground()) {
         let mut scene=Scene::make(specification.id,specification.name,specification.points,
             Vec::new(),config.clone(),false,
             if specification.occupied_volume {GroundEvidence::OccupiedVolume}else{GroundEvidence::MeasuredSurface},&data)?;
         scene.cases=specification.cases;
         scene.metadata["description"]=json!(specification.description);
         scene.metadata["ground_evidence"]=json!(format!("{:?}",scene.ground_evidence));
+        scene.metadata["world_model"]=json!(if scene.terrain.physical_surface.is_some() {"declared_physical_surface"} else {"pointcloud_terrain_approximation"});
+        if matches!(specification.id,"thick-undulating"|"irregular-ground"|"rough-ramp-obstacle") {
+            scene.metadata["ground_input"]=scenarios::complex_ground_metadata(specification.id);
+        }
         scene.metadata["default_start"]=scene.cases[0]["start"].clone();
         scene.metadata["default_goal"]=scene.cases[0]["goal"].clone();
         catalog["scenes"].as_array_mut().unwrap().push(scene.metadata.clone());
@@ -1243,12 +1335,16 @@ fn run() -> Result<(), String> {
                     let scene=scenes.get(request["scene_id"].as_str().ok_or("场景缺失")?).ok_or("场景不存在")?;
                     let from:Body=serde_json::from_value(request["from"].clone()).map_err(|e|e.to_string())?;
                     let to:Body=serde_json::from_value(request["to"].clone()).map_err(|e|e.to_string())?;
+                    let mut initial_witness=None;
+                    let initial_pose_check=scene.map.validate_body_pose_with_witness(from.0,from.1,&mut initial_witness)
+                        .map_err(|e|e.to_string());
                     let mut witness=None;
                     let full=scene.map.with_current_body_support(from.0,from.1)
                         .and_then(|m|m.validate_body_motion_with_witness(from,to,&[],&mut witness)).map_err(|e|e.to_string());
                     let query=scene.map.body_query_with_current_support(from.0,from.1)
                         .and_then(|m|m.validate_body_motion(from,to,&[])).map_err(|e|e.to_string());
-                    Ok(json!({"full":full,"query":query,"witness":format!("{witness:?}")}))
+                    Ok(json!({"full":full,"query":query,"witness":format!("{witness:?}"),
+                        "initial_pose_check":initial_pose_check,"initial_witness":format!("{initial_witness:?}")}))
                 }
                 "inspect_motions" => {
                     let scene=scenes.get(request["scene_id"].as_str().ok_or("场景缺失")?).ok_or("场景不存在")?;
@@ -1366,6 +1462,114 @@ mod tests {
             0.05,
             [0.15, 0.15],
         )
+    }
+
+    #[test]
+    fn declared_physical_ground_is_independent_of_downward_observation_thickness() {
+        let thin = terrain_points(|_, _| 0.0);
+        let mut thick = thin.clone();
+        for &(x,y,z) in &thin {
+            for layer in 1..=if x<0.0 {2} else {4} {
+                thick.push((x,y,z-layer as f32*0.05));
+            }
+        }
+        let physical = scenarios::PhysicalSurface { height: |_,_|0.0, bounds: [-2.0,2.0,-2.0,2.0] };
+        let mut first = test_terrain(&thin,false);
+        let mut second = test_terrain(&thick,false);
+        assert_ne!(first.columns,second.columns,"夹具必须保留不同观测厚度");
+        first.physical_surface=Some(physical);
+        second.physical_surface=Some(physical);
+        for x in [-0.5,-0.001,0.001,0.5] {
+            for reference in [-0.1,0.0,0.1] {
+                let a=first.response_at([x,0.0],reference,0.3,0.4).unwrap();
+                let b=second.response_at([x,0.0],reference,0.3,0.4).unwrap();
+                assert_eq!(a,b,"独立物理面不得随观测带厚度改变");
+                assert_eq!(a.0[2],0.4);
+                assert_eq!(a.1,quaternion(0.0,0.0,0.3));
+            }
+        }
+    }
+
+    fn follow_environment_ground(terrain:&Terrain,mut current:Body,end:f64,step:f64)->Body {
+        let start=current.0[0];
+        let count=((end-start).abs()/step).round() as usize;
+        for index in 1..=count {
+            let x=start+(end-start)*index as f64/count as f64;
+            let heading=yaw(current);
+            let reference=contact_reference(current,0.4);
+            let before=terrain.response_at([current.0[0],current.0[1]],reference,heading,0.4).unwrap();
+            let after=terrain.response_at([x,current.0[1]],reference,heading,0.4).unwrap();
+            current=body_after_ground_change(current,([x,current.0[1],current.0[2]],current.1),before,after,0.4);
+        }
+        current
+    }
+
+    #[test]
+    fn declared_rough_physical_surface_closes_and_does_not_depend_on_step_size() {
+        let scenario=scenarios::complex_ground().into_iter().find(|s|s.id=="rough-ramp-obstacle").unwrap();
+        let surface=scenarios::physical_surface(scenario.id).unwrap();
+        let mut terrain=test_terrain(&scenario.points,false);
+        terrain.physical_surface=Some(surface);
+        let height=(surface.height)(0.0,1.1);
+        let initial=([0.0,1.1,height+0.4],terrain.body_at([0.0,1.1],height,0.0,0.4).unwrap().1);
+        let reference=follow_environment_ground(&terrain,initial,3.0,0.1);
+        assert!((reference.0[2]-((surface.height)(3.0,1.1)+0.4)).abs()<0.03,
+            "物理坡面不能因观测下向加厚累计降低机体：{reference:?}");
+        for step in [0.1,0.02,0.005] {
+            let upper=follow_environment_ground(&terrain,initial,3.0,step);
+            assert!((upper.0[2]-reference.0[2]).abs()<1e-9);
+            let returned=follow_environment_ground(&terrain,upper,0.0,step);
+            assert!(distance(initial,returned)<1e-9);
+            assert!(returned.1.iter().zip(initial.1).all(|(a,b)|(a-b).abs()<1e-9));
+        }
+    }
+
+    #[test]
+    fn fixed_legacy_geometry_response_keeps_common_height_and_distinct_layers() {
+        let q=f64::from(0.05_f32);
+        let mut biased=Vec::new();
+        let mut floors=Vec::new();
+        for ix in -30..30 {for iy in -20..20 {
+            let x=((ix as f64+0.5)*q) as f32;
+            let y=((iy as f64+0.5)*q) as f32;
+            for iz in if ix<0 {-3..= -1} else {-5..= -1} {
+                biased.push((x,y,((iz as f64+0.5)*q) as f32));
+            }
+            for iz in [-1,39] {floors.push((x,y,((iz as f64+0.5)*q) as f32));}
+        }}
+        let terrain=test_terrain(&biased,false);
+        let initial=([-0.6,0.0,0.4],quaternion(0.0,0.0,0.0));
+        let next=follow_environment_ground(&terrain,initial,0.6,0.02);
+        assert!((next.0[2]-0.4).abs()<1e-7,
+            "两侧存在同一区域水平参考，不能把单侧向下加厚当作平地下降");
+        let floors=test_terrain(&floors,false);
+        for height in [0.0,2.0] {
+            let body=floors.response_at([0.0,0.0],height,0.0,0.4).unwrap();
+            assert!((body.0[2]-(height+0.4)).abs()<1e-7);
+        }
+        assert!(floors.response_at([0.0,0.0],1.0,0.0,0.4).is_err());
+    }
+
+    #[test]
+    fn common_interval_response_keeps_horizontal_frame_despite_midpoint_gradient() {
+        let q=f64::from(0.05_f32);
+        let mut points=Vec::new();
+        for x in -24..24 {for y in -24..24 {
+            let px=(f64::from(x)+0.5)*q;
+            let top=((0.15*px+0.1)/q).round() as i32-1;
+            for z in top-4..=top {
+                points.push((px as f32,((f64::from(y)+0.5)*q) as f32,
+                    ((f64::from(z)+0.5)*q) as f32));
+            }
+        }}
+        let terrain=test_terrain(&points,false);
+        let expected=terrain.response_at([0.0,0.0],0.0,0.0,0.4).unwrap().0[2];
+        for heading in [-3.0,-1.0,0.0,1.0,3.0] {for reference in [-0.04,0.0,0.04] {
+            let body=terrain.response_at([0.0,0.0],reference,heading,0.4).unwrap();
+            assert_eq!(body.0[2],expected,"同层固定场不得由实际高度决定");
+            assert_eq!(body.1,quaternion(0.0,0.0,heading),
+                "共同可行水平区间的中点梯度不能强加法向");
+        }}
     }
 
     #[test]
@@ -1609,7 +1813,7 @@ mod tests {
         let source = f64::from(0.05_f32);
         let mut points = Vec::new();
         for x in -12..=12 { for y in -12..=12 {
-            for z in -2..=0 {
+            for z in -2..=1 {
                 if (x, y) == (7, 0) && z != -1 { continue; }
                 points.push((((f64::from(x) + 0.5) * source) as f32,
                     ((f64::from(y) + 0.5) * source) as f32,
@@ -1624,8 +1828,8 @@ mod tests {
         assert!((before.0[2] - after.0[2]).abs() < 1e-8,
             "趋近零权重的边缘厚带样本不能强迫整个机体突降：{before:?} → {after:?}");
         let entered = terrain.response_at([boundary + 0.1, 0.0], 0.01, 0.0, 0.4).unwrap();
-        assert!(entered.0[2] < before.0[2] && entered.0[2] > 0.4,
-            "观测权重增长后必须连续产生真实响应，不能冻结高度或直接跳到边界");
+        assert!((entered.0[2]-before.0[2]).abs()<1e-12,
+            "全区共同支持的水平面不应因同一窄区间进入局部足迹而再次改变");
     }
 
     #[test]

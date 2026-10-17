@@ -139,6 +139,19 @@ fn measured_plane_response_uses_source_height_instead_of_legacy_voxel_top() {
 }
 
 #[test]
+fn fixed_motion_reference_keeps_observed_layer_priority_over_legacy_midpoint() {
+    let map=with_measured_floor(layered_map(&[[-3,-1],[37,39]]),-0.025);
+    for reference in [-0.04,-0.025,0.0] {
+        let center=map.locate_near_support([0.025,0.025,reference],0.3).unwrap();
+        let dynamic=map.body_motion_contact_frame(center,reference,0.4).unwrap();
+        let static_frame=map.body_contact_frame(center,reference,0.4).unwrap();
+        assert_eq!(dynamic,static_frame,"实测平面应在两个模式下保持同一真实高度与法向");
+        assert!((dynamic.0+0.025).abs()<1e-12,"实测高度不能换成旧占据带中点");
+    }
+    assert!(map.body_query_cache.lock().unwrap().planes.is_empty(),"真实层不读写旧式拟合缓存");
+}
+
+#[test]
 fn measured_members_stay_fixed_as_body_rises_and_preserve_the_low_obstacle() {
     let map=with_measured_floor(layered_map(&[[-1,-1],[2,2]]),-0.025);
     let ground=(0,0,-1); // the explicit, fixed lower physical layer

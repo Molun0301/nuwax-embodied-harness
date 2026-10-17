@@ -195,6 +195,28 @@ fn encode_response<T: Serialize>(response: T) -> Result<Value, InvocationError> 
         .map_err(|error| InvocationError::serialization(error.to_string()))
 }
 
+fn encode_navigation_map_block_response(response: NavigationMapBlockResponse) -> Result<Value, InvocationError> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    match response.schema_version {
+        2 => Ok(serde_json::json!({"schema_version":2,"root":response.root,
+            "block":response.block,"data":response.data})),
+        3 => {
+            if response.data.is_empty()
+                || response.data.len() > nuwax_map_chunks::MAX_BLOCK_TRANSFER_PART_BYTES
+                || response.total_bytes as usize > nuwax_map_chunks::MAX_BLOCK_BYTES
+                || response.offset as u64 + response.data.len() as u64 > response.total_bytes as u64 {
+                return Err(InvocationError::serialization("精细块响应长度错误"));
+            }
+            // 只改变显式新版RPC的字节表示，避免数百万整数值及容器克隆。
+            // 原不可变块、完整身份、拥有方和期限继续由原服务检查。
+            Ok(serde_json::json!({"schema_version":3,"root":response.root,
+                "block":response.block,"offset":response.offset,"total_bytes":response.total_bytes,
+                "data_base64":STANDARD.encode(&response.data)}))
+        }
+        _ => Err(InvocationError::serialization("不支持的精细块响应版本")),
+    }
+}
+
 struct GeometryRpcHandler {
     service: Arc<GeometryRuntimeService>,
     method: GeometryRpcMethod,
@@ -239,7 +261,10 @@ impl GeometryRpcHandler {
                 call_unary!(Empty, get_mapping_state)
             }
             GeometryRpcMethod::GetNavigationMapBlock => {
-                call_unary!(NavigationMapBlockRequest, get_navigation_map_block)
+                let request = decode_request::<NavigationMapBlockRequest>(args)?;
+                let response = GeometryRuntime::get_navigation_map_block(&*self.service, Request::new(request))
+                    .await.map_err(InvocationError::status)?;
+                encode_navigation_map_block_response(response.into_inner())
             }
             GeometryRpcMethod::ActivateMap => {
                 call_unary!(ActivateMapRequest, activate_map)
@@ -326,6 +351,29 @@ pub async fn serve_geometry_rpc(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn navigation_block_encoding_preserves_legacy_and_compact_bytes() {
+        let original = vec![0, 1, 254, 255];
+        for schema_version in [2, 3] {
+            let value = encode_navigation_map_block_response(NavigationMapBlockResponse {
+                schema_version, root: None, block: None, data: original.clone(), offset:0,total_bytes:4,
+            }).unwrap();
+            assert_eq!(value["schema_version"], schema_version);
+            if schema_version == 2 {
+                assert_eq!(value["data"], serde_json::json!([0, 1, 254, 255]));
+                assert!(value.get("data_base64").is_none());
+            } else {
+                assert_eq!(value["data_base64"], "AAH+/w==", "标准编码的固定独立向量");
+                assert!(value.get("data").is_none());
+            }
+        }
+        for (schema_version, length) in [(3, nuwax_map_chunks::MAX_BLOCK_BYTES + 1), (4, 1)] {
+            assert!(encode_navigation_map_block_response(NavigationMapBlockResponse {
+                schema_version, root: None, block: None, data: vec![0; length],offset:0,total_bytes:length as u32,
+            }).is_err());
+        }
+    }
 
     #[test]
     fn names_follow_original_module_class_method_contract() {

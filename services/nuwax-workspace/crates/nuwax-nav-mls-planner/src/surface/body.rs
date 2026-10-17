@@ -6,6 +6,10 @@ use super::body_witness::{CachedBodyResult, reject, height_rejection};
 use crate::body_query_profile::{self as query_profile, Counter as QueryCounter, Stage as QueryStage};
 #[path = "body_translation.rs"]
 mod translation;
+#[path = "body_reference_field.rs"]
+pub(super) mod reference_field;
+#[path = "body_dynamic_interval.rs"]
+mod dynamic_interval;
 type GroundPatchCache = AHashMap<(VoxelKey, u64, u64), Arc<AHashMap<(i32, i32), VoxelKey>>>;
 pub(super) type CacheSlot = std::sync::Mutex<GroundPatchCache>;
 
@@ -1207,7 +1211,7 @@ impl SurfaceSnapshot {
                                 let high=[x,y,z].map(|v|f64::from(v+1)*fine);
                                 if high[2]>=min[2] && low[2]<=max[2] && prism_query.intersects(low,high) {
                                     return Err(reject(slot,BodyRejection::Occupancy{cell:[x,y,z],
-                                        source:OccupancySource::Recent,z_bounds:[low[2],high[2]],ground_height:None}));
+                                        source:OccupancySource::Recent,z_bounds:[low[2],high[2]],ground_height:height}));
                                 }
                             }
                         }
@@ -1356,10 +1360,17 @@ impl SurfaceSnapshot {
             let mut covered=std::collections::BTreeSet::new();
             for ix in (f64::from(x)*size/fine).floor() as i32..(f64::from(x+1)*size/fine).ceil() as i32 {
                 for iy in (f64::from(y)*size/fine).floor() as i32..(f64::from(y+1)*size/fine).ceil() as i32 {
+                    let levels=observations.column_levels(ix,iy).unwrap_or(&[]);
+                    // 完整细源对粗格的覆盖与机体投影无关；先保留该粗格所有真实高度证据。
+                    // 否则机体外的细占据会被遗漏，随后又被膨胀为相交的整块粗障碍。
+                    for &z in levels {
+                        if observations.get([ix,iy,z]).is_some() {
+                            covered.insert((((f64::from(z)+0.5)*fine)/size).floor() as i32);
+                        }
+                    }
                     if !polygon.intersects(ix,iy,fine) {continue;}
                     let column=selected.as_ref().and_then(|rows|rows.iter().find(|row|row.xy==[ix,iy]));
-                    for &z in observations.column_levels(ix,iy).unwrap_or(&[]) {
-                        covered.insert((((f64::from(z)+0.5)*fine)/size).floor() as i32);
+                    for &z in levels {
                         let key=[ix,iy,z];
                         if column.is_some_and(|column|column.permits_contact(z))
                             || !observations.get(key).is_some() {continue;}
@@ -1550,11 +1561,11 @@ impl SurfaceSnapshot {
         };
         #[cfg(feature = "body-query-profile")]
         drop(next_support_profile);
-        let (base_height,base_attitude)=match self.body_contact_frame(base_projection,initial_height,current_yaw) {
+        let (base_height,base_attitude)=match self.body_motion_contact_frame(base_projection,initial_height,current_yaw) {
             Ok(frame)=>frame,Err(SurfaceError::MissingSupport)=>return self.estimated_body_motion(from,xy,yaw,slot),
             Err(error)=>return Err(error),
         };
-        let (next_height,next_attitude)=match self.body_contact_frame(projected,initial_height,yaw) {
+        let (next_height,next_attitude)=match self.body_motion_contact_frame(projected,initial_height,yaw) {
             Ok(frame)=>frame,Err(SurfaceError::MissingSupport)=>return self.estimated_body_motion(from,xy,yaw,slot),
             Err(error)=>return Err(error),
         };
@@ -2676,13 +2687,26 @@ impl SurfaceSnapshot {
     /// 在连续足迹邻域上共同拟合接触高度和法向；连续厚带保留实测参考允许的区间。
     fn body_contact_frame(&self,centre:SurfaceLocation,height:f64,yaw:f64)
         -> Result<(f64,[f64;4]),SurfaceError> {
+        self.body_contact_frame_with_mode(centre,height,yaw,ContactPlaneMode::StaticInterval)
+    }
+
+    /// 动态输运只使用同一物理层的固定参考场，实际高度仅参与层关联。
+    /// LegacyContactInterval（旧式接触区间）从不可变源的连通高度族读取固定参考。
+    /// 该参考是几何近似，不是实测均值或物理真值；原区间仍决定动态拟合。
+    fn body_motion_contact_frame(&self,centre:SurfaceLocation,height:f64,yaw:f64)
+        -> Result<(f64,[f64;4]),SurfaceError> {
+        self.body_contact_frame_with_mode(centre,height,yaw,ContactPlaneMode::FixedMotionReference)
+    }
+
+    fn body_contact_frame_with_mode(&self,centre:SurfaceLocation,height:f64,yaw:f64,mode:ContactPlaneMode)
+        -> Result<(f64,[f64;4]),SurfaceError> {
         #[cfg(feature = "body-query-profile")]
         let _frame_profile = query_profile::guard(QueryStage::ContactFrame);
         let model=self.body_envelope()
             .ok_or_else(||SurfaceError::InvalidConfig("body envelope is unavailable".into()))?;
         let support=[centre.support_xyz[0],centre.support_xyz[1],height];
         if let Some(frame)=self.measured_contact_frame([support[0],support[1]],height,yaw) {return Ok(frame);}
-        let key=(centre.cell,support.map(f64::to_bits));
+        let key=(centre.cell,support.map(f64::to_bits),mode);
         #[cfg(feature = "body-query-profile")]
         let cache_profile = query_profile::guard(QueryStage::PlaneCacheLookup);
         let cached=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner()).planes.get(&key).copied();
@@ -2728,7 +2752,26 @@ impl SurfaceSnapshot {
             drop(sort_profile);
             #[cfg(feature = "body-query-profile")]
             let fit_profile = query_profile::guard(QueryStage::ContactPlaneFit);
-            let plane=fit_contact_plane(&points,support).ok_or(SurfaceError::MissingSupport)?;
+            let plane=match mode {
+                ContactPlaneMode::StaticInterval=>fit_contact_plane(&points,support),
+                ContactPlaneMode::FixedMotionReference=> {
+                    let thick=points.iter().any(|&(point,low,_)|point[2]!=low);
+                    let reference=if let Some(observations)=self.observations.as_ref().filter(|_|thick) {
+                        let field=observations.legacy_reference_field(self.ground_evidence,model.radius());
+                        let samples:Option<Vec<_>>=points.iter().map(|&(point,low,weight)|
+                            field.height(point,low).map(|height|([point[0]-support[0],point[1]-support[1],height],weight))).collect();
+                        fit_plane_weighted(samples.ok_or(SurfaceError::MissingSupport)?.into_iter(),[0.0;3])
+                            .ok_or(SurfaceError::MissingSupport)?.2
+                    } else {
+                        // 缺少原始细列时仍保留粗几何近似；薄面原高度不受固定参考影响。
+                        let mass=points.iter().map(|point|point.2).sum::<f64>();
+                        let origin=points.first().map_or(0.0,|&(point,low,_)|(low+point[2])*0.5);
+                        origin+points.iter().map(|&(point,low,weight)|
+                            ((low+point[2])*0.5-origin)*weight).sum::<f64>()/mass
+                    };
+                    dynamic_interval::fit_dynamic_contact_plane(&points,[support[0],support[1],reference])
+                },
+            }.ok_or(SurfaceError::MissingSupport)?;
             #[cfg(feature = "body-query-profile")]
             drop(fit_profile);
             let mut cache=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner());
@@ -2901,6 +2944,7 @@ mod tests {
     mod recent_query_tests { include!("body_recent_query_tests.rs"); }
     mod live_geometry_tests { include!("body_live_geometry_tests.rs"); }
     include!("body_observation_vec_tests.rs");
+    include!("body_motion_reference_tests.rs");
     use super::*;
     #[test]
     fn oversized_motion_is_a_resource_error_without_a_collision_witness() {
@@ -4702,7 +4746,7 @@ mod tests {
 
     #[test]
     fn relative_terrain_uses_exposed_fine_surface_without_internal_or_other_floor_drift() {
-        let make=|fill:bool,upper:bool| {
+        let make=|fill:bool,upper:bool,blocked:bool| {
             let mut points=Vec::new();
             for x in -40..40 {for y in -20..20 {
                 let px=(x as f32+0.5)*0.05;let py=(y as f32+0.5)*0.05;
@@ -4710,6 +4754,11 @@ mod tests {
                 if fill {for z in if x<0 {vec![-0.025,-0.075,-0.125]}else{vec![-0.025]} {points.push((px,py,z));}}
                 if upper {points.push((px,py,0.825));}
             }}
+            if blocked {
+                for x in -1..=0 {for y in -1..=0 {for z in 4..16 {
+                    points.push(((x as f32+0.5)*0.05,(y as f32+0.5)*0.05,(z as f32+0.5)*0.05));
+                }}}
+            }
             let mut blocks=std::collections::BTreeMap::<[i32;3],std::collections::BTreeMap<[i32;3],SurfaceObservation>>::new();
             for &(x,y,z) in &points {
                 let key=[x,y,z].map(|v|(f64::from(v)/f64::from(0.05_f32)).floor() as i32);
@@ -4722,15 +4771,28 @@ mod tests {
         };
         let from=([-0.65,0.05,0.45],[0.01,0.02,0.15,1.0]);
         let r=rotation(from.1).unwrap();let yaw=r[0][1].atan2(r[0][0]);
-        let mut results=Vec::new();
-        for (fill,upper) in [(false,false),(true,false),(true,true)] {
-            let map=make(fill,upper);
-            let result=map.body_pose_after_motion(from,[0.65,0.05],yaw).unwrap();
-            assert_eq!(result.1,from.1,"同一平坦露顶保留原完整四元数");
-            assert_eq!(result.0[2],from.0[2],"不同内部填充与独立上层都不能产生实际机体升降");
-            map.validate_body_motion(from,result,&[]).unwrap();results.push(result);
+        for evidence in [GroundEvidence::OccupiedVolume,GroundEvidence::MeasuredSurface] {
+            let mut results=Vec::new();
+            for (fill,upper) in [(false,false),(true,false),(true,true)] {
+                let map=make(fill,upper,false).with_ground_evidence(evidence);
+                let result=map.body_pose_after_motion(from,[0.65,0.05],yaw).unwrap();
+                assert_eq!(result.1,from.1,"两端固定参考面相同时保留原完整四元数");
+                // 两侧原区间共同支持同一水平参考，向下填充不应再制造5厘米高度漂移。
+                assert!((result.0[2]-from.0[2]).abs()<1e-12,
+                    "固定区域应利用共同可行高度，不把厚度分布变化当作地面升降");
+                map.validate_body_motion(from,result,&[]).unwrap();
+                let returned=map.body_pose_after_motion(result,[from.0[0],from.0[1]],yaw).unwrap();
+                assert!((returned.0[2]-from.0[2]).abs()<1e-10,"几何近似不能累积往返漂移");
+                results.push(result);
+            }
+            assert_eq!(results[1],results[2],"独立上层不得混入当前已关联带");
+            if evidence==GroundEvidence::OccupiedVolume {assert_eq!(results[0],results[1]);}
         }
-        assert!(results.windows(2).all(|pair|pair[0]==pair[1]));
+        let blocked=make(true,false,true).with_ground_evidence(GroundEvidence::MeasuredSurface);
+        let to=make(true,false,false).body_pose_after_motion(from,[0.65,0.05],yaw).unwrap();
+        blocked.validate_body_pose(from.0,from.1).unwrap();
+        blocked.validate_body_pose(to.0,to.1).unwrap();
+        assert!(blocked.validate_body_motion(from,to,&[]).is_err(),"固定厚带近似不能穿透真实中间障碍");
     }
 
     #[test]
@@ -4975,9 +5037,9 @@ mod tests {
         coarse.body_pose_after_motion(from,[0.001,0.0],0.0).expect("原粗响应可完成真实平地微动");
         let next=map.body_pose_after_motion(from,[0.001,0.0],0.0)
             .expect("外部孤岛恰好包含参考高度，不应夺走当前完整地面的响应种子");
-        // 共同带改为软区间残差后，旧“高度差<1e-10”的精确identity不再成立。
-        // 这不是放大epsilon：按独立二分求得的新目标根验证高度，同时保留零倾斜和完整扫掠许可。
-        super::scalar_response_tests::assert_flat_response_matches_reference(&map,from,next);
+        // 固定几何场可包含外部观测造成的微小形状偏差；静态区间根仍须保持，
+        // 动态输运则必须通过完整扫掠并能严格回到同一实际站姿。
+        super::scalar_response_tests::assert_static_interval_and_reversible_motion(&map,from,next);
         eprintln!("SCALAR_FLAT_SEED height_delta_m={:?}",next.0[2]-from.0[2]);
     }
 
@@ -5475,6 +5537,34 @@ mod tests {
             map.validate_body_motion(from,next,&[]).unwrap();
             assert!((next.0[2]-from.0[2]).abs()<2.0*delta && next.1.iter().zip(from.1).all(|(a,b)|(a-b).abs()<10.0*delta));
         }
+    }
+
+    #[test]
+    fn relative_terrain_whole_footprint_descends_a_real_thick_step_and_closes() {
+        let q=f64::from(0.05_f32);let mut points=Vec::new();
+        let mut blocks=std::collections::BTreeMap::<[i32;3],std::collections::BTreeMap<[i32;3],SurfaceObservation>>::new();
+        for x in -40_i32..40 {for y in -20_i32..20 {
+            let top=if x<0 {0}else{-3};
+            for z in top-2..top {
+                let key=[x,y,z];points.push((((f64::from(x)+0.5)*q)as f32,((f64::from(y)+0.5)*q)as f32,((f64::from(z)+0.5)*q)as f32));
+                blocks.entry(key.map(|v|v.div_euclid(32))).or_default().insert(key,SurfaceObservation{observed_ns:0,hits:0});
+            }
+        }}
+        let mut observations=SurfaceObservations::new(0.05,32).unwrap();
+        for (key,values) in blocks {observations.replace_block(key,values).unwrap();}observations.mark_complete_geometry_source();
+        let mut cfg=scene(&[],false).config().clone();cfg.robot_height=0.1;cfg.wall_clearance_m=0.0;
+        let mut envelope=model();envelope.footprint_xy_m=vec![[-0.3,-0.15],[0.3,-0.15],[0.3,0.15],[-0.3,0.15]];
+        envelope.z_bounds_m=[-0.448,0.057];envelope.max_step_up_m=3.0*q;envelope.max_step_down_m=3.0*q;envelope.max_cross_slope_deg=18.0;
+        let map=SurfaceSnapshot::from_points(&points,cfg,0.05).unwrap().with_body_envelope(envelope).unwrap().with_observations(Some(Arc::new(observations)));
+        let start=([-0.6,0.025,0.4],[0.0,0.0,0.0,1.0]);let mut current=start;
+        for i in (1..=120).chain((0..120).rev()) {
+            let x=-0.6+f64::from(i)*0.01;let next=map.body_pose_after_motion(current,[x,0.025],0.0).unwrap();
+            map.validate_body_motion(current,next,&[]).unwrap_or_else(|e|panic!("厚阶原扫掠x={x}：{e}；{current:?}->{next:?}"));
+            if i==120 {assert!((next.0[2]-(0.4-3.0*q)).abs()<1e-8,"全部足迹已进入低台，不能悬停在高台参考：{next:?}");}
+            current=next;
+        }
+        assert!((current.0[2]-start.0[2]).abs()<1e-8);
+        assert!(current.1.iter().zip(start.1).all(|(a,b)|(a-b).abs()<1e-8));
     }
 
     #[test]
@@ -6467,12 +6557,15 @@ fn reference_prism_intersects_voxel(
 }
 
 // 缓存只属于同一不可变表面及当前足迹视图；输入保留浮点精确位，不扩大几何容差。
+#[derive(Clone,Copy,PartialEq,Eq,Hash)]
+enum ContactPlaneMode { StaticInterval, FixedMotionReference }
+
 #[derive(Default)]
 pub(super) struct BodyQueryCache {
     pub(super) supports: AHashMap<[u64;8],Result<SurfaceLocation,SurfaceError>>,
     measured_ground_patches: GroundPatchCache,
     lower_bounds: AHashMap<VoxelKey,f64>,
-    planes: AHashMap<(VoxelKey,[u64;3]),(f64,f64,f64)>,
+    planes: AHashMap<(VoxelKey,[u64;3],ContactPlaneMode),(f64,f64,f64)>,
     contact_samples: AHashMap<VoxelKey,Arc<Vec<([f64;3],f64)>>>,
     fine_bands: AHashMap<(i32,i32),Arc<Vec<FineContactBand>>>,
     complete_columns: AHashMap<(i32,i32),bool>,

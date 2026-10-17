@@ -30,6 +30,36 @@ fn update(w: &mut Writer, layer: LayerObservation) {
     w.replace_layer_observations([0, 0, 0], [(0, layer)].into())
         .unwrap();
 }
+
+#[test]
+fn complete_horizontal_layers_survive_block_encoding_without_column_loss() {
+    let q = 0.125;
+    let mut block = Block::new();
+    let mut layers = LayerObservations::new();
+    // 同一32×32水平块中的两个真实平面，各细列保留独立成员和原回波。
+    for z in [0_u16, 16] {
+        for y in 0_u16..32 {
+            for x in 0_u16..32 {
+                let key = x + 32 * y + 1024 * z;
+                let point = [(f64::from(x) + 0.5) * q,
+                    (f64::from(y) + 0.5) * q, (f64::from(z) + 0.5) * q];
+                block.insert(key, Evidence { observed_ns: 1, hits: 1 });
+                layers.insert(key, LayerObservation {
+                    members: vec![key], normal: [0.0, 0.0, 1.0], plane_origin: point,
+                    samples: vec![LayerSample { source: Arc::new(LayerSource::Legacy),
+                        point, source_sequence: 1, source_timestamp_ns: 1,
+                        point_index: u32::from(key) }],
+                });
+            }
+        }
+    }
+    let bytes = encode_layer_block(&block, &layers)
+        .expect("完整平面不能因单列记录数超过256而丢失成员");
+    assert!(bytes.len() < MAX_BLOCK_BYTES, "真实字节预算仍约束编码");
+    assert_eq!(decode_layer_observations(&bytes).unwrap(), layers);
+    assert_eq!(decode_block(&bytes).unwrap(), block);
+}
+
 #[test]
 fn observed_block_roundtrip_and_legacy_has_no_fabricated_samples() {
     let block = [(
@@ -196,4 +226,42 @@ fn invalid_layer_population_cannot_change_writer_or_mix_columns() {
     }
     w.remove([[0, 0, 0]]).unwrap();
     assert!(w.layer_observations([0, 0, 0]).unwrap().is_empty());
+}
+
+#[test]
+fn partial_layer_deletion_reanchors_and_retires_only_removed_sample_statistics() {
+    for base in [[0,0,0],[-1,-1,-2]] {
+        for removed_index in [0_usize,1] {
+            let repository=Repository::temporary().unwrap();
+            let mut w=Writer::new(repository.clone(),0.125,4*1024*1024).unwrap();
+            let keys=[base,[base[0],base[1],base[2]+1]];
+            w.observe([keys[0]],30).unwrap();w.observe([keys[1]],20).unwrap();
+            let block=block_key(base);
+            let plane=[(f64::from(base[0])+0.5)*0.125,(f64::from(base[1])+0.5)*0.125,
+                f64::from(base[2]+1)*0.125];
+            let layer=LayerObservation {
+                members:keys.map(local_key).to_vec(),plane_origin:plane,normal:[0.,0.,1.],
+                samples:(0..2).map(|index|LayerSample { source:Arc::new(LayerSource::Legacy),
+                    point:[plane[0],plane[1],plane[2]+if index==0 {-0.001} else {0.001}],
+                    source_sequence:1,source_timestamp_ns:if index==0 {30} else {20},point_index:index }).collect(),
+            };
+            w.replace_layer_observations(block,[(local_key(base),layer.clone())].into()).unwrap();
+            let first=w.snapshot(domain(),1,30).unwrap();
+            w.remove([keys[removed_index]]).unwrap();
+            let remaining=keys[1-removed_index];
+            let kept=w.layer_observations(block).unwrap();
+            assert_eq!(kept.len(),1);
+            let kept=&kept[&local_key(remaining)];
+            assert_eq!(kept.members,vec![local_key(remaining)]);
+            assert_eq!((kept.plane_origin,kept.normal),(layer.plane_origin,layer.normal));
+            assert_eq!(kept.samples,vec![layer.samples[1-removed_index].clone()]);
+            assert_eq!(kept.statistics().unwrap().moments().count(),1);
+            let second=w.snapshot(domain(),2,30).unwrap();
+            assert!(second.geometry_revision>first.geometry_revision);
+            let bytes=repository.read_object(second.blocks[0].object,MAX_BLOCK_BYTES).unwrap();
+            assert_eq!(decode_layer_observations(&bytes).unwrap().len(),1);
+            w.remove([remaining]).unwrap();
+            assert!(w.layer_observations(block).unwrap().is_empty());
+        }
+    }
 }

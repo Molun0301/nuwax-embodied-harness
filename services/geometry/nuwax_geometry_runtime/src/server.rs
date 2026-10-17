@@ -7130,8 +7130,14 @@ impl GeometryRuntime for GeometryRuntimeService {
     ) -> Result<Response<NavigationMapBlockResponse>, Status> {
         self.ensure_running_admission("GetNavigationMapBlock").await?;
         let request = request.into_inner();
-        if request.schema_version != 2 {
+        if !matches!(request.schema_version, 2 | 3) {
             return Err(Status::invalid_argument("unsupported fine-map block protocol version"));
+        }
+        if (request.schema_version == 2 && (request.offset != 0 || request.max_bytes != 0))
+            || (request.schema_version == 3 && (request.max_bytes == 0
+                || request.max_bytes as usize > nuwax_map_chunks::MAX_BLOCK_TRANSFER_PART_BYTES
+                || request.offset as usize >= nuwax_map_chunks::MAX_BLOCK_BYTES)) {
+            return Err(Status::invalid_argument("invalid fine-map block range"));
         }
         let wire_root = request.root.as_ref().ok_or_else(|| Status::invalid_argument("missing retained root"))?;
         let wire_domain = wire_root.domain.as_ref().ok_or_else(|| Status::invalid_argument("missing root domain"))?;
@@ -7161,9 +7167,18 @@ impl GeometryRuntime for GeometryRuntimeService {
             points: wire_block.points,
         };
         let receiver = self.bridge.read_navigation_map_block(&root, &reference).map_err(Status::failed_precondition)?;
-        let data = receiver.await.map_err(|e| Status::unavailable(e.to_string()))?.map_err(Status::not_found)?;
+        let mut data = receiver.await.map_err(|e| Status::unavailable(e.to_string()))?.map_err(Status::not_found)?;
+        let total_bytes = data.len() as u32;
+        if request.schema_version == 3 {
+            let start = request.offset as usize;
+            if start >= data.len() { return Err(Status::invalid_argument("fine-map block offset exceeds object")); }
+            let end = data.len().min(start + request.max_bytes as usize);
+            // 每段仍读取同一保留根中的不可变对象；不在服务端累积下载会话。
+            data = data[start..end].to_vec();
+        }
         Ok(Response::new(NavigationMapBlockResponse {
-            schema_version: 2, root: request.root, block: request.block, data,
+            schema_version: request.schema_version, root: request.root, block: request.block, data,
+            offset: request.offset, total_bytes: if request.schema_version == 3 { total_bytes } else { 0 },
         }))
     }
 
@@ -15534,6 +15549,75 @@ async fn assigned_mapping_cloud_boundary_slice(
             session_id: activated.session_id,
             reason: "first-pose checkpoint regression complete".to_owned(),
         })).await.expect("stop activated checkpoint session");
+        assert!(owner.task_owner.shutdown().await.producers_settled());
+    }
+
+    #[tokio::test]
+    async fn retained_navigation_block_serves_both_wire_versions() {
+        let handle = checkpoint_frame_test_handle().await;
+        let mut owner = crate::lcm_runtime::attach_root_task_owner_for_tests(handle);
+        let handle = owner.handle.clone();
+        let service = GeometryRuntimeService::new(handle.clone());
+        let xyz = [[0.025_f32, 0.025, 0.025], [1.025_f32, 0.025, 0.025]]
+            .into_iter().flatten().flat_map(f32::to_le_bytes).collect();
+        let activated = GeometryRuntime::activate_map(&service, Request::new(cloud_activation_request(xyz)))
+            .await.unwrap().into_inner();
+        assert!(activated.success && activated.active);
+        let fine = handle.cloud_map_writer.lock().as_ref().unwrap().committed_fine_cloud().unwrap();
+        let root = fine.manifest();
+        let reference = root.blocks.first().unwrap();
+        let expected = fine.repository.read_object(reference.object, nuwax_map_chunks::MAX_BLOCK_BYTES).unwrap();
+        let object = match reference.object {
+            nuwax_map_chunks::ObjectIdentity::Assigned(id) => NavigationMapObjectIdentity {
+                kind: 1, object_id: id.0.to_vec(), legacy_alias: Vec::new(),
+            },
+            nuwax_map_chunks::ObjectIdentity::Legacy(id) => NavigationMapObjectIdentity {
+                kind: 2, object_id: Vec::new(), legacy_alias: id.0.to_vec(),
+            },
+        };
+        let wire_root = NavigationMapRootIdentity { revision: root.revision, domain: Some(NavigationMapDomain {
+            session: root.domain.session.clone(), generation: root.domain.generation,
+            frame_generation: root.domain.frame_generation, producer_generation: root.domain.producer_generation,
+        }) };
+        let wire_block = NavigationMapBlockRef { key: reference.key.to_vec(), object: Some(object),
+            block_revision: reference.block_revision, geometry_revision: reference.geometry_revision, points: reference.points };
+        for schema_version in [2, 3] {
+            let request = NavigationMapBlockRequest { schema_version,
+                root: Some(wire_root.clone()), block: Some(wire_block.clone()), offset:0,
+                max_bytes:if schema_version==3 {nuwax_map_chunks::MAX_BLOCK_TRANSFER_PART_BYTES as u32} else {0} };
+            let response = GeometryRuntime::get_navigation_map_block(&service, Request::new(request.clone()))
+                .await.expect("两版编码共用真实保留根与读取拥有方").into_inner();
+            assert_eq!(response.schema_version, schema_version);
+            assert_eq!(response.root, request.root);
+            assert_eq!(response.block, request.block);
+            assert_eq!(response.data, expected);
+            assert_eq!(response.total_bytes,if schema_version==3 {expected.len() as u32} else {0});
+        }
+        let mut joined=Vec::new();
+        while joined.len()<expected.len() {
+            let response=GeometryRuntime::get_navigation_map_block(&service,Request::new(NavigationMapBlockRequest {
+                schema_version:3,root:Some(wire_root.clone()),block:Some(wire_block.clone()),
+                offset:joined.len() as u32,max_bytes:7,
+            })).await.unwrap().into_inner();
+            assert_eq!(response.offset as usize,joined.len());
+            assert_eq!(response.total_bytes as usize,expected.len());
+            assert_eq!(response.data.len(),7.min(expected.len()-joined.len()));
+            joined.extend_from_slice(&response.data);
+        }
+        assert_eq!(joined,expected);
+        for (offset,max_bytes) in [(0,0),(expected.len() as u32,7),(0,nuwax_map_chunks::MAX_BLOCK_TRANSFER_PART_BYTES as u32+1)] {
+            assert!(GeometryRuntime::get_navigation_map_block(&service,Request::new(NavigationMapBlockRequest {
+                schema_version:3,root:Some(wire_root.clone()),block:Some(wire_block.clone()),offset,max_bytes,
+            })).await.is_err());
+        }
+        for schema_version in [0, 1, 4] {
+            assert!(GeometryRuntime::get_navigation_map_block(&service, Request::new(NavigationMapBlockRequest {
+                schema_version, root: Some(wire_root.clone()), block: Some(wire_block.clone()),offset:0,max_bytes:0,
+            })).await.is_err());
+        }
+        GeometryRuntime::stop_mapping(&service, Request::new(StopMappingRequest {
+            session_id: activated.session_id, reason: "块编码版本回归结束".into(),
+        })).await.unwrap();
         assert!(owner.task_owner.shutdown().await.producers_settled());
     }
 

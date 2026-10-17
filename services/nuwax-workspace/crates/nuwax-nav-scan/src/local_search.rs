@@ -442,6 +442,29 @@ pub fn plan(
     follow_reference: bool,
     expansion_limit: usize,
 ) -> Result<Vec<BodyPose>, LocalPlanError> {
+    plan_progress(map,tomogram,start,reference,motion,final_yaw,arrival,boundary,horizon,corridor,
+        follow_reference,expansion_limit,None).map(|path|path.poses)
+}
+#[derive(Debug)]
+pub(super) struct SearchPath {
+    pub poses: Vec<BodyPose>,
+    pub partial: bool,
+}
+pub(super) fn plan_progress(
+    map: &SurfaceSnapshot,
+    tomogram: &Tomogram,
+    start: BodyPose,
+    reference: &[[f64; 3]],
+    motion: &MotionKinematics,
+    final_yaw: Option<f64>,
+    arrival: Option<([f64; 3], f64)>,
+    boundary: &[[f64; 2]],
+    horizon: f64,
+    corridor: f64,
+    follow_reference: bool,
+    expansion_limit: usize,
+    progress_policy: Option<super::ProgressPrefixPolicy<'_>>,
+) -> Result<SearchPath, LocalPlanError> {
     super::cancellation::checkpoint()?;
     validate_caps(motion)?;
     let target = *reference.last().ok_or("近场搜索缺少目标")?;
@@ -627,6 +650,8 @@ pub fn plan(
             // 这一步不授予机体许可，入选提案随后保留完整地形、旋转和扫掠检查。
             let samples=(length/(tomogram.resolution*0.5)).ceil().max(1.0) as usize;
             let mut previous=[from.0[0],from.0[1],from.0[2]-support_offset];
+            let Some(reference_height)=tomogram.calibrated_reference_height(previous) else {continue;};
+            previous[2]=reference_height;
             let mut visible=true;
             for i in 1..=samples {
                 super::cancellation::checkpoint()?;
@@ -634,10 +659,15 @@ pub fn plan(
                 let theta=turn*t;
                 let (dx,dy)=if turn.abs()<1e-8 {(length*t,0.0)}
                     else {(length/turn*theta.sin(),length/turn*(1.0-theta.cos()))};
-                let point=[from.0[0]+dx*heading.cos()-dy*heading.sin(),
-                    from.0[1]+dx*heading.sin()+dy*heading.cos(),
-                    (from.0[2]-support_offset)*(1.0-t)+target[2]*t];
-                if arrival.is_some_and(|(goal,tolerance)|(point[0]-goal[0]).hypot(point[1]-goal[1])<tolerance) {break;}
+                let xy=[from.0[0]+dx*heading.cos()-dy*heading.sin(),
+                    from.0[1]+dx*heading.sin()+dy*heading.cos()];
+                if arrival.is_some_and(|(goal,tolerance)|(xy[0]-goal[0]).hypot(xy[1]-goal[1])<tolerance) {break;}
+                // 预检沿真实地形更新参考，缺测只继承已有高度。直插目标Z会在
+                // 缺测列里造出斜面，再把自己虚构的高度误差当作障碍拒绝。
+                // 这里只核对参考几何，不用额外圆盘替换下方完整非对称机体扫掠。
+                let height=tomogram.cell_at([xy[0],xy[1],previous[2]])
+                    .map_or(previous[2],|id|tomogram.position(id)[2]);
+                let point=[xy[0],xy[1],height];
                 if !tomogram.segment_clear(previous,point,boundary) {visible=false;break;}
                 previous=point;
             }
@@ -672,7 +702,7 @@ pub fn plan(
                 path.extend(connection.into_iter().skip(1));
             }
             super::cancellation::checkpoint()?;
-            return Ok(path);
+            return Ok(SearchPath {poses:path,partial:false});
         }
         expanded += 1;
         if expanded > expansion_limit {
@@ -757,6 +787,42 @@ pub fn plan(
         }
     }
     super::cancellation::checkpoint()?;
+    if let Some(policy)=progress_policy.filter(|_|budget_exhausted) {
+        let reference=policy.reference;
+        let initial_progress=reference_progress([start.0[0],start.0[1],start.0[2]-support_offset],reference).1;
+        let mut selected:Option<(usize,f64)>=None;
+        for (id,node) in nodes.iter().enumerate().skip(1) {
+            super::cancellation::checkpoint()?;
+            if is_stale(node,&best) {continue;}
+            let p=node.pose;let support=[p.0[0],p.0[1],p.0[2]-support_offset];
+            let (deviation,progress,height)=reference_progress(support,reference);
+            if progress-initial_progress<model.radius()
+                || (p.0[0]-start.0[0]).hypot(p.0[1]-start.0[1])<policy.minimum_distance_m.max(model.radius())
+                || deviation>corridor || (support[2]-height).abs()>layer_tolerance {continue;}
+            let mut along=0.0;let mut local_heading=tangent;
+            for pair in reference.windows(2) {
+                let dx=pair[1][0]-pair[0][0];let dy=pair[1][1]-pair[0][1];let length=dx.hypot(dy);
+                if length>1e-9 && progress<=along+length+1e-9 {local_heading=dy.atan2(dx);break;}
+                along+=length;
+            }
+            if angle(yaw(p.1)-local_heading).cos()<=0.0 {continue;}
+            if selected.is_none_or(|(old,best_progress)|progress>best_progress
+                || progress==best_progress&&node.cost<nodes[old].cost) {selected=Some((id,progress));}
+        }
+        if let Some((id,progress))=selected {
+            let mut chain=Vec::new();let mut current=id;
+            while let Some(parent)=nodes[current].parent {super::cancellation::checkpoint()?;chain.push(current);current=parent;}
+            chain.reverse();let mut poses=vec![start];
+            for node in chain {poses.extend_from_slice(&nodes[node].samples);}
+            // 每条精确边已完整扫掠；这只交付候选，发速仍由当前输入的完整停车检查决定。
+            super::cancellation::checkpoint()?;
+            tracing::info!(target:"navigation.scan",event="navigation.scan.progress_prefix",
+                progress_m=progress-initial_progress,poses=poses.len(),expanded,
+                "原预算耗尽后交付有前向进度的有限候选，原目标保持未到达");
+            let partial=!reach(*poses.last().unwrap());
+            return Ok(SearchPath {poses,partial});
+        }
+    }
     // Neither a drained discretized search nor an expansion limit proves obstruction.
     Err(LocalPlanError {
         reason: format!(

@@ -86,7 +86,7 @@
  };
  
  class LaserMapping
-@@ -280,9 +305,20 @@
+@@ -280,16 +305,31 @@
      double gyr_cov = 0.1, acc_cov = 0.1, b_gyr_cov = 0.0001, b_acc_cov = 0.0001;
      double filter_size_corner_min = 0, filter_size_surf_min = 0, filter_size_map_min = 0, fov_deg = 0;
      double cube_len = 0, HALF_FOV_COS = 0, FOV_DEG = 0, total_distance = 0, lidar_end_time = 0, first_lidar_time = 0.0;
@@ -108,7 +108,19 @@
      bool   scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
  
      vector<vector<int>>  pointSearchInd_surf; 
-@@ -371,7 +407,10 @@
+     vector<BoxPointType> cub_needrm;
+     vector<double>       extrinT;
+     vector<double>       extrinR;
+-    deque<double>                     time_buffer;
++    struct ScanSourceTime {
++        custom_messages::Time begin;
++        uint64_t end_ns;
++    };
++    deque<ScanSourceTime>             time_buffer;
+     deque<PointCloudXYZI::Ptr>        lidar_buffer;
+     deque<ImuConstPtr> imu_buffer;
+ 
+@@ -371,7 +411,10 @@
      filter_size_corner_min        = 0.5;
      filter_size_surf_min          = params.filter_size_surf;
      filter_size_map_min           = params.filter_size_map;
@@ -120,7 +132,7 @@
      p_pre->point_filter_num       = 2;
      p_pre->feature_enabled        = false;
  
-@@ -504,9 +543,6 @@
+@@ -504,9 +547,6 @@
  
  void LaserMapping::lasermap_fov_segment()
  {
@@ -130,7 +142,29 @@
      cub_needrm.clear();
      kdtree_delete_counter = 0;
      kdtree_delete_time = 0.0;    
-@@ -625,9 +661,6 @@
+@@ -565,6 +605,7 @@
+     {
+         if (fastlio_debug) std::cout << "lidar loop back, clear buffer" << std::endl;
+         lidar_buffer.clear();
++        time_buffer.clear();
+     }
+     last_timestamp_lidar = msg->header.stamp.toSec();
+     
+@@ -585,7 +626,12 @@
+     p_pre->process(msg, ptr);
+    //  std::cout << "ptr size: " << ptr->points.size() << std::endl;
+     lidar_buffer.push_back(ptr);
+-    time_buffer.push_back(last_timestamp_lidar);
++    // 原始整帧的最大点时间是同步上界，预处理的浮点偏移不能越过它。
++    uint64_t max_offset_ns = 0;
++    for (const auto& point : msg->points) {
++        max_offset_ns = std::max(max_offset_ns, static_cast<uint64_t>(point.offset_time));
++    }
++    time_buffer.push_back({msg->header.stamp, msg->header.stamp.toNsec() + max_offset_ns});
+     
+     s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
+     mtx_buffer.unlock();
+@@ -625,9 +671,6 @@
  
  bool LaserMapping::sync_packages(MeasureGroup &meas)
  {
@@ -140,7 +174,34 @@
      // std::cout << "Lidar: " << lidar_buffer.size() << ", IMU: " << imu_buffer.size() << std::endl;
      if (lidar_buffer.empty() || imu_buffer.empty()) {
          // std::cout << "Empttttyyyy..." << std::endl;
-@@ -873,6 +906,8 @@
+@@ -637,7 +680,7 @@
+     if(!lidar_pushed)
+     {
+         meas.lidar = lidar_buffer.front();
+-        meas.lidar_beg_time = time_buffer.front();
++        meas.lidar_beg_time = time_buffer.front().begin.toSec();
+         if (meas.lidar->points.size() <= 1) // time too little
+         {
+             lidar_end_time = meas.lidar_beg_time + lidar_mean_scantime;
+@@ -651,7 +694,16 @@
+         else
+         {
+             scan_num ++;
+-            lidar_end_time = meas.lidar_beg_time + meas.lidar->points.back().curvature / double(1000);
++            // 保留整数起点直到与最后有效点的偏移相加，再与惯性使用同一转换。
++            // 先把绝对纪元变成浮点再相加，会制造约一个浮点最小间距的缺测并多等整帧。
++            const uint64_t retained_end_ns = time_buffer.front().begin.toNsec()
++                + static_cast<uint64_t>(std::llround(
++                    static_cast<double>(meas.lidar->points.back().curvature) * 1000000.0));
++            const uint64_t end_ns = std::min(retained_end_ns, time_buffer.front().end_ns);
++            custom_messages::Time end_stamp;
++            end_stamp.sec = end_ns / 1000000000ULL;
++            end_stamp.nsecs = end_ns % 1000000000ULL;
++            lidar_end_time = end_stamp.toSec();
+             lidar_mean_scantime += (meas.lidar->points.back().curvature / double(1000) - lidar_mean_scantime) / scan_num;
+         }
+ 
+@@ -873,6 +925,8 @@
          t0 = omp_get_wtime();
  
          // std::cout << "I am here 2" << std::endl;
@@ -149,7 +210,7 @@
          p_imu->Process(Measures, kf, feats_undistort);
          state_point = kf.get_x();
          pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
-@@ -920,7 +955,13 @@
+@@ -920,7 +974,13 @@
                  {
                      pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
                  }

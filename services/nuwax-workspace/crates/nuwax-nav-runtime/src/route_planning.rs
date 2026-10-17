@@ -18,6 +18,20 @@ pub(crate) struct ReferenceSource {
     pub progress: f64,
 }
 impl ReferenceSource {
+    /// 进度沿原全局窗口累计；实际当前位置的接头只供轨迹生成。
+    fn nominal_reference(&self, materialized:&[[f64;3]]) -> Vec<[f64;3]> {
+        let mut reference=materialized.to_vec();
+        let i=self.cumulative.partition_point(|&value|value<self.progress).saturating_sub(1);
+        if let (Some(first),Some(a))=(reference.first_mut(),self.route.poses.get(i).map(|p|p.pose.position)) {
+            let p=if let Some(b)=self.route.poses.get(i+1).map(|p|p.pose.position) {
+                let length=self.cumulative[i+1]-self.cumulative[i];
+                let t=((self.progress-self.cumulative[i])/length.max(1e-12)).clamp(0.0,1.0);
+                Point3::new(a.x+(b.x-a.x)*t,a.y+(b.y-a.y)*t,a.z+(b.z-a.z)*t)
+            }else{a};
+            *first=[p.x,p.y,p.z-self.offset];
+        }
+        reference
+    }
     pub fn materialize(
         &self,
         current: &PoseStamped,
@@ -108,7 +122,8 @@ pub(crate) struct PlanRequest {
 }
 impl PlanRequest {
     pub fn materialize_reference(&mut self) -> Result<(), LocalPlanError> {
-        if let Some(source) = self.reference_source.take() {
+        // 保留不可变原路线，供有限候选比较真实覆盖进度。
+        if let Some(source) = self.reference_source.as_ref() {
             let (reference, end, at_end, straight) =
                 source.materialize(&self.pose, self.scan.horizon_m)?;
             self.reference = reference;
@@ -132,6 +147,7 @@ impl PlanRequest {
     }
 }
 pub(crate) struct Candidate {
+    pub partial: bool,
     pub path: Path3D,
     pub elapsed_ms: f64,
 }
@@ -140,6 +156,7 @@ pub(crate) struct PlanResult {
     pub outcome: Result<Candidate, Vec<LocalPlanError>>,
 }
 struct FailedLocalPlan {
+    coverage_context: [u64;2],
     source: Arc<SurfaceSnapshot>,
     tomogram: Arc<nuwax_nav_pct::Tomogram>,
     boundary: Arc<Vec<[f64; 2]>>,
@@ -228,6 +245,13 @@ impl PlanKernel {
         });
         PlanResult { request, outcome }
     }
+    fn progress_minimum_distance(&self, request:&PlanRequest) -> f64 {
+        let tolerance=request.reference_source.as_ref().map_or_else(
+            ||request.arrival.map_or(self.config.controller.goal_tolerance,|(_,tolerance)|tolerance),
+            |source|source.options.position_tolerance_m);
+        tolerance.max(request.source.body_envelope().map_or(0.0,|model|model.radius()))
+            +f64::from(request.source.source_voxel_size_m())*0.5
+    }
     fn compute_inner(
         &mut self,
         r: &PlanRequest,
@@ -271,6 +295,12 @@ impl PlanKernel {
             Some(recent_guide_overlay::RecentGuideOverlay::new(hints, tomogram.resolution, f64::from(map.source_voxel_size_m()), model)
                 .map_err(|e|vec![LocalPlanError::from(e)])?)
         } else { None };
+        let nominal_reference=self.config.motion_limits.as_ref().map(|_|r.reference_source.as_ref()
+            .map_or_else(||r.reference.clone(),|source|source.nominal_reference(&r.reference)));
+        let progress_policy=nominal_reference.as_deref().map(|reference|nuwax_nav_scan::ProgressPrefixPolicy {
+            reference,
+            minimum_distance_m:self.progress_minimum_distance(r),
+        });
         let mut failures = Vec::new();
         for detour in if r.detour {
             &[true][..]
@@ -320,6 +350,7 @@ impl PlanKernel {
             let straight = r.straight && !follow_reference;
             let cached = self.failed.iter().find(|f| {
                 Arc::ptr_eq(&f.tomogram, &tomogram)
+                    && f.coverage_context==[r.progress.to_bits(),r.end.to_bits()]
                     && f.source.same_body_query_view(&r.source)
                     && exact_points(&f.boundary, &r.boundary)
                     && pose_bits(f.start) == pose_bits(start)
@@ -333,7 +364,7 @@ impl PlanKernel {
             let result = if let Some(f) = cached {
                 Err(f.failure.clone())
             } else {
-                let result = nuwax_nav_scan::plan(
+                let result = nuwax_nav_scan::plan_with_progress(
                     &map,
                     &tomogram,
                     start,
@@ -345,6 +376,7 @@ impl PlanKernel {
                     &r.boundary,
                     follow_reference,
                     straight,
+                    progress_policy,
                 );
                 if let Err(failure) = &result {
                     if failure.kind != nuwax_nav_scan::LocalPlanFailureKind::Cancelled {
@@ -352,6 +384,7 @@ impl PlanKernel {
                             self.failed.remove(0);
                         }
                         self.failed.push(FailedLocalPlan {
+                            coverage_context:[r.progress.to_bits(),r.end.to_bits()],
                             source: r.source.clone(),
                             tomogram: tomogram.clone(),
                             boundary: r.boundary.clone(),
@@ -386,7 +419,7 @@ impl PlanKernel {
                             })
                             .collect(),
                     };
-                    return Ok(Candidate {
+                    return Ok(Candidate { partial: trajectory.partial,
                         path,
                         elapsed_ms: trajectory.elapsed_ms,
                     });
@@ -401,6 +434,7 @@ impl PlanKernel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("route_progress_policy_tests.rs");
     use nuwax_nav_mls_planner::{SurfaceBodyEnvelope, SurfaceObservation, SurfaceObservations};
     use nuwax_nav_types_messages::{MotionKinematics, MotionModel, NavFrameId, Pose3, Timestamp};
     use std::sync::atomic::AtomicU64;
@@ -517,6 +551,7 @@ mod tests {
                 }
             }
             kernel.failed.push(FailedLocalPlan {
+                coverage_context:[request.progress.to_bits(),request.end.to_bits()],
                 source: request.source.clone(),
                 tomogram: tomogram.clone(),
                 boundary: request.boundary.clone(),

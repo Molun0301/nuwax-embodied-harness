@@ -494,3 +494,7 @@ mod auxiliary_source_tests {
     }
 
 }
+
+#[cfg(test)]
+#[path = "fine_ground_deletion_qualification.rs"]
+mod ground_deletion_qualification;

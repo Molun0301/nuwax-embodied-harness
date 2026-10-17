@@ -61,7 +61,10 @@ impl RpcHandler for BlockServer {
         let Ok(manifest) = manifest else {
             return RpcResponse::error(request.id, serde_json::json!({"message":"没有此根"}));
         };
-        let Some(reference) = manifest.blocks.iter().find(|block| block_request(&manifest, block) == *scope) else {
+        let Some(reference) = manifest.blocks.iter().find(|block| {
+            let expected=block_request(&manifest,block);
+            ["schema_version","root","block"].iter().all(|field|expected[*field]==scope[*field])
+        }) else {
             return RpcResponse::error(request.id, serde_json::json!({"message":"根与精确块引用不符"}));
         };
         let bytes = Repository::open(&self.root).and_then(|repository|
@@ -70,8 +73,16 @@ impl RpcHandler for BlockServer {
             return RpcResponse::error(request.id, serde_json::json!({"message":"没有此块"}));
         };
         if mode=="corrupt" {bytes[0]^=1;}
+        let offset=scope["offset"].as_u64().unwrap() as usize;
+        let maximum=scope["max_bytes"].as_u64().unwrap() as usize;
+        assert!(offset<bytes.len() && maximum>0 && maximum<=MAX_BLOCK_TRANSFER_PART_BYTES);
+        let end=bytes.len().min(offset+maximum);
         let mut response = scope.clone();
-        response["data"] = serde_json::json!(bytes);
+        response["total_bytes"] = serde_json::json!(bytes.len());
+        response["data_base64"] = serde_json::json!(base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD, &bytes[offset..end]));
+        if mode=="changed-total" && offset>0 {response["total_bytes"]=serde_json::json!(bytes.len()+1);}
+        if mode=="repeated-part" && offset>0 {response["offset"]=serde_json::json!(0);}
         if mode=="wrong-root" {response["root"]["revision"] = serde_json::json!(revision + 1);}
         if mode=="wrong-block" {response["block"]["geometry_revision"] = serde_json::json!(revision + 1);}
         RpcResponse::ok(request.id, response)
@@ -171,4 +182,82 @@ async fn real_process_rpc_recovers_late_missing_and_corrupt_blocks_without_parti
     std::fs::write(root.join("stop"),"stop").unwrap();
     let deadline=Instant::now()+Duration::from_secs(3);
     loop {if let Some(status)=child.0.try_wait().unwrap(){assert!(status.success());break;}assert!(Instant::now()<deadline,"补取服务未结束");tokio::time::sleep(Duration::from_millis(10)).await;}
+}
+
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+#[ignore="需要本机真实大块路径NUWAX_REAL_BLOCK_FIXTURE，显式执行端到端传输诊断"]
+async fn recorded_large_block_crosses_real_process_rpc_with_original_deadlines() {
+    let bytes=std::fs::read(std::env::var("NUWAX_REAL_BLOCK_FIXTURE").unwrap()).unwrap();
+    assert!(bytes.len()>3_000_000 && bytes.len()<=MAX_BLOCK_BYTES);
+    let (points,latest)=block_summary(&bytes).unwrap();
+    let repository=Repository::temporary().unwrap();
+    let root=repository.path();
+    let mut input=message(&repository,1,1);
+    let mut manifest=Manifest::decode(&input.fine.as_ref().unwrap().root).unwrap();
+    manifest.version=4;
+    let mut watermarks=BTreeMap::<Arc<LayerSource>,(u64,u64)>::new();
+    for layer in decode_layer_observations(&bytes).unwrap().values() {
+        for sample in &layer.samples {
+            if !sample.source.is_legacy() {
+                let marker=(sample.source_timestamp_ns,sample.source_sequence);
+                watermarks.entry(sample.source.clone()).and_modify(|old|*old=(*old).max(marker)).or_insert(marker);
+            }
+        }
+    }
+    manifest.source_watermarks=watermarks.into_iter().map(|(source,(source_timestamp_ns,source_sequence))|
+        SourceWatermark {source,source_timestamp_ns,source_sequence}).collect();
+    let object=ObjectIdentity::Assigned(ObjectId::random().unwrap());
+    repository.put_object(object,&bytes).unwrap();
+    manifest.source_timestamp_ns=latest.max(manifest.source_timestamp_ns);
+    manifest.blocks=vec![BlockRef { key:[0,0,0],object,block_revision:1,
+        geometry_revision:1,points }];
+    let encoded=manifest.encode().unwrap();
+    std::fs::write(root.join("manifest-1.json"),&encoded).unwrap();
+    input.fine.as_mut().unwrap().root=encoded;
+    input.source_timestamp_ns=manifest.source_timestamp_ns as i64;
+    input.committed_map.source_timestamp_ns=input.source_timestamp_ns;
+    let (url,rpc_name)=test_endpoint();
+    std::fs::write(root.join("mode"),"good").unwrap();
+    let mut child=ChildOwner(Command::new(std::env::current_exe().unwrap())
+        .args(["--exact","surface_chunks::rpc_process_tests::map_block_server_process","--ignored","--nocapture"])
+        .env("NUWAX_BLOCK_TEST_ROOT",root).env("NUWAX_BLOCK_TEST_URL",&url)
+        .env("NUWAX_BLOCK_TEST_RPC_NAME",&rpc_name)
+        .stdout(Stdio::null()).stderr(Stdio::inherit()).spawn().unwrap());
+    let deadline=Instant::now()+Duration::from_secs(3);
+    while !root.join("ready").exists() {
+        assert!(Instant::now()<deadline && child.0.try_wait().unwrap().is_none());
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mut failed=Vec::new();
+    for attempt in 0..5 {
+        let mut reader=FineMapReader::new(url.clone()).unwrap();
+        reader.client=Some(nuwax_rpc::RpcClient::new(Arc::new(
+            nuwax_rpc::LcmRpcTransport::from_provider(&url).unwrap()),&rpc_name).unwrap());
+        let started=Instant::now();
+        let (mut reader,result)=receive(reader,input.clone()).await;
+        eprintln!("large_block attempt={attempt} bytes={} elapsed_ms={:.3} result={:?}",
+            bytes.len(),started.elapsed().as_secs_f64()*1000.0,result.as_ref().map(|m|m.revision));
+        if let Err(error)=result {failed.push(error.to_string());}
+        else {
+            assert_eq!(reader.receiver.block(&manifest.blocks[0]).unwrap().len(),points as usize);
+        }
+        drop(reader);
+    }
+    for mode in ["changed-total","repeated-part"] {
+        std::fs::write(root.join("mode"),mode).unwrap();
+        let mut reader=FineMapReader::new(url.clone()).unwrap();
+        reader.client=Some(nuwax_rpc::RpcClient::new(Arc::new(
+            nuwax_rpc::LcmRpcTransport::from_provider(&url).unwrap()),&rpc_name).unwrap());
+        let (reader,result)=receive(reader,input.clone()).await;
+        assert!(matches!(result,Err(SurfaceMapBuildError::Invalid(_))),"mode={mode} result={result:?}");
+        assert!(reader.receiver.current().is_none(),"分段不完整不能安装根");
+    }
+    std::fs::write(root.join("stop"),"stop").unwrap();
+    let deadline=Instant::now()+Duration::from_secs(3);
+    loop {
+        if let Some(status)=child.0.try_wait().unwrap(){assert!(status.success());break;}
+        assert!(Instant::now()<deadline);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(failed.is_empty(),"实际大块仍有补取失败：{failed:?}");
 }

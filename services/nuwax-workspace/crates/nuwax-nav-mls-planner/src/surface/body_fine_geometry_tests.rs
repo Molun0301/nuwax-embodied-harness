@@ -9,6 +9,41 @@ fn map_at(points:&[(f32,f32,f32)],observed:&Arc<SurfaceObservations>,envelope:&S
 }
 
 #[test]
+fn unassigned_complete_fine_coverage_is_not_clipped_to_the_body_polygon() {
+    let mut envelope=model();
+    envelope.footprint_xy_m=vec![[-0.025,-0.025],[0.025,-0.025],[0.025,0.025],[-0.025,0.025]];
+    envelope.z_bounds_m=[-0.05,0.05];
+    let body=[0.1,0.1,0.25];
+    let r=rotation([0.0,0.0,0.0,1.0]).unwrap();
+    let boundary=[[0.075,0.075],[0.125,0.075],[0.125,0.125],[0.075,0.125]];
+    let polygon=PolygonQuery::new(&boundary);
+    let check=|keys:Vec<[i32;3]>,complete:bool| {
+        let mut blocks=std::collections::BTreeMap::<[i32;3],std::collections::BTreeMap<[i32;3],SurfaceObservation>>::new();
+        for key in keys {blocks.entry(key.map(|v|v.div_euclid(32))).or_default()
+            .insert(key,SurfaceObservation{observed_ns:1,hits:1});}
+        let mut observations=SurfaceObservations::new(0.05,32).unwrap();
+        for (key,values) in blocks {observations.replace_block(key,values).unwrap();}
+        if complete {observations.mark_complete_geometry_source();}
+        let map=map_at(&[(0.025,0.025,0.225)],&Arc::new(observations),&envelope,0.1);
+        let prism=PrismQuery::new(map.body_envelope().unwrap(),r,body);
+        let mut witness=None;
+        let result=map.check_unassigned_body_column(body,r,&polygon,&prism,0,0,&mut witness);
+        (result,witness)
+    };
+    let outside=check(vec![[0,0,4]],true);
+    assert_eq!(outside.0,Ok(()),"粗格虽相交，其完整细占据都在机体外，不得再次膨胀粗格：{:?}",outside.1);
+    assert!(outside.1.is_none());
+    let inside=check(vec![[1,1,4]],true);
+    assert_eq!(inside.0,Err(SurfaceError::InsufficientClearance));
+    assert!(matches!(inside.1,Some(BodyRejection::Occupancy{source:OccupancySource::Fine,..})));
+    for (keys,complete) in [(vec![[0,0,4]],false),(vec![[0,0,2]],true),(vec![],true)] {
+        let missing=check(keys,complete);
+        assert_eq!(missing.0,Err(SurfaceError::InsufficientClearance),"部分细源或缺对应高度不能当自由空间");
+        assert!(matches!(missing.1,Some(BodyRejection::Occupancy{source:OccupancySource::CoarseFallback,..})));
+    }
+}
+
+#[test]
 fn partial_fine_source_cannot_alias_a_high_echo_to_coarse_ground() {
     let mut points:Vec<_>=(-30..30).flat_map(|x|(-20..20).map(move|y|
         ((x as f32+0.5)*0.05,(y as f32+0.5)*0.05,0.025))).collect();

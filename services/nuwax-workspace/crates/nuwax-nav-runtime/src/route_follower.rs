@@ -317,6 +317,30 @@ impl RouteFollower {
         match result.outcome {
             Ok(candidate)=> {
                 if request.end+1e-6<self.progress {self.dirty=true;return;}
+                let covered_end=if candidate.partial {
+                    if self.config.motion_limits.is_none() {self.dirty=true;return;}
+                    let Some(endpoint)=candidate.path.poses.last().map(|p|p.pose.position) else {self.dirty=true;return;};
+                    let Some(route)=self.route.as_ref() else {return;};
+                    let mut nearest=f64::INFINITY;let mut covered=request.progress;
+                    for (i,pair) in route.poses.windows(2).enumerate().skip(
+                        self.cumulative.partition_point(|&value|value<request.progress).saturating_sub(1)) {
+                        if self.cumulative[i]>request.end {break;}
+                        let length=self.cumulative[i+1]-self.cumulative[i];
+                        if length<=1e-12 || self.cumulative[i+1]<request.progress || self.cumulative[i]>request.end {continue;}
+                        let a=pair[0].pose.position;let b=pair[1].pose.position;
+                        let v=[b.x-a.x,b.y-a.y,b.z-a.z];let l2=v.iter().map(|x|x*x).sum::<f64>();
+                        let lo=((request.progress-self.cumulative[i])/length).clamp(0.0,1.0);
+                        let hi=((request.end-self.cumulative[i])/length).clamp(0.0,1.0);
+                        let t=(((endpoint.x-a.x)*v[0]+(endpoint.y-a.y)*v[1]+(endpoint.z-a.z)*v[2])/l2).clamp(lo,hi);
+                        let projected=Point3::new(a.x+v[0]*t,a.y+v[1]*t,a.z+v[2]*t);
+                        let distance=projected.distance(endpoint);
+                        if distance<nearest {nearest=distance;covered=self.cumulative[i]+length*t;}
+                    }
+                    let minimum=request.source.body_envelope().map_or(f64::INFINITY,|m|m.radius());
+                    if nearest>self.config.max_path_deviation_m || covered-request.progress<minimum
+                        || covered+1e-6<self.progress {self.dirty=true;return;}
+                    covered
+                }else{request.end};
                 let Some(goal)=self.goal.clone() else {return;};
                 // Candidate geometry is advice only. Current bounded connector admission
                 // uses the actual latest pose/evidence; current step still owns motion.
@@ -325,10 +349,10 @@ impl RouteFollower {
                         self.local_path=Some(candidate.path);
                         self.admitted_generation=Some(self.route_generation);
                         self.local_failures.clear();self.qualified_failure=None;self.local_progress_at_plan=request.progress;
-                        self.local_end=request.end;self.local_start=Some(request.pose.pose.position);
+                        self.local_end=covered_end;self.local_start=Some(request.pose.pose.position);
                         self.dirty=false;self.local_plans+=1;
                         tracing::info!(target:"navigation.scan",event="navigation.scan.candidate_admitted",
-                            elapsed_ms=candidate.elapsed_ms,request_id=completion.id,"geometry candidate admitted; current guard remains authoritative");
+                            elapsed_ms=candidate.elapsed_ms,request_id=completion.id,partial=candidate.partial,covered_end,requested_end=request.end,"geometry candidate admitted; current guard remains authoritative");
                     }
                     Err(e)=> {
                         // Moved-start failure neither teleports nor destroys current admission.
@@ -586,6 +610,7 @@ impl NavPlanner for RouteFollower {
 mod tests {
     use super::*;
     include!("route_selective_refresh_tests.rs");
+    include!("route_progress_prefix_tests.rs");
     use nuwax_nav_mls_planner::SurfaceBodyEnvelope;
     use nuwax_nav_types_messages::{MotionKinematics, MotionModel, NavFrameId, Pose3, Quaternion, Timestamp};
     use crate::route_planning::Candidate;
@@ -713,7 +738,7 @@ mod tests {
                 pose.pose.position = Point3::new(p[0], p[1], p[2] + offset);
                 pose
             }).collect() };
-            PlanResult { request, outcome: Ok(Candidate { path, elapsed_ms: 0.0 }) }
+            PlanResult { request, outcome: Ok(Candidate { partial: false, path, elapsed_ms: 0.0 }) }
         }).unwrap());
         follower.dirty = true;
         PlannerGate { starts, release }

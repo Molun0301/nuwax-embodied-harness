@@ -346,8 +346,10 @@ impl Tomogram {
                 let Some(next) = self.reference_neighbor(from, [x, y]) else { continue; };
                 let b = self.reference_position(next);
                 if !accepts(actual_a, b) { continue; }
-                // The real start connector may cross more than one grid edge.
-                if id == 0 && self.reference_segment(start, b, boundary, cancelled).is_none() { continue; }
+                // 邻接成立不代表整段成立：缺测格继承的高度与斜向段内经过的
+                // 侧格可能不同。入队前复用输出段检查，拒绝此边后继续搜索，
+                // 避免最后才因一条不合法邻边丢弃整条候选路线。
+                if self.reference_segment(actual_a, b, boundary, cancelled).is_none() { continue; }
                 if outside_radius {
                     // Only an otherwise admissible successor establishes an
                     // artificial horizon cutoff. A wall/forbidden/physical-boundary
@@ -456,7 +458,7 @@ impl Tomogram {
             checkpoint(cancelled)?;
             let Some(cost) = self.segment_cost(pair[0], pair[1], boundary, penalties, cancelled, accepts) else {
                 checkpoint(cancelled)?;
-                return Err("层析参考相邻段未通过一致的障碍/地形验证".into());
+                return Err(format!("层析参考相邻段未通过一致的障碍/地形验证：{:?} -> {:?}", pair[0], pair[1]));
             };
             prefix.push(prefix.last().unwrap() + cost);
         }
@@ -491,6 +493,31 @@ impl Tomogram {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn irregular_thick_ground_keeps_search_and_segment_admission_consistent() {
+        let q = f64::from(0.05_f32);
+        let columns = (-20_i32..180).flat_map(|ix| (-50_i32..50).filter_map(move |iy| {
+            let code = (ix * 73 + iy * 151).rem_euclid(997);
+            if code % 11 == 0 { return None; }
+            let jitter = f64::from(code % 7 - 3) * 0.003;
+            let x = (f64::from(ix) + 0.5) * q + jitter;
+            let y = (f64::from(iy) + 0.5) * q - jitter;
+            let height = 0.035 * (1.2 * x).sin() + 0.025 * (1.7 * y + 0.4 * x).sin()
+                + 0.010 * (3.1 * x + 2.3 * y).cos();
+            let top = (height / q).round() as i32 - 1;
+            let layers = 2 + code % 3;
+            Some(([ix, iy], vec![[f64::from(top - layers) * q, f64::from(top + 1) * q]]))
+        }));
+        let map = Tomogram::from_columns_with_evidence(q, q, columns,
+            0.46, 0.16, 0.15, 0.15, 18.0, 0.34, false).unwrap();
+        for (start, goal) in [([0.0,0.0,0.01],[7.0,0.0,0.0287065174779703]),
+            ([7.0,0.0,0.0287065174779703],[0.0,0.0,0.01])] {
+            let route = map.plan(start, goal, 0.15, &[], None)
+                .expect("细小缺测与厚层起伏不应让搜索已接纳的相邻边在输出时失配");
+            assert!(route.points.windows(2).all(|edge|map.segment_clear(edge[0],edge[1],&[])));
+            assert!(distance(*route.points.last().unwrap(),goal)<=0.15);
+        }
+    }
     #[test]
     fn noisy_same_level_ground_keeps_observed_progress_within_the_original_budget() {
         let columns = (-40..680).flat_map(|x| (-30..31).filter_map(move |y| {

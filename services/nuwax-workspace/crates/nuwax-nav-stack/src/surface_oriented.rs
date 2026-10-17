@@ -2261,9 +2261,10 @@ mod tests {
                 .validate_body_motion(edge[0], edge[1], &[])
                 .unwrap();
         }
-        assert!(corrected
-            .locate_support_from_body(turn.0, turn.1, 0.4)
-            .is_err());
+        let ground_before = original.query_ground([turn.0[0], turn.0[1]], 0.2).height.unwrap();
+        let ground_after = corrected.query_ground([turn.0[0], turn.0[1]], 0.2).height.unwrap();
+        assert!(ground_after < ground_before,
+            "本例必须包含真实地图高度校正；同层接触关联允许保留原站姿");
         let mut config = SurfaceFollowerConfig::new(0.4);
         config.controller.control_frequency = 20.0;
         let mut follower = SurfaceFollower::new(config).unwrap();
@@ -3074,7 +3075,10 @@ mod tests {
                 || (f64::from(y)-start.0[1]).abs() > 0.12).collect();
         let map = Arc::new(SurfaceSnapshot::from_points(&points, base.config().clone(), 0.05)
             .unwrap().with_body_envelope(base.body_envelope().unwrap().clone()).unwrap());
-        assert!(map.validate_body_pose(start.0, start.1).is_err());
+        assert!(matches!(map.query_ground([start.0[0], start.0[1]], 0.1).state,
+            nuwax_nav_mls_planner::surface::GroundQueryState::Unknown
+                | nuwax_nav_mls_planner::surface::GroundQueryState::Estimated),
+            "邻域估计可以提供坐标参考，原始盲区仍没有实测地面");
         let view = map.with_current_body_support(start.0, start.1).unwrap();
         let motion = limits();
         let options = GoalOptions { allow_reverse: false, position_tolerance_m: 0.08,
@@ -3108,7 +3112,10 @@ mod tests {
         }
         assert!(reached, "盲区起步未到达目标: {current:?}");
         assert!((current.0[0]-goal.0[0]).abs() < 0.08);
-        assert!(map.validate_body_pose(start.0, start.1).is_err(), "执行不能补写原始盲区");
+        assert!(matches!(map.query_ground([start.0[0], start.0[1]], 0.1).state,
+            nuwax_nav_mls_planner::surface::GroundQueryState::Unknown
+                | nuwax_nav_mls_planner::surface::GroundQueryState::Estimated),
+            "执行不能给原始盲区补造实测地面");
     }
 
     #[test]
@@ -3122,11 +3129,23 @@ mod tests {
         let map = SurfaceSnapshot::from_points(&points, base.config().clone(), 0.05)
             .unwrap().with_body_envelope(base.body_envelope().unwrap().clone()).unwrap();
         let view = map.with_current_body_support(start.0, start.1).unwrap();
-        assert!(map.validate_body_pose(start.0, start.1).is_err());
+        assert!(matches!(map.query_ground([start.0[0], start.0[1]], 0.1).state,
+            nuwax_nav_mls_planner::surface::GroundQueryState::Unknown
+                | nuwax_nav_mls_planner::surface::GroundQueryState::Estimated),
+            "当前位置的缺测事实必须保留");
         let options = GoalOptions { allow_reverse: false, position_tolerance_m: 0.08,
             yaw_tolerance_rad: 0.08 };
-        plan(&view, start, start, options, Some(&limits()), &[], 2000)
-            .expect("当前占据区内的目标不能重新用未处理自体的原图拒绝");
+        // 按当前生产PCT入口验证；旧plan接口明确要求目标有观测支撑。
+        let planner = nuwax_nav_pct::PctPlanner::default();
+        let path = plan_reference_cancellable(&view, &planner, start, start, options,
+            Some(&limits()), &[], 2000, None)
+            .expect("当前已验证姿态满足目标时，不能把缺测误当成碰撞");
+        assert_eq!(path, vec![start]);
+        let blocked = view.with_recent_obstacle_points(1, 100, 0, &[],
+            [(0, [start.0[0], start.0[1], start.0[2]])]).unwrap();
+        assert!(plan_reference_cancellable(&blocked, &planner, start, start, options,
+            Some(&limits()), &[], 2000, None).is_err(),
+            "目标就在当前位置也不能越过实际占据检查");
     }
 
     #[test]

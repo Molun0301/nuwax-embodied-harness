@@ -130,8 +130,17 @@ impl From<&str> for LocalPlanError {
         reason.to_owned().into()
     }
 }
+/// 有限段的进度依据；调用方必须保留原目标、当前来源复核及逐拍完整停车检查。
+/// 参考首点属于原全局窗口，不能用当前位置到旧折点的临时接头替代。
+#[derive(Clone, Copy, Debug)]
+pub struct ProgressPrefixPolicy<'a> {
+    pub reference: &'a [[f64;3]],
+    pub minimum_distance_m: f64,
+}
 #[derive(Debug)]
 pub struct LocalTrajectory {
+    /// 有限段只覆盖原路线的一部分，不表示原目标已到达。
+    pub partial: bool,
     pub poses: Vec<BodyPose>,
     pub smoothed: bool,
     pub elapsed_ms: f64,
@@ -250,6 +259,31 @@ fn rotate(
     Err(LocalPlanError{body_witness:rejected_sample,.."近场初始转向未通过机体/支撑检查".into()})
 }
 fn project(
+    map: &SurfaceSnapshot,
+    start: BodyPose,
+    points: &[[f64; 3]],
+    kinematics: &MotionKinematics,
+    smooth: bool,
+    final_yaw: Option<f64>,
+    arrival: Option<([f64; 3], f64)>,
+    boundary: &[[f64; 2]],
+    blocked: &std::cell::Cell<Option<[f64; 3]>>,
+) -> Result<Vec<BodyPose>, LocalPlanError> {
+    if let Some((goal,tolerance))=arrival {
+        // 可达参考终点优先保留，避免局部轨迹主动截在到达边缘而提前减速。
+        // 这只选择候选，不缩小合法目标球；中心不可站立仍回退原区域投影。
+        let endpoint_blocked=std::cell::Cell::new(None);
+        if let Some(poses)=admit_candidate(project_to_region(map,start,points,kinematics,
+            smooth,final_yaw,None,boundary,&endpoint_blocked))? {
+            if poses.last().is_some_and(|end|distance3(end.0,goal)<tolerance) {
+                return Ok(poses);
+            }
+        }
+    }
+    project_to_region(map,start,points,kinematics,smooth,final_yaw,arrival,boundary,blocked)
+}
+
+fn project_to_region(
     map: &SurfaceSnapshot,
     start: BodyPose,
     points: &[[f64; 3]],
@@ -392,9 +426,32 @@ pub fn plan(
     follow_reference: bool,
     prefer_straight: bool,
 ) -> Result<LocalTrajectory, LocalPlanError> {
+    plan_with_progress(map,tomogram,start,reference,kinematics,config,final_yaw,arrival,boundary,
+        follow_reference,prefer_straight,None)
+}
+/// 显式请求有限进度候选；完整连接仍优先，预算、运动能力与几何许可保持。
+pub fn plan_with_progress(
+    map: &SurfaceSnapshot,
+    tomogram: &Tomogram,
+    start: BodyPose,
+    reference: &[[f64; 3]],
+    kinematics: &MotionKinematics,
+    config: &ScanConfig,
+    final_yaw: Option<f64>,
+    arrival: Option<([f64; 3], f64)>,
+    boundary: &[[f64; 2]],
+    follow_reference: bool,
+    prefer_straight: bool,
+    progress: Option<ProgressPrefixPolicy<'_>>,
+) -> Result<LocalTrajectory, LocalPlanError> {
     cancellation::checkpoint()?;
+    if progress.is_some_and(|policy| !policy.minimum_distance_m.is_finite()
+        || policy.minimum_distance_m<0.0 || policy.reference.is_empty()
+        || policy.reference.iter().flatten().any(|value|!value.is_finite())) {
+        return Err("有限进度策略缺少有效的原全局窗口或控制距离".into());
+    }
     let result = plan_impl(map, tomogram, start, reference, kinematics, config, final_yaw,
-        arrival, boundary, follow_reference, prefer_straight);
+        arrival, boundary, follow_reference, prefer_straight,progress);
     cancellation::checkpoint()?;
     result.map_err(|mut failure| {
         if let Some(witness)=failure.body_witness.take() {
@@ -436,6 +493,7 @@ fn plan_impl(
     boundary: &[[f64; 2]],
     follow_reference: bool,
     prefer_straight: bool,
+    progress: Option<ProgressPrefixPolicy<'_>>,
 ) -> Result<LocalTrajectory, LocalPlanError> {
     #[cfg(feature="profile")]
     let _profile=profile::Scope::begin(start,reference,kinematics,config,final_yaw,arrival,follow_reference,prefer_straight);
@@ -505,7 +563,7 @@ fn plan_impl(
                     if let Some(poses)=admit_candidate(project(map,start,&samples,kinematics,false,final_yaw,region,boundary,&blocked))? {
                         #[cfg(feature="profile")]
                         profile::success();
-                        return Ok(LocalTrajectory {poses,smoothed:false,
+                        return Ok(LocalTrajectory { partial: false,poses,smoothed:false,
                             elapsed_ms:began.elapsed().as_secs_f64()*1000.0});
                     }
                     if arrival.is_none(){break;}
@@ -530,7 +588,7 @@ fn plan_impl(
                 model.body_to_support_z_m, corridor, layer_tolerance, length, tangent) {
                 #[cfg(feature="profile")]
                 profile::success();
-                return Ok(LocalTrajectory { poses, smoothed: false,
+                return Ok(LocalTrajectory { partial: false, poses, smoothed: false,
                     elapsed_ms: began.elapsed().as_secs_f64() * 1000.0 });
             }
         }
@@ -565,7 +623,7 @@ fn plan_impl(
         if let Some(poses) = admit_candidate(project(map, start, &samples, kinematics, true, final_yaw, interior, boundary, &shortcut_blocked))? {
             #[cfg(feature="profile")]
             profile::success();
-            return Ok(LocalTrajectory { poses, smoothed: true, elapsed_ms: began.elapsed().as_secs_f64()*1000.0 });
+            return Ok(LocalTrajectory { partial: false, poses, smoothed: true, elapsed_ms: began.elapsed().as_secs_f64()*1000.0 });
         }
     }
     // 首段方向属于全局路线的接续意图。固定该切向，先完成实际转向，
@@ -601,7 +659,7 @@ fn plan_impl(
                 Ok(poses) => {
                     #[cfg(feature="profile")]
                         profile::success();
-                        return Ok(LocalTrajectory {
+                        return Ok(LocalTrajectory { partial: false,
                         poses,
                         smoothed: true,
                         elapsed_ms: began.elapsed().as_secs_f64() * 1000.0,
@@ -629,7 +687,7 @@ fn plan_impl(
         Ok(poses) => {
             #[cfg(feature="profile")]
             profile::success();
-            return Ok(LocalTrajectory {
+            return Ok(LocalTrajectory { partial: false,
                 poses,
                 smoothed: false,
                 elapsed_ms: began.elapsed().as_secs_f64() * 1000.0,
@@ -689,7 +747,7 @@ fn plan_impl(
                 ))? {
                     #[cfg(feature="profile")]
                         profile::success();
-                        return Ok(LocalTrajectory {
+                        return Ok(LocalTrajectory { partial: false,
                         poses,
                         smoothed: false,
                         elapsed_ms: began.elapsed().as_secs_f64() * 1000.0,
@@ -714,8 +772,8 @@ fn plan_impl(
         polyline_reuse_tests::record_projection();
         project(map, start, &sampled, kinematics, false, final_yaw, arrival, boundary, &blocked)
     };
-    let poses = match polyline {
-        Ok(poses) => poses,
+    let (poses, partial) = match polyline {
+        Ok(poses) => (poses,false),
         Err(polyline) => {
             if matches!(polyline.kind, LocalPlanFailureKind::Cancelled) { return Err(polyline); }
             cancellation::checkpoint()?;
@@ -731,7 +789,7 @@ fn plan_impl(
                 && admit_candidate(rotate(map,&mut prefix,departure,kinematics,boundary))?.is_some() {
                 *prefix.last().unwrap()
             }else{start};
-            merge_search_result(local_search::plan(
+            merge_search_result(local_search::plan_progress(
             map,
             tomogram,
             search_start,
@@ -744,16 +802,17 @@ fn plan_impl(
             config.reference_corridor_m,
             follow_reference,
             config.search_expansion_limit,
+            progress,
         )
-        .map(|poses| {
-            prefix.extend(poses.into_iter().skip(1));
-            prefix
+        .map(|result| {
+            prefix.extend(result.poses.into_iter().skip(1));
+            (prefix,result.partial)
         }), polyline, failures.first())?
         },
     };
     #[cfg(feature="profile")]
     profile::success();
-    Ok(LocalTrajectory {
+    Ok(LocalTrajectory { partial,
         poses,
         smoothed: false,
         elapsed_ms: began.elapsed().as_secs_f64() * 1000.0,
@@ -768,6 +827,7 @@ mod tests {
     };
     use nuwax_nav_types_messages::MotionModel;
     use std::{collections::BTreeMap, sync::Arc};
+    include!("progress_prefix_tests.rs");
     pub(super) fn motion() -> MotionKinematics {
         MotionKinematics {
             model: MotionModel::Differential,
@@ -781,6 +841,35 @@ mod tests {
     }
     fn scene(door: Option<i32>) -> SurfaceSnapshot {
         scene_with_slope(door, 0.0)
+    }
+
+    #[test]
+    fn terminal_projection_prefers_reachable_reference_endpoint_before_goal_region_edge() {
+        let map=scene(None);
+        let start=([-1.0,0.0,0.4],[0.0,0.0,0.0,1.0]);
+        let goal=[0.5,0.0,0.4];
+        let points=[[-1.0,0.0,0.0],[0.5,0.0,0.0]];
+        let blocked=std::cell::Cell::new(None);
+        let path=project(&map,start,&points,&motion(),false,None,Some((goal,0.15)),&[],&blocked).unwrap();
+        let end=path.last().unwrap();
+        assert!((end.0[0]-goal[0]).abs()<1e-9,
+            "可站立参考终点应保留，不能先截掉最后到达容差这段跟随距离");
+        for pair in path.windows(2) {map.validate_body_motion(pair[0],pair[1],&[]).unwrap();}
+    }
+
+    #[test]
+    fn terminal_projection_keeps_safe_goal_region_when_reference_endpoint_is_occupied() {
+        let obstacles:Vec<_>=(25..55).map(|z|[50,0,z]).collect();
+        let map=scene_with_extra_cells(None,0.0,&obstacles);
+        let start=([-1.0,0.0,0.4],[0.0,0.0,0.0,1.0]);
+        let goal=[0.5,0.0,0.4];
+        assert!(map.validate_body_pose(goal,[0.0,0.0,0.0,1.0]).is_err());
+        let blocked=std::cell::Cell::new(None);
+        let path=project(&map,start,&[[-1.0,0.0,0.0],[0.5,0.0,0.0]],&motion(),false,
+            None,Some((goal,0.35)),&[],&blocked).unwrap();
+        let end=path.last().unwrap();
+        assert!(distance3(end.0,goal)<0.35 && end.0[0]<0.2);
+        for pair in path.windows(2) {map.validate_body_motion(pair[0],pair[1],&[]).unwrap();}
     }
     fn scene_with_slope(door: Option<i32>, slope: f64) -> SurfaceSnapshot {
         scene_with_extra_cells(door, slope, &[])
@@ -1224,8 +1313,56 @@ mod tests {
         let goal = [0.02, 0.22, 0.4];
         let path = local_search::plan(&map, &tomo, start,
             &[[0.0, 0.2, 0.0], [goal[0], goal[1], 0.0]], &motion(), Some(0.0),
-            Some((goal, 0.1)), &[], 3.0, 0.9, true).unwrap();
+            Some((goal, 0.1)), &[], 3.0, 0.9, true, DEFAULT_SEARCH_EXPANSION_LIMIT).unwrap();
         assert_eq!(path, vec![start], "arrival is already satisfied at the actual input pose");
+    }
+
+    #[test]
+    fn analytic_connector_keeps_factual_height_through_a_missing_ramp_column() {
+        let base = coarse_open_floor();
+        let points: Vec<_> = (-15..25).filter(|&x|x != 5).flat_map(|x|
+            (-8..15).map(move |y| {
+                let px = (x as f32 + 0.5) * 0.1;
+                (px, (y as f32 + 0.5) * 0.1, 0.1 * px)
+            })).collect();
+        let map = SurfaceSnapshot::from_points(&points,base.config().clone(),0.01).unwrap()
+            .with_body_envelope(base.body_envelope().unwrap().clone()).unwrap();
+        let start = ([-0.55,0.05,0.35],[0.0,0.0,0.0,1.0]);
+        let proven = local_search::probe_motion(&map,start,2.0,0.0,&[])
+            .expect("独立完整扫掠先确认同一条前向连接确实可行");
+        let end = *proven.last().unwrap();
+        let tomo = Tomogram::from_surface(&map).unwrap();
+        let reference = [[start.0[0],start.0[1],start.0[2]-0.4],
+            [end.0[0],end.0[1],end.0[2]-0.4]];
+        let path = local_search::with_expansion_limit(0,||local_search::plan(
+            &map,&tomo,start,&reference,&motion(),None,Some((end.0,0.05)),
+            &[],3.0,0.9,false,DEFAULT_SEARCH_EXPANSION_LIMIT))
+            .expect("已验证的解析连接不能被缺测列上的线性高度预检误拒绝");
+        assert!(distance3(path.last().unwrap().0,end.0)<0.05);
+        for edge in path.windows(2) {map.validate_body_motion(edge[0],edge[1],&[]).unwrap();}
+    }
+
+    #[test]
+    fn analytic_reference_does_not_replace_an_asymmetric_body_with_a_centered_disk() {
+        let base = coarse_open_floor();
+        let mut points: Vec<_> = (-15..25).flat_map(|x|(-8..15).map(move |y|
+            ((x as f32+0.5)*0.1,(y as f32+0.5)*0.1,-0.05))).collect();
+        points.extend((-3..3).flat_map(|y|(0..6).map(move |z|
+            (-0.05,(y as f32+0.5)*0.1,(z as f32+0.5)*0.1))));
+        let mut model = base.body_envelope().unwrap().clone();
+        model.footprint_xy_m = vec![[0.0,-0.1],[0.6,-0.1],[0.6,0.1],[0.0,0.1]];
+        let map = SurfaceSnapshot::from_points(&points,base.config().clone(),0.1).unwrap()
+            .with_body_envelope(model).unwrap();
+        let start = ([0.025,0.05,0.4],[0.0,0.0,0.0,1.0]);
+        let proven = local_search::probe_motion(&map,start,1.0,0.0,&[])
+            .expect("机体后缘与墙有真实间隔，原始完整扫掠必须可以向前离墙");
+        let end = *proven.last().unwrap();
+        let tomo = Tomogram::from_surface(&map).unwrap();
+        let path = local_search::with_expansion_limit(0,||local_search::plan(
+            &map,&tomo,start,&[[start.0[0],start.0[1],0.0],[end.0[0],end.0[1],0.0]],
+            &motion(),None,Some((end.0,0.05)),&[],3.0,0.9,false,DEFAULT_SEARCH_EXPANSION_LIMIT))
+            .expect("参考预检不能额外用居中圆盘否决真实非对称机体");
+        for edge in path.windows(2) {map.validate_body_motion(edge[0],edge[1],&[]).unwrap();}
     }
 
     #[test]

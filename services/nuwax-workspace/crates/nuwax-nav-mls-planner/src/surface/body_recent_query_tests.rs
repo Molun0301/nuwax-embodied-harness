@@ -1,5 +1,6 @@
 // Uncached complete pose comparator for recent height-only row reuse.
 // Ground classification follows the current source-only contract.
+// 对照继续核对相同碰撞结果；诊断高度与当前公开证据字段保持一致。
 use super::*;
 
 impl SurfaceSnapshot {
@@ -78,7 +79,7 @@ impl SurfaceSnapshot {
                                 let high=[x,y,z].map(|v|f64::from(v+1)*fine);
                                 if high[2]>=min[2] && low[2]<=max[2] && prism_query.intersects(low,high) {
                                     return Err(reject(slot,BodyRejection::Occupancy{cell:[x,y,z],
-                                        source:OccupancySource::Recent,z_bounds:[low[2],high[2]],ground_height:None}));
+                                        source:OccupancySource::Recent,z_bounds:[low[2],high[2]],ground_height:height}));
                                 }
                             }
                     }

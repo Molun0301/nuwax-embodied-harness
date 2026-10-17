@@ -100,13 +100,16 @@ fn fetched_identity_and_body_corruption_never_become_incomplete() {
             receive_with_fetch(&mut receiver, &transfer, &root.domain, |root, reference| {
                 let request = block_request(root, reference);
                 let mut response = request.clone();
-                response["data"] = serde_json::json!(if wrong_scope {
+                use base64::{engine::general_purpose::STANDARD, Engine as _};
+                let data=if wrong_scope {
                     repository
                         .read_object(reference.object, MAX_BLOCK_BYTES)
                         .unwrap()
                 } else {
                     vec![0_u8; 16]
-                });
+                };
+                response["total_bytes"] = serde_json::json!(data.len());
+                response["data_base64"] = serde_json::json!(STANDARD.encode(data));
                 if wrong_scope {
                     response["root"]["revision"] = serde_json::json!(999);
                 }

@@ -114,6 +114,7 @@ click-goal = ["lcm-runtime", "dep:nuwax-nav-click-goal-bridge"]
 
 # ---- 3D / 探索(可选,本 crate 默认不引入 explore)----
 mls = [
+    "dep:base64",
     "dep:nuwax-nav-pct",
     "guard-runtime",
     "dep:nuwax-map-chunks",
@@ -164,6 +165,7 @@ full = [
 ]
 
 [dependencies]
+base64 = { version = "0.22.1", optional = true }
 nuwax-nav-pct = { path = "../nuwax-nav-pct", optional = true }
 nuwax-nav-control = { path = "../nuwax-nav-control" }
 nuwax-core = { path = "../nuwax-core" }

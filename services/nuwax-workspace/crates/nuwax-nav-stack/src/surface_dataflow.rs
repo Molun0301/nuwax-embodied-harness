@@ -1904,9 +1904,13 @@ mod tests {
         let mut start = pose_from_schema(&goal.goal).unwrap();
         start.pose.position.x = 0.55;
         let path = body_path(&surface, &start, &goal, &configured).unwrap();
+        // 生产后台在控制交付前准备平面查询；测试也必须交付同一完整输入。
+        let prepared = nuwax_nav_runtime::surface_changes::SurfaceMapUpdate::prepare(
+            surface, &configured.follower.pct,
+        ).unwrap();
         let mut follower = nuwax_nav_runtime::RouteFollower::new(configured.follower).unwrap();
         follower
-            .update_execution_map(nuwax_nav_runtime::ExecutionMap::Surface(surface))
+            .update_execution_map(nuwax_nav_runtime::ExecutionMap::SurfaceUpdate(prepared))
             .unwrap();
         follower.update_odometry(start);
         follower
@@ -3036,25 +3040,16 @@ mod tests {
         first.path_for(&pending).await;
         first.wait_controlling().await;
 
-        // 同域的新点云删除前方支撑，实际执行先零速等待；恢复后连续重规划。
+        // 同域的新点云新增真实占据冲突，实际执行先零速等待；清障后连续重规划。
+        // 缺测本身不是障碍，不能只删除地面采样就要求执行端宣告阻塞。
         let original = first.feed.lock().unwrap().map.cloud.clone();
         {
             let mut feed = first.feed.lock().unwrap();
-            let data: Vec<_> = feed
-                .map
-                .cloud
-                .data
-                .chunks_exact(12)
-                .filter(|point| {
-                    let x = f32::from_le_bytes(point[0..4].try_into().unwrap());
-                    !(0.9..1.3).contains(&x)
-                })
-                .flatten()
-                .copied()
-                .collect();
-            feed.map.cloud.width = (data.len() / 12) as i32;
-            feed.map.cloud.row_step = data.len() as i32;
-            feed.map.cloud.data = data;
+            for coordinate in [0.55_f32, 1.55, 2.35] {
+                feed.map.cloud.data.extend_from_slice(&coordinate.to_le_bytes());
+            }
+            feed.map.cloud.width = (feed.map.cloud.data.len() / 12) as i32;
+            feed.map.cloud.row_step = feed.map.cloud.data.len() as i32;
         }
         first.wait_phase(SchedulerPhase::AwaitingPath).await;
         assert_eq!(

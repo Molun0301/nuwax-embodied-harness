@@ -608,7 +608,9 @@ static void run_main_iter(
         if (!points.empty()) {
             auto lidar_msg = boost::make_shared<custom_messages::CustomMsg>();
             lidar_msg->header.seq = 0;
-            lidar_msg->header.stamp = custom_messages::Time().fromSec(static_cast<double>(frame_start) / 1e9);
+            // 原始整数源时间不能先经绝对浮点秒舍入，末端同步仍需精确起点。
+            lidar_msg->header.stamp.sec = frame_start / NANOS_PER_SECOND;
+            lidar_msg->header.stamp.nsecs = frame_start % NANOS_PER_SECOND;
             lidar_msg->header.frame_id = "livox_frame";
             lidar_msg->timebase = frame_start;
             lidar_msg->lidar_id = 0;

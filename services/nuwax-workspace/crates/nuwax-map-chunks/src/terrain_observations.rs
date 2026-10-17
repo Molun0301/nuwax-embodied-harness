@@ -5,7 +5,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, OnceLock};
 
 pub const MAX_LAYER_SAMPLES: usize = 32;
-pub const MAX_LAYERS_PER_BLOCK: usize = 256;
+// 每条层记录至少拥有一个互不重叠的真实成员，结构上限取32³个块内体素。
+// 层按细列保存，256条甚至不足以覆盖32×32的完整平地；实际资源仍由
+// 原有4MiB块编码、样本数和读写缓存字节预算共同约束。
+pub const MAX_LAYERS_PER_BLOCK: usize = 32 * 32 * 32;
 pub const MAX_LAYER_MEMBERS: usize = 32;
 pub type LayerObservations = BTreeMap<u16, LayerObservation>;
 

@@ -26,6 +26,8 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{interval_at, Instant, MissedTickBehavior};
 
+mod arrival_confirmation;
+use arrival_confirmation::ArrivalConfirmation;
 mod command_dispatch;
 pub use command_dispatch::CommandDispatchBound;
 mod planner_worker;
@@ -262,7 +264,7 @@ pub enum SchedulerPhase {
     Controlling,
     /// Cancel accepted; no more twist is issued while fence proof is pending.
     Cancelling,
-    /// A non-cancel terminal path is waiting for fence proof.
+    /// 非取消收尾正在等待停车证明，或复核停车后的目标位置。
     Fencing,
     /// Fail-closed state. No twist or renewal is issued.
     Failed,
@@ -273,7 +275,7 @@ pub enum SchedulerPhase {
 pub enum TerminalOutcome {
     /// Cancel completed after a valid resource fence.
     Cancelled,
-    /// Planner reported arrival and the lease was fenced.
+    /// 规划到达、租约已围栏，停车后采样仍满足原目标。
     Succeeded,
     /// Planner failed and the lease was fenced.
     PlannerFailed,
@@ -1054,6 +1056,9 @@ pub struct NavScheduler<M, P> {
     current_execution_identity: Option<Arc<PathExecutionIdentity>>,
     local_intent_sequence: u64,
     path_wait_started_at: Option<Instant>,
+    arrival_confirmation: Option<ArrivalConfirmation>,
+    latest_pose: Option<PoseStamped>,
+    pose_acquired_at: Option<Instant>,
     pose_receipt: Option<PlannerInputReceipt>,
     pose_valid_until: Option<Instant>,
     obstacle_source_available: bool,
@@ -1095,6 +1100,9 @@ where
             current_execution_identity: None,
             local_intent_sequence: 0,
             path_wait_started_at: None,
+            arrival_confirmation: None,
+            latest_pose: None,
+            pose_acquired_at: None,
             pose_receipt: None,
             pose_valid_until: None,
             obstacle_source_available: true,
@@ -1129,7 +1137,8 @@ where
             }
 
             let renewal_due = self.motion.renewal_due_at().map_or(fallback_renewal, |due| due.min(fallback_renewal));
-            let controlling=matches!(self.status.phase,SchedulerPhase::AwaitingPath|SchedulerPhase::Controlling);
+            let controlling=matches!(self.status.phase,SchedulerPhase::AwaitingPath|SchedulerPhase::Controlling)
+                || self.arrival_confirmation.is_some();
             tokio::select! {
                 biased;
 
@@ -1190,7 +1199,14 @@ where
                         None=>input_open=false,
                     },
                     SchedulerEvent::Tick=>{
-                    match await_interruptible(urgent_open, &mut urgent_rx, self.session_tick(&status_tx)).await {
+                    // 重新取租约期间已经确认静止；与原StartSession一样收敛有界
+                    // acquire结果，不能丢弃未知grant后再拿旧停车票据确认新租约。
+                    let outcome = if self.arrival_resume_requested() {
+                        Interruptible::Completed(self.session_tick(&status_tx).await)
+                    } else {
+                        await_interruptible(urgent_open, &mut urgent_rx, self.session_tick(&status_tx)).await
+                    };
+                    match outcome {
                         Interruptible::Completed(Ok(())) => {}
                         Interruptible::Completed(Err(error)) => {
                             if !self.lease_active && self.session.is_none() { continue; }
@@ -1279,8 +1295,8 @@ where
         let result = match command.kind {
             InputKind::StartSession(session) => self.start_session(status_tx, session).await,
             InputKind::SubmitPath(path) => self.submit_path(status_tx, path).await,
-            InputKind::UpdateOdometry(odometry, valid_until) => {
-                self.observe_odometry(status_tx, odometry, valid_until)
+            InputKind::UpdateOdometry(odometry, valid_until, acquired_at) => {
+                self.observe_odometry_at(status_tx, odometry, valid_until, acquired_at)
             }
             InputKind::UpdateCostmap(observation, received_at) => {
                 self.observe_costmap(status_tx, observation, received_at)
@@ -1304,12 +1320,28 @@ where
         let _ = command.reply.send(result);
     }
 
+    #[cfg(test)]
     fn observe_odometry(
         &mut self,
         status_tx: &watch::Sender<SchedulerStatus>,
         odometry: PoseStamped,
         valid_until: Option<Instant>,
     ) -> Result<(), RuntimeError> {
+        self.observe_odometry_at(status_tx, odometry, valid_until, Instant::now())
+    }
+
+    fn observe_odometry_at(
+        &mut self,
+        status_tx: &watch::Sender<SchedulerStatus>,
+        odometry: PoseStamped,
+        valid_until: Option<Instant>,
+        acquired_at: Instant,
+    ) -> Result<(), RuntimeError> {
+        if acquired_at > Instant::now() {
+            return Err(RuntimeError::InvalidInput {
+                field: "odometry.acquired_at", reason: "位姿采集时刻或来源期限无效".into(),
+            });
+        }
         if odometry.frame_id != nuwax_nav_types_messages::NavFrameId::Map {
             return Err(RuntimeError::InvalidInput {
                 field: "odometry.frame_id",
@@ -1327,6 +1359,8 @@ where
             source_timestamp_ns,
             self.pose_receipt,
         )?;
+        self.latest_pose = Some(odometry.clone());
+        self.pose_acquired_at = Some(acquired_at);
         self.planner.update_odometry(odometry);
         self.pose_receipt = Some(PlannerInputReceipt {
             source_timestamp_ns,
@@ -1836,6 +1870,9 @@ where
         &mut self,
         status_tx: &watch::Sender<SchedulerStatus>,
     ) -> Result<(), RuntimeError> {
+        if self.arrival_confirmation.is_some() {
+            return self.confirm_stopped_arrival(status_tx).await;
+        }
         if self.status.phase == SchedulerPhase::Controlling {
             return self.control_tick(status_tx).await;
         }
@@ -1947,11 +1984,14 @@ where
         // 上层可能只消费首次终态；先保留真实原因，不能等围栏完成后再补发。
         let failure_reason = matches!(terminal, TerminalOutcome::PlannerFailed | TerminalOutcome::SafetyFailed)
             .then(|| self.status.message.clone());
-        self.current_execution_identity = None;
+        let arrived_identity = self.current_execution_identity.take();
         self.local_intent_sequence = 0;
         self.planner.stop();
         let had_lease = self.lease_active;
-        let mut verified_fence = None;
+        if terminal == TerminalOutcome::Succeeded && had_lease {
+            self.path_wait_started_at.get_or_insert_with(Instant::now);
+        }
+        let mut verified_fence = self.arrival_confirmation.take().map(|pending| pending.proof);
         if had_lease {
             if self.status.phase != SchedulerPhase::Cancelling {
                 self.status.phase = SchedulerPhase::Fencing;
@@ -1978,6 +2018,19 @@ where
         } else if terminal == TerminalOutcome::Shutdown && self.status.last_terminal.is_some() {
             self.status.phase = SchedulerPhase::Idle;
             self.status.message = "scheduler stopped; prior verified terminal retained".into();
+            self.publish_status(status_tx);
+            return Ok(());
+        }
+
+        if terminal == TerminalOutcome::Succeeded && had_lease {
+            self.arrival_confirmation = Some(ArrivalConfirmation {
+                proof: verified_fence.take().expect("已确认真实停车"),
+                confirmed_at: Instant::now(), resume_requested: false,
+                execution_identity: arrived_identity,
+            });
+            self.status.phase = SchedulerPhase::Fencing;
+            self.status.last_applied_twist = Some(Twist2::ZERO);
+            self.status.message = "已确认停稳，等待停车后采样的有效位姿复核目标".into();
             self.publish_status(status_tx);
             return Ok(());
         }
@@ -2075,20 +2128,27 @@ impl NavSchedulerHandle {
         self.send_input(InputKind::SubmitPath(path)).await
     }
 
-    /// Update planner odometry through the scheduler task.
+    /// 同进程当前观察入口；调用时刻保留至队列消费，传输来源须用采集时刻入口。
     pub async fn update_odometry(&self, odometry: PoseStamped) -> Result<(), RuntimeError> {
-        self.send_input(InputKind::UpdateOdometry(odometry, None))
+        self.send_input(InputKind::UpdateOdometry(odometry, None, Instant::now()))
             .await
     }
 
-    /// 保留真实来源有效期限；队列消费不能把旧观测重新变成新鲜位姿。
+    /// 保留来源期限的同进程当前观察入口；传输来源须另提供实际采集时刻。
     pub async fn update_odometry_with_deadline(
         &self,
         odometry: PoseStamped,
         valid_until: Instant,
     ) -> Result<(), RuntimeError> {
-        self.send_input(InputKind::UpdateOdometry(odometry, Some(valid_until)))
+        self.send_input(InputKind::UpdateOdometry(odometry, Some(valid_until), Instant::now()))
             .await
+    }
+
+    /// 生产位姿保留实际采集单调时刻，停车复核不能把队列消费当新采样。
+    pub async fn update_odometry_with_acquisition(
+        &self, odometry: PoseStamped, acquired_at: Instant, valid_until: Instant,
+    ) -> Result<(), RuntimeError> {
+        self.send_input(InputKind::UpdateOdometry(odometry, Some(valid_until), acquired_at)).await
     }
 
     /// Update the planner costmap with its real revision and source timestamp.
@@ -2284,7 +2344,7 @@ struct InputCommand {
 enum InputKind {
     StartSession(NavSession),
     SubmitPath(VersionedPath),
-    UpdateOdometry(PoseStamped, Option<Instant>),
+    UpdateOdometry(PoseStamped, Option<Instant>, Instant),
     UpdateCostmap(CostmapObservation, Instant),
     UpdateObstacleSource(Option<ExecutionMap>,bool,Option<CommandDispatchBound>),
     PlanningDiagnostic(String, GoalKey, String),
@@ -2543,6 +2603,7 @@ fn path_rejected(reason: impl Into<String>) -> RuntimeError {
 
 #[cfg(test)]
 mod tests {
+    include!("arrival_confirmation_tests.rs");
     include!("recent_source_health_tests.rs");
     include!("scheduler_detour_cancellation_tests.rs");
     use std::collections::HashMap;
@@ -3386,6 +3447,7 @@ mod tests {
         }).await.expect("地图");
         handle.update_odometry(map_pose()).await.expect("位姿");
         handle.submit_path(path()).await.expect("路径");
+        publish_pose_after_confirmed_stop(&handle, session().goal_pose.clone()).await;
         let mut status = handle.subscribe_status();
         tokio::time::timeout(Duration::from_secs(3), async {
             while status.borrow().last_terminal != Some(TerminalOutcome::Succeeded) {
@@ -3629,7 +3691,8 @@ mod tests {
 
         let mut aligned = nuwax_nav_astar::helpers::make_pose_stamped("map", 2.0, 0.0, goal_yaw);
         aligned.stamp = Timestamp::from_unix(2, 0);
-        handle.update_odometry(aligned).await.expect("朝向已到");
+        handle.update_odometry(aligned.clone()).await.expect("朝向已到");
+        publish_pose_after_confirmed_stop(&handle, aligned).await;
         let terminal = wait_for_terminal(&handle, TerminalOutcome::Succeeded).await;
         assert_eq!(terminal.last_applied_twist, Some(Twist2::ZERO));
         assert!(terminal.last_zero_ack_id.is_some());
@@ -3856,6 +3919,7 @@ mod tests {
             .submit_path(path_for("goal-a", 1))
             .await
             .expect("path A");
+        publish_pose_after_confirmed_stop(&handle, session().goal_pose.clone()).await;
         wait_for_terminal(&handle, TerminalOutcome::Succeeded).await;
         assert!(!task.is_finished(), "natural terminal must not stop owner");
 
@@ -3875,6 +3939,7 @@ mod tests {
             .submit_path(path_for("goal-b", 1))
             .await
             .expect("path B");
+        publish_pose_after_confirmed_stop(&handle, session().goal_pose.clone()).await;
         wait_for_terminal(&handle, TerminalOutcome::Succeeded).await;
 
         let fence_count = motion_state
@@ -3940,6 +4005,7 @@ mod tests {
             .submit_path(path_for("retry-2", 1))
             .await
             .expect("retry path");
+        publish_pose_after_confirmed_stop(&handle, session().goal_pose.clone()).await;
         wait_for_terminal(&handle, TerminalOutcome::Succeeded).await;
         handle.shutdown().await.expect("shutdown");
         task.await.expect("join").expect("task result");
@@ -4654,6 +4720,7 @@ mod tests {
             .submit_path(path_for("after-timeout", 1))
             .await
             .expect("path after timeout");
+        publish_pose_after_confirmed_stop(&handle, session().goal_pose.clone()).await;
         wait_for_terminal(&handle, TerminalOutcome::Succeeded).await;
 
         handle.shutdown().await.expect("shutdown");
@@ -4687,7 +4754,8 @@ mod tests {
                 .submit_path(path_for(child, 1))
                 .await
                 .expect("frontier path accepted");
-            wait_for_terminal(&handle, TerminalOutcome::Succeeded).await;
+            publish_pose_after_confirmed_stop(&handle, session().goal_pose.clone()).await;
+        wait_for_terminal(&handle, TerminalOutcome::Succeeded).await;
             if index == 0 {
                 handle
                     .update_odometry(map_pose_at(2))

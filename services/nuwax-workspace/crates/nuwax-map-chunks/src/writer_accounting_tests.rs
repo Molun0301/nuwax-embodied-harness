@@ -19,6 +19,26 @@ fn assert_accounting(w: &Writer) {
     assert_eq!(w.resident_bytes(), w.source_watermark_bytes + bytes + w.dirty_points * 64 + w.reader.cached_bytes()
         + w.pending.values().map(|p| p.bytes.len()).sum::<usize>());
 }
+
+#[test]
+fn partial_layer_deletion_releases_member_and_original_sample_budget() {
+    let mut w=writer();
+    w.observe([[0,0,0],[0,0,1]],1).unwrap();
+    let mut observations=layers(2);
+    let layer=observations.get_mut(&0).unwrap();
+    layer.members.push(1024);
+    layer.samples[0].point=[0.01,0.01,0.124];
+    layer.samples[1].point=[0.01,0.01,0.126];
+    w.replace_layer_observations([0,0,0],observations).unwrap();
+    assert_accounting(&w);
+    let before=w.dirty_layer_bytes();
+    w.remove([[0,0,0]]).unwrap();
+    assert_accounting(&w);
+    assert_eq!(w.dirty_layer_bytes(),before-2-64);
+    w.remove([[0,0,1]]).unwrap();
+    assert_accounting(&w);
+    assert_eq!(w.dirty_layer_bytes(),0);
+}
 #[test]
 fn dirty_layer_accounting_tracks_mutations_and_failed_flush() {
     let mut w = writer();

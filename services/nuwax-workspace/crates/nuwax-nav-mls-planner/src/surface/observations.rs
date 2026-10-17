@@ -67,6 +67,8 @@ pub struct SurfaceObservations {
     observed_layers: im::HashMap<[i32;3],Arc<BTreeMap<u16,ObservedGroundLayer>>,ahash::RandomState>,
     // Identity only changes when a measured plane/member geometry changes.
     layer_geometry: Arc<()>,
+    // 纯占据几何的固定参考场；统计刷新与私有查询视图共享，真实成员变化才撤销。
+    pub(super) legacy_reference_cache: Arc<std::sync::Mutex<super::body::reference_field::LegacyReferenceCache>>,
 }
 impl SurfaceObservations {
     pub(super) fn fork_for_planning(&self) -> Self {
@@ -80,6 +82,7 @@ impl SurfaceObservations {
             columns: self.columns.clone(),
             observed_layers: self.observed_layers.clone(),
             layer_geometry: self.layer_geometry.clone(),
+            legacy_reference_cache: self.legacy_reference_cache.clone(),
             #[cfg(test)]
             obstacle_cache: Default::default(),
         }
@@ -100,6 +103,7 @@ impl SurfaceObservations {
             columns: Default::default(),
             observed_layers: Default::default(),
             layer_geometry: Arc::new(()),
+            legacy_reference_cache: Default::default(),
             #[cfg(test)]
             obstacle_cache: Default::default(),
         })
@@ -140,6 +144,7 @@ impl SurfaceObservations {
         // Evidence-only refreshes leave occupied cells unchanged, so avoid allocating
         // per-column vectors or cloning, sorting and deduplicating column levels.
         if !same_membership {
+            self.legacy_reference_cache = Default::default();
             let mut replacement=AHashMap::<[i32;2],Vec<i32>>::new();
             for key in values.keys() {replacement.entry([key[0],key[1]]).or_default().push(key[2]);}
             let mut affected:AHashSet<[i32;2]>=replacement.keys().copied().collect();

@@ -91,6 +91,7 @@ pub(crate) struct PlannerWorker {
     shared: Arc<(Mutex<Inputs>, Condvar, Condvar)>,
     thread: Option<std::thread::JoinHandle<()>>,
     wait_reason: Option<String>,
+    delivered_pending: Option<std::time::Instant>,
     delivered_dispatch_bound: Option<CommandDispatchBound>,
     #[cfg(test)]
     delivered_command_deadline: Option<std::time::Instant>,
@@ -365,6 +366,7 @@ impl PlannerWorker {
             shared,
             thread: Some(thread),
             wait_reason: None,
+            delivered_pending: None,
             delivered_dispatch_bound: None,
             #[cfg(test)]
             delivered_command_deadline: None,
@@ -518,9 +520,14 @@ impl NavPlanner for PlannerWorker {
             return PlannerStep::Failed("局部计算线程已退出".into());
         }
         input.control_width = Some(width);
-        // 位姿接收可能紧贴控制拍。已有候选失效时，在本拍预算内接收工作线程
-        // 的当前状态复核；不能因先读取空隙而固定停满下一拍。条件变量释放
-        // 输入锁，不执行几何、不轮询；超时仍归零，原候选及来源期限不续期。
+        // 位姿接收和结果发布可能紧贴控制拍。连续控制的空槽、已交付等待结果，
+        // 以及已有候选失效时，只在本拍预算内接收一次当前计算。新等待结果必须
+        // 立即归零；条件变量释放输入锁，超时不复用命令、不延长原来源期限。
+        let previous_pending=input.result.as_ref().and_then(|(started,step)|
+            (matches!(step,PlannerStep::Pending(_)) && self.delivered_pending==Some(*started))
+                .then_some(*started));
+        let delivery_gap=input.applied!=Twist2::ZERO
+            && (input.result.is_none() || previous_pending.is_some());
         let refresh_in_tick=input.result.as_ref().is_some_and(|(started,step)|
             matches!(step,PlannerStep::Command(c) if *c!=Twist2::ZERO)
                 && started.elapsed()<=DEFAULT_CONTROL_HORIZON
@@ -529,13 +536,15 @@ impl NavPlanner for PlannerWorker {
                     || input.result_applied_version!=input.applied_version
                     || input.result_map_version!=input.map_version
                     || input.result_boundary_version!=input.boundary_version));
-        if refresh_in_tick {
+        if refresh_in_tick || delivery_gap {
             input.requested=Some(width);
             self.shared.1.notify_one();
             let epoch=input.epoch;
             let remaining=tick_deadline.saturating_duration_since(std::time::Instant::now());
             input=self.shared.2.wait_timeout_while(input,remaining,|input|
                 input.epoch==epoch && !input.closed && (input.result.is_none()
+                    || input.result.as_ref().is_some_and(|(started,step)|
+                        previous_pending==Some(*started) && matches!(step,PlannerStep::Pending(_)))
                     || input.result_pose_version!=input.pose_version
                     || input.result_applied_version!=input.applied_version
                     || input.result_map_version!=input.map_version
@@ -597,6 +606,9 @@ impl NavPlanner for PlannerWorker {
             };
         }
         self.delivered_dispatch_bound=if matches!(&ready,Some(PlannerStep::Command(v)) if *v!=Twist2::ZERO) {input.result_dispatch_bound}else{None};
+        self.delivered_pending=if matches!(&ready,Some(PlannerStep::Pending(_))) {
+            input.result.as_ref().map(|(started,_)|*started)
+        } else {None};
         self.wait_reason = if ready.is_some() { input.result_wait_reason.clone() } else if arrival_changed {
             Some("位姿已更新，保持零速并重新核对到达状态".into())
         } else if terminal_changed {
@@ -631,6 +643,7 @@ impl NavPlanner for PlannerWorker {
     }
     fn stop(&mut self) {
         self.delivered_dispatch_bound=None;
+        self.delivered_pending=None;
         self.wait_reason = None;
         #[cfg(test)]
         {self.delivered_command_deadline=None;self.delivered_command_context=None;}
@@ -1452,6 +1465,48 @@ mod tests {
         (PlannerWorker::new(TerminalPlanner { started, outcome }).unwrap(), receive, send)
     }
     #[test]
+    fn continuous_delivery_waits_for_new_result_in_empty_or_pending_slot() {
+        for old_pending in [false, true] {
+            let (mut worker, started, finish) = terminal_worker();
+            let velocity = Twist2 {
+                linear: nuwax_nav_types_messages::Point2::new(0.1, 0.0), angular_z: 0.0,
+            };
+            let command = PlannerStep::Command(velocity);
+            assert_eq!(worker.step(0.3), PlannerStep::Pending(Vec::new()));
+            started.recv_timeout(Duration::from_secs(1)).unwrap();
+            finish.send(command.clone()).unwrap();
+            wait_for_source_result(&worker);
+            assert_eq!(worker.step(0.3), command);
+            worker.observe_applied_command(velocity);
+            started.recv_timeout(Duration::from_secs(1)).unwrap();
+            if old_pending {
+                finish.send(PlannerStep::Pending(Vec::new())).unwrap();
+                wait_for_source_result(&worker);
+                assert_eq!(worker.step(0.3), PlannerStep::Pending(Vec::new()),
+                    "首次交付的真实等待结果必须保持归零语义");
+                started.recv_timeout(Duration::from_secs(1)).unwrap();
+            }
+            // 确认本拍已发出计算请求后才放行；旧实现仍持锁立即返回空结果。
+            let shared = Arc::clone(&worker.shared);
+            let release = finish.clone();
+            let next = command.clone();
+            let publisher = std::thread::spawn(move || {
+                let input = shared.0.lock().unwrap();
+                let (input, timeout) = shared.1.wait_timeout_while(
+                    input, Duration::from_secs(1), |input| input.requested.is_none(),
+                ).unwrap();
+                assert!(!timeout.timed_out(), "本拍没有请求新计算");
+                drop(input);
+                release.send(next).unwrap();
+            });
+            let delivered = worker.step(0.3);
+            publisher.join().unwrap();
+            worker.stop();
+            let _ = finish.send(PlannerStep::Pending(Vec::new()));
+            assert_eq!(delivered, command, "旧等待结果={old_pending}，本拍应接收新结果");
+        }
+    }
+    #[test]
     fn pose_only_update_retires_inflight_negative_and_accepts_current_failure() {
         for negative in [PlannerStep::ReplanRequired("old pose".into()), PlannerStep::Failed("old pose".into())] {
             let (mut worker, started, finish) = terminal_worker();
@@ -1747,17 +1802,16 @@ mod tests {
             worker
                 .replace_execution_path(route.clone(), None, goal.clone())
                 .unwrap();
-            worker.step(0.3);
-            let deadline = std::time::Instant::now() + Duration::from_secs(1);
-            while worker.shared.0.lock().unwrap().result.is_none()
-                && std::time::Instant::now() < deadline
-            {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            assert_eq!(
-                worker.shared.0.lock().unwrap().result.as_ref().unwrap().1,
-                PlannerStep::Command(command)
-            );
+            // 同拍可直接取得新结果；验证真实交付，不能要求已消费命令继续留在槽中。
+            let delivered = match worker.step(0.3) {
+                PlannerStep::Pending(_) => {
+                    wait_for_source_result(&worker);
+                    worker.step(0.3)
+                }
+                result => result,
+            };
+            assert_eq!(delivered, PlannerStep::Command(command));
+            assert!(worker.shared.0.lock().unwrap().result.is_none());
             assert_eq!(
                 goals.load(Ordering::SeqCst),
                 1,

@@ -190,18 +190,29 @@ impl Writer {
         Ok(())
     }
     pub fn remove(&mut self, keys: impl IntoIterator<Item = Key>) -> Result<(), String> {
+        let quantum=f64::from(self.voxel_size_m);
         let mut grouped: BTreeMap<Key, BTreeSet<u16>> = BTreeMap::new();
         for key in keys { grouped.entry(block_key(key)).or_default().insert(local_key(key)); }
         for (key, removed) in grouped {
             if !self.blocks.contains_key(&key) && !self.dirty.contains_key(&key) { continue; }
             let dirty = self.load_dirty(key)?; let before = dirty.block.len();
-            for local in removed { dirty.block.remove(&local); }
-            let mut removed_layer_bytes = 0;
-            dirty.layers.retain(|_, layer| {
-                let retain = layer.members.iter().all(|member| dirty.block.contains_key(member));
-                if !retain { removed_layer_bytes += layer_bytes(layer); }
-                retain
-            });
+            for local in &removed { dirty.block.remove(local); }
+            let before_layer_bytes=dirty.layers.values().map(layer_bytes).sum::<usize>();
+            dirty.layers=std::mem::take(&mut dirty.layers).into_values().filter_map(|mut layer| {
+                let previous_members=layer.members.len();
+                layer.members.retain(|member|dirty.block.contains_key(member));
+                if layer.members.is_empty() {return None;}
+                if layer.members.len()!=previous_members {
+                    // 删除只撤销被射线证实消失的成员及其原样本；剩余真实成员
+                    // 继续使用捕获时已拟合的平面，不能退回无地面身份的占据。
+                    layer.samples.retain(|sample| {
+                        let sample_key=sample.point.map(|value|(value/quantum).floor() as i32);
+                        block_key(sample_key)!=key || !removed.contains(&local_key(sample_key))
+                    });
+                }
+                (!layer.samples.is_empty()).then(||(layer.members[0],layer))
+            }).collect();
+            let removed_layer_bytes=before_layer_bytes-dirty.layers.values().map(layer_bytes).sum::<usize>();
             let removed = before - dirty.block.len(); dirty.changed |= removed > 0; self.dirty_points -= removed; self.dirty_layer_bytes -= removed_layer_bytes;
             if removed > 0 { self.pending.remove(&key); self.touched.insert(key); self.membership_touched.insert(key); }
         }

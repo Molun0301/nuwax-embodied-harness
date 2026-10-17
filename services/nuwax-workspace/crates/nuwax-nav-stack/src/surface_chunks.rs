@@ -1,6 +1,6 @@
 //! 原表面构建任务拥有的块接收、可靠补取和有界磁盘缓存。
 use nuwax_codec::lcm::schema;
-use nuwax_map_chunks::{Manifest, Receiver, Repository, MAX_BLOCK_BYTES};
+use nuwax_map_chunks::{Manifest, Receiver, Repository, MAX_BLOCK_BYTES, MAX_BLOCK_TRANSFER_PART_BYTES};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use crate::surface_map::SurfaceMapBuildError;
@@ -103,22 +103,34 @@ impl FineMapReader {
                 ).map_err(|e| e.to_string())?);
             }
             let runtime = tokio::runtime::Handle::try_current().map_err(|_| "可靠补取必须在原受管阻塞构建任务中执行")?;
-            let request = block_request(root, reference);
-            let mut last = "精细块补取期限耗尽".to_string();
-            for _ in 0..3 {
-                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else { break; };
-                let result = runtime.block_on(client.as_ref().unwrap().call_scoped((vec![request.clone()], Default::default()), remaining.min(Duration::from_millis(350))));
-                match result {
-                    Ok(value) => {
-                        return block_response(&request, &value).map_err(Into::into);
+            let mut request = block_request(root, reference);
+            let mut joined = Vec::new();
+            let mut total = None;
+            loop {
+                request["offset"] = serde_json::json!(joined.len());
+                let mut last = "精细块补取期限耗尽".to_string();
+                let mut reply = None;
+                for _ in 0..3 {
+                    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else { break; };
+                    let result = runtime.block_on(client.as_ref().unwrap().call_scoped((vec![request.clone()], Default::default()), remaining.min(Duration::from_millis(350))));
+                    match result {
+                        Ok(value) => { reply=Some(value); break; }
+                        Err(error @ (nuwax_rpc::RpcError::Timeout { .. } | nuwax_rpc::RpcError::Transport(_))) => {
+                            last = error.to_string();
+                        }
+                        Err(error) => return Err(SurfaceMapBuildError::Invalid(error.to_string())),
                     }
-                    Err(error @ (nuwax_rpc::RpcError::Timeout { .. } | nuwax_rpc::RpcError::Transport(_))) => {
-                        last = error.to_string();
-                    }
-                    Err(error) => return Err(SurfaceMapBuildError::Invalid(error.to_string())),
                 }
+                let reply=reply.ok_or(SurfaceMapBuildError::IncompleteFineSource(last))?;
+                let part=block_response(&request,&reply)?;
+                let length=reply["total_bytes"].as_u64().expect("分段格式已检查") as usize;
+                if total.is_some_and(|previous|previous!=length) {
+                    return Err(SurfaceMapBuildError::Invalid("精细块分段总长变化".into()));
+                }
+                total=Some(length);
+                joined.extend_from_slice(&part);
+                if joined.len()==length {return Ok(joined);}
             }
-            Err(SurfaceMapBuildError::IncompleteFineSource(last))
         })?;
         if fetched_blocks>0 {tracing::debug!(fetched_blocks,blocks=received.blocks.len(),revision=received.revision,"精细地图可靠补取完成");}
         Ok(received)
@@ -242,7 +254,9 @@ pub(super) fn block_request(root: &Manifest, reference: &nuwax_map_chunks::Block
         }),
     };
     serde_json::json!({
-        "schema_version": 2,
+        "schema_version": 3,
+        "offset": 0,
+        "max_bytes": MAX_BLOCK_TRANSFER_PART_BYTES,
         "root": root.identity(),
         "block": {
             "key": reference.key,
@@ -260,6 +274,28 @@ fn block_response(request: &serde_json::Value, response: &serde_json::Value) -> 
         || response.get("block") != request.get("block")
     {
         return Err("精细块响应与请求的根或块身份不符".into());
+    }
+    if request["schema_version"].as_u64() == Some(3) {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        if response.get("data").is_some() { return Err("精细块响应包含混合编码".into()); }
+        let encoded = response.get("data_base64").and_then(serde_json::Value::as_str)
+            .ok_or("精细块紧凑响应格式错误")?;
+        let offset=request["offset"].as_u64().filter(|value|*value<MAX_BLOCK_BYTES as u64)
+            .ok_or("精细块请求偏移错误")?;
+        let maximum=request["max_bytes"].as_u64().filter(|value|*value>0 && *value<=MAX_BLOCK_TRANSFER_PART_BYTES as u64)
+            .ok_or("精细块请求段上限错误")?;
+        let total=response["total_bytes"].as_u64().filter(|value|*value>offset && *value<=MAX_BLOCK_BYTES as u64)
+            .ok_or("精细块响应总长错误")?;
+        if response["offset"].as_u64()!=Some(offset) {return Err("精细块响应偏移错误".into());}
+        let expected=maximum.min(total-offset) as usize;
+        // 分配前限制编码长度，解码后要求精确段长；空段、错序及尾部缺字节不能推进。
+        if encoded.len() > expected.div_ceil(3) * 4 { return Err("精细块响应长度错误".into()); }
+        let data = STANDARD.decode(encoded).map_err(|_| "精细块紧凑响应编码无效")?;
+        if data.len()!=expected { return Err("精细块响应长度错误".into()); }
+        return Ok(data);
+    }
+    if request["schema_version"].as_u64() != Some(2) || response.get("data_base64").is_some() {
+        return Err("不支持的精细块响应版本或混合编码".into());
     }
     let data = response.get("data").and_then(serde_json::Value::as_array)
         .ok_or("精细块响应格式错误")?;
@@ -481,7 +517,8 @@ mod tests {
         let repository = Repository::temporary().unwrap();
         let root = install_revisioned(&repository, &BTreeSet::from([[0, 0, 0]]), 0.05, 1, None);
         let reference = &root.blocks[0];
-        let request = block_request(&root, reference);
+        let mut request = block_request(&root, reference);
+        request["schema_version"] = serde_json::json!(2);
         let bytes = repository.read_object(reference.object, MAX_BLOCK_BYTES).unwrap();
         let mut response = request.clone();
         response["data"] = serde_json::json!(bytes);
@@ -515,6 +552,51 @@ mod tests {
         assert_eq!(legacy_request["block"]["object"]["kind"], 2);
         assert_eq!(legacy_request["block"]["object"]["object_id"], serde_json::json!([]));
         assert_eq!(legacy_request["block"]["object"]["legacy_alias"], serde_json::to_value([7_u8; 32]).unwrap());
+    }
+
+    #[test]
+    fn compact_block_reply_keeps_scope_and_decoded_size_boundaries() {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let repository = Repository::temporary().unwrap();
+        let root = install_revisioned(&repository, &BTreeSet::from([[0, 0, 0]]), 0.05, 1, None);
+        let request = block_request(&root, &root.blocks[0]);
+        assert_eq!(request["schema_version"], 3);
+        let mut response = request.clone();
+        response["data_base64"] = serde_json::json!("AAH+/w==");
+        response["total_bytes"] = serde_json::json!(4);
+        assert_eq!(block_response(&request, &response).unwrap(), [0, 1, 254, 255]);
+        for path in [vec!["root", "revision"], vec!["block", "block_revision"],
+            vec!["block", "geometry_revision"], vec!["block", "points"]] {
+            let mut invalid = response.clone();
+            invalid[path[0]][path[1]] = serde_json::json!(99);
+            assert!(block_response(&request, &invalid).is_err());
+        }
+        for encoded in [serde_json::json!("!"), serde_json::json!("AAH+/w"),
+            serde_json::json!([0, 1]), serde_json::json!("A".repeat(MAX_BLOCK_BYTES.div_ceil(3) * 4 + 4))] {
+            let mut invalid = response.clone(); invalid["data_base64"] = encoded;
+            assert!(block_response(&request, &invalid).is_err());
+        }
+        let mut mixed = response.clone(); mixed["data"] = serde_json::json!([0]);
+        assert!(block_response(&request, &mixed).is_err());
+        // 段上限和上限+1可有相同编码长度，必须在解码后检查精确字节数。
+        for length in [MAX_BLOCK_TRANSFER_PART_BYTES, MAX_BLOCK_TRANSFER_PART_BYTES + 1] {
+            let bytes: Vec<_> = (0..length).map(|index| index as u8).collect();
+            let mut actual = request.clone(); actual["data_base64"] = serde_json::json!(STANDARD.encode(&bytes));
+            actual["total_bytes"] = serde_json::json!(MAX_BLOCK_BYTES);
+            let result = block_response(&request, &actual);
+            if length == MAX_BLOCK_TRANSFER_PART_BYTES { assert_eq!(result.unwrap(), bytes); }
+            else { assert!(result.is_err()); }
+        }
+        for (field,value) in [("offset",serde_json::json!(1)),("total_bytes",serde_json::json!(0)),
+            ("total_bytes",serde_json::json!(MAX_BLOCK_BYTES+1)),("total_bytes",serde_json::json!(5))] {
+            let mut invalid=response.clone();invalid[field]=value;
+            assert!(block_response(&request,&invalid).is_err());
+        }
+        let mut last_request=request.clone();
+        last_request["offset"]=serde_json::json!(MAX_BLOCK_BYTES-4);
+        let mut last=response.clone();last["offset"]=last_request["offset"].clone();
+        last["total_bytes"]=serde_json::json!(MAX_BLOCK_BYTES);
+        assert_eq!(block_response(&last_request,&last).unwrap(),[0,1,254,255]);
     }
 
     fn assert_columns(

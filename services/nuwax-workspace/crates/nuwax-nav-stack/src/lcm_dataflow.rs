@@ -1697,8 +1697,10 @@ where
                 commit_guarded_pose_telemetry(&mut candidate_telemetry, &input);
                 let result = match source_deadline {
                     Some(deadline) => {
+                        let acquired_at = deadline.checked_sub(source_max_age.expect("已配置来源期限"))
+                            .ok_or_else(|| NavStackError::InvalidConfig("位姿采集单调时刻下溢".into()))?;
                         scheduler
-                            .update_odometry_with_deadline(input.pose, deadline)
+                            .update_odometry_with_acquisition(input.pose, acquired_at, deadline)
                             .await
                     }
                     None => scheduler.update_odometry(input.pose).await,
@@ -7518,7 +7520,7 @@ mod guarded_tests {
         *harness.planner_twist.lock().unwrap() = expected_twist;
         let mut status = harness.scheduler.subscribe_status();
         let feeder =
-            GuardedContentionFeeder::spawn(harness.poses.clone(), harness.costmaps.clone());
+            GuardedContentionFeeder::spawn(harness.poses.clone(), harness.costmaps.clone(), goal.goal.pose.position);
         harness.publication_probe.lock().unwrap().ledgers=Some((Arc::clone(&feeder.pose_ledger),Arc::clone(&feeder.costmap_ledger)));
 
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -8068,6 +8070,10 @@ mod guarded_tests {
     }
 
     fn guarded_pose_body(stamp_sec: i32) -> Vec<u8> {
+        guarded_pose_body_at(stamp_sec, [0.0; 3])
+    }
+
+    fn guarded_pose_body_at(stamp_sec: i32, position: [f64; 3]) -> Vec<u8> {
         schema::encode_pose_stamped_body(&schema::PoseStamped {
             header: schema::Header {
                 seq: stamp_sec,
@@ -8076,7 +8082,7 @@ mod guarded_tests {
                 ..schema::Header::default()
             },
             pose: schema::Pose {
-                position: [0.0, 0.0, 0.0],
+                position,
                 orientation_xyzw: [0.0, 0.0, 0.0, 1.0],
             },
         })
@@ -8269,7 +8275,7 @@ mod guarded_tests {
     }
 
     impl GuardedContentionFeeder {
-        fn spawn(poses: GuardedTestSender, costmaps: GuardedTestSender) -> Self {
+        fn spawn(poses: GuardedTestSender, costmaps: GuardedTestSender, position: [f64; 3]) -> Self {
             const WINDOW: usize = 8;
             let (stop, stop_rx) = tokio::sync::watch::channel(false);
             let pose_ledger = Arc::new(GuardedDequeueLedger::default());
@@ -8285,7 +8291,7 @@ mod guarded_tests {
                         receipts.push(send_guarded_test_body_observed_with_ledger(
                             &poses,
                             "geometry_msgs.PoseStamped",
-                            guarded_pose_body(stamp),
+                            guarded_pose_body_at(stamp, position),
                             Some(Arc::clone(&ledger)),
                         ));
                         stamp += 1;
@@ -8309,7 +8315,7 @@ mod guarded_tests {
                                 receipts.push(send_guarded_test_body_observed_with_ledger(
                                     &poses,
                                     "geometry_msgs.PoseStamped",
-                                    guarded_pose_body(stamp),
+                                    guarded_pose_body_at(stamp, position),
                                     Some(Arc::clone(&ledger)),
                                 ));
                                 stamp += 1;
@@ -8714,6 +8720,28 @@ mod guarded_tests {
                 .expect("guarded goal was not dequeued")
                 .expect("guarded goal dequeue receipt was dropped");
             assert!(!self.loop_task.is_finished(), "guarded loop exited early");
+        }
+
+        async fn publish_stopped_goal_pose(&self, goal: &schema::GoalEnvelope) {
+            let mut status = self.scheduler.subscribe_status();
+            let source = tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    let snapshot = status.borrow().clone();
+                    assert_ne!(snapshot.last_terminal, Some(TerminalOutcome::Succeeded),
+                        "停车后观察尚未送达，不能提前成功");
+                    if snapshot.phase == SchedulerPhase::Fencing && snapshot.message.starts_with("已确认停稳") {
+                        assert!(snapshot.last_zero_ack_id.is_none());
+                        break snapshot.pose_source_timestamp_ns + 1;
+                    }
+                    status.changed().await.unwrap();
+                }
+            }).await.expect("真实停车证明后的复核阶段");
+            // 夹具继续通过同一位姿数据面发送停车后的目标位置，不直接改终态。
+            let mut pose = goal.goal.clone();
+            pose.header.stamp_sec = (source / 1_000_000_000) as i32;
+            pose.header.stamp_nsec = (source % 1_000_000_000) as i32;
+            send_guarded_test_body(&self.poses, "geometry_msgs.PoseStamped",
+                schema::encode_pose_stamped_body(&pose).unwrap());
         }
 
         fn send_pose(&self, stamp_sec: i32) {
@@ -9562,6 +9590,7 @@ mod guarded_tests {
         harness
             .planner_succeeds
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        harness.publish_stopped_goal_pose(goal_a).await;
         tokio::time::timeout(Duration::from_secs(1), async {
             while harness.scheduler.status().session_id.is_some()
                 || harness.scheduler.status().last_zero_ack_id.is_none()
@@ -9741,6 +9770,7 @@ mod guarded_tests {
         harness
             .planner_succeeds
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        harness.publish_stopped_goal_pose(&goal).await;
         tokio::time::timeout(Duration::from_secs(1), async {
             while harness.scheduler.status().last_terminal != Some(TerminalOutcome::Succeeded) {
                 tokio::time::sleep(Duration::from_millis(5)).await;

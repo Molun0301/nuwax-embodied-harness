@@ -164,24 +164,33 @@ fn scalar_root_handles_tied_endpoints_interior_and_legacy_degenerate_cases() {
     assert_eq!(fit_contact_plane(&line, [0.0; 3]), None);
 }
 
-pub(super) fn assert_flat_response_matches_reference(
+pub(super) fn assert_static_interval_and_reversible_motion(
     map: &SurfaceSnapshot,
     from: Pose,
     next: Pose,
 ) {
-    assert_eq!(next.1, from.1, "common horizontal bands cannot create tilt");
     let model = map.body_envelope().unwrap();
-    let initial = from.0[2] - model.body_to_support_z_m;
+    let current_rotation=rotation(from.1).unwrap();
+    let initial = from.0[2] - model.body_to_support_z_m/current_rotation[2][2];
     let radius = model.radius() + f64::from(map.observations.as_ref().unwrap().size_m);
     let base = [from.0[0], from.0[1], initial];
     let target = [next.0[0], next.0[1], initial];
     let base_rows = map.fine_contact_domain(base, radius).unwrap();
     let target_rows = map.fine_contact_domain(target, radius).unwrap();
-    let expected =
-        from.0[2] + reference_root(&target_rows, target) - reference_root(&base_rows, base);
-    assert!((next.0[2] - expected).abs() <= 16.0 * f64::EPSILON * (1.0 + expected.abs()));
+    // 静态标量区间解继续与独立求根对照；它不再作为动态输运的物理真值。
+    for (rows,origin) in [(&base_rows,base),(&target_rows,target)] {
+        let expected=reference_root(rows,origin);
+        let actual=fit_contact_plane(rows,origin).unwrap().2;
+        assert!((actual-expected).abs()<=16.0*f64::EPSILON*(1.0+expected.abs()));
+    }
     map.validate_body_motion(from, next, &[])
         .expect("full collision permission remains required");
+    let yaw=current_rotation[0][1].atan2(current_rotation[0][0]);
+    let returned=map.body_pose_after_motion(next,[from.0[0],from.0[1]],yaw).unwrap();
+    map.validate_body_motion(next,returned,&[]).unwrap();
+    assert!((returned.0[2]-from.0[2]).abs()<1e-10,"固定动态场不能积累往返高度偏差");
+    assert!(rotation(returned.1).unwrap().iter().flatten().zip(current_rotation.iter().flatten())
+        .all(|(a,b)|(a-b).abs()<1e-10),"固定动态场不能积累往返倾斜偏差");
 }
 
 // Frozen contact rows at the recorded A domain boundary; no external file required.
@@ -550,7 +559,7 @@ fn external_low_patch_does_not_pull_body_into_an_independent_flat_plane() {
         map.validate_body_motion(a, t, &[])
             .expect("independent truth path must be admissible");
         let frozen = map.body_pose_after_motion(a, [t.0[0], 0.0], 0.0).unwrap();
-        assert_flat_response_matches_reference(&map, a, frozen);
+        assert_static_interval_and_reversible_motion(&map, a, frozen);
         assert!(
             analytic_prism_clearance(&map, frozen, 0.0) >= 0.0,
             "fitted response must not enter the declared true plane"
@@ -558,14 +567,17 @@ fn external_low_patch_does_not_pull_body_into_an_independent_flat_plane() {
         let next = map
             .body_pose_after_motion(actual, [t.0[0], 0.0], 0.0)
             .unwrap();
-        assert_flat_response_matches_reference(&map, actual, next);
+        assert_static_interval_and_reversible_motion(&map, actual, next);
         assert!(analytic_prism_clearance(&map, next, 0.0) >= 0.0);
         let errors = analytic_errors(next, t);
-        assert_eq!(errors[1], 0.0);
         max_error = max_error.max(errors[0].abs());
         actual = next;
     }
     eprintln!("INTEGRATED_ANALYTIC_FLAT segments=8 max_height_error_m={max_error:?} return_error_m={:?} minimum_patch_gap_m={minimum_patch_gap:?}",actual.0[2]-analytic_truth(path[0],0.0).0[2]);
+    let initial=analytic_truth(path[0],0.0);
+    assert!((actual.0[2]-initial.0[2]).abs()<1e-10);
+    assert!(rotation(actual.1).unwrap().iter().flatten().zip(rotation(initial.1).unwrap().iter().flatten())
+        .all(|(a,b)|(a-b).abs()<1e-10));
 }
 
 #[test]

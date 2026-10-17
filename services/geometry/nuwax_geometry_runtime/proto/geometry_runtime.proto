@@ -38,10 +38,13 @@ message NavigationMapBlockRef {
 message NavigationMapBlockRequest {
   reserved 1;
   reserved "sha256_hex";
-  // Required value 2; unversioned/hash-only requests are rejected.
+  // 版本2读取整块；版本3按偏移读取最多256KiB，LCM RPC使用Base64段编码。
+  // 无版本或仅哈希请求继续拒绝，版本3须配套支持分段的服务与客户端。
   uint32 schema_version = 2;
   NavigationMapRootIdentity root = 3;
   NavigationMapBlockRef block = 4;
+  uint32 offset = 5;
+  uint32 max_bytes = 6;
 }
 message NavigationMapBlockResponse {
   reserved 1;
@@ -51,6 +54,8 @@ message NavigationMapBlockResponse {
   NavigationMapRootIdentity root = 3;
   NavigationMapBlockRef block = 4;
   bytes data = 5;
+  uint32 offset = 6;
+  uint32 total_bytes = 7;
 }
 message Vec3 { double x = 1; double y = 2; double z = 3; }
 message Quat { double x = 1; double y = 2; double z = 3; double w = 4; }

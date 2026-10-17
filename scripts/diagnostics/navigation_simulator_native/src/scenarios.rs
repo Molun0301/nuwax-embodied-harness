@@ -11,6 +11,22 @@ pub struct Scenario {
     pub occupied_volume: bool,
 }
 
+/// 仅供模拟环境响应与评分读取；不写入导航地图、实测层或占据成员。
+#[derive(Clone, Copy)]
+pub struct PhysicalSurface {
+    pub height: fn(f64, f64) -> f64,
+    pub bounds: [f64; 4],
+}
+
+pub fn physical_surface(id: &str) -> Option<PhysicalSurface> {
+    let height: fn(f64, f64) -> f64 = match id {
+        "thick-undulating" | "irregular-ground" => |x, y| complex_ground_height(x, y, false),
+        "rough-ramp-obstacle" => |x, y| complex_ground_height(x, y, true),
+        _ => return None,
+    };
+    Some(PhysicalSurface { height, bounds: [-1.0, 9.0, -2.5, 2.5] })
+}
+
 #[derive(Default)]
 struct Cloud(BTreeSet<[i32; 3]>);
 impl Cloud {
@@ -203,6 +219,75 @@ pub fn multilevel() -> Vec<Scenario> {
         )],
     });
     result
+}
+
+/// 有厚度且非平面的合成观测；所有样本保留在生产地图输入中。
+pub fn complex_ground() -> Vec<Scenario> {
+    let mut scenes = Vec::new();
+    for (id, name, description, irregular, slope, blocked) in [
+        ("thick-undulating", "厚层地面 · 连续起伏", "5厘米源体素；地面高差振幅上界7厘米，观测层厚10—20厘米；双向及偏航起步。", false, false, false),
+        ("irregular-ground", "不规则地面 · 非均匀采样", "厚10—20厘米的起伏地面，确定性稀疏列与厘米级采样偏移；保留局部凸起和凹陷。", true, false, false),
+        ("rough-ramp-obstacle", "粗糙坡道 · 厚层绕障", "8.5度坡道叠加厘米级起伏与10—20厘米观测厚度，中段实心障碍高80厘米；双向绕行。", true, true, true),
+    ] {
+        let mut cloud = Vec::new();
+        let q = f64::from(0.05_f32);
+        for ix in -20_i32..180 {
+            for iy in -50_i32..50 {
+                let code = (ix * 73 + iy * 151).rem_euclid(997);
+                // 按散列余数移除约1/11列，缺测仍保留为空，没有给生产地图补造支撑。
+                if irregular && code % 11 == 0 { continue; }
+                let jitter = if irregular { ((code % 7) as f64 - 3.0) * 0.003 } else { 0.0 };
+                let x = (f64::from(ix) + 0.5) * q + jitter;
+                let y = (f64::from(iy) + 0.5) * q - jitter;
+                let nominal = complex_ground_height(x, y, slope);
+                let layers = 2 + (code % 3);
+                let top = (nominal / q).round() as i32 - 1;
+                for layer in 0..=layers {
+                    cloud.push((x as f32, y as f32, ((f64::from(top - layer) + 0.5) * q) as f32));
+                }
+                if blocked && (3.2..3.8).contains(&x) && (-0.65..0.65).contains(&y) {
+                    for layer in 1..=16 {
+                        cloud.push((x as f32, y as f32, ((f64::from(top + layer) + 0.5) * q) as f32));
+                    }
+                }
+            }
+        }
+        let z = |x, y| complex_ground_height(x, y, slope) + 0.4;
+        let mut cases = Vec::new();
+        for (suffix, start, goal, heading) in [
+            ("forward", [0.0, 0.0], [7.0, 0.0], 0.0),
+            ("reverse", [7.0, 0.0], [0.0, 0.0], std::f64::consts::PI),
+            ("forward-oblique", [0.0, -0.45], [7.0, 0.45], 0.6),
+            ("reverse-oblique", [7.0, 0.45], [0.0, -0.45], -2.5),
+        ] {
+            cases.push(case(&format!("{id}-{suffix}"), suffix,
+                [start[0], start[1], z(start[0], start[1]), heading],
+                [goal[0], goal[1], z(goal[0], goal[1]), heading], true));
+        }
+        scenes.push(Scenario { id, name, description, points: cloud, cases, occupied_volume: false });
+    }
+    scenes
+}
+
+fn complex_ground_height(x: f64, y: f64, slope: bool) -> f64 {
+    let wave = 0.035 * (1.2 * x).sin() + 0.025 * (1.7 * y + 0.4 * x).sin()
+        + 0.010 * (3.1 * x + 2.3 * y).cos();
+    wave + if slope { 0.15 * x.clamp(0.0, 7.0) } else { 0.0 }
+}
+
+pub fn complex_ground_metadata(id: &str) -> Value {
+    json!({"source":"deterministic_synthetic_observations", "source_voxel_m":0.05,
+        "surface_wave_amplitude_bound_m":0.07, "observed_band_center_span_m":[0.10,0.20],
+        "sampling_xy_jitter_bound_m":if id=="thick-undulating" {0.0}else{0.009},
+        "missing_column_nominal_fraction":if id=="thick-undulating" {0.0}else{1.0/11.0},
+        "missing_column_rule":"integer_xy_hash_modulo_11_equals_zero",
+        "ramp_gradient":if id=="rough-ramp-obstacle" {0.15}else{0.0},
+        "obstacle_height_m":if id=="rough-ramp-obstacle" {0.8}else{0.0},
+        "normal_source":"independent_weighted_fit_of_declared_physical_surface",
+        "navigation_ground_source":"unmodified_pointcloud_geometry_without_measured_layers",
+        "physical_surface_source":"complex_ground_height",
+        "physical_surface_used_by_navigation":false,
+        "measurement_provenance":"synthetic_observations_not_sensor_capture", "seed":"integer_xy_73_151_mod_997"})
 }
 
 #[cfg(test)]

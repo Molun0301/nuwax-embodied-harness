@@ -100,6 +100,13 @@ fn key(p: BodyPose) -> [u64; 7] {
      p.1[0].to_bits(), p.1[1].to_bits(), p.1[2].to_bits(), p.1[3].to_bits()]
 }
 
+// Queue labels use exactly the same dominance relation as admission. A cheaper
+// path to this exact seven-component pose supersedes the old entry even when
+// the cost difference is smaller than a geometric tolerance.
+fn is_stale(node: &Node, best: &HashMap<[u64; 7], f64>) -> bool {
+    best.get(&key(node.pose)).is_some_and(|&cost| node.cost > cost)
+}
+
 pub fn probe_motion(
     map: &SurfaceSnapshot,
     from: BodyPose,
@@ -508,10 +515,7 @@ pub fn plan(
         super::cancellation::checkpoint()?;
         let from = nodes[id].pose;
         let cost = nodes[id].cost;
-        if best
-            .get(&key(from))
-            .is_some_and(|&v| cost > v + 1e-9)
-        {
+        if is_stale(&nodes[id], &best) {
             continue;
         }
         #[cfg(all(test,feature="profile"))]
@@ -523,7 +527,10 @@ pub fn plan(
         // 终端区域内优先尝试完整直线接续；离散动作只用于绕过确实阻挡直线的障碍。
         // 解析接续避免用交替左右固定角度去逼近一个本来可以直达的交接横截面。
         let mut connection=None;
-        let offsets=if arrival.is_some() {vec![0.0]}else{vec![0.0,corridor*0.5,-corridor*0.5,corridor,-corridor]};
+        // A reached state already has a fully admitted prefix. Do not turn
+        // toward the click center and back after its arrival region is satisfied.
+        let reached = reach(from);
+        let offsets=if reached {Vec::new()}else if arrival.is_some() {vec![0.0]}else{vec![0.0,corridor*0.5,-corridor*0.5,corridor,-corridor]};
         let mut proposals=Vec::new();
         for offset in offsets {
             super::cancellation::checkpoint()?;
@@ -578,7 +585,7 @@ pub fn plan(
                 connection=Some(prefix);break;
             }
         }
-        if reach(from) || connection.is_some() {
+        if reached || connection.is_some() {
             let mut chain = Vec::new();
             let mut current = id;
             while let Some(parent) = nodes[current].parent {
@@ -699,6 +706,25 @@ pub fn plan(
 #[cfg(test)]
 mod identity_tests {
     use super::*;
+    #[test]
+    fn exact_pose_dominance_skips_even_one_ulp_costlier_queue_labels() {
+        let pose = ([0.0, 0.0, 0.4], [0.0, 0.0, 0.0, 1.0]);
+        let current_cost = 1.0_f64;
+        let best = HashMap::from([(key(pose), current_cost)]);
+        let mut node = Node { pose, cost: f64::from_bits(current_cost.to_bits() + 1),
+            parent: None, samples: Vec::new() };
+        assert!(is_stale(&node, &best), "an obsolete exact-pose label must not use expansion work");
+        node.cost = current_cost;
+        assert!(!is_stale(&node, &best));
+        node.cost = f64::from_bits(current_cost.to_bits() - 1);
+        assert!(!is_stale(&node, &best), "a genuinely cheaper label remains eligible");
+        node.cost = 2.0;
+        node.pose.0[0] = -0.0;
+        assert!(!is_stale(&node, &best), "different raw poses cannot be merged");
+        node.pose = (pose.0, pose.1.map(|v| -v));
+        assert!(!is_stale(&node, &best), "quaternion antipodes keep existing exact identity");
+    }
+
     #[test]
     fn raw_pose_key_preserves_all_seven_components_and_antipodes() {
         let pose=([0.0,0.0,0.4],[0.0,0.0,0.0,1.0]);

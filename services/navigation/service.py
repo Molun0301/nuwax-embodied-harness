@@ -1389,8 +1389,52 @@ class NavigationService:
                         return previous_context
                 if previous_fenced and current_goal is None and navigation_state.status == NavigationStatus.IDLE:
                     return previous_context
+                if (
+                    same_identity and old_identity is not None
+                    and current_goal is not previous_context.current_goal
+                ):
+                    # 同一目标 ID 可用于新尝试；旧代次仍属于旧上下文，不能挂到新提交对象。
+                    current_goal = previous_context.current_goal
+            reuse_terminal_state = (
+                previous_context is not None
+                and previous_context.navigation_state.status
+                in {NavigationStatus.SUCCEEDED, NavigationStatus.FAILED, NavigationStatus.CANCELLED}
+                and navigation_state.status == NavigationStatus.IDLE
+                and previous_context.navigation_state.current_goal_id is not None
+                and (current_goal is None or current_goal is previous_context.current_goal)
+            )
+            if reuse_terminal_state:
+                navigation_state = previous_context.navigation_state
+
+            # 帧中的目标与提交中的目标可不同；旧帧只能携带自己的目标，不能结束新目标。
+            incoming_goal_id = navigation_state.current_goal_id
+            if current_goal is not None and current_goal.goal_id != incoming_goal_id:
+                current_goal = None
+            if current_goal is None and previous_context is not None:
+                previous_goal = previous_context.current_goal
+                if previous_goal is not None and previous_goal.goal_id == incoming_goal_id:
+                    current_goal = previous_goal
+            if (
+                self._current_goal is None
+                and current_goal is not None
+                and navigation_state.status in {
+                    NavigationStatus.ACCEPTED, NavigationStatus.PLANNING, NavigationStatus.RUNNING,
+                }
+            ):
+                # 同目标的新尝试可在旧终态之后到达，复用其目标引用，不重建目标或准入凭据。
+                self._current_goal = current_goal
+
+            # 状态机只投影已通过代次/时间检查的权威帧；轻量读取与推送采用同一条路径。
+            # 到达证据仍属于这一帧，不用本地旧状态覆盖后端的运行、重规划或终态。
+            goal_reached = bool(navigation_state.goal_reached)
+            self._state_machine.update_from_backend_state(
+                backend_name=provider.provider_name,
+                backend_status=navigation_state.status.value,
+                message=navigation_state.message,
+                goal_reached=goal_reached,
+                goal_id=incoming_goal_id,
+            )
             if lightweight:
-                goal_reached = bool(navigation_state.goal_reached)
                 context = NavigationContext(
                     current_goal=current_goal,
                     navigation_state=navigation_state,
@@ -1400,69 +1444,22 @@ class NavigationService:
                 )
                 self._latest_navigation_context = context
                 self._navigation_history.append(context)
-                if navigation_state.status in {
-                    NavigationStatus.SUCCEEDED,
-                    NavigationStatus.FAILED,
-                    NavigationStatus.CANCELLED,
-                }:
+                if (
+                    navigation_state.status in {
+                        NavigationStatus.SUCCEEDED, NavigationStatus.FAILED, NavigationStatus.CANCELLED,
+                    }
+                    and self._current_goal is current_goal
+                ):
                     self._current_goal = None
                 return context
-            reuse_terminal_state = (
-                previous_context is not None
-                and previous_context.navigation_state.status
-                in {NavigationStatus.SUCCEEDED, NavigationStatus.FAILED, NavigationStatus.CANCELLED}
-                and navigation_state.status == NavigationStatus.IDLE
-                and previous_context.navigation_state.current_goal_id is not None
-                and (current_goal is None or current_goal is previous_context.current_goal)
-            )
 
             diagnostics = self._build_navigation_diagnostics(provider, navigation_state)
             self._last_navigation_diagnostics = diagnostics
 
-            # 到达证据属于这一帧，不能混用提供器随后收到的另一目标状态。
-            goal_reached = bool(navigation_state.goal_reached)
-            if reuse_terminal_state:
-                navigation_state = previous_context.navigation_state.model_copy(deep=True)
-                current_goal = current_goal or previous_context.current_goal
-                goal_reached = previous_context.goal_reached
-            else:
-                self._state_machine.update_from_backend_state(
-                    backend_name=provider.provider_name,
-                    backend_status=navigation_state.status.value,
-                    message=navigation_state.message,
-                    goal_reached=goal_reached,
-                )
-                current_machine_state = self._state_machine.current_status
-                if current_machine_state != navigation_state.status:
-                    state_summary = self._state_machine.get_state_summary()
-                    navigation_state = navigation_state.model_copy(
-                        update={
-                            "status": current_machine_state,
-                            "message": state_summary.get("message"),
-                        },
-                        deep=True,
-                    )
-                if current_goal is not None and navigation_state.current_goal_id is None:
-                    navigation_state = navigation_state.model_copy(
-                        update={"current_goal_id": current_goal.goal_id},
-                        deep=True,
-                    )
-                if goal_reached and current_machine_state not in {
-                    NavigationStatus.SUCCEEDED,
-                    NavigationStatus.FAILED,
-                    NavigationStatus.CANCELLED,
-                }:
-                    navigation_state = navigation_state.model_copy(
-                        update={
-                            "status": NavigationStatus.SUCCEEDED,
-                            "goal_reached": True,
-                            "message": navigation_state.message or "目标已到达。",
-                        },
-                        deep=True,
-                    )
-
             runtime_metadata = self._build_map_runtime_metadata(
-                map_name=current_goal.map_name if current_goal is not None else None,
+                # 已结束的旧尝试可与新地图并存，只让当前拥有方约束活动地图。
+                map_name=(current_goal.map_name
+                    if current_goal is not None and self._current_goal is current_goal else None),
                 existing_waiting_for=navigation_state.metadata.get("waiting_for"),
                 refresh_localization=False,
             )
@@ -1507,11 +1504,12 @@ class NavigationService:
                     status="available",
                     metadata={"backend_name": provider.provider_name, "navigation_status": navigation_status},
                 )
-            if context.navigation_state.status in {
-                NavigationStatus.SUCCEEDED,
-                NavigationStatus.FAILED,
-                NavigationStatus.CANCELLED,
-            }:
+            if (
+                context.navigation_state.status in {
+                    NavigationStatus.SUCCEEDED, NavigationStatus.FAILED, NavigationStatus.CANCELLED,
+                }
+                and self._current_goal is current_goal
+            ):
                 self._current_goal = None
             return context
 

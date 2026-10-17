@@ -578,14 +578,7 @@ impl SurfaceSnapshot {
         body:[f64;3],normal:[f64;3],x:i32,y:i32)->Option<Vec<T>> {
         let observations=self.observations.as_ref()?;
         let model=self.body_envelope()?;
-        // Without a source terrain anchor carry the calibrated support height
-        // in the gravity frame. Body pitch/roll belongs to the physical prism,
-        // and cannot relabel a horizontal ground band as an obstacle.
-        let (body,normal)=if ground.is_none() {
-            ([body[0],body[1],body[2]+model.body_to_support_z_m*(1.0-normal[2])],[0.0,0.0,1.0])
-        } else {(body,normal)};
         let fine=f64::from(observations.size_m);let size=f64::from(self.config().voxel_size);
-        let contact=model.max_step_up_m.max(model.max_step_down_m)+f64::from(self.source_voxel_size_m())+model.support_uncertainty_m;
         let mut columns=Vec::new();
         for ix in (f64::from(x)*size/fine).floor() as i32..(f64::from(x+1)*size/fine).ceil() as i32 {
             for iy in (f64::from(y)*size/fine).floor() as i32..(f64::from(y+1)*size/fine).ceil() as i32 {
@@ -610,117 +603,141 @@ impl SurfaceSnapshot {
             cache.fine_bands.extend(missing);
         }
         Some(columns.into_iter().map(|(xy,bands)| {
-            // Newly measured layers have source-owned members and a fixed plane.
-            // Legacy columns retain the existing compatibility behavior below.
-            if self.ground_evidence==GroundEvidence::MeasuredSurface {
-                let center=xy.map(|v|(f64::from(v)+0.5)*fine);
-                let mut records=observations.ground_layers(xy).peekable();
-                let any_measured=records.peek().is_some();
-                // A known source anchor fixes the measured physical layer;
-                // missing anchors use only the carried calibrated reference for
-                // association, without creating observed members or a plane.
-                let reference=ground.map_or(body[2]-model.body_to_support_z_m/normal[2],
-                    |ground|self.cell_position(ground)[2]);
-                let uncertainty=f64::from(self.source_voxel_size_m())+model.support_uncertainty_m;
-                let record=records.filter(|record| {
-                    if let Some(ground)=ground {
-                        record.members.iter().any(|&z|(((f64::from(z)+0.5)*fine)/size).floor() as i32==ground.2)
-                    } else {
-                        record.height_at(center).is_some_and(|height|
-                            height-reference<=model.max_step_up_m+uncertainty+1e-6
-                            && reference-height<=model.max_step_down_m+uncertainty+1e-6
-                            && record.normal[2]>=f64::from(self.config().max_slope_deg).to_radians().cos())
-                    }
-                }).min_by(|a,b|(a.height_at(center).unwrap_or(f64::INFINITY)-reference).abs()
-                    .total_cmp(&(b.height_at(center).unwrap_or(f64::INFINITY)-reference).abs()));
-                if let Some(record)=record {
-                    let height=record.height_at(center);
-                    let mut contacts=FineContacts::default();
-                    if T::CONTACTS {for &z in &record.members {
-                        if let Some(last)=contacts.last_mut().filter(|last|last[1].checked_add(1)==Some(z)) {last[1]=z;}
-                        else {contacts.push([z,z]);}
-                    }}
-                    return T::from_parts(xy,height,contacts);
-                }
-                if any_measured {return T::from_parts(xy,None,FineContacts::default());}
-            }
-            let support_offset=model.body_to_support_z_m/normal[2];
-            let body_lower_offset=model.z_bounds_m[0]/normal[2];
-            let uncertainty=f64::from(self.source_voxel_size_m())+model.support_uncertainty_m;
-            let allowance=(-support_offset+contact+1e-6).min(uncertainty);
-            // contact_plane has only two query-local return values. The original
-            // height-dependent fast branch still chooses between them for each Z.
-            let flat=[-normal[0]/normal[2],-normal[1]/normal[2]]==[0.0,0.0];
-            let (rectangular_plane,clipped_plane,upper_plane)=if flat {
-                (body[2],body[2],body[2])
-            } else {
-                (polygon.contact_plane(body,normal,xy[0],xy[1],fine,f64::NEG_INFINITY,0.0),
-                 polygon.contact_plane(body,normal,xy[0],xy[1],fine,f64::INFINITY,0.0),
-                 -polygon.contact_plane([body[0],body[1],-body[2]],[-normal[0],-normal[1],normal[2]],
-                    xy[0],xy[1],fine,f64::INFINITY,0.0))
-            };
-            let lower=clipped_plane-support_offset;
-            let upper=upper_plane-support_offset;
-            let nominal_upper=lower+contact+1e-6;
-            let contact_plane=|top:f64|if top<=rectangular_plane+allowance {rectangular_plane}else{clipped_plane};
-            let reference=(lower+upper)*0.5;
-            let distance=|b:[f64;2]|(b[0]-reference).max(reference-b[1]).max(0.0);
             let bands=bands.expect("批读已填充");
-            let band=bands.iter().min_by(|a,b|distance(a.fit).total_cmp(&distance(b.fit))
-                .then_with(||(a.fit[1]-reference).abs().total_cmp(&(b.fit[1]-reference).abs()))
-                .then_with(||a.fit[1].total_cmp(&b.fit[1])));
-            // Associate the original fit interval with the existing actual-overlap
-            // nominal window. Intersection is a predicate, never a truncated band.
-            let band=band.filter(|candidate|
-                candidate.fit[0].max(upper-contact-1e-6)
-                    <= candidate.fit[1].min(nominal_upper));
-            let height=band.and_then(|band| {
-                // OccupiedVolume still selects only the collapsed fit top here.
-                let first=(band.fit[0]/fine-1.0).round() as i32;
-                let last=band.run[1];
-                (first..=last).rev().find_map(|iz| {
-                    let key=[xy[0],xy[1],iz];
-                    let top=f64::from(iz+1)*fine;
-                    (top<=nominal_upper || prism.intersects(key.map(|v|f64::from(v)*fine),
-                        key.map(|v|f64::from(v+1)*fine))).then_some(top)
-                })
-            });
-            let mut contacts=FineContacts::default();
-            if T::CONTACTS {
-                for candidate in bands.iter() {
-                    let [first,last]=candidate.run;
-                    if Some(candidate)==band {
-                        // Check each original selected-band voxel with the existing
-                        // nominal upper bound and height predicate. Higher intersecting
-                        // voxels remain in `height` and in the original prism checks.
-                        for iz in first..=last {
-                            let top=f64::from(iz+1)*fine;
-                            if top>nominal_upper {continue;}
-                            let plane=contact_plane(top);
-                            let support=plane-support_offset;
-                            let body_lower=plane+body_lower_offset;
-                            if height_rejection(body_lower,support,plane,contact,top,uncertainty).is_none() {
-                                if let Some(run)=contacts.last_mut().filter(|run|run[1].checked_add(1)==Some(iz)) {
-                                    run[1]=iz;
-                                } else {contacts.push([iz,iz]);}
-                            }
+            self.select_fine_ground_value::<T>(observations,model,ground,polygon,prism,
+                body,normal,xy,Some(bands.as_slice()))
+        }).collect())
+    }
+
+    /// One source-owned fine column, shared by batched body checks and live guide hints.
+    /// Measured layers return before any compatibility-band cache access.
+    fn select_fine_ground_value<T:FineGroundValue>(&self,observations:&SurfaceObservations,
+        model:&SurfaceBodyEnvelope,ground:Option<VoxelKey>,polygon:&PolygonQuery,prism:&PrismQuery,
+        body:[f64;3],normal:[f64;3],xy:[i32;2],bands:Option<&[FineContactBand]>)->T {
+        // Without a source terrain anchor carry the calibrated support height
+        // in the gravity frame. Body pitch/roll belongs to the physical prism,
+        // and cannot relabel a horizontal ground band as an obstacle.
+        let (body,normal)=if ground.is_none() {
+            ([body[0],body[1],body[2]+model.body_to_support_z_m*(1.0-normal[2])],[0.0,0.0,1.0])
+        } else {(body,normal)};
+        let fine=f64::from(observations.size_m);let size=f64::from(self.config().voxel_size);
+        let contact=model.max_step_up_m.max(model.max_step_down_m)+f64::from(self.source_voxel_size_m())+model.support_uncertainty_m;
+        // Newly measured layers have source-owned members and a fixed plane.
+        // Legacy columns retain the existing compatibility behavior below.
+        if self.ground_evidence==GroundEvidence::MeasuredSurface {
+            let center=xy.map(|v|(f64::from(v)+0.5)*fine);
+            let mut records=observations.ground_layers(xy).peekable();
+            let any_measured=records.peek().is_some();
+            // A known source anchor fixes the measured physical layer;
+            // missing anchors use only the carried calibrated reference for
+            // association, without creating observed members or a plane.
+            let reference=ground.map_or(body[2]-model.body_to_support_z_m/normal[2],
+                |ground|self.cell_position(ground)[2]);
+            let uncertainty=f64::from(self.source_voxel_size_m())+model.support_uncertainty_m;
+            let record=records.filter(|record| {
+                if let Some(ground)=ground {
+                    record.members.iter().any(|&z|(((f64::from(z)+0.5)*fine)/size).floor() as i32==ground.2)
+                } else {
+                    record.height_at(center).is_some_and(|height|
+                        height-reference<=model.max_step_up_m+uncertainty+1e-6
+                        && reference-height<=model.max_step_down_m+uncertainty+1e-6
+                        && record.normal[2]>=f64::from(self.config().max_slope_deg).to_radians().cos())
+                }
+            }).min_by(|a,b|(a.height_at(center).unwrap_or(f64::INFINITY)-reference).abs()
+                .total_cmp(&(b.height_at(center).unwrap_or(f64::INFINITY)-reference).abs()));
+            if let Some(record)=record {
+                let height=record.height_at(center);
+                let mut contacts=FineContacts::default();
+                if T::CONTACTS {for &z in &record.members {
+                    if let Some(last)=contacts.last_mut().filter(|last|last[1].checked_add(1)==Some(z)) {last[1]=z;}
+                    else {contacts.push([z,z]);}
+                }}
+                return T::from_parts(xy,height,contacts);
+            }
+            if any_measured {return T::from_parts(xy,None,FineContacts::default());}
+        }
+        let support_offset=model.body_to_support_z_m/normal[2];
+        let body_lower_offset=model.z_bounds_m[0]/normal[2];
+        let uncertainty=f64::from(self.source_voxel_size_m())+model.support_uncertainty_m;
+        let allowance=(-support_offset+contact+1e-6).min(uncertainty);
+        // contact_plane has only two query-local return values. The original
+        // height-dependent fast branch still chooses between them for each Z.
+        let flat=[-normal[0]/normal[2],-normal[1]/normal[2]]==[0.0,0.0];
+        let (rectangular_plane,clipped_plane,upper_plane)=if flat {
+            (body[2],body[2],body[2])
+        } else {
+            (polygon.contact_plane(body,normal,xy[0],xy[1],fine,f64::NEG_INFINITY,0.0),
+             polygon.contact_plane(body,normal,xy[0],xy[1],fine,f64::INFINITY,0.0),
+             -polygon.contact_plane([body[0],body[1],-body[2]],[-normal[0],-normal[1],normal[2]],
+                xy[0],xy[1],fine,f64::INFINITY,0.0))
+        };
+        let lower=clipped_plane-support_offset;
+        let upper=upper_plane-support_offset;
+        let nominal_upper=lower+contact+1e-6;
+        let contact_plane=|top:f64|if top<=rectangular_plane+allowance {rectangular_plane}else{clipped_plane};
+        let reference=(lower+upper)*0.5;
+        let distance=|b:[f64;2]|(b[0]-reference).max(reference-b[1]).max(0.0);
+        // Batched body checks pass their existing prefetched bands. A single
+        // guide column loads only its own legacy band, after the measured fast path.
+        let cached;
+        let bands=match bands {
+            Some(bands)=>bands,
+            None=>{cached=self.fine_contact_bands(xy[0],xy[1]);cached.as_slice()},
+        };
+        let band=bands.iter().min_by(|a,b|distance(a.fit).total_cmp(&distance(b.fit))
+            .then_with(||(a.fit[1]-reference).abs().total_cmp(&(b.fit[1]-reference).abs()))
+            .then_with(||a.fit[1].total_cmp(&b.fit[1])));
+        // Associate the original fit interval with the existing actual-overlap
+        // nominal window. Intersection is a predicate, never a truncated band.
+        let band=band.filter(|candidate|
+            candidate.fit[0].max(upper-contact-1e-6)
+                <= candidate.fit[1].min(nominal_upper));
+        let height=band.and_then(|band| {
+            // OccupiedVolume still selects only the collapsed fit top here.
+            let first=(band.fit[0]/fine-1.0).round() as i32;
+            let last=band.run[1];
+            (first..=last).rev().find_map(|iz| {
+                let key=[xy[0],xy[1],iz];
+                let top=f64::from(iz+1)*fine;
+                (top<=nominal_upper || prism.intersects(key.map(|v|f64::from(v)*fine),
+                    key.map(|v|f64::from(v+1)*fine))).then_some(top)
+            })
+        });
+        let mut contacts=FineContacts::default();
+        if T::CONTACTS {
+            for candidate in bands.iter() {
+                let [first,last]=candidate.run;
+                if Some(candidate)==band {
+                    // Check each original selected-band voxel with the existing
+                    // nominal upper bound and height predicate. Higher intersecting
+                    // voxels remain in `height` and in the original prism checks.
+                    for iz in first..=last {
+                        let top=f64::from(iz+1)*fine;
+                        if top>nominal_upper {continue;}
+                        let plane=contact_plane(top);
+                        let support=plane-support_offset;
+                        let body_lower=plane+body_lower_offset;
+                        if height_rejection(body_lower,support,plane,contact,top,uncertainty).is_none() {
+                            if let Some(run)=contacts.last_mut().filter(|run|run[1].checked_add(1)==Some(iz)) {
+                                run[1]=iz;
+                            } else {contacts.push([iz,iz]);}
                         }
-                        continue;
                     }
-                    // An extra band is not a new support anchor. Its complete exposed
-                    // top must fit the existing nominal-support travel at this overlap;
-                    // rigid-body bottom height must not enlarge that travel.
-                    let plane=contact_plane(candidate.fit[1]);
-                    let support=plane-support_offset;
-                    let body_lower=plane+body_lower_offset;
-                    if candidate.fit[1]<=support+contact+1e-6
-                        && height_rejection(body_lower,support,plane,contact,candidate.fit[1],uncertainty).is_none() {
-                        contacts.push([first,last]);
-                    }
+                    continue;
+                }
+                // An extra band is not a new support anchor. Its complete exposed
+                // top must fit the existing nominal-support travel at this overlap;
+                // rigid-body bottom height must not enlarge that travel.
+                let plane=contact_plane(candidate.fit[1]);
+                let support=plane-support_offset;
+                let body_lower=plane+body_lower_offset;
+                if candidate.fit[1]<=support+contact+1e-6
+                    && height_rejection(body_lower,support,plane,contact,candidate.fit[1],uncertainty).is_none() {
+                    contacts.push([first,last]);
                 }
             }
-            T::from_parts(xy,height,contacts)
-        }).collect())
+        }
+        T::from_parts(xy,height,contacts)
     }
 
     /// 接触关联与包络复用实际相交精细列的地面高度；缺精细依据时仍保留粗层。
@@ -1071,22 +1088,23 @@ impl SurfaceSnapshot {
         let radius=bounds_xy.into_iter().map(|p|(p[0]-reference_body.0[0]).hypot(p[1]-reference_body.0[1]))
             .fold(0.0,f64::max)+coarse*2.0;
         let patch=centre.map(|c|self.ground_patch(c,radius));
+        // A detour hint must interpret the same source-local floor as the body
+        // checker, even when the center has no observed/connected ground anchor.
+        // The query rectangle only selects existing columns; it creates no floor.
+        let rectangle=[bounds_xy[0],[bounds_xy[1][0],bounds_xy[0][1]],
+            bounds_xy[1],[bounds_xy[0][0],bounds_xy[1][1]]];
+        let polygon=PolygonQuery::new(&rectangle);
+        let prism=PrismQuery::new(model,r,reference_body.0);
         let mut result=Vec::new();
         for frame in &recent.frames {for (&[x,y],zs) in frame.columns.range(low..=high) {
             if y<low[1] || y>high[1] {continue;}
             let xy=[x,y].map(|v|(f64::from(v)+0.5)*fine);
             let column=xy.map(|v|(v/coarse).floor() as i32);
             let ground=patch.as_ref().and_then(|p|p.get(&(column[0],column[1]))).copied();
-            let height=ground.and_then(|ground| {
-                let base=self.cell_position(ground)[2];
-                if let Some(observations)=&self.observations {
-                    let records:Vec<_>=observations.ground_layers([x,y]).collect();
-                    if !records.is_empty() {return records.into_iter().filter(|record|record.members.iter().any(|&z|
-                        (((f64::from(z)+0.5)*fine)/coarse).floor() as i32==ground.2))
-                        .filter_map(|record|record.height_at(xy)).min_by(|a,b|(a-base).abs().total_cmp(&(b-base).abs()));}
-                }
-                Some(base)
-            });
+            let height=if let Some(observations)=&self.observations {
+                self.select_fine_ground_value::<FineGroundHeight>(observations,model,ground,&polygon,&prism,
+                    reference_body.0,r[2],[x,y],None).0
+            } else {ground.map(|ground|self.cell_position(ground)[2])};
             let plane=reference_body.0[2]-((xy[0]-reference_body.0[0])*r[2][0]+(xy[1]-reference_body.0[1])*r[2][1])/r[2][2];
             let z_low=plane+model.z_bounds_m[0]/r[2][2];let z_high=plane+model.z_bounds_m[1]/r[2][2];
             for &z in zs {

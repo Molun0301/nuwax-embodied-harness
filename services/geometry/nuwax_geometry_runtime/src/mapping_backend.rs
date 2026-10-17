@@ -3279,3 +3279,7 @@ mod tests {
         assert!(voxel.current_window.is_empty());
     }
 }
+
+#[cfg(test)]
+#[path = "mapping_backend_ray_count_equivalence_tests.rs"]
+pub(crate) mod ray_count_equivalence_tests;

@@ -7166,19 +7166,17 @@ impl GeometryRuntime for GeometryRuntimeService {
             object, block_revision: wire_block.block_revision, geometry_revision: wire_block.geometry_revision,
             points: wire_block.points,
         };
-        let receiver = self.bridge.read_navigation_map_block(&root, &reference).map_err(Status::failed_precondition)?;
-        let mut data = receiver.await.map_err(|e| Status::unavailable(e.to_string()))?.map_err(Status::not_found)?;
-        let total_bytes = data.len() as u32;
-        if request.schema_version == 3 {
-            let start = request.offset as usize;
-            if start >= data.len() { return Err(Status::invalid_argument("fine-map block offset exceeds object")); }
-            let end = data.len().min(start + request.max_bytes as usize);
-            // 每段仍读取同一保留根中的不可变对象；不在服务端累积下载会话。
-            data = data[start..end].to_vec();
-        }
+        // 每段仍由原任务拥有方固定同一保留根，只读取所需范围，不积累下载会话。
+        let range = (request.schema_version == 3)
+            .then_some((request.offset as usize, request.max_bytes as usize));
+        let receiver = self.bridge.read_navigation_map_block(&root, &reference, range).map_err(Status::failed_precondition)?;
+        let read = receiver.await.map_err(|e| Status::unavailable(e.to_string()))?.map_err(Status::not_found)?;
+        let nuwax_map_chunks::ObjectRangeRead::Data { bytes: data, total_bytes } = read else {
+            return Err(Status::invalid_argument("fine-map block offset exceeds object"));
+        };
         Ok(Response::new(NavigationMapBlockResponse {
             schema_version: request.schema_version, root: request.root, block: request.block, data,
-            offset: request.offset, total_bytes: if request.schema_version == 3 { total_bytes } else { 0 },
+            offset: request.offset, total_bytes: if request.schema_version == 3 { total_bytes as u32 } else { 0 },
         }))
     }
 
@@ -15515,10 +15513,14 @@ async fn assigned_mapping_cloud_boundary_slice(
                 .pin_fine_map_root(&old_fine.manifest().identity(), reference)
                 .expect("old published root remains pinnable after frame rehome/export");
             assert!(Arc::ptr_eq(&pinned, &old_fine));
-            let fetched = handle.read_navigation_map_block(&old_fine.manifest().identity(), reference)
+            let fetched = handle.read_navigation_map_block(&old_fine.manifest().identity(), reference, None)
                 .expect("admit fetch under retained old root")
                 .await.expect("retained fetch completion").expect("retained old object bytes");
+            let nuwax_map_chunks::ObjectRangeRead::Data { bytes: fetched, total_bytes: total } = fetched else {
+                panic!("full retained read cannot be out of range");
+            };
             assert_eq!(fetched, bytes_before);
+            assert_eq!(total, bytes_before.len());
         }
 
         // A later odometry observation must not reseal the already anchored root.
@@ -15606,9 +15608,10 @@ async fn assigned_mapping_cloud_boundary_slice(
         }
         assert_eq!(joined,expected);
         for (offset,max_bytes) in [(0,0),(expected.len() as u32,7),(0,nuwax_map_chunks::MAX_BLOCK_TRANSFER_PART_BYTES as u32+1)] {
-            assert!(GeometryRuntime::get_navigation_map_block(&service,Request::new(NavigationMapBlockRequest {
+            let error = GeometryRuntime::get_navigation_map_block(&service,Request::new(NavigationMapBlockRequest {
                 schema_version:3,root:Some(wire_root.clone()),block:Some(wire_block.clone()),offset,max_bytes,
-            })).await.is_err());
+            })).await.unwrap_err();
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
         }
         for schema_version in [0, 1, 4] {
             assert!(GeometryRuntime::get_navigation_map_block(&service, Request::new(NavigationMapBlockRequest {
@@ -15620,6 +15623,8 @@ async fn assigned_mapping_cloud_boundary_slice(
         })).await.unwrap();
         assert!(owner.task_owner.shutdown().await.producers_settled());
     }
+
+    include!("navigation_block_unit_transport_tests.rs");
 
     #[tokio::test]
     async fn checkpoint_v2_flush_keeps_the_actual_first_pose_frame() {

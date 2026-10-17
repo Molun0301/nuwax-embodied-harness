@@ -3207,12 +3207,20 @@ pub struct GeometryRuntimeHandle {
 impl GeometryRuntimeHandle {
     /// 缺片读取保留到原根任务集合，客户端取消也等待实际文件读取结束。
     pub(crate) fn read_navigation_map_block(&self, root: &nuwax_map_chunks::RootIdentity,
-        reference: &nuwax_map_chunks::BlockRef) -> Result<oneshot::Receiver<Result<Vec<u8>, String>>, String> {
+        reference: &nuwax_map_chunks::BlockRef, range: Option<(usize, usize)>)
+        -> Result<oneshot::Receiver<Result<nuwax_map_chunks::ObjectRangeRead, String>>, String> {
         let fine = self.cloud_map_writer.lock().as_ref().ok_or("fine-map owner is unavailable")?
             .pin_fine_map_root(root, reference)?;
         let object = reference.object;
         self.register_navigation_map_operation(async move {
-            tokio::task::spawn_blocking(move || fine.repository.read_object(object, nuwax_map_chunks::MAX_BLOCK_BYTES))
+            tokio::task::spawn_blocking(move || match range {
+                Some((offset, maximum)) => fine.repository.read_object_range(
+                    object, nuwax_map_chunks::MAX_BLOCK_BYTES, offset, maximum),
+                None => fine.repository.read_object(object, nuwax_map_chunks::MAX_BLOCK_BYTES)
+                    .map(|bytes| nuwax_map_chunks::ObjectRangeRead::Data {
+                        total_bytes: bytes.len(), bytes,
+                    }),
+            })
                 .await.map_err(|e| e.to_string()).and_then(|v| v)
         })
     }

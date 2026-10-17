@@ -1233,3 +1233,7 @@ mod complete_guide_turn_tests {
     }
 
 }
+
+#[cfg(test)]
+#[path = "terminal_turn_selection_diagnostic_tests.rs"]
+mod terminal_turn_selection_diagnostic_tests;

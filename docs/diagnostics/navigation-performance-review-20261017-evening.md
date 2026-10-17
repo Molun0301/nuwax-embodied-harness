@@ -130,7 +130,16 @@ flowchart TD
 
 ## 本阶段交付边界
 
-本次提交包含已验证的 MLS、PCT/Scan、异步调度、地图块范围读取方法和 Python 工具入口。第一阶段之后，geometry Writer 关联优化已补齐实际回归和独占关联 A/B，作为后续单独阶段交付。RPC owner 接线和探索错误归因仍在同一工作区继续验证，尚未随该阶段交付。真实 LCM 服务测试在缺少 multicast 路由的初始化阶段失败；后续补明确命名的进程内服务测试，不将其冒充真实传输覆盖。
+本次提交包含已验证的 MLS、PCT/Scan、异步调度、地图块范围读取方法和 Python 工具入口。第一阶段之后，geometry Writer 关联优化已补齐实际回归和独占关联 A/B，作为后续单独阶段交付。后续第三阶段已完成 RPC owner 接线的 4 项明确 unit_transport 服务回归，包含错误分层、完整末片、换 frame 保留旧根及已接纳但排队等待 IO 的请求取消。真实 LCM 服务测试仍在缺少 multicast 路由的初始化阶段失败，进程内服务测试不等于真实传输覆盖。
+
+## 第三阶段：探索任务资格与错误归因
+
+- 真实返航核已返回 ResourceLimited，探索 owner 却提前归为连续失败。已保留底层错误类型，将未决资源结果映射到既有 PlanningResourceLimited；真实 owner 完整回归与 candidate 对照通过，不增加重试线程或导航门槛
+- 真实 composite builder 证明地图输入完全相同，仅 committed_map revision/sequence 前进时，旧实现会在 Accept 前 Discard 或 Accept 后 Cancelled。两项实际红测保留
+- 修复只对 Surface：完整 same_source_view 不变、原坐标域相同且提交单调前进时保留计算。Planar 仍要求原完整身份相等。GoalIntent 保留捕获时的原始来源，不改写成新提交
+- 复用导航现有域比较函数，保留 session、generation、frame、boot 与真实 ground/observations/recent-obstacle/mask 的资格；7 项正负例及无 LCM 的生产准入函数测试全部通过
+- 终点附近转向的另一个怀疑经真实几何测试不成立：默认 256 预算下受阻中心公开入口只展开 4 次就成功，开放中心也成功。该场景关闭缺陷假设，保留 3 项诊断回归，没有修改生产搜索优先级
+- 射线历史点物化优化前，6 项真实 kernel/PGO 基线已通过并保存完整业务数据；包含节流、flush、检查点恢复、48 帧 interval=0、并行分片和取消后继续。生产射线优化尚未包含在本阶段
 
 ## 后续持续检查
 

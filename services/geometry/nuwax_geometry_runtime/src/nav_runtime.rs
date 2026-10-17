@@ -2472,6 +2472,18 @@ fn rejected_goal_intent(goal_id: String, reason: impl Into<String>) -> SetGoalOu
     }
 }
 
+/// Coordinate/commit domain shared by navigation admission and frozen Surface work.
+/// Revision and receipt fields are not part of the coordinate/commit domain.
+pub(crate) fn same_committed_map_domain(
+    source: &schema::CommittedMapIdentity,
+    current: &schema::CommittedMapIdentity,
+) -> bool {
+    source.session_id == current.session_id
+        && source.session_generation == current.session_generation
+        && source.frame_id == current.frame_id
+        && source.commit_boot_nonce == current.commit_boot_nonce
+}
+
 fn goal_map_rejection(admission: &NavAdmissionContext, source: &schema::CommittedMapIdentity,
     frame_generation: i64, goal_id: &str, source_prevalidated: bool) -> Option<SetGoalOutcome> {
     if admission.mapping_adapter.as_ref().is_some_and(|a| a.lock().checkpoint_localization_required) {
@@ -2485,8 +2497,7 @@ fn goal_map_rejection(admission: &NavAdmissionContext, source: &schema::Committe
         outcome.retry_reason = Some(SetGoalRetryReason::MapRevisionAdvanced);
         return Some(outcome);
     };
-    let same_domain = source.session_id == current.session_id && source.session_generation == current.session_generation && source.frame_id == current.frame_id
-        && source.commit_boot_nonce == current.commit_boot_nonce;
+    let same_domain = same_committed_map_domain(source, &current);
     if frame_generation < 0 || !same_domain || frame_generation != admission.map_frame_generation() {
         return Some(rejected_goal_intent_with_reason(goal_id.into(), "map session or coordinate generation changed before admission", SetGoalRejectReason::MapFrameChanged));
     }
@@ -4135,6 +4146,124 @@ mod tests {
             assert_eq!(goal_map_rejection(&context,&source,frame,"before-localized",verified).unwrap().retry_reason,
                 Some(SetGoalRetryReason::NavigationNotReady(NavigationReadinessCode::PlannerNotReady)));
         }
+    }
+
+    #[test]
+    fn goal_map_rejection_previous_source_uses_authority_without_transport() {
+        // Exercise the production admission function without GeometryRuntimeHandle,
+        // LcmTransport, socket readiness, or a running mapping/navigation backend.
+        let current = schema::CommittedMapIdentity {
+            session_id: "surface-map-admission".into(),
+            session_generation: 1,
+            revision: 3,
+            commit_boot_nonce: [7; 16],
+            commit_sequence: 3,
+            source_timestamp_ns: 3,
+            frame_id: "map".into(),
+        };
+        let authority = Arc::new(StdMutex::new(Some(current.clone())));
+        let (_revision_tx, revision_rx) = tokio::sync::watch::channel(None);
+        let adapter = Arc::new(parking_lot::Mutex::new(
+            crate::mapping_adapter::MappingAdapter::new(crate::mapping_adapter::MappingAdapterConfig {
+                resolution: 0.1,
+                width_cells: 4,
+                height_cells: 4,
+                origin_xy: (0.0, 0.0),
+                voxel_size: 0.1,
+                initial_safe_radius_meters: 0.0,
+            }),
+        ));
+        let context = NavAdmissionContext::new(
+            Arc::new(tokio::sync::Mutex::new(())),
+            authority.clone(),
+            revision_rx,
+        )
+        .with_mapping_adapter(Some(adapter.clone()))
+        .with_previous_map_revisions(true);
+        let frame = context.map_frame_generation();
+        let mut source = current.clone();
+        source.revision = 2;
+        source.commit_sequence = 2;
+        source.source_timestamp_ns = 2;
+        let original = source.clone();
+        for prevalidated in [false, true] {
+            assert!(goal_map_rejection(&context, &current, frame, "exact", prevalidated).is_none());
+            assert!(goal_map_rejection(&context, &source, frame, "previous", prevalidated).is_none());
+            for field in ["session", "session_generation", "frame_id", "boot"] {
+                let mut foreign = source.clone();
+                match field {
+                    "session" => foreign.session_id.push_str("-replacement"),
+                    "session_generation" => foreign.session_generation += 1,
+                    "frame_id" => foreign.frame_id = "other-map".into(),
+                    _ => foreign.commit_boot_nonce[0] ^= 1,
+                }
+                assert_eq!(
+                    goal_map_rejection(&context, &foreign, frame, field, prevalidated)
+                        .unwrap()
+                        .reject_reason,
+                    Some(SetGoalRejectReason::MapFrameChanged),
+                    "{field} must not be qualified by an older revision"
+                );
+            }
+            for wrong_frame in [-1, frame + 1] {
+                assert_eq!(
+                    goal_map_rejection(&context, &source, wrong_frame, "frame", prevalidated)
+                        .unwrap()
+                        .reject_reason,
+                    Some(SetGoalRejectReason::MapFrameChanged)
+                );
+            }
+            let mut conflict = source.clone();
+            conflict.revision = current.revision;
+            assert!(
+                goal_map_rejection(&context, &conflict, frame, "conflict", prevalidated)
+                    .unwrap()
+                    .retry_reason
+                    .is_none()
+            );
+            let mut future = current.clone();
+            future.revision += 1;
+            future.commit_sequence += 1;
+            assert!(goal_map_rejection(&context, &future, frame, "future", prevalidated).is_some());
+        }
+        for strict in [
+            context.clone().with_previous_map_revisions(false),
+            context.clone().with_mapping_adapter(None),
+        ] {
+            let frame = strict.map_frame_generation();
+            assert_eq!(
+                goal_map_rejection(&strict, &source, frame, "strict", false)
+                    .unwrap()
+                    .retry_reason,
+                Some(SetGoalRetryReason::MapRevisionAdvanced)
+            );
+            // The existing explicitly prevalidated path is independent of policy.
+            assert!(goal_map_rejection(&strict, &source, frame, "verified", true).is_none());
+        }
+        adapter.lock().checkpoint_localization_required = true;
+        for prevalidated in [false, true] {
+            assert_eq!(
+                goal_map_rejection(&context, &source, frame, "unlocalized", prevalidated)
+                    .unwrap()
+                    .retry_reason,
+                Some(SetGoalRetryReason::NavigationNotReady(
+                    NavigationReadinessCode::PlannerNotReady
+                ))
+            );
+        }
+        adapter.lock().checkpoint_localization_required = false;
+        assert_eq!(
+            source, original,
+            "admission must never relabel old provenance"
+        );
+        assert_eq!(authority.lock().unwrap().as_ref(), Some(&current));
+        *authority.lock().unwrap() = None;
+        assert_eq!(
+            goal_map_rejection(&context, &source, frame, "missing-authority", false)
+                .unwrap()
+                .retry_reason,
+            Some(SetGoalRetryReason::MapRevisionAdvanced)
+        );
     }
 
     #[tokio::test]

@@ -319,7 +319,6 @@ impl ComputeBasis {
             || self.generation != inner.generation
             || self.parent != inner.last_request_id
             || expected_history != inner.compute.history
-            || self.committed_map != inner.committed_map
             || self.frame != input_frame(inner)
             || inner.pending_child_cancellation.is_some()
             || inner
@@ -334,10 +333,26 @@ impl ComputeBasis {
             return false;
         }
         match (&self.input, &inner.surface_mode, &inner.costmap_input) {
-            (ComputeInput::Planar(before), None, Some(now)) => Arc::ptr_eq(before, now),
+            (ComputeInput::Planar(before), None, Some(now)) => {
+                self.committed_map == inner.committed_map && Arc::ptr_eq(before, now)
+            }
             (ComputeInput::Surface { original, .. }, Some(mode), _) => {
+                // A same-view composite receipt may advance without changing the
+                // frozen computation. Keep its original identity for GoalIntent;
+                // domain changes and conflicting/non-monotonic commits still fail.
+                let map_current = self.committed_map == inner.committed_map
+                    || self
+                        .committed_map
+                        .as_ref()
+                        .zip(inner.committed_map.as_ref())
+                        .is_some_and(|(before, now)| {
+                            crate::nav_runtime::same_committed_map_domain(before, now)
+                                && before.revision < now.revision
+                                && before.commit_sequence < now.commit_sequence
+                        });
                 mode.accepting
                     && mode.input_ready
+                    && map_current
                     && mode
                         .receiver
                         .freeze()
@@ -1664,9 +1679,14 @@ fn drain_locked(
         {
             if let ComputeProjection::Selection(selection) = &output.projection {
                 if let Some(Err(error)) = &selection.mission {
+                    let reason = if error.is_inconclusive() {
+                        ExplorationStopReason::PlanningResourceLimited
+                    } else {
+                        ExplorationStopReason::ConsecutiveFailuresExceeded
+                    };
                     context.retain_stop(
                         inner,
-                        ExplorationStopReason::ConsecutiveFailuresExceeded,
+                        reason,
                         format!("返航路线核验失败：{error}"),
                     )?;
                 } else {

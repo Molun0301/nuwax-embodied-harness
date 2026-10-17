@@ -1615,3 +1615,7 @@ mod tests {
     }
 
 }
+
+#[cfg(test)]
+#[path = "pgo_ray_count_equivalence_tests.rs"]
+mod ray_count_equivalence_tests;

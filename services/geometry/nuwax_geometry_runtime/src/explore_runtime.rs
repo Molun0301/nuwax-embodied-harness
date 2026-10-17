@@ -9110,6 +9110,15 @@ mod tests {
 
     #[tokio::test]
     async fn mission_inconclusive_candidate_does_not_blacklist_or_return() {
+        assert_mission_inconclusive_route_does_not_blacklist_or_return(false).await;
+    }
+
+    #[tokio::test]
+    async fn mission_inconclusive_homeward_keeps_resource_reason_through_owner() {
+        assert_mission_inconclusive_route_does_not_blacklist_or_return(true).await;
+    }
+
+    async fn assert_mission_inconclusive_route_does_not_blacklist_or_return(homeward: bool) {
         use nuwax_exploration::{ExplorationGoalSource, ExplorationSourceDiagnostics, ExploreResult};
         struct CandidateSource(Arc<StdMutex<Vec<ExplorationGoalFeedback>>>, Option<ExplorationPoll>);
         impl ExplorationGoalSource for CandidateSource {
@@ -9163,17 +9172,37 @@ mod tests {
         }).await;
         assert_eq!(accepted.status,STATUS_ACCEPTED,"{}",accepted.message);
         enable_test_mission(&handle,None).await;
+        let pose=surface_pose(&snapshot,0.0,Quaternion::IDENTITY);
+        if homeward {
+            // The real non-rotating route query is inconclusive at the first
+            // (homeward) leg, before candidate advice can be produced.
+            let mut home=mission_pose(&pose);
+            let q=Quaternion::from_yaw(std::f64::consts::FRAC_PI_2);
+            home.orientation_xyzw=[q.x,q.y,q.z,q.w];
+            handle.inner.lock().await.mission=Some(MissionProgress::new(home).unwrap());
+        }
         let feedback=Arc::new(StdMutex::new(Vec::new()));
         let mut controller=ExplorationController::new(ExplorationArbitrationPolicy::FirstAvailable);
         controller.add_source(CandidateSource(feedback.clone(),None));controller.begin_exploration().unwrap();
         handle.install_compute_controller(controller).await.unwrap();
-        let stopped=handle.tick_with_pose(surface_pose(&snapshot,0.0,Quaternion::IDENTITY)).await;
+        let stopped=handle.tick_with_pose(pose).await;
+        owner_watchdog(handle.await_compute_idle()).await.unwrap();
         assert_eq!(stopped.status,STATUS_FAILED,"{}",stopped.message);
         assert_eq!(stopped.last_stop_reason,"planning_resource_limited","{}",stopped.message);
-        assert!(stopped.message.contains("inconclusive"));
-        assert!(feedback.lock().unwrap().is_empty(),"inconclusive planning must not poison failure history");
+        if !homeward {
+            assert!(stopped.message.contains("inconclusive"));
+        }
+        if homeward {
+            assert!(matches!(feedback.lock().unwrap().as_slice(),[ExplorationGoalFeedback::Cancelled]),
+                "the accepted, undispatched goal must be retired once without failed-goal feedback");
+        } else {
+            assert!(feedback.lock().unwrap().is_empty(),"inconclusive planning must not poison failure history");
+        }
         assert!(sink.submitted.lock().unwrap().is_empty());
-        assert!(handle.inner.lock().await.return_reason.is_none());
+        let guard=handle.inner.lock().await;
+        assert!(!guard.logical_active);
+        assert!(guard.return_reason.is_none());
+        assert!(guard.mission.as_ref().is_some_and(|mission|!mission.returning));
     }
 
     #[tokio::test]

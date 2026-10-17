@@ -192,6 +192,8 @@ struct PreparedJob {
 pub(super) struct ExploreComputeBackend {
     controller: ExplorationController,
     prepared: Option<PreparedJob>,
+    // 唯一 worker 只保留同一 controller/config 的一份私有查询，不共享源缓存。
+    surface_planning: Option<(Arc<ExploreStartConfig>, FrozenSurfacePlanningInput)>,
 }
 
 impl ExploreComputeBackend {
@@ -200,6 +202,7 @@ impl ExploreComputeBackend {
         Self {
             controller,
             prepared: None,
+            surface_planning: None,
         }
     }
 
@@ -208,6 +211,25 @@ impl ExploreComputeBackend {
             self.prepared.is_none(),
             "resolve exploration work before another operation"
         );
+    }
+
+    fn selection_planning(&mut self, context: &ComputeContext) -> Option<FrozenSurfacePlanningInput> {
+        let ComputeInput::Surface { original, .. } = &context.input else {
+            self.surface_planning = None;
+            return None;
+        };
+        if original.snapshot().is_none() {
+            self.surface_planning = None;
+            return Some(original.fork_for_planning());
+        }
+        // 标定由 controller 生命周期固定；地图配置/证据由完整 source view 资格覆盖。
+        // 新 ExploreStartConfig（含 boundary）即冷失效，不比较局部字段或扫描地图。
+        let planning = self.surface_planning.as_ref()
+            .filter(|(config, _)| Arc::ptr_eq(config, &context.config))
+            .and_then(|(_, planning)| planning.rebind_original(original))
+            .unwrap_or_else(|| original.fork_for_planning());
+        self.surface_planning = Some((Arc::clone(&context.config), planning.clone()));
+        Some(planning)
     }
 
     fn prepare_request(
@@ -260,6 +282,14 @@ impl ExploreComputeBackend {
                 }
             }
         };
+        // 未完成或不可用的选择不延长私有查询生命；不改变 delta 的结算协议。
+        if matches!(&projection, ComputeProjection::Cancelled)
+            || matches!(&projection, ComputeProjection::Selection(selection)
+                if selection.cancelled || matches!(&selection.poll,
+                    Err(_) | Ok(ExplorationPoll::SourceUnavailable(_))))
+        {
+            self.surface_planning = None;
+        }
         self.prepared = Some(PreparedJob {
             #[cfg(test)]
             attribution,
@@ -277,7 +307,7 @@ impl ExploreComputeBackend {
         cancellation: Option<&std::sync::atomic::AtomicBool>,
     ) -> (ComputeProjection, bool) {
         let SelectionRequest { context, progress } = request;
-        let planning = context.input.fork_for_planning();
+        let planning = self.selection_planning(&context);
         if cancelled() {
             return (ComputeProjection::Cancelled, false);
         }
@@ -442,6 +472,7 @@ impl Backend for ExploreComputeBackend {
             .map(|trace| trace.begin(attribution::Stage::OwnerFinalization, 0));
         match decision {
             Decision::Discard => {
+                self.surface_planning = None;
                 if prepared.controller_prepared {
                     // A failed discard is a poisoned transaction, not a successful
                     // discard acknowledgement. Panic is caught by the exchange.
@@ -461,6 +492,9 @@ impl Backend for ExploreComputeBackend {
                     // ID generators run at commit. Goal pose and mission route
                     // inputs do not change, so the ordered query results stay put.
                     // Preserve a real commit error even for a cancelled projection.
+                    if result.is_err() {
+                        self.surface_planning = None;
+                    }
                     selection.poll = result;
                 }
                 Settlement::Accepted(ComputeFinalized {
@@ -486,6 +520,8 @@ impl Backend for ExploreComputeBackend {
 
     fn lifecycle(&mut self, operation: Self::Lifecycle) -> Self::LifecycleAck {
         self.assert_settled();
+        // Stop/Install/Retire/导出均不继承查询；失败的生命周期操作同样冷失效。
+        self.surface_planning = None;
         let result = match operation {
             ComputeLifecycle::Install {
                 controller,

@@ -3,6 +3,42 @@
 // Every selection, staged delta, commit, discard and feedback below delegates to
 // the real SurfaceGoalSourceAdapter. No LCM, network, hardware or clock rewrites.
 
+#[derive(Clone, Default)]
+struct SurfaceOwnerFrontierWork(Arc<StdMutex<(usize, usize)>>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SurfaceOwnerFrontierWork {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        if event.metadata().target() != "navigation.surface.frontier.rebuild" {
+            return;
+        }
+        #[derive(Default)]
+        struct Cells(Option<usize>);
+        impl tracing::field::Visit for Cells {
+            fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+                if field.name() == "evaluated_cells" {
+                    self.0 = Some(usize::try_from(value).unwrap());
+                }
+            }
+            fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+        }
+        let mut cells = Cells::default();
+        event.record(&mut cells);
+        let mut work = self.0.lock().unwrap();
+        work.0 += 1;
+        work.1 += cells.0.expect("actual rebuild event must report evaluated_cells");
+    }
+}
+
+fn capture_surface_owner_frontier_work<T>(prepare: impl FnOnce() -> T) -> (T, usize, usize) {
+    use tracing_subscriber::prelude::*;
+    let work = SurfaceOwnerFrontierWork::default();
+    // 同步闭包在真实 owner worker 上执行；只观察本次 prepare，无全局 subscriber。
+    let result = tracing::subscriber::with_default(
+        tracing_subscriber::registry().with(work.clone()), prepare);
+    let (rebuilds, cells) = *work.0.lock().unwrap();
+    (result, rebuilds, cells)
+}
+
 #[derive(Clone)]
 struct SurfaceOwnerCapture {
     original: nuwax_exploration::FrozenSurfaceInput,
@@ -16,6 +52,8 @@ struct SurfaceOwnerCapture {
     source_frontier_before: Option<nuwax_nav_mls_planner::SurfaceFrontierCacheStats>,
     source_frontier_after: Option<nuwax_nav_mls_planner::SurfaceFrontierCacheStats>,
     private_query: std::sync::Weak<SurfaceSnapshot>,
+    frontier_rebuilds: usize,
+    frontier_evaluated_cells: usize,
 }
 
 #[derive(Default)]
@@ -72,7 +110,9 @@ impl ExplorationGoalSource for GatedRealSurfaceSource {
         let private_frontier_before = query.frontier_cache_stats();
         let source_frontier_before = original.snapshot().unwrap().frontier_cache_stats();
         let checkpoint_before = self.source.checkpoint()?;
-        let prepared = self.source.prepare_poll(state)?;
+        let (prepared, frontier_rebuilds, frontier_evaluated_cells) =
+            capture_surface_owner_frontier_work(|| self.source.prepare_poll(state));
+        let prepared = prepared?;
         let checkpoint_after = self.source.checkpoint()?;
         let private_frontier_after = query.frontier_cache_stats();
         let source_frontier_after = original.snapshot().unwrap().frontier_cache_stats();
@@ -92,6 +132,8 @@ impl ExplorationGoalSource for GatedRealSurfaceSource {
                 source_frontier_before,
                 source_frontier_after,
                 private_query,
+                frontier_rebuilds,
+                frontier_evaluated_cells,
             });
         // The real source has finished preparing, but no proposal is visible to
         // the actor yet. Take makes the hold one-shot; later progress is real.
@@ -296,6 +338,9 @@ async fn finish_surface_owner_success(
     owner_watchdog(handle.await_compute_idle()).await.unwrap();
     handle.request_compute_shutdown().await;
     owner_watchdog(handle.compute_service.join()).await.unwrap();
+    assert!(audit.lock().unwrap().captures.iter()
+        .all(|capture| capture.private_query.upgrade().is_none()),
+        "stop and owner shutdown must release every retained private query");
 }
 
 #[tokio::test]
@@ -421,6 +466,10 @@ async fn compute_owner_surface_repeated_same_root_receipts_preserve_capture_then
         );
     }
     assert_eq!(handle.inner.lock().await.reached_goals, 0);
+    let inspection = owner_watchdog(handle.inspect_compute_checkpoint()).await.unwrap();
+    assert!(!inspection.is_empty());
+    assert!(audit.lock().unwrap().captures[0].private_query.upgrade().is_some(),
+        "active checkpoint inspection must not clear the private query");
     // The only newer observation arrived DURING preparation. A commit which
     // accidentally consumed the live notification would strand this next tick.
     let next =
@@ -507,38 +556,31 @@ async fn compute_owner_surface_repeated_same_root_receipts_preserve_capture_then
     assert!(sink.cancelled.lock().unwrap().is_empty());
     {
         let audit = audit.lock().unwrap();
-        // This is a BASELINE workload witness, not the optimized acceptance
-        // assertion. An empty cache before each call makes the reported last
-        // calculation unambiguously work performed by that particular call.
+        // 首次实际重建必须被观察到；暖统计仅作诊断，不能计成本次工作。
         let source_cells = snapshot.cell_keys().count();
         assert!(source_cells > 0);
-        let mut cold_evaluated = 0;
+        let first_query = &audit.captures[0].private_query;
+        let mut rebuilt_cells = 0;
         for (index, capture) in audit.captures.iter().enumerate() {
-            assert!(capture.private_frontier_before.is_none(), "capture {index}");
+            assert_eq!(capture.private_frontier_before.is_none(), index == 0, "capture {index}");
+            assert!(capture.private_frontier_after.is_some(), "capture {index}");
             assert!(capture.source_frontier_before.is_none(), "capture {index}");
             assert!(capture.source_frontier_after.is_none(), "capture {index}");
-            assert!(capture.private_query.upgrade().is_none(),
-                "the baseline disposes of each private query after preparation");
+            assert!(std::sync::Weak::ptr_eq(first_query, &capture.private_query));
+            assert!(capture.private_query.upgrade().is_some());
+            assert_eq!(capture.frontier_rebuilds, usize::from(index == 0), "capture {index}");
+            assert_eq!(capture.frontier_evaluated_cells,
+                if index == 0 { source_cells } else { 0 }, "capture {index}");
+            rebuilt_cells += capture.frontier_evaluated_cells;
             match capture.preview.as_ref().unwrap() {
-                ExplorationPoll::Goal(_) => {
-                    assert!(matches!(index, 0 | 1 | 3));
-                    let stats = capture.private_frontier_after.expect("selection builds an index");
-                    assert!(!stats.incremental, "capture {index}: {stats:?}");
-                    assert_eq!(stats.retained_frontiers, 0, "capture {index}");
-                    assert_eq!(stats.evaluated_cells, source_cells, "capture {index}");
-                    cold_evaluated += stats.evaluated_cells;
-                    eprintln!("surface_owner_frontier_work capture={index} outcome=Goal cold=true evaluated_cells={} source_cells={source_cells}",
-                        stats.evaluated_cells);
-                }
-                ExplorationPoll::Pending => {
-                    assert_eq!(index, 2);
-                    assert!(capture.private_frontier_after.is_none());
-                    eprintln!("surface_owner_frontier_work capture={index} outcome=Pending cold=true evaluated_cells=0 source_cells={source_cells}");
-                }
+                ExplorationPoll::Goal(_) => assert!(matches!(index, 0 | 1 | 3)),
+                ExplorationPoll::Pending => assert_eq!(index, 2),
                 other => panic!("unexpected real owner capture {index}: {other:?}"),
             }
+            eprintln!("surface_owner_frontier_work capture={index} rebuilds={} evaluated_cells={} source_cells={source_cells}",
+                capture.frontier_rebuilds, capture.frontier_evaluated_cells);
         }
-        assert_eq!(cold_evaluated, 3 * source_cells);
+        assert_eq!(rebuilt_cells, source_cells);
         assert!(snapshot.frontier_cache_stats().is_none());
     }
     finish_surface_owner_success(&handle, request_id, &fresh, &audit).await;
@@ -640,6 +682,13 @@ async fn compute_owner_surface_accepted_cancelled_preserves_newer_receipt_for_ne
         assert_eq!(audit.feedback.len(), 1);
     }
     assert_eq!(sink.submitted.lock().unwrap().len(), 1);
+    {
+        let audit = audit.lock().unwrap();
+        assert_eq!(audit.captures.iter().map(|c| c.frontier_rebuilds).collect::<Vec<_>>(), vec![1, 1]);
+        assert!(audit.captures.iter().all(|c| c.private_frontier_before.is_none()));
+        assert!(audit.captures[0].private_query.upgrade().is_none(), "Retire releases the old query");
+        assert!(!std::sync::Weak::ptr_eq(&audit.captures[0].private_query, &audit.captures[1].private_query));
+    }
     finish_surface_owner_success(&handle, request_id, &next, &audit).await;
 }
 
@@ -834,6 +883,17 @@ async fn surface_owner_changed_source_discards_then_progresses(observation_owner
     assert_eq!(status.incarnation, incarnation);
     assert_eq!(status.high_water.workers, 1);
     assert_eq!(status.high_water.active, 1);
+    {
+        let audit = audit.lock().unwrap();
+        assert_eq!(audit.captures.iter().map(|c| c.frontier_rebuilds).collect::<Vec<_>>(), vec![1, 1]);
+        for capture in &audit.captures {
+            assert!(capture.private_frontier_before.is_none());
+            assert_eq!(capture.frontier_evaluated_cells,
+                capture.original.snapshot().unwrap().cell_keys().count());
+        }
+        assert!(audit.captures[0].private_query.upgrade().is_none(), "Discard releases the old query");
+        assert!(!std::sync::Weak::ptr_eq(&audit.captures[0].private_query, &audit.captures[1].private_query));
+    }
     finish_surface_owner_success(&handle, request_id, &fresh, &audit).await;
 }
 

@@ -136,8 +136,8 @@ impl FrozenSurfaceInput {
 }
 
 /// An opaque original-input/private-query pair for one captured observation.
-/// Construct only through [`FrozenSurfaceInput::fork_for_planning`]; its private
-/// fields prevent attaching unrelated geometry to a trusted original source.
+/// 首次只能由 [`FrozenSurfaceInput::fork_for_planning`] 构造；后续仅允许
+/// [`Self::rebind_original`] 重新绑定相同完整源，私有字段仍禁止注入无关查询图。
 ///
 /// ```
 /// use nuwax_exploration::surface_adapter::{FrozenSurfacePlanningInput, SurfaceInputReceiver};
@@ -158,6 +158,18 @@ pub struct FrozenSurfacePlanningInput {
 }
 
 impl FrozenSurfacePlanningInput {
+    /// 同一完整不可变源可复用私有查询，但必须保留本次捕获的来源和通知。
+    /// 不读取接收器或源缓存；配置/生命周期资格仍由唯一查询拥有方负责。
+    pub fn rebind_original(&self, captured: &FrozenSurfaceInput) -> Option<Self> {
+        if self.query_view.is_none() || !self.original.same_source_view(captured) {
+            return None;
+        }
+        Some(Self {
+            original: captured.clone(),
+            query_view: self.query_view.clone(),
+        })
+    }
+
     /// Qualify against the captured ORIGINAL source, never the private query fork.
     /// This borrow cannot change the source or captured notification.
     pub fn original_input(&self) -> &FrozenSurfaceInput {
@@ -2003,6 +2015,45 @@ mod tests {
             source.poll_goal(&state(0.4, 4)).unwrap(),
             ExplorationPoll::Goal(_)
         ));
+    }
+
+    #[test]
+    fn planning_rebind_keeps_new_capture_and_rejects_every_changed_source_view() {
+        let receiver = SurfaceInputReceiver::new();
+        let observations = Arc::new(nuwax_nav_mls_planner::SurfaceObservations::new(0.1, 32).unwrap());
+        let snapshot = Arc::new(map().with_observations(Some(observations.clone())));
+        receiver.observe(snapshot.clone()).unwrap();
+        let captured = receiver.freeze().unwrap();
+        let planning = captured.fork_for_planning();
+        let receipt = Arc::new(snapshot.as_ref().clone());
+        receiver.observe(receipt.clone()).unwrap();
+        let refreshed = receiver.freeze().unwrap();
+        let rebound = planning.rebind_original(&refreshed).unwrap();
+        assert_eq!(rebound.original_input().notification(), captured.notification() + 1);
+        assert!(Arc::ptr_eq(rebound.original_input().snapshot().unwrap(), &receipt));
+        assert!(Arc::ptr_eq(planning.query_snapshot().unwrap(), rebound.query_snapshot().unwrap()));
+        assert_eq!(planning.original_input().notification(), captured.notification());
+        assert!(!Arc::ptr_eq(planning.query_snapshot().unwrap(), &snapshot));
+        let changed = vec![
+            map(),
+            Arc::new(snapshot.as_ref().clone().with_ground_evidence(
+                nuwax_nav_mls_planner::surface::GroundEvidence::OccupiedVolume)),
+            Arc::new(snapshot.with_observations(Some(Arc::new(observations.as_ref().clone())))),
+            Arc::new(snapshot.with_recent_obstacle_points(1, 1, 0, &[],
+                std::iter::empty::<(u32, [f64; 3])>()).unwrap()),
+            Arc::new(snapshot.with_virtual_obstacles([0.0, 0.0], 0.1, 20, 20, &vec![false; 400]).unwrap()),
+        ];
+        for source in changed {
+            receiver.observe(source).unwrap();
+            let changed = receiver.freeze().unwrap();
+            assert!(!captured.same_source_view(&changed));
+            assert!(planning.rebind_original(&changed).is_none());
+        }
+        receiver.clear().unwrap();
+        let absent = receiver.freeze().unwrap();
+        assert!(planning.rebind_original(&absent).is_none());
+        assert!(absent.fork_for_planning().rebind_original(&absent).is_none());
+        assert!(snapshot.frontier_cache_stats().is_none());
     }
 
     #[test]

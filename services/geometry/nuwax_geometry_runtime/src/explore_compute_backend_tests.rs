@@ -707,8 +707,8 @@ fn actual_surface_backend_uses_original_input_and_pins_it_until_resolution() {
         || false,
     ));
     assert_eq!(projection.poll.as_ref().unwrap(), &expected);
-    // All request-local strong roots are gone. The backend pin alone must remain.
-    assert_eq!(original_weak.strong_count(), 1);
+    // 请求局部引用已释放；prepared anchor 与 owner 私有槽各保留一份原始来源。
+    assert_eq!(original_weak.strong_count(), 2);
     let pending_original = backend
         .prepared
         .as_ref()
@@ -722,10 +722,11 @@ fn actual_surface_backend_uses_original_input_and_pins_it_until_resolution() {
     assert_eq!(selection(accepted.projection).poll.unwrap(), expected);
     assert_eq!(
         original_weak.strong_count(),
-        0,
-        "settlement releases the request pin"
+        1,
+        "settlement releases only the transaction pin; the qualified owner slot remains"
     );
-    assert!(original_weak.upgrade().is_none());
+    backend.lifecycle(ComputeLifecycle::Stop(ExplorationStopReason::UserCancelled)).result.unwrap();
+    assert!(original_weak.upgrade().is_none(), "Stop releases the retained source");
 }
 
 #[test]
@@ -1191,4 +1192,178 @@ fn mission_resource_error_keeps_typed_homeward_and_candidate_nesting() {
     let q = Quaternion::from_yaw(std::f64::consts::FRAC_PI_2);
     goal.orientation_xyzw = [q.x,q.y,q.z,q.w];
     assert!(routes.query(&start,&goal,home_goal_options(),None).err().unwrap().is_inconclusive());
+}
+
+
+fn surface_reuse_context(receiver: &SurfaceInputReceiver, config: Arc<ExploreStartConfig>) -> ComputeContext {
+    let mut context = context();
+    context.robot_pose.pose.position = Point3::new(1.05, 1.05, 0.4);
+    context.config = config;
+    context.input = ComputeInput::Surface {
+        original: receiver.freeze().unwrap(),
+        config: SurfaceNavigationConfig::new("map".into(), 0.3, 0.2, 0.45, 0.1, 0.2, 25.0, 0.3).unwrap(),
+    };
+    context
+}
+
+fn surface_reuse_query(backend: &mut ExploreComputeBackend, context: &ComputeContext)
+    -> std::sync::Weak<SurfaceSnapshot>
+{
+    let planning = backend.selection_planning(context).unwrap();
+    Arc::downgrade(planning.query_snapshot().unwrap())
+}
+
+#[test]
+fn surface_planning_slot_rebinds_receipts_but_invalidates_config_boundary_and_absence() {
+    let receiver = SurfaceInputReceiver::new();
+    let snapshot = surface_fixture(0.0);
+    receiver.observe(snapshot.clone()).unwrap();
+    let mut context = surface_reuse_context(&receiver, Arc::new(ExploreStartConfig::default()));
+    let mut backend = ExploreComputeBackend::new(surface_controller(receiver.clone()));
+    let first = surface_reuse_query(&mut backend, &context);
+    let notification = backend.surface_planning.as_ref().unwrap().1.original_input().notification();
+    receiver.observe(snapshot).unwrap();
+    context = surface_reuse_context(&receiver, context.config.clone());
+    context.robot_pose.pose.position.x += 0.02;
+    let rebound = surface_reuse_query(&mut backend, &context);
+    assert!(std::sync::Weak::ptr_eq(&first, &rebound));
+    assert_eq!(backend.surface_planning.as_ref().unwrap().1.original_input().notification(), notification + 1);
+    // 数值相同但配置拥有方改变，也保守冷失效。
+    context.config = Arc::new(context.config.as_ref().clone());
+    let changed_config = surface_reuse_query(&mut backend, &context);
+    assert!(first.upgrade().is_none());
+    assert!(!std::sync::Weak::ptr_eq(&rebound, &changed_config));
+    let mut changed = context.config.as_ref().clone();
+    changed.boundary = Some(nuwax_exploration::ExplorationBoundary::from_vertices(vec![
+        Point2::new(0.0, 0.0), Point2::new(2.0, 0.0), Point2::new(2.0, 2.0), Point2::new(0.0, 2.0),
+    ]).unwrap());
+    context.config = Arc::new(changed);
+    let bounded = surface_reuse_query(&mut backend, &context);
+    assert!(changed_config.upgrade().is_none());
+    assert!(!std::sync::Weak::ptr_eq(&changed_config, &bounded));
+    receiver.clear().unwrap();
+    context = surface_reuse_context(&receiver, context.config.clone());
+    assert!(backend.selection_planning(&context).unwrap().query_snapshot().is_none());
+    assert!(backend.surface_planning.is_none());
+    assert!(bounded.upgrade().is_none());
+    receiver.observe(surface_fixture(0.0)).unwrap();
+    let restored = surface_reuse_context(&receiver, context.config.clone());
+    let restored_query = surface_reuse_query(&mut backend, &restored);
+    let planar = super::tests::context();
+    assert!(backend.selection_planning(&planar).is_none());
+    assert!(restored_query.upgrade().is_none());
+}
+
+#[test]
+fn real_surface_warm_and_cold_queries_match_after_exact_input_feedback() {
+    let receiver = SurfaceInputReceiver::new();
+    let snapshot = surface_fixture(0.0);
+    receiver.observe(snapshot.clone()).unwrap();
+    let config = Arc::new(ExploreStartConfig::default());
+    let mut warm = ExploreComputeBackend::new(surface_controller(receiver.clone()));
+    let mut cold = ExploreComputeBackend::new(surface_controller(receiver.clone()));
+    let mut retained = None;
+    for round in 0..2 {
+        let mut context = surface_reuse_context(&receiver, config.clone());
+        if round == 1 {
+            context.robot_pose.pose.position.x += 0.02;
+            context.robot_pose.pose.orientation = Quaternion {
+                x: 0.0, y: 0.0, z: (0.1_f64 * 0.5).sin(), w: (0.1_f64 * 0.5).cos(),
+            };
+        }
+        cold.surface_planning = None;
+        let warm_preview = selection(warm.prepare_request(None, selection_request(&context), || false));
+        let cold_preview = selection(cold.prepare_request(None, selection_request(&context), || false));
+        assert_eq!(warm_preview.poll, cold_preview.poll);
+        let warm_poll = selection(finalized(&mut warm).projection).poll.unwrap();
+        let cold_poll = selection(finalized(&mut cold).projection).poll.unwrap();
+        assert_eq!(warm_poll, cold_poll, "warm and cold outcomes in round {round}");
+        let ExplorationPoll::Goal(goal) = warm_poll else { panic!("real Surface goal"); };
+        let current = Arc::downgrade(warm.surface_planning.as_ref().unwrap().1.query_snapshot().unwrap());
+        if let Some(previous) = &retained { assert!(std::sync::Weak::ptr_eq(previous, &current)); }
+        retained = Some(current);
+        for backend in [&mut warm, &mut cold] {
+            let before = checkpoint_payloads(&backend.controller);
+            backend.feedback(ComputeFeedback { goal_id: goal.id.clone(),
+                feedback: ExplorationGoalFeedback::InputUnavailable("fixture receipt interruption".into()),
+            }).result.unwrap();
+            assert_eq!(checkpoint_payloads(&backend.controller), before);
+            assert!(backend.surface_planning.is_some(), "ordinary exact feedback keeps immutable queries");
+        }
+        assert_eq!(checkpoint_payloads(&warm.controller), checkpoint_payloads(&cold.controller));
+        receiver.observe(snapshot.clone()).unwrap();
+    }
+    warm.lifecycle(ComputeLifecycle::Stop(ExplorationStopReason::UserCancelled)).result.unwrap();
+    assert!(retained.unwrap().upgrade().is_none());
+}
+
+#[test]
+fn surface_planning_slot_cancel_discard_and_unavailable_release_without_history() {
+    let snapshot = surface_fixture(0.0);
+    for case in ["pre_cancel", "post_prepare_cancel", "discard", "unavailable"] {
+        let receiver = SurfaceInputReceiver::new();
+        receiver.observe(snapshot.clone()).unwrap();
+        let mut context = surface_reuse_context(&receiver, Arc::new(ExploreStartConfig::default()));
+        let mut backend = ExploreComputeBackend::new(surface_controller(receiver));
+        let retained = surface_reuse_query(&mut backend, &context);
+        let before = checkpoint_payloads(&backend.controller);
+        if case == "unavailable" { context.robot_pose.frame_id = NavFrameId::from_static("odom"); }
+        let checks = Cell::new(0);
+        let result = backend.prepare_request(None, selection_request(&context), || {
+            checks.set(checks.get() + 1);
+            case == "pre_cancel" || case == "post_prepare_cancel" && checks.get() >= 3
+        });
+        match case {
+            "pre_cancel" => {
+                assert!(matches!(result, ComputeProjection::Cancelled));
+                assert!(!backend.prepared.as_ref().unwrap().controller_prepared);
+            }
+            "post_prepare_cancel" => {
+                let result = selection(result);
+                assert!(result.cancelled);
+                assert!(matches!(result.poll, Ok(ExplorationPoll::Goal(_))));
+                assert!(backend.prepared.as_ref().unwrap().controller_prepared);
+            }
+            "unavailable" => assert!(matches!(selection(result).poll, Ok(ExplorationPoll::SourceUnavailable(_)))),
+            _ => assert!(matches!(selection(result).poll, Ok(ExplorationPoll::Goal(_)))),
+        }
+        // 查询槽先释放，原事务 anchor 仍在，直到明确 resolve。
+        assert!(backend.prepared.as_ref().unwrap()._original_surface.is_some(), "{case}");
+        if case != "discard" {
+            assert!(backend.surface_planning.is_none(), "{case}");
+            assert!(retained.upgrade().is_none(), "{case}");
+        }
+        assert!(matches!(backend.resolve(Decision::Discard), Settlement::Discarded));
+        assert!(backend.prepared.is_none(), "{case}");
+        assert!(backend.surface_planning.is_none(), "{case}");
+        assert!(retained.upgrade().is_none(), "{case}");
+        assert_eq!(checkpoint_payloads(&backend.controller), before, "{case}");
+    }
+}
+
+#[test]
+fn surface_planning_slot_lifecycle_clears_even_failed_install_and_export() {
+    let snapshot = surface_fixture(0.0);
+    for case in ["stop", "install", "failed_install", "export"] {
+        let receiver = SurfaceInputReceiver::new();
+        receiver.observe(snapshot.clone()).unwrap();
+        let context = surface_reuse_context(&receiver, Arc::new(ExploreStartConfig::default()));
+        let mut backend = ExploreComputeBackend::new(surface_controller(receiver.clone()));
+        if case == "install" {
+            // 单独检查 Install 边界，不让之前的 Stop 清槽代替该断言。
+            backend.controller.end_exploration().unwrap();
+        }
+        let retained = surface_reuse_query(&mut backend, &context);
+        let operation = match case {
+            "stop" => ComputeLifecycle::Stop(ExplorationStopReason::UserCancelled),
+            "export" => ComputeLifecycle::ExportCheckpoint,
+            _ => ComputeLifecycle::Install {
+                controller: surface_controller(receiver), begin: false, restore: None,
+            },
+        };
+        let result = backend.lifecycle(operation).result;
+        assert_eq!(result.is_err(), matches!(case, "failed_install" | "export"), "{case}");
+        assert!(backend.surface_planning.is_none(), "{case}");
+        assert!(retained.upgrade().is_none(), "{case}");
+    }
 }

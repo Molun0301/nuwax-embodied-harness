@@ -296,6 +296,10 @@ impl SurfaceSnapshot {
             seed: Arc::clone(&index),
             dirty: None,
         });
+        // 仅真实重建发出工作量事件；命中旧索引不重复报告上一次统计。
+        tracing::trace!(target: "navigation.surface.frontier.rebuild",
+            evaluated_cells, retained_frontiers, incremental = dirty.is_some(),
+            "前沿几何索引重建");
         index
     }
 

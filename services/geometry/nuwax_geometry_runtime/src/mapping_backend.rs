@@ -21,10 +21,12 @@ use nalgebra::Point3;
 use nuwax_mapping::cost_mapper::{CostMapper, OccupancyConfig, PointCloud2Like};
 use nuwax_mapping::OccupancyGrid;
 use nuwax_mapping_raytracing::voxel_ray_tracer::{
-    append_voxel_map_checkpoint, decode_voxel_map_checkpoint_for_config, iter_global_points,
+    append_voxel_map_checkpoint, decode_voxel_map_checkpoint_for_config,
     try_update_map, voxel_map_checkpoint_encoded_len, Config, PreparedRayUpdate, VoxelMap,
     VOXEL_MAP_CHECKPOINT_ENTRY_BYTES, VOXEL_MAP_CHECKPOINT_HEADER_BYTES,
 };
+#[cfg(test)]
+use nuwax_mapping_raytracing::voxel_ray_tracer::iter_global_points;
 
 const WORKER_QUEUE_CAPACITY: usize = 1;
 const WORKER_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(15);
@@ -1252,8 +1254,6 @@ impl MappingBackendSpec {
             map: VoxelMap::default(),
             prepared_update: None,
             input: Vec::new(),
-            stable_points: Vec::new(),
-            stable_points_dirty: false,
             last_occupancy: None,
             last_candidate_point_count: 0,
             last_candidate_received_at_ns: 0,
@@ -1279,8 +1279,6 @@ impl MappingBackendSpec {
                 map: VoxelMap::default(),
                 prepared_update: None,
                 input: Vec::new(),
-                stable_points: Vec::new(),
-                stable_points_dirty: false,
                 last_occupancy: None,
                 last_candidate_point_count: 0,
                 last_candidate_received_at_ns: 0,
@@ -1319,7 +1317,7 @@ impl MappingKernel {
     pub(crate) fn ready_to_build(&self) -> bool {
         match self {
             Self::Voxel(_) => true,
-            Self::Raytracing(kernel) => !kernel.stable_points.is_empty(),
+            Self::Raytracing(kernel) => kernel.map.healthy_count() != 0,
         }
     }
 
@@ -1338,18 +1336,24 @@ impl MappingKernel {
         let Self::Raytracing(kernel) = self else {
             return Ok(());
         };
-        kernel.commit_prepared_map_frame()?;
-        kernel.refresh_stable_points();
-        Ok(())
+        kernel.commit_prepared_map_frame()
     }
 
-    pub(crate) fn accumulated_points<'a>(
-        &'a self,
-        voxel_points: &'a [Point3<f64>],
-    ) -> &'a [Point3<f64>] {
+    // 旧诊断测试显式读取时才物化；生产构图只读取健康体素计数。
+    pub(crate) fn accumulated_points(&self, voxel_points: &[Point3<f64>]) -> Vec<Point3<f64>> {
         match self {
-            Self::Voxel(_) => voxel_points,
-            Self::Raytracing(kernel) => &kernel.stable_points,
+            Self::Voxel(_) => voxel_points.to_vec(),
+            Self::Raytracing(kernel) => {
+                let mut points = iter_global_points(&kernel.map, kernel.config.voxel_size)
+                    .map(|(x, y, z)| Point3::new(f64::from(x), f64::from(y), f64::from(z)))
+                    .collect::<Vec<_>>();
+                points.sort_unstable_by(|left, right| {
+                    left.x.total_cmp(&right.x)
+                        .then_with(|| left.y.total_cmp(&right.y))
+                        .then_with(|| left.z.total_cmp(&right.z))
+                });
+                points
+            }
         }
     }
 
@@ -1357,9 +1361,7 @@ impl MappingKernel {
         if let Self::Raytracing(kernel) = self {
             kernel.map = VoxelMap::default();
             kernel.prepared_update = None;
-            kernel.stable_points_dirty = false;
             kernel.input.clear();
-            kernel.stable_points.clear();
         }
     }
 }
@@ -1393,8 +1395,6 @@ pub(crate) struct RaytracingKernel {
     map: VoxelMap,
     prepared_update: Option<PreparedRayUpdate>,
     input: Vec<(f32, f32, f32)>,
-    stable_points: Vec<Point3<f64>>,
-    stable_points_dirty: bool,
     last_occupancy: Option<OccupancyGrid>,
     last_candidate_point_count: usize,
     last_candidate_received_at_ns: u64,
@@ -1443,26 +1443,7 @@ impl RaytracingKernel {
         } else {
             prepared.apply_serial(&mut self.map)
         };
-        self.stable_points_dirty = true;
         Ok(())
-    }
-
-    fn refresh_stable_points(&mut self) {
-        if !self.stable_points_dirty {
-            return;
-        }
-        self.stable_points.clear();
-        self.stable_points.extend(
-            iter_global_points(&self.map, self.config.voxel_size)
-                .map(|(x, y, z)| Point3::new(f64::from(x), f64::from(y), f64::from(z))),
-        );
-        self.stable_points.sort_unstable_by(|left, right| {
-            left.x
-                .total_cmp(&right.x)
-                .then_with(|| left.y.total_cmp(&right.y))
-                .then_with(|| left.z.total_cmp(&right.z))
-        });
-        self.stable_points_dirty = false;
     }
 
     fn validate_retained_state_bound(&self) -> Result<(), String> {
@@ -2043,22 +2024,11 @@ fn restore_mapping_kernel_checkpoint(
                         .to_owned(),
                 );
             }
-            let mut stable_points = iter_global_points(&map, config.voxel_size)
-                .map(|(x, y, z)| Point3::new(f64::from(x), f64::from(y), f64::from(z)))
-                .collect::<Vec<_>>();
-            stable_points.sort_unstable_by(|left, right| {
-                left.x
-                    .total_cmp(&right.x)
-                    .then_with(|| left.y.total_cmp(&right.y))
-                    .then_with(|| left.z.total_cmp(&right.z))
-            });
             let ray = RaytracingKernel {
                 config,
                 map,
                 prepared_update: None,
                 input: Vec::new(),
-                stable_points,
-                stable_points_dirty: false,
                 last_occupancy,
                 last_candidate_point_count,
                 last_candidate_received_at_ns,
@@ -2197,11 +2167,10 @@ pub(crate) fn flush_candidate(
                 ray.validate_checkpoint_budget()?;
                 return Ok(None);
             }
-            ray.refresh_stable_points();
             let live = build_occupancy(input, config)?;
             ray.last_occupancy = Some(live.clone());
             ray.last_candidate_received_at_ns = input.received_at_ns;
-            ray.last_candidate_point_count = ray.stable_points.len();
+            ray.last_candidate_point_count = ray.map.healthy_count();
             ray.dirty_since_candidate = false;
             ray.validate_checkpoint_budget()?;
             (MappingBackendKind::Raytracing, live.clone(), live)
@@ -2364,7 +2333,7 @@ fn compute_candidate_with_parallelism(
                 eprintln!("PGO_RAY_PHASE frame={} points={} voxels={} prepare_us={prepare_us} update_us={update_us} dynamic_us={}", input.frame_sequence, input.registered_points_map.len(), ray.map.voxels.len(), phase.elapsed().as_micros());
             }
             ray.dirty_since_candidate = true;
-            // 每帧更新体素，但只有真正构图时才导出并排序完整历史点集。
+            // 每帧更新体素；构图只读本帧扫描，历史体素无需物化成点云。
             if !candidate_due(
                 ray.last_candidate_received_at_ns,
                 input.received_at_ns,
@@ -2372,7 +2341,6 @@ fn compute_candidate_with_parallelism(
             ) {
                 return Ok(None);
             }
-            ray.refresh_stable_points();
             MappingBackendKind::Raytracing
         }
     };
@@ -2395,7 +2363,7 @@ fn compute_candidate_with_parallelism(
             result
         }
         MappingKernel::Raytracing(ray) => {
-            let point_count = ray.stable_points.len();
+            let point_count = ray.map.healthy_count();
             if !candidate_due(
                 ray.last_candidate_received_at_ns,
                 input.received_at_ns,
@@ -2508,7 +2476,7 @@ mod tests {
                 MappingKernel::Voxel(voxel) => {
                     voxel.current_window.iter().copied().collect::<Vec<_>>()
                 }
-                MappingKernel::Raytracing(ray) => ray.stable_points.clone(),
+                MappingKernel::Raytracing(_) => kernel.accumulated_points(&[]),
             };
             let ghosts = retained
                 .iter()
@@ -2780,7 +2748,7 @@ mod tests {
     }
 
     #[test]
-    fn ray_history_is_materialized_only_when_candidate_or_flush_needs_it() {
+    fn ray_candidate_and_flush_preserve_healthy_count_without_history_points() {
         let mut kernel = MappingBackendSpec::raytracing_defaults().into_kernel(1024);
         for sequence in 1..=3 {
             compute_candidate_in_place(&mut kernel, &input(sequence), compute_config()).unwrap();
@@ -2796,7 +2764,7 @@ mod tests {
         let MappingKernel::Raytracing(ray) = &kernel else {
             panic!("射线后端");
         };
-        assert!(ray.stable_points_dirty);
+        assert!(ray.dirty_since_candidate);
         let mut flush_token = token(4);
         flush_token.source_timestamp_ns = skipped.source_timestamp_ns;
         assert!(
@@ -2807,7 +2775,8 @@ mod tests {
         let MappingKernel::Raytracing(ray) = &kernel else {
             panic!("射线后端");
         };
-        assert!(!ray.stable_points_dirty);
+        assert!(!ray.dirty_since_candidate);
+        assert_eq!(ray.last_candidate_point_count, ray.map.healthy_count());
     }
 
     #[test]
@@ -3246,18 +3215,18 @@ mod tests {
             panic!("ray kernel expected");
         };
         let voxel_count = before.map.voxels.len();
-        let stable_points = before.stable_points.clone();
+        let stable_points = kernel.accumulated_points(&[]);
         let last_candidate_point_count = before.last_candidate_point_count;
         let last_candidate_received_at_ns = before.last_candidate_received_at_ns;
         let mut invalid_config = compute_config();
         invalid_config.resolution = 0.0;
         let result = compute_candidate(&mut kernel, &input(4), invalid_config);
         assert!(result.is_err());
-        let MappingKernel::Raytracing(ray) = kernel else {
+        let MappingKernel::Raytracing(ray) = &kernel else {
             panic!("ray kernel expected");
         };
         assert_eq!(ray.map.voxels.len(), voxel_count);
-        assert_eq!(ray.stable_points, stable_points);
+        assert_eq!(kernel.accumulated_points(&[]), stable_points);
         assert_eq!(ray.last_candidate_point_count, last_candidate_point_count);
         assert_eq!(
             ray.last_candidate_received_at_ns,

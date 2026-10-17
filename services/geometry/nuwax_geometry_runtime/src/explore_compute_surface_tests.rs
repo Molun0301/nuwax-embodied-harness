@@ -10,6 +10,12 @@ struct SurfaceOwnerCapture {
     preview: nuwax_exploration::ExploreResult<ExplorationPoll>,
     checkpoint_before: String,
     checkpoint_after: String,
+    // Only observe completed work in the real owner; never warm either cache.
+    private_frontier_before: Option<nuwax_nav_mls_planner::SurfaceFrontierCacheStats>,
+    private_frontier_after: Option<nuwax_nav_mls_planner::SurfaceFrontierCacheStats>,
+    source_frontier_before: Option<nuwax_nav_mls_planner::SurfaceFrontierCacheStats>,
+    source_frontier_after: Option<nuwax_nav_mls_planner::SurfaceFrontierCacheStats>,
+    private_query: std::sync::Weak<SurfaceSnapshot>,
 }
 
 #[derive(Default)]
@@ -62,9 +68,15 @@ impl ExplorationGoalSource for GatedRealSurfaceSource {
                 .query_snapshot()
                 .expect("private Surface query view"),
         ));
+        let query = planning.query_snapshot().expect("private Surface query view");
+        let private_frontier_before = query.frontier_cache_stats();
+        let source_frontier_before = original.snapshot().unwrap().frontier_cache_stats();
         let checkpoint_before = self.source.checkpoint()?;
         let prepared = self.source.prepare_poll(state)?;
         let checkpoint_after = self.source.checkpoint()?;
+        let private_frontier_after = query.frontier_cache_stats();
+        let source_frontier_after = original.snapshot().unwrap().frontier_cache_stats();
+        let private_query = Arc::downgrade(query);
         self.audit
             .lock()
             .unwrap()
@@ -75,6 +87,11 @@ impl ExplorationGoalSource for GatedRealSurfaceSource {
                 preview: prepared.outcome().clone(),
                 checkpoint_before,
                 checkpoint_after,
+                private_frontier_before,
+                private_frontier_after,
+                source_frontier_before,
+                source_frontier_after,
+                private_query,
             });
         // The real source has finished preparing, but no proposal is visible to
         // the actor yet. Take makes the hold one-shot; later progress is real.
@@ -488,6 +505,42 @@ async fn compute_owner_surface_repeated_same_root_receipts_preserve_capture_then
     }
     assert_eq!(sink.submitted.lock().unwrap().len(), 3);
     assert!(sink.cancelled.lock().unwrap().is_empty());
+    {
+        let audit = audit.lock().unwrap();
+        // This is a BASELINE workload witness, not the optimized acceptance
+        // assertion. An empty cache before each call makes the reported last
+        // calculation unambiguously work performed by that particular call.
+        let source_cells = snapshot.cell_keys().count();
+        assert!(source_cells > 0);
+        let mut cold_evaluated = 0;
+        for (index, capture) in audit.captures.iter().enumerate() {
+            assert!(capture.private_frontier_before.is_none(), "capture {index}");
+            assert!(capture.source_frontier_before.is_none(), "capture {index}");
+            assert!(capture.source_frontier_after.is_none(), "capture {index}");
+            assert!(capture.private_query.upgrade().is_none(),
+                "the baseline disposes of each private query after preparation");
+            match capture.preview.as_ref().unwrap() {
+                ExplorationPoll::Goal(_) => {
+                    assert!(matches!(index, 0 | 1 | 3));
+                    let stats = capture.private_frontier_after.expect("selection builds an index");
+                    assert!(!stats.incremental, "capture {index}: {stats:?}");
+                    assert_eq!(stats.retained_frontiers, 0, "capture {index}");
+                    assert_eq!(stats.evaluated_cells, source_cells, "capture {index}");
+                    cold_evaluated += stats.evaluated_cells;
+                    eprintln!("surface_owner_frontier_work capture={index} outcome=Goal cold=true evaluated_cells={} source_cells={source_cells}",
+                        stats.evaluated_cells);
+                }
+                ExplorationPoll::Pending => {
+                    assert_eq!(index, 2);
+                    assert!(capture.private_frontier_after.is_none());
+                    eprintln!("surface_owner_frontier_work capture={index} outcome=Pending cold=true evaluated_cells=0 source_cells={source_cells}");
+                }
+                other => panic!("unexpected real owner capture {index}: {other:?}"),
+            }
+        }
+        assert_eq!(cold_evaluated, 3 * source_cells);
+        assert!(snapshot.frontier_cache_stats().is_none());
+    }
     finish_surface_owner_success(&handle, request_id, &fresh, &audit).await;
 }
 

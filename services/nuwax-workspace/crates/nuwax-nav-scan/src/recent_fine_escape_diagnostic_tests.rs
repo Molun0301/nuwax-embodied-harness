@@ -54,7 +54,7 @@ fn check_recent_guide_fine_escape(tolerance: Option<f64>) {
     let original=tomo.plan_bounded(from,to,tomo.resolution,&[],None,Some(5.0),&[]).expect("static guide").points;
     let hints=map.recent_obstacle_hints([[-3.0,-3.0],[3.0,3.0]],start).unwrap();
     eprintln!("FALLBACK_ELIGIBILITY hints={} original={original:?}",hints.len());
-    let overlay=recent_guide_overlay::RecentGuideOverlay::new(hints,tomo.resolution,map.body_envelope().unwrap()).unwrap();
+    let overlay=recent_guide_overlay::RecentGuideOverlay::new(hints,tomo.resolution,f64::from(map.source_voxel_size_m()),map.body_envelope().unwrap()).unwrap();
     assert!(!overlay.is_empty());
     let reference=tomo.plan_bounded_with_segment_filter(from,to,tomo.resolution,&[],None,Some(5.0),&[],
         &|a,b|overlay.accepts(a,b)).expect("real recent guide must exist").points;

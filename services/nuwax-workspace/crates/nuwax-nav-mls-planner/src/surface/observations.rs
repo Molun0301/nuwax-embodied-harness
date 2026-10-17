@@ -257,6 +257,11 @@ impl SurfaceObservations {
         self.complete_geometry_source
     }
 
+    /// 完整源是否包含独立于占据带顶的实测地面层；仅检查索引状态。
+    pub(super) fn has_measured_ground_layers(&self)->bool {
+        self.complete_geometry_source && !self.observed_layers.is_empty()
+    }
+
     /// 仅比较占据几何；新扫描时间和命中次数不使层析代价重建。
     pub fn same_geometry(&self,other:&Self)->bool {
         self.size_m.to_bits()==other.size_m.to_bits()

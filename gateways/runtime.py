@@ -46,6 +46,7 @@ from contracts.map_workspace import (
     MAP_GEOREFERENCE_SCHEMA_VERSION,
     MAP_GEOREFERENCE_SOURCE_CRS,
 )
+from contracts.motion_limits import MotionCommandLimits
 from contracts.skills import SkillCategory, SkillDescriptor
 from contracts.navigation import ExplorationStatus, ExploreAreaRequest, NavigationGoal, NavigationStatus
 from contracts.runtime_views import (
@@ -3839,17 +3840,7 @@ class GatewayRuntime:
                 "按给定速度和时长执行短时移动，返回异步任务。",
                 execution_mode=CapabilityExecutionMode.ASYNC_TASK,
                 risk_level=CapabilityRiskLevel.MEDIUM,
-                input_schema=_schema_object(
-                    {
-                        "vx": {"type": "number"},
-                        "vy": {"type": "number", "default": 0.0},
-                        "vyaw": {"type": "number", "default": 0.0},
-                        "duration_sec": {"type": "number", "exclusiveMinimum": 0.0},
-                        "interval_sec": {"type": "number", "exclusiveMinimum": 0.0, "default": 0.05},
-                        "timeout_sec": {"type": "number", "exclusiveMinimum": 0.0},
-                    },
-                    required=("vx", "duration_sec"),
-                ),
+                input_schema=self._relative_move_input_schema(),
                 output_schema=_schema_object({"task": {"type": "object"}, "status": {"type": "object"}}),
                 required_resources=(RuntimeResource.BASE_MOTION.value,),
                 timeout_sec=_DEFAULT_ASYNC_TASK_TIMEOUT_SEC,
@@ -8925,6 +8916,40 @@ class GatewayRuntime:
             ),
         )
 
+    def _relative_move_limits(self) -> Optional[MotionCommandLimits]:
+        """目录与调用共用设备声明；未实现接口表示未知，损坏声明明确失败。"""
+        getter = getattr(getattr(self, "robot", None), "get_motion_command_limits", None)
+        if not callable(getter):
+            return None
+        try:
+            limits = getter()
+            if limits is not None and not isinstance(limits, MotionCommandLimits):
+                raise TypeError("设备速度策略必须返回 MotionCommandLimits 或 None。")
+            return limits
+        except Exception as exc:
+            raise GatewayError(
+                f"无法读取设备速度策略：{exc}", error_code="motion_limits_unavailable",
+                http_status=503, jsonrpc_code=-32000,
+            ) from exc
+
+    def _relative_move_input_schema(self, limits: Optional[MotionCommandLimits] = None) -> Dict[str, Any]:
+        properties = {
+            "vx": {"type": "number", "description": "前向速度，米/秒；设备尚未公开速度限制。"},
+            "vy": {"type": "number", "default": 0.0, "description": "横向速度，米/秒；设备尚未公开速度限制。"},
+            "vyaw": {"type": "number", "default": 0.0, "description": "角速度，弧度/秒；设备尚未公开速度限制。"},
+            "duration_sec": {"type": "number", "exclusiveMinimum": 0.0},
+            "interval_sec": {"type": "number", "exclusiveMinimum": 0.0, "default": 0.05},
+            "timeout_sec": {"type": "number", "exclusiveMinimum": 0.0},
+        }
+        if limits is not None:
+            properties.update(limits.velocity_schema())
+        schema = _schema_object(properties, required=("vx", "duration_sec"))
+        schema["description"] = (
+            limits.description() if limits is not None else
+            "设备尚未公开当前输入帧下的速度限制；未知不表示无限制，执行器仍按设备策略校验。"
+        )
+        return schema
+
     def _handle_relative_move(
         self,
         arguments: Dict[str, Any],
@@ -8943,6 +8968,21 @@ class GatewayRuntime:
         duration_sec = self._require_float(arguments, "duration_sec")
         interval_sec = self._float(arguments, "interval_sec", 0.05)
         timeout_override = self._float(arguments, "timeout_sec", 0.0)
+
+        if not all(math.isfinite(value) for value in (vx, vy, vyaw, duration_sec, interval_sec, timeout_override)):
+            raise GatewayError(
+                "相对移动速度、时长和间隔必须为有限数值。", error_code="invalid_params",
+                http_status=422, jsonrpc_code=-32602,
+            )
+        limits = self._relative_move_limits()
+        if limits is not None:
+            try:
+                limits.validate_velocity(vx, vy, vyaw)
+            except ValueError as exc:
+                raise GatewayError(
+                    str(exc), error_code="invalid_params", http_status=422, jsonrpc_code=-32602,
+                    details={"motion_command_limits": limits.model_dump(mode="json")},
+                ) from exc
 
         if duration_sec <= 0 or interval_sec <= 0:
             raise GatewayError(
@@ -14087,6 +14127,22 @@ class GatewayRuntime:
             name for name in capability_names if name in self._gateway_capability_names
         )
         for capability_name in names:
+            if capability_name == "relative_move":
+                registration = self.capability_registry.get_registration(capability_name)
+                try:
+                    schema = self._relative_move_input_schema(self._relative_move_limits())
+                except GatewayError as exc:
+                    # 设备策略损坏只撤销相对移动能力，不阻断其它能力发现。
+                    merged_capabilities[capability_name] = CapabilityAvailability(
+                        name=capability_name, supported=False, reason=str(exc),
+                    )
+                    continue
+                if registration.descriptor.input_schema != schema:
+                    self.capability_registry.register(
+                        registration.descriptor.model_copy(update={"input_schema": schema}, deep=True),
+                        registration.handler, owner=registration.owner,
+                        metadata=registration.metadata, overwrite=True,
+                    )
             merged_capabilities[capability_name] = self._build_gateway_capability_availability(
                 capability_name,
                 fallback=base_capabilities.get(capability_name),

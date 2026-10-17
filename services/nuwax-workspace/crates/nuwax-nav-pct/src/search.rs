@@ -269,12 +269,28 @@ impl Tomogram {
         indexes.insert(initial, 0);
         let mut queue = BinaryHeap::new();
         queue.push(Queue { score: heuristic(initial), cost: 0.0, id: 0, order: order(initial) });
+        // 起终点都有观测参考时，先沿有限的已观测连接寻找首条路线。
+        // 同层噪声也会产生多个缺测高程平面，不能按端点高差或半数预算
+        // 提前放弃观测进展。缺测候选共用状态、代价和预算，仍可桥接断点；
+        // 找到首条路线后合并队列，继续按原代价改进。未知目标仍走混合搜索。
+        let mut prefer_observed = matches!(initial, crate::reference::Reference::Known(_))
+            && self.cell_at(goal).is_some();
+        let mut deferred = BinaryHeap::new();
         let mut edge_states: ahash::AHashSet<usize> = ahash::AHashSet::new();
         let mut expanded = 0;
         let mut radius_clipped = false;
         let mut best: Option<(usize, [f64; 3], f64)> = None;
         'search: loop {
             checkpoint(cancelled)?;
+            if prefer_observed && best.is_some() {
+                prefer_observed = false;
+                queue.append(&mut deferred);
+            }
+            if prefer_observed && queue.is_empty() {
+                // 已观测坡道中也可能有缺测缝；取一个未知候选继续连接，
+                // 新发现的观测状态仍有机会在当前共享预算内展开。
+                if let Some(next) = deferred.pop() { queue.push(next); }
+            }
             let Some(Queue { cost, id, score, .. }) = queue.pop() else {
                 if best.is_some() || edge_states.is_empty() || !domain.grow() { break; }
                 // Continue the same search, retaining every admitted state/cost.
@@ -358,11 +374,15 @@ impl Tomogram {
                 if next_cost < states[next_id].cost {
                     states[next_id].cost = next_cost;
                     states[next_id].parent = id;
-                    if queue.len() >= limits.max_states {
+                    if queue.len() + deferred.len() >= limits.max_states {
                         queue.retain(|entry| entry.cost == states[entry.id].cost);
+                        deferred.retain(|entry: &Queue| entry.cost == states[entry.id].cost);
                         checkpoint(cancelled)?;
                     }
-                    queue.push(Queue { score: next_cost + heuristic(next), cost: next_cost,
+                    let target = if prefer_observed && matches!(next, crate::reference::Reference::Unknown { .. }) {
+                        &mut deferred
+                    } else { &mut queue };
+                    target.push(Queue { score: next_cost + heuristic(next), cost: next_cost,
                         id: next_id, order: order(next) });
                 }
             }}
@@ -471,6 +491,75 @@ impl Tomogram {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn noisy_same_level_ground_keeps_observed_progress_within_the_original_budget() {
+        let columns = (-40..680).flat_map(|x| (-30..31).filter_map(move |y| {
+            // 稀疏点云保留多种细小高程，不把缺测格补成地面。
+            if x == 120 { return None; }
+            let z = f64::from((x / 3_i32).rem_euclid(5)) * 0.0125;
+            Some(([x,y], vec![[z-0.05,z]]))
+        }));
+        let map = Tomogram::from_columns_with_evidence(0.05,0.05,columns,
+            0.46,0.16,0.15,0.15,18.0,0.34,true).unwrap();
+        let start = [0.075,0.025,0.0]; let goal = [30.075,0.025,0.0];
+        let route = map.plan(start,goal,0.15,&[],None)
+            .expect("同层噪声地面的缺测外延不应提前耗尽已观测连接机会");
+        assert!(distance(*route.points.last().unwrap(),goal)<=0.15);
+        assert!(route.stats.expanded<=SearchLimits::default().max_states);
+        assert!(route.points.windows(2).all(|p|map.segment_clear(p[0],p[1],&[])));
+        eprintln!("NOISY_ROUTE expanded={} points={}",route.stats.expanded,route.points.len());
+    }
+
+    #[test]
+    fn overlapping_floors_reach_the_observed_ramp_within_the_original_budget() {
+        let mut columns = std::collections::BTreeMap::<[i32; 2], Vec<[f64; 2]>>::new();
+        for x in -20..20 { for y in -20..20 {
+            columns.insert([x,y], vec![[-0.05,0.0],[1.95,2.0]]);
+        }}
+        for x in 20..100 { for y in -9..9 {
+            let z = ((f64::from(x)+0.5)*0.1-2.0)*0.25;
+            columns.entry([x,y]).or_default().push([z-0.05,z]);
+        }}
+        for x in 20..120 { for y in 10..23 {
+            columns.entry([x,y]).or_default().push([1.95,2.0]);
+        }}
+        for x in 100..120 { for y in -9..10 {
+            columns.entry([x,y]).or_default().push([1.95,2.0]);
+        }}
+        let mut gap_columns = columns.clone();
+        gap_columns.retain(|c,_| c[0] != 50 || c[1] >= 10);
+        let gap = Tomogram::from_columns(0.1,gap_columns,0.46,0.16,0.15,0.15,18.0).unwrap();
+        let map = Tomogram::from_columns(0.1,columns,0.46,0.16,0.15,0.15,18.0).unwrap();
+        let start = [-1.0,0.0,0.0]; let goal = [-1.0,0.0,2.0];
+        // 独立遍历已观测连接，先证明场景确实有路；不靠目标高程生成未知楼层。
+        let mut seen = ahash::AHashSet::new();
+        let mut queue = std::collections::VecDeque::from([map.reference_start(start).unwrap()]);
+        let mut reached = false;
+        while let Some(from) = queue.pop_front() {
+            if !seen.insert(from) { continue; }
+            reached |= distance(map.reference_position(from),goal) < 0.15;
+            let c = map.reference_column(from);
+            for x in -1..=1 { for y in -1..=1 {
+                if let Some(to @ crate::reference::Reference::Known(_)) = map.reference_neighbor(from,[c[0]+x,c[1]+y]) {
+                    if !seen.contains(&to) { queue.push_back(to); }
+                }
+            }}
+        }
+        assert!(reached, "独立观测连接必须能够跨层");
+        eprintln!("RAMP_CONNECTED observed_states={}",seen.len());
+        let route = map.plan(start,goal,0.15,&[],None).expect("有限已观测坡道不应被未知外延耗尽预算");
+        assert!(route.stats.expanded <= SearchLimits::default().max_states);
+        assert!(route.points.iter().any(|p|p[0]>9.0));
+        assert!(distance(*route.points.last().unwrap(),goal)<=0.15);
+        assert!(route.points.windows(2).all(|p|map.segment_clear(p[0],p[1],&[])));
+        eprintln!("RAMP_ROUTE expanded={} points={} elapsed_ms={}",route.stats.expanded,route.points.len(),route.stats.elapsed_ms);
+        let route = gap.plan(start,goal,0.15,&[],None).expect("坡道缺测缝仍可沿原高度参考接续");
+        assert!(route.points.windows(2).all(|p|gap.segment_clear(p[0],p[1],&[])));
+        assert!(distance(*route.points.last().unwrap(),goal)<=0.15);
+        assert!(route.stats.expanded <= SearchLimits::default().max_states);
+        eprintln!("RAMP_GAP expanded={} points={} elapsed_ms={}",route.stats.expanded,route.points.len(),route.stats.elapsed_ms);
+    }
+
     fn map(hole: bool) -> Tomogram {
         let columns = (-15..100).flat_map(|x| {
             (-15..16).filter_map(move |y| {

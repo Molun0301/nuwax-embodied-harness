@@ -260,6 +260,17 @@ impl PlanKernel {
             .kinematics()
             .ok_or_else(|| vec!["近场执行缺少运动能力".into()])?;
         let costs = self.config.pct.local_costs();
+        // 首次规划也读取本次近期源；静态层析缓存不包含这些障碍。
+        // 范围覆盖完整绕行搜索圆及机体外包，避免只导出原直线附近的回波。
+        let recent_guide = if let Some(model) = map.body_envelope() {
+            let center = [r.pose.pose.position.x, r.pose.pose.position.y];
+            let radius = r.scan.horizon_m * 1.5 + model.radius();
+            let bounds = [center.map(|v|v-radius), center.map(|v|v+radius)];
+            let hints = map.recent_obstacle_hints(bounds, body(&r.pose))
+                .map_err(|e|vec![LocalPlanError::from(e.to_string())])?;
+            Some(recent_guide_overlay::RecentGuideOverlay::new(hints, tomogram.resolution, f64::from(map.source_voxel_size_m()), model)
+                .map_err(|e|vec![LocalPlanError::from(e)])?)
+        } else { None };
         let mut failures = Vec::new();
         for detour in if r.detour {
             &[true][..]
@@ -287,41 +298,26 @@ impl PlanKernel {
                 ) {
                     reference = route.points;
                 }
-                // Live obstacles constrain this request's guide only. Keep the
-                // static tomogram cache and final Scan body admission unchanged.
-                if let Some(model) = map.body_envelope() {
-                    let center = [r.pose.pose.position.x, r.pose.pose.position.y];
-                    let radius = r.scan.horizon_m + 1.5 + model.radius();
-                    let bounds = [center.map(|v|v-radius),center.map(|v|v+radius)];
-                    let hints = match map.recent_obstacle_hints(bounds,body(&r.pose)) {
-                        Ok(hints) => hints,
-                        Err(reason) => {
-                            tracing::debug!(target:"navigation.scan",%reason,
-                                "recent guide hints unavailable; retaining exact Scan fallback");
-                            Vec::new()
-                        }
-                    };
-                    let overlay = recent_guide_overlay::RecentGuideOverlay::new(hints,tomogram.resolution,model)
-                        .map_err(|e|vec![LocalPlanError::from(e)])?;
-                    if !overlay.is_empty() {
-                        match tomogram.plan_bounded_with_segment_filter(
-                            reference[0], *reference.last().unwrap(), tomogram.resolution,
-                            &r.boundary, None, Some(r.scan.horizon_m*1.5), &costs,
-                            &|a,b|overlay.accepts(a,b),
-                        ) {
-                            Ok(route) => reference = route.points,
-                            Err(reason) => {
-                                // A radius guide can reject a pose-feasible narrow
-                                // passage. Its failure never proves no executable path.
-                                tracing::debug!(target:"navigation.scan",%reason,
-                                    "recent guide unavailable; retaining exact Scan fallback");
-                            }
-                        }
+            }
+            let mut follow_reference = *detour;
+            if let Some(overlay) = recent_guide.as_ref().filter(|overlay|
+                !overlay.is_empty() && reference.windows(2).any(|p|!overlay.accepts(p[0],p[1]))) {
+                match tomogram.plan_bounded_with_segment_filter(
+                    reference[0], *reference.last().unwrap(), tomogram.resolution,
+                    &r.boundary, None, Some(r.scan.horizon_m*1.5), &costs,
+                    &|a,b|overlay.accepts(a,b),
+                ) {
+                    Ok(route) => {reference = route.points; follow_reference = true;}
+                    Err(reason) => {
+                        // 外接圆比完整姿态保守，窄门仍交给原机体扫掠判断。
+                        // 引导失败不等于真实不可通行；非法提示输入则在上方明确返回。
+                        tracing::debug!(target:"navigation.scan",%reason,
+                            "recent guide unavailable; retaining exact Scan fallback");
                     }
                 }
             }
             let start = body(&r.pose);
-            let straight = r.straight && !*detour;
+            let straight = r.straight && !follow_reference;
             let cached = self.failed.iter().find(|f| {
                 Arc::ptr_eq(&f.tomogram, &tomogram)
                     && f.source.same_body_query_view(&r.source)
@@ -331,7 +327,7 @@ impl PlanKernel {
                     && f.final_yaw.map(f64::to_bits) == r.final_yaw.map(f64::to_bits)
                     && f.arrival.map(|(p, t)| (p.map(f64::to_bits), t.to_bits()))
                         == r.arrival.map(|(p, t)| (p.map(f64::to_bits), t.to_bits()))
-                    && f.detour == *detour
+                    && f.detour == follow_reference
                     && f.straight == straight
             });
             let result = if let Some(f) = cached {
@@ -347,7 +343,7 @@ impl PlanKernel {
                     r.final_yaw,
                     r.arrival,
                     &r.boundary,
-                    *detour,
+                    follow_reference,
                     straight,
                 );
                 if let Err(failure) = &result {
@@ -364,7 +360,7 @@ impl PlanKernel {
                             final_yaw: r.final_yaw,
                             arrival: r.arrival,
                             failure: failure.clone(),
-                            detour: *detour,
+                            detour: follow_reference,
                             straight,
                         });
                     }
@@ -540,6 +536,32 @@ mod tests {
         }
     }
     #[test]
+    fn first_plan_routes_around_recent_wall_before_exhausting_scan() {
+        let (mut kernel, mut request, cancel) = fixture();
+        request.source = Arc::new(request.source.with_recent_obstacle_points(
+            1, 1_000_000_000, 0, &[],
+            (0..5).map(|i| (i, [0.73, 0.8 + f64::from(i) * 0.1, 0.5])),
+        ).unwrap());
+        request.final_yaw = Some(0.0);
+        let began = std::time::Instant::now();
+        let result = kernel.compute_inner(&request, &cancel).unwrap();
+        let elapsed_ms = began.elapsed().as_secs_f64() * 1000.0;
+        let length_m: f64 = result.path.poses.windows(2)
+            .map(|p|p[0].pose.position.distance(p[1].pose.position)).sum();
+        let turns: Vec<_> = result.path.poses.windows(2).map(|p|
+            nuwax_nav_astar::controllers::angle_diff(p[1].pose.orientation.yaw(),p[0].pose.orientation.yaw()).abs()).collect();
+        eprintln!("FIRST_RECENT_PLAN elapsed_ms={elapsed_ms} scan_ms={} failed_attempts={} poses={} length_m={length_m} turn_rad={} max_turn_rad={}",
+            result.elapsed_ms, kernel.failed.len(), result.path.poses.len(),
+            turns.iter().sum::<f64>(), turns.iter().copied().fold(0.0,f64::max));
+        assert!(kernel.failed.is_empty(), "首次规划须先避开近期墙，不能消耗一次失败搜索后才绕行");
+        assert!(result.path.poses.iter().any(|p| (p.pose.position.y - 1.0).abs() > 0.1));
+        let end = result.path.poses.last().unwrap();
+        assert!(end.pose.position.distance(Point3::new(3.0, 1.0, 0.5)) < 0.35);
+        for pair in result.path.poses.windows(2) {
+            request.source.validate_body_motion(body(&pair[0]), body(&pair[1]), &[]).unwrap();
+        }
+    }
+    #[test]
     fn recent_detour_overlay_reuses_static_tomogram_and_clears_without_rebuild() {
         let (mut kernel,mut request,cancel)=fixture();
         kernel.compute_inner(&request,&cancel).unwrap_or_else(|e|panic!("baseline: {e:?}"));
@@ -575,7 +597,7 @@ mod tests {
         map.validate_body_motion(start,end,&request.boundary).expect("real long body fits the narrow door");
         let tomo=nuwax_nav_pct::Tomogram::local_from_surface(map,[0.5,1.0],6.5).unwrap();
         let hints=map.recent_obstacle_hints([[-6.5,-6.5],[6.5,6.5]],start).unwrap();
-        let overlay=recent_guide_overlay::RecentGuideOverlay::new(hints,tomo.resolution,map.body_envelope().unwrap()).unwrap();
+        let overlay=recent_guide_overlay::RecentGuideOverlay::new(hints,tomo.resolution,f64::from(map.source_voxel_size_m()),map.body_envelope().unwrap()).unwrap();
         assert!(!overlay.is_empty());
         assert!(tomo.plan_bounded_with_segment_filter(request.reference[0],*request.reference.last().unwrap(),
             tomo.resolution,&request.boundary,None,Some(7.5),&[],&|a,b|overlay.accepts(a,b)).is_err(),

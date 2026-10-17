@@ -17,6 +17,34 @@ pub(super) fn with_expansion_limit<T>(limit: usize, f: impl FnOnce() -> T) -> T 
     let _reset = Reset(EXPANSION_LIMIT.replace(limit));
     f()
 }
+// Production uses the caller's configured bound; tests may substitute a smaller
+// one so the identical exhaustion branch stays reachable without huge fixtures.
+#[cfg(not(test))]
+fn effective_expansion_limit(configured: usize) -> usize { configured }
+#[cfg(test)]
+fn effective_expansion_limit(_configured: usize) -> usize { EXPANSION_LIMIT.get() }
+
+// 队列排序对照实验。只影响排队优先级，不改变真实碰撞、支撑与运动许可。
+#[cfg(test)]
+#[derive(Clone, Copy, Default, PartialEq)]
+pub(super) enum HeuristicMode {
+    /// 乘积形式下界：max(行程时间, 转向时间)。
+    #[default]
+    AdmissibleMax,
+    /// 原始加权和，用于保持既有诊断可复现。
+    ScaledSum(f64),
+    /// 不加权的和，仍是下界但偏保守。
+    AdmissibleSum,
+}
+#[cfg(test)]
+thread_local! { static HEURISTIC_MODE: std::cell::Cell<HeuristicMode> = const { std::cell::Cell::new(HeuristicMode::AdmissibleMax) }; }
+#[cfg(test)]
+pub(super) fn with_heuristic_mode<T>(mode: HeuristicMode, f: impl FnOnce() -> T) -> T {
+    struct Reset(HeuristicMode);
+    impl Drop for Reset { fn drop(&mut self) { HEURISTIC_MODE.set(self.0); } }
+    let _reset = Reset(HEURISTIC_MODE.replace(mode));
+    f()
+}
 
 
 // Synthetic queue-order experiments only. Production builds and default tests do
@@ -108,6 +136,20 @@ pub fn probe_motion(
     boundary: &[[f64; 2]],
 ) -> Option<Vec<BodyPose>> {
     probe_motion_until(map,from,length,turn,boundary,|_|false).ok()
+}
+/// Diagnostic only: run one production primitive through the same swept-body
+/// admission the search uses, so a stall can be attributed to admission rather
+/// than to queue ordering. Never grants clearance to search.
+pub fn probe_swept_admission(
+    map: &SurfaceSnapshot,
+    from: BodyPose,
+    length: f64,
+    turn: f64,
+    boundary: &[[f64; 2]],
+) -> Result<Vec<BodyPose>, LocalPlanError> {
+    let (poses,views)=project_motion_until(map,from,length,turn,|_|false)?;
+    validate_projected(from,&poses,&views,boundary)?;
+    Ok(poses)
 }
 fn probe_motion_until(
     map: &SurfaceSnapshot,
@@ -213,6 +255,17 @@ struct ReferenceTurn {
     next: Option<usize>,
 }
 // One plan-local preparation; the guide's original >1e-9 heading rule is unchanged.
+/// 所有偏离原末点的候选共用同一窗口交接条件，不能只交付受阻前缀。
+pub(super) fn reference_handoff(p: BodyPose, reference: &[[f64; 3]], support_offset: f64,
+    corridor: f64, layer_tolerance: f64, reference_length: f64, tangent: f64) -> bool {
+    let Some(target) = reference.last() else { return false; };
+    let support = [p.0[0], p.0[1], p.0[2] - support_offset];
+    let (deviation, progress, height) = reference_progress(support, reference);
+    if (p.0[0]-target[0]).hypot(p.0[1]-target[1]) > corridor || deviation > corridor
+        || progress < reference_length - 1e-6 || (support[2]-height).abs() > layer_tolerance { return false; }
+    angle(yaw(p.1)-tangent).cos()>0.0
+}
+
 fn reference_turns(reference: &[[f64; 3]]) -> Result<Vec<ReferenceTurn>, LocalPlanError> {
     let mut turns = Vec::with_capacity(reference.len().saturating_sub(1));
     for pair in reference.windows(2) {
@@ -380,6 +433,7 @@ pub fn plan(
     horizon: f64,
     corridor: f64,
     follow_reference: bool,
+    expansion_limit: usize,
 ) -> Result<Vec<BodyPose>, LocalPlanError> {
     super::cancellation::checkpoint()?;
     validate_caps(motion)?;
@@ -411,18 +465,9 @@ pub fn plan(
                 < tolerance
                 && final_yaw.is_none_or(|heading| angle(yaw(p.1) - heading).abs() < 0.1);
         }
-        let (deviation, progress, height) =
-            reference_progress([p.0[0], p.0[1], p.0[2] - support_offset], reference);
-        if distance(p) > corridor
-            || deviation > corridor
-            || progress < reference_length - 1e-6
-            || (p.0[2] - support_offset - height).abs() > layer_tolerance
-        {
-            return false;
-        }
         // 中间轨迹必须走到窗口末端的横截面，并保持前向朝向。
         // 不能把障碍前的六成前缀当作已经接通交接点。
-        angle(yaw(p.1) - tangent).cos() > 0.0
+        reference_handoff(p, reference, support_offset, corridor, layer_tolerance, reference_length, tangent)
     };
     // 绕行窗口的目标可能就在墙另一侧；直线距离会把搜索反复拉回已失败的通道。
     // 沿已给出的参考走廊估计剩余行程，仍由实际机体动作决定能否通行。
@@ -474,7 +519,26 @@ pub fn plan(
         let (remaining_distance,progress)=remaining(p);
         let guide = follow_reference.then(|| reference_guide(reference,progress+guidance_distance,reference_length));
         let turn = heading_potential(p,target,tangent,corridor,arrival.is_some(),guide,&turns);
-        4.0*remaining_distance/motion.max_forward_mps+4.0*turn/motion.max_angular_rps
+        // Guided weighted nominal seconds. The weight deliberately over-estimates
+        // the per-metre floor so the queue stays focused on the reference corridor;
+        // every admitted edge still passes the full swept-body checks, so this
+        // ranks work rather than granting clearance. A pure lower bound expands
+        // far more states to reach the same connection.
+        #[cfg(test)]
+        {
+            match HEURISTIC_MODE.with(|v|v.get()) {
+                HeuristicMode::AdmissibleMax => return (remaining_distance/motion.max_forward_mps)
+                    .max(turn/motion.max_angular_rps),
+                HeuristicMode::ScaledSum(w) => return w*remaining_distance/motion.max_forward_mps
+                    + w*turn/motion.max_angular_rps,
+                HeuristicMode::AdmissibleSum => return remaining_distance/motion.max_forward_mps
+                    + turn/motion.max_angular_rps,
+            }
+        }
+        #[cfg(not(test))]
+        {
+            4.0*remaining_distance/motion.max_forward_mps+4.0*turn/motion.max_angular_rps
+        }
     };
     // Exact identity retains legal centimetre departures and small rotations.
     // More distinct states compete within the same finite expansion budget.
@@ -500,10 +564,7 @@ pub fn plan(
     let mut expanded = 0;
     let mut closest = start;
     let mut budget_exhausted = false;
-    #[cfg(not(test))]
-    let expansion_limit = 256;
-    #[cfg(test)]
-    let expansion_limit = EXPANSION_LIMIT.get();
+    let expansion_limit = effective_expansion_limit(expansion_limit);
     while let Some(Entry(_priority, id)) = open.pop() {
         super::cancellation::checkpoint()?;
         let from = nodes[id].pose;
@@ -513,6 +574,14 @@ pub fn plan(
             .is_some_and(|&v| cost > v + 1e-9)
         {
             continue;
+        }
+        #[cfg(all(test,feature="profile"))]
+        if std::env::var_os("NEH_ON_POP_TRACE").is_some() {
+            eprintln!("ON_POP {}",serde_json::json!({"id":id,"parent":nodes[id].parent,
+                "pose":from,"g":cost,"h":heuristic(from),"f":_priority,
+                "start_xy":[start.0[0],start.0[1]],"expanded":expanded,
+                "travel":(from.0[0]-start.0[0]).hypot(from.0[1]-start.0[1]),
+                "nodes":nodes.len(),"frontier":open.len()}));
         }
         #[cfg(all(test,feature="profile"))]
         if std::env::var_os("NEH_ON_DIAGNOSTIC").is_some() {

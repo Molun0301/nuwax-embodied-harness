@@ -7399,7 +7399,7 @@ fn matrix_publish_device_frame(
 ) -> (RawLcmFrame, RawLcmFrame) {
     let sequence = u32::try_from(frame.odometry.header.seq).expect("device sequence is positive");
     let odometry = typed_binding("/odom", "nav_msgs.Odometry");
-    let cloud = typed_binding("/go2/lidar/points", "sensor_msgs.PointCloud2");
+    let cloud = typed_binding("/lidar/points", "sensor_msgs.PointCloud2");
     let odometry_frame = nuwax_protocol::RawLcmFrameBuilder::new(odometry.0, odometry.1)
         .seqno(sequence)
         .payload(schema::encode_odometry_body(&frame.odometry).expect("encode device odometry"))

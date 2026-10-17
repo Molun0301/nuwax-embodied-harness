@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Dict, Optional
 
 from adapters.base import AdapterConfig
 from contracts.calibration import SensorTopology
+from contracts.motion_limits import MotionCommandLimits
 from drivers.common.assembly import RobotAssemblyBase, RobotAssemblyStatus
 from drivers.common.manifest import RobotDefaults
 from drivers.customrobot.manifest import build_customrobot_defaults, build_customrobot_manifest
@@ -41,6 +42,11 @@ class CustomRobotAssembly(RobotAssemblyBase):
         if self.list_adapters():
             return None
         return False
+
+    def get_motion_command_limits(self) -> Optional[MotionCommandLimits]:
+        """接入方只返回已发现的本地策略快照；目录读取不能发起设备请求。"""
+        getter = getattr(self.motion_control, "get_motion_command_limits", None)
+        return getter() if callable(getter) else None
 
     def start(self) -> None:
         """启用标准输入并初始化接入方绑定的适配器。"""

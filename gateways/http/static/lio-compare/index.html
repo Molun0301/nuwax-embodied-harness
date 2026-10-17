@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>LIO建图效果对比</title>
+<link rel="stylesheet" href="/static/lio-compare/comparison.css"></head><body>
+<header><div><h1>LIO建图效果对比</h1><div class="source">正在读取本版本的数据来源</div></div><small>选择参考结果与待对比结果</small></header>
+<main><aside>
+<label for="reference">参考结果</label><select id="reference"></select><label for="variant">待对比结果</label><select id="variant"><option>正在读取版本…</option></select>
+<div class="badge" id="badge">加载中</div><div id="change"></div><details><summary>具体修改位置</summary><div id="location"></div><div id="identity"></div></details><div id="assessment"></div>
+<div class="cards"><div class="card"><small id="reference-metric-label">参考起终段距离</small><div class="number" id="fast-metric">—</div></div><div class="card"><small id="candidate-metric-label">此版起终段距离</small><div class="number" id="point-metric">—</div></div></div>
+<p class="note" id="metric-note">首末距离不等于绝对精度；需要相同输入、坐标约定及实际返回起点的证据。</p>
+<div class="buttons"><button id="fit">按参考图取景</button><button id="candidate-fit">查看此版全图</button><button id="top">俯视</button><button id="side">侧视</button></div>
+<label class="check"><input id="sync" type="checkbox" checked>两幅图使用同一视角</label><label class="check"><input id="trajectory" type="checkbox">显示行走轨迹</label>
+<label for="color">点云颜色</label><select id="color"><option value="height">按高度</option><option value="time">按采集先后</option></select>
+<label for="end">显示至 <strong id="time-value">420</strong> 秒</label><div class="range"><span>0</span><input id="end" type="range" min="0" max="420" step="1" value="420"><span id="time-max">420</span></div>
+<label for="size">点大小</label><input id="size" type="range" min="1" max="4" step=".25" value="1.25" style="width:100%">
+<p class="note">左键拖动旋转 · 右键平移 · 滚轮缩放。绿色是出发段，橙色是末段。所有图均保留原始高度和估计轨迹，没有人工拉直或强行闭合。</p><div id="error"></div>
+</aside><div class="stage"><section class="view" id="left"><div class="caption"><b id="left-title">参考结果</b><p id="left-status">正在读取…</p></div><div class="overlay">保留导入数据</div></section><section class="view" id="right"><div class="caption"><b id="right-title">待对比结果</b><p id="right-status">正在读取…</p></div><div class="overlay">每个版本保留真实三维形状</div></section></div></main>
+<script type="module" src="/static/lio-compare/comparison.js"></script></body></html>

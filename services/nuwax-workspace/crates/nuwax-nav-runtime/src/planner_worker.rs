@@ -83,7 +83,7 @@ fn arrival_event_still_in_goal(input: &Inputs) -> bool {
 
 /// 计算线程没有运动端，结果须经原调度器核对目标身份再执行。
 pub(crate) struct PlannerWorker {
-    shared: Arc<(Mutex<Inputs>, Condvar)>,
+    shared: Arc<(Mutex<Inputs>, Condvar, Condvar)>,
     thread: Option<std::thread::JoinHandle<()>>,
     wait_reason: Option<String>,
     delivered_dispatch_bound: Option<CommandDispatchBound>,
@@ -100,12 +100,12 @@ impl PlannerWorker {
         self.delivered_command_context.as_ref()
     }
     pub(crate) fn new(mut planner: impl NavPlanner) -> Result<Self, RuntimeError> {
-        let shared = Arc::new((Mutex::new(Inputs::default()), Condvar::new()));
+        let shared = Arc::new((Mutex::new(Inputs::default()), Condvar::new(), Condvar::new()));
         let worker = Arc::clone(&shared);
         let thread = std::thread::Builder::new()
             .name("nav-local-compute".into())
             .spawn(move || {
-                let (lock, wake) = &*worker;
+                let (lock, wake, published) = &*worker;
                 let mut goal_version = u64::MAX;
                 let mut path_version = u64::MAX;
                 let mut map_version = 0;
@@ -198,7 +198,7 @@ impl PlannerWorker {
                             applied_bits:crate::command_proof_trace::command_bits(applied),
                             epoch:version,goal_version:goal_seq,path_version:path_seq,map_version:map_seq,
                             boundary_version:boundary_seq,pose_version:pose_seq,applied_version:applied_seq,
-                            compute_started:started,compute_start_unix_ns:crate::command_proof_trace::unix_ns(),
+                            compute_started:std::time::Instant::now(),compute_start_unix_ns:crate::command_proof_trace::unix_ns(),
                         })
                     });
                     let span=tracing::info_span!("navigation.local",goal_id=%goal_id);
@@ -331,7 +331,7 @@ impl PlannerWorker {
                         }else{computed};
                         input.result_dispatch_bound=dispatch_bound;
                         input.result = Some((started, computed));
-                        #[cfg(test)] {input.result_proof=if matches!(input.result.as_ref(),Some((_,PlannerStep::Command(_)))) {computed_proof.map(|proof|proof.published())}else{None};}
+                        #[cfg(test)] {input.result_proof=if matches!(input.result.as_ref(),Some((_,PlannerStep::Command(_)))) {computed_proof.map(|proof|proof.published_for(started))}else{None};}
                         input.result_pose_version = pose_seq;
                         input.result_applied_version = applied_seq;
                         input.result_map_version = map_seq;
@@ -342,6 +342,7 @@ impl PlannerWorker {
                         input.result_boundary_version = boundary_seq;
                         input.result_wait_reason = wait_reason;
                         input.display_path = display_path;
+                        published.notify_one();
                     }
                     drop(input);
                     // 日志不持输入锁，慢磁盘不能阻塞调度器的取消与续租。
@@ -495,6 +496,7 @@ impl NavPlanner for PlannerWorker {
     }
     fn take_command_dispatch_bound(&mut self)->Option<CommandDispatchBound> {self.delivered_dispatch_bound.take()}
     fn step(&mut self, width: f64) -> PlannerStep {
+        let tick_deadline=std::time::Instant::now()+DEFAULT_TICK_INTERVAL;
         self.delivered_dispatch_bound=None;
         #[cfg(test)] {self.delivered_command_context=None;}
         let mut input = self.shared.0.lock().unwrap();
@@ -506,6 +508,30 @@ impl NavPlanner for PlannerWorker {
             return PlannerStep::Failed("局部计算线程已退出".into());
         }
         input.control_width = Some(width);
+        // 位姿接收可能紧贴控制拍。已有候选失效时，在本拍预算内接收工作线程
+        // 的当前状态复核；不能因先读取空隙而固定停满下一拍。条件变量释放
+        // 输入锁，不执行几何、不轮询；超时仍归零，原候选及来源期限不续期。
+        let refresh_in_tick=input.result.as_ref().is_some_and(|(started,step)|
+            matches!(step,PlannerStep::Command(c) if *c!=Twist2::ZERO)
+                && started.elapsed()<=DEFAULT_CONTROL_HORIZON
+                && !input.result_dispatch_bound.is_some_and(CommandDispatchBound::expired_now)
+                && (input.result_pose_version!=input.pose_version
+                    || input.result_applied_version!=input.applied_version
+                    || input.result_map_version!=input.map_version
+                    || input.result_boundary_version!=input.boundary_version));
+        if refresh_in_tick {
+            input.requested=Some(width);
+            self.shared.1.notify_one();
+            let epoch=input.epoch;
+            let remaining=tick_deadline.saturating_duration_since(std::time::Instant::now());
+            input=self.shared.2.wait_timeout_while(input,remaining,|input|
+                input.epoch==epoch && !input.closed && (input.result.is_none()
+                    || input.result_pose_version!=input.pose_version
+                    || input.result_applied_version!=input.applied_version
+                    || input.result_map_version!=input.map_version
+                    || input.result_boundary_version!=input.boundary_version)
+            ).unwrap().0;
+        }
         let expired = input.result.as_ref().is_some_and(|(started, step)|
             matches!(step, PlannerStep::Command(_)) && started.elapsed() > DEFAULT_CONTROL_HORIZON);
         let dispatch_expired=input.result_dispatch_bound.is_some_and(CommandDispatchBound::expired_now);
@@ -1851,6 +1877,27 @@ mod tests {
         // A coalesced request may already have entered the gated test planner;
         // release it after stop so its late result must retire without a long join.
         let _=release.send(());
+    }
+
+    #[test]
+    fn current_tick_refresh_timeout_keeps_zero_and_stop_responsive() {
+        let(mut worker,started,finish)=terminal_worker();
+        worker.update_odometry(route_pose(0.5,0));
+        worker.step(0.3);started.recv_timeout(Duration::from_secs(1)).unwrap();
+        finish.send(PlannerStep::Command(Twist2 {
+            linear:nuwax_nav_types_messages::Point2::new(0.1,0.0),angular_z:0.0,
+        })).unwrap();
+        wait_for_source_result(&worker);
+        worker.update_odometry(route_pose(0.6,1));
+        // 新计算由通道挂起；控制拍必须在有界时间内归零，不能续用旧许可。
+        let began=std::time::Instant::now();
+        assert!(matches!(worker.step(0.3),PlannerStep::Pending(_)));
+        assert!(began.elapsed()<DEFAULT_TICK_INTERVAL*2,"等待超过一个控制拍加调度余量");
+        assert!(worker.delivered_command_deadline_for_test().is_none());
+        let stopped=std::time::Instant::now();
+        worker.stop();
+        assert!(stopped.elapsed()<Duration::from_millis(20));
+        let _=finish.send(PlannerStep::Pending(Vec::new()));
     }
 
     /// Diagnostic falsifier: static evidence and a held next publication isolate

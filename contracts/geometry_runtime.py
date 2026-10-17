@@ -250,7 +250,7 @@ class LcmChannelConfig:
     odom: str = "/odom#nav_msgs.Odometry"
     tf: str = "/tf#tf2_msgs.TFMessage"
     tf_static: str = "/tf_static#tf2_msgs.TFMessage"
-    point_cloud: str = "/go2/lidar/points#sensor_msgs.PointCloud2"
+    point_cloud: str = "/lidar/points#sensor_msgs.PointCloud2"
     occupancy: str = "/map/occupancy#nav_msgs.OccupancyGrid"
     planar_navigation: str = "/nav/planar_occupancy#nuwax_msgs.PlanarNavigationMap"
     cmd_vel: str = "/cmd_vel#geometry_msgs.Twist"

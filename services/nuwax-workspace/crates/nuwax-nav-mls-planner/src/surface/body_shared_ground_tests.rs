@@ -39,6 +39,10 @@ fn shared_legacy_bands_keep_exact_membership_contact_quantization_and_provenance
 }
 
 fn with_measured_floor(map:SurfaceSnapshot,plane_z:f64)->SurfaceSnapshot {
+    with_measured_floor_heights(map,|_,_|plane_z)
+}
+
+fn with_measured_floor_heights(map:SurfaceSnapshot,height:impl Fn(i32,i32)->f64)->SurfaceSnapshot {
     use nuwax_map_chunks::{LayerObservation,LayerObservations,LayerSample,block_key,local_key};
     let mut observations=map.observations.as_ref().unwrap().as_ref().clone();
     let q=f64::from(observations.size_m);
@@ -50,7 +54,8 @@ fn with_measured_floor(map:SurfaceSnapshot,plane_z:f64)->SurfaceSnapshot {
     for (key,values) in occupancy {observations.replace_block(key,values).unwrap();}
     let mut blocks=std::collections::BTreeMap::<[i32;3],LayerObservations>::new();
     for x in -12..12 {for y in -12..12 {
-        let key=[x,y,-1];let local=local_key(key);
+        let plane_z=height(x,y);
+        let key=[x,y,(plane_z/q).floor() as i32];let local=local_key(key);
         let origin=[(f64::from(x)+0.5)*q,(f64::from(y)+0.5)*q,plane_z];
         blocks.entry(block_key(key)).or_default().insert(local,LayerObservation {
             members:vec![local],normal:[0.0,0.0,1.0],plane_origin:origin,
@@ -61,6 +66,59 @@ fn with_measured_floor(map:SurfaceSnapshot,plane_z:f64)->SurfaceSnapshot {
     for (block,layers) in blocks {observations.replace_ground_layers(block,Arc::new(layers)).unwrap();}
     observations.mark_complete_geometry_source();
     map.with_observations(Some(Arc::new(observations)))
+}
+
+#[test]
+fn measured_layer_change_recomputes_contact_neighbors_without_rewriting_occupancy() {
+    let mut envelope=model();envelope.max_step_up_m=0.0;envelope.max_step_down_m=0.0;
+    let map=with_measured_floor(layered_map(&[[-2,-1]]),-0.075)
+        .with_body_envelope(envelope).unwrap();
+    let centre=map.locate_support([0.05,0.05,-0.075]).unwrap();
+    let old_patch=map.ground_patch(centre,0.4);
+    assert!(old_patch.contains_key(&(2,0)));
+    let changed=with_measured_floor_heights(map.clone(),|x,_|if x>=4 {-0.005}else{-0.075});
+    assert!(map.same_geometry(&changed),"层面更新不能重建未变化的物理占据图");
+    let next=changed.locate_support([0.05,0.05,-0.075]).unwrap();
+    assert_eq!(centre,next,"中心未变化，变化发生在接触邻域边缘");
+    assert!(!changed.ground_patch(next,0.4).contains_key(&(2,0)),
+        "零越阶机体不能复用旧平面跨过新测得的7厘米高度差");
+    assert!(map.ground_patch(centre,0.4).contains_key(&(2,0)),"旧快照仍须返回自己的地面层");
+}
+
+#[test]
+fn observed_ground_height_does_not_absorb_an_upper_return_in_the_same_coarse_cell() {
+    let mut envelope=model();envelope.z_bounds_m=[-0.4,0.2];
+    let map=with_measured_floor(layered_map(&[[0,0],[1,1]]),0.025)
+        .with_body_envelope(envelope).unwrap();
+    let pose=([0.025,0.025,0.425],[0.,0.,0.,1.]);
+    let location=map.locate_support_from_body(pose.0,pose.1,0.4).unwrap();
+    assert!((location.surface_xyz[2]-0.025).abs()<1e-12);
+    assert_eq!(map.query_ground([0.025,0.025],0.025).height,Some(0.025));
+    assert!(map.observations.as_ref().unwrap().get([0,0,1]).is_some());
+    assert_eq!(map.validate_body_pose(pose.0,pose.1),Err(SurfaceError::InsufficientClearance),
+        "地面参考下降不能把同粗格内未分类的真实障碍变成接触面");
+}
+
+#[test]
+fn support_anchor_uses_the_observed_layer_plane_at_both_grid_resolutions() {
+    for coarse in [0.05,0.1] {
+        let original=layered_map(&[[-1,-1],[17,19]]);
+        let mut config=original.config().clone();config.voxel_size=coarse;
+        let points:Vec<_>=original.observations.as_ref().unwrap().navigation_columns()
+            .flat_map(|(xy,zs)|zs.iter().map(move|&z|((xy[0] as f32+0.5)*0.05,
+                (xy[1] as f32+0.5)*0.05,(z as f32+0.5)*0.05))).collect();
+        let source=SurfaceSnapshot::from_points(&points,config,0.05).unwrap()
+            .with_body_envelope(model()).unwrap().with_observations(original.observations.clone());
+        let map=with_measured_floor(source,-0.025);
+        for body_z in [0.375,0.39,0.415] {
+            let location=map.locate_support_from_body([0.025,0.025,body_z],[0.,0.,0.,1.],0.4).unwrap();
+            eprintln!("GROUND_ANCHOR coarse={coarse} body_z={body_z} height={}",location.surface_xyz[2]);
+            assert!((location.surface_xyz[2]+0.025).abs()<1e-12,
+                "粗支撑定位与精细地面查询必须使用同一个真实观测平面");
+            assert!((map.query_ground([0.025,0.025],body_z-0.4).height.unwrap()+0.025).abs()<1e-12);
+        }
+        assert!(map.observations.as_ref().unwrap().get([0,0,19]).is_some(),"上层占据不能被地面估计清除");
+    }
 }
 
 #[test]
@@ -178,4 +236,42 @@ fn unknown_motion_keeps_current_reference_and_factual_unknown_state() {
     assert!(map.locate_support([4.35,0.05,0.1]).is_err());
     let blocked=map.with_recent_obstacle_points(1,100,0,&[],[(0,[4.2,0.05,0.55])]).unwrap();
     assert_eq!(blocked.validate_body_motion(pose,next,&[]),Err(SurfaceError::InsufficientClearance));
+}
+
+#[test]
+fn reported_g1_pose_keeps_unclassified_ankle_height_voxel_as_obstacle() {
+    // 仅复用报告的姿态和包络；平地与单格障碍为合成输入，不冒充遗失的现场地图。
+    let body=[0.025503599830406017,-0.01896920386050657,0.026239193644733066];
+    let q=[-0.020289298542609635,0.003576779120836624,0.2868225967805427,0.9577621567966841];
+    let envelope=SurfaceBodyEnvelope {
+        footprint_xy_m:vec![[-0.029020616290581558,-0.21585853486343462],
+            [0.4539265102797319,-0.21585853486343462],[0.4539265102797319,0.220775355547328],
+            [-0.029020616290581558,0.220775355547328]],
+        z_bounds_m:[-0.9432042695110971,0.3386525932121276],
+        body_to_support_z_m:0.9432044618093445,max_step_up_m:0.0,max_step_down_m:0.0,
+        max_cross_slope_deg:10.0,support_uncertainty_m:0.02,
+    };
+    let make_map=|obstacle:bool| {
+        let fine=0.05_f32;
+        let mut keys:Vec<[i32;3]>=(-16..16).flat_map(|x|(-16..16).map(move|y|[x,y,-19])).collect();
+        if obstacle {keys.push([5,4,-18]);}
+        let points:Vec<_>=keys.iter().map(|k|((k[0] as f32+0.5)*fine,
+            (k[1] as f32+0.5)*fine,(k[2] as f32+0.5)*fine)).collect();
+        let mut blocks=std::collections::BTreeMap::<_,std::collections::BTreeMap<_,_>>::new();
+        for key in keys {blocks.entry(key.map(|v|v.div_euclid(32))).or_default()
+            .insert(key,SurfaceObservation{observed_ns:100,hits:1});}
+        let mut observations=SurfaceObservations::new(fine,32).unwrap();
+        for (key,values) in blocks {observations.replace_block(key,values).unwrap();}
+        observations.mark_complete_geometry_source();
+        let mut config=scene(&[],false).config().clone();config.wall_clearance_m=0.0;
+        SurfaceSnapshot::from_points(&points,config,fine).unwrap()
+            .with_body_envelope(envelope.clone()).unwrap().with_observations(Some(Arc::new(observations)))
+    };
+    let floor=make_map(false);
+    assert_eq!(floor.validate_body_pose(body,q),Ok(()),"精细地面应已有接触豁免");
+    let blocked=make_map(true);
+    let mut witness=None;
+    assert_eq!(blocked.check_body_pose(body,q,&mut witness),Err(SurfaceError::InsufficientClearance));
+    assert!(matches!(witness,Some(BodyRejection::Occupancy{cell:[5,4,-18],source:OccupancySource::Fine,..})),"{witness:?}");
+    eprintln!("报告姿态合成对照：平地通过，未分类低障碍保持拒绝：{witness:?}");
 }

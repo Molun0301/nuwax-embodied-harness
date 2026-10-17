@@ -394,12 +394,24 @@ impl Terrain {
         Ok(samples)
     }
 
-    fn body_at(
+    fn body_at(&self, xy: [f64; 2], reference: f64, heading: f64, offset: f64)
+        -> Result<Body, String> {
+        self.fit_body_at(xy, reference, heading, offset, false)
+    }
+
+    /// 静态地面查询保持幂等；实际运动对有厚度的接触区间使用加权响应。
+    fn response_at(&self, xy: [f64; 2], reference: f64, heading: f64, offset: f64)
+        -> Result<Body, String> {
+        self.fit_body_at(xy, reference, heading, offset, true)
+    }
+
+    fn fit_body_at(
         &self,
         xy: [f64; 2],
         reference: f64,
         heading: f64,
         offset: f64,
+        response: bool,
     ) -> Result<Body, String> {
         if self.flat {
             return Ok(([xy[0], xy[1], offset], quaternion(0., 0., heading)));
@@ -428,7 +440,10 @@ impl Terrain {
         let lower=samples.iter().map(|s|s.2).fold(f64::NEG_INFINITY,f64::max);
         let upper=samples.iter().map(|s|s.3).fold(f64::INFINITY,f64::min);
         if lower<=upper {
-            return Ok(([xy[0],xy[1],reference.clamp(lower,upper)+offset],quaternion(0.0,0.0,heading)));
+            let height = if response {
+                interval_height_response(&samples, reference, lower, upper)
+            } else { reference.clamp(lower, upper) };
+            return Ok(([xy[0],xy[1],height+offset],quaternion(0.0,0.0,heading)));
         }
         let centre=samples.iter().map(|s|(s.2+s.3)*0.5*s.4).sum::<f64>()/sw;
         let mut plane = [0.0, 0.0, centre];
@@ -461,6 +476,34 @@ impl Terrain {
         let roll = ((-gx * heading.sin() + gy * heading.cos()) * pitch.cos()).atan();
         Ok(([xy[0], xy[1], z + offset], quaternion(roll, pitch, heading)))
     }
+}
+
+/// 独立最小化共同区间的加权残差与实际高度偏差，系数来自区间宽度和空间跨度。
+/// 用单调导数二分求根，与生产端的端点事件算法交叉核对，不读取规划预测或路线。
+fn interval_height_response(samples: &[(f64, f64, f64, f64, f64)], reference: f64,
+    lower: f64, upper: f64) -> f64 {
+    let clamped = reference.clamp(lower, upper);
+    if clamped == reference { return reference; }
+    let (mut mass, mut uncertainty, mut span) = (0.0, 0.0, 0.0);
+    for &(x, y, low, high, weight) in samples {
+        mass += weight;
+        uncertainty += weight * (high-low).powi(2) / 12.0;
+        span += weight * (x*x+y*y);
+    }
+    // 精确单层没有厚度不确定性，保留原真实踏面高度。
+    if uncertainty == 0.0 { return clamped; }
+    let anchor = mass * uncertainty / (uncertainty + span);
+    let mut lo = reference.min(clamped);
+    let mut hi = reference.max(clamped);
+    for _ in 0..64 {
+        let mid = lo + (hi-lo) * 0.5;
+        if mid == lo || mid == hi { break; }
+        let gradient = anchor * (mid-reference) + samples.iter().map(|&(_,_,low,high,w)|
+            w * (mid-mid.clamp(low,high))).sum::<f64>();
+        if gradient == 0.0 { return mid; }
+        if gradient < 0.0 { lo = mid; } else { hi = mid; }
+    }
+    lo + (hi-lo) * 0.5
 }
 
 struct Scene {
@@ -905,13 +948,13 @@ impl Simulation {
         let planar = integrate(self.current, mean, DT);
         let offset = scene.config.follower.body_to_support_z_m;
         let heading = yaw(planar);
-        let before_ground = scene.terrain.body_at(
+        let before_ground = scene.terrain.response_at(
             [self.current.0[0], self.current.0[1]],
             contact_reference(self.current, offset),
             yaw(self.current),
             offset,
         )?;
-        let after_ground = scene.terrain.body_at(
+        let after_ground = scene.terrain.response_at(
             [planar.0[0], planar.0[1]],
             contact_reference(self.current, offset),
             heading,
@@ -1200,11 +1243,12 @@ fn run() -> Result<(), String> {
                     let scene=scenes.get(request["scene_id"].as_str().ok_or("场景缺失")?).ok_or("场景不存在")?;
                     let from:Body=serde_json::from_value(request["from"].clone()).map_err(|e|e.to_string())?;
                     let to:Body=serde_json::from_value(request["to"].clone()).map_err(|e|e.to_string())?;
+                    let mut witness=None;
                     let full=scene.map.with_current_body_support(from.0,from.1)
-                        .and_then(|m|m.validate_body_motion(from,to,&[])).map_err(|e|e.to_string());
+                        .and_then(|m|m.validate_body_motion_with_witness(from,to,&[],&mut witness)).map_err(|e|e.to_string());
                     let query=scene.map.body_query_with_current_support(from.0,from.1)
                         .and_then(|m|m.validate_body_motion(from,to,&[])).map_err(|e|e.to_string());
-                    Ok(json!({"full":full,"query":query}))
+                    Ok(json!({"full":full,"query":query,"witness":format!("{witness:?}")}))
                 }
                 "inspect_motions" => {
                     let scene=scenes.get(request["scene_id"].as_str().ok_or("场景缺失")?).ok_or("场景不存在")?;
@@ -1543,6 +1587,45 @@ mod tests {
             down.iter().all(|p| (p.3 - 3.0 * source).abs() < 1e-12),
             "没有下阶能力时不能借低层拟合高台姿态"
         );
+    }
+
+    #[test]
+    fn interval_response_matches_analytic_minima_and_weight_scale() {
+        let samples = [(-1.0,0.0,-1.0,1.0,1.0),(1.0,0.0,-1.0,0.0,1.0),
+            (0.0,1.0,-1.0,1.0,1.0),(0.0,-1.0,-1.0,1.0,1.0)];
+        // 此几何给出α=52/61；上方仅一项活跃，下方四项活跃，解析极值分别如下。
+        for (reference, expected) in [(0.25,13.0/113.0),(-1.25,-309.0/296.0)] {
+            for scale in [0.001,1.0,1000.0] {
+                let weighted: Vec<_> = samples.iter().map(|&(x,y,l,h,w)|(x,y,l,h,w*scale)).collect();
+                let actual = interval_height_response(&weighted,reference,-1.0,0.0);
+                assert!((actual-expected).abs()<1e-12,
+                    "独立求根应满足解析极值且不依赖权重总量：{actual} {expected}");
+            }
+        }
+    }
+
+    #[test]
+    fn vanishing_weight_contact_does_not_jump_to_a_noisy_band_boundary() {
+        let source = f64::from(0.05_f32);
+        let mut points = Vec::new();
+        for x in -12..=12 { for y in -12..=12 {
+            for z in -2..=0 {
+                if (x, y) == (7, 0) && z != -1 { continue; }
+                points.push((((f64::from(x) + 0.5) * source) as f32,
+                    ((f64::from(y) + 0.5) * source) as f32,
+                    ((f64::from(z) + 0.5) * source) as f32));
+            }
+        }}
+        let terrain = test_terrain(&points, false);
+        let boundary = 7.5 * source
+            - (terrain.response_radius_m.powi(2) - (0.5 * source).powi(2)).sqrt();
+        let before = terrain.response_at([boundary - 1e-6, 0.0], 0.01, 0.0, 0.4).unwrap();
+        let after = terrain.response_at([boundary + 1e-6, 0.0], 0.01, 0.0, 0.4).unwrap();
+        assert!((before.0[2] - after.0[2]).abs() < 1e-8,
+            "趋近零权重的边缘厚带样本不能强迫整个机体突降：{before:?} → {after:?}");
+        let entered = terrain.response_at([boundary + 0.1, 0.0], 0.01, 0.0, 0.4).unwrap();
+        assert!(entered.0[2] < before.0[2] && entered.0[2] > 0.4,
+            "观测权重增长后必须连续产生真实响应，不能冻结高度或直接跳到边界");
     }
 
     #[test]

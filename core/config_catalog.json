@@ -1443,7 +1443,7 @@
   "NUWAX_LCM_CHANNEL_POINTCLOUD": {
     "zh_name": "原始点云通道",
     "type": "str",
-    "default": "/go2/lidar/points#sensor_msgs.PointCloud2",
+    "default": "/lidar/points#sensor_msgs.PointCloud2",
     "section_id": "lcm",
     "target_file": "core_env",
     "consumers": [

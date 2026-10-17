@@ -488,6 +488,14 @@ impl SurfaceFollower {
         while self.path_index < path.poses.len() {
             let target = &path.poses[self.path_index];
             let previous = &path.poses[self.path_index - 1];
+            // 完整姿态重复的接点不包含新运动，直接沿已消费的前点推进。
+            // 否则低频位姿越过接点时，零长度横向距离会成为NaN并锁住进度。
+            // 高度或任意姿态分量不同的点仍由原平移/转向检查处理。
+            if target.pose==previous.pose {
+                self.progress_m=self.cumulative[self.path_index];
+                self.path_index+=1;
+                continue;
+            }
             // 连续曲线拼接会保留重复端点；零长度、零偏航变化不产生新的转向意图。
             let rotation = is_rotation(target,previous);
             let error = angle_diff(target.pose.orientation.yaw(), yaw);
@@ -646,16 +654,11 @@ impl SurfaceFollower {
         }
         let target = &path.poses[self.path_index];
         let previous = &path.poses[self.path_index - 1];
-        let deviation = if self.config.local_planning_enabled {
-            position.distance(previous.pose.position).min(position.distance(target.pose.position))
-        } else {
-            // Global routes may have long sparse segments. Their midpoint is on
-            // the route, even when it is far from both stored endpoints. This is
-            // a distance check only; the same body/braking guards still run.
-            let (_, projected) = closest_in_window(path, &self.cumulative, position,
-                self.cumulative[self.path_index - 1], self.cumulative[self.path_index]);
-            position.distance(projected.pose.position)
-        };
+        // 偏离按当前连续路段的三维投影计算，不能由采样点密度决定阈值。
+        // 零长度转向段仍投影到原支点；机体及制动扫掠继续独立核验。
+        let (_, projected) = closest_in_window(path, &self.cumulative, position,
+            self.cumulative[self.path_index - 1], self.cumulative[self.path_index]);
+        let deviation = position.distance(projected.pose.position);
         if deviation > self.config.max_path_deviation_m {
             return PlannerStep::ReplanRequired("机体偏离连续三维路线".into());
         }

@@ -97,8 +97,8 @@ pub const MAX_NAV_REQUEST_TIMEOUT: Duration = Duration::from_millis(250);
 pub const DEFAULT_POSE_TTL: Duration = Duration::ZERO;
 /// 地图在同一来源内持续有效，直到更新、清空或来源失效。
 pub const DEFAULT_COSTMAP_TTL: Duration = Duration::ZERO;
-/// 零表示持续等待路径，用户取消和任务显式期限仍有效。
-pub const DEFAULT_PATH_WAIT_TIMEOUT: Duration = Duration::ZERO;
+/// 默认连续等待路径或可执行运动的期限；成功执行运动后重新计时。
+pub const DEFAULT_PATH_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 /// 局部运动预测长度，与输入过期门槛独立。
 pub const DEFAULT_CONTROL_HORIZON: Duration = Duration::from_millis(250);
 /// Hard upper bound from cancel admission to a terminal fence attempt.
@@ -1670,10 +1670,13 @@ where
                     return self.check_path_wait_timeout(status_tx).await;
                 }
                 if twist == Twist2::ZERO {
-                    if let Some(reason) = wait_reason {
-                        self.status.message = reason;
-                        self.publish_status(status_tx);
-                    }
+                    // 零速已确认不等于规划恢复；同一轮持续等待不能被每拍归零续期。
+                    // 正常制动后会继续运动或到达；缺少原因也不能无限清除等待期限。
+                    self.path_wait_started_at.get_or_insert_with(Instant::now);
+                    self.status.message = wait_reason.filter(|reason| !reason.trim().is_empty())
+                        .unwrap_or_else(|| "控制器持续零速，等待可执行运动".into());
+                    self.publish_status(status_tx);
+                    return self.check_path_wait_timeout(status_tx).await;
                 }
                 self.path_wait_started_at = None;
                 Ok(())
@@ -4111,6 +4114,63 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn default_wait_budget_terminates_all_stationary_waits_and_allows_recovery() {
+        for reason in [None, Some(""), Some("当前几何尚无可执行运动")] {
+        for pending in [false, true] {
+            for recover in [false, true] {
+                let planner = FakePlanner::commanding();
+                {
+                    let mut state = planner.state.lock().unwrap();
+                    state.step = if pending { PlannerStep::Pending(vec![]) }
+                        else { PlannerStep::Command(Twist2::ZERO) };
+                    state.wait_reason = reason.map(str::to_owned);
+                }
+                let mut scheduler = NavScheduler::new(
+                    FakeMotion(Arc::new(Mutex::new(FakeMotionState::default()))),
+                    planner, SchedulerConfig::default()).unwrap();
+                let (sender, _) = watch::channel(scheduler.status.clone());
+                scheduler.observe_odometry(&sender, map_pose(), None).unwrap();
+                scheduler.observe_costmap(&sender, costmap_at(1_000_000_000), Instant::now()).unwrap();
+                scheduler.start_session(&sender, session()).await.unwrap();
+                scheduler.submit_path(&sender, path()).await.unwrap();
+                let started = scheduler.path_wait_started_at;
+                scheduler.control_tick(&sender).await.unwrap();
+                assert_eq!(scheduler.path_wait_started_at, started, "持续零速不得清除等待期限");
+                if recover {
+                    let mut state = scheduler.planner.state.lock().unwrap();
+                    state.step = PlannerStep::Command(Twist2 { linear: Point2::new(0.2, 0.0), angular_z: 0.0 });
+                    state.wait_reason = None;
+                }
+                scheduler.path_wait_started_at = Some(Instant::now() - Duration::from_secs(31));
+                scheduler.control_tick(&sender).await.unwrap();
+                assert!(scheduler.path_wait_started_at.is_none());
+                if recover {
+                    assert_eq!(scheduler.status.last_terminal, None);
+                    assert_ne!(scheduler.status.last_applied_twist, Some(Twist2::ZERO));
+                } else {
+                    assert_eq!(scheduler.status.last_terminal, Some(TerminalOutcome::PlannerFailed));
+                    assert!(scheduler.status.last_zero_ack_id.is_some());
+                    if let Some(reason) = reason.filter(|s|!s.is_empty()) {
+                        assert!(scheduler.status.message.contains(reason));
+                    }
+                }
+            }
+        }
+        }
+        let mut scheduler = NavScheduler::new(
+            FakeMotion(Arc::new(Mutex::new(FakeMotionState::default()))),
+            FakePlanner::commanding(), SchedulerConfig::default()).unwrap();
+        let (sender, _) = watch::channel(scheduler.status.clone());
+        scheduler.observe_odometry(&sender, map_pose(), None).unwrap();
+        scheduler.observe_costmap(&sender, costmap_at(1_000_000_000), Instant::now()).unwrap();
+        scheduler.start_session(&sender, session()).await.unwrap();
+        scheduler.path_wait_started_at = Some(Instant::now() - Duration::from_secs(31));
+        scheduler.check_path_wait_timeout(&sender).await.unwrap();
+        assert_eq!(scheduler.status.last_terminal, Some(TerminalOutcome::PlannerFailed));
+        assert!(scheduler.status.last_zero_ack_id.is_some());
     }
 
     #[tokio::test]

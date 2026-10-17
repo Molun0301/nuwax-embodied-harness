@@ -346,10 +346,14 @@ def _build_collection_description(collection_name: str, catalog: Dict[str, Dict[
     if not catalog:
         return f"{display_name}。当前没有可调用功能。"
     function_names = "、".join(sorted(catalog))
-    return (
+    description = (
         f"{display_name}。通过 function 选择具体功能，通过 parameters 传入该功能参数。"
         f"当前可用：{function_names}。参数不符合对应能力 schema 时会返回 invalid_params。"
     )
+    relative_schema = catalog.get("relative_move", {}).get("input_schema", {})
+    if relative_schema.get("description"):
+        description += "\nrelative_move（相对移动）：" + str(relative_schema["description"])
+    return description
 
 
 def _build_collection_input_schema(catalog: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:

@@ -109,6 +109,18 @@ fn local_recent_guide_hints_preserve_surface_and_volume_without_exporting_floor(
 }
 
 #[test]
+fn recent_guide_keeps_obstacles_above_and_below_the_starting_body() {
+    let map=scene(&[],false).with_recent_obstacle_points(1,100,0,&[],
+        [(0,[0.25,0.05,0.15]),(1,[0.25,0.15,1.05])]).unwrap();
+    let start=([0.05,0.05,0.5],[0.,0.,0.,1.]);
+    let hints=map.recent_obstacle_hints([[-0.5,-0.5],[0.5,0.5]],start).unwrap();
+    assert_eq!(hints.len(),2,"参考沿地形升降，不能用起点机身高度截去后续障碍");
+    for (_,point) in [(0,[0.25,0.05,0.15]),(1,[0.25,0.15,1.05])] {
+        assert!(hints.iter().any(|(a,b)|(0..3).all(|i|a[i]<=point[i]&&point[i]<=b[i])));
+    }
+}
+
+#[test]
 fn recent_hint_range_uses_nonempty_columns_at_fine_source_resolution() {
     for quantum in [0.05_f32,0.01] {
         let source=scene(&[],false);let cfg=source.config().clone();

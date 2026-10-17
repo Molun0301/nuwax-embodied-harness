@@ -542,6 +542,37 @@ mod tests {
         }
     }
     #[test]
+    fn noisy_ground_and_sparse_upper_returns_keep_separate_representatives() {
+        let mut writer = new_writer();
+        let quantum = f64::from(writer.voxel_size_m());
+        for frame in 1..=4 {
+            let mut points: Vec<_> = grid(|x,y| {
+                // 以源体素的十分之一为峰峰噪声；帧间扰动独立于高处回波。
+                let parity = ((x/0.022).round() as i32 + (y/0.022).round() as i32 + frame) % 2;
+                0.01 + if parity == 0 {quantum*0.05} else {-quantum*0.05}
+            });
+            let echoes: Vec<_> = points.iter().step_by(8).map(|p|
+                Point3::new(p.x,p.y,p.z+quantum*4.0)).collect();
+            points.extend(echoes.iter().copied());
+            ingest(&mut writer,&points,frame as u64);
+            let layers = writer.layer_observations([0,0,0]).unwrap();
+            let floor: Vec<_> = layers.values().filter(|layer|layer.plane_origin[2]<quantum).collect();
+            assert!(!floor.is_empty(),"有二维面积支撑的抖动地面应保留分层观测");
+            for layer in floor {
+                assert!((layer.plane_origin[2]-0.01).abs()<=quantum*0.1,
+                    "地面拟合不能向上方回波的混合均值漂移");
+                assert!(layer.samples.iter().all(|sample|sample.point[2]<quantum));
+            }
+            // 未归入地面层的上方回波仍是真实占据；拟合不删除物理几何。
+            for echo in echoes {
+                let key = super::super::voxel_key([echo.x,echo.y,echo.z],quantum as f32).unwrap();
+                let key = [key.0,key.1,key.2];
+                assert_eq!(writer.region(key,key,1).unwrap().len(),1);
+            }
+        }
+    }
+
+    #[test]
     fn bounded_plane_stabilization_eventually_tracks_both_height_directions() {
         let mut writer = new_writer();
         ingest(&mut writer, &grid(|_, _| 0.01), 1);

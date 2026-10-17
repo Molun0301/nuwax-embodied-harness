@@ -69,6 +69,16 @@ impl SurfaceNavigationConfig {
             return Err(NavStackError::InvalidConfig("近场样条迭代次数需要0—100的整数".into()));
         }
         config.follower.scan.optimization_iterations = iterations as usize;
+        let expansion_limit = configured_number(
+            "NUWAX_NAV_LOCAL_SEARCH_EXPANSIONS",
+            config.follower.scan.search_expansion_limit as f64,
+        )?;
+        if expansion_limit.fract() != 0.0 || expansion_limit < 1.0 || expansion_limit > 1_000_000.0 {
+            return Err(NavStackError::InvalidConfig(
+                "近场搜索展开上限需要1—1000000的整数".into(),
+            ));
+        }
+        config.follower.scan.search_expansion_limit = expansion_limit as usize;
         config.follower.scan.validate().map_err(NavStackError::InvalidConfig)?;
         if let Ok(value) = std::env::var("_NUWAX_NAV_ACTUATOR_MAX_LINEAR_MPS") {
             if !value.trim().is_empty() {

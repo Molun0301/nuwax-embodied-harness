@@ -57,7 +57,7 @@ fn synthetic_priority_ablation() {
             if selected_mode.as_ref().is_some_and(|s|s!=mode) {continue;}
             eprintln!("PRIORITY_BEGIN case={name} mode={mode}");
             let result=local_search::with_diagnostic_priority(priority,||local_search::plan(
-                &map,&tomo,start,&reference,&motion,Some(0.0),Some((goal,0.35)),boundary,5.0,0.9,true));
+                &map,&tomo,start,&reference,&motion,Some(0.0),Some((goal,0.35)),boundary,5.0,0.9,true, DEFAULT_SEARCH_EXPANSION_LIMIT));
             let work=local_search::last_work();
             if let Ok(path)=&result {
                 for pair in path.windows(2) {

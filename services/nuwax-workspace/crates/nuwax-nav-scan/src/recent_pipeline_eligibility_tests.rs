@@ -21,7 +21,7 @@ fn five_static_ablation_cases_through_actual_recent_guide() {
         let radius=6.5+map.body_envelope().unwrap().radius();
         let hints=map.recent_obstacle_hints([[0.5-radius,1.0-radius],[0.5+radius,1.0+radius]],start).unwrap();
         assert!(!hints.is_empty());
-        let overlay=recent_guide_overlay::RecentGuideOverlay::new(hints,tomo.resolution,map.body_envelope().unwrap()).unwrap();
+        let overlay=recent_guide_overlay::RecentGuideOverlay::new(hints,tomo.resolution,f64::from(map.source_voxel_size_m()),map.body_envelope().unwrap()).unwrap();
         let guide=tomo.plan_bounded_with_segment_filter(static_reference[0],*static_reference.last().unwrap(),
             tomo.resolution,&[],None,Some(7.5),&[],&|a,b|overlay.accepts(a,b));
         let guide_success=guide.is_ok();

@@ -91,10 +91,6 @@ pub enum SurfaceError {
     /// 参考位置或实际足迹与虚拟禁行几何相交。
     #[error("position or footprint intersects the virtual navigation boundary")]
     VirtualObstacle,
-    /// Legacy descriptive result with no production motion-check emitter.
-    /// Missing ground estimates remain unknown and do not reject motion.
-    #[error("ground geometry is unknown at the requested location")]
-    UnknownGround,
     /// 运动与已知坡阶、层高或实际几何冲突；旧图查询也可用来表示没有连续图边。
     #[error("surface segment is not traversable")]
     UntraversableSegment,
@@ -681,7 +677,12 @@ impl SurfaceSnapshot {
         let size = f64::from(self.config().voxel_size);
         let horizontal = [(to[0] - from[0]).abs(), (to[1] - from[1]).abs()];
         let steps = (horizontal[0].max(horizontal[1]) / size).ceil() as i64;
-        if dx == 0 && dy == 0 || steps == 0 || steps > MAX_SEGMENT_CELLS {
+        if steps > MAX_SEGMENT_CELLS {
+            return Err(SurfaceError::InvalidConfig(format!(
+                "支撑连线需要{steps}列，超过{MAX_SEGMENT_CELLS}列工作上限；未证明几何不可通行"
+            )));
+        }
+        if dx == 0 && dy == 0 || steps == 0 {
             return Err(SurfaceError::UntraversableSegment);
         }
         let mut previous = start.cell;
@@ -1062,13 +1063,37 @@ impl SurfaceSnapshot {
         Ok(SurfaceLocation {
             cell,
             support_xyz,
-            surface_xyz: self.cell_position(cell),
+            surface_xyz: self.ground_cell_position(cell),
         })
     }
 
     fn cell_position(&self, cell: VoxelKey) -> [f64; 3] {
         let point = surface_point_xyz(cell.0, cell.1, cell.2, self.config().voxel_size);
         [f64::from(point.0), f64::from(point.1), f64::from(self.data.height_bounds.get(&cell).map_or(point.2, |bounds|bounds[1]))]
+    }
+
+    /// 接触代表高度与物理图单元坐标分开，避免观察层污染占据图的路由缓存。
+    fn ground_cell_position(&self, cell: VoxelKey) -> [f64; 3] {
+        let mut position = self.cell_position(cell);
+        if self.ground_evidence == GroundEvidence::MeasuredSurface {
+            if let Some(source) = self.observations.as_ref().filter(|s|s.is_complete_geometry_source()) {
+                let fine = f64::from(source.size_m);
+                let coarse = f64::from(self.config().voxel_size);
+                let xy = [position[0],position[1]];
+                let column = xy.map(|v|(v/fine).floor() as i32);
+                // 只消费同列、属于该物理单元的已关联地面层。代表平面由源端
+                // 分层后的真实回波拟合，不能再用占据上界覆盖它，也不跨层平均。
+                // 一个粗格内的上方回波继续留在占据集合，供完整机体检查净空。
+                if let Some(height) = source.ground_layers(column)
+                    .filter(|layer|layer.members.iter().any(|&z|
+                        (((f64::from(z)+0.5)*fine)/coarse).floor() as i32 == cell.2))
+                    .filter_map(|layer|layer.height_at(xy))
+                    .min_by(f64::total_cmp) {
+                    position[2] = height;
+                }
+            }
+        }
+        position
     }
 
     fn nearest_column_cell(
@@ -1085,7 +1110,7 @@ impl SurfaceSnapshot {
             .iter()
             .map(|&iz| {
                 (
-                    (self.cell_position((ix, iy, iz))[2] - height).abs(),
+                    (self.ground_cell_position((ix, iy, iz))[2] - height).abs(),
                     (ix, iy, iz),
                 )
             })

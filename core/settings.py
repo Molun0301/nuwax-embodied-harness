@@ -988,7 +988,7 @@ def load_config() -> NuwaxRobotBridgeConfig:
             tf=_cfg_str("NUWAX_LCM_CHANNEL_TF", "/tf#tf2_msgs.TFMessage"),
             point_cloud=_cfg_str(
                 "NUWAX_LCM_CHANNEL_POINTCLOUD",
-                "/go2/lidar/points#sensor_msgs.PointCloud2",
+                "/lidar/points#sensor_msgs.PointCloud2",
             ),
             occupancy=_cfg_str(
                 "NUWAX_LCM_CHANNEL_OCCUPANCY",

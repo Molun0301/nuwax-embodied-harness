@@ -27,7 +27,7 @@ UMask=0007
 # 服务默认值；用户配置文件覆盖同名业务设置。
 Environment=PYTHONUNBUFFERED=1
 Environment=NUWAX_BOOTSTRAP_ENV_FILE=@NUWAX_CONFIG_DIR@/nuwax.env
-Environment="NUWAX_LCM_CHANNEL_POINTCLOUD=/go2/lidar/points#sensor_msgs.PointCloud2"
+Environment="NUWAX_LCM_CHANNEL_POINTCLOUD=/lidar/points#sensor_msgs.PointCloud2"
 Environment="NUWAX_LCM_CHANNEL_CLOUD_MAP=/cloud_map#sensor_msgs.PointCloud2"
 Environment="NUWAX_LCM_CHANNEL_GOAL_POSE=/nav/goal#nuwax_msgs.GoalEnvelope"
 Environment="NUWAX_LCM_CHANNEL_NAV_PATH=/nav/path#nuwax_msgs.PathEnvelope"

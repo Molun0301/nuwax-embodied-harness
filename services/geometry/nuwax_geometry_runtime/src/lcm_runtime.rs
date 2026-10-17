@@ -19,7 +19,7 @@
 //! - `/odom#nav_msgs.Odometry`
 //! - `/tf#tf2_msgs.TFMessage`
 //! - `/map/occupancy#nav_msgs.OccupancyGrid`
-//! - `/go2/lidar/points#sensor_msgs.PointCloud2`
+//! - `/lidar/points#sensor_msgs.PointCloud2`
 //! - `/nav/state#nuwax_msgs.NavigationState`
 //! - `/explore/frontiers#nuwax_msgs.FrontierList`
 //!
@@ -5355,7 +5355,7 @@ fn parse_pointcloud_payload(payload: &[u8]) -> Option<ParsedPointCloudPayload> {
     // 187GB abort 模式)。
     if !(12..=crate::pointcloud::POINTCLOUD_MAX_POINT_STEP_BYTES).contains(&point_step) {
         warn!(
-            "/go2/lidar/points payload point_step={} 超过 sanity cap [12, {}];按异常帧跳过",
+            "/lidar/points payload point_step={} 超过 sanity cap [12, {}];按异常帧跳过",
             point_step,
             crate::pointcloud::POINTCLOUD_MAX_POINT_STEP_BYTES
         );
@@ -5365,13 +5365,13 @@ fn parse_pointcloud_payload(payload: &[u8]) -> Option<ParsedPointCloudPayload> {
     // (Go2 单帧 ~30k 点 ≈ 360 KB);超过则 upstream LCM 帧异常,拒绝。
     if message.data.len() > 4 * 1024 * 1024 {
         warn!(
-            "/go2/lidar/points payload len={} 超过 4 MiB sanity cap;按异常帧跳过",
+            "/lidar/points payload len={} 超过 4 MiB sanity cap;按异常帧跳过",
             message.data.len()
         );
         return None;
     }
     if message.is_bigendian {
-        warn!("/go2/lidar/points big-endian PointCloud2 暂不支持;按异常帧跳过");
+        warn!("/lidar/points big-endian PointCloud2 暂不支持;按异常帧跳过");
         return None;
     }
     let (height, width, row_step) = (
@@ -5382,7 +5382,7 @@ fn parse_pointcloud_payload(payload: &[u8]) -> Option<ParsedPointCloudPayload> {
     let point_count = height.checked_mul(width)?;
     if point_count > crate::pointcloud::POINTCLOUD_MAX_FRAME_POINTS {
         warn!(
-            "/go2/lidar/points point_count={} 超过单帧上限={};按异常帧跳过",
+            "/lidar/points point_count={} 超过单帧上限={};按异常帧跳过",
             point_count,
             crate::pointcloud::POINTCLOUD_MAX_FRAME_POINTS
         );
@@ -5394,7 +5394,7 @@ fn parse_pointcloud_payload(payload: &[u8]) -> Option<ParsedPointCloudPayload> {
         || row_step != packed_row
         || message.data.len() != height.checked_mul(row_step)?
     {
-        warn!("/go2/lidar/points PointCloud2 dimensions/data length inconsistent;按异常帧跳过");
+        warn!("/lidar/points PointCloud2 dimensions/data length inconsistent;按异常帧跳过");
         return None;
     }
     let xyz_layout = [("x", 0_i32), ("y", 4_i32), ("z", 8_i32)];
@@ -5406,7 +5406,7 @@ fn parse_pointcloud_payload(payload: &[u8]) -> Option<ParsedPointCloudPayload> {
                 && field.count == 1
         })
     }) {
-        warn!("/go2/lidar/points PointCloud2 缺少 packed float32 x/y/z 字段;按异常帧跳过");
+        warn!("/lidar/points PointCloud2 缺少 packed float32 x/y/z 字段;按异常帧跳过");
         return None;
     }
     Some(ParsedPointCloudPayload {
@@ -8397,7 +8397,7 @@ pub async fn spawn_geometry_runtime(
     };
     let cm_writer = Arc::new(parking_lot::Mutex::new(cm_writer));
 
-    // Phase 3 增强:订阅 /odom 和 /go2/lidar/points 时同步把数据喂给 mapping
+    // Phase 3 增强:订阅 /odom 和 /lidar/points 时同步把数据喂给 mapping
     // adapter。`feed_pose` / `feed_pointcloud` 内部持 parking_lot 锁同步,
     // 不会跨 await。
     // Phase 3: 构造 occupancy grid SHM sidecar(默认 /tmp/nuwax_occupancy.mmap)。
@@ -12254,7 +12254,7 @@ async fn publish_registered_lio_commit(
     .await
 }
 
-/// Phase 3: 把 LCM `/odom` 与 `/go2/lidar/points` typed channel 喂给 mapping adapter。
+/// Phase 3: 把 LCM `/odom` 与 `/lidar/points` typed channel 喂给 mapping adapter。
 ///
 /// MappingAdapter 是 occupancy revision 的唯一 writer；`/map/occupancy` 仅为
 /// 输出 fanout，不作为输入回灌。mapping feed 累积点云、维护
@@ -12262,7 +12262,7 @@ async fn publish_registered_lio_commit(
 ///
 /// - `/odom` payload 走 `parse_odom_payload` → 归一化 quaternion/yaw →
 ///   `feed_pose_in_frame`，并从固定 anchor 发布 map→odom→base canonical TF
-/// - `/go2/lidar/points` payload 走 `parse_pointcloud_payload` → 转 Point3 →
+/// - `/lidar/points` payload 走 `parse_pointcloud_payload` → 转 Point3 →
 ///   `feed_pointcloud_session` + 增量 cloud-map voxel + `build_and_publish`
 ///
 /// 点云 feed 仍持 parking_lot Mutex；里程计在锁繁忙时使用同会话的只读
@@ -12353,7 +12353,7 @@ fn spawn_mapping_feed_tasks(
         warn!("mapping_feed: odometry binding unavailable; odom anchor/TF feed disabled");
     }
 
-    // ---- /go2/lidar/points → feed_pointcloud + build_and_publish ----
+    // ---- /lidar/points → feed_pointcloud + build_and_publish ----
     let (lidar_topic, lidar_msg_type) = pointcloud_binding;
     let transport_lidar = transport.clone();
     let mapping_lidar = mapping_arc.clone();
@@ -12371,7 +12371,7 @@ fn spawn_mapping_feed_tasks(
             let frame = match frame_result {
                 Ok(f) => f,
                 Err(e) => {
-                    error!("mapping_feed /go2/lidar/points LCM 订阅错误: {}", e);
+                    error!("mapping_feed /lidar/points LCM 订阅错误: {}", e);
                     continue;
                 }
             };
@@ -12390,7 +12390,7 @@ fn spawn_mapping_feed_tasks(
             // 防止后续解析调整绕过单帧上限。
             if raw_count > crate::pointcloud::POINTCLOUD_MAX_FRAME_POINTS {
                 warn!(
-                    "mapping_feed /go2/lidar/points raw_count={} 超过 sanity cap={};按异常帧跳过",
+                    "mapping_feed /lidar/points raw_count={} 超过 sanity cap={};按异常帧跳过",
                     raw_count,
                     crate::pointcloud::POINTCLOUD_MAX_FRAME_POINTS
                 );

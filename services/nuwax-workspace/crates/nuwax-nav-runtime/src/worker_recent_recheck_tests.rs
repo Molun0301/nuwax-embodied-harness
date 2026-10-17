@@ -182,3 +182,31 @@ fn latest_received_pose_recheck_keeps_twenty_hz_moving_progress() {
     assert!(poses>=45 && controls>=23 && nonzero>=12 && x-0.5>0.05,"current-pose checks starved ordinary moving control");
     assert!(c.rechecks>0);drop(c);worker.stop();
 }
+
+#[test]
+fn pose_arriving_at_the_control_tick_receives_current_stopping_permission() {
+    let(mut worker,map,counts,computed,release)=recent_recheck_fixture();
+    computed.recv_timeout(Duration::from_secs(2)).unwrap();
+    release.send(()).unwrap();wait_recent_rechecked(&worker);
+    let mut position=0.5;
+    let mut current=Twist2::ZERO;
+    // 位姿与控制拍完全同相，复现旧代码必然漏掉下一拍的顺序。
+    for tick in 0..8 {
+        if tick>0 {std::thread::sleep(DEFAULT_TICK_INTERVAL);}
+        position+=current.linear.x*DEFAULT_TICK_INTERVAL.as_secs_f64();
+        let pose=route_pose(position,tick);
+        worker.update_odometry(pose.clone());
+        let output=worker.step(0.3);
+        let PlannerStep::Command(command)=output else {panic!("同拍复核没有交付有效命令：{output:?}");};
+        assert!(command.linear.x>0.0);
+        let proof=worker.delivered_command_context_for_test().expect("每次交付应对应本次守卫");
+        assert_eq!(proof.proof.guard.pose,crate::command_proof_trace::PoseTrace::capture(&pose));
+        assert_eq!(proof.proof.guard.applied_bits,crate::command_proof_trace::command_bits(current));
+        assert!(proof.proof.worker_guard_pose_bits_equal && proof.proof.worker_guard_applied_bits_equal);
+        assert!(map.validate_body_pose([position,1.0,0.5],[0.0,0.0,0.0,1.0]).is_ok());
+        worker.observe_applied_command(command);
+        current=command;
+    }
+    assert!(counts.lock().unwrap().rechecks>=7);
+    worker.stop();
+}

@@ -60,6 +60,8 @@ pub(crate) struct GuardSelectionTrace {
     // diagnostic clock read supplies, shifts, or substitutes its time anchor.
     pub(crate) observation_anchor_ns: Option<u64>,
     pub(crate) observation_max_age_ns: Option<u64>,
+    // 实际守卫开始核验的诊断时刻，不作为观察许可或运动时限。
+    pub(crate) checked_unix_ns: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -74,7 +76,11 @@ pub(crate) struct ComputedCommandContext {
 }
 impl ComputedCommandContext {
     pub(crate) fn published(self) -> PublishedCommandContext {
-        PublishedCommandContext { proof: self, publication_unix_ns: unix_ns() }
+        let issued_at=self.input.compute_started;
+        self.published_for(issued_at)
+    }
+    pub(crate) fn published_for(self, issued_at: Instant) -> PublishedCommandContext {
+        PublishedCommandContext { proof: self, issued_at, publication_unix_ns: unix_ns() }
     }
 }
 
@@ -82,11 +88,12 @@ impl ComputedCommandContext {
 pub(crate) struct PublishedCommandContext {
     pub(crate) proof: ComputedCommandContext,
     pub(crate) publication_unix_ns: u64,
+    issued_at: Instant,
 }
 impl PublishedCommandContext {
     // The caller holds the result mutex and supplies that very stored result.
     pub(crate) fn retrieved(&self, started: Instant, command: Twist2) -> Option<DeliveredCommandContext> {
-        if command == Twist2::ZERO || self.proof.input.compute_started != started
+        if command == Twist2::ZERO || self.issued_at != started
             || self.proof.guard.selected_command_bits != command_bits(command) {
             return None;
         }
@@ -109,6 +116,7 @@ struct GuardBasis {
     pose: PoseTrace,
     applied_bits: [u64; 3],
     observation: Option<(u64, u64)>,
+    checked_unix_ns: u64,
 }
 struct GuardFrame {
     id: u64,
@@ -225,7 +233,8 @@ impl GuardScope {
             let mut trace = trace.borrow_mut();
             let Some(frame) = trace.computes.last_mut().filter(|frame| frame.token == compute) else { return; };
             let Some(active) = frame.guards.last_mut().filter(|active| active.id == guard) else { return; };
-            active.basis = Some(GuardBasis { pose: PoseTrace::capture(pose), applied_bits: command_bits(applied), observation });
+            active.basis = Some(GuardBasis { pose: PoseTrace::capture(pose), applied_bits: command_bits(applied), observation,
+                checked_unix_ns: unix_ns() });
             active.selected = None;
         });
     }
@@ -264,6 +273,7 @@ pub(crate) fn record_selected(command: Twist2) {
             selected_command_bits: command_bits(command),
             observation_anchor_ns: basis.observation.map(|(anchor, _)| anchor),
             observation_max_age_ns: basis.observation.map(|(_, age)| age),
+            checked_unix_ns: basis.checked_unix_ns,
         });
     });
 }
@@ -272,6 +282,22 @@ pub(crate) fn record_selected(command: Twist2) {
 mod tests {
     use super::*;
     use nuwax_nav_types_messages::{Point2, Point3, Pose3, Quaternion};
+
+    #[test]
+    fn fallback_issue_time_does_not_drop_exact_computation_provenance() {
+        let original=input(901);
+        let computed_at=original.compute_started;
+        let scope=ComputeScope::begin(original);
+        selected(29);
+        let proof=scope.finish(&PlannerStep::Command(command())).unwrap();
+        // 不支持复核的后端重新计算后拥有新的许可起点，诊断仍属于这一计算。
+        let issued_at=computed_at+std::time::Duration::from_nanos(1);
+        let published=proof.published_for(issued_at);
+        let delivered=published.retrieved(issued_at,command()).unwrap();
+        assert_eq!(delivered.proof.input.result_id,901);
+        assert_eq!(delivered.proof.input.compute_started,computed_at);
+        assert!(published.retrieved(computed_at,command()).is_none());
+    }
 
     fn pose() -> PoseStamped {
         PoseStamped { frame_id: NavFrameId::Map, stamp: Timestamp::from_unix(7, 31),

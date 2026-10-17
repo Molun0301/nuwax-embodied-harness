@@ -254,7 +254,11 @@ fn recent_obstacle_updates_keep_terrain_and_trigger_bounded_detour_then_recover(
                 period,f64::from(map.source_voxel_size_m())*0.5,map.body_envelope().unwrap().radius(),check(),check()).is_some(),
                 "cleared-obstacle recovery command must retain its complete braking tail");
             applied=command;
-            if command.linear.x>0.0 {break;}
+            if command.linear.x>0.0 {
+                eprintln!("RECENT_RECOVERY elapsed_ms={} extra_planning_calls={}",
+                    began.elapsed().as_secs_f64()*1000.0,follower.local_planning_calls()-submitted);
+                break;
+            }
         } else {applied=nuwax_nav_types_messages::Twist2::ZERO;}
         assert!(Instant::now()<deadline,"cleared recent obstacle never recovered: {step:?}");
         std::thread::sleep(Duration::from_secs_f64(period));

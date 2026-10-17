@@ -127,7 +127,7 @@ const CHANNEL_KEY_TABLE: &[(ChannelKey, &str, &str, &str, &str)] = &[
         ChannelKey::PointCloud,
         "NUWAX_GEOMETRY_RUNTIME_POINTCLOUD_CHANNEL",
         "NUWAX_LCM_CHANNEL_POINTCLOUD",
-        "/go2/lidar/points",
+        "/lidar/points",
         "sensor_msgs.PointCloud2",
     ),
     (
@@ -647,7 +647,7 @@ mod tests {
 
         assert_eq!(raw_runtime, "NUWAX_GEOMETRY_RUNTIME_POINTCLOUD_CHANNEL");
         assert_eq!(raw_platform, "NUWAX_LCM_CHANNEL_POINTCLOUD");
-        assert_eq!(raw_default, "/go2/lidar/points");
+        assert_eq!(raw_default, "/lidar/points");
         assert_eq!(map_runtime, "NUWAX_GEOMETRY_RUNTIME_CLOUDMAP_CHANNEL");
         assert_eq!(map_platform, "NUWAX_LCM_CHANNEL_CLOUD_MAP");
         assert_eq!(map_default, "/cloud_map");

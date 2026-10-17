@@ -8,6 +8,8 @@ import time
 from typing import Dict, Optional, Tuple, Any, Callable, TYPE_CHECKING
 
 from adapters.base import AdapterBase, AdapterConfig
+from contracts.motion_limits import MotionCommandLimits
+from core.config_values import runtime_value
 from drivers.common import ManagedRobotDeviceDataPlane, RobotAssemblyBase, RobotAssemblyStatus
 from drivers.go2.capabilities import GO2_CAPABILITY_DESCRIPTORS_BY_NAME
 from drivers.go2.data_plane import Go2DataPlaneRuntime, Go2DeviceDataPlane
@@ -73,6 +75,19 @@ class Go2RobotAssembly(RobotAssemblyBase):
     def has_motion_actuator(self) -> Optional[bool]:
         """Physical motion hardware remains present even when disconnected."""
         return True
+
+    def get_motion_command_limits(self) -> Optional[MotionCommandLimits]:
+        """公开守卫执行器使用的速度配置；导航巡航上限不代替设备策略。"""
+        linear = float(runtime_value("GO2_OFFICIAL_MAX_LINEAR_VELOCITY_MPS", "1.0"))
+        yaw = float(runtime_value("GO2_OFFICIAL_MAX_YAW_RATE_RPS", "0.8"))
+        if linear <= 0.0 or yaw <= 0.0:
+            raise ValueError("Go2 运动守卫速度限制必须大于0。")
+        return MotionCommandLimits(
+            max_linear_x_mps=linear, max_linear_y_mps=linear,
+            max_angular_z_rps=yaw, max_planar_speed_mps=linear,
+            source="go2_motion_guard_config",
+            rounding_relative_tolerance=8 * sys.float_info.epsilon,
+        )
 
     def __post_init__(self) -> None:
         _prepare_go2_sdk_path(self.config)

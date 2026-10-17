@@ -199,6 +199,7 @@ struct ControlStepSample {
 #[derive(Default)]
 struct Probe {
     control_ms:Vec<f64>,map_update_ms:Vec<f64>,submitted:u64,admitted:u64,
+    recheck_ms:Vec<f64>,recheck_overflow:usize,
     negative:usize,pending:usize,endpoints:Vec<[f64;3]>,
     control_samples:Vec<ControlStepSample>,control_sample_limit:usize,control_sample_overflow:usize,
     source_frames:Vec<SourceFrameSample>,source_frame_overflow:usize,
@@ -242,8 +243,20 @@ impl Measured {
             self.first_after_view_change=true;
         }
     }
+    fn recheck(&mut self,command:Twist2,current_state:bool)->Option<PlannerStep> {
+        let started=Instant::now();
+        let outcome=if current_state {self.inner.revalidate_selected_command_at_current_state(command)}
+            else {self.inner.revalidate_selected_command(command)};
+        let elapsed=started.elapsed().as_secs_f64()*1e3;
+        let mut probe=self.probe.lock().unwrap();
+        if probe.recheck_ms.len()<probe.control_sample_limit {probe.recheck_ms.push(elapsed);}
+        else {probe.recheck_overflow+=1;}
+        outcome
+    }
 }
 impl NavPlanner for Measured {
+    fn revalidate_selected_command(&mut self,c:Twist2)->Option<PlannerStep>{self.recheck(c,false)}
+    fn revalidate_selected_command_at_current_state(&mut self,c:Twist2)->Option<PlannerStep>{self.recheck(c,true)}
     fn take_command_dispatch_bound(&mut self)->Option<crate::CommandDispatchBound> {self.inner.take_command_dispatch_bound()}
     fn configure_goal(&mut self,g:&PoseStamped,o:GoalOptions)->Result<(),RuntimeError>{self.inner.configure_goal(g,o)}
     fn configure_boundary(&mut self,b:&[[f64;2]]){self.inner.configure_boundary(b)}
@@ -376,12 +389,23 @@ fn receipt_oracle_at(r:&RawReceipt,resolution:f32,anchor_ns:u64)->bool {
 }
 fn report_proof_receipts(receipts:&[RawReceipt]) {
     let mut guard_age=Vec::new();let mut guard_delay=Vec::new();let mut compute_delay=Vec::new();let mut publication_delay=Vec::new();
+    let mut pose_to_receipt=Vec::new();let mut compute_to_receipt=Vec::new();
     let mut missing=0;let mut state_mismatch=0;let mut worker_guard_mismatch=0;let mut clock_invalid=0;let mut previous_id=None;
     for receipt in receipts {
         let Some(context)=&receipt.proof_context else {missing+=1;continue;};
         assert_eq!(context.proof.guard.selected_command_bits,crate::command_proof_trace::command_bits(receipt.command));
         assert!(previous_id.is_none_or(|previous|context.proof.input.result_id>previous),"one result must never be delivered twice");
         previous_id=Some(context.proof.input.result_id);
+        // 本夹具的输入位姿使用Unix源时间，按实际发布结果中的同一输入配对。
+        // 未跟踪的回执保持缺失，不以最近一拍的位姿代替它的真实输入。
+        if let Some(pose)=context.proof.input.pose.as_ref().filter(|p|p.stamp.nanos>0) {
+            if let Some(delay)=receipt.ns.checked_sub(pose.stamp.nanos as u64) {
+                pose_to_receipt.push(delay as f64/1e6);
+            } else {clock_invalid+=1;}
+        }
+        if let Some(delay)=receipt.ns.checked_sub(context.proof.input.compute_start_unix_ns) {
+            compute_to_receipt.push(delay as f64/1e6);
+        } else {clock_invalid+=1;}
         let guard=&context.proof.guard;
         worker_guard_mismatch+=usize::from(!context.proof.worker_guard_pose_bits_equal
             || !context.proof.worker_guard_pose_stamp_equal || !context.proof.worker_guard_pose_frame_equal
@@ -389,8 +413,11 @@ fn report_proof_receipts(receipts:&[RawReceipt]) {
         state_mismatch+=usize::from(guard.pose.bits!=receipt.receipt_pose.bits
             || guard.pose.frame_id!=receipt.receipt_pose.frame_id
             || guard.applied_bits!=crate::command_proof_trace::command_bits(receipt.before));
-        if let Some(anchor)=guard.observation_anchor_ns {
-            if let (Some(age),Some(delay))=(anchor.checked_sub(receipt.source_sample_ns),receipt.ns.checked_sub(anchor)) {
+        // 当前守卫无地面有效期；用其真实诊断时刻与精确回执来源配对。
+        // 该时刻只统计年龄，不补造守卫中的观察许可。
+        {
+            let checked=guard.checked_unix_ns;
+            if let (Some(age),Some(delay))=(checked.checked_sub(receipt.source_sample_ns),receipt.ns.checked_sub(checked)) {
                 guard_age.push(age as f64/1e6);guard_delay.push(delay as f64/1e6);
             }else{clock_invalid+=1;}
         }
@@ -399,6 +426,13 @@ fn report_proof_receipts(receipts:&[RawReceipt]) {
     }
     eprintln!("PROOF_RECEIPTS receipts={} traced={} missing={missing} worker_guard_basis_mismatches={worker_guard_mismatch} guard_receipt_state_mismatches={state_mismatch} invalid_clock_pairs={clock_invalid} source_age_at_selected_guard_ms={} guard_to_receipt_ms={} compute_ms={} publication_to_retrieval_ms={} result_identity=exact_stored_publication no_motion_authority_from_diagnostics=true",
         receipts.len(),receipts.len()-missing,measured_distribution(&guard_age),measured_distribution(&guard_delay),measured_distribution(&compute_delay),measured_distribution(&publication_delay));
+    // 两次非零回执之间缺失的消费拍在原夹具中明确施加零速。末尾停车另算，
+    // 此处只统计再次运动之前的停顿，不将末态或初始等待计入恢复事件。
+    let pauses:Vec<_>=receipts.windows(2).filter(|p|p[1].tick>p[0].tick+1)
+        .map(|p|(p[1].tick-p[0].tick-1) as f64*PERIOD.as_secs_f64()*1000.0).collect();
+    eprintln!("NAVIGATION_TIMING pose_to_receipt_ms={} compute_to_receipt_ms={} paired_receipts={} missing_receipts={missing} pause_events={} pause_ms={} scope=synthetic_pose_sample_to_local_command_receipt",
+        measured_distribution(&pose_to_receipt),measured_distribution(&compute_to_receipt),pose_to_receipt.len(),
+        pauses.len(),measured_distribution(&pauses));
 }
 fn distribution(values:&[f64])->(f64,f64,f64) {let mut v=values.to_vec();v.sort_by(f64::total_cmp);if v.is_empty(){return (0.0,0.0,0.0);} (v[v.len()/2],v[((v.len()-1)as f64*0.95).ceil()as usize],*v.last().unwrap())}
 fn measured_distribution(values:&[f64])->String {
@@ -481,6 +515,8 @@ fn report_control_stages(p:&Probe,factory:bool,scenario:Scenario,enabled:bool,re
         eprintln!("BODY_QUERY_SCOPE {context} available=false reason=unprobed_factory wall_not_thread_cpu=true");
         return;
     }
+    eprintln!("SELECTED_RECHECK {context} count={} omitted={} wall_ms_median_p95_max={} scope=selected_stopping_trajectory_without_candidate_ranking",
+        p.recheck_ms.len(),p.recheck_overflow,measured_distribution(&p.recheck_ms));
     let sample_scope=if p.control_sample_overflow==0 {"all_recorded_steps"}else{"retained_prefix_only_incomplete"};
     eprintln!("CONTROL_STAGE_SCOPE {context} available=true sample_scope={sample_scope} retained_steps={} record_limit={} omitted_steps={} attribution_complete={} nested_stages=inclusive_do_not_sum duration=wall_not_thread_cpu source_marker=successful_compute_owner_same_body_query_view_changes first_after_view_change=first_step_after_input_view_change metadata_cold_is_not_geometry_cold=true pose_stamp=actual_compute_owner_update_odometry_stamp planning_and_held_markers=independent_step_boundary_samples exact_transition_time=unavailable held_phase_0=not_started held_phase_1=held held_phase_2=released derived_body_view_identity=unavailable generated_candidate_count=unavailable candidate_eligibility_is_not_generated_candidate_count=true",
         p.control_samples.len(),p.control_sample_limit,p.control_sample_overflow,p.control_sample_overflow==0);

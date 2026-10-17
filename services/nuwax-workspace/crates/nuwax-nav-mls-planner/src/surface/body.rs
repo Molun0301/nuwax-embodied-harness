@@ -6,8 +6,8 @@ use super::body_witness::{CachedBodyResult, reject, height_rejection};
 use crate::body_query_profile::{self as query_profile, Counter as QueryCounter, Stage as QueryStage};
 #[path = "body_translation.rs"]
 mod translation;
-pub(super) type CacheSlot =
-    std::sync::Mutex<AHashMap<(VoxelKey, u64, u64), Arc<AHashMap<(i32, i32), VoxelKey>>>>;
+type GroundPatchCache = AHashMap<(VoxelKey, u64, u64), Arc<AHashMap<(i32, i32), VoxelKey>>>;
+pub(super) type CacheSlot = std::sync::Mutex<GroundPatchCache>;
 
 /// 只复用同一不可变视图的一个精确足迹；不保存观察许可或失败。
 #[cfg(test)]
@@ -571,7 +571,7 @@ impl SurfaceSnapshot {
         body:[f64;3],normal:[f64;3],x:i32,y:i32)->Option<f64> {
         self.fine_ground_values::<FineGroundHeight>(Some(ground),polygon,prism,body,normal,x,y)
             .map(|rows|rows.into_iter().filter_map(|row|row.0).max_by(f64::total_cmp)
-                .unwrap_or_else(||self.cell_position(ground)[2]))
+                .unwrap_or_else(||self.ground_cell_position(ground)[2]))
     }
 
     fn fine_ground_values<T:FineGroundValue>(&self,ground:Option<VoxelKey>,polygon:&PolygonQuery,prism:&PrismQuery,
@@ -620,7 +620,7 @@ impl SurfaceSnapshot {
                 // missing anchors use only the carried calibrated reference for
                 // association, without creating observed members or a plane.
                 let reference=ground.map_or(body[2]-model.body_to_support_z_m/normal[2],
-                    |ground|self.cell_position(ground)[2]);
+                    |ground|self.ground_cell_position(ground)[2]);
                 let uncertainty=f64::from(self.source_voxel_size_m())+model.support_uncertainty_m;
                 let record=records.filter(|record| {
                     if let Some(ground)=ground {
@@ -735,11 +735,11 @@ impl SurfaceSnapshot {
     ) -> Result<f64, SurfaceError> {
         if let Some(columns)=selected {
             return Ok(columns.iter().filter_map(|c|c.height).max_by(f64::total_cmp)
-                .unwrap_or_else(||self.cell_position(ground)[2]));
+                .unwrap_or_else(||self.ground_cell_position(ground)[2]));
         }
         let (x, y, _) = ground;
         let size = f64::from(self.config().voxel_size);
-        let mut ground_height = self.cell_position(ground)[2];
+        let mut ground_height = self.ground_cell_position(ground)[2];
         if let Some(observations) = self.observations.as_ref() {
             let fine = f64::from(observations.size_m);
             let lower = self.observed_support_lower_bound(ground);
@@ -796,7 +796,7 @@ impl SurfaceSnapshot {
         };
         let graph = &self.data.physical_graph;
         let quantum = f64::from(self.source_voxel_size_m());
-        let height = self.cell_position(cell)[2];
+        let height = self.ground_cell_position(cell)[2];
         DIRECTIONS
             .iter()
             .flat_map(|&(dx, dy)| {
@@ -808,7 +808,7 @@ impl SurfaceSnapshot {
                     .map(move |&z| (cell.0 + dx, cell.1 + dy, z))
             })
             .filter(|&next| {
-                let rise = self.cell_position(next)[2] - height;
+                let rise = self.ground_cell_position(next)[2] - height;
                 rise <= model.max_step_up_m + quantum + 1e-6
                     && -rise <= model.max_step_down_m + quantum + 1e-6
             })
@@ -826,15 +826,17 @@ impl SurfaceSnapshot {
     fn ground_patch_at_height(&self,centre:SurfaceLocation,radius:f64,height:f64)
         -> Arc<AHashMap<(i32,i32),VoxelKey>> {
         let key = (centre.cell, radius.to_bits(), height.to_bits());
-        if let Some(patch) = self
-            .data
-            .body_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&key)
-        {
-            return Arc::clone(patch);
-        }
+        // 实测平面属于观察快照，地形占据不变时其高度仍可能改变。
+        // 这类邻域随现有查询缓存退休；无实测层的邻域仍共享物理图缓存。
+        let measured = self.ground_evidence == GroundEvidence::MeasuredSurface
+            && self.observations.as_ref().is_some_and(|s|s.has_measured_ground_layers());
+        let cached = if measured {
+            self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner())
+                .measured_ground_patches.get(&key).cloned()
+        } else {
+            self.data.body_cache.lock().unwrap_or_else(|e|e.into_inner()).get(&key).cloned()
+        };
+        if let Some(patch) = cached {return patch;}
         let graph = &self.data.physical_graph;
         let Some(start) = graph.cells.id(centre.cell) else {
             return Arc::new(AHashMap::new());
@@ -847,11 +849,11 @@ impl SurfaceSnapshot {
                 return Arc::new(AHashMap::new());
             }
             let cell = graph.cells.coord(id);
-            let p = self.cell_position(cell);
+            let p = self.ground_cell_position(cell);
             patch
                 .entry((cell.0, cell.1))
                 .and_modify(|old: &mut VoxelKey| {
-                    if (self.cell_position(*old)[2] - height).abs()
+                    if (self.ground_cell_position(*old)[2] - height).abs()
                         > (p[2] - height).abs()
                     {
                         *old = cell;
@@ -860,7 +862,7 @@ impl SurfaceSnapshot {
                 .or_insert(cell);
             for next in self.contact_neighbors(cell) {
                 let Some(next_id)=graph.cells.id(next) else {continue;};
-                let point = self.cell_position(next);
+                let point = self.ground_cell_position(next);
                 if (point[0] - centre.surface_xyz[0]).hypot(point[1] - centre.surface_xyz[1])
                         <= radius
                     && seen.insert(next_id)
@@ -870,15 +872,16 @@ impl SurfaceSnapshot {
             }
         }
         let patch = Arc::new(patch);
-        let mut cache = self
-            .data
-            .body_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if cache.len() >= 512 {
-            cache.clear();
+        if measured {
+            let mut owner = self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner());
+            let cache = &mut owner.measured_ground_patches;
+            if cache.len() >= 512 {cache.clear();}
+            cache.insert(key, Arc::clone(&patch));
+        } else {
+            let mut cache = self.data.body_cache.lock().unwrap_or_else(|e|e.into_inner());
+            if cache.len() >= 512 {cache.clear();}
+            cache.insert(key, Arc::clone(&patch));
         }
-        cache.insert(key, Arc::clone(&patch));
         patch
     }
 
@@ -949,7 +952,7 @@ impl SurfaceSnapshot {
                     // 必须是原几何中的真实占据带顶，不能在行程上限截断高墙。
                     let top=f64::from(iz+1)*fine;let z=(top/size).ceil() as i32-1;
                     if coarse_levels.binary_search(&z).is_err() {continue;}
-                    let cell=(x,y,z);let top=top.min(self.cell_position(cell)[2]);
+                    let cell=(x,y,z);let top=top.min(self.ground_cell_position(cell)[2]);
                     if top<low-1e-6 || top>high+1e-6 || top<f64::from(iz)*fine-1e-6 {continue;}
                     let distance=(top-reference).abs();
                     if best.as_ref().is_none_or(|best|distance<best.0) {best=Some((distance,cell,top));}
@@ -989,7 +992,7 @@ impl SurfaceSnapshot {
                     let neighbor_height=if let Some(&height)=precise.get(&key) {height}
                         else if let Some(&height)=known_heights.get(&key) {height}
                         else {
-                            let plane=query.contact_plane(body,r[2],key.0,key.1,size,self.cell_position(neighbor)[2],
+                            let plane=query.contact_plane(body,r[2],key.0,key.1,size,self.ground_cell_position(neighbor)[2],
                                 -model.body_to_support_z_m/r[2][2]+contact+1e-6);
                             let height=if let Some(height)=self.fine_ground_height(neighbor,query,prism,body,r[2],key.0,key.1) {height}
                                 else {
@@ -1078,7 +1081,7 @@ impl SurfaceSnapshot {
             let column=xy.map(|v|(v/coarse).floor() as i32);
             let ground=patch.as_ref().and_then(|p|p.get(&(column[0],column[1]))).copied();
             let height=ground.and_then(|ground| {
-                let base=self.cell_position(ground)[2];
+                let base=self.ground_cell_position(ground)[2];
                 if let Some(observations)=&self.observations {
                     let records:Vec<_>=observations.ground_layers([x,y]).collect();
                     if !records.is_empty() {return records.into_iter().filter(|record|record.members.iter().any(|&z|
@@ -1087,17 +1090,16 @@ impl SurfaceSnapshot {
                 }
                 Some(base)
             });
-            let plane=reference_body.0[2]-((xy[0]-reference_body.0[0])*r[2][0]+(xy[1]-reference_body.0[1])*r[2][1])/r[2][2];
-            let z_low=plane+model.z_bounds_m[0]/r[2][2];let z_high=plane+model.z_bounds_m[1]/r[2][2];
+            // 参考沿地形改变高度，起点姿态只用于识别当前接触，不能作为
+            // 整条路线的竖直裁剪窗。引导叠层按各路段支撑高度检查三维相交。
             for &z in zs {
                 if let Some(points)=frame.surface_points.get(&[x,y,z]) {
                     for &point in points {
-                        if point[2]>=z_low && point[2]<=z_high
-                            && !self.recent_surface_contact(point,height,reference_body.0,r) {result.push((point,point));}
+                        if !self.recent_surface_contact(point,height,reference_body.0,r) {result.push((point,point));}
                     }
                 } else {
                     let a=[x,y,z].map(|v|f64::from(v)*fine);let b=[x,y,z].map(|v|f64::from(v+1)*fine);
-                    if b[2]>=z_low && a[2]<=z_high {result.push((a,b));}
+                    result.push((a,b));
                 }
             }
         }}
@@ -1178,7 +1180,7 @@ impl SurfaceSnapshot {
                                 selected_column=Some((cx,cy));
                             }
                             let height=if let Some(rows)=&selected_rows {rows.iter().find(|row|row.xy==[x,y]).and_then(|row|row.height)}
-                                else {ground.map(|g|self.cell_position(g)[2])};
+                                else {ground.map(|g|self.ground_cell_position(g)[2])};
                             for &z in zs {
                                 if let Some(points)=frame.surface_points.get(&[x,y,z]) {
                                     if !points.iter().any(|&point|!self.recent_surface_contact(point,height,body,r)
@@ -1191,7 +1193,7 @@ impl SurfaceSnapshot {
                                         source:OccupancySource::Recent,z_bounds:[low[2],high[2]],ground_height:None}));
                                 }
                             }
-                    }
+                        }
                 }
             }
         }
@@ -1222,7 +1224,7 @@ impl SurfaceSnapshot {
                 let px = (x as f64 + 0.5) * size;
                 let py = (y as f64 + 0.5) * size;
                 let contact = model.max_step_up_m.max(model.max_step_down_m) + uncertainty;
-                let plane=polygon_query.contact_plane(body,r[2],x,y,size,self.cell_position(ground)[2],
+                let plane=polygon_query.contact_plane(body,r[2],x,y,size,self.ground_cell_position(ground)[2],
                     (-model.body_to_support_z_m/r[2][2]+contact+1e-6).min(uncertainty));
                 let support_plane = plane - model.body_to_support_z_m / r[2][2];
                 let selected=self.fine_ground_columns(Some(ground),&polygon_query,&prism_query,body,r[2],x,y);
@@ -1367,7 +1369,7 @@ impl SurfaceSnapshot {
             let reference=body[2]-model.body_to_support_z_m*r[2][2];
             let uncertainty=f64::from(self.source_voxel_size_m())+model.support_uncertainty_m;
             let ground=self.data.physical_graph.surface_lookup.get(&(x,y)).into_iter().flatten()
-                .map(|&z|self.cell_position((x,y,z))[2])
+                .map(|&z|self.ground_cell_position((x,y,z))[2])
                 .filter(|&height|height-reference<=model.max_step_up_m+uncertainty+1e-6
                     && reference-height<=model.max_step_down_m+uncertainty+1e-6)
                 .min_by(|a,b|(a-reference).abs().total_cmp(&(b-reference).abs()));
@@ -1424,7 +1426,7 @@ impl SurfaceSnapshot {
                 let ground=if selected_rows.is_some() {
                     column.and_then(|c|c.height)
                 } else if let Some(&cell)=patch.get(&(x,y)) {
-                    let plane=polygon.contact_plane(body,r[2],x,y,size,self.cell_position(cell)[2],
+                    let plane=polygon.contact_plane(body,r[2],x,y,size,self.ground_cell_position(cell)[2],
                         -model.body_to_support_z_m/r[2][2]+contact+1e-6);
                     Some(self.footprint_ground_height(cell,polygon,prism,plane-model.body_to_support_z_m/r[2][2],contact,None)?)
                 } else {self.fine_footprint_ground(polygon,body,r[2],x,y).map(|(_,height)|height)};
@@ -1697,7 +1699,7 @@ impl SurfaceSnapshot {
                 let column = (((x as f64 + 0.5) * size / planner_size).floor() as i32,
                     ((y as f64 + 0.5) * size / planner_size).floor() as i32);
                 let ground = *patch.get(&column).ok_or(SurfaceError::MissingSupport)?;
-                let height = self.cell_position(ground)[2];
+                let height = self.ground_cell_position(ground)[2];
                 // 粗格跨坡面/阶边时，低侧真实细格可以属于同列较低的占据粗格。
                 // 查询范围由一格内允许的坡差/阶差限制，并要求候选确在规范物理占据内。
                 // 始终先选实际最高回波再查时效，旧顶部不能被新低面替代。
@@ -1835,7 +1837,7 @@ impl SurfaceSnapshot {
                 // 部分源只能沿原已知露顶证明，不能把没有提交的块当作完整空白。
 
                 if !self.data.physical_graph.surface_lookup.get(&key).is_some_and(|levels|levels.iter().any(|&z|
-                    (self.cell_position((key.0,key.1,z))[2]-f64::from(above)*size).abs()<=1e-6)) {return None;}
+                    (self.ground_cell_position((key.0,key.1,z))[2]-f64::from(above)*size).abs()<=1e-6)) {return None;}
             }
             Some((lower,top))
         };
@@ -2101,7 +2103,9 @@ impl SurfaceSnapshot {
             .ceil()
             .max(1.0) as usize;
         if count > 4096 {
-            return Err(SurfaceError::UntraversableSegment);
+            return Err(SurfaceError::InvalidConfig(format!(
+                "机体扫掠需要{count}次采样，超过4096次工作上限；未证明几何不可通行"
+            )));
         }
         self.validate_known_terrain_motion(from,to)?;
         for i in 1..count {
@@ -2146,7 +2150,7 @@ impl SurfaceSnapshot {
     fn ground_contact_samples(&self,cell:VoxelKey)->Arc<Vec<([f64;3],f64)>> {
         if let Some(points)=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner())
             .contact_samples.get(&cell).cloned() {return points;}
-        let coarse=self.cell_position(cell);
+        let coarse=self.ground_cell_position(cell);
         let low=if self.ground_evidence==GroundEvidence::OccupiedVolume {coarse[2]}else{
             (self.observed_support_lower_bound(cell)+f64::from(self.source_voxel_size_m())).min(coarse[2])};
         let points=Arc::new(vec![(coarse,low)]);
@@ -2494,7 +2498,7 @@ impl SurfaceSnapshot {
             let size=f64::from(self.config().voxel_size);
             let column=xy.map(|v|(v/size).floor() as i32);
             return self.data.physical_graph.surface_lookup.get(&(column[0],column[1]))
-                .into_iter().flatten().map(|&z|self.cell_position((column[0],column[1],z))[2])
+                .into_iter().flatten().map(|&z|self.ground_cell_position((column[0],column[1],z))[2])
                 .min_by(|a,b|(a-reference).abs().total_cmp(&(b-reference).abs()));
         };
         let fine=f64::from(observations.size_m);
@@ -2523,7 +2527,7 @@ impl SurfaceSnapshot {
         let coarse=f64::from(self.config().voxel_size);
         let column=xy.map(|v|(v/coarse).floor() as i32);
         self.data.physical_graph.surface_lookup.get(&(column[0],column[1]))
-            .into_iter().flatten().map(|&z|self.cell_position((column[0],column[1],z))[2])
+            .into_iter().flatten().map(|&z|self.ground_cell_position((column[0],column[1],z))[2])
             .chain(direct).min_by(|a,b|(a-reference).abs().total_cmp(&(b-reference).abs()))
     }
 
@@ -2558,9 +2562,9 @@ impl SurfaceSnapshot {
         let x=(xy[0]/size).floor() as i32;let y=(xy[1]/size).floor() as i32;
         let Some(levels)=self.data.physical_graph.surface_lookup.get(&(x,y)) else {return GroundQuery::unknown();};
         let Some(&z)=levels.iter().min_by(|&&a,&&b|
-            (self.cell_position((x,y,a))[2]-reference).abs().total_cmp(&(self.cell_position((x,y,b))[2]-reference).abs()))
+            (self.ground_cell_position((x,y,a))[2]-reference).abs().total_cmp(&(self.ground_cell_position((x,y,b))[2]-reference).abs()))
             else {return GroundQuery::unknown();};
-        let top=self.cell_position((x,y,z))[2];let quantum=f64::from(self.source_voxel_size_m());
+        let top=self.ground_cell_position((x,y,z))[2];let quantum=f64::from(self.source_voxel_size_m());
         let bottom=self.observed_support_lower_bound((x,y,z)).min(top-quantum);
         let Some(layer)=GroundLayer::from_legacy_band([bottom,top],quantum,self.ground_evidence) else {return GroundQuery::unknown();};
         GroundQuery {state:GroundQueryState::LegacyGeometry,height:Some(layer.representative_z),normal:Some([0.0,0.0,1.0]),
@@ -2610,7 +2614,7 @@ impl SurfaceSnapshot {
             let origin=[first.0[0],first.0[1],z];
             let at=|point:[f64;2]|origin[2]-(normal[0]*(point[0]-origin[0])+normal[1]*(point[1]-origin[1]))/normal[2];
             if (at(center)-reference).abs()>model.max_step_up_m.max(model.max_step_down_m)+quantum {return None;}
-            let location=SurfaceLocation{cell:first.2,support_xyz:origin,surface_xyz:self.cell_position(first.2)};
+            let location=SurfaceLocation{cell:first.2,support_xyz:origin,surface_xyz:self.ground_cell_position(first.2)};
             let connected=self.ground_patch(location,2.0*radius+grid);
             let mut residual=0.0_f64;
             for (point,source,cell) in &samples {
@@ -2881,6 +2885,19 @@ mod tests {
     mod live_geometry_tests { include!("body_live_geometry_tests.rs"); }
     include!("body_observation_vec_tests.rs");
     use super::*;
+    #[test]
+    fn oversized_motion_is_a_resource_error_without_a_collision_witness() {
+        let map = scene(&[], false);
+        let from = ([0.05, 0.05, 0.5], [0.0, 0.0, 0.0, 1.0]);
+        let to = ([300.05, 0.05, 0.5], from.1);
+        map.validate_body_pose(from.0, from.1).unwrap();
+        map.validate_body_pose(to.0, to.1).unwrap();
+        let mut witness = None;
+        let result = map.validate_body_motion_with_witness(from, to, &[], &mut witness);
+        assert!(matches!(result, Err(SurfaceError::InvalidConfig(ref reason)) if reason.contains("4096")), "{result:?}");
+        assert!(witness.is_none(), "资源不足不能生成碰撞证据");
+    }
+
     #[test]
     fn voxel_projection_accounts_for_corners_and_attitude_without_yaw_inflation() {
         let size=0.05;
@@ -6436,6 +6453,7 @@ fn reference_prism_intersects_voxel(
 #[derive(Default)]
 pub(super) struct BodyQueryCache {
     pub(super) supports: AHashMap<[u64;8],Result<SurfaceLocation,SurfaceError>>,
+    measured_ground_patches: GroundPatchCache,
     lower_bounds: AHashMap<VoxelKey,f64>,
     planes: AHashMap<(VoxelKey,[u64;3]),(f64,f64,f64)>,
     contact_samples: AHashMap<VoxelKey,Arc<Vec<([f64;3],f64)>>>,

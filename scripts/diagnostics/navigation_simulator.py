@@ -3,12 +3,16 @@ from __future__ import annotations
 
 import argparse
 from collections import OrderedDict
+from datetime import datetime
+import fcntl
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib.util
 import json
+import math
 import mimetypes
 import os
 from pathlib import Path
+import select
 import signal
 import subprocess
 import sys
@@ -19,8 +23,43 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[2]
 STATIC = ROOT / "gateways/http/static"
-DEFAULT_CLOUD = ROOT / "docs/开发文档/任务记录/2026-09-16_Point对照Fast实录修复与三维展示/三维对照/0918-1512-full.xyzt"
-DEFAULT_POSES = ROOT / "docs/开发文档/任务记录/2026-09-18_本次实录纯Point与完整三维链路对照/实机原参数完整链路/轨迹.jsonl"
+DEFAULT_RECORDING = ROOT / "runtime_data/navigation_simulator/recording.json"
+sys.path.insert(0, str(ROOT / "scripts/diagnostics"))
+from tool_data import cloud_statistics, load_poses, write_json
+
+
+def default_binary() -> Path:
+    if os.environ.get("CARGO_TARGET_DIR"):
+        return Path(os.environ["CARGO_TARGET_DIR"]) / "release/nuwax-navigation-simulator"
+    local = ROOT / ".nuwax-test-env/target/release/nuwax-navigation-simulator"
+    if local.is_file():
+        return local
+    return ROOT / "runtime_data/navigation_simulator_build/release/nuwax-navigation-simulator"
+
+
+def select_recording(cloud: Path | None, poses: Path | None, synthetic_only: bool,
+                     configuration: Path = DEFAULT_RECORDING) -> tuple[Path | None, Path | None, str | None]:
+    """显式输入优先；默认加载本机登记的实录，登记错误不能静默退为合成场景。"""
+    if (cloud is None) != (poses is None):
+        raise ValueError("--cloud与--poses必须同时提供")
+    if synthetic_only:
+        if cloud is not None:
+            raise ValueError("--synthetic-only不能与--cloud/--poses同时使用")
+        return None, None, None
+    if cloud is not None:
+        return cloud, poses, None
+    if not configuration.exists():
+        return None, None, None
+    recording = json.loads(configuration.read_text(encoding="utf-8"))
+    if not isinstance(recording, dict) or any(
+        not isinstance(recording.get(key), str) or not recording[key].strip() for key in ("name", "cloud", "poses")
+    ):
+        raise ValueError(f"实录配置必须包含name、cloud、poses字符串：{configuration}")
+    cloud = (configuration.parent / recording["cloud"]).resolve()
+    poses = (configuration.parent / recording["poses"]).resolve()
+    if not cloud.is_file() or not poses.is_file():
+        raise ValueError(f"已登记的实机地图或轨迹不存在，请修复{configuration}，或显式使用--synthetic-only")
+    return cloud, poses, recording["name"]
 
 
 def worker_environment() -> dict[str, str]:
@@ -43,11 +82,11 @@ def worker_environment() -> dict[str, str]:
     }
 
 
-def binary_provenance(binary: Path, cloud: Path, poses: Path) -> dict:
+def binary_provenance(binary: Path, cloud: Path | None, poses: Path | None) -> dict:
     """只记录文件元数据，不读取二进制内容，也不为取得版本启动原生程序。"""
     observed = binary.stat()
     return {
-        "binary": str(binary), "source_cloud": str(cloud), "source_poses": str(poses),
+        "binary": str(binary), "source_cloud": str(cloud) if cloud else None, "source_poses": str(poses) if poses else None,
         "binary_stat": {"size_bytes": observed.st_size, "mtime_ns": observed.st_mtime_ns,
                         "ctime_ns": observed.st_ctime_ns, "dev": observed.st_dev, "inode": observed.st_ino},
         "binary_version": None,
@@ -57,22 +96,54 @@ def binary_provenance(binary: Path, cloud: Path, poses: Path) -> dict:
 
 
 class NativeWorker:
-    def __init__(self, binary: Path, data: Path, cloud: Path, poses: Path):
+    def __init__(self, binary: Path, data: Path, cloud: Path | None = None, poses: Path | None = None,
+                 startup_timeout: float = 120):
         self.data = data
         self.provenance = binary_provenance(binary, cloud, poses)
         self.lock = threading.Lock()
         self.error_log = (data / "原生模拟.log").open("a", encoding="utf-8")
         args = [str(binary), str(data)]
-        if cloud.exists() and poses.exists():
+        if (cloud is None) != (poses is None):
+            self.error_log.close()
+            raise ValueError("实录点云与轨迹必须同时提供")
+        if cloud is not None:
+            if not cloud.is_file() or not poses.is_file():
+                self.error_log.close()
+                raise ValueError("指定的实录点云或轨迹不存在")
             args += [str(cloud), str(poses)]
-        self.process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        try:
+            self.process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                         stderr=self.error_log, text=True, encoding="utf-8",
                                         bufsize=1, env=worker_environment(), cwd=ROOT)
-        line = self.process.stdout.readline()
-        if not line:
-            raise RuntimeError("原生模拟器未完成地图加载，请查看原生模拟.log")
-        ready = json.loads(line)
-        self.catalog = ready["catalog"]
+            # 逐块读取到换行，部分输出也必须受启动期限约束。
+            deadline = time.monotonic() + startup_timeout
+            line = bytearray()
+            while b"\n" not in line:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not select.select([self.process.stdout], [], [], remaining)[0]:
+                    raise RuntimeError(f"原生模拟器启动超过{startup_timeout:g}秒，请查看原生模拟.log")
+                chunk = os.read(self.process.stdout.fileno(), 65536)
+                if not chunk:
+                    raise RuntimeError("原生模拟器未完成地图加载，请查看原生模拟.log")
+                line.extend(chunk)
+            ready_line, _, extra = line.partition(b"\n")
+            if extra.strip():
+                raise RuntimeError("原生模拟器在场景清单后输出了未请求的数据")
+            ready = json.loads(ready_line)
+            if not ready.get("ready") or not isinstance(ready.get("catalog", {}).get("scenes"), list):
+                raise RuntimeError("原生模拟器未返回有效场景清单")
+            self.catalog = ready["catalog"]
+            if cloud is not None:
+                recorded = next((s for s in self.catalog["scenes"] if s["id"] == "recorded"), None)
+                if recorded is None:
+                    raise RuntimeError("原生模拟器未加载指定实录")
+                recorded["name"] = "导入实录 · " + cloud.stem
+        except BaseException:
+            if hasattr(self, "process"):
+                self.close()
+            else:
+                self.error_log.close()
+            raise
 
     def exchange(self, request: dict) -> dict:
         with self.lock:
@@ -109,6 +180,8 @@ class NativeWorker:
                 self.process.kill()
                 self.process.wait()
         self.error_log.close()
+        self.process.stdin.close()
+        self.process.stdout.close()
 
 
 class Run:
@@ -188,12 +261,16 @@ class Simulator:
             return self._start(request)
 
     def _start(self, request: dict) -> Run:
+        if not isinstance(request, dict):
+            raise ValueError("导航请求必须为JSON对象")
         scene_ids = {scene["id"] for scene in self.worker.catalog["scenes"]}
         if request.get("scene_id") not in scene_ids:
             raise ValueError("场景不存在")
         for key in ("start", "goal"):
             if not isinstance(request.get(key), list) or len(request[key]) != 4:
                 raise ValueError("起点和目标需要机体XYZ以及方向角")
+            if not all(type(value) in (int, float) and math.isfinite(value) for value in request[key]):
+                raise ValueError("起点和目标必须包含有限数值")
         with self.lock:
             previous = self.current
             if previous:
@@ -372,32 +449,109 @@ def serve(simulator: Simulator, host: str, port: int):
 
     server = ThreadingHTTPServer((host, port), Handler)
     server.daemon_threads = True
-    print(f"导航模拟器：http://{host}:{port}/", flush=True)
+    print(f"导航模拟器：http://{host}:{server.server_port}/", flush=True)
     try:
         server.serve_forever(poll_interval=0.2)
     finally:
-        simulator.close()
         server.server_close()
 
 
-def main():
+def run_case(simulator: Simulator, args) -> int:
+    if args.request:
+        request = json.loads(args.request.read_text(encoding="utf-8"))
+    else:
+        scenes = {s["id"]: s for s in simulator.worker.catalog["scenes"]}
+        if args.scene not in scenes:
+            raise ValueError(f"场景不存在：{args.scene}，可选：{', '.join(scenes)}")
+        cases = json.loads((simulator.data / (args.scene + "-cases.json")).read_text())["cases"]
+        sample = next((case for case in cases if case["id"] == args.case), None) if args.case else (cases[0] if cases else None)
+        if sample is None:
+            raise ValueError("场景中没有指定用例；可用--request传入起点和目标")
+        request = {**sample, "case_id": sample["id"], "scene_id": args.scene, "speed_mps": args.speed}
+    run = simulator.start(request)
+    deadline = time.monotonic() + args.timeout
+    while run.thread.is_alive() and time.monotonic() < deadline:
+        run.thread.join(timeout=min(0.2, max(0, deadline - time.monotonic())))
+    timed_out = run.thread.is_alive()
+    if timed_out:
+        simulator.control(run, {"action": "cancel"})
+        simulator.close()
+    result = {"id": run.id, "status": run.snapshot()["status"], "runner_timeout": timed_out,
+              "timeout_seconds": args.timeout, "result_file": str(simulator.data / "results" / (run.id + ".json"))}
+    write_json(simulator.data / "运行结果.json", result)
+    print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
+    return 0 if result["status"] == "succeeded" and not timed_out else 1
+
+
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", default=18898, type=int)
-    parser.add_argument("--binary", type=Path, default=ROOT / ".nuwax-test-env/target/release/nuwax-navigation-simulator")
-    parser.add_argument("--data-dir", type=Path, default=ROOT / "runtime_data/navigation_simulator")
-    parser.add_argument("--cloud", type=Path, default=DEFAULT_CLOUD)
-    parser.add_argument("--poses", type=Path, default=DEFAULT_POSES)
-    args = parser.parse_args()
-    args.data_dir.mkdir(parents=True, exist_ok=True)
-    worker = NativeWorker(args.binary.resolve(), args.data_dir.resolve(), args.cloud.resolve(), args.poses.resolve())
+    parser.add_argument("--binary", type=Path, default=default_binary(), help="原生程序；首次使用先执行scripts/dev_tools.py nav build")
+    parser.add_argument("--data-dir", type=Path, help="结果目录；默认每次创建独立目录")
+    parser.add_argument("--cloud", type=Path, help="可选实录地图XYZT，小端float32，每点16字节")
+    parser.add_argument("--poses", type=Path, help="配套机体轨迹JSON数组或逐行JSON，与点云同时提供")
+    parser.add_argument("--synthetic-only", action="store_true", help="只加载合成场景，跳过本机已登记的实机地图")
+    parser.add_argument("--startup-timeout", type=float, default=120, help="原生地图加载超时秒数")
+    parser.add_argument("--run", action="store_true", help="执行一个用例并退出，不启动网页服务")
+    parser.add_argument("--scene", default="straight", help="自动执行场景，默认straight")
+    parser.add_argument("--case", help="自动执行用例标识，默认该场景第一个用例")
+    parser.add_argument("--request", type=Path, help="自动执行请求JSON，可自定义起点/目标/障碍")
+    parser.add_argument("--speed", type=float, default=1.0)
+    parser.add_argument("--timeout", type=float, default=120, help="自动执行的墙钟上限秒数，超时失败并保留结果")
+    args = parser.parse_args(argv)
     try:
-        serve(Simulator(worker, args.data_dir.resolve()), args.host, args.port)
+        args.cloud, args.poses, recording_name = select_recording(args.cloud, args.poses, args.synthetic_only)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if not all(0 < value < float("inf") for value in (args.timeout, args.startup_timeout, args.speed)):
+        parser.error("超时和速度必须是有限正数")
+    if not args.binary.is_file() or not os.access(args.binary, os.X_OK):
+        parser.error("原生程序不存在或不可执行；请先运行python3 scripts/dev_tools.py nav build")
+    rows = None
+    if args.cloud is not None:
+        cloud_statistics(args.cloud)
+        rows = load_poses(args.poses)
+    data = (args.data_dir or ROOT / "runtime_data/navigation_simulator" / (datetime.now().strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:8])).resolve()
+    data.mkdir(parents=True, exist_ok=True)
+    lock = (data / "运行.lock").open("a")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock.close()
+        raise ValueError("结果目录正被另一个测试台使用，请选择新的--data-dir")
+    worker = simulator = None
+    def stop_requested(*_):
+        raise KeyboardInterrupt
+
+    previous_signal = signal.signal(signal.SIGTERM, stop_requested)
+    try:
+        poses = None
+        if rows is not None:
+            poses = data / "输入轨迹.jsonl"
+            poses.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows), encoding="utf-8")
+        worker = NativeWorker(args.binary.resolve(), data, args.cloud.resolve() if args.cloud else None, poses, args.startup_timeout)
+        if recording_name:
+            next(scene for scene in worker.catalog["scenes"] if scene["id"] == "recorded")["name"] = recording_name
+        if args.poses:
+            worker.provenance["source_poses"] = str(args.poses.resolve())
+        write_json(data / "scenes.json", worker.catalog)
+        print(f"导航测试台结果目录：{data}", flush=True)
+        simulator = Simulator(worker, data)
+        if args.run:
+            return run_case(simulator, args)
+        serve(simulator, args.host, args.port)
+        return 0
     except KeyboardInterrupt:
-        pass
+        return 130 if args.run else 0
     finally:
-        worker.close()
+        if simulator:
+            simulator.close()
+        elif worker:
+            worker.close()
+        signal.signal(signal.SIGTERM, previous_signal)
+        lock.close()
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -10,7 +10,7 @@
 //! 接成本仓 `MapProvider`/occupancy/costmap/cloud_map 的真实数据源。
 //!
 //! ## 数据流
-//! 1. 订阅 `/odom` (odometry) + `/tf` (transform) + `/go2/lidar/points` (point cloud)
+//! 1. 订阅 `/odom` (odometry) + `/tf` (transform) + `/lidar/points` (point cloud)
 //! 2. 用 `MappingSession` 的有界滚动窗口累积点云
 //! 3. 用 `nuwax_mapping::PointCloudOccupancyBuilder` 把累积点云 + 当前 odom pose
 //!    生成 `OccupancyGrid`
@@ -26,7 +26,7 @@
 //!
 //! ## LCM typed channel 解析
 //! - 优先用 `channel_registry::resolve_channel` 解析 `/odom` `/tf`
-//!   `/go2/lidar/points`;不重读 `std::env::var`
+//!   `/lidar/points`;不重读 `std::env::var`
 //! - 该 adapter 是 `lcm_runtime.rs` 启动时调用的 `spawn_*` 之一,
 //!   接收的 channel 字符串由调用方决定,这里只在 missing 时回退到 default
 
@@ -3223,7 +3223,7 @@ impl MappingAdapter {
     /// - dedup 只过滤完整消息重放，静止位置的新采样仍被接收
     ///
     /// **调用方契约**:由 `lcm_runtime::spawn_mapping_feed_tasks` 或 `server.rs`
-    /// 在解析 `/odom` + `/go2/lidar/points` LCM 帧后调用。
+    /// 在解析 `/odom` + `/lidar/points` LCM 帧后调用。
     pub fn feed_pointcloud_session(
         &mut self,
         points: &[Point3<f64>],

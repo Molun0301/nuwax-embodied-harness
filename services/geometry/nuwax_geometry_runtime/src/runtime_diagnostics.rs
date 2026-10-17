@@ -195,10 +195,11 @@ pub fn navigation_readiness(handle: &GeometryRuntimeHandle) -> ComponentReadines
             vec![BLOCKER_LCM_BACKEND.to_string()],
         );
     }
-    if !handle.nav.execution_chain_is_live() {
+    let missing = handle.nav.execution_chain_blockers();
+    if !missing.is_empty() {
         return ComponentReadiness::not_ready_with_code(
             ComponentReadinessCode::NavExecutionChainUnavailable,
-            "导航执行链未就绪:需要新鲜 TF、planner-observed map/pose、nav-stack heartbeat 与 guard UDS sink",
+            format!("导航执行链未就绪: {}", missing.iter().map(|code| code.as_str()).collect::<Vec<_>>().join(", ")),
             vec![BLOCKER_NAV_STACK_NOT_READY.to_string()],
         );
     }
@@ -371,6 +372,8 @@ mod tests {
             })
             .await;
         handle.set_cmd_vel_sink_ready(true);
+        handle.nav.observe_motion_sink(MotionSinkObservation { generation: 1, ready: true })
+            .expect("执行端观察");
 
         let missing = navigation_readiness(&handle);
         assert!(!missing.ready);
@@ -378,6 +381,11 @@ mod tests {
             missing.code,
             ComponentReadinessCode::NavExecutionChainUnavailable
         );
+
+        assert!(missing.reason.contains("TF_UNOBSERVED"));
+        assert!(missing.reason.contains("PLANNER_INPUT_UNOBSERVED"));
+        assert!(!missing.reason.contains("MOTION_SINK"), "执行端已就绪，不能伪报缺失");
+        assert!(!missing.reason.contains("STACK_STATE"), "心跳已就绪，不能伪报缺失");
 
         handle
             .nav
@@ -411,5 +419,16 @@ mod tests {
         let ready = navigation_readiness(&handle);
         assert!(ready.ready, "{}", ready.reason);
         assert_eq!(ready.code, ComponentReadinessCode::Ready);
+
+        handle.nav.observe_tf_chain(TfChainObservation {
+            generation: 1, map_frame: "map".into(), odom_frame: "odom".into(),
+            base_frame: "base_link".into(), map_to_odom: false, odom_to_base: true,
+        }).expect("撤销完整坐标链");
+        let stale = navigation_readiness(&handle);
+        assert!(!stale.ready);
+        assert_eq!(stale.reason, "导航执行链未就绪: TF_INCOMPLETE");
+        let detailed = crate::nav_runtime::compute_readiness(&handle, &handle.nav).await;
+        assert_eq!(detailed.blockers, vec![crate::nav_runtime::NavigationReadinessCode::TfIncomplete]);
+        assert!(!detailed.ready);
     }
 }

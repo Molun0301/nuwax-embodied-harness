@@ -3,6 +3,7 @@
 mod cancellation;
 mod local_search;
 mod spline;
+mod step_turn;
 #[cfg(test)]
 mod polyline_reuse_tests;
 #[cfg(feature="profile")]
@@ -23,6 +24,8 @@ pub struct ScanConfig {
     pub optimization_iterations: usize,
     /// 中间参考走廊，生产拥有方与既有路线偏差范围同步。
     pub reference_corridor_m: f64,
+    /// 近场搜索的展开上限，单位状态数。按视距与真实离散粒度自适应，不是地形阈值。
+    pub search_expansion_limit: usize,
 }
 impl Default for ScanConfig {
     fn default() -> Self {
@@ -31,9 +34,16 @@ impl Default for ScanConfig {
             refresh_distance_m: 1.0,
             optimization_iterations: 12,
             reference_corridor_m: 0.9,
+            search_expansion_limit: DEFAULT_SEARCH_EXPANSION_LIMIT,
         }
     }
 }
+/// 近场搜索展开上限的默认值。它是资源上限，不是地形结论。
+/// 取 256 是因为提高上限对成功率没有帮助：参考被近期障碍横穿时，搜索会走到
+/// 一个"站姿合法、但任何一步运动都非法"的位姿并停住，预算从 256 提到 8192
+/// 只把单次耗时从 0.8 秒推到 22.6 秒，位置与失败类型完全不变。正确做法是让
+/// 参考本身避开近期障碍（hints 通道），而不是让失败的搜索多跑。
+pub const DEFAULT_SEARCH_EXPANSION_LIMIT: usize = 256;
 impl ScanConfig {
     pub fn validate(&self) -> Result<(), String> {
         if !self.horizon_m.is_finite()
@@ -43,6 +53,7 @@ impl ScanConfig {
             || !self.reference_corridor_m.is_finite()
             || self.reference_corridor_m <= 0.0
             || self.optimization_iterations > 100
+            || self.search_expansion_limit == 0
         {
             return Err("近场视距、更新距离或样条迭代次数无效".into());
         }
@@ -502,6 +513,28 @@ fn plan_impl(
             }
         }
     }
+    // 台阶后紧接转弯时，先给完整机身留出离开阶边的空间。该参考候选
+    // 与普通折线共用全部真实机体检查；失败不修改地图、代价或运动能力。
+    if let Some(guide) = step_turn::guide(map, tomogram, reference, config, arrival.is_some(), boundary)? {
+        let samples = spline::resample(&guide, spacing)?;
+        let candidate_blocked = std::cell::Cell::new(None);
+        if let Some(poses) = admit_candidate(project(map, start, &samples, kinematics, false,
+            final_yaw, interior, boundary, &candidate_blocked))? {
+            let end = *poses.last().unwrap();
+            let corridor = (config.reference_corridor_m * 0.9).min(config.horizon_m * 0.3);
+            let layer_tolerance = (model.body_to_support_z_m + model.z_bounds_m[1]) * 0.5;
+            let length = reference.windows(2).map(|w| (w[1][0]-w[0][0]).hypot(w[1][1]-w[0][1])).sum();
+            let tangent = reference.windows(2).rfind(|w| (w[1][0]-w[0][0]).hypot(w[1][1]-w[0][1])>1e-9)
+                .map_or(yaw(start.1), |w| (w[1][1]-w[0][1]).atan2(w[1][0]-w[0][0]));
+            if arrival.is_some() || local_search::reference_handoff(end, reference,
+                model.body_to_support_z_m, corridor, layer_tolerance, length, tangent) {
+                #[cfg(feature="profile")]
+                profile::success();
+                return Ok(LocalTrajectory { poses, smoothed: false,
+                    elapsed_ms: began.elapsed().as_secs_f64() * 1000.0 });
+            }
+        }
+    }
     // 已沿局部走廊前进后，粗参考的近处折点可能落在侧后方。
     // 尝试从实际位置直达较远的参考折点，保留末段切向供下一窗口接续。
     // 完整候选仍核验地形、机体和转向，不能用仅中心可见或整窗直弦切掉真正转角。
@@ -710,6 +743,7 @@ fn plan_impl(
             config.horizon_m,
             config.reference_corridor_m,
             follow_reference,
+            config.search_expansion_limit,
         )
         .map(|poses| {
             prefix.extend(poses.into_iter().skip(1));
@@ -896,7 +930,7 @@ mod tests {
         let tomo=Tomogram::from_surface(&map).unwrap();
         let began=std::time::Instant::now();
         let result=local_search::plan(&map,&tomo,start,&[[start.0[0],start.0[1],0.0],[goal[0],goal[1],0.0]],
-            &motion(),None,Some((goal,0.015)),&[],3.0,0.9,false);
+            &motion(),None,Some((goal,0.015)),&[],3.0,0.9,false, DEFAULT_SEARCH_EXPANSION_LIMIT);
         eprintln!("fine_escape mirror={mirror} shift={shift:?} coarse_dead_end={coarse_dead_end} half_width_cells={half_width_cells} result={:?} elapsed_ms={:.3}",
             result.as_ref().map(|p|p.len()),began.elapsed().as_secs_f64()*1000.0);
         let path=result.expect("the independently swept fine escape must be searchable");
@@ -977,7 +1011,7 @@ mod tests {
         let reference=[[-0.35,0.05,0.0],[0.5,0.05,0.0]];
         let arrival=Some(([0.5,0.05,2.0],0.01));
         let failure=local_search::with_expansion_limit(1,||local_search::plan(&map,&tomo,start,
-            &reference,&motion(),None,arrival,&[],3.0,0.9,true)).unwrap_err();
+            &reference,&motion(),None,arrival,&[],3.0,0.9,true, DEFAULT_SEARCH_EXPANSION_LIMIT)).unwrap_err();
         assert_eq!(failure.kind,LocalPlanFailureKind::BudgetExhausted);
         assert_eq!(failure.blocked,None);
         let sample=failure.body_witness.expect("finite search contains an actually rejected outgoing sample");
@@ -1000,7 +1034,7 @@ mod tests {
         let tomo=Tomogram::from_surface(&map).unwrap();
         let failure=local_search::with_expansion_limit(1,||local_search::plan(&map,&tomo,start,
             &[[0.0101,0.005,0.0],[0.3,0.005,0.0]],&motion(),None,
-            Some(([0.3,0.005,2.0],0.01)),&[],3.0,0.9,false)).unwrap_err();
+            Some(([0.3,0.005,2.0],0.01)),&[],3.0,0.9,false, DEFAULT_SEARCH_EXPANSION_LIMIT)).unwrap_err();
         assert_eq!(failure.kind,LocalPlanFailureKind::BudgetExhausted);
         assert!(failure.blocked.is_none());
         let admitted=local_search::initial_admissions();
@@ -1083,7 +1117,7 @@ mod tests {
         for checkpoints in [3, 40, 400] {
             let error = cancellation::after_checkpoints(checkpoints, || local_search::plan(
                 &map, &tomo, start, &[[-1.0, 0.2, 0.0], [0.1, 0.2, 0.0]], &motion(),
-                None, Some(([0.1, 0.2, 2.0], 0.1)), &[], 3.0, 0.9, true)).unwrap_err();
+                None, Some(([0.1, 0.2, 2.0], 0.1)), &[], 3.0, 0.9, true, DEFAULT_SEARCH_EXPANSION_LIMIT)).unwrap_err();
             assert_eq!(error.kind, LocalPlanFailureKind::Cancelled);
             assert_eq!(error.blocked, None);
             assert_eq!(error.closest_pose, None);
@@ -1122,7 +1156,7 @@ mod tests {
         let goal=[-0.1,0.2,0.4];
         assert!(map.validate_body_pose(goal,start.1).is_err(),"点击中心的机体确实与墙相交");
         let path=local_search::plan(&map,&tomo,start,&[[-0.8,0.2,0.0],[-0.1,0.2,0.0]],
-            &motion(),None,Some((goal,0.35)),&[],3.0,0.9,false).unwrap();
+            &motion(),None,Some((goal,0.35)),&[],3.0,0.9,false, DEFAULT_SEARCH_EXPANSION_LIMIT).unwrap();
         assert!(distance3(path.last().unwrap().0,goal)<0.35);
         assert!(path.iter().all(|p|(p.0[1]-0.2).abs()<1e-9),"可直入目标球时不应绕圈寻找点击中心");
         for pair in path.windows(2) {
@@ -1146,7 +1180,7 @@ mod tests {
             }
             for pair in witness.windows(2) {map.validate_body_motion(pair[0],pair[1],&[]).unwrap();}
             let goal=[-sign*0.8,-0.3,0.4];
-            let path=local_search::plan(&map,&tomo,start,&reference,&motion(),None,Some((goal,0.1)),&[],3.0,0.9,true).unwrap();
+            let path=local_search::plan(&map,&tomo,start,&reference,&motion(),None,Some((goal,0.1)),&[],3.0,0.9,true, DEFAULT_SEARCH_EXPANSION_LIMIT).unwrap();
             assert_eq!(path[0],start);
             assert!(distance3(path.last().unwrap().0,goal)<0.1);
             for pair in path.windows(2) {
@@ -1240,14 +1274,14 @@ mod tests {
         let start=([0.0,0.2,0.4],[0.0,0.0,0.0,1.0]);
         for reference in [vec![[0.0,0.2,0.0]],vec![[0.0,0.2,0.0];3]] {
             let path=local_search::plan(&map,&tomo,start,&reference,&motion(),Some(0.5),
-                Some((start.0,0.01)),&[],3.0,0.9,true).unwrap();
+                Some((start.0,0.01)),&[],3.0,0.9,true, DEFAULT_SEARCH_EXPANSION_LIMIT).unwrap();
             assert!(angle(yaw(path.last().unwrap().1)-0.5).abs()<1e-6);
             for pair in path.windows(2) {map.validate_body_motion(pair[0],pair[1],&[]).unwrap();}
             for invalid in [0.0,-1.0,f64::NAN,f64::INFINITY,f64::NEG_INFINITY] {
                 for angular in [true,false] {
                     let mut caps=motion();
                     if angular {caps.max_angular_rps=invalid;}else{caps.max_forward_mps=invalid;}
-                    let failure=local_search::plan(&map,&tomo,start,&reference,&caps,None,None,&[],3.0,0.9,true).unwrap_err();
+                    let failure=local_search::plan(&map,&tomo,start,&reference,&caps,None,None,&[],3.0,0.9,true, DEFAULT_SEARCH_EXPANSION_LIMIT).unwrap_err();
                     assert!(failure.blocked.is_none());
                     let failure=plan(&map,&tomo,start,&reference,&caps,&ScanConfig::default(),None,None,&[],true,true).unwrap_err();
                     assert!(failure.blocked.is_none());
@@ -1261,7 +1295,7 @@ mod tests {
         let start=([0.0,0.2,0.4],[0.0,0.0,0.0,1.0]);
         for reference in [vec![[0.0,0.2,0.0]],vec![[0.0,0.2,0.0];3],
             vec![[0.0,0.2,0.0],[0.5,0.7,0.0],[0.5,0.7,0.0]]] {
-            let path=local_search::plan(&map,&tomo,start,&reference,&motion(),None,None,&[],3.0,0.9,true).unwrap();
+            let path=local_search::plan(&map,&tomo,start,&reference,&motion(),None,None,&[],3.0,0.9,true, DEFAULT_SEARCH_EXPANSION_LIMIT).unwrap();
             for pair in path.windows(2) {map.validate_body_motion(pair[0],pair[1],&[]).unwrap();}
             let end=path.last().unwrap();let target=reference.last().unwrap();
             let tangent=if target[0]>0.0 {std::f64::consts::FRAC_PI_4}else{0.0};
@@ -1293,7 +1327,7 @@ mod tests {
                 assert!(time(&line)+0.2<time(&arc));
                 let began=std::time::Instant::now();
                 let path=local_search::plan(&map,&tomo,start,&[[shift[0],shift[1],0.0],[goal[0],goal[1],0.0]],
-                    &motion(),Some(heading),Some((goal,0.001)),&[],3.0,0.9,false).unwrap();
+                    &motion(),Some(heading),Some((goal,0.001)),&[],3.0,0.9,false, DEFAULT_SEARCH_EXPANSION_LIMIT).unwrap();
                 eprintln!("final_yaw_case sign={sign} shift={shift:?} elapsed_ms={:.3} line_time={} arc_time={}",
                     began.elapsed().as_secs_f64()*1000.0,time(&line),time(&arc));
                 report_path_metrics("final_yaw",&path);
@@ -1317,7 +1351,7 @@ mod tests {
                 let arrival=if name=="budget16" {Some(([0.1,0.2,2.0],0.1))} else {None};
                 let began=std::time::Instant::now();
                 let result=local_search::with_expansion_limit(16,||local_search::plan(&map,&tomo,start,
-                    &reference,&motion(),None,arrival,boundary,3.0,0.9,true));
+                    &reference,&motion(),None,arrival,boundary,3.0,0.9,true, DEFAULT_SEARCH_EXPANSION_LIMIT));
                 eprintln!("matched_workload name={name} repeat={repeat} result={:?} elapsed_ms={:.3}",
                     result.as_ref().map(|p|p.len()),began.elapsed().as_secs_f64()*1000.0);
                 if name=="open_connection" {report_path_metrics(name,result.as_ref().unwrap());assert!(result.is_ok());} else {
@@ -1336,13 +1370,13 @@ mod tests {
         let tomo = Tomogram::from_surface(&map).unwrap();
         let start = ([-1.0, 0.2, 0.4], [0.0, 0.0, 0.0, 1.0]);
         let run = || local_search::plan(&map, &tomo, start,
-            &[[-1.0,0.2,0.0], [0.1,0.2,0.0]], &motion(), None, None, &[], 3.0, 0.9, true);
+            &[[-1.0,0.2,0.0], [0.1,0.2,0.0]], &motion(), None, None, &[], 3.0, 0.9, true, DEFAULT_SEARCH_EXPANSION_LIMIT);
         assert!(run().is_ok(), "the unbounded fixture has an open-floor connection");
         // Force a finite attempt using the production branch with a reduced test budget.
         // The elevated arrival ball is unconnected, but is not an obstacle measurement.
         let failure = local_search::with_expansion_limit(0, || local_search::plan(&map, &tomo, start,
             &[[-1.0,0.2,0.0], [0.1,0.2,0.0]], &motion(), None,
-            Some(([0.1,0.2,2.0],0.1)), &[], 3.0, 0.9, true)).unwrap_err();
+            Some(([0.1,0.2,2.0],0.1)), &[], 3.0, 0.9, true, DEFAULT_SEARCH_EXPANSION_LIMIT)).unwrap_err();
         assert_eq!(failure.kind, LocalPlanFailureKind::BudgetExhausted);
         assert_eq!(failure.closest_pose, Some(start));
         assert_eq!(failure.blocked, None);
@@ -1356,7 +1390,7 @@ mod tests {
         // A goal ball above the only floor prevents arrival without blocking the open terrain.
         let failure = local_search::plan(&map, &tomo, start,
             &[[-1.0,0.2,0.0],[0.1,0.2,0.0]], &motion(), None,
-            Some(([0.1,0.2,2.0],0.1)), &[], 3.0, 0.9, true).unwrap_err();
+            Some(([0.1,0.2,2.0],0.1)), &[], 3.0, 0.9, true, DEFAULT_SEARCH_EXPANSION_LIMIT).unwrap_err();
         assert_eq!(failure.kind, LocalPlanFailureKind::BudgetExhausted);
         assert!(failure.closest_pose.is_some());
         let (expanded,nodes,frontier)=local_search::last_work();
@@ -1374,7 +1408,7 @@ mod tests {
         let boundary = [[2.0,2.0], [3.0,2.0], [3.0,3.0], [2.0,3.0]];
         let reference = [[-1.0,0.2,0.0], [0.1,0.2,0.0]];
         let drained = local_search::plan(&map, &tomo, start, &reference,
-            &motion(), None, None, &boundary, 3.0, 0.9, true).unwrap_err();
+            &motion(), None, None, &boundary, 3.0, 0.9, true, DEFAULT_SEARCH_EXPANSION_LIMIT).unwrap_err();
         assert_eq!(drained.kind, LocalPlanFailureKind::SearchExhausted);
         assert!(drained.blocked.is_none());
         let wrapped = local_search::with_expansion_limit(0, || plan(&map, &tomo, start, &reference,
@@ -1396,7 +1430,7 @@ mod tests {
         let start = ([-1.0, 0.2, 0.4], [0.0, 0.0, 0.0, 1.0]);
         let path = local_search::plan(
             &map, &tomo, start, &[[-1.0, 0.2, 0.0], [0.1, 0.2, 0.0]],
-            &motion(), None, None, &[], 3.0, 0.9, true,
+            &motion(), None, None, &[], 3.0, 0.9, true, DEFAULT_SEARCH_EXPANSION_LIMIT,
         ).unwrap();
         assert!(path.last().unwrap().0[0] >= 0.1 - 1e-6);
         for pair in path.windows(2) {
@@ -1413,7 +1447,7 @@ mod tests {
         // 墙位于x=0；走到墙前虽已覆盖六成参考，仍没有连接到窗口交接点。
         let result = local_search::plan(
             &map, &tomo, start, &[[-1.0, 0.2, 0.0], [0.1, 0.2, 0.0]],
-            &motion(), None, None, &[], 3.0, 0.9, true,
+            &motion(), None, None, &[], 3.0, 0.9, true, DEFAULT_SEARCH_EXPANSION_LIMIT,
         );
         let failure = result.expect_err("不能把墙前的可行前缀当作完整近场接续");
         assert!(failure.blocked.is_none(), "finite search cannot report an obstacle");

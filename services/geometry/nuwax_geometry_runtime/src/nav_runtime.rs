@@ -1450,22 +1450,22 @@ impl NavRuntimeState {
         Ok(())
     }
 
-    /// Synchronous coarse gate used by process diagnostics.
+    /// 进程诊断复用实际观察分类，只报告本次缺失或过期的条件。
+    pub(crate) fn execution_chain_blockers(&self) -> Vec<NavigationReadinessCode> {
+        let observations = self.runtime_observation_snapshot();
+        let stack = self.stack_health_snapshot();
+        let profile = self.inner.try_read().ok().map(|slot| profile_has_guarded_execution(slot.profile));
+        let mut blockers = observation_blockers(profile.unwrap_or(true), &stack, &observations);
+        if profile.is_none() {
+            // 配置正在更新时保持原不就绪语义，不把锁忙误报为不支持的配置。
+            blockers.push(NavigationReadinessCode::Unknown);
+        }
+        blockers
+    }
+
+    /// 同步诊断与实际缺失项使用同一份观察判断。
     pub fn execution_chain_is_live(&self) -> bool {
-        let snapshot = self.runtime_observation_snapshot();
-        let profile_supported = self
-            .inner
-            .try_read()
-            .is_ok_and(|slot| profile_has_guarded_execution(slot.profile));
-        profile_supported
-            && self.stack_is_live()
-            && snapshot.tf_fresh
-            && snapshot.tf_complete
-            && snapshot.planner_fresh
-            && snapshot.planner_ready
-            && snapshot.planner_frame_matches
-            && snapshot.motion_sink_fresh
-            && snapshot.motion_sink_ready
+        self.execution_chain_blockers().is_empty()
     }
 
     /// Return the current cancellation generation and typed state.
@@ -2075,42 +2075,7 @@ pub async fn compute_readiness(
     if !lcm_backend {
         blockers.push(NavigationReadinessCode::LcmBackendUnavailable);
     }
-    if !observations.motion_sink_observed {
-        blockers.push(NavigationReadinessCode::MotionSinkUnobserved);
-    } else if !observations.motion_sink_fresh {
-        blockers.push(NavigationReadinessCode::MotionSinkStale);
-    } else if !observations.motion_sink_ready {
-        blockers.push(NavigationReadinessCode::MotionSinkNotReady);
-    }
-    if !stack_health.observed {
-        blockers.push(NavigationReadinessCode::StackStateUnobserved);
-    } else if !stack_health.fresh {
-        blockers.push(NavigationReadinessCode::StackStateStale);
-    }
-    if !observations.tf_observed {
-        blockers.push(NavigationReadinessCode::TfUnobserved);
-    } else if !observations.tf_fresh {
-        blockers.push(NavigationReadinessCode::TfStale);
-    } else if !observations.tf_complete {
-        blockers.push(NavigationReadinessCode::TfIncomplete);
-    }
-    if !observations.planner_observed {
-        blockers.push(NavigationReadinessCode::PlannerInputUnobserved);
-    } else if !observations.planner_fresh {
-        blockers.push(NavigationReadinessCode::PlannerInputStale);
-    } else {
-        if !observations.map_frame.trim().is_empty()
-            && !observations.pose_frame.trim().is_empty()
-            && !observations.planner_frame_matches {
-            blockers.push(NavigationReadinessCode::PlannerFrameMismatch);
-        }
-        if !observations.planner_ready || !observations.planner_frame_matches {
-            blockers.push(NavigationReadinessCode::PlannerNotReady);
-        }
-    }
-    if !profile_supported {
-        blockers.push(NavigationReadinessCode::ProfileUnsupported);
-    }
+    blockers.extend(observation_blockers(profile_supported, &stack_health, &observations));
     let reason_code = blockers
         .first()
         .copied()
@@ -2184,42 +2149,7 @@ fn compute_admission_readiness<'a>(
         if !lcm_backend {
             blockers.push(NavigationReadinessCode::LcmBackendUnavailable);
         }
-        if !observations.motion_sink_observed {
-            blockers.push(NavigationReadinessCode::MotionSinkUnobserved);
-        } else if !observations.motion_sink_fresh {
-            blockers.push(NavigationReadinessCode::MotionSinkStale);
-        } else if !observations.motion_sink_ready {
-            blockers.push(NavigationReadinessCode::MotionSinkNotReady);
-        }
-        if !stack_health.observed {
-            blockers.push(NavigationReadinessCode::StackStateUnobserved);
-        } else if !stack_health.fresh {
-            blockers.push(NavigationReadinessCode::StackStateStale);
-        }
-        if !observations.tf_observed {
-            blockers.push(NavigationReadinessCode::TfUnobserved);
-        } else if !observations.tf_fresh {
-            blockers.push(NavigationReadinessCode::TfStale);
-        } else if !observations.tf_complete {
-            blockers.push(NavigationReadinessCode::TfIncomplete);
-        }
-        if !observations.planner_observed {
-            blockers.push(NavigationReadinessCode::PlannerInputUnobserved);
-        } else if !observations.planner_fresh {
-            blockers.push(NavigationReadinessCode::PlannerInputStale);
-        } else {
-            if !observations.map_frame.trim().is_empty()
-            && !observations.pose_frame.trim().is_empty()
-            && !observations.planner_frame_matches {
-                blockers.push(NavigationReadinessCode::PlannerFrameMismatch);
-            }
-            if !observations.planner_ready || !observations.planner_frame_matches {
-                blockers.push(NavigationReadinessCode::PlannerNotReady);
-            }
-        }
-        if !profile_supported {
-            blockers.push(NavigationReadinessCode::ProfileUnsupported);
-        }
+        blockers.extend(observation_blockers(profile_supported, &stack_health, &observations));
         let reason_code = blockers
             .first()
             .copied()
@@ -2259,6 +2189,52 @@ fn compute_admission_readiness<'a>(
             motion_sink_fresh: observations.motion_sink_fresh,
         }
     }
+}
+
+/// 按同一观察快照分类实际缺失项；不改变各来源的期限或运动准入。
+fn observation_blockers(
+    profile_supported: bool,
+    stack_health: &StackHealthSnapshot,
+    observations: &RuntimeObservationSnapshot,
+) -> Vec<NavigationReadinessCode> {
+    let mut blockers = Vec::new();
+    if !observations.motion_sink_observed {
+        blockers.push(NavigationReadinessCode::MotionSinkUnobserved);
+    } else if !observations.motion_sink_fresh {
+        blockers.push(NavigationReadinessCode::MotionSinkStale);
+    } else if !observations.motion_sink_ready {
+        blockers.push(NavigationReadinessCode::MotionSinkNotReady);
+    }
+    if !stack_health.observed {
+        blockers.push(NavigationReadinessCode::StackStateUnobserved);
+    } else if !stack_health.fresh {
+        blockers.push(NavigationReadinessCode::StackStateStale);
+    }
+    if !observations.tf_observed {
+        blockers.push(NavigationReadinessCode::TfUnobserved);
+    } else if !observations.tf_fresh {
+        blockers.push(NavigationReadinessCode::TfStale);
+    } else if !observations.tf_complete {
+        blockers.push(NavigationReadinessCode::TfIncomplete);
+    }
+    if !observations.planner_observed {
+        blockers.push(NavigationReadinessCode::PlannerInputUnobserved);
+    } else if !observations.planner_fresh {
+        blockers.push(NavigationReadinessCode::PlannerInputStale);
+    } else {
+        if !observations.map_frame.trim().is_empty()
+            && !observations.pose_frame.trim().is_empty()
+            && !observations.planner_frame_matches {
+            blockers.push(NavigationReadinessCode::PlannerFrameMismatch);
+        }
+        if !observations.planner_ready || !observations.planner_frame_matches {
+            blockers.push(NavigationReadinessCode::PlannerNotReady);
+        }
+    }
+    if !profile_supported {
+        blockers.push(NavigationReadinessCode::ProfileUnsupported);
+    }
+    blockers
 }
 
 fn readiness_reason(code: NavigationReadinessCode) -> &'static str {

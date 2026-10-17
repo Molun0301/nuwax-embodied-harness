@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
 from adapters.base import AdapterBase, AdapterConfig, AdapterHealthStatus
+from contracts.motion_limits import MotionCommandLimits
 from drivers.common.manifest import RobotDefaults, RobotManifest
 
 
@@ -94,6 +95,10 @@ class RobotAssemblyBase(ABC):
         Availability and readiness are not evidence that an actuator is absent.
         Assemblies must explicitly override this contract to prove absence.
         """
+        return None
+
+    def get_motion_command_limits(self) -> Optional[MotionCommandLimits]:
+        """立即返回设备已知速度策略；未公开时保留未知，不推断为无限制。"""
         return None
 
     @abstractmethod

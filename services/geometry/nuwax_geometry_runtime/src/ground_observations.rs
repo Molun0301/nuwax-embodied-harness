@@ -380,15 +380,35 @@ fn associate(layers: &mut LayerObservations, candidate: LayerObservation, thresh
     let Ok(center) = candidate.representative() else {
         return;
     };
-    let overlapping: Vec<_> = layers
-        .iter()
-        .filter(|(_, old)| old.members.iter().any(|m| candidate.members.contains(m)))
-        .map(|(key, _)| *key)
-        .collect();
-    let same = layers
-        .iter()
-        .find(|(_, old)| same_physical_layer(old, &candidate, threshold, block, voxel_size))
-        .map(|(key, _)| *key);
+    let column = candidate.members[0] % 1024;
+    let mut overlapping = Vec::new();
+    let mut same = None;
+    // Validated layer anchors are x + 32*y + 1024*z, z in 0..32.
+    // Preserve original BTreeMap order within exactly the candidate's XY.
+    let levels = layers.first_key_value().zip(layers.last_key_value())
+        .map(|((&first, _), (&last, _))| (first / 1024, last / 1024));
+    let mut visit = |key, old: &LayerObservation| {
+        if old.members.iter().any(|m| candidate.members.contains(m)) {
+            overlapping.push(key);
+        }
+        if same.is_none() && same_physical_layer(old, &candidate, threshold, block, voxel_size) {
+            same = Some(key);
+        }
+    };
+    if let Some((first, last)) = levels {
+        // A sparse, tall block may contain fewer records than candidate Z keys.
+        // Choose the smaller enumeration; both retain the same ascending order.
+        if layers.len() < usize::from(last - first + 1) {
+            for (&key, old) in layers.iter().filter(|(key, _)| **key % 1024 == column) {
+                visit(key, old);
+            }
+        } else {
+            for z in first..=last {
+                let key = column + z * 1024;
+                if let Some(old) = layers.get(&key) { visit(key, old); }
+            }
+        }
+    }
     // Ambiguous claims are withdrawn rather than merging unrelated physical layers.
     for key in &overlapping {
         if Some(*key) != same {
@@ -440,6 +460,7 @@ fn associate(layers: &mut LayerObservations, candidate: LayerObservation, thresh
         layers.insert(result.members[0], result);
     }
 }
+
 
 /// 各真实来源内部按采集顺序取新样本，再按来源轮流保留；不同设备时钟不可比大小。
 /// 输入最多是旧层与本帧各 32 个返回；只选原数组下标，不复制点或增加历史表。
@@ -497,8 +518,119 @@ mod tests {
                 "refined_central_indices":local(refined),"accepted_refinement":accepted}));
         });
     }
+    fn associate_full_block_reference(layers: &mut LayerObservations, candidate: LayerObservation, threshold: f64,
+        block: Key, voxel_size: f32) {
+        let Ok(center) = candidate.representative() else {
+            return;
+        };
+        let overlapping: Vec<_> = layers
+            .iter()
+            .filter(|(_, old)| old.members.iter().any(|m| candidate.members.contains(m)))
+            .map(|(key, _)| *key)
+            .collect();
+        let same = layers
+            .iter()
+            .find(|(_, old)| same_physical_layer(old, &candidate, threshold, block, voxel_size))
+            .map(|(key, _)| *key);
+        // Ambiguous claims are withdrawn rather than merging unrelated physical layers.
+        for key in &overlapping {
+            if Some(*key) != same {
+                layers.remove(key);
+            }
+        }
+        let mut result = candidate;
+        if let Some(key) = same {
+            let old = layers.remove(&key).unwrap();
+            // Retain the prior fitted output only inside half the fitting residual
+            // bound (0.1 source voxel). Compare to the old fixed output, not the last
+            // input: persistent motion accumulates and eventually crosses this bound.
+            // Normal drift is measured as height at one patch radius, also in metres.
+            let normal_shift = (old.normal[0] / old.normal[2] - result.normal[0] / result.normal[2])
+                .abs()
+                + (old.normal[1] / old.normal[2] - result.normal[1] / result.normal[2]).abs();
+            let stability = threshold * 0.5;
+            if (old.plane_origin[2] - result.plane_origin[2]).abs() <= stability
+                && normal_shift * (threshold / 0.2) * f64::from(PATCH_SIDE_VOXELS) <= stability
+            {
+                result.plane_origin = old.plane_origin;
+                result.normal = old.normal;
+            }
+            let current_source = Arc::clone(&result.samples[0].source);
+            let mut samples = old.samples;
+            for sample in result.samples {
+                if !samples.iter().any(|old| {
+                    old.source == sample.source
+                        && old.source_sequence == sample.source_sequence
+                        && old.source_timestamp_ns == sample.source_timestamp_ns
+                        && old.point_index == sample.point_index
+                }) {
+                    samples.push(sample);
+                }
+            }
+            // Retained inliers are rechecked against the newly fitted plane. Old ground
+            // is not expired by a clock; only new geometric evidence changes this patch.
+            samples.retain(|p| distance(p.point, center, result.normal).abs() <= threshold);
+            retain_bounded_sources(&mut samples, &current_source);
+            result.samples = samples;
+            result.members.extend(old.members);
+            result.members.sort_unstable();
+            result.members.dedup();
+        }
+        if !result.samples.is_empty()
+            && result.members.len() <= nuwax_map_chunks::MAX_LAYER_MEMBERS
+            && (layers.len() < MAX_LAYERS_PER_BLOCK || layers.contains_key(&result.members[0]))
+        {
+            layers.insert(result.members[0], result);
+        }
+    }
+
+
     fn new_writer() -> Writer {
         Writer::new(Repository::temporary().unwrap(), 0.05, 4 * 1024 * 1024).unwrap()
+    }
+
+    #[test]
+    fn same_column_association_preserves_full_block_results_and_source_samples() {
+        let quantum = 0.05_f32;
+        let threshold = f64::from(quantum) * 0.2;
+        for (columns, scans_existing) in [(1_u16, true), (8, true), (96, false)] {
+            let mut actual = LayerObservations::new();
+            for z in [0_u16, 4, 31] { for column in 0..columns {
+                let anchor = column + 1024 * z;
+                let point = [(f64::from(column % 32) + 0.5) * f64::from(quantum),
+                    (f64::from(column / 32) + 0.5) * f64::from(quantum),
+                    (f64::from(z) + 0.5) * f64::from(quantum)];
+                actual.insert(anchor, LayerObservation {
+                    members: vec![anchor], plane_origin: point, normal: [0.0, 0.0, 1.0],
+                    samples: vec![LayerSample { point, source: Arc::new(LayerSource::Legacy),
+                        point_index: u32::from(anchor), source_sequence: 1, source_timestamp_ns: 100 }],
+                });
+            }}
+            let first = actual.first_key_value().unwrap().0 / 1024;
+            let last = actual.last_key_value().unwrap().0 / 1024;
+            assert_eq!(actual.len() < usize::from(last - first + 1), scans_existing,
+                "exercise both existing-record and bounded-key enumeration");
+            let mut expected = actual.clone();
+            let originals: Vec<_> = actual.values().cloned().collect();
+            for round in 0..4_u64 { for (index, original) in originals.iter().enumerate() {
+                let mut candidate = original.clone();
+                let shift = [0.004, -0.004, 0.006, -0.006][round as usize];
+                candidate.plane_origin[2] += shift;
+                if round == 2 && index % 7 == 0 { candidate.normal = [0.6, 0.0, 0.8]; }
+                candidate.samples[0].point = candidate.plane_origin;
+                candidate.samples[0].source_sequence = round + 2;
+                candidate.samples[0].source_timestamp_ns = 200 + round;
+                candidate.samples[0].source = Arc::new(if index % 2 == 0 {
+                    LayerSource::Lidar { backend: 1, runtime_generation: 1, sensor_frame_id: "lidar".into() }
+                } else {
+                    LayerSource::Auxiliary { sensor_id: "aux".into(), clock_id: "clock".into(),
+                        runtime_generation: 1, session_generation: 1 }
+                });
+                associate_full_block_reference(&mut expected, candidate.clone(), threshold, [0; 3], quantum);
+                associate(&mut actual, candidate, threshold, [0; 3], quantum);
+                assert_eq!(actual, expected, "columns={columns} round={round} index={index}");
+            }}
+        }
     }
     fn ingest(writer: &mut Writer, points: &[Point3<f64>], stamp: u64) {
         let keys = points
@@ -1132,6 +1264,44 @@ mod tests {
         let after = writer.snapshot(domain(), 2, 2).unwrap();
         assert!(after.geometry_revision > before.geometry_revision);
         assert_eq!(writer.region([0, 0, 0], [0, 0, 0], 1).unwrap().len(), 1);
+    }
+
+    // Stage-only: excludes capture, Writer persistence, publish, planner and controller.
+    #[test]
+    #[ignore = "manual serial release exact-output association crossover benchmark"]
+    fn benchmark_same_column_association_crossover() {
+        use std::{hint::black_box,time::Instant};
+        let q=0.05_f32;let threshold=f64::from(q)*0.2;
+        for columns in [1_u16,4,32,1024] {for zs in [&[0_u16][..],&[0,31][..],&[0,1,2,3][..]] {
+            let mut initial=LayerObservations::new();
+            for &z in zs {for column in 0..columns {
+                let anchor=column+1024*z;
+                let point=[(f64::from(column%32)+0.5)*f64::from(q),
+                    (f64::from(column/32)+0.5)*f64::from(q),(f64::from(z)+0.5)*f64::from(q)];
+                initial.insert(anchor,LayerObservation{members:vec![anchor],normal:[0.,0.,1.],plane_origin:point,
+                    samples:vec![LayerSample{source:Arc::new(LayerSource::Legacy),point,
+                        point_index:u32::from(anchor),source_sequence:1,source_timestamp_ns:1}]});
+            }}
+            let rows:Vec<_>=initial.values().collect();
+            let candidates:Vec<_>=(0..1024).map(|i| {
+                let mut value=(*rows[(i*127)%rows.len()]).clone();
+                value.samples[0].source_sequence=2;value.samples[0].source_timestamp_ns=2;value
+            }).collect();
+            let mut expected=initial.clone();
+            for candidate in candidates.iter().cloned() {
+                associate_full_block_reference(&mut expected,candidate,threshold,[0;3],q);
+            }
+            for pair in 0..7 {for fast in if pair%2==0 {[false,true]} else {[true,false]} {
+                let mut actual=initial.clone();let fresh=candidates.clone();let start=Instant::now();
+                for candidate in fresh {
+                    if fast {associate(&mut actual,black_box(candidate),threshold,[0;3],q);}
+                    else {associate_full_block_reference(&mut actual,black_box(candidate),threshold,[0;3],q);}
+                }
+                let elapsed=start.elapsed().as_nanos();
+                assert_eq!(actual,expected,"complete exact layer/sample equality");
+                eprintln!("ASSOCIATION_NATIVE_AB columns={columns} zs={zs:?} updates=1024 pair={pair} fast={fast} ns={elapsed}");
+            }}
+        }}
     }
 
 }

@@ -217,6 +217,18 @@ Scan 预算与 partial 首点/最小进度纳入真实资格；共享 PctPlanner
 
 可复用入口为 `scripts/diagnostics/qualify_mapping_sidecar.py`，说明见 `mapping-sidecar-production-qualification.md`。大oracle、构建产物及原始响应保留在外部工作目录，不入Git。本资格不包含生产父supervisor/commit-owner/watchdog、LCM网络、ARM或真实机器人，也不推导端侧性能。
 
+## 第十一阶段：旋转采样不再构造未使用的接触几何
+
+旋转地形采样只读取原四帧插值、归一化端点和中间姿态，旧实现却同时构造完整机身顶点、面、边及各自扫掠范围。现提取私有 MotionInterpolation，采样只构造所需数据；完整 RotationEvents 在实际接触检查处仍复用同样插值并构造原几何。没有新增缓存、锁、哈希、采样容差或运动许可，也未删除地形、机体及边界检查。
+
+- tests-only 先验证原实现：4 项数学/真实接触/异常分类对照通过，结构断言实际 1 对预期 0 失败；候选同一 5 项全部通过，支撑网格不再构造未消费的完整几何
+- 486 组完整采样时刻逐位对照；完整接触预计算字段和接触区间与冻结原构造器一致。实际接触路径仍构造完整几何，纯平移原路径不变
+- 真实 pose/project/motion、近期障碍、凹边界及 first witness 的 240 条完整旧新 trace 逐字节一致；原 clear/interior-obstacle/boundary sanity 保持
+- 默认无 Scan/profile 的同配置增量 check/no-run 通过；MLS 369 通过/20 ignored，Scan 71/1 ignored，runtime 287/67 ignored且仅原5 UDS过滤，Surface adapter 60/5 ignored全部通过。默认与此前profile配置的测试数量不同，不混为新增跳过
+- 验证后只删除新测试文件末尾一个多余空行，未改变任何语句。结构构造减少不代表全导航耗时比例；未做受控整链或端侧性能比较
+
+原晚到路径进展失败、真实网络/ARM限制仍保留。新的5cm诊断另外发现旧Wall测试把无边界未知域当成禁止域；该测试契约正在独立纠正，不混入本性能补丁，也不追溯改判旧失败。
+
 ## 后续持续检查
 
 1. 墙前晚到路径的实际恢复与初始 full/partial/PCT 顺序，保留及时移动和真实避障

@@ -59,8 +59,16 @@ struct RotationEvents {
     from: ([f64;3],[f64;4]),
     to: ([f64;3],[f64;4]),
 }
-impl RotationEvents {
-    fn new(model:&SurfaceBodyEnvelope,from:([f64;3],[f64;4]),to:([f64;3],[f64;4]))->Self {
+// This query-local interpolation is also sufficient for support-grid events.
+// Body feature bounds belong only to the full occupied-volume contact pass.
+struct MotionInterpolation {
+    samples: [([[f64;3];3],f64,[f64;3]);4],
+    from: ([f64;3],[f64;4]),
+    to: ([f64;3],[f64;4]),
+    middle:[[f64;3];3],
+}
+impl MotionInterpolation {
+    fn new(from:([f64;3],[f64;4]),to:([f64;3],[f64;4]))->Self {
         let norm=|q:[f64;4]| {let n=q.iter().map(|v|v*v).sum::<f64>().sqrt();q.map(|v|v/n)};
         let qa=norm(from.1);let mut qb=norm(to.1);
         if qa.iter().zip(qb).map(|(a,b)|a*b).sum::<f64>()<0.0 {qb=qb.map(|v|-v);}
@@ -71,11 +79,22 @@ impl RotationEvents {
             let r=rotation(q).expect("已验证四元数插值").map(|a|a.map(|v|v*n));
             (r,n,std::array::from_fn(|j|from.0[j]*(1.0-t)+to.0[j]*t))
         });
+        let middle=rotation(std::array::from_fn(|i|qa[i]+qb[i])).expect("已验证最短插值");
+        Self {samples,from:(from.0,qa),to:(to.0,qb),middle}
+    }
+}
+impl RotationEvents {
+    fn new(model:&SurfaceBodyEnvelope,from:([f64;3],[f64;4]),to:([f64;3],[f64;4]))->Self {
+        let interpolation=MotionInterpolation::new(from,to);
+        let qa=interpolation.from.1;let qb=interpolation.to.1;
+        let samples=interpolation.samples;
         // 以中间姿态覆盖整段旋转。单位四元数弦长等于2*sin(转角/4)，
         // 乘特征半径即可界定其相对中间姿态的最大位移，微小真实转角也保留。
-        let middle=rotation(std::array::from_fn(|i|qa[i]+qb[i])).expect("已验证最短插值");
+        let middle=interpolation.middle;
         let angular_bound=qa.iter().zip(qb).map(|(a,b)|(a-b).powi(2)).sum::<f64>().sqrt();
         let displacement:[f64;3]=std::array::from_fn(|i|to.0[i]-from.0[i]);
+        #[cfg(test)]
+        interpolation_reuse_tests::record_event_geometry_build();
         let sweep_bounds=|vertices:&[[f64;3]]| {
             let padding=vertices.iter().map(|v|dot(*v,*v).sqrt()).fold(0.0,f64::max)*angular_bound;
             let mut min=[f64::INFINITY;3];let mut max=[f64::NEG_INFINITY;3];
@@ -323,7 +342,7 @@ impl SurfaceSnapshot {
             let b=self.support_position_from_body(to.0,to.1,model.body_to_support_z_m)?;
             return reference_grid_fractions(a,b,size);
         }
-        let events=RotationEvents::new(model,from,to);
+        let events=MotionInterpolation::new(from,to);
         let point=[0.0,0.0,-model.body_to_support_z_m];
         let middle=rotation(std::array::from_fn(|i|events.from.1[i]+events.to.1[i]))?;
         let centre=world(middle,from.0,point);
@@ -631,3 +650,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "body_interpolation_reuse_tests.rs"]
+mod interpolation_reuse_tests;

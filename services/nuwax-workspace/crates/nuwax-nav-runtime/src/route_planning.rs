@@ -160,10 +160,14 @@ pub(crate) struct PlanResult {
 }
 struct FailedLocalPlan {
     coverage_context: [u64;2],
+    scan_context: ([u64;2], [usize;2]),
+    prefix_context: Option<(Option<[u64;3]>, u64)>,
+    costs: Arc<Vec<nuwax_nav_pct::RoutePenalty>>,
     source: Arc<SurfaceSnapshot>,
     tomogram: Arc<nuwax_nav_pct::Tomogram>,
     boundary: Arc<Vec<[f64; 2]>>,
     start: BodyPose,
+    // Input to this branch, before PCT/recent guidance. Only one reference copy.
     reference: Vec<[f64; 3]>,
     final_yaw: Option<f64>,
     arrival: Option<([f64; 3], f64)>,
@@ -186,6 +190,16 @@ pub(crate) fn exact_points<const N: usize>(a: &[[f64; N]], b: &[[f64; N]]) -> bo
 }
 pub(crate) fn pose_bits(p: BodyPose) -> ([u64; 3], [u64; 4]) {
     (p.0.map(f64::to_bits), p.1.map(f64::to_bits))
+}
+// These are exact values, not hashes. refresh_distance_m only schedules requests.
+fn scan_context(scan: &ScanConfig) -> ([u64;2], [usize;2]) {
+    ([scan.horizon_m.to_bits(), scan.reference_corridor_m.to_bits()],
+        [scan.optimization_iterations, scan.search_expansion_limit])
+}
+fn exact_costs(a: &[nuwax_nav_pct::RoutePenalty], b: &[nuwax_nav_pct::RoutePenalty]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(a,b)|
+        a.center.map(f64::to_bits) == b.center.map(f64::to_bits)
+        && a.radius.to_bits() == b.radius.to_bits() && a.weight.to_bits() == b.weight.to_bits())
 }
 const LOCAL_MAP_REUSE_DISTANCE_M: f64 = 0.25;
 fn local_map_radius(horizon: f64, source: &SurfaceSnapshot) -> f64 {
@@ -286,7 +300,8 @@ impl PlanKernel {
             .config
             .kinematics()
             .ok_or_else(|| vec!["近场执行缺少运动能力".into()])?;
-        let costs = self.config.pct.local_costs();
+        // One existing cost snapshot, shared by the two failure slots; no second lock/read.
+        let costs = Arc::new(self.config.pct.local_costs());
         // 首次规划也读取本次近期源；静态层析缓存不包含这些障碍。
         // 范围覆盖完整绕行搜索圆及机体外包，避免只导出原直线附近的回波。
         let recent_guide = if let Some(model) = map.body_envelope() {
@@ -304,6 +319,11 @@ impl PlanKernel {
             reference,
             minimum_distance_m:self.progress_minimum_distance(r),
         });
+        // nominal_reference changes only the first point of r.reference. The rest
+        // is already compared below, so retaining a second full route is unnecessary.
+        let prefix_context = progress_policy.map(|p|
+            (p.reference.first().copied().map(|v|v.map(f64::to_bits)), p.minimum_distance_m.to_bits()));
+        let start = body(&r.pose);
         let mut failures = Vec::new();
         for detour in if r.detour {
             &[true][..]
@@ -317,6 +337,27 @@ impl PlanKernel {
                     blocked: None,
                     reason: "planning superseded".into(),
                 }]);
+            }
+            let cached = self.failed.iter().find(|f| {
+                Arc::ptr_eq(&f.tomogram, &tomogram)
+                    && f.coverage_context==[r.progress.to_bits(),r.end.to_bits()]
+                    && f.scan_context == scan_context(&r.scan)
+                    && f.prefix_context == prefix_context
+                    && exact_costs(&f.costs, &costs)
+                    && f.source.same_body_query_view(&r.source)
+                    && exact_points(&f.boundary, &r.boundary)
+                    && pose_bits(f.start) == pose_bits(start)
+                    && exact_points(&f.reference, &r.reference)
+                    && f.final_yaw.map(f64::to_bits) == r.final_yaw.map(f64::to_bits)
+                    && f.arrival.map(|(p, t)| (p.map(f64::to_bits), t.to_bits()))
+                        == r.arrival.map(|(p, t)| (p.map(f64::to_bits), t.to_bits()))
+                    && f.detour == *detour
+                    && f.straight == r.straight
+            });
+            if let Some(f) = cached {
+                #[cfg(test)] priority_probe::reused_failure(*detour, f.failure.kind);
+                failures.push(f.failure.clone());
+                continue;
             }
             let mut reference = r.reference.clone();
             if *detour && reference.len() > 1 {
@@ -353,26 +394,10 @@ impl PlanKernel {
                     }
                 }
             }
-            let start = body(&r.pose);
             let straight = r.straight && !follow_reference;
-            let cached = self.failed.iter().find(|f| {
-                Arc::ptr_eq(&f.tomogram, &tomogram)
-                    && f.coverage_context==[r.progress.to_bits(),r.end.to_bits()]
-                    && f.source.same_body_query_view(&r.source)
-                    && exact_points(&f.boundary, &r.boundary)
-                    && pose_bits(f.start) == pose_bits(start)
-                    && exact_points(&f.reference, &reference)
-                    && f.final_yaw.map(f64::to_bits) == r.final_yaw.map(f64::to_bits)
-                    && f.arrival.map(|(p, t)| (p.map(f64::to_bits), t.to_bits()))
-                        == r.arrival.map(|(p, t)| (p.map(f64::to_bits), t.to_bits()))
-                    && f.detour == follow_reference
-                    && f.straight == straight
-            });
             #[cfg(test)] let branch_at=priority_probe::branch_begin(*detour,follow_reference,straight,
-                &r.reference,&reference,cached.is_some());
-            let result = if let Some(f) = cached {
-                Err(f.failure.clone())
-            } else {
+                &r.reference,&reference,false);
+            let result = {
                 let result = nuwax_nav_scan::plan_with_progress(
                     &map,
                     &tomogram,
@@ -394,16 +419,19 @@ impl PlanKernel {
                         }
                         self.failed.push(FailedLocalPlan {
                             coverage_context:[r.progress.to_bits(),r.end.to_bits()],
+                            scan_context: scan_context(&r.scan),
+                            prefix_context,
+                            costs: Arc::clone(&costs),
                             source: r.source.clone(),
                             tomogram: tomogram.clone(),
                             boundary: r.boundary.clone(),
                             start,
-                            reference,
+                            reference: r.reference.clone(),
                             final_yaw: r.final_yaw,
                             arrival: r.arrival,
                             failure: failure.clone(),
-                            detour: follow_reference,
-                            straight,
+                            detour: *detour,
+                            straight: r.straight,
                         });
                     }
                 }
@@ -445,6 +473,7 @@ impl PlanKernel {
 mod tests {
     use super::*;
     include!("route_progress_policy_tests.rs");
+    include!("route_repeated_detour_key_tests.rs");
     use nuwax_nav_mls_planner::{SurfaceBodyEnvelope, SurfaceObservation, SurfaceObservations};
     use nuwax_nav_types_messages::{MotionKinematics, MotionModel, NavFrameId, Pose3, Timestamp};
     use std::sync::atomic::AtomicU64;
@@ -546,27 +575,20 @@ mod tests {
         ));
         kernel.failed.clear();
         for detour in [false, true] {
-            let mut reference = request.reference.clone();
-            if detour {
-                if let Ok(route) = tomogram.plan_bounded(
-                    reference[0],
-                    *reference.last().unwrap(),
-                    tomogram.resolution,
-                    &request.boundary,
-                    None,
-                    Some(request.scan.horizon_m * 1.5),
-                    &kernel.config.pct.local_costs(),
-                ) {
-                    reference = route.points;
-                }
-            }
             kernel.failed.push(FailedLocalPlan {
                 coverage_context:[request.progress.to_bits(),request.end.to_bits()],
+                scan_context: scan_context(&request.scan),
+                prefix_context: kernel.config.motion_limits.as_ref().map(|_| {
+                    let nominal=request.reference_source.as_ref().map_or_else(
+                        ||request.reference.clone(),|source|source.nominal_reference(&request.reference));
+                    (nominal.first().copied().map(|v|v.map(f64::to_bits)), kernel.progress_minimum_distance(request).to_bits())
+                }),
+                costs: Arc::new(kernel.config.pct.local_costs()),
                 source: request.source.clone(),
                 tomogram: tomogram.clone(),
                 boundary: request.boundary.clone(),
                 start: body(&request.pose),
-                reference,
+                reference: request.reference.clone(),
                 final_yaw: request.final_yaw,
                 arrival: request.arrival,
                 failure: LocalPlanError { body_witness: None,
@@ -576,7 +598,7 @@ mod tests {
                     reason: "exact cached failure".into(),
                 },
                 detour,
-                straight: request.straight && !detour,
+                straight: request.straight,
             });
         }
     }
@@ -713,15 +735,16 @@ mod tests {
                 6 => request.pose.pose.orientation.x = -0.0,
                 7 => request.final_yaw = Some(0.0),
                 8 => {
-                    // Both attempts have their own reference after the optional PCT pass.
+                    // Each failure qualifies the original input, before the optional PCT pass.
                     for cached in &mut kernel.failed {
                         cached.reference[0][0] += 0.01;
                     }
                 }
                 9 => {
-                    for cached in &mut kernel.failed {
-                        cached.detour = !cached.detour;
-                    }
+                    // Reversing both flags only permutes the two valid input keys.
+                    // A detour-only request cannot inherit the nominal-only failure.
+                    kernel.failed.retain(|cached| !cached.detour);
+                    request.detour = true;
                 }
                 10 => {
                     for cached in &mut kernel.failed {
@@ -744,6 +767,41 @@ mod tests {
                 );
             }
             assert!(kernel.failed.len() <= 2);
+        }
+    }
+    #[test]
+    fn exact_failed_attempt_cache_isolates_nominal_and_detour_inputs_both_ways() {
+        use nuwax_nav_scan::LocalPlanFailureKind;
+        for requested_detour in [false, true] {
+            let (mut kernel, mut request, cancel) = fixture();
+            request.detour = requested_detour;
+            seed_exact_failures(&mut kernel, &request);
+            priority_probe::begin();
+            let same = kernel.compute_inner(&request, &cancel);
+            let same_work = priority_probe::end();
+            let same_failures = same.err().expect("identical branches must hit their exact failures");
+            let expected_branches = if requested_detour { vec![true] } else { vec![false, true] };
+            assert_eq!(same_failures.len(), expected_branches.len());
+            assert!(same_failures.iter().all(|f|f.reason == "exact cached failure"));
+            assert_eq!(same_work.reused_failures, expected_branches.into_iter()
+                .map(|d|(d, LocalPlanFailureKind::BudgetExhausted)).collect::<Vec<_>>());
+            assert!(same_work.pct.is_empty() && same_work.branches.is_empty());
+
+            // Keep exactly one WRONG branch entry. Flipping both seeded flags
+            // would only permute the same valid {nominal, detour} input keys.
+            kernel.failed.retain(|f|f.detour != requested_detour);
+            assert_eq!(kernel.failed.len(), 1);
+            priority_probe::begin();
+            let changed = kernel.compute_inner(&request, &cancel);
+            let changed_work = priority_probe::end();
+            let candidate = changed.unwrap_or_else(|errors|
+                panic!("wrong-branch failure replaced actual clear-fixture planning: {errors:?}"));
+            assert!(!candidate.partial && !candidate.path.poses.is_empty());
+            assert!(changed_work.reused_failures.is_empty(),
+                "the opposite branch's input-qualified failure must not be reused");
+            assert_eq!(changed_work.branches.iter().map(|b|b.detour).collect::<Vec<_>>(),
+                vec![requested_detour], "the requested branch must actually enter Scan");
+            assert_eq!(changed_work.pct.len(), usize::from(requested_detour));
         }
     }
     #[test]

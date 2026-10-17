@@ -36,6 +36,8 @@ pub(crate) struct Branch {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Frame {
     pub branches: Vec<Branch>,
+    // No derived reference was recomputed for these exact input cache hits.
+    pub reused_failures: Vec<(bool, LocalPlanFailureKind)>,
     pub pct: Vec<PctWork>,
     pub searches: Vec<SearchWork>,
     pub profile_events: u64,
@@ -97,6 +99,11 @@ pub(crate) fn pct(at: Option<Instant>, stats: Option<SearchStats>) {
             }
         });
     }
+}
+pub(crate) fn reused_failure(detour: bool, kind: LocalPlanFailureKind) {
+    STATE.with(|s| {
+        if let Some(f)=s.borrow_mut().frame.as_mut() {f.reused_failures.push((detour,kind));}
+    });
 }
 pub(crate) fn branch_begin(
     detour: bool,

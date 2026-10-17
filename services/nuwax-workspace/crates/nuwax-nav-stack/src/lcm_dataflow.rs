@@ -1598,6 +1598,8 @@ where
     }
     let mut planar_admission=nuwax_codec::lcm::planar_navigation::Admission::default();
     let mut publications = GuardedStatusPublications::default();
+    #[cfg(all(test,feature="surface-recovery-qualification"))]
+    { publications.qualification_timing=scheduler.qualification_timing().cloned(); }
     let mut diagnostics = InputDiagnosticLimiter::default();
     let mut last_cancel_terminal: Option<GuardedCancelTerminal> = None;
     // This watermark rejects generation rollback but never grants replay or
@@ -1668,6 +1670,8 @@ where
                 );
             }
             GuardedNavEvent::Pose(message) => {
+                #[cfg(all(test,feature="surface-recovery-qualification"))]
+                if let Some(t)=scheduler.qualification_timing() {t.mark("bridge.pose.selected",0);}
                 let Some(input) = drain_guarded_pose_input(
                     message,
                     &mut poses,
@@ -1693,8 +1697,12 @@ where
                 } else {
                     None
                 };
+                #[cfg(all(test,feature="surface-recovery-qualification"))]
+                if let Some(t)=scheduler.qualification_timing() {t.mark("bridge.pose.drained",input.pose.stamp.nanos);}
                 let mut candidate_telemetry = telemetry.clone();
                 commit_guarded_pose_telemetry(&mut candidate_telemetry, &input);
+                #[cfg(all(test,feature="surface-recovery-qualification"))]
+                let pose_ack=scheduler.qualification_timing().map(|t|t.span("bridge.pose.scheduler_ack",input.pose.stamp.nanos));
                 let result = match source_deadline {
                     Some(deadline) => {
                         let acquired_at = deadline.checked_sub(source_max_age.expect("已配置来源期限"))
@@ -1705,6 +1713,8 @@ where
                     }
                     None => scheduler.update_odometry(input.pose).await,
                 };
+                #[cfg(all(test,feature="surface-recovery-qualification"))]
+                drop(pose_ack);
                 if let Err(error) = result {
                     match runtime_input_error::<()>("guarded_nav_scheduler.map_pose", error)? {
                         OwnerInput::Rejected(reason) => {
@@ -1810,6 +1820,8 @@ where
                     }
                     #[cfg(feature = "mls")]
                     GuardedMapFrame::Surface(update) => {
+                        #[cfg(all(test,feature="surface-recovery-qualification"))]
+                        if let Some(t)=scheduler.qualification_timing() {t.mark("bridge.map.prepared_received",update.source_timestamp_ns);}
                         let changed_domain = surface_authority
                             .as_ref()
                             .is_some_and(|previous| !previous.same_domain(&update.authority));
@@ -1889,6 +1901,8 @@ where
                 // 保留活动会话；只有显式替换目标才能抢占。
                 let mut candidate_telemetry = telemetry.clone();
                 commit_guarded_costmap_telemetry(&mut candidate_telemetry, &input);
+                #[cfg(all(test,feature="surface-recovery-qualification"))]
+                let map_ack=scheduler.qualification_timing().map(|t|t.span("bridge.map.scheduler_ack",input.observation.source_timestamp_ns));
                 if let Err(error) = scheduler
                     .update_costmap_received(
                         input.observation,
@@ -1906,6 +1920,8 @@ where
                         }
                     }
                 }
+                #[cfg(all(test,feature="surface-recovery-qualification"))]
+                drop(map_ack);
                 telemetry = candidate_telemetry;
                 let ready_goal = goal_buffer.observe_costmap();
                 if let Some(goal) = ready_goal {
@@ -2956,6 +2972,8 @@ fn update_progress(telemetry: &mut GuardedNavTelemetry) {
 #[cfg(feature = "guard-runtime")]
 #[derive(Default)]
 struct GuardedStatusPublications {
+    #[cfg(all(test,feature="surface-recovery-qualification"))]
+    qualification_timing: Option<nuwax_nav_runtime::qualification_timing::TraceSink>,
     goal: Option<(String, i32, String, i64, i64)>,
     applied_commands: u64,
     last_zero_ack_id: Option<String>,
@@ -3028,13 +3046,27 @@ async fn publish_guarded_nav_observation(
     planner_observation: Option<bool>,
     publications: &mut GuardedStatusPublications,
 ) -> NavStackResult<()> {
+    #[cfg(all(test,feature="surface-recovery-qualification"))]
+    let encode=publications.qualification_timing.as_ref().map(|t|t.span("bridge.observation.encode",status.costmap_source_timestamp_ns));
     let frames=publications.frames(node, &status, telemetry, planner_observation)?;
+    #[cfg(all(test,feature="surface-recovery-qualification"))]
+    drop(encode);
+    #[cfg(all(test,feature="surface-recovery-qualification"))]
+    if let Some(t)=publications.qualification_timing.as_ref() {t.count("bridge.observation.bytes",status.costmap_source_timestamp_ns,frames.iter().map(|f|f.payload.len() as u64).sum());}
+    #[cfg(all(test,feature="surface-recovery-qualification"))]
+    let fixture_copy=publications.qualification_timing.as_ref().map(|t|t.span("bridge.observation.fixture_receipt_copy",status.costmap_source_timestamp_ns));
     #[cfg(test)]
     let receipts=frames.iter().map(|frame|frame.payload.to_vec()).collect::<Vec<_>>();
+    #[cfg(all(test,feature="surface-recovery-qualification"))]
+    drop(fixture_copy);
+    #[cfg(all(test,feature="surface-recovery-qualification"))]
+    let publish=publications.qualification_timing.as_ref().map(|t|t.span("bridge.observation.publish_ack",status.costmap_source_timestamp_ns));
     transport
         .publish_batch(frames)
         .await
         .map_err(|error| NavStackError::Internal(format!("publish guard status batch: {error}")))?;
+    #[cfg(all(test,feature="surface-recovery-qualification"))]
+    drop(publish);
     #[cfg(test)]
     guarded_tests::record_test_publication(&receipts);
     Ok(())

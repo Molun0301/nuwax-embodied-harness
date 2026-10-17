@@ -30,6 +30,9 @@ mod arrival_confirmation;
 use arrival_confirmation::ArrivalConfirmation;
 mod command_dispatch;
 pub use command_dispatch::CommandDispatchBound;
+/// Explicit elapsed-time observer seam for bounded recovery qualifications.
+#[cfg(feature = "surface-recovery-qualification")]
+pub mod qualification_timing;
 mod planner_worker;
 pub mod surface_follower;
 pub use nuwax_nav_mls_planner::SurfaceSnapshot;
@@ -1077,6 +1080,8 @@ pub struct NavScheduler<M, P> {
     map_invalidated_at: Option<Instant>,
     operation_sequence: u64,
     status: SchedulerStatus,
+    #[cfg(feature = "surface-recovery-qualification")]
+    qualification_timing: Option<qualification_timing::TraceSink>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1121,7 +1126,55 @@ where
             map_invalidated_at: None,
             operation_sequence: 0,
             status,
+            #[cfg(feature = "surface-recovery-qualification")]
+            qualification_timing: None,
         })
+    }
+
+    /// Attach an explicit qualification-only observer; default construction is silent.
+    #[cfg(feature = "surface-recovery-qualification")]
+    pub fn with_qualification_timing(mut self, sink: qualification_timing::TraceSink) -> Self {
+        self.qualification_timing = Some(sink);
+        self
+    }
+
+    #[cfg(feature = "surface-recovery-qualification")]
+    fn qualification_span(&self, phase: &'static str, source: i64)
+        -> Option<qualification_timing::SpanGuard> {
+        self.qualification_timing.as_ref().map(|sink| sink.span(phase, source))
+    }
+
+    #[cfg(feature = "surface-recovery-qualification")]
+    fn qualification_snapshot(&self, phase: &'static str, source: i64,
+        stale: Option<bool>, stale_cause_bits: u8) {
+        let Some(sink) = self.qualification_timing.as_ref().filter(|sink| sink.enabled()) else { return; };
+        // These are copies of admitted fields. Do not call refresh_input_status,
+        // stale_input_reason, expired_now, planner methods, or any geometry here.
+        let now = Instant::now();
+        let recent = self.obstacle_source_bound.map(|bound| bound.qualification_timing_fields());
+        sink.snapshot_at(phase, source, now.into_std(), qualification_timing::SchedulerSnapshot {
+            phase: self.status.phase, lease_active: self.lease_active,
+            session_active: self.session.is_some(), planner_inputs_fresh: self.status.planner_inputs_fresh,
+            operation_sequence: self.operation_sequence,
+            path_revision: self.current_path_revision,
+            pose_source_ns: self.pose_receipt.map(|receipt| receipt.source_timestamp_ns),
+            map_source_ns: self.costmap_receipt.map(|receipt| receipt.source_timestamp_ns),
+            pose_receipt_age_ns: self.pose_receipt.map(|receipt|
+                qualification_timing::nanos(now.saturating_duration_since(receipt.received_at))),
+            map_receipt_age_ns: self.costmap_receipt.map(|receipt|
+                qualification_timing::nanos(now.saturating_duration_since(receipt.received_at))),
+            pose_deadline_remaining_ns: self.pose_valid_until.map(|deadline|
+                qualification_timing::remaining_ns(deadline.into_std(), now.into_std())),
+            recent_available: self.obstacle_source_available,
+            recent_bound_present: recent.is_some(),
+            recent_anchor_unix_ns: recent.map(|(anchor, _, _)| anchor),
+            recent_latest_issue_unix_ns: recent.map(|(_, latest, _)| latest),
+            recent_deadline_remaining_ns: recent.and_then(|(_, _, deadline)| deadline)
+                .map(|deadline| qualification_timing::remaining_ns(deadline, now.into_std())),
+            last_applied: self.status.last_applied_twist.map(|twist|
+                [twist.linear.x, twist.linear.y, twist.angular_z]),
+            stale, stale_cause_bits,
+        });
     }
 
     async fn run(
@@ -1254,7 +1307,13 @@ where
                         if !finish_wait && self.status.phase == SchedulerPhase::Controlling
                             && self.arrival_confirmation.is_none() {
                             if let Some(identity) = self.current_execution_identity.clone() {
-                                if let Some(publication) = self.planner.prepare_control_step(self.config.robot_width_m, previous.is_some()) {
+                                let publication = {
+                                    #[cfg(feature = "surface-recovery-qualification")]
+                                    let _qualification_span = self.qualification_span(
+                                        "scheduler.prepare_control_step", self.status.pose_source_timestamp_ns);
+                                    self.planner.prepare_control_step(self.config.robot_width_m, previous.is_some())
+                                };
+                                if let Some(publication) = publication {
                                     deferred_control = Some(DeferredControl {
                                         publication, deadline, identity, queued_inputs: None, finish_wait: false,
                                     });
@@ -1355,6 +1414,28 @@ where
         status_tx: &watch::Sender<SchedulerStatus>,
         command: InputCommand,
     ) {
+        #[cfg(feature = "surface-recovery-qualification")]
+        let qualification_input = self.qualification_timing.as_ref().map(|sink| {
+            let (kind, source) = match &command.kind {
+                InputKind::StartSession(_) => ("scheduler.input.start_session", 0),
+                InputKind::SubmitPath(_) => ("scheduler.input.path", 0),
+                InputKind::UpdateOdometry(pose, _, _) => ("scheduler.input.pose", pose.stamp.nanos),
+                InputKind::UpdateCostmap(map, _) => ("scheduler.input.map", map.source_timestamp_ns),
+                // Runtime owns no recent source timestamp; record its actual incoming bound.
+                InputKind::UpdateObstacleSource(_, _, _) => ("scheduler.input.recent", 0),
+                InputKind::PlanningDiagnostic(_, _, _) => ("scheduler.input.planning_diagnostic", 0),
+            };
+            sink.mark("scheduler.input.dequeue", source);
+            match &command.kind {
+                InputKind::SubmitPath(path) => sink.count("scheduler.input.path_revision", source, path.path_revision),
+                InputKind::UpdateObstacleSource(_, available, bound) => {
+                    sink.count("scheduler.input.recent_available", 0, u64::from(*available));
+                    sink.bound("scheduler.input.recent_bound", 0, *bound);
+                }
+                _ => {}
+            }
+            (sink.clone(), source, sink.span(kind, source))
+        });
         let result = match command.kind {
             InputKind::StartSession(session) => self.start_session(status_tx, session).await,
             InputKind::SubmitPath(path) => self.submit_path(status_tx, path).await,
@@ -1380,7 +1461,14 @@ where
                 Ok(())
             }
         };
+        #[cfg(feature = "surface-recovery-qualification")]
+        let qualification_ok = result.is_ok();
         let _ = command.reply.send(result);
+        #[cfg(feature = "surface-recovery-qualification")]
+        if let Some((sink, source, _span)) = qualification_input {
+            sink.mark(if qualification_ok { "scheduler.input.ack.ok" }
+                else { "scheduler.input.ack.error" }, source);
+        }
     }
 
     #[cfg(test)]
@@ -1738,7 +1826,21 @@ where
         &mut self,
         status_tx: &watch::Sender<SchedulerStatus>,
     ) -> Result<(), RuntimeError> {
+        #[cfg(feature = "surface-recovery-qualification")]
+        let _qualification_span = self.qualification_span("scheduler.control_tick", self.status.pose_source_timestamp_ns);
+        #[cfg(feature = "surface-recovery-qualification")]
+        self.qualification_snapshot("scheduler.control_tick.enter", self.status.pose_source_timestamp_ns, None, 0);
         if let Some(reason) = self.stale_input_reason(Instant::now()) {
+            #[cfg(feature = "surface-recovery-qualification")]
+            if self.qualification_timing.as_ref().is_some_and(|sink| sink.enabled()) {
+                // Classify only the existing result. Never evaluate staleness again.
+                let mut bits = 0;
+                if reason.contains("pose") { bits |= 1; }
+                if reason.contains("costmap") { bits |= 2; }
+                if reason.contains("recent") { bits |= 4; }
+                if bits == 0 { bits = 8; }
+                self.qualification_snapshot("scheduler.control_tick.stale", self.status.pose_source_timestamp_ns, Some(true), bits);
+            }
             let qualified_cause = format!("SafetyFailed cause=StaleInput: {reason}");
             self.status.message = qualified_cause.clone();
             self.publish_status(status_tx);
@@ -1752,7 +1854,13 @@ where
             self.publish_status(status_tx);
             return Ok(());
         }
-        let step = self.planner.step(self.config.robot_width_m);
+        #[cfg(feature = "surface-recovery-qualification")]
+        self.qualification_snapshot("scheduler.control_tick.fresh", self.status.pose_source_timestamp_ns, Some(false), 0);
+        let step = {
+            #[cfg(feature = "surface-recovery-qualification")]
+            let _qualification_span = self.qualification_span("scheduler.planner.step", self.status.pose_source_timestamp_ns);
+            self.planner.step(self.config.robot_width_m)
+        };
         let intent = self.wrap_local_intent(step)?;
         if !self.local_intent_is_current(&intent) {
             self.status.message = "stale local execution intent rejected".into();
@@ -1833,6 +1941,13 @@ where
         &mut self, status_tx:&watch::Sender<SchedulerStatus>, twist:Twist2,
         mut bound:Option<CommandDispatchBound>,
     )->Result<bool,RuntimeError> {
+        #[cfg(feature = "surface-recovery-qualification")]
+        let _qualification_span = self.qualification_span("scheduler.apply_controller_twist", self.status.pose_source_timestamp_ns);
+        #[cfg(feature = "surface-recovery-qualification")]
+        if let Some(sink) = &self.qualification_timing {
+            sink.motion("scheduler.apply.requested", self.status.pose_source_timestamp_ns,
+                [twist.linear.x, twist.linear.y, twist.angular_z]);
+        }
         if twist!=Twist2::ZERO {
             if let Some(source)=self.obstacle_source_bound {
                 bound=Some(bound.map_or(source,|candidate|candidate.earliest(source)));
@@ -1851,7 +1966,28 @@ where
                 applied_twist=Twist2::ZERO;bound=None;expired=true;
             }
             let operation_id=self.next_operation_id("twist")?;
-            let proof=match self.motion.submit_twist_bounded(&operation_id,applied_twist,bound).await {
+            #[cfg(feature = "surface-recovery-qualification")]
+            self.qualification_snapshot("scheduler.motion.submit.enter", self.status.pose_source_timestamp_ns, None, 0);
+            let outcome = {
+                #[cfg(feature = "surface-recovery-qualification")]
+                let _qualification_span = self.qualification_span("scheduler.motion.submit", self.status.pose_source_timestamp_ns);
+                #[cfg(feature = "surface-recovery-qualification")]
+                if let Some(sink) = &self.qualification_timing {
+                    sink.motion("scheduler.motion.submit.command", self.status.pose_source_timestamp_ns,
+                        [applied_twist.linear.x, applied_twist.linear.y, applied_twist.angular_z]);
+                    sink.bound("scheduler.motion.submit.bound", self.status.pose_source_timestamp_ns, bound);
+                }
+                self.motion.submit_twist_bounded(&operation_id,applied_twist,bound).await
+            };
+            #[cfg(feature = "surface-recovery-qualification")]
+            if let Some(sink) = &self.qualification_timing {
+                sink.mark(match &outcome {
+                    Ok(BoundedTwistOutcome::Applied(_)) => "scheduler.motion.submit.return.applied",
+                    Ok(BoundedTwistOutcome::ExpiredNotApplied) => "scheduler.motion.submit.return.expired",
+                    Err(_) => "scheduler.motion.submit.return.error",
+                }, self.status.pose_source_timestamp_ns);
+            }
+            let proof=match outcome {
                 Ok(BoundedTwistOutcome::Applied(proof))=>proof,
                 Ok(BoundedTwistOutcome::ExpiredNotApplied) if bound.is_some()=>{
                     applied_twist=Twist2::ZERO;bound=None;expired=true;continue;
@@ -1991,10 +2127,18 @@ where
 
     async fn renew(&mut self) -> Result<(), RuntimeError> {
         let operation_id = self.next_operation_id("renew")?;
-        self.motion
+        #[cfg(feature = "surface-recovery-qualification")]
+        self.qualification_snapshot("scheduler.renew.enter", self.status.pose_source_timestamp_ns, None, 0);
+        #[cfg(feature = "surface-recovery-qualification")]
+        let _qualification_span = self.qualification_span("scheduler.renew", self.status.pose_source_timestamp_ns);
+        let result = self.motion
             .renew(&operation_id)
             .await
-            .map_err(|error| RuntimeError::Motion(error.message))
+            .map_err(|error| RuntimeError::Motion(error.message));
+        #[cfg(feature = "surface-recovery-qualification")]
+        self.qualification_snapshot(if result.is_ok() { "scheduler.renew.ok" }
+            else { "scheduler.renew.error" }, self.status.pose_source_timestamp_ns, None, 0);
+        result
     }
 
     async fn fail_closed(
@@ -2044,12 +2188,20 @@ where
         terminal: TerminalOutcome,
         phase_after: SchedulerPhase,
     ) -> Result<(), RuntimeError> {
+        #[cfg(feature = "surface-recovery-qualification")]
+        let _qualification_span = self.qualification_span("scheduler.finish_terminal", self.status.pose_source_timestamp_ns);
+        #[cfg(feature = "surface-recovery-qualification")]
+        self.qualification_snapshot("scheduler.finish_terminal.enter", self.status.pose_source_timestamp_ns, None, 0);
         // 上层可能只消费首次终态；先保留真实原因，不能等围栏完成后再补发。
         let failure_reason = matches!(terminal, TerminalOutcome::PlannerFailed | TerminalOutcome::SafetyFailed)
             .then(|| self.status.message.clone());
         let arrived_identity = self.current_execution_identity.take();
         self.local_intent_sequence = 0;
-        self.planner.stop();
+        {
+            #[cfg(feature = "surface-recovery-qualification")]
+            let _qualification_span = self.qualification_span("scheduler.finish_terminal.planner_stop", self.status.pose_source_timestamp_ns);
+            self.planner.stop();
+        }
         let had_lease = self.lease_active;
         if terminal == TerminalOutcome::Succeeded && had_lease {
             self.path_wait_started_at.get_or_insert_with(Instant::now);
@@ -2062,7 +2214,17 @@ where
                 self.publish_status(status_tx);
             }
             let operation_id = self.next_operation_id("fence")?;
-            let proof = match self.motion.priority_revoke_and_zero(&operation_id).await {
+            #[cfg(feature = "surface-recovery-qualification")]
+            self.qualification_snapshot("scheduler.fence.enter", self.status.pose_source_timestamp_ns, None, 0);
+            let outcome = {
+                #[cfg(feature = "surface-recovery-qualification")]
+                let _qualification_span = self.qualification_span("scheduler.priority_revoke_and_zero", self.status.pose_source_timestamp_ns);
+                self.motion.priority_revoke_and_zero(&operation_id).await
+            };
+            #[cfg(feature = "surface-recovery-qualification")]
+            self.qualification_snapshot(if outcome.is_ok() { "scheduler.fence.return.ok" }
+                else { "scheduler.fence.return.error" }, self.status.pose_source_timestamp_ns, None, 0);
+            let proof = match outcome {
                 Ok(proof) => proof,
                 Err(error) => {
                     self.fail_status(status_tx, &error.message);
@@ -2098,7 +2260,11 @@ where
             return Ok(());
         }
 
-        self.planner.stop();
+        {
+            #[cfg(feature = "surface-recovery-qualification")]
+            let _qualification_span = self.qualification_span("scheduler.finish_terminal.planner_stop", self.status.pose_source_timestamp_ns);
+            self.planner.stop();
+        }
         self.session = None;
         self.current_path_revision = 0;
 
@@ -2178,9 +2344,17 @@ pub struct NavSchedulerHandle {
     input_tx: mpsc::Sender<InputCommand>,
     urgent_tx: mpsc::Sender<UrgentCommand>,
     status_rx: watch::Receiver<SchedulerStatus>,
+    #[cfg(feature = "surface-recovery-qualification")]
+    qualification_timing: Option<qualification_timing::TraceSink>,
 }
 
 impl NavSchedulerHandle {
+    /// Observer explicitly attached before spawn; None is the silent default.
+    #[cfg(feature = "surface-recovery-qualification")]
+    pub fn qualification_timing(&self) -> Option<&qualification_timing::TraceSink> {
+        self.qualification_timing.as_ref()
+    }
+
     /// Acquire a lease for a new session.
     pub async fn start_session(&self, session: NavSession) -> Result<(), RuntimeError> {
         self.send_input(InputKind::StartSession(session)).await
@@ -2310,12 +2484,42 @@ impl NavSchedulerHandle {
     }
 
     async fn send_input(&self, kind: InputKind) -> Result<(), RuntimeError> {
+        #[cfg(feature = "surface-recovery-qualification")]
+        let qualification_input = self.qualification_timing.as_ref().map(|sink| {
+            let (phase, source) = match &kind {
+                InputKind::StartSession(_) => ("scheduler.send.start_session", 0),
+                InputKind::SubmitPath(_) => ("scheduler.send.path", 0),
+                InputKind::UpdateOdometry(pose, _, _) => ("scheduler.send.pose", pose.stamp.nanos),
+                InputKind::UpdateCostmap(map, _) => ("scheduler.send.map", map.source_timestamp_ns),
+                InputKind::UpdateObstacleSource(_, _, _) => ("scheduler.send.recent", 0),
+                InputKind::PlanningDiagnostic(_, _, _) => ("scheduler.send.planning_diagnostic", 0),
+            };
+            if let InputKind::UpdateObstacleSource(_, _, bound) = &kind {
+                sink.bound("scheduler.input.send.recent_bound", 0, *bound);
+            }
+            sink.mark("scheduler.input.send.begin", source);
+            (sink.clone(), source, sink.span(phase, source))
+        });
         let (reply, result) = oneshot::channel();
         self.input_tx
             .send(InputCommand { kind, reply })
             .await
             .map_err(|_| RuntimeError::SchedulerStopped)?;
-        result.await.map_err(|_| RuntimeError::SchedulerStopped)?
+        #[cfg(feature = "surface-recovery-qualification")]
+        if let Some((sink, source, _span)) = &qualification_input {
+            // Successful send means queued; the actor may already have dequeued it.
+            sink.mark("scheduler.input.send.accepted", *source);
+        }
+        let reply = result.await.map_err(|_| RuntimeError::SchedulerStopped);
+        #[cfg(feature = "surface-recovery-qualification")]
+        if let Some((sink, source, _span)) = &qualification_input {
+            sink.mark(match &reply {
+                Ok(Ok(())) => "scheduler.input.reply.ok",
+                Ok(Err(_)) => "scheduler.input.reply.error",
+                Err(_) => "scheduler.input.reply.closed",
+            }, *source);
+        }
+        reply?
     }
 }
 
@@ -2328,6 +2532,8 @@ where
     M: NavMotionPort,
     P: NavPlanner,
 {
+    #[cfg(feature = "surface-recovery-qualification")]
+    let qualification_timing = scheduler.qualification_timing.clone();
     let (input_tx, input_rx) = mpsc::channel(INPUT_CAPACITY);
     let (urgent_tx, urgent_rx) = mpsc::channel(URGENT_CAPACITY);
     let (status_tx, status_rx) = watch::channel(scheduler.status.clone());
@@ -2335,6 +2541,8 @@ where
         input_tx,
         urgent_tx,
         status_rx,
+        #[cfg(feature = "surface-recovery-qualification")]
+        qualification_timing,
     };
     let task = tokio::spawn(scheduler.run(input_rx, urgent_rx, status_tx));
     (handle, task)

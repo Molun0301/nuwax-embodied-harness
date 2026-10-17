@@ -31,7 +31,15 @@ impl RecentSourceState {
     }
     pub(crate) async fn consume(&mut self,body:&[u8],authority:Option<&GuardedMapAuthority>,
         scheduler:&nuwax_nav_runtime::NavSchedulerHandle)->Result<(),String> {
+        #[cfg(all(test,feature="surface-recovery-qualification"))]
+        let decode=scheduler.qualification_timing().map(|t|t.span("recent.codec_decode",0));
         let packet=nuwax_codec::lcm::recent_cloud::decode_body(body).map_err(|error|error.to_string())?;
+        #[cfg(all(test,feature="surface-recovery-qualification"))]
+        drop(decode);
+        #[cfg(all(test,feature="surface-recovery-qualification"))]
+        if let (Some(t),Some(cloud))=(scheduler.qualification_timing(),packet.cloud.as_ref()) {
+            t.mark("recent.codec_decoded",cloud.source_timestamp_ns);
+        }
         let authority=authority.ok_or("recent cloud has no admitted terrain domain")?;
         if packet.producer_runtime_generation!=authority.producer_runtime_generation
             || packet.session_id!=authority.committed_map.session_id
@@ -68,11 +76,23 @@ impl RecentSourceState {
                 .map_err(|error|error.to_string())?;
             Some(CommandDispatchBound::from_source_timestamp(source_time,age))
         } else {None};
+        #[cfg(all(test,feature="surface-recovery-qualification"))]
+        if let Some(t)=scheduler.qualification_timing() {t.count("recent.emitted_points",cloud.source_timestamp_ns,cloud.emitted_point_count as u64);t.mark("recent.source_admitted",cloud.source_timestamp_ns);}
+        #[cfg(all(test,feature="surface-recovery-qualification"))]
+        let xyz=scheduler.qualification_timing().map(|t|t.span("recent.xyz_materialize",cloud.source_timestamp_ns));
         let points=point_cloud_from_schema(cloud.cloud).map_err(|error|error.to_string())?;
+        #[cfg(all(test,feature="surface-recovery-qualification"))]
+        drop(xyz);
+        #[cfg(all(test,feature="surface-recovery-qualification"))]
+        let finite=scheduler.qualification_timing().map(|t|t.span("recent.finite_scan",cloud.source_timestamp_ns));
         if points.points.len()!=cloud.emitted_point_count as usize
             || points.points.iter().any(|p|![p.x,p.y,p.z].into_iter().all(f64::is_finite)) {
             return Err("recent cloud contains invalid admitted points".into());
         }
+        #[cfg(all(test,feature="surface-recovery-qualification"))]
+        drop(finite);
+        #[cfg(all(test,feature="surface-recovery-qualification"))]
+        let build=scheduler.qualification_timing().map(|t|t.span("recent.recent_frame_build",cloud.source_timestamp_ns));
         let retention=self.max_age.map_or(0,|age|age.as_nanos().min(u128::from(u64::MAX)) as u64);
         let cleared;
         let previous=if self.watermark.is_some_and(|(generation,_,_)|generation!=cloud.runtime_generation) {
@@ -82,9 +102,15 @@ impl RecentSourceState {
             source_time,retention,&packet.ground_point_indices,
             points.points.into_iter().enumerate().map(|(index,p)|(index as u32,[p.x,p.y,p.z])))
             .map_err(|error|error.to_string())?);
+        #[cfg(all(test,feature="surface-recovery-qualification"))]
+        drop(build);
+        #[cfg(all(test,feature="surface-recovery-qualification"))]
+        let ack=scheduler.qualification_timing().map(|t|t.span("recent.scheduler_ack",cloud.source_timestamp_ns));
         scheduler.update_obstacle_source(Some(ExecutionMap::SurfaceUpdate(SurfaceMapUpdate {
             planar_reference:self.planar_reference.clone(),snapshot:snapshot.clone(),change_basis:Some(basis.clone()),changes:Arc::new(SurfaceGeometryChanges::Empty),
         })),true,bound).await.map_err(|error|error.to_string())?;
+        #[cfg(all(test,feature="surface-recovery-qualification"))]
+        drop(ack);
         self.enabled=true;
         self.snapshot=Some(snapshot);
         self.watermark=Some((cloud.runtime_generation,cloud.source_sequence,cloud.source_timestamp_ns));

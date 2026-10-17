@@ -245,3 +245,25 @@ async fn explicit_mask_wall_preserves_active_goal() {qualify_world(World::Explic
 #[tokio::test(flavor="multi_thread",worker_threads=2)]
 #[ignore="new finite-Wall positive; true world is flat beyond observed floor; no mask"]
 async fn finite_wall_unknown_flat_continuation_arrives() {qualify_world(World::UnobservedFlatContinuation).await;}
+
+
+// Diagnostic wrappers preserve the original world, source, runtime and oracle.
+// Only fixed-size scalar observation is added, and only after explicit activation.
+async fn trace_world_input_timing(world:World) {
+    let trace=nuwax_nav_runtime::qualification_timing::TraceSession::start(65536);
+    let mut harness=OccupancyHarness::start_with_world_timing(true,Scene::Wall,None,None,world,Some(trace.sink())).await;
+    let result=harness.exercise().await;let status=harness.scheduler.status();
+    let cleanup=harness.shutdown().await;harness.plant.lock().unwrap().sample();
+    let audit=harness.audit_after_cleanup();harness.dump_evidence();
+    let mut report=trace.finish();
+    if cleanup.is_err() {report.incomplete=true;}
+    eprintln!("ACTOR_TIMING world={world:?} report={report:?}");
+    eprintln!("WORLD_FINAL world={world:?} result={result:?} status={status:?} cleanup={cleanup:?} audit={audit:?}");
+    assert!(result.is_ok()&&cleanup.is_ok()&&audit.is_ok(),"world={world:?}; result={result:?}; cleanup={cleanup:?}; audit={audit:?}");
+}
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+#[ignore="one opt-in bounded real-actor trace; same explicit-mask Wall assertions"]
+async fn trace_explicit_mask_wall_input_timing() {trace_world_input_timing(World::ExplicitVirtualMaskDomain).await;}
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+#[ignore="one opt-in bounded real-actor trace; same unmasked flat-continuation assertions"]
+async fn trace_finite_wall_flat_input_timing() {trace_world_input_timing(World::UnobservedFlatContinuation).await;}

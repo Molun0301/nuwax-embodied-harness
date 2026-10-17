@@ -81,3 +81,13 @@ cargo test --locked --release -p nuwax-nav-stack --lib --features surface-recove
 新精确入口使用 `local-guidance-qualification`：
 `lcm_dataflow::surface_dataflow::tests::dynamic_occupancy_qualification::static_source_only::fixed_recent_box_first_partial_branch`。
 原始CAPTURE、ATTRIBUTION、STATUS及失败终态分别保留在工作目录阶段日志，不将重型日志写入Git。
+
+## 实际 actor 时间观察（单次，未复现旧失败）
+
+显式 recovery 诊断会话记录定容标量：fixture 点云生成/审计，输入桥decode/build与scheduler ACK，状态输出ACK，以及scheduler实际renew内部快照、控制和fence。默认无会话不记录；不增加工作线程、await、source gate或新鲜度计算。try_lock记录不等待；容量或竞争丢失明确报告。期限、数据、原时序与碰撞oracle不变。
+
+旧 `surface-recovery-qualification` 的 runtime/stack 增量check/no-run及6项记录器控制通过；实际features无local-guidance/Scanprofile。唯一 `wall_world::trace_finite_wall_flat_input_timing` 运行26.86秒，原result/cleanup/连续几何oracle全Ok，Succeeded并完成原零速fence。此前无插桩失败仍保留，本次没有复现该失败，不能作为修复或加速证据。
+
+记录42701条，竞争丢91条，overflow/poison/open-spans均0，报告明确incomplete。22个end缺start、14个start缺end；只配对完整区间才能报告elapsed，缺失不能补猜。65536×224=14680064字节只是固定记录区逻辑容量，不是RSS。时间包括抢占/等待/插桩，不能当线程CPU。
+
+普通默认七包tests check另通过。原始 ACTOR_TIMING、完整来源和终态保留在工作目录；后续使用这些已有数据归因，不为得到理想结果重复取样。此资格不包含UDP网络、Python真实guard或机器人。

@@ -33,6 +33,8 @@ pub(super) struct PreparedSurfaceMap {
 
 #[derive(Clone)]
 struct SurfaceMapHub {
+    #[cfg(all(test,feature="surface-recovery-qualification"))]
+    qualification_timing: Option<nuwax_nav_runtime::qualification_timing::TraceSink>,
     body_reference_frame_id: Arc<str>,
     latest: Arc<Mutex<Option<PreparedSurfaceMap>>>,
     events: tokio::sync::broadcast::Sender<PreparedSurfaceMap>,
@@ -45,6 +47,8 @@ impl SurfaceMapHub {
     fn new(body_reference_frame_id: Arc<str>) -> Self {
         Self {
             body_reference_frame_id,
+            #[cfg(all(test,feature="surface-recovery-qualification"))]
+            qualification_timing: None,
             latest: Arc::new(Mutex::new(None)),
             events: tokio::sync::broadcast::channel(32).0,
             planning: tokio::sync::watch::channel(None).0,
@@ -54,6 +58,8 @@ impl SurfaceMapHub {
     }
 
     fn publish(&self, update: PreparedSurfaceMap) {
+        #[cfg(all(test,feature="surface-recovery-qualification"))]
+        let _publish=self.qualification_timing.as_ref().map(|t|t.span("map.hub.publish",update.source_timestamp_ns));
         let mut latest = self
             .latest
             .lock()
@@ -775,9 +781,17 @@ async fn run_surface_planner_with_computer(
                 let cache = Arc::clone(&cache);
                 let config = config.clone();
                 #[cfg(test)] let map_computer = hub.map_computer.clone();
+                #[cfg(all(test,feature="surface-recovery-qualification"))]
+                let timing=hub.qualification_timing.clone();
+                #[cfg(all(test,feature="surface-recovery-qualification"))]
+                let queued=timing.as_ref().map(|t|t.span("map.build.queue",message.source_timestamp_ns));
                 computations.spawn(async move {
                     let retry_message = Arc::clone(&message);
                     let computed = tokio::task::spawn_blocking(move || {
+                        #[cfg(all(test,feature="surface-recovery-qualification"))]
+                        drop(queued);
+                        #[cfg(all(test,feature="surface-recovery-qualification"))]
+                        let _build=timing.as_ref().map(|t|t.span("map.build.compute_and_cache_lock",message.source_timestamp_ns));
                         let mut cache = cache.lock().map_err(|_| "表面计算缓存锁失效".to_string())?;
                         #[cfg(test)] if let Some(computer) = map_computer {
                             return Ok(computer(message, received_at, &config, &mut cache));
@@ -932,10 +946,16 @@ async fn run_surface_planner_with_computer(
             frame = maps.next() => {
                 let frame = required_frame(frame, "surface planner map")?;
                 let received_at = Instant::now();
+                #[cfg(all(test,feature="surface-recovery-qualification"))]
+                let decode=hub.qualification_timing.as_ref().map(|t|t.span("map.ingress.decode",0));
                 let message = match schema::decode_navigation_map_3d_body(&frame.payload) {
                     Ok(message) => Arc::new(message),
                     Err(error) => { diagnostics.reject("surface map", &error.to_string()); continue; }
                 };
+                #[cfg(all(test,feature="surface-recovery-qualification"))]
+                drop(decode);
+                #[cfg(all(test,feature="surface-recovery-qualification"))]
+                if let Some(t)=hub.qualification_timing.as_ref() {t.mark("map.ingress.decoded",message.source_timestamp_ns);}
                 // Move the transport allocation into immutable ownership; neither
                 // retaining a baseline nor accepting a new revision scans its bytes.
                 let payload = Arc::new(frame.payload);

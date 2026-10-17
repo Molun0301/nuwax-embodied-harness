@@ -60,6 +60,11 @@ impl CommandDispatchBound {
     }
     /// Whether either original clock qualification has expired or become invalid.
     pub fn expired_now(self)->bool {self.expired_at(Instant::now(),unix_ns())}
+    /// Read-only scalar provenance for an explicitly enabled qualification observer.
+    #[cfg(feature = "surface-recovery-qualification")]
+    pub(crate) fn qualification_timing_fields(self) -> (u64, u64, Option<Instant>) {
+        (self.anchor_unix_ns, self.latest_issue_unix_ns, self.monotonic_deadline)
+    }
     /// Original absolute issue deadline; None denotes an invalid bound, never an unrestricted one.
     pub fn monotonic_deadline(self)->Option<Instant> {self.monotonic_deadline}
 }

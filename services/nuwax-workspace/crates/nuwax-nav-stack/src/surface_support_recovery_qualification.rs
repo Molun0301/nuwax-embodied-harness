@@ -699,6 +699,14 @@ pub(super) async fn publish_sampled_recent(
     transport: &LcmTransport, map: &schema::NavigationMap3D, sequence: i32, stamp: i64, pose_stamp: i64,
     returns: impl IntoIterator<Item=([i32;3],bool)>,
 ) {
+    publish_sampled_recent_with_timing(transport,map,sequence,stamp,pose_stamp,returns,None).await;
+}
+pub(super) async fn publish_sampled_recent_with_timing(
+    transport: &LcmTransport, map: &schema::NavigationMap3D, sequence: i32, stamp: i64, pose_stamp: i64,
+    returns: impl IntoIterator<Item=([i32;3],bool)>,
+    timing: Option<&nuwax_nav_runtime::qualification_timing::TraceSink>,
+) {
+    let encode=timing.map(|t|t.span("producer.recent.assemble_encode",stamp));
     use nuwax_codec::lcm::{lio,recent_cloud};
     let mut data=Vec::new(); let mut ground_point_indices=Vec::new(); let mut count=0;
     for (index,(key,ground)) in returns.into_iter().enumerate() {
@@ -729,8 +737,12 @@ pub(super) async fn publish_sampled_recent(
             source_point_count:i64::from(count),emitted_point_count:i64::from(count),cloud,
         }),
     };
+    let bytes=recent_cloud::encode_body(&packet).unwrap();
+    drop(encode);
+    if let Some(t)=timing {t.count("producer.recent.bytes",stamp,bytes.len() as u64);}
+    let _publish=timing.map(|t|t.span("producer.recent.publish_ack",stamp));
     publish_body(transport,recent_cloud::DEFAULT_TOPIC,recent_cloud::TYPE_NAME,
-        recent_cloud::encode_body(&packet).unwrap()).await.unwrap();
+        bytes).await.unwrap();
 }
 
 #[tokio::test(flavor="multi_thread",worker_threads=2)]

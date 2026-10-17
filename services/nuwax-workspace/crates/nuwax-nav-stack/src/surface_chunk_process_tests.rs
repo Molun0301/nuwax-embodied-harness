@@ -67,21 +67,29 @@ impl RpcHandler for BlockServer {
         }) else {
             return RpcResponse::error(request.id, serde_json::json!({"message":"根与精确块引用不符"}));
         };
+        let offset=scope["offset"].as_u64().unwrap() as usize;
+        let maximum=scope["max_bytes"].as_u64().unwrap() as usize;
+        assert!(maximum>0 && maximum<=MAX_BLOCK_TRANSFER_PART_BYTES);
+        if mode=="missing-tail" && offset>0 {
+            return RpcResponse::error(request.id,serde_json::json!({"message":"后续段已不可用"}));
+        }
+        if mode=="tail-delay" && offset>0 {
+            std::fs::write(self.root.join("mode"),"good").unwrap();
+            tokio::time::sleep(Duration::from_millis(650)).await;
+        }
         let bytes = Repository::open(&self.root).and_then(|repository|
-            repository.read_object(reference.object, MAX_BLOCK_BYTES));
-        let Ok(mut bytes) = bytes else {
+            repository.read_object_range(reference.object, MAX_BLOCK_BYTES, offset, maximum));
+        let Ok(ObjectRangeRead::Data { mut bytes, total_bytes }) = bytes else {
             return RpcResponse::error(request.id, serde_json::json!({"message":"没有此块"}));
         };
         if mode=="corrupt" {bytes[0]^=1;}
-        let offset=scope["offset"].as_u64().unwrap() as usize;
-        let maximum=scope["max_bytes"].as_u64().unwrap() as usize;
-        assert!(offset<bytes.len() && maximum>0 && maximum<=MAX_BLOCK_TRANSFER_PART_BYTES);
-        let end=bytes.len().min(offset+maximum);
+        if mode=="corrupt-tail" && offset>0 {bytes[0]^=1;}
+        if mode=="truncated-tail" && offset>0 {bytes.pop();}
         let mut response = scope.clone();
-        response["total_bytes"] = serde_json::json!(bytes.len());
+        response["total_bytes"] = serde_json::json!(total_bytes);
         response["data_base64"] = serde_json::json!(base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD, &bytes[offset..end]));
-        if mode=="changed-total" && offset>0 {response["total_bytes"]=serde_json::json!(bytes.len()+1);}
+            &base64::engine::general_purpose::STANDARD, &bytes));
+        if mode=="changed-total" && offset>0 {response["total_bytes"]=serde_json::json!(total_bytes+1);}
         if mode=="repeated-part" && offset>0 {response["offset"]=serde_json::json!(0);}
         if mode=="wrong-root" {response["root"]["revision"] = serde_json::json!(revision + 1);}
         if mode=="wrong-block" {response["block"]["geometry_revision"] = serde_json::json!(revision + 1);}
@@ -111,11 +119,14 @@ struct ChildOwner(Child);
 impl Drop for ChildOwner {fn drop(&mut self){if self.0.try_wait().ok().flatten().is_none(){let _=self.0.kill();}let _=self.0.wait();}}
 
 fn message(repository:&Repository,revision:u64,variant:u16)->schema::NavigationMap3D {
+    message_with_points(repository, revision, variant, 12000)
+}
+fn message_with_points(repository:&Repository,revision:u64,variant:u16,point_count:u16)->schema::NavigationMap3D {
     let stamp=1_700_000_000_000_000_000+revision;
     let domain=Domain{session:"remote-fine".into(),generation:1,frame_generation:1,producer_generation:17};
     let mut references=Vec::new();
     for x in 0..3 {
-        let block=Block::from_iter((0..12000).map(|id|(id,Evidence{observed_ns:stamp,hits:variant})));
+        let block=Block::from_iter((0..point_count).map(|id|(id,Evidence{observed_ns:stamp,hits:variant})));
         let bytes=encode_block(&block).unwrap();
         let object = ObjectIdentity::Assigned(ObjectId::random().unwrap());
         repository.put_object(object,&bytes).unwrap();
@@ -182,6 +193,67 @@ async fn real_process_rpc_recovers_late_missing_and_corrupt_blocks_without_parti
     std::fs::write(root.join("stop"),"stop").unwrap();
     let deadline=Instant::now()+Duration::from_secs(3);
     loop {if let Some(status)=child.0.try_wait().unwrap(){assert!(status.success());break;}assert!(Instant::now()<deadline,"补取服务未结束");tokio::time::sleep(Duration::from_millis(10)).await;}
+}
+
+#[tokio::test(flavor="multi_thread", worker_threads=2)]
+async fn multipart_rpc_preserves_complete_installation_and_original_deadlines() {
+    let repository = Repository::temporary().unwrap();
+    let root = repository.path();
+    let (url, rpc_name) = test_endpoint();
+    std::fs::write(root.join("mode"), "good").unwrap();
+    let mut child = ChildOwner(Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "surface_chunks::rpc_process_tests::map_block_server_process", "--ignored", "--nocapture"])
+        .env("NUWAX_BLOCK_TEST_ROOT", root).env("NUWAX_BLOCK_TEST_URL", &url)
+        .env("NUWAX_BLOCK_TEST_RPC_NAME", &rpc_name)
+        .stdout(Stdio::null()).stderr(Stdio::inherit()).spawn().unwrap());
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !root.join("ready").exists() {
+        assert!(Instant::now() < deadline && child.0.try_wait().unwrap().is_none());
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mut reader = FineMapReader::new(url.clone()).unwrap();
+    reader.client = Some(nuwax_rpc::RpcClient::new(Arc::new(
+        nuwax_rpc::LcmRpcTransport::from_provider(&url).unwrap()), &rpc_name).unwrap());
+    let first = message_with_points(&repository, 1, 1, 32768);
+    let manifest = Manifest::decode(&first.fine.as_ref().unwrap().root).unwrap();
+    let block = &manifest.blocks[0];
+    let expected = repository.read_object(block.object, MAX_BLOCK_BYTES).unwrap();
+    assert_eq!(expected.len(), 393_232);
+    assert!(expected.len() > MAX_BLOCK_TRANSFER_PART_BYTES
+        && expected.len() < MAX_BLOCK_TRANSFER_PART_BYTES * 2);
+    let started = Instant::now();
+    let (mut reader, result) = receive(reader, first).await;
+    let installed = result.unwrap();
+    eprintln!("multipart bytes_per_block={} blocks={} elapsed_ms={:.3}",
+        expected.len(), installed.blocks.len(), started.elapsed().as_secs_f64() * 1000.0);
+    assert_eq!(reader.receiver.block(block).unwrap().len(), 32768);
+    assert_eq!(encode_block(&reader.receiver.block(block).unwrap()).unwrap(), expected);
+    let calls = std::fs::read_to_string(root.join("calls")).unwrap().parse::<usize>().unwrap();
+    assert!(calls >= manifest.blocks.len() * 2, "every block must cross two real RPC parts");
+
+    for (index, mode) in ["changed-total", "repeated-part", "truncated-tail", "corrupt-tail", "missing-tail"]
+        .into_iter().enumerate() {
+        std::fs::write(root.join("mode"), mode).unwrap();
+        let candidate = message_with_points(&repository, index as u64 + 2, 2, 32768);
+        let (next, result) = receive(reader, candidate).await;
+        reader = next;
+        assert!(matches!(result, Err(SurfaceMapBuildError::Invalid(_))), "mode={mode}: {result:?}");
+        assert_eq!(reader.receiver.current().unwrap(), installed,
+            "an invalid or missing later part must not install a partial root");
+    }
+    std::fs::write(root.join("mode"), "tail-delay").unwrap();
+    let next = message_with_points(&repository, 8, 3, 32768);
+    let (reader, result) = receive(reader, next).await;
+    assert_eq!(result.unwrap().revision, 8, "a later part retries within the original shared deadline");
+    assert_eq!(reader.receiver.current().unwrap().revision, 8);
+    drop(reader);
+    std::fs::write(root.join("stop"), "stop").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Some(status) = child.0.try_wait().unwrap() { assert!(status.success()); break; }
+        assert!(Instant::now() < deadline, "multipart server did not stop");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 #[tokio::test(flavor="multi_thread",worker_threads=2)]

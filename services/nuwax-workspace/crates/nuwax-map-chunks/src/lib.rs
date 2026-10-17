@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 mod repository;
-pub use repository::{Repository, RegionReader};
+pub use repository::{ObjectRangeRead, Repository, RegionReader};
 mod writer;
 pub use writer::Writer;
 /// Observation moments reused by the capture owner and bounded layer records.

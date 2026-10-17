@@ -7,37 +7,42 @@ use std::{
     cmp::Ordering,
     collections::{BinaryHeap, HashMap},
 };
-// Tests can reduce the limit but execute the identical production exhaustion branch.
+// 普通测试沿用调用者预算；显式诊断可临时覆盖，以保留预算扫描实验。
 #[cfg(test)]
-thread_local! { static EXPANSION_LIMIT: std::cell::Cell<usize> = const { std::cell::Cell::new(256) }; }
+thread_local! { static EXPANSION_LIMIT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) }; }
 #[cfg(test)]
 pub(super) fn with_expansion_limit<T>(limit: usize, f: impl FnOnce() -> T) -> T {
-    struct Reset(usize);
+    struct Reset(Option<usize>);
     impl Drop for Reset { fn drop(&mut self) { EXPANSION_LIMIT.set(self.0); } }
-    let _reset = Reset(EXPANSION_LIMIT.replace(limit));
+    let _reset = Reset(EXPANSION_LIMIT.replace(Some(limit)));
     f()
 }
-// Production uses the caller's configured bound; tests may substitute a smaller
-// one so the identical exhaustion branch stays reachable without huge fixtures.
-#[cfg(not(test))]
-fn effective_expansion_limit(configured: usize) -> usize { configured }
-#[cfg(test)]
-fn effective_expansion_limit(_configured: usize) -> usize { EXPANSION_LIMIT.get() }
+fn effective_expansion_limit(configured: usize) -> usize {
+    #[cfg(test)]
+    if let Some(limit) = EXPANSION_LIMIT.get() { return limit; }
+    configured
+}
 
+const PRODUCTION_HEURISTIC_WEIGHT: f64 = 4.0;
 // 队列排序对照实验。只影响排队优先级，不改变真实碰撞、支撑与运动许可。
 #[cfg(test)]
-#[derive(Clone, Copy, Default, PartialEq)]
+#[derive(Clone, Copy, PartialEq)]
 pub(super) enum HeuristicMode {
-    /// 乘积形式下界：max(行程时间, 转向时间)。
-    #[default]
+    /// 历史诊断名称：取行程与转向估计的最大值；参考引导未保证可采纳性。
     AdmissibleMax,
-    /// 原始加权和，用于保持既有诊断可复现。
+    /// 加权和；默认权重与生产共享，其他权重只用于显式诊断。
     ScaledSum(f64),
-    /// 不加权的和，仍是下界但偏保守。
+    /// 历史诊断名称：不加权的和，平移和转向可并发时不保证是下界。
     AdmissibleSum,
 }
 #[cfg(test)]
-thread_local! { static HEURISTIC_MODE: std::cell::Cell<HeuristicMode> = const { std::cell::Cell::new(HeuristicMode::AdmissibleMax) }; }
+impl Default for HeuristicMode {
+    fn default() -> Self { Self::ScaledSum(PRODUCTION_HEURISTIC_WEIGHT) }
+}
+#[cfg(test)]
+thread_local! { static HEURISTIC_MODE: std::cell::Cell<HeuristicMode> = const {
+    std::cell::Cell::new(HeuristicMode::ScaledSum(PRODUCTION_HEURISTIC_WEIGHT))
+}; }
 #[cfg(test)]
 pub(super) fn with_heuristic_mode<T>(mode: HeuristicMode, f: impl FnOnce() -> T) -> T {
     struct Reset(HeuristicMode);
@@ -559,16 +564,18 @@ pub(super) fn plan_progress(
             match HEURISTIC_MODE.with(|v|v.get()) {
                 HeuristicMode::AdmissibleMax => return (remaining_distance/motion.max_forward_mps)
                     .max(turn/motion.max_angular_rps),
-                HeuristicMode::ScaledSum(w) => return w*remaining_distance/motion.max_forward_mps
-                    + w*turn/motion.max_angular_rps,
+                HeuristicMode::ScaledSum(w) => {
+                    if w != PRODUCTION_HEURISTIC_WEIGHT {
+                        return w*remaining_distance/motion.max_forward_mps + w*turn/motion.max_angular_rps;
+                    }
+                }
                 HeuristicMode::AdmissibleSum => return remaining_distance/motion.max_forward_mps
                     + turn/motion.max_angular_rps,
             }
         }
-        #[cfg(not(test))]
-        {
-            4.0*remaining_distance/motion.max_forward_mps+4.0*turn/motion.max_angular_rps
-        }
+        // 默认测试与生产执行同一表达式，避免测试专用排序掩盖真实预算行为。
+        PRODUCTION_HEURISTIC_WEIGHT*remaining_distance/motion.max_forward_mps
+            + PRODUCTION_HEURISTIC_WEIGHT*turn/motion.max_angular_rps
     };
     // Exact identity retains legal centimetre departures and small rotations.
     // More distinct states compete within the same finite expansion budget.
@@ -836,6 +843,36 @@ pub(super) fn plan_progress(
         blocked: None,
         body_witness: rejected_sample,
     })
+}
+
+#[cfg(test)]
+mod production_default_tests {
+    use super::*;
+    #[test]
+    fn default_priority_matches_production_weighted_sum() {
+        assert!(matches!(HEURISTIC_MODE.get(),HeuristicMode::ScaledSum(4.0)),
+            "普通测试必须使用生产的四倍加权和，诊断排序只能显式启用");
+        assert!(matches!(HeuristicMode::default(),HeuristicMode::ScaledSum(4.0)));
+    }
+    #[test]
+    fn configured_expansion_limit_applies_without_diagnostic_override() {
+        for configured in [0,1,7,256,257] {
+            assert_eq!(effective_expansion_limit(configured),configured);
+        }
+    }
+    #[test]
+    fn explicit_expansion_diagnostics_restore_configured_limit_after_nested_unwind() {
+        with_expansion_limit(11,|| {
+            assert_eq!(effective_expansion_limit(3),11);
+            let unwind=std::panic::catch_unwind(||with_expansion_limit(0,|| {
+                assert_eq!(effective_expansion_limit(3),0);
+                panic!("检查诊断覆盖恢复");
+            }));
+            assert!(unwind.is_err());
+            assert_eq!(effective_expansion_limit(3),11);
+        });
+        assert_eq!(effective_expansion_limit(3),3);
+    }
 }
 
 #[cfg(test)]

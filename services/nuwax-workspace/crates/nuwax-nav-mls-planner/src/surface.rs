@@ -701,8 +701,7 @@ impl SurfaceSnapshot {
             let height = start.surface_xyz[2] * (1.0 - ratio) + end.surface_xyz[2] * ratio;
             let current = self
                 .nearest_column_cell(
-                    ix,
-                    iy,
+                    [point[0], point[1]],
                     height,
                     f64::from(self.config().step_threshold_m + self.config().voxel_size),
                 )
@@ -1049,10 +1048,8 @@ impl SurfaceSnapshot {
         {
             return Err(SurfaceError::InvalidPose);
         }
-        let ix = (support_xyz[0] / size).floor() as i32;
-        let iy = (support_xyz[1] / size).floor() as i32;
         let cell = self
-            .nearest_column_cell(ix, iy, support_xyz[2], tolerance)
+            .nearest_column_cell([support_xyz[0], support_xyz[1]], support_xyz[2], tolerance)
             .ok_or(SurfaceError::MissingSupport)?;
 
         if self.data.virtual_obstacles.as_ref().is_some_and(|mask| !mask.permits_cell(cell,size,0.0)) {
@@ -1060,11 +1057,14 @@ impl SurfaceSnapshot {
         }
         // A terrain lookup identifies a measured layer; wall-distance penalties
         // belong to route ranking, not an additional body-collision admission.
-        Ok(SurfaceLocation {
-            cell,
-            support_xyz,
-            surface_xyz: self.ground_cell_position(cell),
-        })
+        let mut surface_xyz = self.cell_position(cell);
+        if let Some(layer) = self.measured_ground_layer_near(cell,
+            [support_xyz[0], support_xyz[1]], Some(support_xyz[2])) {
+            if let Some(height) = layer.height_at([surface_xyz[0], surface_xyz[1]]) {
+                surface_xyz[2] = height;
+            }
+        }
+        Ok(SurfaceLocation { cell, support_xyz, surface_xyz })
     }
 
     fn cell_position(&self, cell: VoxelKey) -> [f64; 3] {
@@ -1074,49 +1074,61 @@ impl SurfaceSnapshot {
 
     /// 接触代表高度与物理图单元坐标分开，避免观察层污染占据图的路由缓存。
     fn ground_cell_position(&self, cell: VoxelKey) -> [f64; 3] {
+        self.ground_cell_position_near(cell, None)
+    }
+
+    // A physical cell may contain several source-owned measured layers. Carry
+    // the query's reference through contact lookup rather than choosing its
+    // lowest layer again. Callers without a reference keep their old ordering.
+    fn ground_cell_position_near(&self, cell: VoxelKey, reference: Option<f64>) -> [f64; 3] {
         let mut position = self.cell_position(cell);
-        if self.ground_evidence == GroundEvidence::MeasuredSurface {
-            if let Some(source) = self.observations.as_ref().filter(|s|s.is_complete_geometry_source()) {
-                let fine = f64::from(source.size_m);
-                let coarse = f64::from(self.config().voxel_size);
-                let xy = [position[0],position[1]];
-                let column = xy.map(|v|(v/fine).floor() as i32);
-                // 只消费同列、属于该物理单元的已关联地面层。代表平面由源端
-                // 分层后的真实回波拟合，不能再用占据上界覆盖它，也不跨层平均。
-                // 一个粗格内的上方回波继续留在占据集合，供完整机体检查净空。
-                if let Some(height) = source.ground_layers(column)
-                    .filter(|layer|layer.members.iter().any(|&z|
-                        (((f64::from(z)+0.5)*fine)/coarse).floor() as i32 == cell.2))
-                    .filter_map(|layer|layer.height_at(xy))
-                    .min_by(f64::total_cmp) {
-                    position[2] = height;
-                }
-            }
+        let xy = [position[0], position[1]];
+        if let Some(layer) = self.measured_ground_layer_near(cell, xy, reference) {
+            if let Some(height) = layer.height_at(xy) { position[2] = height; }
         }
         position
     }
 
+    fn measured_ground_layer_near(&self, cell: VoxelKey, xy: [f64; 2], reference: Option<f64>)
+        -> Option<&ObservedGroundLayer> {
+        if self.ground_evidence != GroundEvidence::MeasuredSurface { return None; }
+        let source = self.observations.as_ref().filter(|s|s.is_complete_geometry_source())?;
+        let fine = f64::from(source.size_m);
+        let coarse = f64::from(self.config().voxel_size);
+        let column = xy.map(|v|(v/fine).floor() as i32);
+        // Association and height comparison use the same actual query XY.
+        // Only source members belonging to this physical cell may be contact.
+        source.ground_layers(column)
+            .filter(|layer|layer.members.iter().any(|&z|
+                (((f64::from(z)+0.5)*fine)/coarse).floor() as i32 == cell.2))
+            .filter_map(|layer|layer.height_at(xy).map(|height|(layer,height)))
+            .min_by(|a,b| match reference {
+                Some(height)=>(a.1-height).abs().total_cmp(&(b.1-height).abs()),
+                None=>a.1.total_cmp(&b.1),
+            }).map(|(layer,_)|layer)
+    }
+
     fn nearest_column_cell(
         &self,
-        ix: i32,
-        iy: i32,
+        xy: [f64; 2],
         height: f64,
         tolerance: f64,
     ) -> Option<VoxelKey> {
+        let size = f64::from(self.config().voxel_size);
+        let [ix, iy] = xy.map(|v|(v/size).floor() as i32);
         self.data
             .graph
             .surface_lookup
             .get(&(ix, iy))?
             .iter()
             .map(|&iz| {
-                (
-                    (self.ground_cell_position((ix, iy, iz))[2] - height).abs(),
-                    (ix, iy, iz),
-                )
+                let cell = (ix, iy, iz);
+                let at_query = self.measured_ground_layer_near(cell, xy, Some(height))
+                    .and_then(|layer|layer.height_at(xy))
+                    .unwrap_or_else(||self.cell_position(cell)[2]);
+                ((at_query - height).abs(), cell)
             })
-            .filter(|(distance, _)| {
-                *distance <= tolerance + f64::from(self.config().voxel_size) * 1e-5
-            })
+            .filter(|(distance, _)| *distance <= tolerance + size * 1e-5)
             .min_by(|left, right| left.0.total_cmp(&right.0))
             .map(|(_, cell)| cell)
     }

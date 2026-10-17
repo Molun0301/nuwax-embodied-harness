@@ -10,6 +10,11 @@ pub(super) fn fit_dynamic_contact_plane(
     if points.len() < 3 {
         return None;
     }
+    // Thin observations use the original fit and its rank check directly;
+    // constructing and inverting the same moment matrix twice adds no evidence.
+    if points.iter().all(|&(point, low, _)| point[2] == low) {
+        return original_fit_contact_plane(points, origin);
+    }
     let mut rows = Vec::with_capacity(points.len());
     let mut matrix = [[0.0; 3]; 3];
     let (mut mass, mut uncertainty, mut span) = (0.0, 0.0, 0.0);
@@ -191,6 +196,26 @@ fn scalar_interval_minimum(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thin_fast_path_preserves_original_fit_and_rank_rejection() {
+        for origin in [[0.0, 0.0, 0.3], [10.0, -20.0, 0.6]] {
+            for slope in [0.0, 0.2] {
+                let points: Vec<_> = (-2..=2).flat_map(|x| (-2..=2).map(move |y| {
+                    let (x, y) = (f64::from(x) * 0.1, f64::from(y) * 0.1);
+                    let z = slope * x - slope * 0.5 * y + 0.3;
+                    ([x, y, z], z, 1.0)
+                })).collect();
+                assert_eq!(fit_dynamic_contact_plane(&points, origin),
+                    original_fit_contact_plane(&points, origin));
+            }
+        }
+        for count in 0..5 {
+            let points: Vec<_> = (0..count).map(|x| ([f64::from(x), 0.0, 0.3], 0.3, 1.0)).collect();
+            assert_eq!(fit_dynamic_contact_plane(&points, [0.0; 3]), None);
+        }
+    }
+
     fn fixture() -> Vec<([f64; 3], f64, f64)> {
         let mut points = Vec::new();
         for x in [-0.2, 0.0, 0.2] {

@@ -346,20 +346,29 @@ impl Tomogram {
                 let Some(next) = self.reference_neighbor(from, [x, y]) else { continue; };
                 let b = self.reference_position(next);
                 if !accepts(actual_a, b) { continue; }
-                // 邻接成立不代表整段成立：缺测格继承的高度与斜向段内经过的
-                // 侧格可能不同。入队前复用输出段检查，拒绝此边后继续搜索，
-                // 避免最后才因一条不合法邻边丢弃整条候选路线。
-                if self.reference_segment(actual_a, b, boundary, cancelled).is_none() { continue; }
                 if outside_radius {
-                    // Only an otherwise admissible successor establishes an
-                    // artificial horizon cutoff. A wall/forbidden/physical-boundary
-                    // enclosure remains a geometric conclusion inside the disk.
-                    radius_clipped = true;continue;
+                    // 只有整段可接纳的越界边才证明人工半径截断；仅有邻点
+                    // 不能把真实障碍或高度不连续改写成搜索范围不足。
+                    #[cfg(test)]
+                    tests::record_neighbor_validation(b);
+                    if self.reference_segment(actual_a, b, boundary, cancelled).is_some() {
+                        radius_clipped = true;
+                    }
+                    continue;
                 }
                 let local_cost = penalties.iter().map(|p| penalty_at(b, p)).sum::<f64>();
                 let next_cost = cost + distance(a, b)
                     * ((self.reference_cost(from) + self.reference_cost(next)) * 0.5 + local_cost);
-                let next_id = match indexes.get(&next).copied() {
+                let existing = indexes.get(&next).copied();
+                // 只跳过同一精确参考状态的不改善边，保留过滤回调的原调用顺序。
+                // 新状态仍在完整段验证之后才占用状态预算。
+                if existing.is_some_and(|next_id| !(next_cost < states[next_id].cost)) { continue; }
+                // 邻接成立不代表整段成立：缺测格继承的高度与斜向段内经过的
+                // 侧格可能不同。所有可能改善路线的边仍复用输出段检查。
+                #[cfg(test)]
+                tests::record_neighbor_validation(b);
+                if self.reference_segment(actual_a, b, boundary, cancelled).is_none() { continue; }
+                let next_id = match existing {
                     Some(id) => id,
                     None => {
                         if states.len() >= limits.max_states {
@@ -493,6 +502,61 @@ impl Tomogram {
 #[cfg(test)]
 mod tests {
     use super::*;
+    thread_local! {
+        static NEIGHBOR_VALIDATIONS: std::cell::Cell<Option<([f64;3],usize,usize)>> = const {
+            std::cell::Cell::new(None)
+        };
+    }
+    pub(super) fn record_neighbor_validation(endpoint: [f64;3]) {
+        if let Some((start,total,returns)) = NEIGHBOR_VALIDATIONS.get() {
+            NEIGHBOR_VALIDATIONS.set(Some((start,total+1,returns+usize::from(endpoint==start))));
+        }
+    }
+    #[test]
+    fn dominated_return_edges_skip_segment_validation_but_keep_filter_calls() {
+        for known in [false,true] {
+            let columns: Vec<_> = if known {(0..5).map(|x|([x,0],vec![[-0.1,0.0]])).collect()}
+                else {Vec::new()};
+            let map=Tomogram::from_columns(0.1,columns,0.4,0.0,0.1,0.1,20.0).unwrap();
+            let start=[0.05,0.05,0.0];let goal=[0.45,0.05,0.0];
+            let boundary=[[0.0,0.0],[0.5,0.0],[0.5,0.1],[0.0,0.1]];
+            // 非空但远离路线的软代价只关闭直连快路，不改变任何邻边代价。
+            let penalties=[crate::RoutePenalty{center:[10.0,0.0,0.0],radius:0.1,weight:1.0}];
+            let filter_returns=std::cell::Cell::new(0);
+            let accepts=|_: [f64;3],b: [f64;3]| {
+                if b==start {filter_returns.set(filter_returns.get()+1);}
+                true
+            };
+            NEIGHBOR_VALIDATIONS.set(Some((start,0,0)));
+            let result=map.plan_bounded_with_segment_filter(start,goal,0.0,&boundary,None,
+                Some(1.0),&penalties,&accepts);
+            let (_,validations,returns)=NEIGHBOR_VALIDATIONS.take().unwrap();
+            let route=result.unwrap();
+            assert_eq!(route.stats.expanded,5);
+            assert!(filter_returns.get()>0,"既有过滤回调仍观察到返回起点的候选");
+            assert_eq!(returns,0,"已接纳起点的更贵回边不应重复扫描整段，known={known}");
+            assert_eq!(validations,4,"只完整核验四条实际改善代价的邻边");
+            assert_eq!(route.points.first(),Some(&start));
+            assert_eq!(route.points.last(),Some(&goal));
+            assert!(route.points.windows(2).all(|p|map.segment_clear(p[0],p[1],&boundary)));
+        }
+    }
+    #[test]
+    fn radius_cutoff_requires_full_off_center_segment_admission() {
+        let map=Tomogram::from_columns(0.1,[([0,1],vec![[0.0,0.1]])],
+            0.4,0.0,0.15,0.15,20.0).unwrap();
+        let start=[0.01,0.09,0.0];let goal=[0.55,0.55,0.0];
+        let initial=map.reference_start(start).unwrap();
+        let next=map.reference_neighbor(initial,[1,1]).expect("格邻接允许这个候选");
+        let endpoint=map.reference_position(next);
+        assert_eq!(endpoint[2],0.0);
+        assert!(map.reference_segment(start,endpoint,&[],None).is_none(),
+            "实际斜线先跨过较高侧格，不能再在缺测格虚构下降平面");
+        let error=map.plan_bounded_with_segment_filter_and_limits_typed(start,goal,0.0,&[],None,
+            Some(0.05),&[],&|_,b|b==endpoint,SearchLimits::default()).unwrap_err();
+        assert!(matches!(error,PlanningFailure::Other(_)),
+            "越界邻点存在但整段不合法，不能谎报搜索半径截断：{error}");
+    }
     #[test]
     fn irregular_thick_ground_keeps_search_and_segment_admission_consistent() {
         let q = f64::from(0.05_f32);

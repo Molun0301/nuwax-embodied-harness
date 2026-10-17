@@ -101,16 +101,20 @@ class NativeWorker:
         self.data = data
         self.provenance = binary_provenance(binary, cloud, poses)
         self.lock = threading.Lock()
-        self.error_log = (data / "原生模拟.log").open("a", encoding="utf-8")
-        args = [str(binary), str(data)]
         if (cloud is None) != (poses is None):
-            self.error_log.close()
             raise ValueError("实录点云与轨迹必须同时提供")
+        args = [str(binary), str(data)]
         if cloud is not None:
-            if not cloud.is_file() or not poses.is_file():
-                self.error_log.close()
-                raise ValueError("指定的实录点云或轨迹不存在")
-            args += [str(cloud), str(poses)]
+            # 网页、单例与矩阵共用原生入口；原生程序只读取逐行JSON。
+            cloud_statistics(cloud)
+            rows = load_poses(poses)
+            normalized_poses = data / "输入轨迹.jsonl"
+            normalized_poses.write_text(
+                "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+                encoding="utf-8",
+            )
+            args += [str(cloud.resolve()), str(normalized_poses)]
+        self.error_log = (data / "原生模拟.log").open("a", encoding="utf-8")
         try:
             self.process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                         stderr=self.error_log, text=True, encoding="utf-8",
@@ -508,10 +512,6 @@ def main(argv=None):
         parser.error("超时和速度必须是有限正数")
     if not args.binary.is_file() or not os.access(args.binary, os.X_OK):
         parser.error("原生程序不存在或不可执行；请先运行python3 scripts/dev_tools.py nav build")
-    rows = None
-    if args.cloud is not None:
-        cloud_statistics(args.cloud)
-        rows = load_poses(args.poses)
     data = (args.data_dir or ROOT / "runtime_data/navigation_simulator" / (datetime.now().strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:8])).resolve()
     data.mkdir(parents=True, exist_ok=True)
     lock = (data / "运行.lock").open("a")
@@ -526,15 +526,10 @@ def main(argv=None):
 
     previous_signal = signal.signal(signal.SIGTERM, stop_requested)
     try:
-        poses = None
-        if rows is not None:
-            poses = data / "输入轨迹.jsonl"
-            poses.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows), encoding="utf-8")
-        worker = NativeWorker(args.binary.resolve(), data, args.cloud.resolve() if args.cloud else None, poses, args.startup_timeout)
+        worker = NativeWorker(args.binary.resolve(), data, args.cloud.resolve() if args.cloud else None,
+                              args.poses.resolve() if args.poses else None, args.startup_timeout)
         if recording_name:
             next(scene for scene in worker.catalog["scenes"] if scene["id"] == "recorded")["name"] = recording_name
-        if args.poses:
-            worker.provenance["source_poses"] = str(args.poses.resolve())
         write_json(data / "scenes.json", worker.catalog)
         print(f"导航测试台结果目录：{data}", flush=True)
         simulator = Simulator(worker, data)

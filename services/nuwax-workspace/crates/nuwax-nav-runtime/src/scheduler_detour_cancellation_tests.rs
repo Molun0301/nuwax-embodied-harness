@@ -217,6 +217,9 @@ mod scheduler_detour_cancellation {
         fn observe_applied_command(&mut self, c: Twist2) {
             self.inner.observe_applied_command(c)
         }
+        fn prepare_control_step(&mut self, w: f64, continuing_wait: bool) -> Option<watch::Receiver<()>> {
+            self.inner.prepare_control_step(w, continuing_wait)
+        }
         fn step(&mut self, w: f64) -> PlannerStep {
             let result = self.inner.step(w);
             *self.grant.lock().unwrap() = if matches!(result,PlannerStep::Command(c) if c!=Twist2::ZERO)

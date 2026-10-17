@@ -1549,6 +1549,26 @@ mod tests {
     }
 
     #[test]
+    fn configured_search_limits_bound_real_expansions_without_test_override() {
+        let map=coarse_open_floor();let tomo=Tomogram::from_surface(&map).unwrap();
+        let start=([-1.0,0.2,0.4],[0.0,0.0,0.0,1.0]);
+        let reference=[[-1.0,0.2,0.0],[0.1,0.2,0.0]];
+        for limit in [0,1,3] {
+            let failure=local_search::plan(&map,&tomo,start,&reference,&motion(),None,
+                Some(([0.1,0.2,2.0],0.1)),&[],3.0,0.9,true,limit).unwrap_err();
+            assert_eq!(failure.kind,LocalPlanFailureKind::BudgetExhausted);
+            let (expanded,nodes,frontier)=local_search::last_work();
+            assert_eq!(expanded,limit,"调用者配置必须约束真正展开次数");
+            assert!(nodes<=1+14*limit && frontier<=1+14*limit);
+            assert!(failure.blocked.is_none(),"有限工作预算不能改写为物理障碍");
+        }
+        let path=local_search::plan(&map,&tomo,start,&reference,&motion(),None,
+            Some(([0.1,0.2,0.4],0.1)),&[],3.0,0.9,true,0).unwrap();
+        assert_eq!(local_search::last_work().0,0,"零展开仍可返回完整核验的解析直连");
+        for edge in path.windows(2) {map.validate_body_motion(edge[0],edge[1],&[]).unwrap();}
+    }
+
+    #[test]
     fn exhausted_search_is_distinct_and_outer_projection_cannot_supply_obstruction() {
         let map = coarse_open_floor();
         let tomo = Tomogram::from_surface(&map).unwrap();

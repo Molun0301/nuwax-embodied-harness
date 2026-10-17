@@ -455,13 +455,35 @@ mod tests {
     #[tokio::test]
     #[cfg(not(feature = "simple-2d"))]
     async fn non_dry_cli_rejects_unowned_profile_instead_of_reporting_success() {
-        let opts = CliOptions::parse(&[]).expect("default CLI options");
+        // The default pipeline is now 3D. Isolate the explicit 2D fixture from
+        // other tests instead of mutating their process-wide environment.
+        const CHILD: &str = "NUWAX_TEST_UNOWNED_SIMPLE_CLI";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "bin_support::tests::non_dry_cli_rejects_unowned_profile_instead_of_reporting_success",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("NUWAX_GEOMETRY_PIPELINE", "slam_2d")
+                .env_remove("NUWAX_NAV_PROFILE")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        let opts = CliOptions::parse(&["--profile=simple-2d".into()])
+            .expect("explicit unowned CLI profile");
         let error = run_until_shutdown(opts, async { Ok(()) })
             .await
             .expect_err("Simple2D has no registered runtime owners");
         assert!(matches!(
             error,
-            crate::error::NavStackError::MissingRuntimeOwners { .. }
+            crate::error::NavStackError::MissingRuntimeOwners { nodes }
+                if nodes.iter().any(|node| node.starts_with("simple_planner ("))
         ));
     }
 

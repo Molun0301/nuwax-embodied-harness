@@ -1,9 +1,16 @@
 use super::*;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
+
+/// A range can exceed an existing object's length without the object being missing.
+#[derive(Debug)]
+pub enum ObjectRangeRead {
+    Data { bytes: Vec<u8>, total_bytes: usize },
+    OutOfBounds,
+}
 
 /// Typed immutable object directory; legacy filenames retain their exact namespace.
 #[derive(Clone)]
@@ -40,7 +47,7 @@ impl Repository {
             Ok(_) => Ok(true), Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false), Err(e) => Err(e.to_string()),
         }
     }
-    pub fn read_object(&self, object: ObjectIdentity, max_bytes: usize) -> Result<Vec<u8>, String> {
+    fn open_object(&self, object: ObjectIdentity, max_bytes: usize) -> Result<(File, usize), String> {
         object.validate()?;
         #[cfg(test)] self.stats.reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut options = OpenOptions::new(); options.read(true);
@@ -49,10 +56,27 @@ impl Repository {
         let file = options.open(self.object_path(object)).map_err(|e| e.to_string())?;
         let meta = file.metadata().map_err(|e| e.to_string())?;
         if !meta.is_file() || meta.len() > max_bytes as u64 { return Err("invalid object type or size".into()); }
-        let mut bytes = Vec::with_capacity(meta.len() as usize);
+        Ok((file, meta.len() as usize))
+    }
+    pub fn read_object(&self, object: ObjectIdentity, max_bytes: usize) -> Result<Vec<u8>, String> {
+        let (file, total) = self.open_object(object, max_bytes)?;
+        let mut bytes = Vec::with_capacity(total);
         file.take(max_bytes as u64 + 1).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
-        if bytes.len() != meta.len() as usize || bytes.len() > max_bytes { return Err("object length changed or exceeds budget".into()); }
+        if bytes.len() != total || bytes.len() > max_bytes { return Err("object length changed or exceeds budget".into()); }
         Ok(bytes)
+    }
+    /// Read one bounded range of an immutable object, returning its complete length.
+    /// The caller retains the owning root and validates the transfer's part budget.
+    pub fn read_object_range(&self, object: ObjectIdentity, max_bytes: usize,
+        offset: usize, maximum: usize) -> Result<ObjectRangeRead, String> {
+        if maximum == 0 { return Ok(ObjectRangeRead::OutOfBounds); }
+        let (mut file, total) = self.open_object(object, max_bytes)?;
+        if offset >= total { return Ok(ObjectRangeRead::OutOfBounds); }
+        let count = maximum.min(total - offset);
+        file.seek(SeekFrom::Start(offset as u64)).map_err(|e| e.to_string())?;
+        let mut bytes = vec![0; count];
+        file.read_exact(&mut bytes).map_err(|e| e.to_string())?;
+        Ok(ObjectRangeRead::Data { bytes, total_bytes: total })
     }
     /// Publish once using a no-replace hard link. Existing IDs must have exact equal bytes.
     pub fn put_object(&self, object: ObjectIdentity, bytes: &[u8]) -> Result<(), String> {

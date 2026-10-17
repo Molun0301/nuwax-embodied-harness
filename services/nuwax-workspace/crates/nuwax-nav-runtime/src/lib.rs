@@ -914,7 +914,14 @@ pub trait NavPlanner: Send + 'static {
     fn execution_wait_reason(&self) -> Option<String> { None }
     /// 只读展示当前局部规划，不改变速度或路径许可。
     fn local_path_for_display(&self) -> Vec<[f64; 3]> { Vec::new() }
-    /// Produce one controller step.
+    /// Prepare a deferred control result without blocking the scheduler task.
+    /// A receiver requests a bounded wait for publication, not command authority.
+    /// `continuing_wait` keeps an already deferred tick waiting for matching input
+    /// versions; it does not broaden which initial steps may defer.
+    /// Synchronous backends return None and retain their immediate step behavior.
+    /// Delegating adapters must forward this hook with `step` to preserve scheduling.
+    fn prepare_control_step(&mut self, _robot_width_m: f64, _continuing_wait: bool) -> Option<watch::Receiver<()>> { None }
+    /// Produce one controller step without waiting for a background computation.
     fn step(&mut self, robot_width_m: f64) -> PlannerStep;
     /// Clear planner state after a terminal fence.
     fn stop(&mut self);
@@ -1128,8 +1135,18 @@ where
         let mut fallback_renewal = Instant::now() + self.config.renew_interval;
         let mut input_open = true;
         let mut urgent_open = true;
+        let mut deferred_control: Option<DeferredControl> = None;
 
         loop {
+            // A deferred tick belongs to one accepted path, never the next goal
+            // or a replacement path admitted while computation was outstanding.
+            if deferred_control.as_ref().is_some_and(|wait|
+                self.status.phase != SchedulerPhase::Controlling
+                    || self.arrival_confirmation.is_some()
+                    || !self.current_execution_identity.as_ref()
+                        .is_some_and(|identity| Arc::ptr_eq(identity, &wait.identity))) {
+                deferred_control = None;
+            }
             if !input_open && !urgent_open {
                 return self
                     .finish_terminal(&status_tx, TerminalOutcome::Shutdown, SchedulerPhase::Idle)
@@ -1187,18 +1204,61 @@ where
                 }
 
                 event = async {
-                    // 普通输入与控制公平轮换；取消和续租仍由外层优先选择。
-                    tokio::select! {
-                        command=input_rx.recv(), if input_open=>SchedulerEvent::Input(command),
-                        _=tick.tick(), if controlling=>SchedulerEvent::Tick,
-                        else=>std::future::pending().await,
+                    if let Some(wait) = deferred_control.as_mut() {
+                        match wait.queued_inputs {
+                            Some(0) => SchedulerEvent::ControlReady,
+                            Some(_) => SchedulerEvent::Input(input_rx.recv().await),
+                            None => tokio::select! {
+                                biased;
+                                finish = wait.ready() => SchedulerEvent::Publication(finish),
+                                command = input_rx.recv(), if input_open => SchedulerEvent::Input(command),
+                            },
+                        }
+                    } else {
+                        // 普通输入与控制公平轮换；取消和续租仍由外层优先选择。
+                        tokio::select! {
+                            command=input_rx.recv(), if input_open=>SchedulerEvent::Input(command),
+                            _=tick.tick(), if controlling=>SchedulerEvent::Tick,
+                            else=>std::future::pending().await,
+                        }
                     }
                 } => match event {
-                    SchedulerEvent::Input(command)=>match command {
-                        Some(command)=>self.handle_input(&status_tx,command).await,
-                        None=>input_open=false,
-                    },
-                    SchedulerEvent::Tick=>{
+                    SchedulerEvent::Input(command)=> {
+                        if let Some(remaining) = deferred_control.as_mut().and_then(|wait| wait.queued_inputs.as_mut()) {
+                            *remaining = remaining.saturating_sub(1);
+                        }
+                        match command {
+                            Some(command)=>self.handle_input(&status_tx,command).await,
+                            None=>input_open=false,
+                        }
+                    }
+                    SchedulerEvent::Publication(finish_wait) => {
+                        if let Some(wait) = deferred_control.as_mut() {
+                            // Admit the finite prefix already queued at readiness.
+                            // Versions advance only in handle_input, so consuming a
+                            // publication first could otherwise dispatch old sources.
+                            // New arrivals do not extend this prefix or its deadline.
+                            wait.queued_inputs = Some(input_rx.len());
+                            wait.finish_wait = finish_wait;
+                        }
+                    }
+                    SchedulerEvent::Tick | SchedulerEvent::ControlReady => {
+                        let previous = deferred_control.take();
+                        let deadline = previous.as_ref().map_or_else(
+                            || Instant::now() + self.config.tick_interval, |wait| wait.deadline);
+                        let finish_wait = previous.as_ref().is_some_and(|wait| wait.finish_wait)
+                            || Instant::now() >= deadline;
+                        if !finish_wait && self.status.phase == SchedulerPhase::Controlling
+                            && self.arrival_confirmation.is_none() {
+                            if let Some(identity) = self.current_execution_identity.clone() {
+                                if let Some(publication) = self.planner.prepare_control_step(self.config.robot_width_m, previous.is_some()) {
+                                    deferred_control = Some(DeferredControl {
+                                        publication, deadline, identity, queued_inputs: None, finish_wait: false,
+                                    });
+                                    continue;
+                                }
+                            }
+                        }
                     // 重新取租约期间已经确认静止；与原StartSession一样收敛有界
                     // acquire结果，不能丢弃未知grant后再拿旧停车票据确认新租约。
                     let outcome = if self.arrival_resume_requested() {
@@ -2334,7 +2394,27 @@ pub fn qualification_surface_backend(
     production_surface_backend(config)
 }
 
-enum SchedulerEvent { Input(Option<InputCommand>), Tick }
+struct DeferredControl {
+    publication: watch::Receiver<()>,
+    deadline: Instant,
+    identity: Arc<PathExecutionIdentity>,
+    queued_inputs: Option<usize>,
+    finish_wait: bool,
+}
+
+impl DeferredControl {
+    // True ends the wait even if the worker still has no current result. Channel
+    // closure must resolve once, not repeatedly subscribe to a closed notifier.
+    async fn ready(&mut self) -> bool {
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(self.deadline) => true,
+            changed = self.publication.changed() => changed.is_err(),
+        }
+    }
+}
+
+enum SchedulerEvent { Input(Option<InputCommand>), Tick, Publication(bool), ControlReady }
 
 struct InputCommand {
     kind: InputKind,
@@ -2603,6 +2683,7 @@ fn path_rejected(reason: impl Into<String>) -> RuntimeError {
 
 #[cfg(test)]
 mod tests {
+    include!("scheduler_delivery_gap_tests.rs");
     include!("arrival_confirmation_tests.rs");
     include!("recent_source_health_tests.rs");
     include!("scheduler_detour_cancellation_tests.rs");

@@ -221,7 +221,53 @@ fn repository_rejects_symlink_and_directory_without_overwrite() {
     let r=Repository::temporary().unwrap();let alias=ObjectIdentity::Legacy(LegacyAlias([3;32]));let path=r.path().join("03".repeat(32));
     let target=r.path().join("outside");std::fs::write(&target,b"unchanged").unwrap();std::os::unix::fs::symlink(&target,&path).unwrap();
     assert!(r.read_object(alias,100).is_err());assert!(r.put_object(alias,b"different").is_err());assert_eq!(std::fs::read(&target).unwrap(),b"unchanged");
+    assert!(r.read_object_range(alias,100,0,7).is_err());
     std::fs::remove_file(&path).unwrap();std::fs::create_dir(&path).unwrap();assert!(r.read_object(alias,100).is_err());assert!(r.put_object(alias,b"different").is_err());
+    assert!(r.read_object_range(alias,100,0,7).is_err());
+}
+#[test]
+fn repository_ranges_reassemble_exact_bytes_with_bounded_buffers() {
+    for length in [1, MAX_BLOCK_TRANSFER_PART_BYTES - 1, MAX_BLOCK_TRANSFER_PART_BYTES,
+        MAX_BLOCK_TRANSFER_PART_BYTES + 1, 393_232, MAX_BLOCK_BYTES] {
+        let repository = Repository::temporary().unwrap();
+        let expected: Vec<_> = (0..length).map(|index| index as u8).collect();
+        for object in [ObjectIdentity::Assigned(ObjectId([1; 16])),
+            ObjectIdentity::Legacy(LegacyAlias([2; 32]))] {
+            repository.put_object(object, &expected).unwrap();
+            let mut joined = Vec::new();
+            while joined.len() < length {
+                let ObjectRangeRead::Data { bytes, total_bytes } = repository.read_object_range(
+                    object, MAX_BLOCK_BYTES, joined.len(), MAX_BLOCK_TRANSFER_PART_BYTES,
+                ).unwrap() else { panic!("valid range must return bytes"); };
+                assert_eq!(total_bytes, length);
+                assert_eq!(bytes.len(), MAX_BLOCK_TRANSFER_PART_BYTES.min(length - joined.len()));
+                assert!(bytes.capacity() <= MAX_BLOCK_TRANSFER_PART_BYTES,
+                    "a range must not allocate the complete object");
+                joined.extend_from_slice(&bytes);
+            }
+            assert_eq!(joined, repository.read_object(object, MAX_BLOCK_BYTES).unwrap());
+            assert_eq!(joined, expected);
+        }
+    }
+}
+#[test]
+fn repository_ranges_keep_bounds_separate_from_missing_or_invalid_objects() {
+    let repository = Repository::temporary().unwrap();
+    let object = ObjectIdentity::Assigned(ObjectId([1; 16]));
+    repository.put_object(object, &[7; 16]).unwrap();
+    for (offset, maximum) in [(16, 1), (usize::MAX, 1), (0, 0)] {
+        assert!(matches!(repository.read_object_range(object, MAX_BLOCK_BYTES, offset, maximum),
+            Ok(ObjectRangeRead::OutOfBounds)));
+    }
+    let ObjectRangeRead::Data { bytes, total_bytes } = repository.read_object_range(
+        object, MAX_BLOCK_BYTES, 15, usize::MAX,
+    ).unwrap() else { panic!("the last byte is in range"); };
+    assert_eq!((bytes, total_bytes), (vec![7], 16));
+    assert!(repository.read_object_range(object, 15, 0, 1).is_err());
+    assert!(repository.read_object_range(ObjectIdentity::Assigned(ObjectId([0; 16])),
+        MAX_BLOCK_BYTES, 0, 1).is_err());
+    assert!(repository.read_object_range(ObjectIdentity::Assigned(ObjectId([3; 16])),
+        MAX_BLOCK_BYTES, 0, 1).is_err());
 }
 #[test]
 fn legacy_alias_paths_and_shared_spatial_keys_are_retained() {

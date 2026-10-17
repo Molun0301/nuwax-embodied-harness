@@ -98,7 +98,12 @@ impl LegacyReferenceField {
             .iter()
             .map(|band| (band.low + band.high) as f64 * quantum * 0.5)
             .collect();
+        let mut previous_members = Vec::new();
         for (level, members) in levels {
+            // Identical members have identical components. Their member counts
+            // already won at the previous, lower source height, so this level
+            // cannot change any chosen reference.
+            if members == previous_members { continue; }
             let lookup: AHashMap<_, _> = members
                 .iter()
                 .enumerate()
@@ -204,6 +209,7 @@ impl LegacyReferenceField {
                     chosen[id] = component.len();
                 }
             }
+            previous_members = members;
         }
         let heights = bands
             .iter()
@@ -283,6 +289,24 @@ mod tests {
                 "同一水平高度被整片真实区间共同支持时，下向加厚不能让参考下降"
             );
         }
+    }
+
+    #[test]
+    fn repeated_height_members_keep_distinct_equal_size_components() {
+        let mut source = SurfaceObservations::new(0.05, 32).unwrap();
+        let mut blocks = BTreeMap::<[i32; 3], BTreeMap<[i32; 3], SurfaceObservation>>::new();
+        for (start, bottom, top) in [(0, -3, -1), (8, 2, 5)] {
+            for x in start..start + 2 { for y in 0..2 { for z in bottom..=top {
+                let key: [i32; 3] = [x, y, z];
+                blocks.entry(key.map(|v| v.div_euclid(32))).or_default()
+                    .insert(key, SurfaceObservation { observed_ns: 0, hits: 0 });
+            }}}
+        }
+        for (key, values) in blocks { source.replace_block(key, values).unwrap(); }
+        let field = source.legacy_reference_field(GroundEvidence::MeasuredSurface, 0.34);
+        let q = f64::from(0.05_f32);
+        for x in 0..2 { for y in 0..2 { assert_eq!(field.heights[&[x, y, -1]], -q); }}
+        for x in 8..10 { for y in 0..2 { assert_eq!(field.heights[&[x, y, 5]], 4.5 * q); }}
     }
 
     #[test]

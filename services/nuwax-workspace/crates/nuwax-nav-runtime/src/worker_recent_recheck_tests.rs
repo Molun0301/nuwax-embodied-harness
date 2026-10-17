@@ -189,8 +189,8 @@ fn latest_received_pose_recheck_keeps_twenty_hz_moving_progress() {
     assert!(c.rechecks>0);drop(c);worker.stop();
 }
 
-#[test]
-fn pose_arriving_at_the_control_tick_receives_current_stopping_permission() {
+#[tokio::test]
+async fn pose_arriving_at_the_control_tick_receives_current_stopping_permission() {
     let(mut worker,map,counts,computed,release)=recent_recheck_fixture();
     computed.recv_timeout(Duration::from_secs(2)).unwrap();
     release.send(()).unwrap();wait_recent_rechecked(&worker);
@@ -202,6 +202,15 @@ fn pose_arriving_at_the_control_tick_receives_current_stopping_permission() {
         position+=current.linear.x*DEFAULT_TICK_INTERVAL.as_secs_f64();
         let pose=route_pose(position,tick);
         worker.update_odometry(pose.clone());
+        // Worker-level publication qualification: scheduler interleaving is
+        // exercised separately by the real run-loop delivery-gap regressions.
+        let deadline = tokio::time::Instant::now() + DEFAULT_TICK_INTERVAL;
+        let mut continuing_wait = false;
+        while tokio::time::Instant::now() < deadline {
+            let Some(mut publication) = worker.prepare_control_step(0.3, continuing_wait) else { break; };
+            if !matches!(tokio::time::timeout_at(deadline, publication.changed()).await, Ok(Ok(()))) { break; }
+            continuing_wait = true;
+        }
         let output=worker.step(0.3);
         let PlannerStep::Command(command)=output else {panic!("同拍复核没有交付有效命令：{output:?}");};
         assert!(command.linear.x>0.0);

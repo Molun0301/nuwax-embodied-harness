@@ -101,7 +101,7 @@ def test_pipeline_preflight_works_without_runtime_python_packages():
     (["core", "geometry", "navigation"], "lio_3d", "pct-scan-3d"),
     (["core", "geometry", "slam2d", "navigation"], "slam_2d", "simple-2d"),
 ])
-def test_installer_replaces_stale_profile_with_selected_complete_pipeline(tmp_path, modules, pipeline, profile):
+def test_installer_derives_profile_from_selected_pipeline_without_pinning_legacy_value(tmp_path, modules, pipeline, profile):
     from scripts.module_installer.runtime import write_runtime
 
     prefix = tmp_path / "generation"
@@ -110,7 +110,12 @@ def test_installer_replaces_stale_profile_with_selected_complete_pipeline(tmp_pa
                   existing={"NUWAX_NAV_PROFILE": "replanning-astar"})
     saved = read_env_values(prefix / "settings.env")
     assert saved["NUWAX_GEOMETRY_PIPELINE"] == pipeline
-    assert saved["NUWAX_NAV_PROFILE"] == profile
+    assert "NUWAX_NAV_PROFILE" not in saved
+    assert resolve_navigation_profile(saved["NUWAX_GEOMETRY_PIPELINE"], saved.get("NUWAX_NAV_PROFILE")) == profile
+    # A later pipeline switch must not remain pinned to the install-time profile.
+    other_pipeline = "slam_2d" if pipeline == "lio_3d" else "lio_3d"
+    other_profile = "simple-2d" if other_pipeline == "slam_2d" else "pct-scan-3d"
+    assert resolve_navigation_profile(other_pipeline, saved.get("NUWAX_NAV_PROFILE")) == other_profile
 
 
 def test_exploration_diagnostic_does_not_count_deadline_as_completion():

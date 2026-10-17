@@ -71,3 +71,9 @@ generated/python/nuwax_msgs/*
 
 # Independent live observation channel and its generated Python binding.
 !generated/python/nuwax_msgs/RecentCloud3D.py
+
+# The delivery recorder consumes canonical transforms alongside odometry.
+!generated/python/tf2_msgs/
+generated/python/tf2_msgs/*
+!generated/python/tf2_msgs/__init__.py
+!generated/python/tf2_msgs/TFMessage.py

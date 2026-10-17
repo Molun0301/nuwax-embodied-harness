@@ -632,11 +632,11 @@ impl SurfaceSnapshot {
             let center=xy.map(|v|(f64::from(v)+0.5)*fine);
             let mut records=observations.ground_layers(xy).peekable();
             let any_measured=records.peek().is_some();
-            // A known source anchor fixes the measured physical layer;
-            // missing anchors use only the carried calibrated reference for
-            // association, without creating observed members or a plane.
-            let reference=ground.map_or(body[2]-model.body_to_support_z_m/normal[2],
-                |ground|self.ground_cell_position(ground)[2]);
+            // The physical anchor constrains membership to its coarse cell.
+            // Within that cell retain the layer nearest the calibrated support
+            // plane, as in support lookup; never merge the other layer's members.
+            let reference=body[2]-(normal[0]*(center[0]-body[0])
+                +normal[1]*(center[1]-body[1])+model.body_to_support_z_m)/normal[2];
             let uncertainty=f64::from(self.source_voxel_size_m())+model.support_uncertainty_m;
             let record=records.filter(|record| {
                 if let Some(ground)=ground {
@@ -811,13 +811,13 @@ impl SurfaceSnapshot {
 
     // 脚下相邻接触点无需容纳完整机体中心和踏面窗口。只连接实际观测的
     // 邻列及腿部可达高度；机体移动仍由原路径连边与包络扫掠验证。
-    fn contact_neighbors(&self, cell: VoxelKey) -> Vec<VoxelKey> {
+    fn contact_neighbors(&self, cell: VoxelKey, reference: &impl Fn(VoxelKey) -> f64) -> Vec<VoxelKey> {
         let Some(model) = self.body_envelope() else {
             return vec![];
         };
         let graph = &self.data.physical_graph;
         let quantum = f64::from(self.source_voxel_size_m());
-        let height = self.ground_cell_position(cell)[2];
+        let height = self.ground_cell_position_near(cell, Some(reference(cell)))[2];
         DIRECTIONS
             .iter()
             .flat_map(|&(dx, dy)| {
@@ -829,7 +829,7 @@ impl SurfaceSnapshot {
                     .map(move |&z| (cell.0 + dx, cell.1 + dy, z))
             })
             .filter(|&next| {
-                let rise = self.ground_cell_position(next)[2] - height;
+                let rise = self.ground_cell_position_near(next, Some(reference(next)))[2] - height;
                 rise <= model.max_step_up_m + quantum + 1e-6
                     && -rise <= model.max_step_down_m + quantum + 1e-6
             })
@@ -858,6 +858,16 @@ impl SurfaceSnapshot {
             self.data.body_cache.lock().unwrap_or_else(|e|e.into_inner()).get(&key).cloned()
         };
         if let Some(patch) = cached {return patch;}
+        // This source plane is determined by the existing cell/height cache key.
+        // Extrapolation only selects an existing layer in each neighbour; it
+        // never creates observed members or changes the actual step-height test.
+        let center = self.cell_position(centre.cell);
+        let reference_plane = self.measured_ground_layer_near(centre.cell,
+            [center[0], center[1]], Some(height));
+        let reference_at = |cell| reference_plane.and_then(|plane| {
+            let point = self.cell_position(cell);
+            plane.height_at([point[0],point[1]])
+        }).unwrap_or(height);
         let graph = &self.data.physical_graph;
         let Some(start) = graph.cells.id(centre.cell) else {
             return Arc::new(AHashMap::new());
@@ -870,20 +880,21 @@ impl SurfaceSnapshot {
                 return Arc::new(AHashMap::new());
             }
             let cell = graph.cells.coord(id);
-            let p = self.ground_cell_position(cell);
+            let reference = reference_at(cell);
+            let p = self.ground_cell_position_near(cell, Some(reference));
             patch
                 .entry((cell.0, cell.1))
                 .and_modify(|old: &mut VoxelKey| {
-                    if (self.ground_cell_position(*old)[2] - height).abs()
-                        > (p[2] - height).abs()
+                    if (self.ground_cell_position_near(*old, Some(reference))[2] - reference).abs()
+                        > (p[2] - reference).abs()
                     {
                         *old = cell;
                     }
                 })
                 .or_insert(cell);
-            for next in self.contact_neighbors(cell) {
+            for next in self.contact_neighbors(cell, &reference_at) {
                 let Some(next_id)=graph.cells.id(next) else {continue;};
-                let point = self.ground_cell_position(next);
+                let point = self.ground_cell_position_near(next, Some(reference_at(next)));
                 if (point[0] - centre.surface_xyz[0]).hypot(point[1] - centre.surface_xyz[1])
                         <= radius
                     && seen.insert(next_id)
@@ -2625,9 +2636,7 @@ impl SurfaceSnapshot {
                 if (point[0]-center[0]).hypot(point[1]-center[1])>radius+1e-9 {break;}
                 let source=self.direct_ground_query(point,reference);
                 if let Some(height)=source.height {
-                    let coarse=f64::from(self.config().voxel_size);
-                    let cell=self.nearest_column_cell((point[0]/coarse).floor() as i32,(point[1]/coarse).floor() as i32,
-                        height,model.max_step_up_m.max(model.max_step_down_m)+quantum);
+                    let cell=self.nearest_column_cell(point, height,model.max_step_up_m.max(model.max_step_down_m)+quantum);
                     if let Some(cell)=cell {samples.push((point,source,cell));}
                     break; // never look past a known different surface or wall
                 }
@@ -2642,7 +2651,11 @@ impl SurfaceSnapshot {
             let origin=[first.0[0],first.0[1],z];
             let at=|point:[f64;2]|origin[2]-(normal[0]*(point[0]-origin[0])+normal[1]*(point[1]-origin[1]))/normal[2];
             if (at(center)-reference).abs()>model.max_step_up_m.max(model.max_step_down_m)+quantum {return None;}
-            let location=SurfaceLocation{cell:first.2,support_xyz:origin,surface_xyz:self.ground_cell_position(first.2)};
+            let surface_xyz=if first.1.state==GroundQueryState::Observed {
+                let mut point=self.cell_position(first.2);
+                point[2]=at([point[0],point[1]]);point
+            } else {self.ground_cell_position_near(first.2,Some(z))};
+            let location=SurfaceLocation{cell:first.2,support_xyz:origin,surface_xyz};
             let connected=self.ground_patch(location,2.0*radius+grid);
             let mut residual=0.0_f64;
             for (point,source,cell) in &samples {

@@ -29,14 +29,45 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SurfaceOwnerFronti
     }
 }
 
-fn capture_surface_owner_frontier_work<T>(prepare: impl FnOnce() -> T) -> (T, usize, usize) {
+#[derive(Clone, Default)]
+struct SurfaceOwnerTomogramWork(Arc<StdMutex<(usize, usize)>>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SurfaceOwnerTomogramWork {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        if event.metadata().target() != "navigation.pct" {
+            return;
+        }
+        #[derive(Default)]
+        struct Build { is_map: bool, cells: Option<usize> }
+        impl tracing::field::Visit for Build {
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                if field.name() == "event" { self.is_map = value == "navigation.pct.map"; }
+            }
+            fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+                if field.name() == "cells" { self.cells = Some(usize::try_from(value).unwrap()); }
+            }
+            fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+        }
+        let mut build = Build::default();
+        event.record(&mut build);
+        if build.is_map {
+            let mut work = self.0.lock().unwrap();
+            work.0 += 1;
+            work.1 += build.cells.expect("actual map construction must report cells");
+        }
+    }
+}
+
+fn capture_surface_owner_work<T>(prepare: impl FnOnce() -> T) -> (T, usize, usize, usize, usize) {
     use tracing_subscriber::prelude::*;
     let work = SurfaceOwnerFrontierWork::default();
+    let tomogram = SurfaceOwnerTomogramWork::default();
     // 同步闭包在真实 owner worker 上执行；只观察本次 prepare，无全局 subscriber。
     let result = tracing::subscriber::with_default(
-        tracing_subscriber::registry().with(work.clone()), prepare);
+        tracing_subscriber::registry().with(work.clone()).with(tomogram.clone()), prepare);
     let (rebuilds, cells) = *work.0.lock().unwrap();
-    (result, rebuilds, cells)
+    let (tomogram_builds, tomogram_cells) = *tomogram.0.lock().unwrap();
+    (result, rebuilds, cells, tomogram_builds, tomogram_cells)
 }
 
 #[derive(Clone)]
@@ -54,6 +85,8 @@ struct SurfaceOwnerCapture {
     private_query: std::sync::Weak<SurfaceSnapshot>,
     frontier_rebuilds: usize,
     frontier_evaluated_cells: usize,
+    tomogram_builds: usize,
+    tomogram_cells: usize,
 }
 
 #[derive(Default)]
@@ -110,8 +143,8 @@ impl ExplorationGoalSource for GatedRealSurfaceSource {
         let private_frontier_before = query.frontier_cache_stats();
         let source_frontier_before = original.snapshot().unwrap().frontier_cache_stats();
         let checkpoint_before = self.source.checkpoint()?;
-        let (prepared, frontier_rebuilds, frontier_evaluated_cells) =
-            capture_surface_owner_frontier_work(|| self.source.prepare_poll(state));
+        let (prepared, frontier_rebuilds, frontier_evaluated_cells, tomogram_builds, tomogram_cells) =
+            capture_surface_owner_work(|| self.source.prepare_poll(state));
         let prepared = prepared?;
         let checkpoint_after = self.source.checkpoint()?;
         let private_frontier_after = query.frontier_cache_stats();
@@ -134,6 +167,8 @@ impl ExplorationGoalSource for GatedRealSurfaceSource {
                 private_query,
                 frontier_rebuilds,
                 frontier_evaluated_cells,
+                tomogram_builds,
+                tomogram_cells,
             });
         // The real source has finished preparing, but no proposal is visible to
         // the actor yet. Take makes the hold one-shot; later progress is real.
@@ -561,6 +596,9 @@ async fn compute_owner_surface_repeated_same_root_receipts_preserve_capture_then
         assert!(source_cells > 0);
         let first_query = &audit.captures[0].private_query;
         let mut rebuilt_cells = 0;
+        let tomogram_size = audit.captures[0].tomogram_cells;
+        assert!(tomogram_size > 0, "the actual owner must build a nonempty first tomogram");
+        let mut built_tomogram_cells = 0;
         for (index, capture) in audit.captures.iter().enumerate() {
             assert_eq!(capture.private_frontier_before.is_none(), index == 0, "capture {index}");
             assert!(capture.private_frontier_after.is_some(), "capture {index}");
@@ -572,6 +610,12 @@ async fn compute_owner_surface_repeated_same_root_receipts_preserve_capture_then
             assert_eq!(capture.frontier_evaluated_cells,
                 if index == 0 { source_cells } else { 0 }, "capture {index}");
             rebuilt_cells += capture.frontier_evaluated_cells;
+            let expected_builds = usize::from(index == 0);
+            assert_eq!(capture.tomogram_builds, expected_builds, "capture {index}");
+            assert_eq!(capture.tomogram_cells, expected_builds * tomogram_size, "capture {index}");
+            built_tomogram_cells += capture.tomogram_cells;
+            eprintln!("surface_owner_tomogram_work capture={index} builds={} cells={} first_cells={tomogram_size}",
+                capture.tomogram_builds, capture.tomogram_cells);
             match capture.preview.as_ref().unwrap() {
                 ExplorationPoll::Goal(_) => assert!(matches!(index, 0 | 1 | 3)),
                 ExplorationPoll::Pending => assert_eq!(index, 2),
@@ -581,6 +625,7 @@ async fn compute_owner_surface_repeated_same_root_receipts_preserve_capture_then
                 capture.frontier_rebuilds, capture.frontier_evaluated_cells);
         }
         assert_eq!(rebuilt_cells, source_cells);
+        assert_eq!(built_tomogram_cells, tomogram_size);
         assert!(snapshot.frontier_cache_stats().is_none());
     }
     finish_surface_owner_success(&handle, request_id, &fresh, &audit).await;
@@ -685,6 +730,8 @@ async fn compute_owner_surface_accepted_cancelled_preserves_newer_receipt_for_ne
     {
         let audit = audit.lock().unwrap();
         assert_eq!(audit.captures.iter().map(|c| c.frontier_rebuilds).collect::<Vec<_>>(), vec![1, 1]);
+        assert_eq!(audit.captures.iter().map(|c| c.tomogram_builds).collect::<Vec<_>>(), vec![1, 1]);
+        assert!(audit.captures.iter().all(|c| c.tomogram_cells > 0));
         assert!(audit.captures.iter().all(|c| c.private_frontier_before.is_none()));
         assert!(audit.captures[0].private_query.upgrade().is_none(), "Retire releases the old query");
         assert!(!std::sync::Weak::ptr_eq(&audit.captures[0].private_query, &audit.captures[1].private_query));
@@ -886,6 +933,8 @@ async fn surface_owner_changed_source_discards_then_progresses(observation_owner
     {
         let audit = audit.lock().unwrap();
         assert_eq!(audit.captures.iter().map(|c| c.frontier_rebuilds).collect::<Vec<_>>(), vec![1, 1]);
+        assert_eq!(audit.captures.iter().map(|c| c.tomogram_builds).collect::<Vec<_>>(), vec![1, 1]);
+        assert!(audit.captures.iter().all(|c| c.tomogram_cells > 0));
         for capture in &audit.captures {
             assert!(capture.private_frontier_before.is_none());
             assert_eq!(capture.frontier_evaluated_cells,

@@ -33,9 +33,27 @@ pub(crate) struct Branch {
     pub partial: Option<bool>,
     pub failure: Option<LocalPlanFailureKind>,
 }
+#[derive(Clone, Debug)]
+pub(crate) struct KernelPhase {
+    pub phase: &'static str,
+    pub wall: Duration,
+}
+#[derive(Clone, Debug)]
+pub(crate) struct ScanPhase {
+    pub branch: usize,
+    pub phase: String,
+    pub exit: String,
+    pub selection: String,
+    pub complete: bool,
+    pub elapsed_ms: f64,
+    pub calls: [u64; 3],
+    pub milliseconds: [f64; 3],
+}
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Frame {
     pub branches: Vec<Branch>,
+    pub kernel_phases: Vec<KernelPhase>,
+    pub scan_phases: Vec<ScanPhase>,
     // No derived reference was recomputed for these exact input cache hits.
     pub reused_failures: Vec<(bool, LocalPlanFailureKind)>,
     pub pct: Vec<PctWork>,
@@ -86,6 +104,20 @@ pub(crate) fn end_control() -> Vec<Admission> {
 }
 pub(crate) fn clock() -> Option<Instant> {
     STATE.with(|s| s.borrow().frame.as_ref().map(|_| Instant::now()))
+}
+pub(crate) struct KernelPhaseGuard { phase: &'static str, at: Option<Instant> }
+pub(crate) fn kernel_phase(phase: &'static str) -> KernelPhaseGuard {
+    KernelPhaseGuard { phase, at: clock() }
+}
+impl Drop for KernelPhaseGuard {
+    fn drop(&mut self) {
+        if let Some(at)=self.at {
+            let wall=at.elapsed();
+            STATE.with(|s| { if let Some(f)=s.borrow_mut().frame.as_mut() {
+                f.kernel_phases.push(KernelPhase { phase: self.phase, wall });
+            }});
+        }
+    }
 }
 pub(crate) fn pct(at: Option<Instant>, stats: Option<SearchStats>) {
     if let Some(at) = at {
@@ -155,6 +187,11 @@ pub(crate) struct Subscriber;
 struct Fields {
     work: SearchWork,
     event: Option<String>,
+    phase: Option<String>,
+    phase_exit: String,
+    selection: String,
+    complete: bool,
+    elapsed_ms: f64,
     request_id: Option<u64>,
     partial: bool,
     covered_end: f64,
@@ -165,14 +202,17 @@ struct Fields {
 impl tracing::field::Visit for Fields {
     fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
     fn record_str(&mut self, f: &tracing::field::Field, v: &str) {
-        if f.name() == "event" {
-            self.event = Some(v.to_owned());
+        match f.name() {
+            "event" => self.event=Some(v.to_owned()),
+            "phase" => self.phase=Some(v.to_owned()),
+            "phase_exit" => self.phase_exit=v.to_owned(),
+            "selection" => self.selection=v.to_owned(),
+            _ => {}
         }
     }
     fn record_bool(&mut self, f: &tracing::field::Field, v: bool) {
-        if f.name() == "partial" {
-            self.partial = v;
-        }
+        if f.name() == "partial" { self.partial = v; }
+        if f.name() == "complete" { self.complete = v; }
     }
     fn record_u64(&mut self, f: &tracing::field::Field, v: u64) {
         match f.name() {
@@ -190,6 +230,7 @@ impl tracing::field::Visit for Fields {
     }
     fn record_f64(&mut self, f: &tracing::field::Field, v: f64) {
         match f.name() {
+            "elapsed_ms" => self.elapsed_ms=v,
             "covered_end" => self.covered_end = v,
             "requested_end" => self.requested_end = v,
             "view_ms" => self.milliseconds[0] = v,
@@ -203,7 +244,7 @@ impl tracing::Subscriber for Subscriber {
     fn enabled(&self, m: &tracing::Metadata<'_>) -> bool {
         matches!(
             m.target(),
-            "navigation.scan.search" | "navigation.scan.profile" | "navigation.scan"
+            "navigation.scan.search" | "navigation.scan.profile" | "navigation.scan.phase" | "navigation.scan"
         )
     }
     fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
@@ -223,6 +264,15 @@ impl tracing::Subscriber for Subscriber {
                     "navigation.scan.search" => {
                         fields.work.branch = f.branches.len().saturating_sub(1);
                         f.searches.push(fields.work);
+                    }
+                    "navigation.scan.phase" => {
+                        f.scan_phases.push(ScanPhase {
+                            branch: f.branches.len().saturating_sub(1),
+                            phase: fields.phase.take().unwrap_or_default(),
+                            exit: fields.phase_exit.clone(), selection: fields.selection.clone(),
+                            complete: fields.complete, elapsed_ms: fields.elapsed_ms,
+                            calls: fields.calls, milliseconds: fields.milliseconds,
+                        });
                     }
                     "navigation.scan.profile" => {
                         f.profile_events += 1;

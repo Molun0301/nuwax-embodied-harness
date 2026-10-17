@@ -241,6 +241,7 @@ impl PlanKernel {
         let token = nuwax_nav_pct::PlanningCancellation::new(cancel.epoch.clone(), cancel.expected);
         let outcome = nuwax_nav_pct::with_planning_cancellation(&token, || {
             if cancel.cancelled() {return Err(vec!["planning superseded".into()]);}
+            #[cfg(test)] let reference_phase = priority_probe::kernel_phase("request_materialization");
             request.scan.reference_corridor_m = self.config.max_path_deviation_m;
             request.scan.horizon_m = request
                 .scan
@@ -258,6 +259,7 @@ impl PlanKernel {
                 )
                 .max(self.config.lookahead_m * 2.0);
             request.materialize_reference().map_err(|e| vec![e])?;
+            #[cfg(test)] drop(reference_phase);
             self.compute_inner(&request, cancel)
         });
         PlanResult { request, outcome }
@@ -274,6 +276,7 @@ impl PlanKernel {
         r: &PlanRequest,
         cancel: &Cancellation,
     ) -> Result<Candidate, Vec<LocalPlanError>> {
+        #[cfg(test)] let map_phase = priority_probe::kernel_phase("map_prepare");
         // Fork on this CPU owner. No cache permission travels back to control.
         let map = r.source.fork_for_planning();
         let prepare = || -> Result<(Arc<nuwax_nav_pct::Tomogram>, Point3), LocalPlanError> {
@@ -296,6 +299,8 @@ impl PlanKernel {
         };
         let (tomogram, center) = prepare().map_err(|e| vec![e])?;
         self.local_map = Some((r.source.clone(), center, tomogram.clone()));
+        #[cfg(test)] drop(map_phase);
+        #[cfg(test)] let policy_phase = priority_probe::kernel_phase("overlay_and_policy");
         let kinematics = self
             .config
             .kinematics()
@@ -324,6 +329,7 @@ impl PlanKernel {
         let prefix_context = progress_policy.map(|p|
             (p.reference.first().copied().map(|v|v.map(f64::to_bits)), p.minimum_distance_m.to_bits()));
         let start = body(&r.pose);
+        #[cfg(test)] drop(policy_phase);
         let mut failures = Vec::new();
         for detour in if r.detour {
             &[true][..]
@@ -380,6 +386,7 @@ impl PlanKernel {
             let mut follow_reference = *detour;
             if let Some(overlay) = recent_guide.as_ref().filter(|overlay|
                 !overlay.is_empty() && reference.windows(2).any(|p|!overlay.accepts(p[0],p[1]))) {
+                #[cfg(test)] let _overlay_phase = priority_probe::kernel_phase("filtered_recent_pct");
                 match tomogram.plan_bounded_with_segment_filter(
                     reference[0], *reference.last().unwrap(), tomogram.resolution,
                     &r.boundary, None, Some(r.scan.horizon_m*1.5), &costs,

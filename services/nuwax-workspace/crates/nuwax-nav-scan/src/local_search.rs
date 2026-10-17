@@ -470,6 +470,7 @@ pub(super) fn plan_progress(
     expansion_limit: usize,
     progress_policy: Option<super::ProgressPrefixPolicy<'_>>,
 ) -> Result<SearchPath, LocalPlanError> {
+    #[cfg(feature="profile")] let setup_phase=super::profile::Phase::begin("search_setup");
     super::cancellation::checkpoint()?;
     validate_caps(motion)?;
     let target = *reference.last().ok_or("近场搜索缺少目标")?;
@@ -602,6 +603,8 @@ pub(super) fn plan_progress(
     let mut closest = start;
     let mut budget_exhausted = false;
     let expansion_limit = effective_expansion_limit(expansion_limit);
+    #[cfg(feature="profile")] drop(setup_phase);
+    #[cfg(feature="profile")] let mut remaining_phase: Option<super::profile::Phase> = None;
     while let Some(Entry(_priority, id)) = open.pop() {
         super::cancellation::checkpoint()?;
         let from = nodes[id].pose;
@@ -623,6 +626,8 @@ pub(super) fn plan_progress(
             eprintln!("ON_POP {}",serde_json::json!({"id":id,"parent":nodes[id].parent,"pose":from,"g":cost,"h":heuristic(from),"translation_h":4.0*remaining(from).0/motion.max_forward_mps,"f":_priority,"remaining":distance(from),"progress":reference_progress(support,reference).1,"cell":tomogram.cell_at(support).map(|i|format!("{:?}",tomogram.cells[i]))}));
         }
         if distance(from) < distance(closest) {closest=from;}
+        #[cfg(feature="profile")]
+        let mut root_phase = (id == 0).then(|| super::profile::Phase::begin("root_connector"));
         // 终端区域内优先尝试完整直线接续；离散动作只用于绕过确实阻挡直线的障碍。
         // 解析接续避免用交替左右固定角度去逼近一个本来可以直达的交接横截面。
         let mut connection=None;
@@ -688,10 +693,17 @@ pub(super) fn plan_progress(
                 if admitted(super::rotate(map,&mut prefix,heading,motion,boundary),&mut rejected_sample)?.is_none(){continue;}
             }
             if reach(*prefix.last().unwrap()) {
+                #[cfg(feature="profile")] if let Some(phase)=root_phase.as_mut() {
+                    phase.finish("full"); phase.selected(if turn.abs()<1e-8 {"line"} else {"arc"});
+                }
                 connection=Some(prefix);break;
             }
         }
         if reached || connection.is_some() {
+            #[cfg(feature="profile")] if reached { if let Some(phase)=root_phase.as_mut() {
+                phase.finish("full"); phase.selected("already_reached");
+            }}
+            #[cfg(feature="profile")] if let Some(phase)=remaining_phase.as_mut() {phase.finish("full");}
             let mut chain = Vec::new();
             let mut current = id;
             while let Some(parent) = nodes[current].parent {
@@ -710,6 +722,11 @@ pub(super) fn plan_progress(
             }
             super::cancellation::checkpoint()?;
             return Ok(SearchPath {poses:path,partial:false});
+        }
+        #[cfg(feature="profile")] {
+            if let Some(phase)=root_phase.as_mut() {phase.finish("miss");}
+            drop(root_phase);
+            if remaining_phase.is_none() {remaining_phase=Some(super::profile::Phase::begin("search_remaining"));}
         }
         expanded += 1;
         if expanded > expansion_limit {
@@ -827,8 +844,14 @@ pub(super) fn plan_progress(
                 progress_m=progress-initial_progress,poses=poses.len(),expanded,
                 "原预算耗尽后交付有前向进度的有限候选，原目标保持未到达");
             let partial=!reach(*poses.last().unwrap());
+            #[cfg(feature="profile")] if let Some(phase)=remaining_phase.as_mut() {
+                phase.finish(if partial {"partial"} else {"full"});
+            }
             return Ok(SearchPath {poses,partial});
         }
+    }
+    #[cfg(feature="profile")] if let Some(phase)=remaining_phase.as_mut() {
+        phase.finish(if budget_exhausted {"budget_exhausted"} else {"search_exhausted"});
     }
     // Neither a drained discretized search nor an expansion limit proves obstruction.
     Err(LocalPlanError {

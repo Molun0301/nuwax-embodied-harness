@@ -4,6 +4,7 @@
 mod partial_route_priority_tests {
     include!("route_partial_rejoin_tests.rs");
     include!("route_repeated_detour_tests.rs");
+    include!("route_phase_qualification_tests.rs");
     use super::*;
     use crate::route_planning::priority_probe as probe;
     use nuwax_nav_mls_planner::{SurfaceObservation, SurfaceObservations};

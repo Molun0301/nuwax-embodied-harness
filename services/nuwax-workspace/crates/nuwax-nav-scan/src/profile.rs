@@ -41,6 +41,7 @@ impl Scope {
         follow_reference: bool,
         prefer_straight: bool,
     ) -> Self {
+        #[cfg(test)] PHASE_RECORDS.with(|phases| phases.borrow_mut().clear());
         COUNTERS.with(|c| {
             *c.borrow_mut() = Counters {
                 active: true,
@@ -73,3 +74,77 @@ impl Drop for Scope {
 
 #[cfg(test)]
 pub(crate) fn calls() -> [u64; 3] { COUNTERS.with(|c| c.borrow().calls) }
+
+
+// Opt-in observations only. These scopes partition the existing call; they never
+// replay a projection, grant clearance, or select a candidate.
+#[derive(Clone, Copy, Default)]
+struct Snapshot {
+    calls: [u64; 3],
+    milliseconds: [f64; 3],
+    success: bool,
+}
+fn snapshot() -> Snapshot {
+    COUNTERS.with(|c| {
+        let c = c.borrow();
+        Snapshot { calls: c.calls, milliseconds: c.milliseconds, success: c.success }
+    })
+}
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct PhaseRecord {
+    pub phase: &'static str,
+    pub exit: &'static str,
+    pub selection: &'static str,
+    pub complete: bool,
+    pub elapsed_ms: f64,
+    pub calls: [u64; 3],
+    pub milliseconds: [f64; 3],
+}
+#[cfg(test)]
+thread_local! { static PHASE_RECORDS: RefCell<Vec<PhaseRecord>> = const { RefCell::new(Vec::new()) }; }
+#[cfg(test)]
+pub(crate) fn take_phases() -> Vec<PhaseRecord> {
+    PHASE_RECORDS.with(|phases| std::mem::take(&mut *phases.borrow_mut()))
+}
+pub(crate) struct Phase {
+    phase: &'static str,
+    exit: &'static str,
+    selection: &'static str,
+    began: Instant,
+    before: Snapshot,
+}
+impl Phase {
+    pub(crate) fn begin(phase: &'static str) -> Self {
+        Self { phase, exit: "return_or_error", selection: "none",
+            began: Instant::now(), before: snapshot() }
+    }
+    pub(crate) fn next(&mut self, phase: &'static str) {
+        self.exit = "continued";
+        self.emit();
+        self.phase = phase;
+        self.exit = "return_or_error";
+        self.selection = "none";
+        self.before = snapshot();
+        self.began = Instant::now();
+    }
+    pub(crate) fn finish(&mut self, exit: &'static str) { self.exit = exit; }
+    pub(crate) fn selected(&mut self, selection: &'static str) { self.selection = selection; }
+    fn emit(&self) {
+        let elapsed_ms = self.began.elapsed().as_secs_f64() * 1000.0;
+        let after = snapshot();
+        let calls = std::array::from_fn::<_,3,_>(|i| after.calls[i] - self.before.calls[i]);
+        let milliseconds = std::array::from_fn::<_,3,_>(|i| after.milliseconds[i] - self.before.milliseconds[i]);
+        let complete = self.exit == "full" || after.success && !self.before.success;
+        tracing::info!(target: "navigation.scan.phase", event="navigation.scan.phase",
+            phase=self.phase, phase_exit=self.exit, selection=self.selection, complete,
+            elapsed_ms, view_calls=calls[0], project_calls=calls[1], sweep_calls=calls[2],
+            view_ms=milliseconds[0], project_ms=milliseconds[1], sweep_ms=milliseconds[2],
+            "existing Scan phase observations");
+        #[cfg(test)] PHASE_RECORDS.with(|phases| phases.borrow_mut().push(PhaseRecord {
+            phase: self.phase, exit: self.exit, selection: self.selection, complete,
+            elapsed_ms, calls, milliseconds,
+        }));
+    }
+}
+impl Drop for Phase { fn drop(&mut self) { self.emit(); } }

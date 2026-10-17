@@ -117,6 +117,7 @@ impl FrozenSurfaceInput {
     pub fn fork_for_planning(&self) -> FrozenSurfacePlanningInput {
         FrozenSurfacePlanningInput {
             original: self.clone(),
+            tomogram: Arc::new(nuwax_nav_pct::PctPlanner::default()),
             query_view: self
                 .snapshot
                 .as_ref()
@@ -155,6 +156,9 @@ impl FrozenSurfaceInput {
 pub struct FrozenSurfacePlanningInput {
     original: FrozenSurfaceInput,
     query_view: Option<Arc<SurfaceSnapshot>>,
+    // Only map() is used: route penalties and search budgets never enter selection.
+    // Share and release this existing planner with the qualified private query pair.
+    tomogram: Arc<nuwax_nav_pct::PctPlanner>,
 }
 
 impl FrozenSurfacePlanningInput {
@@ -167,6 +171,7 @@ impl FrozenSurfacePlanningInput {
         Some(Self {
             original: captured.clone(),
             query_view: self.query_view.clone(),
+            tomogram: Arc::clone(&self.tomogram),
         })
     }
 
@@ -438,7 +443,7 @@ impl SurfaceGoalSourceAdapter {
         let outcome = self.evaluate_poll(
             state,
             &input.original,
-            input.query_view.as_ref(),
+            Some(input),
             &mut delta,
         );
         Ok(self.stage_poll(outcome, delta))
@@ -448,7 +453,7 @@ impl SurfaceGoalSourceAdapter {
         &self,
         state: &ExplorationStateSnapshot<'_>,
         input: &FrozenSurfaceInput,
-        query_view: Option<&Arc<SurfaceSnapshot>>,
+        planning: Option<&FrozenSurfacePlanningInput>,
         delta: &mut SurfacePollDelta,
     ) -> ExploreResult<ExplorationPoll> {
         if !self.active {
@@ -504,6 +509,7 @@ impl SurfaceGoalSourceAdapter {
         // Existing synchronous callers retain their cache behavior. A compute owner
         // may supply private caches, but all identity tests and consumption stamps
         // still refer to the original frozen source, never its planning fork.
+        let query_view = planning.and_then(FrozenSurfacePlanningInput::query_snapshot);
         let snapshot = query_view.unwrap_or(source_snapshot);
         // An unchanged-input wait cannot select a frontier. Its private fork
         // will be discarded, so only retain the required body/support checks
@@ -542,10 +548,19 @@ impl SurfaceGoalSourceAdapter {
             .map_err(|error| ExploreError::SourceError(error.to_string()))?;
         let mut candidates = geometry.candidates;
         let observation_targets = geometry.targets;
-        // One immutable PCT map serves every candidate and regional route query
-        // in this poll. Unknown states remain request-local inside PCT searches.
-        let tomogram = nuwax_nav_pct::Tomogram::from_surface(snapshot)
+        // Only the immutable map follows the owner's qualified private query lifetime.
+        // Unknown states, penalties and budgets remain request-local; synchronous
+        // callers without a planning pair keep the original uncached builder.
+        let cached = planning.map(|input| input.tomogram.map(snapshot)).transpose()
             .map_err(ExploreError::SourceError)?;
+        let uncached;
+        let tomogram = if let Some(map) = cached.as_deref() {
+            map
+        } else {
+            uncached = nuwax_nav_pct::Tomogram::from_surface(snapshot)
+                .map_err(ExploreError::SourceError)?;
+            &uncached
+        };
         let planar_bias = if snapshot.body_envelope().is_none() {
             tomogram.calibrated_reference_height(robot_support)
                 .map(|height| robot_support[2] - height)
@@ -2032,6 +2047,9 @@ mod tests {
         assert_eq!(rebound.original_input().notification(), captured.notification() + 1);
         assert!(Arc::ptr_eq(rebound.original_input().snapshot().unwrap(), &receipt));
         assert!(Arc::ptr_eq(planning.query_snapshot().unwrap(), rebound.query_snapshot().unwrap()));
+        assert!(Arc::ptr_eq(&planning.tomogram, &rebound.tomogram));
+        let derived_map = planning.tomogram.map(planning.query_snapshot().unwrap()).unwrap();
+        assert!(Arc::ptr_eq(&derived_map, &rebound.tomogram.map(rebound.query_snapshot().unwrap()).unwrap()));
         assert_eq!(planning.original_input().notification(), captured.notification());
         assert!(!Arc::ptr_eq(planning.query_snapshot().unwrap(), &snapshot));
         let changed = vec![
@@ -2042,18 +2060,127 @@ mod tests {
             Arc::new(snapshot.with_recent_obstacle_points(1, 1, 0, &[],
                 std::iter::empty::<(u32, [f64; 3])>()).unwrap()),
             Arc::new(snapshot.with_virtual_obstacles([0.0, 0.0], 0.1, 20, 20, &vec![false; 400]).unwrap()),
+            Arc::new(snapshot.as_ref().clone().with_body_envelope(nuwax_nav_mls_planner::SurfaceBodyEnvelope {
+                footprint_xy_m: vec![[-0.1, -0.1], [0.1, -0.1], [0.1, 0.1], [-0.1, 0.1]],
+                z_bounds_m: [-0.05, 0.2], body_to_support_z_m: 0.3,
+                max_step_up_m: 0.2, max_step_down_m: 0.2, max_cross_slope_deg: 15.0,
+                support_uncertainty_m: 0.0,
+            }).unwrap()),
         ];
         for source in changed {
             receiver.observe(source).unwrap();
             let changed = receiver.freeze().unwrap();
             assert!(!captured.same_source_view(&changed));
             assert!(planning.rebind_original(&changed).is_none());
+            let cold = changed.fork_for_planning();
+            assert!(!Arc::ptr_eq(&planning.tomogram, &cold.tomogram));
+            let rebuilt = cold.tomogram.map(cold.query_snapshot().unwrap()).unwrap();
+            assert!(!Arc::ptr_eq(&derived_map, &rebuilt));
+            assert!(rebuilt.matches_surface(cold.query_snapshot().unwrap()));
         }
         receiver.clear().unwrap();
         let absent = receiver.freeze().unwrap();
         assert!(planning.rebind_original(&absent).is_none());
         assert!(absent.fork_for_planning().rebind_original(&absent).is_none());
         assert!(snapshot.frontier_cache_stats().is_none());
+    }
+
+    #[test]
+    fn planning_tomogram_lives_only_with_its_query_pair_and_rebound_clones() {
+        let receiver = SurfaceInputReceiver::new();
+        let snapshot = map();
+        receiver.observe(snapshot.clone()).unwrap();
+        let planning = receiver.freeze().unwrap().fork_for_planning();
+        let derived = planning.tomogram.map(planning.query_snapshot().unwrap()).unwrap();
+        assert!(!derived.cells.is_empty());
+        let weak_map = Arc::downgrade(&derived);
+        let weak_planner = Arc::downgrade(&planning.tomogram);
+        let weak_query = Arc::downgrade(planning.query_snapshot().unwrap());
+        drop(derived);
+        receiver.observe(snapshot).unwrap();
+        let rebound = planning.rebind_original(&receiver.freeze().unwrap()).unwrap();
+        drop(planning);
+        assert!(weak_map.upgrade().is_some());
+        assert!(weak_planner.upgrade().is_some());
+        assert!(weak_query.upgrade().is_some());
+        // The compute owner clears this same pair on Stop/Discard/retire/config loss.
+        drop(rebound);
+        assert!(weak_map.upgrade().is_none());
+        assert!(weak_planner.upgrade().is_none());
+        assert!(weak_query.upgrade().is_none());
+    }
+
+    #[test]
+    fn planning_tomogram_does_not_import_route_penalties_or_search_budget() {
+        let receiver = SurfaceInputReceiver::new();
+        receiver.observe(map()).unwrap();
+        let frozen = receiver.freeze().unwrap();
+        let clean = frozen.fork_for_planning();
+        let mut noisy = frozen.fork_for_planning();
+        noisy.tomogram = Arc::new(nuwax_nav_pct::PctPlanner::default()
+            .with_search_limits(nuwax_nav_pct::SearchLimits { max_states: 1 }));
+        noisy.tomogram.report_local_blockage([1.05, 1.05, 0.05], 100.0);
+        assert!(!noisy.tomogram.local_costs().is_empty());
+        let mut normal = source(receiver.clone(), 1);
+        let mut constrained = source(receiver, 1);
+        let current = state(0.4, 1);
+        let expected = normal.prepare_poll_with_planning_input(&current, &clean).unwrap();
+        let actual = constrained.prepare_poll_with_planning_input(&current, &noisy).unwrap();
+        assert!(matches!(expected.outcome(), Ok(ExplorationPoll::Goal(_))));
+        assert_eq!(actual.outcome(), expected.outcome());
+        assert_eq!(normal.commit_prepared_poll().unwrap(), constrained.commit_prepared_poll().unwrap());
+        assert_eq!(committed(&normal), committed(&constrained));
+    }
+
+    #[test]
+    fn planning_tomogram_warm_map_does_not_bypass_actual_body_recent_collision() {
+        let snapshot = map().as_ref().clone().with_body_envelope(
+            nuwax_nav_mls_planner::SurfaceBodyEnvelope {
+                footprint_xy_m: vec![[-0.8, -0.12], [0.8, -0.12], [0.8, 0.12], [-0.8, 0.12]],
+                z_bounds_m: [-0.05, 0.2], body_to_support_z_m: 0.3,
+                max_step_up_m: 0.2, max_step_down_m: 0.2, max_cross_slope_deg: 15.0,
+                support_uncertainty_m: 0.0,
+            }).unwrap();
+        let snapshot = Arc::new(snapshot.with_recent_obstacle_points(1, 1_000_000_000, 0,
+            &[], [(0, [-0.25, 1.05, 0.45])]).unwrap());
+        let q = snapshot.body_orientation_at([0.15, 1.05, 0.1], std::f64::consts::PI).unwrap();
+        let body = snapshot.body_position_from_support([0.15, 1.05, 0.1], q, 0.3).unwrap();
+        assert_eq!(snapshot.validate_body_pose(body, q),
+            Err(nuwax_nav_mls_planner::SurfaceError::InsufficientClearance));
+        let receiver = SurfaceInputReceiver::new();
+        receiver.observe(snapshot).unwrap();
+        let planning = receiver.freeze().unwrap().fork_for_planning();
+        let cached = planning.tomogram.map(planning.query_snapshot().unwrap()).unwrap();
+        assert!(!cached.cells.is_empty());
+        let mut adapter = source(receiver, 1);
+        let mut current = state(0.4, 1);
+        current.robot_pose.pose.position = Point3::new(body[0], body[1], body[2]);
+        current.robot_pose.pose.orientation = Quaternion { x: q[0], y: q[1], z: q[2], w: q[3] };
+        let result = adapter.prepare_poll_with_planning_input(&current, &planning).unwrap();
+        assert!(matches!(result.outcome(), Ok(ExplorationPoll::SourceUnavailable(reason))
+            if reason.starts_with("current body geometry:")));
+        assert!(Arc::ptr_eq(&cached, &planning.tomogram.map(planning.query_snapshot().unwrap()).unwrap()));
+        adapter.discard_prepared_poll().unwrap();
+    }
+
+    #[test]
+    fn planning_tomogram_rejects_cancelled_map_lookup_with_cold_and_warm_pairs() {
+        let receiver = SurfaceInputReceiver::new();
+        receiver.observe(map()).unwrap();
+        let frozen = receiver.freeze().unwrap();
+        for warm in [false, true] {
+            let planning = frozen.fork_for_planning();
+            let previous = warm.then(|| planning.tomogram.map(planning.query_snapshot().unwrap()).unwrap());
+            let token = nuwax_nav_pct::PlanningCancellation::from_flag(Arc::new(
+                std::sync::atomic::AtomicBool::new(true)));
+            let result = nuwax_nav_pct::with_planning_cancellation(&token, ||
+                planning.tomogram.map(planning.query_snapshot().unwrap()));
+            assert_eq!(result.unwrap_err(), "层析规划已取消");
+            assert!(!nuwax_nav_pct::planning_cancelled());
+            let current = planning.tomogram.map(planning.query_snapshot().unwrap()).unwrap();
+            if let Some(previous) = previous { assert!(Arc::ptr_eq(&previous, &current)); }
+            assert!(Arc::ptr_eq(&current, &planning.tomogram.map(planning.query_snapshot().unwrap()).unwrap()));
+        }
     }
 
     #[test]

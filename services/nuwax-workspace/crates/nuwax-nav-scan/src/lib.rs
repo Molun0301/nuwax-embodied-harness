@@ -497,6 +497,8 @@ fn plan_impl(
 ) -> Result<LocalTrajectory, LocalPlanError> {
     #[cfg(feature="profile")]
     let _profile=profile::Scope::begin(start,reference,kinematics,config,final_yaw,arrival,follow_reference,prefer_straight);
+    #[cfg(feature="profile")]
+    let mut phase = profile::Phase::begin("scan_setup");
     cancellation::checkpoint()?;
     local_search::validate_caps(kinematics)?;
     let began = std::time::Instant::now();
@@ -526,6 +528,7 @@ fn plan_impl(
     let centers = [(xmin + radius).min(0.0), (xmax - radius).max(0.0)];
     let mut failures = Vec::new();
     let interior = arrival.map(|(goal, tolerance)| (goal, tolerance * 0.8));
+    #[cfg(feature="profile")] phase.next("quick_direct");
     // 可执行直线优先保留，不用初始偏航或墙距梯度把它改成蛇形。
     if let Some(&end)=reference.last() {
         let origin=reference[0];
@@ -571,6 +574,7 @@ fn plan_impl(
             }
         }
     }
+    #[cfg(feature="profile")] phase.next("quick_step_turn");
     // 台阶后紧接转弯时，先给完整机身留出离开阶边的空间。该参考候选
     // 与普通折线共用全部真实机体检查；失败不修改地图、代价或运动能力。
     if let Some(guide) = step_turn::guide(map, tomogram, reference, config, arrival.is_some(), boundary)? {
@@ -593,6 +597,7 @@ fn plan_impl(
             }
         }
     }
+    #[cfg(feature="profile")] phase.next("quick_rejoin");
     // 已沿局部走廊前进后，粗参考的近处折点可能落在侧后方。
     // 尝试从实际位置直达较远的参考折点，保留末段切向供下一窗口接续。
     // 完整候选仍核验地形、机体和转向，不能用仅中心可见或整窗直弦切掉真正转角。
@@ -633,6 +638,7 @@ fn plan_impl(
     // 先沿参考直段生成仅在拐点圆滑的样条；碰撞距离优化只用于受阻候选。
     // 无条件推动全部控制点会把可通行的直段也推向离散墙距梯度，产生无必要的蛇形。
     for optimize_obstacles in [false, true] {
+        #[cfg(feature="profile")] phase.next(if optimize_obstacles {"quick_spline_optimized"} else {"quick_spline_reference"});
         cancellation::checkpoint()?;
         let controls = if optimize_obstacles { spline::optimize(
             reference,
@@ -677,6 +683,7 @@ fn plan_impl(
             }
         }
     }
+    #[cfg(feature="profile")] phase.next("quick_polyline_interior");
     // 极窄空间可能需要显式转向；原折线也经过同一真实地形及机体检查。
     let sampled = spline::resample(reference, spacing)?;
     #[cfg(test)]
@@ -696,6 +703,7 @@ fn plan_impl(
         Err(error) if matches!(error.kind, LocalPlanFailureKind::Cancelled) => return Err(error),
         Err(error) => error,
     };
+    #[cfg(feature="profile")] phase.next("quick_passage");
     // 细门缝的中线可能落在全局粗格之间，直接使用近场真实占据给出的连续空隙。
     let mut attempted = 0;
     for pair in reference.windows(2) {
@@ -756,6 +764,7 @@ fn plan_impl(
             }
         }
     }
+    #[cfg(feature="profile")] phase.next("quick_polyline_arrival");
     // Without an arrival ball, interior and arrival are both None: the exact
     // original polyline already failed on this immutable request snapshot. Keep
     // its full error, while still observing cancellation after passage attempts.
@@ -777,6 +786,7 @@ fn plan_impl(
         Err(polyline) => {
             if matches!(polyline.kind, LocalPlanFailureKind::Cancelled) { return Err(polyline); }
             cancellation::checkpoint()?;
+            #[cfg(feature="profile")] phase.next("search_prepare");
             // 后备搜索也遵守起步方向：可原地完成后方转向时先对齐，
             // 不能因样条失败又把尚未完成的转向混进前进动作。
             let mut prefix=vec![start];
@@ -789,6 +799,7 @@ fn plan_impl(
                 && admit_candidate(rotate(map,&mut prefix,departure,kinematics,boundary))?.is_some() {
                 *prefix.last().unwrap()
             }else{start};
+            #[cfg(feature="profile")] drop(phase);
             merge_search_result(local_search::plan_progress(
             map,
             tomogram,
@@ -828,6 +839,8 @@ mod tests {
     use nuwax_nav_types_messages::MotionModel;
     use std::{collections::BTreeMap, sync::Arc};
     include!("progress_prefix_tests.rs");
+    #[cfg(feature="profile")]
+    include!("phase_qualification_tests.rs");
     pub(super) fn motion() -> MotionKinematics {
         MotionKinematics {
             model: MotionModel::Differential,

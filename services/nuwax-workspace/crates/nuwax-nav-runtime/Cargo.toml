@@ -33,5 +33,7 @@ prost = { workspace = true }
 default = []
 # Opt-in construction seam for cross-crate recovery qualification tests.
 surface-recovery-qualification = []
+# Bounded capture of one actual owner request for offline h-only qualification.
+local-guidance-qualification = ["surface-recovery-qualification", "nuwax-nav-scan/local-guidance-qualification"]
 # Opt-in wall-time attribution only; no production navigation option.
 body-query-profile = ["nuwax-nav-mls-planner/body-query-profile"]

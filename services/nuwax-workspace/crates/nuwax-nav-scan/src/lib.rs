@@ -1,6 +1,9 @@
 //! Scan式路线引导近场规划：优化三次样条，按真实地形生成可执行机体轨迹。
 //! 全局层析路线只作参考，局部轨迹在有限视距内处理转向、机体碰撞与接触。
 mod cancellation;
+/// Opt-in bounded phase/work observations; does not select a strategy.
+#[cfg(feature="local-guidance-qualification")]
+pub mod local_guidance_qualification;
 mod local_search;
 mod spline;
 mod step_turn;

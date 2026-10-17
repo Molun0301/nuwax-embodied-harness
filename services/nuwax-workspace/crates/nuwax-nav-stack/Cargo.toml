@@ -33,6 +33,8 @@ description = "Navigation stack orchestration for the nuwax robot platform (prof
 # ============================================================
 [features]
 default = []
+# Explicit ignored qualification selectors, never a navigation default.
+local-guidance-qualification = ["surface-recovery-qualification", "nuwax-nav-runtime/local-guidance-qualification"]
 # Opt-in real-owner/worker recovery qualification; absent from default builds.
 surface-recovery-qualification = [
     "mls",

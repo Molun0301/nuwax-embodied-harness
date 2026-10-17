@@ -9,6 +9,8 @@ publish.workspace = true
 description = "路线引导的近场三次样条与三维机体轨迹"
 
 [features]
+# Explicit cross-crate observations only; no strategy or resource override.
+local-guidance-qualification = ["profile"]
 profile = ["dep:serde_json"]
 
 [dependencies]

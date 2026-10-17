@@ -83,6 +83,8 @@ struct SearchWork {
 }
 impl Drop for SearchWork {
     fn drop(&mut self) {
+        #[cfg(feature="local-guidance-qualification")]
+        super::local_guidance_qualification::record_work([self.expanded,self.candidates,self.sweeps,self.nodes,self.frontier_peak]);
         tracing::debug!(target: "navigation.scan.search", expanded=self.expanded,
             candidates=self.candidates, sweeps=self.sweeps, nodes=self.nodes,
             frontier_peak=self.frontier_peak, "bounded local search work");

@@ -229,6 +229,12 @@ Scan 预算与 partial 首点/最小进度纳入真实资格；共享 PctPlanner
 
 原晚到路径进展失败、真实网络/ARM限制仍保留。新的5cm诊断另外发现旧Wall测试把无边界未知域当成禁止域；该测试契约正在独立纠正，不混入本性能补丁，也不追溯改判旧失败。
 
+## 第十二阶段：真实来源与测试世界诊断（闭环仍有失败）
+
+新增显式真实输入捕获、fixed-recent测量资格、无mask平地与显式mask许可域测试。默认导航策略不变。默认/显式构建通过，16项纯控制和preflight通过；3项新live测试失败，fixedWall未运行，不能称为完整导航资格通过。旧Wall观测域前提冲突、新时序碰撞、fixedBox晚到绕行分别保留和归因。
+
+诊断自身的fork-owner误断言已修正：原request source用于账本关联，实际planning fork用于复放，二者不能用owner相等替代数据继承关系。两个真实fork接缝回归通过，合成admission不是实际h资格。详细结果、守卫与时序边界、可重跑入口见 [真实owner资格记录](navigation-real-owner-qualification-20261017.md)。后续仍需实际分支和actor时序观测，未实施新选择策略或延长超时。
+
 ## 后续持续检查
 
 1. 墙前晚到路径的实际恢复与初始 full/partial/PCT 顺序，保留及时移动和真实避障

@@ -404,6 +404,8 @@ impl PlanKernel {
             let straight = r.straight && !follow_reference;
             #[cfg(test)] let branch_at=priority_probe::branch_begin(*detour,follow_reference,straight,
                 &r.reference,&reference,false);
+            #[cfg(feature="local-guidance-qualification")]
+            let qualification=crate::local_guidance_qualification::begin(r);
             let result = {
                 let result = nuwax_nav_scan::plan_with_progress(
                     &map,
@@ -444,6 +446,9 @@ impl PlanKernel {
                 }
                 result
             };
+            #[cfg(feature="local-guidance-qualification")]
+            crate::local_guidance_qualification::finish(qualification,r,&map,&tomogram,
+                &reference,&kinematics,*detour,follow_reference,straight,progress_policy,&result);
             #[cfg(test)] priority_probe::branch_end(branch_at,&result);
             match result {
                 Ok(trajectory) => {

@@ -39,6 +39,9 @@ pub mod surface_changes;
 mod route_follower;
 mod planning_owner;
 mod route_planning;
+/// Explicit, bounded real-input capture for ignored cross-crate qualifications.
+#[cfg(feature="local-guidance-qualification")]
+pub mod local_guidance_qualification;
 #[cfg(test)]
 mod route_moving_worker_tests;
 #[cfg(test)]

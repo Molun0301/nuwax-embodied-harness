@@ -41,7 +41,7 @@ impl Scope {
         follow_reference: bool,
         prefer_straight: bool,
     ) -> Self {
-        #[cfg(test)] PHASE_RECORDS.with(|phases| phases.borrow_mut().clear());
+        #[cfg(any(test,feature="local-guidance-qualification"))] PHASE_RECORDS.with(|phases| phases.borrow_mut().clear());
         COUNTERS.with(|c| {
             *c.borrow_mut() = Counters {
                 active: true,
@@ -90,9 +90,9 @@ fn snapshot() -> Snapshot {
         Snapshot { calls: c.calls, milliseconds: c.milliseconds, success: c.success }
     })
 }
-#[cfg(test)]
-#[derive(Debug)]
-pub(crate) struct PhaseRecord {
+#[cfg(any(test,feature="local-guidance-qualification"))]
+#[derive(Clone, Debug)]
+pub struct PhaseRecord {
     pub phase: &'static str,
     pub exit: &'static str,
     pub selection: &'static str,
@@ -101,9 +101,9 @@ pub(crate) struct PhaseRecord {
     pub calls: [u64; 3],
     pub milliseconds: [f64; 3],
 }
-#[cfg(test)]
+#[cfg(any(test,feature="local-guidance-qualification"))]
 thread_local! { static PHASE_RECORDS: RefCell<Vec<PhaseRecord>> = const { RefCell::new(Vec::new()) }; }
-#[cfg(test)]
+#[cfg(any(test,feature="local-guidance-qualification"))]
 pub(crate) fn take_phases() -> Vec<PhaseRecord> {
     PHASE_RECORDS.with(|phases| std::mem::take(&mut *phases.borrow_mut()))
 }
@@ -141,7 +141,7 @@ impl Phase {
             elapsed_ms, view_calls=calls[0], project_calls=calls[1], sweep_calls=calls[2],
             view_ms=milliseconds[0], project_ms=milliseconds[1], sweep_ms=milliseconds[2],
             "existing Scan phase observations");
-        #[cfg(test)] PHASE_RECORDS.with(|phases| phases.borrow_mut().push(PhaseRecord {
+        #[cfg(any(test,feature="local-guidance-qualification"))] PHASE_RECORDS.with(|phases| phases.borrow_mut().push(PhaseRecord {
             phase: self.phase, exit: self.exit, selection: self.selection, complete,
             elapsed_ms, calls, milliseconds,
         }));

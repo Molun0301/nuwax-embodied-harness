@@ -12,7 +12,13 @@ use nuwax_nav_runtime::{AppliedProof, BoundedTwistOutcome, CommandDispatchBound,
 use nuwax_nav_types_messages::{MotionLimits, MotionModel, NavigationCapabilities,
     RobotGeometry, TerrainLimits};
 
+mod wall_world { include!("surface_wall_world_qualification.rs"); }
 mod dense_recent { include!("surface_dense_recent_qualification.rs"); }
+#[cfg(feature="local-guidance-qualification")]
+mod local_guidance {
+    include!("surface_local_guidance_qualification.rs");
+}
+mod static_source_only { include!("surface_static_source_only_qualification.rs"); }
 
 const SAMPLE_PERIOD: Duration = Duration::from_millis(200);
 const QUALIFICATION_WINDOW: Duration = Duration::from_secs(60);
@@ -231,6 +237,7 @@ struct SourceRecord {
     authority:GuardedMapAuthority,root:nuwax_map_chunks::RootIdentity,
     root_geometry_revision:u64,retained_cells:usize,ground_count:usize,obstacle_count:usize,
     all_keys_exact:bool,all_observed_ns_current:bool,obstacle_hits_min:u16,obstacle_hits_max:u16,
+    declared_world: wall_world::World, wire_mask_matches_declared_world: bool,
 }
 #[derive(Clone)]
 struct SensorControl {stage:Stage,scene:Scene}
@@ -992,7 +999,7 @@ struct OccupancyHarness {
     plant: Arc<Mutex<Plant>>, sensor: Arc<Mutex<SensorControl>>,
     evidence: Arc<Mutex<Evidence>>, feeder: tokio::task::JoinHandle<()>,
     observers: Vec<tokio::task::JoinHandle<()>>, goal: Option<schema::GoalEnvelope>,
-    started: Instant, local_planning_enabled: bool, scene:Scene, insertion:Option<(Instant,BodyPose,u64)>, wall_hold:Option<(MotionEvent,Instant)>,
+    started: Instant, local_planning_enabled: bool, scene:Scene, world:wall_world::World, insertion:Option<(Instant,BodyPose,u64)>, wall_hold:Option<(MotionEvent,Instant)>,
 }
 impl OccupancyHarness {
     async fn start(local_planning_enabled: bool,scene:Scene) -> Self {
@@ -1001,6 +1008,29 @@ impl OccupancyHarness {
     // An explicit new load case; original entry points always select None.
     async fn start_with_dense_recent(local_planning_enabled: bool,scene:Scene,
         dense_log:Option<Arc<Mutex<Vec<dense_recent::PublishedDenseScan>>>>) -> Self {
+        Self::start_with_recent_stage(local_planning_enabled,scene,dense_log,None).await
+    }
+    // Only the new static-source case overrides recent GEOMETRY. SensorControl
+    // remains the persistent/physical stage; source time is always newly sampled.
+    async fn start_with_recent_stage(local_planning_enabled: bool,scene:Scene,
+        dense_log:Option<Arc<Mutex<Vec<dense_recent::PublishedDenseScan>>>>,
+        recent_stage_override:Option<Stage>) -> Self {
+        Self::start_with_recent_stage_and_world(local_planning_enabled,scene,dense_log,
+            recent_stage_override,wall_world::World::LegacyObservedSupport).await
+    }
+    async fn start_in_world(local_planning_enabled:bool,scene:Scene,world:wall_world::World)->Self {
+        Self::start_with_recent_stage_and_world(local_planning_enabled,scene,None,None,world).await
+    }
+    // A new named world contract. Existing selectors retain the legacy contract.
+    async fn start_with_recent_stage_and_world(local_planning_enabled: bool,scene:Scene,
+        dense_log:Option<Arc<Mutex<Vec<dense_recent::PublishedDenseScan>>>>,
+        recent_stage_override:Option<Stage>,world:wall_world::World)->Self {
+        assert!(world==wall_world::World::LegacyObservedSupport || scene==Scene::Wall);
+        // Declared world bounds and recent measurement geometry are orthogonal.
+        // The static-source-only diagnostic may reuse this constructor unchanged.
+        assert!(world==wall_world::World::LegacyObservedSupport || dense_log.is_none());
+        assert!(recent_stage_override.is_none() || dense_log.is_none(),
+            "recent geometry override and dense load are distinct qualification cases");
         let started=Instant::now();
         use crate::topics::{NavTopicConfig,TopicName};
         let config=calibrated_config(local_planning_enabled);
@@ -1093,7 +1123,10 @@ impl OccupancyHarness {
                 writer.observe(retained.iter().copied(),stamp as u64).unwrap(); revision+=1;
                 let root=writer.snapshot(Domain {session:"memq-dynamic-occupancy-map".into(),generation:1,
                     frame_generation:1,producer_generation:17},revision as u64,stamp as u64).unwrap();
-                let map=map_from_fine(&root,&repository);
+                let mut map=map_from_fine(&root,&repository);
+                world.declare_on_wire(&mut map);
+                let wire_mask_matches_declared_world=world.wire_matches(&map);
+                assert!(wire_mask_matches_declared_world);
                 let payload=schema::encode_navigation_map_3d_body(&map).unwrap();
                 let values=writer.region([0,0,1],[99,59,20],16000).unwrap();
                 let actual:BTreeSet<_>=values.iter().map(|(k,_)|*k).collect();
@@ -1105,7 +1138,8 @@ impl OccupancyHarness {
                     obstacle_count:hits.len(),all_keys_exact:actual==retained,
                     all_observed_ns_current:values.iter().all(|(_,v)|v.observed_ns==stamp as u64),
                     obstacle_hits_min:hits.iter().copied().min().unwrap_or(0),
-                    obstacle_hits_max:hits.iter().copied().max().unwrap_or(0)};
+                    obstacle_hits_max:hits.iter().copied().max().unwrap_or(0),
+                    declared_world:world,wire_mask_matches_declared_world};
                 assert!(record.all_keys_exact && record.all_observed_ns_current);
                 assert_eq!(record.ground_count,6000);
                 if control.stage==Stage::Inserted && previous_stage==Stage::Clear {
@@ -1113,7 +1147,12 @@ impl OccupancyHarness {
                 }
                 publish_body(&feed_transport,&feed_node.inputs[0],"nuwax_msgs.NavigationMap3D",
                     payload).await.unwrap();
-                if let Some(log)=&dense_log {
+                if let Some(stage)=recent_stage_override {
+                    let recent_retained=scene_keys(control.scene,stage);
+                    super::support_recovery_qualification::publish_sampled_recent(
+                        &feed_transport,&map,sequence,stamp,pose_stamp,
+                        recent_retained.iter().copied().map(|key|(key,key[2]==1))).await;
+                } else if let Some(log)=&dense_log {
                     let record=dense_recent::publish(&feed_transport,&map,sequence,stamp,pose_stamp,
                         control.scene,control.stage).await;
                     log.lock().unwrap().push(record);
@@ -1129,7 +1168,10 @@ impl OccupancyHarness {
             }
         });
         Self {transport,node,scheduler,planner:Some(planner),executor:Some(executor),plant,sensor,
-            evidence,feeder,observers,goal:None,started,local_planning_enabled,scene,insertion:None,wall_hold:None}
+            evidence,feeder,observers,goal:None,started,local_planning_enabled,scene,world,insertion:None,wall_hold:None}
+    }
+    fn expects_wall_hold(&self)->bool {
+        self.scene==Scene::Wall && self.world!=wall_world::World::UnobservedFlatContinuation
     }
     fn check_live(&self,stage:&str)->Result<(),String> {
         if self.started.elapsed()>QUALIFICATION_WINDOW {return Err(format!("{stage}: 60s qualification window exhausted"));}
@@ -1233,7 +1275,7 @@ impl OccupancyHarness {
             }
             drop(plant);tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        if self.scene==Scene::Wall {
+        if self.expects_wall_hold() {
             // Passive observation only: temporary zero during map adoption is not
             // assumed to be the final wall hold. Any actual nonzero resets only
             // this candidate window, never the original sixty-second deadline.
@@ -1304,10 +1346,14 @@ impl OccupancyHarness {
             if index>0 && segments[index-1].to!=segment.from {return Err(format!("trajectory gap at {index}"));}
             if segment.from<insert && segment.to>insert {return Err(format!("unsplit insertion interval {index}"));}
             if segment.motion.obstacle_active!=(segment.from>=insert) {return Err(format!("wrong physical obstacle epoch at {index}"));}
-            oracle_nodes+=check_segment(&segment.motion,self.scene).map_err(|e|format!("actual segment {index}: {e}; {segment:?}"))?;
+            oracle_nodes+=self.world.check_segment(&segment.motion,self.scene)
+                .map_err(|e|format!("actual segment {index}: {e}; {segment:?}"))?;
         }
         if !segments.iter().any(|s|s.from==insert && s.motion.obstacle_active) {return Err("prior applied command's insertion boundary was not recorded".into());}
-        eprintln!("OFFLINE_ORACLE_PASS segments={} nodes={oracle_nodes} exact_insertion={insert:?} support_domain=full_footprint collision=strict_contact outcome=continuous_se2_only",segments.len());
+        eprintln!("OFFLINE_ORACLE_PASS segments={} nodes={oracle_nodes} exact_insertion={insert:?} world={:?} support_domain={} collision=strict_contact outcome=continuous_se2_only",
+            segments.len(),self.world,if self.world==wall_world::World::UnobservedFlatContinuation {
+                "explicit_flat_continuation_not_observation_extent"
+            }else{"original_full_footprint_rectangle"});
         for event in events.iter().filter(|e|is_nonzero_applied(e)) {
             if event.twist.linear.x<0.0 || event.twist.linear.x>0.5+1e-12 || event.twist.linear.y!=0.0 || event.twist.angular_z.abs()>0.8+1e-12 {
                 return Err(format!("actual applied motion violates original limits: {event:?}"));
@@ -1319,6 +1365,9 @@ impl OccupancyHarness {
         let evidence=self.evidence.lock().unwrap();let sources:Vec<_>=evidence.maps.values().cloned().collect();
         let mut first_inserted=None;let mut last_clear_geometry=None;let mut inserted_geometry=None;let mut previous:Option<&SourceRecord>=None;
         for row in &sources {
+            if row.declared_world!=self.world || !row.wire_mask_matches_declared_world {
+                return Err(format!("declared-world wire source mismatch: {row:?}"));
+            }
             if !row.all_keys_exact || !row.all_observed_ns_current || row.ground_count!=6000 {return Err(format!("source ledger mismatch {row:?}"));}
             if let Some(prior)=previous {if row.sample.duration_since(prior.sample)<SAMPLE_PERIOD || row.source<=prior.source {return Err("non-real-time or regressing sensor samples".into());}}
             previous=Some(row);
@@ -1340,6 +1389,7 @@ impl OccupancyHarness {
         for (row,built) in &built_inserted {
             let map=built.snapshot.as_ref().map_err(|e|format!("built source {} failed: {e}",row.source))?;
             audit_observations(map,self.scene,Stage::Inserted,row.source)?;
+            self.world.audit_built(map)?;
         }
         let (row,built)=&built_inserted[0];let map=built.snapshot.as_ref().map_err(|e|e.to_string())?;
         let mut witness=None;let direct=map.validate_body_motion_with_witness(insert_body,body_pose(3.5,1.5,0.0),&[],&mut witness);
@@ -1378,7 +1428,7 @@ impl OccupancyHarness {
         // Receipt ordering proves observed delivery/execution, not the precise
         // planner snapshot. PathEnvelope.committed_map remains the sealed goal's
         // identity; owner tests must separately cover the captured input source.
-        if self.scene==Scene::Wall {
+        if self.expects_wall_hold() {
             let (stop,hold_end)=self.wall_hold.as_ref().ok_or("wall has no completed passive stationary window")?;
             if hold_end.duration_since(stop.at)<Duration::from_secs(5) {return Err("wall stationary window too short".into());}
             if events.iter().any(|e|e.seq>stop.seq && e.at<=*hold_end && is_nonzero_applied(e)) {
@@ -1405,7 +1455,9 @@ impl OccupancyHarness {
         // This audit also runs after a failed exercise. Only STRICT_ARRIVAL in
         // exercise() reports terminal arrival; these labels classify the trace.
         eprintln!("EVIDENCE_AUDIT scene={:?} local_planning_enabled={} classification={} initial_revision={initial_revision} inserted_source={} built_consumed={} inserted_published={inserted_published:?} soft_global_execution={soft_global_refresh:?} natural_zero={stopped:?} global_resume={global_recovery:?} same_global_revision={same_global_revision} local_display={local_display} actual_detour={actual_detour} precise_new_global_input_identity=not_independently_proven selected_command_proof_cells=not_recorded physical_braking=not_proven uds=not_covered",
-            self.scene,self.local_planning_enabled,if self.scene==Scene::Wall {"bounded_active_five_second_wall_hold"}else if !self.local_planning_enabled {"off_soft_global_reference_executed"}else if global_recovery.is_some() {"natural_stop_global_replan_executed"}else if same_global_revision {"on_continuous_trace_same_global_revision"}else {"on_continuous_trace_global_order_not_fully_attributed"},first_inserted.unwrap(),built_inserted.len());
+            self.scene,self.local_planning_enabled,if self.expects_wall_hold() {"bounded_active_five_second_wall_hold"}
+                else if self.world==wall_world::World::UnobservedFlatContinuation {"unobserved_flat_finite_wall_strict_arrival"}
+                else if !self.local_planning_enabled {"off_soft_global_reference_executed"}else if global_recovery.is_some() {"natural_stop_global_replan_executed"}else if same_global_revision {"on_continuous_trace_same_global_revision"}else {"on_continuous_trace_global_order_not_fully_attributed"},first_inserted.unwrap(),built_inserted.len());
         Ok(())
     }
 

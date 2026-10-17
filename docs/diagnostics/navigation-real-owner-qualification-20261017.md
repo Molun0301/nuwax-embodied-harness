@@ -63,3 +63,21 @@ cargo test --locked --release -p nuwax-nav-stack --lib --features surface-recove
 - `static_source_only::fixed_recent_wall_local_planning_on`（本轮未运行）
 
 `local-guidance-qualification` 是单独显式观察特性，会启用 Scan/profile。旧Box h wrapper仅得到 global_curved=0、NOT_QUALIFIED；旧Wall wrapper在原闭环断言失败，未获得h对照。所有这些 ignored 资格必须显式运行，普通CI通过不代表它们通过。
+
+## 首个真实 partial 分支事实（2026-10-17 UTC 21:50）
+
+独立 `FirstPartialBranch` 窗口只保留第一个真实 `Ok(partial=true)` 分支；原h资格不变，不离线重放，不改变选择策略。显式 runtime/stack check 与 no-run 通过，两个 fork 接缝回归通过；默认无Scan/profile的七包tests类型检查另通过；一次原参数 fixed Box live 运行 38.16 秒、exit101，原 PlannerFailed/30秒局部路径等待失败保留。
+
+本次来源与时序测量资格为 `QUALIFIED_OBSERVED_FAILURE`：cleanup、原连续运动/几何oracle和fixed-recent测量审计均通过，不能用上一次晚期pose过期解释本次失败。首partial绑定唯一 Inserted 原source（revision5），事实窗口为 `QUALIFIED_CAPTURED_FACT`：
+
+- request_detour=false、branch_detour=false、request_straight=true、follow_reference=false、prefer_straight=true
+- 真实 start=(1.1372021953,1.5,0.5)，目标=(3.5,1.5,0.5)、容差0.1；原reference与实际Scan reference一致
+- 输出 partial=true、smoothed=false，末点≈(1.8492436168,1.4521450198,0.5)；该分支365.062242ms，预算256未变
+- 原全局路线真实来自owner；此为按“首partial结果”条件取样，不能冒充随机性能样本或旧curved-global h资格
+- 后续91行display的XYZ与捕获结果一致，但display没有request identity；controller admission/execution的严格同请求归因仍为unknown
+
+当前生产代码遇到该nominal partial即返回，确实不会在同次compute继续现有detour分支。因此“nominal partial暂存、尝试完整detour”的候选触发条件已由实际记录确认；它是否得到完整路线、额外等待是否值得、旧路径是否继续推进，仍未验证。不得把分支事实当作候选收益或闭环修复。
+
+新精确入口使用 `local-guidance-qualification`：
+`lcm_dataflow::surface_dataflow::tests::dynamic_occupancy_qualification::static_source_only::fixed_recent_box_first_partial_branch`。
+原始CAPTURE、ATTRIBUTION、STATUS及失败终态分别保留在工作目录阶段日志，不将重型日志写入Git。

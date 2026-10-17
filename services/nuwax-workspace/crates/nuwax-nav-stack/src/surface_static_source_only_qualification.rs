@@ -404,6 +404,15 @@ fn audit_static_source_isolation(
 async fn qualify_static_source_only(
     scene: Scene, qualification: RecentQualification, world: wall_world::World,
 ) {
+    qualify_static_source_only_then(scene,qualification,world,|_,_|{}).await;
+}
+
+// A diagnostic hook only after the unchanged cleanup/audits and failure report.
+// Existing selectors use a no-op; first-partial evidence survives a failed loop.
+async fn qualify_static_source_only_then(
+    scene: Scene, qualification: RecentQualification, world: wall_world::World,
+    after_cleanup:impl FnOnce(&OccupancyHarness,bool),
+) {
     let mut harness = OccupancyHarness::start_with_recent_stage_and_world(
         true, scene, None, Some(Stage::Clear), world).await;
     let mut recent = typed_stream(&harness.transport, recent_cloud::DEFAULT_TOPIC, recent_cloud::TYPE_NAME).await.unwrap();
@@ -455,6 +464,7 @@ async fn qualify_static_source_only(
         else { "QUALIFIED_BOUNDED_ACTIVE_WALL_HOLD" };
     let raw_hints_empty = isolation.as_ref().map_or("unknown", |hints| if hints.is_empty() { "true" } else { "false" });
     eprintln!("STATIC_SOURCE_FINAL qualification={} world={world:?} scene={scene:?} classification={classification} result={result:?} status={status:?} cleanup={cleanup:?} oracle_and_original_audit={audit:?} fixed_recent_measurement_audit={isolation:?} raw_hints_empty={raw_hints_empty} raw_hint_scope=offline_representative_reconstructed_snapshot recent_guide_interference=unknown captured_recent_packets={} motion_fixture_retuning=false", qualification.label(), scans.len());
+    after_cleanup(&harness,cleanup.is_ok());
     assert!(result.is_ok() && cleanup.is_ok() && audit.is_ok() && isolation.is_ok(),
         "{classification}: result={result:?}; cleanup={cleanup:?}; audit={audit:?}; isolation={isolation:?}");
 }
@@ -485,4 +495,16 @@ async fn fixed_recent_box_local_planning_on() {
 async fn fixed_recent_wall_local_planning_on() {
     qualify_static_source_only(Scene::Wall, RecentQualification::FixedRecentGeometry,
         wall_world::World::ExplicitVirtualMaskDomain).await;
+}
+
+#[cfg(feature="local-guidance-qualification")]
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+#[ignore="first actual partial fact window; unchanged fixed-recent Box may still fail its original whole-loop oracle"]
+async fn fixed_recent_box_first_partial_branch() {
+    let capture=nuwax_nav_runtime::local_guidance_qualification::CaptureSession::first_partial_branch([3.5,1.5,0.5]);
+    qualify_static_source_only_then(Scene::Box,RecentQualification::FixedRecentGeometry,
+        wall_world::World::LegacyObservedSupport,move |harness,owners_stopped| {
+            let (counts,captured)=capture.finish();
+            super::local_guidance::dump_first_partial_branch(harness,owners_stopped,counts,captured);
+        }).await;
 }

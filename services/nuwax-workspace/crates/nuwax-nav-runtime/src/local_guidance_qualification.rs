@@ -17,14 +17,23 @@ pub struct Counts {
     pub target_calls:usize, pub nominal:usize, pub global_curved:usize,
     pub remaining_search:usize, pub cancelled:usize, pub eligible:usize,
 }
-struct State { goal:[u64;3], counts:Counts, captured:Option<Captured> }
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum CaptureWindow { CurvedNominalHeuristic, FirstPartialBranch }
+struct State { goal:[u64;3], window:CaptureWindow, counts:Counts, captured:Option<Captured> }
 /// One scoped observer. Run the ignored selector alone with --test-threads=1.
 pub struct CaptureSession { state:Arc<Mutex<State>> }
 impl CaptureSession {
     pub fn start(goal:[f64;3])->Self {
+        Self::start_window(goal,CaptureWindow::CurvedNominalHeuristic)
+    }
+    /// First actual partial result for this target; no h/fallback/source-stage gate.
+    pub fn first_partial_branch(goal:[f64;3])->Self {
+        Self::start_window(goal,CaptureWindow::FirstPartialBranch)
+    }
+    fn start_window(goal:[f64;3],window:CaptureWindow)->Self {
         let mut active=ACTIVE.lock().unwrap();
         assert!(active.as_ref().and_then(Weak::upgrade).is_none(),"qualification already active");
-        let state=Arc::new(Mutex::new(State {goal:goal.map(f64::to_bits),counts:Counts::default(),captured:None}));
+        let state=Arc::new(Mutex::new(State {goal:goal.map(f64::to_bits),window,counts:Counts::default(),captured:None}));
         *active=Some(Arc::downgrade(&state)); Self {state}
     }
     /// Take evidence only after owners have shut down, so replays add no live CPU load.
@@ -49,30 +58,35 @@ pub(crate) fn begin(r:&PlanRequest)->Option<Token> {
 }
 #[derive(Clone,Debug)]
 pub struct Output {
-    pub partial:Option<bool>, pub poses:Vec<BodyPose>, pub error:Option<LocalPlanError>, pub elapsed_ms:f64,
+    pub partial:Option<bool>, pub poses:Vec<BodyPose>, pub smoothed:Option<bool>,
+    pub error:Option<LocalPlanError>, pub elapsed_ms:f64,
 }
 impl Output {
     fn from_result(result:&Result<LocalTrajectory,LocalPlanError>)->Self {
         match result {
-            Ok(t)=>Self {partial:Some(t.partial),poses:t.poses.clone(),error:None,elapsed_ms:t.elapsed_ms},
-            Err(e)=>Self {partial:None,poses:Vec::new(),error:Some(e.clone()),elapsed_ms:0.0},
+            Ok(t)=>Self {partial:Some(t.partial),poses:t.poses.clone(),smoothed:Some(t.smoothed),error:None,elapsed_ms:t.elapsed_ms},
+            Err(e)=>Self {partial:None,poses:Vec::new(),smoothed:None,error:Some(e.clone()),elapsed_ms:0.0},
         }
     }
 }
 /// Exactly one immutable input; no synthesized reference, source, pose or motion.
 pub struct Captured {
-    pub started:Instant, pub finished:Instant, pub generation:u64,
+    pub started:Instant, pub finished:Instant, pub generation:u64, pub window:CaptureWindow,
     /// Original request owner, retained for the external source ledger.
     pub source:Arc<SurfaceSnapshot>,
     /// Clone of the actual private map passed to Scan in compute_inner.
     /// fork_for_planning preserves immutable inputs, not snapshot-owner identity.
     pub planning_source:SurfaceSnapshot,
     pub tomogram:Arc<Tomogram>, pub global_route:Arc<Path3D>, pub pose:nuwax_nav_types_messages::PoseStamped, pub start:BodyPose,
+    /// Materialized request input before this branch's PCT/recent guidance.
+    pub request_reference:Vec<[f64;3]>,
+    /// Exact normalized reference supplied to this Scan call.
     pub reference:Vec<[f64;3]>, pub boundary:Arc<Vec<[f64;2]>>,
     pub motion:MotionKinematics, pub config:ScanConfig,
     pub final_yaw:Option<f64>, pub arrival:Option<([f64;3],f64)>,
     pub progress_reference:Option<Vec<[f64;3]>>, pub minimum_progress:Option<f64>,
     pub reference_progress:f64, pub reference_end:f64,
+    pub request_detour:bool, pub branch_detour:bool, pub request_straight:bool,
     pub follow_reference:bool, pub prefer_straight:bool,
     pub original:Output, pub observation:scan_observation::Observation,
 }
@@ -93,18 +107,25 @@ fn finish_with_observation(token:Token,r:&PlanRequest,map:&SurfaceSnapshot,tomog
     observation:scan_observation::Observation) {
     let mut state=token.state.lock().unwrap();
     state.counts.target_calls+=1;
-    if detour || follow_reference {return;}
-    state.counts.nominal+=1;
-    if r.straight {return;}
-    state.counts.global_curved+=1;
-    if !observation.phases.iter().any(|p|p.phase=="search_remaining") {return;}
-    state.counts.remaining_search+=1;
-    if result.as_ref().err().is_some_and(|e|e.kind==LocalPlanFailureKind::Cancelled) {
-        state.counts.cancelled+=1;return;
+    match state.window {
+        CaptureWindow::CurvedNominalHeuristic => {
+            if detour || follow_reference {return;}
+            state.counts.nominal+=1;
+            if r.straight {return;}
+            state.counts.global_curved+=1;
+            if !observation.phases.iter().any(|p|p.phase=="search_remaining") {return;}
+            state.counts.remaining_search+=1;
+            if result.as_ref().err().is_some_and(|e|e.kind==LocalPlanFailureKind::Cancelled) {
+                state.counts.cancelled+=1;return;
+            }
+            // Root-only success/failure has no non-root ordering contest. Keep it out.
+            if observation.work[0]<=1 || prefer_straight
+                || r.scan.search_expansion_limit!=nuwax_nav_scan::DEFAULT_SEARCH_EXPANSION_LIMIT {return;}
+        }
+        CaptureWindow::FirstPartialBranch => {
+            if !result.as_ref().is_ok_and(|trajectory|trajectory.partial) {return;}
+        }
     }
-    // Root-only success/failure has no non-root ordering contest. Keep it out.
-    if observation.work[0]<=1 || prefer_straight
-        || r.scan.search_expansion_limit!=nuwax_nav_scan::DEFAULT_SEARCH_EXPANSION_LIMIT {return;}
     state.counts.eligible+=1;
     if state.captured.is_some() {return;}
     let Some(global)=r.reference_source.as_ref() else {return;};
@@ -112,16 +133,19 @@ fn finish_with_observation(token:Token,r:&PlanRequest,map:&SurfaceSnapshot,tomog
     // map is its actual fork_for_planning view used by the Scan call. Retain both
     // by construction, not by an owner-equality assertion or partial-field proof.
     // The existing fork contract shares immutable inputs and isolates caches.
-    state.captured=Some(Captured {started:token.started,finished:Instant::now(),generation:r.generation,
+    state.captured=Some(Captured {started:token.started,finished:Instant::now(),generation:r.generation,window:state.window,
         source:r.source.clone(),planning_source:map.clone(),tomogram:tomogram.clone(),global_route:global.route.clone(),pose:r.pose.clone(),
-        start:body(&r.pose),reference:reference.to_vec(),boundary:r.boundary.clone(),motion:motion.clone(),config:r.scan.clone(),
+        start:body(&r.pose),request_reference:r.reference.clone(),reference:reference.to_vec(),boundary:r.boundary.clone(),motion:motion.clone(),config:r.scan.clone(),
         final_yaw:r.final_yaw,arrival:r.arrival,progress_reference:progress.map(|p|p.reference.to_vec()),
         minimum_progress:progress.map(|p|p.minimum_distance_m),reference_progress:r.progress,reference_end:r.end,
+        request_detour:r.detour,branch_detour:detour,request_straight:r.straight,
         follow_reference,prefer_straight,original:Output::from_result(result),observation});
 }
 impl Captured {
     /// Frozen, offline normal-Scan replay. The single changed argument is h's existing flag.
     pub fn replay(&self,follow_reference:bool)->(Output,scan_observation::Observation) {
+        assert_eq!(self.window,CaptureWindow::CurvedNominalHeuristic,
+            "FirstPartialBranch is evidence only, not an h replay qualification");
         assert!(!self.follow_reference && !self.prefer_straight);
         assert_eq!(self.config.search_expansion_limit,nuwax_nav_scan::DEFAULT_SEARCH_EXPANSION_LIMIT);
         let map=self.planning_source.fork_for_planning();
@@ -219,7 +243,7 @@ mod synthetic_capture_replay_seam_tests {
     fn local_token(request:&PlanRequest)->(Arc<Mutex<State>>,Token) {
         let goal=request.reference_source.as_ref().unwrap().goal.as_ref().unwrap().pose.position;
         let state=Arc::new(Mutex::new(State {goal:[goal.x,goal.y,goal.z].map(f64::to_bits),
-            counts:Counts::default(),captured:None}));
+            window:CaptureWindow::CurvedNominalHeuristic,counts:Counts::default(),captured:None}));
         // Do not register with ACTIVE or influence another test/real capture session.
         let token=Token {state:state.clone(),started:Instant::now()};
         (state,token)

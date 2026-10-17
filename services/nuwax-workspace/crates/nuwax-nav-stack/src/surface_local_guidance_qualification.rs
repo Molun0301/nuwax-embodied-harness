@@ -81,3 +81,58 @@ async fn existing_box_nominal_guidance_qualification() {qualify_existing_chain(S
 #[tokio::test(flavor="multi_thread",worker_threads=2)]
 #[ignore="explicit qualification; wall negative may correctly remain NOT_QUALIFIED"]
 async fn existing_wall_nominal_guidance_qualification() {qualify_existing_chain(Scene::Wall).await;}
+
+// No replay, rematerialization, body query, or candidate revalidation in this
+// independent fact window. Existing source/path/display ledgers are read only.
+pub(super) fn dump_first_partial_branch(
+    harness:&OccupancyHarness, owners_stopped:bool,
+    counts:nuwax_nav_runtime::local_guidance_qualification::Counts,
+    captured:Option<nuwax_nav_runtime::local_guidance_qualification::Captured>,
+) {
+    eprintln!("FIRST_PARTIAL_COUNTS window=FirstPartialBranch {counts:?} owners_stopped={owners_stopped}");
+    let Some(c)=captured else {
+        eprintln!("FIRST_PARTIAL_STATUS status=NOT_QUALIFIED reason=no_matching_target_partial_observed no_replay=true original_fixture_result=reported_separately");
+        return;
+    };
+    // Dump before any post-hoc qualification failure; never replace this first
+    // result with a later Inserted-source partial, nor drop it on exercise failure.
+    eprintln!("FIRST_PARTIAL_CAPTURE window={:?} generation={} started={:?} finished={:?} pose={:?} start={:?} request_detour={} branch_detour={} request_straight={} follow_reference={} prefer_straight={} request_reference={:?} scan_reference={:?} progress={} end={} motion={:?} config={:?} final_yaw={:?} arrival={:?} boundary={:?} prefix={:?} minimum_progress={:?} global_route={:?} output={:?} observation={:?} source_origin=original_request_owner planning_view_origin=compute_inner_actual_fork recent_view=actual_retained owner_request_id=not_recorded owner_epoch=not_recorded controller_admission=unknown execution=unknown no_replay=true",
+        c.window,c.generation,c.started,c.finished,c.pose,c.start,c.request_detour,c.branch_detour,
+        c.request_straight,c.follow_reference,c.prefer_straight,c.request_reference,c.reference,
+        c.reference_progress,c.reference_end,c.motion,c.config,c.final_yaw,c.arrival,c.boundary,
+        c.progress_reference,c.minimum_progress,c.global_route,c.original,c.observation);
+    let Some(goal)=harness.goal.as_ref() else {
+        eprintln!("FIRST_PARTIAL_STATUS status=NOT_QUALIFIED reason=original_goal_not_recorded");return;
+    };
+    let evidence=harness.evidence.lock().unwrap();
+    let sources:Vec<_>=evidence.maps.values().filter(|row|row.published<=c.started
+        && evidence.built.get(&row.source).and_then(|built|built.snapshot.as_ref().ok()).is_some_and(|map|
+            map.same_geometry(&c.source) && match (map.observations(),c.source.observations()) {
+                (Some(a),Some(b))=>Arc::ptr_eq(a,b),(None,None)=>true,_=>false,
+            })).collect();
+    let wires:Vec<_>=evidence.paths.iter().filter(|p|exact_wire_route(p,&c.global_route)
+        && validate_path_goal_correlation(p,goal).is_ok()
+        && evidence.path_receipts.iter().any(|(at,revision,_)|*at<=c.started && *revision==p.path_revision)).collect();
+    let displays:Vec<_>=evidence.states.iter().filter(|s|state_matches_goal(s,goal)
+        && s.local_path.len()==c.original.poses.len()
+        && s.local_path.iter().zip(&c.original.poses).all(|(a,b)|a.map(f64::to_bits)==b.0.map(f64::to_bits))).collect();
+    let source_unique=sources.len()==1;
+    let source_inserted=source_unique && sources[0].stage==Stage::Inserted;
+    let source_consumed=source_unique && evidence.consumed.iter().any(|(at,source)|
+        *source==sources[0].source && *at>=sources[0].published && *at<=c.finished);
+    // States contain full display XYZ but no local owner request ID and no
+    // corresponding capture-time admission event. Geometry matches cannot prove
+    // this request was admitted, when it was admitted, or that it was executed.
+    eprintln!("FIRST_PARTIAL_ATTRIBUTION source_matches={sources:?} preceding_correlated_global_wires={wires:?} source_unique={source_unique} source_inserted={source_inserted} scheduler_source_observed={source_consumed} unobserved_scheduler_source=unknown global_wire_request_identity=unknown exact_display_xyz_rows={} first_display={:?} display_request_identity=unknown display_time_relation=unknown controller_admission=unknown execution=unknown",
+        displays.len(),displays.first().map(|s|(s.stamp_sec,s.stamp_nsec,s.path_revision,s.current,s.pose_source_timestamp_ns,s.costmap_source_timestamp_ns)));
+    let reason=if !owners_stopped {"owner_shutdown_not_confirmed"}
+        else if !source_unique {"original_owner_ledger_not_unique"}
+        else if !source_inserted {"first_partial_source_is_not_inserted"}
+        else {"first_partial_bound_to_inserted_source"};
+    // Polling can miss a short request; repeated identical global payloads may
+    // have several revisions. Keep both as attribution evidence, not extra
+    // gates on the captured fact's unique Inserted original-owner relationship.
+    let qualified=owners_stopped && source_unique && source_inserted;
+    eprintln!("FIRST_PARTIAL_STATUS status={} reason={reason} branch_partial_observed=true current_compute_selects_any_ok=true nominal_partial_policy_would_trigger={} real_global_h_qualified=false whole_loop_success=reported_separately sampling=first_partial_result_conditioned no_replay=true",
+        if qualified {"QUALIFIED_CAPTURED_FACT"}else{"NOT_QUALIFIED"},!c.request_detour && !c.branch_detour);
+}

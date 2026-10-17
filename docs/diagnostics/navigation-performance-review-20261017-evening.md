@@ -235,6 +235,12 @@ Scan 预算与 partial 首点/最小进度纳入真实资格；共享 PctPlanner
 
 诊断自身的fork-owner误断言已修正：原request source用于账本关联，实际planning fork用于复放，二者不能用owner相等替代数据继承关系。两个真实fork接缝回归通过，合成admission不是实际h资格。详细结果、守卫与时序边界、可重跑入口见 [真实owner资格记录](navigation-real-owner-qualification-20261017.md)。后续仍需实际分支和actor时序观测，未实施新选择策略或延长超时。
 
+## 第十三阶段：证实首个 partial 的真实分支来源
+
+新增独立首partial事实窗口，保留原h资格与默认导航策略。显式增量check/no-run和两个fork接缝回归通过；一次原参数fixed Box闭环仍失败（38.16秒，PlannerFailed），但本次来源测量、原连续运动oracle及cleanup均通过。实际捕获唯一Inserted来源的nominal partial，request/branch detour均false，尚未尝试另一分支即返回。具体输入、输出、不可推导的接纳/执行关系与候选边界见 [真实owner资格记录](navigation-real-owner-qualification-20261017.md)。
+
+这验证了选择策略候选的触发条件，并未实施该候选或宣称改善。输入延迟诊断另行进行，不能用上次晚期过期解释本次持续有效输入下的规划失败。
+
 ## 后续持续检查
 
 1. 墙前晚到路径的实际恢复与初始 full/partial/PCT 顺序，保留及时移动和真实避障

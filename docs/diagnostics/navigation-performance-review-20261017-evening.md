@@ -209,6 +209,14 @@ Scan 预算与 partial 首点/最小进度纳入真实资格；共享 PctPlanner
 - 原8项阶段观测一致性通过，解析出的11条观测在路径类别、资格、展开、几何调用计数及阶段顺序/结果方面均与原记录相同，公共arc-root仍为NOT_QUALIFIED
 - 4→0、mixed4→2仅是这段真实缓存工作量；完整pose其他路径仍可能构建bands。未做受控耗时A/B，不宣称全链时延下降或已解决1cm墙压力热点
 
+## 第十阶段：普通生产 sidecar 的真实跨进程协议
+
+使用普通 `cargo build --release --bin nuwax-geometry-runtime` 产物（Cargo artifact 的 test=false），以 stdin/stdout 实际驱动生产 ray sidecar。完整生命周期、新进程恢复、历史计数、三类待决取消、STOP/EOF 和错误事务/阶段/来源共 11 项全部通过，候选业务 wire bytes 与完整 checkpoint 对照一致。没有用测试 binary 冒充生产入口。
+
+首次第10项因诊断脚本漏写生产 Option 调试文本的 Some(...) 失败；只修脚本精确预期，ERROR帧、阶段、exit1/EOF都保留，同一binary全量重跑通过。原失败和前9项证据保留。诊断脚本已在repo路径、不同cwd及相对参数下用Python3.8.10再次完成11项；不强制用户Python恰为3.8.10，结果记录实际版本。
+
+可复用入口为 `scripts/diagnostics/qualify_mapping_sidecar.py`，说明见 `mapping-sidecar-production-qualification.md`。大oracle、构建产物及原始响应保留在外部工作目录，不入Git。本资格不包含生产父supervisor/commit-owner/watchdog、LCM网络、ARM或真实机器人，也不推导端侧性能。
+
 ## 后续持续检查
 
 1. 墙前晚到路径的实际恢复与初始 full/partial/PCT 顺序，保留及时移动和真实避障

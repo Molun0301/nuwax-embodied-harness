@@ -427,6 +427,13 @@ impl FineContacts {
     }
 }
 
+// Query-local selection borrows the immutable measured record; it never copies
+// members or stores pose-dependent selection in the shared compatibility cache.
+enum FineGroundInput<'a> {
+    Measured(Option<&'a ObservedGroundLayer>),
+    Legacy(Option<Arc<Vec<FineContactBand>>>),
+}
+
 struct FineGroundColumn {
     xy: [i32; 2],
     // Missing source remains None; never a zero-height permission.
@@ -582,35 +589,99 @@ impl SurfaceSnapshot {
         body:[f64;3],normal:[f64;3],x:i32,y:i32)->Option<Vec<T>> {
         let observations=self.observations.as_ref()?;
         let model=self.body_envelope()?;
+        // Without a source terrain anchor carry the calibrated support height
+        // in the gravity frame. Body pitch/roll belongs to the physical prism,
+        // and cannot relabel a horizontal ground band as an obstacle.
+        let (body,normal)=if ground.is_none() {
+            ([body[0],body[1],body[2]+model.body_to_support_z_m*(1.0-normal[2])],[0.0,0.0,1.0])
+        } else {(body,normal)};
         let fine=f64::from(observations.size_m);let size=f64::from(self.config().voxel_size);
-        let mut columns=Vec::new();
+        let mut columns=Vec::new();let mut has_legacy=false;
         for ix in (f64::from(x)*size/fine).floor() as i32..(f64::from(x+1)*size/fine).ceil() as i32 {
             for iy in (f64::from(y)*size/fine).floor() as i32..(f64::from(y+1)*size/fine).ceil() as i32 {
-                if polygon.intersects(ix,iy,fine) {columns.push(([ix,iy],None));}
+                if !polygon.intersects(ix,iy,fine) {continue;}
+                let xy=[ix,iy];
+                let input=match self.select_measured_fine_ground_layer(observations,model,ground,body,normal,xy) {
+                    Some(record)=>FineGroundInput::Measured(record),
+                    None=>{has_legacy=true;FineGroundInput::Legacy(None)},
+                };
+                columns.push((xy,input));
             }
         }
-        // 与接触响应域相同的现有带缓存，单次批读；冷列仅扫描其原始列索引。
-        {
-            let cache=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner());
-            for (xy,bands) in &mut columns {*bands=cache.fine_bands.get(&(xy[0],xy[1])).cloned();}
-        }
-        let mut missing=Vec::new();
-        for (xy,bands) in &mut columns {
-            if bands.is_none() {
-                let values=Arc::new(self.read_fine_contact_bands(xy[0],xy[1]));
-                missing.push(((xy[0],xy[1]),Arc::clone(&values)));*bands=Some(values);
+        // Only compatibility columns use the existing one-batch cache path.
+        // Measured rejection is final too: it must not fall back to a voxel band.
+        if has_legacy {
+            {
+                let cache=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner());
+                for (xy,input) in &mut columns {if let FineGroundInput::Legacy(bands)=input {
+                    *bands=cache.fine_bands.get(&(xy[0],xy[1])).cloned();
+                }}
+            }
+            let mut missing=Vec::new();
+            for (xy,input) in &mut columns {if let FineGroundInput::Legacy(bands)=input {
+                if bands.is_none() {
+                    let values=Arc::new(self.read_fine_contact_bands(xy[0],xy[1]));
+                    missing.push(((xy[0],xy[1]),Arc::clone(&values)));*bands=Some(values);
+                }
+            }}
+            if !missing.is_empty() {
+                let mut cache=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner());
+                if cache.fine_bands.len()>=8192 {cache.fine_bands.clear();}
+                cache.fine_bands.extend(missing);
             }
         }
-        if !missing.is_empty() {
-            let mut cache=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner());
-            if cache.fine_bands.len()>=8192 {cache.fine_bands.clear();}
-            cache.fine_bands.extend(missing);
-        }
-        Some(columns.into_iter().map(|(xy,bands)| {
-            let bands=bands.expect("批读已填充");
-            self.select_fine_ground_value::<T>(observations,model,ground,polygon,prism,
-                body,normal,xy,Some(bands.as_slice()))
+        Some(columns.into_iter().map(|(xy,input)|match input {
+            FineGroundInput::Measured(record)=>Self::measured_fine_ground_value::<T>(xy,fine,record),
+            FineGroundInput::Legacy(bands)=>{
+                let bands=bands.expect("批读已填充");
+                self.select_legacy_fine_ground_value::<T>(observations,model,polygon,prism,
+                    body,normal,xy,Some(bands.as_slice()))
+            },
         }).collect())
+    }
+
+    /// None requests compatibility; Some(None) is a final measured-layer miss.
+    /// Inputs already use the same anchor/gravity frame as the legacy selector.
+    fn select_measured_fine_ground_layer<'a>(&self,observations:&'a SurfaceObservations,
+        model:&SurfaceBodyEnvelope,ground:Option<VoxelKey>,body:[f64;3],normal:[f64;3],xy:[i32;2])
+        ->Option<Option<&'a ObservedGroundLayer>> {
+        if self.ground_evidence!=GroundEvidence::MeasuredSurface {return None;}
+        let fine=f64::from(observations.size_m);let size=f64::from(self.config().voxel_size);
+        let center=xy.map(|v|(f64::from(v)+0.5)*fine);
+        let mut records=observations.ground_layers(xy).peekable();
+        let any_measured=records.peek().is_some();
+        // The physical anchor constrains membership to its coarse cell.
+        // Within that cell retain the layer nearest the calibrated support
+        // plane, as in support lookup; never merge the other layer's members.
+        let reference=body[2]-(normal[0]*(center[0]-body[0])
+            +normal[1]*(center[1]-body[1])+model.body_to_support_z_m)/normal[2];
+        let uncertainty=f64::from(self.source_voxel_size_m())+model.support_uncertainty_m;
+        let record=records.filter(|record| {
+            if let Some(ground)=ground {
+                record.members.iter().any(|&z|(((f64::from(z)+0.5)*fine)/size).floor() as i32==ground.2)
+            } else {
+                record.height_at(center).is_some_and(|height|
+                    height-reference<=model.max_step_up_m+uncertainty+1e-6
+                    && reference-height<=model.max_step_down_m+uncertainty+1e-6
+                    && record.normal[2]>=f64::from(self.config().max_slope_deg).to_radians().cos())
+            }
+        }).min_by(|a,b|(a.height_at(center).unwrap_or(f64::INFINITY)-reference).abs()
+            .total_cmp(&(b.height_at(center).unwrap_or(f64::INFINITY)-reference).abs()));
+        any_measured.then_some(record)
+    }
+
+    fn measured_fine_ground_value<T:FineGroundValue>(xy:[i32;2],fine:f64,record:Option<&ObservedGroundLayer>)->T {
+        if let Some(record)=record {
+            let center=xy.map(|v|(f64::from(v)+0.5)*fine);
+            let height=record.height_at(center);
+            let mut contacts=FineContacts::default();
+            if T::CONTACTS {for &z in &record.members {
+                if let Some(last)=contacts.last_mut().filter(|last|last[1].checked_add(1)==Some(z)) {last[1]=z;}
+                else {contacts.push([z,z]);}
+            }}
+            return T::from_parts(xy,height,contacts);
+        }
+        T::from_parts(xy,None,FineContacts::default())
     }
 
     /// One source-owned fine column, shared by batched body checks and live guide hints.
@@ -624,42 +695,18 @@ impl SurfaceSnapshot {
         let (body,normal)=if ground.is_none() {
             ([body[0],body[1],body[2]+model.body_to_support_z_m*(1.0-normal[2])],[0.0,0.0,1.0])
         } else {(body,normal)};
-        let fine=f64::from(observations.size_m);let size=f64::from(self.config().voxel_size);
-        let contact=model.max_step_up_m.max(model.max_step_down_m)+f64::from(self.source_voxel_size_m())+model.support_uncertainty_m;
-        // Newly measured layers have source-owned members and a fixed plane.
-        // Legacy columns retain the existing compatibility behavior below.
-        if self.ground_evidence==GroundEvidence::MeasuredSurface {
-            let center=xy.map(|v|(f64::from(v)+0.5)*fine);
-            let mut records=observations.ground_layers(xy).peekable();
-            let any_measured=records.peek().is_some();
-            // The physical anchor constrains membership to its coarse cell.
-            // Within that cell retain the layer nearest the calibrated support
-            // plane, as in support lookup; never merge the other layer's members.
-            let reference=body[2]-(normal[0]*(center[0]-body[0])
-                +normal[1]*(center[1]-body[1])+model.body_to_support_z_m)/normal[2];
-            let uncertainty=f64::from(self.source_voxel_size_m())+model.support_uncertainty_m;
-            let record=records.filter(|record| {
-                if let Some(ground)=ground {
-                    record.members.iter().any(|&z|(((f64::from(z)+0.5)*fine)/size).floor() as i32==ground.2)
-                } else {
-                    record.height_at(center).is_some_and(|height|
-                        height-reference<=model.max_step_up_m+uncertainty+1e-6
-                        && reference-height<=model.max_step_down_m+uncertainty+1e-6
-                        && record.normal[2]>=f64::from(self.config().max_slope_deg).to_radians().cos())
-                }
-            }).min_by(|a,b|(a.height_at(center).unwrap_or(f64::INFINITY)-reference).abs()
-                .total_cmp(&(b.height_at(center).unwrap_or(f64::INFINITY)-reference).abs()));
-            if let Some(record)=record {
-                let height=record.height_at(center);
-                let mut contacts=FineContacts::default();
-                if T::CONTACTS {for &z in &record.members {
-                    if let Some(last)=contacts.last_mut().filter(|last|last[1].checked_add(1)==Some(z)) {last[1]=z;}
-                    else {contacts.push([z,z]);}
-                }}
-                return T::from_parts(xy,height,contacts);
-            }
-            if any_measured {return T::from_parts(xy,None,FineContacts::default());}
+        if let Some(record)=self.select_measured_fine_ground_layer(observations,model,ground,body,normal,xy) {
+            return Self::measured_fine_ground_value::<T>(xy,f64::from(observations.size_m),record);
         }
+        self.select_legacy_fine_ground_value::<T>(observations,model,polygon,prism,body,normal,xy,bands)
+    }
+
+    /// Compatibility math is unchanged; body/normal are already anchor-adjusted.
+    fn select_legacy_fine_ground_value<T:FineGroundValue>(&self,observations:&SurfaceObservations,
+        model:&SurfaceBodyEnvelope,polygon:&PolygonQuery,prism:&PrismQuery,
+        body:[f64;3],normal:[f64;3],xy:[i32;2],bands:Option<&[FineContactBand]>)->T {
+        let fine=f64::from(observations.size_m);
+        let contact=model.max_step_up_m.max(model.max_step_down_m)+f64::from(self.source_voxel_size_m())+model.support_uncertainty_m;
         let support_offset=model.body_to_support_z_m/normal[2];
         let body_lower_offset=model.z_bounds_m[0]/normal[2];
         let uncertainty=f64::from(self.source_voxel_size_m())+model.support_uncertainty_m;
@@ -1317,7 +1364,6 @@ impl SurfaceSnapshot {
                                         }
                                         if observations.get([ix,iy,iz]).is_none() { continue; }
                                         found = true;
-                                        if !observations.get([ix,iy,iz]).is_some() {continue;}
                                         let contact=selected.is_none() && coarse_contact
                                             && fine_ground.is_some_and(|height|f64::from(iz+1)*fine<=height+1e-6);
                                         if contact {continue;}

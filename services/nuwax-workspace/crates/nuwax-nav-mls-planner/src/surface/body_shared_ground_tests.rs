@@ -610,3 +610,5 @@ fn projected_patch_reference_does_not_create_missing_measured_members() {
     assert!(map.observations.as_ref().unwrap().get([-4,0,z]).is_some(),
         "unclassified real occupancy is still available to the collision checker");
 }
+
+mod hotpath_proposal_tests { include!("body_hotpath_proposal_tests.rs"); }

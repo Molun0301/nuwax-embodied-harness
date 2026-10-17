@@ -199,6 +199,16 @@ Scan 预算与 partial 首点/最小进度纳入真实资格；共享 PctPlanner
 
 尺度限定：两墙源体素为 1cm、122241 输入点，规划网格虽为 10cm，仍是密集细源压力场景；体型 0.60×0.32m。1cm 出发反例机体宽仅 3.98cm。以上不是 Go2 常规 5cm 实测，也不能直接与旧无 profile 墙钟比较或推导完整导航加速倍数。
 
+## 第九阶段：去除地面查询中无用的兼容工作
+
+同一不可变观察源、同一 voxel key 的相邻重复 get 已直接复用既有存在性结果。实测层选择提取为共享借用 helper，成功与“有实测层但不合格”都直接返回原结果；仅真正 legacy 列走原单次批读与冷建。没有新缓存、哈希、锁或精度/避障变化，mixed 列原顺序与 legacy 回退边界不变。
+
+- tests-only 旧核在预期工作量断言失败：measured bands 4 对目标 0，mixed 4 keys 对目标 2；完整冻结旧 selector 与 Option 契约先通过
+- 合并候选五项精确测试通过；180 条完整 pose/motion 旧新 trace 逐字节一致，包含合法/拒绝结果及 witness；measured 拒绝没有转入 legacy 放行
+- MLS 364 通过/19 ignored，Scan 75/10 ignored，runtime 287/67 ignored且仅已知5 UDS过滤，Surface 60/5 ignored；默认无 Scan/profile 的七包 tests 类型检查通过
+- 原8项阶段观测一致性通过，解析出的11条观测在路径类别、资格、展开、几何调用计数及阶段顺序/结果方面均与原记录相同，公共arc-root仍为NOT_QUALIFIED
+- 4→0、mixed4→2仅是这段真实缓存工作量；完整pose其他路径仍可能构建bands。未做受控耗时A/B，不宣称全链时延下降或已解决1cm墙压力热点
+
 ## 后续持续检查
 
 1. 墙前晚到路径的实际恢复与初始 full/partial/PCT 顺序，保留及时移动和真实避障

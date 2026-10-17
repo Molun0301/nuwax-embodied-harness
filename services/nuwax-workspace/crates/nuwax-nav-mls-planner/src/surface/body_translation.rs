@@ -495,7 +495,7 @@ impl SurfaceSnapshot {
                                     let key = [ix,iy,iz];
                                     if observations.get(key).is_none() { continue; }
                                     found_fine = true;
-                                    if f64::from(iz+1)*fine <= cutoff || !observations.get(key).is_some() { continue; }
+                                    if f64::from(iz+1)*fine <= cutoff { continue; }
                                     let low=key.map(|v|f64::from(v)*fine);let high=key.map(|v|f64::from(v+1)*fine);
                                     if let Some(interval) = prism.expanded_translated_interval(displacement,low,high,padding) {
                                         if let Some(events)=&events {for interval in events.contacts(model,low,high,interval,&changes) {record(interval)?;}}

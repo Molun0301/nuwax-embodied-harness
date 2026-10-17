@@ -845,8 +845,8 @@ pub trait NavPlanner: Send + 'static {
     /// Take observation timing metadata belonging only to the immediately returned command.
     /// None means that this result has no finite observation-time dependency.
     fn take_command_dispatch_bound(&mut self)->Option<CommandDispatchBound> {None}
-    /// Recheck only the previous selected full stopping trajectory after a soft
-    /// surface-view refresh. None keeps the legacy full-computation behavior.
+    /// Recheck the previous selected full stopping trajectory against the latest
+    /// complete surface update. None keeps the legacy full-computation behavior.
     fn revalidate_selected_command(&mut self,_command:Twist2)->Option<PlannerStep> {None}
     /// Recheck the unissued selected command from latest odometry and actual
     /// applied velocity, without selecting another candidate or renewing its lease.

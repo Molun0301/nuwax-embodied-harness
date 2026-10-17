@@ -416,7 +416,13 @@ fn same_retained_mask(left: &schema::NavigationMap3D, right: &schema::Navigation
     if left.committed_map == right.committed_map { return true; }
     match (&left.virtual_obstacles, &right.virtual_obstacles) {
         (None, None) => true,
-        (Some(a), Some(b)) => a.info == b.info && a.data == b.data,
+        // map_load_time is the occupancy commit clock in the production
+        // publisher. It is not geometry and must not revoke a retained map
+        // while an unchanged-mask fine root is being fetched.
+        (Some(a), Some(b)) => a.header.frame_id == b.header.frame_id
+            && a.info.resolution.to_bits() == b.info.resolution.to_bits()
+            && a.info.width == b.info.width && a.info.height == b.info.height
+            && a.info.origin == b.info.origin && a.data == b.data,
         _ => false,
     }
 }
@@ -1630,6 +1636,10 @@ mod tests {
                 frame_id: "map".into(),
             },
             info: schema::MapMetaData {
+                // Match Geometry's production mask clock, not a constant-zero
+                // fixture that hides receipt-only update regressions.
+                map_load_time_sec: (map.committed_map.source_timestamp_ns / 1_000_000_000) as i32,
+                map_load_time_nsec: (map.committed_map.source_timestamp_ns % 1_000_000_000) as i32,
                 resolution: 0.1,
                 width: 40,
                 height: 30,

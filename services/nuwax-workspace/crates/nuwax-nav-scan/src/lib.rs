@@ -1217,6 +1217,18 @@ mod tests {
     }
 
     #[test]
+    fn already_arrived_search_does_not_drive_to_the_goal_center() {
+        let map = coarse_open_floor();
+        let tomo = Tomogram::from_surface(&map).unwrap();
+        let start = ([0.0, 0.2, 0.4], [0.0, 0.0, 0.0, 1.0]);
+        let goal = [0.02, 0.22, 0.4];
+        let path = local_search::plan(&map, &tomo, start,
+            &[[0.0, 0.2, 0.0], [goal[0], goal[1], 0.0]], &motion(), Some(0.0),
+            Some((goal, 0.1)), &[], 3.0, 0.9, true).unwrap();
+        assert_eq!(path, vec![start], "arrival is already satisfied at the actual input pose");
+    }
+
+    #[test]
     fn close_goal_turns_in_place_and_respects_boundary() {
         let map = scene(None);
         let tomo = Tomogram::from_surface(&map).unwrap();

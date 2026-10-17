@@ -275,3 +275,133 @@ fn reported_g1_pose_keeps_unclassified_ankle_height_voxel_as_obstacle() {
     assert!(matches!(witness,Some(BodyRejection::Occupancy{cell:[5,4,-18],source:OccupancySource::Fine,..})),"{witness:?}");
     eprintln!("报告姿态合成对照：平地通过，未分类低障碍保持拒绝：{witness:?}");
 }
+
+#[test]
+fn recent_guide_and_body_share_measured_contact_when_center_ground_is_unknown() {
+    use nuwax_map_chunks::{LayerObservation, LayerObservations, LayerSample, block_key, local_key};
+    let key=[5,0,-1];let point=[0.275,0.025,-0.025];
+    let mut cfg=scene(&[],false).config().clone();cfg.wall_clearance_m=0.4;
+    let mut envelope=model();envelope.z_bounds_m=[-0.45,0.25];
+    let mut observations=SurfaceObservations::new(0.05,32).unwrap();
+    observations.replace_block(block_key(key),std::collections::BTreeMap::from([
+        (key,SurfaceObservation{observed_ns:100,hits:1})])).unwrap();
+    let local=local_key(key);
+    let layers=LayerObservations::from([(local,LayerObservation {
+        members:vec![local],normal:[0.0,0.0,1.0],plane_origin:point,
+        samples:vec![LayerSample{source:Default::default(),point,source_sequence:1,
+            source_timestamp_ns:100,point_index:0}],
+    })]);
+    observations.replace_ground_layers(block_key(key),Arc::new(layers)).unwrap();
+    observations.mark_complete_geometry_source();
+    let map=SurfaceSnapshot::from_points(&[(point[0] as f32,point[1] as f32,point[2] as f32)],cfg,0.05)
+        .unwrap().with_body_envelope(envelope).unwrap().with_observations(Some(Arc::new(observations)));
+    let pose=([0.025,0.025,0.4],[0.0,0.0,0.0,1.0]);
+    assert_eq!(map.locate_support_from_body(pose.0,pose.1,0.4),Err(SurfaceError::MissingSupport));
+    let floor=map.with_recent_obstacle_points(1,100,0,&[0],[(0,point)]).unwrap();
+    floor.validate_body_pose(pose.0,pose.1).unwrap();
+    let bounds=[[-0.5,-0.5],[0.5,0.5]];
+    assert!(floor.recent_obstacle_hints(bounds,pose).unwrap().is_empty(),
+        "an accepted measured floor must not become a detour obstacle because the center lacks ground");
+    assert_eq!(floor.query_ground([pose.0[0],pose.0[1]],0.0).state,GroundQueryState::Unknown);
+    for indices in [&[][..],&[0][..]] {
+        let obstacle=[point[0],point[1],0.35];
+        let blocked=map.with_recent_obstacle_points(2,200,0,indices,[(0,obstacle)]).unwrap();
+        assert_eq!(blocked.validate_body_pose(pose.0,pose.1),Err(SurfaceError::InsufficientClearance));
+        assert_eq!(blocked.recent_obstacle_hints(bounds,pose).unwrap().len(),1,
+            "an independent volume or elevated plane still supplies a real detour obstacle");
+    }
+}
+
+// Frozen pre-fix guide only, for the opt-in same-source cost comparison below.
+impl SurfaceSnapshot {
+    fn legacy_recent_obstacle_hints(&self,bounds_xy:[[f64;2];2],reference_body:([f64;3],[f64;4]))
+        ->Result<Vec<([f64;3],[f64;3])>,SurfaceError> {
+        let Some(recent)=&self.recent_obstacles else {return Ok(vec![]);};
+        let model=self.body_envelope().ok_or(SurfaceError::InvalidPose)?;
+        if !bounds_xy.into_iter().flatten().all(f64::is_finite)
+            || (0..2).any(|i|bounds_xy[0][i]>bounds_xy[1][i])
+            || bounds_xy.into_iter().flatten().any(|v|(v/recent.size).abs()>=f64::from(i32::MAX)*0.5) {
+            return Err(SurfaceError::InvalidConfig("invalid recent-obstacle hint bounds".into()));
+        }
+        if !reference_body.0.into_iter().all(f64::is_finite) {return Err(SurfaceError::InvalidPose);}
+        let r=rotation(reference_body.1)?;
+        if r[2][2]<=0.0 {return Err(SurfaceError::InvalidPose);}
+        let fine=recent.size;let coarse=f64::from(self.config().voxel_size);
+        let low=bounds_xy[0].map(|v|(v/fine).floor() as i32);
+        let high=bounds_xy[1].map(|v|(v/fine).floor() as i32);
+        let centre=self.locate_support_from_body(reference_body.0,reference_body.1,model.body_to_support_z_m).ok();
+        let radius=bounds_xy.into_iter().map(|p|(p[0]-reference_body.0[0]).hypot(p[1]-reference_body.0[1]))
+            .fold(0.0,f64::max)+coarse*2.0;
+        let patch=centre.map(|c|self.ground_patch(c,radius));
+        let mut result=Vec::new();
+        for frame in &recent.frames {for (&[x,y],zs) in frame.columns.range(low..=high) {
+            if y<low[1] || y>high[1] {continue;}
+            let xy=[x,y].map(|v|(f64::from(v)+0.5)*fine);
+            let column=xy.map(|v|(v/coarse).floor() as i32);
+            let ground=patch.as_ref().and_then(|p|p.get(&(column[0],column[1]))).copied();
+            let height=ground.and_then(|ground| {
+                let base=self.cell_position(ground)[2];
+                if let Some(observations)=&self.observations {
+                    let records:Vec<_>=observations.ground_layers([x,y]).collect();
+                    if !records.is_empty() {return records.into_iter().filter(|record|record.members.iter().any(|&z|
+                        (((f64::from(z)+0.5)*fine)/coarse).floor() as i32==ground.2))
+                        .filter_map(|record|record.height_at(xy)).min_by(|a,b|(a-base).abs().total_cmp(&(b-base).abs()));}
+                }
+                Some(base)
+            });
+            let plane=reference_body.0[2]-((xy[0]-reference_body.0[0])*r[2][0]+(xy[1]-reference_body.0[1])*r[2][1])/r[2][2];
+            let z_low=plane+model.z_bounds_m[0]/r[2][2];let z_high=plane+model.z_bounds_m[1]/r[2][2];
+            for &z in zs {
+                if let Some(points)=frame.surface_points.get(&[x,y,z]) {
+                    for &point in points {
+                        if point[2]>=z_low && point[2]<=z_high
+                            && !self.recent_surface_contact(point,height,reference_body.0,r) {result.push((point,point));}
+                    }
+                } else {
+                    let a=[x,y,z].map(|v|f64::from(v)*fine);let b=[x,y,z].map(|v|f64::from(v+1)*fine);
+                    if b[2]>=z_low && a[2]<=z_high {result.push((a,b));}
+                }
+            }
+        }}
+        Ok(result)
+    }
+
+}
+
+#[test]
+#[ignore="manual serial release A/B timing of the same recent-hint source"]
+fn recent_guide_shared_contact_cost_comparison() {
+    use std::{hint::black_box,time::Instant};
+    for evidence in [false,true] {for stride in [1,4] {for frames in [1,8] {
+        let base=layered_map(&[[-1,-1]]);
+        let base=if evidence {with_measured_floor(base,-0.025)}else{base};
+        let mut model=base.body_envelope().unwrap().clone();model.z_bounds_m=[-0.45,0.25];
+        let mut map=base.with_body_envelope(model).unwrap();
+        let points:Vec<_>=(-12_i32..12).flat_map(|x|(-12_i32..12).filter(move|y|
+            x.rem_euclid(stride)==0 && y.rem_euclid(stride)==0).map(move|y|
+            [(f64::from(x)+0.5)*0.05,(f64::from(y)+0.5)*0.05,-0.025])).collect();
+        let ids:Vec<_>=(0..points.len() as u32).collect();
+        for seq in 1..=frames {map=map.with_recent_obstacle_points(seq,seq*100,10000,&ids,
+            points.iter().copied().enumerate().map(|(i,p)|(i as u32,p))).unwrap();}
+        let pose=([0.025,0.025,0.4],[0.,0.,0.,1.]);let bounds=[[-0.6,-0.6],[0.6,0.6]];
+        let old=map.legacy_recent_obstacle_hints(bounds,pose).unwrap();
+        let new=map.recent_obstacle_hints(bounds,pose).unwrap();
+        assert_eq!(new,old,"timing fixture must preserve the same interpretation");
+        for cold in [false,true] {for pair in 0..5 {
+            let mut ns=[0;2];
+            for arm in if pair%2==0 {[0,1]}else{[1,0]} {
+                for _ in 0..20 {
+                    // Fork only cache owners; immutable maps/observations are shared.
+                    // Exclude fork allocation from the timed hint query itself.
+                    let source=if cold {map.fork_for_planning()}else{map.clone()};
+                    let start=Instant::now();
+                    let result=if arm==0 {source.legacy_recent_obstacle_hints(black_box(bounds),black_box(pose))}
+                        else {source.recent_obstacle_hints(black_box(bounds),black_box(pose))};
+                    ns[arm]+=start.elapsed().as_nanos();
+                    assert_eq!(result.unwrap(),old);
+                }
+            }
+            eprintln!("RECENT_HINT_AB measured={evidence} stride={stride} frames={frames} cold={cold} pair={pair} columns={} calls=20 old_ns={} new_ns={}",points.len()*frames as usize,ns[0],ns[1]);
+        }}
+    }}}
+}

@@ -236,8 +236,14 @@ class NavigationStateMachine:
         backend_status: str,
         message: Optional[str] = None,
         goal_reached: bool = False,
+        goal_id: Optional[str] = None,
     ) -> NavigationStatus:
-        """根据通用后端状态更新平台状态。"""
+        """投影已由调用方检查身份和时序的后端快照。
+
+        与本地发起动作不同，订阅者可能错过 ACCEPTED 首帧，也可能先收到重规划
+        或重试的新代次；不能要求逐帧走完本地迁移，再用旧状态覆盖权威反馈。
+        到达与停车证明仍由调用方分别核对，状态投影不生成这些证据。
+        """
 
         # 所有后端使用同一状态表。
         status_map = {
@@ -261,24 +267,43 @@ class NavigationStateMachine:
         if new_status is None:
             return self._current_status
 
-        if new_status == NavigationStatus.SUCCEEDED and goal_reached:
-            return self.succeed(message or "导航目标已到达。")
-        if new_status == NavigationStatus.FAILED:
-            return self.fail(message or "导航失败。")
-        if new_status == NavigationStatus.CANCELLED:
-            return self.cancel(message or "导航已取消。")
-        if new_status == NavigationStatus.RUNNING:
-            if normalized == "recovery":
-                self.enter_recovery(message or "导航后端进入恢复行为。")
-            return self.start_running(message or "开始执行导航。")
-        if new_status == NavigationStatus.PLANNING:
-            return self.start_planning(message or "开始路径规划。")
-        if new_status == NavigationStatus.ACCEPTED and self._current_status == NavigationStatus.IDLE:
-            return self.set_goal(self._current_goal_id or "unknown", message or "目标已接受。")
+        if new_status == NavigationStatus.IDLE or goal_id != self._current_goal_id:
+            self.reset()
+        if new_status != NavigationStatus.IDLE and (
+            self._start_time is None
+            or (self.is_terminal and new_status in {
+                NavigationStatus.ACCEPTED, NavigationStatus.PLANNING, NavigationStatus.RUNNING,
+            })
+        ):
+            self._start_time = utc_now()
+            self._end_time = None
+            self._recovery_attempts = 0
+            self._last_error = None
+        # 匿名帧不能继承提交中目标的身份、计时或失败诊断。
+        self._current_goal_id = goal_id
 
+        previous_status = self._current_status
+        previous_backend_state = self._nav2_state
         self._current_status = new_status
-        if message:
-            self._status_message = message
+        self._nav2_state = normalized
+        self._status_message = message or {
+            NavigationStatus.IDLE: None,
+            NavigationStatus.ACCEPTED: "导航目标已接受。",
+            NavigationStatus.PLANNING: "开始路径规划。",
+            NavigationStatus.RUNNING: "开始执行导航。",
+            NavigationStatus.SUCCEEDED: "导航目标已到达。" if goal_reached else "导航后端报告完成。",
+            NavigationStatus.FAILED: "导航失败。",
+            NavigationStatus.CANCELLED: "导航已取消。",
+        }[new_status]
+        if normalized == "recovery" and previous_backend_state != "recovery":
+            self.enter_recovery(message or "导航后端进入恢复行为。")
+        if self.is_terminal:
+            if self._end_time is None or previous_status != new_status:
+                self._end_time = utc_now()
+            if new_status == NavigationStatus.FAILED:
+                self._last_error = self._status_message
+        else:
+            self._end_time = None
         return self._current_status
 
     def get_state_summary(self) -> Dict[str, Any]:

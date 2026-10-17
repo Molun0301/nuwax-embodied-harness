@@ -1221,15 +1221,44 @@ mod tests {
     }
 
     #[test]
-    fn both_modes_reject_changed_support_but_accept_old_ground() {
+    fn both_modes_allow_missing_ground_without_inventing_obstacles() {
         for enabled in [true,false] {
             let mut follower = RouteFollower::new(comparison_config(Some(enabled))).unwrap();
             follower.update_execution_map(ExecutionMap::Surface(comparison_map(false,None))).unwrap();
             comparison_route(&mut follower,comparison_pose(0.95,0),comparison_pose(3.0,0));
-            assert!(matches!(ready_step(&mut follower, 0.3),PlannerStep::Command(c) if c.linear.x > 0.0));
+            assert!(matches!(ready_step(&mut follower,0.3),PlannerStep::Command(c) if c.linear.x>0.0));
+            // This fixture removes ground samples; it does not measure a cliff or obstacle.
             follower.update_execution_map(ExecutionMap::Surface(comparison_map(true,None))).unwrap();
             follower.update_odometry(comparison_pose(0.95,1));
-            assert!(!matches!(follower.step(0.3),PlannerStep::Command(c) if c.linear.x > 0.0),"changed support allowed motion, mode={enabled}");
+            assert!(matches!(ready_step(&mut follower,0.3),PlannerStep::Command(c) if c.linear.x>0.0),
+                "missing ground must remain an admissible candidate: mode={enabled}");
+            assert!(follower.local_failures().iter().all(|failure|failure.blocked.is_none()));
+            assert!(follower.planner.local_costs().is_empty());
+            if !enabled {assert_eq!(follower.local_planning_calls(),0);}
+        }
+    }
+
+    #[test]
+    fn both_modes_reject_known_support_obstacle_but_accept_old_ground() {
+        let clear = comparison_map(false,None);
+        let points: Vec<_> = clear.cell_keys().map(|(x,y,z)| {
+            // A measured 40 cm rise exceeds this body's 20 cm step capability
+            // and intersects its current footprint. Keep occupancy evidence.
+            let z = if (10..=13).contains(&x) {z+4} else {z};
+            ((x as f32+0.5)*0.1,(y as f32+0.5)*0.1,(z as f32+0.5)*0.1)
+        }).collect();
+        let raised = Arc::new(SurfaceSnapshot::from_points(&points,clear.config().clone(),0.1).unwrap()
+            .with_body_envelope(clear.body_envelope().unwrap().clone()).unwrap());
+        assert!(raised.validate_body_pose([0.95,1.0,0.5],[0.0,0.0,0.0,1.0]).is_err(),
+            "fixture must contain measured incompatible body geometry");
+        for enabled in [true,false] {
+            let mut follower = RouteFollower::new(comparison_config(Some(enabled))).unwrap();
+            follower.update_execution_map(ExecutionMap::Surface(clear.clone())).unwrap();
+            comparison_route(&mut follower,comparison_pose(0.95,0),comparison_pose(3.0,0));
+            assert!(matches!(ready_step(&mut follower, 0.3),PlannerStep::Command(c) if c.linear.x > 0.0));
+            follower.update_execution_map(ExecutionMap::Surface(raised.clone())).unwrap();
+            follower.update_odometry(comparison_pose(0.95,1));
+            assert!(!matches!(follower.step(0.3),PlannerStep::Command(c) if c.linear.x > 0.0),"known incompatible support allowed motion, mode={enabled}");
             let mut config = comparison_config(Some(enabled));
             config.max_observation_age_sec = Some(1.0);
             let mut follower = RouteFollower::new(config).unwrap();
@@ -1405,8 +1434,7 @@ mod tests {
         assert!(arrived);
         assert!(actual.pose.position.distance(goal.pose.position) < 0.35);
     }
-    #[test]
-    fn disconnected_forward_window_defers_to_fresh_controller_without_inventing_obstruction() {
+    fn rolling_window_follower() -> (RouteFollower,Arc<SurfaceSnapshot>) {
         let envelope = SurfaceBodyEnvelope {
             footprint_xy_m: vec![[-0.1, -0.1], [0.1, -0.1], [0.1, 0.1], [-0.1, 0.1]],
             z_bounds_m: [-0.05, 0.2],
@@ -1463,32 +1491,68 @@ mod tests {
             .unwrap();
         assert!(matches!(ready_step(&mut follower, 0.2), PlannerStep::Command(_)));
         assert!(follower.local_end < *follower.cumulative.last().unwrap());
+        (follower,clear)
+    }
+
+    #[test]
+    fn missing_forward_ground_refreshes_window_without_inventing_obstruction() {
+        let (mut follower,clear) = rolling_window_follower();
         let previous_local = follower.local_plans();
         let missing = Arc::new(
             crate::surface_follower::test_snapshot(0.0, true)
-                .with_body_envelope(envelope)
+                .with_body_envelope(clear.body_envelope().unwrap().clone())
                 .unwrap(),
         );
         follower
             .update_execution_map(ExecutionMap::Surface(missing))
             .unwrap();
-        let mut moved = make(0.7);
+        let mut moved = comparison_pose(0.7,0);
         moved.stamp = Timestamp::from_unix(2, 0);
         follower.update_odometry(moved);
         let outcome = follower.step(0.2);
-        assert!(matches!(outcome, PlannerStep::Command(_) | PlannerStep::ReplanRequired(_)),
-            "a current admitted route must use a fresh controller outcome: {outcome:?}");
-        wait_for(|| {
-            follower.step(0.2);
-            !follower.local_failures().is_empty()
-        });
-        assert!(follower.local_failures().iter().all(|failure| failure.blocked.is_none()));
-        assert!(follower.planner.local_costs().is_empty(), "search failure must not penalize PCT");
-        assert_eq!(follower.local_plans(), previous_local);
-        assert!(follower.local_path().is_some(), "search failure keeps the last display trajectory");
+        assert!(matches!(outcome,PlannerStep::Command(c) if c.linear.x>0.0),
+            "missing samples must not revoke fresh guarded control: {outcome:?}");
+        // Exercise the real Scan algorithm across the missing strip: unknown
+        // ground can produce a candidate, so waiting for search failure is wrong.
+        wait_for_plan(&mut follower,previous_local);
+        assert!(follower.local_failures().is_empty());
+        assert!(follower.planner.local_costs().is_empty(), "missing samples must not penalize PCT");
+        assert!(follower.local_path().is_some());
+        let refreshed = follower.local_plans();
         follower.update_execution_map(ExecutionMap::Surface(clear)).unwrap();
-        wait_for_plan(&mut follower, previous_local);
-        assert_eq!(follower.local_plans(), previous_local + 1);
+        wait_for_plan(&mut follower,refreshed);
+        assert!(matches!(follower.step(0.2),PlannerStep::Command(c) if c.linear.x>0.0));
+        follower.stop();
+        assert!(follower.local_failures().is_empty());
+    }
+
+    #[test]
+    fn incomplete_forward_window_keeps_fresh_control_and_recovers() {
+        let (mut follower,_) = rolling_window_follower();
+        let previous_local = follower.local_plans();
+        let previous_path = follower.local_path().cloned();
+        let route = follower.route.clone();
+        let goal = follower.goal.clone();
+        // Typed failure injection tests owner/result handling, not geometry.
+        // Preserve the real idle owner for an algorithm-backed recovery below.
+        let real_owner = follower.owner.take().unwrap();
+        assert!(real_owner.is_idle_for_test());
+        install_failures(&mut follower,typed_failures());
+        follower.update_odometry(comparison_pose(0.7,1));
+        complete_failure(&mut follower);
+        assert!(matches!(follower.step(0.2),PlannerStep::Command(c) if c.linear.x>0.0));
+        assert_eq!(follower.local_failures(),typed_failures());
+        assert!(follower.planner.local_costs().is_empty(), "incomplete search must not penalize PCT");
+        assert_eq!(follower.local_plans(),previous_local);
+        assert_eq!(follower.local_path(),previous_path.as_ref());
+        assert_eq!(follower.route,route);
+        assert_eq!(follower.goal,goal);
+        follower.cancel_planning();
+        follower.owner=Some(real_owner);
+        follower.dirty=true;
+        wait_for_plan(&mut follower,previous_local);
+        assert!(follower.local_failures().is_empty());
+        assert!(matches!(follower.step(0.2),PlannerStep::Command(c) if c.linear.x>0.0));
         follower.stop();
         assert!(follower.local_failures().is_empty());
     }

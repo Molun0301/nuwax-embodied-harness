@@ -3,6 +3,9 @@
 use std::sync::Arc;
 #[path="surface_body_control.rs"]
 mod body_control;
+#[cfg(test)]
+#[path="surface_rejoin_probe.rs"]
+pub(crate) mod rejoin_probe;
 
 use nuwax_nav_astar::controllers::{angle_diff, Controller, PController};
 use nuwax_nav_astar::global_planner::GlobalPlannerConfig;
@@ -261,23 +264,28 @@ impl SurfaceFollower {
         crate::validate_map_pose(odometry, "odometry")?;
         // 完整规划属于后台MLS拥有方；调度器只验证当前接续与有界前向段，
         // 避免长路线的全图遍历阻塞优先取消和续租。
-        let (progress, projected) = if path.poses[0].pose.position == odometry.pose.position {
+        let (progress, projected, path_index) = if path.poses[0].pose.position == odometry.pose.position {
             // 原始首点就是当前机体时，不让零弧长的旋转点或归一化余量改变接续站姿。
-            (0.0, path.poses[0].clone())
+            (0.0, path.poses[0].clone(), 1)
         } else {
-            closest_in_window(&path, &cumulative, odometry.pose.position, 0.0,
+            closest_in_window_with_segment(&path, &cumulative, odometry.pose.position, 0.0,
                 self.config.max_path_deviation_m)
         };
+        #[cfg(test)] rejoin_probe::admission_projection(progress, &projected);
         if projected.pose.position.distance(odometry.pose.position)
             > self.config.max_path_deviation_m
         {
+            #[cfg(test)] rejoin_probe::admission_position_gate(false);
             return Err(rejected("新路径首段不能与当前三维机体位置连续接续"));
         }
+        #[cfg(test)] rejoin_probe::admission_position_gate(true);
         if map.body_envelope().is_some() {
             let q = odometry.pose.orientation;
             let from = (xyz(odometry.pose.position), [q.x, q.y, q.z, q.w]);
             // 完整机体已沿实际地形验证；粗格中心连边不能否决精细层上的合法接续。
-            if body_control::connection_endpoint(map, from, &projected).is_none() {
+            let connected=body_control::connection_endpoint(map, from, &projected).is_some();
+            #[cfg(test)] rejoin_probe::admission_connector(connected);
+            if !connected {
                 return Err(rejected("新路径不能从实际机体站姿连续接续"));
             }
         } else {
@@ -294,7 +302,10 @@ impl SurfaceFollower {
         }
         self.progress_m = progress;
         self.last_tracked_pose = Some(odometry.clone());
-        self.path_index=1;
+        // Arc progress and the consumed waypoint belong to the same selected
+        // segment. Keep its incoming endpoint even at t=1: later zero-length
+        // yaw waypoints must still pass the original turn/progress handling.
+        self.path_index=path_index;
         self.alignment_target_index=None;
         self.path = Some(path);
         self.goal = Some(goal);
@@ -703,7 +714,13 @@ impl NavPlanner for SurfaceFollower {
     ) -> Result<(), RuntimeError> {
         self.last_command_dispatch_bound = None;
         match path {
-            ExecutionPath::Surface(path) if yaws.is_none() => self.admit_path(path, goal),
+            ExecutionPath::Surface(path) if yaws.is_none() => {
+                #[cfg(test)] rejoin_probe::admission_begin(
+                    self.odometry.as_ref(),path.poses.first(),self.progress_m,self.path_index);
+                let result=self.admit_path(path,goal);
+                #[cfg(test)] rejoin_probe::admission_end(&result,self.progress_m,self.path_index);
+                result
+            },
             _ => Err(rejected(
                 "三维后端必须接收完整三维路径，不能使用二维朝向来源",
             )),
@@ -849,20 +866,26 @@ fn normalized_quaternion(q: Quaternion) -> [f64; 4] {
 }
 
 fn pose_at_distance(path: &Path3D, cumulative: &[f64], distance: f64) -> PoseStamped {
+    pose_at_distance_with_segment(path,cumulative,distance).0
+}
+
+fn pose_at_distance_with_segment(path: &Path3D, cumulative: &[f64], distance: f64) -> (PoseStamped, usize) {
     let end = cumulative.partition_point(|value| *value <= distance);
     if end >= path.poses.len() {
-        return path.poses.last().expect("非空路径").clone();
+        // Admission starts at zero. A single pose or all-zero-length path has
+        // no positive segment; retain its previous index-1 consumption rule.
+        return (path.poses.last().expect("非空路径").clone(),1);
     }
     let start = end.saturating_sub(1);
     let length = cumulative[end] - cumulative[start];
     if length <= f64::EPSILON {
-        return path.poses[end].clone();
+        return (path.poses[end].clone(),end);
     }
-    interpolate_pose(
+    (interpolate_pose(
         &path.poses[start],
         &path.poses[end],
         ((distance - cumulative[start]) / length).clamp(0.0, 1.0),
-    )
+    ),end)
 }
 
 fn closest_in_window(
@@ -872,8 +895,17 @@ fn closest_in_window(
     begin: f64,
     end: f64,
 ) -> (f64, PoseStamped) {
+    let (progress,pose,_)=closest_in_window_with_segment(path,cumulative,position,begin,end);
+    (progress,pose)
+}
+
+// Carry provenance when the projection is selected; do not recover an index
+// afterwards from s, which cannot distinguish same-position yaw waypoints.
+fn closest_in_window_with_segment(
+    path: &Path3D, cumulative: &[f64], position: Point3, begin: f64, end: f64,
+) -> (f64, PoseStamped, usize) {
     let mut best_s = begin;
-    let mut best = pose_at_distance(path, cumulative, begin);
+    let (mut best,mut best_index) = pose_at_distance_with_segment(path, cumulative, begin);
     let mut best_distance = best.pose.position.distance(position);
     let first_segment = cumulative
         .partition_point(|distance| *distance < begin)
@@ -894,6 +926,7 @@ fn closest_in_window(
         if b.distance(position) <= 1e-6 && end_s >= begin && end_s <= end + 1e-6 {
             best_s = end_s;
             best = path.poses[index + 1].clone();
+            best_index = index + 1;
             best_distance = b.distance(position);
             continue;
         }
@@ -910,9 +943,10 @@ fn closest_in_window(
             best_distance = distance;
             best_s = start_s + ratio * length;
             best = candidate;
+            best_index = index + 1;
         }
     }
-    (best_s, best)
+    (best_s, best, best_index)
 }
 
 #[cfg(test)]
@@ -957,6 +991,7 @@ pub(crate) fn prepared_test_surface(map:Arc<SurfaceSnapshot>)->ExecutionMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("surface_projection_index_tests.rs");
     use nuwax_nav_types_messages::{GoalOptions, NavFrameId, Pose3, Timestamp};
 
     fn omni_route_follower(poses: Vec<PoseStamped>, calibrated: bool) -> (SurfaceFollower, Arc<SurfaceSnapshot>) {

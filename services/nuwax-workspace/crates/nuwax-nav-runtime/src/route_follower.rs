@@ -611,6 +611,7 @@ mod tests {
     use super::*;
     include!("route_selective_refresh_tests.rs");
     include!("route_progress_prefix_tests.rs");
+    include!("route_partial_priority_tests.rs");
     use nuwax_nav_mls_planner::SurfaceBodyEnvelope;
     use nuwax_nav_types_messages::{MotionKinematics, MotionModel, NavFrameId, Pose3, Quaternion, Timestamp};
     use crate::route_planning::Candidate;

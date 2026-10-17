@@ -6,6 +6,11 @@ use std::sync::{
 };
 use std::thread::JoinHandle;
 
+#[cfg(test)]
+thread_local! { static CURRENT_REQUEST_FOR_TEST: std::cell::Cell<Option<(u64,u64)>> = const { std::cell::Cell::new(None) }; }
+#[cfg(test)]
+pub(crate) fn current_request_for_test()->Option<(u64,u64)> { CURRENT_REQUEST_FOR_TEST.get() }
+
 #[derive(Clone)]
 pub(crate) struct Cancellation {
     pub epoch: Arc<AtomicU64>,
@@ -81,11 +86,13 @@ impl<T: Send + 'static, R: Send + 'static> PlanningOwner<T, R> {
                         epoch: worker.epoch.clone(),
                         expected: request.epoch,
                     };
+                    #[cfg(test)] CURRENT_REQUEST_FOR_TEST.set(Some((request.id,request.epoch)));
                     let result = if cancel.cancelled() {
                         None
                     } else {
                         Some(compute(request.value, &cancel))
                     };
+                    #[cfg(test)] CURRENT_REQUEST_FOR_TEST.set(None);
                     let mut result = result.map(|value| Completion {
                         id: request.id,
                         epoch: request.epoch,

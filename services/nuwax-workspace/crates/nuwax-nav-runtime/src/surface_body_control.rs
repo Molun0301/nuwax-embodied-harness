@@ -754,6 +754,7 @@ impl SurfaceFollower {
         }
         #[cfg(test)] drop(profile_lookahead);
         let target = &path.poses[target_index];
+        #[cfg(test)] super::rejoin_probe::target(self.path_index,target_index,rotation,pose,target,previous);
         let heading_error = angle_diff(target.pose.orientation.yaw(), yaw);
         self.control_target = Some(planar(target));
         let mut preferred = Twist2 {

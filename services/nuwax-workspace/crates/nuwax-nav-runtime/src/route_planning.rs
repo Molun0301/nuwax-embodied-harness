@@ -1,4 +1,7 @@
 //! Planning-only state. This module has no controller or motion port.
+#[cfg(test)]
+#[path="route_priority_probe.rs"]
+pub(crate) mod priority_probe;
 #[path="recent_guide_overlay.rs"]
 mod recent_guide_overlay;
 use crate::planning_owner::Cancellation;
@@ -317,6 +320,8 @@ impl PlanKernel {
             }
             let mut reference = r.reference.clone();
             if *detour && reference.len() > 1 {
+                #[cfg(test)] let pct_at=priority_probe::clock();
+                #[cfg(test)] let mut pct_stats=None;
                 if let Ok(route) = tomogram.plan_bounded(
                     reference[0],
                     *reference.last().unwrap(),
@@ -326,8 +331,10 @@ impl PlanKernel {
                     Some(r.scan.horizon_m * 1.5),
                     &costs,
                 ) {
+                    #[cfg(test)] {pct_stats=Some(route.stats.clone());}
                     reference = route.points;
                 }
+                #[cfg(test)] priority_probe::pct(pct_at,pct_stats);
             }
             let mut follow_reference = *detour;
             if let Some(overlay) = recent_guide.as_ref().filter(|overlay|
@@ -361,6 +368,8 @@ impl PlanKernel {
                     && f.detour == follow_reference
                     && f.straight == straight
             });
+            #[cfg(test)] let branch_at=priority_probe::branch_begin(*detour,follow_reference,straight,
+                &r.reference,&reference,cached.is_some());
             let result = if let Some(f) = cached {
                 Err(f.failure.clone())
             } else {
@@ -400,6 +409,7 @@ impl PlanKernel {
                 }
                 result
             };
+            #[cfg(test)] priority_probe::branch_end(branch_at,&result);
             match result {
                 Ok(trajectory) => {
                     let path = Path3D {

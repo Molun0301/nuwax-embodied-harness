@@ -8,6 +8,7 @@ use crate::planning_owner::Cancellation;
 use crate::{SurfaceFollowerConfig, SurfaceSnapshot};
 use nuwax_nav_scan::{BodyPose, LocalPlanError, ScanConfig};
 use nuwax_nav_types_messages::{GoalOptions, Path3D, Point3, PoseStamped, Quaternion};
+use std::borrow::Cow;
 use std::sync::Arc;
 
 /// Immutable global reference roots. Clipping/materialization runs only on the
@@ -395,7 +396,7 @@ impl PlanKernel {
                 failures.push(f.failure.clone());
                 continue;
             }
-            let mut reference = r.reference.clone();
+            let mut reference: Cow<'_, [[f64; 3]]> = Cow::Borrowed(r.reference.as_slice());
             if *detour && reference.len() > 1 {
                 #[cfg(test)] let pct_at=priority_probe::clock();
                 #[cfg(test)] let mut pct_stats=None;
@@ -409,7 +410,7 @@ impl PlanKernel {
                     &costs,
                 ) {
                     #[cfg(test)] {pct_stats=Some(route.stats.clone());}
-                    reference = route.points;
+                    reference = Cow::Owned(route.points);
                 }
                 #[cfg(test)] priority_probe::pct(pct_at,pct_stats);
             }
@@ -422,7 +423,7 @@ impl PlanKernel {
                     &r.boundary, None, Some(r.scan.horizon_m*1.5), &costs,
                     &|a,b|overlay.accepts(a,b),
                 ) {
-                    Ok(route) => {reference = route.points; follow_reference = true;}
+                    Ok(route) => {reference = Cow::Owned(route.points); follow_reference = true;}
                     Err(reason) => {
                         // 外接圆比完整姿态保守，窄门仍交给原机体扫掠判断。
                         // 引导失败不等于真实不可通行；非法提示输入则在上方明确返回。
@@ -702,7 +703,14 @@ mod tests {
         request.source=Arc::new(original.with_recent_obstacle_points(1,1_000_000_000,0,&[],
             (0..5).map(|i|(i,[0.73,0.8+f64::from(i)*0.1,0.5]))).unwrap());
         request.detour=true;request.final_yaw=Some(0.0);
-        let detour=kernel.compute_inner(&request,&cancel).unwrap_or_else(|e|panic!("detour: {e:?}"));
+        let original_reference=request.reference.clone();
+        let original_boundary=request.boundary.clone();
+        let original_horizon=request.scan.horizon_m.to_bits();
+        let original_costs=kernel.config.pct.local_costs();
+        priority_probe::begin();
+        let detour_result=kernel.compute_inner(&request,&cancel);
+        let detour_work=priority_probe::end();
+        let detour=detour_result.unwrap_or_else(|e|panic!("detour: {e:?}"));
         assert!(Arc::ptr_eq(&cached,&kernel.local_map.as_ref().unwrap().2));
         assert!(nuwax_nav_pct::same_source_geometry(&original,&request.source));
         assert!(detour.path.poses.iter().any(|p|(p.pose.position.y-1.0).abs()>0.1));
@@ -710,9 +718,30 @@ mod tests {
             request.source.validate_body_motion(body(&pair[0]),body(&pair[1]),&[]).unwrap();
         }
         request.source=Arc::new(request.source.with_recent_obstacle_points(2,2_000_000_000,0,&[],std::iter::empty()).unwrap());
-        let clear=kernel.compute_inner(&request,&cancel).unwrap_or_else(|e|panic!("clear: {e:?}"));
+        assert!(exact_points(&request.reference,&original_reference));
+        assert!(exact_points(&request.boundary,&original_boundary));
+        assert_eq!(request.scan.horizon_m.to_bits(),original_horizon);
+        assert!(exact_costs(&kernel.config.pct.local_costs(),&original_costs));
+        priority_probe::begin();
+        let clear_result=kernel.compute_inner(&request,&cancel);
+        let clear_work=priority_probe::end();
+        let clear=clear_result.unwrap_or_else(|e|panic!("clear: {e:?}"));
         assert!(Arc::ptr_eq(&cached,&kernel.local_map.as_ref().unwrap().2));
         assert!(clear.path.poses.iter().all(|p|(p.pose.position.y-1.0).abs()<1e-6));
+        assert!(exact_points(&request.reference,&original_reference));
+        for work in [&detour_work,&clear_work] {
+            assert_eq!(work.branches.len(),1);
+            assert_eq!(work.pct.len(),1);
+            assert!(work.pct[0].stats.is_some(),"actual unfiltered PCT must succeed");
+            assert!(work.branches[0].detour && work.branches[0].follow_reference && !work.branches[0].straight);
+        }
+        assert_eq!(detour_work.kernel_phases.iter().filter(|p|p.phase=="filtered_recent_pct").count(),1);
+        assert!(!clear_work.kernel_phases.iter().any(|p|p.phase=="filtered_recent_pct"));
+        assert!(!exact_points(&detour_work.branches[0].reference,&clear_work.branches[0].reference),
+            "same static PCT inputs require the recent filtered success to replace its reference");
+        eprintln!("COW_REFERENCE_REPLACEMENTS detour_bits={:?} clear_bits={:?}",
+            detour_work.branches[0].reference.iter().map(|p|p.map(f64::to_bits)).collect::<Vec<_>>(),
+            clear_work.branches[0].reference.iter().map(|p|p.map(f64::to_bits)).collect::<Vec<_>>());
     }
     #[test]
     fn recent_radius_guide_failure_preserves_pose_feasible_narrow_door() {

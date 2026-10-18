@@ -296,7 +296,13 @@ mod partial_choice {
     fn real_clear_nominal_full_keeps_zero_detour_work() {
         let (mut kernel, request, cancel) = fixture();
         assert!(kernel.scan_hook.is_none());
+        let original_reference = request.reference.clone();
         let (result, work) = run(&mut kernel, &request, &cancel);
+        assert!(exact_points(&request.reference, &original_reference));
+        assert_eq!(work.branches.len(), 1);
+        assert!(exact_points(&work.branches[0].reference, &original_reference));
+        eprintln!("COW_REFERENCE_NOMINAL reference_bits={:?}",
+            work.branches[0].reference.iter().map(|p| p.map(f64::to_bits)).collect::<Vec<_>>());
         let result = result.unwrap_or_else(|errors| panic!("real clear fixture: {errors:?}"));
         assert!(!result.partial);
         assert_eq!(branches(&work), [false]);

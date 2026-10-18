@@ -617,6 +617,14 @@ C3原槽为448姿态full，同批prefix及固定hit [283,47,51] 实际碰撞edge
 
 候选按预声明门拒绝，71语义不抵消不利N，T/R不运行。先按计划恢复语义B并default7通过（4s），再完整恢复17c1生产与事实测试，2新候选测试归档撤出；原11核心方法逐字一致。只持久化本报告与整数记录，不保留额外生产代码或永久测试接线。首次A check共同helper别名缺口E0425及构建会话未知终态都保留；两臂共同修正后仅既定四样本。完整复算见[拒绝报告](navigation-single-full-rejection-20261018.md)及[整数记录](navigation-single-full-rejection-20261018.json)。
 
+## 第四十五阶段：借用分支只读参考，移除一次临时Vec复制
+
+接受四处最小生产修改：PlanKernel每个未命中失败槽的分支使用标准库Cow借用原request.reference，两处PCT成功则直接move其points进入Owned。此前每个分支先clone原参考，成功PCT又覆盖并释放；所有后续消费者只读取切片。原失败槽仍拥有原request参考副本，请求API、生命周期、取消/失败顺序及输入版本不改，无新字段、锁、hash或计数。
+
+只在原两个测试补既有probe内容断言。旧核2项增强首跑通过，候选12项普通exact首跑通过，actual-list各1；合计14执行/12distinct。A/B nominal、近期detour及clear完整参考bits逐项相同，原request不变；近期两次原PCT成功、detour独有filtered phase，同静态Tomogram与原输入下参考4点对2点，证明两成功接管路径。原窄门测试保持；其独立filtered Err不能说成owner内错误直接观测。其余真实/合成分支资格按原范围保留，不扩大缓存键或端到端覆盖。
+
+A/B default release check/no-run与local-guidance-qualification+body-query-profile tests check全部通过，只有同一target增量构建。原重压力13/14、全链default7及AB计时未执行。本轮结论仅删除每个到达初始化位置的分支一次实际Vec复制，不宣称规划耗时、CPU或RSS改善；历史wide原参考仅两点，也不把几十字节复制与秒级搜索关联。
+
 ## 后续持续检查
 
 1. 墙前晚到路径的实际恢复与初始 full/partial/PCT 顺序，保留及时移动和真实避障

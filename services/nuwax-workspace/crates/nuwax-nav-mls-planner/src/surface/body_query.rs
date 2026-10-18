@@ -61,6 +61,25 @@ impl SurfaceSnapshot {
             &&same(&self.recent_obstacles,&other.recent_obstacles)
     }
 
+    /// Conservative equality for Explore's derived planning queries only.
+    /// Admitted raw timestamps/hits can differ; this is neither source identity
+    /// nor permission to reuse a live body-execution cache. All derived layer
+    /// fields, occupancy, completeness, body geometry and recent input remain equal.
+    pub fn same_planning_query_view(&self,other:&Self)->bool {
+        let observations=match (&self.observations,&other.observations) {
+            (None,None)=>true,
+            (Some(left),Some(right))=>left.same_planning_query_view(right),
+            _=>false,
+        };
+        let recent=match (&self.recent_obstacles,&other.recent_obstacles) {
+            (None,None)=>true,
+            (Some(left),Some(right))=>Arc::ptr_eq(left,right),
+            _=>false,
+        };
+        self.ground_evidence==other.ground_evidence && Arc::ptr_eq(&self.data,&other.data)
+            && observations && recent
+    }
+
     pub(super) fn can_defer_body_query_edges(&self)->bool {
         let config=self.config();
         // 软项只影响排序，但溢出成无穷也会拒绝边；仅在其保守上界有限时延后。
@@ -194,5 +213,197 @@ mod tests {
         let direct=blind.body_query_with_current_support(moved.0,moved.1).unwrap();
         assert_eq!(next.validate_body_motion(moved,from,&[]),direct.validate_body_motion(moved,from,&[]),
             "后续足迹派生始终回到同一原始图，不累积旧盲区授权");
+    }
+}
+
+#[cfg(test)]
+mod planning_snapshot_identity_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use nuwax_map_chunks::{LayerObservation, LayerObservations, LayerSample};
+
+    fn scene() -> SurfaceSnapshot {
+        let points: Vec<_> = (-12..12).flat_map(|x| (-8..8).map(move |y|
+            ((x as f32 + 0.5) * 0.1, (y as f32 + 0.5) * 0.1, 0.025))).collect();
+        let config = Config {
+            world_frame: "map".into(), voxel_size: 0.1, robot_height: 0.2,
+            surface_closing_radius: 0.0, node_spacing_m: 0.3,
+            wall_clearance_m: 0.0, wall_buffer_m: 0.2, wall_buffer_weight: 2.0,
+            max_slope_deg: 18.0, step_threshold_m: 0.21,
+            min_step_tread_depth_m: 0.2, step_penalty_weight: 2.0,
+            goal_tolerance: 0.1, viz_publish_hz: 0.0,
+        };
+        let model = SurfaceBodyEnvelope {
+            footprint_xy_m: vec![[-0.2, -0.12], [0.3, -0.12], [0.3, 0.12], [-0.2, 0.12]],
+            z_bounds_m: [-0.1, 0.15], body_to_support_z_m: 0.4,
+            max_step_up_m: 0.21, max_step_down_m: 0.1,
+            max_cross_slope_deg: 18.0, support_uncertainty_m: 0.0,
+        };
+        SurfaceSnapshot::from_points(&points, config, 0.05).unwrap()
+            .with_body_envelope(model).unwrap()
+    }
+
+    fn record(time: u64, z: f64) -> Arc<LayerObservations> {
+        Arc::new(BTreeMap::from([(0, LayerObservation {
+            members: vec![0], normal: [0.0, 0.0, 1.0],
+            plane_origin: [0.025, 0.025, 0.025],
+            samples: vec![LayerSample {
+                source: Default::default(), point: [0.025, 0.025, z],
+                source_sequence: time, source_timestamp_ns: time, point_index: 0,
+            }],
+        })]))
+    }
+
+    fn observations() -> SurfaceObservations {
+        let mut observations = SurfaceObservations::new(0.05, 32).unwrap();
+        refresh(&mut observations, 100, 1, 0.02);
+        observations
+    }
+
+    fn refresh(observations: &mut SurfaceObservations, time: u64, hits: u16, z: f64) {
+        observations.replace_block([0, 0, 0], BTreeMap::from([
+            ([0, 0, 0], SurfaceObservation { observed_ns: time, hits }),
+        ])).unwrap();
+        observations.replace_ground_layers([0, 0, 0], record(time, z)).unwrap();
+        observations.mark_complete_geometry_source();
+    }
+
+    #[test]
+    fn planning_snapshot_metadata_equivalence_keeps_body_execution_identity_strict() {
+        let observations = Arc::new(observations());
+        let original = scene().with_observations(Some(observations.clone()));
+        let mut next = observations.as_ref().clone();
+        refresh(&mut next, 200, 2, 0.02);
+        let refreshed = original.with_observations(Some(Arc::new(next)));
+        assert!(original.same_geometry(&refreshed));
+        assert!(original.same_planning_query_view(&refreshed));
+        assert!(refreshed.same_planning_query_view(&original));
+        assert!(!original.same_body_query_view(&refreshed));
+        assert!(!original.body_query().same_body_query_view(&refreshed));
+        assert!(!Arc::ptr_eq(&original.body_query_cache, &refreshed.body_query_cache));
+        assert!(!Arc::ptr_eq(original.observations().unwrap(), refreshed.observations().unwrap()));
+        assert_eq!(original.observations().unwrap().get([0, 0, 0]),
+            Some(SurfaceObservation { observed_ns: 100, hits: 1 }));
+        assert_eq!(refreshed.observations().unwrap().get([0, 0, 0]),
+            Some(SurfaceObservation { observed_ns: 200, hits: 2 }));
+
+        let copied_owner = original.with_observations(Some(Arc::new(observations.as_ref().clone())));
+        assert!(original.same_planning_query_view(&copied_owner));
+        assert!(!original.same_body_query_view(&copied_owner));
+        assert!(!Arc::ptr_eq(&original.body_query_cache, &copied_owner.body_query_cache));
+        let reattached = original.with_observations(Some(observations));
+        assert!(original.same_body_query_view(&reattached));
+        assert!(original.same_planning_query_view(&reattached));
+        assert!(Arc::ptr_eq(&original.body_query_cache, &reattached.body_query_cache));
+    }
+
+    #[test]
+    fn planning_snapshot_keeps_observation_option_size_partition_and_completeness() {
+        let base = scene();
+        assert!(base.same_planning_query_view(&base.clone()));
+        let empty = base.with_observations(Some(Arc::new(SurfaceObservations::new(0.05, 32).unwrap())));
+        assert!(base.same_geometry(&empty));
+        assert!(!base.same_planning_query_view(&empty));
+        assert!(!empty.same_planning_query_view(&base));
+        for (size, edge) in [(0.1, 32), (0.05, 16)] {
+            let changed = base.with_observations(Some(Arc::new(SurfaceObservations::new(size, edge).unwrap())));
+            assert!(empty.same_geometry(&changed));
+            assert!(!empty.same_planning_query_view(&changed));
+        }
+        let original = base.with_observations(Some(Arc::new(observations())));
+        let mut partial = original.observations().unwrap().as_ref().clone();
+        partial.replace_block([0, 0, 0], BTreeMap::from([
+            ([0, 0, 0], SurfaceObservation { observed_ns: 200, hits: 2 }),
+        ])).unwrap();
+        let partial = original.with_observations(Some(Arc::new(partial)));
+        assert!(original.same_geometry(&partial));
+        assert!(!original.same_planning_query_view(&partial));
+        assert!(!original.same_planning_query_view(&original.with_observations(None)));
+    }
+
+    #[test]
+    fn planning_snapshot_statistics_and_fine_keys_still_invalidate_under_same_data() {
+        let original = scene().with_observations(Some(Arc::new(observations())));
+        let mut changed = original.observations().unwrap().as_ref().clone();
+        refresh(&mut changed, 200, 2, 0.03);
+        assert!(original.observations().unwrap().same_geometry(&changed));
+        let changed = original.with_observations(Some(Arc::new(changed)));
+        assert!(original.same_geometry(&changed));
+        assert!(!original.same_planning_query_view(&changed));
+        for key in [[0, 0, 1], [1, 0, 0]] {
+            let mut changed = original.observations().unwrap().as_ref().clone();
+            changed.replace_block([0, 0, 0], BTreeMap::from([
+                (key, SurfaceObservation { observed_ns: 200, hits: 2 }),
+            ])).unwrap();
+            changed.mark_complete_geometry_source();
+            let changed = original.with_observations(Some(Arc::new(changed)));
+            assert!(original.same_geometry(&changed), "coarse data owner is deliberately unchanged");
+            assert!(!original.same_planning_query_view(&changed));
+        }
+    }
+
+    #[test]
+    fn planning_snapshot_rejects_different_data_body_mask_and_ground_interpretation() {
+        let original = scene().with_observations(Some(Arc::new(observations())));
+        let rebuilt = scene().with_observations(original.observations().cloned());
+        assert!(!original.same_planning_query_view(&rebuilt), "independently rebuilt data stays conservative");
+        let volume = original.clone().with_ground_evidence(GroundEvidence::OccupiedVolume);
+        assert!(Arc::ptr_eq(&original.data, &volume.data));
+        assert!(!original.same_planning_query_view(&volume));
+        assert!(!original.same_body_query_view(&volume));
+        assert!(!original.same_geometry(&volume));
+        let mut envelope = original.body_envelope().unwrap().clone();
+        envelope.z_bounds_m[1] += 0.01;
+        let body = original.with_body_envelope(envelope).unwrap();
+        assert!(!original.same_planning_query_view(&body));
+        let mut blocked = vec![false; 40 * 40];
+        blocked[20 * 40 + 20] = true;
+        let masked = original.with_virtual_obstacles([-2.0, -2.0], 0.1, 40, 40, &blocked).unwrap();
+        assert!(!original.same_planning_query_view(&masked));
+        assert!(!original.same_geometry(&masked));
+    }
+
+    #[test]
+    fn planning_snapshot_keeps_recent_owner_presence_refresh_clear_and_retention_guards() {
+        let original = scene().with_observations(Some(Arc::new(observations())));
+        let recent = original.with_recent_obstacle_points(1, 100, 0, &[],
+            [(0, [0.025, 0.025, 0.4])]).unwrap();
+        assert!(original.same_geometry(&recent));
+        assert!(!original.same_planning_query_view(&recent));
+        assert!(!recent.same_planning_query_view(&original));
+        assert!(recent.same_planning_query_view(&recent.clone()));
+        let changed = recent.with_recent_obstacle_points(2, 200, 0, &[],
+            [(0, [0.025, 0.025, 0.4])]).unwrap();
+        assert!(!recent.same_planning_query_view(&changed), "same points do not alias a new recent owner");
+        let retained = recent.with_recent_obstacle_points(2, 200, 200, &[],
+            [(0, [0.025, 0.025, 0.4])]).unwrap();
+        assert!(!recent.same_planning_query_view(&retained));
+        assert!(!changed.same_planning_query_view(&retained));
+        assert!(!recent.same_planning_query_view(&recent.clear_recent_obstacles()));
+        let empty_recent = original.with_recent_obstacle_points(1, 100, 0, &[], []).unwrap();
+        assert!(!original.same_planning_query_view(&empty_recent), "None differs even from an empty recent frame");
+        let mut next = original.observations().unwrap().as_ref().clone();
+        refresh(&mut next, 200, 2, 0.02);
+        let carried = original.with_observations(Some(Arc::new(next)))
+            .with_recent_obstacles_from(&recent);
+        assert!(recent.same_planning_query_view(&carried));
+        assert!(!recent.same_body_query_view(&carried));
+    }
+
+    #[test]
+    fn planning_snapshot_private_forks_never_masquerade_as_original_source_identity() {
+        let original = scene().with_observations(Some(Arc::new(observations())));
+        let left = original.fork_for_planning();
+        let right = original.fork_for_planning();
+        assert!(original.observations().unwrap()
+            .same_planning_query_view(left.observations().unwrap()));
+        assert!(!Arc::ptr_eq(&original.data, &left.data));
+        assert!(!Arc::ptr_eq(&left.data, &right.data));
+        assert!(!original.same_planning_query_view(&left));
+        assert!(!original.same_body_query_view(&left));
+        assert!(!original.same_geometry(&left));
+        assert!(!left.same_planning_query_view(&right));
+        assert!(left.same_planning_query_view(&left.clone()));
+        assert!(left.same_body_query_view(&left.clone()));
     }
 }

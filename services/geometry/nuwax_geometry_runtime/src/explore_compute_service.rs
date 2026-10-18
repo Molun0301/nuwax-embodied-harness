@@ -337,8 +337,8 @@ impl ComputeBasis {
                 self.committed_map == inner.committed_map && Arc::ptr_eq(before, now)
             }
             (ComputeInput::Surface { original, .. }, Some(mode), _) => {
-                // A same-view composite receipt may advance without changing the
-                // frozen computation. Keep its original identity for GoalIntent;
+                // A query-equivalent composite receipt may advance without changing
+                // the frozen computation. Keep its original identity for GoalIntent;
                 // domain changes and conflicting/non-monotonic commits still fail.
                 let map_current = self.committed_map == inner.committed_map
                     || self
@@ -356,7 +356,7 @@ impl ComputeBasis {
                     && mode
                         .receiver
                         .freeze()
-                        .is_ok_and(|now| original.same_source_view(&now))
+                        .is_ok_and(|now| original.same_planning_query_view(&now))
             }
             _ => false,
         }

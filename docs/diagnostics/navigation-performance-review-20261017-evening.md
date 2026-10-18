@@ -435,6 +435,18 @@ GREEN同一原release/LTO二进制51个exact全部通过：原RED与5新控制�
 
 本批不接受，全部生产和新8测试撤回并归档，不追加挑选样本。后续优先审查真实重复观测是否造成计算过期与持续重规划，先明确query依赖和原数据合同，再考虑修改。
 
+## 第三十三阶段：Explore 仅按实际查询输入判断计算失效
+
+两个新合同RED在旧生产真实成立：Writer同key三次更新时间/hits，完整传输、codec/cache及原owner结算后(capture,commit,discard)为(1,0,1)，新期望(1,1,0)；真实receipt年龄2.321ms低于原2秒，排除本例receipt过期，原Goal前提和完整cleanup通过。measured例真实raw-only及sample-renewed两次rebind均false，最新对象decode/raw字段与完整GroundQuery输出前提通过。两项各运行1个exact并在目标断言失败；不是已复现无限饥饿，也不是传感器回放频率证据。
+
+有意改变旧raw-only Discard与Explore同值新观察owner冷建合同：原replace_ground_layers转换/验证照常，在原变化层循环逐bit比较全部stored派生字段（anchor/members/normal/plane_origin及statistics count/mean/M2/min/max），完全相同才保留observed_layers原持久根。新O(1)planning-query谓词比较原data/ground_evidence/recent、size bits/block_edge/complete与columns/observed_layers根，仅用于Explore ComputeBasis和私有query重绑。没有新token、hash、cache、锁或全图比较；真实统计、占据、模型、mask、配置、partial等变化仍失效。
+
+原raw块仍更新ns/hits，原始layer样本记录仍持久化，新original/notification和真实receipt照常前移。复用的private query允许保留其冻结旧raw；最新原始证据须从original_input读取。strict same_source_view、same_body_query_view、全局body cache退休、Nav和所有parent/session/frame/history/Stop/反馈/TTL合同保持。GoalIntent仍捕获时身份，不伪装最新重算。Nav同域旧revision许可不能替代Explore前沿排序、NoFrontier与staged区域状态的资格。
+
+最终83个distinct exact取得PASS：workspace48（MLS28、EXP14、stack6）与Geometry35，含18新MLS全字段位差/身份控制、完整旧暖与新冷Fine/Recent Err及witness、两个RED转绿、显式旧合同迁移、7个真实Writer owner门与原回归。当前Explore LCM未发现独立RecentCloud挂载入口，recent负例是显式注入；不把它称真实传感器接入验证。真实stats持续变动仍可Discard，本阶段不保证整体饥饿消失，不放宽统计等价以求通过。
+
+首GREEN批82通过/1失败：作者把旧watermark(false)控制的尾部扩大为第二次也必须Accept，却未提供第二gate/真实续receipt。旧合同只要求首轮Accept和第二capture暖复用，均已过；首2.1397s日志属于root1，不能解释其后root2第二轮原因。仅tests-only把新增总(2,0)/两提交/第二root身份断言限定到已具备第二gate和真实续期的evidence(true)分支，原false全部断言保留，true语句去缩进逐字不变。补watermark单例通过，原FAIL保留，不称单轮83全绿或已证明第二轮TTL原因。生产四文件在两批间未变；原release/LTO与唯一增量target沿用。
+
 ## 后续持续检查
 
 1. 墙前晚到路径的实际恢复与初始 full/partial/PCT 顺序，保留及时移动和真实避障

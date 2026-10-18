@@ -45,6 +45,21 @@ impl ObservedGroundLayer {
             approximation:GroundApproximation::ObservedLayer,
         })
     }
+    // Every stored derived field is retained bit-for-bit. Original sample
+    // identities and voxel evidence remain in the newly admitted raw source.
+    fn query_eq(&self,other:&Self)->bool {
+        let left=self.statistics.moments();let right=other.statistics.moments();
+        let (left_min,left_max)=self.statistics.observed_extent();
+        let (right_min,right_max)=other.statistics.observed_extent();
+        self.anchor==other.anchor && self.members==other.members
+            && self.normal.map(f64::to_bits)==other.normal.map(f64::to_bits)
+            && self.plane_origin.map(f64::to_bits)==other.plane_origin.map(f64::to_bits)
+            && left.count()==right.count()
+            && left.mean().map(f64::to_bits)==right.mean().map(f64::to_bits)
+            && left.m2().map(f64::to_bits)==right.m2().map(f64::to_bits)
+            && left_min.map(f64::to_bits)==right_min.map(f64::to_bits)
+            && left_max.map(f64::to_bits)==right_max.map(f64::to_bits)
+    }
     fn geometry_eq(&self,other:&Self)->bool {
         self.anchor==other.anchor && self.members==other.members
             && self.normal==other.normal && self.plane_origin==other.plane_origin
@@ -218,6 +233,7 @@ impl SurfaceObservations {
             converted.insert(anchor,ObservedGroundLayer{anchor:key,members,statistics,normal:layer.normal,plane_origin:layer.plane_origin});
         }
         let old=self.observed_layers.get(&block);
+        let mut same_query=old.map_or(converted.is_empty(),|old|old.len()==converted.len());
         let mut changed=AHashSet::new();
         if let Some(old)=old {for (&anchor,layer) in old.iter() {
             if converted.get(&anchor).is_none_or(|new|!layer.geometry_eq(new)) {
@@ -225,12 +241,18 @@ impl SurfaceObservations {
             }
         }}
         for (&anchor,layer) in &converted {
-            if old.and_then(|old|old.get(&anchor)).is_none_or(|old|!old.geometry_eq(layer)) {
+            let previous=old.and_then(|old|old.get(&anchor));
+            same_query=same_query && previous.is_some_and(|old|old.query_eq(layer));
+            if previous.is_none_or(|old|!old.geometry_eq(layer)) {
                 changed.insert([layer.anchor[0],layer.anchor[1]]);
             }
         }
-        if converted.is_empty() {self.observed_layers.remove(&block);}
-        else {self.observed_layers.insert(block,Arc::new(converted));}
+        // Preserve the existing query payload only after full conversion and
+        // validation, using the mandatory changed-block walk above.
+        if !same_query {
+            if converted.is_empty() {self.observed_layers.remove(&block);}
+            else {self.observed_layers.insert(block,Arc::new(converted));}
+        }
         if !changed.is_empty() {self.layer_geometry=Arc::new(());self.complete_geometry_source=false;}
         let mut changed:Vec<_>=changed.into_iter().collect();changed.sort_unstable();Ok(changed)
     }
@@ -273,6 +295,16 @@ impl SurfaceObservations {
             && self.complete_geometry_source==other.complete_geometry_source
             && self.columns.ptr_eq(&other.columns)
             && Arc::ptr_eq(&self.layer_geometry,&other.layer_geometry)
+    }
+    // Sufficient equality for Explore's derived queries, not raw evidence.
+    // Exact columns and block_edge also preserve block presence for partial
+    // sources: replace_block never retains an empty raw block.
+    pub(super) fn same_planning_query_view(&self,other:&Self)->bool {
+        self.size_m.to_bits()==other.size_m.to_bits()
+            && self.block_edge==other.block_edge
+            && self.complete_geometry_source==other.complete_geometry_source
+            && self.columns.ptr_eq(&other.columns)
+            && self.observed_layers.ptr_eq(&other.observed_layers)
     }
     pub(super) fn navigation_columns(&self)->impl Iterator<Item=([i32;2],&[i32])> {
         self.columns.iter().map(|(&key,levels)|(key,levels.as_slice()))
@@ -898,5 +930,411 @@ mod measured_layer_tests {
         assert_eq!(source.replace_ground_layers([0,0,0],Arc::new(BTreeMap::new())).unwrap(),vec![[0,0]]);
         assert_eq!(source.ground_layers([0,0]).count(),0);
         assert!(source.get([0,0,0]).is_some(),"removing layer metadata does not clear occupancy");
+    }
+}
+
+#[cfg(test)]
+mod planning_query_equivalence_tests {
+    use super::*;
+    use nuwax_map_chunks::surface_statistics::ObservationStatistics;
+    use nuwax_map_chunks::{LayerObservation, LayerObservations, LayerSample, LayerSource};
+
+    fn statistics(points: &[[f64; 3]]) -> ObservationStatistics {
+        assert!(!points.is_empty());
+        if points.len() == 1 {
+            return ObservationStatistics::from_point(points[0]).unwrap();
+        }
+        let (left, right) = points.split_at(points.len() / 2);
+        statistics(left).merged(&statistics(right)).unwrap()
+    }
+
+    // The field layout is intentionally explicit: count, mean XYZ, all six M2
+    // terms, minimum XYZ, maximum XYZ. Tests never forge private math fields.
+    fn statistics_bits(value: ObservationStatistics) -> [u64; 16] {
+        let moments = value.moments();
+        let (minimum, maximum) = value.observed_extent();
+        let mut bits = [0; 16];
+        bits[0] = moments.count();
+        bits[1..4].copy_from_slice(&moments.mean().map(f64::to_bits));
+        bits[4..10].copy_from_slice(&moments.m2().map(f64::to_bits));
+        bits[10..13].copy_from_slice(&minimum.map(f64::to_bits));
+        bits[13..16].copy_from_slice(&maximum.map(f64::to_bits));
+        bits
+    }
+
+    fn layer(statistics: ObservationStatistics) -> ObservedGroundLayer {
+        ObservedGroundLayer {
+            anchor: [0, 0, 0],
+            members: vec![0, 1],
+            statistics,
+            normal: [0.0, 0.0, 1.0],
+            plane_origin: [0.025, 0.025, 0.025],
+        }
+    }
+
+    fn assert_only_statistics_field_changes(
+        left: ObservationStatistics,
+        right: ObservationStatistics,
+        expected: usize,
+    ) {
+        let left_bits = statistics_bits(left);
+        let right_bits = statistics_bits(right);
+        let changed: Vec<_> = (0..16).filter(|&i| left_bits[i] != right_bits[i]).collect();
+        assert_eq!(changed, vec![expected], "the fixture must isolate its stated field");
+        let left = layer(left);
+        let right = layer(right);
+        assert!(left.geometry_eq(&right), "same_geometry keeps its existing contract");
+        assert!(left.query_eq(&left.clone()));
+        assert!(!left.query_eq(&right), "omitted stored field {expected}");
+        assert!(!right.query_eq(&left), "comparison must be symmetric");
+    }
+
+    #[test]
+    fn planning_layer_query_equality_checks_each_stored_statistics_field() {
+        assert_only_statistics_field_changes(
+            statistics(&[[0.0; 3]]), statistics(&[[0.0; 3], [0.0; 3]]), 0,
+        );
+        for axis in 0..3 {
+            let point = |value| {
+                let mut result = [0.0; 3];
+                result[axis] = value;
+                result
+            };
+            // Balanced binary merges make every intermediate dyadic/exact.
+            assert_only_statistics_field_changes(
+                statistics(&[point(0.0), point(0.0), point(0.0), point(4.0)]),
+                statistics(&[point(0.0), point(4.0), point(4.0), point(4.0)]),
+                1 + axis,
+            );
+            assert_only_statistics_field_changes(
+                statistics(&[point(-2.0), point(2.0), point(0.0), point(0.0)]),
+                statistics(&[point(-2.0), point(2.0), point(-1.0), point(1.0)]),
+                4 + [0, 3, 5][axis],
+            );
+            assert_only_statistics_field_changes(
+                statistics(&[point(0.0), point(4.0), point(3.0), point(3.0)]),
+                statistics(&[point(1.0), point(1.0), point(4.0), point(4.0)]),
+                10 + axis,
+            );
+            assert_only_statistics_field_changes(
+                statistics(&[point(0.0), point(-4.0), point(-3.0), point(-3.0)]),
+                statistics(&[point(-1.0), point(-1.0), point(-4.0), point(-4.0)]),
+                13 + axis,
+            );
+        }
+        for (x, y, m2_index) in [(0, 1, 1), (0, 2, 2), (1, 2, 4)] {
+            let point = |a, b| {
+                let mut result = [0.0; 3];
+                result[x] = a;
+                result[y] = b;
+                result
+            };
+            assert_only_statistics_field_changes(
+                statistics(&[point(1.0, 1.0), point(-1.0, -1.0),
+                    point(1.0, -1.0), point(-1.0, 1.0)]),
+                statistics(&[point(1.0, 1.0), point(-1.0, -1.0),
+                    point(1.0, 1.0), point(-1.0, -1.0)]),
+                4 + m2_index,
+            );
+        }
+    }
+
+    #[test]
+    fn planning_layer_query_equality_checks_anchor_members_normal_origin_and_signed_zero() {
+        let original = layer(statistics(&[[0.0; 3]]));
+        for axis in 0..3 {
+            let mut changed = original.clone();
+            changed.anchor[axis] += 1;
+            assert!(!original.query_eq(&changed), "anchor axis {axis}");
+            let mut changed = original.clone();
+            changed.normal[axis] = f64::from_bits(changed.normal[axis].to_bits() + 1);
+            assert!(!original.query_eq(&changed), "normal axis {axis}");
+            let mut changed = original.clone();
+            changed.plane_origin[axis] = f64::from_bits(changed.plane_origin[axis].to_bits() + 1);
+            assert!(!original.query_eq(&changed), "plane origin axis {axis}");
+
+            let mut positive = original.clone();
+            let mut negative = original.clone();
+            positive.plane_origin[axis] = 0.0;
+            negative.plane_origin[axis] = -0.0;
+            assert!(positive.geometry_eq(&negative));
+            assert!(!positive.query_eq(&negative), "origin zero sign axis {axis}");
+
+            // A singleton preserves the supplied signs in mean and both extrema.
+            let mut point = [0.0; 3];
+            point[axis] = -0.0;
+            let negative = layer(statistics(&[point]));
+            let left = statistics_bits(original.statistics);
+            let right = statistics_bits(negative.statistics);
+            let changed: Vec<_> = (0..16).filter(|&i| left[i] != right[i]).collect();
+            assert_eq!(changed, vec![1 + axis, 10 + axis, 13 + axis]);
+            assert_eq!(original.statistics, negative.statistics, "numeric == merges zero signs");
+            assert!(!original.query_eq(&negative), "stored statistics zero sign axis {axis}");
+        }
+        for axis in 0..2 {
+            let mut negative = original.clone();
+            negative.normal[axis] = -0.0;
+            assert!(original.geometry_eq(&negative));
+            assert!(!original.query_eq(&negative), "normal zero sign axis {axis}");
+        }
+        for members in [vec![0], vec![0, 2], vec![0, 1, 2], vec![1, 0]] {
+            let mut changed = original.clone();
+            changed.members = members;
+            assert!(!original.query_eq(&changed));
+        }
+    }
+
+    fn record(time: u64, sample_z: f64) -> Arc<LayerObservations> {
+        Arc::new(BTreeMap::from([(0, LayerObservation {
+            members: vec![nuwax_map_chunks::local_key([0, 0, 0]),
+                nuwax_map_chunks::local_key([0, 0, 1])],
+            normal: [0.0, 0.0, 1.0],
+            plane_origin: [0.025, 0.025, 0.025],
+            samples: vec![LayerSample {
+                source: Default::default(), point: [0.025, 0.025, sample_z],
+                source_sequence: 1, source_timestamp_ns: time, point_index: 0,
+            }],
+        })]))
+    }
+
+    fn occupancy(time: u64, hits: u16) -> BTreeMap<[i32; 3], SurfaceObservation> {
+        [[0, 0, 0], [0, 0, 1], [1, 0, 0]].into_iter()
+            .map(|key| (key, SurfaceObservation { observed_ns: time, hits })).collect()
+    }
+
+    fn source() -> SurfaceObservations {
+        let mut source = SurfaceObservations::new(0.05, 32).unwrap();
+        source.replace_block([0, 0, 0], occupancy(100, 1)).unwrap();
+        source.replace_ground_layers([0, 0, 0], record(10, 0.02)).unwrap();
+        source.mark_complete_geometry_source();
+        source
+    }
+
+    #[test]
+    fn planning_equivalent_layer_replacement_keeps_payload_root_and_new_raw_evidence() {
+        let original = source();
+        let mut refreshed = original.clone();
+        let old_payload = original.observed_layers.get(&[0, 0, 0]).unwrap().clone();
+        assert!(refreshed.replace_block_with_geometry_changes([0, 0, 0], occupancy(200, 2))
+            .unwrap().is_empty());
+        assert!(!refreshed.same_planning_query_view(&original), "partial is not complete");
+        let mut next = record(20, 0.02).as_ref().clone();
+        let sample = &mut next.get_mut(&0).unwrap().samples[0];
+        sample.source = Arc::new(LayerSource::Lidar {
+            backend: 1, runtime_generation: 1, sensor_frame_id: "lidar".into(),
+        });
+        sample.source_sequence = 2;
+        sample.point_index = 17;
+        assert!(refreshed.replace_ground_layers([0, 0, 0], Arc::new(next)).unwrap().is_empty());
+        refreshed.mark_complete_geometry_source();
+        assert!(original.columns.ptr_eq(&refreshed.columns));
+        assert!(original.observed_layers.ptr_eq(&refreshed.observed_layers));
+        assert!(Arc::ptr_eq(&old_payload, refreshed.observed_layers.get(&[0, 0, 0]).unwrap()));
+        assert!(!original.blocks.ptr_eq(&refreshed.blocks), "fresh raw evidence remains installed");
+        assert!(original.same_geometry(&refreshed));
+        assert!(original.same_planning_query_view(&refreshed));
+        assert!(refreshed.same_planning_query_view(&original));
+        assert_eq!(original.get([0, 0, 0]), Some(SurfaceObservation { observed_ns: 100, hits: 1 }));
+        assert_eq!(refreshed.get([0, 0, 0]), Some(SurfaceObservation { observed_ns: 200, hits: 2 }));
+        assert_eq!(statistics_bits(original.ground_layers([0, 0]).next().unwrap().statistics),
+            statistics_bits(refreshed.ground_layers([0, 0]).next().unwrap().statistics));
+    }
+
+    #[test]
+    fn planning_layer_statistics_change_retires_query_but_not_geometry_identity() {
+        let original = source();
+        let mut changed = original.clone();
+        assert!(changed.replace_ground_layers([0, 0, 0], record(20, 0.03)).unwrap().is_empty());
+        changed.mark_complete_geometry_source();
+        assert!(original.columns.ptr_eq(&changed.columns));
+        assert!(!original.observed_layers.ptr_eq(&changed.observed_layers));
+        assert!(original.same_geometry(&changed));
+        assert!(!original.same_planning_query_view(&changed));
+        assert_eq!(original.ground_layers([0, 0]).next().unwrap().statistics.moments().mean()[2], 0.02);
+        assert_eq!(changed.ground_layers([0, 0]).next().unwrap().statistics.moments().mean()[2], 0.03);
+    }
+
+    #[test]
+    fn planning_layer_plane_member_anchor_and_removal_changes_are_not_equivalent() {
+        let original = source();
+        for variant in 0..5 {
+            let mut changed = original.clone();
+            let mut next = record(10, 0.02).as_ref().clone();
+            match variant {
+                0 => next.get_mut(&0).unwrap().plane_origin[2] = 0.035,
+                1 => next.get_mut(&0).unwrap().normal = [0.6, 0.0, 0.8],
+                2 => next.get_mut(&0).unwrap().members.truncate(1),
+                3 => {
+                    let mut moved = next.remove(&0).unwrap();
+                    let anchor = nuwax_map_chunks::local_key([0, 0, 1]);
+                    moved.members = vec![anchor];
+                    next.insert(anchor, moved);
+                }
+                _ => next.clear(),
+            }
+            assert!(!changed.replace_ground_layers([0, 0, 0], Arc::new(next)).unwrap().is_empty());
+            changed.mark_complete_geometry_source();
+            assert!(original.columns.ptr_eq(&changed.columns));
+            assert!(!original.same_geometry(&changed));
+            assert!(!original.same_planning_query_view(&changed), "layer variant {variant}");
+        }
+    }
+
+    #[test]
+    fn planning_layer_signed_zero_changes_payload_without_widening_geometry_equality() {
+        let original = source();
+        let mut changed = original.clone();
+        let mut next = record(10, 0.02).as_ref().clone();
+        next.get_mut(&0).unwrap().normal[0] = -0.0;
+        assert!(changed.replace_ground_layers([0, 0, 0], Arc::new(next)).unwrap().is_empty());
+        assert!(original.same_geometry(&changed));
+        assert!(!original.observed_layers.ptr_eq(&changed.observed_layers));
+        assert!(!original.same_planning_query_view(&changed));
+    }
+
+    #[test]
+    fn planning_query_equality_keeps_size_block_partition_and_completeness() {
+        let mut original = SurfaceObservations::new(0.05, 32).unwrap();
+        original.replace_block([0, 0, 0], occupancy(100, 1)).unwrap();
+        let mut complete = original.clone();
+        complete.mark_complete_geometry_source();
+        assert!(!original.same_planning_query_view(&complete));
+        assert!(!complete.same_planning_query_view(&original));
+        let mut resized = original.clone();
+        resized.size_m = f32::from_bits(original.size_m.to_bits() + 1);
+        assert!(!original.same_planning_query_view(&resized));
+        // All fixture keys fit both partitions; only the existing block's covered
+        // empty positions differ. Preserve roots to isolate the scalar guard.
+        let mut repartitioned = original.clone();
+        repartitioned.block_edge = 16;
+        assert!(original.columns.ptr_eq(&repartitioned.columns));
+        assert!(original.observed_layers.ptr_eq(&repartitioned.observed_layers));
+        assert!(original.same_geometry(&repartitioned), "do not silently change same_geometry");
+        assert!(original.has_complete_block([31, 0, 0]));
+        assert!(!repartitioned.has_complete_block([31, 0, 0]));
+        assert!(!original.same_planning_query_view(&repartitioned));
+    }
+
+    #[test]
+    fn planning_metadata_refresh_preserves_exact_presence_across_signed_block_boundaries() {
+        let keys = [[-33, -1, -1], [-32, 0, 0], [-1, 31, 31], [0, 0, 0],
+            [31, 31, 31], [32, 32, 32], [63, 0, 0], [64, 0, 0]];
+        let mut blocks: BTreeMap<[i32; 3], BTreeMap<[i32; 3], SurfaceObservation>> = BTreeMap::new();
+        for key in keys {
+            blocks.entry(nuwax_map_chunks::block_key(key)).or_default()
+                .insert(key, SurfaceObservation { observed_ns: 100, hits: 1 });
+        }
+        let mut original = SurfaceObservations::new(0.05, 32).unwrap();
+        for (&block, values) in &blocks {
+            original.replace_block(block, values.clone()).unwrap();
+        }
+        original.mark_complete_geometry_source();
+        let mut refreshed = original.clone();
+        for (&block, values) in &blocks {
+            let updated = values.keys().map(|&key|
+                (key, SurfaceObservation { observed_ns: 200, hits: 2 })).collect();
+            assert!(refreshed.replace_block_with_geometry_changes(block, updated).unwrap().is_empty());
+            assert!(refreshed.replace_ground_layers(block, Arc::new(BTreeMap::new())).unwrap().is_empty());
+        }
+        refreshed.mark_complete_geometry_source();
+        assert!(original.same_planning_query_view(&refreshed));
+        let probes = [-65, -64, -33, -32, -31, -1, 0, 1, 30, 31, 32, 33, 63, 64, 65];
+        for x in probes { for y in probes { for z in probes {
+            let key = [x, y, z];
+            let present = keys.contains(&key);
+            let block_present = blocks.contains_key(&nuwax_map_chunks::block_key(key));
+            assert_eq!(original.get(key).is_some(), present);
+            assert_eq!(refreshed.get(key).is_some(), present);
+            assert_eq!(original.has_complete_block(key), block_present);
+            assert_eq!(refreshed.has_complete_block(key), block_present);
+        }}}
+        let mut removed = refreshed.clone();
+        removed.replace_block([1, 1, 1], BTreeMap::new()).unwrap();
+        removed.mark_complete_geometry_source();
+        assert!(!refreshed.same_planning_query_view(&removed));
+        assert!(refreshed.has_complete_block([33, 33, 33]));
+        assert!(!removed.has_complete_block([33, 33, 33]));
+        assert!(refreshed.get([32, 32, 32]).is_some());
+        assert!(removed.get([32, 32, 32]).is_none());
+    }
+
+    #[test]
+    fn planning_occupancy_add_remove_and_move_retires_view_even_with_same_coarse_owner() {
+        let original = source();
+        for variant in 0..3 {
+            let mut changed = original.clone();
+            let mut values = occupancy(100, 1);
+            match variant {
+                0 => { values.insert([2, 0, 0], SurfaceObservation { observed_ns: 100, hits: 1 }); }
+                1 => { values.remove(&[1, 0, 0]); }
+                _ => { values.remove(&[0, 0, 1]);
+                    values.insert([0, 0, 2], SurfaceObservation { observed_ns: 100, hits: 1 }); }
+            }
+            assert!(!changed.replace_block_with_geometry_changes([0, 0, 0], values).unwrap().is_empty());
+            changed.mark_complete_geometry_source();
+            assert!(!original.same_planning_query_view(&changed), "occupancy variant {variant}");
+        }
+        assert_eq!(original.ground_layers([0, 0]).count(), 1, "retained source is unchanged");
+    }
+
+    #[test]
+    fn planning_observation_forks_keep_shared_payload_but_divergent_cow_branches_are_distinct() {
+        let original = source();
+        let fork = original.fork_for_planning();
+        assert!(original.same_planning_query_view(&fork));
+        assert!(original.blocks.ptr_eq(&fork.blocks));
+        assert!(original.columns.ptr_eq(&fork.columns));
+        assert!(original.observed_layers.ptr_eq(&fork.observed_layers));
+        let mut left = fork.clone();
+        let mut right = fork.clone();
+        left.replace_ground_layers([0, 0, 0], record(20, 0.03)).unwrap();
+        right.replace_ground_layers([0, 0, 0], record(20, 0.04)).unwrap();
+        assert!(original.same_geometry(&left));
+        assert!(original.same_geometry(&right));
+        assert!(!original.same_planning_query_view(&left));
+        assert!(!original.same_planning_query_view(&right));
+        assert!(!left.same_planning_query_view(&right), "equal update counts are not identity");
+        assert!(original.same_planning_query_view(&fork), "COW never alters retained roots");
+        let rebuilt = source();
+        assert_eq!(statistics_bits(original.ground_layers([0, 0]).next().unwrap().statistics),
+            statistics_bits(rebuilt.ground_layers([0, 0]).next().unwrap().statistics));
+        assert!(!original.same_planning_query_view(&rebuilt), "no full-content fallback for independent roots");
+    }
+
+    #[test]
+    fn planning_observation_geometry_round_trip_does_not_recover_old_persistent_identity() {
+        let original = source();
+        let mut changed = original.clone();
+        changed.replace_block([0, 0, 0], BTreeMap::from([
+            ([0, 0, 0], SurfaceObservation { observed_ns: 100, hits: 1 }),
+        ])).unwrap();
+        changed.replace_block([0, 0, 0], occupancy(100, 1)).unwrap();
+        changed.replace_ground_layers([0, 0, 0], record(10, 0.02)).unwrap();
+        changed.mark_complete_geometry_source();
+        assert_eq!(original.column_levels(0, 0), changed.column_levels(0, 0));
+        assert_eq!(original.column_levels(1, 0), changed.column_levels(1, 0));
+        assert!(original.ground_layers([0, 0]).next().unwrap()
+            .query_eq(changed.ground_layers([0, 0]).next().unwrap()));
+        assert!(!original.columns.ptr_eq(&changed.columns));
+        assert!(!original.same_planning_query_view(&changed));
+    }
+
+    #[test]
+    fn planning_query_payload_reuse_never_bypasses_layer_validation() {
+        let original = source();
+        for variant in 0..4 {
+            let mut next = record(10, 0.02).as_ref().clone();
+            match variant {
+                0 => next.get_mut(&0).unwrap().members.push(nuwax_map_chunks::local_key([0, 0, 2])),
+                1 => next.get_mut(&0).unwrap().members.reverse(),
+                2 => next.get_mut(&0).unwrap().samples.clear(),
+                _ => next.get_mut(&0).unwrap().samples[0].point[2] = f64::NAN,
+            }
+            let mut changed = original.clone();
+            assert!(changed.replace_ground_layers([0, 0, 0], Arc::new(next)).is_err());
+            assert!(original.same_planning_query_view(&changed), "rejected conversion is transactional");
+            assert!(original.observed_layers.ptr_eq(&changed.observed_layers));
+            assert_eq!(changed.get([0, 0, 0]), original.get([0, 0, 0]));
+        }
     }
 }

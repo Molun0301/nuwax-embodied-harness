@@ -329,6 +329,16 @@ fn assert_surface_owner_capture(
     notification: u64,
     pose: &ExploreRobotPose,
 ) {
+    assert_surface_owner_capture_at_goal(capture, source, notification, pose, 1);
+}
+
+fn assert_surface_owner_capture_at_goal(
+    capture: &SurfaceOwnerCapture,
+    source: &Arc<SurfaceSnapshot>,
+    notification: u64,
+    pose: &ExploreRobotPose,
+    goal_sequence: u64,
+) {
     assert_eq!(capture.original.notification(), notification);
     assert!(Arc::ptr_eq(capture.original.snapshot().unwrap(), source));
     assert_eq!(capture.pose.stamp.nanos, pose.source_timestamp_ns as i64);
@@ -342,7 +352,7 @@ fn assert_surface_owner_capture(
     assert_eq!(capture.checkpoint_before, capture.checkpoint_after);
     assert!(surface_owner_goal(capture.preview.as_ref().unwrap())
         .id
-        .ends_with("-1"));
+        .ends_with(&format!("-{goal_sequence}")));
 }
 
 async fn finish_surface_owner_success(
@@ -785,8 +795,18 @@ fn surface_owner_observations(
     Arc::new(observations)
 }
 
-async fn surface_owner_changed_source_discards_then_progresses(observation_owner_only: bool) {
+async fn surface_owner_changed_source_qualifies_query_then_progresses(observation_owner_only: bool) {
+    use futures::FutureExt;
     let (handle, sink) = configured_handle();
+    let request_id = if observation_owner_only {
+        "owner-surface-evidence"
+    } else {
+        "owner-surface-new-root"
+    };
+    let prepare = Arc::new(OwnerRuntimeGate::default());
+    let _release = OwnerRuntimeGateRelease(prepare.clone());
+    let mut ticking: Option<tokio::task::JoinHandle<ExploreRuntimeSnapshot>> = None;
+    let exercise = std::panic::AssertUnwindSafe(async {
     let (message, _, bare) = install_surface_fixture(&handle, "map").await;
     let snapshot = if observation_owner_only {
         let observed = Arc::new(bare.with_observations(Some(surface_owner_observations(&message))));
@@ -797,18 +817,11 @@ async fn surface_owner_changed_source_discards_then_progresses(observation_owner
     } else {
         bare
     };
-    let request_id = if observation_owner_only {
-        "owner-surface-evidence"
-    } else {
-        "owner-surface-new-root"
-    };
     assert_eq!(
         handle.start(request_id, "prefer_wavefront").await.status,
         STATUS_ACCEPTED
     );
     let audit = Arc::new(StdMutex::new(SurfaceOwnerAudit::default()));
-    let prepare = Arc::new(OwnerRuntimeGate::default());
-    let _release = OwnerRuntimeGateRelease(prepare.clone());
     let receiver =
         install_gated_real_surface_source(&handle, audit.clone(), prepare.clone(), None).await;
     let before = owner_watchdog(handle.inspect_compute_checkpoint())
@@ -826,11 +839,11 @@ async fn surface_owner_changed_source_discards_then_progresses(observation_owner
         .unwrap()
         .incarnation;
     let pose = surface_pose(&snapshot, 0.0, Quaternion::IDENTITY);
-    let tick = tokio::spawn({
+    ticking = Some(tokio::spawn({
         let handle = handle.clone();
         let pose = pose.clone();
         async move { handle.tick_with_pose(pose).await }
-    });
+    }));
     owner_watchdog(prepare.entered()).await;
     let replacement = if observation_owner_only {
         let observations = snapshot.observations().unwrap();
@@ -859,7 +872,7 @@ async fn surface_owner_changed_source_discards_then_progresses(observation_owner
     let current = receiver.freeze().unwrap();
     assert!(!original.same_source_view(&current));
     assert_eq!(current.notification(), original.notification() + 1);
-    assert!(!tick.is_finished());
+    assert!(!ticking.as_ref().unwrap().is_finished());
     assert!(sink.submitted.lock().unwrap().is_empty());
     {
         let audit = audit.lock().unwrap();
@@ -873,8 +886,40 @@ async fn surface_owner_changed_source_discards_then_progresses(observation_owner
         assert_eq!(audit.discards, 0);
     }
     prepare.release();
-    owner_watchdog(tick).await.unwrap();
+    let joined_tick = owner_watchdog(ticking.as_mut().expect("held source-owner tick")).await;
+    ticking = None;
+    let settled = joined_tick.unwrap();
     owner_watchdog(handle.await_compute_idle()).await.unwrap();
+    if observation_owner_only {
+        // Intentional migration: a new raw owner is still a different source,
+        // but the shared derived payload now qualifies this Explore selection.
+        assert!(original.same_planning_query_view(&current));
+        assert_eq!(settled.status, STATUS_ACTIVE, "{}", settled.message);
+        assert_eq!(settled.child_task_id, format!("{request_id}.nav.1"));
+        {
+            let audit = audit.lock().unwrap();
+            assert_eq!((audit.captures.len(), audit.commits.len(), audit.discards), (1, 1, 0));
+            assert!(surface_owner_goal(&audit.commits[0]).id.ends_with("-1"));
+            assert!(audit.feedback.is_empty());
+        }
+        {
+            let submitted = sink.submitted.lock().unwrap();
+            assert_eq!(submitted.len(), 1);
+            assert_eq!(submitted[0].intent.committed_map, message.committed_map);
+            assert_eq!(
+                submitted[0].frontier_goal_id,
+                surface_owner_goal(&audit.lock().unwrap().commits[0]).id
+            );
+        }
+        let status = handle.inner.lock().await.compute.status().unwrap();
+        assert_eq!(status.incarnation, incarnation);
+        assert_eq!(status.high_water.workers, 1);
+        assert_eq!(status.high_water.active, 1);
+        assert!(sink.cancelled.lock().unwrap().is_empty());
+        finish_surface_owner_success(&handle, request_id, &settled, &audit).await;
+        return;
+    }
+    assert!(!original.same_planning_query_view(&current));
     {
         let audit = audit.lock().unwrap();
         assert_eq!(
@@ -959,16 +1004,25 @@ async fn surface_owner_changed_source_discards_then_progresses(observation_owner
         assert!(!std::sync::Weak::ptr_eq(&audit.captures[0].private_query, &audit.captures[1].private_query));
     }
     finish_surface_owner_success(&handle, request_id, &fresh, &audit).await;
+    }).catch_unwind().await;
+    prepare.release();
+    if let Err(panic) = exercise {
+        let cleanup = std::panic::AssertUnwindSafe(
+            watermark_owner_cleanup(&handle, request_id, &mut ticking)
+        ).catch_unwind().await;
+        eprintln!("QUERY_EQ migrated source-owner cleanup completed={} business_panicked=true", cleanup.is_ok());
+        std::panic::resume_unwind(panic);
+    }
 }
 
 #[tokio::test]
-async fn compute_owner_surface_changed_observation_owner_discards_without_history_or_id() {
-    surface_owner_changed_source_discards_then_progresses(true).await;
+async fn compute_owner_surface_new_raw_owner_keeps_query_equivalent_selection() {
+    surface_owner_changed_source_qualifies_query_then_progresses(true).await;
 }
 
 #[tokio::test]
 async fn compute_owner_surface_new_immutable_source_discards_without_history_or_id() {
-    surface_owner_changed_source_discards_then_progresses(false).await;
+    surface_owner_changed_source_qualifies_query_then_progresses(false).await;
 }
 
 // F2 real-input fixtures. Append inside the existing explore_runtime::tests
@@ -1199,18 +1253,20 @@ async fn watermark_owner_real_publication_qualifies_prepared_selection(evidence_
     };
     let submitted = sink.submitted.lock().unwrap().clone();
     let cancelled = sink.cancelled.lock().unwrap().clone();
-    // Prove the real evidence transition before any second prepare or renewal.
-    // The later pure-watermark transition cannot substitute for this Discard.
-    if evidence_change {
-        assert!(!observations_reused && !same_view && rebound.is_none());
-        assert_eq!((captures.len(), commits.len(), discards), (1, 0, 1));
-        assert!(submitted.is_empty() && cancelled.is_empty());
-        assert_surface_owner_capture(&captures[0], &first, original.notification(), &pose);
-    }
+    // Intentional contract migration: truthful raw evidence still changes the
+    // source, but no derived query field changed before this actual Accept.
+    if evidence_change { assert!(!observations_reused && !same_view); }
+    else { assert!(observations_reused && same_view); }
+    assert!(original.same_planning_query_view(&current));
+    assert!(rebound.is_some());
+    assert_eq!((captures.len(), commits.len(), discards), (1, 1, 0));
+    assert_eq!(submitted.len(), 1);
+    assert!(cancelled.is_empty());
+    assert_surface_owner_capture(&captures[0], &first, original.notification(), &pose);
     // Exercise the actual owner's next selection too. InputUnavailable retires
     // the real child without blacklisting the frontier or consuming the newer
     // map notification; this is the same terminal-proof flow as the existing
-    // same-root owner reuse tests. A discarded first proposal has no child.
+    // same-root owner reuse tests. The first proposal now owns its real child.
     if result.status == STATUS_ACTIVE && !submitted.is_empty() {
         let lease = active_child_lease(&handle).await;
         owner_watchdog(handle.report_navigation_result(&result.child_task_id,
@@ -1231,26 +1287,28 @@ async fn watermark_owner_real_publication_qualifies_prepared_selection(evidence_
         owner_watchdog(second_gate.entered()).await;
         // Capture completed real work on root2 before publishing root3. Neither
         // the source nor its private query is replaced or warmed by this check.
-        let (cold_captures, cold_commits, cold_discards) = {
+        let (warm_captures, warm_commits, warm_discards) = {
             let audit = audit.lock().unwrap();
             (audit.captures.clone(), audit.commits.len(), audit.discards)
         };
         {
-            assert_eq!((cold_captures.len(), cold_commits, cold_discards), (2, 0, 1));
-            let cold = &cold_captures[1];
-            assert_surface_owner_capture(cold, &second, current.notification(), &second_pose);
-            assert!(!std::sync::Weak::ptr_eq(&cold_captures[0].private_query, &cold.private_query));
-            assert!(cold.private_frontier_before.is_none());
-            let cells = second.cell_keys().count();
-            assert_eq!(cells, 3000, "unchanged real Writer fixture size");
-            assert_eq!((cold.tomogram_builds, cold.tomogram_cells), (1, cells));
-            assert_eq!((cold.frontier_rebuilds, cold.frontier_evaluated_cells), (1, cells));
-            eprintln!("F2 evidence cold prepare before renewal: notification={}, tomogram={}/{}, frontier={}/{}, commits=0, discards=1",
-                cold.original.notification(), cold.tomogram_builds, cold.tomogram_cells,
-                cold.frontier_rebuilds, cold.frontier_evaluated_cells);
+            assert_eq!((warm_captures.len(), warm_commits, warm_discards), (2, 1, 0));
+            let warm = &warm_captures[1];
+            assert_surface_owner_capture_at_goal(warm, &second, current.notification(), &second_pose, 2);
+            assert!(std::sync::Weak::ptr_eq(&warm_captures[0].private_query, &warm.private_query));
+            assert!(warm.private_frontier_before.is_some());
+            assert_eq!(second.cell_keys().count(), 3000, "unchanged real Writer fixture size");
+            assert_eq!((warm.tomogram_builds, warm.tomogram_cells), (0, 0));
+            assert_eq!((warm.frontier_rebuilds, warm.frontier_evaluated_cells), (0, 0));
         }
         assert!(!ticking.as_ref().unwrap().is_finished());
-        assert!(sink.submitted.lock().unwrap().is_empty());
+        {
+            let submitted_at_gate = sink.submitted.lock().unwrap();
+            assert_eq!(submitted_at_gate.len(), 1);
+            assert_eq!(submitted_at_gate[0].intent.committed_map, first_message.committed_map);
+            assert_eq!(submitted_at_gate[0].frontier_goal_id,
+                surface_owner_goal(&commits[0]).id);
+        }
         assert!(sink.cancelled.lock().unwrap().is_empty());
         let second_bytes: std::collections::BTreeMap<_, _> = second_root.blocks.iter().map(|reference|
             (reference.object, repository.read_object(reference.object, nuwax_map_chunks::MAX_BLOCK_BYTES).unwrap())).collect();
@@ -1287,7 +1345,8 @@ async fn watermark_owner_real_publication_qualifies_prepared_selection(evidence_
         assert!(current.same_source_view(&renewed));
         assert!(!Arc::ptr_eq(first.observations().unwrap(), third.observations().unwrap()));
         assert!(!original.same_source_view(&renewed));
-        assert!(planning.rebind_original(&renewed).is_none());
+        assert!(original.same_planning_query_view(&renewed));
+        assert!(planning.rebind_original(&renewed).is_some());
         assert_eq!(cache.last_build_stats().unwrap().input_points, 0);
         renewed_committed_map = Some(third_message.committed_map.clone());
         eprintln!("F2 evidence pure-watermark renewal: root2={}, root3={}, original_receipt_ns={second_receipt}, renewed_receipt_ns={third_receipt}, notification={}",
@@ -1309,49 +1368,44 @@ async fn watermark_owner_real_publication_qualifies_prepared_selection(evidence_
     assert_eq!(later_captures[1].original.notification(), current.notification());
     assert_eq!(later_captures[0].tomogram_builds, 1);
     assert!(later_captures[0].tomogram_cells > 0);
+    if evidence_change { assert!(!observations_reused && !same_view); }
+    else { assert!(observations_reused && same_view); }
+    assert!(rebound.is_some());
+    assert!(std::sync::Weak::ptr_eq(&later_captures[0].private_query,
+        &later_captures[1].private_query));
+    assert_eq!((later_captures[1].tomogram_builds, later_captures[1].tomogram_cells), (0, 0));
+    assert_eq!((later_captures[1].frontier_rebuilds, later_captures[1].frontier_evaluated_cells), (0, 0));
+    assert_eq!((captures.len(), commits.len(), discards), (1, 1, 0), "{}", result.message);
+    assert_eq!(result.status, STATUS_ACTIVE, "{}", result.message);
+    assert_eq!(submitted.len(), 1);
+    assert!(cancelled.is_empty());
+    assert_eq!(submitted[0].intent.committed_map, first_message.committed_map,
+        "accepted goal must retain the actual frozen source identity");
+    assert_ne!(submitted[0].intent.committed_map, second_message.committed_map);
     if evidence_change {
-        assert!(!observations_reused && !same_view && rebound.is_none());
-        assert_eq!((captures.len(), commits.len(), discards), (1, 0, 1));
-        assert!(submitted.is_empty() && cancelled.is_empty());
-        assert!(!std::sync::Weak::ptr_eq(&later_captures[0].private_query,
-            &later_captures[1].private_query));
-        assert_eq!(later_captures[1].tomogram_builds, 1);
-        assert!(later_captures[1].tomogram_cells > 0);
-        let final_counts = {
+        {
             let audit = audit.lock().unwrap();
-            (audit.commits.len(), audit.discards)
-        };
-        assert_eq!(final_counts, (1, 1));
-        let submitted = sink.submitted.lock().unwrap();
-        assert_eq!(submitted.len(), 1);
-        assert_eq!(submitted[0].intent.committed_map, second_message.committed_map,
-            "accepted goal must retain root2's actual frozen source identity");
-        assert_ne!(&submitted[0].intent.committed_map, renewed_committed_map.as_ref().unwrap());
+            assert_eq!((audit.commits.len(), audit.discards), (2, 0));
+        }
+        let final_submitted = sink.submitted.lock().unwrap();
+        assert_eq!(final_submitted.len(), 2);
+        assert_eq!(final_submitted[1].intent.committed_map, second_message.committed_map);
+        if let Some(renewed) = renewed_committed_map.as_ref() {
+            assert_ne!(&final_submitted[1].intent.committed_map, renewed);
+        }
         assert!(sink.cancelled.lock().unwrap().is_empty());
-    } else {
-        assert!(observations_reused, "F2 RED: unchanged Writer blocks recreated observations");
-        assert!(same_view && rebound.is_some());
-        assert!(std::sync::Weak::ptr_eq(&later_captures[0].private_query,
-            &later_captures[1].private_query));
-        assert_eq!(later_captures[1].tomogram_builds, 0);
-        assert_eq!(later_captures[1].tomogram_cells, 0);
-        assert_eq!(later_captures[1].frontier_rebuilds, 0);
-        assert_eq!(later_captures[1].frontier_evaluated_cells, 0);
-        assert_eq!((captures.len(), commits.len(), discards), (1, 1, 0), "{}", result.message);
-        assert_eq!(result.status, STATUS_ACTIVE, "{}", result.message);
-        assert_eq!(submitted.len(), 1);
-        assert!(cancelled.is_empty());
-        assert_eq!(submitted[0].intent.committed_map, first_message.committed_map,
-            "accepted goal must retain the actual frozen source identity");
-        assert_ne!(submitted[0].intent.committed_map, second_message.committed_map);
     }
     }).catch_unwind().await;
     // Release every possible native hold before waiting for the test waiter,
     // then attempt the original Stop/idle/shutdown/join even after a panic.
     gate.release();
     if let Some(gate) = second_gate.as_ref() { gate.release(); }
-    watermark_owner_cleanup(&handle, request_id, &mut ticking).await;
+    let cleanup = std::panic::AssertUnwindSafe(
+        watermark_owner_cleanup(&handle, request_id, &mut ticking)
+    ).catch_unwind().await;
+    eprintln!("QUERY_EQ migrated writer cleanup completed={} business_panicked={}", cleanup.is_ok(), exercise.is_err());
     if let Err(panic) = exercise { std::panic::resume_unwind(panic); }
+    if let Err(panic) = cleanup { std::panic::resume_unwind(panic); }
 }
 
 #[tokio::test]
@@ -1360,10 +1414,9 @@ async fn compute_owner_real_writer_watermark_keeps_prepared_source_view() {
 }
 
 #[tokio::test]
-async fn compute_owner_real_writer_evidence_change_discards_prepared_source_view() {
-    // Two-stage contract: real evidence invalidates, then the cold root2 result
-    // can commit after a pure-watermark root3 renewal. The latter needs F2 reuse;
-    // it is not an independent old-production negative-control expectation.
+async fn compute_owner_real_writer_evidence_change_keeps_prepared_query_view() {
+    // New Explore-only contract: real evidence changes the raw source but keeps
+    // query-equivalent selection and its warm private owner across later receipts.
     watermark_owner_real_publication_qualifies_prepared_selection(true).await;
 }
 
@@ -1435,5 +1488,465 @@ async fn real_writer_same_plane_scatter_change_invalidates_complete_source_view(
     receiver.observe(second).unwrap();
     let current = receiver.freeze().unwrap();
     assert!(!original.same_source_view(&current));
+    assert!(!original.same_planning_query_view(&current));
     assert!(planning.rebind_original(&current).is_none());
+}
+
+// DRAFT ONLY: append inside the existing explore_runtime::tests inclusion via
+// explore_compute_surface_tests.rs. Reuses the real Writer, wire codec, cache,
+// compute owner, after_prepare gate and existing Stop/ZEROED/shutdown cleanup.
+// This intentionally specifies a NEW Explore query-equivalence contract.
+// It is not a replacement explanation of the F2 evidence-change negative test.
+
+#[tokio::test]
+async fn compute_owner_repeated_writer_evidence_keeps_query_equivalent_selection() {
+    use futures::FutureExt;
+    let (handle, sink) = configured_handle();
+    let request_id = "owner-query-equivalent-evidence";
+    let gate = Arc::new(OwnerRuntimeGate::default());
+    let _release = OwnerRuntimeGateRelease(gate.clone());
+    let mut ticking: Option<tokio::task::JoinHandle<ExploreRuntimeSnapshot>> = None;
+    let exercise = std::panic::AssertUnwindSafe(async {
+        let config = watermark_owner_config();
+        handle.configure_surface_source(Ok(config.clone()), 37, [7; 16]).await.unwrap();
+        let mut cache = nuwax_nav_stack::surface_map::SurfaceMapCache::configured(&config);
+        let repository = nuwax_map_chunks::Repository::temporary().unwrap();
+        let mut writer = nuwax_map_chunks::Writer::new(repository, 0.1, 4 * 1024 * 1024).unwrap();
+        let first_time = now_unix_nanos();
+        writer.observe([0, 30].into_iter().flat_map(|z| (0..50).flat_map(move |x|
+            (0..30).map(move |y| [x, y, z]))), first_time).unwrap();
+        let source = watermark_owner_source();
+        writer.record_source_watermark(source.clone(), first_time, 1).unwrap();
+        let (first_message, first_sealed) = watermark_owner_publication(&mut writer, None, 1, first_time);
+        let (first, mut latest_receipt) = watermark_owner_install(&handle, &mut cache, &first_message).await;
+        assert_eq!(handle.start(request_id, "prefer_wavefront").await.status, STATUS_ACCEPTED);
+        let audit = Arc::new(StdMutex::new(SurfaceOwnerAudit::default()));
+        let receiver = install_gated_real_surface_source_with_second_prepare(
+            &handle, audit.clone(), gate.clone(), None, None,
+        ).await;
+        let original = receiver.freeze().unwrap();
+        let planning = original.fork_for_planning();
+        let old_evidence = first.observations().unwrap().get([15, 15, 0]).unwrap();
+        let pose = surface_pose(&first, 0.0, Quaternion::IDENTITY);
+        ticking = Some(tokio::spawn({
+            let handle = handle.clone();
+            let pose = pose.clone();
+            async move { handle.tick_with_pose(pose).await }
+        }));
+        owner_watchdog(gate.entered()).await;
+        {
+            let observed = audit.lock().unwrap();
+            assert_eq!((observed.captures.len(), observed.commits.len(), observed.discards), (1, 0, 0));
+            let _ = surface_owner_goal(observed.captures[0].preview.as_ref().unwrap());
+        }
+        assert!(sink.submitted.lock().unwrap().is_empty());
+
+        // Several truthful updates land while one REAL prepared selection is held.
+        // No geometry/obstacle/plane/config/pose is changed and no TTL is lengthened.
+        let mut previous = first_sealed.manifest().clone();
+        let mut latest = first.clone();
+        let mut newest_message = first_message.clone();
+        let mut current = original.clone();
+        let mut timestamp = first_time;
+        for revision in 2..=4 {
+            timestamp = now_unix_nanos().max(timestamp + 1);
+            writer.observe([[15, 15, 0]], timestamp).unwrap();
+            writer.record_source_watermark(source.clone(), timestamp, revision as u64).unwrap();
+            let (message, sealed) = watermark_owner_publication(&mut writer,
+                Some(previous.as_ref()), revision, timestamp);
+            let root = sealed.manifest();
+            assert_eq!(root.domain, previous.domain);
+            assert_eq!(root.geometry_revision, previous.geometry_revision);
+            assert_ne!(root.blocks, previous.blocks);
+            assert!(!message.fine.as_ref().unwrap().included.is_empty());
+            let (snapshot, receipt) = watermark_owner_install(&handle, &mut cache, &message).await;
+            latest_receipt = receipt;
+            let captured = receiver.freeze().unwrap();
+            assert_eq!(captured.notification(), original.notification() + (revision - 1) as u64);
+            assert!(first.same_geometry(&snapshot));
+            assert!(first.observations().unwrap().same_geometry(snapshot.observations().unwrap()));
+            assert!(!Arc::ptr_eq(first.observations().unwrap(), snapshot.observations().unwrap()));
+            assert!(!original.same_source_view(&captured), "raw source equality stays strict");
+            let evidence = snapshot.observations().unwrap().get([15, 15, 0]).unwrap();
+            assert_eq!(evidence.observed_ns, timestamp);
+            assert_eq!(evidence.hits, old_evidence.hits + (revision - 1) as u16);
+            assert_eq!(first.observations().unwrap().get([15, 15, 0]).unwrap(), old_evidence);
+            assert_eq!(cache.last_build_stats().unwrap().input_points, 0);
+            previous = root.clone();
+            latest = snapshot;
+            newest_message = message;
+            current = captured;
+        }
+        let rebound = planning.rebind_original(&current);
+        gate.release();
+        let joined = owner_watchdog(ticking.as_mut().unwrap()).await;
+        ticking = None;
+        let result = joined.unwrap();
+        owner_watchdog(handle.await_compute_idle()).await.unwrap();
+        // A business RED requires the original receipt TTL to remain valid.
+        // Nothing after the last real installation renews or edits this receipt.
+        let (receipt, ttl) = {
+            let guard = handle.inner.lock().await;
+            (guard.costmap_received_monotonic_ns, guard.costmap_receipt_ttl)
+        };
+        let receipt_age_ns = now_monotonic_nanos().saturating_sub(receipt);
+        eprintln!("QUERY_EQ receipt qualification: receipt={receipt} age_ns={receipt_age_ns} ttl_ns={}", ttl.as_nanos());
+        assert_eq!(receipt, latest_receipt);
+        assert!(receipt != 0 && u128::from(receipt_age_ns) <= ttl.as_nanos(),
+            "fixture receipt expired before business classification");
+        let (captures, commits, discards) = {
+            let observed = audit.lock().unwrap();
+            (observed.captures.clone(), observed.commits.clone(), observed.discards)
+        };
+        eprintln!("QUERY_EQ actual owner: captures={} commits={} discards={} status={} message={} rebound={}",
+            captures.len(), commits.len(), discards, result.status, result.message, rebound.is_some());
+        assert_surface_owner_capture(&captures[0], &first, original.notification(), &pose);
+        // First NEW-contract business assertion. On current HEAD, the actual
+        // settled counts should be (1,0,1), rather than a manufactured Arc RED.
+        assert_eq!((captures.len(), commits.len(), discards), (1, 1, 0),
+            "query-equivalent raw evidence must not discard a prepared selection: {}", result.message);
+        assert_eq!(result.status, STATUS_ACTIVE, "{}", result.message);
+        {
+            let submitted = sink.submitted.lock().unwrap();
+            assert_eq!(submitted.len(), 1);
+            assert_eq!(submitted[0].intent.committed_map, first_message.committed_map);
+            assert_ne!(submitted[0].intent.committed_map, newest_message.committed_map);
+        }
+        assert!(sink.cancelled.lock().unwrap().is_empty());
+        let rebound = rebound.expect("new contract must preserve qualified private query");
+        assert_eq!(rebound.original_input().notification(), current.notification());
+        assert!(Arc::ptr_eq(rebound.original_input().snapshot().unwrap(), &latest));
+        assert!(Arc::ptr_eq(rebound.query_snapshot().unwrap(), planning.query_snapshot().unwrap()));
+        assert_eq!(rebound.query_snapshot().unwrap().observations().unwrap().get([15, 15, 0]), Some(old_evidence),
+            "private query keeps its immutable raw source; only query semantics are equivalent");
+        assert_eq!(rebound.original_input().snapshot().unwrap().observations().unwrap().get([15, 15, 0]),
+            latest.observations().unwrap().get([15, 15, 0]), "original exposes the newest evidence");
+
+        // Reuse must also happen inside the actual backend on its next request,
+        // after exact feedback. The production source owns notification/history.
+        let lease = active_child_lease(&handle).await;
+        owner_watchdog(handle.report_navigation_result(&result.child_task_id,
+            ChildNavigationResult::Failed {
+                proof: terminal_proof(&lease),
+                reason: "SafetyFailed cause=StaleInput: query equivalence fixture".into(),
+            })).await.unwrap();
+        owner_watchdog(handle.await_compute_idle()).await.unwrap();
+        let next_pose = surface_pose(&latest, 0.0, Quaternion::IDENTITY);
+        let next = owner_watchdog(handle.tick_with_pose(next_pose.clone())).await;
+        owner_watchdog(handle.await_compute_idle()).await.unwrap();
+        let observed = audit.lock().unwrap();
+        assert_eq!(next.status, STATUS_ACTIVE, "{}", next.message);
+        assert_eq!(observed.captures.len(), 2);
+        assert_surface_owner_capture_at_goal(&observed.captures[1], &latest, current.notification(), &next_pose, 2);
+        let actual_private = observed.captures[1].private_query.upgrade().unwrap();
+        assert_eq!(actual_private.observations().unwrap().get([15, 15, 0]), Some(old_evidence),
+            "the actual backend retains only its old immutable query raw evidence");
+        assert_eq!(observed.captures[1].original.snapshot().unwrap().observations().unwrap().get([15, 15, 0]),
+            latest.observations().unwrap().get([15, 15, 0]), "actual captured original stays current");
+        assert!(std::sync::Weak::ptr_eq(&observed.captures[0].private_query,
+            &observed.captures[1].private_query));
+        assert_eq!((observed.captures[1].tomogram_builds, observed.captures[1].tomogram_cells), (0, 0));
+        assert_eq!((observed.captures[1].frontier_rebuilds, observed.captures[1].frontier_evaluated_cells), (0, 0));
+        assert_eq!((observed.commits.len(), observed.discards), (2, 0));
+    }).catch_unwind().await;
+    gate.release();
+    let cleanup = std::panic::AssertUnwindSafe(
+        watermark_owner_cleanup(&handle, request_id, &mut ticking),
+    ).catch_unwind().await;
+    eprintln!("QUERY_EQ cleanup completed={} business_panicked={}", cleanup.is_ok(), exercise.is_err());
+    if let Err(panic) = exercise { std::panic::resume_unwind(panic); }
+    if let Err(panic) = cleanup { std::panic::resume_unwind(panic); }
+}
+
+#[tokio::test]
+async fn real_writer_measured_metadata_keeps_private_query_and_new_raw_evidence() {
+    let config = watermark_owner_config();
+    let repository = nuwax_map_chunks::Repository::temporary().unwrap();
+    let mut writer = nuwax_map_chunks::Writer::new(repository.clone(), 0.1, 4 * 1024 * 1024).unwrap();
+    let source = watermark_owner_source();
+    let key = [15, 15, 0];
+    let block = nuwax_map_chunks::block_key(key);
+    let anchor = nuwax_map_chunks::local_key(key);
+    let first_time = now_unix_nanos();
+    writer.observe((0..50).flat_map(|x| (0..30).map(move |y| [x, y, 0])), first_time).unwrap();
+    let layers = |timestamp, sequence| std::collections::BTreeMap::from([(anchor,
+        nuwax_map_chunks::LayerObservation {
+            members: vec![anchor], plane_origin: [1.55, 1.55, 0.025], normal: [0.0, 0.0, 1.0],
+            samples: [0.024, 0.026].into_iter().enumerate().map(|(index, z)|
+                nuwax_map_chunks::LayerSample { source: source.clone(), point: [1.55, 1.55, z],
+                    source_sequence: sequence, source_timestamp_ns: timestamp, point_index: index as u32 }).collect(),
+        })]);
+    let original_layers = layers(first_time, 1);
+    writer.replace_layer_observations(block, original_layers.clone()).unwrap();
+    writer.record_source_watermark(source.clone(), first_time, 1).unwrap();
+    let (first_message, first_sealed) = watermark_owner_publication(&mut writer, None, 1, first_time);
+    let mut cache = nuwax_nav_stack::surface_map::SurfaceMapCache::configured(&config);
+    let first = cache.build(&first_message).unwrap();
+    let receiver = SurfaceInputReceiver::new();
+    receiver.observe(first.clone()).unwrap();
+    let original = receiver.freeze().unwrap();
+    let planning = original.fork_for_planning();
+    let old_layer = first.observations().unwrap().ground_layers([15, 15]).next().unwrap();
+    let old_query = planning.query_snapshot().unwrap().query_ground([1.55, 1.55], 0.025);
+    let old_evidence = first.observations().unwrap().get(key).unwrap();
+    let mut previous = first_sealed.manifest().clone();
+    let mut timestamp = first_time;
+    let mut rebound_results = Vec::new();
+    for (revision, renew_layer_samples) in [(2, false), (3, true)] {
+        timestamp = now_unix_nanos().max(timestamp + 1);
+        writer.observe([key], timestamp).unwrap();
+        let expected_layers = if renew_layer_samples {
+            let renewed = layers(timestamp, revision as u64);
+            writer.replace_layer_observations(block, renewed.clone()).unwrap();
+            renewed
+        } else { original_layers.clone() };
+        writer.record_source_watermark(source.clone(), timestamp, revision as u64).unwrap();
+        let (message, sealed) = watermark_owner_publication(&mut writer,
+            Some(previous.as_ref()), revision, timestamp);
+        assert_eq!(previous.geometry_revision, sealed.manifest().geometry_revision);
+        assert_ne!(previous.blocks, sealed.manifest().blocks);
+        let reference = sealed.manifest().blocks.iter().find(|reference| reference.key == block).unwrap();
+        let bytes = repository.read_object(reference.object, nuwax_map_chunks::MAX_BLOCK_BYTES).unwrap();
+        assert_eq!(nuwax_map_chunks::decode_layer_observations(&bytes).unwrap(), expected_layers,
+            "raw layer sample identity/time remains truthful in the actual persisted object");
+        let current_snapshot = cache.build(&message).unwrap();
+        let current_layer = current_snapshot.observations().unwrap().ground_layers([15, 15]).next().unwrap();
+        assert_eq!(old_layer.anchor, current_layer.anchor);
+        assert_eq!(old_layer.members, current_layer.members);
+        assert_eq!(old_layer.normal, current_layer.normal);
+        assert_eq!(old_layer.plane_origin, current_layer.plane_origin);
+        assert_eq!(old_layer.statistics, current_layer.statistics);
+        assert!(first.same_geometry(&current_snapshot));
+        assert!(!Arc::ptr_eq(first.observations().unwrap(), current_snapshot.observations().unwrap()));
+        let new_evidence = current_snapshot.observations().unwrap().get(key).unwrap();
+        assert_eq!(new_evidence.observed_ns, timestamp);
+        assert_eq!(new_evidence.hits, old_evidence.hits + (revision - 1) as u16);
+        let new_query = current_snapshot.query_ground([1.55, 1.55], 0.025);
+        assert_eq!(old_query.state, new_query.state);
+        assert_eq!(old_query.height, new_query.height);
+        assert_eq!(old_query.normal, new_query.normal);
+        assert_eq!(old_query.sources, new_query.sources);
+        assert_eq!(old_query.radius_m, new_query.radius_m);
+        assert_eq!(old_query.max_residual_m, new_query.max_residual_m);
+        receiver.observe(current_snapshot.clone()).unwrap();
+        let current = receiver.freeze().unwrap();
+        assert!(!original.same_source_view(&current));
+        assert_eq!(current.notification(), original.notification() + (revision - 1) as u64);
+        let rebound = planning.rebind_original(&current);
+        if let Some(rebound) = rebound.as_ref() {
+            assert!(Arc::ptr_eq(rebound.original_input().snapshot().unwrap(), &current_snapshot));
+            assert!(Arc::ptr_eq(rebound.query_snapshot().unwrap(), planning.query_snapshot().unwrap()));
+            assert_eq!(rebound.original_input().notification(), current.notification());
+            assert_eq!(rebound.original_input().snapshot().unwrap().observations().unwrap().get(key), Some(new_evidence));
+            assert_eq!(rebound.query_snapshot().unwrap().observations().unwrap().get(key), Some(old_evidence));
+        }
+        rebound_results.push((renew_layer_samples, rebound.is_some()));
+        previous = sealed.manifest().clone();
+    }
+    assert_eq!(first.observations().unwrap().get(key).unwrap(), old_evidence);
+    assert_eq!(rebound_results, vec![(false, true), (true, true)],
+        "NEW contract: unchanged complete layer query payload must preserve the private query");
+}
+
+// These controls first prove a truthful Writer raw-only transition qualifies,
+// then independently revoke the prepared result through an unchanged safety gate.
+#[derive(Clone, Copy, Debug)]
+enum QueryEquivalentSafetyFence {
+    ReceiptExpiry,
+    UserStop,
+    Session,
+    Frame,
+    PartialSource,
+    RecentInput,
+    LayerScatter,
+}
+
+async fn query_equivalent_writer_still_obeys_safety_fence(fence: QueryEquivalentSafetyFence) {
+    use futures::FutureExt;
+    let (handle, sink) = configured_handle();
+    let request_id = format!("query-equivalent-safety-{fence:?}");
+    let gate = Arc::new(OwnerRuntimeGate::default());
+    let _release = OwnerRuntimeGateRelease(gate.clone());
+    let mut ticking: Option<tokio::task::JoinHandle<ExploreRuntimeSnapshot>> = None;
+    let exercise = std::panic::AssertUnwindSafe(async {
+        let config = watermark_owner_config();
+        handle.configure_surface_source(Ok(config.clone()), 37, [7; 16]).await.unwrap();
+        let repository = nuwax_map_chunks::Repository::temporary().unwrap();
+        let mut writer = nuwax_map_chunks::Writer::new(repository, 0.1, 4 * 1024 * 1024).unwrap();
+        let mut cache = nuwax_nav_stack::surface_map::SurfaceMapCache::configured(&config);
+        let source = watermark_owner_source();
+        let first_time = now_unix_nanos();
+        writer.observe([0, 30].into_iter().flat_map(|z| (0..50).flat_map(move |x|
+            (0..30).map(move |y| [x, y, z]))), first_time).unwrap();
+        let key = [15, 15, 0];
+        let block = nuwax_map_chunks::block_key(key);
+        let anchor = nuwax_map_chunks::local_key(key);
+        let layers = |spread: f64| std::collections::BTreeMap::from([(anchor,
+            nuwax_map_chunks::LayerObservation {
+                members: vec![anchor], plane_origin: [1.55, 1.55, 0.025], normal: [0.0, 0.0, 1.0],
+                samples: [0.025 - spread, 0.025 + spread].into_iter().enumerate().map(|(index, z)|
+                    nuwax_map_chunks::LayerSample { source: source.clone(), point: [1.55, 1.55, z],
+                        source_sequence: 1, source_timestamp_ns: first_time, point_index: index as u32 }).collect(),
+            })]);
+        if matches!(fence, QueryEquivalentSafetyFence::LayerScatter) {
+            writer.replace_layer_observations(block, layers(0.001)).unwrap();
+        }
+        writer.record_source_watermark(source.clone(), first_time, 1).unwrap();
+        let (first_message, first_sealed) = watermark_owner_publication(&mut writer, None, 1, first_time);
+        let (first, _) = watermark_owner_install(&handle, &mut cache, &first_message).await;
+        assert_eq!(handle.start(&request_id, "prefer_wavefront").await.status, STATUS_ACCEPTED);
+        let audit = Arc::new(StdMutex::new(SurfaceOwnerAudit::default()));
+        let receiver = install_gated_real_surface_source(&handle, audit.clone(), gate.clone(), None).await;
+        let original = receiver.freeze().unwrap();
+        let planning = original.fork_for_planning();
+        let pose = surface_pose(&first, 0.0, Quaternion::IDENTITY);
+        ticking = Some(tokio::spawn({
+            let handle = handle.clone();
+            async move { handle.tick_with_pose(pose).await }
+        }));
+        owner_watchdog(gate.entered()).await;
+        {
+            let audit = audit.lock().unwrap();
+            assert_eq!((audit.captures.len(), audit.commits.len(), audit.discards), (1, 0, 0));
+            assert_eq!(audit.captures[0].checkpoint_before, audit.captures[0].checkpoint_after);
+            // A statistics control may prepare a valid non-Goal projection. It
+            // still must not commit any staged state from the changed query.
+            assert!(audit.captures[0].preview.is_ok(), "{fence:?}: {:?}", audit.captures[0].preview);
+            if !matches!(fence, QueryEquivalentSafetyFence::LayerScatter) {
+                let _ = surface_owner_goal(audit.captures[0].preview.as_ref().unwrap());
+            }
+        }
+        let second_time = now_unix_nanos().max(first_time + 1);
+        writer.observe([key], second_time).unwrap();
+        writer.record_source_watermark(source.clone(), second_time, 2).unwrap();
+        let (second_message, second_sealed) = watermark_owner_publication(&mut writer,
+            Some(first_sealed.manifest().as_ref()), 2, second_time);
+        let (second, receipt) = watermark_owner_install(&handle, &mut cache, &second_message).await;
+        let current = receiver.freeze().unwrap();
+        assert!(!original.same_source_view(&current));
+        assert!(original.same_planning_query_view(&current));
+        assert!(planning.rebind_original(&current).is_some());
+        assert!(second.observations().unwrap().get(key).unwrap().observed_ns
+            > first.observations().unwrap().get(key).unwrap().observed_ns);
+        assert!(first.same_geometry(&second));
+
+        match fence {
+            QueryEquivalentSafetyFence::ReceiptExpiry => {
+                let ttl = handle.inner.lock().await.costmap_receipt_ttl;
+                tokio::time::sleep(ttl + Duration::from_millis(1)).await;
+                let guard = handle.inner.lock().await;
+                assert_eq!(guard.costmap_received_monotonic_ns, receipt);
+                assert!(now_monotonic_nanos().saturating_sub(receipt) > ttl.as_nanos() as u64);
+                assert!(original.same_planning_query_view(&receiver.freeze().unwrap()));
+            }
+            QueryEquivalentSafetyFence::UserStop => {
+                let stopped = owner_watchdog(handle.stop(&request_id)).await;
+                assert_eq!(stopped.status, STATUS_CANCELLED);
+                assert!(!handle.inner.lock().await.logical_active);
+            }
+            QueryEquivalentSafetyFence::Session | QueryEquivalentSafetyFence::Frame => {
+                // Seal a truthful new-domain root; do not relabel an old fine
+                // manifest or skip the actual wire/admission path.
+                let third_time = now_unix_nanos().max(second_time + 1);
+                let mut next = surface_message("map", 3);
+                if matches!(fence, QueryEquivalentSafetyFence::Session) {
+                    next.committed_map.session_id = "query-equivalent-new-session".into();
+                    next.committed_map.session_generation += 1;
+                } else { next.map_frame_generation += 1; }
+                next.source_timestamp_ns = third_time as i64;
+                next.committed_map.source_timestamp_ns = third_time as i64;
+                next.cloud.header.stamp_sec = (third_time / 1_000_000_000) as i32;
+                next.cloud.header.stamp_nsec = (third_time % 1_000_000_000) as i32;
+                next.cloud.width = 0; next.cloud.row_step = 0; next.cloud.data.clear();
+                let sealed = writer.seal(schema::navigation_map_3d_domain(&next), 3, third_time).unwrap();
+                next.source_voxel_size = sealed.manifest().voxel_size_m;
+                next.fine = Some(crate::lcm_runtime::mapping_feed_tests::prepare_fine_transfer_for_watermark_tests(
+                    &sealed, None).unwrap());
+                let bytes = schema::encode_navigation_map_3d_body(&next).unwrap();
+                let next = schema::decode_navigation_map_3d_body(&bytes).unwrap();
+                watermark_owner_install(&handle, &mut cache, &next).await;
+                assert!(!handle.inner.lock().await.logical_active);
+                assert!(!original.same_planning_query_view(&receiver.freeze().unwrap()));
+            }
+            QueryEquivalentSafetyFence::PartialSource => {
+                let mut partial = second.observations().unwrap().as_ref().clone();
+                let values = [0, 30].into_iter().flat_map(|z| (0..32).flat_map(move |x|
+                    (0..30).map(move |y| [x, y, z])))
+                    .map(|key| (key, second.observations().unwrap().get(key).unwrap())).collect();
+                partial.replace_block([0, 0, 0], values).unwrap();
+                assert!(!partial.is_complete_geometry_source());
+                let partial = Arc::new(second.with_observations(Some(Arc::new(partial))));
+                // Explicit partial-source injection, not a complete Reader result.
+                publish_surface_owner_receipt(&handle, &second_message.committed_map, 3, partial).await;
+                assert!(!original.same_planning_query_view(&receiver.freeze().unwrap()));
+            }
+            QueryEquivalentSafetyFence::RecentInput => {
+                let changed = Arc::new(second.with_recent_obstacle_points(1,
+                    second_time, 0, &[], [(0, [1.55, 1.55, 0.6])]).unwrap());
+                // Explicit recent injection; this does not claim current GEO
+                // Explore LCM ingress attaches the independent recent stream.
+                publish_surface_owner_receipt(&handle, &second_message.committed_map, 3, changed).await;
+                assert!(!original.same_planning_query_view(&receiver.freeze().unwrap()));
+            }
+            QueryEquivalentSafetyFence::LayerScatter => {
+                writer.replace_layer_observations(block, layers(0.01)).unwrap();
+                let third_time = now_unix_nanos().max(second_time + 1);
+                let (third_message, third_sealed) = watermark_owner_publication(&mut writer,
+                    Some(second_sealed.manifest().as_ref()), 3, third_time);
+                assert_eq!(second_sealed.manifest().geometry_revision, third_sealed.manifest().geometry_revision);
+                let (third, _) = watermark_owner_install(&handle, &mut cache, &third_message).await;
+                assert!(second.same_geometry(&third));
+                assert_eq!(second.observations().unwrap().get(key), third.observations().unwrap().get(key));
+                assert!(third.query_ground([1.55, 1.55], 0.025).max_residual_m.unwrap()
+                    > second.query_ground([1.55, 1.55], 0.025).max_residual_m.unwrap());
+                assert!(!original.same_planning_query_view(&receiver.freeze().unwrap()));
+                assert!(planning.rebind_original(&receiver.freeze().unwrap()).is_none());
+            }
+        }
+        gate.release();
+        let joined = owner_watchdog(ticking.as_mut().unwrap()).await;
+        ticking = None;
+        joined.unwrap();
+        owner_watchdog(handle.await_compute_idle()).await.unwrap();
+        let audit = audit.lock().unwrap();
+        assert_eq!((audit.captures.len(), audit.commits.len(), audit.discards), (1, 0, 1), "{fence:?}");
+        assert!(audit.feedback.is_empty());
+        assert!(sink.submitted.lock().unwrap().is_empty());
+        assert!(sink.cancelled.lock().unwrap().is_empty());
+    }).catch_unwind().await;
+    gate.release();
+    let cleanup = std::panic::AssertUnwindSafe(
+        watermark_owner_cleanup(&handle, &request_id, &mut ticking),
+    ).catch_unwind().await;
+    if let Err(panic) = exercise { std::panic::resume_unwind(panic); }
+    if let Err(panic) = cleanup { std::panic::resume_unwind(panic); }
+}
+
+#[tokio::test]
+async fn compute_owner_query_equivalent_writer_still_obeys_receipt_expiry() {
+    query_equivalent_writer_still_obeys_safety_fence(QueryEquivalentSafetyFence::ReceiptExpiry).await;
+}
+#[tokio::test]
+async fn compute_owner_query_equivalent_writer_still_obeys_user_stop() {
+    query_equivalent_writer_still_obeys_safety_fence(QueryEquivalentSafetyFence::UserStop).await;
+}
+#[tokio::test]
+async fn compute_owner_query_equivalent_writer_still_obeys_session_change() {
+    query_equivalent_writer_still_obeys_safety_fence(QueryEquivalentSafetyFence::Session).await;
+}
+#[tokio::test]
+async fn compute_owner_query_equivalent_writer_still_obeys_frame_change() {
+    query_equivalent_writer_still_obeys_safety_fence(QueryEquivalentSafetyFence::Frame).await;
+}
+#[tokio::test]
+async fn compute_owner_query_equivalent_writer_rejects_partial_source() {
+    query_equivalent_writer_still_obeys_safety_fence(QueryEquivalentSafetyFence::PartialSource).await;
+}
+#[tokio::test]
+async fn compute_owner_query_equivalent_writer_rejects_injected_recent() {
+    query_equivalent_writer_still_obeys_safety_fence(QueryEquivalentSafetyFence::RecentInput).await;
+}
+#[tokio::test]
+async fn compute_owner_query_equivalent_writer_rejects_changed_layer_scatter() {
+    query_equivalent_writer_still_obeys_safety_fence(QueryEquivalentSafetyFence::LayerScatter).await;
 }

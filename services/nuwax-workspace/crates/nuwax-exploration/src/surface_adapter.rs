@@ -125,6 +125,16 @@ impl FrozenSurfaceInput {
         }
     }
 
+    /// Compare only Explore's derived query inputs. Raw evidence and captured
+    /// notifications may differ; source identity and lifecycle checks stay separate.
+    pub fn same_planning_query_view(&self, other: &Self) -> bool {
+        match (&self.snapshot, &other.snapshot) {
+            (Some(left), Some(right)) => left.same_planning_query_view(right),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
     /// Compare original source evidence without confusing a receipt refresh with
     /// changed geometry, observations, current-body support, or ground evidence.
     pub fn same_source_view(&self, other: &Self) -> bool {
@@ -138,7 +148,7 @@ impl FrozenSurfaceInput {
 
 /// An opaque original-input/private-query pair for one captured observation.
 /// 首次只能由 [`FrozenSurfaceInput::fork_for_planning`] 构造；后续仅允许
-/// [`Self::rebind_original`] 重新绑定相同完整源，私有字段仍禁止注入无关查询图。
+/// [`Self::rebind_original`] 重新绑定查询等价的源，私有字段仍禁止注入无关查询图。
 ///
 /// ```
 /// use nuwax_exploration::surface_adapter::{FrozenSurfacePlanningInput, SurfaceInputReceiver};
@@ -162,10 +172,11 @@ pub struct FrozenSurfacePlanningInput {
 }
 
 impl FrozenSurfacePlanningInput {
-    /// 同一完整不可变源可复用私有查询，但必须保留本次捕获的来源和通知。
+    /// 查询等价的源可复用私有查询，但必须保留本次捕获的来源和通知。
+    /// 私有查询仍含旧冻结 raw 证据；最新 raw 证据须从 original_input 读取。
     /// 不读取接收器或源缓存；配置/生命周期资格仍由唯一查询拥有方负责。
     pub fn rebind_original(&self, captured: &FrozenSurfaceInput) -> Option<Self> {
-        if self.query_view.is_none() || !self.original.same_source_view(captured) {
+        if self.query_view.is_none() || !self.original.same_planning_query_view(captured) {
             return None;
         }
         Some(Self {
@@ -182,6 +193,7 @@ impl FrozenSurfacePlanningInput {
     }
 
     /// Read the same private query owner used for selection, for related route advice.
+    /// After a qualified rebind its raw evidence can remain older than original_input.
     pub fn query_snapshot(&self) -> Option<&Arc<SurfaceSnapshot>> {
         self.query_view.as_ref()
     }
@@ -2033,7 +2045,7 @@ mod tests {
     }
 
     #[test]
-    fn planning_rebind_keeps_new_capture_and_rejects_every_changed_source_view() {
+    fn planning_rebind_keeps_new_capture_and_rejects_changed_planning_query_view() {
         let receiver = SurfaceInputReceiver::new();
         let observations = Arc::new(nuwax_nav_mls_planner::SurfaceObservations::new(0.1, 32).unwrap());
         let snapshot = Arc::new(map().with_observations(Some(observations.clone())));
@@ -2052,11 +2064,45 @@ mod tests {
         assert!(Arc::ptr_eq(&derived_map, &rebound.tomogram.map(rebound.query_snapshot().unwrap()).unwrap()));
         assert_eq!(planning.original_input().notification(), captured.notification());
         assert!(!Arc::ptr_eq(planning.query_snapshot().unwrap(), &snapshot));
+
+        // Deliberate contract migration: a new raw observations Arc with the same
+        // planning inputs is positive, while same_source_view stays strict.
+        let same_values = Arc::new(snapshot.with_observations(Some(Arc::new(observations.as_ref().clone()))));
+        receiver.observe(same_values.clone()).unwrap();
+        let same_capture = receiver.freeze().unwrap();
+        assert!(!captured.same_source_view(&same_capture));
+        assert!(!snapshot.same_body_query_view(&same_values));
+        assert!(captured.same_planning_query_view(&same_capture));
+        assert!(snapshot.same_planning_query_view(&same_values));
+        let same_rebound = planning.rebind_original(&same_capture).unwrap();
+        assert_eq!(same_rebound.original_input().notification(), same_capture.notification());
+        assert!(Arc::ptr_eq(same_rebound.original_input().snapshot().unwrap(), &same_values));
+        assert!(Arc::ptr_eq(same_rebound.query_snapshot().unwrap(), planning.query_snapshot().unwrap()));
+        assert!(Arc::ptr_eq(&same_rebound.tomogram, &planning.tomogram));
+        assert!(Arc::ptr_eq(&derived_map, &same_rebound.tomogram.map(same_rebound.query_snapshot().unwrap()).unwrap()));
+
+        let mut changed_membership = observations.as_ref().clone();
+        changed_membership.replace_block([0, 0, 0], std::collections::BTreeMap::from([
+            ([10, 10, 0], nuwax_nav_mls_planner::SurfaceObservation { observed_ns: 1, hits: 1 }),
+        ])).unwrap();
+        let mut points: Vec<_> = [0.0_f32, 3.0].into_iter().flat_map(|level|
+            (0..20).flat_map(move |x| (0..20).map(move |y|
+                ((x as f32 + 0.5) * 0.1, (y as f32 + 0.5) * 0.1, level + 0.05)))).collect();
+        let mut config = snapshot.config().clone();
+        config.wall_buffer_weight = 0.25;
+        let changed_config = Arc::new(SurfaceSnapshot::from_points(&points, config, 0.1).unwrap()
+            .with_observations(Some(observations.clone())));
+        points.push((1.05, 1.05, 0.55));
+        let changed_geometry = Arc::new(SurfaceSnapshot::from_points(&points, snapshot.config().clone(), 0.1).unwrap()
+            .with_observations(Some(observations.clone())));
         let changed = vec![
             map(),
+            changed_geometry,
+            changed_config,
             Arc::new(snapshot.as_ref().clone().with_ground_evidence(
                 nuwax_nav_mls_planner::surface::GroundEvidence::OccupiedVolume)),
-            Arc::new(snapshot.with_observations(Some(Arc::new(observations.as_ref().clone())))),
+            Arc::new(snapshot.with_observations(Some(Arc::new(changed_membership)))),
+            Arc::new(snapshot.with_observations(None)),
             Arc::new(snapshot.with_recent_obstacle_points(1, 1, 0, &[],
                 std::iter::empty::<(u32, [f64; 3])>()).unwrap()),
             Arc::new(snapshot.with_virtual_obstacles([0.0, 0.0], 0.1, 20, 20, &vec![false; 400]).unwrap()),
@@ -2071,6 +2117,8 @@ mod tests {
             receiver.observe(source).unwrap();
             let changed = receiver.freeze().unwrap();
             assert!(!captured.same_source_view(&changed));
+            assert!(!captured.same_planning_query_view(&changed));
+            assert!(!snapshot.same_planning_query_view(changed.snapshot().unwrap()));
             assert!(planning.rebind_original(&changed).is_none());
             let cold = changed.fork_for_planning();
             assert!(!Arc::ptr_eq(&planning.tomogram, &cold.tomogram));
@@ -2080,6 +2128,9 @@ mod tests {
         }
         receiver.clear().unwrap();
         let absent = receiver.freeze().unwrap();
+        assert!(!captured.same_planning_query_view(&absent));
+        assert!(!absent.same_planning_query_view(&captured));
+        assert!(absent.same_planning_query_view(&absent));
         assert!(planning.rebind_original(&absent).is_none());
         assert!(absent.fork_for_planning().rebind_original(&absent).is_none());
         assert!(snapshot.frontier_cache_stats().is_none());
@@ -2236,6 +2287,305 @@ mod tests {
             Ok(ExplorationPoll::SourceUnavailable(_))
         ));
         adapter.discard_prepared_poll().unwrap();
+    }
+
+    // EXP-level oracle: real public production queries, never a reimplementation of
+    // collision, support, interpolation, or motion algorithms. The GEO Writer /
+    // wire / Reader tests separately prove source admission and sample provenance.
+    mod planning_query_warm_cold_tests {
+        use super::*;
+        use nuwax_nav_mls_planner::{SurfaceBodyEnvelope, SurfaceError, SurfaceObservation, SurfaceObservations};
+        use nuwax_nav_mls_planner::surface::{
+            BodyFailureWitness, BodyRejection, GroundQuery, GroundQueryState, OccupancySource,
+        };
+        use std::collections::BTreeMap;
+
+        type Pose = ([f64; 3], [f64; 4]);
+        type PoseBits = ([u64; 3], [u64; 4]);
+        type Blocks = BTreeMap<[i32; 3], BTreeMap<[i32; 3], SurfaceObservation>>;
+        type WitnessBits = (PoseBits, [i32; 3], OccupancySource, [u64; 2], Option<u64>);
+        const Q: [f64; 4] = [0.0, 0.0, 0.0, 1.0];
+        const CLEAR: Pose = ([-1.0, 0.05, 0.5], Q);
+        const NEXT: Pose = ([-0.8, 0.05, 0.5], Q);
+        const BLOCKED: Pose = ([0.05, 0.05, 0.5], Q);
+        const FAR: Pose = ([20.05, 0.05, 0.5], Q);
+        const FINE_CLEAR: Pose = ([1.4, 0.05, 0.5], Q);
+        const FINE_BLOCKED: Pose = ([2.25, 0.05, 0.5], Q);
+        const FINE_KEY: [i32; 3] = [22, 0, 5];
+
+        #[derive(Debug, PartialEq, Eq)]
+        struct GroundBits {
+            state: GroundQueryState,
+            height: Option<u64>,
+            normal: Option<[u64; 3]>,
+            sources: Vec<[i32; 3]>,
+            radius_m: u64,
+            max_residual_m: Option<u64>,
+        }
+
+        fn ground_bits(query: GroundQuery) -> GroundBits {
+            // Exhaustive destructuring makes a newly added output field visible.
+            let GroundQuery { state, height, normal, sources, radius_m, max_residual_m } = query;
+            GroundBits { state, height: height.map(f64::to_bits),
+                normal: normal.map(|normal| normal.map(f64::to_bits)), sources,
+                radius_m: radius_m.to_bits(), max_residual_m: max_residual_m.map(f64::to_bits) }
+        }
+
+        fn pose_bits(pose: Pose) -> PoseBits {
+            (pose.0.map(f64::to_bits), pose.1.map(f64::to_bits))
+        }
+
+        fn witness_bits(witness: Option<BodyFailureWitness>) -> Option<WitnessBits> {
+            witness.map(|witness| {
+                let BodyFailureWitness { pose, rejection } = witness;
+                match rejection {
+                    BodyRejection::Occupancy { cell, source, z_bounds, ground_height } =>
+                        (pose_bits(pose), cell, source, z_bounds.map(f64::to_bits),
+                            ground_height.map(f64::to_bits)),
+                }
+            })
+        }
+
+        fn poison_witness() -> Option<BodyFailureWitness> {
+            Some(BodyFailureWitness { pose: ([999.0; 3], [1.0; 4]),
+                rejection: BodyRejection::Occupancy { cell: [999, 998, 997],
+                    source: OccupancySource::CoarseFallback, z_bounds: [-0.0, 1.0],
+                    ground_height: Some(-0.0) } })
+        }
+
+        fn assert_result<T: std::fmt::Debug + PartialEq>(actual: &Result<T, SurfaceError>,
+            expected: &Result<T, SurfaceError>, label: &str) {
+            assert_eq!(actual, expected, "complete Ok/Err and payload: {label}");
+            if let (Err(SurfaceError::InsufficientResolution { source_m: a, planner_m: b }),
+                Err(SurfaceError::InsufficientResolution { source_m: c, planner_m: d })) = (actual, expected) {
+                assert_eq!([a.to_bits(), b.to_bits()], [c.to_bits(), d.to_bits()], "{label}");
+            }
+        }
+
+        fn fresh(input: &FrozenSurfaceInput, warm: &SurfaceSnapshot) -> FrozenSurfacePlanningInput {
+            let cold = input.fork_for_planning();
+            // Public fork construction creates independent disposable query caches.
+            // Source-owned legacy_reference_cache is intentionally shared, so this
+            // is not a claim that every source-owned memo is globally cold/reset.
+            assert!(!warm.same_body_query_view(cold.query_snapshot().unwrap()));
+            cold
+        }
+
+        fn fixture() -> (Arc<SurfaceSnapshot>, SurfaceObservations, Blocks) {
+            // Existing MLS body::tests::scene/model dimensions; all exact fine
+            // occupied cells are present and explicitly re-marked complete after
+            // every admitted block replacement. No cfg(test) TTL/quality API.
+            let mut points: Vec<_> = (-30..30).flat_map(|x| (-30..30).map(move |y|
+                ((x as f32 + 0.5) * 0.1, (y as f32 + 0.5) * 0.1, 0.025))).collect();
+            // This persistent obstacle enters both the coarse point cloud and
+            // complete fine observations. Its voxel starts at x=2.2, beyond the
+            // original Recent sweep's maximal body extent x=1.55.
+            points.push((2.25, 0.05, 0.55));
+            let mut config = map().config().clone();
+            config.robot_height = 0.25;
+            config.wall_clearance_m = 0.01;
+            config.wall_buffer_m = 0.0;
+            config.step_threshold_m = 0.21;
+            config.min_step_tread_depth_m = 0.2;
+            let model = SurfaceBodyEnvelope {
+                footprint_xy_m: vec![[-0.55, -0.14], [0.55, -0.14], [0.55, 0.14], [-0.55, 0.14]],
+                z_bounds_m: [-0.1, 0.25], body_to_support_z_m: 0.4,
+                max_step_up_m: 0.2, max_step_down_m: 0.1,
+                max_cross_slope_deg: 10.0, support_uncertainty_m: 0.0,
+            };
+            let mut blocks = Blocks::new();
+            for &(x, y, z) in &points {
+                let key = [x, y, z].map(|v| (f64::from(v) / f64::from(0.1_f32)).floor() as i32);
+                blocks.entry(key.map(|v| v.div_euclid(32))).or_default()
+                    .insert(key, SurfaceObservation { observed_ns: 100, hits: 1 });
+            }
+            let mut observations = SurfaceObservations::new(0.1, 32).unwrap();
+            for (block, values) in &blocks { observations.replace_block(*block, values.clone()).unwrap(); }
+            observations.mark_complete_geometry_source();
+            let source = SurfaceSnapshot::from_points(&points, config, 0.1).unwrap()
+                .with_body_envelope(model).unwrap()
+                .with_observations(Some(Arc::new(observations.clone())))
+                .with_recent_obstacle_points(1, 100, 0, &[], [(0, [0.05, 0.05, 0.55])]).unwrap();
+            (Arc::new(source), observations, blocks)
+        }
+
+        fn assert_queries(warm: &SurfaceSnapshot, input: &FrozenSurfaceInput) {
+            assert!(warm.observations().unwrap().is_complete_geometry_source());
+            assert!(input.snapshot().unwrap().observations().unwrap().is_complete_geometry_source());
+            for (xy, reference, expected_state) in [
+                ([-0.95, 0.05], 0.1, GroundQueryState::LegacyGeometry),
+                ([0.05, 0.05], 0.1, GroundQueryState::LegacyGeometry),
+                ([20.05, 0.05], 0.1, GroundQueryState::Unknown),
+                ([f64::NAN, 0.05], 0.1, GroundQueryState::Unknown),
+            ] {
+                let cold = fresh(input, warm);
+                let expected = ground_bits(cold.query_snapshot().unwrap().query_ground(xy, reference));
+                assert_eq!(expected.state, expected_state, "fixture must exercise known and unknown ground");
+                for _ in 0..3 { assert_eq!(ground_bits(warm.query_ground(xy, reference)), expected); }
+            }
+
+            for (label, pose, expected_result, has_witness) in [
+                ("clear pose", CLEAR, Ok(()), false),
+                ("real recent collision", BLOCKED, Err(SurfaceError::InsufficientClearance), true),
+                ("unknown ground is not collision", FAR, Ok(()), false),
+                ("invalid quaternion", (CLEAR.0, [0.0; 4]), Err(SurfaceError::InvalidPose), false),
+            ] {
+                let cold = fresh(input, warm);
+                let mut expected_witness = poison_witness();
+                let expected = cold.query_snapshot().unwrap().validate_body_pose_with_witness(
+                    pose.0, pose.1, &mut expected_witness);
+                assert_result(&expected, &expected_result, label);
+                assert_eq!(expected_witness.is_some(), has_witness, "{label}");
+                if has_witness { assert!(matches!(expected_witness.unwrap().rejection,
+                    BodyRejection::Occupancy { source: OccupancySource::Recent, .. })); }
+                // Also check the legacy API on its own fresh owner, not on the
+                // just-populated cold witness cache.
+                let legacy_cold = fresh(input, warm);
+                assert_result(&legacy_cold.query_snapshot().unwrap().validate_body_pose(pose.0, pose.1), &expected, label);
+                for _ in 0..3 {
+                    let mut actual_witness = poison_witness();
+                    assert_result(&warm.validate_body_pose_with_witness(pose.0, pose.1, &mut actual_witness), &expected, label);
+                    assert_eq!(witness_bits(actual_witness), witness_bits(expected_witness), "{label}");
+                    assert_result(&warm.validate_body_pose(pose.0, pose.1), &expected, label);
+                }
+            }
+
+            let wide = [[-1.7, -0.3], [-0.2, -0.3], [-0.2, 0.3], [-1.7, 0.3]];
+            let excludes_destination = [[-1.2, -0.3], [-0.9, -0.3], [-0.9, 0.3], [-1.2, 0.3]];
+            let malformed = [[-1.2, -0.3], [-0.9, -0.3]];
+            let quarter_turn = [0.0, 0.0, std::f64::consts::FRAC_PI_4.sin(), std::f64::consts::FRAC_PI_4.cos()];
+            let motions: Vec<(&str, Pose, Pose, &[[f64; 2]], Result<(), SurfaceError>, bool)> = vec![
+                ("clear translation", CLEAR, NEXT, &[], Ok(()), false),
+                ("clear rotation", CLEAR, (CLEAR.0, quarter_turn), &[], Ok(()), false),
+                ("intermediate collision", CLEAR, ([1.0, 0.05, 0.5], Q), &[], Err(SurfaceError::InsufficientClearance), true),
+                ("zero motion still collides", BLOCKED, BLOCKED, &[], Err(SurfaceError::InsufficientClearance), true),
+                ("same motion with admitted boundary", CLEAR, NEXT, &wide, Ok(()), false),
+                ("same motion with rejecting boundary", CLEAR, NEXT, &excludes_destination, Err(SurfaceError::InvalidBoundary), false),
+                ("malformed boundary", CLEAR, NEXT, &malformed, Err(SurfaceError::InvalidBoundary), false),
+            ];
+            for (label, from, to, boundary, expected_result, has_witness) in motions {
+                let cold = fresh(input, warm);
+                let mut expected_witness = poison_witness();
+                let expected = cold.query_snapshot().unwrap().validate_body_motion_with_witness(
+                    from, to, boundary, &mut expected_witness);
+                assert_result(&expected, &expected_result, label);
+                assert_eq!(expected_witness.is_some(), has_witness, "{label}");
+                if has_witness { assert!(matches!(expected_witness.unwrap().rejection,
+                    BodyRejection::Occupancy { source: OccupancySource::Recent, .. })); }
+                let legacy_cold = fresh(input, warm);
+                assert_result(&legacy_cold.query_snapshot().unwrap().validate_body_motion(from, to, boundary), &expected, label);
+                for _ in 0..3 {
+                    let mut actual_witness = poison_witness();
+                    assert_result(&warm.validate_body_motion_with_witness(from, to, boundary, &mut actual_witness), &expected, label);
+                    assert_eq!(witness_bits(actual_witness), witness_bits(expected_witness), "{label}");
+                    assert_result(&warm.validate_body_motion(from, to, boundary), &expected, label);
+                }
+            }
+            // Boundary checks above must not poison or inherit the cached no-boundary permission.
+            assert_eq!(warm.validate_body_motion(CLEAR, NEXT, &[]), Ok(()));
+
+            // The updated raw record is now this actual rejecting obstacle, not
+            // an unrelated floor sample. It is strictly inside the coarse XY
+            // bounds at FINE_BLOCKED, so the real intersection must be Fine.
+            // Verify the motion's start independently; keep each oracle API on
+            // a separate fresh owner, as in the other query controls above.
+            let clear = fresh(input, warm);
+            assert_eq!(clear.query_snapshot().unwrap().validate_body_pose(FINE_CLEAR.0, FINE_CLEAR.1), Ok(()));
+            for from in [None, Some(FINE_CLEAR)] {
+                let label = if from.is_some() { "motion into updated fine obstacle" } else { "updated fine obstacle pose" };
+                let query = |snapshot: &SurfaceSnapshot, slot: &mut Option<BodyFailureWitness>| match from {
+                    Some(from) => snapshot.validate_body_motion_with_witness(from, FINE_BLOCKED, &[], slot),
+                    None => snapshot.validate_body_pose_with_witness(FINE_BLOCKED.0, FINE_BLOCKED.1, slot),
+                };
+                let legacy = |snapshot: &SurfaceSnapshot| match from {
+                    Some(from) => snapshot.validate_body_motion(from, FINE_BLOCKED, &[]),
+                    None => snapshot.validate_body_pose(FINE_BLOCKED.0, FINE_BLOCKED.1),
+                };
+                let cold = fresh(input, warm);
+                let mut expected_witness = poison_witness();
+                let expected = query(cold.query_snapshot().unwrap(), &mut expected_witness);
+                assert_result(&expected, &Err(SurfaceError::InsufficientClearance), label);
+                let witness = expected_witness.expect("actual fine intersection must retain its witness");
+                let BodyRejection::Occupancy { cell, source, .. } = witness.rejection;
+                assert_eq!(source, OccupancySource::Fine, "{label}");
+                assert_eq!(cell, FINE_KEY, "must reject the exact raw key being refreshed");
+                assert_eq!(pose_bits(witness.pose), pose_bits(FINE_BLOCKED), "{label}");
+                let legacy_cold = fresh(input, warm);
+                assert_result(&legacy(legacy_cold.query_snapshot().unwrap()), &expected, label);
+                for _ in 0..3 {
+                    let mut actual_witness = poison_witness();
+                    assert_result(&query(warm, &mut actual_witness), &expected, label);
+                    assert_eq!(witness_bits(actual_witness), witness_bits(expected_witness), "{label}");
+                    assert_result(&legacy(warm), &expected, label);
+                }
+            }
+
+            for (label, from, xy, yaw, expected_error, has_witness) in [
+                ("project clear translation", CLEAR, [NEXT.0[0], NEXT.0[1]], 0.0, None, false),
+                ("project identity", CLEAR, [CLEAR.0[0], CLEAR.0[1]], 0.0, None, false),
+                ("project into obstacle", CLEAR, [BLOCKED.0[0], BLOCKED.0[1]], 0.0, Some(SurfaceError::InsufficientClearance), true),
+                ("project blocked identity", BLOCKED, [BLOCKED.0[0], BLOCKED.0[1]], 0.0, Some(SurfaceError::InsufficientClearance), true),
+                ("project unknown ground", FAR, [20.25, 0.05], 0.25, None, false),
+                ("project invalid coordinate", CLEAR, [f64::NAN, 0.05], 0.0, Some(SurfaceError::InvalidPose), false),
+            ] {
+                let cold = fresh(input, warm);
+                let mut expected_witness = poison_witness();
+                let expected = cold.query_snapshot().unwrap().body_pose_after_motion_with_witness(
+                    from, xy, yaw, &mut expected_witness).map(pose_bits);
+                assert_eq!(expected.as_ref().err(), expected_error.as_ref(), "{label}");
+                assert_eq!(expected_witness.is_some(), has_witness, "{label}");
+                if has_witness { assert!(matches!(expected_witness.unwrap().rejection,
+                    BodyRejection::Occupancy { source: OccupancySource::Recent, .. })); }
+                let legacy_cold = fresh(input, warm);
+                assert_result(&legacy_cold.query_snapshot().unwrap().body_pose_after_motion(from, xy, yaw).map(pose_bits), &expected, label);
+                for _ in 0..3 {
+                    let mut actual_witness = poison_witness();
+                    assert_result(&warm.body_pose_after_motion_with_witness(from, xy, yaw, &mut actual_witness).map(pose_bits), &expected, label);
+                    assert_eq!(witness_bits(actual_witness), witness_bits(expected_witness), "{label}");
+                    assert_result(&warm.body_pose_after_motion(from, xy, yaw).map(pose_bits), &expected, label);
+                }
+            }
+        }
+
+        #[test]
+        fn planning_rebound_raw_metadata_matches_fresh_cold_queries_and_witnesses() {
+            let (snapshot, mut observations, mut blocks) = fixture();
+            let receiver = SurfaceInputReceiver::new();
+            receiver.observe(snapshot.clone()).unwrap();
+            let captured = receiver.freeze().unwrap();
+            let mut planning = captured.fork_for_planning();
+            let original_query = planning.query_snapshot().unwrap().clone();
+            let original_tomogram = planning.tomogram.clone();
+            let key = FINE_KEY;
+            let original_evidence = snapshot.observations().unwrap().get(key).unwrap();
+            assert_queries(&original_query, &captured); // warm successes, errors, projections and full witnesses
+            for revision in 2_u16..=4 {
+                let expected = SurfaceObservation { observed_ns: u64::from(revision) * 100, hits: revision };
+                *blocks.get_mut(&[0, 0, 0]).unwrap().get_mut(&key).unwrap() = expected;
+                let changed = observations.replace_block_with_geometry_changes([0, 0, 0], blocks[&[0, 0, 0]].clone()).unwrap();
+                assert!(changed.is_empty());
+                observations.mark_complete_geometry_source();
+                let latest = Arc::new(snapshot.with_observations(Some(Arc::new(observations.clone()))));
+                receiver.observe(latest.clone()).unwrap();
+                let current = receiver.freeze().unwrap();
+                assert_eq!(current.notification(), captured.notification() + u64::from(revision - 1));
+                assert!(!Arc::ptr_eq(snapshot.observations().unwrap(), latest.observations().unwrap()));
+                assert!(!captured.same_source_view(&current), "strict source qualification remains unchanged");
+                assert!(!snapshot.same_body_query_view(&latest), "global body-cache contract remains strict");
+                assert!(captured.same_planning_query_view(&current));
+                assert!(snapshot.same_planning_query_view(&latest));
+                let rebound = planning.rebind_original(&current).expect("query-equivalent raw evidence keeps the private owner");
+                assert!(Arc::ptr_eq(rebound.query_snapshot().unwrap(), &original_query));
+                assert!(Arc::ptr_eq(&rebound.tomogram, &original_tomogram));
+                assert!(Arc::ptr_eq(rebound.original_input().snapshot().unwrap(), &latest));
+                assert_eq!(rebound.original_input().notification(), current.notification());
+                assert_eq!(rebound.original_input().snapshot().unwrap().observations().unwrap().get(key), Some(expected));
+                assert_eq!(original_query.observations().unwrap().get(key), Some(original_evidence));
+                assert_eq!(snapshot.observations().unwrap().get(key), Some(original_evidence));
+                assert_queries(rebound.query_snapshot().unwrap(), &current);
+                planning = rebound; // also exercise successive rebinds, not only the first capture
+            }
+        }
     }
 
     #[test]

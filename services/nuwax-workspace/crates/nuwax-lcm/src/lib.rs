@@ -1269,3 +1269,190 @@ mod tests {
         unsafe { lcm_destroy(owner.lcm) };
     }
 }
+
+// Tests-only publish-stage controls; appended to baseline 322e996b.
+// Original draft and all actual qualification results are retained outside the repo.
+// No production changes or network setup.
+// T1-T5 exercise the actual LcmContext publisher with a manually owned queue.
+// T6 exercises actual OwnerThread::handle_command and same-context liblcm memq.
+// This is not a UDP, remote-receiver, or robot qualification.
+
+#[cfg(test)]
+mod publish_error_outcomes_review {
+    use super::*;
+    use std::future::{poll_fn, Future};
+    use std::net::Shutdown;
+    use std::pin::Pin;
+    use std::task::Poll;
+
+    fn manual_context() -> (
+        LcmContext,
+        mpsc::Receiver<Command>,
+        std::sync::mpsc::Receiver<Command>,
+    ) {
+        let (cmd_tx, cmd_rx) = mpsc::channel(1);
+        let (control_tx, control_rx) = std::sync::mpsc::channel();
+        (
+            LcmContext {
+                cmd_tx,
+                control_tx,
+                wakeup: Arc::new(CommandWakeup::new().expect("isolated test wakeup")),
+                provider: Arc::new("test-manual-command-owner".to_owned()),
+                owner_thread: Mutex::new(None),
+                // No real owner thread is claimed by this test fixture.
+                owner_alive: Arc::new(AtomicBool::new(false)),
+            },
+            cmd_rx,
+            control_rx,
+        )
+    }
+
+    async fn completion_with_deadline<F: Future>(future: F) -> F::Output {
+        tokio::time::timeout(std::time::Duration::from_secs(5), future)
+            .await
+            .expect("isolated LCM publication did not complete within fixture deadline")
+    }
+
+    async fn poll_once_pending<F: Future>(mut future: Pin<&mut F>) {
+        poll_fn(move |cx| {
+            assert!(future.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn nul_rejection_does_not_enqueue() {
+        let (context, mut commands, _control) = manual_context();
+        let result = completion_with_deadline(context.publish("/test/nul\0suffix", Bytes::from_static(b"goal"))).await;
+        let queue_is_empty = matches!(commands.try_recv(), Err(mpsc::error::TryRecvError::Empty));
+        assert!(matches!(result, Err(LcmError::NulByte(_))));
+        assert!(queue_is_empty, "CString rejection precedes command ownership transfer");
+    }
+
+    #[tokio::test]
+    async fn closed_command_queue_does_not_enqueue() {
+        let (context, commands, _control) = manual_context();
+        drop(commands);
+        let result = completion_with_deadline(context.publish("/test/closed", Bytes::from_static(b"goal"))).await;
+        assert!(matches!(result, Err(LcmError::OwnerThreadDown { .. })));
+        // No receiver existed for the send, so this attempt cannot be executed.
+    }
+
+    #[tokio::test]
+    async fn fatal_wakeup_error_leaves_the_command_queued() {
+        let (context, mut commands, _control) = manual_context();
+        // Artificially inject a fatal wake failure into this isolated fixture.
+        context.wakeup.writer.shutdown(Shutdown::Write).expect("half-close test writer");
+        let result = completion_with_deadline(context.publish("/test/wake", Bytes::from_static(b"goal"))).await;
+        let queued = commands.try_recv().expect("send succeeded before wake failed");
+        let (channel, payload, caller_stopped_observing) = match queued {
+            Command::Publish { channel, payload, reply } => {
+                (channel, payload, reply.is_closed())
+            }
+            _ => panic!("expected the original single publish command"),
+        };
+        assert!(matches!(result, Err(LcmError::OwnerThreadDown { .. })));
+        assert_eq!(channel.to_bytes(), b"/test/wake");
+        assert_eq!(payload.as_ref(), b"goal");
+        assert!(caller_stopped_observing, "current wake-error ? dropped the original reply receiver");
+    }
+
+    #[tokio::test]
+    async fn reply_loss_after_enqueue_is_not_send_rejection() {
+        let (context, mut commands, _control) = manual_context();
+        let mut publication = Box::pin(context.publish("/test/reply-lost", Bytes::from_static(b"goal")));
+        poll_once_pending(publication.as_mut()).await;
+        let queued = commands.try_recv().expect("actual publish call enqueued its command");
+        assert!(matches!(&queued, Command::Publish { .. }));
+        // This fixture deliberately discards a not-yet-executed command.
+        // Other histories cannot be inferred from the shared error variant.
+        drop(queued);
+        assert!(matches!(completion_with_deadline(publication).await, Err(LcmError::OwnerThreadDown { .. })));
+    }
+
+    #[tokio::test]
+    async fn reply_already_delivered_survives_queue_close() {
+        let (context, mut commands, _control) = manual_context();
+        let mut publication = Box::pin(context.publish("/test/replied", Bytes::from_static(b"goal")));
+        poll_once_pending(publication.as_mut()).await;
+        let queued = commands.try_recv().expect("original publication command");
+        match queued {
+            Command::Publish { reply, .. } => reply.send(Ok(())).expect("live reply receiver"),
+            _ => panic!("expected publish command"),
+        }
+        drop(commands);
+        assert!(completion_with_deadline(publication).await.is_ok(), "queue/owner termination cannot erase an already sent reply");
+    }
+
+    // Keep cleanup owned even if an assertion panics after native setup.
+    #[cfg(feature = "link-liblcm")]
+    struct ManualNativeOwner {
+        context: LcmContext,
+        owner: Option<OwnerThread>,
+    }
+
+    #[cfg(feature = "link-liblcm")]
+    impl ManualNativeOwner {
+        fn new() -> Self {
+            let (context, cmd_rx, control_rx) = manual_context();
+            let provider = to_cstring("memq://").expect("literal provider");
+            let lcm = unsafe { lcm_create(provider.as_ptr()) };
+            assert!(!lcm.is_null(), "same-context memq must be available");
+            let owner = OwnerThread {
+                lcm,
+                cmd_rx,
+                control_rx,
+                wakeup: Arc::clone(&context.wakeup),
+                subscriptions: std::collections::HashMap::new(),
+                next_subscription_id: 1,
+                retired_entries: Vec::new(),
+            };
+            Self { context, owner: Some(owner) }
+        }
+    }
+
+    #[cfg(feature = "link-liblcm")]
+    impl Drop for ManualNativeOwner {
+        fn drop(&mut self) {
+            if let Some(owner) = self.owner.take() {
+                // The original owner loop consumes its control Shutdown first,
+                // unsubscribes/destroys native state, then drops queued commands.
+                let _ = self.context.control_tx.send(Command::Shutdown { reply: None });
+                owner.run();
+            }
+        }
+    }
+
+    #[cfg(feature = "link-liblcm")]
+    #[tokio::test]
+    async fn queued_command_can_publish_after_fatal_wakeup_error() {
+        let mut fixture = ManualNativeOwner::new();
+        let channel = to_cstring("/test/real-owner-wake-error").expect("literal channel");
+        let (sender, mut callback) = broadcast::channel(1);
+        fixture.owner.as_mut().unwrap()
+            .subscribe(channel.clone(), channel, sender)
+            .expect("same-context real subscription");
+        fixture.context.wakeup.writer.shutdown(Shutdown::Write)
+            .expect("inject fatal wake error only in isolated test fixture");
+
+        let caller_result = completion_with_deadline(fixture.context.publish(
+            "/test/real-owner-wake-error", Bytes::from_static(b"original-goal-body")
+        )).await;
+        let owner = fixture.owner.as_mut().unwrap();
+        let command = owner.cmd_rx.try_recv().expect("original queued command survives caller Err");
+        let abandoned_reply = matches!(&command, Command::Publish { reply, .. } if reply.is_closed());
+        let (stopped, _) = owner.handle_command(command);
+        let callbacks_handled = unsafe { lcm_handle_timeout(owner.lcm, 0) };
+        let delivery = callback.try_recv();
+        drop(fixture); // Native ownership cleaned before reporting assertions.
+
+        assert!(matches!(caller_result, Err(LcmError::OwnerThreadDown { .. })));
+        assert!(abandoned_reply);
+        assert!(!stopped);
+        assert!(callbacks_handled > 0);
+        assert_eq!(delivery.expect("real memq callback").payload.as_ref(), b"original-goal-body");
+        // This proves execution through real liblcm after an injected wake Err.
+        // It does NOT prove a UDP packet or a physical navigation command.
+    }
+}

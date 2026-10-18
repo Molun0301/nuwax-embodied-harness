@@ -447,6 +447,14 @@ GREEN同一原release/LTO二进制51个exact全部通过：原RED与5新控制�
 
 首GREEN批82通过/1失败：作者把旧watermark(false)控制的尾部扩大为第二次也必须Accept，却未提供第二gate/真实续receipt。旧合同只要求首轮Accept和第二capture暖复用，均已过；首2.1397s日志属于root1，不能解释其后root2第二轮原因。仅tests-only把新增总(2,0)/两提交/第二root身份断言限定到已具备第二gate和真实续期的evidence(true)分支，原false全部断言保留，true语句去缩进逐字不变。补watermark单例通过，原FAIL保留，不称单轮83全绿或已证明第二轮TTL原因。生产四文件在两批间未变；原release/LTO与唯一增量target沿用。
 
+## 第三十四阶段：发布错误的原入口事实控制
+
+仅增加LCM cfg(test)事实控制，生产前缀逐字不变。6新exact与3原owner生命周期控制共9/9通过，无超时：CString拒绝和已关闭cmd队列可证明本命令未入队；send成功后的wake错误仍留命令；reply关闭不能解释为send拒绝，已交付reply不因随后队列关闭丢失。人工半关闭wake的T6中，原publish返回OwnerThreadDown并丢回复观察后，原排队命令仍由手动原handle_command进入真实同context memq callback，payload一致。
+
+T1–5没有native owner线程，T6也是手动执行原入口，不证明生产owner循环自然会执行或网络实际交付；3原控制另验证真实owner线程join、队列次序/订阅清理及保留容量时关闭。原release/link-liblcm check9.89s/no-run20.17s，实际liblcm1.3.1。新增5秒异步观察超时仅防夹具挂起，外层180秒不伪造结算；本批未触发超时。
+
+这些是旧行为事实与生命周期控制，不是Nav/Bridge业务RED或生产修复。阶段27只防Explore观察者取消丢future，genericErr字符串擦除、Nav条件rollback和Bridge丢lease仍需单独审议。Some lease可能来自attempted/existing/installed，不能据它生成取消责任；永久丢包、unknown Cancel先到晚Goal及跨接收端重启不能由本地错误分类保证完成。
+
 ## 后续持续检查
 
 1. 墙前晚到路径的实际恢复与初始 full/partial/PCT 顺序，保留及时移动和真实避障

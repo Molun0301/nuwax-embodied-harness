@@ -6,6 +6,18 @@ use std::sync::{
 };
 use std::thread::JoinHandle;
 
+#[cfg(feature = "surface-recovery-qualification")]
+#[path = "planning_owner_first_dequeue.rs"]
+pub(crate) mod qualification_first_dequeue;
+
+#[cfg(any(test, feature = "surface-recovery-qualification"))]
+thread_local! { static PENDING_REPLACE_LOCK_ATTEMPTS_FOR_QUALIFICATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
+#[cfg(any(test, feature = "surface-recovery-qualification"))]
+pub(crate) fn pending_replace_lock_attempts_for_qualification() -> u64 {
+    PENDING_REPLACE_LOCK_ATTEMPTS_FOR_QUALIFICATION.get()
+}
+
+
 #[cfg(test)]
 thread_local! { static CURRENT_REQUEST_FOR_TEST: std::cell::Cell<Option<(u64,u64)>> = const { std::cell::Cell::new(None) }; }
 #[cfg(test)]
@@ -65,11 +77,17 @@ impl<T: Send + 'static, R: Send + 'static> PlanningOwner<T, R> {
             alive: AtomicBool::new(true),
         });
         let worker = shared.clone();
+        #[cfg(feature = "surface-recovery-qualification")]
+        let first_dequeue_probe = qualification_first_dequeue::take_for_new_owner();
         let thread = std::thread::Builder::new()
             .name("nav-local-planning".into())
             .spawn(move || {
+                #[cfg(feature = "surface-recovery-qualification")]
+                let mut first_dequeue_recorded = false;
                 // Catch the entire loop, including an unexpected implementation panic.
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| loop {
+                    #[cfg(feature = "surface-recovery-qualification")]
+                    let mut dequeue_before = None;
                     let request = {
                         let mut slot = worker.exchange.lock().unwrap();
                         while !slot.closed && (slot.pending.is_none() || slot.completion.is_some())
@@ -80,8 +98,18 @@ impl<T: Send + 'static, R: Send + 'static> PlanningOwner<T, R> {
                             break;
                         }
                         slot.active = true;
+                        #[cfg(feature = "surface-recovery-qualification")]
+                        if !first_dequeue_recorded && first_dequeue_probe.is_some() {
+                            dequeue_before = Some(std::time::Instant::now());
+                        }
                         slot.pending.take().unwrap()
                     };
+                    #[cfg(feature = "surface-recovery-qualification")]
+                    if let (Some(probe), Some(before)) = (&first_dequeue_probe, dequeue_before) {
+                        let after = std::time::Instant::now();
+                        probe.record(request.id, request.epoch, before, after);
+                        first_dequeue_recorded = true;
+                    }
                     let cancel = Cancellation {
                         epoch: worker.epoch.clone(),
                         expected: request.epoch,

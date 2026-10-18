@@ -16,6 +16,10 @@ use crate::planning_owner::PlanningOwner;
 use crate::route_planning::{body, pose_bits, exact_points, PlanKernel, PlanRequest, PlanResult, ReferenceSource};
 use std::time::{Duration,Instant};
 
+#[cfg(any(test, feature = "surface-recovery-qualification"))]
+thread_local! { static PLANNING_REQUEST_BUILDS_FOR_QUALIFICATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
+
+
 pub struct RouteFollower {
     controller: SurfaceFollower,
     config: SurfaceFollowerConfig,
@@ -119,6 +123,11 @@ impl RouteFollower {
     }
     /// Number of entries into local planning, including failed attempts.
     pub fn local_planning_calls(&self) -> u64 { self.local_planning_calls }
+    #[cfg(any(test, feature = "surface-recovery-qualification"))]
+    pub(crate) fn pending_source_work_for_qualification(&self) -> (u64, u64) {
+        (crate::planning_owner::pending_replace_lock_attempts_for_qualification(),
+            PLANNING_REQUEST_BUILDS_FOR_QUALIFICATION.get())
+    }
     pub fn local_path(&self) -> Option<&Path3D> {
         self.local_path.as_ref()
     }
@@ -252,6 +261,8 @@ impl RouteFollower {
         if self.config.kinematics().is_none() {self.preparation_fault=Some("近场执行缺少运动能力".into());return;}
         let Some(route)=&self.route else {return;};
         let Some(id)=self.next_request.checked_add(1) else {self.permanent_fault=Some("planning request IDs exhausted".into());return;};
+        #[cfg(any(test, feature = "surface-recovery-qualification"))]
+        PLANNING_REQUEST_BUILDS_FOR_QUALIFICATION.with(|count| count.set(count.get() + 1));
         let reference_source=ReferenceSource{route:route.clone(),cumulative:self.cumulative.clone(),
             goal:self.goal.clone(),options:self.options,offset:self.config.body_to_support_z_m,progress:self.progress};
         let request=PlanRequest{source:map.clone(),pose:pose.clone(),boundary:self.boundary.clone(),reference:Vec::new(),
@@ -613,6 +624,10 @@ pub mod route_change_scope_qualification;
 #[cfg(feature = "surface-recovery-qualification")]
 #[path = "route_pending_source_qualification.rs"]
 pub mod route_pending_source_qualification;
+
+#[cfg(feature = "surface-recovery-qualification")]
+#[path = "route_r11_qualification.rs"]
+pub mod route_r11_qualification;
 
 #[cfg(test)]
 mod tests {

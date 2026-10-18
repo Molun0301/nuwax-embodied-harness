@@ -56,6 +56,8 @@ pub use route_follower::RouteFollower;
 pub use route_follower::route_change_scope_qualification;
 #[cfg(feature = "surface-recovery-qualification")]
 pub use route_follower::route_pending_source_qualification;
+#[cfg(feature = "surface-recovery-qualification")]
+pub use route_follower::route_r11_qualification;
 
 /// 局部执行保留路径维度，三维路径不能通过默认适配静默丢弃高度。
 #[derive(Debug, Clone, PartialEq)]

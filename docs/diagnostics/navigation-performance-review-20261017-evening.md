@@ -576,6 +576,14 @@ release 最小 `surface-recovery-qualification` lane 的6项定向测试全部�
 默认七包tests check通过（10.15s）；唯一增量target、原release资格feature，阶段39测试与生产策略均未修改。
 
 
+## 第四十一阶段：广泛保留 active 候选被不利回放否决
+
+候选的59项语义/原边界与1项独立组合预检全部通过，但固定四进程A1/B1/B2/A2的8个无hold case触发既定接受阻断。OnlyActive最新源起算A为0.385/3.013ms，B为250.337/250.093ms；首L层非零A为300.477/350.727ms，B为600.532/550.461ms。初始单槽pending四次自然窗口也均真实覆盖，B恢复同样更迟。首非零只是原controller角速度0.1、无dispatch bound，不是桥交付或机器人运动。control执行max没有一致恶化，不能扩大结论。
+
+真实事件表明B旧A在277–296ms才完整返回，250ms tick时冷却已过但同位姿submitted仍阻止新源；300ms消费拒收后才提交最新源。不能把损失全归冷却，也不以M1/Q1有利例抵消。未改点、预算、输入相位或补样；两样本不是总体分布证明。完整数据与解释见[独立报告](navigation-pending-source-abba-20261018.md)及[八case整数记录](navigation-pending-source-abba-20261018.json)。
+
+本轮生产候选不接受，owner/follower原策略已恢复；只保留共同R11资格驱动、两个测试计数与真实first-dequeue观察。原M/Q合同完整恢复，剥离诊断新增行后原生产字节一致。默认七包tests check7.76s通过。M1/M2无谓取消问题仍未解决；后续仅考虑恢复原相关变化取消、独立保留Q1 pending换源的新策略，须重新验收，不能沿用本轮通过结论。
+
 ## 后续持续检查
 
 1. 墙前晚到路径的实际恢复与初始 full/partial/PCT 顺序，保留及时移动和真实避障

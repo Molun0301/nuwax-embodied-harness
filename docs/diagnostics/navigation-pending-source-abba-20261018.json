@@ -1,0 +1,490 @@
+[
+  {
+    "sample": "A1",
+    "case": "OnlyActive",
+    "observed_min_positive_clock_ns": 24,
+    "end_ns": 350590001,
+    "accepted": 2,
+    "replace_lock_attempts": 0,
+    "request_builder_calls": 2,
+    "observer_drops": 0,
+    "skipped_pose": 0,
+    "skipped_control": 0,
+    "latest_entry_ns": 50493598,
+    "installed_to_entry_ns": 384956,
+    "first_checked_nonzero_ns": 350586016,
+    "installed_to_nonzero_ns": 300477374,
+    "only_active_at_damage_start": true,
+    "initial_pending_coverage": "NOT_PENDING_DEQUEUED_BEFORE_DAMAGE",
+    "max_control_ns": 493628,
+    "max_due_delay_ns": 132903,
+    "timed_out_or_missing_endpoint": false,
+    "cleanup_returned": true,
+    "first_nonzero_bound_present": false,
+    "entry_source_acquisition_age_ns_lower_upper": [
+      97857436,
+      119938085
+    ],
+    "nonzero_current_source_acquisition_age_ns_lower_upper": [
+      129871700,
+      150476917
+    ],
+    "origin_damage_acquisition_to_entry_ns_lower_upper": [
+      97857436,
+      119938085
+    ],
+    "origin_damage_acquisition_to_nonzero_ns_lower_upper": [
+      397949854,
+      420030503
+    ],
+    "control_samples": 7,
+    "kernel_entries": 2,
+    "kernel_returns": 2,
+    "cleanup_kernel_returns": 0,
+    "deadline_expired_at_return_nonzero": 0,
+    "issues_empty": true,
+    "first_dequeue": {
+      "id": 1,
+      "epoch": 1,
+      "before_ns": 17967,
+      "after_ns": 18125
+    },
+    "damage": {
+      "began_ns": 50096930,
+      "finished_ns": 50108642,
+      "acquisition_before_ns": -69444487,
+      "acquisition_after_ns": -47363838,
+      "epoch_before": 1,
+      "epoch_after": 2,
+      "tickets_before": 1,
+      "tickets_after": 0
+    }
+  },
+  {
+    "sample": "A1",
+    "case": "InitialSlotObservation",
+    "observed_min_positive_clock_ns": 24,
+    "end_ns": 450881813,
+    "accepted": 2,
+    "replace_lock_attempts": 0,
+    "request_builder_calls": 2,
+    "observer_drops": 0,
+    "skipped_pose": 0,
+    "skipped_control": 0,
+    "latest_entry_ns": 50443685,
+    "installed_to_entry_ns": 50437655,
+    "first_checked_nonzero_ns": 450878865,
+    "installed_to_nonzero_ns": 450872835,
+    "only_active_at_damage_start": false,
+    "initial_pending_coverage": "COVERED_FIRST_DEQUEUE_AFTER_DAMAGE_INSTALLED",
+    "max_control_ns": 771530,
+    "max_due_delay_ns": 260017,
+    "timed_out_or_missing_endpoint": false,
+    "cleanup_returned": true,
+    "first_nonzero_bound_present": false,
+    "entry_source_acquisition_age_ns_lower_upper": [
+      103082962,
+      136023224
+    ],
+    "nonzero_current_source_acquisition_age_ns_lower_upper": [
+      32080325,
+      50773021
+    ],
+    "origin_damage_acquisition_to_entry_ns_lower_upper": [
+      103082962,
+      136023224
+    ],
+    "origin_damage_acquisition_to_nonzero_ns_lower_upper": [
+      503518142,
+      536458404
+    ],
+    "control_samples": 9,
+    "kernel_entries": 1,
+    "kernel_returns": 1,
+    "cleanup_kernel_returns": 0,
+    "deadline_expired_at_return_nonzero": 0,
+    "issues_empty": true,
+    "first_dequeue": {
+      "id": 2,
+      "epoch": 2,
+      "before_ns": 50440128,
+      "after_ns": 50440449
+    },
+    "damage": {
+      "began_ns": 1145,
+      "finished_ns": 6030,
+      "acquisition_before_ns": -85579539,
+      "acquisition_after_ns": -52639277,
+      "epoch_before": 1,
+      "epoch_after": 2,
+      "tickets_before": 1,
+      "tickets_after": 0
+    }
+  },
+  {
+    "sample": "B1",
+    "case": "OnlyActive",
+    "observed_min_positive_clock_ns": 25,
+    "end_ns": 650632901,
+    "accepted": 2,
+    "replace_lock_attempts": 0,
+    "request_builder_calls": 2,
+    "observer_drops": 0,
+    "skipped_pose": 1,
+    "skipped_control": 0,
+    "latest_entry_ns": 300434204,
+    "installed_to_entry_ns": 250336569,
+    "first_checked_nonzero_ns": 650629801,
+    "installed_to_nonzero_ns": 600532166,
+    "only_active_at_damage_start": true,
+    "initial_pending_coverage": "NOT_PENDING_DEQUEUED_BEFORE_DAMAGE",
+    "max_control_ns": 545519,
+    "max_due_delay_ns": 33309566,
+    "timed_out_or_missing_endpoint": false,
+    "cleanup_returned": true,
+    "first_nonzero_bound_present": false,
+    "entry_source_acquisition_age_ns_lower_upper": [
+      66184343,
+      100308887
+    ],
+    "nonzero_current_source_acquisition_age_ns_lower_upper": [
+      28402901,
+      50521459
+    ],
+    "origin_damage_acquisition_to_entry_ns_lower_upper": [
+      335326484,
+      354789201
+    ],
+    "origin_damage_acquisition_to_nonzero_ns_lower_upper": [
+      685522081,
+      704984798
+    ],
+    "control_samples": 13,
+    "kernel_entries": 2,
+    "kernel_returns": 2,
+    "cleanup_kernel_returns": 0,
+    "deadline_expired_at_return_nonzero": 0,
+    "issues_empty": true,
+    "first_dequeue": {
+      "id": 1,
+      "epoch": 1,
+      "before_ns": 11850,
+      "after_ns": 12082
+    },
+    "damage": {
+      "began_ns": 50085234,
+      "finished_ns": 50097635,
+      "acquisition_before_ns": -54354997,
+      "acquisition_after_ns": -34892280,
+      "epoch_before": 1,
+      "epoch_after": 1,
+      "tickets_before": 1,
+      "tickets_after": 1
+    }
+  },
+  {
+    "sample": "B1",
+    "case": "InitialSlotObservation",
+    "observed_min_positive_clock_ns": 25,
+    "end_ns": 650636353,
+    "accepted": 2,
+    "replace_lock_attempts": 0,
+    "request_builder_calls": 2,
+    "observer_drops": 0,
+    "skipped_pose": 1,
+    "skipped_control": 0,
+    "latest_entry_ns": 300146482,
+    "installed_to_entry_ns": 300137234,
+    "first_checked_nonzero_ns": 650633203,
+    "installed_to_nonzero_ns": 650623955,
+    "only_active_at_damage_start": false,
+    "initial_pending_coverage": "COVERED_FIRST_DEQUEUE_AFTER_DAMAGE_INSTALLED",
+    "max_control_ns": 536154,
+    "max_due_delay_ns": 4368481,
+    "timed_out_or_missing_endpoint": false,
+    "cleanup_returned": true,
+    "first_nonzero_bound_present": false,
+    "entry_source_acquisition_age_ns_lower_upper": [
+      83318512,
+      100038450
+    ],
+    "nonzero_current_source_acquisition_age_ns_lower_upper": [
+      30730260,
+      50533783
+    ],
+    "origin_damage_acquisition_to_entry_ns_lower_upper": [
+      353508081,
+      373397882
+    ],
+    "origin_damage_acquisition_to_nonzero_ns_lower_upper": [
+      703994802,
+      723884603
+    ],
+    "control_samples": 13,
+    "kernel_entries": 2,
+    "kernel_returns": 2,
+    "cleanup_kernel_returns": 0,
+    "deadline_expired_at_return_nonzero": 0,
+    "issues_empty": true,
+    "first_dequeue": {
+      "id": 1,
+      "epoch": 1,
+      "before_ns": 41971,
+      "after_ns": 42441
+    },
+    "damage": {
+      "began_ns": 3251,
+      "finished_ns": 9248,
+      "acquisition_before_ns": -73251400,
+      "acquisition_after_ns": -53361599,
+      "epoch_before": 1,
+      "epoch_after": 1,
+      "tickets_before": 1,
+      "tickets_after": 1
+    }
+  },
+  {
+    "sample": "B2",
+    "case": "OnlyActive",
+    "observed_min_positive_clock_ns": 22,
+    "end_ns": 600565136,
+    "accepted": 2,
+    "replace_lock_attempts": 0,
+    "request_builder_calls": 2,
+    "observer_drops": 0,
+    "skipped_pose": 0,
+    "skipped_control": 0,
+    "latest_entry_ns": 300193041,
+    "installed_to_entry_ns": 250092855,
+    "first_checked_nonzero_ns": 600561325,
+    "installed_to_nonzero_ns": 550461139,
+    "only_active_at_damage_start": true,
+    "initial_pending_coverage": "NOT_PENDING_DEQUEUED_BEFORE_DAMAGE",
+    "max_control_ns": 470543,
+    "max_due_delay_ns": 142844,
+    "timed_out_or_missing_endpoint": false,
+    "cleanup_returned": true,
+    "first_nonzero_bound_present": false,
+    "entry_source_acquisition_age_ns_lower_upper": [
+      81428980,
+      100091149
+    ],
+    "nonzero_current_source_acquisition_age_ns_lower_upper": [
+      181554744,
+      200464648
+    ],
+    "origin_damage_acquisition_to_entry_ns_lower_upper": [
+      341027796,
+      358939895
+    ],
+    "origin_damage_acquisition_to_nonzero_ns_lower_upper": [
+      641396080,
+      659308179
+    ],
+    "control_samples": 12,
+    "kernel_entries": 2,
+    "kernel_returns": 2,
+    "cleanup_kernel_returns": 0,
+    "deadline_expired_at_return_nonzero": 0,
+    "issues_empty": true,
+    "first_dequeue": {
+      "id": 1,
+      "epoch": 1,
+      "before_ns": 12030,
+      "after_ns": 12211
+    },
+    "damage": {
+      "began_ns": 50092406,
+      "finished_ns": 50100186,
+      "acquisition_before_ns": -58746854,
+      "acquisition_after_ns": -40834755,
+      "epoch_before": 1,
+      "epoch_after": 1,
+      "tickets_before": 1,
+      "tickets_after": 1
+    }
+  },
+  {
+    "sample": "B2",
+    "case": "InitialSlotObservation",
+    "observed_min_positive_clock_ns": 22,
+    "end_ns": 600646691,
+    "accepted": 2,
+    "replace_lock_attempts": 0,
+    "request_builder_calls": 2,
+    "observer_drops": 0,
+    "skipped_pose": 0,
+    "skipped_control": 0,
+    "latest_entry_ns": 300139233,
+    "installed_to_entry_ns": 300133098,
+    "first_checked_nonzero_ns": 600642605,
+    "installed_to_nonzero_ns": 600636470,
+    "only_active_at_damage_start": false,
+    "initial_pending_coverage": "COVERED_FIRST_DEQUEUE_AFTER_DAMAGE_INSTALLED",
+    "max_control_ns": 544831,
+    "max_due_delay_ns": 192951,
+    "timed_out_or_missing_endpoint": false,
+    "cleanup_returned": true,
+    "first_nonzero_bound_present": false,
+    "entry_source_acquisition_age_ns_lower_upper": [
+      78414583,
+      100032163
+    ],
+    "nonzero_current_source_acquisition_age_ns_lower_upper": [
+      177592560,
+      200536102
+    ],
+    "origin_damage_acquisition_to_entry_ns_lower_upper": [
+      336036978,
+      354702283
+    ],
+    "origin_damage_acquisition_to_nonzero_ns_lower_upper": [
+      636540350,
+      655205655
+    ],
+    "control_samples": 12,
+    "kernel_entries": 2,
+    "kernel_returns": 2,
+    "cleanup_kernel_returns": 0,
+    "deadline_expired_at_return_nonzero": 0,
+    "issues_empty": true,
+    "first_dequeue": {
+      "id": 1,
+      "epoch": 1,
+      "before_ns": 11554,
+      "after_ns": 11849
+    },
+    "damage": {
+      "began_ns": 1652,
+      "finished_ns": 6135,
+      "acquisition_before_ns": -54563050,
+      "acquisition_after_ns": -35897745,
+      "epoch_before": 1,
+      "epoch_after": 1,
+      "tickets_before": 1,
+      "tickets_after": 1
+    }
+  },
+  {
+    "sample": "A2",
+    "case": "OnlyActive",
+    "observed_min_positive_clock_ns": 24,
+    "end_ns": 400827815,
+    "accepted": 2,
+    "replace_lock_attempts": 0,
+    "request_builder_calls": 2,
+    "observer_drops": 0,
+    "skipped_pose": 0,
+    "skipped_control": 0,
+    "latest_entry_ns": 53110064,
+    "installed_to_entry_ns": 3013199,
+    "first_checked_nonzero_ns": 400823433,
+    "installed_to_nonzero_ns": 350726568,
+    "only_active_at_damage_start": true,
+    "initial_pending_coverage": "NOT_PENDING_DEQUEUED_BEFORE_DAMAGE",
+    "max_control_ns": 555693,
+    "max_due_delay_ns": 267740,
+    "timed_out_or_missing_endpoint": false,
+    "cleanup_returned": true,
+    "first_nonzero_bound_present": false,
+    "entry_source_acquisition_age_ns_lower_upper": [
+      89615583,
+      108667623
+    ],
+    "nonzero_current_source_acquisition_age_ns_lower_upper": [
+      173194842,
+      200708566
+    ],
+    "origin_damage_acquisition_to_entry_ns_lower_upper": [
+      89615583,
+      108667623
+    ],
+    "origin_damage_acquisition_to_nonzero_ns_lower_upper": [
+      437328952,
+      456380992
+    ],
+    "control_samples": 8,
+    "kernel_entries": 2,
+    "kernel_returns": 2,
+    "cleanup_kernel_returns": 0,
+    "deadline_expired_at_return_nonzero": 0,
+    "issues_empty": true,
+    "first_dequeue": {
+      "id": 1,
+      "epoch": 1,
+      "before_ns": 13526,
+      "after_ns": 13822
+    },
+    "damage": {
+      "began_ns": 50082984,
+      "finished_ns": 50096865,
+      "acquisition_before_ns": -55557559,
+      "acquisition_after_ns": -36505519,
+      "epoch_before": 1,
+      "epoch_after": 2,
+      "tickets_before": 1,
+      "tickets_after": 0
+    }
+  },
+  {
+    "sample": "A2",
+    "case": "InitialSlotObservation",
+    "observed_min_positive_clock_ns": 24,
+    "end_ns": 400992099,
+    "accepted": 2,
+    "replace_lock_attempts": 0,
+    "request_builder_calls": 2,
+    "observer_drops": 0,
+    "skipped_pose": 0,
+    "skipped_control": 0,
+    "latest_entry_ns": 50610145,
+    "installed_to_entry_ns": 50603913,
+    "first_checked_nonzero_ns": 400988785,
+    "installed_to_nonzero_ns": 400982553,
+    "only_active_at_damage_start": false,
+    "initial_pending_coverage": "COVERED_FIRST_DEQUEUE_AFTER_DAMAGE_INSTALLED",
+    "max_control_ns": 885249,
+    "max_due_delay_ns": 108665,
+    "timed_out_or_missing_endpoint": false,
+    "cleanup_returned": true,
+    "first_nonzero_bound_present": false,
+    "entry_source_acquisition_age_ns_lower_upper": [
+      96330613,
+      113608894
+    ],
+    "nonzero_current_source_acquisition_age_ns_lower_upper": [
+      184249348,
+      200884848
+    ],
+    "origin_damage_acquisition_to_entry_ns_lower_upper": [
+      96330613,
+      113608894
+    ],
+    "origin_damage_acquisition_to_nonzero_ns_lower_upper": [
+      446709253,
+      463987534
+    ],
+    "control_samples": 8,
+    "kernel_entries": 1,
+    "kernel_returns": 1,
+    "cleanup_kernel_returns": 0,
+    "deadline_expired_at_return_nonzero": 0,
+    "issues_empty": true,
+    "first_dequeue": {
+      "id": 2,
+      "epoch": 2,
+      "before_ns": 50606160,
+      "after_ns": 50606625
+    },
+    "damage": {
+      "began_ns": 1189,
+      "finished_ns": 6232,
+      "acquisition_before_ns": -62998749,
+      "acquisition_after_ns": -45720468,
+      "epoch_before": 1,
+      "epoch_after": 2,
+      "tickets_before": 1,
+      "tickets_after": 0
+    }
+  }
+]

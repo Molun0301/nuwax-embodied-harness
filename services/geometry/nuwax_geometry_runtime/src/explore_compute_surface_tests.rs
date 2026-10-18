@@ -58,11 +58,11 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SurfaceOwnerTomogr
     }
 }
 
-fn capture_surface_owner_work<T>(prepare: impl FnOnce() -> T) -> (T, usize, usize, usize, usize) {
+pub(super) fn capture_surface_owner_work<T>(prepare: impl FnOnce() -> T) -> (T, usize, usize, usize, usize) {
     use tracing_subscriber::prelude::*;
     let work = SurfaceOwnerFrontierWork::default();
     let tomogram = SurfaceOwnerTomogramWork::default();
-    // 同步闭包在真实 owner worker 上执行；只观察本次 prepare，无全局 subscriber。
+    // 同步闭包覆盖调用方的本次 prepare；适用于 owner worker 或 backend 事实夹具，无全局 subscriber。
     let result = tracing::subscriber::with_default(
         tracing_subscriber::registry().with(work.clone()).with(tomogram.clone()), prepare);
     let (rebuilds, cells) = *work.0.lock().unwrap();
@@ -1027,7 +1027,7 @@ async fn compute_owner_surface_new_immutable_source_discards_without_history_or_
 
 // F2 real-input fixtures. Append inside the existing explore_runtime::tests
 // inclusion; reuse its actual compute owner, gated Surface source and cleanup.
-fn watermark_owner_config() -> SurfaceNavigationConfig {
+pub(super) fn watermark_owner_config() -> SurfaceNavigationConfig {
     let mut config = surface_config("map");
     config.apply_calibration(Some(nuwax_nav_types_messages::RobotGeometry {
         footprint_xy_m: vec![[-0.1, -0.1], [0.1, -0.1], [0.1, 0.1], [-0.1, 0.1]],
@@ -1037,14 +1037,14 @@ fn watermark_owner_config() -> SurfaceNavigationConfig {
     config
 }
 
-fn watermark_owner_source() -> Arc<nuwax_map_chunks::LayerSource> {
+pub(super) fn watermark_owner_source() -> Arc<nuwax_map_chunks::LayerSource> {
     Arc::new(nuwax_map_chunks::LayerSource::Auxiliary {
         sensor_id: "depth-front".into(), clock_id: "camera-clock".into(),
         runtime_generation: 7, session_generation: 1,
     })
 }
 
-fn watermark_owner_publication(
+pub(super) fn watermark_owner_publication(
     writer: &mut nuwax_map_chunks::Writer,
     previous: Option<&nuwax_map_chunks::Manifest>,
     revision: i32,

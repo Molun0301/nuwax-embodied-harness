@@ -625,6 +625,16 @@ C3原槽为448姿态full，同批prefix及固定hit [283,47,51] 实际碰撞edge
 
 A/B default release check/no-run与local-guidance-qualification+body-query-profile tests check全部通过，只有同一target增量构建。原重压力13/14、全链default7及AB计时未执行。本轮结论仅删除每个到达初始化位置的分支一次实际Vec复制，不宣称规划耗时、CPU或RSS改善；历史wide原参考仅两点，也不把几十字节复制与秒级搜索关联。
 
+## 第四十六阶段：返航预算重复构图的真实backend事实
+
+仅tests-only三源：原四helper可见性、backend测试include与292行三项事实控制，生产backend/runtime逐字保持。原geometry默认release增量check/no-run通过，三个exact实际各1且首跑PASS，无修正、失败或额外样本。
+
+同backend/context/config/source/PCT Arc的两次Homeward，实际map构建[1,1]、cells[800,800]；真实Selection/Homeward/Selection为[1,1,0]、cells[800,800,0]；真实Writer初始/raw等价/散布变化/重复为[1,1,1,1]，每次1500cells。Homeward frontier构建均0。现有tracing观察包住完整同步backend.prepare_request，没有新增生产计数。代码链确认fresh private fork改变SurfaceData Arc，使共享导航PCT每次失配。
+
+三路返航位移均X+0.5m、unknown-space、目标yawπ/2，前两原标定0.3m，Writer原标定0.5m；不是known-ground或真实active-child周期。原始捕获source/notification、无controller delta、source进度/history及原Stop通过。独立新planner冷oracle在全部计数结束后核完整路径/长度/终点/预算投影，但未取得backend内部路径，不冒称其逐点等价。真实owner调度、TTL、取消竞态、内存/时延未在本批验证。
+
+基线事实已保存，下一步只评审在原fork位置复用既有单query槽。不得缓存路线或预算结果；routes仍须使用当次导航config/PCT及local_costs，保留原限制先于取消与route错误嵌套。少构图不自动证明交错占用、控制延迟或端到端收益。
+
 ## 后续持续检查
 
 1. 墙前晚到路径的实际恢复与初始 full/partial/PCT 顺序，保留及时移动和真实避障

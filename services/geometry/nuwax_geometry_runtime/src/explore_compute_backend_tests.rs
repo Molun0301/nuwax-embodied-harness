@@ -1367,3 +1367,6 @@ fn surface_planning_slot_lifecycle_clears_even_failed_install_and_export() {
         assert!(retained.upgrade().is_none(), "{case}");
     }
 }
+
+// Backend-only real-work facts; not scheduler/receipt-TTL qualification.
+include!("explore_homeward_refresh_fact_tests.rs");

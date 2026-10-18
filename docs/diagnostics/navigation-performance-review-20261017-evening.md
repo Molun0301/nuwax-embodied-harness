@@ -285,6 +285,14 @@ Writer::region 原来逐项扫描全部持久块和 dirty 块目录，再筛选�
 - 结构模型中 131072 个目录 key 缩为 1248 个 X 范围候选，之后仍需 Y/Z 精筛。这不是生产访问计数或同倍数耗时收益；地图沿 Y 延伸且 X 均在窗口内时，仍可能扫描全部 key
 - 原必须执行的块内读取/坐标转换/输出分配保持，未新增空间索引、缓存、锁、哈希或运行时校验。没有整链或实机提速结论
 
+## 第十八阶段：净几何未变时顺序继承块版本
+
+Writer::seal 只在原 same_domain 且 changed_members 为空时，按新旧相同的有序 key 顺序读取旧 geometry_revision，避免逐块重复二分。现有编辑、flush、恢复与 rehome 路径保证所有净 key 差均进入 membership_touched，再进入 changed_members；因此该窄分支的新旧 key 集合相同，真实继承次数 L=N=M。没有新增运行时 key 比对、全图统计、缓存或哈希。净几何变化与换域仍沿原路径，避免“删多保少”或只剩少量查找时无条件扫描旧目录的退化。
+
+- 先在原生产上跑 10 项冻结旧 seal oracle 的等价测试，再装候选跑同 10 项，均通过；完整 map-chunks 94 通过/1 原 ignored/0 filtered，默认七包 tests 类型检查通过
+- 完整 Manifest、工作状态、I/O 计数及旧读者保持与原算法一致。用异质旧 geometry_revision 检测错位，覆盖 evidence-only、真实 pressure flush、净删除重加、同数换 key、rehome、失败重试、恢复与换域
+- 原完整 staging clone、root Vec、root.validate、安装与失败副作用顺序保留；没有改变 membership 阶段的二分、Receiver 或 GC。只减少被选分支的版本继承查找，不声称整个 seal 线性化、零复制或已测得整链提速
+
 ## 后续持续检查
 
 1. 墙前晚到路径的实际恢复与初始 full/partial/PCT 顺序，保留及时移动和真实避障

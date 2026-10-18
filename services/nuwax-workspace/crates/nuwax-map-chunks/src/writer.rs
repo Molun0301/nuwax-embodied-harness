@@ -274,6 +274,8 @@ impl Writer {
         }
         let geometry_revision = if !same_domain || !changed_members.is_empty() { revision } else { self.published.as_ref().unwrap().geometry_revision };
         let mut blocks = self.blocks.clone();
+        let reuse_ordered_baseline = same_domain && changed_members.is_empty();
+        let mut previous_index = 0_usize;
         for (key, block) in &mut blocks {
             if !same_domain { block.block_revision = revision; block.geometry_revision = revision; }
             else {
@@ -281,7 +283,10 @@ impl Writer {
                 if changed_members.contains(key) { block.geometry_revision = revision; }
                 else {
                     let previous = self.published.as_ref().unwrap();
-                    if let Ok(index) = previous.blocks.binary_search_by_key(key, |b| b.key) {
+                    if reuse_ordered_baseline {
+                        block.geometry_revision = previous.blocks[previous_index].geometry_revision;
+                        previous_index += 1;
+                    } else if let Ok(index) = previous.blocks.binary_search_by_key(key, |b| b.key) {
                         block.geometry_revision = previous.blocks[index].geometry_revision;
                     }
                 }
@@ -337,6 +342,10 @@ impl Writer {
     #[cfg(test)]
     pub(crate) fn pending_ids(&self) -> Vec<ObjectIdentity> { self.pending.values().map(|p| p.object).collect() }
 }
+
+#[cfg(test)]
+#[path = "writer_seal_cursor_tests.rs"]
+mod seal_cursor_tests;
 
 #[cfg(test)]
 #[path = "writer_accounting_tests.rs"]

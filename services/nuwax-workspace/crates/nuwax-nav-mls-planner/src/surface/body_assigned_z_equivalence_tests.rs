@@ -659,3 +659,69 @@ fn pose_assigned_z_integer_selector_preserves_half_open_order() {
         }
     }
 }
+
+
+#[cfg(feature = "body-query-profile")]
+fn capture_pose_path_scope(source: &SurfaceSnapshot, pose: Pose)
+    -> (Result<(),SurfaceError>,Option<BodyRejection>,crate::body_query_profile::Record) {
+    use crate::body_query_profile as profile;
+    struct Cleanup(bool);
+    impl Drop for Cleanup { fn drop(&mut self) { if self.0 { let _ = profile::end(); } } }
+    let map=source.fork_for_planning();
+    profile::begin(); let mut cleanup=Cleanup(true);
+    let mut rejection=Some(poison());
+    let result=map.check_body_pose(pose.0,pose.1,&mut rejection);
+    let record=profile::end(); cleanup.0=false;
+    (result,rejection,record)
+}
+
+#[cfg(feature = "body-query-profile")]
+fn assert_pose_path_scope(record: &crate::body_query_profile::Record, columns: u32,
+    assigned: u64, unassigned: u64) {
+    use crate::body_query_profile::{Stage,Counter};
+    assert_eq!(record.calls[Stage::PoseCoreTotal as usize],1);
+    assert_eq!(record.calls[Stage::PosePrelude as usize],1);
+    assert_eq!(record.calls[Stage::PoseCoarseColumns as usize],columns);
+    assert_eq!(record.counters[Counter::PoseAssignedColumns as usize],assigned);
+    assert_eq!(record.counters[Counter::PoseUnassignedColumns as usize],unassigned);
+    let total=record.wall_nanos[Stage::PoseCoreTotal as usize];
+    let prelude=record.wall_nanos[Stage::PosePrelude as usize];
+    let coarse=record.wall_nanos[Stage::PoseCoarseColumns as usize];
+    assert!(total>=prelude+coarse,"disjoint P/C must fit inside T: {total}, {prelude}, {coarse}");
+}
+
+#[test]
+#[cfg(feature = "body-query-profile")]
+fn pose_path_profile_success_records_real_assigned_and_unknown_columns() {
+    let (source,pose)=single_column_fixture(0.01,0.1,-1,&[],&[],true,false);
+    let (result,rejection,record)=capture_pose_path_scope(&source,pose);
+    assert_eq!(result,Ok(())); assert!(rejection.is_none());
+    assert_pose_path_scope(&record,1,1,0);
+    // Same immutable source, actual unknown space beyond its retained floor.
+    // Unknown ground remains traversable; no fabricated ground or witness.
+    let size=f64::from(source.config().voxel_size);
+    let unknown=([size*50.5,size*50.5,0.4],pose.1);
+    assert!(matches!(source.locate_support_from_body(unknown.0,unknown.1,0.4),
+        Err(SurfaceError::MissingSupport)));
+    let (result,rejection,record)=capture_pose_path_scope(&source,unknown);
+    assert_eq!(result,Ok(())); assert!(rejection.is_none());
+    assert_pose_path_scope(&record,1,0,1);
+}
+
+#[test]
+#[cfg(feature = "body-query-profile")]
+fn pose_path_profile_early_prelude_and_column_errors_finish_scopes() {
+    let (clear,pose)=single_column_fixture(0.01,0.1,-1,&[],&[],true,false);
+    let (result,rejection,record)=capture_pose_path_scope(&clear,(pose.0,[0.0;4]));
+    assert_eq!(result,Err(SurfaceError::InvalidPose)); assert!(rejection.is_none());
+    assert_pose_path_scope(&record,0,0,0);
+    // Reuse the already qualified true measured-member/nonmember collision.
+    let (blocked,pose)=single_column_fixture(0.01,0.1,0,&[[0,0,1]],&[],true,true);
+    let (expected,witness)=compare_pose(&blocked,pose);
+    let (result,rejection,record)=capture_pose_path_scope(&blocked,pose);
+    assert_result_bits(&result,&expected);
+    assert_eq!(rejection_bits(rejection),rejection_bits(witness));
+    assert_eq!(result,Err(SurfaceError::InsufficientClearance));
+    assert!(matches!(rejection,Some(BodyRejection::Occupancy {cell:[0,0,1],source:OccupancySource::Fine,..})));
+    assert_pose_path_scope(&record,1,1,0);
+}

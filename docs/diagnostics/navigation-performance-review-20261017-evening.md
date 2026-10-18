@@ -315,6 +315,16 @@ Writer::seal 只在原 same_domain 且 changed_members 为空时，按新旧相�
 
 最终源码只保留三个诊断计数和五项测试。原 A 的新测试/计数控制 14 项、独立 BFS 9 项均通过；390 项完整 MLS 属于含候选 B，不能冒称恢复 A 同次全绿。恢复 A 的增量 check/no-run、微基准及默认七包 tests check 14.22s 通过，三源文件与原 A 逐字节相同（提交时仅更新新测试顶部的草案状态注释）。全部原失败/计时日志保留，单一 target、原 release 与预算不变。下一步仅细分实际 pose 核的前置构造和整段粗列处理，定位后再修改算法。
 
+## 第二十一阶段：将实际机体成本定位到粗列处理
+
+仅在显式诊断下增加真实未缓存 pose 核 T、前置构造 P、整段粗 XY 循环 C 三个计时和 assigned/unassigned 两个局部累加计数；保留原 locals 生命周期、早返顺序及默认 feature-off 排除。32 以上计数数组仅补 Default 和测试 JSON slice 兼容，不修改几何算法。
+
+原同一 bounded 两请求仍保留 256 partial 资格，32 阶段/34 计数分解完整，原 32 计数、旧阶段次数及分支结果与上一 A 一致。N remaining 的 T/P/C 为 5256.397/86.254/5136.035ms；T 请求对应 5483.811/86.514/5366.313ms。粗列循环约占实际 pose 核 97.71%/97.86%；assigned/unassigned 分支次数分别 454542/2750 和 405870/2889。次数不能直接用于分摊耗时，尚不能将 C 全归于 assigned 或某一个 helper。
+
+末段 assigned-Z 计数仍全零，前置 pose 构造 P 不是此样本的大头。下一审查目标收敛到粗列循环内地面/contact 选择、临时结构构造及真实 unassigned 检查。T 包含 project 与 sweep 调用，不与其相加；T−P−C 还含尾部、局部清理和诊断汇总，不能叫纯 fringe 时间。不同插桩批次不作提速比较。
+
+原单 target 增量 check/no-run 12.00s/2m48s；实际 22 个 exact 全通过，含成功/早返计时边界、新完整旧核/witness、既有计数/cache 控制；默认七包 tests check 15.40s 通过。唯一原压力诊断 exit0，两份守恒均成立；整进程 wall19.316s、user19.162s、system0.140s 包含两请求和夹具。没有本批全量 MLS 或实机资格结论，旧失败和环境限制保留。
+
 ## 后续持续检查
 
 1. 墙前晚到路径的实际恢复与初始 full/partial/PCT 顺序，保留及时移动和真实避障

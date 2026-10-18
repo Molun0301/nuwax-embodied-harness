@@ -79,11 +79,20 @@ pub enum Stage {
     ProjectedKnownTerrain,
     /// Only the actual known-terrain call inside the checked sweep.
     SweptKnownTerrain,
+    /// Uncached check_body_pose kernel, including early returns and local cleanup.
+    /// Nested inside its caller; not exclusive of Scan project/sweep or final validation.
+    PoseCoreTotal,
+    /// Kernel entry through support/shape/patch/refine setup, inclusive on early errors.
+    /// Normal-path retained locals are retired later inside PoseCoreTotal.
+    PosePrelude,
+    /// One complete coarse XY loop, including assigned selection and unassigned checks.
+    /// Excludes preceding fringe and following slope/ground-relation checks.
+    PoseCoarseColumns,
 }
 
 impl Stage {
     /// Number of fixed timing categories.
-    pub const COUNT: usize = 29;
+    pub const COUNT: usize = 32;
     /// Every timing category, in record-array order.
     pub const ALL: [Self; Self::COUNT] = [
         Self::MotionTotal,
@@ -115,6 +124,9 @@ impl Stage {
         Self::KnownOnlyFallback,
         Self::ProjectedKnownTerrain,
         Self::SweptKnownTerrain,
+        Self::PoseCoreTotal,
+        Self::PosePrelude,
+        Self::PoseCoarseColumns,
     ];
 
     /// Stable label for reporting after the measured interval.
@@ -149,6 +161,9 @@ impl Stage {
             Self::KnownOnlyFallback => "known_only_fallback",
             Self::ProjectedKnownTerrain => "projected_known_terrain",
             Self::SweptKnownTerrain => "swept_known_terrain",
+            Self::PoseCoreTotal => "pose_core_total",
+            Self::PosePrelude => "pose_prelude",
+            Self::PoseCoarseColumns => "pose_coarse_columns",
 
         }
     }
@@ -226,11 +241,17 @@ pub enum Counter {
     AssignedActualZCandidates,
     /// Actual non-exempt assigned-loop get calls returning None.
     AssignedFineGetAbsent,
+    /// Polygon-intersecting coarse XY columns taking the patch Some branch,
+    /// counted before virtual-mask rejection; not a count of completed fine selectors.
+    PoseAssignedColumns,
+    /// Polygon-intersecting coarse XY columns taking the patch None branch,
+    /// counted before virtual-mask rejection; not a count of completed collision checks.
+    PoseUnassignedColumns,
 }
 
 impl Counter {
     /// Number of fixed counter categories.
-    pub const COUNT: usize = 32;
+    pub const COUNT: usize = 34;
     /// Every counter category, in record-array order.
     pub const ALL: [Self; Self::COUNT] = [
         Self::PlaneCacheHits,
@@ -265,6 +286,8 @@ impl Counter {
         Self::AssignedDenseZSpan,
         Self::AssignedActualZCandidates,
         Self::AssignedFineGetAbsent,
+        Self::PoseAssignedColumns,
+        Self::PoseUnassignedColumns,
     ];
 
     /// Stable label for reporting after the measured interval.
@@ -302,13 +325,15 @@ impl Counter {
             Self::AssignedDenseZSpan => "dense_z_span",
             Self::AssignedActualZCandidates => "actual_z_candidates",
             Self::AssignedFineGetAbsent => "fine_get_absent",
+            Self::PoseAssignedColumns => "pose_assigned_columns",
+            Self::PoseUnassignedColumns => "pose_unassigned_columns",
 
         }
     }
 }
 
 /// Fixed-size results for one thread's explicit profiling interval.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct Record {
     /// Inclusive per-stage elapsed nanoseconds, saturated at `u64::MAX`.
     pub wall_nanos: [u64; Stage::COUNT],
@@ -316,6 +341,10 @@ pub struct Record {
     pub calls: [u32; Stage::COUNT],
     /// Actual event counts, saturated at `u64::MAX`.
     pub counters: [u64; Counter::COUNT],
+}
+
+impl Default for Record {
+    fn default() -> Self { Self::EMPTY }
 }
 
 impl Record {

@@ -90,6 +90,19 @@ impl Drop for AssignedZCounts {
     }
 }
 
+// Actual coarse-column branch choices; publish once per uncached pose, including errors.
+// Kept separate from the existing assigned-Z counts and absent from default builds.
+#[cfg(feature = "body-query-profile")]
+#[derive(Default)]
+struct PoseColumnCounts { assigned:u64, unassigned:u64 }
+#[cfg(feature = "body-query-profile")]
+impl Drop for PoseColumnCounts {
+    fn drop(&mut self) {
+        query_profile::add(QueryCounter::PoseAssignedColumns,self.assigned);
+        query_profile::add(QueryCounter::PoseUnassignedColumns,self.unassigned);
+    }
+}
+
 /// 数学核心使用的机体和地形参数；外层从唯一标定契约转换。
 /// 检查完整凸柱碰撞与已知地形约束；未知地面不构成第二次准入条件。
 /// 不模拟离散足端接触或足步执行。
@@ -1211,8 +1224,15 @@ impl SurfaceSnapshot {
 
     fn check_body_pose(&self,body:[f64;3],quaternion:[f64;4],slot:&mut Option<BodyRejection>)->Result<(),SurfaceError> {
         *slot=None;
+        // Declared before all kernel locals so normal/error cleanup stays inside T.
+        #[cfg(feature = "body-query-profile")]
+        let _pose_core_profile=query_profile::guard(QueryStage::PoseCoreTotal);
+        #[cfg(feature = "body-query-profile")]
+        let mut pose_column_counts=PoseColumnCounts::default();
         #[cfg(feature = "body-query-profile")]
         let mut assigned_z_counts=AssignedZCounts::default();
+        #[cfg(feature = "body-query-profile")]
+        let pose_prelude_profile=query_profile::guard(QueryStage::PosePrelude);
         self.validate_complete_source_resolution()?;
         let model = self
             .body_envelope()
@@ -1259,6 +1279,8 @@ impl SurfaceSnapshot {
             .fold(0.0,f64::max)+size*2.0)/size).ceil()*size;
         let patch=centre.map_or_else(||Arc::new(AHashMap::new()),|centre|self.ground_patch(centre,radius));
         let (patch,precise_ground)=self.refine_footprint_support(patch,&polygon_query,&prism_query,body,r,([x0,y0],[x1,y1]));
+        #[cfg(feature = "body-query-profile")]
+        drop(pose_prelude_profile);
         if let Some(recent)=&self.recent_obstacles {
             let fine=recent.size;
             // All row inputs (pose, patch, source and prism)
@@ -1305,12 +1327,17 @@ impl SurfaceSnapshot {
         self.check_fine_column_fringe(body,r,&polygon_query,&prism_query,&patch,min,max,([x0,y0],[x1,y1]),slot)?;
         let uncertainty = f64::from(self.source_voxel_size_m()) + model.support_uncertainty_m;
         let mut ground_points = Vec::new();
+        // One guard for the entire loop, never a clock/TLS update per XY or Z.
+        #[cfg(feature = "body-query-profile")]
+        let pose_columns_profile=query_profile::guard(QueryStage::PoseCoarseColumns);
         for x in x0..=x1 {
             for y in y0..=y1 {
                 if !polygon_query.intersects(x,y,size) {
                     continue;
                 }
                 let Some(&ground)=patch.get(&(x,y)) else {
+                    #[cfg(feature = "body-query-profile")]
+                    { pose_column_counts.unassigned=pose_column_counts.unassigned.saturating_add(1); }
                     // A sparse/unknown footprint column does not veto the pose.
                     // It still receives the exact same actual-volume collision pass.
                     if self.data.virtual_obstacles.as_ref().is_some_and(|mask|
@@ -1318,6 +1345,8 @@ impl SurfaceSnapshot {
                     self.check_unassigned_body_column(body,r,&polygon_query,&prism_query,x,y,slot)?;
                     continue;
                 };
+                #[cfg(feature = "body-query-profile")]
+                { pose_column_counts.assigned=pose_column_counts.assigned.saturating_add(1); }
                 if self
                     .data
                     .virtual_obstacles
@@ -1430,6 +1459,8 @@ impl SurfaceSnapshot {
                 }
             }
         }
+        #[cfg(feature = "body-query-profile")]
+        drop(pose_columns_profile);
         if let Some((a, b, _)) = fit_plane(&ground_points, centre.map_or(body,|c|c.support_xyz)) {
             let yaw = r[0][1].atan2(r[0][0]);
             let cross_slope = (-a * yaw.sin() + b * yaw.cos()).abs().atan().to_degrees();

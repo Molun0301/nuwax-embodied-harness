@@ -51,7 +51,7 @@ mod footprint_container_experiment {
                         eprintln!("CONTAINER_PATH {}", serde_json::json!({
                             "size":size,"kind":kind,"exemption":exemption,"loops":64,"wall_ns":wall_ns,
                             "snapshot_geometry_warmed_by_parity":true,"time_ns":NOW,
-                            "stage_ns":record.wall_nanos,"calls":record.calls,"counters":record.counters,
+                            "stage_ns":record.wall_nanos,"calls":record.calls,"counters":record.counters.as_slice(),
                             "public_conversion_and_result_retirement_included":true}));
                     }
                     #[cfg(not(feature="body-query-profile"))]

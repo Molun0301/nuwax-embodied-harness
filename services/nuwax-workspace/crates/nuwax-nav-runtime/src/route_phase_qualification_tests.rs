@@ -55,7 +55,7 @@ mod route_phase_qualification {
             use nuwax_nav_mls_planner::body_query_profile::{Counter, Record, Stage};
             // Serialize only after compute and capture have ended; no hot-path log.
             let record = |r: Record| serde_json::json!({
-                "wall_nanos": r.wall_nanos, "calls": r.calls, "counters": r.counters,
+                "wall_nanos": r.wall_nanos, "calls": r.calls, "counters": r.counters.as_slice(),
             });
             let phases: Vec<_> = audit.scan_phases.iter().map(|p| serde_json::json!({
                 "branch": p.branch,
@@ -72,7 +72,7 @@ mod route_phase_qualification {
                 "kind": kind, "owner": "synchronous_plan_kernel_thread",
                 "duration": "instrumented_wall_not_cpu",
                 "stage_labels": Stage::ALL.map(Stage::label),
-                "counter_labels": Counter::ALL.map(Counter::label),
+                "counter_labels": Counter::ALL.map(Counter::label).as_slice(),
                 "total": audit.body_total.map(record), "phases": phases,
             }));
         }

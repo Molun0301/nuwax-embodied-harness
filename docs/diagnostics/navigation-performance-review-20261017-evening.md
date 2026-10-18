@@ -609,6 +609,14 @@ C3原槽为448姿态full，同批prefix及固定hit [283,47,51] 实际碰撞edge
 
 五选择器中包含completion五个独立案例及retirement两个案例，不能写成七个独立测试。无bridge、机器人、TTL或性能收益结论。原始事实记录见[阶段43记录](navigation-completed-slot-facts-20261018.json)。后续仅评审单C、无P、full-only候选的最小免提前取消；保留原retry-now/dirty/失败清理与后续真实接纳判断，尚未实施。
 
+## 第四十四阶段：单个已完成候选保留未通过独立性能门
+
+针对阶段43事实，仓外最小两生产文件候选限定single full、无active/P；bounded原ticket advisory只免提前取消，原retry-now/dirty/失败清理及真正consume全部保留。新71项定向语义首跑全部通过，资格check12s/no-run211s/default7 9s。真C1/C2同一候选由唯一原step接纳、calls1；C3真实受损仍取消；进度/connector拒收时在原250ms截止尚余约247ms立即提交新源。未覆盖单C仅旧local相关的新组合或专用fault分支，不能宣称全部状态覆盖。
+
+随后独立固定N四进程A1/B1/B2/A2、每进程两个case，共八格均自然覆盖且完整性通过。OnlyActive六项冻结门均双B不利，InitialSlot首L/max due/max map三门亦触发。OnlyActive首合法L固定差+249.807063/+100.089542ms，D更新调用外窗+56.531/+33.256µs；B1一次控制due delay74.701593ms且跳过一格。全部样本保留，不补样、不改门。原entry→kernel return wall也有明显差异，没有证据把百毫秒差归因几十微秒额外锁，更不能据此宣称实机下降。
+
+候选按预声明门拒绝，71语义不抵消不利N，T/R不运行。先按计划恢复语义B并default7通过（4s），再完整恢复17c1生产与事实测试，2新候选测试归档撤出；原11核心方法逐字一致。只持久化本报告与整数记录，不保留额外生产代码或永久测试接线。首次A check共同helper别名缺口E0425及构建会话未知终态都保留；两臂共同修正后仅既定四样本。完整复算见[拒绝报告](navigation-single-full-rejection-20261018.md)及[整数记录](navigation-single-full-rejection-20261018.json)。
+
 ## 后续持续检查
 
 1. 墙前晚到路径的实际恢复与初始 full/partial/PCT 顺序，保留及时移动和真实避障

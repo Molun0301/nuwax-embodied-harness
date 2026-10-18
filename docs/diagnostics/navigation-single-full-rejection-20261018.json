@@ -1,0 +1,719 @@
+{
+  "reviewer": "/root/audit_completed_candidate_retirement",
+  "status": "PARENT_REJECTED_CANDIDATE_AFTER_PREDECLARED_N_GATE",
+  "source_logs_read": [
+    "SFN-A1",
+    "SFN-B1",
+    "SFN-B2",
+    "SFN-A2"
+  ],
+  "process_exit0": 4,
+  "cases_naturally_covered": 8,
+  "raw_metrics_recomputed_without_importing_validator_analyzer": true,
+  "receipt_identity_fields_verified_in_raw": [
+    "id",
+    "epoch",
+    "source pointer",
+    "source_ns",
+    "pose_stamp_ns",
+    "detour",
+    "generation"
+  ],
+  "unprinted_pose_coordinates_frames_verified_by_runtime_not_reconstructed_from_logs": true,
+  "computed_gates_exactly_equal_validator_json": true,
+  "adverse_gate_count": 9,
+  "cases": [
+    {
+      "sample": "SFN-A1",
+      "case": "OnlyActive",
+      "clock_min_positive_ns": 25,
+      "natural_coverage_independently_recomputed": true,
+      "metrics_ns": {
+        "installed_to_entry_ns": 3092389,
+        "installed_to_nonzero_ns": 350618503,
+        "max_control_ns": 597917,
+        "max_due_delay_ns": 248659,
+        "damage_map_update_ns": 11066,
+        "max_map_update_ns": 11066
+      },
+      "damage": {
+        "began_ns": 50102107,
+        "finished_ns": 50113173,
+        "epoch_before": 1,
+        "epoch_after": 2,
+        "tickets_before": 1,
+        "tickets_after": 0,
+        "submitted_before": 1,
+        "submitted_after": null
+      },
+      "first_dequeue": {
+        "id": 1,
+        "epoch": 1,
+        "before_ns": 14589,
+        "after_ns": 14755
+      },
+      "kernel": [
+        {
+          "request_id": 1,
+          "ordinal": 1,
+          "entry_ns": 17642,
+          "return_ns": 53198310,
+          "elapsed_wall_ns": 53180668,
+          "outcome": "Failure",
+          "cancelled": true,
+          "during_cleanup": false
+        },
+        {
+          "request_id": 2,
+          "ordinal": 2,
+          "entry_ns": 53205562,
+          "return_ns": 386639667,
+          "elapsed_wall_ns": 333434105,
+          "outcome": "Full",
+          "cancelled": false,
+          "during_cleanup": false
+        }
+      ],
+      "control_sample_count": 8,
+      "control_elapsed_over_50ms_count": 0,
+      "control_due_over_50ms_count": 0,
+      "skipped_pose": 0,
+      "skipped_control": 0,
+      "all_nonzero_bound_absent": true,
+      "first_nonzero_linear_zero_angular_point_one": true,
+      "issues_empty": true,
+      "cleanup_returned": true,
+      "replace_lock_attempts": 0,
+      "request_builder_calls": 2,
+      "raw_log": "/workspace/scratch/71cdb9d17732/neh-review-20261017/stage-single-full-completion-nohold-N/SFN-A1.log",
+      "recovery_wall_partition_ns": {
+        "D_finished_to_entry": 3092389,
+        "entry_to_kernel_return": 333434105,
+        "kernel_return_to_first_L": 14092009
+      }
+    },
+    {
+      "sample": "SFN-A1",
+      "case": "InitialSlotObservation",
+      "clock_min_positive_ns": 25,
+      "natural_coverage_independently_recomputed": true,
+      "metrics_ns": {
+        "installed_to_entry_ns": 50435173,
+        "installed_to_nonzero_ns": 400937608,
+        "max_control_ns": 831927,
+        "max_due_delay_ns": 130964,
+        "damage_map_update_ns": 5225,
+        "max_map_update_ns": 5225
+      },
+      "damage": {
+        "began_ns": 1940,
+        "finished_ns": 7165,
+        "epoch_before": 1,
+        "epoch_after": 2,
+        "tickets_before": 1,
+        "tickets_after": 0,
+        "submitted_before": 1,
+        "submitted_after": null
+      },
+      "first_dequeue": {
+        "id": 2,
+        "epoch": 2,
+        "before_ns": 50438610,
+        "after_ns": 50439077
+      },
+      "kernel": [
+        {
+          "request_id": 2,
+          "ordinal": 1,
+          "entry_ns": 50442338,
+          "return_ns": 356074834,
+          "elapsed_wall_ns": 305632496,
+          "outcome": "Full",
+          "cancelled": false,
+          "during_cleanup": false
+        }
+      ],
+      "control_sample_count": 8,
+      "control_elapsed_over_50ms_count": 0,
+      "control_due_over_50ms_count": 0,
+      "skipped_pose": 0,
+      "skipped_control": 0,
+      "all_nonzero_bound_absent": true,
+      "first_nonzero_linear_zero_angular_point_one": true,
+      "issues_empty": true,
+      "cleanup_returned": true,
+      "replace_lock_attempts": 0,
+      "request_builder_calls": 2,
+      "raw_log": "/workspace/scratch/71cdb9d17732/neh-review-20261017/stage-single-full-completion-nohold-N/SFN-A1.log",
+      "recovery_wall_partition_ns": {
+        "D_finished_to_entry": 50435173,
+        "entry_to_kernel_return": 305632496,
+        "kernel_return_to_first_L": 44869939
+      }
+    },
+    {
+      "sample": "SFN-B1",
+      "case": "OnlyActive",
+      "clock_min_positive_ns": 25,
+      "natural_coverage_independently_recomputed": true,
+      "metrics_ns": {
+        "installed_to_entry_ns": 6732810,
+        "installed_to_nonzero_ns": 600425566,
+        "max_control_ns": 1580950,
+        "max_due_delay_ns": 74701593,
+        "damage_map_update_ns": 67597,
+        "max_map_update_ns": 67597
+      },
+      "damage": {
+        "began_ns": 50188220,
+        "finished_ns": 50255817,
+        "epoch_before": 1,
+        "epoch_after": 2,
+        "tickets_before": 1,
+        "tickets_after": 0,
+        "submitted_before": 1,
+        "submitted_after": null
+      },
+      "first_dequeue": {
+        "id": 1,
+        "epoch": 1,
+        "before_ns": 34798,
+        "after_ns": 34992
+      },
+      "kernel": [
+        {
+          "request_id": 1,
+          "ordinal": 1,
+          "entry_ns": 38161,
+          "return_ns": 56978064,
+          "elapsed_wall_ns": 56939903,
+          "outcome": "Failure",
+          "cancelled": true,
+          "during_cleanup": false
+        },
+        {
+          "request_id": 2,
+          "ordinal": 2,
+          "entry_ns": 56988627,
+          "return_ns": 607077983,
+          "elapsed_wall_ns": 550089356,
+          "outcome": "Full",
+          "cancelled": false,
+          "during_cleanup": false
+        }
+      ],
+      "control_sample_count": 12,
+      "control_elapsed_over_50ms_count": 0,
+      "control_due_over_50ms_count": 1,
+      "skipped_pose": 2,
+      "skipped_control": 1,
+      "all_nonzero_bound_absent": true,
+      "first_nonzero_linear_zero_angular_point_one": true,
+      "issues_empty": true,
+      "cleanup_returned": true,
+      "replace_lock_attempts": 0,
+      "request_builder_calls": 2,
+      "raw_log": "/workspace/scratch/71cdb9d17732/neh-review-20261017/stage-single-full-completion-nohold-N/SFN-B1.log",
+      "recovery_wall_partition_ns": {
+        "D_finished_to_entry": 6732810,
+        "entry_to_kernel_return": 550089356,
+        "kernel_return_to_first_L": 43603400
+      }
+    },
+    {
+      "sample": "SFN-B1",
+      "case": "InitialSlotObservation",
+      "clock_min_positive_ns": 25,
+      "natural_coverage_independently_recomputed": true,
+      "metrics_ns": {
+        "installed_to_entry_ns": 50714092,
+        "installed_to_nonzero_ns": 500695403,
+        "max_control_ns": 598320,
+        "max_due_delay_ns": 1129627,
+        "damage_map_update_ns": 4170,
+        "max_map_update_ns": 52751
+      },
+      "damage": {
+        "began_ns": 1115,
+        "finished_ns": 5285,
+        "epoch_before": 1,
+        "epoch_after": 2,
+        "tickets_before": 1,
+        "tickets_after": 0,
+        "submitted_before": 1,
+        "submitted_after": null
+      },
+      "first_dequeue": {
+        "id": 2,
+        "epoch": 2,
+        "before_ns": 50715798,
+        "after_ns": 50716274
+      },
+      "kernel": [
+        {
+          "request_id": 2,
+          "ordinal": 1,
+          "entry_ns": 50719377,
+          "return_ns": 478352011,
+          "elapsed_wall_ns": 427632634,
+          "outcome": "Full",
+          "cancelled": false,
+          "during_cleanup": false
+        }
+      ],
+      "control_sample_count": 10,
+      "control_elapsed_over_50ms_count": 0,
+      "control_due_over_50ms_count": 0,
+      "skipped_pose": 0,
+      "skipped_control": 0,
+      "all_nonzero_bound_absent": true,
+      "first_nonzero_linear_zero_angular_point_one": true,
+      "issues_empty": true,
+      "cleanup_returned": true,
+      "replace_lock_attempts": 0,
+      "request_builder_calls": 2,
+      "raw_log": "/workspace/scratch/71cdb9d17732/neh-review-20261017/stage-single-full-completion-nohold-N/SFN-B1.log",
+      "recovery_wall_partition_ns": {
+        "D_finished_to_entry": 50714092,
+        "entry_to_kernel_return": 427632634,
+        "kernel_return_to_first_L": 22348677
+      }
+    },
+    {
+      "sample": "SFN-B2",
+      "case": "OnlyActive",
+      "clock_min_positive_ns": 23,
+      "natural_coverage_independently_recomputed": true,
+      "metrics_ns": {
+        "installed_to_entry_ns": 3139995,
+        "installed_to_nonzero_ns": 450553185,
+        "max_control_ns": 557113,
+        "max_due_delay_ns": 30761386,
+        "damage_map_update_ns": 44705,
+        "max_map_update_ns": 44986
+      },
+      "damage": {
+        "began_ns": 50088752,
+        "finished_ns": 50133457,
+        "epoch_before": 1,
+        "epoch_after": 2,
+        "tickets_before": 1,
+        "tickets_after": 0,
+        "submitted_before": 1,
+        "submitted_after": null
+      },
+      "first_dequeue": {
+        "id": 1,
+        "epoch": 1,
+        "before_ns": 194928,
+        "after_ns": 195103
+      },
+      "kernel": [
+        {
+          "request_id": 1,
+          "ordinal": 1,
+          "entry_ns": 197760,
+          "return_ns": 53266226,
+          "elapsed_wall_ns": 53068466,
+          "outcome": "Failure",
+          "cancelled": true,
+          "during_cleanup": false
+        },
+        {
+          "request_id": 2,
+          "ordinal": 2,
+          "entry_ns": 53273452,
+          "return_ns": 473600496,
+          "elapsed_wall_ns": 420327044,
+          "outcome": "Full",
+          "cancelled": false,
+          "during_cleanup": false
+        }
+      ],
+      "control_sample_count": 10,
+      "control_elapsed_over_50ms_count": 0,
+      "control_due_over_50ms_count": 0,
+      "skipped_pose": 1,
+      "skipped_control": 0,
+      "all_nonzero_bound_absent": true,
+      "first_nonzero_linear_zero_angular_point_one": true,
+      "issues_empty": true,
+      "cleanup_returned": true,
+      "replace_lock_attempts": 0,
+      "request_builder_calls": 2,
+      "raw_log": "/workspace/scratch/71cdb9d17732/neh-review-20261017/stage-single-full-completion-nohold-N/SFN-B2.log",
+      "recovery_wall_partition_ns": {
+        "D_finished_to_entry": 3139995,
+        "entry_to_kernel_return": 420327044,
+        "kernel_return_to_first_L": 27086146
+      }
+    },
+    {
+      "sample": "SFN-B2",
+      "case": "InitialSlotObservation",
+      "clock_min_positive_ns": 23,
+      "natural_coverage_independently_recomputed": true,
+      "metrics_ns": {
+        "installed_to_entry_ns": 50459533,
+        "installed_to_nonzero_ns": 401780478,
+        "max_control_ns": 533109,
+        "max_due_delay_ns": 1255463,
+        "damage_map_update_ns": 5845,
+        "max_map_update_ns": 5845
+      },
+      "damage": {
+        "began_ns": 2249,
+        "finished_ns": 8094,
+        "epoch_before": 1,
+        "epoch_after": 2,
+        "tickets_before": 1,
+        "tickets_after": 0,
+        "submitted_before": 1,
+        "submitted_after": null
+      },
+      "first_dequeue": {
+        "id": 2,
+        "epoch": 2,
+        "before_ns": 50466301,
+        "after_ns": 50466899
+      },
+      "kernel": [
+        {
+          "request_id": 2,
+          "ordinal": 1,
+          "entry_ns": 50467627,
+          "return_ns": 352704081,
+          "elapsed_wall_ns": 302236454,
+          "outcome": "Full",
+          "cancelled": false,
+          "during_cleanup": false
+        }
+      ],
+      "control_sample_count": 8,
+      "control_elapsed_over_50ms_count": 0,
+      "control_due_over_50ms_count": 0,
+      "skipped_pose": 0,
+      "skipped_control": 0,
+      "all_nonzero_bound_absent": true,
+      "first_nonzero_linear_zero_angular_point_one": true,
+      "issues_empty": true,
+      "cleanup_returned": true,
+      "replace_lock_attempts": 0,
+      "request_builder_calls": 2,
+      "raw_log": "/workspace/scratch/71cdb9d17732/neh-review-20261017/stage-single-full-completion-nohold-N/SFN-B2.log",
+      "recovery_wall_partition_ns": {
+        "D_finished_to_entry": 50459533,
+        "entry_to_kernel_return": 302236454,
+        "kernel_return_to_first_L": 49084491
+      }
+    },
+    {
+      "sample": "SFN-A2",
+      "case": "OnlyActive",
+      "clock_min_positive_ns": 26,
+      "natural_coverage_independently_recomputed": true,
+      "metrics_ns": {
+        "installed_to_entry_ns": 3126157,
+        "installed_to_nonzero_ns": 350463643,
+        "max_control_ns": 550408,
+        "max_due_delay_ns": 131471,
+        "damage_map_update_ns": 11449,
+        "max_map_update_ns": 11449
+      },
+      "damage": {
+        "began_ns": 50117662,
+        "finished_ns": 50129111,
+        "epoch_before": 1,
+        "epoch_after": 2,
+        "tickets_before": 1,
+        "tickets_after": 0,
+        "submitted_before": 1,
+        "submitted_after": null
+      },
+      "first_dequeue": {
+        "id": 1,
+        "epoch": 1,
+        "before_ns": 452584,
+        "after_ns": 452823
+      },
+      "kernel": [
+        {
+          "request_id": 1,
+          "ordinal": 1,
+          "entry_ns": 455895,
+          "return_ns": 53247977,
+          "elapsed_wall_ns": 52792082,
+          "outcome": "Failure",
+          "cancelled": true,
+          "during_cleanup": false
+        },
+        {
+          "request_id": 2,
+          "ordinal": 2,
+          "entry_ns": 53255268,
+          "return_ns": 389360509,
+          "elapsed_wall_ns": 336105241,
+          "outcome": "Full",
+          "cancelled": false,
+          "during_cleanup": false
+        }
+      ],
+      "control_sample_count": 8,
+      "control_elapsed_over_50ms_count": 0,
+      "control_due_over_50ms_count": 0,
+      "skipped_pose": 0,
+      "skipped_control": 0,
+      "all_nonzero_bound_absent": true,
+      "first_nonzero_linear_zero_angular_point_one": true,
+      "issues_empty": true,
+      "cleanup_returned": true,
+      "replace_lock_attempts": 0,
+      "request_builder_calls": 2,
+      "raw_log": "/workspace/scratch/71cdb9d17732/neh-review-20261017/stage-single-full-completion-nohold-N/SFN-A2.log",
+      "recovery_wall_partition_ns": {
+        "D_finished_to_entry": 3126157,
+        "entry_to_kernel_return": 336105241,
+        "kernel_return_to_first_L": 11232245
+      }
+    },
+    {
+      "sample": "SFN-A2",
+      "case": "InitialSlotObservation",
+      "clock_min_positive_ns": 26,
+      "natural_coverage_independently_recomputed": true,
+      "metrics_ns": {
+        "installed_to_entry_ns": 50462866,
+        "installed_to_nonzero_ns": 400660033,
+        "max_control_ns": 560366,
+        "max_due_delay_ns": 119466,
+        "damage_map_update_ns": 4478,
+        "max_map_update_ns": 4478
+      },
+      "damage": {
+        "began_ns": 2334,
+        "finished_ns": 6812,
+        "epoch_before": 1,
+        "epoch_after": 2,
+        "tickets_before": 1,
+        "tickets_after": 0,
+        "submitted_before": 1,
+        "submitted_after": null
+      },
+      "first_dequeue": {
+        "id": 2,
+        "epoch": 2,
+        "before_ns": 50465255,
+        "after_ns": 50465660
+      },
+      "kernel": [
+        {
+          "request_id": 2,
+          "ordinal": 1,
+          "entry_ns": 50469678,
+          "return_ns": 386617344,
+          "elapsed_wall_ns": 336147666,
+          "outcome": "Full",
+          "cancelled": false,
+          "during_cleanup": false
+        }
+      ],
+      "control_sample_count": 8,
+      "control_elapsed_over_50ms_count": 0,
+      "control_due_over_50ms_count": 0,
+      "skipped_pose": 0,
+      "skipped_control": 0,
+      "all_nonzero_bound_absent": true,
+      "first_nonzero_linear_zero_angular_point_one": true,
+      "issues_empty": true,
+      "cleanup_returned": true,
+      "replace_lock_attempts": 0,
+      "request_builder_calls": 2,
+      "raw_log": "/workspace/scratch/71cdb9d17732/neh-review-20261017/stage-single-full-completion-nohold-N/SFN-A2.log",
+      "recovery_wall_partition_ns": {
+        "D_finished_to_entry": 50462866,
+        "entry_to_kernel_return": 336147666,
+        "kernel_return_to_first_L": 14049501
+      }
+    }
+  ],
+  "gates": [
+    {
+      "case": "OnlyActive",
+      "metric": "installed_to_entry_ns",
+      "all_four_qualified": true,
+      "differences_B1_minus_A1_B2_minus_A2_ns": [
+        3640421,
+        13838
+      ],
+      "paired_clock_references_ns": [
+        25,
+        26
+      ],
+      "status": "ADVERSE_STOP"
+    },
+    {
+      "case": "OnlyActive",
+      "metric": "installed_to_nonzero_ns",
+      "all_four_qualified": true,
+      "differences_B1_minus_A1_B2_minus_A2_ns": [
+        249807063,
+        100089542
+      ],
+      "paired_clock_references_ns": [
+        25,
+        26
+      ],
+      "status": "ADVERSE_STOP"
+    },
+    {
+      "case": "OnlyActive",
+      "metric": "max_control_ns",
+      "all_four_qualified": true,
+      "differences_B1_minus_A1_B2_minus_A2_ns": [
+        983033,
+        6705
+      ],
+      "paired_clock_references_ns": [
+        25,
+        26
+      ],
+      "status": "ADVERSE_STOP"
+    },
+    {
+      "case": "OnlyActive",
+      "metric": "max_due_delay_ns",
+      "all_four_qualified": true,
+      "differences_B1_minus_A1_B2_minus_A2_ns": [
+        74452934,
+        30629915
+      ],
+      "paired_clock_references_ns": [
+        25,
+        26
+      ],
+      "status": "ADVERSE_STOP"
+    },
+    {
+      "case": "OnlyActive",
+      "metric": "damage_map_update_ns",
+      "all_four_qualified": true,
+      "differences_B1_minus_A1_B2_minus_A2_ns": [
+        56531,
+        33256
+      ],
+      "paired_clock_references_ns": [
+        25,
+        26
+      ],
+      "status": "ADVERSE_STOP"
+    },
+    {
+      "case": "OnlyActive",
+      "metric": "max_map_update_ns",
+      "all_four_qualified": true,
+      "differences_B1_minus_A1_B2_minus_A2_ns": [
+        56531,
+        33537
+      ],
+      "paired_clock_references_ns": [
+        25,
+        26
+      ],
+      "status": "ADVERSE_STOP"
+    },
+    {
+      "case": "InitialSlotObservation",
+      "metric": "installed_to_entry_ns",
+      "all_four_qualified": true,
+      "differences_B1_minus_A1_B2_minus_A2_ns": [
+        278919,
+        -3333
+      ],
+      "paired_clock_references_ns": [
+        25,
+        26
+      ],
+      "status": "STOP_RULE_NOT_TRIGGERED"
+    },
+    {
+      "case": "InitialSlotObservation",
+      "metric": "installed_to_nonzero_ns",
+      "all_four_qualified": true,
+      "differences_B1_minus_A1_B2_minus_A2_ns": [
+        99757795,
+        1120445
+      ],
+      "paired_clock_references_ns": [
+        25,
+        26
+      ],
+      "status": "ADVERSE_STOP"
+    },
+    {
+      "case": "InitialSlotObservation",
+      "metric": "max_control_ns",
+      "all_four_qualified": true,
+      "differences_B1_minus_A1_B2_minus_A2_ns": [
+        -233607,
+        -27257
+      ],
+      "paired_clock_references_ns": [
+        25,
+        26
+      ],
+      "status": "STOP_RULE_NOT_TRIGGERED"
+    },
+    {
+      "case": "InitialSlotObservation",
+      "metric": "max_due_delay_ns",
+      "all_four_qualified": true,
+      "differences_B1_minus_A1_B2_minus_A2_ns": [
+        998663,
+        1135997
+      ],
+      "paired_clock_references_ns": [
+        25,
+        26
+      ],
+      "status": "ADVERSE_STOP"
+    },
+    {
+      "case": "InitialSlotObservation",
+      "metric": "damage_map_update_ns",
+      "all_four_qualified": true,
+      "differences_B1_minus_A1_B2_minus_A2_ns": [
+        -1055,
+        1367
+      ],
+      "paired_clock_references_ns": [
+        25,
+        26
+      ],
+      "status": "STOP_RULE_NOT_TRIGGERED"
+    },
+    {
+      "case": "InitialSlotObservation",
+      "metric": "max_map_update_ns",
+      "all_four_qualified": true,
+      "differences_B1_minus_A1_B2_minus_A2_ns": [
+        47526,
+        1367
+      ],
+      "paired_clock_references_ns": [
+        25,
+        26
+      ],
+      "status": "ADVERSE_STOP"
+    }
+  ],
+  "limitations": [
+    "Clock references are diagnostics, not noise or confidence bounds",
+    "Map/control/compute wall brackets do not measure CPU or lock-held duration",
+    "No causal isolation of extra inspector mutex from environment, scheduling, cache or build-layout effects",
+    "All first L are rotation only and have no dispatch bound; no translational braking-bound coverage",
+    "No hardware/bridge/real scheduler TTL or physical closed loop",
+    "No additional samples or revised threshold; T/R not run",
+    "Default/17c1 restoration status belongs to validator final evidence, not inferred here"
+  ],
+  "decision": "Reject this production candidate under frozen N rule; do not offset adverse endpoints by semantic success or unrun T/R"
+}

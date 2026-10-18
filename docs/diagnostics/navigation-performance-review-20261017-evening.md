@@ -427,6 +427,14 @@ GREEN同一原release/LTO二进制51个exact全部通过：原RED与5新控制�
 
 按事先要求负例无一致重要退化的验收原则，本批暂不接受；保留局部收益及所有未解释负面，不追加样本、不宣称稳定退化。候选、测试hooks及ignored诊断全部撤回，后续优先核查真实接纳链重复工作与owner逻辑，再决定是否重新评估目录算法。
 
+## 第三十二阶段：根枚举去重候选未接受
+
+源码核实Receiver已复用verified intrinsic，实际纯metadata无逐对象payload读取；原GC不能跳过，旧pin释放、失败candidate部分安装和collection_error重试均有原合同。最窄候选只在失败时追加candidate，删除重复current追加，利用成功root必登记Weak及current强引用不变量，避免成功同Arc块表三次枚举；GC时机、read_dir、删除、错误和所有IO不变。独立完整旧receive/collector双Repository对照A8通过，B map-chunks102/1原ignored、stack15通过，去重117PASS，默认七包通过。
+
+固定7配置四进程ABBA，224正式+112预热，84份实际root/included字节及全部语义/IO/Arc/GC效果一致。完整receive metadata1024中位数A5.145–5.277ms/B4.949–5.304ms交叠；真实小更新1024 A5.248–5.639ms/B5.895–6.732ms；零cache更新64 A0.373–0.727ms/B0.821–1.238ms，后两项两B较高。全部7配置保留，无一致收益；不能由结构少2B推导实测提速，也不据有限样本断言稳定退化。
+
+本批不接受，全部生产和新8测试撤回并归档，不追加挑选样本。后续优先审查真实重复观测是否造成计算过期与持续重规划，先明确query依赖和原数据合同，再考虑修改。
+
 ## 后续持续检查
 
 1. 墙前晚到路径的实际恢复与初始 full/partial/PCT 顺序，保留及时移动和真实避障

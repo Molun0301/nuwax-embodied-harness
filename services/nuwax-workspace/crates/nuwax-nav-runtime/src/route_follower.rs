@@ -566,7 +566,7 @@ impl NavPlanner for RouteFollower {
             pose.pose.position.distance(start)>=self.scan.refresh_distance_m.min(window*0.6));
         let at_end=self.cumulative.last().is_some_and(|&end|self.local_end>=end-1e-6);
         let near_end=!at_end && self.local_end-self.progress<self.scan.refresh_distance_m.min(window*0.35);
-        if self.dirty || moved && !at_end || near_end {self.schedule(false);}
+        if self.dirty || moved && !at_end || near_end {self.schedule(self.local_path.is_some() && self.admitted_generation.is_none());}
         if let Some(reason)=&self.permanent_fault {return PlannerStep::Failed(reason.clone());}
         if let Some(reason)=&self.preparation_fault {
             self.local_failures=vec![reason.clone().into()];
@@ -612,6 +612,340 @@ mod tests {
     include!("route_selective_refresh_tests.rs");
     include!("route_progress_prefix_tests.rs");
     include!("route_partial_priority_tests.rs");
+
+#[derive(Clone, Copy)]
+enum RecoveryFixtureResult { Incomplete, Full, Partial }
+struct RecoveryLifecycleProbe {
+    entered: mpsc::Receiver<(bool, u64)>,
+    completed: mpsc::Receiver<(bool, bool)>,
+    release: Option<mpsc::Sender<()>>,
+}
+impl Drop for RecoveryLifecycleProbe {
+    fn drop(&mut self) {
+        if let Some(tx) = self.release.take() {
+            // At most active + latest pending. Also release on assertion unwind.
+            let _ = tx.send(()); let _ = tx.send(());
+        }
+    }
+}
+fn install_recovery_lifecycle_probe(
+    follower: &mut RouteFollower, first_result: RecoveryFixtureResult,
+) -> RecoveryLifecycleProbe {
+    let (entered, receive) = mpsc::channel();
+    let (completed, completions) = mpsc::channel();
+    let (release, wait) = mpsc::channel();
+    follower.cancel_planning();
+    let offset = follower.config.body_to_support_z_m;
+    let mut index = 0;
+    follower.owner = Some(PlanningOwner::new(move |mut request: PlanRequest, cancel| {
+        let detour = request.detour;
+        let _ = entered.send((detour, cancel.expected));
+        let _ = wait.recv_timeout(Duration::from_secs(5));
+        let cancelled = cancel.cancelled();
+        let _ = completed.send((detour, cancelled));
+        let mode = if index == 0 { first_result } else { RecoveryFixtureResult::Incomplete };
+        index += 1;
+        let outcome = if cancelled || matches!(mode, RecoveryFixtureResult::Incomplete) {
+            Err(typed_failures())
+        } else {
+            request.materialize_reference().unwrap();
+            let partial = matches!(mode, RecoveryFixtureResult::Partial);
+            let path = if partial {
+                Path3D { poses: vec![comparison_pose(0.5, 0), comparison_pose(1.2, 0)] }
+            } else {
+                Path3D { poses: request.reference.iter().map(|p| {
+                    let mut pose = request.pose.clone();
+                    pose.pose.position = Point3::new(p[0], p[1], p[2] + offset);
+                    pose
+                }).collect() }
+            };
+            // A synthetic status fixture may not smuggle invalid geometry into
+            // the current connector. All edges use the captured source too.
+            for edge in path.poses.windows(2) {
+                request.source.validate_body_motion(body(&edge[0]), body(&edge[1]),
+                    &request.boundary).unwrap();
+            }
+            Ok(Candidate { partial, path, elapsed_ms: 0.0 })
+        };
+        PlanResult { request, outcome }
+    }).unwrap());
+    RecoveryLifecycleProbe { entered: receive, completed: completions, release: Some(release) }
+}
+fn recovery_publish_real_wall(follower: &mut RouteFollower) {
+    let basis = follower.map.clone().unwrap();
+    let wall = Arc::new(basis.with_recent_obstacle_points(2, 2_000_000_000, 0, &[],
+        (0..5).map(|i| (i, [0.73, 0.8 + f64::from(i) * 0.1, 0.5]))).unwrap());
+    wall.validate_body_pose([0.5, 1.0, 0.5], [0.0, 0.0, 0.0, 1.0]).unwrap();
+    assert!(nuwax_nav_pct::same_source_geometry(&basis, &wall));
+    follower.update_execution_map(ExecutionMap::SurfaceUpdate(SurfaceMapUpdate {
+        planar_reference: None, snapshot: wall, change_basis: Some(basis),
+        changes: Arc::new(SurfaceGeometryChanges::Empty),
+    })).unwrap();
+    follower.observe_applied_command(Twist2 {
+        linear: nuwax_nav_types_messages::Point2::new(0.5, 0.0), angular_z: 0.0,
+    });
+    let deadline = follower.retry_after;
+    let rejected = follower.step(0.3);
+    assert!(Instant::now() < deadline, "fixture missed original 250ms cooldown");
+    assert!(matches!(rejected, PlannerStep::Pending(_)), "{rejected:?}");
+    assert!(follower.execution_wait_reason().is_some_and(|s| s.contains("当前轨迹受阻")));
+    assert!(follower.local_path.is_some() && follower.admitted_generation.is_none());
+    assert_eq!(follower.retry_after, deadline);
+    follower.observe_applied_command(Twist2::ZERO);
+}
+fn recovery_clear_wall(follower: &mut RouteFollower) {
+    let basis = follower.map.clone().unwrap();
+    let cleared = Arc::new(basis.clear_recent_obstacles());
+    follower.update_execution_map(ExecutionMap::SurfaceUpdate(SurfaceMapUpdate {
+        planar_reference: None, snapshot: cleared, change_basis: Some(basis),
+        changes: Arc::new(SurfaceGeometryChanges::Empty),
+    })).unwrap();
+}
+fn recovery_cleanup(mut follower: RouteFollower, probe: &mut RecoveryLifecycleProbe) {
+    follower.stop();
+    if let Some(tx) = probe.release.take() { let _ = tx.send(()); let _ = tx.send(()); }
+    drop(follower); // joins the original owner; observations are asserted afterward
+    eprintln!("RECOVERY_CLEANUP original_owner_joined=true");
+}
+
+#[test]
+fn rejected_active_nominal_gets_latest_detour_after_original_cooldown() {
+    let mut follower = open_follower();
+    assert!(matches!(ready_step(&mut follower, 0.3), PlannerStep::Command(c) if c.linear.x > 0.0));
+    let mut probe = install_recovery_lifecycle_probe(&mut follower, RecoveryFixtureResult::Incomplete);
+    let epoch = follower.owner.as_ref().unwrap().epoch();
+    let generation = follower.route_generation;
+    let goal = follower.goal.clone(); let route = follower.route.clone();
+    follower.dirty = true; // explicit background-refresh stimulus, no field resets after rejection
+    follower.schedule(false); // actual admission starts the unchanged 250ms deadline
+    let first = probe.entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(first, (false, epoch));
+    let active_id = follower.submitted.unwrap().0;
+    let original_deadline = follower.retry_after;
+    recovery_publish_real_wall(&mut follower);
+    assert_eq!(follower.submitted.unwrap().0, active_id);
+
+    std::thread::sleep(original_deadline.saturating_duration_since(Instant::now()));
+    let after_cooldown = follower.step(0.3);
+    let pending = follower.submitted;
+    let after_submit_calls = follower.local_planning_calls();
+    let proof_ids: Vec<_> = follower.source_tickets.iter().flatten().map(|(id, _)| *id).collect();
+    let no_second_active = matches!(probe.entered.try_recv(), Err(mpsc::TryRecvError::Empty));
+    let same_epoch = follower.owner.as_ref().unwrap().epoch() == epoch;
+
+    // Pass the new request's unchanged cooldown too, so duplicate suppression
+    // is tested by the existing submitted-detour predicate, not just the timer.
+    std::thread::sleep(follower.retry_after.saturating_duration_since(Instant::now()));
+    for _ in 0..3 { assert!(matches!(follower.step(0.3), PlannerStep::Pending(_))); }
+    let no_duplicates = follower.local_planning_calls() == after_submit_calls
+        && follower.submitted == pending && follower.owner.as_ref().unwrap().epoch() == epoch;
+
+    // Releasing the first active job must publish its non-cancelled result.
+    probe.release.as_ref().unwrap().send(()).unwrap();
+    let first_completion = probe.completed.recv_timeout(Duration::from_secs(5));
+    wait_for(|| follower.owner.as_ref().unwrap().completion_ready_for_test());
+    follower.consume_plan();
+    let second = probe.entered.recv_timeout(Duration::from_secs(5));
+    let retained = follower.goal == goal && follower.route == route
+        && follower.route_generation == generation && follower.admitted_generation.is_none();
+    recovery_cleanup(follower, &mut probe);
+
+    assert!(matches!(after_cooldown, PlannerStep::Pending(_)));
+    assert_eq!(pending.map(|(id, _, d)| (id, d)), Some((active_id + 1, true)));
+    assert_eq!(proof_ids, vec![active_id, active_id + 1]);
+    assert!(no_second_active && same_epoch && no_duplicates && retained);
+    assert_eq!(first_completion.unwrap(), (false, false), "active nominal was cancelled");
+    assert_eq!(second.unwrap(), (true, epoch), "latest pending did not become the next detour");
+}
+
+#[test]
+fn readmitted_full_and_partial_restore_ordinary_refresh_mode() {
+    for mode in [RecoveryFixtureResult::Full, RecoveryFixtureResult::Partial] {
+        let mut follower = open_follower();
+        assert!(matches!(ready_step(&mut follower, 0.3), PlannerStep::Command(_)));
+        let goal = follower.goal.clone(); let route = follower.route.clone();
+        let generation = follower.route_generation;
+        let plans = follower.local_plans();
+        let mut probe = install_recovery_lifecycle_probe(&mut follower, mode);
+        let epoch = follower.owner.as_ref().unwrap().epoch();
+        follower.retry_after = Instant::now() + Duration::from_millis(250);
+        recovery_publish_real_wall(&mut follower);
+        recovery_clear_wall(&mut follower); // real latest evidence before the new request
+        assert!(follower.local_path.is_some() && follower.admitted_generation.is_none());
+        std::thread::sleep(follower.retry_after.saturating_duration_since(Instant::now()));
+        assert!(matches!(follower.step(0.3), PlannerStep::Pending(_)));
+        let recovery_request = probe.entered.recv_timeout(Duration::from_secs(5));
+        probe.release.as_ref().unwrap().send(()).unwrap();
+        wait_for(|| follower.owner.as_ref().unwrap().completion_ready_for_test());
+        follower.consume_plan(); // actual ticket, coverage, and latest connector admission
+        let accepted = follower.local_plans() == plans + 1
+            && follower.admitted_generation == Some(generation)
+            && follower.goal == goal && follower.route == route;
+        let coverage = follower.local_end;
+        let total = *follower.cumulative.last().unwrap();
+
+        follower.dirty = true; // trigger another refresh without replacing owner or clearing admission
+        std::thread::sleep(follower.retry_after.saturating_duration_since(Instant::now()));
+        let _ = follower.step(0.3);
+        let normal_request = probe.entered.recv_timeout(Duration::from_secs(5));
+        recovery_cleanup(follower, &mut probe);
+
+        assert_eq!(recovery_request.unwrap(), (true, epoch));
+        assert!(accepted, "synthetic valid candidate failed actual current admission");
+        match mode {
+            RecoveryFixtureResult::Partial => assert!((coverage - 0.7).abs() < 1e-9 && coverage < total),
+            RecoveryFixtureResult::Full => assert!((coverage - total).abs() < 1e-9),
+            RecoveryFixtureResult::Incomplete => unreachable!(),
+        }
+        assert_eq!(normal_request.unwrap(), (false, epoch), "successful re-admission retained a stale detour mode");
+    }
+}
+
+#[test]
+fn stop_and_new_route_clear_rejected_path_mode() {
+    for stop_first in [false, true] {
+        let mut follower = open_follower();
+        assert!(matches!(ready_step(&mut follower, 0.3), PlannerStep::Command(_)));
+        let mut probe = install_recovery_lifecycle_probe(&mut follower, RecoveryFixtureResult::Incomplete);
+        follower.retry_after = Instant::now() + Duration::from_millis(250);
+        recovery_publish_real_wall(&mut follower);
+        recovery_clear_wall(&mut follower);
+        let old_generation = follower.route_generation;
+        let old_epoch = follower.owner.as_ref().unwrap().epoch();
+        if stop_first {
+            follower.stop();
+            assert!(follower.route.is_none() && follower.goal.is_none());
+            assert!(follower.local_path.is_none() && follower.admitted_generation.is_none());
+            assert!(matches!(follower.step(0.3), PlannerStep::Pending(_)));
+            assert!(matches!(probe.entered.try_recv(), Err(mpsc::TryRecvError::Empty)));
+            follower.configure_goal(&comparison_pose(3.0, 0), GoalOptions::default()).unwrap();
+        }
+        follower.replace_execution_path(ExecutionPath::Surface(Path3D { poses: vec![
+            comparison_pose(0.5, 0), comparison_pose(1.1, 0), comparison_pose(3.0, 0),
+        ] }), None, comparison_pose(3.0, 0)).unwrap();
+        let cleared = follower.local_path.is_none() && follower.admitted_generation.is_none()
+            && follower.route_generation > old_generation
+            && follower.owner.as_ref().unwrap().epoch() > old_epoch;
+        let new_epoch = follower.owner.as_ref().unwrap().epoch();
+        let next = follower.step(0.3);
+        let request = probe.entered.recv_timeout(Duration::from_secs(5));
+        recovery_cleanup(follower, &mut probe);
+        assert!(cleared && matches!(next, PlannerStep::Pending(_)));
+        assert_eq!(request.unwrap(), (false, new_epoch), "new route inherited old rejected-path detour intent");
+    }
+}
+
+
+struct CooldownRequestProbe {
+    entered: std::sync::mpsc::Receiver<bool>,
+    release: Option<std::sync::mpsc::Sender<()>>,
+}
+impl Drop for CooldownRequestProbe {
+    fn drop(&mut self) {
+        // Unwind cannot strand the original bounded PlanningOwner thread.
+        if let Some(release) = self.release.take() { let _ = release.send(()); }
+    }
+}
+fn install_cooldown_request_probe(follower: &mut RouteFollower) -> CooldownRequestProbe {
+    let (entered, receive) = std::sync::mpsc::channel();
+    let (release, wait) = std::sync::mpsc::channel();
+    follower.cancel_planning();
+    let mut kernel = PlanKernel::new(follower.config.clone());
+    follower.owner = Some(PlanningOwner::new(move |request: PlanRequest, cancel| {
+        let _ = entered.send(request.detour);
+        // Hold before PlanKernel. Cleanup cancels this same owner before release;
+        // the production cancellation path then prevents unnecessary search.
+        let _ = wait.recv_timeout(Duration::from_secs(5));
+        kernel.compute(request, cancel)
+    }).unwrap());
+    CooldownRequestProbe { entered: receive, release: Some(release) }
+}
+
+#[test]
+fn real_rejection_during_cooldown_keeps_detour_on_next_step() {
+    let mut follower = open_follower();
+    assert!(matches!(ready_step(&mut follower, 0.3), PlannerStep::Command(c) if c.linear.x > 0.0));
+    let old_route = follower.route.clone();
+    let old_goal = follower.goal.clone();
+    let generation = follower.route_generation;
+    let old_path = follower.local_path.clone();
+    assert!(old_path.is_some());
+
+    // Geometry is identical to the existing selective recent-source regression.
+    // The current footprint is clear; the commanded stopping tail meets the wall.
+    let basis = follower.map.clone().unwrap();
+    let wall = Arc::new(basis.with_recent_obstacle_points(2, 2_000_000_000, 0, &[],
+        (0..5).map(|i| (i, [0.73, 0.8 + f64::from(i) * 0.1, 0.5]))).unwrap());
+    assert!(nuwax_nav_pct::same_source_geometry(&basis, &wall));
+    wall.validate_body_pose([0.5, 1.0, 0.5], [0.0, 0.0, 0.0, 1.0]).unwrap();
+
+    let mut probe = install_cooldown_request_probe(&mut follower);
+    let epoch = follower.owner.as_ref().unwrap().epoch();
+    follower.update_execution_map(ExecutionMap::SurfaceUpdate(SurfaceMapUpdate {
+        planar_reference: None, snapshot: wall, change_basis: Some(basis),
+        changes: Arc::new(SurfaceGeometryChanges::Empty),
+    })).unwrap();
+    follower.observe_applied_command(Twist2 {
+        linear: nuwax_nav_types_messages::Point2::new(0.5, 0.0), angular_z: 0.0,
+    });
+    // Synthetic scheduling phase, not a new production threshold or source time.
+    let original_deadline = Instant::now() + Duration::from_millis(250);
+    follower.retry_after = original_deadline;
+    let rejected = follower.step(0.3); // real controller -> current_rejection
+    assert!(Instant::now() < original_deadline, "fixture missed the original cooldown phase");
+    assert!(matches!(rejected, PlannerStep::Pending(_)), "{rejected:?}");
+    assert!(follower.execution_wait_reason().is_some_and(|s| s.contains("当前轨迹受阻")));
+    assert!(follower.submitted.is_none(), "no job can enter during this cooldown");
+    assert_eq!(probe.entered.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty));
+    assert_eq!(follower.admitted_generation, None);
+    assert_eq!(follower.retry_after, original_deadline);
+
+    // Model the scheduler's acknowledged zero, preserving pose and obstacle.
+    follower.observe_applied_command(Twist2::ZERO);
+    std::thread::sleep(original_deadline.saturating_duration_since(Instant::now()));
+    let next = follower.step(0.3); // never call current_rejection a second time
+    let received = probe.entered.recv_timeout(Duration::from_secs(5));
+    let retained = follower.route == old_route && follower.goal == old_goal
+        && follower.route_generation == generation && follower.local_path == old_path
+        && follower.admitted_generation.is_none()
+        && follower.owner.as_ref().unwrap().epoch() == epoch;
+    let submitted_detour = follower.submitted.map(|(_, _, detour)| detour);
+    eprintln!("COOLDOWN_REQUEST observed={received:?} submitted={submitted_detour:?}");
+
+    // Complete cleanup BEFORE the expected RED assertion.
+    follower.stop();
+    if let Some(release) = probe.release.take() { let _ = release.send(()); }
+    drop(follower); // joins the same PlanningOwner, never a detached replacement
+    eprintln!("COOLDOWN_CLEANUP original_owner_joined=true");
+
+    assert!(matches!(next, PlannerStep::Pending(_)), "{next:?}");
+    assert!(retained, "retry must preserve original goal/route and zero-only permission");
+    assert_eq!(received.unwrap(), true, "actual PlanningOwner received nominal-first work");
+    assert_eq!(submitted_detour, Some(true), "post-cooldown recovery lost detour intent");
+}
+
+#[test]
+fn ordinary_incomplete_search_keeps_nominal_retry_without_guard_rejection() {
+    let mut follower = open_follower();
+    install_failures(&mut follower, typed_failures());
+    complete_failure(&mut follower);
+    assert!(follower.local_path.is_none());
+    assert!(follower.admitted_generation.is_none());
+    assert!(follower.qualified_failure.is_none());
+    let mut probe = install_cooldown_request_probe(&mut follower);
+    let next = follower.step(0.3);
+    let received = probe.entered.recv_timeout(Duration::from_secs(5));
+    let submitted_detour = follower.submitted.map(|(_, _, detour)| detour);
+    eprintln!("COOLDOWN_REQUEST observed={received:?} submitted={submitted_detour:?}");
+    follower.stop();
+    if let Some(release) = probe.release.take() { let _ = release.send(()); }
+    drop(follower);
+    eprintln!("COOLDOWN_CLEANUP original_owner_joined=true");
+    assert!(matches!(next, PlannerStep::Pending(_)));
+    assert_eq!(submitted_detour, Some(false));
+    assert_eq!(received.unwrap(), false, "ordinary incomplete work must retain nominal-first policy");
+}
+
     use nuwax_nav_mls_planner::SurfaceBodyEnvelope;
     use nuwax_nav_types_messages::{MotionKinematics, MotionModel, NavFrameId, Pose3, Quaternion, Timestamp};
     use crate::route_planning::Candidate;

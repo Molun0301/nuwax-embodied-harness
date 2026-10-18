@@ -484,6 +484,16 @@ Python 3.8.10 最终 199/199（core 146、public 25、旧回归28），另 JS 40
 
 以上覆盖真实 memq 本地 codec 与明确注入错误、精确身份/并发模型和公开消费者控制。ZERO 仅在冻结业务事实后由模型清理；没有实机运动/制动、自然网络故障或真实浏览器全链证明。20项固定 UDPM 旧夹具因既有环境限制未重跑，未改网络或放宽权限。不能以缓存清空、观察超时或测试绿代替真实已发/已停证明。
 
+## 第三十六阶段：局部拒绝后的绕行意图跨过原冷却
+
+真实 RouteFollower 回归在已有可执行路线后加入原近期墙。当前身体仍合法，但当前控制/停车轨迹被真实几何拒绝。原250ms冷却内的schedule(true)没有提交；冷却到期后只走真实step，PlanningOwner实际收到detour=false，重新落入nominal-first。原测试在冷却后再次直接调用current_rejection，未覆盖这条自然后续路径。新业务RED在实际请求false→预期true处失败，Stop、释放gate及原owner join均已完成；普通Budget/SearchExhausted负控保持false并通过。失败日志完整保留。
+
+生产修复仅改step调度的一行入参，使用已有local_path=Some且admitted_generation=None状态继续绕行。这一组合由当前拒绝撤执行许可产生；Stop、新目标、新路线会同时清路径，成功full/partial接纳会恢复admission。没有新标志、锁、线程、哈希或全图副本，也不把所有未接纳/普通搜索失败改成绕行。原250ms冷却、防重复、active/latest-pending/completion槽、源票据、当前机体/完整制动检查及搜索预算均保持。
+
+最终同一原release/LTO binary的51个distinct exact全部通过：5新（原RED转绿、普通不完整负控及3补充）+46原RouteFollower回归，9个原ignored未运行。active nominal未取消，原epoch不变，冷却后仅接latest pending detour；重复step不增加提交；成功full/partial接纳后回普通模式；Stop/newroute不继承旧绕行意图。新例均在原owner清理join后核验结果，补充3例首次运行通过，无fixture/type修正。增量check6.67s/no-run2m31；七包tests check10.42s通过（stack/mls、exploration/surface，无额外Scan/profile）。这是定向RouteFollower验证及类型检查，不是完整runtime全套。
+
+证据边界：主例是进程内真实RouteFollower/PlanningOwner、真实静态地形与近期障碍几何；250ms相位由tests-only字段设置，ZERO由夹具报告，未跨真实scheduler/LCM/执行器。补充full/partial是明确合成但经真实源逐边与当前接续检查的状态控制，不冒充真实Scan搜索性能或整目标运动。没有因本次改动放宽预算、时间窗、障碍或运动安全标准，不宣称整体墙前恢复或端侧时延已解决。无body兼容入口和全路线矩形的保守取消是独立后续问题，本阶段未处理。
+
 ## 后续持续检查
 
 1. 墙前晚到路径的实际恢复与初始 full/partial/PCT 顺序，保留及时移动和真实避障

@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import logging
 import threading
 import time
@@ -631,6 +632,7 @@ class NavigationService:
         context = getattr(self, "_latest_navigation_context", None)
         state = getattr(context, "navigation_state", None)
         if getattr(state, "status", None) not in {
+            NavigationStatus.UNCONFIRMED,
             NavigationStatus.ACCEPTED,
             NavigationStatus.PLANNING,
             NavigationStatus.RUNNING,
@@ -747,6 +749,7 @@ class NavigationService:
             getattr(state, "current_goal_id", "") or ""
         ).strip()
         is_active = status in {
+            NavigationStatus.UNCONFIRMED.value,
             NavigationStatus.ACCEPTED.value,
             NavigationStatus.PLANNING.value,
             NavigationStatus.RUNNING.value,
@@ -1360,6 +1363,12 @@ class NavigationService:
             # 同步查询开始后可能已有新推送到达；旧查询不能回退新目标或抹掉停车证据。
             if previous_context is not None:
                 previous = previous_context.navigation_state
+                previous_metadata = dict(previous.metadata or {})
+                if (previous_metadata.get("ownership_retained") is True
+                        and previous_metadata.get("authority_current") is False):
+                    # A late command body cannot restore authority invalidated by a
+                    # connection replacement; automatic recovery is outside this path.
+                    return previous_context
                 def identity(state):
                     metadata = dict(state.metadata or {})
                     try:
@@ -1385,7 +1394,57 @@ class NavigationService:
                 if same_identity:
                     if previous_fenced and navigation_state.status not in {NavigationStatus.SUCCEEDED, NavigationStatus.FAILED, NavigationStatus.CANCELLED}:
                         return previous_context
-                    if navigation_state.updated_at < previous.updated_at:
+                    incoming_metadata = dict(navigation_state.metadata or {})
+                    old_without_source = metadata.get("command_projection_without_source") is True
+                    incoming_without_source = incoming_metadata.get("command_projection_without_source") is True
+                    def full_identity(state):
+                        values = dict(state.metadata or {})
+                        return (state.current_goal_id, values.get("owner_kind"),
+                                values.get("parent_request_id"), values.get("goal_generation"),
+                                values.get("producer_runtime_generation"))
+                    exact_identity = (old_identity is not None
+                        and full_identity(previous) == full_identity(navigation_state))
+                    if exact_identity and (old_without_source or incoming_without_source):
+                        old_path = int(metadata.get("path_revision") or 0)
+                        incoming_path = int(incoming_metadata.get("path_revision") or 0)
+                        old_planner = int(metadata.get("planner_runtime_generation") or 0)
+                        incoming_planner = int(incoming_metadata.get("planner_runtime_generation") or 0)
+                        if (incoming_path < old_path
+                                or (incoming_path == old_path and incoming_planner != old_planner)):
+                            return previous_context
+                    incoming_fenced = bool(
+                        navigation_state.status in {NavigationStatus.SUCCEEDED, NavigationStatus.FAILED, NavigationStatus.CANCELLED}
+                        and incoming_metadata.get("actuator_zeroed") is True
+                        and str(incoming_metadata.get("zero_ack_id") or "").strip()
+                        and int(incoming_metadata.get("zero_applied_monotonic_ns") or 0) > 0)
+                    if previous_fenced and not incoming_fenced:
+                        return previous_context
+                    obligation = metadata.get("dispatch_obligation") or {}
+                    if (obligation.get("terminal_observed")
+                            and navigation_state.status in {
+                                NavigationStatus.ACCEPTED, NavigationStatus.PLANNING, NavigationStatus.RUNNING,
+                            }):
+                        return previous_context
+                    incoming_obligation = incoming_metadata.get("dispatch_obligation") or {}
+                    stronger_terminal_observation = bool(
+                        exact_identity and incoming_without_source
+                        and incoming_metadata.get("ownership_retained") is True
+                        and incoming_metadata.get("authority_current") is True
+                        and incoming_obligation.get("terminal_observed")
+                        and incoming_metadata.get("reason_code") == "GOAL_TERMINAL_PROOF_PENDING"
+                        and not obligation.get("terminal_observed")
+                        and not previous_fenced
+                        and int(incoming_metadata.get("path_revision") or 0) >= int(metadata.get("path_revision") or 0)
+                        and (int(incoming_metadata.get("path_revision") or 0) > int(metadata.get("path_revision") or 0)
+                             or incoming_metadata.get("planner_runtime_generation") == metadata.get("planner_runtime_generation")))
+                    # A newly observed terminal is stronger than Running. Other late
+                    # source-less commands cannot roll back a sourced execution frame.
+                    if (exact_identity and incoming_without_source and not old_without_source
+                            and not stronger_terminal_observation):
+                        return previous_context
+                    if (navigation_state.updated_at < previous.updated_at
+                            and not stronger_terminal_observation
+                            and not (exact_identity and old_without_source and not incoming_without_source)):
                         return previous_context
                 if previous_fenced and current_goal is None and navigation_state.status == NavigationStatus.IDLE:
                     return previous_context
@@ -1418,7 +1477,8 @@ class NavigationService:
                 self._current_goal is None
                 and current_goal is not None
                 and navigation_state.status in {
-                    NavigationStatus.ACCEPTED, NavigationStatus.PLANNING, NavigationStatus.RUNNING,
+                    NavigationStatus.UNCONFIRMED, NavigationStatus.ACCEPTED,
+                    NavigationStatus.PLANNING, NavigationStatus.RUNNING,
                 }
             ):
                 # 同目标的新尝试可在旧终态之后到达，复用其目标引用，不重建目标或准入凭据。
@@ -1513,6 +1573,40 @@ class NavigationService:
                 self._current_goal = None
             return context
 
+    @staticmethod
+    def _resolved_navigation_command_context(provider, goal, receipt, *, lightweight):
+        """Return this command's proof without publishing or restoring old authority."""
+        receipt = receipt.model_copy(update={"metadata": {
+            **dict(receipt.metadata), "authority_current": False,
+            "ownership_retained": False, "command_receipt_only": True,
+        }}, deep=True)
+        context_metadata = {"provider_version": provider.provider_version,
+                            "command_receipt_only": True}
+        if not lightweight:
+            # Use a private projection, never the service's possibly newer state machine.
+            machine = NavigationStateMachine()
+            machine.update_from_backend_state(provider.provider_name, receipt.status.value,
+                receipt.message, receipt.goal_reached, goal.goal_id)
+            summary = machine.get_state_summary()
+            diagnostics = NavigationDiagnostics(
+                backend_name=provider.provider_name, backend_status=receipt.status.value,
+                platform_status=receipt.status, goal_id=goal.goal_id,
+                remaining_distance_m=receipt.remaining_distance_m,
+                remaining_yaw_rad=receipt.remaining_yaw_rad,
+                last_error=receipt.message if receipt.status == NavigationStatus.FAILED else None,
+                metadata={"is_running": False, "is_terminal": True, "command_receipt_only": True},
+            )
+            context_metadata.update(diagnostics=diagnostics.model_dump(mode="json"),
+                                    navigation_state_machine=summary, map_name=goal.map_name)
+            receipt = receipt.model_copy(update={"metadata": {
+                **dict(receipt.metadata), "navigation_state_machine": summary,
+            }}, deep=True)
+        return NavigationContext(
+            timestamp=receipt.timestamp, current_goal=goal, navigation_state=receipt,
+            backend_name=provider.provider_name, goal_reached=receipt.goal_reached,
+            metadata=context_metadata,
+        )
+
     def set_goal(
         self,
         goal: NavigationGoal,
@@ -1564,6 +1658,16 @@ class NavigationService:
             "SetNavigationGoal",
         ):
             self._raise_forbidden_zone_motion_start_blocked_locked()
+            previous_goal = self._current_goal
+            previous_context = self._latest_navigation_context
+            if (previous_context is not None
+                    and previous_context.navigation_state.metadata.get("ownership_retained") is True):
+                raise GatewayError("已有导航责任尚未结算，禁止提交新目标。",
+                    error_code="navigation_goal_busy", http_status=409,
+                    details={"goal_id": previous_context.navigation_state.current_goal_id,
+                             "reason_code": "BUSY", "retryable": False,
+                             "ownership_retained": True,
+                             "authority_current": previous_context.navigation_state.metadata.get("authority_current", False)})
             self._current_goal = goal
             self._state_machine.set_goal(goal.goal_id, message="平台导航目标已接受。")
         LOGGER.debug("导航服务转发目标 goal_id=%s provider=%s", goal.goal_id, provider.provider_name)
@@ -1576,6 +1680,80 @@ class NavigationService:
             )
         take_result = getattr(provider, "take_goal_submission_result", None)
         submission = take_result(goal.goal_id) if callable(take_result) else None
+        # Confirmed submissions use the original refresh path below. Their
+        # trusted responsibility metadata is already committed in the provider cache.
+        if (isinstance(submission, dict) and submission.get("goal_id") == goal.goal_id
+                and submission.get("disposition") in {"owned_unconfirmed", "resolved"}
+                and isinstance(submission.get("navigation"), dict)):
+            wire = dict(submission["navigation"])
+            source_ns = int(wire.get("timestamp_ns") or 0)
+            timestamp = (datetime.fromtimestamp(source_ns / 1_000_000_000, tz=timezone.utc)
+                         if source_ns > 0 else datetime.now(timezone.utc))
+            raw_submission_status = str(wire.get("status") or "idle").strip().lower()
+            status = NavigationStatus("accepted" if raw_submission_status == "pending" else raw_submission_status)
+            metadata = {key: value for key, value in wire.items()
+                        if key not in {"status", "goal_id", "message", "timestamp_ns", "distance_remaining"}}
+            metadata.update(raw_status=wire.get("status", ""), observed_goal_id=wire.get("goal_id", ""),
+                            source_timestamp_ns=source_ns,
+                            ownership_retained=bool(submission.get("ownership_retained")),
+                            authority_current=bool(submission.get("authority_current")))
+            submitted_state = NavigationState(
+                current_goal_id=wire.get("goal_id") or goal.goal_id, status=status,
+                timestamp=timestamp, updated_at=timestamp, message=wire.get("message"),
+                remaining_distance_m=wire.get("distance_remaining"),
+                goal_reached=status == NavigationStatus.SUCCEEDED, metadata=metadata,
+            )
+            context = self._ingest_navigation_state(provider, submitted_state,
+                lightweight=deadline_monotonic is not None, deadline_monotonic=deadline_monotonic)
+            selected_state = context.navigation_state
+            selected_metadata = dict(selected_state.metadata or {})
+            selected_exact = bool(selected_state.current_goal_id == wire.get("goal_id")
+                and all(selected_metadata.get(key) == wire.get(key) for key in (
+                    "owner_kind", "parent_request_id", "goal_generation", "producer_runtime_generation")))
+            selected_complete = bool(selected_exact
+                and selected_state.status in {NavigationStatus.SUCCEEDED, NavigationStatus.FAILED, NavigationStatus.CANCELLED}
+                and selected_metadata.get("actuator_zeroed") is True
+                and str(selected_metadata.get("zero_ack_id") or "").strip()
+                and int(selected_metadata.get("zero_applied_monotonic_ns") or 0) > 0)
+            # A stream can win after provider commit but before this command is consumed.
+            # Consume the selected exact proof/real acceptance, not the obsolete unary label.
+            if selected_complete:
+                return context
+            if submission["disposition"] == "resolved":
+                # A newer owner/epoch may have won the shared context while the unary
+                # result was being consumed. This original receipt remains the command
+                # result; returning a foreign context would lose its exact proof.
+                return self._resolved_navigation_command_context(provider, goal, submitted_state,
+                    lightweight=deadline_monotonic is not None)
+            if submission["disposition"] == "owned_unconfirmed":
+                selected_accepted = bool(selected_exact
+                    and selected_metadata.get("authority_current") is True
+                    and not selected_metadata.get("command_projection_without_source")
+                    and selected_state.status in {
+                        NavigationStatus.ACCEPTED, NavigationStatus.PLANNING, NavigationStatus.RUNNING,
+                    })
+                if selected_accepted:
+                    accepted = True
+                else:
+                    selected_wire = dict(wire)
+                    if selected_state.current_goal_id == goal.goal_id:
+                        for key in tuple(selected_wire):
+                            if key in selected_metadata:
+                                selected_wire[key] = selected_metadata[key]
+                        selected_wire.update(status=selected_state.status.value,
+                            goal_id=selected_state.current_goal_id, message=selected_state.message or "",
+                            timestamp_ns=int(selected_metadata.get("source_timestamp_ns") or 0),
+                            distance_remaining=selected_state.remaining_distance_m)
+                        for key in ("dispatch_obligation", "observed_status", "historical_navigation_identity", "historical_navigation"):
+                            if key in selected_metadata:
+                                selected_wire[key] = selected_metadata[key]
+                    raise GatewayError(selected_wire.get("message") or "导航目标发布尚未确认，原责任仍未结算。",
+                        error_code="navigation_dispatch_unconfirmed", http_status=409,
+                        details={"goal_id": goal.goal_id, "navigation": selected_wire,
+                                 "reason_code": selected_wire.get("reason_code") or submission.get("reason_code"),
+                                 "ownership_retained": True,
+                                 "authority_current": bool(selected_wire.get("authority_current")),
+                                 "retryable": False})
         if not accepted:
             message = "导航后端拒绝目标 %s。" % goal.goal_id
             details = {"goal_id": goal.goal_id}
@@ -1591,8 +1769,16 @@ class NavigationService:
                 self._lock, deadline_monotonic, "SetNavigationGoal",
             ):
                 if self._current_goal is goal:
-                    self._current_goal = None
-                    self._state_machine.fail(message)
+                    if submission and submission.get("reason_code") == "BUSY":
+                        self._current_goal = previous_goal
+                        self._latest_navigation_context = previous_context
+                        if previous_context is not None:
+                            old = previous_context.navigation_state
+                            self._state_machine.update_from_backend_state(provider.provider_name,
+                                old.status.value, old.message, old.goal_reached, old.current_goal_id)
+                    else:
+                        self._current_goal = None
+                        self._state_machine.fail(message)
             raise GatewayError(message, error_code="navigation_goal_rejected", details=details)
         LOGGER.info("导航服务目标已被后端接收 goal_id=%s provider=%s", goal.goal_id, provider.provider_name)
         if deadline_monotonic is None:
@@ -1670,6 +1856,16 @@ class NavigationService:
             )
             or ""
         ).strip()
+        control_metadata = dict(getattr(provider_state, "metadata", {}) or {})
+        if (control_metadata.get("ownership_retained") is True
+                and control_metadata.get("authority_current") is False):
+            raise GatewayError("原导航责任尚未结算，当前连接没有原 exact 取消资格。",
+                error_code="navigation_control_authority_unavailable", http_status=409,
+                details={"goal_id": backend_goal_id, "ownership_retained": True,
+                         "authority_current": False, "retryable": False,
+                         "reason_code": control_metadata.get("reason_code"),
+                         "historical_navigation_identity": control_metadata.get("historical_navigation_identity"),
+                         "navigation": control_metadata.get("historical_navigation")})
         # 目标以完整对象替换，先捕获引用；最终取消仍由后端精确租约再次裁决。
         # 不等待持有显示聚合锁的线程，避免停车截止被无关读取耗尽。
         local_goal = self._current_goal
@@ -1680,6 +1876,7 @@ class NavigationService:
             or (local_goal_id and local_goal_id != exact_goal_id)
             or backend_status
             not in {
+                NavigationStatus.UNCONFIRMED.value,
                 NavigationStatus.ACCEPTED.value,
                 NavigationStatus.PLANNING.value,
                 NavigationStatus.RUNNING.value,

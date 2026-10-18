@@ -345,6 +345,36 @@ async function runChecks() {
     h.window.dispatch('pagehide'); const detail = h.detail();
     h.ws({message: 'after teardown'}); assert.equal(h.detail(), detail); assert.equal(h.timerCount(), 0);
   });
+  await check('UNCONFIRMED stream retains selected goal and task cancel identity without resubmission', async () => {
+    const h = harness(); await h.submit(); await h.advance(0);
+    const before = h.module.getState().pendingPose;
+    h.ws({status: 'unconfirmed', current_goal_id: 'owned-goal', message: '目标发送结果未确认',
+      metadata: {ownership_retained: true, authority_current: true}});
+    assert(h.detail().includes('unconfirmed'));
+    assert.equal(h.module.getState().pendingPose, before);
+    assert.equal(h.module.getState().inflightRequestId, 'task-1');
+    h.module.cancel(); const command = h.requests.at(-1);
+    assert.equal(command.url, '/api/tasks/task-1/cancel');
+    command.resolve({cancelled: true}); await flush();
+    assert.equal(h.requests.filter(request => request.url.includes('/navigate_to_pose/')).length, 1);
+    assert.equal(h.module.getState().inflightRequestId, 'task-1');
+    h.pending()[0].resolve(snapshot('cancelled', 'exact task barrier completed')); await flush();
+    assert.equal(h.module.getState().inflightRequestId, null);
+    h.window.dispatch('pagehide'); await flush();
+  });
+  await check('unknown without a task uses canonical cancel gateway instead of historical lease', async () => {
+    const h = harness();
+    h.ws({status: 'unconfirmed', current_goal_id: 'historical-goal', message: '当前连接没有取消资格',
+      metadata: {ownership_retained: true, authority_current: false,
+        historical_navigation_identity: {goal_id: 'historical-goal'}}});
+    h.module.cancel(); const command = h.requests.at(-1);
+    assert.equal(command.url, '/api/capabilities/cancel_navigation/invoke');
+    assert.deepEqual(JSON.parse(command.options.body), {arguments: {}});
+    command.resolve({error: {message: '当前连接没有取消资格'}}, {ok: false, status: 503}); await flush();
+    assert(h.status().includes('当前连接没有取消资格'));
+    assert.equal(h.requests.filter(request => request.url.includes('/navigate_to_pose/')).length, 0);
+    h.window.dispatch('pagehide'); await flush();
+  });
   return checks;
 }
 (async () => {

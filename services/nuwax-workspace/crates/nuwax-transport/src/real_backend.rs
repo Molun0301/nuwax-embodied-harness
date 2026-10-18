@@ -30,7 +30,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::Stream;
-use nuwax_lcm::{LcmContext, LcmError, LcmReceivedMessage, LcmSubscription};
+use nuwax_lcm::{LcmContext, LcmError, LcmReceivedMessage, LcmSubscription, PublishError};
 use nuwax_protocol::{
     build_lcm_message_bytes, LcmMessageType, LcmTopic, RawLcmFrame, RawLcmFrameBuilder,
 };
@@ -207,12 +207,12 @@ impl RealLcmBackend {
 #[async_trait]
 impl LcmBackend for RealLcmBackend {
     async fn publish(&self, frame: RawLcmFrame) -> TransportResult<()> {
-        let (typed_channel, payload) = encode_publish_frame(frame)?;
+        let (typed_channel, payload) = encode_publish_frame(frame)
+            .map_err(|error| TransportError::NotDispatched(Box::new(error)))?;
         self.context
-            .publish(&typed_channel, payload)
+            .publish_with_outcome(&typed_channel, payload)
             .await
-            .map_err(|e| TransportError::LcmBackend(format!("lcm_publish 失败: {e}")))?;
-        Ok(())
+            .map_err(single_publish_error)
     }
 
     async fn publish_batch(&self, frames: Vec<RawLcmFrame>) -> TransportResult<()> {
@@ -250,6 +250,16 @@ impl LcmBackend for RealLcmBackend {
 
     fn shared_lcm_context(&self) -> Option<Arc<LcmContext>> {
         Some(Arc::clone(&self.context))
+    }
+}
+
+fn single_publish_error(error: PublishError) -> TransportError {
+    match error {
+        PublishError::NotDispatched(cause) => TransportError::NotDispatched(Box::new(
+            TransportError::LcmBackend(format!("lcm_publish 失败: {cause}")),
+        )),
+        PublishError::EffectUnconfirmed(cause) =>
+            TransportError::LcmBackend(format!("lcm_publish 失败: {cause}")),
     }
 }
 
@@ -424,6 +434,21 @@ mod tests {
 
     /// 注:不在 unit test 里调 `RealLcmBackend::new` —— 真起 liblcm context
     /// 需要 system liblcm + 网络组播。这里仅验证 name() 与 new() 的失败路径。
+
+    #[test]
+    fn single_publish_mapping_uses_stage_not_shared_owner_down_variant() {
+        let unsent = single_publish_error(PublishError::NotDispatched(
+            LcmError::OwnerThreadDown { detail: "same diagnostic".into() },
+        ));
+        let unknown = single_publish_error(PublishError::EffectUnconfirmed(
+            LcmError::OwnerThreadDown { detail: "same diagnostic".into() },
+        ));
+        assert!(unsent.is_definitely_not_dispatched());
+        assert!(!unknown.is_definitely_not_dispatched());
+        assert!(!single_publish_error(PublishError::EffectUnconfirmed(
+            LcmError::Publish { channel: "/test/native-error".into() },
+        )).is_definitely_not_dispatched());
+    }
 
     #[test]
     fn name_is_real_lcm() {

@@ -455,6 +455,35 @@ T1–5没有native owner线程，T6也是手动执行原入口，不证明生产
 
 这些是旧行为事实与生命周期控制，不是Nav/Bridge业务RED或生产修复。阶段27只防Explore观察者取消丢future，genericErr字符串擦除、Nav条件rollback和Bridge丢lease仍需单独审议。Some lease可能来自attempted/existing/installed，不能据它生成取消责任；永久丢包、unknown Cancel先到晚Goal及跨接收端重启不能由本地错误分类保证完成。
 
+## 第三十五阶段：发送结果未确认时保留原导航责任
+
+### 问题与证据
+原业务 RED 使用唯一真实 LCM `memq://` context：Goal 确实发布并由同 context 订阅解码、匹配原 lease 后，测试 wrapper 人工返回未确认错误。旧实现随 generic Err 清 Nav active、Bridge 返回 Rejected，虽曾广播身份，原 Retained 仍提前完成，blocker 消失、root 结算，且未发 Cancel、无 terminal proof。该证据证明真实本地发布后的错误回传会丢责任，不证明生产自然 reply loss、UDP 丢包或机器人执行。原 RED 源码与失败日志永久保留。
+
+### 本批实现
+
+发布源点以 typed outcome 区分确定未进入发布与结果未确认；NotDispatched 只由源点证据产生，不按错误文字推断。Nav 区分 attempted、existing、installed lease，仅本次真实安装的未结算责任交回原 Retained 完整 continuation。明确未发仍保留原 rollback；generic Err 保留 exact owner，不能把任意 Some lease 当新任务取消。
+
+所有未知/迟到完成的本地命令投影采用 NoPublish，避免覆盖先到的真实 Running 或完整终态；真实 consumer 继续独占状态 fanout。公开链贯通 Rust unary、Python provider/service、mapping-cloud、HTTP/MCP/Agent 与双份 Web：新增非终态 UNCONFIRMED 和可信 reason_code，保留 goal_id、责任与控制资格。未确认不冒充 accepted；若真实进展已证明接受，则保留 Running 与其责任来源。已有未结算 owner 时 cloud 查询前 BUSY，不抢旧 owner 的取消权；命名/记忆导航不记不可达、不转投下一 Goal。
+
+### 结算与并发边界
+
+完整 receipt 沿本次结果栈传递，resolved 与 accepted 分开，Explore 按真实 Reached/Failed/Cancelled 消费；不二次查询可淘汰缓存，不从 active 缺席或 CancelTracker 合成停车 proof。终态已见、完整 proof 尚未提交的间隙保留 PROOF_PENDING。新路径按 revision 推进，同路径 planner 必须 exact，不把 planner ID 当全局时序。无源时间投影不制造当前时间水位，迟到命令不能回盖真实状态。原 transaction gate 不扩大；Stop/root-close、原 exact orphan 与发布前预算合同保留。
+
+同连接重试保留责任；跨 epoch 仅保留历史未结算诊断，不恢复旧取消权，新 stub 不发送旧 lease。永久缺失 exact proof 可能永久未结算，公开可见而不伪称已停。本批没有新增 tombstone、registry、自动重发 Goal 或通用重试层。
+
+### 验证与性能收口
+
+Rust 源点 19/19；owner 同一 release/LTO binary 64/64（11 新、2 native 业务、51 原回归）。native 错误臂现保留 exact active，Bridge 返回 DispatchUnresolved，无本地低阶段广播；清理前原 Cancel Pending、blocker 保持、root 观察未结算，Goal 仍仅一次。两例最终 cleanup=[]。由于 NoPublish 新合同，夹具仅迁移错误臂观察点到结构化返回 gate；原 Goal/lease、双 gate、责任断言及精确清理保留，不能称旧 RED 字节不变转绿。
+
+Python 3.8.10 最终 199/199（core 146、public 25、旧回归28），另 JS 40 分列通过。首轮111例中83例因测试 Pose 缺必填 frame_id 未进业务；合法前提修正后通过。另1例暴露失权错误 HTTP503 被 internal 脱敏丢 details，最终仅该码改409，真实 handler→public/MCP/Agent 保留历史身份、authority=false、不可重试；普通503脱敏不变。原失败与中间方案均留档。
+
+性能控制先 tests-only 跑55例，记录14通过/41失败，再应用窄修；不将两次进程耗时当 benchmark。实际 Set/cloud 路径物化3→2、wire2→1；precommit4或5→2；proof 判定物化1→0；TLS领取完整深拷贝1→0；普通 confirmed ingest2→1。cache/返回路径仍独立，2048点可变隔离控制通过。拒绝仍1次物化，第二线程确认 delivery/command/state 三锁已释放；显式 Cancel 恢复轻量 context 与原 authority guard，无参原 refresh。unknown/resolved 必需投影保留。
+
+### 证据缺口
+
+以上覆盖真实 memq 本地 codec 与明确注入错误、精确身份/并发模型和公开消费者控制。ZERO 仅在冻结业务事实后由模型清理；没有实机运动/制动、自然网络故障或真实浏览器全链证明。20项固定 UDPM 旧夹具因既有环境限制未重跑，未改网络或放宽权限。不能以缓存清空、观察超时或测试绿代替真实已发/已停证明。
+
 ## 后续持续检查
 
 1. 墙前晚到路径的实际恢复与初始 full/partial/PCT 顺序，保留及时移动和真实避障

@@ -167,6 +167,29 @@ pub enum LcmError {
     NulByte(String),
 }
 
+/// Failed single publication, classified at the ownership-transfer source.
+///
+/// Neither a completed local publish nor an unconfirmed effect proves that a
+/// remote execution lease has stopped. Batch publication keeps its own contract.
+#[derive(Debug, Error)]
+pub enum PublishError {
+    /// This command was not transferred to the owner queue.
+    #[error("{0}")]
+    NotDispatched(#[source] LcmError),
+    /// The command may have executed; its external effect is not disproved.
+    #[error("{0}")]
+    EffectUnconfirmed(#[source] LcmError),
+}
+
+impl PublishError {
+    /// Return the original error for callers retaining the legacy API contract.
+    pub fn into_error(self) -> LcmError {
+        match self {
+            Self::NotDispatched(error) | Self::EffectUnconfirmed(error) => error,
+        }
+    }
+}
+
 // =============================================================================
 // Subscription handle —— caller 通过 broadcast::Receiver 拿 payload Bytes
 // =============================================================================
@@ -838,7 +861,22 @@ impl LcmContext {
     /// rework22 P0-04:返回真错误。命令队列入队失败 → `OwnerThreadDown`;
     /// owner 执行结果 → 通过 oneshot reply 透传回 caller。
     pub async fn publish(&self, channel: &str, payload: Bytes) -> Result<(), LcmError> {
-        let c = to_cstring(channel).map_err(|_| LcmError::NulByte(channel.to_owned()))?;
+        self.publish_with_outcome(channel, payload)
+            .await
+            .map_err(PublishError::into_error)
+    }
+
+    /// Publish once while preserving whether this command reached the queue.
+    ///
+    /// A fatal wake error still returns immediately after enqueue. It does not
+    /// retract the command, wait indefinitely for a reply, or send another copy.
+    pub async fn publish_with_outcome(
+        &self,
+        channel: &str,
+        payload: Bytes,
+    ) -> Result<(), PublishError> {
+        let c = to_cstring(channel)
+            .map_err(|_| PublishError::NotDispatched(LcmError::NulByte(channel.to_owned())))?;
         let (reply_tx, reply_rx) = oneshot::channel();
         self.cmd_tx
             .send(Command::Publish {
@@ -847,13 +885,16 @@ impl LcmContext {
                 reply: reply_tx,
             })
             .await
-            .map_err(|e| LcmError::OwnerThreadDown {
-                detail: e.to_string(),
-            })?;
-        self.wakeup.wake_owner()?;
-        reply_rx.await.map_err(|e| LcmError::OwnerThreadDown {
-            detail: e.to_string(),
-        })?
+            .map_err(|error| PublishError::NotDispatched(LcmError::OwnerThreadDown {
+                detail: error.to_string(),
+            }))?;
+        self.wakeup.wake_owner().map_err(PublishError::EffectUnconfirmed)?;
+        reply_rx
+            .await
+            .map_err(|error| PublishError::EffectUnconfirmed(LcmError::OwnerThreadDown {
+                detail: error.to_string(),
+            }))?
+            .map_err(PublishError::EffectUnconfirmed)
     }
 
     /// 将一个有序批次交给原有线程连续发布，完成整批后返回一次确认。
@@ -1454,5 +1495,120 @@ mod publish_error_outcomes_review {
         assert_eq!(delivery.expect("real memq callback").payload.as_ref(), b"original-goal-body");
         // This proves execution through real liblcm after an injected wake Err.
         // It does NOT prove a UDP packet or a physical navigation command.
+    }
+
+    #[tokio::test]
+    async fn typed_nul_error_is_not_dispatched_and_queue_stays_empty() {
+        let (context, mut commands, _control) = manual_context();
+        let result = completion_with_deadline(context.publish_with_outcome(
+            "/test/typed-nul\0suffix", Bytes::from_static(b"goal"),
+        )).await;
+        assert!(matches!(result, Err(PublishError::NotDispatched(LcmError::NulByte(_)))));
+        assert!(matches!(commands.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+    }
+
+    #[tokio::test]
+    async fn typed_closed_queue_error_is_not_dispatched() {
+        let (context, commands, _control) = manual_context();
+        drop(commands);
+        let result = completion_with_deadline(context.publish_with_outcome(
+            "/test/typed-closed", Bytes::from_static(b"goal"),
+        )).await;
+        assert!(matches!(result, Err(PublishError::NotDispatched(LcmError::OwnerThreadDown { .. }))));
+    }
+
+    #[tokio::test]
+    async fn typed_wake_error_is_unconfirmed_with_original_command_queued() {
+        let (context, mut commands, _control) = manual_context();
+        context.wakeup.writer.shutdown(Shutdown::Write).expect("inject wake failure");
+        let result = completion_with_deadline(context.publish_with_outcome(
+            "/test/typed-wake", Bytes::from_static(b"original-goal"),
+        )).await;
+        let queued = commands.try_recv().expect("the original command was transferred");
+        assert!(matches!(result, Err(PublishError::EffectUnconfirmed(LcmError::OwnerThreadDown { .. }))));
+        match queued {
+            Command::Publish { channel, payload, reply } => {
+                assert_eq!(channel.to_bytes(), b"/test/typed-wake");
+                assert_eq!(payload.as_ref(), b"original-goal");
+                assert!(reply.is_closed());
+            }
+            _ => panic!("expected one original Publish command"),
+        }
+        assert!(matches!(commands.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+    }
+
+    #[tokio::test]
+    async fn typed_reply_loss_is_unconfirmed_after_actual_enqueue() {
+        let (context, mut commands, _control) = manual_context();
+        let mut publication = Box::pin(context.publish_with_outcome(
+            "/test/typed-reply-loss", Bytes::from_static(b"goal"),
+        ));
+        poll_once_pending(publication.as_mut()).await;
+        let queued = commands.try_recv().expect("actual publisher enqueued");
+        assert!(matches!(&queued, Command::Publish { .. }));
+        drop(queued); // Explicitly unexecuted here; the API cannot infer that history.
+        assert!(matches!(completion_with_deadline(publication).await,
+            Err(PublishError::EffectUnconfirmed(LcmError::OwnerThreadDown { .. }))));
+    }
+
+    #[tokio::test]
+    async fn typed_owner_error_reply_is_unconfirmed_not_a_send_rejection() {
+        let (context, mut commands, _control) = manual_context();
+        let mut publication = Box::pin(context.publish_with_outcome(
+            "/test/typed-owner-error", Bytes::from_static(b"goal"),
+        ));
+        poll_once_pending(publication.as_mut()).await;
+        match commands.try_recv().expect("original queued command") {
+            Command::Publish { reply, .. } => reply.send(Err(LcmError::Publish {
+                channel: "/test/typed-owner-error".to_owned(),
+            })).expect("live receiver"),
+            _ => panic!("expected Publish"),
+        }
+        // The reply is injected, not evidence of a naturally failing native call.
+        assert!(matches!(completion_with_deadline(publication).await,
+            Err(PublishError::EffectUnconfirmed(LcmError::Publish { .. }))));
+    }
+
+    #[tokio::test]
+    async fn typed_delivered_ok_survives_queue_close() {
+        let (context, mut commands, _control) = manual_context();
+        let mut publication = Box::pin(context.publish_with_outcome(
+            "/test/typed-replied", Bytes::from_static(b"goal"),
+        ));
+        poll_once_pending(publication.as_mut()).await;
+        match commands.try_recv().expect("original queued command") {
+            Command::Publish { reply, .. } => reply.send(Ok(())).expect("live receiver"),
+            _ => panic!("expected Publish"),
+        }
+        drop(commands);
+        assert!(completion_with_deadline(publication).await.is_ok());
+    }
+
+    #[cfg(feature = "link-liblcm")]
+    #[tokio::test]
+    async fn typed_wake_unknown_can_still_publish_through_original_native_owner() {
+        let mut fixture = ManualNativeOwner::new();
+        let channel = to_cstring("/test/typed-native-wake").expect("literal channel");
+        let (sender, mut callback) = broadcast::channel(1);
+        fixture.owner.as_mut().unwrap().subscribe(channel.clone(), channel, sender)
+            .expect("same-context subscription");
+        fixture.context.wakeup.writer.shutdown(Shutdown::Write).expect("inject wake failure");
+        let result = completion_with_deadline(fixture.context.publish_with_outcome(
+            "/test/typed-native-wake", Bytes::from_static(b"original-typed-body"),
+        )).await;
+        let owner = fixture.owner.as_mut().unwrap();
+        let command = owner.cmd_rx.try_recv().expect("the original command is still owned");
+        let (stopped, _) = owner.handle_command(command);
+        // SAFETY: the fixture exclusively owns this same native context until Drop.
+        let handled = unsafe { lcm_handle_timeout(owner.lcm, 0) };
+        let delivery = callback.try_recv();
+        drop(fixture); // Existing fixture runs original Shutdown/destroy before assertions.
+        assert!(matches!(result, Err(PublishError::EffectUnconfirmed(_))));
+        assert!(!stopped);
+        assert!(handled > 0);
+        let delivery = delivery.expect("actual same-context native delivery");
+        assert_eq!(delivery.channel, "/test/typed-native-wake");
+        assert_eq!(delivery.payload.as_ref(), b"original-typed-body");
+        // Manual original handle_command is not natural wake recovery or UDP proof.
     }
 }

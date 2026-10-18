@@ -188,6 +188,19 @@ def _navigation_state_payload(
         "updated_at",
         _payload_value(navigation_state, "timestamp"),
     )
+    metadata = _payload_value(navigation_state, "metadata", {}) or {}
+    obligation = metadata.get("dispatch_obligation") or {}
+    authority_current = metadata.get("authority_current")
+    identity = {
+        "goal_id": goal_id,
+        "owner_kind": metadata.get("owner_kind"),
+        "parent_request_id": metadata.get("parent_request_id"),
+        "goal_generation": metadata.get("goal_generation"),
+        "producer_runtime_generation": metadata.get("producer_runtime_generation"),
+    }
+    # Identity is diagnostic data. Only the provider/service can grant current
+    # cancellation authority; neither owner numbers nor identifier syntax do so.
+    current_identity = identity if authority_current is True else None
     return {
         "state": public_state,
         "status": public_state.lower(),
@@ -199,6 +212,23 @@ def _navigation_state_payload(
         "backend_name": _payload_value(stream_payload, "backend_name"),
         "cancel_zero_ack_observed": zero_ack_observed,
         "cancel_terminal_source": cancel_terminal_source,
+        "reason_code": metadata.get("reason_code"),
+        "ownership_retained": metadata.get("ownership_retained", False),
+        "authority_current": authority_current,
+        "observed_status": obligation.get("observed_status"),
+        "terminal_observed": obligation.get("terminal_observed", False),
+        "current_navigation_identity": current_identity,
+        "observed_navigation_identity": identity,
+        "historical_navigation_identity": to_jsonable(metadata.get("historical_navigation_identity")),
+        "historical_navigation": to_jsonable(metadata.get("historical_navigation")),
+        "dispatch_obligation": to_jsonable(obligation) or None,
+        "command_projection_without_source": metadata.get("command_projection_without_source", False),
+        # Pass through actual proof/path fields; no new proof is inferred from UNCONFIRMED.
+        "path_revision": metadata.get("path_revision"),
+        "planner_runtime_generation": metadata.get("planner_runtime_generation"),
+        "actuator_zeroed": metadata.get("actuator_zeroed"),
+        "zero_ack_id": metadata.get("zero_ack_id"),
+        "zero_applied_monotonic_ns": metadata.get("zero_applied_monotonic_ns"),
     }
 
 

@@ -373,6 +373,7 @@
         failed: "失败",
         cancelled: "已取消",
         pending: "等待中",
+        unconfirmed: "目标状态未确认",
       };
       const TASK_STATE_LABELS = {
         accepted: "已接收",
@@ -479,7 +480,7 @@
       function statusClass(status) {
         const raw = String(status || "missing").toLowerCase();
         if (["available", "ready", "ok", "streaming", "succeeded", "completed"].includes(raw)) return "available";
-        if (["stale", "degraded", "idle", "disabled", "cleared", "pending", "queued"].includes(raw)) return "stale";
+        if (["stale", "degraded", "idle", "disabled", "cleared", "pending", "queued", "unconfirmed"].includes(raw)) return "stale";
         if (["error", "failed", "timeout", "unavailable", "cancelled"].includes(raw)) return "error";
         if (["unsupported"].includes(raw)) return "unsupported";
         return "missing";
@@ -3817,7 +3818,7 @@
       }
       function navigationContextIsPublic(context) {
         const nav = context && context.navigation_state || {};
-        const owner = Number(nav.metadata?.owner_kind || 0);
+        const owner = Number(nav.metadata?.owner_kind || nav.metadata?.historical_navigation_identity?.owner_kind || 0);
         if (owner) return owner === 1;
         const goalId = nav.current_goal_id || nav.metadata?.observed_goal_id || context?.current_goal?.goal_id;
         return state.navigationDisplay?.isPublic === true && (!goalId || goalId === state.navigationDisplay.goalId);
@@ -4005,9 +4006,26 @@
           }
         }
         if (els.navigationPathStatus) {
-          const text = !hasPath ? "" : retained ? "保留全局路线（橙色），等待执行更新" : "全局路线（浅绿） · 局部路线（青色）";
+          const warning = state.navigationDisplay?.warning || "";
+          const route = !hasPath ? "" : retained ? "保留全局路线（橙色），等待执行更新" : "全局路线（浅绿） · 局部路线（青色）";
+          const text = [warning, route].filter(Boolean).join(" · ");
+          els.navigationPathStatus.dataset.level = warning ? "warn" : "";
           if (els.navigationPathStatus.textContent !== text) els.navigationPathStatus.textContent = text;
         }
+      }
+      function navigationControlWarning(context) {
+        const nav = context?.navigation_state || {};
+        const metadata = nav.metadata || {};
+        if (metadata.ownership_retained === true && metadata.authority_current === false) {
+          return "原目标尚未结算；当前连接没有取消资格，不能确认已停车";
+        }
+        if (metadata.ownership_retained === true && metadata.dispatch_obligation?.terminal_observed === true) {
+          return "已观察到终态，仍在等待原目标的完整停车证明";
+        }
+        if (String(nav.status || "").toLowerCase() === "unconfirmed") {
+          return "目标发送结果未确认，仍需按原目标取消并确认停车";
+        }
+        return "";
       }
       function mergeNavigationDisplay(previous, context, goal, path, clear = false) {
         const nav = context?.navigation_state || {};
@@ -4015,10 +4033,16 @@
         const goalId = String(nav.current_goal_id || metadata.observed_goal_id || context?.current_goal?.goal_id || "");
         const status = String(nav.status || "").toLowerCase();
         const terminal = ["succeeded", "failed", "cancelled", "timeout"].includes(status);
-        const producer = Number(metadata.producer_runtime_generation || 0);
-        const generation = Number(metadata.goal_generation || 0);
+        const history = metadata.authority_current === false ? metadata.historical_navigation_identity : null;
+        const ownerKind = Number(metadata.owner_kind || history?.owner_kind || 0);
+        const parentRequestId = String(metadata.parent_request_id || history?.parent_request_id || "");
+        const producer = Number(metadata.producer_runtime_generation || history?.producer_runtime_generation || 0);
+        const generation = Number(metadata.goal_generation || history?.goal_generation || 0);
         const revision = Number(metadata.path_revision || 0);
-        const timestamp = Date.parse(nav.updated_at || nav.timestamp || context?.timestamp || "") || 0;
+        const planner = Number(metadata.planner_runtime_generation || 0);
+        const terminalObserved = metadata.dispatch_obligation?.terminal_observed === true;
+        const withoutSource = metadata.command_projection_without_source === true;
+        const timestamp = withoutSource ? 0 : Date.parse(nav.updated_at || nav.timestamp || context?.timestamp || "") || 0;
         const sameGoal = previous && goalId && previous.goalId === goalId
           && (!producer || !previous.producer || producer === previous.producer)
           && (!generation || !previous.generation || generation === previous.generation);
@@ -4030,24 +4054,62 @@
         if (!goalId) return previous && !previous.terminal
           ? { ...previous, localPath: [], mode: "retained" } : previous;
         if (sameGoal && previous.terminal && !terminal) return previous;
+        // Only an already retained typed-dispatch lineage gets the narrow
+        // terminal proof upgrade gate. Ordinary terminal display stays unchanged.
+        // Planner IDs come from SystemTime: only path revisions have ordering.
+        if (terminal && previous?.dispatchObligationRetained && previous.goalId === goalId && (
+          ownerKind !== previous.ownerKind || parentRequestId !== previous.parentRequestId
+          || producer !== previous.producer || generation !== previous.generation
+          || revision < previous.revision
+          || (revision === previous.revision && planner !== previous.planner))) return previous;
         if (terminal) return {
-          goalId, producer, generation, revision, terminal: true, goal: null, path: [], localPath: [], mode: "none",
+          goalId, ownerKind, parentRequestId, producer, generation, revision, planner,
+          terminal: true, goal: null, path: [], localPath: [], mode: "none",
           isPublic: Number(metadata.owner_kind) === 1 || (sameGoal && previous.isPublic === true),
         };
         const base = sameGoal ? previous : null;
+        // Epoch loss revokes authority independently of execution timestamps.
+        // Preserve the last observed path instead of treating history as new proof.
+        if (base && metadata.ownership_retained === true && metadata.authority_current === false) return {
+          ...base, localPath: [], mode: base.path.length ? "retained" : "none",
+          warning: navigationControlWarning(context), authorityCurrent: false, historicalIdentity: history || null,
+        };
+        // A typed terminal-seen projection is awaiting proof, not fresh execution.
+        if (base?.terminalObserved && status !== "unconfirmed") return base;
         const olderPath = base && revision > 0 && base.revision > revision;
         // 迟到状态不能把较新路线切回等待颜色，也不能替换同修订的新局部轨迹。
         if (olderPath || (base && timestamp && base.timestamp && timestamp < base.timestamp)) return base;
+        // Terminal-seen without source time must retain exact owner identity.
+        // Older paths lose; the same path requires the exact planner. A newer
+        // path may use another planner ID, including a numerically smaller one.
+        if (base && withoutSource && terminalObserved && (
+          ownerKind !== base.ownerKind || parentRequestId !== base.parentRequestId
+          || producer !== base.producer || generation !== base.generation
+          || revision < base.revision
+          || (revision === base.revision && planner !== base.planner))) return base;
+        // A late source-less command projection cannot downgrade observed execution.
+        // A lost connection authority is still visible, even after real progress.
+        if (base && withoutSource && !base.withoutSource && base.timestamp && metadata.authority_current !== false
+          && metadata.dispatch_obligation?.terminal_observed !== true) return base;
         const nextPath = path.length ? path : (base?.path || []);
         const rawGoal = context?.current_goal;
         const nextGoal = rawGoal?.goal_id && rawGoal.goal_id !== goalId ? base?.goal || null : goal || base?.goal || null;
         return {
-          goalId, producer: producer || base?.producer || 0, generation: generation || base?.generation || 0,
+          goalId, ownerKind, parentRequestId,
+          producer: producer || base?.producer || 0, generation: generation || base?.generation || 0,
           revision: Math.max(revision, base?.revision || 0),
+          planner: planner || base?.planner || 0,
           timestamp: timestamp || base?.timestamp || 0,
+          withoutSource,
+          terminalObserved: terminalObserved || base?.terminalObserved === true,
+          dispatchObligationRetained: (metadata.ownership_retained === true && Boolean(metadata.dispatch_obligation))
+            || base?.dispatchObligationRetained === true,
+          warning: navigationControlWarning(context),
+          authorityCurrent: metadata.authority_current,
+          historicalIdentity: history || null,
           pathRevision: path.length ? revision : (base?.pathRevision || 0),
           terminal: false,
-          isPublic: Number(metadata.owner_kind) === 1 || (base?.isPublic === true && !Number(metadata.owner_kind)),
+          isPublic: Number(metadata.owner_kind || history?.owner_kind) === 1 || (base?.isPublic === true && !Number(metadata.owner_kind)),
           goal: nextGoal,
           goalData: rawGoal?.goal_id === goalId ? rawGoal : base?.goalData || null,
           path: nextPath,
@@ -4167,7 +4229,12 @@
         }
         state.navigationLocalPath = state.navigationDisplay?.localPath || [];
         renderNavigationPathStatus();
+        const navigationWarning = state.navigationDisplay?.warning || "";
+        const cancelButton = document.querySelector('#navigation-container [data-role="nav-cancel"]');
+        if (cancelButton) cancelButton.title = navigationWarning || "按原任务或当前权威目标取消，等待停车确认";
+        if (navigationWarning) setPill(els.navigationStatus, "unconfirmed");
         setKv(els.navigationMeta, [
+          ["导航责任", navigationWarning || "--"],
           ["导航", summarizeContext(data.navigation_context, "navigation_state")],
           ["探索", summarizeContext(data.exploration_context, "exploration_state")],
           ["探索器状态", explorerStatus ? normalizeExplorerStatusText(explorerStatus) : "--"],

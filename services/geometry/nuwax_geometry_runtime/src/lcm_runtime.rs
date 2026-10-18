@@ -196,6 +196,51 @@ pub struct NavigationUpdate {
 }
 
 impl NavigationUpdate {
+    /// One lossless projection for Bridge, direct RPC and mapping-cloud responses.
+    /// NoPublish outcomes deliberately avoid the mutable current CancelTracker.
+    pub async fn from_set_goal_outcome(
+        outcome: &crate::nav_runtime::SetGoalOutcome,
+        nav: &crate::nav_runtime::NavRuntimeState,
+    ) -> Self {
+        if let Some(receipt) = outcome.resolved_receipt.as_ref() {
+            return receipt.clone();
+        }
+        if outcome.publication == crate::nav_runtime::GoalPublicationPolicy::Local {
+            return Self::from_local(outcome.state.clone(), nav, outcome.lease.clone()).await;
+        }
+        let lease = outcome.lease.as_ref();
+        Self {
+            state: outcome.state.clone(),
+            producer_runtime_generation: lease.map_or(0, |lease| lease.producer_runtime_generation),
+            feedback: NavigationFeedback {
+                reason_code: outcome.diagnostic.map_or_else(String::new, |reason| reason.as_str().to_string()),
+                owner_kind: lease.map_or(0, |lease| lease.owner_kind),
+                parent_request_id: lease.map_or_else(String::new, |lease| lease.parent_request_id.clone()),
+                goal_generation: lease.map_or(0, |lease| lease.goal_generation),
+                producer_runtime_generation: lease.map_or(0, |lease| lease.producer_runtime_generation),
+                path_revision: lease.map_or(0, |lease| lease.path_revision),
+                planner_runtime_generation: lease.map_or(0, |lease| lease.planner_runtime_generation),
+                // Neither a terminal phase nor current ZEROED tracker is a receipt.
+                ..NavigationFeedback::default()
+            },
+        }
+    }
+
+    /// Preserve legacy local publication only when the command explicitly permits it.
+    pub async fn publish_local_set_goal_outcome(
+        outcome: &crate::nav_runtime::SetGoalOutcome,
+        nav: &crate::nav_runtime::NavRuntimeState,
+        shared: &Arc<RwLock<SharedState>>,
+        updates: &broadcast::Sender<NavigationUpdate>,
+    ) -> Self {
+        let update = Self::from_set_goal_outcome(outcome, nav).await;
+        if outcome.publication == crate::nav_runtime::GoalPublicationPolicy::Local {
+            shared.write().await.nav_state = update.state.clone();
+            let _ = updates.send(update.clone());
+        }
+        update
+    }
+
     pub async fn from_local(
         state: NavState,
         nav: &crate::nav_runtime::NavRuntimeState,
@@ -6005,6 +6050,24 @@ impl ExploreNavigationBridge {
     }
 }
 
+/// The outcome's receipt was selected under Nav's original gate using natural
+/// retirement provenance or exact CANCELLED proof. No second cache lookup occurs.
+fn resolved_exploration_submission(
+    outcome: &crate::nav_runtime::SetGoalOutcome,
+) -> Option<crate::explore_runtime::ChildNavigationSubmitError> {
+    let receipt = outcome.resolved_receipt.as_ref()?;
+    let result = exploration_navigation_terminal_result(receipt)?;
+    if matches!(&result,
+        crate::explore_runtime::ChildNavigationResult::Reached(_)
+            | crate::explore_runtime::ChildNavigationResult::Failed { .. }
+            | crate::explore_runtime::ChildNavigationResult::Cancelled(_)) {
+        Some(crate::explore_runtime::ChildNavigationSubmitError::DispatchResolved(
+            crate::explore_runtime::ChildNavigationResolved { result }))
+    } else {
+        None
+    }
+}
+
 fn classify_exploration_submit_rejection(
     retry_reason: Option<crate::nav_runtime::SetGoalRetryReason>,
     reject_reason: Option<crate::nav_runtime::SetGoalRejectReason>,
@@ -6165,15 +6228,31 @@ impl crate::explore_runtime::ExploreNavigationSink for ExploreNavigationBridge {
             },
         )
         .await;
-        let accepted = matches!(
-            outcome.state.status.to_ascii_uppercase().as_str(),
-            "ACCEPTED" | "PLANNING" | "RUNNING"
-        );
+        let accepted = outcome.accepted();
         let message = outcome.state.message.clone();
         let lease = outcome.lease.clone();
         let retry_reason = outcome.retry_reason;
         let reject_reason = outcome.reject_reason;
-        self.publish_state(outcome.state, outcome.lease).await;
+        // Bridge consumes typed responsibility/receipt below. NoPublish has no
+        // fanout and no returned wire body here, so do not clone an unused receipt.
+        if outcome.publication == crate::nav_runtime::GoalPublicationPolicy::Local {
+            NavigationUpdate::publish_local_set_goal_outcome(
+                &outcome, &self.nav, &self.state, &self.nav_state_tx,
+            ).await;
+        }
+        if outcome.lease_origin == crate::nav_runtime::GoalLeaseOrigin::InstalledUnresolved {
+            // Only THIS trusted installation can transfer cleanup to THIS retained
+            // dispatch. Actual Running is publicly accepted but Explore still settles
+            // this failed submission through its original strict orphan continuation.
+            let lease = lease.as_ref().map(exploration_child_lease).expect(
+                "installed-unresolved Nav outcome must carry its original lease");
+            return Err(crate::explore_runtime::ChildNavigationSubmitError::DispatchUnresolved(
+                crate::explore_runtime::ChildNavigationUnresolved { lease, reason: message },
+            ));
+        }
+        if let Some(resolved) = resolved_exploration_submission(&outcome) {
+            return Err(resolved);
+        }
         if !accepted {
             let rejection = classify_exploration_submit_rejection(
                 retry_reason,
@@ -6181,12 +6260,11 @@ impl crate::explore_runtime::ExploreNavigationSink for ExploreNavigationBridge {
                 message,
             );
             // Preserve the original typed readiness/source/session policy first.
-            // All current nonaccepted None-lease returns from admit_goal_intent
-            // precede installing this attempt's active owner and goal publish.
-            // New producers must preserve that invariant; Some is not stage proof.
+            // Preserve explicit pre-install provenance; attempted/existing/released
+            // identities do not acquire this attempt's prepublish retry budget.
             return Err(match rejection {
                 crate::explore_runtime::ChildNavigationSubmitError::Rejected(message)
-                    if lease.is_none() =>
+                    if outcome.lease_origin == crate::nav_runtime::GoalLeaseOrigin::NotInstalled =>
                 {
                     crate::explore_runtime::ChildNavigationSubmitError::RejectedBeforePublish(message)
                 }
@@ -6557,6 +6635,10 @@ async fn apply_typed_navigation_feedback(
         if let Some(lease) = correlated_lease.as_ref() {
             update.feedback.planned_path = nav.display_path_for(lease,update.state.status=="RUNNING").await;
         }
+    }
+    #[cfg(test)]
+    if matches!(update.state.status.as_str(), "SUCCEEDED" | "FAILED" | "CANCELLED") {
+        nav.pause_terminal_before_retention_for_test().await;
     }
     nav.retain_terminal_receipt(&update).await;
     Some(update)
@@ -22711,6 +22793,488 @@ mod exploration_cancel_retry_tests {
         }
     }
 
+    // REVIEW-ONLY tests-only draft. Base: 43409333f738327af8d4e33fe1e08ed598c4035d.
+    // Append this nested module inside lcm_runtime.rs::exploration_cancel_retry_tests.
+    // Not applied, compiled, or run. Uses existing cfg(test) Nav read seam only.
+    // Real evidence: original scheduler/Retained/Bridge/Nav and same-context liblcm.
+    // Artificial: the returned post-publish Err and cleanup's typed model ZEROED.
+    mod emitted_goal_error_ownership_red {
+        use super::*;
+        use crate::explore_runtime::{
+            ChildNavigationCancelOutcome, ChildNavigationCancelRecovery, ChildNavigationDispatch,
+            ChildNavigationDispatchObserver, ChildNavigationLease, ChildNavigationRequest,
+            ChildNavigationResult, ChildNavigationSubmitError, ChildNavigationTicket,
+            ExploreNavigationSink, ExplorePoseProvider, ExploreRobotPose, ExploreRuntimeHandle,
+            ExploreSchedulerHandle,
+        };
+        use crate::nav_runtime::{CancelGoalInput, CancelPhase, CancelSnapshot, GoalLease,
+            TestNavPublishInFlight, TestNavPublishKind};
+        use nuwax_transport::real_backend::RealLcmBackend;
+        use nuwax_transport::{OwnedLcmSubscription, TransportError};
+        use std::panic::{resume_unwind, AssertUnwindSafe};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        const PARENT: &str = "emitted-goal-error-owner-red";
+        const STEP: Duration = Duration::from_secs(3);
+        const OBSERVATION: Duration = Duration::from_millis(450);
+        type SubmitResult = Result<ChildNavigationTicket, ChildNavigationSubmitError>;
+
+        struct NativeThenError {
+            real: RealLcmBackend,
+            inject_error: bool,
+            first_goal: AtomicBool,
+            successful_goals: AtomicUsize,
+            successful_cancels: AtomicUsize,
+            original_goal_payload: Mutex<Option<Vec<u8>>>,
+            native_goal_done: tokio::sync::Notify,
+            return_gate: tokio::sync::Semaphore,
+        }
+
+        #[async_trait]
+        impl LcmBackend for NativeThenError {
+            async fn publish(&self, frame: RawLcmFrame) -> TransportResult<()> {
+                let goal = frame.msg_type.fqn() == "nuwax_msgs.GoalEnvelope";
+                let cancel = frame.msg_type.fqn() == "nuwax_msgs.CancelNavigation";
+                let first = goal && self.first_goal.swap(false, Ordering::AcqRel);
+                if first {
+                    *self.original_goal_payload.lock().expect("test payload") = Some(frame.payload.to_vec());
+                }
+                self.real.publish(frame).await?;
+                if goal { self.successful_goals.fetch_add(1, Ordering::AcqRel); }
+                if cancel { self.successful_cancels.fetch_add(1, Ordering::AcqRel); }
+                if first {
+                    self.native_goal_done.notify_one();
+                    self.return_gate.acquire().await.expect("test gate remains owned").forget();
+                    if self.inject_error {
+                        return Err(TransportError::LcmBackend(
+                            "ISOLATED TEST: real same-context publish succeeded; inject unconfirmed return".into(),
+                        ));
+                    }
+                }
+                Ok(())
+            }
+            async fn subscribe(&self, topic: LcmTopic, kind: Option<LcmMessageType>) -> LcmFrameStream {
+                self.real.subscribe(topic, kind).await
+            }
+            fn name(&self) -> &str { self.real.name() }
+            fn shared_lcm_context(&self) -> Option<Arc<nuwax_lcm::LcmContext>> {
+                self.real.shared_lcm_context()
+            }
+        }
+
+        // This wrapper observes the actual Bridge return. It does not classify text,
+        // synthesize a ticket, publish a goal, or replace the retained owner capability.
+        struct ObservedSink {
+            inner: ExploreNavigationBridge,
+            result: Mutex<Option<SubmitResult>>,
+            returned: tokio::sync::Notify,
+            return_gate: tokio::sync::Semaphore,
+        }
+        #[async_trait]
+        impl ExploreNavigationSink for ObservedSink {
+            fn retain_child_dispatch(&self, operation: ChildNavigationDispatch)
+                -> Result<ChildNavigationDispatchObserver, String> {
+                self.inner.retain_child_dispatch(operation)
+            }
+            fn current_map_frame_generation(&self) -> Result<Option<i64>, String> {
+                self.inner.current_map_frame_generation()
+            }
+            fn current_cancel_generation(&self) -> Result<u64, String> { self.inner.current_cancel_generation() }
+            fn current_map_name(&self) -> Result<String, String> { self.inner.current_map_name() }
+            async fn submit(&self, request: ChildNavigationRequest) -> SubmitResult {
+                let result = self.inner.submit(request).await;
+                *self.result.lock().expect("Bridge result observation") = Some(result.clone());
+                self.returned.notify_one();
+                self.return_gate.acquire().await.expect("test Bridge gate remains owned").forget();
+                result
+            }
+            async fn cancel(&self, lease: &ChildNavigationLease) -> Result<ChildNavigationCancelOutcome, String> {
+                self.inner.cancel(lease).await
+            }
+            async fn terminal_result_for(&self, lease: &ChildNavigationLease) -> Option<ChildNavigationResult> {
+                self.inner.terminal_result_for(lease).await
+            }
+            fn recover_cancel_receipt(&self, lease: &ChildNavigationLease) -> Option<ChildNavigationCancelRecovery> {
+                self.inner.recover_cancel_receipt(lease)
+            }
+            fn retain_orphan_cancellation(&self, lease: ChildNavigationLease) -> Result<(), String> {
+                self.inner.retain_orphan_cancellation(lease)
+            }
+            async fn orphan_lease_is_terminal(&self, lease: &ChildNavigationLease) -> bool {
+                self.inner.orphan_lease_is_terminal(lease).await
+            }
+        }
+
+        struct FreshPose;
+        #[async_trait]
+        impl ExplorePoseProvider for FreshPose {
+            async fn current_pose(&self) -> Result<ExploreRobotPose, String> {
+                Ok(ExploreRobotPose { x: 2.0, y: 2.0, z: 0.0,
+                    orientation: nuwax_nav_types_messages::geometry::Quaternion::IDENTITY,
+                    frame_id: "map".into(),
+                    source_timestamp_ns: crate::explore_runtime::now_unix_nanos(),
+                    received_monotonic_ns: crate::explore_runtime::now_monotonic_nanos() })
+            }
+        }
+
+        #[derive(Debug, Default)]
+        struct Evidence {
+            native_goal_received: bool,
+            original: Option<GoalLease>,
+            original_flight: Vec<TestNavPublishInFlight>,
+            scheduler_shutdown: Option<Result<(), String>>,
+            bridge_result: Option<SubmitResult>,
+            local_update_status: Option<String>,
+            local_update_identity: Option<ChildNavigationLease>,
+            no_local_unknown_broadcast: bool,
+            active_at_bridge_gate: Option<GoalLease>,
+            flights_at_bridge_gate: Vec<TestNavPublishInFlight>,
+            cancel_at_bridge_gate: Option<CancelSnapshot>,
+            blocks_at_bridge_gate: bool,
+            active_before_cleanup: Option<GoalLease>,
+            cancel_before_cleanup: Option<CancelSnapshot>,
+            flight_before_cleanup: Vec<TestNavPublishInFlight>,
+            terminal_receipt_before_cleanup: bool,
+            child_before_cleanup: String,
+            blocks_before_cleanup: bool,
+            root_before_cleanup: Option<GeometryTaskShutdownOutcome>,
+            root_observation_timed_out: bool,
+            persistent_stop_before_cleanup: bool,
+            topology_before_cleanup: Vec<String>,
+            successful_goals: usize,
+            successful_cancels: usize,
+        }
+
+        struct Fixture {
+            bridge: ExploreNavigationBridge,
+            explore: ExploreRuntimeHandle,
+            scheduler: ExploreSchedulerHandle,
+            backend: Arc<NativeThenError>,
+            observed: Arc<ObservedSink>,
+            control: GeometryRuntimeTaskControl,
+            topology: Arc<GeometryTopologyTestControl>,
+            root: GeometryRuntimeTaskOwner,
+            goal_subscription: Option<OwnedLcmSubscription>,
+            cancel_subscription: Option<OwnedLcmSubscription>,
+            local_updates: broadcast::Receiver<NavigationUpdate>,
+            evidence: Evidence,
+        }
+
+        // Diagnostic deadlines borrow an owned future; expiry never detaches it.
+        async fn finish_owned<F: Future>(label: &str, future: F) -> F::Output {
+            tokio::pin!(future);
+            loop {
+                match tokio::time::timeout(STEP, future.as_mut()).await {
+                    Ok(result) => return result,
+                    Err(_) => eprintln!("EMITTED_RED cleanup still owns {label}; no settlement claimed"),
+                }
+            }
+        }
+        fn input(lease: &GoalLease) -> CancelGoalInput {
+            CancelGoalInput { goal_id: lease.session_id.clone(), owner_kind: lease.owner_kind,
+                parent_request_id: lease.parent_request_id.clone(), goal_generation: lease.goal_generation,
+                producer_runtime_generation: lease.producer_runtime_generation }
+        }
+        fn cancel_matches(cancel: &schema::CancelNavigation, lease: &GoalLease, generation: u64) -> bool {
+            cancel.session_id == lease.session_id && cancel.owner_kind == lease.owner_kind
+                && cancel.parent_request_id == lease.parent_request_id
+                && u64::try_from(cancel.goal_generation).ok() == Some(lease.goal_generation)
+                && u64::try_from(cancel.producer_runtime_generation).ok() == Some(lease.producer_runtime_generation)
+                && u64::try_from(cancel.cancel_generation).ok() == Some(generation)
+        }
+
+        impl Fixture {
+            async fn new(inject_error: bool) -> Self {
+                // Existing configuration creates no producer, fanout, file, or native owner.
+                let (mut bridge, _unused_recording_backend) = configured_bridge().await;
+                let backend = Arc::new(NativeThenError {
+                    real: RealLcmBackend::new("memq://").expect("real same-context memq"), inject_error,
+                    first_goal: AtomicBool::new(true), successful_goals: AtomicUsize::new(0),
+                    successful_cancels: AtomicUsize::new(0), original_goal_payload: Mutex::new(None),
+                    native_goal_done: tokio::sync::Notify::new(), return_gate: tokio::sync::Semaphore::new(0),
+                });
+                bridge.transport = LcmTransport::new(backend.clone());
+                let local_updates = bridge.nav_state_tx.subscribe();
+                let explore = ExploreRuntimeHandle::default_with_wavefront();
+                bridge.exploration_producer_epoch = explore.producer_epoch_projection();
+                bridge.orphan_cancellations = explore.orphan_cancellation_registry();
+                let topology = Arc::new(GeometryTopologyTestControl::default());
+                let (control, registrations) = GeometryRuntimeTaskControl::channel_with_topology_control(Some(topology.clone()));
+                let root = GeometryRuntimeTaskOwner::start(control.clone(), registrations);
+                bridge.set_geometry_task_control_for_tests(Some(control.clone()));
+                let observed = Arc::new(ObservedSink { inner: bridge.clone(), result: Mutex::new(None),
+                    returned: tokio::sync::Notify::new(), return_gate: tokio::sync::Semaphore::new(0) });
+                explore.set_navigation_sink(observed.clone());
+                // Inactive until exercise; the original scheduler owns compute shutdown.
+                let scheduler = explore.spawn_scheduler(Arc::new(FreshPose), Duration::from_millis(5));
+                Self { bridge, explore, scheduler, backend, observed, control, topology, root,
+                    goal_subscription: None, cancel_subscription: None, local_updates, evidence: Evidence::default() }
+            }
+
+            async fn exercise(&mut self) {
+                let (topic, kind) = crate::nav_runtime::goal_envelope_binding().expect("original goal binding");
+                self.goal_subscription = Some(self.bridge.transport.subscribe_owned(topic, Some(kind)).await.expect("Goal subscription on SAME context"));
+                let cancel_channel = crate::channel_registry::resolve_channel(
+                    "NUWAX_GEOMETRY_RUNTIME_NAV_CANCEL_CHANNEL", "NUWAX_LCM_CHANNEL_NAV_CANCEL",
+                    "/nav/cancel#nuwax_msgs.CancelNavigation");
+                let (topic, suffix) = crate::nav_runtime::parse_channel_with_suffix(&cancel_channel).expect("original cancel channel");
+                let kind = LcmMessageType::new(&suffix.expect("typed cancellation suffix")).expect("cancel message type");
+                assert_eq!(kind.fqn(), "nuwax_msgs.CancelNavigation");
+                self.cancel_subscription = Some(self.bridge.transport.subscribe_owned(topic, Some(kind)).await.expect("Cancel subscription on SAME context"));
+                self.control.register_persistent("exploration-scheduler", run_explore_scheduler_persistent(
+                    self.scheduler.clone(), self.control.shutdown_receiver())).expect("original root scheduler registration");
+                self.explore.ingest_committed_costmap_snapshot(frontier_costmap(), test_committed_map_identity(1)).await.expect("fixture map");
+                let started = self.explore.start(PARENT, "prefer_wavefront").await;
+                assert_eq!(started.status, crate::explore_runtime::STATUS_ACCEPTED, "{}", started.message);
+                tokio::time::timeout(STEP, self.backend.native_goal_done.notified()).await.expect("real Goal native publish completion");
+                let frame = tokio::time::timeout(STEP, self.goal_subscription.as_mut().unwrap().recv()).await
+                    .expect("same-context Goal callback deadline").expect("same-context Goal callback");
+                assert_eq!(Some(frame.payload.to_vec()), *self.backend.original_goal_payload.lock().unwrap());
+                let emitted = schema::decode_goal_envelope_body(&frame.payload).expect("actual received Goal body");
+                let lease = self.bridge.nav.active_goal_lease().await.expect("actual INSTALLED owner");
+                assert_eq!(emitted.session_id, lease.session_id);
+                assert_eq!(emitted.parent_request_id, PARENT);
+                assert_eq!(emitted.parent_request_id, lease.parent_request_id);
+                assert_eq!(emitted.owner_kind, lease.owner_kind);
+                assert_eq!(lease.owner_kind, schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD);
+                assert_eq!(u64::try_from(emitted.goal_generation).ok(), Some(lease.goal_generation));
+                assert_eq!(u64::try_from(emitted.producer_runtime_generation).ok(), Some(lease.producer_runtime_generation));
+                self.evidence.native_goal_received = true;
+                self.evidence.original = Some(lease.clone());
+                self.evidence.original_flight = self.bridge.nav.publish_in_flight_for_test().expect("original flight");
+                assert_eq!(self.evidence.original_flight.len(), 1);
+                assert_eq!(self.evidence.original_flight[0].kind, TestNavPublishKind::Goal);
+                assert_eq!(self.evidence.original_flight[0].lease, lease);
+                assert!(self.topology.events().iter().any(|e| e == "registered:exploration-child-dispatch"));
+
+                self.evidence.scheduler_shutdown = Some(tokio::time::timeout(STEP, self.scheduler.shutdown()).await.expect("public shutdown deadline"));
+                assert_eq!(self.evidence.scheduler_shutdown, Some(Ok(())));
+                assert_eq!(self.bridge.nav.publish_in_flight_for_test().unwrap(), self.evidence.original_flight);
+                self.control.request_stop();
+                assert!(!self.control.admission_is_open());
+                assert!(!*self.control.shutdown_receiver().borrow());
+                self.backend.return_gate.add_permits(1);
+                tokio::time::timeout(STEP, self.observed.returned.notified()).await.expect("actual Bridge returned after Nav finish_publish");
+                self.evidence.bridge_result = self.observed.result.lock().unwrap().clone();
+                self.evidence.active_at_bridge_gate = self.bridge.nav.active_goal_lease().await;
+                self.evidence.flights_at_bridge_gate = self.bridge.nav.publish_in_flight_for_test().unwrap();
+                self.evidence.cancel_at_bridge_gate = Some(self.bridge.nav.cancel_snapshot());
+                self.evidence.blocks_at_bridge_gate = self.explore.blocks_mapping_mutation().await;
+                // r3 publication contract: the structured Bridge return gate is the
+                // observation point for unknown. Preserve both original gates and
+                // ownership assertions; the authoritative execution consumer owns fanout.
+                if self.backend.inject_error {
+                    let Some(Err(ChildNavigationSubmitError::DispatchUnresolved(unresolved))) =
+                        self.evidence.bridge_result.as_ref() else {
+                            panic!("unknown return must carry this installed exact responsibility");
+                        };
+                    assert_eq!(unresolved.lease, exploration_child_lease(&lease));
+                    assert!(matches!(self.local_updates.try_recv(), Err(broadcast::error::TryRecvError::Empty)),
+                        "unknown command projection must not broadcast a lower-stage state");
+                    self.evidence.no_local_unknown_broadcast = true;
+                } else {
+                    let update = tokio::time::timeout(STEP, self.local_updates.recv()).await.expect("original Bridge state broadcast").expect("local update");
+                    self.evidence.local_update_status = Some(update.state.status.clone());
+                    self.evidence.local_update_identity = Some(ChildNavigationLease {
+                        session_id: update.state.goal_id, owner_kind: update.feedback.owner_kind,
+                        parent_request_id: update.feedback.parent_request_id,
+                        goal_generation: update.feedback.goal_generation,
+                        producer_runtime_generation: update.producer_runtime_generation,
+                    });
+                    assert_eq!(self.evidence.local_update_identity.as_ref(), Some(&exploration_child_lease(&lease)),
+                        "ordinary accepted Bridge broadcast retains the original identity");
+                }
+                assert!(self.evidence.blocks_at_bridge_gate);
+                assert!(self.evidence.flights_at_bridge_gate.is_empty());
+                self.observed.return_gate.add_permits(1);
+
+                // shutdown borrows the original root owner/JoinHandle. Dropping only
+                // this observation on expiry does not drop or abort that producer.
+                match tokio::time::timeout(OBSERVATION, self.root.shutdown()).await {
+                    Ok(outcome) => self.evidence.root_before_cleanup = Some(outcome),
+                    Err(_) => self.evidence.root_observation_timed_out = true,
+                }
+                self.evidence.active_before_cleanup = self.bridge.nav.active_goal_lease().await;
+                self.evidence.cancel_before_cleanup = Some(self.bridge.nav.cancel_snapshot());
+                self.evidence.flight_before_cleanup = self.bridge.nav.publish_in_flight_for_test().unwrap();
+                self.evidence.terminal_receipt_before_cleanup = self.bridge.nav.terminal_receipt_for(&input(&lease)).await.is_some();
+                self.evidence.child_before_cleanup = self.explore.snapshot().child_task_id;
+                self.evidence.blocks_before_cleanup = self.explore.blocks_mapping_mutation().await;
+                self.evidence.persistent_stop_before_cleanup = *self.control.shutdown_receiver().borrow();
+                self.evidence.topology_before_cleanup = self.topology.events();
+                self.evidence.successful_goals = self.backend.successful_goals.load(Ordering::Acquire);
+                self.evidence.successful_cancels = self.backend.successful_cancels.load(Ordering::Acquire);
+                // Everything above is frozen before cleanup's first cancel or ACK.
+            }
+
+            async fn cleanup(&mut self) -> Vec<String> {
+                let mut failures = Vec::new();
+                // Revoke the parent FIRST, including panic paths before exercise's
+                // scheduler shutdown. Releasing either gate first could attach a late
+                // success or allow a second dispatch to wait on an unowned gate.
+                finish_owned("Explore Stop before gate release", self.explore.stop(PARENT)).await;
+                self.backend.return_gate.add_permits(1);
+                self.observed.return_gate.add_permits(1);
+                if let Err(error) = finish_owned("original scheduler / compute settlement", settle_explore_scheduler(&self.scheduler)).await { failures.push(error); }
+                loop {
+                    let flights = self.bridge.nav.publish_in_flight_for_test().expect("cleanup original flights");
+                    if !flights.is_empty() {
+                        eprintln!("EMITTED_RED cleanup retains original in-flight operation: {flights:?}");
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        continue;
+                    }
+                    let Some(active) = self.bridge.nav.active_goal_lease().await else {
+                        let events = self.topology.events();
+                        let registered = events.iter().any(|e| e == "registered:exploration-child-dispatch");
+                        let completed = events.iter().any(|e| e == "completed:exploration-child-dispatch");
+                        if registered && !completed {
+                            // Early business failure may release a retained operation
+                            // before it has installed Nav. Do not skip its later ACK.
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                            continue;
+                        }
+                        break;
+                    };
+                    assert_eq!(active.parent_request_id, PARENT, "do not cancel foreign cleanup owner");
+                    assert_eq!(active.owner_kind, schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD);
+                    // Only after the verdict: ensure a real exact cancellation exists.
+                    // This is the existing no-successor-registration path, never a new Goal.
+                    if let Err(error) = finish_owned("cleanup exact cancellation", self.bridge.cancel_child_navigation(
+                        &exploration_child_lease(&active), false)).await { failures.push(error); }
+                    while !self.bridge.nav.publish_in_flight_for_test().expect("cleanup flights").is_empty() {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                    let pending = self.bridge.nav.cancel_snapshot();
+                    if pending.phase != CancelPhase::Pending || pending.generation == 0 || pending.lease.as_ref() != Some(&active) {
+                        eprintln!("EMITTED_RED no exact pending cleanup ticket; retain owner: {pending:?}");
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        continue;
+                    }
+                    let received_exact = finish_owned("same-context exact Cancel receipt", async {
+                        loop {
+                            let sub = self.cancel_subscription.as_mut().expect("owned Cancel subscription before Goal start");
+                            let frame = sub.recv().await.map_err(|e| e.to_string())?;
+                            let decoded = schema::decode_cancel_navigation_body(&frame.payload).map_err(|e| e.to_string())?;
+                            if cancel_matches(&decoded, &active, pending.generation) { return Ok::<_, String>(()); }
+                        }
+                    }).await;
+                    if let Err(error) = received_exact { failures.push(error); continue; }
+                    let modeled = NavigationUpdate {
+                        producer_runtime_generation: active.producer_runtime_generation,
+                        state: NavState { status: "CANCELLED".into(), goal_id: active.session_id.clone(),
+                            message: "ISOLATED TEST MODEL cleanup after frozen evidence; no physical assertion".into(),
+                            timestamp_ns: crate::explore_runtime::now_unix_nanos(), ..NavState::default() },
+                        feedback: NavigationFeedback { cancel_generation: pending.generation,
+                            owner_kind: active.owner_kind, parent_request_id: active.parent_request_id.clone(),
+                            goal_generation: active.goal_generation, producer_runtime_generation: active.producer_runtime_generation,
+                            path_revision: active.path_revision, planner_runtime_generation: active.planner_runtime_generation,
+                            guard_generation: crate::nav_runtime::test_motion_admission().guard_generation, sink_ready: true,
+                            zero_ack_id: format!("{}-ISOLATED-CLEANUP-{}", active.session_id, pending.generation),
+                            zero_applied_monotonic_ns: crate::explore_runtime::now_monotonic_nanos(),
+                            ..NavigationFeedback::default() },
+                    };
+                    if let Some(update) = finish_owned("typed model proof", apply_typed_navigation_feedback(&self.bridge.nav, modeled)).await {
+                        if update.feedback.actuator_zeroed && update.state.status == "CANCELLED" {
+                            finish_owned("original terminal fanout", fanout_navigation_update(
+                                &self.bridge.state, &self.bridge.nav_state_tx, &self.explore, update)).await;
+                        } else { failures.push("model proof not admitted as exact ZEROED".into()); }
+                    } else { failures.push("model proof rejected".into()); }
+                }
+                loop {
+                    let outcome = finish_owned("original root join", self.root.shutdown()).await;
+                    let settled = outcome.producers_settled();
+                    if let Err(error) = outcome.result { failures.push(error); }
+                    if settled { break; }
+                    eprintln!("EMITTED_RED cleanup root still retains unresolved producers");
+                }
+                assert!(self.explore.snapshot().child_task_id.is_empty(), "no attached cleanup child may be abandoned");
+                if let Some(sub) = self.goal_subscription.take() {
+                    if let Err(error) = finish_owned("Goal unsubscribe", sub.unsubscribe()).await { failures.push(error.to_string()); }
+                }
+                if let Some(sub) = self.cancel_subscription.take() {
+                    if let Err(error) = finish_owned("Cancel unsubscribe", sub.unsubscribe()).await { failures.push(error.to_string()); }
+                }
+                let context = self.backend.shared_lcm_context().expect("original context");
+                if let Err(error) = finish_owned("original LCM owner shutdown / join", context.shutdown()).await { failures.push(error.to_string()); }
+                self.bridge.set_geometry_task_control_for_tests(None);
+                self.topology.task_control.lock().take();
+                failures
+            }
+        }
+
+        fn panic_text(payload: &(dyn std::any::Any + Send)) -> &str {
+            payload.downcast_ref::<String>().map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&'static str>().copied())
+                .unwrap_or("non-string panic payload")
+        }
+
+        async fn run_case(inject_error: bool) {
+            let mut fixture = Fixture::new(inject_error).await;
+            let business = tokio::time::timeout(Duration::from_secs(15), AssertUnwindSafe(fixture.exercise()).catch_unwind()).await;
+            let cleanup = AssertUnwindSafe(fixture.cleanup()).catch_unwind().await;
+            let cleanup_failures = match cleanup {
+                Ok(failures) => failures,
+                Err(panic) => {
+                    eprintln!("EMITTED_RED cleanup panic: {}; retain complete fixture for external watchdog, never detach", panic_text(panic.as_ref()));
+                    match &business {
+                        Ok(Err(panic)) => eprintln!("EMITTED_RED preceding business panic: {}", panic_text(panic.as_ref())),
+                        Err(error) => eprintln!("EMITTED_RED preceding business deadline: {error}"),
+                        Ok(Ok(())) => eprintln!("EMITTED_RED business observation returned before cleanup panic"),
+                    }
+                    eprintln!("EMITTED_RED evidence before unresolved cleanup: {:#?}", fixture.evidence);
+                    std::future::pending::<()>().await;
+                    unreachable!()
+                }
+            };
+            let evidence = std::mem::take(&mut fixture.evidence);
+            drop(fixture);
+            let lost_owner_signature = inject_error && evidence.native_goal_received
+                && evidence.active_at_bridge_gate.is_none()
+                && matches!(evidence.bridge_result.as_ref(), Some(Err(ChildNavigationSubmitError::Rejected(_))))
+                && evidence.active_before_cleanup.is_none() && !evidence.terminal_receipt_before_cleanup
+                && evidence.successful_cancels == 0
+                && evidence.cancel_before_cleanup.as_ref().is_some_and(|c| c.phase == CancelPhase::Idle)
+                && evidence.topology_before_cleanup.iter().any(|e| e == "completed:exploration-child-dispatch")
+                && evidence.root_before_cleanup.as_ref().is_some_and(|o| o.producers_settled());
+            eprintln!("EMITTED_RED injected={inject_error} loss_signature={lost_owner_signature}; frozen evidence={evidence:#?}; cleanup={cleanup_failures:?}");
+            match business {
+                Ok(Err(payload)) => resume_unwind(payload),
+                Err(error) => panic!("business deadline after owned cleanup: {error}; {cleanup_failures:?}"),
+                Ok(Ok(())) => {}
+            }
+            assert!(cleanup_failures.is_empty(), "cleanup failures: {cleanup_failures:?}");
+            assert!(evidence.native_goal_received);
+            assert_eq!(evidence.successful_goals, 1);
+            assert!(!evidence.terminal_receipt_before_cleanup);
+            assert!(evidence.child_before_cleanup.is_empty());
+            if inject_error {
+                assert!(evidence.no_local_unknown_broadcast);
+                assert!(evidence.local_update_identity.is_none());
+            } else {
+                assert_eq!(evidence.local_update_identity.as_ref(), evidence.original.as_ref().map(exploration_child_lease).as_ref());
+            }
+            assert_eq!(evidence.active_before_cleanup.as_ref(), evidence.original.as_ref(),
+                "RED: a locally emitted installed Goal lost its exact owner before any terminal proof");
+            assert!(evidence.blocks_before_cleanup, "unknown emission must remain an owned obligation");
+            assert!(!evidence.topology_before_cleanup.iter().any(|e| e == "completed:exploration-child-dispatch"),
+                "original Retained must not finish without handing off or proving the installed lease terminal");
+            assert!(!evidence.root_before_cleanup.as_ref().is_some_and(|o| o.producers_settled()),
+                "root must remain unsettled before an exact proof");
+            assert!(!evidence.persistent_stop_before_cleanup);
+            if !inject_error {
+                assert!(matches!(evidence.bridge_result.as_ref(), Some(Ok(_))));
+                assert!(evidence.successful_cancels > 0);
+                assert_eq!(evidence.cancel_before_cleanup.as_ref().unwrap().phase, CancelPhase::Pending);
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn emitted_goal_error_must_keep_original_retained_owner() { run_case(true).await; }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn emitted_goal_success_keeps_retained_owner_until_exact_cleanup() { run_case(false).await; }
+    }
+
     #[derive(Clone, Default)]
     struct RecordingBackend {
         frames: Arc<Mutex<Vec<RawLcmFrame>>>,
@@ -23947,6 +24511,246 @@ mod retained_firstfix_proof_controls {
         assert_eq!(bridge.nav.cancel_snapshot().generation, 0);
         assert_eq!(telemetry_guard.nav_state.status, cached_status);
         drop(telemetry_guard);
+    }
+
+    // All new gap controls traverse the actual typed feedback classifier and pause
+    // immediately before its original retention call. No production gate is enlarged.
+    fn assert_original_update_fields(actual: &NavigationUpdate, original: &NavigationUpdate) {
+        assert_eq!(actual.state.status, original.state.status);
+        assert_eq!(actual.state.message, original.state.message);
+        assert_eq!(actual.state.goal_id, original.state.goal_id);
+        assert_eq!(actual.state.distance_remaining, original.state.distance_remaining);
+        assert_eq!(actual.state.timestamp_ns, original.state.timestamp_ns);
+        assert_eq!(actual.producer_runtime_generation, original.producer_runtime_generation);
+        // NavigationFeedback Debug includes every field, including path arrays and ZERO.
+        assert_eq!(format!("{:?}", actual.feedback), format!("{:?}", original.feedback));
+    }
+
+    #[tokio::test]
+    async fn late_goal_error_terminal_phase_gap_waits_for_original_receipt_without_publication() {
+        use crate::nav_runtime::{GoalLeaseOrigin, GoalPublicationPolicy, GoalSubmissionDiagnostic};
+        for status in ["SUCCEEDED", "FAILED"] {
+        let (bridge, _backend, lease) = start_goal(&format!("late-error-natural-proof-gap-{status}")).await;
+        let mut updates = bridge.nav_state_tx.subscribe();
+        let shared_before = bridge.state.read().await.nav_state.clone();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        bridge.nav.inject_terminal_before_retention_barrier(barrier.clone());
+        let mut feedback = Box::pin(apply_typed_navigation_feedback(
+            &bridge.nav, measured_natural_terminal(&lease, status)));
+        assert!(futures::poll!(feedback.as_mut()).is_pending());
+        barrier.wait().await;
+        assert_eq!(bridge.nav.inner().read().await.phase.as_str(), status);
+        assert_eq!(bridge.nav.active_goal_lease().await.as_ref(), Some(&lease));
+        assert!(bridge.nav.terminal_receipts().await.is_empty());
+        let pending = bridge.nav.project_late_goal_completion_for_test(&lease).await;
+        assert_eq!(pending.lease_origin, GoalLeaseOrigin::InstalledUnresolved);
+        assert_eq!(pending.diagnostic, Some(GoalSubmissionDiagnostic::TerminalProofPending));
+        assert_eq!(pending.publication, GoalPublicationPolicy::NoPublish);
+        assert_eq!(pending.state.status, "UNCONFIRMED");
+        let command = NavigationUpdate::publish_local_set_goal_outcome(
+            &pending, &bridge.nav, &bridge.state, &bridge.nav_state_tx).await;
+        assert!(!command.feedback.actuator_zeroed);
+        assert_eq!(command.feedback.cancel_generation, 0);
+        assert!(command.feedback.zero_ack_id.is_empty());
+        assert_eq!(command.state.timestamp_ns, 0);
+        assert!(matches!(updates.try_recv(), Err(broadcast::error::TryRecvError::Empty)));
+        assert_eq!(bridge.state.read().await.nav_state.status, shared_before.status);
+        assert_eq!(bridge.state.read().await.nav_state.timestamp_ns, shared_before.timestamp_ns);
+        assert_eq!(bridge.nav.inner().read().await.phase.as_str(), status);
+        let (receipt, _) = tokio::join!(feedback, barrier.wait());
+        let receipt = receipt.expect("original typed measured terminal");
+        let explore = crate::explore_runtime::ExploreRuntimeHandle::default_with_wavefront();
+        fanout_navigation_update(&bridge.state, &bridge.nav_state_tx, &explore, receipt.clone()).await;
+        assert_original_update_fields(&updates.recv().await.unwrap(), &receipt);
+        let resolved = bridge.nav.project_late_goal_completion_for_test(&lease).await;
+        assert!(resolved.resolved_receipt.is_some());
+        let crate::explore_runtime::ChildNavigationSubmitError::DispatchResolved(business) =
+            resolved_exploration_submission(&resolved).unwrap() else {
+                panic!("Bridge's actual outcome classifier must return the structured resolved carrier");
+            };
+        assert!(match (status, business.result) {
+            ("SUCCEEDED", crate::explore_runtime::ChildNavigationResult::Reached(_)) => true,
+            ("FAILED", crate::explore_runtime::ChildNavigationResult::Failed { .. }) => true,
+            _ => false,
+        });
+        assert!(!resolved.accepted(), "settlement is independent of accepted=false");
+        assert!(resolved.diagnostic.is_none());
+        let projection = NavigationUpdate::publish_local_set_goal_outcome(
+            &resolved, &bridge.nav, &bridge.state, &bridge.nav_state_tx).await;
+        assert_original_update_fields(&projection, &receipt);
+        assert_eq!(bridge.state.read().await.nav_state.status, status);
+        assert_eq!(bridge.state.read().await.nav_state.timestamp_ns, receipt.state.timestamp_ns);
+        assert!(matches!(updates.try_recv(), Err(broadcast::error::TryRecvError::Empty)));
+        }
+    }
+
+    #[tokio::test]
+    async fn late_goal_error_zeroed_tracker_gap_never_synthesizes_full_receipt() {
+        use crate::nav_runtime::{CancelPhase, GoalSubmissionDiagnostic, NavPhase};
+        use crate::explore_runtime::ChildNavigationCancelOutcome;
+        let (bridge, backend, lease) = start_goal("late-error-zeroed-proof-gap").await;
+        let goal = {
+            let frames = backend.frames.lock().unwrap();
+            let frame = frames.iter().find(|frame| frame.msg_type.fqn() == "nuwax_msgs.GoalEnvelope").unwrap();
+            schema::decode_goal_envelope_body(&frame.payload).unwrap()
+        };
+        let path = schema::PathEnvelope {
+            schema_version: schema::NAVIGATION_ENVELOPE_SCHEMA_VERSION,
+            session_id: lease.session_id.clone(), owner_kind: lease.owner_kind,
+            parent_request_id: lease.parent_request_id.clone(), goal_generation: lease.goal_generation as i64,
+            producer: goal.producer.clone(), producer_epoch: goal.producer_epoch,
+            producer_runtime_generation: lease.producer_runtime_generation as i64,
+            committed_map_session_id: goal.committed_map_session_id.clone(),
+            committed_map_session_generation: goal.committed_map_session_generation,
+            committed_map_revision: goal.committed_map_revision,
+            committed_map_boot_nonce: goal.committed_map_boot_nonce,
+            committed_map_commit_sequence: goal.committed_map_commit_sequence,
+            committed_map_source_timestamp_ns: goal.committed_map_source_timestamp_ns,
+            committed_map_frame_id: goal.committed_map_frame_id.clone(),
+            motion_guard_generation: goal.motion_guard_generation,
+            motion_guard_boot_nonce: goal.motion_guard_boot_nonce,
+            motion_stop_generation: goal.motion_stop_generation,
+            planner_runtime_generation: 17, path_revision: 3, source_timestamp_ns: 10,
+            path: schema::Path {
+                header: schema::Header { frame_id: "map".into(), ..Default::default() },
+                poses: vec![schema::PoseStamped {
+                    header: schema::Header { frame_id: "map".into(), ..Default::default() },
+                    pose: schema::Pose { position: [1.0, 0.0, 0.0],
+                        orientation_xyzw: [0.0, 0.0, 0.0, 1.0] },
+                }],
+            },
+            ..Default::default()
+        };
+        schema::validate_path_envelope(&path).unwrap();
+        let candidate = bridge.nav.observe_path_envelope(&path).await.unwrap();
+        let mut running = measured_natural_terminal(&candidate, "RUNNING");
+        running.feedback.zero_ack_id.clear();
+        running.feedback.zero_applied_monotonic_ns = 0;
+        apply_typed_navigation_feedback(&bridge.nav, running).await.unwrap();
+        let executing = bridge.nav.active_goal_lease().await.unwrap();
+        assert_eq!((executing.path_revision, executing.planner_runtime_generation), (3, 17));
+        let ChildNavigationCancelOutcome::Pending(ticket) = bridge.cancel_child_navigation(
+            &exploration_child_lease(&lease), false).await.unwrap() else {
+            panic!("original exact cancellation must start");
+        };
+        let mut updates = bridge.nav_state_tx.subscribe();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        bridge.nav.inject_terminal_before_retention_barrier(barrier.clone());
+        let mut modeled = measured_natural_terminal(&executing, "FAILED");
+        modeled.feedback.cancel_generation = ticket.cancel_generation;
+        let mut feedback = Box::pin(apply_typed_navigation_feedback(&bridge.nav, modeled));
+        assert!(futures::poll!(feedback.as_mut()).is_pending());
+        barrier.wait().await;
+        assert_eq!(bridge.nav.cancel_snapshot().phase, CancelPhase::Zeroed);
+        assert_eq!(bridge.nav.inner().read().await.phase, NavPhase::Cancelled);
+        assert!(bridge.nav.active_goal_lease().await.is_none());
+        assert!(bridge.nav.terminal_receipts().await.is_empty());
+        let cancel_before = bridge.nav.cancel_snapshot();
+        let pending = bridge.nav.project_late_goal_completion_for_test(&lease).await;
+        assert_eq!(pending.state.status, "UNCONFIRMED");
+        assert_eq!(pending.lease.as_ref(), Some(&executing), "proof-pending retains tracker execution identity, not attempted path zero");
+        assert_eq!(pending.diagnostic, Some(GoalSubmissionDiagnostic::TerminalProofPending));
+        let command = NavigationUpdate::publish_local_set_goal_outcome(
+            &pending, &bridge.nav, &bridge.state, &bridge.nav_state_tx).await;
+        assert_eq!((command.feedback.path_revision, command.feedback.planner_runtime_generation), (3, 17));
+        assert!(!command.feedback.actuator_zeroed);
+        assert!(command.feedback.zero_ack_id.is_empty());
+        assert_eq!(command.feedback.cancel_generation, 0);
+        assert_eq!(bridge.nav.cancel_snapshot(), cancel_before);
+        assert!(matches!(updates.try_recv(), Err(broadcast::error::TryRecvError::Empty)));
+        let (receipt, _) = tokio::join!(feedback, barrier.wait());
+        let receipt = receipt.unwrap();
+        assert_eq!(receipt.state.status, "CANCELLED");
+        assert_eq!(receipt.feedback.cancel_generation, ticket.cancel_generation);
+        let resolved = bridge.nav.project_late_goal_completion_for_test(&lease).await;
+        assert!(resolved.resolved_receipt.is_some());
+        let crate::explore_runtime::ChildNavigationSubmitError::DispatchResolved(business) =
+            resolved_exploration_submission(&resolved).unwrap() else {
+                panic!("Bridge's actual outcome classifier must return the structured resolved carrier");
+            };
+        let crate::explore_runtime::ChildNavigationResult::Cancelled(proof) = business.result else {
+            panic!("resolved ZERO must remain cancellation rather than Reached");
+        };
+        assert_eq!(proof.cancel_generation, receipt.feedback.cancel_generation);
+        assert_eq!(proof.zero_ack_id, receipt.feedback.zero_ack_id);
+        let command = NavigationUpdate::publish_local_set_goal_outcome(
+            &resolved, &bridge.nav, &bridge.state, &bridge.nav_state_tx).await;
+        assert_original_update_fields(&command, &receipt);
+        assert!(matches!(updates.try_recv(), Err(broadcast::error::TryRecvError::Empty)));
+        assert_eq!(backend.cancel_count(), 1, "projection must not start another Cancel");
+    }
+
+    #[tokio::test]
+    async fn late_goal_error_real_running_remains_accepted_but_unary_only_and_without_source_time() {
+        use crate::nav_runtime::{GoalLeaseOrigin, GoalSubmissionDiagnostic, NavPhase};
+        let (bridge, backend, lease) = start_goal("late-error-running-no-publish").await;
+        let mut actual = measured_natural_terminal(&lease, "RUNNING");
+        actual.state.message = "real source progress wins".into();
+        actual.state.timestamp_ns = 7;
+        actual.feedback.zero_ack_id.clear();
+        actual.feedback.zero_applied_monotonic_ns = 0;
+        let actual = apply_typed_navigation_feedback(&bridge.nav, actual).await.unwrap();
+        let explore = crate::explore_runtime::ExploreRuntimeHandle::default_with_wavefront();
+        fanout_navigation_update(&bridge.state, &bridge.nav_state_tx, &explore, actual.clone()).await;
+        let mut updates = bridge.nav_state_tx.subscribe();
+        let outcome = bridge.nav.project_late_goal_completion_for_test(&lease).await;
+        assert_eq!(outcome.lease_origin, GoalLeaseOrigin::InstalledUnresolved);
+        assert!(outcome.accepted());
+        assert_eq!(outcome.state.status, "RUNNING");
+        assert_eq!(outcome.diagnostic, Some(GoalSubmissionDiagnostic::PublishUnconfirmed));
+        let command = NavigationUpdate::publish_local_set_goal_outcome(
+            &outcome, &bridge.nav, &bridge.state, &bridge.nav_state_tx).await;
+        assert_eq!(command.state.timestamp_ns, 0);
+        assert_eq!(command.feedback.reason_code, "GOAL_PUBLISH_UNCONFIRMED");
+        assert_eq!(bridge.state.read().await.nav_state.timestamp_ns, 7);
+        assert_eq!(bridge.nav.inner().read().await.phase, NavPhase::Running);
+        assert!(matches!(updates.try_recv(), Err(broadcast::error::TryRecvError::Empty)));
+        assert_eq!(backend.cancel_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn late_goal_error_old_path_nonretirement_receipt_cannot_resolve_empty_or_foreign_slot() {
+        use crate::nav_runtime::{GoalLeaseOrigin, GoalSubmissionDiagnostic};
+        for foreign in [false, true] {
+            let (bridge, backend, old) = start_goal(if foreign { "old-path-foreign-slot" } else { "old-path-empty-slot" }).await;
+            let mut newer_path = bridge.nav.inner().read().await.goal.clone().unwrap();
+            newer_path.lease.path_revision += 1;
+            newer_path.lease.planner_runtime_generation += 17;
+            bridge.nav.replace_active_goal_for_test(newer_path.clone()).await;
+            // Explicit negative API fixture: a cached complete OLD-path body did not
+            // retire current execution. The original provenance bit remains false.
+            let mut stale = measured_natural_terminal(&old, "FAILED");
+            stale.feedback.actuator_zeroed = true;
+            bridge.nav.retain_terminal_receipt(&stale).await;
+            assert!(bridge.nav.naturally_retired_terminal_for(&crate::nav_runtime::CancelGoalInput {
+                goal_id: old.session_id.clone(), owner_kind: old.owner_kind,
+                parent_request_id: old.parent_request_id.clone(), goal_generation: old.goal_generation,
+                producer_runtime_generation: old.producer_runtime_generation,
+            }).await.is_none());
+            if foreign {
+                newer_path.id = "foreign-owner".into();
+                newer_path.lease.session_id = newer_path.id.clone();
+                newer_path.lease.goal_generation += 1;
+                bridge.nav.replace_active_goal_for_test(newer_path).await;
+            } else {
+                bridge.nav.observe_stack_state(NavState { status: "SUCCEEDED".into(),
+                    goal_id: old.session_id.clone(), ..Default::default() }).await;
+            }
+            let before = bridge.nav.active_goal_lease().await;
+            let cancel_before = bridge.nav.cancel_snapshot();
+            let mut updates = bridge.nav_state_tx.subscribe();
+            let outcome = bridge.nav.project_late_goal_completion_for_test(&old).await;
+            assert!(outcome.resolved_receipt.is_none());
+            assert_eq!(outcome.lease_origin, GoalLeaseOrigin::InstalledUnresolved);
+            assert_eq!(outcome.lease.as_ref(), Some(&old));
+            assert_eq!(outcome.diagnostic, Some(GoalSubmissionDiagnostic::PublishUnconfirmed));
+            NavigationUpdate::publish_local_set_goal_outcome(
+                &outcome, &bridge.nav, &bridge.state, &bridge.nav_state_tx).await;
+            assert_eq!(bridge.nav.active_goal_lease().await, before);
+            assert_eq!(bridge.nav.cancel_snapshot(), cancel_before);
+            assert_eq!(backend.cancel_count(), 0);
+            assert!(matches!(updates.try_recv(), Err(broadcast::error::TryRecvError::Empty)));
+        }
     }
 
     fn measured_natural_terminal(

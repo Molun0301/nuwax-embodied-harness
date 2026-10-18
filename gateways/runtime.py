@@ -7162,7 +7162,7 @@ class GatewayRuntime:
         query_text = self._require_str(arguments, "query_text")
         query_request_id = str(arguments.get("query_request_id") or "").strip() or self._build_runtime_request_id("place")
         admission = self._require_motion_admission(arguments, "navigate_to_place")
-        return self._run_with_motion_admission(
+        result = self._run_with_motion_admission(
             admission,
             lambda: self.map_workspace_service.submit_mapping_cloud_goal(
                 query_request_id=query_request_id,
@@ -7174,6 +7174,34 @@ class GatewayRuntime:
                 },
             ),
         )
+
+        # The outer query/admission result is distinct from navigation completion.
+        # Keep the original wire receipt intact; the existing MCP/Agent wrappers
+        # require an explicit error payload, not merely an unfamiliar status string.
+        status = str(result.get("status") or "").upper()
+        codes = {
+            "ADMISSION_UNCONFIRMED": "navigation_dispatch_unconfirmed",
+            "BUSY": "navigation_busy",
+            "ADMISSION_REJECTED": "navigation_goal_rejected",
+            "FAILED": "navigation_failed",
+            "CANCELLED": "navigation_cancelled",
+        }
+        if status in codes:
+            navigation = result.get("navigation")
+            navigation = navigation if isinstance(navigation, dict) else {}
+            details = {
+                "query_request_id": result.get("query_request_id") or query_request_id,
+                "goal_id": navigation.get("goal_id"),
+                "navigation": result.get("navigation"),
+                "reason_code": result.get("reason_code") or navigation.get("reason_code"),
+                "ownership_retained": result.get("ownership_retained", navigation.get("ownership_retained", False)),
+                "authority_current": result.get("authority_current", navigation.get("authority_current", False)),
+                "retryable": False,
+            }
+            error = GatewayError(result.get("message") or "地点导航请求未完成。",
+                error_code=codes[status], http_status=409, details=details)
+            return {**result, "ok": False, "retryable": False, "error_payload": {**error.to_payload(), "retryable": False}}
+        return result
 
     # ------------------------------------------------------------------
     # V2 新增 handlers（navigation-and-exploration-boundary §6.2）
@@ -7190,14 +7218,37 @@ class GatewayRuntime:
 
         del request_context
         request_id = str(arguments.get("request_id") or "").strip() or None
+        # Exact cancel checks cached control authority before any display aggregation.
+        # The service/provider still revalidate the exact lease at cancellation.
+        navigation_context = (
+            self.navigation_service.get_navigation_control_context()
+            if request_id is not None
+            else self.navigation_service.refresh_navigation()
+        )
+        state = navigation_context.navigation_state
+        metadata = dict(state.metadata or {})
+        if metadata.get("ownership_retained") is True and metadata.get("authority_current") is False:
+            raise GatewayError(
+                "原导航目标尚未结算，当前连接没有该目标的取消资格。",
+                error_code="navigation_control_authority_unavailable",
+                http_status=409,
+                details={
+                    "goal_id": state.current_goal_id,
+                    "navigation": to_jsonable(state),
+                    "reason_code": metadata.get("reason_code"),
+                    "ownership_retained": True,
+                    "authority_current": False,
+                    "historical_navigation_identity": metadata.get("historical_navigation_identity"),
+                    "retryable": False,
+                },
+            )
         cancellation_requested = True
         if request_id is None:
-            navigation_context = self.navigation_service.refresh_navigation()
-            state = navigation_context.navigation_state
             cancellation_requested = state.status in {
                 NavigationStatus.ACCEPTED,
                 NavigationStatus.PLANNING,
                 NavigationStatus.RUNNING,
+                NavigationStatus.UNCONFIRMED,
             }
             request_id = state.current_goal_id
             if cancellation_requested and not request_id:
@@ -10603,7 +10654,9 @@ class GatewayRuntime:
                 raise
             except GatewayError as exc:
                 settle_navigation_error(goal.goal_id)
-                if exc.error_code == "navigation_timeout":
+                if exc.error_code in {"navigation_timeout", "navigation_dispatch_unconfirmed"}:
+                    # The exact safety barrier above settles this attempt. A typed
+                    # dispatch uncertainty never spends unreachable-candidate budget.
                     raise
                 rejected_record_ids.add(candidate_record_id)
                 for item in candidate_diagnostics:
@@ -10688,7 +10741,9 @@ class GatewayRuntime:
                 raise
             except GatewayError as exc:
                 settle_navigation_error(semantic_goal.goal_id)
-                if exc.error_code == "navigation_timeout":
+                if exc.error_code in {"navigation_timeout", "navigation_dispatch_unconfirmed"}:
+                    # The exact safety barrier above settles this attempt. A typed
+                    # dispatch uncertainty never spends unreachable-candidate budget.
                     raise
                 last_error = exc
             except Exception:
@@ -12416,6 +12471,8 @@ class GatewayRuntime:
                     except GatewayError as error:
                         if error.error_code == "navigation_goal_rejected":
                             goal_dispatched = False
+                        # navigation_dispatch_unconfirmed retains this attempt's
+                        # responsibility and must reach the original finally barrier.
                         raise
                     generation_snapshot = self._capture_task_generation_snapshot(
                         navigation_context=last_context,
@@ -13041,6 +13098,7 @@ class GatewayRuntime:
                 NavigationStatus.ACCEPTED.value,
                 NavigationStatus.PLANNING.value,
                 NavigationStatus.RUNNING.value,
+                NavigationStatus.UNCONFIRMED.value,
             }:
                 raise self._navigation_parking_error(
                     goal_id=goal_id,

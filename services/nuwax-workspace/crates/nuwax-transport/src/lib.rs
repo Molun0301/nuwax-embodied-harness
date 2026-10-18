@@ -47,6 +47,11 @@ pub use real_backend::OwnedLcmSubscription;
 /// 传输错误
 #[derive(Debug, Error)]
 pub enum TransportError {
+    /// A source branch proved this single command was not dispatched.
+    ///
+    /// Do not construct this from an opaque backend error or an error message.
+    #[error("not dispatched: {0}")]
+    NotDispatched(#[source] Box<TransportError>),
     /// LCM 后端错误
     #[error("lcm backend error: {0}")]
     LcmBackend(String),
@@ -68,6 +73,14 @@ pub enum TransportError {
     /// 通道已关闭
     #[error("channel closed")]
     ChannelClosed,
+}
+
+impl TransportError {
+    /// Whether the original source proved that this command was not dispatched.
+    /// All legacy error variants deliberately remain effect-unconfirmed.
+    pub fn is_definitely_not_dispatched(&self) -> bool {
+        matches!(self, Self::NotDispatched(_))
+    }
 }
 
 /// 传输结果
@@ -275,6 +288,22 @@ mod tests {
         fn name(&self) -> &str {
             "contextless-test"
         }
+    }
+
+    #[test]
+    fn opaque_backend_error_does_not_prove_no_dispatch() {
+        let error = TransportError::LcmBackend("owner thread down; not sent".to_owned());
+        assert!(!error.is_definitely_not_dispatched(), "text cannot establish a source fact");
+        assert!(!TransportError::ChannelClosed.is_definitely_not_dispatched());
+    }
+
+    #[test]
+    fn explicit_not_dispatched_preserves_original_cause() {
+        let error = TransportError::NotDispatched(Box::new(TransportError::Topic("binding".into())));
+        assert!(error.is_definitely_not_dispatched());
+        assert!(std::error::Error::source(&error).is_some());
+        assert!(matches!(error, TransportError::NotDispatched(cause)
+            if matches!(*cause, TransportError::Topic(_))));
     }
 
     #[test]

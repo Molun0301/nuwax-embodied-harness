@@ -81,6 +81,7 @@ _RETRYABLE_ERROR_CODES = frozenset(
 )
 _NON_RETRYABLE_ERROR_CODES = frozenset(
     {
+        "navigation_control_authority_unavailable",
         "authentication_required",
         "invalid_token",
         "access_denied",

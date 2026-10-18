@@ -43,7 +43,7 @@ use crate::mapping_adapter::{
 };
 use crate::nav_runtime::{
     cancel as nav_cancel, compute_readiness, ensure_goal_id, readiness_to_reason, set_goal,
-    CancelOutcome, MotionAdmissionProof, SetGoalInput, SetGoalOutcome,
+    CancelOutcome, MotionAdmissionProof, SetGoalInput,
 };
 use crate::occupancy_shm::{OccupancyGridShmWriter, OccupancySessionFenceTransaction};
 use crate::proto::geometry_runtime_server::GeometryRuntime;
@@ -7112,16 +7112,10 @@ impl GeometryRuntime for GeometryRuntimeService {
                 exploration.status, exploration.request_id, exploration.child_task_id
             )));
         }
-        let SetGoalOutcome {
-            state: nav, lease, ..
-        } = set_goal(&self.bridge, &self.bridge.nav, input).await;
-        // 同步到 SharedState.nav_state,供 SubscribeNavigationState 推送。
-        {
-            let mut s = self.bridge.state.write().await;
-            s.nav_state = nav.clone();
-        }
-        let update = NavigationUpdate::from_local(nav, &self.bridge.nav, lease).await;
-        let _ = self.bridge.nav_state_tx.send(update.clone());
+        let outcome = set_goal(&self.bridge, &self.bridge.nav, input).await;
+        let update = NavigationUpdate::publish_local_set_goal_outcome(
+            &outcome, &self.bridge.nav, &self.bridge.state, &self.bridge.nav_state_tx,
+        ).await;
         Ok(Response::new(nav_state_to_proto(update)))
     }
 
@@ -7447,18 +7441,17 @@ impl GeometryRuntime for GeometryRuntimeService {
                     crate::nav_runtime::GoalProducerEpochAuthority::MappingCloud,
                 )
                 .await;
-                let update = NavigationUpdate::from_local(
-                    outcome.state.clone(),
-                    &self.bridge.nav,
-                    outcome.lease,
-                )
-                .await;
+                let update = NavigationUpdate::from_set_goal_outcome(&outcome, &self.bridge.nav).await;
                 let navigation = nav_state_to_proto(update);
-                let status = if matches!(
-                    navigation.status.as_str(),
-                    "ACCEPTED" | "PLANNING" | "RUNNING"
-                ) {
+                // A resolved receipt is evaluated independently of accepted=false.
+                let status = if outcome.resolved_receipt.is_some() {
+                    navigation.status.as_str()
+                } else if outcome.accepted() {
                     "SUCCEEDED"
+                } else if matches!(outcome.lease_origin,
+                    crate::nav_runtime::GoalLeaseOrigin::InstalledUnresolved
+                        | crate::nav_runtime::GoalLeaseOrigin::ExistingUnresolved) {
+                    "ADMISSION_UNCONFIRMED"
                 } else {
                     "ADMISSION_REJECTED"
                 };

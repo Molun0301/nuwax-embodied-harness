@@ -15,6 +15,7 @@ class NavigationStatus(StrEnum):
     """导航状态。"""
 
     IDLE = "idle"
+    UNCONFIRMED = "unconfirmed"
     ACCEPTED = "accepted"
     PLANNING = "planning"
     RUNNING = "running"

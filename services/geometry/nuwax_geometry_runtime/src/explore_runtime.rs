@@ -300,7 +300,7 @@ pub struct FrontierSnapshot {
     pub revision: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ChildNavigationRequest {
     pub parent_request_id: String,
     pub request_id: String,
@@ -422,9 +422,56 @@ pub struct ChildNavigationTicket {
     pub lease: ChildNavigationLease,
 }
 
+/// Trusted installed-unresolved responsibility. Only the Nav-backed Bridge constructs
+/// this carrier; external sinks cannot upgrade an arbitrary Some lease into ownership.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildNavigationUnresolved {
+    pub(crate) lease: ChildNavigationLease,
+    pub(crate) reason: String,
+}
+
+/// An already-proved result for THIS installed command. Bridge constructs it only
+/// from Nav's retained natural-retirement or exact Cancel ZEROED selection, not
+/// from an arbitrary status string. It is stack data, never another owner/cache.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildNavigationResolved {
+    pub(crate) result: ChildNavigationResult,
+}
+
+impl ChildNavigationResolved {
+    fn lease(&self) -> &ChildNavigationLease {
+        match &self.result {
+            ChildNavigationResult::Reached(proof) | ChildNavigationResult::Failed { proof, .. }
+                | ChildNavigationResult::CancelFailed { proof, .. } => &proof.lease,
+            ChildNavigationResult::Cancelled(proof) => &proof.lease,
+        }
+    }
+
+    fn reason(&self) -> &str {
+        match &self.result {
+            ChildNavigationResult::Reached(_) => "child navigation already reached",
+            ChildNavigationResult::Failed { reason, .. } | ChildNavigationResult::CancelFailed { reason, .. } => reason,
+            ChildNavigationResult::Cancelled(_) => "child navigation already cancelled with exact ZEROED proof",
+        }
+    }
+}
+
+fn child_lease_matches_request(lease: &ChildNavigationLease, request: &ChildNavigationRequest) -> bool {
+    lease.session_id == request.request_id
+        && lease.parent_request_id == request.parent_request_id
+        && lease.owner_kind == schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD
+        && (request.intent.goal_generation <= 0
+            || u64::try_from(request.intent.goal_generation).ok() == Some(lease.goal_generation))
+        && lease.goal_generation > 0 && lease.producer_runtime_generation > 0
+}
+
 /// Child navigation submission failure; the variant carries any admission-stage proof.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChildNavigationSubmitError {
+    /// This invocation installed an exact owner and must settle it before business feedback.
+    DispatchUnresolved(ChildNavigationUnresolved),
+    /// A terminal receipt already settled the original owner; independent of accepted.
+    DispatchResolved(ChildNavigationResolved),
     /// 输入修订前进，释放候选等待新观察，不记为目标失败。
     SourceChanged(String),
     /// Navigation is temporarily unable to accept the goal; retry without feedback.
@@ -441,6 +488,8 @@ pub enum ChildNavigationSubmitError {
 impl ChildNavigationSubmitError {
     fn reason(&self) -> &str {
         match self {
+            Self::DispatchUnresolved(unresolved) => &unresolved.reason,
+            Self::DispatchResolved(resolved) => resolved.reason(),
             Self::RetryableReadiness(reason)
             | Self::SourceChanged(reason)
             | Self::Rejected(reason)
@@ -4321,52 +4370,80 @@ impl ExploreRuntimeHandle {
         sink: Arc<dyn ExploreNavigationSink>,
         owner: Option<&dyn ChildNavigationDispatchOwner>,
     ) -> ExploreRuntimeSnapshot {
-        let proposed_request_id = request.request_id.clone();
-        let expected_parent_request_id = request.parent_request_id.clone();
         let frontier_goal_id = request.frontier_goal_id.clone();
-        let ticket = match sink.submit(request.clone()).await {
-            Ok(ticket) => ticket,
+        let (ticket, mut resolved) = match sink.submit(request.clone()).await {
+            Ok(ticket) => (ticket, None),
+            Err(ChildNavigationSubmitError::DispatchResolved(resolved)) => {
+                if !child_lease_matches_request(resolved.lease(), &request) {
+                    return self.record_dispatch_failure(generation, request,
+                        ChildNavigationSubmitError::Rejected("navigation sink returned a mismatched resolved child lease".into())).await;
+                }
+                match &resolved.result {
+                    ChildNavigationResult::Reached(_) | ChildNavigationResult::Failed { .. } => {}
+                    ChildNavigationResult::Cancelled(_) => {
+                        return self.complete_resolved_dispatch_cancellation(generation, request, resolved, owner).await;
+                    }
+                    ChildNavigationResult::CancelFailed { .. } => {
+                        panic!("resolved dispatch cannot contain an unproved cancellation failure");
+                    }
+                }
+                (ChildNavigationTicket { lease: resolved.lease().clone() }, Some(resolved))
+            }
+            Err(ChildNavigationSubmitError::DispatchUnresolved(unresolved)) => {
+                if !child_lease_matches_request(&unresolved.lease, &request) {
+                    return self.record_dispatch_failure(generation, request,
+                        ChildNavigationSubmitError::Rejected(
+                            "navigation sink returned a mismatched unresolved child lease".into())).await;
+                }
+                {
+                    let guard = self.inner.lock().await;
+                    // Register in the EXISTING orphan registry, inside this ORIGINAL
+                    // retained continuation; root close does not revoke responsibility.
+                    self.orphan_cancellations.register(unresolved.lease.clone());
+                    if generation == guard.generation && guard.logical_active
+                        && guard.pending_child_dispatch.as_ref() == Some(&request) {
+                        self.store_snapshot(guard.snapshot(STATUS_STOPPING,
+                            format!("child goal dispatch unconfirmed; awaiting exact stop proof: {}", unresolved.reason)));
+                    }
+                }
+                let owner = owner.expect(
+                    "installed-unresolved child requires the original retained dispatch owner; inline sink contract violation");
+                // Keeps original tick permit and full frozen request throughout.
+                owner.settle_retained_dispatch_orphan(unresolved.lease.clone()).await;
+                return self.record_dispatch_failure(generation, request,
+                    ChildNavigationSubmitError::DispatchUnresolved(unresolved)).await;
+            }
             Err(error) => {
-                return self
-                    .record_dispatch_failure(generation, request, error)
-                    .await;
+                return self.record_dispatch_failure(generation, request, error).await;
             }
         };
-        if ticket.lease.session_id != proposed_request_id
-            || ticket.lease.parent_request_id != expected_parent_request_id
-            || ticket.lease.owner_kind != schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD
-            || (request.intent.goal_generation > 0
-                && u64::try_from(request.intent.goal_generation).ok()
-                    != Some(ticket.lease.goal_generation))
-            || ticket.lease.goal_generation == 0
-            || ticket.lease.producer_runtime_generation == 0
-        {
-            return self
-                .record_dispatch_failure(
-                    generation,
-                    request,
-                    ChildNavigationSubmitError::Rejected(
-                        "navigation sink returned a mismatched child goal lease".to_string(),
-                    ),
-                )
-                .await;
+        if !child_lease_matches_request(&ticket.lease, &request) {
+            return self.record_dispatch_failure(generation, request,
+                ChildNavigationSubmitError::Rejected(
+                    "navigation sink returned a mismatched child goal lease".to_string())).await;
         }
 
         let mut guard = self.inner.lock().await;
         let mut attached = false;
         {
             let mut decide = |admission_open: bool| {
-                let frozen_request_matches = guard.pending_child_dispatch.as_ref().is_some_and(|pending| {
-                    pending.request_id == request.request_id
-                        && pending.parent_request_id == request.parent_request_id
-                        && pending.intent == request.intent
-                });
+                let frozen_request_matches = if resolved.is_some() {
+                    guard.pending_child_dispatch.as_ref() == Some(&request)
+                } else {
+                    guard.pending_child_dispatch.as_ref().is_some_and(|pending| {
+                        pending.request_id == request.request_id
+                            && pending.parent_request_id == request.parent_request_id
+                            && pending.intent == request.intent
+                    })
+                };
                 if !admission_open || generation != guard.generation
                     || !guard.logical_active || !frozen_request_matches
                 {
                     // Synchronous visibility before releasing either state lock.
                     // The original tick permit excludes all batch reconcilers.
-                    self.orphan_cancellations.register(ticket.lease.clone());
+                    if resolved.is_none() {
+                        self.orphan_cancellations.register(ticket.lease.clone());
+                    }
                     return;
                 }
                 guard.pending_child_dispatch = None;
@@ -4393,8 +4470,26 @@ impl ExploreRuntimeHandle {
         }
         drop(guard);
         if attached {
+            if let Some(resolved) = resolved.take() {
+                // Consume the proof already returned by THIS command. Do not read
+                // the bounded Nav receipt cache again or infer success from accepted.
+                let result = resolved.result;
+                match self.report_navigation_result(&ticket.lease.session_id, result.clone()).await {
+                    Ok(snapshot) => return snapshot,
+                    Err(error) => {
+                        tracing::debug!(%error, "resolved child result lost business admission after attachment");
+                        // Stop may win between attach and feedback. The original
+                        // natural proof completes only its exact pending logical action.
+                        if let ChildNavigationResult::Reached(proof) | ChildNavigationResult::Failed { proof, .. } = result {
+                            return self.finish_already_terminal_child(&ticket.lease, proof).await;
+                        }
+                        return self.snapshot();
+                    }
+                }
+            }
             return self.reconcile_child_terminal(&ticket.lease).await;
         }
+        if resolved.is_some() { return self.snapshot(); }
         if let Some(owner) = owner {
             // The task that published also owns the exact orphan continuation.
             // No new root admission is needed, even after root close wins.
@@ -4403,6 +4498,57 @@ impl ExploreRuntimeHandle {
             self.reconcile_orphan_cancellation(&sink, ticket.lease).await;
         }
         self.snapshot()
+    }
+
+    async fn complete_resolved_dispatch_cancellation(
+        &self,
+        generation: u64,
+        request: ChildNavigationRequest,
+        resolved: ChildNavigationResolved,
+        owner: Option<&dyn ChildNavigationDispatchOwner>,
+    ) -> ExploreRuntimeSnapshot {
+        let ChildNavigationResult::Cancelled(proof) = &resolved.result else {
+            unreachable!("only proved cancellation uses this branch");
+        };
+        assert!(proof.cancel_generation > 0 && !proof.zero_ack_id.trim().is_empty()
+            && proof.zero_applied_monotonic_ns > 0, "resolved cancellation requires complete original ZERO proof");
+        let mut guard = self.inner.lock().await;
+        let mut admission = None;
+        {
+            let mut decide = |admission_open: bool| {
+                if !admission_open || generation != guard.generation || !guard.logical_active
+                    || guard.pending_child_dispatch.as_ref() != Some(&request) { return; }
+                guard.pending_child_dispatch = None;
+                guard.no_frontier_since = None;
+                // Reuse original Cancelled feedback inside the SAME original root
+                // admission callback. No arrival, unreachable result or new Cancel.
+                let feedback = ExplorationGoalFeedback::Cancelled;
+                admission = Some(self.admit_feedback_locked(&mut guard,
+                    FeedbackIdentity::Internal { generation, lineage: request.request_id.clone(),
+                        goal: request.frontier_goal_id.clone(), feedback: feedback.clone() },
+                    request.frontier_goal_id.clone(), feedback, None, false));
+            };
+            if let Some(owner) = owner { owner.with_dispatch_admission(&mut decide); }
+            else { decide(true); }
+        }
+        let ticket = match admission {
+            None => return self.snapshot(),
+            Some(Ok(ticket)) => ticket,
+            Some(Err(error)) => {
+                drop(guard);
+                return self.finish_session(None, ExplorationStopReason::ConsecutiveFailuresExceeded, error).await;
+            }
+        };
+        drop(guard);
+        let acknowledged = self.await_feedback(&ticket).await;
+        let guard = self.inner.lock().await;
+        if generation != guard.generation || !guard.logical_active { return self.snapshot(); }
+        if let Err(error) = acknowledged {
+            drop(guard);
+            return self.finish_session(None, ExplorationStopReason::ConsecutiveFailuresExceeded, error).await;
+        }
+        self.store_snapshot(guard.snapshot(STATUS_PENDING,
+            "child navigation cancelled before attachment; original exact ZERO proof consumed"))
     }
 
     async fn reconcile_child_terminal(&self, lease: &ChildNavigationLease) -> ExploreRuntimeSnapshot {
@@ -4431,6 +4577,12 @@ impl ExploreRuntimeHandle {
     ) -> ExploreRuntimeSnapshot {
         let mut guard = self.inner.lock().await;
         if generation != guard.generation || !guard.logical_active {
+            return self.snapshot();
+        }
+        // Physical settlement happened before this call for installed-unresolved.
+        // Stop/new generation/full-request replacement may discard only business feedback.
+        if matches!(&error, ChildNavigationSubmitError::DispatchUnresolved(_))
+            && guard.pending_child_dispatch.as_ref() != Some(&request) {
             return self.snapshot();
         }
         let reason = error.reason().to_string();
@@ -10500,6 +10652,133 @@ async fn scheme_a_nan_payload_preserves_same_id_exactly_once_consumption() {
 #[tokio::test]
 async fn scheme_a_signed_zero_payload_preserves_same_id_exactly_once_consumption() {
     scheme_a_check_float_payload_is_not_identity(false).await;
+}
+
+// Post-settlement business-fence control only. The original tick supplies its real
+// frozen request. Direct delivery below does NOT claim a physical terminal proof;
+// Bridge/root integration separately tests the strict settlement continuation.
+#[tokio::test]
+async fn unresolved_dispatch_feedback_requires_original_generation_and_full_frozen_request() {
+    let mut case = SchemeARaceHarness::new("unresolved-full-request-fence");
+    let observed = async {
+        case.prepare().await?;
+        let (generation, request) = case.blocked_rejection().await?;
+        let lease = ChildNavigationLease {
+            session_id: request.request_id.clone(), owner_kind: schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD,
+            parent_request_id: request.parent_request_id.clone(), goal_generation: 1,
+            producer_runtime_generation: 11,
+        };
+        let before = scheme_a_race_state(&case.handle).await;
+        let mut observations = Vec::new();
+        for mutation in 0..7 {
+            let mut stale = request.clone();
+            let received_generation = if mutation == 0 { generation + 1 } else { generation };
+            match mutation {
+                0 => {},
+                1 => stale.expected_map_name.push_str("-other"),
+                2 => stale.frontier_goal_id.push_str("-other"),
+                3 => stale.goal.target.pose.position.x += 1.0,
+                4 => stale.intent.goal.pose.position[0] += 1.0,
+                5 => stale.motion_admission.motion_stop_generation += 1,
+                _ => Arc::make_mut(&mut stale.boundary_owner).max_navigation_retries += 1,
+            }
+            let returned = case.handle.record_dispatch_failure(received_generation, stale,
+                ChildNavigationSubmitError::DispatchUnresolved(ChildNavigationUnresolved {
+                    lease: lease.clone(), reason: "already-settled submission business result".into(),
+                })).await;
+            observations.push((mutation, returned, scheme_a_race_state(&case.handle).await));
+        }
+        let mut identity_checks = Vec::new();
+        identity_checks.push(child_lease_matches_request(&lease, &request));
+        for mutation in 0..5 {
+            let mut wrong = lease.clone();
+            match mutation {
+                0 => wrong.session_id.push_str("-foreign"),
+                1 => wrong.parent_request_id.push_str("-foreign"),
+                2 => wrong.owner_kind = schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV,
+                3 => wrong.goal_generation = 0,
+                _ => wrong.producer_runtime_generation = 0,
+            }
+            identity_checks.push(child_lease_matches_request(&wrong, &request));
+        }
+        Ok::<_, String>((before, observations, identity_checks))
+    }.await;
+    let cleanup = case.cleanup().await;
+    assert!(cleanup.is_ok(), "{cleanup:#?}; observations={observed:#?}");
+    let (before, observations, identity_checks) = observed.expect("scenario failed");
+    for (mutation, returned, after) in observations {
+        assert_eq!(after, before, "stale settled failure mutated business state: case {mutation}");
+        assert_eq!(returned.revision, before.snapshot_revision);
+    }
+    assert_eq!(identity_checks, vec![true, false, false, false, false, false]);
+}
+
+// Consumer contract only: original start/tick freezes each request, then the
+// mock sink returns the current command's typed terminal carrier. The companion
+// lcm_runtime controls establish each carrier from the actual typed source path.
+#[tokio::test]
+async fn resolved_dispatch_consumes_original_reached_failed_and_cancelled_without_cache_reread() {
+    for (parent, terminal) in [
+        ("resolved-dispatch-reached", "SUCCEEDED"),
+        ("resolved-dispatch-failed", "FAILED"),
+        ("resolved-dispatch-cancelled", "CANCELLED"),
+    ] {
+        let mut case = SchemeARaceHarness::new(parent);
+        let observed = async {
+            case.refresh().await?;
+            let started = scheme_a_race_wait("start original resolved consumer",
+                case.handle.start_with_config(parent, scheme_a_race_config())).await?;
+            if started.status != STATUS_ACCEPTED { return Err(format!("start rejected: {started:#?}")); }
+            let (_generation, request) = case.blocked_rejection().await?;
+            let lease = ChildNavigationLease {
+                session_id: request.request_id.clone(), parent_request_id: request.parent_request_id.clone(),
+                owner_kind: schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD,
+                goal_generation: 1, producer_runtime_generation: 11,
+            };
+            let result = match terminal {
+                "SUCCEEDED" => ChildNavigationResult::Reached(terminal_proof(&lease)),
+                "FAILED" => ChildNavigationResult::Failed { proof: terminal_proof(&lease),
+                    reason: "original measured terminal failure".into() },
+                "CANCELLED" => ChildNavigationResult::Cancelled(zero_proof(&lease, 7)),
+                _ => unreachable!(),
+            };
+            {
+                let mut queued = case.sink.submit_errors.lock().unwrap();
+                queued.clear();
+                queued.push_back(ChildNavigationSubmitError::DispatchResolved(ChildNavigationResolved { result }));
+            }
+            let before = scheme_a_race_state(&case.handle).await;
+            let returned = case.release_tick().await?;
+            let after = scheme_a_race_state(&case.handle).await;
+            let source = receipt_test_source_history(&case.handle).await;
+            Ok::<_, String>((request, before, returned, after, source))
+        }.await;
+        let cleanup = case.cleanup().await;
+        assert!(cleanup.is_ok(), "{cleanup:#?}; observations={observed:#?}");
+        let (request, before, returned, after, source) = observed.expect("resolved consumer scenario failed");
+        assert_eq!(after.reached_goals, before.reached_goals + u32::from(terminal == "SUCCEEDED"));
+        assert_eq!(after.compute_history, before.compute_history + 1, "one original source feedback");
+        assert!(after.pending.is_none());
+        assert!(after.active_lease.is_none());
+        assert!(!after.has_pending_cancellation);
+        assert!(returned.child_task_id.is_empty());
+        assert!(returned.child_lease.is_none());
+        assert_eq!(scheme_a_submitted_ids(&case), vec![scheme_a_request_ids(&request)]);
+        match terminal {
+            "SUCCEEDED" => assert!(returned.message.contains("reached; selecting next frontier")),
+            "FAILED" => {
+                assert!(returned.message.contains("failed; retry/blacklist policy applied"));
+                assert_one_receipt_source_failure(&source);
+            }
+            "CANCELLED" => {
+                assert!(returned.message.contains("cancelled before attachment"));
+                assert!(source[1]["failed_goals"].as_array().unwrap().is_empty(),
+                    "proved cancellation must not become an unreachable frontier");
+            }
+            _ => unreachable!(),
+        }
+        scheme_a_assert_no_lease_side_effects(&case, 1);
+    }
 }
 
 #[tokio::test]

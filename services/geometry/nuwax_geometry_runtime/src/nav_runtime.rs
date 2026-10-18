@@ -45,7 +45,7 @@ use nuwax_nav_stack::{
     graph::ModuleNode, NavStackBuilder, NavStackHandle, NavStackPreset, NavStackProfile,
 };
 use nuwax_protocol::{LcmMessageType, LcmTopic, RawLcmFrame};
-use nuwax_transport::LcmTransport;
+use nuwax_transport::{LcmTransport, TransportError};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
@@ -207,6 +207,8 @@ pub enum NavPhase {
     Idle,
     /// 收到 set_goal,已写 active goal + 已发布 /nav/goal,等待进入规划。
     Accepted,
+    /// 本次已安装目标的发送效果未确认；保留 exact 执行责任，非终态。
+    DispatchUnresolved,
     /// 正在规划路径。
     Planning,
     /// 规划成功,正在跟随路径生成 cmd_vel。
@@ -227,6 +229,7 @@ impl NavPhase {
         match self {
             NavPhase::Idle => "IDLE",
             NavPhase::Accepted => "ACCEPTED",
+            NavPhase::DispatchUnresolved => "UNCONFIRMED",
             NavPhase::Planning => "PLANNING",
             NavPhase::Running => "RUNNING",
             NavPhase::Succeeded => "SUCCEEDED",
@@ -382,6 +385,8 @@ pub struct NavRuntimeState {
     next_publish_attempt: Arc<AtomicU64>,
     #[cfg(test)]
     transaction_after_correlation: Arc<StdMutex<Option<Arc<tokio::sync::Barrier>>>>,
+    #[cfg(test)]
+    terminal_before_retention: Arc<StdMutex<Option<Arc<tokio::sync::Barrier>>>>,
     producer_runtime_generation: u64,
     next_goal_generation: Arc<AtomicU64>,
     next_cancel_generation: Arc<AtomicU64>,
@@ -761,6 +766,8 @@ impl NavRuntimeState {
             next_publish_attempt: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             transaction_after_correlation: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            terminal_before_retention: Arc::new(StdMutex::new(None)),
             producer_runtime_generation,
             next_goal_generation: Arc::new(AtomicU64::new(0)),
             next_cancel_generation: Arc::new(AtomicU64::new(0)),
@@ -776,6 +783,27 @@ impl NavRuntimeState {
             .transaction_after_correlation
             .lock()
             .expect("transaction correlation barrier") = Some(barrier);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_terminal_before_retention_barrier(&self, barrier: Arc<tokio::sync::Barrier>) {
+        *self.terminal_before_retention.lock().expect("terminal retention barrier") = Some(barrier);
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn pause_terminal_before_retention_for_test(&self) {
+        let barrier = self.terminal_before_retention.lock().expect("terminal retention barrier").take();
+        if let Some(barrier) = barrier {
+            barrier.wait().await;
+            barrier.wait().await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn project_late_goal_completion_for_test(&self, lease: &GoalLease) -> SetGoalOutcome {
+        let _transaction_guard = self.transaction_gate.lock().await;
+        project_installed_goal_completion(self, lease, 0.0,
+            GoalDispatchEffect::EffectUnconfirmed, "test-only late generic backend error".into(), false).await
     }
 
     #[cfg(test)]
@@ -2487,17 +2515,98 @@ pub enum SetGoalRejectReason {
     ActiveMapNameChanged,
 }
 
-/// `set_goal` 的输出:成功时返回 `NavigationState(ACCEPTED)`,
-/// 失败时返回带 reason 的 `Failed` state。
+/// Source of the lease in THIS command result; Some alone never grants ownership.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GoalLeaseOrigin {
+    /// No execution owner was installed by this attempt.
+    #[default]
+    NotInstalled,
+    /// Sealed attempted identity rejected before installation (for example Busy).
+    Attempted,
+    /// Exact idempotent replay; this command did not install an owner.
+    Existing,
+    /// Exact replay of an owner whose responsibility is still unresolved.
+    ExistingUnresolved,
+    /// This command installed the owner; dispatch effect and any resolution remain separate facts.
+    Installed,
+    /// This command installed then definitely released its original provisional owner.
+    InstalledReleased,
+    /// This command installed an owner that still needs exact terminal proof.
+    InstalledUnresolved,
+}
+
+/// Local dispatch fact, separate from authoritative execution acceptance or settlement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GoalDispatchEffect {
+    /// No new Goal publish was attempted by this command.
+    #[default]
+    NotAttempted,
+    /// An explicit source point proves this command was not dispatched.
+    NotDispatched,
+    /// The local publish call completed successfully; no remote guarantee is implied.
+    LocallyCompleted,
+    /// The backend cannot prove absence of external effects.
+    EffectUnconfirmed,
+}
+
+/// A command projection is not a second execution-state producer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GoalPublicationPolicy {
+    /// Preserve the existing ordinary accepted/rejected local notification path.
+    #[default]
+    Local,
+    /// Unary/Bridge result only: never rewrite SharedState or broadcast this projection.
+    NoPublish,
+}
+
+/// Machine reason constructed from typed control flow, never parsed from message text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoalSubmissionDiagnostic {
+    /// The installed attempt retains responsibility after uncertain completion.
+    PublishUnconfirmed,
+    /// A terminal observation exists but the full original receipt is not readable yet.
+    TerminalProofPending,
+}
+
+impl GoalSubmissionDiagnostic {
+    /// Existing wire reason_code; no new protobuf field is required.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PublishUnconfirmed => "GOAL_PUBLISH_UNCONFIRMED",
+            Self::TerminalProofPending => "GOAL_TERMINAL_PROOF_PENDING",
+        }
+    }
+}
+
+/// Submission facts plus a lossless command projection; settlement is independent of accepted.
+#[derive(Default)]
 pub struct SetGoalOutcome {
-    /// 新的 NavState(status + message + goal_id + distance_remaining)。
+    /// Current execution projection for this exact attempted identity.
     pub state: NavState,
-    /// Sealed attempted/acquired lease for lossless response projection.
+    /// Attempted/existing/installed lease; consult lease_origin before transferring responsibility.
     pub lease: Option<GoalLease>,
-    /// Retryable admission cause; `None` means accepted or permanently rejected.
+    /// Retryable admission cause; unrelated dispatch uncertainty never creates a retry budget.
     pub retry_reason: Option<SetGoalRetryReason>,
-    /// Permanent admission rejection cause; `None` means accepted or otherwise rejected.
+    /// Permanent admission rejection cause.
     pub reject_reason: Option<SetGoalRejectReason>,
+    /// Trusted source of the lease in this result.
+    pub lease_origin: GoalLeaseOrigin,
+    /// Local transport completion fact.
+    pub dispatch_effect: GoalDispatchEffect,
+    /// Typed command-only reason when no complete original receipt is available.
+    pub diagnostic: Option<GoalSubmissionDiagnostic>,
+    /// Controls only local command projection, never authoritative consumer fanout.
+    pub publication: GoalPublicationPolicy,
+    /// Original authoritative terminal body, copied intact rather than reconstructed.
+    pub resolved_receipt: Option<NavigationUpdate>,
+}
+
+impl SetGoalOutcome {
+    /// Confirmed acceptance does not imply settlement; a receipt is evaluated separately.
+    pub fn accepted(&self) -> bool {
+        self.resolved_receipt.is_none()
+            && matches!(self.state.status.as_str(), "ACCEPTED" | "PLANNING" | "RUNNING")
+    }
 }
 
 /// Complete CAS identity required to cancel one goal lease.
@@ -2562,6 +2671,7 @@ fn rejected_goal_intent(goal_id: String, reason: impl Into<String>) -> SetGoalOu
         lease: None,
         retry_reason: None,
         reject_reason: None,
+        ..SetGoalOutcome::default()
     }
 }
 
@@ -2745,6 +2855,7 @@ pub async fn set_goal_with_boundary(
             lease: None,
             retry_reason: None,
             reject_reason: None,
+            ..SetGoalOutcome::default()
         };
     }
     let admission = NavAdmissionContext::new(
@@ -3030,6 +3141,7 @@ async fn admit_goal_input(
             lease: None,
             retry_reason: None,
             reject_reason: None,
+            ..SetGoalOutcome::default()
         };
     }
     if let Err(reason) = input.motion_admission.validate() {
@@ -3044,6 +3156,7 @@ async fn admit_goal_input(
             lease: None,
             retry_reason: None,
             reject_reason: None,
+            ..SetGoalOutcome::default()
         };
     }
     if input.goal_id.is_empty()
@@ -3068,6 +3181,7 @@ async fn admit_goal_input(
             lease: None,
             retry_reason: None,
             reject_reason: None,
+            ..SetGoalOutcome::default()
         };
     }
     // 1. readiness 校验。
@@ -3093,6 +3207,7 @@ async fn admit_goal_input(
             lease: None,
             retry_reason: Some(SetGoalRetryReason::NavigationNotReady(detail.reason_code)),
             reject_reason: None,
+            ..SetGoalOutcome::default()
         };
     }
     if input.frame_id != detail.map_frame {
@@ -3113,6 +3228,7 @@ async fn admit_goal_input(
             lease: None,
             retry_reason: None,
             reject_reason: None,
+            ..SetGoalOutcome::default()
         };
     }
     let distance_remaining = distance_to_target_from_state(
@@ -3146,6 +3262,7 @@ async fn admit_goal_input(
                 lease: None,
                 retry_reason: None,
                 reject_reason: None,
+                ..SetGoalOutcome::default()
             };
         }
     };
@@ -3165,6 +3282,7 @@ async fn admit_goal_input(
             lease: None,
             retry_reason: None,
             reject_reason: None,
+            ..SetGoalOutcome::default()
         };
     }
     let stamp_sec = match i32::try_from(input.target.timestamp_ns / 1_000_000_000) {
@@ -3181,6 +3299,7 @@ async fn admit_goal_input(
                 lease: None,
                 retry_reason: None,
                 reject_reason: None,
+                ..SetGoalOutcome::default()
             };
         }
     };
@@ -3256,17 +3375,31 @@ async fn admit_goal_input(
                 && active.body_to_support_z_m == body_to_support_z_m
                 && boundary_matches_owner(&input.frame_id, &envelope.boundary_points, active.boundary_owner.as_deref())
             {
+                let unresolved = slot.phase == NavPhase::DispatchUnresolved;
+                let proof_pending = slot.phase.is_terminal();
+                let diagnostic = if proof_pending {
+                    Some(GoalSubmissionDiagnostic::TerminalProofPending)
+                } else if unresolved {
+                    Some(GoalSubmissionDiagnostic::PublishUnconfirmed)
+                } else {
+                    None
+                };
                 return SetGoalOutcome {
                     state: NavState {
-                        status: slot.phase.as_str().to_string(),
-                        message: "GOAL_LEASE_IDEMPOTENT: existing lease retained".to_string(),
+                        status: if proof_pending { "UNCONFIRMED" } else { slot.phase.as_str() }.to_string(),
+                        message: if diagnostic.is_some() { slot.message.clone() }
+                            else { "GOAL_LEASE_IDEMPOTENT: existing lease retained".to_string() },
                         goal_id: lease.session_id.clone(),
                         distance_remaining,
-                        timestamp_ns: now_ns(),
+                        timestamp_ns: if diagnostic.is_some() { 0 } else { now_ns() },
                     },
                     lease: Some(active.lease.clone()),
-                    retry_reason: None,
-                    reject_reason: None,
+                    lease_origin: if diagnostic.is_some() { GoalLeaseOrigin::ExistingUnresolved }
+                        else { GoalLeaseOrigin::Existing },
+                    diagnostic,
+                    publication: if diagnostic.is_some() { GoalPublicationPolicy::NoPublish }
+                        else { GoalPublicationPolicy::Local },
+                    ..SetGoalOutcome::default()
                 };
             }
             return SetGoalOutcome {
@@ -3284,8 +3417,10 @@ async fn admit_goal_input(
                     timestamp_ns: now_ns(),
                 },
                 lease: Some(lease),
+                lease_origin: GoalLeaseOrigin::Attempted,
                 retry_reason: None,
                 reject_reason: None,
+                ..SetGoalOutcome::default()
             };
         }
         if goal_generation <= slot.last_goal_generation {
@@ -3301,8 +3436,10 @@ async fn admit_goal_input(
                     timestamp_ns: now_ns(),
                 },
                 lease: Some(lease),
+                lease_origin: GoalLeaseOrigin::Attempted,
                 retry_reason: None,
                 reject_reason: None,
+                ..SetGoalOutcome::default()
             };
         }
         let Ok(mut cancel) = state.cancel.lock() else {
@@ -3315,8 +3452,10 @@ async fn admit_goal_input(
                     timestamp_ns: now_ns(),
                 },
                 lease: Some(lease),
+                lease_origin: GoalLeaseOrigin::Attempted,
                 retry_reason: None,
                 reject_reason: None,
+                ..SetGoalOutcome::default()
             };
         };
         let cancel_fence_matches = cancel.generation == cancel_fence.generation
@@ -3338,8 +3477,10 @@ async fn admit_goal_input(
                     timestamp_ns: now_ns(),
                 },
                 lease: Some(lease),
+                lease_origin: GoalLeaseOrigin::Attempted,
                 retry_reason: None,
                 reject_reason: None,
+                ..SetGoalOutcome::default()
             };
         }
         goal_payload = match typed_codec::encode_goal_envelope_payload(&envelope) {
@@ -3356,6 +3497,7 @@ async fn admit_goal_input(
             lease: None,
             retry_reason: None,
             reject_reason: None,
+            ..SetGoalOutcome::default()
         };
     }
     };
@@ -3387,28 +3529,12 @@ async fn admit_goal_input(
         match state.begin_publish(PublishKind::Goal, lease.clone(), goal_generation) {
             Ok(attempt) => attempt,
             Err(reason) => {
-                let mut slot = state.inner.write().await;
-                if slot
-                    .goal
-                    .as_ref()
-                    .is_some_and(|active| active.lease == lease)
-                {
-                    slot.goal = None;
-                    slot.phase = NavPhase::Failed;
-                    slot.message = format!("SET_GOAL_REJECTED[{reason}]");
-                }
-                return SetGoalOutcome {
-                    state: NavState {
-                        status: NavPhase::Failed.as_str().to_string(),
-                        message: format!("SET_GOAL_REJECTED[{reason}]"),
-                        goal_id: input.goal_id,
-                        distance_remaining,
-                        timestamp_ns: now_ns(),
-                    },
-                    lease: Some(lease),
-                    retry_reason: None,
-                    reject_reason: None,
-                };
+                // Installation happened; begin_publish proves only that this command
+                // never reached the backend. Release solely the original provisional owner.
+                return project_installed_goal_completion(
+                    state, &lease, distance_remaining, GoalDispatchEffect::NotDispatched,
+                    format!("SET_GOAL_REJECTED[{reason}]"), true,
+                ).await;
             }
         };
     drop(map_goal_guard);
@@ -3417,65 +3543,23 @@ async fn admit_goal_input(
     // 2. publish sealed GoalEnvelope without N, L, slot, or synchronous guards.
     let publish_result = publish_encoded_goal_frame_from_transport(&io.transport, goal_payload).await;
     let _transaction_guard = state.transaction_gate.lock().await;
-    if !state.finish_publish(PublishKind::Goal, &lease, goal_generation, publish_attempt) {
-        return SetGoalOutcome {
-            state: NavState {
-                status: NavPhase::Failed.as_str().to_string(),
-                message: "SET_GOAL_COMPLETION_SUPERSEDED".to_string(),
-                goal_id: input.goal_id,
-                distance_remaining,
-                timestamp_ns: now_ns(),
-            },
-            lease: Some(lease),
-            retry_reason: None,
-            reject_reason: None,
+    let finished = state.finish_publish(PublishKind::Goal, &lease, goal_generation, publish_attempt);
+    let dispatch_effect = match &publish_result {
+        Ok(()) => GoalDispatchEffect::LocallyCompleted,
+        Err(error) if error.is_definitely_not_dispatched() => GoalDispatchEffect::NotDispatched,
+        Err(_) => GoalDispatchEffect::EffectUnconfirmed,
+    };
+    if !finished || publish_result.is_err() {
+        let message = match publish_result {
+            Err(error) => format!("SetNavigationGoal publish completion: {error}; flight_finished={finished}"),
+            Ok(()) => "SET_GOAL_COMPLETION_SUPERSEDED: local publish completed; ownership still requires proof".to_string(),
         };
-    }
-    if let Err(e) = publish_result {
-        let failure_message = format!("SetNavigationGoal 失败:publish /nav/goal 错误: {e}");
-        let mut slot = state.inner.write().await;
-        let provisional_goal_matches = slot.goal.as_ref().is_some_and(|goal| {
-            goal.lease == lease
-                && goal.lease.path_revision == 0
-                && goal.lease.planner_runtime_generation == 0
-                && slot.phase == NavPhase::Accepted
-        });
-        if provisional_goal_matches {
-            let Ok(mut cancel) = state.cancel.lock() else {
-                slot.phase = NavPhase::Failed;
-                slot.message = "SET_GOAL_ROLLBACK_FAILED[CANCEL_STATE_UNAVAILABLE]".to_string();
-                return SetGoalOutcome {
-                    state: NavState {
-                        status: NavPhase::Failed.as_str().to_string(),
-                        message: slot.message.clone(),
-                        goal_id: input.goal_id,
-                        distance_remaining,
-                        timestamp_ns: now_ns(),
-                    },
-                    lease: Some(lease),
-                    retry_reason: None,
-                    reject_reason: None,
-                };
-            };
-            if cancel.lease.as_ref() == Some(&lease) {
-                *cancel = CancelTracker::default();
-            }
-            slot.goal = None;
-            slot.phase = NavPhase::Failed;
-            slot.message = failure_message.clone();
-        }
-        return SetGoalOutcome {
-            state: NavState {
-                status: NavPhase::Failed.as_str().to_string(),
-                message: failure_message,
-                goal_id: input.goal_id,
-                distance_remaining,
-                timestamp_ns: now_ns(),
-            },
-            lease: Some(lease),
-            retry_reason: None,
-            reject_reason: None,
-        };
+        warn!(session_id = %lease.session_id, goal_generation = lease.goal_generation,
+            producer_runtime_generation = lease.producer_runtime_generation,
+            ?dispatch_effect, finished, cause = %message, "goal submission requires exact ownership resolution");
+        return project_installed_goal_completion(
+            state, &lease, distance_remaining, dispatch_effect, message, finished,
+        ).await;
     }
 
     SetGoalOutcome {
@@ -3487,8 +3571,106 @@ async fn admit_goal_input(
             timestamp_ns: now_ns(),
         },
         lease: Some(lease),
-        retry_reason: None,
-        reject_reason: None,
+        lease_origin: GoalLeaseOrigin::Installed,
+        dispatch_effect: GoalDispatchEffect::LocallyCompleted,
+        ..SetGoalOutcome::default()
+    }
+}
+
+/// Select facts while the caller holds the ORIGINAL transaction gate. This helper
+/// never expands that gate across transport I/O or waits for a terminal receipt.
+async fn project_installed_goal_completion(
+    state: &NavRuntimeState,
+    attempted: &GoalLease,
+    distance_remaining: f32,
+    dispatch_effect: GoalDispatchEffect,
+    message: String,
+    allow_definite_rollback: bool,
+) -> SetGoalOutcome {
+    let mut slot = state.inner.write().await;
+    let input = CancelGoalInput {
+        goal_id: attempted.session_id.clone(), owner_kind: attempted.owner_kind,
+        parent_request_id: attempted.parent_request_id.clone(),
+        goal_generation: attempted.goal_generation,
+        producer_runtime_generation: attempted.producer_runtime_generation,
+    };
+    let exact_active = slot.goal.as_ref().filter(|goal| goal.lease.identity_matches(attempted));
+    let receipt = slot.terminal_receipts.iter().rev().find(|receipt| {
+        let settlement_proven = receipt.retired_naturally
+            || (receipt.update.state.status == "CANCELLED" && exact_active.is_none());
+        receipt.matches(&input) && settlement_proven && exact_active.is_none_or(|active| {
+            active.lease.path_revision == receipt.update.feedback.path_revision
+                && active.lease.planner_runtime_generation == receipt.update.feedback.planner_runtime_generation
+        })
+    }).map(|receipt| receipt.update.clone());
+    if let Some(receipt) = receipt {
+        // Never borrow the current (possibly foreign) CancelTracker to rebuild this body.
+        let lease = GoalLease {
+            session_id: receipt.state.goal_id.clone(), owner_kind: receipt.feedback.owner_kind,
+            parent_request_id: receipt.feedback.parent_request_id.clone(),
+            goal_generation: receipt.feedback.goal_generation,
+            producer_runtime_generation: receipt.producer_runtime_generation,
+            path_revision: receipt.feedback.path_revision,
+            planner_runtime_generation: receipt.feedback.planner_runtime_generation,
+        };
+        return SetGoalOutcome {
+            state: receipt.state.clone(), lease: Some(lease),
+            lease_origin: GoalLeaseOrigin::Installed, dispatch_effect,
+            publication: GoalPublicationPolicy::NoPublish,
+            resolved_receipt: Some(receipt), ..SetGoalOutcome::default()
+        };
+    }
+    let provisional = slot.goal.as_ref().is_some_and(|goal| {
+        goal.lease == *attempted && goal.lease.path_revision == 0
+            && goal.lease.planner_runtime_generation == 0 && slot.phase == NavPhase::Accepted
+    });
+    if provisional && allow_definite_rollback && dispatch_effect == GoalDispatchEffect::NotDispatched {
+        if let Ok(mut cancel) = state.cancel.lock() {
+            if cancel.lease.as_ref() == Some(attempted) { *cancel = CancelTracker::default(); }
+            slot.goal = None;
+            slot.phase = NavPhase::Failed;
+            slot.message = message.clone();
+            return SetGoalOutcome {
+                state: NavState { status: "FAILED".into(), message, goal_id: attempted.session_id.clone(),
+                    distance_remaining, timestamp_ns: now_ns() },
+                lease: Some(attempted.clone()), lease_origin: GoalLeaseOrigin::InstalledReleased,
+                dispatch_effect, ..SetGoalOutcome::default()
+            };
+        }
+        // A poisoned tracker is not permission to erase a physical responsibility.
+    }
+    if provisional {
+        slot.phase = NavPhase::DispatchUnresolved;
+        slot.message = message.clone();
+    }
+    let exact_active = slot.goal.as_ref().filter(|goal| goal.lease.identity_matches(attempted));
+    let exact_zeroed_lease = state.cancel.lock().ok().and_then(|cancel| {
+        (cancel.phase == CancelPhase::Zeroed).then(|| {
+            cancel.lease.as_ref().filter(|lease| lease.identity_matches(attempted)).cloned()
+        }).flatten()
+    });
+    let proof_pending = exact_active.is_some() && slot.phase.is_terminal()
+        || exact_zeroed_lease.is_some();
+    let diagnostic = if proof_pending { GoalSubmissionDiagnostic::TerminalProofPending }
+        else { GoalSubmissionDiagnostic::PublishUnconfirmed };
+    // A candidate PathEnvelope alone cannot reach any of these slot phases.
+    let progress = exact_active.is_some() && !proof_pending
+        && matches!(slot.phase, NavPhase::Accepted | NavPhase::Planning | NavPhase::Running);
+    // ZEROED may already have retired the active slot before the original receipt
+    // is retained. Preserve its actual execution identity, never its partial ZERO body.
+    let lease = exact_active.map(|goal| goal.lease.clone())
+        .or(exact_zeroed_lease).unwrap_or_else(|| attempted.clone());
+    SetGoalOutcome {
+        state: NavState {
+            status: if progress { slot.phase.as_str() } else { "UNCONFIRMED" }.into(),
+            message: if progress { slot.message.clone() } else { message },
+            goal_id: attempted.session_id.clone(), distance_remaining,
+            // Slot has no full source body/timestamp. Do not invent a source watermark.
+            timestamp_ns: 0,
+        },
+        lease: Some(lease), lease_origin: GoalLeaseOrigin::InstalledUnresolved,
+        dispatch_effect, diagnostic: Some(diagnostic),
+        publication: GoalPublicationPolicy::NoPublish, ..SetGoalOutcome::default()
     }
 }
 
@@ -3921,27 +4103,29 @@ pub fn path_envelope_binding() -> Result<(LcmTopic, LcmMessageType), String> {
 async fn publish_goal_frame_from_transport(
     transport: &LcmTransport,
     envelope: &schema::GoalEnvelope,
-) -> Result<(), String> {
+) -> Result<(), TransportError> {
     let payload = typed_codec::encode_goal_envelope_payload(envelope)
-        .map_err(|e| format!("GoalEnvelope LCM encode failed: {e}"))?;
+        .map_err(|e| TransportError::NotDispatched(Box::new(
+            TransportError::LcmBackend(format!("GoalEnvelope LCM encode failed: {e}")))))?;
     publish_encoded_goal_frame_from_transport(transport, payload).await
 }
 
 async fn publish_encoded_goal_frame_from_transport(
     transport: &LcmTransport,
     payload: Vec<u8>,
-) -> Result<(), String> {
-    let (topic, msg_type) = goal_envelope_binding()?;
+) -> Result<(), TransportError> {
+    let (topic, msg_type) = goal_envelope_binding().map_err(|error|
+        TransportError::NotDispatched(Box::new(TransportError::Topic(error))))?;
     let frame: RawLcmFrame =
         typed_codec::build_typed_frame(topic, msg_type, payload, now_ns() & 0x0000_FFFF_FFFF_FFFF);
-    transport.publish(frame).await.map_err(|e| format!("LcmTransport::publish 失败: {}", e))
+    transport.publish(frame).await
 }
 
 /// publish `/nav/goal` typed frame。
 async fn publish_goal_frame(
     handle: &GeometryRuntimeHandle,
     envelope: &schema::GoalEnvelope,
-) -> Result<(), String> {
+) -> Result<(), TransportError> {
     publish_goal_frame_from_transport(&handle.transport, envelope).await
 }
 
@@ -4434,7 +4618,7 @@ mod tests {
     struct BlockingPublishBackend {
         frames: Arc<Mutex<Vec<RawLcmFrame>>>,
         publish_gate: Arc<Semaphore>,
-        outcomes: Arc<Mutex<VecDeque<Option<String>>>>,
+        outcomes: Arc<Mutex<VecDeque<Option<TransportError>>>>,
     }
 
     impl BlockingPublishBackend {
@@ -4442,7 +4626,7 @@ mod tests {
             Self {
                 frames: Arc::new(Mutex::new(Vec::new())),
                 publish_gate: Arc::new(Semaphore::new(0)),
-                outcomes: Arc::new(Mutex::new(outcomes.into_iter().collect())),
+                outcomes: Arc::new(Mutex::new(outcomes.into_iter().map(|outcome| outcome.map(TransportError::LcmBackend)).collect())),
             }
         }
 
@@ -4514,7 +4698,7 @@ mod tests {
                 .pop_front()
                 .flatten()
             {
-                Some(error) => Err(TransportError::LcmBackend(error)),
+                Some(error) => Err(error),
                 None => Ok(()),
             }
         }
@@ -4538,6 +4722,15 @@ mod tests {
         let mut handle = make_handle().await;
         let backend = BlockingPublishBackend::new(outcomes);
         handle.transport = LcmTransport::new(Arc::new(backend.clone()));
+        (handle, backend)
+    }
+
+    // Only the original rollback fixture opts into a definite source-point error.
+    // Generic string fixtures remain opaque EffectUnconfirmed errors.
+    async fn make_definite_blocking_handle(reason: &str) -> (GeometryRuntimeHandle, BlockingPublishBackend) {
+        let (handle, backend) = make_blocking_handle([]).await;
+        backend.outcomes.lock().unwrap().push_back(Some(TransportError::NotDispatched(
+            Box::new(TransportError::LcmBackend(reason.to_owned())))));
         (handle, backend)
     }
 
@@ -4742,6 +4935,166 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _restore = set_nav_profile_for_test(Some("hologram"));
         assert!(resolve_profile_from_env().is_err());
+    }
+
+    #[test]
+    fn dispatch_unresolved_phase_is_local_nonterminal_only() {
+        assert_eq!(NavPhase::DispatchUnresolved.as_str(), "UNCONFIRMED");
+        assert!(!NavPhase::DispatchUnresolved.is_terminal());
+        assert_eq!(NavPhase::from_stack_status("UNCONFIRMED"), None);
+    }
+
+    #[tokio::test]
+    async fn generic_goal_error_keeps_exact_owner_replay_and_cancel_without_second_goal() {
+        let (handle, backend, owner) = make_unit_blocking_handle([
+            Some("opaque backend error, no source-point proof".to_owned()), None,
+        ]).await;
+        let state = NavRuntimeState::with_profile_and_producer_runtime_generation(PROFILE_SIMPLE_2D, 1);
+        observe_ready_execution_chain(&state).await;
+        let mut input = test_goal_input("generic-error-keeps-owner");
+        input.goal_generation = 61;
+        backend.release_one();
+        let unknown = set_goal(&handle, &state, input.clone()).await;
+        assert_eq!(unknown.state.status, "UNCONFIRMED");
+        assert_eq!(unknown.state.timestamp_ns, 0);
+        assert_eq!(unknown.lease_origin, GoalLeaseOrigin::InstalledUnresolved);
+        assert_eq!(unknown.dispatch_effect, GoalDispatchEffect::EffectUnconfirmed);
+        assert_eq!(unknown.publication, GoalPublicationPolicy::NoPublish);
+        assert_eq!(unknown.diagnostic, Some(GoalSubmissionDiagnostic::PublishUnconfirmed));
+        assert!(!unknown.accepted());
+        let lease = unknown.lease.clone().unwrap();
+        assert_eq!(state.active_goal_lease().await.as_ref(), Some(&lease));
+        assert!(state.publish_in_flight_for_test().unwrap().is_empty());
+        let replay = set_goal(&handle, &state, input).await;
+        assert_eq!(replay.state.status, "UNCONFIRMED");
+        assert_eq!(replay.lease_origin, GoalLeaseOrigin::ExistingUnresolved);
+        assert_eq!(replay.dispatch_effect, GoalDispatchEffect::NotAttempted);
+        assert_eq!(replay.publication, GoalPublicationPolicy::NoPublish);
+        let mut foreign = test_goal_input("foreign-cannot-steal-unknown");
+        foreign.goal_generation = 62;
+        let busy = set_goal(&handle, &state, foreign).await;
+        assert_eq!(busy.lease_origin, GoalLeaseOrigin::Attempted);
+        assert_eq!(busy.state.status, "FAILED");
+        assert_eq!(state.active_goal_lease().await.as_ref(), Some(&lease));
+        assert_eq!(backend.publish_count(), 1);
+        backend.release_one();
+        let pending = cancel(&handle, &state, cancel_input(&lease)).await;
+        assert_eq!(pending.state.status, "PENDING");
+        assert_eq!(state.cancel_snapshot().lease.as_ref(), Some(&lease));
+        assert_eq!(backend.publish_count(), 2);
+        assert_eq!(backend.published_message_types(), vec![
+            "nuwax_msgs.GoalEnvelope".to_string(), "nuwax_msgs.CancelNavigation".to_string(),
+        ]);
+        drop(handle);
+        owner.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn explicit_not_dispatched_unit_fixture_releases_only_provisional_owner() {
+        let (handle, backend, owner) = make_unit_blocking_handle([]).await;
+        backend.outcomes.lock().unwrap().push_back(Some(TransportError::NotDispatched(
+            Box::new(TransportError::LcmBackend("explicit pre-dispatch fixture".into())))));
+        backend.release_one();
+        let state = NavRuntimeState::with_profile_and_producer_runtime_generation(PROFILE_SIMPLE_2D, 1);
+        observe_ready_execution_chain(&state).await;
+        let mut input = test_goal_input("definite-unit-control");
+        input.goal_generation = 61;
+        let rejected = set_goal(&handle, &state, input).await;
+        assert_eq!(rejected.state.status, "FAILED");
+        assert_eq!(rejected.lease_origin, GoalLeaseOrigin::InstalledReleased);
+        assert_eq!(rejected.dispatch_effect, GoalDispatchEffect::NotDispatched);
+        assert!(state.active_goal_lease().await.is_none());
+        let cancel = cancel(&handle, &state, cancel_input(rejected.lease.as_ref().unwrap())).await;
+        assert_eq!(cancel.state.status, "FAILED");
+        assert!(cancel.state.message.contains("GOAL_LEASE_MISSING"));
+        assert_eq!(backend.publish_count(), 1);
+        drop(handle);
+        owner.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn late_generic_goal_error_distinguishes_path_candidate_from_correlated_running() {
+        for correlated_running in [false, true] {
+            let (handle, backend, owner) = make_unit_blocking_handle([Some("late unknown".into())]).await;
+            let state = NavRuntimeState::with_profile_and_producer_runtime_generation(PROFILE_SIMPLE_2D, 1);
+            observe_ready_execution_chain(&state).await;
+            let mut input = test_goal_input("candidate-versus-confirmed-path");
+            input.goal_generation = 61;
+            let mut submission = Box::pin(set_goal(&handle, &state, input));
+            tokio::select! {
+                _ = backend.wait_for_publish_count(1) => {},
+                _ = &mut submission => panic!("submission must wait at the original backend gate"),
+            }
+            let original = state.active_goal_lease().await.unwrap();
+            let path = sealed_path(&original, 1, 2.0);
+            let candidate = state.observe_path_envelope(&path).await.unwrap();
+            assert_eq!(state.active_goal_lease().await.as_ref(), Some(&original));
+            if correlated_running {
+                state.apply_correlated_navigation_state(
+                    NavState { status: "RUNNING".into(), goal_id: original.session_id.clone(),
+                        message: "actual correlated source progress".into(), timestamp_ns: 7, ..Default::default() },
+                    &original.session_id, original.owner_kind, &original.parent_request_id,
+                    original.goal_generation, candidate.path_revision, original.producer_runtime_generation,
+                    candidate.planner_runtime_generation, None, None,
+                ).await.unwrap();
+            }
+            backend.release_one();
+            let outcome = submission.await;
+            assert_eq!(outcome.lease_origin, GoalLeaseOrigin::InstalledUnresolved);
+            assert_eq!(outcome.publication, GoalPublicationPolicy::NoPublish);
+            assert_eq!(outcome.diagnostic, Some(GoalSubmissionDiagnostic::PublishUnconfirmed));
+            assert_eq!(outcome.state.timestamp_ns, 0);
+            if correlated_running {
+                assert_eq!(outcome.state.status, "RUNNING");
+                assert!(outcome.accepted());
+                assert_eq!(outcome.lease.as_ref(), Some(&candidate));
+                assert_eq!(state.inner.read().await.phase, NavPhase::Running);
+            } else {
+                assert_eq!(outcome.state.status, "UNCONFIRMED");
+                assert!(!outcome.accepted());
+                assert_eq!(outcome.lease.as_ref(), Some(&original));
+                assert_eq!(state.inner.read().await.phase, NavPhase::DispatchUnresolved);
+            }
+            assert_eq!(backend.publish_count(), 1);
+            drop(handle);
+            owner.finish().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn superseded_finish_keeps_installed_attempt_and_does_not_clear_foreign_owner() {
+        let (handle, backend, owner) = make_unit_blocking_handle([Some("unknown completion".into())]).await;
+        let state = NavRuntimeState::with_profile_and_producer_runtime_generation(PROFILE_SIMPLE_2D, 1);
+        observe_ready_execution_chain(&state).await;
+        let mut input = test_goal_input("superseded-original");
+        input.goal_generation = 61;
+        let mut submission = Box::pin(set_goal(&handle, &state, input));
+        tokio::select! {
+            _ = backend.wait_for_publish_count(1) => {},
+            _ = &mut submission => panic!("submission must wait at the original backend gate"),
+        }
+        let original = state.active_goal_lease().await.unwrap();
+        let flight = state.publish_in_flight.lock().unwrap()[0].clone();
+        assert!(state.finish_publish(PublishKind::Goal, &original, original.goal_generation, flight.attempt));
+        let mut foreign = test_active_goal_with_lease(original.clone());
+        foreign.lease.session_id = "foreign-new-owner".into();
+        foreign.lease.goal_generation += 1;
+        foreign.id = foreign.lease.session_id.clone();
+        let foreign_lease = foreign.lease.clone();
+        state.replace_active_goal_for_test(foreign).await;
+        let cancel_before = state.cancel_snapshot();
+        backend.release_one();
+        let outcome = submission.await;
+        assert_eq!(outcome.lease_origin, GoalLeaseOrigin::InstalledUnresolved);
+        assert_eq!(outcome.lease.as_ref(), Some(&original));
+        assert_eq!(outcome.state.status, "UNCONFIRMED");
+        assert_eq!(outcome.publication, GoalPublicationPolicy::NoPublish);
+        assert_eq!(state.active_goal_lease().await.as_ref(), Some(&foreign_lease));
+        assert_eq!(state.inner.read().await.phase, NavPhase::Running);
+        assert_eq!(state.cancel_snapshot(), cancel_before);
+        assert_eq!(backend.publish_count(), 1);
+        drop(handle);
+        owner.finish().await.unwrap();
     }
 
     #[test]
@@ -5896,7 +6249,7 @@ mod tests {
     #[tokio::test]
     async fn failed_goal_publish_rolls_back_before_exact_cancel_can_start() {
         let (handle, backend) =
-            make_blocking_handle([Some("goal publish failed".to_string())]).await;
+            make_definite_blocking_handle("goal publish failed").await;
         let state = NavRuntimeState::from_env();
         observe_ready_execution_chain(&state).await;
         let set_handle = handle.clone();

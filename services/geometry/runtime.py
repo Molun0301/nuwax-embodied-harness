@@ -11984,11 +11984,16 @@ class PlatformGeometryProviderBundle(
         observed_goal_id = str(
             dict(getattr(state, "metadata", {}) or {}).get("observed_goal_id") or ""
         ).strip()
+        control_metadata = dict(getattr(state, "metadata", {}) or {})
+        if (control_metadata.get("ownership_retained") is True
+                and control_metadata.get("authority_current") is False):
+            return False
         if (
             active_goal_id != exact_goal_id
             or (observed_goal_id and observed_goal_id != exact_goal_id)
             or active_status
             not in {
+                NavigationStatus.UNCONFIRMED.value,
                 NavigationStatus.ACCEPTED.value,
                 NavigationStatus.PLANNING.value,
                 NavigationStatus.RUNNING.value,

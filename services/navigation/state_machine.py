@@ -95,7 +95,7 @@ class NavigationStateMachine:
     def start_planning(self, message: str = "开始路径规划。") -> NavigationStatus:
         """开始路径规划，转移到 PLANNING 状态。"""
 
-        if self._current_status == NavigationStatus.ACCEPTED:
+        if self._current_status in {NavigationStatus.UNCONFIRMED, NavigationStatus.ACCEPTED}:
             self._current_status = NavigationStatus.PLANNING
             self._status_message = message
         return self._current_status
@@ -103,7 +103,7 @@ class NavigationStateMachine:
     def start_running(self, message: str = "开始执行导航。") -> NavigationStatus:
         """开始执行导航，转移到 RUNNING 状态。"""
 
-        if self._current_status in {NavigationStatus.ACCEPTED, NavigationStatus.PLANNING}:
+        if self._current_status in {NavigationStatus.UNCONFIRMED, NavigationStatus.ACCEPTED, NavigationStatus.PLANNING}:
             self._current_status = NavigationStatus.RUNNING
             self._status_message = message
         return self._current_status
@@ -112,6 +112,7 @@ class NavigationStateMachine:
         """导航成功，转移到 SUCCEEDED 状态。"""
 
         if self._current_status in {
+            NavigationStatus.UNCONFIRMED,
             NavigationStatus.ACCEPTED,
             NavigationStatus.PLANNING,
             NavigationStatus.RUNNING,
@@ -134,6 +135,7 @@ class NavigationStateMachine:
         """取消导航，转移到 CANCELLED 状态。"""
 
         if self._current_status in {
+            NavigationStatus.UNCONFIRMED,
             NavigationStatus.ACCEPTED,
             NavigationStatus.PLANNING,
             NavigationStatus.RUNNING,
@@ -183,6 +185,7 @@ class NavigationStateMachine:
 
         status_map = {
             "idle": NavigationStatus.IDLE,
+            "unconfirmed": NavigationStatus.UNCONFIRMED,
             "accepted": NavigationStatus.ACCEPTED,
             "executing": NavigationStatus.RUNNING,
             "succeeded": NavigationStatus.SUCCEEDED,
@@ -248,6 +251,7 @@ class NavigationStateMachine:
         # 所有后端使用同一状态表。
         status_map = {
             "idle": NavigationStatus.IDLE,
+            "unconfirmed": NavigationStatus.UNCONFIRMED,
             "accepted": NavigationStatus.ACCEPTED,
             "goal_set": NavigationStatus.ACCEPTED,
             "planning": NavigationStatus.PLANNING,
@@ -272,7 +276,8 @@ class NavigationStateMachine:
         if new_status != NavigationStatus.IDLE and (
             self._start_time is None
             or (self.is_terminal and new_status in {
-                NavigationStatus.ACCEPTED, NavigationStatus.PLANNING, NavigationStatus.RUNNING,
+                NavigationStatus.UNCONFIRMED, NavigationStatus.ACCEPTED,
+                NavigationStatus.PLANNING, NavigationStatus.RUNNING,
             })
         ):
             self._start_time = utc_now()
@@ -288,6 +293,7 @@ class NavigationStateMachine:
         self._nav2_state = normalized
         self._status_message = message or {
             NavigationStatus.IDLE: None,
+            NavigationStatus.UNCONFIRMED: "导航目标尚未确认，责任未结算。",
             NavigationStatus.ACCEPTED: "导航目标已接受。",
             NavigationStatus.PLANNING: "开始路径规划。",
             NavigationStatus.RUNNING: "开始执行导航。",
@@ -370,6 +376,7 @@ def map_nav2_status_to_platform(nav2_status: str) -> NavigationStatus:
 
     status_map = {
         "idle": NavigationStatus.IDLE,
+        "unconfirmed": NavigationStatus.UNCONFIRMED,
         "accepted": NavigationStatus.ACCEPTED,
         "executing": NavigationStatus.RUNNING,
         "succeeded": NavigationStatus.SUCCEEDED,

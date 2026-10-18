@@ -220,11 +220,17 @@ pub enum Counter {
     MotionCacheCapacityClears,
     /// Nonempty boundary took the original uncached motion path; never a miss.
     MotionCacheBoundaryBypasses,
+    /// Sum of original half-open integer Z spans in assigned fine XY slices.
+    AssignedDenseZSpan,
+    /// Actual assigned-loop Z entries before contact checks: dense baseline or indexed candidate.
+    AssignedActualZCandidates,
+    /// Actual non-exempt assigned-loop get calls returning None.
+    AssignedFineGetAbsent,
 }
 
 impl Counter {
     /// Number of fixed counter categories.
-    pub const COUNT: usize = 29;
+    pub const COUNT: usize = 32;
     /// Every counter category, in record-array order.
     pub const ALL: [Self; Self::COUNT] = [
         Self::PlaneCacheHits,
@@ -256,6 +262,9 @@ impl Counter {
         Self::MotionCacheMisses,
         Self::MotionCacheCapacityClears,
         Self::MotionCacheBoundaryBypasses,
+        Self::AssignedDenseZSpan,
+        Self::AssignedActualZCandidates,
+        Self::AssignedFineGetAbsent,
     ];
 
     /// Stable label for reporting after the measured interval.
@@ -290,6 +299,9 @@ impl Counter {
             Self::MotionCacheMisses => "motion_cache_misses",
             Self::MotionCacheCapacityClears => "motion_cache_capacity_clears",
             Self::MotionCacheBoundaryBypasses => "motion_cache_boundary_bypasses",
+            Self::AssignedDenseZSpan => "dense_z_span",
+            Self::AssignedActualZCandidates => "actual_z_candidates",
+            Self::AssignedFineGetAbsent => "fine_get_absent",
 
         }
     }

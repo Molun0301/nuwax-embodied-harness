@@ -76,6 +76,20 @@ impl Drop for ObservationHeightCounts {
     }
 }
 
+// Three assigned-column work counts, accumulated once per actual pose check.
+// No timestamps, geometry queries or per-cell TLS access are added.
+#[cfg(feature = "body-query-profile")]
+#[derive(Default)]
+struct AssignedZCounts { dense_z_span:u64, actual_z_candidates:u64, fine_get_absent:u64 }
+#[cfg(feature = "body-query-profile")]
+impl Drop for AssignedZCounts {
+    fn drop(&mut self) {
+        query_profile::add(QueryCounter::AssignedDenseZSpan,self.dense_z_span);
+        query_profile::add(QueryCounter::AssignedActualZCandidates,self.actual_z_candidates);
+        query_profile::add(QueryCounter::AssignedFineGetAbsent,self.fine_get_absent);
+    }
+}
+
 /// 数学核心使用的机体和地形参数；外层从唯一标定契约转换。
 /// 检查完整凸柱碰撞与已知地形约束；未知地面不构成第二次准入条件。
 /// 不模拟离散足端接触或足步执行。
@@ -1197,6 +1211,8 @@ impl SurfaceSnapshot {
 
     fn check_body_pose(&self,body:[f64;3],quaternion:[f64;4],slot:&mut Option<BodyRejection>)->Result<(),SurfaceError> {
         *slot=None;
+        #[cfg(feature = "body-query-profile")]
+        let mut assigned_z_counts=AssignedZCounts::default();
         self.validate_complete_source_resolution()?;
         let model = self
             .body_envelope()
@@ -1364,7 +1380,16 @@ impl SurfaceSnapshot {
                                             [f64::from(ix+1)*fine,f64::from(iy+1)*fine,f64::from(bounds[1])]) {
                                         missing_slice_hit=true;
                                     }
+                                    #[cfg(feature = "body-query-profile")]
+                                    {
+                                        let first=(f64::from(bounds[0])/fine+1e-5).floor() as i32;
+                                        let last=(f64::from(bounds[1])/fine-1e-5).ceil() as i32;
+                                        assigned_z_counts.dense_z_span=assigned_z_counts.dense_z_span
+                                            .saturating_add((i64::from(last)-i64::from(first)).max(0) as u64);
+                                    }
                                     for iz in (f64::from(bounds[0])/fine+1e-5).floor() as i32..(f64::from(bounds[1])/fine-1e-5).ceil() as i32 {
+                                        #[cfg(feature = "body-query-profile")]
+                                        { assigned_z_counts.actual_z_candidates=assigned_z_counts.actual_z_candidates.saturating_add(1); }
                                         // Both contact-run forms contain only real supported members
                                         // of this immutable observation owner. Preserve `found` so
                                         // an exempt fine contact cannot trigger coarse fallback.
@@ -1372,7 +1397,11 @@ impl SurfaceSnapshot {
                                             found=true;
                                             continue;
                                         }
-                                        if observations.get([ix,iy,iz]).is_none() { continue; }
+                                        if observations.get([ix,iy,iz]).is_none() {
+                                            #[cfg(feature = "body-query-profile")]
+                                            { assigned_z_counts.fine_get_absent=assigned_z_counts.fine_get_absent.saturating_add(1); }
+                                            continue;
+                                        }
                                         found = true;
                                         let contact=selected.is_none() && coarse_contact
                                             && fine_ground.is_some_and(|height|f64::from(iz+1)*fine<=height+1e-6);
@@ -3043,6 +3072,7 @@ mod tests {
     #[cfg(feature = "body-query-profile")]
     mod cache_profile_counter_tests { include!("body_cache_profile_counter_tests.rs"); }
     mod recent_query_tests { include!("body_recent_query_tests.rs"); }
+    mod assigned_z_equivalence_tests { include!("body_assigned_z_equivalence_tests.rs"); }
     mod live_geometry_tests { include!("body_live_geometry_tests.rs"); }
     include!("body_observation_vec_tests.rs");
     include!("body_motion_reference_tests.rs");

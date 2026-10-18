@@ -397,6 +397,14 @@ GREEN同一原release/LTO二进制51个exact全部通过：原RED与5新控制�
 
 据此拒绝候选，不追加样本、不宣称稳定退化。原计划恢复B编译结束后，精确撤回生产/helper与9测试，body.rs与99ddbd5b逐字节相同，所有材料保留仓外。仅保留现有cfg(test)+profile输出中的四行candidate partial/pose bits，位于原计算捕获之后，用于以后核验真实路径等价；没有新增hash、时钟或热路径处理。
 
+## 第二十九阶段：暖单层内联读取候选撤回
+
+候选只在已有fine_bands cache命中时内联empty或单个完整fit+run，冷miss和多层保持原Arc路径。冻结旧两variant enum、完整batch和height后，A15/15、B15新+59旧exact以及完整默认MLS393/20原ignored、Scan75/2、runtime27+46/9+4全部通过，去重545 PASS/31原ignored。实际input16→32B、XY行24→40B，输出类型不变；此宽行代价也由measured/multi/cold承担。8192清cache时最后Arc/Vec析构可能前移锁内，锁次数相同不能称锁内成本相同。
+
+固定8进程A1/B1/B2/A2，A/B同09测试，仅切08生产，基线93c3cf10。1cm两请求各50pose bits、partial、全部calls/counters/分支相同。false kernel A8.535–8.578s/B9.062–9.444s；true A7.439–9.279s/B8.821–8.907s重叠。5cm36组总new_ns A2.255–2.261s/B2.293–3.984s，其中7组B全低、21重叠、8全高，coarse-only也双向波动，不声称稳定退化。原5cm benchmark不含真实measured-only/multi-band性能负控，语义测试不替代其性能验证。
+
+没有一致整段收益，故不扩样、不保留理论优化，08/09两文件精确恢复HEAD93c3cf10。全部草案和原始数据留仓外；默认七包撤回检查15.00s通过，无生产改动保留。继续排查真实源更新、重试调度和缓存路径，不以正确性通过替代性能验收。
+
 ## 后续持续检查
 
 1. 墙前晚到路径的实际恢复与初始 full/partial/PCT 顺序，保留及时移动和真实避障

@@ -55,6 +55,8 @@ pub use route_follower::RouteFollower;
 #[cfg(feature = "surface-recovery-qualification")]
 pub use route_follower::route_change_scope_qualification;
 #[cfg(feature = "surface-recovery-qualification")]
+pub use route_follower::route_completed_slot_qualification;
+#[cfg(feature = "surface-recovery-qualification")]
 pub use route_follower::route_pending_source_qualification;
 #[cfg(feature = "surface-recovery-qualification")]
 pub use route_follower::route_r11_qualification;

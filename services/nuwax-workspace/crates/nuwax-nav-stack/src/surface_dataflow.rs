@@ -1194,6 +1194,8 @@ mod tests {
         #[cfg(feature = "surface-recovery-qualification")]
         include!("surface_route_change_scope_qualification.rs");
         #[cfg(feature = "surface-recovery-qualification")]
+        include!("surface_completed_slot_qualification.rs");
+        #[cfg(feature = "surface-recovery-qualification")]
         include!("surface_pending_source_qualification.rs");
         #[cfg(feature = "surface-recovery-qualification")]
         include!("surface_r11_qualification.rs");

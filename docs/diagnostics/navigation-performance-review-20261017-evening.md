@@ -597,6 +597,18 @@ Q-A2出现171.990100ms control、55.662638ms due延迟及2pose/4control漏拍，
 接受只限此次最小范围及两固定目标配对。阶段41旧broad拒绝未撤销，旧60不复用；原M1/M2可用候选被取消的问题仍未解。完整方法、负面与原始整数事件见[阶段42独立报告](navigation-pending-only-refresh-20261018.md)和[完整12case数据](navigation-pending-only-refresh-20261018.json)。最终合并qualification tests check通过（10s）、stack no-run通过（211s）、默认七包tests check通过（9s）；3个新诊断选择器实际各1、旧Q1为0。合并4驱动与正式A/B源逐字一致，生产与已测语义不变，没有新增N/Q样本或重复运行语义。
 
 
+## 第四十三阶段：已发布候选的取消与外层路径回收事实
+
+本轮仅保留诊断测试，无生产语义修改。三个completion ignored exact与两个retirement普通exact，实际list各1、分别一次PASS；runtime+stack资格check14s、增量no-run246s、默认七包tests check9s通过。默认feature闭包不含资格/profile。执行前将两项生命周期测试的前提断言移出Inputs锁，避免失败时锁poison干扰原RAII清理，原期待不变。
+
+C1/C2分别包括独立无更新对照及更新案例：原owner已真正发布135姿态full，active=false、pending=None，真实id/epoch及全部pose bits/frame/Timestamp核对一致。无更新时原step接纳；固定历史prefix [31,31,51] 或远端future [591,31,51] 更新后，候选完整票据、全边、当前body、connector和完整停车仍合法，但原粗范围相关取消递增epoch、清掉已发布结果，接纳为0。下一原step提交新源，不声称其已完成。此处与阶段39的kernel返回前暂停不同，没有worker hold或take/reinsert。
+
+C3原槽为448姿态full，同批prefix及固定hit [283,47,51] 实际碰撞edge142，原完整票据拒绝并取消；当前body/connector/停车仍合法。这保持真实受损候选负控，不以可用候选误取消为由放过碰撞。
+
+外层Inputs Arc<Route>：idle从2到1，原stop返回后0；in-flight从2到stop后1，正常release后0且stop曾仍排队。两例原Drop返回、closed和empty成立。Weak0不单独证明析构完成，也不等于内层RouteFollower的独立路径Arc。PlanningOwner现有退休payload已锁外释放，无改动理由；两点路径不证明回收延迟，无法据此解释既有urgent 50.767828ms失败，额外回收性能实验暂存。
+
+五选择器中包含completion五个独立案例及retirement两个案例，不能写成七个独立测试。无bridge、机器人、TTL或性能收益结论。原始事实记录见[阶段43记录](navigation-completed-slot-facts-20261018.json)。后续仅评审单C、无P、full-only候选的最小免提前取消；保留原retry-now/dirty/失败清理与后续真实接纳判断，尚未实施。
+
 ## 后续持续检查
 
 1. 墙前晚到路径的实际恢复与初始 full/partial/PCT 顺序，保留及时移动和真实避障

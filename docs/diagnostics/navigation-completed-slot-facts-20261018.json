@@ -1,0 +1,226 @@
+{
+  "baseline": "978ece88d4477bc62cf9bded4b22a9405dd47f2b",
+  "scope": "tests-only current-policy facts; no production optimization or timing claim",
+  "results": [
+    {
+      "group": "completion",
+      "package": "stack",
+      "ignored": true,
+      "selector": "lcm_dataflow::surface_dataflow::tests::selective_refresh_tests::completed_slot_m1_published_full_lost_on_historical_column",
+      "status": "PASS",
+      "actual_list_count": 1,
+      "pid": 15,
+      "exit_code": 0,
+      "wall_seconds": 0.8758094310760498,
+      "watchdog_elapsed": false,
+      "log": "completed_slot_m1_published_full_lost_on_historical_column.log"
+    },
+    {
+      "group": "completion",
+      "package": "stack",
+      "ignored": true,
+      "selector": "lcm_dataflow::surface_dataflow::tests::selective_refresh_tests::completed_slot_m2_published_full_lost_on_distant_future_column",
+      "status": "PASS",
+      "actual_list_count": 1,
+      "pid": 30,
+      "exit_code": 0,
+      "wall_seconds": 0.8191146850585938,
+      "watchdog_elapsed": false,
+      "log": "completed_slot_m2_published_full_lost_on_distant_future_column.log"
+    },
+    {
+      "group": "completion",
+      "package": "stack",
+      "ignored": true,
+      "selector": "lcm_dataflow::surface_dataflow::tests::selective_refresh_tests::completed_slot_m3_published_full_related_actual_hit_is_retired",
+      "status": "PASS",
+      "actual_list_count": 1,
+      "pid": 45,
+      "exit_code": 0,
+      "wall_seconds": 0.8219470977783203,
+      "watchdog_elapsed": false,
+      "log": "completed_slot_m3_published_full_related_actual_hit_is_retired.log"
+    },
+    {
+      "group": "retirement",
+      "package": "runtime",
+      "ignored": false,
+      "selector": "planner_worker::tests::path_retirement_facts::real_route_idle_stop_retires_last_outer_path_arc",
+      "status": "PASS",
+      "actual_list_count": 1,
+      "pid": 8,
+      "exit_code": 0,
+      "wall_seconds": 0.11530804634094238,
+      "watchdog_elapsed": false,
+      "log": "real_route_idle_stop_retires_last_outer_path_arc.log"
+    },
+    {
+      "group": "retirement",
+      "package": "runtime",
+      "ignored": false,
+      "selector": "planner_worker::tests::path_retirement_facts::real_route_inflight_stop_defers_outer_path_retirement_to_worker",
+      "status": "PASS",
+      "actual_list_count": 1,
+      "pid": 21,
+      "exit_code": 0,
+      "wall_seconds": 0.11594581604003906,
+      "watchdog_elapsed": false,
+      "log": "real_route_inflight_stop_defers_outer_path_retirement_to_worker.log"
+    }
+  ],
+  "events": [
+    {
+      "selector": "lcm_dataflow::surface_dataflow::tests::selective_refresh_tests::completed_slot_m1_published_full_lost_on_historical_column",
+      "event": "COMPLETED_SLOT_READY id=1 epoch=1 current_epoch=1 active=false pending=None full=true receipt_match=true mirror_all_pose_bits_frame_full_stamp_match=true poses=135"
+    },
+    {
+      "selector": "lcm_dataflow::surface_dataflow::tests::selective_refresh_tests::completed_slot_m1_published_full_lost_on_historical_column",
+      "event": "COMPLETED_SLOT_PREREQUISITE id=1 epoch=1 progress=12 end=17 horizon=5 poses=135 ready_full=true active=false pending=None mirror_exact=true no_worker_hold=true"
+    },
+    {
+      "selector": "lcm_dataflow::surface_dataflow::tests::selective_refresh_tests::completed_slot_m1_published_full_lost_on_historical_column",
+      "event": "COMPLETED_SLOT_CLEANUP returned=true original_drop_join_result_not_exposed=true"
+    },
+    {
+      "selector": "lcm_dataflow::surface_dataflow::tests::selective_refresh_tests::completed_slot_m1_published_full_lost_on_historical_column",
+      "event": "COMPLETED_SLOT_CONTROL id=1 original_published_full_consumed=true original_admission=1 checked_nonzero=true cleanup_returned=true no_performance_claim=true"
+    },
+    {
+      "selector": "lcm_dataflow::surface_dataflow::tests::selective_refresh_tests::completed_slot_m1_published_full_lost_on_historical_column",
+      "event": "COMPLETED_SLOT_READY id=1 epoch=1 current_epoch=1 active=false pending=None full=true receipt_match=true mirror_all_pose_bits_frame_full_stamp_match=true poses=135"
+    },
+    {
+      "selector": "lcm_dataflow::surface_dataflow::tests::selective_refresh_tests::completed_slot_m1_published_full_lost_on_historical_column",
+      "event": "COMPLETED_SLOT_PREREQUISITE id=1 epoch=1 progress=12 end=17 horizon=5 poses=135 ready_full=true active=false pending=None mirror_exact=true no_worker_hold=true"
+    },
+    {
+      "selector": "lcm_dataflow::surface_dataflow::tests::selective_refresh_tests::completed_slot_m1_published_full_lost_on_historical_column",
+      "event": "COMPLETED_SLOT_CLEANUP returned=true original_drop_join_result_not_exposed=true"
+    },
+    {
+      "selector": "lcm_dataflow::surface_dataflow::tests::selective_refresh_tests::completed_slot_m1_published_full_lost_on_historical_column",
+      "event": "COMPLETED_SLOT_BASELINE cell=[31, 31, 51] id=1 actual_ready_before_update=true full_candidate_original_ticket_allowed=true latest_all_edges_body_connector_stop_valid=true original_epoch_bumped=true original_slot_cleared=true original_admission=0 next_original_submit=1 cleanup_returned=true no_performance_claim=true"
+    },
+    {
+      "selector": "lcm_dataflow::surface_dataflow::tests::selective_refresh_tests::completed_slot_m2_published_full_lost_on_distant_future_column",
+      "event": "COMPLETED_SLOT_READY id=1 epoch=1 current_epoch=1 active=false pending=None full=true receipt_match=true mirror_all_pose_bits_frame_full_stamp_match=true poses=135"
+    },
+    {
+      "selector": "lcm_dataflow::surface_dataflow::tests::selective_refresh_tests::completed_slot_m2_published_full_lost_on_distant_future_column",
+      "event": "COMPLETED_SLOT_PREREQUISITE id=1 epoch=1 progress=12 end=17 horizon=5 poses=135 ready_full=true active=false pending=None mirror_exact=true no_worker_hold=true"
+    },
+    {
+      "selector": "lcm_dataflow::surface_dataflow::tests::selective_refresh_tests::completed_slot_m2_published_full_lost_on_distant_future_column",
+      "event": "COMPLETED_SLOT_CLEANUP returned=true original_drop_join_result_not_exposed=true"
+    },
+    {
+      "selector": "lcm_dataflow::surface_dataflow::tests::selective_refresh_tests::completed_slot_m2_published_full_lost_on_distant_future_column",
+      "event": "COMPLETED_SLOT_CONTROL id=1 original_published_full_consumed=true original_admission=1 checked_nonzero=true cleanup_returned=true no_performance_claim=true"
+    },
+    {
+      "selector": "lcm_dataflow::surface_dataflow::tests::selective_refresh_tests::completed_slot_m2_published_full_lost_on_distant_future_column",
+      "event": "COMPLETED_SLOT_READY id=1 epoch=1 current_epoch=1 active=false pending=None full=true receipt_match=true mirror_all_pose_bits_frame_full_stamp_match=true poses=135"
+    },
+    {
+      "selector": "lcm_dataflow::surface_dataflow::tests::selective_refresh_tests::completed_slot_m2_published_full_lost_on_distant_future_column",
+      "event": "COMPLETED_SLOT_PREREQUISITE id=1 epoch=1 progress=12 end=17 horizon=5 poses=135 ready_full=true active=false pending=None mirror_exact=true no_worker_hold=true"
+    },
+    {
+      "selector": "lcm_dataflow::surface_dataflow::tests::selective_refresh_tests::completed_slot_m2_published_full_lost_on_distant_future_column",
+      "event": "COMPLETED_SLOT_CLEANUP returned=true original_drop_join_result_not_exposed=true"
+    },
+    {
+      "selector": "lcm_dataflow::surface_dataflow::tests::selective_refresh_tests::completed_slot_m2_published_full_lost_on_distant_future_column",
+      "event": "COMPLETED_SLOT_BASELINE cell=[591, 31, 51] id=1 actual_ready_before_update=true full_candidate_original_ticket_allowed=true latest_all_edges_body_connector_stop_valid=true original_epoch_bumped=true original_slot_cleared=true original_admission=0 next_original_submit=1 cleanup_returned=true no_performance_claim=true"
+    },
+    {
+      "selector": "lcm_dataflow::surface_dataflow::tests::selective_refresh_tests::completed_slot_m3_published_full_related_actual_hit_is_retired",
+      "event": "COMPLETED_SLOT_READY id=1 epoch=1 current_epoch=1 active=false pending=None full=true receipt_match=true mirror_all_pose_bits_frame_full_stamp_match=true poses=448"
+    },
+    {
+      "selector": "lcm_dataflow::surface_dataflow::tests::selective_refresh_tests::completed_slot_m3_published_full_related_actual_hit_is_retired",
+      "event": "COMPLETED_SLOT_PREREQUISITE id=1 epoch=1 progress=12 end=17 horizon=5 poses=448 ready_full=true active=false pending=None mirror_exact=true no_worker_hold=true"
+    },
+    {
+      "selector": "lcm_dataflow::surface_dataflow::tests::selective_refresh_tests::completed_slot_m3_published_full_related_actual_hit_is_retired",
+      "event": "COMPLETED_SLOT_COMBINED_WRITER fixed_cells=[[31, 31, 51], [283, 47, 51]] fine_size=0.05 fine=[[31, 31], [283, 47]] planner_size=0.1 coarse=[[15, 15], [141, 23]]"
+    },
+    {
+      "selector": "lcm_dataflow::surface_dataflow::tests::selective_refresh_tests::completed_slot_m3_published_full_related_actual_hit_is_retired",
+      "event": "COMPLETED_SLOT_FIXED_ACTUAL_HIT first_new_edge_rejection=Some((142, \"occupied geometry intersects the configured body volume\"))"
+    },
+    {
+      "selector": "lcm_dataflow::surface_dataflow::tests::selective_refresh_tests::completed_slot_m3_published_full_related_actual_hit_is_retired",
+      "event": "COMPLETED_SLOT_CLEANUP returned=true original_drop_join_result_not_exposed=true"
+    },
+    {
+      "selector": "lcm_dataflow::surface_dataflow::tests::selective_refresh_tests::completed_slot_m3_published_full_related_actual_hit_is_retired",
+      "event": "COMPLETED_SLOT_HIT_BASELINE id=1 actual_ready_before_update=true fixed_prefix_and_hit=true original_ticket_denied=true actual_full_edge_hit=true current_body_connector_stop_valid=true original_epoch_bumped=true original_slot_cleared=true original_admission=0 cleanup_returned=true no_performance_claim=true"
+    },
+    {
+      "selector": "planner_worker::tests::path_retirement_facts::real_route_idle_stop_retires_last_outer_path_arc",
+      "event": "PATH_RETIREMENT_FACT idle initial_strong=2 before_stop_strong=1 after_stop_strong=0 points=2 closed=true final_empty=true cleanup_returned=true"
+    },
+    {
+      "selector": "planner_worker::tests::path_retirement_facts::real_route_inflight_stop_defers_outer_path_retirement_to_worker",
+      "event": "PATH_RETIREMENT_FACT inflight initial_strong=2 after_stop_strong=1 after_worker_strong=0 stop_still_queued=true points=2 closed=true final_empty=true cleanup_returned=true"
+    }
+  ],
+  "preservation": {
+    "head": "978ece88d4477bc62cf9bded4b22a9405dd47f2b",
+    "old_files_insert_only": true,
+    "new_items_scope": "existing cfg(test) / surface-recovery-qualification only; explicit review completed",
+    "files": [
+      {
+        "path": "services/nuwax-workspace/crates/nuwax-nav-runtime/src/planning_owner.rs",
+        "original_lines_retained_in_order": true,
+        "insert_only": true,
+        "inserted_lines": 14,
+        "current_bytes_equal_freeze": true
+      },
+      {
+        "path": "services/nuwax-workspace/crates/nuwax-nav-runtime/src/route_follower.rs",
+        "original_lines_retained_in_order": true,
+        "insert_only": true,
+        "inserted_lines": 4,
+        "current_bytes_equal_freeze": true
+      },
+      {
+        "path": "services/nuwax-workspace/crates/nuwax-nav-runtime/src/lib.rs",
+        "original_lines_retained_in_order": true,
+        "insert_only": true,
+        "inserted_lines": 2,
+        "current_bytes_equal_freeze": true
+      },
+      {
+        "path": "services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_dataflow.rs",
+        "original_lines_retained_in_order": true,
+        "insert_only": true,
+        "inserted_lines": 2,
+        "current_bytes_equal_freeze": true
+      },
+      {
+        "path": "services/nuwax-workspace/crates/nuwax-nav-runtime/src/route_completed_slot_qualification.rs",
+        "new_file": true,
+        "current_bytes_equal_freeze": true
+      },
+      {
+        "path": "services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_completed_slot_qualification.rs",
+        "new_file": true,
+        "current_bytes_equal_freeze": true
+      },
+      {
+        "path": "services/nuwax-workspace/crates/nuwax-nav-runtime/src/planner_worker.rs",
+        "original_lines_retained_in_order": true,
+        "insert_only": true,
+        "inserted_lines": 1,
+        "current_bytes_equal_freeze": true
+      },
+      {
+        "path": "services/nuwax-workspace/crates/nuwax-nav-runtime/src/worker_path_retirement_facts.rs",
+        "new_file": true,
+        "current_bytes_equal_freeze": true
+      }
+    ]
+  }
+}

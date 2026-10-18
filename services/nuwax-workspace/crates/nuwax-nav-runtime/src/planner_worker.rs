@@ -690,6 +690,7 @@ impl Drop for PlannerWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod path_retirement_facts { include!("worker_path_retirement_facts.rs"); }
     include!("worker_first_delivery_tests.rs");
     include!("worker_geometry_recheck_tests.rs");
     mod snapshot_tests { use super::*; include!("worker_snapshot_tests.rs"); }

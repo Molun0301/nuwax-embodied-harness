@@ -673,6 +673,10 @@ pub mod route_r11_qualification;
 #[path = "route_pending_only_nohold_qualification.rs"]
 pub mod route_pending_only_nohold_qualification;
 
+#[cfg(feature = "surface-recovery-qualification")]
+#[path = "route_completed_slot_qualification.rs"]
+pub mod route_completed_slot_qualification;
+
 #[cfg(test)]
 mod tests {
     use super::*;

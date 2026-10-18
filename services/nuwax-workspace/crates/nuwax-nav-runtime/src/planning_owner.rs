@@ -269,6 +269,20 @@ impl<T: Send + 'static, R: Send + 'static> PlanningOwner<T, R> {
         Some((slot.active, slot.completion.is_some()))
     }
 
+    /// Read-only semantic qualification of the real original completion slot.
+    /// The callback cannot take/reinsert, submit, cancel, or wait. Full mirror
+    /// comparison is tests-only audit overhead; it is not timing instrumentation.
+    #[cfg(feature = "surface-recovery-qualification")]
+    pub(crate) fn inspect_completion_slot_for_qualification<O>(
+        &self,
+        inspect: impl FnOnce(Option<&Completion<R>>, bool, Option<(u64,u64)>, bool, bool, u64) -> O,
+    ) -> Option<O> {
+        let slot = self.shared.exchange.lock().ok()?;
+        Some(inspect(slot.completion.as_ref(), slot.active,
+            slot.pending.as_ref().map(|request|(request.id,request.epoch)),
+            slot.closed, self.faulted(), self.epoch()))
+    }
+
     pub fn take(&self) -> Option<Completion<R>> {
         let result = self
             .shared

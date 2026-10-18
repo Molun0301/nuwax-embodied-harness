@@ -557,6 +557,25 @@ release 最小 `surface-recovery-qualification` lane 的6项定向测试全部�
 默认七包tests check通过（12.16s）；单一增量target、原release资格feature，既有三文件移除资格入口后逐字还原，另两个源仅用于显式资格驱动。
 
 
+## 第四十阶段：真实旧 pending 阻挡最新源的时序见证
+
+在阶段39基线 efeab10e 上，仅增加显式资格feature的 Q1-R 驱动。唯一执行者 exact 运行1项 ignored，实际1/1 PASS、退出码0。本审查已亲读 results.json、原始日志及原生产/阶段39未改证据。
+
+- A 在 x=12.55 使用真实墙图S0，返回完整448点候选后暂停。Writer 同 cells 发布真实 Empty S1；两个body和连接均合法的姿态输入推进到13.55，沿原250ms及原step提交 P(S1)。这是首次候选时序夹具，不是已有admission下的真实行走闭环
+- 固定新增点 [283,47,51] 形成真实 S2 Columns（fine [283,47]、coarse [141,23]）。S2后没有移动pose、修改mode或重试期限。当前body合法且原250ms截止已过，calls仍2、submitted仍指旧源P；A/P票据basis已到S2，实际P输入仍是S1
+- A被消费时，P已经直接从真实闭包入口读到S1并开始计算。日志中 P START 的单调时间为621.363ms，早于移走A票据的 TICK_RETURN 621.486ms。这是一次实际并发先后观察；take精确时刻未插桩，不能把tick返回当take时间
+- P实际返回完整489点候选。A/P旧源全边合法；同一个固定S2点分别使最新运动边142/99发生机体体积碰撞，两者完整票据都拒收，接纳数均0。由此证实此例等待确实让一份已被最新图破坏的旧源P先完成计算，而非仅“源标签较旧但路径仍有效”
+- 直到P被原step消费、清掉自己的submitted/ticket，R才真正从S2开始。R完整514点仅为返回观测，未据此声称接纳或运动。所有id按真实source/pose/time/mode/generation与提交receipt唯一对应，未把计算序号当request id
+
+时间/root/observed_ns、原量化与固定几何前提全部通过，未调点/墙/pose/预算；正常清理返回。SUBMIT日志在原schedule返回后观察receipt，不是提交线性化点；release ACK在owner闭包返回前，也不是已发布确认。
+
+结论：仅保留active作业、设置dirty而不处理最新pending来源，会留下真实的新源搜索延后风险；等A消费结束再处理P也可能太晚。下一方案须同时保持A/P独立票据、原两槽与锁、pending原子替换和重试语义。尚未实施生产改动；人工barrier、这些时间差及kernel耗时都不是生产提速数据。
+
+范围：本项仍仅首次候选、固定持久地形与姿态输入回放；未覆盖已有admission、删除、Unknown或真实桥接计时。
+
+默认七包tests check通过（10.15s）；唯一增量target、原release资格feature，阶段39测试与生产策略均未修改。
+
+
 ## 后续持续检查
 
 1. 墙前晚到路径的实际恢复与初始 full/partial/PCT 顺序，保留及时移动和真实避障

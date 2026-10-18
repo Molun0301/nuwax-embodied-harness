@@ -299,3 +299,99 @@ async fn delivery_gap_renewal_runs_while_publication_is_pending() {
     assert!(renewed, "renewal waited behind geometry");
     assert_eq!(pending.applied_commands, applied_before, "test must observe the open publication window");
 }
+
+
+// Explicit observation of the unchanged urgent-cancel regression. This does not
+// replace its ordinary-suite result or change its 20 ms latency requirement.
+#[cfg(feature = "surface-recovery-qualification")]
+#[tokio::test]
+#[ignore = "explicit urgent-cancel timeline; retains the original latency assertion"]
+async fn delivery_gap_observe_urgent_cancel_timeline() {
+    let (scheduler, _, release) = delivery_gap_fixture(DEFAULT_TICK_INTERVAL).await;
+    // A small, preallocated session; every lost record is reported below. The
+    // existing sink uses try_lock and never waits for its recording buffer.
+    let trace = crate::qualification_timing::TraceSession::start(256);
+    let scheduler = scheduler.with_qualification_timing(trace.sink());
+    let (handle, task) = spawn_scheduler(scheduler);
+    let urgent = handle.urgent_tx.clone();
+    let (reply, response) = oneshot::channel();
+    let (measured, measurement) = oneshot::channel();
+    let sender = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(70));
+        let began = std::time::Instant::now();
+        urgent.blocking_send(UrgentCommand::Cancel { session_id: "goal-1".into(), reply }).unwrap();
+        let queued = std::time::Instant::now();
+        response.blocking_recv().unwrap().unwrap();
+        let received = std::time::Instant::now();
+        let elapsed = received.duration_since(began);
+        // Keep B -> R as the original wall-time metric. No observer or printing
+        // runs on this thread inside that interval, apart from the Q clock read.
+        let _ = measured.send(elapsed);
+        (began, queued, received)
+    });
+    let publisher = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(120));
+        let before_release = std::time::Instant::now();
+        release.send(()).unwrap();
+        let after_release = std::time::Instant::now();
+        (before_release, after_release)
+    });
+    let measurement_result = tokio::time::timeout(Duration::from_secs(1), measurement).await;
+    let terminal_before_shutdown = handle.status().last_terminal;
+    // Retain outcomes until after cleanup so a latency failure or a missing
+    // measurement cannot suppress the diagnostic report. Shutdown's worker join
+    // stays outside the B -> R measurement, as in the original test.
+    let shutdown_result = handle.shutdown().await;
+    let task_result = task.await;
+    let sender_result = sender.join();
+    let publisher_result = publisher.join();
+    let mut report = trace.finish();
+    report.records.sort_by_key(|record| record.at_ns);
+    let at_ns = |at: std::time::Instant| at.duration_since(report.origin).as_nanos();
+    eprintln!(
+        "DELIVERY_GAP_CANCEL_TRACE capacity={} records={} record_capacity_bytes={} incomplete={} dropped_contended={} dropped_overflow={} dropped_poisoned={} dropped_closed_race={} open_spans_at_finish={} finish_buffer_unavailable={}",
+        report.capacity, report.records.len(), report.record_capacity_bytes, report.incomplete,
+        report.dropped_contended, report.dropped_overflow, report.dropped_poisoned,
+        report.dropped_closed_race, report.open_spans_at_finish, report.finish_buffer_unavailable,
+    );
+    eprintln!(
+        "DELIVERY_GAP_CANCEL_OUTCOME measurement={measurement_result:?} terminal_before_shutdown={terminal_before_shutdown:?} shutdown={shutdown_result:?} task={task_result:?}",
+    );
+    match &sender_result {
+        Ok((began, queued, received)) => eprintln!(
+            "DELIVERY_GAP_CANCEL_SENDER B_ns={} Q_ns={} R_ns={} send_call_ms={} receive_call_ms={} elapsed_ms={}",
+            at_ns(*began), at_ns(*queued), at_ns(*received),
+            queued.duration_since(*began).as_secs_f64() * 1000.0,
+            received.duration_since(*queued).as_secs_f64() * 1000.0,
+            received.duration_since(*began).as_secs_f64() * 1000.0,
+        ),
+        Err(_) => eprintln!("DELIVERY_GAP_CANCEL_SENDER missing=true reason=sender_thread_panicked"),
+    }
+    match &publisher_result {
+        Ok((before_release, after_release)) => eprintln!(
+            "DELIVERY_GAP_CANCEL_RELEASE P0_ns={} P1_ns={}",
+            at_ns(*before_release), at_ns(*after_release),
+        ),
+        Err(_) => eprintln!("DELIVERY_GAP_CANCEL_RELEASE missing=true reason=publisher_thread_panicked"),
+    }
+    eprintln!(
+        "DELIVERY_GAP_CANCEL_BOUNDARIES Q is sender-side send return, not actor dequeue; P0/P1 bracket release send, not worker receipt; no exact reply.send marker; terminal span end to R is an unresolved response tail",
+    );
+    for record in &report.records {
+        eprintln!(
+            "DELIVERY_GAP_CANCEL_EVENT at_ns={} phase={} source={} thread={:?} data={:?}",
+            record.at_ns, record.phase, record.source, record.thread, record.data,
+        );
+    }
+    let elapsed = measurement_result.expect("urgent-cancel measurement timed out")
+        .expect("urgent-cancel measurement sender closed");
+    assert_eq!(terminal_before_shutdown, Some(TerminalOutcome::Cancelled));
+    shutdown_result.unwrap();
+    task_result.unwrap().unwrap();
+    sender_result.unwrap();
+    publisher_result.unwrap();
+    assert!(elapsed < Duration::from_millis(20),
+        "urgent cancellation exceeded the original latency requirement: {elapsed:?}");
+    assert!(!report.incomplete,
+        "urgent-cancel timeline is incomplete; do not assign latency from a partial trace");
+}

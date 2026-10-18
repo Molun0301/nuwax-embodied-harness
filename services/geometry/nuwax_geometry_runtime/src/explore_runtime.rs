@@ -461,6 +461,13 @@ pub struct ChildNavigationCancelTicket {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChildNavigationCancelOutcome {
+    Pending(ChildNavigationCancelTicket),
+    /// Authoritative natural retirement, not a fabricated cancellation proof.
+    AlreadyTerminal(ChildNavigationTerminalProof),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChildNavigationCancelRecovery {
     pub ticket: ChildNavigationCancelTicket,
     pub failure: Option<String>,
@@ -561,7 +568,13 @@ pub trait ExploreNavigationSink: Send + Sync {
     async fn cancel(
         &self,
         lease: &ChildNavigationLease,
-    ) -> Result<ChildNavigationCancelTicket, String>;
+    ) -> Result<ChildNavigationCancelOutcome, String>;
+
+    /// Read only a natural terminal that authoritatively retired this exact
+    /// execution. An absent active lease alone is not proof of completion.
+    async fn terminal_result_for(&self, _lease: &ChildNavigationLease) -> Option<ChildNavigationResult> {
+        None
+    }
 
     /// Recover an exact cancellation receipt when the async response was lost.
     /// A receipt identifies the transaction only; ownership remains held until
@@ -741,6 +754,8 @@ struct ActiveChildNavigation {
     request_id: String,
     frontier_goal_id: String,
     lease: ChildNavigationLease,
+    /// False survives cancellation of the post-attachment receipt read.
+    terminal_receipt_checked: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -2263,8 +2278,20 @@ impl ExploreRuntimeHandle {
         let recovered = sink
             .recover_cancel_receipt(&lease)
             .is_some_and(|recovery| recovery.failure.is_none());
-        if recovered || sink.cancel(&lease).await.is_ok() {
+        if recovered {
             self.orphan_cancellations.mark_cancel_pending(&lease);
+        } else {
+            match sink.cancel(&lease).await {
+                Ok(ChildNavigationCancelOutcome::Pending(_)) => {
+                    self.orphan_cancellations.mark_cancel_pending(&lease);
+                }
+                Ok(ChildNavigationCancelOutcome::AlreadyTerminal(proof))
+                    if proof.lease.matches(&lease) => {
+                    self.orphan_cancellations.remove_terminal(&lease);
+                    return;
+                }
+                Ok(_) | Err(_) => {}
+            }
         }
         let _ = sink.retain_orphan_cancellation(lease.clone());
         if sink.orphan_lease_is_terminal(&lease).await {
@@ -3290,7 +3317,10 @@ impl ExploreRuntimeHandle {
                             .await;
                     }
                 },
-                Ok(Ok(ticket))
+                Ok(Ok(ChildNavigationCancelOutcome::AlreadyTerminal(proof))) => {
+                    return self.finish_already_terminal_child(&child.lease, proof).await;
+                }
+                Ok(Ok(ChildNavigationCancelOutcome::Pending(ticket)))
                     if ticket.cancel_generation > 0 && ticket.lease.matches(&child.lease) =>
                 {
                     (ticket, false)
@@ -3359,6 +3389,82 @@ impl ExploreRuntimeHandle {
                 .unwrap_or_else(|_| self.snapshot());
         }
         snapshot
+    }
+
+    async fn finish_already_terminal_child(
+        &self,
+        lease: &ChildNavigationLease,
+        proof: ChildNavigationTerminalProof,
+    ) -> ExploreRuntimeSnapshot {
+        if !proof.lease.matches(lease) {
+            return self.record_child_cancel_failure(lease,
+                "navigation sink returned an invalid natural-retirement result".into(), None).await;
+        }
+        let guard = self.inner.lock().await;
+        if guard.active_child.as_ref().is_none_or(|child| !child.lease.matches(lease))
+            || guard.pending_child_cancellation.is_none()
+        {
+            return self.snapshot();
+        }
+        if guard.pending_child_cancellation.as_ref().is_some_and(|pending| pending.ticket.is_some()) {
+            drop(guard);
+            return self.record_child_cancel_failure(lease,
+                "natural retirement cannot replace an assigned cancellation ticket".into(), None).await;
+        }
+        // Stop already closed source feedback admission. Complete only its
+        // retained logical action; preserve the original Nav natural terminal.
+        self.complete_pending_child_action(guard)
+    }
+
+    fn complete_pending_child_action(
+        &self,
+        mut guard: tokio::sync::MutexGuard<'_, ExploreRuntimeInner>,
+    ) -> ExploreRuntimeSnapshot {
+        let pending = guard
+            .pending_child_cancellation
+            .take()
+            .expect("pending child cancellation checked above");
+        guard
+            .active_child
+            .take()
+            .expect("active child checked above");
+        guard.no_frontier_since = None;
+        if guard.return_after_cancellation && pending.failure.is_none() {
+            guard.return_after_cancellation=false;
+            let snapshot=guard.snapshot(STATUS_ACTIVE,"当前子目标已物理停稳，等待返航路线与新租约");
+            drop(guard);return self.store_snapshot(snapshot);
+        }
+        guard.return_after_cancellation=false;
+        guard.progress_stopped_ns.get_or_insert_with(now_unix_nanos);
+        let (status, message, frontier_update) = if let Some(error) = pending.failure {
+            guard.request_compute_stop(ExplorationStopReason::ConsecutiveFailuresExceeded);
+            self.compute_service.wake.notify_one();
+            guard.last_stop = Some(ExplorationStopReason::ConsecutiveFailuresExceeded);
+            guard.last_stop_reason = "child_cancel_failed".to_string();
+            (
+                STATUS_FAILED,
+                format!("child cancellation failed before ownership settled: {error}"),
+                guard.update_frontiers(Vec::new()),
+            )
+        } else {
+            (
+                status_for_stop_reason(pending.action.reason),
+                pending.action.message,
+                guard.update_frontiers(Vec::new()),
+            )
+        };
+        let snapshot = guard.snapshot(status, message);
+        let backend_available = self.readiness_cache.lock().backend_available;
+        let readiness = Self::compute_readiness_locked(
+            &guard,
+            self.expected_map_frame.as_ref(),
+            backend_available,
+            self.navigation_sink.read().is_some(),
+        );
+        drop(guard);
+        *self.readiness_cache.lock() = readiness;
+        self.publish_frontiers(frontier_update);
+        self.store_snapshot(snapshot)
     }
 
     async fn record_child_cancel_failure(
@@ -3616,7 +3722,12 @@ impl ExploreRuntimeHandle {
             }
         }
 
-        if guard.active_child.is_some() {
+        if let Some(child) = guard.active_child.as_ref() {
+            if !child.terminal_receipt_checked {
+                let lease = child.lease.clone();
+                drop(guard);
+                return self.reconcile_child_terminal(&lease).await;
+            }
             let snapshot =
                 guard.snapshot(STATUS_ACTIVE, "waiting for child navigation terminal state");
             drop(guard);
@@ -4069,10 +4180,7 @@ impl ExploreRuntimeHandle {
             // to a retained exact-lease recovery task or remain in Explore's
             // persistent in-process orphan set for scheduler retry.
             self.orphan_cancellations.register(ticket.lease.clone());
-            if sink.cancel(&ticket.lease).await.is_ok() {
-                self.orphan_cancellations.mark_cancel_pending(&ticket.lease);
-            }
-            let _ = sink.retain_orphan_cancellation(ticket.lease);
+            self.reconcile_orphan_cancellation(&sink, ticket.lease).await;
             return self.snapshot();
         }
 
@@ -4081,14 +4189,36 @@ impl ExploreRuntimeHandle {
         guard.active_child = Some(ActiveChildNavigation {
             request_id: child_request_id.clone(),
             frontier_goal_id,
-            lease: ticket.lease,
+            lease: ticket.lease.clone(),
+            terminal_receipt_checked: false,
         });
         let snapshot = guard.snapshot(
             STATUS_ACTIVE,
             format!("child navigation accepted: {child_request_id}"),
         );
+        // Publish attached identity before any receipt read, in the same
+        // non-cancellable segment as installation. Live fanout can now find it.
+        self.store_snapshot(snapshot);
         drop(guard);
-        self.store_snapshot(snapshot)
+        self.reconcile_child_terminal(&ticket.lease).await
+    }
+
+    async fn reconcile_child_terminal(&self, lease: &ChildNavigationLease) -> ExploreRuntimeSnapshot {
+        let Some(sink) = self.navigation_sink.read().clone() else { return self.snapshot(); };
+        if let Some(result) = sink.terminal_result_for(lease).await {
+            // Admission itself persists before report's first completion await.
+            // Concurrent live/recovery delivery shares its original identity.
+            if let Err(error) = self.report_navigation_result(&lease.session_id, result).await {
+                tracing::debug!(child_request_id = %lease.session_id, %error,
+                    "retained child terminal no longer admitted by current exploration action");
+            }
+        } else {
+            let mut guard = self.inner.lock().await;
+            if let Some(child) = guard.active_child.as_mut().filter(|child| child.lease.matches(lease)) {
+                child.terminal_receipt_checked = true;
+            }
+        }
+        self.snapshot()
     }
 
     async fn record_dispatch_failure(
@@ -4387,51 +4517,7 @@ impl ExploreRuntimeHandle {
                 }
             }
 
-            let pending = guard
-                .pending_child_cancellation
-                .take()
-                .expect("pending child cancellation checked above");
-            guard
-                .active_child
-                .take()
-                .expect("active child checked above");
-            guard.no_frontier_since = None;
-            if guard.return_after_cancellation && pending.failure.is_none() {
-                guard.return_after_cancellation=false;
-                let snapshot=guard.snapshot(STATUS_ACTIVE,"当前子目标已物理停稳，等待返航路线与新租约");
-                drop(guard);return Ok(self.store_snapshot(snapshot));
-            }
-            guard.return_after_cancellation=false;
-            guard.progress_stopped_ns.get_or_insert_with(now_unix_nanos);
-            let (status, message, frontier_update) = if let Some(error) = pending.failure {
-                guard.request_compute_stop(ExplorationStopReason::ConsecutiveFailuresExceeded);
-                self.compute_service.wake.notify_one();
-                guard.last_stop = Some(ExplorationStopReason::ConsecutiveFailuresExceeded);
-                guard.last_stop_reason = "child_cancel_failed".to_string();
-                (
-                    STATUS_FAILED,
-                    format!("child cancellation failed before late ZEROED proof: {error}"),
-                    guard.update_frontiers(Vec::new()),
-                )
-            } else {
-                (
-                    status_for_stop_reason(pending.action.reason),
-                    pending.action.message,
-                    guard.update_frontiers(Vec::new()),
-                )
-            };
-            let snapshot = guard.snapshot(status, message);
-            let backend_available = self.readiness_cache.lock().backend_available;
-            let readiness = Self::compute_readiness_locked(
-                &guard,
-                self.expected_map_frame.as_ref(),
-                backend_available,
-                self.navigation_sink.read().is_some(),
-            );
-            drop(guard);
-            *self.readiness_cache.lock() = readiness;
-            self.publish_frontiers(frontier_update);
-            return Ok(self.store_snapshot(snapshot));
+            return Ok(self.complete_pending_child_action(guard));
         }
 
         let frontier_goal_id = active_child.frontier_goal_id.clone();
@@ -5442,6 +5528,11 @@ mod tests {
         cancel_error: StdMutex<Option<String>>,
         cancel_recovery: StdMutex<Option<ChildNavigationCancelRecovery>>,
         lease_override: StdMutex<Option<ChildNavigationLease>>,
+        receipt_reads: AtomicU64,
+        receipt_entered: tokio::sync::Notify,
+        receipt_release: StdMutex<Option<Arc<tokio::sync::Notify>>>,
+        terminal_result: StdMutex<Option<ChildNavigationResult>>,
+        cancel_outcome: StdMutex<Option<ChildNavigationCancelOutcome>>,
         next_goal_generation: AtomicU64,
         next_cancel_generation: AtomicU64,
         submit_entered: tokio::sync::Notify,
@@ -5496,10 +5587,21 @@ mod tests {
             Ok(ChildNavigationTicket { lease })
         }
 
+        async fn terminal_result_for(&self, _lease: &ChildNavigationLease) -> Option<ChildNavigationResult> {
+            self.receipt_reads.fetch_add(1, Ordering::SeqCst);
+            let release = { self.receipt_release.lock().unwrap().clone() };
+            if let Some(release) = release {
+                self.receipt_entered.notify_one();
+                release.notified().await;
+            }
+            self.terminal_result.lock().unwrap().clone()
+        }
+
         async fn cancel(
             &self,
             lease: &ChildNavigationLease,
-        ) -> Result<ChildNavigationCancelTicket, String> {
+        ) -> Result<ChildNavigationCancelOutcome, String> {
+            if let Some(outcome) = self.cancel_outcome.lock().unwrap().clone() { return Ok(outcome); }
             let cancel_release = { self.cancel_release.lock().unwrap().clone() };
             if let Some(release) = cancel_release {
                 self.cancel_entered.notify_one();
@@ -5512,10 +5614,10 @@ mod tests {
             if let Some(error) = self.cancel_error.lock().unwrap().clone() {
                 return Err(error);
             }
-            Ok(ChildNavigationCancelTicket {
+            Ok(ChildNavigationCancelOutcome::Pending(ChildNavigationCancelTicket {
                 lease: lease.clone(),
                 cancel_generation: self.next_cancel_generation.fetch_add(1, Ordering::SeqCst) + 1,
-            })
+            }))
         }
 
         fn recover_cancel_receipt(
@@ -5528,6 +5630,172 @@ mod tests {
                 .clone()
                 .filter(|recovery| recovery.ticket.lease.matches(lease))
         }
+    }
+
+    async fn receipt_test_source_history(handle: &ExploreRuntimeHandle) -> serde_json::Value {
+        let sources = handle.inspect_compute_checkpoint().await.expect("owner checkpoint inspection");
+        let wavefront = sources.iter().find(|source| source.name == "wavefront").unwrap();
+        serde_json::from_str(&wavefront.payload).unwrap()
+    }
+
+    fn assert_one_receipt_source_failure(history: &serde_json::Value) {
+        let failures = history[1]["failed_goals"].as_array().expect("Wavefront failed-goal history");
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0]["failures"], serde_json::json!(1));
+        assert_eq!(history[1]["blacklisted_goals"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn absent_child_terminal_receipt_is_read_once_per_child() {
+        let (handle, sink) = configured_handle();
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1).await.unwrap();
+        handle.start("receipt-none-once", "prefer_wavefront").await;
+        let active = handle.tick((2.0, 2.0)).await;
+        assert!(!active.child_task_id.is_empty());
+        assert_eq!(sink.receipt_reads.load(Ordering::SeqCst), 1);
+        for _ in 0..3 {
+            assert_eq!(handle.tick((2.0, 2.0)).await.child_task_id, active.child_task_id);
+        }
+        assert_eq!(sink.receipt_reads.load(Ordering::SeqCst), 1);
+        let lease = active_child_lease(&handle).await;
+        handle.stop("receipt-none-once").await;
+        handle.report_navigation_result(&lease.session_id,
+            ChildNavigationResult::Cancelled(zero_proof(&lease, 1))).await.unwrap();
+    }
+
+    async fn child_paused_in_receipt_read(
+        parent: &str,
+    ) -> (ExploreRuntimeHandle, Arc<RecordingNavSink>, tokio::task::JoinHandle<ExploreRuntimeSnapshot>, Arc<tokio::sync::Notify>) {
+        let (handle, sink) = configured_handle();
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1).await.unwrap();
+        handle.start(parent, "prefer_wavefront").await;
+        let release = Arc::new(tokio::sync::Notify::new());
+        *sink.receipt_release.lock().unwrap() = Some(release.clone());
+        let tick = {
+            let handle = handle.clone();
+            tokio::spawn(async move { handle.tick((2.0, 2.0)).await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), sink.receipt_entered.notified()).await
+            .expect("child attached before receipt read");
+        assert!(!handle.snapshot().child_task_id.is_empty());
+        assert!(handle.inner.lock().await.pending_child_dispatch.is_none());
+        (handle, sink, tick, release)
+    }
+
+    #[tokio::test]
+    async fn cancelled_child_receipt_waiter_resumes_on_next_tick() {
+        let parent = "receipt-resume";
+        let (handle, sink, tick, _) = child_paused_in_receipt_read(parent).await;
+        let lease = active_child_lease(&handle).await;
+        *sink.terminal_result.lock().unwrap() = Some(ChildNavigationResult::Failed {
+            proof: terminal_proof(&lease), reason: "retained failure".into(),
+        });
+        tick.abort();
+        assert!(tick.await.unwrap_err().is_cancelled());
+        assert!(!handle.inner.lock().await.active_child.as_ref().unwrap().terminal_receipt_checked);
+        *sink.receipt_release.lock().unwrap() = None;
+        let resumed = handle.tick((2.0, 2.0)).await;
+        assert!(resumed.child_task_id.is_empty());
+        assert_eq!(sink.receipt_reads.load(Ordering::SeqCst), 2);
+        assert_eq!(sink.submitted.lock().unwrap().len(), 1, "resume must not resubmit");
+        assert!(handle.frontier_snapshot().frontiers.is_empty());
+        assert_one_receipt_source_failure(&receipt_test_source_history(&handle).await);
+        handle.stop(parent).await;
+    }
+
+    #[tokio::test]
+    async fn live_and_recovered_child_terminal_share_one_feedback_admission() {
+        for reached in [false, true] {
+            let parent = if reached { "receipt-live-reached" } else { "receipt-live-failed" };
+            let (handle, sink, tick, release) = child_paused_in_receipt_read(parent).await;
+            let lease = active_child_lease(&handle).await;
+            let result = if reached { ChildNavigationResult::Reached(terminal_proof(&lease)) }
+                else { ChildNavigationResult::Failed { proof: terminal_proof(&lease), reason: "one failure".into() } };
+            let history = handle.inner.lock().await.compute.history;
+            *sink.terminal_result.lock().unwrap() = Some(result.clone());
+            handle.report_navigation_result(&lease.session_id, result).await.unwrap();
+            release.notify_one();
+            let completed = tokio::time::timeout(Duration::from_secs(2), tick).await.unwrap().unwrap();
+            assert!(completed.child_task_id.is_empty());
+            let inner = handle.inner.lock().await;
+            assert_eq!(inner.reached_goals, if reached { 1 } else { 0 });
+            assert_eq!(inner.compute.history, history + 1);
+            assert!(inner.active_child.is_none());
+            drop(inner);
+            if !reached {
+                assert_one_receipt_source_failure(&receipt_test_source_history(&handle).await);
+            }
+            handle.stop(parent).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_wins_while_child_receipt_waits_without_reopening_feedback() {
+        let parent = "receipt-stop-wins";
+        let (handle, sink, tick, release) = child_paused_in_receipt_read(parent).await;
+        let lease = active_child_lease(&handle).await;
+        let result = ChildNavigationResult::Reached(terminal_proof(&lease));
+        *sink.terminal_result.lock().unwrap() = Some(result.clone());
+        *sink.cancel_outcome.lock().unwrap() = Some(ChildNavigationCancelOutcome::AlreadyTerminal(terminal_proof(&lease)));
+        let history = handle.inner.lock().await.compute.history;
+        let stopped = handle.stop(parent).await;
+        assert_eq!(stopped.status, STATUS_CANCELLED);
+        assert!(stopped.child_task_id.is_empty());
+        release.notify_one();
+        let settled = tokio::time::timeout(Duration::from_secs(2), tick).await.unwrap().unwrap();
+        assert_eq!(settled.status, STATUS_CANCELLED);
+        let inner = handle.inner.lock().await;
+        assert!(!inner.logical_active);
+        assert_eq!(inner.reached_goals, 0, "Stop closed ordinary source admission");
+        assert_eq!(inner.compute.history, history, "Stop must not admit ordinary feedback");
+    }
+
+    #[tokio::test]
+    async fn resumed_child_receipt_preserves_existing_duration_stop_priority() {
+        let parent = "receipt-duration-priority";
+        let (handle, sink, tick, _) = child_paused_in_receipt_read(parent).await;
+        let lease = active_child_lease(&handle).await;
+        let result = ChildNavigationResult::Reached(terminal_proof(&lease));
+        *sink.terminal_result.lock().unwrap() = Some(result.clone());
+        *sink.cancel_outcome.lock().unwrap() = Some(ChildNavigationCancelOutcome::AlreadyTerminal(terminal_proof(&lease)));
+        tick.abort();
+        assert!(tick.await.unwrap_err().is_cancelled());
+        *sink.receipt_release.lock().unwrap() = None;
+        {
+            let mut inner = handle.inner.lock().await;
+            Arc::make_mut(inner.active_config.as_mut().unwrap()).stop_conditions.max_duration_ms = Some(1);
+            inner.started_at_ns = now_unix_nanos().saturating_sub(2_000_000);
+        }
+        let stopped = handle.tick((2.0, 2.0)).await;
+        assert_eq!(stopped.last_stop_reason, "duration_exceeded");
+        assert!(stopped.child_task_id.is_empty());
+        assert_eq!(sink.receipt_reads.load(Ordering::SeqCst), 1,
+            "existing stop priority precedes a resumed ordinary receipt read");
+        assert_eq!(handle.inner.lock().await.reached_goals, 0);
+    }
+
+    #[tokio::test]
+    async fn already_terminal_cannot_replace_a_locally_retained_cancel_ticket() {
+        let (handle, sink) = configured_handle();
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1).await.unwrap();
+        handle.start("receipt-local-ticket", "prefer_wavefront").await;
+        handle.tick((2.0, 2.0)).await;
+        let lease = active_child_lease(&handle).await;
+        handle.stop("receipt-local-ticket").await;
+        let before = handle.inner.lock().await.pending_child_cancellation.as_ref().unwrap().ticket.clone();
+        assert!(before.is_some());
+        let result = handle.finish_already_terminal_child(&lease, terminal_proof(&lease)).await;
+        assert_eq!(result.status, STATUS_FAILED);
+        assert_eq!(result.child_task_id, lease.session_id);
+        assert_eq!(handle.inner.lock().await.pending_child_cancellation.as_ref().unwrap().ticket, before);
+        assert!(handle.blocks_mapping_mutation().await);
+        assert_eq!(sink.cancelled.lock().unwrap().len(), 1);
+        let ticket = before.expect("original retained cancel ticket");
+        let settled = handle.report_navigation_result(&lease.session_id,
+            ChildNavigationResult::Cancelled(zero_proof(&lease, ticket.cancel_generation))).await.unwrap();
+        assert_eq!(settled.status, STATUS_FAILED, "prior failure remains visible after exact ZERO");
+        assert!(settled.child_task_id.is_empty());
+        assert!(!handle.blocks_mapping_mutation().await);
     }
 
     struct StaticPoseProvider;

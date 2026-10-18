@@ -2839,10 +2839,11 @@ async fn geometry_runtime_retained_tasks_settle_before_mapping_and_shm_cleanup()
         let handle = fixture.handle();
         let lease = start_topology_exploration_goal(&handle, "production-topology-cancel").await;
         let sink = handle.explore.navigation_sink_for_tests();
-        let ticket = sink
+        let crate::explore_runtime::ChildNavigationCancelOutcome::Pending(ticket) = sink
             .cancel(&exploration_child_lease(&lease))
             .await
-            .expect("production correlated cancellation ticket");
+            .expect("production correlated cancellation ticket")
+        else { panic!("active production goal must receive a cancellation ticket"); };
         wait_for_topology_condition("production correlated retry gate", || {
             fixture.topology_control().cancel_retry_entered()
         })
@@ -5948,10 +5949,33 @@ impl crate::explore_runtime::ExploreNavigationSink for ExploreNavigationBridge {
         Ok(crate::explore_runtime::ChildNavigationTicket { lease })
     }
 
+    async fn terminal_result_for(
+        &self,
+        expected: &crate::explore_runtime::ChildNavigationLease,
+    ) -> Option<crate::explore_runtime::ChildNavigationResult> {
+        let update = self.nav.naturally_retired_terminal_for(&crate::nav_runtime::CancelGoalInput {
+            goal_id: expected.session_id.clone(),
+            owner_kind: expected.owner_kind,
+            parent_request_id: expected.parent_request_id.clone(),
+            goal_generation: expected.goal_generation,
+            producer_runtime_generation: expected.producer_runtime_generation,
+        }).await?;
+        exploration_navigation_terminal_result(&update)
+    }
+
     async fn cancel(
         &self,
         expected: &crate::explore_runtime::ChildNavigationLease,
-    ) -> Result<crate::explore_runtime::ChildNavigationCancelTicket, String> {
+    ) -> Result<crate::explore_runtime::ChildNavigationCancelOutcome, String> {
+        use crate::explore_runtime::{ChildNavigationCancelOutcome, ChildNavigationResult};
+        let natural_terminal = |result| match result {
+            ChildNavigationResult::Reached(proof) | ChildNavigationResult::Failed { proof, .. } =>
+                Some(ChildNavigationCancelOutcome::AlreadyTerminal(proof)),
+            ChildNavigationResult::Cancelled(_) | ChildNavigationResult::CancelFailed { .. } => None,
+        };
+        if let Some(outcome) = self.terminal_result_for(expected).await.and_then(natural_terminal) {
+            return Ok(outcome);
+        }
         let facade = self.facade_handle();
         let lease = self
             .nav
@@ -5962,7 +5986,14 @@ impl crate::explore_runtime::ExploreNavigationSink for ExploreNavigationBridge {
                 projected.matches(expected)
                     && lease.owner_kind == schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD
             })
-            .ok_or_else(|| "exploration child does not own the active goal lease".to_string())?;
+            ;
+        let Some(lease) = lease else {
+            // Retirement can win after the first lookup, before this lease read.
+            return match self.terminal_result_for(expected).await.and_then(natural_terminal) {
+                Some(outcome) => Ok(outcome),
+                None => Err("exploration child does not own the active goal lease".to_string()),
+            };
+        };
         let outcome = crate::nav_runtime::cancel(
             &facade,
             &self.nav,
@@ -5978,6 +6009,13 @@ impl crate::explore_runtime::ExploreNavigationSink for ExploreNavigationBridge {
         let failed = outcome.state.status.eq_ignore_ascii_case("FAILED");
         let message = outcome.state.message.clone();
         let cancel = self.nav.cancel_snapshot();
+        if failed {
+            // Natural retirement can win after lease lookup but before cancel
+            // admission. Settle from authority before unrelated telemetry awaits.
+            if let Some(outcome) = self.terminal_result_for(expected).await.and_then(natural_terminal) {
+                return Ok(outcome);
+            }
+        }
         self.publish_state(outcome.state, outcome.lease).await;
         if failed {
             Err(message)
@@ -5991,10 +6029,10 @@ impl crate::explore_runtime::ExploreNavigationSink for ExploreNavigationBridge {
                 return Err("navigation cancel tracker returned a mismatched ticket".to_string());
             }
             self.spawn_correlated_cancel_retry(lease, cancel.generation)?;
-            Ok(crate::explore_runtime::ChildNavigationCancelTicket {
+            Ok(ChildNavigationCancelOutcome::Pending(crate::explore_runtime::ChildNavigationCancelTicket {
                 lease: cancel_lease,
                 cancel_generation: cancel.generation,
-            })
+            }))
         }
     }
 
@@ -6074,7 +6112,16 @@ impl crate::explore_runtime::ExploreNavigationSink for ExploreNavigationBridge {
                     )
                     .await
                     {
-                        Ok(_) => registry.mark_cancel_pending(&retained_lease),
+                        Ok(crate::explore_runtime::ChildNavigationCancelOutcome::Pending(_)) => {
+                            registry.mark_cancel_pending(&retained_lease);
+                        }
+                        Ok(crate::explore_runtime::ChildNavigationCancelOutcome::AlreadyTerminal(proof))
+                            if proof.lease.matches(&retained_lease) => {
+                            registry.remove_terminal(&retained_lease);
+                            return Ok(());
+                        }
+                        Ok(_) => warn!(session_id = %retained_lease.session_id,
+                            "orphan cancellation returned a mismatched natural terminal"),
                         Err(error) => warn!(
                             session_id = %retained_lease.session_id,
                             %error,
@@ -21454,12 +21501,23 @@ mod exploration_cancel_retry_tests {
     #[derive(Clone, Default)]
     struct RecordingBackend {
         frames: Arc<Mutex<Vec<RawLcmFrame>>>,
+        goal_publish_pause: Arc<Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>,
     }
 
     #[async_trait]
     impl LcmBackend for RecordingBackend {
         async fn publish(&self, frame: RawLcmFrame) -> TransportResult<()> {
+            let goal = frame.msg_type.fqn() == "nuwax_msgs.GoalEnvelope";
             self.frames.lock().expect("recording backend").push(frame);
+            let pause = if goal {
+                self.goal_publish_pause.lock().expect("goal publish pause").take()
+            } else {
+                None
+            };
+            if let Some((entered, release)) = pause {
+                entered.notify_one();
+                release.notified().await;
+            }
             Ok(())
         }
 
@@ -21551,8 +21609,15 @@ mod exploration_cancel_retry_tests {
         async fn cancel(
             &self,
             lease: &crate::explore_runtime::ChildNavigationLease,
-        ) -> Result<crate::explore_runtime::ChildNavigationCancelTicket, String> {
+        ) -> Result<crate::explore_runtime::ChildNavigationCancelOutcome, String> {
             crate::explore_runtime::ExploreNavigationSink::cancel(&self.inner, lease).await
+        }
+
+        async fn terminal_result_for(
+            &self,
+            lease: &crate::explore_runtime::ChildNavigationLease,
+        ) -> Option<crate::explore_runtime::ChildNavigationResult> {
+            crate::explore_runtime::ExploreNavigationSink::terminal_result_for(&self.inner, lease).await
         }
     }
 
@@ -21701,9 +21766,10 @@ mod exploration_cancel_retry_tests {
     ) {
         let (bridge, backend, lease) = start_goal(goal_id).await;
         let expected = exploration_child_lease(&lease);
-        let ticket = crate::explore_runtime::ExploreNavigationSink::cancel(&bridge, &expected)
-            .await
-            .expect("exploration cancellation ticket");
+        let crate::explore_runtime::ChildNavigationCancelOutcome::Pending(ticket) =
+            crate::explore_runtime::ExploreNavigationSink::cancel(&bridge, &expected)
+                .await.expect("exploration cancellation ticket")
+        else { panic!("active test goal must receive a cancellation ticket"); };
         (bridge, backend, lease, ticket)
     }
 
@@ -21743,6 +21809,163 @@ mod exploration_cancel_retry_tests {
         let settled_count = backend.cancel_count();
         tokio::time::sleep(EXPLORATION_CANCEL_RETRY_INTERVAL + Duration::from_millis(100)).await;
         assert_eq!(backend.cancel_count(), settled_count);
+    }
+
+    // This gates the existing real bridge's transport publish future after the
+    // GoalEnvelope is recorded. It is not a synthetic ChildNavigationTicket.
+    async fn assert_terminal_before_exploration_attachment(status: &str) {
+        use crate::explore_runtime::ExploreRuntimeHandle;
+
+        let (bridge, backend) = configured_bridge().await;
+        let explore = ExploreRuntimeHandle::default_with_wavefront();
+        explore.set_navigation_sink(Arc::new(bridge.clone()));
+        // This bridge has no MappingAdapter, so Nav admission uses coordinate
+        // generation 0. Inspect owner history after Stop instead of requiring a
+        // public progress checkpoint with a positive coordinate generation.
+        explore
+            .ingest_committed_costmap_snapshot(
+                frontier_costmap(), test_committed_map_identity(1),
+            )
+            .await
+            .expect("committed exploration costmap");
+        let parent = format!("early-terminal-{}", status.to_ascii_lowercase());
+        assert_eq!(
+            explore.start(&parent, "prefer_wavefront").await.status,
+            crate::explore_runtime::STATUS_ACCEPTED,
+        );
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *backend.goal_publish_pause.lock().expect("goal publish pause") =
+            Some((entered.clone(), release.clone()));
+        let tick = {
+            let explore = explore.clone();
+            tokio::spawn(async move { explore.tick((2.0, 2.0)).await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("real bridge reached GoalEnvelope publication");
+        assert!(!tick.is_finished(), "submit has not returned its assigned ticket");
+        assert!(explore.snapshot().child_task_id.is_empty());
+        let lease = bridge.nav.active_goal_lease().await.expect("allocated Nav lease");
+        let envelope = {
+            let frames = backend.frames.lock().expect("recorded frames");
+            let goals: Vec<_> = frames.iter()
+                .filter(|frame| frame.msg_type.fqn() == "nuwax_msgs.GoalEnvelope")
+                .collect();
+            assert_eq!(goals.len(), 1);
+            schema::decode_goal_envelope_body(&goals[0].payload)
+                .expect("actual encoded GoalEnvelope")
+        };
+        assert_eq!(envelope.session_id, lease.session_id);
+        assert_eq!(envelope.parent_request_id, parent);
+        assert_eq!(envelope.goal_generation as u64, lease.goal_generation);
+        assert_eq!(envelope.producer_runtime_generation as u64, lease.producer_runtime_generation);
+        assert!(lease.goal_generation > 0 && lease.producer_runtime_generation > 0);
+
+        // A pre-path failure is a real terminal case. SUCCEEDED also exercises
+        // the same facade delivery contract; this test does not simulate motion.
+        let terminal = NavigationUpdate {
+            producer_runtime_generation: lease.producer_runtime_generation,
+            state: NavState {
+                status: status.into(),
+                message: if status == "FAILED" {
+                    "early route failure with measured stop".into()
+                } else {
+                    "early reached result with measured stop".into()
+                },
+                goal_id: lease.session_id.clone(),
+                timestamp_ns: crate::explore_runtime::now_unix_nanos(),
+                ..NavState::default()
+            },
+            feedback: NavigationFeedback {
+                owner_kind: lease.owner_kind,
+                parent_request_id: lease.parent_request_id.clone(),
+                goal_generation: lease.goal_generation,
+                producer_runtime_generation: lease.producer_runtime_generation,
+                path_revision: lease.path_revision,
+                planner_runtime_generation: lease.planner_runtime_generation,
+                guard_generation: crate::nav_runtime::test_motion_admission().guard_generation,
+                sink_ready: true,
+                zero_ack_id: format!("{parent}-measured-zero"),
+                zero_applied_monotonic_ns: crate::explore_runtime::now_monotonic_nanos(),
+                ..NavigationFeedback::default()
+            },
+        };
+        // Same string names cannot admit an old/different assigned lease.
+        for mismatch in 0..5 {
+            let mut wrong = terminal.clone();
+            match mismatch {
+                0 => wrong.state.goal_id.push_str("-old"),
+                1 => wrong.feedback.parent_request_id.push_str("-old"),
+                2 => wrong.feedback.owner_kind = schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV,
+                3 => wrong.feedback.goal_generation += 1,
+                _ => wrong.feedback.producer_runtime_generation += 1,
+            }
+            assert!(apply_typed_navigation_feedback(&bridge.nav, wrong).await.is_none());
+            assert_eq!(bridge.nav.active_goal_lease().await.as_ref(), Some(&lease));
+            assert!(bridge.nav.terminal_receipts().await.is_empty());
+        }
+        let terminal = apply_typed_navigation_feedback(&bridge.nav, terminal)
+            .await.expect("fully correlated measured terminal");
+        assert_eq!(terminal.state.status, status);
+        assert!(terminal.feedback.actuator_zeroed);
+        assert!(bridge.nav.active_goal_lease().await.is_none());
+        assert_eq!(bridge.nav.terminal_receipts().await.len(), 1);
+        let result = exploration_navigation_terminal_result(&terminal).expect("ordinary terminal");
+        // Repeat an already validated fanout as a delivery duplicate. Upstream
+        // wire duplicates after Nav retirement are separately rejected there.
+        for _ in 0..2 {
+            fanout_navigation_update(&bridge.state, &bridge.nav_state_tx, &explore, terminal.clone()).await;
+        }
+        assert!(explore.snapshot().child_task_id.is_empty());
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), tick)
+            .await.expect("real submit future settled").expect("exploration tick");
+        let after_attach = explore.snapshot();
+        let after_frontiers = explore.frontier_snapshot();
+
+        // Clean up even on the old/red implementation. This delayed direct
+        // delivery is AFTER the captured assertions and is not the tested repair.
+        explore.report_navigation_result(&lease.session_id, result.clone())
+            .await.expect("exact terminal or exact accepted duplicate");
+        explore.report_navigation_result(&lease.session_id, result)
+            .await.expect("exact duplicate stays idempotent");
+        // A replay of the already validated transport delivery must remain inert.
+        fanout_navigation_update(&bridge.state, &bridge.nav_state_tx, &explore, terminal).await;
+        let stopped = explore.stop(&parent).await;
+        assert_eq!(stopped.status, crate::explore_runtime::STATUS_CANCELLED);
+        assert!(stopped.child_task_id.is_empty());
+        assert_eq!(backend.cancel_count(), 0, "the child was already physically stopped");
+        assert!(bridge.nav.active_goal_lease().await.is_none());
+        // The source and exact child must settle without a second terminal event.
+        assert!(after_attach.child_task_id.is_empty(),
+            "terminal before submit return was lost; attached dead child {}", after_attach.child_task_id);
+        assert!(after_frontiers.frontiers.is_empty(),
+            "committed source still exposes the selected frontier after exact terminal");
+        // Controller diagnostics cache the last poll; inspect the authoritative
+        // source history through its existing owner lifecycle after normal Stop.
+        let sources = explore.inspect_compute_checkpoint().await.expect("settled owner checkpoint");
+        let source = sources.iter().find(|source| source.name == "wavefront").unwrap();
+        let history: serde_json::Value = serde_json::from_str(&source.payload).unwrap();
+        assert_eq!(history[1]["blacklisted_goals"], serde_json::json!([]));
+        if status == "FAILED" {
+            let failures = history[1]["failed_goals"].as_array().unwrap();
+            assert_eq!(failures.len(), 1);
+            assert_eq!(failures[0]["failures"], serde_json::json!(1),
+                "early/live/duplicate feedback must consume exactly one retry");
+        } else {
+            assert_eq!(history[1]["explored_goals"].as_array().unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn exploration_failed_before_submit_return_releases_selected_frontier() {
+        assert_terminal_before_exploration_attachment("FAILED").await;
+    }
+
+    #[tokio::test]
+    async fn exploration_reached_before_submit_return_releases_selected_frontier() {
+        assert_terminal_before_exploration_attachment("SUCCEEDED").await;
     }
 
     #[tokio::test]
@@ -21861,6 +22084,392 @@ mod exploration_cancel_retry_tests {
             crate::explore_runtime::ExploreNavigationSink::recover_cancel_receipt(&bridge, &wrong)
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn natural_retirement_keeps_its_original_body_after_late_old_path_receipt() {
+        use crate::explore_runtime::{ChildNavigationCancelOutcome, ExploreNavigationSink};
+        let (bridge, backend, lease) = start_goal("receipt-body-provenance").await;
+        let terminal = apply_typed_navigation_feedback(
+            &bridge.nav, measured_natural_terminal(&lease, "FAILED"),
+        ).await.expect("actual natural retirement");
+        let expected = exploration_child_lease(&lease);
+        let mut late = terminal.clone();
+        late.state.status = "SUCCEEDED".into();
+        late.state.message = "late other path body must not inherit retirement".into();
+        late.feedback.path_revision += 1;
+        late.feedback.zero_ack_id = "late-other-body".into();
+        bridge.nav.retain_terminal_receipt(&late).await;
+        let input = crate::nav_runtime::CancelGoalInput {
+            goal_id: lease.session_id.clone(), owner_kind: lease.owner_kind,
+            parent_request_id: lease.parent_request_id.clone(), goal_generation: lease.goal_generation,
+            producer_runtime_generation: lease.producer_runtime_generation,
+        };
+        for retained in [bridge.nav.terminal_receipt_for(&input).await,
+            bridge.nav.naturally_retired_terminal_for(&input).await] {
+            let retained = retained.expect("original authoritative receipt remains");
+            assert_eq!(retained.state.status, terminal.state.status);
+            assert_eq!(retained.state.message, terminal.state.message);
+            assert_eq!(retained.feedback.path_revision, terminal.feedback.path_revision);
+            assert_eq!(retained.feedback.zero_ack_id, terminal.feedback.zero_ack_id);
+        }
+        let ChildNavigationCancelOutcome::AlreadyTerminal(proof) = bridge.cancel(&expected).await.unwrap()
+            else { panic!("the retained natural retirement must not issue another cancel"); };
+        assert_eq!(proof.lease, expected);
+        assert_eq!(backend.cancel_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancel_admitted_after_idle_classification_cannot_become_already_terminal() {
+        use crate::explore_runtime::{ChildNavigationCancelOutcome, ExploreNavigationSink};
+        for phase in ["pending", "failed", "timed_out"] {
+            let (bridge, _backend, lease) = start_goal(&format!("classify-retain-{phase}")).await;
+            let (task_control, mut registrations) = GeometryRuntimeTaskControl::channel();
+            bridge.set_geometry_task_control_for_tests(Some(task_control.clone()));
+            // The typed classifier already observed Idle. Stop then admits an exact
+            // transaction before the retention commit. This fixture controls that
+            // internal boundary; it is not an unvalidated wire message.
+            let mut classified = measured_natural_terminal(&lease, "FAILED");
+            classified.feedback.actuator_zeroed = true;
+            classified.feedback.cancel_phase = "IDLE".into();
+            assert_eq!(bridge.nav.cancel_snapshot().phase, crate::nav_runtime::CancelPhase::Idle);
+            let expected = exploration_child_lease(&lease);
+            let ChildNavigationCancelOutcome::Pending(ticket) = bridge.cancel(&expected).await.unwrap()
+                else { panic!("the real cancellation transaction must be admitted first"); };
+            // Keep ownership of the registered retry future without starting it;
+            // this test controls Nav classification/retention, not retry timing.
+            let retained_retry = registrations.try_recv().expect("owned correlated cancel retry");
+            if phase == "failed" {
+                bridge.nav.observe_cancel_ack(crate::nav_runtime::MotionSinkCancelAck {
+                    cancel_generation: ticket.cancel_generation,
+                    goal_id: lease.session_id.clone(), owner_kind: lease.owner_kind,
+                    parent_request_id: lease.parent_request_id.clone(), goal_generation: lease.goal_generation,
+                    status: crate::nav_runtime::MotionSinkCancelAckStatus::Failed,
+                    message: "measured cancel failure".into(),
+                }).await;
+            } else if phase == "timed_out" {
+                bridge.nav.expire_cancel_for_test();
+                assert!(bridge.nav.poll_cancel_timeout().await.is_some());
+            }
+            bridge.nav.retain_terminal_receipt(&classified).await;
+            assert!(bridge.nav.active_goal_lease().await.is_none(),
+                "the old exact-seven-field measured retirement rule is unchanged");
+            assert!(bridge.terminal_result_for(&expected).await.is_none(),
+                "retirement commit must inspect the actual admitted cancellation");
+            assert!(bridge.cancel(&expected).await.is_err(),
+                "Pending/Failed/TimedOut cannot be converted to natural AlreadyTerminal");
+            assert_eq!(bridge.nav.cancel_snapshot().generation, ticket.cancel_generation);
+            task_control.close_admission();
+            bridge.set_geometry_task_control_for_tests(None);
+            drop(retained_retry);
+        }
+    }
+
+    #[tokio::test]
+    async fn natural_retirement_between_lookup_and_cancel_bypasses_busy_telemetry() {
+        let parent = "receipt-second-read-busy-telemetry";
+        let (explore, bridge, backend, lease) = active_exploration_for_stop_receipt(parent).await;
+        // Hold an existing valid nonterminal Nav transaction at its established
+        // test barrier. The terminal retention and Stop cancel queue behind it.
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        bridge.nav.inject_transaction_after_correlation_barrier(barrier.clone());
+        let correlation = {
+            let nav = bridge.nav.clone();
+            let lease = lease.clone();
+            tokio::spawn(async move {
+                nav.apply_correlated_navigation_state(
+                    NavState { goal_id: lease.session_id.clone(), status: "RUNNING".into(),
+                        timestamp_ns: crate::explore_runtime::now_unix_nanos(), ..NavState::default() },
+                    &lease.session_id, lease.owner_kind, &lease.parent_request_id,
+                    lease.goal_generation, lease.path_revision, lease.producer_runtime_generation,
+                    lease.planner_runtime_generation, None, None,
+                ).await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(2), barrier.wait()).await.unwrap();
+        let mut classified = measured_natural_terminal(&lease, "FAILED");
+        classified.feedback.actuator_zeroed = true;
+        classified.feedback.cancel_phase = "IDLE".into();
+        let mut retention = Box::pin(bridge.nav.retain_terminal_receipt(&classified));
+        assert!(futures::poll!(retention.as_mut()).is_pending());
+        let telemetry_guard = bridge.state.write().await;
+        let cached_status = telemetry_guard.nav_state.status.clone();
+        let mut stop = Box::pin(explore.stop(parent));
+        assert!(futures::poll!(stop.as_mut()).is_pending());
+        assert_eq!(explore.snapshot().status, crate::explore_runtime::STATUS_STOPPING);
+        assert_eq!(backend.cancel_count(), 0);
+        assert_eq!(bridge.nav.cancel_snapshot().phase, crate::nav_runtime::CancelPhase::Idle);
+        // FIFO gives retention the commit before Nav::cancel admission, after
+        // Bridge's first receipt lookup and its active-lease lookup both saw it live.
+        barrier.wait().await;
+        correlation.await.unwrap().unwrap();
+        retention.await;
+        assert!(bridge.nav.active_goal_lease().await.is_none());
+        let stopped = tokio::time::timeout(Duration::from_secs(2), stop).await
+            .expect("second receipt lookup must precede busy telemetry publication");
+        assert_eq!(stopped.status, crate::explore_runtime::STATUS_CANCELLED);
+        assert!(stopped.child_task_id.is_empty());
+        assert!(!explore.blocks_mapping_mutation().await);
+        assert_eq!(backend.cancel_count(), 0);
+        assert_eq!(bridge.nav.cancel_snapshot().phase, crate::nav_runtime::CancelPhase::Idle);
+        assert_eq!(bridge.nav.cancel_snapshot().generation, 0);
+        assert_eq!(telemetry_guard.nav_state.status, cached_status);
+        drop(telemetry_guard);
+    }
+
+    fn measured_natural_terminal(
+        lease: &crate::nav_runtime::GoalLease,
+        status: &str,
+    ) -> NavigationUpdate {
+        NavigationUpdate {
+            producer_runtime_generation: lease.producer_runtime_generation,
+            state: NavState {
+                status: status.into(),
+                message: "natural terminal with exact measured ZERO".into(),
+                goal_id: lease.session_id.clone(),
+                timestamp_ns: crate::explore_runtime::now_unix_nanos(),
+                ..NavState::default()
+            },
+            feedback: NavigationFeedback {
+                owner_kind: lease.owner_kind,
+                parent_request_id: lease.parent_request_id.clone(),
+                goal_generation: lease.goal_generation,
+                producer_runtime_generation: lease.producer_runtime_generation,
+                path_revision: lease.path_revision,
+                planner_runtime_generation: lease.planner_runtime_generation,
+                guard_generation: crate::nav_runtime::test_motion_admission().guard_generation,
+                sink_ready: true,
+                zero_ack_id: format!("{}-natural-zero", lease.session_id),
+                zero_applied_monotonic_ns: crate::explore_runtime::now_monotonic_nanos(),
+                ..NavigationFeedback::default()
+            },
+        }
+    }
+
+    async fn active_exploration_for_stop_receipt(
+        parent: &str,
+    ) -> (
+        crate::explore_runtime::ExploreRuntimeHandle,
+        ExploreNavigationBridge,
+        RecordingBackend,
+        crate::nav_runtime::GoalLease,
+    ) {
+        let (bridge, backend) = configured_bridge().await;
+        let explore = crate::explore_runtime::ExploreRuntimeHandle::default_with_wavefront();
+        explore.set_navigation_sink(Arc::new(bridge.clone()));
+        explore.ingest_committed_costmap_snapshot(
+            frontier_costmap(), test_committed_map_identity(1),
+        ).await.expect("committed exploration costmap");
+        assert_eq!(explore.start(parent, "prefer_wavefront").await.status,
+            crate::explore_runtime::STATUS_ACCEPTED);
+        let active = explore.tick((2.0, 2.0)).await;
+        assert_eq!(active.status, crate::explore_runtime::STATUS_ACTIVE);
+        let lease = bridge.nav.active_goal_lease().await.expect("real assigned Nav lease");
+        assert_eq!(active.child_lease.as_ref(), Some(&exploration_child_lease(&lease)));
+        (explore, bridge, backend, lease)
+    }
+
+    async fn assert_stop_consumes_retired_natural_terminal(status: &str) {
+        let parent = format!("stop-retired-{}", status.to_ascii_lowercase());
+        let (explore, bridge, backend, lease) = active_exploration_for_stop_receipt(&parent).await;
+        let cancel_before = bridge.nav.cancel_snapshot();
+        let terminal = apply_typed_navigation_feedback(
+            &bridge.nav, measured_natural_terminal(&lease, status),
+        ).await.expect("fully correlated natural terminal");
+        assert_eq!(terminal.state.status, status);
+        assert!(terminal.feedback.actuator_zeroed);
+        assert_eq!(terminal.feedback.cancel_generation, 0);
+        assert!(bridge.nav.active_goal_lease().await.is_none());
+        assert_eq!(bridge.nav.terminal_receipts().await.len(), 1);
+        assert_eq!(bridge.nav.cancel_snapshot(), cancel_before);
+        // Hold the already-validated live delivery. Stop now races after Nav
+        // retirement but before Explore sees that event. No test-only ticket.
+        assert_eq!(explore.snapshot().child_task_id, lease.session_id);
+        let stopped = explore.stop(&parent).await;
+        assert_eq!(backend.cancel_count(), 0, "retired exact lease needs no cancel command");
+        assert_eq!(bridge.nav.cancel_snapshot(), cancel_before,
+            "natural completion must not manufacture a cancellation transaction");
+        let receipts = bridge.nav.terminal_receipts().await;
+        assert_eq!(receipts[0].state.status, status, "preserve original Nav terminal kind");
+        assert_eq!(receipts[0].feedback.cancel_generation, 0);
+        fanout_navigation_update(&bridge.state, &bridge.nav_state_tx, &explore, terminal).await;
+        // Required GREEN: Stop consumes an authoritative AlreadyTerminal fact,
+        // rather than forging Cancelled or reopening stopped source admission.
+        assert_eq!(stopped.status, crate::explore_runtime::STATUS_CANCELLED,
+            "{}", stopped.message);
+        assert!(stopped.child_task_id.is_empty(), "Stop retained an already-retired child");
+        assert!(!explore.blocks_mapping_mutation().await);
+        assert!(explore.snapshot().child_task_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn exploration_stop_consumes_retired_failed_before_live_fanout() {
+        assert_stop_consumes_retired_natural_terminal("FAILED").await;
+    }
+
+    #[tokio::test]
+    async fn exploration_stop_consumes_retired_reached_before_live_fanout() {
+        assert_stop_consumes_retired_natural_terminal("SUCCEEDED").await;
+    }
+
+    #[tokio::test]
+    async fn exploration_pending_cancel_rejects_ordinary_until_exact_zero() {
+        use crate::explore_runtime::{ChildNavigationResult, ChildNavigationTerminalProof, ChildNavigationZeroProof};
+        let parent = "stop-real-cancel-proof";
+        let (explore, bridge, backend, lease) = active_exploration_for_stop_receipt(parent).await;
+        let stopped = explore.stop(parent).await;
+        assert_eq!(stopped.status, crate::explore_runtime::STATUS_STOPPING);
+        let cancel = bridge.nav.cancel_snapshot();
+        assert_eq!(cancel.phase, crate::nav_runtime::CancelPhase::Pending);
+        assert!(cancel.generation > 0);
+        assert!(backend.cancel_count() > 0);
+        let projected = exploration_child_lease(&lease);
+        let proof = ChildNavigationTerminalProof { lease: projected.clone() };
+        for ordinary in [
+            ChildNavigationResult::Reached(proof.clone()),
+            ChildNavigationResult::Failed { proof, reason: "ordinary result cannot satisfy cancellation".into() },
+        ] {
+            let error = explore.report_navigation_result(&lease.session_id, ordinary).await
+                .expect_err("ordinary result must not bypass the issued cancel transaction");
+            assert!(error.contains("cannot bypass pending actuator ZEROED proof"));
+            assert_eq!(explore.snapshot().child_task_id, lease.session_id);
+        }
+        let wrong = ChildNavigationResult::Cancelled(ChildNavigationZeroProof {
+            lease: projected,
+            cancel_generation: cancel.generation + 1,
+            zero_ack_id: "wrong-cancel-generation".into(),
+            zero_applied_monotonic_ns: crate::explore_runtime::now_monotonic_nanos(),
+        });
+        assert!(explore.report_navigation_result(&lease.session_id, wrong).await.is_err());
+        assert!(explore.blocks_mapping_mutation().await);
+        // The existing Nav path may correlate a real measured natural terminal
+        // to its already-issued exact cancel. The bridge must not fabricate it.
+        let zeroed = apply_typed_navigation_feedback(
+            &bridge.nav, measured_natural_terminal(&lease, "FAILED"),
+        ).await.expect("authoritative existing cancellation proof path");
+        assert_eq!(zeroed.state.status, "CANCELLED");
+        assert_eq!(zeroed.feedback.cancel_generation, cancel.generation);
+        assert_eq!(zeroed.feedback.cancel_phase, "ZEROED");
+        assert!(zeroed.feedback.actuator_zeroed);
+        fanout_navigation_update(&bridge.state, &bridge.nav_state_tx, &explore, zeroed.clone()).await;
+        fanout_navigation_update(&bridge.state, &bridge.nav_state_tx, &explore, zeroed).await;
+        assert_eq!(explore.snapshot().status, crate::explore_runtime::STATUS_CANCELLED);
+        assert!(explore.snapshot().child_task_id.is_empty());
+        assert!(!explore.blocks_mapping_mutation().await);
+        assert!(bridge.nav.active_goal_lease().await.is_none());
+        assert_exact_cancels(&backend, &lease, cancel.generation);
+    }
+
+    #[tokio::test]
+    async fn exploration_old_path_receipt_cannot_end_attached_or_cancelling_child() {
+        let parent = "old-path-receipt-control";
+        let (bridge, backend) = configured_bridge().await;
+        let explore = crate::explore_runtime::ExploreRuntimeHandle::default_with_wavefront();
+        explore.set_navigation_sink(Arc::new(bridge.clone()));
+        explore.ingest_committed_costmap_snapshot(
+            frontier_costmap(), test_committed_map_identity(1),
+        ).await.expect("committed exploration costmap");
+        assert_eq!(explore.start(parent, "prefer_wavefront").await.status,
+            crate::explore_runtime::STATUS_ACCEPTED);
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *backend.goal_publish_pause.lock().expect("goal publish pause") =
+            Some((entered.clone(), release.clone()));
+        let tick = {
+            let explore = explore.clone();
+            tokio::spawn(async move { explore.tick((2.0, 2.0)).await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), entered.notified()).await
+            .expect("real child publication is held");
+        let old = bridge.nav.active_goal_lease().await.expect("allocated exact lease");
+        let mut stale = measured_natural_terminal(&old, "FAILED");
+        stale.feedback.actuator_zeroed = true;
+        stale.feedback.cancel_phase = "IDLE".into();
+        // Isolate the already-existing post-correlation/pre-retention boundary,
+        // as retained_zero_receipt_does_not_retire_replaced_goal_or_path does.
+        // This does not claim a fresh wire frame passes current-path validation.
+        let current = {
+            let inner = bridge.nav.inner();
+            let mut slot = inner.write().await;
+            let goal = slot.goal.as_mut().expect("same active goal");
+            goal.lease.path_revision = 1;
+            goal.lease.planner_runtime_generation = 17;
+            goal.lease.clone()
+        };
+        assert_eq!(exploration_child_lease(&old), exploration_child_lease(&current));
+        bridge.nav.retain_terminal_receipt(&stale).await;
+        assert_eq!(bridge.nav.active_goal_lease().await.as_ref(), Some(&current));
+        let stored = bridge.nav.terminal_receipt_for(&crate::nav_runtime::CancelGoalInput {
+            goal_id: old.session_id.clone(), owner_kind: old.owner_kind,
+            parent_request_id: old.parent_request_id.clone(), goal_generation: old.goal_generation,
+            producer_runtime_generation: old.producer_runtime_generation,
+        }).await.expect("raw exact-goal receipt intentionally includes the old path");
+        assert_eq!(stored.feedback.path_revision, old.path_revision);
+        assert_ne!(stored.feedback.path_revision, current.path_revision);
+        release.notify_one();
+        let attached = tokio::time::timeout(Duration::from_secs(2), tick).await
+            .expect("real submit completion").expect("child tick");
+        assert_eq!(attached.child_task_id, current.session_id,
+            "receipt lookup must not release still-active same-goal ownership");
+        assert_eq!(bridge.nav.active_goal_lease().await.as_ref(), Some(&current));
+        assert!(!explore.frontier_snapshot().frontiers.is_empty(), "old path must not clear the selected frontier");
+        let stopping = explore.stop(parent).await;
+        assert_eq!(stopping.status, crate::explore_runtime::STATUS_STOPPING,
+            "old path receipt must not masquerade as AlreadyTerminal");
+        assert_eq!(stopping.child_task_id, current.session_id);
+        assert!(backend.cancel_count() > 0);
+        let cancel = bridge.nav.cancel_snapshot();
+        assert_eq!(cancel.lease.as_ref(), Some(&current));
+        assert_eq!(cancel.phase, crate::nav_runtime::CancelPhase::Pending);
+        let zero = apply_typed_navigation_feedback(
+            &bridge.nav, measured_natural_terminal(&current, "FAILED"),
+        ).await.expect("real current-path measured terminal");
+        assert_eq!(zero.feedback.cancel_generation, cancel.generation);
+        assert_eq!(zero.state.status, "CANCELLED");
+        fanout_navigation_update(&bridge.state, &bridge.nav_state_tx, &explore, zero).await;
+        assert!(explore.snapshot().child_task_id.is_empty());
+        assert!(!explore.blocks_mapping_mutation().await);
+        assert_exact_cancels(&backend, &current, cancel.generation);
+    }
+
+    #[tokio::test]
+    async fn exploration_old_path_receipt_plus_empty_nav_is_not_retirement_proof() {
+        let parent = "old-path-empty-nav-contract";
+        let (explore, bridge, backend, old) = active_exploration_for_stop_receipt(parent).await;
+        let mut stale = measured_natural_terminal(&old, "FAILED");
+        stale.feedback.actuator_zeroed = true;
+        stale.feedback.cancel_phase = "IDLE".into();
+        {
+            let inner = bridge.nav.inner();
+            let mut slot = inner.write().await;
+            let active = slot.goal.as_mut().expect("same goal before path replacement");
+            active.lease.path_revision = 1;
+            active.lease.planner_runtime_generation = 19;
+        }
+        bridge.nav.retain_terminal_receipt(&stale).await;
+        assert!(bridge.nav.active_goal_lease().await.is_some(),
+            "the old path receipt did not retire current execution");
+        // Public Nav API contract control, not a claimed production interleaving:
+        // this legacy untyped terminal clears the slot without retaining a new
+        // exact measured receipt. Absence now must not change the old provenance.
+        bridge.nav.observe_stack_state(NavState {
+            status: "SUCCEEDED".into(), goal_id: old.session_id.clone(),
+            message: "legacy API clears current goal without exact retirement receipt".into(),
+            timestamp_ns: crate::explore_runtime::now_unix_nanos(),
+            ..NavState::default()
+        }).await;
+        assert!(bridge.nav.active_goal_lease().await.is_none());
+        let receipts = bridge.nav.terminal_receipts().await;
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].feedback.path_revision, old.path_revision);
+        assert_eq!(receipts[0].feedback.zero_ack_id, stale.feedback.zero_ack_id);
+        let stopped = explore.stop(parent).await;
+        assert_eq!(stopped.status, crate::explore_runtime::STATUS_FAILED,
+            "empty Nav slot cannot promote old path receipt into AlreadyTerminal");
+        assert_eq!(stopped.child_task_id, old.session_id);
+        assert!(explore.blocks_mapping_mutation().await);
+        assert_eq!(backend.cancel_count(), 0);
+        assert_eq!(bridge.nav.cancel_snapshot().generation, 0);
     }
 
     #[tokio::test]

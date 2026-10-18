@@ -10385,7 +10385,7 @@ async fn assigned_mapping_cloud_boundary_slice(
     }
     use super::*;
     use crate::explore_runtime::{
-        now_monotonic_nanos, now_unix_nanos, ChildNavigationCancelTicket, ChildNavigationLease,
+        now_monotonic_nanos, now_unix_nanos, ChildNavigationCancelOutcome, ChildNavigationCancelTicket, ChildNavigationLease,
         ChildNavigationRequest, ChildNavigationResult, ChildNavigationSubmitError,
         ChildNavigationTerminalProof, ChildNavigationTicket, ChildNavigationZeroProof,
         ExploreCostmapSnapshot, ExploreNavigationSink, ExplorePoseProvider, ExploreRobotPose,
@@ -11438,7 +11438,7 @@ async fn assigned_mapping_cloud_boundary_slice(
         async fn cancel(
             &self,
             lease: &ChildNavigationLease,
-        ) -> Result<ChildNavigationCancelTicket, String> {
+        ) -> Result<ChildNavigationCancelOutcome, String> {
             let ticket = ChildNavigationCancelTicket {
                 lease: lease.clone(),
                 cancel_generation: 1,
@@ -11468,7 +11468,7 @@ async fn assigned_mapping_cloud_boundary_slice(
             {
                 return Err(error);
             }
-            Ok(ticket)
+            Ok(ChildNavigationCancelOutcome::Pending(ticket))
         }
 
         fn recover_cancel_receipt(
@@ -11605,7 +11605,7 @@ async fn assigned_mapping_cloud_boundary_slice(
         async fn cancel(
             &self,
             _lease: &ChildNavigationLease,
-        ) -> Result<ChildNavigationCancelTicket, String> {
+        ) -> Result<ChildNavigationCancelOutcome, String> {
             Err("response-loss child is cancelled through NavRuntime ownership".to_string())
         }
     }

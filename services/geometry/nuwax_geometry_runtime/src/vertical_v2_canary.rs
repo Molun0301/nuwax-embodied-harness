@@ -245,7 +245,7 @@ impl crate::explore_runtime::ExploreNavigationSink for FailClosedNavSink {
     async fn cancel(
         &self,
         _lease: &crate::explore_runtime::ChildNavigationLease,
-    ) -> Result<crate::explore_runtime::ChildNavigationCancelTicket, String> {
+    ) -> Result<crate::explore_runtime::ChildNavigationCancelOutcome, String> {
         panic!("fail-closed case must not own child navigation")
     }
 }

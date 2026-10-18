@@ -303,6 +303,24 @@ pub struct ActiveGoal {
     pub lease: GoalLease,
 }
 
+/// The original validated body owns its natural-retirement fact. An old path
+/// receipt may be retained for display without ever retiring current execution.
+struct RetainedTerminalReceipt {
+    update: NavigationUpdate,
+    retired_naturally: bool,
+}
+
+impl RetainedTerminalReceipt {
+    fn matches(&self, input: &CancelGoalInput) -> bool {
+        let update = &self.update;
+        update.state.goal_id == input.goal_id
+            && update.feedback.owner_kind == input.owner_kind
+            && update.feedback.parent_request_id == input.parent_request_id
+            && update.feedback.goal_generation == input.goal_generation
+            && update.producer_runtime_generation == input.producer_runtime_generation
+    }
+}
+
 /// `NavRuntime` 的内部 slot:facade submission phase + active goal。
 ///
 /// 一次只记录一个 active goal；新 `set_goal` 覆盖 facade 记录并由真实 stack
@@ -321,7 +339,7 @@ pub struct NavRuntimeSlot {
     /// 最近同目标的计算路径，仅用于展示，不能替代执行回执。
     display_path: Option<(GoalLease, Vec<[f64; 3]>)>,
     /// 已核验的停车终态独立于展示缓存，供取消重试和订阅重连读取。
-    terminal_receipts: VecDeque<NavigationUpdate>,
+    terminal_receipts: VecDeque<RetainedTerminalReceipt>,
     /// Highest goal generation ever reserved by this runtime.
     pub last_goal_generation: u64,
     /// module graph 模块节点 ID 列表(diagnostics 暴露)。
@@ -742,7 +760,7 @@ impl NavRuntimeState {
         let mut slot=self.inner.write().await;
         // 失败先保留原拥有方；仅同目标、同路径的真实停稳证明才能退休它。
         // 状态关联后若已切换目标或规划器代际，旧证明不能清掉新的拥有方。
-        if slot.goal.as_ref().is_some_and(|active| {
+        let retires_active = slot.goal.as_ref().is_some_and(|active| {
             let lease = &active.lease;
             lease.session_id == update.state.goal_id
                 && lease.owner_kind == update.feedback.owner_kind
@@ -751,32 +769,64 @@ impl NavRuntimeState {
                 && lease.producer_runtime_generation == update.producer_runtime_generation
                 && lease.path_revision == update.feedback.path_revision
                 && lease.planner_runtime_generation == update.feedback.planner_runtime_generation
-        }) {
+        });
+        // Keep the existing slot -> cancel lock order. Unknown cancel state is
+        // not evidence that no transaction was admitted. This records provenance
+        // only; the original measured-ZERO retirement below remains unchanged.
+        let retired_naturally = retires_active
+            && matches!(update.state.status.as_str(), "SUCCEEDED" | "FAILED")
+            && update.feedback.cancel_generation == 0
+            && self.cancel.lock().ok().is_some_and(|cancel| {
+                cancel.phase == CancelPhase::Idle
+                    || cancel.lease.as_ref().is_some_and(|lease| {
+                        lease.session_id != update.state.goal_id
+                            || lease.owner_kind != update.feedback.owner_kind
+                            || lease.parent_request_id != update.feedback.parent_request_id
+                            || lease.goal_generation != update.feedback.goal_generation
+                            || lease.producer_runtime_generation != update.producer_runtime_generation
+                    })
+            });
+        if retires_active {
             slot.goal = None;
         }
-        slot.terminal_receipts.retain(|old| !(old.state.goal_id==update.state.goal_id
-            && old.feedback.owner_kind==update.feedback.owner_kind
-            && old.feedback.parent_request_id==update.feedback.parent_request_id
-            && old.feedback.goal_generation==update.feedback.goal_generation
-            && old.producer_runtime_generation==update.producer_runtime_generation));
-        slot.terminal_receipts.push_back(update.clone());
-        while slot.terminal_receipts.len()>32 {slot.terminal_receipts.pop_front();}
+        if let Some(index) = slot.terminal_receipts.iter().position(|old| {
+            old.update.state.goal_id == update.state.goal_id
+                && old.update.feedback.owner_kind == update.feedback.owner_kind
+                && old.update.feedback.parent_request_id == update.feedback.parent_request_id
+                && old.update.feedback.goal_generation == update.feedback.goal_generation
+                && old.update.producer_runtime_generation == update.producer_runtime_generation
+        }) {
+            // A late old-path body must not replace an authoritative retirement,
+            // nor inherit its fact. Keep the original body and fact together.
+            if slot.terminal_receipts[index].retired_naturally {
+                return;
+            }
+            slot.terminal_receipts.remove(index);
+        }
+        slot.terminal_receipts.push_back(RetainedTerminalReceipt {
+            update: update.clone(),
+            retired_naturally,
+        });
+        while slot.terminal_receipts.len() > 32 { slot.terminal_receipts.pop_front(); }
     }
 
     /// 订阅恢复只重放已验证的有界终态；客户端继续按完整目标身份消费。
     pub(crate) async fn terminal_receipts(&self) -> Vec<NavigationUpdate> {
-        self.inner.read().await.terminal_receipts.iter().cloned().collect()
+        self.inner.read().await.terminal_receipts.iter().map(|receipt| receipt.update.clone()).collect()
     }
 
     /// 旧目标的精确取消重试只读取原停车回执，不触碰活动的新目标。
     pub(crate) async fn terminal_receipt_for(&self, input: &CancelGoalInput) -> Option<NavigationUpdate> {
-        self.inner.read().await.terminal_receipts.iter().rev().find(|update|
-            update.state.goal_id==input.goal_id
-            && update.feedback.owner_kind==input.owner_kind
-            && update.feedback.parent_request_id==input.parent_request_id
-            && update.feedback.goal_generation==input.goal_generation
-            && update.producer_runtime_generation==input.producer_runtime_generation
-        ).cloned()
+        self.inner.read().await.terminal_receipts.iter().rev()
+            .find(|receipt| receipt.matches(input)).map(|receipt| receipt.update.clone())
+    }
+
+    /// Only this exact body actually retired execution without an admitted
+    /// cancellation. Neither an old path receipt nor present absence proves it.
+    pub(crate) async fn naturally_retired_terminal_for(&self, input: &CancelGoalInput) -> Option<NavigationUpdate> {
+        self.inner.read().await.terminal_receipts.iter().rev()
+            .find(|receipt| receipt.retired_naturally && receipt.matches(input))
+            .map(|receipt| receipt.update.clone())
     }
 
     /// 当前拥有方整个生命周期内保持不变的生产代次。
@@ -4460,6 +4510,44 @@ mod tests {
         handle.lcm_backend_available = true;
         install_committed_map_fixture(&handle, "map", true).await;
         (handle, backend, owner)
+    }
+
+    #[tokio::test]
+    async fn natural_retirement_records_cancel_authority_at_commit_only() {
+        for poison_before_commit in [true, false] {
+            let state = NavRuntimeState::with_profile_and_producer_runtime_generation(PROFILE_SIMPLE_2D, 1);
+            let lease = test_lease("retirement-unknown-tracker", 1);
+            state.replace_active_goal_for_test(test_active_goal_with_lease(lease.clone())).await;
+            let receipt = NavigationUpdate {
+                producer_runtime_generation: lease.producer_runtime_generation,
+                state: NavState { goal_id: lease.session_id.clone(), status: "FAILED".into(),
+                    ..NavState::default() },
+                feedback: crate::lcm_runtime::NavigationFeedback {
+                    owner_kind: lease.owner_kind, parent_request_id: lease.parent_request_id.clone(),
+                    goal_generation: lease.goal_generation,
+                    producer_runtime_generation: lease.producer_runtime_generation,
+                    path_revision: lease.path_revision,
+                    planner_runtime_generation: lease.planner_runtime_generation,
+                    actuator_zeroed: true, zero_ack_id: "measured-stop".into(),
+                    zero_applied_monotonic_ns: 1, ..Default::default()
+                },
+            };
+            let poison_tracker = || {
+                assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _guard = state.cancel.lock().unwrap();
+                    panic!("test-only unavailable cancellation tracker");
+                })).is_err());
+            };
+            if poison_before_commit { poison_tracker(); }
+            state.retain_terminal_receipt(&receipt).await;
+            if !poison_before_commit { poison_tracker(); }
+            assert!(state.active_goal_lease().await.is_none(),
+                "retirement itself keeps the existing measured full-lease rule");
+            assert!(state.terminal_receipt_for(&cancel_input(&lease)).await.is_some());
+            assert_eq!(state.naturally_retired_terminal_for(&cancel_input(&lease)).await.is_some(),
+                !poison_before_commit,
+                "unknown at commit is no proof; later tracker failure cannot erase an established fact");
+        }
     }
 
     fn test_goal_input(goal_id: &str) -> SetGoalInput {

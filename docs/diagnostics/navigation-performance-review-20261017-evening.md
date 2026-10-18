@@ -262,6 +262,20 @@ Scan 预算与 partial 首点/最小进度纳入真实资格；共享 PctPlanner
 
 当前显式 profile 的 N remaining 仍分别约 17.385/16.883/7.769 秒，主要落在 project 与 sweep。它们是含调度影响的墙钟，不是 CPU 独占耗时；嵌套阶段不能重复相加，也不能和旧版本直接算倍数。此前完整 runtime 的一次 urgent cancellation 50.768ms 超过原 20ms 断言仍未解释，后续独立观察成功不撤销该失败。探索早终态交接另行修复和验证，不混入本阶段通过结论。
 
+## 第十六阶段：探索不再丢失提交返回前的导航终态
+
+真实交接顺序存在空窗：Nav 已分配目标并收到结束结果，但 Explore 尚未拿到 submit 返回的 ticket；实时 fanout 找不到已附着的子目标，随后 Explore 反而装入一个已经结束的 child。Stop 再取消这个已退休目标也会失败，留下逻辑占用。
+
+修复复用 Nav 原有 32 条有界终态记录，在原精确执行退休点保留该条结果的自然退休出处。Explore 安装并发布 child 身份后，只回读一次该目标的结束结果；读取等待者被取消时，由下一 tick 的原 active-child 分支续读，保留既有 Stop/返航优先级。补读和实时反馈共用原去重与源状态结算。Stop 对已自然结束的 child 结算原待决动作，不重开普通反馈，也不伪造 Nav 的取消结果。已发出的取消仍要求原票据对应的真实 ZERO；旧路径记录不能冒充当前执行已结束。
+
+- 旧实现的 early Reached、已退休 Failed/Reached 后 Stop 三项命中真实逻辑红。early Failed 首轮被错误的缓存 diagnostics 断言挡住，未计作合格目标红
+- 最终原 7 项加新 10 项共 17 个 exact 全通过：早终态、停止优先、等待者取消恢复、重复反馈、旧路径/原始结果归属、取消事务、忙 telemetry 下的第二次结果查询等均保留原限制
+- 前一批 69 个既有相关回归已通过；43 个原 UDPM 测试在当前云环境的 lcm_create/组播路由初始化受阻，没有以 memq 替换或记为通过。上述是分批证据，不是同一次 129 项全通过
+- 测试使用实际 geometry bin 的原 release/LTO 构建。最后增量 check 1m07s、no-run 14m28s；实际 binary 与冻结源码核对，单一 target 复用，没有降低构建配置
+- 验证中修正了测试前提：源历史经原 owner inspection 读取，不能把最后一次 poll 的 diagnostics 当作反馈后的状态；无 MappingAdapter 的 Bridge 使用 frame=0，不能为公开 checkpoint 强设 frame=1；独立 workspace TMPDIR 避免不同执行 namespace 重用 PID 时读到上轮 journal。原失败日志与旧 journal 保留，生产接纳、first-winner 和 ZERO 合同未放宽
+
+此阶段修复的是终态交接与探索逻辑占用，不是实机路径质量、网络通信或主搜索耗时资格。主搜索的细分归因与建图增量成本优化继续进行。
+
 ## 后续持续检查
 
 1. 墙前晚到路径的实际恢复与初始 full/partial/PCT 顺序，保留及时移动和真实避障

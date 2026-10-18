@@ -1096,7 +1096,7 @@ impl ExploreRuntimeHandle {
         Ok(())
     }
     #[cfg(test)]
-    pub(super) async fn inspect_compute_checkpoint(
+    pub(crate) async fn inspect_compute_checkpoint(
         &self,
     ) -> Result<Vec<nuwax_exploration::mission::SourceCheckpoint>, String> {
         self.await_compute_idle().await?;

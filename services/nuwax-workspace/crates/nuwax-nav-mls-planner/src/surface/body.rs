@@ -1109,10 +1109,20 @@ impl SurfaceSnapshot {
             quaternion[0].to_bits(),quaternion[1].to_bits(),quaternion[2].to_bits(),quaternion[3].to_bits()];
         let mut rejection=None;
         let cached=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner()).poses.get(&key).cloned();
-        let result=if let Some(cached)=cached {cached.result(&mut rejection)} else {
+        let result=if let Some(cached)=cached {
+            #[cfg(feature = "body-query-profile")]
+            query_profile::count(QueryCounter::PoseCacheHits);
+            cached.result(&mut rejection)
+        } else {
+            #[cfg(feature = "body-query-profile")]
+            query_profile::count(QueryCounter::PoseCacheMisses);
             let result=self.check_body_pose(body,quaternion,&mut rejection);
             let mut cache=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner());
-            if cache.poses.len()>=8192 {cache.poses.clear();}
+            if cache.poses.len()>=8192 {
+                #[cfg(feature = "body-query-profile")]
+                query_profile::count(QueryCounter::PoseCacheCapacityClears);
+                cache.poses.clear();
+            }
             cache.poses.insert(key,CachedBodyResult::new(result.clone(),rejection));
             result
         };
@@ -1665,7 +1675,11 @@ impl SurfaceSnapshot {
         let body = [xy[0],xy[1],body_z];
         #[cfg(feature = "body-query-profile")]
         let validation_profile = query_profile::guard(QueryStage::FinalBodyValidation);
-        self.validate_known_terrain_motion(from,(body,q))?;
+        {
+            #[cfg(feature = "body-query-profile")]
+            let _profile = query_profile::guard(QueryStage::ProjectedKnownTerrain);
+            self.validate_known_terrain_motion(from,(body,q))?;
+        }
         self.validate_body_pose_with_witness(body,q,slot)?;
         #[cfg(feature = "body-query-profile")]
         drop(validation_profile);
@@ -1715,16 +1729,26 @@ impl SurfaceSnapshot {
         *slot=None;
         // 观察年龄与外部边界不属于纯几何键，仍沿各自的完整验证路径处理。
         if !boundary.is_empty() {
+            #[cfg(feature = "body-query-profile")]
+            query_profile::count(QueryCounter::MotionCacheBoundaryBypasses);
             return self.validate_body_motion_checked_with_witness(from,to,boundary,|_|Ok(()),slot);
         }
         let key=[from.0[0],from.0[1],from.0[2],from.1[0],from.1[1],from.1[2],from.1[3],
             to.0[0],to.0[1],to.0[2],to.1[0],to.1[1],to.1[2],to.1[3]].map(f64::to_bits);
         if let Some(result)=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner()).motions.get(&key).cloned() {
+            #[cfg(feature = "body-query-profile")]
+            query_profile::count(QueryCounter::MotionCacheHits);
             return result.result(slot);
         }
+        #[cfg(feature = "body-query-profile")]
+        query_profile::count(QueryCounter::MotionCacheMisses);
         let result=self.validate_body_motion_checked_with_witness(from,to,boundary,|_|Ok(()),slot);
         let mut cache=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner());
-        if cache.motions.len()>=8192 {cache.motions.clear();}
+        if cache.motions.len()>=8192 {
+            #[cfg(feature = "body-query-profile")]
+            query_profile::count(QueryCounter::MotionCacheCapacityClears);
+            cache.motions.clear();
+        }
         cache.motions.insert(key,CachedBodyResult::new(result.clone(),*slot));
         result
     }
@@ -1899,6 +1923,8 @@ impl SurfaceSnapshot {
 
     // 原共同占据带证明保持不变；新离散踏面证明不能扩大它的高度区间。
     fn known_common_band_samples(&self,from:([f64;3],[f64;4]),to:([f64;3],[f64;4]))->Option<Vec<f64>> {
+        #[cfg(feature = "body-query-profile")]
+        let _profile = query_profile::guard(QueryStage::KnownCommonBand);
         let observations=self.observations.as_ref()?;
         if observations.size_m>=self.config().voxel_size {return None;}
         let size=f64::from(observations.size_m);let coarse=f64::from(self.config().voxel_size);
@@ -1974,6 +2000,8 @@ impl SurfaceSnapshot {
     /// 只补证支撑参考的连接；调用者仍检查完整机体、接触事件、边界和观察时效。
     /// 不删占据、不生成地面，不把相同粗列里的独立楼层连接起来。
     fn known_tread_geometry_samples(&self,from:([f64;3],[f64;4]),to:([f64;3],[f64;4]))->Option<Vec<f64>> {
+        #[cfg(feature = "body-query-profile")]
+        let _profile = query_profile::guard(QueryStage::KnownTreadGeometry);
         let observations=self.observations.as_ref()?;
         if !observations.is_complete_geometry_source()
             || observations.size_m.to_bits()!=self.source_voxel_size_m().to_bits() {return None;}
@@ -2057,6 +2085,8 @@ impl SurfaceSnapshot {
     /// unknown; actual occupied geometry is checked independently by the sweep.
     fn validate_known_terrain_motion(&self,from:([f64;3],[f64;4]),to:([f64;3],[f64;4]))
         ->Result<(),SurfaceError> {
+        #[cfg(feature = "body-query-profile")]
+        let _profile = query_profile::guard(QueryStage::KnownTerrainTotal);
         let model=self.body_envelope().ok_or(SurfaceError::InvalidPose)?;
         // Exact known-band/tread geometry can settle a transition without
         // inventing discrete steps from a thick contact interval or coarse XY.
@@ -2064,6 +2094,8 @@ impl SurfaceSnapshot {
         // known-only pass below still allows missing terrain.
         if self.known_common_band_samples(from,to).is_some()
             || self.known_tread_geometry_samples(from,to).is_some() {return Ok(());}
+        #[cfg(feature = "body-query-profile")]
+        let _fallback_profile = query_profile::guard(QueryStage::KnownOnlyFallback);
         let size=f64::from(self.observations.as_ref().map_or(self.config().voxel_size,|o|o.size_m));
         let samples=self.body_support_grid_fractions(from,to,size)?.into_iter().map(|t| {
             let pose=interpolated_body_pose(from,to,t);
@@ -2192,7 +2224,11 @@ impl SurfaceSnapshot {
                 "机体扫掠需要{count}次采样，超过4096次工作上限；未证明几何不可通行"
             )));
         }
-        self.validate_known_terrain_motion(from,to)?;
+        {
+            #[cfg(feature = "body-query-profile")]
+            let _profile = query_profile::guard(QueryStage::SweptKnownTerrain);
+            self.validate_known_terrain_motion(from,to)?;
+        }
         for i in 1..count {
             let t = i as f64 / count as f64;
             let q = norm(std::array::from_fn(|j| qa[j] * (1.0 - t) + qb[j] * t));
@@ -2549,7 +2585,11 @@ impl SurfaceSnapshot {
         let columns=actual.map(|axis|world(next_rotation,[0.0;3],base_rotation.map(|basis|dot(basis,axis))));
         let q=if base_rotation==next_rotation {from.1} else {quaternion_from_columns(columns)};
         let next_pose=([xy[0],xy[1],from.0[2]+delta],q);
-        self.validate_known_terrain_motion(from,next_pose)?;
+        {
+            #[cfg(feature = "body-query-profile")]
+            let _profile = query_profile::guard(QueryStage::ProjectedKnownTerrain);
+            self.validate_known_terrain_motion(from,next_pose)?;
+        }
         self.validate_body_pose_with_witness(next_pose.0,next_pose.1,slot)?;
         Ok(next_pose)
     }
@@ -3000,6 +3040,8 @@ fn quaternion_from_columns(r: [[f64; 3]; 3]) -> [f64; 4] {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "body-query-profile")]
+    mod cache_profile_counter_tests { include!("body_cache_profile_counter_tests.rs"); }
     mod recent_query_tests { include!("body_recent_query_tests.rs"); }
     mod live_geometry_tests { include!("body_live_geometry_tests.rs"); }
     include!("body_observation_vec_tests.rs");
@@ -3896,7 +3938,7 @@ mod tests {
 
     #[cfg(feature = "body-query-profile")]
     #[test]
-    fn observed_profile_separates_cached_geometry_exempt_cells_and_failure_prefix() {
+    fn observed_profile_keeps_footprint_cache_and_geometry_only_compatibility() {
         let map=scene(&[],false).with_observations(Some(observation_grid(|_|{})));
         let pose=([0.05,0.05,0.5],[0.0,0.0,0.0,1.0]);
         let occupied=map.body_observation_footprint(pose).unwrap();
@@ -3909,21 +3951,41 @@ mod tests {
         assert_eq!(geometry.counters[QueryCounter::ObservationFootprintCacheHits as usize],1);
         assert_eq!(geometry.counters[QueryCounter::ObservationFootprintCellsBuilt as usize],occupied.len() as u64);
         assert_eq!(geometry.calls[QueryStage::ObservationFootprint as usize],1);
-        let mut exempt=map.observed_body_motion_checker_with_expiry(&occupied,1_000_000_000,&[]);
-        query_profile::begin();
-        assert_eq!(exempt(pose,pose,12_000_000_000).unwrap(),None);
-        let exempt=query_profile::end();
-        assert!(exempt.counters[QueryCounter::ObservationInputCells as usize]>0);
-        assert_eq!(exempt.counters[QueryCounter::ObservationVisitedCells as usize],0);
-        assert_eq!(exempt.counters[QueryCounter::ObservationCheckedCells as usize],0);
+        fn assert_no_observation_lease(record: &query_profile::Record) {
+            for counter in [QueryCounter::ObservationInputCells,
+                QueryCounter::ObservationVisitedCells, QueryCounter::ObservationCheckedCells] {
+                assert_eq!(record.counters[counter as usize],0);
+            }
+            assert_eq!(record.calls[QueryStage::ObservationEvidence as usize],0);
+        }
         let none=std::collections::BTreeSet::new();
-        let mut expired=map.observed_body_motion_checker_with_expiry(&none,1_000_000_000,&[]);
+        for legacy_occupied in [&occupied,&none] {
+            for (max_age_ns,checked_ns) in [(0,0),(1_000_000_000,12_000_000_000)] {
+                // Cold independent geometry: neither the old exemption set nor
+                // a future/expired observation time grants or rejects clearance.
+                let cold=map.fork_for_planning();
+                let mut checker=cold.observed_body_motion_checker_with_expiry(legacy_occupied,max_age_ns,&[]);
+                query_profile::begin();
+                let result=checker(pose,pose,checked_ns);
+                let geometry_only=query_profile::end();
+                assert_eq!(result,Ok(None),"compatibility age is not a support permission or lease");
+                assert_no_observation_lease(&geometry_only);
+            }
+        }
+        // Real occupied geometry still rejects, even with the legacy occupied
+        // set supplied and an unbounded checked time. Preserve the real witness.
+        let blocked=scene(&[(0.55,0.05,0.55)],false);
+        let mut checker=blocked.observed_body_motion_checker_with_expiry_and_witness(&occupied,0,&[]);
+        let mut witness=None;
         query_profile::begin();
-        assert!(matches!(expired(pose,pose,12_000_000_000),Err(SurfaceError::NearFieldObservation{..})));
-        let failure=query_profile::end();
-        assert_eq!(failure.counters[QueryCounter::ObservationVisitedCells as usize],1);
-        assert_eq!(failure.counters[QueryCounter::ObservationCheckedCells as usize],1);
-        assert_eq!(failure.calls[QueryStage::ObservationEvidence as usize],1);
+        let result=checker(pose,pose,u64::MAX,&mut witness);
+        let collision=query_profile::end();
+        assert_eq!(result,Err(SurfaceError::InsufficientClearance));
+        assert_eq!(witness.map(|rejected|rejected.pose),Some(pose));
+        assert!(matches!(witness,Some(BodyFailureWitness {
+            rejection:BodyRejection::Occupancy {source:OccupancySource::CoarseFallback,..},..
+        })));
+        assert_no_observation_lease(&collision);
     }
 
     #[test]

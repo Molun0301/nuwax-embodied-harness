@@ -293,6 +293,18 @@ Writer::seal 只在原 same_domain 且 changed_members 为空时，按新旧相�
 - 完整 Manifest、工作状态、I/O 计数及旧读者保持与原算法一致。用异质旧 geometry_revision 检测错位，覆盖 evidence-only、真实 pressure flush、净删除重加、同数换 key、rehome、失败重试、恢复与换域
 - 原完整 staging clone、root Vec、root.validate、安装与失败副作用顺序保留；没有改变 membership 阶段的二分、Receiver 或 GC。只减少被选分支的版本继承查找，不声称整个 seal 线性化、零复制或已测得整链提速
 
+## 第十九阶段：用实际搜索记录定位机体计算成本
+
+在显式 body-query-profile 下增加固定阶段、缓存事件计数与完成查询边界快照；默认 feature-off 不编入新增计时。观察器沿实际同步 PlanKernel owner 采集原 Scan 阶段，不回放几何、不改变预算、缓存键/容量、边界或规划决策。仅补齐测试使用的既有 serde_json 开发依赖，没有新增包版本。
+
+唯一一次原 bounded 1cm 压力夹具中，false/true 两请求仍各展开 256 并保留原 partial 资格；两份逐阶段计数分解均守恒。N remaining 为 7310.527ms，其中 known-terrain 检查 8093 次合计 38.928ms，不能据此把秒级延迟归咎于该检查。project/sweep 分别 4046.115/3190.551ms；投影内 FinalBodyValidation 2407.454ms、contact_frame 1623.867ms，后者含 contact_domain 1367.925ms及其中 BFS 689.782ms。这些是嵌套 inclusive 墙钟，不能相加或当独占 CPU。旧 estimated fallback 的部分 guard 生命周期跨越后续调用，不能仅按标签作互斥归因。
+
+整子进程 wall 17.106s、user CPU 16.986s、system CPU 0.099s、RSS 98744KiB，包含夹具、两请求和输出清理。此样本主要消耗 CPU，但不是逐阶段 CPU，也不是 Go2/5cm 实机性能。N pose hit/miss 为 3554/14140、一次容量清理；非空边界 motion bypass 1597 次，不能据此推出安全缓存键、重复边率或调大缓存的收益。
+
+验证：R2 251 通过、1 个旧 profile-only 合同断言失败、15 原 ignored；该断言要求的 expiry/ObservationInputCells 已与原生产 geometry-only 适配器不符。保留原失败日志，仅修正这一测试并保留真实占据拒绝/witness、缓存断言。R3 精确 14 项全通过（13 项重复），当前合同分批 252 个不同成功项，不声称同一次全绿。默认七包 tests 类型检查 14.23s 通过。初次缺开发依赖及离线全 workspace metadata 缺缓存包的失败也保留，未下载依赖或更改版本。全部复用原 release、单一增量 target。
+
+下一步围绕现有细占据列索引减少空 Z 查询，以及 contact-domain BFS 重复读取建立原算法等价对照。此阶段交付诊断与定位，不宣称已加速主搜索；此前 urgent cancellation 超时和实机资格仍未解决。
+
 ## 后续持续检查
 
 1. 墙前晚到路径的实际恢复与初始 full/partial/PCT 顺序，保留及时移动和真实避障

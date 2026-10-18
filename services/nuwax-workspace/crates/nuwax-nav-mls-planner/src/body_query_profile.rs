@@ -67,11 +67,23 @@ pub enum Stage {
     ObservationFootprintCells,
     /// Check occupied exemptions, exact evidence, time/hits and finite expiry.
     ObservationEvidence,
+    /// Complete known-terrain validation, including early errors.
+    KnownTerrainTotal,
+    /// Existing common-band helper, including early None; excludes caller Vec cleanup.
+    KnownCommonBand,
+    /// Existing tread helper, including early None; excludes caller Vec cleanup.
+    KnownTreadGeometry,
+    /// Existing known-only fallback after both geometry proofs miss.
+    KnownOnlyFallback,
+    /// Only actual known-terrain calls from normal or estimated projection.
+    ProjectedKnownTerrain,
+    /// Only the actual known-terrain call inside the checked sweep.
+    SweptKnownTerrain,
 }
 
 impl Stage {
     /// Number of fixed timing categories.
-    pub const COUNT: usize = 23;
+    pub const COUNT: usize = 29;
     /// Every timing category, in record-array order.
     pub const ALL: [Self; Self::COUNT] = [
         Self::MotionTotal,
@@ -97,6 +109,12 @@ impl Stage {
         Self::ObservationFootprintPatch,
         Self::ObservationFootprintCells,
         Self::ObservationEvidence,
+        Self::KnownTerrainTotal,
+        Self::KnownCommonBand,
+        Self::KnownTreadGeometry,
+        Self::KnownOnlyFallback,
+        Self::ProjectedKnownTerrain,
+        Self::SweptKnownTerrain,
     ];
 
     /// Stable label for reporting after the measured interval.
@@ -125,6 +143,12 @@ impl Stage {
             Self::ObservationFootprintPatch => "observation_footprint_patch",
             Self::ObservationFootprintCells => "observation_footprint_cells",
             Self::ObservationEvidence => "observation_evidence",
+            Self::KnownTerrainTotal => "known_terrain_total",
+            Self::KnownCommonBand => "known_common_band",
+            Self::KnownTreadGeometry => "known_tread_geometry",
+            Self::KnownOnlyFallback => "known_only_fallback",
+            Self::ProjectedKnownTerrain => "projected_known_terrain",
+            Self::SweptKnownTerrain => "swept_known_terrain",
 
         }
     }
@@ -182,11 +206,25 @@ pub enum Counter {
     ObservationHeightAbsent,
     /// Persistent observation block-root lookups by short-lived borrowed accessors.
     ObservationBlockRootResolutions,
+    /// Original exact-pose lookup returned an entry, including cached failures.
+    PoseCacheHits,
+    /// Original exact-pose lookup returned no entry.
+    PoseCacheMisses,
+    /// Original pose-cache capacity branch cleared its table; not source replacement.
+    PoseCacheCapacityClears,
+    /// Original empty-boundary motion lookup returned an entry, including failures.
+    MotionCacheHits,
+    /// Original empty-boundary motion lookup returned no entry; excludes bypasses.
+    MotionCacheMisses,
+    /// Original motion-cache capacity branch cleared its table; not source replacement.
+    MotionCacheCapacityClears,
+    /// Nonempty boundary took the original uncached motion path; never a miss.
+    MotionCacheBoundaryBypasses,
 }
 
 impl Counter {
     /// Number of fixed counter categories.
-    pub const COUNT: usize = 22;
+    pub const COUNT: usize = 29;
     /// Every counter category, in record-array order.
     pub const ALL: [Self; Self::COUNT] = [
         Self::PlaneCacheHits,
@@ -211,6 +249,13 @@ impl Counter {
         Self::ObservationHeightProbes,
         Self::ObservationHeightAbsent,
         Self::ObservationBlockRootResolutions,
+        Self::PoseCacheHits,
+        Self::PoseCacheMisses,
+        Self::PoseCacheCapacityClears,
+        Self::MotionCacheHits,
+        Self::MotionCacheMisses,
+        Self::MotionCacheCapacityClears,
+        Self::MotionCacheBoundaryBypasses,
     ];
 
     /// Stable label for reporting after the measured interval.
@@ -238,6 +283,13 @@ impl Counter {
             Self::ObservationHeightProbes => "observation_height_probes",
             Self::ObservationHeightAbsent => "observation_height_absent",
             Self::ObservationBlockRootResolutions => "observation_block_root_resolutions",
+            Self::PoseCacheHits => "pose_cache_hits",
+            Self::PoseCacheMisses => "pose_cache_misses",
+            Self::PoseCacheCapacityClears => "pose_cache_capacity_clears",
+            Self::MotionCacheHits => "motion_cache_hits",
+            Self::MotionCacheMisses => "motion_cache_misses",
+            Self::MotionCacheCapacityClears => "motion_cache_capacity_clears",
+            Self::MotionCacheBoundaryBypasses => "motion_cache_boundary_bypasses",
 
         }
     }
@@ -300,6 +352,16 @@ pub fn end() -> Record {
     })
 }
 
+/// Read completed work without changing the active interval, epoch or record.
+/// A live guard contributes only after drop; call at completed query boundaries.
+/// Inactive threads return None. This fixed-size copy reads no clock.
+pub fn snapshot() -> Option<Record> {
+    PROFILE.with(|profile| {
+        let state = profile.borrow();
+        state.enabled.then_some(state.record)
+    })
+}
+
 pub(crate) fn count(counter: Counter) {
     add(counter, 1);
 }
@@ -353,6 +415,29 @@ impl Drop for Guard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshots_are_read_only_and_only_include_completed_guards() {
+        assert!(snapshot().is_none());
+        begin();
+        let pending = guard(Stage::KnownTerrainTotal);
+        count(Counter::PoseCacheMisses);
+        let first = snapshot().expect("active profile");
+        let second = snapshot().expect("still active");
+        assert_eq!(first.calls, second.calls);
+        assert_eq!(first.wall_nanos, second.wall_nanos);
+        assert_eq!(first.counters, second.counters);
+        assert_eq!(first.calls[Stage::KnownTerrainTotal as usize], 0);
+        drop(pending);
+        let completed = snapshot().expect("snapshot did not end the interval");
+        assert_eq!(completed.calls[Stage::KnownTerrainTotal as usize], 1);
+        assert_eq!(completed.counters[Counter::PoseCacheMisses as usize], 1);
+        let final_record = end();
+        assert_eq!(completed.calls, final_record.calls);
+        assert_eq!(completed.wall_nanos, final_record.wall_nanos);
+        assert_eq!(completed.counters, final_record.counters);
+        assert!(snapshot().is_none());
+    }
 
     #[test]
     fn disabled_and_stale_guards_do_not_leak() {

@@ -1,4 +1,6 @@
 //! Test-only observations; never a planning decision or reusable permission.
+#[cfg(feature = "body-query-profile")]
+use nuwax_nav_mls_planner::body_query_profile::{self as body_profile, Record as BodyRecord};
 use nuwax_nav_pct::SearchStats;
 use nuwax_nav_scan::{LocalPlanFailureKind, LocalTrajectory};
 use std::{
@@ -41,6 +43,11 @@ pub(crate) struct KernelPhase {
 }
 #[derive(Clone, Debug)]
 pub(crate) struct ScanPhase {
+    // Completed-work snapshots only; differences/conservation are checked offline.
+    #[cfg(feature = "body-query-profile")]
+    pub body_before: Option<BodyRecord>,
+    #[cfg(feature = "body-query-profile")]
+    pub body_after: Option<BodyRecord>,
     pub branch: usize,
     pub phase: String,
     pub exit: String,
@@ -52,6 +59,8 @@ pub(crate) struct ScanPhase {
 }
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Frame {
+    #[cfg(feature = "body-query-profile")]
+    pub body_total: Option<BodyRecord>,
     pub branches: Vec<Branch>,
     pub kernel_phases: Vec<KernelPhase>,
     pub scan_phases: Vec<ScanPhase>,
@@ -73,6 +82,8 @@ pub(crate) struct Admission {
 }
 #[derive(Default)]
 struct State {
+    #[cfg(feature = "body-query-profile")]
+    body_last: Option<BodyRecord>,
     frame: Option<Frame>,
     admissions: Option<Vec<Admission>>,
 }
@@ -88,6 +99,39 @@ pub(crate) fn begin() {
 pub(crate) fn end() -> Frame {
     STATE.with(|s| s.borrow_mut().frame.take().expect("active priority probe"))
 }
+// This module is test-only. Capture runs on the actual synchronous kernel owner,
+// never on the separate moving-worker compute owner. No query is replayed.
+#[cfg(feature = "body-query-profile")]
+pub(crate) struct BodyCapture {
+    active: bool,
+}
+#[cfg(feature = "body-query-profile")]
+impl BodyCapture {
+    pub(crate) fn begin() -> Self {
+        body_profile::begin();
+        Self { active: true }
+    }
+    pub(crate) fn finish(mut self) {
+        let total = body_profile::end();
+        self.active = false;
+        STATE.with(|s| {
+            let mut s = s.borrow_mut();
+            s.body_last = None;
+            if let Some(f) = s.frame.as_mut() { f.body_total = Some(total); }
+        });
+    }
+}
+#[cfg(feature = "body-query-profile")]
+impl Drop for BodyCapture {
+    fn drop(&mut self) {
+        if self.active {
+            // Release only diagnostic TLS on panic; do not catch/replace the panic.
+            let _ = body_profile::end();
+            STATE.with(|s| s.borrow_mut().body_last = None);
+        }
+    }
+}
+
 pub(crate) fn begin_control() {
     STATE.with(|s| {
         let mut s = s.borrow_mut();
@@ -148,6 +192,8 @@ pub(crate) fn branch_begin(
 ) -> Option<Instant> {
     STATE.with(|s| {
         let mut s = s.borrow_mut();
+        #[cfg(feature = "body-query-profile")]
+        { s.body_last = body_profile::snapshot(); }
         let f = s.frame.as_mut()?;
         f.branches.push(Branch {
             detour,
@@ -170,7 +216,10 @@ pub(crate) fn branch_end(
 ) {
     if let Some(at) = at {
         STATE.with(|s| {
-            if let Some(f) = s.borrow_mut().frame.as_mut() {
+            let mut s = s.borrow_mut();
+            #[cfg(feature = "body-query-profile")]
+            { s.body_last = None; }
+            if let Some(f) = s.frame.as_mut() {
                 let branch = f.branches.last_mut().unwrap();
                 branch.wall = at.elapsed();
                 match result {
@@ -185,7 +234,10 @@ pub(crate) fn branch_end(
 pub(crate) fn branch_reference_miss(at: Option<Instant>) {
     if let Some(at) = at {
         STATE.with(|s| {
-            if let Some(f) = s.borrow_mut().frame.as_mut() {
+            let mut s = s.borrow_mut();
+            #[cfg(feature = "body-query-profile")]
+            { s.body_last = None; }
+            if let Some(f) = s.frame.as_mut() {
                 let branch = f.branches.last_mut().unwrap();
                 branch.wall = at.elapsed();
                 branch.reference_miss = true;
@@ -273,6 +325,12 @@ impl tracing::Subscriber for Subscriber {
         event.record(&mut fields);
         STATE.with(|s| {
             let mut s = s.borrow_mut();
+            #[cfg(feature = "body-query-profile")]
+            let (body_before, body_after) = if event.metadata().target() == "navigation.scan.phase" {
+                let after = body_profile::snapshot();
+                let before = std::mem::replace(&mut s.body_last, after);
+                (before, after)
+            } else { (None, None) };
             if let Some(f) = s.frame.as_mut() {
                 match event.metadata().target() {
                     "navigation.scan.search" => {
@@ -281,6 +339,10 @@ impl tracing::Subscriber for Subscriber {
                     }
                     "navigation.scan.phase" => {
                         f.scan_phases.push(ScanPhase {
+                            #[cfg(feature = "body-query-profile")]
+                            body_before,
+                            #[cfg(feature = "body-query-profile")]
+                            body_after,
                             branch: f.branches.len().saturating_sub(1),
                             phase: fields.phase.take().unwrap_or_default(),
                             exit: fields.phase_exit.clone(), selection: fields.selection.clone(),

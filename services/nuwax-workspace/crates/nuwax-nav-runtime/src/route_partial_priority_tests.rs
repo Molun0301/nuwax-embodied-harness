@@ -246,9 +246,13 @@ mod partial_route_priority_tests {
         cancel: &crate::planning_owner::Cancellation,
     ) -> (PlanResult, Duration, probe::Frame) {
         probe::begin();
+        #[cfg(feature = "body-query-profile")]
+        let body_capture = probe::BodyCapture::begin();
         let began = Instant::now();
         let result = kernel.compute(request, cancel);
         let elapsed = began.elapsed();
+        #[cfg(feature = "body-query-profile")]
+        body_capture.finish();
         let audit = probe::end();
         (result, elapsed, audit)
     }

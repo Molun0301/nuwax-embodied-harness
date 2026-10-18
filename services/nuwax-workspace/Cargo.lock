@@ -2056,6 +2056,7 @@ dependencies = [
  "nuwax-nav-scan",
  "nuwax-nav-types-messages",
  "prost",
+ "serde_json",
  "thiserror 1.0.69",
  "tokio",
  "tracing",

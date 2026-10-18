@@ -50,6 +50,32 @@ mod route_phase_qualification {
         eprintln!("KERNEL_PHASE_QUALIFICATION case={case:?} detour={detour} bounded_wall={bounded_wall} qualification={} kind={kind} kernel_wall_ms={} source_pose={:?} progress={} end={} audit={audit:?}",
             if expected {"QUALIFIED"} else {"NOT_QUALIFIED"}, wall.as_secs_f64()*1000.0,
             body(&result.request.pose), result.request.progress, result.request.end);
+        #[cfg(feature = "body-query-profile")]
+        {
+            use nuwax_nav_mls_planner::body_query_profile::{Counter, Record, Stage};
+            // Serialize only after compute and capture have ended; no hot-path log.
+            let record = |r: Record| serde_json::json!({
+                "wall_nanos": r.wall_nanos, "calls": r.calls, "counters": r.counters,
+            });
+            let phases: Vec<_> = audit.scan_phases.iter().map(|p| serde_json::json!({
+                "branch": p.branch,
+                "branch_detour": audit.branches.get(p.branch).map(|b| b.detour),
+                "phase": p.phase, "exit": p.exit, "selection": p.selection,
+                "complete": p.complete, "scan_elapsed_ms": p.elapsed_ms,
+                "scan_calls": p.calls, "scan_ms": p.milliseconds,
+                "before": p.body_before.map(&record), "after": p.body_after.map(&record),
+            })).collect();
+            eprintln!("BODY_QUERY_PROFILE {}", serde_json::json!({
+                "case": format!("{case:?}"), "request_detour": detour,
+                "bounded_wall": bounded_wall, "expansion_limit": 256,
+                "qualification": if expected {"QUALIFIED"} else {"NOT_QUALIFIED"},
+                "kind": kind, "owner": "synchronous_plan_kernel_thread",
+                "duration": "instrumented_wall_not_cpu",
+                "stage_labels": Stage::ALL.map(Stage::label),
+                "counter_labels": Counter::ALL.map(Counter::label),
+                "total": audit.body_total.map(record), "phases": phases,
+            }));
+        }
         // No current-pose/admission or real-time performance claim is made here.
         // The existing owner/control tests remain the source of those results.
         (is_partial, is_full)

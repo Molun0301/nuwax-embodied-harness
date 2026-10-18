@@ -164,6 +164,8 @@ async fn selective_refresh_original_unrelated_a_and_evidence_add_zero_planner_wo
     let refreshed = latest(&harness).unwrap();
     let new_evidence = refreshed.observations().unwrap().get([40,30,40]).unwrap();
     assert!(new_evidence.observed_ns>first_evidence.observed_ns && new_evidence.hits>first_evidence.hits);
+    let evidence_observation_owner_changed = !Arc::ptr_eq(first.observations().unwrap(), refreshed.observations().unwrap());
+    let evidence_query_view_changed = !first.same_body_query_view(&refreshed);
     assert!(nuwax_nav_pct::same_source_geometry(&first,&refreshed));
     assert_eq!(harness.hub.reference_checks.load(Ordering::SeqCst),0);
     cells.lock().unwrap().insert(A);
@@ -183,6 +185,8 @@ async fn selective_refresh_original_unrelated_a_and_evidence_add_zero_planner_wo
     assert_eq!(replacement.path_revision,initial.path_revision+1);
     eprintln!("SELECTIVE_RELATED coordinate={RELATED:?} normal_extra=1 quick_extra=0 path_extra=1");
     harness.cancel(&goal).await; harness.terminal(TerminalOutcome::Cancelled).await; harness.shutdown().await;
+    assert!(evidence_observation_owner_changed);
+    assert!(evidence_query_view_changed, "truthful evidence must invalidate a complete query view");
 }
 
 #[tokio::test]
@@ -252,6 +256,8 @@ async fn selective_refresh_source_watermarks_add_zero_geometry_or_planner_work()
     assert_eq!(first_root.blocks, refreshed_root.blocks);
     assert_eq!(first_root.geometry_revision, refreshed_root.geometry_revision);
     assert_eq!(first_evidence, refreshed.observations().unwrap().get([40, 30, 40]));
+    let same_observation_owner = Arc::ptr_eq(first.observations().unwrap(), refreshed.observations().unwrap());
+    let same_query_view = first.same_body_query_view(&refreshed);
     assert!(nuwax_nav_pct::same_source_geometry(&first, &refreshed));
     unchanged_path(&mut harness, initial.path_revision).await;
     assert_eq!((normal.load(Ordering::SeqCst), quick.load(Ordering::SeqCst)), (1, 0));
@@ -260,6 +266,9 @@ async fn selective_refresh_source_watermarks_add_zero_geometry_or_planner_work()
     harness.cancel(&goal).await;
     harness.terminal(TerminalOutcome::Cancelled).await;
     harness.shutdown().await;
+    assert!(same_observation_owner,
+        "F2: watermark-only Writer publication must retain observations through the real map owner");
+    assert!(same_query_view);
 }
 
 #[tokio::test]

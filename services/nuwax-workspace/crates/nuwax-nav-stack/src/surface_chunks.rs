@@ -35,6 +35,8 @@ impl FineMapReader {
             return Ok((Arc::clone(grid), Some(Vec::new())));
         }
         let known = previous.is_some();
+        // Empty geometry changes do not prove unchanged evidence or layer statistics.
+        let mut mutated = false;
         let mut changed = Vec::new();
         let mut grid = match previous {
             Some((_, grid)) => grid.as_ref().clone(),
@@ -43,6 +45,7 @@ impl FineMapReader {
         let old: BTreeMap<_, _> = previous.into_iter().flat_map(|(r, _)| &r.blocks).map(|b| (b.key, b)).collect();
         let new: BTreeMap<_, _> = root.blocks.iter().map(|b| (b.key, b)).collect();
         for key in old.keys().filter(|key| !new.contains_key(*key)) {
+            mutated = true;
             changed.extend(grid.replace_block_with_geometry_changes(*key, BTreeMap::new())
                 .map_err(|e| e.to_string())?);
             // Removing the final occupied block also retires its measured layers.
@@ -58,6 +61,7 @@ impl FineMapReader {
                 values.insert(nuwax_map_chunks::global_key(reference.key, local)?,
                     SurfaceObservation { observed_ns: evidence.observed_ns, hits: evidence.hits });
             }
+            mutated = true;
             changed.extend(grid.replace_block_with_geometry_changes(reference.key, values)
                 .map_err(|e| e.to_string())?);
             // BL2/BL3 layers use the same admitted object and decode cache. BL1 returns
@@ -71,7 +75,11 @@ impl FineMapReader {
         grid.mark_complete_geometry_source();
         changed.sort_unstable();
         changed.dedup();
-        Ok((Arc::new(grid), known.then_some(changed)))
+        let grid = match previous {
+            Some((_, previous)) if !mutated && previous.is_complete_geometry_source() => Arc::clone(previous),
+            _ => Arc::new(grid),
+        };
+        Ok((grid, known.then_some(changed)))
     }
 
     pub(super) fn new(lcm_url: String) -> Result<Self, String> {

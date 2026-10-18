@@ -102,6 +102,7 @@ struct GatedRealSurfaceSource {
     source: SurfaceGoalSourceAdapter,
     audit: Arc<StdMutex<SurfaceOwnerAudit>>,
     after_prepare: Option<Arc<OwnerRuntimeGate>>,
+    second_after_prepare: Option<Arc<OwnerRuntimeGate>>,
     before_commit: Option<Arc<OwnerRuntimeGate>>,
 }
 
@@ -171,8 +172,9 @@ impl ExplorationGoalSource for GatedRealSurfaceSource {
                 tomogram_cells,
             });
         // The real source has finished preparing, but no proposal is visible to
-        // the actor yet. Take makes the hold one-shot; later progress is real.
+        // the actor yet. Each of the at most two test holds is used once.
         if let Some(gate) = self.after_prepare.take() {
+            self.after_prepare = self.second_after_prepare.take();
             gate.hold();
         }
         Ok(prepared)
@@ -231,6 +233,18 @@ async fn install_gated_real_surface_source(
     after_prepare: Arc<OwnerRuntimeGate>,
     before_commit: Option<Arc<OwnerRuntimeGate>>,
 ) -> SurfaceInputReceiver {
+    install_gated_real_surface_source_with_second_prepare(
+        handle, audit, after_prepare, None, before_commit,
+    ).await
+}
+
+async fn install_gated_real_surface_source_with_second_prepare(
+    handle: &ExploreRuntimeHandle,
+    audit: Arc<StdMutex<SurfaceOwnerAudit>>,
+    after_prepare: Arc<OwnerRuntimeGate>,
+    second_after_prepare: Option<Arc<OwnerRuntimeGate>>,
+    before_commit: Option<Arc<OwnerRuntimeGate>>,
+) -> SurfaceInputReceiver {
     let (receiver, config, body_to_support) = {
         let guard = handle.inner.lock().await;
         let mode = guard.surface_mode.as_ref().unwrap();
@@ -260,6 +274,7 @@ async fn install_gated_real_surface_source(
         source,
         audit,
         after_prepare: Some(after_prepare),
+        second_after_prepare,
         before_commit,
     });
     controller.begin_exploration().unwrap();
@@ -954,4 +969,471 @@ async fn compute_owner_surface_changed_observation_owner_discards_without_histor
 #[tokio::test]
 async fn compute_owner_surface_new_immutable_source_discards_without_history_or_id() {
     surface_owner_changed_source_discards_then_progresses(false).await;
+}
+
+// F2 real-input fixtures. Append inside the existing explore_runtime::tests
+// inclusion; reuse its actual compute owner, gated Surface source and cleanup.
+fn watermark_owner_config() -> SurfaceNavigationConfig {
+    let mut config = surface_config("map");
+    config.apply_calibration(Some(nuwax_nav_types_messages::RobotGeometry {
+        footprint_xy_m: vec![[-0.1, -0.1], [0.1, -0.1], [0.1, 0.1], [-0.1, 0.1]],
+        z_min_m: -0.05, z_max_m: 0.2, source: "F2 real Writer owner fixture".into(),
+    }), None).unwrap();
+    assert!(config.body_envelope.is_some());
+    config
+}
+
+fn watermark_owner_source() -> Arc<nuwax_map_chunks::LayerSource> {
+    Arc::new(nuwax_map_chunks::LayerSource::Auxiliary {
+        sensor_id: "depth-front".into(), clock_id: "camera-clock".into(),
+        runtime_generation: 7, session_generation: 1,
+    })
+}
+
+fn watermark_owner_publication(
+    writer: &mut nuwax_map_chunks::Writer,
+    previous: Option<&nuwax_map_chunks::Manifest>,
+    revision: i32,
+    timestamp: u64,
+) -> (schema::NavigationMap3D, nuwax_map_chunks::SealedMap) {
+    let mut message = surface_message("map", revision);
+    message.source_timestamp_ns = timestamp as i64;
+    message.committed_map.source_timestamp_ns = timestamp as i64;
+    message.cloud.header.stamp_sec = (timestamp / 1_000_000_000) as i32;
+    message.cloud.header.stamp_nsec = (timestamp % 1_000_000_000) as i32;
+    message.cloud.width = 0;
+    message.cloud.row_step = 0;
+    message.cloud.data.clear();
+    let sealed = writer.seal(schema::navigation_map_3d_domain(&message),
+        revision as u64, timestamp).unwrap();
+    message.source_voxel_size = sealed.manifest().voxel_size_m;
+    message.fine = Some(crate::lcm_runtime::mapping_feed_tests::prepare_fine_transfer_for_watermark_tests(&sealed, previous).unwrap());
+    if previous.is_none() {
+        assert!(sealed.manifest().blocks.iter().all(|reference|
+            message.fine.as_ref().unwrap().included.contains_key(&reference.object)),
+            "F2 initial real fixture must fit the original inline transfer budget");
+    }
+    // Traverse the actual NavigationMap3D wire codec, not a hand-written mock.
+    let bytes = schema::encode_navigation_map_3d_body(&message).unwrap();
+    let message = schema::decode_navigation_map_3d_body(&bytes).unwrap();
+    (message, sealed)
+}
+
+async fn watermark_owner_install(
+    handle: &ExploreRuntimeHandle,
+    cache: &mut nuwax_nav_stack::surface_map::SurfaceMapCache,
+    message: &schema::NavigationMap3D,
+) -> (Arc<SurfaceSnapshot>, u64) {
+    let receipt = now_monotonic_nanos();
+    let ticket = owner_watchdog(handle.begin_surface_map_update(message, receipt))
+        .await.unwrap().unwrap();
+    let snapshot = cache.build(message).unwrap();
+    assert!(snapshot.observations().is_some(), "full-body fixture must enable observations");
+    assert!(owner_watchdog(handle.finish_surface_map_update(ticket, Ok(snapshot.clone()))).await);
+    let guard = handle.inner.lock().await;
+    assert_eq!(guard.costmap_received_monotonic_ns, receipt);
+    assert_eq!(guard.committed_map.as_ref(), Some(&message.committed_map));
+    assert_eq!(guard.surface_mode.as_ref().unwrap().installed_revision,
+        Some((message.cloud_revision, message.committed_map.revision)));
+    (snapshot, receipt)
+}
+
+async fn watermark_owner_cleanup(
+    handle: &ExploreRuntimeHandle,
+    request_id: &str,
+    ticking: &mut Option<tokio::task::JoinHandle<ExploreRuntimeSnapshot>>,
+) {
+    let tick_cleanup = if let Some(mut ticking) = ticking.take() {
+        match scheme_a_race_wait("F2 released test waiter", &mut ticking).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(error)) => Err(format!("test waiter failed: {error}")),
+            Err(error) => {
+                // Only the exceptional test waiter is aborted, exactly as the
+                // existing Scheme A fixture. Native owner still gets Stop/join.
+                ticking.abort();
+                let _ = ticking.await;
+                Err(error)
+            },
+        }
+    } else { Ok(()) };
+    let stopped = scheme_a_race_wait("F2 original Stop", handle.stop(request_id)).await;
+    let ticket = scheme_a_race_wait("F2 original cancellation ticket", async {
+        handle.inner.lock().await.pending_child_cancellation.as_ref().and_then(|pending| pending.ticket.clone())
+    }).await;
+    let reported = match ticket.as_ref().ok().and_then(|ticket| ticket.as_ref()) {
+        Some(ticket) => Some(scheme_a_race_wait("F2 exact ZEROED", handle.report_navigation_result(
+            &ticket.lease.session_id,
+            ChildNavigationResult::Cancelled(zero_proof(&ticket.lease, ticket.cancel_generation)),
+        )).await),
+        None => None,
+    };
+    let idle = scheme_a_race_wait("F2 original compute idle", handle.await_compute_idle()).await;
+    let shutdown = scheme_a_race_wait("F2 original compute shutdown", handle.request_compute_shutdown()).await;
+    let joined = scheme_a_race_wait("F2 original compute join", handle.compute_service.join()).await;
+    let retired = scheme_a_race_wait("F2 settled child ownership", async {
+        let guard = handle.inner.lock().await;
+        (guard.active_child.is_some(), guard.pending_child_cancellation.is_some(), guard.logical_active)
+    }).await;
+    eprintln!("F2 cleanup: tick={tick_cleanup:?}, stopped={stopped:?}, ticket={ticket:?}, reported={reported:?}, idle={idle:?}, shutdown={shutdown:?}, joined={joined:?}, retired={retired:?}");
+    assert!(tick_cleanup.is_ok());
+    assert!(stopped.is_ok());
+    assert!(ticket.is_ok());
+    assert!(matches!(reported, None | Some(Ok(Ok(_)))));
+    assert!(matches!(idle, Ok(Ok(()))));
+    assert!(shutdown.is_ok());
+    assert!(matches!(joined, Ok(Ok(()))));
+    assert!(matches!(retired, Ok((false, false, false))));
+}
+
+async fn watermark_owner_real_publication_qualifies_prepared_selection(evidence_change: bool) {
+    use futures::FutureExt;
+    let (handle, sink) = configured_handle();
+    let request_id = if evidence_change { "owner-real-writer-evidence" } else { "owner-real-writer-watermark" };
+    let gate = Arc::new(OwnerRuntimeGate::default());
+    let _release = OwnerRuntimeGateRelease(gate.clone());
+    let second_gate = evidence_change.then(|| Arc::new(OwnerRuntimeGate::default()));
+    let _second_release = second_gate.as_ref().map(|gate| OwnerRuntimeGateRelease(gate.clone()));
+    let mut ticking: Option<tokio::task::JoinHandle<ExploreRuntimeSnapshot>> = None;
+    let exercise = std::panic::AssertUnwindSafe(async {
+    let config = watermark_owner_config();
+    handle.configure_surface_source(Ok(config.clone()), 37, [7; 16]).await.unwrap();
+    let mut cache = nuwax_nav_stack::surface_map::SurfaceMapCache::configured(&config);
+    let repository = nuwax_map_chunks::Repository::temporary().unwrap();
+    let mut writer = nuwax_map_chunks::Writer::new(repository.clone(), 0.1, 4 * 1024 * 1024).unwrap();
+    let first_time = now_unix_nanos();
+    writer.observe([0, 30].into_iter().flat_map(|z| (0..50).flat_map(move |x|
+        (0..30).map(move |y| [x, y, z]))), first_time).unwrap();
+    let source = watermark_owner_source();
+    writer.record_source_watermark(source.clone(), 90, 0).unwrap();
+    let (first_message, first_sealed) = watermark_owner_publication(&mut writer, None, 1, first_time);
+    let first_root = first_sealed.manifest().clone();
+    let first_bytes: std::collections::BTreeMap<_, _> = first_root.blocks.iter().map(|reference|
+        (reference.object, repository.read_object(reference.object, nuwax_map_chunks::MAX_BLOCK_BYTES).unwrap())).collect();
+    let (first, first_receipt) = watermark_owner_install(&handle, &mut cache, &first_message).await;
+    assert_eq!(handle.start(request_id, "prefer_wavefront").await.status, STATUS_ACCEPTED);
+    let audit = Arc::new(StdMutex::new(SurfaceOwnerAudit::default()));
+    let receiver = install_gated_real_surface_source_with_second_prepare(
+        &handle, audit.clone(), gate.clone(), second_gate.clone(), None,
+    ).await;
+    let original = receiver.freeze().unwrap();
+    let planning = original.fork_for_planning();
+    let original_evidence = first.observations().unwrap().get([15, 15, 0]).unwrap();
+    let pose = surface_pose(&first, 0.0, Quaternion::IDENTITY);
+    ticking = Some(tokio::spawn({
+        let handle = handle.clone();
+        let pose = pose.clone();
+        async move { handle.tick_with_pose(pose).await }
+    }));
+    owner_watchdog(gate.entered()).await;
+    let (prepared_at_gate, committed_at_gate, discarded_at_gate) = {
+        let audit = audit.lock().unwrap();
+        (audit.captures.clone(), audit.commits.len(), audit.discards)
+    };
+    assert_eq!(prepared_at_gate.len(), 1, "F2 fixture must reach one real prepare");
+    eprintln!("F2 before-Accept qualification: preview={:?}, receipt_age_ns={}",
+        prepared_at_gate[0].preview, now_monotonic_nanos().saturating_sub(first_receipt));
+    let _ = surface_owner_goal(prepared_at_gate[0].preview.as_ref().unwrap());
+    assert_eq!((committed_at_gate, discarded_at_gate), (0, 0));
+    assert!(sink.submitted.lock().unwrap().is_empty());
+    assert!(!ticking.as_ref().unwrap().is_finished());
+
+    let second_time = now_unix_nanos().max(first_time + 1);
+    writer.record_source_watermark(source.clone(), 900, 1).unwrap();
+    if evidence_change {
+        writer.observe([[15, 15, 0]], second_time).unwrap();
+    }
+    let (second_message, second_sealed) = watermark_owner_publication(&mut writer,
+        Some(first_root.as_ref()), 2, second_time);
+    let second_root = second_sealed.manifest();
+    assert_eq!(first_root.domain, second_root.domain);
+    assert_eq!(first_root.voxel_size_m.to_bits(), second_root.voxel_size_m.to_bits());
+    assert_eq!(first_root.geometry_revision, second_root.geometry_revision);
+    assert_ne!(first_root.source_watermarks, second_root.source_watermarks);
+    assert!(second_root.revision > first_root.revision);
+    assert!(second_root.source_timestamp_ns > first_root.source_timestamp_ns);
+    assert_eq!(first_message.virtual_obstacles, second_message.virtual_obstacles);
+    if evidence_change {
+        assert_ne!(first_root.blocks, second_root.blocks);
+        assert!(!second_message.fine.as_ref().unwrap().included.is_empty());
+    } else {
+        // Complete BlockRef equality is an input proof for this test only. The
+        // production candidate must not add another whole-root comparison.
+        assert_eq!(first_root.blocks, second_root.blocks);
+        assert!(second_message.fine.as_ref().unwrap().included.is_empty());
+        for reference in &second_root.blocks {
+            assert_eq!(first_bytes[&reference.object], repository
+                .read_object(reference.object, nuwax_map_chunks::MAX_BLOCK_BYTES).unwrap());
+        }
+    }
+    let (second, second_receipt) = watermark_owner_install(&handle, &mut cache, &second_message).await;
+    let current = receiver.freeze().unwrap();
+    assert!(second_receipt >= first_receipt);
+    assert_eq!(current.notification(), original.notification() + 1);
+    assert!(first.same_geometry(&second));
+    assert!(first.observations().unwrap().same_geometry(second.observations().unwrap()));
+    assert_eq!(cache.last_build_stats().unwrap().input_points, 0);
+    let new_evidence = second.observations().unwrap().get([15, 15, 0]).unwrap();
+    if evidence_change {
+        assert!(new_evidence.observed_ns > original_evidence.observed_ns);
+        assert!(new_evidence.hits > original_evidence.hits);
+    } else {
+        assert_eq!(original_evidence, new_evidence);
+    }
+    // Capture red facts, then settle the worker before asserting. A red test
+    // must never strand a prepared native owner or leave an accepted child.
+    let observations_reused = Arc::ptr_eq(first.observations().unwrap(), second.observations().unwrap());
+    let same_view = original.same_source_view(&current);
+    let rebound = planning.rebind_original(&current);
+    if let Some(rebound) = rebound.as_ref() {
+        assert_eq!(rebound.original_input().notification(), current.notification());
+        assert!(Arc::ptr_eq(rebound.query_snapshot().unwrap(), planning.query_snapshot().unwrap()));
+    }
+    gate.release();
+    let joined_tick = owner_watchdog(ticking.as_mut().expect("real gated tick")).await;
+    ticking = None;
+    let result = joined_tick.unwrap();
+    owner_watchdog(handle.await_compute_idle()).await.unwrap();
+    let (captures, commits, discards) = {
+        let audit = audit.lock().unwrap();
+        (audit.captures.clone(), audit.commits.clone(), audit.discards)
+    };
+    let submitted = sink.submitted.lock().unwrap().clone();
+    let cancelled = sink.cancelled.lock().unwrap().clone();
+    // Prove the real evidence transition before any second prepare or renewal.
+    // The later pure-watermark transition cannot substitute for this Discard.
+    if evidence_change {
+        assert!(!observations_reused && !same_view && rebound.is_none());
+        assert_eq!((captures.len(), commits.len(), discards), (1, 0, 1));
+        assert!(submitted.is_empty() && cancelled.is_empty());
+        assert_surface_owner_capture(&captures[0], &first, original.notification(), &pose);
+    }
+    // Exercise the actual owner's next selection too. InputUnavailable retires
+    // the real child without blacklisting the frontier or consuming the newer
+    // map notification; this is the same terminal-proof flow as the existing
+    // same-root owner reuse tests. A discarded first proposal has no child.
+    if result.status == STATUS_ACTIVE && !submitted.is_empty() {
+        let lease = active_child_lease(&handle).await;
+        owner_watchdog(handle.report_navigation_result(&result.child_task_id,
+            ChildNavigationResult::Failed {
+                proof: terminal_proof(&lease),
+                reason: "SafetyFailed cause=StaleInput: F2 actual owner reuse fixture".into(),
+            })).await.unwrap();
+        owner_watchdog(handle.await_compute_idle()).await.unwrap();
+    }
+    let second_pose = surface_pose(&second, 0.0, Quaternion::IDENTITY);
+    let mut renewed_committed_map = None;
+    let next_result = if let Some(second_gate) = second_gate.as_ref() {
+        ticking = Some(tokio::spawn({
+            let handle = handle.clone();
+            let pose = second_pose.clone();
+            async move { handle.tick_with_pose(pose).await }
+        }));
+        owner_watchdog(second_gate.entered()).await;
+        // Capture completed real work on root2 before publishing root3. Neither
+        // the source nor its private query is replaced or warmed by this check.
+        let (cold_captures, cold_commits, cold_discards) = {
+            let audit = audit.lock().unwrap();
+            (audit.captures.clone(), audit.commits.len(), audit.discards)
+        };
+        {
+            assert_eq!((cold_captures.len(), cold_commits, cold_discards), (2, 0, 1));
+            let cold = &cold_captures[1];
+            assert_surface_owner_capture(cold, &second, current.notification(), &second_pose);
+            assert!(!std::sync::Weak::ptr_eq(&cold_captures[0].private_query, &cold.private_query));
+            assert!(cold.private_frontier_before.is_none());
+            let cells = second.cell_keys().count();
+            assert_eq!(cells, 3000, "unchanged real Writer fixture size");
+            assert_eq!((cold.tomogram_builds, cold.tomogram_cells), (1, cells));
+            assert_eq!((cold.frontier_rebuilds, cold.frontier_evaluated_cells), (1, cells));
+            eprintln!("F2 evidence cold prepare before renewal: notification={}, tomogram={}/{}, frontier={}/{}, commits=0, discards=1",
+                cold.original.notification(), cold.tomogram_builds, cold.tomogram_cells,
+                cold.frontier_rebuilds, cold.frontier_evaluated_cells);
+        }
+        assert!(!ticking.as_ref().unwrap().is_finished());
+        assert!(sink.submitted.lock().unwrap().is_empty());
+        assert!(sink.cancelled.lock().unwrap().is_empty());
+        let second_bytes: std::collections::BTreeMap<_, _> = second_root.blocks.iter().map(|reference|
+            (reference.object, repository.read_object(reference.object, nuwax_map_chunks::MAX_BLOCK_BYTES).unwrap())).collect();
+        let third_time = now_unix_nanos().max(second_time + 1);
+        writer.record_source_watermark(source, 901, 2).unwrap();
+        let (third_message, third_sealed) = watermark_owner_publication(&mut writer,
+            Some(second_root.as_ref()), 3, third_time);
+        let third_root = third_sealed.manifest();
+        assert_eq!(second_root.domain, third_root.domain);
+        assert_eq!(second_root.voxel_size_m.to_bits(), third_root.voxel_size_m.to_bits());
+        assert_eq!(second_root.geometry_revision, third_root.geometry_revision);
+        assert_eq!(second_root.blocks, third_root.blocks);
+        assert_ne!(second_root.source_watermarks, third_root.source_watermarks);
+        assert!(third_root.revision > second_root.revision);
+        assert!(third_root.source_timestamp_ns > second_root.source_timestamp_ns);
+        assert_eq!(second_message.virtual_obstacles, third_message.virtual_obstacles);
+        assert!(third_message.fine.as_ref().unwrap().included.is_empty());
+        for reference in &third_root.blocks {
+            assert_eq!(second_bytes[&reference.object], repository
+                .read_object(reference.object, nuwax_map_chunks::MAX_BLOCK_BYTES).unwrap());
+        }
+        // Use the original Writer/transfer/codec/cache/receiver completion path.
+        // This is a new real receipt, never a clock or field assignment in test.
+        let (third, third_receipt) = watermark_owner_install(&handle, &mut cache, &third_message).await;
+        let renewed = receiver.freeze().unwrap();
+        assert!(third_receipt > second_receipt);
+        assert_eq!(renewed.notification(), current.notification() + 1);
+        assert!(second.same_geometry(&third));
+        assert!(Arc::ptr_eq(second.observations().unwrap(), third.observations().unwrap()));
+        let renewed_evidence = third.observations().unwrap().get([15, 15, 0]).unwrap();
+        assert_eq!(new_evidence, renewed_evidence);
+        assert!(renewed_evidence.observed_ns > original_evidence.observed_ns);
+        assert!(renewed_evidence.hits > original_evidence.hits);
+        assert!(current.same_source_view(&renewed));
+        assert!(!Arc::ptr_eq(first.observations().unwrap(), third.observations().unwrap()));
+        assert!(!original.same_source_view(&renewed));
+        assert!(planning.rebind_original(&renewed).is_none());
+        assert_eq!(cache.last_build_stats().unwrap().input_points, 0);
+        renewed_committed_map = Some(third_message.committed_map.clone());
+        eprintln!("F2 evidence pure-watermark renewal: root2={}, root3={}, original_receipt_ns={second_receipt}, renewed_receipt_ns={third_receipt}, notification={}",
+            second_root.revision, third_root.revision, renewed.notification());
+        second_gate.release();
+        let joined_tick = owner_watchdog(ticking.as_mut().expect("second real gated tick")).await;
+        ticking = None;
+        joined_tick.unwrap()
+    } else {
+        owner_watchdog(handle.tick_with_pose(second_pose)).await
+    };
+    owner_watchdog(handle.await_compute_idle()).await.unwrap();
+    let later_captures = audit.lock().unwrap().captures.clone();
+    eprintln!("F2 actual owner: evidence_change={evidence_change}, observations_reused={observations_reused}, same_view={same_view}, rebound={}, first_status={}, captures={}, commits={}, discards={discards}, first_submitted={}, first_cancelled={}, next_status={}, later_captures={}",
+        rebound.is_some(), result.status, captures.len(), commits.len(), submitted.len(), cancelled.len(), next_result.status, later_captures.len());
+    assert_surface_owner_capture(&captures[0], &first, original.notification(), &pose);
+    assert_eq!(next_result.status, STATUS_ACTIVE, "{}", next_result.message);
+    assert_eq!(later_captures.len(), 2);
+    assert_eq!(later_captures[1].original.notification(), current.notification());
+    assert_eq!(later_captures[0].tomogram_builds, 1);
+    assert!(later_captures[0].tomogram_cells > 0);
+    if evidence_change {
+        assert!(!observations_reused && !same_view && rebound.is_none());
+        assert_eq!((captures.len(), commits.len(), discards), (1, 0, 1));
+        assert!(submitted.is_empty() && cancelled.is_empty());
+        assert!(!std::sync::Weak::ptr_eq(&later_captures[0].private_query,
+            &later_captures[1].private_query));
+        assert_eq!(later_captures[1].tomogram_builds, 1);
+        assert!(later_captures[1].tomogram_cells > 0);
+        let final_counts = {
+            let audit = audit.lock().unwrap();
+            (audit.commits.len(), audit.discards)
+        };
+        assert_eq!(final_counts, (1, 1));
+        let submitted = sink.submitted.lock().unwrap();
+        assert_eq!(submitted.len(), 1);
+        assert_eq!(submitted[0].intent.committed_map, second_message.committed_map,
+            "accepted goal must retain root2's actual frozen source identity");
+        assert_ne!(&submitted[0].intent.committed_map, renewed_committed_map.as_ref().unwrap());
+        assert!(sink.cancelled.lock().unwrap().is_empty());
+    } else {
+        assert!(observations_reused, "F2 RED: unchanged Writer blocks recreated observations");
+        assert!(same_view && rebound.is_some());
+        assert!(std::sync::Weak::ptr_eq(&later_captures[0].private_query,
+            &later_captures[1].private_query));
+        assert_eq!(later_captures[1].tomogram_builds, 0);
+        assert_eq!(later_captures[1].tomogram_cells, 0);
+        assert_eq!(later_captures[1].frontier_rebuilds, 0);
+        assert_eq!(later_captures[1].frontier_evaluated_cells, 0);
+        assert_eq!((captures.len(), commits.len(), discards), (1, 1, 0), "{}", result.message);
+        assert_eq!(result.status, STATUS_ACTIVE, "{}", result.message);
+        assert_eq!(submitted.len(), 1);
+        assert!(cancelled.is_empty());
+        assert_eq!(submitted[0].intent.committed_map, first_message.committed_map,
+            "accepted goal must retain the actual frozen source identity");
+        assert_ne!(submitted[0].intent.committed_map, second_message.committed_map);
+    }
+    }).catch_unwind().await;
+    // Release every possible native hold before waiting for the test waiter,
+    // then attempt the original Stop/idle/shutdown/join even after a panic.
+    gate.release();
+    if let Some(gate) = second_gate.as_ref() { gate.release(); }
+    watermark_owner_cleanup(&handle, request_id, &mut ticking).await;
+    if let Err(panic) = exercise { std::panic::resume_unwind(panic); }
+}
+
+#[tokio::test]
+async fn compute_owner_real_writer_watermark_keeps_prepared_source_view() {
+    watermark_owner_real_publication_qualifies_prepared_selection(false).await;
+}
+
+#[tokio::test]
+async fn compute_owner_real_writer_evidence_change_discards_prepared_source_view() {
+    // Two-stage contract: real evidence invalidates, then the cold root2 result
+    // can commit after a pure-watermark root3 renewal. The latter needs F2 reuse;
+    // it is not an independent old-production negative-control expectation.
+    watermark_owner_real_publication_qualifies_prepared_selection(true).await;
+}
+
+#[tokio::test]
+async fn real_writer_same_plane_scatter_change_invalidates_complete_source_view() {
+    let config = watermark_owner_config();
+    let repository = nuwax_map_chunks::Repository::temporary().unwrap();
+    let mut writer = nuwax_map_chunks::Writer::new(repository.clone(), 0.1, 4 * 1024 * 1024).unwrap();
+    let source = watermark_owner_source();
+    let timestamp = now_unix_nanos();
+    writer.observe((0..50).flat_map(|x| (0..30).map(move |y| [x, y, 0])), timestamp).unwrap();
+    let layer_key = [15, 15, 0];
+    let anchor = nuwax_map_chunks::local_key(layer_key);
+    let block_key = nuwax_map_chunks::block_key(layer_key);
+    let layers = |spread: f64| std::collections::BTreeMap::from([(anchor,
+        nuwax_map_chunks::LayerObservation {
+            members: vec![anchor], plane_origin: [1.55, 1.55, 0.025], normal: [0.0, 0.0, 1.0],
+            samples: [0.025 - spread, 0.025 + spread].into_iter().enumerate().map(|(index, z)|
+                nuwax_map_chunks::LayerSample { source: source.clone(), point: [1.55, 1.55, z],
+                    source_sequence: 1, source_timestamp_ns: timestamp, point_index: index as u32 }).collect(),
+        })]);
+    writer.replace_layer_observations(block_key, layers(0.001)).unwrap();
+    writer.record_source_watermark(source.clone(), timestamp, 1).unwrap();
+    let (first_message, first_sealed) = watermark_owner_publication(&mut writer, None, 1, timestamp);
+    let mut cache = nuwax_nav_stack::surface_map::SurfaceMapCache::configured(&config);
+    let first = cache.build(&first_message).unwrap();
+    let receiver = SurfaceInputReceiver::new();
+    receiver.observe(first.clone()).unwrap();
+    let original = receiver.freeze().unwrap();
+    let planning = original.fork_for_planning();
+    let old_evidence = first.observations().unwrap().get(layer_key);
+    let old_layer = first.observations().unwrap().ground_layers([15, 15]).next().unwrap();
+    let old_scatter = old_layer.statistics.moments().sample_scatter().unwrap();
+    let old_query = first.query_ground([1.55, 1.55], 0.025);
+    // Same occupied members, plane, normal, sample identity and mean. Only the
+    // truthful sample spread changes; no observe() call advances voxel evidence.
+    writer.replace_layer_observations(block_key, layers(0.01)).unwrap();
+    let (second_message, second_sealed) = watermark_owner_publication(&mut writer,
+        Some(first_sealed.manifest().as_ref()), 2, timestamp + 1);
+    let first_root = first_sealed.manifest();
+    let second_root = second_sealed.manifest();
+    assert_eq!(first_root.geometry_revision, second_root.geometry_revision);
+    assert_eq!(first_root.source_watermarks, second_root.source_watermarks);
+    assert_ne!(first_root.blocks, second_root.blocks);
+    let before = first_root.blocks.iter().find(|reference| reference.key == block_key).unwrap();
+    let after = second_root.blocks.iter().find(|reference| reference.key == block_key).unwrap();
+    assert!(after.block_revision > before.block_revision);
+    assert_eq!(after.geometry_revision, before.geometry_revision);
+    assert_eq!(after.points, before.points);
+    let before_bytes = repository.read_object(before.object, nuwax_map_chunks::MAX_BLOCK_BYTES).unwrap();
+    let after_bytes = repository.read_object(after.object, nuwax_map_chunks::MAX_BLOCK_BYTES).unwrap();
+    assert_ne!(before_bytes, after_bytes);
+    let second = cache.build(&second_message).unwrap();
+    let new_layer = second.observations().unwrap().ground_layers([15, 15]).next().unwrap();
+    let new_scatter = new_layer.statistics.moments().sample_scatter().unwrap();
+    let new_query = second.query_ground([1.55, 1.55], 0.025);
+    assert_eq!(old_evidence, second.observations().unwrap().get(layer_key));
+    assert_eq!(old_layer.members, new_layer.members);
+    assert_eq!(old_layer.plane_origin, new_layer.plane_origin);
+    assert_eq!(old_layer.normal, new_layer.normal);
+    assert!((old_layer.statistics.moments().mean()[2] - new_layer.statistics.moments().mean()[2]).abs() < 1e-12);
+    assert!(new_scatter[5] > old_scatter[5]);
+    assert_eq!(old_query.height, new_query.height);
+    assert!(new_query.max_residual_m.unwrap() > old_query.max_residual_m.unwrap());
+    assert!(first.same_geometry(&second));
+    assert!(first.observations().unwrap().same_geometry(second.observations().unwrap()));
+    assert_eq!(cache.last_build_stats().unwrap().input_points, 0);
+    assert!(!Arc::ptr_eq(first.observations().unwrap(), second.observations().unwrap()));
+    receiver.observe(second).unwrap();
+    let current = receiver.freeze().unwrap();
+    assert!(!original.same_source_view(&current));
+    assert!(planning.rebind_original(&current).is_none());
 }

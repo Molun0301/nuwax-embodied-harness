@@ -55,6 +55,8 @@ fn measured_layer_transfer_distinguishes_plane_changes_metadata_and_deletions() 
                 let (old,grid)=previous.as_ref().unwrap();
                 assert_eq!(old.geometry_revision,root.geometry_revision);
                 assert!(grid.same_geometry(&observations));
+                assert!(!Arc::ptr_eq(grid, &observations),
+                    "empty geometry delta must not discard real sample/evidence changes");
                 assert_eq!(observations.get([0,0,0]).unwrap().observed_ns,revision);
                 assert_ne!(grid.ground_layers([0,0]).next().unwrap().statistics.moments().mean(),layers[0].statistics.moments().mean());
             }
@@ -92,6 +94,8 @@ fn source_watermark_only_transfer_preserves_blocks_and_geometry() {
     let first = writer.snapshot(domain.clone(), 1, 100).unwrap();
     let admitted = reader.receive(&transfer_message(&repository, &first)).unwrap();
     let mut observations = reader.observations(&admitted, None).unwrap();
+    let first_bytes: BTreeMap<_, _> = first.blocks.iter().map(|reference|
+        (reference.object, repository.read_object(reference.object, MAX_BLOCK_BYTES).unwrap())).collect();
     let mut previous = admitted;
     for (revision, updated_source, timestamp, sequence) in [
         (2, source.clone(), 900, 1), (3, other_clock, 2, 0), (4, source.clone(), 900, 2),
@@ -100,6 +104,10 @@ fn source_watermark_only_transfer_preserves_blocks_and_geometry() {
         let root = writer.snapshot(domain.clone(), revision, 100).unwrap();
         assert_eq!(root.blocks, first.blocks, "source bookkeeping must not rewrite block objects");
         assert_eq!(root.geometry_revision, first.geometry_revision);
+        for reference in &root.blocks {
+            assert_eq!(first_bytes[&reference.object],
+                repository.read_object(reference.object, MAX_BLOCK_BYTES).unwrap());
+        }
         assert_eq!(root.source_timestamp_ns, first.source_timestamp_ns);
         assert_ne!(root.source_watermarks, previous.source_watermarks);
         let admitted = reader.receive(&transfer_message(&repository, &root)).unwrap();
@@ -109,6 +117,10 @@ fn source_watermark_only_transfer_preserves_blocks_and_geometry() {
             Some((previous.as_ref(), &observations))).unwrap();
         assert_eq!(changed, Some(vec![]));
         assert!(observations.same_geometry(&next));
+        assert!(Arc::ptr_eq(&observations, &next),
+            "F2: a true watermark-only root must reuse the complete observation owner");
+        assert!(next.is_complete_geometry_source());
+        assert_eq!(reader.receiver.current().unwrap().identity(), admitted.identity());
         assert_eq!(observations.get([0, 0, 0]), next.get([0, 0, 0]));
         let layers = reader.receiver.layers(&admitted.blocks[0]).unwrap();
         assert_eq!(layers[&0].samples[0].source, source);
@@ -117,4 +129,56 @@ fn source_watermark_only_transfer_preserves_blocks_and_geometry() {
         previous = admitted;
         observations = next;
     }
+}
+
+// F2: publication headers do not rewrite unchanged observations. This test uses
+// real Writer/Receiver publications; no replacement Arc is injected as input.
+#[test]
+fn root_header_only_reuses_complete_observations() {
+    let repository = Repository::temporary().unwrap();
+    let mut writer = Writer::new(repository.clone(), 0.05, 4 * 1024 * 1024).unwrap();
+    let mut reader = FineMapReader::new(String::new()).unwrap();
+    let domain = Domain { session: "header-only".into(), generation: 1,
+        frame_generation: 1, producer_generation: 1 };
+    writer.observe([[0, 0, 0]], 90).unwrap();
+    let first = writer.snapshot(domain.clone(), 1, 100).unwrap();
+    let first = reader.receive(&transfer_message(&repository, &first)).unwrap();
+    let observations = reader.observations(&first, None).unwrap();
+    assert!(observations.is_complete_geometry_source());
+    let second = writer.snapshot(domain, 2, 200).unwrap();
+    assert_eq!(first.blocks, second.blocks);
+    assert_eq!(first.geometry_revision, second.geometry_revision);
+    assert_eq!(first.source_watermarks, second.source_watermarks);
+    assert_ne!(first.source_timestamp_ns, second.source_timestamp_ns);
+    let second = reader.receive(&transfer_message(&repository, &second)).unwrap();
+    let (next, changes) = reader.observations_with_changes(&second,
+        Some((first.as_ref(), &observations))).unwrap();
+    assert_eq!(changes, Some(vec![]));
+    assert_eq!(reader.receiver.current().unwrap().identity(), second.identity());
+    assert_eq!(next.get([0, 0, 0]), observations.get([0, 0, 0]));
+    assert!(Arc::ptr_eq(&observations, &next),
+        "F2: a real header-only publication must retain its observation owner");
+}
+
+#[test]
+fn root_header_no_block_mutation_still_completes_an_incomplete_baseline() {
+    let repository = Repository::temporary().unwrap();
+    let mut writer = Writer::new(repository.clone(), 0.05, 4 * 1024 * 1024).unwrap();
+    let mut reader = FineMapReader::new(String::new()).unwrap();
+    let domain = Domain { session: "empty-header-completeness".into(), generation: 1,
+        frame_generation: 1, producer_generation: 1 };
+    let first = writer.snapshot(domain.clone(), 1, 100).unwrap();
+    let first = reader.receive(&transfer_message(&repository, &first)).unwrap();
+    // Intentional narrow API guard: the previous empty index has not been marked
+    // complete. The real root must still establish completeness in a new owner.
+    let incomplete = Arc::new(nuwax_nav_mls_planner::SurfaceObservations::new(0.05, 32).unwrap());
+    assert!(!incomplete.is_complete_geometry_source());
+    let second = writer.snapshot(domain, 2, 200).unwrap();
+    let second = reader.receive(&transfer_message(&repository, &second)).unwrap();
+    let (complete, changes) = reader.observations_with_changes(&second,
+        Some((first.as_ref(), &incomplete))).unwrap();
+    assert_eq!(changes, Some(vec![]));
+    assert!(complete.is_complete_geometry_source());
+    assert!(!incomplete.is_complete_geometry_source());
+    assert!(!Arc::ptr_eq(&incomplete, &complete));
 }

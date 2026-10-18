@@ -363,6 +363,16 @@ GREEN实际44个不同exact通过（54次执行含10重复）：geometry30/30、
 
 恢复验证采用更高完整inline root，不声称隔离memq跨context RPC补齐、UDP或实机通过。750ms仅本次warm测试判别窗口，不是性能保证。导航旧退避、F2纯水位观察owner更新、旧urgent/live失败均未被本阶段顺手修改。
 
+## 第二十六阶段：纯水位刷新保留观察视图和已准备的目标
+
+FineMapReader 原本在新 root 无任何块删除或替换时仍新建 observations Arc，导致查询身份变化并丢弃已准备的探索 Goal。现在仅在原块遍历没有实际修改、且旧 observations 已完整时复用原 Arc。真实 evidence 或 layer statistics 更新仍进入原替换分支；不以 changed_columns 为空推断数据相同，不放宽接纳、来源或 TTL。根版本和安装 receipt 继续原流程更新。
+
+原实现的九项 targeted RED 中四项业务失败、五项负例通过。首次候选批次 stack35/35、geometry38/39：主水位复用通过，但 evidence 负例第二次冷计算预期 ACTIVE 时为 ACCEPTED，后续缓存断言未执行。该原失败保留。一次独立测试诊断通过，实际第二轮在 receipt 年龄1.885528s接纳、1.885604s复验，第一轮则因真实 source-view 变化丢弃；这不能唯一解释历史失败，亦不作性能比较。
+
+最终将该夹具拆成两个明确阶段：先确认真实 evidence 变更使旧计算 Discard；第二次真实冷计算准备 Goal 后，由第二个有界 gate 暂停，经真实 Writer/codec/cache/begin/finish 发布仅水位变化的 root3，核验完整 refs/object bytes/evidence 与 root2 相同，再放行。仍使用原2秒有效期和全部原断言，最终 GoalIntent 保留 root2身份而不是改写成root3。第二阶段明确依赖本修复，不冒称旧实现独立负例。两个 gate、Stop、compute/native owner 均在失败路径清理。
+
+最终修改夹具后的17个 exact 全通过（F2三项及14个原 gate 控制），默认七包 tests check通过；原35个stack和其余geometry成功结果按原批次保留，不将不同版本执行相加冒充一次全绿。实际冷 Tomogram/frontier 各1次、3000单元；水位主例复用原 query/Tomogram/frontier，真实scatter变化控制仍通过。临时诊断接缝精确撤回，ComputeService和ExploreRuntime与提交前逐字节一致；生产变更仅reader的9增1删。沿用唯一target、原release/LTO、既有GTSAM缓存，无实机或跨进程运动结论。
+
 ## 后续持续检查
 
 1. 墙前晚到路径的实际恢复与初始 full/partial/PCT 顺序，保留及时移动和真实避障

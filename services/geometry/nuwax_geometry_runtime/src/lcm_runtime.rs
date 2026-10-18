@@ -13588,6 +13588,16 @@ pub(crate) mod mapping_feed_tests {
 
     include!("explore_surface_incomplete_fixture_tests.rs");
 
+
+    // F2 shares F1's existing cfg(test) mapping_feed_tests module visibility.
+    // Keep this helper inside that test module; do not expose production APIs.
+    pub(crate) fn prepare_fine_transfer_for_watermark_tests(
+        fine: &nuwax_map_chunks::SealedMap,
+        published: Option<&nuwax_map_chunks::Manifest>,
+    ) -> Result<nuwax_map_chunks::Transfer, String> {
+        navigation_map_transfer::prepare(fine, published)
+    }
+
     // Isolated canonical-applier fixtures still cross the real V3 candidate seal.
     // Actual handoff fixtures supply the admitted scan and producer receipt proofs.
     fn sealed_canonical_transaction_for_test(

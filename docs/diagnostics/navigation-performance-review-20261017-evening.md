@@ -505,6 +505,42 @@ release 最小 `surface-recovery-qualification` lane 的6项定向测试全部�
 这确认了普通publication continuation与原Cancel输入选择的串行依赖；人为持门长度不是自然时延或优化收益，cancel API区间也没有拆成scheduler内部执行。输入不包含native入站/UDP，不测物理停稳。历史fullsuite urgent 50.767828ms超过20ms仍未归因，本阶段不称性能修复，不解除该资格问题。生产解耦尚未实施。
 
 
+## 第三十八阶段：普通发布尾部给 exact Cancel 一次独立推进机会
+
+已实现并完成 26/26 定向验证：在 Status、Pose、最终 Costmap 三个普通 observation 尾部，原 publication P 尚未返回时，同一原 loop owner 可以从原 Cancel stream 读取一帧，完成原 exact 身份/generation 校验，并推进真实 scheduler.cancel C。保留 P 的原 future、Result、batch 与先后顺序；没有新增 owner、线程、队列、缓存、锁、重试或公共 API。它解除的是这三个白名单尾部对 Cancel 读取的串行依赖，不是所有 await 的通用并发化。
+
+### 生产范围与合同
+
+- 资格严格为 active Goal 存在、旧 snapshot.last_terminal 为 None、旧 snapshot.session_id 匹配 active。session 比较依赖原单 owner 的安装合同：先 await preempt/fence 清旧 active，再 await start_session 真正返回，成功后连续安装 telemetry/active；同 session 新 generation 也不能与尾部并行安装。实际 Cancel 沿用 session/owner/parent/goal_generation/producer_generation 五项关联、正 cancel generation 和原水位规则。
+- P 优先 Ready 就直接返回，不额外预取。P 等待中最多消费一个头帧；foreign/stale/格式错误也不会被绕过而读取第二帧。正常无 Cancel 路径只借用 active Goal，不复制带 boundary 的完整 GoalEnvelope；真正接受 Cancel 后才沿原结算需要复制一次。
+- 接受 C 后，P/C 两边均被同一 owner 保留并收取，任何一边先完成都不丢另一边。P 成功后，先完成原旧 snapshot 的尾部 clear，再共享原 active Cancel 成功/拒绝/致命错误结算。符合资格的旧 snapshot 使该 clear 为 no-op，不能用 C 后的新 terminal snapshot 提前抹掉取消身份。
+- 原 `frames()` 去重水位与单次 batch 不回滚、不重建。旧 P 完成后才生成原 stop bool/terminal publication；P 失败时不跨过它发虚假的外部取消确认。P Err+C Result 通过一次非限流 tracing 记录保留主附结果及 exact 身份，再原样返回 P Err；已消费拒绝/输入错同样保留一次真实附带原因，不伪造 C Result。原外层 task 先失败时的根因优先级仍保持。
+- 初始化、Goal、Cancel 自身输出、pending/buffered/replay、invalid-map 中段与 recent 准备均未接入该机会。排队 Goal 在旧 P/C 与原取消结算结束后才回到原轮转，不能抢先 acquire 新目标。原 TTL、tick、lease、20ms urgent 门槛未改。
+
+### 实际验证与证据口径
+
+实际使用原 release target，最小 CLI feature `surface-recovery-qualification`；其传递启用 mls/guard-runtime/lcm-runtime 和 runtime qualification。每个 exact selector 独立进程、`--test-threads=1`，先列表确认各一项再执行。9 项 ignored 新/迁移控制、17 项原回归全部 PASS，无 watchdog；check 10.08s、release no-run 3m02s，默认 7 crate release check PASS 7.90s。构建时长是工程记录，不是导航延迟。应用后的两源与最终仓外候选逐字一致，没有编译或 fixture 修正。
+
+1. **三尾实际推进**：复用真实 `run_guarded_nav_loop`、原 RawFrame 输入、原 scheduler/CommandingPlanner/RecordingMotion fixture 和同 context liblcm `memq://` 输出。Pose、Status、最终 Costmap 的 after-ACK gate 均观察到 Cancel dequeue/decode/API成功发生在原 P 返回仍被扣住期间。检查点取消围栏计数由 0→1，旧 P release 后才收到 exact ZEROED。无 gate 对照同路径正常通过。
+2. **旧观测晚发顺序**：独立 pre-delegate gate 在原 frames 已生成、真实 publish_batch 尚未调用处暂停。先安装一次门闩，再同步将原 fixture planner 改成独有 0.37/0.13 Twist，捕获首个含该值的实际 batch，避免先前同值帧冒充。日志顺序为真实 C API_OK → 正常 release → 旧非零 Twist 收到 → 旧 state 收到 → exact ZEROED。测试还在真实 command stream 断言旧非零先于新 ZERO，state stream 断言旧身份先于 correlated ZEROED；不把 state 墙钟当唯一序号。最终仍走唯一原 same-context publish_batch，没有 native 故障注入。
+3. **完整收尾**：以上加排队 Goal 共六次真实 loop 场景，trace 事件数分别 13/9/15/13/13/13，全部 incomplete=false，drops/open=0；正常 bridge shutdown/join、scheduler shutdown/join，无 abort fallback。每例所记录的取消前后围栏计数均 0→1；这不是包含随后 shutdown 的整个 fixture 生命周期计数。
+4. **双结果矩阵**：同一生产协调 helper、受控 P future、真实 scheduler C，共 P Ok/Err × C Ok/真实 Busy × 两种确定完成顺序 8 case。实际捕获一次真实 tracing event、验证 P 原错误类型和值及 C 结果/exact 身份，且原 coordinator shutdown 一次、join 完成。P 错误是协调控制，不包装为 native publish 失败。
+5. **资格与输入错误**：五项 foreign、stale、非正 generation、malformed body、真实源 EOF，各配 P Ok/Err 共 18 case；只读头部一次、无 C 调用、后续合法帧保留、水位不污染、主附错误保留。P Ready/eligible=None 两 case 无预取；真实 wrapper 的 terminal/session mismatch 两个合成 snapshot 控制让 P 确定 Pending，实际求值排除资格并保持原 clear 行为。这些 snapshot 不伪称运行时自然终态。
+6. **既有回归**：原四项 exact 身份/重放、五项 coordinator 生命周期/根因顺序、另八项安全错误、源关闭、terminal、map与buffered Cancel 回归全部通过。它们保持各自层级，原受控 coordinator 测试仍不是 native publication 错误证明。
+
+阶段37旧主例 `guarded_cancel_ingress_waits_for_observation_ack_return` 明确更名为 `guarded_cancel_ingress_completes_while_observation_ack_return_held`，旧“等 ACK 后才读取”断言随合同迁移退出；旧 selector 当前 list=0 是显式迁移记录，不计通过。阶段37原源码、完整原始日志与 6fa5696b 提交保留，原无 gate selector 保留正常控制口径。
+
+### 未覆盖及不能扩大的结论
+
+- 这是人为 gate 建立的因果偏序，未测自然 P95/P99、吞吐收益或硬件制动时长。旧 fullsuite urgent 50.767828ms > 20ms 仍未归因，本次未用它重跑或放宽原门槛。
+- P 永不返回时只可能提前完成运动 fence；外部 ZEROED 与 loop 完成仍无保证。内部 P/C 收齐以原 execution loop 仍活着为前提。surface 原 execution/diagnostic 外层 select 仍可能 drop 整个 execution loop，原普通 Cancel 同样有此边界；本批没有生命周期重构或伪造外部 ZEROED。
+- 六次真实 loop 沿原 LcmContext Drop 同步 join native owner；既有 Drop 不暴露 join 错误，仍无独立 native exit status、unsubscribe ACK 或显式 shutdown ACK 证明。
+- 旧 Twist 在源码上来自已校验 APPLIED 的状态，正式运动链是私有 UDS guard；其晚发是过去运动的延迟观测，同 publisher 必须先旧 batch 再新终态。未访问实机配置；任何正式/自配硬件若实际订阅该 Twist 作 actuator 输入，必须另审，不能仅凭“观测”命名宣称安全。
+- 新 C Err 矩阵用真实 Idle/Busy，不等于自然 Succeeded 与所有硬件 fence 故障都被重新制造；原错误分类与相关旧回归保持。其它长 await、recent CPU 准备、native 永久不回、外部 surface drop 分支并未获得本次提前读取保证。
+
+源码范围仅 `services/nuwax-workspace/crates/nuwax-nav-stack/src/lcm_dataflow.rs`（+320/-165，包含原 Cancel 逻辑抽取与 tests-only hook）及相邻 `guarded_ingress_ack_tests.rs`（353→1128 行，+842/-67）。最终静审仅补了新 matrix_scheduler 自 spawn 后 setup 失败的真实 shutdown/join、必要 abort/rejoin 与原 panic 恢复；成功前提、断言和阈值未动。未新增 Cargo feature/依赖/lock 改动，未计算 hash。
+
+
 ## 后续持续检查
 
 1. 墙前晚到路径的实际恢复与初始 full/partial/PCT 顺序，保留及时移动和真实避障

@@ -1654,20 +1654,11 @@ where
                     NavStackError::Internal("guard scheduler status stream closed".into())
                 })?;
                 let snapshot = status.borrow().clone();
-                publish_guarded_nav_observation(
-                    transport,
-                    node,
-                    snapshot.clone(),
-                    &telemetry,
-                    None,
-                    &mut publications,
-                )
-                .await?;
-                clear_terminal_session_after_publication(
-                    &mut active_session,
-                    &mut telemetry,
-                    &snapshot,
-                );
+                publish_guarded_tail_observation(
+                    transport, node, scheduler, snapshot, &mut telemetry, None, &mut publications,
+                    &mut cancels, &mut active_session, &mut goal_buffer, &mut last_cancel_terminal,
+                    &mut cancel_generation_watermark, &mut arbiter,
+                ).await?;
             }
             GuardedNavEvent::Pose(message) => {
                 #[cfg(all(test,feature="surface-recovery-qualification"))]
@@ -1742,20 +1733,12 @@ where
                     .await?;
                 }
                 let snapshot = scheduler.status();
-                publish_guarded_nav_observation(
-                    transport,
-                    node,
-                    snapshot.clone(),
-                    &telemetry,
-                    Some(snapshot.planner_inputs_fresh),
-                    &mut publications,
-                )
-                .await?;
-                clear_terminal_session_after_publication(
-                    &mut active_session,
-                    &mut telemetry,
-                    &snapshot,
-                );
+                let planner_inputs_fresh = snapshot.planner_inputs_fresh;
+                publish_guarded_tail_observation(
+                    transport, node, scheduler, snapshot, &mut telemetry, Some(planner_inputs_fresh),
+                    &mut publications, &mut cancels, &mut active_session, &mut goal_buffer,
+                    &mut last_cancel_terminal, &mut cancel_generation_watermark, &mut arbiter,
+                ).await?;
             }
             GuardedNavEvent::Costmap(message) => {
                 let frame = message
@@ -1939,20 +1922,12 @@ where
                     .await?;
                 }
                 let snapshot = scheduler.status();
-                publish_guarded_nav_observation(
-                    transport,
-                    node,
-                    snapshot.clone(),
-                    &telemetry,
-                    Some(snapshot.planner_inputs_fresh),
-                    &mut publications,
-                )
-                .await?;
-                clear_terminal_session_after_publication(
-                    &mut active_session,
-                    &mut telemetry,
-                    &snapshot,
-                );
+                let planner_inputs_fresh = snapshot.planner_inputs_fresh;
+                publish_guarded_tail_observation(
+                    transport, node, scheduler, snapshot, &mut telemetry, Some(planner_inputs_fresh),
+                    &mut publications, &mut cancels, &mut active_session, &mut goal_buffer,
+                    &mut last_cancel_terminal, &mut cancel_generation_watermark, &mut arbiter,
+                ).await?;
             }
             GuardedNavEvent::Goal(message) => {
                 let frame = required_frame(message, "guarded_nav_scheduler.goal")?;
@@ -2214,133 +2189,33 @@ where
                 }
             }
             GuardedNavEvent::Cancel(message) => {
-                let frame = required_frame(message, "guarded_nav_scheduler.cancel")?;
-                let cancel = match schema::decode_cancel_navigation_body(&frame.payload) {
-                    Ok(cancel) => cancel,
-                    Err(error) => {
+                let (cancel, cancel_generation) = match decode_guarded_cancel(message)? {
+                    OwnerInput::Accepted(value) => value,
+                    OwnerInput::Rejected(reason) => {
                         publish_guarded_rejection(
-                            transport,
-                            &node.outputs[1],
-                            scheduler.status(),
-                            &telemetry,
-                            "cancel",
-                            &format!("CancelNavigation rejected: {error}"),
-                        )
-                        .await?;
+                            transport, &node.outputs[1], scheduler.status(), &telemetry,
+                            "cancel", &reason,
+                        ).await?;
                         continue;
                     }
                 };
-                #[cfg(all(test, feature = "surface-recovery-qualification"))]
-                guarded_tests::record_ack_return_cancel("bridge_ack_test.cancel_decoded", &cancel);
-                let Some(cancel_generation) = u64::try_from(cancel.cancel_generation)
-                    .ok()
-                    .filter(|generation| *generation > 0)
-                else {
-                    publish_guarded_rejection(
-                        transport,
-                        &node.outputs[1],
-                        scheduler.status(),
-                        &telemetry,
-                        "cancel",
-                        "CancelNavigation.cancel_generation must be positive",
-                    )
-                    .await?;
-                    continue;
-                };
-                let mut candidate_telemetry = telemetry.clone();
-                candidate_telemetry.cancel_generation = cancel_generation;
-                candidate_telemetry.public_session_id = cancel.session_id.clone();
-                candidate_telemetry.owner_kind = cancel.owner_kind;
-                candidate_telemetry.parent_request_id = cancel.parent_request_id.clone();
-                candidate_telemetry.goal_generation = cancel.goal_generation;
-                candidate_telemetry.path_revision = 0;
-                candidate_telemetry.planner_runtime_generation = 0;
                 if let Some(active_goal) = active_session.clone() {
-                    if let Err(reason) = validate_cancel_goal_correlation(&cancel, &active_goal) {
-                        publish_guarded_rejection(
-                            transport,
-                            &node.outputs[1],
-                            scheduler.status(),
-                            &telemetry,
-                            "cancel",
-                            &reason,
-                        )
-                        .await?;
-                        continue;
-                    }
-                    if let Err(reason) = observe_guarded_cancel_generation(
-                        &mut cancel_generation_watermark,
-                        &active_goal,
-                        cancel_generation,
+                    if let Err(reason) = admit_guarded_active_cancel(
+                        &cancel, cancel_generation, &active_goal, &mut cancel_generation_watermark,
                     ) {
                         publish_guarded_rejection(
-                            transport,
-                            &node.outputs[1],
-                            scheduler.status(),
-                            &telemetry,
-                            "cancel",
-                            &reason,
-                        )
-                        .await?;
+                            transport, &node.outputs[1], scheduler.status(), &telemetry,
+                            "cancel", &reason,
+                        ).await?;
                         continue;
                     }
-                    let session_id = active_goal.session_id.clone();
-                    #[cfg(all(test, feature = "surface-recovery-qualification"))]
-                    guarded_tests::record_ack_return_cancel("bridge_ack_test.cancel_api_begin", &cancel);
-                    if let Err(error) = scheduler.cancel(&session_id).await {
-                        match runtime_input_error::<()>("guarded_nav_scheduler.cancel", error)? {
-                            OwnerInput::Rejected(reason) => {
-                                publish_guarded_rejection(
-                                    transport,
-                                    &node.outputs[1],
-                                    scheduler.status(),
-                                    &telemetry,
-                                    "cancel",
-                                    &reason,
-                                )
-                                .await?;
-                                let snapshot = scheduler.status();
-                                clear_terminal_session_after_publication(
-                                    &mut active_session,
-                                    &mut telemetry,
-                                    &snapshot,
-                                );
-                                continue;
-                            }
-                            OwnerInput::Accepted(()) => {
-                                unreachable!("error classifier accepted an error")
-                            }
-                        }
-                    }
-                    #[cfg(all(test, feature = "surface-recovery-qualification"))]
-                    guarded_tests::record_ack_return_cancel("bridge_ack_test.cancel_api_ok", &cancel);
-                    telemetry = candidate_telemetry;
-                    publish_bool(transport, &node.outputs[3], true).await?;
-                    let snapshot = scheduler.status();
-                    publish_guarded_nav_observation(
-                        transport,
-                        node,
-                        snapshot.clone(),
-                        &telemetry,
-                        None,
-                        &mut publications,
-                    )
-                    .await?;
-                    goal_buffer.clear_pending_goal_for(&active_goal);
-                    last_cancel_terminal =
-                        goal_buffer
-                            .is_newest_goal(&active_goal)
-                            .then(|| GuardedCancelTerminal {
-                                goal: active_goal,
-                                cancel_generation,
-                                status: snapshot.clone(),
-                                telemetry: telemetry.clone(),
-                            });
-                    clear_terminal_session_after_publication(
-                        &mut active_session,
-                        &mut telemetry,
-                        &snapshot,
-                    );
+                    let result = execute_guarded_active_cancel(scheduler, &cancel).await;
+                    finish_guarded_active_cancel(
+                        transport, node, scheduler,
+                        GuardedActiveCancelCompletion { active_goal, cancel, cancel_generation, result },
+                        &mut telemetry, &mut active_session, &mut goal_buffer,
+                        &mut last_cancel_terminal, &mut publications,
+                    ).await?;
                 } else {
                     let buffered_goal = match goal_buffer.cancelled_pending_goal(&cancel) {
                         Ok(goal) => goal,
@@ -3044,6 +2919,268 @@ impl GuardedStatusPublications {
 }
 
 #[cfg(feature = "guard-runtime")]
+fn decode_guarded_cancel(
+    message: Option<TransportResult<RawLcmFrame>>,
+) -> OwnerInputResult<(schema::CancelNavigation, u64)> {
+    let frame = required_frame(message, "guarded_nav_scheduler.cancel")?;
+    let cancel = match schema::decode_cancel_navigation_body(&frame.payload) {
+        Ok(cancel) => cancel,
+        Err(error) => return Ok(OwnerInput::Rejected(format!("CancelNavigation rejected: {error}"))),
+    };
+    #[cfg(all(test, feature = "surface-recovery-qualification"))]
+    guarded_tests::record_ack_return_cancel("bridge_ack_test.cancel_decoded", &cancel);
+    let Some(generation) = u64::try_from(cancel.cancel_generation).ok().filter(|value| *value > 0) else {
+        return Ok(OwnerInput::Rejected("CancelNavigation.cancel_generation must be positive".into()));
+    };
+    Ok(OwnerInput::Accepted((cancel, generation)))
+}
+
+#[cfg(feature = "guard-runtime")]
+fn admit_guarded_active_cancel(
+    cancel: &schema::CancelNavigation,
+    generation: u64,
+    active_goal: &schema::GoalEnvelope,
+    watermark: &mut Option<GuardedCancelGenerationWatermark>,
+) -> Result<(), String> {
+    validate_cancel_goal_correlation(cancel, active_goal)?;
+    observe_guarded_cancel_generation(watermark, active_goal, generation)
+}
+
+#[cfg(feature = "guard-runtime")]
+async fn execute_guarded_active_cancel(
+    scheduler: &nuwax_nav_runtime::NavSchedulerHandle,
+    cancel: &schema::CancelNavigation,
+) -> Result<(), nuwax_nav_runtime::RuntimeError> {
+    #[cfg(all(test, feature = "surface-recovery-qualification"))]
+    guarded_tests::record_ack_return_cancel("bridge_ack_test.cancel_api_begin", cancel);
+    let result = scheduler.cancel(&cancel.session_id).await;
+    #[cfg(all(test, feature = "surface-recovery-qualification"))]
+    guarded_tests::record_ack_return_cancel("bridge_ack_test.cancel_api_done", cancel);
+    #[cfg(all(test, feature = "surface-recovery-qualification"))]
+    if result.is_ok() {
+        guarded_tests::record_ack_return_cancel("bridge_ack_test.cancel_api_ok", cancel);
+    }
+    result
+}
+
+#[cfg(feature = "guard-runtime")]
+struct GuardedActiveCancelCompletion {
+    active_goal: schema::GoalEnvelope,
+    cancel: schema::CancelNavigation,
+    cancel_generation: u64,
+    result: Result<(), nuwax_nav_runtime::RuntimeError>,
+}
+
+// This is one publication tail, not a second ingress owner. An eligible active
+// goal is borrowed until a Cancel is actually read; the no-Cancel path clones none.
+#[cfg(feature = "guard-runtime")]
+async fn await_guarded_tail_publication<P>(
+    publication: P,
+    scheduler: &nuwax_nav_runtime::NavSchedulerHandle,
+    cancels: &mut LcmFrameStream,
+    active_goal: Option<&schema::GoalEnvelope>,
+    watermark: &mut Option<GuardedCancelGenerationWatermark>,
+    arbiter: &mut GuardedNavArbiter,
+) -> NavStackResult<Option<OwnerInput<GuardedActiveCancelCompletion>>>
+where
+    P: Future<Output = NavStackResult<()>>,
+{
+    tokio::pin!(publication);
+    let (publication_result, pending) = if let Some(active_goal) = active_goal {
+        tokio::select! {
+            biased;
+            result = &mut publication => (result, None),
+            message = cancels.next() => {
+                arbiter.record_dispatch(GuardedNavSource::Cancel);
+                match decode_guarded_cancel(message) {
+                    Err(error) => (publication.await, Some(Err(error))),
+                    Ok(OwnerInput::Rejected(reason)) => (
+                        publication.await, Some(Ok(OwnerInput::Rejected(reason))),
+                    ),
+                    Ok(OwnerInput::Accepted((cancel, cancel_generation))) => {
+                        if let Err(reason) = admit_guarded_active_cancel(
+                            &cancel, cancel_generation, active_goal, watermark,
+                        ) {
+                            (publication.await, Some(Ok(OwnerInput::Rejected(reason))))
+                        } else {
+                            // Preserve both futures and both Results, whichever completes first.
+                            // No shutdown branch may discard an already admitted cancellation.
+                            let (published, result) = tokio::join!(
+                                &mut publication,
+                                execute_guarded_active_cancel(scheduler, &cancel),
+                            );
+                            (published, Some(Ok(OwnerInput::Accepted(GuardedActiveCancelCompletion {
+                                active_goal: active_goal.clone(), cancel, cancel_generation, result,
+                            }))))
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        (publication.await, None)
+    };
+    if let Err(error) = publication_result {
+        match &pending {
+            Some(Ok(OwnerInput::Accepted(completion))) => {
+                // One failure event, never the rate-limited rejection diagnostic.
+                // The unchanged outer coordinator still owns shutdown/task error precedence.
+                tracing::warn!(
+                    publication_error = %error, cancel_result = ?completion.result,
+                    session_id = %completion.cancel.session_id,
+                    owner_kind = completion.cancel.owner_kind,
+                    parent_request_id = %completion.cancel.parent_request_id,
+                    goal_generation = completion.cancel.goal_generation,
+                    producer_runtime_generation = completion.cancel.producer_runtime_generation,
+                    cancel_generation = completion.cancel_generation,
+                    "ordinary publication failed after early active cancellation",
+                );
+            }
+            Some(Ok(OwnerInput::Rejected(reason))) => {
+                tracing::warn!(
+                    publication_error = %error, cancel_rejection = %reason,
+                    "ordinary publication failed after consuming rejected cancellation input",
+                );
+            }
+            Some(Err(input_error)) => {
+                tracing::warn!(
+                    publication_error = %error, cancel_input_error = %input_error,
+                    "ordinary publication failed after consuming failed cancellation input",
+                );
+            }
+            None => {}
+        }
+        return Err(error);
+    }
+    pending.transpose()
+}
+
+#[cfg(feature = "guard-runtime")]
+#[allow(clippy::too_many_arguments)]
+async fn publish_guarded_tail_observation(
+    transport: &LcmTransport,
+    node: &ModuleNode,
+    scheduler: &nuwax_nav_runtime::NavSchedulerHandle,
+    snapshot: nuwax_nav_runtime::SchedulerStatus,
+    telemetry: &mut GuardedNavTelemetry,
+    planner_observation: Option<bool>,
+    publications: &mut GuardedStatusPublications,
+    cancels: &mut LcmFrameStream,
+    active_session: &mut Option<schema::GoalEnvelope>,
+    goal_buffer: &mut PlannerGoalBuffer,
+    last_cancel_terminal: &mut Option<GuardedCancelTerminal>,
+    watermark: &mut Option<GuardedCancelGenerationWatermark>,
+    arbiter: &mut GuardedNavArbiter,
+) -> NavStackResult<()> {
+    let pending = {
+        let eligible = active_session.as_ref().filter(|goal| {
+            snapshot.last_terminal.is_none()
+                && snapshot.session_id.as_deref() == Some(goal.session_id.as_str())
+        });
+        let publication = publish_guarded_nav_observation(
+            transport, node, snapshot.clone(), telemetry, planner_observation, publications,
+        );
+        await_guarded_tail_publication(
+            publication, scheduler, cancels, eligible, watermark, arbiter,
+        ).await?
+    };
+    // Keep the original snapshot. An early C may have made the scheduler terminal,
+    // but clearing with that newer status here would erase the Cancel's identity.
+    clear_terminal_session_after_publication(active_session, telemetry, &snapshot);
+    match pending {
+        None => Ok(()),
+        Some(OwnerInput::Rejected(reason)) => {
+            publish_guarded_rejection(
+                transport, &node.outputs[1], scheduler.status(), telemetry, "cancel", &reason,
+            ).await
+        }
+        Some(OwnerInput::Accepted(completion)) => {
+            finish_guarded_active_cancel(
+                transport, node, scheduler, completion, telemetry, active_session,
+                goal_buffer, last_cancel_terminal, publications,
+            ).await
+        }
+    }
+}
+
+#[cfg(feature = "guard-runtime")]
+#[allow(clippy::too_many_arguments)]
+async fn finish_guarded_active_cancel(
+    transport: &LcmTransport,
+    node: &ModuleNode,
+    scheduler: &nuwax_nav_runtime::NavSchedulerHandle,
+    completion: GuardedActiveCancelCompletion,
+    telemetry: &mut GuardedNavTelemetry,
+    active_session: &mut Option<schema::GoalEnvelope>,
+    goal_buffer: &mut PlannerGoalBuffer,
+    last_cancel_terminal: &mut Option<GuardedCancelTerminal>,
+    publications: &mut GuardedStatusPublications,
+) -> NavStackResult<()> {
+    let GuardedActiveCancelCompletion { active_goal, cancel, cancel_generation, result } = completion;
+    let mut candidate_telemetry = telemetry.clone();
+    candidate_telemetry.cancel_generation = cancel_generation;
+    candidate_telemetry.public_session_id = cancel.session_id.clone();
+    candidate_telemetry.owner_kind = cancel.owner_kind;
+    candidate_telemetry.parent_request_id = cancel.parent_request_id.clone();
+    candidate_telemetry.goal_generation = cancel.goal_generation;
+    candidate_telemetry.path_revision = 0;
+    candidate_telemetry.planner_runtime_generation = 0;
+    if let Err(error) = result {
+        match runtime_input_error::<()>("guarded_nav_scheduler.cancel", error)? {
+            OwnerInput::Rejected(reason) => {
+                publish_guarded_rejection(
+                    transport,
+                    &node.outputs[1],
+                    scheduler.status(),
+                    telemetry,
+                    "cancel",
+                    &reason,
+                )
+                .await?;
+                let snapshot = scheduler.status();
+                clear_terminal_session_after_publication(
+                    active_session,
+                    telemetry,
+                    &snapshot,
+                );
+                return Ok(());
+            }
+            OwnerInput::Accepted(()) => {
+                unreachable!("error classifier accepted an error")
+            }
+        }
+    }
+    *telemetry = candidate_telemetry;
+    publish_bool(transport, &node.outputs[3], true).await?;
+    let snapshot = scheduler.status();
+    publish_guarded_nav_observation(
+        transport,
+        node,
+        snapshot.clone(),
+        telemetry,
+        None,
+        publications,
+    )
+    .await?;
+    goal_buffer.clear_pending_goal_for(&active_goal);
+    *last_cancel_terminal =
+        goal_buffer
+            .is_newest_goal(&active_goal)
+            .then(|| GuardedCancelTerminal {
+                goal: active_goal,
+                cancel_generation,
+                status: snapshot.clone(),
+                telemetry: telemetry.clone(),
+            });
+    clear_terminal_session_after_publication(
+        active_session,
+        telemetry,
+        &snapshot,
+    );
+    Ok(())
+}
+
+#[cfg(feature = "guard-runtime")]
 async fn publish_guarded_nav_observation(
     transport: &LcmTransport,
     node: &ModuleNode,
@@ -3065,6 +3202,10 @@ async fn publish_guarded_nav_observation(
     let receipts=frames.iter().map(|frame|frame.payload.to_vec()).collect::<Vec<_>>();
     #[cfg(all(test,feature="surface-recovery-qualification"))]
     drop(fixture_copy);
+    #[cfg(all(test, feature = "surface-recovery-qualification"))]
+    guarded_tests::hold_test_publication_before_delegate(
+        &status, telemetry, planner_observation, &frames,
+    ).await;
     #[cfg(all(test,feature="surface-recovery-qualification"))]
     let publish=publications.qualification_timing.as_ref().map(|t|t.span("bridge.observation.publish_ack",status.costmap_source_timestamp_ns));
     transport
@@ -3074,7 +3215,7 @@ async fn publish_guarded_nav_observation(
     #[cfg(all(test,feature="surface-recovery-qualification"))]
     drop(publish);
     #[cfg(all(test, feature = "surface-recovery-qualification"))]
-    guarded_tests::hold_test_publication_ack(&status, telemetry).await;
+    guarded_tests::hold_test_publication_ack(&status, telemetry, planner_observation).await;
     #[cfg(test)]
     guarded_tests::record_test_publication(&receipts);
     Ok(())
@@ -7509,9 +7650,23 @@ mod guarded_tests {
 
     #[cfg(feature = "surface-recovery-qualification")]
     pub(super) async fn hold_test_publication_ack(
-        status: &nuwax_nav_runtime::SchedulerStatus, telemetry: &GuardedNavTelemetry,
+        status: &nuwax_nav_runtime::SchedulerStatus,
+        telemetry: &GuardedNavTelemetry,
+        planner_observation: Option<bool>,
     ) {
-        ingress_ack_tests::hold_publication_ack(status, telemetry).await;
+        ingress_ack_tests::hold_publication_ack(status, telemetry, planner_observation).await;
+    }
+
+    #[cfg(feature = "surface-recovery-qualification")]
+    pub(super) async fn hold_test_publication_before_delegate(
+        status: &nuwax_nav_runtime::SchedulerStatus,
+        telemetry: &GuardedNavTelemetry,
+        planner_observation: Option<bool>,
+        frames: &[RawLcmFrame],
+    ) {
+        ingress_ack_tests::hold_publication_before_delegate(
+            status, telemetry, planner_observation, frames,
+        ).await;
     }
 
     #[cfg(feature = "surface-recovery-qualification")]
@@ -9066,7 +9221,7 @@ mod guarded_tests {
             }
             if let Some(dequeued) = dequeued {
                 #[cfg(feature = "surface-recovery-qualification")]
-                ingress_ack_tests::record_observed_dequeue();
+                ingress_ack_tests::record_observed_dequeue(&frame);
                 let _ = dequeued.send(());
             }
             frame

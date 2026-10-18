@@ -12,7 +12,7 @@ pub(crate) use nuwax_nav_runtime::surface_changes::SurfaceGeometryChanges;
 /// Only missing immutable-object transport/deadline failures are retryable;
 /// malformed roots, objects, replies and geometry remain authoritative failures.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum SurfaceMapBuildError {
+pub enum SurfaceMapBuildError {
     #[error("{0}")]
     IncompleteFineSource(String),
     #[error("{0}")]
@@ -87,6 +87,22 @@ struct DerivedSurface {
     mask_layout: Option<MaskLayout>,
     physical: Arc<SurfaceSnapshot>,
     snapshot: Arc<SurfaceSnapshot>,
+}
+
+impl DerivedSurface {
+    // Both paths borrow the original mask and retained obstacle storage. No
+    // second mask vector or full publication is retained to prove equality.
+    fn matches_mask_contents(
+        &self,
+        mask: &schema::OccupancyGrid,
+        mut observed_cell: impl FnMut(),
+    ) -> bool {
+        self.snapshot.matches_virtual_obstacles(
+            [mask.info.origin.position[0], mask.info.origin.position[1]],
+            f64::from(mask.info.resolution), mask.info.width as u32, mask.info.height as u32,
+            mask.data.iter().map(|value| { observed_cell(); *value == 100 }),
+        )
+    }
 }
 
 /// 仅缓存几何计算；调用者仍须核对消息来源、修订、接收时刻与更新票据。
@@ -180,7 +196,44 @@ impl SurfaceMapCache {
         &mut self,
         message: &schema::NavigationMap3D,
     ) -> Result<Arc<SurfaceSnapshot>, String> {
-        self.build_with_changes(message).map(|update| update.snapshot).map_err(|error| error.to_string())
+        self.build_typed(message).map_err(|error| error.to_string())
+    }
+
+    /// Preserve the existing incomplete-versus-invalid classification for owners
+    /// that can keep an already installed complete source while fetching.
+    pub fn build_typed(
+        &mut self,
+        message: &schema::NavigationMap3D,
+    ) -> Result<Arc<SurfaceSnapshot>, SurfaceMapBuildError> {
+        self.build_with_changes(message).map(|update| update.snapshot)
+    }
+
+    /// Call only for IncompleteFineSource from build_typed(message). The message
+    /// has passed the original schema admission; no partial root was committed.
+    /// This proves only cache/source correspondence and mask geometry. The
+    /// caller must still prove this Arc is its actually installed source and
+    /// apply its original ticket/domain/clear fences without renewing clocks.
+    pub fn retained_source_for_incomplete(
+        &self,
+        message: &schema::NavigationMap3D,
+    ) -> Option<Arc<SurfaceSnapshot>> {
+        if message.cleared || message.fine.is_none() { return None; }
+        let previous = self.latest.as_ref()?;
+        let (revision, physical) = self.physical.as_ref()?;
+        if !Arc::ptr_eq(&previous.physical, physical) { return None; }
+        let GeometryRevision::Fine { domain, .. } = revision else { return None; };
+        if *domain != schema::navigation_map_3d_domain(message) { return None; }
+        let same_mask = match (&previous.mask_revision, &message.virtual_obstacles) {
+            (None, None) => true,
+            (Some(old), Some(mask)) => old.domain == *domain
+                && old.commit_boot_nonce == message.commit_boot_nonce
+                // Incomplete retention uses actual borrowed contents, including
+                // same-receipt input; no new trust in an identity-only shortcut.
+                && previous.mask_layout.as_ref() == Some(&MaskLayout::new(mask))
+                && previous.matches_mask_contents(mask, || {}),
+            _ => false,
+        };
+        same_mask.then(|| Arc::clone(&previous.snapshot))
     }
 
     pub(crate) fn build_with_changes(
@@ -300,14 +353,9 @@ impl SurfaceMapCache {
                 || previous.mask_layout != mask_layout
             { return false; }
             // 比较借用完整输入与已有积分图，不保留或复制另一份遮罩。
-            previous.snapshot.matches_virtual_obstacles(
-                [mask.info.origin.position[0], mask.info.origin.position[1]],
-                f64::from(mask.info.resolution), mask.info.width as u32, mask.info.height as u32,
-                mask.data.iter().map(|value| {
-                    #[cfg(test)] { compared_cells += 1; }
-                    *value == 100
-                }),
-            )
+            previous.matches_mask_contents(mask, || {
+                #[cfg(test)] { compared_cells += 1; }
+            })
         });
         #[cfg(test)] { self.mask_work.compared_cells += compared_cells; }
         let reusable = same_mask && self.latest.as_ref()

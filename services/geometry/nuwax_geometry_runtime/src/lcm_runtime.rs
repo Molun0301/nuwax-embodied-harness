@@ -7979,9 +7979,17 @@ async fn run_owned_nav_state_consumer(
         .await
 }
 
+// The original worker returns the publication allocation, not a deep clone.
+// Outer String errors remain worker/registration failures, never retryable.
+struct SurfaceMapBuildAttempt {
+    message: schema::NavigationMap3D,
+    result: Result<Arc<nuwax_nav_mls_planner::SurfaceSnapshot>, nuwax_nav_stack::surface_map::SurfaceMapBuildError>,
+    retained_source: Option<Arc<nuwax_nav_mls_planner::SurfaceSnapshot>>,
+}
+
 type SurfaceMapComputation = (
     crate::explore_runtime::SurfaceMapTicket,
-    Result<Arc<nuwax_nav_mls_planner::SurfaceSnapshot>, String>,
+    Result<SurfaceMapBuildAttempt, String>,
 );
 
 #[cfg(test)]
@@ -7996,7 +8004,7 @@ fn register_surface_map_build(
     control: &GeometryRuntimeTaskControl,
     ticket: crate::explore_runtime::SurfaceMapTicket,
     completed: tokio::sync::mpsc::Sender<SurfaceMapComputation>,
-    compute: impl FnOnce() -> Result<Arc<nuwax_nav_mls_planner::SurfaceSnapshot>, String>
+    compute: impl FnOnce() -> Result<SurfaceMapBuildAttempt, String>
         + Send
         + 'static,
 ) -> Result<(), String> {
@@ -8019,6 +8027,7 @@ async fn run_owned_surface_map_consumer(
     control: GeometryRuntimeTaskControl,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(), String> {
+    use nuwax_nav_stack::surface_map::SurfaceMapBuildError;
     let (computed_tx, mut computed_rx) = tokio::sync::mpsc::channel::<SurfaceMapComputation>(1);
     // 缓存只由原单在途阻塞任务访问，接收/清空/关闭不等待计算锁。
     let cache = Arc::new(std::sync::Mutex::new(
@@ -8029,14 +8038,20 @@ async fn run_owned_surface_map_consumer(
         schema::NavigationMap3D,
         crate::explore_runtime::SurfaceMapTicket,
     )> = None;
+    let mut retry_after = tokio::time::Instant::now();
     let terminal = loop {
-        if !computing {
+        if !computing && tokio::time::Instant::now() >= retry_after {
             if let Some((message, ticket)) = latest_pending.take() {
                 let cache = Arc::clone(&cache);
                 let completed = computed_tx.clone();
                 let rejected_ticket = ticket.clone();
                 let compute = move || {
-                    cache.lock().map_err(|_| "共享表面计算缓存已失效".to_owned())?.build(&message)
+                    let mut cache = cache.lock().map_err(|_| "共享表面计算缓存已失效".to_owned())?;
+                    let result = cache.build_typed(&message);
+                    let retained_source = if matches!(&result, Err(SurfaceMapBuildError::IncompleteFineSource(_))) {
+                        cache.retained_source_for_incomplete(&message)
+                    } else { None };
+                    Ok(SurfaceMapBuildAttempt { message, result, retained_source })
                 };
                 match register_surface_map_build(&control, ticket, completed, compute) {
                     Ok(()) => computing = true,
@@ -8056,7 +8071,36 @@ async fn run_owned_surface_map_consumer(
                     break Err("surface map completion channel closed".into());
                 };
                 computing = false;
-                explore.finish_surface_map_update(ticket, result).await;
+                retry_after = tokio::time::Instant::now();
+                #[cfg(test)] let finished_revision = ticket.cloud_revision_for_test();
+                match result {
+                    Err(error) => { explore.finish_surface_map_update(ticket, Err(error)).await; }
+                    Ok(SurfaceMapBuildAttempt { message, result, retained_source }) => match result {
+                        Ok(snapshot) => { explore.finish_surface_map_update(ticket, Ok(snapshot)).await; }
+                        Err(error) => {
+                            let retain = if matches!(&error, SurfaceMapBuildError::IncompleteFineSource(_)) {
+                                if let Some(retained) = retained_source.as_ref() {
+                                    explore.can_defer_incomplete_surface_map(&ticket, retained).await
+                                } else { false }
+                            } else { false };
+                            if retain {
+                                // Back off only this same failed candidate. A
+                                // newer pending root is immediately eligible in
+                                // the original single-flight owner. Preserve the
+                                // first receipt; never send retries through begin.
+                                if latest_pending.is_none() {
+                                    retry_after = tokio::time::Instant::now() + Duration::from_secs(1);
+                                    latest_pending = Some((message, ticket));
+                                }
+                            } else {
+                                // Invalid/worker/reset/domain/mask/source mismatch
+                                // keep the original finish and child cancel path.
+                                explore.finish_surface_map_update(ticket, Err(error.to_string())).await;
+                            }
+                        }
+                    },
+                }
+                #[cfg(test)] record_topology_event(format!("surface-map-finish-cloud:{finished_revision}"));
             }
             frame = subscription.recv() => {
                 // 接收时刻先于解码和MLS构建，计算耗时不能使旧图重新变新鲜。
@@ -8070,11 +8114,16 @@ async fn run_owned_surface_map_consumer(
                     Err(error) => { warn!(%error, "invalid NavigationMap3D rejected by exploration"); continue; }
                 };
                 match explore.begin_surface_map_update(&message, received).await {
-                    Ok(Some(ticket)) => latest_pending = Some((message, ticket)),
-                    Ok(None) => latest_pending = None,
+                    Ok(Some(ticket)) => {
+                        latest_pending = Some((message, ticket));
+                        retry_after = tokio::time::Instant::now();
+                    },
+                    Ok(None) => { latest_pending = None; retry_after = tokio::time::Instant::now(); }
                     Err(error) => warn!(%error, "stale or foreign surface map rejected by exploration"),
                 }
             }
+            _ = tokio::time::sleep_until(retry_after),
+                if !computing && latest_pending.is_some() => {}
         }
     };
     explore.stop_surface_input_owner().await;
@@ -13528,7 +13577,7 @@ mod public_tf_ownership_tests {
 }
 
 #[cfg(test)]
-mod mapping_feed_tests {
+pub(crate) mod mapping_feed_tests {
     use super::*;
     use crate::mapping_adapter::MappingReadiness;
     use crate::mapping_backend::MappingBackendTestGate;
@@ -13536,6 +13585,8 @@ mod mapping_feed_tests {
     use nalgebra::Point3;
     use nuwax_protocol::RawLcmFrame;
     use nuwax_transport::{LcmBackend, LcmFrameStream, TransportResult};
+
+    include!("explore_surface_incomplete_fixture_tests.rs");
 
     // Isolated canonical-applier fixtures still cross the real V3 candidate seal.
     // Actual handoff fixtures supply the admitted scan and producer receipt proofs.

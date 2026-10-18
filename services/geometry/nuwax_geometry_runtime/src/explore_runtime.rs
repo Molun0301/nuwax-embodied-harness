@@ -1503,6 +1503,9 @@ pub(crate) struct SurfaceMapTicket {
 }
 
 impl SurfaceMapTicket {
+    #[cfg(test)]
+    pub(crate) fn cloud_revision_for_test(&self) -> i64 { self.cloud_revision }
+
     // Compare only inside the same domain. A mask commit can advance while the
     // cloud root stays unchanged; neither component is a new synthetic clock.
     fn revision(&self) -> (i64, i64) {
@@ -1530,6 +1533,18 @@ struct SurfaceExplorationMode {
     input_ready: bool,
     input_error: Option<String>,
     accepting: bool,
+}
+
+impl SurfaceExplorationMode {
+    // The existing finish contract permits an older in-flight success newer
+    // than installed_revision. Do not replace this with "ticket == latest".
+    fn accepts_surface_ticket(&self, ticket: &SurfaceMapTicket) -> bool {
+        self.accepting
+            && self.latest.as_ref().is_some_and(|latest|
+                ticket.same_domain(latest) && ticket.revision() <= latest.revision())
+            && ticket.cloud_revision >= self.minimum_eligible_cloud_revision
+            && self.installed_revision.is_none_or(|revision| ticket.revision() > revision)
+    }
 }
 
 pub struct ExploreRuntimeInner {
@@ -2130,6 +2145,21 @@ impl ExploreRuntimeHandle {
         Ok((!message.cleared).then_some(ticket))
     }
 
+    /// A cache success is not necessarily an owner installation. Qualify the
+    /// same already-installed Arc under the original completion fences; this
+    /// operation does not update source, notification, ticket or receipt clocks.
+    pub(crate) async fn can_defer_incomplete_surface_map(
+        &self,
+        ticket: &SurfaceMapTicket,
+        retained: &Arc<SurfaceSnapshot>,
+    ) -> bool {
+        let guard = self.inner.lock().await;
+        let Some(mode) = guard.surface_mode.as_ref() else { return false; };
+        mode.accepts_surface_ticket(ticket)
+            && mode.receiver.snapshot().ok().flatten()
+                .is_some_and(|installed| Arc::ptr_eq(&installed, retained))
+    }
+
     /// 同域允许最新完成图先安装；票据保留自身身份和接收时刻，清空/换域仍撤销旧结果。
     pub(crate) async fn finish_surface_map_update(
         &self,
@@ -2141,15 +2171,7 @@ impl ExploreRuntimeHandle {
             let Some(mode) = guard.surface_mode.as_mut() else {
                 return false;
             };
-            if !mode.accepting
-                || mode.latest.as_ref().is_none_or(|latest| {
-                    !ticket.same_domain(latest) || ticket.revision() > latest.revision()
-                })
-                || ticket.cloud_revision < mode.minimum_eligible_cloud_revision
-                || mode
-                    .installed_revision
-                    .is_some_and(|revision| ticket.revision() <= revision)
-            {
+            if !mode.accepts_surface_ticket(&ticket) {
                 return false;
             }
             match result {
@@ -9006,6 +9028,7 @@ mod tests {
     include!("explore_compute_runtime_tests.rs");
     include!("explore_compute_surface_tests.rs");
     include!("explore_composite_map_tests.rs");
+    include!("explore_surface_incomplete_tests.rs");
 
     #[tokio::test]
     async fn compute_owner_surface_slow_prepare_keeps_result_but_rejects_stale_next_tick() {

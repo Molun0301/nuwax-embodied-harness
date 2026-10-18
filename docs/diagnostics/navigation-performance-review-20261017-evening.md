@@ -345,6 +345,24 @@ RED 先只加入分类和测试，原结算不动：24 新 exact 中 16 通过�
 
 使用真实 geometry bin 默认 real-lcm-bridge 的原 release/LTO，增量 GREEN check54.60s/no-run14m08s；既有 GTSAM fresh，无 SDK 下载重建或新 target。两项原真实 UDPM 期待迁移仅编译、未运行，不记通过；新 Bridge 验证使用 RecordingBackend。发布后未知归属、reply/rollback 故障和物理停稳没有被本次小修解决，不将逻辑预算终态冒充运动停止证明。
 
+## 第二十四阶段：高度归约输出 Vec 候选未接受
+
+试验将原 fine-ground producer 的输出收集器泛型化，用完全消费原顺序的最大值归约替代高度临时 Vec，输入批读、三个 Vec 消费者、None/Some 语义不变。独立冻结完整 batch/旧 height wrapper 后，35 focused、MLS401/20原ignored、Scan79/11、原 runtime27+46/9+4、默认七包均通过；首次两处 tests-only E0716 仅以局部数组绑定修复，原编译失败保留。
+
+唯一同配置 bounded 观察的整进程 wall16.360s、N remaining6.945s，没有优于已接受上一优化的两个样本（wall15.345–16.057s、N6.498–6.724s）；T remaining6.158s落在原范围6.085–6.568s内。结果/calls/计数一致，但没有一致性能收益。故精确撤回该生产和测试候选，未提交收集器抽象，不据单次结果宣称稳定退化。原全部试验材料保留，未清缓存、复制binary或重复原A全套；后续Cargo正常增量更新。
+
+## 第二十五阶段：暂时缺块不撤销仍合格的完整探索地图
+
+实入口 RED 使用真实 Writer/发布 codec、同context memq owned订阅、原cache和retained worker。初始完整地图和 ACTIVE child成功后，合法新root省略一个新对象，原无provider RPC超时；旧实现清空source/identity/receipt并撤销探索任务、定向取消child。失败位于首个ready保留断言，后续未到达；两套owner均实际清理join后保留失败日志。
+
+修复从原产生点保留 IncompleteFineSource 类型，仅当原缓存完整source、同域同virtual mask、原ticket资格和实际已安装Arc对应时，保留原源并重试。原message所有权回同一latest_pending槽，不深复制地图、不新建线程/缓存/锁；同失败candidate沿1秒限速，新root不继承旧退避。旧receipt及source时间不刷新，原2秒TTL照常；Invalid、变mask、clear/换域、owner故障仍原失效与精确child取消。mask借原layout/积分存储比较，无额外全mask副本或哈希。原允许较旧在途成功安装的合同保留，不把所有非latest结果丢弃。
+
+GREEN实际44个不同exact通过（54次执行含10重复）：geometry30/30、stack typed/chunk/mask13/13、新Some/Some retained入口1项四变体及重复mask10项。主例原source/identity/receipt、generation和child保留且无取消；覆盖实际新pending不被旧退避拖住、原期限到期Pending、真实clear/换域、真实Receiver Invalid与mask变化终止、独立cache Arc不冒充安装来源。Some/Some正例真实Incomplete后允许同内容但新receipt/load时钟，cell/layout/domain变化拒绝。
+
+原release/LTO单target，geometry修正后check1m06/no-run14m04，GTSAM fresh；默认七包15.82s通过。保留初次stack未开mls导致selector零匹配的执行前拒绝，以及tests-only cloud_revision权限E0616后最窄cfg(test)getter修正。完成观测改用同Writer跨session递增cloud_revision，避免新域occupancy revision复用；未改生产身份。
+
+恢复验证采用更高完整inline root，不声称隔离memq跨context RPC补齐、UDP或实机通过。750ms仅本次warm测试判别窗口，不是性能保证。导航旧退避、F2纯水位观察owner更新、旧urgent/live失败均未被本阶段顺手修改。
+
 ## 后续持续检查
 
 1. 墙前晚到路径的实际恢复与初始 full/partial/PCT 顺序，保留及时移动和真实避障

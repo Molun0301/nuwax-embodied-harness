@@ -503,3 +503,95 @@ fn calibrated_repeated_occupancy_mask_reuse_cost_baseline() {
         }));
     }
 }
+
+// Append inside the existing surface_dataflow::tests::mask_reuse_tests module.
+// Reuses FineFixture/calibrated_config/virtual_mask; no new production API.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incomplete_fine_retains_present_mask_only_for_same_contents_and_domain() {
+    use crate::surface_map::SurfaceMapBuildError;
+    use nuwax_map_chunks::Manifest;
+
+    // Cache construction captures the URL. Set it on this exact test process,
+    // never mutate shared process environment from a concurrently running test.
+    assert_eq!(std::env::var("NUWAX_LCM_URL").ok().as_deref(), Some("memq://"));
+    for variant in ["same_mask_new_receipt", "cell", "layout", "domain"] {
+        let mut fixture = FineFixture::new();
+        let cells = fine_ground();
+        let mut first = fixture.message(&cells, 1);
+        let mut candidate = fixture.message(&cells, 2);
+        // Cover both occupied and free cells in an actually present mask. This
+        // is a legal protocol mask, not a claim about Geometry's zones store.
+        first.virtual_obstacles.as_mut().unwrap().data[0] = 100;
+        candidate.virtual_obstacles.as_mut().unwrap().data[0] = 100;
+        let first_mask = first.virtual_obstacles.as_ref().unwrap();
+        let next_mask = candidate.virtual_obstacles.as_ref().unwrap();
+        assert_eq!(first_mask.data, next_mask.data);
+        assert_eq!(first_mask.info.origin, next_mask.info.origin);
+        assert_eq!(first_mask.info.resolution, next_mask.info.resolution);
+        assert_ne!(first_mask.header.seq, next_mask.header.seq);
+        assert_ne!(
+            (first_mask.info.map_load_time_sec, first_mask.info.map_load_time_nsec),
+            (next_mask.info.map_load_time_sec, next_mask.info.map_load_time_nsec),
+        );
+        assert!(candidate.committed_map.revision > first.committed_map.revision);
+        match variant {
+            "same_mask_new_receipt" => {},
+            "cell" => candidate.virtual_obstacles.as_mut().unwrap().data[1] = 100,
+            "layout" => candidate.virtual_obstacles.as_mut().unwrap().info.origin.position[0] = 0.25,
+            "domain" => {
+                candidate.committed_map.session_id = "f1-present-mask-new-domain".into();
+                // The replacement domain is sealed by the same real Writer,
+                // rather than forging a root header that admission would reject.
+                let root = fixture.writer.snapshot(
+                    schema::navigation_map_3d_domain(&candidate),
+                    candidate.cloud_revision as u64,
+                    candidate.source_timestamp_ns as u64,
+                ).unwrap();
+                let included = root.blocks.iter().map(|block| (block.object,
+                    fixture.repository.read_object(block.object, MAX_BLOCK_BYTES).unwrap())).collect();
+                candidate.fine = Some(Transfer { root: root.encode().unwrap(), included });
+            },
+            _ => unreachable!(),
+        }
+        let old_root = Manifest::decode(&first.fine.as_ref().unwrap().root).unwrap();
+        let next_root = Manifest::decode(&candidate.fine.as_ref().unwrap().root).unwrap();
+        let missing = next_root.blocks.iter().find(|next|
+            !old_root.blocks.iter().any(|old| old.object == next.object))
+            .expect("real repeated observations must produce an uncached object").object;
+        assert!(candidate.fine.as_mut().unwrap().included.remove(&missing).is_some());
+        // Both messages traverse real codec/schema admission. Omission is legal;
+        // bad cells, dimensions or mismatched root domain must not fake Incomplete.
+        schema::validate_navigation_map_3d(&first).unwrap();
+        schema::validate_navigation_map_3d(&candidate).unwrap();
+        let first = schema::decode_navigation_map_3d_body(
+            &schema::encode_navigation_map_3d_body(&first).unwrap()).unwrap();
+        let candidate = schema::decode_navigation_map_3d_body(
+            &schema::encode_navigation_map_3d_body(&candidate).unwrap()).unwrap();
+
+        // Use the same blocking context required by FineMapReader's real RPC.
+        // This fresh cache has only first's complete objects; the omitted new
+        // object really reaches no-provider memq timeout, never an injected Err.
+        tokio::task::spawn_blocking(move || {
+            let configured = calibrated_config();
+            let mut cache = SurfaceGeometryCache::configured(&configured);
+            let old = cache.build_typed(&first).unwrap();
+            let physical = cache.physical_snapshot().unwrap();
+            let error = match cache.build_typed(&candidate) {
+                Err(error) => error,
+                Ok(_) => panic!("{variant}: missing object unexpectedly completed"),
+            };
+            assert!(matches!(error, SurfaceMapBuildError::IncompleteFineSource(_)),
+                "{variant}: expected real typed Incomplete, got {error}");
+            let retained = cache.retained_source_for_incomplete(&candidate);
+            if variant == "same_mask_new_receipt" {
+                assert!(retained.as_ref().is_some_and(|source| Arc::ptr_eq(source, &old)),
+                    "present mask contents are unchanged despite newer receipt/load clock");
+            } else {
+                assert!(retained.is_none(), "{variant}: changed geometry/domain cannot retain old mask");
+            }
+            assert!(Arc::ptr_eq(&physical, &cache.physical_snapshot().unwrap()));
+            assert!(Arc::ptr_eq(&old, &cache.build_typed(&first).unwrap()),
+                "failed candidate must leave the complete source honest");
+        }).await.expect("present-mask RPC build must finish and join");
+    }
+}

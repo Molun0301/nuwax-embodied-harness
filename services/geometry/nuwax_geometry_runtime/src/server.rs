@@ -11412,6 +11412,14 @@ async fn assigned_mapping_cloud_boundary_slice(
 
     #[async_trait::async_trait]
     impl ExploreNavigationSink for LifecycleExploreSink {
+        fn retain_child_dispatch(
+            &self,
+            operation: crate::explore_runtime::ChildNavigationDispatch,
+        ) -> Result<crate::explore_runtime::ChildNavigationDispatchObserver, String> {
+            // Legacy fake-sink contract; this fixture does not prove root ownership.
+            Ok(crate::explore_runtime::ChildNavigationDispatchObserver::inline(operation))
+        }
+
         fn current_map_name(&self) -> Result<String, String> {
             Ok("map".to_string())
         }
@@ -11491,6 +11499,14 @@ async fn assigned_mapping_cloud_boundary_slice(
 
     #[async_trait::async_trait]
     impl ExploreNavigationSink for SubmitLeaseThenBlockSink {
+        fn retain_child_dispatch(
+            &self,
+            operation: crate::explore_runtime::ChildNavigationDispatch,
+        ) -> Result<crate::explore_runtime::ChildNavigationDispatchObserver, String> {
+            // Legacy fake-sink contract; this fixture does not prove root ownership.
+            Ok(crate::explore_runtime::ChildNavigationDispatchObserver::inline(operation))
+        }
+
         fn current_map_name(&self) -> Result<String, String> {
             Ok("map".to_string())
         }

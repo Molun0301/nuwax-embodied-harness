@@ -550,8 +550,79 @@ fn take_early_cancel_terminal(
     Some(pending.early_terminals.remove(position))
 }
 
+/// The original tick permit and its complete navigation handoff travel together.
+/// A real retained run requires the explicit internal root-owned capability.
+pub struct ChildNavigationDispatch {
+    runtime: ExploreRuntimeHandle,
+    generation: u64,
+    request: ChildNavigationRequest,
+    sink: Arc<dyn ExploreNavigationSink>,
+    tick_permit: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl ChildNavigationDispatch {
+    pub(crate) async fn run(
+        self,
+        owner: Option<&dyn ChildNavigationDispatchOwner>,
+    ) -> ExploreRuntimeSnapshot {
+        let Self { runtime, generation, request, sink, tick_permit } = self;
+        // Keep the ORIGINAL permit through publish, attachment, and any exact
+        // orphan settlement. Dropping the observer cannot release this permit.
+        let _tick_permit = tick_permit;
+        let snapshot = runtime.complete_child_dispatch(generation, request, sink, owner).await;
+        if owner.is_some() {
+            // Only explicit completion clears this projection. A panic leaves
+            // it set and is reported by the original root supervisor.
+            runtime.inner.lock().await.retained_child_dispatch = false;
+        }
+        snapshot
+    }
+}
+
+/// A response is only an observation; it never transfers navigation ownership.
+pub enum ChildNavigationDispatchObserver {
+    Retained(tokio::sync::oneshot::Receiver<ExploreRuntimeSnapshot>),
+    #[cfg(test)]
+    Inline(std::pin::Pin<Box<dyn std::future::Future<Output = ExploreRuntimeSnapshot> + Send>>),
+}
+
+impl ChildNavigationDispatchObserver {
+    #[cfg(test)]
+    pub(crate) fn inline(operation: ChildNavigationDispatch) -> Self {
+        Self::Inline(Box::pin(operation.run(None)))
+    }
+
+    async fn observe(self) -> Option<ExploreRuntimeSnapshot> {
+        match self {
+            Self::Retained(receiver) => receiver.await.ok(),
+            #[cfg(test)]
+            Self::Inline(operation) => Some(operation.await),
+        }
+    }
+}
+
+/// Internal, explicit root-owned capability. Both methods are required; there
+/// is no silent pending/default settlement for an incompletely wired sink.
+#[async_trait]
+pub(crate) trait ChildNavigationDispatchOwner: Send + Sync {
+    /// The callback runs once under the original root admission mutex, no await.
+    fn with_dispatch_admission(&self, decide: &mut dyn FnMut(bool));
+    /// Return only after authority proves the exact orphan terminal.
+    async fn settle_retained_dispatch_orphan(&self, lease: ChildNavigationLease);
+}
+
 #[async_trait]
 pub trait ExploreNavigationSink: Send + Sync {
+    /// Register BEFORE polling submit. A failed registration must drop the
+    /// never-polled operation; it must not fall back to an unmanaged task.
+    fn retain_child_dispatch(
+        &self,
+        operation: ChildNavigationDispatch,
+    ) -> Result<ChildNavigationDispatchObserver, String> {
+        drop(operation);
+        Err("retained child dispatch owner is unavailable".to_string())
+    }
+
     /// 实际坐标拥有方的当前代际；测试替身可没有该观察能力。
     fn current_map_frame_generation(&self) -> Result<Option<i64>, String> { Ok(None) }
     /// Snapshot the authoritative navigation cancel generation for a frozen intent.
@@ -1580,6 +1651,9 @@ pub struct ExploreRuntimeInner {
     progress_origin: Option<(String,i64,i64)>,
     active_child: Option<ActiveChildNavigation>,
     pending_child_dispatch: Option<ChildNavigationRequest>,
+    // One accepted dispatch owns the original tick permit across all epochs.
+    // Neither Stop nor Start clears this; only that operation may settle it.
+    retained_child_dispatch: bool,
     pending_child_cancellation: Option<PendingChildCancellation>,
     completed_rollover_recovery: Option<CompletedOwnershipTransition>,
     session_generation: u64,
@@ -1628,6 +1702,7 @@ impl ExploreRuntimeInner {
             progress_origin: None,
             active_child: None,
             pending_child_dispatch: None,
+            retained_child_dispatch: false,
             pending_child_cancellation: None,
             completed_rollover_recovery: None,
             session_generation: 0,
@@ -2326,6 +2401,13 @@ impl ExploreRuntimeHandle {
     }
 
     pub(crate) async fn reconcile_orphan_cancellations(&self) -> bool {
+        // Process Stop shares the original dispatch fence. An accepted dispatch
+        // may still be between Goal publication and registering its exact orphan.
+        let Ok(_tick_permit) = self.tick_gate.try_lock() else { return false; };
+        self.reconcile_orphan_cancellations_with_tick_permit().await
+    }
+
+    async fn reconcile_orphan_cancellations_with_tick_permit(&self) -> bool {
         let leases = self
             .orphan_cancellations
             .next_batch(ORPHAN_RECONCILE_BATCH_SIZE);
@@ -3591,7 +3673,7 @@ impl ExploreRuntimeHandle {
         generation: u64,
         pose: ExploreRobotPose,
     ) -> ExploreRuntimeSnapshot {
-        let Ok(_tick_permit) = self.tick_gate.try_lock() else { return self.snapshot(); };
+        let Ok(tick_permit) = self.tick_gate.clone().try_lock_owned() else { return self.snapshot(); };
         if ![pose.x, pose.y, pose.z]
             .iter()
             .all(|value| value.is_finite())
@@ -3645,13 +3727,24 @@ impl ExploreRuntimeHandle {
             return self.snapshot();
         }
 
+        if guard.retained_child_dispatch {
+            // Normally the original task still owns tick_gate. A panic can drop
+            // that permit, but cannot authorize a replacement to clear this bit.
+            let snapshot = guard.snapshot(
+                STATUS_PENDING,
+                "previous retained child dispatch remains unresolved",
+            );
+            drop(guard);
+            return self.store_snapshot(snapshot);
+        }
+
         if self.orphan_cancellations.has_entries() {
             let snapshot = guard.snapshot(
                 STATUS_PENDING,
                 "recovering orphan navigation ownership before child dispatch",
             );
             drop(guard);
-            self.reconcile_orphan_cancellations().await;
+            self.reconcile_orphan_cancellations_with_tick_permit().await;
             return self.store_snapshot(snapshot);
         }
 
@@ -3849,7 +3942,7 @@ impl ExploreRuntimeHandle {
                 ),
             );
             self.store_snapshot(snapshot);
-            return self.dispatch_child(generation, request, guard).await;
+            return self.dispatch_child(generation, request, guard, tick_permit).await;
         }
 
         // 先确认提交所需的同步上下文，再允许选择器领取目标。
@@ -4088,7 +4181,7 @@ impl ExploreRuntimeHandle {
                 self.store_snapshot(dispatching);
                 guard.pending_child_dispatch = Some(request.clone());
                 selection_ticket.finish(&mut guard);
-                self.dispatch_child(generation, request, guard).await
+                self.dispatch_child(generation, request, guard, tick_permit).await
             }
             Ok(ExplorationPoll::NoFrontier) => {
                 selection_ticket.finish(&mut guard);
@@ -4155,6 +4248,7 @@ impl ExploreRuntimeHandle {
         generation: u64,
         request: ChildNavigationRequest,
         mut guard: tokio::sync::MutexGuard<'_, ExploreRuntimeInner>,
+        tick_permit: tokio::sync::OwnedMutexGuard<()>,
     ) -> ExploreRuntimeSnapshot {
         if generation != guard.generation || !guard.logical_active {
             return self.snapshot();
@@ -4169,15 +4263,52 @@ impl ExploreRuntimeHandle {
                 )
                 .await;
         };
-        let proposed_request_id = request.request_id.clone();
-        let expected_parent_request_id = request.parent_request_id.clone();
-        let frontier_goal_id = request.frontier_goal_id.clone();
-
         // Freeze the exact request before releasing Explore state. Navigation
         // admission is async and must never hold the Explore inner lock.
         guard.pending_child_dispatch = Some(request.clone());
-        drop(guard);
 
+        let operation = ChildNavigationDispatch {
+            runtime: self.clone(),
+            generation,
+            request,
+            sink: sink.clone(),
+            tick_permit,
+        };
+        // Hold original inner while original admission accepts/rejects the
+        // future. A started task may run, but Stop/projection cannot observe it
+        // before this synchronous accepted-ownership bit becomes visible.
+        let observation = sink.retain_child_dispatch(operation);
+        if matches!(&observation, Ok(ChildNavigationDispatchObserver::Retained(_))) {
+            guard.retained_child_dispatch = true;
+        }
+        drop(guard);
+        match observation {
+            Ok(observer) => observer.observe().await.unwrap_or_else(|| self.snapshot()),
+            Err(error) => {
+                // No submit was polled. Keep the frozen request for the original
+                // scheduler cadence; this is not a goal rejection/budget event.
+                let guard = self.inner.lock().await;
+                if generation != guard.generation || !guard.logical_active {
+                    return self.snapshot();
+                }
+                self.store_snapshot(guard.snapshot(
+                    STATUS_PENDING,
+                    format!("child dispatch owner unavailable: {error}"),
+                ))
+            }
+        }
+    }
+
+    async fn complete_child_dispatch(
+        &self,
+        generation: u64,
+        request: ChildNavigationRequest,
+        sink: Arc<dyn ExploreNavigationSink>,
+        owner: Option<&dyn ChildNavigationDispatchOwner>,
+    ) -> ExploreRuntimeSnapshot {
+        let proposed_request_id = request.request_id.clone();
+        let expected_parent_request_id = request.parent_request_id.clone();
+        let frontier_goal_id = request.frontier_goal_id.clone();
         let ticket = match sink.submit(request.clone()).await {
             Ok(ticket) => ticket,
             Err(error) => {
@@ -4207,45 +4338,56 @@ impl ExploreRuntimeHandle {
         }
 
         let mut guard = self.inner.lock().await;
-        let frozen_request_matches = guard
-            .pending_child_dispatch
-            .as_ref()
-            .is_some_and(|pending| {
-                pending.request_id == request.request_id
-                    && pending.parent_request_id == request.parent_request_id
-                    && pending.intent == request.intent
-            });
-        if generation != guard.generation
-            || !guard.logical_active
-            || !frozen_request_matches
+        let mut attached = false;
         {
-            drop(guard);
-            // Nav may already own the exact lease. Do not attach it to a newer
-            // Explore epoch. A failed immediate cancel must transfer ownership
-            // to a retained exact-lease recovery task or remain in Explore's
-            // persistent in-process orphan set for scheduler retry.
-            self.orphan_cancellations.register(ticket.lease.clone());
-            self.reconcile_orphan_cancellation(&sink, ticket.lease).await;
-            return self.snapshot();
+            let mut decide = |admission_open: bool| {
+                let frozen_request_matches = guard.pending_child_dispatch.as_ref().is_some_and(|pending| {
+                    pending.request_id == request.request_id
+                        && pending.parent_request_id == request.parent_request_id
+                        && pending.intent == request.intent
+                });
+                if !admission_open || generation != guard.generation
+                    || !guard.logical_active || !frozen_request_matches
+                {
+                    // Synchronous visibility before releasing either state lock.
+                    // The original tick permit excludes all batch reconcilers.
+                    self.orphan_cancellations.register(ticket.lease.clone());
+                    return;
+                }
+                guard.pending_child_dispatch = None;
+                let child_request_id = ticket.lease.session_id.clone();
+                guard.active_child = Some(ActiveChildNavigation {
+                    request_id: child_request_id.clone(),
+                    frontier_goal_id: frontier_goal_id.clone(),
+                    lease: ticket.lease.clone(),
+                    terminal_receipt_checked: false,
+                });
+                // Publish identity in the SAME non-cancellable admission segment.
+                self.store_snapshot(guard.snapshot(
+                    STATUS_ACTIVE,
+                    format!("child navigation accepted: {child_request_id}"),
+                ));
+                attached = true;
+            };
+            if let Some(owner) = owner {
+                owner.with_dispatch_admission(&mut decide);
+            } else {
+                // Explicit cfg(test) inline sinks retain their original contract.
+                decide(true);
+            }
         }
-
-        guard.pending_child_dispatch = None;
-        let child_request_id = ticket.lease.session_id.clone();
-        guard.active_child = Some(ActiveChildNavigation {
-            request_id: child_request_id.clone(),
-            frontier_goal_id,
-            lease: ticket.lease.clone(),
-            terminal_receipt_checked: false,
-        });
-        let snapshot = guard.snapshot(
-            STATUS_ACTIVE,
-            format!("child navigation accepted: {child_request_id}"),
-        );
-        // Publish attached identity before any receipt read, in the same
-        // non-cancellable segment as installation. Live fanout can now find it.
-        self.store_snapshot(snapshot);
         drop(guard);
-        self.reconcile_child_terminal(&ticket.lease).await
+        if attached {
+            return self.reconcile_child_terminal(&ticket.lease).await;
+        }
+        if let Some(owner) = owner {
+            // The task that published also owns the exact orphan continuation.
+            // No new root admission is needed, even after root close wins.
+            owner.settle_retained_dispatch_orphan(ticket.lease).await;
+        } else {
+            self.reconcile_orphan_cancellation(&sink, ticket.lease).await;
+        }
+        self.snapshot()
     }
 
     async fn reconcile_child_terminal(&self, lease: &ChildNavigationLease) -> ExploreRuntimeSnapshot {
@@ -4822,7 +4964,10 @@ impl ExploreRuntimeHandle {
     /// still owns motion-safety state, including a failed cancellation barrier.
     pub async fn blocks_mapping_mutation(&self) -> bool {
         let guard = self.inner.lock().await;
-        guard.logical_active
+        // Stop may clear pending while its accepted dispatch is still running.
+        // Pure pose/compute work under tick_gate is NOT a motion-safety blocker.
+        guard.retained_child_dispatch
+            || guard.logical_active
             || guard.active_child.is_some()
             || guard.pending_child_cancellation.is_some()
             || self.orphan_cancellations.blocks_motion_mutation()
@@ -5629,6 +5774,14 @@ mod tests {
 
     #[async_trait]
     impl ExploreNavigationSink for RecordingNavSink {
+        fn retain_child_dispatch(
+            &self,
+            operation: crate::explore_runtime::ChildNavigationDispatch,
+        ) -> Result<crate::explore_runtime::ChildNavigationDispatchObserver, String> {
+            // Legacy fake-sink contract; this fixture does not prove root ownership.
+            Ok(crate::explore_runtime::ChildNavigationDispatchObserver::inline(operation))
+        }
+
         fn current_cancel_generation(&self) -> Result<u64, String> {
             self.cancel_snapshot
                 .lock()

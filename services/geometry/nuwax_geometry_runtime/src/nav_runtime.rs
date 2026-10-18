@@ -387,6 +387,49 @@ pub struct NavRuntimeState {
     next_cancel_generation: Arc<AtomicU64>,
 }
 
+// DRAFT ONLY. Insert at module scope in nav_runtime.rs.
+// The whole addition is cfg(test). It reads the existing Vec under its original
+// mutex; it cannot clear a fence, notify a waiter, replace a lease, or add state.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TestNavPublishKind {
+    Goal,
+    Cancel,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TestNavPublishInFlight {
+    pub kind: TestNavPublishKind,
+    pub lease: GoalLease,
+    pub generation: u64,
+    pub attempt: u64,
+}
+
+#[cfg(test)]
+impl NavRuntimeState {
+    pub(crate) fn publish_in_flight_for_test(
+        &self,
+    ) -> Result<Vec<TestNavPublishInFlight>, &'static str> {
+        let records = self
+            .publish_in_flight
+            .lock()
+            .map_err(|_| "NAV_PUBLISH_STATE_UNAVAILABLE")?;
+        Ok(records
+            .iter()
+            .map(|record| TestNavPublishInFlight {
+                kind: match record.kind {
+                    PublishKind::Goal => TestNavPublishKind::Goal,
+                    PublishKind::Cancel => TestNavPublishKind::Cancel,
+                },
+                lease: record.lease.clone(),
+                generation: record.generation,
+                attempt: record.attempt,
+            })
+            .collect())
+    }
+}
+
 #[derive(Clone, Default)]
 struct StackObservation {
     observed_at: Option<Instant>,

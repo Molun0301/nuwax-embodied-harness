@@ -231,6 +231,14 @@ struct FailClosedNavSink {
 
 #[async_trait]
 impl crate::explore_runtime::ExploreNavigationSink for FailClosedNavSink {
+    fn retain_child_dispatch(
+        &self,
+        operation: crate::explore_runtime::ChildNavigationDispatch,
+    ) -> Result<crate::explore_runtime::ChildNavigationDispatchObserver, String> {
+        // Legacy fake-sink contract; this fixture does not prove root ownership.
+        Ok(crate::explore_runtime::ChildNavigationDispatchObserver::inline(operation))
+    }
+
     async fn submit(
         &self,
         request: crate::explore_runtime::ChildNavigationRequest,

@@ -373,6 +373,20 @@ FineMapReader 原本在新 root 无任何块删除或替换时仍新建 observat
 
 最终修改夹具后的17个 exact 全通过（F2三项及14个原 gate 控制），默认七包 tests check通过；原35个stack和其余geometry成功结果按原批次保留，不将不同版本执行相加冒充一次全绿。实际冷 Tomogram/frontier 各1次、3000单元；水位主例复用原 query/Tomogram/frontier，真实scatter变化控制仍通过。临时诊断接缝精确撤回，ComputeService和ExploreRuntime与提交前逐字节一致；生产变更仅reader的9增1删。沿用唯一target、原release/LTO、既有GTSAM缓存，无实机或跨进程运动结论。
 
+## 第二十七阶段：调度观察者退出不丢失已接纳的目标发送
+
+真实 RED 经过原 scheduler.shutdown→worker abort→释放发送 gate，原 Goal publish future 被丢弃，留下原 attempt/完整 lease 的 in-flight。原精确 Cancel 等待500ms仍 Pending，tracker Idle、Goal调用1/Cancel调用0，无Explore child；stranded_signature=true，目标断言失败。scheduler/compute/root任务均完成清理，Nav遗留只随隔离fixture销毁，不是物理停车。该反证永久保留。
+
+修复把原 tick permit 与完整 submit、Nav结算、attach/orphan continuation 一起交给既有 root Retained，scheduler只观察结果。同步注册在原inner/admission锁内完成，成功后才置单个窄owned位；Stop/Start不清它，完整操作显式结束才清，panic由原root报告且残留不被新tick覆盖。注册拒绝没有Goal副作用，保留原pending按原周期处理，不扣Goal失败预算。
+
+attach与root关闭在原admission锁下决定；关闭先赢时，同一Retained负责精确orphan收尾，不在关闭后重新注册后继任务。复用原cancel单步与orphan循环，legacy分支保持原recover/should_cancel/public cancel行为；新inline分支沿原generation重试。取消证明读取原typed ZEROED或原精确Cancelled receipt，先排除同child仍active，foreign新目标只读旧证明不受取消。没有新增Mutex、unmanaged spawn、静默永久pending默认或registry phase。
+
+审查拒绝了“tick_gate忙就阻止映射停止”的泛化方案，因为tick还包含只读计算。最终只有已登记dispatch的owned位进入原blocks投影；纯compute Stop不增加这一阻塞。外部orphan reconcile复用原try_gate，内部使用已持permit入口，不递归锁。显式private owner能力由真正Bridge提供，旧fake sink仅显式tests-only Inline，真实root拒绝不会退回Inline。
+
+GREEN同一原release/LTO二进制51个exact全部通过：原RED与5新控制、Bridge25、Explore20。覆盖真实root登记、Stop清pending后owned仍可见、root关闭期间保持unsettled并延后Persistent stop、精确结算后join、纯计算不阻塞、真实新admission覆盖tracker后的旧取消receipt、同child旧path负例。原RED在候选上0.818s通过；测试支持合法Cancel Pending/JOIN之后等待原发布实际结算再冻结，不改变生产JOIN合同。本次三个scheduler/root用例实际均返回CANCEL_PENDING_ZERO_ACK，未声称命中JOIN文本。模型ACK仅用于明确票据的进程内证明/清理，不代表LCM接收或实机反馈。
+
+另外20项原Nav rollback/JOIN、ProcessStop、typed receipt测试固定使用UDPM，原构造器忽略环境URL；已有multicast初始化失败证据，本批未重跑或改成memq冒充通过。check1m13、原LTO no-run16m10，另普通非test geometry check45.63s与默认七包tests check16.97s通过，唯一target增量与GTSAM fresh。通用Err/Unknown分阶段rollback、UDP晚Goal、独立Cancel future被drop、panic主动恢复仍待后续；此阶段只修复已复现的Goal观察者取消归属漏洞。
+
 ## 后续持续检查
 
 1. 墙前晚到路径的实际恢复与初始 full/partial/PCT 顺序，保留及时移动和真实避障

@@ -2043,3 +2043,85 @@ async fn compute_owner_ownerless_final_shutdown_never_spawns_a_late_worker() {
     assert_eq!(guard.compute.lifecycle_counter_for_tests(), 0);
     assert!(!guard.logical_active);
 }
+
+// Append inside explore_runtime::tests via its existing included compute tests.
+// This negative control holds REAL prepared compute, not a fabricated gate bit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retained_dispatch_projection_does_not_block_stopped_read_only_prepare() {
+    use futures::FutureExt;
+    use std::panic::{resume_unwind, AssertUnwindSafe};
+
+    async fn finish_original<F: std::future::Future>(label: &str, future: F) -> F::Output {
+        tokio::pin!(future);
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(3), future.as_mut()).await {
+                Ok(value) => return value,
+                Err(_) => eprintln!("retained-dispatch negative cleanup still owns {label}"),
+            }
+        }
+    }
+
+    let (handle, sink) = configured_handle();
+    let feedback = Arc::new(StdMutex::new(Vec::new()));
+    let gate = Arc::new(OwnerRuntimeGate::default());
+    let _gate_cleanup = OwnerRuntimeGateRelease(gate.clone());
+    let mut tick = None;
+    let business = tokio::time::timeout(std::time::Duration::from_secs(12), AssertUnwindSafe(async {
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1).await.unwrap();
+        let started = handle.start("retained-negative-held-prepare", "prefer_wavefront").await;
+        assert_eq!(started.status, STATUS_ACCEPTED);
+        let mut source = OwnerRuntimeSource::new(feedback.clone());
+        source.prepare_gate = Some(gate.clone());
+        install_owner_runtime_source(&handle, source).await;
+        tick = Some(tokio::spawn({
+            let handle = handle.clone();
+            async move { handle.tick((2.0, 2.0)).await }
+        }));
+        owner_watchdog(gate.entered()).await;
+        let stopped = owner_watchdog(handle.stop("retained-negative-held-prepare")).await;
+        assert_eq!(stopped.status, STATUS_CANCELLED);
+        {
+            let inner = handle.inner.lock().await;
+            assert!(!inner.logical_active);
+            assert!(!inner.retained_child_dispatch);
+            assert!(inner.active_child.is_none());
+            assert!(inner.pending_child_dispatch.is_none());
+            assert!(inner.compute.status().unwrap().phase != crate::explore_compute_owner::Phase::Idle);
+        }
+        assert!(handle.tick_gate.try_lock().is_err(), "real compute tick still owns the original permit");
+        assert!(sink.submitted.lock().unwrap().is_empty());
+        assert!(!handle.blocks_mapping_mutation().await,
+            "stopped read-only compute is not retained navigation dispatch ownership");
+    }).catch_unwind()).await;
+
+    // Restore the real worker gate first, then join the original tick/compute.
+    // A watchdog never aborts the tick, detaches a JoinHandle, or claims success.
+    gate.release();
+    let mut failures = Vec::new();
+    if let Some(mut tick) = tick.take() {
+        match AssertUnwindSafe(finish_original("original tick", &mut tick)).catch_unwind().await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => failures.push(format!("tick join failed: {error}")),
+            Err(_) => failures.push("tick cleanup panicked".to_string()),
+        }
+    }
+    match AssertUnwindSafe(finish_original("compute shutdown request", handle.request_compute_shutdown()))
+        .catch_unwind().await {
+        Ok(()) => {}
+        Err(_) => failures.push("compute shutdown request panicked".to_string()),
+    }
+    match AssertUnwindSafe(finish_original("original compute owner", handle.compute_service.join()))
+        .catch_unwind().await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => failures.push(format!("compute owner failed: {error}")),
+        Err(_) => failures.push("compute owner cleanup panicked".to_string()),
+    }
+    drop(handle);
+    eprintln!("retained-dispatch read-only negative cleanup: {failures:?}");
+    match business {
+        Ok(Ok(())) => {}
+        Ok(Err(payload)) => resume_unwind(payload),
+        Err(_) => panic!("held-compute negative business deadline expired after original owner cleanup"),
+    }
+    assert!(failures.is_empty(), "{failures:?}");
+}

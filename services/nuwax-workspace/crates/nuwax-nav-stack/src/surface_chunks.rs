@@ -129,7 +129,8 @@ impl FineMapReader {
                         Err(error) => return Err(SurfaceMapBuildError::Invalid(error.to_string())),
                     }
                 }
-                let reply=reply.ok_or(SurfaceMapBuildError::IncompleteFineSource(last))?;
+                let reply=reply.ok_or_else(|| SurfaceMapBuildError::IncompleteFineSource(
+                    crate::surface_map::MissingFineObject { object: reference.object, key: reference.key, reason: last }))?;
                 let part=block_response(&request,&reply)?;
                 let length=reply["total_bytes"].as_u64().expect("分段格式已检查") as usize;
                 if total.is_some_and(|previous|previous!=length) {

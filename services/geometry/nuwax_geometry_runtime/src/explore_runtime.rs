@@ -2123,6 +2123,16 @@ impl ExploreRuntimeHandle {
         message: &schema::NavigationMap3D,
         received_monotonic_ns: u64,
     ) -> Result<Option<SurfaceMapTicket>, String> {
+        self.begin_surface_map_update_with_retained_source(message, received_monotonic_ns, None)
+            .await.map(|(ticket, _)| ticket)
+    }
+
+    pub(crate) async fn begin_surface_map_update_with_retained_source(
+        &self,
+        message: &schema::NavigationMap3D,
+        received_monotonic_ns: u64,
+        retained: Option<&Arc<SurfaceSnapshot>>,
+    ) -> Result<(Option<SurfaceMapTicket>, bool), String> {
         schema::validate_navigation_map_3d(message)?;
         if received_monotonic_ns == 0
             || message.committed_map.frame_id != self.expected_map_frame.as_ref()
@@ -2138,7 +2148,7 @@ impl ExploreRuntimeHandle {
             received_monotonic_ns,
         };
         let mut guard = self.inner.lock().await;
-        let invalidates = {
+        let (invalidates, same_installed_source) = {
             let mode = guard
                 .surface_mode
                 .as_mut()
@@ -2190,7 +2200,12 @@ impl ExploreRuntimeHandle {
                     .into(),
                 );
             }
-            invalidates
+            // This is only actual installation identity, not mask equality.
+            // The shared retry dependency checks actual mask layout/contents.
+            let same_installed_source = !invalidates && retained.is_some_and(|retained|
+                mode.receiver.snapshot().ok().flatten()
+                    .is_some_and(|installed| Arc::ptr_eq(&installed, retained)));
+            (invalidates, same_installed_source)
         };
         let finish_request = if invalidates {
             guard.committed_map = None;
@@ -2217,7 +2232,7 @@ impl ExploreRuntimeHandle {
         }
         let backend = self.readiness_cache.lock().backend_available;
         self.refresh_readiness_cache_with_backend(backend);
-        Ok((!message.cleared).then_some(ticket))
+        Ok(((!message.cleared).then_some(ticket), same_installed_source))
     }
 
     /// A cache success is not necessarily an owner installation. Qualify the

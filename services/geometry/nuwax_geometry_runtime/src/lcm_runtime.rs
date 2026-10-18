@@ -846,6 +846,7 @@ pub(crate) enum GeometryTopologyInjectedTerminal {
 #[cfg(test)]
 #[derive(Default)]
 pub(crate) struct GeometryTopologyTestControl {
+    surface_retry_clock: std::sync::OnceLock<tokio::time::Instant>,
     events: parking_lot::Mutex<Vec<String>>,
     task_control: parking_lot::Mutex<Option<GeometryRuntimeTaskControl>>,
     startup_shutdown_emitter:
@@ -1001,6 +1002,12 @@ impl GeometryTopologyTestControl {
                 .expect("production startup shutdown emitter")
                 .emit_completed(stage);
         }
+    }
+
+    fn record_surface_clock(&self, kind: &str, revision: i64, at: tokio::time::Instant) {
+        let origin = *self.surface_retry_clock.get_or_init(|| at);
+        self.record(format!("surface-clock:{kind}:{revision}:{}",
+            at.saturating_duration_since(origin).as_nanos()));
     }
 
     fn record(&self, event: impl Into<String>) {
@@ -8104,6 +8111,7 @@ async fn run_owned_nav_state_consumer(
 // Outer String errors remain worker/registration failures, never retryable.
 struct SurfaceMapBuildAttempt {
     message: schema::NavigationMap3D,
+    parsed_root: Option<Arc<nuwax_map_chunks::Manifest>>,
     result: Result<Arc<nuwax_nav_mls_planner::SurfaceSnapshot>, nuwax_nav_stack::surface_map::SurfaceMapBuildError>,
     retained_source: Option<Arc<nuwax_nav_mls_planner::SurfaceSnapshot>>,
 }
@@ -8131,6 +8139,17 @@ fn register_surface_map_build(
 ) -> Result<(), String> {
     control.register_retained("surface-map-build", async move {
         // 注册接纳后才启动实际计算；保留任务始终等待阻塞工作句柄结束。
+        #[cfg(test)]
+        let compute = {
+            let probe = topology_test_control();
+            let revision = ticket.cloud_revision_for_test();
+            move || {
+                if let Some(probe) = probe {
+                    probe.record_surface_clock("build", revision, tokio::time::Instant::now());
+                }
+                compute()
+            }
+        };
         let result = tokio::task::spawn_blocking(compute)
             .await
             .map_err(|error| format!("surface map worker join failed: {error}"))
@@ -8148,7 +8167,7 @@ async fn run_owned_surface_map_consumer(
     control: GeometryRuntimeTaskControl,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(), String> {
-    use nuwax_nav_stack::surface_map::SurfaceMapBuildError;
+    use nuwax_nav_stack::surface_map::{SurfaceMapBuildError, SurfaceMapRetryDependency};
     let (computed_tx, mut computed_rx) = tokio::sync::mpsc::channel::<SurfaceMapComputation>(1);
     // 缓存只由原单在途阻塞任务访问，接收/清空/关闭不等待计算锁。
     let cache = Arc::new(std::sync::Mutex::new(
@@ -8158,11 +8177,14 @@ async fn run_owned_surface_map_consumer(
     let mut latest_pending: Option<(
         schema::NavigationMap3D,
         crate::explore_runtime::SurfaceMapTicket,
+        Option<Arc<nuwax_map_chunks::Manifest>>,
     )> = None;
     let mut retry_after = tokio::time::Instant::now();
+    let mut retry_dependency: Option<SurfaceMapRetryDependency> = None;
     let terminal = loop {
         if !computing && tokio::time::Instant::now() >= retry_after {
-            if let Some((message, ticket)) = latest_pending.take() {
+            if let Some((message, ticket, parsed_root)) = latest_pending.take() {
+                retry_dependency = None;
                 let cache = Arc::clone(&cache);
                 let completed = computed_tx.clone();
                 let rejected_ticket = ticket.clone();
@@ -8172,7 +8194,7 @@ async fn run_owned_surface_map_consumer(
                     let retained_source = if matches!(&result, Err(SurfaceMapBuildError::IncompleteFineSource(_))) {
                         cache.retained_source_for_incomplete(&message)
                     } else { None };
-                    Ok(SurfaceMapBuildAttempt { message, result, retained_source })
+                    Ok(SurfaceMapBuildAttempt { message, parsed_root, result, retained_source })
                 };
                 match register_surface_map_build(&control, ticket, completed, compute) {
                     Ok(()) => computing = true,
@@ -8193,10 +8215,11 @@ async fn run_owned_surface_map_consumer(
                 };
                 computing = false;
                 retry_after = tokio::time::Instant::now();
+                retry_dependency = None;
                 #[cfg(test)] let finished_revision = ticket.cloud_revision_for_test();
                 match result {
                     Err(error) => { explore.finish_surface_map_update(ticket, Err(error)).await; }
-                    Ok(SurfaceMapBuildAttempt { message, result, retained_source }) => match result {
+                    Ok(SurfaceMapBuildAttempt { message, parsed_root, result, retained_source }) => match result {
                         Ok(snapshot) => { explore.finish_surface_map_update(ticket, Ok(snapshot)).await; }
                         Err(error) => {
                             let retain = if matches!(&error, SurfaceMapBuildError::IncompleteFineSource(_)) {
@@ -8205,14 +8228,27 @@ async fn run_owned_surface_map_consumer(
                                 } else { false }
                             } else { false };
                             if retain {
-                                // Back off only this same failed candidate. A
-                                // newer pending root is immediately eligible in
-                                // the original single-flight owner. Preserve the
-                                // first receipt; never send retries through begin.
+                                let missing = match &error {
+                                    SurfaceMapBuildError::IncompleteFineSource(missing) => (missing.object, missing.key),
+                                    _ => unreachable!("retention requires typed incomplete source"),
+                                };
+                                retry_dependency = parsed_root.as_ref().map(|root|
+                                    SurfaceMapRetryDependency::new(missing.0, missing.1, root, &message, retained_source));
                                 if latest_pending.is_none() {
-                                    retry_after = tokio::time::Instant::now() + Duration::from_secs(1);
-                                    latest_pending = Some((message, ticket));
+                                    // Preserve the first ticket/receipt. Retries
+                                    // never re-enter begin or refresh source TTL.
+                                    latest_pending = Some((message, ticket, parsed_root));
                                 }
+                                let still_blocked = retry_dependency.as_ref().is_some_and(|dependency|
+                                    latest_pending.as_ref().is_some_and(|(pending, _, root)|
+                                        dependency.still_blocked(pending, root.as_deref())));
+                                if still_blocked {
+                                    retry_after = tokio::time::Instant::now() + Duration::from_secs(1);
+                                    #[cfg(test)]
+                                    if let Some(probe) = topology_test_control() {
+                                        probe.record_surface_clock("backoff", finished_revision, retry_after);
+                                    }
+                                } else { retry_dependency = None; }
                             } else {
                                 // Invalid/worker/reset/domain/mask/source mismatch
                                 // keep the original finish and child cancel path.
@@ -8230,16 +8266,29 @@ async fn run_owned_surface_map_consumer(
                     Ok(frame) => frame,
                     Err(error) => break Err(format!("surface map receive failed: {error}")),
                 };
-                let message = match schema::decode_navigation_map_3d_body(&frame.payload) {
-                    Ok(message) => message,
+                let (message, parsed_root) = match schema::decode_navigation_map_3d_body_with_root(&frame.payload) {
+                    Ok((message, root)) => (message, root.map(Arc::new)),
                     Err(error) => { warn!(%error, "invalid NavigationMap3D rejected by exploration"); continue; }
                 };
-                match explore.begin_surface_map_update(&message, received).await {
-                    Ok(Some(ticket)) => {
-                        latest_pending = Some((message, ticket));
-                        retry_after = tokio::time::Instant::now();
+                let retained = retry_dependency.as_ref().and_then(|dependency| dependency.retained_source());
+                match explore.begin_surface_map_update_with_retained_source(&message, received, retained).await {
+                    Ok((Some(ticket), same_installed_source)) => {
+                        #[cfg(test)] let admitted_revision = ticket.cloud_revision_for_test();
+                        let keep_deadline = same_installed_source && retry_dependency.as_ref().is_some_and(|dependency|
+                            dependency.still_blocked(&message, parsed_root.as_deref()));
+                        latest_pending = Some((message, ticket, parsed_root));
+                        if !keep_deadline {
+                            retry_after = tokio::time::Instant::now();
+                            retry_dependency = None;
+                        }
+                        #[cfg(test)]
+                        if let Some(probe) = topology_test_control() {
+                            probe.record_surface_clock("ingress", admitted_revision, tokio::time::Instant::now());
+                        }
                     },
-                    Ok(None) => { latest_pending = None; retry_after = tokio::time::Instant::now(); }
+                    Ok((None, _)) => {
+                        latest_pending = None; retry_after = tokio::time::Instant::now(); retry_dependency = None;
+                    }
                     Err(error) => warn!(%error, "stale or foreign surface map rejected by exploration"),
                 }
             }

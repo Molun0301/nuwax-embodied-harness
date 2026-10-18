@@ -659,6 +659,12 @@ impl Default for NavigationMap3D {
 
 /// 校验三维导航地图身份、内部云头及有限三维点布局。
 pub fn validate_navigation_map_3d(message: &NavigationMap3D) -> Result<(), String> {
+    validate_navigation_map_3d_with_root(message).map(|_| ())
+}
+
+fn validate_navigation_map_3d_with_root(
+    message: &NavigationMap3D,
+) -> Result<Option<nuwax_map_chunks::Manifest>, String> {
     if message.schema_version != NAVIGATION_MAP_3D_SCHEMA_VERSION {
         return Err("unsupported NavigationMap3D schema_version".into());
     }
@@ -787,7 +793,7 @@ pub fn validate_navigation_map_3d(message: &NavigationMap3D) -> Result<(), Strin
             return Err("NavigationMap3D virtual obstacles require finite axis-aligned XY geometry and 0/100 cells".into());
         }
     }
-    if let Some(fine) = &message.fine {
+    let parsed_root = if let Some(fine) = &message.fine {
         let root = nuwax_map_chunks::Manifest::decode(&fine.root)?;
         if message.cleared || root.domain != navigation_map_3d_domain(message)
             || root.revision != message.cloud_revision as u64
@@ -811,8 +817,10 @@ pub fn validate_navigation_map_3d(message: &NavigationMap3D) -> Result<(), Strin
                 }
             }
         }
-    }
-    validate_navigation_map_3d_cloud(&message.cloud, message.cleared || message.fine.is_some())
+        Some(root)
+    } else { None };
+    validate_navigation_map_3d_cloud(&message.cloud, message.cleared || message.fine.is_some())?;
+    Ok(parsed_root)
 }
 
 /// 分块根直接复用同一消息的地图域。
@@ -1041,6 +1049,14 @@ pub fn decode_navigation_map_3d(encoded: &[u8]) -> CodecResult<NavigationMap3D> 
 
 /// 解码并验证三维导航地图的纯消息体。
 pub fn decode_navigation_map_3d_body(encoded: &[u8]) -> CodecResult<NavigationMap3D> {
+    decode_navigation_map_3d_body_with_root(encoded).map(|(message, _)| message)
+}
+
+/// Retain the root already parsed by the original admission validation. This
+/// metadata is a scheduling hint, never a replacement for Receiver validation.
+pub fn decode_navigation_map_3d_body_with_root(
+    encoded: &[u8],
+) -> CodecResult<(NavigationMap3D, Option<nuwax_map_chunks::Manifest>)> {
     let mut cursor = Cursor::new(encoded);
     let schema_version = cursor.read_i32()?;
     if schema_version != NAVIGATION_MAP_3D_SCHEMA_VERSION {
@@ -1132,8 +1148,8 @@ pub fn decode_navigation_map_3d_body(encoded: &[u8]) -> CodecResult<NavigationMa
         fine,
         cloud,
     };
-    validate_navigation_map_3d(&message).map_err(CodecError::LcmDecode)?;
-    Ok(message)
+    let root = validate_navigation_map_3d_with_root(&message).map_err(CodecError::LcmDecode)?;
+    Ok((message, root))
 }
 
 /// Fixed-width tagged identity used only by NavigationMapBlock's v3 wire body.

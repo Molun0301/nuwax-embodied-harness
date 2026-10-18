@@ -405,6 +405,18 @@ GREEN同一原release/LTO二进制51个exact全部通过：原RED与5新控制�
 
 没有一致整段收益，故不扩样、不保留理论优化，08/09两文件精确恢复HEAD93c3cf10。全部草案和原始数据留仓外；默认七包撤回检查15.00s通过，无生产改动保留。继续排查真实源更新、重试调度和缓存路径，不以正确性通过替代性能验收。
 
+## 第三十阶段：缺块重试按实际缺失依赖判断
+
+确认两个相反问题：Nav让可完整的新pending输入继承旧缺块1秒等待；F1对每个新水位取消等待，即便仍引用同一缺失对象。真实F1 RED使用原Writer/inline delta/owned memq/Reader缺块路径，root4 worker在1.233731820s进入、旧deadline2.218245658s，提前984.514ms；目标断言失败，原Arc/receipt/identity与全部owner清理断言通过。5项为1业务RED+4PASS，未用注入错误替代真实fetch；原latest-only末断言在RED后未执行。
+
+修复沿原typed缺块错误保留object/key/reason，并复用codec准入已经解析的Manifest随原pending/completion同行；原最后cloud校验、build/Receiver完整验证仍执行。原单失败状态保存有界Domain副本（session最多1024字节，仅失败时复制）、原retained source Arc和固定mask layout；不增加负缓存表、hash、owner、线程或全点云副本。相同key二分确认原对象仍被引用；key消失或替换时借用扫描，保留同object多key合法情况。
+
+两owner共同判断：仍缺同对象且未携带它时，更新latest pending但原deadline既不提前也不延长；对象不再需要或输入携带对象时，允许原完整验证立即尝试，不提前认可字节。clear/换域/epoch、typed Invalid、原source或mask保留资格失效仍原路处理，不能用缺块等待延长旧运动资格。F1在原inner锁内确认实际安装Arc，活动退避会额外读取原receiver读锁；Some mask复用原bitmap逐cell比较，有实际成本，不能称零额外加锁或恒定时间。路径失败退避、搜索预算和生产TTL均未修改。
+
+去重63项均取得PASS证据：共享6、真实Nav4、原chunk11/mask7/retry-TTL8、codec15、Geometry12。Nav用map_computer=None进入真实Reader，沿既有fixture costmap_ttl=ZERO隔离调度/身份合同，不作TTL连续运动证明；F1另有原2秒TTL控制。覆盖已有pending、在途水位、同cloud新occupancy、供块、不再依赖对象、多key引用、source Arc错配、真实mask变化、合法结构坏membership到Receiver拒绝、clear/domain及child精确取消。
+
+首轮codec C/Python互通因已装SDK header不在该子进程include路径而失败，补进程include/lib后完整C/Python3.8.10/Rust wire断言通过，无源码修复。新mask测试草案的远处1×1域合法阻挡了pose，未进入退避断言；仅测试改为0.25m、28×20、原点[-1,-1]覆盖图与边距，保留同layout和真实单cell变化后单例通过。两份前提失败均保留，不称单轮63全绿；未放宽生产或原断言。唯一target原release/LTO增量，无实机或网络吞吐收益宣称。
+
 ## 后续持续检查
 
 1. 墙前晚到路径的实际恢复与初始 full/partial/PCT 顺序，保留及时移动和真实避障

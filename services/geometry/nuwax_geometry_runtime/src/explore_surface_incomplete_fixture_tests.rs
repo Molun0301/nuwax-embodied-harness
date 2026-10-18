@@ -180,3 +180,90 @@ impl F1RealEntryFixture {
         }).await.map_err(|_| format!("missing actual finish {revision} count {count}"))
     }
 }
+
+// Append inside the EXISTING tests-only F1 fixture module.
+// Writer-generated watermark roots enter the real publication codec and original
+// consumer. No manual SurfaceSnapshot, synthetic build failure, or fake RPC.
+// Scope: consumer ingress/retry qualification, not a claim that this helper
+// exercises the full production sensor-to-canonical-commit lineage.
+impl F1RealEntryFixture {
+    pub(crate) async fn prepare_watermark_retry_series(
+        &mut self,
+        count: u64,
+        complete_last: bool,
+    ) -> Result<(schema::NavigationMap3D, Vec<schema::NavigationMap3D>), String> {
+        use nuwax_map_chunks::{LayerSource, Manifest, Writer};
+        if count == 0 { return Err("watermark series must be nonempty".into()); }
+        let complete = self.prepare_complete_candidate().await?;
+        let initial = Manifest::decode(&self.first.fine.as_ref().ok_or("initial fine root missing")?.root)?;
+        let failed = Manifest::decode(&complete.fine.as_ref().ok_or("candidate fine root missing")?.root)?;
+        if initial.domain != failed.domain || complete.cloud_revision <= self.first.cloud_revision {
+            return Err("fixture did not produce a strictly newer same-domain root".into());
+        }
+        let mask_same = match (&self.first.virtual_obstacles, &complete.virtual_obstacles) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a.header.frame_id == b.header.frame_id && a.info.width == b.info.width
+                && a.info.height == b.info.height && a.info.resolution.to_bits() == b.info.resolution.to_bits()
+                && a.info.origin == b.info.origin && a.data == b.data,
+            _ => false,
+        };
+        if !mask_same { return Err("fixture changed virtual mask; not the F1 narrow case".into()); }
+        let sealed = self.fixture.writer.lock().as_ref()
+            .and_then(CloudMapShmWriter::committed_fine_cloud).ok_or("canonical sealed root missing")?;
+        if **sealed.manifest() != failed { return Err("fixture lost canonical candidate lineage".into()); }
+        let missing = failed.blocks.iter().find(|next|
+            !initial.blocks.iter().any(|old| old.object == next.object)
+                && complete.fine.as_ref().unwrap().included.contains_key(&next.object))
+            .ok_or("candidate has no new inline object to omit")?.object;
+        let mut partial = complete.clone();
+        partial.fine.as_mut().unwrap().included.remove(&missing);
+        schema::validate_navigation_map_3d(&partial)?;
+
+        // Restore an authentic canonical root into a real Writer with the same
+        // object repository, then change ONLY source-watermark metadata. This
+        // happens before publishing the failed input or starting its deadline.
+        let mut writer = Writer::new(sealed.repository.clone(), failed.voxel_size_m, 4 * 1024 * 1024)?;
+        writer.restore(&failed)?;
+        let source = Arc::new(LayerSource::Auxiliary {
+            sensor_id: "f1-watermark-retry-fixture".into(), clock_id: "fixture-clock".into(),
+            runtime_generation: 1, session_generation: 1,
+        });
+        let mut previous = sealed;
+        let mut messages = Vec::new();
+        for index in 1..=count {
+            writer.record_source_watermark(source.clone(), failed.source_timestamp_ns, index)?;
+            let next = Arc::new(writer.seal(failed.domain.clone(), failed.revision + index,
+                failed.source_timestamp_ns)?);
+            if next.manifest().blocks != failed.blocks
+                || next.manifest().geometry_revision != failed.geometry_revision
+                || next.manifest().source_timestamp_ns != failed.source_timestamp_ns
+                || next.manifest().source_watermarks == previous.manifest().source_watermarks {
+                return Err("fixture is not a pure source-watermark publication".into());
+            }
+            // Real production inline delta deliberately carries no unchanged
+            // object, including the object the consumer still lacks.
+            let mut transfer = navigation_map_transfer::prepare(&next, Some(previous.manifest()))?;
+            if !transfer.included.is_empty() || transfer.included.contains_key(&missing) {
+                return Err("watermark delta unexpectedly supplied missing object".into());
+            }
+            if complete_last && index == count {
+                transfer = navigation_map_transfer::prepare(&next, None)?;
+                if !next.manifest().blocks.iter().all(|block| transfer.included.contains_key(&block.object)) {
+                    return Err("complete control exceeds original inline budget".into());
+                }
+            }
+            let mut message = complete.clone();
+            message.cloud_revision = i64::try_from(next.manifest().revision).map_err(|_| "root revision overflow")?;
+            message.cloud.header.seq = i32::try_from(message.cloud_revision).map_err(|_| "cloud header overflow")?;
+            // Keep the authentic complete candidate's entire occupancy/cloud
+            // receipt and mask unchanged. Only publication revision/header and
+            // Writer source-watermark root advance. This isolates watermark
+            // admission rather than relying on a synthetic occupancy advance.
+            message.fine = Some(transfer);
+            schema::validate_navigation_map_3d(&message)?;
+            messages.push(message);
+            previous = next;
+        }
+        Ok((partial, messages))
+    }
+}

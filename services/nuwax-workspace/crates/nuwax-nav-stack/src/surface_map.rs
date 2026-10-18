@@ -14,9 +14,19 @@ pub(crate) use nuwax_nav_runtime::surface_changes::SurfaceGeometryChanges;
 #[derive(Debug, thiserror::Error)]
 pub enum SurfaceMapBuildError {
     #[error("{0}")]
-    IncompleteFineSource(String),
+    IncompleteFineSource(MissingFineObject),
     #[error("{0}")]
     Invalid(String),
+}
+
+/// The original fetch closure knows the exact absent immutable object. Keep its
+/// reason for diagnostics; never recover identity by parsing that string.
+#[derive(Debug, thiserror::Error)]
+#[error("{reason}")]
+pub struct MissingFineObject {
+    pub object: nuwax_map_chunks::ObjectIdentity,
+    pub key: nuwax_map_chunks::Key,
+    pub reason: String,
 }
 
 impl From<String> for SurfaceMapBuildError {
@@ -71,6 +81,72 @@ impl MaskLayout {
             height: mask.info.height,
             position: mask.info.origin.position.map(f64::to_bits),
             orientation: mask.info.origin.orientation_xyzw.map(f64::to_bits),
+        }
+    }
+}
+
+/// One current failed dependency, owned beside the original retry deadline.
+/// This is not a negative-cache table. The source Arc is already installed;
+/// Only fixed-size mask layout and the domain (session <= 1024 bytes) are
+/// copied once per real failure; no mask/cloud/block payloads are copied.
+pub struct SurfaceMapRetryDependency {
+    object: nuwax_map_chunks::ObjectIdentity,
+    key: nuwax_map_chunks::Key,
+    domain: nuwax_map_chunks::Domain,
+    commit_boot_nonce: [u8; 16],
+    source: Option<Arc<SurfaceSnapshot>>,
+    mask: Option<MaskLayout>,
+}
+
+impl SurfaceMapRetryDependency {
+    /// `source`, when present, must have passed the owner's original installed
+    /// Arc/ticket and incomplete-mask retention checks for this failed message.
+    /// None is for Nav's already-revoked/unavailable input, never permission to
+    /// retain an executable map. F1 always supplies its proven installed Arc.
+    pub fn new(
+        object: nuwax_map_chunks::ObjectIdentity,
+        key: nuwax_map_chunks::Key,
+        root: &nuwax_map_chunks::Manifest,
+        message: &schema::NavigationMap3D,
+        source: Option<Arc<SurfaceSnapshot>>,
+    ) -> Self {
+        Self { object, key, domain: root.domain.clone(), commit_boot_nonce: message.commit_boot_nonce,
+            source, mask: message.virtual_obstacles.as_ref().map(MaskLayout::new) }
+    }
+
+    pub fn retained_source(&self) -> Option<&Arc<SurfaceSnapshot>> { self.source.as_ref() }
+
+    /// Caller first proves the retained Arc is still actually installed under
+    /// its original owner fence. Supplied bytes only permit an early attempt;
+    /// the unchanged build/Receiver path still validates every byte and binding.
+    pub fn still_blocked(
+        &self,
+        message: &schema::NavigationMap3D,
+        root: Option<&nuwax_map_chunks::Manifest>,
+    ) -> bool {
+        let (Some(root), Some(fine)) = (root, message.fine.as_ref()) else { return false; };
+        if message.cleared || self.domain != root.domain
+            || self.commit_boot_nonce != message.commit_boot_nonce
+            || fine.included.contains_key(&self.object) {
+            return false;
+        }
+        // Admission already proved strict key order. Watermark/same-key roots
+        // need only binary search. A miss/replacement is not proof of absence:
+        // the same immutable object can still be referenced at another key.
+        let same_key = root.blocks.binary_search_by_key(&self.key, |block| block.key)
+            .ok().is_some_and(|index| root.blocks[index].object == self.object);
+        if !same_key && !root.blocks.iter().any(|block| block.object == self.object) {
+            return false;
+        }
+        let Some(source) = self.source.as_ref() else { return true; };
+        match (&self.mask, &message.virtual_obstacles) {
+            (None, None) => true,
+            (Some(layout), Some(mask)) => *layout == MaskLayout::new(mask)
+                && source.matches_virtual_obstacles(
+                    [mask.info.origin.position[0], mask.info.origin.position[1]],
+                    f64::from(mask.info.resolution), mask.info.width as u32, mask.info.height as u32,
+                    mask.data.iter().map(|value| *value == 100)),
+            _ => false,
         }
     }
 }

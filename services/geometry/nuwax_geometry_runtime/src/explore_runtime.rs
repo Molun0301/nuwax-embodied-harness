@@ -422,15 +422,18 @@ pub struct ChildNavigationTicket {
     pub lease: ChildNavigationLease,
 }
 
-/// Admission failure returned before a child navigation lease becomes active.
+/// Child navigation submission failure; the variant carries any admission-stage proof.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChildNavigationSubmitError {
     /// 输入修订前进，释放候选等待新观察，不记为目标失败。
     SourceChanged(String),
     /// Navigation is temporarily unable to accept the goal; retry without feedback.
     RetryableReadiness(String),
-    /// The request is permanently rejected and must enter goal-failure policy.
+    /// Permanent rejection without proof that no execution ownership/publication occurred.
     Rejected(String),
+    /// This attempt was rejected before installing a navigation execution owner or
+    /// publishing its goal. Does not prove absence or physical stop of another owner.
+    RejectedBeforePublish(String),
     /// The exploration session's frozen navigation authority is no longer valid.
     SessionInvalidated(String),
 }
@@ -441,6 +444,7 @@ impl ChildNavigationSubmitError {
             Self::RetryableReadiness(reason)
             | Self::SourceChanged(reason)
             | Self::Rejected(reason)
+            | Self::RejectedBeforePublish(reason)
             | Self::SessionInvalidated(reason) => reason,
         }
     }
@@ -3212,31 +3216,11 @@ impl ExploreRuntimeHandle {
             }
         }
         let generation = if compute_action.is_some() { guard.generation } else { self.next_exploration_generation(&mut guard) };
-        guard.generation = generation;
-        guard.request_compute_stop(action.reason);
-        self.compute_service.wake.notify_one();
-        guard.last_stop = Some(action.reason);
-        guard.last_stop_reason = stop_reason_str(action.reason).to_string();
-        guard.last_poll = Some(ExplorationPoll::Stop(action.reason));
-        guard.pending_child_dispatch = None;
+        self.record_child_action_stop_locked(&mut guard, generation, action.reason);
 
         let Some(child) = guard.active_child.clone() else {
-            guard.progress_stopped_ns.get_or_insert_with(now_unix_nanos);
-            let status = status_for_stop_reason(action.reason);
-            let message = action.message;
-            let frontier_update = if matches!(status, STATUS_PENDING | STATUS_ACTIVE) {
-                None
-            } else {
-                guard.update_frontiers(Vec::new())
-            };
-            let snapshot = guard.snapshot(status, message);
-            let backend_available = self.readiness_cache.lock().backend_available;
-            let readiness = Self::compute_readiness_locked(
-                &guard,
-                self.expected_map_frame.as_ref(),
-                backend_available,
-                self.navigation_sink.read().is_some(),
-            );
+            let (snapshot, readiness, frontier_update) =
+                self.prepare_no_child_stop_locked(&mut guard, action);
             drop(guard);
             *self.readiness_cache.lock() = readiness;
             self.publish_frontiers(frontier_update);
@@ -3261,6 +3245,45 @@ impl ExploreRuntimeHandle {
         drop(guard);
 
         self.dispatch_child_cancellation(child, false).await
+    }
+
+    fn record_child_action_stop_locked(
+        &self,
+        guard: &mut ExploreRuntimeInner,
+        generation: u64,
+        reason: ExplorationStopReason,
+    ) {
+        guard.generation = generation;
+        guard.request_compute_stop(reason);
+        self.compute_service.wake.notify_one();
+        guard.last_stop = Some(reason);
+        guard.last_stop_reason = stop_reason_str(reason).to_string();
+        guard.last_poll = Some(ExplorationPoll::Stop(reason));
+        guard.pending_child_dispatch = None;
+    }
+
+    fn prepare_no_child_stop_locked(
+        &self,
+        guard: &mut ExploreRuntimeInner,
+        action: PendingChildAction,
+    ) -> (ExploreRuntimeSnapshot, ExplorationReadinessDetail, Option<FrontierSnapshot>) {
+        guard.progress_stopped_ns.get_or_insert_with(now_unix_nanos);
+        let status = status_for_stop_reason(action.reason);
+        let message = action.message;
+        let frontier_update = if matches!(status, STATUS_PENDING | STATUS_ACTIVE) {
+            None
+        } else {
+            guard.update_frontiers(Vec::new())
+        };
+        let snapshot = guard.snapshot(status, message);
+        let backend_available = self.readiness_cache.lock().backend_available;
+        let readiness = Self::compute_readiness_locked(
+            guard,
+            self.expected_map_frame.as_ref(),
+            backend_available,
+            self.navigation_sink.read().is_some(),
+        );
+        (snapshot, readiness, frontier_update)
     }
 
     async fn dispatch_child_cancellation(
@@ -4232,6 +4255,47 @@ impl ExploreRuntimeHandle {
             return self.snapshot();
         }
         let reason = error.reason().to_string();
+        if matches!(error, ChildNavigationSubmitError::RejectedBeforePublish(_)) {
+            // The existing frozen pending request is the one-use admission token.
+            // Check it before home identity so an old result cannot clear a newer
+            // dispatch merely because return_goal_id has already advanced.
+            let pending_matches = guard.pending_child_dispatch.as_ref().is_some_and(|pending| {
+                pending.request_id == request.request_id
+                    && pending.parent_request_id == request.parent_request_id
+            });
+            if !pending_matches {
+                return self.snapshot();
+            }
+            if guard.return_goal_id.as_deref() == Some(request.frontier_goal_id.as_str()) {
+                guard.pending_child_dispatch = None;
+                guard.no_frontier_since = None;
+                guard.return_failures = guard.return_failures.saturating_add(1);
+                if guard.return_failures
+                    > guard.active_config.as_ref().map_or(0, |config| config.max_navigation_retries)
+                {
+                    let action = PendingChildAction {
+                        reason: ExplorationStopReason::ConsecutiveFailuresExceeded,
+                        message: format!("返航派发在投递前被拒绝，已耗尽重试次数：{reason}"),
+                    };
+                    let generation = self.next_exploration_generation(&mut guard);
+                    self.record_child_action_stop_locked(&mut guard, generation, action.reason);
+                    // Current frozen pending dispatch excludes an attached child:
+                    // tick gates children/cancellation, and attach consumes pending.
+                    let (snapshot, readiness, frontier_update) =
+                        self.prepare_no_child_stop_locked(&mut guard, action);
+                    // Only this new synchronous rejection path publishes while
+                    // holding inner; the public Stop publication order is unchanged.
+                    *self.readiness_cache.lock() = readiness;
+                    self.publish_frontiers(frontier_update);
+                    return self.store_snapshot(snapshot);
+                }
+                let snapshot = guard.snapshot(
+                    STATUS_PENDING,
+                    format!("返航派发在投递前被拒绝，等待重新核验路线：{reason}"),
+                );
+                return self.store_snapshot(snapshot);
+            }
+        }
         if matches!(error, ChildNavigationSubmitError::SourceChanged(_)) {
             guard.pending_child_dispatch = None;
             guard.no_frontier_since = None;
@@ -9323,6 +9387,1220 @@ mod tests {
             assert!(!other.is_active().await);assert!(sink.submitted.lock().unwrap().is_empty());
         }
     }
+
+    #[tokio::test]
+    async fn mission_return_two_pre_admission_rejections_exhaust_original_retry_budget() {
+        const PARENT: &str = "mission-return-rejected";
+        #[derive(Debug)]
+        struct AttemptObservation {
+            snapshot: ExploreRuntimeSnapshot,
+            return_failures: u32,
+            logical_active: bool,
+            returning: bool,
+            return_goal_id: Option<String>,
+            frame_generation: i64,
+            has_active_child: bool,
+            has_pending_dispatch: bool,
+            reached_goals: u32,
+            submitted_count: usize,
+            lease_allocations: u64,
+        }
+
+        let (handle, sink) = configured_handle();
+        let map = frontier_costmap(1);
+        let identity = committed_map_identity(1, "map");
+        let mut observed = Vec::with_capacity(2);
+        let scenario = async {
+            scheme_a_race_wait(
+                "install original map receipt",
+                handle.ingest_committed_costmap_snapshot_in_frame(map.clone(), identity.clone(), 1),
+            ).await??;
+            let started = scheme_a_race_wait("start original owner", handle
+                .start_with_config(
+                    PARENT,
+                    ExploreStartConfig {
+                        motion_admission: crate::nav_runtime::test_motion_admission(),
+                        max_navigation_retries: 1,
+                        ..ExploreStartConfig::default()
+                    },
+                )).await?;
+            if started.status != STATUS_ACCEPTED {
+                return Err(format!("fixture start was not accepted: {started:#?}"));
+            }
+            // Reuse the existing real-owner mission fixture. Its frame assignment
+            // stays at the already installed frame 1; no frame change is injected.
+            enable_test_mission(&handle, Some(0.01)).await;
+            sink.submit_errors.lock().unwrap().extend((0..2).map(|_| {
+                // RecordingNavSink returns this before allocating any lease.
+                // The explicit variant is the new contract, not a Bridge inference.
+                ChildNavigationSubmitError::RejectedBeforePublish(
+                    "test permanent pre-admission rejection".to_string(),
+                )
+            }));
+
+            for _ in 0..2 {
+                // A new receipt for the same map/frame keeps the original input Arc
+                // and owner identity; do not bypass the production freshness checks.
+                scheme_a_race_wait(
+                    "refresh original map receipt",
+                    handle.ingest_committed_costmap_snapshot_in_frame(map.clone(), identity.clone(), 1),
+                ).await??;
+                let snapshot = scheme_a_race_wait("real rejection tick", handle.tick((2.0, 2.0))).await?;
+                let submitted_count = sink.submitted.lock().unwrap().len();
+                let lease_allocations = sink.next_goal_generation.load(Ordering::SeqCst);
+                let guard = handle.inner.lock().await;
+                observed.push(AttemptObservation {
+                    snapshot,
+                    return_failures: guard.return_failures,
+                    logical_active: guard.logical_active,
+                    returning: guard.mission.as_ref().is_some_and(|mission| mission.returning),
+                    return_goal_id: guard.return_goal_id.clone(),
+                    frame_generation: guard.costmap_frame_generation,
+                    has_active_child: guard.active_child.is_some(),
+                    has_pending_dispatch: guard.pending_child_dispatch.is_some(),
+                    reached_goals: guard.reached_goals,
+                    submitted_count,
+                    lease_allocations,
+                });
+            }
+            Ok::<(), String>(())
+        }.await;
+        let requests = sink.submitted.lock().unwrap().clone();
+        let remaining_errors = sink.submit_errors.lock().unwrap().len();
+        let cancel_count = sink.cancelled.lock().unwrap().len();
+        let receipt_reads = sink.receipt_reads.load(Ordering::SeqCst);
+        eprintln!("return rejection observations before cleanup: {observed:#?}; scenario={scenario:#?}");
+
+        // Capture BOTH attempts before testing the budget. Clean the still-active
+        // red path with ordinary Stop, without inventing a terminal/zero proof or
+        // replacing either observed snapshot with the cleanup result.
+        let cleanup = scheme_a_race_wait("ordinary cleanup Stop", async {
+            if handle.is_active().await { Some(handle.stop(PARENT).await) } else { None }
+        }).await;
+        let settled = scheme_a_race_wait("ordinary compute-idle cleanup", handle.await_compute_idle()).await;
+        // Idle retires the current job; it does not shut down the native owner.
+        // Always attempt both existing lifecycle steps before asserting a failure.
+        let shutdown = scheme_a_race_wait("request original compute shutdown", handle.request_compute_shutdown()).await;
+        let joined = scheme_a_race_wait("join original compute owner", handle.compute_service.join()).await;
+        assert!(shutdown.is_ok(), "compute shutdown request failed: {shutdown:?}; scenario={scenario:#?}");
+        assert!(matches!(&joined, Ok(Ok(()))), "compute owner join failed: {joined:?}; scenario={scenario:#?}");
+        assert!(matches!(&settled, Ok(Ok(()))), "compute cleanup failed: {settled:?}; scenario={scenario:#?}");
+        if let Some(cleanup) = cleanup.expect("ordinary Stop cleanup timed out") {
+            assert_eq!(cleanup.status, STATUS_CANCELLED, "{}", cleanup.message);
+        }
+        assert!(scenario.is_ok(), "fixture/body failed after cleanup: {scenario:#?}; observations={observed:#?}");
+        assert!(sink.cancelled.lock().unwrap().is_empty());
+
+        assert_eq!(requests.len(), 2, "both real-owner attempts must reach the sink");
+        assert_eq!(remaining_errors, 0, "both pre-admission errors must be consumed");
+        assert_eq!(cancel_count, 0);
+        assert_eq!(receipt_reads, 0, "there was no accepted lease to reconcile");
+        for (index, (attempt, request)) in observed.iter().zip(&requests).enumerate() {
+            assert_eq!(attempt.submitted_count, index + 1, "{attempt:#?}");
+            assert_eq!(attempt.lease_allocations, 0, "{attempt:#?}");
+            assert_eq!(attempt.frame_generation, 1, "{attempt:#?}");
+            if index == 0 {
+                assert!(attempt.returning, "{attempt:#?}");
+            }
+            assert!(!attempt.has_active_child, "{attempt:#?}");
+            assert!(!attempt.has_pending_dispatch, "{attempt:#?}");
+            assert_eq!(attempt.reached_goals, 0, "{attempt:#?}");
+            assert!(attempt.snapshot.child_task_id.is_empty(), "{attempt:#?}");
+            assert!(attempt.snapshot.child_lease.is_none(), "{attempt:#?}");
+            assert_eq!(request.parent_request_id, PARENT);
+            assert_eq!(request.request_id, format!("{PARENT}.nav.{}", index + 1));
+            assert_eq!(request.frontier_goal_id, format!("{PARENT}.return.{}", index + 1));
+            if index == 0 {
+                assert_eq!(attempt.return_goal_id.as_deref(), Some(request.frontier_goal_id.as_str()));
+            }
+            assert_eq!(request.intent.map_frame_generation, 1);
+            assert_eq!(request.intent.committed_map, identity);
+            assert_eq!(request.intent.goal.pose.position, [2.0, 2.0, 0.0]);
+            assert_eq!(request.boundary_owner.max_navigation_retries, 1);
+        }
+        assert_eq!(
+            [observed[0].return_failures, observed[1].return_failures],
+            [1, 2],
+            "one original retry permits two failures, not an unbounded return loop: {observed:#?}",
+        );
+        assert!(observed[0].logical_active, "{:#?}", observed[0]);
+        assert!(matches!(observed[0].snapshot.status, STATUS_PENDING | STATUS_ACTIVE));
+        assert!(!observed[1].logical_active, "{:#?}", observed[1]);
+        assert_eq!(observed[1].snapshot.status, STATUS_FAILED, "{:#?}", observed[1]);
+        assert_eq!(
+            observed[1].snapshot.last_stop_reason,
+            "consecutive_failures_exceeded",
+            "{:#?}", observed[1],
+        );
+    }
+
+
+    #[tokio::test]
+    async fn mission_return_generic_rejections_do_not_consume_definite_rejection_budget() {
+        const PARENT: &str = "mission-return-rejected";
+        #[derive(Debug)]
+        struct AttemptObservation {
+            snapshot: ExploreRuntimeSnapshot,
+            return_failures: u32,
+            logical_active: bool,
+            returning: bool,
+            return_goal_id: Option<String>,
+            frame_generation: i64,
+            has_active_child: bool,
+            has_pending_dispatch: bool,
+            reached_goals: u32,
+            submitted_count: usize,
+            lease_allocations: u64,
+        }
+
+        let (handle, sink) = configured_handle();
+        let map = frontier_costmap(1);
+        let identity = committed_map_identity(1, "map");
+        let mut observed = Vec::with_capacity(2);
+        let scenario = async {
+            scheme_a_race_wait(
+                "install original map receipt",
+                handle.ingest_committed_costmap_snapshot_in_frame(map.clone(), identity.clone(), 1),
+            ).await??;
+            let started = scheme_a_race_wait("start original owner", handle
+                .start_with_config(
+                    PARENT,
+                    ExploreStartConfig {
+                        motion_admission: crate::nav_runtime::test_motion_admission(),
+                        max_navigation_retries: 1,
+                        ..ExploreStartConfig::default()
+                    },
+                )).await?;
+            if started.status != STATUS_ACCEPTED {
+                return Err(format!("fixture start was not accepted: {started:#?}"));
+            }
+            // Reuse the existing real-owner mission fixture. Its frame assignment
+            // stays at the already installed frame 1; no frame change is injected.
+            enable_test_mission(&handle, Some(0.01)).await;
+            sink.submit_errors.lock().unwrap().extend((0..2).map(|_| {
+                // Even this no-lease mock cannot upgrade a generic error's contract.
+                // Real generic results can mean already/possibly published work.
+                ChildNavigationSubmitError::Rejected(
+                    "test legacy generic rejection".to_string(),
+                )
+            }));
+
+            for _ in 0..2 {
+                // A new receipt for the same map/frame keeps the original input Arc
+                // and owner identity; do not bypass the production freshness checks.
+                scheme_a_race_wait(
+                    "refresh original map receipt",
+                    handle.ingest_committed_costmap_snapshot_in_frame(map.clone(), identity.clone(), 1),
+                ).await??;
+                let snapshot = scheme_a_race_wait("real rejection tick", handle.tick((2.0, 2.0))).await?;
+                let submitted_count = sink.submitted.lock().unwrap().len();
+                let lease_allocations = sink.next_goal_generation.load(Ordering::SeqCst);
+                let guard = handle.inner.lock().await;
+                observed.push(AttemptObservation {
+                    snapshot,
+                    return_failures: guard.return_failures,
+                    logical_active: guard.logical_active,
+                    returning: guard.mission.as_ref().is_some_and(|mission| mission.returning),
+                    return_goal_id: guard.return_goal_id.clone(),
+                    frame_generation: guard.costmap_frame_generation,
+                    has_active_child: guard.active_child.is_some(),
+                    has_pending_dispatch: guard.pending_child_dispatch.is_some(),
+                    reached_goals: guard.reached_goals,
+                    submitted_count,
+                    lease_allocations,
+                });
+            }
+            Ok::<(), String>(())
+        }.await;
+        let requests = sink.submitted.lock().unwrap().clone();
+        let remaining_errors = sink.submit_errors.lock().unwrap().len();
+        let cancel_count = sink.cancelled.lock().unwrap().len();
+        let receipt_reads = sink.receipt_reads.load(Ordering::SeqCst);
+        eprintln!("return rejection observations before cleanup: {observed:#?}; scenario={scenario:#?}");
+
+        // Capture BOTH attempts before testing the budget. Clean the still-active
+        // still-active path with ordinary Stop, without inventing a terminal/zero proof or
+        // replacing either observed snapshot with the cleanup result.
+        let cleanup = scheme_a_race_wait("ordinary cleanup Stop", async {
+            if handle.is_active().await { Some(handle.stop(PARENT).await) } else { None }
+        }).await;
+        let settled = scheme_a_race_wait("ordinary compute-idle cleanup", handle.await_compute_idle()).await;
+        // Idle retires the current job; it does not shut down the native owner.
+        // Always attempt both existing lifecycle steps before asserting a failure.
+        let shutdown = scheme_a_race_wait("request original compute shutdown", handle.request_compute_shutdown()).await;
+        let joined = scheme_a_race_wait("join original compute owner", handle.compute_service.join()).await;
+        assert!(shutdown.is_ok(), "compute shutdown request failed: {shutdown:?}; scenario={scenario:#?}");
+        assert!(matches!(&joined, Ok(Ok(()))), "compute owner join failed: {joined:?}; scenario={scenario:#?}");
+        assert!(matches!(&settled, Ok(Ok(()))), "compute cleanup failed: {settled:?}; scenario={scenario:#?}");
+        if let Some(cleanup) = cleanup.expect("ordinary Stop cleanup timed out") {
+            assert_eq!(cleanup.status, STATUS_CANCELLED, "{}", cleanup.message);
+        }
+        assert!(scenario.is_ok(), "fixture/body failed after cleanup: {scenario:#?}; observations={observed:#?}");
+        assert!(sink.cancelled.lock().unwrap().is_empty());
+
+        assert_eq!(requests.len(), 2, "both real-owner attempts must reach the sink");
+        assert_eq!(remaining_errors, 0, "both generic errors must be consumed");
+        assert_eq!(cancel_count, 0);
+        assert_eq!(receipt_reads, 0, "there was no accepted lease to reconcile");
+        for (index, (attempt, request)) in observed.iter().zip(&requests).enumerate() {
+            assert_eq!(attempt.submitted_count, index + 1, "{attempt:#?}");
+            assert_eq!(attempt.lease_allocations, 0, "{attempt:#?}");
+            assert_eq!(attempt.frame_generation, 1, "{attempt:#?}");
+            if index == 0 {
+                assert!(attempt.returning, "{attempt:#?}");
+            }
+            assert!(!attempt.has_active_child, "{attempt:#?}");
+            assert!(!attempt.has_pending_dispatch, "{attempt:#?}");
+            assert_eq!(attempt.reached_goals, 0, "{attempt:#?}");
+            assert!(attempt.snapshot.child_task_id.is_empty(), "{attempt:#?}");
+            assert!(attempt.snapshot.child_lease.is_none(), "{attempt:#?}");
+            assert_eq!(request.parent_request_id, PARENT);
+            assert_eq!(request.request_id, format!("{PARENT}.nav.{}", index + 1));
+            assert_eq!(request.frontier_goal_id, format!("{PARENT}.return.{}", index + 1));
+            if index == 0 {
+                assert_eq!(attempt.return_goal_id.as_deref(), Some(request.frontier_goal_id.as_str()));
+            }
+            assert_eq!(request.intent.map_frame_generation, 1);
+            assert_eq!(request.intent.committed_map, identity);
+            assert_eq!(request.intent.goal.pose.position, [2.0, 2.0, 0.0]);
+            assert_eq!(request.boundary_owner.max_navigation_retries, 1);
+        }
+        assert_eq!(
+            [observed[0].return_failures, observed[1].return_failures],
+            [0, 0],
+            "generic errors must not consume the new definite-rejection budget: {observed:#?}",
+        );
+        assert!(observed[0].logical_active, "{:#?}", observed[0]);
+        assert!(matches!(observed[0].snapshot.status, STATUS_PENDING | STATUS_ACTIVE));
+        assert!(observed[1].logical_active, "{:#?}", observed[1]);
+        assert!(matches!(observed[1].snapshot.status, STATUS_PENDING | STATUS_ACTIVE));
+        assert_ne!(observed[1].snapshot.last_stop_reason, "consecutive_failures_exceeded");
+    }
+
+
+// Review-only excerpt; NOT applied, parsed, formatted, compiled, or executed.
+// Baseline: 332237e1. Insert in explore_runtime.rs's existing #[cfg(test)]
+// mod tests, beside two-rejections-new-contract-tests.rs after implementation
+// approval. This excerpt uses that module's existing imports and fixtures.
+//
+// Preconditions:
+// - Add ChildNavigationSubmitError::RejectedBeforePublish and its reason arm.
+// - Final admission identity is the existing generation + logical_active gate,
+//   followed by pending.request_id / pending.parent_request_id. Home branching
+//   still uses the existing return_goal_id. Payload is NOT dispatch identity.
+//   Do NOT derive PartialEq on ChildNavigationRequest or add Arc identity gates.
+//   The sink gets a clone; production's result handler gets the request retained
+//   by dispatch_child. The direct-call controls below test this private identity
+//   contract, not permission for untrusted external callers to forge a result.
+// - Keep the original configured_handle, RecordingNavSink, enable_test_mission,
+//   Stop, await_compute_idle and compute-owner lifecycle. No production hooks,
+//   wrapper projection APIs, alternate owner, or fabricated pending are used.
+// - max_navigation_retries=1 means two definite home failures exhaust the budget.
+// - Runtime execution, when separately approved, must use an approved temporary
+//   directory for configured_handle's existing reconciliation journal fixture.
+//
+// All state expected by these tests comes from real start/tick operations.
+// Only direct duplicate/mismatched RESULT delivery clones a captured request.
+// Original submit_entered/submit_release establish order; timeouts are deadlock
+// watchdogs only. There is no sleep, yield, polling loop, fake terminal or ZEROED.
+// Body results and snapshots are captured before ordinary Stop + compute-idle,
+// then original request_compute_shutdown + compute_service.join. Assertions
+// follow all cleanup steps even on contract-red paths. A watchdog may
+// abort/join a stuck test waiter, but never fabricates retirement or owner proof.
+//
+// This test-only observation is NOT a new production frozen-request type.
+#[derive(Debug, Clone, PartialEq)]
+struct SchemeARaceState {
+    generation: u64,
+    session_generation: u64,
+    parent: String,
+    logical_active: bool,
+    return_failures: u32,
+    return_goal_id: Option<String>,
+    returning: bool,
+    pending: Option<(String, String)>, // (parent_request_id, request_id)
+    active_lease: Option<ChildNavigationLease>,
+    has_pending_cancellation: bool,
+    retry_budget: Option<u32>,
+    frame_generation: i64,
+    reached_goals: u32,
+    compute_history: u64,
+    compute_fault: Option<String>,
+    status: &'static str,
+    message: String,
+    snapshot_parent: String,
+    snapshot_generation: u64,
+    snapshot_revision: u64,
+    last_stop_reason: String,
+    snapshot_child: String,
+    snapshot_lease: Option<ChildNavigationLease>,
+}
+
+async fn scheme_a_race_state(handle: &ExploreRuntimeHandle) -> SchemeARaceState {
+    let guard = handle.inner.lock().await;
+    let snapshot = handle.snapshot();
+    SchemeARaceState {
+        generation: guard.generation,
+        session_generation: guard.session_generation,
+        parent: guard.last_request_id.clone(),
+        logical_active: guard.logical_active,
+        return_failures: guard.return_failures,
+        return_goal_id: guard.return_goal_id.clone(),
+        returning: guard.mission.as_ref().is_some_and(|mission| mission.returning),
+        pending: guard.pending_child_dispatch.as_ref().map(scheme_a_request_ids),
+        active_lease: guard.active_child.as_ref().map(|child| child.lease.clone()),
+        has_pending_cancellation: guard.pending_child_cancellation.is_some(),
+        retry_budget: guard.active_config.as_ref().map(|config| config.max_navigation_retries),
+        frame_generation: guard.costmap_frame_generation,
+        reached_goals: guard.reached_goals,
+        compute_history: guard.compute.history,
+        compute_fault: guard.compute.fault.clone(),
+        status: snapshot.status,
+        message: snapshot.message,
+        snapshot_parent: snapshot.request_id,
+        snapshot_generation: snapshot.exploration_generation,
+        snapshot_revision: snapshot.revision,
+        last_stop_reason: snapshot.last_stop_reason,
+        snapshot_child: snapshot.child_task_id,
+        snapshot_lease: snapshot.child_lease,
+    }
+}
+
+// Test observations compare only existing discrete identity; no request-wide
+// PartialEq, deep bit serialization or new production hash is needed.
+fn scheme_a_request_ids(request: &ChildNavigationRequest) -> (String, String) {
+    (request.parent_request_id.clone(), request.request_id.clone())
+}
+
+fn scheme_a_submitted_ids(case: &SchemeARaceHarness) -> Vec<(String, String)> {
+    case.sink.submitted.lock().unwrap().iter().map(scheme_a_request_ids).collect()
+}
+
+fn scheme_a_definite_rejection() -> ChildNavigationSubmitError {
+    ChildNavigationSubmitError::RejectedBeforePublish(
+        "test definite rejection before owner installation and goal publication".into(),
+    )
+}
+
+fn scheme_a_race_config() -> ExploreStartConfig {
+    ExploreStartConfig {
+        motion_admission: crate::nav_runtime::test_motion_admission(),
+        max_navigation_retries: 1,
+        ..ExploreStartConfig::default()
+    }
+}
+
+async fn scheme_a_race_wait<T>(
+    label: &str,
+    future: impl std::future::Future<Output = T>,
+) -> Result<T, String> {
+    tokio::time::timeout(Duration::from_secs(5), future)
+        .await
+        .map_err(|_| format!("watchdog expired: {label}"))
+}
+
+// Owns only test waiters and references to the original fixture. It does not
+// write production state, except through the already existing mission helper.
+struct SchemeARaceHarness {
+    handle: ExploreRuntimeHandle,
+    sink: Arc<RecordingNavSink>,
+    map: ExploreCostmapSnapshot,
+    identity: schema::CommittedMapIdentity,
+    parent: &'static str,
+    release: Option<Arc<tokio::sync::Notify>>,
+    ticking: Option<tokio::task::JoinHandle<ExploreRuntimeSnapshot>>,
+}
+
+impl SchemeARaceHarness {
+    fn new(parent: &'static str) -> Self {
+        let (handle, sink) = configured_handle();
+        Self {
+            handle,
+            sink,
+            map: frontier_costmap(1),
+            identity: committed_map_identity(1, "map"),
+            parent,
+            release: None,
+            ticking: None,
+        }
+    }
+
+    async fn refresh(&self) -> Result<(), String> {
+        // Same committed map/domain/frame, with a fresh original input receipt.
+        scheme_a_race_wait(
+            "refresh original map receipt",
+            self.handle.ingest_committed_costmap_snapshot_in_frame(
+                self.map.clone(), self.identity.clone(), 1,
+            ),
+        ).await??;
+        Ok(())
+    }
+
+    async fn prepare(&self) -> Result<(), String> {
+        self.refresh().await?;
+        let started = scheme_a_race_wait(
+            "start original owner",
+            self.handle.start_with_config(self.parent, scheme_a_race_config()),
+        ).await?;
+        if started.status != STATUS_ACCEPTED {
+            return Err(format!("fixture start was not accepted: {started:#?}"));
+        }
+        // Installs no alternate controller or source. Frame stays at the
+        // already-ingested 1; the helper enables the original tiny mission.
+        enable_test_mission(&self.handle, Some(0.01)).await;
+        Ok(())
+    }
+
+    async fn completed_rejection(
+        &self,
+    ) -> Result<(ExploreRuntimeSnapshot, u64, ChildNavigationRequest), String> {
+        self.refresh().await?;
+        let generation = self.handle.inner.lock().await.generation;
+        self.sink.submit_errors.lock().unwrap().push_back(scheme_a_definite_rejection());
+        let snapshot = scheme_a_race_wait("real rejecting tick", self.handle.tick((2.0, 2.0))).await?;
+        let request = self.sink.submitted.lock().unwrap().last().cloned()
+            .ok_or_else(|| format!("real tick never reached sink: {snapshot:#?}"))?;
+        Ok((snapshot, generation, request))
+    }
+
+    async fn blocked_rejection(&mut self) -> Result<(u64, ChildNavigationRequest), String> {
+        if self.ticking.is_some() || self.release.is_some() {
+            return Err("test attempted to overlap two gated ticks".into());
+        }
+        self.refresh().await?;
+        self.sink.submit_errors.lock().unwrap().push_back(scheme_a_definite_rejection());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *self.sink.submit_release.lock().unwrap() = Some(release.clone());
+        self.release = Some(release);
+        let handle = self.handle.clone();
+        self.ticking = Some(tokio::spawn(async move { handle.tick((2.0, 2.0)).await }));
+        scheme_a_race_wait("original submit_entered gate", self.sink.submit_entered.notified()).await?;
+        // The original sink appends submitted AFTER this gate. Read the REAL
+        // frozen pending here; verify the sink's copy only after release.
+        let guard = self.handle.inner.lock().await;
+        let request = guard.pending_child_dispatch.clone()
+            .ok_or_else(|| "submit entered without a real pending request".to_string())?;
+        Ok((guard.generation, request))
+    }
+
+    fn release_submit(&mut self) {
+        *self.sink.submit_release.lock().unwrap() = None;
+        if let Some(release) = self.release.take() {
+            release.notify_one();
+        }
+    }
+
+    async fn release_tick(&mut self) -> Result<ExploreRuntimeSnapshot, String> {
+        self.release_submit();
+        let result = match self.ticking.as_mut() {
+            Some(ticking) => scheme_a_race_wait("released real tick", ticking).await,
+            None => return Err("no gated tick to release".into()),
+        };
+        // On watchdog expiry retain the JoinHandle for cleanup, rather than
+        // detaching a task still retaining the handle and its tick_gate.
+        match result {
+            Ok(joined) => {
+                self.ticking = None;
+                joined.map_err(|error| format!("gated tick failed: {error}"))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn cleanup(&mut self) -> Result<ExploreRuntimeSnapshot, String> {
+        let mut errors = Vec::new();
+        self.release_submit();
+        if let Some(mut ticking) = self.ticking.take() {
+            match scheme_a_race_wait("cleanup released tick", &mut ticking).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => errors.push(format!("cleanup tick failed: {error}")),
+                Err(error) => {
+                    errors.push(error);
+                    // Exceptional watchdog recovery only. Original Stop below
+                    // remains responsible for the exploration/compute state.
+                    ticking.abort();
+                    let _ = ticking.await;
+                }
+            }
+        }
+        // Read the current real parent because a restart test may have changed
+        // it. Never clear pending or synthesize completion as test cleanup.
+        let current_parent = self.handle.inner.lock().await.last_request_id.clone();
+        let stopped = scheme_a_race_wait("ordinary cleanup Stop", self.handle.stop(&current_parent)).await;
+        let idle = scheme_a_race_wait("ordinary compute-idle cleanup", self.handle.await_compute_idle()).await;
+        // Stop/idle settle jobs but leave the native compute owner alive. Reuse
+        // the existing final shutdown + retained join pattern even when an
+        // earlier scenario or cleanup step failed. No new thread controller.
+        let shutdown = scheme_a_race_wait("request original compute shutdown", self.handle.request_compute_shutdown()).await;
+        let joined = scheme_a_race_wait("join original compute owner", self.handle.compute_service.join()).await;
+        if let Err(error) = shutdown { errors.push(format!("compute shutdown request failed: {error}")); }
+        match joined {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) | Err(error) => errors.push(format!("compute owner join failed: {error}")),
+        }
+        if let Err(error) = &stopped { errors.push(error.clone()); }
+        if let Ok(snapshot) = &stopped {
+            if snapshot.status != STATUS_CANCELLED {
+                errors.push(format!("cleanup Stop did not cancel: {snapshot:#?}"));
+            }
+        }
+        match idle {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) | Err(error) => errors.push(format!("compute cleanup failed: {error}")),
+        }
+        if !errors.is_empty() { return Err(errors.join("; ")); }
+        stopped
+    }
+}
+
+// Called AFTER cleanup only. These are mock facts, not evidence about physical
+// retirement of a real external Nav owner, especially in the wrong-ticket case.
+fn scheme_a_assert_no_lease_side_effects(case: &SchemeARaceHarness, submitted: usize) {
+    assert_eq!(case.sink.submitted.lock().unwrap().len(), submitted);
+    assert!(case.sink.submit_errors.lock().unwrap().is_empty());
+    assert_eq!(case.sink.next_goal_generation.load(Ordering::SeqCst), 0);
+    assert_eq!(case.sink.receipt_reads.load(Ordering::SeqCst), 0);
+    assert!(case.sink.cancelled.lock().unwrap().is_empty());
+    assert!(!case.handle.orphan_cancellations.has_entries());
+}
+
+fn scheme_a_assert_home_request(request: &ChildNavigationRequest, parent: &str, sequence: u64) {
+    assert_eq!(request.parent_request_id, parent);
+    assert_eq!(request.request_id, format!("{parent}.nav.{sequence}"));
+    assert_eq!(request.frontier_goal_id, format!("{parent}.return.{sequence}"));
+    assert_eq!(request.intent.committed_map, committed_map_identity(1, "map"));
+    assert_eq!(request.intent.map_frame_generation, 1);
+    assert_eq!(request.intent.goal.pose.position, [2.0, 2.0, 0.0]);
+    assert_eq!(request.boundary_owner.max_navigation_retries, 1);
+}
+
+#[tokio::test]
+async fn scheme_a_duplicate_home_rejection_consumes_budget_once() {
+    let mut case = SchemeARaceHarness::new("scheme-a-duplicate");
+    let observed = async {
+        case.prepare().await?;
+        let (first, generation, request) = case.completed_rejection().await?;
+        let before = scheme_a_race_state(&case.handle).await;
+        let duplicate = scheme_a_race_wait("duplicate rejection", case.handle.record_dispatch_failure(
+            generation, request.clone(), scheme_a_definite_rejection(),
+        )).await?;
+        let after = scheme_a_race_state(&case.handle).await;
+        let duplicate_again = scheme_a_race_wait("second duplicate rejection", case.handle.record_dispatch_failure(
+            generation, request.clone(), scheme_a_definite_rejection(),
+        )).await?;
+        let after_again = scheme_a_race_state(&case.handle).await;
+        Ok::<_, String>((first, request, before, duplicate, after, duplicate_again, after_again))
+    }.await;
+    eprintln!("duplicate rejection before cleanup: {observed:#?}");
+    let cleanup = case.cleanup().await;
+    assert!(cleanup.is_ok(), "{cleanup:#?}; observations={observed:#?}");
+    let (first, request, before, duplicate, after, duplicate_again, after_again) = observed.expect("scenario failed");
+    scheme_a_assert_home_request(&request, case.parent, 1);
+    assert_eq!(before.return_failures, 1);
+    assert!(before.logical_active);
+    assert!(before.pending.is_none());
+    assert_eq!(before, after, "duplicate changed owner, cache, pending or compute history");
+    assert_eq!(before, after_again);
+    assert_eq!(duplicate.status, first.status);
+    assert_eq!(duplicate_again.status, first.status);
+    scheme_a_assert_no_lease_side_effects(&case, 1);
+}
+
+#[tokio::test]
+async fn scheme_a_old_home_result_cannot_consume_new_real_pending() {
+    let mut case = SchemeARaceHarness::new("scheme-a-old-result");
+    let observed = async {
+        case.prepare().await?;
+        let (first, old_generation, old_request) = case.completed_rejection().await?;
+        let first_state = scheme_a_race_state(&case.handle).await;
+        let (new_generation, new_request) = case.blocked_rejection().await?;
+        let before = scheme_a_race_state(&case.handle).await;
+        let duplicate = scheme_a_race_wait("old result against newer pending", case.handle.record_dispatch_failure(
+            old_generation, old_request.clone(), scheme_a_definite_rejection(),
+        )).await?;
+        let after = scheme_a_race_state(&case.handle).await;
+        let second = case.release_tick().await?;
+        let second_state = scheme_a_race_state(&case.handle).await;
+        Ok::<_, String>((first, first_state, old_generation, old_request, new_generation,
+            new_request, before, duplicate, after, second, second_state))
+    }.await;
+    eprintln!("old result / new pending before cleanup: {observed:#?}");
+    let cleanup = case.cleanup().await;
+    assert!(cleanup.is_ok(), "{cleanup:#?}; observations={observed:#?}");
+    let (_, first_state, old_generation, old_request, new_generation, new_request,
+        before, duplicate, after, second, second_state) = observed.expect("scenario failed");
+    scheme_a_assert_home_request(&old_request, case.parent, 1);
+    scheme_a_assert_home_request(&new_request, case.parent, 2);
+    assert_eq!(old_generation, new_generation, "this is a same-session stale request");
+    assert_eq!(before.pending.as_ref(), Some(&scheme_a_request_ids(&new_request)));
+    assert_eq!(before.return_goal_id.as_deref(), Some(new_request.frontier_goal_id.as_str()));
+    assert_ne!(old_request.frontier_goal_id, new_request.frontier_goal_id);
+    assert_eq!(before, after, "old result must not clear new pending or admit source feedback");
+    assert_eq!(duplicate.status, before.status);
+    assert_eq!([first_state.return_failures, after.return_failures, second_state.return_failures], [1, 1, 2]);
+    assert_eq!(second.status, STATUS_FAILED);
+    assert_eq!(second.last_stop_reason, "consecutive_failures_exceeded");
+    assert!(!second_state.logical_active);
+    assert!(second_state.pending.is_none());
+    assert_eq!(scheme_a_submitted_ids(&case), vec![scheme_a_request_ids(&old_request), scheme_a_request_ids(&new_request)]);
+    scheme_a_assert_no_lease_side_effects(&case, 2);
+}
+
+#[tokio::test]
+async fn scheme_a_stop_before_home_rejection_keeps_cancelled_snapshot() {
+    let mut case = SchemeARaceHarness::new("scheme-a-stop-first");
+    let observed = async {
+        case.prepare().await?;
+        let (generation, request) = case.blocked_rejection().await?;
+        let before = scheme_a_race_state(&case.handle).await;
+        let stopped = scheme_a_race_wait("Stop while submit is blocked", case.handle.stop(case.parent)).await?;
+        scheme_a_race_wait("Stop compute settlement", case.handle.await_compute_idle()).await??;
+        let after_stop = scheme_a_race_state(&case.handle).await;
+        let late = case.release_tick().await?;
+        let after_late = scheme_a_race_state(&case.handle).await;
+        Ok::<_, String>((generation, request, before, stopped, after_stop, late, after_late))
+    }.await;
+    eprintln!("Stop-before-rejection before cleanup: {observed:#?}");
+    let cleanup = case.cleanup().await;
+    assert!(cleanup.is_ok(), "{cleanup:#?}; observations={observed:#?}");
+    let (generation, request, before, stopped, after_stop, late, after_late) = observed.expect("scenario failed");
+    scheme_a_assert_home_request(&request, case.parent, 1);
+    assert_eq!(before.pending.as_ref(), Some(&scheme_a_request_ids(&request)));
+    assert_eq!(before.return_failures, 0);
+    assert_eq!(stopped.status, STATUS_CANCELLED);
+    assert!(after_stop.generation > generation);
+    assert!(!after_stop.logical_active);
+    assert!(after_stop.pending.is_none());
+    assert_eq!(after_stop.return_failures, 0);
+    assert_eq!(late.status, STATUS_CANCELLED);
+    assert_eq!(after_stop, after_late, "late pre-publication failure overwrote Stop");
+    assert_eq!(scheme_a_submitted_ids(&case), vec![scheme_a_request_ids(&request)]);
+    scheme_a_assert_no_lease_side_effects(&case, 1);
+}
+
+#[tokio::test]
+async fn scheme_a_exhausted_rejection_before_stop_preserves_newer_cancelled() {
+    let mut case = SchemeARaceHarness::new("scheme-a-reject-first");
+    let observed = async {
+        case.prepare().await?;
+        let (_, _, first_request) = case.completed_rejection().await?;
+        let first_state = scheme_a_race_state(&case.handle).await;
+        let (failed, generation, second_request) = case.completed_rejection().await?;
+        let failed_state = scheme_a_race_state(&case.handle).await;
+        let stopped = scheme_a_race_wait("Stop after exhausted failure", case.handle.stop(case.parent)).await?;
+        scheme_a_race_wait("newer Stop compute settlement", case.handle.await_compute_idle()).await??;
+        let after_stop = scheme_a_race_state(&case.handle).await;
+        let duplicate = scheme_a_race_wait("old terminal-attempt rejection", case.handle.record_dispatch_failure(
+            generation, second_request.clone(), scheme_a_definite_rejection(),
+        )).await?;
+        let after_duplicate = scheme_a_race_state(&case.handle).await;
+        Ok::<_, String>((first_request, first_state, failed, failed_state, second_request,
+            stopped, after_stop, duplicate, after_duplicate))
+    }.await;
+    eprintln!("rejection-before-Stop before cleanup: {observed:#?}");
+    let cleanup = case.cleanup().await;
+    assert!(cleanup.is_ok(), "{cleanup:#?}; observations={observed:#?}");
+    let (first_request, first_state, failed, failed_state, second_request,
+        stopped, after_stop, duplicate, after_duplicate) = observed.expect("scenario failed");
+    scheme_a_assert_home_request(&first_request, case.parent, 1);
+    scheme_a_assert_home_request(&second_request, case.parent, 2);
+    assert_eq!([first_state.return_failures, failed_state.return_failures], [1, 2]);
+    assert_eq!(failed.status, STATUS_FAILED);
+    assert_eq!(failed.last_stop_reason, "consecutive_failures_exceeded");
+    assert!(!failed_state.logical_active);
+    assert_eq!(stopped.status, STATUS_CANCELLED);
+    assert!(after_stop.generation > failed_state.generation);
+    assert_eq!(after_stop.return_failures, 2);
+    assert_eq!(duplicate.status, STATUS_CANCELLED);
+    assert_eq!(after_stop, after_duplicate);
+    scheme_a_assert_no_lease_side_effects(&case, 2);
+}
+
+async fn scheme_a_check_restart_isolation(new_parent: &'static str) {
+    let mut case = SchemeARaceHarness::new("scheme-a-restart-old");
+    let observed = async {
+        case.prepare().await?;
+        let (old_generation, old_request) = case.blocked_rejection().await?;
+        let old_state = scheme_a_race_state(&case.handle).await;
+        let stopped = scheme_a_race_wait("Stop old session", case.handle.stop(case.parent)).await?;
+        scheme_a_race_wait("retire old compute lifecycle", case.handle.await_compute_idle()).await??;
+        case.refresh().await?;
+        let restarted = scheme_a_race_wait("start while old submit is blocked", case.handle.start_with_config(
+            new_parent, scheme_a_race_config(),
+        )).await?;
+        let before_late = scheme_a_race_state(&case.handle).await;
+        // Old tick still owns tick_gate here. The requirement is that start can
+        // proceed; this test neither requests nor expects a new concurrent tick.
+        let late = case.release_tick().await?;
+        let after_late = scheme_a_race_state(&case.handle).await;
+        Ok::<_, String>((old_generation, old_request, old_state, stopped,
+            restarted, before_late, late, after_late))
+    }.await;
+    eprintln!("restart {new_parent:?} before cleanup: {observed:#?}");
+    let cleanup = case.cleanup().await;
+    assert!(cleanup.is_ok(), "{cleanup:#?}; observations={observed:#?}");
+    let (old_generation, old_request, old_state, stopped,
+        restarted, before_late, late, after_late) = observed.expect("scenario failed");
+    scheme_a_assert_home_request(&old_request, case.parent, 1);
+    assert_eq!(old_state.pending.as_ref(), Some(&scheme_a_request_ids(&old_request)));
+    assert_eq!(stopped.status, STATUS_CANCELLED);
+    assert_eq!(restarted.status, STATUS_ACCEPTED, "{}", restarted.message);
+    assert!(before_late.logical_active);
+    assert_eq!(before_late.parent, new_parent);
+    assert_eq!(before_late.snapshot_parent, new_parent);
+    assert!(before_late.generation > old_generation);
+    assert_ne!(before_late.session_generation, old_state.session_generation);
+    assert_eq!(before_late.session_generation, before_late.generation);
+    assert_eq!(before_late.return_failures, 0);
+    assert!(before_late.pending.is_none());
+    assert_eq!(late.status, STATUS_ACCEPTED);
+    assert_eq!(late.request_id, new_parent);
+    assert_eq!(before_late, after_late, "old rejection mutated new session with parent {new_parent:?}");
+    assert_eq!(scheme_a_submitted_ids(&case), vec![scheme_a_request_ids(&old_request)]);
+    scheme_a_assert_no_lease_side_effects(&case, 1);
+}
+
+#[tokio::test]
+async fn scheme_a_old_rejection_cannot_mutate_different_parent_restart() {
+    scheme_a_check_restart_isolation("scheme-a-restart-new").await;
+}
+
+#[tokio::test]
+async fn scheme_a_old_rejection_cannot_mutate_same_parent_text_restart() {
+    scheme_a_check_restart_isolation("scheme-a-restart-old").await;
+}
+
+// Two independent negative tests change exactly one existing discrete ID on
+// a RESULT copy. The actual pending request is always produced by the real tick.
+async fn scheme_a_check_single_id_mismatch(change_parent_id: bool) {
+    let parent = if change_parent_id { "scheme-a-parent-id-only" } else { "scheme-a-request-id-only" };
+    let mut case = SchemeARaceHarness::new(parent);
+    let observed = async {
+        case.prepare().await?;
+        let (generation, real_request) = case.blocked_rejection().await?;
+        let mut mismatched = real_request.clone();
+        if change_parent_id {
+            mismatched.parent_request_id.push_str(".wrong-parent");
+        } else {
+            mismatched.request_id.push_str(".wrong-attempt");
+        }
+        let before = scheme_a_race_state(&case.handle).await;
+        let ignored = scheme_a_race_wait("single-ID mismatched result", case.handle.record_dispatch_failure(
+            generation, mismatched.clone(), scheme_a_definite_rejection(),
+        )).await?;
+        let after = scheme_a_race_state(&case.handle).await;
+        let actual = case.release_tick().await?;
+        let after_actual = scheme_a_race_state(&case.handle).await;
+        Ok::<_, String>((real_request, mismatched, before, ignored, after, actual, after_actual))
+    }.await;
+    eprintln!("single-ID mismatch parent={change_parent_id} before cleanup: {observed:#?}");
+    let cleanup = case.cleanup().await;
+    assert!(cleanup.is_ok(), "{cleanup:#?}; observations={observed:#?}");
+    let (real_request, mismatched, before, ignored, after, actual, after_actual) = observed.expect("scenario failed");
+    scheme_a_assert_home_request(&real_request, parent, 1);
+    if change_parent_id {
+        assert_ne!(mismatched.parent_request_id, real_request.parent_request_id);
+        assert_eq!(mismatched.request_id, real_request.request_id);
+    } else {
+        assert_eq!(mismatched.parent_request_id, real_request.parent_request_id);
+        assert_ne!(mismatched.request_id, real_request.request_id);
+    }
+    // Fixture-control checks only: this finite payload was cloned untouched.
+    // These comparisons are NOT part of the proposed production identity guard.
+    assert_eq!(mismatched.frontier_goal_id, real_request.frontier_goal_id);
+    assert_eq!(mismatched.intent, real_request.intent);
+    assert_eq!(mismatched.goal, real_request.goal);
+    assert_eq!(mismatched.boundary_owner, real_request.boundary_owner);
+    assert_eq!(mismatched.expected_map_name, real_request.expected_map_name);
+    assert_eq!(mismatched.motion_admission, real_request.motion_admission);
+    assert_eq!(before.pending.as_ref(), Some(&scheme_a_request_ids(&real_request)));
+    assert_eq!(before.return_failures, 0);
+    assert_eq!(before, after, "mismatched ID consumed pending, budget or source feedback");
+    assert_eq!(ignored.status, before.status);
+    assert_eq!(after_actual.return_failures, 1, "real IDs must remain consumable exactly once");
+    assert!(after_actual.logical_active);
+    assert!(after_actual.pending.is_none());
+    assert!(matches!(actual.status, STATUS_PENDING | STATUS_ACTIVE));
+    assert_eq!(scheme_a_submitted_ids(&case), vec![scheme_a_request_ids(&real_request)]);
+    scheme_a_assert_no_lease_side_effects(&case, 1);
+}
+
+#[tokio::test]
+async fn scheme_a_request_id_only_mismatch_cannot_consume_home_pending() {
+    scheme_a_check_single_id_mismatch(false).await;
+}
+
+#[tokio::test]
+async fn scheme_a_parent_id_only_mismatch_cannot_consume_home_pending() {
+    scheme_a_check_single_id_mismatch(true).await;
+}
+
+// Positive identity controls: alter ONE f64 in a direct RESULT copy while keeping
+// generation, parent/request IDs and the home goal ID unchanged. The real pending
+// and original submit payload stay finite and untouched. This does NOT claim a
+// real home producer emits NaN, or authorize admitting malformed navigation data.
+async fn scheme_a_check_float_payload_is_not_identity(use_nan: bool) {
+    let parent = if use_nan { "scheme-a-nan-payload" } else { "scheme-a-signed-zero" };
+    let mut case = SchemeARaceHarness::new(parent);
+    let observed = async {
+        case.prepare().await?;
+        let (generation, real_request) = case.blocked_rejection().await?;
+        let mut reported_request = real_request.clone();
+        reported_request.intent.goal.pose.position[2] = if use_nan { f64::NAN } else { -0.0 };
+        let before = scheme_a_race_state(&case.handle).await;
+        let reported = scheme_a_race_wait("same-ID result with altered float payload", case.handle.record_dispatch_failure(
+            generation, reported_request.clone(), scheme_a_definite_rejection(),
+        )).await?;
+        let after_reported = scheme_a_race_state(&case.handle).await;
+        let duplicate = scheme_a_race_wait("duplicate same-ID altered-payload result", case.handle.record_dispatch_failure(
+            generation, reported_request.clone(), scheme_a_definite_rejection(),
+        )).await?;
+        let after_duplicate = scheme_a_race_state(&case.handle).await;
+        // Original sink now returns the queued definite rejection with the
+        // original retained request. Its discrete token was already consumed.
+        let original = case.release_tick().await?;
+        let after_original = scheme_a_race_state(&case.handle).await;
+        Ok::<_, String>((real_request, reported_request, before, reported, after_reported,
+            duplicate, after_duplicate, original, after_original))
+    }.await;
+    eprintln!("float payload identity control NaN={use_nan} before cleanup: {observed:#?}");
+    let cleanup = case.cleanup().await;
+    assert!(cleanup.is_ok(), "{cleanup:#?}; observations={observed:#?}");
+    let (real_request, reported_request, before, reported, after_reported,
+        duplicate, after_duplicate, original, after_original) = observed.expect("scenario failed");
+    scheme_a_assert_home_request(&real_request, parent, 1);
+    assert_eq!(scheme_a_request_ids(&reported_request), scheme_a_request_ids(&real_request));
+    assert_eq!(reported_request.frontier_goal_id, real_request.frontier_goal_id);
+    assert_eq!(real_request.intent.goal.pose.position[2], 0.0);
+    assert!(real_request.intent.goal.pose.position[2].is_sign_positive(), "control starts with +0.0");
+    let changed = reported_request.intent.goal.pose.position[2];
+    if use_nan {
+        assert!(changed.is_nan(), "NaN must not prevent consuming the same discrete attempt");
+    } else {
+        assert_eq!(changed, 0.0);
+        assert!(changed.is_sign_negative(), "control changes +0.0 to -0.0");
+    }
+    assert_eq!(before.pending.as_ref(), Some(&scheme_a_request_ids(&real_request)));
+    assert_eq!(before.return_failures, 0);
+    assert_eq!(after_reported.generation, before.generation);
+    assert_eq!(after_reported.return_failures, 1);
+    assert!(after_reported.logical_active);
+    assert!(after_reported.pending.is_none());
+    assert!(after_reported.active_lease.is_none());
+    assert_eq!(after_reported.compute_history, before.compute_history, "no source feedback for definite home rejection");
+    assert!(matches!(reported.status, STATUS_PENDING | STATUS_ACTIVE));
+    assert_eq!(duplicate.status, reported.status);
+    assert_eq!(original.status, reported.status);
+    assert_eq!(after_reported, after_duplicate, "duplicate same-ID report consumed twice");
+    assert_eq!(after_reported, after_original, "original submit result consumed the same ID again");
+    assert_eq!(after_original.return_failures, 1);
+    assert_eq!(scheme_a_submitted_ids(&case), vec![scheme_a_request_ids(&real_request)]);
+    let original_sink_z = case.sink.submitted.lock().unwrap()[0].intent.goal.pose.position[2];
+    assert_eq!(original_sink_z, 0.0);
+    assert!(original_sink_z.is_sign_positive(), "only the direct result copy was altered");
+    scheme_a_assert_no_lease_side_effects(&case, 1);
+}
+
+#[tokio::test]
+async fn scheme_a_nan_payload_preserves_same_id_exactly_once_consumption() {
+    scheme_a_check_float_payload_is_not_identity(true).await;
+}
+
+#[tokio::test]
+async fn scheme_a_signed_zero_payload_preserves_same_id_exactly_once_consumption() {
+    scheme_a_check_float_payload_is_not_identity(false).await;
+}
+
+#[tokio::test]
+async fn scheme_a_success_with_foreign_ticket_stays_generic_for_home_budget() {
+    let mut case = SchemeARaceHarness::new("scheme-a-foreign-ticket");
+    let observed = async {
+        case.prepare().await?;
+        let foreign = ChildNavigationLease {
+            session_id: "foreign-public-session".into(),
+            owner_kind: schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV,
+            parent_request_id: "foreign-parent".into(),
+            goal_generation: 91,
+            producer_runtime_generation: 11,
+        };
+        *case.sink.lease_override.lock().unwrap() = Some(foreign.clone());
+        case.refresh().await?;
+        let before = scheme_a_race_state(&case.handle).await;
+        // No error is enqueued: submit REALLY returns Ok(ticket) through the
+        // original lease_override seam; production validation makes it generic.
+        let returned = scheme_a_race_wait("real tick with wrong successful ticket", case.handle.tick((2.0, 2.0))).await?;
+        let request = case.sink.submitted.lock().unwrap().last().cloned()
+            .ok_or_else(|| format!("home tick did not reach original sink: {returned:#?}"))?;
+        let after = scheme_a_race_state(&case.handle).await;
+        Ok::<_, String>((foreign, before, request, returned, after))
+    }.await;
+    eprintln!("foreign-ticket generic result before cleanup: {observed:#?}");
+    let cleanup = case.cleanup().await;
+    assert!(cleanup.is_ok(), "{cleanup:#?}; observations={observed:#?}");
+    let (foreign, before, request, returned, after) = observed.expect("scenario failed");
+    scheme_a_assert_home_request(&request, case.parent, 1);
+    assert_ne!(foreign.session_id, request.request_id);
+    assert_ne!(foreign.parent_request_id, request.parent_request_id);
+    assert_ne!(foreign.owner_kind, schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD);
+    assert_eq!(before.return_failures, 0);
+    assert_eq!(after.return_failures, 0, "wrong successful ticket provides no before-publish proof");
+    assert!(after.logical_active);
+    assert!(after.returning);
+    assert!(after.pending.is_none());
+    assert!(after.active_lease.is_none());
+    assert!(!after.has_pending_cancellation);
+    assert_eq!(returned.status, STATUS_PENDING);
+    assert!(returned.message.contains("mismatched child goal lease"));
+    assert_ne!(returned.last_stop_reason, "consecutive_failures_exceeded");
+    assert!(returned.child_task_id.is_empty());
+    assert!(returned.child_lease.is_none());
+    scheme_a_assert_no_lease_side_effects(&case, 1);
+    // IMPORTANT: RecordingNavSink holds no real external Nav owner. Zero calls
+    // to cancel prove only that this mismatched foreign identity was not blindly
+    // cancelled here. Ordinary Explore Stop is test-fixture cleanup, NOT proof
+    // that a real Some/unknown external owner is retired or physically stopped.
+}
+
+// Separate integration plan, intentionally NOT approximated by a new production
+// projection wrapper in this excerpt:
+// 1. Real Bridge nonaccepted Some(attempted/existing owner), and publication /
+//    rollback failures retaining Some, must remain generic after original typed
+//    classification; verify real owner identity and original lifecycle effects.
+// 2. Real Bridge accepted=true + lease=None must remain generic; a missing lease
+//    on that accepted path is not a before-publish proof. Exercise the real producer/bridge branch when a
+//    supported existing seam can produce it; otherwise retain as source-audit /
+//    integration-test gap rather than fake success with a synthetic Nav result.
+// 3. The wrong-ticket test above covers the existing Explore consumer path only.
+//    Neither that mock nor no-cancel/no-allocation counters close real Some /
+//    accepted-without-lease / unknown-phase ownership recovery or physical-stop safety.
+
+// Review-only excerpt; NOT applied, parsed, formatted, compiled, or executed.
+// Baseline: 332237e1. Insert in explore_runtime.rs's existing #[cfg(test)]
+// mod tests after implementation approval, alongside scheme-a-race-tests.rs.
+// Reuses its scheme_a_race_wait / scheme_a_race_state / SchemeARaceState and
+// the original configured_handle, RecordingNavSink and pure assertion helper
+// assert_one_receipt_source_failure. It does NOT use the mission race harness.
+// Exact selector:
+// explore_runtime::tests::scheme_a_frontier_rejection_before_publish_preserves_source_failed_ack
+//
+// Source-checked prerequisites and evidence (baseline line numbers):
+// - R=services/geometry/nuwax_geometry_runtime/src/explore_runtime.rs.
+//   R:5864-5906 supplies a real frontier grid and complete committed identity;
+//   R:5965-5971 installs the original Wavefront runtime and RecordingNavSink.
+//   R:4642-4687 requires compatible identity/frame and renews an unchanged
+//   input receipt. This test ingests frame generation 1 BEFORE start and keeps
+//   that same identity/frame for the refresh; it never changes the live domain.
+//   R:3809-3855 preflights map identity, cancel generation, map name and selects
+//   through the original compute owner. No controller/source is replaced.
+//   R:5565-5588 records the real request, pops submit_errors, then allocates a
+//   lease. Thus this queued error is observed before any mock lease allocation.
+//   R:4273-4290 is the ordinary Failed feedback + await_feedback path which
+//   Scheme A must retain for a non-home RejectedBeforePublish request.
+// - C=services/geometry/nuwax_geometry_runtime/src/explore_compute_service.rs.
+//   C:845-911 submits feedback to the owner; C:949-964 waits for its completion;
+//   C:1829-1852 installs the ACK's committed view and increments history once.
+//   C:1099-1179 inspect_compute_checkpoint reads the SAME owner/source through
+//   the existing serialized checkpoint operation. It does not replace it.
+// - W=services/nuwax-workspace/crates/nuwax-exploration/src/wavefront_adapter.rs.
+//   W:186-192 exports (version, real session). W:399-441 matches the selected
+//   goal ID, records Failed at that goal's XY, and clears the selected frontier.
+//   nuwax-explore-wavefront/src/session.rs:150-188 stores point/failures and
+//   only blacklists after failures exceed max_navigation_retries.
+//
+// No mission/home helper, fabricated pending/result, terminal receipt, new
+// production hook, alternate source, thread control, sleep, polling, or second
+// successful navigation is used. All contract assertions follow every cleanup
+// attempt, even when the body or an earlier cleanup operation returns an error.
+// Runtime execution, if separately approved, needs an approved temporary
+// directory for configured_handle's original reconciliation journal fixture.
+
+#[tokio::test]
+async fn scheme_a_frontier_rejection_before_publish_preserves_source_failed_ack() {
+    #[derive(Debug, Default)]
+    struct Observations {
+        initial_ingest_changed: Option<bool>,
+        refresh_changed: Option<bool>,
+        started: Option<ExploreRuntimeSnapshot>,
+        before: Option<SchemeARaceState>,
+        before_mission_absent: Option<bool>,
+        before_source: Option<serde_json::Value>,
+        rejected: Option<ExploreRuntimeSnapshot>,
+        submitted: Vec<ChildNavigationRequest>,
+        after: Option<SchemeARaceState>,
+        after_mission_absent: Option<bool>,
+        after_source: Option<serde_json::Value>,
+        after_checkpoint: Option<SchemeARaceState>,
+    }
+
+    // Same original inspection as receipt_test_source_history, but errors are
+    // returned to the body instead of panicking before owner shutdown/join.
+    async fn source_history(handle: &ExploreRuntimeHandle) -> Result<serde_json::Value, String> {
+        let sources = scheme_a_race_wait(
+            "inspect original Wavefront checkpoint",
+            handle.inspect_compute_checkpoint(),
+        ).await??;
+        if sources.len() != 1 {
+            return Err(format!("expected the one original source, got {sources:#?}"));
+        }
+        let wavefront = sources.iter().find(|source| source.name == "wavefront")
+            .ok_or_else(|| format!("original Wavefront checkpoint missing: {sources:#?}"))?;
+        serde_json::from_str(&wavefront.payload)
+            .map_err(|error| format!("original Wavefront checkpoint decode failed: {error}"))
+    }
+
+    let parent = "scheme-a-frontier-before-publish";
+    let (handle, sink) = configured_handle();
+    let map = frontier_costmap(1);
+    let identity = committed_map_identity(1, "map");
+    let mut observed = Observations::default();
+    let body = async {
+        observed.initial_ingest_changed = Some(scheme_a_race_wait(
+            "initial committed map in frame 1",
+            handle.ingest_committed_costmap_snapshot_in_frame(map.clone(), identity.clone(), 1),
+        ).await??);
+        let started = scheme_a_race_wait(
+            "start original owner without mission",
+            handle.start_with_config(parent, ExploreStartConfig {
+                motion_admission: crate::nav_runtime::test_motion_admission(),
+                max_navigation_retries: 1,
+                ..ExploreStartConfig::default()
+            }),
+        ).await?;
+        observed.started = Some(started.clone());
+        if started.status != STATUS_ACCEPTED {
+            return Err(format!("ordinary frontier fixture did not start: {started:#?}"));
+        }
+        observed.before_source = Some(source_history(&handle).await?);
+        observed.before = Some(scheme_a_race_wait(
+            "capture original pre-dispatch state", scheme_a_race_state(&handle),
+        ).await?);
+        observed.before_mission_absent = Some(scheme_a_race_wait(
+            "observe mission remains disabled before tick",
+            async { handle.inner.lock().await.mission.is_none() },
+        ).await?);
+        // A real receipt refresh avoids aging out while checkpointing. Neither
+        // the grid, committed identity, nor frame generation is changed.
+        observed.refresh_changed = Some(scheme_a_race_wait(
+            "refresh unchanged original committed map receipt",
+            handle.ingest_committed_costmap_snapshot_in_frame(map.clone(), identity.clone(), 1),
+        ).await??);
+        sink.submit_errors.lock()
+            .map_err(|_| "original sink error queue lock poisoned".to_string())?
+            .push_back(ChildNavigationSubmitError::RejectedBeforePublish(
+                "ordinary frontier rejected before owner installation and goal publication".into(),
+            ));
+        observed.rejected = Some(scheme_a_race_wait(
+            "real ordinary frontier tick and Failed ACK", handle.tick((2.0, 2.0)),
+        ).await?);
+        observed.submitted = sink.submitted.lock()
+            .map_err(|_| "original sink submitted lock poisoned".to_string())?.clone();
+        observed.after = Some(scheme_a_race_wait(
+            "capture post-ACK state before checkpoint", scheme_a_race_state(&handle),
+        ).await?);
+        observed.after_mission_absent = Some(scheme_a_race_wait(
+            "observe mission remains disabled after rejection",
+            async { handle.inner.lock().await.mission.is_none() },
+        ).await?);
+        observed.after_source = Some(source_history(&handle).await?);
+        observed.after_checkpoint = Some(scheme_a_race_wait(
+            "capture state after original source inspection", scheme_a_race_state(&handle),
+        ).await?);
+        Ok::<(), String>(())
+    }.await;
+    eprintln!("ordinary frontier rejection before cleanup: body={body:#?}; observed={observed:#?}");
+
+    // Deliberately no ?, unwrap, expect, or assertion between these cleanup
+    // operations: a failed Stop/idle/shutdown still cannot skip shutdown/join.
+    let stopped = scheme_a_race_wait("ordinary frontier cleanup Stop", handle.stop(parent)).await;
+    let idle = scheme_a_race_wait("ordinary frontier compute-idle cleanup", handle.await_compute_idle()).await;
+    let shutdown = scheme_a_race_wait("request original compute shutdown", handle.request_compute_shutdown()).await;
+    let joined = scheme_a_race_wait("join original compute owner", handle.compute_service.join()).await;
+    let mut cleanup_errors = Vec::new();
+    match &stopped {
+        Ok(snapshot) if snapshot.status == STATUS_CANCELLED => {}
+        Ok(snapshot) => cleanup_errors.push(format!("cleanup Stop did not cancel: {snapshot:#?}")),
+        Err(error) => cleanup_errors.push(format!("cleanup Stop failed: {error}")),
+    }
+    if let Err(error) = &shutdown {
+        cleanup_errors.push(format!("compute shutdown request failed: {error}"));
+    }
+    match &idle {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) | Err(error) => cleanup_errors.push(format!("compute idle failed: {error}")),
+    }
+    match &joined {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) | Err(error) => cleanup_errors.push(format!("compute owner join failed: {error}")),
+    }
+    assert!(cleanup_errors.is_empty(), "cleanup={cleanup_errors:#?}; body={body:#?}; observed={observed:#?}");
+    assert!(body.is_ok(), "body={body:#?}; observed={observed:#?}");
+
+    let before = observed.before.as_ref().expect("captured initial state");
+    let after = observed.after.as_ref().expect("captured post-ACK state");
+    let after_checkpoint = observed.after_checkpoint.as_ref().expect("captured post-inspection state");
+    let before_source = observed.before_source.as_ref().expect("initial source checkpoint");
+    let after_source = observed.after_source.as_ref().expect("post-rejection source checkpoint");
+    let rejected = observed.rejected.as_ref().expect("real tick result");
+    assert_eq!(observed.initial_ingest_changed, Some(true));
+    assert_eq!(observed.refresh_changed, Some(false));
+    assert_eq!(observed.before_mission_absent, Some(true));
+    assert_eq!(observed.after_mission_absent, Some(true));
+    assert_eq!(observed.submitted.len(), 1, "must reach the original sink with one real frontier");
+    let request = &observed.submitted[0];
+    assert_eq!(request.parent_request_id, parent);
+    assert_eq!(request.request_id, format!("{parent}.nav.1"));
+    assert!(!request.frontier_goal_id.is_empty());
+    assert!(!request.frontier_goal_id.starts_with(&format!("{parent}.return.")));
+    assert_eq!(request.goal.id, request.request_id);
+    assert_eq!(request.intent.committed_map, identity);
+    assert_eq!(request.intent.map_frame_generation, 1);
+    assert_eq!(request.intent.producer, "wavefront");
+    assert_eq!(request.intent.owner_kind, schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD);
+    assert_eq!(request.expected_map_name, "map");
+    assert_eq!(request.motion_admission, crate::nav_runtime::test_motion_admission());
+    assert_eq!(request.boundary_owner.max_navigation_retries, 1);
+    assert!(!request.boundary_owner.return_policy.enabled());
+    for state in [before, after, after_checkpoint] {
+        assert!(state.logical_active);
+        assert!(!state.returning);
+        assert!(state.return_goal_id.is_none());
+        assert_eq!(state.return_failures, 0, "ordinary frontier must not consume home retry budget");
+        assert!(state.pending.is_none());
+        assert!(state.active_lease.is_none());
+        assert!(!state.has_pending_cancellation);
+        assert!(state.compute_fault.is_none());
+        assert_eq!(state.frame_generation, 1);
+        assert_eq!(state.reached_goals, 0);
+        assert_eq!(state.parent, parent);
+        assert_eq!(state.generation, before.generation);
+        assert_eq!(state.session_generation, before.session_generation);
+    }
+    assert_eq!(rejected.status, STATUS_PENDING);
+    assert_eq!(rejected.selected_source, "wavefront");
+    assert!(rejected.child_task_id.is_empty());
+    assert!(rejected.child_lease.is_none());
+    assert_eq!(rejected.frontier_count, 0, "the actual source must release its selected frontier");
+    assert_eq!(before.compute_history.checked_add(1), Some(after.compute_history),
+        "ordinary dispatch rejection must await exactly one owner Feedback ACK");
+    assert_eq!(after_checkpoint.compute_history, after.compute_history,
+        "checkpoint inspection must not manufacture another feedback/history increment");
+    assert_eq!(before_source[1]["failed_goals"], serde_json::json!([]));
+    assert_eq!(before_source[1]["consecutive_failures"], serde_json::json!(0));
+    assert_eq!(before_source[1]["blacklisted_goals"], serde_json::json!([]));
+    assert_one_receipt_source_failure(after_source);
+    assert_eq!(after_source[1]["consecutive_failures"], serde_json::json!(1));
+    assert_eq!(after_source[1]["failed_goals"][0]["point"], serde_json::json!({
+        "x": request.goal.target.pose.position.x,
+        "y": request.goal.target.pose.position.y,
+    }), "failure belongs to the original source's selected frontier position");
+    assert_eq!(after_source[1]["explored_goals"], before_source[1]["explored_goals"]);
+    assert!(sink.submit_errors.lock().unwrap().is_empty());
+    assert_eq!(sink.submitted.lock().unwrap().len(), 1);
+    assert_eq!(sink.next_goal_generation.load(Ordering::SeqCst), 0);
+    assert_eq!(sink.receipt_reads.load(Ordering::SeqCst), 0);
+    assert!(sink.cancelled.lock().unwrap().is_empty());
+    assert!(!handle.orphan_cancellations.has_entries());
+}
 
     async fn enable_test_mission(handle:&ExploreRuntimeHandle,limit:Option<f64>) {
         let mut guard=handle.inner.lock().await;

@@ -335,6 +335,16 @@ Writer::seal 只在原 same_domain 且 changed_members 为空时，按新旧相�
 
 最终精确恢复已验证 B 源码，再增量 check/no-run、默认七包检查通过，无第三次 B 计时，单一 target 继续复用。未应用此前无收益的 BFS P1 和未命中热点的 indexed-Z02。原 urgent cancellation、UDP/UDS及实机失败范围保留。
 
+## 第二十三阶段：明确未投递的返航拒绝进入原失败预算
+
+真实复现：返航预算允许一次重试，但两次已知 admission 前拒绝后的 return_failures 仍为 [0,0]，原预期是 [1,2]。该 home 标识不属于普通 source，旧 source Failed 反馈不能替代返航预算结算；旧回报还可能清掉正在等待的另一请求。
+
+Bridge 保留原 typed readiness/source/session 分类优先，只对确定本次没有安装执行 owner、没有发布 Goal 的拒绝给出 RejectedBeforePublish。非 accepted + None lease 的原产生点均符合此事实；Some lease、accepted 无 lease、错票和 reply 丢失不被强转为“没发出”。返航结算在原 inner 临界区内依据原 generation/request/parent 身份一次性消费 pending、累加原预算并提交耗尽结果；不添加浮点 payload 相等、Arc 身份或哈希门槛。普通 frontier 继续原 source Failed/ACK，两段同步 Stop helper 复用原逻辑，公共 Stop 发布顺序保持。
+
+RED 先只加入分类和测试，原结算不动：24 新 exact 中 16 通过、8 个逻辑断言失败，原 39 项全部通过。主预算、旧回报及单独 request/parent 不匹配确实到达目标断言；其他用例先在预算处失败，未声称 RED 覆盖后续每个断言。GREEN 只补剩余三个结算 hunk，24+39 共 63 个 exact 全通过，含原 17 项终态/取消控制（去重），覆盖 Stop 两序、重启、重复/旧请求、普通 frontier 真 source ACK 和 Bridge 分类。测试收尾执行原 shutdown/join，全部原失败日志保留。
+
+使用真实 geometry bin 默认 real-lcm-bridge 的原 release/LTO，增量 GREEN check54.60s/no-run14m08s；既有 GTSAM fresh，无 SDK 下载重建或新 target。两项原真实 UDPM 期待迁移仅编译、未运行，不记通过；新 Bridge 验证使用 RecordingBackend。发布后未知归属、reply/rollback 故障和物理停稳没有被本次小修解决，不将逻辑预算终态冒充运动停止证明。
+
 ## 后续持续检查
 
 1. 墙前晚到路径的实际恢复与初始 full/partial/PCT 顺序，保留及时移动和真实避障

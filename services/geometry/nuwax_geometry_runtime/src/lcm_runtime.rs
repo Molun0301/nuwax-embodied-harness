@@ -5896,7 +5896,7 @@ impl crate::explore_runtime::ExploreNavigationSink for ExploreNavigationBridge {
             || request.intent.owner_kind != schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD
         {
             return Err(
-                crate::explore_runtime::ChildNavigationSubmitError::Rejected(
+                crate::explore_runtime::ChildNavigationSubmitError::RejectedBeforePublish(
                     "wavefront child request does not match its frozen GoalIntent".to_string(),
                 ),
             );
@@ -5935,11 +5935,23 @@ impl crate::explore_runtime::ExploreNavigationSink for ExploreNavigationBridge {
         let reject_reason = outcome.reject_reason;
         self.publish_state(outcome.state, outcome.lease).await;
         if !accepted {
-            return Err(classify_exploration_submit_rejection(
+            let rejection = classify_exploration_submit_rejection(
                 retry_reason,
                 reject_reason,
                 message,
-            ));
+            );
+            // Preserve the original typed readiness/source/session policy first.
+            // All current nonaccepted None-lease returns from admit_goal_intent
+            // precede installing this attempt's active owner and goal publish.
+            // New producers must preserve that invariant; Some is not stage proof.
+            return Err(match rejection {
+                crate::explore_runtime::ChildNavigationSubmitError::Rejected(message)
+                    if lease.is_none() =>
+                {
+                    crate::explore_runtime::ChildNavigationSubmitError::RejectedBeforePublish(message)
+                }
+                rejection => rejection,
+            });
         }
         let lease = lease.as_ref().map(exploration_child_lease).ok_or_else(|| {
             crate::explore_runtime::ChildNavigationSubmitError::Rejected(
@@ -21756,6 +21768,310 @@ mod exploration_cancel_retry_tests {
         (bridge, backend, lease)
     }
 
+
+fn scheme_a_goal_frame_count(backend: &RecordingBackend) -> usize {
+    backend.frames.lock().expect("recorded frames").iter()
+        .filter(|frame| frame.msg_type.fqn() == "nuwax_msgs.GoalEnvelope")
+        .count()
+}
+
+fn scheme_a_child_request(
+    bridge: &ExploreNavigationBridge,
+    request_id: &str,
+) -> crate::explore_runtime::ChildNavigationRequest {
+    use nuwax_nav_types_messages::frames::NavFrameId;
+    use nuwax_nav_types_messages::geometry::{Point3, Pose3, PoseStamped, Quaternion, Timestamp};
+    use nuwax_nav_types_messages::goal::{GoalSource, NavigationGoal};
+
+    let parent = "scheme-a-return-parent";
+    let committed_map = bridge.committed_map_authority.lock()
+        .expect("fixture committed map authority").clone()
+        .expect("fixture committed map identity");
+    let intent = test_wavefront_goal_intent(
+        request_id,
+        parent,
+        bridge.exploration_producer_epoch.load(std::sync::atomic::Ordering::Acquire),
+        bridge.nav.cancel_snapshot().generation,
+        committed_map,
+    );
+    let target = PoseStamped {
+        frame_id: NavFrameId::Map,
+        stamp: Timestamp::from_unix(
+            i64::from(intent.goal.header.stamp_sec),
+            intent.goal.header.stamp_nsec as u32,
+        ),
+        pose: Pose3 {
+            position: Point3 {
+                x: intent.goal.pose.position[0],
+                y: intent.goal.pose.position[1],
+                z: intent.goal.pose.position[2],
+            },
+            orientation: Quaternion::IDENTITY,
+        },
+    };
+    crate::explore_runtime::ChildNavigationRequest {
+        parent_request_id: parent.to_string(),
+        request_id: request_id.to_string(),
+        expected_map_name: "office".to_string(),
+        motion_admission: crate::nav_runtime::test_motion_admission(),
+        frontier_goal_id: "scheme-a-home".to_string(),
+        goal: NavigationGoal::new("scheme-a-home", target)
+            .with_source(GoalSource::Frontier).with_priority(100),
+        intent,
+        boundary_owner: Arc::new(crate::explore_runtime::ExploreStartConfig::default()),
+    }
+}
+
+// This TEST-ONLY adapter calls the existing real admission function unchanged.
+// It does not manufacture outcomes or move the production Bridge classifier.
+// Its role is to establish the raw lease/cause precondition before submitting
+// the same rejected request through the actual Bridge.
+async fn scheme_a_real_admission(
+    bridge: &ExploreNavigationBridge,
+    request: &crate::explore_runtime::ChildNavigationRequest,
+) -> crate::nav_runtime::SetGoalOutcome {
+    let context = crate::nav_runtime::NavAdmissionContext::with_expected_map_name(
+        bridge.mapping_lifecycle_lock.clone(),
+        bridge.committed_map_authority.clone(),
+        bridge.map_revision_latest_tx.subscribe(),
+        Some(request.expected_map_name.clone()),
+    ).with_mapping_adapter(bridge.mapping_adapter.clone())
+        .with_previous_map_revisions(true);
+    let io = crate::nav_runtime::NavAdmissionIo::new(
+        bridge.state.clone(),
+        bridge.transport.clone(),
+        bridge.transport_backend_name,
+        bridge.lcm_backend_available,
+        bridge.body_reference_frame_id.clone(),
+    );
+    crate::nav_runtime::admit_goal_intent(
+        &context, &io, &bridge.nav, request.intent.clone(),
+        crate::nav_runtime::GoalProducerEpochAuthority::Wavefront {
+            current_session_generation: bridge.exploration_producer_epoch.clone(),
+            boundary_owner: request.boundary_owner.clone(),
+        },
+    ).await
+}
+
+#[tokio::test]
+async fn scheme_a_real_bridge_permanent_none_is_before_publish() {
+    use crate::explore_runtime::{ChildNavigationSubmitError, ExploreNavigationSink};
+
+    let (bridge, backend) = configured_bridge().await;
+    let mut request = scheme_a_child_request(&bridge, "scheme-a-invalid-frame");
+    // Keeps frozen request/producer identity valid; Nav's actual GoalIntent
+    // validation rejects this semantic frame before lease CAS/publication.
+    request.intent.goal.header.frame_id = "odom".to_string();
+    let cancel_before = bridge.nav.cancel_snapshot();
+    let raw = scheme_a_real_admission(&bridge, &request).await;
+    assert_eq!(raw.state.status, "FAILED");
+    assert!(raw.lease.is_none());
+    assert_eq!(raw.retry_reason, None);
+    assert_eq!(raw.reject_reason, None);
+    assert!(bridge.nav.active_goal_lease().await.is_none());
+    assert_eq!(scheme_a_goal_frame_count(&backend), 0);
+
+    assert_eq!(
+        bridge.submit(request).await.expect_err("actual pre-publication rejection"),
+        ChildNavigationSubmitError::RejectedBeforePublish(raw.state.message),
+    );
+    assert!(bridge.nav.active_goal_lease().await.is_none());
+    assert_eq!(scheme_a_goal_frame_count(&backend), 0);
+    assert_eq!(backend.cancel_count(), 0);
+    assert_eq!(bridge.nav.cancel_snapshot(), cancel_before);
+    assert!(bridge.nav.terminal_receipts().await.is_empty());
+}
+
+#[tokio::test]
+async fn scheme_a_real_bridge_frozen_request_mismatch_is_before_publish() {
+    use crate::explore_runtime::{ChildNavigationSubmitError, ExploreNavigationSink};
+
+    let (bridge, backend) = configured_bridge().await;
+    let mut request = scheme_a_child_request(&bridge, "scheme-a-frozen-identity");
+    request.intent.parent_request_id.push_str("-different-owner");
+    let cancel_before = bridge.nav.cancel_snapshot();
+    assert!(matches!(bridge.submit(request).await,
+        Err(ChildNavigationSubmitError::RejectedBeforePublish(_))));
+    assert!(bridge.nav.active_goal_lease().await.is_none());
+    assert_eq!(scheme_a_goal_frame_count(&backend), 0);
+    assert_eq!(backend.cancel_count(), 0);
+    assert_eq!(bridge.nav.cancel_snapshot(), cancel_before);
+    assert!(bridge.nav.terminal_receipts().await.is_empty());
+}
+
+#[tokio::test]
+async fn scheme_a_real_bridge_none_readiness_is_not_promoted_to_permanent() {
+    use crate::explore_runtime::{ChildNavigationSubmitError, ExploreNavigationSink};
+    use crate::nav_runtime::{MotionSinkObservation, NavigationReadinessCode, SetGoalRetryReason};
+
+    let (bridge, backend) = configured_bridge().await;
+    let request = scheme_a_child_request(&bridge, "scheme-a-motion-not-ready");
+    bridge.nav.observe_motion_sink(MotionSinkObservation { generation: 2, ready: false })
+        .expect("actual typed not-ready observation");
+    let cancel_before = bridge.nav.cancel_snapshot();
+    let raw = scheme_a_real_admission(&bridge, &request).await;
+    assert_eq!(raw.state.status, "FAILED");
+    assert!(raw.lease.is_none());
+    assert_eq!(raw.retry_reason, Some(SetGoalRetryReason::NavigationNotReady(
+        NavigationReadinessCode::MotionSinkNotReady,
+    )));
+    assert_eq!(raw.reject_reason, None);
+    assert_eq!(bridge.submit(request).await.expect_err("typed readiness rejection"),
+        ChildNavigationSubmitError::RetryableReadiness(raw.state.message));
+    assert!(bridge.nav.active_goal_lease().await.is_none());
+    assert_eq!(scheme_a_goal_frame_count(&backend), 0);
+    assert_eq!(backend.cancel_count(), 0);
+    assert_eq!(bridge.nav.cancel_snapshot(), cancel_before);
+}
+
+#[tokio::test]
+async fn scheme_a_real_bridge_none_source_changed_keeps_source_policy() {
+    use crate::explore_runtime::{ChildNavigationSubmitError, ExploreNavigationSink};
+    use crate::nav_runtime::SetGoalRetryReason;
+
+    let (bridge, backend) = configured_bridge().await;
+    let request = scheme_a_child_request(&bridge, "scheme-a-source-unavailable");
+    // Request retains its valid frozen receipt. Temporarily absent authoritative
+    // input is an existing typed MapRevisionAdvanced path, not a permanent goal.
+    *bridge.committed_map_authority.lock().expect("fixture authority") = None;
+    let cancel_before = bridge.nav.cancel_snapshot();
+    let raw = scheme_a_real_admission(&bridge, &request).await;
+    assert_eq!(raw.state.status, "FAILED");
+    assert!(raw.lease.is_none());
+    assert_eq!(raw.retry_reason, Some(SetGoalRetryReason::MapRevisionAdvanced));
+    assert_eq!(raw.reject_reason, None);
+    assert_eq!(bridge.submit(request).await.expect_err("typed source rejection"),
+        ChildNavigationSubmitError::SourceChanged(raw.state.message));
+    assert!(bridge.nav.active_goal_lease().await.is_none());
+    assert_eq!(scheme_a_goal_frame_count(&backend), 0);
+    assert_eq!(backend.cancel_count(), 0);
+    assert_eq!(bridge.nav.cancel_snapshot(), cancel_before);
+}
+
+#[tokio::test]
+async fn scheme_a_real_bridge_none_session_changes_keep_session_policy() {
+    use crate::explore_runtime::{ChildNavigationSubmitError, ExploreNavigationSink};
+    use crate::nav_runtime::SetGoalRejectReason;
+
+    for reject in [SetGoalRejectReason::MapFrameChanged, SetGoalRejectReason::ActiveMapNameChanged] {
+        let (bridge, backend) = configured_bridge().await;
+        let mut request = scheme_a_child_request(&bridge, "scheme-a-session-invalidated");
+        match reject {
+            SetGoalRejectReason::MapFrameChanged => request.intent.map_frame_generation = 1,
+            SetGoalRejectReason::ActiveMapNameChanged => {
+                request.expected_map_name = "a-different-map-name".to_string();
+            }
+        }
+        let cancel_before = bridge.nav.cancel_snapshot();
+        let raw = scheme_a_real_admission(&bridge, &request).await;
+        assert_eq!(raw.state.status, "FAILED");
+        assert!(raw.lease.is_none());
+        assert_eq!(raw.retry_reason, None);
+        assert_eq!(raw.reject_reason, Some(reject));
+        assert_eq!(bridge.submit(request).await.expect_err("typed session rejection"),
+            ChildNavigationSubmitError::SessionInvalidated(raw.state.message));
+        assert!(bridge.nav.active_goal_lease().await.is_none());
+        assert_eq!(scheme_a_goal_frame_count(&backend), 0);
+        assert_eq!(backend.cancel_count(), 0);
+        assert_eq!(bridge.nav.cancel_snapshot(), cancel_before);
+    }
+}
+
+// ========================== SECTION C ==========================
+// Also inside exploration_cancel_retry_tests. These tests must remain pure local
+// RecordingBackend fixtures. They preserve the exact active Nav owner through
+// every assertion, never issue cancellation, and never invent a terminal/Zeroed.
+// Fixture memory release is not asserted to mean physical stop or Nav retirement.
+
+#[tokio::test]
+async fn scheme_a_real_bridge_some_busy_keeps_generic_rejection() {
+    let (bridge, backend, active) = start_goal("scheme-a-live-owner-busy").await;
+    assert_eq!(bridge.transport.backend_name(), "recording");
+    scheme_a_assert_real_bridge_some_busy_keeps_generic_rejection(
+        &bridge, &backend, &active,
+    ).await;
+    assert_eq!(bridge.nav.active_goal_lease().await.as_ref(), Some(&active));
+    // No spawned worker or real transport exists. Only local fixture memory drops.
+}
+
+#[tokio::test]
+async fn scheme_a_real_bridge_none_proof_is_only_for_this_attempt() {
+    let (bridge, backend, active) = start_goal("scheme-a-live-owner-none").await;
+    assert_eq!(bridge.transport.backend_name(), "recording");
+    scheme_a_assert_none_rejection_does_not_stop_another_owner(
+        &bridge, &backend, &active,
+    ).await;
+    assert_eq!(bridge.nav.active_goal_lease().await.as_ref(), Some(&active));
+    // No spawned worker or real transport exists. Only local fixture memory drops.
+}
+
+async fn scheme_a_assert_real_bridge_some_busy_keeps_generic_rejection(
+    bridge: &ExploreNavigationBridge,
+    backend: &RecordingBackend,
+    active: &crate::nav_runtime::GoalLease,
+) {
+    use crate::explore_runtime::{ChildNavigationSubmitError, ExploreNavigationSink};
+
+    assert_eq!(bridge.nav.active_goal_lease().await.as_ref(), Some(active));
+    assert_eq!(bridge.nav.cancel_snapshot().phase, crate::nav_runtime::CancelPhase::Idle);
+    let request = scheme_a_child_request(bridge, "scheme-a-second-owner");
+    assert_ne!(request.request_id, active.session_id);
+    let frames_before = scheme_a_goal_frame_count(backend);
+    assert_eq!(frames_before, 1, "start_goal must have actually published the first goal");
+    let cancels_before = backend.cancel_count();
+    assert_eq!(cancels_before, 0, "the local fixture never started cancellation");
+    let cancel_before = bridge.nav.cancel_snapshot();
+
+    // Directly inspect the real nonaccepted+Some premise. This attempt only
+    // allocates an attempted lease; the active owner is not replaced.
+    let raw = scheme_a_real_admission(bridge, &request).await;
+    assert_eq!(raw.state.status, "FAILED");
+    assert_eq!(raw.retry_reason, None);
+    assert_eq!(raw.reject_reason, None);
+    let attempted = raw.lease.expect("actual busy CAS branch retains attempted Some lease");
+    assert_eq!(attempted.session_id, request.request_id);
+    assert_ne!(attempted, *active);
+    assert_eq!(bridge.nav.active_goal_lease().await.as_ref(), Some(active));
+
+    let error = bridge.submit(request).await.expect_err("existing owner prevents admission");
+    assert!(matches!(&error, ChildNavigationSubmitError::Rejected(_)),
+        "nonaccepted Some must remain generic, got {error:?}");
+    assert_eq!(scheme_a_goal_frame_count(backend), frames_before);
+    assert_eq!(backend.cancel_count(), cancels_before);
+    assert_eq!(bridge.nav.cancel_snapshot(), cancel_before);
+    assert_eq!(bridge.nav.active_goal_lease().await.as_ref(), Some(active));
+    assert!(bridge.nav.terminal_receipts().await.is_empty());
+}
+
+async fn scheme_a_assert_none_rejection_does_not_stop_another_owner(
+    bridge: &ExploreNavigationBridge,
+    backend: &RecordingBackend,
+    active: &crate::nav_runtime::GoalLease,
+) {
+    use crate::explore_runtime::{ChildNavigationSubmitError, ExploreNavigationSink};
+
+    assert_eq!(bridge.nav.active_goal_lease().await.as_ref(), Some(active));
+    let mut request = scheme_a_child_request(bridge, "scheme-a-invalid-second-request");
+    request.intent.goal.header.frame_id = "odom".to_string();
+    let goals_before = scheme_a_goal_frame_count(backend);
+    let cancels_before = backend.cancel_count();
+    assert_eq!(cancels_before, 0, "the local fixture never started cancellation");
+    let cancel_before = bridge.nav.cancel_snapshot();
+    let raw = scheme_a_real_admission(bridge, &request).await;
+    assert_eq!(raw.state.status, "FAILED");
+    assert!(raw.lease.is_none());
+    assert_eq!(raw.retry_reason, None);
+    assert_eq!(raw.reject_reason, None);
+    assert_eq!(bridge.submit(request).await.expect_err("invalid attempt before CAS"),
+        ChildNavigationSubmitError::RejectedBeforePublish(raw.state.message));
+    assert_eq!(bridge.nav.active_goal_lease().await.as_ref(), Some(active));
+    assert_eq!(bridge.nav.cancel_snapshot(), cancel_before);
+    assert_eq!(scheme_a_goal_frame_count(backend), goals_before);
+    assert_eq!(backend.cancel_count(), cancels_before);
+    assert!(bridge.nav.terminal_receipts().await.is_empty());
+}
+
+
     async fn start_cancel(
         goal_id: &str,
     ) -> (
@@ -22964,6 +23280,115 @@ mod exploration_lcm_smoke_tests {
         }
     }
 
+
+#[test]
+fn scheme_a_all_thirteen_typed_readiness_causes_keep_retry_policy() {
+    use crate::explore_runtime::ChildNavigationSubmitError;
+    use crate::nav_runtime::{NavigationReadinessCode as Code, SetGoalRetryReason};
+
+    let retryable_codes = [
+        Code::MotionSinkUnobserved,
+        Code::MotionSinkStale,
+        Code::MotionSinkNotReady,
+        Code::StackStateUnobserved,
+        Code::StackStateStale,
+        Code::TfUnobserved,
+        Code::TfStale,
+        Code::TfIncomplete,
+        Code::PlannerInputUnobserved,
+        Code::PlannerInputStale,
+        Code::PlannerFrameMismatch,
+        Code::CostmapUnavailable,
+        Code::PlannerNotReady,
+    ];
+    assert_eq!(retryable_codes.len(), 13);
+    for code in retryable_codes {
+        // Intentionally unrelated diagnostic text. The typed cause, not text,
+        // decides retry policy. Exact reason preservation is checked separately.
+        let message = format!("opaque diagnostic for typed cause {code:?}");
+        assert_eq!(
+            classify_exploration_submit_rejection(
+                Some(SetGoalRetryReason::NavigationNotReady(code)),
+                None,
+                message.clone(),
+            ),
+            ChildNavigationSubmitError::RetryableReadiness(message),
+            "typed readiness code {code:?} must remain retryable",
+        );
+    }
+}
+
+#[test]
+fn scheme_a_session_reasons_outrank_source_and_readiness() {
+    use crate::explore_runtime::ChildNavigationSubmitError;
+    use crate::nav_runtime::{NavigationReadinessCode, SetGoalRejectReason, SetGoalRetryReason};
+
+    for reject in [
+        SetGoalRejectReason::ActiveMapNameChanged,
+        SetGoalRejectReason::MapFrameChanged,
+    ] {
+        for retry in [
+            None,
+            Some(SetGoalRetryReason::MapRevisionAdvanced),
+            Some(SetGoalRetryReason::NavigationNotReady(
+                NavigationReadinessCode::MotionSinkNotReady,
+            )),
+        ] {
+            let message = "opaque session diagnostic".to_string();
+            assert_eq!(
+                classify_exploration_submit_rejection(retry, Some(reject), message.clone()),
+                ChildNavigationSubmitError::SessionInvalidated(message),
+                "session cause {reject:?} must outrank retry cause {retry:?}",
+            );
+        }
+    }
+    let message = "opaque source diagnostic".to_string();
+    assert_eq!(
+        classify_exploration_submit_rejection(
+            Some(SetGoalRetryReason::MapRevisionAdvanced), None, message.clone(),
+        ),
+        ChildNavigationSubmitError::SourceChanged(message),
+    );
+}
+
+#[test]
+fn scheme_a_unlisted_codes_and_text_do_not_create_retry_or_stage_proof() {
+    use crate::explore_runtime::ChildNavigationSubmitError;
+    use crate::nav_runtime::{NavigationReadinessCode as Code, SetGoalRetryReason};
+
+    // Exhausts the present enum's non-retryable members. The original classifier
+    // knows no lease/publication phase and must NEVER emit RejectedBeforePublish.
+    for code in [
+        Code::Unknown,
+        Code::Ready,
+        Code::LcmBackendUnavailable,
+        Code::ProfileUnsupported,
+        Code::GoalFrameMismatch,
+    ] {
+        let message = "motion sink unavailable; map revision advanced".to_string();
+        assert_eq!(
+            classify_exploration_submit_rejection(
+                Some(SetGoalRetryReason::NavigationNotReady(code)), None, message.clone(),
+            ),
+            ChildNavigationSubmitError::Rejected(message),
+            "unlisted readiness code {code:?} must stay generic",
+        );
+    }
+    for text in [
+        "MOTION_SINK_NOT_READY",
+        "active map changed",
+        "map revision advanced",
+        "GOAL_LEASE_BUSY",
+        "rejected before publish",
+    ] {
+        assert_eq!(
+            classify_exploration_submit_rejection(None, None, text.to_string()),
+            ChildNavigationSubmitError::Rejected(text.to_string()),
+        );
+    }
+}
+
+
     #[test]
     fn exploration_submit_rejection_classification_is_typed() {
         use crate::explore_runtime::ChildNavigationSubmitError;
@@ -23310,7 +23735,7 @@ mod exploration_lcm_smoke_tests {
         .expect_err("wrong frozen intent frame must fail closed before lease CAS");
         assert!(matches!(
             rejection,
-            crate::explore_runtime::ChildNavigationSubmitError::Rejected(message)
+            crate::explore_runtime::ChildNavigationSubmitError::RejectedBeforePublish(message)
                 if message == "SET_GOAL_REJECTED[GOAL_INTENT_INVALID]: goal header, frame, timestamp, or pose is invalid"
         ));
 

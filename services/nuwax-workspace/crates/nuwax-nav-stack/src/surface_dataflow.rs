@@ -1191,6 +1191,8 @@ mod tests {
     }
     mod selective_refresh_tests {
         include!("surface_selective_refresh_tests.rs");
+        #[cfg(feature = "surface-recovery-qualification")]
+        include!("surface_route_change_scope_qualification.rs");
     }
     mod map_retry_tests {
         include!("surface_map_retry_tests.rs");

@@ -606,6 +606,10 @@ impl NavPlanner for RouteFollower {
     }
 }
 
+#[cfg(feature = "surface-recovery-qualification")]
+#[path = "route_change_scope_qualification.rs"]
+pub mod route_change_scope_qualification;
+
 #[cfg(test)]
 mod tests {
     use super::*;

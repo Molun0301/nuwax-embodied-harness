@@ -541,6 +541,22 @@ release 最小 `surface-recovery-qualification` lane 的6项定向测试全部�
 源码范围仅 `services/nuwax-workspace/crates/nuwax-nav-stack/src/lcm_dataflow.rs`（+320/-165，包含原 Cancel 逻辑抽取与 tests-only hook）及相邻 `guarded_ingress_ack_tests.rs`（353→1128 行，+842/-67）。最终静审仅补了新 matrix_scheduler 自 spawn 后 setup 失败的真实 shutdown/join、必要 abort/rejoin 与原 panic 恢复；成功前提、断言和阈值未动。未新增 Cargo feature/依赖/lock 改动，未计算 hash。
 
 
+## 第三十九阶段：地图变化范围的真实候选因果验证
+
+基线 e0e0392d；仅新增显式资格 feature 下的测试驱动及三个 ignored 选择器，原生产调度、取消、票据和停车规则不变。唯一执行者已串行运行三项，每项 exact 命中1个测试、退出码0；本审查亲读 results.json、三份原始日志及实际补丁。
+
+- M1 历史前缀、M2 远期段：真实 PlanKernel 均返回完整135点候选，当前全局进度12米、窗口终点17米、有效 horizon 5米。各自无变化对照真实接纳1次并产生非零已检查命令。新增固定 fine 列 [31,31] / [591,31]，真实 coarse 为 [15,15] / [295,15]；完整候选的源票据、最新全路径边、当前机体、接头和完整停车段均允许。但原全局范围判定取消整个 owner epoch，真实成功结果接纳数为0。由此证实：当前取消范围会丢弃本来可用的首次局部候选。
+- M3 安全负例：固定墙与固定新增点 [283,47,51] 均未移动。真实 kernel 返回完整448点绕行候选；新增点在 global proof 范围外，真实 coarse 为 [141,23]，却使候选最新第142条运动边发生机体体积碰撞。原 owner epoch 保留，结果确实被消费，随后完整候选票据拒收，接纳数0。当前机体、接头与停车检查仍通过，说明它们不能代替完整候选源票据。
+- 三项真实 message、root、observed_ns 时间链与 fine/coarse 原量化断言均通过。暂停发生在真实 kernel 返回之后、原 PlanningOwner 返回之前，无合成成功路径、无结果取出再塞回、无修改固定点或搜索预算。正常清理返回；原 Drop 不公开 join 结果，不能另称独立 worker 成功状态。
+
+范围：仅首次 candidate，未覆盖已有 admission 的后台刷新、删除、Unknown、Q1 active/pending 最新输入时序或真实桥接端到端计时。135/448是本夹具结果；kernel_ms、测试耗时和人工 barrier 不是生产性能数据。三项 PASS 是现状行为与安全负例见证，不是优化后的 RED/GREEN，也不构成生产改动或提速结论。
+
+下一步先验证 Q1：避免保留可用 A 时，让旧源 pending P 阻挡最新源请求。不能直接删除 global-route 取消条件或把完整范围缩成短窗。
+
+
+默认七包tests check通过（12.16s）；单一增量target、原release资格feature，既有三文件移除资格入口后逐字还原，另两个源仅用于显式资格驱动。
+
+
 ## 后续持续检查
 
 1. 墙前晚到路径的实际恢复与初始 full/partial/PCT 顺序，保留及时移动和真实避障

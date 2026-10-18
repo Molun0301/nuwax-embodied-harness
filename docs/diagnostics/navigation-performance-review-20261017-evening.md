@@ -635,6 +635,14 @@ A/B default release check/no-run与local-guidance-qualification+body-query-profi
 
 基线事实已保存，下一步只评审在原fork位置复用既有单query槽。不得缓存路线或预算结果；routes仍须使用当次导航config/PCT及local_costs，保留原限制先于取消与route错误嵌套。少构图不自动证明交错占用、控制延迟或端到端收益。
 
+## 第四十七阶段：返航预算复用现有合格查询槽
+
+接受最小生产改动：Homeward分支把backend传给原free函数，原fork位置改用已有selection_planning；原ComputeInput fork只剩7测试调用，标为cfg(test)。没有新缓存、字段、锁、哈希或路线/预算结果缓存。原hook/取消/错误顺序、当前导航配置/PCT及local_costs读取、controller准备和settlement路径保持。
+
+候选十二个exact首跑全通过，actual-list新4+旧8各1，原三baseline名字各0；原事实源码与日志已在阶段46保留。默认geometry release check/tests与bin no-run通过，无修正或失败。连续返航实际构图[1,1]→[1,0]、800cells→0；Selection/Homeward/Selection保持[1,1,0]；真实Writer初始/raw等价/真实散布变化/重复由[1,1,1,1]→[1,0,1,0]，每次必要重建1500cells。metadata等价继续保持最新original/raw与notification，真实变化仍失效重建。
+
+retained与fresh有序完整pose数值、长度和终点对照通过；fresh查询仍可能共享observations中的原reference缓存，不称完全全冷或bitwise。暖态当前limits先于取消、原route内typed错误保留至Discard，以及原配置/边界/缺图/反馈/生命周期控制均通过。接受范围是已验证的重复构图消除，不宣称端到端时延、CPU/RSS、动态local_cost变化、实际active-child节拍或TTL实测收益。
+
 ## 后续持续检查
 
 1. 墙前晚到路径的实际恢复与初始 full/partial/PCT 顺序，保留及时移动和真实避障

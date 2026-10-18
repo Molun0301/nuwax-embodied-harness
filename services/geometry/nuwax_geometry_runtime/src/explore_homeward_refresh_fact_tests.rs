@@ -1,6 +1,6 @@
-// DRAFT: include from explore_compute_backend_tests.rs after static review.
-// No production candidate is included. The existing tracing observer surrounds
-// the complete prepare_request body, not source.prepare_poll. No wall timing.
+// Candidate migration of the archived, executed Homeward refresh baseline facts.
+// The existing tracing observer surrounds the complete prepare_request body,
+// not source.prepare_poll. Work counts are not wall-time performance claims.
 use crate::explore_runtime::tests::{
     capture_surface_owner_work, watermark_owner_config, watermark_owner_publication,
     watermark_owner_source,
@@ -34,40 +34,61 @@ fn homeward_fact_progress(context: &ComputeContext) -> MissionProgress {
     MissionProgress::new(goal).unwrap()
 }
 
-// Called only AFTER all observed prepares in a sequence. This deliberately
-// uses a separate planner: no probe warms/replaces the tested navigation PCT.
-// These existing fixtures have default search limits and no local penalties.
-// Backend exposes only bool, so this validates the fixture's complete reference
-// path/end/length and projection, not an inaccessible backend-internal path.
-fn homeward_fact_cold_oracle(context: &ComputeContext, progress: &MissionProgress) {
+// Called only AFTER all observed prepares. Both reference queries use their own
+// independent PCT: neither can warm/replace the navigation planner under test.
+// Retained-query versus fresh-query full paths are compared, including body-memo
+// effects. These fixtures have default search limits and EMPTY local costs.
+// Backend still exposes only bool; this does not capture its hidden route path.
+fn homeward_fact_cold_oracle(
+    context: &ComputeContext,
+    progress: &MissionProgress,
+    retained: &FrozenSurfacePlanningInput,
+) {
+    let ComputeInput::Surface { config, .. } = &context.input else { unreachable!() };
+    let tested_pct = config.follower.pct.clone();
+    assert!(tested_pct.local_costs().is_empty(), "oracle fixture has no local penalties");
     let mut cold = context.clone();
     let ComputeInput::Surface { config, .. } = &mut cold.input else { unreachable!() };
-    let old_pct = config.follower.pct.clone();
     config.follower.pct = Default::default();
-    assert!(!Arc::ptr_eq(&config.follower.pct, &old_pct));
-    let planning = cold.input.fork_for_planning();
-    let routes = cold.routes(planning.as_ref()).unwrap();
-    let start = mission_pose_from_stamped(&cold.robot_pose);
+    assert!(!Arc::ptr_eq(&config.follower.pct, &tested_pct));
+    let fresh_planning = cold.input.fork_for_planning();
+    let fresh_routes = cold.routes(fresh_planning.as_ref()).unwrap();
+    let mut retained_routes = context.routes(Some(retained)).unwrap();
+    let MissionRoutes::Surface { config, .. } = &mut retained_routes else { unreachable!() };
+    assert!(Arc::ptr_eq(&config.follower.pct, &tested_pct),
+        "routes initially binds the current navigation config, not selection's private PCT");
+    config.follower.pct = Default::default();
+    let MissionRoutes::Surface { config: fresh_config, .. } = &fresh_routes else { unreachable!() };
+    assert!(!Arc::ptr_eq(&config.follower.pct, &fresh_config.follower.pct));
+    assert!(!Arc::ptr_eq(&config.follower.pct, &tested_pct));
+    let start = mission_pose_from_stamped(&context.robot_pose);
     let options = home_goal_options();
-    let MissionRoutes::Surface { map, config, boundary } = &routes else { unreachable!() };
-    let path = nuwax_nav_stack::surface_oriented::plan_reference_cancellable(map, &config.follower.pct,
-        (start.position, start.orientation_xyzw), (progress.home.position, progress.home.orientation_xyzw),
-        options, config.follower.motion_limits.as_ref(), boundary, 30_000, None).unwrap();
-    let expected_end = path.last().unwrap();
-    let expected_length: f64 = path.windows(2).map(|p|
+    let complete_path = |routes: &MissionRoutes| {
+        let MissionRoutes::Surface { map, config, boundary } = routes else { unreachable!() };
+        nuwax_nav_stack::surface_oriented::plan_reference_cancellable(map, &config.follower.pct,
+            (start.position, start.orientation_xyzw), (progress.home.position, progress.home.orientation_xyzw),
+            options, config.follower.motion_limits.as_ref(), boundary, 30_000, None).unwrap()
+    };
+    let fresh_path = complete_path(&fresh_routes);
+    let retained_path = complete_path(&retained_routes);
+    assert_eq!(retained_path, fresh_path, "all body poses, not only route endpoint/length");
+    let expected_end = fresh_path.last().unwrap();
+    let expected_length: f64 = fresh_path.windows(2).map(|p|
         p[0].0.iter().zip(p[1].0).map(|(a, b)| (a - b).powi(2)).sum::<f64>().sqrt()).sum();
-    let route = routes.query(&start, &progress.home, options, None).unwrap();
-    assert_eq!(route.length, expected_length);
-    assert_eq!(route.end.position, expected_end.0);
-    assert_eq!(route.end.orientation_xyzw, expected_end.1);
-    assert!(route.length >= 0.4);
-    let distance = route.end.position.iter().zip(progress.home.position)
-        .map(|(a, b)| (a - b).powi(2)).sum::<f64>().sqrt();
-    assert!(distance <= options.position_tolerance_m);
-    let [x, y, z, w] = route.end.orientation_xyzw;
-    let yaw = (2.0 * (x * y + w * z)).atan2(1.0 - 2.0 * (y * y + z * z));
-    assert!((yaw - std::f64::consts::FRAC_PI_2).abs() <= options.yaw_tolerance_rad);
-    assert!(!cold.config.return_policy.should_return(progress.travelled_m, route.length).unwrap());
+    for routes in [&retained_routes, &fresh_routes] {
+        let route = routes.query(&start, &progress.home, options, None).unwrap();
+        assert_eq!(route.length, expected_length);
+        assert_eq!(route.end.position, expected_end.0);
+        assert_eq!(route.end.orientation_xyzw, expected_end.1);
+        assert!(route.length >= 0.4);
+        let distance = route.end.position.iter().zip(progress.home.position)
+            .map(|(a, b)| (a - b).powi(2)).sum::<f64>().sqrt();
+        assert!(distance <= options.position_tolerance_m);
+        let [x, y, z, w] = route.end.orientation_xyzw;
+        let yaw = (2.0 * (x * y + w * z)).atan2(1.0 - 2.0 * (y * y + z * z));
+        assert!((yaw - std::f64::consts::FRAC_PI_2).abs() <= options.yaw_tolerance_rad);
+        assert!(!context.config.return_policy.should_return(progress.travelled_m, route.length).unwrap());
+    }
 }
 
 // All state snapshots and checks are outside the existing actual-work observer.
@@ -94,6 +115,10 @@ fn homeward_fact_prepare(
     let captured = backend.prepared.as_ref().unwrap()._original_surface.as_ref().unwrap();
     assert!(Arc::ptr_eq(captured.snapshot().unwrap(), expected.snapshot().unwrap()));
     assert_eq!(captured.notification(), expected.notification());
+    let (config, pair) = backend.surface_planning.as_ref().unwrap();
+    assert!(Arc::ptr_eq(config, &context.config));
+    assert!(Arc::ptr_eq(pair.original_input().snapshot().unwrap(), expected.snapshot().unwrap()));
+    assert_eq!(pair.original_input().notification(), expected.notification());
     assert_eq!(checkpoint_payloads(&backend.controller), history);
     let accepted = finalized(backend);
     assert!(matches!(accepted.projection, ComputeProjection::HomewardBudget(Ok(false))), "{label}");
@@ -101,12 +126,12 @@ fn homeward_fact_prepare(
     assert_eq!(accepted.committed.diagnostics, diagnostics);
     assert_eq!(accepted.committed.frontiers, frontiers);
     assert_eq!((rebuilds, cells), (0, 0), "route-only work must not enumerate frontiers");
-    eprintln!("homeward_refresh_fact label={label} frontier_builds={rebuilds} frontier_cells={cells} pct_builds={maps} pct_cells={map_cells}");
+    eprintln!("homeward_refresh_candidate label={label} frontier_builds={rebuilds} frontier_cells={cells} pct_builds={maps} pct_cells={map_cells}");
     (rebuilds, cells, maps, map_cells)
 }
 
 #[test]
-fn surface_homeward_same_context_repeats_actual_tomogram_build_baseline() {
+fn surface_homeward_same_context_reuses_actual_tomogram() {
     // Construct once. Rebuilding surface_reuse_context per round would allocate
     // another navigation PctPlanner and manufacture an unrelated cache miss.
     let mut context = homeward_fact_unknown_context(cancellable_surface_context());
@@ -120,6 +145,7 @@ fn surface_homeward_same_context_repeats_actual_tomogram_build_baseline() {
     let mut backend = ExploreComputeBackend::new(surface_controller(receiver));
     let progress = homeward_fact_progress(&context);
     let mut work = Vec::new();
+    let mut retained_query = None;
     for label in ["same_first", "same_second"] {
         let ComputeInput::Surface { original: current, config } = &context.input else { unreachable!() };
         assert!(Arc::ptr_eq(&context.config, &explore_config));
@@ -127,17 +153,20 @@ fn surface_homeward_same_context_repeats_actual_tomogram_build_baseline() {
         assert!(Arc::ptr_eq(current.snapshot().unwrap(), original.snapshot().unwrap()));
         assert_eq!(current.notification(), original.notification());
         work.push(homeward_fact_prepare(&mut backend, &context, &progress, label));
+        let query = Arc::downgrade(backend.surface_planning.as_ref().unwrap().1.query_snapshot().unwrap());
+        if let Some(previous) = &retained_query { assert!(std::sync::Weak::ptr_eq(previous, &query)); }
+        retained_query = Some(query);
     }
-    homeward_fact_cold_oracle(&context, &progress);
+    homeward_fact_cold_oracle(&context, &progress, &backend.surface_planning.as_ref().unwrap().1);
     backend.lifecycle(ComputeLifecycle::Stop(ExplorationStopReason::UserCancelled)).result.unwrap();
-    assert_eq!(work.iter().map(|v| v.2).collect::<Vec<_>>(), vec![1, 1],
-        "baseline fact, not a candidate-performance assertion");
+    assert!(retained_query.unwrap().upgrade().is_none());
+    assert_eq!(work.iter().map(|v| v.2).collect::<Vec<_>>(), vec![1, 0]);
     assert!(work[0].3 > 0);
-    assert_eq!(work[0].3, work[1].3);
+    assert_eq!(work[1].3, 0);
 }
 
 #[test]
-fn surface_homeward_between_selections_preserves_original_source_progress_baseline() {
+fn surface_homeward_between_selections_preserves_original_source_progress() {
     let mut context = cancellable_surface_context();
     Arc::make_mut(&mut context.config).return_policy.maximum_distance_m = Some(100.0);
     let ComputeInput::Surface { original, config } = &context.input else { unreachable!() };
@@ -189,18 +218,18 @@ fn surface_homeward_between_selections_preserves_original_source_progress_baseli
     let pair = &backend.surface_planning.as_ref().unwrap().1;
     assert!(std::sync::Weak::ptr_eq(&query, &Arc::downgrade(pair.query_snapshot().unwrap())));
     assert_eq!(pair.original_input().notification(), receiver.freeze().unwrap().notification());
-    homeward_fact_cold_oracle(&homeward_context, &progress);
+    homeward_fact_cold_oracle(&homeward_context, &progress, &backend.surface_planning.as_ref().unwrap().1);
     backend.lifecycle(ComputeLifecycle::Stop(ExplorationStopReason::UserCancelled)).result.unwrap();
     assert!(query.upgrade().is_none());
     assert_eq!((first_maps, homeward_work.2, second_maps), (1, 1, 0));
     assert!(first_cells > 0 && homeward_work.3 > 0);
     assert_eq!(second_cells, 0);
-    eprintln!("homeward_refresh_fact interleave=selection,homeward,selection pct_builds={first_maps},{},{} pct_cells={first_cells},{},{}",
+    eprintln!("homeward_refresh_candidate interleave=selection,homeward,selection pct_builds={first_maps},{},{} pct_cells={first_cells},{},{}",
         homeward_work.2, second_maps, homeward_work.3, second_cells);
 }
 
 #[test]
-fn surface_homeward_real_writer_metadata_and_scatter_build_facts_baseline() {
+fn surface_homeward_real_writer_metadata_reuses_and_scatter_invalidates() {
     // Same bounded real-Writer fixture as the existing metadata/scatter tests:
     // 50 x 30 occupied columns and exactly one two-sample measured record.
     let config = watermark_owner_config();
@@ -242,6 +271,7 @@ fn surface_homeward_real_writer_metadata_and_scatter_build_facts_baseline() {
     let progress = homeward_fact_progress(&context);
     let initial_context = context.clone();
     let mut work = vec![homeward_fact_prepare(&mut backend, &context, &progress, "writer_initial")];
+    let initial_planning = backend.surface_planning.as_ref().unwrap().1.clone();
     let original_evidence = first.observations().unwrap().get(key).unwrap();
     let original_statistics = first.observations().unwrap().ground_layers([15, 15]).next().unwrap().statistics.clone();
     let next_time = now_unix_nanos().max(timestamp + 1);
@@ -263,6 +293,10 @@ fn surface_homeward_real_writer_metadata_and_scatter_build_facts_baseline() {
     *original = metadata_input.clone();
     work.push(homeward_fact_prepare(&mut backend, &context, &progress, "writer_raw_equivalent"));
     let metadata_context = context.clone();
+    let metadata_planning = backend.surface_planning.as_ref().unwrap().1.clone();
+    assert!(Arc::ptr_eq(initial_planning.query_snapshot().unwrap(), metadata_planning.query_snapshot().unwrap()));
+    assert_eq!(metadata_planning.original_input().snapshot().unwrap().observations().unwrap().get(key), Some(evidence));
+    assert_eq!(metadata_planning.query_snapshot().unwrap().observations().unwrap().get(key), Some(original_evidence));
     writer.replace_layer_observations(block, layers(0.01)).unwrap();
     let (scatter_message, scatter_sealed) = watermark_owner_publication(&mut writer,
         Some(metadata_sealed.manifest().as_ref()), 3, next_time + 1);
@@ -281,12 +315,84 @@ fn surface_homeward_real_writer_metadata_and_scatter_build_facts_baseline() {
     assert!(Arc::ptr_eq(&config.follower.pct, &pct));
     assert!(Arc::ptr_eq(&context.config, &explore_config));
     work.push(homeward_fact_prepare(&mut backend, &context, &progress, "writer_scatter_changed"));
+    let scatter_planning = backend.surface_planning.as_ref().unwrap().1.clone();
+    assert!(!Arc::ptr_eq(metadata_planning.query_snapshot().unwrap(), scatter_planning.query_snapshot().unwrap()));
     work.push(homeward_fact_prepare(&mut backend, &context, &progress, "writer_scatter_repeat"));
-    for oracle_context in [&initial_context, &metadata_context, &context] {
-        homeward_fact_cold_oracle(oracle_context, &progress);
+    assert!(Arc::ptr_eq(scatter_planning.query_snapshot().unwrap(),
+        backend.surface_planning.as_ref().unwrap().1.query_snapshot().unwrap()));
+    for (oracle_context, planning) in [(&initial_context, &initial_planning),
+        (&metadata_context, &metadata_planning), (&context, &scatter_planning)] {
+        homeward_fact_cold_oracle(oracle_context, &progress, planning);
     }
+    let query = Arc::downgrade(scatter_planning.query_snapshot().unwrap());
+    drop((initial_planning, metadata_planning, scatter_planning));
     backend.lifecycle(ComputeLifecycle::Stop(ExplorationStopReason::UserCancelled)).result.unwrap();
-    assert_eq!(work.iter().map(|v| v.2).collect::<Vec<_>>(), vec![1, 1, 1, 1]);
-    assert!(work.iter().all(|v| v.3 > 0));
+    assert!(query.upgrade().is_none());
+    assert_eq!(work.iter().map(|v| v.2).collect::<Vec<_>>(), vec![1, 0, 1, 0]);
+    assert!(work[0].3 > 0 && work[2].3 > 0);
+    assert_eq!((work[1].3, work[3].3), (0, 0));
     assert_eq!(first.observations().unwrap().get(key), Some(original_evidence));
+}
+
+
+#[test]
+fn surface_homeward_warm_route_keeps_current_limits_and_cancel_nesting() {
+    use nuwax_nav_types_messages::{MotionLimits, MotionModel};
+    for invalid_limits in [false, true] {
+        let mut context = homeward_fact_unknown_context(cancellable_surface_context());
+        Arc::make_mut(&mut context.config).return_policy.maximum_distance_m = Some(100.0);
+        let ComputeInput::Surface { original, .. } = &context.input else { unreachable!() };
+        let receiver = SurfaceInputReceiver::new();
+        receiver.observe(original.snapshot().unwrap().clone()).unwrap();
+        let mut backend = ExploreComputeBackend::new(surface_controller(receiver));
+        let progress = homeward_fact_progress(&context);
+        assert_eq!(homeward_fact_prepare(&mut backend, &context, &progress, "warm_before_error").2, 1);
+        let query = Arc::downgrade(backend.surface_planning.as_ref().unwrap().1.query_snapshot().unwrap());
+        let config_owner = context.config.clone();
+        let history = checkpoint_payloads(&backend.controller);
+        let expected_error = if invalid_limits {
+            // Exactly the existing invalid-limits fixture. Only this request's
+            // navigation config changes; the Explore config/Q stay identical.
+            let limits = MotionLimits {
+                model: MotionModel::Differential,
+                max_forward_mps: 0.5, max_reverse_mps: 0.3, max_lateral_mps: 0.0,
+                max_angular_rps: 0.7, linear_acceleration_mps2: 1.0,
+                guaranteed_braking_mps2: 0.0,
+                angular_acceleration_rps2: 2.0, guaranteed_angular_braking_rps2: 2.0,
+                reaction_time_sec: 0.1, minimum_turning_radius_m: 0.0, can_rotate_in_place: true,
+            };
+            let error = limits.validate().unwrap_err();
+            assert!(limits.kinematics().validate().is_ok());
+            let ComputeInput::Surface { config, .. } = &mut context.input else { unreachable!() };
+            config.follower.motion_limits = Some(limits);
+            error
+        } else { "三维规划已取消".to_owned() };
+        let cancellation = std::sync::atomic::AtomicBool::new(false);
+        let checks = Cell::new(0);
+        let (projection, rebuilds, cells, maps, map_cells) = capture_surface_owner_work(||
+            backend.prepare_request(Some(&cancellation),
+                ComputeRequest::HomewardBudget(HomewardBudgetRequest {
+                    context: context.clone(), progress: progress.clone(),
+                }), || {
+                    checks.set(checks.get() + 1);
+                    if checks.get() == 3 { cancellation.store(true, Ordering::Release); }
+                    false
+                }));
+        assert_eq!(checks.get(), 3);
+        assert!(cancellation.load(Ordering::Acquire));
+        assert!(matches!(projection, ComputeProjection::HomewardBudget(Err(MissionRouteError::Failed(ref error)))
+            if error == &expected_error));
+        assert!(!backend.prepared.as_ref().unwrap().controller_prepared);
+        assert_eq!((rebuilds, cells, maps, map_cells), (0, 0, 0, 0));
+        let (config, planning) = backend.surface_planning.as_ref().unwrap();
+        assert!(Arc::ptr_eq(config, &config_owner));
+        assert!(std::sync::Weak::ptr_eq(&query, &Arc::downgrade(planning.query_snapshot().unwrap())));
+        assert_eq!(checkpoint_payloads(&backend.controller), history);
+        // Route Err retains its original nesting and slot until explicit Discard.
+        assert!(matches!(backend.resolve(Decision::Discard), Settlement::Discarded));
+        assert!(backend.prepared.is_none() && backend.surface_planning.is_none());
+        assert!(query.upgrade().is_none());
+        assert_eq!(checkpoint_payloads(&backend.controller), history);
+        backend.lifecycle(ComputeLifecycle::Stop(ExplorationStopReason::UserCancelled)).result.unwrap();
+    }
 }

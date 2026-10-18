@@ -258,7 +258,7 @@ impl ExploreComputeBackend {
             match request {
                 ComputeRequest::Selection(request) => self.prepare_selection(request, &cancelled, cancellation),
                 ComputeRequest::HomewardBudget(request) => {
-                    (prepare_homeward_budget(request, &cancelled, cancellation), false)
+                    (prepare_homeward_budget(self, request, &cancelled, cancellation), false)
                 }
                 ComputeRequest::Coverage { context } => {
                     #[cfg(test)]
@@ -580,6 +580,7 @@ fn fail_on_protocol_fault<T>(stage: &str, result: ExploreResult<T>) -> ExploreRe
 }
 
 impl ComputeInput {
+    #[cfg(test)]
     fn fork_for_planning(&self) -> Option<FrozenSurfacePlanningInput> {
         match self {
             Self::Planar(_) => None,
@@ -694,6 +695,7 @@ fn ordered_mission_query(
 }
 
 fn prepare_homeward_budget(
+    backend: &mut ExploreComputeBackend,
     request: HomewardBudgetRequest,
     cancelled: &impl Fn() -> bool,
     cancellation: Option<&std::sync::atomic::AtomicBool>,
@@ -703,7 +705,7 @@ fn prepare_homeward_budget(
     if let Some(hook) = &context.homeward_test_hook {
         hook();
     }
-    let planning = context.input.fork_for_planning();
+    let planning = backend.selection_planning(&context);
     if cancelled() {
         return ComputeProjection::Cancelled;
     }

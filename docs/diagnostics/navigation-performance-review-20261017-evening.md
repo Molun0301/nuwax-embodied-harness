@@ -387,6 +387,16 @@ GREEN同一原release/LTO二进制51个exact全部通过：原RED与5新控制�
 
 另外20项原Nav rollback/JOIN、ProcessStop、typed receipt测试固定使用UDPM，原构造器忽略环境URL；已有multicast初始化失败证据，本批未重跑或改成memq冒充通过。check1m13、原LTO no-run16m10，另普通非test geometry check45.63s与默认七包tests check16.97s通过，唯一target增量与GTSAM fresh。通用Err/Unknown分阶段rollback、UDP晚Goal、独立Cancel future被drop、panic主动恢复仍待后续；此阶段只修复已复现的Goal观察者取消归属漏洞。
 
+## 第二十八阶段：细格 SAT 全通过证书候选撤回
+
+候选利用原轴、原中心/半径表达式及1e-10，按实际fine索引矩形计算极值，一次证明所有细格的旧SAT均为true后省略逐格比较。它不是矩形几何全包含；N≤2不尝试，失败或非有限数值仍回原路径，不改选层/contacts/prism。先在旧路径跑5项冻结oracle，再候选9新+54旧exact、完整默认MLS387/20原ignored、Scan75/2、runtime27+46/9+4通过，去重539 PASS/31原ignored。提案测试配置0.1 tread不足现有0.1voxel要求，测试值修为0.2，未放宽生产约束。私有fine_bands首轮冷不等于全部source冷。
+
+固定A1→B1→B2→A2，每次原1cm bounded两请求及已有5cm完整uncached-pose benchmark，共8进程；A/B保持同helper与测试，只切换调用接入，A生产不调用helper。构建和烟测不计时，唯一target。1cm每请求50姿态全部bits、partial、分支/search、profile调用与计数一致；5cm每进程252行，全Result/首witness断言通过。
+
+1cm false kernel A8.721–10.563s/B8.205–10.295s，true A8.177–8.231s/B8.062–8.523s，均重叠，无一致整段收益。5cm跨版本new_ns总和A2.367–2.731s/B2.250–2.287s，但36组中13组B全低、22重叠、1组B全高（MLS7.5cm clear/1frame，A66.96–71.29ms/B75.05–87.56ms）。没有SAT输入的coarse-only也同向波动，不能把总和全部归因候选；5cm是已预热cache的完整body核，非完整导航端到端。原benchmark内old/new比值不是本次SAT收益。
+
+据此拒绝候选，不追加样本、不宣称稳定退化。原计划恢复B编译结束后，精确撤回生产/helper与9测试，body.rs与99ddbd5b逐字节相同，所有材料保留仓外。仅保留现有cfg(test)+profile输出中的四行candidate partial/pose bits，位于原计算捕获之后，用于以后核验真实路径等价；没有新增hash、时钟或热路径处理。
+
 ## 后续持续检查
 
 1. 墙前晚到路径的实际恢复与初始 full/partial/PCT 顺序，保留及时移动和真实避障

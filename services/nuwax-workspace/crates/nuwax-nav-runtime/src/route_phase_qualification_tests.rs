@@ -70,6 +70,10 @@ mod route_phase_qualification {
                 "bounded_wall": bounded_wall, "expansion_limit": 256,
                 "qualification": if expected {"QUALIFIED"} else {"NOT_QUALIFIED"},
                 "kind": kind, "owner": "synchronous_plan_kernel_thread",
+                "candidate_geometry_bits": result.outcome.as_ref().ok().map(|candidate| serde_json::json!({
+                    "partial": candidate.partial,
+                    "poses": candidate.path.poses.iter().map(|pose| pose_bits(body(pose))).collect::<Vec<_>>(),
+                })),
                 "duration": "instrumented_wall_not_cpu",
                 "stage_labels": Stage::ALL.map(Stage::label),
                 "counter_labels": Counter::ALL.map(Counter::label).as_slice(),

@@ -6,6 +6,13 @@ use std::sync::{
 };
 use std::thread::JoinHandle;
 
+#[cfg(test)]
+#[path = "planning_owner_pending_only_v2_test_hooks.rs"]
+mod pending_only_v2_test_hooks;
+#[cfg(test)]
+#[path = "planning_owner_pending_only_v2_tests.rs"]
+mod pending_only_v2_tests;
+
 #[cfg(feature = "surface-recovery-qualification")]
 #[path = "planning_owner_first_dequeue.rs"]
 pub(crate) mod qualification_first_dequeue;
@@ -197,6 +204,71 @@ impl<T: Send + 'static, R: Send + 'static> PlanningOwner<T, R> {
         self.shared.wake.notify_one();
         Some(retired)
     }
+    /// Refresh only the expected queued request; never create another slot.
+    /// The factory is called under the existing lock only after an exact match.
+    /// It must only copy the small request fields/Arcs, without owner reentry,
+    /// geometry work or owned captures that need heavyweight destruction.
+    pub(crate) fn replace_pending_with_retired(
+        &self,
+        expected_id: u64,
+        expected_epoch: u64,
+        id: u64,
+        make_request: impl FnOnce() -> T,
+    ) -> Option<u64> {
+        if self.faulted() {
+            return None;
+        }
+        #[cfg(any(test, feature = "surface-recovery-qualification"))]
+        PENDING_REPLACE_LOCK_ATTEMPTS_FOR_QUALIFICATION.with(|count| count.set(count.get() + 1));
+        let old;
+        {
+            let mut slot = self.shared.exchange.lock().unwrap_or_else(|e| {
+                self.shared.fault.store(true, Ordering::Release);
+                e.into_inner()
+            });
+            if slot.closed || self.shared.fault.load(Ordering::Acquire)
+                || !slot.pending.as_ref().is_some_and(|pending|
+                    pending.id == expected_id && pending.epoch == expected_epoch)
+                || self.epoch() != expected_epoch
+            {
+                return None;
+            }
+            #[cfg(test)]
+            pending_only_v2_test_hooks::run(
+                Arc::as_ptr(&self.shared) as usize,
+                pending_only_v2_test_hooks::Phase::ReplaceChecked,
+            );
+            // cancel bumps the epoch before locking this exchange. Retain the
+            // checked epoch even if cancellation races with this small factory.
+            old = slot.pending.replace(Request {
+                id,
+                epoch: expected_epoch,
+                value: make_request(),
+            });
+        }
+        let retired = old.as_ref().map(|request| request.id);
+        drop(old);
+        self.shared.wake.notify_one();
+        retired
+    }
+    // Qualification-only Q case observation. Called once after the S2 update
+    // returns and before the next original step/take, identically in A and B.
+    // This reports a locked queued-state observation, NOT the replace point.
+    // Caller brackets the complete call with Instant::now outside the lock.
+    #[cfg(feature = "surface-recovery-qualification")]
+    pub(crate) fn pending_only_q_state_for_qualification(
+        &self, expected_id: u64, expected_epoch: u64,
+    ) -> Option<(bool, bool)> {
+        let slot = self.shared.exchange.lock().ok()?;
+        if slot.closed || self.faulted() || self.epoch() != expected_epoch
+            || !slot.pending.as_ref().is_some_and(|pending|
+                pending.id == expected_id && pending.epoch == expected_epoch)
+        {
+            return None;
+        }
+        Some((slot.active, slot.completion.is_some()))
+    }
+
     pub fn take(&self) -> Option<Completion<R>> {
         let result = self
             .shared
@@ -221,6 +293,11 @@ impl<T: Send + 'static, R: Send + 'static> PlanningOwner<T, R> {
         {
             self.shared.fault.store(true, Ordering::Release);
         }
+        #[cfg(test)]
+        pending_only_v2_test_hooks::run(
+            Arc::as_ptr(&self.shared) as usize,
+            pending_only_v2_test_hooks::Phase::CancelBumped,
+        );
         let retired = {
             let mut slot = self.shared.exchange.lock().unwrap_or_else(|e| {
                 self.shared.fault.store(true, Ordering::Release);

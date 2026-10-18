@@ -1197,6 +1197,12 @@ mod tests {
         include!("surface_pending_source_qualification.rs");
         #[cfg(feature = "surface-recovery-qualification")]
         include!("surface_r11_qualification.rs");
+        #[cfg(feature = "surface-recovery-qualification")]
+        include!("surface_pending_only_n_nohold_qualification.rs");
+        #[cfg(feature = "surface-recovery-qualification")]
+        include!("surface_pending_only_q_nohold_qualification.rs");
+        #[cfg(feature = "surface-recovery-qualification")]
+        include!("surface_pending_only_v2_qualification.rs");
     }
     mod map_retry_tests {
         include!("surface_map_retry_tests.rs");

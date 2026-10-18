@@ -250,6 +250,58 @@ impl RouteFollower {
         self.qualified_failure=None;
         self.retry_after=Instant::now();
     }
+    fn planning_request(
+        &self, map: &Arc<SurfaceSnapshot>, pose: &PoseStamped,
+        route: &Arc<Path3D>, detour: bool,
+    ) -> PlanRequest {
+        #[cfg(any(test, feature = "surface-recovery-qualification"))]
+        PLANNING_REQUEST_BUILDS_FOR_QUALIFICATION.with(|count| count.set(count.get() + 1));
+        let reference_source=ReferenceSource{route:Arc::clone(route),cumulative:Arc::clone(&self.cumulative),
+            goal:self.goal.clone(),options:self.options,offset:self.config.body_to_support_z_m,progress:self.progress};
+        PlanRequest{source:Arc::clone(map),pose:pose.clone(),boundary:Arc::clone(&self.boundary),reference:Vec::new(),
+            reference_source:Some(reference_source),final_yaw:None,arrival:None,end:0.0,progress:self.progress,
+            generation:self.route_generation,straight:false,detour,scan:self.scan.clone()}
+    }
+    // One receipt path for normal submission and pending-only replacement.
+    // The caller alone decides whether a new retry deadline is appropriate.
+    fn record_submission(&mut self,id:u64,start:Point3,detour:bool,retired:Option<u64>)->bool {
+        self.next_request=id;self.submitted=Some((id,start,detour));
+        for slot in &mut self.source_tickets {
+            if slot.as_ref().is_some_and(|(old,_)|Some(*old)==retired) {*slot=None;}
+        }
+        if let Some(map)=self.map.as_ref().filter(|map|map.body_envelope().is_some()) {
+            let Some(slot)=self.source_tickets.iter_mut().find(|slot|slot.is_none()) else {
+                self.cancel_planning();self.permanent_fault=Some("planning proof slots exhausted".into());return false;
+            };
+            *slot=Some((id,SurfaceJobTicket::new(Some(Arc::clone(map)))));
+        }
+        self.local_planning_calls+=1;
+        true
+    }
+    fn coalesce_pending_source(&mut self) {
+        if self.preparation_fault.is_some() {return;}
+        let Some((pending_id,_,previous_detour))=self.submitted else {return;};
+        // Before take(), two proofs describe active/completed A and queued P.
+        // A single changed active request must not add a lock/factory per tick.
+        let [Some((first_id,first)),Some((second_id,second))]=&self.source_tickets else {return;};
+        let proof=if *first_id==pending_id {first} else if *second_id==pending_id {second} else {return;};
+        if proof.unknown || proof.changes.is_empty() {return;}
+        let (Some(owner),Some(map),Some(pose),Some(route))=
+            (&self.owner,&self.map,&self.pose,&self.route) else {return;};
+        if self.config.kinematics().is_none() {self.preparation_fault=Some("近场执行缺少运动能力".into());return;}
+        let Some(id)=self.next_request.checked_add(1) else {self.permanent_fault=Some("planning request IDs exhausted".into());return;};
+        // Refresh source/reference inputs only; original scheduling owns mode changes.
+        let detour=previous_detour;
+        let start=pose.pose.position;
+        // Borrow only; no request or Arc clone until the original lock matches P.
+        let retired=owner.replace_pending_with_retired(pending_id,owner.epoch(),id,
+            ||self.planning_request(map,pose,route,detour));
+        if let Some(retired)=retired {
+            self.record_submission(id,start,detour,Some(retired));
+            // This updates the already queued slot, not the normal submit cadence.
+            // Keep its original retry_after and request mode.
+        }
+    }
     fn schedule(&mut self,detour:bool) {
         #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::PlanSchedule);
         if self.owner.is_none() || self.preparation_fault.is_some() || Instant::now()<self.retry_after {return;}
@@ -261,26 +313,12 @@ impl RouteFollower {
         if self.config.kinematics().is_none() {self.preparation_fault=Some("近场执行缺少运动能力".into());return;}
         let Some(route)=&self.route else {return;};
         let Some(id)=self.next_request.checked_add(1) else {self.permanent_fault=Some("planning request IDs exhausted".into());return;};
-        #[cfg(any(test, feature = "surface-recovery-qualification"))]
-        PLANNING_REQUEST_BUILDS_FOR_QUALIFICATION.with(|count| count.set(count.get() + 1));
-        let reference_source=ReferenceSource{route:route.clone(),cumulative:self.cumulative.clone(),
-            goal:self.goal.clone(),options:self.options,offset:self.config.body_to_support_z_m,progress:self.progress};
-        let request=PlanRequest{source:map.clone(),pose:pose.clone(),boundary:self.boundary.clone(),reference:Vec::new(),
-            reference_source:Some(reference_source),final_yaw:None,arrival:None,end:0.0,progress:self.progress,
-            generation:self.route_generation,straight:false,detour,scan:self.scan.clone()};
+        let request=self.planning_request(map,pose,route,detour);
+        let start=pose.pose.position;
         if let Some(retired)=self.owner.as_ref().unwrap().submit_with_retired(id,request) {
-            self.next_request=id;self.submitted=Some((id,pose.pose.position,detour));
-            for slot in &mut self.source_tickets {
-                if slot.as_ref().is_some_and(|(old,_)|Some(*old)==retired) {*slot=None;}
+            if self.record_submission(id,start,detour,retired) {
+                self.retry_after=Instant::now()+Duration::from_millis(250);
             }
-            if map.body_envelope().is_some() {
-                let Some(slot)=self.source_tickets.iter_mut().find(|slot|slot.is_none()) else {
-                    self.cancel_planning();self.permanent_fault=Some("planning proof slots exhausted".into());return;
-                };
-                *slot=Some((id,SurfaceJobTicket::new(Some(Arc::clone(map)))));
-            }
-            self.local_planning_calls+=1;
-            self.retry_after=Instant::now()+Duration::from_millis(250);
         }
     }
     fn current_rejection(&mut self, reason: String) -> PlannerStep {
@@ -568,6 +606,8 @@ impl NavPlanner for RouteFollower {
                 self.controller.step(width)
             };
         }
+        // Refresh a real queued P before take() can wake it behind completed A.
+        self.coalesce_pending_source();
         self.consume_plan();
         if self.owner.as_ref().is_some_and(|owner|owner.faulted()) {
             return PlannerStep::Failed("local planning owner terminated unexpectedly".into());
@@ -629,10 +669,15 @@ pub mod route_pending_source_qualification;
 #[path = "route_r11_qualification.rs"]
 pub mod route_r11_qualification;
 
+#[cfg(feature = "surface-recovery-qualification")]
+#[path = "route_pending_only_nohold_qualification.rs"]
+pub mod route_pending_only_nohold_qualification;
+
 #[cfg(test)]
 mod tests {
     use super::*;
     include!("route_selective_refresh_tests.rs");
+    include!("route_pending_only_v2_tests.rs");
     include!("route_progress_prefix_tests.rs");
     include!("route_partial_priority_tests.rs");
 

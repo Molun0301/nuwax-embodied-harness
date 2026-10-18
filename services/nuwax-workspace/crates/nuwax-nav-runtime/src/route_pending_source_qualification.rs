@@ -41,6 +41,7 @@ pub struct TicketState {
     pub basis: Option<Arc<SurfaceSnapshot>>,
     pub columns: usize,
     pub batches: usize,
+    pub changes: Vec<Arc<SurfaceGeometryChanges>>,
     pub unknown: bool,
 }
 pub struct PendingState {
@@ -137,10 +138,15 @@ impl PendingSourceCase {
         let f=self.follower.as_ref().unwrap();
         PendingState {epoch:f.owner.as_ref().unwrap().epoch(),submitted:f.submitted,
             tickets:f.source_tickets.iter().flatten().map(|(id,t)|TicketState {id:*id,basis:t.basis.clone(),
-                columns:t.columns,batches:t.changes.len(),unknown:t.unknown}).collect(),
+                columns:t.columns,batches:t.changes.len(),changes:t.changes.clone(),unknown:t.unknown}).collect(),
             map:f.map.as_ref().unwrap().clone(),pose:f.pose.as_ref().unwrap().clone(),retry_after:f.retry_after,
             dirty:f.dirty,calls:f.local_planning_calls,plans:f.local_plans,generation:f.route_generation,
             admission:f.admitted_generation}
+    }
+    /// Borrow original retained-path and wait-reason state without cloning it.
+    pub fn retained_local_guard_state(&self)->(Option<&Path3D>,Option<&str>) {
+        let f=self.follower.as_ref().unwrap();
+        (f.local_path.as_ref(),f.wait_reason.as_deref())
     }
     pub fn current_body_ok(&mut self)->bool {self.follower.as_mut().unwrap().controller.current_body_error().is_none()}
     pub fn refresh_distance(&self)->f64 {self.follower.as_ref().unwrap().scan.refresh_distance_m}
@@ -195,6 +201,17 @@ impl PendingSourceCase {
         if got!=ordinal || cancelled || !explicit {return Err(format!("invalid real return ordinal={got} cancelled={cancelled} explicit={explicit}"));}
         Ok(())
     }
+    /// Qualification-only acknowledgement of a deliberately cancelled real job.
+    /// Keep release_actual's existing noncancelled contract unchanged.
+    pub fn release_cancelled_actual(&mut self,ordinal:u64)->Result<(),String> {
+        self.release.as_ref().ok_or("missing barrier")?.send(()).map_err(|e|e.to_string())?;
+        let (got,cancelled,explicit)=self.returned.recv_timeout(Duration::from_secs(30)).map_err(|e|e.to_string())?;
+        eprintln!("PENDING_ONLY_V2_CANCELLED_ACK_BEFORE_OWNER_RETURN ordinal={got} cancelled={cancelled} explicit={explicit} owner_publish_not_observed=true");
+        if got!=ordinal || !cancelled || !explicit {
+            return Err(format!("invalid cancelled return ordinal={got} cancelled={cancelled} explicit={explicit}"));
+        }
+        Ok(())
+    }
     pub fn pump_until_consumed(&mut self,id:u64)->Result<(),String> {
         let until=Instant::now()+Duration::from_secs(5);
         loop {
@@ -210,6 +227,60 @@ impl PendingSourceCase {
             actual.source.validate_body_motion(body(&e[0]),body(&e[1]),boundary).is_ok()),
             latest_first_rejection:actual.path.poses.windows(2).enumerate().find_map(|(i,e)|
                 latest.validate_body_motion(body(&e[0]),body(&e[1]),boundary).err().map(|e|(i,e.to_string())))}
+    }
+    pub fn pending_source_work(&self)->(u64,u64) {
+        self.follower.as_ref().unwrap().pending_source_work_for_qualification()
+    }
+    pub fn no_entry_ready(&self)->bool {matches!(self.entered.try_recv(),Err(mpsc::TryRecvError::Empty))}
+    pub fn pump_until_consumed_with_step(&mut self,id:u64)->Result<PlannerStep,String> {
+        let until=Instant::now()+Duration::from_secs(5);
+        loop {
+            let step=self.tick()?;
+            if self.state().tickets.iter().all(|t|t.id!=id) {return Ok(step);}
+            if Instant::now()>=until {return Err(format!("real request {id} was not consumed by step"));}
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    pub fn audit_current_candidate(&self,actual:&ActualCandidate,latest:Arc<SurfaceSnapshot>)
+        ->Result<super::route_change_scope_qualification::GeometryAudit,String> {
+        let f=self.follower.as_ref().unwrap();
+        let current=f.pose.as_ref().ok_or("missing current pose")?.clone();
+        let goal=f.goal.clone().ok_or("missing original goal")?;
+        let edges=self.audit_edges(actual,&latest);
+        let from=body(&current);
+        let latest_body_valid=latest.validate_body_pose(from.0,from.1).is_ok();
+        let mut oracle=SurfaceFollower::new(f.config.clone()).map_err(|e|e.to_string())?;
+        oracle.update_execution_map(ExecutionMap::Surface(latest.clone())).map_err(|e|e.to_string())?;
+        oracle.configure_boundary(&f.boundary);oracle.update_odometry(current.clone());
+        oracle.configure_goal(&goal,f.options).map_err(|e|e.to_string())?;
+        oracle.observe_applied_command(Twist2::ZERO);
+        let latest_connector_valid=oracle.replace_execution_path(
+            ExecutionPath::Surface(actual.path.clone()),None,goal).is_ok();
+        let current_command=if latest_connector_valid {
+            match oracle.step(0.3) {PlannerStep::Command(c)=>Some(c),_=>None}
+        } else {None};
+        let limits=f.config.motion_limits.as_ref().ok_or("missing original motion limits")?;
+        let pose=nuwax_nav_control::PlanarPose {x:current.pose.position.x,y:current.pose.position.y,
+            yaw:current.pose.orientation.yaw()};
+        let body_at=|p:nuwax_nav_control::PlanarPose| {
+            let q=nuwax_nav_types_messages::Quaternion::from_yaw(p.yaw);
+            ([p.x,p.y,current.pose.position.z],[q.x,q.y,q.z,q.w])
+        };
+        let check=|| |a:nuwax_nav_control::PlanarPose,b:nuwax_nav_control::PlanarPose,_:f64| {
+            latest.validate_body_motion(body_at(a),body_at(b),&f.boundary)
+                .and_then(|_|latest.body_query_with_current_support(body_at(a).0,body_at(a).1)
+                    .and_then(|v|v.validate_body_motion(body_at(a),body_at(b),&f.boundary))).is_ok()
+        };
+        let complete_stop_valid=current_command.is_some_and(|command|
+            nuwax_nav_control::check_stopping_trajectory_with_period_check(pose,Twist2::ZERO,command,limits,
+                1.0/f.config.controller.control_frequency,f64::from(latest.source_voxel_size_m())*0.5,
+                latest.body_envelope().unwrap().radius(),check(),check()).is_some());
+        Ok(super::route_change_scope_qualification::GeometryAudit {
+            old_edges_valid:edges.old_all_valid,latest_body_valid,
+            latest_edges_valid:edges.latest_first_rejection.is_none(),
+            first_new_edge_rejection:edges.latest_first_rejection,latest_connector_valid,
+            current_command,complete_stop_valid,
+        })
     }
     pub fn finish(mut self)->PendingState {
         let state=self.state();self.cleanup();state

@@ -584,6 +584,19 @@ release 最小 `surface-recovery-qualification` lane 的6项定向测试全部�
 
 本轮生产候选不接受，owner/follower原策略已恢复；只保留共同R11资格驱动、两个测试计数与真实first-dequeue观察。原M/Q合同完整恢复，剥离诊断新增行后原生产字节一致。默认七包tests check7.76s通过。M1/M2无谓取消问题仍未解决；后续仅考虑恢复原相关变化取消、独立保留Q1 pending换源的新策略，须重新验收，不能沿用本轮通过结论。
 
+## 第四十二阶段：仅刷新真正 pending 的旧源，保留原相关取消
+
+本轮接受最小pending-only范围：整个update_execution_map逐字保留，只在原策略幸存epoch、两真实source票据且submitted自身完整非空changes时，于原consume/take前按expected id及pending/current epoch原子replace-only。factory仅在原锁内匹配后构造；miss不新增槽，旧P mode与250ms retry不变，A变化链保留，旧payload锁外析构。无新生产字段/锁/队列/hash。
+
+新66 distinct语义/组合预检跨批均有PASS：首批65PASS/1前置FAIL永久保留，tests-only local控制修订后补1PASS。原失败为固定pose触发真实偏离guard、admission已撤；补验精确证明原reason及448pose同一retained path，再由S2 local相关触发原epoch取消。不是持续admitted运动。原M1/M2/M3与边界断言保持；旧相反Q1 selector显式迁移，历史证据保留。
+
+新独立N四进程八case全自然覆盖，原related取消与helper lock0成立。按冻结B1−A1/B2−A2配对，没有核心指标两次都B更慢，未触发负控门；混向及不利值完整保留，不称等价。N后另批固定Q四进程均真实pending、原cooldown内且唯一receipt配对：A实际kernel ids[1,2,3]，B[1,3]，旧P确实未起算。最新源entry分别早250.036502/399.977214ms，首L非零早199.570818/626.313949ms。
+
+Q-A2出现171.990100ms control、55.662638ms due延迟及2pose/4control漏拍，原因未证；Q-B1 max control/due分别逆向+0.278220/+0.262037ms。全部保留，不把整段差归候选、不补样，不声称实时期限全过。所有首L仅角速度0.1、linear0、无dispatch bound；TTL未测，不是桥交付或机器人移动。CPU/分配/锁持有及owner publish/consume/replace线性化未观测。
+
+接受只限此次最小范围及两固定目标配对。阶段41旧broad拒绝未撤销，旧60不复用；原M1/M2可用候选被取消的问题仍未解。完整方法、负面与原始整数事件见[阶段42独立报告](navigation-pending-only-refresh-20261018.md)和[完整12case数据](navigation-pending-only-refresh-20261018.json)。最终合并qualification tests check通过（10s）、stack no-run通过（211s）、默认七包tests check通过（9s）；3个新诊断选择器实际各1、旧Q1为0。合并4驱动与正式A/B源逐字一致，生产与已测语义不变，没有新增N/Q样本或重复运行语义。
+
+
 ## 后续持续检查
 
 1. 墙前晚到路径的实际恢复与初始 full/partial/PCT 顺序，保留及时移动和真实避障

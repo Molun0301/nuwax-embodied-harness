@@ -308,10 +308,23 @@ impl Writer {
     pub fn region(&mut self, min: Key, max: Key, point_budget: usize) -> Result<Vec<(Key, Evidence)>, String> {
         if (0..3).any(|i| min[i] > max[i]) { return Err("reversed region".into()); }
         let low = block_key(min); let high = block_key(max);
-        let keys = self.blocks.keys().chain(self.dirty.keys()).copied().filter(|key| (0..3).all(|i| key[i] >= low[i] && key[i] <= high[i])).collect::<BTreeSet<_>>();
+        let keys = self.blocks
+            .range([low[0], i32::MIN, i32::MIN]..=[high[0], i32::MAX, i32::MAX])
+            .map(|(&key, _)| key)
+            .chain(self.dirty
+                .range([low[0], i32::MIN, i32::MIN]..=[high[0], i32::MAX, i32::MAX])
+                .map(|(&key, _)| key))
+            .filter(|key| (1..3).all(|i| key[i] >= low[i] && key[i] <= high[i]))
+            .collect::<BTreeSet<_>>();
         let mut out = Vec::new();
         for key in keys {
-            let block = if let Some(dirty) = self.dirty.get(&key) { Arc::new(dirty.block.clone()) } else { self.reader.block(&self.blocks[&key])? };
+            let persisted_block: Arc<Block>;
+            let block: &Block = if let Some(dirty) = self.dirty.get(&key) {
+                &dirty.block
+            } else {
+                persisted_block = self.reader.block(&self.blocks[&key])?;
+                persisted_block.as_ref()
+            };
             for (&local, &evidence) in block.iter() {
                 let key = global_key(key, local)?;
                 if (0..3).all(|i| key[i] >= min[i] && key[i] <= max[i]) {
@@ -328,3 +341,7 @@ impl Writer {
 #[cfg(test)]
 #[path = "writer_accounting_tests.rs"]
 mod accounting_tests;
+
+#[cfg(test)]
+#[path = "writer_region_tests.rs"]
+mod region_tests;

@@ -2230,6 +2230,8 @@ where
                         continue;
                     }
                 };
+                #[cfg(all(test, feature = "surface-recovery-qualification"))]
+                guarded_tests::record_ack_return_cancel("bridge_ack_test.cancel_decoded", &cancel);
                 let Some(cancel_generation) = u64::try_from(cancel.cancel_generation)
                     .ok()
                     .filter(|generation| *generation > 0)
@@ -2283,6 +2285,8 @@ where
                         continue;
                     }
                     let session_id = active_goal.session_id.clone();
+                    #[cfg(all(test, feature = "surface-recovery-qualification"))]
+                    guarded_tests::record_ack_return_cancel("bridge_ack_test.cancel_api_begin", &cancel);
                     if let Err(error) = scheduler.cancel(&session_id).await {
                         match runtime_input_error::<()>("guarded_nav_scheduler.cancel", error)? {
                             OwnerInput::Rejected(reason) => {
@@ -2308,6 +2312,8 @@ where
                             }
                         }
                     }
+                    #[cfg(all(test, feature = "surface-recovery-qualification"))]
+                    guarded_tests::record_ack_return_cancel("bridge_ack_test.cancel_api_ok", &cancel);
                     telemetry = candidate_telemetry;
                     publish_bool(transport, &node.outputs[3], true).await?;
                     let snapshot = scheduler.status();
@@ -3067,6 +3073,8 @@ async fn publish_guarded_nav_observation(
         .map_err(|error| NavStackError::Internal(format!("publish guard status batch: {error}")))?;
     #[cfg(all(test,feature="surface-recovery-qualification"))]
     drop(publish);
+    #[cfg(all(test, feature = "surface-recovery-qualification"))]
+    guarded_tests::hold_test_publication_ack(&status, telemetry).await;
     #[cfg(test)]
     guarded_tests::record_test_publication(&receipts);
     Ok(())
@@ -7493,6 +7501,24 @@ mod guarded_tests {
     use nuwax_nav_runtime::{NavSchedulerHandle, RuntimeError, SchedulerPhase, TerminalOutcome};
     use tokio::task::JoinHandle;
 
+    #[cfg(feature = "surface-recovery-qualification")]
+    mod ingress_ack_tests {
+        use super::*;
+        include!("guarded_ingress_ack_tests.rs");
+    }
+
+    #[cfg(feature = "surface-recovery-qualification")]
+    pub(super) async fn hold_test_publication_ack(
+        status: &nuwax_nav_runtime::SchedulerStatus, telemetry: &GuardedNavTelemetry,
+    ) {
+        ingress_ack_tests::hold_publication_ack(status, telemetry).await;
+    }
+
+    #[cfg(feature = "surface-recovery-qualification")]
+    pub(super) fn record_ack_return_cancel(phase: &'static str, cancel: &schema::CancelNavigation) {
+        ingress_ack_tests::record_cancel(phase, cancel);
+    }
+
     #[test]
     fn arbiter_rotates_all_simultaneously_ready_sources() {
         let mut arbiter = GuardedNavArbiter::default();
@@ -8574,6 +8600,8 @@ mod guarded_tests {
 
     #[derive(Default)]
     struct PublicationProbe {
+        #[cfg(feature = "surface-recovery-qualification")]
+        ack_return_probe: Option<ingress_ack_tests::AckReturnProbe>,
         ledgers:Option<(Arc<GuardedDequeueLedger>,Arc<GuardedDequeueLedger>)>,
         entries:std::collections::BTreeMap<Vec<u8>,(usize,usize)>,
     }
@@ -9037,6 +9065,8 @@ mod guarded_tests {
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
             if let Some(dequeued) = dequeued {
+                #[cfg(feature = "surface-recovery-qualification")]
+                ingress_ack_tests::record_observed_dequeue();
                 let _ = dequeued.send(());
             }
             frame

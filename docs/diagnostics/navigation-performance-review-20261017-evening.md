@@ -494,6 +494,17 @@ Python 3.8.10 最终 199/199（core 146、public 25、旧回归28），另 JS 40
 
 证据边界：主例是进程内真实RouteFollower/PlanningOwner、真实静态地形与近期障碍几何；250ms相位由tests-only字段设置，ZERO由夹具报告，未跨真实scheduler/LCM/执行器。补充full/partial是明确合成但经真实源逐边与当前接续检查的状态控制，不冒充真实Scan搜索性能或整目标运动。没有因本次改动放宽预算、时间窗、障碍或运动安全标准，不宣称整体墙前恢复或端侧时延已解决。无body兼容入口和全路线矩形的保守取消是独立后续问题，本阶段未处理。
 
+## 第三十七阶段：原 bridge ACK 返回背压事实控制（2026-10-18）
+
+本阶段仅新增 tests-only 诊断：`lcm_dataflow.rs` 在7个位置增加30行测试条件编译 hook，相邻新测试文件353行；原生产语句无改删，没有新feature、owner或线程。复用生产 `run_guarded_nav_loop`、原 RawFrame 测试输入、原 scheduler/planner/motion 夹具和真实 same-context liblcm memq 输出。一次性门闩只在真实 `publish_batch` 成功且原计时 span 关闭后暂扣调用者 continuation；原错误映射与 `?` 路径保持。
+
+release 最小 `surface-recovery-qualification` lane 的6项定向测试全部通过：新增主闭门闩与未启用门闩正常控制各1项，原active同generation重放、新generation重获围栏、跨producer延迟取消、replacement清旧资格4项。各exact selector实际列出和运行各1次；新2项用ignored，原4项不用。default七包检查通过（11.31s），diff检查通过，所有构建/测试进程已终态；没有为通过测试修改fixture、TTL或原20ms门槛。
+
+主例完整保留12个事件：Cancel入原stream后，真实scheduler非零APPLIED仍前进；闭闩检查点原dequeue仍未发生；明确正常释放后才dequeue、decode、调用原cancel API并取得外部精确ZEROED。无gate控制8个事件。两项均 `incomplete=false`、所有drop/open计数为0、zero调用计数0→1；原bridge与scheduler正常shutdown/join，无abort fallback。native owner只经过原 `LcmContext::drop` 的同步join返回，既有Drop吞join错误；没有独立native exit status、unsubscribe ACK或新增shutdown ACK证明。
+
+这确认了普通publication continuation与原Cancel输入选择的串行依赖；人为持门长度不是自然时延或优化收益，cancel API区间也没有拆成scheduler内部执行。输入不包含native入站/UDP，不测物理停稳。历史fullsuite urgent 50.767828ms超过20ms仍未归因，本阶段不称性能修复，不解除该资格问题。生产解耦尚未实施。
+
+
 ## 后续持续检查
 
 1. 墙前晚到路径的实际恢复与初始 full/partial/PCT 顺序，保留及时移动和真实避障

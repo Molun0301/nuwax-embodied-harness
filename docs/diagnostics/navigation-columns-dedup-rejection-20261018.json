@@ -1,0 +1,8361 @@
+{
+  "decision": "REJECT_MATERIAL_REGRESSION",
+  "recorded_samples": 256,
+  "warmup_samples": 128,
+  "total_checked_rows": 384,
+  "timed_processes": 4,
+  "case_count": 8,
+  "new_samples_from_this_review": 0,
+  "raw_inputs_equal_across_processes": true,
+  "logged_semantic_outputs_equal_across_processes": true,
+  "primary_case": 2,
+  "primary_columns_pass": true,
+  "primary_wholeReader_pass": false,
+  "material_regression_gate_failures": [
+    {
+      "case": 7,
+      "window": "wholeReader"
+    }
+  ],
+  "unchanged_stage_drift_count": 16,
+  "unchanged_stage_drift_entries": [
+    {
+      "case": 1,
+      "window": "observations",
+      "lane": "B",
+      "low_median_twice_ns": 183233,
+      "high_median_twice_ns": 224700,
+      "drift_fraction_numerator": 41467,
+      "drift_fraction_denominator": 183233
+    },
+    {
+      "case": 2,
+      "window": "receive",
+      "lane": "A",
+      "low_median_twice_ns": 4685879,
+      "high_median_twice_ns": 7243459,
+      "drift_fraction_numerator": 2557580,
+      "drift_fraction_denominator": 4685879
+    },
+    {
+      "case": 2,
+      "window": "builder",
+      "lane": "A",
+      "low_median_twice_ns": 1059437,
+      "high_median_twice_ns": 1984711,
+      "drift_fraction_numerator": 925274,
+      "drift_fraction_denominator": 1059437
+    },
+    {
+      "case": 3,
+      "window": "receive",
+      "lane": "A",
+      "low_median_twice_ns": 5587793,
+      "high_median_twice_ns": 7419590,
+      "drift_fraction_numerator": 1831797,
+      "drift_fraction_denominator": 5587793
+    },
+    {
+      "case": 3,
+      "window": "observations",
+      "lane": "A",
+      "low_median_twice_ns": 571136,
+      "high_median_twice_ns": 864915,
+      "drift_fraction_numerator": 293779,
+      "drift_fraction_denominator": 571136
+    },
+    {
+      "case": 4,
+      "window": "receive",
+      "lane": "A",
+      "low_median_twice_ns": 7769423,
+      "high_median_twice_ns": 35461283,
+      "drift_fraction_numerator": 27691860,
+      "drift_fraction_denominator": 7769423
+    },
+    {
+      "case": 4,
+      "window": "builder",
+      "lane": "B",
+      "low_median_twice_ns": 2688060,
+      "high_median_twice_ns": 3277642,
+      "drift_fraction_numerator": 589582,
+      "drift_fraction_denominator": 2688060
+    },
+    {
+      "case": 5,
+      "window": "receive",
+      "lane": "A",
+      "low_median_twice_ns": 9405553,
+      "high_median_twice_ns": 33508704,
+      "drift_fraction_numerator": 24103151,
+      "drift_fraction_denominator": 9405553
+    },
+    {
+      "case": 5,
+      "window": "builder",
+      "lane": "B",
+      "low_median_twice_ns": 2628227,
+      "high_median_twice_ns": 3242264,
+      "drift_fraction_numerator": 614037,
+      "drift_fraction_denominator": 2628227
+    },
+    {
+      "case": 6,
+      "window": "receive",
+      "lane": "A",
+      "low_median_twice_ns": 10838875,
+      "high_median_twice_ns": 28688693,
+      "drift_fraction_numerator": 17849818,
+      "drift_fraction_denominator": 10838875
+    },
+    {
+      "case": 6,
+      "window": "builder",
+      "lane": "B",
+      "low_median_twice_ns": 2283220,
+      "high_median_twice_ns": 3121094,
+      "drift_fraction_numerator": 837874,
+      "drift_fraction_denominator": 2283220
+    },
+    {
+      "case": 7,
+      "window": "receive",
+      "lane": "A",
+      "low_median_twice_ns": 10771001,
+      "high_median_twice_ns": 25480708,
+      "drift_fraction_numerator": 14709707,
+      "drift_fraction_denominator": 10771001
+    },
+    {
+      "case": 7,
+      "window": "observations",
+      "lane": "A",
+      "low_median_twice_ns": 3195353,
+      "high_median_twice_ns": 3855900,
+      "drift_fraction_numerator": 660547,
+      "drift_fraction_denominator": 3195353
+    },
+    {
+      "case": 7,
+      "window": "builder",
+      "lane": "A",
+      "low_median_twice_ns": 2130219,
+      "high_median_twice_ns": 2585665,
+      "drift_fraction_numerator": 455446,
+      "drift_fraction_denominator": 2130219
+    },
+    {
+      "case": 8,
+      "window": "receive",
+      "lane": "B",
+      "low_median_twice_ns": 557900,
+      "high_median_twice_ns": 769735,
+      "drift_fraction_numerator": 211835,
+      "drift_fraction_denominator": 557900
+    },
+    {
+      "case": 8,
+      "window": "builder",
+      "lane": "B",
+      "low_median_twice_ns": 2240303,
+      "high_median_twice_ns": 2959190,
+      "drift_fraction_numerator": 718887,
+      "drift_fraction_denominator": 2240303
+    }
+  ],
+  "primary_unchanged_stage_bias": [],
+  "rules": {
+    "absolute_floor_ns": 10000,
+    "clock_reported_resolution_ns": 1,
+    "relative_threshold_numerator": 1,
+    "relative_threshold_denominator": 20,
+    "drift_limit_numerator": 1,
+    "drift_limit_denominator": 5,
+    "median_twice_ns": "exact 2 * median in ns, so half-ns medians retain integer representation",
+    "threshold_fortieth_ns": "threshold numerator with denominator 40 ns",
+    "p95": "nearest rank; n=8, equal to sample maximum"
+  },
+  "metric_order": [
+    "receive",
+    "observations",
+    "columns",
+    "builder",
+    "wholeReader"
+  ],
+  "all_raw_rows": [
+    {
+      "run": "A1",
+      "case": 1,
+      "iteration": 0,
+      "warmup": true,
+      "timing_ns": [
+        2967883,
+        105499,
+        252244,
+        222833,
+        3548809
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 1,
+      "iteration": 1,
+      "warmup": true,
+      "timing_ns": [
+        8387435,
+        1416018,
+        207590,
+        4453924,
+        14465420
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 1,
+      "iteration": 2,
+      "warmup": true,
+      "timing_ns": [
+        3938423,
+        103186,
+        375685,
+        543183,
+        4960930
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 1,
+      "iteration": 3,
+      "warmup": true,
+      "timing_ns": [
+        2981943,
+        231905,
+        187387,
+        194001,
+        3595597
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 1,
+      "iteration": 4,
+      "warmup": false,
+      "timing_ns": [
+        3336411,
+        96129,
+        194366,
+        189160,
+        3816386
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 1,
+      "iteration": 5,
+      "warmup": false,
+      "timing_ns": [
+        3713429,
+        98180,
+        184663,
+        297245,
+        4293873
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 1,
+      "iteration": 6,
+      "warmup": false,
+      "timing_ns": [
+        2835530,
+        99659,
+        297189,
+        175190,
+        3407954
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 1,
+      "iteration": 7,
+      "warmup": false,
+      "timing_ns": [
+        5107322,
+        101133,
+        190631,
+        178827,
+        5578192
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 1,
+      "iteration": 8,
+      "warmup": false,
+      "timing_ns": [
+        3904336,
+        102764,
+        201385,
+        175810,
+        4384680
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 1,
+      "iteration": 9,
+      "warmup": false,
+      "timing_ns": [
+        3006586,
+        87355,
+        181260,
+        445485,
+        3721028
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 1,
+      "iteration": 10,
+      "warmup": false,
+      "timing_ns": [
+        2404709,
+        129102,
+        190792,
+        167823,
+        2892715
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 1,
+      "iteration": 11,
+      "warmup": false,
+      "timing_ns": [
+        2561880,
+        93656,
+        204198,
+        181250,
+        3041294
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 2,
+      "iteration": 0,
+      "warmup": true,
+      "timing_ns": [
+        6242069,
+        190978,
+        696742,
+        1933877,
+        9064113
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 2,
+      "iteration": 1,
+      "warmup": true,
+      "timing_ns": [
+        5911027,
+        892753,
+        458091,
+        548783,
+        7811115
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 2,
+      "iteration": 2,
+      "warmup": true,
+      "timing_ns": [
+        11283122,
+        292413,
+        1453808,
+        2951397,
+        15981286
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 2,
+      "iteration": 3,
+      "warmup": true,
+      "timing_ns": [
+        8454461,
+        902012,
+        445464,
+        4410196,
+        14212594
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 2,
+      "iteration": 4,
+      "warmup": false,
+      "timing_ns": [
+        5424001,
+        523383,
+        1778022,
+        923829,
+        8649846
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 2,
+      "iteration": 5,
+      "warmup": false,
+      "timing_ns": [
+        3992225,
+        189436,
+        402737,
+        539386,
+        5124156
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 2,
+      "iteration": 6,
+      "warmup": false,
+      "timing_ns": [
+        4377326,
+        187174,
+        5968977,
+        3667229,
+        14201134
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 2,
+      "iteration": 7,
+      "warmup": false,
+      "timing_ns": [
+        9215366,
+        228734,
+        364884,
+        3928823,
+        13738154
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 2,
+      "iteration": 8,
+      "warmup": false,
+      "timing_ns": [
+        3251234,
+        197322,
+        844161,
+        1519183,
+        5812217
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 2,
+      "iteration": 9,
+      "warmup": false,
+      "timing_ns": [
+        2323645,
+        175637,
+        373854,
+        515511,
+        3389032
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 2,
+      "iteration": 10,
+      "warmup": false,
+      "timing_ns": [
+        2954707,
+        194594,
+        376517,
+        1060882,
+        4587088
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 2,
+      "iteration": 11,
+      "warmup": false,
+      "timing_ns": [
+        3193096,
+        1226880,
+        365037,
+        881532,
+        5666873
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 3,
+      "iteration": 0,
+      "warmup": true,
+      "timing_ns": [
+        3052464,
+        417575,
+        727973,
+        622237,
+        4820577
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 3,
+      "iteration": 1,
+      "warmup": true,
+      "timing_ns": [
+        4605295,
+        297426,
+        1520498,
+        855856,
+        7279426
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 3,
+      "iteration": 2,
+      "warmup": true,
+      "timing_ns": [
+        3532794,
+        316322,
+        454406,
+        781961,
+        5085818
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 3,
+      "iteration": 3,
+      "warmup": true,
+      "timing_ns": [
+        2479035,
+        284854,
+        471043,
+        906202,
+        4141489
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 3,
+      "iteration": 4,
+      "warmup": false,
+      "timing_ns": [
+        4141856,
+        523060,
+        529400,
+        669853,
+        5864595
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 3,
+      "iteration": 5,
+      "warmup": false,
+      "timing_ns": [
+        4312738,
+        717882,
+        583450,
+        532727,
+        6147215
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 3,
+      "iteration": 6,
+      "warmup": false,
+      "timing_ns": [
+        2449363,
+        289854,
+        445941,
+        507622,
+        3693110
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 3,
+      "iteration": 7,
+      "warmup": false,
+      "timing_ns": [
+        2990550,
+        517386,
+        477876,
+        636053,
+        4622233
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 3,
+      "iteration": 8,
+      "warmup": false,
+      "timing_ns": [
+        3277734,
+        291711,
+        485768,
+        693144,
+        4749051
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 3,
+      "iteration": 9,
+      "warmup": false,
+      "timing_ns": [
+        4300725,
+        1378713,
+        454825,
+        541463,
+        6676102
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 3,
+      "iteration": 10,
+      "warmup": false,
+      "timing_ns": [
+        3146948,
+        347529,
+        744145,
+        802772,
+        5041795
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 3,
+      "iteration": 11,
+      "warmup": false,
+      "timing_ns": [
+        4584236,
+        326964,
+        802159,
+        561043,
+        6274747
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 4,
+      "iteration": 0,
+      "warmup": true,
+      "timing_ns": [
+        9047536,
+        1352792,
+        5002676,
+        2606352,
+        18009744
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 4,
+      "iteration": 1,
+      "warmup": true,
+      "timing_ns": [
+        6700096,
+        962241,
+        2483682,
+        1061659,
+        11208072
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 4,
+      "iteration": 2,
+      "warmup": true,
+      "timing_ns": [
+        6233265,
+        1117342,
+        2817859,
+        1065513,
+        11234365
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 4,
+      "iteration": 3,
+      "warmup": true,
+      "timing_ns": [
+        4430381,
+        778233,
+        2900795,
+        1236525,
+        9346295
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 4,
+      "iteration": 4,
+      "warmup": false,
+      "timing_ns": [
+        5094054,
+        735670,
+        2670398,
+        1623114,
+        10123760
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 4,
+      "iteration": 5,
+      "warmup": false,
+      "timing_ns": [
+        3618606,
+        1001692,
+        2841422,
+        1150437,
+        8612472
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 4,
+      "iteration": 6,
+      "warmup": false,
+      "timing_ns": [
+        4079604,
+        704652,
+        2638655,
+        929031,
+        8352259
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 4,
+      "iteration": 7,
+      "warmup": false,
+      "timing_ns": [
+        3969425,
+        1482730,
+        2787467,
+        1417390,
+        9657414
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 4,
+      "iteration": 8,
+      "warmup": false,
+      "timing_ns": [
+        4219222,
+        849239,
+        2886688,
+        1048101,
+        9003638
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 4,
+      "iteration": 9,
+      "warmup": false,
+      "timing_ns": [
+        3606382,
+        1077051,
+        2502176,
+        1667594,
+        8853671
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 4,
+      "iteration": 10,
+      "warmup": false,
+      "timing_ns": [
+        3372426,
+        707692,
+        3561395,
+        1102235,
+        8744151
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 4,
+      "iteration": 11,
+      "warmup": false,
+      "timing_ns": [
+        3799998,
+        691389,
+        2599081,
+        1125256,
+        8216080
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 5,
+      "iteration": 0,
+      "warmup": true,
+      "timing_ns": [
+        3393896,
+        2068170,
+        3430100,
+        1445544,
+        10338078
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 5,
+      "iteration": 1,
+      "warmup": true,
+      "timing_ns": [
+        4527508,
+        2622788,
+        4088513,
+        1249698,
+        12488930
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 5,
+      "iteration": 2,
+      "warmup": true,
+      "timing_ns": [
+        3670017,
+        2646339,
+        4371516,
+        1080089,
+        11768383
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 5,
+      "iteration": 3,
+      "warmup": true,
+      "timing_ns": [
+        3552214,
+        2474935,
+        3500584,
+        1283821,
+        10812003
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 5,
+      "iteration": 4,
+      "warmup": false,
+      "timing_ns": [
+        4138520,
+        2204531,
+        4234122,
+        1013138,
+        11590700
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 5,
+      "iteration": 5,
+      "warmup": false,
+      "timing_ns": [
+        5267033,
+        2485173,
+        3442206,
+        1393667,
+        12588462
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 5,
+      "iteration": 6,
+      "warmup": false,
+      "timing_ns": [
+        6692161,
+        2248931,
+        3285043,
+        1994738,
+        14221420
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 5,
+      "iteration": 7,
+      "warmup": false,
+      "timing_ns": [
+        5495655,
+        3049692,
+        3612145,
+        1506019,
+        13663883
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 5,
+      "iteration": 8,
+      "warmup": false,
+      "timing_ns": [
+        3661333,
+        3681778,
+        3228288,
+        1046286,
+        11618246
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 5,
+      "iteration": 9,
+      "warmup": false,
+      "timing_ns": [
+        7265168,
+        3309532,
+        3654969,
+        1072294,
+        15302542
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 5,
+      "iteration": 10,
+      "warmup": false,
+      "timing_ns": [
+        3687005,
+        2366621,
+        3407959,
+        1286836,
+        10748926
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 5,
+      "iteration": 11,
+      "warmup": false,
+      "timing_ns": [
+        3170446,
+        2117535,
+        4567436,
+        1265492,
+        11121352
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 6,
+      "iteration": 0,
+      "warmup": true,
+      "timing_ns": [
+        5069217,
+        625453,
+        1988763,
+        798978,
+        8482778
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 6,
+      "iteration": 1,
+      "warmup": true,
+      "timing_ns": [
+        7130974,
+        1001338,
+        2394165,
+        1232985,
+        11759838
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 6,
+      "iteration": 2,
+      "warmup": true,
+      "timing_ns": [
+        7501845,
+        773632,
+        2160970,
+        1654532,
+        12091350
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 6,
+      "iteration": 3,
+      "warmup": true,
+      "timing_ns": [
+        5038885,
+        710652,
+        2160817,
+        1251433,
+        9162202
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 6,
+      "iteration": 4,
+      "warmup": false,
+      "timing_ns": [
+        4564595,
+        563922,
+        2411929,
+        970897,
+        8511747
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 6,
+      "iteration": 5,
+      "warmup": false,
+      "timing_ns": [
+        4528592,
+        664326,
+        2018998,
+        955994,
+        8168268
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 6,
+      "iteration": 6,
+      "warmup": false,
+      "timing_ns": [
+        6393438,
+        723695,
+        2402267,
+        1133397,
+        10653180
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 6,
+      "iteration": 7,
+      "warmup": false,
+      "timing_ns": [
+        6649152,
+        590314,
+        2171585,
+        1195866,
+        10607329
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 6,
+      "iteration": 8,
+      "warmup": false,
+      "timing_ns": [
+        5149801,
+        578719,
+        2173671,
+        1158160,
+        9061010
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 6,
+      "iteration": 9,
+      "warmup": false,
+      "timing_ns": [
+        5559227,
+        580576,
+        1860831,
+        1142187,
+        9143155
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 6,
+      "iteration": 10,
+      "warmup": false,
+      "timing_ns": [
+        5279648,
+        611764,
+        2149549,
+        836158,
+        8877493
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 6,
+      "iteration": 11,
+      "warmup": false,
+      "timing_ns": [
+        7271410,
+        694991,
+        2830483,
+        1062343,
+        11859658
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 7,
+      "iteration": 0,
+      "warmup": true,
+      "timing_ns": [
+        5701455,
+        2008152,
+        2493639,
+        1041139,
+        11244798
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 7,
+      "iteration": 1,
+      "warmup": true,
+      "timing_ns": [
+        4739224,
+        1878374,
+        2955922,
+        1241905,
+        10815790
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 7,
+      "iteration": 2,
+      "warmup": true,
+      "timing_ns": [
+        6072722,
+        2152580,
+        2820993,
+        1356850,
+        12403542
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 7,
+      "iteration": 3,
+      "warmup": true,
+      "timing_ns": [
+        5252164,
+        2117705,
+        3364911,
+        926055,
+        11661201
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 7,
+      "iteration": 4,
+      "warmup": false,
+      "timing_ns": [
+        6523610,
+        1714318,
+        2826758,
+        1020285,
+        12085361
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 7,
+      "iteration": 5,
+      "warmup": false,
+      "timing_ns": [
+        6295674,
+        1668747,
+        2127360,
+        1169420,
+        11261583
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 7,
+      "iteration": 6,
+      "warmup": false,
+      "timing_ns": [
+        5583296,
+        2503082,
+        2116618,
+        1145717,
+        11349139
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 7,
+      "iteration": 7,
+      "warmup": false,
+      "timing_ns": [
+        5155886,
+        3033049,
+        2581253,
+        909691,
+        11680300
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 7,
+      "iteration": 8,
+      "warmup": false,
+      "timing_ns": [
+        5187705,
+        1858401,
+        2684269,
+        1109934,
+        10840667
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 7,
+      "iteration": 9,
+      "warmup": false,
+      "timing_ns": [
+        5772561,
+        2090341,
+        2158899,
+        852098,
+        10874293
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 7,
+      "iteration": 10,
+      "warmup": false,
+      "timing_ns": [
+        5054632,
+        1548549,
+        2592569,
+        1384215,
+        10580450
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 7,
+      "iteration": 11,
+      "warmup": false,
+      "timing_ns": [
+        4922355,
+        1997499,
+        2690850,
+        961224,
+        10572521
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 8,
+      "iteration": 0,
+      "warmup": true,
+      "timing_ns": [
+        269822,
+        92331,
+        863738,
+        1256078,
+        2482297
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 8,
+      "iteration": 1,
+      "warmup": true,
+      "timing_ns": [
+        293766,
+        90092,
+        888420,
+        1239333,
+        2511961
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 8,
+      "iteration": 2,
+      "warmup": true,
+      "timing_ns": [
+        297369,
+        89567,
+        659895,
+        900832,
+        1948024
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 8,
+      "iteration": 3,
+      "warmup": true,
+      "timing_ns": [
+        268196,
+        119529,
+        759539,
+        2410881,
+        3558509
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 8,
+      "iteration": 4,
+      "warmup": false,
+      "timing_ns": [
+        357747,
+        652136,
+        941420,
+        1109863,
+        3061522
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 8,
+      "iteration": 5,
+      "warmup": false,
+      "timing_ns": [
+        291822,
+        133903,
+        948949,
+        2300960,
+        3676012
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 8,
+      "iteration": 6,
+      "warmup": false,
+      "timing_ns": [
+        264863,
+        88284,
+        697796,
+        918006,
+        1969320
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 8,
+      "iteration": 7,
+      "warmup": false,
+      "timing_ns": [
+        350088,
+        89639,
+        661243,
+        1482946,
+        2584267
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 8,
+      "iteration": 8,
+      "warmup": false,
+      "timing_ns": [
+        466132,
+        165799,
+        1357823,
+        1093651,
+        3083844
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 8,
+      "iteration": 9,
+      "warmup": false,
+      "timing_ns": [
+        262895,
+        78737,
+        834771,
+        1669633,
+        2846397
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 8,
+      "iteration": 10,
+      "warmup": false,
+      "timing_ns": [
+        331394,
+        103399,
+        671646,
+        970670,
+        2077606
+      ]
+    },
+    {
+      "run": "A1",
+      "case": 8,
+      "iteration": 11,
+      "warmup": false,
+      "timing_ns": [
+        692659,
+        120031,
+        1396308,
+        2444207,
+        4653825
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 1,
+      "iteration": 0,
+      "warmup": true,
+      "timing_ns": [
+        2876523,
+        99987,
+        145442,
+        280656,
+        3402921
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 1,
+      "iteration": 1,
+      "warmup": true,
+      "timing_ns": [
+        3520535,
+        87598,
+        149083,
+        172622,
+        3930366
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 1,
+      "iteration": 2,
+      "warmup": true,
+      "timing_ns": [
+        6999015,
+        98316,
+        872570,
+        183981,
+        8154208
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 1,
+      "iteration": 3,
+      "warmup": true,
+      "timing_ns": [
+        2631328,
+        150269,
+        177199,
+        171803,
+        3130920
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 1,
+      "iteration": 4,
+      "warmup": false,
+      "timing_ns": [
+        2802403,
+        91383,
+        301620,
+        169776,
+        3365608
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 1,
+      "iteration": 5,
+      "warmup": false,
+      "timing_ns": [
+        3423202,
+        88387,
+        283486,
+        196027,
+        3991706
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 1,
+      "iteration": 6,
+      "warmup": false,
+      "timing_ns": [
+        3447996,
+        228772,
+        206932,
+        172562,
+        4056633
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 1,
+      "iteration": 7,
+      "warmup": false,
+      "timing_ns": [
+        2774976,
+        91115,
+        229990,
+        565211,
+        3661701
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 1,
+      "iteration": 8,
+      "warmup": false,
+      "timing_ns": [
+        2739338,
+        91850,
+        154019,
+        176889,
+        3162390
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 1,
+      "iteration": 9,
+      "warmup": false,
+      "timing_ns": [
+        6523147,
+        138026,
+        1138468,
+        211315,
+        8011351
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 1,
+      "iteration": 10,
+      "warmup": false,
+      "timing_ns": [
+        3198692,
+        85669,
+        228141,
+        192175,
+        3704991
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 1,
+      "iteration": 11,
+      "warmup": false,
+      "timing_ns": [
+        3651881,
+        97290,
+        144640,
+        202955,
+        4097230
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 2,
+      "iteration": 0,
+      "warmup": true,
+      "timing_ns": [
+        2247561,
+        294745,
+        262572,
+        666362,
+        3471592
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 2,
+      "iteration": 1,
+      "warmup": true,
+      "timing_ns": [
+        2395835,
+        510065,
+        290449,
+        1275399,
+        4472212
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 2,
+      "iteration": 2,
+      "warmup": true,
+      "timing_ns": [
+        2073432,
+        158320,
+        296103,
+        793678,
+        3321881
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 2,
+      "iteration": 3,
+      "warmup": true,
+      "timing_ns": [
+        2021159,
+        592626,
+        273083,
+        740224,
+        3627491
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 2,
+      "iteration": 4,
+      "warmup": false,
+      "timing_ns": [
+        2123029,
+        160447,
+        265625,
+        530221,
+        3079660
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 2,
+      "iteration": 5,
+      "warmup": false,
+      "timing_ns": [
+        2484043,
+        177946,
+        1768975,
+        687776,
+        5119276
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 2,
+      "iteration": 6,
+      "warmup": false,
+      "timing_ns": [
+        2889133,
+        185653,
+        267977,
+        615923,
+        3959015
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 2,
+      "iteration": 7,
+      "warmup": false,
+      "timing_ns": [
+        2196285,
+        624366,
+        399692,
+        992101,
+        4212795
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 2,
+      "iteration": 8,
+      "warmup": false,
+      "timing_ns": [
+        2003258,
+        347549,
+        484188,
+        594523,
+        3429872
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 2,
+      "iteration": 9,
+      "warmup": false,
+      "timing_ns": [
+        2913640,
+        157358,
+        320496,
+        619820,
+        4011655
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 2,
+      "iteration": 10,
+      "warmup": false,
+      "timing_ns": [
+        2084221,
+        159466,
+        267205,
+        529174,
+        3040405
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 2,
+      "iteration": 11,
+      "warmup": false,
+      "timing_ns": [
+        2484250,
+        161574,
+        328529,
+        512772,
+        3487504
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 3,
+      "iteration": 0,
+      "warmup": true,
+      "timing_ns": [
+        2122173,
+        346603,
+        422695,
+        535056,
+        3426872
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 3,
+      "iteration": 1,
+      "warmup": true,
+      "timing_ns": [
+        7581406,
+        313297,
+        332598,
+        516373,
+        8744215
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 3,
+      "iteration": 2,
+      "warmup": true,
+      "timing_ns": [
+        3027597,
+        318126,
+        324273,
+        550674,
+        4221020
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 3,
+      "iteration": 3,
+      "warmup": true,
+      "timing_ns": [
+        4567924,
+        326310,
+        535426,
+        660152,
+        6090247
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 3,
+      "iteration": 4,
+      "warmup": false,
+      "timing_ns": [
+        3627114,
+        326213,
+        658313,
+        1150059,
+        5762135
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 3,
+      "iteration": 5,
+      "warmup": false,
+      "timing_ns": [
+        2863678,
+        440742,
+        340198,
+        620387,
+        4265319
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 3,
+      "iteration": 6,
+      "warmup": false,
+      "timing_ns": [
+        3222422,
+        289668,
+        349213,
+        488871,
+        4350485
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 3,
+      "iteration": 7,
+      "warmup": false,
+      "timing_ns": [
+        3166827,
+        304896,
+        438223,
+        776895,
+        4687246
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 3,
+      "iteration": 8,
+      "warmup": false,
+      "timing_ns": [
+        3217731,
+        373362,
+        372754,
+        659836,
+        4624042
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 3,
+      "iteration": 9,
+      "warmup": false,
+      "timing_ns": [
+        5945471,
+        286757,
+        328211,
+        786119,
+        7346998
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 3,
+      "iteration": 10,
+      "warmup": false,
+      "timing_ns": [
+        4533148,
+        596612,
+        358950,
+        999183,
+        6488263
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 3,
+      "iteration": 11,
+      "warmup": false,
+      "timing_ns": [
+        3998297,
+        698157,
+        626642,
+        567610,
+        5891154
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 4,
+      "iteration": 0,
+      "warmup": true,
+      "timing_ns": [
+        14594072,
+        1179898,
+        2830349,
+        1745611,
+        20350329
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 4,
+      "iteration": 1,
+      "warmup": true,
+      "timing_ns": [
+        12867021,
+        1058887,
+        2777799,
+        2008066,
+        18712190
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 4,
+      "iteration": 2,
+      "warmup": true,
+      "timing_ns": [
+        13079123,
+        1177492,
+        3018632,
+        1129375,
+        18405046
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 4,
+      "iteration": 3,
+      "warmup": true,
+      "timing_ns": [
+        26098500,
+        3106970,
+        4000459,
+        5074145,
+        38280502
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 4,
+      "iteration": 4,
+      "warmup": false,
+      "timing_ns": [
+        19195916,
+        2357833,
+        7018533,
+        1185315,
+        29758109
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 4,
+      "iteration": 5,
+      "warmup": false,
+      "timing_ns": [
+        16487153,
+        873308,
+        2884303,
+        2029267,
+        22274502
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 4,
+      "iteration": 6,
+      "warmup": false,
+      "timing_ns": [
+        15208894,
+        2134686,
+        5116989,
+        1482953,
+        23944075
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 4,
+      "iteration": 7,
+      "warmup": false,
+      "timing_ns": [
+        16982599,
+        1195731,
+        3758369,
+        1893697,
+        23830876
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 4,
+      "iteration": 8,
+      "warmup": false,
+      "timing_ns": [
+        13991053,
+        994884,
+        3100723,
+        1139198,
+        19226241
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 4,
+      "iteration": 9,
+      "warmup": false,
+      "timing_ns": [
+        14715435,
+        1154377,
+        3081274,
+        2162665,
+        21114143
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 4,
+      "iteration": 10,
+      "warmup": false,
+      "timing_ns": [
+        18236790,
+        850509,
+        2670546,
+        1786649,
+        23545015
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 4,
+      "iteration": 11,
+      "warmup": false,
+      "timing_ns": [
+        11789522,
+        856130,
+        2358562,
+        1490993,
+        16495610
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 5,
+      "iteration": 0,
+      "warmup": true,
+      "timing_ns": [
+        18300283,
+        2905889,
+        8418399,
+        1271940,
+        30896949
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 5,
+      "iteration": 1,
+      "warmup": true,
+      "timing_ns": [
+        13300883,
+        2217771,
+        6334274,
+        1305283,
+        23158725
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 5,
+      "iteration": 2,
+      "warmup": true,
+      "timing_ns": [
+        13016297,
+        2620475,
+        3700700,
+        1793638,
+        21131589
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 5,
+      "iteration": 3,
+      "warmup": true,
+      "timing_ns": [
+        16938279,
+        4406093,
+        5381529,
+        1511641,
+        28238009
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 5,
+      "iteration": 4,
+      "warmup": false,
+      "timing_ns": [
+        14616845,
+        2812673,
+        3219586,
+        1268571,
+        21918119
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 5,
+      "iteration": 5,
+      "warmup": false,
+      "timing_ns": [
+        13926430,
+        2805010,
+        5303219,
+        1488474,
+        23523565
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 5,
+      "iteration": 6,
+      "warmup": false,
+      "timing_ns": [
+        17068920,
+        5191012,
+        5381348,
+        1407151,
+        29049208
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 5,
+      "iteration": 7,
+      "warmup": false,
+      "timing_ns": [
+        13220264,
+        2366465,
+        8431656,
+        1767143,
+        25785939
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 5,
+      "iteration": 8,
+      "warmup": false,
+      "timing_ns": [
+        14392966,
+        2514007,
+        3213370,
+        1055560,
+        21176304
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 5,
+      "iteration": 9,
+      "warmup": false,
+      "timing_ns": [
+        14350331,
+        4006733,
+        3734908,
+        1999106,
+        24091454
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 5,
+      "iteration": 10,
+      "warmup": false,
+      "timing_ns": [
+        13139812,
+        2410329,
+        7060047,
+        1796073,
+        24406714
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 5,
+      "iteration": 11,
+      "warmup": false,
+      "timing_ns": [
+        22335220,
+        5784848,
+        3860459,
+        1753790,
+        33734817
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 6,
+      "iteration": 0,
+      "warmup": true,
+      "timing_ns": [
+        21768211,
+        737047,
+        1947828,
+        847238,
+        25300699
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 6,
+      "iteration": 1,
+      "warmup": true,
+      "timing_ns": [
+        11956452,
+        866894,
+        2291311,
+        1288331,
+        16403416
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 6,
+      "iteration": 2,
+      "warmup": true,
+      "timing_ns": [
+        12538086,
+        660934,
+        2154955,
+        1155983,
+        16510398
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 6,
+      "iteration": 3,
+      "warmup": true,
+      "timing_ns": [
+        12748899,
+        1020472,
+        2259959,
+        1253498,
+        17283246
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 6,
+      "iteration": 4,
+      "warmup": false,
+      "timing_ns": [
+        13699226,
+        745153,
+        2508853,
+        1146824,
+        18100474
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 6,
+      "iteration": 5,
+      "warmup": false,
+      "timing_ns": [
+        14900072,
+        758402,
+        2740435,
+        1642346,
+        20041647
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 6,
+      "iteration": 6,
+      "warmup": false,
+      "timing_ns": [
+        11974435,
+        932791,
+        2118603,
+        1136396,
+        16162650
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 6,
+      "iteration": 7,
+      "warmup": false,
+      "timing_ns": [
+        23671558,
+        674559,
+        4826347,
+        5077462,
+        34250431
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 6,
+      "iteration": 8,
+      "warmup": false,
+      "timing_ns": [
+        11409192,
+        619122,
+        2163107,
+        948533,
+        15140432
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 6,
+      "iteration": 9,
+      "warmup": false,
+      "timing_ns": [
+        13127217,
+        1437817,
+        1856290,
+        1510467,
+        17932191
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 6,
+      "iteration": 10,
+      "warmup": false,
+      "timing_ns": [
+        12551191,
+        630998,
+        1893243,
+        825865,
+        15901688
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 6,
+      "iteration": 11,
+      "warmup": false,
+      "timing_ns": [
+        13287573,
+        599844,
+        1926039,
+        1074210,
+        16888140
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 7,
+      "iteration": 0,
+      "warmup": true,
+      "timing_ns": [
+        11312833,
+        2155204,
+        2368146,
+        1232186,
+        17068786
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 7,
+      "iteration": 1,
+      "warmup": true,
+      "timing_ns": [
+        18303291,
+        2005594,
+        2389487,
+        2085006,
+        24783784
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 7,
+      "iteration": 2,
+      "warmup": true,
+      "timing_ns": [
+        21535964,
+        1833591,
+        4452829,
+        3329075,
+        31151856
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 7,
+      "iteration": 3,
+      "warmup": true,
+      "timing_ns": [
+        15437561,
+        2471439,
+        5495139,
+        1116823,
+        24521377
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 7,
+      "iteration": 4,
+      "warmup": false,
+      "timing_ns": [
+        13417279,
+        1937417,
+        2481305,
+        1049262,
+        18885660
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 7,
+      "iteration": 5,
+      "warmup": false,
+      "timing_ns": [
+        15719283,
+        1838004,
+        2366700,
+        1062728,
+        20987102
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 7,
+      "iteration": 6,
+      "warmup": false,
+      "timing_ns": [
+        19148015,
+        2358699,
+        4355316,
+        1364975,
+        27227428
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 7,
+      "iteration": 7,
+      "warmup": false,
+      "timing_ns": [
+        17053132,
+        1801447,
+        3892801,
+        2788649,
+        25536486
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 7,
+      "iteration": 8,
+      "warmup": false,
+      "timing_ns": [
+        27254319,
+        3991831,
+        7951081,
+        1640059,
+        40837728
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 7,
+      "iteration": 9,
+      "warmup": false,
+      "timing_ns": [
+        25125073,
+        2417632,
+        3822793,
+        1437452,
+        32803487
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 7,
+      "iteration": 10,
+      "warmup": false,
+      "timing_ns": [
+        23616007,
+        4423924,
+        3577169,
+        1323960,
+        32941467
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 7,
+      "iteration": 11,
+      "warmup": false,
+      "timing_ns": [
+        16592743,
+        1851346,
+        2320446,
+        1515631,
+        22280557
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 8,
+      "iteration": 0,
+      "warmup": true,
+      "timing_ns": [
+        341515,
+        117875,
+        822911,
+        2247200,
+        3529910
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 8,
+      "iteration": 1,
+      "warmup": true,
+      "timing_ns": [
+        263406,
+        90550,
+        728982,
+        1049612,
+        2133002
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 8,
+      "iteration": 2,
+      "warmup": true,
+      "timing_ns": [
+        267760,
+        90535,
+        743333,
+        1182684,
+        2284666
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 8,
+      "iteration": 3,
+      "warmup": true,
+      "timing_ns": [
+        282937,
+        94426,
+        941216,
+        1342468,
+        2661435
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 8,
+      "iteration": 4,
+      "warmup": false,
+      "timing_ns": [
+        267605,
+        171592,
+        1793349,
+        2672344,
+        4905309
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 8,
+      "iteration": 5,
+      "warmup": false,
+      "timing_ns": [
+        411820,
+        101604,
+        739421,
+        922832,
+        2175969
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 8,
+      "iteration": 6,
+      "warmup": false,
+      "timing_ns": [
+        273332,
+        101007,
+        689033,
+        1851127,
+        2914827
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 8,
+      "iteration": 7,
+      "warmup": false,
+      "timing_ns": [
+        556004,
+        96267,
+        802925,
+        1092455,
+        2548002
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 8,
+      "iteration": 8,
+      "warmup": false,
+      "timing_ns": [
+        408618,
+        195886,
+        1424221,
+        1358653,
+        3387757
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 8,
+      "iteration": 9,
+      "warmup": false,
+      "timing_ns": [
+        361117,
+        90040,
+        984306,
+        1552675,
+        2988685
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 8,
+      "iteration": 10,
+      "warmup": false,
+      "timing_ns": [
+        280209,
+        104190,
+        1014131,
+        1406515,
+        2805469
+      ]
+    },
+    {
+      "run": "B1",
+      "case": 8,
+      "iteration": 11,
+      "warmup": false,
+      "timing_ns": [
+        530606,
+        113874,
+        1438181,
+        1687683,
+        3770736
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 1,
+      "iteration": 0,
+      "warmup": true,
+      "timing_ns": [
+        7153621,
+        106579,
+        147029,
+        283803,
+        7691434
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 1,
+      "iteration": 1,
+      "warmup": true,
+      "timing_ns": [
+        2935137,
+        92462,
+        145016,
+        166665,
+        3339677
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 1,
+      "iteration": 2,
+      "warmup": true,
+      "timing_ns": [
+        3404333,
+        89074,
+        519861,
+        425269,
+        4439018
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 1,
+      "iteration": 3,
+      "warmup": true,
+      "timing_ns": [
+        3546811,
+        90914,
+        274846,
+        171363,
+        4084329
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 1,
+      "iteration": 4,
+      "warmup": false,
+      "timing_ns": [
+        3452540,
+        161775,
+        163232,
+        283774,
+        4061704
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 1,
+      "iteration": 5,
+      "warmup": false,
+      "timing_ns": [
+        4708442,
+        107890,
+        288891,
+        587580,
+        5693123
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 1,
+      "iteration": 6,
+      "warmup": false,
+      "timing_ns": [
+        3403083,
+        119491,
+        235487,
+        171171,
+        3929598
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 1,
+      "iteration": 7,
+      "warmup": false,
+      "timing_ns": [
+        2838686,
+        83156,
+        146979,
+        165230,
+        3234343
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 1,
+      "iteration": 8,
+      "warmup": false,
+      "timing_ns": [
+        3357793,
+        87095,
+        222310,
+        168756,
+        3836288
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 1,
+      "iteration": 9,
+      "warmup": false,
+      "timing_ns": [
+        3573984,
+        119244,
+        142880,
+        207135,
+        4043534
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 1,
+      "iteration": 10,
+      "warmup": false,
+      "timing_ns": [
+        3463704,
+        116810,
+        147057,
+        170561,
+        3898413
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 1,
+      "iteration": 11,
+      "warmup": false,
+      "timing_ns": [
+        2646028,
+        93235,
+        143178,
+        169441,
+        3052272
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 2,
+      "iteration": 0,
+      "warmup": true,
+      "timing_ns": [
+        4459322,
+        181644,
+        271931,
+        1718752,
+        6632032
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 2,
+      "iteration": 1,
+      "warmup": true,
+      "timing_ns": [
+        4842229,
+        177615,
+        293714,
+        519049,
+        5832938
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 2,
+      "iteration": 2,
+      "warmup": true,
+      "timing_ns": [
+        2218259,
+        394136,
+        311299,
+        485055,
+        3409084
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 2,
+      "iteration": 3,
+      "warmup": true,
+      "timing_ns": [
+        2340205,
+        175990,
+        268676,
+        527899,
+        3313094
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 2,
+      "iteration": 4,
+      "warmup": false,
+      "timing_ns": [
+        2128574,
+        165272,
+        267478,
+        550203,
+        3111835
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 2,
+      "iteration": 5,
+      "warmup": false,
+      "timing_ns": [
+        2547794,
+        418660,
+        280589,
+        705902,
+        3953275
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 2,
+      "iteration": 6,
+      "warmup": false,
+      "timing_ns": [
+        2817846,
+        323057,
+        275847,
+        696276,
+        4113369
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 2,
+      "iteration": 7,
+      "warmup": false,
+      "timing_ns": [
+        2005312,
+        165615,
+        276052,
+        1123079,
+        3570411
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 2,
+      "iteration": 8,
+      "warmup": false,
+      "timing_ns": [
+        3315028,
+        185513,
+        301275,
+        571839,
+        4373993
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 2,
+      "iteration": 9,
+      "warmup": false,
+      "timing_ns": [
+        2213482,
+        162368,
+        345125,
+        690472,
+        3411799
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 2,
+      "iteration": 10,
+      "warmup": false,
+      "timing_ns": [
+        2269109,
+        170960,
+        285998,
+        648792,
+        3375246
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 2,
+      "iteration": 11,
+      "warmup": false,
+      "timing_ns": [
+        2286676,
+        190616,
+        447679,
+        785031,
+        3710329
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 3,
+      "iteration": 0,
+      "warmup": true,
+      "timing_ns": [
+        3531992,
+        295067,
+        342588,
+        681833,
+        4851779
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 3,
+      "iteration": 1,
+      "warmup": true,
+      "timing_ns": [
+        2502632,
+        279030,
+        343326,
+        520361,
+        3645659
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 3,
+      "iteration": 2,
+      "warmup": true,
+      "timing_ns": [
+        2460523,
+        349569,
+        389831,
+        546997,
+        3747222
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 3,
+      "iteration": 3,
+      "warmup": true,
+      "timing_ns": [
+        2117214,
+        276549,
+        353258,
+        488068,
+        3235398
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 3,
+      "iteration": 4,
+      "warmup": false,
+      "timing_ns": [
+        2957319,
+        374894,
+        412589,
+        952710,
+        4697859
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 3,
+      "iteration": 5,
+      "warmup": false,
+      "timing_ns": [
+        2061515,
+        421707,
+        337052,
+        539392,
+        3360050
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 3,
+      "iteration": 6,
+      "warmup": false,
+      "timing_ns": [
+        4047828,
+        435066,
+        500757,
+        666374,
+        5650400
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 3,
+      "iteration": 7,
+      "warmup": false,
+      "timing_ns": [
+        4673149,
+        411057,
+        369314,
+        1051591,
+        6505492
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 3,
+      "iteration": 8,
+      "warmup": false,
+      "timing_ns": [
+        3057733,
+        572744,
+        652953,
+        541600,
+        4825401
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 3,
+      "iteration": 9,
+      "warmup": false,
+      "timing_ns": [
+        3637196,
+        311402,
+        368239,
+        520204,
+        4837355
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 3,
+      "iteration": 10,
+      "warmup": false,
+      "timing_ns": [
+        3631780,
+        672056,
+        330951,
+        796748,
+        5431864
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 3,
+      "iteration": 11,
+      "warmup": false,
+      "timing_ns": [
+        5259352,
+        393228,
+        332935,
+        910782,
+        6896622
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 4,
+      "iteration": 0,
+      "warmup": true,
+      "timing_ns": [
+        16340432,
+        860567,
+        2689689,
+        1685891,
+        21577023
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 4,
+      "iteration": 1,
+      "warmup": true,
+      "timing_ns": [
+        15292729,
+        1096852,
+        3026613,
+        1380475,
+        20797079
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 4,
+      "iteration": 2,
+      "warmup": true,
+      "timing_ns": [
+        14421373,
+        1097564,
+        2680400,
+        1047828,
+        19247733
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 4,
+      "iteration": 3,
+      "warmup": true,
+      "timing_ns": [
+        25097005,
+        1079991,
+        2884109,
+        1269476,
+        30331055
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 4,
+      "iteration": 4,
+      "warmup": false,
+      "timing_ns": [
+        13258833,
+        1057707,
+        2804299,
+        1327903,
+        18449205
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 4,
+      "iteration": 5,
+      "warmup": false,
+      "timing_ns": [
+        14457649,
+        957130,
+        2724451,
+        1059169,
+        19198790
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 4,
+      "iteration": 6,
+      "warmup": false,
+      "timing_ns": [
+        12662558,
+        782657,
+        2494660,
+        1518823,
+        17459064
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 4,
+      "iteration": 7,
+      "warmup": false,
+      "timing_ns": [
+        13419126,
+        792897,
+        2244575,
+        1372343,
+        17829332
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 4,
+      "iteration": 8,
+      "warmup": false,
+      "timing_ns": [
+        15449575,
+        971692,
+        2850378,
+        1360157,
+        20632166
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 4,
+      "iteration": 9,
+      "warmup": false,
+      "timing_ns": [
+        14001062,
+        936318,
+        2668344,
+        1218669,
+        18824855
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 4,
+      "iteration": 10,
+      "warmup": false,
+      "timing_ns": [
+        12706046,
+        888590,
+        2542337,
+        932506,
+        17069806
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 4,
+      "iteration": 11,
+      "warmup": false,
+      "timing_ns": [
+        13586060,
+        1036567,
+        2831928,
+        1774122,
+        19229202
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 5,
+      "iteration": 0,
+      "warmup": true,
+      "timing_ns": [
+        15642373,
+        2710719,
+        2944667,
+        2001589,
+        23299721
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 5,
+      "iteration": 1,
+      "warmup": true,
+      "timing_ns": [
+        16004912,
+        2170562,
+        3316725,
+        1296701,
+        22789316
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 5,
+      "iteration": 2,
+      "warmup": true,
+      "timing_ns": [
+        13566692,
+        2123949,
+        3440763,
+        993507,
+        20125399
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 5,
+      "iteration": 3,
+      "warmup": true,
+      "timing_ns": [
+        14757540,
+        2228433,
+        3132640,
+        1190640,
+        21309690
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 5,
+      "iteration": 4,
+      "warmup": false,
+      "timing_ns": [
+        13810361,
+        2312153,
+        2843694,
+        1276618,
+        20243276
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 5,
+      "iteration": 5,
+      "warmup": false,
+      "timing_ns": [
+        13576302,
+        2472709,
+        3612546,
+        1154921,
+        20816917
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 5,
+      "iteration": 6,
+      "warmup": false,
+      "timing_ns": [
+        16624178,
+        2406915,
+        3495159,
+        1227432,
+        23754081
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 5,
+      "iteration": 7,
+      "warmup": false,
+      "timing_ns": [
+        13798755,
+        2402792,
+        3579087,
+        1391826,
+        21172864
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 5,
+      "iteration": 8,
+      "warmup": false,
+      "timing_ns": [
+        14828461,
+        2654556,
+        3346465,
+        1328530,
+        22158438
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 5,
+      "iteration": 9,
+      "warmup": false,
+      "timing_ns": [
+        13681451,
+        2355971,
+        3439826,
+        1671268,
+        21148926
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 5,
+      "iteration": 10,
+      "warmup": false,
+      "timing_ns": [
+        18611765,
+        2703939,
+        3421497,
+        1418984,
+        26156578
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 5,
+      "iteration": 11,
+      "warmup": false,
+      "timing_ns": [
+        15012411,
+        2672880,
+        3195320,
+        1299697,
+        22180683
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 6,
+      "iteration": 0,
+      "warmup": true,
+      "timing_ns": [
+        9964288,
+        615904,
+        1664273,
+        949673,
+        13194478
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 6,
+      "iteration": 1,
+      "warmup": true,
+      "timing_ns": [
+        13080060,
+        612368,
+        1852228,
+        3686085,
+        19231084
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 6,
+      "iteration": 2,
+      "warmup": true,
+      "timing_ns": [
+        10359402,
+        636851,
+        1760558,
+        933772,
+        13690965
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 6,
+      "iteration": 3,
+      "warmup": true,
+      "timing_ns": [
+        11378008,
+        1226401,
+        2324857,
+        987142,
+        15916850
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 6,
+      "iteration": 4,
+      "warmup": false,
+      "timing_ns": [
+        11039115,
+        601370,
+        2017563,
+        1560651,
+        15219192
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 6,
+      "iteration": 5,
+      "warmup": false,
+      "timing_ns": [
+        10985290,
+        607586,
+        2495989,
+        878777,
+        14968039
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 6,
+      "iteration": 6,
+      "warmup": false,
+      "timing_ns": [
+        14269298,
+        791440,
+        3295177,
+        992096,
+        19348377
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 6,
+      "iteration": 7,
+      "warmup": false,
+      "timing_ns": [
+        9882090,
+        642698,
+        2052879,
+        1560443,
+        14138500
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 6,
+      "iteration": 8,
+      "warmup": false,
+      "timing_ns": [
+        11797413,
+        639386,
+        2240472,
+        1205375,
+        15883152
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 6,
+      "iteration": 9,
+      "warmup": false,
+      "timing_ns": [
+        11864985,
+        717694,
+        2058297,
+        2783934,
+        17425288
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 6,
+      "iteration": 10,
+      "warmup": false,
+      "timing_ns": [
+        11057694,
+        1073500,
+        3355928,
+        1684086,
+        17171624
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 6,
+      "iteration": 11,
+      "warmup": false,
+      "timing_ns": [
+        16314350,
+        684174,
+        4363691,
+        5644423,
+        27007154
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 7,
+      "iteration": 0,
+      "warmup": true,
+      "timing_ns": [
+        12908860,
+        1965272,
+        2452311,
+        1894560,
+        19221447
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 7,
+      "iteration": 1,
+      "warmup": true,
+      "timing_ns": [
+        9968154,
+        2826894,
+        4760071,
+        1742481,
+        19298150
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 7,
+      "iteration": 2,
+      "warmup": true,
+      "timing_ns": [
+        12300025,
+        2162040,
+        3304870,
+        1456386,
+        19223717
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 7,
+      "iteration": 3,
+      "warmup": true,
+      "timing_ns": [
+        15969297,
+        1838689,
+        2331545,
+        1161547,
+        21301772
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 7,
+      "iteration": 4,
+      "warmup": false,
+      "timing_ns": [
+        11652751,
+        2523270,
+        2958485,
+        1778787,
+        18913692
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 7,
+      "iteration": 5,
+      "warmup": false,
+      "timing_ns": [
+        14126483,
+        2309430,
+        2277247,
+        1094118,
+        19807721
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 7,
+      "iteration": 6,
+      "warmup": false,
+      "timing_ns": [
+        19500049,
+        1783234,
+        2700964,
+        834684,
+        24819380
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 7,
+      "iteration": 7,
+      "warmup": false,
+      "timing_ns": [
+        15846894,
+        1789767,
+        2644957,
+        1241937,
+        21524001
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 7,
+      "iteration": 8,
+      "warmup": false,
+      "timing_ns": [
+        17199616,
+        1772727,
+        2370105,
+        1178221,
+        22521057
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 7,
+      "iteration": 9,
+      "warmup": false,
+      "timing_ns": [
+        19635623,
+        3080083,
+        2457141,
+        1340724,
+        26514185
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 7,
+      "iteration": 10,
+      "warmup": false,
+      "timing_ns": [
+        17354951,
+        2606358,
+        3186489,
+        1564455,
+        24712644
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 7,
+      "iteration": 11,
+      "warmup": false,
+      "timing_ns": [
+        24315061,
+        1560860,
+        2170917,
+        947824,
+        28995088
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 8,
+      "iteration": 0,
+      "warmup": true,
+      "timing_ns": [
+        298757,
+        84109,
+        730168,
+        1007250,
+        2120568
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 8,
+      "iteration": 1,
+      "warmup": true,
+      "timing_ns": [
+        267664,
+        85885,
+        722946,
+        961000,
+        2037902
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 8,
+      "iteration": 2,
+      "warmup": true,
+      "timing_ns": [
+        302540,
+        91943,
+        652128,
+        920050,
+        1967098
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 8,
+      "iteration": 3,
+      "warmup": true,
+      "timing_ns": [
+        785540,
+        103822,
+        807160,
+        1601426,
+        3298453
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 8,
+      "iteration": 4,
+      "warmup": false,
+      "timing_ns": [
+        286279,
+        99728,
+        1057529,
+        2491865,
+        3935769
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 8,
+      "iteration": 5,
+      "warmup": false,
+      "timing_ns": [
+        271621,
+        93828,
+        922767,
+        1193028,
+        2481552
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 8,
+      "iteration": 6,
+      "warmup": false,
+      "timing_ns": [
+        271161,
+        95555,
+        859501,
+        2642812,
+        3869389
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 8,
+      "iteration": 7,
+      "warmup": false,
+      "timing_ns": [
+        362027,
+        91403,
+        716178,
+        958172,
+        2128071
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 8,
+      "iteration": 8,
+      "warmup": false,
+      "timing_ns": [
+        395589,
+        86075,
+        837907,
+        1047275,
+        2367130
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 8,
+      "iteration": 9,
+      "warmup": false,
+      "timing_ns": [
+        265439,
+        126682,
+        653326,
+        917522,
+        1963275
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 8,
+      "iteration": 10,
+      "warmup": false,
+      "timing_ns": [
+        267957,
+        86998,
+        931406,
+        1689157,
+        2975935
+      ]
+    },
+    {
+      "run": "B2",
+      "case": 8,
+      "iteration": 11,
+      "warmup": false,
+      "timing_ns": [
+        580904,
+        87896,
+        862941,
+        980247,
+        2512317
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 1,
+      "iteration": 0,
+      "warmup": true,
+      "timing_ns": [
+        3047394,
+        93043,
+        207702,
+        170400,
+        3518905
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 1,
+      "iteration": 1,
+      "warmup": true,
+      "timing_ns": [
+        2515307,
+        94419,
+        186906,
+        164216,
+        2961153
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 1,
+      "iteration": 2,
+      "warmup": true,
+      "timing_ns": [
+        2697844,
+        92232,
+        205735,
+        163444,
+        3159701
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 1,
+      "iteration": 3,
+      "warmup": true,
+      "timing_ns": [
+        3573571,
+        96037,
+        187412,
+        162838,
+        4020172
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 1,
+      "iteration": 4,
+      "warmup": false,
+      "timing_ns": [
+        11596242,
+        314165,
+        191816,
+        573942,
+        12676609
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 1,
+      "iteration": 5,
+      "warmup": false,
+      "timing_ns": [
+        3069454,
+        89287,
+        219122,
+        171408,
+        3549688
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 1,
+      "iteration": 6,
+      "warmup": false,
+      "timing_ns": [
+        2482528,
+        82797,
+        179002,
+        184831,
+        2929463
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 1,
+      "iteration": 7,
+      "warmup": false,
+      "timing_ns": [
+        2602471,
+        125548,
+        184304,
+        168368,
+        3081020
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 1,
+      "iteration": 8,
+      "warmup": false,
+      "timing_ns": [
+        2639557,
+        89763,
+        194195,
+        172016,
+        3095848
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 1,
+      "iteration": 9,
+      "warmup": false,
+      "timing_ns": [
+        2929132,
+        94538,
+        183937,
+        407108,
+        3615086
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 1,
+      "iteration": 10,
+      "warmup": false,
+      "timing_ns": [
+        2731681,
+        104807,
+        183024,
+        239520,
+        3259397
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 1,
+      "iteration": 11,
+      "warmup": false,
+      "timing_ns": [
+        3022795,
+        91537,
+        201299,
+        169194,
+        3485191
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 2,
+      "iteration": 0,
+      "warmup": true,
+      "timing_ns": [
+        2072304,
+        163820,
+        355438,
+        532938,
+        3124848
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 2,
+      "iteration": 1,
+      "warmup": true,
+      "timing_ns": [
+        2315572,
+        158291,
+        453960,
+        1119985,
+        4048229
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 2,
+      "iteration": 2,
+      "warmup": true,
+      "timing_ns": [
+        3735359,
+        159978,
+        636571,
+        533613,
+        5065867
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 2,
+      "iteration": 3,
+      "warmup": true,
+      "timing_ns": [
+        6023723,
+        171396,
+        368457,
+        556399,
+        7120350
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 2,
+      "iteration": 4,
+      "warmup": false,
+      "timing_ns": [
+        2020622,
+        167974,
+        381661,
+        517160,
+        3087726
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 2,
+      "iteration": 5,
+      "warmup": false,
+      "timing_ns": [
+        2635551,
+        172061,
+        364969,
+        539451,
+        3712387
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 2,
+      "iteration": 6,
+      "warmup": false,
+      "timing_ns": [
+        2066123,
+        169400,
+        717941,
+        1412334,
+        4366202
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 2,
+      "iteration": 7,
+      "warmup": false,
+      "timing_ns": [
+        2097667,
+        159926,
+        363842,
+        1276596,
+        3898419
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 2,
+      "iteration": 8,
+      "warmup": false,
+      "timing_ns": [
+        1859822,
+        153743,
+        351453,
+        519986,
+        2885367
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 2,
+      "iteration": 9,
+      "warmup": false,
+      "timing_ns": [
+        2998968,
+        217392,
+        359759,
+        509777,
+        4086300
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 2,
+      "iteration": 10,
+      "warmup": false,
+      "timing_ns": [
+        2685348,
+        162755,
+        378652,
+        503927,
+        3731139
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 2,
+      "iteration": 11,
+      "warmup": false,
+      "timing_ns": [
+        2588212,
+        159207,
+        356875,
+        623444,
+        3728131
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 3,
+      "iteration": 0,
+      "warmup": true,
+      "timing_ns": [
+        3211681,
+        315635,
+        432627,
+        585024,
+        4545385
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 3,
+      "iteration": 1,
+      "warmup": true,
+      "timing_ns": [
+        2898896,
+        289861,
+        442621,
+        683064,
+        4314929
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 3,
+      "iteration": 2,
+      "warmup": true,
+      "timing_ns": [
+        3037680,
+        310278,
+        442440,
+        724012,
+        4514796
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 3,
+      "iteration": 3,
+      "warmup": true,
+      "timing_ns": [
+        2842019,
+        307444,
+        416752,
+        568993,
+        4135574
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 3,
+      "iteration": 4,
+      "warmup": false,
+      "timing_ns": [
+        3054349,
+        360893,
+        438034,
+        669399,
+        4523050
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 3,
+      "iteration": 5,
+      "warmup": false,
+      "timing_ns": [
+        2767773,
+        279514,
+        447509,
+        486893,
+        3982068
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 3,
+      "iteration": 6,
+      "warmup": false,
+      "timing_ns": [
+        2820020,
+        288061,
+        410328,
+        610512,
+        4129240
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 3,
+      "iteration": 7,
+      "warmup": false,
+      "timing_ns": [
+        2655310,
+        279965,
+        413333,
+        965337,
+        4314306
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 3,
+      "iteration": 8,
+      "warmup": false,
+      "timing_ns": [
+        2894653,
+        287931,
+        491189,
+        596369,
+        4270538
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 3,
+      "iteration": 9,
+      "warmup": false,
+      "timing_ns": [
+        2727010,
+        274347,
+        461930,
+        484945,
+        3948673
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 3,
+      "iteration": 10,
+      "warmup": false,
+      "timing_ns": [
+        2697272,
+        283205,
+        448732,
+        494964,
+        3924544
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 3,
+      "iteration": 11,
+      "warmup": false,
+      "timing_ns": [
+        3041355,
+        289874,
+        446987,
+        489017,
+        4267576
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 4,
+      "iteration": 0,
+      "warmup": true,
+      "timing_ns": [
+        14673841,
+        1239204,
+        2410940,
+        1274714,
+        19599104
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 4,
+      "iteration": 1,
+      "warmup": true,
+      "timing_ns": [
+        11685054,
+        706701,
+        2490414,
+        1120103,
+        16002695
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 4,
+      "iteration": 2,
+      "warmup": true,
+      "timing_ns": [
+        18109648,
+        822632,
+        2435682,
+        1356120,
+        22724483
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 4,
+      "iteration": 3,
+      "warmup": true,
+      "timing_ns": [
+        15999342,
+        825746,
+        2474820,
+        923218,
+        20223579
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 4,
+      "iteration": 4,
+      "warmup": false,
+      "timing_ns": [
+        17899323,
+        749259,
+        2582540,
+        1046416,
+        22277967
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 4,
+      "iteration": 5,
+      "warmup": false,
+      "timing_ns": [
+        18714880,
+        1347677,
+        3017813,
+        1695870,
+        24776651
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 4,
+      "iteration": 6,
+      "warmup": false,
+      "timing_ns": [
+        18626408,
+        993763,
+        3154651,
+        2797473,
+        25572713
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 4,
+      "iteration": 7,
+      "warmup": false,
+      "timing_ns": [
+        16484370,
+        764183,
+        2398261,
+        1237896,
+        20885175
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 4,
+      "iteration": 8,
+      "warmup": false,
+      "timing_ns": [
+        23607629,
+        822379,
+        3791467,
+        2442037,
+        30663967
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 4,
+      "iteration": 9,
+      "warmup": false,
+      "timing_ns": [
+        16471622,
+        726466,
+        2578220,
+        1093712,
+        20870481
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 4,
+      "iteration": 10,
+      "warmup": false,
+      "timing_ns": [
+        15079641,
+        745264,
+        2291214,
+        971540,
+        19088166
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 4,
+      "iteration": 11,
+      "warmup": false,
+      "timing_ns": [
+        17561960,
+        720501,
+        2258486,
+        992924,
+        21534247
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 5,
+      "iteration": 0,
+      "warmup": true,
+      "timing_ns": [
+        16714663,
+        2071856,
+        2905499,
+        1345839,
+        23038334
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 5,
+      "iteration": 1,
+      "warmup": true,
+      "timing_ns": [
+        16443200,
+        1965580,
+        2898783,
+        1098887,
+        22406921
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 5,
+      "iteration": 2,
+      "warmup": true,
+      "timing_ns": [
+        19912301,
+        2311055,
+        3155905,
+        924137,
+        26303981
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 5,
+      "iteration": 3,
+      "warmup": true,
+      "timing_ns": [
+        16274501,
+        2136360,
+        3034590,
+        1394999,
+        22840883
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 5,
+      "iteration": 4,
+      "warmup": false,
+      "timing_ns": [
+        15820564,
+        2112009,
+        2743579,
+        1168530,
+        21845130
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 5,
+      "iteration": 5,
+      "warmup": false,
+      "timing_ns": [
+        17405151,
+        2063305,
+        3139433,
+        1470375,
+        24078746
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 5,
+      "iteration": 6,
+      "warmup": false,
+      "timing_ns": [
+        18446478,
+        2427147,
+        2821913,
+        1295857,
+        24991808
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 5,
+      "iteration": 7,
+      "warmup": false,
+      "timing_ns": [
+        17778410,
+        2622649,
+        3109370,
+        984222,
+        24495035
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 5,
+      "iteration": 8,
+      "warmup": false,
+      "timing_ns": [
+        16103553,
+        2009463,
+        2903824,
+        1553392,
+        22570679
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 5,
+      "iteration": 9,
+      "warmup": false,
+      "timing_ns": [
+        20232910,
+        2061135,
+        3017130,
+        1926667,
+        27238261
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 5,
+      "iteration": 10,
+      "warmup": false,
+      "timing_ns": [
+        15645589,
+        2438454,
+        2794787,
+        1347449,
+        22226714
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 5,
+      "iteration": 11,
+      "warmup": false,
+      "timing_ns": [
+        16081078,
+        2204096,
+        2908556,
+        1284383,
+        22478591
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 6,
+      "iteration": 0,
+      "warmup": true,
+      "timing_ns": [
+        13084369,
+        725256,
+        2134574,
+        967117,
+        16911742
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 6,
+      "iteration": 1,
+      "warmup": true,
+      "timing_ns": [
+        13231498,
+        676491,
+        2159092,
+        919489,
+        16987066
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 6,
+      "iteration": 2,
+      "warmup": true,
+      "timing_ns": [
+        13951111,
+        2695381,
+        1932021,
+        1414647,
+        19993604
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 6,
+      "iteration": 3,
+      "warmup": true,
+      "timing_ns": [
+        13186389,
+        915444,
+        2432636,
+        922927,
+        17457780
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 6,
+      "iteration": 4,
+      "warmup": false,
+      "timing_ns": [
+        13449281,
+        605052,
+        1819910,
+        1211939,
+        17086610
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 6,
+      "iteration": 5,
+      "warmup": false,
+      "timing_ns": [
+        13118080,
+        726189,
+        2178386,
+        1547317,
+        17570487
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 6,
+      "iteration": 6,
+      "warmup": false,
+      "timing_ns": [
+        23131434,
+        917762,
+        1901457,
+        1155376,
+        27106444
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 6,
+      "iteration": 7,
+      "warmup": false,
+      "timing_ns": [
+        12759073,
+        628348,
+        2229438,
+        923542,
+        16540820
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 6,
+      "iteration": 8,
+      "warmup": false,
+      "timing_ns": [
+        19732192,
+        621162,
+        3850640,
+        2047912,
+        26252324
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 6,
+      "iteration": 9,
+      "warmup": false,
+      "timing_ns": [
+        13733694,
+        641556,
+        2178293,
+        1823869,
+        18377869
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 6,
+      "iteration": 10,
+      "warmup": false,
+      "timing_ns": [
+        14954999,
+        678099,
+        1835666,
+        1083559,
+        18552849
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 6,
+      "iteration": 11,
+      "warmup": false,
+      "timing_ns": [
+        15980247,
+        697406,
+        1883942,
+        1293759,
+        19855785
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 7,
+      "iteration": 0,
+      "warmup": true,
+      "timing_ns": [
+        14456805,
+        1839796,
+        2290551,
+        889620,
+        19477212
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 7,
+      "iteration": 1,
+      "warmup": true,
+      "timing_ns": [
+        15646000,
+        1571573,
+        2832740,
+        1276915,
+        21327773
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 7,
+      "iteration": 2,
+      "warmup": true,
+      "timing_ns": [
+        16933498,
+        1775896,
+        2347188,
+        1299607,
+        22356567
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 7,
+      "iteration": 3,
+      "warmup": true,
+      "timing_ns": [
+        13519448,
+        1618308,
+        2090986,
+        1018760,
+        18247949
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 7,
+      "iteration": 4,
+      "warmup": false,
+      "timing_ns": [
+        13059766,
+        1976109,
+        2224422,
+        950339,
+        18211047
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 7,
+      "iteration": 5,
+      "warmup": false,
+      "timing_ns": [
+        12229622,
+        1584963,
+        2058433,
+        1465525,
+        17338967
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 7,
+      "iteration": 6,
+      "warmup": false,
+      "timing_ns": [
+        13054204,
+        1831076,
+        2121660,
+        1218394,
+        18225788
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 7,
+      "iteration": 7,
+      "warmup": false,
+      "timing_ns": [
+        12426504,
+        1457467,
+        2100016,
+        828035,
+        16812407
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 7,
+      "iteration": 8,
+      "warmup": false,
+      "timing_ns": [
+        13708654,
+        1560192,
+        2068148,
+        1056407,
+        18393837
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 7,
+      "iteration": 9,
+      "warmup": false,
+      "timing_ns": [
+        13276738,
+        1610390,
+        2236310,
+        1649606,
+        18773507
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 7,
+      "iteration": 10,
+      "warmup": false,
+      "timing_ns": [
+        11756285,
+        1485387,
+        2675056,
+        2826491,
+        18743749
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 7,
+      "iteration": 11,
+      "warmup": false,
+      "timing_ns": [
+        12331277,
+        1622512,
+        2096036,
+        1367271,
+        17417606
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 8,
+      "iteration": 0,
+      "warmup": true,
+      "timing_ns": [
+        285427,
+        96664,
+        713944,
+        3127971,
+        4224340
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 8,
+      "iteration": 1,
+      "warmup": true,
+      "timing_ns": [
+        305995,
+        89967,
+        667483,
+        880808,
+        1944626
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 8,
+      "iteration": 2,
+      "warmup": true,
+      "timing_ns": [
+        274761,
+        89748,
+        898504,
+        1555712,
+        2819229
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 8,
+      "iteration": 3,
+      "warmup": true,
+      "timing_ns": [
+        276212,
+        95479,
+        765478,
+        1150645,
+        2288283
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 8,
+      "iteration": 4,
+      "warmup": false,
+      "timing_ns": [
+        273120,
+        108791,
+        701243,
+        869176,
+        1952708
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 8,
+      "iteration": 5,
+      "warmup": false,
+      "timing_ns": [
+        287266,
+        87145,
+        838742,
+        900301,
+        2113849
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 8,
+      "iteration": 6,
+      "warmup": false,
+      "timing_ns": [
+        298666,
+        103084,
+        782471,
+        1334844,
+        2519575
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 8,
+      "iteration": 7,
+      "warmup": false,
+      "timing_ns": [
+        286895,
+        167599,
+        732824,
+        1593359,
+        2781156
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 8,
+      "iteration": 8,
+      "warmup": false,
+      "timing_ns": [
+        322299,
+        85779,
+        694875,
+        1183883,
+        2287221
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 8,
+      "iteration": 9,
+      "warmup": false,
+      "timing_ns": [
+        310635,
+        135895,
+        731212,
+        1589667,
+        2767834
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 8,
+      "iteration": 10,
+      "warmup": false,
+      "timing_ns": [
+        261436,
+        85973,
+        784398,
+        871583,
+        2003764
+      ]
+    },
+    {
+      "run": "A2",
+      "case": 8,
+      "iteration": 11,
+      "warmup": false,
+      "timing_ns": [
+        260017,
+        85411,
+        695751,
+        3778028,
+        4819654
+      ]
+    }
+  ],
+  "cases": [
+    {
+      "case": 1,
+      "name": "shared_tail_512x1",
+      "windows": {
+        "receive": {
+          "arms": {
+            "A1": {
+              "samples_ns": [
+                3336411,
+                3713429,
+                2835530,
+                5107322,
+                3904336,
+                3006586,
+                2404709,
+                2561880
+              ],
+              "n": 8,
+              "min_ns": 2404709,
+              "median_twice_ns": 6342997,
+              "p95_nearest_rank_ns": 5107322,
+              "max_ns": 5107322
+            },
+            "B1": {
+              "samples_ns": [
+                2802403,
+                3423202,
+                3447996,
+                2774976,
+                2739338,
+                6523147,
+                3198692,
+                3651881
+              ],
+              "n": 8,
+              "min_ns": 2739338,
+              "median_twice_ns": 6621894,
+              "p95_nearest_rank_ns": 6523147,
+              "max_ns": 6523147
+            },
+            "B2": {
+              "samples_ns": [
+                3452540,
+                4708442,
+                3403083,
+                2838686,
+                3357793,
+                3573984,
+                3463704,
+                2646028
+              ],
+              "n": 8,
+              "min_ns": 2646028,
+              "median_twice_ns": 6855623,
+              "p95_nearest_rank_ns": 4708442,
+              "max_ns": 4708442
+            },
+            "A2": {
+              "samples_ns": [
+                11596242,
+                3069454,
+                2482528,
+                2602471,
+                2639557,
+                2929132,
+                2731681,
+                3022795
+              ],
+              "n": 8,
+              "min_ns": 2482528,
+              "median_twice_ns": 5660813,
+              "p95_nearest_rank_ns": 11596242,
+              "max_ns": 11596242
+            }
+          },
+          "gain_twice_ns": -1194810,
+          "gain_threshold_fortieth_ns": 5660813,
+          "robust_gain": false,
+          "regression_twice_ns": 278897,
+          "regression_threshold_fortieth_ns": 6342997,
+          "material_regression": false
+        },
+        "observations": {
+          "arms": {
+            "A1": {
+              "samples_ns": [
+                96129,
+                98180,
+                99659,
+                101133,
+                102764,
+                87355,
+                129102,
+                93656
+              ],
+              "n": 8,
+              "min_ns": 87355,
+              "median_twice_ns": 197839,
+              "p95_nearest_rank_ns": 129102,
+              "max_ns": 129102
+            },
+            "B1": {
+              "samples_ns": [
+                91383,
+                88387,
+                228772,
+                91115,
+                91850,
+                138026,
+                85669,
+                97290
+              ],
+              "n": 8,
+              "min_ns": 85669,
+              "median_twice_ns": 183233,
+              "p95_nearest_rank_ns": 228772,
+              "max_ns": 228772
+            },
+            "B2": {
+              "samples_ns": [
+                161775,
+                107890,
+                119491,
+                83156,
+                87095,
+                119244,
+                116810,
+                93235
+              ],
+              "n": 8,
+              "min_ns": 83156,
+              "median_twice_ns": 224700,
+              "p95_nearest_rank_ns": 161775,
+              "max_ns": 161775
+            },
+            "A2": {
+              "samples_ns": [
+                314165,
+                89287,
+                82797,
+                125548,
+                89763,
+                94538,
+                104807,
+                91537
+              ],
+              "n": 8,
+              "min_ns": 82797,
+              "median_twice_ns": 186075,
+              "p95_nearest_rank_ns": 314165,
+              "max_ns": 314165
+            }
+          },
+          "gain_twice_ns": -38625,
+          "gain_threshold_fortieth_ns": 400000,
+          "robust_gain": false,
+          "regression_twice_ns": -14606,
+          "regression_threshold_fortieth_ns": 400000,
+          "material_regression": false
+        },
+        "columns": {
+          "arms": {
+            "A1": {
+              "samples_ns": [
+                194366,
+                184663,
+                297189,
+                190631,
+                201385,
+                181260,
+                190792,
+                204198
+              ],
+              "n": 8,
+              "min_ns": 181260,
+              "median_twice_ns": 385158,
+              "p95_nearest_rank_ns": 297189,
+              "max_ns": 297189
+            },
+            "B1": {
+              "samples_ns": [
+                301620,
+                283486,
+                206932,
+                229990,
+                154019,
+                1138468,
+                228141,
+                144640
+              ],
+              "n": 8,
+              "min_ns": 144640,
+              "median_twice_ns": 458131,
+              "p95_nearest_rank_ns": 1138468,
+              "max_ns": 1138468
+            },
+            "B2": {
+              "samples_ns": [
+                163232,
+                288891,
+                235487,
+                146979,
+                222310,
+                142880,
+                147057,
+                143178
+              ],
+              "n": 8,
+              "min_ns": 142880,
+              "median_twice_ns": 310289,
+              "p95_nearest_rank_ns": 288891,
+              "max_ns": 288891
+            },
+            "A2": {
+              "samples_ns": [
+                191816,
+                219122,
+                179002,
+                184304,
+                194195,
+                183937,
+                183024,
+                201299
+              ],
+              "n": 8,
+              "min_ns": 179002,
+              "median_twice_ns": 376120,
+              "p95_nearest_rank_ns": 219122,
+              "max_ns": 219122
+            }
+          },
+          "gain_twice_ns": -82011,
+          "gain_threshold_fortieth_ns": 400000,
+          "robust_gain": false,
+          "regression_twice_ns": -74869,
+          "regression_threshold_fortieth_ns": 400000,
+          "material_regression": false
+        },
+        "builder": {
+          "arms": {
+            "A1": {
+              "samples_ns": [
+                189160,
+                297245,
+                175190,
+                178827,
+                175810,
+                445485,
+                167823,
+                181250
+              ],
+              "n": 8,
+              "min_ns": 167823,
+              "median_twice_ns": 360077,
+              "p95_nearest_rank_ns": 445485,
+              "max_ns": 445485
+            },
+            "B1": {
+              "samples_ns": [
+                169776,
+                196027,
+                172562,
+                565211,
+                176889,
+                211315,
+                192175,
+                202955
+              ],
+              "n": 8,
+              "min_ns": 169776,
+              "median_twice_ns": 388202,
+              "p95_nearest_rank_ns": 565211,
+              "max_ns": 565211
+            },
+            "B2": {
+              "samples_ns": [
+                283774,
+                587580,
+                171171,
+                165230,
+                168756,
+                207135,
+                170561,
+                169441
+              ],
+              "n": 8,
+              "min_ns": 165230,
+              "median_twice_ns": 341732,
+              "p95_nearest_rank_ns": 587580,
+              "max_ns": 587580
+            },
+            "A2": {
+              "samples_ns": [
+                573942,
+                171408,
+                184831,
+                168368,
+                172016,
+                407108,
+                239520,
+                169194
+              ],
+              "n": 8,
+              "min_ns": 168368,
+              "median_twice_ns": 356847,
+              "p95_nearest_rank_ns": 573942,
+              "max_ns": 573942
+            }
+          },
+          "gain_twice_ns": -31355,
+          "gain_threshold_fortieth_ns": 400000,
+          "robust_gain": false,
+          "regression_twice_ns": -18345,
+          "regression_threshold_fortieth_ns": 400000,
+          "material_regression": false
+        },
+        "wholeReader": {
+          "arms": {
+            "A1": {
+              "samples_ns": [
+                3816386,
+                4293873,
+                3407954,
+                5578192,
+                4384680,
+                3721028,
+                2892715,
+                3041294
+              ],
+              "n": 8,
+              "min_ns": 2892715,
+              "median_twice_ns": 7537414,
+              "p95_nearest_rank_ns": 5578192,
+              "max_ns": 5578192
+            },
+            "B1": {
+              "samples_ns": [
+                3365608,
+                3991706,
+                4056633,
+                3661701,
+                3162390,
+                8011351,
+                3704991,
+                4097230
+              ],
+              "n": 8,
+              "min_ns": 3162390,
+              "median_twice_ns": 7696697,
+              "p95_nearest_rank_ns": 8011351,
+              "max_ns": 8011351
+            },
+            "B2": {
+              "samples_ns": [
+                4061704,
+                5693123,
+                3929598,
+                3234343,
+                3836288,
+                4043534,
+                3898413,
+                3052272
+              ],
+              "n": 8,
+              "min_ns": 3052272,
+              "median_twice_ns": 7828011,
+              "p95_nearest_rank_ns": 5693123,
+              "max_ns": 5693123
+            },
+            "A2": {
+              "samples_ns": [
+                12676609,
+                3549688,
+                2929463,
+                3081020,
+                3095848,
+                3615086,
+                3259397,
+                3485191
+              ],
+              "n": 8,
+              "min_ns": 2929463,
+              "median_twice_ns": 6744588,
+              "p95_nearest_rank_ns": 12676609,
+              "max_ns": 12676609
+            }
+          },
+          "gain_twice_ns": -1083423,
+          "gain_threshold_fortieth_ns": 6744588,
+          "robust_gain": false,
+          "regression_twice_ns": 159283,
+          "regression_threshold_fortieth_ns": 7537414,
+          "material_regression": false
+        }
+      }
+    },
+    {
+      "case": 2,
+      "name": "shared_8_of_64x128",
+      "windows": {
+        "receive": {
+          "arms": {
+            "A1": {
+              "samples_ns": [
+                5424001,
+                3992225,
+                4377326,
+                9215366,
+                3251234,
+                2323645,
+                2954707,
+                3193096
+              ],
+              "n": 8,
+              "min_ns": 2323645,
+              "median_twice_ns": 7243459,
+              "p95_nearest_rank_ns": 9215366,
+              "max_ns": 9215366
+            },
+            "B1": {
+              "samples_ns": [
+                2123029,
+                2484043,
+                2889133,
+                2196285,
+                2003258,
+                2913640,
+                2084221,
+                2484250
+              ],
+              "n": 8,
+              "min_ns": 2003258,
+              "median_twice_ns": 4680328,
+              "p95_nearest_rank_ns": 2913640,
+              "max_ns": 2913640
+            },
+            "B2": {
+              "samples_ns": [
+                2128574,
+                2547794,
+                2817846,
+                2005312,
+                3315028,
+                2213482,
+                2269109,
+                2286676
+              ],
+              "n": 8,
+              "min_ns": 2005312,
+              "median_twice_ns": 4555785,
+              "p95_nearest_rank_ns": 3315028,
+              "max_ns": 3315028
+            },
+            "A2": {
+              "samples_ns": [
+                2020622,
+                2635551,
+                2066123,
+                2097667,
+                1859822,
+                2998968,
+                2685348,
+                2588212
+              ],
+              "n": 8,
+              "min_ns": 1859822,
+              "median_twice_ns": 4685879,
+              "p95_nearest_rank_ns": 2998968,
+              "max_ns": 2998968
+            }
+          },
+          "gain_twice_ns": 5551,
+          "gain_threshold_fortieth_ns": 4685879,
+          "robust_gain": false,
+          "regression_twice_ns": -2687674,
+          "regression_threshold_fortieth_ns": 7243459,
+          "material_regression": false
+        },
+        "observations": {
+          "arms": {
+            "A1": {
+              "samples_ns": [
+                523383,
+                189436,
+                187174,
+                228734,
+                197322,
+                175637,
+                194594,
+                1226880
+              ],
+              "n": 8,
+              "min_ns": 175637,
+              "median_twice_ns": 391916,
+              "p95_nearest_rank_ns": 1226880,
+              "max_ns": 1226880
+            },
+            "B1": {
+              "samples_ns": [
+                160447,
+                177946,
+                185653,
+                624366,
+                347549,
+                157358,
+                159466,
+                161574
+              ],
+              "n": 8,
+              "min_ns": 157358,
+              "median_twice_ns": 339520,
+              "p95_nearest_rank_ns": 624366,
+              "max_ns": 624366
+            },
+            "B2": {
+              "samples_ns": [
+                165272,
+                418660,
+                323057,
+                165615,
+                185513,
+                162368,
+                170960,
+                190616
+              ],
+              "n": 8,
+              "min_ns": 162368,
+              "median_twice_ns": 356473,
+              "p95_nearest_rank_ns": 418660,
+              "max_ns": 418660
+            },
+            "A2": {
+              "samples_ns": [
+                167974,
+                172061,
+                169400,
+                159926,
+                153743,
+                217392,
+                162755,
+                159207
+              ],
+              "n": 8,
+              "min_ns": 153743,
+              "median_twice_ns": 330729,
+              "p95_nearest_rank_ns": 217392,
+              "max_ns": 217392
+            }
+          },
+          "gain_twice_ns": -25744,
+          "gain_threshold_fortieth_ns": 400000,
+          "robust_gain": false,
+          "regression_twice_ns": -52396,
+          "regression_threshold_fortieth_ns": 400000,
+          "material_regression": false
+        },
+        "columns": {
+          "arms": {
+            "A1": {
+              "samples_ns": [
+                1778022,
+                402737,
+                5968977,
+                364884,
+                844161,
+                373854,
+                376517,
+                365037
+              ],
+              "n": 8,
+              "min_ns": 364884,
+              "median_twice_ns": 779254,
+              "p95_nearest_rank_ns": 5968977,
+              "max_ns": 5968977
+            },
+            "B1": {
+              "samples_ns": [
+                265625,
+                1768975,
+                267977,
+                399692,
+                484188,
+                320496,
+                267205,
+                328529
+              ],
+              "n": 8,
+              "min_ns": 265625,
+              "median_twice_ns": 649025,
+              "p95_nearest_rank_ns": 1768975,
+              "max_ns": 1768975
+            },
+            "B2": {
+              "samples_ns": [
+                267478,
+                280589,
+                275847,
+                276052,
+                301275,
+                345125,
+                285998,
+                447679
+              ],
+              "n": 8,
+              "min_ns": 267478,
+              "median_twice_ns": 566587,
+              "p95_nearest_rank_ns": 447679,
+              "max_ns": 447679
+            },
+            "A2": {
+              "samples_ns": [
+                381661,
+                364969,
+                717941,
+                363842,
+                351453,
+                359759,
+                378652,
+                356875
+              ],
+              "n": 8,
+              "min_ns": 351453,
+              "median_twice_ns": 728811,
+              "p95_nearest_rank_ns": 717941,
+              "max_ns": 717941
+            }
+          },
+          "gain_twice_ns": 79786,
+          "gain_threshold_fortieth_ns": 728811,
+          "robust_gain": true,
+          "regression_twice_ns": -212667,
+          "regression_threshold_fortieth_ns": 779254,
+          "material_regression": false
+        },
+        "builder": {
+          "arms": {
+            "A1": {
+              "samples_ns": [
+                923829,
+                539386,
+                3667229,
+                3928823,
+                1519183,
+                515511,
+                1060882,
+                881532
+              ],
+              "n": 8,
+              "min_ns": 515511,
+              "median_twice_ns": 1984711,
+              "p95_nearest_rank_ns": 3928823,
+              "max_ns": 3928823
+            },
+            "B1": {
+              "samples_ns": [
+                530221,
+                687776,
+                615923,
+                992101,
+                594523,
+                619820,
+                529174,
+                512772
+              ],
+              "n": 8,
+              "min_ns": 512772,
+              "median_twice_ns": 1210446,
+              "p95_nearest_rank_ns": 992101,
+              "max_ns": 992101
+            },
+            "B2": {
+              "samples_ns": [
+                550203,
+                705902,
+                696276,
+                1123079,
+                571839,
+                690472,
+                648792,
+                785031
+              ],
+              "n": 8,
+              "min_ns": 550203,
+              "median_twice_ns": 1386748,
+              "p95_nearest_rank_ns": 1123079,
+              "max_ns": 1123079
+            },
+            "A2": {
+              "samples_ns": [
+                517160,
+                539451,
+                1412334,
+                1276596,
+                519986,
+                509777,
+                503927,
+                623444
+              ],
+              "n": 8,
+              "min_ns": 503927,
+              "median_twice_ns": 1059437,
+              "p95_nearest_rank_ns": 1412334,
+              "max_ns": 1412334
+            }
+          },
+          "gain_twice_ns": -327311,
+          "gain_threshold_fortieth_ns": 1059437,
+          "robust_gain": false,
+          "regression_twice_ns": -774265,
+          "regression_threshold_fortieth_ns": 1984711,
+          "material_regression": false
+        },
+        "wholeReader": {
+          "arms": {
+            "A1": {
+              "samples_ns": [
+                8649846,
+                5124156,
+                14201134,
+                13738154,
+                5812217,
+                3389032,
+                4587088,
+                5666873
+              ],
+              "n": 8,
+              "min_ns": 3389032,
+              "median_twice_ns": 11479090,
+              "p95_nearest_rank_ns": 14201134,
+              "max_ns": 14201134
+            },
+            "B1": {
+              "samples_ns": [
+                3079660,
+                5119276,
+                3959015,
+                4212795,
+                3429872,
+                4011655,
+                3040405,
+                3487504
+              ],
+              "n": 8,
+              "min_ns": 3040405,
+              "median_twice_ns": 7446519,
+              "p95_nearest_rank_ns": 5119276,
+              "max_ns": 5119276
+            },
+            "B2": {
+              "samples_ns": [
+                3111835,
+                3953275,
+                4113369,
+                3570411,
+                4373993,
+                3411799,
+                3375246,
+                3710329
+              ],
+              "n": 8,
+              "min_ns": 3111835,
+              "median_twice_ns": 7280740,
+              "p95_nearest_rank_ns": 4373993,
+              "max_ns": 4373993
+            },
+            "A2": {
+              "samples_ns": [
+                3087726,
+                3712387,
+                4366202,
+                3898419,
+                2885367,
+                4086300,
+                3731139,
+                3728131
+              ],
+              "n": 8,
+              "min_ns": 2885367,
+              "median_twice_ns": 7459270,
+              "p95_nearest_rank_ns": 4366202,
+              "max_ns": 4366202
+            }
+          },
+          "gain_twice_ns": 12751,
+          "gain_threshold_fortieth_ns": 7459270,
+          "robust_gain": false,
+          "regression_twice_ns": -4198350,
+          "regression_threshold_fortieth_ns": 11479090,
+          "material_regression": false
+        }
+      }
+    },
+    {
+      "case": 3,
+      "name": "shared_8_of_64x128_zero",
+      "windows": {
+        "receive": {
+          "arms": {
+            "A1": {
+              "samples_ns": [
+                4141856,
+                4312738,
+                2449363,
+                2990550,
+                3277734,
+                4300725,
+                3146948,
+                4584236
+              ],
+              "n": 8,
+              "min_ns": 2449363,
+              "median_twice_ns": 7419590,
+              "p95_nearest_rank_ns": 4584236,
+              "max_ns": 4584236
+            },
+            "B1": {
+              "samples_ns": [
+                3627114,
+                2863678,
+                3222422,
+                3166827,
+                3217731,
+                5945471,
+                4533148,
+                3998297
+              ],
+              "n": 8,
+              "min_ns": 2863678,
+              "median_twice_ns": 6849536,
+              "p95_nearest_rank_ns": 5945471,
+              "max_ns": 5945471
+            },
+            "B2": {
+              "samples_ns": [
+                2957319,
+                2061515,
+                4047828,
+                4673149,
+                3057733,
+                3637196,
+                3631780,
+                5259352
+              ],
+              "n": 8,
+              "min_ns": 2061515,
+              "median_twice_ns": 7268976,
+              "p95_nearest_rank_ns": 5259352,
+              "max_ns": 5259352
+            },
+            "A2": {
+              "samples_ns": [
+                3054349,
+                2767773,
+                2820020,
+                2655310,
+                2894653,
+                2727010,
+                2697272,
+                3041355
+              ],
+              "n": 8,
+              "min_ns": 2655310,
+              "median_twice_ns": 5587793,
+              "p95_nearest_rank_ns": 3054349,
+              "max_ns": 3054349
+            }
+          },
+          "gain_twice_ns": -1681183,
+          "gain_threshold_fortieth_ns": 5587793,
+          "robust_gain": false,
+          "regression_twice_ns": -570054,
+          "regression_threshold_fortieth_ns": 7419590,
+          "material_regression": false
+        },
+        "observations": {
+          "arms": {
+            "A1": {
+              "samples_ns": [
+                523060,
+                717882,
+                289854,
+                517386,
+                291711,
+                1378713,
+                347529,
+                326964
+              ],
+              "n": 8,
+              "min_ns": 289854,
+              "median_twice_ns": 864915,
+              "p95_nearest_rank_ns": 1378713,
+              "max_ns": 1378713
+            },
+            "B1": {
+              "samples_ns": [
+                326213,
+                440742,
+                289668,
+                304896,
+                373362,
+                286757,
+                596612,
+                698157
+              ],
+              "n": 8,
+              "min_ns": 286757,
+              "median_twice_ns": 699575,
+              "p95_nearest_rank_ns": 698157,
+              "max_ns": 698157
+            },
+            "B2": {
+              "samples_ns": [
+                374894,
+                421707,
+                435066,
+                411057,
+                572744,
+                311402,
+                672056,
+                393228
+              ],
+              "n": 8,
+              "min_ns": 311402,
+              "median_twice_ns": 832764,
+              "p95_nearest_rank_ns": 672056,
+              "max_ns": 672056
+            },
+            "A2": {
+              "samples_ns": [
+                360893,
+                279514,
+                288061,
+                279965,
+                287931,
+                274347,
+                283205,
+                289874
+              ],
+              "n": 8,
+              "min_ns": 274347,
+              "median_twice_ns": 571136,
+              "p95_nearest_rank_ns": 360893,
+              "max_ns": 360893
+            }
+          },
+          "gain_twice_ns": -261628,
+          "gain_threshold_fortieth_ns": 571136,
+          "robust_gain": false,
+          "regression_twice_ns": -165340,
+          "regression_threshold_fortieth_ns": 864915,
+          "material_regression": false
+        },
+        "columns": {
+          "arms": {
+            "A1": {
+              "samples_ns": [
+                529400,
+                583450,
+                445941,
+                477876,
+                485768,
+                454825,
+                744145,
+                802159
+              ],
+              "n": 8,
+              "min_ns": 445941,
+              "median_twice_ns": 1015168,
+              "p95_nearest_rank_ns": 802159,
+              "max_ns": 802159
+            },
+            "B1": {
+              "samples_ns": [
+                658313,
+                340198,
+                349213,
+                438223,
+                372754,
+                328211,
+                358950,
+                626642
+              ],
+              "n": 8,
+              "min_ns": 328211,
+              "median_twice_ns": 731704,
+              "p95_nearest_rank_ns": 658313,
+              "max_ns": 658313
+            },
+            "B2": {
+              "samples_ns": [
+                412589,
+                337052,
+                500757,
+                369314,
+                652953,
+                368239,
+                330951,
+                332935
+              ],
+              "n": 8,
+              "min_ns": 330951,
+              "median_twice_ns": 737553,
+              "p95_nearest_rank_ns": 652953,
+              "max_ns": 652953
+            },
+            "A2": {
+              "samples_ns": [
+                438034,
+                447509,
+                410328,
+                413333,
+                491189,
+                461930,
+                448732,
+                446987
+              ],
+              "n": 8,
+              "min_ns": 410328,
+              "median_twice_ns": 894496,
+              "p95_nearest_rank_ns": 491189,
+              "max_ns": 491189
+            }
+          },
+          "gain_twice_ns": 156943,
+          "gain_threshold_fortieth_ns": 894496,
+          "robust_gain": true,
+          "regression_twice_ns": -283464,
+          "regression_threshold_fortieth_ns": 1015168,
+          "material_regression": false
+        },
+        "builder": {
+          "arms": {
+            "A1": {
+              "samples_ns": [
+                669853,
+                532727,
+                507622,
+                636053,
+                693144,
+                541463,
+                802772,
+                561043
+              ],
+              "n": 8,
+              "min_ns": 507622,
+              "median_twice_ns": 1197096,
+              "p95_nearest_rank_ns": 802772,
+              "max_ns": 802772
+            },
+            "B1": {
+              "samples_ns": [
+                1150059,
+                620387,
+                488871,
+                776895,
+                659836,
+                786119,
+                999183,
+                567610
+              ],
+              "n": 8,
+              "min_ns": 488871,
+              "median_twice_ns": 1436731,
+              "p95_nearest_rank_ns": 1150059,
+              "max_ns": 1150059
+            },
+            "B2": {
+              "samples_ns": [
+                952710,
+                539392,
+                666374,
+                1051591,
+                541600,
+                520204,
+                796748,
+                910782
+              ],
+              "n": 8,
+              "min_ns": 520204,
+              "median_twice_ns": 1463122,
+              "p95_nearest_rank_ns": 1051591,
+              "max_ns": 1051591
+            },
+            "A2": {
+              "samples_ns": [
+                669399,
+                486893,
+                610512,
+                965337,
+                596369,
+                484945,
+                494964,
+                489017
+              ],
+              "n": 8,
+              "min_ns": 484945,
+              "median_twice_ns": 1091333,
+              "p95_nearest_rank_ns": 965337,
+              "max_ns": 965337
+            }
+          },
+          "gain_twice_ns": -371789,
+          "gain_threshold_fortieth_ns": 1091333,
+          "robust_gain": false,
+          "regression_twice_ns": 239635,
+          "regression_threshold_fortieth_ns": 1197096,
+          "material_regression": true
+        },
+        "wholeReader": {
+          "arms": {
+            "A1": {
+              "samples_ns": [
+                5864595,
+                6147215,
+                3693110,
+                4622233,
+                4749051,
+                6676102,
+                5041795,
+                6274747
+              ],
+              "n": 8,
+              "min_ns": 3693110,
+              "median_twice_ns": 10906390,
+              "p95_nearest_rank_ns": 6676102,
+              "max_ns": 6676102
+            },
+            "B1": {
+              "samples_ns": [
+                5762135,
+                4265319,
+                4350485,
+                4687246,
+                4624042,
+                7346998,
+                6488263,
+                5891154
+              ],
+              "n": 8,
+              "min_ns": 4265319,
+              "median_twice_ns": 10449381,
+              "p95_nearest_rank_ns": 7346998,
+              "max_ns": 7346998
+            },
+            "B2": {
+              "samples_ns": [
+                4697859,
+                3360050,
+                5650400,
+                6505492,
+                4825401,
+                4837355,
+                5431864,
+                6896622
+              ],
+              "n": 8,
+              "min_ns": 3360050,
+              "median_twice_ns": 10269219,
+              "p95_nearest_rank_ns": 6896622,
+              "max_ns": 6896622
+            },
+            "A2": {
+              "samples_ns": [
+                4523050,
+                3982068,
+                4129240,
+                4314306,
+                4270538,
+                3948673,
+                3924544,
+                4267576
+              ],
+              "n": 8,
+              "min_ns": 3924544,
+              "median_twice_ns": 8396816,
+              "p95_nearest_rank_ns": 4523050,
+              "max_ns": 4523050
+            }
+          },
+          "gain_twice_ns": -2052565,
+          "gain_threshold_fortieth_ns": 8396816,
+          "robust_gain": false,
+          "regression_twice_ns": -637171,
+          "regression_threshold_fortieth_ns": 10906390,
+          "material_regression": false
+        }
+      }
+    },
+    {
+      "case": 4,
+      "name": "first_64x128",
+      "windows": {
+        "receive": {
+          "arms": {
+            "A1": {
+              "samples_ns": [
+                5094054,
+                3618606,
+                4079604,
+                3969425,
+                4219222,
+                3606382,
+                3372426,
+                3799998
+              ],
+              "n": 8,
+              "min_ns": 3372426,
+              "median_twice_ns": 7769423,
+              "p95_nearest_rank_ns": 5094054,
+              "max_ns": 5094054
+            },
+            "B1": {
+              "samples_ns": [
+                19195916,
+                16487153,
+                15208894,
+                16982599,
+                13991053,
+                14715435,
+                18236790,
+                11789522
+              ],
+              "n": 8,
+              "min_ns": 11789522,
+              "median_twice_ns": 31696047,
+              "p95_nearest_rank_ns": 19195916,
+              "max_ns": 19195916
+            },
+            "B2": {
+              "samples_ns": [
+                13258833,
+                14457649,
+                12662558,
+                13419126,
+                15449575,
+                14001062,
+                12706046,
+                13586060
+              ],
+              "n": 8,
+              "min_ns": 12662558,
+              "median_twice_ns": 27005186,
+              "p95_nearest_rank_ns": 15449575,
+              "max_ns": 15449575
+            },
+            "A2": {
+              "samples_ns": [
+                17899323,
+                18714880,
+                18626408,
+                16484370,
+                23607629,
+                16471622,
+                15079641,
+                17561960
+              ],
+              "n": 8,
+              "min_ns": 15079641,
+              "median_twice_ns": 35461283,
+              "p95_nearest_rank_ns": 23607629,
+              "max_ns": 23607629
+            }
+          },
+          "gain_twice_ns": -23926624,
+          "gain_threshold_fortieth_ns": 7769423,
+          "robust_gain": false,
+          "regression_twice_ns": -8456097,
+          "regression_threshold_fortieth_ns": 35461283,
+          "material_regression": false
+        },
+        "observations": {
+          "arms": {
+            "A1": {
+              "samples_ns": [
+                735670,
+                1001692,
+                704652,
+                1482730,
+                849239,
+                1077051,
+                707692,
+                691389
+              ],
+              "n": 8,
+              "min_ns": 691389,
+              "median_twice_ns": 1584909,
+              "p95_nearest_rank_ns": 1482730,
+              "max_ns": 1482730
+            },
+            "B1": {
+              "samples_ns": [
+                2357833,
+                873308,
+                2134686,
+                1195731,
+                994884,
+                1154377,
+                850509,
+                856130
+              ],
+              "n": 8,
+              "min_ns": 850509,
+              "median_twice_ns": 2149261,
+              "p95_nearest_rank_ns": 2357833,
+              "max_ns": 2357833
+            },
+            "B2": {
+              "samples_ns": [
+                1057707,
+                957130,
+                782657,
+                792897,
+                971692,
+                936318,
+                888590,
+                1036567
+              ],
+              "n": 8,
+              "min_ns": 782657,
+              "median_twice_ns": 1893448,
+              "p95_nearest_rank_ns": 1057707,
+              "max_ns": 1057707
+            },
+            "A2": {
+              "samples_ns": [
+                749259,
+                1347677,
+                993763,
+                764183,
+                822379,
+                726466,
+                745264,
+                720501
+              ],
+              "n": 8,
+              "min_ns": 720501,
+              "median_twice_ns": 1513442,
+              "p95_nearest_rank_ns": 1347677,
+              "max_ns": 1347677
+            }
+          },
+          "gain_twice_ns": -635819,
+          "gain_threshold_fortieth_ns": 1513442,
+          "robust_gain": false,
+          "regression_twice_ns": 308539,
+          "regression_threshold_fortieth_ns": 1584909,
+          "material_regression": true
+        },
+        "columns": {
+          "arms": {
+            "A1": {
+              "samples_ns": [
+                2670398,
+                2841422,
+                2638655,
+                2787467,
+                2886688,
+                2502176,
+                3561395,
+                2599081
+              ],
+              "n": 8,
+              "min_ns": 2502176,
+              "median_twice_ns": 5457865,
+              "p95_nearest_rank_ns": 3561395,
+              "max_ns": 3561395
+            },
+            "B1": {
+              "samples_ns": [
+                7018533,
+                2884303,
+                5116989,
+                3758369,
+                3100723,
+                3081274,
+                2670546,
+                2358562
+              ],
+              "n": 8,
+              "min_ns": 2358562,
+              "median_twice_ns": 6181997,
+              "p95_nearest_rank_ns": 7018533,
+              "max_ns": 7018533
+            },
+            "B2": {
+              "samples_ns": [
+                2804299,
+                2724451,
+                2494660,
+                2244575,
+                2850378,
+                2668344,
+                2542337,
+                2831928
+              ],
+              "n": 8,
+              "min_ns": 2244575,
+              "median_twice_ns": 5392795,
+              "p95_nearest_rank_ns": 2850378,
+              "max_ns": 2850378
+            },
+            "A2": {
+              "samples_ns": [
+                2582540,
+                3017813,
+                3154651,
+                2398261,
+                3791467,
+                2578220,
+                2291214,
+                2258486
+              ],
+              "n": 8,
+              "min_ns": 2258486,
+              "median_twice_ns": 5160760,
+              "p95_nearest_rank_ns": 3791467,
+              "max_ns": 3791467
+            }
+          },
+          "gain_twice_ns": -1021237,
+          "gain_threshold_fortieth_ns": 5160760,
+          "robust_gain": false,
+          "regression_twice_ns": -65070,
+          "regression_threshold_fortieth_ns": 5457865,
+          "material_regression": false
+        },
+        "builder": {
+          "arms": {
+            "A1": {
+              "samples_ns": [
+                1623114,
+                1150437,
+                929031,
+                1417390,
+                1048101,
+                1667594,
+                1102235,
+                1125256
+              ],
+              "n": 8,
+              "min_ns": 929031,
+              "median_twice_ns": 2275693,
+              "p95_nearest_rank_ns": 1667594,
+              "max_ns": 1667594
+            },
+            "B1": {
+              "samples_ns": [
+                1185315,
+                2029267,
+                1482953,
+                1893697,
+                1139198,
+                2162665,
+                1786649,
+                1490993
+              ],
+              "n": 8,
+              "min_ns": 1139198,
+              "median_twice_ns": 3277642,
+              "p95_nearest_rank_ns": 2162665,
+              "max_ns": 2162665
+            },
+            "B2": {
+              "samples_ns": [
+                1327903,
+                1059169,
+                1518823,
+                1372343,
+                1360157,
+                1218669,
+                932506,
+                1774122
+              ],
+              "n": 8,
+              "min_ns": 932506,
+              "median_twice_ns": 2688060,
+              "p95_nearest_rank_ns": 1774122,
+              "max_ns": 1774122
+            },
+            "A2": {
+              "samples_ns": [
+                1046416,
+                1695870,
+                2797473,
+                1237896,
+                2442037,
+                1093712,
+                971540,
+                992924
+              ],
+              "n": 8,
+              "min_ns": 971540,
+              "median_twice_ns": 2331608,
+              "p95_nearest_rank_ns": 2797473,
+              "max_ns": 2797473
+            }
+          },
+          "gain_twice_ns": -1001949,
+          "gain_threshold_fortieth_ns": 2275693,
+          "robust_gain": false,
+          "regression_twice_ns": 356452,
+          "regression_threshold_fortieth_ns": 2331608,
+          "material_regression": true
+        },
+        "wholeReader": {
+          "arms": {
+            "A1": {
+              "samples_ns": [
+                10123760,
+                8612472,
+                8352259,
+                9657414,
+                9003638,
+                8853671,
+                8744151,
+                8216080
+              ],
+              "n": 8,
+              "min_ns": 8216080,
+              "median_twice_ns": 17597822,
+              "p95_nearest_rank_ns": 10123760,
+              "max_ns": 10123760
+            },
+            "B1": {
+              "samples_ns": [
+                29758109,
+                22274502,
+                23944075,
+                23830876,
+                19226241,
+                21114143,
+                23545015,
+                16495610
+              ],
+              "n": 8,
+              "min_ns": 16495610,
+              "median_twice_ns": 45819517,
+              "p95_nearest_rank_ns": 29758109,
+              "max_ns": 29758109
+            },
+            "B2": {
+              "samples_ns": [
+                18449205,
+                19198790,
+                17459064,
+                17829332,
+                20632166,
+                18824855,
+                17069806,
+                19229202
+              ],
+              "n": 8,
+              "min_ns": 17069806,
+              "median_twice_ns": 37274060,
+              "p95_nearest_rank_ns": 20632166,
+              "max_ns": 20632166
+            },
+            "A2": {
+              "samples_ns": [
+                22277967,
+                24776651,
+                25572713,
+                20885175,
+                30663967,
+                20870481,
+                19088166,
+                21534247
+              ],
+              "n": 8,
+              "min_ns": 19088166,
+              "median_twice_ns": 43812214,
+              "p95_nearest_rank_ns": 30663967,
+              "max_ns": 30663967
+            }
+          },
+          "gain_twice_ns": -28221695,
+          "gain_threshold_fortieth_ns": 17597822,
+          "robust_gain": false,
+          "regression_twice_ns": -6538154,
+          "regression_threshold_fortieth_ns": 43812214,
+          "material_regression": false
+        }
+      }
+    },
+    {
+      "case": 5,
+      "name": "first_64x128_zero",
+      "windows": {
+        "receive": {
+          "arms": {
+            "A1": {
+              "samples_ns": [
+                4138520,
+                5267033,
+                6692161,
+                5495655,
+                3661333,
+                7265168,
+                3687005,
+                3170446
+              ],
+              "n": 8,
+              "min_ns": 3170446,
+              "median_twice_ns": 9405553,
+              "p95_nearest_rank_ns": 7265168,
+              "max_ns": 7265168
+            },
+            "B1": {
+              "samples_ns": [
+                14616845,
+                13926430,
+                17068920,
+                13220264,
+                14392966,
+                14350331,
+                13139812,
+                22335220
+              ],
+              "n": 8,
+              "min_ns": 13139812,
+              "median_twice_ns": 28743297,
+              "p95_nearest_rank_ns": 22335220,
+              "max_ns": 22335220
+            },
+            "B2": {
+              "samples_ns": [
+                13810361,
+                13576302,
+                16624178,
+                13798755,
+                14828461,
+                13681451,
+                18611765,
+                15012411
+              ],
+              "n": 8,
+              "min_ns": 13576302,
+              "median_twice_ns": 28638822,
+              "p95_nearest_rank_ns": 18611765,
+              "max_ns": 18611765
+            },
+            "A2": {
+              "samples_ns": [
+                15820564,
+                17405151,
+                18446478,
+                17778410,
+                16103553,
+                20232910,
+                15645589,
+                16081078
+              ],
+              "n": 8,
+              "min_ns": 15645589,
+              "median_twice_ns": 33508704,
+              "p95_nearest_rank_ns": 20232910,
+              "max_ns": 20232910
+            }
+          },
+          "gain_twice_ns": -19337744,
+          "gain_threshold_fortieth_ns": 9405553,
+          "robust_gain": false,
+          "regression_twice_ns": -4869882,
+          "regression_threshold_fortieth_ns": 33508704,
+          "material_regression": false
+        },
+        "observations": {
+          "arms": {
+            "A1": {
+              "samples_ns": [
+                2204531,
+                2485173,
+                2248931,
+                3049692,
+                3681778,
+                3309532,
+                2366621,
+                2117535
+              ],
+              "n": 8,
+              "min_ns": 2117535,
+              "median_twice_ns": 4851794,
+              "p95_nearest_rank_ns": 3681778,
+              "max_ns": 3681778
+            },
+            "B1": {
+              "samples_ns": [
+                2812673,
+                2805010,
+                5191012,
+                2366465,
+                2514007,
+                4006733,
+                2410329,
+                5784848
+              ],
+              "n": 8,
+              "min_ns": 2366465,
+              "median_twice_ns": 5617683,
+              "p95_nearest_rank_ns": 5784848,
+              "max_ns": 5784848
+            },
+            "B2": {
+              "samples_ns": [
+                2312153,
+                2472709,
+                2406915,
+                2402792,
+                2654556,
+                2355971,
+                2703939,
+                2672880
+              ],
+              "n": 8,
+              "min_ns": 2312153,
+              "median_twice_ns": 4879624,
+              "p95_nearest_rank_ns": 2703939,
+              "max_ns": 2703939
+            },
+            "A2": {
+              "samples_ns": [
+                2112009,
+                2063305,
+                2427147,
+                2622649,
+                2009463,
+                2061135,
+                2438454,
+                2204096
+              ],
+              "n": 8,
+              "min_ns": 2009463,
+              "median_twice_ns": 4316105,
+              "p95_nearest_rank_ns": 2622649,
+              "max_ns": 2622649
+            }
+          },
+          "gain_twice_ns": -1301578,
+          "gain_threshold_fortieth_ns": 4316105,
+          "robust_gain": false,
+          "regression_twice_ns": 27830,
+          "regression_threshold_fortieth_ns": 4851794,
+          "material_regression": false
+        },
+        "columns": {
+          "arms": {
+            "A1": {
+              "samples_ns": [
+                4234122,
+                3442206,
+                3285043,
+                3612145,
+                3228288,
+                3654969,
+                3407959,
+                4567436
+              ],
+              "n": 8,
+              "min_ns": 3228288,
+              "median_twice_ns": 7054351,
+              "p95_nearest_rank_ns": 4567436,
+              "max_ns": 4567436
+            },
+            "B1": {
+              "samples_ns": [
+                3219586,
+                5303219,
+                5381348,
+                8431656,
+                3213370,
+                3734908,
+                7060047,
+                3860459
+              ],
+              "n": 8,
+              "min_ns": 3213370,
+              "median_twice_ns": 9163678,
+              "p95_nearest_rank_ns": 8431656,
+              "max_ns": 8431656
+            },
+            "B2": {
+              "samples_ns": [
+                2843694,
+                3612546,
+                3495159,
+                3579087,
+                3346465,
+                3439826,
+                3421497,
+                3195320
+              ],
+              "n": 8,
+              "min_ns": 2843694,
+              "median_twice_ns": 6861323,
+              "p95_nearest_rank_ns": 3612546,
+              "max_ns": 3612546
+            },
+            "A2": {
+              "samples_ns": [
+                2743579,
+                3139433,
+                2821913,
+                3109370,
+                2903824,
+                3017130,
+                2794787,
+                2908556
+              ],
+              "n": 8,
+              "min_ns": 2743579,
+              "median_twice_ns": 5812380,
+              "p95_nearest_rank_ns": 3139433,
+              "max_ns": 3139433
+            }
+          },
+          "gain_twice_ns": -3351298,
+          "gain_threshold_fortieth_ns": 5812380,
+          "robust_gain": false,
+          "regression_twice_ns": -193028,
+          "regression_threshold_fortieth_ns": 7054351,
+          "material_regression": false
+        },
+        "builder": {
+          "arms": {
+            "A1": {
+              "samples_ns": [
+                1013138,
+                1393667,
+                1994738,
+                1506019,
+                1046286,
+                1072294,
+                1286836,
+                1265492
+              ],
+              "n": 8,
+              "min_ns": 1013138,
+              "median_twice_ns": 2552328,
+              "p95_nearest_rank_ns": 1994738,
+              "max_ns": 1994738
+            },
+            "B1": {
+              "samples_ns": [
+                1268571,
+                1488474,
+                1407151,
+                1767143,
+                1055560,
+                1999106,
+                1796073,
+                1753790
+              ],
+              "n": 8,
+              "min_ns": 1055560,
+              "median_twice_ns": 3242264,
+              "p95_nearest_rank_ns": 1999106,
+              "max_ns": 1999106
+            },
+            "B2": {
+              "samples_ns": [
+                1276618,
+                1154921,
+                1227432,
+                1391826,
+                1328530,
+                1671268,
+                1418984,
+                1299697
+              ],
+              "n": 8,
+              "min_ns": 1154921,
+              "median_twice_ns": 2628227,
+              "p95_nearest_rank_ns": 1671268,
+              "max_ns": 1671268
+            },
+            "A2": {
+              "samples_ns": [
+                1168530,
+                1470375,
+                1295857,
+                984222,
+                1553392,
+                1926667,
+                1347449,
+                1284383
+              ],
+              "n": 8,
+              "min_ns": 984222,
+              "median_twice_ns": 2643306,
+              "p95_nearest_rank_ns": 1926667,
+              "max_ns": 1926667
+            }
+          },
+          "gain_twice_ns": -689936,
+          "gain_threshold_fortieth_ns": 2552328,
+          "robust_gain": false,
+          "regression_twice_ns": -15079,
+          "regression_threshold_fortieth_ns": 2643306,
+          "material_regression": false
+        },
+        "wholeReader": {
+          "arms": {
+            "A1": {
+              "samples_ns": [
+                11590700,
+                12588462,
+                14221420,
+                13663883,
+                11618246,
+                15302542,
+                10748926,
+                11121352
+              ],
+              "n": 8,
+              "min_ns": 10748926,
+              "median_twice_ns": 24206708,
+              "p95_nearest_rank_ns": 15302542,
+              "max_ns": 15302542
+            },
+            "B1": {
+              "samples_ns": [
+                21918119,
+                23523565,
+                29049208,
+                25785939,
+                21176304,
+                24091454,
+                24406714,
+                33734817
+              ],
+              "n": 8,
+              "min_ns": 21176304,
+              "median_twice_ns": 48498168,
+              "p95_nearest_rank_ns": 33734817,
+              "max_ns": 33734817
+            },
+            "B2": {
+              "samples_ns": [
+                20243276,
+                20816917,
+                23754081,
+                21172864,
+                22158438,
+                21148926,
+                26156578,
+                22180683
+              ],
+              "n": 8,
+              "min_ns": 20243276,
+              "median_twice_ns": 43331302,
+              "p95_nearest_rank_ns": 26156578,
+              "max_ns": 26156578
+            },
+            "A2": {
+              "samples_ns": [
+                21845130,
+                24078746,
+                24991808,
+                24495035,
+                22570679,
+                27238261,
+                22226714,
+                22478591
+              ],
+              "n": 8,
+              "min_ns": 21845130,
+              "median_twice_ns": 46649425,
+              "p95_nearest_rank_ns": 27238261,
+              "max_ns": 27238261
+            }
+          },
+          "gain_twice_ns": -24291460,
+          "gain_threshold_fortieth_ns": 24206708,
+          "robust_gain": false,
+          "regression_twice_ns": -3318123,
+          "regression_threshold_fortieth_ns": 46649425,
+          "material_regression": false
+        }
+      }
+    },
+    {
+      "case": 6,
+      "name": "add_48_to_16x128",
+      "windows": {
+        "receive": {
+          "arms": {
+            "A1": {
+              "samples_ns": [
+                4564595,
+                4528592,
+                6393438,
+                6649152,
+                5149801,
+                5559227,
+                5279648,
+                7271410
+              ],
+              "n": 8,
+              "min_ns": 4528592,
+              "median_twice_ns": 10838875,
+              "p95_nearest_rank_ns": 7271410,
+              "max_ns": 7271410
+            },
+            "B1": {
+              "samples_ns": [
+                13699226,
+                14900072,
+                11974435,
+                23671558,
+                11409192,
+                13127217,
+                12551191,
+                13287573
+              ],
+              "n": 8,
+              "min_ns": 11409192,
+              "median_twice_ns": 26414790,
+              "p95_nearest_rank_ns": 23671558,
+              "max_ns": 23671558
+            },
+            "B2": {
+              "samples_ns": [
+                11039115,
+                10985290,
+                14269298,
+                9882090,
+                11797413,
+                11864985,
+                11057694,
+                16314350
+              ],
+              "n": 8,
+              "min_ns": 9882090,
+              "median_twice_ns": 22855107,
+              "p95_nearest_rank_ns": 16314350,
+              "max_ns": 16314350
+            },
+            "A2": {
+              "samples_ns": [
+                13449281,
+                13118080,
+                23131434,
+                12759073,
+                19732192,
+                13733694,
+                14954999,
+                15980247
+              ],
+              "n": 8,
+              "min_ns": 12759073,
+              "median_twice_ns": 28688693,
+              "p95_nearest_rank_ns": 23131434,
+              "max_ns": 23131434
+            }
+          },
+          "gain_twice_ns": -15575915,
+          "gain_threshold_fortieth_ns": 10838875,
+          "robust_gain": false,
+          "regression_twice_ns": -5833586,
+          "regression_threshold_fortieth_ns": 28688693,
+          "material_regression": false
+        },
+        "observations": {
+          "arms": {
+            "A1": {
+              "samples_ns": [
+                563922,
+                664326,
+                723695,
+                590314,
+                578719,
+                580576,
+                611764,
+                694991
+              ],
+              "n": 8,
+              "min_ns": 563922,
+              "median_twice_ns": 1202078,
+              "p95_nearest_rank_ns": 723695,
+              "max_ns": 723695
+            },
+            "B1": {
+              "samples_ns": [
+                745153,
+                758402,
+                932791,
+                674559,
+                619122,
+                1437817,
+                630998,
+                599844
+              ],
+              "n": 8,
+              "min_ns": 599844,
+              "median_twice_ns": 1419712,
+              "p95_nearest_rank_ns": 1437817,
+              "max_ns": 1437817
+            },
+            "B2": {
+              "samples_ns": [
+                601370,
+                607586,
+                791440,
+                642698,
+                639386,
+                717694,
+                1073500,
+                684174
+              ],
+              "n": 8,
+              "min_ns": 601370,
+              "median_twice_ns": 1326872,
+              "p95_nearest_rank_ns": 1073500,
+              "max_ns": 1073500
+            },
+            "A2": {
+              "samples_ns": [
+                605052,
+                726189,
+                917762,
+                628348,
+                621162,
+                641556,
+                678099,
+                697406
+              ],
+              "n": 8,
+              "min_ns": 605052,
+              "median_twice_ns": 1319655,
+              "p95_nearest_rank_ns": 917762,
+              "max_ns": 917762
+            }
+          },
+          "gain_twice_ns": -217634,
+          "gain_threshold_fortieth_ns": 1202078,
+          "robust_gain": false,
+          "regression_twice_ns": 7217,
+          "regression_threshold_fortieth_ns": 1319655,
+          "material_regression": false
+        },
+        "columns": {
+          "arms": {
+            "A1": {
+              "samples_ns": [
+                2411929,
+                2018998,
+                2402267,
+                2171585,
+                2173671,
+                1860831,
+                2149549,
+                2830483
+              ],
+              "n": 8,
+              "min_ns": 1860831,
+              "median_twice_ns": 4345256,
+              "p95_nearest_rank_ns": 2830483,
+              "max_ns": 2830483
+            },
+            "B1": {
+              "samples_ns": [
+                2508853,
+                2740435,
+                2118603,
+                4826347,
+                2163107,
+                1856290,
+                1893243,
+                1926039
+              ],
+              "n": 8,
+              "min_ns": 1856290,
+              "median_twice_ns": 4281710,
+              "p95_nearest_rank_ns": 4826347,
+              "max_ns": 4826347
+            },
+            "B2": {
+              "samples_ns": [
+                2017563,
+                2495989,
+                3295177,
+                2052879,
+                2240472,
+                2058297,
+                3355928,
+                4363691
+              ],
+              "n": 8,
+              "min_ns": 2017563,
+              "median_twice_ns": 4736461,
+              "p95_nearest_rank_ns": 4363691,
+              "max_ns": 4363691
+            },
+            "A2": {
+              "samples_ns": [
+                1819910,
+                2178386,
+                1901457,
+                2229438,
+                3850640,
+                2178293,
+                1835666,
+                1883942
+              ],
+              "n": 8,
+              "min_ns": 1819910,
+              "median_twice_ns": 4079750,
+              "p95_nearest_rank_ns": 3850640,
+              "max_ns": 3850640
+            }
+          },
+          "gain_twice_ns": -656711,
+          "gain_threshold_fortieth_ns": 4079750,
+          "robust_gain": false,
+          "regression_twice_ns": -63546,
+          "regression_threshold_fortieth_ns": 4345256,
+          "material_regression": false
+        },
+        "builder": {
+          "arms": {
+            "A1": {
+              "samples_ns": [
+                970897,
+                955994,
+                1133397,
+                1195866,
+                1158160,
+                1142187,
+                836158,
+                1062343
+              ],
+              "n": 8,
+              "min_ns": 836158,
+              "median_twice_ns": 2195740,
+              "p95_nearest_rank_ns": 1195866,
+              "max_ns": 1195866
+            },
+            "B1": {
+              "samples_ns": [
+                1146824,
+                1642346,
+                1136396,
+                5077462,
+                948533,
+                1510467,
+                825865,
+                1074210
+              ],
+              "n": 8,
+              "min_ns": 825865,
+              "median_twice_ns": 2283220,
+              "p95_nearest_rank_ns": 5077462,
+              "max_ns": 5077462
+            },
+            "B2": {
+              "samples_ns": [
+                1560651,
+                878777,
+                992096,
+                1560443,
+                1205375,
+                2783934,
+                1684086,
+                5644423
+              ],
+              "n": 8,
+              "min_ns": 878777,
+              "median_twice_ns": 3121094,
+              "p95_nearest_rank_ns": 5644423,
+              "max_ns": 5644423
+            },
+            "A2": {
+              "samples_ns": [
+                1211939,
+                1547317,
+                1155376,
+                923542,
+                2047912,
+                1823869,
+                1083559,
+                1293759
+              ],
+              "n": 8,
+              "min_ns": 923542,
+              "median_twice_ns": 2505698,
+              "p95_nearest_rank_ns": 2047912,
+              "max_ns": 2047912
+            }
+          },
+          "gain_twice_ns": -925354,
+          "gain_threshold_fortieth_ns": 2195740,
+          "robust_gain": false,
+          "regression_twice_ns": -222478,
+          "regression_threshold_fortieth_ns": 2505698,
+          "material_regression": false
+        },
+        "wholeReader": {
+          "arms": {
+            "A1": {
+              "samples_ns": [
+                8511747,
+                8168268,
+                10653180,
+                10607329,
+                9061010,
+                9143155,
+                8877493,
+                11859658
+              ],
+              "n": 8,
+              "min_ns": 8168268,
+              "median_twice_ns": 18204165,
+              "p95_nearest_rank_ns": 11859658,
+              "max_ns": 11859658
+            },
+            "B1": {
+              "samples_ns": [
+                18100474,
+                20041647,
+                16162650,
+                34250431,
+                15140432,
+                17932191,
+                15901688,
+                16888140
+              ],
+              "n": 8,
+              "min_ns": 15140432,
+              "median_twice_ns": 34820331,
+              "p95_nearest_rank_ns": 34250431,
+              "max_ns": 34250431
+            },
+            "B2": {
+              "samples_ns": [
+                15219192,
+                14968039,
+                19348377,
+                14138500,
+                15883152,
+                17425288,
+                17171624,
+                27007154
+              ],
+              "n": 8,
+              "min_ns": 14138500,
+              "median_twice_ns": 33054776,
+              "p95_nearest_rank_ns": 27007154,
+              "max_ns": 27007154
+            },
+            "A2": {
+              "samples_ns": [
+                17086610,
+                17570487,
+                27106444,
+                16540820,
+                26252324,
+                18377869,
+                18552849,
+                19855785
+              ],
+              "n": 8,
+              "min_ns": 16540820,
+              "median_twice_ns": 36930718,
+              "p95_nearest_rank_ns": 27106444,
+              "max_ns": 27106444
+            }
+          },
+          "gain_twice_ns": -16616166,
+          "gain_threshold_fortieth_ns": 18204165,
+          "robust_gain": false,
+          "regression_twice_ns": -3875942,
+          "regression_threshold_fortieth_ns": 36930718,
+          "material_regression": false
+        }
+      }
+    },
+    {
+      "case": 7,
+      "name": "add_48_to_16x128_zero",
+      "windows": {
+        "receive": {
+          "arms": {
+            "A1": {
+              "samples_ns": [
+                6523610,
+                6295674,
+                5583296,
+                5155886,
+                5187705,
+                5772561,
+                5054632,
+                4922355
+              ],
+              "n": 8,
+              "min_ns": 4922355,
+              "median_twice_ns": 10771001,
+              "p95_nearest_rank_ns": 6523610,
+              "max_ns": 6523610
+            },
+            "B1": {
+              "samples_ns": [
+                13417279,
+                15719283,
+                19148015,
+                17053132,
+                27254319,
+                25125073,
+                23616007,
+                16592743
+              ],
+              "n": 8,
+              "min_ns": 13417279,
+              "median_twice_ns": 36201147,
+              "p95_nearest_rank_ns": 27254319,
+              "max_ns": 27254319
+            },
+            "B2": {
+              "samples_ns": [
+                11652751,
+                14126483,
+                19500049,
+                15846894,
+                17199616,
+                19635623,
+                17354951,
+                24315061
+              ],
+              "n": 8,
+              "min_ns": 11652751,
+              "median_twice_ns": 34554567,
+              "p95_nearest_rank_ns": 24315061,
+              "max_ns": 24315061
+            },
+            "A2": {
+              "samples_ns": [
+                13059766,
+                12229622,
+                13054204,
+                12426504,
+                13708654,
+                13276738,
+                11756285,
+                12331277
+              ],
+              "n": 8,
+              "min_ns": 11756285,
+              "median_twice_ns": 25480708,
+              "p95_nearest_rank_ns": 13708654,
+              "max_ns": 13708654
+            }
+          },
+          "gain_twice_ns": -25430146,
+          "gain_threshold_fortieth_ns": 10771001,
+          "robust_gain": false,
+          "regression_twice_ns": 9073859,
+          "regression_threshold_fortieth_ns": 25480708,
+          "material_regression": true
+        },
+        "observations": {
+          "arms": {
+            "A1": {
+              "samples_ns": [
+                1714318,
+                1668747,
+                2503082,
+                3033049,
+                1858401,
+                2090341,
+                1548549,
+                1997499
+              ],
+              "n": 8,
+              "min_ns": 1548549,
+              "median_twice_ns": 3855900,
+              "p95_nearest_rank_ns": 3033049,
+              "max_ns": 3033049
+            },
+            "B1": {
+              "samples_ns": [
+                1937417,
+                1838004,
+                2358699,
+                1801447,
+                3991831,
+                2417632,
+                4423924,
+                1851346
+              ],
+              "n": 8,
+              "min_ns": 1801447,
+              "median_twice_ns": 4296116,
+              "p95_nearest_rank_ns": 4423924,
+              "max_ns": 4423924
+            },
+            "B2": {
+              "samples_ns": [
+                2523270,
+                2309430,
+                1783234,
+                1789767,
+                1772727,
+                3080083,
+                2606358,
+                1560860
+              ],
+              "n": 8,
+              "min_ns": 1560860,
+              "median_twice_ns": 4099197,
+              "p95_nearest_rank_ns": 3080083,
+              "max_ns": 3080083
+            },
+            "A2": {
+              "samples_ns": [
+                1976109,
+                1584963,
+                1831076,
+                1457467,
+                1560192,
+                1610390,
+                1485387,
+                1622512
+              ],
+              "n": 8,
+              "min_ns": 1457467,
+              "median_twice_ns": 3195353,
+              "p95_nearest_rank_ns": 1976109,
+              "max_ns": 1976109
+            }
+          },
+          "gain_twice_ns": -1100763,
+          "gain_threshold_fortieth_ns": 3195353,
+          "robust_gain": false,
+          "regression_twice_ns": 243297,
+          "regression_threshold_fortieth_ns": 3855900,
+          "material_regression": true
+        },
+        "columns": {
+          "arms": {
+            "A1": {
+              "samples_ns": [
+                2826758,
+                2127360,
+                2116618,
+                2581253,
+                2684269,
+                2158899,
+                2592569,
+                2690850
+              ],
+              "n": 8,
+              "min_ns": 2116618,
+              "median_twice_ns": 5173822,
+              "p95_nearest_rank_ns": 2826758,
+              "max_ns": 2826758
+            },
+            "B1": {
+              "samples_ns": [
+                2481305,
+                2366700,
+                4355316,
+                3892801,
+                7951081,
+                3822793,
+                3577169,
+                2320446
+              ],
+              "n": 8,
+              "min_ns": 2320446,
+              "median_twice_ns": 7399962,
+              "p95_nearest_rank_ns": 7951081,
+              "max_ns": 7951081
+            },
+            "B2": {
+              "samples_ns": [
+                2958485,
+                2277247,
+                2700964,
+                2644957,
+                2370105,
+                2457141,
+                3186489,
+                2170917
+              ],
+              "n": 8,
+              "min_ns": 2170917,
+              "median_twice_ns": 5102098,
+              "p95_nearest_rank_ns": 3186489,
+              "max_ns": 3186489
+            },
+            "A2": {
+              "samples_ns": [
+                2224422,
+                2058433,
+                2121660,
+                2100016,
+                2068148,
+                2236310,
+                2675056,
+                2096036
+              ],
+              "n": 8,
+              "min_ns": 2058433,
+              "median_twice_ns": 4221676,
+              "p95_nearest_rank_ns": 2675056,
+              "max_ns": 2675056
+            }
+          },
+          "gain_twice_ns": -3178286,
+          "gain_threshold_fortieth_ns": 4221676,
+          "robust_gain": false,
+          "regression_twice_ns": -71724,
+          "regression_threshold_fortieth_ns": 5173822,
+          "material_regression": false
+        },
+        "builder": {
+          "arms": {
+            "A1": {
+              "samples_ns": [
+                1020285,
+                1169420,
+                1145717,
+                909691,
+                1109934,
+                852098,
+                1384215,
+                961224
+              ],
+              "n": 8,
+              "min_ns": 852098,
+              "median_twice_ns": 2130219,
+              "p95_nearest_rank_ns": 1384215,
+              "max_ns": 1384215
+            },
+            "B1": {
+              "samples_ns": [
+                1049262,
+                1062728,
+                1364975,
+                2788649,
+                1640059,
+                1437452,
+                1323960,
+                1515631
+              ],
+              "n": 8,
+              "min_ns": 1049262,
+              "median_twice_ns": 2802427,
+              "p95_nearest_rank_ns": 2788649,
+              "max_ns": 2788649
+            },
+            "B2": {
+              "samples_ns": [
+                1778787,
+                1094118,
+                834684,
+                1241937,
+                1178221,
+                1340724,
+                1564455,
+                947824
+              ],
+              "n": 8,
+              "min_ns": 834684,
+              "median_twice_ns": 2420158,
+              "p95_nearest_rank_ns": 1778787,
+              "max_ns": 1778787
+            },
+            "A2": {
+              "samples_ns": [
+                950339,
+                1465525,
+                1218394,
+                828035,
+                1056407,
+                1649606,
+                2826491,
+                1367271
+              ],
+              "n": 8,
+              "min_ns": 828035,
+              "median_twice_ns": 2585665,
+              "p95_nearest_rank_ns": 2826491,
+              "max_ns": 2826491
+            }
+          },
+          "gain_twice_ns": -672208,
+          "gain_threshold_fortieth_ns": 2130219,
+          "robust_gain": false,
+          "regression_twice_ns": -165507,
+          "regression_threshold_fortieth_ns": 2585665,
+          "material_regression": false
+        },
+        "wholeReader": {
+          "arms": {
+            "A1": {
+              "samples_ns": [
+                12085361,
+                11261583,
+                11349139,
+                11680300,
+                10840667,
+                10874293,
+                10580450,
+                10572521
+              ],
+              "n": 8,
+              "min_ns": 10572521,
+              "median_twice_ns": 22135876,
+              "p95_nearest_rank_ns": 12085361,
+              "max_ns": 12085361
+            },
+            "B1": {
+              "samples_ns": [
+                18885660,
+                20987102,
+                27227428,
+                25536486,
+                40837728,
+                32803487,
+                32941467,
+                22280557
+              ],
+              "n": 8,
+              "min_ns": 18885660,
+              "median_twice_ns": 52763914,
+              "p95_nearest_rank_ns": 40837728,
+              "max_ns": 40837728
+            },
+            "B2": {
+              "samples_ns": [
+                18913692,
+                19807721,
+                24819380,
+                21524001,
+                22521057,
+                26514185,
+                24712644,
+                28995088
+              ],
+              "n": 8,
+              "min_ns": 18913692,
+              "median_twice_ns": 47233701,
+              "p95_nearest_rank_ns": 28995088,
+              "max_ns": 28995088
+            },
+            "A2": {
+              "samples_ns": [
+                18211047,
+                17338967,
+                18225788,
+                16812407,
+                18393837,
+                18773507,
+                18743749,
+                17417606
+              ],
+              "n": 8,
+              "min_ns": 16812407,
+              "median_twice_ns": 36436835,
+              "p95_nearest_rank_ns": 18773507,
+              "max_ns": 18773507
+            }
+          },
+          "gain_twice_ns": -30628038,
+          "gain_threshold_fortieth_ns": 22135876,
+          "robust_gain": false,
+          "regression_twice_ns": 10796866,
+          "regression_threshold_fortieth_ns": 36436835,
+          "material_regression": true
+        }
+      }
+    },
+    {
+      "case": 8,
+      "name": "remove_16_of_64x128",
+      "windows": {
+        "receive": {
+          "arms": {
+            "A1": {
+              "samples_ns": [
+                357747,
+                291822,
+                264863,
+                350088,
+                466132,
+                262895,
+                331394,
+                692659
+              ],
+              "n": 8,
+              "min_ns": 262895,
+              "median_twice_ns": 681482,
+              "p95_nearest_rank_ns": 692659,
+              "max_ns": 692659
+            },
+            "B1": {
+              "samples_ns": [
+                267605,
+                411820,
+                273332,
+                556004,
+                408618,
+                361117,
+                280209,
+                530606
+              ],
+              "n": 8,
+              "min_ns": 267605,
+              "median_twice_ns": 769735,
+              "p95_nearest_rank_ns": 556004,
+              "max_ns": 556004
+            },
+            "B2": {
+              "samples_ns": [
+                286279,
+                271621,
+                271161,
+                362027,
+                395589,
+                265439,
+                267957,
+                580904
+              ],
+              "n": 8,
+              "min_ns": 265439,
+              "median_twice_ns": 557900,
+              "p95_nearest_rank_ns": 580904,
+              "max_ns": 580904
+            },
+            "A2": {
+              "samples_ns": [
+                273120,
+                287266,
+                298666,
+                286895,
+                322299,
+                310635,
+                261436,
+                260017
+              ],
+              "n": 8,
+              "min_ns": 260017,
+              "median_twice_ns": 574161,
+              "p95_nearest_rank_ns": 322299,
+              "max_ns": 322299
+            }
+          },
+          "gain_twice_ns": -195574,
+          "gain_threshold_fortieth_ns": 574161,
+          "robust_gain": false,
+          "regression_twice_ns": -123582,
+          "regression_threshold_fortieth_ns": 681482,
+          "material_regression": false
+        },
+        "observations": {
+          "arms": {
+            "A1": {
+              "samples_ns": [
+                652136,
+                133903,
+                88284,
+                89639,
+                165799,
+                78737,
+                103399,
+                120031
+              ],
+              "n": 8,
+              "min_ns": 78737,
+              "median_twice_ns": 223430,
+              "p95_nearest_rank_ns": 652136,
+              "max_ns": 652136
+            },
+            "B1": {
+              "samples_ns": [
+                171592,
+                101604,
+                101007,
+                96267,
+                195886,
+                90040,
+                104190,
+                113874
+              ],
+              "n": 8,
+              "min_ns": 90040,
+              "median_twice_ns": 205794,
+              "p95_nearest_rank_ns": 195886,
+              "max_ns": 195886
+            },
+            "B2": {
+              "samples_ns": [
+                99728,
+                93828,
+                95555,
+                91403,
+                86075,
+                126682,
+                86998,
+                87896
+              ],
+              "n": 8,
+              "min_ns": 86075,
+              "median_twice_ns": 185231,
+              "p95_nearest_rank_ns": 126682,
+              "max_ns": 126682
+            },
+            "A2": {
+              "samples_ns": [
+                108791,
+                87145,
+                103084,
+                167599,
+                85779,
+                135895,
+                85973,
+                85411
+              ],
+              "n": 8,
+              "min_ns": 85411,
+              "median_twice_ns": 190229,
+              "p95_nearest_rank_ns": 167599,
+              "max_ns": 167599
+            }
+          },
+          "gain_twice_ns": -15565,
+          "gain_threshold_fortieth_ns": 400000,
+          "robust_gain": false,
+          "regression_twice_ns": -38199,
+          "regression_threshold_fortieth_ns": 400000,
+          "material_regression": false
+        },
+        "columns": {
+          "arms": {
+            "A1": {
+              "samples_ns": [
+                941420,
+                948949,
+                697796,
+                661243,
+                1357823,
+                834771,
+                671646,
+                1396308
+              ],
+              "n": 8,
+              "min_ns": 661243,
+              "median_twice_ns": 1776191,
+              "p95_nearest_rank_ns": 1396308,
+              "max_ns": 1396308
+            },
+            "B1": {
+              "samples_ns": [
+                1793349,
+                739421,
+                689033,
+                802925,
+                1424221,
+                984306,
+                1014131,
+                1438181
+              ],
+              "n": 8,
+              "min_ns": 689033,
+              "median_twice_ns": 1998437,
+              "p95_nearest_rank_ns": 1793349,
+              "max_ns": 1793349
+            },
+            "B2": {
+              "samples_ns": [
+                1057529,
+                922767,
+                859501,
+                716178,
+                837907,
+                653326,
+                931406,
+                862941
+              ],
+              "n": 8,
+              "min_ns": 653326,
+              "median_twice_ns": 1722442,
+              "p95_nearest_rank_ns": 1057529,
+              "max_ns": 1057529
+            },
+            "A2": {
+              "samples_ns": [
+                701243,
+                838742,
+                782471,
+                732824,
+                694875,
+                731212,
+                784398,
+                695751
+              ],
+              "n": 8,
+              "min_ns": 694875,
+              "median_twice_ns": 1464036,
+              "p95_nearest_rank_ns": 838742,
+              "max_ns": 838742
+            }
+          },
+          "gain_twice_ns": -534401,
+          "gain_threshold_fortieth_ns": 1464036,
+          "robust_gain": false,
+          "regression_twice_ns": -53749,
+          "regression_threshold_fortieth_ns": 1776191,
+          "material_regression": false
+        },
+        "builder": {
+          "arms": {
+            "A1": {
+              "samples_ns": [
+                1109863,
+                2300960,
+                918006,
+                1482946,
+                1093651,
+                1669633,
+                970670,
+                2444207
+              ],
+              "n": 8,
+              "min_ns": 918006,
+              "median_twice_ns": 2592809,
+              "p95_nearest_rank_ns": 2444207,
+              "max_ns": 2444207
+            },
+            "B1": {
+              "samples_ns": [
+                2672344,
+                922832,
+                1851127,
+                1092455,
+                1358653,
+                1552675,
+                1406515,
+                1687683
+              ],
+              "n": 8,
+              "min_ns": 922832,
+              "median_twice_ns": 2959190,
+              "p95_nearest_rank_ns": 2672344,
+              "max_ns": 2672344
+            },
+            "B2": {
+              "samples_ns": [
+                2491865,
+                1193028,
+                2642812,
+                958172,
+                1047275,
+                917522,
+                1689157,
+                980247
+              ],
+              "n": 8,
+              "min_ns": 917522,
+              "median_twice_ns": 2240303,
+              "p95_nearest_rank_ns": 2642812,
+              "max_ns": 2642812
+            },
+            "A2": {
+              "samples_ns": [
+                869176,
+                900301,
+                1334844,
+                1593359,
+                1183883,
+                1589667,
+                871583,
+                3778028
+              ],
+              "n": 8,
+              "min_ns": 869176,
+              "median_twice_ns": 2518727,
+              "p95_nearest_rank_ns": 3778028,
+              "max_ns": 3778028
+            }
+          },
+          "gain_twice_ns": -440463,
+          "gain_threshold_fortieth_ns": 2518727,
+          "robust_gain": false,
+          "regression_twice_ns": -352506,
+          "regression_threshold_fortieth_ns": 2592809,
+          "material_regression": false
+        },
+        "wholeReader": {
+          "arms": {
+            "A1": {
+              "samples_ns": [
+                3061522,
+                3676012,
+                1969320,
+                2584267,
+                3083844,
+                2846397,
+                2077606,
+                4653825
+              ],
+              "n": 8,
+              "min_ns": 1969320,
+              "median_twice_ns": 5907919,
+              "p95_nearest_rank_ns": 4653825,
+              "max_ns": 4653825
+            },
+            "B1": {
+              "samples_ns": [
+                4905309,
+                2175969,
+                2914827,
+                2548002,
+                3387757,
+                2988685,
+                2805469,
+                3770736
+              ],
+              "n": 8,
+              "min_ns": 2175969,
+              "median_twice_ns": 5903512,
+              "p95_nearest_rank_ns": 4905309,
+              "max_ns": 4905309
+            },
+            "B2": {
+              "samples_ns": [
+                3935769,
+                2481552,
+                3869389,
+                2128071,
+                2367130,
+                1963275,
+                2975935,
+                2512317
+              ],
+              "n": 8,
+              "min_ns": 1963275,
+              "median_twice_ns": 4993869,
+              "p95_nearest_rank_ns": 3935769,
+              "max_ns": 3935769
+            },
+            "A2": {
+              "samples_ns": [
+                1952708,
+                2113849,
+                2519575,
+                2781156,
+                2287221,
+                2767834,
+                2003764,
+                4819654
+              ],
+              "n": 8,
+              "min_ns": 1952708,
+              "median_twice_ns": 4806796,
+              "p95_nearest_rank_ns": 4819654,
+              "max_ns": 4819654
+            }
+          },
+          "gain_twice_ns": -1096716,
+          "gain_threshold_fortieth_ns": 4806796,
+          "robust_gain": false,
+          "regression_twice_ns": -914050,
+          "regression_threshold_fortieth_ns": 5907919,
+          "material_regression": false
+        }
+      }
+    }
+  ],
+  "causality": "wholeReader rejection is observed; contains_key alone is not established as its cause",
+  "sampling_policy": "fixed batch terminal; no extra samples or changed thresholds",
+  "restore_verification": {
+    "original_source_bytes_equal_after_removing_only_qualification_test_hooks": true,
+    "qualification_new_file_absent": true,
+    "performance_new_file_absent": true,
+    "validator_clean_status_record_empty": true,
+    "new_sampling": 0,
+    "new_builds_by_independent_review": 0,
+    "packaging_issue": "reverse unified diff left temporary empty file before explicit removal; preserved, not a Rust failure"
+  }
+}

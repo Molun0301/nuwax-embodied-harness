@@ -643,6 +643,14 @@ A/B default release check/no-run与local-guidance-qualification+body-query-profi
 
 retained与fresh有序完整pose数值、长度和终点对照通过；fresh查询仍可能共享observations中的原reference缓存，不称完全全冷或bitwise。暖态当前limits先于取消、原route内typed错误保留至Discard，以及原配置/边界/缺图/反馈/生命周期控制均通过。接受范围是已验证的重复构图消除，不宣称端到端时延、CPU/RSS、动态local_cost变化、实际active-child节拍或TTL实测收益。
 
+## 第四十八阶段：脏列共有块去重未通过完整链性能门
+
+本轮仅尝试columns新key枚举跳过old已包含项，保留原两BTreeMap/dirty集合/第一次错误和预算；阶段31曾拒绝的observations双游标不是本次候选。旧核两边界PASS，真实双Reader主例在两缓存完整内容/读请求序/旧root等价后，仅预定重复展开2→1尾断言RED；候选11项PASS，两预算实际展开1/冻结旧核2。共14执行/11distinct。初次3旧selector缺lcm_dataflow前缀在任何B测试前被list发现，修仓外runner不改源码，原记录保留。
+
+独立性能固定ABBA四进程、8配置各4预热8记录，共384条（256记录128预热）输入/语义/资源/清理完整。临时去4个资格hook，原单binary两核精确一行差，计receive→observations→columns→实际builder返回，不是完整SurfaceMapCache/导航。ID2局部columns稳定收益39.893μs，但wholeReader最保守只6.3755μs未达门；ID7零cache新增占优wholeReader A中位11.068–18.218ms，B23.617–26.382ms，触发预声明重要回退门。另16个未改阶段漂移条目跨8配置，不把这些或整窗差归因contains_key，不补样或改门。
+
+按原门拒绝候选。恢复资格B两源四hook后stack/mls tests check通过，再精确恢复4c652c5f整源、归档撤出新tests及临时perf，tree clean。反向patch清空文件未删除的包装断言异常独立保留；check实际针对已恢复且不引用空文件的B，无追加性能样本。仅保存[拒绝报告](navigation-columns-dedup-rejection-20261018.md)与[全部整数结果](navigation-columns-dedup-rejection-20261018.json)，不保留新生产/永久诊断接线。
+
 ## 后续持续检查
 
 1. 墙前晚到路径的实际恢复与初始 full/partial/PCT 顺序，保留及时移动和真实避障

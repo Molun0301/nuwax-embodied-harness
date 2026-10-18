@@ -1361,6 +1361,28 @@ impl SurfaceSnapshot {
                 let plane=polygon_query.contact_plane(body,r[2],x,y,size,self.ground_cell_position(ground)[2],
                     (-model.body_to_support_z_m/r[2][2]+contact+1e-6).min(uncertainty));
                 let support_plane = plane - model.body_to_support_z_m / r[2][2];
+                // Borrow the original coarse levels. Only the original strict Z-separation
+                // predicate proves that no collision consumer can use fine contact rows.
+                let occupied_zs=self.data.occupied_columns.get(&(x,y));
+                let has_vertical_overlap=occupied_zs.is_some_and(|zs|zs.iter().any(|&z| {
+                    let bounds=self.data.height_bounds.get(&(x,y,z)).copied().unwrap_or([
+                        z as f32*self.config().voxel_size,
+                        (z as f32+1.0)*self.config().voxel_size,
+                    ]);
+                    !(f64::from(bounds[0])>max[2] || f64::from(bounds[1])<min[2])
+                }));
+                if !has_vertical_overlap {
+                    // Same ordered height selection/reduction, without unused contact membership.
+                    // Some(all-missing rows) still falls back inside fine_ground_height;
+                    // only a genuine None permits the original precise-ground precedence.
+                    let ground_height=if let Some(height)=self.fine_ground_height(
+                        ground,&polygon_query,&prism_query,body,r[2],x,y) {height}
+                        else if precise_ground.contains_key(&(x,y)) {precise_ground[&(x,y)]}
+                        else {self.footprint_ground_height(
+                            ground,&polygon_query,&prism_query,support_plane,contact,None)?};
+                    ground_points.push([px,py,ground_height]);
+                    continue;
+                }
                 let selected=self.fine_ground_columns(Some(ground),&polygon_query,&prism_query,body,r[2],x,y);
                 let ground_height = if selected.is_none() && precise_ground.contains_key(&(x,y)) {precise_ground[&(x,y)]} else {
                     self.footprint_ground_height(ground,&polygon_query,&prism_query,support_plane,contact,selected.as_deref())?
@@ -1374,7 +1396,7 @@ impl SurfaceSnapshot {
                 // remaining occupied volume intersects the prism below.
                 let coarse_contact=height_rejection(plane+model.z_bounds_m[0]/r[2][2],
                     support_plane,plane,contact,ground_height,uncertainty).is_none();
-                if let Some(zs) = self.data.occupied_columns.get(&(x, y)) {
+                if let Some(zs) = occupied_zs {
                     for &z in zs {
                         let bounds = self.data.height_bounds.get(&(x, y, z)).copied().unwrap_or([
                             z as f32 * self.config().voxel_size,

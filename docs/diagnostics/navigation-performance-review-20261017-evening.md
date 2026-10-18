@@ -325,6 +325,16 @@ Writer::seal 只在原 same_domain 且 changed_members 为空时，按新旧相�
 
 原单 target 增量 check/no-run 12.00s/2m48s；实际 22 个 exact 全通过，含成功/早返计时边界、新完整旧核/witness、既有计数/cache 控制；默认七包 tests check 15.40s 通过。唯一原压力诊断 exit0，两份守恒均成立；整进程 wall19.316s、user19.162s、system0.140s 包含两请求和夹具。没有本批全量 MLS 或实机资格结论，旧失败和环境限制保留。
 
+## 第二十二阶段：仅构造实际会消费的细地面数据
+
+粗列中原占据 Z 范围若全部严格位于机体上下界之外，原碰撞循环不会使用 contacts/XY 行信息，只有高度会进入 ground_points。现在在这个窄条件下复用现有 fine_ground_height（CONTACTS=false），保留同一有序地面选择和最大值；有任何潜在 Z 交叠仍走完整原路径。闭端点接触不当作分离，原 f32 bounds/fallback、Some(all-None)、precise_ground 优先级、横坡/ground-relation 尾检查与错误/witness 顺序均保留。新增范围预扫的成本计入实测，没有新计时/缓存/锁。
+
+测试先在原生产通过，再同套对照候选：26 focused 全通过，完整 MLS 396 通过/20 原 ignored、Scan79/11、route_planning27、route_follower46/9、planning_owner4；默认七包 tests 检查通过。新增四项覆盖真实无 Z 交叠、上下端点 ULP 边界、mixed 首 witness、Some(all-None)、多列横坡及独立 source 重建。更正旧注释：planning fork 不代表所有缓存冷启动，source legacy_reference_cache 仍共享 Arc；完整旧核比较有效，新增独立 source 对照用于真正源缓存 cold 控制。
+
+限定 ABBA 各两次原 1cm 压力观察，8 个原请求的全部阶段调用数、34 计数、分支和 256 partial 结果完全一致。整子进程 wall A18.185–19.316s，B15.345–16.057s；N remaining A6.953–7.815s，B6.498–6.724s；T remaining A8.068–8.262s，B6.085–6.568s。两个 B 样本均低于两个 A，故接受此窄优化；这些范围不是统计稳定百分比或 Go2 实机收益，不能把嵌套阶段相加或将全部差额当作 contacts 独占成本。
+
+最终精确恢复已验证 B 源码，再增量 check/no-run、默认七包检查通过，无第三次 B 计时，单一 target 继续复用。未应用此前无收益的 BFS P1 和未命中热点的 indexed-Z02。原 urgent cancellation、UDP/UDS及实机失败范围保留。
+
 ## 后续持续检查
 
 1. 墙前晚到路径的实际恢复与初始 full/partial/PCT 顺序，保留及时移动和真实避障

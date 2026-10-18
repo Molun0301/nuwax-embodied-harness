@@ -293,8 +293,9 @@ fn poison() -> BodyRejection {
 }
 
 // Every paired call executes the actual kernels, never a shared pose-cache hit.
-// Planning forks isolate ALL caches, including observation-owner caches and the
-// legacy ground-patch cache, while preserving the exact source payloads.
+// Planning forks isolate disposable body-query/ground-patch caches. Observation
+// legacy_reference_cache remains shared by Arc (surface/observations.rs), so
+// these phases do not claim that every source-owned cache is cold/reset.
 fn compare_pose(source: &SurfaceSnapshot, pose: Pose) -> (Result<(), SurfaceError>, Option<BodyRejection>) {
     let mut candidate = source.fork_for_planning();
     let mut oracle = source.fork_for_planning();
@@ -724,4 +725,239 @@ fn pose_path_profile_early_prelude_and_column_errors_finish_scopes() {
     assert_eq!(result,Err(SurfaceError::InsufficientClearance));
     assert!(matches!(rejection,Some(BodyRejection::Occupancy {cell:[0,0,1],source:OccupancySource::Fine,..})));
     assert_pose_path_scope(&record,1,1,0);
+}
+
+// A predicate/consumer admission check, not a replacement collision implementation.
+// Original full rows and height-only rows are queried outside the profile interval.
+struct LazyContactAdmission {
+    assigned: u64,
+    disjoint: u64,
+    overlapping: u64,
+    ground_points: Vec<[f64;3]>,
+    min: [f64;3],
+    max: [f64;3],
+}
+fn admit_lazy_contact_pose(source:&SurfaceSnapshot,pose:Pose)->LazyContactAdmission {
+    let map=source.fork_for_planning();
+    assert!(map.recent_obstacles.is_none() && map.data.virtual_obstacles.is_none());
+    let model=map.body_envelope().unwrap(); let r=rotation(pose.1).unwrap();
+    let centre=map.locate_support_from_body(pose.0,pose.1,model.body_to_support_z_m).unwrap();
+    let vertices:Vec<_>=model.footprint_xy_m.iter()
+        .flat_map(|p|model.z_bounds_m.map(|z|world(r,pose.0,[p[0],p[1],z]))).collect();
+    let polygon=hull(vertices.iter().map(|p|[p[0],p[1]]).collect());
+    let query=PolygonQuery::new(&polygon); let prism=PrismQuery::new(model,r,pose.0);
+    let (min,max)=vertices.iter().fold(([f64::INFINITY;3],[f64::NEG_INFINITY;3]),|(mut a,mut b),p| {
+        for i in 0..3 { a[i]=a[i].min(p[i]); b[i]=b[i].max(p[i]); } (a,b)
+    });
+    let size=f64::from(map.config().voxel_size);
+    let bounds=([min[0],min[1]].map(|v|(v/size).floor()as i32),
+        [max[0],max[1]].map(|v|(v/size).floor()as i32));
+    let radius=((vertices.iter().map(|p|(p[0]-centre.surface_xyz[0]).hypot(p[1]-centre.surface_xyz[1]))
+        .fold(0.0,f64::max)+size*2.0)/size).ceil()*size;
+    let (patch,precise)=map.refine_footprint_support(map.ground_patch(centre,radius),
+        &query,&prism,pose.0,r,bounds);
+    let mut fringe=None;
+    assert_eq!(map.check_fine_column_fringe(pose.0,r,&query,&prism,&patch,min,max,bounds,&mut fringe),Ok(()));
+    assert!(fringe.is_none(),"control must reach the original coarse loop");
+    let mut result=LazyContactAdmission {assigned:0,disjoint:0,overlapping:0,ground_points:Vec::new(),min,max};
+    let uncertainty=f64::from(map.source_voxel_size_m())+model.support_uncertainty_m;
+    let contact=model.max_step_up_m.max(model.max_step_down_m)+uncertainty;
+    for x in bounds.0[0]..=bounds.1[0] {for y in bounds.0[1]..=bounds.1[1] {
+        if !query.intersects(x,y,size) {continue;}
+        let ground=*patch.get(&(x,y)).expect("controlled footprint must use assigned ground");
+        result.assigned+=1;
+        let plane=query.contact_plane(pose.0,r[2],x,y,size,map.ground_cell_position(ground)[2],
+            (-model.body_to_support_z_m/r[2][2]+contact+1e-6).min(uncertainty));
+        let support=plane-model.body_to_support_z_m/r[2][2];
+        let rows=map.fine_ground_columns(Some(ground),&query,&prism,pose.0,r[2],x,y);
+        let old_height=if rows.is_none() && precise.contains_key(&(x,y)) {precise[&(x,y)]}
+            else {map.footprint_ground_height(ground,&query,&prism,support,contact,rows.as_deref()).unwrap()};
+        let height=map.fine_ground_height(ground,&query,&prism,pose.0,r[2],x,y);
+        assert_eq!(height.is_some(),rows.is_some(),"Some(empty/all-None) must remain Some");
+        let new_height=if let Some(height)=height {height}
+            else if precise.contains_key(&(x,y)) {precise[&(x,y)]}
+            else {map.footprint_ground_height(ground,&query,&prism,support,contact,None).unwrap()};
+        assert_eq!(new_height.to_bits(),old_height.to_bits(),"ordered row maximum/fallback bits");
+        result.ground_points.push([(f64::from(x)+0.5)*size,(f64::from(y)+0.5)*size,old_height]);
+        let has_overlap=map.data.occupied_columns.get(&(x,y)).is_some_and(|zs|zs.iter().any(|&z| {
+            let b=map.data.height_bounds.get(&(x,y,z)).copied().unwrap_or([
+                z as f32*map.config().voxel_size,(z as f32+1.0)*map.config().voxel_size]);
+            !(f64::from(b[0])>max[2] || f64::from(b[1])<min[2])
+        }));
+        if has_overlap {result.overlapping+=1;} else {result.disjoint+=1;}
+    }}
+    assert!(result.assigned>0);
+    result
+}
+fn disjoint_contact_fixture(fine:f32,coarse:f32,measured:bool,complete:bool)->(SurfaceSnapshot,Pose) {
+    let (source,pose)=single_column_fixture(fine,coarse,if measured {0}else{-1},&[],&[],complete,measured);
+    let mut envelope=source.body_envelope().unwrap().clone(); envelope.z_bounds_m=[-0.15,0.15];
+    (source.with_body_envelope(envelope).unwrap(),pose)
+}
+fn assert_independent_source_cold(actual:SurfaceSnapshot,oracle:SurfaceSnapshot,pose:Pose) {
+    // Independently built owners, rather than forks sharing the source reference cache.
+    assert!(!Arc::ptr_eq(&actual.observations.as_ref().unwrap().legacy_reference_cache,
+        &oracle.observations.as_ref().unwrap().legacy_reference_cache));
+    assert!(!Arc::ptr_eq(&actual.body_query_cache,&oracle.body_query_cache));
+    let mut a=Some(poison()); let mut b=Some(poison());
+    let ar=actual.check_body_pose(pose.0,pose.1,&mut a);
+    let br=oracle.check_body_pose_dense_z_oracle(pose.0,pose.1,&mut b);
+    assert_result_bits(&ar,&br); assert_eq!(rejection_bits(a),rejection_bits(b));
+}
+
+#[test]
+fn pose_lazy_contacts_real_disjoint_assigned_matches_frozen_and_independent_cold() {
+    for (fine,coarse) in [(0.01,0.1),(0.05,0.05),(0.05,0.1)] {
+        for measured in [false,true] {for complete in [false,true] {
+            let (map,pose)=disjoint_contact_fixture(fine,coarse,measured,complete);
+            let admission=admit_lazy_contact_pose(&map,pose);
+            assert_eq!((admission.assigned,admission.disjoint,admission.overlapping),(1,1,0));
+            assert_clear(&map,pose); // Full frozen kernel plus cold/warm public witness parity.
+            #[cfg(feature="body-query-profile")] {
+                use crate::body_query_profile::Counter;
+                let (result,witness,record)=capture_pose_path_scope(&map,pose);
+                assert_eq!(result,Ok(())); assert!(witness.is_none());
+                assert_pose_path_scope(&record,1,1,0);
+                assert_eq!(record.counters[Counter::AssignedDenseZSpan as usize],0);
+                eprintln!("LAZY_CONTACT_CONTROL fine={fine} coarse={coarse} measured={measured} complete={complete} assigned=1 independently_proved_disjoint=1");
+            }
+        }}
+        // One representative genuinely independent source rebuild per resolution,
+        // before any query/admission check warms these two new owners.
+        let (actual,pose)=disjoint_contact_fixture(fine,coarse,false,true);
+        let (oracle,oracle_pose)=disjoint_contact_fixture(fine,coarse,false,true);
+        assert_eq!(pose,oracle_pose); assert_independent_source_cold(actual,oracle,pose);
+    }
+}
+
+fn adjacent_positive(value:f64,up:bool)->f64 {
+    assert!(value>0.0 && value.is_finite());
+    f64::from_bits(if up {value.to_bits()+1}else{value.to_bits()-1})
+}
+#[test]
+fn pose_lazy_contacts_closed_z_boundary_keeps_collision_path_and_first_witness() {
+    for (fine,coarse,echo_z) in [(0.01,0.1,22),(0.05,0.05,4),(0.05,0.1,4)] {
+        let echo=[0,0,echo_z];
+        let (source,pose)=single_column_fixture(fine,coarse,-1,&[echo],&[],true,false);
+        let coarse_z=(((f64::from(echo_z)+0.5)*f64::from(fine))/f64::from(coarse)).floor()as i32;
+        let stored=source.data.height_bounds.get(&(0,0,coarse_z)).copied().unwrap_or([
+            coarse_z as f32*coarse,(coarse_z as f32+1.0)*coarse]);
+        let high=f64::from(stored[1]);
+        for (bottom,overlap) in [(adjacent_positive(high,false),true),(high,true),(adjacent_positive(high,true),false)] {
+            let mut envelope=source.body_envelope().unwrap().clone();
+            envelope.z_bounds_m=[bottom-pose.0[2],0.15];
+            let map=source.with_body_envelope(envelope).unwrap();
+            let admission=admit_lazy_contact_pose(&map,pose);
+            assert_eq!(admission.min[2].to_bits(),bottom.to_bits(),"real transformed bound, not a rounded target");
+            assert_eq!(admission.overlapping,if overlap {1}else{0});
+            if overlap {
+                let (result,witness)=compare_pose(&map,pose);
+                assert_eq!(result,Err(SurfaceError::InsufficientClearance));
+                assert!(matches!(witness,Some(BodyRejection::Occupancy{source:OccupancySource::Fine,..})));
+                #[cfg(feature="body-query-profile")] assert_assigned_execution(&map,pose);
+            } else { assert_clear(&map,pose); }
+        }
+        // The other closed endpoint: body top touches the obstacle's lower bound.
+        let low=f64::from(stored[0]);
+        for (top,overlap) in [(adjacent_positive(low,false),false),(low,true),(adjacent_positive(low,true),true)] {
+            let mut envelope=source.body_envelope().unwrap().clone();
+            envelope.z_bounds_m=[-0.3,top-pose.0[2]];
+            let map=source.with_body_envelope(envelope).unwrap();
+            let admission=admit_lazy_contact_pose(&map,pose);
+            assert_eq!(admission.max[2].to_bits(),top.to_bits(),"real transformed upper bound");
+            assert_eq!(admission.overlapping,if overlap {1}else{0});
+            if overlap {
+                let (result,witness)=compare_pose(&map,pose);
+                assert_eq!(result,Err(SurfaceError::InsufficientClearance));
+                assert!(matches!(witness,Some(BodyRejection::Occupancy{source:OccupancySource::Fine,..})));
+                #[cfg(feature="body-query-profile")] assert_assigned_execution(&map,pose);
+            } else { assert_clear(&map,pose); }
+        }
+    }
+    // Predicate-only supplement: NaN is not permission to skip the original path.
+    for (lo,hi,min,max) in [(f64::NAN,1.0,0.0,2.0),(0.0,f64::NAN,0.0,2.0),
+        (-0.0,0.0,0.0,1.0),(1.0,2.0,0.0,1.0)] {
+        assert!(!(lo>max || hi<min));
+    }
+    // Real mixed footprint: clear assigned columns precede the original echo.
+    for fine in [0.01,0.05] {
+        let map=indexed_z_fixture(fine,0.1,0); let pose=([-0.05,0.05,0.4],[0.,0.,0.,1.]);
+        let admission=admit_lazy_contact_pose(&map,pose);
+        assert!(admission.disjoint>0 && admission.overlapping>0);
+        let (result,witness)=compare_pose(&map,pose);
+        assert_eq!(result,Err(SurfaceError::InsufficientClearance));
+        assert!(matches!(witness,Some(BodyRejection::Occupancy{source:OccupancySource::Fine,..})));
+    }
+}
+
+#[test]
+fn pose_lazy_contacts_all_none_rows_keep_some_and_precise_precedence_contract() {
+    for fine in [0.01,0.05] {
+        let (base,pose)=disjoint_contact_fixture(fine,0.1,false,true);
+        let empty=SurfaceObservations::new(fine,32).unwrap(); // Explicitly partial, not complete.
+        let partial=base.with_observations(Some(Arc::new(empty)));
+        let absent=base.with_observations(None);
+        for source in [&partial,&absent] {
+            let admission=admit_lazy_contact_pose(source,pose);
+            assert_eq!((admission.disjoint,admission.overlapping),(1,0));
+            assert_clear(source,pose);
+        }
+        let model=partial.body_envelope().unwrap();let r=rotation(pose.1).unwrap();
+        let points:Vec<_>=model.footprint_xy_m.iter().map(|p|[p[0]+pose.0[0],p[1]+pose.0[1]]).collect();
+        let query=PolygonQuery::new(&points);let prism=PrismQuery::new(model,r,pose.0);
+        let ground=partial.locate_support_from_body(pose.0,pose.1,model.body_to_support_z_m).unwrap().cell;
+        let rows=partial.fine_ground_columns(Some(ground),&query,&prism,pose.0,r[2],0,0).unwrap();
+        assert!(!rows.is_empty() && rows.iter().all(|row|row.height.is_none()));
+        let fallback=partial.ground_cell_position(ground)[2];
+        let height=partial.fine_ground_height(ground,&query,&prism,pose.0,r[2],0,0);
+        assert_eq!(height.map(f64::to_bits),Some(fallback.to_bits()));
+        assert!(absent.fine_ground_height(ground,&query,&prism,pose.0,r[2],0,0).is_none());
+        // Defensive fallback contract only, NOT a claim that the public path can
+        // produce precise_ground while observations/model are absent.
+        let precise_height=3.0;
+        assert_eq!(height.unwrap_or(precise_height).to_bits(),fallback.to_bits());
+        let absent_height=absent.fine_ground_height(ground,&query,&prism,pose.0,r[2],0,0);
+        assert_eq!(absent_height.unwrap_or(precise_height).to_bits(),precise_height.to_bits());
+    }
+}
+
+fn disjoint_cross_slope_fixture(fine:f32)->(SurfaceSnapshot,Pose) {
+    let n=(0.5/fine).round()as i32;
+    let keys:BTreeSet<_>=(-n..=n).flat_map(|x|(-n..=n).map(move|y|[x,y,y.div_euclid(5)-1])).collect();
+    let points:Vec<_>=keys.iter().map(|k|((k[0]as f32+0.5)*fine,(k[1]as f32+0.5)*fine,(k[2]as f32+0.5)*fine)).collect();
+    let mut blocks=BTreeMap::<[i32;3],BTreeMap<[i32;3],SurfaceObservation>>::new();
+    for key in keys {blocks.entry(key.map(|v|v.div_euclid(32))).or_default().insert(key,SurfaceObservation{observed_ns:1,hits:2});}
+    let mut observations=SurfaceObservations::new(fine,32).unwrap();
+    for (key,values) in blocks {observations.replace_block(key,values).unwrap();}
+    observations.mark_complete_geometry_source();
+    let mut cfg=scene(&[],false).config().clone();cfg.voxel_size=0.1;cfg.wall_clearance_m=0.0;
+    let envelope=SurfaceBodyEnvelope{footprint_xy_m:vec![[-0.18,-0.18],[0.18,-0.18],[0.18,0.18],[-0.18,0.18]],
+        z_bounds_m:[-0.15,0.15],body_to_support_z_m:0.4,max_step_up_m:0.15,max_step_down_m:0.15,
+        max_cross_slope_deg:1.0,support_uncertainty_m:0.0};
+    let map=SurfaceSnapshot::from_points(&points,cfg,fine).unwrap().with_body_envelope(envelope).unwrap()
+        .with_observations(Some(Arc::new(observations)));
+    let z=*map.data.physical_graph.surface_lookup[&(0,0)].first().unwrap();
+    let height=map.ground_cell_position((0,0,z))[2];
+    (map,([0.05,0.05,height+0.4],[0.,0.,0.,1.]))
+}
+#[test]
+fn pose_lazy_contacts_disjoint_columns_still_reject_actual_cross_slope() {
+    for fine in [0.01,0.05] {
+        let (map,pose)=disjoint_cross_slope_fixture(fine);
+        let admission=admit_lazy_contact_pose(&map,pose);
+        assert!(admission.assigned>2 && admission.disjoint==admission.assigned && admission.overlapping==0);
+        let (_,b,_)=fit_plane(&admission.ground_points,pose.0).expect("real multi-column ground plane");
+        assert!(b.abs().atan().to_degrees()>map.body_envelope().unwrap().max_cross_slope_deg+1e-5);
+        assert_eq!(map.body_ground_relation(pose.0,pose.1),Ok(BodyGroundRelation::KnownCompatible),
+            "same error must not be explained by the later known-terrain tail");
+        let (result,witness)=compare_pose(&map,pose);
+        assert_eq!(result,Err(SurfaceError::UntraversableSegment));assert!(witness.is_none());
+        #[cfg(feature="body-query-profile")] {
+            use crate::body_query_profile::Counter;
+            let (result,witness,record)=capture_pose_path_scope(&map,pose);
+            assert_eq!(result,Err(SurfaceError::UntraversableSegment));assert!(witness.is_none());
+            assert_pose_path_scope(&record,1,admission.assigned,0);
+            assert_eq!(record.counters[Counter::AssignedDenseZSpan as usize],0);
+        }
+    }
 }

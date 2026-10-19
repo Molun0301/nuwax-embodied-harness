@@ -1250,7 +1250,7 @@ async fn run_surface_planner_with_computer(
                 }
                 held_same_input=false; replan_input_dirty=false; held_penalties=None;
                 #[cfg(test)] if let Some(probe)=&hub.fast_replan_probe {
-                    probe.record(tests::fast_pct_confluence_tests::Event::Dispatch {complete:input.actual.is_some()});
+                    probe.capture(&input);
                 }
                 // 同一几何不并行重复快速搜索；新几何才允许一次完整直连抢先接续。
                 checked_surface = Some(Arc::downgrade(surface));
@@ -2642,6 +2642,8 @@ mod tests {
             planner.start().unwrap();
             let calls = Arc::new(Mutex::new(Vec::new()));
             let motion_calls = Arc::clone(&calls);
+            let initial_position = feedback_probe.as_ref().and_then(|probe| probe.initial_position)
+                .unwrap_or([0.55, 1.55, 2.5]);
             let scheduler_transport = if memq {transport.clone()} else {LcmTransport::new_real(&url).unwrap()};
             let scheduler_hub = hub.clone();
             let scheduler_spec = scheduler_node.clone();
@@ -2687,7 +2689,7 @@ mod tests {
                 map_enabled: true,
                 frozen_pose_stamp: None,
                 integrate: false,
-                position: [0.55, 1.55, 2.5],
+                position: initial_position,
                 yaw: 0.0,
                 pitch: 0.0,
                 last_published: None,

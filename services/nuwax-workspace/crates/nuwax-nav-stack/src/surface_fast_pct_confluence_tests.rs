@@ -18,10 +18,22 @@ pub(in crate::lcm_dataflow::surface_dataflow) enum Event {
     Gate(usize),
     Reuse { complete: bool },
     Held,
+    Applied,
+    NormalReturnHeld(usize),
+    NormalReturned { call: usize, cancelled: bool },
+    QuickComputed { call: usize, ok: bool },
 }
 
 pub(in crate::lcm_dataflow::surface_dataflow) struct Probe {
     events: Mutex<Vec<Event>>,
+    pub(super) initial_position: Option<[f64; 3]>,
+    captures: Mutex<Vec<SurfaceReplanInput>>,
+    planner_pct: Mutex<Option<Arc<nuwax_nav_pct::PctPlanner>>>,
+    free_running: AtomicBool,
+    allow_commands: AtomicUsize,
+    applied: Mutex<Vec<Twist2>>,
+    hold_next_normal_return: AtomicBool,
+    return_releases: Mutex<BTreeMap<usize, std_mpsc::Sender<()>>>,
     changed: tokio::sync::watch::Sender<usize>,
     pub(super) normal: AtomicUsize,
     pub(super) quick: AtomicUsize,
@@ -34,14 +46,23 @@ pub(in crate::lcm_dataflow::surface_dataflow) struct Probe {
     permits: Mutex<std_mpsc::Receiver<usize>>,
 }
 impl Probe {
-    fn new() -> Arc<Self> {
+    fn new() -> Arc<Self> { Self::with_position(None) }
+    fn with_position(initial_position: Option<[f64; 3]>) -> Arc<Self> {
         let (permit, permits) = std_mpsc::channel();
-        Arc::new(Self { events: Mutex::new(Vec::new()),
+        Arc::new(Self { events: Mutex::new(Vec::new()), initial_position,
+            captures: Mutex::new(Vec::new()), planner_pct: Mutex::new(None),
+            free_running: AtomicBool::new(false), allow_commands: AtomicUsize::new(0),
+            applied: Mutex::new(Vec::new()),
+            hold_next_normal_return: AtomicBool::new(false), return_releases: Mutex::new(BTreeMap::new()),
             changed: tokio::sync::watch::channel(0).0,
             normal: AtomicUsize::new(0), quick: AtomicUsize::new(0),
             refusals: AtomicUsize::new(0), pending_refusal_zero: AtomicBool::new(false), armed: AtomicBool::new(false),
             gate: AtomicUsize::new(0), releases: Mutex::new(BTreeMap::new()),
             permit, permits: Mutex::new(permits) })
+    }
+    pub(in crate::lcm_dataflow::surface_dataflow) fn capture(&self, input: &SurfaceReplanInput) {
+        self.captures.lock().unwrap().push(input.clone());
+        self.record(Event::Dispatch { complete: input.actual.is_some() });
     }
     pub(in crate::lcm_dataflow::surface_dataflow) fn record(&self, event: Event) {
         let count = {
@@ -71,7 +92,12 @@ impl Probe {
             let _ = sender.send(());
         }
     }
+    fn release_return(&self, call:usize) {
+        self.return_releases.lock().unwrap().remove(&call).expect("held real result").send(()).unwrap();
+    }
     fn release_all(&self) {
+        self.hold_next_normal_return.store(false,Order::SeqCst);
+        for (_,sender) in std::mem::take(&mut *self.return_releases.lock().unwrap()) { let _=sender.send(()); }
         self.armed.store(false, Order::SeqCst);
         for (_, sender) in std::mem::take(&mut *self.releases.lock().unwrap()) {
             let _ = sender.send(());
@@ -108,6 +134,8 @@ impl<P: NavPlanner> NavPlanner for RefuseRealCommand<P> {
     fn step(&mut self, width: f64) -> PlannerStep {
         let step = self.inner.step(width);
         if matches!(&step, PlannerStep::Command(command) if *command != Twist2::ZERO) {
+            if self.probe.allow_commands.fetch_update(Order::SeqCst, Order::SeqCst,
+                |remaining| remaining.checked_sub(1)).is_ok() { return step; }
             let refusal = self.probe.refusals.fetch_add(1, Order::SeqCst) + 1;
             self.probe.pending_refusal_zero.store(true, Order::SeqCst);
             self.probe.record(Event::Refusal(refusal));
@@ -125,7 +153,7 @@ impl NavMotionPort for GateMotion {
     }
     async fn acquire(&mut self, id: &str, a: &NavMotionAdmission) -> Result<LeaseProof, MotionPortError> { self.inner.acquire(id, a).await }
     async fn renew(&mut self, id: &str) -> Result<(), MotionPortError> {
-        if self.probe.armed.swap(false, Order::SeqCst) {
+        if self.probe.armed.swap(false, Order::SeqCst) && !self.probe.free_running.load(Order::SeqCst) {
             let index = self.probe.refusals.load(Order::SeqCst);
             let (send, receive) = oneshot::channel();
             self.probe.releases.lock().unwrap().insert(index, send);
@@ -139,8 +167,11 @@ impl NavMotionPort for GateMotion {
         self.inner.renew(id).await
     }
     async fn submit_twist(&mut self, id: &str, twist: Twist2) -> Result<AppliedProof, MotionPortError> {
-        assert_eq!(twist, Twist2::ZERO, "the synthetic refusal must never reach motion as nonzero");
         let result = self.inner.submit_twist(id, twist).await;
+        if result.is_ok() && twist != Twist2::ZERO {
+            self.probe.applied.lock().unwrap().push(twist);
+            self.probe.record(Event::Applied);
+        }
         // The scheduler may renew inside apply_controller_twist, before its
         // original ZERO submission. Arm only after that real receipt returns;
         // the outer renewal branch then gates after refusal status publication.
@@ -150,7 +181,11 @@ impl NavMotionPort for GateMotion {
         result
     }
     async fn submit_twist_bounded(&mut self, id: &str, twist: Twist2, bound: Option<CommandDispatchBound>) -> Result<BoundedTwistOutcome, MotionPortError> {
-        assert!(bound.is_none(), "refusal ZERO must not inherit the candidate command bound");
+        if twist == Twist2::ZERO {
+            assert!(bound.is_none(), "refusal ZERO must not inherit the candidate command bound");
+        } else {
+            assert!(bound.is_none(), "this original no-source-age fixture has no command bound");
+        }
         self.submit_twist(id, twist).await.map(BoundedTwistOutcome::Applied)
     }
     async fn revoke_and_zero(&mut self, id: &str) -> Result<FenceProof, MotionPortError> { self.inner.revoke_and_zero(id).await }
@@ -279,11 +314,16 @@ async fn real_fast_pct_publication_before_wait_tick_converges_after_injected_ref
     assert_eq!(feedback.rejected_context, feedback.current_context);
     assert_eq!(Some(feedback.current_context), same_actual);
     eprintln!("FAST_PCT_CONFLUENCE real_normal_calls={stable_calls} real_quick_calls=0 initial_actual=None final_actual=Some held_ticks=2 refusal=synthetic real_worker_command=true");
-    // Cancel uses the original urgent branch while renew is still pending.
-    harness.cancel(&goal).await;
+    // Exercise the scheduler's original urgent API while renew is pending.
+    // The outer LCM handler can itself be awaiting a normal pose/path update;
+    // bypassing that transport queue here is explicit, not an ingress claim.
+    harness.scheduler.cancel(&goal.session_id).await.unwrap();
     status_when(&harness, |s| s.last_terminal == Some(TerminalOutcome::Cancelled)).await;
     drop(cleanup);
     harness.shutdown().await;
     assert_eq!(probe.normal.load(Order::SeqCst), stable_calls);
     assert_eq!(probe.quick.load(Order::SeqCst), 0);
 }
+
+#[cfg(feature = "surface-recovery-qualification")]
+mod held_wakeup_tests { include!("surface_held_wakeup_tests.rs"); }

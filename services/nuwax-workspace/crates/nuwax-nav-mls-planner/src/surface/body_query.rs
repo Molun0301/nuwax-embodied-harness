@@ -132,6 +132,135 @@ impl SurfaceSnapshot {
 
 }
 
+// Request-local reference data. None of these private modes is selected by the
+// public body-query constructors. Members always remain owned by observations.
+#[derive(Clone, Debug, PartialEq)]
+pub(in crate::surface) enum NativeGroundSource {
+    ObservedFine { anchor: [i32; 3] },
+    LegacyFineRun { xy: [i32; 2], first: i32, last: i32 },
+    CoarseCell(VoxelKey),
+}
+#[derive(Clone, Debug, PartialEq)]
+pub(in crate::surface) struct GroundSample {
+    pub reference_origin: [f64; 3],
+    pub reference_normal: Option<[f64; 3]>,
+    pub query_state: GroundQueryState,
+    pub reference_sources: Vec<NativeGroundSource>,
+}
+impl GroundSample {
+    pub(in crate::surface) fn height_at(&self, xy: [f64; 2]) -> f64 {
+        self.reference_normal.map_or(self.reference_origin[2], |n|
+            self.reference_origin[2] - (n[0]*(xy[0]-self.reference_origin[0])
+                + n[1]*(xy[1]-self.reference_origin[1]))/n[2])
+    }
+}
+#[derive(Clone, Debug)]
+pub(in crate::surface) struct LocalGroundReference {
+    pub first: GroundSample,
+    pub changes: Vec<(f64, GroundSample)>,
+}
+impl LocalGroundReference {
+    fn at(&self, t: f64) -> &GroundSample {
+        // The owner supplies this one segment's ordered changes. Right-continuous
+        // lookup has an explicit first sample, never an inferred layer/sample 0.
+        self.changes.iter().rev().find(|(at,_)| *at<=t)
+            .map_or(&self.first, |(_,sample)| sample)
+    }
+}
+#[derive(Clone, Debug)]
+pub(in crate::surface) enum BodyQueryReference {
+    Ground(Arc<LocalGroundReference>),
+    Unanchored,
+}
+#[derive(Clone, Debug)]
+pub(in crate::surface) struct BoundBodyQueryView {
+    snapshot: SurfaceSnapshot,
+    reference: BodyQueryReference,
+}
+#[derive(Clone, Copy)]
+pub(in crate::surface) enum QuerySample<'a> {
+    LegacyNominal,
+    Ground(&'a GroundSample),
+    Unanchored,
+}
+impl<'a> QuerySample<'a> {
+    pub(in crate::surface) fn is_legacy(self) -> bool { matches!(self,Self::LegacyNominal) }
+    pub(in crate::surface) fn ground(self) -> Option<&'a GroundSample> {
+        match self { Self::Ground(sample)=>Some(sample), _=>None }
+    }
+    fn same(self, other: Self) -> bool {
+        match (self,other) {
+            (Self::Ground(a),Self::Ground(b))=>std::ptr::eq(a,b),
+            (Self::LegacyNominal,Self::LegacyNominal)|(Self::Unanchored,Self::Unanchored)=>true,
+            _=>false,
+        }
+    }
+}
+#[derive(Clone, Copy)]
+pub(in crate::surface) struct QuerySegment<'a> {
+    reference: Option<&'a BodyQueryReference>,
+    samples: [f64; 2],
+}
+impl<'a> QuerySegment<'a> {
+    pub(in crate::surface) const LEGACY: Self = Self { reference:None, samples:[0.0,1.0] };
+    pub(in crate::surface) fn at(self, s: f64) -> QuerySample<'a> {
+        match self.reference {
+            None=>QuerySample::LegacyNominal,
+            Some(BodyQueryReference::Unanchored)=>QuerySample::Unanchored,
+            Some(BodyQueryReference::Ground(reference))=>QuerySample::Ground(reference.at(
+                self.samples[0]+s*(self.samples[1]-self.samples[0]))),
+        }
+    }
+    pub(in crate::surface) fn is_legacy(self) -> bool { self.reference.is_none() }
+    pub(in crate::surface) fn append_changes(self, changes: &mut Vec<f64>) {
+        let Some(BodyQueryReference::Ground(reference))=self.reference else {return;};
+        let delta=self.samples[1]-self.samples[0];
+        if delta==0.0 {return;}
+        changes.extend(reference.changes.iter().filter_map(|(at,_)| {
+            let s=(*at-self.samples[0])/delta;(s>0.0&&s<1.0).then_some(s)
+        }));
+    }
+    pub(in crate::surface) fn constant(self) -> bool {
+        if !self.at(0.0).same(self.at(1.0)) {return false;}
+        let Some(BodyQueryReference::Ground(reference))=self.reference else {return true;};
+        let [a,b]=self.samples;
+        !reference.changes.iter().any(|(at,_)| *at>a.min(b)&&*at<a.max(b))
+    }
+}
+impl BoundBodyQueryView {
+    fn segment(&self,samples:[f64;2])->QuerySegment<'_> {
+        QuerySegment {reference:Some(&self.reference),samples}
+    }
+    #[cfg(test)]
+    pub(in crate::surface) fn segment_for_diagnostic(&self,samples:[f64;2])->QuerySegment<'_> {
+        self.segment(samples)
+    }
+    pub(in crate::surface) fn pose_at(&self,actual:([f64;3],[f64;4]),t:f64,
+        witness:&mut Option<BodyFailureWitness>)->Result<(),SurfaceError> {
+        self.snapshot.validate_body_pose_in_context(actual.0,actual.1,self.segment([t,t]).at(0.0),witness)
+    }
+    pub(in crate::surface) fn project_from_to_samples(&self,from:([f64;3],[f64;4]),xy:[f64;2],yaw:f64,
+        samples:[f64;2],witness:&mut Option<BodyFailureWitness>)->Result<([f64;3],[f64;4]),SurfaceError> {
+        self.snapshot.body_pose_after_motion_in_context(from,xy,yaw,self.segment(samples),witness)
+    }
+    pub(in crate::surface) fn motion_on_segment(&self,from:([f64;3],[f64;4]),to:([f64;3],[f64;4]),
+        samples:[f64;2],boundary:&[[f64;2]],witness:&mut Option<BodyFailureWitness>)->Result<(),SurfaceError> {
+        self.snapshot.validate_body_motion_in_context(from,to,boundary,self.segment(samples),witness)
+    }
+    pub(in crate::surface) fn geometry_checker<'a>(&'a self,boundary:&'a [[f64;2]])
+        ->impl FnMut(([f64;3],[f64;4]),([f64;3],[f64;4]),[f64;2],&mut Option<BodyFailureWitness>)
+            ->Result<(),SurfaceError>+'a {
+        move |from,to,samples,witness|self.motion_on_segment(from,to,samples,boundary,witness)
+    }
+}
+impl SurfaceSnapshot {
+    pub(in crate::surface) fn bind_body_query(&self,reference:BodyQueryReference)->BoundBodyQueryView {
+        // C0-a bypasses association-sensitive results; source-only caches stay
+        // source-only. No shared cache is cleared or planning snapshot rebuilt.
+        BoundBodyQueryView {snapshot:self.clone(),reference}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

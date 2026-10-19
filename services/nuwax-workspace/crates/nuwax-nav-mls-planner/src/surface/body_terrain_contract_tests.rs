@@ -515,3 +515,507 @@ fn planar_known_terrain_is_lock_free_while_shared_body_cache_is_held() {
         assert_eq!(completed.unwrap(),expected,"known terrain must not wait on a planner's body cache");
     }
 }
+
+// APPEND-ONLY DRAFT for body_terrain_contract_tests.rs. Not compiled or run.
+// Four new tests only. Existing fixtures/tests must remain byte-for-byte unchanged.
+// These are internal bound-query tests, not a PCT/Scan/owner execution proof.
+// `query_ground_with_native` is the production producer companion agreed for C0-a.
+// Repetition below checks result/witness stability after source-only caches may warm;
+// it does not claim C0-a association-sensitive result-cache hits.
+use crate::surface::body_query::{
+    BodyQueryReference, BoundBodyQueryView, GroundSample, LocalGroundReference,
+    NativeGroundSource,
+};
+
+// This helper consumes the actual producer's typed output; it never guesses a
+// source domain from the public GroundQuery.sources array or from actual body.z.
+fn c0_terrain_sample(
+    source: &SurfaceSnapshot, xy: [f64; 2], reference: f64, state: GroundQueryState,
+) -> GroundSample {
+    let (query, native) = source.query_ground_with_native(xy, reference);
+    eprintln!("C0_TERRAIN_SOURCE xy={xy:?} reference={reference:?} query={query:?} native={native:?}");
+    assert_eq!(query.state, state, "fixed source prerequisite failed; do not move input points");
+    assert!(!native.is_empty(), "known/estimated source needs its actual typed producer provenance");
+    assert_eq!(query.normal, Some([0.0, 0.0, 1.0]), "all four fixed fixtures have horizontal reference planes");
+    let observations = source.observations.as_ref().unwrap();
+    for item in &native {
+        match item {
+            NativeGroundSource::LegacyFineRun { xy, first, last } => {
+                assert!(source.fine_contact_bands(xy[0], xy[1]).iter()
+                    .any(|band| band.run == [*first, *last]));
+                let layer = GroundLayer::from_voxel_run([*first, *last], f64::from(FINE),
+                    source.ground_evidence).unwrap();
+                assert_eq!(Some(layer.representative_z), query.height,
+                    "horizontal fixture contributors must match the returned reference");
+                for z in *first..=*last {
+                    assert!(observations.get([xy[0], xy[1], z]).is_some());
+                }
+            }
+            NativeGroundSource::ObservedFine { anchor } => {
+                let record = observations.ground_layers([anchor[0], anchor[1]])
+                    .find(|record| record.anchor == *anchor).expect("native anchor is in this source");
+                assert!(!record.members.is_empty());
+                assert_eq!(record.height_at(xy), query.height);
+                for &z in &record.members {
+                    assert!(observations.get([anchor[0], anchor[1], z]).is_some());
+                }
+            }
+            NativeGroundSource::CoarseCell(cell) => {
+                panic!("complete fine fixtures must not silently substitute coarse provenance: {cell:?}");
+            }
+        }
+    }
+    GroundSample {
+        reference_origin: [xy[0], xy[1], query.height.expect("known source height")],
+        reference_normal: query.normal,
+        query_state: query.state,
+        reference_sources: native,
+    }
+}
+
+fn c0_terrain_bound(source: &SurfaceSnapshot, sample: GroundSample) -> BoundBodyQueryView {
+    source.bind_body_query(BodyQueryReference::Ground(Arc::new(LocalGroundReference {
+        first: sample, changes: vec![],
+    })))
+}
+
+#[derive(Debug, PartialEq)]
+struct C0TerrainProbe {
+    poses: [Result<(), SurfaceError>; 2],
+    pose_witnesses: [Option<BodyFailureWitness>; 2],
+    projection: Result<Body, SurfaceError>,
+    projection_witness: Option<BodyFailureWitness>,
+    motion: Result<(), SurfaceError>,
+    motion_witness: Option<BodyFailureWitness>,
+}
+
+fn c0_terrain_probe(
+    label: &str, view: &BoundBodyQueryView, from: Body, to: Body,
+    yaw: f64, boundary: &[[f64; 2]],
+) -> C0TerrainProbe {
+    let mut pose_witnesses = [None, None];
+    let poses = [view.pose_at(from, 0.0, &mut pose_witnesses[0]),
+        view.pose_at(to, 1.0, &mut pose_witnesses[1])];
+    let mut projection_witness = None;
+    let projection = view.project_from_to_samples(from, [to.0[0], to.0[1]], yaw,
+        [0.0, 1.0], &mut projection_witness);
+    let mut motion_witness = None;
+    let motion = view.motion_on_segment(from, to, [0.0, 1.0], boundary, &mut motion_witness);
+    let result = C0TerrainProbe { poses, pose_witnesses, projection,
+        projection_witness, motion, motion_witness };
+    eprintln!("C0_TERRAIN_PROBE {label} from={from:?} to={to:?} result={result:?}");
+    result
+}
+
+fn c0_terrain_assert_clear(probe: &C0TerrainProbe, expected: Body) {
+    assert_eq!(probe.poses, [Ok(()), Ok(())]);
+    assert_eq!(probe.pose_witnesses, [None, None]);
+    assert_eq!(probe.projection, Ok(expected));
+    assert_eq!(probe.projection_witness, None);
+    assert_eq!(probe.motion, Ok(()));
+    assert_eq!(probe.motion_witness, None);
+}
+
+fn c0_terrain_assert_fine_witness(
+    source: &SurfaceSnapshot, witness: Option<BodyFailureWitness>, occupied: &BTreeSet<[i32; 3]>,
+) {
+    let witness = witness.expect("actual fine occupancy rejection must retain its witness");
+    let BodyRejection::Occupancy { cell, source: kind, .. } = witness.rejection;
+    assert!(matches!(kind, OccupancySource::Fine | OccupancySource::FineFringe), "{witness:?}");
+    assert!(occupied.contains(&cell), "unexpected source member: {witness:?}");
+    assert!(source.observations.as_ref().unwrap().get(cell).is_some());
+    let size = f64::from(FINE);
+    let prism = PrismQuery::new(source.body_envelope().unwrap(),
+        rotation(witness.pose.1).unwrap(), witness.pose.0);
+    assert!(prism.intersects(cell.map(|v| f64::from(v) * size),
+        cell.map(|v| f64::from(v + 1) * size)), "witness must intersect this actual prism");
+}
+
+#[test]
+fn ground_context_whole_body_floor_and_noncontact_occupancy_pair() {
+    let from = body(0.025, 0.025, 0.4);
+    let to = body(0.425, 0.025, 0.4);
+    let high_keys = [[-5, -3, 5], [-5, 2, 5], [4, -3, 5], [4, 2, 5]];
+    let low_keys = [[-5, -3, 2], [-5, 2, 2], [4, -3, 2], [4, 2, 2]];
+    let size = f64::from(FINE);
+    assert!(from.0[2] + envelope(true).z_bounds_m[0] < 0.0);
+    assert!(from.0[2] + envelope(true).z_bounds_m[0] > -size);
+    for planner in [0.05, 0.1] {
+        for obstructed in [false, true] {
+            let mut keys = ground(Terrain::Flat);
+            if obstructed { keys.extend(high_keys); }
+            let source = build_map_config(&keys, true, planner, 0.2);
+            let sample = c0_terrain_sample(&source, [0.025, 0.025], 0.0,
+                GroundQueryState::LegacyGeometry);
+            assert_eq!(sample.reference_origin[2], 0.0);
+            let grounded = c0_terrain_bound(&source, sample);
+            let unanchored = source.bind_body_query(BodyQueryReference::Unanchored);
+            // Both direction orders keep the same actual endpoints and source.
+            let mut expected_ground = None;
+            let mut expected_unanchored = None;
+            for (mode, view, expected) in [
+                ("Ground", &grounded, &mut expected_ground),
+                ("Unanchored", &unanchored, &mut expected_unanchored),
+            ] {
+                let probe = c0_terrain_probe(mode, view, from, to, 0.0, &[]);
+                if !obstructed { c0_terrain_assert_clear(&probe, to); }
+                else {
+                    assert_eq!(probe.poses, [Err(SurfaceError::InsufficientClearance),
+                        Err(SurfaceError::InsufficientClearance)]);
+                    assert_eq!(probe.projection, Err(SurfaceError::InsufficientClearance));
+                    assert_eq!(probe.motion, Err(SurfaceError::InsufficientClearance));
+                    let occupied = high_keys.into_iter().collect();
+                    for witness in probe.pose_witnesses.into_iter()
+                        .chain([probe.projection_witness, probe.motion_witness]) {
+                        c0_terrain_assert_fine_witness(&source, witness, &occupied);
+                    }
+                }
+                *expected = Some(probe);
+            }
+            for (mode, view, expected) in [
+                ("Unanchored repeat", &unanchored, expected_unanchored.as_ref().unwrap()),
+                ("Ground repeat", &grounded, expected_ground.as_ref().unwrap()),
+                ("Unanchored alternate", &unanchored, expected_unanchored.as_ref().unwrap()),
+            ] {
+                assert_eq!(&c0_terrain_probe(mode, view, from, to, 0.0, &[]), expected);
+            }
+            for &key in &keys {
+                assert_eq!(source.observations.as_ref().unwrap().get(key),
+                    Some(SurfaceObservation { observed_ns: 0, hits: 0 }));
+            }
+            if obstructed {
+                for key in high_keys {
+                    assert_eq!(source.observations.as_ref().unwrap().column_levels(key[0], key[1]),
+                        Some(&[-1, 5][..]));
+                    assert_eq!(source.fine_contact_bands(key[0], key[1]).iter()
+                        .map(|band| (band.run, band.fit)).collect::<Vec<_>>(),
+                        vec![([-1, -1], [0.0, 0.0]), ([5, 5], [6.0 * size, 6.0 * size])]);
+                }
+            }
+        }
+        // C01-c explicitly keeps the old LegacyNominal compatibility oracle.
+        // These fixture-only labels do not assign production self identity.
+        let mut keys = ground(Terrain::Flat); keys.extend(low_keys);
+        let source = build_map_config(&keys, true, planner, 0.2);
+        assert_eq!(advance(&source, from, to.0[0]).unwrap(), to);
+        for key in low_keys {
+            assert_eq!(source.observations.as_ref().unwrap().column_levels(key[0], key[1]),
+                Some(&[-1, 2][..]));
+            assert_eq!(source.fine_contact_bands(key[0], key[1]).iter()
+                .map(|band| band.fit).collect::<Vec<_>>(),
+                vec![[0.0, 0.0], [3.0 * size, 3.0 * size]]);
+        }
+    }
+}
+
+// Exact F1 lower-only data/settings from layered_map(&[[0,0]]) plus
+// with_measured_floor(0.5 * f64::from(FINE)); copied test-local because those
+// existing helpers are private in the separate body::tests module. No new physics.
+fn c0_terrain_measured_lower_only() -> SurfaceSnapshot {
+    use nuwax_map_chunks::{LayerObservation, LayerObservations, LayerSample, block_key, local_key};
+    let keys: Vec<_> = (-12..12).flat_map(|x| (-12..12).map(move |y| [x, y, 0])).collect();
+    let points: Vec<_> = keys.iter().map(|k| ((k[0] as f32 + 0.5) * FINE,
+        (k[1] as f32 + 0.5) * FINE, (k[2] as f32 + 0.5) * FINE)).collect();
+    let config = Config { voxel_size: 0.1, robot_height: 0.25, surface_closing_radius: 0.0,
+        wall_clearance_m: 0.0, step_threshold_m: 0.21, min_step_tread_depth_m: 0.2,
+        world_frame: "map".into(), node_spacing_m: 0.3, wall_buffer_m: 0.0,
+        wall_buffer_weight: 0.0, max_slope_deg: 25.0, step_penalty_weight: 1.0,
+        goal_tolerance: 0.1, viz_publish_hz: 0.0 };
+    let model = SurfaceBodyEnvelope {
+        footprint_xy_m: vec![[-0.55, -0.14], [0.55, -0.14], [0.55, 0.14], [-0.55, 0.14]],
+        z_bounds_m: [-0.15, 0.15], body_to_support_z_m: 0.4,
+        max_step_up_m: 0.2, max_step_down_m: 0.1, max_cross_slope_deg: 10.0,
+        support_uncertainty_m: 0.0,
+    };
+    let mut occupancy = BTreeMap::<[i32; 3], BTreeMap<[i32; 3], SurfaceObservation>>::new();
+    for &key in &keys { occupancy.entry(block_key(key)).or_default().insert(key,
+        SurfaceObservation { observed_ns: 1000, hits: 1 }); }
+    let mut observations = SurfaceObservations::new(FINE, 32).unwrap();
+    for (block, values) in occupancy { observations.replace_block(block, values).unwrap(); }
+    let size = f64::from(FINE); let height = 0.5 * size;
+    let mut blocks = BTreeMap::<[i32; 3], LayerObservations>::new();
+    for [x, y, z] in keys {
+        let key = [x, y, z]; let local = local_key(key);
+        let origin = [(f64::from(x) + 0.5) * size, (f64::from(y) + 0.5) * size, height];
+        blocks.entry(block_key(key)).or_default().insert(local, LayerObservation {
+            members: vec![local], normal: [0.0, 0.0, 1.0], plane_origin: origin,
+            samples: (0..3).map(|i| LayerSample { source: Default::default(), point: origin,
+                source_sequence: i + 1, source_timestamp_ns: 100 + i, point_index: u32::from(local) }).collect(),
+        });
+    }
+    for (block, layers) in blocks { observations.replace_ground_layers(block, Arc::new(layers)).unwrap(); }
+    observations.mark_complete_geometry_source();
+    SurfaceSnapshot::from_points(&points, config, FINE).unwrap().with_body_envelope(model).unwrap()
+        .with_observations(Some(Arc::new(observations)))
+}
+
+#[test]
+fn ground_context_fixed_ground_varies_body_height_and_roof_collision() {
+    let size = f64::from(FINE);
+    for planner in [0.05, 0.1] {
+        for roof in [false, true] {
+            let mut keys = ground(Terrain::Flat);
+            let roof_keys: BTreeSet<_> = (-8..16).flat_map(|x| (-8..8).map(move |y| [x, y, 13])).collect();
+            assert_eq!(roof_keys.len(), 24 * 16);
+            if roof { keys.extend(roof_keys.iter().copied()); }
+            let source = build_map_config(&keys, false, planner, 0.2);
+            assert_eq!(source.body_envelope().unwrap().body_to_support_z_m, 0.4);
+            let sample = c0_terrain_sample(&source, [0.025, 0.025], 0.0,
+                GroundQueryState::LegacyGeometry);
+            assert_eq!(sample.reference_origin[2], 0.0);
+            let grounded = c0_terrain_bound(&source, sample);
+            let unanchored = source.bind_body_query(BodyQueryReference::Unanchored);
+            for z in [0.25, 0.4, 0.65] {
+                let from = body(0.025, 0.025, z); let to = body(0.425, 0.025, z);
+                assert!(z - 0.15 > 0.0, "all three fixed torso envelopes clear the floor");
+                let collides = roof && z == 0.65;
+                assert_eq!(roof && z + 0.15 >= 13.0 * size && z - 0.15 <= 14.0 * size, collides);
+                for (mode, view) in [("Ground", &grounded), ("Unanchored", &unanchored)] {
+                    let probe = c0_terrain_probe(mode, view, from, to, 0.0, &[]);
+                    if collides {
+                        assert_eq!(probe.poses, [Err(SurfaceError::InsufficientClearance),
+                            Err(SurfaceError::InsufficientClearance)]);
+                        assert_eq!(probe.projection, Err(SurfaceError::InsufficientClearance));
+                        assert_eq!(probe.motion, Err(SurfaceError::InsufficientClearance));
+                        for witness in probe.pose_witnesses.into_iter()
+                            .chain([probe.projection_witness, probe.motion_witness]) {
+                            c0_terrain_assert_fine_witness(&source, witness, &roof_keys);
+                        }
+                    } else { c0_terrain_assert_clear(&probe, to); }
+                    assert_eq!(c0_terrain_probe("repeat fixed height", view, from, to, 0.0, &[]), probe);
+                }
+                let fixed = source.query_ground([0.025, 0.025], 0.0);
+                assert_eq!(fixed.height, Some(0.0));
+                assert_eq!(fixed.state, GroundQueryState::LegacyGeometry);
+                assert_eq!(source.observations.as_ref().unwrap().column_levels(0, 0),
+                    if roof { Some(&[-1, 13][..]) } else { Some(&[-1][..]) });
+            }
+        }
+    }
+    // C03-c records the fixed whole-body model's mechanical interpretation.
+    // It cannot be presented as known retractable-leg or torso geometry.
+    let whole = build_map(&ground(Terrain::Flat), true);
+    let grounded = c0_terrain_bound(&whole, c0_terrain_sample(&whole, [0.025, 0.025], 0.0,
+        GroundQueryState::LegacyGeometry));
+    let floor = ground(Terrain::Flat);
+    for z in [0.25, 0.4, 0.65] {
+        let from = body(0.025, 0.025, z); let to = body(0.425, 0.025, z);
+        let probe = c0_terrain_probe("fixed whole envelope diagnostic", &grounded, from, to, 0.0, &[]);
+        for (result, witness) in probe.poses.iter().zip(probe.pose_witnesses)
+            .chain(std::iter::once((&probe.motion, probe.motion_witness))) {
+            match result {
+                Ok(()) => assert_eq!(witness, None),
+                Err(SurfaceError::InsufficientClearance) => c0_terrain_assert_fine_witness(&whole, witness, &floor),
+                other => panic!("fixed whole envelope must not reintroduce nominal navigation veto: {other:?}"),
+            }
+        }
+        match &probe.projection {
+            Ok(projected) => { assert_eq!(*projected, to); assert_eq!(probe.projection_witness, None); }
+            Err(SurfaceError::InsufficientClearance) => c0_terrain_assert_fine_witness(&whole, probe.projection_witness, &floor),
+            other => panic!("mechanical diagnostic has an unexpected projection result: {other:?}"),
+        }
+    }
+    // C03-d: the same measured lower members remain ground, but membership alone
+    // must not waive an actual submerged torso through those members.
+    let source = c0_terrain_measured_lower_only();
+    let sample = c0_terrain_sample(&source, [0.025, 0.025], 0.5 * size, GroundQueryState::Observed);
+    assert_eq!(sample.reference_origin[2], 0.5 * size);
+    let observed = source.observations.as_ref().unwrap();
+    let record = observed.ground_layers([0, 0]).next().unwrap();
+    assert_eq!(record.members, vec![0]); assert_eq!(record.plane_origin[2], 0.5 * size);
+    let grounded = c0_terrain_bound(&source, sample);
+    let normal = body(0.025, 0.025, 0.4); let submerged = body(0.025, 0.025, -0.1);
+    let floor: BTreeSet<_> = (-12..12).flat_map(|x| (-12..12).map(move |y| [x, y, 0])).collect();
+    assert!(submerged.0[2] - 0.15 < 0.0 && submerged.0[2] + 0.15 > 0.0);
+    assert!(normal.0[2] - 0.15 > size);
+    for pose in [normal, submerged, normal, submerged] {
+        let probe = c0_terrain_probe("measured torso penetration pair", &grounded, pose, pose, 0.0, &[]);
+        if pose == normal { c0_terrain_assert_clear(&probe, normal); }
+        else {
+            assert_eq!(probe.poses, [Err(SurfaceError::InsufficientClearance), Err(SurfaceError::InsufficientClearance)]);
+            assert_eq!(probe.projection, Err(SurfaceError::InsufficientClearance));
+            assert_eq!(probe.motion, Err(SurfaceError::InsufficientClearance));
+            for witness in probe.pose_witnesses.into_iter().chain([probe.projection_witness, probe.motion_witness]) {
+                c0_terrain_assert_fine_witness(&source, witness, &floor);
+            }
+        }
+        assert_eq!(source.query_ground([0.025, 0.025], 0.5 * size).height, Some(0.5 * size));
+        assert_eq!(observed.ground_layers([0, 0]).next().unwrap().members, vec![0]);
+    }
+}
+
+#[test]
+fn ground_context_observed_drop_missing_and_unanchored_pair() {
+    let size = f64::from(FINE);
+    let from = body(-0.525, 0.025, 0.4); let above = body(0.025, 0.025, 0.4);
+    let end = body(0.525, 0.025, 0.4); let short = body(0.075, 0.025, 0.4);
+    let low_keys: BTreeSet<_> = (-2..2).flat_map(|x| (-2..2).map(move |y| [x, y, -9])).collect();
+    let mut pit_keys = ground(Terrain::Gap); pit_keys.extend(low_keys.iter().copied());
+    let pit = build_map(&pit_keys, true);
+    let lower = pit.query_ground([above.0[0], above.0[1]], 0.0);
+    assert_eq!(lower.state, GroundQueryState::LegacyGeometry);
+    assert_eq!(lower.height, Some(-8.0 * size));
+    assert!(8.0 * size > envelope(true).max_step_down_m + size + 1e-6);
+    // The independent floor0 reference is produced on THIS pit source at the
+    // real left endpoint; it is not fabricated on the isolated low-only source.
+    let sample = c0_terrain_sample(&pit, [from.0[0], from.0[1]], 0.0, GroundQueryState::LegacyGeometry);
+    assert_eq!(sample.reference_origin[2], 0.0);
+    let grounded = c0_terrain_bound(&pit, sample);
+    let unanchored = pit.bind_body_query(BodyQueryReference::Unanchored);
+    let across = c0_terrain_probe("known drop across endpoints", &grounded, from, end, 0.0, &[]);
+    assert_eq!(across.poses, [Ok(()), Ok(())]);
+    assert_eq!(across.pose_witnesses, [None, None]);
+    assert_eq!(across.projection, Err(SurfaceError::UntraversableSegment));
+    assert_eq!(across.motion, Err(SurfaceError::UntraversableSegment));
+    assert_eq!(across.projection_witness, None); assert_eq!(across.motion_witness, None);
+    let entering = c0_terrain_probe("known drop at center", &grounded, from, above, 0.0, &[]);
+    assert_eq!(entering.poses, [Ok(()), Err(SurfaceError::UntraversableSegment)]);
+    assert_eq!(entering.projection, Err(SurfaceError::UntraversableSegment));
+    assert_eq!(entering.motion, Err(SurfaceError::UntraversableSegment));
+    assert_eq!(entering.pose_witnesses, [None, None]);
+    assert_eq!(entering.projection_witness, None); assert_eq!(entering.motion_witness, None);
+    // C05-b: identical actual endpoints and source, opposite navigation contexts.
+    let grounded_pit = c0_terrain_probe("anchored pit center", &grounded, above, short, 0.0, &[]);
+    assert_eq!(grounded_pit.poses, [Err(SurfaceError::UntraversableSegment), Err(SurfaceError::UntraversableSegment)]);
+    assert_eq!(grounded_pit.projection, Err(SurfaceError::UntraversableSegment));
+    assert_eq!(grounded_pit.motion, Err(SurfaceError::UntraversableSegment));
+    assert_eq!(grounded_pit.pose_witnesses, [None, None]);
+    assert_eq!(grounded_pit.projection_witness, None); assert_eq!(grounded_pit.motion_witness, None);
+    let free_pit = c0_terrain_probe("unanchored pit center", &unanchored, above, short, 0.0, &[]);
+    c0_terrain_assert_clear(&free_pit, short);
+    for (label, view, expected) in [
+        ("Ground repeat", &grounded, &grounded_pit), ("Unanchored repeat", &unanchored, &free_pit),
+        ("Unanchored alternate", &unanchored, &free_pit), ("Ground alternate", &grounded, &grounded_pit),
+    ] { assert_eq!(&c0_terrain_probe(label, view, above, short, 0.0, &[]), expected); }
+    for &key in &pit_keys { assert_eq!(pit.observations.as_ref().unwrap().get(key),
+        Some(SurfaceObservation { observed_ns: 0, hits: 0 })); }
+
+    // C04-b: delete only the pit returns. Keep the original bounded estimate,
+    // including its production-native contributor domains, rather than Observed.
+    let gap = build_map(&ground(Terrain::Gap), true);
+    let sample = c0_terrain_sample(&gap, [above.0[0], above.0[1]], 0.0, GroundQueryState::Estimated);
+    assert_eq!(sample.reference_origin[2], 0.0);
+    let gap_view = c0_terrain_bound(&gap, sample);
+    c0_terrain_assert_clear(&c0_terrain_probe("bounded missing gap", &gap_view, from, above, 0.0, &[]), above);
+    c0_terrain_assert_clear(&c0_terrain_probe("bounded missing crossing", &gap_view, from, end, 0.0, &[]), end);
+    assert_eq!(gap.query_ground([above.0[0], above.0[1]], 0.0).state, GroundQueryState::Estimated);
+    assert!(gap.observations.as_ref().unwrap().column_levels(0, 0).is_none());
+
+    // C04-c: Unknown current strip query, with a genuinely carried reference from
+    // the same source's known left side. Unknown itself is not a new obstacle.
+    let mut keys = ground(Terrain::Flat); keys.retain(|key| !(-2..=1).contains(&key[0]));
+    let strip = build_map(&keys, true);
+    let (unknown, native) = strip.query_ground_with_native([above.0[0], above.0[1]], 0.0);
+    assert_eq!(unknown.state, GroundQueryState::Unknown); assert_eq!(unknown.height, None);
+    assert_eq!(unknown.normal, None); assert!(unknown.sources.is_empty()); assert!(native.is_empty());
+    let mut carried = c0_terrain_sample(&strip, [from.0[0], from.0[1]], 0.0, GroundQueryState::LegacyGeometry);
+    assert_eq!(carried.reference_origin[2], 0.0);
+    carried.query_state = GroundQueryState::Unknown;
+    let strip_view = c0_terrain_bound(&strip, carried);
+    c0_terrain_assert_clear(&c0_terrain_probe("Unknown carried strip", &strip_view, from, above, 0.0, &[]), above);
+    c0_terrain_assert_clear(&c0_terrain_probe("Unknown carried crossing", &strip_view, from, end, 0.0, &[]), end);
+    let after = strip.query_ground([above.0[0], above.0[1]], 0.0);
+    assert_eq!(after.state, GroundQueryState::Unknown); assert_eq!(after.height, None); assert_eq!(after.normal, None);
+
+    // C05-a/c: the actual low occupancy is below either unchanged envelope.
+    // No Ground(0) is ever constructed from this isolated source or empty pair.
+    for whole in [false, true] {
+        let isolated = build_map(&low_keys, whole);
+        let low = isolated.query_ground([above.0[0], above.0[1]], 0.0);
+        assert_eq!(low.height, Some(-8.0 * size));
+        assert_eq!(low.state, GroundQueryState::LegacyGeometry);
+        assert!(above.0[2] + isolated.body_envelope().unwrap().z_bounds_m[0] > -8.0 * size);
+        let view = isolated.bind_body_query(BodyQueryReference::Unanchored);
+        let first = c0_terrain_probe("unanchored isolated low face", &view, above, short, 0.0, &[]);
+        c0_terrain_assert_clear(&first, short);
+        assert_eq!(c0_terrain_probe("unanchored isolated repeat", &view, above, short, 0.0, &[]), first);
+        // from_points([]) is InvalidPointCloud; use the existing complete-empty
+        // root builder, which expressly represents an empty unknown map.
+        let mut builder = crate::surface::SurfaceMapBuilder::configured(isolated.config().clone(),
+            Some(isolated.body_envelope().unwrap().clone()));
+        let empty = builder.build_column_updates(&[], FINE, true, 0).unwrap().snapshot;
+        let mut empty_observations = SurfaceObservations::new(FINE, 32).unwrap();
+        empty_observations.mark_complete_geometry_source();
+        let empty = empty.with_observations(Some(Arc::new(empty_observations)));
+        assert!(empty.data.occupied_columns.is_empty());
+        let (unknown, native) = empty.query_ground_with_native([above.0[0], above.0[1]], 0.0);
+        assert_eq!(unknown.state, GroundQueryState::Unknown); assert_eq!(unknown.height, None);
+        assert_eq!(unknown.normal, None); assert!(unknown.sources.is_empty()); assert!(native.is_empty());
+        let view = empty.bind_body_query(BodyQueryReference::Unanchored);
+        c0_terrain_assert_clear(&c0_terrain_probe("unanchored empty source", &view, above, short, 0.0, &[]), short);
+    }
+    // The bound API returns physical outcomes only. These checks prove no
+    // nominal drop/delta is synthesized; they do not claim an owner-level
+    // navigation-ground=None output field that this C0-a interface does not have.
+}
+
+#[test]
+fn ground_context_origin_boundary_and_physical_forbidden_pair() {
+    let mut model = envelope(false);
+    model.footprint_xy_m = vec![[-0.02, -0.02], [0.02, -0.02], [0.02, 0.02], [-0.02, 0.02]];
+    model.z_bounds_m = [-0.05, 0.05];
+    let source = build_map(&ground(Terrain::Flat), false).with_body_envelope(model).unwrap();
+    let pitch = 0.3_f64;
+    let q0 = [0.0, (pitch * 0.5).sin(), 0.0, (pitch * 0.5).cos()];
+    let yaw = std::f64::consts::FRAC_PI_2;
+    let yaw_rotation = rotation([0.0, 0.0, (yaw * 0.5).sin(), (yaw * 0.5).cos()]).unwrap();
+    let q1 = quaternion_from_columns(rotation(q0).unwrap().map(|axis| world(yaw_rotation, [0.0; 3], axis)));
+    let from = ([0.025, 0.025, 0.4], q0); let to = (from.0, q1);
+    let boundary = [[-0.025, -0.025], [0.075, -0.025], [0.075, 0.075], [-0.025, 0.075]];
+    assert!(segment_inside_boundary([from.0[0], from.0[1]], [to.0[0], to.0[1]], &boundary));
+    for pose in [from, to] {
+        let support = source.support_position_from_body(pose.0, pose.1, 0.4).unwrap();
+        assert!(!inside_boundary([support[0], support[1]], &boundary),
+            "fixed rotated nominal point must actually be outside: {support:?}");
+    }
+    for i in 0..=36 {
+        let pose = interpolated_body_pose(from, to, f64::from(i) / 36.0);
+        let r = rotation(pose.1).unwrap();
+        for point in &source.body_envelope().unwrap().footprint_xy_m {
+            for z in [-0.05, 0.05] {
+                let corner = world(r, pose.0, [point[0], point[1], z]);
+                assert!(inside_boundary([corner[0], corner[1]], &boundary));
+                assert!(corner[2] > 0.0, "tiny torso must clear source floor before interpreting the result");
+            }
+        }
+    }
+    let mut blocked = vec![false; 20 * 20]; blocked[10 * 20 + 10] = true;
+    // The actual body origin lies in forbidden XY [0,.1]², so the paired
+    // failure is a real physical exclusion, not a shifted nominal boundary.
+    assert!(from.0[0] >= 0.0 && from.0[0] < 0.1 && from.0[1] >= 0.0 && from.0[1] < 0.1);
+    let forbidden = source.with_virtual_obstacles([-1.0, -1.0], 0.1, 20, 20, &blocked).unwrap();
+    for (blocked, map) in [(false, &source), (true, &forbidden)] {
+        let grounded = c0_terrain_bound(map, c0_terrain_sample(map, [0.025, 0.025], 0.0,
+            GroundQueryState::LegacyGeometry));
+        let unanchored = map.bind_body_query(BodyQueryReference::Unanchored);
+        for (mode, view) in [("Ground origin boundary", &grounded), ("Unanchored origin boundary", &unanchored)] {
+            let probe = c0_terrain_probe(mode, view, from, to, yaw, &boundary);
+            if blocked {
+                assert_eq!(probe.poses, [Err(SurfaceError::VirtualObstacle), Err(SurfaceError::VirtualObstacle)]);
+                assert_eq!(probe.projection, Err(SurfaceError::VirtualObstacle));
+                assert_eq!(probe.motion, Err(SurfaceError::VirtualObstacle));
+                assert_eq!(probe.pose_witnesses, [None, None]);
+                assert_eq!(probe.projection_witness, None); assert_eq!(probe.motion_witness, None);
+            } else {
+                assert_eq!(probe.poses, [Ok(()), Ok(())]); assert_eq!(probe.pose_witnesses, [None, None]);
+                assert_eq!(probe.motion, Ok(())); assert_eq!(probe.motion_witness, None);
+                let projected = probe.projection.as_ref().expect("same-origin yaw projection must clear");
+                assert_eq!(projected.0, from.0); assert_eq!(probe.projection_witness, None);
+                let actual = rotation(projected.1).unwrap();
+                assert!((actual[0][1].atan2(actual[0][0]) - yaw).abs() < 1e-12);
+                assert!((actual[2][2] - pitch.cos()).abs() < 1e-12,
+                    "projection cannot erase actual tilt to pass the boundary");
+                // The fixed q0->q1 pair above is the full-motion oracle. The
+                // projector retains the original mode's attitude/yaw response;
+                // it need not use the same world-normal transport convention.
+                let mut witness = None;
+                view.motion_on_segment(from, *projected, [0.0, 1.0], &boundary, &mut witness).unwrap();
+                assert_eq!(witness, None);
+                let mut checker = view.geometry_checker(&boundary);
+                checker(from, to, [0.0, 1.0], &mut witness).unwrap();
+                assert_eq!(witness, None);
+            }
+            assert_eq!(c0_terrain_probe("origin boundary repeat", view, from, to, yaw, &boundary), probe);
+        }
+    }
+}

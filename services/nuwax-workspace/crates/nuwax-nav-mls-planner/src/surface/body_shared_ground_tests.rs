@@ -612,3 +612,757 @@ fn projected_patch_reference_does_not_create_missing_measured_members() {
 }
 
 mod hotpath_proposal_tests { include!("body_hotpath_proposal_tests.rs"); }
+
+// Append-only draft for body_shared_ground_tests.rs. Not built or executed.
+// Existing fixtures and tests above this append remain byte-for-byte unchanged.
+use crate::surface::body_query::{
+    BodyQueryReference, BoundBodyQueryView, GroundSample, LocalGroundReference,
+    NativeGroundSource, QuerySample,
+};
+
+type C0SharedPose = ([f64; 3], [f64; 4]);
+type C0SharedResults = [(Result<(), SurfaceError>, Option<BodyFailureWitness>); 3];
+
+fn c0_shared_measured_sample(map: &SurfaceSnapshot, xy: [f64; 2], height: f64,
+    anchor: [i32; 3]) -> GroundSample {
+    let (query, sources) = map.query_ground_with_native(xy, height);
+    eprintln!("C0_SHARED_SOURCE xy={xy:?} requested={height:?} query={query:?} native={sources:?}");
+    assert_eq!(query.state, GroundQueryState::Observed, "fixed measured-source premise");
+    assert_eq!(query.height, Some(height));
+    assert_eq!(query.normal, Some([0.0, 0.0, 1.0]));
+    assert_eq!(sources.len(), 1);
+    assert!(matches!(sources.as_slice(), [NativeGroundSource::ObservedFine { anchor: a }] if *a == anchor));
+    let observation = map.observations.as_ref().unwrap();
+    let record = observation.ground_layers([anchor[0], anchor[1]])
+        .find(|r| r.anchor == anchor).expect("actual source-owned measured record");
+    assert_eq!(record.members.as_slice(), &[anchor[2]]);
+    GroundSample {
+        reference_origin: [xy[0], xy[1], height],
+        reference_normal: query.normal,
+        query_state: query.state,
+        reference_sources: sources,
+    }
+}
+
+fn c0_shared_constant(sample: GroundSample) -> BodyQueryReference {
+    BodyQueryReference::Ground(Arc::new(LocalGroundReference { first: sample, changes: vec![] }))
+}
+
+// Every arm uses the real bound pose, relative projection and full-motion owners.
+// A second call may warm source-only leaves; C0-a bypasses association-sensitive
+// result caches, so no assertion below claims a new-mode result-cache hit.
+fn c0_shared_check(view: &BoundBodyQueryView, from: C0SharedPose, to: C0SharedPose,
+    t: f64, blocked: bool, source: Option<OccupancySource>, fine_z: Option<i32>) -> C0SharedResults {
+    let mut witness = None;
+    let pose = view.pose_at(from, t, &mut witness);
+    let pose_witness = witness;
+    let projected = view.project_from_to_samples(from, [to.0[0], to.0[1]], 0.0,
+        [t, t], &mut witness);
+    let projected_pose = projected.as_ref().ok().copied();
+    let projection = projected.map(|_| ());
+    let projection_witness = witness;
+    let motion = view.motion_on_segment(from, to, [t, t], &[], &mut witness);
+    let results = [(pose, pose_witness), (projection, projection_witness), (motion, witness)];
+    eprintln!("C0_SHARED_CHECK from={from:?} to={to:?} sample={t} blocked={blocked} projected={projected_pose:?} results={results:?}");
+    if !blocked { assert_eq!(projected_pose, Some(to)); }
+    for (result, witness) in &results {
+        if blocked {
+            assert_eq!(*result, Err(SurfaceError::InsufficientClearance));
+            let BodyRejection::Occupancy { source: actual_source, cell, .. } =
+                witness.expect("actual occupancy must retain its original witness").rejection;
+            if let Some(source) = source { assert_eq!(actual_source, source); }
+            if let Some(z) = fine_z {
+                assert!(matches!(actual_source, OccupancySource::Fine | OccupancySource::FineFringe));
+                assert_eq!(cell[2], z, "the other fine member, not the selected floor, collides");
+            }
+        } else {
+            assert_eq!(*result, Ok(()));
+            assert!(witness.is_none(), "success must clear the prior rejection slot");
+        }
+    }
+    results
+}
+
+// Read the actual context-aware contact leaf over every coarse tile touched by
+// the unchanged actual footprint. This is an oracle call into the original
+// kernel, not a replacement selector built in the test.
+fn c0_shared_footprint_members(map: &SurfaceSnapshot, actual: C0SharedPose,
+    sample: &GroundSample, selected: i32) {
+    eprintln!("C0_SHARED_FOOTPRINT_INPUT pose={actual:?} selected={selected} reference={:?} state={:?} sources={:?}",
+        sample.reference_origin, sample.query_state, sample.reference_sources);
+    assert_eq!(actual.1, [0.0, 0.0, 0.0, 1.0]);
+    let envelope = map.body_envelope().unwrap();
+    let footprint: Vec<_> = envelope.footprint_xy_m.iter()
+        .map(|p| [actual.0[0] + p[0], actual.0[1] + p[1]]).collect();
+    let polygon = PolygonQuery::new(&footprint);
+    let r = rotation(actual.1).unwrap();
+    let prism = PrismQuery::new(envelope, r, actual.0);
+    let coarse = f64::from(map.config().voxel_size);
+    let fine = f64::from(map.source_voxel_size_m());
+    let low: [i32; 2] = std::array::from_fn(|axis| (footprint.iter()
+        .map(|p| p[axis]).fold(f64::INFINITY, f64::min) / coarse).floor() as i32);
+    let high: [i32; 2] = std::array::from_fn(|axis| (footprint.iter()
+        .map(|p| p[axis]).fold(f64::NEG_INFINITY, f64::max) / coarse).floor() as i32);
+    let observations = map.observations.as_ref().unwrap();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut evidence = Vec::new();
+    for x in low[0]..=high[0] { for y in low[1]..=high[1] {
+        let rows = map.fine_ground_columns_in_context(Some((x, y, 0)), &polygon,
+            &prism, actual.0, r[2], x, y, QuerySample::Ground(sample)).unwrap();
+        for row in rows {
+            assert!(polygon.intersects(row.xy[0], row.xy[1], fine));
+            let records: Vec<_> = observations.ground_layers(row.xy).collect();
+            if records.is_empty() {
+                assert!(row.contacts.as_slice().is_empty(), "outside fixed source has no new members");
+                continue;
+            }
+            // Adjacent coarse tiles can enumerate a shared fine edge because
+            // quantized coarse/fine sizes need not divide exactly. Every copy
+            // must still preserve the same exact membership.
+            seen.insert(row.xy);
+            assert_eq!(row.height, Some(sample.reference_origin[2]), "actual fine column {:?}", row.xy);
+            assert_eq!(row.contacts.as_slice(), &[[selected, selected]], "actual fine column {:?}", row.xy);
+            assert!(!row.permits_contact(1 - selected));
+            let record = records.iter().find(|record| record.anchor[2] == selected)
+                .expect("selected measured floor exists in this actual fine column");
+            assert_eq!(record.members.as_slice(), &[selected]);
+            evidence.push((row.xy, row.height, row.contacts.as_slice().to_vec()));
+        }
+    }}
+    assert!(seen.len() > 1 && seen.iter().any(|xy| *xy != [0, 0]),
+        "center anchor alone is not the footprint oracle");
+    // Every source-owned fine column intersecting the footprint was visited.
+    for (xy, _) in observations.navigation_columns() {
+        if polygon.intersects(xy[0], xy[1], fine) { assert!(seen.contains(&xy)); }
+    }
+    eprintln!("C0_SHARED_FOOTPRINT pose={actual:?} selected={selected} rows={evidence:?}");
+}
+
+#[test]
+fn ground_context_exact_members_keep_same_coarse_obstacle() {
+    let mut envelope = model();
+    envelope.z_bounds_m = [-0.4, 0.2];
+    let floor = with_measured_floor(layered_map(&[[0, 0]]), 0.025)
+        .with_body_envelope(envelope.clone()).unwrap();
+    let upper = with_measured_floor(layered_map(&[[0, 0], [1, 1]]), 0.025)
+        .with_body_envelope(envelope).unwrap();
+    let a = ([0.025, 0.025, 0.425], [0.0, 0.0, 0.0, 1.0]);
+    let b = ([0.125, 0.025, 0.425], a.1);
+    let q = f64::from(upper.source_voxel_size_m());
+    let coarse = f64::from(upper.config().voxel_size);
+    assert_eq!(((0.5 * q) / coarse).floor() as i32, 0);
+    assert_eq!(((1.5 * q) / coarse).floor() as i32, 0);
+    assert!(upper.observations.as_ref().unwrap().get([0, 0, 1]).is_some());
+    assert!(!floor.observations.as_ref().unwrap().get([0, 0, 1]).is_some());
+    for (label, map, blocked) in [("floor", &floor, false), ("same-coarse upper", &upper, true)] {
+        for anchored in [true, false] {
+            let reference = if anchored {
+                c0_shared_constant(c0_shared_measured_sample(map, [0.025, 0.025], 0.025, [0, 0, 0]))
+            } else { BodyQueryReference::Unanchored };
+            let view = map.bind_body_query(reference);
+            eprintln!("C02 arm={label} Ground={anchored} A={a:?} B={b:?}");
+            let first = c0_shared_check(&view, a, b, 0.0, blocked, None, blocked.then_some(1));
+            assert_eq!(c0_shared_check(&view, a, b, 0.0, blocked, None, blocked.then_some(1)), first);
+        }
+    }
+
+    // Keep the original coarse geometry, but admit only the fixed high fine
+    // return. The vanished lower anchor is a carried reference, never current
+    // Observed evidence and never permission to exempt an absent source member.
+    let mut partial_observations = SurfaceObservations::new(0.05, 32).unwrap();
+    partial_observations.replace_block([0, 0, 0], std::collections::BTreeMap::from([
+        ([0, 0, 1], SurfaceObservation { observed_ns: 1000, hits: 1 }),
+    ])).unwrap();
+    let partial = upper.with_observations(Some(Arc::new(partial_observations)));
+    assert!(Arc::ptr_eq(&upper.data, &partial.data));
+    assert!(!partial.observations.as_ref().unwrap().is_complete_geometry_source());
+    assert!(partial.observations.as_ref().unwrap().get([0, 0, 0]).is_none());
+    assert!(partial.observations.as_ref().unwrap().ground_layers([0, 0]).next().is_none());
+    let (current, current_native) = partial.query_ground_with_native([0.025, 0.025], 0.025);
+    eprintln!("C02 partial current={current:?} current_native={current_native:?}");
+    assert_eq!(current.state, GroundQueryState::LegacyGeometry);
+    assert!(current.height.is_some());
+    assert_ne!(current.height, Some(0.025));
+    assert!(matches!(current_native.as_slice(),
+        [NativeGroundSource::LegacyFineRun { xy: [0, 0], first: 1, last: 1 }]));
+    // Cold Legacy controls use equal geometry/facts but distinct private
+    // owner/cache identities. This partial fixture replaces all measured layers
+    // with one high run; the original full entry can classify its coarse cells
+    // as mechanical contact. The older unassigned-leaf test uses a different
+    // body/height and bypasses that assigned-patch path, so it is not an oracle
+    // requiring this complete entry to reject. Preserve both original failures
+    // and the cold Legacy values in the C0-a execution record.
+    for method in ["pose", "projection", "motion"] {
+        let cold = partial.fork_for_planning();
+        assert_eq!(cold.data.occupied_columns, partial.data.occupied_columns);
+        assert_eq!(cold.data.height_bounds, partial.data.height_bounds);
+        assert_eq!(cold.observations.as_ref().unwrap().navigation_columns().collect::<Vec<_>>(),
+            partial.observations.as_ref().unwrap().navigation_columns().collect::<Vec<_>>());
+        assert_eq!(cold.ground_evidence, partial.ground_evidence);
+        eprintln!("C02_COLD_ID method={method} data_same_arc={} observations_same_arc={} coarse_columns={} fine_columns={:?} complete={} measured={}",
+            Arc::ptr_eq(&cold.data, &partial.data),
+            Arc::ptr_eq(cold.observations.as_ref().unwrap(), partial.observations.as_ref().unwrap()),
+            cold.data.occupied_columns.len(), cold.observations.as_ref().unwrap().navigation_columns().collect::<Vec<_>>(),
+            cold.observations.as_ref().unwrap().is_complete_geometry_source(),
+            cold.observations.as_ref().unwrap().has_measured_ground_layers());
+        let mut witness = None;
+        match method {
+            "pose" => {
+                let result = cold.validate_body_pose_with_witness(a.0, a.1, &mut witness);
+                eprintln!("C02_COLD_LEGACY pose={result:?} witness={witness:?}");
+                assert_eq!(result, Ok(()));
+            }
+            "projection" => {
+                let result = cold.body_pose_after_motion_with_witness(a, [b.0[0], b.0[1]], 0.0, &mut witness);
+                eprintln!("C02_COLD_LEGACY projection={result:?} witness={witness:?}");
+                assert!(result.is_ok());
+            }
+            _ => {
+                let result = cold.validate_body_motion_with_witness(a, b, &[], &mut witness);
+                eprintln!("C02_COLD_LEGACY motion={result:?} witness={witness:?}");
+                assert_eq!(result, Ok(()));
+            }
+        }
+        assert!(witness.is_none());
+    }
+    let cold = partial.fork_for_planning();
+    let model = cold.body_envelope().unwrap(); let r = rotation(a.1).unwrap();
+    let vertices: Vec<_> = model.footprint_xy_m.iter().flat_map(|p|
+        model.z_bounds_m.map(|z| world(r, a.0, [p[0], p[1], z]))).collect();
+    let polygon_points = hull(vertices.iter().map(|p| [p[0], p[1]]).collect());
+    let polygon = PolygonQuery::new(&polygon_points);
+    let prism = PrismQuery::new(model, r, a.0);
+    let centre = cold.locate_support_from_body(a.0, a.1, model.body_to_support_z_m);
+    eprintln!("C02_COLD_LEAF centre={centre:?} model={model:?} actual={a:?}");
+    if let Ok(centre) = centre {
+        let size = f64::from(cold.config().voxel_size);
+        let radius = ((vertices.iter().map(|p| (p[0]-centre.surface_xyz[0]).hypot(p[1]-centre.surface_xyz[1]))
+            .fold(0.0, f64::max)+size*2.0)/size).ceil()*size;
+        let patch = cold.ground_patch(centre, radius);
+        for (x,y) in [(-6,-2),(-5,-2),(0,0)] {
+            let ground = patch.get(&(x,y)).copied();
+            let rows = cold.fine_ground_columns(ground, &polygon, &prism, a.0, r[2], x, y);
+            let row_values = rows.as_ref().map(|rows| rows.iter()
+                .map(|row| (row.xy, row.height, row.contacts.as_slice().to_vec())).collect::<Vec<_>>());
+            eprintln!("C02_COLD_LEAF column={:?} patch_ground={ground:?} coarse_levels={:?} rows={row_values:?}",
+                [x,y], cold.data.occupied_columns.get(&(x,y)));
+            if let Some(ground) = ground {
+                let uncertainty = f64::from(cold.source_voxel_size_m())+model.support_uncertainty_m;
+                let contact = model.max_step_up_m.max(model.max_step_down_m)+uncertainty;
+                let plane = polygon.contact_plane(a.0, r[2], x, y, size, cold.ground_cell_position(ground)[2],
+                    (-model.body_to_support_z_m/r[2][2]+contact+1e-6).min(uncertainty));
+                let support = plane-model.body_to_support_z_m/r[2][2];
+                let height = cold.footprint_ground_height(ground,&polygon,&prism,support,contact,rows.as_deref());
+                eprintln!("C02_COLD_CONTACT column={:?} plane={plane:?} support={support:?} contact={contact:?} height={height:?} predicate={:?} bounds={:?} actual_coarse_intersection={:?}",
+                    [x,y], height.as_ref().ok().map(|&h| height_rejection(plane+model.z_bounds_m[0]/r[2][2],support,plane,contact,h,uncertainty)),
+                    cold.data.height_bounds.get(&ground), cold.data.height_bounds.get(&ground).map(|b|
+                        prism.intersects([f64::from(x)*size,f64::from(y)*size,f64::from(b[0])],
+                            [f64::from(x+1)*size,f64::from(y+1)*size,f64::from(b[1])])));
+            }
+        }
+    }
+    for anchored in [true, false] {
+        let reference = if anchored {
+            let mut carried = c0_shared_measured_sample(&upper, [0.025, 0.025], 0.025, [0, 0, 0]);
+            carried.query_state = GroundQueryState::Unknown;
+            c0_shared_constant(carried)
+        } else { BodyQueryReference::Unanchored };
+        let view = partial.bind_body_query(reference);
+        // Ground carried has no current lower member and still rejects via the
+        // original coarse fallback. Unanchored retains the old mechanical
+        // contact acceptance, but its projection keeps actual Z=.425 rather
+        // than borrowing Legacy's navigation-height adjustment to about .4.
+        let source = anchored.then_some(OccupancySource::CoarseFallback);
+        let first = c0_shared_check(&view, a, b, 0.0, anchored, source, None);
+        assert_eq!(c0_shared_check(&view, a, b, 0.0, anchored, source, None), first);
+    }
+
+    // Independent live geometry must survive even when all persistent fine
+    // occupancy is precisely the allowed lower measured floor.
+    let recent = floor.with_recent_obstacle_points(1, 100, 0, &[],
+        [(0, [0.025, 0.025, 0.35])]).unwrap();
+    for anchored in [true, false] {
+        let reference = if anchored {
+            c0_shared_constant(c0_shared_measured_sample(&recent, [0.025, 0.025], 0.025, [0, 0, 0]))
+        } else { BodyQueryReference::Unanchored };
+        let view = recent.bind_body_query(reference);
+        let first = c0_shared_check(&view, a, b, 0.0, true, Some(OccupancySource::Recent), None);
+        assert_eq!(c0_shared_check(&view, a, b, 0.0, true, Some(OccupancySource::Recent), None), first);
+    }
+}
+
+#[test]
+fn ground_context_recent_floor_box_and_refresh_pair() {
+    use nuwax_map_chunks::{LayerObservation, LayerObservations, LayerSample, block_key, local_key};
+    // Same isolated-floor fixture as the pre-existing guide/body test above.
+    let key = [5, 0, -1];
+    let point = [0.275, 0.025, -0.025];
+    let mut cfg = scene(&[], false).config().clone();
+    cfg.wall_clearance_m = 0.4;
+    let mut envelope = model();
+    envelope.z_bounds_m = [-0.45, 0.25];
+    let mut observations = SurfaceObservations::new(0.05, 32).unwrap();
+    observations.replace_block(block_key(key), std::collections::BTreeMap::from([
+        (key, SurfaceObservation { observed_ns: 100, hits: 1 }),
+    ])).unwrap();
+    let local = local_key(key);
+    observations.replace_ground_layers(block_key(key), Arc::new(LayerObservations::from([
+        (local, LayerObservation {
+            members: vec![local], normal: [0.0, 0.0, 1.0], plane_origin: point,
+            samples: vec![LayerSample { source: Default::default(), point,
+                source_sequence: 1, source_timestamp_ns: 100, point_index: 0 }],
+        }),
+    ]))).unwrap();
+    observations.mark_complete_geometry_source();
+    let map = SurfaceSnapshot::from_points(
+        &[(point[0] as f32, point[1] as f32, point[2] as f32)], cfg, 0.05)
+        .unwrap().with_body_envelope(envelope).unwrap()
+        .with_observations(Some(Arc::new(observations)));
+    let a = ([0.025, 0.025, 0.4], [0.0, 0.0, 0.0, 1.0]);
+    // Stationary projection/motion are deliberate here: C07's fixed actual pose
+    // stays identical while the recent owner and independent association change.
+    let bounds = [[-0.5, -0.5], [0.5, 0.5]];
+    assert_eq!(map.locate_support_from_body(a.0, a.1, 0.4), Err(SurfaceError::MissingSupport));
+    let (center, center_native) = map.query_ground_with_native([a.0[0], a.0[1]], -0.025);
+    assert_eq!(center.state, GroundQueryState::Unknown);
+    assert_eq!(center.height, None);
+    assert_eq!(center.normal, None);
+    assert!(center_native.is_empty());
+    let mut carried = c0_shared_measured_sample(&map, [point[0], point[1]], -0.025, key);
+    carried.query_state = GroundQueryState::Unknown;
+    let reference = Arc::new(LocalGroundReference { first: carried, changes: vec![] });
+    assert_eq!(reference.first.reference_origin[2], -0.025, "this source has no ground zero");
+    assert_eq!(reference.first.query_state, GroundQueryState::Unknown);
+    let floor = map.with_recent_obstacle_points(1, 100, 0, &[0], [(0, point)]).unwrap();
+    assert!(floor.recent_obstacle_hints(bounds, a).unwrap().is_empty());
+    for indices in [&[][..], &[0][..]] {
+        let blocked = floor.with_recent_obstacle_points(2, 200, 0, indices,
+            [(0, [point[0], point[1], 0.35])]).unwrap();
+        let restored = blocked.with_recent_obstacle_points(3, 300, 0, &[0], [(0, point)]).unwrap();
+        let blocked_again = restored.with_recent_obstacle_points(4, 400, 0, indices,
+            [(0, [point[0], point[1], 0.35])]).unwrap();
+        let cleared = blocked_again.clear_recent_obstacles();
+        assert_eq!(blocked.recent_obstacle_hints(bounds, a).unwrap().len(), 1);
+        assert!(restored.recent_obstacle_hints(bounds, a).unwrap().is_empty());
+        assert_eq!(blocked_again.recent_obstacle_hints(bounds, a).unwrap().len(), 1);
+        assert!(cleared.recent_obstacle_hints(bounds, a).unwrap().is_empty());
+        for source in [&floor, &blocked, &restored, &blocked_again, &cleared] {
+            assert!(Arc::ptr_eq(&map.data, &source.data));
+            assert!(Arc::ptr_eq(map.observations.as_ref().unwrap(), source.observations.as_ref().unwrap()));
+            let query = source.query_ground([a.0[0], a.0[1]], -0.025);
+            assert_eq!(query.state, GroundQueryState::Unknown);
+            assert_eq!(query.height, None);
+            assert_eq!(query.normal, None);
+        }
+        for order in [[false, true], [true, false]] {
+            for (label, source, is_blocked) in [
+                ("a", &floor, false), ("b", &blocked, true),
+                ("a refreshed", &restored, false), ("b refreshed", &blocked_again, true),
+                ("recent cleared", &cleared, false),
+            ] {
+                for anchored in order {
+                    let binding = if anchored { BodyQueryReference::Ground(reference.clone()) }
+                        else { BodyQueryReference::Unanchored };
+                    let view = source.bind_body_query(binding);
+                    eprintln!("C07 arm={label} indices={indices:?} Ground-carried={anchored} pose={a:?}");
+                    let expected_source = is_blocked.then_some(OccupancySource::Recent);
+                    let first = c0_shared_check(&view, a, a, 0.0, is_blocked, expected_source, None);
+                    assert_eq!(c0_shared_check(&view, a, a, 0.0, is_blocked, expected_source, None), first);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn ground_context_same_pose_distinct_measured_layer_cache_pair() {
+    for order in [[1, 0, 1], [0, 1, 0]] {
+        // Each order starts with a fresh source owner. Repeated calls share only
+        // that owner's caches; no private association cache is being enabled.
+        let map = same_coarse_measured_map(&[0, 1]);
+        let q = f64::from(map.source_voxel_size_m());
+        let heights = [0.5 * q, 1.5 * q];
+        let a = ([0.025, 0.025, heights[1] + 0.4], [0.0, 0.0, 0.0, 1.0]);
+        let b = ([0.125, 0.025, heights[1] + 0.4], a.1);
+        let low = map.locate_support([a.0[0], a.0[1], heights[0]]).unwrap();
+        let high = map.locate_support([a.0[0], a.0[1], heights[1]]).unwrap();
+        assert_eq!(low.cell, high.cell);
+        assert_eq!(low.cell, (0, 0, 0));
+        assert_ne!(low.surface_xyz[2], high.surface_xyz[2]);
+        let views = [0, 1].map(|level| {
+            let sample = c0_shared_measured_sample(&map, [a.0[0], a.0[1]],
+                heights[level], [0, 0, level as i32]);
+            c0_shared_footprint_members(&map, a, &sample, level as i32);
+            c0_shared_footprint_members(&map, b, &sample, level as i32);
+            map.bind_body_query(c0_shared_constant(sample))
+        });
+        let mut baseline: [Option<C0SharedResults>; 2] = [None, None];
+        for pass in 0..2 {
+            for selected in order {
+                let blocked = selected == 0;
+                eprintln!("C08 pass={pass} selected={selected} A={a:?} B={b:?} association-cache=bypassed");
+                let result = c0_shared_check(&views[selected], a, b, 0.0, blocked, None,
+                    blocked.then_some(1));
+                if let Some(expected) = &baseline[selected] { assert_eq!(&result, expected); }
+                else { baseline[selected] = Some(result); }
+            }
+        }
+        // Explicit stale-slot test across views, with unchanged actual geometry.
+        let mut witness = None;
+        assert_eq!(views[0].pose_at(a, 0.0, &mut witness), Err(SurfaceError::InsufficientClearance));
+        assert!(witness.is_some());
+        assert_eq!(views[1].pose_at(a, 0.0, &mut witness), Ok(()));
+        assert!(witness.is_none());
+
+        // Local contact is allowed to choose its existing mechanical explanation;
+        // map ground facts do not promote this explicitly Unanchored request.
+        let unanchored = map.bind_body_query(BodyQueryReference::Unanchored);
+        let mut first = None;
+        for pass in 0..2 {
+            let mut witness = None;
+            let pose = unanchored.pose_at(a, 0.0, &mut witness);
+            let pose_witness = witness;
+            let projected = unanchored.project_from_to_samples(a, [b.0[0], b.0[1]], 0.0,
+                [0.0, 0.0], &mut witness);
+            if let Ok(actual) = &projected { assert_eq!(*actual, b); }
+            let projection_witness = witness;
+            let motion = unanchored.motion_on_segment(a, b, [0.0, 0.0], &[], &mut witness);
+            let results = [(pose, pose_witness), (projected.map(|_| ()), projection_witness), (motion, witness)];
+            eprintln!("C08 Unanchored pass={pass} results={results:?}; association input=None");
+            for (result, witness) in &results {
+                match result {
+                    Ok(()) => assert!(witness.is_none()),
+                    Err(SurfaceError::InsufficientClearance) => assert!(witness.is_some()),
+                    other => panic!("Unanchored must not invent known terrain incompatibility: {other:?}"),
+                }
+            }
+            if let Some(expected) = &first { assert_eq!(&results, expected); }
+            else { first = Some(results); }
+        }
+    }
+}
+
+#[test]
+fn ground_context_same_view_explicit_sample_cold_warm_pair() {
+    for order in [[0.0, 0.5, 1.0], [0.5, 0.0, 0.5]] {
+        let map = same_coarse_measured_map(&[0, 1]);
+        let q = f64::from(map.source_voxel_size_m());
+        let heights = [0.5 * q, 1.5 * q];
+        let a = ([0.025, 0.025, heights[1] + 0.4], [0.0, 0.0, 0.0, 1.0]);
+        let b = ([0.125, 0.025, heights[1] + 0.4], a.1);
+        let sample = |level: usize| {
+            let sample = c0_shared_measured_sample(&map,
+                [a.0[0], a.0[1]], heights[level], [0, 0, level as i32]);
+            c0_shared_footprint_members(&map, a, &sample, level as i32);
+            sample
+        };
+        // A diagnostic local connection: right-continuous H / L / H. This is
+        // input/cursor validation, not a claim of a robot changing floors in place.
+        let view = map.bind_body_query(BodyQueryReference::Ground(Arc::new(LocalGroundReference {
+            first: sample(1), changes: vec![(0.25, sample(0)), (0.75, sample(1))],
+        })));
+        let mut baseline: [Option<C0SharedResults>; 2] = [None, None];
+        for pass in 0..2 {
+            for t in order {
+                let low = t >= 0.25 && t < 0.75;
+                let result = c0_shared_check(&view, a, b, t, low, None, low.then_some(1));
+                eprintln!("C11 pass={pass} t={t} low={low} association-cache=bypassed");
+                let index = usize::from(low);
+                if let Some(expected) = &baseline[index] { assert_eq!(&result, expected); }
+                else { baseline[index] = Some(result); }
+            }
+        }
+        // Exact changes are right-continuous, including stale witness clearing.
+        let mut witness = None;
+        assert_eq!(view.pose_at(a, 0.25, &mut witness), Err(SurfaceError::InsufficientClearance));
+        assert!(witness.is_some());
+        assert_eq!(view.pose_at(a, 0.75, &mut witness), Ok(()));
+        assert!(witness.is_none());
+        assert_eq!(view.project_from_to_samples(a, [a.0[0], a.0[1]], 0.0,
+            [0.0, 0.0], &mut witness), Ok(a));
+        assert!(witness.is_none());
+        assert_eq!(view.motion_on_segment(a, a, [0.0, 0.0], &[], &mut witness), Ok(()));
+        assert!(witness.is_none());
+        // Different target sample cannot take the old zero-XY/yaw early return.
+        let changed = view.project_from_to_samples(a, [a.0[0], a.0[1]], 0.0,
+            [0.0, 0.5], &mut witness);
+        eprintln!("C11 zero-XY changed-target result={changed:?} witness={witness:?}");
+        // The unchanged known-terrain edge rejects a nonzero H->L change in
+        // the same fine XY before target occupancy; no occupancy witness exists.
+        assert_eq!(changed, Err(SurfaceError::UntraversableSegment));
+        assert!(witness.is_none());
+        // Both endpoints resolve to H. The interior L change must still be
+        // consumed. Original terrain rejection precedes regular/event occupancy
+        // in these fixed full-motion inputs; it does not prove event execution.
+        for to in [a, b] {
+            let mut first = None;
+            for _ in 0..2 {
+                let result = view.motion_on_segment(a, to, [0.0, 1.0], &[], &mut witness);
+                eprintln!("C11 H/L/H segment from={a:?} to={to:?} result={result:?} witness={witness:?}");
+                assert_eq!(result, Err(SurfaceError::UntraversableSegment));
+                assert!(witness.is_none());
+                let actual = (result, witness);
+                if let Some(expected) = &first { assert_eq!(&actual, expected); }
+                else { first = Some(actual); }
+            }
+        }
+        let mut checker = view.geometry_checker(&[]);
+        assert_eq!(checker(a, a, [0.0, 1.0], &mut witness), Err(SurfaceError::UntraversableSegment));
+        assert!(witness.is_none());
+        assert_eq!(checker(a, a, [0.0, 0.0], &mut witness), Ok(()));
+        assert!(witness.is_none());
+
+        // Separate original terrain-leaf replay using the real bound segment
+        // and original fraction/height helpers. This is not a main-call trace.
+        for (label, to, interval) in [("projection", a, [0.0, 0.5]),
+            ("stationary", a, [0.0, 1.0]), ("translating", b, [0.0, 1.0])] {
+            let context = view.segment_for_diagnostic(interval);
+            let size = f64::from(map.source_voxel_size_m());
+            let mut fractions = translation::reference_grid_fractions(
+                [a.0[0], a.0[1], 0.0], [to.0[0], to.0[1], 0.0], size).unwrap();
+            context.append_changes(&mut fractions);
+            fractions.sort_by(f64::total_cmp); fractions.dedup();
+            let samples: Vec<_> = fractions.iter().map(|&s| {
+                let xy = [a.0[0] + (to.0[0]-a.0[0])*s, a.0[1] + (to.0[1]-a.0[1])*s];
+                let sample = context.at(s).ground().unwrap();
+                let height = sample.height_at(xy);
+                eprintln!("C11_TERRAIN_LEAF label={label} s={s:?} t={:?} xy={xy:?} reference={height:?} actual_height={:?}",
+                    interval[0]+s*(interval[1]-interval[0]), map.known_terrain_transition_top(xy, height));
+                [xy[0], xy[1], height]
+            }).collect();
+            let model = map.body_envelope().unwrap();
+            let terrain = map.validate_known_reference_samples(samples, size,
+                model.max_step_up_m, model.max_step_down_m, model.support_uncertainty_m);
+            eprintln!("C11_TERRAIN_LEAF_RESULT label={label} result={terrain:?}");
+            assert_eq!(terrain, Err(SurfaceError::UntraversableSegment));
+        }
+        // Independent contact-event qualification: the complete motion may be
+        // rejected by the earlier terrain pass. Invoke the unchanged real event
+        // kernel with this same bound segment and its real pose checker.
+        for to in [a, b] {
+            let context = view.segment_for_diagnostic([0.0, 1.0]);
+            let mut event_witness = None;
+            let mut calls = Vec::new();
+            let event = map.validate_body_contact_events_in_context(a, to, context, |s| {
+                let actual = interpolated_body_pose(a, to, s);
+                let result = view.pose_at(actual, s, &mut event_witness);
+                eprintln!("C11_EVENT_LEAF s={s:?} t={s:?} actual={actual:?} result={result:?} witness={event_witness:?}");
+                calls.push((s, actual, result.clone(), event_witness));
+                result
+            });
+            eprintln!("C11_EVENT_LEAF_RESULT to={to:?} calls={calls:?} result={event:?} witness={event_witness:?}");
+            assert_eq!(event, Err(SurfaceError::InsufficientClearance));
+            let (s, actual_pose, result, last_witness) = calls.last().unwrap();
+            assert_eq!(*s, 0.25, "right-continuous L association reaches the event checker");
+            assert_eq!(*actual_pose, interpolated_body_pose(a, to, 0.25));
+            assert_eq!(*result, Err(SurfaceError::InsufficientClearance));
+            assert!(calls[..calls.len()-1].iter().all(|(s, _, result, witness)|
+                *s < 0.25 && *result == Ok(()) && witness.is_none()));
+            let actual = event_witness.expect("independent event leaf has a real occupancy witness");
+            assert_eq!(Some(actual), *last_witness);
+            assert_eq!(actual.pose, *actual_pose);
+            assert_eq!(actual.rejection, BodyRejection::Occupancy {
+                cell: if to == a { [-11, -3, 1] } else { [-10, -3, 1] },
+                source: OccupancySource::Fine, z_bounds: [q, 2.0*q],
+                ground_height: Some(heights[0]),
+            });
+        }
+    }
+}
+
+// Fixed C0-a diagnostic: continuous height changes inside one fine cell are
+// motion on one real measured plane, not a stationary change of selected floor.
+#[test]
+fn ground_context_same_observed_plane_subcell_motion_diagnostic() {
+    let map = parallel_measured_slope_map(0.045, false, None);
+    let fine = f64::from(map.source_voxel_size_m());
+    let from_xy = [0.01, 0.025];
+    let to_xy = [0.02, 0.025];
+    let plane_height = |xy: [f64; 2]| 0.045 - 0.4 * xy[0] + 0.06;
+    let observations = map.observations.as_ref().unwrap();
+    let fractions = translation::reference_grid_fractions(
+        [from_xy[0], from_xy[1], 0.0], [to_xy[0], to_xy[1], 0.0], fine).unwrap();
+    let mut previous: Option<([f64; 2], f64, &ObservedGroundLayer)> = None;
+    for &s in &fractions {
+        let xy = std::array::from_fn(|i| from_xy[i] + (to_xy[i] - from_xy[i]) * s);
+        let reference = plane_height(xy);
+        let column = xy.map(|v| (v / fine).floor() as i32);
+        let (query, native) = map.query_ground_with_native(xy, reference);
+        let selected = observations.ground_layers(column).min_by(|a, b|
+            (a.height_at(xy).unwrap_or(f64::INFINITY) - reference).abs().total_cmp(
+                &(b.height_at(xy).unwrap_or(f64::INFINITY) - reference).abs())).unwrap();
+        let height = selected.height_at(xy).unwrap();
+        let top = map.known_terrain_transition_top(xy, reference);
+        eprintln!("C12_SOURCE s={s:?} xy={xy:?} fine={fine:?} column={column:?} reference={reference:?} query={query:?} native={native:?} anchor={:?} members={:?} normal={:?} origin={:?} top={top:?}",
+            selected.anchor, selected.members, selected.normal, selected.plane_origin);
+        assert_eq!(column, [0, 0]);
+        assert_eq!(query.state, GroundQueryState::Observed);
+        assert_eq!(native, vec![NativeGroundSource::ObservedFine { anchor: [0, 0, 1] }]);
+        assert_eq!(selected.anchor, [0, 0, 1]);
+        assert_eq!(selected.members.as_slice(), &[1]);
+        assert_eq!(query.height, Some(height));
+        assert_eq!(top, Some(height));
+        assert!(selected.normal[2] >= f64::from(map.config().max_slope_deg).to_radians().cos());
+        if let Some((old_xy, old_height, old_layer)) = previous {
+            let actual_run = (xy[0] - old_xy[0]).hypot(xy[1] - old_xy[1]);
+            let rise = height - old_height;
+            let same_record = std::ptr::eq(old_layer, selected);
+            eprintln!("C12_EDGE from={old_xy:?} to={xy:?} same_record={same_record} actual_run={actual_run:?} cell_run=0 rise={rise:?} max_slope_deg={:?}", map.config().max_slope_deg);
+            assert!(same_record);
+            assert!(actual_run > 0.0 && rise.abs() > 1e-6);
+            assert!(rise.abs() <= actual_run * f64::from(map.config().max_slope_deg).to_radians().tan() + 1e-6);
+        }
+        previous = Some((xy, height, selected));
+    }
+    assert_eq!(fractions, vec![0.0, 0.5, 1.0]);
+    let (height, attitude) = map.measured_contact_frame(from_xy, plane_height(from_xy), 0.0).unwrap();
+    let r = rotation(attitude).unwrap();
+    let offset = map.body_envelope().unwrap().body_to_support_z_m / r[2][2];
+    let from = ([from_xy[0], from_xy[1], height + offset], attitude);
+    let to = ([to_xy[0], to_xy[1], plane_height(to_xy) + offset], attitude);
+    let (query, native) = map.query_ground_with_native(from_xy, height);
+    let reference = c0_shared_constant(GroundSample {
+        reference_origin: [from_xy[0], from_xy[1], height],
+        reference_normal: query.normal,
+        query_state: query.state,
+        reference_sources: native,
+    });
+    // Private disposable caches start cold. Forks retain identical geometry and
+    // source records, but are deliberately not the same snapshot-owner identity.
+    let legacy_source = map.fork_for_planning();
+    let ground_source = map.fork_for_planning();
+    let legacy = legacy_source.body_query();
+    let ground = ground_source.bind_body_query(reference);
+    let mut witness = None;
+    let legacy_from = (legacy_source.validate_body_pose_with_witness(from.0, from.1, &mut witness), witness);
+    let legacy_to = (legacy_source.validate_body_pose_with_witness(to.0, to.1, &mut witness), witness);
+    let legacy_projection = (legacy.body_pose_after_motion_with_witness(from, to_xy, 0.0, &mut witness), witness);
+    let legacy_motion = (legacy.validate_body_motion_with_witness(from, to, &[], &mut witness), witness);
+    let ground_from = (ground.pose_at(from, 0.0, &mut witness), witness);
+    let ground_to = (ground.pose_at(to, 1.0, &mut witness), witness);
+    let ground_projection = (ground.project_from_to_samples(from, to_xy, 0.0, [0.0, 1.0], &mut witness), witness);
+    let ground_motion = (ground.motion_on_segment(from, to, [0.0, 1.0], &[], &mut witness), witness);
+    eprintln!("C12_POSES from={from:?} to={to:?} rotation={r:?} envelope={:?}", map.body_envelope());
+    eprintln!("C12_LEGACY from={legacy_from:?} to={legacy_to:?} projection={legacy_projection:?} motion={legacy_motion:?}");
+    eprintln!("C12_GROUND from={ground_from:?} to={ground_to:?} projection={ground_projection:?} motion={ground_motion:?}");
+    // Check all fixed physical premises only after recording every full entry.
+    for result in [legacy_from, legacy_to, ground_from, ground_to] {
+        assert_eq!(result, (Ok(()), None), "fixed tilted endpoint body premise");
+    }
+    assert!(legacy_projection.0.is_ok(), "original Legacy projection control");
+    assert_eq!(legacy_projection.1, None);
+    assert_eq!(legacy_motion, (Ok(()), None), "original Legacy motion control");
+    assert!(ground_projection.0.is_ok(), "one real legal measured plane must permit subcell movement");
+    assert_eq!(ground_projection.1, None);
+    assert_eq!(ground_motion, (Ok(()), None));
+}
+
+#[test]
+fn ground_context_carried_unknown_keeps_actual_height_on_observed_subcell_slope() {
+    let map = parallel_measured_slope_map(0.045, false, None);
+    let from_xy = [0.01, 0.025];
+    let to_xy = [0.02, 0.025];
+    let (height, attitude) = map.measured_contact_frame(from_xy, 0.101, 0.0).unwrap();
+    let (query, sources) = map.query_ground_with_native(from_xy, height);
+    assert_eq!(query.state, GroundQueryState::Observed);
+    assert_eq!(sources, vec![NativeGroundSource::ObservedFine { anchor: [0, 0, 1] }]);
+    let sample = GroundSample { reference_origin: [from_xy[0], from_xy[1], height],
+        reference_normal: query.normal, query_state: GroundQueryState::Unknown,
+        reference_sources: sources };
+    let reference = Arc::new(LocalGroundReference { first: sample.clone(), changes: vec![] });
+    let view = map.bind_body_query(BodyQueryReference::Ground(reference.clone()));
+    let r = rotation(attitude).unwrap();
+    let from = ([from_xy[0], from_xy[1], height + map.body_envelope().unwrap().body_to_support_z_m / r[2][2]], attitude);
+    let to = ([to_xy[0], to_xy[1], from.0[2]], attitude);
+    let mut witness = None;
+    let from_result = (view.pose_at(from, 0.0, &mut witness), witness);
+    let to_result = (view.pose_at(to, 1.0, &mut witness), witness);
+    let projection = (view.project_from_to_samples(from, to_xy, 0.0, [0.0, 1.0], &mut witness), witness);
+    let motion = (view.motion_on_segment(from, to, [0.0, 1.0], &[], &mut witness), witness);
+    let selected_a = map.known_terrain_transition_sample(from_xy, sample.height_at(from_xy)).unwrap();
+    let selected_b = map.known_terrain_transition_sample(to_xy, sample.height_at(to_xy)).unwrap();
+    let same_record = std::ptr::eq(selected_a.1.unwrap(), selected_b.1.unwrap());
+    eprintln!("C12_CARRIED reference={sample:?} selected_heights={:?} same_record={same_record} from={from:?} to={to:?} from_result={from_result:?} to_result={to_result:?} projection={projection:?} motion={motion:?}", [selected_a.0, selected_b.0]);
+    assert!(same_record);
+    assert!(selected_b.0 < selected_a.0, "current source really has a descending plane");
+    assert_eq!(from_result, (Ok(()), None));
+    assert_eq!(to_result, (Ok(()), None));
+    assert_eq!(projection, (Ok(to), None));
+    assert_eq!(motion, (Ok(()), None));
+    assert_eq!(to.0[2].to_bits(), from.0[2].to_bits(), "Unknown reference carries actual height without a new terrain delta");
+    assert_eq!(reference.first, sample, "factual checking must not promote the carried reference to Observed");
+}
+
+#[test]
+fn ground_context_subcell_distinct_observed_anchors_keep_original_rejection() {
+    use nuwax_map_chunks::{LayerObservation, LayerObservations, LayerSample, block_key, local_key};
+    // Fixed two source-native layers straddle the actual fine-cell boundary in Z.
+    // Their 2 mm separation produces a legal apparent slope over 5 mm of XY;
+    // only their distinct actual selected records can exclude continuity.
+    let base = layered_map(&[[0, 0], [1, 1]]);
+    let mut observations = base.observations.as_ref().unwrap().as_ref().clone();
+    let fine = f64::from(observations.size_m);
+    let mut blocks = std::collections::BTreeMap::<[i32; 3], LayerObservations>::new();
+    for x in -12..12 { for y in -12..12 { for (z, height) in [(0, 0.049), (1, 0.051)] {
+        let key = [x, y, z];
+        let local = local_key(key);
+        let origin = [(f64::from(x) + 0.5) * fine, (f64::from(y) + 0.5) * fine, height];
+        assert_eq!((height / fine).floor() as i32, z);
+        blocks.entry(block_key(key)).or_default().insert(local, LayerObservation {
+            members: vec![local], normal: [0.0, 0.0, 1.0], plane_origin: origin,
+            samples: vec![LayerSample { source: Default::default(), point: origin,
+                source_sequence: 1, source_timestamp_ns: 100, point_index: u32::from(local) }],
+        });
+    } } }
+    for (block, layers) in blocks { observations.replace_ground_layers(block, Arc::new(layers)).unwrap(); }
+    observations.mark_complete_geometry_source();
+    let map = base.with_observations(Some(Arc::new(observations)));
+    let make_sample = |xy: [f64; 2], height: f64, anchor: [i32; 3]| {
+        let (query, native) = map.query_ground_with_native(xy, height);
+        assert_eq!(query.state, GroundQueryState::Observed);
+        assert_eq!(query.height, Some(height));
+        assert_eq!(native, vec![NativeGroundSource::ObservedFine { anchor }]);
+        GroundSample { reference_origin: [xy[0], xy[1], height], reference_normal: query.normal,
+            query_state: query.state, reference_sources: native }
+    };
+    let lower = make_sample([0.01, 0.025], 0.049, [0, 0, 0]);
+    let upper = make_sample([0.02, 0.025], 0.051, [0, 0, 1]);
+    let reference = BodyQueryReference::Ground(Arc::new(LocalGroundReference {
+        first: lower, changes: vec![(1.0, upper)] }));
+    let view = map.bind_body_query(reference);
+    let samples = [[0.01, 0.025, 0.049], [0.015, 0.025, 0.049], [0.02, 0.025, 0.051]];
+    let selected: Vec<_> = samples.iter().map(|p| map.known_terrain_transition_sample([p[0], p[1]], p[2]).unwrap()).collect();
+    for (point, (height, layer)) in samples.iter().zip(&selected) {
+        let layer = layer.unwrap();
+        eprintln!("C12_DISTINCT source_point={point:?} selected_height={height:?} anchor={:?} members={:?}", layer.anchor, layer.members);
+        assert_eq!(point[..2].iter().map(|v| (v / fine).floor() as i32).collect::<Vec<_>>(), vec![0, 0]);
+        assert_eq!(*height, point[2]);
+    }
+    assert!(std::ptr::eq(selected[0].1.unwrap(), selected[1].1.unwrap()));
+    assert!(!std::ptr::eq(selected[1].1.unwrap(), selected[2].1.unwrap()));
+    assert_eq!(selected[1].1.unwrap().anchor, [0, 0, 0]);
+    assert_eq!(selected[2].1.unwrap().anchor, [0, 0, 1]);
+    let run = samples[2][0] - samples[1][0];
+    let rise = selected[2].0 - selected[1].0;
+    assert!(run > 0.0 && rise > 1e-6);
+    assert!(rise <= run * f64::from(map.config().max_slope_deg).to_radians().tan() + 1e-6);
+    let envelope = map.body_envelope().unwrap();
+    let from = ([0.01, 0.025, 0.049 + envelope.body_to_support_z_m], [0.0, 0.0, 0.0, 1.0]);
+    let to = ([0.02, 0.025, 0.051 + envelope.body_to_support_z_m], from.1);
+    let mut witness = None;
+    let from_result = (view.pose_at(from, 0.0, &mut witness), witness);
+    let to_result = (view.pose_at(to, 1.0, &mut witness), witness);
+    let projection = (view.project_from_to_samples(from, [0.02, 0.025], 0.0, [0.0, 1.0], &mut witness), witness);
+    let motion = (view.motion_on_segment(from, to, [0.0, 1.0], &[], &mut witness), witness);
+    let old_edge = map.validate_known_reference_samples(samples, fine,
+        envelope.max_step_up_m, envelope.max_step_down_m, envelope.support_uncertainty_m);
+    let ground_terrain = map.validate_known_terrain_motion_in_context(from, to,
+        view.segment_for_diagnostic([0.0, 1.0]));
+    eprintln!("C12_DISTINCT run={run:?} rise={rise:?} from={from:?} to={to:?} from_result={from_result:?} to_result={to_result:?} projection={projection:?} motion={motion:?} old_edge={old_edge:?} ground_terrain={ground_terrain:?}");
+    assert_eq!(from_result, (Ok(()), None));
+    assert_eq!(to_result, (Ok(()), None));
+    assert_eq!(old_edge, Err(SurfaceError::UntraversableSegment));
+    assert_eq!(ground_terrain, Err(SurfaceError::UntraversableSegment), "direct real Ground terrain kernel, independent of body-entry rejection order");
+    assert_eq!(projection, (Err(SurfaceError::UntraversableSegment), None));
+    assert_eq!(motion, (Err(SurfaceError::UntraversableSegment), None));
+}

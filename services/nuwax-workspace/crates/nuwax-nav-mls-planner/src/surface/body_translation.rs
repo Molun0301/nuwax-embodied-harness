@@ -368,9 +368,19 @@ impl SurfaceSnapshot {
         to: ([f64; 3], [f64; 4]),
         mut check:impl FnMut(f64)->Result<(),SurfaceError>,
     ) -> Result<(), SurfaceError> {
+        self.validate_body_contact_events_in_context(from,to,QuerySegment::LEGACY,check)
+    }
+
+    pub(super) fn validate_body_contact_events_in_context(
+        &self,
+        from: ([f64; 3], [f64; 4]),
+        to: ([f64; 3], [f64; 4]),
+        context:QuerySegment<'_>,
+        mut check:impl FnMut(f64)->Result<(),SurfaceError>,
+    ) -> Result<(), SurfaceError> {
         let r = rotation(from.1)?;
         let rotating=r != rotation(to.1)?;
-        if !rotating && from.0 == to.0 { return Ok(()); }
+        if !rotating && from.0 == to.0 && context.constant() { return Ok(()); }
         let model = self.body_envelope().ok_or(SurfaceError::InvalidPose)?;
         let events=rotating.then(||RotationEvents::new(model,from,to));
         let angle=events.as_ref().map_or(0.0,|events|2.0*events.from.1.iter().zip(events.to.1)
@@ -416,6 +426,7 @@ impl SurfaceSnapshot {
                 if t > 0.0 && t < 1.0 { changes.push(t); }
             }
         }
+        context.append_changes(&mut changes);
         changes.sort_by(f64::total_cmp);
         changes.dedup();
         let mut checked=AHashSet::new();
@@ -499,7 +510,7 @@ impl SurfaceSnapshot {
                             +(model.z_bounds_m[0].max(-model.body_to_support_z_m)/upward+contact+1e-6).min(uncertainty)
                     } else {f64::NEG_INFINITY}
                 } else {allowed};
-                let cutoff = (ground + 1e-6).min(allowed - 1e-10);
+                let cutoff = if context.is_legacy() {(ground + 1e-6).min(allowed - 1e-10)} else {f64::NEG_INFINITY};
                 for &z in zs {
                     let bounds = self.data.height_bounds.get(&(x,y,z)).copied().unwrap_or([
                         z as f32*self.config().voxel_size, (z as f32+1.0)*self.config().voxel_size]);

@@ -747,6 +747,26 @@ trace记录每条原实际评价的from/to、steps、Reference变化及最终poi
 
 这是地面路线来源不再丢失的内部基础，非耗时优化结论。true有新元数据成本；未做CPU/RSS/延时AB，未接真正无锚XY、MLS关联、Scan/worker/停车、wire或实机。公共迁移仍须后续各批闭合。
 
+## 第五十八阶段：MLS内部地面上下文C0-a及连续实测坡修复
+
+接受原五源内部接线：私有bound view持Ground/Unanchored及显式first/变化sample，原公开view仍Legacy。pose、相对projection、完整motion及contact-event同核传递实际cursor，按独立参考在各fine XY选择原生层/成员；成员还需原局部机械接触兼容才豁免。没有默认sample0、额外Observed/TTL/覆盖率许可门、第二碰撞器或新服务。Unknown参考不升级为地面观测，也不凭目标高度生成缺测坡道。
+
+正常whole-body包络可能包含足端接触；Unanchored保留原source-owned机械近似，不把它输出为导航层/深坑/到达证据。Ground分开真实地形矛盾与名义站高偏差，原fine/coarse/recent/禁区实际几何保留。旧public API、绝对body_pose_on_surface及原缓存类型保持。
+
+原35项最终通过后，独立审查发现真实新Ground回归：Observed平面在同fine cell内有合法连续高差，旧离散edge令run=0误拒。固定原parallel_measured_slope_map(.045,false,None)、fine=.05、坡.4<tan25度，x=.01→.02/y=.025；同实际ObservedFine[0,0,1]的h=.101/.099/.097，Legacy端点/投影/motion全Ok，Ground端点Ok但projection/motion为UntraversableSegment，成功期待真实RED。
+
+经单独审批仅修原terrain叶：原选择一次返回height及实际Observed层借用，旧height wrapper只取height；新Ground在samefine、同实际record、实际XY有位移时按原max_slope及原1e-6允许连续坡，放在原连续坡分支、离散step限制之前。不同实际层、同实际XY、非Observed仍原edge，step/drop/tread/diagonal保留。没有input query_state门：carried Unknown标签不否定独立实际坡事实，不升级标签、Unknown投影仍保actualZ。
+
+修后38exact全部PASS、actual-list各1：原25回归+原10新组+实测坡原RED/Unknown标签正控/同fine不同anchor2mm且表观合法坡负控。原RED函数正文不改转绿；C11同XY换层仍严格拒绝。不同anchor负控直接核原terrain叶，未借上游占据早拒冒覆盖。
+
+完整过程78次执行=73PASS+5保留FAIL。前4个FAIL是两组草案oracle前提错误及保留原期待的诊断：C02 partial源删全部measured后，冷Legacy同输入也按旧机械contact接受，故只修Unanchored期待，Ground carried的CoarseFallback/完整source上障碍/recent负控不变；Legacy投影约.4与Unanchored=.425不冒称全等。C11完整入口先原samefine非零换高规则拒terrain/None，并未到occupancy；修改为精确错误优先级，单t占据与独立真实event叶分别核验。独立event在s=.25命中Fine后短路，不冒称完整motion到达event或遍历后续H。第5FAIL是上述真实Observed坡回归，修生产后原期待转绿。原失败、全部固定输入及中间版本均保留，无移点/调预算凑结果。
+
+9轮check：7成功、2测试类型接线失败（E0689 Vec整数类型、E0716临时hull借用）修复后保留日志；7次no-run均成功。全部同一target、MLS lib原release opt3/fatLTO/CGU1/offline/locked/-j4，无全workspace/PCT/Scan/runtime重编。最终真实生产改动发生于Observed坡修正，不能沿用早期“首测后生产未改”的过时描述；另有4行cfgtest segment借用入口。
+
+缓存准确边界：新pose/motion结果旁路，Ground patch旁路，typed estimate旁路；Unanchored patch/support沿旧机械路径，source-only fine bands/complete columns/lower bounds共享。新相对projection不调用旧plane/contact-frame拟合或绝对projections，不能统称这些都被bypass。bind只是snapshot.clone，没有新cache owner，不能直接开旧7/14位cache；C0-b须按实际sample/有方向区间恢复等价复用并验证云端CPU/内存/延时。Legacy性能对照还须包含context引入前4f351d4e，不以新旧不同返回冒充速度收益。
+
+本批是内部正确性基础，尚无PCT/Scan/worker/停车/wire/public接入，不宣称实际导航已换地面合同或Go2问题解决；ARM/Go2未测，不作为云端继续工作的前置。
+
 ## 后续持续检查
 
 1. 墙前晚到路径的实际恢复与初始 full/partial/PCT 顺序，保留及时移动和真实避障

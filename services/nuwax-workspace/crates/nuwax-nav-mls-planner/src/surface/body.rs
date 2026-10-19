@@ -1,5 +1,6 @@
 //! 三维机体凸柱包络、支撑接触与方向性地形约束。
 use super::*;
+use super::body_query::{NativeGroundSource, QuerySample, QuerySegment};
 use std::collections::VecDeque;
 use super::body_witness::{CachedBodyResult, reject, height_rejection};
 #[cfg(feature = "body-query-profile")]
@@ -614,12 +615,22 @@ impl SurfaceSnapshot {
 
     fn fine_ground_values<T:FineGroundValue>(&self,ground:Option<VoxelKey>,polygon:&PolygonQuery,prism:&PrismQuery,
         body:[f64;3],normal:[f64;3],x:i32,y:i32)->Option<Vec<T>> {
+        self.fine_ground_values_in_context(ground,polygon,prism,body,normal,x,y,QuerySample::LegacyNominal)
+    }
+
+    fn fine_ground_columns_in_context(&self,ground:Option<VoxelKey>,polygon:&PolygonQuery,prism:&PrismQuery,
+        body:[f64;3],normal:[f64;3],x:i32,y:i32,sample:QuerySample<'_>)->Option<Vec<FineGroundColumn>> {
+        self.fine_ground_values_in_context(ground,polygon,prism,body,normal,x,y,sample)
+    }
+
+    fn fine_ground_values_in_context<T:FineGroundValue>(&self,ground:Option<VoxelKey>,polygon:&PolygonQuery,prism:&PrismQuery,
+        body:[f64;3],normal:[f64;3],x:i32,y:i32,sample:QuerySample<'_>)->Option<Vec<T>> {
         let observations=self.observations.as_ref()?;
         let model=self.body_envelope()?;
         // Without a source terrain anchor carry the calibrated support height
         // in the gravity frame. Body pitch/roll belongs to the physical prism,
         // and cannot relabel a horizontal ground band as an obstacle.
-        let (body,normal)=if ground.is_none() {
+        let (body,normal)=if ground.is_none() && sample.ground().is_none() {
             ([body[0],body[1],body[2]+model.body_to_support_z_m*(1.0-normal[2])],[0.0,0.0,1.0])
         } else {(body,normal)};
         let fine=f64::from(observations.size_m);let size=f64::from(self.config().voxel_size);
@@ -628,7 +639,7 @@ impl SurfaceSnapshot {
             for iy in (f64::from(y)*size/fine).floor() as i32..(f64::from(y+1)*size/fine).ceil() as i32 {
                 if !polygon.intersects(ix,iy,fine) {continue;}
                 let xy=[ix,iy];
-                let input=match self.select_measured_fine_ground_layer(observations,model,ground,body,normal,xy) {
+                let input=match self.select_measured_fine_ground_layer_in_context(observations,model,ground,body,normal,xy,sample) {
                     Some(record)=>FineGroundInput::Measured(record),
                     None=>{has_legacy=true;FineGroundInput::Legacy(None)},
                 };
@@ -658,11 +669,11 @@ impl SurfaceSnapshot {
             }
         }
         Some(columns.into_iter().map(|(xy,input)|match input {
-            FineGroundInput::Measured(record)=>Self::measured_fine_ground_value::<T>(xy,fine,record),
+            FineGroundInput::Measured(record)=>self.measured_fine_ground_value_in_context::<T>(xy,fine,record,model,polygon,body,normal,sample),
             FineGroundInput::Legacy(bands)=>{
                 let bands=bands.expect("批读已填充");
-                self.select_legacy_fine_ground_value::<T>(observations,model,polygon,prism,
-                    body,normal,xy,Some(bands.as_slice()))
+                self.select_legacy_fine_ground_value_in_context::<T>(observations,model,polygon,prism,
+                    body,normal,xy,Some(bands.as_slice()),sample)
             },
         }).collect())
     }
@@ -672,19 +683,33 @@ impl SurfaceSnapshot {
     fn select_measured_fine_ground_layer<'a>(&self,observations:&'a SurfaceObservations,
         model:&SurfaceBodyEnvelope,ground:Option<VoxelKey>,body:[f64;3],normal:[f64;3],xy:[i32;2])
         ->Option<Option<&'a ObservedGroundLayer>> {
+        self.select_measured_fine_ground_layer_in_context(observations,model,ground,body,normal,xy,QuerySample::LegacyNominal)
+    }
+
+    fn select_measured_fine_ground_layer_in_context<'a>(&self,observations:&'a SurfaceObservations,
+        model:&SurfaceBodyEnvelope,ground:Option<VoxelKey>,body:[f64;3],normal:[f64;3],xy:[i32;2],sample:QuerySample<'_>)
+        ->Option<Option<&'a ObservedGroundLayer>> {
         if self.ground_evidence!=GroundEvidence::MeasuredSurface {return None;}
         let fine=f64::from(observations.size_m);let size=f64::from(self.config().voxel_size);
         let center=xy.map(|v|(f64::from(v)+0.5)*fine);
         let mut records=observations.ground_layers(xy).peekable();
         let any_measured=records.peek().is_some();
+        if let Some(sample)=sample.ground() {
+            if let Some(anchor)=sample.reference_sources.iter().find_map(|source|match source {
+                NativeGroundSource::ObservedFine{anchor} if [anchor[0],anchor[1]]==xy=>Some(*anchor),
+                _=>None,
+            }) {
+                return Some(records.find(|record|record.anchor==anchor));
+            }
+        }
         // The physical anchor constrains membership to its coarse cell.
         // Within that cell retain the layer nearest the calibrated support
         // plane, as in support lookup; never merge the other layer's members.
-        let reference=body[2]-(normal[0]*(center[0]-body[0])
-            +normal[1]*(center[1]-body[1])+model.body_to_support_z_m)/normal[2];
+        let reference=sample.ground().map_or_else(||body[2]-(normal[0]*(center[0]-body[0])
+            +normal[1]*(center[1]-body[1])+model.body_to_support_z_m)/normal[2],|sample|sample.height_at(center));
         let uncertainty=f64::from(self.source_voxel_size_m())+model.support_uncertainty_m;
         let record=records.filter(|record| {
-            if let Some(ground)=ground {
+            if let Some(ground)=ground.filter(|_|sample.ground().is_none()) {
                 record.members.iter().any(|&z|(((f64::from(z)+0.5)*fine)/size).floor() as i32==ground.2)
             } else {
                 record.height_at(center).is_some_and(|height|
@@ -711,6 +736,27 @@ impl SurfaceSnapshot {
         T::from_parts(xy,None,FineContacts::default())
     }
 
+    fn measured_fine_ground_value_in_context<T:FineGroundValue>(&self,xy:[i32;2],fine:f64,
+        record:Option<&ObservedGroundLayer>,model:&SurfaceBodyEnvelope,polygon:&PolygonQuery,
+        body:[f64;3],normal:[f64;3],sample:QuerySample<'_>)->T {
+        if sample.is_legacy() {return Self::measured_fine_ground_value(xy,fine,record);}
+        let Some(record)=record else {return T::from_parts(xy,None,FineContacts::default());};
+        let height=record.height_at(xy.map(|v|(f64::from(v)+0.5)*fine));
+        let uncertainty=f64::from(self.source_voxel_size_m())+model.support_uncertainty_m;
+        let contact=model.max_step_up_m.max(model.max_step_down_m)+uncertainty;
+        let mut contacts=FineContacts::default();
+        if T::CONTACTS {for &z in &record.members {
+            let top=f64::from(z+1)*fine;
+            let plane=polygon.contact_plane(body,normal,xy[0],xy[1],fine,top,
+                (-model.body_to_support_z_m/normal[2]+contact+1e-6).min(uncertainty));
+            if height_rejection(plane+model.z_bounds_m[0]/normal[2],
+                plane-model.body_to_support_z_m/normal[2],plane,contact,top,uncertainty).is_some() {continue;}
+            if let Some(last)=contacts.last_mut().filter(|last|last[1].checked_add(1)==Some(z)) {last[1]=z;}
+            else {contacts.push([z,z]);}
+        }}
+        T::from_parts(xy,height,contacts)
+    }
+
     /// One source-owned fine column, shared by batched body checks and live guide hints.
     /// Measured layers return before any compatibility-band cache access.
     fn select_fine_ground_value<T:FineGroundValue>(&self,observations:&SurfaceObservations,
@@ -732,6 +778,12 @@ impl SurfaceSnapshot {
     fn select_legacy_fine_ground_value<T:FineGroundValue>(&self,observations:&SurfaceObservations,
         model:&SurfaceBodyEnvelope,polygon:&PolygonQuery,prism:&PrismQuery,
         body:[f64;3],normal:[f64;3],xy:[i32;2],bands:Option<&[FineContactBand]>)->T {
+        self.select_legacy_fine_ground_value_in_context(observations,model,polygon,prism,body,normal,xy,bands,QuerySample::LegacyNominal)
+    }
+
+    fn select_legacy_fine_ground_value_in_context<T:FineGroundValue>(&self,observations:&SurfaceObservations,
+        model:&SurfaceBodyEnvelope,polygon:&PolygonQuery,prism:&PrismQuery,
+        body:[f64;3],normal:[f64;3],xy:[i32;2],bands:Option<&[FineContactBand]>,sample:QuerySample<'_>)->T {
         let fine=f64::from(observations.size_m);
         let contact=model.max_step_up_m.max(model.max_step_down_m)+f64::from(self.source_voxel_size_m())+model.support_uncertainty_m;
         let support_offset=model.body_to_support_z_m/normal[2];
@@ -753,7 +805,7 @@ impl SurfaceSnapshot {
         let upper=upper_plane-support_offset;
         let nominal_upper=lower+contact+1e-6;
         let contact_plane=|top:f64|if top<=rectangular_plane+allowance {rectangular_plane}else{clipped_plane};
-        let reference=(lower+upper)*0.5;
+        let reference=sample.ground().map_or((lower+upper)*0.5,|sample|sample.height_at(xy.map(|v|(f64::from(v)+0.5)*fine)));
         let distance=|b:[f64;2]|(b[0]-reference).max(reference-b[1]).max(0.0);
         // Batched body checks pass their existing prefetched bands. A single
         // guide column loads only its own legacy band, after the measured fast path.
@@ -762,15 +814,20 @@ impl SurfaceSnapshot {
             Some(bands)=>bands,
             None=>{cached=self.fine_contact_bands(xy[0],xy[1]);cached.as_slice()},
         };
-        let band=bands.iter().min_by(|a,b|distance(a.fit).total_cmp(&distance(b.fit))
+        let explicit=sample.ground().and_then(|sample|sample.reference_sources.iter().find_map(|source|match source {
+            NativeGroundSource::LegacyFineRun{xy:source_xy,first,last} if *source_xy==xy=>Some([*first,*last]),
+            _=>None,
+        }));
+        let band=bands.iter().filter(|band|explicit.is_none_or(|run|run==band.run)).min_by(|a,b|distance(a.fit).total_cmp(&distance(b.fit))
             .then_with(||(a.fit[1]-reference).abs().total_cmp(&(b.fit[1]-reference).abs()))
             .then_with(||a.fit[1].total_cmp(&b.fit[1])));
         // Associate the original fit interval with the existing actual-overlap
         // nominal window. Intersection is a predicate, never a truncated band.
-        let band=band.filter(|candidate|
-            candidate.fit[0].max(upper-contact-1e-6)
-                <= candidate.fit[1].min(nominal_upper));
+        let band=band.filter(|candidate|if sample.ground().is_some() {
+            candidate.fit[0].max(reference-contact-1e-6)<=candidate.fit[1].min(reference+contact+1e-6)
+        } else {candidate.fit[0].max(upper-contact-1e-6)<=candidate.fit[1].min(nominal_upper)});
         let height=band.and_then(|band| {
+            if sample.ground().is_some() {return Some(band.fit[1]);}
             // OccupiedVolume still selects only the collapsed fit top here.
             let first=(band.fit[0]/fine-1.0).round() as i32;
             let last=band.run[1];
@@ -803,6 +860,7 @@ impl SurfaceSnapshot {
                     }
                     continue;
                 }
+                if sample.ground().is_some() {continue;}
                 // An extra band is not a new support anchor. Its complete exposed
                 // top must fit the existing nominal-support travel at this overlap;
                 // rigid-body bottom height must not enlarge that travel.
@@ -920,12 +978,17 @@ impl SurfaceSnapshot {
 
     fn ground_patch_at_height(&self,centre:SurfaceLocation,radius:f64,height:f64)
         -> Arc<AHashMap<(i32,i32),VoxelKey>> {
+        self.ground_patch_in_context(centre,radius,height,QuerySample::LegacyNominal)
+    }
+
+    fn ground_patch_in_context(&self,centre:SurfaceLocation,radius:f64,height:f64,sample:QuerySample<'_>)
+        -> Arc<AHashMap<(i32,i32),VoxelKey>> {
         let key = (centre.cell, radius.to_bits(), height.to_bits());
         // 实测平面属于观察快照，地形占据不变时其高度仍可能改变。
         // 这类邻域随现有查询缓存退休；无实测层的邻域仍共享物理图缓存。
         let measured = self.ground_evidence == GroundEvidence::MeasuredSurface
             && self.observations.as_ref().is_some_and(|s|s.has_measured_ground_layers());
-        let cached = if measured {
+        let cached = if sample.ground().is_some() {None} else if measured {
             self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner())
                 .measured_ground_patches.get(&key).cloned()
         } else {
@@ -936,12 +999,14 @@ impl SurfaceSnapshot {
         // Extrapolation only selects an existing layer in each neighbour; it
         // never creates observed members or changes the actual step-height test.
         let center = self.cell_position(centre.cell);
-        let reference_plane = self.measured_ground_layer_near(centre.cell,
-            [center[0], center[1]], Some(height));
-        let reference_at = |cell| reference_plane.and_then(|plane| {
+        let reference_plane = if sample.ground().is_none() {self.measured_ground_layer_near(centre.cell,
+            [center[0], center[1]], Some(height))} else {None};
+        let reference_at = |cell| if let Some(sample)=sample.ground() {
+            let point=self.cell_position(cell);sample.height_at([point[0],point[1]])
+        } else {reference_plane.and_then(|plane| {
             let point = self.cell_position(cell);
             plane.height_at([point[0],point[1]])
-        }).unwrap_or(height);
+        }).unwrap_or(height)};
         let graph = &self.data.physical_graph;
         let Some(start) = graph.cells.id(centre.cell) else {
             return Arc::new(AHashMap::new());
@@ -978,6 +1043,7 @@ impl SurfaceSnapshot {
             }
         }
         let patch = Arc::new(patch);
+        if sample.ground().is_some() {return patch;}
         if measured {
             let mut owner = self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner());
             let cache = &mut owner.measured_ground_patches;
@@ -1033,6 +1099,11 @@ impl SurfaceSnapshot {
     /// 粗列被未相交的墙半列覆盖时，仅从实际相交细列读取真实暴露地面。
     fn fine_footprint_ground(&self,query:&PolygonQuery,body:[f64;3],normal:[f64;3],x:i32,y:i32)
         -> Option<(VoxelKey,f64)> {
+        self.fine_footprint_ground_in_context(query,body,normal,x,y,QuerySample::LegacyNominal)
+    }
+
+    fn fine_footprint_ground_in_context(&self,query:&PolygonQuery,body:[f64;3],normal:[f64;3],x:i32,y:i32,
+        sample:QuerySample<'_>)->Option<(VoxelKey,f64)> {
         let observations=self.observations.as_ref()?;let model=self.body_envelope()?;
         if observations.size_m>=self.config().voxel_size {return None;}
         let size=f64::from(self.config().voxel_size);let fine=f64::from(observations.size_m);
@@ -1048,6 +1119,9 @@ impl SurfaceSnapshot {
                 let lower=query.contact_plane(body,normal,ix,iy,fine,f64::INFINITY,0.0)-model.body_to_support_z_m/normal[2];
                 let upper=-query.contact_plane([body[0],body[1],-body[2]],[-normal[0],-normal[1],normal[2]],
                     ix,iy,fine,f64::INFINITY,0.0)-model.body_to_support_z_m/normal[2];
+                let (lower,upper)=sample.ground().map_or((lower,upper),|sample| {
+                    let h=sample.height_at([ix,iy].map(|v|(f64::from(v)+0.5)*fine));(h,h)
+                });
                 let low=upper-reach;let high=lower+reach;let reference=(lower+upper)*0.5;
                 let mut best:Option<(f64,VoxelKey,f64)>=None;
                 let first=((low-1e-6)/fine).ceil() as i32-1;
@@ -1074,6 +1148,12 @@ impl SurfaceSnapshot {
     fn refine_footprint_support(&self,patch:Arc<AHashMap<(i32,i32),VoxelKey>>,query:&PolygonQuery,
         prism:&PrismQuery,body:[f64;3],r:[[f64;3];3],bounds:([i32;2],[i32;2]))
         -> (Arc<AHashMap<(i32,i32),VoxelKey>>,AHashMap<(i32,i32),f64>) {
+        self.refine_footprint_support_in_context(patch,query,prism,body,r,bounds,QuerySample::LegacyNominal)
+    }
+
+    fn refine_footprint_support_in_context(&self,patch:Arc<AHashMap<(i32,i32),VoxelKey>>,query:&PolygonQuery,
+        prism:&PrismQuery,body:[f64;3],r:[[f64;3];3],bounds:([i32;2],[i32;2]),sample:QuerySample<'_>)
+        -> (Arc<AHashMap<(i32,i32),VoxelKey>>,AHashMap<(i32,i32),f64>) {
         let mut precise=AHashMap::new();
         let Some(model)=self.body_envelope() else {return (patch,precise);};
         if self.observations.as_ref().is_none_or(|o|o.size_m>=self.config().voxel_size) {return (patch,precise);}
@@ -1082,7 +1162,7 @@ impl SurfaceSnapshot {
         let mut pending=Vec::new();
         for x in bounds.0[0]..=bounds.1[0] {for y in bounds.0[1]..=bounds.1[1] {
             if patch.contains_key(&(x,y)) || !query.intersects(x,y,size) {continue;}
-            if let Some((cell,height))=self.fine_footprint_ground(query,body,r[2],x,y) {pending.push((cell,height));}
+            if let Some((cell,height))=self.fine_footprint_ground_in_context(query,body,r[2],x,y,sample) {pending.push((cell,height));}
         }}
         if pending.is_empty() {return (patch,precise);}
         let mut extended=None;let mut known_heights=AHashMap::new();
@@ -1100,7 +1180,11 @@ impl SurfaceSnapshot {
                         else {
                             let plane=query.contact_plane(body,r[2],key.0,key.1,size,self.ground_cell_position(neighbor)[2],
                                 -model.body_to_support_z_m/r[2][2]+contact+1e-6);
-                            let height=if let Some(height)=self.fine_ground_height(neighbor,query,prism,body,r[2],key.0,key.1) {height}
+                            let height=if let Some(rows)=self.fine_ground_values_in_context::<FineGroundHeight>(
+                                Some(neighbor),query,prism,body,r[2],key.0,key.1,sample) {
+                                rows.into_iter().filter_map(|row|row.0).max_by(f64::total_cmp)
+                                    .unwrap_or_else(||self.ground_cell_position(neighbor)[2])
+                            }
                                 else {
                                     let Ok(height)=self.footprint_ground_height(neighbor,query,prism,
                                         plane-model.body_to_support_z_m/r[2][2],contact,None) else {continue;};
@@ -1223,6 +1307,19 @@ impl SurfaceSnapshot {
     }
 
     fn check_body_pose(&self,body:[f64;3],quaternion:[f64;4],slot:&mut Option<BodyRejection>)->Result<(),SurfaceError> {
+        self.check_body_pose_in_context(body,quaternion,QuerySample::LegacyNominal,slot)
+    }
+
+    pub(in crate::surface) fn validate_body_pose_in_context(&self,body:[f64;3],quaternion:[f64;4],
+        sample:QuerySample<'_>,slot:&mut Option<BodyFailureWitness>)->Result<(),SurfaceError> {
+        if sample.is_legacy() {return self.validate_body_pose_with_witness(body,quaternion,slot);}
+        let mut rejection=None;
+        let result=self.check_body_pose_in_context(body,quaternion,sample,&mut rejection);
+        *slot=rejection.map(|rejection|BodyFailureWitness{pose:(body,quaternion),rejection});result
+    }
+
+    fn check_body_pose_in_context(&self,body:[f64;3],quaternion:[f64;4],sample:QuerySample<'_>,
+        slot:&mut Option<BodyRejection>)->Result<(),SurfaceError> {
         *slot=None;
         // Declared before all kernel locals so normal/error cleanup stays inside T.
         #[cfg(feature = "body-query-profile")]
@@ -1241,7 +1338,11 @@ impl SurfaceSnapshot {
         if r[2][2]<=0.0 {return Err(SurfaceError::InvalidPose);}
         // Ground is useful for contact interpretation, not a second permission to
         // execute geometry checking. Missing samples are not occupied obstacles.
-        let centre=match self.locate_support_from_body(body,quaternion,model.body_to_support_z_m) {
+        let located=if let Some(sample)=sample.ground() {
+            if !body.into_iter().all(f64::is_finite) {return Err(SurfaceError::InvalidPose);}
+            self.locate_support([body[0],body[1],sample.height_at([body[0],body[1]])])
+        } else {self.locate_support_from_body(body,quaternion,model.body_to_support_z_m)};
+        let centre=match located {
             Ok(value)=>Some(value),Err(SurfaceError::MissingSupport)=>None,Err(error)=>return Err(error),
         };
         let vertices: Vec<_> = model
@@ -1277,8 +1378,9 @@ impl SurfaceSnapshot {
         // 向上对齐体素以复用同一格的邻域，并保留两格接触连接余量。
         let radius = ((vertices.iter().map(|p|(p[0]-centre.map_or(body[0],|c|c.surface_xyz[0])).hypot(p[1]-centre.map_or(body[1],|c|c.surface_xyz[1])))
             .fold(0.0,f64::max)+size*2.0)/size).ceil()*size;
-        let patch=centre.map_or_else(||Arc::new(AHashMap::new()),|centre|self.ground_patch(centre,radius));
-        let (patch,precise_ground)=self.refine_footprint_support(patch,&polygon_query,&prism_query,body,r,([x0,y0],[x1,y1]));
+        let patch=centre.map_or_else(||Arc::new(AHashMap::new()),|centre|self.ground_patch_in_context(centre,radius,
+            sample.ground().map_or(centre.surface_xyz[2],|s|s.height_at([body[0],body[1]])),sample));
+        let (patch,precise_ground)=self.refine_footprint_support_in_context(patch,&polygon_query,&prism_query,body,r,([x0,y0],[x1,y1]),sample);
         #[cfg(feature = "body-query-profile")]
         drop(pose_prelude_profile);
         if let Some(recent)=&self.recent_obstacles {
@@ -1302,8 +1404,8 @@ impl SurfaceSnapshot {
                             let cy=(((f64::from(y)+0.5)*fine)/coarse).floor() as i32;
                             let ground=patch.get(&(cx,cy)).copied();
                             if selected_column!=Some((cx,cy)) {
-                                selected_rows=self.fine_ground_values::<FineGroundHeightRow>(
-                                    ground,&polygon_query,&prism_query,body,r[2],cx,cy);
+                                selected_rows=self.fine_ground_values_in_context::<FineGroundHeightRow>(
+                                    ground,&polygon_query,&prism_query,body,r[2],cx,cy,sample);
                                 selected_column=Some((cx,cy));
                             }
                             let height=if let Some(rows)=&selected_rows {rows.iter().find(|row|row.xy==[x,y]).and_then(|row|row.height)}
@@ -1324,7 +1426,7 @@ impl SurfaceSnapshot {
                 }
             }
         }
-        self.check_fine_column_fringe(body,r,&polygon_query,&prism_query,&patch,min,max,([x0,y0],[x1,y1]),slot)?;
+        self.check_fine_column_fringe_in_context(body,r,&polygon_query,&prism_query,&patch,min,max,([x0,y0],[x1,y1]),sample,slot)?;
         let uncertainty = f64::from(self.source_voxel_size_m()) + model.support_uncertainty_m;
         let mut ground_points = Vec::new();
         // One guard for the entire loop, never a clock/TLS update per XY or Z.
@@ -1342,7 +1444,7 @@ impl SurfaceSnapshot {
                     // It still receives the exact same actual-volume collision pass.
                     if self.data.virtual_obstacles.as_ref().is_some_and(|mask|
                         !mask.permits_cell((x,y,0),size,0.0)) {return Err(SurfaceError::VirtualObstacle);}
-                    self.check_unassigned_body_column(body,r,&polygon_query,&prism_query,x,y,slot)?;
+                    self.check_unassigned_body_column_in_context(body,r,&polygon_query,&prism_query,x,y,sample,slot)?;
                     continue;
                 };
                 #[cfg(feature = "body-query-profile")]
@@ -1375,15 +1477,18 @@ impl SurfaceSnapshot {
                     // Same ordered height selection/reduction, without unused contact membership.
                     // Some(all-missing rows) still falls back inside fine_ground_height;
                     // only a genuine None permits the original precise-ground precedence.
-                    let ground_height=if let Some(height)=self.fine_ground_height(
-                        ground,&polygon_query,&prism_query,body,r[2],x,y) {height}
+                    let ground_height=if let Some(rows)=self.fine_ground_values_in_context::<FineGroundHeight>(
+                        Some(ground),&polygon_query,&prism_query,body,r[2],x,y,sample) {
+                            rows.into_iter().filter_map(|row|row.0).max_by(f64::total_cmp)
+                                .unwrap_or_else(||self.ground_cell_position(ground)[2])
+                        }
                         else if precise_ground.contains_key(&(x,y)) {precise_ground[&(x,y)]}
                         else {self.footprint_ground_height(
                             ground,&polygon_query,&prism_query,support_plane,contact,None)?};
                     ground_points.push([px,py,ground_height]);
                     continue;
                 }
-                let selected=self.fine_ground_columns(Some(ground),&polygon_query,&prism_query,body,r[2],x,y);
+                let selected=self.fine_ground_columns_in_context(Some(ground),&polygon_query,&prism_query,body,r[2],x,y,sample);
                 let ground_height = if selected.is_none() && precise_ground.contains_key(&(x,y)) {precise_ground[&(x,y)]} else {
                     self.footprint_ground_height(ground,&polygon_query,&prism_query,support_plane,contact,selected.as_deref())?
                 };
@@ -1483,7 +1588,8 @@ impl SurfaceSnapshot {
         }
         #[cfg(feature = "body-query-profile")]
         drop(pose_columns_profile);
-        if let Some((a, b, _)) = fit_plane(&ground_points, centre.map_or(body,|c|c.support_xyz)) {
+        if let Some((a, b, _)) = (!matches!(sample,QuerySample::Unanchored))
+            .then(||fit_plane(&ground_points, centre.map_or(body,|c|c.support_xyz))).flatten() {
             let yaw = r[0][1].atan2(r[0][0]);
             let cross_slope = (-a * yaw.sin() + b * yaw.cos()).abs().atan().to_degrees();
             if cross_slope > model.max_cross_slope_deg + 1e-5 {
@@ -1494,7 +1600,16 @@ impl SurfaceSnapshot {
         // Known terrain contradictions (including a measured drop) remain a
         // safety constraint. Absence of a layer returns Unknown and grants no
         // fabricated observation, but it is not a rejection.
-        if self.body_ground_relation(body,quaternion)? == BodyGroundRelation::KnownIncompatible {
+        let incompatible=if sample.is_legacy() {
+            self.body_ground_relation(body,quaternion)? == BodyGroundRelation::KnownIncompatible
+        } else if let Some(sample)=sample.ground() {
+            let reference=sample.height_at([body[0],body[1]]);
+            self.known_terrain_height([body[0],body[1]],reference).is_some_and(|height| {
+                let rounding=f64::from(self.source_voxel_size_m())+model.support_uncertainty_m+1e-6;
+                height-reference>model.max_step_up_m+rounding || reference-height>model.max_step_down_m+rounding
+            })
+        } else {false};
+        if incompatible {
             return Err(SurfaceError::UntraversableSegment);
         }
         Ok(())
@@ -1502,10 +1617,15 @@ impl SurfaceSnapshot {
 
     fn check_unassigned_body_column(&self,body:[f64;3],r:[[f64;3];3],polygon:&PolygonQuery,
         prism:&PrismQuery,x:i32,y:i32,slot:&mut Option<BodyRejection>)->Result<(),SurfaceError> {
+        self.check_unassigned_body_column_in_context(body,r,polygon,prism,x,y,QuerySample::LegacyNominal,slot)
+    }
+
+    fn check_unassigned_body_column_in_context(&self,body:[f64;3],r:[[f64;3];3],polygon:&PolygonQuery,
+        prism:&PrismQuery,x:i32,y:i32,sample:QuerySample<'_>,slot:&mut Option<BodyRejection>)->Result<(),SurfaceError> {
         let size=f64::from(self.config().voxel_size);
         if let Some(observations)=&self.observations {
             let fine=f64::from(observations.size_m);
-            let selected=self.fine_ground_columns(None,polygon,prism,body,r[2],x,y);
+            let selected=self.fine_ground_columns_in_context(None,polygon,prism,body,r[2],x,y,sample);
             let mut covered=std::collections::BTreeSet::new();
             for ix in (f64::from(x)*size/fine).floor() as i32..(f64::from(x+1)*size/fine).ceil() as i32 {
                 for iy in (f64::from(y)*size/fine).floor() as i32..(f64::from(y+1)*size/fine).ceil() as i32 {
@@ -1543,7 +1663,7 @@ impl SurfaceSnapshot {
             }
         } else {
             let model=self.body_envelope().ok_or(SurfaceError::InvalidPose)?;
-            let reference=body[2]-model.body_to_support_z_m*r[2][2];
+            let reference=sample.ground().map_or(body[2]-model.body_to_support_z_m*r[2][2],|s|s.height_at([(f64::from(x)+0.5)*size,(f64::from(y)+0.5)*size]));
             let uncertainty=f64::from(self.source_voxel_size_m())+model.support_uncertainty_m;
             let ground=self.data.physical_graph.surface_lookup.get(&(x,y)).into_iter().flatten()
                 .map(|&z|self.ground_cell_position((x,y,z))[2])
@@ -1553,7 +1673,9 @@ impl SurfaceSnapshot {
             for &z in self.data.occupied_columns.get(&(x,y)).into_iter().flatten() {
                 let bounds=self.data.height_bounds.get(&(x,y,z)).map_or(
                     [f64::from(z)*size,(f64::from(z)+1.0)*size],|b|b.map(f64::from));
-                if ground.is_some_and(|height|bounds[1]<=height+1e-6) {continue;}
+                if ground.is_some_and(|height|bounds[1]<=height+1e-6 && (sample.is_legacy()
+                    || height_rejection(body[2]+model.z_bounds_m[0]/r[2][2],body[2]-model.body_to_support_z_m/r[2][2],
+                        body[2],model.max_step_up_m.max(model.max_step_down_m)+uncertainty,height,uncertainty).is_none())) {continue;}
                 if prism.intersects([f64::from(x)*size,f64::from(y)*size,bounds[0]],
                     [(f64::from(x)+1.0)*size,(f64::from(y)+1.0)*size,bounds[1]]) {
                     return Err(reject(slot,BodyRejection::Occupancy{cell:[x,y,z],source:OccupancySource::CoarseFallback,
@@ -1568,6 +1690,12 @@ impl SurfaceSnapshot {
     /// 只补查中心归属在粗包围框外、实际体积却与机体相交的已知细体素。
     fn check_fine_column_fringe(&self,body:[f64;3],r:[[f64;3];3],polygon:&PolygonQuery,prism:&PrismQuery,
         patch:&AHashMap<(i32,i32),VoxelKey>,min:[f64;3],max:[f64;3],bounds:([i32;2],[i32;2]),slot:&mut Option<BodyRejection>)
+        ->Result<(),SurfaceError> {
+        self.check_fine_column_fringe_in_context(body,r,polygon,prism,patch,min,max,bounds,QuerySample::LegacyNominal,slot)
+    }
+
+    fn check_fine_column_fringe_in_context(&self,body:[f64;3],r:[[f64;3];3],polygon:&PolygonQuery,prism:&PrismQuery,
+        patch:&AHashMap<(i32,i32),VoxelKey>,min:[f64;3],max:[f64;3],bounds:([i32;2],[i32;2]),sample:QuerySample<'_>,slot:&mut Option<BodyRejection>)
         ->Result<(),SurfaceError> {
         let Some(observations)=self.observations.as_ref() else {return Ok(());};
         let model=self.body_envelope().ok_or(SurfaceError::InvalidPose)?;
@@ -1596,7 +1724,7 @@ impl SurfaceSnapshot {
                 let begin=levels.partition_point(|&iz|iz<first);
                 if levels.get(begin).is_none_or(|&iz|iz>last) {continue;}
                 if selected_column!=Some((x,y)) {
-                    selected_rows=self.fine_ground_columns(patch.get(&(x,y)).copied(),polygon,prism,body,r[2],x,y);
+                    selected_rows=self.fine_ground_columns_in_context(patch.get(&(x,y)).copied(),polygon,prism,body,r[2],x,y,sample);
                     selected_column=Some((x,y));
                 }
                 let column=selected_rows.as_ref().and_then(|rows|rows.iter().find(|c|c.xy==[ix,iy]));
@@ -1606,7 +1734,7 @@ impl SurfaceSnapshot {
                     let plane=polygon.contact_plane(body,r[2],x,y,size,self.ground_cell_position(cell)[2],
                         -model.body_to_support_z_m/r[2][2]+contact+1e-6);
                     Some(self.footprint_ground_height(cell,polygon,prism,plane-model.body_to_support_z_m/r[2][2],contact,None)?)
-                } else {self.fine_footprint_ground(polygon,body,r[2],x,y).map(|(_,height)|height)};
+                } else {self.fine_footprint_ground_in_context(polygon,body,r[2],x,y,sample).map(|(_,height)|height)};
                 for &iz in levels.iter().skip(begin).take_while(|&&iz|iz<=last) {
                     let key=[ix,iy,iz];
                     let contact=if selected_rows.is_some() {column.is_some_and(|c|c.permits_contact(iz))}
@@ -1656,6 +1784,11 @@ impl SurfaceSnapshot {
     /// Preserve the actual rejected projected pose without replaying its geometry.
     pub fn body_pose_after_motion_with_witness(&self,from:([f64;3],[f64;4]),xy:[f64;2],yaw:f64,
         slot:&mut Option<BodyFailureWitness>)->Result<([f64;3],[f64;4]),SurfaceError> {
+        self.body_pose_after_motion_in_context(from,xy,yaw,QuerySegment::LEGACY,slot)
+    }
+
+    pub(in crate::surface) fn body_pose_after_motion_in_context(&self,from:([f64;3],[f64;4]),xy:[f64;2],yaw:f64,
+        context:QuerySegment<'_>,slot:&mut Option<BodyFailureWitness>)->Result<([f64;3],[f64;4]),SurfaceError> {
         *slot=None;
         #[cfg(feature = "body-query-profile")]
         let _motion_profile = query_profile::guard(QueryStage::MotionTotal);
@@ -1668,14 +1801,15 @@ impl SurfaceSnapshot {
         let current_yaw = actual_rotation[0][1].atan2(actual_rotation[0][0]);
         let yaw_delta = (yaw-current_yaw+std::f64::consts::PI).rem_euclid(std::f64::consts::TAU)
             - std::f64::consts::PI;
-        if xy == [from.0[0],from.0[1]] && yaw_delta.abs() < 1e-12 {
+        if xy == [from.0[0],from.0[1]] && yaw_delta.abs() < 1e-12 && context.constant() {
             #[cfg(feature = "body-query-profile")]
             let validation_profile = query_profile::guard(QueryStage::FinalBodyValidation);
-            self.validate_body_pose_with_witness(from.0,from.1,slot)?;
+            self.validate_body_pose_in_context(from.0,from.1,context.at(0.0),slot)?;
             #[cfg(feature = "body-query-profile")]
             drop(validation_profile);
             return Ok(from);
         }
+        let (base_height,base_attitude,next_height,next_attitude)=if context.is_legacy() {
         #[cfg(feature = "body-query-profile")]
         let current_support_profile = query_profile::guard(QueryStage::CurrentSupportLookup);
         match self.locate_support_from_body(from.0,from.1,model.body_to_support_z_m) {
@@ -1718,6 +1852,22 @@ impl SurfaceSnapshot {
             Ok(frame)=>frame,Err(SurfaceError::MissingSupport)=>return self.estimated_body_motion(from,xy,yaw,slot),
             Err(error)=>return Err(error),
         };
+            (base_height,base_attitude,next_height,next_attitude)
+        } else {
+            if actual_rotation[2][2]<=0.0 {return Err(SurfaceError::InvalidPose);}
+            let frame=|normal:Option<[f64;3]>,yaw:f64| {
+                let normal=normal.unwrap_or([0.0,0.0,1.0]);
+                let forward=normalize([yaw.cos(),yaw.sin(),
+                    -(normal[0]*yaw.cos()+normal[1]*yaw.sin())/normal[2]]);
+                quaternion_from_columns([forward,cross(normal,forward),normal])
+            };
+            let (height,normal)=context.at(0.0).ground().map_or((from.0[2],None),|sample|
+                (sample.height_at([from.0[0],from.0[1]]),sample.reference_normal));
+            let (next_height,next_normal)=context.at(1.0).ground()
+                .filter(|sample|sample.query_state!=GroundQueryState::Unknown)
+                .map_or((height,normal),|sample|(sample.height_at(xy),sample.reference_normal.or(normal)));
+            (height,frame(normal,current_yaw),next_height,frame(next_normal,yaw))
+        };
         let base_rotation=rotation(base_attitude)?;
         let next_rotation=rotation(next_attitude)?;
         // 同一真实接触拟合场同时给出高度和法向，前足进入高地面时即可连续适应。
@@ -1750,7 +1900,9 @@ impl SurfaceSnapshot {
         let after_contact=plane_at_offset(next_rotation,offset)-offset[2];
         let height_delta=centre_height_delta+(after_contact-before_contact);
         // 只改变朝向时没有地面平移，实际机体中心不应因标定偏移自行升降。
-        let body_z=if xy==[from.0[0],from.0[1]] {from.0[2]} else {from.0[2]+height_delta};
+        let carry_height=!context.is_legacy() && context.at(1.0).ground()
+            .is_none_or(|sample|sample.query_state==GroundQueryState::Unknown);
+        let body_z=if xy==[from.0[0],from.0[1]] || carry_height {from.0[2]} else {from.0[2]+height_delta};
         // Observed terrain provides the response, never a second connected-floor
         // admission. The actual swept body still checks known terrain, occupancy,
         // recent returns and forbidden geometry between the two poses.
@@ -1760,9 +1912,9 @@ impl SurfaceSnapshot {
         {
             #[cfg(feature = "body-query-profile")]
             let _profile = query_profile::guard(QueryStage::ProjectedKnownTerrain);
-            self.validate_known_terrain_motion(from,(body,q))?;
+            self.validate_known_terrain_motion_in_context(from,(body,q),context)?;
         }
-        self.validate_body_pose_with_witness(body,q,slot)?;
+        self.validate_body_pose_in_context(body,q,context.at(1.0),slot)?;
         #[cfg(feature = "body-query-profile")]
         drop(validation_profile);
         Ok((body,q))
@@ -2187,6 +2339,24 @@ impl SurfaceSnapshot {
             model.support_uncertainty_m)
     }
 
+    fn validate_known_terrain_motion_in_context(&self,from:([f64;3],[f64;4]),to:([f64;3],[f64;4]),
+        context:QuerySegment<'_>)->Result<(),SurfaceError> {
+        if context.is_legacy() {return self.validate_known_terrain_motion(from,to);}
+        if matches!(context.at(0.0),QuerySample::Unanchored) {return Ok(());}
+        let model=self.body_envelope().ok_or(SurfaceError::InvalidPose)?;
+        let size=f64::from(self.observations.as_ref().map_or(self.config().voxel_size,|o|o.size_m));
+        let mut fractions=translation::reference_grid_fractions([from.0[0],from.0[1],0.0],
+            [to.0[0],to.0[1],0.0],size)?;
+        context.append_changes(&mut fractions);fractions.sort_by(f64::total_cmp);fractions.dedup();
+        let samples=fractions.into_iter().map(|t| {
+            let xy=[from.0[0]+(to.0[0]-from.0[0])*t,from.0[1]+(to.0[1]-from.0[1])*t];
+            let sample=context.at(t).ground().expect("bound Ground segment");
+            [xy[0],xy[1],sample.height_at(xy)]
+        });
+        self.validate_known_reference_samples_in_context(samples,size,model.max_step_up_m,model.max_step_down_m,
+            model.support_uncertainty_m,true)
+    }
+
     /// Check only known step, drop, slope and tread contradictions along a
     /// calibrated support-reference segment. Missing columns remain unknown.
     /// This does not check body volume, recent returns or forbidden geometry.
@@ -2204,6 +2374,11 @@ impl SurfaceSnapshot {
 
     fn validate_known_reference_samples(&self,samples:impl IntoIterator<Item=[f64;3]>,size:f64,
         step_up:f64,step_down:f64,uncertainty:f64)->Result<(),SurfaceError> {
+        self.validate_known_reference_samples_in_context(samples,size,step_up,step_down,uncertainty,false)
+    }
+
+    fn validate_known_reference_samples_in_context(&self,samples:impl IntoIterator<Item=[f64;3]>,size:f64,
+        step_up:f64,step_down:f64,uncertainty:f64,ground_context:bool)->Result<(),SurfaceError> {
         let depth=(f64::from(self.config().min_step_tread_depth_m)/size-1e-6).ceil().max(1.0) as usize;
         let sample=|xy:[i32;2],reference:f64|self.known_terrain_transition_top(
             xy.map(|v|(f64::from(v)+0.5)*size),reference);
@@ -2213,12 +2388,20 @@ impl SurfaceSnapshot {
                 sample(point,height).is_none_or(|z|(z-height).abs()<=1e-6)
             })
         };
-        let edge=|a:([i32;2],f64),b:([i32;2],f64)| {
+        let edge=|a:([i32;2],f64),b:([i32;2],f64),continuous_run:Option<f64>| {
             let rise=b.1-a.1;
             if rise.abs()<=1e-6 {return true;}
             let dx=b.0[0]-a.0[0];let dy=b.0[1]-a.0[1];
             let run=f64::from(dx).hypot(f64::from(dy))*size;
             if run>0.0 && rise.abs()<=run*f64::from(self.config().max_slope_deg).to_radians().tan()+1e-6 {
+                return true;
+            }
+            // Only the bound Ground caller can supply a same-record measured
+            // run. A real subcell slope precedes discrete step limits just as
+            // the original nonzero-cell slope above; stationary layer changes
+            // and every legacy/unknown source retain the original edge rules.
+            if dx==0 && dy==0 && continuous_run.is_some_and(|run|run>0.0
+                && rise.abs()<=run*f64::from(self.config().max_slope_deg).to_radians().tan()+1e-6) {
                 return true;
             }
             let limit=if rise>0.0 {step_up}else{step_down};
@@ -2228,26 +2411,33 @@ impl SurfaceSnapshot {
             let direction=[dx.signum(),dy.signum()];
             tread(a.0,a.1,[-direction[0],-direction[1]]) && tread(b.0,b.1,direction)
         };
-        let mut previous=None;
+        let mut previous:Option<(([i32;2],f64),[f64;2],Option<&ObservedGroundLayer>)>=None;
         for support in samples {
+            let actual_xy=[support[0],support[1]];
             let xy=[(support[0]/size).floor() as i32,(support[1]/size).floor() as i32];
-            let Some(height)=self.known_terrain_transition_top([support[0],support[1]],support[2]) else {
+            let Some((height,layer))=self.known_terrain_transition_sample(actual_xy,support[2]) else {
                 previous=None;continue;
             };
             let current=(xy,height);
-            if let Some(a)=previous {
-                if !edge(a,current) {return Err(SurfaceError::UntraversableSegment);}
+            if let Some((a,previous_xy,previous_layer))=previous {
+                // These borrows are the actual original query's selections in
+                // this immutable snapshot, not the reference's carried sources.
+                let continuous_run=if ground_context && a.0==xy
+                    && previous_layer.zip(layer).is_some_and(|(a,b)|std::ptr::eq(a,b)) {
+                    Some((actual_xy[0]-previous_xy[0]).hypot(actual_xy[1]-previous_xy[1]))
+                } else {None};
+                if !edge(a,current,continuous_run) {return Err(SurfaceError::UntraversableSegment);}
                 if a.0[0]!=xy[0] && a.0[1]!=xy[1] {
                     for side in [[a.0[0],xy[1]],[xy[0],a.0[1]]] {
                         if let Some(z)=sample(side,a.1) {
-                            if !edge(a,(side,z)) || !edge((side,z),current) {
+                            if !edge(a,(side,z),None) || !edge((side,z),current,None) {
                                 return Err(SurfaceError::UntraversableSegment);
                             }
                         }
                     }
                 }
             }
-            previous=Some(current);
+            previous=Some((current,actual_xy,layer));
         }
         Ok(())
     }
@@ -2266,15 +2456,34 @@ impl SurfaceSnapshot {
         mut check_observations: impl FnMut(([f64; 3], [f64; 4])) -> Result<(), SurfaceError>,
         slot:&mut Option<BodyFailureWitness>,
     ) -> Result<(), SurfaceError> {
+        self.validate_body_motion_checked_in_context(from,to,boundary,check_observations,QuerySegment::LEGACY,slot)
+    }
+
+    pub(in crate::surface) fn validate_body_motion_in_context(&self,from:([f64;3],[f64;4]),to:([f64;3],[f64;4]),
+        boundary:&[[f64;2]],context:QuerySegment<'_>,slot:&mut Option<BodyFailureWitness>)->Result<(),SurfaceError> {
+        self.validate_body_motion_checked_in_context(from,to,boundary,|_|Ok(()),context,slot)
+    }
+
+    fn validate_body_motion_checked_in_context(
+        &self,
+        from: ([f64; 3], [f64; 4]),
+        to: ([f64; 3], [f64; 4]),
+        boundary: &[[f64; 2]],
+        mut check_observations: impl FnMut(([f64; 3], [f64; 4])) -> Result<(), SurfaceError>,
+        context:QuerySegment<'_>,
+        slot:&mut Option<BodyFailureWitness>,
+    ) -> Result<(), SurfaceError> {
         *slot=None;
         validate_boundary(boundary)?;
         let model = self.body_envelope().ok_or(SurfaceError::InvalidPose)?;
-        self.validate_body_pose_with_witness(from.0, from.1,slot)?;
-        self.validate_body_pose_with_witness(to.0, to.1,slot)?;
+        self.validate_body_pose_in_context(from.0, from.1,context.at(0.0),slot)?;
+        self.validate_body_pose_in_context(to.0, to.1,context.at(1.0),slot)?;
         check_observations(from)?;
         check_observations(to)?;
-        let a = self.support_position_from_body(from.0, from.1, model.body_to_support_z_m)?;
-        let b = self.support_position_from_body(to.0, to.1, model.body_to_support_z_m)?;
+        let (a,b)=if context.is_legacy() {
+            (self.support_position_from_body(from.0,from.1,model.body_to_support_z_m)?,
+             self.support_position_from_body(to.0,to.1,model.body_to_support_z_m)?)
+        } else {(from.0,to.0)};
         if !segment_inside_boundary([a[0], a[1]], [b[0], b[1]], boundary) {
             return Err(SurfaceError::InvalidBoundary);
         }
@@ -2309,22 +2518,22 @@ impl SurfaceSnapshot {
         {
             #[cfg(feature = "body-query-profile")]
             let _profile = query_profile::guard(QueryStage::SweptKnownTerrain);
-            self.validate_known_terrain_motion(from,to)?;
+            self.validate_known_terrain_motion_in_context(from,to,context)?;
         }
         for i in 1..count {
             let t = i as f64 / count as f64;
             let q = norm(std::array::from_fn(|j| qa[j] * (1.0 - t) + qb[j] * t));
             let p = std::array::from_fn(|j| from.0[j] * (1.0 - t) + to.0[j] * t);
-            self.validate_body_pose_with_witness(p, q,slot)?;
+            self.validate_body_pose_in_context(p, q,context.at(t),slot)?;
             check_observations((p, q))?;
         }
         // 按真实占据接触事件补查，并保持调用方的实际位置与姿态插值。
-        self.validate_body_contact_events(from,to,|t| {
+        self.validate_body_contact_events_in_context(from,to,context,|t| {
             let p = std::array::from_fn(|j| if from.0[j]==to.0[j] {from.0[j]} else {
                 from.0[j]*(1.0-t)+to.0[j]*t
             });
             let q=norm(std::array::from_fn(|j|qa[j]*(1.0-t)+qb[j]*t));
-            self.validate_body_pose_with_witness(p,q,slot)?;
+            self.validate_body_pose_in_context(p,q,context.at(t),slot)?;
             check_observations((p,q))
         })
     }
@@ -2701,12 +2910,17 @@ impl SurfaceSnapshot {
     /// when their legacy interval means differ. Missing fine samples must not
     /// inherit another half-column's coarse top.
     fn known_terrain_transition_top(&self,xy:[f64;2],reference:f64)->Option<f64> {
+        self.known_terrain_transition_sample(xy,reference).map(|(height,_)|height)
+    }
+
+    fn known_terrain_transition_sample(&self,xy:[f64;2],reference:f64)
+        ->Option<(f64,Option<&ObservedGroundLayer>)> {
         let Some(observations)=&self.observations else {
             let size=f64::from(self.config().voxel_size);
             let column=xy.map(|v|(v/size).floor() as i32);
             return self.data.physical_graph.surface_lookup.get(&(column[0],column[1]))
                 .into_iter().flatten().map(|&z|self.ground_cell_position((column[0],column[1],z))[2])
-                .min_by(|a,b|(a-reference).abs().total_cmp(&(b-reference).abs()));
+                .min_by(|a,b|(a-reference).abs().total_cmp(&(b-reference).abs())).map(|height|(height,None));
         };
         let fine=f64::from(observations.size_m);
         let column=xy.map(|v|(v/fine).floor() as i32);
@@ -2714,7 +2928,7 @@ impl SurfaceSnapshot {
             if let Some(layer)=observations.ground_layers(column).min_by(|a,b|
                 (a.height_at(xy).unwrap_or(f64::INFINITY)-reference).abs()
                     .total_cmp(&(b.height_at(xy).unwrap_or(f64::INFINITY)-reference).abs())) {
-                return layer.height_at(xy);
+                return layer.height_at(xy).map(|height|(height,Some(layer)));
             }
         }
         // Planar controllers and planning owners share immutable tomograms.
@@ -2725,7 +2939,7 @@ impl SurfaceSnapshot {
         self.read_fine_contact_bands(column[0],column[1]).iter().min_by(|a,b|
             distance(a).total_cmp(&distance(b)).then_with(||
                 (a.fit[1]-reference).abs().total_cmp(&(b.fit[1]-reference).abs())))
-            .map(|band|(f64::from(band.run[1])+1.0)*fine)
+            .map(|band|((f64::from(band.run[1])+1.0)*fine,None))
     }
 
     fn known_terrain_height(&self,xy:[f64;2],reference:f64)->Option<f64> {
@@ -2739,6 +2953,11 @@ impl SurfaceSnapshot {
     }
 
     fn direct_ground_query(&self,xy:[f64;2],reference:f64)->GroundQuery {
+        self.direct_ground_query_recorded(xy,reference,None)
+    }
+
+    fn direct_ground_query_recorded(&self,xy:[f64;2],reference:f64,
+        native:Option<&mut Option<NativeGroundSource>>)->GroundQuery {
         if let Some(observations)=&self.observations {
             let fine=f64::from(observations.size_m);let column=xy.map(|v|(v/fine).floor() as i32);
             if self.ground_evidence==GroundEvidence::MeasuredSurface {
@@ -2750,6 +2969,7 @@ impl SurfaceSnapshot {
                         (n[0]*n[0]*s[0]+2.0*n[0]*n[1]*s[1]+2.0*n[0]*n[2]*s[2]
                             +n[1]*n[1]*s[3]+2.0*n[1]*n[2]*s[4]+n[2]*n[2]*s[5]).max(0.0).sqrt()
                     });
+                    if let Some(native)=native {*native=Some(NativeGroundSource::ObservedFine{anchor:layer.anchor});}
                     return GroundQuery {state:GroundQueryState::Observed,height:layer.height_at(xy),normal:Some(layer.normal),
                         sources:vec![layer.anchor],radius_m:0.0,max_residual_m:Some(scatter)};
                 }
@@ -2759,6 +2979,8 @@ impl SurfaceSnapshot {
                 (a.fit[0]+(a.fit[1]-a.fit[0])*0.5-reference).abs()
                     .total_cmp(&(b.fit[0]+(b.fit[1]-b.fit[0])*0.5-reference).abs())) {
                 let layer=GroundLayer::from_voxel_run(band.run,fine,self.ground_evidence).expect("valid source run");
+                if let Some(native)=native {*native=Some(NativeGroundSource::LegacyFineRun{xy:column,
+                    first:band.run[0],last:band.run[1]});}
                 return GroundQuery {state:GroundQueryState::LegacyGeometry,height:Some(layer.representative_z),
                     normal:Some([0.0,0.0,1.0]),sources:vec![[column[0],column[1],band.run[0]]],radius_m:0.0,
                     max_residual_m:Some((layer.contact_interval[1]-layer.contact_interval[0])*0.5)};
@@ -2774,6 +2996,7 @@ impl SurfaceSnapshot {
         let top=self.ground_cell_position((x,y,z))[2];let quantum=f64::from(self.source_voxel_size_m());
         let bottom=self.observed_support_lower_bound((x,y,z)).min(top-quantum);
         let Some(layer)=GroundLayer::from_legacy_band([bottom,top],quantum,self.ground_evidence) else {return GroundQuery::unknown();};
+        if let Some(native)=native {*native=Some(NativeGroundSource::CoarseCell((x,y,z)));}
         GroundQuery {state:GroundQueryState::LegacyGeometry,height:Some(layer.representative_z),normal:Some([0.0,0.0,1.0]),
             sources:vec![[x,y,z]],radius_m:0.0,max_residual_m:Some((layer.contact_interval[1]-layer.contact_interval[0])*0.5)}
     }
@@ -2782,30 +3005,52 @@ impl SurfaceSnapshot {
     /// connected same-plane neighbourhood; unknown never means occupied or free.
     /// Interpolation is lazy and cached per missing source column in this snapshot.
     pub fn query_ground(&self,xy:[f64;2],reference:f64)->GroundQuery {
+        self.query_ground_recorded(xy,reference,None)
+    }
+
+    pub(in crate::surface) fn query_ground_with_native(&self,xy:[f64;2],reference:f64)
+        ->(GroundQuery,Vec<NativeGroundSource>) {
+        let mut native=Vec::new();let query=self.query_ground_recorded(xy,reference,Some(&mut native));
+        (query,native)
+    }
+
+    fn query_ground_recorded(&self,xy:[f64;2],reference:f64,
+        mut native:Option<&mut Vec<NativeGroundSource>>)->GroundQuery {
         if !xy.into_iter().chain([reference]).all(f64::is_finite) {return GroundQuery::unknown();}
-        let direct=self.direct_ground_query(xy,reference);
-        if direct.state!=GroundQueryState::Unknown {return direct;}
+        let mut direct_native=None;
+        let direct=self.direct_ground_query_recorded(xy,reference,native.as_ref().map(|_|&mut direct_native));
+        if direct.state!=GroundQueryState::Unknown {
+            if let (Some(native),Some(source))=(native,direct_native) {native.push(source);}
+            return direct;
+        }
         let Some(model)=self.body_envelope() else {return GroundQuery::unknown();};
         let grid=f64::from(self.observations.as_ref().map_or(self.config().voxel_size,|o|o.size_m));
         if xy.iter().any(|v|(v/grid).abs()>f64::from(i32::MAX)/2.0) {return GroundQuery::unknown();}
         let column=xy.map(|v|(v/grid).floor() as i32);let key=(column,reference.to_bits());
-        if let Some(estimate)=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner()).ground_estimates.get(&key).cloned() {
-            return estimate.map_or_else(GroundQuery::unknown,|e|e.at(xy));
+        if native.is_none() {
+            if let Some(estimate)=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner()).ground_estimates.get(&key).cloned() {
+                return estimate.map_or_else(GroundQuery::unknown,|e|e.at(xy));
+            }
         }
         let center=column.map(|v|(f64::from(v)+0.5)*grid);
         let radius=model.radius()+grid;
         let steps=(radius/grid).ceil() as i32;
         let quantum=f64::from(self.source_voxel_size_m());
         let mut samples=Vec::new();
+        let mut retained_native=native.as_ref().map(|_|Vec::new());
         for dx in -1..=1 {for dy in -1..=1 {
             if dx==0&&dy==0 {continue;}
             for step in 1..=steps {
                 let point=[center[0]+f64::from(dx*step)*grid,center[1]+f64::from(dy*step)*grid];
                 if (point[0]-center[0]).hypot(point[1]-center[1])>radius+1e-9 {break;}
-                let source=self.direct_ground_query(point,reference);
+                let mut source_native=None;
+                let source=self.direct_ground_query_recorded(point,reference,native.as_ref().map(|_|&mut source_native));
                 if let Some(height)=source.height {
                     let cell=self.nearest_column_cell(point, height,model.max_step_up_m.max(model.max_step_down_m)+quantum);
-                    if let Some(cell)=cell {samples.push((point,source,cell));}
+                    if let Some(cell)=cell {
+                        samples.push((point,source,cell));
+                        if let (Some(retained),Some(source))=(&mut retained_native,source_native) {retained.push(source);}
+                    }
                     break; // never look past a known different surface or wall
                 }
                 let ix=(point[0]/grid).floor() as i32;let iy=(point[1]/grid).floor() as i32;
@@ -2843,6 +3088,10 @@ impl SurfaceSnapshot {
             Some(GroundEstimate{origin,normal,sources,hull:boundary,radius,residual})
         })();
         let result=estimate.as_ref().map_or_else(GroundQuery::unknown,|e|e.at(xy));
+        if let Some(native)=native.as_mut() {
+            if result.state!=GroundQueryState::Unknown {native.extend(retained_native.into_iter().flatten());}
+            return result; // Old cache does not retain native source domains.
+        }
         let mut cache=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner());
         if cache.ground_estimates.len()>=8192 {cache.ground_estimates.clear();}
         cache.ground_estimates.insert(key,estimate);result
@@ -6634,6 +6883,313 @@ mod tests {
         enclosed.validate_body_pose([1.0,0.2,0.45],q).unwrap();
         assert!(enclosed.validate_body_motion(([1.0,0.2,0.45],q),([1.0,0.2,0.45],turn),&[]).is_err(),"actual side walls reject rotation");
     }
+
+// Append inside body.rs's existing mod tests, before its closing brace.
+// Read-only draft: not inserted into the repository, built, or executed.
+// Existing tests and fixtures are unchanged. These are the two exact selectors.
+
+#[test]
+fn ground_context_rotation_and_contact_events_keep_actual_witness() {
+    use crate::surface::body_query::{BodyQueryReference, GroundSample, LocalGroundReference};
+    use std::collections::BTreeMap;
+    type Pose = ([f64; 3], [f64; 4]);
+
+    // Exact F0 whole-body input. The original terrain-contract helper is private
+    // to a sibling module; retain its input here rather than change that helper.
+    fn flat(extra: bool) -> SurfaceSnapshot {
+        let fine = 0.05_f32;
+        let s = f64::from(fine);
+        let mut keys: Vec<[i32;3]> = (-32..32).flat_map(|x| (-20..20).map(move |y| [x,y,-1])).collect();
+        if extra { keys.push([4,4,6]); }
+        let points: Vec<_> = keys.iter().map(|k| (
+            ((f64::from(k[0])+0.5)*s) as f32,
+            ((f64::from(k[1])+0.5)*s) as f32,
+            ((f64::from(k[2])+0.5)*s) as f32,
+        )).collect();
+        let mut blocks = BTreeMap::<[i32;3],BTreeMap<[i32;3],SurfaceObservation>>::new();
+        for key in keys { blocks.entry(key.map(|v|v.div_euclid(32))).or_default()
+            .insert(key, SurfaceObservation { observed_ns:0, hits:0 }); }
+        let mut observations = SurfaceObservations::new(fine,32).unwrap();
+        for (key, values) in blocks { observations.replace_block(key,values).unwrap(); }
+        observations.mark_complete_geometry_source();
+        let config = Config { world_frame:"map".into(), voxel_size:0.1, robot_height:0.1,
+            surface_closing_radius:0.0, node_spacing_m:0.3, wall_clearance_m:0.0,
+            wall_buffer_m:0.0, wall_buffer_weight:0.0, max_slope_deg:18.0,
+            step_threshold_m:0.15, min_step_tread_depth_m:0.2,
+            step_penalty_weight:2.0, goal_tolerance:0.1, viz_publish_hz:0.0 };
+        let envelope = SurfaceBodyEnvelope {
+            footprint_xy_m:vec![[-0.3,-0.15],[0.3,-0.15],[0.3,0.15],[-0.3,0.15]],
+            z_bounds_m:[-0.448,0.057], body_to_support_z_m:0.4,
+            max_step_up_m:0.15, max_step_down_m:0.15,
+            max_cross_slope_deg:18.0, support_uncertainty_m:0.0,
+        };
+        SurfaceSnapshot::from_points(&points,config,fine).unwrap()
+            .with_body_envelope(envelope).unwrap()
+            .with_observations(Some(Arc::new(observations)))
+    }
+    fn reference(source:&SurfaceSnapshot, xy:[f64;2]) -> Arc<LocalGroundReference> {
+        let (query,native) = source.query_ground_with_native(xy,0.0);
+        eprintln!("C06_SOURCE xy={xy:?} query={query:?} native={native:?}");
+        assert_ne!(query.state,GroundQueryState::Unknown,"independently known fixed source premise");
+        assert!(!native.is_empty());
+        Arc::new(LocalGroundReference { first:GroundSample {
+            reference_origin:[xy[0],xy[1],query.height.unwrap()],
+            reference_normal:query.normal, query_state:query.state, reference_sources:native,
+        }, changes:vec![] })
+    }
+    fn interpolation(from:Pose,to:Pose,t:f64) -> Pose {
+        let norm = |q:[f64;4]| { let n=q.iter().map(|v|v*v).sum::<f64>().sqrt();q.map(|v|v/n) };
+        let qa=norm(from.1);let mut qb=norm(to.1);
+        if qa.iter().zip(qb).map(|(a,b)|a*b).sum::<f64>()<0.0 { qb=qb.map(|v|-v); }
+        (std::array::from_fn(|i|if from.0[i]==to.0[i] {from.0[i]} else {from.0[i]*(1.0-t)+to.0[i]*t}),
+            norm(std::array::from_fn(|i|qa[i]*(1.0-t)+qb[i]*t)))
+    }
+    fn regular_count(source:&SurfaceSnapshot,from:Pose,to:Pose) -> usize {
+        let norm = |q:[f64;4]| { let n=q.iter().map(|v|v*v).sum::<f64>().sqrt();q.map(|v|v/n) };
+        let cosine=norm(from.1).iter().zip(norm(to.1)).map(|(a,b)|a*b).sum::<f64>();
+        let angle=2.0*cosine.abs().min(1.0).acos();
+        let distance=(from.0[0]-to.0[0]).hypot(from.0[1]-to.0[1]).hypot(from.0[2]-to.0[2]);
+        let model=source.body_envelope().unwrap();
+        let radius=model.radius().hypot(model.z_bounds_m.into_iter().map(f64::abs)
+            .fold(model.body_to_support_z_m,f64::max));
+        ((distance+radius*angle)/(f64::from(source.source_voxel_size_m())*0.5))
+            .max(angle/0.05).ceil().max(1.0) as usize
+    }
+    fn run(source:&SurfaceSnapshot,from:Pose,to:Pose,label:&str,
+        hit_t:Option<f64>,event_count:Option<usize>,recent:bool,actual_point:Option<[f64;3]>) {
+        let ground=reference(source,[from.0[0],from.0[1]]);
+        let mut ground_first=None;
+        let mut unanchored_first=None;
+        // Alternating references exercise the same source-only warm leaves.
+        // C0-a has no association-sensitive result-cache reuse claim.
+        for (pass,anchored) in [true,false,true,false].into_iter().enumerate() {
+            let view=source.bind_body_query(if anchored {BodyQueryReference::Ground(Arc::clone(&ground))}
+                else {BodyQueryReference::Unanchored});
+            let mut slot=None;
+            for (t,pose) in [(0.0,from),(1.0,to)] {
+                let result=view.pose_at(pose,t,&mut slot);
+                eprintln!("C06_ENDPOINT {label} pass={pass} anchored={anchored} t={t} pose={pose:?} result={result:?} witness={slot:?}");
+                assert_eq!(result,Ok(()),"fixed endpoint must be clear: {label}");
+                assert!(slot.is_none());
+            }
+            let end_r=rotation(to.1).unwrap();let yaw=end_r[0][1].atan2(end_r[0][0]);
+            let projected=view.project_from_to_samples(from,[to.0[0],to.0[1]],yaw,[0.0,1.0],&mut slot);
+            eprintln!("C06_PROJECT {label} anchored={anchored} result={projected:?} witness={slot:?}");
+            let projected=projected.expect("clear endpoint projection must preserve actual pose");
+            assert_eq!([projected.0[0],projected.0[1]],[to.0[0],to.0[1]]);
+            assert!((projected.0[2]-to.0[2]).abs()<1e-10);
+            let pr=rotation(projected.1).unwrap();
+            assert!(pr.iter().flatten().zip(end_r.iter().flatten()).all(|(a,b)|(a-b).abs()<1e-10));
+            assert!(slot.is_none());
+            if let Some(expected)=event_count {
+                let count=regular_count(source,from,to);
+                eprintln!("C06_EVENT_PREMISE {label} anchored={anchored} count={count} expected={expected}");
+                assert_eq!(count,expected,"fixed event-only sampling premise changed; retain and report input");
+                for i in 0..=count {
+                    let t=i as f64/count as f64;let pose=interpolation(from,to,t);
+                    let result=view.pose_at(pose,t,&mut slot);
+                    eprintln!("C06_REGULAR {label} anchored={anchored} i={i}/{count} t={t:.17} pose={pose:?} result={result:?} witness={slot:?}");
+                    assert_eq!(result,Ok(()),"fixed point is NOT event-only if a regular sample rejects; do not relax this assertion");
+                    assert!(slot.is_none());
+                }
+            }
+            if let Some(t)=hit_t {
+                let pose=interpolation(from,to,t);
+                let result=view.pose_at(pose,t,&mut slot);
+                eprintln!("C06_FIXED_HIT {label} anchored={anchored} t={t:.17} pose={pose:?} result={result:?} witness={slot:?}");
+                assert_eq!(result,Err(SurfaceError::InsufficientClearance));
+                let witness=slot.expect("real fixed contact must retain its occupancy witness");
+                assert_eq!(witness.pose,pose);
+                assert!(matches!(witness.rejection,BodyRejection::Occupancy {..}));
+                if recent {assert!(matches!(witness.rejection,
+                    BodyRejection::Occupancy {source:OccupancySource::Recent,..}));}
+                if let Some(point)=actual_point {
+                    assert!(PrismQuery::new(source.body_envelope().unwrap(),rotation(pose.1).unwrap(),pose.0)
+                        .intersects(point,point),"fixed point must really intersect actual prism");
+                }
+            }
+            let result=view.motion_on_segment(from,to,[0.0,1.0],&[],&mut slot);
+            eprintln!("C06_MOTION {label} anchored={anchored} pass={pass} result={result:?} witness={slot:?}");
+            let expected=if hit_t.is_some() {Err(SurfaceError::InsufficientClearance)} else {Ok(())};
+            assert_eq!(result,expected);
+            let motion_witness=slot;
+            if hit_t.is_some() {
+                let witness=motion_witness.expect("full sweep must retain actual rejecting pose");
+                assert_ne!(witness.pose,from);assert_ne!(witness.pose,to);
+                assert_eq!(witness.pose.0[2],from.0[2]);
+                assert!(matches!(witness.rejection,BodyRejection::Occupancy {..}));
+                if recent {assert!(matches!(witness.rejection,
+                    BodyRejection::Occupancy {source:OccupancySource::Recent,..}));}
+                else if label=="fine-rotation" {assert!(matches!(witness.rejection,
+                    BodyRejection::Occupancy {cell:[4,4,6],source:OccupancySource::Fine|OccupancySource::FineFringe,..}));}
+                if let Some(point)=actual_point {
+                    assert!(PrismQuery::new(source.body_envelope().unwrap(),rotation(witness.pose.1).unwrap(),witness.pose.0)
+                        .intersects(point,point),"event witness must hit the actual retained point");
+                }
+                // Constant association: replaying the witness at any sample is exact.
+                assert_eq!(view.pose_at(witness.pose,0.5,&mut slot),Err(SurfaceError::InsufficientClearance));
+                assert_eq!(slot,Some(witness));
+            } else {assert!(motion_witness.is_none());}
+            let previous=if anchored {&mut ground_first} else {&mut unanchored_first};
+            if let Some(first)=previous {assert_eq!(first,&(result.clone(),motion_witness));}
+            else {*previous=Some((result.clone(),motion_witness));}
+            let mut checker=view.geometry_checker(&[]);
+            assert_eq!(checker(from,to,[0.0,1.0],&mut slot),result);
+            assert_eq!(slot,motion_witness,"bound geometry closure must preserve actual sweep witness");
+        }
+    }
+
+    let from=([0.025,0.025,0.4],[0.0,0.0,0.0,1.0]);
+    let to=(from.0,[0.0,0.0,std::f64::consts::FRAC_1_SQRT_2,std::f64::consts::FRAC_1_SQRT_2]);
+    let clear=flat(false);
+    run(&clear,from,to,"flat-rotation",None,None,false,None);
+    let fine=flat(true);
+    assert!(fine.observations.as_ref().unwrap().get([4,4,6]).is_some());
+    run(&fine,from,to,"fine-rotation",Some(0.5),None,false,None);
+    let recent=clear.with_recent_obstacle_points(1,100,0,&[],[(0,[0.225,0.225,0.325])]).unwrap();
+    run(&recent,from,to,"recent-rotation",Some(0.5),None,true,None);
+
+    let translated=ground_band_sweep_scene(0.525);
+    let a=([-0.25,0.0295,0.375],[0.0,0.0,0.0,1.0]);let b=([0.06,0.3395,0.375],a.1);
+    run(&translated,a,b,"fixed-translation-event",Some(0.15/0.31),Some(18),false,None);
+
+    // This fixed point is intentionally not moved if the event-only premise fails.
+    let star_t=1.0/72.0;
+    let star=interpolation(from,to,star_t);
+    let point=world(rotation(star.1).unwrap(),star.0,[0.3-1e-8,0.15-1e-8,-0.05]);
+    eprintln!("C06_ROTATION_EVENT_INPUT t_star={star_t:.17} star={star:?} point={point:?} ground_indices=[0]");
+    assert!((point[2]-0.35).abs()<1e-10);
+    let event=clear.with_recent_obstacle_points(1,100,0,&[0],[(0,point)]).unwrap();
+    run(&event,from,to,"fixed-recent-point-event",Some(star_t),Some(36),true,Some(point));
+}
+
+#[test]
+fn ground_context_anchored_bias_carried_and_unanchored_ramp_pair() {
+    use crate::surface::body_query::{BodyQueryReference, GroundSample, LocalGroundReference};
+    use std::collections::BTreeMap;
+    type Pose = ([f64; 3], [f64; 4]);
+
+    // Independent input plane belongs to the fixture's actual source points.
+    // Legacy query normal is flat; it is NOT relabelled as a fitted ramp normal.
+    fn plane(xy:[f64;2]) -> f64 {0.12*xy[0]+0.06*xy[1]}
+    fn sample(source:&SurfaceSnapshot,xy:[f64;2],carried:bool) -> GroundSample {
+        let (query,native)=source.query_ground_with_native(xy,plane(xy));
+        eprintln!("C10_SOURCE xy={xy:?} analytic_height={:?} query={query:?} native={native:?} carried={carried}",plane(xy));
+        assert_eq!(query.state,GroundQueryState::LegacyGeometry,"existing quantized legacy fixture is not a measured layer");
+        assert!(!native.is_empty());
+        GroundSample {reference_origin:[xy[0],xy[1],plane(xy)],
+            reference_normal:Some(normalize([-0.12,-0.06,1.0])),
+            query_state:if carried {GroundQueryState::Unknown} else {query.state},
+            reference_sources:native}
+    }
+    fn gap_from_fixture(base:&SurfaceSnapshot) -> SurfaceSnapshot {
+        let fine=0.05_f32;
+        // Same original point formula and extents; remove columns before BOTH
+        // coarse construction and fine observations, never only one of them.
+        let points:Vec<_>=(-35..35).filter(|x|!(3..6).contains(x)).flat_map(|x|
+            (-35..35).map(move |y| {
+                let px=(x as f32+0.5)*fine;let py=(y as f32+0.5)*fine;
+                (px,py,0.12*px+0.06*py)
+            })).collect();
+        assert_eq!(points.len(),70*67);
+        let mut blocks=BTreeMap::<[i32;3],BTreeMap<[i32;3],SurfaceObservation>>::new();
+        for &(x,y,z) in &points {
+            let key=[x,y,z].map(|v|(f64::from(v)/f64::from(fine)).floor() as i32);
+            assert!(!(3..6).contains(&key[0]));
+            assert!(base.observations.as_ref().unwrap().get(key).is_some(),"retained fine members must be original source members");
+            blocks.entry(key.map(|v|v.div_euclid(32))).or_default()
+                .insert(key,SurfaceObservation{observed_ns:0,hits:0});
+        }
+        let mut observations=SurfaceObservations::new(fine,32).unwrap();
+        for (key,values) in blocks {observations.replace_block(key,values).unwrap();}
+        observations.mark_complete_geometry_source();
+        for x in 3..6 {for y in -35..35 {assert!(observations.column_levels(x,y).is_none());}}
+        eprintln!("C10_GAP_SOURCE fixed_deleted_columns=[3,6) retained_points={} source={fine:?}",points.len());
+        SurfaceSnapshot::from_points(&points,base.config().clone(),fine).unwrap()
+            .with_body_envelope(base.body_envelope().unwrap().clone()).unwrap()
+            .with_observations(Some(Arc::new(observations)))
+    }
+    fn reference(source:&SurfaceSnapshot,gapped:bool) -> Arc<LocalGroundReference> {
+        let mut changes=Vec::new();
+        if gapped {
+            let s=f64::from(source.source_voxel_size_m());
+            changes.push(((0.125-0.025)/0.4,sample(source,[0.125,0.025],false)));
+            changes.push(((3.0*s-0.025)/0.4,sample(source,[0.125,0.025],true)));
+            changes.push(((6.0*s-0.025)/0.4,sample(source,[0.325,0.025],false)));
+        }
+        changes.push((1.0,sample(source,[0.425,0.025],false)));
+        let first=sample(source,[0.025,0.025],false);
+        eprintln!("C10_REFERENCE gapped={gapped} first={:?} normal={:?} changes={:?}",
+            first.reference_origin,first.reference_normal,
+            changes.iter().map(|(t,s)|(*t,s.reference_origin,s.query_state)).collect::<Vec<_>>());
+        Arc::new(LocalGroundReference{first,changes})
+    }
+    fn same_attitude(a:Pose,b:Pose) {
+        let a=rotation(a.1).unwrap();let b=rotation(b.1).unwrap();
+        assert!(a.iter().flatten().zip(b.iter().flatten()).all(|(a,b)|(a-b).abs()<1e-10),
+            "unchanged independent plane and yaw must retain actual tilt bias");
+    }
+
+    let (known,from)=biased_sloped_contact_fixture();
+    let gapped=gap_from_fixture(&known);
+    let actual=rotation(from.1).unwrap();let yaw=actual[0][1].atan2(actual[0][0]);
+    let normal=normalize([-0.12,-0.06,1.0]);
+    assert!(dot(actual[2],normal)<0.999,"retain the existing nonzero roll/pitch bias premise");
+    let original_height_bias=from.0[2]-plane([from.0[0],from.0[1]]);
+    eprintln!("C10_ACTUAL from={from:?} yaw={yaw:?} source_normal={normal:?} actual_up={:?} height_bias={original_height_bias:?}",actual[2]);
+    for x in [0.175,0.225,0.275] {
+        let (query,native)=gapped.query_ground_with_native([x,0.025],plane([x,0.025]));
+        eprintln!("C10_GAP_QUERY x={x:?} query={query:?} native={native:?}");
+        assert_eq!(query.state,GroundQueryState::Unknown,"fixed strip must genuinely be Unknown; do not turn an Estimated result into an Unknown claim");
+        assert_eq!(query.height,None);assert_eq!(query.normal,None);
+        assert!(query.sources.is_empty());assert!(native.is_empty());
+    }
+    for (label,source,gap) in [("known",&known,false),("carried",&gapped,true)] {
+        let ground=reference(source,gap);
+        let mut anchored_first=None;let mut unanchored_first=None;
+        for (pass,anchored) in [true,false,true,false].into_iter().enumerate() {
+            let view=source.bind_body_query(if anchored {BodyQueryReference::Ground(Arc::clone(&ground))}
+                else {BodyQueryReference::Unanchored});
+            let mut current=from;let mut from_t=0.0;let mut slot=None;
+            assert_eq!(view.pose_at(current,from_t,&mut slot),Ok(()));assert!(slot.is_none());
+            for x in [0.125,0.175,0.225,0.275,0.325,0.425] {
+                let t=(x-0.025)/0.4;let xy=[x,0.025];
+                let missing=gap&&(0.15..0.3).contains(&x);
+                let result=view.project_from_to_samples(current,xy,yaw,[from_t,t],&mut slot);
+                eprintln!("C10_PROJECT {label} pass={pass} anchored={anchored} from_t={from_t:.17} to_t={t:.17} from={current:?} to_xy={xy:?} unknown_target={missing} result={result:?} witness={slot:?}");
+                let next=result.expect("fixed ramp pair must be physically clear; a failure retains exact source/witness above for review");
+                let delta=if anchored&&!missing {plane(xy)-plane([current.0[0],current.0[1]])} else {0.0};
+                assert!((next.0[2]-current.0[2]-delta).abs()<1e-10,
+                    "Unknown and Unanchored cannot invent terrain delta; known targets resume the original local plane difference");
+                assert_eq!([next.0[0],next.0[1]],xy);same_attitude(current,next);
+                if !anchored {assert_eq!(next.0[2],from.0[2]);}
+                if anchored&&!gap {assert!((next.0[2]-plane(xy)-original_height_bias).abs()<1e-10);}
+                assert!(slot.is_none());
+                assert_eq!(view.pose_at(next,t,&mut slot),Ok(()));assert!(slot.is_none());
+                let motion=view.motion_on_segment(current,next,[from_t,t],&[],&mut slot);
+                eprintln!("C10_MOTION {label} anchored={anchored} samples={:?} from={current:?} to={next:?} result={motion:?} witness={slot:?}",[from_t,t]);
+                assert_eq!(motion,Ok(()));assert!(slot.is_none());
+                let mut checker=view.geometry_checker(&[]);
+                assert_eq!(checker(current,next,[from_t,t],&mut slot),motion);assert!(slot.is_none());
+                current=next;from_t=t;
+            }
+            let expected=if anchored {if gap {0.12*(0.1+0.05+0.1)} else {0.12*0.4}} else {0.0};
+            eprintln!("C10_END {label} anchored={anchored} pass={pass} from={from:?} end={current:?} expected_delta={expected:?}");
+            assert!((current.0[2]-from.0[2]-expected).abs()<1e-10);
+            let previous=if anchored {&mut anchored_first} else {&mut unanchored_first};
+            if let Some(first)=previous {assert_eq!(*first,current,"same inputs after context alternation must retain output bits");}
+            else {*previous=Some(current);}
+            // Direct known transport is partition-independent. A carried path is
+            // intentionally evaluated segment-by-segment at its Unknown samples.
+            if !gap {
+                let direct=view.project_from_to_samples(from,[0.425,0.025],yaw,[0.0,1.0],&mut slot).unwrap();
+                assert!((direct.0[2]-current.0[2]).abs()<1e-10);same_attitude(direct,current);
+                assert_eq!(view.motion_on_segment(from,direct,[0.0,1.0],&[],&mut slot),Ok(()));
+                assert!(slot.is_none());
+            }
+        }
+    }
+}
 
 }
 

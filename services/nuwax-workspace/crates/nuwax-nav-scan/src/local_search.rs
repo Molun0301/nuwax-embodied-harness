@@ -2,6 +2,7 @@
 use super::{angle, yaw, BodyGroundState, BodyMotionProjection, BodyPose, LocalPlanError, SurfaceBodyQueryView};
 use nuwax_nav_mls_planner::SurfaceSnapshot;
 use nuwax_nav_pct::Tomogram;
+use super::{MotionState,GroundWalkState,GroundWalkSegment,GroundWalkKey};
 use nuwax_nav_types_messages::MotionKinematics;
 use std::{
     cmp::Ordering,
@@ -108,14 +109,18 @@ pub(super) fn initial_admissions() -> Vec<(f64,f64,BodyPose)> {
     INITIAL_ADMISSIONS.with(|v| v.borrow().clone())
 }
 
-struct ProjectedMotion {
+struct ProjectedMotion<'a> {
     poses: Vec<BodyPose>,
     projections: Vec<BodyMotionProjection>,
     ground: BodyGroundState,
+    navigation:Option<GroundWalkState<'a>>,
+    segments:Option<Vec<GroundWalkSegment<'a>>>,
 }
-struct Node {
+struct Node<'a> {
     pose: BodyPose,
     ground: BodyGroundState,
+    navigation:Option<GroundWalkState<'a>>,
+    segments:Option<Vec<GroundWalkSegment<'a>>>,
     cost: f64,
     parent: Option<usize>,
     samples: Vec<BodyPose>,
@@ -145,15 +150,19 @@ fn key(p: BodyPose) -> [u64; 7] {
 struct SearchKey {
     pose: [u64; 7],
     ground: BodyGroundState,
+    navigation:Option<GroundWalkKey>,
 }
 fn state_key(pose: BodyPose, ground: &BodyGroundState) -> SearchKey {
-    SearchKey { pose: key(pose), ground: ground.clone() }
+    state_key_navigation(pose,ground,None)
 }
 
+fn state_key_navigation(pose:BodyPose,ground:&BodyGroundState,navigation:Option<GroundWalkState<'_>>)->SearchKey {
+    SearchKey {pose:key(pose),ground:ground.clone(),navigation:navigation.map(GroundWalkState::semantic_key)}
+}
 // 入队与过期标签使用相同身份：原七分量精确姿态加地面关联。
 // 同一完整状态的任意真实成本差都沿用严格支配，不引入几何容差。
-fn is_stale(node: &Node, best: &HashMap<SearchKey, f64>) -> bool {
-    best.get(&state_key(node.pose, &node.ground)).is_some_and(|&cost| node.cost > cost)
+fn is_stale(node: &Node<'_>, best: &HashMap<SearchKey, f64>) -> bool {
+    best.get(&state_key_navigation(node.pose, &node.ground,node.navigation)).is_some_and(|&cost| node.cost > cost)
 }
 
 pub fn probe_motion(
@@ -187,15 +196,19 @@ fn probe_motion_until(
     turn: f64,
     boundary: &[[f64;2]],
     reached: impl Fn(BodyPose)->bool,
-) -> Result<ProjectedMotion, LocalPlanError> {
+) -> Result<ProjectedMotion<'static>, LocalPlanError> {
     let projected=project_motion_until(map,query,ground,from,length,turn,reached)?;
     validate_projected(query,from,&projected,boundary)?;
     Ok(projected)
 }
-fn project_motion_until(
-    map:&SurfaceSnapshot,query:&SurfaceBodyQueryView,from_ground:&BodyGroundState,
-    from:BodyPose,length:f64,turn:f64,reached:impl Fn(BodyPose)->bool,
-) -> Result<ProjectedMotion, LocalPlanError> {
+fn project_motion_until(map:&SurfaceSnapshot,query:&SurfaceBodyQueryView,from_ground:&BodyGroundState,
+    from:BodyPose,length:f64,turn:f64,reached:impl Fn(BodyPose)->bool)->Result<ProjectedMotion<'static>,LocalPlanError> {
+    project_motion_state(map,query,&MotionState::body(from_ground.clone()),from,length,turn,&[],reached)
+}
+fn project_motion_state<'a>(
+    map:&SurfaceSnapshot,query:&SurfaceBodyQueryView,from_ground:&MotionState<'a>,
+    from:BodyPose,length:f64,turn:f64,boundary:&[[f64;2]],reached:impl Fn(BodyPose)->bool,
+) -> Result<ProjectedMotion<'a>, LocalPlanError> {
     super::cancellation::checkpoint()?;
     let radius = map.body_envelope().ok_or("近场搜索缺少机体")?.radius();
     let n = ((length + turn.abs() * radius) / 0.025).ceil().max(1.0) as usize;
@@ -204,6 +217,7 @@ fn project_motion_until(
     let mut poses = Vec::with_capacity(n);
     let mut projections = Vec::with_capacity(n);
     let mut ground = from_ground.clone();
+    let mut segments=ground.navigation.map(|_|Vec::with_capacity(n));
     for i in 1..=n {
         super::cancellation::checkpoint()?;
         if reached(previous) {break;}
@@ -221,43 +235,41 @@ fn project_motion_until(
             from.0[0] + dx * heading.cos() - dy * heading.sin(),
             from.0[1] + dx * heading.sin() + dy * heading.cos(),
         ];
-        let projection=super::project_endpoint(query,&ground,previous,xy,heading+theta)?;
-        previous=projection.pose();
-        ground=projection.ground().clone();
+        let edge=super::project_edge(query,&ground,previous,xy,heading+theta,boundary)?;
+        previous=edge.physical.pose();
+        ground=edge.end();
         poses.push(previous);
-        projections.push(projection);
+        projections.push(edge.physical);
+        if let (Some(out),Some(segment))=(&mut segments,edge.navigation) {out.push(segment);}
+
     }
     // 端点几何已拒绝的候选不再支付沿途扫掠；任何返回的候选仍逐段核验全部运动。
     // 保留同一拥有方产生的逐段投影，不把尚未验证的未来站姿写回地图。
-    Ok(ProjectedMotion {poses,projections,ground})
+    Ok(ProjectedMotion {poses,projections,ground:ground.physical,navigation:ground.navigation,segments})
 }
 fn validate_projected(
-    query:&SurfaceBodyQueryView,from:BodyPose,projected:&ProjectedMotion,boundary:&[[f64;2]],
+    query:&SurfaceBodyQueryView,from:BodyPose,projected:&ProjectedMotion<'_>,boundary:&[[f64;2]],
 )->Result<(), LocalPlanError> {
     let mut previous=from;
     for projection in &projected.projections {
         super::cancellation::checkpoint()?;
         super::check_projected_motion(query,previous,projection,boundary)?;
+        #[cfg(test)] if projected.segments.is_some() {
+            super::GROUND_EDGE_WORK.set({let mut n=super::GROUND_EDGE_WORK.get();n[1]+=1;n});
+        }
         previous=projection.pose();
     }
     Ok(())
 }
-fn reference_distance(p: [f64; 3], reference: &[[f64; 3]]) -> f64 {
-    reference
-        .windows(2)
-        .map(|pair| {
-            let a = pair[0];
-            let b = pair[1];
-            let dx = b[0] - a[0];
-            let dy = b[1] - a[1];
-            let t = (((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / (dx * dx + dy * dy).max(1e-9))
-                .clamp(0.0, 1.0);
-            (p[0] - a[0] - t * dx).hypot(p[1] - a[1] - t * dy)
-        })
-        .fold(reference.first().map_or(0.0, |a| (p[0]-a[0]).hypot(p[1]-a[1])), f64::min)
+fn reference_distance<const N:usize>(p:[f64;3],reference:&[[f64;N]])->f64 {
+    reference_distance_xy([p[0],p[1]],reference)
 }
-fn reference_progress(p: [f64; 3], reference: &[[f64; 3]]) -> (f64, f64, f64) {
-    let mut best = (super::distance3(p,reference[0]), 0.0, reference[0][2]);
+fn reference_progress(p:[f64;3],reference:&[[f64;3]])->(f64,f64,f64) {
+    let (distance,progress,height)=reference_progress_nd(p,reference);
+    (distance,progress,height.unwrap())
+}
+fn reference_progress_nd<const N:usize>(p: [f64; 3], reference: &[[f64; N]]) -> (f64, f64, Option<f64>) {
+    let mut best = (super::goal_distance(p,reference[0]), 0.0, reference[0].get(2).copied());
     let mut along = 0.0;
     for pair in reference.windows(2) {
         let a = pair[0];
@@ -269,10 +281,10 @@ fn reference_progress(p: [f64; 3], reference: &[[f64; 3]]) -> (f64, f64, f64) {
             continue;
         }
         let t = (((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / (length * length)).clamp(0.0, 1.0);
-        let z = a[2] + t * (b[2] - a[2]);
+        let z = if N==3 {Some(a[2] + t * (b[2] - a[2]))} else {None};
         let distance = (p[0] - a[0] - t * dx)
             .hypot(p[1] - a[1] - t * dy)
-            .hypot(p[2] - z);
+            .hypot(z.map_or(0.0,|z|p[2]-z));
         if distance < best.0 {
             best = (distance, along + t * length, z);
         }
@@ -288,18 +300,24 @@ struct ReferenceTurn {
 }
 // One plan-local preparation; the guide's original >1e-9 heading rule is unchanged.
 /// 所有偏离原末点的候选共用同一窗口交接条件，不能只交付受阻前缀。
-pub(super) fn reference_handoff(map: &SurfaceSnapshot, p: BodyPose, reference: &[[f64; 3]], support_offset: f64,
+pub(super) fn reference_handoff(map:&SurfaceSnapshot,p:BodyPose,reference:&[[f64;3]],support_offset:f64,
+    corridor:f64,layer_tolerance:f64,reference_length:f64,tangent:f64)->bool {
+    reference_handoff_nd(map,p,reference,support_offset,corridor,layer_tolerance,reference_length,tangent)
+}
+pub(super) fn reference_handoff_nd<const N:usize>(map: &SurfaceSnapshot, p: BodyPose, reference: &[[f64; N]], support_offset: f64,
     corridor: f64, layer_tolerance: f64, reference_length: f64, tangent: f64) -> bool {
     let Some(target) = reference.last() else { return false; };
     // 窗口参考位于支撑坐标；倾斜时偏移同时改变 XY 与 Z，不能只减标称高度。
-    let Ok(support) = map.support_position_from_body(p.0,p.1,support_offset) else { return false; };
-    let (deviation, progress, height) = reference_progress(support, reference);
+    let support=if N==3 {
+        let Ok(support)=map.support_position_from_body(p.0,p.1,support_offset) else {return false;}; support
+    } else {p.0};
+    let (deviation, progress, height) = reference_progress_nd(support, reference);
     if (support[0]-target[0]).hypot(support[1]-target[1]) > corridor || deviation > corridor
-        || progress < reference_length - 1e-6 || (support[2]-height).abs() > layer_tolerance { return false; }
+        || progress < reference_length - 1e-6 || height.is_some_and(|height|(support[2]-height).abs()>layer_tolerance) { return false; }
     angle(yaw(p.1)-tangent).cos()>0.0
 }
 
-fn reference_turns(reference: &[[f64; 3]]) -> Result<Vec<ReferenceTurn>, LocalPlanError> {
+fn reference_turns<const N:usize>(reference: &[[f64; N]]) -> Result<Vec<ReferenceTurn>, LocalPlanError> {
     let mut turns = Vec::with_capacity(reference.len().saturating_sub(1));
     for pair in reference.windows(2) {
         super::cancellation::checkpoint()?;
@@ -324,13 +342,13 @@ fn reference_turns(reference: &[[f64; 3]]) -> Result<Vec<ReferenceTurn>, LocalPl
     Ok(turns)
 }
 #[derive(Clone, Copy)]
-struct ReferenceGuide {
-    point: [f64; 3],
+struct ReferenceGuide<const N:usize> {
+    point: [f64; N],
     segment: Option<usize>,
     at_vertex: bool,
     matched: bool,
 }
-fn reference_guide(reference: &[[f64; 3]], lookahead: f64, reference_length: f64) -> ReferenceGuide {
+fn reference_guide<const N:usize>(reference: &[[f64; N]], lookahead: f64, reference_length: f64) -> ReferenceGuide<N> {
     let mut guide = ReferenceGuide { point: *reference.last().unwrap(), segment: None, at_vertex: false, matched: false };
     let mut along = 0.0;
     for (index, pair) in reference.windows(2).enumerate() {
@@ -349,7 +367,7 @@ fn reference_guide(reference: &[[f64; 3]], lookahead: f64, reference_length: f64
     guide
 }
 // Experimental angular accounting changes ordering, never body admission.
-fn reference_guide_turn(position: [f64; 2], heading: f64, guide: ReferenceGuide, turns: &[ReferenceTurn]) -> f64 {
+fn reference_guide_turn<const N:usize>(position: [f64; 2], heading: f64, guide: ReferenceGuide<N>, turns: &[ReferenceTurn]) -> f64 {
     let dx = guide.point[0]-position[0];
     let dy = guide.point[1]-position[1];
     let coincident = dx.hypot(dy) < 1e-6;
@@ -365,8 +383,8 @@ fn reference_guide_turn(position: [f64; 2], heading: f64, guide: ReferenceGuide,
     angle(heading-bearing).abs()
         + continuation.map_or(0.0, |(theta,suffix)| angle(bearing-theta).abs()+suffix)
 }
-fn heading_potential(p: BodyPose, target: [f64;3], tangent: f64, corridor: f64,
-    arrival: bool, guide: Option<ReferenceGuide>, turns: &[ReferenceTurn]) -> f64 {
+fn heading_potential<const N:usize>(p: BodyPose, target: [f64;N], tangent: f64, corridor: f64,
+    arrival: bool, guide: Option<ReferenceGuide<N>>, turns: &[ReferenceTurn]) -> f64 {
     if let Some(guide) = guide {
         if guide.matched || arrival {
             return reference_guide_turn([p.0[0],p.0[1]],yaw(p.1),guide,turns);
@@ -401,29 +419,51 @@ fn step_cost(distance: f64, turn: f64, preference: f64, motion: &MotionKinematic
     (distance / motion.max_forward_mps).max(turn.abs() / motion.max_angular_rps)
         + distance * preference / motion.max_forward_mps
 }
-fn preference(tomogram: &Tomogram, support: [f64;3], reference: &[[f64;3]]) -> f64 {
+fn preference<const N:usize>(tomogram: &Tomogram, support: [f64;3], reference: &[[f64;N]]) -> f64 {
     let terrain=tomogram.cell_at(support).map_or(2.0, |id| tomogram.cells[id].cost);
     0.15 * terrain.max(0.0) + 0.1 * reference_distance(support,reference)
 }
-fn projected_cost(from: BodyPose, samples: &[BodyPose], offset: f64,
-    tomogram: &Tomogram, reference: &[[f64;3]], motion: &MotionKinematics) -> f64 {
-    let soft=|p:BodyPose|preference(tomogram,[p.0[0],p.0[1],p.0[2]-offset],reference);
+fn projected_cost(from:BodyPose,samples:&[BodyPose],offset:f64,tomogram:&Tomogram,
+    reference:&[[f64;3]],motion:&MotionKinematics)->f64 {
+    projected_cost_navigation(from,samples,offset,tomogram,reference,motion,None,None)
+}
+fn navigation_preference<const N:usize>(tomogram:&Tomogram,xy:[f64;2],height:Option<f64>,reference:&[[f64;N]])->f64 {
+    let terrain=height.and_then(|h|tomogram.cell_at([xy[0],xy[1],h])).map_or(2.0,|id|tomogram.cells[id].cost);
+    // reference_distance consumes XY only; keep the height optional until the
+    // numerical soft lookup. Its result never grants physical or nav admission.
+    0.15*terrain.max(0.0)+0.1*reference_distance_xy(xy,reference)
+}
+fn reference_distance_xy<const N:usize>(xy:[f64;2],reference:&[[f64;N]])->f64 {
+    reference.windows(2).map(|w| {
+        let dx=w[1][0]-w[0][0];let dy=w[1][1]-w[0][1];
+        let t=(((xy[0]-w[0][0])*dx+(xy[1]-w[0][1])*dy)/(dx*dx+dy*dy).max(1e-9)).clamp(0.0,1.0);
+        (xy[0]-w[0][0]-t*dx).hypot(xy[1]-w[0][1]-t*dy)
+    }).fold(reference.first().map_or(0.0,|p|(xy[0]-p[0]).hypot(xy[1]-p[1])),f64::min)
+}
+fn projected_cost_navigation<const N:usize>(from: BodyPose, samples: &[BodyPose], offset: f64,
+    tomogram: &Tomogram, reference: &[[f64;N]], motion: &MotionKinematics, navigation:Option<GroundWalkState<'_>>,segments:Option<&[GroundWalkSegment<'_>]>) -> f64 {
+    let soft=|p:BodyPose,nav:Option<GroundWalkState<'_>>| match nav {
+        None=>preference(tomogram,[p.0[0],p.0[1],p.0[2]-offset],reference),
+        Some(nav)=>navigation_preference(tomogram,[p.0[0],p.0[1]],nav.planned_ground_z(),reference),
+    };
     let mut previous=from; let mut cost=0.0;
     let mut previous_soft=None;
-    for &next in samples {
+    let mut previous_nav=navigation;
+    for (index,&next) in samples.iter().enumerate() {
+        let next_nav=segments.map(|segments|segments[index].end());
         if super::cancellation::checkpoint().is_err() { return f64::INFINITY; }
         let distance=super::distance3(previous.0,next.0);
         let weight=if distance==0.0 {
             previous_soft=None;
             0.0
         } else {
-            let left=previous_soft.unwrap_or_else(||soft(previous));
-            let right=soft(next);
+            let left=previous_soft.unwrap_or_else(||soft(previous,previous_nav));
+            let right=soft(next,next_nav);
             previous_soft=Some(right);
             (left+right)*0.5
         };
         cost+=step_cost(distance,angle(yaw(next.1)-yaw(previous.1)),weight,motion);
-        previous=next;
+        previous=next; previous_nav=next_nav;
     }
     cost
 }
@@ -431,12 +471,19 @@ fn projected_cost(from: BodyPose, samples: &[BodyPose], offset: f64,
 // It ranks nominal connectors, including sequential initial/final rotations.
 // Actual projection, arrival truncation and alternate swept turns may cost more/less.
 fn soft_intervals(length: f64) -> usize { (length/0.05).ceil().clamp(1.0,64.0) as usize }
-fn connector_cost(from: BodyPose, heading: f64, length: f64, turn: f64,
-    final_yaw: Option<f64>, target_z: f64, offset: f64, tomogram: &Tomogram,
-    reference: &[[f64;3]], motion: &MotionKinematics) -> f64 {
+fn connector_cost(from:BodyPose,heading:f64,length:f64,turn:f64,final_yaw:Option<f64>,target_z:f64,
+    offset:f64,tomogram:&Tomogram,reference:&[[f64;3]],motion:&MotionKinematics)->f64 {
+    connector_cost_navigation(from,heading,length,turn,final_yaw,Some(target_z),offset,tomogram,reference,motion,None)
+}
+fn connector_cost_navigation<const N:usize>(from: BodyPose, heading: f64, length: f64, turn: f64,
+    final_yaw: Option<f64>, target_z: Option<f64>, offset: f64, tomogram: &Tomogram,
+    reference: &[[f64;N]], motion: &MotionKinematics,navigation:Option<GroundWalkState<'_>>) -> f64 {
     let n=soft_intervals(length);
     let mut previous=[from.0[0],from.0[1],from.0[2]-offset];
-    let mut weight=preference(tomogram,previous,reference);
+    let nav_height=navigation.and_then(GroundWalkState::planned_ground_z);
+    let soft=|point:[f64;3]| if navigation.is_some() {navigation_preference(tomogram,[point[0],point[1]],nav_height,reference)}
+        else {preference(tomogram,point,reference)};
+    let mut weight=soft(previous);
     let mut cost=step_cost(0.0,angle(heading-yaw(from.1)),0.0,motion);
     for i in 1..=n {
         if super::cancellation::checkpoint().is_err() { return f64::INFINITY; }
@@ -445,8 +492,8 @@ fn connector_cost(from: BodyPose, heading: f64, length: f64, turn: f64,
             else {(length/turn*theta.sin(),length/turn*(1.0-theta.cos()))};
         let next=[from.0[0]+dx*heading.cos()-dy*heading.sin(),
             from.0[1]+dx*heading.sin()+dy*heading.cos(),
-            (from.0[2]-offset)*(1.0-t)+target_z*t];
-        let next_weight=preference(tomogram,next,reference);
+            target_z.map_or(previous[2],|z|(from.0[2]-offset)*(1.0-t)+z*t)];
+        let next_weight=soft(next);
         // Use exact nominal arc length, not quadrature chords.
         let distance=(length/n as f64).hypot(next[2]-previous[2]);
         cost+=step_cost(distance,turn/n as f64,if distance==0.0 {0.0}else{(weight+next_weight)*0.5},motion);
@@ -472,7 +519,8 @@ pub fn plan(
         follow_reference,expansion_limit,None).map(|path|path.poses)
 }
 #[derive(Debug)]
-pub(super) struct SearchPath {
+pub(super) struct SearchPath<'a> {
+    pub navigation:Option<Vec<GroundWalkSegment<'a>>>,
     pub poses: Vec<BodyPose>,
     pub partial: bool,
 }
@@ -490,7 +538,7 @@ pub(super) fn plan_progress(
     follow_reference: bool,
     expansion_limit: usize,
     progress_policy: Option<super::ProgressPrefixPolicy<'_>>,
-) -> Result<SearchPath, LocalPlanError> {
+) -> Result<SearchPath<'static>, LocalPlanError> {
     super::cancellation::checkpoint()?;
     validate_caps(motion)?;
     #[cfg(feature="profile")] let binding_phase=super::profile::Phase::begin("search_bind");
@@ -515,28 +563,36 @@ pub(super) fn plan_progress_bound(
     follow_reference: bool,
     expansion_limit: usize,
     progress_policy: Option<super::ProgressPrefixPolicy<'_>>,
-) -> Result<SearchPath, LocalPlanError> {
+) -> Result<SearchPath<'static>, LocalPlanError> {
     plan_progress_bound_recorded(map,query,start_ground,tomogram,start,reference,motion,final_yaw,
         arrival,boundary,horizon,corridor,follow_reference,expansion_limit,progress_policy,None)
 }
-pub(super) fn plan_progress_bound_recorded(
+pub(super) fn plan_progress_bound_recorded(map:&SurfaceSnapshot,query:&SurfaceBodyQueryView,
+    start_ground:&BodyGroundState,tomogram:&Tomogram,start:BodyPose,reference:&[[f64;3]],motion:&MotionKinematics,
+    final_yaw:Option<f64>,arrival:Option<([f64;3],f64)>,boundary:&[[f64;2]],horizon:f64,corridor:f64,
+    follow_reference:bool,expansion_limit:usize,progress_policy:Option<super::ProgressPrefixPolicy<'_>>,
+    origins:Option<(&mut Vec<super::CandidatePart>,usize)>)->Result<SearchPath<'static>,LocalPlanError> {
+    plan_progress_state(map,query,&MotionState::body(start_ground.clone()),tomogram,start,reference,motion,
+        final_yaw,arrival,boundary,horizon,corridor,follow_reference,expansion_limit,progress_policy.map(Into::into),origins)
+}
+pub(super) fn plan_progress_state<'a,const N:usize>(
     map: &SurfaceSnapshot,
     query: &SurfaceBodyQueryView,
-    start_ground: &BodyGroundState,
+    start_ground: &MotionState<'a>,
     tomogram: &Tomogram,
     start: BodyPose,
-    reference: &[[f64; 3]],
+    reference: &[[f64; N]],
     motion: &MotionKinematics,
     final_yaw: Option<f64>,
-    arrival: Option<([f64; 3], f64)>,
+    arrival: Option<([f64; N], f64)>,
     boundary: &[[f64; 2]],
     horizon: f64,
     corridor: f64,
     follow_reference: bool,
     expansion_limit: usize,
-    progress_policy: Option<super::ProgressPrefixPolicy<'_>>,
+    progress_policy: Option<super::ProgressPolicy<'_,N>>,
     mut origins: Option<(&mut Vec<super::CandidatePart>,usize)>,
-) -> Result<SearchPath, LocalPlanError> {
+) -> Result<SearchPath<'a>, LocalPlanError> {
     #[cfg(feature="profile")] let setup_phase=super::profile::Phase::begin("search_setup");
     super::cancellation::checkpoint()?;
     validate_caps(motion)?;
@@ -562,19 +618,16 @@ pub(super) fn plan_progress_bound_recorded(
     let reach = |p: BodyPose| {
         if let Some((goal, tolerance)) = arrival {
             let position_ok = if tolerance == 0.0 {
-                super::same_finite_position(p.0, goal)
+                super::goal_exact(p.0, goal)
             } else {
-                ((p.0[0] - goal[0]).powi(2)
-                    + (p.0[1] - goal[1]).powi(2)
-                    + (p.0[2] - goal[2]).powi(2))
-                .sqrt() < tolerance
+                super::goal_distance(p.0,goal) < tolerance
             };
             return position_ok
                 && final_yaw.is_none_or(|heading| angle(yaw(p.1) - heading).abs() < 0.1);
         }
         // 中间轨迹必须走到窗口末端的横截面，并保持前向朝向。
         // 不能把障碍前的六成前缀当作已经接通交接点。
-        reference_handoff(map, p, reference, support_offset, corridor, layer_tolerance, reference_length, tangent)
+        reference_handoff_nd(map, p, reference, support_offset, corridor, layer_tolerance, reference_length, tangent)
     };
     // 绕行窗口的目标可能就在墙另一侧；直线距离会把搜索反复拉回已失败的通道。
     // 沿已给出的参考走廊估计剩余行程，仍由实际机体动作决定能否通行。
@@ -583,7 +636,7 @@ pub(super) fn plan_progress_bound_recorded(
             return (distance(p), 0.0);
         }
         let (deviation, progress, _) =
-            reference_progress([p.0[0], p.0[1], p.0[2] - support_offset], reference);
+            reference_progress_nd([p.0[0], p.0[1], p.0[2] - support_offset], reference);
         ((reference_length - progress).max(0.0) + deviation, progress)
     };
     // Forward-only search must rank the turn needed to make progress as well as
@@ -617,9 +670,9 @@ pub(super) fn plan_progress_bound_recorded(
                 return weight * (travel/motion.max_forward_mps).max(turn/motion.max_angular_rps);
             }
             if let Some((points, oracle_turns, length)) = &oracle {
-                let (deviation, progress, _) = reference_progress([p.0[0],p.0[1],p.0[2]-support_offset],points);
+                let (deviation, progress, _) = reference_progress_nd([p.0[0],p.0[1],p.0[2]-support_offset],points);
                 let guide = reference_guide(points,progress+guidance_distance,*length);
-                let turn = heading_potential(p,target,tangent,corridor,arrival.is_some(),Some(guide),oracle_turns);
+                let turn = heading_potential(p,[target[0],target[1],p.0[2]],tangent,corridor,arrival.is_some(),Some(guide),oracle_turns);
                 return 4.0*((length-progress).max(0.0)+deviation)/motion.max_forward_mps + 4.0*turn/motion.max_angular_rps;
             }
         }
@@ -653,13 +706,14 @@ pub(super) fn plan_progress_bound_recorded(
     // More distinct states compete within the same finite expansion budget.
     let mut nodes = vec![Node {
         pose: start,
-        ground: start_ground.clone(),
+        ground: start_ground.physical.clone(),
+        navigation:start_ground.navigation,segments:None,
         cost: 0.0,
         parent: None,
         samples: Vec::new(),
     }];
     let mut open = BinaryHeap::from([Entry(heuristic(start), 0)]);
-    let mut best = HashMap::from([(state_key(start,start_ground), 0.0)]);
+    let mut best = HashMap::from([(state_key_navigation(start,&start_ground.physical,start_ground.navigation), 0.0)]);
     let mut rejected_sample=None;
     fn admitted<T>(result:Result<T,LocalPlanError>,sample:&mut Option<nuwax_nav_mls_planner::surface::BodyFailureWitness>)
         ->Result<Option<T>,LocalPlanError> {
@@ -684,7 +738,7 @@ pub(super) fn plan_progress_bound_recorded(
         if is_stale(&nodes[id], &best) {
             continue;
         }
-        let from_ground = nodes[id].ground.clone();
+        let from_ground=MotionState {physical:nodes[id].ground.clone(),navigation:nodes[id].navigation};
         #[cfg(all(test,feature="profile"))]
         if std::env::var_os("NEH_ON_POP_TRACE").is_some() {
             eprintln!("ON_POP {}",serde_json::json!({"id":id,"parent":nodes[id].parent,
@@ -696,7 +750,7 @@ pub(super) fn plan_progress_bound_recorded(
         #[cfg(all(test,feature="profile"))]
         if std::env::var_os("NEH_ON_DIAGNOSTIC").is_some() {
             let support=[from.0[0],from.0[1],from.0[2]-support_offset];
-            eprintln!("ON_POP {}",serde_json::json!({"id":id,"parent":nodes[id].parent,"pose":from,"g":cost,"h":heuristic(from),"translation_h":4.0*remaining(from).0/motion.max_forward_mps,"f":_priority,"remaining":distance(from),"progress":reference_progress(support,reference).1,"cell":tomogram.cell_at(support).map(|i|format!("{:?}",tomogram.cells[i]))}));
+            eprintln!("ON_POP {}",serde_json::json!({"id":id,"parent":nodes[id].parent,"pose":from,"g":cost,"h":heuristic(from),"translation_h":4.0*remaining(from).0/motion.max_forward_mps,"f":_priority,"remaining":distance(from),"progress":reference_progress_nd(support,reference).1,"cell":tomogram.cell_at(support).map(|i|format!("{:?}",tomogram.cells[i]))}));
         }
         if distance(from) < distance(closest) {closest=from;}
         #[cfg(feature="profile")]
@@ -716,12 +770,12 @@ pub(super) fn plan_progress_bound_recorded(
             let distance=dx.hypot(dy);
             let heading=if distance==0.0 {yaw(from.1)}else{dy.atan2(dx)};
             let error=angle(heading-yaw(from.1));
-            let line_time=connector_cost(from,heading,distance,0.0,final_yaw,target[2],support_offset,tomogram,reference,motion);
+            let line_time=connector_cost_navigation(from,heading,distance,0.0,final_yaw,target.get(2).copied(),support_offset,tomogram,reference,motion,from_ground.navigation);
             proposals.push((line_time,heading,distance,0.0));
             if error.abs()>1e-6 && error.abs()<std::f64::consts::FRAC_PI_2 {
                 let length=distance*error/error.sin();let turn=2.0*error;
                 if motion.minimum_turning_radius_m==0.0 || length/turn.abs()>=motion.minimum_turning_radius_m {
-                    let time=connector_cost(from,yaw(from.1),length,turn,final_yaw,target[2],support_offset,tomogram,reference,motion);
+                    let time=connector_cost_navigation(from,yaw(from.1),length,turn,final_yaw,target.get(2).copied(),support_offset,tomogram,reference,motion,from_ground.navigation);
                     proposals.push((time,yaw(from.1),length,turn));
                 }
             }
@@ -733,6 +787,7 @@ pub(super) fn plan_progress_bound_recorded(
             super::cancellation::checkpoint()?;
             // 解析长接续先用层析中心路线排除穿墙提案；未通过仍可由原姿态动作搜索绕行。
             // 这一步不授予机体许可，入选提案随后保留完整地形、旋转和扫掠检查。
+            if N==3 {
             let samples=(length/(tomogram.resolution*0.5)).ceil().max(1.0) as usize;
             let mut previous=[from.0[0],from.0[1],from.0[2]-support_offset];
             let Some(reference_height)=tomogram.calibrated_reference_height(previous) else {continue;};
@@ -757,23 +812,28 @@ pub(super) fn plan_progress_bound_recorded(
                 previous=point;
             }
             if !visible {continue;}
+            }
             let mut prefix=vec![from];
             let mut connection_ground=from_ground.clone();
-            if admitted(super::rotate_bound(query,&mut connection_ground,&mut prefix,heading,motion,boundary),&mut rejected_sample)?.is_none() {continue;}
+            let mut connection_segments=from_ground.navigation.map(|_|Vec::new());
+            if admitted(super::rotate_state(query,&mut connection_ground,&mut prefix,heading,motion,boundary,&mut connection_segments),&mut rejected_sample)?.is_none() {continue;}
             let in_goal=|pose:BodyPose|arrival.is_some_and(|(goal,tolerance)|
-                if tolerance == 0.0 { super::same_finite_position(pose.0, goal) }
-                else { super::distance3(pose.0,goal)<tolerance });
-            let Some(line)=admitted(probe_motion_until(map,query,&connection_ground,*prefix.last().unwrap(),length,turn,boundary,in_goal),&mut rejected_sample)? else{continue;};
-            connection_ground=line.ground;
+                if tolerance == 0.0 { super::goal_exact(pose.0, goal) }
+                else { super::goal_distance(pose.0,goal)<tolerance });
+            let line_start=*prefix.last().unwrap();
+            let Some(line)=admitted(project_motion_state(map,query,&connection_ground,line_start,length,turn,boundary,in_goal),&mut rejected_sample)? else {continue;};
+            if admitted(validate_projected(query,line_start,&line,boundary),&mut rejected_sample)?.is_none() {continue;}
+            connection_ground=MotionState {physical:line.ground,navigation:line.navigation};
             prefix.extend(line.poses);
+            if let (Some(out),Some(accepted))=(&mut connection_segments,line.segments) {out.extend(accepted);}
             if let Some(heading)=final_yaw {
-                if admitted(super::rotate_bound(query,&mut connection_ground,&mut prefix,heading,motion,boundary),&mut rejected_sample)?.is_none(){continue;}
+                if admitted(super::rotate_state(query,&mut connection_ground,&mut prefix,heading,motion,boundary,&mut connection_segments),&mut rejected_sample)?.is_none(){continue;}
             }
             if reach(*prefix.last().unwrap()) {
                 #[cfg(feature="profile")] if let Some(phase)=root_phase.as_mut() {
                     phase.finish("full"); phase.selected(if turn.abs()<1e-8 {"line"} else {"arc"});
                 }
-                connection=Some(prefix);break;
+                connection=Some((prefix,connection_segments));break;
             }
         }
         if reached || connection.is_some() {
@@ -790,16 +850,19 @@ pub(super) fn plan_progress_bound_recorded(
             }
             chain.reverse();
             let mut path = vec![start];
+            let mut navigation=start_ground.navigation.map(|_|Vec::new());
             for id in chain {
                 super::cancellation::checkpoint()?;
                 let edge_start=path.len()-1;
                 path.extend_from_slice(&nodes[id].samples);
+                if let (Some(out),Some(accepted))=(&mut navigation,nodes[id].segments.take()) {out.extend(accepted);}
                 if let Some((parts,offset))=origins.as_mut() {
                     parts.push(super::CandidatePart {edges:edge_start+*offset..path.len()-1+*offset,
                         origin:super::CandidateEdgeOrigin::Parent {node:id}});
                 }
             }
-            if let Some(connection)=connection {
+            if let Some((connection,segments))=connection {
+                if let (Some(out),Some(accepted))=(&mut navigation,segments) {out.extend(accepted);}
                 let edge_start=path.len()-1;
                 path.extend(connection.into_iter().skip(1));
                 if let Some((parts,offset))=origins.as_mut() {
@@ -808,7 +871,7 @@ pub(super) fn plan_progress_bound_recorded(
                 }
             }
             super::cancellation::checkpoint()?;
-            return Ok(SearchPath {poses:path,partial:false});
+            return Ok(SearchPath {poses:path,partial:false,navigation});
         }
         #[cfg(feature="profile")] {
             if let Some(phase)=root_phase.as_mut() {phase.finish("miss");}
@@ -857,7 +920,7 @@ pub(super) fn plan_progress_bound_recorded(
                 continue;
             }
             work.candidates += 1;
-            let Some(projected) = admitted(project_motion_until(map, query, &from_ground, from, length, turn, |_|false),&mut rejected_sample)? else {
+            let Some(projected) = admitted(project_motion_state(map, query, &from_ground, from, length, turn, boundary, |_|false),&mut rejected_sample)? else {
                 continue;
             };
             let samples = &projected.poses;
@@ -865,8 +928,8 @@ pub(super) fn plan_progress_bound_recorded(
             if (next.0[0] - start.0[0]).hypot(next.0[1] - start.0[1]) > distance(start) + 1.0 {
                 continue;
             }
-            let next_cost = cost + projected_cost(from,samples,support_offset,tomogram,reference,motion);
-            let k = state_key(next,&projected.ground);
+            let next_cost = cost + projected_cost_navigation(from,samples,support_offset,tomogram,reference,motion,from_ground.navigation,projected.segments.as_deref());
+            let k = state_key_navigation(next,&projected.ground,projected.navigation);
             if best.get(&k).is_some_and(|&old| next_cost >= old) {
                 continue;
             }
@@ -877,13 +940,14 @@ pub(super) fn plan_progress_bound_recorded(
             if id == 0 { INITIAL_ADMISSIONS.with(|v|v.borrow_mut().push((length,turn,next))); }
             #[cfg(all(test,feature="profile"))]
             if std::env::var_os("NEH_ON_DIAGNOSTIC").is_some() && id==0 {
-                eprintln!("ON_ADMIT {}",serde_json::json!({"length":length,"turn":turn,"pose":next,"g":next_cost,"h":heuristic(next),"translation_h":4.0*remaining(next).0/motion.max_forward_mps,"progress":reference_progress([next.0[0],next.0[1],next.0[2]-support_offset],reference).1}));
+                eprintln!("ON_ADMIT {}",serde_json::json!({"length":length,"turn":turn,"pose":next,"g":next_cost,"h":heuristic(next),"translation_h":4.0*remaining(next).0/motion.max_forward_mps,"progress":reference_progress_nd([next.0[0],next.0[1],next.0[2]-support_offset],reference).1}));
             }
             best.insert(k,next_cost);
             let next_id = nodes.len();
             nodes.push(Node {
                 pose: next,
                 ground: projected.ground,
+                navigation:projected.navigation,segments:projected.segments,
                 cost: next_cost,
                 parent: Some(id),
                 samples: projected.poses,
@@ -902,19 +966,19 @@ pub(super) fn plan_progress_bound_recorded(
     super::cancellation::checkpoint()?;
     if let Some(policy)=progress_policy.filter(|_|budget_exhausted) {
         let reference=policy.reference;
-        let initial_support=map.support_position_from_body(start.0,start.1,support_offset)
-            .map_err(|error|error.to_string())?;
-        let initial_progress=reference_progress(initial_support,reference).1;
+        let initial_support=if N==3 {map.support_position_from_body(start.0,start.1,support_offset)
+            .map_err(|error|error.to_string())?} else {start.0};
+        let initial_progress=reference_progress_nd(initial_support,reference).1;
         let mut selected:Option<(usize,f64)>=None;
         for (id,node) in nodes.iter().enumerate().skip(1) {
             super::cancellation::checkpoint()?;
             if is_stale(node,&best) {continue;}
             let p=node.pose;
-            let Ok(support)=map.support_position_from_body(p.0,p.1,support_offset) else {continue;};
-            let (deviation,progress,height)=reference_progress(support,reference);
+            let support=if N==3 {let Ok(support)=map.support_position_from_body(p.0,p.1,support_offset) else {continue;};support} else {p.0};
+            let (deviation,progress,height)=reference_progress_nd(support,reference);
             if progress-initial_progress<model.radius()
                 || (p.0[0]-start.0[0]).hypot(p.0[1]-start.0[1])<policy.minimum_distance_m.max(model.radius())
-                || deviation>corridor || (support[2]-height).abs()>layer_tolerance {continue;}
+                || deviation>corridor || height.is_some_and(|height|(support[2]-height).abs()>layer_tolerance) {continue;}
             let mut along=0.0;let mut local_heading=tangent;
             for pair in reference.windows(2) {
                 let dx=pair[1][0]-pair[0][0];let dy=pair[1][1]-pair[0][1];let length=dx.hypot(dy);
@@ -929,9 +993,11 @@ pub(super) fn plan_progress_bound_recorded(
             let mut chain=Vec::new();let mut current=id;
             while let Some(parent)=nodes[current].parent {super::cancellation::checkpoint()?;chain.push(current);current=parent;}
             chain.reverse();let mut poses=vec![start];
+            let mut navigation=start_ground.navigation.map(|_|Vec::new());
             for node in chain {
                 let edge_start=poses.len()-1;
                 poses.extend_from_slice(&nodes[node].samples);
+                if let (Some(out),Some(accepted))=(&mut navigation,nodes[node].segments.take()) {out.extend(accepted);}
                 if let Some((parts,offset))=origins.as_mut() {
                     parts.push(super::CandidatePart {edges:edge_start+*offset..poses.len()-1+*offset,
                         origin:super::CandidateEdgeOrigin::Parent {node}});
@@ -946,7 +1012,7 @@ pub(super) fn plan_progress_bound_recorded(
             #[cfg(feature="profile")] if let Some(phase)=remaining_phase.as_mut() {
                 phase.finish(if partial {"partial"} else {"full"});
             }
-            return Ok(SearchPath {poses,partial});
+            return Ok(SearchPath {poses,partial,navigation});
         }
     }
     #[cfg(feature="profile")] if let Some(phase)=remaining_phase.as_mut() {
@@ -1025,7 +1091,7 @@ mod identity_tests {
         assert_eq!(high.query_state(), nuwax_nav_mls_planner::surface::GroundQueryState::Unknown);
         assert_ne!(low, high, "未知列携带的不同旧高度会影响未来重入，不能合并");
         let best = HashMap::from([(state_key(pose, &low), 1.0)]);
-        let mut node = Node { pose, ground: high, cost: 2.0, parent: None, samples: Vec::new() };
+        let mut node = Node { pose, ground: high, navigation:None,segments:None,cost: 2.0, parent: None, samples: Vec::new() };
         assert!(!is_stale(&node, &best), "相同姿态的另一地面关联不是旧标签");
         node.ground = low;
         assert!(is_stale(&node, &best), "相同完整状态仍沿用严格成本支配");
@@ -1036,7 +1102,7 @@ mod identity_tests {
         let ground = crate::tests::coarse_open_floor().body_query().start_ground_state(pose).unwrap();
         let current_cost = 1.0_f64;
         let best = HashMap::from([(state_key(pose,&ground), current_cost)]);
-        let mut node = Node { pose, ground, cost: f64::from_bits(current_cost.to_bits() + 1),
+        let mut node = Node { pose, ground, navigation:None,segments:None,cost: f64::from_bits(current_cost.to_bits() + 1),
             parent: None, samples: Vec::new() };
         assert!(is_stale(&node, &best), "an obsolete exact-pose label must not use expansion work");
         node.cost = current_cost;
@@ -1394,3 +1460,18 @@ mod reference_handoff_tests;
 #[cfg(test)]
 #[path = "terminal_turn_selection_diagnostic_tests.rs"]
 mod terminal_turn_selection_diagnostic_tests;
+
+#[cfg(test)]
+pub(super) fn assert_navigation_dominance(pose:BodyPose,physical:&BodyGroundState,
+    a:GroundWalkState<'_>,b:GroundWalkState<'_>) {
+    let ka=state_key_navigation(pose,physical,Some(a));let kb=state_key_navigation(pose,physical,Some(b));
+    assert!(ka!=kb,"same actual/physical pose retains different genuine navigation associations");
+    let mut best=HashMap::from([(ka,1.0)]);
+    let mut node=Node {pose,ground:physical.clone(),navigation:Some(b),segments:None,cost:2.0,parent:None,samples:vec![]};
+    assert!(!is_stale(&node,&best));best.insert(kb,2.0);assert!(!is_stale(&node,&best));
+    let better=f64::from_bits(2.0_f64.to_bits()-1);
+    assert!(!best.get(&state_key_navigation(pose,physical,Some(b))).is_some_and(|&old|better>=old));
+    best.insert(state_key_navigation(pose,physical,Some(b)),better);assert!(is_stale(&node,&best));
+    node.cost=better;assert!(!is_stale(&node,&best));
+    assert!(best.get(&state_key_navigation(pose,physical,Some(b))).is_some_and(|&old|better>=old));
+}

@@ -15,6 +15,7 @@ pub use local_search::probe_motion;
 use nuwax_nav_mls_planner::SurfaceSnapshot;
 use nuwax_nav_mls_planner::surface::{BodyGroundState, BodyMotionProjection, SurfaceBodyQueryView};
 use nuwax_nav_pct::Tomogram;
+use nuwax_nav_pct::ground_route::{GroundWalkState, GroundWalkSegment, GroundWalkKey};
 pub use nuwax_nav_pct::{PlanningCancellation, planning_cancelled, with_planning_cancellation};
 use nuwax_nav_types_messages::{same_finite_position, MotionKinematics};
 pub type BodyPose = ([f64; 3], [f64; 4]);
@@ -270,6 +271,126 @@ pub fn plan_mapped_ground(
     map_selected_candidate(trajectory,origins,window,boundary)
 }
 
+/// Finite progress on an independent Ground XY window; no implied body height.
+#[derive(Clone,Copy,Debug)]
+pub struct GroundProgressPrefixPolicy<'a> {pub reference:&'a [[f64;2]],pub minimum_distance_m:f64}
+/// Internal Ground successor seam. Each accepted physical edge retains its own
+/// original PCT walk. This plans intent only and does not consume actual progress.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_driven_ground(
+    map:&SurfaceSnapshot,tomogram:&Tomogram,start:BodyPose,start_ground:&BodyGroundState,
+    reference:&[[f64;2]],kinematics:&MotionKinematics,config:&ScanConfig,final_yaw:Option<f64>,
+    arrival:Option<([f64;2],f64)>,boundary:&[[f64;2]],follow_reference:bool,prefer_straight:bool,
+    progress:Option<GroundProgressPrefixPolicy<'_>>,window:nuwax_nav_pct::ground_route::GroundRouteWindow<'_>,
+)->Result<MappedLocalTrajectory,GroundCandidateError> {
+    if !window.owner().matches_source(map) || window.from().walk_state().xy()!=[start.0[0],start.0[1]] {
+        return Err(GroundCandidateError::MappingInput("navigation source/start address retired".into()));
+    }
+    cancellation::checkpoint().map_err(GroundCandidateError::Planning)?;
+    let progress=progress.map(|p|ProgressPolicy {reference:p.reference,minimum_distance_m:p.minimum_distance_m});
+    validate_progress(progress).map_err(GroundCandidateError::Planning)?;
+    let mut origins=CandidateOrigins {family:CandidateFamily::Direct,parts:Vec::new()};
+    let mut navigation=None;
+    let outcome=plan_impl(map,tomogram,start,reference,kinematics,config,final_yaw,arrival,boundary,
+        follow_reference,prefer_straight,progress,PlanExtent::Full,Some(start_ground),Some(&mut origins),
+        Some(window.from().walk_state()),&mut navigation).map_err(GroundCandidateError::Planning)?;
+    let PlanOutcome::Trajectory(trajectory)=outcome else {unreachable!("full Scan")};
+    let result=(|| ->Result<GroundCandidateBinding,LocalPlanError> {
+        cancellation::checkpoint()?;
+        let segments=navigation.unwrap_or_default();
+        if segments.len()!=trajectory.poses.len().saturating_sub(1) {
+            return Err("accepted candidate lost a navigation edge".into());
+        }
+        #[cfg(test)] GROUND_EDGE_WORK.set({let mut n=GROUND_EDGE_WORK.get();n[2]+=1;n});
+        let candidate=window.owner().freeze_candidate(segments).map_err(|e|LocalPlanError::from(e.to_string()))?;
+        let edges=trajectory.poses.windows(2).enumerate().map(|(edge,pair)|GroundMotionBinding {
+            motion:[pair[0],pair[1]],origin:origins.parts.iter().find(|part|part.edges.contains(&edge))
+                .map_or(CandidateEdgeOrigin::Family(origins.family),|part|part.origin),
+        }).collect();
+        let planned_join=!trajectory.partial && candidate.end_matches(window.to());
+        cancellation::checkpoint()?;
+        Ok(GroundCandidateBinding {original:window.freeze(),candidate,edges,family:origins.family,planned_join})
+    })();
+    match result {Ok(binding)=>Ok(MappedLocalTrajectory {trajectory,binding}),
+        Err(error) if error.kind==LocalPlanFailureKind::Cancelled=>Err(GroundCandidateError::Cancelled {trajectory,error}),
+        Err(error)=>Err(GroundCandidateError::Mapping {trajectory,reason:error.to_string()})}
+}
+// Request-local two-axis state. Navigation borrows the original PCT owner;
+// physical association remains the H3 projection input, never an inferred nav anchor.
+#[derive(Clone)]
+struct MotionState<'a> {
+    physical: BodyGroundState,
+    navigation: Option<GroundWalkState<'a>>,
+}
+impl MotionState<'_> {
+    fn body(physical: BodyGroundState) -> Self { Self {physical,navigation:None} }
+}
+struct MotionEdge<'a> {
+    physical: BodyMotionProjection,
+    navigation: Option<GroundWalkSegment<'a>>,
+}
+impl<'a> MotionEdge<'a> {
+    fn end(&self) -> MotionState<'a> {
+        MotionState {physical:self.physical.ground().clone(),navigation:self.navigation.as_ref().map(GroundWalkSegment::end)}
+    }
+}
+struct MotionPath<'a> { poses:Vec<BodyPose>, navigation:Option<Vec<GroundWalkSegment<'a>>> }
+impl<'a> MotionPath<'a> {
+    fn publish(self, target:&mut Option<Vec<GroundWalkSegment<'a>>>) -> Vec<BodyPose> {
+        *target=self.navigation; self.poses
+    }
+}
+#[derive(Clone,Copy)]
+struct ProgressPolicy<'a,const N:usize> {reference:&'a [[f64;N]],minimum_distance_m:f64}
+impl<'a> From<ProgressPrefixPolicy<'a>> for ProgressPolicy<'a,3> {
+    fn from(p:ProgressPrefixPolicy<'a>)->Self {Self {reference:p.reference,minimum_distance_m:p.minimum_distance_m}}
+}
+// N=3 is the original Body coordinate contract; N=2 is actual Ground XY.
+// No missing ground height is represented by a numeric third coordinate.
+fn goal_distance<const N:usize>(pose:[f64;3],goal:[f64;N])->f64 {
+    if N==3 {distance3(pose,[goal[0],goal[1],goal[2]])}
+    else {(pose[0]-goal[0]).hypot(pose[1]-goal[1])}
+}
+fn goal_exact<const N:usize>(pose:[f64;3],goal:[f64;N])->bool {
+    if N==3 {same_finite_position(pose,[goal[0],goal[1],goal[2]])}
+    else {pose[..2]==goal[..] && pose[..2].iter().all(|v|v.is_finite())}
+}
+#[cfg(test)]
+thread_local! {static GROUND_EDGE_WORK:std::cell::Cell<[usize;3]>=const {std::cell::Cell::new([0;3])};}
+fn project_edge<'a>(query:&SurfaceBodyQueryView,state:&MotionState<'a>,from:BodyPose,
+    xy:[f64;2],heading:f64,boundary:&[[f64;2]])->Result<MotionEdge<'a>,LocalPlanError> {
+    let Some(navigation)=state.navigation else {
+        return project_endpoint(query,&state.physical,from,xy,heading)
+            .map(|physical|MotionEdge {physical,navigation:None});
+    };
+    cancellation::checkpoint()?;
+    #[cfg(test)] GROUND_EDGE_WORK.set({let mut n=GROUND_EDGE_WORK.get();n[0]+=1;n});
+    let segment=navigation.walk_xy(xy,boundary,None).map_err(|e|LocalPlanError::from(e.to_string()))?;
+    cancellation::checkpoint()?;
+    let mut witness=None;
+    #[cfg(feature="profile")] let began=std::time::Instant::now();
+    // The adapter's source is only the navigation binding. The current request
+    // query retains recent observations and supplies the actual physical kernel.
+    let next=segment.with_body_navigation(|_,nav|
+        query.project_motion_with_navigation(from,&state.physical,xy,heading,nav,&mut witness))
+        .map_err(|e|LocalPlanError::from(e.to_string()))?;
+    #[cfg(feature="profile")] profile::record(1,began,next.is_err());
+    cancellation::checkpoint()?;
+    let physical=next.map_err(|e|LocalPlanError::from_surface(e,witness))?;
+    Ok(MotionEdge {physical,navigation:Some(segment)})
+}
+fn advance_state<'a>(query:&SurfaceBodyQueryView,state:&mut MotionState<'a>,from:BodyPose,
+    xy:[f64;2],heading:f64,boundary:&[[f64;2]],segments:&mut Option<Vec<GroundWalkSegment<'a>>>)
+    ->Result<BodyPose,LocalPlanError> {
+    cancellation::checkpoint()?;
+    let edge=project_edge(query,state,from,xy,heading,boundary)?;
+    check_projected_motion(query,from,&edge.physical,boundary)?;
+    #[cfg(test)] if edge.navigation.is_some() {GROUND_EDGE_WORK.set({let mut n=GROUND_EDGE_WORK.get();n[1]+=1;n});}
+    *state=edge.end();
+    let pose=edge.physical.pose();
+    if let (Some(out),Some(segment))=(segments,edge.navigation) {out.push(segment);}
+    Ok(pose)
+}
 fn distance3(a: [f64; 3], b: [f64; 3]) -> f64 {
     ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
 }
@@ -353,13 +474,20 @@ fn check_projected_motion(
     checked.map_err(|e|LocalPlanError::from_surface(e,witness))?;
     Ok(())
 }
-fn rotate_bound(
+fn rotate_bound(query:&SurfaceBodyQueryView,ground:&mut BodyGroundState,poses:&mut Vec<BodyPose>,
+    heading:f64,kinematics:&MotionKinematics,boundary:&[[f64;2]])->Result<(),LocalPlanError> {
+    let mut state=MotionState::body(ground.clone());
+    rotate_state(query,&mut state,poses,heading,kinematics,boundary,&mut None)?;
+    *ground=state.physical; Ok(())
+}
+fn rotate_state<'a>(
     query: &SurfaceBodyQueryView,
-    ground: &mut BodyGroundState,
+    ground: &mut MotionState<'a>,
     poses: &mut Vec<BodyPose>,
     heading: f64,
     kinematics: &MotionKinematics,
     boundary: &[[f64; 2]],
+    segments: &mut Option<Vec<GroundWalkSegment<'a>>>,
 ) -> Result<(), LocalPlanError> {
     cancellation::checkpoint()?;
     let from = *poses.last().unwrap();
@@ -383,17 +511,19 @@ fn rotate_bound(
         let mut candidate = Vec::with_capacity(n);
         let mut previous = from;
         let mut candidate_ground = ground.clone();
+        let mut candidate_segments=ground.navigation.map(|_|Vec::new());
         let mut failed = false;
         for i in 1..=n {
             cancellation::checkpoint()?;
             // 原地转向保持实际中心和相对地面倾斜；不能把地面法向绕世界Z轴转走。
-            let result = advance_bound(
+            let result = advance_state(
                 query,
                 &mut candidate_ground,
                 previous,
                 [from.0[0], from.0[1]],
                 yaw(from.1) + delta * i as f64 / n as f64,
                 boundary,
+                &mut candidate_segments,
             );
             let next = match result {
                 Ok(next) => next,
@@ -406,6 +536,7 @@ fn rotate_bound(
         if !failed {
             poses.extend(candidate);
             *ground = candidate_ground;
+            if let (Some(out),Some(accepted))=(segments.as_mut(),candidate_segments) {out.extend(accepted);}
             return Ok(());
         }
     }
@@ -417,90 +548,101 @@ fn rotate(map: &SurfaceSnapshot, poses: &mut Vec<BodyPose>, heading: f64,
     let (query, mut ground) = bind_query(map, *poses.last().unwrap())?;
     rotate_bound(&query, &mut ground, poses, heading, kinematics, boundary)
 }
-fn project_bound(
+fn project_bound(map:&SurfaceSnapshot,query:&SurfaceBodyQueryView,start_ground:&BodyGroundState,
+    start:BodyPose,points:&[[f64;3]],kinematics:&MotionKinematics,smooth:bool,final_yaw:Option<f64>,
+    arrival:Option<([f64;3],f64)>,boundary:&[[f64;2]],blocked:&std::cell::Cell<Option<[f64;3]>>)
+    ->Result<Vec<BodyPose>,LocalPlanError> {
+    project_state(map,query,&MotionState::body(start_ground.clone()),start,points,kinematics,smooth,
+        final_yaw,arrival,boundary,blocked).map(|path|path.poses)
+}
+fn project_state<'a,const N:usize>(
     map: &SurfaceSnapshot,
     query: &SurfaceBodyQueryView,
-    start_ground: &BodyGroundState,
+    start_ground: &MotionState<'a>,
     start: BodyPose,
-    points: &[[f64; 3]],
+    points: &[[f64; N]],
     kinematics: &MotionKinematics,
     smooth: bool,
     final_yaw: Option<f64>,
-    arrival: Option<([f64; 3], f64)>,
+    arrival: Option<([f64; N], f64)>,
     boundary: &[[f64; 2]],
     blocked: &std::cell::Cell<Option<[f64; 3]>>,
-) -> Result<Vec<BodyPose>, LocalPlanError> {
+) -> Result<MotionPath<'a>, LocalPlanError> {
     if let Some((goal,tolerance))=arrival {
         // 可达参考终点优先保留，避免局部轨迹主动截在到达边缘而提前减速。
         // 这只选择候选，不缩小合法目标球；中心不可站立仍回退原区域投影。
         let endpoint_blocked=std::cell::Cell::new(None);
-        if let Some(poses)=admit_candidate(project_to_region(map,query,start_ground,start,points,kinematics,
+        if let Some(poses)=admit_candidate(project_to_region_state(map,query,start_ground,start,points,kinematics,
             smooth,final_yaw,None,boundary,&endpoint_blocked))? {
-            if poses.last().is_some_and(|end| if tolerance == 0.0 {
-                same_finite_position(end.0, goal)
-            } else { distance3(end.0,goal)<tolerance }) {
+            if poses.poses.last().is_some_and(|end| if tolerance == 0.0 {
+                goal_exact(end.0, goal)
+            } else { goal_distance(end.0,goal)<tolerance }) {
                 return Ok(poses);
             }
         }
     }
-    project_to_region(map,query,start_ground,start,points,kinematics,smooth,final_yaw,arrival,boundary,blocked)
+    project_to_region_state(map,query,start_ground,start,points,kinematics,smooth,final_yaw,arrival,boundary,blocked)
 }
 
 #[cfg(test)]
-fn project(map: &SurfaceSnapshot, start: BodyPose, points: &[[f64; 3]],
-    kinematics: &MotionKinematics, smooth: bool, final_yaw: Option<f64>,
-    arrival: Option<([f64; 3], f64)>, boundary: &[[f64; 2]],
-    blocked: &std::cell::Cell<Option<[f64; 3]>>) -> Result<Vec<BodyPose>, LocalPlanError> {
-    let (query, ground) = bind_query(map, start)?;
-    project_bound(map, &query, &ground, start, points, kinematics, smooth, final_yaw,
-        arrival, boundary, blocked)
+fn project_to_region(map:&SurfaceSnapshot,query:&SurfaceBodyQueryView,start_ground:&BodyGroundState,
+    start:BodyPose,points:&[[f64;3]],kinematics:&MotionKinematics,smooth:bool,final_yaw:Option<f64>,
+    arrival:Option<([f64;3],f64)>,boundary:&[[f64;2]],blocked:&std::cell::Cell<Option<[f64;3]>>)
+    ->Result<Vec<BodyPose>,LocalPlanError> {
+    project_to_region_state(map,query,&MotionState::body(start_ground.clone()),start,points,kinematics,smooth,
+        final_yaw,arrival,boundary,blocked).map(|path|path.poses)
 }
-
-fn project_to_region(
+fn project_to_region_state<'a,const N:usize>(
     map: &SurfaceSnapshot,
     query: &SurfaceBodyQueryView,
-    start_ground: &BodyGroundState,
+    start_ground: &MotionState<'a>,
     start: BodyPose,
-    points: &[[f64; 3]],
+    points: &[[f64; N]],
     kinematics: &MotionKinematics,
     smooth: bool,
     final_yaw: Option<f64>,
-    arrival: Option<([f64; 3], f64)>,
+    arrival: Option<([f64; N], f64)>,
     boundary: &[[f64; 2]],
     blocked: &std::cell::Cell<Option<[f64; 3]>>,
-) -> Result<Vec<BodyPose>, LocalPlanError> {
+) -> Result<MotionPath<'a>, LocalPlanError> {
     cancellation::checkpoint()?;
     let mut poses = vec![start];
     let mut ground = start_ground.clone();
+    let mut segments=ground.navigation.map(|_|Vec::new());
     let mut valid = Vec::new();
     for &point in points {
         cancellation::checkpoint()?;
         if (point[0] - start.0[0]).hypot(point[1] - start.0[1]) > 1e-5 { valid.push(point); }
     }
     if valid.is_empty() {
+        if ground.navigation.is_some() {
+            let next=advance_state(query,&mut ground,start,[start.0[0],start.0[1]],yaw(start.1),boundary,&mut segments)?;
+            poses.push(next);
+        }
         if arrival.is_some_and(|(goal, tolerance)| if tolerance == 0.0 {
-            !same_finite_position(start.0, goal)
-        } else { distance3(start.0, goal) >= tolerance }) {
+            !goal_exact(start.0, goal)
+        } else { goal_distance(start.0, goal) >= tolerance }) {
             return Err("近场参考尚未到达原三维目标区域".into());
         }
         if let Some(yaw) = final_yaw {
-            rotate_bound(query, &mut ground, &mut poses, yaw, kinematics, boundary)?;
+            rotate_state(query, &mut ground, &mut poses, yaw, kinematics, boundary, &mut segments)?;
         }
         // 转向可按地形重投影高度；零容差仍须保留原三维位置。
         if arrival.is_some_and(|(goal, tolerance)| tolerance == 0.0
-            && !same_finite_position(poses.last().unwrap().0, goal)) {
+            && !goal_exact(poses.last().unwrap().0, goal)) {
             return Err("地形投影后的末点尚未到达原三维目标区域".into());
         }
-        return Ok(poses);
+        return Ok(MotionPath {poses,navigation:segments});
     }
     let first = valid[0];
-    rotate_bound(
+    rotate_state(
         query,
         &mut ground,
         &mut poses,
         (first[1] - start.0[1]).atan2(first[0] - start.0[0]),
         kinematics,
         boundary,
+        &mut segments,
     )?;
     for (index, point) in valid.iter().enumerate() {
         cancellation::checkpoint()?;
@@ -523,7 +665,7 @@ fn project_to_region(
             return Err("样条存在切向反折，需要显式转向接续".into());
         }
         if !smooth && change.abs() > 0.03 {
-            rotate_bound(query, &mut ground, &mut poses, tangent, kinematics, boundary)?;
+            rotate_state(query, &mut ground, &mut poses, tangent, kinematics, boundary, &mut segments)?;
         }
         if smooth
             && kinematics.minimum_turning_radius_m > 0.0
@@ -536,7 +678,7 @@ fn project_to_region(
         if let Some((goal, tolerance)) = arrival {
             // 在进入原三维到达球的位置截取末段，不强迫机体走到不可站立的点击中心。
             let delta = [xy[0] - previous.0[0], xy[1] - previous.0[1]];
-            let dz = previous.0[2] - goal[2];
+            let dz = if N==3 {previous.0[2] - goal[2]} else {0.0};
             let endpoint_distance = (xy[0] - goal[0]).hypot(xy[1] - goal[1]).hypot(dz);
             if endpoint_distance < tolerance && delta[0] * delta[0] + delta[1] * delta[1] > 1e-12 {
                 let mut low = 0.0;
@@ -559,7 +701,7 @@ fn project_to_region(
                 ];
             }
         }
-        let next = advance_bound(query, &mut ground, previous, xy, tangent, boundary).map_err(|mut error| {
+        let next = advance_state(query, &mut ground, previous, xy, tangent, boundary, &mut segments).map_err(|mut error| {
             if !matches!(error.kind, LocalPlanFailureKind::Cancelled)
                 && blocked.get().is_none() {
                 blocked.set(Some([xy[0], xy[1], previous.0[2]]));
@@ -569,18 +711,15 @@ fn project_to_region(
         })?;
         // 地形投影不得跳至层析参考的另一楼层。
         let offset = map.body_envelope().unwrap().body_to_support_z_m;
-        if (next.0[2] - offset - point[2]).abs()
+        if N==3 && (next.0[2] - offset - point[2]).abs()
             > f64::from(map.config().step_threshold_m + map.config().voxel_size) * 2.0
         {
             return Err("局部地形与参考路线不在同一高度层".into());
         }
         poses.push(next);
         if arrival.is_some_and(|(goal, tolerance)| {
-            if tolerance == 0.0 { return same_finite_position(next.0, goal); }
-            ((next.0[0] - goal[0]).powi(2)
-                + (next.0[1] - goal[1]).powi(2)
-                + (next.0[2] - goal[2]).powi(2))
-            .sqrt()
+            if tolerance == 0.0 { return goal_exact(next.0, goal); }
+            goal_distance(next.0,goal)
                 < tolerance
         }) {
             break;
@@ -588,22 +727,32 @@ fn project_to_region(
     }
     if arrival
         .is_some_and(|(goal, tolerance)| if tolerance == 0.0 {
-            !same_finite_position(poses.last().unwrap().0, goal)
-        } else { distance3(poses.last().unwrap().0, goal) >= tolerance })
+            !goal_exact(poses.last().unwrap().0, goal)
+        } else { goal_distance(poses.last().unwrap().0, goal) >= tolerance })
     {
         return Err("地形投影后的末点尚未到达原三维目标区域".into());
     }
     if let Some(heading) = final_yaw {
-        rotate_bound(query, &mut ground, &mut poses, heading, kinematics, boundary)?;
+        rotate_state(query, &mut ground, &mut poses, heading, kinematics, boundary, &mut segments)?;
     }
     // 不改变正容差的原检查顺序；新零值出口验证最终完整姿态的位置。
     if arrival.is_some_and(|(goal, tolerance)| tolerance == 0.0
-        && !same_finite_position(poses.last().unwrap().0, goal)) {
+        && !goal_exact(poses.last().unwrap().0, goal)) {
         return Err("地形投影后的末点尚未到达原三维目标区域".into());
     }
     cancellation::checkpoint()?;
-    Ok(poses)
+    Ok(MotionPath {poses,navigation:segments})
 }
+#[cfg(test)]
+fn project(map: &SurfaceSnapshot, start: BodyPose, points: &[[f64; 3]],
+    kinematics: &MotionKinematics, smooth: bool, final_yaw: Option<f64>,
+    arrival: Option<([f64; 3], f64)>, boundary: &[[f64; 2]],
+    blocked: &std::cell::Cell<Option<[f64; 3]>>) -> Result<Vec<BodyPose>, LocalPlanError> {
+    let (query, ground) = bind_query(map, start)?;
+    project_bound(map, &query, &ground, start, points, kinematics, smooth, final_yaw,
+        arrival, boundary, blocked)
+}
+
 /// 参考坐标为支撑面；起点保留实际机体完整站姿，必要时执行完整近场搜索。
 pub fn plan(
     map: &SurfaceSnapshot,
@@ -702,14 +851,12 @@ fn plan_with_extent_recorded(
     initial_ground: Option<&BodyGroundState>,
     origins: Option<&mut CandidateOrigins>,
 ) -> Result<PlanOutcome, LocalPlanError> {
+    #[cfg(feature="profile")]
+    let _profile=profile::Scope::begin(start,reference,kinematics,config,final_yaw,arrival,follow_reference,prefer_straight);
     cancellation::checkpoint()?;
-    if progress.is_some_and(|policy| !policy.minimum_distance_m.is_finite()
-        || policy.minimum_distance_m<0.0 || policy.reference.is_empty()
-        || policy.reference.iter().flatten().any(|value|!value.is_finite())) {
-        return Err("有限进度策略缺少有效的原全局窗口或控制距离".into());
-    }
+    validate_progress(progress.map(Into::into))?;
     let result = plan_impl(map, tomogram, start, reference, kinematics, config, final_yaw,
-        arrival, boundary, follow_reference, prefer_straight,progress,extent,initial_ground,origins);
+        arrival, boundary, follow_reference, prefer_straight,progress.map(Into::into),extent,initial_ground,origins,None,&mut None);
     cancellation::checkpoint()?;
     result.map_err(|mut failure| {
         if let Some(witness)=failure.body_witness.take() {
@@ -718,6 +865,15 @@ fn plan_with_extent_recorded(
         }
         failure
     })
+}
+
+fn validate_progress<const N:usize>(progress:Option<ProgressPolicy<'_,N>>)->Result<(),LocalPlanError> {
+    if progress.is_some_and(|policy| !policy.minimum_distance_m.is_finite()
+        || policy.minimum_distance_m<0.0 || policy.reference.is_empty()
+        || policy.reference.iter().flatten().any(|value|!value.is_finite())) {
+        return Err("有限进度策略缺少有效的原全局窗口或控制距离".into());
+    }
+    Ok(())
 }
 
 /// Result of the existing reference candidate family, before local search.
@@ -802,25 +958,25 @@ fn merge_search_result<T>(result: Result<T, LocalPlanError>, polyline: LocalPlan
     })
 }
 
-fn plan_impl(
+fn plan_impl<'a,const N:usize>(
     map: &SurfaceSnapshot,
     tomogram: &Tomogram,
     start: BodyPose,
-    reference: &[[f64; 3]],
+    reference: &[[f64; N]],
     kinematics: &MotionKinematics,
     config: &ScanConfig,
     final_yaw: Option<f64>,
-    arrival: Option<([f64; 3], f64)>,
+    arrival: Option<([f64; N], f64)>,
     boundary: &[[f64; 2]],
     follow_reference: bool,
     prefer_straight: bool,
-    progress: Option<ProgressPrefixPolicy<'_>>,
+    progress: Option<ProgressPolicy<'_,N>>,
     extent: PlanExtent,
     initial_ground: Option<&BodyGroundState>,
     mut origins: Option<&mut CandidateOrigins>,
+    initial_navigation:Option<GroundWalkState<'a>>,
+    navigation_output:&mut Option<Vec<GroundWalkSegment<'a>>>,
 ) -> Result<PlanOutcome, LocalPlanError> {
-    #[cfg(feature="profile")]
-    let _profile=profile::Scope::begin(start,reference,kinematics,config,final_yaw,arrival,follow_reference,prefer_straight);
     #[cfg(feature="profile")]
     let mut phase = profile::Phase::begin("scan_setup");
     cancellation::checkpoint()?;
@@ -840,7 +996,8 @@ fn plan_impl(
         .fold(0.0, f64::max);
     let model = map.body_envelope().unwrap();
     // 来源只由本次规划拥有方绑定一次，候选分支只复制小地面状态。
-    let (query, start_ground) = bind_query_with_ground(map, start, initial_ground)?;
+    let (query, physical) = bind_query_with_ground(map, start, initial_ground)?;
+    let start_ground=MotionState {physical,navigation:initial_navigation};
     let xmin = model
         .footprint_xy_m
         .iter()
@@ -889,10 +1046,11 @@ fn plan_impl(
                 let samples=spline::resample(&[origin,end],spacing)?;
                 for region in [interior,arrival] {
                     cancellation::checkpoint()?;
-                    if let Some(poses)=admit_candidate(project_bound(map, &query, &start_ground,start,&samples,kinematics,false,final_yaw,region,boundary,&blocked))? {
+                    if let Some(poses)=admit_candidate(project_state(map, &query, &start_ground,start,&samples,kinematics,false,final_yaw,region,boundary,&blocked))? {
                         #[cfg(feature="profile")]
                         profile::success();
                         if let Some(origins)=origins.as_deref_mut() {origins.family=CandidateFamily::Direct;}
+                        let poses=poses.publish(navigation_output);
                         return Ok(PlanOutcome::Trajectory(LocalTrajectory { partial: false,poses,smoothed:false,
                             elapsed_ms:began.elapsed().as_secs_f64()*1000.0}));
                     }
@@ -904,22 +1062,23 @@ fn plan_impl(
     #[cfg(feature="profile")] phase.next("quick_step_turn");
     // 台阶后紧接转弯时，先给完整机身留出离开阶边的空间。该参考候选
     // 与普通折线共用全部真实机体检查；失败不修改地图、代价或运动能力。
-    if let Some(guide) = step_turn::guide(map, &query, &start_ground, start, reference, config, arrival.is_some())? {
+    if let Some(guide) = step_turn::guide_state(map, &query, &start_ground, start, reference, config, arrival.is_some(),boundary)? {
         let samples = spline::resample(&guide, spacing)?;
         let candidate_blocked = std::cell::Cell::new(None);
-        if let Some(poses) = admit_candidate(project_bound(map, &query, &start_ground, start, &samples, kinematics, false,
+        if let Some(poses) = admit_candidate(project_state(map, &query, &start_ground, start, &samples, kinematics, false,
             final_yaw, interior, boundary, &candidate_blocked))? {
-            let end = *poses.last().unwrap();
+            let end = *poses.poses.last().unwrap();
             let corridor = (config.reference_corridor_m * 0.9).min(config.horizon_m * 0.3);
             let layer_tolerance = (model.body_to_support_z_m + model.z_bounds_m[1]) * 0.5;
             let length = reference.windows(2).map(|w| (w[1][0]-w[0][0]).hypot(w[1][1]-w[0][1])).sum();
             let tangent = reference.windows(2).rfind(|w| (w[1][0]-w[0][0]).hypot(w[1][1]-w[0][1])>1e-9)
                 .map_or(yaw(start.1), |w| (w[1][1]-w[0][1]).atan2(w[1][0]-w[0][0]));
-            if arrival.is_some() || local_search::reference_handoff(map, end, reference,
+            if arrival.is_some() || local_search::reference_handoff_nd(map, end, reference,
                 model.body_to_support_z_m, corridor, layer_tolerance, length, tangent) {
                 #[cfg(feature="profile")]
                 profile::success();
                 if let Some(origins)=origins.as_deref_mut() {origins.family=CandidateFamily::StepTurn;}
+                        let poses=poses.publish(navigation_output);
                         return Ok(PlanOutcome::Trajectory(LocalTrajectory { partial: false, poses, smoothed: false,
                     elapsed_ms: began.elapsed().as_secs_f64() * 1000.0 }));
             }
@@ -953,10 +1112,11 @@ fn plan_impl(
         let samples = spline::sample(&controls, spacing)?;
         // 捷径受阻只否决该候选，不能把它的碰撞点当作原参考走廊受阻的证据。
         let shortcut_blocked = std::cell::Cell::new(None);
-        if let Some(poses) = admit_candidate(project_bound(map, &query, &start_ground, start, &samples, kinematics, true, final_yaw, interior, boundary, &shortcut_blocked))? {
+        if let Some(poses) = admit_candidate(project_state(map, &query, &start_ground, start, &samples, kinematics, true, final_yaw, interior, boundary, &shortcut_blocked))? {
             #[cfg(feature="profile")]
             profile::success();
             if let Some(origins)=origins.as_deref_mut() {origins.family=CandidateFamily::Rejoin;}
+                        let poses=poses.publish(navigation_output);
                         return Ok(PlanOutcome::Trajectory(LocalTrajectory { partial: false, poses, smoothed: true, elapsed_ms: began.elapsed().as_secs_f64()*1000.0 }));
         }
     }
@@ -969,18 +1129,17 @@ fn plan_impl(
     for optimize_obstacles in [false, true] {
         #[cfg(feature="profile")] phase.next(if optimize_obstacles {"quick_spline_optimized"} else {"quick_spline_reference"});
         cancellation::checkpoint()?;
-        let controls = if optimize_obstacles { spline::optimize(
-            reference,
-            tomogram,
-            radius,
-            centers,
-            config.optimization_iterations,
-            Some(departure),
-        ) } else { spline::resample(reference, 0.25_f64.max(tomogram.resolution)) }?;
+        let proposed = if optimize_obstacles { spline::optimize_navigation(
+            reference,tomogram,radius,centers,config.optimization_iterations,Some(departure),
+            start_ground.navigation,boundary,
+        ) } else { spline::resample(reference, 0.25_f64.max(tomogram.resolution)) };
+        let controls=if start_ground.navigation.is_some() {
+            let Some(controls)=admit_candidate(proposed)? else {continue;}; controls
+        } else {proposed?};
         let sampled = spline::sample(&controls, spacing)?;
         for goal_region in [interior, arrival] {
             cancellation::checkpoint()?;
-            match project_bound(
+            match project_state(
                 map, &query, &start_ground,
                 start,
                 &sampled,
@@ -995,6 +1154,7 @@ fn plan_impl(
                     #[cfg(feature="profile")]
                         profile::success();
                         if let Some(origins)=origins.as_deref_mut() {origins.family=CandidateFamily::Spline { optimized: optimize_obstacles };}
+                        let poses=poses.publish(navigation_output);
                         return Ok(PlanOutcome::Trajectory(LocalTrajectory { partial: false,
                         poses,
                         smoothed: true,
@@ -1018,13 +1178,14 @@ fn plan_impl(
     let sampled = spline::resample(reference, spacing)?;
     #[cfg(test)]
     polyline_reuse_tests::record_projection();
-    let polyline_error = match project_bound(
+    let polyline_error = match project_state(
         map, &query, &start_ground, start, &sampled, kinematics, false, final_yaw, interior, boundary, &blocked,
     ) {
         Ok(poses) => {
             #[cfg(feature="profile")]
             profile::success();
             if let Some(origins)=origins.as_deref_mut() {origins.family=CandidateFamily::Polyline;}
+                        let poses=poses.publish(navigation_output);
                         return Ok(PlanOutcome::Trajectory(LocalTrajectory { partial: false,
                 poses,
                 smoothed: false,
@@ -1054,11 +1215,11 @@ fn plan_impl(
             }
             attempted += 1;
             let t = (i as f64 + 0.5) / count as f64;
-            let center = [
-                pair[0][0] + t * dx,
-                pair[0][1] + t * dy,
-                pair[0][2] + model.body_to_support_z_m,
-            ];
+            let xy=[pair[0][0]+t*dx,pair[0][1]+t*dy];
+            let center=if N==3 {[xy[0],xy[1],pair[0][2]+model.body_to_support_z_m]} else {
+                let Some(edge)=admit_candidate(project_edge(&query,&start_ground,start,xy,heading,boundary))?
+                    else {continue;}; edge.physical.pose().0
+            };
             let Ok(candidates) =
                 map.body_passage_candidates(center, heading, [0.15, model.radius() * 2.0])
             else {
@@ -1070,7 +1231,7 @@ fn plan_impl(
                 {
                     continue;
                 }
-                let support = |p: [f64; 3]| [p[0], p[1], p[2] - model.body_to_support_z_m];
+                let support = |p: [f64; 3]| -> [f64;N] {std::array::from_fn(|axis| if axis<2 {p[axis]} else {p[2]-model.body_to_support_z_m})};
                 let mut guide = vec![reference[0]];
                 let entry = candidate.entry_xyz;
                 if (entry[0] - start.0[0]) * heading.cos() + (entry[1] - start.0[1]) * heading.sin()
@@ -1081,12 +1242,13 @@ fn plan_impl(
                 guide.push(support(candidate.exit_xyz));
                 guide.push(*reference.last().unwrap());
                 let samples = spline::resample(&guide, spacing)?;
-                if let Some(poses) = admit_candidate(project_bound(
+                if let Some(poses) = admit_candidate(project_state(
                     map, &query, &start_ground, start, &samples, kinematics, false, final_yaw, arrival, boundary, &blocked,
                 ))? {
                     #[cfg(feature="profile")]
                         profile::success();
                         if let Some(origins)=origins.as_deref_mut() {origins.family=CandidateFamily::Passage;}
+                        let poses=poses.publish(navigation_output);
                         return Ok(PlanOutcome::Trajectory(LocalTrajectory { partial: false,
                         poses,
                         smoothed: false,
@@ -1111,7 +1273,7 @@ fn plan_impl(
     } else {
         #[cfg(test)]
         polyline_reuse_tests::record_projection();
-        project_bound(map, &query, &start_ground, start, &sampled, kinematics, false, final_yaw, arrival, boundary, &blocked)
+        project_state(map, &query, &start_ground, start, &sampled, kinematics, false, final_yaw, arrival, boundary, &blocked)
     };
     let (poses, partial) = match polyline {
         Ok(poses) => {
@@ -1130,13 +1292,14 @@ fn plan_impl(
             // 不能因样条失败又把尚未完成的转向混进前进动作。
             let mut prefix=vec![start];
             let mut search_ground=start_ground.clone();
+            let mut prefix_navigation=start_ground.navigation.map(|_|Vec::new());
             let departure_distance=reference.iter().find(|p|(p[0]-start.0[0]).hypot(p[1]-start.0[1])>1e-5)
                 .map_or(0.0,|p|(p[0]-start.0[0]).hypot(p[1]-start.0[1]));
             // 首个拐点位于机体尺度内时，不能用起步圆弧吞掉这段方向。
             // 更长的段已经尝试过直线和样条；它们失败后允许搜索必要的绕障曲线。
             let search_start=if departure_distance<=model.radius()*2.0
                 && angle(departure-yaw(start.1)).abs()>std::f64::consts::FRAC_PI_2
-                && admit_candidate(rotate_bound(&query,&mut search_ground,&mut prefix,departure,kinematics,boundary))?.is_some() {
+                && admit_candidate(rotate_state(&query,&mut search_ground,&mut prefix,departure,kinematics,boundary,&mut prefix_navigation))?.is_some() {
                 *prefix.last().unwrap()
             }else{start};
             #[cfg(feature="profile")] drop(phase);
@@ -1145,7 +1308,7 @@ fn plan_impl(
                 origins.parts.push(CandidatePart {edges:0..prefix.len().saturating_sub(1),origin:CandidateEdgeOrigin::Departure});
             }
             let prefix_edges=prefix.len().saturating_sub(1);
-            merge_search_result(local_search::plan_progress_bound_recorded(
+            merge_search_result(local_search::plan_progress_state(
             map,
             &query,
             &search_ground,
@@ -1165,12 +1328,14 @@ fn plan_impl(
         )
         .map(|result| {
             prefix.extend(result.poses.into_iter().skip(1));
-            (prefix,result.partial)
+            if let (Some(out),Some(accepted))=(&mut prefix_navigation,result.navigation) {out.extend(accepted);}
+            (MotionPath {poses:prefix,navigation:prefix_navigation},result.partial)
         }), polyline, failures.first())?
         },
     };
     #[cfg(feature="profile")]
     profile::success();
+    let poses=poses.publish(navigation_output);
     Ok(PlanOutcome::Trajectory(LocalTrajectory { partial,
         poses,
         smoothed: false,

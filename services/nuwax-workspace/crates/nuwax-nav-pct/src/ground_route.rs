@@ -323,6 +323,8 @@ pub struct GroundWalkState<'a> {map:&'a Tomogram,reference:Reference,xy:[f64;2]}
 pub struct GroundWalkKey {owner:usize,reference:Reference,xy:[u64;2]}
 impl<'a> GroundWalkState<'a> {
     pub fn xy(self)->[f64;2] {self.xy}
+    /// Height of this independent planned association; Unanchored stays None.
+    pub fn planned_ground_z(self)->Option<f64> {self.map.reference_height_at(self.reference,self.xy)}
     pub fn semantic_key(self)->GroundWalkKey {
         GroundWalkKey {owner:std::ptr::from_ref(self.map) as usize,reference:self.reference,xy:self.xy.map(f64::to_bits)}
     }

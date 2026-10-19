@@ -98,3 +98,23 @@ fn default_search_outcomes_are_stable_across_repeated_requests() {
         }
     }
 }
+
+#[test]
+fn c1c2_06_rotation_keeps_navigation_and_failed_directions_do_not_commit() {
+    let map=coarse_open_floor();let start=([100.,100.,0.55],[0.,0.,0.,1.]);
+    let route=c1b_route(&map,start,[100.1,100.]);let mut state=c2_state(&map,start,&route);
+    let original=state.clone();let mut poses=vec![start];let mut segments=Some(Vec::new());
+    rotate_state(&map.body_query(),&mut state,&mut poses,0.5,&motion(),&[],&mut segments).unwrap();
+    assert!(poses.len()>2);assert!(poses.iter().all(|p|p.0==start.0));
+    assert_eq!(state.physical,original.physical);assert_eq!(state.navigation.unwrap().semantic_key(),original.navigation.unwrap().semantic_key());
+    assert_eq!(segments.as_ref().unwrap().len(),poses.len()-1);
+    assert!(segments.unwrap().iter().all(|s|s.end().planned_ground_z().is_none()));
+    let (map,start)=fine_escape_scene(false,[1,0],false,2);let route=c1b_route(&map,start,[start.0[0]+0.01,start.0[1]]);
+    let mut state=c2_state(&map,start,&route);let physical=state.physical.clone();let key=state.navigation.unwrap().semantic_key();
+    let mut poses=vec![start];let mut segments=Some(Vec::new());
+    let failed=rotate_state(&map.body_query(),&mut state,&mut poses,0.3,&motion(),&[],&mut segments);
+    assert!(failed.is_err());assert_eq!(poses,vec![start]);assert!(segments.as_ref().unwrap().is_empty());
+    assert_eq!(state.physical,physical);assert_eq!(state.navigation.unwrap().semantic_key(),key);
+    advance_state(&map.body_query(),&mut state,start,[start.0[0]+0.01,start.0[1]],0.0,&[],&mut segments).unwrap();
+    eprintln!("C1C2_ROTATION retained zero-XY edges; both rejected turn alternatives preserve entry; sampled H/L/H same-pose event family NOT_COVERED here");
+}

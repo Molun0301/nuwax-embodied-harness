@@ -1,11 +1,11 @@
 //! 均匀三次B样条：控制点优化与固定起终点边界，不在显示端伪造平滑。
-use nuwax_nav_pct::Tomogram;
+use nuwax_nav_pct::{ground_route::GroundWalkState, Tomogram};
 use crate::{cancellation::checkpoint, LocalPlanError};
 pub type Point = [f64; 3];
-fn length(a: Point, b: Point) -> f64 {
+fn length<const N: usize>(a: [f64; N], b: [f64; N]) -> f64 {
     (a[0] - b[0]).hypot(a[1] - b[1])
 }
-pub fn resample(points: &[Point], spacing: f64) -> Result<Vec<Point>, LocalPlanError> {
+pub fn resample<const N: usize>(points: &[[f64; N]], spacing: f64) -> Result<Vec<[f64; N]>, LocalPlanError> {
     checkpoint()?;
     let mut result = vec![points[0]];
     for pair in points.windows(2) {
@@ -34,6 +34,41 @@ pub fn optimize(
     iterations: usize,
     initial_heading: Option<f64>,
 ) -> Result<Vec<Point>, LocalPlanError> {
+    optimize_navigation(reference, map, radius, centers, iterations, initial_heading, None, &[])
+}
+#[cfg(test)]
+thread_local! {
+    static GROUND_PROPOSAL_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+/// Counts attempted proposal walks only, separately from final physical edges.
+#[cfg(test)]
+pub(super) fn take_ground_proposal_walks() -> usize {
+    GROUND_PROPOSAL_WALKS.replace(0)
+}
+fn walk_ground<'a>(
+    state: GroundWalkState<'a>,
+    to: [f64; 2],
+    boundary: &[[f64; 2]],
+) -> Result<GroundWalkState<'a>, LocalPlanError> {
+    checkpoint()?;
+    #[cfg(test)]
+    GROUND_PROPOSAL_WALKS.set(GROUND_PROPOSAL_WALKS.get() + 1);
+    let result = state.walk_xy(to, boundary, None);
+    // A PCT error is local to this proposal; cancellation must remain typed.
+    checkpoint()?;
+    result.map(|segment| segment.end()).map_err(|error| error.to_string().into())
+}
+#[allow(clippy::too_many_arguments)]
+pub(super) fn optimize_navigation<const N: usize>(
+    reference: &[[f64; N]],
+    map: &Tomogram,
+    radius: f64,
+    centers: [f64; 2],
+    iterations: usize,
+    initial_heading: Option<f64>,
+    ground_start: Option<GroundWalkState<'_>>,
+    boundary: &[[f64; 2]],
+) -> Result<Vec<[f64; N]>, LocalPlanError> {
     checkpoint()?;
     let mut controls = resample(reference, 0.25_f64.max(map.resolution))?;
     if controls.len() < 3 {
@@ -41,58 +76,100 @@ pub fn optimize(
     }
     if let Some(heading) = initial_heading {
         let lead = length(controls[0], controls[1]).clamp(0.1, 0.3);
-        controls[1] = [
-            controls[0][0] + lead * heading.cos(),
-            controls[0][1] + lead * heading.sin(),
-            controls[0][2],
-        ];
+        controls[1] = std::array::from_fn(|axis| match axis {
+            0 => controls[0][0] + lead * heading.cos(),
+            1 => controls[0][1] + lead * heading.sin(),
+            _ => controls[0][axis],
+        });
     }
     let original = controls.clone();
     let h = map.resolution;
     for _ in 0..iterations {
         checkpoint()?;
         let previous = controls.clone();
+        // Reconstruct this Jacobi iteration's control states from its original
+        // source-local start. No prior proposal's endpoint becomes a new root.
+        let ground_controls = if let Some(mut state) = ground_start {
+            let mut states = Vec::with_capacity(previous.len());
+            let first=[previous[0][0],previous[0][1]];
+            if state.xy()!=first {state=walk_ground(state,first,boundary)?;}
+            states.push(state);
+            for point in previous.iter().skip(1) {
+                state = walk_ground(state, [point[0], point[1]], boundary)?;
+                states.push(state);
+            }
+            Some(states)
+        } else {
+            None
+        };
         for i in (if initial_heading.is_some() { 2 } else { 1 })..controls.len() - 1 {
             checkpoint()?;
             let p = previous[i];
             let heading = (previous[i + 1][1] - previous[i - 1][1])
                 .atan2(previous[i + 1][0] - previous[i - 1][0]);
             // 与机体偏航一起转动的前后双圆柱，避免长机体仅检查中心圆。
-            let body_clearance = |point: Point| {
-                centers
-                    .iter()
-                    .map(|&offset| {
-                        clearance(
-                            map,
-                            [
-                                point[0] + offset * heading.cos(),
-                                point[1] + offset * heading.sin(),
-                                point[2],
-                            ],
-                        )
-                        .min(radius + map.resolution * 3.0)
-                    })
-                    .fold(f64::INFINITY, f64::min)
+            let body_clearance = |point: [f64; N]| -> Result<f64, LocalPlanError> {
+                if let Some(states) = &ground_controls {
+                    let mut value = f64::INFINITY;
+                    for &offset in &centers {
+                        let xy = [
+                            point[0] + offset * heading.cos(),
+                            point[1] + offset * heading.sin(),
+                        ];
+                        let state = walk_ground(states[i - 1], xy, boundary)?;
+                        // This Tomogram lookup is a numerical soft score only.
+                        // None remains missing clearance, never a made-up Z.
+                        let c = state.planned_ground_z().map_or(0.0, |z| {
+                            clearance(map, [xy[0], xy[1], z])
+                        });
+                        value = value.min(c.min(radius + map.resolution * 3.0));
+                    }
+                    Ok(value)
+                } else {
+                    Ok(centers
+                        .iter()
+                        .map(|&offset| {
+                            clearance(
+                                map,
+                                [
+                                    point[0] + offset * heading.cos(),
+                                    point[1] + offset * heading.sin(),
+                                    point[2],
+                                ],
+                            )
+                            .min(radius + map.resolution * 3.0)
+                        })
+                        .fold(f64::INFINITY, f64::min))
+                }
             };
-            let c = body_clearance(p);
+            let c = body_clearance(p)?;
             let mut next = p;
             for axis in 0..2 {
                 let mut a = p;
                 let mut b = p;
                 a[axis] += h;
                 b[axis] -= h;
-                let gradient = (body_clearance(a) - body_clearance(b)) / (2.0 * h);
+                let gradient = (body_clearance(a)? - body_clearance(b)?) / (2.0 * h);
                 let smooth = (previous[i - 1][axis] + previous[i + 1][axis] - 2.0 * p[axis]) * 0.18;
                 let reference = (original[i][axis] - p[axis]) * 0.12;
                 let repulsion = (radius + map.resolution - c).max(0.0) * gradient * 0.2;
                 next[axis] += (smooth + reference + repulsion).clamp(-h * 0.35, h * 0.35);
             }
-            if let Some(id) = map.cell_at(next) {
-                next[2] = map.cells[id].ground;
-                if map.segment_clear(previous[i - 1], next, &[])
-                    && map.segment_clear(next, previous[i + 1], &[])
-                {
-                    controls[i] = next;
+            if let Some(states) = &ground_controls {
+                let state = walk_ground(states[i - 1], [next[0], next[1]], boundary)?;
+                walk_ground(state, [previous[i + 1][0], previous[i + 1][1]], boundary)?;
+                controls[i] = next;
+            } else {
+                let mut next = [next[0], next[1], next[2]];
+                if let Some(id) = map.cell_at(next) {
+                    next[2] = map.cells[id].ground;
+                    if map.segment_clear(
+                        [previous[i - 1][0], previous[i - 1][1], previous[i - 1][2]], next, &[],
+                    ) && map.segment_clear(
+                        next, [previous[i + 1][0], previous[i + 1][1], previous[i + 1][2]], &[],
+                    ) {
+                        controls[i] = std::array::from_fn(|axis| next[axis]);
+                    }
                 }
             }
         }
@@ -101,7 +178,7 @@ pub fn optimize(
     Ok(controls)
 }
 /// 重复端控制点使曲线从实际起点出发、终止于局部目标。
-pub fn sample(controls: &[Point], spacing: f64) -> Result<Vec<Point>, LocalPlanError> {
+pub fn sample<const N: usize>(controls: &[[f64; N]], spacing: f64) -> Result<Vec<[f64; N]>, LocalPlanError> {
     checkpoint()?;
     if controls.len() < 3 {
         return resample(controls, spacing);

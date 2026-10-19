@@ -1,13 +1,29 @@
 //! 台阶后转角的请求内参考候选；是否可执行仍由原投影和完整扫掠决定。
 use super::{BodyGroundState, BodyPose, LocalPlanError, ScanConfig, SurfaceBodyQueryView, SurfaceSnapshot};
 
-pub(super) fn guide(map: &SurfaceSnapshot, query: &SurfaceBodyQueryView,
-    start_ground: &BodyGroundState, start: BodyPose, reference: &[[f64; 3]],
-    config: &ScanConfig, arrival: bool) -> Result<Option<Vec<[f64; 3]>>, LocalPlanError> {
+pub(super) fn guide(map:&SurfaceSnapshot,query:&SurfaceBodyQueryView,start_ground:&BodyGroundState,
+    start:BodyPose,reference:&[[f64;3]],config:&ScanConfig,arrival:bool)->Result<Option<Vec<[f64;3]>>,LocalPlanError> {
+    guide_state(map,query,&super::MotionState::body(start_ground.clone()),start,reference,config,arrival,&[])
+}
+pub(super) fn guide_state<const N:usize>(map: &SurfaceSnapshot, query: &SurfaceBodyQueryView,
+    start_ground: &super::MotionState<'_>, start: BodyPose, reference: &[[f64; N]],
+    config: &ScanConfig, arrival: bool,boundary:&[[f64;2]]) -> Result<Option<Vec<[f64; N]>>, LocalPlanError> {
     let model = map.body_envelope().ok_or("台阶转角候选缺少机体尺寸")?;
     let radius = model.radius();
     let quantum = f64::from(map.source_voxel_size_m());
     let slope = f64::from(map.config().max_slope_deg).to_radians().tan();
+    // Proposal heights come from the independent navigation walk. Unknown
+    // remains None; an absent step proposal never rejects the planning request.
+    let heights=if let Some(mut navigation)=start_ground.navigation {
+        let mut heights=Vec::with_capacity(reference.len());
+        for point in reference {
+            super::cancellation::checkpoint()?;
+            let result=navigation.walk_xy([point[0],point[1]],boundary,None).map_err(|e|LocalPlanError::from(e.to_string()));
+            let Some(segment)=super::admit_candidate(result)? else {return Ok(None);};
+            navigation=segment.end(); heights.push(navigation.planned_ground_z());
+        }
+        Some(heights)
+    } else {None};
     'candidate: for i in 1..reference.len().saturating_sub(1) {
         super::cancellation::checkpoint()?;
         let (a, b, c) = (reference[i-1], reference[i], reference[i+1]);
@@ -16,7 +32,10 @@ pub(super) fn guide(map: &SurfaceSnapshot, query: &SurfaceBodyQueryView,
         let before = incoming[0].hypot(incoming[1]);
         let after = outgoing[0].hypot(outgoing[1]);
         // 平滑坡面和源量化的单格起伏不触发；这里只尝试紧接转弯的参考高差。
-        if before <= 1e-9 || after <= 1e-9 || (b[2]-a[2]).abs() <= before*slope+quantum+1e-6 {
+        let height_delta=if let Some(heights)=&heights {
+            let (Some(a),Some(b))=(heights[i-1],heights[i]) else {continue;}; b-a
+        } else {b[2]-a[2]};
+        if before <= 1e-9 || after <= 1e-9 || height_delta.abs() <= before*slope+quantum+1e-6 {
             continue;
         }
         let incoming = incoming.map(|v|v/before);
@@ -48,8 +67,13 @@ pub(super) fn guide(map: &SurfaceSnapshot, query: &SurfaceBodyQueryView,
         if !inside { continue; }
         // XY仍是原候选；从真实起点推进同一拥有方的分支状态，不能由参考Z重种站姿。
         // 拥有方以完整姿态转换的实际支撑XY选列；未知只携带先前h。
+        if start_ground.navigation.is_some() {
+            // Genuine XY proposal. The selected physical candidate below walks
+            // these actual subedges afresh and performs the full H3 sweep.
+            return Ok(Some(guide_xy.into_iter().map(|xy|std::array::from_fn(|axis|xy[axis])).collect()));
+        }
         let mut pose=start;
-        let mut ground=start_ground.clone();
+        let mut ground=start_ground.physical.clone();
         let mut guide=Vec::with_capacity(guide_xy.len());
         for xy in guide_xy {
             super::cancellation::checkpoint()?;
@@ -58,7 +82,7 @@ pub(super) fn guide(map: &SurfaceSnapshot, query: &SurfaceBodyQueryView,
             let Some(projected)=super::admit_candidate(super::project_endpoint(query,&ground,pose,xy,heading))?
                 else { continue 'candidate; };
             pose=projected.pose();ground=projected.ground().clone();
-            guide.push([xy[0],xy[1],ground.height()]);
+            guide.push(std::array::from_fn(|axis|if axis<2 {xy[axis]} else {ground.height()}));
         }
         // 这里只取得候选高度；完整project_bound仍重新投影并逐段扫掠/检查任务边界。
         return Ok(Some(guide));

@@ -47,6 +47,8 @@ _LOW_VALUE_HTTP_PATHS = frozenset(
         "/api/health",
         "/api/tasks",
         "/api/memory/instances",
+        # 控制台每5秒读取一次更新状态；检查、保存与安装走各自子路径，仍按常规记录。
+        "/api/updates",
         "/mcp",
         "/api/logs",
         "/console",
@@ -60,6 +62,7 @@ _LOW_VALUE_HTTP_PATHS = frozenset(
     )
 )
 _LOW_VALUE_HTTP_PREFIXES = ("/static/",)
+_MANAGER_SESSION_PROBE_PATH = "/api/manager/session"
 _REQUEST_LOG_RATE_LIMIT_SEC = 30.0
 _HTTP_SLOW_REQUEST_THRESHOLD_MS = 1000.0
 
@@ -133,8 +136,10 @@ class RequestLoggingMiddleware:
                         and status_code == 503
                         and getattr(request.state, "error_category", None) == "not_ready"
                     )
+                    # 控制台探测自己是否经设备管理服务代理；直连网关时没有该接口，404 是预期结果。
+                    manager_probe_absent = path == _MANAGER_SESSION_PROBE_PATH and status_code == 404
                     level = logging.INFO
-                    if waiting_for_video:
+                    if waiting_for_video or manager_probe_absent:
                         level = logging.DEBUG
                     elif status_code >= 500:
                         level = logging.ERROR
@@ -154,7 +159,8 @@ class RequestLoggingMiddleware:
                         extra["slow_request"] = True
                         extra["slow_request_threshold_ms"] = _HTTP_SLOW_REQUEST_THRESHOLD_MS
                     if (
-                        waiting_for_video and duration_ms < _HTTP_SLOW_REQUEST_THRESHOLD_MS
+                        (waiting_for_video or manager_probe_absent)
+                        and duration_ms < _HTTP_SLOW_REQUEST_THRESHOLD_MS
                     ) or _should_rate_limit_http_request(path, status_code, duration_ms):
                         extra["low_value_request"] = True
                         extra["slow_request_threshold_ms"] = _HTTP_SLOW_REQUEST_THRESHOLD_MS

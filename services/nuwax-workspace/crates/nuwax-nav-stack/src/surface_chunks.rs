@@ -28,7 +28,8 @@ impl FineMapReader {
         previous: Option<(&Manifest, &Arc<nuwax_nav_mls_planner::SurfaceObservations>)>,
     ) -> Result<(Arc<nuwax_nav_mls_planner::SurfaceObservations>, Option<Vec<[i32; 2]>>), String> {
         use nuwax_nav_mls_planner::{SurfaceObservation, SurfaceObservations};
-        use std::collections::BTreeMap;
+        use std::collections::{BTreeMap, BTreeSet};
+        use nuwax_map_chunks::{GroundRecords, GroundRecordRef};
         let previous = previous.filter(|(old, _)| old.domain == root.domain
             && old.voxel_size_m.to_bits() == root.voxel_size_m.to_bits());
         if let Some((_, grid)) = previous.filter(|(old, _)| *old == root) {
@@ -44,8 +45,14 @@ impl FineMapReader {
         };
         let old: BTreeMap<_, _> = previous.into_iter().flat_map(|(r, _)| &r.blocks).map(|b| (b.key, b)).collect();
         let new: BTreeMap<_, _> = root.blocks.iter().map(|b| (b.key, b)).collect();
+        // Only roots containing typed ground need the vertical native-group pass.
+        // Reuse each changed object's one parts decode, including with zero cache.
+        let typed = root.version >= 5 || previous.is_some_and(|(old,_)|old.version >= 5);
+        let mut native_groups = BTreeSet::new();
+        let mut records_by_block = BTreeMap::new();
         for key in old.keys().filter(|key| !new.contains_key(*key)) {
             mutated = true;
+            if typed { native_groups.insert([key[0],key[1]]); }
             changed.extend(grid.replace_block_with_geometry_changes(*key, BTreeMap::new())
                 .map_err(|e| e.to_string())?);
             // Removing the final occupied block also retires its measured layers.
@@ -54,7 +61,7 @@ impl FineMapReader {
         }
         for reference in &root.blocks {
             if old.get(&reference.key).is_some_and(|old| old.block_revision == reference.block_revision) { continue; }
-            let block = self.receiver.block(reference)?;
+            let (block, records) = self.receiver.ground_parts(reference)?;
             let mut values = BTreeMap::new();
             for (&local, evidence) in block.iter() {
                 if evidence.observed_ns > root.source_timestamp_ns { return Err("精细观察晚于提交根".into()); }
@@ -64,11 +71,30 @@ impl FineMapReader {
             mutated = true;
             changed.extend(grid.replace_block_with_geometry_changes(reference.key, values)
                 .map_err(|e| e.to_string())?);
-            // BL2/BL3 layers use the same admitted object and decode cache. BL1 returns
-            // an empty set, preserving honest geometric compatibility for old maps.
-            let layers = self.receiver.layers(reference)?;
+            let layers = match &records {
+                GroundRecords::Legacy(layers) => Arc::clone(layers),
+                GroundRecords::Versioned(_) => Arc::new(records.iter().filter_map(|(key,record)| {
+                    match record { GroundRecordRef::LegacyPlane(layer)=>Some((key,layer.clone())),
+                        GroundRecordRef::HeightfieldV1(_)=>None }
+                }).collect()),
+            };
             changed.extend(grid.replace_ground_layers(reference.key, layers)
                 .map_err(|e| e.to_string())?);
+            if typed {
+                native_groups.insert([reference.key[0],reference.key[1]]);
+                records_by_block.insert(reference.key,records);
+            }
+        }
+        for xy in native_groups {
+            let mut group = Vec::new();
+            for (&key, reference) in new.range([xy[0],xy[1],i32::MIN]..=[xy[0],xy[1],i32::MAX]) {
+                let records = match records_by_block.remove(&key) {
+                    Some(records) => records,
+                    None => self.receiver.ground_records(reference)?,
+                };
+                group.push((key,records));
+            }
+            changed.extend(grid.replace_heightfield_columns(xy,&group));
         }
 
         // 同一提交根的全部块已经读取并验证，缺少占据块不等于缺少已提交的几何源。

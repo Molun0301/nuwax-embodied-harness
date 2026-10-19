@@ -188,6 +188,10 @@ impl SurfaceObservations {
         } else {
             self.blocks.insert(block, Arc::new(values.into_iter().collect()));
         }
+        let columns = &self.columns;
+        if self.native_ground.retire_missing_members(&changed, |key| {
+            columns.get(&[key[0],key[1]]).is_some_and(|zs|zs.binary_search(&key[2]).is_ok())
+        }) { self.layer_geometry=Arc::new(()); }
         // Removing source members invalidates their layer immediately, even if
         // this caller is a legacy block-only producer. Retained snapshots keep it.
         if let Some(old)=self.observed_layers.get(&block).filter(|old|!same_membership

@@ -61,16 +61,12 @@ impl ObservedHeightfield {
             return false;
         }
         let block = nuwax_map_chunks::block_key(key);
-        self.fragments
-            .binary_search_by_key(&block, |fragment| fragment.block)
-            .ok()
-            .is_some_and(|index| {
-                self.fragments[index]
-                    .value()
-                    .members
-                    .binary_search_by_key(&nuwax_map_chunks::local_key(key), |member| member.0)
-                    .is_ok()
-            })
+        let first = self.fragments.partition_point(|fragment| fragment.block < block);
+        let local = nuwax_map_chunks::local_key(key);
+        self.fragments[first..]
+            .iter()
+            .take_while(|fragment| fragment.block == block)
+            .any(|fragment| fragment.value().members.binary_search_by_key(&local, |member| member.0).is_ok())
     }
 }
 
@@ -164,7 +160,7 @@ enum MemberIter<'a> {
     Legacy(std::slice::Iter<'a, i32>),
     Heightfield {
         fragments: std::slice::Iter<'a, Fragment>,
-        current: Option<(i32, std::slice::Iter<'a, (u16, [f64; 8])>)>,
+        current: Option<(i32, u32)>,
     },
 }
 impl Iterator for GroundMembers<'_> {
@@ -174,12 +170,24 @@ impl Iterator for GroundMembers<'_> {
             MemberIter::Legacy(members) => members.next().copied(),
             MemberIter::Heightfield { fragments, current } => loop {
                 if let Some((block_z, members)) = current {
-                    if let Some((local, _)) = members.next() {
-                        return Some(*block_z * 32 + i32::from(*local / 1024));
+                    if *members != 0 {
+                        let z = members.trailing_zeros();
+                        *members &= *members - 1;
+                        return Some(*block_z * 32 + z as i32);
                     }
                 }
                 let fragment = fragments.next()?;
-                *current = Some((fragment.block[2], fragment.value().members.iter()));
+                let block = fragment.block;
+                // Admission permits disjoint fragments of one surface within
+                // the same block. A block has only 32 native z positions: merge
+                // their borrowed members into one stack mask, not a copied Vec.
+                let mut mask = 0_u32;
+                for (local, _) in &fragment.value().members { mask |= 1 << (local / 1024); }
+                while fragments.as_slice().first().is_some_and(|next| next.block == block) {
+                    let next = fragments.next().unwrap();
+                    for (local, _) in &next.value().members { mask |= 1 << (local / 1024); }
+                }
+                *current = Some((block[2], mask));
             },
         }
     }
@@ -199,6 +207,37 @@ impl NativeGroundIndex {
     }
     pub(super) fn is_empty(&self) -> bool {
         self.columns.is_empty()
+    }
+
+    /// A block-only update must not retain a claim for a removed occupied member.
+    /// Complete-root readers subsequently install the new admitted column group.
+    pub(super) fn retire_missing_members(
+        &mut self,
+        changed: &[[i32; 2]],
+        present: impl Fn(Key) -> bool,
+    ) -> bool {
+        if self.columns.is_empty() {
+            return false;
+        }
+        let mut retired = false;
+        for &xy in changed {
+            let Some(records) = self.columns.get(&xy) else {
+                continue;
+            };
+            let valid =
+                |record: &ObservedHeightfield| record.members().all(|z| present([xy[0], xy[1], z]));
+            if records.iter().all(valid) {
+                continue;
+            }
+            let retained: Vec<_> = records.iter().filter(|r| valid(r)).cloned().collect();
+            if retained.is_empty() {
+                self.columns.remove(&xy);
+            } else {
+                self.columns.insert(xy, Arc::new(retained));
+            }
+            retired = true;
+        }
+        retired
     }
 
     /// All vertical native blocks for one changed block-XY, already admitted by
@@ -593,5 +632,24 @@ mod tests {
             .unwrap()
             .legacy()
             .is_ok());
+    }
+    #[test]
+    fn native_block_only_member_removal_retires_stale_claim() {
+        let mut writer = writer();
+        let xy = [0, 0];
+        install(&mut writer, xy, &column(xy, &[-33, 0, 33]));
+        let root = root(&mut writer, 1);
+        let (mut source, _) = admitted(&writer, &root);
+        let old = source.clone();
+        assert_eq!(
+            source
+                .replace_block_with_geometry_changes([0, 0, -2], BTreeMap::new())
+                .unwrap(),
+            vec![xy]
+        );
+        assert!(!source.is_complete_geometry_source());
+        assert!(source.ground_records(xy).next().is_none());
+        assert!(source.get([0, 0, 0]).is_some());
+        assert_eq!(old.ground_records(xy).next().unwrap().members().count(), 3);
     }
 }

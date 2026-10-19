@@ -3,11 +3,55 @@
 use crate::{PctPlanner, PlanningFailure, RoutePenalty, SearchLimits, SearchStats, Tomogram};
 use crate::reference::Reference;
 use crate::search::{RouteReferenceTrace, checkpoint};
-use nuwax_nav_mls_planner::{SurfaceSnapshot, surface::SourceGroundRecord};
+use nuwax_nav_mls_planner::{SurfaceSnapshot, surface::{SourceGroundRecord, SurfaceBodyQueryView}};
 use nuwax_types::navigation::{GroundHeightIntent, GroundLayerResult};
 use std::sync::{Arc, atomic::AtomicBool};
 
 type BodyPose = ([f64;3],[f64;4]);
+
+/// Internal admission-deterministic predicate. Only this module can construct
+/// it, from a frozen request's MLS view/actual transform/boundary. MLS caches may
+/// change, but there is no caller callback, output witness or cancellation poll.
+pub(crate) struct GroundPhysicalAdmitter<'a> {
+    body: &'a SurfaceBodyQueryView,
+    actual: BodyPose,
+    from: [f64;3],
+    start_xy: [f64;2],
+    initial_z: f64,
+    anchored: bool,
+    boundary: &'a [[f64;2]],
+}
+impl GroundPhysicalAdmitter<'_> {
+    fn physical(&self,p:[f64;3])->BodyPose {
+        if p==self.from {self.actual} else {
+            ([self.actual.0[0]+(p[0]-self.start_xy[0]),self.actual.0[1]+(p[1]-self.start_xy[1]),
+                self.actual.0[2]+if self.anchored {p[2]-self.initial_z}else{0.0}],self.actual.1)
+        }
+    }
+    pub(crate) fn accepts(&self,a:[f64;3],b:[f64;3])->bool {
+        let result=self.body.validate_unanchored_motion(self.physical(a),self.physical(b),self.boundary,&mut None).is_ok();
+        #[cfg(test)]
+        physical_test_capture::record(a,b,result);
+        result
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod physical_test_capture {
+    use std::cell::RefCell;
+    pub type Call=([[u64;3];2],bool);
+    thread_local! {static CALLS:RefCell<Option<Vec<Call>>>=const {RefCell::new(None)};}
+    pub(super) fn record(a:[f64;3],b:[f64;3],result:bool) {
+        CALLS.with(|v|if let Some(v)=v.borrow_mut().as_mut(){v.push(([a.map(f64::to_bits),b.map(f64::to_bits)],result));});
+    }
+    pub(crate) fn capture<T>(call:impl FnOnce()->T)->(T,Vec<Call>) {
+        struct Reset(Option<Vec<Call>>);
+        impl Drop for Reset {fn drop(&mut self){CALLS.with(|v|*v.borrow_mut()=self.0.take());}}
+        let _reset=Reset(CALLS.with(|v|v.replace(Some(Vec::new()))));
+        let result=call();(result,CALLS.with(|v|v.take().unwrap()))
+    }
+}
+
 
 /// Independent navigation start. None is genuinely Unanchored, never body Z
 /// minus calibration. A supplied height may be a carried navigation reference.
@@ -111,6 +155,21 @@ impl PctPlanner {
         xy_tolerance:f64,boundary:&[[f64;2]],cancelled:Option<&AtomicBool>,radius:Option<f64>,
         limits:SearchLimits,penalties:&[RoutePenalty],
     )->Result<PlannedGroundRoute,GroundRouteFailure> {
+        self.ground_route_impl::<true>(source,actual,start,goal,xy_tolerance,boundary,cancelled,radius,limits,penalties)
+    }
+    #[cfg(test)]
+    pub(crate) fn ground_route_original_order(
+        &self,source:&SurfaceSnapshot,actual:BodyPose,start:GroundRouteStart,goal:GroundRouteGoal,
+        xy_tolerance:f64,boundary:&[[f64;2]],cancelled:Option<&AtomicBool>,radius:Option<f64>,
+        limits:SearchLimits,penalties:&[RoutePenalty],
+    )->Result<PlannedGroundRoute,GroundRouteFailure> {
+        self.ground_route_impl::<false>(source,actual,start,goal,xy_tolerance,boundary,cancelled,radius,limits,penalties)
+    }
+    fn ground_route_impl<const EARLY:bool>(
+        &self,source:&SurfaceSnapshot,actual:BodyPose,start:GroundRouteStart,goal:GroundRouteGoal,
+        xy_tolerance:f64,boundary:&[[f64;2]],cancelled:Option<&AtomicBool>,radius:Option<f64>,
+        limits:SearchLimits,penalties:&[RoutePenalty],
+    )->Result<PlannedGroundRoute,GroundRouteFailure> {
         checkpoint(cancelled)?;
         if start.xy.into_iter().chain(goal.xy).chain(start.ground_z).chain(goal.requested_ground_z)
             .any(|value|!value.is_finite()) {
@@ -138,19 +197,16 @@ impl PctPlanner {
         }
         let from=[start.xy[0],start.xy[1],initial_z];
         let to=[goal.xy[0],goal.xy[1],goal.requested_ground_z.unwrap_or(initial_z)];
-        let physical=|p:[f64;3]| if p==from {actual} else {
-            ([actual.0[0]+(p[0]-start.xy[0]),actual.0[1]+(p[1]-start.xy[1]),
-                actual.0[2]+if start.ground_z.is_some(){p[2]-initial_z}else{0.0}],actual.1)
-        };
-        let accepts=|a,b|body.validate_unanchored_motion(physical(a),physical(b),boundary,&mut None).is_ok();
+        let admitter=GroundPhysicalAdmitter {body:&body,actual,from,start_xy:start.xy,
+            initial_z,anchored:start.ground_z.is_some(),boundary};
         // Existing penalties are in actual body coordinates. Convert this one
         // captured snapshot once, without reading the planner's mutable costs.
         let penalties:Vec<_>=penalties.iter().map(|p|RoutePenalty {
             center:[p.center[0]-actual.0[0]+start.xy[0],p.center[1]-actual.0[1]+start.xy[1],
                 p.center[2]-actual.0[2]+initial_z],radius:p.radius,weight:p.weight,
         }).collect();
-        let traced=map.plan_ground_traced(from,to,xy_tolerance,boundary,cancelled,radius,&penalties,
-            &accepts,limits,start.ground_z.is_none().then_some(actual.0[2]),
+        let traced=map.plan_ground_physical::<EARLY>(from,to,xy_tolerance,boundary,cancelled,radius,&penalties,
+            &admitter,limits,start.ground_z.is_none().then_some(actual.0[2]),
             if start.ground_z.is_some(){target}else{None})?;
         let last=traced.trace.changes.last().expect("successful recorded route has an initial sample").reference;
         let end=*traced.route.points.last().unwrap();
@@ -169,7 +225,7 @@ impl PctPlanner {
         };
         let points=traced.route.points.iter().map(|p|GroundRoutePoint {xy:[p[0],p[1]],
             ground_z:start.ground_z.map(|_|p[2])}).collect();
-        let guide_body_poses=traced.route.points.iter().copied().map(physical).collect();
+        let guide_body_poses=traced.route.points.iter().copied().map(|p|admitter.physical(p)).collect();
         Ok(PlannedGroundRoute {points,guide_body_poses,
             height:GroundHeightIntent {requested_ground_z:goal.requested_ground_z,resolved_ground_z},
             planned_layer,reference:GroundRouteReference {map,trace:traced.trace},stats:traced.route.stats})

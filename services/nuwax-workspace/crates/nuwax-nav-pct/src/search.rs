@@ -365,7 +365,7 @@ impl Tomogram {
         accepts: &dyn Fn([f64; 3], [f64; 3]) -> bool,
         limits: SearchLimits,
     ) -> Result<SearchOutput, PlanningFailure> {
-        self.plan_bounded_impl_in::<RECORD>(start,goal,tolerance,boundary,cancelled,radius,
+        self.plan_bounded_impl_in::<RECORD, false>(start,goal,tolerance,boundary,cancelled,radius,
             penalties,accepts,limits,SearchGeometry::Body)
     }
     pub(crate) fn plan_ground_traced(
@@ -375,12 +375,26 @@ impl Tomogram {
         unanchored_z:Option<f64>,target:Option<usize>,
     )->Result<TracedRoute,PlanningFailure> {
         checkpoint(cancelled)?;
-        let result=self.plan_bounded_impl_in::<true>(start,goal,tolerance,boundary,cancelled,radius,
+        let result=self.plan_bounded_impl_in::<true, false>(start,goal,tolerance,boundary,cancelled,radius,
             penalties,accepts,limits,SearchGeometry::Ground {unanchored_z,target});
         checkpoint(cancelled)?;
         result.map(|output|TracedRoute {route:output.route,trace:output.trace.expect("Ground records its admitted trace")})
     }
-    fn plan_bounded_impl_in<const RECORD: bool>(
+    /// Only the frozen concrete MLS admitter can opt into early dominance.
+    #[cfg(feature="mls-adapter")]
+    pub(crate) fn plan_ground_physical<const EARLY:bool>(
+        &self,start:[f64;3],goal:[f64;3],tolerance:f64,boundary:&[[f64;2]],
+        cancelled:Option<&AtomicBool>,radius:Option<f64>,penalties:&[crate::RoutePenalty],
+        admitter:&crate::ground_route::GroundPhysicalAdmitter<'_>,limits:SearchLimits,
+        unanchored_z:Option<f64>,target:Option<usize>,
+    )->Result<TracedRoute,PlanningFailure> {
+        checkpoint(cancelled)?;
+        let result=self.plan_bounded_impl_in::<true,EARLY>(start,goal,tolerance,boundary,cancelled,radius,
+            penalties,&|a,b|admitter.accepts(a,b),limits,SearchGeometry::Ground {unanchored_z,target});
+        checkpoint(cancelled)?;
+        result.map(|output|TracedRoute {route:output.route,trace:output.trace.expect("Ground records its admitted trace")})
+    }
+    fn plan_bounded_impl_in<const RECORD: bool, const EARLY: bool>(
         &self,
         start: [f64; 3],
         goal: [f64; 3],
@@ -567,6 +581,21 @@ impl Tomogram {
                 }
                 let Some(next) = self.reference_neighbor(from, [x, y]) else { continue; };
                 let b = geometry.position(self,next);
+                // One unchanged g expression; arbitrary callbacks still run
+                // before evaluating it. Only the internal deterministic MLS
+                // admitter may skip a dominated in-radius physical sweep.
+                let cost_and_index = || {
+                    let local_cost = penalties.iter().map(|p| penalty_at(b, p)).sum::<f64>();
+                    let next_cost = cost + distance(a, b)
+                        * ((self.reference_cost(from) + self.reference_cost(next)) * 0.5 + local_cost);
+                    let existing = indexes.get(&next).copied();
+                    (next_cost, existing)
+                };
+                let early = if EARLY && !outside_radius {
+                    let (next_cost, existing) = cost_and_index();
+                    if existing.is_some_and(|next_id| !(next_cost < states[next_id].cost)) { continue; }
+                    Some((next_cost, existing))
+                } else { None };
                 if !accepts(actual_a, b) { continue; }
                 if outside_radius {
                     // 只有整段可接纳的越界边才证明人工半径截断；仅有邻点
@@ -579,13 +608,10 @@ impl Tomogram {
                     }
                     continue;
                 }
-                let local_cost = penalties.iter().map(|p| penalty_at(b, p)).sum::<f64>();
-                let next_cost = cost + distance(a, b)
-                    * ((self.reference_cost(from) + self.reference_cost(next)) * 0.5 + local_cost);
-                let existing = indexes.get(&next).copied();
-                // 只跳过同一精确参考状态的不改善边，保留过滤回调的原调用顺序。
+                let (next_cost, existing) = if EARLY { early.expect("in-radius candidate") }
+                    else { cost_and_index() };
                 // 新状态仍在完整段验证之后才占用状态预算。
-                if existing.is_some_and(|next_id| !(next_cost < states[next_id].cost)) { continue; }
+                if !EARLY && existing.is_some_and(|next_id| !(next_cost < states[next_id].cost)) { continue; }
                 candidates[candidate_count] = Some((next, b, next_cost, existing));
                 candidate_count += 1;
             }}

@@ -209,3 +209,6 @@ fn c1a_08_trace_retains_original_owner_after_planner_geometry_replacement() {
     assert_eq!(record.key(),GroundKey::HeightfieldV1([0,0,0]));
     assert_eq!(record.members().collect::<Vec<_>>(),vec![0]);
 }
+
+#[path="ground_physical_dominance_tests.rs"]
+mod physical_dominance_tests;

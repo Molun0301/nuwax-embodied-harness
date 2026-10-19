@@ -409,3 +409,6 @@ fn b1_10_geometry_budget_radius_filter_and_cancellation_match() {
     let concave=[[0.,0.],[0.6,0.],[0.6,0.6],[0.4,0.6],[0.4,0.2],[0.2,0.2],[0.2,0.6],[0.,0.6]];
     assert!(paired(&map,[0.1,0.5,0.],[0.5,0.5,0.],0.,&concave,None,&[],&|_,_|true,SearchLimits::default(),None).0.is_ok());
 }
+
+#[path="pure_dominance_tests.rs"]
+mod pure_dominance_tests;

@@ -3,6 +3,8 @@
 use std::sync::Arc;
 #[path="surface_body_control.rs"]
 mod body_control;
+#[path="ground_reference_cursor.rs"]
+mod ground_cursor;
 #[cfg(test)]
 #[path="surface_rejoin_probe.rs"]
 pub(crate) mod rejoin_probe;
@@ -154,6 +156,7 @@ pub struct SurfaceFollower {
     control_target: Option<nuwax_nav_control::PlanarPose>,
     body_view_dirty: bool,
     body_query: Option<nuwax_nav_mls_planner::surface::SurfaceBodyQueryView>,
+    ground_execution: Option<ground_cursor::GroundExecution>,
     actual_ground: Option<(nuwax_nav_types_messages::Pose3, Result<nuwax_nav_mls_planner::surface::BodyGroundState, String>)>,
 }
 
@@ -190,6 +193,7 @@ impl SurfaceFollower {
             body_view_dirty: true,
             body_query: None,
             actual_ground: None,
+            ground_execution: None,
         })
     }
 
@@ -320,6 +324,7 @@ impl SurfaceFollower {
                 return Err(rejected("新路径与当前标定高度不能连续接续"));
             }
         }
+        self.ground_execution=None;
         self.progress_m = progress;
         self.last_tracked_pose = Some(odometry.clone());
         // Arc progress and the consumed waypoint belong to the same selected
@@ -730,6 +735,9 @@ impl NavPlanner for SurfaceFollower {
     fn configure_goal(&mut self, _goal:&PoseStamped, options:nuwax_nav_types_messages::GoalOptions)->Result<(),RuntimeError> {
         self.last_command_dispatch_bound = None;
         options.validate().map_err(|reason|RuntimeError::InvalidInput {field:"goal_options",reason})?;
+        if self.ground_execution.take().is_some() {
+            self.path=None;self.goal=None;self.cumulative.clear();self.progress_m=0.0;self.last_tracked_pose=None;
+        }
         // 新目标执行仍须取得守卫准入；旧规划器内部状态不能代替该证明。
         self.braking_deadline = None;
         self.last_command = Twist2::ZERO;
@@ -779,6 +787,9 @@ impl NavPlanner for SurfaceFollower {
 
     fn update_costmap(&mut self, _costmap: CostMap2D) {
         self.last_command_dispatch_bound = None;
+        if self.ground_execution.take().is_some() {
+            self.path=None;self.goal=None;self.cumulative.clear();self.progress_m=0.0;self.last_tracked_pose=None;
+        }
         self.map = None;
         self.source_map = None;
         self.planar_reference=None;
@@ -805,6 +816,11 @@ impl NavPlanner for SurfaceFollower {
                     self.map = Some(Arc::clone(&map));
                     self.body_view_dirty = true;
                 }
+                if self.ground_execution.as_ref().is_some_and(|execution|!execution.matches_source(&map)) {
+                    self.ground_execution=None;
+                    self.path=None;self.goal=None;self.cumulative.clear();
+                    self.progress_m=0.0;self.last_tracked_pose=None;
+                }
                 self.source_map = Some(map);
                 self.planar_reference=planar_reference;
                 Ok(())
@@ -827,12 +843,18 @@ impl NavPlanner for SurfaceFollower {
 
     fn step(&mut self, robot_width_m: f64) -> PlannerStep {
         self.last_command_dispatch_bound = None;
+        if self.ground_execution.is_some() {
+            // C1-b has only the internal actual-geometric consumption seam.
+            // Never feed it to the legacy Body arrival branch before D wiring.
+            return PlannerStep::ReplanRequired("Ground control/arrival consumption is not activated".into());
+        }
         self.refresh_current_body_view();
         self.follow_step(robot_width_m)
     }
 
     fn stop(&mut self) {
         self.begin_braking();
+        self.ground_execution=None;
         self.path = None;
         self.goal = None;
         self.cumulative.clear();

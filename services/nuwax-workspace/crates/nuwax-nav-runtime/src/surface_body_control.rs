@@ -94,7 +94,7 @@ fn memoized_body_motion_impl<E:Clone>(
     result
 }
 
-fn body(p: &PoseStamped) -> ([f64; 3], [f64; 4]) {
+pub(super) fn body(p: &PoseStamped) -> ([f64; 3], [f64; 4]) {
     let q = p.pose.orientation;
     (xyz(p.pose.position), [q.x, q.y, q.z, q.w])
 }
@@ -284,6 +284,204 @@ pub(super) struct SelectedBodyCommand {
     dt:f64,
     sample_step:f64,
     radius:f64,
+}
+
+// Same index convention as SurfaceFollower: path_index is the next control target,
+// not an assertion that candidate reference samples through that vertex were consumed.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct AdjacentWaypointProgress {
+    pub(super) path_index: usize,
+    pub(super) progress_m: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) enum AdjacentWaypointAdvance {
+    Duplicate,
+    Reached { rotation: bool, passed: bool, midpoint_reached: bool },
+}
+
+// The caller supplies the original support predicate. Ground can supply its
+// explicit XY geometry policy without turning that policy into an actual-layer
+// claim. Physical connector/turn queries below still use the actual H3 state.
+// allow_advance operates on provisional state only; false retains this boundary,
+// Err aborts the proposal. Default Body supplies |_, _| Ok(true).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn advance_adjacent_waypoints<
+    const TRANSLATION_INTENT: bool,
+    const COLLINEAR_PROGRESS: bool,
+>(
+    config: &SurfaceFollowerConfig,
+    map: &SurfaceSnapshot,
+    query: &SurfaceBodyQueryView,
+    ground: &BodyGroundState,
+    path: &Path3D,
+    goal: &PoseStamped,
+    pose: &PoseStamped,
+    cumulative: &[f64],
+    options: &nuwax_nav_types_messages::GoalOptions,
+    final_position_reached: bool,
+    progress: &mut AdjacentWaypointProgress,
+    mut target_same_support: impl FnMut(&PoseStamped) -> bool,
+    mut allow_advance: impl FnMut(usize, AdjacentWaypointAdvance) -> Result<bool, String>,
+) -> Result<(), String> {
+    let position = pose.pose.position;
+    let yaw = pose.pose.orientation.yaw();
+    // 逐点保留转向停留；曲线点只在到达或沿已确认小段越过时消耗。
+    let tolerance = (f64::from(map.config().voxel_size) * 0.7).min(0.07);
+    while progress.path_index < path.poses.len() {
+        let target = &path.poses[progress.path_index];
+        let previous = &path.poses[progress.path_index - 1];
+        // 完整姿态重复的接点不包含新运动，直接沿已消费的前点推进。
+        // 否则低频位姿越过接点时，零长度横向距离会成为NaN并锁住进度。
+        // 高度或任意姿态分量不同的点仍由原平移/转向检查处理。
+        if target.pose==previous.pose {
+            if !allow_advance(progress.path_index, AdjacentWaypointAdvance::Duplicate)? { break; }
+            progress.progress_m=cumulative[progress.path_index];
+            progress.path_index+=1;
+            continue;
+        }
+        // 连续曲线拼接会保留重复端点；零长度、零偏航变化不产生新的转向意图。
+        let rotation = is_rotation(target,previous);
+        let error = angle_diff(target.pose.orientation.yaw(), yaw);
+        let same_support=target_same_support(target);
+        // 路径高度用于选择地面层，接触参考按实际姿态转换；平面执行器
+        // 不控制路径拟合的横滚/俯仰。地面厚层允许实际足端参考位于层内。
+        // 已通过完整机体检查且关联
+        // 同一高度层时，按水平进度消耗路径点；平面速度无法补偿层顶偏差。
+        // 最终到达仍使用上方完整三维距离，不跨楼层或扩大用户容差。
+        let distance = if same_support {
+            (position.x-target.pose.position.x).hypot(position.y-target.pose.position.y)
+        } else {position.distance(target.pose.position)};
+        let passed = if rotation {
+            // 实际步态可能一次越过多个细分角度；沿同向进度消费，不倒转追旧点。
+            let step = angle_diff(target.pose.orientation.yaw(), previous.pose.orientation.yaw());
+            let actual = angle_diff(yaw, previous.pose.orientation.yaw());
+            step * actual > 0.0 && actual.abs() >= step.abs()
+                && actual.abs() < std::f64::consts::FRAC_PI_2
+        } else {
+            let a = previous.pose.position;
+            let b = target.pose.position;
+            let dx=b.x-a.x;let dy=b.y-a.y;
+            let dot = (position.x - b.x) * dx + (position.y - b.y) * dy;
+            let lateral=((position.x-b.x)*dy-(position.y-b.y)*dx).abs()/dx.hypot(dy);
+            // 位姿可低于控制频率到达；同层沿线越过多个采样点时按横向偏差消费，不能反向追旧点。
+            dot >= 0.0 && (distance < tolerance * 2.0 || same_support && lateral < tolerance * 2.0)
+        };
+        // 换线时的实际制动位移可能越过新曲线的起始采样，但仍有横差。
+        // 这些点既不能按到点容差直接跳过，也不能掉头重新追赶；从实际站姿重接局部路线。
+        // 同层、沿原段已越过且目标落在当前机体后方，三者共同确认过期的平移目标。
+        if !rotation && !passed && same_support && distance > tolerance {
+            let a = previous.pose.position;
+            let b = target.pose.position;
+            let along = (position.x - b.x) * (b.x - a.x)
+                + (position.y - b.y) * (b.y - a.y);
+            let forward = (b.x - position.x) * yaw.cos() + (b.y - position.y) * yaw.sin();
+            if along >= 0.0 && forward < 0.0 && horizontal_distance(previous, target) > 1e-5 {
+                return Err("实际机体已越过局部采样且存在横差，需要从当前站姿接续前方路线".into());
+            }
+        }
+        // 容差区域内的替代终点也是路径终点。不能先按路径点容差消费它，
+        // 再发现机器人仍在用户目标区域之外，陷入原地重规划循环。
+        // 防止提前消费的是最终位置组；内部采样即使靠近原目标，也须允许沿已确认进度越过。
+        // 否则实际高度使机体仍在原三维球外时，会被锁在身后内部点，无法走到合法末点。
+        let terminal_position=path.poses[progress.path_index..].iter()
+            .all(|pose|horizontal_distance(target,pose)<1e-5);
+        let goal_position = if options.position_tolerance_m == 0.0 {
+            nuwax_nav_types_messages::same_finite_position(
+                super::xyz(target.pose.position), super::xyz(goal.pose.position))
+        } else { (target.pose.position.x-goal.pose.position.x)
+            .hypot(target.pose.position.y-goal.pose.position.y)<config.controller.goal_tolerance };
+
+        // 原目标外的安全截断末点仍须消费，交由后续分支请求新的完整路线。
+        let reached_position = !terminal_position || !goal_position
+            || final_position_reached;
+        let segment_length=horizontal_distance(target,previous);
+        let curved=!rotation && segment_length>1e-5
+            && angle_diff(target.pose.orientation.yaw(),previous.pose.orientation.yaw()).abs()>1e-6;
+        // 短弧按相邻采样的中点切换，不能用整车到点范围一次消耗多段弯道。
+        let arrival_distance=if curved {tolerance.min(segment_length*0.5)}else{tolerance};
+        let midpoint_reached=curved && same_support && distance<tolerance && {
+            let a=previous.pose.position;let b=target.pose.position;
+            let dx=b.x-a.x;let dy=b.y-a.y;
+            // 中点是沿路径的进度平面；末采样很短时，正常横差不能把其缩成无法到达的小圆。
+            (position.x-a.x)*dx+(position.y-a.y)*dy >= (dx*dx+dy*dy)*0.5
+        };
+        // 前段已允许在当前实际位置完成转向，旋转本身只消费角度进度。
+        // 再要求旧支点距离会让已完成的转向永远不能退出；最终位置仍由reached_position约束。
+        let reached = reached_position && (if rotation {error.abs()<WAYPOINT_ROTATION_TOLERANCE_RAD || passed}
+            else {distance<arrival_distance || passed || midpoint_reached});
+        let mut safe_to_skip = true;
+        if reached && !rotation
+            && (target.pose.position.x-previous.pose.position.x)
+                .hypot(target.pose.position.y-previous.pose.position.y)>1e-5 {
+            // 微小平移可能是为后续转向让出净空，不能仅凭到点容差省略。
+            // 只有当前位置能完成后续同位置转向，才允许提前消费这段平移。
+            let mut turn_end = progress.path_index;
+            while turn_end + 1 < path.poses.len()
+                && horizontal_distance(&path.poses[turn_end + 1],target) < 1e-5 {
+                turn_end += 1;
+            }
+            let has_turn=path.poses[progress.path_index..=turn_end].windows(2)
+                .any(|pair|is_rotation(&pair[0],&pair[1]));
+            if !has_turn {
+                // 重复端点后面的真实移动段才决定能否提前消费当前点。
+                // 用零长度重复边判折点会漏掉必须依次经过的小弧接点。
+                if let Some(next) = path.poses.get(turn_end + 1) {
+                    let incoming = [target.pose.position.x - previous.pose.position.x,
+                        target.pose.position.y - previous.pose.position.y];
+                    let outgoing = [next.pose.position.x - target.pose.position.x,
+                        next.pose.position.y - target.pose.position.y];
+                    let lengths = incoming[0].hypot(incoming[1]) * outgoing[0].hypot(outgoing[1]);
+                    // 平滑曲线的采样点按沿线进度消费，实际横差不把每个采样变成折角。
+                    // 真实折角仍核对后继接续；每拍完整机体及制动检查负责实际运动许可。
+                    let off_segment = ((position.x-target.pose.position.x)*outgoing[1]
+                        - (position.y-target.pose.position.y)*outgoing[0]).abs();
+                    let collinear_progress_advice=COLLINEAR_PROGRESS && TRANSLATION_INTENT
+                        && config.motion_limits.is_some() && same_support && !curved
+                        && collinear_same_height_progress_run(path,progress.path_index,turn_end+1,position);
+                    if lengths > 1e-10 && (incoming[0] * outgoing[0] + incoming[1] * outgoing[1]
+                        < lengths * 0.25_f64.cos()
+                        || !curved && !collinear_progress_advice
+                            && off_segment > outgoing[0].hypot(outgoing[1]) * 1e-5) {
+                        // 短平移可能是绕过墙角所必需，只有接续可行才提前消费折点。
+                        // 从实际站姿沿地形推进，不能借路径拟合的横滚/俯仰取得接续许可。
+                        safe_to_skip = translation_connects_in_query(map,&query,body(pose),&ground,next);
+                        if !safe_to_skip && !connection_endpoint_in_query(map,&query,body(pose),&ground,target)
+                            .is_some_and(|(arrival,state)|translation_connects_in_query(map,&query,arrival,&state,next)) {
+                            return Err("平移折点的实际站姿无法接续下一段，需要从实际位姿重规划".into());
+                        }
+                    }
+                }
+            }
+            if has_turn {
+                let turn_clear=|(initial,mut state):(BodyPose,BodyGroundState)| {
+                    let mut previous=initial;
+                    for waypoint in &path.poses[progress.path_index+1..=turn_end] {
+                        let mut at_waypoint=waypoint.clone();
+                        at_waypoint.pose.position=Point3::new(initial.0[0],initial.0[1],initial.0[2]);
+                        let Some((next,next_ground))=connection_endpoint_in_query(map,&query,previous,&state,&at_waypoint) else {return false;};
+                        previous=next;state=next_ground;
+                    }
+                    true
+                };
+                safe_to_skip=turn_clear((body(pose),ground.clone()));
+                if !safe_to_skip && !connection_endpoint_in_query(map,&query,body(pose),&ground,target).is_some_and(turn_clear) {
+                    // 从当前位置及真正到达原转向点的站姿都无法接续时，旧路径已失效。
+                    return Err("转向点的规划站姿与实际接触不一致，需要按当前足迹重新规划".into());
+                }
+            }
+        }
+        if reached && safe_to_skip {
+            if !allow_advance(progress.path_index, AdjacentWaypointAdvance::Reached {
+                rotation, passed, midpoint_reached,
+            })? { break; }
+            progress.progress_m = cumulative[progress.path_index];
+            progress.path_index += 1;
+        } else {
+            break;
+        }
+    }
+    Ok(())
 }
 
 impl SurfaceFollower {
@@ -558,161 +756,28 @@ impl SurfaceFollower {
         }
         #[cfg(test)] drop(profile_support);
         #[cfg(test)] let profile_waypoints=crate::control_profile::guard(crate::control_profile::Stage::WaypointProgress);
-        // 逐点保留转向停留；曲线点只在到达或沿已确认小段越过时消耗。
-        let tolerance = (f64::from(map.config().voxel_size) * 0.7).min(0.07);
-        while self.path_index < path.poses.len() {
-            let target = &path.poses[self.path_index];
-            let previous = &path.poses[self.path_index - 1];
-            // 完整姿态重复的接点不包含新运动，直接沿已消费的前点推进。
-            // 否则低频位姿越过接点时，零长度横向距离会成为NaN并锁住进度。
-            // 高度或任意姿态分量不同的点仍由原平移/转向检查处理。
-            if target.pose==previous.pose {
-                self.progress_m=self.cumulative[self.path_index];
-                self.path_index+=1;
-                continue;
-            }
-            // 连续曲线拼接会保留重复端点；零长度、零偏航变化不产生新的转向意图。
-            let rotation = is_rotation(target,previous);
-            let error = angle_diff(target.pose.orientation.yaw(), yaw);
-            let same_support=actual_layer_matches
+        let mut adjacent = AdjacentWaypointProgress {
+            path_index: self.path_index,
+            progress_m: self.progress_m,
+        };
+        let adjacent_result = advance_adjacent_waypoints::<TRANSLATION_INTENT, COLLINEAR_PROGRESS>(
+            &self.config, map, &query, &ground, path, goal, pose, &self.cumulative,
+            &self.options, final_position_reached, &mut adjacent,
+            |target| actual_layer_matches
                 && query.start_ground_state((body(target).0,body(pose).1)).is_ok_and(|target_ground|
                     target_ground.query_state()!=nuwax_nav_mls_planner::surface::GroundQueryState::Unknown
                         && support_matches_height(body(target).0,target_ground.height())
                         && (ground.height()-target_ground.height()).abs()
-                            <= f64::from(map.source_voxel_size_m())+1e-6);
-            // 路径高度用于选择地面层，接触参考按实际姿态转换；平面执行器
-            // 不控制路径拟合的横滚/俯仰。地面厚层允许实际足端参考位于层内。
-            // 已通过完整机体检查且关联
-            // 同一高度层时，按水平进度消耗路径点；平面速度无法补偿层顶偏差。
-            // 最终到达仍使用上方完整三维距离，不跨楼层或扩大用户容差。
-            let distance = if same_support {
-                (position.x-target.pose.position.x).hypot(position.y-target.pose.position.y)
-            } else {position.distance(target.pose.position)};
-            let passed = if rotation {
-                // 实际步态可能一次越过多个细分角度；沿同向进度消费，不倒转追旧点。
-                let step = angle_diff(target.pose.orientation.yaw(), previous.pose.orientation.yaw());
-                let actual = angle_diff(yaw, previous.pose.orientation.yaw());
-                step * actual > 0.0 && actual.abs() >= step.abs()
-                    && actual.abs() < std::f64::consts::FRAC_PI_2
-            } else {
-                let a = previous.pose.position;
-                let b = target.pose.position;
-                let dx=b.x-a.x;let dy=b.y-a.y;
-                let dot = (position.x - b.x) * dx + (position.y - b.y) * dy;
-                let lateral=((position.x-b.x)*dy-(position.y-b.y)*dx).abs()/dx.hypot(dy);
-                // 位姿可低于控制频率到达；同层沿线越过多个采样点时按横向偏差消费，不能反向追旧点。
-                dot >= 0.0 && (distance < tolerance * 2.0 || same_support && lateral < tolerance * 2.0)
-            };
-            // 换线时的实际制动位移可能越过新曲线的起始采样，但仍有横差。
-            // 这些点既不能按到点容差直接跳过，也不能掉头重新追赶；从实际站姿重接局部路线。
-            // 同层、沿原段已越过且目标落在当前机体后方，三者共同确认过期的平移目标。
-            if !rotation && !passed && same_support && distance > tolerance {
-                let a = previous.pose.position;
-                let b = target.pose.position;
-                let along = (position.x - b.x) * (b.x - a.x)
-                    + (position.y - b.y) * (b.y - a.y);
-                let forward = (b.x - position.x) * yaw.cos() + (b.y - position.y) * yaw.sin();
-                if along >= 0.0 && forward < 0.0 && horizontal_distance(previous, target) > 1e-5 {
-                    return PlannerStep::ReplanRequired("实际机体已越过局部采样且存在横差，需要从当前站姿接续前方路线".into());
-                }
-            }
-            // 容差区域内的替代终点也是路径终点。不能先按路径点容差消费它，
-            // 再发现机器人仍在用户目标区域之外，陷入原地重规划循环。
-            // 防止提前消费的是最终位置组；内部采样即使靠近原目标，也须允许沿已确认进度越过。
-            // 否则实际高度使机体仍在原三维球外时，会被锁在身后内部点，无法走到合法末点。
-            let terminal_position=path.poses[self.path_index..].iter()
-                .all(|pose|horizontal_distance(target,pose)<1e-5);
-            let goal_position = if self.options.position_tolerance_m == 0.0 {
-                nuwax_nav_types_messages::same_finite_position(
-                    super::xyz(target.pose.position), super::xyz(goal.pose.position))
-            } else { (target.pose.position.x-goal.pose.position.x)
-                .hypot(target.pose.position.y-goal.pose.position.y)<self.config.controller.goal_tolerance };
-
-            // 原目标外的安全截断末点仍须消费，交由后续分支请求新的完整路线。
-            let reached_position = !terminal_position || !goal_position
-                || final_position_reached;
-            let segment_length=horizontal_distance(target,previous);
-            let curved=!rotation && segment_length>1e-5
-                && angle_diff(target.pose.orientation.yaw(),previous.pose.orientation.yaw()).abs()>1e-6;
-            // 短弧按相邻采样的中点切换，不能用整车到点范围一次消耗多段弯道。
-            let arrival_distance=if curved {tolerance.min(segment_length*0.5)}else{tolerance};
-            let midpoint_reached=curved && same_support && distance<tolerance && {
-                let a=previous.pose.position;let b=target.pose.position;
-                let dx=b.x-a.x;let dy=b.y-a.y;
-                // 中点是沿路径的进度平面；末采样很短时，正常横差不能把其缩成无法到达的小圆。
-                (position.x-a.x)*dx+(position.y-a.y)*dy >= (dx*dx+dy*dy)*0.5
-            };
-            // 前段已允许在当前实际位置完成转向，旋转本身只消费角度进度。
-            // 再要求旧支点距离会让已完成的转向永远不能退出；最终位置仍由reached_position约束。
-            let reached = reached_position && (if rotation {error.abs()<WAYPOINT_ROTATION_TOLERANCE_RAD || passed}
-                else {distance<arrival_distance || passed || midpoint_reached});
-            let mut safe_to_skip = true;
-            if reached && !rotation
-                && (target.pose.position.x-previous.pose.position.x)
-                    .hypot(target.pose.position.y-previous.pose.position.y)>1e-5 {
-                // 微小平移可能是为后续转向让出净空，不能仅凭到点容差省略。
-                // 只有当前位置能完成后续同位置转向，才允许提前消费这段平移。
-                let mut turn_end = self.path_index;
-                while turn_end + 1 < path.poses.len()
-                    && horizontal_distance(&path.poses[turn_end + 1],target) < 1e-5 {
-                    turn_end += 1;
-                }
-                let has_turn=path.poses[self.path_index..=turn_end].windows(2)
-                    .any(|pair|is_rotation(&pair[0],&pair[1]));
-                if !has_turn {
-                    // 重复端点后面的真实移动段才决定能否提前消费当前点。
-                    // 用零长度重复边判折点会漏掉必须依次经过的小弧接点。
-                    if let Some(next) = path.poses.get(turn_end + 1) {
-                        let incoming = [target.pose.position.x - previous.pose.position.x,
-                            target.pose.position.y - previous.pose.position.y];
-                        let outgoing = [next.pose.position.x - target.pose.position.x,
-                            next.pose.position.y - target.pose.position.y];
-                        let lengths = incoming[0].hypot(incoming[1]) * outgoing[0].hypot(outgoing[1]);
-                        // 平滑曲线的采样点按沿线进度消费，实际横差不把每个采样变成折角。
-                        // 真实折角仍核对后继接续；每拍完整机体及制动检查负责实际运动许可。
-                        let off_segment = ((position.x-target.pose.position.x)*outgoing[1]
-                            - (position.y-target.pose.position.y)*outgoing[0]).abs();
-                        let collinear_progress_advice=COLLINEAR_PROGRESS && TRANSLATION_INTENT
-                            && self.config.motion_limits.is_some() && same_support && !curved
-                            && collinear_same_height_progress_run(path,self.path_index,turn_end+1,position);
-                        if lengths > 1e-10 && (incoming[0] * outgoing[0] + incoming[1] * outgoing[1]
-                            < lengths * 0.25_f64.cos()
-                            || !curved && !collinear_progress_advice
-                                && off_segment > outgoing[0].hypot(outgoing[1]) * 1e-5) {
-                            // 短平移可能是绕过墙角所必需，只有接续可行才提前消费折点。
-                            // 从实际站姿沿地形推进，不能借路径拟合的横滚/俯仰取得接续许可。
-                            safe_to_skip = translation_connects_in_query(map,&query,body(pose),&ground,next);
-                            if !safe_to_skip && !connection_endpoint_in_query(map,&query,body(pose),&ground,target)
-                                .is_some_and(|(arrival,state)|translation_connects_in_query(map,&query,arrival,&state,next)) {
-                                return PlannerStep::ReplanRequired("平移折点的实际站姿无法接续下一段，需要从实际位姿重规划".into());
-                            }
-                        }
-                    }
-                }
-                if has_turn {
-                    let turn_clear=|(initial,mut state):(BodyPose,BodyGroundState)| {
-                        let mut previous=initial;
-                        for waypoint in &path.poses[self.path_index+1..=turn_end] {
-                            let mut at_waypoint=waypoint.clone();
-                            at_waypoint.pose.position=Point3::new(initial.0[0],initial.0[1],initial.0[2]);
-                            let Some((next,next_ground))=connection_endpoint_in_query(map,&query,previous,&state,&at_waypoint) else {return false;};
-                            previous=next;state=next_ground;
-                        }
-                        true
-                    };
-                    safe_to_skip=turn_clear((body(pose),ground.clone()));
-                    if !safe_to_skip && !connection_endpoint_in_query(map,&query,body(pose),&ground,target).is_some_and(turn_clear) {
-                        // 从当前位置及真正到达原转向点的站姿都无法接续时，旧路径已失效。
-                        return PlannerStep::ReplanRequired("转向点的规划站姿与实际接触不一致，需要按当前足迹重新规划".into());
-                    }
-                }
-            }
-            if reached && safe_to_skip {
-                self.progress_m = self.cumulative[self.path_index];
-                self.path_index += 1;
-            } else {
-                break;
-            }
+                            <= f64::from(map.source_voxel_size_m())+1e-6),
+            |_, _| Ok(true),
+        );
+        // Legacy Body wrote each accepted waypoint before a later loop error.
+        // Preserve that behavior; Ground will commit only after the whole
+        // actual-consumption transaction succeeds.
+        self.path_index = adjacent.path_index;
+        self.progress_m = adjacent.progress_m;
+        if let Err(error) = adjacent_result {
+            return PlannerStep::ReplanRequired(error);
         }
         #[cfg(test)] drop(profile_waypoints);
         // 显式原地转向按已有角度进度完成；同方向细分角由下方前瞻连续消费。

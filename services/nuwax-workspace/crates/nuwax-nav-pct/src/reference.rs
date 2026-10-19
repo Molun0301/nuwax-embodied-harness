@@ -382,57 +382,69 @@ impl Tomogram {
         a: [f64; 3], b: [f64; 3], boundary: &[[f64; 2]],
         cancelled: Option<&AtomicBool>, scratch: &mut Option<SegmentTrace>,
         initial: Option<Reference>) -> Option<(f64, bool, Reference)> {
+        self.reference_walk_recorded::<RECORD>([a[0],a[1]],[b[0],b[1]],Some([a[2],b[2]]),
+            boundary,cancelled,scratch,initial)
+    }
+    /// The same discrete source walk. None supplies only candidate XY geometry;
+    /// it does not synthesize a navigation height or grant body clearance.
+    pub(crate) fn reference_walk_recorded<const RECORD: bool>(&self,
+        from: [f64;2], to: [f64;2], heights: Option<[f64;2]>, boundary: &[[f64;2]],
+        cancelled: Option<&AtomicBool>, scratch: &mut Option<SegmentTrace>,
+        initial: Option<Reference>) -> Option<(f64,bool,Reference)> {
         #[cfg(test)]
-        crate::search::trace_tests::record_evaluation(a, b);
-        if RECORD { scratch.as_mut().expect("recording scratch").changes.clear(); }
-        if !a.into_iter().chain(b).all(f64::is_finite)
-            || !self.reference_inside_window([a[0],a[1]])
-            || !self.reference_inside_window([b[0],b[1]])
-            || !crate::segment_inside_boundary([a[0], a[1]], [b[0], b[1]], boundary) { return None; }
-        let mut reference = match initial { Some(reference)=>reference, None=>self.reference_start(a)? };
-        let mut observed = matches!(reference, Reference::Known(_));
-        let length = distance(a, b);
-        let steps = ((a[0] - b[0]).hypot(a[1] - b[1]) / (self.resolution * 0.4)).ceil().max(1.0) as usize;
-        if RECORD {
-            let trace = scratch.as_mut().expect("recording scratch");
-            trace.steps = steps;
-            trace.record(0, reference);
+        if let Some([az,bz])=heights {
+            crate::search::trace_tests::record_evaluation([from[0],from[1],az],[to[0],to[1],bz]);
         }
-        let mut cost = 0.0;
+        if RECORD { scratch.as_mut().expect("recording scratch").changes.clear(); }
+        if !from.into_iter().chain(to).chain(heights.into_iter().flatten()).all(f64::is_finite)
+            || !self.reference_inside_window(from) || !self.reference_inside_window(to)
+            || !crate::segment_inside_boundary(from,to,boundary) { return None; }
+        let mut reference=match initial {
+            Some(reference)=>reference,
+            None=>self.reference_start([from[0],from[1],heights?[0]])?,
+        };
+        let mut observed=matches!(reference,Reference::Known(_));
+        let length=heights.map_or_else(||(from[0]-to[0]).hypot(from[1]-to[1]),
+            |[az,bz]|distance([from[0],from[1],az],[to[0],to[1],bz]));
+        let steps=((from[0]-to[0]).hypot(from[1]-to[1])/(self.resolution*0.4)).ceil().max(1.0) as usize;
+        if RECORD {
+            let trace=scratch.as_mut().expect("recording scratch");
+            trace.steps=steps;trace.record(0,reference);
+        }
+        let mut cost=0.0;
         for i in 1..=steps {
             crate::search::checkpoint(cancelled).ok()?;
-            let t = i as f64 / steps as f64;
-            let p = std::array::from_fn(|axis| a[axis] + t * (b[axis] - a[axis]));
-            // 保留原图参考状态及 trace 语义。Heightfield 的列内 h 恒定；
-            // LegacyPlane 跨缺测仍携带原图中心参考，连续物理输运归投影。
-            reference = self.reference_neighbor(reference, self.point_column(p))?;
-            observed |= matches!(reference, Reference::Known(_));
-            if matches!(reference, Reference::Unanchored { .. }) {
-                cost += UNKNOWN_COST * length / steps as f64;
-                if RECORD { scratch.as_mut().expect("recording scratch").record(i, reference); }
+            let t=i as f64/steps as f64;
+            let xy=std::array::from_fn(|axis|from[axis]+t*(to[axis]-from[axis]));
+            reference=self.reference_neighbor(reference,xy.map(|v|(v/self.resolution).floor() as i32))?;
+            observed|=matches!(reference,Reference::Known(_));
+            if matches!(reference,Reference::Unanchored {..}) {
+                cost+=UNKNOWN_COST*length/steps as f64;
+                if RECORD {scratch.as_mut().expect("recording scratch").record(i,reference);}
                 continue;
             }
-            let z = self.reference_height_at(reference,[p[0],p[1]])?;
-            if matches!(reference, Reference::Unknown { .. })
-                && !self.unknown_footprint_clear([p[0], p[1]], z) { return None; }
-            // A shortcut may approximate a known step/ramp, but it cannot invent
-            // a rising/falling plane while passing through absent observations.
-            let tolerance = match reference {
-                Reference::Unanchored { .. } => unreachable!("handled without a navigation height"),
-                Reference::Known(_) => self.step_up.max(self.step_down).max(self.resolution) * 1.5 + 1e-6,
-                Reference::Unknown { .. } => {
-                    let col = self.reference_column(reference);
-                    let end = self.point_column(b);
-                    if (i64::from(col[0]) - i64::from(end[0])).abs() <= 1
-                        && (i64::from(col[1]) - i64::from(end[1])).abs() <= 1
-                        && self.cell_at(b).is_some() {
-                        self.step_up.max(self.step_down).max(self.resolution) + 1e-6
-                    } else { 1e-6 }
-                },
-            };
-            if (z - p[2]).abs() > tolerance { return None; }
-            cost += self.reference_cost(reference) * length / steps as f64;
-            if RECORD { scratch.as_mut().expect("recording scratch").record(i, reference); }
+            let z=self.reference_height_at(reference,xy)?;
+            if matches!(reference,Reference::Unknown {..}) && !self.unknown_footprint_clear(xy,z) {return None;}
+            // The existing segment leaf keeps its exact line-height tolerance.
+            // The candidate-XY leaf has no prescribed z line to compare against.
+            if let Some([az,bz])=heights {
+                let end_point=[to[0],to[1],bz];
+                let tolerance=match reference {
+                    Reference::Unanchored {..}=>unreachable!("handled without a navigation height"),
+                    Reference::Known(_)=>self.step_up.max(self.step_down).max(self.resolution)*1.5+1e-6,
+                    Reference::Unknown {..}=> {
+                        let col=self.reference_column(reference);let end=self.point_column(end_point);
+                        if (i64::from(col[0])-i64::from(end[0])).abs()<=1
+                            && (i64::from(col[1])-i64::from(end[1])).abs()<=1
+                            && self.cell_at(end_point).is_some() {
+                            self.step_up.max(self.step_down).max(self.resolution)+1e-6
+                        }else{1e-6}
+                    },
+                };
+                if (z-(az+t*(bz-az))).abs()>tolerance {return None;}
+            }
+            cost+=self.reference_cost(reference)*length/steps as f64;
+            if RECORD {scratch.as_mut().expect("recording scratch").record(i,reference);}
         }
         #[cfg(test)]
         crate::search::trace_tests::record_segment_cost(cost);

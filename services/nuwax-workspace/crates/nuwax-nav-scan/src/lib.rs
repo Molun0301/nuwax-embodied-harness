@@ -149,6 +149,127 @@ pub struct LocalTrajectory {
     pub smoothed: bool,
     pub elapsed_ms: f64,
 }
+/// The actual selected geometric family. This is recorded at its success outlet,
+/// never inferred from the final pose, timing, or proximity to the global route.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CandidateFamily { Direct, StepTurn, Rejoin, Spline { optimized: bool }, Polyline, Passage, Search }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CandidateEdgeOrigin { Family(CandidateFamily), Departure, Parent { node:usize }, Connector { node:usize } }
+#[derive(Debug)]
+struct CandidatePart { edges:std::ops::Range<usize>, origin:CandidateEdgeOrigin }
+struct CandidateOrigins { family:CandidateFamily, parts:Vec<CandidatePart> }
+#[derive(Clone, Debug)]
+pub struct GroundMotionBinding {
+    motion:[BodyPose;2],
+    origin:CandidateEdgeOrigin,
+}
+impl GroundMotionBinding {
+    pub fn motion(&self)->[BodyPose;2] {self.motion}
+    pub fn origin(&self)->CandidateEdgeOrigin {self.origin}
+}
+/// A successful physical candidate and its own source-local navigation walk.
+/// Its coverage is planned intent only, never actual progress or arrival.
+#[derive(Clone, Debug)]
+pub struct GroundCandidateBinding {
+    original:nuwax_nav_pct::ground_route::OwnedGroundRouteWindow,
+    candidate:nuwax_nav_pct::ground_route::GroundCandidateReference,
+    edges:Vec<GroundMotionBinding>,
+    family:CandidateFamily,
+    planned_join:bool,
+}
+impl GroundCandidateBinding {
+    pub fn original_window(&self)->nuwax_nav_pct::ground_route::GroundRouteWindow<'_> {self.original.window()}
+    pub fn candidate(&self)->&nuwax_nav_pct::ground_route::GroundCandidateReference {&self.candidate}
+    pub fn edges(&self)->&[GroundMotionBinding] {&self.edges}
+    pub fn family(&self)->CandidateFamily {self.family}
+    pub fn planned_join(&self)->bool {self.planned_join}
+    pub fn covers_original_goal(&self)->bool {self.planned_join && self.original.window().to().is_terminal()}
+    /// Cropping retains the original connection and sampling grid. No source
+    /// query or shortened-segment re-walk takes place here.
+    pub fn slice(&self,edge:usize,from:f64,to:f64)->Option<GroundMotionSlice<'_>> {
+        self.edges.get(edge)?;
+        (from.is_finite() && to.is_finite() && 0.0<=from && from<=to && to<=1.0)
+            .then_some(GroundMotionSlice {binding:self,edge,from,to})
+    }
+}
+#[derive(Clone,Copy,Debug)]
+pub struct GroundMotionSlice<'a> {binding:&'a GroundCandidateBinding,edge:usize,from:f64,to:f64}
+impl<'a> GroundMotionSlice<'a> {
+    pub fn binding(self)->&'a GroundCandidateBinding {self.binding}
+    pub fn edge(self)->usize {self.edge}
+    pub fn range(self)->[f64;2] {[self.from,self.to]}
+    pub fn original_sample(self,progress:f64)->Option<(usize,f64)> {
+        if !progress.is_finite() || !(0.0..=1.0).contains(&progress) {return None;}
+        let (_,_,steps)=self.binding.candidate.connection(self.edge)?;
+        let t=self.from+progress*(self.to-self.from);
+        let value=t*steps as f64;
+        let sample=(value.floor() as usize).min(steps);
+        Some((sample,if sample==steps {0.0}else{value-sample as f64}))
+    }
+}
+#[derive(Debug)]
+pub struct MappedLocalTrajectory {pub trajectory:LocalTrajectory,pub binding:GroundCandidateBinding}
+#[derive(Debug)]
+pub enum GroundCandidateError {
+    Planning(LocalPlanError),
+    MappingInput(String),
+    Cancelled { trajectory:LocalTrajectory, error:LocalPlanError },
+    /// The original physical winner is preserved for diagnosis. This is not a
+    /// physical NoPath result and does not trigger selection of another winner.
+    Mapping { trajectory:LocalTrajectory, reason:String },
+}
+#[cfg(test)]
+thread_local! {static GROUND_MAPPING_WORK:std::cell::Cell<usize>=const {std::cell::Cell::new(0)};}
+fn map_selected_candidate(trajectory:LocalTrajectory,origins:CandidateOrigins,
+    window:nuwax_nav_pct::ground_route::GroundRouteWindow<'_>,boundary:&[[f64;2]])
+    ->Result<MappedLocalTrajectory,GroundCandidateError> {
+    let mapped=(|| ->Result<GroundCandidateBinding,LocalPlanError> {
+        cancellation::checkpoint()?;
+        let mut state=window.from().walk_state();
+        if trajectory.poses.first().map(|pose|[pose.0[0],pose.0[1]])!=Some(state.xy()) {
+            return Err("candidate start has no explicit navigation address".into());
+        }
+        let mut segments=Vec::with_capacity(trajectory.poses.len().saturating_sub(1));
+        let mut edges=Vec::with_capacity(segments.capacity());
+        for (edge,pair) in trajectory.poses.windows(2).enumerate() {
+            cancellation::checkpoint()?;
+            #[cfg(test)] GROUND_MAPPING_WORK.set(GROUND_MAPPING_WORK.get()+1);
+            let segment=state.walk_xy([pair[1].0[0],pair[1].0[1]],boundary,None).map_err(|e|LocalPlanError::from(e.to_string()))?;
+            state=segment.end();segments.push(segment);
+            let origin=origins.parts.iter().find(|part|part.edges.contains(&edge))
+                .map_or(CandidateEdgeOrigin::Family(origins.family),|part|part.origin);
+            edges.push(GroundMotionBinding {motion:[pair[0],pair[1]],origin});
+        }
+        let candidate=window.owner().freeze_candidate(segments).map_err(|e|LocalPlanError::from(e.to_string()))?;
+        let planned_join=!trajectory.partial && candidate.end_matches(window.to());
+        cancellation::checkpoint()?;
+        Ok(GroundCandidateBinding {original:window.freeze(),candidate,edges,family:origins.family,planned_join})
+    })();
+    match mapped {Ok(binding)=>Ok(MappedLocalTrajectory {trajectory,binding}),
+        Err(error) if error.kind==LocalPlanFailureKind::Cancelled=>Err(GroundCandidateError::Cancelled {trajectory,error}),
+        Err(error)=>Err(GroundCandidateError::Mapping {trajectory,reason:error.to_string()})}
+}
+/// Opt-in internal migration seam. The physical kernel, winner ordering and
+/// body association remain unchanged. Navigation mapping is frozen only after
+/// the selected geometry (including original search parents/connector) exists.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_mapped_ground(
+    map:&SurfaceSnapshot,tomogram:&Tomogram,start:BodyPose,start_ground:&BodyGroundState,
+    reference:&[[f64;3]],kinematics:&MotionKinematics,config:&ScanConfig,final_yaw:Option<f64>,
+    arrival:Option<([f64;3],f64)>,boundary:&[[f64;2]],follow_reference:bool,prefer_straight:bool,
+    progress:Option<ProgressPrefixPolicy<'_>>,window:nuwax_nav_pct::ground_route::GroundRouteWindow<'_>,
+)->Result<MappedLocalTrajectory,GroundCandidateError> {
+    if !window.owner().matches_source(map) {
+        return Err(GroundCandidateError::MappingInput("navigation reference source retired".into()));
+    }
+    let mut origins=CandidateOrigins {family:CandidateFamily::Direct,parts:Vec::new()};
+    let outcome=plan_with_extent_recorded(map,tomogram,start,reference,kinematics,config,final_yaw,
+        arrival,boundary,follow_reference,prefer_straight,progress,PlanExtent::Full,Some(start_ground),Some(&mut origins))
+        .map_err(GroundCandidateError::Planning)?;
+    let PlanOutcome::Trajectory(trajectory)=outcome else {unreachable!("full Scan")};
+    map_selected_candidate(trajectory,origins,window,boundary)
+}
+
 fn distance3(a: [f64; 3], b: [f64; 3]) -> f64 {
     ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
 }
@@ -560,6 +681,27 @@ fn plan_with_extent(
     extent: PlanExtent,
     initial_ground: Option<&BodyGroundState>,
 ) -> Result<PlanOutcome, LocalPlanError> {
+    plan_with_extent_recorded(map,tomogram,start,reference,kinematics,config,final_yaw,arrival,
+        boundary,follow_reference,prefer_straight,progress,extent,initial_ground,None)
+}
+
+fn plan_with_extent_recorded(
+    map: &SurfaceSnapshot,
+    tomogram: &Tomogram,
+    start: BodyPose,
+    reference: &[[f64; 3]],
+    kinematics: &MotionKinematics,
+    config: &ScanConfig,
+    final_yaw: Option<f64>,
+    arrival: Option<([f64; 3], f64)>,
+    boundary: &[[f64; 2]],
+    follow_reference: bool,
+    prefer_straight: bool,
+    progress: Option<ProgressPrefixPolicy<'_>>,
+    extent: PlanExtent,
+    initial_ground: Option<&BodyGroundState>,
+    origins: Option<&mut CandidateOrigins>,
+) -> Result<PlanOutcome, LocalPlanError> {
     cancellation::checkpoint()?;
     if progress.is_some_and(|policy| !policy.minimum_distance_m.is_finite()
         || policy.minimum_distance_m<0.0 || policy.reference.is_empty()
@@ -567,7 +709,7 @@ fn plan_with_extent(
         return Err("有限进度策略缺少有效的原全局窗口或控制距离".into());
     }
     let result = plan_impl(map, tomogram, start, reference, kinematics, config, final_yaw,
-        arrival, boundary, follow_reference, prefer_straight,progress,extent,initial_ground);
+        arrival, boundary, follow_reference, prefer_straight,progress,extent,initial_ground,origins);
     cancellation::checkpoint()?;
     result.map_err(|mut failure| {
         if let Some(witness)=failure.body_witness.take() {
@@ -675,6 +817,7 @@ fn plan_impl(
     progress: Option<ProgressPrefixPolicy<'_>>,
     extent: PlanExtent,
     initial_ground: Option<&BodyGroundState>,
+    mut origins: Option<&mut CandidateOrigins>,
 ) -> Result<PlanOutcome, LocalPlanError> {
     #[cfg(feature="profile")]
     let _profile=profile::Scope::begin(start,reference,kinematics,config,final_yaw,arrival,follow_reference,prefer_straight);
@@ -749,6 +892,7 @@ fn plan_impl(
                     if let Some(poses)=admit_candidate(project_bound(map, &query, &start_ground,start,&samples,kinematics,false,final_yaw,region,boundary,&blocked))? {
                         #[cfg(feature="profile")]
                         profile::success();
+                        if let Some(origins)=origins.as_deref_mut() {origins.family=CandidateFamily::Direct;}
                         return Ok(PlanOutcome::Trajectory(LocalTrajectory { partial: false,poses,smoothed:false,
                             elapsed_ms:began.elapsed().as_secs_f64()*1000.0}));
                     }
@@ -775,7 +919,8 @@ fn plan_impl(
                 model.body_to_support_z_m, corridor, layer_tolerance, length, tangent) {
                 #[cfg(feature="profile")]
                 profile::success();
-                return Ok(PlanOutcome::Trajectory(LocalTrajectory { partial: false, poses, smoothed: false,
+                if let Some(origins)=origins.as_deref_mut() {origins.family=CandidateFamily::StepTurn;}
+                        return Ok(PlanOutcome::Trajectory(LocalTrajectory { partial: false, poses, smoothed: false,
                     elapsed_ms: began.elapsed().as_secs_f64() * 1000.0 }));
             }
         }
@@ -811,7 +956,8 @@ fn plan_impl(
         if let Some(poses) = admit_candidate(project_bound(map, &query, &start_ground, start, &samples, kinematics, true, final_yaw, interior, boundary, &shortcut_blocked))? {
             #[cfg(feature="profile")]
             profile::success();
-            return Ok(PlanOutcome::Trajectory(LocalTrajectory { partial: false, poses, smoothed: true, elapsed_ms: began.elapsed().as_secs_f64()*1000.0 }));
+            if let Some(origins)=origins.as_deref_mut() {origins.family=CandidateFamily::Rejoin;}
+                        return Ok(PlanOutcome::Trajectory(LocalTrajectory { partial: false, poses, smoothed: true, elapsed_ms: began.elapsed().as_secs_f64()*1000.0 }));
         }
     }
     // 首段方向属于全局路线的接续意图。固定该切向，先完成实际转向，
@@ -848,6 +994,7 @@ fn plan_impl(
                 Ok(poses) => {
                     #[cfg(feature="profile")]
                         profile::success();
+                        if let Some(origins)=origins.as_deref_mut() {origins.family=CandidateFamily::Spline { optimized: optimize_obstacles };}
                         return Ok(PlanOutcome::Trajectory(LocalTrajectory { partial: false,
                         poses,
                         smoothed: true,
@@ -877,7 +1024,8 @@ fn plan_impl(
         Ok(poses) => {
             #[cfg(feature="profile")]
             profile::success();
-            return Ok(PlanOutcome::Trajectory(LocalTrajectory { partial: false,
+            if let Some(origins)=origins.as_deref_mut() {origins.family=CandidateFamily::Polyline;}
+                        return Ok(PlanOutcome::Trajectory(LocalTrajectory { partial: false,
                 poses,
                 smoothed: false,
                 elapsed_ms: began.elapsed().as_secs_f64() * 1000.0,
@@ -938,6 +1086,7 @@ fn plan_impl(
                 ))? {
                     #[cfg(feature="profile")]
                         profile::success();
+                        if let Some(origins)=origins.as_deref_mut() {origins.family=CandidateFamily::Passage;}
                         return Ok(PlanOutcome::Trajectory(LocalTrajectory { partial: false,
                         poses,
                         smoothed: false,
@@ -965,7 +1114,10 @@ fn plan_impl(
         project_bound(map, &query, &start_ground, start, &sampled, kinematics, false, final_yaw, arrival, boundary, &blocked)
     };
     let (poses, partial) = match polyline {
-        Ok(poses) => (poses,false),
+        Ok(poses) => {
+            if let Some(origins)=origins.as_deref_mut() {origins.family=CandidateFamily::Polyline;}
+            (poses,false)
+        },
         Err(polyline) => {
             if matches!(polyline.kind, LocalPlanFailureKind::Cancelled) { return Err(polyline); }
             cancellation::checkpoint()?;
@@ -988,7 +1140,12 @@ fn plan_impl(
                 *prefix.last().unwrap()
             }else{start};
             #[cfg(feature="profile")] drop(phase);
-            merge_search_result(local_search::plan_progress_bound(
+            if let Some(origins)=origins.as_deref_mut() {
+                origins.family=CandidateFamily::Search;
+                origins.parts.push(CandidatePart {edges:0..prefix.len().saturating_sub(1),origin:CandidateEdgeOrigin::Departure});
+            }
+            let prefix_edges=prefix.len().saturating_sub(1);
+            merge_search_result(local_search::plan_progress_bound_recorded(
             map,
             &query,
             &search_ground,
@@ -1004,6 +1161,7 @@ fn plan_impl(
             follow_reference,
             config.search_expansion_limit,
             progress,
+            origins.as_deref_mut().map(|origins| (&mut origins.parts,prefix_edges)),
         )
         .map(|result| {
             prefix.extend(result.poses.into_iter().skip(1));
@@ -1029,6 +1187,7 @@ mod tests {
     use nuwax_nav_types_messages::MotionModel;
     use std::{collections::BTreeMap, sync::Arc};
     include!("progress_prefix_tests.rs");
+    include!("ground_candidate_tests.rs");
     include!("reference_probe_tests.rs");
     include!("scan_zero_arrival_tests.rs");
     include!("position_zero_search_tests.rs");

@@ -516,6 +516,27 @@ pub(super) fn plan_progress_bound(
     expansion_limit: usize,
     progress_policy: Option<super::ProgressPrefixPolicy<'_>>,
 ) -> Result<SearchPath, LocalPlanError> {
+    plan_progress_bound_recorded(map,query,start_ground,tomogram,start,reference,motion,final_yaw,
+        arrival,boundary,horizon,corridor,follow_reference,expansion_limit,progress_policy,None)
+}
+pub(super) fn plan_progress_bound_recorded(
+    map: &SurfaceSnapshot,
+    query: &SurfaceBodyQueryView,
+    start_ground: &BodyGroundState,
+    tomogram: &Tomogram,
+    start: BodyPose,
+    reference: &[[f64; 3]],
+    motion: &MotionKinematics,
+    final_yaw: Option<f64>,
+    arrival: Option<([f64; 3], f64)>,
+    boundary: &[[f64; 2]],
+    horizon: f64,
+    corridor: f64,
+    follow_reference: bool,
+    expansion_limit: usize,
+    progress_policy: Option<super::ProgressPrefixPolicy<'_>>,
+    mut origins: Option<(&mut Vec<super::CandidatePart>,usize)>,
+) -> Result<SearchPath, LocalPlanError> {
     #[cfg(feature="profile")] let setup_phase=super::profile::Phase::begin("search_setup");
     super::cancellation::checkpoint()?;
     validate_caps(motion)?;
@@ -771,10 +792,20 @@ pub(super) fn plan_progress_bound(
             let mut path = vec![start];
             for id in chain {
                 super::cancellation::checkpoint()?;
+                let edge_start=path.len()-1;
                 path.extend_from_slice(&nodes[id].samples);
+                if let Some((parts,offset))=origins.as_mut() {
+                    parts.push(super::CandidatePart {edges:edge_start+*offset..path.len()-1+*offset,
+                        origin:super::CandidateEdgeOrigin::Parent {node:id}});
+                }
             }
             if let Some(connection)=connection {
+                let edge_start=path.len()-1;
                 path.extend(connection.into_iter().skip(1));
+                if let Some((parts,offset))=origins.as_mut() {
+                    parts.push(super::CandidatePart {edges:edge_start+*offset..path.len()-1+*offset,
+                        origin:super::CandidateEdgeOrigin::Connector {node:id}});
+                }
             }
             super::cancellation::checkpoint()?;
             return Ok(SearchPath {poses:path,partial:false});
@@ -898,7 +929,14 @@ pub(super) fn plan_progress_bound(
             let mut chain=Vec::new();let mut current=id;
             while let Some(parent)=nodes[current].parent {super::cancellation::checkpoint()?;chain.push(current);current=parent;}
             chain.reverse();let mut poses=vec![start];
-            for node in chain {poses.extend_from_slice(&nodes[node].samples);}
+            for node in chain {
+                let edge_start=poses.len()-1;
+                poses.extend_from_slice(&nodes[node].samples);
+                if let Some((parts,offset))=origins.as_mut() {
+                    parts.push(super::CandidatePart {edges:edge_start+*offset..poses.len()-1+*offset,
+                        origin:super::CandidateEdgeOrigin::Parent {node}});
+                }
+            }
             // 每条精确边已完整扫掠；这只交付候选，发速仍由当前输入的完整停车检查决定。
             super::cancellation::checkpoint()?;
             tracing::info!(target:"navigation.scan",event="navigation.scan.progress_prefix",

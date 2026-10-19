@@ -721,7 +721,7 @@ impl NavPlanner for SurfaceFollower {
         let odometry = self.odometry.as_ref()?.clone();
         let ground = self.actual_ground.as_ref()?.1.as_ref().ok()?.clone();
         Some(Arc::new(crate::replan_feedback::ActualExecutionContext {
-            source, odometry, ground, applied, navigation:self.committed_ground_basis(),
+            source, odometry, ground, applied, navigation:self.paired_ground_basis(),
         }))
     }
     fn revalidate_selected_command(&mut self,command:Twist2)->Option<PlannerStep> {

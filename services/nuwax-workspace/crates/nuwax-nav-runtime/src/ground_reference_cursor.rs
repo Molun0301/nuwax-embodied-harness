@@ -9,7 +9,12 @@ use std::sync::atomic::{AtomicBool,Ordering};
 pub(crate) struct GroundCursor {pub(crate) edge:usize,pub(crate) fraction:f64}
 #[derive(Clone)]
 pub(crate) struct GroundResume {binding:Arc<GroundCandidateBinding>,cursor:GroundCursor,actual:PoseStamped}
-pub(super) struct GroundExecution {
+pub(super) enum GroundExecution {
+    Initial {state:nuwax_nav_pct::ground_route::OwnedGroundWalkState,last_actual:PoseStamped,
+        last_physical:nuwax_nav_mls_planner::surface::BodyGroundState},
+    Candidate(CandidateExecution),
+}
+pub(super) struct CandidateExecution {
     binding:Arc<GroundCandidateBinding>,cursor:GroundCursor,last_actual:PoseStamped,xy_cumulative:Vec<f64>,
 }
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
@@ -22,7 +27,8 @@ pub(crate) enum GroundControlStep {
 }
 struct GroundActualProposal {
     basis: GroundActualBasis,
-    cursor: GroundCursor,
+    cursor: Option<GroundCursor>,
+    physical: nuwax_nav_mls_planner::surface::BodyGroundState,
     path_index: usize,
     progress_m: f64,
     actual: PoseStamped,
@@ -41,7 +47,8 @@ fn ground_xy_lengths(path:&Path3D)->Vec<f64> {
 }
 fn zero_admission_connector(binding:&GroundCandidateBinding,edge:usize)->bool {
     binding.edges().get(edge).is_some_and(|edge|
-        edge.origin()==nuwax_nav_scan::CandidateEdgeOrigin::AdmissionConnector
+        matches!(edge.origin(),nuwax_nav_scan::CandidateEdgeOrigin::AdmissionConnector
+            | nuwax_nav_scan::CandidateEdgeOrigin::AdmissionTerminal)
             && edge.motion()[0]==edge.motion()[1])
 }
 fn validate_ground_seam(candidate:&nuwax_nav_pct::ground_route::GroundCandidateReference,right:usize,
@@ -76,6 +83,18 @@ fn pose_at(path:&Path3D,cursor:GroundCursor)->PoseStamped {
     super::interpolate_pose(a,b,cursor.fraction)
 }
 impl GroundExecution {
+    fn candidate(&self)->Option<&CandidateExecution> {match self {Self::Candidate(v)=>Some(v),_=>None}}
+    pub(super) fn matches_source(&self,source:&SurfaceSnapshot)->bool {match self {
+        Self::Initial {state,..}=>state.matches_source(source),Self::Candidate(v)=>v.matches_source(source),
+    }}
+    pub(super) fn basis(&self)->GroundActualBasis {match self {
+        Self::Initial {state,..}=>GroundActualBasis::initial(state.clone()),Self::Candidate(v)=>v.basis(),
+    }}
+    fn last_actual(&self)->&PoseStamped {match self {
+        Self::Initial {last_actual,..}=>last_actual,Self::Candidate(v)=>&v.last_actual,
+    }}
+}
+impl CandidateExecution {
     pub(super) fn matches_source(&self,source:&SurfaceSnapshot)->bool {self.binding.candidate().matches_source(source)}
     fn basis_at(&self,cursor:GroundCursor,actual:&PoseStamped)->GroundActualBasis {
         GroundActualBasis::new(Arc::clone(&self.binding),cursor.edge,cursor.fraction,
@@ -84,6 +103,27 @@ impl GroundExecution {
     pub(super) fn basis(&self)->GroundActualBasis {self.basis_at(self.cursor,&self.last_actual)}
 }
 impl SurfaceFollower {
+    /// Install the independent initial basis before any asynchronous request.
+    /// This internal seam does not activate the public Ground goal lifecycle.
+    pub(crate) fn initialize_ground_actual(&mut self,state:nuwax_nav_pct::ground_route::OwnedGroundWalkState,
+        cancelled:Option<&AtomicBool>)->Result<(),String> {
+        checkpoint(cancelled)?;self.refresh_current_body_view();
+        let map=self.source_map.as_ref().ok_or("initial Ground has no current source")?;
+        let actual=self.odometry.as_ref().ok_or("initial Ground has no actual pose")?;
+        crate::validate_map_pose(actual,"initial Ground actual").map_err(|e|e.to_string())?;
+        if state.walk_state().xy()!=[actual.pose.position.x,actual.pose.position.y] {
+            return Err("initial Ground was not captured at this actual observation".into());
+        }
+        if self.ground_execution.is_some() {return Err("initial Ground basis is already established".into());}
+        let query=state.bind_body_query(map).map_err(|e|e.to_string())?;
+        let (_,physical)=self.current_ground_query_owned()?;
+        body_control::validate_control_actual_pose(&query,body_control::body(actual),&physical,
+            Some(state.walk_state()),&self.boundary)?;
+        checkpoint(cancelled)?;
+        self.selected_body_command=None;self.last_command_dispatch_bound=None;
+        self.ground_execution=Some(GroundExecution::Initial {state,last_actual:actual.clone(),last_physical:physical});
+        Ok(())
+    }
     /// Exact initial installation, retained resume, and moving replacement
     /// share one commit. A moving replacement begins with a real, unconsumed
     /// connector from the current actual basis, then retains the original grid.
@@ -108,7 +148,7 @@ impl SurfaceFollower {
         }
         let cursor=match resume.as_ref() {
             Some(resume) if Arc::ptr_eq(&binding,&resume.binding)
-                && self.ground_execution.as_ref().is_some_and(|current|
+                && self.ground_execution.as_ref().and_then(GroundExecution::candidate).is_some_and(|current|
                     Arc::ptr_eq(&current.binding,&resume.binding) && current.cursor==resume.cursor
                         && current.last_actual.pose==resume.actual.pose)=>resume.cursor,
             Some(_)=>return Err("resume is not the current consumed candidate address".into()),
@@ -130,9 +170,9 @@ impl SurfaceFollower {
             let incoming=proposal.basis.walk_state()?;
             let owner=binding.original_window().owner();
             if !incoming.same_reference_owner(owner) {return Err("moving candidate reference owner changed".into());}
-            if binding.edges().is_empty() {return Err("moving singleton has no directed suffix".into());}
             let xy_lengths=ground_xy_lengths(&path);
-            let selected=if path.poses[0].pose.position.x==actual.pose.position.x
+            let stationary=binding.edges().is_empty();
+            let selected=if stationary || path.poses[0].pose.position.x==actual.pose.position.x
                 && path.poses[0].pose.position.y==actual.pose.position.y {
                 super::PathProjection {progress:0.0,pose:path.poses[0].clone(),index:1,fraction:0.0}
             }else {
@@ -153,10 +193,12 @@ impl SurfaceFollower {
             let (connector,end_ground)=connector.ok_or("new ground suffix has no valid actual connector")?;
             let prefix=owner.freeze_candidate_from(incoming,connector.segments).map_err(|e|e.to_string())?;
             let seam=prefix.connection_count();
-            let joined=binding.prepend_admission_connector(prefix,&connector.poses,
-                selected.index-1,selected.fraction)?;
+            let joined=if stationary {binding.prepend_admission_to_stationary(prefix,&connector.poses)?}
+                else {binding.prepend_admission_connector(prefix,&connector.poses,
+                    selected.index-1,selected.fraction)?};
             let at=*connector.poses.last().expect("real connector has its actual start");
             let seam_ground=validate_ground_seam(joined.candidate(),seam,&query,at,&end_ground,&self.boundary)?;
+            if !stationary {
             let target=joined.edges()[seam].motion()[1];
             let xy=[target.0[0],target.0[1]];
             let q=target.1;let yaw=Quaternion{x:q[0],y:q[1],z:q[2],w:q[3]}.yaw();
@@ -166,6 +208,7 @@ impl SurfaceFollower {
                 .map_err(|e|e.to_string())?.map_err(|e|format!("ground suffix projection: {e}; {witness:?}"))?;
             query.validate_projected_motion(at,&projected,&self.boundary,&mut witness)
                 .map_err(|e|format!("ground suffix sweep: {e}; {witness:?}"))?;
+            }
             // Original suffix XY/yaw/grid are guidance. Never teleport the real
             // connector endpoint to the old candidate's planned Z or attitude.
             let stamped=|body:([f64;3],[f64;4])| {
@@ -189,26 +232,41 @@ impl SurfaceFollower {
         self.alignment_target_index=None;
         self.selected_body_command=None;
         self.last_tracked_pose=Some(actual.clone());
-        self.ground_execution=Some(GroundExecution {binding,cursor,last_actual:actual.clone(),xy_cumulative});
+        self.ground_execution=Some(GroundExecution::Candidate(CandidateExecution {binding,cursor,last_actual:actual.clone(),xy_cumulative}));
         self.path=Some(path);self.goal=Some(goal);self.cumulative=cumulative;
         self.invalid_input=None;self.controller.reset_errors();
         Ok(())
     }
     #[cfg(test)]
+    pub(super) fn initial_ground_for_test(&self)->Option<(nuwax_nav_pct::ground_route::OwnedGroundWalkState,
+        PoseStamped,nuwax_nav_mls_planner::surface::BodyGroundState)> {
+        match self.ground_execution.as_ref()? {
+            GroundExecution::Initial {state,last_actual,last_physical}=>Some((state.clone(),last_actual.clone(),last_physical.clone())),
+            _=>None,
+        }
+    }
+    #[cfg(test)]
     pub(super) fn ground_binding_for_test(&self)->Option<Arc<GroundCandidateBinding>> {
-        self.ground_execution.as_ref().map(|execution|Arc::clone(&execution.binding))
+        self.ground_execution.as_ref().and_then(GroundExecution::candidate).map(|execution|Arc::clone(&execution.binding))
     }
     pub(crate) fn ground_resume(&self)->Option<GroundResume> {
-        self.ground_execution.as_ref().map(|execution|GroundResume {
+        self.ground_execution.as_ref().and_then(GroundExecution::candidate).map(|execution|GroundResume {
             binding:Arc::clone(&execution.binding),cursor:execution.cursor,actual:execution.last_actual.clone()})
     }
-    pub(crate) fn ground_cursor(&self)->Option<GroundCursor> {self.ground_execution.as_ref().map(|e|e.cursor)}
+    pub(crate) fn ground_cursor(&self)->Option<GroundCursor> {self.ground_execution.as_ref().and_then(GroundExecution::candidate).map(|e|e.cursor)}
     pub(crate) fn committed_ground_basis(&self)->Option<GroundActualBasis> {
         self.ground_execution.as_ref().map(GroundExecution::basis)
     }
+    pub(super) fn paired_ground_basis(&self)->Option<GroundActualBasis> {
+        let execution=self.ground_execution.as_ref()?;let actual=self.odometry.as_ref()?;
+        crate::replan_feedback::same_pose(execution.last_actual(),actual).then(||execution.basis())
+    }
     pub(super) fn owns_ground_basis(&self,basis:&GroundActualBasis)->bool {
         self.ground_execution.as_ref().zip(self.source_map.as_ref()).is_some_and(|(execution,source)|
-            basis.matches_binding(&execution.binding) && execution.matches_source(source))
+            execution.matches_source(source) && match execution {
+                GroundExecution::Initial {..}=>execution.basis()==*basis,
+                GroundExecution::Candidate(current)=>basis.matches_binding(&current.binding),
+            })
     }
     /// Read the current actual observation through the same bounded adjacent
     /// proposal as consumption. No prediction or request capture commits it.
@@ -224,9 +282,19 @@ impl SurfaceFollower {
         if !execution.matches_source(map) {return Err("ground candidate source retired".into());}
         let actual=self.odometry.as_ref().ok_or("no actual pose")?;
         crate::validate_map_pose(actual,"ground actual observation").map_err(|e|e.to_string())?;
+        let (_,ground)=self.current_ground_query_owned()?;
+        if let GroundExecution::Initial {state,last_actual,last_physical}=execution {
+            let query=state.bind_body_query(map).map_err(|e|e.to_string())?;
+            let next=body_control::observe_initial_ground_actual(&query,state,
+                body_control::body(last_actual),body_control::body(actual),last_physical,&self.boundary,cancelled)?;
+            let outcome=if crate::replan_feedback::same_pose(last_actual,actual) {GroundConsumption::Unchanged}
+                else {GroundConsumption::Advanced};
+            return Ok(GroundActualProposal {basis:GroundActualBasis::initial(next),cursor:None,
+                physical:ground,path_index:self.path_index,progress_m:self.progress_m,actual:actual.clone(),outcome});
+        }
+        let execution=execution.candidate().expect("candidate phase");
         let path=self.path.as_ref().ok_or("no candidate path")?;
         let goal=self.goal.as_ref().ok_or("no candidate goal")?;
-        let (_,ground)=self.current_ground_query_owned()?;
         if actual.pose==execution.last_actual.pose
             && !zero_admission_connector(&execution.binding,execution.cursor.edge) {
             let basis=execution.basis_at(execution.cursor,actual);
@@ -234,7 +302,7 @@ impl SurfaceFollower {
             let query=navigation.bind_body_query(map).map_err(|e|e.to_string())?;
             body_control::validate_control_actual_pose(&query,body_control::body(actual),&ground,
                 Some(navigation),&self.boundary)?;
-            return Ok(GroundActualProposal {basis,cursor:execution.cursor,path_index:self.path_index,
+            return Ok(GroundActualProposal {basis,cursor:Some(execution.cursor),physical:ground,path_index:self.path_index,
                 progress_m:self.progress_m,actual:actual.clone(),outcome:GroundConsumption::Unchanged});
         }
         if execution.binding.edges().is_empty() {
@@ -323,7 +391,7 @@ impl SurfaceFollower {
         let covers=execution.binding.covers_original_goal();
         let outcome=if at_end {GroundConsumption::LocalReferenceEnd {covers_original_goal:covers}}
             else if changed {GroundConsumption::Advanced}else{GroundConsumption::Unchanged};
-        Ok(GroundActualProposal {basis,cursor,path_index:adjacent.path_index,
+        Ok(GroundActualProposal {basis,cursor:Some(cursor),physical:ground,path_index:adjacent.path_index,
             progress_m:self.cumulative[cursor.edge]+cursor.fraction*(self.cumulative[cursor.edge+1]-self.cumulative[cursor.edge]),
             actual:actual.clone(),outcome})
     }
@@ -337,7 +405,15 @@ impl SurfaceFollower {
         self.path_index=proposal.path_index;self.progress_m=proposal.progress_m;
         self.last_tracked_pose=Some(proposal.actual.clone());
         let execution=self.ground_execution.as_mut().expect("proposal retains its current owner");
-        execution.cursor=proposal.cursor;execution.last_actual=proposal.actual;
+        match execution {
+            GroundExecution::Initial {state,last_actual,last_physical}=>{
+                let next=proposal.basis.into_initial().expect("initial proposal");
+                *state=next;*last_actual=proposal.actual;*last_physical=proposal.physical;
+            },
+            GroundExecution::Candidate(current)=>{
+                current.cursor=proposal.cursor.expect("candidate proposal");current.last_actual=proposal.actual;
+            },
+        }
         Ok(proposal.outcome)
     }
     /// Explicit finite-window control seam. The normal RouteFollower/public
@@ -346,7 +422,9 @@ impl SurfaceFollower {
         ->Result<GroundControlStep,String> {
         self.last_command_dispatch_bound=None;
         self.consume_ground_actual(cancelled)?;
-        let execution=self.ground_execution.as_ref().ok_or("no ground candidate")?;
+        let Some(execution)=self.ground_execution.as_ref().and_then(GroundExecution::candidate) else {
+            return Ok(GroundControlStep::Control(PlannerStep::Pending(Vec::new())));
+        };
         if execution.binding.edges().is_empty() ||
             execution.cursor.edge+1==execution.binding.edges().len() && execution.cursor.fraction==1.0 {
             return Ok(GroundControlStep::LocalReferenceEnd {covers_original_goal:execution.binding.covers_original_goal()});

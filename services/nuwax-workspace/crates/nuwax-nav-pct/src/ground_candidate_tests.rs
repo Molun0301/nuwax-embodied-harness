@@ -26,7 +26,7 @@ fn c1b_direct_owner(map: Arc<Tomogram>, unanchored: bool) -> GroundRouteReferenc
         unanchored.then_some(z), None,
     ).unwrap();
     assert_eq!(traced.route.stats.expanded, 0);
-    GroundRouteReference { map, trace: traced.trace }
+    GroundRouteReference { target:GroundRouteTarget {goal:GroundRouteGoal {xy:traced.route.points.last().map(|p|[p[0],p[1]]).unwrap(),requested_ground_z:None},reference:None},map, trace: traced.trace }
 }
 
 const C1B_BOUNDARY: [[f64; 2]; 4] = [[0.0, 0.0], [2.0, 0.0], [2.0, 0.3], [0.0, 0.3]];
@@ -85,7 +85,7 @@ fn c1b_01_original_trace_addresses() {
         assert_eq!(traced.trace.connections[0].point_span, [0, 1]);
         assert_eq!(traced.trace.connections[1].point_span, [1, 1]);
         let original_trace = Arc::clone(&traced.trace);
-        let owner = GroundRouteReference { map, trace: traced.trace };
+        let owner = GroundRouteReference { target:GroundRouteTarget {goal:GroundRouteGoal {xy:traced.route.points.last().map(|p|[p[0],p[1]]).unwrap(),requested_ground_z:None},reference:None},map, trace: traced.trace };
         let connections = owner.connections().collect::<Vec<_>>();
         for (connection, record) in original_trace.connections.iter().enumerate() {
             assert_eq!(connections[connection].point_span, record.point_span);
@@ -151,7 +151,7 @@ fn c1b_01_original_trace_addresses() {
         assert_eq!(traced.trace.connections.len(), 1);
         assert_eq!(traced.trace.connections[0].point_span, [0, 0]);
         assert_eq!(traced.trace.connections[0].steps, 1);
-        let owner = GroundRouteReference { map, trace: traced.trace };
+        let owner = GroundRouteReference { target:GroundRouteTarget {goal:GroundRouteGoal {xy:traced.route.points.last().map(|p|[p[0],p[1]]).unwrap(),requested_ground_z:None},reference:None},map, trace: traced.trace };
         let first = owner.position(0, 0, 0.0).unwrap();
         let last = owner.position(0, 1, 0.0).unwrap();
         assert_ne!(first.indices(), last.indices());
@@ -294,7 +294,7 @@ fn c1c4_01_retained_slices_keep_original_grid_boundaries() {
     let original=owner.freeze_candidate_from(start,vec![segment]).unwrap();
     let leaf=original.leaf(0).unwrap().crop(0.2,0.9).unwrap();
     let cropped=GroundCandidateReference {map:Arc::clone(&original.map),
-        recording:CandidateRecording::Slices(vec![leaf.owned()].into())};
+        recording:CandidateRecording::Slices(vec![RecordedLeaf::Slice(leaf.owned())].into())};
     assert_eq!(cropped.original_range(0),Some((0,[0.2,0.9])));
     assert_eq!(cropped.connection(0),original.connection(0),"diagnostic grid is not resampled");
     let actual=[0.21,0.17];
@@ -352,8 +352,8 @@ fn c1c4_02_flat_splices_keep_original_trace_owners() {
     let prefix_trace=match &prefix.recording {CandidateRecording::Recorded(t)=>Arc::clone(t),_=>unreachable!()};
     let first=original.prepend_to_suffix(&prefix,1,0.25).unwrap();
     let CandidateRecording::Slices(leaves)=&first.recording else {panic!("flat slices required")};
-    assert_eq!(leaves.len(),3);assert!(Arc::ptr_eq(&leaves[0].trace,&prefix_trace));
-    assert!(leaves[1..].iter().all(|leaf|Arc::ptr_eq(&leaf.trace,&trace)));
+    assert_eq!(leaves.len(),3);assert!(matches!(&leaves[0],RecordedLeaf::Slice(leaf) if Arc::ptr_eq(&leaf.trace,&prefix_trace)));
+    assert!(leaves[1..].iter().all(|leaf|matches!(leaf,RecordedLeaf::Slice(leaf) if Arc::ptr_eq(&leaf.trace,&trace))));
     assert_eq!(first.original_range(1),Some((1,[0.25,1.0])));
     assert!(first.is_splice_boundary(1));assert!(!first.is_splice_boundary(2));
     // A second splice retains the original trace directly, never the first
@@ -364,7 +364,7 @@ fn c1c4_02_flat_splices_keep_original_trace_owners() {
     let second_prefix=owner.freeze_candidate_from(incoming,vec![segment]).unwrap();
     let second=first.prepend_to_suffix(&second_prefix,1,0.5).unwrap();
     let CandidateRecording::Slices(leaves)=&second.recording else {panic!("flat slices required")};
-    assert_eq!(leaves.len(),3);assert!(leaves[1..].iter().all(|leaf|Arc::ptr_eq(&leaf.trace,&trace)));
+    assert_eq!(leaves.len(),3);assert!(leaves[1..].iter().all(|leaf|matches!(leaf,RecordedLeaf::Slice(leaf) if Arc::ptr_eq(&leaf.trace,&trace))));
     assert_eq!(second.original_range(1),Some((1,[new_cut,1.0])));
     assert_eq!(trace.changes,old_changes);
     assert!(second.end_matches(owner.full_window().unwrap().to()));

@@ -155,7 +155,7 @@ pub struct LocalTrajectory {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CandidateFamily { Direct, StepTurn, Rejoin, Spline { optimized: bool }, Polyline, Passage, Search }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CandidateEdgeOrigin { Family(CandidateFamily), Departure, Parent { node:usize }, Connector { node:usize }, AdmissionConnector }
+pub enum CandidateEdgeOrigin { Family(CandidateFamily), Departure, Parent { node:usize }, Connector { node:usize }, AdmissionConnector, AdmissionTerminal }
 #[derive(Debug)]
 struct CandidatePart { edges:std::ops::Range<usize>, origin:CandidateEdgeOrigin }
 struct CandidateOrigins { family:CandidateFamily, parts:Vec<CandidatePart> }
@@ -210,6 +210,23 @@ impl GroundCandidateBinding {
         // or roll/pitch: the preceding real connector is the physical origin.
         first.motion[0]=*prefix_poses.last().unwrap();edges.push(first);
         edges.extend_from_slice(&self.edges[edge+1..]);
+        Ok(Self {original:self.original.clone(),candidate,edges,family:self.family,
+            planned_join:self.planned_join,stationary_pose:None})
+    }
+    /// Retain a real singleton's original point association after a checked
+    /// connector. The last zero-length event is not a newly sampled suffix.
+    pub fn prepend_admission_to_stationary(&self,
+        prefix:nuwax_nav_pct::ground_route::GroundCandidateReference,prefix_poses:&[BodyPose])
+        ->Result<Self,String> {
+        if !self.edges.is_empty() || self.stationary_pose.is_none()
+            || prefix_poses.len()!=prefix.connection_count()+1 || prefix_poses.is_empty() {
+            return Err("stationary connector geometry and recording differ".into());
+        }
+        let candidate=self.candidate.prepend_to_stationary(&prefix).map_err(|e|e.to_string())?;
+        let mut edges:Vec<_>=prefix_poses.windows(2).map(|p|GroundMotionBinding {
+            motion:[p[0],p[1]],origin:CandidateEdgeOrigin::AdmissionConnector}).collect();
+        let actual=*prefix_poses.last().unwrap();
+        edges.push(GroundMotionBinding {motion:[actual,actual],origin:CandidateEdgeOrigin::AdmissionTerminal});
         Ok(Self {original:self.original.clone(),candidate,edges,family:self.family,
             planned_join:self.planned_join,stationary_pose:None})
     }

@@ -19,9 +19,9 @@ fn pair(map:&Tomogram,start:[f64;3],goal:[f64;3],boundary:&[[f64;2]],radius:Opti
         let calls=RefCell::new(Vec::new());
         let accept=|a:[f64;3],b:[f64;3]| {let ok=accepts(a,b);calls.borrow_mut().push((bits(&[a,b]),ok));ok};
         let call=||if early {map.plan_bounded_impl_in::<true,true>(start,goal,0.,boundary,None,radius,
-            penalties,&accept,limits,SearchGeometry::Ground{unanchored_z:None,target:None})}
+            penalties,&accept,limits,SearchGeometry::Ground{unanchored_z:None,target:None,initial:None})}
             else {map.plan_bounded_impl_in::<true,false>(start,goal,0.,boundary,None,radius,
-            penalties,&accept,limits,SearchGeometry::Ground{unanchored_z:None,target:None})};
+            penalties,&accept,limits,SearchGeometry::Ground{unanchored_z:None,target:None,initial:None})};
         let result=observe(||match cancel {Some(n)=>crate::cancellation::after_checkpoints(n,call),None=>call()});
         (result,calls.into_inner())
     };

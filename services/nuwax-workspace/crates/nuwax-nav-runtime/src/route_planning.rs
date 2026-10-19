@@ -122,6 +122,14 @@ pub(crate) struct GroundPlanInput {
     pub arrival_tolerance_m: Option<f64>,
 }
 impl GroundPlanInput {
+    /// Context-only capture never pairs new odometry with an unconsumed basis.
+    /// Missing proof means capture is incomplete, not that motion is forbidden.
+    pub(crate) fn from_actual(actual:&crate::replan_feedback::ActualExecutionContext,
+        intent:crate::replan_feedback::GroundIntent,xy_reference:Arc<Vec<[f64;2]>>,
+        arrival_tolerance_m:Option<f64>)->Option<Self> {
+        Some(Self {incoming:actual.navigation.as_ref()?.continuation().ok()?,intent,
+            xy_reference,arrival_tolerance_m})
+    }
     pub fn same_input(&self, other:&Self)->bool {
         self.incoming.semantic_key()==other.incoming.semantic_key()
             && self.intent.same_intent(&other.intent)

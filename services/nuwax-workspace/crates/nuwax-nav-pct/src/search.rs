@@ -64,12 +64,13 @@ struct SearchOutput { route: Route, trace: Option<Arc<RouteReferenceTrace>> }
 #[derive(Clone, Copy)]
 enum SearchGeometry {
     Body,
-    Ground { unanchored_z: Option<f64>, target: Option<usize> },
+    Ground { unanchored_z: Option<f64>, target: Option<usize>, initial: Option<Reference> },
 }
 impl SearchGeometry {
     fn ground(self) -> bool { matches!(self,Self::Ground { .. }) }
     fn initial(self,map:&Tomogram,start:[f64;3])->Option<Reference> {
         match self {
+            Self::Ground {initial:Some(reference),..}=>Some(reference),
             Self::Ground {unanchored_z:Some(_),..}=>map.unanchored_at(map.point_column(start)),
             _=>map.reference_start(start),
         }
@@ -376,7 +377,7 @@ impl Tomogram {
     )->Result<TracedRoute,PlanningFailure> {
         checkpoint(cancelled)?;
         let result=self.plan_bounded_impl_in::<true, false>(start,goal,tolerance,boundary,cancelled,radius,
-            penalties,accepts,limits,SearchGeometry::Ground {unanchored_z,target});
+            penalties,accepts,limits,SearchGeometry::Ground {unanchored_z,target,initial:None});
         checkpoint(cancelled)?;
         result.map(|output|TracedRoute {route:output.route,trace:output.trace.expect("Ground records its admitted trace")})
     }
@@ -386,11 +387,11 @@ impl Tomogram {
         &self,start:[f64;3],goal:[f64;3],tolerance:f64,boundary:&[[f64;2]],
         cancelled:Option<&AtomicBool>,radius:Option<f64>,penalties:&[crate::RoutePenalty],
         admitter:&crate::ground_route::GroundPhysicalAdmitter<'_>,limits:SearchLimits,
-        unanchored_z:Option<f64>,target:Option<usize>,
+        unanchored_z:Option<f64>,target:Option<usize>,initial:Option<Reference>,
     )->Result<TracedRoute,PlanningFailure> {
         checkpoint(cancelled)?;
         let result=self.plan_bounded_impl_in::<true,EARLY>(start,goal,tolerance,boundary,cancelled,radius,
-            penalties,&|a,b|admitter.accepts(a,b),limits,SearchGeometry::Ground {unanchored_z,target});
+            penalties,&|a,b|admitter.accepts(a,b),limits,SearchGeometry::Ground {unanchored_z,target,initial});
         checkpoint(cancelled)?;
         result.map(|output|TracedRoute {route:output.route,trace:output.trace.expect("Ground records its admitted trace")})
     }

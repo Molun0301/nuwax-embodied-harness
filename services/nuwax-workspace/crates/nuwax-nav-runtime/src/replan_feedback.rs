@@ -13,32 +13,51 @@ use crate::PathExecutionIdentity;
 /// A source-owned address actually consumed by the executor. This is not an
 /// arrival proof; its binding retains the original candidate sampling grid.
 #[derive(Clone, Debug)]
-pub struct GroundActualBasis {
-    binding: Arc<GroundCandidateBinding>,
-    edge: usize,
-    fraction: f64,
-    actual_xy: [f64; 2],
+pub struct GroundActualBasis {address:GroundActualAddress}
+#[derive(Clone,Debug)]
+enum GroundActualAddress {
+    /// Established synchronously before the first asynchronous request.
+    Initial(OwnedGroundWalkState),
+    Candidate {binding:Arc<GroundCandidateBinding>,edge:usize,fraction:f64,actual_xy:[f64;2]},
 }
 impl GroundActualBasis {
-    pub(crate) fn new(binding: Arc<GroundCandidateBinding>, edge: usize, fraction: f64,
-        actual_xy: [f64; 2]) -> Self { Self { binding, edge, fraction, actual_xy } }
-    pub(crate) fn continuation(&self) -> Result<OwnedGroundWalkState, String> {
-        self.binding.candidate().continuation_at(self.edge,self.fraction,self.actual_xy)
-            .ok_or_else(|| "ground actual address is outside its retained candidate".into())
+    pub(crate) fn initial(state:OwnedGroundWalkState)->Self {Self {address:GroundActualAddress::Initial(state)}}
+    pub(crate) fn into_initial(self)->Option<OwnedGroundWalkState> {
+        match self.address {GroundActualAddress::Initial(state)=>Some(state),_=>None}
     }
-    pub(crate) fn walk_state(&self) -> Result<GroundWalkState<'_>, String> {
-        self.binding.candidate().walk_state_at(self.edge,self.fraction,self.actual_xy)
-            .ok_or_else(|| "ground actual address is outside its retained candidate".into())
+    pub(crate) fn new(binding:Arc<GroundCandidateBinding>,edge:usize,fraction:f64,actual_xy:[f64;2])->Self {
+        Self {address:GroundActualAddress::Candidate {binding,edge,fraction,actual_xy}}
     }
-    pub(crate) fn matches_binding(&self, binding: &Arc<GroundCandidateBinding>) -> bool {
-        Arc::ptr_eq(&self.binding,binding)
+    pub(crate) fn continuation(&self)->Result<OwnedGroundWalkState,String> {
+        match &self.address {
+            GroundActualAddress::Initial(state)=>Ok(state.clone()),
+            GroundActualAddress::Candidate {binding,edge,fraction,actual_xy}=>binding.candidate()
+                .continuation_at(*edge,*fraction,*actual_xy)
+                .ok_or_else(||"ground actual address is outside its retained candidate".into()),
+        }
+    }
+    pub(crate) fn walk_state(&self)->Result<GroundWalkState<'_>,String> {
+        match &self.address {
+            GroundActualAddress::Initial(state)=>Ok(state.walk_state()),
+            GroundActualAddress::Candidate {binding,edge,fraction,actual_xy}=>binding.candidate()
+                .walk_state_at(*edge,*fraction,*actual_xy)
+                .ok_or_else(||"ground actual address is outside its retained candidate".into()),
+        }
+    }
+    pub(crate) fn matches_binding(&self,binding:&Arc<GroundCandidateBinding>)->bool {
+        matches!(&self.address,GroundActualAddress::Candidate {binding:current,..} if Arc::ptr_eq(current,binding))
     }
 }
 impl PartialEq for GroundActualBasis {
-    fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.binding,&other.binding) && self.edge==other.edge
-            && self.fraction.to_bits()==other.fraction.to_bits()
-            && self.actual_xy.map(f64::to_bits)==other.actual_xy.map(f64::to_bits)
+    fn eq(&self,other:&Self)->bool {
+        match (&self.address,&other.address) {
+            (GroundActualAddress::Initial(a),GroundActualAddress::Initial(b))=>a==b,
+            (GroundActualAddress::Candidate {binding:a,edge:ae,fraction:af,actual_xy:axy},
+             GroundActualAddress::Candidate {binding:b,edge:be,fraction:bf,actual_xy:bxy})=>
+                Arc::ptr_eq(a,b) && ae==be && af.to_bits()==bf.to_bits()
+                    && axy.map(f64::to_bits)==bxy.map(f64::to_bits),
+            _=>false,
+        }
     }
 }
 impl Eq for GroundActualBasis {}
@@ -173,7 +192,8 @@ impl SurfaceReplanInput {
     /// Missing actual context is deliberately inconclusive, not a new gate.
     pub fn same_complete_input(&self, other: &Self) -> bool {
         let actual_equal = self.actual.as_ref().zip(other.actual.as_ref())
-            .is_some_and(|(a,b)| same_actual(a,b));
+            .is_some_and(|(a,b)| same_actual(a,b) && (self.ground_intent.is_none()
+                || a.navigation.is_some() && b.navigation.is_some()));
         actual_equal && self.ground_intent == other.ground_intent
             && self.source.same_body_query_view(&other.source)
             && same_pose(&self.start, &other.start) && same_pose(&self.goal, &other.goal)

@@ -1851,3 +1851,319 @@ fn c1c4_08_rolling_lifecycle_and_source_keep_body_compatibility() {
     assert!(matches!(command, PlannerStep::Command(_)));
     assert_eq!(walks, 0);
 }
+
+// C1-c5: explicit Initial lifecycle and real stationary Scan terminals.
+// Public RouteFollower goal dispatch and stopped-arrival results remain separate.
+fn c5_initial(source:Arc<SurfaceSnapshot>,actual:BodyPose,height:Option<f64>)
+    ->(SurfaceFollower,nuwax_nav_pct::ground_route::PreparedGroundStart) {
+    let config=c3_config();
+    let initial=config.pct.prepare_ground_start(&source,GroundRouteStart {
+        xy:[actual.0[0],actual.0[1]],ground_z:height},None).unwrap();
+    let mut owner=SurfaceFollower::new(config).unwrap();
+    owner.update_execution_map(ExecutionMap::Surface(source)).unwrap();
+    owner.update_odometry(c3_stamped(actual));
+    owner.initialize_ground_actual(initial.basis().clone(),None).unwrap();
+    assert!(owner.path.is_none());assert!(owner.ground_binding_for_test().is_none());
+    assert!(owner.ground_cursor().is_none());
+    (owner,initial)
+}
+fn c5_pending(owner:&mut SurfaceFollower) {
+    assert!(matches!(owner.step_ground_internal(0.2,None).unwrap(),
+        ground_cursor::GroundControlStep::Control(PlannerStep::Pending(_))));
+    assert!(owner.path.is_none());assert!(owner.ground_cursor().is_none());
+}
+fn c5_stationary(source:&SurfaceSnapshot,route:&PlannedGroundRoute,
+    incoming:&nuwax_nav_pct::ground_route::OwnedGroundWalkState,pose:BodyPose)
+    ->(Arc<GroundCandidateBinding>,Path3D) {
+    let xy=[pose.0[0],pose.0[1]];
+    assert_eq!(incoming.walk_state().xy(),xy);
+    assert!(incoming.same_reference_owner(&route.reference));
+    let physical=source.body_query().start_ground_state(pose).unwrap();
+    let fork=incoming.planning_fork(source).unwrap();
+    let tomo=Tomogram::from_surface(fork.snapshot()).unwrap();
+    let mapped=nuwax_nav_scan::plan_driven_ground_on_fork(&fork,&tomo,pose,&physical,
+        incoming.walk_state(),&[xy],&c3_motion(),&ScanConfig::default(),None,Some((xy,0.0)),
+        &[],false,false,None,route.reference.full_window().unwrap()).unwrap();
+    assert_eq!(mapped.trajectory.poses,vec![pose]);assert!(mapped.binding.edges().is_empty());
+    assert_eq!(mapped.binding.candidate().connection_count(),0);
+    assert_eq!(mapped.binding.stationary_pose(),Some(pose));
+    assert_eq!(mapped.binding.candidate().walk_state_at(0,0.0,xy).unwrap().semantic_key(),incoming.semantic_key());
+    (Arc::new(mapped.binding),Path3D {poses:mapped.trajectory.poses.into_iter().map(c3_stamped).collect()})
+}
+fn c5_consume_path(owner:&mut SurfaceFollower,path:&Path3D) {
+    for pose in path.poses.iter().skip(1) {owner.update_odometry(pose.clone());owner.consume_ground_actual(None).unwrap();}
+}
+fn c5_terminal_matches(joined:&GroundCandidateBinding,original:&GroundCandidateBinding,xy:[f64;2]) {
+    let last=joined.candidate().connection_count()-1;
+    assert_eq!(joined.edges()[last].origin(),nuwax_nav_scan::CandidateEdgeOrigin::AdmissionTerminal);
+    assert_eq!(joined.candidate().connection(last),None,"point event has no invented sample grid");
+    assert_eq!(joined.candidate().original_sample(last,0.0),None);
+    assert_eq!(joined.candidate().walk_state_at(last,1.0,xy).unwrap().semantic_key(),
+        original.candidate().walk_state_at(0,0.0,xy).unwrap().semantic_key());
+    assert_eq!(joined.family(),original.family());
+    assert_eq!(joined.covers_original_goal(),original.covers_original_goal());
+}
+
+#[test]
+fn i01_first_pending_movement_uses_initial_actual_basis() {
+    let (source,_)=c3_direct_source();let source=Arc::new(source);
+    let (mut actual_owner,seed)=c5_initial(source.clone(),c3_start(),None);
+    let route=actual_owner.config.pct.ground_route_from_start(&source,c3_start(),&seed,
+        GroundRouteGoal {xy:[0.1,0.2],requested_ground_z:None},0.0,&[],None,None,SearchLimits::default(),&[]).unwrap();
+    let context=actual_owner.refresh_execution_context(Twist2::ZERO).unwrap();
+    let mut request=c3_request(source.clone(),&route,1);
+    let input=request.ground.take().unwrap();
+    request.ground=GroundPlanInput::from_actual(&context,input.intent,input.xy_reference,input.arrival_tolerance_m);
+    request.pose=context.odometry.clone();request.start_ground=Ok(context.ground.clone());
+    assert_eq!(request.ground.as_ref().unwrap().incoming.semantic_key(),seed.basis().semantic_key());
+    let mut kernel=PlanKernel::new(c3_config());
+    let (started_tx,started_rx)=mpsc::channel();let (compute_tx,compute_rx)=mpsc::channel();
+    let (computed_tx,computed_rx)=mpsc::channel();let (publish_tx,publish_rx)=mpsc::channel();
+    let worker=PlanningOwner::new(move |request:PlanRequest,cancel:&Cancellation| {
+        started_tx.send(request.generation).unwrap();c3_recv(&compute_rx);
+        let result=kernel.compute(request,cancel);
+        computed_tx.send(result.outcome.as_ref().map(|v|v.path.clone()).map_err(|e|format!("{e:?}"))).unwrap();
+        c3_recv(&publish_rx);result
+    }).unwrap();
+    let cleanup=C3GateCleanup {compute:compute_tx.clone(),publish:publish_tx.clone()};
+    assert!(worker.submit(1,request));assert_eq!(c3_recv(&started_rx),1);compute_tx.send(()).unwrap();
+    let planned=c3_recv(&computed_rx).unwrap();assert!(worker.take().is_none());
+    let edge=c4_first_motion(&planned);let observed=c4_fractional_actual(&planned,edge,0.5,0.01,0.0);
+    actual_owner.update_odometry(observed.clone());
+    let read=actual_owner.refresh_execution_context(Twist2::ZERO).unwrap();assert!(read.navigation.is_none());
+    assert_eq!(actual_owner.initial_ground_for_test().unwrap().0,*seed.basis());
+    c5_pending(&mut actual_owner);
+    let initial=actual_owner.initial_ground_for_test().unwrap();assert_eq!(initial.1.pose,observed.pose);
+    assert_eq!(initial.0.walk_state().xy(),[observed.pose.position.x,observed.pose.position.y]);
+    c5_pending(&mut actual_owner);assert_eq!(actual_owner.initial_ground_for_test().unwrap(),initial);
+    publish_tx.send(()).unwrap();c3_until(||worker.completion_ready_for_test());
+    let completion=worker.take().unwrap();assert_eq!((completion.id,completion.epoch),(1,worker.epoch()));
+    let candidate=completion.value.outcome.unwrap();let original=candidate.ground_binding.unwrap();
+    assert_eq!(candidate.path.poses[0].pose,c3_stamped(c3_start()).pose);
+    let (cut,fraction,_)=c4_selected(&actual_owner,&candidate.path,&observed);c4_assert_half_cut(edge,cut,fraction);
+    actual_owner.admit_ground_candidate(candidate.path.clone(),candidate.path.poses.last().unwrap().clone(),original.clone(),None,None).unwrap();
+    assert!(actual_owner.initial_ground_for_test().is_none());
+    let joined=c4_binding(&actual_owner);let first=c4_retained_start(&joined);
+    c4_assert_original_suffix(&joined,first,&original,cut,fraction);
+    let installed=actual_owner.path.as_ref().unwrap().clone();assert_eq!(installed.poses[0].pose,observed.pose);
+    assert!(installed.poses[..=first].windows(2).any(|p|p[0].pose.position.distance(p[1].pose.position)>0.0));
+    assert_eq!(actual_owner.progress_m(),0.0);
+    actual_owner.update_odometry(c4_fractional_actual(&installed,0,0.5,0.0,0.0));
+    assert_eq!(actual_owner.consume_ground_actual(None).unwrap(),ground_cursor::GroundConsumption::Advanced);
+    drop(cleanup);drop(worker);
+}
+
+#[test]
+fn i02_initial_context_never_pairs_new_pose_with_old_navigation() {
+    use crate::replan_feedback::SurfaceReplanInput;
+    let (source,_)=c3_direct_source();let source=Arc::new(source);
+    let (mut owner,seed)=c5_initial(source.clone(),c3_start(),Some(0.0));
+    let original=owner.initial_ground_for_test().unwrap();
+    let route=owner.config.pct.ground_route_from_start(&source,c3_start(),&seed,
+        GroundRouteGoal {xy:[0.1,0.2],requested_ground_z:None},0.0,&[],None,None,SearchLimits::default(),&[]).unwrap();
+    let intent=GroundIntent::new(route.reference.full_window().unwrap(),route.reference.original_goal(),route.height.resolved_ground_z);
+    let mut last=None;
+    for x in [-0.95,-0.90] {
+        let actual=c3_stamped(([x,0.2,0.4],c3_start().1));owner.update_odometry(actual.clone());
+        let context=owner.refresh_execution_context(Twist2::ZERO).unwrap();
+        assert_eq!(context.odometry,actual);assert!(context.navigation.is_none());
+        assert_eq!(owner.initial_ground_for_test().unwrap(),original);last=Some(context);
+    }
+    let context=last.unwrap();
+    assert!(GroundPlanInput::from_actual(&context,intent.clone(),Arc::new(c3_xy_reference()),Some(0.1)).is_none());
+    let input=SurfaceReplanInput {source:source.clone(),start:context.odometry.clone(),goal:c3_stamped(([0.1,0.2,0.4],c3_start().1)),
+        options:nuwax_nav_types_messages::GoalOptions::default(),boundary:Arc::new(vec![]),actual:Some(context.clone()),ground_intent:Some(intent),
+        limits:SearchLimits::default(),offset:0.4,local_planning_enabled:true,penalties:Arc::new(vec![])};
+    assert!(!input.same_complete_input(&input));let mut body=input.clone();body.ground_intent=None;
+    assert!(body.same_complete_input(&body),"old Body context equality remains valid");
+    let walk=seed.basis().walk_state().walk_xy([-0.90,0.2],&[],None).unwrap();let query=seed.basis().bind_body_query(&source).unwrap();
+    walk.with_body_navigation(|_,nav|query.validate_motion_with_navigation(c3_start(),body_control::body(&context.odometry),
+        &original.2,nav,&[],&mut None)).unwrap().unwrap();
+    let expected=seed.basis().recorded_successor(&walk).unwrap();
+    c5_pending(&mut owner);let committed=owner.initial_ground_for_test().unwrap();
+    assert_eq!(committed.0,expected);assert_eq!(committed.1,context.odometry);assert_eq!(committed.2,context.ground);
+    let paired=owner.refresh_execution_context(Twist2::ZERO).unwrap();assert!(paired.navigation.is_some());
+    let mut changed=context.odometry.clone();changed.pose.position.z+=0.001;owner.update_odometry(changed);
+    let flag=std::sync::atomic::AtomicBool::new(true);
+    assert!(owner.step_ground_internal(0.2,Some(&flag)).is_err());assert_eq!(owner.initial_ground_for_test().unwrap(),committed);
+    c5_pending(&mut owner);assert_ne!(owner.initial_ground_for_test().unwrap().1.pose,committed.1.pose);
+}
+
+#[test]
+fn i03_initial_unknown_bias_and_source_retirement() {
+    let (source,mut blocks)=c3_direct_source();let source=Arc::new(source);
+    let actual=([100.0,100.0,0.55],c3_start().1);
+    for height in [None,Some(0.0)] {
+        let (mut owner,seed)=c5_initial(source.clone(),actual,height);
+        assert_eq!(seed.basis().walk_state().planned_ground_z(),height);
+        owner.update_odometry(c3_stamped(([100.05,100.0,0.56],actual.1)));c5_pending(&mut owner);
+        assert_eq!(owner.initial_ground_for_test().unwrap().0.walk_state().planned_ground_z(),height);
+        assert_eq!(owner.odometry.as_ref().unwrap().pose.position.z,0.56);
+        let old=owner.initial_ground_for_test().unwrap();
+        let mut observations=source.observations().unwrap().as_ref().clone();
+        for (&key,values) in &mut blocks {for value in values.values_mut(){value.observed_ns=900;value.hits=17;}
+            assert!(observations.replace_block_with_geometry_changes(key,values.clone()).unwrap().is_empty());}
+        observations.mark_complete_geometry_source();
+        let timed=Arc::new(source.with_observations(Some(Arc::new(observations))));
+        owner.update_execution_map(ExecutionMap::Surface(timed.clone())).unwrap();
+        assert_eq!(owner.initial_ground_for_test().unwrap(),old);
+        let recent=Arc::new(timed.with_recent_obstacle_points(1,1_000_000_000,0,&[],[(0,[100.05,100.0,0.56])]).unwrap());
+        owner.update_execution_map(ExecutionMap::Surface(recent)).unwrap();
+        assert!(owner.step_ground_internal(0.2,None).is_err());assert_eq!(owner.initial_ground_for_test().unwrap(),old);
+        let mut model=source.body_envelope().unwrap().clone();model.footprint_xy_m[0][0]-=0.01;
+        owner.update_execution_map(ExecutionMap::Surface(Arc::new(source.with_body_envelope(model).unwrap()))).unwrap();
+        assert!(owner.committed_ground_basis().is_none());
+    }
+}
+
+#[test]
+fn i04_owned_stationary_terminal_is_admissible() {
+    for antipode in [false,true] {
+        let (mut owner,_,path,route)=c3_installed_body();c5_consume_path(&mut owner,&path);
+        let terminal=body_control::body(path.poses.last().unwrap());let xy=[terminal.0[0],terminal.0[1]];
+        let incoming=route.reference.full_window().unwrap().to().continuation(xy).unwrap();
+        let (single,single_path)=c5_stationary(owner.source_map.as_ref().unwrap(),&route,&incoming,terminal);
+        assert!(single.candidate().end_matches(route.reference.full_window().unwrap().to()));
+        assert!(single.covers_original_goal());let old=c4_binding(&owner);
+        if antipode {owner.update_odometry(c3_stamped((terminal.0,terminal.1.map(|v|-v))));}
+        let actual=owner.odometry.as_ref().unwrap().clone();
+        owner.admit_ground_candidate(single_path.clone(),single_path.poses[0].clone(),single.clone(),None,None).unwrap();
+        let joined=c4_binding(&owner);assert!(!Arc::ptr_eq(&old,&joined));
+        c5_terminal_matches(&joined,&single,xy);assert_eq!(owner.path.as_ref().unwrap().poses[0].pose,actual.pose);
+        assert_eq!(owner.ground_cursor().unwrap().fraction,0.0);
+        assert!(matches!(owner.step_ground_internal(0.2,None).unwrap(),ground_cursor::GroundControlStep::LocalReferenceEnd {covers_original_goal:true}));
+        assert!(single.edges().is_empty());assert_eq!(single.stationary_pose(),Some(terminal));
+    }
+}
+
+#[test]
+fn i05_stationary_yaw_and_semantic_seam_are_consumed() {
+    let (mut owner,_,path,route)=c3_installed_body();c5_consume_path(&mut owner,&path);
+    let terminal=body_control::body(path.poses.last().unwrap());let xy=[terminal.0[0],terminal.0[1]];
+    let yaw=Quaternion::from_yaw(0.2);let target=(terminal.0,[yaw.x,yaw.y,yaw.z,yaw.w]);
+    let incoming=route.reference.full_window().unwrap().to().continuation(xy).unwrap();
+    let (single,single_path)=c5_stationary(owner.source_map.as_ref().unwrap(),&route,&incoming,target);
+    owner.admit_ground_candidate(single_path.clone(),single_path.poses[0].clone(),single.clone(),None,None).unwrap();
+    let joined=c4_binding(&owner);let installed=owner.path.as_ref().unwrap().clone();
+    assert!(installed.poses.windows(2).any(|p|p[0].pose.orientation!=p[1].pose.orientation));
+    assert!(installed.poses.windows(2).any(|p|
+        angle_diff(p[1].pose.orientation.yaw(),p[0].pose.orientation.yaw()).abs()>0.0));
+    let target_yaw=yaw.yaw();let installed_yaw=installed.poses.last().unwrap().pose.orientation.yaw();
+    assert!(angle_diff(installed_yaw,target_yaw).abs()<1e-12);
+    assert!(installed.poses.iter().all(|p|p.pose.position==installed.poses[0].pose.position));
+    c5_terminal_matches(&joined,&single,xy);
+    assert_eq!(owner.consume_ground_actual(None).unwrap(),ground_cursor::GroundConsumption::Unchanged);
+    let saved=c4_execution(&owner);let flag=std::sync::atomic::AtomicBool::new(true);
+    owner.update_odometry(installed.poses[1].clone());assert!(owner.consume_ground_actual(Some(&flag)).is_err());
+    assert_eq!(owner.ground_cursor(),saved.cursor);assert_eq!(owner.committed_ground_basis(),saved.basis);
+    c5_consume_path(&mut owner,&installed);
+    let actual_yaw=owner.odometry.as_ref().unwrap().pose.orientation.yaw();
+    assert!(angle_diff(actual_yaw,target_yaw).abs()<1e-12);
+    eprintln!("I05 real yaw start={:?} target={:?} installed={:?} consumed_actual={:?}",
+        installed.poses[0].pose.orientation.yaw(),target_yaw,installed_yaw,actual_yaw);
+    assert!(matches!(owner.step_ground_internal(0.2,None).unwrap(),ground_cursor::GroundControlStep::LocalReferenceEnd {..}));
+    // A different legitimate original sample at the same actual pose survives
+    // the zero connector as its own terminal event, not as the connector end.
+    let (mut owner,_,path,route)=c3_installed_body();let edge=c4_first_motion(&path);
+    let actual=c4_fractional_actual(&path,edge,0.5,0.0,0.0);owner.update_odometry(actual.clone());owner.consume_ground_actual(None).unwrap();
+    let xy=[actual.pose.position.x,actual.pose.position.y];
+    let old=owner.committed_ground_basis().unwrap().continuation().unwrap();
+    // The earlier original sample remains in the current/adjacent column;
+    // a far terminal Unanchored id is not a legal zero-walk incoming here.
+    let incoming=route.reference.full_window().unwrap().from().continuation(xy).unwrap();
+    assert_ne!(old.walk_state().reference_sample_xy(),incoming.walk_state().reference_sample_xy());
+    let (single,p)=c5_stationary(owner.source_map.as_ref().unwrap(),&route,&incoming,body_control::body(&actual));
+    assert!(!single.covers_original_goal());
+    owner.admit_ground_candidate(p.clone(),p.poses[0].clone(),single.clone(),None,None).unwrap();
+    let joined=c4_binding(&owner);c5_terminal_matches(&joined,&single,xy);
+    let end=joined.edges().len()-1;assert!(joined.candidate().is_splice_boundary(end));
+    assert_ne!(joined.candidate().walk_state_at(end-1,1.0,xy).unwrap().reference_sample_xy(),
+        joined.candidate().walk_state_at(end,0.0,xy).unwrap().reference_sample_xy());
+    assert!(matches!(owner.step_ground_internal(0.2,None).unwrap(),ground_cursor::GroundControlStep::LocalReferenceEnd {covers_original_goal:false}));
+    assert_eq!(owner.committed_ground_basis().unwrap().walk_state().unwrap().semantic_key(),incoming.semantic_key());
+}
+
+#[test]
+fn i06_moving_stationary_terminal_uses_real_connector() {
+    for cancel_stage in [None,Some("entry"),Some("connector"),Some("commit")] {
+        let (mut owner,_,path,route)=c3_installed_body();let end=path.poses.last().unwrap();
+        let previous=path.poses.iter().rposition(|p|p.pose.position!=end.pose.position).unwrap();
+        for p in path.poses.iter().take(previous+1).skip(1) {owner.update_odometry(p.clone());owner.consume_ground_actual(None).unwrap();}
+        let actual=owner.odometry.as_ref().unwrap().clone();let distance=actual.pose.position.distance(end.pose.position);
+        assert!(distance>0.0 && distance<=owner.config.max_path_deviation_m);
+        let terminal=body_control::body(end);let xy=[terminal.0[0],terminal.0[1]];
+        let incoming=route.reference.full_window().unwrap().to().continuation(xy).unwrap();
+        let (single,p)=c5_stationary(owner.source_map.as_ref().unwrap(),&route,&incoming,terminal);
+        let saved=c4_execution(&owner);let flag=Arc::new(std::sync::atomic::AtomicBool::new(cancel_stage==Some("entry")));
+        let result=if let Some(stage)=cancel_stage.filter(|s|*s!="entry") {
+            ground_cursor::cancel_ground_admission_at_for_test(stage,1,flag.clone(),||
+                owner.admit_ground_candidate(p.clone(),p.poses[0].clone(),single.clone(),None,Some(&flag)))
+        }else {owner.admit_ground_candidate(p.clone(),p.poses[0].clone(),single.clone(),None,Some(&flag))};
+        if cancel_stage.is_some() {
+            assert!(flag.load(std::sync::atomic::Ordering::Relaxed));assert!(result.unwrap_err().contains("cancel"));
+            assert_eq!(c4_execution(&owner),saved);continue;
+        }
+        result.unwrap();let joined=c4_binding(&owner);let installed=owner.path.as_ref().unwrap().clone();
+        assert_eq!(installed.poses[0].pose,actual.pose);assert!(installed.poses.windows(2).any(|p|p[0].pose.position!=p[1].pose.position));
+        c5_terminal_matches(&joined,&single,xy);assert_eq!(owner.progress_m(),0.0);
+        assert_eq!(owner.consume_ground_actual(None).unwrap(),ground_cursor::GroundConsumption::Unchanged);
+        c5_consume_path(&mut owner,&installed);
+        assert!(matches!(owner.step_ground_internal(0.2,None).unwrap(),ground_cursor::GroundControlStep::LocalReferenceEnd {covers_original_goal:true}));
+    }
+    let (source,_)=c3_direct_source();let (mut owner,_,path,route)=c3_install(Arc::new(source),c3_start(),[0.1,0.2],None,c3_config());
+    let terminal=body_control::body(path.poses.last().unwrap());let xy=[terminal.0[0],terminal.0[1]];
+    assert!(c3_stamped(c3_start()).pose.position.distance(path.poses.last().unwrap().pose.position)>owner.config.max_path_deviation_m);
+    let incoming=route.reference.full_window().unwrap().to().continuation(xy).unwrap();
+    let (single,p)=c5_stationary(owner.source_map.as_ref().unwrap(),&route,&incoming,terminal);
+    let saved=c4_execution(&owner);
+    assert!(owner.admit_ground_candidate(p.clone(),p.poses[0].clone(),single,None,None).unwrap_err().contains("window"));
+    assert_eq!(c4_execution(&owner),saved);
+}
+
+#[test]
+fn i07_prepared_start_and_original_target_keep_presence() {
+    let (source,_)=c3_direct_source();let planner=PctPlanner::default();let actual=c3_start();
+    for height in [None,Some(0.0)] {
+        let start=GroundRouteStart {xy:[actual.0[0],actual.0[1]],ground_z:height};
+        let initial=planner.prepare_ground_start(&source,start,None).unwrap();
+        assert_eq!(initial.basis().walk_state().planned_ground_z().is_some(),height.is_some());
+        for requested in [None,Some(0.0)] {
+            let goal=GroundRouteGoal {xy:[0.1,0.2],requested_ground_z:requested};
+            let old=planner.ground_route_with_limits_and_penalties(&source,actual,start,goal,0.0,&[],None,None,SearchLimits::default(),&[]).unwrap();
+            let prepared=planner.ground_route_from_start(&source,actual,&initial,goal,0.0,&[],None,None,SearchLimits::default(),&[]).unwrap();
+            assert_eq!(old.points,prepared.points);assert_eq!(old.guide_body_poses,prepared.guide_body_poses);
+            assert_eq!(old.height,prepared.height);assert_eq!(old.planned_layer,prepared.planned_layer);
+            assert_eq!(prepared.reference.original_goal().requested_ground_z,requested);
+            assert_eq!(prepared.reference.original_goal().xy,goal.xy);
+            assert_eq!(prepared.reference.target_sample().is_some(),requested.is_some());
+            assert_eq!(prepared.reference.full_window().unwrap().from().walk_state().semantic_key(),initial.basis().semantic_key());
+            let retained=prepared.reference.clone();assert_eq!(retained.original_goal().requested_ground_z,requested);
+        }
+    }
+    let cancel=std::sync::atomic::AtomicBool::new(true);
+    assert!(planner.prepare_ground_start(&source,GroundRouteStart {xy:[-1.0,0.2],ground_z:None},Some(&cancel)).is_err());
+}
+
+#[test]
+fn i08_initial_candidate_stationary_lifecycle_keeps_body() {
+    let (source,_)=c3_direct_source();let source=Arc::new(source);
+    let (mut initial,_)=c5_initial(source.clone(),c3_start(),None);
+    let old=initial.committed_ground_basis().unwrap();initial.stop();assert!(initial.committed_ground_basis().is_none());
+    assert!(!initial.owns_ground_basis(&old));
+    let (mut owner,_,path,route)=c3_installed_body();c5_consume_path(&mut owner,&path);
+    let terminal=body_control::body(path.poses.last().unwrap());let xy=[terminal.0[0],terminal.0[1]];
+    let incoming=route.reference.full_window().unwrap().to().continuation(xy).unwrap();
+    let (single,p)=c5_stationary(owner.source_map.as_ref().unwrap(),&route,&incoming,terminal);
+    owner.admit_ground_candidate(p.clone(),p.poses[0].clone(),single,None,None).unwrap();
+    let _=owner.step_ground_internal(0.2,None).unwrap();
+    let token=owner.ground_resume().unwrap();let binding=c4_binding(&owner);let installed=owner.path.as_ref().unwrap().clone();
+    let saved=owner.ground_cursor();owner.admit_ground_candidate(installed.clone(),p.poses[0].clone(),binding,Some(token),None).unwrap();
+    assert_eq!(owner.ground_cursor(),saved);
+    owner.stop();assert!(owner.ground_execution.is_none());
+    owner.replace_execution_path(ExecutionPath::Surface(installed.clone()),None,p.poses[0].clone()).unwrap();
+    assert!(owner.ground_execution.is_none());
+    let query=source.body_query();let physical=query.start_ground_state(c3_start()).unwrap();
+    let to=[-0.95,0.2];let expected=query.project_motion(c3_start(),&physical,to,0.0,&mut None).unwrap();
+    let (actual,walks)=body_control::capture_navigation_walks(||body_control::control_project_edge(&query,c3_start(),&physical,None,to,0.0,&[],body_control::ControlEdgeProfile::Preview));
+    let actual=actual.unwrap();assert_eq!(actual.body.pose,expected.pose());assert!(actual.navigation.is_none());assert_eq!(walks,0);
+}

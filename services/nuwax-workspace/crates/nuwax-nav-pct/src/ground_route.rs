@@ -61,6 +61,12 @@ pub struct GroundRouteStart {
     pub xy: [f64;2],
     pub ground_z: Option<f64>,
 }
+/// Only the factory creates this exact initial sampling address. General
+/// consumed continuations may have a different original sample XY and are not
+/// silently reinterpreted as a new global search origin by this entry point.
+#[derive(Clone,Debug)]
+pub struct PreparedGroundStart {state:OwnedGroundWalkState}
+impl PreparedGroundStart {pub fn basis(&self)->&OwnedGroundWalkState {&self.state}}
 #[derive(Clone, Copy, Debug)]
 pub struct GroundRouteGoal {
     pub xy: [f64;2],
@@ -111,8 +117,23 @@ pub struct GroundConnection {
 pub struct GroundRouteReference {
     map:Arc<Tomogram>,
     trace:Arc<RouteReferenceTrace>,
+    target:GroundRouteTarget,
 }
+#[derive(Clone,Copy,Debug)]
+struct GroundRouteTarget {goal:GroundRouteGoal,reference:Option<Reference>}
 impl GroundRouteReference {
+    /// Original target captured once by PCT. This is planned intent, not an
+    /// observed layer match or a stopped-arrival result.
+    pub fn original_goal(&self)->GroundRouteGoal {self.target.goal}
+    pub fn target_sample(&self)->Option<PlannedGroundSample<'_>> {
+        let reference=self.target.reference?;let xy=self.target.goal.xy;
+        Some(PlannedGroundSample {point:GroundRoutePoint {xy,
+            ground_z:self.map.reference_height_at(reference,xy)},association:match reference {
+                Reference::Known(id)=>PlannedGroundAssociation::Known {source:self.map.source_ground_record(id)},
+                Reference::Unknown{..}=>PlannedGroundAssociation::Carried,
+                Reference::Unanchored{..}=>PlannedGroundAssociation::Unanchored,
+            }})
+    }
     pub fn connections(&self)->impl Iterator<Item=GroundConnection>+'_ {
         self.trace.connections.iter().map(|c|GroundConnection {point_span:c.point_span,steps:c.steps})
     }
@@ -156,7 +177,7 @@ impl PctPlanner {
         xy_tolerance:f64,boundary:&[[f64;2]],cancelled:Option<&AtomicBool>,radius:Option<f64>,
         limits:SearchLimits,penalties:&[RoutePenalty],
     )->Result<PlannedGroundRoute,GroundRouteFailure> {
-        self.ground_route_impl::<true>(source,actual,start,goal,xy_tolerance,boundary,cancelled,radius,limits,penalties)
+        self.ground_route_impl::<true>(source,actual,start,None,goal,xy_tolerance,boundary,cancelled,radius,limits,penalties)
     }
     #[cfg(test)]
     pub(crate) fn ground_route_original_order(
@@ -164,10 +185,39 @@ impl PctPlanner {
         xy_tolerance:f64,boundary:&[[f64;2]],cancelled:Option<&AtomicBool>,radius:Option<f64>,
         limits:SearchLimits,penalties:&[RoutePenalty],
     )->Result<PlannedGroundRoute,GroundRouteFailure> {
-        self.ground_route_impl::<false>(source,actual,start,goal,xy_tolerance,boundary,cancelled,radius,limits,penalties)
+        self.ground_route_impl::<false>(source,actual,start,None,goal,xy_tolerance,boundary,cancelled,radius,limits,penalties)
+    }
+    /// Establish the independent initial association before waiting for a plan.
+    /// None remains Unanchored even when the source has a floor below the body.
+    pub fn prepare_ground_start(&self,source:&SurfaceSnapshot,start:GroundRouteStart,
+        cancelled:Option<&AtomicBool>)->Result<PreparedGroundStart,PlanningFailure> {
+        checkpoint(cancelled)?;
+        if start.xy.into_iter().chain(start.ground_z).any(|v|!v.is_finite()) {
+            return Err("Ground reference height must be finite when present".into());
+        }
+        let map=self.map(source)?;checkpoint(cancelled)?;
+        let reference=match start.ground_z {
+            Some(h)=>{let z=map.cell_at([start.xy[0],start.xy[1],h])
+                .and_then(|id|map.ground_height_at(id,start.xy)).unwrap_or(h);
+                map.reference_start([start.xy[0],start.xy[1],z])},
+            None=>map.unanchored_at(map.point_column([start.xy[0],start.xy[1],0.0])),
+        }.ok_or("invalid initial Ground reference")?;
+        Ok(PreparedGroundStart {state:OwnedGroundWalkState {map,reference,reference_sample_xy:start.xy,actual_xy:start.xy}})
+    }
+    /// Consume a previously captured actual association. In particular a pending
+    /// request cannot recreate its incoming reference from a later body height.
+    pub fn ground_route_from_start(&self,source:&SurfaceSnapshot,actual:BodyPose,
+        prepared:&PreparedGroundStart,goal:GroundRouteGoal,xy_tolerance:f64,
+        boundary:&[[f64;2]],cancelled:Option<&AtomicBool>,radius:Option<f64>,
+        limits:SearchLimits,penalties:&[RoutePenalty])->Result<PlannedGroundRoute,GroundRouteFailure> {
+        let incoming=prepared.basis();
+        let start=GroundRouteStart {xy:incoming.actual_xy,ground_z:incoming.walk_state().planned_ground_z()};
+        self.ground_route_impl::<true>(source,actual,start,Some(incoming),goal,xy_tolerance,
+            boundary,cancelled,radius,limits,penalties)
     }
     fn ground_route_impl<const EARLY:bool>(
-        &self,source:&SurfaceSnapshot,actual:BodyPose,start:GroundRouteStart,goal:GroundRouteGoal,
+        &self,source:&SurfaceSnapshot,actual:BodyPose,start:GroundRouteStart,
+        prepared:Option<&OwnedGroundWalkState>,goal:GroundRouteGoal,
         xy_tolerance:f64,boundary:&[[f64;2]],cancelled:Option<&AtomicBool>,radius:Option<f64>,
         limits:SearchLimits,penalties:&[RoutePenalty],
     )->Result<PlannedGroundRoute,GroundRouteFailure> {
@@ -181,13 +231,18 @@ impl PctPlanner {
         // height inferred from its Z. This also validates the original model.
         body.validate_unanchored_motion(actual,actual,boundary,&mut None)
             .map_err(|error|error.to_string())?;
-        let map=self.map(source)?;
+        let map=if let Some(incoming)=prepared {
+            if !incoming.matches_source(source) {return Err("initial Ground source retired".into());}
+            Arc::clone(&incoming.map)
+        }else {self.map(source)?};
         checkpoint(cancelled)?;
-        let initial_z=match start.ground_z {
+        let initial_z=if let Some(incoming)=prepared {
+            incoming.walk_state().planned_ground_z().unwrap_or(actual.0[2])
+        }else {match start.ground_z {
             Some(h)=>map.cell_at([start.xy[0],start.xy[1],h])
                 .and_then(|id|map.ground_height_at(id,start.xy)).unwrap_or(h),
             None=>actual.0[2], // private physical coordinate, never exported as ground
-        };
+        }};
         let target=goal.requested_ground_z.and_then(|h|map.cell_at([goal.xy[0],goal.xy[1],h]));
         if goal.requested_ground_z.is_some() && target.is_none()
             && map.columns.get(&map.point_column([goal.xy[0],goal.xy[1],initial_z]))
@@ -208,7 +263,7 @@ impl PctPlanner {
         }).collect();
         let traced=map.plan_ground_physical::<EARLY>(from,to,xy_tolerance,boundary,cancelled,radius,&penalties,
             &admitter,limits,start.ground_z.is_none().then_some(actual.0[2]),
-            if start.ground_z.is_some(){target}else{None})?;
+            if start.ground_z.is_some(){target}else{None},prepared.map(|v|v.reference))?;
         let last=traced.trace.changes.last().expect("successful recorded route has an initial sample").reference;
         let end=*traced.route.points.last().unwrap();
         let resolved_ground_z=match last {
@@ -229,7 +284,7 @@ impl PctPlanner {
         let guide_body_poses=traced.route.points.iter().copied().map(|p|admitter.physical(p)).collect();
         Ok(PlannedGroundRoute {points,guide_body_poses,
             height:GroundHeightIntent {requested_ground_z:goal.requested_ground_z,resolved_ground_z},
-            planned_layer,reference:GroundRouteReference {map,trace:traced.trace},stats:traced.route.stats})
+            planned_layer,reference:GroundRouteReference {map,trace:traced.trace,target:GroundRouteTarget {goal,reference:target.map(Reference::Known)}},stats:traced.route.stats})
     }
 }
 
@@ -351,6 +406,13 @@ pub struct OwnedGroundWalkState {
     map:Arc<Tomogram>,reference:Reference,reference_sample_xy:[f64;2],actual_xy:[f64;2],
 }
 impl OwnedGroundWalkState {
+    pub fn matches_source(&self,source:&SurfaceSnapshot)->bool {self.map.matches_surface(source)}
+    /// Own the result of this exact already checked walk, without walking again.
+    pub fn recorded_successor(&self,segment:&GroundWalkSegment<'_>)->Option<Self> {
+        if self.semantic_key()!=segment.from.semantic_key() {return None;}
+        Some(Self {map:Arc::clone(&self.map),reference:segment.to.reference,
+            reference_sample_xy:segment.to.reference_sample_xy,actual_xy:segment.to.xy})
+    }
     pub fn walk_state(&self)->GroundWalkState<'_> {
         GroundWalkState {map:&self.map,reference:self.reference,
             reference_sample_xy:self.reference_sample_xy,xy:self.actual_xy}
@@ -509,7 +571,9 @@ struct GroundCandidateTrace {connections:Vec<GroundWalkConnection>,changes:Vec<c
 #[derive(Clone,Debug)]
 struct RecordedSlice {trace:Arc<GroundCandidateTrace>,edge:usize,from:f64,to:f64}
 #[derive(Clone,Debug)]
-enum CandidateRecording {Recorded(Arc<GroundCandidateTrace>),Slices(Arc<[RecordedSlice]>)}
+enum CandidateRecording {Recorded(Arc<GroundCandidateTrace>),Slices(Arc<[RecordedLeaf]>)}
+#[derive(Clone,Debug)]
+enum RecordedLeaf {Slice(RecordedSlice),Point(Arc<GroundCandidateTrace>)}
 #[derive(Clone,Copy)]
 struct BorrowedSlice<'a> {trace:&'a Arc<GroundCandidateTrace>,edge:usize,from:f64,to:f64}
 impl<'a> BorrowedSlice<'a> {
@@ -577,9 +641,22 @@ impl GroundCandidateReference {
         match &self.recording {
             CandidateRecording::Recorded(trace)=>trace.connections.get(edge)
                 .map(|_|BorrowedSlice {trace,edge,from:0.0,to:1.0}),
-            CandidateRecording::Slices(leaves)=>leaves.get(edge)
-                .map(|v|BorrowedSlice {trace:&v.trace,edge:v.edge,from:v.from,to:v.to}),
+            CandidateRecording::Slices(leaves)=>match leaves.get(edge)? {
+                RecordedLeaf::Slice(v)=>Some(BorrowedSlice {trace:&v.trace,edge:v.edge,from:v.from,to:v.to}),
+                RecordedLeaf::Point(_)=>None,
+            },
         }
+    }
+    fn point(&self,edge:usize)->Option<&Arc<GroundCandidateTrace>> {
+        match &self.recording {
+            CandidateRecording::Recorded(t) if edge==0 && t.connections.is_empty()=>Some(t),
+            CandidateRecording::Slices(v)=>match v.get(edge)? {RecordedLeaf::Point(t)=>Some(t),_=>None},
+            _=>None,
+        }
+    }
+    fn owned_leaf(&self,edge:usize)->Option<RecordedLeaf> {
+        if let Some(t)=self.point(edge) {Some(RecordedLeaf::Point(Arc::clone(t)))}
+        else {self.leaf(edge).map(|v|RecordedLeaf::Slice(v.owned()))}
     }
     pub fn connection_count(&self)->usize {match &self.recording {
         CandidateRecording::Recorded(trace)=>trace.connections.len(),CandidateRecording::Slices(v)=>v.len(),
@@ -598,11 +675,10 @@ impl GroundCandidateReference {
     }
     pub fn walk_state_at(&self,edge:usize,fraction:f64,actual_xy:[f64;2])->Option<GroundWalkState<'_>> {
         if !actual_xy.into_iter().all(f64::is_finite) {return None;}
-        if let CandidateRecording::Recorded(trace)=&self.recording {
-            if trace.connections.is_empty() && edge==0 && fraction==0.0 {
-                let (reference,reference_sample_xy,_)=trace.initial?;
-                return Some(GroundWalkState {map:&self.map,reference,reference_sample_xy,xy:actual_xy});
-            }
+        if let Some(trace)=self.point(edge) {
+            if !fraction.is_finite() || !(0.0..=1.0).contains(&fraction) {return None;}
+            let (reference,reference_sample_xy,_)=trace.initial?;
+            return Some(GroundWalkState {map:&self.map,reference,reference_sample_xy,xy:actual_xy});
         }
         let leaf=self.leaf(edge)?;let (index,_)=leaf.decode(fraction)?;
         Some(GroundWalkState {map:&self.map,reference:leaf.reference(index),
@@ -626,6 +702,7 @@ impl GroundCandidateReference {
         Some(PlannedGroundSample {point:GroundRoutePoint {xy,ground_z:self.map.reference_height_at(reference,xy)},association})
     }
     pub fn constant_association(&self,connection:usize)->bool {
+        if self.point(connection).is_some() {return true;}
         let Some(leaf)=self.leaf(connection)else{return false;};
         let c=leaf.connection();
         if leaf.from==0.0 && leaf.to==1.0 {
@@ -648,15 +725,27 @@ impl GroundCandidateReference {
         if !Arc::ptr_eq(&self.map,&prefix.map) {return Err("splice reference owner changed".into());}
         let first=self.leaf(edge).and_then(|v|v.crop(fraction,1.0)).ok_or("invalid retained suffix address")?;
         let mut leaves=Vec::with_capacity(prefix.connection_count()+self.connection_count()-edge);
-        for i in 0..prefix.connection_count() {leaves.push(prefix.leaf(i).unwrap().owned());}
-        leaves.push(first.owned());
-        for i in edge+1..self.connection_count() {leaves.push(self.leaf(i).unwrap().owned());}
+        for i in 0..prefix.connection_count() {leaves.push(prefix.owned_leaf(i).unwrap());}
+        leaves.push(RecordedLeaf::Slice(first.owned()));
+        for i in edge+1..self.connection_count() {leaves.push(self.owned_leaf(i).unwrap());}
+        Ok(Self {map:Arc::clone(&self.map),recording:CandidateRecording::Slices(leaves.into())})
+    }
+    /// A stationary winner has no grid to crop. Retain its original initial
+    /// sample as a terminal point event after the independently checked prefix.
+    pub fn prepend_to_stationary(&self,prefix:&Self)->Result<Self,PlanningFailure> {
+        if !Arc::ptr_eq(&self.map,&prefix.map) {return Err("splice reference owner changed".into());}
+        if self.connection_count()!=0 {return Err("candidate is not stationary".into());}
+        let point=self.point(0).filter(|t|t.initial.is_some()).ok_or("stationary candidate has no incoming address")?;
+        let mut leaves=Vec::with_capacity(prefix.connection_count()+1);
+        for i in 0..prefix.connection_count() {leaves.push(prefix.owned_leaf(i).unwrap());}
+        leaves.push(RecordedLeaf::Point(Arc::clone(point)));
         Ok(Self {map:Arc::clone(&self.map),recording:CandidateRecording::Slices(leaves.into())})
     }
     /// A boundary between separately recorded/cropped pieces is not discarded
     /// merely because its two geometric poses happen to be equal.
     pub fn is_splice_boundary(&self,right:usize)->bool {
         if right==0 {return false;}
+        if self.point(right).is_some() || self.point(right-1).is_some() {return right<self.connection_count();}
         let Some(a)=self.leaf(right-1)else{return false;};let Some(b)=self.leaf(right)else{return false;};
         !Arc::ptr_eq(a.trace,b.trace) || a.edge+1!=b.edge || a.to!=1.0 || b.from!=0.0
     }
@@ -664,8 +753,17 @@ impl GroundCandidateReference {
     pub fn with_body_navigation_slice<R>(&self,edge:usize,from:f64,to:f64,
         actual_from_xy:[f64;2],actual_to_xy:[f64;2],
         run:impl FnOnce(&BodyNavigationSegment<'_,'_>)->R)->Result<R,PlanningFailure> {
-        let leaf=self.leaf(edge).and_then(|v|v.crop(from,to)).ok_or("invalid retained navigation slice")?;
         let source=self.map.source.as_ref().ok_or("recorded navigation has no physical source")?;
+        if let Some(point)=self.point(edge) {
+            if !from.is_finite() || !to.is_finite() || from<0.0 || from>to || to>1.0 {
+                return Err("invalid retained navigation slice".into());
+            }
+            let (reference,xy,_)=point.initial.ok_or("stationary candidate has no incoming address")?;
+            let sample=|_|navigation_sample(&self.map,reference,xy);
+            let navigation=BodyNavigationSegment::from_recorded(source,actual_from_xy,actual_to_xy,&[],&sample);
+            return Ok(run(&navigation));
+        }
+        let leaf=self.leaf(edge).and_then(|v|v.crop(from,to)).ok_or("invalid retained navigation slice")?;
         let c=leaf.connection();let (first,_)=leaf.decode(0.0).unwrap();let (last,_)=leaf.decode(1.0).unwrap();
         let mut changes=Vec::new();let mut previous=(leaf.reference(first),
             self.map.reference_height_at(leaf.reference(first),c.sample_xy(first)));
@@ -699,6 +797,10 @@ impl GroundCandidateReference {
             return self.walk_state_at(0,0.0,target.xy).is_some_and(|state|
                 state.reference==target.reference && state.reference_sample_xy==target.reference_sample_xy
                     && match &self.recording {CandidateRecording::Recorded(t)=>t.initial.is_some_and(|v|v.2==target.xy),_=>false});
+        }
+        if let Some(point)=self.point(self.connection_count()-1) {
+            return point.initial.is_some_and(|(reference,xy,actual)|reference==target.reference
+                && xy==target.reference_sample_xy && actual==target.xy);
         }
         let leaf=self.leaf(self.connection_count()-1).unwrap();let c=leaf.connection();
         let xy=if leaf.to==1.0 {c.to}else {std::array::from_fn(|i|c.from[i]+leaf.to*(c.to[i]-c.from[i]))};

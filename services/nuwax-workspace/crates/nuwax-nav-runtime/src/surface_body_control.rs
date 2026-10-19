@@ -254,6 +254,23 @@ pub(super) fn validate_control_actual_pose(
     control_validate_edge(query,pose,pose,ground,navigation,boundary).map_err(|error|error.to_string())
 }
 
+/// Actual-only Initial transition. Reuse the same full-pose H3 edge and own
+/// its recorded end; predicted body height/state is deliberately discarded.
+pub(super) fn observe_initial_ground_actual(
+    query:&SurfaceBodyQueryView,incoming:&nuwax_nav_pct::ground_route::OwnedGroundWalkState,
+    from:BodyPose,to:BodyPose,physical:&BodyGroundState,boundary:&[[f64;2]],
+    cancelled:Option<&std::sync::atomic::AtomicBool>,
+)->Result<nuwax_nav_pct::ground_route::OwnedGroundWalkState,String> {
+    if from==to {
+        validate_control_actual_pose(query,to,physical,Some(incoming.walk_state()),boundary)?;
+        return Ok(incoming.clone());
+    }
+    let mut recorded=Vec::with_capacity(1);
+    control_validate_edge_recorded(query,from,to,physical,Some(incoming.walk_state()),boundary,
+        Some(&mut recorded),cancelled).map_err(|error|error.to_string())?;
+    incoming.recorded_successor(&recorded[0]).ok_or_else(||"initial actual walk changed owner".into())
+}
+
 pub(super) fn body(p: &PoseStamped) -> ([f64; 3], [f64; 4]) {
     let q = p.pose.orientation;
     (xyz(p.pose.position), [q.x, q.y, q.z, q.w])

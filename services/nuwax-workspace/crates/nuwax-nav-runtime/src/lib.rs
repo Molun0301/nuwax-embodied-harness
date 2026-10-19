@@ -1392,6 +1392,10 @@ where
     ) -> Option<Result<(), RuntimeError>> {
         match command {
             UrgentCommand::Cancel { session_id, reply } => {
+                #[cfg(feature = "surface-recovery-qualification")]
+                if let Some(sink) = &self.qualification_timing {
+                    sink.mark("scheduler.cancel.handle.enter", 0);
+                }
                 let result = self.cancel(status_tx, &session_id).await;
                 let _ = reply.send(result);
                 None
@@ -2509,6 +2513,10 @@ impl NavSchedulerHandle {
             })
             .await
             .map_err(|_| RuntimeError::SchedulerStopped)?;
+        #[cfg(feature = "surface-recovery-qualification")]
+        if let Some(sink) = &self.qualification_timing {
+            sink.mark("scheduler.cancel.send.accepted", 0);
+        }
         result.await.map_err(|_| RuntimeError::SchedulerStopped)?
     }
 

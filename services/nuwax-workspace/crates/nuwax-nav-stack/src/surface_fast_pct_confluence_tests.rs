@@ -314,10 +314,9 @@ async fn real_fast_pct_publication_before_wait_tick_converges_after_injected_ref
     assert_eq!(feedback.rejected_context, feedback.current_context);
     assert_eq!(Some(feedback.current_context), same_actual);
     eprintln!("FAST_PCT_CONFLUENCE real_normal_calls={stable_calls} real_quick_calls=0 initial_actual=None final_actual=Some held_ticks=2 refusal=synthetic real_worker_command=true");
-    // Exercise the scheduler's original urgent API while renew is pending.
-    // The outer LCM handler can itself be awaiting a normal pose/path update;
-    // bypassing that transport queue here is explicit, not an ingress claim.
-    harness.scheduler.cancel(&goal.session_id).await.unwrap();
+    // The bridge must forward the original LCM Cancel even while its
+    // ordinary pose/path ACK is queued behind the pending renewal.
+    harness.cancel(&goal).await;
     status_when(&harness, |s| s.last_terminal == Some(TerminalOutcome::Cancelled)).await;
     drop(cleanup);
     harness.shutdown().await;

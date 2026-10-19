@@ -1694,30 +1694,35 @@ where
                 commit_guarded_pose_telemetry(&mut candidate_telemetry, &input);
                 #[cfg(all(test,feature="surface-recovery-qualification"))]
                 let pose_ack=scheduler.qualification_timing().map(|t|t.span("bridge.pose.scheduler_ack",input.pose.stamp.nanos));
-                let result = match source_deadline {
-                    Some(deadline) => {
-                        let acquired_at = deadline.checked_sub(source_max_age.expect("已配置来源期限"))
-                            .ok_or_else(|| NavStackError::InvalidConfig("位姿采集单调时刻下溢".into()))?;
-                        scheduler
-                            .update_odometry_with_acquisition(input.pose, acquired_at, deadline)
-                            .await
+                let acquired_at = source_deadline.map(|deadline| {
+                    deadline.checked_sub(source_max_age.expect("已配置来源期限"))
+                        .ok_or_else(|| NavStackError::InvalidConfig("位姿采集单调时刻下溢".into()))
+                }).transpose()?;
+                let settlement = await_guarded_active_input(async {
+                    match (source_deadline, acquired_at) {
+                        (Some(deadline), Some(acquired_at)) => scheduler
+                            .update_odometry_with_acquisition(input.pose, acquired_at, deadline).await,
+                        _ => scheduler.update_odometry(input.pose).await,
                     }
-                    None => scheduler.update_odometry(input.pose).await,
-                };
+                }, node, transport, scheduler, &mut cancels, active_session.as_ref(),
+                    &mut cancel_generation_watermark, &mut arbiter, &telemetry).await;
                 #[cfg(all(test,feature="surface-recovery-qualification"))]
                 drop(pose_ack);
-                if let Err(error) = result {
-                    match runtime_input_error::<()>("guarded_nav_scheduler.map_pose", error)? {
-                        OwnerInput::Rejected(reason) => {
-                            diagnostics.reject("guarded_nav_scheduler.map_pose", &reason);
-                            continue;
+                let accepted = settlement.input.is_ok();
+                let ordinary = match settlement.input {
+                    Ok(()) => { telemetry = candidate_telemetry; Ok(()) }
+                    Err(error) => match runtime_input_error::<()>("guarded_nav_scheduler.map_pose", error) {
+                        Ok(OwnerInput::Rejected(reason)) => {
+                            diagnostics.reject("guarded_nav_scheduler.map_pose", &reason); Ok(())
                         }
-                        OwnerInput::Accepted(()) => {
-                            unreachable!("error classifier accepted an error")
-                        }
-                    }
-                }
-                telemetry = candidate_telemetry;
+                        Ok(OwnerInput::Accepted(())) => unreachable!("error classifier accepted an error"),
+                        Err(error) => Err(error),
+                    },
+                };
+                let cancelled = settle_guarded_input_cancel(ordinary, settlement.cancel,
+                    transport, node, scheduler, &mut telemetry, &mut active_session,
+                    &mut goal_buffer, &mut last_cancel_terminal, &mut publications).await?;
+                if !accepted || cancelled { continue; }
                 if let Some(goal) = goal_buffer.take_ready_goal() {
                     activate_or_defer_guarded_goal(
                         node,
@@ -1747,9 +1752,17 @@ where
                 let (decoded, received_at) = match frame {
                     #[cfg(feature="mls")]
                     GuardedMapFrame::RecentCloud(frame) => {
-                        if let Err(reason)=recent_source.consume(&frame.payload,surface_authority.as_ref(),scheduler).await {
-                            diagnostics.reject("recent obstacle source",&reason);
+                        let settlement = await_guarded_active_input(
+                            recent_source.consume(&frame.payload, surface_authority.as_ref(), scheduler),
+                            node, transport, scheduler, &mut cancels, active_session.as_ref(),
+                            &mut cancel_generation_watermark, &mut arbiter, &telemetry,
+                        ).await;
+                        if let Err(reason) = settlement.input {
+                            diagnostics.reject("recent obstacle source", &reason);
                         }
+                        settle_guarded_input_cancel(Ok(()), settlement.cancel,
+                            transport, node, scheduler, &mut telemetry, &mut active_session,
+                            &mut goal_buffer, &mut last_cancel_terminal, &mut publications).await?;
                         continue;
                     }
                     GuardedMapFrame::Planar(frame) => {
@@ -1848,7 +1861,13 @@ where
                             );
                         }
                         if changed_domain || update.snapshot.is_err() {
-                            recent_source.reset(scheduler).await.map_err(|error|module_error("recent source domain reset",error))?;
+                            let settlement = await_guarded_active_input(recent_source.reset(scheduler),
+                                node, transport, scheduler, &mut cancels, active_session.as_ref(),
+                                &mut cancel_generation_watermark, &mut arbiter, &telemetry).await;
+                            let ordinary = settlement.input.map_err(|error|module_error("recent source domain reset",error));
+                            settle_guarded_input_cancel(ordinary, settlement.cancel,
+                                transport, node, scheduler, &mut telemetry, &mut active_session,
+                                &mut goal_buffer, &mut last_cancel_terminal, &mut publications).await?;
                         }
                         surface_authority = Some(update.authority.clone());
                         let surface = match update.snapshot {
@@ -1886,27 +1905,36 @@ where
                 commit_guarded_costmap_telemetry(&mut candidate_telemetry, &input);
                 #[cfg(all(test,feature="surface-recovery-qualification"))]
                 let map_ack=scheduler.qualification_timing().map(|t|t.span("bridge.map.scheduler_ack",input.observation.source_timestamp_ns));
-                if let Err(error) = scheduler
-                    .update_costmap_received(
-                        input.observation,
-                        tokio::time::Instant::from_std(received_at.unwrap_or_else(Instant::now)),
-                    )
-                    .await
-                {
-                    match runtime_input_error::<()>("guarded_nav_scheduler.costmap", error)? {
-                        OwnerInput::Rejected(reason) => {
-                            diagnostics.reject("guarded_nav_scheduler.costmap", &reason);
-                            continue;
-                        }
-                        OwnerInput::Accepted(()) => {
-                            unreachable!("error classifier accepted an error")
-                        }
-                    }
-                }
+                let settlement = await_guarded_active_input(
+                    scheduler.update_costmap_received(input.observation,
+                        tokio::time::Instant::from_std(received_at.unwrap_or_else(Instant::now))),
+                    node, transport, scheduler, &mut cancels, active_session.as_ref(),
+                    &mut cancel_generation_watermark, &mut arbiter, &telemetry,
+                ).await;
                 #[cfg(all(test,feature="surface-recovery-qualification"))]
                 drop(map_ack);
-                telemetry = candidate_telemetry;
-                let ready_goal = goal_buffer.observe_costmap();
+                let accepted = settlement.input.is_ok();
+                let ordinary = match settlement.input {
+                    Ok(()) => {
+                        telemetry = candidate_telemetry;
+                        // Observe the accepted map without taking/activating a
+                        // buffered goal before an early cancellation settles.
+                        goal_buffer.costmap_observed = true;
+                        Ok(())
+                    }
+                    Err(error) => match runtime_input_error::<()>("guarded_nav_scheduler.costmap", error) {
+                        Ok(OwnerInput::Rejected(reason)) => {
+                            diagnostics.reject("guarded_nav_scheduler.costmap", &reason); Ok(())
+                        }
+                        Ok(OwnerInput::Accepted(())) => unreachable!("error classifier accepted an error"),
+                        Err(error) => Err(error),
+                    },
+                };
+                let cancelled = settle_guarded_input_cancel(ordinary, settlement.cancel,
+                    transport, node, scheduler, &mut telemetry, &mut active_session,
+                    &mut goal_buffer, &mut last_cancel_terminal, &mut publications).await?;
+                if !accepted || cancelled { continue; }
+                let ready_goal = goal_buffer.take_ready_goal();
                 if let Some(goal) = ready_goal {
                     activate_or_defer_guarded_goal(
                         node,
@@ -2132,7 +2160,9 @@ where
                         continue;
                     }
                 };
-                let result = scheduler
+                let active_goal_key = active_goal.goal_key();
+                let settlement = await_guarded_active_input(
+                    scheduler
                     .submit_path(nuwax_nav_runtime::VersionedPath {
                         session_id: path_envelope.session_id.clone(),
                         execution_identity: guarded_path_execution_identity(&path_envelope),
@@ -2154,38 +2184,37 @@ where
                             )
                         },
                         path,
-                    })
-                    .await;
-                if let Err(error) = result {
-                    match runtime_input_error::<()>("guarded_nav_scheduler.path", error)? {
-                        OwnerInput::Rejected(reason) => {
-                            publish_guarded_rejection(
-                                transport,
-                                &node.outputs[1],
-                                scheduler.status(),
-                                &telemetry,
-                                "path",
-                                &reason,
-                            )
-                            .await?;
-                            let snapshot = scheduler.status();
-                            clear_terminal_session_after_publication(
-                                &mut active_session,
-                                &mut telemetry,
-                                &snapshot,
-                            );
+                    }),
+                    node, transport, scheduler, &mut cancels, Some(active_goal),
+                    &mut cancel_generation_watermark, &mut arbiter, &telemetry,
+                ).await;
+                let rejected = settlement.input.is_err();
+                let ordinary = match settlement.input {
+                    Err(error) => match runtime_input_error::<()>("guarded_nav_scheduler.path", error) {
+                        Ok(OwnerInput::Rejected(reason)) => publish_guarded_rejection(
+                            transport, &node.outputs[1], scheduler.status(), &telemetry, "path", &reason,
+                        ).await,
+                        Ok(OwnerInput::Accepted(())) => unreachable!("error classifier accepted an error"),
+                        Err(error) => Err(error),
+                    },
+                    Ok(()) => {
+                        if matches!(&settlement.cancel, Ok(None)) {
+                            accepted_planner_generation = Some((active_goal_key,
+                                path_envelope.planner_runtime_generation));
+                            telemetry.path_revision = path_envelope.path_revision;
+                            telemetry.planner_runtime_generation = path_envelope.planner_runtime_generation;
                         }
-                        OwnerInput::Accepted(()) => {
-                            unreachable!("error classifier accepted an error")
-                        }
+                        Ok(())
                     }
-                } else {
-                    accepted_planner_generation = Some((
-                        active_goal.goal_key(),
-                        path_envelope.planner_runtime_generation,
-                    ));
-                    telemetry.path_revision = path_envelope.path_revision;
-                    telemetry.planner_runtime_generation = path_envelope.planner_runtime_generation;
+                };
+                let cancelled = settle_guarded_input_cancel(ordinary, settlement.cancel,
+                    transport, node, scheduler, &mut telemetry, &mut active_session,
+                    &mut goal_buffer, &mut last_cancel_terminal, &mut publications).await?;
+                if rejected && !cancelled {
+                    let snapshot = scheduler.status();
+                    clear_terminal_session_after_publication(
+                        &mut active_session, &mut telemetry, &snapshot,
+                    );
                 }
             }
             GuardedNavEvent::Cancel(message) => {
@@ -2969,6 +2998,141 @@ struct GuardedActiveCancelCompletion {
     cancel: schema::CancelNavigation,
     cancel_generation: u64,
     result: Result<(), nuwax_nav_runtime::RuntimeError>,
+}
+
+#[cfg(feature = "guard-runtime")]
+struct GuardedInputSettlement<T> {
+    input: T,
+    cancel: NavStackResult<Option<GuardedActiveCancelCompletion>>,
+}
+
+// One ordinary request remains owned from its bounded send through its ACK.
+// Only an already-active goal is eligible: a queued StartSession could acquire
+// after a cancellation and must never be passed to this helper.
+#[cfg(feature = "guard-runtime")]
+#[allow(clippy::too_many_arguments)]
+async fn await_guarded_active_input<P, T>(
+    input: P,
+    node: &ModuleNode,
+    transport: &LcmTransport,
+    scheduler: &nuwax_nav_runtime::NavSchedulerHandle,
+    cancels: &mut LcmFrameStream,
+    active_goal: Option<&schema::GoalEnvelope>,
+    watermark: &mut Option<GuardedCancelGenerationWatermark>,
+    arbiter: &mut GuardedNavArbiter,
+    telemetry: &GuardedNavTelemetry,
+) -> GuardedInputSettlement<T>
+where
+    P: Future<Output = T>,
+{
+    let eligible = {
+        // Borrow the existing watch value; a pose ACK must not clone local_path
+        // merely to inspect these two scalar/session fields.
+        let status = scheduler.subscribe_status();
+        let snapshot = status.borrow();
+        active_goal.filter(|goal| snapshot.last_terminal.is_none()
+            && snapshot.session_id.as_deref() == Some(goal.session_id.as_str()))
+    };
+    let Some(active_goal) = eligible else {
+        return GuardedInputSettlement { input: input.await, cancel: Ok(None) };
+    };
+    tokio::pin!(input);
+    loop {
+        let message = tokio::select! {
+            biased;
+            result = &mut input => return GuardedInputSettlement { input: result, cancel: Ok(None) },
+            message = cancels.next() => message,
+        };
+        arbiter.record_dispatch(GuardedNavSource::Cancel);
+        let decoded = decode_guarded_cancel(message).map(|decoded| match decoded {
+            OwnerInput::Accepted((cancel, generation)) => {
+                match admit_guarded_active_cancel(&cancel, generation, active_goal, watermark) {
+                    Ok(()) => OwnerInput::Accepted((cancel, generation)),
+                    Err(reason) => OwnerInput::Rejected(reason),
+                }
+            }
+            OwnerInput::Rejected(reason) => OwnerInput::Rejected(reason),
+        });
+        let fatal = match decoded {
+            Ok(OwnerInput::Accepted((cancel, cancel_generation))) => {
+                let (input, result) = tokio::join!(
+                    &mut input, execute_guarded_active_cancel(scheduler, &cancel),
+                );
+                return GuardedInputSettlement {
+                    input,
+                    cancel: Ok(Some(GuardedActiveCancelCompletion {
+                        active_goal: active_goal.clone(), cancel, cancel_generation, result,
+                    })),
+                };
+            }
+            Ok(OwnerInput::Rejected(reason)) => {
+                // Preserve the original diagnostic and its transport backpressure.
+                // A rejected head must not leave a later valid Cancel waiting
+                // for the blocked ordinary ACK.
+                publish_guarded_rejection(
+                    transport, &node.outputs[1], scheduler.status(), telemetry, "cancel", &reason,
+                ).await.err()
+            }
+            Err(error) => Some(error),
+        };
+        if let Some(error) = fatal {
+            // Returning early would discard a possibly-enqueued request; merely
+            // awaiting it could prevent outer cleanup behind a pending renew.
+            // The original urgent shutdown closes the actor and its input queue.
+            let (input, shutdown) = tokio::join!(&mut input, scheduler.shutdown());
+            if let Err(shutdown_error) = shutdown {
+                tracing::warn!(ingress_error = %error, shutdown_error = %shutdown_error,
+                    "guarded input cancellation error during shutdown settlement");
+            }
+            return GuardedInputSettlement { input, cancel: Err(error) };
+        }
+    }
+}
+
+// Input bookkeeping/diagnostics have completed, but no goal has been activated
+// and no terminal identity has been cleared. Keep both completed results even
+// when the ordinary input failed; never let an early `?` discard cancellation.
+#[cfg(feature = "guard-runtime")]
+#[allow(clippy::too_many_arguments)]
+async fn settle_guarded_input_cancel(
+    ordinary: NavStackResult<()>,
+    cancel: NavStackResult<Option<GuardedActiveCancelCompletion>>,
+    transport: &LcmTransport,
+    node: &ModuleNode,
+    scheduler: &nuwax_nav_runtime::NavSchedulerHandle,
+    telemetry: &mut GuardedNavTelemetry,
+    active_session: &mut Option<schema::GoalEnvelope>,
+    goal_buffer: &mut PlannerGoalBuffer,
+    last_cancel_terminal: &mut Option<GuardedCancelTerminal>,
+    publications: &mut GuardedStatusPublications,
+) -> NavStackResult<bool> {
+    let completion = match cancel {
+        Ok(completion) => completion,
+        Err(error) => {
+            if let Err(input_error) = ordinary {
+                tracing::warn!(ingress_error = %error, input_error = %input_error,
+                    "guarded input also failed during fatal ingress settlement");
+            }
+            return Err(error);
+        }
+    };
+    let interrupted = completion.is_some();
+    let cancelled = match completion {
+        Some(completion) => finish_guarded_active_cancel(
+            transport, node, scheduler, completion, telemetry, active_session,
+            goal_buffer, last_cancel_terminal, publications,
+        ).await,
+        None => Ok(()),
+    };
+    if let Err(error) = ordinary {
+        if let Err(cancel_error) = cancelled {
+            tracing::warn!(input_error = %error, cancel_error = %cancel_error,
+                "ordinary guarded input failed with cancellation settlement failure");
+        }
+        return Err(error);
+    }
+    cancelled?;
+    Ok(interrupted)
 }
 
 // This is one publication tail, not a second ingress owner. An eligible active
@@ -7641,6 +7805,12 @@ mod guarded_tests {
     use futures::channel::mpsc::{unbounded, UnboundedSender};
     use nuwax_nav_runtime::{NavSchedulerHandle, RuntimeError, SchedulerPhase, TerminalOutcome};
     use tokio::task::JoinHandle;
+
+    #[cfg(feature = "surface-recovery-qualification")]
+    mod ordinary_ack_cancel_tests {
+        use super::*;
+        include!("guarded_ordinary_ack_cancel_tests.rs");
+    }
 
     #[cfg(feature = "surface-recovery-qualification")]
     mod ingress_ack_tests {

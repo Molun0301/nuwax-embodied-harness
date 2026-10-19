@@ -699,6 +699,17 @@ impl SurfaceFollower {
 }
 
 impl NavPlanner for SurfaceFollower {
+    fn refresh_execution_context(&mut self, applied: Twist2) -> Option<Arc<crate::replan_feedback::ActualExecutionContext>> {
+        // Reuse actual observation association, including carried Unknown ground.
+        // No current-body validation, route projection, step, or command occurs.
+        self.refresh_current_body_view();
+        let source = Arc::clone(self.source_map.as_ref()?);
+        let odometry = self.odometry.as_ref()?.clone();
+        let ground = self.actual_ground.as_ref()?.1.as_ref().ok()?.clone();
+        Some(Arc::new(crate::replan_feedback::ActualExecutionContext {
+            source, odometry, ground, applied,
+        }))
+    }
     fn revalidate_selected_command(&mut self,command:Twist2)->Option<PlannerStep> {
         if self.source_map.as_ref().is_some_and(|map|map.body_envelope().is_none()) {
             return Some(self.recheck_planar_command(command));
@@ -1057,6 +1068,40 @@ mod tests {
         }).unwrap();
         follower.replace_execution_path(ExecutionPath::Surface(Path3D{poses}),None,goal).unwrap();
         (follower,map)
+    }
+
+    #[test]
+    fn context_refresh_preserves_unknown_carried_ground_after_stop_and_recent_overlay() {
+        use nuwax_nav_mls_planner::SurfaceBodyEnvelope;
+        let source=Arc::new(test_snapshot(0.0,false).with_body_envelope(SurfaceBodyEnvelope {
+            fixed_collision:None,
+            footprint_xy_m:vec![[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],
+            z_bounds_m:[-0.05,0.2],body_to_support_z_m:0.4,
+            max_step_up_m:0.2,max_step_down_m:0.2,max_cross_slope_deg:18.0,
+            support_uncertainty_m:0.0,
+        }).unwrap());
+        let mut follower=SurfaceFollower::new(SurfaceFollowerConfig::new(0.4)).unwrap();
+        follower.update_execution_map(ExecutionMap::Surface(source.clone())).unwrap();
+        follower.update_odometry(body_pose([0.5,1.0,0.5],Quaternion::IDENTITY,0));
+        let known=follower.refresh_execution_context(Twist2::ZERO).unwrap();
+        follower.stop();
+        // Actual localization can move outside observed ground and change body z.
+        // The observation hook must carry the established h, not reseed from z.
+        follower.update_odometry(body_pose([100.0,1.0,20.0],Quaternion::IDENTITY,1));
+        let unknown=follower.refresh_execution_context(Twist2::ZERO).unwrap();
+        assert_eq!(unknown.ground.query_state(),nuwax_nav_mls_planner::surface::GroundQueryState::Unknown);
+        assert_eq!(unknown.ground.height().to_bits(),known.ground.height().to_bits());
+        let recent=Arc::new(source.with_recent_obstacle_points(1,1,0,&[],[(0,[100.0,1.0,20.0])]).unwrap());
+        follower.update_execution_map(ExecutionMap::Surface(recent.clone())).unwrap();
+        let overlay=follower.refresh_execution_context(Twist2::ZERO).unwrap();
+        assert!(Arc::ptr_eq(&overlay.source,&recent));
+        assert!(!overlay.source.same_body_query_view(&source));
+        assert_eq!(overlay.ground,unknown.ground);
+        assert!(follower.path.is_none() && follower.goal.is_none());
+        assert_eq!(follower.last_command,Twist2::ZERO);
+        follower.update_odometry(body_pose([0.5,1.0,0.5],Quaternion::IDENTITY,2));
+        let returned=follower.refresh_execution_context(Twist2::ZERO).unwrap();
+        assert_eq!(returned.ground,known.ground);
     }
 
     #[test]

@@ -7,6 +7,7 @@ use nuwax_nav_mls_planner::{
 };
 use nuwax_nav_mls_planner::surface::{BodyGroundState, GroundEvidence};
 use nuwax_nav_runtime::{ExecutionMap, ExecutionPath, NavPlanner, PlannerStep, RouteFollower};
+use nuwax_nav_runtime::replan_feedback::{ActualExecutionContext, SurfaceReplanInput, SuccessfulReplanMemo};
 use nuwax_nav_stack::{surface_config::SurfaceNavigationConfig};
 use nuwax_nav_types_messages::{
     GoalOptions, MotionLimits, MotionModel, NavFrameId, Path3D, Point3, Pose3, PoseStamped,
@@ -867,6 +868,11 @@ struct Simulation {
     max_lateral_command_mps: f64,
     pose_mode: String,
     braking_for_replan: bool,
+    // Only the plan/tick adapter owns this one-success memo; Scene is untouched.
+    successful_replan: SuccessfulReplanMemo<u64>,
+    rejected_plan: Option<u64>,
+    rejected_context: Option<Arc<ActualExecutionContext>>,
+    local_planning_enabled: bool,
 }
 fn request_local_planning_enabled(request: &Value, startup: bool) -> Result<bool, String> {
     request.get("local_planning_enabled").map_or(Ok(startup), |value|
@@ -956,6 +962,7 @@ impl Simulation {
         let actual_ground = if matches!(&scene.source,SceneSource::Publication {..}) {
             Some(scene.map.body_query().start_ground_state(current).map_err(|e|e.to_string())?)
         } else {None};
+        let local_planning_enabled=config.local_planning_enabled;
         let mut follower = RouteFollower::new(config).map_err(|e| e.to_string())?;
         follower
             .update_execution_map(ExecutionMap::Surface(scene.map.clone()))
@@ -1001,13 +1008,41 @@ impl Simulation {
             }
             .into(),
             braking_for_replan: false,
+            successful_replan: SuccessfulReplanMemo::default(),
+            rejected_plan: None,
+            rejected_context: None,
+            local_planning_enabled,
         })
     }
     fn plan(&mut self, scene: &Scene) -> Result<(), String> {
+        let penalties=Arc::new(scene.config.follower.pct.local_costs());
+        let limits=scene.config.follower.pct.search_limits();
+        // Reassociate only actual observation/ground. Never step while waiting.
+        let input=SurfaceReplanInput {
+            source:Arc::clone(&scene.map), start:stamped(self.current,self.time),
+            goal:stamped(self.goal,self.time), options:self.options,
+            boundary:Arc::new(vec![]),
+            actual:self.follower.refresh_execution_context(as_twist(self.applied)),
+            limits,
+            offset:scene.map.body_envelope().map_or(scene.config.follower.body_to_support_z_m,
+                |body|body.body_to_support_z_m),
+            local_planning_enabled:self.local_planning_enabled,
+            penalties:Arc::clone(&penalties),
+        };
+        let rejected=(!self.braking_for_replan)
+            .then(|| self.rejected_plan.as_ref().zip(self.rejected_context.as_deref())).flatten();
+        // Retain the existing cancellation result/counter path even while the
+        // memo would otherwise reuse this success; no new cancellation policy.
+        if !CANCEL.load(Ordering::Relaxed) && self.successful_replan.should_reuse(rejected,&input) {
+            self.last_plan_ms=0.0;
+            // Original failure/status/scene remain visible; this is not success
+            // and not a claim of no path. A changed real dependency retries.
+            return Ok(());
+        }
         let started = Instant::now();
-        let route = scene.config.follower.pct.body_route(
-            &scene.map, self.current, self.goal, self.options, &[], Some(&CANCEL),
-        );
+        let route = scene.config.follower.pct.body_route_with_limits_and_penalties_typed(
+            &scene.map, self.current, self.goal, self.options, &[], Some(&CANCEL),limits,&penalties,
+        ).map_err(|error|error.to_string());
         self.last_plan_ms = started.elapsed().as_secs_f64() * 1000.;
         self.plans += 1;
         self.path = route?;
@@ -1025,6 +1060,9 @@ impl Simulation {
                 stamped(self.goal, self.time),
             )
             .map_err(|e| e.to_string())?;
+        self.successful_replan.published(self.plans,input);
+        self.rejected_plan=None;
+        self.rejected_context=None;
         self.need_plan = false;
         self.status = "running".into();
         self.message = "沿完整全局路线前进".into();
@@ -1032,12 +1070,13 @@ impl Simulation {
     }
 
     fn tick(&mut self, scene: &Scene) -> Result<(), String> {
-        let planned_this_tick = self.need_plan;
-        if self.need_plan {
+        let previous_plans=self.plans;
+        if self.need_plan && !self.braking_for_replan {
             self.plan(scene)?;
         }
+        let planned_this_tick=self.plans!=previous_plans;
         let began = Instant::now();
-        let step = if self.braking_for_replan {
+        let step = if self.braking_for_replan || self.need_plan {
             PlannerStep::Command(Twist2::ZERO)
         } else {
             self.follower.step(scene.config.robot_width_m)
@@ -1055,6 +1094,10 @@ impl Simulation {
                 arriving = true;
             }
             PlannerStep::ReplanRequired(reason) => {
+                self.rejected_plan=Some(self.plans);
+                // Bind the original actual APPLIED value, not begin_braking's
+                // internally cleared command, to this synchronous step result.
+                self.rejected_context=self.follower.take_step_execution_context(as_twist(self.applied));
                 self.command = [0.; 3];
                 self.message = reason;
                 self.braking_for_replan = true;
@@ -1514,6 +1557,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    mod replan_feedback_tests { include!("replan_feedback_tests.rs"); }
     use super::*;
 
     #[test]

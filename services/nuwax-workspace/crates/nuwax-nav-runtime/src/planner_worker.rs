@@ -3,6 +3,27 @@ use super::*;
 use std::sync::{Condvar, Mutex};
 
 type Route = (ExecutionPath, Option<Vec<f64>>, PoseStamped);
+
+struct ExecutionContextPublication {
+    epoch: u64,
+    map_version: u64,
+    pose_version: u64,
+    applied_version: u64,
+    boundary_version: u64,
+    context: Option<Arc<ActualExecutionContext>>,
+}
+impl ExecutionContextPublication {
+    fn is_current(&self, input: &Inputs) -> bool {
+        self.epoch == input.epoch && self.map_version == input.map_version
+            && self.pose_version == input.pose_version && self.applied_version == input.applied_version
+            && self.boundary_version == input.boundary_version && !input.closed
+    }
+}
+
+fn same_applied(a: Twist2, b: Twist2) -> bool {
+    [a.linear.x, a.linear.y, a.angular_z].map(f64::to_bits)
+        == [b.linear.x, b.linear.y, b.angular_z].map(f64::to_bits)
+}
 #[derive(Default)]
 struct Inputs {
     goal_id:String,
@@ -25,6 +46,8 @@ struct Inputs {
     applied: Twist2,
     applied_version: u64,
     result: Option<(std::time::Instant, PlannerStep)>,
+    result_execution_context: Option<Arc<ActualExecutionContext>>,
+    execution_context: Option<ExecutionContextPublication>,
     result_dispatch_bound: Option<CommandDispatchBound>,
     #[cfg(test)]
     result_proof: Option<crate::command_proof_trace::PublishedCommandContext>,
@@ -106,6 +129,7 @@ pub(crate) struct PlannerWorker {
     wait_reason: Option<String>,
     delivered_pending: Option<std::time::Instant>,
     delivered_dispatch_bound: Option<CommandDispatchBound>,
+    delivered_execution_context: Option<Arc<ActualExecutionContext>>,
     #[cfg(test)]
     delivered_command_deadline: Option<std::time::Instant>,
     #[cfg(test)]
@@ -151,6 +175,7 @@ impl PlannerWorker {
                         width,
                         applied,
                         mut applied_seq,
+                        admission_applied,
                     ) = {
                         let mut input = lock.lock().unwrap();
                         while input.requested.is_none() && !input.lifecycle_stop && !input.lifecycle_update && !input.closed {
@@ -206,10 +231,24 @@ impl PlannerWorker {
                             input.requested.take(),
                             input.applied,
                             input.applied_version,
+                            // A replacement may reject before this iteration's
+                            // original observe_applied call. Only a prior consumed
+                            // value with the same original version can accompany
+                            // that refusal; the latch alone is not consumption.
+                            if input.goal_version==goal_version {
+                                input.execution_context.as_ref()
+                                    .filter(|previous|previous.applied_version==input.applied_version)
+                                    .and_then(|previous|previous.context.as_ref())
+                                    .filter(|context|same_applied(context.applied,input.applied))
+                                    .map(|context|context.applied)
+                            } else {None},
                         )
                     };
                     let mut started = replay.map_or_else(std::time::Instant::now,|(started,_,_,_)|started);
                     let mut rechecked=false;
+                    let mut inputs_consumed=false;
+                    let mut admission_refusal_context=None;
+                    let mut consumed_applied=applied;
                     #[cfg(test)] let compute_trace=width.map(|_| {
                         result_id=result_id.checked_add(1).expect("test worker result ID exhausted");
                         crate::command_proof_trace::ComputeScope::begin(crate::command_proof_trace::ComputeInputTrace {
@@ -251,16 +290,27 @@ impl PlannerWorker {
                         // 同一目标的新路径只替换路线，保留速度、制动及跟随状态。
                         if path_seq != path_version {
                             if let Some(path) = &path {
-                                planner.replace_execution_path(
+                                if let Err(error)=planner.replace_execution_path(
                                     path.0.clone(),
                                     path.1.clone(),
                                     path.2.clone(),
-                                )?;
+                                ) {
+                                    // Source/pose/boundary installation succeeded.
+                                    // Refresh current actual geometry, not the old
+                                    // publication's geometry. Do not call observe
+                                    // early or attach an unconsumed new velocity.
+                                    if matches!(&error,RuntimeError::PathRejected {..}) {
+                                        admission_refusal_context=admission_applied
+                                            .and_then(|actual|planner.refresh_execution_context(actual));
+                                    }
+                                    return Err(error);
+                                }
                             }
                             path_version = path_seq;
                         }
                         planner.observe_applied_command(applied);
-                        if let Some((_,command,current_state,_))=replay {
+                        inputs_consumed=true;
+                        if let Some((_,command,current_state,_))=replay.filter(|_| width.is_some()) {
                             let checked=if current_state {planner.revalidate_selected_command_at_current_state(command)}
                                 else {planner.revalidate_selected_command(command)};
                             if let Some(result)=checked {
@@ -314,11 +364,31 @@ impl PlannerWorker {
                         if let Some(bound)=planner.take_command_dispatch_bound() {
                             dispatch_bound=Some(dispatch_bound.map_or(bound,|old|old.earliest(bound)));
                         }
-                        computed=checked;map_seq=sequence;pose_seq=latest_pose_seq;applied_seq=latest_applied_seq;rechecked=true;
+                        computed=checked;map_seq=sequence;pose_seq=latest_pose_seq;applied_seq=latest_applied_seq;
+                        consumed_applied=applied;rechecked=true;
                     }
                     #[cfg(test)] let computed_proof=compute_trace.and_then(|trace|trace.finish(&computed));
                     if !matches!(&computed,PlannerStep::Command(v) if *v!=Twist2::ZERO) {dispatch_bound=None;}
-                    if width.is_none() {continue;}
+                    // Geometry stays on this worker, outside the input lock. Bind
+                    // actual velocity from the consumed inputs even if step began
+                    // braking and changed the controller's internal last command.
+                    let execution_context=if inputs_consumed {
+                        planner.refresh_execution_context(consumed_applied)
+                    } else {admission_refusal_context};
+                    if width.is_none() {
+                        let publication=ExecutionContextPublication {
+                            epoch:version,map_version:map_seq,pose_version:pose_seq,
+                            applied_version:applied_seq,boundary_version:boundary_seq,
+                            context:execution_context,
+                        };
+                        let mut input=lock.lock().unwrap();
+                        if publication.is_current(&input) {
+                            input.execution_context=Some(publication);
+                            // Context-only output never installs or renews a result.
+                            published.send_replace(());
+                        }
+                        continue;
+                    }
                     let mut wait_reason = if matches!(computed, PlannerStep::Pending(_))
                         || matches!(computed, PlannerStep::Command(command) if command == Twist2::ZERO) {
                         planner.execution_wait_reason()
@@ -349,6 +419,16 @@ impl PlannerWorker {
                             wait_reason=Some("观察扫掠凭据在发布前已过期，保持零速并重新计算".into());
                             PlannerStep::Pending(Vec::new())
                         }else{computed};
+                        let publication=ExecutionContextPublication {
+                            epoch:version,map_version:map_seq,pose_version:pose_seq,
+                            applied_version:applied_seq,boundary_version:boundary_seq,
+                            context:execution_context,
+                        };
+                        input.result_execution_context=if publication.is_current(&input) {
+                            let context=publication.context.clone();
+                            input.execution_context=Some(publication);
+                            context
+                        } else {None};
                         input.result_dispatch_bound=dispatch_bound;
                         input.result = Some((started, computed));
                         #[cfg(test)] {input.result_proof=if matches!(input.result.as_ref(),Some((_,PlannerStep::Command(_)))) {computed_proof.map(|proof|proof.published_for(started))}else{None};}
@@ -383,6 +463,7 @@ impl PlannerWorker {
             wait_reason: None,
             delivered_pending: None,
             delivered_dispatch_bound: None,
+            delivered_execution_context: None,
             #[cfg(test)]
             delivered_command_deadline: None,
             #[cfg(test)]
@@ -391,11 +472,22 @@ impl PlannerWorker {
     }
 }
 impl NavPlanner for PlannerWorker {
+    fn refresh_execution_context(&mut self, applied: Twist2) -> Option<Arc<ActualExecutionContext>> {
+        // Setters/stop already request the lifecycle refresh. Reading a snapshot
+        // never runs terrain work or creates another timer/control request.
+        let input=self.shared.0.lock().unwrap();
+        input.execution_context.as_ref().filter(|p|p.is_current(&input))
+            .and_then(|p|p.context.clone()).filter(|context|same_applied(context.applied,applied))
+    }
+    fn take_step_execution_context(&mut self, applied: Twist2) -> Option<Arc<ActualExecutionContext>> {
+        self.delivered_execution_context.take().filter(|context|same_applied(context.applied,applied))
+    }
     fn set_goal_log_context(&mut self,goal_id:&str) {
         self.shared.0.lock().unwrap().goal_id=goal_id.to_owned();
     }
     fn configure_boundary(&mut self, boundary: &[[f64;2]]) {
         self.delivered_dispatch_bound=None;
+        self.delivered_execution_context=None;
         let mut input=self.shared.0.lock().unwrap();
         input.boundary=boundary.to_vec();
         input.boundary_version += 1;
@@ -411,12 +503,14 @@ impl NavPlanner for PlannerWorker {
         options: nuwax_nav_types_messages::GoalOptions,
     ) -> Result<(), RuntimeError> {
         self.delivered_dispatch_bound=None;
+        self.delivered_execution_context=None;
         options.validate().map_err(RuntimeError::Planner)?;
         // 自主导航授权按前向策略收窄；旧目标允许倒退不能导致误拒或恢复倒退。
         let options=nuwax_nav_types_messages::GoalOptions {allow_reverse:false,..options};
         let mut input = self.shared.0.lock().unwrap();
         input.epoch += 1;
         input.result = None;
+        input.result_execution_context=None;
         input.result_dispatch_bound=None;
         #[cfg(test)] {input.result_proof=None;}
         input.display_path.clear();
@@ -438,9 +532,11 @@ impl NavPlanner for PlannerWorker {
         goal: PoseStamped,
     ) -> Result<(), RuntimeError> {
         self.delivered_dispatch_bound=None;
+        self.delivered_execution_context=None;
         let mut input = self.shared.0.lock().unwrap();
         input.epoch += 1;
         input.result = None;
+        input.result_execution_context=None;
         input.result_dispatch_bound=None;
         #[cfg(test)] {input.result_proof=None;}
         input.display_path.clear();
@@ -452,6 +548,7 @@ impl NavPlanner for PlannerWorker {
     }
     fn update_odometry(&mut self, pose: PoseStamped) {
         self.delivered_dispatch_bound=None;
+        self.delivered_execution_context=None;
         let mut input = self.shared.0.lock().unwrap();
         if input.pose.as_ref().is_none_or(|previous|
             !same_pose(previous, &pose))
@@ -462,8 +559,9 @@ impl NavPlanner for PlannerWorker {
             // neither invalidate nor re-enumerate the selected candidate.
             if input.result.as_ref().is_some_and(|(_,step)|matches!(step,PlannerStep::Command(c) if *c!=Twist2::ZERO)) {
                 input.requested=input.control_width;
-                self.shared.1.notify_one();
             }
+            input.lifecycle_update=true;
+            self.shared.1.notify_one();
         }
         input.pose = Some(pose);
     }
@@ -472,6 +570,7 @@ impl NavPlanner for PlannerWorker {
     }
     fn update_execution_map(&mut self, map: ExecutionMap) -> Result<(), RuntimeError> {
         self.delivered_dispatch_bound=None;
+        self.delivered_execution_context=None;
         let mut input = self.shared.0.lock().unwrap();
         let recheckable=recheckable_surface_update(input.map.as_ref(),&map);
         let map = match (input.map_pending, input.map.as_ref(), map) {
@@ -508,13 +607,17 @@ impl NavPlanner for PlannerWorker {
         let mut input = self.shared.0.lock().unwrap();
         input.map = None;
         input.map_version += 1;
+        input.lifecycle_update = true;
+        self.shared.1.notify_one();
     }
     fn observe_applied_command(&mut self, command: Twist2) {
         self.delivered_dispatch_bound=None;
+        self.delivered_execution_context=None;
         let mut input = self.shared.0.lock().unwrap();
-        if input.applied != command {
+        if !same_applied(input.applied, command) {
             input.applied_version += 1;
             input.applied = command;
+            input.lifecycle_update = true;
         }
         // 执行回执到达后计算下一拍，使用实际已下发速度；不在本拍
         // 下发前抢算下一拍，避免候选被误作真实执行状态。
@@ -559,6 +662,7 @@ impl NavPlanner for PlannerWorker {
     }
     fn step(&mut self, width: f64) -> PlannerStep {
         self.delivered_dispatch_bound=None;
+        self.delivered_execution_context=None;
         #[cfg(test)] {self.delivered_command_context=None;}
         let mut input = self.shared.0.lock().unwrap();
         if self.thread.as_ref().is_none_or(|thread| thread.is_finished()) {
@@ -621,6 +725,13 @@ impl NavPlanner for PlannerWorker {
                 _ => None,
             };
         }
+        self.delivered_execution_context=if ready.is_some()
+            && input.result_pose_version==input.pose_version
+            && input.result_applied_version==input.applied_version
+            && input.result_map_version==input.map_version
+            && input.result_boundary_version==input.boundary_version {
+                input.result_execution_context.clone()
+            } else {None};
         self.delivered_dispatch_bound=if matches!(&ready,Some(PlannerStep::Command(v)) if *v!=Twist2::ZERO) {input.result_dispatch_bound}else{None};
         self.delivered_pending=if matches!(&ready,Some(PlannerStep::Pending(_))) {
             input.result.as_ref().map(|(started,_)|*started)
@@ -646,6 +757,7 @@ impl NavPlanner for PlannerWorker {
             // feedback (or a later step seeing no result) requests that compute;
             // selecting this candidate is not an actuator receipt.
             input.result = None;
+            input.result_execution_context=None;
             input.result_dispatch_bound=None;
             #[cfg(test)] {input.result_proof=None;}
         }
@@ -659,26 +771,44 @@ impl NavPlanner for PlannerWorker {
     }
     fn stop(&mut self) {
         self.delivered_dispatch_bound=None;
+        self.delivered_execution_context=None;
         self.delivered_pending=None;
         self.wait_reason = None;
         #[cfg(test)]
         {self.delivered_command_deadline=None;self.delivered_command_context=None;}
         let mut input = self.shared.0.lock().unwrap();
+        let carry_zero_context=same_applied(input.applied,Twist2::ZERO)
+            && input.execution_context.as_ref().is_some_and(|publication|
+                publication.is_current(&input) && publication.context.as_ref()
+                    .is_some_and(|context|same_applied(context.applied,Twist2::ZERO)));
         input.epoch += 1;
         input.result = None;
+        input.result_execution_context=None;
         input.result_dispatch_bound=None;
         #[cfg(test)] {input.result_proof=None;}
         input.display_path.clear();
         input.result_wait_reason = None;
         input.path = None;
         input.goal = None;
+        // Preserve the original control initialization / stop contract. Public
+        // context getters still require the caller's real applied value to match.
         input.applied = Twist2::ZERO;
         input.applied_version += 1;
+        if carry_zero_context {
+            // Only this observation slot crosses the pure stop transition.
+            // Source/pose/boundary and carried ground do not change at stop;
+            // result/command versions remain revoked exactly as before.
+            let (epoch,applied_version)=(input.epoch,input.applied_version);
+            let publication=input.execution_context.as_mut().unwrap();
+            publication.epoch=epoch;
+            publication.applied_version=applied_version;
+        }
         input.goal_version += 1;
         input.path_version += 1;
         input.requested = None;
         input.control_width = None;
         input.lifecycle_stop = true;
+        input.lifecycle_update = true;
         self.shared.1.notify_one();
     }
 }
@@ -688,6 +818,7 @@ impl Drop for PlannerWorker {
             let mut input = self.shared.0.lock().unwrap();
             input.closed = true;
             input.result = None;
+            input.result_execution_context=None;
             input.result_dispatch_bound=None;
             #[cfg(test)] {input.result_proof=None;}
             input.display_path.clear();
@@ -714,6 +845,359 @@ mod tests {
         GoalOptions, MotionKinematics, MotionModel, NavFrameId, Path3D, Point3, Pose3,
         Quaternion, Timestamp,
     };
+
+
+    struct AdmissionContextProbe {
+        inner: SurfaceFollower,
+        events: Arc<Mutex<Vec<&'static str>>>,
+        steps: Arc<std::sync::atomic::AtomicUsize>,
+        pause_context: Arc<std::sync::atomic::AtomicBool>,
+        paused: std::sync::mpsc::Sender<()>,
+        resume: std::sync::mpsc::Receiver<()>,
+    }
+    impl NavPlanner for AdmissionContextProbe {
+        fn configure_goal(&mut self,goal:&PoseStamped,options:GoalOptions)->Result<(),RuntimeError> {
+            self.inner.configure_goal(goal,options)
+        }
+        fn configure_boundary(&mut self,boundary:&[[f64;2]]) {self.inner.configure_boundary(boundary);}
+        fn replace_path(&mut self,_:Path2D) {}
+        fn replace_execution_path(&mut self,path:ExecutionPath,yaws:Option<Vec<f64>>,goal:PoseStamped)
+            ->Result<(),RuntimeError> {
+            self.events.lock().unwrap().push("admission");
+            self.inner.replace_execution_path(path,yaws,goal)
+        }
+        fn update_odometry(&mut self,pose:PoseStamped) {
+            self.events.lock().unwrap().push("pose");self.inner.update_odometry(pose);
+        }
+        fn update_costmap(&mut self,map:CostMap2D) {self.inner.update_costmap(map);}
+        fn update_execution_map(&mut self,map:ExecutionMap)->Result<(),RuntimeError> {
+            self.events.lock().unwrap().push("map");self.inner.update_execution_map(map)
+        }
+        fn invalidate_execution_map(&mut self) {self.inner.invalidate_execution_map();}
+        fn observe_applied_command(&mut self,applied:Twist2) {
+            self.events.lock().unwrap().push("applied");self.inner.observe_applied_command(applied);
+        }
+        fn refresh_execution_context(&mut self,applied:Twist2)->Option<Arc<ActualExecutionContext>> {
+            let context=self.inner.refresh_execution_context(applied);
+            if self.pause_context.swap(false,std::sync::atomic::Ordering::SeqCst) {
+                let _=self.paused.send(());
+                let _=self.resume.recv_timeout(Duration::from_secs(5));
+            }
+            context
+        }
+        fn step(&mut self,_:f64)->PlannerStep {
+            self.steps.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
+            PlannerStep::ReplanRequired("unexpected control step after admission rejection".into())
+        }
+        fn stop(&mut self) {self.inner.stop();}
+    }
+    struct AdmissionContextHarness {
+        worker: PlannerWorker,
+        source: Arc<SurfaceSnapshot>,
+        events: Arc<Mutex<Vec<&'static str>>>,
+        steps: Arc<std::sync::atomic::AtomicUsize>,
+        pause_context: Arc<std::sync::atomic::AtomicBool>,
+        paused: std::sync::mpsc::Receiver<()>,
+        resume: std::sync::mpsc::Sender<()>,
+    }
+    impl AdmissionContextHarness {
+        fn new(applied:Twist2)->Self {
+            let source=Arc::new(crate::surface_follower::test_snapshot(0.0,false)
+                .with_body_envelope(SurfaceBodyEnvelope {
+                    fixed_collision:None,
+                    footprint_xy_m:vec![[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],
+                    z_bounds_m:[-0.05,0.2],body_to_support_z_m:0.4,
+                    max_step_up_m:0.2,max_step_down_m:0.2,max_cross_slope_deg:18.0,
+                    support_uncertainty_m:0.0,
+                }).unwrap());
+            let events=Arc::new(Mutex::new(Vec::new()));
+            let steps=Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let pause_context=Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (paused,receive)=std::sync::mpsc::channel();
+            let (resume,wait)=std::sync::mpsc::channel();
+            let mut worker=PlannerWorker::new(AdmissionContextProbe {
+                inner:SurfaceFollower::new(SurfaceFollowerConfig::new(0.4)).unwrap(),
+                events:events.clone(),steps:steps.clone(),pause_context:pause_context.clone(),
+                paused,resume:wait,
+            }).unwrap();
+            worker.configure_goal(&route_pose(3.0,0),GoalOptions::default()).unwrap();
+            worker.update_execution_map(ExecutionMap::Surface(source.clone())).unwrap();
+            worker.update_odometry(route_pose(0.5,0));
+            worker.observe_applied_command(applied);
+            wait_for_feedback(&mut worker,0.5,applied);
+            Self {worker,source,events,steps,pause_context,paused:receive,resume}
+        }
+        fn pause_before_next_publication(&mut self) {
+            self.pause_context.store(true,std::sync::atomic::Ordering::SeqCst);
+            self.worker.update_odometry(route_pose(0.6,1));
+            self.paused.recv_timeout(Duration::from_secs(5)).unwrap();
+            self.events.lock().unwrap().clear();
+        }
+        fn replace_with_disconnected_path(&mut self) {
+            self.worker.replace_execution_path(ExecutionPath::Surface(Path3D {
+                poses:vec![route_pose(100.0,1),route_pose(101.0,1)],
+            }),None,route_pose(3.0,1)).unwrap();
+            let _=self.worker.step(0.3);
+        }
+        fn take_refusal(&mut self,actual:Twist2)->Option<Arc<ActualExecutionContext>> {
+            self.resume.send(()).unwrap();
+            wait_for_source_result(&self.worker);
+            let result=self.worker.step(0.3);
+            assert!(matches!(result,PlannerStep::ReplanRequired(ref reason)
+                if reason.contains("新路径首段不能与当前三维机体位置连续接续")),"{result:?}");
+            assert_eq!(self.steps.load(std::sync::atomic::Ordering::SeqCst),0);
+            assert!(!self.events.lock().unwrap().contains(&"applied"),
+                "admission refusal must still precede this iteration's observe_applied");
+            self.worker.take_step_execution_context(actual)
+        }
+    }
+    impl Drop for AdmissionContextHarness {
+        fn drop(&mut self) {let _=self.resume.send(());self.worker.stop();}
+    }
+    #[test]
+    fn replacement_admission_refusal_uses_new_geometry_and_previously_consumed_applied() {
+        let mut harness=AdmissionContextHarness::new(Twist2::ZERO);
+        harness.pause_before_next_publication();
+        let source=Arc::new(harness.source.with_recent_obstacle_points(1,1,0,&[],[(0,[10.0,10.0,1.0])]).unwrap());
+        harness.worker.update_execution_map(ExecutionMap::Surface(source.clone())).unwrap();
+        harness.worker.update_odometry(route_pose(0.7,2));
+        harness.replace_with_disconnected_path();
+        let context=harness.take_refusal(Twist2::ZERO).expect("same consumed APPLIED permits rejection context");
+        assert!(Arc::ptr_eq(&context.source,&source),"old publication supplies no geometry");
+        assert_eq!(context.odometry.pose,route_pose(0.7,2).pose);
+        assert!(same_applied(context.applied,Twist2::ZERO));
+    }
+    #[test]
+    fn replacement_admission_refusal_does_not_attach_a_new_unconsumed_applied_value() {
+        let mut harness=AdmissionContextHarness::new(Twist2::ZERO);
+        harness.pause_before_next_publication();
+        let moving=Twist2 {linear:nuwax_nav_types_messages::Point2::new(0.2,0.0),angular_z:0.0};
+        harness.worker.observe_applied_command(moving);
+        harness.replace_with_disconnected_path();
+        assert!(harness.take_refusal(moving).is_none());
+    }
+    #[test]
+    fn replacement_admission_refusal_does_not_promote_stop_initialized_zero() {
+        let moving=Twist2 {linear:nuwax_nav_types_messages::Point2::new(0.2,0.0),angular_z:0.0};
+        let mut harness=AdmissionContextHarness::new(moving);
+        harness.pause_before_next_publication();
+        harness.worker.stop();
+        harness.replace_with_disconnected_path();
+        assert!(harness.take_refusal(Twist2::ZERO).is_none(),
+            "internal stop ZERO cannot inherit the prior nonzero applied version");
+    }
+
+    struct FeedbackProbe {
+        inner: SurfaceFollower,
+        contexts: std::sync::mpsc::Sender<Option<Arc<ActualExecutionContext>>>,
+        steps: Arc<std::sync::atomic::AtomicUsize>,
+        gate: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+        stop_gate: Option<(Arc<std::sync::atomic::AtomicBool>,std::sync::mpsc::Sender<()>,std::sync::mpsc::Receiver<()>)>,
+    }
+    impl NavPlanner for FeedbackProbe {
+        fn replace_path(&mut self, _: Path2D) {}
+        fn update_odometry(&mut self, pose: PoseStamped) {self.inner.update_odometry(pose);}
+        fn update_costmap(&mut self, map: CostMap2D) {self.inner.update_costmap(map);}
+        fn update_execution_map(&mut self, map: ExecutionMap) -> Result<(), RuntimeError> {
+            self.inner.update_execution_map(map)
+        }
+        fn invalidate_execution_map(&mut self) {self.inner.invalidate_execution_map();}
+        fn observe_applied_command(&mut self, applied: Twist2) {self.inner.observe_applied_command(applied);}
+        fn refresh_execution_context(&mut self, applied: Twist2) -> Option<Arc<ActualExecutionContext>> {
+            let context=self.inner.refresh_execution_context(applied);
+            let _=self.contexts.send(context.clone());
+            context
+        }
+        fn step(&mut self, _: f64) -> PlannerStep {
+            self.steps.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
+            // Model a refusal that internally begins braking before returning.
+            self.inner.stop();
+            if let Some((entered,release))=&self.gate {
+                let _=entered.send(());
+                let _=release.recv_timeout(Duration::from_secs(5));
+            }
+            PlannerStep::ReplanRequired("gated refusal".into())
+        }
+        fn stop(&mut self) {
+            self.inner.stop();
+            if let Some((armed,entered,release))=&self.stop_gate {
+                if armed.swap(false,std::sync::atomic::Ordering::SeqCst) {
+                    let _=entered.send(());
+                    let _=release.recv_timeout(Duration::from_secs(5));
+                }
+            }
+        }
+    }
+    fn feedback_worker(gate: Option<(std::sync::mpsc::Sender<()>,std::sync::mpsc::Receiver<()>)>)
+        -> (PlannerWorker,std::sync::mpsc::Receiver<Option<Arc<ActualExecutionContext>>>,Arc<std::sync::atomic::AtomicUsize>)
+    {
+        let source=Arc::new(crate::surface_follower::test_snapshot(0.0,false)
+            .with_body_envelope(SurfaceBodyEnvelope {
+                fixed_collision:None,
+                footprint_xy_m:vec![[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],
+                z_bounds_m:[-0.05,0.2],body_to_support_z_m:0.4,
+                max_step_up_m:0.2,max_step_down_m:0.2,max_cross_slope_deg:18.0,
+                support_uncertainty_m:0.0,
+            }).unwrap());
+        let (send,receive)=std::sync::mpsc::channel();
+        let steps=Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut worker=PlannerWorker::new(FeedbackProbe {
+            inner:SurfaceFollower::new(SurfaceFollowerConfig::new(0.4)).unwrap(),
+            contexts:send,steps:steps.clone(),gate,stop_gate:None,
+        }).unwrap();
+        worker.update_execution_map(ExecutionMap::Surface(source)).unwrap();
+        worker.update_odometry(route_pose(0.5,0));
+        worker.observe_applied_command(Twist2::ZERO);
+        (worker,receive,steps)
+    }
+    fn wait_for_feedback(worker:&mut PlannerWorker, x:f64, applied:Twist2)->Arc<ActualExecutionContext> {
+        let deadline=std::time::Instant::now()+Duration::from_secs(5);
+        loop {
+            if let Some(context)=worker.refresh_execution_context(applied) {
+                if context.odometry.pose.position.x.to_bits()==x.to_bits()
+                    && same_applied(context.applied,applied) {return context;}
+            }
+            assert!(std::time::Instant::now()<deadline,"context publication did not become current");
+            std::thread::yield_now();
+        }
+    }
+    #[test]
+    fn context_only_stop_preserves_control_zero_reset_without_fabricating_feedback() {
+        let (mut worker,_contexts,steps)=feedback_worker(None);
+        let moving=Twist2 {linear:nuwax_nav_types_messages::Point2::new(0.2,0.0),angular_z:0.0};
+        worker.observe_applied_command(moving);
+        let before=wait_for_feedback(&mut worker,0.5,moving);
+        worker.stop();
+        {
+            let input=worker.shared.0.lock().unwrap();
+            assert_eq!(input.applied,Twist2::ZERO,"retain original control lifecycle reset");
+        }
+        // The caller still holds the last real nonzero receipt. An internal
+        // stop ZERO may never be returned as that real execution context.
+        assert!(worker.refresh_execution_context(moving).is_none());
+        worker.observe_applied_command(Twist2::ZERO);
+        let stopped_lifecycle=wait_for_feedback(&mut worker,0.5,Twist2::ZERO);
+        assert_eq!(before.ground,stopped_lifecycle.ground,"stop must retain carried ground");
+        worker.update_odometry(route_pose(0.6,1));
+        let actual=wait_for_feedback(&mut worker,0.6,Twist2::ZERO);
+        assert!(actual.source.same_body_query_view(&before.source));
+        assert_eq!(steps.load(std::sync::atomic::Ordering::SeqCst),0);
+        let input=worker.shared.0.lock().unwrap();
+        assert!(input.result.is_none() && input.control_width.is_none());
+        assert!(input.execution_context.as_ref().unwrap().is_current(&input));
+    }
+    #[test]
+    fn rejected_step_and_context_share_consumed_applied_not_internal_braking_zero() {
+        let (mut worker,_contexts,_steps)=feedback_worker(None);
+        let moving=Twist2 {linear:nuwax_nav_types_messages::Point2::new(0.2,0.0),angular_z:0.1};
+        worker.observe_applied_command(moving);
+        wait_for_feedback(&mut worker,0.5,moving);
+        assert!(matches!(worker.step(0.3),PlannerStep::Pending(_)));
+        wait_for_source_result(&worker);
+        assert!(matches!(worker.step(0.3),PlannerStep::ReplanRequired(_)));
+        let context=worker.take_step_execution_context(moving).unwrap();
+        assert!(same_applied(context.applied,moving));
+        assert_eq!(context.odometry.pose,route_pose(0.5,0).pose);
+        assert!(worker.take_step_execution_context(moving).is_none(),"delivered context is one-shot");
+    }
+    #[test]
+    fn zero_context_survives_stop_while_context_only_worker_is_blocked() {
+        let source=Arc::new(crate::surface_follower::test_snapshot(0.0,false)
+            .with_body_envelope(SurfaceBodyEnvelope {
+                fixed_collision:None,
+                footprint_xy_m:vec![[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],
+                z_bounds_m:[-0.05,0.2],body_to_support_z_m:0.4,
+                max_step_up_m:0.2,max_step_down_m:0.2,max_cross_slope_deg:18.0,
+                support_uncertainty_m:0.0,
+            }).unwrap());
+        let armed=Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (entered,stopped)=std::sync::mpsc::channel();
+        let (release,wait)=std::sync::mpsc::channel();
+        let (contexts,_)=std::sync::mpsc::channel();
+        let steps=Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut worker=PlannerWorker::new(FeedbackProbe {
+            inner:SurfaceFollower::new(SurfaceFollowerConfig::new(0.4)).unwrap(),
+            contexts,steps:steps.clone(),gate:None,
+            stop_gate:Some((armed.clone(),entered,wait)),
+        }).unwrap();
+        worker.update_execution_map(ExecutionMap::Surface(source)).unwrap();
+        worker.update_odometry(route_pose(0.5,0));
+        worker.observe_applied_command(Twist2::ZERO);
+        let before=wait_for_feedback(&mut worker,0.5,Twist2::ZERO);
+        armed.store(true,std::sync::atomic::Ordering::SeqCst);
+        worker.stop();
+        stopped.recv_timeout(Duration::from_secs(5)).unwrap();
+        // The worker cannot complete the next lifecycle/context-only pass yet.
+        let after=worker.refresh_execution_context(Twist2::ZERO).unwrap();
+        assert!(Arc::ptr_eq(&before,&after),"no artificial context gap at same actual ZERO");
+        assert_eq!(steps.load(std::sync::atomic::Ordering::SeqCst),0);
+        {
+            let input=worker.shared.0.lock().unwrap();
+            assert!(input.result.is_none() && input.control_width.is_none());
+            assert_eq!(input.applied,Twist2::ZERO);
+            assert!(input.execution_context.as_ref().unwrap().is_current(&input));
+        }
+        // An actual dependency change still invalidates the carried slot.
+        worker.update_odometry(route_pose(0.6,1));
+        assert!(worker.refresh_execution_context(Twist2::ZERO).is_none());
+        release.send(()).unwrap();
+        wait_for_feedback(&mut worker,0.6,Twist2::ZERO);
+        assert_eq!(steps.load(std::sync::atomic::Ordering::SeqCst),0);
+    }
+
+    #[test]
+    fn same_zero_receipt_keeps_exact_context_available_before_lifecycle_stop() {
+        let (mut worker,_contexts,_steps)=feedback_worker(None);
+        wait_for_feedback(&mut worker,0.5,Twist2::ZERO);
+        let _=worker.step(0.3);
+        wait_for_source_result(&worker);
+        assert!(matches!(worker.step(0.3),PlannerStep::ReplanRequired(_)));
+        let rejected=worker.take_step_execution_context(Twist2::ZERO).unwrap();
+        worker.observe_applied_command(Twist2::ZERO);
+        // No next tick, wait, or context publication is required for a receipt
+        // that has exactly the same already-consumed actual velocity.
+        let stopped=worker.refresh_execution_context(Twist2::ZERO).unwrap();
+        assert_eq!(stopped,rejected);
+        worker.stop();
+        assert_eq!(stopped.applied,Twist2::ZERO);
+        assert_eq!(stopped.ground,rejected.ground);
+    }
+
+    #[test]
+    fn newer_pose_retires_inflight_refusal_and_its_context_together() {
+        let (entered,computing)=std::sync::mpsc::channel();
+        let (release,gate)=std::sync::mpsc::channel();
+        let (mut worker,_contexts,steps)=feedback_worker(Some((entered,gate)));
+        wait_for_feedback(&mut worker,0.5,Twist2::ZERO);
+        let _=worker.step(0.3);
+        computing.recv_timeout(Duration::from_secs(5)).unwrap();
+        worker.update_odometry(route_pose(0.6,1));
+        release.send(()).unwrap();
+        wait_for_feedback(&mut worker,0.6,Twist2::ZERO);
+        let input=worker.shared.0.lock().unwrap();
+        assert!(input.result.is_none(),"old refusal cannot pair with latest context");
+        assert!(input.result_execution_context.is_none());
+        assert_eq!(steps.load(std::sync::atomic::Ordering::SeqCst),1,
+            "the newer observation refresh must not call step");
+    }
+    #[test]
+    fn context_publication_requires_every_original_version() {
+        let mut input=Inputs::default();
+        let publication=ExecutionContextPublication {epoch:0,map_version:0,pose_version:0,
+            applied_version:0,boundary_version:0,context:None};
+        assert!(publication.is_current(&input));
+        for version in 0..5 {
+            match version {0=>input.epoch+=1,1=>input.map_version+=1,2=>input.pose_version+=1,
+                3=>input.applied_version+=1,_=>input.boundary_version+=1};
+            assert!(!publication.is_current(&input));
+            input=Inputs::default();
+        }
+        input.closed=true;
+        assert!(!publication.is_current(&input));
+        assert!(!same_applied(Twist2::ZERO,Twist2 {
+            linear:nuwax_nav_types_messages::Point2::new(-0.0,0.0),angular_z:0.0,
+        }));
+    }
 
     #[test]
     fn selective_worker_coalesces_undelivered_related_and_far_columns() {

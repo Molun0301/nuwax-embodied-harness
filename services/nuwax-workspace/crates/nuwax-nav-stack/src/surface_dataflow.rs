@@ -6,6 +6,9 @@ mod recent_source;
 pub(super) use recent_source::RecentSourceState;
 
 use nuwax_nav_mls_planner::SurfaceSnapshot;
+use nuwax_nav_runtime::replan_feedback::{
+    ActualExecutionContext, SurfaceReplanFeedback, SurfaceReplanInput, SuccessfulReplanMemo, same_pose, same_penalties,
+};
 use crate::surface_map::{SurfaceMapCache as SurfaceGeometryCache, SurfaceGeometryChanges, SurfaceMapBuildError, SurfaceMapRetryDependency};
 #[path = "surface_reference_scope.rs"]
 mod reference_scope;
@@ -39,8 +42,11 @@ struct SurfaceMapHub {
     latest: Arc<Mutex<Option<PreparedSurfaceMap>>>,
     events: tokio::sync::broadcast::Sender<PreparedSurfaceMap>,
     planning: tokio::sync::watch::Sender<Option<(String,GoalKey,String)>>,
+    // Same in-process scheduler owner; no new wire fields or inferred ground.
+    execution_feedback: tokio::sync::watch::Sender<Option<SurfaceReplanFeedback>>,
     #[cfg(test)] reference_checks: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)] map_computer: Option<SurfaceMapComputer>,
+    #[cfg(test)] fast_replan_probe: Option<Arc<tests::fast_pct_confluence_tests::Probe>>,
     #[cfg(test)] reader_guard: Arc<tests::nav_reader_guards::ReaderGuardProbe>,
 }
 
@@ -53,8 +59,10 @@ impl SurfaceMapHub {
             latest: Arc::new(Mutex::new(None)),
             events: tokio::sync::broadcast::channel(32).0,
             planning: tokio::sync::watch::channel(None).0,
+            execution_feedback: tokio::sync::watch::channel(None).0,
             #[cfg(test)] reference_checks: Default::default(),
             #[cfg(test)] map_computer: None,
+            #[cfg(test)] fast_replan_probe: None,
             #[cfg(test)] reader_guard: Default::default(),
         }
     }
@@ -211,6 +219,18 @@ where
         .await
         .map_err(|error| module_error("surface scheduler connect", error))?;
     let status = scheduler.subscribe_status();
+    let mut feedback_status = status.clone();
+    // A restarted owner cannot inherit the old owner's sticky refusal.
+    hub.execution_feedback.send_replace(None);
+    let feedback_loop = async {
+        loop {
+            let update = feedback_status.borrow_and_update().surface_replan_feedback.clone();
+            let changed={let current=hub.execution_feedback.borrow(); *current!=update};
+            if changed {hub.execution_feedback.send_replace(update);}
+            feedback_status.changed().await.map_err(|error|module_error("execution feedback",error))?;
+        }
+        #[allow(unreachable_code)] Ok::<(),NavStackError>(())
+    };
     let mut planning=hub.planning.subscribe();
     let diagnostic_loop=async {
         loop {
@@ -243,19 +263,22 @@ where
     let loop_future=async {tokio::select! {
         result=execution_loop=>result,
         result=diagnostic_loop=>result,
+        result=feedback_loop=>result,
     }};
     let task_future = async move {
         task.await
             .map_err(|error| module_error("surface scheduler join", error))?
             .map_err(|error| module_error("surface scheduler task", error))
     };
-    coordinate_guarded_scheduler(loop_future, task_future, || async {
+    let outcome = coordinate_guarded_scheduler(loop_future, task_future, || async {
         scheduler
             .shutdown()
             .await
             .map_err(|error| module_error("surface scheduler shutdown", error))
     })
-    .await
+    .await;
+    hub.execution_feedback.send_replace(None);
+    outcome
 }
 
 /// 同一Geometry进程与点云修订不可变，进程代次由现有持久分配器排序。
@@ -528,6 +551,10 @@ fn body_path_with_budget(
     surface: &SurfaceSnapshot, start: &PoseStamped, goal: &schema::GoalEnvelope,
     config: &SurfaceNavigationConfig, search_budget: usize,
 ) -> NavStackResult<Path3D> {
+    // The owner captures once for both the memo and this exact computation.
+    // Existing direct callers keep the old capture-at-entry behavior.
+    let penalties = config.planning_penalties.clone()
+        .unwrap_or_else(|| Arc::new(config.follower.pct.local_costs()));
     let start_quat = [
         start.pose.orientation.x,
         start.pose.orientation.y,
@@ -544,10 +571,10 @@ fn body_path_with_budget(
         let target = (goal.goal.pose.position,goal.goal.pose.orientation_xyzw);
         let limits = nuwax_nav_pct::SearchLimits { max_states: search_budget };
         if surface.body_envelope().is_some() {
-            config.follower.pct.body_route_with_limits_typed(surface,start,target,goal.options,&boundary,None,limits)
+            config.follower.pct.body_route_with_limits_and_penalties_typed(surface,start,target,goal.options,&boundary,None,limits,&penalties)
         } else {
-            config.follower.pct.reference_body_route_with_offset_typed(surface,start,target,goal.options,
-                &boundary,None,limits,config.follower.body_to_support_z_m)
+            config.follower.pct.reference_body_route_with_offset_and_penalties_typed(surface,start,target,goal.options,
+                &boundary,None,limits,config.follower.body_to_support_z_m,&penalties)
         }
     };
     // Zero remains direct-only; BudgetExhausted stays inconclusive in both modes.
@@ -561,6 +588,46 @@ fn body_path_with_budget(
         pose:Pose3 {position:Point3::new(p[0],p[1],p[2]),
             orientation:Quaternion{x:q[0],y:q[1],z:q[2],w:q[3]}},
     }).collect() })
+}
+
+// Capture only existing request values. Goal/owner retirement is performed by
+// the same loop that already owns `goal`; path revision is only correlation.
+fn surface_replan_input(
+    surface: &Arc<SurfaceSnapshot>, start: &PoseStamped, goal: &schema::GoalEnvelope,
+    config: &SurfaceNavigationConfig, budget: usize,
+    penalties: Arc<Vec<nuwax_nav_pct::RoutePenalty>>, feedback: Option<&SurfaceReplanFeedback>,
+) -> NavStackResult<SurfaceReplanInput> {
+    let matching = feedback.filter(|feedback| feedback.path_identity
+        .has_same_goal_identity(&guarded_goal_execution_identity(goal)));
+    Ok(SurfaceReplanInput {
+        source: Arc::clone(surface), start:start.clone(), goal:pose_from_schema(&goal.goal)?,
+        options:goal.options,
+        boundary:Arc::new(goal.boundary_points.iter().map(|p|[p[0],p[1]]).collect()),
+        actual:matching.and_then(|feedback|feedback.current_context.clone()),
+        limits:nuwax_nav_pct::SearchLimits { max_states:budget },
+        offset:surface.body_envelope().map_or(config.follower.body_to_support_z_m,|body|body.body_to_support_z_m),
+        local_planning_enabled:config.follower.local_planning_enabled,
+        penalties,
+    })
+}
+
+// Keep the actual refusing observation attached to its original path key.
+// The shared memo, not either adapter, compares it with the current input.
+fn surface_replan_rejection<'a>(
+    feedback: Option<&'a SurfaceReplanFeedback>, goal: &schema::GoalEnvelope,
+) -> Option<(&'a nuwax_nav_runtime::PathExecutionIdentity, &'a ActualExecutionContext)> {
+    feedback.filter(|feedback| feedback.zero_confirmed_rejection
+        && feedback.path_identity.has_same_goal_identity(&guarded_goal_execution_identity(goal)))
+        .and_then(|feedback| feedback.rejected_context.as_deref()
+            .map(|rejected| (feedback.path_identity.as_ref(), rejected)))
+}
+
+fn published_surface_identity(goal: &schema::GoalEnvelope, generation: i64, revision: i64)
+    -> nuwax_nav_runtime::PathExecutionIdentity {
+    let mut identity=guarded_goal_execution_identity(goal);
+    identity.planner_runtime_generation=generation;
+    identity.path_revision=revision as u64;
+    identity
 }
 
 async fn publish_surface_path(
@@ -761,6 +828,12 @@ async fn run_surface_planner_with_computer(
         typed_stream(&transport, &node.inputs[3], "nuwax_msgs.CancelNavigation").await?;
     let mut states =
         typed_stream(&transport, &node.inputs[4], "nuwax_msgs.NavigationState").await?;
+    let mut feedback_events = hub.execution_feedback.subscribe();
+    let mut execution_feedback = feedback_events.borrow_and_update().clone();
+    let mut successful = SuccessfulReplanMemo::default();
+    let mut held_same_input = false;
+    let mut replan_input_dirty = true;
+    let mut held_penalties: Option<Arc<Vec<nuwax_nav_pct::RoutePenalty>>> = None;
     let mut order = SurfaceMapOrder::default();
     let cache = Arc::new(std::sync::Mutex::new(SurfaceGeometryCache::configured(&config)));
     let mut computations = tokio::task::JoinSet::new();
@@ -842,6 +915,7 @@ async fn run_surface_planner_with_computer(
                 };
                 if goal.as_ref().is_some_and(|active| validate_cancel_goal_correlation(&cancel, active).is_ok()) {
                     retire_goal(&mut goal, &mut retired_goals);
+                    successful.clear(); held_same_input=false; replan_input_dirty=true;
                     last_path = None; failed_input = None; needs_plan = false; execution_admitted = false;
                 }
             }
@@ -855,12 +929,27 @@ async fn run_surface_planner_with_computer(
                 let zero_proven = !state.zero_ack_id.is_empty() && state.zero_applied_monotonic_ns > 0;
                 if state.state == 4 || (matches!(state.state, 0 | 3) && zero_proven) {
                     retire_goal(&mut goal, &mut retired_goals);
+                    successful.clear(); held_same_input=false; replan_input_dirty=true;
                     last_path = None; failed_input = None; needs_plan = false; execution_admitted = false;
                 } else if matches!(state.state, 1 | 2) && state.sink_ready != 0 {
                     execution_admitted = true;
                     // 等待旧版路径的迟到帧不能废弃刚交付的新路线。
                     if state.state == 1 && (last_path.is_none()
                         || state.path_revision == path_revision && path_revision > 0) { needs_plan = true; }
+                }
+            }
+            changed = feedback_events.changed() => {
+                changed.map_err(|error| module_error("surface actual feedback",error))?;
+                let update=feedback_events.borrow_and_update().clone();
+                if update != execution_feedback { replan_input_dirty=true; }
+                execution_feedback=update;
+                if let (Some(active),Some(feedback))=(&goal,&execution_feedback) {
+                    if feedback.zero_confirmed_rejection
+                        && feedback.path_identity.has_same_goal_identity(&guarded_goal_execution_identity(active))
+                        && feedback.path_identity.planner_runtime_generation==generation
+                        && feedback.path_identity.path_revision==path_revision as u64 {
+                        needs_plan=true;
+                    }
                 }
             }
             computed = computations.join_next(), if !computations.is_empty() => {
@@ -928,13 +1017,14 @@ async fn run_surface_planner_with_computer(
                 }
                 complete_map_source = update.snapshot.is_ok().then_some(message);
                 latest_map = Some(update);
+                replan_input_dirty=true;
                 needs_plan = goal.is_some() && (needs_plan || last_path.is_none());
             }
             computed = path_computations.join_next(), if !path_computations.is_empty() => {
                 let ticket = path_cancellation.take();
                 let cancelled = ticket.as_ref().is_some_and(|ticket|
                     ticket.cancelled.load(std::sync::atomic::Ordering::Relaxed));
-                let (epoch, planned_goal, surface, start, attempted_budget, result): (u64, schema::GoalEnvelope, Arc<SurfaceSnapshot>, Pose3, usize, NavStackResult<Path3D>) =
+                let (epoch, planned_goal, surface, start, attempted_budget, input, result): (u64, schema::GoalEnvelope, Arc<SurfaceSnapshot>, Pose3, usize, SurfaceReplanInput, NavStackResult<Path3D>) =
                     computed.expect("已有路径任务").map_err(|error| module_error("surface planning join",error))?;
                 // 计算期间继续处理地图、位姿及取消；退休目标不能被迟到路径复活。
                 if cancelled || epoch != map_epoch || !execution_admitted
@@ -948,6 +1038,8 @@ async fn run_surface_planner_with_computer(
                     Ok(path) => {
                         path_revision = path_revision.checked_add(1).ok_or_else(|| NavStackError::Internal("surface path revision exhausted".into()))?;
                         publish_surface_path(&transport, &node.outputs[0], &planned_goal, generation, path_revision, &path).await?;
+                        successful.published(published_surface_identity(&planned_goal,generation,path_revision),input);
+                        held_same_input=false; replan_input_dirty=true;
                         last_path = Some(path); needs_plan = false; failed_input = None;
                     }
                     Err(error) => {
@@ -973,7 +1065,7 @@ async fn run_surface_planner_with_computer(
                 let ticket = quick_cancellation.take();
                 let cancelled = ticket.as_ref().is_some_and(|ticket|
                     ticket.cancelled.load(std::sync::atomic::Ordering::Relaxed));
-                let (epoch, planned_goal, surface, result): (u64, schema::GoalEnvelope, Arc<SurfaceSnapshot>, NavStackResult<Path3D>) =
+                let (epoch, planned_goal, surface, input, result): (u64, schema::GoalEnvelope, Arc<SurfaceSnapshot>, SurfaceReplanInput, NavStackResult<Path3D>) =
                     computed.expect("已有快速路径检查").map_err(|error|module_error("quick surface planning",error))?;
                 if cancelled || epoch != map_epoch || !execution_admitted
                     || goal.as_ref().is_none_or(|active|active.goal_key()!=planned_goal.goal_key())
@@ -988,6 +1080,8 @@ async fn run_surface_planner_with_computer(
                     if let Some(ticket)=&path_cancellation {ticket.cancelled.store(true,std::sync::atomic::Ordering::Relaxed);}
                     path_revision=path_revision.checked_add(1).ok_or_else(||module_error("surface revision","overflow"))?;
                     publish_surface_path(&transport,&node.outputs[0],&planned_goal,generation,path_revision,&path).await?;
+                    successful.published(published_surface_identity(&planned_goal,generation,path_revision),input);
+                    held_same_input=false; replan_input_dirty=true;
                     last_path=Some(path);needs_plan=false;failed_input=None;
                 }
             }
@@ -1021,6 +1115,7 @@ async fn run_surface_planner_with_computer(
                             received_at, awaiting_build: false, snapshot:Err(reason.into()),
                             planar_reference: None, change_basis: None, geometry_changes: Arc::new(SurfaceGeometryChanges::Unknown) };
                         retire_goal(&mut goal, &mut retired_goals);
+                        successful.clear(); held_same_input=false; replan_input_dirty=true;
                         pose = None; last_path = None; failed_input = None; needs_plan = false; execution_admitted = false;
                         hub.publish(update.clone()); latest_map = Some(update);
                         diagnostics.reject("surface map integrity",reason);continue;
@@ -1031,6 +1126,7 @@ async fn run_surface_planner_with_computer(
                 let changed_domain = accepted_domain.as_ref().is_some_and(|old| !old.same_domain(&authority));
                 accepted_domain = Some(authority.clone());
                 if changed_domain || message.cleared {
+                    successful.clear(); held_same_input=false; replan_input_dirty=true;
                     map_retry_after = Instant::now();
                     map_retry_dependency = None;
                     complete_map_source = None;
@@ -1070,6 +1166,7 @@ async fn run_surface_planner_with_computer(
                 if newest_goal.as_ref().is_some_and(|current| validate_goal_envelope_order(&incoming, current).is_err()) { continue; }
                 if let Err(error) = navigation_boundary_from_goal(&incoming) { diagnostics.reject("surface goal boundary",&error.to_string());continue; }
                 config.follower.pct.clear_local_costs();
+                successful.clear(); held_same_input=false; replan_input_dirty=true;
                 newest_goal = Some(incoming.clone()); goal = Some(incoming);
                 path_revision = 0; last_path = None; needs_plan = true; execution_admitted = false;
                 retry_after = Instant::now(); checked_surface = None; failed_input = None;
@@ -1078,6 +1175,7 @@ async fn run_surface_planner_with_computer(
                 let Some(input)=drain_guarded_pose_input(frame,&mut poses,&mut diagnostics,None)? else {continue;};
                 let incoming=input.pose;
                 if pose.as_ref().is_none_or(|previous| incoming.stamp.nanos>previous.stamp.nanos) {
+                    if pose.as_ref().is_none_or(|old|!same_pose(old,&incoming)) {replan_input_dirty=true;}
                     pose=Some(incoming);
                 }
             }
@@ -1086,6 +1184,17 @@ async fn run_surface_planner_with_computer(
                 let (Some(map), Some(pose), Some(active_goal)) = (latest_map.as_ref(), pose.as_ref(), goal.as_ref()) else { continue; };
                 if !execution_admitted || !map.authority.permits_goal(active_goal) { continue; }
                 let Ok(surface) = map.snapshot.as_ref() else { continue; };
+                // No new timer/epoch. Costs currently have no change stream, so
+                // this original tick observes their small exact snapshot only.
+                // Pose/map/actual feedback events mark the rest of the input dirty.
+                let penalties=Arc::new(config.follower.pct.local_costs());
+                if held_same_input && !replan_input_dirty
+                    && held_penalties.as_ref().is_some_and(|old|same_penalties(old,&penalties)) {
+                    #[cfg(test)] if let Some(probe)=&hub.fast_replan_probe {
+                        probe.record(tests::fast_pct_confluence_tests::Event::Held);
+                    }
+                    continue;
+                }
                 if !path_computations.is_empty() {
                     let unchanged=checked_surface.as_ref().and_then(std::sync::Weak::upgrade)
                         .is_some_and(|previous|previous.same_geometry(surface)
@@ -1096,6 +1205,14 @@ async fn run_surface_planner_with_computer(
                     let epoch=map_epoch;let mut quick_config=config.clone();
                     let flag=Arc::new(std::sync::atomic::AtomicBool::new(false));
                     quick_config.planning_cancelled=Some(Arc::clone(&flag));
+                    quick_config.planning_penalties=Some(Arc::clone(&penalties));
+                    let input=surface_replan_input(&surface,&pose,&planned_goal,&quick_config,0,Arc::clone(&penalties),
+                        execution_feedback.as_ref())?;
+                    let rejected=surface_replan_rejection(execution_feedback.as_ref(),&planned_goal);
+                    if successful.should_reuse(rejected,&input) {
+                        held_same_input=true; replan_input_dirty=false; held_penalties=Some(penalties);
+                        continue;
+                    }
                     quick_cancellation=Some(SurfaceJobTicket::new(epoch,planned_goal.goal_key(),flag,&surface,&config));
                     #[cfg(test)] let quick_computer=quick_computer.clone();
                     quick_checks.spawn_blocking(move || {
@@ -1107,7 +1224,7 @@ async fn run_surface_planner_with_computer(
                         if result.is_ok() {tracing::info!(goal_id=%planned_goal.session_id,mode="latest_map_quick",
                             elapsed_ms=started.elapsed().as_secs_f64()*1000.0,
                             points=result.as_ref().ok().map(|path|path.poses.len()),"三维路径计算完成");}
-                        (epoch,planned_goal,surface,result)
+                        (epoch,planned_goal,surface,input,result)
                     });
                     continue;
                 }
@@ -1119,6 +1236,22 @@ async fn run_surface_planner_with_computer(
                     },
                     None => planning_budget::initial_budget(&config),
                 };
+                let input=surface_replan_input(surface,pose,active_goal,&config,search_budget,
+                    Arc::clone(&penalties),execution_feedback.as_ref())?;
+                let rejected=surface_replan_rejection(execution_feedback.as_ref(),active_goal);
+                if successful.should_reuse(rejected,&input) {
+                    #[cfg(test)] if let Some(probe)=&hub.fast_replan_probe {
+                        probe.record(tests::fast_pct_confluence_tests::Event::Reuse {complete:input.actual.is_some()});
+                    }
+                    held_same_input=true; replan_input_dirty=false; held_penalties=Some(penalties);
+                    // Remain in the original AwaitingPath. No route publication,
+                    // no search error, no new deadline, no motion-side decision.
+                    continue;
+                }
+                held_same_input=false; replan_input_dirty=false; held_penalties=None;
+                #[cfg(test)] if let Some(probe)=&hub.fast_replan_probe {
+                    probe.record(tests::fast_pct_confluence_tests::Event::Dispatch {complete:input.actual.is_some()});
+                }
                 // 同一几何不并行重复快速搜索；新几何才允许一次完整直连抢先接续。
                 checked_surface = Some(Arc::downgrade(surface));
                 let surface = Arc::clone(surface);
@@ -1129,6 +1262,7 @@ async fn run_surface_planner_with_computer(
                 let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 config.planning_cancelled = Some(Arc::clone(&cancelled));
                 config.planning_search_budget = Some(search_budget);
+                config.planning_penalties = Some(penalties);
                 path_cancellation = Some(SurfaceJobTicket::new(epoch, planned_goal.goal_key(), cancelled, &surface, &config));
                 let computer = Arc::clone(&computer);
                 // A retry is still inconclusive while it runs. Preserve the
@@ -1148,7 +1282,7 @@ async fn run_surface_planner_with_computer(
                     let _entered=span.enter();
                     let result = computer(&surface,&pose,&planned_goal,&config);
                     tracing::info!(goal_id=%planned_goal.session_id, queue_ms=started.duration_since(queued).as_secs_f64()*1000.0, elapsed_ms=started.elapsed().as_secs_f64()*1000.0, points=result.as_ref().ok().map(|p|p.poses.len()), error=?result.as_ref().err(), "三维路径计算完成");
-                    (epoch, planned_goal, surface, pose.pose, search_budget, result)
+                    (epoch, planned_goal, surface, pose.pose, search_budget, input, result)
                 });
             }
         }
@@ -1178,6 +1312,8 @@ async fn run_surface_planner_with_computer(
 
 #[cfg(test)]
 mod tests {
+    pub(super) mod fast_pct_confluence_tests { include!("surface_fast_pct_confluence_tests.rs"); }
+    mod replan_feedback_tests { include!("surface_replan_feedback_tests.rs"); }
     #[cfg(feature = "surface-recovery-qualification")]
     mod support_recovery_qualification {
         include!("surface_support_recovery_qualification.rs");
@@ -2428,6 +2564,14 @@ mod tests {
         async fn start_with_components(computer:SurfacePathComputer,feed_period:Duration,
             configured:SurfaceNavigationConfig,memq:bool,quick_computer:Option<SurfacePathComputer>,
             map_computer:Option<SurfaceMapComputer>,scheduler_config:nuwax_nav_runtime::SchedulerConfig)->Self {
+            Self::start_with_components_and_feedback_probe(computer,feed_period,configured,memq,
+                quick_computer,map_computer,scheduler_config,None).await
+        }
+
+        async fn start_with_components_and_feedback_probe(computer:SurfacePathComputer,feed_period:Duration,
+            configured:SurfaceNavigationConfig,memq:bool,quick_computer:Option<SurfacePathComputer>,
+            map_computer:Option<SurfaceMapComputer>,scheduler_config:nuwax_nav_runtime::SchedulerConfig,
+            feedback_probe:Option<Arc<fast_pct_confluence_tests::Probe>>)->Self {
             use crate::topics::{NavTopicConfig, TopicName};
             let (url,prefix) = if memq {
                 ("memq://".to_string(), "/sf-soft-refresh".to_string())
@@ -2473,6 +2617,7 @@ mod tests {
             .unwrap();
             let mut hub = SurfaceMapHub::new(Arc::from("base_link"));
             hub.map_computer = map_computer;
+            hub.fast_replan_probe = feedback_probe.clone();
             let planner_transport = if memq {transport.clone()} else {LcmTransport::new_real(&url).unwrap()};
             let planner_hub = hub.clone();
             let planner_spec = planner_node.clone();
@@ -2513,13 +2658,22 @@ mod tests {
                         configured.follower.body_to_support_z_m,
                         configured.follower.max_observation_age_sec.map(Duration::from_secs_f64),
                         async move {
-                            let local = nuwax_nav_runtime::RouteFollower::new(configured.follower)?;
-                            let scheduler = nuwax_nav_runtime::NavScheduler::new(
-                                RecordingMotion(motion_calls),
-                                local,
-                                scheduler_config,
-                            )?;
-                            let pair = nuwax_nav_runtime::spawn_scheduler(scheduler);
+                            let pair = if let Some(probe) = feedback_probe {
+                                #[cfg(feature="surface-recovery-qualification")]
+                                {
+                                    let backend = nuwax_nav_runtime::qualification_surface_backend(configured.follower)?;
+                                    let local = fast_pct_confluence_tests::RefuseRealCommand {inner:backend,probe:probe.clone()};
+                                    let motion = fast_pct_confluence_tests::GateMotion {inner:RecordingMotion(motion_calls),probe};
+                                    nuwax_nav_runtime::spawn_scheduler(nuwax_nav_runtime::NavScheduler::new(
+                                        motion,local,scheduler_config)?)
+                                }
+                                #[cfg(not(feature="surface-recovery-qualification"))]
+                                { let _=probe; unreachable!("fast confluence requires the existing qualification worker feature") }
+                            } else {
+                                let local = nuwax_nav_runtime::RouteFollower::new(configured.follower)?;
+                                nuwax_nav_runtime::spawn_scheduler(nuwax_nav_runtime::NavScheduler::new(
+                                    RecordingMotion(motion_calls),local,scheduler_config)?)
+                            };
                             sender.send(pair.0.clone()).unwrap();
                             Ok(pair)
                         },

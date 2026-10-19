@@ -33,6 +33,9 @@ pub use command_dispatch::CommandDispatchBound;
 /// Explicit elapsed-time observer seam for bounded recovery qualifications.
 #[cfg(feature = "surface-recovery-qualification")]
 pub mod qualification_timing;
+/// Typed actual execution feedback for deduplicating identical rejected work.
+pub mod replan_feedback;
+use replan_feedback::{ActualExecutionContext, SurfaceReplanFeedback};
 mod planner_worker;
 pub mod surface_follower;
 pub use nuwax_nav_mls_planner::SurfaceSnapshot;
@@ -210,7 +213,8 @@ impl PathExecutionIdentity {
         GoalKey { producer_runtime_generation: self.producer_runtime_generation as u64, goal_generation: self.goal_generation as u64 }
     }
 
-    fn has_same_goal_identity(&self, other: &Self) -> bool {
+    /// Match the complete sealed goal scope while excluding planner output identity.
+    pub fn has_same_goal_identity(&self, other: &Self) -> bool {
         self.session_id == other.session_id
             && self.owner_kind == other.owner_kind
             && self.parent_request_id == other.parent_request_id
@@ -338,6 +342,8 @@ pub struct SchedulerStatus {
     pub message: String,
     /// 当前目标的局部规划轨迹，仅用于显示。
     pub local_path: Vec<[f64; 3]>,
+    /// In-process execution evidence; never grants motion or extends a wait.
+    pub surface_replan_feedback: Option<SurfaceReplanFeedback>,
 }
 
 impl Default for SchedulerStatus {
@@ -360,6 +366,7 @@ impl Default for SchedulerStatus {
             last_fence_monotonic_ns: 0,
             message: "idle".into(),
             local_path: Vec::new(),
+            surface_replan_feedback: None,
         }
     }
 }
@@ -847,6 +854,7 @@ struct LocalExecutionCommandIntent {
     owner_runtime_generation: u64,
     payload: LocalExecutionPayload,
     dispatch_bound: Option<CommandDispatchBound>,
+    execution_context: Option<Arc<ActualExecutionContext>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -860,6 +868,17 @@ enum LocalExecutionPayload {
 
 /// Synchronous deterministic planner boundary.
 pub trait NavPlanner: Send + 'static {
+    /// Refresh only actual source/pose/carried-ground observations. This must
+    /// neither step a controller nor validate a predicted motion or issue a command.
+    /// `applied` is the caller's consumed actuator feedback, never a candidate.
+    /// Participating backends preserve actual source/pose/carried ground across
+    /// `stop`; clearing control state alone does not change this observation.
+    fn refresh_execution_context(&mut self, _applied: Twist2) -> Option<Arc<ActualExecutionContext>> { None }
+    /// Context bound to the immediately returned step. Asynchronous adapters
+    /// override this with their delivered result slot, never a newer input slot.
+    fn take_step_execution_context(&mut self, applied: Twist2) -> Option<Arc<ActualExecutionContext>> {
+        self.refresh_execution_context(applied)
+    }
     /// Take observation timing metadata belonging only to the immediately returned command.
     /// None means that this result has no finite observation-time dependency.
     fn take_command_dispatch_bound(&mut self)->Option<CommandDispatchBound> {None}
@@ -1672,6 +1691,7 @@ where
             last_fence_monotonic_ns: 0,
             message: "acquiring NAV lease".into(),
             local_path: Vec::new(),
+            surface_replan_feedback: None,
         };
         self.publish_status(status_tx);
 
@@ -1802,6 +1822,7 @@ where
 
         self.current_path = Some((planner_path, path_yaws));
         self.current_execution_identity = Some(Arc::new(execution_identity));
+        self.status.surface_replan_feedback = None;
         // 等待预算在真正执行有效控制步骤后清除，不能靠反复投递无效新路径续期。
         self.status.phase = SchedulerPhase::Controlling;
         self.status.path_revision = self.current_path_revision;
@@ -1826,6 +1847,7 @@ where
             )));
         }
         self.status.phase = SchedulerPhase::Cancelling;
+        self.status.surface_replan_feedback = None;
         self.status.message = "cancel accepted; waiting for guard fence".into();
         self.publish_status(status_tx);
         self.finish_terminal(status_tx, TerminalOutcome::Cancelled, SchedulerPhase::Idle)
@@ -1877,6 +1899,14 @@ where
             self.publish_status(status_tx);
             return Ok(());
         }
+        // This evidence belongs to the exact delivered step and accepted path.
+        // It is not reconstructed from the scheduler's latest map/pose inputs.
+        self.status.surface_replan_feedback = Some(SurfaceReplanFeedback {
+            path_identity: Arc::clone(&intent.identity),
+            rejected_context: None,
+            current_context: intent.execution_context.clone(),
+            zero_confirmed_rejection: false,
+        });
         match intent.payload {
             LocalExecutionPayload::Command(twist) => {
                 let wait_reason = self.planner.execution_wait_reason();
@@ -1911,9 +1941,23 @@ where
             }
             LocalExecutionPayload::ReplanRequired(reason) => {
                 self.apply_controller_twist(status_tx, Twist2::ZERO).await?;
+                // A same-valued ZERO receipt leaves the worker's exact actual
+                // input versions current. Preserve that snapshot before stop
+                // retires control epoch; stop does not change source/pose/ground.
+                // A changed speed/input still yields None and normal planning.
+                let stopped_context=self.planner.refresh_execution_context(Twist2::ZERO);
                 self.planner.stop();
                 self.path_wait_started_at.get_or_insert_with(Instant::now);
                 self.status.phase = SchedulerPhase::AwaitingPath;
+                // Never relabel the rejection's pre-braking context as stopped.
+                // `stopped_context` exists only if ZERO was already consumed
+                // with these exact actual source/pose/applied/boundary versions.
+                self.status.surface_replan_feedback = Some(SurfaceReplanFeedback {
+                    path_identity: Arc::clone(&intent.identity),
+                    rejected_context: intent.execution_context,
+                    current_context: stopped_context,
+                    zero_confirmed_rejection: true,
+                });
                 self.status.message = format!("路径失效，零速已执行，等待更新路径: {reason}");
                 self.publish_status(status_tx);
                 Ok(())
@@ -2014,6 +2058,13 @@ where
             self.status.applied_commands=self.status.applied_commands.saturating_add(1);
             self.status.last_applied_twist=Some(applied_twist);
             self.planner.observe_applied_command(applied_twist);
+            if let Some(feedback)=&mut self.status.surface_replan_feedback {
+                if feedback.current_context.as_ref().is_some_and(|context|
+                    [context.applied.linear.x,context.applied.linear.y,context.applied.angular_z].map(f64::to_bits)
+                        != [applied_twist.linear.x,applied_twist.linear.y,applied_twist.angular_z].map(f64::to_bits)) {
+                    feedback.current_context=None;
+                }
+            }
             self.status.message=if expired {"执行来源凭据在下发前已过期，零速已执行，等待重新计算".into()}else{"twist APPLIED".into()};
             self.publish_status(status_tx);
             return Ok(!expired);
@@ -2040,6 +2091,9 @@ where
                     "local planner produced an intent without an active session".into(),
                 )
             })?;
+        // An internal planner initialization ZERO is not an APPLIED receipt.
+        let execution_context=self.status.last_applied_twist
+            .and_then(|applied|self.planner.take_step_execution_context(applied));
         let candidate_bound=self.planner.take_command_dispatch_bound();
         let dispatch_bound=if matches!(&step,PlannerStep::Command(v) if *v!=Twist2::ZERO) {candidate_bound}else{None};
         let payload = match step {
@@ -2055,6 +2109,7 @@ where
             owner_runtime_generation,
             payload,
             dispatch_bound,
+            execution_context,
         })
     }
 
@@ -2102,7 +2157,25 @@ where
                 return Ok(());
             }
         }
-        self.check_path_wait_timeout(status_tx).await
+        self.check_path_wait_timeout(status_tx).await?;
+        if self.status.phase == SchedulerPhase::AwaitingPath {
+            // Preserve the original stale/deadline checks and their ordering.
+            // Worker getter is a short snapshot read, never a controller step.
+            let context=self.status.last_applied_twist
+                .and_then(|applied|self.planner.refresh_execution_context(applied));
+            let mut changed=false;
+            if let Some(feedback)=&mut self.status.surface_replan_feedback {
+                if feedback.zero_confirmed_rejection
+                    && self.current_execution_identity.as_ref().is_some_and(|identity|
+                        identity.as_ref()==feedback.path_identity.as_ref())
+                    && feedback.current_context != context {
+                    feedback.current_context=context;
+                    changed=true;
+                }
+            }
+            if changed {self.publish_status(status_tx);}
+        }
+        Ok(())
     }
 
     async fn check_path_wait_timeout(
@@ -2205,6 +2278,7 @@ where
         // 上层可能只消费首次终态；先保留真实原因，不能等围栏完成后再补发。
         let failure_reason = matches!(terminal, TerminalOutcome::PlannerFailed | TerminalOutcome::SafetyFailed)
             .then(|| self.status.message.clone());
+        self.status.surface_replan_feedback = None;
         let arrived_identity = self.current_execution_identity.take();
         self.local_intent_sequence = 0;
         {
@@ -2330,6 +2404,7 @@ where
     }
 
     fn fail_status(&mut self, status_tx: &watch::Sender<SchedulerStatus>, reason: &str) {
+        self.status.surface_replan_feedback = None;
         self.status.phase = SchedulerPhase::Failed;
         self.status.motion_sink_ready = false;
         self.status.last_terminal = None;
@@ -4335,6 +4410,11 @@ mod tests {
         assert_eq!(held.last_applied_twist, Some(Twist2::ZERO));
         assert!(held.applied_commands > 0);
         assert_eq!(held.last_terminal, None);
+        let feedback=held.surface_replan_feedback.as_ref().expect("typed rejection after ZERO");
+        assert!(feedback.zero_confirmed_rejection);
+        assert_eq!(feedback.path_identity.as_ref(),&path().execution_identity);
+        // Unsupported backends preserve the refusal but provide no reuse proof.
+        assert!(feedback.rejected_context.is_none() && feedback.current_context.is_none());
         assert!(matches!(
             handle.submit_path(path()).await,
             Err(RuntimeError::PathRejected { .. })
@@ -4352,9 +4432,13 @@ mod tests {
         })
         .await
         .expect("更高路径修订恢复执行");
+        assert!(handle.status().surface_replan_feedback.as_ref()
+            .is_none_or(|feedback|!feedback.zero_confirmed_rejection));
         planner_state.lock().unwrap().step = PlannerStep::ReplanRequired("再次阻断".into());
         wait_for_phase(&handle, SchedulerPhase::AwaitingPath).await;
+        assert_eq!(handle.status().surface_replan_feedback.as_ref().unwrap().path_identity.path_revision,2);
         handle.cancel("goal-1").await.unwrap();
+        assert!(handle.status().surface_replan_feedback.is_none());
         assert_eq!(
             handle.status().last_terminal,
             Some(TerminalOutcome::Cancelled)
@@ -4362,6 +4446,24 @@ mod tests {
         assert!(handle.status().last_zero_ack_id.is_some());
         handle.shutdown().await.unwrap();
         task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_zero_receipt_never_publishes_execution_rejection_feedback() {
+        let motion=FakeMotion(Arc::new(Mutex::new(FakeMotionState {fail_twist:true,..Default::default()})));
+        let planner=FakePlanner::commanding();
+        planner.state.lock().unwrap().step=PlannerStep::ReplanRequired("refused".into());
+        let mut scheduler=NavScheduler::new(motion,planner,SchedulerConfig::default()).unwrap();
+        let (status,_)=watch::channel(scheduler.status.clone());
+        scheduler.planner.update_odometry(map_pose());
+        scheduler.planner.update_execution_map(costmap_at(1).costmap).unwrap();
+        scheduler.pose_receipt=Some(PlannerInputReceipt {source_timestamp_ns:1,received_at:Instant::now()});
+        scheduler.costmap_receipt=Some(PlannerInputReceipt {source_timestamp_ns:1,received_at:Instant::now()});
+        scheduler.start_session(&status,session()).await.unwrap();
+        scheduler.submit_path(&status,path()).await.unwrap();
+        assert!(scheduler.control_tick(&status).await.is_err());
+        assert_eq!(scheduler.status.phase,SchedulerPhase::Failed);
+        assert!(scheduler.status.surface_replan_feedback.is_none());
     }
 
     async fn wait_for_phase(handle: &NavSchedulerHandle, expected: SchedulerPhase) {

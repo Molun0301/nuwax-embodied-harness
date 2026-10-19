@@ -223,7 +223,7 @@ fn scan_context(scan: &ScanConfig) -> ([u64;2], [usize;2]) {
     ([scan.horizon_m.to_bits(), scan.reference_corridor_m.to_bits()],
         [scan.optimization_iterations, scan.search_expansion_limit])
 }
-fn exact_costs(a: &[nuwax_nav_pct::RoutePenalty], b: &[nuwax_nav_pct::RoutePenalty]) -> bool {
+pub(crate) fn exact_costs(a: &[nuwax_nav_pct::RoutePenalty], b: &[nuwax_nav_pct::RoutePenalty]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(a,b)|
         a.center.map(f64::to_bits) == b.center.map(f64::to_bits)
         && a.radius.to_bits() == b.radius.to_bits() && a.weight.to_bits() == b.weight.to_bits())

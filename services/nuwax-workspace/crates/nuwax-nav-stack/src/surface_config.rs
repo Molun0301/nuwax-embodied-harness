@@ -21,6 +21,8 @@ pub struct SurfaceNavigationConfig {
     pub(crate) planning_cancelled: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Owner-local work budget for this attempt; never part of calibration/map identity.
     pub(crate) planning_search_budget: Option<usize>,
+    /// This attempt consumes this exact PCT cost snapshot; no second mutex read.
+    pub(crate) planning_penalties: Option<std::sync::Arc<Vec<nuwax_nav_pct::RoutePenalty>>>,
 }
 
 impl SurfaceNavigationConfig {
@@ -237,6 +239,7 @@ impl SurfaceNavigationConfig {
             robot_width_m,
             planning_cancelled: None,
             planning_search_budget: None,
+            planning_penalties: None,
         })
     }
     /// 两端用同一已验证标定物化外形和运动约束。

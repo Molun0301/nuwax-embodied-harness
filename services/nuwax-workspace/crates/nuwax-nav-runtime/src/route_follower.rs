@@ -446,6 +446,10 @@ impl RouteFollower {
 
 }
 impl NavPlanner for RouteFollower {
+    fn refresh_execution_context(&mut self, applied: Twist2) -> Option<Arc<crate::replan_feedback::ActualExecutionContext>> {
+        // Do not schedule/consume a route job while recovering without a path.
+        self.controller.refresh_execution_context(applied)
+    }
     fn revalidate_selected_command(&mut self,command:Twist2)->Option<PlannerStep> {
         let result=self.controller.revalidate_selected_command(command);
         result.map(|step| match step {

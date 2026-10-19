@@ -401,6 +401,7 @@ def _parse_urdf(path: Path, base_link: str, positions: Dict[str, float], *, sour
     if selected not in links:
         raise RobotGeometryError("模型不存在指定机体基准连杆：" + selected)
     values, warnings, resolving = {}, [], set()
+    out_of_limit = []
     def joint_value(name):
         if name in values:
             return values[name]
@@ -432,7 +433,7 @@ def _parse_urdf(path: Path, base_link: str, positions: Dict[str, float], *, sour
             if not lower <= value <= upper:
                 if name in positions:
                     raise RobotGeometryError("显式参考位置超出关节限位：" + name)
-                warnings.append("关节" + name + "的模型零/派生参考位超出运动限位；此结果不是实际站姿。")
+                out_of_limit.append(name)
         resolving.remove(name)
         values[name] = value
         return value
@@ -473,9 +474,13 @@ def _parse_urdf(path: Path, base_link: str, positions: Dict[str, float], *, sour
     base_r, base_t = transforms[selected]
     inverse_r = tuple(tuple(base_r[j][i] for j in range(3)) for i in range(3))
     inverse = inverse_r, _apply(inverse_r, tuple(-v for v in base_t))
+    if out_of_limit:
+        # 同类关节合并为一条，避免每个关节重复同一句提示。
+        warnings.append("{}个关节的模型零位超出运动限位（{}），外形按该静态姿态计算。".format(
+            len(out_of_limit), "、".join(out_of_limit)))
     kind = "collision" if any(link.findall("collision") for link in links.values()) else "visual"
     if kind == "visual":
-        warnings.append("模型没有碰撞几何，使用显示几何作为明确声明的静态外包后备。")
+        warnings.append("模型没有碰撞几何，改用显示几何计算外形。")
     xy, lows, highs = [], [], []
     for name, link in links.items():
         for item in link.findall(kind):
@@ -523,7 +528,7 @@ def _parse_urdf(path: Path, base_link: str, positions: Dict[str, float], *, sour
                     primitive["length_m"] = _number(shape.get("length"), "圆柱长度", positive=True)
             primitives.append(primitive)
     if moving:
-        warnings.append("活动关节使用静态参考姿态，未填写的关节采用模型零位；不表示实时腿部姿态。")
+        warnings.append("活动关节按静态参考姿态计算，不跟随实时腿部姿态；未填写的关节取模型零位。")
     return ResolvedRobotGeometry(_hull(xy), min(lows), max(highs), source_prefix + "_" + kind,
                                  str(path), selected, tuple(sorted(values.items())), tuple(warnings),
                                  tuple(primitives), excluded_moving, unsupported)
@@ -562,7 +567,7 @@ def resolve_robot_geometry(config: RobotGeometryConfig, *, robot_name: str, base
                                  source_prefix="urdf" if explicit else "robot_default_urdf")
         else:
             # 通用回退沿原0.25米外包半宽与0.6米高度，来源明确，不伪称真实模型。
-            result = replace(_box(0.5,0.5,0.6,_ZERO,"legacy_default"), warnings=("当前机器人没有外形模型，使用兼容默认外包；可配置模型或手填真实尺寸。",))
+            result = replace(_box(0.5,0.5,0.6,_ZERO,"legacy_default"), warnings=("当前机器人没有外形模型，暂用默认外形；请配置模型或手填实际尺寸。",))
         old_sizes = (result.length_m,result.width_m,result.height_m)
         old_center = result.center_xyz_m
         effective = list(dimensions)

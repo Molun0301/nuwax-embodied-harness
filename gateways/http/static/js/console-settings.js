@@ -77,12 +77,23 @@ function renderProfileControls(schema) {
     configState.robot = context.robot;
     configState.profile = context.profile;
   }
-  document.getElementById('configProfileStatus').textContent = context
-    ? ('当前编辑：' + context.robot + ' / ' + context.profile + '。' + (context.is_active ? '这是已选择的方案。' : '应用此方案后才改变运行设置。')
-      + (context.migration_required ? '首次保存会迁移该机器人的旧配置。' : '')
-      + (context.running_robot ? ' 启动时：' + context.running_robot + ' / ' + (context.running_profile || '旧配置入口') : ''))
-    : '当前使用显式配置文件入口。';
-  document.getElementById('configProfileApply').disabled = !context;
+  // 只说明所选方案与运行状态的关系，短标签放在下拉框旁，完整说明放在悬停提示里。
+  const running = context?.running_robot ? context.running_robot + ' / ' + (context.running_profile || '旧配置入口') : '';
+  const runningThis = Boolean(context && context.running_robot === context.robot && context.running_profile === context.profile);
+  const profileState = !context ? 'explicit' : !context.is_active ? 'inactive' : (!running || runningThis ? 'running' : 'restart');
+  const profileStatus = document.getElementById('configProfileStatus');
+  profileStatus.textContent = { explicit: '显式配置文件', inactive: '未设为运行方案', running: '运行方案', restart: '已设为运行方案，待重启' }[profileState];
+  profileStatus.dataset.state = profileState;
+  profileStatus.title = ({
+    explicit: '当前使用显式指定的配置文件，不经过机器人配置方案。',
+    inactive: '所选方案不是运行方案，修改不会影响正在运行的机器人。',
+    running: '所选方案就是当前运行的方案。',
+    restart: '所选方案已设为运行方案，重启后生效。',
+  })[profileState] + (running ? '当前运行 ' + running + '。' : '')
+    + (context?.migration_required ? '首次保存会迁移该机器人的旧配置。' : '');
+  const apply = document.getElementById('configProfileApply');
+  apply.disabled = !context;
+  apply.dataset.active = String(Boolean(context?.is_active));
   document.getElementById('configProfileSaveAs').disabled = !context;
   document.getElementById('configRestartPending').disabled = !schema.application?.restart_available;
   document.getElementById('configRestartPending').title = schema.application?.restart_unavailable_reason || '';
@@ -305,6 +316,7 @@ async function fetchConfigSchema({ afterSave = false } = {}) {
   }
 }
 function renderConfigSchema(schema) {
+  hideConfigTip();
   const host = document.getElementById("configSections");
   host.replaceChildren();
   const nav = document.getElementById("configNav");
@@ -404,7 +416,14 @@ function setupConfigScrollSpy(host, navLinks) {
   };
   host.addEventListener("scroll", host._spy, { passive: true });
 }
+// 页面提供“展开说明”开关时，说明可收进悬停浮层；没有该开关的页面保持铺开。
+function configHelpModeAvailable() {
+  return Boolean(document.getElementById("configHelpMode"));
+}
+const CONFIG_INFO_ICON = '<svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6.25"/><path d="M8 7.25v4M8 4.9v.1"/></svg>';
+let hideConfigTip = () => {};
 function buildConfigRow(f, applying = false) {
+  const helpMode = configHelpModeAvailable();
   const row = document.createElement("div");
   row.className = "config-row" + (f.pending_restart ? " pending-restart" : "");
   row.dataset.key = f.key;
@@ -415,7 +434,7 @@ function buildConfigRow(f, applying = false) {
   if (f.sensitive) badges += ' <span class="config-badge sec">敏感</span>';
   label.innerHTML = '<span class="config-label-name">' + configEscape(f.zh_name || "未命名设置") + badges + '</span>' +
     '<code class="ckey">' + configEscape(f.key) + "</code>";
-  if (f.description) label.title = f.description;
+  if (f.description && !helpMode) label.title = f.description;
   const cell = document.createElement("div");
   cell.className = "cfield";
   let input;
@@ -469,7 +488,7 @@ function buildConfigRow(f, applying = false) {
   input.id = "cfg__" + f.key;
   input.className = "field";
   if (f.readonly) { input.disabled = true; input.dataset.readonly = 'true'; }
-  if (f.description) input.title = f.description;
+  if (f.description && !helpMode) input.title = f.description;
   const baseline = configState.acknowledgedValues.has(f.key)
     ? configState.acknowledgedValues.get(f.key) : configFieldInputValue(f);
   if (configState.acknowledgedValues.has(f.key)) input.value = baseline;
@@ -549,11 +568,22 @@ function buildConfigRow(f, applying = false) {
     updatePrerequisite();
     cell.appendChild(prerequisite);
   }
+  // 说明、外形预览、来源与生效范围属于解释，放进同一容器，可整体铺开或悬停查看。
+  const explain = document.createElement("div");
+  explain.className = "config-explain";
+  explain.id = "cfgexp__" + f.key;
   if (f.description) {
     const help = document.createElement("p");
     help.className = "config-help";
     help.textContent = f.description;
-    cell.appendChild(help);
+    explain.appendChild(help);
+  }
+  const geometry = f.key === "NUWAX_ROBOT_MODEL_PATH" ? configState.lastSchema?.robot_geometry_preview : null;
+  if (geometry?.summary && geometry.status !== "error") {
+    const preview = document.createElement("p");
+    preview.className = "config-help config-geometry-preview";
+    preview.textContent = [geometry.summary, ...(geometry.warnings || [])].join(" ");
+    explain.appendChild(preview);
   }
   const meta = document.createElement("div");
   meta.className = "config-field-meta";
@@ -563,32 +593,63 @@ function buildConfigRow(f, applying = false) {
   const scope = document.createElement("span");
   scope.textContent = f.apply_scope || "重启对应服务生效";
   meta.append(source, scope);
+  if (f.effective_value_known === false) {
+    const unknown = document.createElement("span");
+    unknown.textContent = f.effective_value_scope === 'inactive'
+      ? '当前执行链不使用此项'
+      : f.effective_value_scope === 'external_process'
+        ? '由外部进程读取，页面无法确认其实际采用值' : "未采集当前进程的取值";
+    meta.appendChild(unknown);
+  }
+  explain.appendChild(meta);
+  cell.appendChild(explain);
+  // 待重启、正在应用、当前生效值和外形解析失败属于状态，始终显示。
+  const status = document.createElement("div");
+  status.className = "config-field-meta config-field-state";
   if (applying || f.pending_restart) {
     const pending = document.createElement("span");
     pending.className = "config-pending-label";
     pending.textContent = applying ? "已保存，正在应用" : "已保存，待重启生效";
-    meta.appendChild(pending);
+    status.appendChild(pending);
+    if (f.effective_value_known !== false && !f.sensitive && f.effective_value !== undefined) {
+      const effective = document.createElement("span");
+      effective.textContent = "当前生效：" + String(f.effective_value);
+      status.appendChild(effective);
+    }
   }
-  if (f.effective_value_known === false) {
-    const unknown = document.createElement("span");
-    unknown.textContent = f.effective_value_scope === 'inactive'
-      ? '兼容保留，当前流水线不使用'
-      : f.effective_value_scope === 'external_process'
-        ? '外部进程实际采用值未核实；此处仅为启动配置' : "当前进程值未采集";
-    meta.appendChild(unknown);
-  } else if ((applying || f.pending_restart) && !f.sensitive && f.effective_value !== undefined) {
-    const effective = document.createElement("span");
-    effective.textContent = "当前生效：" + String(f.effective_value);
-    meta.appendChild(effective);
+  if (geometry?.status === "error" && geometry.summary) {
+    const failed = document.createElement("span");
+    failed.className = "config-prerequisite";
+    failed.textContent = geometry.summary;
+    status.appendChild(failed);
   }
-  cell.appendChild(meta);
+  if (status.childElementCount) cell.appendChild(status);
   const err = document.createElement("div");
   err.className = "config-err";
   err.id = "cfgerr__" + f.key;
   err.textContent = configState.errors.get(f.key) || "";
   row.classList.toggle("invalid", configState.errors.has(f.key));
   cell.appendChild(err);
-  row.append(label, cell);
+  if (helpMode) {
+    // 标题行带说明图标；悬停或聚焦时由页面浮层显示说明容器内容。
+    const head = document.createElement("div");
+    head.className = "config-row-head";
+    const info = document.createElement("button");
+    info.type = "button";
+    info.className = "config-info";
+    info.innerHTML = CONFIG_INFO_ICON;
+    info.setAttribute("aria-label", "查看说明：" + (f.zh_name || f.key));
+    info.setAttribute("aria-describedby", explain.id);
+    info.setAttribute("aria-expanded", "false");
+    head.append(label, info);
+    // 图标紧跟名称；键名移到标题行下方，仍可选择复制。
+    const keyCode = label.querySelector(".ckey");
+    row.append(head);
+    if (keyCode) row.appendChild(keyCode);
+    row.appendChild(cell);
+  } else {
+    row.append(label, cell);
+  }
   return row;
 }
 function onConfigInput(key, input, row) {
@@ -694,7 +755,20 @@ async function saveConfig() {
   const save = document.getElementById("configSave");
   const search = document.getElementById("configSearch");
   const adv = document.getElementById("configShowAdvanced");
-  if (reload) reload.addEventListener("click", loadConfigSchema);
+  // 读取期间图标旋转、按钮不可重复点击；至少转半圈时间，避免读取太快看不出已刷新。
+  if (reload) reload.addEventListener("click", async () => {
+    if (reload.classList.contains("is-loading")) return;
+    reload.classList.add("is-loading");
+    reload.disabled = true;
+    reload.setAttribute("aria-busy", "true");
+    try {
+      await Promise.all([loadConfigSchema(), new Promise((resolve) => setTimeout(resolve, 450))]);
+    } finally {
+      reload.classList.remove("is-loading");
+      reload.disabled = false;
+      reload.removeAttribute("aria-busy");
+    }
+  });
   if (save) save.addEventListener("click", saveConfig);
   let searchTimer;
   const rerender = () => {
@@ -726,6 +800,100 @@ async function saveConfig() {
       for (const group of host.querySelectorAll(".config-adv")) group.open = adv.checked;
     }
   });
+})();
+// 说明显示方式：“展开说明”开关决定全部铺开或悬停查看，选择记在浏览器本地；只在页面提供该开关时启用。
+(function wireConfigHelp() {
+  const control = document.getElementById("configHelpMode");
+  const panel = document.getElementById("config-section");
+  const host = document.getElementById("configSections");
+  if (!control || !panel || !host) return;
+  const storageKey = "nuwax-config-help-mode";
+  const tip = document.createElement("div");
+  tip.className = "config-tip";
+  tip.setAttribute("role", "tooltip");
+  tip.hidden = true;
+  document.body.appendChild(tip);
+  let anchor = null;
+  let pinned = false;
+  function hide() {
+    anchor?.setAttribute("aria-expanded", "false");
+    anchor = null;
+    pinned = false;
+    tip.classList.remove("pinned");
+    tip.hidden = true;
+  }
+  function place(target) {
+    // 浮层挂在页面根部并按视口定位，不被设置列表的滚动区域裁切。
+    const rect = target.getBoundingClientRect();
+    const margin = 8;
+    tip.style.left = "0px";
+    tip.style.top = "0px";
+    const width = tip.offsetWidth;
+    const height = tip.offsetHeight;
+    const left = Math.max(margin, Math.min(rect.left, window.innerWidth - width - margin));
+    const below = rect.bottom + 6;
+    const top = below + height + margin > window.innerHeight ? Math.max(margin, rect.top - height - 6) : below;
+    tip.style.left = left + "px";
+    tip.style.top = top + "px";
+  }
+  function show(head, pin) {
+    const info = head?.querySelector(".config-info");
+    const explain = head?.closest(".config-row")?.querySelector(".config-explain");
+    if (!info || !explain || panel.dataset.help !== "hover") return;
+    if (anchor && anchor !== info) anchor.setAttribute("aria-expanded", "false");
+    anchor = info;
+    pinned = Boolean(pin);
+    tip.classList.toggle("pinned", pinned);
+    tip.replaceChildren(...Array.from(explain.childNodes, (node) => node.cloneNode(true)));
+    tip.hidden = false;
+    info.setAttribute("aria-expanded", "true");
+    // 从键名下方弹出，避免盖住键名。
+    const keyLine = head.nextElementSibling;
+    place(keyLine?.classList.contains("ckey") ? keyLine : head);
+  }
+  function setMode(mode, persist) {
+    const value = mode === "expand" ? "expand" : "hover";
+    panel.dataset.help = value;
+    control.checked = value === "expand";
+    if (persist) {
+      try { localStorage.setItem(storageKey, value); } catch (_) { /* 无痕模式下仅本次有效 */ }
+    }
+    hide();
+  }
+  hideConfigTip = hide;
+  host.addEventListener("mouseover", (event) => {
+    const head = event.target.closest(".config-row-head");
+    if (head && !pinned && head.querySelector(".config-info") !== anchor) show(head, false);
+  });
+  host.addEventListener("mouseout", (event) => {
+    const head = event.target.closest(".config-row-head");
+    if (head && !pinned && !head.contains(event.relatedTarget)) hide();
+  });
+  host.addEventListener("focusin", (event) => {
+    if (event.target.matches(".config-info") && !pinned) show(event.target.closest(".config-row-head"), false);
+  });
+  host.addEventListener("focusout", (event) => {
+    if (event.target.matches(".config-info") && !pinned) hide();
+  });
+  // 点击固定浮层，便于触屏查看和复制说明；再次点击或点空白处收起。
+  host.addEventListener("click", (event) => {
+    const info = event.target.closest(".config-info");
+    if (!info) return;
+    event.preventDefault();
+    if (pinned && anchor === info) hide();
+    else show(info.closest(".config-row-head"), true);
+  });
+  document.addEventListener("click", (event) => {
+    if (pinned && !event.target.closest(".config-info") && !tip.contains(event.target)) hide();
+  });
+  document.addEventListener("keydown", (event) => { if (event.key === "Escape" && !tip.hidden) hide(); });
+  host.addEventListener("scroll", hide, { passive: true });
+  window.addEventListener("resize", hide);
+  // 勾选“展开说明”时全部铺开，未勾选时悬停查看。
+  control.addEventListener("change", () => setMode(control.checked ? "expand" : "hover", true));
+  let saved = null;
+  try { saved = localStorage.getItem(storageKey); } catch (_) { /* 读不到时用默认 */ }
+  setMode(saved || "hover", false);
 })();
 window.nuwaxConsoleSettings = {
   open() { if (!configState.loaded) return loadConfigSchema(); },

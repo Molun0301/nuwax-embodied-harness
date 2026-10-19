@@ -54,7 +54,7 @@
         mapGrid: null,
         mapViewport: null,
         mapZoom: 1,
-        map2dCameraMode: "free",
+        map2dCameraMode: "follow",
         mapFreeView: { center: null, zoom: 1, fitSpan: null },
         mapFreeViewIdentity: "",
         mapViewMode: PLANAR_PIPELINE ? "2d" : "3d",
@@ -289,7 +289,11 @@
         updateThemeIcon(next);
       }
       function updateThemeIcon(theme) {
-        if (els.themeToggle) els.themeToggle.textContent = theme === "dark" ? "🌙" : "☀️";
+        // 图标由样式按 data-theme 切换，这里只更新说明文字。
+        if (!els.themeToggle) return;
+        const label = theme === "dark" ? "当前为暗色主题，点击切换为亮色" : "当前为亮色主题，点击切换为暗色";
+        els.themeToggle.title = label;
+        els.themeToggle.setAttribute("aria-label", label);
       }
       initTheme();
       if (els.themeToggle) els.themeToggle.addEventListener("click", toggleTheme);
@@ -334,8 +338,9 @@
         if (!workspace) return;
         function toggle() {
           const swapped = workspace.classList.toggle("swapped");
-          if (btnMap) btnMap.textContent = swapped ? "⇄ 地图" : "⇄ 视频";
-          if (btnVideo) btnVideo.textContent = swapped ? "⇄ 缩小" : "⇄ 放大";
+          // 只改文字，保留按钮内的图标。
+          setText(btnMap?.querySelector("[data-swap-label]"), swapped ? "地图" : "视频");
+          setText(btnVideo?.querySelector("[data-swap-label]"), swapped ? "缩小" : "放大");
           if (video) video.classList.toggle("rise", false);
           // 槽位尺寸变化后重排地图画布并重绘（视频靠 CSS 自适应，无需干预）
           setTimeout(redrawMapAfterResize, 60);
@@ -480,7 +485,9 @@
       function statusClass(status) {
         const raw = String(status || "missing").toLowerCase();
         if (["available", "ready", "ok", "streaming", "succeeded", "completed"].includes(raw)) return "available";
-        if (["stale", "degraded", "idle", "disabled", "cleared", "pending", "queued", "unconfirmed"].includes(raw)) return "stale";
+        // 空闲、未启用和等待类状态不是故障，用中性色；排序口径见 statusSeverity。
+        if (["idle", "disabled", "cleared", "pending", "queued"].includes(raw)) return "idle";
+        if (["stale", "degraded", "unconfirmed"].includes(raw)) return "stale";
         if (["error", "failed", "timeout", "unavailable", "cancelled"].includes(raw)) return "error";
         if (["unsupported"].includes(raw)) return "unsupported";
         return "missing";
@@ -531,7 +538,8 @@
       function statusSeverity(status) {
         const value = statusClass(status || "missing");
         if (value === "available") return 0;
-        if (value === "stale") return 1;
+        // 中性色只改变显示，排序仍与改色前一致。
+        if (value === "stale" || value === "idle") return 1;
         if (value === "missing" || value === "unsupported") return 2;
         return 3;
       }
@@ -609,7 +617,7 @@
       function serviceAdvice(status, fallback) {
         const cls = statusClass(status);
         if (cls === "available") return fallback || "无需处理";
-        if (cls === "stale") return fallback || "等待服务刷新，必要时查看运行日志";
+        if (cls === "stale" || cls === "idle") return fallback || "等待服务刷新，必要时查看运行日志";
         if (cls === "error") return fallback || "查看运行日志定位错误";
         if (String(status || "").toLowerCase() === "unsupported") return "当前环境不支持该服务";
         return fallback || "检查服务是否启用并查看运行日志";
@@ -759,6 +767,142 @@
         const roles = Array.isArray(entry.expected_process_roles) ? entry.expected_process_roles : [];
         return roles.length ? "暂无匹配进程证据" : "";
       }
+      // 服务与进程合并：用 process_evidence 的角色与 PID 把实时资源数据挂到对应服务上。
+      function liveProcessesForService(entry) {
+        const processes = Array.isArray(state.latestSystemMetrics?.processes) ? state.latestSystemMetrics.processes : [];
+        if (!processes.length) return [];
+        const roles = new Set();
+        const pids = new Set();
+        for (const proc of (Array.isArray(entry.process_evidence) ? entry.process_evidence : [])) {
+          if (!proc) continue;
+          if (proc.role) roles.add(String(proc.role).replaceAll("-", "_"));
+          if (proc.pid !== undefined && proc.pid !== null) pids.add(String(proc.pid));
+        }
+        for (const role of (Array.isArray(entry.expected_process_roles) ? entry.expected_process_roles : [])) {
+          if (role) roles.add(String(role).replaceAll("-", "_"));
+        }
+        if (entry.service_id) roles.add(String(entry.service_id).replaceAll("-", "_"));
+        return processes.filter((proc) => {
+          if (!proc) return false;
+          if (pids.has(String(proc.pid))) return true;
+          return roles.has(String(proc.role || "").replaceAll("-", "_"))
+            || roles.has(String(proc.name || "").replaceAll("-", "_"));
+        });
+      }
+      function hasProcessTelemetry() {
+        const telemetry = state.latestSystemMetrics;
+        return Boolean(telemetry && Array.isArray(telemetry.processes) && telemetry.processes.length);
+      }
+      function serviceTelemetryHintNode() {
+        if (!state.serviceTelemetryHint) {
+          const hint = document.createElement("p");
+          hint.className = "service-health-hint";
+          hint.textContent = "未收到性能遥测，进程与资源占用暂不可见。";
+          state.serviceTelemetryHint = hint;
+        }
+        state.serviceTelemetryHint.hidden = hasProcessTelemetry();
+        return state.serviceTelemetryHint;
+      }
+      function buildServiceProcessRow(entry) {
+        const matched = liveProcessesForService(entry);
+        const expects = Array.isArray(entry.expected_process_roles) ? entry.expected_process_roles.length : 0;
+        const row = document.createElement("div");
+        row.className = "service-health-process";
+        if (!matched.length) {
+          // 没有进程证据时保留同一列结构，便于纵向扫读；不臆造数值。
+          // 期望存在却未匹配按警告呈现，本就不依赖本地进程的服务按次要信息呈现。
+          const hasTelemetry = hasProcessTelemetry();
+          row.dataset.state = hasTelemetry && expects ? "missing" : "none";
+          // 完全没有遥测时由列表顶部统一说明，各行不再重复显示占位。
+          row.hidden = !hasTelemetry;
+          const emptyPid = document.createElement("span");
+          emptyPid.className = "shp-pid";
+          emptyPid.textContent = "PID --";
+          const emptyCpu = document.createElement("span");
+          emptyCpu.className = "shp-metric";
+          emptyCpu.append("CPU");
+          const emptyCpuValue = document.createElement("b");
+          emptyCpuValue.textContent = "--";
+          emptyCpu.appendChild(emptyCpuValue);
+          const emptyMem = document.createElement("span");
+          emptyMem.className = "shp-metric";
+          emptyMem.append("内存");
+          const emptyMemValue = document.createElement("b");
+          emptyMemValue.textContent = "--";
+          emptyMem.appendChild(emptyMemValue);
+          row.append(emptyPid, emptyCpu, emptyMem);
+          return row;
+        }
+        row.dataset.state = "running";
+        const proc = matched[0];
+        const pid = document.createElement("span");
+        pid.className = "shp-pid";
+        pid.textContent = `PID ${proc.pid === undefined || proc.pid === null ? "--" : proc.pid}`;
+        const cpu = document.createElement("span");
+        cpu.className = "shp-metric";
+        cpu.append("CPU");
+        const cpuValue = document.createElement("b");
+        cpuValue.textContent = fmt(proc.cpu_percent, "%");
+        cpu.appendChild(cpuValue);
+        const mem = document.createElement("span");
+        mem.className = "shp-metric";
+        mem.append("内存");
+        const memValue = document.createElement("b");
+        memValue.textContent = formatGB(proc.rss_bytes);
+        mem.appendChild(memValue);
+        row.append(pid, cpu, mem);
+        if (matched.length > 1) {
+          const more = document.createElement("span");
+          more.className = "shp-metric";
+          more.textContent = `等 ${matched.length} 个进程`;
+          row.appendChild(more);
+        }
+        return row;
+      }
+      // 未关联到任何服务的进程仍要可见，收进「其它进程」，避免进程矩阵信息丢失。
+      function serviceOthersNode(entries) {
+        if (!state.serviceOthersNode) {
+          const node = document.createElement("details");
+          node.className = "service-health-more service-others";
+          const label = document.createElement("summary");
+          const list = document.createElement("div");
+          list.className = "service-health-list";
+          node.append(label, list);
+          state.serviceOthersNode = node;
+        }
+        const node = state.serviceOthersNode;
+        const metrics = state.latestSystemMetrics;
+        const processes = Array.isArray(metrics?.processes) ? metrics.processes : [];
+        const claimed = new Set();
+        for (const entry of entries) {
+          for (const proc of liveProcessesForService(entry)) {
+            if (proc && proc.pid !== undefined && proc.pid !== null) claimed.add(String(proc.pid));
+          }
+        }
+        const rest = processes.filter((proc) => proc && !claimed.has(String(proc.pid)));
+        const degraded = metrics && metrics.psutil_available === false;
+        setText(node.firstElementChild, degraded ? "进程与性能采集不可用（已降级）" : `其它进程（${rest.length}）`);
+        node.hidden = !rest.length && !degraded;
+        node.lastElementChild.replaceChildren(...rest.map(buildProcessSummaryRow));
+        return node;
+      }
+      function buildProcessSummaryRow(proc) {
+        const row = document.createElement("article");
+        row.className = "service-row";
+        const left = document.createElement("div");
+        const title = document.createElement("div");
+        title.className = "mono";
+        title.textContent = `${processPurposeName(proc)} · 进程号 ${safeText(proc.pid)}`;
+        const meta = document.createElement("div");
+        meta.className = "meta";
+        meta.textContent = `内存 ${formatGB(proc.rss_bytes)} · 处理器 ${fmt(proc.cpu_percent, "%")}`;
+        left.append(title, meta);
+        const pill = document.createElement("span");
+        pill.className = "pill mono";
+        pill.textContent = `${Math.round(Number(proc.cpu_percent) || 0)}%`;
+        row.append(left, pill);
+        return row;
+      }
       function serviceHealthChip(label, value, title) {
         const chip = document.createElement("span");
         chip.className = "service-health-chip";
@@ -784,46 +928,23 @@
         const pill = document.createElement("span");
         setPill(pill, status);
         top.append(title, pill);
+        // 进程与性能放在常显行：不展开也能看到该服务对应的进程和资源占用。
+        top.appendChild(buildServiceProcessRow(entry));
         if (SERVICE_ATTENTION_STATUSES.has(status)) {
           const brief = document.createElement("span");
           brief.className = "service-health-brief";
-          brief.textContent = safeText(entry.reason ? displayReasonLabel(entry.reason) : (entry.summary || entry.evidence || "请展开查看诊断"));
+          brief.textContent = safeText(entry.summary || entry.evidence || displayReasonLabel(entry.reason) || "请展开查看诊断");
           top.appendChild(brief);
         }
 
-        const summary = document.createElement("div");
-        summary.className = "service-health-summary";
-        summary.textContent = safeText(entry.summary || displayStatus(status));
         const evidence = document.createElement("div");
         evidence.className = "service-health-evidence";
         evidence.textContent = safeText(entry.evidence || entry.reason || entry.advice || "暂无详细证据");
 
-        const foot = document.createElement("div");
-        foot.className = "service-health-foot";
-        foot.appendChild(serviceHealthChip("来源", displayServiceSource(entry.source || (options && options.source))));
-        const updated = entry.updated_at || (options && (options.generated_at || options.timestamp));
-        if (updated) foot.appendChild(serviceHealthChip("更新", shortTime(updated), String(updated)));
-        const processText = serviceProcessText(entry);
-        if (processText) foot.appendChild(serviceHealthChip("进程", processText, JSON.stringify(entry.process_evidence || entry.expected_process_roles || [])));
-        // 任务 6.1.3：expected_process_roles —— 未命中时显式列出期望角色（让用户知道哪个进程应当启动）
-        const expectedRoles = Array.isArray(entry.expected_process_roles) ? entry.expected_process_roles : [];
-        const evidenceList = Array.isArray(entry.process_evidence) ? entry.process_evidence : [];
-        if (expectedRoles.length && !evidenceList.length) {
-          foot.appendChild(serviceHealthChip("期望角色", expectedRoles.join(", "), "当前遥测暂无这些角色的进程证据；不能据此断言进程不存在"));
-        }
-        if (entry.advice) foot.appendChild(serviceHealthChip("建议", entry.advice));
-        if (options && options.compatibleFallback) foot.appendChild(serviceHealthChip("模式", "兼容推断"));
-
-        // 任务 6.1.1：reason 行（独立 chip，机器可读原因在 title 中展示完整值）
-        if (entry.reason) {
-          const reasonChip = serviceHealthChip("原因", displayReasonLabel(entry.reason), String(entry.reason));
-          reasonChip.classList.add("service-health-reason");
-          foot.appendChild(reasonChip);
-        }
-
+        // 卡片只保留诊断正文；来源、更新、建议、原因等字段不再占位。
         const details = document.createElement("div");
         details.className = "service-health-details";
-        details.append(summary, evidence, foot);
+        details.append(evidence);
         card.append(top, details);
         state.serviceCardNodes ||= new Map();
         const current = state.serviceCardNodes.get(entry.service_id);
@@ -966,10 +1087,21 @@
           || entries.find((entry) => entry.display_name === "网关 Web 服务");
         setText(els.connectionText, displayStatus(gatewayService ? gatewayService.status : "missing"));
         setPill(els.governanceStatus, status, attention ? `${attention} 项需处理` : "服务");
-        const needsAttention = (entry) => SERVICE_ATTENTION_STATUSES.has(String(entry.status || "missing").toLowerCase());
-        const primary = entries.filter((entry) => needsAttention(entry) || SERVICE_PRIMARY_IDS.has(entry.service_id));
-        const secondary = entries.filter((entry) => !needsAttention(entry) && !SERVICE_PRIMARY_IDS.has(entry.service_id));
-        primary.sort((a, b) => Number(needsAttention(b)) - Number(needsAttention(a)));
+        // 只剔除没有独立诊断价值的重复项，其余全部展示：
+        // - 实时流总线的状态在后端恒为「可用」，永远不会报出问题；
+        // - 任务调度服务只反映任务数量，任务状态页签已经覆盖；
+        // - Native geometry runtime 与「统一几何服务」是同一件事的两层，
+        //   后者的 metadata 与期望进程角色都已包含前者。
+        const REDUNDANT_SERVICE_IDS = new Set(["stream_bus", "task_manager", "geometry_runtime"]);
+        const visible = entries.filter((entry) => !REDUNDANT_SERVICE_IDS.has(String(entry.service_id)));
+        // 按后端自带的分组呈现，组内沿用后端顺序，组间按各组最靠前的 order 排列。
+        const grouped = new Map();
+        for (const entry of visible) {
+          const name = String(entry.group || "其他");
+          if (!grouped.has(name)) grouped.set(name, []);
+          grouped.get(name).push(entry);
+        }
+        state.serviceGroupLabels ||= new Map();
         const options = {
           source: summary.source,
           generated_at: summary.generated_at,
@@ -977,25 +1109,22 @@
           compatibleFallback: summary.authoritative === false,
           deferAppend: true,
         };
-        const primaryNodes = primary.map((entry) => appendServiceHealthCard(entry, options));
-        if (!state.serviceMoreNode) {
-          const more = document.createElement("details");
-          more.className = "service-health-more";
-          const label = document.createElement("summary");
-          const list = document.createElement("div");
-          list.className = "service-health-list";
-          more.append(label, list);
-          state.serviceMoreNode = more;
+        const ordered = [];
+        const orderedGroups = [...grouped.entries()].sort(
+          (a, b) => Number(a[1][0]?.order ?? 0) - Number(b[1][0]?.order ?? 0),
+        );
+        for (const [name, list] of orderedGroups) {
+          if (!state.serviceGroupLabels.has(name)) {
+            const label = document.createElement("div");
+            label.className = "service-health-group";
+            state.serviceGroupLabels.set(name, label);
+          }
+          const label = state.serviceGroupLabels.get(name);
+          setText(label, name);
+          ordered.push(label, ...list.map((entry) => appendServiceHealthCard(entry, options)));
         }
-        const more = state.serviceMoreNode;
-        const moreLabel = `其余服务（${secondary.length}）`;
-        if (more.firstElementChild.firstChild) {
-          if (more.firstElementChild.firstChild.nodeValue !== moreLabel) more.firstElementChild.firstChild.nodeValue = moreLabel;
-        } else setText(more.firstElementChild, moreLabel);
-        more.hidden = !secondary.length;
-        const secondaryNodes = secondary.map((entry) => appendServiceHealthCard(entry, options));
-        reconcileServiceNodes(more.lastElementChild, secondaryNodes);
-        reconcileServiceNodes(els.governanceMeta, [...primaryNodes, more]);
+        for (const [name, node] of state.serviceGroupLabels) if (!grouped.has(name)) node.remove();
+        reconcileServiceNodes(els.governanceMeta, [serviceTelemetryHintNode(), ...ordered, serviceOthersNode(entries)]);
         const ids = new Set(entries.map((entry) => entry.service_id));
         for (const id of state.serviceCardNodes.keys()) if (!ids.has(id)) state.serviceCardNodes.delete(id);
         if (focused?.isConnected && document.activeElement !== focused) focused.focus({ preventScroll: true });
@@ -1026,35 +1155,10 @@
         }
       }
       function renderProcessMatrix(snap) {
+        // 进程与性能并入服务状态卡片，不再单独成栏；此处只记录采集状态并触发重绘。
         const status = snap && snap.status ? snap.status : "missing";
         setPill(els.servicesStatus, status);
-        els.serviceMatrix.replaceChildren();
-        const processes = snap && Array.isArray(snap.processes) ? snap.processes : [];
-        if (!processes.length) {
-          const empty = document.createElement("div");
-          empty.className = "empty panel-meta";
-          empty.textContent = snap && snap.psutil_available === false
-            ? "性能采集不可用，已降级。" : "暂无项目进程采集结果。";
-          els.serviceMatrix.appendChild(empty);
-          return;
-        }
-        for (const proc of processes) {
-          const row = document.createElement("article");
-          row.className = "service-row";
-          const left = document.createElement("div");
-          const title = document.createElement("div");
-          title.textContent = `${processPurposeName(proc)} · 进程号 ${safeText(proc.pid)}`;
-          title.className = "mono";
-          const meta = document.createElement("div");
-          meta.className = "meta";
-          meta.textContent = `内存 ${formatGB(proc.rss_bytes)} · 处理器 ${fmt(proc.cpu_percent, "%")}`;
-          left.append(title, meta);
-          const pill = document.createElement("span");
-          pill.className = "pill mono";
-          pill.textContent = `${Math.round(Number(proc.cpu_percent) || 0)}%`;
-          row.append(left, pill);
-          els.serviceMatrix.appendChild(row);
-        }
+        renderServiceStatus();
       }
       function processPurposeName(proc) {
         if (String(proc.cmdline_preview || "").split(/\s+/).includes("--nuwax-video-relay-helper-v1")) return "视频帧中转";
@@ -1107,7 +1211,7 @@
           canMove === true ? "available" : canMove === false ? "stale" : "missing",
         );
         setText(els.motionStatus, canMove === true ? "运动可用" : canMove === false ? "运动不可用" : "运动状态未确认");
-        els.motionStatus.title = safety.warning_message || (canMove == null ? "设备尚未提供运动状态确认。" : "");
+        if (els.motionStatus) els.motionStatus.title = safety.warning_message || (canMove == null ? "设备尚未提供运动状态确认。" : "");
         if (changes.service_health) {
           mergeServiceHealth(changes.service_health, "/api/health", "replace");
         } else {
@@ -1326,7 +1430,7 @@
             updated_at: new Date().toISOString(),
           }, { compatibleFallback: true, source: "frontend_fallback" });
         } else if (kind === "map") {
-          setPill(els.mapStatus, "error");
+          setPill(els.mapStatus, "error", "地图");
           els.mapEmpty.hidden = false;
           els.mapEmpty.textContent = message;
         } else if (kind === "localization") {
@@ -1337,6 +1441,7 @@
           setKv(els.navigationMeta, [["错误", message], ["前端接收", nowText()]]);
         } else if (kind === "video") {
           setPill(els.videoStatus, "error");
+          setText(els.videoStatus, "视频不可用");
           els.videoEmpty.hidden = false;
           els.videoEmpty.textContent = message;
         } else if (kind === "tasks") {
@@ -1427,6 +1532,12 @@
           y: Number(origin.y || 0) + x * sin + y * cos,
         }));
       }
+      // 2D 视角偏航：π/2 表示正北朝上，与原来的 mapFixed 快速路径等价。
+      const NORTH_UP_YAW = Math.PI / 2;
+      function freeViewYaw() {
+        const yaw = Number(state.mapFreeView.yaw);
+        return Number.isFinite(yaw) ? yaw : NORTH_UP_YAW;
+      }
       function usesFreeMapView() {
         return state.map2dCameraMode === "free";
       }
@@ -1455,7 +1566,7 @@
         const center = corners.length
           ? corners.reduce((sum, point) => ({ x: sum.x + point.x / corners.length, y: sum.y + point.y / corners.length }), { x: 0, y: 0 })
           : defaultMapViewCenter();
-        state.mapFreeView = { center, zoom: 1, fitSpan: null };
+        state.mapFreeView = { center, zoom: 1, fitSpan: null, yaw: NORTH_UP_YAW };
         if (window.__nuwaxMapFreeze) window.__nuwaxMapFreezeCenter = { ...center };
         if (state.mapGrid) basePixelsPerMeterFree();
       }
@@ -1519,12 +1630,16 @@
         }
         if (usesFreeMapView()) {
           const center = getFreeMapViewCenter();
-          return { point: { x: center.x, y: center.y, z: 0 }, yaw: 0, locked: false, mapFixed: true };
+          const yaw = freeViewYaw();
+          // 正北向时沿用 mapFixed 快速路径，绘制结果与原来完全一致。
+          const northUp = Math.abs(yaw - NORTH_UP_YAW) < 1e-9;
+          return { point: { x: center.x, y: center.y, z: 0 }, yaw: northUp ? 0 : yaw, locked: false, mapFixed: northUp };
         }
         const posePoint = pointFromPose(state.pose);
         if (posePoint) return { point: posePoint, yaw: planarYawFromPose(state.pose) || 0, locked: true, mapFixed: false };
         const fallback = defaultMapViewCenter();
-        return { point: { x: fallback.x, y: fallback.y, z: 0 }, yaw: 0, locked: false, mapFixed: false };
+        // 无位姿时按正北朝上显示，避免地图在无机器人时无故倾斜。
+        return { point: { x: fallback.x, y: fallback.y, z: 0 }, yaw: 0, locked: false, mapFixed: true };
       }
       function basePixelsPerMeterFree() {
         const canvas = els.mapCanvas;
@@ -1803,10 +1918,9 @@
           const displayedPointCount = state.pointcloud3dPointCountKnown
             ? Math.max(0, Math.floor(Number(state.pointcloud3dDisplayedPoints) || 0))
             : null;
+          // 摘要并入地图底部，只保留度量本身；坐标系与显示状态不再占用位置。
           rows.push(
             ["点云总数", sourcePointCount === null ? "--" : sourcePointCount.toLocaleString("zh-CN")],
-            ["坐标系", pointcloud.payload.frame_id || pointcloud.frame.frame_id || pointcloud.metadata.frame_id || "--"],
-            ["显示状态", displayedPointCount === null ? "等待点云" : displayedPointCount > 0 ? "已显示" : "暂无点云"],
           );
           if (sourcePointCount !== displayedPointCount) {
             rows.splice(2, 0, ["显示点数", displayedPointCount === null ? "--" : displayedPointCount.toLocaleString("zh-CN")]);
@@ -1817,11 +1931,9 @@
           const hasGrid = Number.isFinite(width) && width > 0 && Number.isFinite(height) && height > 0;
           rows.push(
             ["总栅格数", hasGrid ? (width * height).toLocaleString("zh-CN") : "--"],
-            ["坐标系", (grid && grid.frame_id) || envelope.frame_id || diagnostics.frame_id || "--"],
             ["尺寸", hasGrid ? `${width} x ${height}` : "--"],
             ["分辨率", hasGrid ? formatPoseMetric(gridResolution(grid)) : "--"],
           );
-          if (detail.displayStatus) rows.push(["显示状态", detail.displayStatus]);
           if (detail.message) rows.push(["原因", detail.message]);
         }
         if (state.mapViewMode === "semantic") rows.push(["语义区域", window.nuwaxSemanticMap?.count?.() ?? "—"]);
@@ -2203,7 +2315,7 @@
         state.mapFreeViewIdentity = "";
         state.mapFreeView = { center: null, zoom: 1, fitSpan: null };
         if (!activeSpatialContextReason()) clearMapOverlayState();
-        setPill(els.mapStatus, status || "missing");
+        setPill(els.mapStatus, status || "missing", "地图");
         els.mapEmpty.hidden = false;
         els.mapEmpty.textContent = message || MAP_DISPLAY_IDLE_MESSAGE;
         requestMapDraw(true);
@@ -2671,7 +2783,7 @@
           els.semanticMemoryStatus.textContent = status;
           els.semanticMemoryStatus.dataset.state = state.semanticError ? "error" : mismatch ? "stale" : "ready";
         }
-        setText(els.semanticMemoryCount, state.semanticFetchedAt ? String(count) : "—");
+        if (els.semanticMemoryCount) els.semanticMemoryCount.textContent = state.semanticFetchedAt ? String(count) : "";
         const located = state.semanticInstances.filter((inst) => semanticQuality(inst).key === "located").length;
         const observations = state.semanticInstances.filter(semanticObservationOnly).length;
         setText(els.semanticMemorySummary, `${count} 条记录 · ${located} 个有位置 · ${observations} 条仅观察${meta.truncated ? ` · 已载入 ${count}/${meta.total} 条` : ""}`);
@@ -3443,7 +3555,7 @@
           releasePendingMapPose();
           return;
         }
-        setPill(els.mapStatus, status);
+        setPill(els.mapStatus, status, "地图");
         const pinCheckpoint = shouldPinLocalizationCheckpointDisplay(diagnostics);
         const incomingIsLive = !mapSnapshotIsOffline(diagnostics);
         const keepCheckpointGrid = pinCheckpoint && incomingIsLive && state.mapGrid && (Array.isArray(state.mapGrid.data) || state.mapGrid.data instanceof Int8Array);
@@ -3531,9 +3643,10 @@
       }
       function clockCalibrationHint(rawAge) {
         const estimate = activeStreamClockEstimate();
-        if (!estimate) return "尚未估算两端时钟偏差，当前显示包含时钟偏差。";
+        if (!estimate) return "尚未估算网关与浏览器的时钟偏差，延迟可能含偏差。";
         const raw = Number.isFinite(rawAge) ? `原始时间差 ${Math.round(rawAge)} ms；` : "";
-        return `${raw}服务端相对浏览器时钟 ${Math.round(estimate.offsetMs)} ms；校时估计的不确定性至少 ±${Math.ceil(estimate.rttMs / 2)} ms，不是精确物理测量。`;
+        const offset = Math.round(estimate.offsetMs);
+        return `${raw}网关时钟比浏览器${offset >= 0 ? "快" : "慢"} ${Math.abs(offset)} ms，估计误差约 ±${Math.ceil(estimate.rttMs / 2)} ms。`;
       }
       function recordDisplayedMapPose(kind, pose, displayedAt = Date.now()) {
         if (!displayedMapPoseAllowed(kind, pose)) return;
@@ -3591,7 +3704,7 @@
         if (!els.mapStreamStatus) return;
         const kind = state.mapViewMode === "3d" ? "map3d" : "map2d";
         setVisionText(els.mapStreamStatus, mediaMetricText(kind));
-        els.mapStreamStatus.title = "帧率仅统计接受的新地图内容，不是机器人移动或画布重画频率。位姿延迟使用通过当前地图身份校验且实际绘制的位姿采集时间至本次绘制时刻；仿真使用生产端记录的真实采集时间，每个新位姿更新；地图内容时间不参与。缺少有效位姿、源时间或页面隐藏时显示未知；≈表示已估算时钟偏差。" + clockCalibrationHint(state.displayedPoseMetrics?.[kind]?.rawAgeMs);
+        els.mapStreamStatus.title = "帧率：每秒收到的新地图内容数。位姿延迟：当前显示的位姿从采集到画出所用时间；没有有效位姿或页面在后台时显示 --，≈ 表示已扣除估算的时钟偏差。" + clockCalibrationHint(state.displayedPoseMetrics?.[kind]?.rawAgeMs);
       }
       function updateMapHeartbeat(envelope) {
         const cursor = normalizedStreamCursor(envelope.cursor);
@@ -3615,7 +3728,7 @@
           clearMapDisplay(displayDecision.message, displayDecision.status || (cleared ? "cleared" : status), diagnostics, streamBridge, envelope, grid);
           return;
         }
-        setPill(els.mapStatus, status);
+        setPill(els.mapStatus, status, "地图");
         if (grid && (Array.isArray(grid.data) || grid.data instanceof Int8Array)) {
           els.mapEmpty.hidden = true;
           els.mapEmpty.textContent = "";
@@ -4236,14 +4349,16 @@
         const key = `${status}|${label}|${state.videoStreamMessage || ""}`;
         if (key !== state.videoSummaryKey) {
           state.videoSummaryKey = key;
-          setPill(els.videoStatus, status, label);
+          // 标签文字已表达状态，不再追加“：等待中”之类的重复后缀。
+          setPill(els.videoStatus, status);
+          setText(els.videoStatus, label);
           els.videoEmpty.hidden = fresh;
           if (!fresh) setVisionText(els.videoEmpty, hasFrame ? "视频已中断，当前保留上次画面。" : state.videoStreamMessage || "等待摄像头视频帧。");
         }
         setVisionText(els.videoFpsStatus, hasFrame ? mediaMetricText("video") : "-- FPS · 延迟 --");
         els.videoFpsStatus.title = state.videoDisplayedIdentity?.timestampSource === "video_relay.write_time"
-          ? "实际显示帧率；延迟在每帧显示时采样，从视频中转写入时间计算。"
-          : "实际显示帧率；延迟从图像携带的帧时间计算，缺少时间时显示 --。";
+          ? "帧率为实际显示帧率；延迟从视频中转收到画面算起，到画面显示为止。"
+          : "帧率为实际显示帧率；延迟从画面采集时间算起，到画面显示为止，画面没有时间时显示 --。";
         els.videoFpsStatus.title += clockCalibrationHint((state.mediaMetrics?.video?.displayedAt ?? Date.now()) - (state.videoDisplayedIdentity?.sourceTime || NaN));
       }
       function visionDisplayState() {
@@ -5928,7 +6043,16 @@
         }
         if ((state.map2dCameraMode !== "free") || isMap3dVisible()) return;
         const pointer = canvasPointer(event);
-        if (event.button === 1 || event.button === 2 || (event.button === 0 && state.map2dCameraMode === "free")) {
+        if (event.button === 0) {
+          // 与三维视图一致：左键拖拽旋转视角。
+          event.preventDefault();
+          state.mapRotateDrag = { pointerStart: pointer, yawStart: freeViewYaw() };
+          syncMapToolUi();
+          if (els.mapCanvas.setPointerCapture) els.mapCanvas.setPointerCapture(event.pointerId);
+          return;
+        }
+        if (event.button === 1 || event.button === 2) {
+          // 与三维视图一致：中键或右键拖拽平移。
           event.preventDefault();
           state.mapPanDrag = {
             pointerStart: pointer,
@@ -5941,6 +6065,12 @@
       });
       els.mapCanvas.addEventListener("pointermove", (event) => {
         if (window.__nuwaxMapToolV2 && window.__nuwaxMapToolV2.active()) return;
+        if (state.mapRotateDrag) {
+          const pointer = canvasPointer(event);
+          state.mapFreeView.yaw = state.mapRotateDrag.yawStart + (pointer.x - state.mapRotateDrag.pointerStart.x) * 0.006;
+          requestMapDraw(false);
+          return;
+        }
         if (state.mapPanDrag) {
           const pointer = canvasPointer(event);
           const anchor = cameraAnchor();
@@ -5958,6 +6088,7 @@
       });
       els.mapCanvas.addEventListener("pointerup", (event) => {
         if (window.__nuwaxMapToolV2 && window.__nuwaxMapToolV2.active()) return;
+        if (state.mapRotateDrag) state.mapRotateDrag = null;
         if (state.mapPanDrag) finishMapPan(event);
         const start = state.semanticRegionPointerDown;
         state.semanticRegionPointerDown = null;
@@ -5968,6 +6099,10 @@
       });
       els.mapCanvas.addEventListener("pointercancel", (event) => {
         if (window.__nuwaxMapToolV2 && window.__nuwaxMapToolV2.active()) return;
+        if (state.mapRotateDrag) {
+          state.mapRotateDrag = null;
+          return;
+        }
         if (state.mapPanDrag) {
           finishMapPan(event);
           return;

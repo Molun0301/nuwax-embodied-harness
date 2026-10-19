@@ -3,7 +3,7 @@
   "parameters": {
     "use_imu_as_input": {
       "type": "bool",
-      "description": "使用惯性数据作为状态预测输入"
+      "description": "惯性数据作为预测输入（否则作观测）"
     },
     "prop_at_freq_of_imu": {
       "type": "bool",
@@ -11,11 +11,11 @@
     },
     "check_satu": {
       "type": "bool",
-      "description": "检查惯性量程饱和"
+      "description": "检查惯性量程饱和，仅观测模式"
     },
     "space_down_sample": {
       "type": "bool",
-      "description": "启用扫描空间降采样"
+      "description": "启用扫描体素降采样"
     },
     "imu_en": {
       "type": "bool",
@@ -23,7 +23,7 @@
     },
     "start_in_aggressive_motion": {
       "type": "bool",
-      "description": "允许运动中初始化"
+      "description": "允许运动中初始化，需填初始重力"
     },
     "extrinsic_est_en": {
       "type": "bool",
@@ -31,23 +31,23 @@
     },
     "gravity_align": {
       "type": "bool",
-      "description": "对齐重力方向"
+      "description": "世界坐标Z轴对齐重力方向"
     },
     "publish_odometry_without_downsample": {
       "type": "bool",
-      "description": "逐点发布里程计"
+      "description": "额外发布逐点更新的里程计"
     },
     "point_filter_num": {
       "type": "int",
       "minimum": 1,
       "maximum": 2147483647,
-      "description": "点云抽点间隔（点）"
+      "description": "点云抽点间隔，每N点保留1点"
     },
     "init_map_size": {
       "type": "int",
       "minimum": 1,
       "maximum": 2147483647,
-      "description": "初始化地图点数下限"
+      "description": "初始地图最少点数（个）"
     },
     "blind": {
       "type": "number",
@@ -62,95 +62,95 @@
     "satu_acc": {
       "type": "number",
       "exclusive_minimum": 0,
-      "description": "加速度饱和阈值"
+      "description": "加速度饱和阈值，与惯性原始单位一致"
     },
     "satu_gyro": {
       "type": "number",
       "exclusive_minimum": 0,
-      "description": "角速度饱和阈值"
+      "description": "角速度饱和阈值，与惯性原始单位一致"
     },
     "acc_norm": {
       "type": "number",
       "exclusive_minimum": 0,
-      "description": "加速度归一化系数"
+      "description": "加速度单位下的重力大小，g为1、米制为9.81"
     },
     "plane_thr": {
       "type": "number",
       "exclusive_minimum": 0,
-      "description": "平面拟合阈值"
+      "description": "平面判定阈值，越小要求越平"
     },
     "ivox_grid_resolution": {
       "type": "number",
       "exclusive_minimum": 0,
-      "description": "增量体素索引分辨率（米）"
+      "description": "增量体素地图格边长（米）"
     },
     "imu_time_inte": {
       "type": "number",
       "exclusive_minimum": 0,
-      "description": "惯性积分时间间隔（秒）"
+      "description": "惯性采样周期（秒），即1/惯性频率"
     },
     "lidar_meas_cov": {
       "type": "number",
       "exclusive_minimum": 0,
-      "description": "雷达测量方差"
+      "description": "雷达点测量噪声方差"
     },
     "imu_meas_acc_cov": {
       "type": "number",
       "exclusive_minimum": 0,
-      "description": "加速度测量方差"
+      "description": "加速度观测噪声方差，仅观测模式"
     },
     "imu_meas_omg_cov": {
       "type": "number",
       "exclusive_minimum": 0,
-      "description": "角速度测量方差"
+      "description": "角速度观测噪声方差，仅观测模式"
     },
     "match_s": {
       "type": "number",
       "exclusive_minimum": 0,
-      "description": "点面匹配筛选阈值"
+      "description": "点面匹配筛选系数，越大越严格"
     },
     "acc_cov_input": {
       "type": "number",
       "minimum": 0,
-      "description": "输入模型加速度过程方差"
+      "description": "加速度过程噪声方差，仅输入模式"
     },
     "gyr_cov_input": {
       "type": "number",
       "minimum": 0,
-      "description": "输入模型角速度过程方差"
+      "description": "角速度过程噪声方差，仅输入模式"
     },
     "acc_cov_output": {
       "type": "number",
       "minimum": 0,
-      "description": "输出模型加速度过程方差"
+      "description": "加速度过程噪声方差，仅观测模式"
     },
     "gyr_cov_output": {
       "type": "number",
       "minimum": 0,
-      "description": "输出模型角速度过程方差"
+      "description": "角速度过程噪声方差，仅观测模式"
     },
     "vel_cov": {
       "type": "number",
       "minimum": 0,
-      "description": "速度过程方差"
+      "description": "速度过程噪声方差，仅观测模式"
     },
     "b_acc_cov": {
       "type": "number",
       "minimum": 0,
-      "description": "加速度偏置过程方差"
+      "description": "加速度零偏过程噪声方差"
     },
     "b_gyr_cov": {
       "type": "number",
       "minimum": 0,
-      "description": "角速度偏置过程方差"
+      "description": "角速度零偏过程噪声方差"
     },
     "gravity": {
       "type": "vector3",
-      "description": "重力向量（三轴）"
+      "description": "重力对齐目标向量（米每二次方秒）"
     },
     "gravity_init": {
       "type": "vector3",
-      "description": "初始化重力向量（三轴）"
+      "description": "已知初始重力（米每二次方秒），运动启动或无惯性时用"
     },
     "ivox_nearby_type": {
       "type": "enum",
@@ -160,7 +160,7 @@
         "nearby18",
         "nearby26"
       ],
-      "description": "体素邻域类型"
+      "description": "增量体素近邻搜索范围"
     }
   },
   "unsupported": {

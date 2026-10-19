@@ -700,10 +700,13 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         *,
         unwrap: bool = False,
         map_response: bool = False,
+        require_agent_exposure: bool = True,
     ):
         """网页只适配传输和展示；执行、任务与取消均由公共能力拥有。"""
         descriptor = runtime.capability_registry.get_descriptor(capability_name)
-        access_manager.authorize_capability(descriptor)
+        # 只有固定的控制台专用只读路由才会关闭公开性检查，通用调用入口始终检查。
+        if require_agent_exposure:
+            access_manager.authorize_capability(descriptor)
         validate_closed_schema(arguments, descriptor.input_schema, path="arguments")
         requested_by = "local"
         request_context = _build_capability_request_context(
@@ -1025,11 +1028,13 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         # 同步路由由网关线程池执行，读取和序列化均不占用异步事件循环。
         active_library = runtime.memory_service.get_active_library_name()
         target_library = library_name.strip() if library_name is not None else active_library
+        # 该能力只服务控制台物品列表，刻意不向智能体公开；此固定路由复用其执行体，不经公开性检查。
         payload = _invoke_capability(
             request,
             "list_semantic_instances",
             {"library_name": target_library or "", "label": label},
             unwrap=True,
+            require_agent_exposure=False,
         )
         if runtime.memory_service.get_active_library_name() != active_library:
             raise GatewayError("查询期间记忆库已切换，请刷新。", error_code="memory_library_changed", http_status=409)

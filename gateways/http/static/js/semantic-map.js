@@ -59,7 +59,7 @@
     $('showSemanticRegions').disabled = semantic;
     $('semanticRegionPanelToggle').setAttribute('aria-expanded', String(!panel.hidden));
     $('semanticRegionPanelToggle').classList.toggle('active', !panel.hidden);
-    $('semanticRegionCount').textContent = state.data ? String(regions().length) : '—';
+    $('semanticRegionCount').textContent = state.data ? String(regions().length) : '';
     const running = state.service?.running || state.service?.busy;
     $('semanticRegionStart').hidden = Boolean(running);
     $('semanticRegionStop').hidden = !running;

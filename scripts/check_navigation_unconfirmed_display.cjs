@@ -7,7 +7,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const root = path.resolve(__dirname, '..');
-const paths = ['gateways/http/static/js/console.js', 'gateways/http/static/preview/js/console.js'];
+const paths = ['gateways/http/static/js/console.js'];
 let checks = 0;
 for (const relative of paths) {
   const source = fs.readFileSync(path.join(root, relative), 'utf8');

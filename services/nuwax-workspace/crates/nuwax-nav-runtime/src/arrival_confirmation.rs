@@ -50,8 +50,15 @@ impl<M: NavMotionPort, P: NavPlanner> NavScheduler<M, P> {
                 )
                 .await);
         };
-        let position_ok = pose.pose.position.distance(session.goal_pose.pose.position)
-            <= session.options.position_tolerance_m;
+        let actual = pose.pose.position;
+        let target = session.goal_pose.pose.position;
+        let position_ok = if session.options.position_tolerance_m == 0.0 {
+            nuwax_nav_types_messages::same_finite_position(
+                [actual.x, actual.y, actual.z], [target.x, target.y, target.z])
+        } else {
+            pose.pose.position.distance(session.goal_pose.pose.position)
+                <= session.options.position_tolerance_m
+        };
         let yaw = pose.pose.orientation.yaw() - session.goal_pose.pose.orientation.yaw();
         let orientation_ok = !session.options.requires_orientation()
             || yaw.sin().atan2(yaw.cos()).abs() <= session.options.yaw_tolerance_rad;

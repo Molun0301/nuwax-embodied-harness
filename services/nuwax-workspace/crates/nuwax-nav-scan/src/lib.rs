@@ -15,7 +15,7 @@ pub use local_search::probe_motion;
 use nuwax_nav_mls_planner::SurfaceSnapshot;
 use nuwax_nav_pct::Tomogram;
 pub use nuwax_nav_pct::{PlanningCancellation, planning_cancelled, with_planning_cancellation};
-use nuwax_nav_types_messages::MotionKinematics;
+use nuwax_nav_types_messages::{same_finite_position, MotionKinematics};
 pub type BodyPose = ([f64; 3], [f64; 4]);
 #[derive(Clone, Debug)]
 pub struct ScanConfig {
@@ -278,7 +278,9 @@ fn project(
         let endpoint_blocked=std::cell::Cell::new(None);
         if let Some(poses)=admit_candidate(project_to_region(map,start,points,kinematics,
             smooth,final_yaw,None,boundary,&endpoint_blocked))? {
-            if poses.last().is_some_and(|end|distance3(end.0,goal)<tolerance) {
+            if poses.last().is_some_and(|end| if tolerance == 0.0 {
+                same_finite_position(end.0, goal)
+            } else { distance3(end.0,goal)<tolerance }) {
                 return Ok(poses);
             }
         }
@@ -305,11 +307,18 @@ fn project_to_region(
         if (point[0] - start.0[0]).hypot(point[1] - start.0[1]) > 1e-5 { valid.push(point); }
     }
     if valid.is_empty() {
-        if arrival.is_some_and(|(goal, tolerance)| distance3(start.0, goal) >= tolerance) {
+        if arrival.is_some_and(|(goal, tolerance)| if tolerance == 0.0 {
+            !same_finite_position(start.0, goal)
+        } else { distance3(start.0, goal) >= tolerance }) {
             return Err("近场参考尚未到达原三维目标区域".into());
         }
         if let Some(yaw) = final_yaw {
             rotate(map, &mut poses, yaw, kinematics, boundary)?;
+        }
+        // 转向可按地形重投影高度；零容差仍须保留原三维位置。
+        if arrival.is_some_and(|(goal, tolerance)| tolerance == 0.0
+            && !same_finite_position(poses.last().unwrap().0, goal)) {
+            return Err("地形投影后的末点尚未到达原三维目标区域".into());
         }
         return Ok(poses);
     }
@@ -395,6 +404,7 @@ fn project_to_region(
         }
         poses.push(next);
         if arrival.is_some_and(|(goal, tolerance)| {
+            if tolerance == 0.0 { return same_finite_position(next.0, goal); }
             ((next.0[0] - goal[0]).powi(2)
                 + (next.0[1] - goal[1]).powi(2)
                 + (next.0[2] - goal[2]).powi(2))
@@ -405,12 +415,19 @@ fn project_to_region(
         }
     }
     if arrival
-        .is_some_and(|(goal, tolerance)| distance3(poses.last().unwrap().0, goal) >= tolerance)
+        .is_some_and(|(goal, tolerance)| if tolerance == 0.0 {
+            !same_finite_position(poses.last().unwrap().0, goal)
+        } else { distance3(poses.last().unwrap().0, goal) >= tolerance })
     {
         return Err("地形投影后的末点尚未到达原三维目标区域".into());
     }
     if let Some(heading) = final_yaw {
         rotate(map, &mut poses, heading, kinematics, boundary)?;
+    }
+    // 不改变正容差的原检查顺序；新零值出口验证最终完整姿态的位置。
+    if arrival.is_some_and(|(goal, tolerance)| tolerance == 0.0
+        && !same_finite_position(poses.last().unwrap().0, goal)) {
+        return Err("地形投影后的末点尚未到达原三维目标区域".into());
     }
     cancellation::checkpoint()?;
     Ok(poses)
@@ -907,6 +924,8 @@ mod tests {
     use std::{collections::BTreeMap, sync::Arc};
     include!("progress_prefix_tests.rs");
     include!("reference_probe_tests.rs");
+    include!("scan_zero_arrival_tests.rs");
+    include!("position_zero_search_tests.rs");
     #[cfg(feature="profile")]
     include!("phase_qualification_tests.rs");
     pub(super) fn motion() -> MotionKinematics {

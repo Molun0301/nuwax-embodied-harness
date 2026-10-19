@@ -496,11 +496,15 @@ pub(super) fn plan_progress(
     });
     let reach = |p: BodyPose| {
         if let Some((goal, tolerance)) = arrival {
-            return ((p.0[0] - goal[0]).powi(2)
-                + (p.0[1] - goal[1]).powi(2)
-                + (p.0[2] - goal[2]).powi(2))
-            .sqrt()
-                < tolerance
+            let position_ok = if tolerance == 0.0 {
+                super::same_finite_position(p.0, goal)
+            } else {
+                ((p.0[0] - goal[0]).powi(2)
+                    + (p.0[1] - goal[1]).powi(2)
+                    + (p.0[2] - goal[2]).powi(2))
+                .sqrt() < tolerance
+            };
+            return position_ok
                 && final_yaw.is_none_or(|heading| angle(yaw(p.1) - heading).abs() < 0.1);
         }
         // 中间轨迹必须走到窗口末端的横截面，并保持前向朝向。
@@ -688,7 +692,9 @@ pub(super) fn plan_progress(
             if !visible {continue;}
             let mut prefix=vec![from];
             if admitted(super::rotate(map,&mut prefix,heading,motion,boundary),&mut rejected_sample)?.is_none() {continue;}
-            let in_goal=|pose:BodyPose|arrival.is_some_and(|(goal,tolerance)|super::distance3(pose.0,goal)<tolerance);
+            let in_goal=|pose:BodyPose|arrival.is_some_and(|(goal,tolerance)|
+                if tolerance == 0.0 { super::same_finite_position(pose.0, goal) }
+                else { super::distance3(pose.0,goal)<tolerance });
             let Some(line)=admitted(probe_motion_until(map,*prefix.last().unwrap(),length,turn,boundary,in_goal),&mut rejected_sample)? else{continue;};
             prefix.extend(line);
             if let Some(heading)=final_yaw {

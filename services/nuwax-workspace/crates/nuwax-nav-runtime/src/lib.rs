@@ -2906,6 +2906,7 @@ fn path_rejected(reason: impl Into<String>) -> RuntimeError {
 mod tests {
     include!("scheduler_delivery_gap_tests.rs");
     include!("arrival_confirmation_tests.rs");
+    include!("position_zero_runtime_tests.rs");
     include!("recent_source_health_tests.rs");
     include!("scheduler_detour_cancellation_tests.rs");
     use std::collections::HashMap;

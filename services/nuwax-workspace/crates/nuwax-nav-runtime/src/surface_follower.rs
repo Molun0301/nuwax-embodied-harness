@@ -400,7 +400,9 @@ impl SurfaceFollower {
         if at_path_end {
             if endpoint.pose.position.distance(goal.pose.position)
                 >= self.config.controller.goal_tolerance
-                || position.distance(goal.pose.position) >= self.config.controller.goal_tolerance
+                || if self.options.position_tolerance_m == 0.0 {
+                    !nuwax_nav_types_messages::same_finite_position(xyz(position), xyz(goal.pose.position))
+                } else { position.distance(goal.pose.position) >= self.config.controller.goal_tolerance }
             {
                 return PlannerStep::ReplanRequired(
                     "安全截断路径已结束，原三维目标尚未到达".into(),

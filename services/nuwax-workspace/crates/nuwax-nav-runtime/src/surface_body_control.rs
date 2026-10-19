@@ -473,8 +473,13 @@ impl SurfaceFollower {
         ).ok();
         // 目标选点与规划候选共同使用原三维容差球，同层不能扩大最终到达范围。
         let final_distance = position.distance(goal.pose.position);
+        // Control deadbands do not enlarge the raw zero-position goal.
+        let final_position_reached = if self.options.position_tolerance_m == 0.0 {
+            nuwax_nav_types_messages::same_finite_position(
+                super::xyz(position), super::xyz(goal.pose.position))
+        } else { final_distance < self.config.controller.goal_tolerance };
         let final_yaw = angle_diff(goal.pose.orientation.yaw(), yaw);
-        if final_distance < self.config.controller.goal_tolerance
+        if final_position_reached
             && (!self.options.requires_orientation() || final_yaw.abs() < self.config.controller.orientation_tolerance)
         {
             // 这里只确认到达规划终点；调度器随后撤租归零，等待守卫的物理
@@ -547,11 +552,15 @@ impl SurfaceFollower {
             // 否则实际高度使机体仍在原三维球外时，会被锁在身后内部点，无法走到合法末点。
             let terminal_position=path.poses[self.path_index..].iter()
                 .all(|pose|horizontal_distance(target,pose)<1e-5);
-            let goal_position=(target.pose.position.x-goal.pose.position.x)
-                .hypot(target.pose.position.y-goal.pose.position.y)<self.config.controller.goal_tolerance;
+            let goal_position = if self.options.position_tolerance_m == 0.0 {
+                nuwax_nav_types_messages::same_finite_position(
+                    super::xyz(target.pose.position), super::xyz(goal.pose.position))
+            } else { (target.pose.position.x-goal.pose.position.x)
+                .hypot(target.pose.position.y-goal.pose.position.y)<self.config.controller.goal_tolerance };
+
             // 原目标外的安全截断末点仍须消费，交由后续分支请求新的完整路线。
             let reached_position = !terminal_position || !goal_position
-                || final_distance < self.config.controller.goal_tolerance;
+                || final_position_reached;
             let segment_length=horizontal_distance(target,previous);
             let curved=!rotation && segment_length>1e-5
                 && angle_diff(target.pose.orientation.yaw(),previous.pose.orientation.yaw()).abs()>1e-6;
@@ -639,7 +648,8 @@ impl SurfaceFollower {
         // 显式原地转向按已有角度进度完成；同方向细分角由下方前瞻连续消费。
         // 不再按剩余角度或整段角度把尚未完成的转向改写成平移曲线。
         if self.path_index >= path.poses.len() {
-            if final_distance >= self.config.controller.goal_tolerance {
+            if if self.options.position_tolerance_m == 0.0 { !final_position_reached }
+                else { final_distance >= self.config.controller.goal_tolerance } {
                 return PlannerStep::ReplanRequired("三维安全路径结束，原目标未到达".into());
             }
             self.control_target = Some(PlanarPose {

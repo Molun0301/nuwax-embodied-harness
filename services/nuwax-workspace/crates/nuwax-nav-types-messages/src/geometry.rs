@@ -130,6 +130,15 @@ impl Point2 {
     }
 }
 
+/// 数值逐项相等的有限三维位置；不通过距离平方推断相等。
+///
+/// `+0.0` 与 `-0.0` 表示同一位置。调用方仍负责原坐标系和来源资格；
+/// 本函数不定义正容差的开闭边界，也不授予姿态、路径或运动许可。
+#[must_use]
+pub fn same_finite_position(actual: [f64; 3], goal: [f64; 3]) -> bool {
+    actual == goal && actual.iter().all(|coordinate| coordinate.is_finite())
+}
+
 /// 3D 点
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct Point3 {
@@ -533,5 +542,32 @@ mod tests {
         assert!(s.contains("\"monotonic\""));
         let back: Timestamp = serde_json::from_str(&s).unwrap();
         assert_eq!(back, t);
+    }
+}
+
+// DRAFT ONLY: append a private test module to geometry.rs.
+#[cfg(test)]
+mod exact_position_tests {
+    use super::*;
+    #[test]
+    fn exact_finite_position_never_uses_an_underflowed_norm() {
+        let zero = [0.0; 3];
+        assert!(same_finite_position(zero, [-0.0; 3]));
+        for delta in [f64::from_bits(1), f64::MIN_POSITIVE, 1e-200, f64::EPSILON] {
+            for axis in 0..3 {
+                let mut other = zero;
+                other[axis] = delta;
+                assert_ne!(other[axis], zero[axis]);
+                assert!(!same_finite_position(zero, other));
+                assert!(!same_finite_position(other, zero));
+                if delta <= 1e-200 {
+                    assert_eq!(Point3::new(other[0], other[1], other[2])
+                        .distance(Point3::new(0.0, 0.0, 0.0)), 0.0);
+                }
+            }
+        }
+        for invalid in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            assert!(!same_finite_position([invalid, 0.0, 0.0], [invalid, 0.0, 0.0]));
+        }
     }
 }

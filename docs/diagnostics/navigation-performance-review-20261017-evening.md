@@ -651,6 +651,18 @@ retained与fresh有序完整pose数值、长度和终点对照通过；fresh查�
 
 按原门拒绝候选。恢复资格B两源四hook后stack/mls tests check通过，再精确恢复4c652c5f整源、归档撤出新tests及临时perf，tree clean。反向patch清空文件未删除的包装断言异常独立保留；check实际针对已恢复且不引用空文件的B，无追加性能样本。仅保存[拒绝报告](navigation-columns-dedup-rejection-20261018.md)与[全部整数结果](navigation-columns-dedup-rejection-20261018.json)，不保留新生产/永久诊断接线。
 
+## 第四十九阶段：合法零位置容差从不可完成修复为精确原点合同
+
+原公开输入保留显式position_tolerance_m=0，但Scan完整到达要求distance<0。五项原核真实控制实际3PASS+2业务RED：合法body/tomogram及完全相同起终位置下，projection拒绝原目标区域，public Full用默认256预算仍BudgetExhausted且closest为原姿态。原工作量expanded256/candidates3584/sweeps2488/nodes2489/frontier_peak2223；reason257访问是检查口径，不当257展开，也不以单次时间称性能基线。
+
+接受最窄position0修复：共享finite xyz逐项数值相等（先相等再只查actual三项有限，±0等值，不用可下溢的距离平方）；Scan投影/搜索reach/连接in_goal及转向后零位置复核、真实Follower成功/末组/耗尽、worker重资格、停车后新采样确认贯通。所有正容差各层原式和数值控制余量保留，yaw不改。相等不替代body/frame/source/epoch/lease/停止证明，不保证物理系统从非零残差精确收敛。
+
+三包默认release check/tests、lib no-run及27exact全通过，actual-list各1；原5Scan断言与旧核原文一致，两个正常RED转PASS而非ignored。新7包含shared极小/subnormal/非有限控制、内部直接search、真实SurfaceFollower/原scheduler及真实RouteFollowerOFF/worker重资格；旧15保护正边界、partial、目标区域、旧结果和停车确认。内部search原地reach实际expanded0/candidates0/sweeps0/nodes1/frontier1，不外推真实运动性能。
+
+分层证据不是单一ON Scan→worker→scheduler或RPC/实机：FakeMotion仅原内存proof端口，zero连接in_goal未直接命中测试，yaw0及极小正容差既有差异另审。worker明确观察旧result pose version与当前不同，避免新计算覆盖假证据；原停止后新采样及非零漂移拒绝保持。
+
+最终12源（7生产源）与应用前冻结逐字一致，无fixture/类型修正。首offline check在编译前因缺bit-set dev包退出，经原官方registry仅补11个锁定依赖、Cargo.lock逐字不变后原offline批全过。原缺cache、两RED及所有结果保留；报告脚本换行比较修正未改源码。仅源级合同修复与上述资格，不宣称CPU/RSS/实机时延改善。
+
 ## 后续持续检查
 
 1. 墙前晚到路径的实际恢复与初始 full/partial/PCT 顺序，保留及时移动和真实避障

@@ -20,8 +20,10 @@ use crate::surfaces::ColumnIz;
 use crate::voxel::{surface_point_xyz, voxelize, VoxelKey};
 
 mod observations;
+mod native_ground;
 mod recent;
 pub use observations::{ObservedGroundLayer, SurfaceObservation, SurfaceObservations};
+pub use native_ground::{GroundKey, SourceGroundRecord};
 mod body;
 pub use body::{BodyGroundRelation, GroundQuery, GroundQueryState, SurfaceBodyEnvelope};
 mod passage;

@@ -80,6 +80,7 @@ pub struct SurfaceObservations {
     #[cfg(test)]
     obstacle_cache: Arc<std::sync::Mutex<AHashMap<[i32; 3], bool>>>,
     observed_layers: im::HashMap<[i32;3],Arc<BTreeMap<u16,ObservedGroundLayer>>,ahash::RandomState>,
+    native_ground: super::native_ground::NativeGroundIndex,
     // Identity only changes when a measured plane/member geometry changes.
     layer_geometry: Arc<()>,
     // 纯占据几何的固定参考场；统计刷新与私有查询视图共享，真实成员变化才撤销。
@@ -96,6 +97,7 @@ impl SurfaceObservations {
             blocks: self.blocks.clone(),
             columns: self.columns.clone(),
             observed_layers: self.observed_layers.clone(),
+            native_ground: self.native_ground.clone(),
             layer_geometry: self.layer_geometry.clone(),
             legacy_reference_cache: self.legacy_reference_cache.clone(),
             #[cfg(test)]
@@ -117,6 +119,7 @@ impl SurfaceObservations {
             blocks: Default::default(),
             columns: Default::default(),
             observed_layers: Default::default(),
+            native_ground: Default::default(),
             layer_geometry: Arc::new(()),
             legacy_reference_cache: Default::default(),
             #[cfg(test)]
@@ -268,8 +271,29 @@ impl SurfaceObservations {
         })
     }
 
+    /// All source representations use this borrowing query. Legacy plane
+    /// compatibility remains available through ground_layers for old fixtures.
+    pub fn ground_records(&self,column:[i32;2])->impl Iterator<Item=SourceGroundRecord<'_>> {
+        self.ground_layers(column).map(SourceGroundRecord::LegacyPlane)
+            .chain(self.native_ground.records(column))
+    }
+
+    pub fn ground_record(&self,key:GroundKey)->Option<SourceGroundRecord<'_>> {
+        let anchor=key.anchor();
+        self.ground_records([anchor[0],anchor[1]]).find(|record|record.key()==key)
+    }
+
+    /// Install lightweight native projections after all occupancy and record
+    /// fragments for this block-XY have passed the complete-root admission.
+    pub fn replace_heightfield_columns(&mut self,block_xy:[i32;2],
+        blocks:&[(nuwax_map_chunks::Key,nuwax_map_chunks::GroundRecords)]) -> Vec<[i32;2]> {
+        let changed=self.native_ground.replace_block_xy(block_xy,blocks);
+        if !changed.is_empty() {self.layer_geometry=Arc::new(());self.complete_geometry_source=false;}
+        changed
+    }
+
     pub(super) fn ground_member(&self,key:[i32;3])->bool {
-        self.ground_layers([key[0],key[1]]).any(|layer|layer.members.binary_search(&key[2]).is_ok())
+        self.ground_records([key[0],key[1]]).any(|record|record.contains_member(key))
     }
 
     /// 确认本索引覆盖同域、同精度、同次几何提交的全部已知占据。
@@ -286,7 +310,7 @@ impl SurfaceObservations {
 
     /// 完整源是否包含独立于占据带顶的实测地面层；仅检查索引状态。
     pub(super) fn has_measured_ground_layers(&self)->bool {
-        self.complete_geometry_source && !self.observed_layers.is_empty()
+        self.complete_geometry_source && (!self.observed_layers.is_empty() || !self.native_ground.is_empty())
     }
 
     /// 仅比较占据几何；新扫描时间和命中次数不使层析代价重建。
@@ -305,6 +329,7 @@ impl SurfaceObservations {
             && self.complete_geometry_source==other.complete_geometry_source
             && self.columns.ptr_eq(&other.columns)
             && self.observed_layers.ptr_eq(&other.observed_layers)
+            && Arc::ptr_eq(&self.layer_geometry,&other.layer_geometry)
     }
     pub(super) fn navigation_columns(&self)->impl Iterator<Item=([i32;2],&[i32])> {
         self.columns.iter().map(|(&key,levels)|(key,levels.as_slice()))

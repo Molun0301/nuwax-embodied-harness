@@ -64,7 +64,8 @@ impl GroundRecords {
     pub fn iter(&self) -> GroundRecordIter<'_> {
         match self { Self::Legacy(v) => GroundRecordIter::Legacy(v.iter()), Self::Versioned(v) => GroundRecordIter::Versioned(v.iter()) }
     }
-    pub(crate) fn get(&self, key: u16) -> Option<GroundRecordRef<'_>> {
+    /// Borrow one admitted block-local record without copying its members or bins.
+    pub fn get(&self, key: u16) -> Option<GroundRecordRef<'_>> {
         match self {
             Self::Legacy(v) => v.get(&key).map(GroundRecordRef::LegacyPlane),
             Self::Versioned(v) => v.get(&key).map(|r| match r {

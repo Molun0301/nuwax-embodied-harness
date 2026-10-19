@@ -13,7 +13,7 @@ mod polyline_reuse_tests;
 mod profile;
 pub use local_search::probe_motion;
 use nuwax_nav_mls_planner::SurfaceSnapshot;
-use nuwax_nav_mls_planner::surface::{BodyGroundState, BodyMotionProjection, SurfaceBodyQueryView};
+use nuwax_nav_mls_planner::surface::{BodyGroundState, BodyMotionProjection, NavigationPlanningFork, SurfaceBodyQueryView};
 use nuwax_nav_pct::Tomogram;
 use nuwax_nav_pct::ground_route::{GroundWalkState, GroundWalkSegment, GroundWalkKey};
 pub use nuwax_nav_pct::{PlanningCancellation, planning_cancelled, with_planning_cancellation};
@@ -177,12 +177,16 @@ pub struct GroundCandidateBinding {
     edges:Vec<GroundMotionBinding>,
     family:CandidateFamily,
     planned_join:bool,
+    // The pair list is empty for a stationary winner. Retain its actual full
+    // pose so that an unrelated singleton cannot borrow this binding.
+    stationary_pose:Option<BodyPose>,
 }
 impl GroundCandidateBinding {
     pub fn original_window(&self)->nuwax_nav_pct::ground_route::GroundRouteWindow<'_> {self.original.window()}
     pub fn candidate(&self)->&nuwax_nav_pct::ground_route::GroundCandidateReference {&self.candidate}
     pub fn edges(&self)->&[GroundMotionBinding] {&self.edges}
     pub fn family(&self)->CandidateFamily {self.family}
+    pub fn stationary_pose(&self)->Option<BodyPose> {self.stationary_pose}
     pub fn planned_join(&self)->bool {self.planned_join}
     pub fn covers_original_goal(&self)->bool {self.planned_join && self.original.window().to().is_terminal()}
     /// Cropping retains the original connection and sampling grid. No source
@@ -201,11 +205,8 @@ impl<'a> GroundMotionSlice<'a> {
     pub fn range(self)->[f64;2] {[self.from,self.to]}
     pub fn original_sample(self,progress:f64)->Option<(usize,f64)> {
         if !progress.is_finite() || !(0.0..=1.0).contains(&progress) {return None;}
-        let (_,_,steps)=self.binding.candidate.connection(self.edge)?;
         let t=self.from+progress*(self.to-self.from);
-        let value=t*steps as f64;
-        let sample=(value.floor() as usize).min(steps);
-        Some((sample,if sample==steps {0.0}else{value-sample as f64}))
+        self.binding.candidate.original_sample(self.edge,t)
     }
 }
 #[derive(Debug)]
@@ -241,10 +242,11 @@ fn map_selected_candidate(trajectory:LocalTrajectory,origins:CandidateOrigins,
                 .map_or(CandidateEdgeOrigin::Family(origins.family),|part|part.origin);
             edges.push(GroundMotionBinding {motion:[pair[0],pair[1]],origin});
         }
-        let candidate=window.owner().freeze_candidate(segments).map_err(|e|LocalPlanError::from(e.to_string()))?;
+        let candidate=window.owner().freeze_candidate_from(window.from().walk_state(),segments).map_err(|e|LocalPlanError::from(e.to_string()))?;
         let planned_join=!trajectory.partial && candidate.end_matches(window.to());
         cancellation::checkpoint()?;
-        Ok(GroundCandidateBinding {original:window.freeze(),candidate,edges,family:origins.family,planned_join})
+        let stationary_pose=(trajectory.poses.len()==1).then_some(trajectory.poses[0]);
+        Ok(GroundCandidateBinding {original:window.freeze(),candidate,edges,family:origins.family,planned_join,stationary_pose})
     })();
     match mapped {Ok(binding)=>Ok(MappedLocalTrajectory {trajectory,binding}),
         Err(error) if error.kind==LocalPlanFailureKind::Cancelled=>Err(GroundCandidateError::Cancelled {trajectory,error}),
@@ -286,15 +288,67 @@ pub fn plan_driven_ground(
     if !window.owner().matches_source(map) || window.from().walk_state().xy()!=[start.0[0],start.0[1]] {
         return Err(GroundCandidateError::MappingInput("navigation source/start address retired".into()));
     }
+    plan_driven_ground_with_extent(map,None,tomogram,start,start_ground,window.from().walk_state(),
+        reference,kinematics,config,final_yaw,arrival,boundary,follow_reference,prefer_straight,
+        progress,window,PlanExtent::Full).map(|outcome|outcome.expect("full Ground Scan"))
+}
+/// Preserve the source-bound private query all the way into the original Scan
+/// setup. Incoming is the current consumed address, independent of window intent.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_driven_ground_on_fork(
+    fork:&NavigationPlanningFork,tomogram:&Tomogram,start:BodyPose,start_ground:&BodyGroundState,
+    incoming:GroundWalkState<'_>,reference:&[[f64;2]],kinematics:&MotionKinematics,config:&ScanConfig,
+    final_yaw:Option<f64>,arrival:Option<([f64;2],f64)>,boundary:&[[f64;2]],
+    follow_reference:bool,prefer_straight:bool,progress:Option<GroundProgressPrefixPolicy<'_>>,
+    window:nuwax_nav_pct::ground_route::GroundRouteWindow<'_>,
+)->Result<MappedLocalTrajectory,GroundCandidateError> {
+    plan_driven_ground_with_extent(fork.snapshot(),Some(fork.body_query()),tomogram,start,start_ground,
+        incoming,reference,kinematics,config,final_yaw,arrival,boundary,follow_reference,prefer_straight,
+        progress,window,PlanExtent::Full).map(|outcome|outcome.expect("full Ground Scan"))
+}
+/// The unchanged reference-only stopping point of Scan, including Miss. No
+/// local search or second physical winner is substituted after a missed probe.
+#[derive(Debug)]
+pub enum GroundReferenceCandidateOutcome { Complete(MappedLocalTrajectory), Miss }
+#[allow(clippy::too_many_arguments)]
+pub fn probe_ground_reference_candidates_on_fork(
+    fork:&NavigationPlanningFork,tomogram:&Tomogram,start:BodyPose,start_ground:&BodyGroundState,
+    incoming:GroundWalkState<'_>,reference:&[[f64;2]],kinematics:&MotionKinematics,config:&ScanConfig,
+    final_yaw:Option<f64>,arrival:Option<([f64;2],f64)>,boundary:&[[f64;2]],
+    follow_reference:bool,prefer_straight:bool,progress:Option<GroundProgressPrefixPolicy<'_>>,
+    window:nuwax_nav_pct::ground_route::GroundRouteWindow<'_>,
+)->Result<GroundReferenceCandidateOutcome,GroundCandidateError> {
+    plan_driven_ground_with_extent(fork.snapshot(),Some(fork.body_query()),tomogram,start,start_ground,
+        incoming,reference,kinematics,config,final_yaw,arrival,boundary,follow_reference,prefer_straight,
+        progress,window,PlanExtent::ReferenceOnly).map(|outcome|match outcome {
+            Some(path)=>GroundReferenceCandidateOutcome::Complete(path),
+            None=>GroundReferenceCandidateOutcome::Miss,
+        })
+}
+#[allow(clippy::too_many_arguments)]
+fn plan_driven_ground_with_extent(
+    map:&SurfaceSnapshot,paired_query:Option<&SurfaceBodyQueryView>,tomogram:&Tomogram,
+    start:BodyPose,start_ground:&BodyGroundState,incoming:GroundWalkState<'_>,
+    reference:&[[f64;2]],kinematics:&MotionKinematics,config:&ScanConfig,final_yaw:Option<f64>,
+    arrival:Option<([f64;2],f64)>,boundary:&[[f64;2]],follow_reference:bool,prefer_straight:bool,
+    progress:Option<GroundProgressPrefixPolicy<'_>>,window:nuwax_nav_pct::ground_route::GroundRouteWindow<'_>,
+    extent:PlanExtent,
+)->Result<Option<MappedLocalTrajectory>,GroundCandidateError> {
+    if !incoming.same_reference_owner(window.owner()) || incoming.xy()!=[start.0[0],start.0[1]] {
+        return Err(GroundCandidateError::MappingInput("navigation incoming/window address mismatch".into()));
+    }
     cancellation::checkpoint().map_err(GroundCandidateError::Planning)?;
     let progress=progress.map(|p|ProgressPolicy {reference:p.reference,minimum_distance_m:p.minimum_distance_m});
     validate_progress(progress).map_err(GroundCandidateError::Planning)?;
     let mut origins=CandidateOrigins {family:CandidateFamily::Direct,parts:Vec::new()};
     let mut navigation=None;
     let outcome=plan_impl(map,tomogram,start,reference,kinematics,config,final_yaw,arrival,boundary,
-        follow_reference,prefer_straight,progress,PlanExtent::Full,Some(start_ground),Some(&mut origins),
-        Some(window.from().walk_state()),&mut navigation).map_err(GroundCandidateError::Planning)?;
-    let PlanOutcome::Trajectory(trajectory)=outcome else {unreachable!("full Scan")};
+        follow_reference,prefer_straight,progress,extent,Some(start_ground),Some(&mut origins),
+        Some(incoming),&mut navigation,paired_query).map_err(GroundCandidateError::Planning)?;
+    let trajectory=match outcome {
+        PlanOutcome::Trajectory(trajectory)=>trajectory,
+        PlanOutcome::ReferenceMiss=>return Ok(None),
+    };
     let result=(|| ->Result<GroundCandidateBinding,LocalPlanError> {
         cancellation::checkpoint()?;
         let segments=navigation.unwrap_or_default();
@@ -302,16 +356,17 @@ pub fn plan_driven_ground(
             return Err("accepted candidate lost a navigation edge".into());
         }
         #[cfg(test)] GROUND_EDGE_WORK.set({let mut n=GROUND_EDGE_WORK.get();n[2]+=1;n});
-        let candidate=window.owner().freeze_candidate(segments).map_err(|e|LocalPlanError::from(e.to_string()))?;
+        let candidate=window.owner().freeze_candidate_from(incoming,segments).map_err(|e|LocalPlanError::from(e.to_string()))?;
         let edges=trajectory.poses.windows(2).enumerate().map(|(edge,pair)|GroundMotionBinding {
             motion:[pair[0],pair[1]],origin:origins.parts.iter().find(|part|part.edges.contains(&edge))
                 .map_or(CandidateEdgeOrigin::Family(origins.family),|part|part.origin),
         }).collect();
         let planned_join=!trajectory.partial && candidate.end_matches(window.to());
         cancellation::checkpoint()?;
-        Ok(GroundCandidateBinding {original:window.freeze(),candidate,edges,family:origins.family,planned_join})
+        let stationary_pose=(trajectory.poses.len()==1).then_some(trajectory.poses[0]);
+        Ok(GroundCandidateBinding {original:window.freeze(),candidate,edges,family:origins.family,planned_join,stationary_pose})
     })();
-    match result {Ok(binding)=>Ok(MappedLocalTrajectory {trajectory,binding}),
+    match result {Ok(binding)=>Ok(Some(MappedLocalTrajectory {trajectory,binding})),
         Err(error) if error.kind==LocalPlanFailureKind::Cancelled=>Err(GroundCandidateError::Cancelled {trajectory,error}),
         Err(error)=>Err(GroundCandidateError::Mapping {trajectory,reason:error.to_string()})}
 }
@@ -615,9 +670,17 @@ fn project_to_region_state<'a,const N:usize>(
         if (point[0] - start.0[0]).hypot(point[1] - start.0[1]) > 1e-5 { valid.push(point); }
     }
     if valid.is_empty() {
-        if ground.navigation.is_some() {
-            let next=advance_state(query,&mut ground,start,[start.0[0],start.0[1]],yaw(start.1),boundary,&mut segments)?;
-            poses.push(next);
+        if let Some(navigation)=ground.navigation {
+            // A stationary candidate validates the supplied actual pose. It does
+            // not publish a duplicate edge or consume a predicted association.
+            let segment=navigation.walk_xy([start.0[0],start.0[1]],boundary,None)
+                .map_err(|error|LocalPlanError::from(error.to_string()))?;
+            let mut witness=None;
+            let result=segment.with_body_navigation(|_,nav|
+                query.validate_motion_with_navigation(start,start,&ground.physical,nav,boundary,&mut witness))
+                .map_err(|error|LocalPlanError::from(error.to_string()))?;
+            result.map_err(|error|LocalPlanError::from_surface(error,witness))?;
+            cancellation::checkpoint()?;
         }
         if arrival.is_some_and(|(goal, tolerance)| if tolerance == 0.0 {
             !goal_exact(start.0, goal)
@@ -856,7 +919,7 @@ fn plan_with_extent_recorded(
     cancellation::checkpoint()?;
     validate_progress(progress.map(Into::into))?;
     let result = plan_impl(map, tomogram, start, reference, kinematics, config, final_yaw,
-        arrival, boundary, follow_reference, prefer_straight,progress.map(Into::into),extent,initial_ground,origins,None,&mut None);
+        arrival, boundary, follow_reference, prefer_straight,progress.map(Into::into),extent,initial_ground,origins,None,&mut None,None);
     cancellation::checkpoint()?;
     result.map_err(|mut failure| {
         if let Some(witness)=failure.body_witness.take() {
@@ -976,6 +1039,7 @@ fn plan_impl<'a,const N:usize>(
     mut origins: Option<&mut CandidateOrigins>,
     initial_navigation:Option<GroundWalkState<'a>>,
     navigation_output:&mut Option<Vec<GroundWalkSegment<'a>>>,
+    paired_query:Option<&SurfaceBodyQueryView>,
 ) -> Result<PlanOutcome, LocalPlanError> {
     #[cfg(feature="profile")]
     let mut phase = profile::Phase::begin("scan_setup");
@@ -996,7 +1060,17 @@ fn plan_impl<'a,const N:usize>(
         .fold(0.0, f64::max);
     let model = map.body_envelope().unwrap();
     // 来源只由本次规划拥有方绑定一次，候选分支只复制小地面状态。
-    let (query, physical) = bind_query_with_ground(map, start, initial_ground)?;
+    let ordinary_query;
+    let (query, physical) = if let Some(query)=paired_query {
+        // The paired factory has already selected this exact source basis and
+        // private cache. Recreating map.body_query() here would lose the basis.
+        let physical=initial_ground.ok_or("paired Ground Scan requires physical state")?.clone();
+        (query,physical)
+    } else {
+        let (query,physical)=bind_query_with_ground(map,start,initial_ground)?;
+        ordinary_query=query;
+        (&ordinary_query,physical)
+    };
     let start_ground=MotionState {physical,navigation:initial_navigation};
     let xmin = model
         .footprint_xy_m

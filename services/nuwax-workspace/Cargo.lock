@@ -2052,6 +2052,7 @@ dependencies = [
  "async-trait",
  "nuwax-motion-safety-guard",
  "nuwax-nav-astar",
+ "nuwax-map-chunks",
  "nuwax-nav-control",
  "nuwax-nav-mls-planner",
  "nuwax-nav-pct",

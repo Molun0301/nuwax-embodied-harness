@@ -162,7 +162,7 @@ mod partial_route_priority_tests {
     // Mirrors only request construction at route_follower.rs:255-259. It does
     // not bypass PlanKernel::compute's actual normalization/materialization.
     fn snapshot_request(follower: &RouteFollower, detour: bool) -> PlanRequest {
-        PlanRequest {
+        PlanRequest {ground:None,
             start_ground:follower.controller.current_ground_query_owned().map(|(_,ground)|ground),
             source: follower.map.as_ref().unwrap().clone(),
             change_basis: follower.change_basis.clone(),
@@ -190,7 +190,7 @@ mod partial_route_priority_tests {
     }
 
     fn duplicate_request(r: &PlanRequest) -> PlanRequest {
-        PlanRequest {
+        PlanRequest {ground:None,
             start_ground:r.start_ground.clone(),
             source: r.source.clone(),
             change_basis: r.change_basis.clone(),

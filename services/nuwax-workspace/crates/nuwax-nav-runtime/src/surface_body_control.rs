@@ -3,6 +3,8 @@ use super::*;
 use nuwax_nav_control::{choose_tracking_control_with_period_check, PlanarPose, TrackingScore};
 use crate::command_dispatch::ObservationProofAccumulator;
 use nuwax_nav_mls_planner::surface::{BodyGroundState, SurfaceBodyQueryView};
+use nuwax_nav_pct::ground_route::{GroundWalkKey, GroundWalkState};
+use crate::replan_feedback::GroundActualBasis;
 #[cfg(test)]
 use crate::command_dispatch::ObservationClockAnchor;
 type BodyPose = ([f64; 3], [f64; 4]);
@@ -11,25 +13,27 @@ type BodyPose = ([f64; 3], [f64; 4]);
 const WAYPOINT_ROTATION_TOLERANCE_RAD: f64 = 0.05;
 
 #[derive(Clone, Debug, PartialEq)]
-struct BodyMotionSuccess {
-    pose: BodyPose,
-    ground: Option<BodyGroundState>,
+pub(super) struct BodyMotionSuccess {
+    pub(super) pose: BodyPose,
+    pub(super) ground: Option<BodyGroundState>,
     // Dependency of the entire successful query, including its future-view check.
-    latest_start_ns: Option<u64>,
+    pub(super) latest_start_ns: Option<u64>,
 }
 #[cfg(test)]
 type BodyMotionResult = Result<BodyMotionSuccess, nuwax_nav_mls_planner::surface::SurfaceError>;
 
 
 #[derive(Clone, Debug, PartialEq)]
-enum BodyMotionFailure {
+pub(super) enum BodyMotionFailure {
+    Navigation(String),
     Legacy(nuwax_nav_mls_planner::surface::SurfaceError),
     Body(nuwax_nav_mls_planner::surface::BodyFailureWitness),
 }
 impl BodyMotionFailure {
     #[cfg(test)]
     fn legacy_error(&self)->nuwax_nav_mls_planner::surface::SurfaceError {
-        match self {Self::Legacy(error)=>error.clone(),Self::Body(witness)=>witness.rejection.error()}
+        match self {Self::Navigation(_)=>nuwax_nav_mls_planner::surface::SurfaceError::InvalidPose,
+            Self::Legacy(error)=>error.clone(),Self::Body(witness)=>witness.rejection.error()}
     }
 }
 impl From<nuwax_nav_mls_planner::surface::SurfaceError> for BodyMotionFailure {
@@ -37,7 +41,7 @@ impl From<nuwax_nav_mls_planner::surface::SurfaceError> for BodyMotionFailure {
 }
 impl std::fmt::Display for BodyMotionFailure {
     fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {
-        match self {Self::Legacy(error)=>write!(f,"{error}"),Self::Body(witness)=>write!(f,"{}; {witness}",witness.rejection.error())}
+        match self {Self::Navigation(error)=>write!(f,"{error}"),Self::Legacy(error)=>write!(f,"{error}"),Self::Body(witness)=>write!(f,"{}; {witness}",witness.rejection.error())}
     }
 }
 fn motion_failure<T>(result:Result<T,nuwax_nav_mls_planner::surface::SurfaceError>,
@@ -47,12 +51,13 @@ fn motion_failure<T>(result:Result<T,nuwax_nav_mls_planner::surface::SurfaceErro
 
 /// 仅在一次控制选择内共享；地图、当前足迹和观察集合由该调用固定。
 #[derive(Hash, PartialEq, Eq)]
-struct BodyMotionQuery {
+pub(super) struct BodyMotionQuery {
     from: [u64; 7],
     target: [u64; 3],
     preserve_height: bool,
     observation_time_ns: Option<u64>,
     ground: Option<BodyGroundState>,
+    navigation: Option<GroundWalkKey>,
 }
 
 #[cfg(test)]
@@ -73,7 +78,26 @@ fn memoized_body_motion_impl<E:Clone>(
     proof:&ObservationProofAccumulator,from:BodyPose,target:PlanarPose,preserve_height:bool,
     observation_time_ns:Option<u64>,ground:Option<&BodyGroundState>,check:impl FnOnce()->Result<BodyMotionSuccess,E>,
 )->Result<BodyMotionSuccess,E> {
-    // 不量化坐标、不归一化四元数；不同的整拍/细分站姿必须分别查询。
+    memoized_motion(cache,proof,from,target,preserve_height,observation_time_ns,ground,None,
+        check,|success|success.latest_start_ns)
+}
+
+// A successful control edge owns its physical end state and borrows its exact
+// navigation end state. Memo hits restore both; the actual cursor is untouched.
+#[derive(Clone, Debug)]
+pub(super) struct ControlMotionSuccess<'a> {
+    pub(super) body: BodyMotionSuccess,
+    pub(super) navigation: Option<GroundWalkState<'a>>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn memoized_motion<S:Clone,E:Clone>(
+    cache:&std::cell::RefCell<std::collections::HashMap<BodyMotionQuery,Result<S,E>>>,
+    proof:&ObservationProofAccumulator,from:BodyPose,target:PlanarPose,preserve_height:bool,
+    observation_time_ns:Option<u64>,ground:Option<&BodyGroundState>,navigation:Option<GroundWalkKey>,
+    check:impl FnOnce()->Result<S,E>,bound:impl Fn(&S)->Option<u64>,
+)->Result<S,E> {
+    // No quantization; source and boundary are fixed by this invocation's owner.
     let key = BodyMotionQuery {
         from: [from.0[0], from.0[1], from.0[2], from.1[0], from.1[1], from.1[2], from.1[3]]
             .map(f64::to_bits),
@@ -81,17 +105,129 @@ fn memoized_body_motion_impl<E:Clone>(
         preserve_height,
         observation_time_ns,
         ground:ground.cloned(),
+        navigation,
     };
     if let Some(result) = cache.borrow().get(&key) {
         #[cfg(test)] crate::control_profile::count(crate::control_profile::Counter::MotionMemoHits);
-        if let Ok(success)=result {proof.merge(success.latest_start_ns);}
+        if let Ok(success)=result {proof.merge(bound(success));}
         return result.clone();
     }
     #[cfg(test)] crate::control_profile::count(crate::control_profile::Counter::MotionMemoMisses);
     let result = check();
-    if let Ok(success)=&result {proof.merge(success.latest_start_ns);}
+    if let Ok(success)=&result {proof.merge(bound(success));}
     cache.borrow_mut().insert(key, result.clone());
     result
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn memoized_control_motion<'a>(
+    cache:&std::cell::RefCell<std::collections::HashMap<BodyMotionQuery,Result<ControlMotionSuccess<'a>,BodyMotionFailure>>>,
+    proof:&ObservationProofAccumulator,from:BodyPose,target:PlanarPose,preserve_height:bool,
+    ground:&BodyGroundState,navigation:Option<GroundWalkState<'a>>,
+    check:impl FnOnce()->Result<ControlMotionSuccess<'a>,BodyMotionFailure>,
+)->Result<ControlMotionSuccess<'a>,BodyMotionFailure> {
+    memoized_motion(cache,proof,from,target,preserve_height,None,Some(ground),
+        navigation.map(GroundWalkState::semantic_key),check,|success|success.body.latest_start_ns)
+}
+
+#[derive(Clone,Copy)]
+pub(super) enum ControlEdgeProfile { Connector, Guard, Preview }
+
+#[cfg(test)]
+thread_local! {static NAVIGATION_WALKS:std::cell::Cell<Option<usize>>=const {std::cell::Cell::new(None)};}
+#[cfg(test)]
+fn count_navigation_walk() {
+    NAVIGATION_WALKS.set(NAVIGATION_WALKS.get().map(|count|count+1));
+}
+#[cfg(test)]
+pub(super) fn capture_navigation_walks<T>(run:impl FnOnce()->T)->(T,usize) {
+    struct Restore(Option<usize>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let count=NAVIGATION_WALKS.replace(self.0).unwrap_or(0);
+            // Nested captures remain part of their enclosing capture, including
+            // unwind paths. No test hook state leaks into another invocation.
+            if let Some(previous)=self.0 {NAVIGATION_WALKS.set(Some(previous+count));}
+        }
+    }
+    let restore=Restore(NAVIGATION_WALKS.replace(Some(0)));
+    let result=run();
+    let count=NAVIGATION_WALKS.get().unwrap_or(0);
+    drop(restore);
+    (result,count)
+}
+
+// Every predicted control geometry uses this edge: one optional recorded walk,
+// the original H3 projection, and a complete sweep of that same projection.
+// Body executes the original projection/sweep without a walk or trace allocation.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn control_project_edge<'a>(
+    query:&SurfaceBodyQueryView,from:BodyPose,ground:&BodyGroundState,
+    navigation:Option<GroundWalkState<'a>>,xy:[f64;2],yaw:f64,boundary:&[[f64;2]],
+    profile:ControlEdgeProfile,
+)->Result<ControlMotionSuccess<'a>,BodyMotionFailure> {
+    #[cfg(test)] if navigation.is_some() {count_navigation_walk();}
+    let segment=navigation.map(|state|state.walk_xy(xy,boundary,None)).transpose()
+        .map_err(|error|BodyMotionFailure::Navigation(error.to_string()))?;
+    let mut witness=None;
+    #[cfg(test)] if !matches!(profile,ControlEdgeProfile::Preview) {
+        crate::control_profile::count(crate::control_profile::Counter::BodyProjectionCalls);
+    }
+    let projected={
+        #[cfg(test)] let _profile=match profile {
+            ControlEdgeProfile::Connector=>Some(crate::control_profile::guard(crate::control_profile::Stage::ConnectorProjection)),
+            ControlEdgeProfile::Guard=>Some(crate::control_profile::guard(crate::control_profile::Stage::GuardProjection)),
+            ControlEdgeProfile::Preview=>None,
+        };
+        let result=if let Some(segment)=&segment {
+            segment.with_body_navigation(|_,navigation|
+                query.project_motion_with_navigation(from,ground,xy,yaw,navigation,&mut witness))
+                .map_err(|error|BodyMotionFailure::Navigation(error.to_string()))?
+        }else {query.project_motion(from,ground,xy,yaw,&mut witness)};
+        motion_failure(result,witness)?
+    };
+    #[cfg(test)] if !matches!(profile,ControlEdgeProfile::Preview) {
+        crate::control_profile::count(crate::control_profile::Counter::GeometrySweeps);
+    }
+    {
+        #[cfg(test)] let _profile=match profile {
+            ControlEdgeProfile::Connector=>Some(crate::control_profile::guard(crate::control_profile::Stage::ConnectorSweep)),
+            ControlEdgeProfile::Guard=>Some(crate::control_profile::guard(crate::control_profile::Stage::GuardGeometrySweep)),
+            ControlEdgeProfile::Preview=>None,
+        };
+        let result=query.validate_projected_motion(from,&projected,boundary,&mut witness);
+        motion_failure(result,witness)?;
+    }
+    #[cfg(not(test))] let _=profile;
+    Ok(ControlMotionSuccess {
+        body:BodyMotionSuccess {pose:projected.pose(),ground:Some(projected.ground().clone()),latest_start_ns:None},
+        navigation:segment.as_ref().map(|segment|segment.end()),
+    })
+}
+
+// Supplied actual/bridge poses are validated exactly as given. In particular,
+// their Z/roll/pitch are never replaced with a predicted projection.
+fn control_validate_edge(
+    query:&SurfaceBodyQueryView,from:BodyPose,to:BodyPose,ground:&BodyGroundState,
+    navigation:Option<GroundWalkState<'_>>,boundary:&[[f64;2]],
+)->Result<(),BodyMotionFailure> {
+    let mut witness=None;
+    let result=if let Some(navigation)=navigation {
+        #[cfg(test)] count_navigation_walk();
+        let segment=navigation.walk_xy([to.0[0],to.0[1]],boundary,None)
+            .map_err(|error|BodyMotionFailure::Navigation(error.to_string()))?;
+        segment.with_body_navigation(|_,navigation|
+            query.validate_motion_with_navigation(from,to,ground,navigation,boundary,&mut witness))
+            .map_err(|error|BodyMotionFailure::Navigation(error.to_string()))?.map(|_|())
+    }else {query.validate_motion_from_ground(from,to,ground,boundary,&mut witness).map(|_|())};
+    motion_failure(result,witness)
+}
+
+pub(super) fn validate_control_actual_pose(
+    query:&SurfaceBodyQueryView,pose:BodyPose,ground:&BodyGroundState,
+    navigation:Option<GroundWalkState<'_>>,boundary:&[[f64;2]],
+)->Result<(),String> {
+    control_validate_edge(query,pose,pose,ground,navigation,boundary).map_err(|error|error.to_string())
 }
 
 pub(super) fn body(p: &PoseStamped) -> ([f64; 3], [f64; 4]) {
@@ -183,6 +319,12 @@ pub(super) fn connection_endpoint(map: &SurfaceSnapshot, from: BodyPose, next: &
 }
 pub(super) fn connection_endpoint_in_query(map:&SurfaceSnapshot,query:&SurfaceBodyQueryView,
     from:BodyPose,ground:&BodyGroundState,next:&PoseStamped)->Option<(BodyPose,BodyGroundState)> {
+    connection_endpoint_with_navigation(map,query,from,ground,None,next)
+        .map(|(pose,ground,_)|(pose,ground))
+}
+pub(super) fn connection_endpoint_with_navigation<'a>(map:&SurfaceSnapshot,query:&SurfaceBodyQueryView,
+    from:BodyPose,ground:&BodyGroundState,navigation:Option<GroundWalkState<'a>>,next:&PoseStamped)
+    ->Option<(BodyPose,BodyGroundState,Option<GroundWalkState<'a>>)> {
     #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::ConnectionEndpoint);
     let model=map.body_envelope()?;
     let q=from.1;
@@ -195,26 +337,18 @@ pub(super) fn connection_endpoint_in_query(map:&SurfaceSnapshot,query:&SurfaceBo
     if count>4096 {return None;}
     let mut previous=from;
     let mut ground=ground.clone();
+    let mut navigation=navigation;
     for index in 1..=count {
         #[cfg(test)] crate::control_profile::count(crate::control_profile::Counter::ConnectionSubsteps);
-        #[cfg(test)] crate::control_profile::count(crate::control_profile::Counter::BodyProjectionCalls);
         let fraction=index as f64/count as f64;
-        let projection={
-            #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::ConnectorProjection);
-            query.project_motion(previous,&ground,
-                [from.0[0]+dx*fraction,from.0[1]+dy*fraction],initial_yaw+turn*fraction,&mut None)
-        };
-        let Ok(projected)=projection else {return None;};
-        #[cfg(test)] crate::control_profile::count(crate::control_profile::Counter::GeometrySweeps);
-        let swept={
-            #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::ConnectorSweep);
-            query.validate_projected_motion(previous,&projected,&[],&mut None)
-        };
-        if swept.is_err() {return None;}
-        previous=projected.pose();
-        ground=projected.ground().clone();
+        let checked=control_project_edge(query,previous,&ground,navigation,
+            [from.0[0]+dx*fraction,from.0[1]+dy*fraction],initial_yaw+turn*fraction,
+            &[],ControlEdgeProfile::Connector).ok()?;
+        previous=checked.body.pose;
+        ground=checked.body.ground.expect("successful connector keeps physical ground");
+        navigation=checked.navigation;
     }
-    Some((previous,ground))
+    Some((previous,ground,navigation))
 }
 
 /// 以控制器实际前进圆弧核对接续；直弦不可行不能否定绕过墙角的曲线。
@@ -225,6 +359,10 @@ fn forward_arc_connects(map:&SurfaceSnapshot,from:BodyPose,next:&PoseStamped)->b
 }
 fn forward_arc_connects_in_query(map:&SurfaceSnapshot,query:&SurfaceBodyQueryView,
     from:BodyPose,ground:&BodyGroundState,next:&PoseStamped)->bool {
+    forward_arc_connects_with_navigation(map,query,from,ground,None,next)
+}
+pub(super) fn forward_arc_connects_with_navigation(map:&SurfaceSnapshot,query:&SurfaceBodyQueryView,
+    from:BodyPose,ground:&BodyGroundState,navigation:Option<GroundWalkState<'_>>,next:&PoseStamped)->bool {
     #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::ForwardArcConnector);
     let Some(model)=map.body_envelope()else{return false;};
     let q=from.1;let yaw=Quaternion{x:q[0],y:q[1],z:q[2],w:q[3]}.yaw();
@@ -237,23 +375,15 @@ fn forward_arc_connects_in_query(map:&SurfaceSnapshot,query:&SurfaceBodyQueryVie
     let start=PlanarPose{x:from.0[0],y:from.0[1],yaw};let motion=Twist2{linear:Point2::new(length,0.0),angular_z:angle};
     let mut previous=from;
     let mut ground=ground.clone();
+    let mut navigation=navigation;
     for index in 1..=count {
         #[cfg(test)] crate::control_profile::count(crate::control_profile::Counter::ForwardArcSubsteps);
-        #[cfg(test)] crate::control_profile::count(crate::control_profile::Counter::BodyProjectionCalls);
         let planar=nuwax_nav_control::integrate(start,motion,index as f64/count as f64);
-        let projection={
-            #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::ConnectorProjection);
-            query.project_motion(previous,&ground,[planar.x,planar.y],planar.yaw,&mut None)
-        };
-        let Ok(projected)=projection else{return false;};
-        #[cfg(test)] crate::control_profile::count(crate::control_profile::Counter::GeometrySweeps);
-        let swept={
-            #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::ConnectorSweep);
-            query.validate_projected_motion(previous,&projected,&[],&mut None)
-        };
-        if swept.is_err(){return false;}
-        previous=projected.pose();
-        ground=projected.ground().clone();
+        let Ok(checked)=control_project_edge(query,previous,&ground,navigation,
+            [planar.x,planar.y],planar.yaw,&[],ControlEdgeProfile::Connector) else {return false;};
+        previous=checked.body.pose;
+        ground=checked.body.ground.expect("successful arc keeps physical ground");
+        navigation=checked.navigation;
     }
     true
 }
@@ -265,13 +395,18 @@ pub(super) fn translation_connects(map:&SurfaceSnapshot,from:BodyPose,next:&Pose
 }
 pub(super) fn translation_connects_in_query(map:&SurfaceSnapshot,query:&SurfaceBodyQueryView,
     from:BodyPose,ground:&BodyGroundState,next:&PoseStamped)->bool {
+    translation_connects_with_navigation(map,query,from,ground,None,next)
+}
+pub(super) fn translation_connects_with_navigation(map:&SurfaceSnapshot,query:&SurfaceBodyQueryView,
+    from:BodyPose,ground:&BodyGroundState,navigation:Option<GroundWalkState<'_>>,next:&PoseStamped)->bool {
     #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::TranslationConnector);
-    connection_endpoint_in_query(map,query,from,ground,next).is_some() || {
+    connection_endpoint_with_navigation(map,query,from,ground,navigation,next).is_some() || {
         // 窄门前先对齐；两个连接沿同一拥有方和已核验的小地面关联推进。
         let mut aligned=next.clone();
         aligned.pose.position=Point3::new(from.0[0],from.0[1],from.0[2]);
-        connection_endpoint_in_query(map,query,from,ground,&aligned)
-            .is_some_and(|(arrival,state)|connection_endpoint_in_query(map,query,arrival,&state,next).is_some())
+        connection_endpoint_with_navigation(map,query,from,ground,navigation,&aligned)
+            .is_some_and(|(arrival,state,navigation)|
+                connection_endpoint_with_navigation(map,query,arrival,&state,navigation,next).is_some())
     }
 }
 
@@ -284,6 +419,8 @@ pub(super) struct SelectedBodyCommand {
     dt:f64,
     sample_step:f64,
     radius:f64,
+    // Frozen original binding/address + actual XY, never a mutable second cursor.
+    ground_basis:Option<GroundActualBasis>,
 }
 
 // Same index convention as SurfaceFollower: path_index is the next control target,
@@ -314,6 +451,31 @@ pub(super) fn advance_adjacent_waypoints<
     map: &SurfaceSnapshot,
     query: &SurfaceBodyQueryView,
     ground: &BodyGroundState,
+    path: &Path3D,
+    goal: &PoseStamped,
+    pose: &PoseStamped,
+    cumulative: &[f64],
+    options: &nuwax_nav_types_messages::GoalOptions,
+    final_position_reached: bool,
+    progress: &mut AdjacentWaypointProgress,
+    target_same_support: impl FnMut(&PoseStamped) -> bool,
+    allow_advance: impl FnMut(usize, AdjacentWaypointAdvance) -> Result<bool, String>,
+) -> Result<(), String> {
+    advance_adjacent_waypoints_with_navigation::<TRANSLATION_INTENT,COLLINEAR_PROGRESS>(
+        config,map,query,ground,None,path,goal,pose,cumulative,options,final_position_reached,
+        progress,target_same_support,allow_advance)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn advance_adjacent_waypoints_with_navigation<
+    const TRANSLATION_INTENT: bool,
+    const COLLINEAR_PROGRESS: bool,
+>(
+    config: &SurfaceFollowerConfig,
+    map: &SurfaceSnapshot,
+    query: &SurfaceBodyQueryView,
+    ground: &BodyGroundState,
+    navigation: Option<GroundWalkState<'_>>,
     path: &Path3D,
     goal: &PoseStamped,
     pose: &PoseStamped,
@@ -445,27 +607,27 @@ pub(super) fn advance_adjacent_waypoints<
                             && off_segment > outgoing[0].hypot(outgoing[1]) * 1e-5) {
                         // 短平移可能是绕过墙角所必需，只有接续可行才提前消费折点。
                         // 从实际站姿沿地形推进，不能借路径拟合的横滚/俯仰取得接续许可。
-                        safe_to_skip = translation_connects_in_query(map,&query,body(pose),&ground,next);
-                        if !safe_to_skip && !connection_endpoint_in_query(map,&query,body(pose),&ground,target)
-                            .is_some_and(|(arrival,state)|translation_connects_in_query(map,&query,arrival,&state,next)) {
+                        safe_to_skip = translation_connects_with_navigation(map,&query,body(pose),&ground,navigation,next);
+                        if !safe_to_skip && !connection_endpoint_with_navigation(map,&query,body(pose),&ground,navigation,target)
+                            .is_some_and(|(arrival,state,navigation)|translation_connects_with_navigation(map,&query,arrival,&state,navigation,next)) {
                             return Err("平移折点的实际站姿无法接续下一段，需要从实际位姿重规划".into());
                         }
                     }
                 }
             }
             if has_turn {
-                let turn_clear=|(initial,mut state):(BodyPose,BodyGroundState)| {
+                let turn_clear=|(initial,mut state,mut navigation):(BodyPose,BodyGroundState,Option<GroundWalkState<'_>>)| {
                     let mut previous=initial;
                     for waypoint in &path.poses[progress.path_index+1..=turn_end] {
                         let mut at_waypoint=waypoint.clone();
                         at_waypoint.pose.position=Point3::new(initial.0[0],initial.0[1],initial.0[2]);
-                        let Some((next,next_ground))=connection_endpoint_in_query(map,&query,previous,&state,&at_waypoint) else {return false;};
-                        previous=next;state=next_ground;
+                        let Some((next,next_ground,next_navigation))=connection_endpoint_with_navigation(map,&query,previous,&state,navigation,&at_waypoint) else {return false;};
+                        previous=next;state=next_ground;navigation=next_navigation;
                     }
                     true
                 };
-                safe_to_skip=turn_clear((body(pose),ground.clone()));
-                if !safe_to_skip && !connection_endpoint_in_query(map,&query,body(pose),&ground,target).is_some_and(turn_clear) {
+                safe_to_skip=turn_clear((body(pose),ground.clone(),navigation));
+                if !safe_to_skip && !connection_endpoint_with_navigation(map,&query,body(pose),&ground,navigation,target).is_some_and(turn_clear) {
                     // 从当前位置及真正到达原转向点的站姿都无法接续时，旧路径已失效。
                     return Err("转向点的规划站姿与实际接触不一致，需要按当前足迹重新规划".into());
                 }
@@ -519,6 +681,54 @@ impl SurfaceFollower {
         let ground=self.ground_state_at_actual_pose(&query,pose,same_ground_source)?;
         Ok((query,ground))
     }
+    // A single immutable navigation binding for this invocation; physical
+    // observation and all collision/recent data still come from current source.
+    pub(super) fn current_control_query_owned(&self,navigation:Option<GroundWalkState<'_>>)
+        ->Result<(SurfaceBodyQueryView,BodyGroundState),String> {
+        let (query,ground)=self.current_ground_query_owned()?;
+        let Some(navigation)=navigation else {return Ok((query,ground));};
+        let source=self.source_map.as_ref().ok_or("缺少当前机体几何来源")?;
+        let query=navigation.bind_body_query(source).map_err(|error|error.to_string())?;
+        Ok((query,ground))
+    }
+
+    /// Original rotation eligibility with one explicit control continuation.
+    /// Candidate branches borrow it; none can update the actual owner.
+    pub(super) fn rotation_can_restore_translation_with_navigation(&self,
+        command:Twist2,candidate_angular_z:f64,query:&SurfaceBodyQueryView,
+        ground:&BodyGroundState,navigation:Option<GroundWalkState<'_>>)->bool {
+        self.odometry.as_ref().zip(self.control_target).is_none_or(|(pose,target)| {
+            let yaw=pose.pose.orientation.yaw();
+            let omni=self.config.kinematics().is_some_and(|m|m.model==nuwax_nav_types_messages::MotionModel::Omnidirectional && m.max_lateral_mps>0.0);
+            let desired=if !omni && command.linear.x.hypot(command.linear.y)>1e-9 {
+                (target.y-pose.pose.position.y).atan2(target.x-pose.pose.position.x)
+                    + if command.linear.x<0.0 {std::f64::consts::PI} else {0.0}
+            } else {target.yaw};
+            let error=angle_diff(desired,yaw);
+            if !candidate_angular_z.is_finite() {return false;}
+            let braking=candidate_angular_z*self.last_command.angular_z>=0.0
+                && candidate_angular_z.abs()<self.last_command.angular_z.abs();
+            if braking {return true;}
+            if candidate_angular_z*error<=0.0 {return false;}
+            if error.abs()>self.config.controller.orientation_tolerance.min(0.05).max(1e-6) {return true;}
+            if error.abs()<=1e-6 {return false;}
+            let Some(map)=self.map.as_ref() else {return false;};
+            let distance=(target.x-pose.pose.position.x).hypot(target.y-pose.pose.position.y);
+            let travel=(command.linear.x.hypot(command.linear.y)
+                *crate::DEFAULT_CONTROL_HORIZON.as_secs_f64()).min(distance);
+            if travel<=1e-9 || distance<=1e-9 {return false;}
+            let actual=body(pose);
+            let mut aligned_target=pose.clone();aligned_target.pose.orientation=Quaternion::from_yaw(desired);
+            let Some((aligned,aligned_ground,aligned_navigation))=
+                connection_endpoint_with_navigation(map,query,actual,ground,navigation,&aligned_target)
+                else {return false;};
+            let mut next=aligned_target;
+            next.pose.position.x=actual.0[0]+(target.x-actual.0[0])*travel/distance;
+            next.pose.position.y=actual.0[1]+(target.y-actual.0[1])*travel/distance;
+            translation_connects_with_navigation(map,query,aligned,&aligned_ground,aligned_navigation,&next)
+        })
+    }
+
     /// 用已知前向路径曲率提前降速，原始能力与完整停车许可仍保持不变。
     fn curve_speed_limit(&self,path:&Path3D,index:usize,position:Point3,lookahead:f64,angular:f64)->Option<f64> {
         let cruise=self.config.controller.speed*self.config.controller.nerf_speed.min(1.0);
@@ -573,13 +783,20 @@ impl SurfaceFollower {
         command: Twist2,
         horizon: f64,
     ) -> bool {
+        let Ok(basis)=self.proposed_ground_basis() else {return false;};
+        self.predicted_body_motion_with_basis(command,horizon,basis.as_ref())
+    }
+    pub(super) fn predicted_body_motion_with_basis(&self,command:Twist2,horizon:f64,
+        basis:Option<&GroundActualBasis>)->bool {
+        if basis.is_some_and(|basis|!self.owns_ground_basis(basis)) {return false;}
+        let Ok(navigation)=basis.map(GroundActualBasis::walk_state).transpose() else {return false;};
         let (Some(map), Some(pose)) = (self.map.as_ref(), self.odometry.as_ref()) else {
             return false;
         };
         let Some(model) = map.body_envelope() else {
             return false;
         };
-        let Ok((query,initial_ground))=self.current_ground_query_owned() else {return false;};
+        let Ok((query,initial_ground))=self.current_control_query_owned(navigation) else {return false;};
         let from = body(pose);
         let start = planar(pose);
         let count = ((command.linear.x.hypot(command.linear.y)
@@ -595,6 +812,8 @@ impl SurfaceFollower {
         let mut delayed_previous = from;
         let mut ground=initial_ground.clone();
         let mut delayed_ground=initial_ground.clone();
+        let mut normal_navigation=navigation;
+        let mut delayed_navigation=navigation;
         let rotating_in_place = command.linear.x == 0.0 && command.linear.y == 0.0;
         for index in 1..=count {
             let time = horizon * index as f64 / count as f64;
@@ -607,24 +826,29 @@ impl SurfaceFollower {
                 },
                 time,
             );
-            let Ok(next)=query.project_motion(previous,&ground,[next.x,next.y],next.yaw,&mut None)
+            let Ok(next)=control_project_edge(&query,previous,&ground,normal_navigation,
+                [next.x,next.y],next.yaw,&self.boundary,ControlEdgeProfile::Preview)
                 else {return false;};
-            if query.validate_projected_motion(previous,&next,&self.boundary,&mut None).is_err() {
-                return false;
-            }
             if rotating_in_place {
-                previous=next.pose();ground=next.ground().clone();
+                previous=next.body.pose;
+                ground=next.body.ground.expect("successful preview keeps physical ground");
+                normal_navigation=next.navigation;
                 continue;
             }
-            let Ok(delayed)=query.project_motion(delayed_previous,&delayed_ground,
-                [delayed.x,delayed.y],delayed.yaw,&mut None) else {return false;};
-            if query.validate_projected_motion(delayed_previous,&delayed,&self.boundary,&mut None).is_err()
-                || query.validate_motion_from_ground(next.pose(),delayed.pose(),next.ground(),
-                    &self.boundary,&mut None).is_err() {
-                return false;
-            }
-            previous=next.pose();ground=next.ground().clone();
-            delayed_previous=delayed.pose();delayed_ground=delayed.ground().clone();
+            let Ok(delayed)=control_project_edge(&query,delayed_previous,&delayed_ground,delayed_navigation,
+                [delayed.x,delayed.y],delayed.yaw,&self.boundary,ControlEdgeProfile::Preview)
+                else {return false;};
+            // This envelope bridge starts from the normal branch's successful
+            // end navigation. Its own end state is deliberately discarded.
+            if control_validate_edge(&query,next.body.pose,delayed.body.pose,
+                next.body.ground.as_ref().expect("successful preview keeps physical ground"),
+                next.navigation,&self.boundary).is_err() {return false;}
+            previous=next.body.pose;
+            ground=next.body.ground.expect("successful preview keeps physical ground");
+            normal_navigation=next.navigation;
+            delayed_previous=delayed.body.pose;
+            delayed_ground=delayed.body.ground.expect("successful delayed preview keeps physical ground");
+            delayed_navigation=delayed.navigation;
         }
         true
     }
@@ -658,6 +882,15 @@ impl SurfaceFollower {
         self.follow_body_step_inner::<true>(robot_width)
     }
 
+    // Called only after the internal Ground owner has consumed this actual
+    // observation. It never enters Body arrival or writes Body waypoint progress.
+    pub(super) fn follow_ground_control_step(&mut self,robot_width:f64,basis:GroundActualBasis)->PlannerStep {
+        if !self.owns_ground_basis(&basis) {
+            return PlannerStep::ReplanRequired("Ground control basis has retired".into());
+        }
+        self.follow_control_step_policy::<true,true,true,true,true>(robot_width,Some(basis))
+    }
+
     // The false specialization is exercised only by differential tests. The
     // production specialization reuses no state beyond this one invocation.
     fn follow_body_step_inner<const REUSE_LOOKAHEAD: bool>(&mut self, robot_width: f64) -> PlannerStep {
@@ -673,6 +906,11 @@ impl SurfaceFollower {
     // The explicit specialization retains the legacy progress reference for
     // differential measurements and barrier tests.
     fn follow_body_step_progress_policy<const REUSE_LOOKAHEAD: bool, const STRAIGHT_INTENT: bool, const ALIGN_STRAIGHT: bool, const TRANSLATION_INTENT: bool, const COLLINEAR_PROGRESS: bool>(&mut self, robot_width: f64) -> PlannerStep {
+        self.follow_control_step_policy::<REUSE_LOOKAHEAD,STRAIGHT_INTENT,ALIGN_STRAIGHT,TRANSLATION_INTENT,COLLINEAR_PROGRESS>(robot_width,None)
+    }
+
+    fn follow_control_step_policy<const REUSE_LOOKAHEAD: bool, const STRAIGHT_INTENT: bool, const ALIGN_STRAIGHT: bool, const TRANSLATION_INTENT: bool, const COLLINEAR_PROGRESS: bool>(
+        &mut self,robot_width:f64,ground_basis:Option<GroundActualBasis>)->PlannerStep {
         // Scalar provenance for a rejected connector; no additional geometry
         // query or hot-path allocation is needed to diagnose the chosen target.
         self.refresh_current_body_view();
@@ -706,17 +944,25 @@ impl SurfaceFollower {
         if !robot_width.is_finite() || robot_width <= 0.0 {
             return PlannerStep::Failed("机器人宽度无效".into());
         }
-        let (query,ground)=match self.current_ground_query() {
-            Ok((query,ground))=>(query.clone(),ground.clone()),
+        let navigation=match ground_basis.as_ref().map(GroundActualBasis::walk_state).transpose() {
+            Ok(navigation)=>navigation,
             Err(error)=>return PlannerStep::ReplanRequired(error),
         };
-        let mut body_witness=None;
-        let body_validity={
-            #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::CurrentBodyValidation);
-            query.validate_motion_from_ground(body(pose),body(pose),&ground,&[],&mut body_witness)
+        let (query,ground)=match if navigation.is_some() {self.current_control_query_owned(navigation)}
+            else {self.current_ground_query().map(|(query,ground)|(query.clone(),ground.clone()))} {
+            Ok(value)=>value,
+            Err(error)=>return PlannerStep::ReplanRequired(error),
         };
-        if let Err(e) = motion_failure(body_validity,body_witness) {
-            return PlannerStep::ReplanRequired(format!("当前三维机体包络无效: {e}"));
+        // Ground reached this policy only after the actual proposal's complete
+        // validation and atomic commit. Keep Body's original validation here.
+        if navigation.is_none() {
+            let body_validity={
+                #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::CurrentBodyValidation);
+                control_validate_edge(&query,body(pose),body(pose),&ground,None,&[])
+            };
+            if let Err(e) = body_validity {
+                return PlannerStep::ReplanRequired(format!("当前三维机体包络无效: {e}"));
+            }
         }
         #[cfg(test)] let profile_support=crate::control_profile::guard(crate::control_profile::Stage::BodySupportGoal);
         let position = pose.pose.position;
@@ -732,7 +978,7 @@ impl SurfaceFollower {
         let support_matches_height=|position:[f64;3],height:f64|
             map.support_position_from_body(position,body(pose).1,self.config.body_to_support_z_m)
                 .is_ok_and(|support|(support[2]-height).abs()<=layer_tolerance+1e-6);
-        let actual_layer_matches=ground.query_state()!=nuwax_nav_mls_planner::surface::GroundQueryState::Unknown
+        let actual_layer_matches=navigation.is_none() && ground.query_state()!=nuwax_nav_mls_planner::surface::GroundQueryState::Unknown
             && support_matches_height(body(pose).0,ground.height());
 
         // 目标选点与规划候选共同使用原三维容差球，同层不能扩大最终到达范围。
@@ -748,7 +994,7 @@ impl SurfaceFollower {
             || if self.options.yaw_tolerance_rad == 0.0 {
                 nuwax_nav_types_messages::same_finite_yaw(yaw, goal_yaw)
             } else { final_yaw.abs() < self.config.controller.orientation_tolerance };
-        if final_position_reached && final_orientation_reached
+        if navigation.is_none() && final_position_reached && final_orientation_reached
         {
             // 这里只确认到达规划终点；调度器随后撤租归零，等待守卫的物理
             // 停稳证明后才发布成功，避免地图噪声形成第二道停车门槛。
@@ -756,33 +1002,41 @@ impl SurfaceFollower {
         }
         #[cfg(test)] drop(profile_support);
         #[cfg(test)] let profile_waypoints=crate::control_profile::guard(crate::control_profile::Stage::WaypointProgress);
-        let mut adjacent = AdjacentWaypointProgress {
-            path_index: self.path_index,
-            progress_m: self.progress_m,
-        };
-        let adjacent_result = advance_adjacent_waypoints::<TRANSLATION_INTENT, COLLINEAR_PROGRESS>(
-            &self.config, map, &query, &ground, path, goal, pose, &self.cumulative,
-            &self.options, final_position_reached, &mut adjacent,
-            |target| actual_layer_matches
-                && query.start_ground_state((body(target).0,body(pose).1)).is_ok_and(|target_ground|
-                    target_ground.query_state()!=nuwax_nav_mls_planner::surface::GroundQueryState::Unknown
-                        && support_matches_height(body(target).0,target_ground.height())
-                        && (ground.height()-target_ground.height()).abs()
-                            <= f64::from(map.source_voxel_size_m())+1e-6),
-            |_, _| Ok(true),
-        );
-        // Legacy Body wrote each accepted waypoint before a later loop error.
-        // Preserve that behavior; Ground will commit only after the whole
-        // actual-consumption transaction succeeds.
-        self.path_index = adjacent.path_index;
-        self.progress_m = adjacent.progress_m;
-        if let Err(error) = adjacent_result {
-            return PlannerStep::ReplanRequired(error);
+        if navigation.is_none() {
+            let mut adjacent = AdjacentWaypointProgress {
+                path_index: self.path_index,
+                progress_m: self.progress_m,
+            };
+            let adjacent_result = advance_adjacent_waypoints::<TRANSLATION_INTENT, COLLINEAR_PROGRESS>(
+                &self.config, map, &query, &ground, path, goal, pose, &self.cumulative,
+                &self.options, final_position_reached, &mut adjacent,
+                |target| actual_layer_matches
+                    && query.start_ground_state((body(target).0,body(pose).1)).is_ok_and(|target_ground|
+                        target_ground.query_state()!=nuwax_nav_mls_planner::surface::GroundQueryState::Unknown
+                            && support_matches_height(body(target).0,target_ground.height())
+                            && (ground.height()-target_ground.height()).abs()
+                                <= f64::from(map.source_voxel_size_m())+1e-6),
+                |_, _| Ok(true),
+            );
+            // Legacy Body wrote each accepted waypoint before a later loop error.
+            // Preserve that behavior; Ground will commit only after the whole
+            // actual-consumption transaction succeeds.
+            self.path_index = adjacent.path_index;
+            self.progress_m = adjacent.progress_m;
+            if let Err(error) = adjacent_result {
+                return PlannerStep::ReplanRequired(error);
+            }
         }
         #[cfg(test)] drop(profile_waypoints);
         // 显式原地转向按已有角度进度完成；同方向细分角由下方前瞻连续消费。
         // 不再按剩余角度或整段角度把尚未完成的转向改写成平移曲线。
         if self.path_index >= path.poses.len() {
+            if navigation.is_some() {
+                // LocalReferenceEnd belongs to the internal Ground owner. This
+                // defensive zero output is neither Matched nor Succeeded.
+                self.begin_braking();
+                return PlannerStep::Command(Twist2::ZERO);
+            }
             if if self.options.position_tolerance_m == 0.0 { !final_position_reached }
                 else { final_distance >= self.config.controller.goal_tolerance } {
                 return PlannerStep::ReplanRequired("三维安全路径结束，原目标未到达".into());
@@ -801,16 +1055,21 @@ impl SurfaceFollower {
         let previous = &path.poses[self.path_index - 1];
         // 偏离按当前连续路段的三维投影计算，不能由采样点密度决定阈值。
         // 零长度转向段仍投影到原支点；机体及制动扫掠继续独立核验。
-        let (_, projected) = closest_in_window(path, &self.cumulative, position,
-            self.cumulative[self.path_index - 1], self.cumulative[self.path_index]);
-        let deviation = position.distance(projected.pose.position);
-        if deviation > self.config.max_path_deviation_m {
-            return PlannerStep::ReplanRequired("机体偏离连续三维路线".into());
+        if navigation.is_none() {
+            let (_, projected) = closest_in_window(path, &self.cumulative, position,
+                self.cumulative[self.path_index - 1], self.cumulative[self.path_index]);
+            let deviation = position.distance(projected.pose.position);
+            if deviation > self.config.max_path_deviation_m {
+                return PlannerStep::ReplanRequired("机体偏离连续三维路线".into());
+            }
         }
         #[cfg(test)] let profile_lookahead=crate::control_profile::guard(crate::control_profile::Stage::LookaheadSelection);
         let rotation = is_rotation(target,previous);
         let local_path_yaw=(target.pose.position.y-previous.pose.position.y)
             .atan2(target.pose.position.x-previous.pose.position.x);
+        let target_distance=|target:&PoseStamped| if navigation.is_some() {
+            (position.x-target.pose.position.x).hypot(position.y-target.pose.position.y)
+        }else {position.distance(target.pose.position)};
         let mut target_index = self.path_index;
         if rotation {
             // 同方向细分转向共用前瞻，避免每个离散角度都减速；不跨越反转或平移。
@@ -819,7 +1078,7 @@ impl SurfaceFollower {
                 let a = &path.poses[target_index];
                 let b = &path.poses[target_index + 1];
                 if horizontal_distance(a,b)<1e-5 && !is_rotation(a,b) {
-                    if position.distance(b.pose.position)>lookahead_m {break;}
+                    if target_distance(b)>lookahead_m {break;}
                     target_index+=1;
                     continue;
                 }
@@ -841,7 +1100,7 @@ impl SurfaceFollower {
                 let a = &path.poses[target_index];
                 let b = &path.poses[target_index + 1];
                 if horizontal_distance(a,b)<1e-5 && !is_rotation(a,b) {
-                    if position.distance(b.pose.position)>lookahead_m {break;}
+                    if target_distance(b)>lookahead_m {break;}
                     target_index+=1;
                     continue;
                 }
@@ -864,7 +1123,7 @@ impl SurfaceFollower {
                         < lengths * 0.25_f64.cos()
                     || angle_diff(b.pose.orientation.yaw(), target.pose.orientation.yaw()).abs()
                         > 0.25
-                    || position.distance(b.pose.position) > lookahead_m
+                    || target_distance(b) > lookahead_m
                 {
                     break;
                 }
@@ -890,7 +1149,7 @@ impl SurfaceFollower {
             // 不能只沿受阻的长弦不断减速，否则已知可执行的短路径永远得不到跟随。
             // 不能用先转向来保留远处曲线目标，否则会过早朝远端切向旋转并离开原路线。
             while target_index > self.path_index {
-                if forward_arc_connects_in_query(map,&query,body(pose),&ground,&path.poses[target_index]) {
+                if forward_arc_connects_with_navigation(map,&query,body(pose),&ground,navigation,&path.poses[target_index]) {
                     confirmed_lookahead=true;
                     break;
                 }
@@ -913,7 +1172,7 @@ impl SurfaceFollower {
         // path_index, alignment and rotation retain their original checks; this
         // is neither a cross-step permission nor a replacement for body control.
         let track_without_alignment=advisory_intent || rotation || (REUSE_LOOKAHEAD && confirmed_lookahead)
-            || forward_arc_connects_in_query(map,&query,body(pose),&ground,target);
+            || forward_arc_connects_with_navigation(map,&query,body(pose),&ground,navigation,target);
         let alignment = if ALIGN_STRAIGHT && straight_intent
             && self.config.kinematics().is_some_and(|motion|motion.can_rotate_in_place)
             && angle_diff((target.pose.position.y-position.y).atan2(target.pose.position.x-position.x),yaw).abs()>=WAYPOINT_ROTATION_TOLERANCE_RAD {
@@ -924,8 +1183,9 @@ impl SurfaceFollower {
             let mut translated=target.clone();
             translated.pose.orientation=Quaternion::from_yaw(heading);
             let mut turned=translated.clone();turned.pose.position=position;
-            connection_endpoint_in_query(map,&query,body(pose),&ground,&turned)
-                .and_then(|(at_turn,state)|connection_endpoint_in_query(map,&query,at_turn,&state,&translated)).map(|_|heading)
+            connection_endpoint_with_navigation(map,&query,body(pose),&ground,navigation,&turned)
+                .and_then(|(at_turn,state,navigation)|
+                    connection_endpoint_with_navigation(map,&query,at_turn,&state,navigation,&translated)).map(|_|heading)
         }else{None};
         if !track_without_alignment && alignment.is_none() {
             // 旧路径在实际站姿下已不可接续，继续向缺测边界逼近只会让速度趋于零。
@@ -984,7 +1244,9 @@ impl SurfaceFollower {
                 "局部路径点{}仅剩平面速度无法消除的高度差（{:.3}米），需要从实际位姿重新规划",
                 self.path_index,target.pose.position.z-position.z));
         }
-        self.bounded_command_with_speed_limit(preferred,speed_limit)
+        if ground_basis.is_some() {
+            self.bounded_body_command_with_basis(preferred,speed_limit,ground_basis,Some((query,ground)))
+        }else {self.bounded_command_with_speed_limit(preferred,speed_limit)}
     }
     // Keep observation and projected-body callbacks identical for ranking and a
     // standalone selected-candidate proof. Caches live only for this invocation.
@@ -994,9 +1256,33 @@ impl SurfaceFollower {
         &std::cell::RefCell<Option<BodyMotionFailure>>,
         &ObservationProofAccumulator,
     ) -> R) -> Result<R, String> {
+        let basis=self.proposed_ground_basis()?;
+        self.with_body_motion_checks_from_basis(basis.as_ref(),run)
+    }
+
+    pub(super) fn with_body_motion_checks_from_basis<R>(&self,basis:Option<&GroundActualBasis>,run:impl FnOnce(
+        &mut dyn FnMut(PlanarPose,PlanarPose,f64)->bool,
+        &mut dyn FnMut(PlanarPose,PlanarPose,f64)->bool,
+        &std::cell::RefCell<Option<BodyMotionFailure>>,
+        &ObservationProofAccumulator,
+    )->R)->Result<R,String> {
+        if basis.is_some_and(|basis|!self.owns_ground_basis(basis)) {
+            return Err("Ground stopping basis has retired".into());
+        }
+        let navigation=basis.map(GroundActualBasis::walk_state).transpose()?;
+        let (query,ground)=self.current_control_query_owned(navigation)?;
+        self.with_control_motion_checks(query,ground,navigation,run)
+    }
+
+    fn with_control_motion_checks<R>(&self,query:SurfaceBodyQueryView,initial_ground:BodyGroundState,
+        initial_navigation:Option<GroundWalkState<'_>>,run:impl FnOnce(
+        &mut dyn FnMut(PlanarPose,PlanarPose,f64)->bool,
+        &mut dyn FnMut(PlanarPose,PlanarPose,f64)->bool,
+        &std::cell::RefCell<Option<BodyMotionFailure>>,
+        &ObservationProofAccumulator,
+    )->R)->Result<R,String> {
         #[cfg(test)] let proof_scope=crate::command_proof_trace::GuardScope::begin();
         #[cfg(test)] let profile_setup=crate::control_profile::guard(crate::control_profile::Stage::GuardSetup);
-        let (query,initial_ground)=self.current_ground_query_owned()?;
         let pose=self.odometry.as_ref().ok_or("缺少实际位姿")?;
         // Persistent ground has no per-cell time lease. Source/pose health is
         // checked by the scheduler using its own admitted live-input authority.
@@ -1010,6 +1296,7 @@ impl SurfaceFollower {
             let initial_ground=initial_ground.clone();
             let mut previous_body=body(pose);
             let mut previous_ground=initial_ground.clone();
+            let mut previous_navigation=initial_navigation;
             let mut previous_xy=[pose.pose.position.x,pose.pose.position.y];
             let mut previous_yaw=pose.pose.orientation.yaw();
             let last_failure=&last_failure;
@@ -1026,33 +1313,23 @@ impl SurfaceFollower {
                     || angle_diff(from.yaw,previous_yaw).abs()>1e-5 {
                     previous_body = body(pose);
                     previous_ground=initial_ground.clone();
+                    previous_navigation=initial_navigation;
                 }
                 let a = previous_body;
                 let preserve_height = (to.x-from.x).hypot(to.y-from.y)<1e-9;
-                let b=match memoized_body_motion_impl(motion_queries,proof,a,to,preserve_height,None,Some(&previous_ground),|| -> Result<BodyMotionSuccess,BodyMotionFailure> {
-                    let mut witness=None;
-                    #[cfg(test)] crate::control_profile::count(crate::control_profile::Counter::BodyProjectionCalls);
-                    let projected={
-                        #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::GuardProjection);
-                        let result=query.project_motion(a,&previous_ground,[to.x,to.y],to.yaw,&mut witness);
-                        motion_failure(result,witness)?
-                    };
-                    // 始终以同一真实来源核验本拍运动及完整外部边界。
-                    {
-                        #[cfg(test)] crate::control_profile::count(crate::control_profile::Counter::GeometrySweeps);
-                        #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::GuardGeometrySweep);
-                        let result=query.validate_projected_motion(a,&projected,boundary,&mut witness);
-                        motion_failure(result,witness)?;
-                    }
-                    Ok(BodyMotionSuccess {pose:projected.pose(),ground:Some(projected.ground().clone()),latest_start_ns:None})
-                }) {
+                let b=match memoized_control_motion(motion_queries,proof,a,to,preserve_height,
+                    &previous_ground,previous_navigation,|| {
+                        control_project_edge(&query,a,&previous_ground,previous_navigation,
+                            [to.x,to.y],to.yaw,boundary,ControlEdgeProfile::Guard)
+                    }) {
                     Ok(success)=>success,
                     Err(error)=>{
                         *last_failure.borrow_mut()=Some(error);return false;
                     }
                 };
-                previous_body = b.pose;
-                previous_ground=b.ground.expect("拥有方查询成功保留地面关联");
+                previous_body = b.body.pose;
+                previous_ground=b.body.ground.expect("拥有方查询成功保留地面关联");
+                previous_navigation=b.navigation;
                 previous_xy = [to.x, to.y];
                 previous_yaw=to.yaw;
                 true
@@ -1139,7 +1416,24 @@ impl SurfaceFollower {
     fn recheck_selected_body_command_from(&mut self,command:Twist2,current_state:bool)->Option<PlannerStep> {
         let mut selected=self.selected_body_command.as_ref()?.clone();
         if selected.command!=command {return None;}
+        if selected.ground_basis.as_ref().is_some_and(|basis|!self.owns_ground_basis(basis))
+            || selected.ground_basis.is_none() && self.ground_execution.is_some() {
+            self.selected_body_command=None;
+            self.begin_braking();
+            return Some(PlannerStep::ReplanRequired("已选 Ground 控制的路径或来源已退休".into()));
+        }
         if current_state {
+            // New odometry may precede formal actual consumption. The same
+            // adjacent proposal supplies the current predictive basis, without
+            // committing progress or replacing the captured selection's owner.
+            selected.ground_basis=match self.proposed_ground_basis() {
+                Ok(basis)=>basis,
+                Err(error)=>{
+                    self.selected_body_command=None;
+                    self.begin_braking();
+                    return Some(PlannerStep::ReplanRequired(error));
+                }
+            };
             selected.pose=self.odometry.as_ref()?.clone();
             selected.current=self.last_command;
         }
@@ -1153,7 +1447,7 @@ impl SurfaceFollower {
         self.last_command=selected.current;
         self.body_view_dirty=true;
         self.refresh_current_body_view();
-        let checked=self.with_body_motion_checks(|clear,period,last_failure,proof| {
+        let checked=self.with_body_motion_checks_from_basis(selected.ground_basis.as_ref(),|clear,period,last_failure,proof| {
             let valid=nuwax_nav_control::check_stopping_trajectory_with_period_check(
                 planar(&selected.pose),selected.current,selected.command,&selected.limits,
                 selected.dt,selected.sample_step,selected.radius,clear,period).is_some();
@@ -1182,6 +1476,21 @@ impl SurfaceFollower {
     }
 
     pub(super) fn bounded_body_command(&mut self, preferred: Twist2, speed_limit:Option<f64>) -> PlannerStep {
+        self.refresh_current_body_view();
+        let basis=match self.proposed_ground_basis() {
+            Ok(basis)=>basis,
+            Err(error)=>{
+                self.selected_body_command=None;
+                self.last_command_dispatch_bound=None;
+                #[cfg(test)] crate::command_proof_trace::invalidate_selection();
+                return PlannerStep::ReplanRequired(error);
+            }
+        };
+        self.bounded_body_command_with_basis(preferred,speed_limit,basis,None)
+    }
+
+    fn bounded_body_command_with_basis(&mut self,preferred:Twist2,speed_limit:Option<f64>,
+        ground_basis:Option<GroundActualBasis>,bound_query:Option<(SurfaceBodyQueryView,BodyGroundState)>)->PlannerStep {
         self.refresh_current_body_view();
         self.selected_body_command=None;
         self.last_command_dispatch_bound = None;
@@ -1235,11 +1544,23 @@ impl SurfaceFollower {
                 }
             }
         }
+        let navigation=match ground_basis.as_ref().map(GroundActualBasis::walk_state).transpose() {
+            Ok(navigation)=>navigation,
+            Err(error)=>return PlannerStep::ReplanRequired(error),
+        };
+        let (control_query,control_ground)=match bound_query {
+            Some(value)=>value,
+            None=>match self.current_control_query_owned(navigation) {
+                Ok(value)=>value,
+                Err(error)=>return PlannerStep::ReplanRequired(error),
+            },
+        };
         let mut rotation_useful=std::collections::HashMap::<u64,bool>::new();
         let reference_curvature=reference_segments.first().map(|(a,b)|
             2.0*(angle_diff(b.yaw,a.yaw)*0.5).sin()/(b.x-a.x).hypot(b.y-a.y));
         #[cfg(test)] drop(profile_setup);
-        let checked = self.with_body_motion_checks(|clear,period_clear,last_failure,proof| {
+        let checked = self.with_control_motion_checks(control_query.clone(),control_ground.clone(),navigation,
+            |clear,period_clear,last_failure,proof| {
         #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::CandidateRankingSweeps);
         let result = choose_tracking_control_with_period_check(
             planar(pose),
@@ -1266,7 +1587,10 @@ impl SurfaceFollower {
                     && candidate.linear.x.hypot(candidate.linear.y)<=1e-9
                     && candidate.angular_z.abs()>1e-9 {
                     *rotation_useful.entry(candidate.angular_z.to_bits()).or_insert_with(||
-                        self.rotation_can_restore_translation(preferred,candidate.angular_z))
+                        if navigation.is_some() {
+                            self.rotation_can_restore_translation_with_navigation(preferred,candidate.angular_z,
+                                &control_query,&control_ground,navigation)
+                        }else {self.rotation_can_restore_translation(preferred,candidate.angular_z)})
                 } else {true}
             },
             &mut *clear,
@@ -1309,6 +1633,7 @@ impl SurfaceFollower {
                 self.selected_body_command=Some(SelectedBodyCommand {
                     pose:pose.clone(),current,command:choice.command,limits,dt,
                     sample_step:f64::from(map.source_voxel_size_m())*0.5,radius:model.radius(),
+                    ground_basis,
                 });
                 self.last_command = choice.command;
                 self.last_command_dispatch_bound = bound;

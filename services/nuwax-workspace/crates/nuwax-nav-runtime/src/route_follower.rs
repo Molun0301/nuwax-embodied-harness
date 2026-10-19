@@ -275,7 +275,7 @@ impl RouteFollower {
         PLANNING_REQUEST_BUILDS_FOR_QUALIFICATION.with(|count| count.set(count.get() + 1));
         let reference_source=ReferenceSource{route:Arc::clone(route),cumulative:Arc::clone(&self.cumulative),
             goal:self.goal.clone(),options:self.options,offset:self.config.body_to_support_z_m,progress:self.progress};
-        PlanRequest{start_ground,source:Arc::clone(map),change_basis:self.change_basis.clone(),changes:Arc::clone(&self.changes),pose:pose.clone(),boundary:Arc::clone(&self.boundary),reference:Vec::new(),
+        PlanRequest{ground:None,start_ground,source:Arc::clone(map),change_basis:self.change_basis.clone(),changes:Arc::clone(&self.changes),pose:pose.clone(),boundary:Arc::clone(&self.boundary),reference:Vec::new(),
             reference_source:Some(reference_source),final_yaw:None,arrival:None,end:0.0,progress:self.progress,
             generation:self.route_generation,straight:false,detour,scan:self.scan.clone()}
     }
@@ -772,7 +772,7 @@ fn install_recovery_lifecycle_probe(
                 request.source.validate_body_motion(body(&edge[0]), body(&edge[1]),
                     &request.boundary).unwrap();
             }
-            Ok(Candidate { partial, path, elapsed_ms: 0.0 })
+            Ok(Candidate {ground_binding:None, partial, path, elapsed_ms: 0.0 })
         };
         PlanResult { request, outcome }
     }).unwrap());
@@ -1181,7 +1181,7 @@ fn ordinary_incomplete_search_keeps_nominal_retry_without_guard_rejection() {
                 pose.pose.position = Point3::new(p[0], p[1], p[2] + offset);
                 pose
             }).collect() };
-            PlanResult { request, outcome: Ok(Candidate { partial: false, path, elapsed_ms: 0.0 }) }
+            PlanResult { request, outcome: Ok(Candidate {ground_binding:None, partial: false, path, elapsed_ms: 0.0 }) }
         }).unwrap());
         follower.dirty = true;
         PlannerGate { starts, release }

@@ -5,7 +5,7 @@ fn install_progress_prefix(follower:&mut RouteFollower, poses:Vec<PoseStamped>, 
     follower.owner=Some(PlanningOwner::new(move|mut request:PlanRequest,_|{
         started.send(()).unwrap();if held {let _=released.recv_timeout(Duration::from_secs(5));}
         request.materialize_reference().unwrap();
-        PlanResult {request,outcome:Ok(Candidate {partial:true,path:Path3D{poses:poses.clone()},elapsed_ms:0.0})}
+        PlanResult {request,outcome:Ok(Candidate {ground_binding:None,partial:true,path:Path3D{poses:poses.clone()},elapsed_ms:0.0})}
     }).unwrap());follower.dirty=true;PlannerGate{starts,release}
 }
 fn deliver_progress_prefix(follower:&mut RouteFollower) {

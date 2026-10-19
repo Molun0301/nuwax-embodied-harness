@@ -111,7 +111,32 @@ impl ReferenceSource {
         Ok((result, end, at_end, global_straight))
     }
 }
+/// Frozen, explicit input for one internal Ground window. The incoming address
+/// is actual consumed navigation; the intent and XY guide are planned inputs.
+/// None on PlanRequest preserves the existing Body execution path.
+#[derive(Clone)]
+pub(crate) struct GroundPlanInput {
+    pub incoming: nuwax_nav_pct::ground_route::OwnedGroundWalkState,
+    pub intent: crate::replan_feedback::GroundIntent,
+    pub xy_reference: Arc<Vec<[f64;2]>>,
+    pub arrival_tolerance_m: Option<f64>,
+}
+impl GroundPlanInput {
+    pub fn same_input(&self, other:&Self)->bool {
+        self.incoming.semantic_key()==other.incoming.semantic_key()
+            && self.intent.same_intent(&other.intent)
+            && exact_points(&self.xy_reference,&other.xy_reference)
+            && self.arrival_tolerance_m.map(f64::to_bits)==other.arrival_tolerance_m.map(f64::to_bits)
+    }
+    fn arrival(&self)->Option<([f64;2],f64)> {
+        self.arrival_tolerance_m.filter(|_|self.intent.window().to().is_terminal())
+            .map(|tolerance|(self.intent.goal().xy,tolerance))
+    }
+
+}
+
 pub(crate) struct PlanRequest {
+    pub ground: Option<GroundPlanInput>,
     pub start_ground: Result<BodyGroundState, String>,
     pub source: Arc<SurfaceSnapshot>,
     pub change_basis: Option<Arc<SurfaceSnapshot>>,
@@ -131,6 +156,7 @@ pub(crate) struct PlanRequest {
 }
 impl PlanRequest {
     pub fn materialize_reference(&mut self) -> Result<(), LocalPlanError> {
+        if self.ground.is_some() {return Ok(());}
         // 保留不可变原路线，供有限候选比较真实覆盖进度。
         if let Some(source) = self.reference_source.as_ref() {
             let (reference, end, at_end, straight) =
@@ -156,6 +182,7 @@ impl PlanRequest {
     }
 }
 pub(crate) struct Candidate {
+    pub ground_binding: Option<Arc<nuwax_nav_scan::GroundCandidateBinding>>,
     pub partial: bool,
     pub path: Path3D,
     pub elapsed_ms: f64,
@@ -178,13 +205,28 @@ fn candidate_from_trajectory(pose: &PoseStamped, trajectory: nuwax_nav_scan::Loc
             })
             .collect(),
     };
-    Candidate { partial: trajectory.partial, path, elapsed_ms: trajectory.elapsed_ms }
+    Candidate { ground_binding:None, partial: trajectory.partial, path, elapsed_ms: trajectory.elapsed_ms }
+}
+fn candidate_from_mapped_trajectory(pose:&PoseStamped,mapped:nuwax_nav_scan::MappedLocalTrajectory)->Candidate {
+    let mut candidate=candidate_from_trajectory(pose,mapped.trajectory);
+    candidate.ground_binding=Some(Arc::new(mapped.binding));
+    candidate
+}
+fn ground_plan_error(error:nuwax_nav_scan::GroundCandidateError)->LocalPlanError {
+    match error {
+        nuwax_nav_scan::GroundCandidateError::Planning(error)
+        | nuwax_nav_scan::GroundCandidateError::Cancelled {error,..}=>error,
+        nuwax_nav_scan::GroundCandidateError::MappingInput(reason)=>reason.into(),
+        nuwax_nav_scan::GroundCandidateError::Mapping {reason,..}=>
+            format!("selected Ground candidate mapping failed: {reason}").into(),
+    }
 }
 pub(crate) struct PlanResult {
     pub request: PlanRequest,
     pub outcome: Result<Candidate, Vec<LocalPlanError>>,
 }
 struct FailedLocalPlan {
+    ground: Option<GroundPlanInput>,
     start_ground: BodyGroundState,
     coverage_context: [u64;2],
     scan_context: ([u64;2], [usize;2]),
@@ -327,11 +369,124 @@ impl PlanKernel {
         self.local_map=Some((Arc::clone(&r.source),center,Arc::clone(&tomogram),radius));
         Ok(tomogram)
     }
+    /// The same owner, cancellation and bounded failure slots accept an explicit
+    /// finite Ground window. Its XY guide is already supplied by that window's
+    /// caller; Body's support-Z PCT/recent-guide adapter does not synthesize one.
+    /// The local Tomogram is only the existing Scan soft-scoring input.
+    fn compute_ground(
+        &mut self,r:&PlanRequest,input:&GroundPlanInput,cancel:&Cancellation,
+    )->Result<Candidate,Vec<LocalPlanError>> {
+        let start_ground=r.start_ground.as_ref().map_err(|error|vec![LocalPlanError::from(error.clone())])?;
+        let fork=input.incoming.planning_fork(&r.source)
+            .map_err(|error|vec![LocalPlanError::from(error.to_string())])?;
+        let tomogram=self.prepare_local_map(r,fork.snapshot())?;
+        let kinematics=self.config.kinematics().ok_or_else(||vec![LocalPlanError::from("近场执行缺少运动能力")])?;
+        let costs=Arc::new(self.config.pct.local_costs());
+        let nominal_reference=self.config.motion_limits.as_ref().map(|_| {
+            let mut reference=input.xy_reference.as_ref().clone();
+            if let Some(first)=reference.first_mut() {*first=input.intent.window().from().walk_state().xy();}
+            reference
+        });
+        let progress_policy=nominal_reference.as_deref().map(|reference|nuwax_nav_scan::GroundProgressPrefixPolicy {
+            reference,
+            minimum_distance_m:input.arrival_tolerance_m.unwrap_or(self.config.controller.goal_tolerance)
+                .max(r.source.body_envelope().map_or(0.0,|model|model.radius()))
+                +f64::from(r.source.source_voxel_size_m())*0.5,
+        });
+        let start=body(&r.pose);
+        let mut failures=Vec::new();
+        let mut nominal_partial=None;
+        let superseded=||LocalPlanError {body_witness:None,
+            kind:nuwax_nav_scan::LocalPlanFailureKind::Cancelled,closest_pose:None,blocked:None,
+            reason:"planning superseded".into()};
+        for detour in if r.detour {&[true][..]}else{&[false,true][..]} {
+            if cancel.cancelled() {return Err(vec![superseded()]);}
+            let cached=self.failed.iter().find(|f| {
+                f.ground.as_ref().is_some_and(|previous|previous.same_input(input))
+                    && f.start_ground==*start_ground
+                    && Arc::ptr_eq(&f.tomogram,&tomogram)
+                    && f.coverage_context==[r.progress.to_bits(),r.end.to_bits()]
+                    && f.scan_context==scan_context(&r.scan)
+                    // Ground's original window, full XY guide and explicit
+                    // tolerance are compared above, without a fake 3D prefix.
+                    && f.prefix_context.is_none()
+                    && exact_costs(&f.costs,&costs)
+                    && f.source.same_body_query_view(&r.source)
+                    && exact_points(&f.boundary,&r.boundary)
+                    && pose_bits(f.start)==pose_bits(start)
+                    && exact_points(&f.reference,&r.reference)
+                    && f.final_yaw.map(f64::to_bits)==r.final_yaw.map(f64::to_bits)
+                    && f.arrival.map(|(p,t)|(p.map(f64::to_bits),t.to_bits()))
+                        ==r.arrival.map(|(p,t)|(p.map(f64::to_bits),t.to_bits()))
+                    && f.detour==*detour && f.straight==r.straight
+            });
+            if let Some(f)=cached {failures.push(f.failure.clone());continue;}
+            let follow_reference=*detour;
+            let straight=r.straight && !follow_reference;
+            let reference_only=*detour && nominal_partial.is_some();
+            // Both extents enter the original plan_impl with the exact paired
+            // fork/query. The old synthetic Body scan_hook is never consulted.
+            let result=if reference_only {
+                nuwax_nav_scan::probe_ground_reference_candidates_on_fork(&fork,&tomogram,start,start_ground,
+                    input.incoming.walk_state(),&input.xy_reference,&kinematics,&r.scan,r.final_yaw,
+                    input.arrival(),&r.boundary,follow_reference,straight,progress_policy,input.intent.window())
+                    .map(|outcome|match outcome {
+                        nuwax_nav_scan::GroundReferenceCandidateOutcome::Complete(path)=>Some(path),
+                        nuwax_nav_scan::GroundReferenceCandidateOutcome::Miss=>None,
+                    })
+            } else {
+                nuwax_nav_scan::plan_driven_ground_on_fork(&fork,&tomogram,start,start_ground,
+                    input.incoming.walk_state(),&input.xy_reference,&kinematics,&r.scan,r.final_yaw,
+                    input.arrival(),&r.boundary,follow_reference,straight,progress_policy,input.intent.window()).map(Some)
+            };
+            let result=match result {
+                Ok(Some(path))=>Ok(path),
+                Ok(None)=>continue,
+                Err(nuwax_nav_scan::GroundCandidateError::Planning(error))=>Err(error),
+                Err(error)=> {
+                    // A selected physical winner whose original binding failed
+                    // is not a search miss. Do not select a second winner or
+                    // remember the mapping refusal as physical infeasibility.
+                    failures.push(ground_plan_error(error));
+                    return Err(failures);
+                }
+            };
+            if let Err(failure)=&result {
+                if !reference_only && failure.kind!=nuwax_nav_scan::LocalPlanFailureKind::Cancelled {
+                    if self.failed.len()==2 {self.failed.remove(0);}
+                    self.failed.push(FailedLocalPlan {
+                        ground:Some(input.clone()),start_ground:start_ground.clone(),
+                        coverage_context:[r.progress.to_bits(),r.end.to_bits()],scan_context:scan_context(&r.scan),
+                        prefix_context:None,costs:Arc::clone(&costs),source:r.source.clone(),tomogram:tomogram.clone(),
+                        boundary:r.boundary.clone(),start,reference:r.reference.clone(),final_yaw:r.final_yaw,
+                        arrival:r.arrival,failure:failure.clone(),detour:*detour,straight:r.straight,
+                    });
+                }
+            }
+            match result {
+                Ok(path) if !*detour && path.trajectory.partial=>nominal_partial=Some(path),
+                Ok(path)=> {
+                    if nominal_partial.is_some() && cancel.cancelled() {return Err(vec![superseded()]);}
+                    let selected=if path.trajectory.partial {nominal_partial.take().unwrap_or(path)}else{path};
+                    return Ok(candidate_from_mapped_trajectory(&r.pose,selected));
+                }
+                Err(failure)=> {
+                    let cancelled=failure.kind==nuwax_nav_scan::LocalPlanFailureKind::Cancelled;
+                    failures.push(failure);if cancelled {return Err(failures);}
+                }
+            }
+        }
+        if let Some(path)=nominal_partial {
+            if cancel.cancelled() {return Err(vec![superseded()]);}
+            Ok(candidate_from_mapped_trajectory(&r.pose,path))
+        } else {Err(failures)}
+    }
     fn compute_inner(
         &mut self,
         r: &PlanRequest,
         cancel: &Cancellation,
     ) -> Result<Candidate, Vec<LocalPlanError>> {
+        if let Some(ground)=r.ground.as_ref() {return self.compute_ground(r,ground,cancel);}
         #[cfg(test)] let map_phase = priority_probe::kernel_phase("map_prepare");
         let start_ground=r.start_ground.as_ref().map_err(|error|vec![LocalPlanError::from(error.clone())])?;
         // Fork on this CPU owner. No cache permission travels back to control.
@@ -388,7 +543,7 @@ impl PlanKernel {
                 return Err(vec![superseded()]);
             }
             let cached = self.failed.iter().find(|f| {
-                f.start_ground == *start_ground
+                f.ground.is_none() && f.start_ground == *start_ground
                     && Arc::ptr_eq(&f.tomogram, &tomogram)
                     && f.coverage_context==[r.progress.to_bits(),r.end.to_bits()]
                     && f.scan_context == scan_context(&r.scan)
@@ -487,6 +642,7 @@ impl PlanKernel {
                             self.failed.remove(0);
                         }
                         self.failed.push(FailedLocalPlan {
+                            ground:None,
                             start_ground:start_ground.clone(),
                             coverage_context:[r.progress.to_bits(),r.end.to_bits()],
                             scan_context: scan_context(&r.scan),
@@ -610,6 +766,7 @@ mod tests {
             },
         };
         let request = PlanRequest {
+            ground:None,
             start_ground:source.body_query().start_ground_state(body(&pose)).map_err(|error|error.to_string()),
             source,
             change_basis: None,
@@ -662,6 +819,7 @@ mod tests {
         kernel.failed.clear();
         for detour in [false, true] {
             kernel.failed.push(FailedLocalPlan {
+                ground:None,
                 start_ground:request.start_ground.as_ref().unwrap().clone(),
                 coverage_context:[request.progress.to_bits(),request.end.to_bits()],
                 scan_context: scan_context(&request.scan),

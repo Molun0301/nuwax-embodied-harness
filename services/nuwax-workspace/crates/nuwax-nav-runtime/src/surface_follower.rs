@@ -236,6 +236,7 @@ impl SurfaceFollower {
         #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::CurrentBodyValidation);
         let map = self.map.as_ref()?;
         map.body_envelope()?;
+        if self.ground_execution.is_some() {return self.proposed_ground_basis().err();}
         let pose = self.odometry.as_ref()?;
         let (query,ground)=match self.current_ground_query() {Ok(query)=>query,Err(error)=>return Some(error)};
         let q = pose.pose.orientation;
@@ -325,6 +326,7 @@ impl SurfaceFollower {
             }
         }
         self.ground_execution=None;
+        self.selected_body_command=None;
         self.progress_m = progress;
         self.last_tracked_pose = Some(odometry.clone());
         // Arc progress and the consumed waypoint belong to the same selected
@@ -574,6 +576,13 @@ impl SurfaceFollower {
 
     /// 微转向只有能恢复后续平移时才属于接续动作，避免在已对齐堵点渐近旋转。
     pub(super) fn rotation_can_restore_translation(&self, command: Twist2, candidate_angular_z:f64) -> bool {
+        if self.ground_execution.is_some() {
+            let Ok(Some(basis))=self.proposed_ground_basis() else {return false;};
+            let Ok(navigation)=basis.walk_state() else {return false;};
+            let Ok((query,ground))=self.current_control_query_owned(Some(navigation)) else {return false;};
+            return self.rotation_can_restore_translation_with_navigation(command,candidate_angular_z,
+                &query,&ground,Some(navigation));
+        }
         self.odometry.as_ref().zip(self.control_target).is_none_or(|(pose,target)| {
             let yaw=pose.pose.orientation.yaw();
             let omni=self.config.kinematics().is_some_and(|m|m.model==nuwax_nav_types_messages::MotionModel::Omnidirectional && m.max_lateral_mps>0.0);
@@ -712,7 +721,7 @@ impl NavPlanner for SurfaceFollower {
         let odometry = self.odometry.as_ref()?.clone();
         let ground = self.actual_ground.as_ref()?.1.as_ref().ok()?.clone();
         Some(Arc::new(crate::replan_feedback::ActualExecutionContext {
-            source, odometry, ground, applied,
+            source, odometry, ground, applied, navigation:self.committed_ground_basis(),
         }))
     }
     fn revalidate_selected_command(&mut self,command:Twist2)->Option<PlannerStep> {
@@ -735,6 +744,7 @@ impl NavPlanner for SurfaceFollower {
     fn configure_goal(&mut self, _goal:&PoseStamped, options:nuwax_nav_types_messages::GoalOptions)->Result<(),RuntimeError> {
         self.last_command_dispatch_bound = None;
         options.validate().map_err(|reason|RuntimeError::InvalidInput {field:"goal_options",reason})?;
+        self.selected_body_command=None;
         if self.ground_execution.take().is_some() {
             self.path=None;self.goal=None;self.cumulative.clear();self.progress_m=0.0;self.last_tracked_pose=None;
         }
@@ -787,6 +797,7 @@ impl NavPlanner for SurfaceFollower {
 
     fn update_costmap(&mut self, _costmap: CostMap2D) {
         self.last_command_dispatch_bound = None;
+        self.selected_body_command=None;
         if self.ground_execution.take().is_some() {
             self.path=None;self.goal=None;self.cumulative.clear();self.progress_m=0.0;self.last_tracked_pose=None;
         }
@@ -818,6 +829,7 @@ impl NavPlanner for SurfaceFollower {
                 }
                 if self.ground_execution.as_ref().is_some_and(|execution|!execution.matches_source(&map)) {
                     self.ground_execution=None;
+                    self.selected_body_command=None;
                     self.path=None;self.goal=None;self.cumulative.clear();
                     self.progress_m=0.0;self.last_tracked_pose=None;
                 }
@@ -855,6 +867,7 @@ impl NavPlanner for SurfaceFollower {
     fn stop(&mut self) {
         self.begin_braking();
         self.ground_execution=None;
+        self.selected_body_command=None;
         self.path = None;
         self.goal = None;
         self.cumulative.clear();
@@ -2429,3 +2442,7 @@ mod stair_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path="ground_owner_tests.rs"]
+mod ground_owner_tests;

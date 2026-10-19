@@ -30,7 +30,7 @@ mod passage;
 pub use passage::SurfaceBodyPassageCandidate;
 mod body_query;
 pub use body_query::{BodyGroundState, BodyMotionProjection, BodyNavigationSegment,
-    NavigationGroundSample, SurfaceBodyQueryView};
+    NavigationGroundSample, NavigationPlanningFork, SurfaceBodyQueryView, same_source_geometry};
 mod body_witness;
 pub use body_witness::{BodyFailureWitness, BodyRejection, CollisionCheck, OccupancySource};
 mod frontiers;

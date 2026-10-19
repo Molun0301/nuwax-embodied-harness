@@ -237,7 +237,7 @@ mod synthetic_capture_replay_seam_tests {
         for pair in route.poses.windows(2) {
             cumulative.push(cumulative.last().unwrap()+pair[0].pose.position.distance(pair[1].pose.position));
         }
-        let mut request=PlanRequest {
+        let mut request=PlanRequest {ground:None,
             start_ground:source.body_query().start_ground_state(crate::route_planning::body(&route.poses[0])).map_err(|error|error.to_string()),
             source,change_basis:None,
             changes:Arc::new(crate::surface_changes::SurfaceGeometryChanges::Unknown),pose:route.poses[0].clone(),boundary:Arc::new(vec![]),

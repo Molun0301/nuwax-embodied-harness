@@ -6,6 +6,29 @@ use super::*;
 #[derive(Clone,Debug)]
 pub struct SurfaceBodyQueryView {
     snapshot: SurfaceSnapshot,
+    // Only the explicit factories bind original navigation to a current query.
+    navigation_basis: Option<SurfaceSnapshot>,
+}
+
+/// One private planning snapshot and its original-source navigation binding.
+/// The query owns the only snapshot; callers cannot accidentally pair a fork
+/// with an unbound query constructed from that fork.
+#[derive(Clone,Debug)]
+pub struct NavigationPlanningFork { query: SurfaceBodyQueryView }
+impl NavigationPlanningFork {
+    pub fn snapshot(&self)->&SurfaceSnapshot {&self.query.snapshot}
+    pub fn body_query(&self)->&SurfaceBodyQueryView {&self.query}
+}
+
+/// Original PCT geometry-reuse predicate, shared with explicit navigation
+/// binding. Metadata and recent obstacles remain current-query inputs.
+pub fn same_source_geometry(a: &SurfaceSnapshot, b: &SurfaceSnapshot) -> bool {
+    a.same_geometry(b)
+        && match (a.observations(), b.observations()) {
+            (Some(a), Some(b)) => a.same_geometry(b),
+            (None, None) => true,
+            _ => false,
+        }
 }
 
 /// One independent navigation sample from an already recorded source walk.
@@ -36,10 +59,18 @@ impl<'source,'trace> BodyNavigationSegment<'source,'trace> {
     pub(in crate::surface) fn at(&self,t:f64)->NavigationGroundSample<'source> {(self.sample)(t)}
     pub(in crate::surface) fn changes(&self)->&[f64] {self.changes}
     fn matches(&self,view:&SurfaceBodyQueryView,from:[f64;2],to:[f64;2])->bool {
-        self.from==from && self.to==to && view.same_ground_source(self.source)
+        self.from==from && self.to==to && view.same_navigation_source(self.source)
     }
 }
 impl SurfaceBodyQueryView {
+    fn same_navigation_source(&self,other:&SurfaceSnapshot)->bool {
+        let Some(basis)=self.navigation_basis.as_ref() else {return self.same_ground_source(other);};
+        let observations=match (&basis.observations,&other.observations) {
+            (None,None)=>true,(Some(a),Some(b))=>Arc::ptr_eq(a,b),_=>false,
+        };
+        basis.ground_evidence==other.ground_evidence
+            && Arc::ptr_eq(&basis.data,&other.data) && observations
+    }
     /// Project one recorded navigation edge through the original H3 physical
     /// response. Initial actual bias remains actual; navigation never reads it.
     pub fn project_motion_with_navigation(&self,from:([f64;3],[f64;4]),ground:&BodyGroundState,
@@ -214,19 +245,37 @@ impl SurfaceSnapshot {
     /// A zero-copy geometry query over the unchanged source. Ground evidence is
     /// descriptive; actual pose and motion validation remain explicit operations.
     pub fn body_query(&self) -> SurfaceBodyQueryView {
-        SurfaceBodyQueryView { snapshot: self.clone() }
+        SurfaceBodyQueryView { snapshot: self.clone(), navigation_basis: None }
+    }
+
+    /// Bind an original navigation source once while preserving the current
+    /// collision, observation-time and recent-obstacle query and its cache.
+    pub fn body_query_with_navigation_basis(&self,basis:&SurfaceSnapshot)
+        ->Result<SurfaceBodyQueryView,SurfaceError> {
+        if !same_source_geometry(self,basis) {return Err(SurfaceError::InvalidPose);}
+        Ok(SurfaceBodyQueryView {snapshot:self.clone(),navigation_basis:Some(basis.clone())})
+    }
+
+    /// Qualify the original source before creating a private planning owner.
+    /// The original basis supplies source-native navigation records only.
+    pub fn fork_for_navigation_planning(&self,basis:&SurfaceSnapshot)
+        ->Result<NavigationPlanningFork,SurfaceError> {
+        if !same_source_geometry(self,basis) {return Err(SurfaceError::InvalidPose);}
+        Ok(NavigationPlanningFork {query:SurfaceBodyQueryView {
+            snapshot:self.fork_for_planning(),navigation_basis:Some(basis.clone()),
+        }})
     }
 
     /// Compatibility alias: validate the actual pose and share the unchanged source.
     pub fn body_query_with_current_support(&self,body:[f64;3],quaternion:[f64;4])
         ->Result<SurfaceBodyQueryView,SurfaceError> {
-        self.validated_body_snapshot(body,quaternion,&mut None).map(|snapshot|SurfaceBodyQueryView{snapshot})
+        self.validated_body_snapshot(body,quaternion,&mut None).map(|snapshot|SurfaceBodyQueryView{snapshot,navigation_basis:None})
     }
 
     /// Same geometry-only alias, preserving an actual collision witness.
     pub fn body_query_with_current_support_and_witness(&self,body:[f64;3],quaternion:[f64;4],
         slot:&mut Option<BodyFailureWitness>)->Result<SurfaceBodyQueryView,SurfaceError> {
-        self.validated_body_snapshot(body,quaternion,slot).map(|snapshot|SurfaceBodyQueryView{snapshot})
+        self.validated_body_snapshot(body,quaternion,slot).map(|snapshot|SurfaceBodyQueryView{snapshot,navigation_basis:None})
     }
 
     /// Geometry, observation and recent-obstacle identity for exact-pose query reuse.

@@ -80,7 +80,7 @@ mod pending_only_v2_tests {
                             pose.pose.position=Point3::new(p[0],p[1],p[2]+offset); pose
                         }).collect()}
                     };
-                    Ok(Candidate {partial:matches!(kind,ResultKind::Partial),path,elapsed_ms:0.0})
+                    Ok(Candidate {ground_binding:None,partial:matches!(kind,ResultKind::Partial),path,elapsed_ms:0.0})
                 }
             };
             PlanResult {request,outcome}

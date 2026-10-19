@@ -212,12 +212,7 @@ impl std::fmt::Debug for PctPlanner {
 }
 /// 占据几何相同即可复用计算，真实观察时间仍由执行端独立消费。
 pub fn same_source_geometry(a: &SurfaceSnapshot, b: &SurfaceSnapshot) -> bool {
-    a.same_geometry(b)
-        && match (a.observations(), b.observations()) {
-            (Some(a), Some(b)) => a.same_geometry(b),
-            (None, None) => true,
-            _ => false,
-        }
+    nuwax_nav_mls_planner::surface::same_source_geometry(a, b)
 }
 impl PctPlanner {
     /// Configure the actual global body-route request budget. This bounds work,

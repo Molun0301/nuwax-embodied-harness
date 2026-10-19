@@ -4,7 +4,7 @@ use crate::{PctPlanner, PlanningFailure, RoutePenalty, SearchLimits, SearchStats
 use crate::reference::Reference;
 use crate::search::{RouteReferenceTrace, checkpoint};
 use nuwax_nav_mls_planner::{SurfaceSnapshot, surface::{BodyNavigationSegment,
-    NavigationGroundSample, SourceGroundRecord, SurfaceBodyQueryView}};
+    NavigationGroundSample, NavigationPlanningFork, SourceGroundRecord, SurfaceBodyQueryView}};
 use nuwax_types::navigation::{GroundHeightIntent, GroundLayerResult};
 use std::sync::{Arc, atomic::AtomicBool};
 
@@ -266,20 +266,33 @@ impl GroundRouteReference {
     }
     pub fn freeze_candidate(&self,segments:Vec<GroundWalkSegment<'_>>)
         ->Result<GroundCandidateReference,PlanningFailure> {
+        self.freeze_candidate_impl(segments,None)
+    }
+    /// A stationary accepted candidate retains its real incoming address without
+    /// inventing an executed connection or a second source query.
+    pub fn freeze_candidate_from(&self,incoming:GroundWalkState<'_>,segments:Vec<GroundWalkSegment<'_>>)
+        ->Result<GroundCandidateReference,PlanningFailure> {
+        if !incoming.same_reference_owner(self) {return Err("candidate reference owner changed".into());}
+        self.freeze_candidate_impl(segments,Some((incoming.reference,incoming.reference_sample_xy,incoming.xy)))
+    }
+    fn freeze_candidate_impl(&self,segments:Vec<GroundWalkSegment<'_>>,
+        initial:Option<(Reference,[f64;2],[f64;2])>)->Result<GroundCandidateReference,PlanningFailure> {
         let mut connections=Vec::with_capacity(segments.len());let mut changes=Vec::new();
         let mut previous:Option<GroundWalkState<'_>>=None;
         for segment in segments {
             if !std::ptr::eq(segment.from.map,self.map.as_ref()) {return Err("candidate reference owner changed".into());}
-            if previous.is_some_and(|end|end.reference!=segment.from.reference || end.xy!=segment.from.xy) {
+            if previous.is_some_and(|end|end.reference!=segment.from.reference || end.xy!=segment.from.xy
+                || end.reference_sample_xy!=segment.from.reference_sample_xy) {
                 return Err("candidate reference segments are disconnected".into());
             }
             previous=Some(segment.to);
             let start=changes.len();changes.extend(segment.trace.changes);
             connections.push(GroundWalkConnection {from:segment.from.xy,to:segment.to.xy,
+                reference_sample_xy:segment.from.reference_sample_xy,
                 steps:segment.trace.steps,changes:start..changes.len()});
         }
         Ok(GroundCandidateReference {map:Arc::clone(&self.map),
-            trace:Arc::new(GroundCandidateTrace {connections,changes})})
+            trace:Arc::new(GroundCandidateTrace {connections,changes,initial})})
     }
 }
 impl<'a> GroundRoutePosition<'a> {
@@ -292,9 +305,19 @@ impl<'a> GroundRoutePosition<'a> {
         let c=&self.owner.trace.connections[self.connection];
         let reference=self.owner.trace.changes[c.changes.clone()].iter().rev()
             .find(|change|change.sample_index<=self.sample).expect("valid original sample").reference;
+        let sample_t=self.sample as f64/c.steps as f64;
         let t=(self.sample as f64+self.fraction)/c.steps as f64;
         GroundWalkState {map:&self.owner.map,reference,
+            reference_sample_xy:std::array::from_fn(|i|c.evaluated_from[i]+sample_t*(c.evaluated_to[i]-c.evaluated_from[i])),
             xy:std::array::from_fn(|i|c.evaluated_from[i]+t*(c.evaluated_to[i]-c.evaluated_from[i]))}
+    }
+    /// Capture an original address for a request. Actual XY is independent of
+    /// the evaluator sample used by the retained navigation association.
+    pub fn continuation(self,actual_xy:[f64;2])->Option<OwnedGroundWalkState> {
+        if !actual_xy.into_iter().all(f64::is_finite) {return None;}
+        let state=self.walk_state();
+        Some(OwnedGroundWalkState {map:Arc::clone(&self.owner.map),reference:state.reference,
+            reference_sample_xy:state.reference_sample_xy,actual_xy})
     }
     pub fn window_to(self,to:Self)->Option<GroundRouteWindow<'a>> {
         (Arc::ptr_eq(&self.owner.map,&to.owner.map) && Arc::ptr_eq(&self.owner.trace,&to.owner.trace))
@@ -317,16 +340,57 @@ impl OwnedGroundRouteWindow {
         }
     }
 }
+/// Small owned continuation for crossing a request/command lifetime. It owns
+/// only the original Tomogram Arc and the exact small incoming association.
+#[derive(Clone,Debug)]
+pub struct OwnedGroundWalkState {
+    map:Arc<Tomogram>,reference:Reference,reference_sample_xy:[f64;2],actual_xy:[f64;2],
+}
+impl OwnedGroundWalkState {
+    pub fn walk_state(&self)->GroundWalkState<'_> {
+        GroundWalkState {map:&self.map,reference:self.reference,
+            reference_sample_xy:self.reference_sample_xy,xy:self.actual_xy}
+    }
+    pub fn semantic_key(&self)->GroundWalkKey {self.walk_state().semantic_key()}
+    pub fn same_reference_owner(&self,owner:&GroundRouteReference)->bool {
+        self.walk_state().same_reference_owner(owner)
+    }
+    pub fn planning_fork(&self,current:&SurfaceSnapshot)->Result<NavigationPlanningFork,PlanningFailure> {
+        let source=self.map.source.as_ref().ok_or("recorded navigation has no physical source")?;
+        current.fork_for_navigation_planning(source).map_err(|error|PlanningFailure::from(error.to_string()))
+    }
+    pub fn bind_body_query(&self,current:&SurfaceSnapshot)->Result<SurfaceBodyQueryView,PlanningFailure> {
+        self.walk_state().bind_body_query(current)
+    }
+}
+impl PartialEq for OwnedGroundWalkState {
+    fn eq(&self,other:&Self)->bool {self.semantic_key()==other.semantic_key()}
+}
+impl Eq for OwnedGroundWalkState {}
+
 #[derive(Clone,Copy,Debug)]
-pub struct GroundWalkState<'a> {map:&'a Tomogram,reference:Reference,xy:[f64;2]}
+pub struct GroundWalkState<'a> {
+    map:&'a Tomogram,reference:Reference,reference_sample_xy:[f64;2],xy:[f64;2],
+}
 #[derive(Clone,Copy,Debug,PartialEq,Eq,Hash)]
-pub struct GroundWalkKey {owner:usize,reference:Reference,xy:[u64;2]}
+pub struct GroundWalkKey {owner:usize,reference:Reference,reference_sample_xy:[u64;2],xy:[u64;2]}
 impl<'a> GroundWalkState<'a> {
     pub fn xy(self)->[f64;2] {self.xy}
-    /// Height of this independent planned association; Unanchored stays None.
-    pub fn planned_ground_z(self)->Option<f64> {self.map.reference_height_at(self.reference,self.xy)}
+    pub fn reference_sample_xy(self)->[f64;2] {self.reference_sample_xy}
+    pub fn same_reference_owner(self,owner:&GroundRouteReference)->bool {
+        std::ptr::eq(self.map,owner.map.as_ref())
+    }
+    /// Bind once for the invocation without creating an owned continuation.
+    pub fn bind_body_query(self,current:&SurfaceSnapshot)->Result<SurfaceBodyQueryView,PlanningFailure> {
+        let source=self.map.source.as_ref().ok_or("recorded navigation has no physical source")?;
+        current.body_query_with_navigation_basis(source).map_err(|error|PlanningFailure::from(error.to_string()))
+    }
+    /// Height at the original evaluator sample, never at a shifted actual XY.
+    /// Unanchored remains None; physical height cannot fill it in.
+    pub fn planned_ground_z(self)->Option<f64> {self.map.reference_height_at(self.reference,self.reference_sample_xy)}
     pub fn semantic_key(self)->GroundWalkKey {
-        GroundWalkKey {owner:std::ptr::from_ref(self.map) as usize,reference:self.reference,xy:self.xy.map(f64::to_bits)}
+        GroundWalkKey {owner:std::ptr::from_ref(self.map) as usize,reference:self.reference,
+            reference_sample_xy:self.reference_sample_xy.map(f64::to_bits),xy:self.xy.map(f64::to_bits)}
     }
     pub fn walk_xy(self,to:[f64;2],boundary:&[[f64;2]],cancelled:Option<&AtomicBool>)
         ->Result<GroundWalkSegment<'a>,PlanningFailure> {
@@ -336,7 +400,9 @@ impl<'a> GroundWalkState<'a> {
             &mut scratch,Some(self.reference));
         checkpoint(cancelled)?;
         let (_,_,reference)=result.ok_or("candidate XY reference is incompatible with its source")?;
-        Ok(GroundWalkSegment {from:self,to:Self {map:self.map,reference,xy:to},trace:scratch.unwrap()})
+        // Keep the evaluator's own final sample arithmetic, including rounding.
+        let reference_sample_xy=std::array::from_fn(|axis|self.xy[axis]+1.0*(to[axis]-self.xy[axis]));
+        Ok(GroundWalkSegment {from:self,to:Self {map:self.map,reference,reference_sample_xy,xy:to},trace:scratch.unwrap()})
     }
 }
 #[derive(Debug)]
@@ -349,18 +415,13 @@ impl<'a> GroundWalkSegment<'a> {
         self.trace.changes[at-1].reference
     }
     fn sample_xy(&self,index:usize)->[f64;2] {
+        if index==0 {return self.from.reference_sample_xy;}
         let t=index as f64/self.trace.steps as f64;
         std::array::from_fn(|axis|self.from.xy[axis]+t*(self.to.xy[axis]-self.from.xy[axis]))
     }
     pub(crate) fn navigation_at(&self,t:f64)->NavigationGroundSample<'a> {
-        // Compare the evaluator's original division, not floor(t*steps): a
-        // rounded multiplication can place an exact boundary one sample early.
-        let (mut low,mut high)=(0,self.trace.steps);
-        while low<high {
-            let mid=low+(high-low)/2+1;
-            if mid as f64/self.trace.steps as f64<=t {low=mid;}else{high=mid-1;}
-        }
-        let reference=self.reference_at(low);let xy=self.sample_xy(low);
+        let (index,_)=original_grid_sample(self.trace.steps,t).expect("bounded navigation fraction");
+        let reference=self.reference_at(index);let xy=self.sample_xy(index);
         match reference {
             Reference::Known(id)=>match self.from.map.source_ground_record(id) {
                 Some(record)=>NavigationGroundSample::KnownNative {record,reference_xy:xy},
@@ -400,7 +461,7 @@ impl<'a> GroundWalkSegment<'a> {
         ->Result<R,PlanningFailure> {
         let source=self.from.map.source.as_ref().ok_or("recorded navigation has no physical source")?;
         if matches!(self.from.reference,Reference::Known(_))
-            && self.from.map.reference_height_at(self.from.reference,self.from.xy).is_none() {
+            && self.from.map.reference_height_at(self.from.reference,self.from.reference_sample_xy).is_none() {
             return Err("recorded navigation start has no source-local sample height".into());
         }
         let changes=self.navigation_changes();
@@ -413,14 +474,41 @@ impl<'a> GroundWalkSegment<'a> {
 #[cfg(test)]
 pub(crate) fn source_less_navigation_adapter_rejected()->bool {
     let map=Tomogram::from_columns(0.1,[],0.4,0.0,0.1,0.1,20.0).unwrap();
-    let from=GroundWalkState {map:&map,reference:Reference::Unanchored{column:[0,0]},xy:[0.025,0.025]};
+    let from=GroundWalkState {map:&map,reference:Reference::Unanchored{column:[0,0]},
+        reference_sample_xy:[0.025,0.025],xy:[0.025,0.025]};
     let edge=from.walk_xy([0.125,0.025],&[],None).unwrap();
     edge.with_body_navigation(|_,_|()).is_err()
 }
+// Compare the evaluator's original division, never floor(t*steps): rounded
+// multiplication can move an exact boundary to the wrong discrete sample.
+// The residual fraction is measured within those same divided endpoints.
+fn original_grid_sample(steps:usize,t:f64)->Option<(usize,f64)> {
+    if steps==0 || !t.is_finite() || !(0.0..=1.0).contains(&t) {return None;}
+    let (mut low,mut high)=(0,steps);
+    while low<high {
+        let mid=low+(high-low)/2+1;
+        if mid as f64/steps as f64<=t {low=mid;}else{high=mid-1;}
+    }
+    let fraction=if low==steps {0.0}else {
+        let from=low as f64/steps as f64;let to=(low+1) as f64/steps as f64;
+        ((t-from)/(to-from)).clamp(0.0,1.0_f64.next_down())
+    };
+    Some((low,fraction))
+}
 #[derive(Debug)]
-struct GroundWalkConnection {from:[f64;2],to:[f64;2],steps:usize,changes:std::ops::Range<usize>}
+struct GroundWalkConnection {
+    from:[f64;2],to:[f64;2],reference_sample_xy:[f64;2],steps:usize,changes:std::ops::Range<usize>,
+}
+impl GroundWalkConnection {
+    fn sample_xy(&self,index:usize)->[f64;2] {
+        if index==0 {return self.reference_sample_xy;}
+        let t=index as f64/self.steps as f64;
+        std::array::from_fn(|axis|self.from[axis]+t*(self.to[axis]-self.from[axis]))
+    }
+}
 #[derive(Debug)]
-struct GroundCandidateTrace {connections:Vec<GroundWalkConnection>,changes:Vec<crate::reference::TraceChange>}
+struct GroundCandidateTrace {connections:Vec<GroundWalkConnection>,changes:Vec<crate::reference::TraceChange>,
+    initial:Option<(Reference,[f64;2],[f64;2])>}
 /// The selected candidate's own planned walk. It does not assert actual layer or clearance.
 #[derive(Clone,Debug)]
 pub struct GroundCandidateReference {map:Arc<Tomogram>,trace:Arc<GroundCandidateTrace>}
@@ -429,13 +517,37 @@ impl GroundCandidateReference {
     pub fn connection(&self,index:usize)->Option<([f64;2],[f64;2],usize)> {
         let c=self.trace.connections.get(index)?;Some((c.from,c.to,c.steps))
     }
+    /// Decode an address on the retained evaluator grid. Slices and future
+    /// continuations use this same right-continuous decoder.
+    pub fn original_sample(&self,edge:usize,fraction:f64)->Option<(usize,f64)> {
+        original_grid_sample(self.trace.connections.get(edge)?.steps,fraction)
+    }
+    /// Borrow an accepted candidate address for one control invocation. This
+    /// does not move its cursor or choose another layer from actual geometry.
+    pub fn walk_state_at(&self,edge:usize,fraction:f64,actual_xy:[f64;2])->Option<GroundWalkState<'_>> {
+        if !actual_xy.into_iter().all(f64::is_finite) {return None;}
+        if self.trace.connections.is_empty() && edge==0 && fraction==0.0 {
+            let (reference,reference_sample_xy,_)=self.trace.initial?;
+            return Some(GroundWalkState {map:&self.map,reference,reference_sample_xy,xy:actual_xy});
+        }
+        let c=self.trace.connections.get(edge)?;
+        let (index,_)=original_grid_sample(c.steps,fraction)?;
+        let reference=self.trace.changes[c.changes.clone()].iter().rev()
+            .find(|change|change.sample_index<=index)?.reference;
+        Some(GroundWalkState {map:&self.map,reference,reference_sample_xy:c.sample_xy(index),xy:actual_xy})
+    }
+    /// Freeze only when the seed must outlive the borrowed original candidate.
+    pub fn continuation_at(&self,edge:usize,fraction:f64,actual_xy:[f64;2])->Option<OwnedGroundWalkState> {
+        let state=self.walk_state_at(edge,fraction,actual_xy)?;
+        Some(OwnedGroundWalkState {map:Arc::clone(&self.map),reference:state.reference,
+            reference_sample_xy:state.reference_sample_xy,actual_xy})
+    }
     pub fn sample(&self,connection:usize,index:usize)->Option<PlannedGroundSample<'_>> {
         let c=self.trace.connections.get(connection)?;
         if index>c.steps {return None;}
         let reference=self.trace.changes[c.changes.clone()].iter().rev()
             .find(|change|change.sample_index<=index)?.reference;
-        let t=index as f64/c.steps as f64;
-        let xy=std::array::from_fn(|i|c.from[i]+t*(c.to[i]-c.from[i]));
+        let xy=c.sample_xy(index);
         let association=match reference {
             Reference::Known(id)=>PlannedGroundAssociation::Known {source:self.map.source_ground_record(id)},
             Reference::Unknown {..}=>PlannedGroundAssociation::Carried,
@@ -444,14 +556,26 @@ impl GroundCandidateReference {
         Some(PlannedGroundSample {point:GroundRoutePoint {xy,ground_z:self.map.reference_height_at(reference,xy)},association})
     }
     pub fn constant_association(&self,connection:usize)->bool {
-        self.trace.connections.get(connection).is_some_and(|c|c.changes.len()==1)
+        self.trace.connections.get(connection).is_some_and(|c| {
+            if c.changes.len()!=1 {return false;}
+            let reference=self.trace.changes[c.changes.start].reference;
+            let first=self.map.reference_height_at(reference,c.sample_xy(0));
+            first==self.map.reference_height_at(reference,c.sample_xy(1))
+                && first==self.map.reference_height_at(reference,c.sample_xy(c.steps))
+        })
     }
     pub fn matches_source(&self,source:&SurfaceSnapshot)->bool {self.map.matches_surface(source)}
     /// Source-local equality for joins, not a floating-height floor comparison.
     pub fn end_matches(&self,original:GroundRoutePosition<'_>)->bool {
-        std::ptr::eq(self.map.as_ref(),original.owner.map.as_ref())
-            && self.trace.changes.last().is_some_and(|last|last.reference==original.walk_state().reference)
-            && self.trace.connections.last().is_some_and(|last|last.to==original.walk_state().xy)
+        let target=original.walk_state();
+        std::ptr::eq(self.map.as_ref(),original.owner.map.as_ref()) &&
+            if self.trace.connections.is_empty() {
+                self.trace.initial.is_some_and(|(reference,sample_xy,xy)|reference==target.reference
+                    && sample_xy==target.reference_sample_xy && xy==target.xy)
+            } else {
+                self.trace.changes.last().is_some_and(|last|last.reference==target.reference)
+                    && self.trace.connections.last().is_some_and(|last|last.to==target.xy)
+            }
     }
 }
 

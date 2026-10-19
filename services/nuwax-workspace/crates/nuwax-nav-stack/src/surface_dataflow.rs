@@ -604,6 +604,7 @@ fn surface_replan_input(
         options:goal.options,
         boundary:Arc::new(goal.boundary_points.iter().map(|p|[p[0],p[1]]).collect()),
         actual:matching.and_then(|feedback|feedback.current_context.clone()),
+        ground_intent:None,
         limits:nuwax_nav_pct::SearchLimits { max_states:budget },
         offset:surface.body_envelope().map_or(config.follower.body_to_support_z_m,|body|body.body_to_support_z_m),
         local_planning_enabled:config.follower.local_planning_enabled,

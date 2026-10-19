@@ -282,14 +282,48 @@ class AssignedWorkspaceActivationTests(unittest.TestCase):
         self.stub.calls.clear()
         with self.no_legacy_or_hash(), patch.object(
             self.mapping, "ingest_external_snapshot", side_effect=AssertionError("map imported again")
-        ):
+        ), patch.object(self.memory, "get_summary", wraps=self.memory.get_summary) as summary:
             repeated = self.activate()
+        self.assertEqual(summary.call_count, 1)
         self.assert_consistent(repeated)
         self.assertIs(self.runtime._map_activation_snapshot_read(), target)
         self.assertIs(self.localization.get_active_session_token()[0], session)
         self.assertEqual(self.localization.get_active_session_token()[1], epoch)
         self.assertIs(self.mapping.get_latest_snapshot(), mapping)
         self.assertEqual(repeated.active_localization_session.session_id, first.active_localization_session.session_id)
+        self.assertNotIn("ActivateMap", self.stub.calls)
+        self.assertNotIn("StopMapping", self.stub.calls)
+
+    def test_repeat_same_owner_handler_summarizes_service_and_refresh_only(self):
+        from gateways.runtime import GatewayRuntime
+        from skills.handlers.localization_skills import handle_activate_map
+
+        self.activate()
+        self.stub.calls.clear()
+        events = []
+        # Runtime/perception effects stay at the existing offline fixture boundary.
+        # The handler and workspace refresh bodies are the real implementations.
+        ctx = SimpleNamespace(
+            map_workspace_service=self.service,
+            ensure_geometry_runtime_started=lambda reason: events.append(("ensure", reason)),
+            sync_perception_runtime_for_memory_state=lambda **kwargs: events.append(("perception", kwargs)),
+        )
+
+        def refresh(**kwargs):
+            events.append(("refresh", kwargs))
+            return GatewayRuntime._refresh_workspace_snapshots(ctx, **kwargs)
+
+        ctx.refresh_workspace_snapshots = refresh
+        with patch.object(self.memory, "get_summary", wraps=self.memory.get_summary) as summary:
+            result = handle_activate_map(ctx, {"map_name": MAP_NAME})
+        self.assertEqual(summary.call_count, 2)
+        self.assert_consistent(result["active_workspace"])
+        self.assertEqual(events, [
+            ("ensure", "activate_map"),
+            ("refresh", {"refresh_localization": False}),
+            ("perception", {"enabled": True}),
+        ])
+        self.assertEqual(self.stub.installs, 1)
         self.assertNotIn("ActivateMap", self.stub.calls)
         self.assertNotIn("StopMapping", self.stub.calls)
 

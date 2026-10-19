@@ -304,9 +304,12 @@ def _activate(owner, bundle, load_memory_history, metadata, allow_dispatch, publ
             # 已完成的同一真实安装，不产生第二个安装/会话或重新导入地图。
             runtime.validate_prepared_assigned_map_evidence(prepared,
                 activation_request=request, activation_evidence=initial_state)
-            existing = build_assigned_workspace(owner, asset, publish=False)
-            if existing is not None and existing.active_localization_session.activation_receipt_v2.to_dict()['request'] == request:
-                return existing
+            # This probe consumes only the coherent session receipt. The caller
+            # still builds the final workspace after the publication scope, where
+            # the actual summary repairs and currentness checks remain unchanged.
+            components = current_components(owner, asset)
+            if components is not None and components[2].activation_receipt_v2.to_dict()['request'] == request:
+                return
         predecessor = ({key: initial_state[key] for key in _PREDECESSOR_FIELDS}
                        if initial_state['active'] and initial_state['session_id'] != request['session_id'] else None)
         with _transaction(owner):

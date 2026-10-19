@@ -703,6 +703,24 @@ geometry默认release check/tests、bin no-run与6exact全PASS、actual-list各1
 
 接受范围是同帧已分类幸存点的有条件复用，增加常数ptr/7bits比较；mismatch也增加比较，小帧整体收益未知。本轮不另做AB，不宣称耗时/CPU/RSS/吞吐/实机改善。输入为受控NativeCloudSample、进程内RecordingBackend，非原生前端或真实LCM/外层地图；core驱逐不证明FIFO自然超车，原数据面边界不扩。
 
+## 第五十四阶段：公共导航高度入口的跨层事实
+
+仅仓外固定资格，生产源码未改。真实仓内 THREE r170 Raycaster、生产 pick 方法及完整 navigation.js，共9个固定 case覆盖saved/incremental/full地面与非地面命中、显式正/零/负高度。任意非地面Float32样本1.2000000476837158仍被旧入口当作surface，叠加.4后提交1.6000000476837157；并非真实地面分类。完整payload接Python3.8.10真实HTTP capability路由及原任务闭包，9份加旧精确1.6与真正省略z控制，共11测试通过。两层20检查复用9份输入，不是20个独立端到端场景。
+
+显式值至NavigationService.set_goal保持，resolver函数进入但无pending直接返回、assigned高度getter零调用；真省略z仅准备后getter一次。DOM/HTTP末端与native服务仍有明确替身；没有provider/RPC、原生构建或实机因果证明。旧合同事实不作为拒绝用户地面目标要求的依据。目标、路线、到达统一地面语义的迁移仍在独立审查，尚未启用。
+
+## 第五十五阶段：同一地图安装重放的receipt-only探测
+
+接受最窄单生产hunk：同owner、sealed request已匹配的重放，只用原current_components取得一致session并比较receipt；不再为只读receipt完整构造一次无消费者workspace。外层最终build、真实summary/repair、原currentness、publication以及handler refresh一行不动，无新缓存、锁、检查或重试。
+
+原固定事实6/6通过：真实1000条记忆，service两次summary/16页、handler三次/24页。候选固定13/13首次通过：service一次/8页、handler两次/16页，每遍1000行。完整最终workspace/summary与冻结旧核对照仅排除两个原自动timestamp并保留原值。缺向量仍真实CAS repair一次，pending_ready=1、source正文与business revision保持；该oracle比较修复后最终业务状态，不冒充两次同前置修复实验。
+
+final-summary clear改按真实publish=True边界注入且确认实际触发，原currentness拒绝陈旧结果；不是清除全部历史StateStore。真实损坏projection的JSONDecodeError、SQLite repair内部IntegrityError按原错误传播，后者state回滚、pending保持0；原publication/cold/fresh installation/pending/repeat控制保持。六个真实memory关闭与fixture清理完成，不启动模型/后台worker或设备。
+
+永久回归增强原same-owner测试summary=1，新增真实handler/原refresh测试summary=2及ensure→refresh→perception顺序。两项各1并2/2通过；合计15次执行/14 distinct selector，原13未重跑。生产一文件、测试一文件。原13批Pydantic tuple→list警告保留，无失败/修正重跑；无原生构建或新target。
+
+有意变化：无消费者probe中的repair后移到仍保留的最终summary，删除一次观察及其异常机会；owner先失效时不再承诺修复旧库。并发观察结果不保证逐字相同，不以缓存伪造一致。只接受稳定同owner重放减少一遍全量摘要读取，不宣称冷激活、定位READY或端到端时延提升；没有耗时AB或实机测量。
+
 ## 后续持续检查
 
 1. 墙前晚到路径的实际恢复与初始 full/partial/PCT 顺序，保留及时移动和真实避障

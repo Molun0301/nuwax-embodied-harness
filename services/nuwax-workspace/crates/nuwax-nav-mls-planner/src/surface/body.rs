@@ -1,6 +1,6 @@
 //! 三维机体凸柱包络、支撑接触与方向性地形约束。
 use super::*;
-use super::body_query::{NativeGroundSource, QuerySample, QuerySegment};
+use super::body_query::{GroundSampleMode, NativeGroundSource, QuerySample, QuerySegment};
 use std::collections::VecDeque;
 use super::body_witness::{CachedBodyResult, reject, height_rejection};
 #[cfg(feature = "body-query-profile")]
@@ -1078,7 +1078,7 @@ impl SurfaceSnapshot {
         patch
     }
 
-    fn validate_complete_source_resolution(&self)->Result<(),SurfaceError> {
+    pub(in crate::surface) fn validate_complete_source_resolution(&self)->Result<(),SurfaceError> {
         if self.observations.as_ref().is_some_and(|observations|observations.is_complete_geometry_source()
             && observations.size_m.to_bits()!=self.source_voxel_size_m().to_bits()) {
             return Err(SurfaceError::InvalidConfig("完整精细源与当前几何的来源分辨率不一致".into()));
@@ -1688,12 +1688,13 @@ impl SurfaceSnapshot {
         // its existing geometric slope estimate when no measured record exists.
         let measured=self.ground_evidence==GroundEvidence::MeasuredSurface
             && self.observations.as_ref().is_some_and(|o|o.has_measured_ground_layers());
-        let direction=if measured {
+        let explicit=sample.ground().filter(|s|s.mode!=GroundSampleMode::Compatibility);
+        let direction=if let Some(sample)=explicit {sample.reference_normal} else if measured {
             sample.ground().and_then(|s|s.reference_normal).or_else(||
                 self.direct_ground_query(support_xy,actual_support[2]).normal)
         } else {None};
         let slope=direction.map(|n|(-n[0]/n[2],-n[1]/n[2])).or_else(|| {
-            (!measured && !matches!(sample,QuerySample::Unanchored))
+            (explicit.is_none() && !measured && !matches!(sample,QuerySample::Unanchored))
                 .then(||fit_plane(&ground_points,centre.map_or(body,|c|c.support_xyz)))
                 .flatten().map(|(a,b,_)|(a,b))
         });
@@ -3087,12 +3088,22 @@ impl SurfaceSnapshot {
 
     fn direct_ground_query_recorded(&self,xy:[f64;2],reference:f64,
         native:Option<&mut Option<NativeGroundSource>>)->GroundQuery {
+        self.direct_ground_query_selected(xy,reference,None,native)
+    }
+
+    // Same source query, with an already selected native key in this column.
+    // Cross-column navigation supplies only its independent height hint.
+    fn direct_ground_query_selected(&self,xy:[f64;2],reference:f64,selected:Option<GroundKey>,
+        native:Option<&mut Option<NativeGroundSource>>)->GroundQuery {
         if let Some(observations)=&self.observations {
             let fine=f64::from(observations.size_m);let column=xy.map(|v|(v/fine).floor() as i32);
             if self.ground_evidence==GroundEvidence::MeasuredSurface {
-                if let Some(layer)=observations.ground_records(column).min_by(|a,b|
+                let layer=if let Some(key)=selected {
+                    observations.ground_records(column).find(|record|record.key()==key)
+                } else {observations.ground_records(column).min_by(|a,b|
                     (a.height_at(xy).unwrap_or(f64::INFINITY)-reference).abs()
-                        .total_cmp(&(b.height_at(xy).unwrap_or(f64::INFINITY)-reference).abs())) {
+                        .total_cmp(&(b.height_at(xy).unwrap_or(f64::INFINITY)-reference).abs()))};
+                if let Some(layer)=layer {
                     if let Some(native)=native {*native=Some(match layer.key() {
                         GroundKey::LegacyPlane(anchor)=>NativeGroundSource::ObservedFine{anchor},
                         key@GroundKey::HeightfieldV1(_)=>NativeGroundSource::HeightfieldFine{key},
@@ -3100,6 +3111,7 @@ impl SurfaceSnapshot {
                     return GroundQuery {state:GroundQueryState::Observed,height:layer.height_at(xy),normal:layer.direction(),
                         sources:vec![layer.key().anchor()],radius_m:0.0,max_residual_m:layer.scatter()};
                 }
+                if selected.is_some() {return GroundQuery::unknown();}
             }
             if observations.classified_empty_ground(column) {return GroundQuery::unknown();}
             let bands=self.fine_contact_bands(column[0],column[1]);
@@ -7072,7 +7084,7 @@ fn ground_context_rotation_and_contact_events_keep_actual_witness() {
         eprintln!("C06_SOURCE xy={xy:?} query={query:?} native={native:?}");
         assert_ne!(query.state,GroundQueryState::Unknown,"independently known fixed source premise");
         assert!(!native.is_empty());
-        Arc::new(LocalGroundReference { first:GroundSample {
+        Arc::new(LocalGroundReference { first:GroundSample {mode:crate::surface::body_query::GroundSampleMode::Compatibility,
             reference_origin:[xy[0],xy[1],query.height.unwrap()],
             reference_normal:query.normal, query_state:query.state, reference_sources:native,
         }, changes:vec![] })
@@ -7217,7 +7229,7 @@ fn ground_context_anchored_bias_carried_and_unanchored_ramp_pair() {
         eprintln!("C10_SOURCE xy={xy:?} analytic_height={:?} query={query:?} native={native:?} carried={carried}",plane(xy));
         assert_eq!(query.state,GroundQueryState::LegacyGeometry,"existing quantized legacy fixture is not a measured layer");
         assert!(!native.is_empty());
-        GroundSample {reference_origin:[xy[0],xy[1],plane(xy)],
+        GroundSample {mode:crate::surface::body_query::GroundSampleMode::Compatibility,reference_origin:[xy[0],xy[1],plane(xy)],
             reference_normal:Some(normalize([-0.12,-0.06,1.0])),
             query_state:if carried {GroundQueryState::Unknown} else {query.state},
             reference_sources:native}
@@ -7468,21 +7480,23 @@ struct GroundHeightKey {origin:[u64;3],normal:Option<[u64;3]>}
 impl GroundHeightKey {
     fn new(sample:&super::body_query::GroundSample)->Self {
         let mut origin=sample.reference_origin.map(f64::to_bits);
-        if sample.reference_normal.is_none() {origin[0]=0;origin[1]=0;}
-        Self {origin,normal:sample.reference_normal.map(|n|n.map(f64::to_bits))}
+        if sample.height_normal().is_none() {origin[0]=0;origin[1]=0;}
+        Self {origin,normal:sample.height_normal().map(|n|n.map(f64::to_bits))}
     }
 }
 #[derive(Clone,PartialEq,Eq,Hash)]
 enum BoundPoseGroundKey {
     Unanchored,
-    Ground {height:GroundHeightKey,state:u8,source:Option<NativeGroundSource>},
+    Ground {height:GroundHeightKey,mode:GroundSampleMode,direction:Option<[u64;3]>,
+        state:u8,source:Option<NativeGroundSource>},
 }
 impl BoundPoseGroundKey {
     fn new(sample:QuerySample<'_>)->Option<Self> {
         match sample {
             QuerySample::Unanchored=>Some(Self::Unanchored),
             QuerySample::Ground(sample) if sample.reference_sources.len()<=1=>Some(Self::Ground {
-                height:GroundHeightKey::new(sample),state:sample.query_state as u8,
+                height:GroundHeightKey::new(sample),mode:sample.mode,
+                direction:sample.reference_normal.map(|n|n.map(f64::to_bits)),state:sample.query_state as u8,
                 source:sample.reference_sources.first().cloned()}),
             // Old private multi-source bindings remain correct without copying
             // their source collection into every cache key.

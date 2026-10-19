@@ -98,6 +98,11 @@ fn scene_with_raw_counts(counts:impl Fn(i32,i32)->BTreeMap<i32,[u32;8]>,extra:&[
 
 fn scene_with_raw_counts_and_empty(counts:impl Fn(i32,i32)->BTreeMap<i32,[u32;8]>,
     extra:&[[i32;3]],empty:Option<([i32;2],i32)>)->SurfaceSnapshot {
+    scene_with_native_columns(|x,y|vec![HeightfieldColumn::from_counts([x,y],Q,counts(x,y)).unwrap().unwrap()],extra,empty)
+}
+
+fn scene_with_native_columns(columns:impl Fn(i32,i32)->Vec<HeightfieldColumn>,
+    extra:&[[i32;3]],empty:Option<([i32;2],i32)>)->SurfaceSnapshot {
     let mut writer=Writer::new(Repository::temporary().unwrap(),Q,4*1024*1024).unwrap();
     let mut points=vec![];
     for x in -12..12 {for y in -8..8 {
@@ -108,13 +113,13 @@ fn scene_with_raw_counts_and_empty(counts:impl Fn(i32,i32)->BTreeMap<i32,[u32;8]
                 classified_empty:true,legacy:vec![],heightfields:vec![]}).unwrap();
             continue;
         }
-        let counts=counts(x,y);
-        for &z in counts.keys() {
+        let columns=columns(x,y);
+        for (z,_) in columns.iter().flat_map(HeightfieldColumn::members) {
             writer.observe([[x,y,z]],20).unwrap();
             points.push(((x as f32+0.5)*Q,(y as f32+0.5)*Q,(z as f32+0.5)*Q));
         }
-        let record=ColumnGroundRecords {classified_empty: false, legacy:vec![],heightfields:vec![HeightfieldSurface {
-            column:HeightfieldColumn::from_counts([x,y],Q,counts).unwrap().unwrap(),samples:vec![]}]};
+        let record=ColumnGroundRecords {classified_empty: false, legacy:vec![],heightfields:columns.into_iter().map(|column|
+            HeightfieldSurface {column,samples:vec![]}).collect()};
         writer.replace_ground_column([x,y],&record).unwrap();
     }}
     writer.observe(extra.iter().copied(),20).unwrap();
@@ -417,7 +422,7 @@ fn native_large_step_is_rejected_by_capability_without_direction() {
 fn native_small_state_hash_ignores_unused_xy_but_keeps_carried_height_and_source() {
     use std::hash::{Hash,Hasher};
     let hash=|value:&BodyGroundState| {let mut h=std::collections::hash_map::DefaultHasher::new();value.hash(&mut h);h.finish()};
-    let state=BodyGroundState {sample:GroundSample {reference_origin:[0.025,0.025,0.05],reference_normal:None,
+    let state=BodyGroundState {sample:GroundSample {mode:crate::surface::body_query::GroundSampleMode::Compatibility,reference_origin:[0.025,0.025,0.05],reference_normal:None,
         query_state:GroundQueryState::Unknown,reference_sources:vec![NativeGroundSource::HeightfieldFine {
             key:GroundKey::HeightfieldV1([0,0,0])}]}};
     let mut moved=state.clone();moved.sample.reference_origin[0]=8.0;
@@ -611,4 +616,170 @@ fn p0_unanchored_admitted_heightfield_matches_original_core_cold_and_warm() {
     }
     let view=new.body_query();
     view.validate_unanchored_motion(pose,([0.075,0.025,0.425],pose.1),&[],&mut None).unwrap();
+}
+
+// C1-c1 uses admitted records. Explicit navigation callbacks below are physical
+// edge contract inputs, not a claim that the PCT producer emitted these traces.
+fn c1c1_native<'a>(map:&'a SurfaceSnapshot,xy:[i32;2])->NavigationGroundSample<'a> {
+    let record=map.observations().unwrap().ground_records(xy).next().unwrap();
+    NavigationGroundSample::KnownNative {record,reference_xy:xy.map(|v|(f64::from(v)+0.5)*f64::from(Q))}
+}
+
+#[test]
+fn c1c1_navigation_selects_actual_support_column_and_preserves_bias() {
+    let map=scene(3,false);let owner=map.body_query();
+    let angle=0.5_f64;let q=[0.0,(angle*0.5).sin(),0.0,(angle*0.5).cos()];
+    let selected=c1c1_native(&map,[1,0]);let decode=|_|selected;
+    let navigation=BodyNavigationSegment::from_recorded(&map,[0.075,0.025],[0.275,0.025],&[],&decode);
+    // A real prior state on the upper side must not be subtracted from the new
+    // lower initial support. Resolve t=0 without moving the supplied actual.
+    let previous=owner.start_ground_state(([0.275,0.025,0.65],q)).unwrap();
+    let saved=previous.clone();
+    for bias in [0.0,0.04] {
+        let from=([0.075,0.025,0.5+bias],q);
+        let support=map.support_position_from_body(from.0,q,0.4).unwrap();
+        assert!(support[0]<0.0 && from.0[0]>0.0);
+        let next=owner.project_motion_with_navigation(from,&previous,[0.275,0.025],0.0,&navigation,&mut None).unwrap();
+        assert_eq!(next.pose().1,q);
+        assert!((next.pose().0[2]-from.0[2]-3.0*f64::from(Q)).abs()<1e-10);
+        let support=map.support_position_from_body(next.pose().0,next.pose().1,0.4).unwrap();
+        let xy=[support[0],support[1]];let column=xy.map(|v|(v/f64::from(Q)).floor() as i32);
+        let actual=map.observations().unwrap().ground_records(column).next().unwrap();
+        assert_eq!(next.ground().height(),actual.height_at(xy).unwrap());
+        assert_eq!(next.ground().ground_key(),Some(actual.key()));
+        assert!(actual.members().all(|z|actual.contains_member([column[0],column[1],z])));
+        owner.validate_projected_motion(from,&next,&[],&mut None).unwrap();
+        eprintln!("C1C1_SUPPORT bias={bias:?} actual={from:?} support={support:?} key={:?} next={:?}",actual.key(),next.pose());
+    }
+    let from=([0.075,0.025,0.5],q);
+    let stationary=BodyNavigationSegment::from_recorded(&map,[0.075,0.025],[0.075,0.025],&[],&decode);
+    let turn=owner.project_motion_with_navigation(from,&previous,[0.075,0.025],0.2,&stationary,&mut None).unwrap();
+    assert_eq!(turn.pose().0,from.0);owner.validate_projected_motion(from,&turn,&[],&mut None).unwrap();
+    assert_eq!(previous,saved);
+}
+
+#[test]
+fn c1c1_scalar_direction_and_existing_cache_dependencies_are_distinct() {
+    use crate::surface::body_query::GroundSampleMode;
+    let map=scene(0,false);let owner=map.body_query();let pose=([0.025,0.025,0.425],[0.,0.,0.,1.]);
+    let mut scalar=owner.start_ground_state(pose).unwrap().sample;
+    scalar.mode=GroundSampleMode::NavigationScalar;
+    let h=scalar.reference_origin[2];let without=scalar.clone();
+    // Internal optional-direction contract. Current admitted HF direction is
+    // None; this does not fabricate a new direction-producing capture fixture.
+    scalar.reference_normal=Some([-0.25/1.0625_f64.sqrt(),0.,1./1.0625_f64.sqrt()]);
+    assert_eq!(scalar.height_at([0.045,0.025]),h);
+    assert!(GroundHeightKey::new(&scalar)==GroundHeightKey::new(&without));
+    assert!(BoundPoseGroundKey::new(QuerySample::Ground(&scalar))!=BoundPoseGroundKey::new(QuerySample::Ground(&without)));
+    assert_ne!(BodyGroundState{sample:scalar.clone()},BodyGroundState{sample:without.clone()});
+    let mut plane=scalar.clone();plane.mode=GroundSampleMode::NavigationPlane;
+    assert!((plane.height_at([0.045,0.025])-h-0.005).abs()<1e-12);
+    assert!(GroundHeightKey::new(&plane)!=GroundHeightKey::new(&scalar));
+    let mut old=plane.clone();old.mode=GroundSampleMode::Compatibility;old.query_state=GroundQueryState::Unknown;
+    assert_eq!(old.height_at([0.045,0.025]),plane.height_at([0.045,0.025]));
+    let mut same_h_other_key=without.clone();
+    same_h_other_key.reference_sources=vec![NativeGroundSource::HeightfieldFine {
+        key:map.observations().unwrap().ground_records([1,0]).next().unwrap().key()}];
+    assert!(BoundPoseGroundKey::new(QuerySample::Ground(&without))!=BoundPoseGroundKey::new(QuerySample::Ground(&same_h_other_key)));
+    for sample in [&without,&scalar,&without,&scalar] {
+        map.validate_body_pose_in_context(pose.0,pose.1,QuerySample::Ground(sample),&mut None).unwrap();
+    }
+    let cache=map.body_query_cache.lock().unwrap();
+    assert!(cache.bound_poses.contains_key(&([pose.0[0],pose.0[1],pose.0[2],pose.1[0],pose.1[1],pose.1[2],pose.1[3]].map(f64::to_bits),BoundPoseGroundKey::new(QuerySample::Ground(&without)).unwrap())));
+    assert!(cache.bound_poses.contains_key(&([pose.0[0],pose.0[1],pose.0[2],pose.1[0],pose.1[1],pose.1[2],pose.1[3]].map(f64::to_bits),BoundPoseGroundKey::new(QuerySample::Ground(&scalar)).unwrap())));
+}
+
+#[test]
+fn c1c1_navigation_gap_carry_and_unanchored_physical_response_stay_separate() {
+    let map=scene(3,false);let owner=map.body_query();let from=([-0.125,0.025,0.5],[0.,0.,0.,1.]);
+    let initial=owner.start_ground_state(from).unwrap();let original=initial.clone();
+    let low=c1c1_native(&map,[-3,0]);let upper=c1c1_native(&map,[5,0]);
+    let high=map.observations().unwrap().ground_records([5,0]).next().unwrap().height_at([0.275,0.025]).unwrap();
+    let decode=|t|if t<0.5 {low}else{NavigationGroundSample::Carried{height:high}};
+    let navigation=BodyNavigationSegment::from_recorded(&map,[-0.125,0.025],[1.0,0.025],&[0.5],&decode);
+    let next=owner.project_motion_with_navigation(from,&initial,[1.0,0.025],0.0,&navigation,&mut None).unwrap();
+    assert_eq!(next.ground().query_state(),GroundQueryState::Unknown);assert_eq!(next.ground().height(),high);
+    assert!((next.pose().0[2]-from.0[2]-3.0*f64::from(Q)).abs()<1e-10);
+    owner.validate_projected_motion(from,&next,&[],&mut None).unwrap();
+    let returning=|t|if t<1.0 {NavigationGroundSample::Carried{height:high}}else{upper};
+    let edge=BodyNavigationSegment::from_recorded(&map,[1.0,0.025],[0.275,0.025],&[1.0],&returning);
+    let back=owner.project_motion_with_navigation(next.pose(),next.ground(),[0.275,0.025],0.0,&edge,&mut None).unwrap();
+    assert_eq!(back.pose().0[2],next.pose().0[2]);assert_eq!(back.ground().query_state(),GroundQueryState::Observed);
+    owner.validate_projected_motion(next.pose(),&back,&[],&mut None).unwrap();
+    let unanchored=|_|NavigationGroundSample::Unanchored;
+    let edge=BodyNavigationSegment::from_recorded(&map,[-0.125,0.025],[1.0,0.025],&[],&unanchored);
+    let physical=owner.project_motion_with_navigation(from,&initial,[1.0,0.025],0.0,&edge,&mut None).unwrap();
+    assert_eq!(physical.pose(),next.pose());assert_eq!(physical.ground().height(),high);
+    assert!(matches!(unanchored(1.0),NavigationGroundSample::Unanchored));assert_eq!(initial,original);
+}
+
+#[test]
+fn c1c1_same_pose_navigation_changes_survive_physical_trace() {
+    let map=scene_with_native_columns(|x,y|[0,1].map(|z|
+        HeightfieldColumn::from_counts([x,y],Q,BTreeMap::from([(z,[1000,0,0,0,0,0,0,0])])).unwrap().unwrap()).to_vec(),&[],None);
+    let records:Vec<_>=map.observations().unwrap().ground_records([0,0]).collect();
+    assert_eq!(records.len(),2);assert_ne!(records[0].key(),records[1].key());
+    let low=NavigationGroundSample::KnownNative{record:records[0],reference_xy:[0.025,0.025]};
+    let high=NavigationGroundSample::KnownNative{record:records[1],reference_xy:[0.025,0.025]};
+    let decode=|t|if (0.25..0.75).contains(&t) {low}else{high};
+    let edge=BodyNavigationSegment::from_recorded(&map,[0.025,0.025],[0.025,0.025],&[0.25,0.75],&decode);
+    let actual=([0.025,0.025,0.425],[0.,0.,0.,1.]);let owner=map.body_query();
+    let state=owner.start_ground_state(actual).unwrap();let original=state.clone();
+    let initial=map.navigation_initial_support(actual,&state,&edge).unwrap();
+    let reference=map.navigation_ground_motion_reference(actual,actual,&initial,&edge).unwrap();
+    assert_eq!(reference.at(0.0).reference_sources,reference.at(1.0).reference_sources);
+    assert_ne!(reference.at(0.0).reference_sources,reference.at(0.5).reference_sources);
+    let binding=crate::surface::body_query::BodyQueryReference::Ground(Arc::new(reference));
+    let context=QuerySegment::for_reference(&binding);assert!(!context.constant_for_test());
+    let mut boundaries=Vec::new();context.append_changes(&mut boundaries);assert_eq!(boundaries,vec![0.25,0.75]);
+    let mut witness=None;
+    assert_eq!(owner.validate_motion_with_navigation(actual,actual,&state,&edge,&[],&mut witness),
+        Err(SurfaceError::UntraversableSegment));
+    assert_eq!(witness,None);assert_eq!(state,original);
+    // Equal physical samples still carry a navigation boundary into the same
+    // event input; this synthetic segment tests the adapter contract only.
+    let constant=|_|low;let edge=BodyNavigationSegment::from_recorded(&map,[0.025,0.025],[0.025,0.025],&[0.5],&constant);
+    let initial=map.navigation_initial_support(actual,&state,&edge).unwrap();
+    let reference=map.navigation_ground_motion_reference(actual,actual,&initial,&edge).unwrap();
+    assert!(reference.changes.iter().any(|(t,_)|*t==0.5));
+}
+
+#[test]
+fn c1c1_projected_reference_is_reused_by_complete_contact_sweep() {
+    let raw=scene_with_raw_counts(|_,_|BTreeMap::from([(0,[1000,0,0,0,0,0,0,0])]),&[[0,0,8]]);
+    let member=scene(0,true);let recent=scene(0,false).with_recent_obstacle_points(1,1,0,&[],[(0,[0.025,0.025,0.425])]).unwrap();
+    for (name,map,expected_source) in [("raw",raw,OccupancySource::Fine),("member",member,OccupancySource::Fine),
+        ("recent",recent,OccupancySource::Recent)] {
+        let map=map.with_body_envelope(fixed_go2_model()).unwrap();let owner=map.body_query();
+        let from=([-0.45,0.025,0.425],[0.,0.,0.,1.]);let to=[0.45,0.025];let state=owner.start_ground_state(from).unwrap();
+        let h=state.height();let decode=|_|NavigationGroundSample::Carried{height:h};
+        let edge=BodyNavigationSegment::from_recorded(&map,[from.0[0],from.0[1]],to,&[],&decode);
+        let projection=owner.project_motion_with_navigation(from,&state,to,0.0,&edge,&mut None).unwrap();
+        owner.validate_motion_from_ground(from,from,&state,&[],&mut None).unwrap();
+        let reference=Arc::clone(&projection.reference);let mut witness=None;
+        assert_eq!(owner.validate_projected_motion(from,&projection,&[],&mut witness),Err(SurfaceError::InsufficientClearance),"{name}");
+        assert!(Arc::ptr_eq(&reference,&projection.reference));
+        let rejected=witness.unwrap();
+        assert!(matches!(rejected.rejection,BodyRejection::Occupancy{source,..} if source==expected_source),"{name}: {rejected:?}");
+        assert!(rejected.pose.0[0]>from.0[0] && rejected.pose.0[0]<to[0],"{name}: {rejected:?}");
+        eprintln!("C1C1_SWEEP {name} {rejected:?}");
+    }
+}
+
+#[test]
+fn c1c1_recent_refresh_keeps_navigation_but_retires_physical_permission() {
+    let map=scene(0,false);let owner=map.body_query();let from=([0.025,0.025,0.425],[0.,0.,0.,1.]);
+    let state=owner.start_ground_state(from).unwrap();let saved=state.clone();let sample=c1c1_native(&map,[0,0]);let decode=|_|sample;
+    let edge=BodyNavigationSegment::from_recorded(&map,[0.025,0.025],[0.075,0.025],&[],&decode);
+    let to=([0.075,0.025,0.435],from.1);
+    let next=owner.validate_motion_with_navigation(from,to,&state,&edge,&[],&mut None).unwrap();
+    assert_eq!(next.height(),state.height());assert_eq!(to.0[2],0.435);
+    let blocked=map.with_recent_obstacle_points(2,2,0,&[],[(0,[0.075,0.025,0.435])]).unwrap();let current=blocked.body_query();
+    assert!(current.same_ground_source(&map));let mut witness=None;
+    assert_eq!(current.validate_motion_with_navigation(from,to,&state,&edge,&[],&mut witness),Err(SurfaceError::InsufficientClearance));
+    assert!(matches!(witness.unwrap().rejection,BodyRejection::Occupancy{source:OccupancySource::Recent,..}));
+    let replaced=map.fork_for_planning();let mut witness=None;
+    assert!(!replaced.body_query().same_ground_source(&map));
+    assert_eq!(replaced.body_query().validate_motion_with_navigation(from,to,&state,&edge,&[],&mut witness),Err(SurfaceError::InvalidPose));
+    assert_eq!(witness,None);assert_eq!(state,saved);
 }

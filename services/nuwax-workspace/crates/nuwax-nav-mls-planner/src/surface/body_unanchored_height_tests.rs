@@ -7,7 +7,7 @@ fn p0_pair(make:impl Fn()->(SurfaceSnapshot,Pose),mode:u8)->(Result<(),SurfaceEr
     if let (Some(a),Some(b))=(&old.observations,&new.observations) {
         assert!(!Arc::ptr_eq(&a.legacy_reference_cache,&b.legacy_reference_cache));
     }
-    let sample=GroundSample {reference_origin:[pose.0[0],pose.0[1],
+    let sample=GroundSample {mode:crate::surface::body_query::GroundSampleMode::Compatibility,reference_origin:[pose.0[0],pose.0[1],
         pose.0[2]-old.body_envelope().unwrap().body_to_support_z_m],
         reference_normal:None,query_state:GroundQueryState::Unknown,reference_sources:vec![]};
     let sample=match mode {0=>QuerySample::Unanchored,1=>QuerySample::LegacyNominal,

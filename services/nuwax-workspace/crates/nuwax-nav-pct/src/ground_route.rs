@@ -3,7 +3,8 @@
 use crate::{PctPlanner, PlanningFailure, RoutePenalty, SearchLimits, SearchStats, Tomogram};
 use crate::reference::Reference;
 use crate::search::{RouteReferenceTrace, checkpoint};
-use nuwax_nav_mls_planner::{SurfaceSnapshot, surface::{SourceGroundRecord, SurfaceBodyQueryView}};
+use nuwax_nav_mls_planner::{SurfaceSnapshot, surface::{BodyNavigationSegment,
+    NavigationGroundSample, SourceGroundRecord, SurfaceBodyQueryView}};
 use nuwax_types::navigation::{GroundHeightIntent, GroundLayerResult};
 use std::sync::{Arc, atomic::AtomicBool};
 
@@ -338,7 +339,82 @@ impl<'a> GroundWalkState<'a> {
 }
 #[derive(Debug)]
 pub struct GroundWalkSegment<'a> {from:GroundWalkState<'a>,to:GroundWalkState<'a>,trace:crate::reference::SegmentTrace}
-impl<'a> GroundWalkSegment<'a> {pub fn end(&self)->GroundWalkState<'a> {self.to}}
+impl<'a> GroundWalkSegment<'a> {
+    pub fn end(&self)->GroundWalkState<'a> {self.to}
+
+    fn reference_at(&self,index:usize)->Reference {
+        let at=self.trace.changes.partition_point(|change|change.sample_index<=index);
+        self.trace.changes[at-1].reference
+    }
+    fn sample_xy(&self,index:usize)->[f64;2] {
+        let t=index as f64/self.trace.steps as f64;
+        std::array::from_fn(|axis|self.from.xy[axis]+t*(self.to.xy[axis]-self.from.xy[axis]))
+    }
+    pub(crate) fn navigation_at(&self,t:f64)->NavigationGroundSample<'a> {
+        // Compare the evaluator's original division, not floor(t*steps): a
+        // rounded multiplication can place an exact boundary one sample early.
+        let (mut low,mut high)=(0,self.trace.steps);
+        while low<high {
+            let mid=low+(high-low)/2+1;
+            if mid as f64/self.trace.steps as f64<=t {low=mid;}else{high=mid-1;}
+        }
+        let reference=self.reference_at(low);let xy=self.sample_xy(low);
+        match reference {
+            Reference::Known(id)=>match self.from.map.source_ground_record(id) {
+                Some(record)=>NavigationGroundSample::KnownNative {record,reference_xy:xy},
+                None=>NavigationGroundSample::KnownLegacy {reference_xy:xy,
+                    height:self.from.map.reference_height_at(reference,xy).expect("recorded known sample")},
+            },
+            Reference::Unknown{height,..}=>NavigationGroundSample::Carried {height:f64::from_bits(height)},
+            Reference::Unanchored{..}=>NavigationGroundSample::Unanchored,
+        }
+    }
+    pub(crate) fn navigation_changes(&self)->Vec<f64> {
+        let mut changes:Vec<_>=self.trace.changes.iter().skip(1)
+            .map(|change|change.sample_index as f64/self.trace.steps as f64).collect();
+        // Reference changes alone omit a genuine LegacyPlane's discrete height
+        // changes inside one id. Add just those changes, without re-evaluation.
+        for (at,change) in self.trace.changes.iter().enumerate() {
+            let Reference::Known(id)=change.reference else {continue;};
+            let Some(SourceGroundRecord::LegacyPlane(record))=self.from.map.source_ground_record(id) else {continue;};
+            let end=self.trace.changes.get(at+1).map_or(self.trace.steps+1,|next|next.sample_index);
+            let mut previous=SourceGroundRecord::LegacyPlane(record).height_at(self.sample_xy(change.sample_index));
+            for index in change.sample_index+1..end {
+                let next=SourceGroundRecord::LegacyPlane(record).height_at(self.sample_xy(index));
+                if next!=previous {changes.push(index as f64/self.trace.steps as f64);}
+                previous=next;
+            }
+        }
+        changes.sort_by(f64::total_cmp);changes.dedup();
+        changes
+    }
+    #[cfg(test)]
+    pub(crate) fn navigation_steps(&self)->usize {self.trace.steps}
+    /// Borrow this already recorded walk for one H3 edge. The callback and
+    /// fractions stay on this call's stack; the physical projection owns only
+    /// the support interpretation it actually produced. No second walk runs.
+    pub fn with_body_navigation<R>(&self,
+        run:impl FnOnce(&SurfaceBodyQueryView,&BodyNavigationSegment<'_,'_>)->R)
+        ->Result<R,PlanningFailure> {
+        let source=self.from.map.source.as_ref().ok_or("recorded navigation has no physical source")?;
+        if matches!(self.from.reference,Reference::Known(_))
+            && self.from.map.reference_height_at(self.from.reference,self.from.xy).is_none() {
+            return Err("recorded navigation start has no source-local sample height".into());
+        }
+        let changes=self.navigation_changes();
+        let sample=|t|self.navigation_at(t);
+        let navigation=BodyNavigationSegment::from_recorded(source,self.from.xy,self.to.xy,&changes,&sample);
+        Ok(run(&source.body_query(),&navigation))
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn source_less_navigation_adapter_rejected()->bool {
+    let map=Tomogram::from_columns(0.1,[],0.4,0.0,0.1,0.1,20.0).unwrap();
+    let from=GroundWalkState {map:&map,reference:Reference::Unanchored{column:[0,0]},xy:[0.025,0.025]};
+    let edge=from.walk_xy([0.125,0.025],&[],None).unwrap();
+    edge.with_body_navigation(|_,_|()).is_err()
+}
 #[derive(Debug)]
 struct GroundWalkConnection {from:[f64;2],to:[f64;2],steps:usize,changes:std::ops::Range<usize>}
 #[derive(Debug)]

@@ -7,7 +7,66 @@ use super::*;
 pub struct SurfaceBodyQueryView {
     snapshot: SurfaceSnapshot,
 }
+
+/// One independent navigation sample from an already recorded source walk.
+/// This supplies an association, never a body-height seed or motion permission.
+#[derive(Clone, Copy, Debug)]
+pub enum NavigationGroundSample<'source> {
+    KnownNative { record: SourceGroundRecord<'source>, reference_xy: [f64;2] },
+    KnownLegacy { reference_xy: [f64;2], height: f64 },
+    Carried { height: f64 },
+    Unanchored,
+}
+
+/// Short-lived borrowed adapter over a recorded navigation edge. The caller
+/// supplies ordered right-continuous semantic changes and a read-only decoder;
+/// neither callback nor source members are retained by a physical projection.
+pub struct BodyNavigationSegment<'source,'trace> {
+    source: &'source SurfaceSnapshot,
+    from: [f64;2],
+    to: [f64;2],
+    changes: &'trace [f64],
+    sample: &'trace dyn Fn(f64)->NavigationGroundSample<'source>,
+}
+impl<'source,'trace> BodyNavigationSegment<'source,'trace> {
+    pub fn from_recorded(source:&'source SurfaceSnapshot,from:[f64;2],to:[f64;2],
+        changes:&'trace [f64],sample:&'trace dyn Fn(f64)->NavigationGroundSample<'source>)->Self {
+        Self {source,from,to,changes,sample}
+    }
+    pub(in crate::surface) fn at(&self,t:f64)->NavigationGroundSample<'source> {(self.sample)(t)}
+    pub(in crate::surface) fn changes(&self)->&[f64] {self.changes}
+    fn matches(&self,view:&SurfaceBodyQueryView,from:[f64;2],to:[f64;2])->bool {
+        self.from==from && self.to==to && view.same_ground_source(self.source)
+    }
+}
 impl SurfaceBodyQueryView {
+    /// Project one recorded navigation edge through the original H3 physical
+    /// response. Initial actual bias remains actual; navigation never reads it.
+    pub fn project_motion_with_navigation(&self,from:([f64;3],[f64;4]),ground:&BodyGroundState,
+        xy:[f64;2],yaw:f64,navigation:&BodyNavigationSegment<'_,'_>,
+        witness:&mut Option<BodyFailureWitness>)->Result<BodyMotionProjection,SurfaceError> {
+        *witness=None;
+        if !navigation.matches(self,[from.0[0],from.0[1]],xy) {return Err(SurfaceError::InvalidPose);}
+        self.snapshot.project_navigation_ground_motion(from,ground,xy,yaw,navigation,witness)
+    }
+    /// Validate supplied actual geometry; return a physical state only after
+    /// the original complete sweep passes. No navigation cursor is consumed.
+    pub fn validate_motion_with_navigation(&self,from:([f64;3],[f64;4]),to:([f64;3],[f64;4]),
+        ground:&BodyGroundState,navigation:&BodyNavigationSegment<'_,'_>,boundary:&[[f64;2]],
+        witness:&mut Option<BodyFailureWitness>)->Result<BodyGroundState,SurfaceError> {
+        *witness=None;
+        if !navigation.matches(self,[from.0[0],from.0[1]],[to.0[0],to.0[1]]) {return Err(SurfaceError::InvalidPose);}
+        self.snapshot.validate_complete_source_resolution()?;
+        let ground=self.snapshot.navigation_initial_support(from,ground,navigation)?;
+        self.snapshot.validate_owned_actual_support(from,&ground.sample)?;
+        let reference=self.snapshot.navigation_ground_motion_reference(from,to,&ground,navigation)?;
+        let next=BodyGroundState {sample:reference.at(1.0).clone()};
+        self.snapshot.validate_owned_actual_support(to,&next.sample)?;
+        let reference=BodyQueryReference::Ground(Arc::new(reference));
+        self.snapshot.validate_body_motion_in_context(from,to,boundary,
+            QuerySegment {reference:Some(&reference),samples:[0.0,1.0]},witness)?;
+        Ok(next)
+    }
     /// Sweep the supplied actual poses without deriving a navigation reference
     /// from body Z or calibration. Existing occupancy/contact checks still run.
     pub fn validate_unanchored_motion(&self,from:([f64;3],[f64;4]),to:([f64;3],[f64;4]),
@@ -109,13 +168,14 @@ pub struct BodyGroundState {
     pub(in crate::surface) sample:GroundSample,
 }
 impl BodyGroundState {
-    fn identity(&self)->(u8,[u64;3],Option<[u64;3]>,&[NativeGroundSource]) {
+    fn identity(&self)->(GroundSampleMode,u8,[u64;3],Option<[u64;3]>,&[NativeGroundSource]) {
         let sample=&self.sample;
         let mut origin=sample.reference_origin.map(f64::to_bits);
-        if sample.reference_normal.is_none() || sample.query_state==GroundQueryState::Unknown {
+        if sample.height_normal().is_none() || (sample.mode==GroundSampleMode::Compatibility
+            && sample.query_state==GroundQueryState::Unknown) {
             origin[0]=0;origin[1]=0;
         }
-        (sample.query_state as u8,origin,sample.reference_normal.map(|n|n.map(f64::to_bits)),
+        (sample.mode,sample.query_state as u8,origin,sample.reference_normal.map(|n|n.map(f64::to_bits)),
             &sample.reference_sources)
     }
     /// Whether the current support column has direct, legacy or unknown height.
@@ -278,14 +338,24 @@ pub(in crate::surface) enum NativeGroundSource {
 }
 #[derive(Clone, Debug, PartialEq)]
 pub(in crate::surface) struct GroundSample {
+    pub mode: GroundSampleMode,
     pub reference_origin: [f64; 3],
     pub reference_normal: Option<[f64; 3]>,
     pub query_state: GroundQueryState,
     pub reference_sources: Vec<NativeGroundSource>,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(in crate::surface) enum GroundSampleMode {
+    Compatibility,
+    NavigationScalar,
+    NavigationPlane,
+}
 impl GroundSample {
+    pub(in crate::surface) fn height_normal(&self)->Option<[f64;3]> {
+        if self.mode==GroundSampleMode::NavigationScalar {None} else {self.reference_normal}
+    }
     pub(in crate::surface) fn height_at(&self, xy: [f64; 2]) -> f64 {
-        self.reference_normal.map_or(self.reference_origin[2], |n|
+        self.height_normal().map_or(self.reference_origin[2], |n|
             self.reference_origin[2] - (n[0]*(xy[0]-self.reference_origin[0])
                 + n[1]*(xy[1]-self.reference_origin[1]))/n[2])
     }
@@ -350,6 +420,8 @@ impl<'a> QuerySegment<'a> {
                 self.samples[0]+s*(self.samples[1]-self.samples[0]))),
         }
     }
+    #[cfg(test)]
+    pub(in crate::surface) fn constant_for_test(self)->bool {self.constant()}
     pub(in crate::surface) fn is_legacy(self) -> bool { self.reference.is_none() }
     pub(in crate::surface) fn append_changes(self, changes: &mut Vec<f64>) {
         let Some(BodyQueryReference::Ground(reference))=self.reference else {return;};

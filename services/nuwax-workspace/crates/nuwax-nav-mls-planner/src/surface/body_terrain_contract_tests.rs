@@ -569,7 +569,7 @@ fn c0_terrain_sample(
             }
         }
     }
-    GroundSample {
+    GroundSample {mode:crate::surface::body_query::GroundSampleMode::Compatibility,
         reference_origin: [xy[0], xy[1], query.height.expect("known source height")],
         reference_normal: query.normal,
         query_state: query.state,

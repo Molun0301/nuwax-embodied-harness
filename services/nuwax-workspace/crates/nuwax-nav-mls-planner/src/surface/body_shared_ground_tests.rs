@@ -637,7 +637,7 @@ fn c0_shared_measured_sample(map: &SurfaceSnapshot, xy: [f64; 2], height: f64,
     let record = observation.ground_layers([anchor[0], anchor[1]])
         .find(|r| r.anchor == anchor).expect("actual source-owned measured record");
     assert_eq!(record.members.as_slice(), &[anchor[2]]);
-    GroundSample {
+    GroundSample {mode:crate::surface::body_query::GroundSampleMode::Compatibility,
         reference_origin: [xy[0], xy[1], height],
         reference_normal: query.normal,
         query_state: query.state,
@@ -1225,7 +1225,7 @@ fn ground_context_same_observed_plane_subcell_motion_diagnostic() {
     let from = ([from_xy[0], from_xy[1], height + offset], attitude);
     let to = ([to_xy[0], to_xy[1], plane_height(to_xy) + offset], attitude);
     let (query, native) = map.query_ground_with_native(from_xy, height);
-    let reference = c0_shared_constant(GroundSample {
+    let reference = c0_shared_constant(GroundSample {mode:crate::surface::body_query::GroundSampleMode::Compatibility,
         reference_origin: [from_xy[0], from_xy[1], height],
         reference_normal: query.normal,
         query_state: query.state,
@@ -1270,7 +1270,7 @@ fn ground_context_carried_unknown_keeps_actual_height_on_observed_subcell_slope(
     let (query, sources) = map.query_ground_with_native(from_xy, height);
     assert_eq!(query.state, GroundQueryState::Observed);
     assert_eq!(sources, vec![NativeGroundSource::ObservedFine { anchor: [0, 0, 1] }]);
-    let sample = GroundSample { reference_origin: [from_xy[0], from_xy[1], height],
+    let sample = GroundSample {mode:crate::surface::body_query::GroundSampleMode::Compatibility, reference_origin: [from_xy[0], from_xy[1], height],
         reference_normal: query.normal, query_state: GroundQueryState::Unknown,
         reference_sources: sources };
     let reference = Arc::new(LocalGroundReference { first: sample.clone(), changes: vec![] });
@@ -1326,7 +1326,7 @@ fn ground_context_subcell_distinct_observed_anchors_keep_original_rejection() {
         assert_eq!(query.state, GroundQueryState::Observed);
         assert_eq!(query.height, Some(height));
         assert_eq!(native, vec![NativeGroundSource::ObservedFine { anchor }]);
-        GroundSample { reference_origin: [xy[0], xy[1], height], reference_normal: query.normal,
+        GroundSample {mode:crate::surface::body_query::GroundSampleMode::Compatibility, reference_origin: [xy[0], xy[1], height], reference_normal: query.normal,
             query_state: query.state, reference_sources: native }
     };
     let lower = make_sample([0.01, 0.025], 0.049, [0, 0, 0]);

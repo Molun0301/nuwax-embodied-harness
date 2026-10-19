@@ -212,3 +212,94 @@ fn c1a_08_trace_retains_original_owner_after_planner_geometry_replacement() {
 
 #[path="ground_physical_dominance_tests.rs"]
 mod physical_dominance_tests;
+
+fn c1c1_signature(sample:nuwax_nav_mls_planner::surface::NavigationGroundSample<'_>)
+    ->(u8,Option<u64>,Option<GroundKey>) {
+    use nuwax_nav_mls_planner::surface::NavigationGroundSample as S;
+    match sample {
+        S::KnownNative{record,reference_xy}=>(0,record.height_at(reference_xy).map(f64::to_bits),Some(record.key())),
+        S::KnownLegacy{height,..}=>(0,Some(height.to_bits()),None),
+        S::Carried{height}=>(1,Some(height.to_bits()),None),S::Unanchored=>(2,None,None),
+    }
+}
+
+#[test]
+fn c1c1_recorded_navigation_adapter_keeps_discrete_addresses_and_owner() {
+    let (source,h)=known_source();let from_xy=center([0,0]);let to_xy=center([8,0]);
+    let actual=([from_xy[0],from_xy[1],h+0.4],[0.,0.,0.,1.]);
+    let route=plan(&source,actual,GroundRouteStart{xy:from_xy,ground_z:Some(h)},
+        GroundRouteGoal{xy:to_xy,requested_ground_z:None}).unwrap();
+    let start=route.reference.position(0,0,0.0).unwrap().walk_state();let before=start.semantic_key();
+    let edge=start.walk_xy(to_xy,&[],None).unwrap();let steps=edge.navigation_steps();
+    let rows:Vec<_>=(0..=steps).map(|i|c1c1_signature(edge.navigation_at(i as f64/steps as f64))).collect();
+    assert!(rows.iter().any(|r|r.0==1));assert_eq!(rows[0].0,0);assert_eq!(rows[steps].0,0);
+    for i in 1..=steps {
+        let t=i as f64/steps as f64;
+        assert_eq!(c1c1_signature(edge.navigation_at(t.next_down())),rows[i-1]);
+        assert_eq!(c1c1_signature(edge.navigation_at(t)),rows[i]);
+        if i<steps {assert_eq!(c1c1_signature(edge.navigation_at(t.next_up())),rows[i]);}
+    }
+    edge.with_body_navigation(|owner,navigation| {
+        assert!(owner.same_ground_source(&source));let state=owner.start_ground_state(actual).unwrap();
+        let next=owner.project_motion_with_navigation(actual,&state,to_xy,0.0,navigation,&mut None).unwrap();
+        assert_eq!(next.pose().0[2],actual.0[2]);owner.validate_projected_motion(actual,&next,&[],&mut None).unwrap();
+    }).unwrap();
+    assert_eq!(start.semantic_key(),before);
+    let candidate=route.reference.freeze_candidate(vec![edge]).unwrap();
+    for (i,row) in rows.iter().enumerate() {
+        let sample=candidate.sample(0,i).unwrap();let (state,key)=match sample.association {
+            PlannedGroundAssociation::Known{source}=>(0,source.map(|r|r.key())),
+            PlannedGroundAssociation::Carried=>(1,None),PlannedGroundAssociation::Unanchored=>(2,None),
+        };
+        assert_eq!(*row,(state,sample.point.ground_z.map(f64::to_bits),key));
+    }
+    assert!(crate::ground_route::source_less_navigation_adapter_rejected());
+    eprintln!("C1C1_RECORDED steps={steps} samples={} end={:?}",rows.len(),candidate.sample(0,steps));
+}
+
+#[test]
+fn c1c1_recorded_legacy_plane_keeps_finite_attitude_pass_order() {
+    use nuwax_nav_mls_planner::surface::SourceGroundRecord;
+    // Same admitted LegacyPlane as sloped_legacy_fixture, plus one real flat
+    // neighbor. Their direction change moves the calibrated support back across
+    // the column boundary in the existing second (final) H3 pass.
+    let original=sloped_legacy_fixture();let norm=1.0625_f64.sqrt();
+    let columns=[([0,0],[-0.25/norm,0.,1./norm]),([1,0],[0.,0.,1.])].into_iter().map(|(xy,normal)| {
+        let key=[xy[0],xy[1],0];let origin=point(xy,0.5*q());
+        (xy,ColumnGroundRecords {classified_empty:false,heightfields:vec![],legacy:vec![(block_key(key),LayerObservation {
+            members:vec![local_key(key)],plane_origin:origin,normal,samples:vec![LayerSample {source:Default::default(),
+                point:origin,source_sequence:1,source_timestamp_ns:20,point_index:0}]} )]})
+    }).collect();
+    let source=scene(columns,[],original.source.config().clone(),original.source.body_envelope().cloned()).source;
+    let angle=-0.25_f64.atan();let quaternion=[0.,(angle*0.5).sin(),0.,(angle*0.5).cos()];
+    let xy=[-0.05,0.5*q()];let end=[0.5*q(),0.5*q()];
+    let offset=source.support_position_from_body([0.;3],quaternion,0.3).unwrap();
+    let support=[xy[0]+offset[0],xy[1]+offset[1]];
+    let first=source.observations().unwrap().ground_records([0,0]).next().unwrap();
+    assert!(matches!(first,SourceGroundRecord::LegacyPlane(_)));
+    assert!((0.0..q()).contains(&support[0]));
+    let h=first.height_at(support).unwrap();let actual=([xy[0],xy[1],h-offset[2]+0.02],quaternion);
+    let route=plan(&source,actual,GroundRouteStart{xy,ground_z:Some(0.5*q())},
+        GroundRouteGoal{xy:end,requested_ground_z:None}).unwrap();
+    let start=route.reference.position(0,0,0.).unwrap().walk_state();
+    let cancelled=AtomicBool::new(true);assert!(start.walk_xy(end,&[],Some(&cancelled)).is_err());
+    let edge=start.walk_xy(end,&[],None).unwrap();let steps=edge.navigation_steps();
+    let rows:Vec<_>=(0..=steps).map(|i|c1c1_signature(edge.navigation_at(i as f64/steps as f64))).collect();
+    let changes=edge.navigation_changes();
+    for i in 1..=steps {if rows[i]!=rows[i-1] {assert!(changes.contains(&(i as f64/steps as f64)));}}
+    assert!(rows.windows(2).any(|pair|pair[0].0==0&&pair[1].0==0&&pair[0].2==pair[1].2&&pair[0].1!=pair[1].1),
+        "fixed recorded plane must actually change h without changing id");
+    edge.with_body_navigation(|owner,navigation| {
+        let physical=owner.start_ground_state(actual).unwrap();
+        let next=owner.project_motion_with_navigation(actual,&physical,end,0.0,navigation,&mut None).unwrap();
+        let final_support=source.support_position_from_body(next.pose().0,next.pose().1,0.3).unwrap();
+        let column=[final_support[0],final_support[1]].map(|v|(v/q()).floor() as i32);
+        let record=source.observations().unwrap().ground_records(column).next().unwrap();
+        assert_eq!(column,[0,0]);assert_eq!(next.ground().ground_key(),Some(record.key()));
+        assert_eq!(next.ground().height(),record.height_at([final_support[0],final_support[1]]).unwrap());
+        assert_ne!(next.pose().1,actual.1,"fixed direction change must enter the second pass");
+        assert!(next.pose().1[1].abs()<1e-12,"finite transport uses the first-pass flat direction, no convergence iteration");
+        owner.validate_projected_motion(actual,&next,&[],&mut None).unwrap();
+        eprintln!("C1C1_LEGACY from={actual:?} support={support:?} next={:?} final_support={final_support:?} key={:?}",next.pose(),record.key());
+    }).unwrap();
+}

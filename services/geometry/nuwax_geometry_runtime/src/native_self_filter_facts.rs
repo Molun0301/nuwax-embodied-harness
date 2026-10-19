@@ -57,6 +57,11 @@ enum Case {
     FullPoseExternal,
     DifferentPublicPose,
     EvictedPose,
+    SingleExternal,
+    AllSelf,
+    SignedZeroPublicPose,
+    QuaternionSignPublicPose,
+    OneUlpPublicPose,
 }
 
 fn encoded_public_accept(ingress: &NativeLioIngress, envelope: &LioOdometryEnvelope) {
@@ -123,6 +128,8 @@ async fn run_case(backend_id: i32, case: Case) {
         let paired_pose = if matches!(case, Case::FullPoseExternal) {
             Isometry3::from_parts(Translation3::new(1.25, -0.5, 0.375),
                 UnitQuaternion::from_euler_angles(0.2, -0.3, 0.7))
+        } else if matches!(case, Case::OneUlpPublicPose) {
+            Isometry3::translation(1.0, 0.0, 0.0)
         } else { Isometry3::identity() };
         let source = ingress.common.prepare_legacy_odometry(
             1_000_000_000, source_odometry(&paired_pose),
@@ -130,11 +137,25 @@ async fn run_case(backend_id: i32, case: Case) {
         let source_identity = SourceIdentity::from_odometry(&source);
         let pair_pose = odometry_pose_isometry(&source.odometry).expect("actual paired pose");
         let mut public_source = source.clone();
-        if matches!(case, Case::DifferentPublicPose) {
-            public_source.odometry.pose.position = [2.0, 0.0, 0.0];
+        match case {
+            Case::DifferentPublicPose => public_source.odometry.pose.position = [2.0, 0.0, 0.0],
+            Case::SignedZeroPublicPose => public_source.odometry.pose.position[0] = -0.0,
+            Case::QuaternionSignPublicPose => {
+                for component in &mut public_source.odometry.pose.orientation_xyzw {
+                    *component = -*component;
+                }
+            }
+            Case::OneUlpPublicPose => {
+                public_source.odometry.pose.position[0] = f64::from_bits(1.0_f64.to_bits() + 1);
+            }
+            _ => {}
         }
         encoded_public_accept(ingress, &public_source);
         let public_pose = odometry_pose_isometry(&public_source.odometry).expect("actual public pose");
+        if matches!(case, Case::SignedZeroPublicPose | Case::QuaternionSignPublicPose) {
+            assert_eq!(pair_pose, public_pose, "nalgebra PartialEq is deliberately wider than reuse eligibility");
+            assert_ne!(pose_bits(&pair_pose), pose_bits(&public_pose));
+        }
         let correlated = CorrelatedOdometry {
             source_sequence: source_identity.source_sequence,
             source_timestamp_ns: source_identity.source_timestamp_ns,
@@ -143,6 +164,8 @@ async fn run_case(backend_id: i32, case: Case) {
             Case::DifferentPublicPose => vec![Point3::new(0.0, 0.0, -0.2),
                 Point3::new(2.0, 0.0, -0.2), Point3::new(4.0, 0.0, -0.2)],
             Case::FullPoseExternal => vec![Point3::new(2.0, 0.25, 0.125), Point3::new(3.0, -0.5, 0.25)],
+            Case::SingleExternal => vec![Point3::new(2.0, 0.0, -0.2)],
+            Case::AllSelf => vec![Point3::new(0.0, 0.0, -0.2)],
             _ => vec![Point3::new(2.0, 0.0, -0.2), Point3::new(0.0, 0.0, -0.2),
                 Point3::new(4.0, 0.25, -0.2)],
         };
@@ -160,6 +183,8 @@ async fn run_case(backend_id: i32, case: Case) {
         let survivor_indices: &[usize] = match case {
             Case::DifferentPublicPose => &[2],
             Case::FullPoseExternal => &[0, 1],
+            Case::SingleExternal => &[0],
+            Case::AllSelf => &[],
             _ => &[0, 2],
         };
         let expected_odom: Vec<_> = survivor_indices.iter().map(|&index| transformed[index]).collect();
@@ -177,6 +202,19 @@ async fn run_case(backend_id: i32, case: Case) {
         let calls = Rc::new(RefCell::new(Vec::new()));
         let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
         FILTER_CALLS.scope(Rc::clone(&calls), async {
+            if matches!(case, Case::AllSelf) {
+                let error = ingress.process_pair(pair, &mut shutdown_rx).await
+                    .expect_err("first-pass empty input keeps its original early error");
+                assert_eq!(error, "本帧自体过滤后没有外部点云");
+                assert!(!*ingress.source_pair_ready_rx.borrow(), "empty first pass remains before READY");
+                let observed = calls.borrow();
+                assert_eq!(observed.len(), 1);
+                assert_eq!((observed[0].site, observed[0].input, observed[0].output), (Site::Pair, 1, 0));
+                drop(observed);
+                assert!(ingress.common.state.lock().pending_registrations.is_empty());
+                assert!(backend.published.lock().unwrap().iter().all(|frame| frame.topic != public_cloud.0));
+                return;
+            }
             if matches!(case, Case::EvictedPose) {
                 let lifecycle = handle.mapping_lifecycle_lock.lock().await;
                 assert!(ingress.common.state.lock().accepted_odometry_poses
@@ -211,18 +249,22 @@ async fn run_case(backend_id: i32, case: Case) {
             }
             ingress.process_pair(pair, &mut shutdown_rx).await.expect("actual Runtime pair processing");
             let observed = calls.borrow();
-            assert_eq!(observed.len(), 2);
-            assert_eq!((observed[0].site, observed[1].site), (Site::Pair, Site::Common));
-            assert_eq!((observed[0].input, observed[0].output), (source_count, 2));
-            assert_eq!((observed[1].input, observed[1].output), (2, survivor_indices.len()));
+            let fallback = matches!(case, Case::DifferentPublicPose | Case::SignedZeroPublicPose
+                | Case::QuaternionSignPublicPose | Case::OneUlpPublicPose);
+            let first_output = if matches!(case, Case::SingleExternal) { 1 } else { 2 };
+            assert_eq!(observed.len(), if fallback { 2 } else { 1 });
+            assert_eq!(observed[0].site, Site::Pair);
+            assert_eq!((observed[0].input, observed[0].output), (source_count, first_output));
             assert_eq!(observed[0].pose, pose_bits(&pair_pose));
-            assert_eq!(observed[1].pose, pose_bits(&public_pose));
-            assert_eq!(observed[0].filter_owner, observed[1].filter_owner);
-            if matches!(case, Case::DifferentPublicPose) {
+            if fallback {
+                assert_eq!(observed[1].site, Site::Common);
+                assert_eq!((observed[1].input, observed[1].output), (first_output, survivor_indices.len()));
+                assert_eq!(observed[1].pose, pose_bits(&public_pose));
+                assert_eq!(observed[0].filter_owner, observed[1].filter_owner);
                 assert_ne!(observed[0].pose, observed[1].pose);
             } else {
-                assert_eq!(observed[0].pose, observed[1].pose);
-                assert_eq!(observed[0].output, observed[1].output);
+                assert_eq!(pose_bits(&pair_pose), pose_bits(&public_pose));
+                assert_eq!(observed[0].output, survivor_indices.len());
             }
             drop(observed);
             let frames: Vec<_> = backend.published.lock().unwrap().iter()
@@ -277,7 +319,7 @@ async fn run_case(backend_id: i32, case: Case) {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn native_runtime_same_pose_filters_survivors_twice() {
+async fn native_runtime_same_pose_reuses_filtered_survivors() {
     for backend in [LIO_BACKEND_FASTLIO2, LIO_BACKEND_POINTLIO] {
         run_case(backend, Case::MixedWithLaterOdometry).await;
         run_case(backend, Case::FullPoseExternal).await;
@@ -292,4 +334,12 @@ async fn native_runtime_distinct_public_pose_preserves_both_classifications() {
 #[tokio::test(flavor = "current_thread")]
 async fn native_runtime_evicted_public_pose_rejects_before_second_filter() {
     run_case(LIO_BACKEND_POINTLIO, Case::EvictedPose).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn native_runtime_reuse_preserves_small_and_exact_pose_boundaries() {
+    for case in [Case::SingleExternal, Case::AllSelf, Case::SignedZeroPublicPose,
+        Case::QuaternionSignPublicPose, Case::OneUlpPublicPose] {
+        run_case(LIO_BACKEND_POINTLIO, case).await;
+    }
 }

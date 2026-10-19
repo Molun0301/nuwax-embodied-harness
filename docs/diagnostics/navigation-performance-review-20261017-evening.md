@@ -693,6 +693,16 @@ retained与fresh有序完整pose数值、长度和终点对照通过；fresh查�
 
 新六fixture均原mapping stop/join及taskowner.finish完成，5TMPDIR空；无真实硬件LCM、传感器/外层map/RecentCloud/archive资格。原Device/Common冻结pose和Probe exact/fallback两旧控制通过；disabled/全self/发布错误等更广矩阵未在本批跑。原lio全文剥新增cfgtest接线逐字一致，两Cargo.lock不变；提交仅改新测试首DRAFT状态注释、主体不变。事实支持评估有条件复用，尚无生产优化或耗时收益结论。
 
+## 第五十三阶段：同帧同模型精确位姿复用自体过滤结果
+
+接受两源最窄优化：旧注册签名保留None wrapper；仅Native Runtime首遍真实retain之后向private helper携带当前model/pose借用。原缓存lookup、mode/identity/causal/预算及模型Result错误顺序完整保留，Runtime frozen override仍None；同对象且translation3/quaternion4的f64 bits完全相同才省第二retain，其他情况走原过滤。没有新类型/字段/锁、逐点验证、哈希或阻塞错误。nalgebra PartialEq合并q/-q及±0，故不用它作复用资格。
+
+geometry默认release check/tests、bin no-run与6exact全PASS、actual-list各1，旧双遍正常名0；无编译/fixture/断言修正或重跑。两backend四正常case只剩Pair3→2或2→2，省去原Common对2个幸存点的第二分类；单点1→1亦只Pair。异公共pose仍3→2→1；±0/q反号/1ULP仍Common；驱逐仍原MissingFrozenOdometry，全self原早退。完整map f64/canonical f32坐标bits、原序、counts、identity、cached pose、permit及11fixture清理通过，Common/Probe旧控制保持。
+
+原阶段52事实与源码保留，正常selector显式迁移；完整lio反剥新wrapper/guard/Runtime差异逐字等d539，注册尾段/codec/binding/发布与撤销无额外改变，两Cargo.lock不变。disabled/modelErr/不同模型指针等只作源码边界，不冒称已运行新控制。
+
+接受范围是同帧已分类幸存点的有条件复用，增加常数ptr/7bits比较；mismatch也增加比较，小帧整体收益未知。本轮不另做AB，不宣称耗时/CPU/RSS/吞吐/实机改善。输入为受控NativeCloudSample、进程内RecordingBackend，非原生前端或真实LCM/外层地图；core驱逐不证明FIFO自然超车，原数据面边界不扩。
+
 ## 后续持续检查
 
 1. 墙前晚到路径的实际恢复与初始 full/partial/PCT 顺序，保留及时移动和真实避障

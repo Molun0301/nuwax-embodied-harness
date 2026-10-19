@@ -1529,6 +1529,34 @@ impl CommonLioIngress {
         registration_mode_token: RegistrationModeToken,
         frozen_odom_from_body: Option<Isometry3<f64>>,
     ) -> Result<PreparedRegisteredCloud, LioIngressError> {
+        self.register_odom_points_with_prior_self_filter(
+            identity,
+            correlated_odometry,
+            _adapter_clock_ns,
+            source_point_count,
+            odom_points,
+            adapter,
+            registration_mode_token,
+            frozen_odom_from_body,
+            None,
+        )
+    }
+
+    // Some is only supplied by process_pair for this call's unchanged first-pass
+    // survivors. No startup owner or caller of the ordinary wrapper carries it.
+    #[allow(clippy::too_many_arguments)]
+    fn register_odom_points_with_prior_self_filter(
+        &self,
+        identity: SourceIdentity,
+        correlated_odometry: CorrelatedOdometry,
+        _adapter_clock_ns: i64,
+        source_point_count: usize,
+        odom_points: Vec<Point3<f64>>,
+        adapter: &MappingAdapter,
+        registration_mode_token: RegistrationModeToken,
+        frozen_odom_from_body: Option<Isometry3<f64>>,
+        prior_self_filter: Option<(&crate::self_cloud::RobotSelfFilter, &Isometry3<f64>)>,
+    ) -> Result<PreparedRegisteredCloud, LioIngressError> {
         let source_point_count_i64 =
             i64::try_from(source_point_count).map_err(|_| LioIngressError::PointCountOverflow)?;
         let emitted_point_count_i64 =
@@ -1573,14 +1601,26 @@ impl CommonLioIngress {
         if let Some(filter) = self.self_cloud_filter.as_ref().map_err(|error| {
             LioIngressError::Registration(error.clone())
         })? {
-            #[cfg(test)]
-            let filter_input_len = odom_points.len();
-            filter.retain_external(&mut odom_points, &frozen_odom_from_body);
-            #[cfg(test)]
-            tests::native_self_filter_facts::record(
-                tests::native_self_filter_facts::Site::Common,
-                filter_input_len, odom_points.len(), &frozen_odom_from_body, filter,
-            );
+            // The original cache lookup and filter Result check above remain
+            // mandatory. A different model or any pose-bit change uses the old pass.
+            let already_filtered = prior_self_filter.is_some_and(|(previous_filter, previous_pose)| {
+                std::ptr::eq(filter, previous_filter)
+                    && previous_pose.translation.vector.iter()
+                        .chain(previous_pose.rotation.coords.iter())
+                        .zip(frozen_odom_from_body.translation.vector.iter()
+                            .chain(frozen_odom_from_body.rotation.coords.iter()))
+                        .all(|(previous, current)| previous.to_bits() == current.to_bits())
+            });
+            if !already_filtered {
+                #[cfg(test)]
+                let filter_input_len = odom_points.len();
+                filter.retain_external(&mut odom_points, &frozen_odom_from_body);
+                #[cfg(test)]
+                tests::native_self_filter_facts::record(
+                    tests::native_self_filter_facts::Site::Common,
+                    filter_input_len, odom_points.len(), &frozen_odom_from_body, filter,
+                );
+            }
         }
         if odom_points.is_empty() {
             return Err(LioIngressError::InvalidPointBudget {
@@ -1971,7 +2011,7 @@ impl NativeLioIngress {
         let frozen_odom_from_body =
             odometry_pose_isometry(&pair.odometry.odometry).map_err(|error| error.to_string())?;
         // 启动保留帧共享一次封存的过滤点集、位姿和源身份。
-        if let Some(filter) = self.common.self_cloud_filter.as_ref().map_err(Clone::clone)? {
+        let self_filtered_by = if let Some(filter) = self.common.self_cloud_filter.as_ref().map_err(Clone::clone)? {
             #[cfg(test)]
             let filter_input_len = odom_points.len();
             filter.retain_external(&mut odom_points, &frozen_odom_from_body);
@@ -1980,7 +2020,10 @@ impl NativeLioIngress {
                 tests::native_self_filter_facts::Site::Pair,
                 filter_input_len, odom_points.len(), &frozen_odom_from_body, filter,
             );
-        }
+            Some(filter)
+        } else {
+            None
+        };
         if odom_points.is_empty() {
             return Err("本帧自体过滤后没有外部点云".into());
         }
@@ -2055,7 +2098,7 @@ impl NativeLioIngress {
                 return Ok(());
             }
             self.common
-                .register_odom_points_with_mode_token(
+                .register_odom_points_with_prior_self_filter(
                     pair.cloud.identity,
                     correlated_odometry,
                     0,
@@ -2064,6 +2107,7 @@ impl NativeLioIngress {
                     &adapter,
                     pair.cloud.registration_mode_token,
                     None,
+                    self_filtered_by.map(|filter| (filter, &frozen_odom_from_body)),
                 )
                 .map_err(|error| error.to_string())?
         };

@@ -302,3 +302,6 @@ fn capture_reader_mixed_voxel_and_actual_trunk_return_remain_obstacles() {
         reject_static(&map,pose,BTreeSet::from([key]));
     }
 }
+
+// The exporter is isolated from normal unit runs and reuses this real producer seam.
+mod capture_artifact { include!("heightfield_capture_artifact.rs"); }

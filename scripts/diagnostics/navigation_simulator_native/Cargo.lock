@@ -1301,7 +1301,9 @@ name = "nuwax-navigation-simulator"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "nuwax-codec",
  "nuwax-core",
+ "nuwax-map-chunks",
  "nuwax-nav-mls-planner",
  "nuwax-nav-runtime",
  "nuwax-nav-scan",

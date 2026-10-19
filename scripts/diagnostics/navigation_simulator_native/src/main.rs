@@ -1,10 +1,11 @@
 //! 开发机导航模拟工作进程：复用生产规划与跟随，环境运动独立积分速度命令。
+mod captured_source;
 mod scenarios;
 mod terrain_reference;
 use nuwax_nav_mls_planner::{
     SurfaceMapBuilder, SurfaceObservation, SurfaceObservations, SurfaceSnapshot,
 };
-use nuwax_nav_mls_planner::surface::GroundEvidence;
+use nuwax_nav_mls_planner::surface::{BodyGroundState, GroundEvidence};
 use nuwax_nav_runtime::{ExecutionMap, ExecutionPath, NavPlanner, PlannerStep, RouteFollower};
 use nuwax_nav_stack::{surface_config::SurfaceNavigationConfig};
 use nuwax_nav_types_messages::{
@@ -584,6 +585,11 @@ fn interval_height_response(samples: &[(f64, f64, f64, f64, f64)], reference: f6
     lo + (hi-lo) * 0.5
 }
 
+enum SceneSource {
+    LegacyPoints { builder: SurfaceMapBuilder, observations: Arc<SurfaceObservations> },
+    Publication { captured: captured_source::CapturedSource, sequence: u64 },
+}
+
 struct Scene {
     id: String,
     points: Vec<(f32, f32, f32)>,
@@ -591,8 +597,7 @@ struct Scene {
     cases: Vec<Value>,
     terrain: Terrain,
     config: SurfaceNavigationConfig,
-    builder: SurfaceMapBuilder,
-    base_observations: Arc<SurfaceObservations>,
+    source: SceneSource,
     map: Arc<SurfaceSnapshot>,
     obstacles: Vec<Value>,
     metadata: Value,
@@ -633,6 +638,13 @@ impl Scene {
         ground_evidence:GroundEvidence,
         data: &PathBuf,
     ) -> Result<Self, String> {
+        Self::make_with_source(id,name,points,poses,config,flat,ground_evidence,data,None)
+    }
+    fn make_with_source(
+        id: &str, name: &str, points: Vec<(f32,f32,f32)>, poses: Vec<Body>,
+        config: SurfaceNavigationConfig, flat: bool, ground_evidence: GroundEvidence,
+        data: &PathBuf, captured: Option<captured_source::CapturedSource>,
+    ) -> Result<Self,String> {
         let offset = config.follower.body_to_support_z_m;
         let body_model = config.body_envelope.as_ref().ok_or("模拟机体足迹缺失")?;
         let mut terrain = Terrain::new(
@@ -646,6 +658,11 @@ impl Scene {
         if ground_evidence==GroundEvidence::OccupiedVolume {
             for bands in terrain.columns.values_mut() {for band in bands {band.0=band.1;}}
         }
+        let (map, source, ground_evidence) = if let Some(captured) = captured {
+            let map = captured.map.clone();
+            let evidence = map.ground_evidence();
+            (map, SceneSource::Publication { captured, sequence: 0 }, evidence)
+        } else {
         let mut builder =
             SurfaceMapBuilder::configured(config.geometry.clone(), config.body_envelope.clone());
         let observations = Arc::new(observation_index(&points)?);
@@ -657,6 +674,8 @@ impl Scene {
                 .with_observations(Some(observations.clone()))
                 .with_ground_evidence(ground_evidence),
         );
+            (map, SceneSource::LegacyPoints {builder, observations}, ground_evidence)
+        };
         let mut cases = Vec::new();
         if id == "recorded" {
             for i in (0..poses.len()).step_by(800) {
@@ -712,8 +731,7 @@ impl Scene {
             cases,
             terrain,
             config,
-            builder,
-            base_observations: observations,
+            source,
             map,
             obstacles: Vec::new(),
             metadata,
@@ -753,14 +771,30 @@ impl Scene {
                 }
             }
         }
+        match &mut self.source {
+            SceneSource::Publication { captured, sequence } => {
+                let next_sequence = sequence.checked_add(1).ok_or("recent scene sequence overflow")?;
+                let points: Result<Vec<_>,String> = extra.iter().enumerate().map(|(i,&(x,y,z))|
+                    Ok((u32::try_from(i).map_err(|e|e.to_string())?,[f64::from(x),f64::from(y),f64::from(z)]))).collect();
+                // Use the current view so the original recent monotonicity checks apply.
+                let next = Arc::new(self.map.with_recent_obstacle_points(next_sequence,next_sequence,0,&[],points?)
+                    .map_err(|e|e.to_string())?);
+                if !captured.map.same_geometry(&next)
+                    || !Arc::ptr_eq(captured.map.observations().unwrap(),next.observations().unwrap())
+                    || captured.map.ground_evidence()!=next.ground_evidence() {
+                    return Err("recent overlay changed the captured static source".into());
+                }
+                self.map=next;
+                *sequence=next_sequence;
+            }
+            SceneSource::LegacyPoints {builder, observations:base_observations} => {
         let mut points = self.points.clone();
         points.extend(extra.iter().copied());
-        let built = self
-            .builder
+        let built = builder
             .build(&points, 0.05)
             .map_err(|e| e.to_string())?;
         // 地图构建器只重建变化列，原观察块共享；交互障碍变化不进入每拍热路径。
-        let mut observations = (*self.base_observations).clone();
+        let mut observations = (**base_observations).clone();
         let mut blocks = BTreeMap::<[i32; 3], BTreeMap<[i32; 3], SurfaceObservation>>::new();
         for &(x, y, z) in &extra {
             let key = [x, y, z].map(|v| (f64::from(v) / f64::from(0.05_f32)).floor() as i32);
@@ -779,7 +813,7 @@ impl Scene {
             for x in block[0] * 32..(block[0] + 1) * 32 {
                 for y in block[1] * 32..(block[1] + 1) * 32 {
                     for z in block[2] * 32..(block[2] + 1) * 32 {
-                        if let Some(v) = self.base_observations.get([x, y, z]) {
+                        if let Some(v) = base_observations.get([x, y, z]) {
                             values.entry([x, y, z]).or_insert(v);
                         }
                     }
@@ -795,6 +829,8 @@ impl Scene {
                 .with_observations(Some(Arc::new(observations)))
                 .with_ground_evidence(self.ground_evidence),
         );
+            }
+        }
         self.obstacles = values;
         Ok(())
     }
@@ -805,6 +841,8 @@ struct Simulation {
     follower: RouteFollower,
     options: GoalOptions,
     current: Body,
+    // Only publication scenes own an actual ground association across unknown columns.
+    actual_ground: Option<BodyGroundState>,
     goal: Body,
     applied: [f64; 3],
     command: [f64; 3],
@@ -915,6 +953,9 @@ impl Simulation {
             if q.iter().map(|v|v*v).sum::<f64>()<1e-12 {return Err("起点朝向不能为零四元数".into());}
             current.1=q;
         }
+        let actual_ground = if matches!(&scene.source,SceneSource::Publication {..}) {
+            Some(scene.map.body_query().start_ground_state(current).map_err(|e|e.to_string())?)
+        } else {None};
         let mut follower = RouteFollower::new(config).map_err(|e| e.to_string())?;
         follower
             .update_execution_map(ExecutionMap::Surface(scene.map.clone()))
@@ -928,6 +969,7 @@ impl Simulation {
             follower,
             options,
             current,
+            actual_ground,
             goal,
             applied: [0.; 3],
             command: [0.; 3],
@@ -1055,34 +1097,44 @@ impl Simulation {
             after_ground,
             scene.config.follower.body_to_support_z_m,
         );
-        let valid = scene
-            .map
-            .with_current_body_support(self.current.0, self.current.1)
-            .and_then(|m| m.validate_body_motion(self.current, next, &[]));
-        if let Err(error) = valid {
-            self.motion_failures += 1;
-            let predicted = scene
-                .map
-                .with_current_body_support(self.current.0, self.current.1)
-                .and_then(|map| {
-                    map.body_pose_after_motion(self.current, [planar.0[0], planar.0[1]], heading)
-                });
-            let predicted_check = predicted.as_ref().ok().map(|next| {
-                scene
-                    .map
-                    .with_current_body_support(self.current.0, self.current.1)
-                    .and_then(|map| map.validate_body_motion(self.current, *next, &[]))
-                    .map_err(|e| e.to_string())
-            });
-            self.motion_failure = Some(json!({"from":self.current,"next":next,
-                "previous_velocity":old,"velocity":applied,"command":self.command,
-                "model_ground_from":before_ground,"model_ground_next":after_ground,
-                "production_prediction":predicted.map_err(|e| e.to_string()),"prediction_check":predicted_check}));
-            return Err(format!(
-                "模拟实际运动与几何检查不一致：{error}，位置 {:?} → {:?}",
-                self.current.0, next.0
-            ));
-        }
+        let mut actual_witness = None;
+        let checked = if let Some(ground) = &self.actual_ground {
+            // Validate the independently integrated world pose; do not replace it
+            // with a planner projection or reseed Unknown from changing body Z.
+            scene.map.body_query().validate_motion_from_ground(
+                self.current,next,ground,&[],&mut actual_witness).map(Some)
+        } else {
+            scene.map.with_current_body_support(self.current.0,self.current.1)
+                .and_then(|m|m.validate_body_motion(self.current,next,&[])).map(|()|None)
+        };
+        let next_ground = match checked {
+            Ok(ground) => ground,
+            Err(error) => {
+                self.motion_failures += 1;
+                let (predicted,predicted_check) = if let Some(ground) = &self.actual_ground {
+                    let query=scene.map.body_query();
+                    let projection=query.project_motion(self.current,ground,[planar.0[0],planar.0[1]],heading,&mut None);
+                    let checked=projection.as_ref().ok().map(|projection|
+                        query.validate_projected_motion(self.current,projection,&[],&mut None).map_err(|e|e.to_string()));
+                    (projection.map(|projection|projection.pose()).map_err(|e|e.to_string()),checked)
+                } else {
+                    let predicted=scene.map.with_current_body_support(self.current.0,self.current.1)
+                        .and_then(|map|map.body_pose_after_motion(self.current,[planar.0[0],planar.0[1]],heading));
+                    let checked=predicted.as_ref().ok().map(|next|scene.map
+                        .with_current_body_support(self.current.0,self.current.1)
+                        .and_then(|map|map.validate_body_motion(self.current,*next,&[])).map_err(|e|e.to_string()));
+                    (predicted.map_err(|e|e.to_string()),checked)
+                };
+                self.motion_failure=Some(json!({"from":self.current,"next":next,
+                    "previous_velocity":old,"velocity":applied,"command":self.command,
+                    "model_ground_from":before_ground,"model_ground_next":after_ground,
+                    "production_prediction":predicted,"prediction_check":predicted_check,
+                    "actual_check_kind":if self.actual_ground.is_some(){"owned_ground"}else{"legacy"},
+                    "actual_witness":format!("{actual_witness:?}")}));
+                return Err(format!("模拟实际运动与几何检查不一致：{error}，位置 {:?} → {:?}",self.current.0,next.0));
+            }
+        };
+        self.actual_ground=next_ground;
         // 按真实机体速度统计；圆弧的世界坐标横向位移不等于机器狗横着走。
         self.reverse_travel_m+=(-mean[0]).max(0.0)*DT;
         self.lateral_travel_m+=mean[1].abs()*DT;
@@ -1158,6 +1210,31 @@ fn run() -> Result<(), String> {
     fs::create_dir_all(&data).map_err(|e| e.to_string())?;
     let config = SurfaceNavigationConfig::from_env().map_err(|e| e.to_string())?;
     let mut scenes = HashMap::new();
+    let catalog = if args.get(2).is_some_and(|arg|arg=="--captured-source") {
+        let artifact=PathBuf::from(args.get(3).ok_or("capture artifact directory required")?);
+        let cloud=args.get(4).ok_or("original point file required")?;
+        let trajectory=args.get(5).ok_or("original poses required")?;
+        let bytes=fs::read(cloud).map_err(|e|e.to_string())?;
+        if bytes.len()%16!=0 {return Err("invalid original XYZT byte length".into());}
+        let points=bytes.chunks_exact(16).map(|b|(
+            f32::from_le_bytes(b[0..4].try_into().unwrap()),
+            f32::from_le_bytes(b[4..8].try_into().unwrap()),
+            f32::from_le_bytes(b[8..12].try_into().unwrap()))).collect();
+        let poses:Result<Vec<Body>,String>=fs::read_to_string(trajectory).map_err(|e|e.to_string())?.lines().map(|line| {
+            let v:Value=serde_json::from_str(line).map_err(|e|e.to_string())?;
+            Ok((serde_json::from_value(v["p"].clone()).map_err(|e|e.to_string())?,
+                serde_json::from_value(v["q"].clone()).map_err(|e|e.to_string())?))
+        }).collect();
+        let captured=captured_source::CapturedSource::load(&artifact,&config)?;
+        let input=captured.oracle["input"].clone();
+        let mut scene=Scene::make_with_source("recorded","Captured C source",points,poses?,config.clone(),
+            false,GroundEvidence::MeasuredSurface,&data,Some(captured))?;
+        scene.metadata["planning_input"]=json!("actual_capture_publication_receiver");
+        scene.metadata["capture_input"]=input;
+        let catalog=json!({"scenes":[scene.metadata],"default_scene":"recorded"});
+        scenes.insert("recorded".into(),scene);
+        catalog
+    } else {
     for (id, name, blocked) in [
         ("straight", "七米开阔直线", false),
         ("obstacle", "三维障碍绕行", true),
@@ -1230,6 +1307,8 @@ fn run() -> Result<(), String> {
         catalog["scenes"].as_array_mut().unwrap().push(scene.metadata.clone());
         scenes.insert(specification.id.into(),scene);
     }
+        catalog
+    };
     fs::write(
         data.join("scenes.json"),
         serde_json::to_vec_pretty(&catalog).unwrap(),
@@ -1250,6 +1329,22 @@ fn run() -> Result<(), String> {
         let response = (|| -> Result<Value, String> {
             let request: Value = serde_json::from_str(&line).map_err(|e| e.to_string())?;
             match request["op"].as_str().unwrap_or("") {
+                "inspect_source" | "source_obstacles" => {
+                    let scene=scenes.get_mut(request["scene_id"].as_str().ok_or("场景缺失")?).ok_or("场景不存在")?;
+                    let body=if request["body"].is_null() {None} else {
+                        Some(serde_json::from_value(request["body"].clone()).map_err(|e|e.to_string())?)
+                    };
+                    if request["op"]=="source_obstacles" {
+                        if simulation.is_some() || !matches!(&scene.source,SceneSource::Publication {..}) {
+                            return Err("source obstacle diagnostic requires an idle publication scene".into());
+                        }
+                        scene.change_obstacles(request["obstacles"].as_array().ok_or("obstacles required")?.clone())?;
+                    }
+                    match &scene.source {
+                        SceneSource::Publication {captured,..} => captured.inspect(&scene.map,body),
+                        SceneSource::LegacyPoints {..} => Err("scene has no captured publication".into()),
+                    }
+                }
                 "inspect_route" => {
                     let scene=scenes.get(request["scene_id"].as_str().ok_or("场景缺失")?).ok_or("场景不存在")?;
                     let session=Simulation::new(scene,&request)?;

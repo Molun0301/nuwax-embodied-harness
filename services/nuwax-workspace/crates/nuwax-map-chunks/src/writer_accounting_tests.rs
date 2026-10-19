@@ -13,8 +13,11 @@ fn writer() -> Writer {
     Writer::new(Repository::temporary().unwrap(), 0.125, 64 * 1024 * 1024).unwrap()
 }
 fn assert_accounting(w: &Writer) {
-    let bytes: usize = w.dirty.values().flat_map(|d| d.layers.values())
-        .map(layer_bytes).sum();
+    let bytes: usize = w.dirty.values().flat_map(|d| d.layers.iter())
+        .map(|(_, record)| match record {
+            GroundRecordRef::LegacyPlane(layer) => terrain_observations::layer_bytes(layer),
+            GroundRecordRef::HeightfieldV1(_) => panic!("original accounting fixture is Legacy"),
+        }).sum();
     assert_eq!(w.dirty_layer_bytes(), bytes);
     assert_eq!(w.resident_bytes(), w.source_watermark_bytes + bytes + w.dirty_points * 64 + w.reader.cached_bytes()
         + w.pending.values().map(|p| p.bytes.len()).sum::<usize>());

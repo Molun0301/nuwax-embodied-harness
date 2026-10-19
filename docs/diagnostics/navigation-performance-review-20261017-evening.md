@@ -805,6 +805,24 @@ trace记录每条原实际评价的from/to、steps、Reference变化及最终poi
 
 新8覆盖5/10/15cm分布、90/10跨格与49/51双峰、跨帧量化、删除/下溢、跨z块先整列归一与点序、部分bin截尾/洞、版本codec及输入边界。测试中的点到计数仅夹具，不冒称已用真实capture。尚无地表分类、全局/局部导航、近期点过滤、完整存档迁移、实机或性能结果；下一批必须接入原producer/Writer与所有消费者，不能停在未使用的数据类型。
 
+## 第六十二阶段：Heightfield 原存储链H2，生产capture尚未切换
+
+接受12源的原系统内存储接线：map-chunks七个生产源含新ground_records、Python fine_map_archive，以及四个定向/机械测试源。显式LegacyPlane/HeightfieldV1、BL4/root5/AR5复用原Writer/Repository/RegionReader/Receiver/归档，不另建地图或缓存服务。旧BL1/2/3及AR1–4保留旧表示和Arc；旧plane专用入口读取新表示明确不支持，不返回空层或伪造竖直normal。原Cargo.lock不变。
+
+完整列一次归一，跨负z及多个z-block拆片保存原质量份额，删除重算所有剩余片段的h、bounds与规范anchor。零质量中间成员撤销ground归属而占据保留是合法几何变化，不增fragment_count来推断生产者未声明意图；实际质量/anchor/h/bounds不一致才拒绝。只变质量/来源时间不改变几何revision，实际h/members/bounds变化沿原delta传播。首次typed根可完整验证，后续只查变化/删除block涉及XY，Legacy根不做新遍历。
+
+实现初期发现单列更新会重复复制同块记录，构建前收敛为replace_ground_columns批量事务：每受影响块一次prepared、首次编辑COW，逐列只查原32个可能anchor键，后续在同map修改；批尾每changed block计费/验证。没有每列全块clone或prepared深比较，1024列资格实际一次batch。可失败的读取/拆分/验证均先于安装，复用原pending/flush发布屏障；私有最低格式值确保pressure flush后不把BL4发布成root4。
+
+新root5/BL4 import/restore复用原Receiver空间绑定规则；固定四块中两个零质量中片复用同对象的档案被一致拒绝。旧AR1–4/空occupancy内容别名不扩此约束，原legacy alias回归保留。Python原256条限制与Rust已有32768结构上限对齐，原4MiB字节预算不变；运算以原f32分辨率升f64，与Rust保持。
+
+真实原链qualification最终17个Rust、4个Python3.8.10 exact全PASS，每次actual-list恰1。共22次执行=21PASS+1保留测试期待失败：新负控实际已正确拒对象，但误期待import/restore错误文字而Receiver返回原rebound字符串；仅修该断言/打印后重验，生产及输入未变，不重复其余通过项。两处旧私有Dirty测试机械跟随Arc/带标签记录，无新生产wrapper。
+
+实际Rust输出的跨块AR5、零质量撤归属AR5、混合AR5、1024列AR5和旧AR4均通过Python真实验证；另一个rebound非法档被拒。1024列实际archive228983bytes。既有32768占据不可缓存控制中seal为5次Repository读取尝试（比较2、根相关3），完整零cache receive为6次（原缺失尝试1、根相关3、比较2）；只说明API读取工作，非物理IO/耗时/CPU/RSS。ground_parts合并读取避免原block/records分别解码，无新cache。
+
+六轮原target map-chunks lib release no-run：四成功、两编译接线失败，分别旧空Dirty字面量未适配的E0308、新测试浮点数缺前导0；日志全部保留，无warning的成功产物按固定清单执行。未跑全workspace、未复制binary、未清target。新增Python永久回归tests/test_heightfield_archive.py被原/tests/*忽略，提交只显式加入该文件，未改.gitignore。
+
+H2输入仍为已关联counts，不能称真实草地分类或导航修复。capture启用、剩余格式白名单/能力5公告、源端归属/方向、PCT/MLS/近期点/Scan/控制及ground-goal实际消费/停车仍待后续贯通；旧存档暂保Legacy，新真实帧才能渐进产生新统计，不用32诊断样本编造完整地表分布。
+
 ## 后续持续检查
 
 1. 墙前晚到路径的实际恢复与初始 full/partial/PCT 顺序，保留及时移动和真实避障

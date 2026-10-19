@@ -23,7 +23,7 @@ fn full_scan_region(
     let mut out = Vec::new();
     for key in keys {
         let block = if let Some(dirty) = writer.dirty.get(&key) {
-            Arc::new(dirty.block.clone())
+            dirty.block.clone()
         } else {
             writer.reader.block(&writer.blocks[&key])?
         };
@@ -254,7 +254,7 @@ fn region_borrowed_dirty_keeps_budget_and_persisted_error_order() {
     }
     // Dirty still shadows that broken persisted reference, even when empty.
     writer.dirty.insert([1, 0, 0], Dirty {
-        block: Block::new(), layers: LayerObservations::new(), changed: true,
+        block: Arc::new(Block::new()), layers: GroundRecords::empty(), changed: true,
     });
     assert_eq!(same_as_full_scan(&mut writer, [0; 3], [32, 0, 0], 2).unwrap().len(), 2);
 }

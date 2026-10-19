@@ -15,6 +15,8 @@ pub mod surface_statistics;
 pub mod heightfield_observations;
 mod terrain_observations;
 pub use terrain_observations::{LayerObservation, LayerObservations, LayerSample, LayerSource, SourceWatermark, MAX_LAYER_SAMPLES, MAX_LAYERS_PER_BLOCK, MAX_LAYER_MEMBERS, layer_geometry_eq};
+mod ground_records;
+pub use ground_records::{ColumnGroundRecords, GroundRecord, GroundRecordRef, GroundRecords, HeightfieldFragment, HeightfieldSurface};
 mod archive;
 pub use archive::{archive_file, ArchiveReader, ArchivedRoot, LegacyRoot, MAX_ARCHIVE_BYTES};
 
@@ -64,10 +66,17 @@ pub fn encode_block(block: &Block) -> Result<Vec<u8>, String> {
 pub fn decode_block(bytes: &[u8]) -> Result<Block, String> {
     decode_block_parts(bytes).map(|(block, _)| block)
 }
-fn decode_block_parts(bytes: &[u8]) -> Result<(Block, LayerObservations), String> {
+fn decode_block_parts(bytes: &[u8]) -> Result<(Block, GroundRecords), String> {
     let mut block = Block::new();
     visit_block_records(bytes, |key, evidence| { block.insert(key, evidence); })?;
-    let layers = read_layers(bytes, &block)?;
+    let layers = if bytes.starts_with(b"NUWAXBL4") {
+        let start = 16 + block.len() * 12;
+        let entries: Vec<(u16, GroundRecord)> = serde_json::from_slice(&bytes[start..]).map_err(|e| e.to_string())?;
+        if entries.is_empty() || entries.windows(2).any(|w| w[0].0 >= w[1].0) { return Err("invalid ground record anchors".into()); }
+        let records = GroundRecords::Versioned(Arc::new(entries.into_iter().collect()));
+        ground_records::validate_records(&records, &block)?;
+        records
+    } else { GroundRecords::Legacy(Arc::new(read_layers(bytes, &block)?)) };
     Ok((block, layers))
 }
 
@@ -95,12 +104,32 @@ pub fn encode_layer_block(block: &Block, layers: &LayerObservations) -> Result<V
     bytes.extend_from_slice(&json);
     Ok(bytes)
 }
+/// Typed block encoding. Legacy records retain their existing BL1/2/3 spelling.
+pub fn encode_ground_block(block: &Block, records: &GroundRecords) -> Result<Vec<u8>, String> {
+    match records {
+        GroundRecords::Legacy(v) => encode_layer_block(block, v),
+        GroundRecords::Versioned(v) => {
+            ground_records::validate_records(records, block)?;
+            let mut bytes = encode_block(block)?;
+            if v.is_empty() { return Ok(bytes); }
+            let json = serde_json::to_vec(&v.iter().collect::<Vec<_>>()).map_err(|e| e.to_string())?;
+            if bytes.len() + json.len() > MAX_BLOCK_BYTES { return Err("ground block exceeds byte budget".into()); }
+            bytes[..8].copy_from_slice(b"NUWAXBL4");
+            bytes[12..16].copy_from_slice(&(json.len() as u32).to_le_bytes());
+            bytes.extend(json); Ok(bytes)
+        }
+    }
+}
+pub fn decode_ground_records(bytes: &[u8]) -> Result<GroundRecords, String> {
+    decode_block_parts(bytes).map(|(_, records)| records)
+}
+
 pub fn decode_layer_observations(bytes: &[u8]) -> Result<LayerObservations, String> {
     if bytes.starts_with(b"NUWAXBL1") {
         visit_block_records(bytes, |_, _| {})?;
         return Ok(LayerObservations::new());
     }
-    decode_block_parts(bytes).map(|(_, layers)| layers)
+    decode_block_parts(bytes).and_then(|(_, layers)| layers.into_legacy())
 }
 
 fn read_layers(bytes: &[u8], block: &Block) -> Result<LayerObservations, String> {
@@ -121,7 +150,7 @@ fn read_layers(bytes: &[u8], block: &Block) -> Result<LayerObservations, String>
     Ok(layers)
 }
 fn visit_block(bytes: &[u8], mut visit: impl FnMut(u16, Evidence)) -> Result<u32, String> {
-    if bytes.starts_with(b"NUWAXBL2") || bytes.starts_with(b"NUWAXBL3") {
+    if bytes.starts_with(b"NUWAXBL2") || bytes.starts_with(b"NUWAXBL3") || bytes.starts_with(b"NUWAXBL4") {
         let (block, _) = decode_block_parts(bytes)?;
         for (&key, &evidence) in &block { visit(key, evidence); }
         Ok(block.len() as u32)
@@ -131,7 +160,7 @@ fn visit_block_records(bytes: &[u8], mut visit: impl FnMut(u16, Evidence)) -> Re
     if bytes.len() < 16 || bytes.len() > MAX_BLOCK_BYTES { return Err("精细块格式或长度无效".into()); }
     let layer_bytes = match &bytes[..8] {
         b"NUWAXBL1" if bytes[12..16] == [0; 4] => 0,
-        b"NUWAXBL2" | b"NUWAXBL3" => u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize,
+        b"NUWAXBL2" | b"NUWAXBL3" | b"NUWAXBL4" => u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize,
         _ => return Err("精细块格式或长度无效".into()),
     };
     let count = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
@@ -230,7 +259,7 @@ fn validate_members<'a>(members: impl Iterator<Item = (Key, ObjectIdentity, u32)
 impl Manifest {
     pub fn validate(&self) -> Result<(), String> {
         validate_header(&self.domain, self.revision, self.source_timestamp_ns, self.voxel_size_m, self.blocks.len())?;
-        if !matches!(self.version, 2 | 3 | 4) || self.geometry_revision == 0 || self.geometry_revision > self.revision { return Err("invalid current root revision".into()); }
+        if !matches!(self.version, 2 | 3 | 4 | 5) || self.geometry_revision == 0 || self.geometry_revision > self.revision { return Err("invalid current root revision".into()); }
         validate_members(self.blocks.iter().map(|b| (b.key, b.object, b.points)))?;
         if self.version < 4 && !self.source_watermarks.is_empty() {
             return Err("typed source watermarks require root version 4".into());
@@ -303,20 +332,29 @@ impl SealedMap {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transfer { pub root: Vec<u8>, pub included: BTreeMap<ObjectIdentity, Vec<u8>> }
 #[derive(Debug, Clone, Copy)]
-struct Intrinsic { points: u32, latest: u64, layered: bool, sourced: bool }
+struct Intrinsic { points: u32, latest: u64, layered: bool, sourced: bool, versioned: bool }
 fn intrinsic(block: &Block) -> Intrinsic {
-    Intrinsic { layered: false, sourced: false, points: block.len() as u32, latest: block.values().map(|e| e.observed_ns).max().unwrap_or(0) }
+    Intrinsic { layered: false, sourced: false, versioned: false, points: block.len() as u32, latest: block.values().map(|e| e.observed_ns).max().unwrap_or(0) }
 }
 fn intrinsic_bytes(bytes: &[u8], block: &Block) -> Intrinsic {
-    Intrinsic { layered: bytes.starts_with(b"NUWAXBL2") || bytes.starts_with(b"NUWAXBL3"),
-        sourced: bytes.starts_with(b"NUWAXBL3"), ..intrinsic(block) }
+    Intrinsic { layered: bytes.starts_with(b"NUWAXBL2") || bytes.starts_with(b"NUWAXBL3") || bytes.starts_with(b"NUWAXBL4"),
+        sourced: bytes.starts_with(b"NUWAXBL3") || bytes.starts_with(b"NUWAXBL4"), versioned: bytes.starts_with(b"NUWAXBL4"), ..intrinsic(block) }
 }
 fn admit_format(info: Intrinsic, root: &Manifest) -> Result<(), String> {
-    if info.sourced && root.version < 4 { Err("typed layer block requires root version 4".into()) }
+    if info.versioned && root.version < 5 { Err("heightfield block requires root version 5".into()) }
+    else if info.sourced && root.version < 4 { Err("typed layer block requires root version 4".into()) }
     else if info.layered && root.version < 3 { Err("observed layer block requires root version 3".into()) } else { Ok(()) }
 }
 fn admit_intrinsic(value: Intrinsic, points: u32, bound: u64) -> Result<(), String> {
     if value.points != points || value.latest > bound { Err("block count or evidence exceeds root".into()) } else { Ok(()) }
+}
+fn admit_layer_spatial_binding(bindings: &mut BTreeMap<ObjectIdentity, (Key, u32)>,
+    object: ObjectIdentity, layers: &GroundRecords, key: Key, quantum: f32) -> Result<(), String> {
+    if !layers.is_empty() {
+        if bindings.get(&object).is_some_and(|old| *old != (key, quantum.to_bits())) { return Err("immutable layer spatial binding changed".into()); }
+        bindings.insert(object, (key, quantum.to_bits()));
+    }
+    Ok(())
 }
 pub struct Receiver {
     current: Option<Arc<Manifest>>, repository: Repository, reader: RegionReader,
@@ -337,6 +375,13 @@ impl Receiver {
     pub fn layers(&mut self, reference: &BlockRef) -> Result<Arc<LayerObservations>, String> {
         self.reader.layers(reference)
     }
+    pub fn ground_records(&mut self, reference: &BlockRef) -> Result<GroundRecords, String> {
+        self.reader.ground_records(reference)
+    }
+    /// Read original occupancy and ground records from one decode, also with zero cache.
+    pub fn ground_parts(&mut self, reference: &BlockRef) -> Result<(Arc<Block>, GroundRecords), String> {
+        self.reader.ground_parts(reference)
+    }
     pub fn current(&self) -> Option<Arc<Manifest>> { self.current.clone() }
     pub fn collection_error(&self) -> Option<&str> { self.collection_error.as_deref() }
     pub fn clear(&mut self) { self.current = None; self.verified.clear(); self.layer_bindings.clear(); }
@@ -355,7 +400,7 @@ impl Receiver {
             for (&object, bytes) in &transfer.included {
                 let (points, key) = *required.get(&object).ok_or("included object is outside root")?;
                 let (decoded, layers) = decode_block_parts(bytes)?;
-                let decoded = Arc::new(decoded); let layers = Arc::new(layers); let info = intrinsic_bytes(bytes, &decoded);
+                let decoded = Arc::new(decoded); let info = intrinsic_bytes(bytes, &decoded);
                 admit_intrinsic(info, points, candidate.source_timestamp_ns)?;
                 admit_format(info, &candidate)?;
                 self.admit_layer_binding(object, &layers, key, candidate.voxel_size_m)?;
@@ -375,7 +420,7 @@ impl Receiver {
                         if self.repository.object_exists(block.object)? { return Err(error); }
                         let bytes = fetch(&candidate, block)?;
                         let (decoded, layers) = decode_block_parts(&bytes)?;
-                let decoded = Arc::new(decoded); let layers = Arc::new(layers); let info = intrinsic_bytes(&bytes, &decoded);
+                let decoded = Arc::new(decoded); let info = intrinsic_bytes(&bytes, &decoded);
                         admit_intrinsic(info, block.points, candidate.source_timestamp_ns)?; admit_format(info, &candidate)?;
                         self.admit_layer_binding(block.object, &layers, block.key, candidate.voxel_size_m)?;
                         self.repository.put_object(block.object, &bytes)?;
@@ -384,7 +429,7 @@ impl Receiver {
                     }
                 };
                 let (decoded, layers) = decode_block_parts(&bytes)?;
-                let decoded = Arc::new(decoded); let layers = Arc::new(layers); let info = intrinsic_bytes(&bytes, &decoded);
+                let decoded = Arc::new(decoded); let info = intrinsic_bytes(&bytes, &decoded);
                 admit_intrinsic(info, block.points, candidate.source_timestamp_ns)?; admit_format(info, &candidate)?;
                 self.admit_layer_binding(block.object, &layers, block.key, candidate.voxel_size_m)?;
                 self.reader.cache_decoded(block.object, decoded, info, layers);
@@ -395,6 +440,30 @@ impl Receiver {
                     && self.layer_bindings.get(&reference.object) != Some(&(reference.key, candidate.voxel_size_m.to_bits())) {
                     return Err("layer object rebound to another spatial key/resolution".into());
                 }
+            }
+            if candidate.version >= 5 {
+                let previous = self.current.as_ref().filter(|old| old.domain == candidate.domain && old.voxel_size_m == candidate.voxel_size_m);
+                let mut columns = BTreeSet::new();
+                for r in &candidate.blocks {
+                    let unchanged = previous.is_some_and(|old| old.blocks.binary_search_by_key(&r.key, |b| b.key).ok()
+                        .is_some_and(|i| old.blocks[i].object == r.object));
+                    if !unchanged {
+                        ground_records::heightfield_columns(r.key, &self.reader.ground_records(r)?, &mut columns)?;
+                        if let Some(old) = previous {
+                            if let Ok(i) = old.blocks.binary_search_by_key(&r.key, |b| b.key) {
+                                ground_records::heightfield_columns(r.key, &self.reader.ground_records(&old.blocks[i])?, &mut columns)?;
+                            }
+                        }
+                    }
+                }
+                if let Some(old) = previous {
+                    for r in &old.blocks {
+                        if candidate.blocks.binary_search_by_key(&r.key, |b| b.key).is_err() {
+                            ground_records::heightfield_columns(r.key, &self.reader.ground_records(r)?, &mut columns)?;
+                        }
+                    }
+                }
+                ground_records::validate_root_columns(&candidate, &mut self.reader, &columns)?;
             }
             if let Some(old) = self.current.clone() {
                 if old.domain == candidate.domain { self.validate_progression(&old, &candidate)?; }
@@ -419,12 +488,8 @@ impl Receiver {
         self.collection_error = self.repository.collect_objects(&objects).err();
         result
     }
-    fn admit_layer_binding(&mut self, object: ObjectIdentity, layers: &LayerObservations, key: Key, quantum: f32) -> Result<(), String> {
-        if !layers.is_empty() {
-            if self.layer_bindings.get(&object).is_some_and(|old| *old != (key, quantum.to_bits())) { return Err("immutable layer spatial binding changed".into()); }
-            self.layer_bindings.insert(object, (key, quantum.to_bits()));
-        }
-        Ok(())
+    fn admit_layer_binding(&mut self, object: ObjectIdentity, layers: &GroundRecords, key: Key, quantum: f32) -> Result<(), String> {
+        admit_layer_spatial_binding(&mut self.layer_bindings, object, layers, key, quantum)
     }
     fn validate_progression(&mut self, old: &Manifest, new: &Manifest) -> Result<(), String> {
         if new.geometry_revision < old.geometry_revision { return Err("root geometry revision rolled back".into()); }
@@ -435,8 +500,8 @@ impl Receiver {
             if b.block_revision < a.block_revision || b.geometry_revision < a.geometry_revision { return Err("block revision rolled back".into()); }
             if b.object != a.object {
                 if b.block_revision <= a.block_revision { return Err("changed object needs advanced evidence revision".into()); }
-                let after = self.reader.block(b)?; let before = self.reader.block(a)?;
-                if before.keys().ne(after.keys()) || !layer_geometry_eq(&*self.reader.layers(a)?, &*self.reader.layers(b)?) {
+                let (after, after_records) = self.reader.ground_parts(b)?; let (before, before_records) = self.reader.ground_parts(a)?;
+                if before.keys().ne(after.keys()) || !before_records.geometry_eq(&after_records) {
                     membership_changed = true;
                     if b.geometry_revision <= a.geometry_revision { return Err("changed members need advanced geometry revision".into()); }
                 }
@@ -453,3 +518,6 @@ mod terrain_observations_tests;
 
 #[cfg(test)]
 mod source_provenance_tests;
+
+#[cfg(test)]
+mod ground_records_tests;

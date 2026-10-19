@@ -44,6 +44,21 @@ impl HeightfieldColumn {
         }))
     }
 
+    // Complete native fragment assembly is a wire/source boundary, not a query.
+    pub(crate) fn from_normalized_members(
+        xy: [i32; 2], voxel_size_m: f32,
+        members: BTreeMap<i32, [f64; HEIGHT_SUB_BINS]>,
+    ) -> Result<Self, String> {
+        check_resolution(voxel_size_m)?;
+        let total: f64 = members.values().flatten().sum();
+        let rounding = (members.len() * HEIGHT_SUB_BINS + 1) as f64 * f64::EPSILON;
+        if members.is_empty() || members.values().flatten().any(|v| !v.is_finite() || *v < 0.0)
+            || !total.is_finite() || total <= 0.0 || (total - 1.0).abs() > rounding {
+            return Err("heightfield mass is not column-normalized".into());
+        }
+        Ok(Self { xy, voxel_size_m, members })
+    }
+
     pub fn xy(&self) -> [i32; 2] {
         self.xy
     }

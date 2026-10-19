@@ -367,3 +367,19 @@ pub(crate) fn validate_layers(layers: &LayerObservations, block: &Block) -> Resu
     }
     Ok(())
 }
+
+/// Heightfield diagnostics preserve original source validation but do not make
+/// sample count a terrain support gate. Their absence cannot erase a distribution.
+pub(crate) fn validate_diagnostic_samples(samples: &[LayerSample]) -> Result<(), String> {
+    if samples.len() > MAX_LAYER_SAMPLES { return Err("ground diagnostics exceed sample budget".into()); }
+    let mut identities = BTreeSet::new();
+    for sample in samples {
+        sample.source.validate_sample(sample.source_timestamp_ns, sample.source_sequence)?;
+        if !sample.point.iter().all(|v| v.is_finite())
+            || !identities.insert((sample.source.as_ref(), sample.source_sequence,
+                sample.source_timestamp_ns, sample.point_index)) {
+            return Err("invalid or duplicate ground diagnostic sample".into());
+        }
+    }
+    Ok(())
+}

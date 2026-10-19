@@ -5,6 +5,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 pub const MAX_ARCHIVE_BYTES: u64 = 1024 * 1024 * 1024;
 const CURRENT_MAGIC: &[u8; 8] = b"NUWAXAR2";
 const LAYER_MAGIC: &[u8; 8] = b"NUWAXAR3";
+const HEIGHTFIELD_MAGIC: &[u8; 8] = b"NUWAXAR5";
 const SOURCE_MAGIC: &[u8; 8] = b"NUWAXAR4";
 const LEGACY_MAGIC: &[u8; 8] = b"NUWAXAR1";
 
@@ -41,7 +42,7 @@ pub fn archive_file(root: &Manifest, repository: &Repository) -> Result<(File, u
     if expected_size > MAX_ARCHIVE_BYTES { return Err("精细地图资产超出1吉比字节预算".into()); }
     let mut file = tempfile::tempfile().map_err(|e| e.to_string())?;
     let mut write = |bytes: &[u8]| file.write_all(bytes).map_err(|e| e.to_string());
-    write(match root.version { 4 => SOURCE_MAGIC, 3 => LAYER_MAGIC, _ => CURRENT_MAGIC })?;
+    write(match root.version { 5 => HEIGHTFIELD_MAGIC, 4 => SOURCE_MAGIC, 3 => LAYER_MAGIC, _ => CURRENT_MAGIC })?;
     write(&(root_bytes.len() as u64).to_le_bytes())?;
     write(&root_bytes)?;
     write(&(root.blocks.len() as u64).to_le_bytes())?;
@@ -78,7 +79,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
         reader.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
         let mut header = [0; 16]; reader.read_exact(&mut header).map_err(|e| e.to_string())?;
         let legacy = match &header[..8] {
-            magic if magic == CURRENT_MAGIC || magic == LAYER_MAGIC || magic == SOURCE_MAGIC => false,
+            magic if magic == CURRENT_MAGIC || magic == LAYER_MAGIC || magic == SOURCE_MAGIC || magic == HEIGHTFIELD_MAGIC => false,
             magic if magic == LEGACY_MAGIC => true,
             _ => return Err("精细资产格式未知".into()),
         };
@@ -93,6 +94,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
         let root = if let Some(alias) = alias { ArchivedRoot::Legacy(LegacyRoot::decode(bytes, alias)?) }
             else { ArchivedRoot::Current(Manifest::decode(&bytes)?) };
         let archive_version = match &header[..8] {
+            magic if magic == HEIGHTFIELD_MAGIC => 5,
             magic if magic == SOURCE_MAGIC => 4,
             magic if magic == LAYER_MAGIC => 3,
             magic if magic == CURRENT_MAGIC => 2,
@@ -131,7 +133,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
         if &root.manifest.blocks[index] != reference { return Err("请求描述与旧精细资产根不符".into()); }
         self.block_by_key(reference.key)
     }
-    fn read_block(&mut self, key: Key) -> Result<(Vec<u8>, Block), String> {
+    fn read_block(&mut self, key: Key) -> Result<(Vec<u8>, Block, GroundRecords), String> {
         let item = self.offsets.get(&key).ok_or("精细资产不含请求块")?;
         let mut bytes = vec![0; item.size];
         self.reader.seek(SeekFrom::Start(item.offset)).map_err(|e| e.to_string())?;
@@ -155,16 +157,31 @@ impl<R: Read + Seek> ArchiveReader<R> {
         }
         admit_intrinsic(intrinsic(&block), item.points, self.root.source_timestamp_ns())?;
         self.checked.insert(key);
-        Ok((bytes, block))
+        Ok((bytes, block, layers))
     }
-    pub fn block_by_key(&mut self, key: Key) -> Result<Vec<u8>, String> { self.read_block(key).map(|(bytes, _)| bytes) }
+    pub fn block_by_key(&mut self, key: Key) -> Result<Vec<u8>, String> { self.read_block(key).map(|(bytes, _, _)| bytes) }
     /// 全部验证完成才交付可用根；无引用的部分导入交给临时目录或拥有方 GC。
     pub fn import(&mut self, repository: &Repository) -> Result<ArchivedRoot, String> {
         let objects = self.offsets.iter().map(|(&key, item)| (key, item.object)).collect::<Vec<_>>();
         let mut installed = BTreeSet::new();
+        let mut bindings = BTreeMap::new();
         for (key, id) in objects {
-            let bytes = self.block_by_key(key)?;
+            let (bytes, _, records) = self.read_block(key)?;
+            if matches!(&self.root, ArchivedRoot::Current(root) if root.version >= 5)
+                && matches!(records, GroundRecords::Versioned(_)) {
+                admit_layer_spatial_binding(&mut bindings, id, &records, key, self.root.voxel_size_m())?;
+            }
             if installed.insert(id) { repository.put_object(id, &bytes)?; }
+        }
+        if let ArchivedRoot::Current(root) = &self.root {
+            if root.version >= 5 {
+                let mut reader = RegionReader::new(repository.clone(), 4 * 1024 * 1024);
+                let mut columns = BTreeSet::new();
+                for reference in &root.blocks {
+                    ground_records::heightfield_columns(reference.key, &reader.ground_records(reference)?, &mut columns)?;
+                }
+                ground_records::validate_root_columns(root, &mut reader, &columns)?;
+            }
         }
         if let ArchivedRoot::Legacy(root) = &self.root { repository.install_legacy_root(root)?; }
         Ok(self.root.clone())

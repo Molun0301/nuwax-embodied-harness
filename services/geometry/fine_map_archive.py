@@ -49,7 +49,7 @@ def read_fine_archive_root(payload):
     if not isinstance(payload, (bytes, FrozenPayload)) or not 24 <= len(payload) <= MAX_FINE_ARCHIVE_BYTES:
         raise ValueError("精细地图资产类型或大小错误")
     magic = payload[:8]
-    if magic not in (b"NUWAXAR1", b"NUWAXAR2", b"NUWAXAR3", b"NUWAXAR4"):
+    if magic not in (b"NUWAXAR1", b"NUWAXAR2", b"NUWAXAR3", b"NUWAXAR4", b"NUWAXAR5"):
         raise ValueError("精细地图资产格式未知")
     legacy = magic == b"NUWAXAR1"
     root_offset = 48 if legacy else 16
@@ -66,14 +66,14 @@ def read_fine_archive_root(payload):
 
 def validate_fine_archive(payload, *, session=None, generation=None, cloud_revision=None,
                           source_timestamp_ns=None, frame_generation=None, producer_generation=None):
-    """读取 AR1–AR4 完整根并核对块结构和原提交；旧摘要字段仅保留为别名。"""
+    """读取 AR1–AR5 完整根并核对块结构和原提交；旧摘要字段仅保留为别名。"""
     magic, root, offset = read_fine_archive_root(payload)
     legacy = magic == b"NUWAXAR1"
     root_fields = {"version", "domain", "revision", "source_timestamp_ns", "voxel_size_m", "blocks"}
     if not legacy:
         root_fields.add("geometry_revision")
     version = int(chr(magic[-1]))
-    if version == 4 and isinstance(root, dict) and "source_watermarks" in root:
+    if version >= 4 and isinstance(root, dict) and "source_watermarks" in root:
         root_fields.add("source_watermarks")
     if not isinstance(root, dict) or set(root) != root_fields:
         raise ValueError("精细地图根字段错误")
@@ -92,7 +92,7 @@ def validate_fine_archive(payload, *, session=None, generation=None, cloud_revis
         return result
 
     integer(root["version"], version, version)
-    if version == 4:
+    if version >= 4:
         _validate_source_watermarks(root.get("source_watermarks", []), integer)
     revision = integer(root["revision"], 1, 2 ** 64 - 1)
     source_time = integer(root["source_timestamp_ns"], 1, 2 ** 64 - 1)
@@ -122,9 +122,11 @@ def validate_fine_archive(payload, *, session=None, generation=None, cloud_revis
     if struct.unpack("<Q", payload[offset:offset + 8])[0] != len(blocks):
         raise ValueError("精细地图资产块数错误")
     offset += 8
+    heightfields = {}
     previous = None
     object_points = {}
     object_offsets = {}
+    ground_bindings = {}
     reference_fields = ({"key", "sha256", "geometry_sha256", "points"} if legacy else
                         {"key", "object", "block_revision", "geometry_revision", "points"})
     for reference in blocks:
@@ -166,8 +168,9 @@ def validate_fine_archive(payload, *, session=None, generation=None, cloud_revis
         if first_offset != offset and (first_length != length or payload[first_offset:first_offset + length] != block):
             raise ValueError("精细地图同一对象身份的实际字节不一致")
         offset += length
-        sourced = version == 4 and block[:8] == b"NUWAXBL3"
-        layered = (version >= 3 and block[:8] == b"NUWAXBL2") or sourced
+        sourced = version >= 4 and block[:8] == b"NUWAXBL3"
+        versioned = version >= 5 and block[:8] == b"NUWAXBL4"
+        layered = (version >= 3 and block[:8] == b"NUWAXBL2") or sourced or versioned
         layer_length = struct.unpack("<I", block[12:16])[0]
         if (block[:8] != b"NUWAXBL1" and not layered
                 or struct.unpack("<I", block[8:12])[0] != points
@@ -183,9 +186,17 @@ def validate_fine_archive(payload, *, session=None, generation=None, cloud_revis
             _validate_vector_block_evidence(block, points, source_time)
         if layered:
             layers = json.loads(block[records_end:], object_pairs_hook=_unique_json_fields, parse_constant=_reject_nonfinite_json)
-            _validate_layer_structure(layers, integer, sourced=sourced)
+            if versioned:
+                if ground_bindings.setdefault(object_id, (key, size)) != (key, size):
+                    raise ValueError("精细地图地表对象空间绑定改变")
+                evidence = {local: stamp for local, stamp, _ in struct.iter_unpack("<HQH", memoryview(block)[16:records_end])}
+                _validate_ground_records(layers, integer, key, evidence, heightfields)
+            else:
+                _validate_layer_structure(layers, integer, sourced=sourced)
     if offset != len(payload):
         raise ValueError("精细地图资产存在尾随数据")
+    if version >= 5:
+        _validate_heightfield_columns(heightfields, size)
     return root
 
 
@@ -234,7 +245,7 @@ def _validate_layer_structure(layers, integer, *, sourced=False):
                 or any(type(v) not in (int, float) or not -1.7976931348623157e308 <= v <= 1.7976931348623157e308 for v in value)):
             fail()
 
-    if not isinstance(layers, list) or not 1 <= len(layers) <= 256:
+    if not isinstance(layers, list) or not 1 <= len(layers) <= 32768:
         fail()
     for entry in layers:
         if not isinstance(entry, list) or len(entry) != 2:
@@ -284,3 +295,109 @@ def _validate_layer_structure(layers, integer, *, sourced=False):
                     sample = samples[position]
                     integer(sample["source_timestamp_ns"], 1, 2 ** 64 - 1)
                     integer(sample["source_sequence"], 1 if source[0] == "lidar" else 0, 2 ** 64 - 1)
+
+
+def _validate_ground_records(records, integer, block_key, evidence, columns):
+    """BL4 data boundary; current root members define the declared surface."""
+    if not isinstance(records, list) or not 1 <= len(records) <= 32768:
+        raise ValueError("精细地图地表记录数量错误")
+    last, claimed = -1, set()
+    for entry in records:
+        if not isinstance(entry, list) or len(entry) != 2:
+            raise ValueError("精细地图地表记录错误")
+        local, tagged = entry
+        integer(local, 0, 32767)
+        if local <= last or not isinstance(tagged, dict) or set(tagged) != {"representation", "data"}:
+            raise ValueError("精细地图地表记录顺序或标签错误")
+        last = local
+        value = tagged["data"]
+        if tagged["representation"] == "legacy_plane":
+            _validate_layer_structure([[local, value]], integer, sourced=True)
+            members = value["members"]
+        elif tagged["representation"] == "heightfield_v1":
+            if not isinstance(value, dict) or set(value) != {"anchor", "height_m", "occupied_bounds", "members", "samples"}:
+                raise ValueError("精细地图高程片字段错误")
+            anchor, bounds, pairs, samples = (value[k] for k in ("anchor", "occupied_bounds", "members", "samples"))
+            if not isinstance(anchor, list) or len(anchor) != 3:
+                raise ValueError("精细地图高程锚错误")
+            anchor = tuple(integer(v, -(2 ** 31), 2 ** 31 - 1) for v in anchor)
+            h = value["height_m"]
+            if (type(h) not in (int, float) or not math.isfinite(h)
+                    or not isinstance(bounds, list) or len(bounds) != 2
+                    or any(type(v) not in (int, float) or not math.isfinite(v) for v in bounds)
+                    or not bounds[0] < bounds[1]
+                    or not isinstance(pairs, list) or not 1 <= len(pairs) <= 32
+                    or not isinstance(samples, list) or len(samples) > 32):
+                raise ValueError("精细地图高程片数值错误")
+            group = columns.setdefault(anchor, (h, bounds, {}))
+            if group[:2] != (h, bounds):
+                raise ValueError("精细地图高程片几何不一致")
+            members = []
+            for pair in pairs:
+                if not isinstance(pair, list) or len(pair) != 2:
+                    raise ValueError("精细地图高程成员错误")
+                member, bins = pair
+                integer(member, 0, 32767)
+                if (not isinstance(bins, list) or len(bins) != 8
+                        or any(type(v) not in (int, float) or not math.isfinite(v) or v < 0 for v in bins)):
+                    raise ValueError("精细地图高程质量错误")
+                xyz = (block_key[0] * 32 + member % 32,
+                       block_key[1] * 32 + member // 32 % 32,
+                       block_key[2] * 32 + member // 1024)
+                if xyz[:2] != anchor[:2] or xyz[2] in group[2]:
+                    raise ValueError("精细地图高程成员重叠或异列")
+                group[2][xyz[2]] = bins
+                members.append(member)
+            identities = set()
+            for sample in samples:
+                if not isinstance(sample, dict) or set(sample) != {"source", "point", "source_sequence", "source_timestamp_ns", "point_index"}:
+                    raise ValueError("精细地图高程诊断样本错误")
+                source = sample["source"]
+                source_id = (("legacy",) if source == {"kind": "legacy"}
+                             else _validate_observation_source(source, integer))
+                sequence = integer(sample["source_sequence"], 0 if source_id[0] == "auxiliary" else 1, 2 ** 64 - 1)
+                stamp = integer(sample["source_timestamp_ns"], 1, 2 ** 64 - 1)
+                index = integer(sample["point_index"], 0, 2 ** 32 - 1)
+                point = sample["point"]
+                if (not isinstance(point, list) or len(point) != 3
+                        or any(type(v) not in (int, float) or not math.isfinite(v) for v in point)
+                        or stamp > max((evidence.get(m, 0) for m in members), default=0)
+                        or (source_id, sequence, stamp, index) in identities):
+                    raise ValueError("精细地图高程诊断样本证据错误")
+                identities.add((source_id, sequence, stamp, index))
+        else:
+            raise ValueError("精细地图地表表示未知")
+        if (members[0] != local or members != sorted(set(members))
+                or any(m % 1024 != local % 1024 or m not in evidence or m in claimed for m in members)):
+            raise ValueError("精细地图地表成员归属错误")
+        claimed.update(members)
+
+
+def _validate_heightfield_columns(columns, resolution):
+    # The original Rust root stores f32 resolution. Match that value before f64
+    # moments; eight sub-bins encode statistics, not extra measurement precision.
+    q = struct.unpack("<f", struct.pack("<f", resolution))[0]
+    if q <= 0:
+        raise ValueError("精细地图分辨率错误")
+    for anchor, (declared_height, bounds, members) in columns.items():
+        ordered = sorted(members.items())
+        total = sum(mass for _, bins in ordered for mass in bins)
+        rounding = 2.220446049250313e-16 * (len(ordered) * 8 + 1)
+        if (not math.isfinite(total) or total <= 0 or abs(total - 1) > rounding
+                or anchor[2] != ordered[0][0]
+                or bounds != [ordered[0][0] * q, (ordered[-1][0] + 1) * q]):
+            raise ValueError("精细地图完整高程列质量或范围错误")
+        low, high = total * .1, total * .9
+        cumulative = moment = retained = 0.0
+        width = q / 8
+        for z, bins in ordered:
+            for i, mass in enumerate(bins):
+                end = cumulative + mass
+                keep = max(0.0, min(end, high) - max(cumulative, low))
+                centre = (z * 8 + i + .5) * width
+                moment += keep * centre
+                retained += keep
+                cumulative = end
+        height = (math.floor((moment / retained) / width) + .5) * width
+        if height != declared_height:
+            raise ValueError("精细地图完整高程列代表高度错误")

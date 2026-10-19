@@ -18,6 +18,18 @@ pub struct PhysicalSurface {
     pub bounds: [f64; 4],
 }
 
+/// Explicit diagnostic assumption for the original C observation dropout.
+/// The finite plane belongs only to the simulator world, never to its map.
+pub const MISSING_PATCH_FLAT_FLOOR: &str = "c-missing-patch-flat-floor-v1";
+pub fn declared_world_fixture(id: &str) -> Result<PhysicalSurface, String> {
+    if id != MISSING_PATCH_FLAT_FLOOR {
+        return Err(format!("unknown declared world fixture: {id}"));
+    }
+    let q = f64::from(0.05_f32);
+    Ok(PhysicalSurface { height: |_, _| 0.0,
+        bounds: [-20.0*q, 100.0*q, -20.0*q, 20.0*q] })
+}
+
 pub fn physical_surface(id: &str) -> Option<PhysicalSurface> {
     let height: fn(f64, f64) -> f64 = match id {
         "thick-undulating" | "irregular-ground" => |x, y| complex_ground_height(x, y, false),

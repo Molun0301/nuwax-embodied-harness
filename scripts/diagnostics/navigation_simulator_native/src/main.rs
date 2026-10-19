@@ -739,6 +739,27 @@ impl Scene {
             ground_evidence,
         })
     }
+    /// This changes only the diagnostic response model. The admitted map and
+    /// its observation/ground ownership remain the original captured source.
+    fn select_world_fixture(&mut self, id: &str) -> Result<(), String> {
+        let surface = scenarios::declared_world_fixture(id)?;
+        self.terrain.physical_surface = Some(surface);
+        self.metadata["world_model"] = json!("declared_physical_surface");
+        self.metadata["terrain_response"]["reference_kind"] = json!("declared_physical_surface");
+        self.metadata["terrain_response"]["physical_truth_available"] = json!(true);
+        self.metadata["terrain_response"]["domain"] = json!("declared_physical_surface_at_source_spacing");
+        self.metadata["terrain_response"]["declaration"] = json!({
+            "fixture_id": id, "frame": "map", "units": "m", "height_m": 0.0,
+            "xy_half_open_bounds_m": surface.bounds, "solids": [],
+            "basis": "new_analytic_world_assumption_not_recovered_historical_truth",
+            "observation_z_interpretation": "synthetic_observation_perturbation",
+            "navigation_input": "unchanged_capture_publication",
+            "outside_domain": "unsupported_world_response",
+            "bounds_semantics": "response_query_center_and_clipped_samples_not_full_footprint_support",
+            "initial_orientation": "existing_world_initialization_then_existing_explicit_override"
+        });
+        Ok(())
+    }
     fn change_obstacles(&mut self, values: Vec<Value>) -> Result<(), String> {
         if values == self.obstacles {
             return Ok(());
@@ -1243,6 +1264,19 @@ fn synthetic(blocked: bool) -> Vec<(f32, f32, f32)> {
     }
     points
 }
+/// Only the captured-source diagnostic lane accepts a world declaration.
+/// An absent option preserves its historical raw-point response model.
+fn captured_world_fixture(args: &[String]) -> Result<Option<&str>, String> {
+    match args {
+        [] => Ok(None),
+        [flag, id] if flag == "--world-fixture" => {
+            scenarios::declared_world_fixture(id)?;
+            Ok(Some(id))
+        }
+        _ => Err("expected --world-fixture <fixed-fixture-name> after captured-source inputs".into()),
+    }
+}
+
 fn run() -> Result<(), String> {
     nuwax_core::logging::init_component_logging("nuwax-navigation-simulator", "info");
     unsafe {
@@ -1254,6 +1288,7 @@ fn run() -> Result<(), String> {
     let config = SurfaceNavigationConfig::from_env().map_err(|e| e.to_string())?;
     let mut scenes = HashMap::new();
     let catalog = if args.get(2).is_some_and(|arg|arg=="--captured-source") {
+        let world_fixture = captured_world_fixture(args.get(6..).unwrap_or_default())?;
         let artifact=PathBuf::from(args.get(3).ok_or("capture artifact directory required")?);
         let cloud=args.get(4).ok_or("original point file required")?;
         let trajectory=args.get(5).ok_or("original poses required")?;
@@ -1274,6 +1309,7 @@ fn run() -> Result<(), String> {
             false,GroundEvidence::MeasuredSurface,&data,Some(captured))?;
         scene.metadata["planning_input"]=json!("actual_capture_publication_receiver");
         scene.metadata["capture_input"]=input;
+        if let Some(id) = world_fixture { scene.select_world_fixture(id)?; }
         let catalog=json!({"scenes":[scene.metadata],"default_scene":"recorded"});
         scenes.insert("recorded".into(),scene);
         catalog
@@ -1601,6 +1637,62 @@ mod tests {
             0.05,
             [0.15, 0.15],
         )
+    }
+
+    #[test]
+    fn missing_patch_world_fixture_selection_is_explicit() {
+        assert!(captured_world_fixture(&[]).unwrap().is_none());
+        let args = vec!["--world-fixture".into(), scenarios::MISSING_PATCH_FLAT_FLOOR.into()];
+        assert_eq!(captured_world_fixture(&args).unwrap(), Some(scenarios::MISSING_PATCH_FLAT_FLOOR));
+        for args in [vec!["--world-fixture".into()],
+            vec!["--world-fixture".into(), "missing_patch".into()],
+            vec!["--world-fixture".into(), "".into()],
+            vec!["--other".into(), scenarios::MISSING_PATCH_FLAT_FLOOR.into()]] {
+            assert!(captured_world_fixture(&args).is_err());
+        }
+        assert!(scenarios::physical_surface("recorded").is_none());
+        assert!(scenarios::physical_surface("missing_patch").is_none());
+    }
+
+    #[test]
+    fn missing_patch_declared_world_is_finite_and_preserves_raw_failure() {
+        // A fixed collinear raw input has no two-dimensional support solution.
+        let points: Vec<_> = (-8..=8).map(|y| (0.025, y as f32 * 0.025, 0.0)).collect();
+        let mut terrain = test_terrain(&points, false);
+        let raw_columns = terrain.columns.clone();
+        let q = f64::from(0.05_f32);
+        assert_eq!(terrain.response_at([0.5*q,0.0],0.0,0.0,0.4).unwrap_err(),
+            "模拟地面采样共线，无法确定支撑平面");
+        let surface = scenarios::declared_world_fixture(scenarios::MISSING_PATCH_FLAT_FLOOR).unwrap();
+        terrain.physical_surface = Some(surface);
+        assert!(!terrain.flat);
+        assert_eq!(surface.bounds, [-20.0*q,100.0*q,-20.0*q,20.0*q]);
+        for xy in [[0.0,0.0],[1.9,0.0],[4.0,0.0],[-20.0*q,0.0],[0.0,-20.0*q]] {
+            assert_eq!(terrain.response_at(xy,0.2,0.0,0.4).unwrap(),
+                ([xy[0],xy[1],0.4],quaternion(0.0,0.0,0.0)));
+        }
+        for xy in [[100.0*q,0.0],[0.0,20.0*q],[-21.0*q,0.0],[0.0,-21.0*q]] {
+            assert_eq!(terrain.response_at(xy,0.0,0.0,0.4).unwrap_err(),
+                "模拟机体已越出声明的物理地面范围");
+        }
+        assert_eq!(terrain.columns,raw_columns);
+        terrain.physical_surface = None;
+        assert_eq!(terrain.response_at([0.5*q,0.0],0.0,0.0,0.4).unwrap_err(),
+            "模拟地面采样共线，无法确定支撑平面");
+    }
+
+    #[test]
+    fn missing_patch_world_response_preserves_actual_pose_bias() {
+        let mut terrain = test_terrain(&[], false);
+        terrain.physical_surface = Some(scenarios::declared_world_fixture(
+            scenarios::MISSING_PATCH_FLAT_FLOOR).unwrap());
+        let current = ([1.8,0.0,0.47],quaternion(0.1,-0.05,0.0));
+        let planar = ([1.9,0.0,0.47],current.1);
+        let before = terrain.response_at([1.8,0.0],0.07,0.0,0.4).unwrap();
+        let after = terrain.response_at([1.9,0.0],0.07,0.0,0.4).unwrap();
+        let next = body_after_ground_change(current,planar,before,after,0.4);
+        assert_eq!(next,planar,"the declared plane must not snap actual height or tilt to a prediction");
+        assert!(terrain.columns.is_empty(),"world samples never populate observed columns");
     }
 
     #[test]

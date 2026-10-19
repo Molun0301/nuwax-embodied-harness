@@ -6,35 +6,28 @@
   <title>NEH · Nuwax Embodied Harness 机器人控制台</title>
   <meta name="description" content="Nuwax Embodied Harness（NEH，具身运行框架）：机器人地图、感知、空间记忆与任务控制台。">
   <link rel="icon" href="/static/neh-icon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/static/console.css?v=20261001-updates">
+  <link rel="stylesheet" href="/static/console.css?v=20261019-redesign3">
 </head>
 <body>
 <div class="app" id="app">
   <header class="vitals card">
     <div class="brand">
-      <span class="dot"></span>
-      <div><div class="nm" title="Nuwax Embodied Harness（NEH，具身运行框架）">NEH 机器人控制台<button id="updateNewBadge" class="update-new-badge" type="button" title="发现新版本，打开更新设置" hidden>New！</button></div><div class="md"><span id="robotName">机器人未连接</span> · <span id="robotModel">型号 --</span></div></div>
+      <img class="brand-mark" src="/static/neh-icon.svg" alt="" width="26" height="26">
+      <div><div class="nm" title="Nuwax Embodied Harness（NEH，具身运行框架）">NEH 机器人控制台<button id="updateNewBadge" class="update-new-badge" type="button" title="发现新版本，打开更新设置" hidden>New!</button></div><div class="md"><span id="robotName">机器人未连接</span> · <span id="robotModel">型号 --</span></div></div>
     </div>
-    <a href="/" class="console-nav-link" id="deviceManagerLink" title="返回设备管理" hidden>
-      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12h18M3 12l6-6m-6 6 6 6"/></svg>
-      <span>管理</span>
-    </a>
     <div class="vstats">
-      <div class="vstat"><div class="v" id="connectionText">缺失</div><div class="l">网关</div></div>
       <div class="vstat"><div class="v" id="runtimeMode">--</div><div class="l">运行模式</div></div>
       <div class="vstat"><div class="v" id="batteryMetric">--</div><div class="l">电池</div></div>
       <div class="vstat"><div class="v mono" id="networkLatency">--</div><div class="l">CPU</div></div>
-      <div class="vstat"><div class="v mono" id="resourceMetric">--</div><div class="l">运存</div></div>
-      <div class="vstat"><div class="v mono" id="clockNow">--:--:--</div><div class="l">时间</div></div>
-      <div class="vstat" title="主实时连接一次探测的往返耗时，包含浏览器与服务端调度、发送排队及网络；使用浏览器单调时钟，不使用历史日志或传感器时间。等待回执时显示已等待时长。"><div class="v mono" id="lastReceive">--</div><div class="l">连接往返</div></div>
+      <div class="vstat"><div class="v mono" id="resourceMetric">--</div><div class="l">内存</div></div>
+      <div class="vstat" title="浏览器与网关实时连接的一次往返耗时；尚未收到回应时显示已等待的时间。"><div class="v mono" id="lastReceive">--</div><div class="l">连接往返</div></div>
     </div>
-    <span class="pill idle" id="motionStatus">运动状态</span>
     <div class="seg">
       <button class="view-switch-btn active" id="viewSwitchMonitor" type="button" data-view-target="monitor-view">监控</button>
       <button class="view-switch-btn" id="viewSwitchLogs" type="button" data-view-target="logs-view">日志</button>
       <button class="view-switch-btn" id="viewSwitchConfig" type="button" data-view-target="config-view">设置</button>
     </div>
-    <button id="themeToggle" type="button" title="切换主题" aria-label="切换亮色或暗色主题">🌙</button>
+    <button id="themeToggle" type="button" title="切换主题" aria-label="切换亮色或暗色主题"><svg class="theme-icon theme-icon-light" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2.5v2M12 19.5v2M4.6 4.6l1.4 1.4M18 18l1.4 1.4M2.5 12h2M19.5 12h2M4.6 19.4 6 18M18 6l1.4-1.4"/></svg><svg class="theme-icon theme-icon-dark" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5Z"/></svg></button>
   </header>
   <div id="view-host">
     <div id="monitor-view" class="view-pane active">
@@ -66,7 +59,7 @@
                 </div>
                 <button id="mapCenterRobot" class="tool map-locate-button" type="button" title="定位机器人：把机器人移到画面中心" aria-label="定位机器人" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="6.5"/><circle cx="12" cy="12" r="2"/><path d="M12 2v3.5M12 18.5V22M2 12h3.5M18.5 12H22"/></svg></button>
               </div>
-              <span id="mapStatus" class="pill missing">缺失</span><button id="mediaSwapBtn" class="tool media-swap" type="button" title="地图 / 视频 互换位置与大小（遥控时放大视频）">⇄ <span>视频</span></button></div>
+              <span id="mapStatus" class="pill missing">地图：缺失</span><button id="mediaSwapBtn" class="btn btn-sm media-swap" type="button" title="地图 / 视频 互换位置与大小（遥控时放大视频）"><svg class="btn-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8h13l-3.5-3.5M20 16H7l3.5 3.5"/></svg><span data-swap-label>视频</span></button></div>
             </header>
 
             <div class="canvas-wrap">
@@ -89,7 +82,7 @@
                             <span class="sw" aria-hidden="true"></span>
                             <select id="map3dPointStyle" aria-label="3D 点云显示样式">
                               <option value="height" selected>高度</option>
-                              <option value="full" title="分块加载全部有效扫描点，保留原坐标，不受点云间隔和显示精度影响">完整点云</option>
+                              <option value="full" title="加载全部原始扫描点，不受点云显示间隔影响">完整点云</option>
                               <option value="singleFloor">单层</option>
                               <option value="ground">地面</option>
                               <option value="structure">结构</option>
@@ -115,7 +108,7 @@
                         <label class="msb-check" title="本次识别采用符合门槛的标签"><input id="semanticRegionApply" type="checkbox">采用达标标签</label>
                       </div>
                     </div>
-                    <p class="msb-status"><span id="semanticRegionStatus" class="map-semantic-status" role="status">点选区域查看名称与证据。</span><span class="msb-note">区域用于空间理解；通行状态以导航检查为准。</span></p>
+                    <p class="msb-status"><span id="semanticRegionStatus" class="map-semantic-status" role="status">点选区域查看名称与证据。</span><span class="msb-note">区域只表示空间划分，能否通行以导航检查为准。</span></p>
                   </div>
                   <button id="semanticRegionClose" class="msb-close" type="button" aria-label="收起区域" title="收起（Esc）"><svg class="map-close-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8"/></svg></button>
                 </section>
@@ -131,7 +124,7 @@
                       </div>
                       <span id="sceneGraphSummary" class="msb-meta"></span>
                     </div>
-                    <p class="msb-status"><span id="sceneGraphStatus" class="map-semantic-status" role="status">正在读取区域与连接…</span><span class="msb-note">连接线表示空间关系，路径仍需导航检查。</span></p>
+                    <p class="msb-status"><span id="sceneGraphStatus" class="map-semantic-status" role="status">正在读取区域与连接…</span><span class="msb-note">连线表示区域相邻或相通，实际路线以导航检查为准。</span></p>
                   </div>
                   <button id="sceneGraphClose" class="msb-close" type="button" aria-label="收起关系图" title="收起（Esc）"><svg class="map-close-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8"/></svg></button>
                 </section>
@@ -144,7 +137,7 @@
                       <div id="semanticMemoryList" class="msb-chips semantic-memory-list" aria-label="记忆物品列表"></div>
                       <button id="semanticInstancesRefresh" class="msb-btn" type="button" title="手动刷新当前记忆库物品标记">刷新物品</button>
                     </div>
-                    <p class="msb-status"><span id="semanticMemoryStatus" class="semantic-memory-status" role="status">正在读取当前记忆库…</span><span id="semanticMemorySummary" class="msb-meta"></span><span class="msb-note">地图只显示有空间依据的物体位置；观察记录表示曾在此处见过物品。</span></p>
+                    <p class="msb-status"><span id="semanticMemoryStatus" class="semantic-memory-status" role="status">正在读取当前记忆库…</span><span id="semanticMemorySummary" class="msb-meta"></span><span class="msb-note">地图只标出有位置依据的物品；“仅观察”表示在附近见过，位置不精确。</span></p>
                   </div>
                   <button id="semanticMemoryClose" class="msb-close" type="button" aria-label="收起物品" title="收起（Esc）"><svg class="map-close-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8"/></svg></button>
                 </section>
@@ -274,39 +267,48 @@
                   <aside id="sceneGraphDetail" class="map-scene-graph-detail" aria-label="节点详情"><p class="muted">选择节点查看位置、连接和观察证据。</p></aside>
                 </div>
               </div>
-              <details class="glass legend" id="mapLegend">
-                <summary class="legend-toggle" title="收纳或展开地图图例"><span class="legend-arrow" aria-hidden="true">‹</span><span>图例</span></summary>
-                <div class="lgnd legend-items">
-                  <span id="semanticRegionLegend" class="lg" hidden><span class="sw" style="background:var(--info)"></span>语义区域 · 编号对应列表</span>
-                  <span class="lg"><span class="sw" style="background:var(--grid-free)"></span>可通行</span>
-                  <span class="lg"><span class="sw" style="background:var(--grid-occ)"></span>占据</span>
-                  <span class="lg"><span class="sw" style="background:#b2a0f8"></span>轨迹</span>
-                  <span class="lg"><span class="sw" style="background:#a5e27e"></span>全局路线</span>
-                  <span class="lg"><span class="sw" style="background:#69dedc"></span>局部路线</span>
-                  <span class="lg"><span class="sw" style="background:var(--robot)"></span><span id="robotGeometryLegend">机器人</span></span>
-                  <span class="lg"><span class="sw" style="background:var(--frontier)"></span>前沿</span>
-                  <span class="lg"><span class="sw" style="background:var(--goal)"></span>目标</span>
-                  <span id="mapCameraHint" class="lg" hidden>自由视角：拖拽平移 · 滚轮缩放 · 复位适配完整地图</span>
-                  <span class="lg"><span class="sw" style="background:#f59e0b"></span>物品</span>
-                </div>
-              </details>
+              <!-- 图例与状态同处底部：宽屏左右分列，窄屏上下堆叠，避免互相遮挡。 -->
               <div class="map-bottom-bar">
-                <div id="mapPoseHud" class="map-pose-hud glass" aria-live="polite" aria-label="机器人位姿">
-                  <span id="mapPoseState" class="map-pose-state" data-state="missing">未定位</span>
-                  <div id="mapPoseMeta" class="map-pose-meta"></div>
-                  <span class="map-tool-separator" aria-hidden="true"></span>
-                  <span id="mapStreamStatus" class="map-stream-chip" title="地图内容更新帧率与当前显示位姿的源时间至绘制时间">-- FPS · 位姿延迟 --</span>
-                </div>
+                <details class="glass legend" id="mapLegend">
+                  <summary class="legend-toggle" title="收纳或展开地图图例"><span class="legend-arrow" aria-hidden="true">‹</span><span>图例</span></summary>
+                  <div class="lgnd legend-items">
+                    <span id="semanticRegionLegend" class="lg" hidden><span class="sw" style="background:var(--info)"></span>语义区域 · 编号对应列表</span>
+                    <span class="lg"><span class="sw" style="background:var(--grid-free)"></span>可通行</span>
+                    <span class="lg"><span class="sw" style="background:var(--grid-occ)"></span>占据</span>
+                    <span class="lg"><span class="sw" style="background:#b2a0f8"></span>轨迹</span>
+                    <span class="lg"><span class="sw" style="background:#a5e27e"></span>全局路线</span>
+                    <span class="lg"><span class="sw" style="background:#69dedc"></span>局部路线</span>
+                    <span class="lg"><span class="sw" style="background:var(--robot)"></span><span id="robotGeometryLegend">机器人</span></span>
+                    <span class="lg"><span class="sw" style="background:var(--frontier)"></span>前沿</span>
+                    <span class="lg"><span class="sw" style="background:var(--goal)"></span>目标</span>
+                    <span id="mapCameraHint" class="lg" hidden>自由视角：拖拽平移 · 滚轮缩放 · 复位适配完整地图</span>
+                    <span class="lg"><span class="sw" style="background:#f59e0b"></span>物品</span>
+                  </div>
+                </details>
+                <details class="glass map-status-dock" id="mapStatusDock" open>
+                  <summary class="map-status-toggle" title="收起或展开地图状态"><span class="map-status-arrow" aria-hidden="true">‹</span><span>状态</span></summary>
+                  <div class="map-status-body">
+                    <div class="map-status-line"><div id="mapMeta" class="kv map-summary-kv"></div></div>
+                    <div class="map-status-line">
+                      <div id="mapPoseHud" class="map-pose-hud" aria-live="polite" aria-label="机器人位姿">
+                        <span id="mapPoseState" class="map-pose-state" data-state="missing">未定位</span>
+                        <div id="mapPoseMeta" class="map-pose-meta"></div>
+                        <span class="map-tool-separator" aria-hidden="true"></span>
+                        <span id="mapStreamStatus" class="map-stream-chip" title="地图内容帧率与位姿延迟">-- FPS · 位姿延迟 --</span>
+                      </div>
+                    </div>
+                  </div>
+                </details>
               </div>
               <div id="mapEmpty" class="empty">等待地图数据。</div>
             </div>
           </section>
           <section id="video-perception" class="card panel rise" style="animation-delay:.05s">
-            <div class="ph">
-              <div class="t"><div class="eyebrow">视觉感知</div><h2>摄像头与识别</h2></div>
+            <div class="ph panel-bar">
+              <div class="panel-bar-title"><h2>摄像头与识别</h2><span id="videoStatus" class="pill missing">缺失</span></div>
               <div class="panel-actions">
-                <button id="mediaSwapBtnVideo" class="media-swap" type="button" title="地图 / 视频 互换位置与大小">⇄ 放大</button>
-                <span id="videoStatus" class="pill missing">缺失</span>
+                <label class="chip-toggle" title="在画面上叠加检测框"><input id="showDetections" type="checkbox" checked><span>检测框</span></label>
+                <button id="mediaSwapBtnVideo" class="btn btn-sm media-swap" type="button" title="地图 / 视频 互换位置与大小"><svg class="btn-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8h13l-3.5-3.5M20 16H7l3.5 3.5"/></svg><span data-swap-label>放大</span></button>
               </div>
             </div>
             <div class="vision-content">
@@ -319,40 +321,28 @@
                     <span id="videoFpsStatus" class="ovchip glass" title="画面帧率与最新帧延迟">-- FPS · 延迟 --</span>
                   </div>
                 </div>
-                <div id="videoEmpty" class="empty panel-meta">等待摄像头数据。</div>
+                <div id="videoEmpty" class="empty">等待摄像头数据。</div>
               </div>
               <div class="vision-information">
                 <div class="vision-status-row">
                   <div id="visionLabels" class="vision-labels" aria-label="已识别目标"></div>
-                  <label><input id="showDetections" type="checkbox" checked>显示检测框</label>
                 </div>
               </div>
             </div>
           </section>
-          <section class="card panel rise merged-rail recent-logs-panel" style="animation-delay:.1s">
-            <div class="ph">
-              <div class="t"><div class="eyebrow">运行记录</div><h2>最近日志</h2></div>
-              <div class="panel-actions"><button class="btn" type="button" data-open-view="logs-view">查看全部</button><span id="logsStatus" class="pill missing">等待</span></div>
+          <section id="rail-tabs" class="card panel rise merged-rail rail-tabs" style="animation-delay:.1s">
+            <div class="rail-tabbar" role="tablist" aria-label="运行信息">
+              <button class="rail-tab" type="button" role="tab" data-rail-tab="recent" aria-selected="true" aria-controls="rail-pane-recent" id="rail-tab-recent">最近日志</button>
+              <button class="rail-tab" type="button" role="tab" data-rail-tab="task" aria-selected="false" aria-controls="rail-pane-task" id="rail-tab-task">任务状态</button>
+              <button class="rail-tab" type="button" role="tab" data-rail-tab="service" aria-selected="false" aria-controls="rail-pane-service" id="rail-tab-service">服务状态</button>
             </div>
-            <div class="dscroll"><div id="recentLogs" class="recent-logs"><p class="muted small">暂无运行日志。</p></div></div>
-          </section>
-          <section class="dock card rise" style="animation-delay:.2s">
-            <div class="dcol">
-              <div class="dh"><div class="t"><div class="eyebrow">地图信息</div><h3>地图摘要</h3></div><span id="mapSummaryMode" class="mchip">2D 栅格</span></div>
-              <div class="dscroll"><div id="mapMeta" class="kv"></div></div>
+            <div id="rail-pane-recent" class="rail-pane is-active" role="tabpanel" data-rail-pane="recent" aria-labelledby="rail-tab-recent">
+              <div class="dscroll"><div id="recentLogs" class="recent-logs"><p class="muted small">暂无运行日志。</p></div></div>
             </div>
-            <div class="dcol">
-              <div class="dh"><div class="t"><div class="eyebrow">运行进程</div><h3>进程矩阵</h3></div><span id="servicesStatus" class="pill missing">缺失</span></div>
-              <div class="dscroll"><div id="serviceMatrix" class="rows"></div></div>
+            <div id="rail-pane-task" class="rail-pane" role="tabpanel" data-rail-pane="task" aria-labelledby="rail-tab-task">
+              <div class="dscroll"><div id="taskSummary" class="rows"></div></div>
             </div>
-            <div class="dcol">
-              <div class="dh"><div class="t"><div class="eyebrow">任务执行</div><h3>任务状态</h3></div><span id="taskStatus" class="pill missing">缺失</span></div>
-              <div class="dscroll">
-                <div id="taskSummary" class="rows"></div>
-              </div>
-            </div>
-            <div class="dcol">
-              <div class="dh"><div class="t"><div class="eyebrow">平台服务</div><h3>服务状态</h3></div><span id="governanceStatus" class="pill missing">缺失</span></div>
+            <div id="rail-pane-service" class="rail-pane" role="tabpanel" data-rail-pane="service" aria-labelledby="rail-tab-service">
               <div class="dscroll"><div id="governanceMeta" class="service-health-list"></div></div>
             </div>
           </section>
@@ -361,9 +351,9 @@
       <div class="overview-hidden"><section id="overviewGrid" aria-hidden="true"></section></div>
     </div>
     <div id="logs-view" class="view-pane">
-      <section class="card log-workspace" aria-label="结构化运行日志">
-        <header class="log-heading">
-          <div><div class="eyebrow">系统运行记录</div><h2>运行日志</h2><p>按组件、请求或任务追踪运行过程，展开记录查看完整字段与异常。</p></div>
+      <section class="card log-workspace rise" aria-label="结构化运行日志">
+        <header class="page-head log-heading">
+          <div class="page-title"><h2>运行日志</h2><span class="page-desc">按组件、请求或任务追踪运行过程，展开记录查看完整字段与异常。</span></div>
           <div class="log-summary-stats"><span id="logCount">0 条记录</span><span id="logErrorCount">0 条错误</span><span id="logPending" aria-live="polite"></span></div>
         </header>
         <div class="log-filter-grid">
@@ -389,61 +379,101 @@
       </section>
     </div>
     <div id="config-view" class="view-pane">
-      <section id="config-section" class="card cfg rise">
-        <nav class="cfg-nav" id="configNav"><div class="hd eyebrow">设置分类</div></nav>
-        <div class="cfg-main">
-          <div class="card-head config-heading">
-            <div class="t"><div class="eyebrow">配置管理</div><h2>平台设置</h2></div>
-            <span id="configStatus" class="pill missing">缺失</span>
+      <section id="config-section" class="card cfg rise" data-cfg-pane="config" data-help="hover">
+        <aside class="cfg-side" aria-label="设置导航">
+          <nav class="cfg-nav" id="configNav"><div class="hd eyebrow">设置分类</div></nav>
+          <div class="cfg-side-foot">
+            <button id="updatePaneToggle" class="cfg-side-link" type="button" aria-controls="updatePane" aria-current="false">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v10m0 0-4-4m4 4 4-4M5 19h14"/></svg>
+              <span>软件更新</span><span id="updatePaneDot" class="cfg-side-dot" title="发现新版本" hidden></span>
+            </button>
+            <a href="/" class="cfg-side-link console-nav-link" id="deviceManagerLink" title="返回设备管理" hidden>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12h18M3 12l6-6m-6 6 6 6"/></svg>
+              <span>设备管理</span>
+            </a>
           </div>
-          <section id="updatePanel" class="update-panel" aria-label="软件更新">
-            <div class="update-heading"><h3>软件更新</h3><span id="updateVersion" class="mono small">正在读取版本…</span></div>
-            <p id="updateMessage" role="status" aria-live="polite">正在读取更新状态…</p>
-            <p id="updateCheckedAt" class="muted small"></p>
-            <p id="updateUnavailable" class="muted small"></p>
-            <div class="update-controls">
-              <button id="updateCheck" class="btn" type="button">检查更新</button>
-              <button id="updateInstall" class="btn primary" type="button" disabled>更新并重启</button>
-              <label><input id="updateAutoCheck" type="checkbox">自动检查</label>
-              <label><input id="updateAutoInstall" type="checkbox">空闲时自动安装</label>
-              <label>间隔（分钟）<input id="updateInterval" class="field" type="number" min="15" max="1440" value="60"></label>
-              <button id="updateSave" class="btn" type="button">保存更新设置</button>
+        </aside>
+        <div class="cfg-main">
+          <!-- 页头一行：左侧标题与正在编辑的方案，右侧筛选列表；底部操作栏提交改动。 -->
+          <header class="page-head config-heading">
+            <div class="config-heading-main">
+              <h2>平台设置</h2>
+              <div class="config-profile-toolbar" role="group" aria-label="正在编辑的配置方案">
+                <label>机器人<select id="configRobotSelect" class="field" aria-label="配置所属机器人"></select></label>
+                <label>方案<select id="configProfileSelect" class="field" aria-label="机器人配置方案"></select></label>
+                <span id="configProfileStatus" class="config-profile-status"></span>
+                <button id="configProfileApply" class="btn" type="button" title="把所选方案设为运行时使用的方案">设为运行方案</button>
+              </div>
             </div>
-            <p class="muted small">默认每小时检测当前分支的远端版本；自动安装需手动开启。更新会暂停服务，设备须停稳并停用电机。保留配置、地图、模型及恢复环境，只清理受管构建缓存。</p>
+            <div class="config-toolbar" role="group" aria-label="设置列表">
+              <input id="configSearch" class="field" type="search" placeholder="搜索中文名称、键名或说明" aria-label="搜索配置">
+              <label class="chip-toggle" title="勾选后每项说明铺开显示，否则悬停名称查看"><input id="configHelpMode" type="checkbox"><span>展开说明</span></label>
+              <label class="chip-toggle" title="勾选后展开各分类中的高级项"><input id="configShowAdvanced" type="checkbox"><span>展开高级项</span></label>
+              <button id="configReload" class="btn btn-quiet" type="button" title="重新读取已保存的设置，未保存的输入会保留"><svg class="btn-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7"/></svg><span>刷新</span></button>
+            </div>
+          </header>
+          <div id="configSections" class="config-sections"></div>
+          <footer class="config-actionbar" aria-label="保存与生效">
+            <div class="config-actionbar-status">
+              <div class="config-actionbar-line"><span id="configStatus" class="pill missing">缺失</span><span id="configDirty" class="config-dirty"></span></div>
+              <div class="config-actionbar-meta"><span id="configEffectNote"></span><span id="configStoragePath" class="config-storage-path"></span></div>
+            </div>
+            <div class="config-actionbar-actions">
+              <button id="configSaveAsOpen" class="btn" type="button" title="把当前已保存的方案复制为新方案">另存为新方案…</button>
+              <button id="configRestartPending" class="btn" type="button">重启待生效项</button>
+              <button id="configSave" class="btn primary" type="button">保存改动</button>
+            </div>
+          </footer>
+          <dialog id="configSaveAsDialog" class="config-apply-dialog" aria-labelledby="configSaveAsTitle">
+            <h3 id="configSaveAsTitle">另存为新方案</h3>
+            <p class="muted small">复制当前方案已保存的设置；请先保存或撤销未保存的改动。</p>
+            <label class="dialog-field">方案名称<input id="configProfileName" class="field" maxlength="64" placeholder="例如 室外巡检" aria-label="新配置方案名称" required></label>
+            <div class="dialog-actions">
+              <button id="configSaveAsCancel" class="btn" type="button">取消</button>
+              <button id="configProfileSaveAs" class="btn primary" type="button">另存</button>
+            </div>
+          </dialog>
+          <dialog id="configApplyDialog" class="config-apply-dialog">
+            <h3>配置已保存</h3>
+            <p id="configApplyMessage"></p>
+            <p class="muted small">重启会中断正在运行的任务和连接，请在机器人停止后执行。</p>
+            <div class="dialog-actions">
+              <button id="configRestartLater" class="btn" type="button">稍后重启</button>
+              <button id="configRestartNow" class="btn primary" type="button">立即重启相关进程</button>
+            </div>
+          </dialog>
+        </div>
+        <div id="updatePane" class="cfg-update" aria-label="软件更新">
+          <header class="page-head">
+            <div class="page-title"><h2>软件更新</h2></div>
+            <span id="updateVersion" class="mono update-version">正在读取版本…</span>
+          </header>
+          <section id="updatePanel" class="update-panel">
+            <div class="update-block">
+              <p id="updateMessage" class="update-message" role="status" aria-live="polite">正在读取更新状态…</p>
+              <p id="updateCheckedAt" class="update-meta"></p>
+              <div class="update-controls">
+                <button id="updateCheck" class="btn" type="button">检查更新</button>
+                <button id="updateInstall" class="btn primary" type="button" disabled>更新并重启</button>
+              </div>
+              <p id="updateUnavailable" class="update-reason"></p>
+            </div>
+            <div class="update-block">
+              <h3>自动更新</h3>
+              <div class="update-controls">
+                <label class="chip-toggle"><input id="updateAutoCheck" type="checkbox"><span>自动检查</span></label>
+                <label class="chip-toggle"><input id="updateAutoInstall" type="checkbox"><span>空闲时自动安装</span></label>
+                <label class="update-interval">间隔（分钟）<input id="updateInterval" class="field" type="number" min="15" max="1440" value="60"></label>
+                <button id="updateSave" class="btn" type="button">保存更新设置</button>
+              </div>
+              <p class="update-meta">默认每小时检测当前分支的远端版本；自动安装需手动开启。更新会暂停服务，设备须停稳并停用电机。保留配置、地图、模型及恢复环境，只清理受管构建缓存。</p>
+            </div>
           </section>
           <dialog id="updateDialog" class="config-apply-dialog">
             <h3>确认更新并重启</h3>
             <p>将拉取版本 <span id="updateConfirmVersion" class="mono"></span>，编译已安装模块并重新部署。期间页面会暂时断开，后台任务不因关闭页面而取消。</p>
             <p>请先完成或取消任务，停稳机器人并停用电机。构建或启动失败会尝试恢复旧版本，恢复结果可在此查看。</p>
-            <div class="update-controls"><button id="updateCancel" class="btn" type="button">取消</button><button id="updateConfirm" class="btn primary" type="button">确认更新</button></div>
-          </dialog>
-          <div class="config-toolbar">
-            <input id="configSearch" class="field" type="search" placeholder="搜索中文名称、键名或说明" aria-label="搜索配置">
-            <label class="small muted config-option"><input id="configShowAdvanced" type="checkbox">展开高级项</label>
-            <button id="configReload" class="btn" type="button">刷新设置</button>
-            <button id="configSave" class="btn primary" type="button">保存改动</button>
-          </div>
-          <div class="config-profile-toolbar">
-            <label>机器人 <select id="configRobotSelect" class="field" aria-label="配置所属机器人"></select></label>
-            <label>配置方案 <select id="configProfileSelect" class="field" aria-label="机器人配置方案"></select></label>
-            <button id="configProfileApply" class="btn" type="button">应用所选方案</button>
-            <label>另存为 <input id="configProfileName" class="field" maxlength="64" placeholder="新方案名称" aria-label="新配置方案名称"></label>
-            <button id="configProfileSaveAs" class="btn" type="button">另存方案</button>
-            <button id="configRestartPending" class="btn" type="button">重启待生效项</button>
-          </div>
-          <div id="configProfileStatus" class="muted small config-note"></div>
-          <div id="configEffectNote" class="muted small config-note">可热加载项保存后立即应用；其它参数可选择立即或稍后重启。</div>
-          <div id="configStoragePath" class="muted small config-storage-path"></div>
-          <div id="configDirty" class="muted small config-note"></div>
-          <div id="configSections" class="config-sections"></div>
-          <dialog id="configApplyDialog" class="config-apply-dialog">
-            <h3>配置已保存</h3>
-            <p id="configApplyMessage"></p>
-            <p class="muted small">重启会中断正在运行的任务和连接，请在机器人停止后执行。</p>
-            <div class="config-profile-toolbar">
-              <button id="configRestartNow" class="btn primary" type="button">立即重启相关进程</button>
-              <button id="configRestartLater" class="btn" type="button">稍后重启</button>
-            </div>
+            <div class="dialog-actions"><button id="updateCancel" class="btn" type="button">取消</button><button id="updateConfirm" class="btn primary" type="button">确认更新</button></div>
           </dialog>
         </div>
       </section>
@@ -455,10 +485,10 @@
   <script src="/static/js/task-feedback.js?v=20260930"></script>
   <script src="/static/js/console-logs.js?v=20260930-task-feedback"></script>
   <script src="/static/js/console-updates.js?v=20261001"></script>
-  <script src="/static/js/console-settings.js?v=20261004-local-planning"></script>
+  <script src="/static/js/console-settings.js?v=20261019-reload"></script>
   <script src="/static/js/map-workspace.js?v=20260923-map-subbar-overlay"></script>
-  <script src="/static/js/console.js?v=20261015-object-labels"></script>
-  <script src="/static/js/semantic-map.js?v=20260924-semantic-asset-binding"></script>
+  <script src="/static/js/console.js?v=20261019-redesign3"></script>
+  <script src="/static/js/semantic-map.js?v=20261018-count-empty"></script>
   <script src="/static/js/scene-graph.js?v=20260924-semantic-asset-binding"></script>
   <script>
     window.__NUWAX_ROBOT_GEOMETRY__ = "__ROBOT_GEOMETRY__";
@@ -580,6 +610,87 @@
         })
         .catch(function () {})
         .finally(function () { clearTimeout(timeout); });
+    })();
+  </script>
+  <script>
+    // 另存为新方案：对话框只负责收集名称，实际创建沿用设置脚本的“另存”按钮处理。
+    (function () {
+      var dialog = document.getElementById('configSaveAsDialog');
+      var open = document.getElementById('configSaveAsOpen');
+      var name = document.getElementById('configProfileName');
+      var confirm = document.getElementById('configProfileSaveAs');
+      var cancel = document.getElementById('configSaveAsCancel');
+      if (!dialog || !open || !name || !confirm) return;
+      open.addEventListener('click', function () { dialog.showModal(); name.focus(); });
+      cancel.addEventListener('click', function () { dialog.close(); });
+      name.addEventListener('keydown', function (event) {
+        if (event.key === 'Enter') { event.preventDefault(); confirm.click(); }
+      });
+      // 捕获阶段先检查名称，空名称不交给设置脚本，避免底部再出现一条报错。
+      dialog.addEventListener('click', function (event) {
+        if (event.target !== confirm || name.value.trim()) return;
+        event.stopPropagation();
+        name.value = '';
+        name.reportValidity();
+      }, true);
+      confirm.addEventListener('click', function () { if (name.value.trim()) dialog.close(); });
+    })();
+  </script>
+  <script>
+    // 设置页分两块：配置分类与软件更新。软件更新是固定入口，不随配置分类重建。
+    (function () {
+      var root = document.getElementById('config-section');
+      var nav = document.getElementById('configNav');
+      var entry = document.getElementById('updatePaneToggle');
+      var dot = document.getElementById('updatePaneDot');
+      var badge = document.getElementById('updateNewBadge');
+      if (!root || !nav || !entry) return;
+      function show(pane) {
+        root.dataset.cfgPane = pane;
+        entry.setAttribute('aria-current', pane === 'update' ? 'page' : 'false');
+      }
+      entry.addEventListener('click', function () { show('update'); });
+      // 捕获阶段先切回配置区，设置脚本随后才能滚动到对应分组。
+      nav.addEventListener('click', function (event) {
+        if (event.target.closest('a')) show('config');
+      }, true);
+      if (badge) {
+        badge.addEventListener('click', function () {
+          show('update');
+          document.getElementById('updateCheck')?.focus();
+        });
+        var syncDot = function () { if (dot) dot.hidden = badge.hidden; };
+        new MutationObserver(syncDot).observe(badge, { attributes: true, attributeFilter: ['hidden'] });
+        syncDot();
+      }
+    })();
+  </script>
+  <script>
+    // 右栏多栏切换：最近日志 / 任务状态 / 服务状态。只切换可见性，不干预各模块自身轮询。
+    (function () {
+      var root = document.getElementById('rail-tabs');
+      if (!root) return;
+      var tabs = Array.prototype.slice.call(root.querySelectorAll('[data-rail-tab]'));
+      var panes = Array.prototype.slice.call(root.querySelectorAll('[data-rail-pane]'));
+      function select(name, focus) {
+        tabs.forEach(function (tab) {
+          var on = tab.dataset.railTab === name;
+          tab.setAttribute('aria-selected', String(on));
+          tab.tabIndex = on ? 0 : -1;
+          if (on && focus) tab.focus();
+        });
+        panes.forEach(function (pane) { pane.classList.toggle('is-active', pane.dataset.railPane === name); });
+      }
+      tabs.forEach(function (tab) {
+        tab.addEventListener('click', function () { select(tab.dataset.railTab); });
+        tab.addEventListener('keydown', function (event) {
+          if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+          var index = tabs.indexOf(tab) + (event.key === 'ArrowRight' ? 1 : -1);
+          event.preventDefault();
+          select(tabs[(index + tabs.length) % tabs.length].dataset.railTab, true);
+        });
+      });
+      select('recent');
     })();
   </script>
 </body>

@@ -1573,7 +1573,14 @@ impl CommonLioIngress {
         if let Some(filter) = self.self_cloud_filter.as_ref().map_err(|error| {
             LioIngressError::Registration(error.clone())
         })? {
+            #[cfg(test)]
+            let filter_input_len = odom_points.len();
             filter.retain_external(&mut odom_points, &frozen_odom_from_body);
+            #[cfg(test)]
+            tests::native_self_filter_facts::record(
+                tests::native_self_filter_facts::Site::Common,
+                filter_input_len, odom_points.len(), &frozen_odom_from_body, filter,
+            );
         }
         if odom_points.is_empty() {
             return Err(LioIngressError::InvalidPointBudget {
@@ -1965,7 +1972,14 @@ impl NativeLioIngress {
             odometry_pose_isometry(&pair.odometry.odometry).map_err(|error| error.to_string())?;
         // 启动保留帧共享一次封存的过滤点集、位姿和源身份。
         if let Some(filter) = self.common.self_cloud_filter.as_ref().map_err(Clone::clone)? {
+            #[cfg(test)]
+            let filter_input_len = odom_points.len();
             filter.retain_external(&mut odom_points, &frozen_odom_from_body);
+            #[cfg(test)]
+            tests::native_self_filter_facts::record(
+                tests::native_self_filter_facts::Site::Pair,
+                filter_input_len, odom_points.len(), &frozen_odom_from_body, filter,
+            );
         }
         if odom_points.is_empty() {
             return Err("本帧自体过滤后没有外部点云".into());
@@ -4179,6 +4193,10 @@ mod tests {
     use nuwax_transport::{LcmBackend, LcmFrameStream, LcmTransport, TransportResult};
     use std::sync::Arc;
     use std::time::Duration;
+
+    pub(super) mod native_self_filter_facts {
+        include!("native_self_filter_facts.rs");
+    }
 
     #[derive(Clone, Default)]
     struct RecordingBackend {

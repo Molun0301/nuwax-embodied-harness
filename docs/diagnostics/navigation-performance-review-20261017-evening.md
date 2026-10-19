@@ -683,6 +683,16 @@ retained与fresh有序完整pose数值、长度和终点对照通过；fresh查�
 
 生产整lib去唯一cfg(test) include后逐字等6fb55ea0，Cargo.lock不变；提交前仅把新测试首行DRAFT状态注释改为已接入描述，原测试主体字节不变，无重跑。该集成补齐前两阶段分层资格的一项真实ON原地链，不宣布导航整体完成。
 
+## 第五十二阶段：真实Native入口双自体过滤事实
+
+仅tests-only两源，原两过滤及顺序完整保留；geometry默认release check/tests、bin no-run和5exact全PASS、actual-list各1，无修正/重跑。原no-run16m20s只等待同一构建，不新建target或重启。两个backend标识各两正常组合：混合Pair3→2/Common2→2，完整RPY/外参全外点2→2/2→2，两site同filter地址/posebits，N+1已接纳仍绑定N。N是变换后的本帧点数，非传感器raw采样量；backend标识不证明原生两种LIO算法执行。
+
+合法编码同identity异公共pose的合成反例为3→2→1，说明identity不足以无条件删第二遍。原wait(N)Ready后持原lifecycle锁pollPending，调用真实公共准入core接纳32后继驱逐N，放锁得到原MissingFrozenOdometry，仅Pair调用且无canonical cloud/pending。此为core受控时序，outer handler也拿同锁，不声称FIFO自然超车32帧。
+
+成功组合捕获真实canonical payload并经原Common public cloud准入核完整map坐标bits、原顺序、f32点、source/emitted数量及身份/冻结pose/permit。测试构造器先读空env，随后明确安装原固定box；不能用构造日志说被测过滤为空或推断现场模型启用。新观察只task-local两site的len/posebits/filter地址，无逐点新工作或生产哈希。
+
+新六fixture均原mapping stop/join及taskowner.finish完成，5TMPDIR空；无真实硬件LCM、传感器/外层map/RecentCloud/archive资格。原Device/Common冻结pose和Probe exact/fallback两旧控制通过；disabled/全self/发布错误等更广矩阵未在本批跑。原lio全文剥新增cfgtest接线逐字一致，两Cargo.lock不变；提交仅改新测试首DRAFT状态注释、主体不变。事实支持评估有条件复用，尚无生产优化或耗时收益结论。
+
 ## 后续持续检查
 
 1. 墙前晚到路径的实际恢复与初始 full/partial/PCT 顺序，保留及时移动和真实避障

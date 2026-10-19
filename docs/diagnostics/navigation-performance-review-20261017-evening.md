@@ -789,6 +789,22 @@ trace记录每条原实际评价的from/to、steps、Reference变化及最终poi
 
 当前开始实现数据核及原producer/codec迁移；具体字段、归属初值和消费者迁移均需固定回归资格，尚无新高程生产行为通过结论。C0-b未接受候选不会直接混入；已有A/B1/C0-a基础按新合同继续审查复用，不另建第二地图或长期双规划服务。工作目录持久保存、单target增量构建、阶段正常推送工作分支和main的约束继续保持。
 
+## 第六十一阶段：HeightfieldV1 整列数据核，尚未接生产地面链
+
+接受map-chunks三个源的最小纯数据基础：lib导出、新heightfield_observations及定向测试。HeightfieldColumn私有保存XY、原体素分辨率和按member-z的8子bin整列质量；代表高程及成员包围范围派生，不伪装为旧plane/normal。from_counts接原producer已关联、已索引的u32计数，不重复裸XYZ有限性检查、三轴voxel化或每点checked_add；它本身不做分类、源帧准入、接触许可或Writer发布。分辨率范围沿原Writer/Manifest合同，不新增地形限制。
+
+整列先归一，再存各member质量份额，避免每z格独立投票产生体素相位跳变；兼容新帧按初值1/2旧+1/2新融合，有界统计，不存无界raw历史。代表值为两端各10%质量截尾均值，部分bin按实际保留质量计算；截尾不删member或压缩占据范围。高度量化至q/8半开世界bin中心，统计编码不声称提高传感器精度。成员洞保持洞，包围区间不填实或整带免碰撞。geometry_eq仅比较实际h、成员和派生边界，不因每次质量细变都宣称几何改变。
+
+删除只撤销原占据已移除的member并重新归一；空集或全部剩余质量已下溢则返回None，不编造0/NaN、不删除外部占据。如何在真实producer/导航保留未知语义仍待接线。重复source幂等必须复用原Writer/capture水位，本批不以测试外层if冒充实际幂等集成。
+
+显式heightfield_v1 standalone codec严格区分旧plane；保留原4MiB负载预算、版本/有序唯一member/非负有限归一质量检查。这不是BL4/root/archive新格式已经启用，也不证明任意跨块整列能直接装进单块。旧BL2/BL3、AR4/source水位/删除回归仅定向保留。
+
+首批16exact通过后，静态独审发现真实量化tie问题：原round(mean/w-.5)+.5在mean0与meanw选择不一致，可令一bin平移跳两bin。补固定[-2,-1,0,1,2]精确边界及正负零控制，保持正确期待实际RED；改为统一floor(mean/w)+.5，原输入/期待不变转GREEN。同期收窄裸XYZ构造为from_counts、移除私有正质量不变量下不可达merge错误，不以panic或新许可门代替；codec实际边界保留。
+
+最终16exact全部PASS（新8、旧8），每个actual-list恰1；共33次执行=32PASS+1保留FAIL。四次原target map-chunks release no-run均成功，其中build02因测试插入脚本锚点失败后源码未变而仅缓存构建，无测试执行，不算有效新源码资格。其余原输入和失败、全部中间快照保留。无geometry/MLS/全workspace构建，原单target未清理，未复制binary。
+
+新8覆盖5/10/15cm分布、90/10跨格与49/51双峰、跨帧量化、删除/下溢、跨z块先整列归一与点序、部分bin截尾/洞、版本codec及输入边界。测试中的点到计数仅夹具，不冒称已用真实capture。尚无地表分类、全局/局部导航、近期点过滤、完整存档迁移、实机或性能结果；下一批必须接入原producer/Writer与所有消费者，不能停在未使用的数据类型。
+
 ## 后续持续检查
 
 1. 墙前晚到路径的实际恢复与初始 full/partial/PCT 顺序，保留及时移动和真实避障

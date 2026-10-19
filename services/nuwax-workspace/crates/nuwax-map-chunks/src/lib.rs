@@ -11,6 +11,8 @@ mod writer;
 pub use writer::Writer;
 /// Observation moments reused by the capture owner and bounded layer records.
 pub mod surface_statistics;
+/// Column-local height statistics; capture/storage integration is a separate step.
+pub mod heightfield_observations;
 mod terrain_observations;
 pub use terrain_observations::{LayerObservation, LayerObservations, LayerSample, LayerSource, SourceWatermark, MAX_LAYER_SAMPLES, MAX_LAYERS_PER_BLOCK, MAX_LAYER_MEMBERS, layer_geometry_eq};
 mod archive;

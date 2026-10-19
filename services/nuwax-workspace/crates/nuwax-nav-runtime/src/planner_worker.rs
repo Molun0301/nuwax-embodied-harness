@@ -80,8 +80,9 @@ fn arrival_event_still_in_goal(input: &Inputs) -> bool {
         || !same_pose(goal, &path.2) {
         return false;
     }
-    let yaw = nuwax_nav_astar::controllers::angle_diff(
-        goal.pose.orientation.yaw(), pose.pose.orientation.yaw()).abs();
+    let goal_yaw = goal.pose.orientation.yaw();
+    let actual_yaw = pose.pose.orientation.yaw();
+    let yaw = nuwax_nav_astar::controllers::angle_diff(goal_yaw, actual_yaw).abs();
     let actual = pose.pose.position;
     let target = goal.pose.position;
     let position_ok = if options.position_tolerance_m == 0.0 {
@@ -90,7 +91,11 @@ fn arrival_event_still_in_goal(input: &Inputs) -> bool {
     } else {
         pose.pose.position.distance(goal.pose.position) < options.position_tolerance_m
     };
-    position_ok && (!options.requires_orientation() || yaw < options.yaw_tolerance_rad)
+    let orientation_ok = !options.requires_orientation()
+        || if options.yaw_tolerance_rad == 0.0 {
+            nuwax_nav_types_messages::same_finite_yaw(actual_yaw, goal_yaw)
+        } else { yaw < options.yaw_tolerance_rad };
+    position_ok && orientation_ok
 }
 
 /// 计算线程没有运动端，结果须经原调度器核对目标身份再执行。
@@ -697,6 +702,7 @@ impl Drop for PlannerWorker {
 #[cfg(test)]
 mod tests {
     include!("position_zero_worker_tests.rs");
+    include!("yaw_zero_worker_tests.rs");
     use super::*;
     mod path_retirement_facts { include!("worker_path_retirement_facts.rs"); }
     include!("worker_first_delivery_tests.rs");

@@ -478,9 +478,13 @@ impl SurfaceFollower {
             nuwax_nav_types_messages::same_finite_position(
                 super::xyz(position), super::xyz(goal.pose.position))
         } else { final_distance < self.config.controller.goal_tolerance };
-        let final_yaw = angle_diff(goal.pose.orientation.yaw(), yaw);
-        if final_position_reached
-            && (!self.options.requires_orientation() || final_yaw.abs() < self.config.controller.orientation_tolerance)
+        let goal_yaw = goal.pose.orientation.yaw();
+        let final_yaw = angle_diff(goal_yaw, yaw);
+        let final_orientation_reached = !self.options.requires_orientation()
+            || if self.options.yaw_tolerance_rad == 0.0 {
+                nuwax_nav_types_messages::same_finite_yaw(yaw, goal_yaw)
+            } else { final_yaw.abs() < self.config.controller.orientation_tolerance };
+        if final_position_reached && final_orientation_reached
         {
             // 这里只确认到达规划终点；调度器随后撤租归零，等待守卫的物理
             // 停稳证明后才发布成功，避免地图噪声形成第二道停车门槛。

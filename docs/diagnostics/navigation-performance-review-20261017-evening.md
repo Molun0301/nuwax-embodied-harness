@@ -663,6 +663,16 @@ retained与fresh有序完整pose数值、长度和终点对照通过；fresh查�
 
 最终12源（7生产源）与应用前冻结逐字一致，无fixture/类型修正。首offline check在编译前因缺bit-set dev包退出，经原官方registry仅补11个锁定依赖、Cargo.lock逐字不变后原offline批全过。原缺cache、两RED及所有结果保留；报告脚本换行比较修正未改源码。仅源级合同修复与上述资格，不宣称CPU/RSS/实机时延改善。
 
+## 第五十阶段：零朝向容差的同值与精确周期端点合同
+
+旧核四项真实资格实际2PASS+2业务RED：严格单位q/-q提取同yaw可正常停后成功；真实worker先算Succeeded后仅平移.01m（原.1m球内）、yaw仍精确0，result pose版本1→current2，raw<0重资格却返回Pending。另一合法signedzero单位antipode提取+PI/-PI，原iterative wrap为0而停后trig残差2.44929359829470641e-16，真实停车proof后新采样仍resume。微小非零yaw 1.00000000000000035e-7被follower旧floor早接受、停后拒绝，记录为旧行为事实而非正确合同。
+
+接受有限提取yaw的最窄零合同：数值同值或精确±PI端点等价，不先相减/wrap，防PI邻ULP相减舍入TAU误当0；不加epsilon，不比较完整姿态，不定义任意未归一化角度。5源仅共享helper、body/legacy成功门、worker重资格和停后确认；局部复用已提取yaw，正容差原式、控制deadband、position0修复保持。
+
+两包默认release check/tests、lib no-run及17exact全PASS：新/迁移yaw7+原必要10，actual-list各1，旧T2名字0。T1/T3/T4原文保持，两个RED转绿；旧早事件T2显式迁移为同微误差不得提前到达，另增真实停后漂移仍拒绝。helper验证有限/NaN/Inf/subnormal/PI邻值，legacy同时保留正微容差floor。Scan生产未动，不重复其旧全批。
+
+最终union9源、生产5源与预冻结逐字一致，Cargo.lock不变，无编译/fixture修正；原四facts/全部数字和迁移记录保留。分层真实OFF worker、SurfaceFollower/原scheduler与内存FakeMotion证明端口，不冒称单一ON链、RPC或实机；不保证从任意非零微小误差精确物理收敛，不改控制参数或停止证明，不以harness时间宣称性能收益。
+
 ## 后续持续检查
 
 1. 墙前晚到路径的实际恢复与初始 full/partial/PCT 顺序，保留及时移动和真实避障

@@ -59,9 +59,14 @@ impl<M: NavMotionPort, P: NavPlanner> NavScheduler<M, P> {
             pose.pose.position.distance(session.goal_pose.pose.position)
                 <= session.options.position_tolerance_m
         };
-        let yaw = pose.pose.orientation.yaw() - session.goal_pose.pose.orientation.yaw();
         let orientation_ok = !session.options.requires_orientation()
-            || yaw.sin().atan2(yaw.cos()).abs() <= session.options.yaw_tolerance_rad;
+            || if session.options.yaw_tolerance_rad == 0.0 {
+                nuwax_nav_types_messages::same_finite_yaw(
+                    pose.pose.orientation.yaw(), session.goal_pose.pose.orientation.yaw())
+            } else {
+                let yaw = pose.pose.orientation.yaw() - session.goal_pose.pose.orientation.yaw();
+                yaw.sin().atan2(yaw.cos()).abs() <= session.options.yaw_tolerance_rad
+            };
         if position_ok && orientation_ok {
             return self
                 .finish_terminal(status, TerminalOutcome::Succeeded, SchedulerPhase::Idle)

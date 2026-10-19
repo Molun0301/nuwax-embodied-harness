@@ -139,6 +139,19 @@ pub fn same_finite_position(actual: [f64; 3], goal: [f64; 3]) -> bool {
     actual == goal && actual.iter().all(|coordinate| coordinate.is_finite())
 }
 
+/// 零朝向容差的有限提取 yaw 等价；仅合并数值同值与精确的 ±PI 两端点。
+///
+/// 调用值来自已验证四元数的 `Quaternion::yaw`，范围为 [-PI, PI]。
+/// 不先相减或 wrap，避免非零邻值在减法舍入后被当成零；不引入 epsilon。
+/// 这不比较完整姿态，也不替代调用方的坐标系、来源、机体或停车资格。
+#[must_use]
+pub fn same_finite_yaw(actual: f64, goal: f64) -> bool {
+    use std::f64::consts::PI;
+    (actual == goal && actual.is_finite())
+        || (actual == PI && goal == -PI)
+        || (actual == -PI && goal == PI)
+}
+
 /// 3D 点
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct Point3 {
@@ -569,5 +582,55 @@ mod exact_position_tests {
         for invalid in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
             assert!(!same_finite_position([invalid, 0.0, 0.0], [invalid, 0.0, 0.0]));
         }
+    }
+}
+
+#[cfg(test)]
+mod exact_yaw_tests {
+    use super::*;
+    #[test]
+    fn exact_finite_yaw_preserves_branch_neighbors_and_nonzero_subnormals() {
+        let pi = std::f64::consts::PI;
+        assert!(same_finite_yaw(0.0, -0.0));
+        assert!(same_finite_yaw(pi, -pi));
+        assert!(same_finite_yaw(-pi, pi));
+        let inside_pi = f64::from_bits(pi.to_bits() - 1);
+        assert!(inside_pi < pi);
+        for value in [inside_pi, -inside_pi] {
+            assert!(same_finite_yaw(value, value));
+            assert!(!same_finite_yaw(value, pi));
+            assert!(!same_finite_yaw(pi, value));
+            assert!(!same_finite_yaw(value, -pi));
+            assert!(!same_finite_yaw(-pi, value));
+        }
+        // A subtraction-first implementation can round this nonendpoint pair
+        // to TAU, then incorrectly call its wrapped difference exact zero.
+        assert_eq!(pi - (-inside_pi), 2.0 * pi);
+        for value in [f64::from_bits(1), -f64::from_bits(1), f64::MIN_POSITIVE] {
+            assert_ne!(value, 0.0);
+            assert!(same_finite_yaw(value, value));
+            assert!(!same_finite_yaw(value, 0.0));
+            assert!(!same_finite_yaw(0.0, value));
+        }
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(!same_finite_yaw(invalid, invalid));
+            assert!(!same_finite_yaw(invalid, 0.0));
+            assert!(!same_finite_yaw(0.0, invalid));
+            assert!(!same_finite_yaw(invalid, pi));
+            assert!(!same_finite_yaw(-pi, invalid));
+        }
+        let plus = Quaternion { x: 0.0, y: 0.0, z: 1.0, w: 0.0 };
+        for q in [Quaternion::IDENTITY, plus] {
+            let antipode = Quaternion { x: -q.x, y: -q.y, z: -q.z, w: -q.w };
+            assert_eq!(q.yaw(), antipode.yaw());
+            assert!(same_finite_yaw(q.yaw(), antipode.yaw()));
+        }
+        let minus = Quaternion { x: -0.0, y: 0.0, z: -1.0, w: 0.0 };
+        assert_eq!(plus.yaw(), pi);
+        assert_eq!(minus.yaw(), -pi);
+        assert!(same_finite_yaw(plus.yaw(), minus.yaw()));
+        let invalid_yaw = Quaternion::default().yaw();
+        assert!(invalid_yaw.is_nan());
+        assert!(!same_finite_yaw(invalid_yaw, invalid_yaw));
     }
 }

@@ -408,9 +408,14 @@ impl SurfaceFollower {
                     "安全截断路径已结束，原三维目标尚未到达".into(),
                 );
             }
-            let yaw_error =
-                angle_diff(goal.pose.orientation.yaw(), odometry.pose.orientation.yaw());
-            if !self.options.requires_orientation() || yaw_error.abs() < self.config.controller.orientation_tolerance {
+            let goal_yaw = goal.pose.orientation.yaw();
+            let actual_yaw = odometry.pose.orientation.yaw();
+            let yaw_error = angle_diff(goal_yaw, actual_yaw);
+            let orientation_reached = !self.options.requires_orientation()
+                || if self.options.yaw_tolerance_rad == 0.0 {
+                    nuwax_nav_types_messages::same_finite_yaw(actual_yaw, goal_yaw)
+                } else { yaw_error.abs() < self.config.controller.orientation_tolerance };
+            if orientation_reached {
                 return PlannerStep::Succeeded;
             }
             let twist = self.controller.rotate(yaw_error);
@@ -994,6 +999,7 @@ pub(crate) fn prepared_test_surface(map:Arc<SurfaceSnapshot>)->ExecutionMap {
 mod tests {
     use super::*;
     include!("surface_projection_index_tests.rs");
+    include!("yaw_zero_legacy_tests.rs");
     use nuwax_nav_types_messages::{GoalOptions, NavFrameId, Pose3, Timestamp};
 
     fn omni_route_follower(poses: Vec<PoseStamped>, calibrated: bool) -> (SurfaceFollower, Arc<SurfaceSnapshot>) {

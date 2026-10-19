@@ -889,8 +889,9 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
                 "frame_id": pose.frame_id,
                 "x": pose.position.x, "y": pose.position.y,
                 **({"z": pose.position.z} if "z" in pose.position.model_fields_set else {}),
-                "yaw_rad": 2.0 * math.atan2(orientation.z, orientation.w),
             }
+            if any(key in goal.pose for key in ("yaw", "yaw_rad", "orientation")):
+                arguments["yaw_rad"] = 2.0 * math.atan2(orientation.z, orientation.w)
             return await run_in_threadpool(_invoke_capability, request, "navigate_to_pose", arguments)
         except Exception as exc:
             raise as_gateway_error(exc) from exc

@@ -4,6 +4,7 @@
 本机任务调度及导航后端，不启动原生服务或机器人运动。拥有方集成检查还使用
 真实工作区、定位会话与 protobuf 准入，只模拟原生 RPC，不能替代原生实机验证。
 """
+import math
 import unittest
 from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
@@ -359,11 +360,64 @@ class NavigationGoalHeightPublicInputTests(unittest.TestCase):
                 self.assertEqual(capability, "navigate_to_pose")
                 self.assertEqual(forwarded, {
                     "goal_id": "height-goal", "frame_id": "map",
-                    "x": 4.25, "y": -1.5, "yaw_rad": 0.0,
+                    "x": 4.25, "y": -1.5,
                 })
                 self.assert_pending_target(gateway)
                 self.run_latest(gateway)
                 self.assertEqual(gateway.dispatched[-1].target_pose.position.z, 7.25)
+                self.assertFalse(gateway.dispatched[-1].require_goal_orientation)
+
+    def test_real_http_preserves_explicit_yaw_including_zero_for_flat_and_nested_shapes(self):
+        gateway = self.configure_runner(self.gateway())
+        client = self.client(gateway)
+        coordinates = {"x": 4.25, "y": -1.5}
+        cases = [
+            ({**coordinates, key: yaw}, yaw)
+            for key in ("yaw", "yaw_rad") for yaw in (0.0, 0.75, -0.75)
+        ]
+        cases.extend([
+            ({**coordinates, "yaw": 0.75, "yaw_rad": 0.0}, 0.0),
+            ({"position": coordinates, "orientation": {}}, 0.0),
+            ({"position": coordinates, "orientation": {"z": 0.0, "w": 1.0}}, 0.0),
+            ({"position": coordinates, "orientation": {
+                "z": math.sin(-0.75 / 2.0), "w": math.cos(-0.75 / 2.0),
+            }}, -0.75),
+        ])
+        for pose, yaw in cases:
+            with self.subTest(pose=pose):
+                response = client.post("/api/navigation/goal", json={"goal_id": "yaw-goal", "pose": pose})
+                self.assertEqual(response.status_code, 200, response.text)
+                forwarded = gateway.forwarded_arguments[-1][1]
+                self.assertAlmostEqual(forwarded["yaw_rad"], yaw)
+                self.assertNotIn("z", forwarded)
+                self.run_latest(gateway)
+                goal = gateway.dispatched[-1]
+                self.assertTrue(goal.require_goal_orientation)
+                self.assertAlmostEqual(goal.target_pose.orientation.z, math.sin(yaw / 2.0))
+                self.assertAlmostEqual(goal.target_pose.orientation.w, math.cos(yaw / 2.0))
+                self.assertEqual(goal.target_pose.position.z, 7.25)
+
+    def test_mcp_navigation_options_stay_intact_with_and_without_yaw(self):
+        gateway = self.configure_runner(self.gateway())
+        for yaw_present in (False, True):
+            for position_tolerance, yaw_tolerance in ((0.0, 0.0), (0.15, 0.45)):
+                with self.subTest(yaw_present=yaw_present, tolerances=(position_tolerance, yaw_tolerance)):
+                    arguments = {
+                        "frame_id": "map", "x": 4.25, "y": -1.5,
+                        "tolerance_position_m": position_tolerance,
+                        "tolerance_yaw_rad": yaw_tolerance,
+                        "allow_reverse": True,
+                    }
+                    if yaw_present:
+                        arguments["yaw_rad"] = 0.0
+                    self.mcp_call(gateway, arguments)
+                    self.assertEqual(gateway.forwarded_arguments[-1][1], arguments)
+                    self.run_latest(gateway)
+                    goal = gateway.dispatched[-1]
+                    self.assertEqual(goal.require_goal_orientation, yaw_present)
+                    self.assertEqual(goal.tolerance_position_m, position_tolerance)
+                    self.assertEqual(goal.tolerance_yaw_rad, yaw_tolerance)
+                    self.assertTrue(goal.allow_reverse)
 
     def test_real_http_preserves_explicit_height_for_both_shapes_and_pipelines(self):
         for pipeline, schema_version in ((p, s) for p in ("lio_3d", "slam_2d") for s in (1, 2)):

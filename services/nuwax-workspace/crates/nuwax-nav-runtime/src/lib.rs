@@ -2908,6 +2908,7 @@ mod tests {
     include!("arrival_confirmation_tests.rs");
     include!("position_zero_runtime_tests.rs");
     include!("yaw_zero_contract_tests.rs");
+    include!("zero_goal_on_integration_tests.rs");
     include!("recent_source_health_tests.rs");
     include!("scheduler_detour_cancellation_tests.rs");
     use std::collections::HashMap;

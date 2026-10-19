@@ -673,6 +673,16 @@ retained与fresh有序完整pose数值、长度和终点对照通过；fresh查�
 
 最终union9源、生产5源与预冻结逐字一致，Cargo.lock不变，无编译/fixture修正；原四facts/全部数字和迁移记录保留。分层真实OFF worker、SurfaceFollower/原scheduler与内存FakeMotion证明端口，不冒称单一ON链、RPC或实机；不保证从任意非零微小误差精确物理收敛，不改控制参数或停止证明，不以harness时间宣称性能收益。
 
+## 第五十一阶段：精确零目标的真实局部规划ON集成资格
+
+仅tests-only两源接线/单例，runtime默认release check/tests、lib no-run通过，actual-list1、单次PASS，无前提/类型修正。原完整7200 floor keys观测、真实PCT body_route单点参考直接交原目标；真实RouteFollower ON接收原PlanRequest、nominal Scan返回完整单点，经原worker与scheduler到达事件、原FenceProof及停后新采样才最终成功。
+
+实际原候选request_id1/epoch6/generation5、partial=false、原参考/目标/raw0与execution identity核对、实际path单点；nonzero0、fence_count1、fresh_after_stop=true、worker_cleanup_returned=true。PCT是初始参考计算，不冒称nominal分支又执行detourPCT。原hook在materialize之前，未直接捕获之后arrival/final_yaw；原真实成功路径与当前body检查均保留。
+
+保留显式采集起算source/pose1秒期限和fixture max_observation_age1秒；scheduler receipt TTL默认ZERO，不能泛称所有生产TTL路径被测。无发布gate，不覆盖pose-version重资格（此前独立资格保留），不覆盖spawn_scheduler外层异步事件环、RPC、真实硬件、微误差移动收敛或真实物理停止。内存proof端口及Drop返回不冒称独立join结果。测试0.19秒总时长不作性能证据。
+
+生产整lib去唯一cfg(test) include后逐字等6fb55ea0，Cargo.lock不变；提交前仅把新测试首行DRAFT状态注释改为已接入描述，原测试主体字节不变，无重跑。该集成补齐前两阶段分层资格的一项真实ON原地链，不宣布导航整体完成。
+
 ## 后续持续检查
 
 1. 墙前晚到路径的实际恢复与初始 full/partial/PCT 顺序，保留及时移动和真实避障

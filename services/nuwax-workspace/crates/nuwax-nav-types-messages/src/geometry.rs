@@ -5,6 +5,10 @@
 // `AbsDiffEq` 仅为 `abs_diff_eq!` 宏展开提供 trait scope,本身不直接使用。
 #[allow(unused_imports)]
 use approx::{abs_diff_eq, AbsDiffEq};
+use nuwax_types::navigation::{
+    ArrivalBoundary, GoalOptions, GoalReference, GoalRegionAssessment, GroundHeightIntent,
+    GroundLayerResult,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::frames::NavFrameId;
@@ -150,6 +154,133 @@ pub fn same_finite_yaw(actual: f64, goal: f64) -> bool {
     (actual == goal && actual.is_finite())
         || (actual == PI && goal == -PI)
         || (actual == -PI && goal == PI)
+}
+
+/// 纯到达区域的几何输入；当前尚未接入任何运行或公共目标入口。
+///
+/// 输入合法性、坐标系与来源资格由原边界负责；yaw 是已验证姿态提取的
+/// [-PI, PI] 数值。Ground 分支没有机体 z 或固定高度偏移。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ArrivalGeometry {
+    /// 机体三维区域的小型数值分支，不消费地面层结论。
+    Body {
+        /// 当前机体 XYZ。
+        actual_xyz: [f64; 3],
+        /// 目标机体 XYZ。
+        target_xyz: [f64; 3],
+        /// 当前提取 yaw。
+        actual_yaw: f64,
+        /// 目标提取 yaw。
+        target_yaw: f64,
+    },
+    /// 地面 XY/yaw 与原高度意图，层关系由 owner 单独传入。
+    Ground {
+        /// 当前 XY。
+        actual_xy: [f64; 2],
+        /// 目标 XY。
+        target_xy: [f64; 2],
+        /// 当前提取 yaw。
+        actual_yaw: f64,
+        /// 目标提取 yaw。
+        target_yaw: f64,
+        /// 原高度 presence 与独立解析参考。
+        height: GroundHeightIntent,
+    },
+}
+
+impl ArrivalGeometry {
+    /// 由几何分支派生参考，避免另存一个可能与输入矛盾的 reference。
+    #[must_use]
+    pub const fn reference(&self) -> GoalReference {
+        match self {
+            Self::Body { .. } => GoalReference::Body,
+            Self::Ground { .. } => GoalReference::Ground,
+        }
+    }
+}
+
+/// 只判断数值区域与 owner 传入的层结论，不创建实际消费或停车见证。
+///
+/// 零容差复用有限数值精确规则；正容差保留指定的严格/闭边界，yaw 差
+/// 采用原停车数值路径的 sin/atan2 规则。此处没有替换或统一现有调用点。
+/// Ground 的 resolved 数字不改变原 presence，也不能覆盖 typed 层结论。
+/// `WithinRegion` 不等于实际到达或 Succeeded；运行接线留待后续迁移。
+#[must_use]
+pub fn assess_goal_region(
+    geometry: &ArrivalGeometry,
+    options: &GoalOptions,
+    boundary: ArrivalBoundary,
+    layer: GroundLayerResult,
+) -> GoalRegionAssessment {
+    let within = |error: f64, tolerance: f64| match boundary {
+        ArrivalBoundary::Strict => error < tolerance,
+        ArrivalBoundary::Closed => error <= tolerance,
+    };
+    let (position_ok, actual_yaw, target_yaw, height) = match geometry {
+        ArrivalGeometry::Body {
+            actual_xyz,
+            target_xyz,
+            actual_yaw,
+            target_yaw,
+        } => {
+            let position_ok = if options.position_tolerance_m == 0.0 {
+                same_finite_position(*actual_xyz, *target_xyz)
+            } else {
+                within(
+                    Point3::new(actual_xyz[0], actual_xyz[1], actual_xyz[2])
+                        .distance(Point3::new(target_xyz[0], target_xyz[1], target_xyz[2])),
+                    options.position_tolerance_m,
+                )
+            };
+            (position_ok, *actual_yaw, *target_yaw, None)
+        }
+        ArrivalGeometry::Ground {
+            actual_xy,
+            target_xy,
+            actual_yaw,
+            target_yaw,
+            height,
+        } => {
+            let position_ok = if options.position_tolerance_m == 0.0 {
+                // 第三分量仅复用逐项数值比较，不表示地面高度，也不进入 wire。
+                same_finite_position(
+                    [actual_xy[0], actual_xy[1], 0.0],
+                    [target_xy[0], target_xy[1], 0.0],
+                )
+            } else {
+                within(
+                    Point2::new(actual_xy[0], actual_xy[1])
+                        .distance(Point2::new(target_xy[0], target_xy[1])),
+                    options.position_tolerance_m,
+                )
+            };
+            (position_ok, *actual_yaw, *target_yaw, Some(height))
+        }
+    };
+    let yaw_ok = !options.requires_orientation()
+        || if options.yaw_tolerance_rad == 0.0 {
+            same_finite_yaw(actual_yaw, target_yaw)
+        } else {
+            let delta = actual_yaw - target_yaw;
+            within(
+                delta.sin().atan2(delta.cos()).abs(),
+                options.yaw_tolerance_rad,
+            )
+        };
+    if !position_ok || !yaw_ok {
+        return GoalRegionAssessment::OutsideRegion;
+    }
+    match height {
+        Some(_) if layer == GroundLayerResult::KnownConflict => {
+            GoalRegionAssessment::KnownLayerConflict
+        }
+        Some(height)
+            if height.requested_ground_z.is_some() && layer == GroundLayerResult::Unresolved =>
+        {
+            GoalRegionAssessment::TargetLayerUnresolved
+        }
+        _ => GoalRegionAssessment::WithinRegion,
+    }
 }
 
 /// 3D 点
@@ -632,5 +763,449 @@ mod exact_yaw_tests {
         let invalid_yaw = Quaternion::default().yaw();
         assert!(invalid_yaw.is_nan());
         assert!(!same_finite_yaw(invalid_yaw, invalid_yaw));
+    }
+}
+
+// A01–A12 are pure typed-result oracles. Matched is supplied by these tests;
+// no test here claims a real layer observation, consumed segment or stop proof.
+#[cfg(test)]
+mod ground_region_tests {
+    use super::*;
+
+    fn options() -> GoalOptions {
+        GoalOptions {
+            allow_reverse: false,
+            position_tolerance_m: 0.0,
+            yaw_tolerance_rad: 0.0,
+        }
+    }
+
+    fn ground(requested: Option<f64>, resolved: Option<f64>) -> ArrivalGeometry {
+        ArrivalGeometry::Ground {
+            actual_xy: [2.0, 3.0],
+            target_xy: [2.0, 3.0],
+            actual_yaw: 0.0,
+            target_yaw: 0.0,
+            height: GroundHeightIntent {
+                requested_ground_z: requested,
+                resolved_ground_z: resolved,
+            },
+        }
+    }
+
+    fn height_of(geometry: &ArrivalGeometry) -> &GroundHeightIntent {
+        match geometry {
+            ArrivalGeometry::Ground { height, .. } => height,
+            ArrivalGeometry::Body { .. } => panic!("expected ground test input"),
+        }
+    }
+
+    fn assess(geometry: &ArrivalGeometry, layer: GroundLayerResult) -> GoalRegionAssessment {
+        assess_goal_region(geometry, &options(), ArrivalBoundary::Strict, layer)
+    }
+
+    #[test]
+    fn a01_omitted_unresolved_height_keeps_xy_region() {
+        let geometry = ground(None, None);
+        assert_eq!(geometry.reference(), GoalReference::Ground);
+        assert_eq!(
+            assess(&geometry, GroundLayerResult::Unresolved),
+            GoalRegionAssessment::WithinRegion
+        );
+        assert_eq!(
+            *height_of(&geometry),
+            GroundHeightIntent {
+                requested_ground_z: None,
+                resolved_ground_z: None
+            }
+        );
+    }
+
+    #[test]
+    fn a02_resolved_zero_does_not_make_omission_explicit() {
+        let geometry = ground(None, Some(0.0));
+        assert_eq!(
+            assess(&geometry, GroundLayerResult::Matched),
+            GoalRegionAssessment::WithinRegion
+        );
+        // A parsed number must not silently turn the omitted request into a constraint.
+        assert_eq!(
+            assess(&geometry, GroundLayerResult::Unresolved),
+            GoalRegionAssessment::WithinRegion
+        );
+        assert_eq!(height_of(&geometry).requested_ground_z, None);
+        assert_eq!(
+            height_of(&geometry).resolved_ground_z.map(f64::to_bits),
+            Some(0.0f64.to_bits())
+        );
+    }
+
+    #[test]
+    fn a03_explicit_zero_unresolved_is_not_within_region() {
+        let geometry = ground(Some(0.0), None);
+        assert_eq!(
+            assess(&geometry, GroundLayerResult::Unresolved),
+            GoalRegionAssessment::TargetLayerUnresolved
+        );
+        assert_eq!(height_of(&geometry).requested_ground_z, Some(0.0));
+        assert_eq!(height_of(&geometry).resolved_ground_z, None);
+    }
+
+    #[test]
+    fn a04_equal_height_numbers_do_not_resolve_layer() {
+        let geometry = ground(Some(3.0), Some(3.0));
+        assert_eq!(
+            assess(&geometry, GroundLayerResult::Unresolved),
+            GoalRegionAssessment::TargetLayerUnresolved
+        );
+        assert_eq!(
+            height_of(&geometry).requested_ground_z,
+            height_of(&geometry).resolved_ground_z
+        );
+    }
+
+    #[test]
+    fn a05_owner_matched_result_requires_no_fresh_observation_field() {
+        // Supplied typed result only: this does not construct a carried/executed proof.
+        for resolved in [None, Some(3.0)] {
+            assert_eq!(
+                assess(&ground(Some(3.0), resolved), GroundLayerResult::Matched),
+                GoalRegionAssessment::WithinRegion
+            );
+        }
+    }
+
+    #[test]
+    fn a06_known_layer_conflict_wins_at_same_xy() {
+        for requested in [None, Some(0.0), Some(3.0)] {
+            assert_eq!(
+                assess(
+                    &ground(requested, Some(3.0)),
+                    GroundLayerResult::KnownConflict
+                ),
+                GoalRegionAssessment::KnownLayerConflict
+            );
+        }
+    }
+
+    #[test]
+    fn a07_requested_height_presence_and_bits_are_preserved() {
+        for requested in [0.0f64, -0.0, -0.25, 2.75] {
+            let geometry = ground(Some(requested), Some(7.0));
+            assert_eq!(
+                assess(&geometry, GroundLayerResult::Unresolved),
+                GoalRegionAssessment::TargetLayerUnresolved
+            );
+            assert_eq!(
+                height_of(&geometry).requested_ground_z.map(f64::to_bits),
+                Some(requested.to_bits())
+            );
+            assert_eq!(height_of(&geometry).resolved_ground_z, Some(7.0));
+            assert_ne!(height_of(&geometry).requested_ground_z, None);
+        }
+        assert_ne!(
+            GroundHeightIntent {
+                requested_ground_z: None,
+                resolved_ground_z: Some(0.0)
+            },
+            GroundHeightIntent {
+                requested_ground_z: Some(0.0),
+                resolved_ground_z: Some(0.0)
+            }
+        );
+    }
+
+    #[test]
+    fn a08_zero_xy_never_uses_an_underflowed_distance() {
+        let mut geometry = ground(None, None);
+        if let ArrivalGeometry::Ground {
+            actual_xy,
+            target_xy,
+            ..
+        } = &mut geometry
+        {
+            *actual_xy = [-0.0, 0.0];
+            *target_xy = [0.0, -0.0];
+        }
+        assert_eq!(
+            assess(&geometry, GroundLayerResult::Unresolved),
+            GoalRegionAssessment::WithinRegion
+        );
+        for delta in [f64::from_bits(1), 1e-200, f64::EPSILON] {
+            for axis in 0..2 {
+                let mut actual = [0.0; 2];
+                actual[axis] = delta;
+                assert_ne!(actual[axis], 0.0);
+                if let ArrivalGeometry::Ground {
+                    actual_xy,
+                    target_xy,
+                    ..
+                } = &mut geometry
+                {
+                    *actual_xy = actual;
+                    *target_xy = [0.0; 2];
+                }
+                let distance = Point2::new(actual[0], actual[1]).distance(Point2::new(0.0, 0.0));
+                if delta <= 1e-200 {
+                    assert_eq!(distance, 0.0);
+                }
+                for boundary in [ArrivalBoundary::Strict, ArrivalBoundary::Closed] {
+                    assert_eq!(
+                        assess_goal_region(
+                            &geometry,
+                            &options(),
+                            boundary,
+                            GroundLayerResult::Unresolved
+                        ),
+                        GoalRegionAssessment::OutsideRegion
+                    );
+                }
+                eprintln!(
+                    "A08 axis={axis} delta_bits={} distance_bits={}",
+                    delta.to_bits(),
+                    distance.to_bits()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a09_body_checks_z_while_ground_has_no_body_z() {
+        let ground_geometry = ground(None, None);
+        let body = ArrivalGeometry::Body {
+            actual_xyz: [2.0, 3.0, f64::EPSILON],
+            target_xyz: [2.0, 3.0, 0.0],
+            actual_yaw: 0.0,
+            target_yaw: 0.0,
+        };
+        assert_eq!(body.reference(), GoalReference::Body);
+        assert_eq!(
+            assess(&body, GroundLayerResult::Matched),
+            GoalRegionAssessment::OutsideRegion
+        );
+        assert_eq!(
+            assess(&ground_geometry, GroundLayerResult::Unresolved),
+            GoalRegionAssessment::WithinRegion
+        );
+        let matching_body = ArrivalGeometry::Body {
+            actual_xyz: [2.0, 3.0, 0.0],
+            target_xyz: [2.0, 3.0, 0.0],
+            actual_yaw: 0.0,
+            target_yaw: 0.0,
+        };
+        for layer in [
+            GroundLayerResult::Matched,
+            GroundLayerResult::Unresolved,
+            GroundLayerResult::KnownConflict,
+        ] {
+            assert_eq!(
+                assess(&matching_body, layer),
+                GoalRegionAssessment::WithinRegion
+            );
+        }
+    }
+
+    #[test]
+    fn a10_zero_yaw_reuses_exact_endpoints_without_neighbor_rounding() {
+        let pi = std::f64::consts::PI;
+        let plus = Quaternion {
+            x: 0.0,
+            y: 0.0,
+            z: 1.0,
+            w: 0.0,
+        };
+        let minus = Quaternion {
+            x: -0.0,
+            y: 0.0,
+            z: -1.0,
+            w: 0.0,
+        };
+        assert_eq!(plus.yaw(), pi);
+        assert_eq!(minus.yaw(), -pi);
+        let inside_pi = f64::from_bits(pi.to_bits() - 1);
+        assert_ne!(inside_pi, pi);
+        assert_eq!(pi - (-inside_pi), 2.0 * pi);
+        let mut pairs = vec![
+            (pi, -pi, true),
+            (-pi, pi, true),
+            (0.0, -0.0, true),
+            (pi, -inside_pi, false),
+            (-inside_pi, pi, false),
+            (inside_pi, -pi, false),
+            (-pi, inside_pi, false),
+            (1e-7, 0.0, false),
+            (f64::from_bits(1), 0.0, false),
+        ];
+        // Subnormal is supplied directly: from_yaw would halve and round the smallest one to zero.
+        for q in [Quaternion::IDENTITY, plus, minus] {
+            let opposite = Quaternion {
+                x: -q.x,
+                y: -q.y,
+                z: -q.z,
+                w: -q.w,
+            };
+            assert_eq!(q.yaw(), opposite.yaw());
+            pairs.push((q.yaw(), opposite.yaw(), true));
+        }
+        for (actual, target, expected) in pairs {
+            let mut geometry = ground(None, None);
+            if let ArrivalGeometry::Ground {
+                actual_yaw,
+                target_yaw,
+                ..
+            } = &mut geometry
+            {
+                *actual_yaw = actual;
+                *target_yaw = target;
+            }
+            let body = ArrivalGeometry::Body {
+                actual_xyz: [0.0; 3],
+                target_xyz: [0.0; 3],
+                actual_yaw: actual,
+                target_yaw: target,
+            };
+            for input in [geometry, body] {
+                for boundary in [ArrivalBoundary::Strict, ArrivalBoundary::Closed] {
+                    let result = assess_goal_region(
+                        &input,
+                        &options(),
+                        boundary,
+                        GroundLayerResult::Unresolved,
+                    );
+                    assert_eq!(
+                        result,
+                        if expected {
+                            GoalRegionAssessment::WithinRegion
+                        } else {
+                            GoalRegionAssessment::OutsideRegion
+                        }
+                    );
+                }
+            }
+            eprintln!(
+                "A10 actual_bits={} target_bits={} equal={expected}",
+                actual.to_bits(),
+                target.to_bits()
+            );
+        }
+    }
+
+    #[test]
+    fn a11_positive_tolerance_keeps_strict_and_closed_boundaries() {
+        let mut geometry = ground(None, None);
+        if let ArrivalGeometry::Ground { actual_xy, .. } = &mut geometry {
+            actual_xy[0] = 2.25;
+        }
+        let body = ArrivalGeometry::Body {
+            actual_xyz: [2.25, 3.0, 0.0],
+            target_xyz: [2.0, 3.0, 0.0],
+            actual_yaw: 0.0,
+            target_yaw: 0.0,
+        };
+        let positive = GoalOptions {
+            position_tolerance_m: 0.25,
+            ..options()
+        };
+        for input in [geometry, body] {
+            assert_eq!(
+                assess_goal_region(
+                    &input,
+                    &positive,
+                    ArrivalBoundary::Strict,
+                    GroundLayerResult::Unresolved
+                ),
+                GoalRegionAssessment::OutsideRegion
+            );
+            assert_eq!(
+                assess_goal_region(
+                    &input,
+                    &positive,
+                    ArrivalBoundary::Closed,
+                    GroundLayerResult::Unresolved
+                ),
+                GoalRegionAssessment::WithinRegion
+            );
+        }
+        // Also preserve the original positive-yaw wrap and optional-orientation policy.
+        let mut yaw_geometry = ground(None, None);
+        if let ArrivalGeometry::Ground { actual_yaw, .. } = &mut yaw_geometry {
+            *actual_yaw = 0.25;
+        }
+        let error = 0.25f64.sin().atan2(0.25f64.cos()).abs();
+        assert_eq!(error, 0.25);
+        let yaw_options = GoalOptions {
+            yaw_tolerance_rad: error,
+            ..options()
+        };
+        assert_eq!(
+            assess_goal_region(
+                &yaw_geometry,
+                &yaw_options,
+                ArrivalBoundary::Strict,
+                GroundLayerResult::Unresolved
+            ),
+            GoalRegionAssessment::OutsideRegion
+        );
+        assert_eq!(
+            assess_goal_region(
+                &yaw_geometry,
+                &yaw_options,
+                ArrivalBoundary::Closed,
+                GroundLayerResult::Unresolved
+            ),
+            GoalRegionAssessment::WithinRegion
+        );
+        if let ArrivalGeometry::Ground { actual_yaw, .. } = &mut yaw_geometry {
+            *actual_yaw = std::f64::consts::PI;
+        }
+        for tolerance in [std::f64::consts::PI, std::f64::consts::TAU] {
+            let optional = GoalOptions {
+                yaw_tolerance_rad: tolerance,
+                ..options()
+            };
+            assert_eq!(
+                assess_goal_region(
+                    &yaw_geometry,
+                    &optional,
+                    ArrivalBoundary::Strict,
+                    GroundLayerResult::Unresolved
+                ),
+                GoalRegionAssessment::WithinRegion
+            );
+        }
+    }
+
+    #[test]
+    fn a12_geometry_precedes_explicit_unresolved_layer() {
+        let mut geometry = ground(Some(3.0), None);
+        if let ArrivalGeometry::Ground { actual_xy, .. } = &mut geometry {
+            actual_xy[0] = 1.0;
+        }
+        assert_eq!(
+            assess(&geometry, GroundLayerResult::Unresolved),
+            GoalRegionAssessment::OutsideRegion
+        );
+        if let ArrivalGeometry::Ground {
+            actual_xy,
+            actual_yaw,
+            ..
+        } = &mut geometry
+        {
+            *actual_xy = [2.0, 3.0];
+            *actual_yaw = 0.1;
+        }
+        assert_eq!(
+            assess(&geometry, GroundLayerResult::Unresolved),
+            GoalRegionAssessment::OutsideRegion
+        );
+        if let ArrivalGeometry::Ground { actual_yaw, .. } = &mut geometry {
+            *actual_yaw = 0.0;
+        }
+        assert_eq!(
+            assess(&geometry, GroundLayerResult::Unresolved),
+            GoalRegionAssessment::TargetLayerUnresolved
+        );
+        assert_eq!(height_of(&geometry).requested_ground_z, Some(3.0));
+        assert_eq!(height_of(&geometry).resolved_ground_z, None);
     }
 }

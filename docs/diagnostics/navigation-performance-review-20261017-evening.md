@@ -721,6 +721,18 @@ final-summary clear改按真实publish=True边界注入且确认实际触发，�
 
 有意变化：无消费者probe中的repair后移到仍保留的最终summary，删除一次观察及其异常机会；owner先失效时不再承诺修复旧库。并发观察结果不保证逐字相同，不以缓存伪造一致。只接受稳定同owner重放减少一遍全量摘要读取，不宣称冷激活、定位READY或端到端时延提升；没有耗时AB或实机测量。
 
+## 第五十六阶段：地面目标迁移A的纯合同基础
+
+接受两源的小型纯类型和区域判断，尚未接入任何公开入口、PCT/Scan、worker、scheduler或wire。GoalReference由ArrivalGeometry分支派生；Ground输入只有XY/yaw和原requested/resolved高度Option，不能以解析值覆盖原显式presence。owner传入Matched/Unresolved/KnownConflict只是判断输入，不是执行或物理楼层证明。普通省略高度允许WithinRegion，显式高度未解析返回TargetLayerUnresolved，已知层冲突保留；WithinRegion不等于Succeeded。
+
+同一纯helper的Body分支保留XYZ，Ground仅XY；zero复用finite逐项相等与原same_finite_yaw，不用可下溢距离判零。Ground内部第三分量0仅用于复用比较，不进入ground高度或wire。正容差显式Strict/Closed，正yaw沿原停车sin/atan2；未替换各旧调用，也不声称已统一其微小正容差floor等差异。无新Default、序列化、依赖、身份验证器、观测许可门或地图状态。
+
+两库release check/tests、lib no-run及19exact首轮全PASS：12纯oracle加7旧数值回归，actual-list各1。沿同target显式opt3/fatLTO/CGU1、offline/locked/-j4，仅types/messages，无geometry/stack重编。原Cargo profile默认thin与本轮显式资格profile区别保留。没有fixture修正、失败后重跑或性能计时。
+
+最终新增628行，生产纯声明/helper184、测试与分隔444；提交前只调整新增import顺序与Body let空白，原测试版本及格式差异保留，不重编。反剥新增块后两源逐字等06b2879f，原GoalOptions/默认/validate、数值helper、Quaternion与旧测试不变。
+
+A只是迁移基础。实际路径段消费、不同楼层独立关联、stop前到达见证、全未知XY同搜索绕障、协议及公共默认切换仍待后续批次；本批不能证明这些生产行为，更不宣称实机导航问题解决。
+
 ## 后续持续检查
 
 1. 墙前晚到路径的实际恢复与初始 full/partial/PCT 顺序，保留及时移动和真实避障

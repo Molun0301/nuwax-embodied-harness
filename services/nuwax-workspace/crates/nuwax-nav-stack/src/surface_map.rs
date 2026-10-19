@@ -229,6 +229,20 @@ impl SurfaceMapCache {
         cache
     }
 
+    /// Opt-in integration seam for a receiver populated through its original
+    /// bounded transfer / missing-object fetch path. Build still revalidates the
+    /// publication and runs the original Reader, observations and surface builder.
+    /// This does not exercise outer RPC transport or replace any geometry source.
+    #[cfg(feature = "surface-source-qualification")]
+    pub fn configured_with_admitted_fine_source(
+        config: &crate::surface_config::SurfaceNavigationConfig,
+        receiver: nuwax_map_chunks::Receiver,
+    ) -> Self {
+        let mut cache = Self::configured(config);
+        cache.fine = Some(crate::surface_chunks::FineMapReader::from_admitted_receiver(receiver));
+        cache
+    }
+
     /// 撤销计算复用状态；不会改动已交付快照或发布任何业务状态。
     pub fn reset(&mut self) {
         self.builder.reset();

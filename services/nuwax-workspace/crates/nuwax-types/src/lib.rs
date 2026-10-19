@@ -135,3 +135,6 @@ pub mod navigation;
 pub mod ground_layer;
 
 pub mod source_time;
+
+pub mod fixed_collision;
+pub use fixed_collision::{FixedCollisionGeometry, FixedCollisionPrimitive, FixedCollisionShape};

@@ -1030,6 +1030,7 @@ async fn compute_owner_surface_new_immutable_source_discards_without_history_or_
 pub(super) fn watermark_owner_config() -> SurfaceNavigationConfig {
     let mut config = surface_config("map");
     config.apply_calibration(Some(nuwax_nav_types_messages::RobotGeometry {
+        self_collision: None,
         footprint_xy_m: vec![[-0.1, -0.1], [0.1, -0.1], [0.1, 0.1], [-0.1, 0.1]],
         z_min_m: -0.05, z_max_m: 0.2, source: "F2 real Writer owner fixture".into(),
     }), None).unwrap();

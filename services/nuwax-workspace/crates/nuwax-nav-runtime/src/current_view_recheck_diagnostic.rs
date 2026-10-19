@@ -36,6 +36,7 @@ fn current_view_fixture(
         )
         .unwrap()
         .with_body_envelope(SurfaceBodyEnvelope {
+            fixed_collision: None,
             footprint_xy_m: vec![[-0.15, -0.15], [0.15, -0.15], [0.15, 0.15], [-0.15, 0.15]],
             z_bounds_m: [-0.05, 0.2],
             body_to_support_z_m: 0.3,

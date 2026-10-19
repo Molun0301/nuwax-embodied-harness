@@ -89,9 +89,10 @@ impl Writer {
         let mut latest = 0;
         let mut bindings = BTreeMap::new();
         for reference in &root.blocks {
-            let (_, info, records) = self.reader.parts(reference.object, reference.points)?;
+            let (block, info, records) = self.reader.parts(reference.object, reference.points)?;
             admit_format(info, root)?;
             if root.version >= 5 && info.versioned {
+                ground_records::validate_legacy_sample_occupancy(&records, &block, reference.key, root.voxel_size_m)?;
                 admit_layer_spatial_binding(&mut bindings, reference.object, &records, reference.key, root.voxel_size_m)?;
             }
             admit_intrinsic(info, reference.points, root.source_timestamp_ns)?; latest = latest.max(info.latest);
@@ -192,6 +193,25 @@ impl Writer {
         ground_records::assemble_column(xy, self.voxel_size_m,
             &parts.into_iter().map(|(k, _, r)| (k, r)).collect::<Vec<_>>())
     }
+    /// One capture snapshot: read each affected native block-XY once, then
+    /// assemble each requested XY from the original shared records. No second
+    /// persistent column cache or per-point block read is introduced.
+    pub fn ground_columns(&mut self, columns: impl IntoIterator<Item = [i32; 2]>)
+        -> Result<BTreeMap<[i32; 2], ColumnGroundRecords>, String> {
+        let columns: BTreeSet<_> = columns.into_iter().collect();
+        let parts = self.prepare_ground_blocks(columns.iter().copied())?;
+        let mut groups: BTreeMap<[i32; 2], Vec<(Key, GroundRecords)>> = BTreeMap::new();
+        for (key, (_, records)) in parts {
+            groups.entry([key[0], key[1]]).or_default().push((key, records));
+        }
+        let mut result = BTreeMap::new();
+        for xy in columns {
+            let Some(parts) = groups.get(&[xy[0].div_euclid(32), xy[1].div_euclid(32)]) else { continue; };
+            let column = ground_records::assemble_column(xy, self.voxel_size_m, parts)?;
+            if column.classified_empty || !column.legacy.is_empty() || !column.heightfields.is_empty() { result.insert(xy, column); }
+        }
+        Ok(result)
+    }
     /// Replace the complete declared column, not arbitrary independent fragments.
     /// Every fallible read/validation precedes the infallible dirty installation.
     pub fn replace_ground_column(&mut self, xy: [i32; 2], column: &ColumnGroundRecords) -> Result<(), String> {
@@ -205,7 +225,7 @@ impl Writer {
         let mut prepared = self.prepare_ground_blocks(columns.keys().copied())?;
         let mut changed = BTreeSet::new();
         for (xy, column) in columns { Self::stage_column(xy, self.voxel_size_m, column, &mut prepared, &mut changed)?; }
-        for key in &changed { let (block, records) = &prepared[key]; ground_records::validate_records(records, block)?; }
+        for key in &changed { let (block, records) = &prepared[key]; ground_records::validate_records(records, block)?; ground_records::validate_legacy_sample_occupancy(records, block, *key, self.voxel_size_m)?; }
         self.install_ground_parts(prepared, &changed);
         self.write_format = 5;
         Ok(())
@@ -228,6 +248,12 @@ impl Writer {
         let local_xy = local_key([xy[0], xy[1], 0]) % 1024;
         let low = [xy[0].div_euclid(32),xy[1].div_euclid(32),i32::MIN];
         let high = [low[0],low[1],i32::MAX];
+        if column.classified_empty {
+            if let Some((&key, _)) = prepared.range(low..=high).find(|(_, (block, _))|
+                (0..32_u16).any(|z| block.contains_key(&(local_xy+1024*z)))) {
+                additions.entry(key).or_default().insert(local_xy, GroundRecord::ClassifiedEmptyColumn {});
+            }
+        }
         for (key, (_, records)) in prepared.range_mut(low..=high) {
             let add = additions.remove(key).unwrap_or_default();
             let same = (0..32_u16).all(|z| {
@@ -235,6 +261,7 @@ impl Writer {
                 let next = add.get(&k).map(|v| match v {
                     GroundRecord::LegacyPlane(v) => GroundRecordRef::LegacyPlane(v),
                     GroundRecord::HeightfieldV1(v) => GroundRecordRef::HeightfieldV1(v),
+                    GroundRecord::ClassifiedEmptyColumn {} => GroundRecordRef::ClassifiedEmptyColumn,
                 });
                 records.get(k) == next
             });
@@ -250,7 +277,7 @@ impl Writer {
         // the first fragment is installed. The dirty set came from actual edits.
         for (key, (block, records)) in prepared {
             if !changed.contains(&key) { continue; }
-            let records = records.compact();
+            let records = records.compact(&block);
             if let Some(old) = self.dirty.remove(&key) {
                 self.dirty_points -= old.block.len(); self.dirty_layer_bytes -= old.layers.bytes();
             }
@@ -284,11 +311,12 @@ impl Writer {
             }
         }
         for (xy, mut column) in originals {
+            let was_native = column.classified_empty || !column.heightfields.is_empty();
             column.legacy = column.legacy.into_iter().filter_map(|(block, mut layer)| {
                 layer.members.retain(|m| prepared[&block].0.contains_key(m));
                 if layer.members.is_empty() { return None; }
                 layer.samples.retain(|sample| {
-                    let key = sample.point.map(|v| (v / f64::from(self.voxel_size_m)).floor() as i32);
+                    let key = sample.point.map(|v| (v * (1.0 / f64::from(self.voxel_size_m))).floor() as i32);
                     !keys.contains(&key)
                 });
                 (!layer.samples.is_empty()).then_some((block,layer))
@@ -302,9 +330,10 @@ impl Writer {
                 });
                 Some(surface)
             }).collect();
+            column.classified_empty = was_native && column.legacy.is_empty() && column.heightfields.is_empty();
             Self::stage_column(xy, self.voxel_size_m, &column, &mut prepared, &mut changed)?;
         }
-        for key in &changed { let (block, records) = &prepared[key]; ground_records::validate_records(records, block)?; }
+        for key in &changed { let (block, records) = &prepared[key]; ground_records::validate_records(records, block)?; ground_records::validate_legacy_sample_occupancy(records, block, *key, self.voxel_size_m)?; }
         self.install_ground_parts(prepared, &changed);
         Ok(())
     }
@@ -520,3 +549,31 @@ mod accounting_tests;
 #[cfg(test)]
 #[path = "writer_region_tests.rs"]
 mod region_tests;
+
+#[cfg(test)]
+mod capture_column_tests {
+    use super::*;
+    #[test]
+    fn capture_batch_reads_each_native_block_once_and_preserves_columns() {
+        let repo = Repository::temporary().unwrap();
+        let mut writer = Writer::new(repo.clone(), 0.05, 4 * 1024 * 1024).unwrap();
+        let mut expected = BTreeMap::new();
+        for xy in [[0,0],[1,0],[32,0]] {
+            let column = crate::heightfield_observations::HeightfieldColumn::from_counts(xy, 0.05,
+                [-1,0,33].into_iter().map(|z|(z,[1,0,0,0,0,0,0,0])).collect()).unwrap().unwrap();
+            writer.observe(column.members().map(|(z,_)|[xy[0],xy[1],z]),20).unwrap();
+            expected.insert(xy, ColumnGroundRecords { classified_empty: false, legacy:vec![],
+                heightfields:vec![HeightfieldSurface {column,samples:vec![]}] });
+        }
+        writer.replace_ground_columns(expected.iter().map(|(xy,column)|(*xy,column))).unwrap();
+        let root = writer.snapshot(Domain {session:"capture-read".into(),generation:1,
+            frame_generation:1,producer_generation:1},1,20).unwrap();
+        assert_eq!(root.blocks.len(),6);
+        writer.reader = RegionReader::new(repo.clone(),0);
+        let before = repo.counts().0;
+        let actual = writer.ground_columns([[0,0],[1,0],[32,0],[0,0],[200,200]]).unwrap();
+        assert_eq!(repo.counts().0-before,6,"one original decode request per distinct native block");
+        assert_eq!(actual,expected);
+        assert!(!writer.has_unpublished_changes());
+    }
+}

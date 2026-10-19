@@ -21,6 +21,7 @@ fn check_recent_guide_fine_escape(tolerance: Option<f64>) {
     extra.extend((-130..131).flat_map(|x|(100..230).map(move |y|[x,y,-1])));
     let base=crate::tests::scene_with_extra_cells(None,0.0,&extra)
         .with_body_envelope(SurfaceBodyEnvelope {
+            fixed_collision: None,
             footprint_xy_m:vec![[-0.3,-0.0599],[0.3,-0.0599],[0.3,0.0599],[-0.3,0.0599]],
             z_bounds_m:[-0.15,0.15],body_to_support_z_m:0.4,max_step_up_m:0.0,max_step_down_m:0.0,
             max_cross_slope_deg:18.0,support_uncertainty_m:0.0,

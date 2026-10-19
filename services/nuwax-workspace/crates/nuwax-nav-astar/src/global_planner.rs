@@ -827,6 +827,7 @@ mod tests {
 
     fn test_geometry(half_width: f64) -> RobotGeometry {
         RobotGeometry {
+            self_collision: None,
             footprint_xy_m: vec![
                 [-0.3, -half_width],
                 [0.3, -half_width],

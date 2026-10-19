@@ -493,6 +493,7 @@ mod tests {
 
     fn open_room_module() -> (SimplePlannerModule, OccupancyGrid2D) {
         let geometry = nuwax_nav_types_messages::RobotGeometry {
+            self_collision: None,
             footprint_xy_m: vec![[-0.2, -0.15], [0.2, -0.15], [0.2, 0.15], [-0.2, 0.15]],
             z_min_m: -0.2,
             z_max_m: 0.2,

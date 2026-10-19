@@ -64,7 +64,7 @@ mod tests {
             wall_buffer_m: 0.5, wall_buffer_weight: 2.0, step_threshold_m: 0.2,
             max_slope_deg: 18.0, min_step_tread_depth_m: 0.2, step_penalty_weight: 2.0,
             goal_tolerance: 0.1, viz_publish_hz: 0.0 };
-        let model = SurfaceBodyEnvelope { footprint_xy_m: vec![[-half, -half], [half, -half],
+        let model = SurfaceBodyEnvelope {fixed_collision:None, footprint_xy_m: vec![[-half, -half], [half, -half],
             [half, half], [-half, half]], z_bounds_m: [-half, half], body_to_support_z_m: offset,
             max_step_up_m: 0.2, max_step_down_m: 0.2, max_cross_slope_deg: 18.0, support_uncertainty_m: 0.0 };
         SurfaceSnapshot::from_points(&[(0.05, 0.05, 0.025)], config, f).unwrap()
@@ -154,4 +154,85 @@ mod tests {
         // Its over-budget Unknown branch is tested at that owner gate.
         assert!(!ReferenceCorridor::new(&surface, &route).unwrap().intersects_columns(0.05, &[[71, 11]]));
     }
+
+    fn with_outlying_fixed(surface: &SurfaceSnapshot, shape: serde_json::Value) -> SurfaceSnapshot {
+        let mut model=surface.body_envelope().unwrap().clone();
+        let mut primitive=serde_json::json!({"link_name":"actual_outlying_fixed",
+            "translation_m":[0.0,-1.0,0.0],"rotation_row_major":[1,0,0,0,1,0,0,0,1]});
+        primitive.as_object_mut().unwrap().extend(shape.as_object().unwrap().clone());
+        model.fixed_collision=Some(Arc::new(serde_json::from_value(serde_json::json!({
+            "model_base_link":"base","primitives":[primitive],
+            "excluded_moving_collision_count":0,"unsupported_collision_count":0})).unwrap()));
+        surface.with_body_envelope(model).unwrap()
+    }
+
+    #[test]
+    fn fixed_outside_envelope_is_inside_refresh_scope_and_actual_collision_query() {
+        use nuwax_nav_mls_planner::{SurfaceObservation, SurfaceError};
+        use nuwax_nav_mls_planner::surface::{BodyRejection, OccupancySource};
+        let original=original();
+        let route=path(&[[0.55,1.55,0.5],[5.55,1.55,0.5]]);
+        assert!(!ReferenceCorridor::new(&original,&route).unwrap().intersects_columns(0.05,&[[71,11]]));
+        let box_shape=serde_json::json!({"shape":"box","size_m":[0.2,0.2,0.2]});
+        let fixed=with_outlying_fixed(&original,box_shape);
+        let corridor=ReferenceCorridor::new(&fixed,&route).unwrap();
+        assert!(corridor.intersects_columns(0.05,&[[71,11]]));
+        assert!(corridor.intersects_columns(0.1,&[[35,5]]));
+        let mut observations=SurfaceObservations::new(0.05,32).unwrap();
+        observations.replace_block([2,0,0],std::collections::BTreeMap::from([
+            ([71,11,10],SurfaceObservation {observed_ns:1,hits:1})])).unwrap();
+        let blocked=fixed.with_observations(Some(Arc::new(observations)));
+        let pose=([3.55,1.55,0.5],[0.0,0.0,0.0,1.0]);
+        let query=blocked.body_query();let ground=query.start_ground_state(pose).unwrap();
+        let mut witness=None;
+        assert_eq!(query.validate_motion_from_ground(pose,pose,&ground,&[],&mut witness),
+            Err(SurfaceError::InsufficientClearance));
+        assert!(matches!(witness.unwrap().rejection,BodyRejection::Occupancy {
+            cell:[71,11,10],source:OccupancySource::Fine|OccupancySource::FineFringe,..}));
+        eprintln!("FIXED_SCOPE outlying_box_fine_and_coarse_related=true actual_fine_collision=[71,11,10]");
+    }
+
+    #[test]
+    fn fixed_scope_bounds_world_aabb_corners_and_counts_original_advisory_budget() {
+        use crate::surface_changes::{SurfaceGeometryChanges,SurfaceJobTicket,MAX_REFERENCE_SCOPE_WORK};
+        let base=original();
+        for (shape,radius) in [
+            (serde_json::json!({"shape":"box","size_m":[0.2,0.2,0.2]}),0.1_f64*3.0_f64.sqrt()),
+            (serde_json::json!({"shape":"sphere","radius_m":0.2}),0.2),
+            (serde_json::json!({"shape":"cylinder","radius_m":0.2,"length_m":0.4}),0.2_f64.hypot(0.2))] {
+            let map=Arc::new(with_outlying_fixed(&base,shape));
+            let yaw=map.reference_geometry_scope_radius(true,5.55).unwrap();
+            let tilted=map.reference_geometry_scope_radius(false,5.55).unwrap();
+            assert!(yaw>=1.0+std::f64::consts::SQRT_2*radius);
+            assert!(tilted>=1.0+3.0_f64.sqrt()*radius && tilted>=yaw);
+            let mut ticket=SurfaceJobTicket::new(Some(map.clone()));
+            ticket.observe(&map,Some(&map),&Arc::new(SurfaceGeometryChanges::Columns {
+                fine_size:0.05,fine:vec![[1000,1000]],planner_size:0.1,coarse:vec![]}));
+            let pose=path(&[[0.55,1.55,0.5]]).poses.remove(0);
+            // Four original vertices + one actual primitive + one column.
+            let mut route=Path3D {poses:vec![pose.clone();MAX_REFERENCE_SCOPE_WORK-6]};
+            assert!(ticket.permits_path(&map,&route));
+            route.poses.push(pose);
+            assert!(!ticket.permits_path(&map,&route));
+        }
+    }
+    #[test]
+    fn fixed_union_aabb_corners_from_different_primitives_are_in_scope() {
+        let base=original();let mut model=base.body_envelope().unwrap().clone();
+        let primitives=[[10.0,0.0,0.0],[0.0,10.0,0.0]].map(|translation|
+            serde_json::json!({"link_name":"union_corner","translation_m":translation,
+                "rotation_row_major":[1,0,0,0,1,0,0,0,1],"shape":"sphere","radius_m":0.1}));
+        model.fixed_collision=Some(Arc::new(serde_json::from_value(serde_json::json!({
+            "model_base_link":"base","primitives":primitives,
+            "excluded_moving_collision_count":0,"unsupported_collision_count":0})).unwrap()));
+        let source=base.with_body_envelope(model).unwrap();
+        let union_xy=10.1_f64.hypot(10.1);
+        let union_xyz=union_xy.hypot(0.1);
+        let yaw=source.reference_geometry_scope_radius(true,20.0).unwrap();
+        let tilt=source.reference_geometry_scope_radius(false,20.0).unwrap();
+        assert!(yaw>=union_xy,"{yaw} < {union_xy}");
+        assert!(tilt>=union_xyz && tilt>=yaw);
+        eprintln!("FIXED_UNION corners_xy={union_xy} corners_xyz={union_xyz} yaw_scope={yaw} tilt_scope={tilt}");
+    }
+
 }

@@ -501,6 +501,8 @@ impl SurfaceGoalSourceAdapter {
         let new_snapshot = self.last_notification != Some(notification) || !same_geometry;
         let deferred = self.deferred_route.as_ref().filter(|deferred| {
             deferred.source.same_frontier_query_geometry(source_snapshot.as_ref())
+                // Missing-contact evidence is pose-specific, unlike a search allowance.
+                && (deferred.source_unavailable.is_none() || same_query)
                 && distance(deferred.start_body, [position.x, position.y, position.z])
                     <= f64::from(source_snapshot.config().goal_tolerance.max(source_snapshot.config().voxel_size))
         });
@@ -612,6 +614,8 @@ impl SurfaceGoalSourceAdapter {
         let mut route_query_count=0;
         let state_limit = active_deferred.map_or(MAX_FRONTIER_ROUTE_STATES, |route| route.state_limit);
         let route_budget = FrontierRouteBudget::with_states(MAX_FRONTIER_SEARCH_STATES.max(state_limit));
+        *route_budget.source_unavailable.borrow_mut() =
+            deferred.and_then(|route| route.source_unavailable.clone());
         let mut next_deferred = None;
         let mut route_budget_limited=false;
         let mut next_route_cursor = active_deferred.map_or(0, |route| route.resume_cursor);
@@ -630,6 +634,7 @@ impl SurfaceGoalSourceAdapter {
             start_body: deferred_start_body, start_orientation: deferred_start_orientation,
             state_limit: nuwax_nav_pct::SearchLimits::default().max_states,
             terminal: true, resume_cursor, unresolved,
+            source_unavailable: route_budget.source_unavailable.borrow().clone(),
         };
         delta.route_cursor = Some(0);
         delta.route_inconclusive = Some(false);
@@ -698,10 +703,13 @@ impl SurfaceGoalSourceAdapter {
                     let nominal = [candidate.support_xyz[0], candidate.support_xyz[1], nominal_z];
                     let Some(height) = tomogram.calibrated_reference_height(nominal) else { continue; };
                     let carried = [nominal[0], nominal[1], height + bias];
-                    let reference = match tomogram.project_reference_motion(carried,
+                    let reference = match tomogram.project_reference_motion_typed(carried,
                         [carried[0], carried[1]], &boundary) {
                         Ok(reference) => reference,
-                        Err(_) => continue,
+                        Err(error) => {
+                            route_budget.record_source_unavailable(error);
+                            continue;
+                        }
                     };
                     if snapshot.validate_planar_recent_motion(reference, reference).is_err() { continue; }
                     match snapshot.body_position_from_support(
@@ -792,6 +800,7 @@ impl SurfaceGoalSourceAdapter {
                         terminal,
                         resume_cursor: deferred_resume_cursor.unwrap_or(ordinal + 1),
                         unresolved: previous_inconclusive || terminal,
+                        source_unavailable: route_budget.source_unavailable.borrow().clone(),
                     });
                     // Do not consume other candidates while this one is
                     // unresolved: its untouched suffix is resumed explicitly.
@@ -815,7 +824,13 @@ impl SurfaceGoalSourceAdapter {
                 })
             });
             if admissible.is_empty() {
+                if nuwax_nav_pct::planning_cancelled() {
+                    return Err(ExploreError::SourceError("frontier planning cancelled".into()));
+                }
                 delta.last_no_frontier = Some(false);
+                if let Some(error) = route_budget.source_unavailable.borrow().as_ref() {
+                    return Ok(delta.unavailable(error.to_string()));
+                }
                 return Ok(ExplorationPoll::Pending);
             }
         }
@@ -885,6 +900,9 @@ impl SurfaceGoalSourceAdapter {
                 delta.route_inconclusive = Some(unresolved);
                 delta.last_no_frontier = Some(false);
                 if terminal && resume_cursor >= geometric_candidate_count {
+                    if let Some(error) = route_budget.source_unavailable.borrow().as_ref() {
+                        return Ok(delta.unavailable(error.to_string()));
+                    }
                     delta.last_error = Some(Some(format!(
                         "ResourceLimited: frontier route remains inconclusive within its bounded domain ({limit} state allowance)",
                     )));
@@ -905,6 +923,15 @@ impl SurfaceGoalSourceAdapter {
                 delta.last_no_frontier = Some(false);
                 delta.last_error = Some(Some("frontier search is continuing the remaining candidates".into()));
                 return Ok(ExplorationPoll::Pending);
+            }
+            if let Some(error) = route_budget.source_unavailable.borrow().as_ref() {
+                // Keep the unresolved cause with this exact candidate continuation.
+                // Repeated unchanged polls must not become Pending or NoFrontier.
+                delta.deferred_route = Some(Some(continuation(geometric_candidate_count, unresolved)));
+                delta.route_cursor = Some(geometric_candidate_count);
+                delta.route_inconclusive = Some(unresolved);
+                delta.last_no_frontier = Some(false);
+                return Ok(delta.unavailable(error.to_string()));
             }
             if unresolved {
                 delta.deferred_route = Some(Some(continuation(geometric_candidate_count, true)));
@@ -1252,6 +1279,7 @@ struct FrontierRouteBudget {
     queries: std::cell::Cell<usize>,
     expanded: std::cell::Cell<usize>,
     inconclusive: std::cell::Cell<bool>,
+    source_unavailable: std::cell::RefCell<Option<nuwax_nav_pct::ReferenceMotionFailure>>,
 }
 impl Default for FrontierRouteBudget {
     fn default() -> Self { Self::with_states(MAX_FRONTIER_SEARCH_STATES) }
@@ -1261,7 +1289,13 @@ impl FrontierRouteBudget {
         Self { total, last_inconclusive: std::cell::Cell::new(false),
             last_domain_limited: std::cell::Cell::new(false),
             remaining: std::cell::Cell::new(total), queries: std::cell::Cell::new(0),
-            expanded: std::cell::Cell::new(0), inconclusive: std::cell::Cell::new(false) }
+            expanded: std::cell::Cell::new(0), inconclusive: std::cell::Cell::new(false),
+            source_unavailable: std::cell::RefCell::new(None) }
+    }
+    fn record_source_unavailable(&self, error: nuwax_nav_pct::ReferenceMotionFailure) {
+        if matches!(error, nuwax_nav_pct::ReferenceMotionFailure::NativeContactGeometryUnavailable) {
+            self.source_unavailable.borrow_mut().get_or_insert(error);
+        }
     }
     fn exhausted(&self) -> bool {
         self.remaining.get() == 0 || self.queries.get() >= MAX_FRONTIER_ROUTE_QUERIES
@@ -1292,6 +1326,7 @@ struct DeferredFrontierRoute {
     terminal: bool,
     resume_cursor: usize,
     unresolved: bool,
+    source_unavailable: Option<nuwax_nav_pct::ReferenceMotionFailure>,
 }
 
 struct FrontierGeometry {
@@ -1429,10 +1464,20 @@ fn frontier_route_cost(
         snapshot.body_position_from_support(reference, goal_body.1, offset)
             .map(|body| (body, goal_body.1))
     };
+    // The PCT segment filter is bool-valued. Keep this query's typed cause
+    // outside it; a proved alternative route still wins over rejected branches.
+    let source_unavailable = std::cell::RefCell::new(None);
     let planar_accepts = |from: [f64;3], to: [f64;3]| {
-        tomogram.project_reference_motion(from,[to[0],to[1]],boundary)
-            .is_ok_and(|end| distance(end,to)<=1e-6
-                && snapshot.validate_planar_recent_motion(from,end).is_ok())
+        match tomogram.project_reference_motion_typed(from,[to[0],to[1]],boundary) {
+            Ok(end) => distance(end,to)<=1e-6
+                && snapshot.validate_planar_recent_motion(from,end).is_ok(),
+            Err(error) => {
+                if matches!(error, nuwax_nav_pct::ReferenceMotionFailure::NativeContactGeometryUnavailable) {
+                    source_unavailable.borrow_mut().get_or_insert(error);
+                }
+                false
+            }
+        }
     };
     let accepts = |from: [f64; 3], to: [f64; 3]| {
         if !has_body { return planar_accepts(carried(from), carried(to)); }
@@ -1450,6 +1495,10 @@ fn frontier_route_cost(
     ) {
         Ok(route) => route,
         Err(error) => {
+            if let Some(error) = source_unavailable.borrow_mut().take() {
+                budget.record_source_unavailable(error);
+                return None;
+            }
             if matches!(error, nuwax_nav_pct::PlanningFailure::BudgetExhausted(_)
                 | nuwax_nav_pct::PlanningFailure::SearchDomainLimited(_)) {
                 budget.last_domain_limited.set(matches!(error,
@@ -1463,15 +1512,27 @@ fn frontier_route_cost(
     budget.expanded.set(budget.expanded.get() + route.stats.expanded);
     budget.remaining.set(budget.remaining.get() + allowance.saturating_sub(route.stats.expanded.max(1)));
     if !has_body {
+        // Failed alternatives do not contaminate the accepted route witness.
+        source_unavailable.borrow_mut().take();
         let mut previous = start;
         let mut cost = 0.0;
         for point in route.points {
             let next = carried(point);
-            if !planar_accepts(previous, next) { return None; }
+            if !planar_accepts(previous, next) {
+                if let Some(error) = source_unavailable.borrow_mut().take() {
+                    budget.record_source_unavailable(error);
+                }
+                return None;
+            }
             cost += distance(previous, next);
             previous = next;
         }
-        if !planar_accepts(previous, goal) { return None; }
+        if !planar_accepts(previous, goal) {
+            if let Some(error) = source_unavailable.borrow_mut().take() {
+                budget.record_source_unavailable(error);
+            }
+            return None;
+        }
         return Some(cost + distance(previous, goal));
     }
     let mut previous = start_body;
@@ -1584,6 +1645,7 @@ mod tests {
         route_cursor: usize,
         route_inconclusive: bool,
         deferred_route: Option<([f64; 3], [f64; 3], [f64; 4], usize, bool, usize, bool)>,
+        deferred_source_unavailable: Option<nuwax_nav_pct::ReferenceMotionFailure>,
         selected: Option<(FrontierGoal, [f64; 3], f64)>,
         source_anchor: Option<*const SurfaceSnapshot>,
         notification: Option<u64>,
@@ -1604,6 +1666,7 @@ mod tests {
             deferred_route: source.deferred_route.as_ref().map(|deferred|
                 (deferred.candidate.support_xyz, deferred.start_body, deferred.start_orientation,
                     deferred.state_limit, deferred.terminal, deferred.resume_cursor, deferred.unresolved)),
+            deferred_source_unavailable: source.deferred_route.as_ref().and_then(|route| route.source_unavailable.clone()),
             selected: source.selected.as_ref().map(|selected| {
                 (
                     selected.goal.clone(),
@@ -2107,6 +2170,7 @@ mod tests {
                 std::iter::empty::<(u32, [f64; 3])>()).unwrap()),
             Arc::new(snapshot.with_virtual_obstacles([0.0, 0.0], 0.1, 20, 20, &vec![false; 400]).unwrap()),
             Arc::new(snapshot.as_ref().clone().with_body_envelope(nuwax_nav_mls_planner::SurfaceBodyEnvelope {
+                fixed_collision: None,
                 footprint_xy_m: vec![[-0.1, -0.1], [0.1, -0.1], [0.1, 0.1], [-0.1, 0.1]],
                 z_bounds_m: [-0.05, 0.2], body_to_support_z_m: 0.3,
                 max_step_up_m: 0.2, max_step_down_m: 0.2, max_cross_slope_deg: 15.0,
@@ -2187,6 +2251,7 @@ mod tests {
     fn planning_tomogram_warm_map_does_not_bypass_actual_body_recent_collision() {
         let snapshot = map().as_ref().clone().with_body_envelope(
             nuwax_nav_mls_planner::SurfaceBodyEnvelope {
+                fixed_collision: None,
                 footprint_xy_m: vec![[-0.8, -0.12], [0.8, -0.12], [0.8, 0.12], [-0.8, 0.12]],
                 z_bounds_m: [-0.05, 0.2], body_to_support_z_m: 0.3,
                 max_step_up_m: 0.2, max_step_down_m: 0.2, max_cross_slope_deg: 15.0,
@@ -2388,6 +2453,7 @@ mod tests {
             config.step_threshold_m = 0.21;
             config.min_step_tread_depth_m = 0.2;
             let model = SurfaceBodyEnvelope {
+                fixed_collision: None,
                 footprint_xy_m: vec![[-0.55, -0.14], [0.55, -0.14], [0.55, 0.14], [-0.55, 0.14]],
                 z_bounds_m: [-0.1, 0.25], body_to_support_z_m: 0.4,
                 max_step_up_m: 0.2, max_step_down_m: 0.1,
@@ -2740,6 +2806,7 @@ mod tests {
                 || (f64::from(y)-1.05).abs() > 0.12).collect();
         let snapshot = Arc::new(SurfaceSnapshot::from_points(&points,map().config().clone(),0.05)
             .unwrap().with_body_envelope(nuwax_nav_mls_planner::SurfaceBodyEnvelope {
+                fixed_collision: None,
                 footprint_xy_m: vec![[-0.3,-0.12],[0.3,-0.12],[0.3,0.12],[-0.3,0.12]],
                 z_bounds_m: [-0.05,0.2], body_to_support_z_m: 0.3,
                 max_step_up_m: 0.2, max_step_down_m: 0.2, max_cross_slope_deg: 15.0,
@@ -2789,6 +2856,7 @@ mod tests {
     fn original_long_body_fixture_exhausts_radially_clear_frontiers() {
         let snapshot = Arc::new(map().as_ref().clone().with_body_envelope(
             nuwax_nav_mls_planner::SurfaceBodyEnvelope {
+                fixed_collision: None,
                 footprint_xy_m: vec![[-0.8, -0.12], [0.8, -0.12], [0.8, 0.12], [-0.8, 0.12]],
                 z_bounds_m: [-0.05, 0.2],
                 body_to_support_z_m: 0.3,
@@ -2827,6 +2895,7 @@ mod tests {
     fn assert_long_body_frontier_heading(calibrated: bool) {
         let snapshot = Arc::new(map().as_ref().clone().with_body_envelope(
             nuwax_nav_mls_planner::SurfaceBodyEnvelope {
+                fixed_collision: None,
                 footprint_xy_m: vec![[-0.8, -0.12], [0.8, -0.12], [0.8, 0.12], [-0.8, 0.12]],
                 z_bounds_m: [-0.05, 0.2],
                 body_to_support_z_m: 0.3,
@@ -3459,6 +3528,7 @@ mod tests {
         ));
     }
 
+    include!("surface_native_contact_tests.rs");
     include!("surface_unknown_ground_tests.rs");
     include!("surface_prepared_reference_tests.rs");
     include!("surface_view_ownership_tests.rs");

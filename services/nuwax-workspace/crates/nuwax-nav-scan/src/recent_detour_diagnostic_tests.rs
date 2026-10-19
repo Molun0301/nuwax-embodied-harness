@@ -19,6 +19,7 @@ fn fixture() -> (SurfaceSnapshot, SurfaceSnapshot, BodyPose, MotionKinematics) {
     }}
     let base = SurfaceSnapshot::from_points(&points, cfg, 0.1).unwrap()
         .with_body_envelope(SurfaceBodyEnvelope {
+            fixed_collision: None,
             footprint_xy_m: vec![[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],
             z_bounds_m: [-0.05,0.2], body_to_support_z_m: 0.4,
             max_step_up_m: 0.2, max_step_down_m: 0.2,

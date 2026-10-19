@@ -13,6 +13,7 @@ fn calibrated_config() -> SurfaceNavigationConfig {
         "map".into(), 0.4, 0.3, 0.6, 0.1, 0.15, 18.0, 0.2,
     ).unwrap();
     result.apply_calibration(Some(nuwax_nav_types_messages::RobotGeometry {
+        self_collision: None,
         footprint_xy_m: vec![[-0.15,-0.15],[0.15,-0.15],[0.15,0.15],[-0.15,0.15]],
         z_min_m: -0.05,
         z_max_m: 0.2,

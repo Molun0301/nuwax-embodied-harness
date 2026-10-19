@@ -633,6 +633,7 @@ use super::*;
         let scalar = [13817944376698155827, 4594572339843380019, 4600877379321698714, 0, 0, 4625759767262920704, 0].map(f64::from_bits);
         assert_eq!(fine.to_bits(), 0.01_f32.to_bits());
         let envelope = SurfaceBodyEnvelope {
+            fixed_collision: None,
             footprint_xy_m: footprint.into_iter().map(|p| p.map(f64::from_bits)).collect(),
             z_bounds_m: [scalar[0], scalar[1]], body_to_support_z_m: scalar[2],
             max_step_up_m: scalar[3], max_step_down_m: scalar[4],
@@ -1124,6 +1125,7 @@ fn tga_map(missing_future_strip: bool, expired_future_strip: bool) -> Arc<Surfac
     } else {
         (*base).clone()
     }.with_body_envelope(SurfaceBodyEnvelope {
+        fixed_collision: None,
         footprint_xy_m: vec![[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],
         z_bounds_m: [-0.05, 0.2],
         body_to_support_z_m: 0.3,
@@ -1517,6 +1519,7 @@ fn doorway_scene_transforms_preserve_identity_bits_and_source_key_bijections() {
         let scalar = [13817944376698155827, 4594572339843380019, 4600877379321698714, 0, 0, 4625759767262920704, 0].map(f64::from_bits);
         assert_eq!(fine.to_bits(), 0.01_f32.to_bits());
         let envelope = SurfaceBodyEnvelope {
+            fixed_collision: None,
             footprint_xy_m: footprint.into_iter().map(|p| p.map(f64::from_bits)).collect(),
             z_bounds_m: [scalar[0], scalar[1]], body_to_support_z_m: scalar[2],
             max_step_up_m: scalar[3], max_step_down_m: scalar[4],
@@ -2313,6 +2316,7 @@ fn cpp_hard_pivot_map() -> Arc<SurfaceSnapshot> {
         viz_publish_hz: 0.0,
     };
     let envelope = SurfaceBodyEnvelope {
+        fixed_collision: None,
         footprint_xy_m: vec![[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],
         z_bounds_m: [-0.15,0.15],
         body_to_support_z_m: 0.4,

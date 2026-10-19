@@ -30,6 +30,7 @@ fn ground(kind: Terrain) -> BTreeSet<[i32; 3]> {
 
 fn envelope(whole_body: bool) -> SurfaceBodyEnvelope {
     SurfaceBodyEnvelope {
+        fixed_collision: None,
         footprint_xy_m: vec![[-0.3,-0.15],[0.3,-0.15],[0.3,0.15],[-0.3,0.15]],
         z_bounds_m: if whole_body {[-0.448,0.057]} else {[-0.15,0.15]},
         body_to_support_z_m: 0.4, max_step_up_m: 0.15, max_step_down_m: 0.15,

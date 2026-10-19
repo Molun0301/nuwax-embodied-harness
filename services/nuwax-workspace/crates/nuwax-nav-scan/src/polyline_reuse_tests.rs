@@ -68,9 +68,11 @@ fn nonarrival_polyline_reuse_preserves_boundary_drain_and_reduces_queries() {
         {
             eprintln!("POLYLINE_REUSE boundary arrival={} original={:?} reuse={:?} work={:?}",
                 arrival.is_some(),counts[0],counts[1],works[0]);
+            assert_eq!(counts[0][0],1,"原候选重试也只能绑定一个请求拥有方");
+            assert_eq!(counts[1][0],1,"复用分支不能在采样点重新绑定来源");
             if arrival.is_none() {
-                assert!(counts[0].iter().zip(counts[1]).all(|(a,b)|*a>b),
-                    "one rejected projection must remove view, endpoint and sweep work");
+                assert!(counts[0][1..].iter().zip(&counts[1][1..]).all(|(a,b)|a>b),
+                    "one rejected projection must remove endpoint and sweep work");
             } else { assert_eq!(counts[0],counts[1],"different arrival regions must still project separately"); }
         }
     }

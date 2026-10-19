@@ -1,7 +1,9 @@
-use ahash::{AHashMap, AHashSet};
+use ahash::RandomState;
 use crate::cancellation::checkpoint;
 #[cfg(feature = "mls-adapter")]
 use nuwax_nav_mls_planner::SurfaceSnapshot;
+#[cfg(feature = "mls-adapter")]
+use nuwax_nav_mls_planner::surface::GroundKey;
 use std::collections::VecDeque;
 use nuwax_types::ground_layer::{GroundApproximation, GroundEvidence, GroundLayer};
 
@@ -15,22 +17,47 @@ pub struct Cell {
     pub ground_interval: [f64; 2],
     /// Compatibility provenance, not a claim of measured point statistics.
     pub ground_approximation: GroundApproximation,
+    /// 原不可变源内已选地表的键，不复制其成员或统计分布。
+    #[cfg(feature = "mls-adapter")]
+    pub source_ground: Option<GroundKey>,
     pub ceiling: f64,
     /// 已知障碍的层内距离，不把未采到地面的列直接当成墙。
     pub clearance: f64,
     pub(crate) support_clearance: f64,
     pub cost: f64,
+    pub(crate) terrain: f64,
+    pub(crate) terrain_upper: f64,
     pub(crate) neighbors: Vec<usize>,
 }
-#[derive(Debug)]
+/// 构图只需要固定高度、占据范围与来源键，不建立另一份地表记录。
+pub(crate) struct GroundCandidate {
+    pub height: f64,
+    pub bounds: [f64; 2],
+    pub approximation: GroundApproximation,
+    pub ceiling: f64,
+    #[cfg(feature = "mls-adapter")]
+    pub source_ground: Option<GroundKey>,
+}
+impl GroundCandidate {
+    pub(crate) fn legacy(layer: GroundLayer, ceiling: f64) -> Self {
+        Self { height: layer.representative_z, bounds: layer.occupied_interval,
+            approximation: layer.approximation, ceiling,
+            #[cfg(feature = "mls-adapter")]
+            source_ground: None }
+    }
+}
+#[derive(Clone, Debug)]
 pub struct Tomogram {
     pub resolution: f64,
     pub(crate) source_quantum: f64,
-    pub cells: Vec<Cell>,
-    pub(crate) columns: AHashMap<[i32; 2], Vec<usize>>,
-    known_columns: AHashSet<[i32; 2]>,
+    pub cells: crate::Cells,
+    pub(crate) columns: im::HashMap<[i32; 2], Vec<usize>, RandomState>,
+    pub(crate) known_columns: im::HashSet<[i32; 2], RandomState>,
     /// Physical occupancy survives even when no walkable floor cell is produced.
-    pub(crate) occupancy: AHashMap<[i32; 2], Vec<[f64; 2]>>,
+    pub(crate) occupancy: im::HashMap<[i32; 2], Vec<[f64; 2]>, RandomState>,
+    pub(crate) indices: crate::incremental::Indices,
+    pub(crate) seed_order: crate::seed_order::SeedOrder,
+    pub(crate) occupied_volume: bool,
     pub(crate) xy_bounds: Option<[[i32; 2]; 2]>,
     pub(crate) ground_bounds: Option<[f64; 2]>,
     pub(crate) minimum_cost: f64,
@@ -114,7 +141,7 @@ impl Tomogram {
             f64::from(config.max_slope_deg),
             body.map_or(half_width, |body| body.radius()),
             source.ground_evidence()==nuwax_nav_mls_planner::surface::GroundEvidence::OccupiedVolume,
-            |column,bands|source.navigation_measured_ground_layers(column,resolution,bands),
+            |column,bands|crate::source_ground::candidates(source,column,resolution,bands),
         )?;
         // Cheap immutable snapshot sharing also preserves masks in never-observed
         // columns. Absence from the sparse cell graph is not mask permission.
@@ -182,7 +209,7 @@ impl Tomogram {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn from_columns_with_layers(
+    pub(crate) fn from_columns_with_layers(
         resolution: f64,
         source_quantum: f64,
         columns: impl IntoIterator<Item = ([i32; 2], Vec<[f64; 2]>)>,
@@ -193,7 +220,7 @@ impl Tomogram {
         max_slope_deg: f64,
         clearance_radius: f64,
         occupied_volume:bool,
-        measured_layers: impl Fn([i32;2], &[[f64;2]])->Option<Vec<(GroundLayer,f64)>>,
+        measured_layers: impl Fn([i32;2], &[[f64;2]])->Option<Vec<GroundCandidate>>,
     ) -> Result<Self, String> {
         checkpoint()?;
         if !resolution.is_finite()
@@ -218,10 +245,13 @@ impl Tomogram {
         let mut map = Self {
             resolution,
             source_quantum,
-            cells: Vec::new(),
-            columns: AHashMap::new(),
-            known_columns: AHashSet::new(),
-            occupancy: AHashMap::new(),
+            cells: crate::Cells::default(),
+            columns: Default::default(),
+            known_columns: Default::default(),
+            occupancy: Default::default(),
+            indices: Default::default(),
+            seed_order: Default::default(),
+            occupied_volume,
             xy_bounds: None,
             ground_bounds: None,
             minimum_cost: crate::reference::UNKNOWN_COST,
@@ -239,7 +269,9 @@ impl Tomogram {
         let spacing = body_height.max(resolution);
         for (column, mut bands) in columns {
             checkpoint()?;
-            map.known_columns.insert(column);
+            if map.known_columns.insert(column).is_some() {
+                return Err("层析输入含重复 XY 列".into());
+            }
             match &mut map.xy_bounds {
                 Some([lo, hi]) => for axis in 0..2 {
                     lo[axis] = lo[axis].min(column[axis]);
@@ -264,13 +296,14 @@ impl Tomogram {
                         if occupied_volume {GroundEvidence::OccupiedVolume}else{GroundEvidence::MeasuredSurface})
                         .expect("validated height band");
                     let ceiling=merged.get(i+1).map_or(f64::INFINITY,|next|next[0]);
-                    (layer,ceiling)
+                    GroundCandidate::legacy(layer,ceiling)
                 }).collect()
             });
             map.occupancy.insert(column, merged);
-            for (layer,ceiling) in layers {
+            for candidate in layers {
                 checkpoint()?;
-                let ground=layer.representative_z;
+                let ground=candidate.height;
+                let ceiling=candidate.ceiling;
                 if ceiling - ground + 1e-6 < body_height {
                     continue;
                 }
@@ -279,24 +312,32 @@ impl Tomogram {
                     bounds @ None => *bounds = Some([ground, ground]),
                 }
                 let id = map.cells.len();
-                map.cells.push(Cell {
+                map.cells.push_back(Cell {
                     column,
                     layer: (ground / spacing).floor() as i32,
                     ground,
-                    ground_interval: layer.occupied_interval,
-                    ground_approximation: layer.approximation,
+                    ground_interval: candidate.bounds,
+                    ground_approximation: candidate.approximation,
+                    #[cfg(feature = "mls-adapter")]
+                    source_ground: candidate.source_ground,
                     ceiling,
                     clearance: f64::INFINITY,
                     support_clearance: f64::INFINITY,
                     cost: 1.0,
+                    terrain: 0.0,
+                    terrain_upper: 0.0,
                     neighbors: Vec::with_capacity(8),
                 });
                 map.columns.entry(column).or_default().push(id);
+                map.seed_order.insert(&map.cells[id], id)?;
             }
         }
         checkpoint()?;
         map.connect()?;
         map.compute_costs()?;
+        crate::incremental_fields::initialize_upper(&mut map)?;
+        map.cells.seal_indices();
+        map.indices = crate::incremental::Indices::from_map(&map)?;
         checkpoint()?;
         Ok(map)
     }
@@ -307,6 +348,18 @@ impl Tomogram {
             (f64::from(c.column[1]) + 0.5) * self.resolution,
             c.ground,
         ]
+    }
+    /// 在已选单元的实际 XY 读源高度，不能把中心地表外推到相邻列。
+    pub fn ground_height_at(&self, id: usize, xy: [f64; 2]) -> Option<f64> {
+        if !xy.into_iter().all(f64::is_finite) { return None; }
+        let cell=self.cells.get(id)?;
+        let column=xy.map(|v|(v/self.resolution).floor() as i32);
+        if column!=cell.column { return None; }
+        #[cfg(feature = "mls-adapter")]
+        if cell.source_ground.is_some() {
+            return self.source_ground_record(id)?.height_at(xy).filter(|height|height.is_finite());
+        }
+        Some(cell.ground)
     }
     pub fn cell_at(&self, point: [f64; 3]) -> Option<usize> {
         if !point.into_iter().all(f64::is_finite) {
@@ -320,15 +373,15 @@ impl Tomogram {
             .get(&column)?
             .iter()
             .copied()
-            .min_by(|&a, &b| {
-                (self.cells[a].ground - point[2])
-                    .abs()
-                    .total_cmp(&(self.cells[b].ground - point[2]).abs())
+            .filter_map(|id|self.ground_height_at(id,[point[0],point[1]]).map(|height|(id,height)))
+            .min_by(|(_, a), (_, b)| {
+                (a - point[2]).abs().total_cmp(&(b - point[2]).abs())
             })
-            .filter(|&id| {
-                (self.cells[id].ground - point[2]).abs()
+            .filter(|&(_, height)| {
+                (height - point[2]).abs()
                     <= self.step_up.max(self.step_down).max(self.resolution) * 1.5 + 1e-6
             })
+            .map(|(id,_)|id)
     }
     pub fn nearest(&self, point: [f64; 3], radius: f64) -> Option<usize> {
         let x = (point[0] / self.resolution).floor() as i32;
@@ -349,7 +402,7 @@ impl Tomogram {
         }
         best.map(|(id, _)| id)
     }
-    fn compatible(&self, a: usize, b: usize, distance: f64) -> bool {
+    pub(crate) fn compatible(&self, a: usize, b: usize, distance: f64) -> bool {
         let a = &self.cells[a];
         let b = &self.cells[b];
         let rise = b.ground - a.ground;
@@ -361,7 +414,7 @@ impl Tomogram {
         rise.abs() <= limit.max(distance * self.slope) + 1e-6
             && a.ceiling.min(b.ceiling) - a.ground.max(b.ground) + 1e-6 >= self.body_height
     }
-    fn neighbor_in(&self, a: usize, column: [i32; 2], distance: f64) -> Option<usize> {
+    pub(crate) fn neighbor_in(&self, a: usize, column: [i32; 2], distance: f64) -> Option<usize> {
         self.columns
             .get(&column)?
             .iter()
@@ -373,56 +426,59 @@ impl Tomogram {
                     .total_cmp(&(self.cells[a].ground - self.cells[c].ground).abs())
             })
     }
+    pub(crate) fn neighbors_for(&self, id: usize) -> Vec<usize> {
+        let [x, y] = self.cells[id].column;
+        let mut neighbors = Vec::with_capacity(8);
+        // One cell's cardinal choices also serve its diagonal corner checks.
+        // Lazy stack slots preserve the first lookup and short-circuit order.
+        let mut cardinal = [None; 4];
+        let mut cardinal_neighbor = |dx, dy, distance| {
+            let index = match (dx, dy) {
+                (-1, 0) => 0,
+                (0, -1) => 1,
+                (0, 1) => 2,
+                (1, 0) => 3,
+                _ => unreachable!("cardinal direction"),
+            };
+            *cardinal[index].get_or_insert_with(|| {
+                self.neighbor_in(id, [x + dx, y + dy], distance)
+            })
+        };
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                if dx == 0 && dy == 0 {
+                    continue;
+                }
+                let distance = self.resolution * f64::from(dx * dx + dy * dy).sqrt();
+                let next = if dx == 0 || dy == 0 {
+                    cardinal_neighbor(dx, dy, distance)
+                } else {
+                    self.neighbor_in(id, [x + dx, y + dy], distance)
+                };
+                let Some(next) = next else { continue; };
+                if dx != 0 && dy != 0 {
+                    // 对角连接不能穿过两面相接的墙角或落差。
+                    let Some(a) = cardinal_neighbor(dx, 0, self.resolution) else {
+                        continue;
+                    };
+                    let Some(b) = cardinal_neighbor(0, dy, self.resolution) else {
+                        continue;
+                    };
+                    if !self.compatible(a, next, self.resolution)
+                        || !self.compatible(b, next, self.resolution)
+                    {
+                        continue;
+                    }
+                }
+                neighbors.push(next);
+            }
+        }
+        neighbors
+    }
     fn connect(&mut self) -> Result<(), String> {
         for id in 0..self.cells.len() {
             checkpoint()?;
-            let [x, y] = self.cells[id].column;
-            let mut neighbors = Vec::with_capacity(8);
-            // One cell's cardinal choices also serve its diagonal corner checks.
-            // Lazy stack slots preserve the first lookup and short-circuit order.
-            let mut cardinal = [None; 4];
-            let mut cardinal_neighbor = |dx, dy, distance| {
-                let index = match (dx, dy) {
-                    (-1, 0) => 0,
-                    (0, -1) => 1,
-                    (0, 1) => 2,
-                    (1, 0) => 3,
-                    _ => unreachable!("cardinal direction"),
-                };
-                *cardinal[index].get_or_insert_with(|| {
-                    self.neighbor_in(id, [x + dx, y + dy], distance)
-                })
-            };
-            for dx in -1..=1 {
-                for dy in -1..=1 {
-                    if dx == 0 && dy == 0 {
-                        continue;
-                    }
-                    let distance = self.resolution * f64::from(dx * dx + dy * dy).sqrt();
-                    let next = if dx == 0 || dy == 0 {
-                        cardinal_neighbor(dx, dy, distance)
-                    } else {
-                        self.neighbor_in(id, [x + dx, y + dy], distance)
-                    };
-                    let Some(next) = next else { continue; };
-                    if dx != 0 && dy != 0 {
-                        // 对角连接不能穿过两面相接的墙角或落差。
-                        let Some(a) = cardinal_neighbor(dx, 0, self.resolution) else {
-                            continue;
-                        };
-                        let Some(b) = cardinal_neighbor(0, dy, self.resolution) else {
-                            continue;
-                        };
-                        if !self.compatible(a, next, self.resolution)
-                            || !self.compatible(b, next, self.resolution)
-                        {
-                            continue;
-                        }
-                    }
-                    neighbors.push(next);
-                }
-            }
-            self.cells[id].neighbors = neighbors;
+            self.cells[id].neighbors = self.neighbors_for(id);
         }
         checkpoint()?;
         Ok(())
@@ -431,7 +487,7 @@ impl Tomogram {
         self.minimum_cost = crate::reference::UNKNOWN_COST;
         let mut walls = VecDeque::new();
         let mut unknown = VecDeque::new();
-        for id in 0..self.cells.len() {
+        for id in self.seed_order.ids() {
             checkpoint()?;
             self.cells[id].clearance = f64::INFINITY;
             self.cells[id].support_clearance = f64::INFINITY;
@@ -480,14 +536,17 @@ impl Tomogram {
         }
         // 高差影响机体整个足迹，不能只在中心恰好经过阶边时付出代价。
         // 沿同层可连接单元传播有限偏好，真实台阶与唯一通道仍保持连通。
-        let mut terrain = Vec::with_capacity(self.cells.len());
+        let mut terrain = vec![0.0; self.cells.len()];
         let mut queue = VecDeque::new();
-        for (id, cell) in self.cells.iter().enumerate() {
+        // Intentional deterministic contract: geometry order, not HashMap iteration
+        // or dense swap order. FIFO relaxation and neighbor order remain unchanged.
+        for id in self.seed_order.ids() {
             checkpoint()?;
+            let cell = &self.cells[id];
             let value = cell.neighbors.iter()
                 .map(|&n| (self.cells[n].ground - cell.ground).abs() / self.resolution)
                 .fold(0.0, f64::max).min(2.0);
-            terrain.push(value);
+            terrain[id] = value;
             if value > 0.0 { queue.push_back(id); }
         }
         let decay = 2.0 * self.resolution / self.clearance_radius.max(self.resolution);
@@ -512,6 +571,7 @@ impl Tomogram {
             // 缺测仅保留软偏好；搜索用请求局部参考穿越，不伪造地图地面。
             let unknown = ((preferred - c.support_clearance) / preferred).clamp(0.0, 1.0);
             self.cells[id].cost = 1.0 + wall * wall + 3.0 * unknown * unknown + terrain[id];
+            self.cells[id].terrain = terrain[id];
             self.minimum_cost = self.minimum_cost.min(self.cells[id].cost);
         }
         checkpoint()?;
@@ -735,6 +795,21 @@ mod shared_ground_tests {
     use super::*;
 
     #[test]
+    fn exact_height_query_requires_the_selected_cell_column() {
+        let map=Tomogram::from_columns(0.1,
+            [([0,0],vec![[-0.1,0.0]]),([1,0],vec![[0.0,0.1]])],
+            0.3,0.0,0.2,0.2,20.0).unwrap();
+        let first=map.cell_at([0.05,0.05,0.0]).unwrap();
+        let next=map.cell_at([0.15,0.05,0.1]).unwrap();
+        assert_eq!(map.ground_height_at(first,[0.05,0.05]),Some(map.cells[first].ground));
+        assert_eq!(map.ground_height_at(first,[0.1,0.05]),None,
+            "边界点归相邻列，不能沿用原单元的参考");
+        assert_eq!(map.ground_height_at(next,[0.1,0.05]),Some(map.cells[next].ground));
+        assert_eq!(map.ground_height_at(first,[f64::NAN,0.05]),None);
+        assert_eq!(map.ground_height_at(map.cells.len(),[0.05,0.05]),None);
+    }
+
+    #[test]
     fn pct_uses_shared_layer_geometry_for_legacy_and_volume_columns() {
         for occupied in [false,true] {
             for step in [0.0,0.15,0.5] {
@@ -773,7 +848,7 @@ mod measured_layer_adapter_tests {
             surface_closing_radius:0.0,node_spacing_m:0.3,wall_clearance_m:0.0,wall_buffer_m:0.0,
             wall_buffer_weight:0.0,max_slope_deg:20.0,step_threshold_m:0.1,
             min_step_tread_depth_m:0.2,step_penalty_weight:1.0,goal_tolerance:0.1,viz_publish_hz:0.0};
-        let model=SurfaceBodyEnvelope{footprint_xy_m:vec![[-0.15,-0.1],[0.15,-0.1],[0.15,0.1],[-0.15,0.1]],
+        let model=SurfaceBodyEnvelope{fixed_collision:None,footprint_xy_m:vec![[-0.15,-0.1],[0.15,-0.1],[0.15,0.1],[-0.15,0.1]],
             z_bounds_m:[-0.1,0.1],body_to_support_z_m:0.3,max_step_up_m:0.1,max_step_down_m:0.1,
             max_cross_slope_deg:20.0,support_uncertainty_m:0.0};
         let source=SurfaceSnapshot::from_points(&points,cfg,fine).unwrap().with_body_envelope(model).unwrap();

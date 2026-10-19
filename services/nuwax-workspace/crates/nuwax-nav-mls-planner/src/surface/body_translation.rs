@@ -368,7 +368,9 @@ impl SurfaceSnapshot {
         to: ([f64; 3], [f64; 4]),
         mut check:impl FnMut(f64)->Result<(),SurfaceError>,
     ) -> Result<(), SurfaceError> {
-        self.validate_body_contact_events_in_context(from,to,QuerySegment::LEGACY,check)
+        self.validate_body_contact_events_in_context(from,to,QuerySegment::LEGACY,|t,collision| {
+            if let Some(collision)=collision {Err(collision.error())} else {check(t)}
+        })
     }
 
     pub(super) fn validate_body_contact_events_in_context(
@@ -376,12 +378,15 @@ impl SurfaceSnapshot {
         from: ([f64; 3], [f64; 4]),
         to: ([f64; 3], [f64; 4]),
         context:QuerySegment<'_>,
-        mut check:impl FnMut(f64)->Result<(),SurfaceError>,
+        check:impl FnMut(f64,Option<BodyRejection>)->Result<(),SurfaceError>,
     ) -> Result<(), SurfaceError> {
         let r = rotation(from.1)?;
         let rotating=r != rotation(to.1)?;
         if !rotating && from.0 == to.0 && context.constant() { return Ok(()); }
         let model = self.body_envelope().ok_or(SurfaceError::InvalidPose)?;
+        let mut rigid_motion=self.fixed_body_primitives()?.map(|primitives|
+            contact::RigidMotionQuery::new(primitives,from,to)).transpose()?;
+        let check=std::cell::RefCell::new(check);
         let events=rotating.then(||RotationEvents::new(model,from,to));
         let angle=events.as_ref().map_or(0.0,|events|2.0*events.from.1.iter().zip(events.to.1)
             .map(|(a,b)|a*b).sum::<f64>().abs().min(1.0).acos());
@@ -401,6 +406,10 @@ impl SurfaceSnapshot {
             }
         }
         for i in 0..3 {min[i]-=padding;max[i]+=padding;}
+        if let Some(motion)=&rigid_motion {
+            let (low,high)=motion.bounds()?;
+            for axis in 0..3 {min[axis]=min[axis].min(low[axis]);max[axis]=max[axis].max(high[axis]);}
+        }
         let size = f64::from(self.config().voxel_size);
         let from_support = self.support_position_from_body(from.0, from.1, model.body_to_support_z_m)?;
         let to_support = self.support_position_from_body(to.0, to.1, model.body_to_support_z_m)?;
@@ -432,7 +441,7 @@ impl SurfaceSnapshot {
         let mut checked=AHashSet::new();
         let mut record = |interval: [f64; 2]| -> Result<(),SurfaceError> {
             let mut sample=|t:f64| {
-                if t>0.0 && t<1.0 && checked.insert(t.to_bits()) {check(t)} else {Ok(())}
+                if t>0.0 && t<1.0 && checked.insert(t.to_bits()) {(check.borrow_mut())(t,None)} else {Ok(())}
             };
             let mut previous = interval[0];
             sample(previous)?;
@@ -457,6 +466,12 @@ impl SurfaceSnapshot {
                             for &z in zs {
                                 if let Some(points)=frame.surface_points.get(&[x,y,z]) {
                                     for &point in points {
+                                        if let Some(motion)=&mut rigid_motion {
+                                                if let Some(t)=motion.intersection(point,point,[0.0,1.0])? {
+                                                    (check.borrow_mut())(t,Some(BodyRejection::Occupancy{cell:[x,y,z],source:OccupancySource::Recent,
+                                                        z_bounds:[point[2],point[2]],ground_height:None}))?;
+                                                }
+                                        }
                                         if let Some(interval)=prism.expanded_translated_interval(displacement,point,point,padding) {
                                             if let Some(events)=&events {
                                                 for interval in events.contacts(model,point,point,interval,&changes) {record(interval)?;}
@@ -468,6 +483,12 @@ impl SurfaceSnapshot {
                                 let low=[x,y,z].map(|v|f64::from(v)*fine);
                                 let high=[x,y,z].map(|v|f64::from(v+1)*fine);
                                 if high[2]<min[2] || low[2]>max[2] {continue;}
+                                if let Some(motion)=&mut rigid_motion {
+                                        if let Some(t)=motion.intersection(low,high,[0.0,1.0])? {
+                                            (check.borrow_mut())(t,Some(BodyRejection::Occupancy{cell:[x,y,z],source:OccupancySource::Recent,
+                                                z_bounds:[low[2],high[2]],ground_height:None}))?;
+                                        }
+                                }
                                 if let Some(interval)=prism.expanded_translated_interval(displacement,low,high,padding) {
                                     if let Some(events)=&events {
                                         for interval in events.contacts(model,low,high,interval,&changes) {record(interval)?;}
@@ -478,6 +499,35 @@ impl SurfaceSnapshot {
                 }
             }
         }
+        // 精细占据可独立于粗地图存在/更高；只遍历本段局部 XY 的真实 column_levels。
+        // 每个 fine key 在此处理一次，粗路径只判断是否有 fine 接管，不重复窄相位。
+        if rigid_motion.is_some() { if let Some(observations) = &self.observations {
+            let fine = f64::from(observations.size_m);
+            for x in (min[0]/fine).floor() as i32..=(max[0]/fine).floor() as i32 {
+                for y in (min[1]/fine).floor() as i32..=(max[1]/fine).floor() as i32 {
+                    let Some(levels) = observations.column_levels(x,y) else { continue; };
+                    for &z in levels {
+                        let key = [x,y,z];
+                        let low = key.map(|v|f64::from(v)*fine);
+                        let high = key.map(|v|(f64::from(v)+1.0)*fine);
+                        if high[2]<min[2] || low[2]>max[2] { continue; }
+                        if let Some(motion)=&mut rigid_motion {
+                            if let Some(t)=motion.intersection(low,high,[0.0,1.0])? {
+                                (check.borrow_mut())(t,Some(BodyRejection::Occupancy {
+                                    cell:key,source:OccupancySource::Fine,
+                                    z_bounds:[low[2],high[2]],ground_height:None,
+                                }))?;
+                            }
+                        }
+                        if let Some(interval)=prism.expanded_translated_interval(displacement,low,high,padding) {
+                            if let Some(events)=&events {
+                                for interval in events.contacts(model,low,high,interval,&changes) {record(interval)?;}
+                            } else {record(interval)?;}
+                        }
+                    }
+                }
+            }
+        }}
         let uncertainty = f64::from(self.source_voxel_size_m()) + model.support_uncertainty_m;
         let contact = model.max_step_up_m.max(model.max_step_down_m) + uncertainty;
         let allowance = ((model.z_bounds_m[0].max(-model.body_to_support_z_m) / r[2][2])
@@ -485,9 +535,10 @@ impl SurfaceSnapshot {
         for x in (min[0] / size).floor() as i32..=(max[0] / size).floor() as i32 {
             for y in (min[1] / size).floor() as i32..=(max[1] / size).floor() as i32 {
                 let Some(zs) = self.data.occupied_columns.get(&(x, y)) else { continue; };
-                let Some(column_interval) = prism.expanded_translated_interval(displacement,
+                let column_interval = prism.expanded_translated_interval(displacement,
                     [f64::from(x)*size, f64::from(y)*size, min[2]-size],
-                    [f64::from(x+1)*size, f64::from(y+1)*size, max[2]+size],padding) else { continue; };
+                    [f64::from(x+1)*size, f64::from(y+1)*size, max[2]+size],padding);
+                let Some(column_interval)=column_interval.or_else(||rigid_motion.as_ref().map(|_|[0.0,1.0])) else {continue;};
                 let ground = self.data.physical_graph.surface_lookup.get(&(x, y))
                     .into_iter().flatten().map(|&z| self.cell_position((x,y,z))[2])
                     .fold(f64::INFINITY, f64::min);
@@ -510,7 +561,7 @@ impl SurfaceSnapshot {
                             +(model.z_bounds_m[0].max(-model.body_to_support_z_m)/upward+contact+1e-6).min(uncertainty)
                     } else {f64::NEG_INFINITY}
                 } else {allowed};
-                let cutoff = if context.is_legacy() {(ground + 1e-6).min(allowed - 1e-10)} else {f64::NEG_INFINITY};
+                let cutoff = if rigid_motion.is_none() && context.is_legacy() {(ground + 1e-6).min(allowed - 1e-10)} else {f64::NEG_INFINITY};
                 for &z in zs {
                     let bounds = self.data.height_bounds.get(&(x,y,z)).copied().unwrap_or([
                         z as f32*self.config().voxel_size, (z as f32+1.0)*self.config().voxel_size]);
@@ -525,11 +576,13 @@ impl SurfaceSnapshot {
                                     let key = [ix,iy,iz];
                                     if observations.get(key).is_none() { continue; }
                                     found_fine = true;
-                                    if f64::from(iz+1)*fine <= cutoff { continue; }
-                                    let low=key.map(|v|f64::from(v)*fine);let high=key.map(|v|f64::from(v+1)*fine);
-                                    if let Some(interval) = prism.expanded_translated_interval(displacement,low,high,padding) {
-                                        if let Some(events)=&events {for interval in events.contacts(model,low,high,interval,&changes) {record(interval)?;}}
-                                        else {record(interval)?;}
+                                    if rigid_motion.is_none() {
+                                        if f64::from(iz+1)*fine <= cutoff { continue; }
+                                        let low=key.map(|v|f64::from(v)*fine);let high=key.map(|v|f64::from(v+1)*fine);
+                                        if let Some(interval)=prism.expanded_translated_interval(displacement,low,high,padding) {
+                                            if let Some(events)=&events {for interval in events.contacts(model,low,high,interval,&changes) {record(interval)?;}}
+                                            else {record(interval)?;}
+                                        }
                                     }
                                 }
                             }
@@ -538,6 +591,12 @@ impl SurfaceSnapshot {
                     if !found_fine {
                         let low=[f64::from(x)*size,f64::from(y)*size,f64::from(bounds[0])];
                         let high=[f64::from(x+1)*size,f64::from(y+1)*size,f64::from(bounds[1])];
+                        if let Some(motion)=&mut rigid_motion {
+                                if let Some(t)=motion.intersection(low,high,[0.0,1.0])? {
+                                    (check.borrow_mut())(t,Some(BodyRejection::Occupancy{cell:[x,y,z],source:OccupancySource::CoarseFallback,
+                                        z_bounds:[low[2],high[2]],ground_height:None}))?;
+                                }
+                        }
                         if let Some(interval) = prism.expanded_translated_interval(displacement,low,high,padding) {
                             if let Some(events)=&events {for interval in events.contacts(model,low,high,interval,&changes) {record(interval)?;}}
                             else {record(interval)?;}
@@ -555,7 +614,7 @@ mod tests {
     use super::*;
     #[test]
     fn translated_interval_contains_all_grazing_pose_contacts() {
-        let model=SurfaceBodyEnvelope {footprint_xy_m:vec![[-0.3,-0.16],[0.3,-0.16],[0.3,0.16],[-0.3,0.16]],
+        let model=SurfaceBodyEnvelope {fixed_collision:None,footprint_xy_m:vec![[-0.3,-0.16],[0.3,-0.16],[0.3,0.16],[-0.3,0.16]],
             z_bounds_m:[-0.4,0.06],body_to_support_z_m:0.4,max_step_up_m:0.15,max_step_down_m:0.15,
             max_cross_slope_deg:18.0,support_uncertainty_m:0.0};
         let low=[0.025,0.025,-0.2];let high=[0.075,0.075,-0.15];
@@ -579,7 +638,7 @@ mod tests {
 
     #[test]
     fn ground_allowance_covers_all_actual_column_corners_and_attitudes() {
-        let model=SurfaceBodyEnvelope {footprint_xy_m:vec![[-0.3,-0.15],[0.3,-0.15],[0.3,0.15],[-0.3,0.15]],
+        let model=SurfaceBodyEnvelope {fixed_collision:None,footprint_xy_m:vec![[-0.3,-0.15],[0.3,-0.15],[0.3,0.15],[-0.3,0.15]],
             z_bounds_m:[-0.448,0.1],body_to_support_z_m:0.4,max_step_up_m:0.15,max_step_down_m:0.15,
             max_cross_slope_deg:18.0,support_uncertainty_m:0.0};
         let uncertainty=0.05;let contact=0.20;let size=0.1;
@@ -612,7 +671,7 @@ mod tests {
 
     #[test]
     fn finite_feature_bounds_cover_real_quaternion_motion() {
-        let model=SurfaceBodyEnvelope {footprint_xy_m:vec![[-0.3,-0.15],[0.3,-0.15],[0.3,0.15],[-0.3,0.15]],
+        let model=SurfaceBodyEnvelope {fixed_collision:None,footprint_xy_m:vec![[-0.3,-0.15],[0.3,-0.15],[0.3,0.15],[-0.3,0.15]],
             z_bounds_m:[-0.4,0.1],body_to_support_z_m:0.4,max_step_up_m:0.15,max_step_down_m:0.15,
             max_cross_slope_deg:18.0,support_uncertainty_m:0.0};
         for q in [[0.001,-0.002,0.0004,1.0],[0.2,-0.1,0.7,0.6],[1e-18,-2e-18,0.0,1.0]] {

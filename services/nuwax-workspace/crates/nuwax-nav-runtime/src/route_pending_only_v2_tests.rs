@@ -372,10 +372,13 @@ mod pending_only_v2_tests {
 
     #[test]
     fn pending_only_v2_real_guard_rejection_keeps_nominal_inside_original_cooldown() {
+        // 先准备与本次真实位姿无关的远处地图；夹具构造不应消耗原250ms冷却窗口。
+        // 后续发布、真实控制拒绝和原截止断言保持不变。
+        let far_source=selective_scene(&[[100,100,5]]);
         let (mut f,gate,a,p1,deadline)=revoked_nominal_pair();
         let epoch=f.owner.as_ref().unwrap().epoch();let calls=f.local_planning_calls;
         let x=f.pose.as_ref().unwrap().pose.position.x;
-        let changed=recent_wall(&selective_scene(&[[100,100,5]]),x+0.23);
+        let changed=recent_wall(&far_source,x+0.23);
         publish(&mut f,changed,&[[100,100]]); // NEW far fixture, BOTH retained paths checked.
         let original_a=ticket(&f,a);
         assert!(f.local_path.is_some() && f.admitted_generation.is_none());

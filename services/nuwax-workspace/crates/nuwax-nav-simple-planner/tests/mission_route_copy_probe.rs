@@ -12,6 +12,7 @@ const REPETITIONS: usize = 32;
 
 fn geometry() -> RobotGeometry {
     RobotGeometry {
+        self_collision: None,
         footprint_xy_m: vec![[-0.25, -0.15], [0.25, -0.15], [0.25, 0.15], [-0.25, 0.15]],
         z_min_m: -0.2,
         z_max_m: 0.4,

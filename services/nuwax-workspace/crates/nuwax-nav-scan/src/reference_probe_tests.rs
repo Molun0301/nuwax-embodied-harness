@@ -69,7 +69,7 @@ mod reference_probe {
                         (pair[1][0]-pair[0][0]).hypot(pair[1][1]-pair[0][1])).sum();
                     let tangent = (reference[1][1]-reference[0][1])
                         .atan2(reference[1][0]-reference[0][0]);
-                    assert!(local_search::reference_handoff(*probe.as_ref().unwrap().poses.last().unwrap(),
+                    assert!(local_search::reference_handoff(&base,*probe.as_ref().unwrap().poses.last().unwrap(),
                         &reference, model.body_to_support_z_m,
                         (config.reference_corridor_m*0.9).min(config.horizon_m*0.3),
                         (model.body_to_support_z_m+model.z_bounds_m[1])*0.5, length, tangent));

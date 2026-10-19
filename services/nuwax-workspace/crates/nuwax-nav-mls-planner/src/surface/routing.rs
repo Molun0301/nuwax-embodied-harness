@@ -300,6 +300,7 @@ mod tests {
         SurfaceSnapshot::from_points(&points, config, 0.05)
             .unwrap()
             .with_body_envelope(SurfaceBodyEnvelope {
+                fixed_collision: None,
                 footprint_xy_m: vec![[-0.1, -0.08], [0.1, -0.08], [0.1, 0.08], [-0.1, 0.08]],
                 z_bounds_m: [-0.05, 0.1],
                 body_to_support_z_m: 0.25,

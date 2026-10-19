@@ -314,6 +314,14 @@ pub fn layer_geometry_eq(a: &LayerObservations, b: &LayerObservations) -> bool {
             .all(|(key, value)| b.get(key).is_some_and(|other| value.geometry_eq(other)))
 }
 pub(crate) fn validate_layers(layers: &LayerObservations, block: &Block) -> Result<(), String> {
+    validate_layers_with_time_bound(layers, block, None)
+}
+/// BL4 permits diagnostics whose original occupied voxel remains after only its
+/// ground claim was removed. Spatial evidence is checked at the key/q boundary.
+pub(crate) fn validate_versioned_legacy(layers: &LayerObservations, block: &Block, latest: u64) -> Result<(), String> {
+    validate_layers_with_time_bound(layers, block, Some(latest))
+}
+fn validate_layers_with_time_bound(layers: &LayerObservations, block: &Block, bound: Option<u64>) -> Result<(), String> {
     if layers.len() > MAX_LAYERS_PER_BLOCK {
         return Err("layer count exceeds block budget".into());
     }
@@ -355,12 +363,7 @@ pub(crate) fn validate_layers(layers: &LayerObservations, block: &Block) -> Resu
         }
         layer.representative()?;
         if layer.latest_timestamp_ns()
-            > layer
-                .members
-                .iter()
-                .map(|k| block[k].observed_ns)
-                .max()
-                .unwrap_or(0)
+            > bound.unwrap_or_else(|| layer.members.iter().map(|k| block[k].observed_ns).max().unwrap_or(0))
         {
             return Err("layer observation exceeds occupancy evidence".into());
         }

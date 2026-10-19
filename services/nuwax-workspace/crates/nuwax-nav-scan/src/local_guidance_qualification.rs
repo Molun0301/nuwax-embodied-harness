@@ -25,7 +25,7 @@ pub fn full_handoff(map:&SurfaceSnapshot,start:BodyPose,end:BodyPose,
     let length=reference.windows(2).map(|p|(p[1][0]-p[0][0]).hypot(p[1][1]-p[0][1])).sum();
     let tangent=reference.windows(2).rfind(|p|(p[1][0]-p[0][0]).hypot(p[1][1]-p[0][1])>1e-9)
         .map_or(crate::yaw(start.1),|p|(p[1][1]-p[0][1]).atan2(p[1][0]-p[0][0]));
-    crate::local_search::reference_handoff(end,reference,model.body_to_support_z_m,
+    crate::local_search::reference_handoff(map,end,reference,model.body_to_support_z_m,
         (config.reference_corridor_m*0.9).min(config.horizon_m*0.3),
         (model.body_to_support_z_m+model.z_bounds_m[1])*0.5,length,tangent)
 }

@@ -511,9 +511,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auxiliary_admission_publishes_measured_floor_and_keeps_wall_occupancy() {
+    async fn auxiliary_admission_publishes_native_heightfield_and_preserves_occupancy() {
         let (handle, owner) = build_handle_for_tests_with_unit_transport(true,
             Some(MappingBackendSpec::Voxel), LcmTransport::new(Arc::new(UnitTransport))).await.unwrap();
+        let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
         let map = {
             let mut adapter = handle.mapping_adapter.as_ref().unwrap().lock();
             adapter.start_session("aux-ground-unit", "house").unwrap();
@@ -546,21 +547,36 @@ mod tests {
         assert_eq!(registered[0].original_indices()[0], 1);
         let root = handle.cloud_map_writer.lock().as_ref().unwrap().committed_fine_cloud().unwrap();
         let mut measured = Vec::new();
+        let mut actual_occupancy = std::collections::BTreeSet::new();
         let mut wall_occupied = false;
         for block in &root.manifest().blocks {
             let bytes = root.repository.read_object(block.object, nuwax_map_chunks::MAX_BLOCK_BYTES).unwrap();
             let occupancy = nuwax_map_chunks::decode_block(&bytes).unwrap();
+            actual_occupancy.extend(occupancy.keys().map(|key| nuwax_map_chunks::global_key(block.key, *key).unwrap()));
             wall_occupied |= occupancy.keys().any(|key| {
                 let cell = nuwax_map_chunks::global_key(block.key, *key).unwrap();
                 cell[0] == 5 && cell[2] >= 4
             });
-            measured.extend(nuwax_map_chunks::decode_layer_observations(&bytes).unwrap().into_values());
+            let records = nuwax_map_chunks::decode_ground_records(&bytes).unwrap();
+            for (_, record) in records.iter() {
+                let nuwax_map_chunks::GroundRecordRef::HeightfieldV1(field) = record else {
+                    panic!("current admitted points must publish native heightfield records");
+                };
+                measured.push(field.clone());
+            }
         }
         assert!(wall_occupied);
+        let expected_occupancy = points.iter().skip(1).map(|p| {
+            let key = crate::pointcloud::voxel_key(p.map(f64::from), root.manifest().voxel_size_m).unwrap();
+            [key.0, key.1, key.2]
+        }).collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(actual_occupancy, expected_occupancy, "all finite original floor and short vertical returns remain occupied");
         assert!(!measured.is_empty());
+        // This unchanged 14 cm strip does not meet the frozen >4q upright
+        // rule. Its source association is not finite-contact permission.
+        assert!(measured.iter().flat_map(|field| &field.samples).any(|sample| sample.point_index > 64));
         for sample in measured.iter().flat_map(|layer| &layer.samples) {
-            assert!((sample.point[2] + 0.41).abs() < 1e-6, "wall cannot enter measured ground");
-            assert!(sample.point_index > 0 && sample.point_index <= 64);
+            assert!(sample.point_index > 0 && sample.point_index < points.len() as u32);
             assert_eq!(sample.point, points[sample.point_index as usize].map(f64::from));
             assert!(matches!(sample.source.as_ref(), nuwax_map_chunks::LayerSource::Auxiliary {
                 runtime_generation, session_generation, ..
@@ -568,8 +584,13 @@ mod tests {
         }
         // 首次根可能早于第二传感器的发布节拍；两帧实际已归档且指向各自真实来源。
         assert_ne!(registered[0].layer_source(), registered[1].layer_source());
+        })).await;
+        if let Some(adapter) = &handle.mapping_adapter {
+            let _ = adapter.lock().stop_session("aux-ground-unit");
+        }
         drop(handle);
         owner.finish().await.unwrap();
+        if let Err(panic) = outcome { std::panic::resume_unwind(panic); }
     }
 
 }

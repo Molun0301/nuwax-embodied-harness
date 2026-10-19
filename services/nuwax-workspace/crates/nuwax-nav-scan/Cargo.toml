@@ -19,3 +19,6 @@ nuwax-nav-pct = { path = "../nuwax-nav-pct" }
 nuwax-nav-types-messages = { path = "../nuwax-nav-types-messages" }
 tracing.workspace = true
 serde_json = { workspace = true, optional = true }
+
+[dev-dependencies]
+nuwax-map-chunks = { path = "../nuwax-map-chunks" }

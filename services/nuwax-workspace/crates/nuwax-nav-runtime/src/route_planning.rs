@@ -6,7 +6,9 @@ pub(crate) mod priority_probe;
 mod recent_guide_overlay;
 use crate::planning_owner::Cancellation;
 use crate::{SurfaceFollowerConfig, SurfaceSnapshot};
+use crate::surface_changes::{pct_surface_delta, SurfaceGeometryChanges};
 use nuwax_nav_scan::{BodyPose, LocalPlanError, ScanConfig};
+use nuwax_nav_mls_planner::surface::BodyGroundState;
 use nuwax_nav_types_messages::{GoalOptions, Path3D, Point3, PoseStamped, Quaternion};
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -110,7 +112,10 @@ impl ReferenceSource {
     }
 }
 pub(crate) struct PlanRequest {
+    pub start_ground: Result<BodyGroundState, String>,
     pub source: Arc<SurfaceSnapshot>,
+    pub change_basis: Option<Arc<SurfaceSnapshot>>,
+    pub changes: Arc<SurfaceGeometryChanges>,
     pub pose: PoseStamped,
     pub boundary: Arc<Vec<[f64; 2]>>,
     pub reference: Vec<[f64; 3]>,
@@ -180,6 +185,7 @@ pub(crate) struct PlanResult {
     pub outcome: Result<Candidate, Vec<LocalPlanError>>,
 }
 struct FailedLocalPlan {
+    start_ground: BodyGroundState,
     coverage_context: [u64;2],
     scan_context: ([u64;2], [usize;2]),
     prefix_context: Option<(Option<[u64;3]>, u64)>,
@@ -233,7 +239,7 @@ fn local_map_radius(horizon: f64, source: &SurfaceSnapshot) -> f64 {
 }
 pub(crate) struct PlanKernel {
     config: SurfaceFollowerConfig,
-    local_map: Option<(Arc<SurfaceSnapshot>, Point3, Arc<nuwax_nav_pct::Tomogram>)>,
+    local_map: Option<(Arc<SurfaceSnapshot>, Point3, Arc<nuwax_nav_pct::Tomogram>, f64)>,
     failed: Vec<FailedLocalPlan>,
     epoch: Option<u64>,
     #[cfg(test)]
@@ -297,34 +303,40 @@ impl PlanKernel {
         tolerance.max(request.source.body_envelope().map_or(0.0,|model|model.radius()))
             +f64::from(request.source.source_voxel_size_m())*0.5
     }
+    /// 保留现有近场规划域；完整 publication 仅决定旧图如何更新。
+    /// A 当前对局部图执行原窗口冷建，不能把该接口调用报告为局部增量完成。
+    fn prepare_local_map(&mut self,r:&PlanRequest,map:&SurfaceSnapshot)
+        ->Result<Arc<nuwax_nav_pct::Tomogram>,Vec<LocalPlanError>> {
+        if nuwax_nav_pct::planning_cancelled() {return Err(vec!["planning superseded".into()]);}
+        let radius=local_map_radius(r.scan.horizon_m,map);
+        let prepared=if let Some((source,center,local,_))=self.local_map.as_ref().filter(|(_,center,_,old_radius)|
+            center.distance(r.pose.pose.position)<LOCAL_MAP_REUSE_DISTANCE_M && old_radius.to_bits()==radius.to_bits()) {
+            if nuwax_nav_pct::same_source_geometry(source,&r.source) {
+                Ok((Arc::clone(local),*center))
+            } else {
+                let delta=pct_surface_delta(r.change_basis.as_deref(),&r.changes);
+                local.updated_from_surface(map,delta).map(|(next,_)|(Arc::new(next),*center))
+            }
+        } else {
+            nuwax_nav_pct::Tomogram::local_from_surface(map,
+                [r.pose.pose.position.x,r.pose.pose.position.y],radius)
+                .map(|next|(Arc::new(next),r.pose.pose.position))
+        };
+        let (tomogram,center)=prepared.map_err(|error|vec![LocalPlanError::from(error)])?;
+        if nuwax_nav_pct::planning_cancelled() {return Err(vec!["planning superseded".into()]);}
+        self.local_map=Some((Arc::clone(&r.source),center,Arc::clone(&tomogram),radius));
+        Ok(tomogram)
+    }
     fn compute_inner(
         &mut self,
         r: &PlanRequest,
         cancel: &Cancellation,
     ) -> Result<Candidate, Vec<LocalPlanError>> {
         #[cfg(test)] let map_phase = priority_probe::kernel_phase("map_prepare");
+        let start_ground=r.start_ground.as_ref().map_err(|error|vec![LocalPlanError::from(error.clone())])?;
         // Fork on this CPU owner. No cache permission travels back to control.
         let map = r.source.fork_for_planning();
-        let prepare = || -> Result<(Arc<nuwax_nav_pct::Tomogram>, Point3), LocalPlanError> {
-            if let Some((_, center, local)) =
-                self.local_map.as_ref().filter(|(source, center, _)| {
-                    nuwax_nav_pct::same_source_geometry(source, &r.source)
-                        && center.distance(r.pose.pose.position) < LOCAL_MAP_REUSE_DISTANCE_M
-                })
-            {
-                return Ok((local.clone(), *center));
-            }
-            Ok((
-                Arc::new(nuwax_nav_pct::Tomogram::local_from_surface(
-                    &map,
-                    [r.pose.pose.position.x, r.pose.pose.position.y],
-                    local_map_radius(r.scan.horizon_m, &map),
-                )?),
-                r.pose.pose.position,
-            ))
-        };
-        let (tomogram, center) = prepare().map_err(|e| vec![e])?;
-        self.local_map = Some((r.source.clone(), center, tomogram.clone()));
+        let tomogram=self.prepare_local_map(r,&map)?;
         #[cfg(test)] drop(map_phase);
         #[cfg(test)] let policy_phase = priority_probe::kernel_phase("overlay_and_policy");
         let kinematics = self
@@ -376,7 +388,8 @@ impl PlanKernel {
                 return Err(vec![superseded()]);
             }
             let cached = self.failed.iter().find(|f| {
-                Arc::ptr_eq(&f.tomogram, &tomogram)
+                f.start_ground == *start_ground
+                    && Arc::ptr_eq(&f.tomogram, &tomogram)
                     && f.coverage_context==[r.progress.to_bits(),r.end.to_bits()]
                     && f.scan_context == scan_context(&r.scan)
                     && f.prefix_context == prefix_context
@@ -441,14 +454,14 @@ impl PlanKernel {
             let result = {
                 let scan = || {
                     if reference_only {
-                        nuwax_nav_scan::probe_reference_candidates(&map,&tomogram,start,&reference,
+                        nuwax_nav_scan::probe_reference_candidates_from_ground(&map,&tomogram,start,start_ground,&reference,
                             &kinematics,&r.scan,r.final_yaw,r.arrival,&r.boundary,
                             follow_reference,straight,progress_policy).map(|outcome| match outcome {
                                 nuwax_nav_scan::ReferenceCandidateOutcome::Complete(path) => Some(path),
                                 nuwax_nav_scan::ReferenceCandidateOutcome::Miss => None,
                             })
                     } else {
-                        nuwax_nav_scan::plan_with_progress(&map,&tomogram,start,&reference,
+                        nuwax_nav_scan::plan_with_progress_from_ground(&map,&tomogram,start,start_ground,&reference,
                             &kinematics,&r.scan,r.final_yaw,r.arrival,&r.boundary,
                             follow_reference,straight,progress_policy).map(Some)
                     }
@@ -474,6 +487,7 @@ impl PlanKernel {
                             self.failed.remove(0);
                         }
                         self.failed.push(FailedLocalPlan {
+                            start_ground:start_ground.clone(),
                             coverage_context:[r.progress.to_bits(),r.end.to_bits()],
                             scan_context: scan_context(&r.scan),
                             prefix_context,
@@ -540,6 +554,7 @@ mod tests {
     include!("route_progress_policy_tests.rs");
     include!("route_repeated_detour_key_tests.rs");
     include!("route_partial_choice_tests.rs");
+    include!("route_incremental_tests.rs");
     use nuwax_nav_mls_planner::{SurfaceBodyEnvelope, SurfaceObservation, SurfaceObservations};
     use nuwax_nav_types_messages::{MotionKinematics, MotionModel, NavFrameId, Pose3, Timestamp};
     use std::sync::atomic::AtomicU64;
@@ -557,6 +572,7 @@ mod tests {
         });
         let source = crate::surface_follower::test_snapshot(0.0, false)
             .with_body_envelope(SurfaceBodyEnvelope {
+                fixed_collision: None,
                 footprint_xy_m: vec![[-0.1, -0.1], [0.1, -0.1], [0.1, 0.1], [-0.1, 0.1]],
                 z_bounds_m: [-0.05, 0.2],
                 body_to_support_z_m: 0.4,
@@ -594,7 +610,10 @@ mod tests {
             },
         };
         let request = PlanRequest {
+            start_ground:source.body_query().start_ground_state(body(&pose)).map_err(|error|error.to_string()),
             source,
+            change_basis: None,
+            changes: Arc::new(SurfaceGeometryChanges::Unknown),
             pose,
             boundary: Arc::new(Vec::new()),
             reference: vec![[0.5, 1.0, 0.1], [3.0, 1.0, 0.1]],
@@ -630,7 +649,7 @@ mod tests {
             nuwax_nav_pct::Tomogram::local_from_surface(
                 &request.source,
                 [request.pose.pose.position.x, request.pose.pose.position.y],
-                request.scan.horizon_m + 1.5,
+                local_map_radius(request.scan.horizon_m,&request.source),
             )
             .unwrap(),
         );
@@ -638,10 +657,12 @@ mod tests {
             request.source.clone(),
             request.pose.pose.position,
             tomogram.clone(),
+            local_map_radius(request.scan.horizon_m,&request.source),
         ));
         kernel.failed.clear();
         for detour in [false, true] {
             kernel.failed.push(FailedLocalPlan {
+                start_ground:request.start_ground.as_ref().unwrap().clone(),
                 coverage_context:[request.progress.to_bits(),request.end.to_bits()],
                 scan_context: scan_context(&request.scan),
                 prefix_context: kernel.config.motion_limits.as_ref().map(|_| {
@@ -795,16 +816,16 @@ mod tests {
                 .all(|failure| failure.reason == "exact cached failure"));
             match change {
                 0 => {
-                    let (source, center, _) = kernel.local_map.take().unwrap();
+                    let (source, center, _, radius) = kernel.local_map.take().unwrap();
                     let owner = Arc::new(
                         nuwax_nav_pct::Tomogram::local_from_surface(
                             &source,
                             [center.x, center.y],
-                            request.scan.horizon_m + 1.5,
+                            radius,
                         )
                         .unwrap(),
                     );
-                    kernel.local_map = Some((source, center, owner));
+                    kernel.local_map = Some((source, center, owner, radius));
                 }
                 1 => request.pose.pose.position.x += 0.01,
                 2 => {
@@ -924,7 +945,7 @@ mod tests {
         for z_only in [false, true] {
             let (mut kernel, mut request, cancel) = fixture();
             let _ = kernel.compute_inner(&request, &cancel);
-            let (_, original_center, original_tomogram) =
+            let (_, original_center, original_tomogram, _) =
                 kernel.local_map.as_ref().unwrap().clone();
             for distance in [0.1, 0.2] {
                 request.pose.pose.position = original_center;
@@ -934,7 +955,7 @@ mod tests {
                     request.pose.pose.position.x += distance;
                 }
                 let _ = kernel.compute_inner(&request, &cancel);
-                let (_, center, tomogram) = kernel.local_map.as_ref().unwrap();
+                let (_, center, tomogram, _) = kernel.local_map.as_ref().unwrap();
                 assert_eq!(
                     *center, original_center,
                     "cache origin drifted after a sub-threshold move"
@@ -948,7 +969,7 @@ mod tests {
                 request.pose.pose.position.x += 0.3;
             }
             let _ = kernel.compute_inner(&request, &cancel);
-            let (_, center, tomogram) = kernel.local_map.as_ref().unwrap();
+            let (_, center, tomogram, _) = kernel.local_map.as_ref().unwrap();
             assert_eq!(*center, request.pose.pose.position);
             assert!(
                 !Arc::ptr_eq(tomogram, &original_tomogram),
@@ -956,4 +977,78 @@ mod tests {
             );
         }
     }
+// Insert inside route_planning.rs's existing #[cfg(test)] mod tests.
+// Cache-key unit only: the separate route-follower test proves the production
+// request chain. This unit varies only the ground input after common setup.
+// Source-only draft; not built or run. No successful Scan result is simulated.
+#[test]
+fn exact_failed_attempt_cache_isolates_unknown_ground_history() {
+    use nuwax_nav_mls_planner::surface::GroundQueryState;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (mut kernel, mut request, cancel) = fixture();
+    request.pose.pose.position.x = 6.65;
+    let start = body(&request.pose);
+    let mut known_pose = start;
+    known_pose.0[0] = 6.45;
+    request.reference = vec![
+        [start.0[0], start.0[1], start.0[2] - kernel.config.body_to_support_z_m],
+        [known_pose.0[0], known_pose.0[1], known_pose.0[2] - kernel.config.body_to_support_z_m],
+    ];
+    request.arrival = Some((known_pose.0, 0.01));
+    request.end = (start.0[0] - known_pose.0[0]).abs();
+    let query = request.source.body_query();
+    let known = query.start_ground_state(known_pose).unwrap();
+    let fresh = query.start_ground_state(start).unwrap();
+    let carried = query.observe_actual_ground(known_pose, &known, start).unwrap();
+    assert_ne!(known.query_state(), GroundQueryState::Unknown);
+    assert_eq!(fresh.query_state(), GroundQueryState::Unknown);
+    assert_eq!(carried.query_state(), GroundQueryState::Unknown);
+    assert_eq!(carried.height().to_bits(), known.height().to_bits());
+    assert_ne!(fresh, carried, "same actual pose has two legal source-local histories");
+    request.start_ground = Ok(fresh.clone());
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let hook_calls = calls.clone();
+    kernel.scan_hook = Some(Box::new(move |detour, reference_only| {
+        assert!(!reference_only);
+        let n = hook_calls.fetch_add(1, Ordering::SeqCst) + 1;
+        assert_eq!(detour, n % 2 == 0, "misses run nominal then detour");
+        Err(LocalPlanError {
+            kind: nuwax_nav_scan::LocalPlanFailureKind::SearchExhausted,
+            closest_pose: None, blocked: None, body_witness: None,
+            reason: format!("ground-cache-unit-{n}"),
+        })
+    }));
+    let first = kernel.compute_inner(&request, &cancel).err().expect("failure-only unit hook");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(first.iter().map(|f| f.reason.as_str()).collect::<Vec<_>>(),
+        ["ground-cache-unit-1", "ground-cache-unit-2"]);
+    assert_eq!(kernel.failed.len(), 2);
+    assert!(kernel.failed.iter().all(|f| f.start_ground == fresh));
+    let tomogram = kernel.local_map.as_ref().unwrap().2.clone();
+    let repeated = kernel.compute_inner(&request, &cancel).err().expect("exact negative reuse");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(repeated.iter().map(|f| f.reason.as_str()).collect::<Vec<_>>(),
+        ["ground-cache-unit-1", "ground-cache-unit-2"]);
+
+    // Deliberate unit input change, not a substitute production request builder.
+    // Source, complete pose, reference, arrival, policy, epoch and every other
+    // cache input remain untouched. Preserve the production Result field type.
+    request.start_ground = Ok(carried.clone());
+    let changed = kernel.compute_inner(&request, &cancel).err().expect("failure-only unit hook");
+    assert_eq!(calls.load(Ordering::SeqCst), 4,
+        "different ground must not inherit either nominal or detour negative");
+    assert_eq!(changed.iter().map(|f| f.reason.as_str()).collect::<Vec<_>>(),
+        ["ground-cache-unit-3", "ground-cache-unit-4"]);
+    assert!(Arc::ptr_eq(&tomogram, &kernel.local_map.as_ref().unwrap().2),
+        "a tomogram rebuild must not mask a missing ground cache key");
+    assert_eq!(kernel.failed.len(), 2);
+    assert!(kernel.failed.iter().all(|f| f.start_ground == carried));
+    let repeated = kernel.compute_inner(&request, &cancel).err().expect("new exact negative reuse");
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
+    assert_eq!(repeated.iter().map(|f| f.reason.as_str()).collect::<Vec<_>>(),
+        ["ground-cache-unit-3", "ground-cache-unit-4"]);
+    assert!(Arc::ptr_eq(&tomogram, &kernel.local_map.as_ref().unwrap().2));
+}
+
 }

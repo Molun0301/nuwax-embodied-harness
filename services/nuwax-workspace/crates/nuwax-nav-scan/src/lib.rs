@@ -13,6 +13,7 @@ mod polyline_reuse_tests;
 mod profile;
 pub use local_search::probe_motion;
 use nuwax_nav_mls_planner::SurfaceSnapshot;
+use nuwax_nav_mls_planner::surface::{BodyGroundState, BodyMotionProjection, SurfaceBodyQueryView};
 use nuwax_nav_pct::Tomogram;
 pub use nuwax_nav_pct::{PlanningCancellation, planning_cancelled, with_planning_cancellation};
 use nuwax_nav_types_messages::{same_finite_position, MotionKinematics};
@@ -157,6 +158,42 @@ fn yaw(q: [f64; 4]) -> f64 {
 fn angle(v: f64) -> f64 {
     v.sin().atan2(v.cos())
 }
+fn bind_query(map: &SurfaceSnapshot, start: BodyPose)
+    -> Result<(SurfaceBodyQueryView, BodyGroundState), LocalPlanError> {
+    bind_query_with_ground(map, start, None)
+}
+fn bind_query_with_ground(map: &SurfaceSnapshot, start: BodyPose,
+    initial_ground: Option<&BodyGroundState>)
+    -> Result<(SurfaceBodyQueryView, BodyGroundState), LocalPlanError> {
+    cancellation::checkpoint()?;
+    #[cfg(feature="profile")]
+    let began=std::time::Instant::now();
+    let query=map.body_query();
+    let ground=match initial_ground {
+        Some(ground)=>Ok(ground.clone()),
+        None=>query.start_ground_state(start),
+    };
+    #[cfg(feature="profile")]
+    profile::record(0,began,ground.is_err());
+    cancellation::checkpoint()?;
+    let ground=ground.map_err(|e|LocalPlanError::from_surface(e,None))?;
+    Ok((query,ground))
+}
+fn advance_bound(
+    query: &SurfaceBodyQueryView,
+    ground: &mut BodyGroundState,
+    from: BodyPose,
+    xy: [f64; 2],
+    heading: f64,
+    boundary: &[[f64; 2]],
+) -> Result<BodyPose, LocalPlanError> {
+    cancellation::checkpoint()?;
+    let projection = project_endpoint(query, ground, from, xy, heading)?;
+    check_projected_motion(query, from, &projection, boundary)?;
+    *ground = projection.ground().clone();
+    Ok(projection.pose())
+}
+#[cfg(test)]
 fn advance(
     map: &SurfaceSnapshot,
     from: BodyPose,
@@ -164,51 +201,40 @@ fn advance(
     heading: f64,
     boundary: &[[f64; 2]],
 ) -> Result<BodyPose, LocalPlanError> {
-    cancellation::checkpoint()?;
-    let (next,view)=project_endpoint(map,from,xy,heading)?;
-    check_projected_motion(&view,from,next,boundary)?;
-    Ok(next)
+    let (query, mut ground) = bind_query(map, from)?;
+    advance_bound(&query, &mut ground, from, xy, heading, boundary)
 }
 /// 候选先生成完整端点站姿；中间扫掠在候选可能采用时单独核验。
 fn project_endpoint(
-    map:&SurfaceSnapshot,from:BodyPose,xy:[f64;2],heading:f64,
-) -> Result<(BodyPose,nuwax_nav_mls_planner::SurfaceBodyQueryView),LocalPlanError> {
-    #[cfg(feature="profile")]
-    let began=std::time::Instant::now();
+    query:&SurfaceBodyQueryView,ground:&BodyGroundState,from:BodyPose,xy:[f64;2],heading:f64,
+) -> Result<BodyMotionProjection,LocalPlanError> {
     cancellation::checkpoint()?;
     let mut witness=None;
-    let view=map.body_query();
-    #[cfg(feature="profile")]
-    profile::record(0,began,false);
-    cancellation::checkpoint()?;
     #[cfg(feature="profile")]
     let began=std::time::Instant::now();
-    let next=view.body_pose_after_motion_with_witness(from,xy,heading,&mut witness);
+    let next=query.project_motion(from,ground,xy,heading,&mut witness);
     #[cfg(feature="profile")]
     profile::record(1,began,next.is_err());
     cancellation::checkpoint()?;
-    let mut next=next.map_err(|e|LocalPlanError::from_surface(e,witness))?;
-    if (xy[0] - from.0[0]).hypot(xy[1] - from.0[1]) < 1e-9 {
-        next.0[2] = from.0[2];
-    }
-    Ok((next,view))
+    next.map_err(|e|LocalPlanError::from_surface(e,witness))
 }
 fn check_projected_motion(
-    view:&nuwax_nav_mls_planner::SurfaceBodyQueryView,from:BodyPose,next:BodyPose,boundary:&[[f64;2]],
+    view:&SurfaceBodyQueryView,from:BodyPose,next:&BodyMotionProjection,boundary:&[[f64;2]],
 ) -> Result<(),LocalPlanError> {
     #[cfg(feature="profile")]
     let began=std::time::Instant::now();
     cancellation::checkpoint()?;
     let mut witness=None;
-    let checked=view.validate_body_motion_with_witness(from,next,boundary,&mut witness);
+    let checked=view.validate_projected_motion(from,next,boundary,&mut witness);
     #[cfg(feature="profile")]
     profile::record(2,began,checked.is_err());
     cancellation::checkpoint()?;
     checked.map_err(|e|LocalPlanError::from_surface(e,witness))?;
     Ok(())
 }
-fn rotate(
-    map: &SurfaceSnapshot,
+fn rotate_bound(
+    query: &SurfaceBodyQueryView,
+    ground: &mut BodyGroundState,
     poses: &mut Vec<BodyPose>,
     heading: f64,
     kinematics: &MotionKinematics,
@@ -235,12 +261,14 @@ fn rotate(
         };
         let mut candidate = Vec::with_capacity(n);
         let mut previous = from;
+        let mut candidate_ground = ground.clone();
         let mut failed = false;
         for i in 1..=n {
             cancellation::checkpoint()?;
             // 原地转向保持实际中心和相对地面倾斜；不能把地面法向绕世界Z轴转走。
-            let result = advance(
-                map,
+            let result = advance_bound(
+                query,
+                &mut candidate_ground,
                 previous,
                 [from.0[0], from.0[1]],
                 yaw(from.1) + delta * i as f64 / n as f64,
@@ -256,13 +284,22 @@ fn rotate(
         }
         if !failed {
             poses.extend(candidate);
+            *ground = candidate_ground;
             return Ok(());
         }
     }
     Err(LocalPlanError{body_witness:rejected_sample,.."近场初始转向未通过机体/支撑检查".into()})
 }
-fn project(
+#[cfg(test)]
+fn rotate(map: &SurfaceSnapshot, poses: &mut Vec<BodyPose>, heading: f64,
+    kinematics: &MotionKinematics, boundary: &[[f64; 2]]) -> Result<(), LocalPlanError> {
+    let (query, mut ground) = bind_query(map, *poses.last().unwrap())?;
+    rotate_bound(&query, &mut ground, poses, heading, kinematics, boundary)
+}
+fn project_bound(
     map: &SurfaceSnapshot,
+    query: &SurfaceBodyQueryView,
+    start_ground: &BodyGroundState,
     start: BodyPose,
     points: &[[f64; 3]],
     kinematics: &MotionKinematics,
@@ -276,7 +313,7 @@ fn project(
         // 可达参考终点优先保留，避免局部轨迹主动截在到达边缘而提前减速。
         // 这只选择候选，不缩小合法目标球；中心不可站立仍回退原区域投影。
         let endpoint_blocked=std::cell::Cell::new(None);
-        if let Some(poses)=admit_candidate(project_to_region(map,start,points,kinematics,
+        if let Some(poses)=admit_candidate(project_to_region(map,query,start_ground,start,points,kinematics,
             smooth,final_yaw,None,boundary,&endpoint_blocked))? {
             if poses.last().is_some_and(|end| if tolerance == 0.0 {
                 same_finite_position(end.0, goal)
@@ -285,11 +322,23 @@ fn project(
             }
         }
     }
-    project_to_region(map,start,points,kinematics,smooth,final_yaw,arrival,boundary,blocked)
+    project_to_region(map,query,start_ground,start,points,kinematics,smooth,final_yaw,arrival,boundary,blocked)
+}
+
+#[cfg(test)]
+fn project(map: &SurfaceSnapshot, start: BodyPose, points: &[[f64; 3]],
+    kinematics: &MotionKinematics, smooth: bool, final_yaw: Option<f64>,
+    arrival: Option<([f64; 3], f64)>, boundary: &[[f64; 2]],
+    blocked: &std::cell::Cell<Option<[f64; 3]>>) -> Result<Vec<BodyPose>, LocalPlanError> {
+    let (query, ground) = bind_query(map, start)?;
+    project_bound(map, &query, &ground, start, points, kinematics, smooth, final_yaw,
+        arrival, boundary, blocked)
 }
 
 fn project_to_region(
     map: &SurfaceSnapshot,
+    query: &SurfaceBodyQueryView,
+    start_ground: &BodyGroundState,
     start: BodyPose,
     points: &[[f64; 3]],
     kinematics: &MotionKinematics,
@@ -301,6 +350,7 @@ fn project_to_region(
 ) -> Result<Vec<BodyPose>, LocalPlanError> {
     cancellation::checkpoint()?;
     let mut poses = vec![start];
+    let mut ground = start_ground.clone();
     let mut valid = Vec::new();
     for &point in points {
         cancellation::checkpoint()?;
@@ -313,7 +363,7 @@ fn project_to_region(
             return Err("近场参考尚未到达原三维目标区域".into());
         }
         if let Some(yaw) = final_yaw {
-            rotate(map, &mut poses, yaw, kinematics, boundary)?;
+            rotate_bound(query, &mut ground, &mut poses, yaw, kinematics, boundary)?;
         }
         // 转向可按地形重投影高度；零容差仍须保留原三维位置。
         if arrival.is_some_and(|(goal, tolerance)| tolerance == 0.0
@@ -323,8 +373,9 @@ fn project_to_region(
         return Ok(poses);
     }
     let first = valid[0];
-    rotate(
-        map,
+    rotate_bound(
+        query,
+        &mut ground,
         &mut poses,
         (first[1] - start.0[1]).atan2(first[0] - start.0[0]),
         kinematics,
@@ -351,7 +402,7 @@ fn project_to_region(
             return Err("样条存在切向反折，需要显式转向接续".into());
         }
         if !smooth && change.abs() > 0.03 {
-            rotate(map, &mut poses, tangent, kinematics, boundary)?;
+            rotate_bound(query, &mut ground, &mut poses, tangent, kinematics, boundary)?;
         }
         if smooth
             && kinematics.minimum_turning_radius_m > 0.0
@@ -387,7 +438,7 @@ fn project_to_region(
                 ];
             }
         }
-        let next = advance(map, previous, xy, tangent, boundary).map_err(|mut error| {
+        let next = advance_bound(query, &mut ground, previous, xy, tangent, boundary).map_err(|mut error| {
             if !matches!(error.kind, LocalPlanFailureKind::Cancelled)
                 && blocked.get().is_none() {
                 blocked.set(Some([xy[0], xy[1], previous.0[2]]));
@@ -422,7 +473,7 @@ fn project_to_region(
         return Err("地形投影后的末点尚未到达原三维目标区域".into());
     }
     if let Some(heading) = final_yaw {
-        rotate(map, &mut poses, heading, kinematics, boundary)?;
+        rotate_bound(query, &mut ground, &mut poses, heading, kinematics, boundary)?;
     }
     // 不改变正容差的原检查顺序；新零值出口验证最终完整姿态的位置。
     if arrival.is_some_and(|(goal, tolerance)| tolerance == 0.0
@@ -465,7 +516,30 @@ pub fn plan_with_progress(
     progress: Option<ProgressPrefixPolicy<'_>>,
 ) -> Result<LocalTrajectory, LocalPlanError> {
     plan_with_extent(map, tomogram, start, reference, kinematics, config, final_yaw,
-        arrival, boundary, follow_reference, prefer_straight, progress, PlanExtent::Full).map(|outcome| match outcome {
+        arrival, boundary, follow_reference, prefer_straight, progress, PlanExtent::Full, None).map(|outcome| match outcome {
+        PlanOutcome::Trajectory(path) => path,
+        PlanOutcome::ReferenceMiss => unreachable!("full Scan cannot return a reference miss"),
+    })
+}
+/// Use the actual owner's source-local starting ground association.
+/// The caller must derive this map from the same source as that association.
+pub fn plan_with_progress_from_ground(
+    map: &SurfaceSnapshot,
+    tomogram: &Tomogram,
+    start: BodyPose,
+    start_ground: &BodyGroundState,
+    reference: &[[f64; 3]],
+    kinematics: &MotionKinematics,
+    config: &ScanConfig,
+    final_yaw: Option<f64>,
+    arrival: Option<([f64; 3], f64)>,
+    boundary: &[[f64; 2]],
+    follow_reference: bool,
+    prefer_straight: bool,
+    progress: Option<ProgressPrefixPolicy<'_>>,
+) -> Result<LocalTrajectory, LocalPlanError> {
+    plan_with_extent(map, tomogram, start, reference, kinematics, config, final_yaw,
+        arrival, boundary, follow_reference, prefer_straight, progress, PlanExtent::Full, Some(start_ground)).map(|outcome| match outcome {
         PlanOutcome::Trajectory(path) => path,
         PlanOutcome::ReferenceMiss => unreachable!("full Scan cannot return a reference miss"),
     })
@@ -484,6 +558,7 @@ fn plan_with_extent(
     prefer_straight: bool,
     progress: Option<ProgressPrefixPolicy<'_>>,
     extent: PlanExtent,
+    initial_ground: Option<&BodyGroundState>,
 ) -> Result<PlanOutcome, LocalPlanError> {
     cancellation::checkpoint()?;
     if progress.is_some_and(|policy| !policy.minimum_distance_m.is_finite()
@@ -492,7 +567,7 @@ fn plan_with_extent(
         return Err("有限进度策略缺少有效的原全局窗口或控制距离".into());
     }
     let result = plan_impl(map, tomogram, start, reference, kinematics, config, final_yaw,
-        arrival, boundary, follow_reference, prefer_straight,progress,extent);
+        arrival, boundary, follow_reference, prefer_straight,progress,extent,initial_ground);
     cancellation::checkpoint()?;
     result.map_err(|mut failure| {
         if let Some(witness)=failure.body_witness.take() {
@@ -533,7 +608,32 @@ pub fn probe_reference_candidates(
     progress: Option<ProgressPrefixPolicy<'_>>,
 ) -> Result<ReferenceCandidateOutcome, LocalPlanError> {
     plan_with_extent(map, tomogram, start, reference, kinematics, config, final_yaw,
-        arrival, boundary, follow_reference, prefer_straight, progress, PlanExtent::ReferenceOnly).map(|outcome| match outcome {
+        arrival, boundary, follow_reference, prefer_straight, progress, PlanExtent::ReferenceOnly, None).map(|outcome| match outcome {
+        PlanOutcome::Trajectory(path) => {
+            ReferenceCandidateOutcome::Complete(path)
+        }
+        PlanOutcome::ReferenceMiss => ReferenceCandidateOutcome::Miss,
+    })
+}
+/// Use the actual owner's source-local starting ground association.
+/// The caller must derive this map from the same source as that association.
+pub fn probe_reference_candidates_from_ground(
+    map: &SurfaceSnapshot,
+    tomogram: &Tomogram,
+    start: BodyPose,
+    start_ground: &BodyGroundState,
+    reference: &[[f64; 3]],
+    kinematics: &MotionKinematics,
+    config: &ScanConfig,
+    final_yaw: Option<f64>,
+    arrival: Option<([f64; 3], f64)>,
+    boundary: &[[f64; 2]],
+    follow_reference: bool,
+    prefer_straight: bool,
+    progress: Option<ProgressPrefixPolicy<'_>>,
+) -> Result<ReferenceCandidateOutcome, LocalPlanError> {
+    plan_with_extent(map, tomogram, start, reference, kinematics, config, final_yaw,
+        arrival, boundary, follow_reference, prefer_straight, progress, PlanExtent::ReferenceOnly, Some(start_ground)).map(|outcome| match outcome {
         PlanOutcome::Trajectory(path) => {
             ReferenceCandidateOutcome::Complete(path)
         }
@@ -574,6 +674,7 @@ fn plan_impl(
     prefer_straight: bool,
     progress: Option<ProgressPrefixPolicy<'_>>,
     extent: PlanExtent,
+    initial_ground: Option<&BodyGroundState>,
 ) -> Result<PlanOutcome, LocalPlanError> {
     #[cfg(feature="profile")]
     let _profile=profile::Scope::begin(start,reference,kinematics,config,final_yaw,arrival,follow_reference,prefer_straight);
@@ -595,6 +696,8 @@ fn plan_impl(
         .map(|p| p[1].abs())
         .fold(0.0, f64::max);
     let model = map.body_envelope().unwrap();
+    // 来源只由本次规划拥有方绑定一次，候选分支只复制小地面状态。
+    let (query, start_ground) = bind_query_with_ground(map, start, initial_ground)?;
     let xmin = model
         .footprint_xy_m
         .iter()
@@ -643,7 +746,7 @@ fn plan_impl(
                 let samples=spline::resample(&[origin,end],spacing)?;
                 for region in [interior,arrival] {
                     cancellation::checkpoint()?;
-                    if let Some(poses)=admit_candidate(project(map,start,&samples,kinematics,false,final_yaw,region,boundary,&blocked))? {
+                    if let Some(poses)=admit_candidate(project_bound(map, &query, &start_ground,start,&samples,kinematics,false,final_yaw,region,boundary,&blocked))? {
                         #[cfg(feature="profile")]
                         profile::success();
                         return Ok(PlanOutcome::Trajectory(LocalTrajectory { partial: false,poses,smoothed:false,
@@ -657,10 +760,10 @@ fn plan_impl(
     #[cfg(feature="profile")] phase.next("quick_step_turn");
     // 台阶后紧接转弯时，先给完整机身留出离开阶边的空间。该参考候选
     // 与普通折线共用全部真实机体检查；失败不修改地图、代价或运动能力。
-    if let Some(guide) = step_turn::guide(map, tomogram, reference, config, arrival.is_some(), boundary)? {
+    if let Some(guide) = step_turn::guide(map, &query, &start_ground, start, reference, config, arrival.is_some())? {
         let samples = spline::resample(&guide, spacing)?;
         let candidate_blocked = std::cell::Cell::new(None);
-        if let Some(poses) = admit_candidate(project(map, start, &samples, kinematics, false,
+        if let Some(poses) = admit_candidate(project_bound(map, &query, &start_ground, start, &samples, kinematics, false,
             final_yaw, interior, boundary, &candidate_blocked))? {
             let end = *poses.last().unwrap();
             let corridor = (config.reference_corridor_m * 0.9).min(config.horizon_m * 0.3);
@@ -668,7 +771,7 @@ fn plan_impl(
             let length = reference.windows(2).map(|w| (w[1][0]-w[0][0]).hypot(w[1][1]-w[0][1])).sum();
             let tangent = reference.windows(2).rfind(|w| (w[1][0]-w[0][0]).hypot(w[1][1]-w[0][1])>1e-9)
                 .map_or(yaw(start.1), |w| (w[1][1]-w[0][1]).atan2(w[1][0]-w[0][0]));
-            if arrival.is_some() || local_search::reference_handoff(end, reference,
+            if arrival.is_some() || local_search::reference_handoff(map, end, reference,
                 model.body_to_support_z_m, corridor, layer_tolerance, length, tangent) {
                 #[cfg(feature="profile")]
                 profile::success();
@@ -705,7 +808,7 @@ fn plan_impl(
         let samples = spline::sample(&controls, spacing)?;
         // 捷径受阻只否决该候选，不能把它的碰撞点当作原参考走廊受阻的证据。
         let shortcut_blocked = std::cell::Cell::new(None);
-        if let Some(poses) = admit_candidate(project(map, start, &samples, kinematics, true, final_yaw, interior, boundary, &shortcut_blocked))? {
+        if let Some(poses) = admit_candidate(project_bound(map, &query, &start_ground, start, &samples, kinematics, true, final_yaw, interior, boundary, &shortcut_blocked))? {
             #[cfg(feature="profile")]
             profile::success();
             return Ok(PlanOutcome::Trajectory(LocalTrajectory { partial: false, poses, smoothed: true, elapsed_ms: began.elapsed().as_secs_f64()*1000.0 }));
@@ -731,8 +834,8 @@ fn plan_impl(
         let sampled = spline::sample(&controls, spacing)?;
         for goal_region in [interior, arrival] {
             cancellation::checkpoint()?;
-            match project(
-                map,
+            match project_bound(
+                map, &query, &start_ground,
                 start,
                 &sampled,
                 kinematics,
@@ -768,8 +871,8 @@ fn plan_impl(
     let sampled = spline::resample(reference, spacing)?;
     #[cfg(test)]
     polyline_reuse_tests::record_projection();
-    let polyline_error = match project(
-        map, start, &sampled, kinematics, false, final_yaw, interior, boundary, &blocked,
+    let polyline_error = match project_bound(
+        map, &query, &start_ground, start, &sampled, kinematics, false, final_yaw, interior, boundary, &blocked,
     ) {
         Ok(poses) => {
             #[cfg(feature="profile")]
@@ -830,8 +933,8 @@ fn plan_impl(
                 guide.push(support(candidate.exit_xyz));
                 guide.push(*reference.last().unwrap());
                 let samples = spline::resample(&guide, spacing)?;
-                if let Some(poses) = admit_candidate(project(
-                    map, start, &samples, kinematics, false, final_yaw, arrival, boundary, &blocked,
+                if let Some(poses) = admit_candidate(project_bound(
+                    map, &query, &start_ground, start, &samples, kinematics, false, final_yaw, arrival, boundary, &blocked,
                 ))? {
                     #[cfg(feature="profile")]
                         profile::success();
@@ -859,7 +962,7 @@ fn plan_impl(
     } else {
         #[cfg(test)]
         polyline_reuse_tests::record_projection();
-        project(map, start, &sampled, kinematics, false, final_yaw, arrival, boundary, &blocked)
+        project_bound(map, &query, &start_ground, start, &sampled, kinematics, false, final_yaw, arrival, boundary, &blocked)
     };
     let (poses, partial) = match polyline {
         Ok(poses) => (poses,false),
@@ -874,18 +977,21 @@ fn plan_impl(
             // 后备搜索也遵守起步方向：可原地完成后方转向时先对齐，
             // 不能因样条失败又把尚未完成的转向混进前进动作。
             let mut prefix=vec![start];
+            let mut search_ground=start_ground.clone();
             let departure_distance=reference.iter().find(|p|(p[0]-start.0[0]).hypot(p[1]-start.0[1])>1e-5)
                 .map_or(0.0,|p|(p[0]-start.0[0]).hypot(p[1]-start.0[1]));
             // 首个拐点位于机体尺度内时，不能用起步圆弧吞掉这段方向。
             // 更长的段已经尝试过直线和样条；它们失败后允许搜索必要的绕障曲线。
             let search_start=if departure_distance<=model.radius()*2.0
                 && angle(departure-yaw(start.1)).abs()>std::f64::consts::FRAC_PI_2
-                && admit_candidate(rotate(map,&mut prefix,departure,kinematics,boundary))?.is_some() {
+                && admit_candidate(rotate_bound(&query,&mut search_ground,&mut prefix,departure,kinematics,boundary))?.is_some() {
                 *prefix.last().unwrap()
             }else{start};
             #[cfg(feature="profile")] drop(phase);
-            merge_search_result(local_search::plan_progress(
+            merge_search_result(local_search::plan_progress_bound(
             map,
+            &query,
+            &search_ground,
             tomogram,
             search_start,
             reference,
@@ -926,6 +1032,7 @@ mod tests {
     include!("reference_probe_tests.rs");
     include!("scan_zero_arrival_tests.rs");
     include!("position_zero_search_tests.rs");
+    include!("search_contract_tests.rs");
     #[cfg(feature="profile")]
     include!("phase_qualification_tests.rs");
     pub(super) fn motion() -> MotionKinematics {
@@ -1037,6 +1144,7 @@ mod tests {
         SurfaceSnapshot::from_points(&points, cfg, size)
             .unwrap()
             .with_body_envelope(SurfaceBodyEnvelope {
+                fixed_collision: None,
                 footprint_xy_m: vec![[-0.3, -0.16], [0.3, -0.16], [0.3, 0.16], [-0.3, 0.16]],
                 z_bounds_m: [-0.15, 0.15],
                 body_to_support_z_m: 0.4,
@@ -1068,6 +1176,7 @@ mod tests {
         obstacles.extend((-130..131).flat_map(|x|(-100..-70).map(move |y|[x,y,-1])));
         let half_width=half_width_cells as f64*0.01-0.0001;
         let map = scene_with_extra_cells(None, 0.0, &obstacles).with_body_envelope(SurfaceBodyEnvelope {
+            fixed_collision: None,
             footprint_xy_m: vec![[-0.3,-half_width],[0.3,-half_width],[0.3,half_width],[-0.3,half_width]],
             z_bounds_m: [-0.15,0.15], body_to_support_z_m: 0.4, max_step_up_m: 0.0, max_step_down_m: 0.0,
             max_cross_slope_deg: 18.0, support_uncertainty_m: 0.0,
@@ -1511,6 +1620,7 @@ mod tests {
             step_threshold_m: 0.2, min_step_tread_depth_m: 0.2, step_penalty_weight: 1.0,
             goal_tolerance: 0.1, viz_publish_hz: 0.0 };
         SurfaceSnapshot::from_points(&points,config,0.1).unwrap().with_body_envelope(SurfaceBodyEnvelope {
+            fixed_collision: None,
             footprint_xy_m: vec![[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],
             z_bounds_m: [-0.1,0.1], body_to_support_z_m: 0.4,
             max_step_up_m: 0.2, max_step_down_m: 0.2, max_cross_slope_deg: 18.0,

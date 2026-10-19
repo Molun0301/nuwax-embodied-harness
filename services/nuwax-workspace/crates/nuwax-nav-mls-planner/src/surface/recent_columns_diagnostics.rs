@@ -128,6 +128,7 @@ fn fixture() -> SurfaceSnapshot {
     SurfaceSnapshot::from_points(&points, config, 0.1)
         .unwrap()
         .with_body_envelope(body::SurfaceBodyEnvelope {
+            fixed_collision: None,
             footprint_xy_m: vec![[-0.15, -0.15], [0.15, -0.15], [0.15, 0.15], [-0.15, 0.15]],
             z_bounds_m: [-0.2, 0.2],
             body_to_support_z_m: 0.4,

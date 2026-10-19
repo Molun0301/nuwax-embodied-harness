@@ -2,6 +2,7 @@
 fn unknown_layer_map() -> Arc<SurfaceSnapshot> {
     Arc::new(SurfaceSnapshot::from_points(&[(10.05, 10.05, 0.05)], map().config().clone(), 0.1)
         .unwrap().with_body_envelope(nuwax_nav_mls_planner::SurfaceBodyEnvelope {
+            fixed_collision: None,
             footprint_xy_m: vec![[-0.08,-0.08],[0.08,-0.08],[0.08,0.08],[-0.08,0.08]],
             z_bounds_m: [-0.05,0.2], body_to_support_z_m: 0.3,
             max_step_up_m: 0.2, max_step_down_m: 0.2, max_cross_slope_deg: 15.0,
@@ -169,6 +170,7 @@ fn inconclusive_candidate_budget_grows_across_receipts_and_pose_jitter() {
     receiver.observe(snapshot.clone()).unwrap();
     let mut adapter=source(receiver.clone(),1);
     adapter.deferred_route=Some(DeferredFrontierRoute {
+            source_unavailable: None,
         source:snapshot.as_ref().clone(),
         candidate:FrontierCandidate {support_xyz:[1.65,1.05,0.1],gain:0.01,travel_cost:0.6},
         start_body:[1.05,1.05,0.4],start_orientation:[0.,0.,0.,1.],resume_cursor:usize::MAX,unresolved:false,state_limit:1,terminal:false,
@@ -211,6 +213,7 @@ fn exhausted_resource_stage_is_explicit_and_does_not_revoke_source() {
     let receiver=SurfaceInputReceiver::new();receiver.observe(snapshot.clone()).unwrap();
     let mut adapter=source(receiver.clone(),1);
     adapter.deferred_route=Some(DeferredFrontierRoute {
+            source_unavailable: None,
         source:snapshot.as_ref().clone(),
         candidate:FrontierCandidate {support_xyz:[1.65,1.05,0.1],gain:0.01,travel_cost:0.6},
         start_body:[1.05,1.05,0.4],start_orientation:[0.,0.,0.,1.],resume_cursor:usize::MAX,unresolved:true,state_limit:nuwax_nav_pct::SearchLimits::default().max_states,terminal:true,
@@ -341,6 +344,7 @@ fn poll_planar_candidate(snapshot: Arc<SurfaceSnapshot>, target: [f64;3],
     adapter.configure_constraints(Some(ExplorationBoundary::from_vertices(
         boundary.iter().map(|p|Point2::new(p[0],p[1])).collect()).unwrap()),1,0.3).unwrap();
     adapter.deferred_route=Some(DeferredFrontierRoute {
+            source_unavailable: None,
         source:snapshot.as_ref().clone(),
         candidate:FrontierCandidate {support_xyz:target,gain:0.01,travel_cost:0.8},
         start_body:[1.05,1.05,0.4],start_orientation:[0.,0.,0.,1.],resume_cursor:usize::MAX,unresolved:false,state_limit:MAX_FRONTIER_ROUTE_STATES,terminal:false,
@@ -449,6 +453,7 @@ fn deferred_unreachable_or_capped_candidate_preserves_the_reachable_suffix() {
         adapter.configure_constraints(Some(ExplorationBoundary::from_vertices(
             boundary.iter().map(|p|Point2::new(p[0],p[1])).collect()).unwrap()),1,0.3).unwrap();
         adapter.deferred_route=Some(DeferredFrontierRoute {
+            source_unavailable: None,
             source:snapshot.as_ref().clone(),
             candidate:FrontierCandidate {support_xyz:[1.75,1.05,0.1],gain:0.01,travel_cost:0.7},
             start_body:current.0,start_orientation:current.1,resume_cursor,unresolved:capped,
@@ -504,6 +509,7 @@ fn planar_unknown_edge_candidate_keeps_the_current_known_layer_bias() {
         let receiver=SurfaceInputReceiver::new();receiver.observe(snapshot.clone()).unwrap();
         let mut adapter=source(receiver,1);
         adapter.deferred_route=Some(DeferredFrontierRoute {
+            source_unavailable: None,
             source:snapshot.as_ref().clone(),
             candidate:FrontierCandidate {support_xyz:[2.15,1.05,0.1],gain:0.01,travel_cost:1.1},
             start_body:[1.05,1.05,0.4+bias],start_orientation:[0.,0.,0.,1.],

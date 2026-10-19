@@ -34,6 +34,7 @@ impl NavPlanner for RecentRecheckProbe {
 }
 fn recent_recheck_source()->Arc<SurfaceSnapshot> {
     Arc::new(crate::surface_follower::test_snapshot(0.0,false).with_body_envelope(SurfaceBodyEnvelope {
+        fixed_collision: None,
         footprint_xy_m:vec![[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],
         z_bounds_m:[-0.05,0.2],body_to_support_z_m:0.4,max_step_up_m:0.2,max_step_down_m:0.2,
         max_cross_slope_deg:18.0,support_uncertainty_m:0.0,

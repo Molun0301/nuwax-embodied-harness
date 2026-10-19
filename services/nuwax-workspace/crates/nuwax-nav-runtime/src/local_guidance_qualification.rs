@@ -213,6 +213,7 @@ mod synthetic_capture_replay_seam_tests {
     fn fixture()->(PlanRequest,MotionKinematics) {
         let source=crate::surface_follower::test_snapshot(0.0,false)
             .with_body_envelope(SurfaceBodyEnvelope {
+                fixed_collision: None,
                 footprint_xy_m:vec![[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],
                 z_bounds_m:[-0.05,0.2],body_to_support_z_m:0.4,
                 max_step_up_m:0.2,max_step_down_m:0.2,max_cross_slope_deg:18.0,
@@ -236,7 +237,10 @@ mod synthetic_capture_replay_seam_tests {
         for pair in route.poses.windows(2) {
             cumulative.push(cumulative.last().unwrap()+pair[0].pose.position.distance(pair[1].pose.position));
         }
-        let mut request=PlanRequest {source,pose:route.poses[0].clone(),boundary:Arc::new(vec![]),
+        let mut request=PlanRequest {
+            start_ground:source.body_query().start_ground_state(crate::route_planning::body(&route.poses[0])).map_err(|error|error.to_string()),
+            source,change_basis:None,
+            changes:Arc::new(crate::surface_changes::SurfaceGeometryChanges::Unknown),pose:route.poses[0].clone(),boundary:Arc::new(vec![]),
             reference:vec![],reference_source:Some(ReferenceSource {route:route.clone(),
                 cumulative:Arc::new(cumulative),goal:route.poses.last().cloned(),
                 options:GoalOptions {allow_reverse:false,position_tolerance_m:0.35,yaw_tolerance_rad:0.15},

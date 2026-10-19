@@ -760,17 +760,13 @@ fn append_cloud_stage(
     ground_source: Option<&ReplayedGroundSource>,
 ) -> Result<(), RebuildError> {
     if ground_source.is_some_and(|s| s.timestamp_ns() != input.source_timestamp_ns) { return Err("PGO ground/source timestamp mismatch".into()); }
-    if !cloud.accumulate_mapping_scan(
-        1,
-        &input.registered_points_map,
-        Some(input.sensor_origin_map),
-        input.source_timestamp_ns,
-    ) {
-        return Err("PGO重建点云无法接纳原始扫描".into());
-    }
-    if let Some(source) = ground_source {
-        cloud.capture_replayed_ground(&input.registered_points_map, source)?;
-    }
+    let accepted = match ground_source {
+        Some(source) => cloud.accumulate_mapping_replayed_scan(1, &input.registered_points_map,
+            Some(input.sensor_origin_map), source),
+        None => cloud.accumulate_mapping_scan(1, &input.registered_points_map,
+            Some(input.sensor_origin_map), input.source_timestamp_ns),
+    };
+    if !accepted { return Err("PGO重建点云无法接纳原始扫描".into()); }
     Ok(())
 }
 
@@ -1530,7 +1526,7 @@ mod tests {
     }
 
     #[test]
-    fn auxiliary_ground_replays_corrected_originals_in_serial_and_worker_lanes() {
+    fn auxiliary_heightfield_replays_corrected_originals_in_serial_and_worker_lanes() {
         use crate::lcm_runtime::mapping_observation::RegisteredObservation;
         use nuwax_map_chunks::LayerSource;
         let wall: Vec<_> = (0..8).flat_map(|y| (0..8).map(move |z|
@@ -1587,21 +1583,41 @@ mod tests {
             let mut measured = BTreeMap::new();
             for block in &root.manifest().blocks {
                 let bytes = root.repository.read_object(block.object, nuwax_map_chunks::MAX_BLOCK_BYTES).unwrap();
-                for (key, layer) in nuwax_map_chunks::decode_layer_observations(&bytes).unwrap() {
-                    measured.insert((block.key, key), layer);
+                let records = nuwax_map_chunks::decode_ground_records(&bytes).unwrap();
+                for (key, record) in records.iter() {
+                    let nuwax_map_chunks::GroundRecordRef::HeightfieldV1(field) = record else {
+                        panic!("new real frames must use the heightfield representation");
+                    };
+                    measured.insert((block.key, key), field.clone());
                 }
             }
             assert!(!measured.is_empty());
             let mut sensors = std::collections::BTreeSet::new();
             for sample in measured.values().flat_map(|layer| &layer.samples) {
-                let LayerSource::Auxiliary { sensor_id, clock_id, runtime_generation, session_generation } = sample.source.as_ref()
-                    else { panic!("vertical LiDAR wall must not be ground"); };
-                sensors.insert(sensor_id.clone());
-                assert_eq!((clock_id.as_str(), *runtime_generation, *session_generation), ("clock", 7, 1));
-                assert_eq!((sample.source_sequence, sample.source_timestamp_ns), (12, 1_100_000_000));
-                let original = ((sample.point_index - 3) / 2) as usize;
-                assert!(original < floor.len(), "wall return was mislabeled ground");
-                assert_eq!(sample.point, <[f64; 3]>::from((expected_pose * floor[original]).coords));
+                // The unchanged short vertical returns span 14 cm, below
+                // the fixed >4q upright rule. Classification is not collision
+                // permission; this control proves corrected source identity.
+                match sample.source.as_ref() {
+                    LayerSource::Auxiliary { sensor_id, clock_id, runtime_generation, session_generation } => {
+                        sensors.insert(sensor_id.clone());
+                        assert_eq!((clock_id.as_str(), *runtime_generation, *session_generation), ("clock", 7, 1));
+                        assert_eq!((sample.source_sequence, sample.source_timestamp_ns), (12, 1_100_000_000));
+                        assert!(sample.point_index >= 3 && (sample.point_index - 3) % 2 == 0);
+                        let original = ((sample.point_index - 3) / 2) as usize;
+                        let point = floor.iter().chain(&wall).nth(original).expect("original auxiliary index");
+                        assert_eq!(sample.point, <[f64; 3]>::from((expected_pose * point).coords));
+                    },
+                    LayerSource::Lidar { .. } => {
+                        let pose = match (sample.source_sequence, sample.source_timestamp_ns) {
+                            (1, 1_000_000_000) => anchor,
+                            (2, 1_100_000_000) => expected_pose,
+                            other => panic!("unexpected LiDAR source {other:?}"),
+                        };
+                        let point = wall.get(sample.point_index as usize).expect("original LiDAR index");
+                        assert_eq!(sample.point, <[f64; 3]>::from((pose * point).coords));
+                    },
+                    other => panic!("unexpected source {other:?}"),
+                }
             }
             assert_eq!(sensors.len(), 2, "same-time independent sensors both keep evidence");
             if let Some(expected) = &reference_layers { assert_eq!(&measured, expected); }

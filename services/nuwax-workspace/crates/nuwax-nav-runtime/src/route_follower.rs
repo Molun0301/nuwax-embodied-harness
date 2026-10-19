@@ -27,12 +27,15 @@ pub struct RouteFollower {
     boundary: Arc<Vec<[f64; 2]>>,
     planner: Arc<PctPlanner>,
     map: Option<Arc<SurfaceSnapshot>>,
+    change_basis: Option<Arc<SurfaceSnapshot>>,
+    changes: Arc<SurfaceGeometryChanges>,
     pose: Option<PoseStamped>,
     route: Option<Arc<Path3D>>,
     goal: Option<PoseStamped>,
     options: GoalOptions,
     cumulative: Arc<Vec<f64>>,
     progress: f64,
+    progress_pose: Option<Point3>,
     local_end: f64,
     local_progress_at_plan: f64,
     local_path: Option<Path3D>,
@@ -87,12 +90,15 @@ impl RouteFollower {
             scan,
             boundary: Arc::new(Vec::new()),
             map: None,
+            change_basis: None,
+            changes: Arc::new(SurfaceGeometryChanges::Unknown),
             pose: None,
             route: None,
             goal: None,
             options: GoalOptions::default(),
             cumulative: Arc::new(Vec::new()),
             progress: 0.0,
+            progress_pose: None,
             local_end: 0.0,
             local_progress_at_plan: 0.0,
             local_path: None,
@@ -148,10 +154,18 @@ impl RouteFollower {
         let (Some(route), Some(pose)) = (&self.route, &self.pose) else {
             return;
         };
+        let position = pose.pose.position;
+        // 搜索范围来自本次真实位移；同一位置的重复轮询不能反复获得到点容差。
+        // 新路线只在原首段接续范围内定位，不借远处回折段推进执行进度。
+        let advance = match self.progress_pose.replace(position) {
+            Some(previous) if previous == position => return,
+            Some(previous) => previous.distance(position) + self.config.controller.goal_tolerance,
+            None => self.config.max_path_deviation_m,
+        };
         let mut best = f64::INFINITY;
         let mut progress = self.progress;
-        let window =
-            (self.progress + self.scan.horizon_m).min(*self.cumulative.last().unwrap_or(&0.0));
+        let window = (self.progress + advance.min(self.scan.horizon_m))
+            .min(*self.cumulative.last().unwrap_or(&0.0));
         for (i, pair) in route.poses.windows(2).enumerate().skip(self.cumulative.partition_point(|&v|v<self.progress).saturating_sub(1)) {
             if self.cumulative[i + 1] + 1e-6 < self.progress {
                 continue;
@@ -166,14 +180,16 @@ impl RouteFollower {
             if l2 < 1e-12 {
                 continue;
             }
-            let d = pose.pose.position;
-            let t = (((d.x - a.x) * v[0] + (d.y - a.y) * v[1] + (d.z - a.z) * v[2]) / l2)
-                .clamp(0.0, 1.0);
+            let length = l2.sqrt();
+            let low = ((self.progress - self.cumulative[i]) / length).clamp(0.0, 1.0);
+            let high = ((window - self.cumulative[i]) / length).clamp(0.0, 1.0);
+            let t = (((position.x - a.x) * v[0] + (position.y - a.y) * v[1]
+                + (position.z - a.z) * v[2]) / l2).clamp(low, high);
             let projected = Point3::new(a.x + v[0] * t, a.y + v[1] * t, a.z + v[2] * t);
-            let distance = projected.distance(d);
+            let distance = projected.distance(position);
             if distance < best {
                 best = distance;
-                progress = self.cumulative[i] + t * l2.sqrt();
+                progress = self.cumulative[i] + t * length;
             }
         }
         if best < self.config.max_path_deviation_m {
@@ -253,12 +269,13 @@ impl RouteFollower {
     fn planning_request(
         &self, map: &Arc<SurfaceSnapshot>, pose: &PoseStamped,
         route: &Arc<Path3D>, detour: bool,
+        start_ground: Result<nuwax_nav_mls_planner::surface::BodyGroundState,String>,
     ) -> PlanRequest {
         #[cfg(any(test, feature = "surface-recovery-qualification"))]
         PLANNING_REQUEST_BUILDS_FOR_QUALIFICATION.with(|count| count.set(count.get() + 1));
         let reference_source=ReferenceSource{route:Arc::clone(route),cumulative:Arc::clone(&self.cumulative),
             goal:self.goal.clone(),options:self.options,offset:self.config.body_to_support_z_m,progress:self.progress};
-        PlanRequest{source:Arc::clone(map),pose:pose.clone(),boundary:Arc::clone(&self.boundary),reference:Vec::new(),
+        PlanRequest{start_ground,source:Arc::clone(map),change_basis:self.change_basis.clone(),changes:Arc::clone(&self.changes),pose:pose.clone(),boundary:Arc::clone(&self.boundary),reference:Vec::new(),
             reference_source:Some(reference_source),final_yaw:None,arrival:None,end:0.0,progress:self.progress,
             generation:self.route_generation,straight:false,detour,scan:self.scan.clone()}
     }
@@ -293,9 +310,12 @@ impl RouteFollower {
         // Refresh source/reference inputs only; original scheduling owns mode changes.
         let detour=previous_detour;
         let start=pose.pose.position;
-        // Borrow only; no request or Arc clone until the original lock matches P.
+        // Resolve actual ground outside the owner exchange lock; geometry must
+        // never run inside the pending-slot factory. The request remains lazy.
+        let start_ground=self.controller.current_ground_query_owned().map(|(_,ground)|ground);
+        // No request construction until the original lock matches P.
         let retired=owner.replace_pending_with_retired(pending_id,owner.epoch(),id,
-            ||self.planning_request(map,pose,route,detour));
+            ||self.planning_request(map,pose,route,detour,start_ground));
         if let Some(retired)=retired {
             self.record_submission(id,start,detour,Some(retired));
             // This updates the already queued slot, not the normal submit cadence.
@@ -313,7 +333,8 @@ impl RouteFollower {
         if self.config.kinematics().is_none() {self.preparation_fault=Some("近场执行缺少运动能力".into());return;}
         let Some(route)=&self.route else {return;};
         let Some(id)=self.next_request.checked_add(1) else {self.permanent_fault=Some("planning request IDs exhausted".into());return;};
-        let request=self.planning_request(map,pose,route,detour);
+        let start_ground=self.controller.current_ground_query_owned().map(|(_,ground)|ground);
+        let request=self.planning_request(map,pose,route,detour,start_ground);
         let start=pose.pose.position;
         if let Some(retired)=self.owner.as_ref().unwrap().submit_with_retired(id,request) {
             if self.record_submission(id,start,detour,retired) {
@@ -497,6 +518,7 @@ impl NavPlanner for RouteFollower {
         self.route = Some(Arc::new(route));
         self.goal = Some(goal);
         self.progress = 0.0;
+        self.progress_pose = None;
         self.local_end = 0.0;
         self.dirty = true;
         self.advance_progress();
@@ -511,6 +533,7 @@ impl NavPlanner for RouteFollower {
     fn update_costmap(&mut self, map: CostMap2D) {
         self.stop();
         self.map = None;
+        self.change_basis=None;self.changes=Arc::new(SurfaceGeometryChanges::Unknown);
         self.controller.update_costmap(map);
     }
     fn update_execution_map(&mut self, map: ExecutionMap) -> Result<(), RuntimeError> {
@@ -547,14 +570,19 @@ impl NavPlanner for RouteFollower {
         if self.local_path.is_none() {
             self.dirty = true;
         }
+        // 请求只共享已接纳 publication 的根引用，完整删除列仍属于原 changes。
+        let change_basis=update.change_basis.clone();
+        let changes=Arc::clone(&update.changes);
         self.controller
             .update_execution_map(ExecutionMap::SurfaceUpdate(update))?;
         self.map = Some(surface);
+        self.change_basis=change_basis;self.changes=changes;
         Ok(())
     }
     fn invalidate_execution_map(&mut self) {
         self.stop();
         self.map = None;
+        self.change_basis=None;self.changes=Arc::new(SurfaceGeometryChanges::Unknown);
         self.controller.invalidate_execution_map();
     }
     fn observe_applied_command(&mut self, command: Twist2) {
@@ -649,6 +677,7 @@ impl NavPlanner for RouteFollower {
         self.goal = None;
         self.cumulative=Arc::new(Vec::new());
         self.progress = 0.0;
+        self.progress_pose = None;
         self.local_end = 0.0;
         self.local_progress_at_plan = 0.0;
         self.local_path = None;
@@ -684,6 +713,8 @@ mod tests {
     include!("route_pending_only_v2_tests.rs");
     include!("route_progress_prefix_tests.rs");
     include!("route_partial_priority_tests.rs");
+    include!("route_runtime_contract_tests.rs");
+    include!("route_incremental_request_tests.rs");
 
 #[derive(Clone, Copy)]
 enum RecoveryFixtureResult { Incomplete, Full, Partial }
@@ -1039,6 +1070,7 @@ fn ordinary_incomplete_search_keeps_nominal_retry_without_guard_rejection() {
     fn comparison_map(blocked: bool, observed_ns: Option<u64>) -> Arc<SurfaceSnapshot> {
         let map = crate::surface_follower::test_snapshot(0.0, blocked)
             .with_body_envelope(SurfaceBodyEnvelope {
+                fixed_collision: None,
                 footprint_xy_m: vec![[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],
                 z_bounds_m: [-0.05,0.2], body_to_support_z_m: 0.4,
                 max_step_up_m: 0.2, max_step_down_m: 0.2,
@@ -1710,6 +1742,7 @@ fn ordinary_incomplete_search_keeps_nominal_retry_without_guard_rejection() {
     fn invalid_current_support_waits_without_replanning_and_recovers_on_pose_update() {
         let map = Arc::new(crate::surface_follower::test_snapshot(0.0, false)
             .with_body_envelope(SurfaceBodyEnvelope {
+                fixed_collision: None,
                 footprint_xy_m: vec![[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],
                 z_bounds_m: [-0.05,0.2], body_to_support_z_m: 0.4,
                 max_step_up_m: 0.2, max_step_down_m: 0.2,
@@ -1753,7 +1786,7 @@ fn ordinary_incomplete_search_keeps_nominal_retry_without_guard_rejection() {
     #[test]
     fn straight_global_route_stays_straight_after_lateral_tracking_error() {
         let map=Arc::new(crate::surface_follower::test_snapshot(0.0,false)
-            .with_body_envelope(SurfaceBodyEnvelope {footprint_xy_m:vec![[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],
+            .with_body_envelope(SurfaceBodyEnvelope {fixed_collision:None,footprint_xy_m:vec![[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],
                 z_bounds_m:[-0.05,0.2],body_to_support_z_m:0.4,max_step_up_m:0.2,max_step_down_m:0.2,
                 max_cross_slope_deg:18.0,support_uncertainty_m:0.0}).unwrap());
         let make=|x,y|PoseStamped {frame_id:NavFrameId::Map,stamp:Timestamp::from_unix(1,0),
@@ -1788,6 +1821,7 @@ fn ordinary_incomplete_search_keeps_nominal_retry_without_guard_rejection() {
         let map = Arc::new(
             crate::surface_follower::test_snapshot(0.0, false)
                 .with_body_envelope(SurfaceBodyEnvelope {
+                    fixed_collision: None,
                     footprint_xy_m: vec![[-0.1, -0.1], [0.1, -0.1], [0.1, 0.1], [-0.1, 0.1]],
                     z_bounds_m: [-0.05, 0.2],
                     body_to_support_z_m: 0.4,
@@ -1868,6 +1902,7 @@ fn ordinary_incomplete_search_keeps_nominal_retry_without_guard_rejection() {
     }
     fn rolling_window_follower() -> (RouteFollower,Arc<SurfaceSnapshot>) {
         let envelope = SurfaceBodyEnvelope {
+            fixed_collision: None,
             footprint_xy_m: vec![[-0.1, -0.1], [0.1, -0.1], [0.1, 0.1], [-0.1, 0.1]],
             z_bounds_m: [-0.05, 0.2],
             body_to_support_z_m: 0.4,
@@ -2011,5 +2046,159 @@ fn ordinary_incomplete_search_keeps_nominal_retry_without_guard_rejection() {
             }}
         }
     }
+
+// Insert inside route_follower.rs's existing #[cfg(test)] mod tests, before its
+// closing brace. This is a source-only draft; it has not been built or run.
+#[test]
+fn runtime_actual_unknown_request_real_scan_returns_known_at_original_z() {
+    use nuwax_nav_mls_planner::surface::GroundQueryState;
+    use nuwax_nav_types_messages::MotionLimits;
+
+    // Exact surface_body_control::query_reuse_tests::map(0.0) fixture.
+    // Keep the legacy source, extent, body, support offset and thresholds intact.
+    let source = Arc::new(
+        crate::surface_follower::test_snapshot(0.0, false)
+            .with_body_envelope(SurfaceBodyEnvelope {
+                fixed_collision: None,
+                footprint_xy_m: vec![[-0.1, -0.1], [0.1, -0.1], [0.1, 0.1], [-0.1, 0.1]],
+                z_bounds_m: [-0.05, 0.2],
+                body_to_support_z_m: 0.3,
+                max_step_up_m: 0.2,
+                max_step_down_m: 0.2,
+                max_cross_slope_deg: 20.0,
+                support_uncertainty_m: 0.0,
+            })
+            .unwrap(),
+    );
+    // Exact owner_follower configuration, without changing Scan budgets.
+    let mut config = SurfaceFollowerConfig::new(0.3);
+    config.controller.simulation = true;
+    config.motion_limits = Some(MotionLimits {
+        model: MotionModel::Differential,
+        max_forward_mps: 0.5, max_reverse_mps: 0.0, max_lateral_mps: 0.0,
+        max_angular_rps: 0.8, linear_acceleration_mps2: 1.0,
+        guaranteed_braking_mps2: 1.0, angular_acceleration_rps2: 2.0,
+        guaranteed_angular_braking_rps2: 2.0, reaction_time_sec: 0.05,
+        minimum_turning_radius_m: 0.0, can_rotate_in_place: true,
+    });
+    let mut follower = RouteFollower::new(config.clone()).unwrap();
+    follower.update_execution_map(ExecutionMap::Surface(source.clone())).unwrap();
+    let pose = |x: f64, tick: i64| PoseStamped {
+        frame_id: NavFrameId::Map,
+        stamp: Timestamp::from_unix(1 + tick, 0),
+        pose: Pose3 { position: Point3::new(x, 1.05, 0.4), orientation: Quaternion::IDENTITY },
+    };
+    follower.update_odometry(pose(1.05, 0));
+    assert!(follower.controller.current_body_error().is_none());
+    let mut a = pose(6.45, 1);
+    a.pose.position.z = 0.45;
+    // Predeclared yaw-only alignment toward the return target. This avoids an
+    // unrelated 180-degree turn while preserving the fixed map and XYZ fixture.
+    a.pose.orientation = Quaternion::from_yaw(std::f64::consts::PI);
+    let mut b = a.clone();
+    b.pose.position.x = 6.65;
+    b.stamp = pose(6.65, 2).stamp;
+    follower.update_odometry(a.clone());
+    assert!(follower.controller.current_body_error().is_none());
+    let (_, known) = follower.controller.current_ground_query_owned().unwrap();
+    assert_ne!(known.query_state(), GroundQueryState::Unknown);
+    let support_z = a.pose.position.z - config.body_to_support_z_m;
+    assert!((known.height() - support_z).abs() > 0.025);
+
+    // Actual odometry, never a projected endpoint, enters the Unknown column.
+    // Do not call a mutable refresh at B: production schedule must capture the
+    // read-only actual-state fallback without re-seeding it from B's body Z.
+    follower.update_odometry(b.clone());
+    let (query, carried) = follower.controller.current_ground_query_owned().unwrap();
+    let fresh = source.body_query().start_ground_state(body(&b)).unwrap();
+    assert_eq!(carried.query_state(), GroundQueryState::Unknown);
+    assert_eq!(fresh.query_state(), GroundQueryState::Unknown);
+    assert_eq!(carried.height().to_bits(), known.height().to_bits());
+    assert_ne!(carried, fresh);
+
+    // Fail visibly at fixture preflight; do not replace this with a fake Scan
+    // success, loosen the 0.01 arrival ball, or change the body/ground fixture.
+    let direct = query.project_motion(body(&b), &carried, [6.45, 1.05], a.pose.orientation.yaw(), &mut None)
+        .expect("fixed owner fixture must project back to A");
+    assert!((direct.pose().0[2] - a.pose.position.z).abs() < 1e-12);
+    query.validate_projected_motion(body(&b), &direct, &[], &mut None)
+        .expect("fixed owner fixture must admit its original direct sweep");
+
+    let options = GoalOptions { position_tolerance_m: 0.01, ..GoalOptions::default() };
+    follower.configure_goal(&a, options).unwrap();
+    follower.replace_execution_path(
+        ExecutionPath::Surface(Path3D { poses: vec![b.clone(), a.clone()] }),
+        None, a.clone(),
+    ).unwrap();
+    let original_route = follower.route.as_ref().unwrap().clone();
+    let original_goal = follower.goal.clone();
+    assert_eq!(follower.local_planning_calls(), 0);
+    assert!(follower.submitted.is_none(), "path replacement may advance progress but must not schedule");
+    assert_eq!(follower.progress.to_bits(), 0.0_f64.to_bits());
+
+    // Real production request builder and real asynchronous PlanKernel/Scan.
+    // No scan_hook, synthetic Candidate, request literal or ground substitution.
+    follower.schedule(false);
+    assert_eq!(follower.local_planning_calls(), 1);
+    let expected_id = follower.submitted.unwrap().0;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let completion = loop {
+        let owner = follower.owner.as_ref().unwrap();
+        assert!(!owner.faulted(), "real planning owner faulted");
+        if let Some(completion) = owner.take() { break completion; }
+        assert!(Instant::now() < deadline, "real Scan did not finish within the test wait bound");
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    assert_eq!(completion.id, expected_id);
+    assert_eq!(completion.epoch, follower.owner.as_ref().unwrap().epoch());
+    let PlanResult { request, outcome } = completion.value;
+    assert!(Arc::ptr_eq(&request.source, &source));
+    assert_eq!(pose_bits(body(&request.pose)), pose_bits(body(&b)));
+    assert_eq!(request.start_ground.as_ref().expect("production actual-state capture"), &carried);
+    assert_ne!(request.start_ground.as_ref().unwrap(), &fresh);
+    assert_eq!(request.arrival.map(|(p, t)| (p.map(f64::to_bits), t.to_bits())),
+        Some((body(&a).0.map(f64::to_bits), 0.01_f64.to_bits())));
+    assert!(Arc::ptr_eq(&request.reference_source.as_ref().unwrap().route, &original_route));
+    assert!(!request.detour);
+    assert!(request.straight, "the original B-to-A global route is a straight window");
+    assert_eq!(request.progress.to_bits(), 0.0_f64.to_bits());
+    assert_eq!(request.end.to_bits(), b.pose.position.distance(a.pose.position).to_bits());
+    assert!(exact_points(&request.reference, &[
+        [b.pose.position.x, b.pose.position.y, b.pose.position.z - config.body_to_support_z_m],
+        [a.pose.position.x, a.pose.position.y, a.pose.position.z - config.body_to_support_z_m],
+    ]));
+    assert_eq!(request.scan.horizon_m.to_bits(), config.scan.horizon_m.to_bits());
+    assert_eq!(request.scan.refresh_distance_m.to_bits(), config.scan.refresh_distance_m.to_bits());
+    assert_eq!(request.scan.reference_corridor_m.to_bits(), config.max_path_deviation_m.to_bits());
+    assert_eq!(request.scan.search_expansion_limit, config.scan.search_expansion_limit);
+    assert_eq!(request.scan.optimization_iterations, config.scan.optimization_iterations);
+    let candidate = outcome.unwrap_or_else(|failures| {
+        panic!("fixed owner fixture did not produce a real full Scan result: {failures:?}")
+    });
+    assert!(!candidate.partial, "a prefix is not a strict original-goal result");
+    assert!(candidate.path.poses.len() >= 2);
+    assert_eq!(pose_bits(body(candidate.path.poses.first().unwrap())), pose_bits(body(&b)));
+    let endpoint = candidate.path.poses.last().unwrap();
+    assert!(endpoint.pose.position.distance(a.pose.position) < 0.01);
+    assert!((endpoint.pose.position.z - a.pose.position.z).abs() < 1e-12,
+        "return to the original known plane must retain the original body Z");
+
+    // Independently sweep the actual result with the captured actual association.
+    // Standalone source.validate_body_motion would incorrectly fresh-seed B.
+    let mut checked_ground = carried.clone();
+    for edge in candidate.path.poses.windows(2) {
+        checked_ground = query.validate_motion_from_ground(
+            body(&edge[0]), body(&edge[1]), &checked_ground, &request.boundary, &mut None,
+        ).expect("real Scan edge must validate with the same carried ground semantics");
+    }
+    assert_ne!(checked_ground.query_state(), GroundQueryState::Unknown);
+    assert_eq!(checked_ground.height().to_bits(), known.height().to_bits());
+    assert_eq!(follower.controller.current_ground_query_owned().unwrap().1, carried,
+        "planning and result validation must not consume actual owner history");
+    assert_eq!(pose_bits(body(follower.pose.as_ref().unwrap())), pose_bits(body(&b)));
+    assert!(Arc::ptr_eq(follower.route.as_ref().unwrap(), &original_route));
+    assert_eq!(follower.goal, original_goal);
+    follower.stop();
+}
 
 }

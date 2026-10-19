@@ -141,6 +141,7 @@ fn captured_dense_doorway_reproduces_exact_connector_rejection() {
         [-0.15_f64, 0.15, 0.4, 0.0, 0.0, 18.0, 0.0].map(f64::to_bits));
     let scalar = recipe.body_scalar_bits.map(f64::from_bits);
     let envelope = SurfaceBodyEnvelope {
+        fixed_collision: None,
         footprint_xy_m: recipe.footprint_xy_bits.iter().map(|p| p.map(f64::from_bits)).collect(),
         z_bounds_m: [scalar[0], scalar[1]], body_to_support_z_m: scalar[2],
         max_step_up_m: scalar[3], max_step_down_m: scalar[4],
@@ -450,6 +451,7 @@ fn captured_dense_doorway_static_connector_probes() {
         [-0.15_f64, 0.15, 0.4, 0.0, 0.0, 18.0, 0.0].map(f64::to_bits));
     let scalar = recipe.body_scalar_bits.map(f64::from_bits);
     let envelope = SurfaceBodyEnvelope {
+        fixed_collision: None,
         footprint_xy_m: recipe.footprint_xy_bits.iter().map(|p| p.map(f64::from_bits)).collect(),
         z_bounds_m: [scalar[0], scalar[1]], body_to_support_z_m: scalar[2],
         max_step_up_m: scalar[3], max_step_down_m: scalar[4],

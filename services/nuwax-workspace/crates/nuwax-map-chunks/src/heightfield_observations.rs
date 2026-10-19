@@ -98,7 +98,15 @@ impl HeightfieldColumn {
         })
     }
 
-    /// Withdraw only members removed from the owner's actual occupancy.
+    /// Carry caller-confirmed historical ownership without inventing past
+    /// return counts. Existing normalized mass is unchanged. The Writer checks
+    /// that these exact members still exist in its occupancy before publication.
+    pub fn add_zero_mass_members(&mut self, members: impl IntoIterator<Item = i32>) {
+        for z in members { self.members.entry(z).or_default(); }
+    }
+
+    /// Withdraw exact ownership after actual occupancy removal or current
+    /// geometric counter-evidence; this does not remove physical occupancy.
     /// If no statistical mass survives, there is no height record (None), not
     /// height zero. This never deletes the caller's underlying occupancy.
     pub fn retain_members(&self, occupied: &BTreeSet<i32>) -> Option<Self> {

@@ -1,6 +1,7 @@
 //! 禁区源代价优化的同快照精确对照。
 //! 仅冻结旧表面包装函数；未修改的底层构造器继续共用。
 use super::*;
+use ahash::AHashSet;
 use nuwax_nav_mls_planner::{mls_planner::Config, SurfaceObservation, SurfaceObservations};
 use std::{collections::BTreeMap, hint::black_box, sync::Arc, time::{Duration, Instant}};
 
@@ -243,7 +244,7 @@ fn masked_surface_cancellation_uses_real_epoch() {
     epoch.store(0, Ordering::Release);
     let visited = Counter::new(0);
     let resolution = f64::from(FINE);
-    let columns = (0..10_000).map(|_| ([18, 8], vec![[0.0, resolution]]))
+    let columns = (0..10_000).map(|y| ([18, y], vec![[0.0, resolution]]))
         .take_while(|_| !crate::planning_cancelled())
         .map(|(column, mut bands)| {
             assert!(!source.navigation_column_allowed(column, resolution));

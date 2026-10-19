@@ -74,6 +74,7 @@ fn fine_scene(keys: impl IntoIterator<Item = [i32; 3]>, cfg: Config) -> SurfaceS
 fn scene(keys: impl IntoIterator<Item = [i32; 3]>) -> SurfaceSnapshot {
     fine_scene(keys, config())
         .with_body_envelope(SurfaceBodyEnvelope {
+            fixed_collision: None,
             footprint_xy_m: vec![[-0.08, -0.06], [0.08, -0.06], [0.08, 0.06], [-0.08, 0.06]],
             z_bounds_m: [-0.1, 0.2],
             body_to_support_z_m: 0.5,

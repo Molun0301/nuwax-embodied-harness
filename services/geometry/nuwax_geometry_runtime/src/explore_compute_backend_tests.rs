@@ -914,6 +914,7 @@ fn install_rejects_unsupported_source_before_begin_and_preserves_old_controller(
 fn cancellable_surface_context() -> ComputeContext {
     let map = surface_fixture(0.0)
         .with_body_envelope(nuwax_nav_mls_planner::SurfaceBodyEnvelope {
+            fixed_collision: None,
             footprint_xy_m: vec![[-0.1, -0.1], [0.1, -0.1], [0.1, 0.1], [-0.1, 0.1]],
             z_bounds_m: [-0.05, 0.2],
             body_to_support_z_m: 0.3,

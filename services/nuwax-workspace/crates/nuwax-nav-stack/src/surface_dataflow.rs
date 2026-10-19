@@ -487,12 +487,17 @@ fn prepare_surface_map_with_retry(
             (Err(error.to_string()), incomplete, None, Arc::new(SurfaceGeometryChanges::Unknown))
         }
     };
-    // Derive legacy disk/height execution geometry on the existing background
-    // map owner, never on a control tick. The PCT owner retains its one cache.
+    // The existing map owner prepares the shared global reference before either
+    // execution mode consumes it. Complete source deltas stay borrowed here;
+    // the PCT owner retains its one immutable cache outside the control tick.
     let planar_reference = match snapshot.as_ref() {
-        Ok(surface) if surface.body_envelope().is_none() => match config.follower.pct.map(surface) {
-            Ok(reference) => Some(reference),
-            Err(error) => { snapshot = Err(error); None }
+        Ok(surface) => {
+            let delta = nuwax_nav_runtime::surface_changes::pct_surface_delta(
+                change_basis.as_deref(), &geometry_changes);
+            match config.follower.pct.map_with_delta(surface, delta) {
+                Ok(reference) => surface.body_envelope().is_none().then_some(reference),
+                Err(error) => { snapshot = Err(error); None }
+            }
         },
         _ => None,
     };
@@ -678,6 +683,7 @@ fn reference_changes_affect_path(previous: &SurfaceSnapshot, current: &SurfaceSn
     };
     let Some(model) = current.body_envelope() else { return true; };
     let work = model.footprint_xy_m.len().checked_add(path.poses.len())
+        .and_then(|work|work.checked_add(model.fixed_collision.as_ref().map_or(0,|g|g.primitives.len())))
         .and_then(|work| work.checked_add(fine.len())).and_then(|work| work.checked_add(coarse.len()));
     if work.is_none_or(|work| work > MAX_REFERENCE_SCOPE_WORK) { return true; }
     reference_scope::ReferenceCorridor::new(current, path).is_none_or(|corridor| {
@@ -1125,8 +1131,14 @@ async fn run_surface_planner_with_computer(
                 config.planning_search_budget = Some(search_budget);
                 path_cancellation = Some(SurfaceJobTicket::new(epoch, planned_goal.goal_key(), cancelled, &surface, &config));
                 let computer = Arc::clone(&computer);
+                // A retry is still inconclusive while it runs. Preserve the
+                // last typed resource outcome if the original wait deadline
+                // expires before this computation returns; do not reset it.
+                let planning_message = if failed_input.as_ref().is_some_and(|failed| failed.resource_limited()) {
+                    "正在计算三维路径；前次 BudgetExhausted，未证明无路"
+                } else { "正在计算三维路径" };
                 hub.planning.send_replace(Some((planned_goal.session_id.clone(),planned_goal.goal_key(),
-                    "正在计算三维路径".into())));
+                    planning_message.into())));
                 // 全局搜索独立执行；已交付路线的局部有效性由跟随器持续判断。
                 let queued=Instant::now();
                 path_computations.spawn_blocking(move || {
@@ -1746,6 +1758,90 @@ mod tests {
                 ..schema::MapMetaData::default()
             },
             data,
+        }
+    }
+
+    #[test]
+    fn production_fine_delta_prepares_global_pct_for_both_body_modes() {
+        use nuwax_map_chunks::*;
+        use std::collections::BTreeSet;
+        fn facts(map: &nuwax_nav_pct::Tomogram) -> Vec<([i32; 2], [u64; 6])> {
+            let mut values: Vec<_> = map.cells.iter().map(|cell| {
+                (cell.column, [cell.ground, cell.ceiling, cell.clearance,
+                    cell.cost, cell.ground_interval[0], cell.ground_interval[1]].map(f64::to_bits))
+            }).collect();
+            values.sort(); values
+        }
+        fn route(map: &nuwax_nav_pct::Tomogram) -> (Vec<[u64;3]>, usize) {
+            let point = |column: [i32;2]| {
+                let cell = map.cells.iter().find(|cell| cell.column == column).unwrap();
+                [(f64::from(column[0])+0.5)*map.resolution,
+                    (f64::from(column[1])+0.5)*map.resolution,cell.ground]
+            };
+            let route = map.plan(point([-1,2]),point([34,2]),0.001,&[],None).unwrap();
+            (route.points.iter().map(|point| point.map(f64::to_bits)).collect(),route.stats.expanded)
+        }
+        for body in [false, true] {
+            let mut configured = config();
+            configured.follower.max_observation_age_sec = Some(1.0);
+            if body {
+                configured.body_envelope = Some(nuwax_nav_mls_planner::SurfaceBodyEnvelope {
+                    fixed_collision: None,
+                    footprint_xy_m: vec![[-0.15,-0.1],[0.15,-0.1],[0.15,0.1],[-0.15,0.1]],
+                    z_bounds_m: [-0.4,0.1], body_to_support_z_m: 0.4,
+                    max_step_up_m: 0.2, max_step_down_m: 0.2,
+                    max_cross_slope_deg: 35.0, support_uncertainty_m: 0.0,
+                });
+            }
+            let mut cache = SurfaceGeometryCache::configured(&configured);
+            let repository = Repository::temporary().unwrap();
+            let mut writer = Writer::new(repository.clone(), 0.05, 4 * 1024 * 1024).unwrap();
+            let mut cells: BTreeSet<_> = (-3..36).flat_map(|x| (0..5).map(move |y| [x,y,40])).collect();
+            let mut previous_cells = BTreeSet::new();
+            let mut retained = None;
+            let mut previous_map: Option<Arc<nuwax_nav_pct::Tomogram>> = None;
+            for revision in 1..=4 {
+                if revision == 2 { cells.remove(&[31,2,40]); }
+                let mut message = map_message(revision, "pct-fine-delta");
+                if revision == 4 { message.committed_map.session_generation += 1; }
+                message.source_voxel_size = 0.05;
+                message.cloud.width = 0; message.cloud.row_step = 0; message.cloud.data.clear();
+                writer.remove(previous_cells.difference(&cells).copied()).unwrap();
+                writer.observe(cells.iter().copied(), message.source_timestamp_ns as u64).unwrap();
+                let root = writer.snapshot(schema::navigation_map_3d_domain(&message),
+                    revision as u64, message.source_timestamp_ns as u64).unwrap();
+                let included = root.blocks.iter().map(|block| (block.object,
+                    repository.read_object(block.object, MAX_BLOCK_BYTES).unwrap())).collect();
+                message.fine = Some(Transfer { root: root.encode().unwrap(), included });
+                previous_cells = cells.clone();
+                let prepared = prepare_surface_map(message, Instant::now(), &configured, &mut cache);
+                let source = prepared.snapshot.as_ref().unwrap();
+                let map = configured.follower.pct.map(source).unwrap();
+                assert_eq!(prepared.planar_reference.is_some(), !body);
+                if let Some(planar) = prepared.planar_reference.as_ref() { assert!(Arc::ptr_eq(planar,&map)); }
+                let cold = nuwax_nav_pct::Tomogram::from_surface(source).unwrap();
+                assert_eq!(facts(&map), facts(&cold), "body={body}, revision={revision}");
+                assert_eq!(route(&map), route(&cold), "route body={body}, revision={revision}");
+                match revision {
+                    1 => { retained = Some((Arc::clone(source), Arc::clone(&map), facts(&map))); }
+                    2 => {
+                        let SurfaceGeometryChanges::Columns { fine, fine_size, .. } = prepared.geometry_changes.as_ref()
+                            else { panic!("deletion must remain a complete source-column delta"); };
+                        assert!(fine.contains(&[31,2]));
+                        assert_eq!(fine_size.to_bits(), 0.05_f32.to_bits());
+                        assert!(prepared.change_basis.as_ref().is_some_and(|basis|
+                            nuwax_nav_pct::same_source_geometry(basis, &retained.as_ref().unwrap().0)));
+                        assert!(!map.cells.iter().any(|cell| cell.column == [31,2]));
+                    }
+                    3 => assert!(Arc::ptr_eq(previous_map.as_ref().unwrap(), &map), "metadata only keeps the graph"),
+                    4 => assert!(matches!(prepared.geometry_changes.as_ref(), SurfaceGeometryChanges::Unknown)),
+                    _ => unreachable!(),
+                }
+                previous_map = Some(map);
+            }
+            let (_, old, old_facts) = retained.unwrap();
+            assert_eq!(facts(&old), old_facts, "publication must preserve the previous immutable map");
+            assert!(old.cells.iter().any(|cell| cell.column == [31,2]));
         }
     }
 

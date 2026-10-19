@@ -8,6 +8,66 @@ pub struct SurfaceBodyQueryView {
     snapshot: SurfaceSnapshot,
 }
 impl SurfaceBodyQueryView {
+    /// Associate the initial actual support point with this immutable owner.
+    /// Later transitions consume the returned state, never the changing body Z.
+    pub fn start_ground_state(&self,from:([f64;3],[f64;4]))->Result<BodyGroundState,SurfaceError> {
+        self.snapshot.start_owned_ground_state(from)
+    }
+    /// Reassociate an already observed actual pose without granting a motion
+    /// permission or changing its geometry. Unknown samples carry prior h.
+    /// The previous state must belong to this same ground source.
+    pub fn observe_actual_ground(&self,from:([f64;3],[f64;4]),previous:&BodyGroundState,
+        actual:([f64;3],[f64;4]))->Result<BodyGroundState,SurfaceError> {
+        // An actual observation may already be on another observed floor. Its
+        // support Z selects a source layer; the returned height still comes only
+        // from that layer. This is reassociation, not permission to move there.
+        let observed=self.snapshot.start_owned_ground_state(actual)?;
+        if matches!(observed.query_state(),GroundQueryState::Observed|GroundQueryState::LegacyGeometry) {
+            return Ok(observed);
+        }
+        // A fresh unknown start carries actual support Z as its initial seed.
+        // Do not adopt that seed here: retain the previous actual trajectory's
+        // last known h (including any known columns crossed before this gap).
+        let reference=self.snapshot.owned_ground_motion_reference(from,actual,previous)?;
+        Ok(BodyGroundState {sample:reference.at(1.0).clone()})
+    }
+    /// Ground association can survive a new recent cloud, while collision
+    /// proofs must still retire. No value comparison or content hash is used.
+    pub fn same_ground_source(&self,other:&SurfaceSnapshot)->bool {
+        let observations=match (&self.snapshot.observations,&other.observations) {
+            (None,None)=>true,(Some(a),Some(b))=>Arc::ptr_eq(a,b),_=>false,
+        };
+        self.snapshot.ground_evidence==other.ground_evidence
+            && Arc::ptr_eq(&self.snapshot.data,&other.data) && observations
+    }
+    /// Transport the actual pose using source height at the actual support XY.
+    /// The result retains the same segment interpretation for its swept check.
+    pub fn project_motion(&self,from:([f64;3],[f64;4]),ground:&BodyGroundState,xy:[f64;2],yaw:f64,
+        witness:&mut Option<BodyFailureWitness>)->Result<BodyMotionProjection,SurfaceError> {
+        self.snapshot.project_owned_ground_motion(from,ground,xy,yaw,witness)
+    }
+    /// Sweep a projection with the exact ground interpretation that produced it.
+    pub fn validate_projected_motion(&self,from:([f64;3],[f64;4]),projection:&BodyMotionProjection,
+        boundary:&[[f64;2]],witness:&mut Option<BodyFailureWitness>)->Result<(),SurfaceError> {
+        if from!=projection.from {return Err(SurfaceError::InvalidPose);}
+        let reference=BodyQueryReference::Ground(Arc::clone(&projection.reference));
+        self.snapshot.validate_body_motion_in_context(from,projection.pose,boundary,
+            QuerySegment {reference:Some(&reference),samples:[0.0,1.0]},witness)
+    }
+    /// Check an externally supplied actual trajectory without projecting its Z or
+    /// attitude. Return only the next small association after a successful sweep.
+    pub fn validate_motion_from_ground(&self,from:([f64;3],[f64;4]),to:([f64;3],[f64;4]),
+        ground:&BodyGroundState,boundary:&[[f64;2]],witness:&mut Option<BodyFailureWitness>)
+        ->Result<BodyGroundState,SurfaceError> {
+        self.snapshot.validate_owned_actual_support(from,&ground.sample)?;
+        let reference=self.snapshot.owned_ground_motion_reference(from,to,ground)?;
+        let next=BodyGroundState {sample:reference.at(1.0).clone()};
+        self.snapshot.validate_owned_actual_support(to,&next.sample)?;
+        let reference=BodyQueryReference::Ground(Arc::new(reference));
+        self.snapshot.validate_body_motion_in_context(from,to,boundary,
+            QuerySegment {reference:Some(&reference),samples:[0.0,1.0]},witness)?;
+        Ok(next)
+    }
     /// 几何、原始观察和近期障碍同源时，可复用相同位姿的运动检查。
     pub fn same_body_query_view(&self,other:&SurfaceSnapshot)->bool {
         self.snapshot.same_body_query_view(other)
@@ -32,6 +92,55 @@ impl SurfaceBodyQueryView {
         ->Result<(),SurfaceError> {
         self.snapshot.validate_body_motion(from,to,boundary)
     }
+}
+
+/// Small source-local ground association carried by a search node or controller.
+/// Equality includes only data used by future transitions; it copies no members.
+#[derive(Clone,Debug)]
+pub struct BodyGroundState {
+    pub(in crate::surface) sample:GroundSample,
+}
+impl BodyGroundState {
+    fn identity(&self)->(u8,[u64;3],Option<[u64;3]>,&[NativeGroundSource]) {
+        let sample=&self.sample;
+        let mut origin=sample.reference_origin.map(f64::to_bits);
+        if sample.reference_normal.is_none() || sample.query_state==GroundQueryState::Unknown {
+            origin[0]=0;origin[1]=0;
+        }
+        (sample.query_state as u8,origin,sample.reference_normal.map(|n|n.map(f64::to_bits)),
+            &sample.reference_sources)
+    }
+    /// Whether the current support column has direct, legacy or unknown height.
+    pub fn query_state(&self)->GroundQueryState {self.sample.query_state}
+    /// Last usable source height, carried unchanged through an unknown column.
+    pub fn height(&self)->f64 {self.sample.reference_origin[2]}
+    /// Exact native source key, when the last association has a measured record.
+    pub fn ground_key(&self)->Option<GroundKey> {
+        self.sample.reference_sources.first().and_then(|source|match source {
+            NativeGroundSource::ObservedFine{anchor}=>Some(GroundKey::LegacyPlane(*anchor)),
+            NativeGroundSource::HeightfieldFine{key}=>Some(*key),_=>None,
+        })
+    }
+}
+impl PartialEq for BodyGroundState {fn eq(&self,other:&Self)->bool {self.identity()==other.identity()}}
+impl Eq for BodyGroundState {}
+impl std::hash::Hash for BodyGroundState {
+    fn hash<H:std::hash::Hasher>(&self,state:&mut H) {std::hash::Hash::hash(&self.identity(),state);}
+}
+
+/// One projected endpoint and its short-lived, owner-local swept interpretation.
+#[derive(Clone,Debug)]
+pub struct BodyMotionProjection {
+    pub(in crate::surface) from:([f64;3],[f64;4]),
+    pub(in crate::surface) pose:([f64;3],[f64;4]),
+    pub(in crate::surface) ground:BodyGroundState,
+    pub(in crate::surface) reference:Arc<LocalGroundReference>,
+}
+impl BodyMotionProjection {
+    /// Projected actual body position and complete quaternion.
+    pub fn pose(&self)->([f64;3],[f64;4]) {self.pose}
+    /// Small endpoint state to carry after this motion is accepted.
+    pub fn ground(&self)->&BodyGroundState {&self.ground}
 }
 impl SurfaceSnapshot {
     /// A zero-copy geometry query over the unchanged source. Ground evidence is
@@ -98,10 +207,28 @@ impl SurfaceSnapshot {
                 observations.size_m.to_bits()!=self.source_voxel_size_m().to_bits()) {return None;}
         let model=self.body_envelope()?;
         let s=f64::from(self.config().voxel_size);let f=f64::from(self.source_voxel_size_m());
-        let r=model.radius();
+        let mut r=model.radius();
         // Same rotation scale as validate_body_motion_checked_with_witness.
-        let rho=r.hypot(model.z_bounds_m.into_iter().map(f64::abs)
+        let mut rho=r.hypot(model.z_bounds_m.into_iter().map(f64::abs)
             .fold(model.body_to_support_z_m,f64::max));
+        if let Some(geometry)=&model.fixed_collision {
+            for primitive in &geometry.primitives {
+                let shape_radius=match primitive.shape {
+                    nuwax_types::FixedCollisionShape::Box{size_m}=>
+                        (size_m[0]*0.5).hypot(size_m[1]*0.5).hypot(size_m[2]*0.5),
+                    nuwax_types::FixedCollisionShape::Sphere{radius_m}=>radius_m,
+                    nuwax_types::FixedCollisionShape::Cylinder{radius_m,length_m}=>radius_m.hypot(length_m*0.5),
+                };
+                let [x,y,z]=primitive.translation_m;
+                // Actual queries append the rigid world-AABB corners to their
+                // footprint. Cover corners of the union of all primitive AABBs,
+                // including corners combining extents from different primitives.
+                let fixed_xy=std::f64::consts::SQRT_2*(x.hypot(y)+shape_radius);
+                let fixed_xyz=3.0_f64.sqrt()*(x.hypot(y).hypot(z)+shape_radius);
+                if !fixed_xy.is_finite() || !fixed_xyz.is_finite() {return None;}
+                r=r.max(fixed_xy);rho=rho.max(fixed_xyz);
+            }
+        }
         let (projection,h)=if pure_yaw {(r,0.0)}else{(rho,rho)};
         // MLS cell centres use f32. Cover their rounding before ground_patch's
         // ceil, and round the final world-space bound outward as well.
@@ -134,9 +261,10 @@ impl SurfaceSnapshot {
 
 // Request-local reference data. None of these private modes is selected by the
 // public body-query constructors. Members always remain owned by observations.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(in crate::surface) enum NativeGroundSource {
     ObservedFine { anchor: [i32; 3] },
+    HeightfieldFine { key: GroundKey },
     LegacyFineRun { xy: [i32; 2], first: i32, last: i32 },
     CoarseCell(VoxelKey),
 }
@@ -160,7 +288,7 @@ pub(in crate::surface) struct LocalGroundReference {
     pub changes: Vec<(f64, GroundSample)>,
 }
 impl LocalGroundReference {
-    fn at(&self, t: f64) -> &GroundSample {
+    pub(in crate::surface) fn at(&self, t: f64) -> &GroundSample {
         // The owner supplies this one segment's ordered changes. Right-continuous
         // lookup has an explicit first sample, never an inferred layer/sample 0.
         self.changes.iter().rev().find(|(at,_)| *at<=t)
@@ -203,6 +331,9 @@ pub(in crate::surface) struct QuerySegment<'a> {
 }
 impl<'a> QuerySegment<'a> {
     pub(in crate::surface) const LEGACY: Self = Self { reference:None, samples:[0.0,1.0] };
+    pub(in crate::surface) fn for_reference(reference:&'a BodyQueryReference)->Self {
+        Self {reference:Some(reference),samples:[0.0,1.0]}
+    }
     pub(in crate::surface) fn at(self, s: f64) -> QuerySample<'a> {
         match self.reference {
             None=>QuerySample::LegacyNominal,
@@ -274,7 +405,7 @@ mod tests {
             node_spacing_m:0.3,wall_clearance_m:clearance,wall_buffer_m:0.2,wall_buffer_weight:2.0,
             max_slope_deg:18.0,step_threshold_m:0.21,min_step_tread_depth_m:0.2,step_penalty_weight:2.0,
             goal_tolerance:0.1,viz_publish_hz:0.0};
-        let model=SurfaceBodyEnvelope {footprint_xy_m:vec![[-0.2,-0.12],[0.3,-0.12],[0.3,0.12],[-0.2,0.12]],
+        let model=SurfaceBodyEnvelope {fixed_collision:None,footprint_xy_m:vec![[-0.2,-0.12],[0.3,-0.12],[0.3,0.12],[-0.2,0.12]],
             z_bounds_m:[-0.1,0.15],body_to_support_z_m:0.4,max_step_up_m:0.21,max_step_down_m:0.1,
             max_cross_slope_deg:18.0,support_uncertainty_m:0.0};
         SurfaceSnapshot::from_points(&points,config,0.1).unwrap().with_body_envelope(model).unwrap()
@@ -363,6 +494,7 @@ mod planning_snapshot_identity_tests {
             goal_tolerance: 0.1, viz_publish_hz: 0.0,
         };
         let model = SurfaceBodyEnvelope {
+            fixed_collision: None,
             footprint_xy_m: vec![[-0.2, -0.12], [0.3, -0.12], [0.3, 0.12], [-0.2, 0.12]],
             z_bounds_m: [-0.1, 0.15], body_to_support_z_m: 0.4,
             max_step_up_m: 0.21, max_step_down_m: 0.1,

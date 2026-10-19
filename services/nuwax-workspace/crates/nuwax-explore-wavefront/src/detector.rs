@@ -701,6 +701,7 @@ mod tests {
             }
         }
         let geometry = nuwax_nav_types_messages::RobotGeometry {
+            self_collision: None,
             footprint_xy_m: vec![[-0.4, -0.1], [0.4, -0.1], [0.4, 0.1], [-0.4, 0.1]],
             z_min_m: -0.2,
             z_max_m: 0.2,

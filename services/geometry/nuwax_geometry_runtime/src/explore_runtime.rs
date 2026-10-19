@@ -11166,6 +11166,7 @@ async fn scheme_a_frontier_rejection_before_publish_preserves_source_failed_ack(
         let sink=Arc::new(RecordingNavSink::default());handle.set_navigation_sink(sink.clone());
         let mut config=surface_config("map");
         config.apply_calibration(Some(nuwax_nav_types_messages::RobotGeometry {
+            self_collision: None,
             footprint_xy_m:vec![[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],
             z_min_m:-0.05,z_max_m:0.2,source:"resource-limited mission fixture".into(),
         }),None).unwrap();
@@ -11709,6 +11710,7 @@ async fn scheme_a_frontier_rejection_before_publish_preserves_source_failed_ack(
         // the older point-only surface-frontier fixture.
         let mut config = surface_config("map");
         config.apply_calibration(Some(nuwax_nav_types_messages::RobotGeometry {
+            self_collision: None,
             footprint_xy_m: vec![[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],
             z_min_m: -0.05, z_max_m: 0.2, source: "surface return body fixture".into(),
         }), None).unwrap();

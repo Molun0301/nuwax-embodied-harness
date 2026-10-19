@@ -333,10 +333,15 @@ impl Tomogram {
         }
         let initial = self.reference_start(start).ok_or("层析起点存在已知障碍或不兼容地形")?;
         let goal_column = self.point_column(goal);
-        let initial_height = self.reference_position(initial)[2];
+        let initial_height = self.reference_height_at(initial,[start[0],start[1]])
+            .ok_or("层析起点地表来源与实际查询列不一致")?;
+        let goal_height = self.cell_at(goal)
+            .and_then(|id|self.ground_height_at(id,[goal[0],goal[1]]));
         let [low, high] = self.ground_bounds.unwrap_or([initial_height; 2]);
-        if goal[2] + tolerance + 1e-6 < low.min(initial_height)
-            || goal[2] - tolerance - 1e-6 > high.max(initial_height) {
+        let low = low.min(initial_height).min(goal_height.unwrap_or(initial_height));
+        let high = high.max(initial_height).max(goal_height.unwrap_or(initial_height));
+        if goal[2] + tolerance + 1e-6 < low
+            || goal[2] - tolerance - 1e-6 > high {
             // Every reachable height is either an observed cell reference or
             // inherited from one/start. No unknown node can invent a new height.
             // A crop can conclude only that its own reference domain is limited.
@@ -348,7 +353,7 @@ impl Tomogram {
         }
         // Unknown endpoints inherit the current reference. The requested goal z
         // remains an arrival constraint, never evidence for a second floor.
-        let direct_height = self.cell_at(goal).map(|id| self.cells[id].ground).unwrap_or(initial_height);
+        let direct_height = goal_height.unwrap_or(initial_height);
         let direct = [goal[0], goal[1], direct_height];
         let mut scratch = RECORD.then(SegmentTrace::default);
         #[cfg(test)]
@@ -403,6 +408,7 @@ impl Tomogram {
         let mut edge_states: ahash::AHashSet<usize> = ahash::AHashSet::new();
         let mut expanded = 0;
         let mut radius_clipped = false;
+        let mut state_budget_exhausted = false;
         let mut best: Option<(usize, [f64; 3], f64)> = None;
         'search: loop {
             checkpoint(cancelled)?;
@@ -416,7 +422,7 @@ impl Tomogram {
                 if let Some(next) = deferred.pop() { queue.push(next); }
             }
             let Some(Queue { cost, id, score, .. }) = queue.pop() else {
-                if best.is_some() || edge_states.is_empty() || !domain.grow() { break; }
+                if best.is_some() || state_budget_exhausted || edge_states.is_empty() || !domain.grow() { break; }
                 // Continue the same search, retaining every admitted state/cost.
                 // Only states clipped by the previous artificial edge are revisited.
                 for id in edge_states.drain() {
@@ -446,7 +452,8 @@ impl Tomogram {
             let a = self.reference_position(from);
             let actual_a = if id == 0 { start } else { a };
             let precise = (self.reference_column(from) == goal_column)
-                .then_some([goal[0], goal[1], a[2]]);
+                .then(||self.reference_height_at(from,[goal[0],goal[1]]))
+                .flatten().map(|height|[goal[0],goal[1],height]);
             // Keep the cell-center arrival candidate as well: the exact goal XY
             // can be just outside a boundary while its arrival ball overlaps it.
             let center = if precise.is_some_and(|p| distance(p,a) <= 1e-6) { None } else { Some(a) };
@@ -465,6 +472,8 @@ impl Tomogram {
                 }
             }
             let column = self.reference_column(from);
+            let mut candidates = [None; 8];
+            let mut candidate_count = 0;
             for dx in -1..=1 { for dy in -1..=1 {
                 checkpoint(cancelled)?;
                 if dx == 0 && dy == 0 { continue; }
@@ -500,6 +509,17 @@ impl Tomogram {
                 // 只跳过同一精确参考状态的不改善边，保留过滤回调的原调用顺序。
                 // 新状态仍在完整段验证之后才占用状态预算。
                 if existing.is_some_and(|next_id| !(next_cost < states[next_id].cost)) { continue; }
+                candidates[candidate_count] = Some((next, b, next_cost, existing));
+                candidate_count += 1;
+            }}
+            // 先保持过滤回调的原邻居顺序，再让观测优先也作用于状态接纳。
+            // 最多八个栈上候选；同类保持原次序，未知仍由原延后队列接续。
+            if prefer_observed {
+                candidates[..candidate_count].sort_by_key(|candidate| candidate.is_some_and(
+                    |(next, _, _, _)| matches!(next, crate::reference::Reference::Unknown { .. })));
+            }
+            for (next, b, next_cost, existing) in candidates.into_iter().flatten() {
+                checkpoint(cancelled)?;
                 // 邻接成立不代表整段成立：缺测格继承的高度与斜向段内经过的
                 // 侧格可能不同。所有可能改善路线的边仍复用输出段检查。
                 #[cfg(test)]
@@ -510,8 +530,10 @@ impl Tomogram {
                     None => {
                         if states.len() >= limits.max_states {
                             if best.is_some() { break 'search; }
-                            return Err(PlanningFailure::BudgetExhausted(format!("层析请求状态预算耗尽（展开{expanded}格，状态{}，上限{}）；未证明无路",
-                                states.len(), limits.max_states)));
+                            // 新状态被截断不等于已接纳队列没有路线；继续处理原
+                            // 队列及父链，最终无解时仍报告资源不足而非物理无路。
+                            state_budget_exhausted = true;
+                            continue;
                         }
                         let id = states.len();
                         states.push(SearchState { reference: next, cost: f64::INFINITY, parent: usize::MAX });
@@ -550,10 +572,13 @@ impl Tomogram {
                     target.push(Queue { score: next_cost + heuristic(next), cost: next_cost,
                         id: next_id, order: order(next) });
                 }
-            }}
+            }
         }
         let Some((id, endpoint, _)) = best else {
-            return Err(if !edge_states.is_empty() || radius_clipped {
+            return Err(if state_budget_exhausted {
+                PlanningFailure::BudgetExhausted(format!("层析请求状态预算耗尽（展开{expanded}格，状态{}，上限{}）；未证明无路",
+                    states.len(), limits.max_states))
+            } else if !edge_states.is_empty() || radius_clipped {
                 PlanningFailure::SearchDomainLimited(format!("层析搜索范围已耗尽（展开{expanded}格）；未证明物理无路"))
             } else { PlanningFailure::Other(format!("层析参考在请求范围内没有可连接路线（展开{expanded}格）")) });
         };
@@ -1106,3 +1131,7 @@ mod tests {
 #[cfg(test)]
 #[path = "reference_trace_tests.rs"]
 pub(crate) mod trace_tests;
+
+#[cfg(test)]
+#[path = "search_budget_tests.rs"]
+mod budget_tests;

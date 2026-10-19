@@ -1,6 +1,8 @@
 //! 机器人机体坐标外形，以及规划时随当前位置重新生成的栅格轮廓。
 
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use nuwax_types::FixedCollisionGeometry;
 
 use crate::geometry::Point2;
 use crate::grid::{OccupancyCell, OccupancyGrid2D};
@@ -17,6 +19,22 @@ pub struct RobotGeometry {
     /// 模型或手填参数的来源说明。
     #[serde(default)]
     pub source: String,
+    /// 启动模型已经物化的固定 collision；与各查询共享，不从外包生成实体。
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "fixed_collision_arc")]
+    pub self_collision: Option<Arc<FixedCollisionGeometry>>,
+}
+
+// serde 的全局 rc 特性不必因一个配置字段开启；仅物化时分配一次共享实体。
+mod fixed_collision_arc {
+    use super::*;
+    pub fn serialize<S: serde::Serializer>(value: &Option<Arc<FixedCollisionGeometry>>, serializer: S)
+        -> Result<S::Ok, S::Error> {
+        value.as_deref().serialize(serializer)
+    }
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(deserializer: D)
+        -> Result<Option<Arc<FixedCollisionGeometry>>, D::Error> {
+        Option::<FixedCollisionGeometry>::deserialize(deserializer).map(|value| value.map(Arc::new))
+    }
 }
 
 /// 同一朝向下的离散机体轮廓，可复用于当前占据区和待进入位置。
@@ -42,6 +60,7 @@ impl RobotGeometry {
 
     /// 检查有限性、正高度和凸包方向；不读取设备或模型文件。
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(geometry) = &self.self_collision { geometry.validate()?; }
         let vertices = &self.footprint_xy_m;
         if vertices.len() < 3
             || !self.z_min_m.is_finite()
@@ -321,6 +340,42 @@ fn axes_overlap_cell(axes: &[([f64; 2], f64, f64)], x: f64, y: f64, half: f64) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_fixed_collision_json_retains_shared_geometry_and_metadata() {
+        let geometry = RobotGeometry::from_runtime_json(r#"{
+            "footprint_xy_m":[[-0.3,-0.1],[0.3,-0.1],[0.3,0.1],[-0.3,0.1]],
+            "z_min_m":-0.448,"z_max_m":0.057,"source":"robot_default_urdf_collision",
+            "self_collision":{"model_base_link":"trunk","excluded_moving_collision_count":12,
+                "unsupported_collision_count":2,"primitives":[{"link_name":"trunk","shape":"box",
+                    "translation_m":[0.012,0,-0.004],"rotation_row_major":[0,-1,0,1,0,0,0,0,1],
+                    "size_m":[0.4,0.15,0.1]}]}}
+        "#).unwrap();
+        let fixed = geometry.self_collision.as_ref().unwrap();
+        assert_eq!(fixed.model_base_link,"trunk");
+        assert_eq!(fixed.excluded_moving_collision_count,12);
+        assert_eq!(fixed.unsupported_collision_count,2);
+        assert_eq!(fixed.primitives[0].translation_m,[0.012,0.0,-0.004]);
+        assert!(Arc::ptr_eq(fixed,geometry.clone().self_collision.as_ref().unwrap()));
+        let roundtrip = RobotGeometry::from_runtime_json(&serde_json::to_string(&geometry).unwrap()).unwrap();
+        assert_eq!(roundtrip,geometry);
+    }
+
+    #[test]
+    fn absent_fixed_collision_is_not_generated_and_invalid_rotation_is_rejected() {
+        let geometry = body();
+        assert!(geometry.self_collision.is_none());
+        let mut value = serde_json::to_value(&geometry).unwrap();
+        assert!(value.get("self_collision").is_none());
+        value["self_collision"] = serde_json::json!({"model_base_link":"",
+            "excluded_moving_collision_count":12,"unsupported_collision_count":2,"primitives":[]});
+        let empty = RobotGeometry::from_runtime_json(&value.to_string()).unwrap();
+        assert!(empty.self_collision.as_ref().unwrap().primitives.is_empty());
+        value["self_collision"]["primitives"] = serde_json::json!([{"link_name":"trunk","shape":"sphere",
+            "translation_m":[0,0,0],"rotation_row_major":[1,0.000000001,0,0,1,0,0,0,1],"radius_m":0.1}]);
+        assert!(RobotGeometry::from_runtime_json(&value.to_string()).is_err(),
+            "配置旋转阈值须与固定实体相交核一致");
+    }
 
     fn body() -> RobotGeometry {
         RobotGeometry::from_runtime_json(r#"{"footprint_xy_m":[[-0.3,-0.1],[0.3,-0.1],[0.3,0.1],[-0.3,0.1]],"z_min_m":-0.2,"z_max_m":0.2,"source":"测试外形"}"#).unwrap()

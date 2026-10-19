@@ -420,6 +420,7 @@ fn frozen(distance: f64) -> (Vec<([f64; 3], f64, f64)>, [f64; 3]) {
 fn analytic_map(slope: f64, patch: bool) -> SurfaceSnapshot {
     let d = f64::from(0.05_f32);
     let model = SurfaceBodyEnvelope {
+        fixed_collision: None,
         footprint_xy_m: vec![[-0.3, -0.15], [0.3, -0.15], [0.3, 0.15], [-0.3, 0.15]],
         z_bounds_m: [if patch { -0.4 } else { -0.448 }, 0.057],
         body_to_support_z_m: SUPPORT,
@@ -647,6 +648,7 @@ fn recorded_c_positive_fine_obstacle_unchanged() {
         })
         .collect();
     let model = SurfaceBodyEnvelope {
+        fixed_collision: None,
         footprint_xy_m: vec![
             [-0.23940000000115902, -0.1465000000007516],
             [-0.20582090772967018, -0.16149614709381915],

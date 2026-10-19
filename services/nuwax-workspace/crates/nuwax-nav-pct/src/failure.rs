@@ -31,6 +31,31 @@ impl From<&str> for PlanningFailure {
     }
 }
 
+/// Execution-reference failure; missing native contact geometry is not an obstacle.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReferenceMotionFailure {
+    /// Native members overlap the reference shape without a finite contact witness.
+    NativeContactGeometryUnavailable,
+    /// Preserve all existing validation, obstacle and cancellation diagnostics.
+    Other(String),
+}
+impl std::fmt::Display for ReferenceMotionFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NativeContactGeometryUnavailable => formatter.write_str(
+                "NativeContactGeometryUnavailable: 原生地表成员与参考外形重叠，有限接触几何尚未提供；未证明碰撞或可通行"),
+            Self::Other(message) => formatter.write_str(message),
+        }
+    }
+}
+impl std::error::Error for ReferenceMotionFailure {}
+impl From<String> for ReferenceMotionFailure {
+    fn from(message: String) -> Self { Self::Other(message) }
+}
+impl From<&str> for ReferenceMotionFailure {
+    fn from(message: &str) -> Self { Self::Other(message.into()) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

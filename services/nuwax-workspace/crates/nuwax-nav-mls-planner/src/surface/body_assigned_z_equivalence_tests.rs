@@ -260,7 +260,7 @@ fn indexed_z_fixture(fine: f32, coarse: f32, observed_mode: usize) -> SurfaceSna
         surface_closing_radius:0.0,node_spacing_m:0.3,wall_clearance_m:0.0,
         wall_buffer_m:0.1,wall_buffer_weight:2.0,max_slope_deg:18.0,step_threshold_m:0.0,
         min_step_tread_depth_m:0.2,step_penalty_weight:1.0,goal_tolerance:0.1,viz_publish_hz:0.0};
-    let envelope=SurfaceBodyEnvelope {footprint_xy_m:vec![[-0.3,-0.16],[0.3,-0.16],[0.3,0.16],[-0.3,0.16]],
+    let envelope=SurfaceBodyEnvelope {fixed_collision:None,footprint_xy_m:vec![[-0.3,-0.16],[0.3,-0.16],[0.3,0.16],[-0.3,0.16]],
         z_bounds_m:[-0.15,0.15],body_to_support_z_m:0.4,max_step_up_m:0.0,max_step_down_m:0.0,
         max_cross_slope_deg:18.0,support_uncertainty_m:0.0};
     SurfaceSnapshot::from_points(&points,config,fine).unwrap()
@@ -372,6 +372,7 @@ fn single_column_fixture(fine: f32, coarse: f32, floor_z: i32,
     cfg.voxel_size = coarse; cfg.robot_height = 0.1; cfg.wall_clearance_m = 0.0;
     let half = f64::from(coarse)*0.45;
     let envelope = SurfaceBodyEnvelope {
+        fixed_collision: None,
         footprint_xy_m: vec![[-half,-half],[half,-half],[half,half],[-half,half]],
         z_bounds_m: [-0.425,0.1], body_to_support_z_m: 0.4,
         max_step_up_m: 0.05, max_step_down_m: 0.05,
@@ -931,7 +932,7 @@ fn disjoint_cross_slope_fixture(fine:f32)->(SurfaceSnapshot,Pose) {
     for (key,values) in blocks {observations.replace_block(key,values).unwrap();}
     observations.mark_complete_geometry_source();
     let mut cfg=scene(&[],false).config().clone();cfg.voxel_size=0.1;cfg.wall_clearance_m=0.0;
-    let envelope=SurfaceBodyEnvelope{footprint_xy_m:vec![[-0.18,-0.18],[0.18,-0.18],[0.18,0.18],[-0.18,0.18]],
+    let envelope=SurfaceBodyEnvelope{fixed_collision:None,footprint_xy_m:vec![[-0.18,-0.18],[0.18,-0.18],[0.18,0.18],[-0.18,0.18]],
         z_bounds_m:[-0.15,0.15],body_to_support_z_m:0.4,max_step_up_m:0.15,max_step_down_m:0.15,
         max_cross_slope_deg:1.0,support_uncertainty_m:0.0};
     let map=SurfaceSnapshot::from_points(&points,cfg,fine).unwrap().with_body_envelope(envelope).unwrap()
@@ -959,5 +960,54 @@ fn pose_lazy_contacts_disjoint_columns_still_reject_actual_cross_slope() {
             assert_pose_path_scope(&record,1,admission.assigned,0);
             assert_eq!(record.counters[Counter::AssignedDenseZSpan as usize],0);
         }
+    }
+}
+
+
+#[test]
+fn distant_classified_empty_column_preserves_real_legacy_cross_slope() {
+    use nuwax_map_chunks::{ColumnGroundRecords,Domain,Receiver,Repository,Transfer,Writer};
+    // This is the original fixed cross-slope fixture, without retuning its
+    // geometry/model. Only a far-away admitted classification marker is added.
+    for fine in [0.01,0.05] {
+        let (base,pose)=disjoint_cross_slope_fixture(fine);
+        assert!(!base.observations().unwrap().has_measured_ground_layers());
+        let mut writer=Writer::new(Repository::temporary().unwrap(),fine,4*1024*1024).unwrap();
+        let key=[3200,3200,0];
+        writer.observe([key],20).unwrap();
+        writer.replace_ground_column([key[0],key[1]],&ColumnGroundRecords {
+            classified_empty:true,legacy:vec![],heightfields:vec![]}).unwrap();
+        let root=writer.snapshot(Domain {session:"distant-empty-cross-slope".into(),generation:1,
+            frame_generation:0,producer_generation:1},1,20).unwrap();
+        let mut receiver=Receiver::new(Repository::temporary().unwrap());
+        receiver.receive(&Transfer {root:root.encode().unwrap(),included:BTreeMap::new()},&root.domain,
+            |_,r|writer.repository().read_object(r.object,nuwax_map_chunks::MAX_BLOCK_BYTES)).unwrap();
+        let mut observations=base.observations().unwrap().as_ref().clone();
+        let mut parts=vec![];
+        for reference in &root.blocks {
+            let (block,records)=receiver.ground_parts(reference).unwrap();
+            observations.replace_block(reference.key,block.iter().map(|(&local,e)|
+                (nuwax_map_chunks::global_key(reference.key,local).unwrap(),SurfaceObservation {
+                    observed_ns:e.observed_ns,hits:e.hits})).collect()).unwrap();
+            parts.push((reference.key,records));
+        }
+        observations.replace_heightfield_columns([100,100],&parts);
+        observations.mark_complete_geometry_source();
+        assert!(observations.classified_empty_ground([3200,3200]));
+        assert!(observations.get(key).is_some());
+        assert!(!observations.has_measured_ground_layers(),"marker is not an actual measured layer");
+        let map=base.with_observations(Some(Arc::new(observations)));
+        let before=admit_lazy_contact_pose(&base,pose);
+        let after=admit_lazy_contact_pose(&map,pose);
+        assert_eq!(before.ground_points,after.ground_points);
+        assert!(after.assigned>2 && after.disjoint==after.assigned && after.overlapping==0);
+        let (_,b,_)=fit_plane(&after.ground_points,pose.0).unwrap();
+        assert!(b.abs().atan().to_degrees()>map.body_envelope().unwrap().max_cross_slope_deg+1e-5);
+        assert_eq!(map.body_ground_relation(pose.0,pose.1),Ok(BodyGroundRelation::KnownCompatible));
+        let expected=(Err(SurfaceError::UntraversableSegment),None);
+        assert_eq!(compare_pose(&base,pose),expected);
+        assert_eq!(compare_pose(&map,pose),expected);
+        eprintln!("H3_DISTANT_EMPTY_LEGACY fine={fine:?} fitted_cross_slope_deg={:?} unchanged_points={} marker={key:?}",
+            b.abs().atan().to_degrees(),after.ground_points.len());
     }
 }

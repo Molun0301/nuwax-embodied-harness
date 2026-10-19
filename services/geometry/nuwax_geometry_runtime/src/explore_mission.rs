@@ -602,6 +602,7 @@ pub(crate) mod tests {
             maximum_sample_speed_mps: 2.0,
             planar: SimplePlannerConfig {
                 robot_geometry: Some(RobotGeometry {
+                    self_collision: None,
                     footprint_xy_m: vec![[-0.1, -0.1], [0.1, -0.1], [0.1, 0.1], [-0.1, 0.1]],
                     z_min_m: -0.1,
                     z_max_m: 0.1,

@@ -403,7 +403,7 @@ impl Receiver {
                 let decoded = Arc::new(decoded); let info = intrinsic_bytes(bytes, &decoded);
                 admit_intrinsic(info, points, candidate.source_timestamp_ns)?;
                 admit_format(info, &candidate)?;
-                self.admit_layer_binding(object, &layers, key, candidate.voxel_size_m)?;
+                self.admit_layer_binding(object, &layers, &decoded, key, candidate.voxel_size_m)?;
                 self.repository.put_object(object, bytes)?;
                 self.reader.cache_decoded(object, decoded, info, layers);
                 self.verified.insert(object, info);
@@ -422,7 +422,7 @@ impl Receiver {
                         let (decoded, layers) = decode_block_parts(&bytes)?;
                 let decoded = Arc::new(decoded); let info = intrinsic_bytes(&bytes, &decoded);
                         admit_intrinsic(info, block.points, candidate.source_timestamp_ns)?; admit_format(info, &candidate)?;
-                        self.admit_layer_binding(block.object, &layers, block.key, candidate.voxel_size_m)?;
+                        self.admit_layer_binding(block.object, &layers, &decoded, block.key, candidate.voxel_size_m)?;
                         self.repository.put_object(block.object, &bytes)?;
                         self.reader.cache_decoded(block.object, decoded, info, layers);
                         self.verified.insert(block.object, info); continue;
@@ -431,7 +431,7 @@ impl Receiver {
                 let (decoded, layers) = decode_block_parts(&bytes)?;
                 let decoded = Arc::new(decoded); let info = intrinsic_bytes(&bytes, &decoded);
                 admit_intrinsic(info, block.points, candidate.source_timestamp_ns)?; admit_format(info, &candidate)?;
-                self.admit_layer_binding(block.object, &layers, block.key, candidate.voxel_size_m)?;
+                self.admit_layer_binding(block.object, &layers, &decoded, block.key, candidate.voxel_size_m)?;
                 self.reader.cache_decoded(block.object, decoded, info, layers);
                         self.verified.insert(block.object, info);
             }
@@ -488,7 +488,8 @@ impl Receiver {
         self.collection_error = self.repository.collect_objects(&objects).err();
         result
     }
-    fn admit_layer_binding(&mut self, object: ObjectIdentity, layers: &GroundRecords, key: Key, quantum: f32) -> Result<(), String> {
+    fn admit_layer_binding(&mut self, object: ObjectIdentity, layers: &GroundRecords, block: &Block, key: Key, quantum: f32) -> Result<(), String> {
+        ground_records::validate_legacy_sample_occupancy(layers, block, key, quantum)?;
         admit_layer_spatial_binding(&mut self.layer_bindings, object, layers, key, quantum)
     }
     fn validate_progression(&mut self, old: &Manifest, new: &Manifest) -> Result<(), String> {

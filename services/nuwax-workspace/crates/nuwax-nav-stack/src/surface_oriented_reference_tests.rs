@@ -7,6 +7,7 @@ fn scene(wall: bool) -> (SurfaceSnapshot, nuwax_nav_pct::PctPlanner, MotionLimit
     config
         .apply_calibration(
             Some(nuwax_nav_types_messages::RobotGeometry {
+                self_collision: None,
                 footprint_xy_m: vec![[-0.1, -0.1], [0.1, -0.1], [0.1, 0.1], [-0.1, 0.1]],
                 z_min_m: -0.05,
                 z_max_m: 0.2,

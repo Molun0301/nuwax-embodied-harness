@@ -7,7 +7,7 @@ fn make(points:&[(f32,f32,f32)],footprint:Vec<[f64;2]>,bounds:[f64;2])->SurfaceS
         node_spacing_m:0.3,wall_clearance_m:0.0,wall_buffer_m:0.44,wall_buffer_weight:2.0,
         step_threshold_m:0.15,max_slope_deg:18.0,min_step_tread_depth_m:0.2,step_penalty_weight:2.0,
         goal_tolerance:0.2,viz_publish_hz:0.0};
-    let model=SurfaceBodyEnvelope {footprint_xy_m:footprint,z_bounds_m:bounds,body_to_support_z_m:0.4,
+    let model=SurfaceBodyEnvelope {fixed_collision:None,footprint_xy_m:footprint,z_bounds_m:bounds,body_to_support_z_m:0.4,
         max_step_up_m:f64::from(0.15_f32),max_step_down_m:f64::from(0.15_f32),max_cross_slope_deg:18.0,support_uncertainty_m:0.0};
     let mut blocks=BTreeMap::<[i32;3],BTreeMap<[i32;3],SurfaceObservation>>::new();
     for &(x,y,z) in points {let key=[x,y,z].map(|v|(f64::from(v)/f64::from(0.05_f32)).floor() as i32);

@@ -11,7 +11,7 @@ fn reproduce_current_on() {
  let scene=catalog["scenes"].as_array().unwrap().iter().find(|s|s["id"]=="recorded").unwrap();
  let bytes=std::fs::read(catalog["service_version"]["source_cloud"].as_str().unwrap()).unwrap();
  let points:Vec<_>=bytes.chunks_exact(16).map(|b|(f32::from_le_bytes(b[0..4].try_into().unwrap()),f32::from_le_bytes(b[4..8].try_into().unwrap()),f32::from_le_bytes(b[8..12].try_into().unwrap()))).collect();
- let model=SurfaceBodyEnvelope{footprint_xy_m:serde_json::from_value(scene["robot"]["footprint_xy"].clone()).unwrap(),z_bounds_m:serde_json::from_value(scene["robot"]["z_bounds"].clone()).unwrap(),body_to_support_z_m:0.4,max_step_up_m:f64::from(0.15_f32),max_step_down_m:f64::from(0.15_f32),max_cross_slope_deg:18.0,support_uncertainty_m:0.0};
+ let model=SurfaceBodyEnvelope{fixed_collision:None,footprint_xy_m:serde_json::from_value(scene["robot"]["footprint_xy"].clone()).unwrap(),z_bounds_m:serde_json::from_value(scene["robot"]["z_bounds"].clone()).unwrap(),body_to_support_z_m:0.4,max_step_up_m:f64::from(0.15_f32),max_step_down_m:f64::from(0.15_f32),max_cross_slope_deg:18.0,support_uncertainty_m:0.0};
  let cfg=Config{world_frame:"map".into(),voxel_size:0.1,robot_height:0.1,surface_closing_radius:0.0,node_spacing_m:0.3,wall_clearance_m:0.0,wall_buffer_m:(model.radius()+f64::from(0.1_f32))as f32,wall_buffer_weight:2.0,step_threshold_m:0.15,max_slope_deg:18.0,min_step_tread_depth_m:0.2,step_penalty_weight:2.0,goal_tolerance:0.2,viz_publish_hz:0.0};
  let mut blocks=BTreeMap::<[i32;3],BTreeMap<[i32;3],SurfaceObservation>>::new();
  for &(x,y,z) in &points {let k=[x,y,z].map(|v|(f64::from(v)/f64::from(0.05_f32)).floor()as i32);blocks.entry(k.map(|v|v.div_euclid(32))).or_default().insert(k,SurfaceObservation{observed_ns:0,hits:0});}

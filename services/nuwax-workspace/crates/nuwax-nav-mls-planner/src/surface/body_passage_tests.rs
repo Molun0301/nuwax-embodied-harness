@@ -24,7 +24,7 @@ fn door_transformed(gap:i32,block_edge:i32,offset:[i32;2],quarter_turn:bool)->(S
     let config=Config {world_frame:"map".into(),voxel_size:0.1,robot_height:0.1,surface_closing_radius:0.0,
         node_spacing_m:0.3,wall_clearance_m:0.0,wall_buffer_m:0.4,wall_buffer_weight:2.0,max_slope_deg:18.0,
         step_threshold_m:0.0,min_step_tread_depth_m:0.2,step_penalty_weight:2.0,goal_tolerance:0.1,viz_publish_hz:0.0};
-    let envelope=SurfaceBodyEnvelope {footprint_xy_m:vec![[-0.3,-width/2.0],[0.3,-width/2.0],[0.3,width/2.0],[-0.3,width/2.0]],
+    let envelope=SurfaceBodyEnvelope {fixed_collision:None,footprint_xy_m:vec![[-0.3,-width/2.0],[0.3,-width/2.0],[0.3,width/2.0],[-0.3,width/2.0]],
         z_bounds_m:[-0.15,0.15],body_to_support_z_m:0.4,max_step_up_m:0.0,max_step_down_m:0.0,
         max_cross_slope_deg:18.0,support_uncertainty_m:0.0};
     (SurfaceSnapshot::from_points(&points,config,0.01).unwrap().with_body_envelope(envelope).unwrap(),observations)

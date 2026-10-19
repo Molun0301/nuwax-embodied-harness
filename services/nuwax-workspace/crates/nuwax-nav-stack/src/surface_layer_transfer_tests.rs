@@ -188,7 +188,7 @@ fn hf_test_column(xy:[i32;2], first:[f64;8], middle:bool) -> ColumnGroundRecords
         .filter(|(z,_)|*z!=32 || middle).collect::<Vec<_>>();
     let bytes=serde_json::to_vec(&serde_json::json!({"representation":"heightfield_v1",
         "xy":xy,"voxel_size_m":0.05_f32,"members":members})).unwrap();
-    ColumnGroundRecords {legacy:vec![],heightfields:vec![HeightfieldSurface {
+    ColumnGroundRecords {classified_empty: false, legacy:vec![],heightfields:vec![HeightfieldSurface {
         column:heightfield_observations::decode_heightfield_column(&bytes).unwrap(),samples:vec![]}]}
 }
 
@@ -250,7 +250,7 @@ fn heightfield_reader_preserves_mixed_legacy_cross_block_height_and_reanchor() {
             point:[0.075,0.025,0.02],source_sequence:1,source_timestamp_ns:20,point_index:1}]} )].into()).unwrap();
     let column=heightfield_observations::HeightfieldColumn::from_counts([0,0],0.05,
         [(-1,[1,0,0,0,0,0,0,0]),(32,[1,0,0,0,0,0,0,0])].into()).unwrap().unwrap();
-    let h=column.height();writer.replace_ground_column([0,0],&ColumnGroundRecords {legacy:vec![],
+    let h=column.height();writer.replace_ground_column([0,0],&ColumnGroundRecords {classified_empty: false, legacy:vec![],
         heightfields:vec![HeightfieldSurface {column,samples:vec![]}]}).unwrap();
     let root=writer.snapshot(Domain {session:"mixed-reader".into(),generation:1,frame_generation:1,producer_generation:1},1,20).unwrap();
     let mut reader=FineMapReader::new(String::new()).unwrap();let root=reader.receive(&transfer_message(&repo,&root)).unwrap();
@@ -295,7 +295,7 @@ fn heightfield_reader_accepts_same_block_fragments_without_losing_members() {
     writer.observe((0..4).map(|z| [0, 0, z]), 20).unwrap();
     let column = heightfield_observations::HeightfieldColumn::from_counts([0, 0], 0.05,
         (0..4).map(|z| (z, [1,0,0,0,0,0,0,0])).collect()).unwrap().unwrap();
-    writer.replace_ground_column([0,0], &ColumnGroundRecords { legacy: vec![],
+    writer.replace_ground_column([0,0], &ColumnGroundRecords { classified_empty: false, legacy: vec![],
         heightfields: vec![HeightfieldSurface { column, samples: vec![] }] }).unwrap();
     let root = writer.snapshot(Domain { session: "same-block-fragments".into(), generation: 1,
         frame_generation: 1, producer_generation: 1 }, 1, 20).unwrap();
@@ -332,4 +332,32 @@ fn heightfield_reader_accepts_same_block_fragments_without_losing_members() {
     assert_eq!(actual_members, vec![0,1,2,3], "borrowed iteration remains sorted and unique");
     assert!(!selected.contains_member([0,0,4]));
     assert!(!selected.contains_member([1,0,0]));
+}
+
+#[test]
+fn classified_empty_reader_delta_survives_last_claim_and_cold_restore() {
+    let repo=Repository::temporary().unwrap();let mut writer=Writer::new(repo.clone(),0.05,4*1024*1024).unwrap();
+    writer.observe([[0,0,0],[1,0,0]],20).unwrap();
+    let domain=Domain{session:"empty-column-reader".into(),generation:1,frame_generation:0,producer_generation:1};
+    let root=writer.snapshot(domain.clone(),1,20).unwrap();
+    let mut reader=FineMapReader::new(String::new()).unwrap();
+    let before=reader.receive(&transfer_message(&repo,&root)).unwrap();
+    let old=reader.observations(&before,None).unwrap();
+    let empty=ColumnGroundRecords{classified_empty:true,legacy:vec![],heightfields:vec![]};
+    writer.replace_ground_column([0,0],&empty).unwrap();
+    let root=writer.snapshot(domain.clone(),2,20).unwrap();
+    let after=reader.receive(&transfer_message(&repo,&root)).unwrap();
+    let (next,delta)=reader.observations_with_changes(&after,Some((&before,&old))).unwrap();
+    assert_eq!(delta,Some(vec![[0,0]]));assert!(!next.same_geometry(&old));
+    assert!(next.classified_empty_ground([0,0]));assert_eq!(next.ground_records([0,0]).count(),0);
+    assert!(!next.classified_empty_ground([1,0]));assert!(next.get([0,0,0]).is_some());
+    assert!(!old.classified_empty_ground([0,0]));
+    let mut cold=FineMapReader::new(String::new()).unwrap();let admitted=cold.receive(&transfer_message(&repo,&root)).unwrap();
+    let cold_source=cold.observations(&admitted,None).unwrap();
+    assert!(cold_source.classified_empty_ground([0,0]));assert_eq!(cold_source.ground_records([0,0]).count(),0);
+    writer.remove([[0,0,0]]).unwrap();let root=writer.snapshot(domain,3,20).unwrap();
+    let end=reader.receive(&transfer_message(&repo,&root)).unwrap();
+    let (cleared,delta)=reader.observations_with_changes(&end,Some((&after,&next))).unwrap();
+    assert_eq!(delta,Some(vec![[0,0]]));assert!(!cleared.classified_empty_ground([0,0]));
+    assert!(cleared.get([0,0,0]).is_none());assert!(cleared.get([1,0,0]).is_some());
 }

@@ -6,16 +6,28 @@ mod boundary;
 #[cfg(feature = "mls-adapter")]
 mod surface_adapter;
 #[cfg(feature = "mls-adapter")]
+mod source_ground;
+#[cfg(feature = "mls-adapter")]
 pub use surface_adapter::{PctPlanner, same_source_geometry};
 mod cancellation;
 pub use cancellation::{PlanningCancellation, planning_cancelled, with_planning_cancellation};
 mod failure;
-pub use failure::PlanningFailure;
+pub use failure::{PlanningFailure, ReferenceMotionFailure};
 mod reference;
 mod search;
 mod tomogram;
+mod incremental;
+mod incremental_fields;
+mod seed_order;
+mod cells;
+pub use cells::Cells;
+#[cfg(test)]
+mod incremental_tests;
 pub use search::{Route, SearchLimits, SearchStats};
 pub use tomogram::{Cell, Tomogram};
+pub use incremental::{ColumnUpdate, IncrementalStats};
+#[cfg(feature = "mls-adapter")]
+pub use incremental::SurfaceDelta;
 
 /// 仅当前目标使用的局部接续软代价，不修改原地图或宣称该处永久不可通行。
 #[derive(Clone, Debug)]
@@ -28,6 +40,9 @@ pub(crate) fn distance(a: [f64; 3], b: [f64; 3]) -> f64 {
     ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
 }
 pub use boundary::{inside_boundary, segment_inside_boundary};
+
+#[cfg(all(test, feature = "mls-adapter"))]
+mod heightfield_tests;
 
 #[cfg(all(test, feature = "mls-adapter"))]
 mod tests {

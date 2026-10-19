@@ -49,6 +49,7 @@ impl LocalPlanner {
                 return None;
             }
             RobotGeometry {
+                self_collision: None,
                 footprint_xy_m: (0..8)
                     .map(|i| {
                         let angle = i as f64 * std::f64::consts::FRAC_PI_4;

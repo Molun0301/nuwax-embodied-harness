@@ -68,6 +68,7 @@ pub fn run_replay(
     let g: serde_json::Value =
         serde_json::from_str(env["values"]["NUWAX_ROBOT_GEOMETRY_JSON"].as_str().unwrap()).unwrap();
     let model = SurfaceBodyEnvelope {
+        fixed_collision: None,
         footprint_xy_m: serde_json::from_value(g["footprint_xy_m"].clone()).unwrap(),
         z_bounds_m: [
             g["z_min_m"].as_f64().unwrap(),

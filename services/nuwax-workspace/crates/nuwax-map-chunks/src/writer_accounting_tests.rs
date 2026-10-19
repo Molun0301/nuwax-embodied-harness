@@ -16,7 +16,7 @@ fn assert_accounting(w: &Writer) {
     let bytes: usize = w.dirty.values().flat_map(|d| d.layers.iter())
         .map(|(_, record)| match record {
             GroundRecordRef::LegacyPlane(layer) => terrain_observations::layer_bytes(layer),
-            GroundRecordRef::HeightfieldV1(_) => panic!("original accounting fixture is Legacy"),
+            GroundRecordRef::HeightfieldV1(_) | GroundRecordRef::ClassifiedEmptyColumn => panic!("original accounting fixture is Legacy"),
         }).sum();
     assert_eq!(w.dirty_layer_bytes(), bytes);
     assert_eq!(w.resident_bytes(), w.source_watermark_bytes + bytes + w.dirty_points * 64 + w.reader.cached_bytes()

@@ -87,6 +87,7 @@ mod partial_route_priority_tests {
             SurfaceSnapshot::from_points(&points, cfg, size)
                 .unwrap()
                 .with_body_envelope(SurfaceBodyEnvelope {
+                    fixed_collision: None,
                     footprint_xy_m: vec![[-0.3, -0.16], [0.3, -0.16], [0.3, 0.16], [-0.3, 0.16]],
                     z_bounds_m: [-0.15, 0.15],
                     body_to_support_z_m: 0.4,
@@ -162,7 +163,10 @@ mod partial_route_priority_tests {
     // not bypass PlanKernel::compute's actual normalization/materialization.
     fn snapshot_request(follower: &RouteFollower, detour: bool) -> PlanRequest {
         PlanRequest {
+            start_ground:follower.controller.current_ground_query_owned().map(|(_,ground)|ground),
             source: follower.map.as_ref().unwrap().clone(),
+            change_basis: follower.change_basis.clone(),
+            changes: follower.changes.clone(),
             pose: follower.pose.as_ref().unwrap().clone(),
             boundary: follower.boundary.clone(),
             reference: Vec::new(),
@@ -187,7 +191,10 @@ mod partial_route_priority_tests {
 
     fn duplicate_request(r: &PlanRequest) -> PlanRequest {
         PlanRequest {
+            start_ground:r.start_ground.clone(),
             source: r.source.clone(),
+            change_basis: r.change_basis.clone(),
+            changes: r.changes.clone(),
             pose: r.pose.clone(),
             boundary: r.boundary.clone(),
             reference: r.reference.clone(),

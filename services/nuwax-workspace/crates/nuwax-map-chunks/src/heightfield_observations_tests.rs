@@ -301,3 +301,19 @@ fn heightfield_v1_input_boundaries_do_not_mutate_valid_columns() {
     assert_eq!(encode_heightfield_column(&original).unwrap(), bytes);
     assert_eq!(decode_heightfield_column(&bytes).unwrap(), original);
 }
+
+#[test]
+fn heightfield_zero_mass_history_is_ownership_without_fabricated_votes() {
+    let mut value = column([0.001,0.002,0.009]);
+    let before: Vec<_> = value.members().map(|(z,m)|(z,*m)).collect();
+    let height = value.height();
+    value.add_zero_mass_members([-33,0,32]);
+    assert_eq!(value.height(),height);
+    for (z,mass) in before { assert_eq!(value.members().find(|(key,_)|*key==z).unwrap().1,&mass); }
+    assert_eq!(value.members().find(|(z,_)|*z==-33).unwrap().1,&[0.;8]);
+    assert_eq!(value.members().find(|(z,_)|*z==32).unwrap().1,&[0.;8]);
+    let bytes=encode_heightfield_column(&value).unwrap();
+    assert_eq!(decode_heightfield_column(&bytes).unwrap(),value);
+    assert!(value.retain_members(&[-33,32].into()).is_none());
+    assert_eq!(value.retain_members(&[0].into()).unwrap().height(),height);
+}

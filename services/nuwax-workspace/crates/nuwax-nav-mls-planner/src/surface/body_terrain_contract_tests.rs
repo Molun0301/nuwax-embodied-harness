@@ -27,6 +27,7 @@ fn ground(kind: Terrain) -> BTreeSet<[i32; 3]> {
 
 fn envelope(whole_body: bool) -> SurfaceBodyEnvelope {
     SurfaceBodyEnvelope {
+        fixed_collision: None,
         footprint_xy_m: vec![[-0.3,-0.15],[0.3,-0.15],[0.3,0.15],[-0.3,0.15]],
         z_bounds_m: if whole_body {[-0.448,0.057]} else {[-0.15,0.15]},
         body_to_support_z_m: 0.4, max_step_up_m: 0.15, max_step_down_m: 0.15,
@@ -560,6 +561,9 @@ fn c0_terrain_sample(
                     assert!(observations.get([anchor[0], anchor[1], z]).is_some());
                 }
             }
+            NativeGroundSource::HeightfieldFine { key } => {
+                panic!("legacy fixture unexpectedly selected a heightfield: {key:?}");
+            }
             NativeGroundSource::CoarseCell(cell) => {
                 panic!("complete fine fixtures must not silently substitute coarse provenance: {cell:?}");
             }
@@ -722,6 +726,7 @@ fn c0_terrain_measured_lower_only() -> SurfaceSnapshot {
         wall_buffer_weight: 0.0, max_slope_deg: 25.0, step_penalty_weight: 1.0,
         goal_tolerance: 0.1, viz_publish_hz: 0.0 };
     let model = SurfaceBodyEnvelope {
+        fixed_collision: None,
         footprint_xy_m: vec![[-0.55, -0.14], [0.55, -0.14], [0.55, 0.14], [-0.55, 0.14]],
         z_bounds_m: [-0.15, 0.15], body_to_support_z_m: 0.4,
         max_step_up_m: 0.2, max_step_down_m: 0.1, max_cross_slope_deg: 10.0,

@@ -31,6 +31,7 @@ fn main() {
         let mut builder = SurfaceMapBuilder::configured(
             config(),
             Some(SurfaceBodyEnvelope {
+                fixed_collision: None,
                 footprint_xy_m: vec![[-0.15, -0.1], [0.15, -0.1], [0.15, 0.1], [-0.15, 0.1]],
                 z_bounds_m: [-0.1, 0.2],
                 body_to_support_z_m: 0.35,

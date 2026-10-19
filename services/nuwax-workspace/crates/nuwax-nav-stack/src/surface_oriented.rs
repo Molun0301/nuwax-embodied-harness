@@ -1555,6 +1555,7 @@ mod tests {
         SurfaceSnapshot::from_points(&points, cfg, 0.1)
             .unwrap()
             .with_body_envelope(SurfaceBodyEnvelope {
+                fixed_collision: None,
                 footprint_xy_m: vec![[-0.3, -0.12], [0.3, -0.12], [0.3, 0.12], [-0.3, 0.12]],
                 z_bounds_m: [-0.05, 0.2],
                 body_to_support_z_m: 0.4,
@@ -1692,6 +1693,7 @@ mod tests {
             "map".into(), 0.4, 0.32, 0.3, 0.05, 0.2, 20.0, 0.2,
         ).unwrap();
         config.apply_calibration(Some(nuwax_nav_types_messages::RobotGeometry {
+            self_collision: None,
             footprint_xy_m: vec![[-0.30, -0.16], [0.30, -0.16], [0.30, 0.16], [-0.30, 0.16]],
             z_min_m: -0.05, z_max_m: 0.20, source: "静态有墙直角弯验收".into(),
         }), None).unwrap();
@@ -2037,6 +2039,7 @@ mod tests {
             "map".into(),0.4,0.32,0.3,0.1,0.2,20.0,0.2).unwrap();
         config.geometry.wall_buffer_weight=weight;
         let geometry=nuwax_nav_types_messages::RobotGeometry {
+            self_collision: None,
             footprint_xy_m:vec![[-0.3,-0.16],[0.3,-0.16],[0.3,0.16],[-0.3,0.16]],
             z_min_m:-0.05,z_max_m:0.2,source:"软偏好回归".into(),
         };

@@ -257,6 +257,7 @@ fn reported_g1_pose_keeps_unclassified_ankle_height_voxel_as_obstacle() {
     let body=[0.025503599830406017,-0.01896920386050657,0.026239193644733066];
     let q=[-0.020289298542609635,0.003576779120836624,0.2868225967805427,0.9577621567966841];
     let envelope=SurfaceBodyEnvelope {
+        fixed_collision: None,
         footprint_xy_m:vec![[-0.029020616290581558,-0.21585853486343462],
             [0.4539265102797319,-0.21585853486343462],[0.4539265102797319,0.220775355547328],
             [-0.029020616290581558,0.220775355547328]],
@@ -1143,9 +1144,12 @@ fn ground_context_same_view_explicit_sample_cold_warm_pair() {
             let context = view.segment_for_diagnostic([0.0, 1.0]);
             let mut event_witness = None;
             let mut calls = Vec::new();
-            let event = map.validate_body_contact_events_in_context(a, to, context, |s| {
+            let event = map.validate_body_contact_events_in_context(a, to, context, |s, collision| {
                 let actual = interpolated_body_pose(a, to, s);
-                let result = view.pose_at(actual, s, &mut event_witness);
+                let result = if let Some(rejection)=collision {
+                    event_witness=Some(BodyFailureWitness{pose:actual,rejection});
+                    Err(rejection.error())
+                } else {view.pose_at(actual, s, &mut event_witness)};
                 eprintln!("C11_EVENT_LEAF s={s:?} t={s:?} actual={actual:?} result={result:?} witness={event_witness:?}");
                 calls.push((s, actual, result.clone(), event_witness));
                 result

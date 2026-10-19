@@ -271,6 +271,7 @@ impl SurfaceNavigationConfig {
             body.validate().map_err(NavStackError::InvalidConfig)?;
             let terrain = capabilities.as_ref().and_then(|c| c.terrain.as_ref());
             let envelope = SurfaceBodyEnvelope {
+                fixed_collision: body.self_collision,
                 footprint_xy_m: body.footprint_xy_m,
                 z_bounds_m: [body.z_min_m, body.z_max_m],
                 body_to_support_z_m: self.follower.body_to_support_z_m,
@@ -358,6 +359,50 @@ fn parse_number(key: &str, value: &str) -> NavStackResult<f64> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn runtime_fixed_collision_json_reaches_surface_envelope_without_copying() {
+        let body = RobotGeometry::from_runtime_json(r#"{
+            "footprint_xy_m":[[-0.3,-0.16],[0.3,-0.16],[0.3,0.16],[-0.3,0.16]],
+            "z_min_m":-0.448,"z_max_m":0.057,"source":"robot_default_urdf_collision",
+            "self_collision":{"model_base_link":"trunk","excluded_moving_collision_count":12,
+                "unsupported_collision_count":2,"primitives":[
+                {"link_name":"trunk","shape":"box","translation_m":[0.012,0,-0.004],
+                    "rotation_row_major":[0,-1,0,1,0,0,0,0,1],"size_m":[0.4,0.15,0.1]},
+                {"link_name":"sensor","shape":"sphere","translation_m":[0.2,0,0.05],
+                    "rotation_row_major":[1,0,0,0,1,0,0,0,1],"radius_m":0.03},
+                {"link_name":"fixed_mount","shape":"cylinder","translation_m":[-0.1,0,0.02],
+                    "rotation_row_major":[1,0,0,0,1,0,0,0,1],"radius_m":0.02,"length_m":0.08}]}}
+        "#).unwrap();
+        let shared = body.self_collision.as_ref().unwrap().clone();
+        let mut config = SurfaceNavigationConfig::new("map".into(),0.4,0.3,0.6,0.1,0.15,18.0,0.2).unwrap();
+        config.apply_calibration(Some(body),None).unwrap();
+        let envelope = config.body_envelope.as_ref().unwrap();
+        let fixed = envelope.fixed_collision.as_ref().unwrap();
+        assert!(std::sync::Arc::ptr_eq(&shared,fixed));
+        assert!(std::sync::Arc::ptr_eq(fixed,config.clone().body_envelope.as_ref().unwrap().fixed_collision.as_ref().unwrap()));
+        assert_eq!(fixed.model_base_link,"trunk");
+        assert_eq!(fixed.excluded_moving_collision_count,12);
+        assert_eq!(fixed.unsupported_collision_count,2);
+        assert_eq!(fixed.primitives.len(),3);
+        assert_eq!(fixed.primitives[0].rotation_row_major,[0.0,-1.0,0.0,1.0,0.0,0.0,0.0,0.0,1.0]);
+        assert_eq!(envelope.z_bounds_m,[-0.448,0.057],"导航外包仍保留完整标定");
+        envelope.validate().unwrap();
+        let mut invalid = envelope.clone();
+        std::sync::Arc::make_mut(invalid.fixed_collision.as_mut().unwrap())
+            .primitives[0].translation_m[0]=f64::INFINITY;
+        assert!(invalid.validate().is_err(),"直接设置envelope也须校验几何有限性");
+        assert!(shared.primitives[0].translation_m[0].is_finite());
+    }
+
+    #[test]
+    fn missing_fixed_collision_json_keeps_surface_compatibility_absent() {
+        let body = RobotGeometry::from_runtime_json(r#"{"footprint_xy_m":[[-0.3,-0.16],[0.3,-0.16],[0.3,0.16],[-0.3,0.16]],
+            "z_min_m":-0.448,"z_max_m":0.057,"source":"manual"}"#).unwrap();
+        let mut config = SurfaceNavigationConfig::new("map".into(),0.4,0.3,0.6,0.1,0.15,18.0,0.2).unwrap();
+        config.apply_calibration(Some(body),None).unwrap();
+        assert!(config.body_envelope.unwrap().fixed_collision.is_none());
+    }
+
     fn isolated_loader_process() -> std::process::Command {
         let mut command = std::process::Command::new(std::env::current_exe().unwrap());
         command.env_clear();
@@ -435,6 +480,7 @@ mod tests {
                 "max_observation_age_sec":2.0,"stairs_supported":true}}
         "#).unwrap();
         let robot = RobotGeometry {
+            self_collision: None,
             footprint_xy_m: vec![[-0.3,-0.16],[0.3,-0.16],[0.3,0.16],[-0.3,0.16]],
             z_min_m: -0.05, z_max_m: 0.2, source: "台阶设置回归".into(),
         };

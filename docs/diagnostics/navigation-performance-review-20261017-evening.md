@@ -850,3 +850,11 @@ FineMapReader 使用原 ground_parts 单次解码，按变化 block XY 获取该
 5. 真实来源、地图变更、控制/规划并发和执行反馈的持续边界检查
 
 本清单会随红绿验证更新。发现疑点不等于确认缺陷，未复现的推测不直接作为修改依据。专项继续进行，不因单个阶段通过而宣布导航整体完成。
+
+## Stage 65 — Unified native heightfield consumers (2026-10-19)
+
+Unified capture, BL4/AR5 storage, Reader, PCT, MLS/Scan/control and server capability 5. Ground state is carried through real planning requests; fixed primitive extents participate in refresh relevance; Explore retains typed contact-unavailable outcomes. Classified-empty columns persist locally so withdrawn ground claims cannot be recreated from raw occupancy. Unknown space itself is not a rejection gate. Existing occupancy, original collision rules and legacy unmarked archive compatibility remain.
+
+Final directed qualification: 74 distinct tests passed (55 final consumer regressions, 12 unchanged storage controls, 3 Python archive round trips, 4 actual capture/Reader/physical/export controls). Original failures remain in the retained qualification logs. No final full workspace pass or Go2 performance claim is made.
+
+Independent earlier e50add64 simulator qualification remains failed: 40 functional cases yielded 18 passes, 16 failures, 6 unverified; 24 performance samples yielded 8 arrivals and 16 timeouts. That simulator used the legacy raw-occupancy entry, not real native capture/Reader. Follow-up work must connect the actual input chain, diagnose unchanged-success replanning, and resolve world/owner height discrepancies. These directed tests do not replace that acceptance matrix. Public Ground-goal and arrival/consumption migration remains open.

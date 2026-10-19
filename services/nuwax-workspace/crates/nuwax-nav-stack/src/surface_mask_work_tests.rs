@@ -78,6 +78,7 @@ async fn held_global_owner_keeps_unchanged_mask_work_but_changed_mask_retires_it
     });
     let mut configured = config();
     configured.apply_calibration(Some(nuwax_nav_types_messages::RobotGeometry {
+        self_collision: None,
         footprint_xy_m: vec![[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],
         z_min_m: -0.05, z_max_m: 0.2, source: "mask reuse owner fixture".into(),
     }), None).unwrap();

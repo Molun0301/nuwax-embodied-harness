@@ -838,6 +838,7 @@ mod tests {
         fn new(local_planning_enabled: bool) -> Self {
             let clear = Arc::new(crate::surface_follower::test_snapshot(0.0, false)
                 .with_body_envelope(SurfaceBodyEnvelope {
+                    fixed_collision: None,
                     footprint_xy_m: vec![[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],
                     z_bounds_m: [-0.05, 0.2], body_to_support_z_m: 0.4,
                     max_step_up_m: 0.2, max_step_down_m: 0.2,
@@ -2041,6 +2042,7 @@ mod tests {
             angular_acceleration_rps2:2.0,guaranteed_angular_braking_rps2:2.0,reaction_time_sec:0.05,
             minimum_turning_radius_m:0.0,can_rotate_in_place:true};
         let source=crate::surface_follower::test_snapshot(0.0,false).with_body_envelope(SurfaceBodyEnvelope{
+            fixed_collision: None,
             footprint_xy_m:vec![[-0.15,-0.15],[0.15,-0.15],[0.15,0.15],[-0.15,0.15]],
             z_bounds_m:[-0.05,0.2],body_to_support_z_m:0.4,max_step_up_m:0.2,max_step_down_m:0.2,
             max_cross_slope_deg:18.0,support_uncertainty_m:0.0}).unwrap();

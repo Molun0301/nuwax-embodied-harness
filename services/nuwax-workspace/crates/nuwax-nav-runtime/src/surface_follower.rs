@@ -153,6 +153,8 @@ pub struct SurfaceFollower {
     simulation_braking_deadline_ns: Option<i64>,
     control_target: Option<nuwax_nav_control::PlanarPose>,
     body_view_dirty: bool,
+    body_query: Option<nuwax_nav_mls_planner::surface::SurfaceBodyQueryView>,
+    actual_ground: Option<(nuwax_nav_types_messages::Pose3, Result<nuwax_nav_mls_planner::surface::BodyGroundState, String>)>,
 }
 
 impl SurfaceFollower {
@@ -186,6 +188,8 @@ impl SurfaceFollower {
             simulation_braking_deadline_ns:None,
             control_target:None,
             body_view_dirty: true,
+            body_query: None,
+            actual_ground: None,
         })
     }
 
@@ -203,10 +207,23 @@ impl SurfaceFollower {
 
     fn refresh_current_body_view(&mut self) {
         #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::CurrentViewRefresh);
-        if !self.body_view_dirty { return; }
+        if !self.body_view_dirty && self.actual_ground.as_ref().map(|(pose,_)|pose)
+            ==self.odometry.as_ref().map(|pose|&pose.pose) { return; }
         self.body_view_dirty = false;
         self.map = self.source_map.clone();
-
+        let Some(map)=self.map.as_ref().filter(|map|map.body_envelope().is_some()) else {
+            self.body_query=None;self.actual_ground=None;return;
+        };
+        // 新近期障碍要求重建碰撞视图，但不抹去同一地面来源的实际关联。
+        let same_ground_source=self.body_query.as_ref().is_some_and(|query|query.same_ground_source(map));
+        if self.body_query.as_ref().is_none_or(|query|!query.same_body_query_view(map)) {
+            self.body_query=Some(map.body_query());
+        }
+        // 只沿实际里程计携带地面；预测末点始终留在各自局部轨迹。
+        self.actual_ground=self.odometry.as_ref().map(|pose| {
+            (pose.pose.clone(),self.ground_state_at_actual_pose(
+                self.body_query.as_ref().unwrap(),pose,same_ground_source))
+        });
     }
 
     /// 当前站姿自身被拒绝时，全局改道不能恢复运动；保留目标等待实际输入恢复。
@@ -216,9 +233,11 @@ impl SurfaceFollower {
         let map = self.map.as_ref()?;
         map.body_envelope()?;
         let pose = self.odometry.as_ref()?;
+        let (query,ground)=match self.current_ground_query() {Ok(query)=>query,Err(error)=>return Some(error)};
         let q = pose.pose.orientation;
         let mut witness=None;
-        map.validate_body_pose_with_witness(xyz(pose.pose.position), [q.x, q.y, q.z, q.w], &mut witness)
+        let actual=(xyz(pose.pose.position),[q.x,q.y,q.z,q.w]);
+        query.validate_motion_from_ground(actual,actual,ground,&[],&mut witness)
             .err().map(|error| match witness {
                 Some(sample)=>format!("{error}; {sample}"),
                 None=>error.to_string(),
@@ -283,7 +302,8 @@ impl SurfaceFollower {
             let q = odometry.pose.orientation;
             let from = (xyz(odometry.pose.position), [q.x, q.y, q.z, q.w]);
             // 完整机体已沿实际地形验证；粗格中心连边不能否决精细层上的合法接续。
-            let connected=body_control::connection_endpoint(map, from, &projected).is_some();
+            let (query,ground)=self.current_ground_query().map_err(rejected)?;
+            let connected=body_control::connection_endpoint_in_query(map,query,from,ground,&projected).is_some();
             #[cfg(test)] rejoin_probe::admission_connector(connected);
             if !connected {
                 return Err(rejected("新路径不能从实际机体站姿连续接续"));
@@ -574,12 +594,13 @@ impl SurfaceFollower {
             let q=pose.pose.orientation;
             let actual=(xyz(pose.pose.position),[q.x,q.y,q.z,q.w]);
             let mut aligned_target=pose.clone();aligned_target.pose.orientation=Quaternion::from_yaw(desired);
-            let Some(aligned)=body_control::connection_endpoint(map,actual,&aligned_target) else {return false;};
+            let Ok((query,ground))=self.current_ground_query_owned() else {return false;};
+            let Some((aligned,aligned_ground))=body_control::connection_endpoint_in_query(map,&query,actual,&ground,&aligned_target) else {return false;};
             let mut next=aligned_target;
             next.pose.position.x=actual.0[0]+(target.x-actual.0[0])*travel/distance;
             next.pose.position.y=actual.0[1]+(target.y-actual.0[1])*travel/distance;
             // 必要小转向与后续平移都使用同一实际地形接续，不能借旧路径站姿取得许可。
-            body_control::translation_connects(map,aligned,&next)
+            body_control::translation_connects_in_query(map,&query,aligned,&aligned_ground,&next)
         })
     }
 
@@ -750,6 +771,8 @@ impl NavPlanner for SurfaceFollower {
         self.map = None;
         self.source_map = None;
         self.planar_reference=None;
+        self.body_query=None;
+        self.actual_ground=None;
         self.invalid_input = Some("三维后端拒绝二维占据图".into());
     }
 
@@ -782,6 +805,8 @@ impl NavPlanner for SurfaceFollower {
         self.map = None;
         self.source_map = None;
         self.planar_reference=None;
+        self.body_query=None;
+        self.actual_ground=None;
     }
 
     fn observe_applied_command(&mut self, command:Twist2) {
@@ -1006,6 +1031,7 @@ mod tests {
         use nuwax_nav_mls_planner::SurfaceBodyEnvelope;
         use nuwax_nav_types_messages::{MotionLimits, MotionModel};
         let map=Arc::new(test_snapshot(0.0,false).with_body_envelope(SurfaceBodyEnvelope {
+            fixed_collision: None,
             footprint_xy_m:vec![[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],
             z_bounds_m:[-0.05,0.2],body_to_support_z_m:0.3,max_step_up_m:0.0,
             max_step_down_m:0.0,max_cross_slope_deg:10.0,support_uncertainty_m:0.0,
@@ -1348,6 +1374,7 @@ mod tests {
         let source=Arc::new(SurfaceSnapshot::from_points(
             &points,test_snapshot(0.0,false).config().clone(),0.1,
         ).unwrap().with_body_envelope(SurfaceBodyEnvelope {
+            fixed_collision: None,
             footprint_xy_m:vec![[-0.15,-0.15],[0.15,-0.15],[0.15,0.15],[-0.15,0.15]],
             z_bounds_m:[-0.05,0.2],body_to_support_z_m:0.3,
             max_step_up_m:0.15,max_step_down_m:0.15,max_cross_slope_deg:15.0,
@@ -1385,6 +1412,7 @@ mod tests {
     fn slow_translation_keeps_independent_in_place_turn_limit() {
         use nuwax_nav_mls_planner::SurfaceBodyEnvelope;
         let map=Arc::new(test_snapshot(0.0,false).with_body_envelope(SurfaceBodyEnvelope {
+            fixed_collision: None,
             footprint_xy_m:vec![[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],
             z_bounds_m:[-0.05,0.2],body_to_support_z_m:0.3,max_step_up_m:0.0,
             max_step_down_m:0.0,max_cross_slope_deg:10.0,support_uncertainty_m:0.0,
@@ -1410,6 +1438,7 @@ mod tests {
     fn localization_jitter_does_not_create_a_second_stop_gate() {
         use nuwax_nav_mls_planner::SurfaceBodyEnvelope;
         let map = Arc::new(test_snapshot(0.0, false).with_body_envelope(SurfaceBodyEnvelope {
+            fixed_collision: None,
             footprint_xy_m: vec![[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],
             z_bounds_m: [-0.05,0.2], body_to_support_z_m:0.3,
             max_step_up_m:0.0, max_step_down_m:0.0, max_cross_slope_deg:10.0,
@@ -1456,6 +1485,7 @@ mod tests {
         for (key,values) in blocks { observations.replace_block(key,values).unwrap(); }
         let map=Arc::new(SurfaceSnapshot::from_points(&points,cfg,0.05).unwrap()
             .with_body_envelope(SurfaceBodyEnvelope {
+                fixed_collision: None,
                 footprint_xy_m:vec![[-0.55,-0.14],[0.55,-0.14],[0.55,0.14],[-0.55,0.14]],
                 z_bounds_m:[-0.1,0.25],body_to_support_z_m:0.4,max_step_up_m:0.2,
                 max_step_down_m:0.1,max_cross_slope_deg:10.0,support_uncertainty_m:0.0,
@@ -1486,6 +1516,7 @@ mod tests {
             [0.025,0.075,0.125].into_iter().map(move |z|((x as f32+0.5)*0.1,(y as f32+0.5)*0.1,z)))).collect();
         points.push((1.65,0.55,0.45));
         let map=Arc::new(SurfaceSnapshot::from_points(&points,geometry,0.05).unwrap().with_body_envelope(SurfaceBodyEnvelope {
+            fixed_collision: None,
             footprint_xy_m:vec![[-0.3,-0.12],[0.3,-0.12],[0.3,0.12],[-0.3,0.12]],
             z_bounds_m:[-0.05,0.2],body_to_support_z_m:0.4,
             max_step_up_m:0.2,max_step_down_m:0.2,max_cross_slope_deg:15.0,support_uncertainty_m:0.0,
@@ -1524,6 +1555,7 @@ mod tests {
         use nuwax_nav_mls_planner::SurfaceBodyEnvelope;
         use nuwax_nav_types_messages::{MotionLimits,MotionModel,GoalOptions};
         let map=Arc::new(test_snapshot(0.0,false).with_body_envelope(SurfaceBodyEnvelope {
+            fixed_collision: None,
             footprint_xy_m:vec![[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],
             z_bounds_m:[-0.05,0.2],body_to_support_z_m:0.3,
             max_step_up_m:0.0,max_step_down_m:0.0,max_cross_slope_deg:10.0,support_uncertainty_m:0.0,
@@ -1596,6 +1628,7 @@ mod tests {
         use nuwax_nav_mls_planner::SurfaceBodyEnvelope;
         use nuwax_nav_types_messages::GoalOptions;
         let map=Arc::new(test_snapshot(0.0,false).with_body_envelope(SurfaceBodyEnvelope {
+            fixed_collision: None,
             footprint_xy_m:vec![[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],
             z_bounds_m:[-0.05,0.2],body_to_support_z_m:0.3,
             max_step_up_m:0.0,max_step_down_m:0.0,max_cross_slope_deg:10.0,support_uncertainty_m:0.0,
@@ -1624,6 +1657,7 @@ mod tests {
         use nuwax_nav_types_messages::{MotionLimits, MotionModel};
         use std::collections::BTreeMap;
         let base = test_snapshot(0.0, false).with_body_envelope(SurfaceBodyEnvelope {
+            fixed_collision: None,
             footprint_xy_m: vec![[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],
             z_bounds_m: [-0.05, 0.2], body_to_support_z_m: 0.3,
             max_step_up_m: 0.0, max_step_down_m: 0.0,
@@ -1939,6 +1973,7 @@ mod tests {
         let offset = 0.4;
         let normal_scale = (1.0 + slope * slope).sqrt();
         let envelope = SurfaceBodyEnvelope {
+            fixed_collision: None,
             footprint_xy_m: vec![[-0.30, -0.16], [0.30, -0.16], [0.30, 0.16], [-0.30, 0.16]],
             z_bounds_m: [-0.05, 0.20], body_to_support_z_m: offset,
             max_step_up_m: 0.2, max_step_down_m: 0.2,

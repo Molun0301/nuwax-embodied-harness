@@ -13,6 +13,7 @@ fn fixture() -> (
         .flat_map(|x| (0..20).map(move |y| ((x as f32 + 0.5) * 0.1, (y as f32 + 0.5) * 0.1, 0.05)))
         .collect();
     let model = nuwax_nav_mls_planner::SurfaceBodyEnvelope {
+        fixed_collision: None,
         footprint_xy_m: vec![[-0.15, -0.15], [0.15, -0.15], [0.15, 0.15], [-0.15, 0.15]],
         z_bounds_m: [-0.2, 0.2],
         body_to_support_z_m: 0.4,

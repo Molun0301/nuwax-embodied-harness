@@ -11,6 +11,7 @@ fn reset_builds() {EVENT_GEOMETRY_BUILDS.with(|count|count.set(0));}
 fn builds()->usize {EVENT_GEOMETRY_BUILDS.with(Cell::get)}
 fn envelope(polygon:bool)->SurfaceBodyEnvelope {
     SurfaceBodyEnvelope {
+        fixed_collision: None,
         footprint_xy_m:if polygon {vec![[-0.3,-0.12],[0.18,-0.18],[0.32,0.0],[0.18,0.18],[-0.3,0.12]]}
             else {vec![[-0.3,-0.16],[0.3,-0.16],[0.3,0.16],[-0.3,0.16]]},
         z_bounds_m:[-0.10,0.10],body_to_support_z_m:0.4,

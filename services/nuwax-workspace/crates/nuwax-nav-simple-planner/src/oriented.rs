@@ -469,6 +469,7 @@ mod tests {
     use nuwax_nav_types_messages::{OccupancyCell, Timestamp};
     fn geometry(length: f64) -> RobotGeometry {
         RobotGeometry {
+            self_collision: None,
             footprint_xy_m: vec![
                 [-length / 2.0, -0.15],
                 [length / 2.0, -0.15],

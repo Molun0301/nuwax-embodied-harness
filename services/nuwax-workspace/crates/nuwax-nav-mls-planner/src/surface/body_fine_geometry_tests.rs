@@ -114,7 +114,7 @@ fn solid_volume_keeps_its_exposed_top_at_both_resolutions() {
             [0.025,0.075].map(|z|((x as f32+0.5)*0.05,(y as f32+0.5)*0.05,z)))).collect();
         points.push((0.025,-0.025,0.175));
         let mut cfg=scene(&[],false).config().clone();cfg.wall_clearance_m=0.0;cfg.voxel_size=0.05;
-        let envelope=SurfaceBodyEnvelope {footprint_xy_m:vec![[-0.2,-0.1],[0.2,-0.1],[0.2,0.1],[-0.2,0.1]],
+        let envelope=SurfaceBodyEnvelope {fixed_collision:None,footprint_xy_m:vec![[-0.2,-0.1],[0.2,-0.1],[0.2,0.1],[-0.2,0.1]],
             z_bounds_m:[-0.4,0.1],body_to_support_z_m:0.4,max_step_up_m:0.15,max_step_down_m:0.15,
             max_cross_slope_deg:18.0,support_uncertainty_m:0.0};
         let map=SurfaceSnapshot::from_points(&points,cfg,0.05).unwrap().with_body_envelope(envelope).unwrap();

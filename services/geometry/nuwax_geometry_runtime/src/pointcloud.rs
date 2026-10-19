@@ -612,6 +612,18 @@ impl CloudMapShmWriter {
         sensor_origin_map: Option<[f64; 3]>, source_timestamp_ns: u64,
         source: Option<&crate::admitted_cloud::AcceptedMappingCloud>,
     ) -> bool {
+        self.accumulate_mapping_scan_inner(session_generation, points, sensor_origin_map,
+            source_timestamp_ns, source.map(fine_cloud::FrameSource::Canonical))
+    }
+    pub(crate) fn accumulate_mapping_replayed_scan(&mut self, session_generation: u64,
+        points: &[Point3<f64>], sensor_origin_map: Option<[f64;3]>,
+        source: &crate::admitted_cloud::AdmittedCloudSource) -> bool {
+        self.accumulate_mapping_scan_inner(session_generation, points, sensor_origin_map,
+            source.timestamp_ns(), Some(fine_cloud::FrameSource::Corrected(source)))
+    }
+    fn accumulate_mapping_scan_inner(&mut self, session_generation: u64,
+        points: &[Point3<f64>], sensor_origin_map: Option<[f64;3]>, source_timestamp_ns: u64,
+        source: Option<fine_cloud::FrameSource<'_>>) -> bool {
         if points.is_empty()
             || points.len() > POINTCLOUD_MAX_FRAME_POINTS
             || session_generation == 0
@@ -645,9 +657,10 @@ impl CloudMapShmWriter {
         }
         #[cfg(test)]
         let phase_started = std::time::Instant::now();
-        if let Err(error) = self.fine_cloud.as_mut().unwrap().accumulate(points, sensor_origin_map, source_timestamp_ns, source) {
-            warn!(%error, "精细导航源拒绝不完整输入");
-            return false;
+        match self.fine_cloud.as_mut().unwrap().accumulate_frame(points, sensor_origin_map, source_timestamp_ns, source) {
+            Ok(true) => {},
+            Ok(false) => { self.dynamic_filter.clear_frame(); return true; },
+            Err(error) => { warn!(%error, "精细导航源拒绝不完整输入"); return false; },
         }
         #[cfg(test)]
         { self.last_stage_ms[0] = phase_started.elapsed().as_secs_f64() * 1000.0; }
@@ -1063,11 +1076,7 @@ impl CloudMapShmWriter {
 
     /// The private PGO rebuild carries the original admitted scan plus its
     /// corrected rigid pose. Reprojection replaces its geometry, not its identity.
-    pub(crate) fn capture_replayed_ground(&mut self, points: &[Point3<f64>],
-        source: &crate::admitted_cloud::AdmittedCloudSource) -> Result<(), String> {
-        self.fine_cloud.as_mut().ok_or("replayed fine-map owner is unavailable")?
-            .capture_replayed_ground(points, source)
-    }
+
 
     pub(crate) fn committed_fine_cloud(&self) -> Option<Arc<nuwax_map_chunks::SealedMap>> {
         self.committed_fine_cloud.clone()
@@ -1480,6 +1489,105 @@ pub(crate) fn voxel_key(point: [f64; 3], voxel_size: f32) -> Option<VoxelKey> {
 
 #[cfg(test)]
 mod tests {
+#[test]
+fn cloud_map_duplicate_admitted_frame_preserves_dense_coarse_and_fine_state() {
+    use crate::admitted_cloud::AcceptedMappingCloud;
+    use crate::lcm_runtime::mapping_observation::RegisteredObservation;
+    use nuwax_map_chunks::{LayerSource, RegionReader};
+
+    let mut writer = CloudMapShmWriter::new_private_for_test().unwrap();
+    writer.max_points = 4;
+    let points = (0..30).map(|x| Point3::new(f64::from(x) * 0.051, 0.025, 0.175)).collect::<Vec<_>>();
+    let indices = (0..points.len()).map(|i| i as u32 * 3 + 4).collect();
+    let admitted = AcceptedMappingCloud::auxiliary(RegisteredObservation::for_test_source(
+        100, 7, LayerSource::Auxiliary {
+            sensor_id: "owner-duplicate".into(), clock_id: "device-clock".into(),
+            runtime_generation: 1, session_generation: 1,
+        }, points, indices, nalgebra::Isometry3::identity()));
+    // The real retained suffix of the real admitted allocation reaches all
+    // three outputs. No re-centred or reconstructed vector is substituted.
+    let suffix = &admitted.map_points()[8..];
+    assert!(writer.accumulate_mapping_scan_with_source(1, suffix, None, 100, Some(&admitted)));
+    let receipt = OccupancyCommitReceipt {
+        commit_id: crate::mapping_commit::MappingCommitId { boot_nonce: 117, sequence: 1 },
+        session_id: "owner-duplicate".into(), session_generation: 1, occupancy_revision: 1,
+        source_timestamp_ns: 100, backend_kind: crate::mapping_backend::MappingBackendKind::Voxel,
+        backend_generation: 1,
+    };
+    let first = writer.commit_accumulated_snapshot(&receipt).unwrap().unwrap();
+    let coarse = writer.committed_snapshot().unwrap();
+    assert!(coarse.voxel_size > VOXEL_SIZE, "the display must actually have coarsened");
+    assert!(coarse.point_count <= 4);
+    let dense = writer.committed_dense_cloud().unwrap().unwrap();
+    assert_eq!(dense.point_count, suffix.len() as u64);
+    let dense_bytes = dense.read(0, crate::dense_cloud::CHUNK_POINTS).unwrap();
+    assert_eq!(dense_bytes.len(), suffix.len() * 12);
+    let fine = writer.committed_fine_cloud().unwrap();
+    assert_eq!(fine.manifest().points(), suffix.len() as u64);
+    assert_eq!(fine.manifest().source_watermarks.len(), 1);
+    let mut reader = RegionReader::new(fine.repository.clone(), 4 * 1024 * 1024);
+    let fine_parts = fine.manifest().blocks.iter().map(|reference| {
+        let (occupancy, records) = reader.ground_parts(reference).unwrap();
+        (reference.key, occupancy, records)
+    }).collect::<Vec<_>>();
+    assert!(fine_parts.iter().any(|(_, _, records)| records.has_heightfield()));
+    let voxels = writer.voxels.clone();
+    let ordered = writer.ordered_voxels.keys().to_vec();
+    assert!(writer.ordered_voxels.dirty_pages().next().is_none());
+    let metadata = writer.committed_metadata().unwrap();
+    let sequence = writer.publication_sequence;
+    let pages = writer.published_pages.clone();
+
+    assert!(writer.accumulate_mapping_scan_with_source(1, suffix, None, 100, Some(&admitted)),
+        "the duplicate is a successful complete owner no-op");
+    assert_eq!(writer.voxels, voxels);
+    assert_eq!(writer.ordered_voxels.keys(), ordered.as_slice());
+    assert!(writer.ordered_voxels.dirty_pages().next().is_none());
+    assert_eq!(writer.voxel_size, coarse.voxel_size);
+    assert_eq!(writer.committed_metadata().unwrap(), metadata);
+    assert_eq!(writer.publication_sequence, sequence);
+    assert_eq!(writer.published_pages.len(), pages.len());
+    assert!(writer.published_pages.iter().zip(&pages).all(|(after, before)| Arc::ptr_eq(after, before)));
+    assert!(Arc::ptr_eq(&writer.committed_fine_cloud().unwrap(), &fine));
+    assert!(writer.dynamic_filter.removed_keys().is_empty());
+    assert!(writer.fine_cloud.as_ref().unwrap().removed_keys().is_empty());
+    // Snapshot the LIVE dense accumulator: merely rereading its old committed
+    // snapshot could hide an unintended duplicate append awaiting publication.
+    let live_dense = writer.dense_cloud.as_ref().unwrap().snapshot(&first.receipt, &receipt.session_id).unwrap();
+    assert_eq!(live_dense.epoch, dense.epoch);
+    assert_eq!(live_dense.point_count, dense.point_count);
+    assert_eq!(live_dense.bounds_min, dense.bounds_min);
+    assert_eq!(live_dense.bounds_max, dense.bounds_max);
+    assert_eq!(live_dense.read(0, crate::dense_cloud::CHUNK_POINTS).unwrap(), dense_bytes);
+    assert!(writer.dense_error.is_none());
+    assert!(!writer.dense_history_missing);
+
+    // An explicit subsequent publication exposes any hidden pending fine work.
+    // Its publication clock advances by request, but no map contribution does.
+    let next_receipt = OccupancyCommitReceipt {
+        commit_id: crate::mapping_commit::MappingCommitId { boot_nonce: 117, sequence: 2 },
+        occupancy_revision: 2, ..receipt
+    };
+    writer.commit_accumulated_snapshot(&next_receipt).unwrap().unwrap();
+    let after_coarse = writer.committed_snapshot().unwrap();
+    assert_eq!(after_coarse.xyz_f32_le, coarse.xyz_f32_le);
+    assert_eq!(after_coarse.point_count, coarse.point_count);
+    assert_eq!(after_coarse.voxel_size, coarse.voxel_size);
+    let after_dense = writer.committed_dense_cloud().unwrap().unwrap();
+    assert_eq!(after_dense.point_count, dense.point_count);
+    assert_eq!(after_dense.read(0, crate::dense_cloud::CHUNK_POINTS).unwrap(), dense_bytes);
+    let after_fine = writer.committed_fine_cloud().unwrap();
+    assert_eq!(after_fine.manifest().blocks, fine.manifest().blocks,
+        "duplicate cannot add fine occupancy hits or rewrite immutable records");
+    assert_eq!(after_fine.manifest().geometry_revision, fine.manifest().geometry_revision);
+    assert_eq!(after_fine.manifest().source_watermarks, fine.manifest().source_watermarks);
+    let after_parts = after_fine.manifest().blocks.iter().map(|reference| {
+        let (occupancy, records) = reader.ground_parts(reference).unwrap();
+        (reference.key, occupancy, records)
+    }).collect::<Vec<_>>();
+    assert_eq!(after_parts, fine_parts, "actual persisted occupancy and typed heightfield records are unchanged");
+}
+
     use super::*;
 
     /// The Python peer acknowledges each committed phase after reading real SHM.

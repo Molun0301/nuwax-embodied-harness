@@ -155,6 +155,7 @@ impl SurfaceGoalSourceAdapter {
         let deferred_start_body = deferred.map_or(current_body.0, |old| old.start_body);
         let deferred_start_orientation = deferred.map_or(current_body.1, |old| old.start_orientation);
         let continuation = |resume_cursor, unresolved| DeferredFrontierRoute {
+            source_unavailable: None,
             source: source_snapshot.as_ref().clone(),
             candidate: FrontierCandidate { support_xyz: robot_support, gain: 0.0, travel_cost: 0.0 },
             start_body: deferred_start_body, start_orientation: deferred_start_orientation,
@@ -315,6 +316,7 @@ impl SurfaceGoalSourceAdapter {
                     let upper = nuwax_nav_pct::SearchLimits::default().max_states;
                     let terminal = route_budget.last_domain_limited.get() || state_limit >= upper;
                     next_deferred = Some(DeferredFrontierRoute {
+            source_unavailable: None,
                         source: source_snapshot.as_ref().clone(),
                         candidate: candidate.clone(), start_body: deferred_start_body,
                         start_orientation: deferred_start_orientation,
@@ -564,6 +566,7 @@ fn wait_map(width:i32,blind:bool)->Arc<SurfaceSnapshot> {
     })).collect();
     Arc::new(SurfaceSnapshot::from_points(&points,map().config().clone(),0.1).unwrap()
         .with_body_envelope(nuwax_nav_mls_planner::SurfaceBodyEnvelope {
+            fixed_collision: None,
             footprint_xy_m:vec![[-0.3,-0.12],[0.3,-0.12],[0.3,0.12],[-0.3,0.12]],
             z_bounds_m:[-0.05,0.2],body_to_support_z_m:0.3,max_step_up_m:0.2,max_step_down_m:0.2,
             max_cross_slope_deg:15.0,support_uncertainty_m:0.0,

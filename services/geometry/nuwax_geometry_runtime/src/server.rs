@@ -5714,7 +5714,7 @@ impl GeometryRuntime for GeometryRuntimeService {
             uptime_ms: diag.uptime_ms,
             rss_kb: diag.rss_kb,
             lcm_backend: diag.lcm_backend,
-            supported_assigned_fine_archive_versions: vec![1, 2, 3, 4],
+            supported_assigned_fine_archive_versions: vec![1, 2, 3, 4, 5],
         }))
     }
 
@@ -12329,6 +12329,12 @@ async fn assigned_mapping_cloud_boundary_slice(
     }
 
     async fn assigned_export_transfer_activation(spec: crate::mapping_backend::MappingBackendSpec, paired: bool) {
+        assigned_export_transfer_activation_source(spec, paired, false).await;
+    }
+
+    // Keep the four compatibility-array controls unchanged. The native-source
+    // case separately exercises actual Common admission and canonical handoff.
+    async fn assigned_export_transfer_activation_source(spec: crate::mapping_backend::MappingBackendSpec, paired: bool, native_source: bool) {
         const SOURCE_NS: u64 = 1_700_000_000_123_456_789;
         let source = CanonicalResetFixture::with_backend(spec).await;
         let mut destination = CanonicalResetFixture::with_backend(spec).await;
@@ -12369,11 +12375,44 @@ async fn assigned_mapping_cloud_boundary_slice(
                 Point3::new(1.5, 1.5, 1.5),
                 Point3::new(-0.75, 0.5, 0.6),
             ];
+            if native_source {
+                let status=source.service.get_status(Request::new(Empty {})).await.unwrap().into_inner();
+                assert_eq!(status.supported_assigned_fine_archive_versions,vec![1,2,3,4,5]);
+            }
+            let common = native_source.then(|| crate::lio_ingress::CommonLioIngress::new(
+                crate::lio_ingress::DeviceLioIngressSpec::new(1, "sensor", "base_link", "odom", "map").unwrap()));
             for sequence in 0..3 {
                 let timestamp = SOURCE_NS + sequence * 1_000_000_000;
-                assert!(crate::lcm_runtime::handoff_registered_lio_cloud(
-                    &source.handle, &points, 12, timestamp, timestamp, "map",
-                ).await.expect("native source cloud commit"));
+                if let Some(common) = common.as_ref() {
+                    let mut odometry = schema::Odometry::default();
+                    odometry.header.frame_id = "odom".into();
+                    odometry.child_frame_id = "base_link".into();
+                    odometry.pose.orientation_xyzw = [0.0, 0.0, 0.0, 1.0];
+                    let envelope = common.prepare_legacy_odometry(timestamp as i64, odometry).unwrap();
+                    let identity = crate::lio_ingress::SourceIdentity {
+                        backend: envelope.backend, runtime_generation: envelope.runtime_generation,
+                        source_sequence: sequence as i64 + 1, source_timestamp_ns: timestamp as i64,
+                    };
+                    let correlated = crate::lio_ingress::CorrelatedOdometry {
+                        source_sequence: envelope.source_sequence, source_timestamp_ns: envelope.source_timestamp_ns,
+                    };
+                    common.accept_public_odometry(envelope, timestamp as i64).unwrap();
+                    let prepared = common.register_odom_points(identity, correlated, timestamp as i64,
+                        points.len(), points.to_vec(), &source.handle.mapping_adapter.as_ref().unwrap().lock()).unwrap();
+                    let admitted = common.accept_public_cloud(prepared.encoded_for_test().as_ref(), timestamp as i64).unwrap();
+                    assert!(crate::lcm_runtime::handoff_admitted_registered_cloud(&source.handle, &admitted)
+                        .await.expect("canonical admitted source cloud commit"));
+                } else {
+                    assert!(crate::lcm_runtime::handoff_registered_lio_cloud(
+                        &source.handle, &points, 12, timestamp, timestamp, "map",
+                    ).await.expect("compatibility-array cloud commit"));
+                }
+            }
+            if native_source {
+                let root = source.handle.cloud_map_writer.lock().as_ref().unwrap().committed_fine_cloud().unwrap();
+                let mut reader = nuwax_map_chunks::RegionReader::new(root.repository.clone(), 4 * 1024 * 1024);
+                assert!(root.manifest().blocks.iter().any(|block| reader.ground_parts(block).unwrap().1.has_heightfield()),
+                    "actual source-owned capture must precede the new-format export");
             }
             // This is the actual runtime exporter and backend worker, not a
             // hand-authored checkpoint or an assembly/classification fixture.
@@ -12390,7 +12429,7 @@ async fn assigned_mapping_cloud_boundary_slice(
             let cloud = checkpoint.canonical_cloud_checkpoint.as_ref().unwrap();
             assert_eq!(cloud.payload_schema_version, 2);
             assert!(cloud.xyz_sha256.is_empty());
-            let fine_reference = checkpoint.fine_map_artifact.as_ref().expect("native AR4 fine export");
+            let fine_reference = checkpoint.fine_map_artifact.as_ref().expect("actual source fine export");
             let dense_reference = checkpoint.dense_cloud_artifact.as_ref().expect("native dense export");
             let source_dense = source.handle.cloud_map_writer.lock().as_ref().unwrap()
                 .committed_dense_cloud().unwrap().unwrap();
@@ -12425,7 +12464,7 @@ async fn assigned_mapping_cloud_boundary_slice(
             assert_eq!(destination.handle.state.read().await.pose.timestamp_ns, 91);
 
             transfer_assigned_checkpoint_member(
-                &source.service, &destination.service, fine_reference, b"NUWAXAR4",
+                &source.service, &destination.service, fine_reference, if native_source { b"NUWAXAR5" } else { b"NUWAXAR4" },
             ).await;
             transfer_assigned_checkpoint_member(
                 &source.service, &destination.service, dense_reference, b"NUWAXDC1",
@@ -12602,6 +12641,11 @@ async fn assigned_mapping_cloud_boundary_slice(
     // Native server/backend integration uses injected LCM/readiness. Paired
     // cases additionally exercise the real generated tonic client over loopback;
     // no real LCM context, sensor process or actuator resource is constructed.
+    #[tokio::test]
+    async fn assigned_v2_native_heightfield_export_transfer_activate_replay_and_conflicts() {
+        assigned_export_transfer_activation_source(crate::mapping_backend::MappingBackendSpec::Voxel, false, true).await;
+    }
+
     #[tokio::test]
     async fn assigned_v2_voxel_export_transfer_activate_replay_and_conflicts() {
         assigned_export_transfer_activation(crate::mapping_backend::MappingBackendSpec::Voxel, false).await;

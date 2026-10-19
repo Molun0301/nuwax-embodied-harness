@@ -123,6 +123,7 @@ def validate_fine_archive(payload, *, session=None, generation=None, cloud_revis
         raise ValueError("精细地图资产块数错误")
     offset += 8
     heightfields = {}
+    empty_ground_columns, declared_ground_columns = set(), set()
     previous = None
     object_points = {}
     object_offsets = {}
@@ -190,12 +191,19 @@ def validate_fine_archive(payload, *, session=None, generation=None, cloud_revis
                 if ground_bindings.setdefault(object_id, (key, size)) != (key, size):
                     raise ValueError("精细地图地表对象空间绑定改变")
                 evidence = {local: stamp for local, stamp, _ in struct.iter_unpack("<HQH", memoryview(block)[16:records_end])}
-                _validate_ground_records(layers, integer, key, evidence, heightfields)
+                _validate_ground_records(layers, integer, key, evidence, heightfields, size,
+                                         empty_ground_columns, declared_ground_columns)
             else:
                 _validate_layer_structure(layers, integer, sourced=sourced)
+                if version >= 5:
+                    declared_ground_columns.update((key[0] * 32 + local % 32,
+                                                    key[1] * 32 + local // 32 % 32)
+                                                   for local, _ in layers)
     if offset != len(payload):
         raise ValueError("精细地图资产存在尾随数据")
     if version >= 5:
+        if not empty_ground_columns.isdisjoint(declared_ground_columns):
+            raise ValueError("精细地图空地表列与真实地表声明冲突")
         _validate_heightfield_columns(heightfields, size)
     return root
 
@@ -297,7 +305,8 @@ def _validate_layer_structure(layers, integer, *, sourced=False):
                     integer(sample["source_sequence"], 1 if source[0] == "lidar" else 0, 2 ** 64 - 1)
 
 
-def _validate_ground_records(records, integer, block_key, evidence, columns):
+def _validate_ground_records(records, integer, block_key, evidence, columns, resolution,
+                             empty_columns, declared_columns):
     """BL4 data boundary; current root members define the declared surface."""
     if not isinstance(records, list) or not 1 <= len(records) <= 32768:
         raise ValueError("精细地图地表记录数量错误")
@@ -311,6 +320,15 @@ def _validate_ground_records(records, integer, block_key, evidence, columns):
             raise ValueError("精细地图地表记录顺序或标签错误")
         last = local
         value = tagged["data"]
+        xy = (block_key[0] * 32 + local % 32, block_key[1] * 32 + local // 32 % 32)
+        if tagged["representation"] == "classified_empty_column":
+            if (value != {} or not isinstance(value, dict) or local >= 1024
+                    or not any(local + z * 1024 in evidence for z in range(32))
+                    or xy in empty_columns):
+                raise ValueError("精细地图空地表列缺少占据或重复")
+            empty_columns.add(xy)
+            continue
+        declared_columns.add(xy)
         if tagged["representation"] == "legacy_plane":
             _validate_layer_structure([[local, value]], integer, sourced=True)
             members = value["members"]
@@ -370,6 +388,26 @@ def _validate_ground_records(records, integer, block_key, evidence, columns):
         if (members[0] != local or members != sorted(set(members))
                 or any(m % 1024 != local % 1024 or m not in evidence or m in claimed for m in members)):
             raise ValueError("精细地图地表成员归属错误")
+        if tagged["representation"] == "legacy_plane":
+            member_time = max((evidence[m] for m in members), default=0)
+            q = struct.unpack("<f", struct.pack("<f", resolution))[0]
+            if q <= 0:
+                raise ValueError("精细地图分辨率无法表示")
+            reciprocal = 1.0 / q
+            for sample in value["samples"]:
+                stamp = sample["source_timestamp_ns"]
+                if stamp <= member_time:
+                    continue
+                scaled = [v * reciprocal for v in sample["point"]]
+                if any(not math.isfinite(v) for v in scaled):
+                    raise ValueError("精细地图旧诊断缺少实际占据证据")
+                xyz = [math.floor(v) for v in scaled]
+                if (any(v < -(2 ** 31) or v > 2 ** 31 - 1 for v in xyz)
+                        or tuple(v // 32 for v in xyz) != tuple(block_key)):
+                    raise ValueError("精细地图旧诊断缺少实际占据证据")
+                local_sample = xyz[0] % 32 + 32 * (xyz[1] % 32) + 1024 * (xyz[2] % 32)
+                if stamp > evidence.get(local_sample, 0):
+                    raise ValueError("精细地图旧诊断缺少实际占据证据")
         claimed.update(members)
 
 

@@ -128,7 +128,7 @@ mod tests {
     fn ordinary_observation_refresh_and_private_footprints_reuse_one_base_field() {
         let points:Vec<_>=(-10..10).flat_map(|x|(-10..10).filter_map(move|y|
             (!(x==0 && y==0)).then_some(((x as f32+0.5)*0.1,(y as f32+0.5)*0.1,-0.025)))).collect();
-        let model=SurfaceBodyEnvelope {footprint_xy_m:vec![[-0.15,-0.15],[0.15,-0.15],[0.15,0.15],[-0.15,0.15]],
+        let model=SurfaceBodyEnvelope {fixed_collision:None,footprint_xy_m:vec![[-0.15,-0.15],[0.15,-0.15],[0.15,0.15],[-0.15,0.15]],
             z_bounds_m:[-0.1,0.1],body_to_support_z_m:0.4,max_step_up_m:0.15,max_step_down_m:0.15,
             max_cross_slope_deg:18.0,support_uncertainty_m:0.0};
         let map=SurfaceSnapshot::from_points(&points,config(),0.05).unwrap().with_body_envelope(model).unwrap();

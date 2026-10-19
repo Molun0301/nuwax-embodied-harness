@@ -41,6 +41,7 @@ fn calibrated_config(local_planning_enabled: bool) -> SurfaceNavigationConfig {
         }),
     };
     let body = RobotGeometry {
+        self_collision: None,
         footprint_xy_m: vec![[-0.15,-0.15],[0.15,-0.15],[0.15,0.15],[-0.15,0.15]],
         z_min_m: -0.05, z_max_m: 0.2, source: "generic synthetic qualification".into(),
     };

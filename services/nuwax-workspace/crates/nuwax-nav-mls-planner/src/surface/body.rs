@@ -11,6 +11,11 @@ mod translation;
 pub(super) mod reference_field;
 #[path = "body_dynamic_interval.rs"]
 mod dynamic_interval;
+#[path = "body_ground_owner.rs"]
+mod ground_owner;
+// 真实固定刚体的独立查询核；共享几何字段接入前不改变现有接触路径。
+#[path = "body_contact.rs"]
+pub(super) mod contact;
 type GroundPatchCache = AHashMap<(VoxelKey, u64, u64), Arc<AHashMap<(i32, i32), VoxelKey>>>;
 pub(super) type CacheSlot = std::sync::Mutex<GroundPatchCache>;
 
@@ -110,6 +115,8 @@ impl Drop for PoseColumnCounts {
 /// 凸柱包络不能用来推断实时腿部姿态、点的自体身份或地面承载材质。
 #[derive(Clone, Debug, PartialEq)]
 pub struct SurfaceBodyEnvelope {
+    /// 同一启动模型的固定 collision，共享配置所有权；缺省时保留原外包语义。
+    pub fixed_collision: Option<Arc<nuwax_types::FixedCollisionGeometry>>,
     /// 机体坐标中的逆时针凸包。
     pub footprint_xy_m: Vec<[f64; 2]>,
     /// 机体最低/最高局部高度。
@@ -128,6 +135,9 @@ pub struct SurfaceBodyEnvelope {
 impl SurfaceBodyEnvelope {
     /// 检查静态几何和数学预算。
     pub fn validate(&self) -> Result<(), SurfaceError> {
+        if let Some(geometry) = &self.fixed_collision {
+            geometry.validate().map_err(SurfaceError::InvalidConfig)?;
+        }
         validate_boundary(&self.footprint_xy_m)?;
         if self.footprint_xy_m.len() > 256
             || !self
@@ -181,6 +191,15 @@ fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
         a[2] * b[0] - a[0] * b[2],
         a[0] * b[1] - a[1] * b[0],
     ]
+}
+/// 调用方已证明真实成员身份；成员只有不撞固定实体时才能豁免全腿包络。
+fn finite_member_contact(rigid:Option<&contact::RigidBodyQuery>,min:[f64;3],max:[f64;3])
+    ->Result<bool,SurfaceError> {
+    rigid.map_or(Ok(true),|query|query.intersects_voxel(min,max).map(|hit|!hit))
+}
+fn actual_volume_intersects(prism:&PrismQuery,rigid:Option<&contact::RigidBodyQuery>,min:[f64;3],max:[f64;3])
+    ->Result<bool,SurfaceError> {
+    Ok(prism.intersects(min,max) || rigid.map_or(Ok(false),|query|query.intersects_voxel(min,max))?)
 }
 fn normalize(v: [f64; 3]) -> [f64; 3] {
     let n = dot(v, v).sqrt();
@@ -458,7 +477,7 @@ impl FineContacts {
 // Query-local selection borrows the immutable measured record; it never copies
 // members or stores pose-dependent selection in the shared compatibility cache.
 enum FineGroundInput<'a> {
-    Measured(Option<&'a ObservedGroundLayer>),
+    Measured(Option<SourceGroundRecord<'a>>),
     Legacy(Option<Arc<Vec<FineContactBand>>>),
 }
 
@@ -682,24 +701,25 @@ impl SurfaceSnapshot {
     /// Inputs already use the same anchor/gravity frame as the legacy selector.
     fn select_measured_fine_ground_layer<'a>(&self,observations:&'a SurfaceObservations,
         model:&SurfaceBodyEnvelope,ground:Option<VoxelKey>,body:[f64;3],normal:[f64;3],xy:[i32;2])
-        ->Option<Option<&'a ObservedGroundLayer>> {
+        ->Option<Option<SourceGroundRecord<'a>>> {
         self.select_measured_fine_ground_layer_in_context(observations,model,ground,body,normal,xy,QuerySample::LegacyNominal)
     }
 
     fn select_measured_fine_ground_layer_in_context<'a>(&self,observations:&'a SurfaceObservations,
         model:&SurfaceBodyEnvelope,ground:Option<VoxelKey>,body:[f64;3],normal:[f64;3],xy:[i32;2],sample:QuerySample<'_>)
-        ->Option<Option<&'a ObservedGroundLayer>> {
+        ->Option<Option<SourceGroundRecord<'a>>> {
         if self.ground_evidence!=GroundEvidence::MeasuredSurface {return None;}
         let fine=f64::from(observations.size_m);let size=f64::from(self.config().voxel_size);
         let center=xy.map(|v|(f64::from(v)+0.5)*fine);
-        let mut records=observations.ground_layers(xy).peekable();
-        let any_measured=records.peek().is_some();
+        let mut records=observations.ground_records(xy).peekable();
+        let any_measured=records.peek().is_some() || observations.classified_empty_ground(xy);
         if let Some(sample)=sample.ground() {
-            if let Some(anchor)=sample.reference_sources.iter().find_map(|source|match source {
-                NativeGroundSource::ObservedFine{anchor} if [anchor[0],anchor[1]]==xy=>Some(*anchor),
+            if let Some(key)=sample.reference_sources.iter().find_map(|source|match source {
+                NativeGroundSource::ObservedFine{anchor} if [anchor[0],anchor[1]]==xy=>Some(GroundKey::LegacyPlane(*anchor)),
+                NativeGroundSource::HeightfieldFine{key} if key.anchor()[..2]==xy=>Some(*key),
                 _=>None,
             }) {
-                return Some(records.find(|record|record.anchor==anchor));
+                return Some(records.find(|record|record.key()==key));
             }
         }
         // The physical anchor constrains membership to its coarse cell.
@@ -710,47 +730,37 @@ impl SurfaceSnapshot {
         let uncertainty=f64::from(self.source_voxel_size_m())+model.support_uncertainty_m;
         let record=records.filter(|record| {
             if let Some(ground)=ground.filter(|_|sample.ground().is_none()) {
-                record.members.iter().any(|&z|(((f64::from(z)+0.5)*fine)/size).floor() as i32==ground.2)
+                record.members().any(|z|(((f64::from(z)+0.5)*fine)/size).floor() as i32==ground.2)
             } else {
                 record.height_at(center).is_some_and(|height|
                     height-reference<=model.max_step_up_m+uncertainty+1e-6
-                    && reference-height<=model.max_step_down_m+uncertainty+1e-6
-                    && record.normal[2]>=f64::from(self.config().max_slope_deg).to_radians().cos())
+                    && reference-height<=model.max_step_down_m+uncertainty+1e-6)
             }
         }).min_by(|a,b|(a.height_at(center).unwrap_or(f64::INFINITY)-reference).abs()
             .total_cmp(&(b.height_at(center).unwrap_or(f64::INFINITY)-reference).abs()));
         any_measured.then_some(record)
     }
 
-    fn measured_fine_ground_value<T:FineGroundValue>(xy:[i32;2],fine:f64,record:Option<&ObservedGroundLayer>)->T {
-        if let Some(record)=record {
-            let center=xy.map(|v|(f64::from(v)+0.5)*fine);
-            let height=record.height_at(center);
-            let mut contacts=FineContacts::default();
-            if T::CONTACTS {for &z in &record.members {
-                if let Some(last)=contacts.last_mut().filter(|last|last[1].checked_add(1)==Some(z)) {last[1]=z;}
-                else {contacts.push([z,z]);}
-            }}
-            return T::from_parts(xy,height,contacts);
-        }
-        T::from_parts(xy,None,FineContacts::default())
-    }
-
     fn measured_fine_ground_value_in_context<T:FineGroundValue>(&self,xy:[i32;2],fine:f64,
-        record:Option<&ObservedGroundLayer>,model:&SurfaceBodyEnvelope,polygon:&PolygonQuery,
-        body:[f64;3],normal:[f64;3],sample:QuerySample<'_>)->T {
-        if sample.is_legacy() {return Self::measured_fine_ground_value(xy,fine,record);}
+        record:Option<SourceGroundRecord<'_>>,model:&SurfaceBodyEnvelope,polygon:&PolygonQuery,
+        body:[f64;3],normal:[f64;3],_sample:QuerySample<'_>)->T {
         let Some(record)=record else {return T::from_parts(xy,None,FineContacts::default());};
         let height=record.height_at(xy.map(|v|(f64::from(v)+0.5)*fine));
         let uncertainty=f64::from(self.source_voxel_size_m())+model.support_uncertainty_m;
         let contact=model.max_step_up_m.max(model.max_step_down_m)+uncertainty;
         let mut contacts=FineContacts::default();
-        if T::CONTACTS {for &z in &record.members {
-            let top=f64::from(z+1)*fine;
+        // LegacyPlane and Heightfield members are evidence, not whole-record
+        // collision exemptions. Every real member meets the same finite window.
+        // This compatibility window does not identify rigid trunk geometry:
+        // z_bounds_m is the whole-body envelope, including movable legs.
+        if T::CONTACTS {for z in record.members() {
+            let top=(f64::from(z)+1.0)*fine;
             let plane=polygon.contact_plane(body,normal,xy[0],xy[1],fine,top,
                 (-model.body_to_support_z_m/normal[2]+contact+1e-6).min(uncertainty));
-            if height_rejection(plane+model.z_bounds_m[0]/normal[2],
-                plane-model.body_to_support_z_m/normal[2],plane,contact,top,uncertainty).is_some() {continue;}
+            let support=plane-model.body_to_support_z_m/normal[2];
+            if !self.has_complete_fixed_contact_geometry()
+                && height_rejection(plane+model.z_bounds_m[0]/normal[2],
+                support,plane,contact,top,uncertainty).is_some() {continue;}
             if let Some(last)=contacts.last_mut().filter(|last|last[1].checked_add(1)==Some(z)) {last[1]=z;}
             else {contacts.push([z,z]);}
         }}
@@ -769,7 +779,8 @@ impl SurfaceSnapshot {
             ([body[0],body[1],body[2]+model.body_to_support_z_m*(1.0-normal[2])],[0.0,0.0,1.0])
         } else {(body,normal)};
         if let Some(record)=self.select_measured_fine_ground_layer(observations,model,ground,body,normal,xy) {
-            return Self::measured_fine_ground_value::<T>(xy,f64::from(observations.size_m),record);
+            return self.measured_fine_ground_value_in_context::<T>(xy,f64::from(observations.size_m),record,
+                model,polygon,body,normal,QuerySample::LegacyNominal);
         }
         self.select_legacy_fine_ground_value::<T>(observations,model,polygon,prism,body,normal,xy,bands)
     }
@@ -984,11 +995,16 @@ impl SurfaceSnapshot {
     fn ground_patch_in_context(&self,centre:SurfaceLocation,radius:f64,height:f64,sample:QuerySample<'_>)
         -> Arc<AHashMap<(i32,i32),VoxelKey>> {
         let key = (centre.cell, radius.to_bits(), height.to_bits());
+        let bound_key=sample.ground().map(|ground|(centre.cell,radius.to_bits(),
+            [centre.surface_xyz[0].to_bits(),centre.surface_xyz[1].to_bits()],GroundHeightKey::new(ground)));
         // 实测平面属于观察快照，地形占据不变时其高度仍可能改变。
         // 这类邻域随现有查询缓存退休；无实测层的邻域仍共享物理图缓存。
         let measured = self.ground_evidence == GroundEvidence::MeasuredSurface
             && self.observations.as_ref().is_some_and(|s|s.has_measured_ground_layers());
-        let cached = if sample.ground().is_some() {None} else if measured {
+        let cached = if let Some(key)=&bound_key {
+            self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner())
+                .bound_ground_patches.get(key).cloned()
+        } else if measured {
             self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner())
                 .measured_ground_patches.get(&key).cloned()
         } else {
@@ -1043,7 +1059,12 @@ impl SurfaceSnapshot {
             }
         }
         let patch = Arc::new(patch);
-        if sample.ground().is_some() {return patch;}
+        if let Some(key)=bound_key {
+            let mut owner=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner());
+            if owner.bound_ground_patches.len()>=512 {owner.bound_ground_patches.clear();}
+            owner.bound_ground_patches.insert(key,Arc::clone(&patch));
+            return patch;
+        }
         if measured {
             let mut owner = self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner());
             let cache = &mut owner.measured_ground_patches;
@@ -1241,8 +1262,35 @@ impl SurfaceSnapshot {
         result
     }
 
+    fn fixed_body_primitives(&self)->Result<Option<Arc<[contact::RigidPrimitive]>>,SurfaceError> {
+        let Some(geometry)=self.body_envelope().and_then(|model|model.fixed_collision.as_ref()) else {return Ok(None);};
+        // 空实体集合保留旧有限接触；排除/unsupported 统计不增加完整性准入门。
+        if geometry.primitives.is_empty() {return Ok(None);}
+        let mut cache=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner());
+        if let Some(primitives)=&cache.fixed_primitives {return Ok(Some(Arc::clone(primitives)));}
+        let primitives:Arc<[contact::RigidPrimitive]>=geometry.primitives.iter().map(|primitive| {
+            let shape=match primitive.shape {
+                nuwax_types::FixedCollisionShape::Box{size_m}=>contact::RigidShape::Box{size_m},
+                nuwax_types::FixedCollisionShape::Sphere{radius_m}=>contact::RigidShape::Sphere{radius_m},
+                nuwax_types::FixedCollisionShape::Cylinder{radius_m,length_m}=>contact::RigidShape::Cylinder{radius_m,length_m},
+            };
+            contact::RigidPrimitive::new(shape,primitive.translation_m,primitive.rotation_row_major)
+        }).collect::<Result<Vec<_>,_>>()?.into();
+        cache.fixed_primitives=Some(Arc::clone(&primitives));Ok(Some(primitives))
+    }
+
+    fn has_complete_fixed_contact_geometry(&self)->bool {
+        self.body_envelope().and_then(|model|model.fixed_collision.as_ref())
+            .is_some_and(|geometry|!geometry.primitives.is_empty() && geometry.unsupported_collision_count==0)
+    }
+
+    fn fixed_body_query(&self,pose:([f64;3],[f64;4]))->Result<Option<contact::RigidBodyQuery>,SurfaceError> {
+        self.fixed_body_primitives()?.map(|primitives|contact::RigidBodyQuery::new(&primitives,pose)).transpose()
+    }
+
     fn recent_surface_contact(&self,point:[f64;3],height:Option<f64>,body:[f64;3],r:[[f64;3];3])->bool {
         let Some(model)=self.body_envelope() else {return false;};
+        // 缺真实固定几何时完整保留原 legacy 接触合同；本帧实体分支在调用方执行。
         let Some(height)=height else {return false;};
         let uncertainty=f64::from(self.source_voxel_size_m())+model.support_uncertainty_m;
         if (point[2]-height).abs()>uncertainty+1e-6 {return false;}
@@ -1281,6 +1329,7 @@ impl SurfaceSnapshot {
             bounds_xy[1],[bounds_xy[0][0],bounds_xy[1][1]]];
         let polygon=PolygonQuery::new(&rectangle);
         let prism=PrismQuery::new(model,r,reference_body.0);
+        let rigid=self.fixed_body_query(reference_body)?;
         let mut result=Vec::new();
         for frame in &recent.frames {for (&[x,y],zs) in frame.columns.range(low..=high) {
             if y<low[1] || y>high[1] {continue;}
@@ -1295,7 +1344,13 @@ impl SurfaceSnapshot {
             for &z in zs {
                 if let Some(points)=frame.surface_points.get(&[x,y,z]) {
                     for &point in points {
-                        if !self.recent_surface_contact(point,height,reference_body.0,r) {result.push((point,point));}
+                        let contact=if let Some(rigid)=rigid.as_ref().filter(|_|self.has_complete_fixed_contact_geometry()) {
+                            // hint 覆盖未来位置：只有当前实际包络内且已证不撞实体的点可省略。
+                            // 包络外的真实成员保留候选，不能把“尚未走到”误作未来无碰撞。
+                            prism.intersects(point,point) && !rigid.intersects_point(point)?
+                        } else {self.recent_surface_contact(point,height,reference_body.0,r)
+                            && finite_member_contact(rigid.as_ref(),point,point)?};
+                        if !contact {result.push((point,point));}
                     }
                 } else {
                     let a=[x,y,z].map(|v|f64::from(v)*fine);let b=[x,y,z].map(|v|f64::from(v+1)*fine);
@@ -1313,8 +1368,20 @@ impl SurfaceSnapshot {
     pub(in crate::surface) fn validate_body_pose_in_context(&self,body:[f64;3],quaternion:[f64;4],
         sample:QuerySample<'_>,slot:&mut Option<BodyFailureWitness>)->Result<(),SurfaceError> {
         if sample.is_legacy() {return self.validate_body_pose_with_witness(body,quaternion,slot);}
+        let key=BoundPoseGroundKey::new(sample).map(|ground|([body[0],body[1],body[2],
+            quaternion[0],quaternion[1],quaternion[2],quaternion[3]].map(f64::to_bits),ground));
+        let cached=key.as_ref().and_then(|key|self.body_query_cache.lock()
+            .unwrap_or_else(|e|e.into_inner()).bound_poses.get(key).cloned());
         let mut rejection=None;
-        let result=self.check_body_pose_in_context(body,quaternion,sample,&mut rejection);
+        let result=if let Some(cached)=cached {cached.result(&mut rejection)} else {
+            let result=self.check_body_pose_in_context(body,quaternion,sample,&mut rejection);
+            if let Some(key)=key {
+                let mut owner=self.body_query_cache.lock().unwrap_or_else(|e|e.into_inner());
+                if owner.bound_poses.len()>=8192 {owner.bound_poses.clear();}
+                owner.bound_poses.insert(key,CachedBodyResult::new(result.clone(),rejection));
+            }
+            result
+        };
         *slot=rejection.map(|rejection|BodyFailureWitness{pose:(body,quaternion),rejection});result
     }
 
@@ -1338,18 +1405,24 @@ impl SurfaceSnapshot {
         if r[2][2]<=0.0 {return Err(SurfaceError::InvalidPose);}
         // Ground is useful for contact interpretation, not a second permission to
         // execute geometry checking. Missing samples are not occupied obstacles.
+        let actual_support=self.support_position_from_body(body,quaternion,model.body_to_support_z_m)?;
+        let support_xy=[actual_support[0],actual_support[1]];
         let located=if let Some(sample)=sample.ground() {
             if !body.into_iter().all(f64::is_finite) {return Err(SurfaceError::InvalidPose);}
-            self.locate_support([body[0],body[1],sample.height_at([body[0],body[1]])])
+            self.locate_support([support_xy[0],support_xy[1],sample.height_at(support_xy)])
         } else {self.locate_support_from_body(body,quaternion,model.body_to_support_z_m)};
         let centre=match located {
             Ok(value)=>Some(value),Err(SurfaceError::MissingSupport)=>None,Err(error)=>return Err(error),
         };
-        let vertices: Vec<_> = model
+        let rigid=self.fixed_body_query((body,quaternion))?;
+        let mut vertices: Vec<_> = model
             .footprint_xy_m
             .iter()
             .flat_map(|p| model.z_bounds_m.map(|z| world(r, body, [p[0], p[1], z])))
             .collect();
+        if let Some((low,high))=rigid.as_ref().map(|query|query.bounds()).transpose()?.flatten() {
+            vertices.extend((0..8).map(|bits|std::array::from_fn(|axis|if bits&(1<<axis)==0 {low[axis]}else{high[axis]})));
+        }
         let polygon = hull(vertices.iter().map(|p| [p[0], p[1]]).collect());
         let polygon_query=PolygonQuery::new(&polygon);
         let prism_query=PrismQuery::new(model,r,body);
@@ -1379,7 +1452,7 @@ impl SurfaceSnapshot {
         let radius = ((vertices.iter().map(|p|(p[0]-centre.map_or(body[0],|c|c.surface_xyz[0])).hypot(p[1]-centre.map_or(body[1],|c|c.surface_xyz[1])))
             .fold(0.0,f64::max)+size*2.0)/size).ceil()*size;
         let patch=centre.map_or_else(||Arc::new(AHashMap::new()),|centre|self.ground_patch_in_context(centre,radius,
-            sample.ground().map_or(centre.surface_xyz[2],|s|s.height_at([body[0],body[1]])),sample));
+            sample.ground().map_or(centre.surface_xyz[2],|s|s.height_at(support_xy)),sample));
         let (patch,precise_ground)=self.refine_footprint_support_in_context(patch,&polygon_query,&prism_query,body,r,([x0,y0],[x1,y1]),sample);
         #[cfg(feature = "body-query-profile")]
         drop(pose_prelude_profile);
@@ -1412,12 +1485,18 @@ impl SurfaceSnapshot {
                                 else {ground.map(|g|self.ground_cell_position(g)[2])};
                             for &z in zs {
                                 if let Some(points)=frame.surface_points.get(&[x,y,z]) {
-                                    if !points.iter().any(|&point|!self.recent_surface_contact(point,height,body,r)
-                                        &&prism_query.intersects(point,point)) {continue;}
+                                    let mut collision=false;
+                                    for &point in points {
+                                        collision |= if let Some(rigid)=rigid.as_ref().filter(|_|self.has_complete_fixed_contact_geometry()) {rigid.intersects_point(point)?}
+                                            else {(!self.recent_surface_contact(point,height,body,r)
+                                                && prism_query.intersects(point,point))
+                                                || rigid.as_ref().map_or(Ok(false),|query|query.intersects_point(point))?};
+                                    }
+                                    if !collision {continue;}
                                 }
                                 let low=[x,y,z].map(|v|f64::from(v)*fine);
                                 let high=[x,y,z].map(|v|f64::from(v+1)*fine);
-                                if high[2]>=min[2] && low[2]<=max[2] && prism_query.intersects(low,high) {
+                                if high[2]>=min[2] && low[2]<=max[2] && actual_volume_intersects(&prism_query,rigid.as_ref(),low,high)? {
                                     return Err(reject(slot,BodyRejection::Occupancy{cell:[x,y,z],
                                         source:OccupancySource::Recent,z_bounds:[low[2],high[2]],ground_height:height}));
                                 }
@@ -1426,7 +1505,7 @@ impl SurfaceSnapshot {
                 }
             }
         }
-        self.check_fine_column_fringe_in_context(body,r,&polygon_query,&prism_query,&patch,min,max,([x0,y0],[x1,y1]),sample,slot)?;
+        self.check_fine_column_fringe_in_context(body,r,&polygon_query,&prism_query,&patch,min,max,([x0,y0],[x1,y1]),sample,rigid.as_ref(),slot)?;
         let uncertainty = f64::from(self.source_voxel_size_m()) + model.support_uncertainty_m;
         let mut ground_points = Vec::new();
         // One guard for the entire loop, never a clock/TLS update per XY or Z.
@@ -1444,7 +1523,7 @@ impl SurfaceSnapshot {
                     // It still receives the exact same actual-volume collision pass.
                     if self.data.virtual_obstacles.as_ref().is_some_and(|mask|
                         !mask.permits_cell((x,y,0),size,0.0)) {return Err(SurfaceError::VirtualObstacle);}
-                    self.check_unassigned_body_column_in_context(body,r,&polygon_query,&prism_query,x,y,sample,slot)?;
+                    self.check_unassigned_body_column_in_context(body,r,&polygon_query,&prism_query,x,y,sample,rigid.as_ref(),slot)?;
                     continue;
                 };
                 #[cfg(feature = "body-query-profile")]
@@ -1507,14 +1586,17 @@ impl SurfaceSnapshot {
                             z as f32 * self.config().voxel_size,
                             (z as f32 + 1.0) * self.config().voxel_size,
                         ]);
-                        if (selected.is_none() && coarse_contact && f64::from(bounds[1]) <= ground_height + 1e-6)
+                        let coarse_permitted=coarse_contact && f64::from(bounds[1])<=ground_height+1e-6
+                            && finite_member_contact(rigid.as_ref(),[x as f64*size,y as f64*size,f64::from(bounds[0])],
+                                [(x+1) as f64*size,(y+1) as f64*size,f64::from(bounds[1])])?;
+                        if (selected.is_none() && coarse_permitted)
                             || f64::from(bounds[0]) > max[2]
                             || f64::from(bounds[1]) < min[2]
                         {
                             continue;
                         }
                         let mut fine_hit=None;
-                        let coarse_intersects = || prism_query.intersects(
+                        let coarse_intersects = || actual_volume_intersects(&prism_query,rigid.as_ref(),
                             [x as f64 * size, y as f64 * size, f64::from(bounds[0])],
                             [(x + 1) as f64 * size, (y + 1) as f64 * size, f64::from(bounds[1])],
                         );
@@ -1531,9 +1613,9 @@ impl SurfaceSnapshot {
                                     // XY slice of an already occupied coarse volume.
                                     if selected.is_some() && column.is_none_or(|c|c.height.is_none())
                                         && !observations.is_complete_geometry_source()
-                                        && (!coarse_contact || f64::from(bounds[1])>ground_height+1e-6)
-                                        && prism_query.intersects([f64::from(ix)*fine,f64::from(iy)*fine,f64::from(bounds[0])],
-                                            [f64::from(ix+1)*fine,f64::from(iy+1)*fine,f64::from(bounds[1])]) {
+                                        && !coarse_permitted
+                                        && actual_volume_intersects(&prism_query,rigid.as_ref(),[f64::from(ix)*fine,f64::from(iy)*fine,f64::from(bounds[0])],
+                                            [f64::from(ix+1)*fine,f64::from(iy+1)*fine,f64::from(bounds[1])])? {
                                         missing_slice_hit=true;
                                     }
                                     #[cfg(feature = "body-query-profile")]
@@ -1549,7 +1631,9 @@ impl SurfaceSnapshot {
                                         // Both contact-run forms contain only real supported members
                                         // of this immutable observation owner. Preserve `found` so
                                         // an exempt fine contact cannot trigger coarse fallback.
-                                        if column.is_some_and(|c|c.permits_contact(iz)) {
+                                        if column.is_some_and(|c|c.permits_contact(iz))
+                                            && finite_member_contact(rigid.as_ref(),[ix,iy,iz].map(|v|f64::from(v)*fine),
+                                                [ix,iy,iz].map(|v|(f64::from(v)+1.0)*fine))? {
                                             found=true;
                                             continue;
                                         }
@@ -1561,19 +1645,20 @@ impl SurfaceSnapshot {
                                         found = true;
                                         let contact=selected.is_none() && coarse_contact
                                             && fine_ground.is_some_and(|height|f64::from(iz+1)*fine<=height+1e-6);
-                                        if contact {continue;}
+                                        if contact && finite_member_contact(rigid.as_ref(),[ix,iy,iz].map(|v|f64::from(v)*fine),
+                                            [ix,iy,iz].map(|v|(f64::from(v)+1.0)*fine))? {continue;}
 
-                                        let hit=prism_query.intersects(
+                                        let hit=actual_volume_intersects(&prism_query,rigid.as_ref(),
                                             [f64::from(ix)*fine,f64::from(iy)*fine,f64::from(iz)*fine],
-                                            [f64::from(ix+1)*fine,f64::from(iy+1)*fine,f64::from(iz+1)*fine]);
+                                            [f64::from(ix+1)*fine,f64::from(iy+1)*fine,f64::from(iz+1)*fine])?;
                                         if hit && fine_hit.is_none() {fine_hit=Some(([ix,iy,iz],[f64::from(iz)*fine,f64::from(iz+1)*fine],fine_ground));}
                                         intersects |= hit;
                                     }
                                 }
                             }
                             // 缺少该占据格的精细依据时保留粗格障碍，不把缺测当作自由。
-                            if found { intersects || missing_slice_hit } else {  (!coarse_contact || f64::from(bounds[1])>ground_height+1e-6) && coarse_intersects() }
-                        } else {  coarse_intersects() };
+                            if found { intersects || missing_slice_hit } else { !coarse_permitted && coarse_intersects()? }
+                        } else { coarse_intersects()? };
                         if intersects {
                             tracing::debug!(?body, x, y, z, ?bounds, ground_height, "机体与占据单元相交");
                             let (cell,z_bounds,source,ground_height)=match fine_hit {
@@ -1588,14 +1673,24 @@ impl SurfaceSnapshot {
         }
         #[cfg(feature = "body-query-profile")]
         drop(pose_columns_profile);
-        if let Some((a, b, _)) = (!matches!(sample,QuerySample::Unanchored))
-            .then(||fit_plane(&ground_points, centre.map_or(body,|c|c.support_xyz))).flatten() {
-            let yaw = r[0][1].atan2(r[0][0]);
-            let cross_slope = (-a * yaw.sin() + b * yaw.cos()).abs().atan().to_degrees();
-            if cross_slope > model.max_cross_slope_deg + 1e-5 {
-                tracing::debug!(?body, cross_slope, limit=model.max_cross_slope_deg, "实际机体支撑横坡超限");
-                return Err(SurfaceError::UntraversableSegment);
-            }
+        // Source direction is optional. A heightfield's rough member bounds do
+        // not become a fitted-plane admission gate. Legacy geometry still uses
+        // its existing geometric slope estimate when no measured record exists.
+        let measured=self.ground_evidence==GroundEvidence::MeasuredSurface
+            && self.observations.as_ref().is_some_and(|o|o.has_measured_ground_layers());
+        let direction=if measured {
+            sample.ground().and_then(|s|s.reference_normal).or_else(||
+                self.direct_ground_query(support_xy,actual_support[2]).normal)
+        } else {None};
+        let slope=direction.map(|n|(-n[0]/n[2],-n[1]/n[2])).or_else(|| {
+            (!measured && !matches!(sample,QuerySample::Unanchored))
+                .then(||fit_plane(&ground_points,centre.map_or(body,|c|c.support_xyz)))
+                .flatten().map(|(a,b,_)|(a,b))
+        });
+        if let Some((a,b))=slope {
+            let yaw=r[0][1].atan2(r[0][0]);
+            let cross_slope=(-a*yaw.sin()+b*yaw.cos()).abs().atan().to_degrees();
+            if cross_slope>model.max_cross_slope_deg+1e-5 {return Err(SurfaceError::UntraversableSegment);}
         }
         // Known terrain contradictions (including a measured drop) remain a
         // safety constraint. Absence of a layer returns Unknown and grants no
@@ -1603,10 +1698,11 @@ impl SurfaceSnapshot {
         let incompatible=if sample.is_legacy() {
             self.body_ground_relation(body,quaternion)? == BodyGroundRelation::KnownIncompatible
         } else if let Some(sample)=sample.ground() {
-            let reference=sample.height_at([body[0],body[1]]);
-            self.known_terrain_height([body[0],body[1]],reference).is_some_and(|height| {
+            let reference=sample.height_at(support_xy);
+            self.known_terrain_height(support_xy,reference).is_some_and(|height| {
                 let rounding=f64::from(self.source_voxel_size_m())+model.support_uncertainty_m+1e-6;
-                height-reference>model.max_step_up_m+rounding || reference-height>model.max_step_down_m+rounding
+                height-reference>model.max_step_up_m+rounding
+                    || reference-height>model.max_step_down_m+rounding
             })
         } else {false};
         if incompatible {
@@ -1617,11 +1713,12 @@ impl SurfaceSnapshot {
 
     fn check_unassigned_body_column(&self,body:[f64;3],r:[[f64;3];3],polygon:&PolygonQuery,
         prism:&PrismQuery,x:i32,y:i32,slot:&mut Option<BodyRejection>)->Result<(),SurfaceError> {
-        self.check_unassigned_body_column_in_context(body,r,polygon,prism,x,y,QuerySample::LegacyNominal,slot)
+        let rigid=self.fixed_body_query((body,quaternion_from_columns(r)))?;
+        self.check_unassigned_body_column_in_context(body,r,polygon,prism,x,y,QuerySample::LegacyNominal,rigid.as_ref(),slot)
     }
 
     fn check_unassigned_body_column_in_context(&self,body:[f64;3],r:[[f64;3];3],polygon:&PolygonQuery,
-        prism:&PrismQuery,x:i32,y:i32,sample:QuerySample<'_>,slot:&mut Option<BodyRejection>)->Result<(),SurfaceError> {
+        prism:&PrismQuery,x:i32,y:i32,sample:QuerySample<'_>,rigid:Option<&contact::RigidBodyQuery>,slot:&mut Option<BodyRejection>)->Result<(),SurfaceError> {
         let size=f64::from(self.config().voxel_size);
         if let Some(observations)=&self.observations {
             let fine=f64::from(observations.size_m);
@@ -1641,9 +1738,10 @@ impl SurfaceSnapshot {
                     let column=selected.as_ref().and_then(|rows|rows.iter().find(|row|row.xy==[ix,iy]));
                     for &z in levels {
                         let key=[ix,iy,z];
-                        if column.is_some_and(|column|column.permits_contact(z))
+                        if (column.is_some_and(|column|column.permits_contact(z))
+                            && finite_member_contact(rigid,key.map(|v|f64::from(v)*fine),key.map(|v|(f64::from(v)+1.0)*fine))?)
                             || !observations.get(key).is_some() {continue;}
-                        if prism.intersects(key.map(|v|f64::from(v)*fine),key.map(|v|(f64::from(v)+1.0)*fine)) {
+                        if actual_volume_intersects(prism,rigid,key.map(|v|f64::from(v)*fine),key.map(|v|(f64::from(v)+1.0)*fine))? {
                             return Err(reject(slot,BodyRejection::Occupancy{cell:key,source:OccupancySource::Fine,
                                 z_bounds:[f64::from(z)*fine,(f64::from(z)+1.0)*fine],ground_height:column.and_then(|c|c.height)}));
                         }
@@ -1655,8 +1753,8 @@ impl SurfaceSnapshot {
                 if observations.is_complete_geometry_source() && covered.contains(&z) {continue;}
                 let bounds=self.data.height_bounds.get(&(x,y,z)).map_or(
                     [f64::from(z)*size,(f64::from(z)+1.0)*size],|b|b.map(f64::from));
-                if prism.intersects([f64::from(x)*size,f64::from(y)*size,bounds[0]],
-                    [(f64::from(x)+1.0)*size,(f64::from(y)+1.0)*size,bounds[1]]) {
+                if actual_volume_intersects(prism,rigid,[f64::from(x)*size,f64::from(y)*size,bounds[0]],
+                    [(f64::from(x)+1.0)*size,(f64::from(y)+1.0)*size,bounds[1]])? {
                     return Err(reject(slot,BodyRejection::Occupancy{cell:[x,y,z],source:OccupancySource::CoarseFallback,
                         z_bounds:bounds,ground_height:None}));
                 }
@@ -1675,9 +1773,11 @@ impl SurfaceSnapshot {
                     [f64::from(z)*size,(f64::from(z)+1.0)*size],|b|b.map(f64::from));
                 if ground.is_some_and(|height|bounds[1]<=height+1e-6 && (sample.is_legacy()
                     || height_rejection(body[2]+model.z_bounds_m[0]/r[2][2],body[2]-model.body_to_support_z_m/r[2][2],
-                        body[2],model.max_step_up_m.max(model.max_step_down_m)+uncertainty,height,uncertainty).is_none())) {continue;}
-                if prism.intersects([f64::from(x)*size,f64::from(y)*size,bounds[0]],
-                    [(f64::from(x)+1.0)*size,(f64::from(y)+1.0)*size,bounds[1]]) {
+                        body[2],model.max_step_up_m.max(model.max_step_down_m)+uncertainty,height,uncertainty).is_none()))
+                    && finite_member_contact(rigid,[f64::from(x)*size,f64::from(y)*size,bounds[0]],
+                        [(f64::from(x)+1.0)*size,(f64::from(y)+1.0)*size,bounds[1]])? {continue;}
+                if actual_volume_intersects(prism,rigid,[f64::from(x)*size,f64::from(y)*size,bounds[0]],
+                    [(f64::from(x)+1.0)*size,(f64::from(y)+1.0)*size,bounds[1]])? {
                     return Err(reject(slot,BodyRejection::Occupancy{cell:[x,y,z],source:OccupancySource::CoarseFallback,
                         z_bounds:bounds,ground_height:None}));
                 }
@@ -1691,11 +1791,12 @@ impl SurfaceSnapshot {
     fn check_fine_column_fringe(&self,body:[f64;3],r:[[f64;3];3],polygon:&PolygonQuery,prism:&PrismQuery,
         patch:&AHashMap<(i32,i32),VoxelKey>,min:[f64;3],max:[f64;3],bounds:([i32;2],[i32;2]),slot:&mut Option<BodyRejection>)
         ->Result<(),SurfaceError> {
-        self.check_fine_column_fringe_in_context(body,r,polygon,prism,patch,min,max,bounds,QuerySample::LegacyNominal,slot)
+        let rigid=self.fixed_body_query((body,quaternion_from_columns(r)))?;
+        self.check_fine_column_fringe_in_context(body,r,polygon,prism,patch,min,max,bounds,QuerySample::LegacyNominal,rigid.as_ref(),slot)
     }
 
     fn check_fine_column_fringe_in_context(&self,body:[f64;3],r:[[f64;3];3],polygon:&PolygonQuery,prism:&PrismQuery,
-        patch:&AHashMap<(i32,i32),VoxelKey>,min:[f64;3],max:[f64;3],bounds:([i32;2],[i32;2]),sample:QuerySample<'_>,slot:&mut Option<BodyRejection>)
+        patch:&AHashMap<(i32,i32),VoxelKey>,min:[f64;3],max:[f64;3],bounds:([i32;2],[i32;2]),sample:QuerySample<'_>,rigid:Option<&contact::RigidBodyQuery>,slot:&mut Option<BodyRejection>)
         ->Result<(),SurfaceError> {
         let Some(observations)=self.observations.as_ref() else {return Ok(());};
         let model=self.body_envelope().ok_or(SurfaceError::InvalidPose)?;
@@ -1739,9 +1840,10 @@ impl SurfaceSnapshot {
                     let key=[ix,iy,iz];
                     let contact=if selected_rows.is_some() {column.is_some_and(|c|c.permits_contact(iz))}
                         else {ground.is_some_and(|height|f64::from(iz+1)*fine<=height+1e-6)};
-                    if contact
+                    if (contact && finite_member_contact(rigid,key.map(|v|f64::from(v)*fine),
+                        key.map(|v|(f64::from(v)+1.0)*fine))?)
                         || !observations.get(key).is_some() {continue;}
-                    if prism.intersects(key.map(|v|f64::from(v)*fine),key.map(|v|f64::from(v+1)*fine)) {
+                    if actual_volume_intersects(prism,rigid,key.map(|v|f64::from(v)*fine),key.map(|v|f64::from(v+1)*fine))? {
                         return Err(reject(slot,BodyRejection::Occupancy{cell:key,source:OccupancySource::FineFringe,
                             z_bounds:[f64::from(iz)*fine,f64::from(iz+1)*fine],ground_height:ground}));
                     }
@@ -1784,6 +1886,11 @@ impl SurfaceSnapshot {
     /// Preserve the actual rejected projected pose without replaying its geometry.
     pub fn body_pose_after_motion_with_witness(&self,from:([f64;3],[f64;4]),xy:[f64;2],yaw:f64,
         slot:&mut Option<BodyFailureWitness>)->Result<([f64;3],[f64;4]),SurfaceError> {
+        if self.ground_evidence==GroundEvidence::MeasuredSurface
+            && self.observations.as_ref().is_some_and(|o|o.has_measured_ground_layers()) {
+            let state=self.start_owned_ground_state(from)?;
+            return self.project_owned_ground_motion(from,&state,xy,yaw,slot).map(|p|p.pose());
+        }
         self.body_pose_after_motion_in_context(from,xy,yaw,QuerySegment::LEGACY,slot)
     }
 
@@ -1926,18 +2033,20 @@ impl SurfaceSnapshot {
             return Err(SurfaceError::InvalidPose);
         }
         let model = self.body_envelope().ok_or(SurfaceError::InvalidPose)?;
-        let projection=self.sample_segment_support(previous_support,[xy[0],xy[1],previous_support[2]],1.0)?.support_xyz;
-        if let Some((height,q))=self.measured_contact_frame(xy,projection[2],yaw) {
-            let r=rotation(q)?;
+        let query=self.direct_ground_query(xy,previous_support[2]);
+        if query.state==GroundQueryState::Observed {
+            let normal=query.normal.unwrap_or([0.0,0.0,1.0]);
+            let forward=normalize([yaw.cos(),yaw.sin(),-(normal[0]*yaw.cos()+normal[1]*yaw.sin())/normal[2]]);
+            let q=quaternion_from_columns([forward,cross(normal,forward),normal]);
             let offset=rotated_support_offset(q,model.body_to_support_z_m)?;
-            // Keep the existing connectivity/boundary proof, but never replace
-            // the measured plane with the legacy quantized support top afterward.
-            self.sample_segment_support(previous_support,
-                [xy[0]+offset[0],xy[1]+offset[1],projection[2]],1.0)?;
-            let body=[xy[0],xy[1],height+model.body_to_support_z_m/r[2][2]];
+            let support_xy=[xy[0]+offset[0],xy[1]+offset[1]];
+            let height=self.direct_ground_query(support_xy,query.height.unwrap_or(previous_support[2]))
+                .height.unwrap_or(previous_support[2]);
+            let body=[xy[0],xy[1],height-offset[2]];
             self.validate_body_pose(body,q)?;
             return Ok((body,q));
         }
+        let projection=self.sample_segment_support(previous_support,[xy[0],xy[1],previous_support[2]],1.0)?.support_xyz;
         // 姿态在机体水平投影处估计一次，避免支撑偏移反复改变体素和拟合邻域。
         let q=self.body_orientation_at(projection,yaw)?;
         let offset=rotated_support_offset(q,model.body_to_support_z_m)?;
@@ -2345,14 +2454,15 @@ impl SurfaceSnapshot {
         if matches!(context.at(0.0),QuerySample::Unanchored) {return Ok(());}
         let model=self.body_envelope().ok_or(SurfaceError::InvalidPose)?;
         let size=f64::from(self.observations.as_ref().map_or(self.config().voxel_size,|o|o.size_m));
-        let mut fractions=translation::reference_grid_fractions([from.0[0],from.0[1],0.0],
-            [to.0[0],to.0[1],0.0],size)?;
+        let mut fractions=self.body_support_grid_fractions(from,to,size)?;
         context.append_changes(&mut fractions);fractions.sort_by(f64::total_cmp);fractions.dedup();
         let samples=fractions.into_iter().map(|t| {
-            let xy=[from.0[0]+(to.0[0]-from.0[0])*t,from.0[1]+(to.0[1]-from.0[1])*t];
+            let pose=interpolated_body_pose(from,to,t);
+            let support=self.support_position_from_body(pose.0,pose.1,model.body_to_support_z_m)?;
+            let xy=[support[0],support[1]];
             let sample=context.at(t).ground().expect("bound Ground segment");
-            [xy[0],xy[1],sample.height_at(xy)]
-        });
+            Ok([xy[0],xy[1],sample.height_at(xy)])
+        }).collect::<Result<Vec<_>,SurfaceError>>()?;
         self.validate_known_reference_samples_in_context(samples,size,model.max_step_up_m,model.max_step_down_m,
             model.support_uncertainty_m,true)
     }
@@ -2528,11 +2638,15 @@ impl SurfaceSnapshot {
             check_observations((p, q))?;
         }
         // 按真实占据接触事件补查，并保持调用方的实际位置与姿态插值。
-        self.validate_body_contact_events_in_context(from,to,context,|t| {
+        self.validate_body_contact_events_in_context(from,to,context,|t,collision| {
             let p = std::array::from_fn(|j| if from.0[j]==to.0[j] {from.0[j]} else {
                 from.0[j]*(1.0-t)+to.0[j]*t
             });
             let q=norm(std::array::from_fn(|j|qa[j]*(1.0-t)+qb[j]*t));
+            if let Some(rejection)=collision {
+                *slot=Some(BodyFailureWitness{pose:(p,q),rejection});
+                return Err(rejection.error());
+            }
             self.validate_body_pose_in_context(p,q,context.at(t),slot)?;
             check_observations((p,q))
         })
@@ -2586,6 +2700,9 @@ impl SurfaceSnapshot {
     fn read_fine_contact_bands(&self,x:i32,y:i32)->Vec<FineContactBand> {
         let mut bands=Vec::new();
         if let Some(observations)=&self.observations {
+            // Classification withdrew the ground claim, not the occupancy.
+            // Do not recreate known terrain/contact from its raw occupied top.
+            if observations.classified_empty_ground([x,y]) {return bands;}
             let size=f64::from(observations.size_m);
             let mut run:Option<(i32,i32)>=None;
             for &z in observations.column_levels(x,y).unwrap_or(&[]) {
@@ -2607,17 +2724,18 @@ impl SurfaceSnapshot {
         if self.ground_evidence==GroundEvidence::MeasuredSurface {
             if let Some(observations)=&self.observations {
                 let quantum=f64::from(observations.size_m);
-                let records:Vec<_>=observations.ground_layers([x,y]).collect();
+                let records:Vec<_>=observations.ground_records([x,y]).collect();
                 if !records.is_empty() {
                     // A measured physical layer replaces only its associated
                     // compatibility band in the contact response, never occupancy.
-                    bands.retain(|band|!records.iter().any(|record|record.members.iter()
-                        .any(|z|band.run[0]<=*z && *z<=band.run[1])));
+                    bands.retain(|band|!records.iter().any(|record|record.members()
+                        .any(|z|band.run[0]<=z && z<=band.run[1])));
                     let xy=[(f64::from(x)+0.5)*quantum,(f64::from(y)+0.5)*quantum];
                     for record in records {
                         if let Some(z)=record.height_at(xy) {
                             bands.push(FineContactBand {fit:[z,z],
-                                run:[record.members[0],*record.members.last().expect("validated nonempty layer")]});
+                                run:[record.members().next().expect("validated nonempty record"),
+                                    record.members().last().expect("validated nonempty record")]});
                         }
                     }
                     bands.sort_by(|a,b|a.fit[1].total_cmp(&b.fit[1]));
@@ -2925,10 +3043,11 @@ impl SurfaceSnapshot {
         let fine=f64::from(observations.size_m);
         let column=xy.map(|v|(v/fine).floor() as i32);
         if self.ground_evidence==GroundEvidence::MeasuredSurface {
-            if let Some(layer)=observations.ground_layers(column).min_by(|a,b|
+            if let Some(layer)=observations.ground_records(column).min_by(|a,b|
                 (a.height_at(xy).unwrap_or(f64::INFINITY)-reference).abs()
                     .total_cmp(&(b.height_at(xy).unwrap_or(f64::INFINITY)-reference).abs())) {
-                return layer.height_at(xy).map(|height|(height,Some(layer)));
+                return layer.height_at(xy).map(|height|(height,match layer {
+                    SourceGroundRecord::LegacyPlane(record)=>Some(record),SourceGroundRecord::HeightfieldV1(_)=>None}));
             }
         }
         // Planar controllers and planning owners share immutable tomograms.
@@ -2961,19 +3080,18 @@ impl SurfaceSnapshot {
         if let Some(observations)=&self.observations {
             let fine=f64::from(observations.size_m);let column=xy.map(|v|(v/fine).floor() as i32);
             if self.ground_evidence==GroundEvidence::MeasuredSurface {
-                if let Some(layer)=observations.ground_layers(column).min_by(|a,b|
+                if let Some(layer)=observations.ground_records(column).min_by(|a,b|
                     (a.height_at(xy).unwrap_or(f64::INFINITY)-reference).abs()
                         .total_cmp(&(b.height_at(xy).unwrap_or(f64::INFINITY)-reference).abs())) {
-                    let scatter=layer.statistics.moments().sample_scatter().map_or(0.0,|s| {
-                        let n=layer.normal;
-                        (n[0]*n[0]*s[0]+2.0*n[0]*n[1]*s[1]+2.0*n[0]*n[2]*s[2]
-                            +n[1]*n[1]*s[3]+2.0*n[1]*n[2]*s[4]+n[2]*n[2]*s[5]).max(0.0).sqrt()
-                    });
-                    if let Some(native)=native {*native=Some(NativeGroundSource::ObservedFine{anchor:layer.anchor});}
-                    return GroundQuery {state:GroundQueryState::Observed,height:layer.height_at(xy),normal:Some(layer.normal),
-                        sources:vec![layer.anchor],radius_m:0.0,max_residual_m:Some(scatter)};
+                    if let Some(native)=native {*native=Some(match layer.key() {
+                        GroundKey::LegacyPlane(anchor)=>NativeGroundSource::ObservedFine{anchor},
+                        key@GroundKey::HeightfieldV1(_)=>NativeGroundSource::HeightfieldFine{key},
+                    });}
+                    return GroundQuery {state:GroundQueryState::Observed,height:layer.height_at(xy),normal:layer.direction(),
+                        sources:vec![layer.key().anchor()],radius_m:0.0,max_residual_m:layer.scatter()};
                 }
             }
+            if observations.classified_empty_ground(column) {return GroundQuery::unknown();}
             let bands=self.fine_contact_bands(column[0],column[1]);
             if let Some(band)=bands.iter().min_by(|a,b|
                 (a.fit[0]+(a.fit[1]-a.fit[0])*0.5-reference).abs()
@@ -3104,10 +3222,10 @@ impl SurfaceSnapshot {
         let observations=self.observations.as_ref()?;
         let size=f64::from(observations.size_m);
         let column=xy.map(|v|(v/size).floor() as i32);
-        let layer=observations.ground_layers(column).min_by(|a,b|
+        let layer=observations.ground_records(column).min_by(|a,b|
             (a.height_at(xy).unwrap_or(f64::INFINITY)-reference).abs()
                 .total_cmp(&(b.height_at(xy).unwrap_or(f64::INFINITY)-reference).abs()))?;
-        let normal=layer.normal;
+        let normal=layer.direction()?;
         let forward=normalize([yaw.cos(),yaw.sin(),
             -(normal[0]*yaw.cos()+normal[1]*yaw.sin())/normal[2]]);
         let left=cross(normal,forward);
@@ -3135,7 +3253,14 @@ impl SurfaceSnapshot {
         let model=self.body_envelope()
             .ok_or_else(||SurfaceError::InvalidConfig("body envelope is unavailable".into()))?;
         let support=[centre.support_xyz[0],centre.support_xyz[1],height];
-        if let Some(frame)=self.measured_contact_frame([support[0],support[1]],height,yaw) {return Ok(frame);}
+        let query=self.direct_ground_query([support[0],support[1]],height);
+        if query.state==GroundQueryState::Observed {
+            if let Some(height)=query.height {
+                let normal=query.normal.unwrap_or([0.0,0.0,1.0]);
+                let forward=normalize([yaw.cos(),yaw.sin(),-(normal[0]*yaw.cos()+normal[1]*yaw.sin())/normal[2]]);
+                return Ok((height,quaternion_from_columns([forward,cross(normal,forward),normal])));
+            }
+        }
         let key=(centre.cell,support.map(f64::to_bits),mode);
         #[cfg(feature = "body-query-profile")]
         let cache_profile = query_profile::guard(QueryStage::PlaneCacheLookup);
@@ -4769,6 +4894,7 @@ mod tests {
 
     fn model() -> SurfaceBodyEnvelope {
         SurfaceBodyEnvelope {
+            fixed_collision: None,
             footprint_xy_m: vec![[-0.55, -0.14], [0.55, -0.14], [0.55, 0.14], [-0.55, 0.14]],
             z_bounds_m: [-0.1, 0.25],
             body_to_support_z_m: 0.4,
@@ -6158,7 +6284,7 @@ mod tests {
         for x in [0,1] {for z in 0..12 {points.push(((x as f32+0.5)*0.05,-0.075,(z as f32+0.5)*0.05));}}
         for x in [0,1] {points.push(((x as f32+0.5)*0.05,-0.025,0.625));}
         let mut cfg=scene(&[],false).config().clone();cfg.wall_clearance_m=0.0;cfg.robot_height=0.1;
-        let envelope=SurfaceBodyEnvelope {footprint_xy_m:vec![[-0.15,-0.1],[0.15,-0.1],[0.15,0.1],[-0.15,0.1]],
+        let envelope=SurfaceBodyEnvelope {fixed_collision:None,footprint_xy_m:vec![[-0.15,-0.1],[0.15,-0.1],[0.15,0.1],[-0.15,0.1]],
             z_bounds_m:[-0.4,0.1],body_to_support_z_m:0.4,max_step_up_m:0.15,max_step_down_m:0.15,
             max_cross_slope_deg:18.0,support_uncertainty_m:0.0};
         let base=SurfaceSnapshot::from_points(&points,cfg,0.05).unwrap().with_body_envelope(envelope).unwrap();
@@ -6246,7 +6372,7 @@ mod tests {
             [0.025,0.075].map(|z|((x as f32+0.5)*0.05,(y as f32+0.5)*0.05,z)))).collect();
         points.push((0.025,-0.025,0.175));
         let mut cfg=scene(&[],false).config().clone();cfg.wall_clearance_m=0.0;
-        let envelope=SurfaceBodyEnvelope {footprint_xy_m:vec![[-0.2,-0.1],[0.2,-0.1],[0.2,0.1],[-0.2,0.1]],
+        let envelope=SurfaceBodyEnvelope {fixed_collision:None,footprint_xy_m:vec![[-0.2,-0.1],[0.2,-0.1],[0.2,0.1],[-0.2,0.1]],
             z_bounds_m:[-0.4,0.1],body_to_support_z_m:0.4,max_step_up_m:0.15,max_step_down_m:0.15,
             max_cross_slope_deg:18.0,support_uncertainty_m:0.0};
         let map=SurfaceSnapshot::from_points(&points,cfg,0.05).unwrap().with_body_envelope(envelope).unwrap();
@@ -6918,6 +7044,7 @@ fn ground_context_rotation_and_contact_events_keep_actual_witness() {
             step_threshold_m:0.15, min_step_tread_depth_m:0.2,
             step_penalty_weight:2.0, goal_tolerance:0.1, viz_publish_hz:0.0 };
         let envelope = SurfaceBodyEnvelope {
+            fixed_collision: None,
             footprint_xy_m:vec![[-0.3,-0.15],[0.3,-0.15],[0.3,0.15],[-0.3,0.15]],
             z_bounds_m:[-0.448,0.057], body_to_support_z_m:0.4,
             max_step_up_m:0.15, max_step_down_m:0.15,
@@ -7294,6 +7421,7 @@ fn reference_prism_intersects_voxel(
     #[test]
     fn precomputed_projection_matches_vertex_reference_for_tilted_convex_bodies() {
         let model=SurfaceBodyEnvelope {
+            fixed_collision: None,
             footprint_xy_m:(0..24).map(|i| {let a=f64::from(i)*std::f64::consts::TAU/24.0;[0.3*a.cos(),0.16*a.sin()]}).collect(),
             z_bounds_m:[-0.4,0.06],body_to_support_z_m:0.4,max_step_up_m:0.15,max_step_down_m:0.15,
             max_cross_slope_deg:18.0,support_uncertainty_m:0.0,
@@ -7320,10 +7448,42 @@ fn reference_prism_intersects_voxel(
 #[derive(Clone,Copy,PartialEq,Eq,Hash)]
 enum ContactPlaneMode { StaticInterval, FixedMotionReference }
 
+// Exact dependencies of height_at, without copying the segment or member bins.
+// Unknown legacy bindings can still carry a plane, so retain their normal too.
+#[derive(Clone,Copy,PartialEq,Eq,Hash)]
+struct GroundHeightKey {origin:[u64;3],normal:Option<[u64;3]>}
+impl GroundHeightKey {
+    fn new(sample:&super::body_query::GroundSample)->Self {
+        let mut origin=sample.reference_origin.map(f64::to_bits);
+        if sample.reference_normal.is_none() {origin[0]=0;origin[1]=0;}
+        Self {origin,normal:sample.reference_normal.map(|n|n.map(f64::to_bits))}
+    }
+}
+#[derive(Clone,PartialEq,Eq,Hash)]
+enum BoundPoseGroundKey {
+    Unanchored,
+    Ground {height:GroundHeightKey,state:u8,source:Option<NativeGroundSource>},
+}
+impl BoundPoseGroundKey {
+    fn new(sample:QuerySample<'_>)->Option<Self> {
+        match sample {
+            QuerySample::Unanchored=>Some(Self::Unanchored),
+            QuerySample::Ground(sample) if sample.reference_sources.len()<=1=>Some(Self::Ground {
+                height:GroundHeightKey::new(sample),state:sample.query_state as u8,
+                source:sample.reference_sources.first().cloned()}),
+            // Old private multi-source bindings remain correct without copying
+            // their source collection into every cache key.
+            _=>None,
+        }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct BodyQueryCache {
+    fixed_primitives: Option<Arc<[contact::RigidPrimitive]>>,
     pub(super) supports: AHashMap<[u64;8],Result<SurfaceLocation,SurfaceError>>,
     measured_ground_patches: GroundPatchCache,
+    bound_ground_patches: AHashMap<(VoxelKey,u64,[u64;2],GroundHeightKey),Arc<AHashMap<(i32,i32),VoxelKey>>>,
     lower_bounds: AHashMap<VoxelKey,f64>,
     planes: AHashMap<(VoxelKey,[u64;3],ContactPlaneMode),(f64,f64,f64)>,
     contact_samples: AHashMap<VoxelKey,Arc<Vec<([f64;3],f64)>>>,
@@ -7331,6 +7491,7 @@ pub(super) struct BodyQueryCache {
     complete_columns: AHashMap<(i32,i32),bool>,
     ground_estimates: AHashMap<([i32;2],u64),Option<GroundEstimate>>,
     poses: AHashMap<[u64;7],CachedBodyResult<(),BodyRejection>>,
+    bound_poses: AHashMap<([u64;7],BoundPoseGroundKey),CachedBodyResult<(),BodyRejection>>,
     projections: AHashMap<[u64;6],Result<([f64;3],[f64;4]),SurfaceError>>,
     motions: AHashMap<[u64;14],CachedBodyResult<(),BodyFailureWitness>>,
 }
@@ -7346,6 +7507,10 @@ mod contact_domain_tests;
 #[cfg(test)]
 #[path = "body_terrain_contract_tests.rs"]
 mod terrain_contract_tests;
+
+#[cfg(test)]
+#[path = "body_native_ground_tests.rs"]
+mod native_ground_tests;
 
 #[cfg(test)]
 mod witness_cache_sizes {
@@ -7366,3 +7531,7 @@ fn body_witness_cache_value_sizes() {
 #[cfg(test)]
 #[path = "body_scalar_response_tests.rs"]
 mod scalar_response_tests;
+
+#[cfg(test)]
+#[path = "body_actual_ground_tests.rs"]
+mod actual_ground_tests;

@@ -10,7 +10,7 @@ fn surface(xy: [i32; 2], zs: &[i32]) -> HeightfieldSurface {
     HeightfieldSurface { column: HeightfieldColumn::from_counts(xy, Q,
         zs.iter().map(|&z| (z, [1,0,0,0,0,0,0,0])).collect()).unwrap().unwrap(), samples: vec![] }
 }
-fn column(s: HeightfieldSurface) -> ColumnGroundRecords { ColumnGroundRecords { legacy: vec![], heightfields: vec![s] } }
+fn column(s: HeightfieldSurface) -> ColumnGroundRecords { ColumnGroundRecords { classified_empty: false, legacy: vec![], heightfields: vec![s] } }
 fn install(w: &mut Writer, value: &ColumnGroundRecords, stamp: u64) {
     for s in &value.heightfields {
         let xy = s.column.xy();
@@ -227,4 +227,357 @@ fn heightfield_full_horizontal_block_and_existing_byte_budget_roundtrip() {
     }}
     assert!(encode_ground_block(&block,&GroundRecords::Versioned(Arc::new(oversized))).unwrap_err().contains("budget"));
     eprintln!("H2 full_columns=1024 encoded_block_bytes={} byte_budget={MAX_BLOCK_BYTES}",bytes.len());
+}
+
+// Claim-only changes retain historical diagnostics backed by real occupancy.
+struct H3DetachedFixture {
+    writer: Writer,
+    before: Arc<Manifest>,
+    after: Arc<Manifest>,
+    original: LayerObservation,
+    detached: ColumnGroundRecords,
+}
+
+fn h3_detached_fixture() -> H3DetachedFixture {
+    let mut writer = writer();
+    // The precise counterexample: two real occupied members in the same block.
+    writer.observe([[0, 0, 0]], 10).unwrap();
+    writer.observe([[0, 0, 1]], 20).unwrap();
+    let original = LayerObservation {
+        members: vec![0, 1024],
+        plane_origin: [0.025, 0.025, 0.025],
+        normal: [0.0, 0.0, 1.0],
+        samples: vec![LayerSample {
+            source: Arc::new(LayerSource::Lidar {
+                backend: 2, runtime_generation: 7, sensor_frame_id: "lidar".into(),
+            }),
+            point: [0.025, 0.025, 0.075],
+            source_sequence: 1, source_timestamp_ns: 20, point_index: 4,
+        }],
+    };
+    writer.replace_layer_observations([0, 0, 0], [(0, original.clone())].into()).unwrap();
+    let before = writer.seal(domain(), 1, 20).unwrap().root;
+    let mut retained = original.clone();
+    retained.members = vec![0]; // Withdraw only the ground claim, not occupancy.
+    let detached = ColumnGroundRecords {
+        classified_empty: false, legacy: vec![([0, 0, 0], retained)], heightfields: vec![],
+    };
+    writer.replace_ground_column([0, 0], &detached).unwrap();
+    let after = writer.seal(domain(), 2, 20).unwrap().root;
+    H3DetachedFixture { writer, before, after, original, detached }
+}
+
+// Malformed-fixture builders only. Never used to manufacture the green archive.
+// They deliberately bypass ground validation while retaining valid occupancy,
+// JSON serialization, header lengths, and root envelopes.
+fn h3_mutation_block(block: &Block, records: &BTreeMap<u16, GroundRecord>) -> Vec<u8> {
+    let json = serde_json::to_vec(&records.iter().collect::<Vec<_>>()).unwrap();
+    let mut bytes = encode_block(block).unwrap();
+    bytes[..8].copy_from_slice(b"NUWAXBL4");
+    bytes[12..16].copy_from_slice(&(json.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&json);
+    bytes
+}
+
+fn h3_mutation_archive(root: &Manifest, block: &[u8]) -> Vec<u8> {
+    assert_eq!(root.version, 5);
+    assert_eq!(root.blocks.len(), 1);
+    let json = root.encode().unwrap();
+    let mut bytes = b"NUWAXAR5".to_vec();
+    bytes.extend_from_slice(&(json.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(&json);
+    bytes.extend_from_slice(&1_u64.to_le_bytes());
+    bytes.extend_from_slice(&(block.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(block);
+    bytes
+}
+
+#[test]
+fn h3_legacy_claim_withdrawal_retains_original_sample_across_storage() {
+    let mut f = h3_detached_fixture();
+    assert_eq!(f.before.version, 4);
+    assert_eq!(f.after.version, 5);
+    assert_eq!(f.after.blocks.len(), 1);
+    assert_eq!(f.after.points(), 2);
+    assert_eq!(f.after.geometry_revision, 2);
+    assert_eq!(f.writer.ground_column([0, 0]).unwrap(), f.detached);
+    let old_bytes = f.writer.repository().read_object(f.before.blocks[0].object, MAX_BLOCK_BYTES).unwrap();
+    let new_bytes = f.writer.repository().read_object(f.after.blocks[0].object, MAX_BLOCK_BYTES).unwrap();
+    assert!(old_bytes.starts_with(b"NUWAXBL3"));
+    assert!(new_bytes.starts_with(b"NUWAXBL4"), "pure Legacy must not compact into invalid BL3");
+    let (old_block, _) = decode_block_parts(&old_bytes).unwrap();
+    let (block, records) = decode_block_parts(&new_bytes).unwrap();
+    assert_eq!(block, old_block); // Includes original observed_ns and hit counts.
+    assert_eq!(block, BTreeMap::from([
+        (0, Evidence { observed_ns: 10, hits: 1 }),
+        (1024, Evidence { observed_ns: 20, hits: 1 }),
+    ]));
+    assert!(matches!(&records, GroundRecords::Versioned(_)));
+    assert!(!records.has_heightfield(), "an unrelated HF must not hide broken compact");
+    assert_eq!(records.iter().count(), 1);
+    let GroundRecordRef::LegacyPlane(retained) = records.get(0).unwrap() else { panic!("Legacy fixture"); };
+    assert_eq!(retained, &f.detached.legacy[0].1);
+    assert_eq!(retained.samples, f.original.samples);
+    assert_eq!(retained.plane_origin, f.original.plane_origin);
+    assert_eq!(retained.normal, f.original.normal);
+    assert_eq!(retained.members, vec![0]);
+
+    let mut receiver = Receiver::new(Repository::temporary().unwrap());
+    let pinned_before = receive(&mut receiver, &f.before, f.writer.repository()).unwrap();
+    let pinned_after = receive(&mut receiver, &f.after, f.writer.repository()).unwrap();
+    assert_eq!(*receiver.block(&pinned_after.blocks[0]).unwrap(), block);
+    assert_eq!(assembled(&mut receiver, &pinned_after, [0, 0]), f.detached);
+    assert_eq!(assembled(&mut receiver, &pinned_before, [0, 0]).legacy[0].1, f.original);
+    assert_eq!(receive(&mut receiver, &f.after, f.writer.repository()).unwrap(), pinned_after);
+
+    // Only these archives are positive qualification artifacts: real Writer,
+    // real seal, real repository bytes, and the production archive_file path.
+    let old_archive = archive_bytes(&f.before, f.writer.repository());
+    let archive = archive_bytes(&f.after, f.writer.repository());
+    artifact("h3-detached-before.ar4", &old_archive);
+    artifact("h3-detached-legacy.ar5", &archive);
+    let mut archive_reader = ArchiveReader::open(Cursor::new(archive.clone())).unwrap();
+    assert_eq!(archive_reader.block_by_key([0, 0, 0]).unwrap(), new_bytes);
+    assert_eq!(archive_reader.block(&f.after.blocks[0]).unwrap(), new_bytes);
+    assert_eq!(archive_reader.region([0, 0, 0], [0, 0, 1], 2).unwrap(), vec![
+        ([0, 0, 0], Evidence { observed_ns: 10, hits: 1 }),
+        ([0, 0, 1], Evidence { observed_ns: 20, hits: 1 }),
+    ]);
+    let repository = Repository::temporary().unwrap();
+    let restored = ArchiveReader::open(Cursor::new(archive)).unwrap().import(&repository).unwrap();
+    assert_eq!(restored, ArchivedRoot::Current((*f.after).clone()));
+    let mut copy = Writer::new(repository.clone(), Q, BUDGET).unwrap();
+    copy.restore_archived(&restored).unwrap();
+    assert_eq!(copy.ground_column([0, 0]).unwrap(), f.detached);
+    let resealed = copy.seal(domain(), 3, 20).unwrap().root;
+    assert_eq!(resealed.version, 5);
+    assert_eq!(resealed.blocks, f.after.blocks);
+    assert_eq!(repository.read_object(resealed.blocks[0].object, MAX_BLOCK_BYTES).unwrap(), new_bytes);
+
+    // The same detached record is still outside the old BL3 contract. Exercise
+    // both old encoding and old decoding, rather than merely changing a root tag.
+    let legacy: LayerObservations = [(0, f.detached.legacy[0].1.clone())].into();
+    assert_eq!(encode_layer_block(&block, &legacy).unwrap_err(), "layer observation exceeds occupancy evidence");
+    let old_start = 16 + block.len() * 12;
+    let mut old_json: serde_json::Value = serde_json::from_slice(&old_bytes[old_start..]).unwrap();
+    old_json[0][1]["members"] = serde_json::json!([0]); // The sole BL3 mutation.
+    let json = serde_json::to_vec(&old_json).unwrap();
+    let mut bad_bl3 = old_bytes[..old_start].to_vec();
+    bad_bl3[12..16].copy_from_slice(&(json.len() as u32).to_le_bytes());
+    bad_bl3.extend_from_slice(&json);
+    assert_eq!(decode_layer_observations(&bad_bl3).unwrap_err(), "layer observation exceeds occupancy evidence");
+
+    // Subsequent real occupancy deletion must remove its only diagnostic sample.
+    // The old pinned root still owns the unchanged detached historical record.
+    f.writer.remove([[0, 0, 1]]).unwrap();
+    assert!(f.writer.ground_column([0, 0]).unwrap().legacy.is_empty());
+    let deleted = f.writer.seal(domain(), 3, 20).unwrap().root;
+    assert_eq!(deleted.points(), 1);
+    let live = receive(&mut receiver, &deleted, f.writer.repository()).unwrap();
+    assert_eq!(*receiver.block(&live.blocks[0]).unwrap(), [(0, block[&0])].into());
+    assert_eq!(assembled(&mut receiver, &pinned_after, [0, 0]), f.detached);
+    eprintln!("H3_DETACHED green=writer_seal_receiver_archive_read_import_restore unchanged_sample=20 occupancy=0:10,1024:20 legacy_bl3_rejected=true");
+}
+
+#[test]
+fn h3_detached_legacy_samples_reject_forged_evidence_at_admission() {
+    let f = h3_detached_fixture();
+    let original_bytes = f.writer.repository().read_object(f.after.blocks[0].object, MAX_BLOCK_BYTES).unwrap();
+    let (original_block, original_records) = decode_block_parts(&original_bytes).unwrap();
+    // All numbers below are fixed mutation controls, not calibration sweeps.
+    for case in ["future-sample", "occupied-wrong-voxel", "missing-voxel",
+                 "other-block", "f32-resolution", "invalid-source"] {
+        let mut block = original_block.clone();
+        let mut records = original_records.owned_versioned();
+        let GroundRecord::LegacyPlane(layer) = records.get_mut(&0).unwrap() else { panic!("Legacy fixture"); };
+        match case {
+            "future-sample" => layer.samples[0].source_timestamp_ns = 21,
+            "occupied-wrong-voxel" => {
+                // The sample stays at z1/stamp20; its actual voxel is only 19.
+                // An unrelated z2/stamp20 deliberately preserves block-max20.
+                block.get_mut(&1024).unwrap().observed_ns = 19;
+                block.insert(2048, Evidence { observed_ns: 20, hits: 1 });
+            }
+            "missing-voxel" => {
+                // Move only the occupancy evidence to a decoy z2. The sample
+                // stays at z1/stamp20 and member0/plane/source stay unchanged.
+                block.remove(&1024);
+                block.insert(2048, Evidence { observed_ns: 20, hits: 1 });
+            }
+            "other-block" => layer.samples[0].point[2] = f64::from(Q) * 33.5,
+            "f32-resolution" => layer.samples[0].point[2] = 0.05,
+            "invalid-source" => {
+                let LayerSource::Lidar { backend, .. } = Arc::make_mut(&mut layer.samples[0].source) else { panic!("typed fixture"); };
+                *backend = 0; // Explicit negative mutation of the original legal typed source.
+            }
+            _ => unreachable!(),
+        }
+        let candidate_column = ColumnGroundRecords { classified_empty: false, legacy: vec![([0, 0, 0], layer.clone())], heightfields: vec![] };
+        assert_eq!(candidate_column.legacy[0].1.members, vec![0]);
+        assert_eq!(candidate_column.legacy[0].1.plane_origin, f.original.plane_origin);
+        assert_eq!(candidate_column.legacy[0].1.normal, f.original.normal);
+        if case == "f32-resolution" {
+            assert_eq!((0.05_f64 * (1.0 / f64::from(Q))).floor(), 0.0);
+            assert_eq!((0.05_f64 * (1.0 / 0.05_f64)).floor(), 1.0);
+        }
+        let bytes = h3_mutation_block(&block, &records);
+        let intrinsic_ok = !matches!(case, "future-sample" | "invalid-source");
+        assert_eq!(decode_block_parts(&bytes).is_ok(), intrinsic_ok, "{case}: context-free boundary");
+        assert_eq!(encode_ground_block(&block, &GroundRecords::Versioned(Arc::new(records))).is_ok(),
+                   intrinsic_ok, "{case}: encoder boundary");
+
+        // Writer admission sees exactly the mutated real occupied Block. Its
+        // successful baseline has no ground records; no sample time is lowered
+        // or synthesized to obtain that baseline. Failure must not publish any.
+        let mut admission = writer();
+        for (&local, evidence) in &block {
+            admission.observe([global_key([0, 0, 0], local).unwrap()], evidence.observed_ns).unwrap();
+        }
+        let clean = admission.seal(domain(), 1, 20).unwrap().root;
+        assert!(admission.replace_ground_column([0, 0], &candidate_column).is_err(), "{case}: Writer preparation");
+        assert!(!admission.has_unpublished_changes(), "{case}: rejected preparation dirtied writer");
+        assert!(admission.ground_column([0, 0]).unwrap().legacy.is_empty());
+        let unchanged = admission.seal(domain(), 2, 20).unwrap().root;
+        assert_eq!(unchanged.version, 4);
+        assert_eq!(unchanged.blocks, clean.blocks);
+
+        let id: ObjectIdentity = ObjectId::random().unwrap().into();
+        let mut bad = (*f.after).clone();
+        bad.revision = 3;
+        bad.geometry_revision = 3;
+        // Keep a future-sample mutation within the root envelope so failure
+        // proves the block's occupancy bound, not an unrelated root-time check.
+        if case == "future-sample" { bad.source_timestamp_ns = 21; }
+        bad.blocks[0].object = id;
+        bad.blocks[0].points = block.len() as u32;
+        bad.blocks[0].block_revision = 3;
+        bad.blocks[0].geometry_revision = 3;
+        bad.validate().unwrap();
+        for route in ["included", "fetched", "preexisting"] {
+            let target = Repository::temporary().unwrap();
+            let mut receiver = Receiver::new(target.clone());
+            let accepted = receive(&mut receiver, &f.after, f.writer.repository()).unwrap();
+            if route == "preexisting" { target.put_object(id, &bytes).unwrap(); }
+            let included = if route == "included" { [(id, bytes.clone())].into() } else { BTreeMap::new() };
+            let mut fetches = 0;
+            let result = receiver.receive(&Transfer { root: bad.encode().unwrap(), included }, &domain(), |_, reference| {
+                assert_eq!(reference.object, id);
+                fetches += 1;
+                Ok(bytes.clone())
+            });
+            assert!(result.is_err(), "{case}: Receiver {route}");
+            assert_eq!(fetches, usize::from(route == "fetched"), "{case}: wrong Receiver route");
+            assert_eq!(receiver.current().unwrap(), accepted, "{case}: replaced current root");
+            assert_eq!(assembled(&mut receiver, &accepted, [0, 0]), f.detached);
+        }
+
+        let archive = h3_mutation_archive(&bad, &bytes);
+        artifact(&format!("h3-detached-{case}.ar5"), &archive);
+        // Each entry point gets a fresh reader. open() is intentionally lazy
+        // and is expected to accept the well-formed envelope before block read.
+        assert!(ArchiveReader::open(Cursor::new(archive.clone())).unwrap().block_by_key([0, 0, 0]).is_err(), "{case}: archive block_by_key");
+        assert!(ArchiveReader::open(Cursor::new(archive.clone())).unwrap().block(&bad.blocks[0]).is_err(), "{case}: archive block");
+        assert!(ArchiveReader::open(Cursor::new(archive.clone())).unwrap().region([0, 0, 0], [0, 0, 2], 3).is_err(), "{case}: archive region");
+        assert!(ArchiveReader::open(Cursor::new(archive)).unwrap().import(&Repository::temporary().unwrap()).is_err(), "{case}: archive import");
+        let target = Repository::temporary().unwrap();
+        target.put_object(id, &bytes).unwrap();
+        let mut restore = Writer::new(target, Q, BUDGET).unwrap();
+        assert!(restore.restore(&bad).is_err(), "{case}: Writer restore");
+        assert!(!restore.has_unpublished_changes());
+        assert_eq!(restore.block_count(), 0);
+        eprintln!("H3_DETACHED mutation={case} intrinsic_ok={intrinsic_ok} writer_receiver_archive_restore=REJECT");
+    }
+}
+
+#[test]
+fn classified_empty_column_roundtrips_moves_carrier_and_replaces_atomically() {
+    let xy = [0,0]; let empty = ColumnGroundRecords {classified_empty:true,legacy:vec![],heightfields:vec![]};
+    let mut w=writer(); w.observe([[0,0,0],[0,0,32],[0,0,64],[1,0,0]],20).unwrap();
+    let old=w.snapshot(domain(),1,20).unwrap();
+    w.replace_ground_column(xy,&empty).unwrap();
+    let marked=w.snapshot(domain(),2,20).unwrap();
+    assert!(marked.geometry_revision>old.geometry_revision);
+    let mut receiver=Receiver::new(Repository::temporary().unwrap());
+    receive(&mut receiver,&old,w.repository()).unwrap();
+    let pinned=receive(&mut receiver,&marked,w.repository()).unwrap();
+    assert_eq!(assembled(&mut receiver,&pinned,xy),empty);
+    assert!(!assembled(&mut receiver,&pinned,[1,0]).classified_empty);
+    assert_eq!(marked.points(),4);
+    let bytes=archive_bytes(&marked,w.repository());artifact("h3-classified-empty.ar5",&bytes);
+    let repo=Repository::temporary().unwrap();
+    let archived=ArchiveReader::open(Cursor::new(bytes)).unwrap().import(&repo).unwrap();
+    let mut copy=Writer::new(repo,Q,BUDGET).unwrap();copy.restore_archived(&archived).unwrap();
+    assert_eq!(copy.ground_column(xy).unwrap(),empty);
+    for (revision,z,next_z) in [(3,0,32),(4,32,64)] {
+        copy.remove([[0,0,z]]).unwrap();
+        let root=copy.snapshot(domain(),revision,20).unwrap();
+        let mut r=RegionReader::new(copy.repository().clone(),0);
+        let markers:Vec<_>=root.blocks.iter().flat_map(|b| r.ground_records(b).unwrap().iter()
+            .filter_map(|(_,record)|matches!(record,GroundRecordRef::ClassifiedEmptyColumn).then_some(b.key)).collect::<Vec<_>>()).collect();
+        assert_eq!(markers,vec![[0,0,next_z/32]]);
+        assert_eq!(copy.ground_column(xy).unwrap(),empty);
+    }
+    let actual=column(surface(xy,&[64]));
+    copy.replace_ground_column(xy,&actual).unwrap();
+    assert_eq!(copy.ground_column(xy).unwrap(),actual);
+    copy.snapshot(domain(),5,20).unwrap();
+    copy.replace_ground_column(xy,&empty).unwrap();
+    assert_eq!(copy.ground_column(xy).unwrap(),empty);
+    copy.snapshot(domain(),6,20).unwrap();
+    copy.remove([[0,0,64]]).unwrap();
+    let last=copy.snapshot(domain(),7,20).unwrap();
+    assert_eq!(last.points(),1); // Unconverted neighbour remains ordinary occupancy.
+    assert!(!copy.ground_column(xy).unwrap().classified_empty);
+    assert!(copy.ground_column(xy).unwrap().heightfields.is_empty());
+    assert_eq!(assembled(&mut receiver,&pinned,xy),empty);
+    eprintln!("EMPTY_COLUMN persisted=true carrier=0,32,64 real_claim_replaced=true all_occupancy_deleted_clears=true old_neighbor_legacy=true");
+}
+
+#[test]
+fn classified_empty_column_rejects_conflicts_and_unknown_tags_at_boundary() {
+    let xy=[0,0];let mut w=writer();let actual=column(surface(xy,&[0]));install(&mut w,&actual,20);
+    w.observe([[0,0,32]],20).unwrap();let root=w.snapshot(domain(),1,20).unwrap();
+    let mut both=actual.clone();both.classified_empty=true;
+    assert!(w.replace_ground_column(xy,&both).unwrap_err().contains("conflicts"));
+    assert!(!w.has_unpublished_changes());
+    let block=Block::from([(0,Evidence{observed_ns:20,hits:1})]);
+    let good=GroundRecords::Versioned(Arc::new([(0,GroundRecord::ClassifiedEmptyColumn{})].into()));
+    let bytes=encode_ground_block(&block,&good).unwrap();assert!(decode_block_parts(&bytes).is_ok());
+    for json in [
+        serde_json::json!([[0,{"representation":"unrecognized_empty","data":{}}]]),
+        serde_json::json!([[0,{"representation":"classified_empty_column","data":{"height":0}}]]),
+        serde_json::json!([[1,{"representation":"classified_empty_column","data":{}}]]),
+        serde_json::json!([[1024,{"representation":"classified_empty_column","data":{}}]]),
+    ] {
+        let payload=serde_json::to_vec(&json).unwrap();let mut bad=bytes[..28].to_vec();
+        bad[12..16].copy_from_slice(&(payload.len() as u32).to_le_bytes());bad.extend(payload);
+        assert!(decode_block_parts(&bad).is_err(),"{json}");
+    }
+    // Each block is intrinsically valid, but a marker cannot coexist with a
+    // ground claim in another vertical shard of the same actual column.
+    let mut conflicting=root.as_ref().clone();let reference=conflicting.blocks.iter_mut().find(|r|r.key==[0,0,1]).unwrap();
+    let object=ObjectId::random().unwrap().into();reference.object=object;
+    let transfer=Transfer{root:conflicting.encode().unwrap(),included:[(object,bytes)].into()};
+    let mut receiver=Receiver::new(Repository::temporary().unwrap());
+    let error=receiver.receive(&transfer,&conflicting.domain,|_,b| w.repository().read_object(b.object,MAX_BLOCK_BYTES)).unwrap_err();
+    assert!(error.contains("conflicts"),"{error}");
+    // Hot incremental roots must also inspect a changed Legacy-only shard:
+    // the empty marker object itself is unchanged and may be cached.
+    let mut w=writer();w.observe([[0,0,0],[0,0,32]],20).unwrap();
+    w.replace_ground_column(xy,&ColumnGroundRecords{classified_empty:true,legacy:vec![],heightfields:vec![]}).unwrap();
+    let marked=w.snapshot(domain(),1,20).unwrap();
+    let layer=LayerObservation{members:vec![0],normal:[0.,0.,1.],plane_origin:[0.025,0.025,32.5*f64::from(Q)],
+        samples:vec![LayerSample{source:Default::default(),point:[0.025,0.025,32.5*f64::from(Q)],
+            source_sequence:1,source_timestamp_ns:20,point_index:0}]};
+    let mut hot=Receiver::new(Repository::temporary().unwrap());receive(&mut hot,&marked,w.repository()).unwrap();
+    let mut next=marked.as_ref().clone();next.revision=2;next.geometry_revision=2;
+    let changed=next.blocks.iter_mut().find(|r|r.key==[0,0,1]).unwrap();
+    let object=ObjectId::random().unwrap().into();changed.object=object;changed.block_revision=2;changed.geometry_revision=2;
+    let legacy_bytes=encode_layer_block(&block,&[(0,layer.clone())].into()).unwrap();
+    let transfer=Transfer{root:next.encode().unwrap(),included:[(object,legacy_bytes)].into()};
+    let error=hot.receive(&transfer,&next.domain,|_,b|w.repository().read_object(b.object,MAX_BLOCK_BYTES)).unwrap_err();
+    assert!(error.contains("conflicts"),"{error}");
+    w.replace_layer_observations([0,0,1],[(0,layer)].into()).unwrap();
+    let error=w.snapshot(domain(),2,20).unwrap_err();assert!(error.contains("conflicts"),"{error}");
+    eprintln!("EMPTY_COLUMN intrinsic_invalid=4 cross_shard_conflict=REJECT hot_changed_legacy=REJECT writer_seal=REJECT");
 }

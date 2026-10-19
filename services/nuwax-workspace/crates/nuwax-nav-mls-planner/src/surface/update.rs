@@ -805,6 +805,7 @@ mod tests {
     #[test]
     fn captured_body_limits_update_locally_and_explicit_replacement_reopens_direction() {
         let model = SurfaceBodyEnvelope {
+            fixed_collision: None,
             footprint_xy_m: vec![[-0.15, -0.1], [0.15, -0.1], [0.15, 0.1], [-0.15, 0.1]],
             z_bounds_m: [-0.1, 0.2],
             body_to_support_z_m: 0.35,

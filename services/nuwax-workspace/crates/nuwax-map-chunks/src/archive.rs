@@ -151,7 +151,10 @@ impl<R: Read + Seek> ArchiveReader<R> {
         }
         let (block, layers) = decode_block_parts(&bytes)?;
         match &self.root {
-            ArchivedRoot::Current(root) => admit_format(intrinsic_bytes(&bytes, &block), root)?,
+            ArchivedRoot::Current(root) => {
+                admit_format(intrinsic_bytes(&bytes, &block), root)?;
+                if root.version >= 5 { ground_records::validate_legacy_sample_occupancy(&layers, &block, key, root.voxel_size_m)?; }
+            },
             ArchivedRoot::Legacy(_) if !layers.is_empty() => return Err("legacy archive contains observed layer block".into()),
             _ => {},
         }

@@ -10325,6 +10325,13 @@ fn build_navigation_map_3d_publication_frame(
 
 #[path = "navigation_map_transfer.rs"]
 mod navigation_map_transfer;
+// Keep the cross-module capture control on the original publication preparer.
+#[cfg(test)]
+pub(crate) fn prepare_navigation_map_transfer_for_test(
+    fine: &nuwax_map_chunks::SealedMap,
+) -> Result<nuwax_map_chunks::Transfer, String> {
+    navigation_map_transfer::prepare(fine, None)
+}
 
 fn build_navigation_map_3d_publication_frame_with_baseline(
     publication: &CanonicalCloudPublication,

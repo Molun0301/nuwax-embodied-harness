@@ -151,9 +151,30 @@ async fn wait_for_calls(calls: &AtomicUsize, count: usize) {
 }
 #[tokio::test]
 async fn owner_escalates_budget_without_pose_jitter_loops_and_retries_meaningful_motion_at_cap() {
+    async fn wait_for_completed_cap(harness: &Harness, completed: &AtomicUsize, count: usize) {
+        tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                // 计数只证明计算返回；还要等原拥有方接收结果，开始原重试冷却。
+                let received = harness
+                    .hub
+                    .planning
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|(_, _, message)| message.starts_with("搜索工作预算已用尽"));
+                if completed.load(Ordering::SeqCst) >= count && received {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("full search cap result was not completed and received");
+    }
     let calls = Arc::new(AtomicUsize::new(0));
+    let completed = Arc::new(AtomicUsize::new(0));
     let seen = Arc::new(Mutex::new(Vec::new()));
     let count = calls.clone();
+    let finished = completed.clone();
     let budgets = seen.clone();
     let computer: SurfacePathComputer = Arc::new(move |_, _, _, cfg| {
         budgets
@@ -161,7 +182,9 @@ async fn owner_escalates_budget_without_pose_jitter_loops_and_retries_meaningful
             .unwrap()
             .push(cfg.planning_search_budget.unwrap());
         count.fetch_add(1, Ordering::SeqCst);
-        Err(exhausted_real_search(cfg.planning_search_budget.unwrap()))
+        let error = exhausted_real_search(cfg.planning_search_budget.unwrap());
+        finished.fetch_add(1, Ordering::SeqCst);
+        Err(error)
     });
     let cfg = config();
     let distance = cfg.follower.scan.refresh_distance_m;
@@ -173,6 +196,7 @@ async fn owner_escalates_budget_without_pose_jitter_loops_and_retries_meaningful
     wait_for_calls(&calls, 2).await;
     let maximum = nuwax_nav_pct::SearchLimits::default().max_states;
     assert_eq!(*seen.lock().unwrap(), vec![30_000, maximum]);
+    wait_for_completed_cap(&harness, &completed, 2).await;
     harness.feed.lock().unwrap().position[0] += distance * 0.01;
     tokio::time::sleep(Duration::from_millis(1200)).await;
     assert_eq!(
@@ -186,6 +210,7 @@ async fn owner_escalates_budget_without_pose_jitter_loops_and_retries_meaningful
     harness.feed.lock().unwrap().position[0] += distance * 1.1;
     wait_for_calls(&calls, 3).await;
     assert_eq!(*seen.lock().unwrap(), vec![30_000, maximum, maximum]);
+    wait_for_completed_cap(&harness, &completed, 3).await;
     tokio::time::sleep(Duration::from_millis(1100)).await;
     assert_eq!(calls.load(Ordering::SeqCst), 3);
     // A new goal owns a fresh initial allowance, never the retired goal's cap.

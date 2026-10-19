@@ -1,5 +1,5 @@
 //! 仅处理近场样条受阻的前向姿态接续；不承担长距离全局规划。
-use super::{angle, yaw, BodyPose, LocalPlanError};
+use super::{angle, yaw, BodyGroundState, BodyMotionProjection, BodyPose, LocalPlanError, SurfaceBodyQueryView};
 use nuwax_nav_mls_planner::SurfaceSnapshot;
 use nuwax_nav_pct::Tomogram;
 use nuwax_nav_types_messages::MotionKinematics;
@@ -108,9 +108,14 @@ pub(super) fn initial_admissions() -> Vec<(f64,f64,BodyPose)> {
     INITIAL_ADMISSIONS.with(|v| v.borrow().clone())
 }
 
-type ProjectedMotion=(Vec<BodyPose>,Vec<nuwax_nav_mls_planner::SurfaceBodyQueryView>);
+struct ProjectedMotion {
+    poses: Vec<BodyPose>,
+    projections: Vec<BodyMotionProjection>,
+    ground: BodyGroundState,
+}
 struct Node {
     pose: BodyPose,
+    ground: BodyGroundState,
     cost: f64,
     parent: Option<usize>,
     samples: Vec<BodyPose>,
@@ -135,11 +140,20 @@ fn key(p: BodyPose) -> [u64; 7] {
      p.1[0].to_bits(), p.1[1].to_bits(), p.1[2].to_bits(), p.1[3].to_bits()]
 }
 
-// Queue labels use exactly the same dominance relation as admission. A cheaper
-// path to this exact seven-component pose supersedes the old entry even when
-// the cost difference is smaller than a geometric tolerance.
-fn is_stale(node: &Node, best: &HashMap<[u64; 7], f64>) -> bool {
-    best.get(&key(node.pose)).is_some_and(|&cost| node.cost > cost)
+// 来源身份已由请求拥有方固定；这里只增加会影响后继投影的小地面关联。
+#[derive(PartialEq, Eq, Hash)]
+struct SearchKey {
+    pose: [u64; 7],
+    ground: BodyGroundState,
+}
+fn state_key(pose: BodyPose, ground: &BodyGroundState) -> SearchKey {
+    SearchKey { pose: key(pose), ground: ground.clone() }
+}
+
+// 入队与过期标签使用相同身份：原七分量精确姿态加地面关联。
+// 同一完整状态的任意真实成本差都沿用严格支配，不引入几何容差。
+fn is_stale(node: &Node, best: &HashMap<SearchKey, f64>) -> bool {
+    best.get(&state_key(node.pose, &node.ground)).is_some_and(|&cost| node.cost > cost)
 }
 
 pub fn probe_motion(
@@ -149,7 +163,7 @@ pub fn probe_motion(
     turn: f64,
     boundary: &[[f64; 2]],
 ) -> Option<Vec<BodyPose>> {
-    probe_motion_until(map,from,length,turn,boundary,|_|false).ok()
+    probe_swept_admission(map,from,length,turn,boundary).ok()
 }
 /// Diagnostic only: run one production primitive through the same swept-body
 /// admission the search uses, so a stall can be attributed to admission rather
@@ -161,24 +175,26 @@ pub fn probe_swept_admission(
     turn: f64,
     boundary: &[[f64; 2]],
 ) -> Result<Vec<BodyPose>, LocalPlanError> {
-    let (poses,views)=project_motion_until(map,from,length,turn,|_|false)?;
-    validate_projected(from,&poses,&views,boundary)?;
-    Ok(poses)
+    let (query, ground)=super::bind_query(map,from)?;
+    probe_motion_until(map,&query,&ground,from,length,turn,boundary,|_|false).map(|motion|motion.poses)
 }
 fn probe_motion_until(
     map: &SurfaceSnapshot,
+    query: &SurfaceBodyQueryView,
+    ground: &BodyGroundState,
     from: BodyPose,
     length: f64,
     turn: f64,
     boundary: &[[f64;2]],
     reached: impl Fn(BodyPose)->bool,
-) -> Result<Vec<BodyPose>, LocalPlanError> {
-    let (poses,views)=project_motion_until(map,from,length,turn,reached)?;
-    validate_projected(from,&poses,&views,boundary)?;
-    Ok(poses)
+) -> Result<ProjectedMotion, LocalPlanError> {
+    let projected=project_motion_until(map,query,ground,from,length,turn,reached)?;
+    validate_projected(query,from,&projected,boundary)?;
+    Ok(projected)
 }
 fn project_motion_until(
-    map:&SurfaceSnapshot,from:BodyPose,length:f64,turn:f64,reached:impl Fn(BodyPose)->bool,
+    map:&SurfaceSnapshot,query:&SurfaceBodyQueryView,from_ground:&BodyGroundState,
+    from:BodyPose,length:f64,turn:f64,reached:impl Fn(BodyPose)->bool,
 ) -> Result<ProjectedMotion, LocalPlanError> {
     super::cancellation::checkpoint()?;
     let radius = map.body_envelope().ok_or("近场搜索缺少机体")?.radius();
@@ -186,7 +202,8 @@ fn project_motion_until(
     let heading = yaw(from.1);
     let mut previous = from;
     let mut poses = Vec::with_capacity(n);
-    let mut views = Vec::with_capacity(n);
+    let mut projections = Vec::with_capacity(n);
+    let mut ground = from_ground.clone();
     for i in 1..=n {
         super::cancellation::checkpoint()?;
         if reached(previous) {break;}
@@ -204,23 +221,24 @@ fn project_motion_until(
             from.0[0] + dx * heading.cos() - dy * heading.sin(),
             from.0[1] + dx * heading.sin() + dy * heading.cos(),
         ];
-        let (next,view)=super::project_endpoint(map,previous,xy,heading+theta)?;
-        previous=next;
+        let projection=super::project_endpoint(query,&ground,previous,xy,heading+theta)?;
+        previous=projection.pose();
+        ground=projection.ground().clone();
         poses.push(previous);
-        views.push(view);
+        projections.push(projection);
     }
     // 端点几何已拒绝的候选不再支付沿途扫掠；任何返回的候选仍逐段核验全部运动。
-    // 保留生成端点时的同一只读查询视图，不把尚未验证的未来站姿写回地图。
-    Ok((poses,views))
+    // 保留同一拥有方产生的逐段投影，不把尚未验证的未来站姿写回地图。
+    Ok(ProjectedMotion {poses,projections,ground})
 }
 fn validate_projected(
-    from:BodyPose,poses:&[BodyPose],views:&[nuwax_nav_mls_planner::SurfaceBodyQueryView],boundary:&[[f64;2]],
+    query:&SurfaceBodyQueryView,from:BodyPose,projected:&ProjectedMotion,boundary:&[[f64;2]],
 )->Result<(), LocalPlanError> {
     let mut previous=from;
-    for (&next,view) in poses.iter().zip(views) {
+    for projection in &projected.projections {
         super::cancellation::checkpoint()?;
-        super::check_projected_motion(view,previous,next,boundary)?;
-        previous=next;
+        super::check_projected_motion(query,previous,projection,boundary)?;
+        previous=projection.pose();
     }
     Ok(())
 }
@@ -270,12 +288,13 @@ struct ReferenceTurn {
 }
 // One plan-local preparation; the guide's original >1e-9 heading rule is unchanged.
 /// 所有偏离原末点的候选共用同一窗口交接条件，不能只交付受阻前缀。
-pub(super) fn reference_handoff(p: BodyPose, reference: &[[f64; 3]], support_offset: f64,
+pub(super) fn reference_handoff(map: &SurfaceSnapshot, p: BodyPose, reference: &[[f64; 3]], support_offset: f64,
     corridor: f64, layer_tolerance: f64, reference_length: f64, tangent: f64) -> bool {
     let Some(target) = reference.last() else { return false; };
-    let support = [p.0[0], p.0[1], p.0[2] - support_offset];
+    // 窗口参考位于支撑坐标；倾斜时偏移同时改变 XY 与 Z，不能只减标称高度。
+    let Ok(support) = map.support_position_from_body(p.0,p.1,support_offset) else { return false; };
     let (deviation, progress, height) = reference_progress(support, reference);
-    if (p.0[0]-target[0]).hypot(p.0[1]-target[1]) > corridor || deviation > corridor
+    if (support[0]-target[0]).hypot(support[1]-target[1]) > corridor || deviation > corridor
         || progress < reference_length - 1e-6 || (support[2]-height).abs() > layer_tolerance { return false; }
     angle(yaw(p.1)-tangent).cos()>0.0
 }
@@ -472,6 +491,31 @@ pub(super) fn plan_progress(
     expansion_limit: usize,
     progress_policy: Option<super::ProgressPrefixPolicy<'_>>,
 ) -> Result<SearchPath, LocalPlanError> {
+    super::cancellation::checkpoint()?;
+    validate_caps(motion)?;
+    #[cfg(feature="profile")] let binding_phase=super::profile::Phase::begin("search_bind");
+    let (query,ground)=super::bind_query(map,start)?;
+    #[cfg(feature="profile")] drop(binding_phase);
+    plan_progress_bound(map,&query,&ground,tomogram,start,reference,motion,final_yaw,arrival,
+        boundary,horizon,corridor,follow_reference,expansion_limit,progress_policy)
+}
+pub(super) fn plan_progress_bound(
+    map: &SurfaceSnapshot,
+    query: &SurfaceBodyQueryView,
+    start_ground: &BodyGroundState,
+    tomogram: &Tomogram,
+    start: BodyPose,
+    reference: &[[f64; 3]],
+    motion: &MotionKinematics,
+    final_yaw: Option<f64>,
+    arrival: Option<([f64; 3], f64)>,
+    boundary: &[[f64; 2]],
+    horizon: f64,
+    corridor: f64,
+    follow_reference: bool,
+    expansion_limit: usize,
+    progress_policy: Option<super::ProgressPrefixPolicy<'_>>,
+) -> Result<SearchPath, LocalPlanError> {
     #[cfg(feature="profile")] let setup_phase=super::profile::Phase::begin("search_setup");
     super::cancellation::checkpoint()?;
     validate_caps(motion)?;
@@ -509,7 +553,7 @@ pub(super) fn plan_progress(
         }
         // 中间轨迹必须走到窗口末端的横截面，并保持前向朝向。
         // 不能把障碍前的六成前缀当作已经接通交接点。
-        reference_handoff(p, reference, support_offset, corridor, layer_tolerance, reference_length, tangent)
+        reference_handoff(map, p, reference, support_offset, corridor, layer_tolerance, reference_length, tangent)
     };
     // 绕行窗口的目标可能就在墙另一侧；直线距离会把搜索反复拉回已失败的通道。
     // 沿已给出的参考走廊估计剩余行程，仍由实际机体动作决定能否通行。
@@ -588,12 +632,13 @@ pub(super) fn plan_progress(
     // More distinct states compete within the same finite expansion budget.
     let mut nodes = vec![Node {
         pose: start,
+        ground: start_ground.clone(),
         cost: 0.0,
         parent: None,
         samples: Vec::new(),
     }];
     let mut open = BinaryHeap::from([Entry(heuristic(start), 0)]);
-    let mut best = HashMap::from([(key(start), 0.0)]);
+    let mut best = HashMap::from([(state_key(start,start_ground), 0.0)]);
     let mut rejected_sample=None;
     fn admitted<T>(result:Result<T,LocalPlanError>,sample:&mut Option<nuwax_nav_mls_planner::surface::BodyFailureWitness>)
         ->Result<Option<T>,LocalPlanError> {
@@ -618,6 +663,7 @@ pub(super) fn plan_progress(
         if is_stale(&nodes[id], &best) {
             continue;
         }
+        let from_ground = nodes[id].ground.clone();
         #[cfg(all(test,feature="profile"))]
         if std::env::var_os("NEH_ON_POP_TRACE").is_some() {
             eprintln!("ON_POP {}",serde_json::json!({"id":id,"parent":nodes[id].parent,
@@ -691,14 +737,16 @@ pub(super) fn plan_progress(
             }
             if !visible {continue;}
             let mut prefix=vec![from];
-            if admitted(super::rotate(map,&mut prefix,heading,motion,boundary),&mut rejected_sample)?.is_none() {continue;}
+            let mut connection_ground=from_ground.clone();
+            if admitted(super::rotate_bound(query,&mut connection_ground,&mut prefix,heading,motion,boundary),&mut rejected_sample)?.is_none() {continue;}
             let in_goal=|pose:BodyPose|arrival.is_some_and(|(goal,tolerance)|
                 if tolerance == 0.0 { super::same_finite_position(pose.0, goal) }
                 else { super::distance3(pose.0,goal)<tolerance });
-            let Some(line)=admitted(probe_motion_until(map,*prefix.last().unwrap(),length,turn,boundary,in_goal),&mut rejected_sample)? else{continue;};
-            prefix.extend(line);
+            let Some(line)=admitted(probe_motion_until(map,query,&connection_ground,*prefix.last().unwrap(),length,turn,boundary,in_goal),&mut rejected_sample)? else{continue;};
+            connection_ground=line.ground;
+            prefix.extend(line.poses);
             if let Some(heading)=final_yaw {
-                if admitted(super::rotate(map,&mut prefix,heading,motion,boundary),&mut rejected_sample)?.is_none(){continue;}
+                if admitted(super::rotate_bound(query,&mut connection_ground,&mut prefix,heading,motion,boundary),&mut rejected_sample)?.is_none(){continue;}
             }
             if reach(*prefix.last().unwrap()) {
                 #[cfg(feature="profile")] if let Some(phase)=root_phase.as_mut() {
@@ -778,21 +826,22 @@ pub(super) fn plan_progress(
                 continue;
             }
             work.candidates += 1;
-            let Some((samples,views)) = admitted(project_motion_until(map, from, length, turn, |_|false),&mut rejected_sample)? else {
+            let Some(projected) = admitted(project_motion_until(map, query, &from_ground, from, length, turn, |_|false),&mut rejected_sample)? else {
                 continue;
             };
+            let samples = &projected.poses;
             let next = *samples.last().unwrap();
             if (next.0[0] - start.0[0]).hypot(next.0[1] - start.0[1]) > distance(start) + 1.0 {
                 continue;
             }
-            let next_cost = cost + projected_cost(from,&samples,support_offset,tomogram,reference,motion);
-            let k = key(next);
+            let next_cost = cost + projected_cost(from,samples,support_offset,tomogram,reference,motion);
+            let k = state_key(next,&projected.ground);
             if best.get(&k).is_some_and(|&old| next_cost >= old) {
                 continue;
             }
             // 已有合法路径代价更低时不重复做扫掠；真正入队的边仍完整核验。
             work.sweeps += 1;
-            if admitted(validate_projected(from,&samples,&views,boundary),&mut rejected_sample)?.is_none() {continue;}
+            if admitted(validate_projected(query,from,&projected,boundary),&mut rejected_sample)?.is_none() {continue;}
             #[cfg(test)]
             if id == 0 { INITIAL_ADMISSIONS.with(|v|v.borrow_mut().push((length,turn,next))); }
             #[cfg(all(test,feature="profile"))]
@@ -803,9 +852,10 @@ pub(super) fn plan_progress(
             let next_id = nodes.len();
             nodes.push(Node {
                 pose: next,
+                ground: projected.ground,
                 cost: next_cost,
                 parent: Some(id),
-                samples,
+                samples: projected.poses,
             });
             let heading_cost = final_yaw.map_or(0.0, |y| angle(y - yaw(next.1)).abs() / motion.max_angular_rps * 0.05);
             #[cfg(test)]
@@ -821,12 +871,15 @@ pub(super) fn plan_progress(
     super::cancellation::checkpoint()?;
     if let Some(policy)=progress_policy.filter(|_|budget_exhausted) {
         let reference=policy.reference;
-        let initial_progress=reference_progress([start.0[0],start.0[1],start.0[2]-support_offset],reference).1;
+        let initial_support=map.support_position_from_body(start.0,start.1,support_offset)
+            .map_err(|error|error.to_string())?;
+        let initial_progress=reference_progress(initial_support,reference).1;
         let mut selected:Option<(usize,f64)>=None;
         for (id,node) in nodes.iter().enumerate().skip(1) {
             super::cancellation::checkpoint()?;
             if is_stale(node,&best) {continue;}
-            let p=node.pose;let support=[p.0[0],p.0[1],p.0[2]-support_offset];
+            let p=node.pose;
+            let Ok(support)=map.support_position_from_body(p.0,p.1,support_offset) else {continue;};
             let (deviation,progress,height)=reference_progress(support,reference);
             if progress-initial_progress<model.radius()
                 || (p.0[0]-start.0[0]).hypot(p.0[1]-start.0[1])<policy.minimum_distance_m.max(model.radius())
@@ -880,6 +933,21 @@ pub(super) fn plan_progress(
 mod production_default_tests {
     use super::*;
     #[test]
+    fn equal_priority_keeps_insertion_order_and_exact_cost_order() {
+        let next = f64::from_bits(1.0_f64.to_bits() + 1);
+        let mut queue = BinaryHeap::from([
+            Entry(next, 0), Entry(1.0, 8), Entry(2.0, 1), Entry(1.0, 3),
+        ]);
+        let mut ordered = Vec::new();
+        while let Some(Entry(priority, id)) = queue.pop() {
+            ordered.push((priority.to_bits(), id));
+        }
+        assert_eq!(ordered, vec![
+            (1.0_f64.to_bits(), 3), (1.0_f64.to_bits(), 8),
+            (next.to_bits(), 0), (2.0_f64.to_bits(), 1),
+        ], "相同优先级按原入队编号，任意真实成本差仍先于编号比较");
+    }
+    #[test]
     fn default_priority_matches_production_weighted_sum() {
         assert!(matches!(HEURISTIC_MODE.get(),HeuristicMode::ScaledSum(4.0)),
             "普通测试必须使用生产的四倍加权和，诊断排序只能显式启用");
@@ -910,11 +978,27 @@ mod production_default_tests {
 mod identity_tests {
     use super::*;
     #[test]
+    fn exact_pose_dominance_keeps_distinct_carried_ground_heights() {
+        let query = crate::tests::coarse_open_floor().body_query();
+        let pose = ([100.0, 100.0, 0.4], [0.0, 0.0, 0.0, 1.0]);
+        let low = query.start_ground_state(pose).unwrap();
+        let high = query.start_ground_state(([100.0, 100.0, 0.55], pose.1)).unwrap();
+        assert_eq!(low.query_state(), nuwax_nav_mls_planner::surface::GroundQueryState::Unknown);
+        assert_eq!(high.query_state(), nuwax_nav_mls_planner::surface::GroundQueryState::Unknown);
+        assert_ne!(low, high, "未知列携带的不同旧高度会影响未来重入，不能合并");
+        let best = HashMap::from([(state_key(pose, &low), 1.0)]);
+        let mut node = Node { pose, ground: high, cost: 2.0, parent: None, samples: Vec::new() };
+        assert!(!is_stale(&node, &best), "相同姿态的另一地面关联不是旧标签");
+        node.ground = low;
+        assert!(is_stale(&node, &best), "相同完整状态仍沿用严格成本支配");
+    }
+    #[test]
     fn exact_pose_dominance_skips_even_one_ulp_costlier_queue_labels() {
         let pose = ([0.0, 0.0, 0.4], [0.0, 0.0, 0.0, 1.0]);
+        let ground = crate::tests::coarse_open_floor().body_query().start_ground_state(pose).unwrap();
         let current_cost = 1.0_f64;
-        let best = HashMap::from([(key(pose), current_cost)]);
-        let mut node = Node { pose, cost: f64::from_bits(current_cost.to_bits() + 1),
+        let best = HashMap::from([(state_key(pose,&ground), current_cost)]);
+        let mut node = Node { pose, ground, cost: f64::from_bits(current_cost.to_bits() + 1),
             parent: None, samples: Vec::new() };
         assert!(is_stale(&node, &best), "an obsolete exact-pose label must not use expansion work");
         node.cost = current_cost;
@@ -1264,6 +1348,10 @@ mod complete_guide_turn_tests {
     }
 
 }
+
+#[cfg(test)]
+#[path = "reference_handoff_tests.rs"]
+mod reference_handoff_tests;
 
 #[cfg(test)]
 #[path = "terminal_turn_selection_diagnostic_tests.rs"]

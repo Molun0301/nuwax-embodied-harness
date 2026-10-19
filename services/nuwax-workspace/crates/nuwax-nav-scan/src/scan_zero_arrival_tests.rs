@@ -66,12 +66,13 @@ fn zero_arrival_exact_stationary_pose_projection_must_complete() {
 #[test]
 fn zero_arrival_projection_must_not_admit_nearby_nonzero_error() {
     let (map, _tomo, start, reference) = zero_arrival_fixture();
+    let (query, ground) = bind_query(&map, start).expect("zero arrival ground owner");
     for delta in [f64::EPSILON, 5e-7, 1e-6] {
         let mut goal = start.0;
         goal[0] += delta;
         assert!(distance3(start.0, goal) > 0.0, "no underflow/equal-input fake control");
         let blocked = std::cell::Cell::new(None);
-        let result = project_to_region(&map, start, &reference, &motion(), false,
+        let result = project_to_region(&map, &query, &ground, start, &reference, &motion(), false,
             Some(0.0), Some((goal, 0.0)), &[], &blocked);
         assert!(result.is_err(), "do not fix exact zero by widening the original goal: {delta}");
     }
@@ -80,10 +81,11 @@ fn zero_arrival_projection_must_not_admit_nearby_nonzero_error() {
 #[test]
 fn positive_arrival_boundary_projection_current_strict_characterization() {
     let (map, _tomo, start, reference) = zero_arrival_fixture();
+    let (query, ground) = bind_query(&map, start).expect("positive arrival ground owner");
     let goal = [start.0[0] + 0.25, start.0[1], start.0[2]];
     assert_eq!(distance3(start.0, goal), 0.25);
     let blocked = std::cell::Cell::new(None);
-    let result = project_to_region(&map, start, &reference, &motion(), false,
+    let result = project_to_region(&map, &query, &ground, start, &reference, &motion(), false,
         Some(0.0), Some((goal, 0.25)), &[], &blocked);
     assert!(result.is_err(), "records today's strict positive Scan boundary, not a proposed policy");
 }

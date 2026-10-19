@@ -1593,6 +1593,7 @@ dependencies = [
  "nuwax-explore-tare-bridge",
  "nuwax-explore-terrain-map-bridge",
  "nuwax-explore-wavefront",
+ "nuwax-map-chunks",
  "nuwax-nav-base",
  "nuwax-nav-mls-planner",
  "nuwax-nav-native-runner",
@@ -2016,6 +2017,7 @@ name = "nuwax-nav-pct"
 version = "0.1.0"
 dependencies = [
  "ahash",
+ "im",
  "nuwax-map-chunks",
  "nuwax-nav-mls-planner",
  "nuwax-nav-types-messages",
@@ -2066,6 +2068,7 @@ dependencies = [
 name = "nuwax-nav-scan"
 version = "0.1.0"
 dependencies = [
+ "nuwax-map-chunks",
  "nuwax-nav-mls-planner",
  "nuwax-nav-pct",
  "nuwax-nav-types-messages",

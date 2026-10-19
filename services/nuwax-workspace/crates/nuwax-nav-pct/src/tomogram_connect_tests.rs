@@ -45,7 +45,7 @@ impl FrozenConnect for Tomogram {
 
 fn copy_map(m: &Tomogram) -> Tomogram {
     Tomogram { resolution:m.resolution, source_quantum:m.source_quantum, cells:m.cells.clone(), columns:m.columns.clone(),
-        known_columns:m.known_columns.clone(), occupancy:m.occupancy.clone(), xy_bounds:m.xy_bounds, ground_bounds:m.ground_bounds, minimum_cost:m.minimum_cost, window:m.window,
+        known_columns:m.known_columns.clone(), occupancy:m.occupancy.clone(), indices:m.indices.clone(), seed_order:m.seed_order.clone(), occupied_volume:m.occupied_volume, xy_bounds:m.xy_bounds, ground_bounds:m.ground_bounds, minimum_cost:m.minimum_cost, window:m.window,
         #[cfg(feature="mls-adapter")] source:m.source.clone(),
         step_up:m.step_up, step_down:m.step_down,
         slope:m.slope, body_height:m.body_height, half_width:m.half_width,

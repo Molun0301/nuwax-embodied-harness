@@ -26,6 +26,7 @@ fn fixture(center_blocked: bool) -> (SurfaceSnapshot, Tomogram, BodyPose, [[f64;
     }
     let map = crate::tests::scene_with_extra_cells(None, 0.0, &extra)
         .with_body_envelope(SurfaceBodyEnvelope {
+            fixed_collision: None,
             footprint_xy_m: vec![
                 [-0.3, -0.0599],
                 [0.3, -0.0599],
@@ -111,9 +112,10 @@ fn witness(
     );
     let length = GOAL[0] - start.0[0];
     let in_goal = |p: BodyPose| distance3(p.0, GOAL) < TOLERANCE;
+    let (query, ground) = crate::bind_query(map, start).expect("witness ground owner");
     // Actual production stop logic, not a hand-picked radius intersection.
-    let line = probe_motion_until(map, start, length, 0.0, &[], in_goal)
-        .expect("first entry's full incoming sweep");
+    let line = probe_motion_until(map, &query, &ground, start, length, 0.0, &[], in_goal)
+        .expect("first entry's full incoming sweep").poses;
     let first = *line.last().unwrap();
     assert!(in_goal(first));
     assert!(

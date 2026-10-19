@@ -196,6 +196,9 @@ impl Iterator for GroundMembers<'_> {
 #[derive(Clone, Debug, Default)]
 pub(super) struct NativeGroundIndex {
     columns: im::HashMap<[i32; 2], Arc<Vec<ObservedHeightfield>>, ahash::RandomState>,
+    // Empty-classified columns carry no measured ground. Keep this source-wide
+    // compatibility predicate constant-time without counting their markers.
+    measured_columns: usize,
 }
 impl NativeGroundIndex {
     pub(super) fn records(&self, xy: [i32; 2]) -> impl Iterator<Item = SourceGroundRecord<'_>> {
@@ -205,8 +208,11 @@ impl NativeGroundIndex {
             .flat_map(|records| records.iter())
             .map(SourceGroundRecord::HeightfieldV1)
     }
+    pub(super) fn classified_empty(&self, xy: [i32; 2]) -> bool {
+        self.columns.get(&xy).is_some_and(|records| records.is_empty())
+    }
     pub(super) fn is_empty(&self) -> bool {
-        self.columns.is_empty()
+        self.measured_columns == 0
     }
 
     /// A block-only update must not retain a claim for a removed occupied member.
@@ -231,6 +237,7 @@ impl NativeGroundIndex {
             }
             let retained: Vec<_> = records.iter().filter(|r| valid(r)).cloned().collect();
             if retained.is_empty() {
+                self.measured_columns -= 1;
                 self.columns.remove(&xy);
             } else {
                 self.columns.insert(xy, Arc::new(retained));
@@ -248,8 +255,13 @@ impl NativeGroundIndex {
         blocks: &[(Key, GroundRecords)],
     ) -> Vec<[i32; 2]> {
         let mut groups: BTreeMap<Key, ObservedHeightfield> = BTreeMap::new();
+        let mut empty_columns = std::collections::BTreeSet::new();
         for (block, records) in blocks {
             for (local, record) in records.iter() {
+                if matches!(record, GroundRecordRef::ClassifiedEmptyColumn) {
+                    empty_columns.insert([block[0]*32+i32::from(local%32), block[1]*32+i32::from(local/32)]);
+                    continue;
+                }
                 let GroundRecordRef::HeightfieldV1(record) = record else {
                     continue;
                 };
@@ -285,13 +297,18 @@ impl NativeGroundIndex {
                 let xy = [block_xy[0] * 32 + x, block_xy[1] * 32 + y];
                 let next = columns.remove(&xy).unwrap_or_default();
                 let old = self.columns.get(&xy);
-                let equal = old.map_or(next.is_empty(), |old| {
+                let had_measured = old.is_some_and(|records| !records.is_empty());
+                let has_measured = !next.is_empty();
+                let present = has_measured || empty_columns.contains(&xy);
+                let equal = old.is_some() == present && old.map_or(next.is_empty(), |old| {
                     old.len() == next.len() && old.iter().zip(&next).all(|(a, b)| a.geometry_eq(b))
                 });
                 if !equal {
                     changed.push(xy);
                 }
-                if next.is_empty() {
+                self.measured_columns = self.measured_columns - usize::from(had_measured)
+                    + usize::from(has_measured);
+                if !present {
                     self.columns.remove(&xy);
                 } else {
                     self.columns.insert(xy, Arc::new(next));
@@ -318,7 +335,7 @@ mod tests {
     }
     fn column(xy: [i32; 2], zs: &[i32]) -> ColumnGroundRecords {
         ColumnGroundRecords {
-            legacy: vec![],
+            classified_empty: false, legacy: vec![],
             heightfields: vec![HeightfieldSurface {
                 column: HeightfieldColumn::from_counts(
                     xy,
@@ -506,7 +523,7 @@ mod tests {
         let xy = [0, 0];
         let make =
             |a, b, with_middle| ColumnGroundRecords {
-                legacy: vec![],
+                classified_empty: false, legacy: vec![],
                 heightfields: vec![HeightfieldSurface {
                 // Public wire boundary constructs this admitted zero-mass fixture;
                 // the private map-chunks assembler is not exposed for tests.

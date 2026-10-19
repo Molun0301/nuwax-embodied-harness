@@ -20,6 +20,7 @@ fn configured(local: bool, full_body: bool) -> SurfaceNavigationConfig {
     configured.follower.local_planning_enabled = local;
     if full_body {
         configured.apply_calibration(Some(nuwax_nav_types_messages::RobotGeometry {
+            self_collision: None,
             footprint_xy_m: vec![[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],
             z_min_m: -0.05, z_max_m: 0.2, source: "OFF soft-refresh owner fixture".into(),
         }), None).unwrap();

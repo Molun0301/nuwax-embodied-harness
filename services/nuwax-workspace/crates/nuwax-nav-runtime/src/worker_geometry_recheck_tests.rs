@@ -182,6 +182,7 @@ fn complete_columns_recheck_requires_continuity_and_unchanged_query_semantics() 
     let map = Arc::new(
         crate::surface_follower::test_snapshot(0.0, false)
             .with_body_envelope(SurfaceBodyEnvelope {
+                fixed_collision: None,
                 footprint_xy_m: vec![[-0.1, -0.1], [0.1, -0.1], [0.1, 0.1], [-0.1, 0.1]],
                 z_bounds_m: [-0.05, 0.2],
                 body_to_support_z_m: 0.4,

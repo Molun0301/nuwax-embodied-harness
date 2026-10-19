@@ -162,6 +162,7 @@ impl SurfaceGoalSourceAdapter {
         let deferred_start_body = deferred.map_or(current_body.0, |old| old.start_body);
         let deferred_start_orientation = deferred.map_or(current_body.1, |old| old.start_orientation);
         let continuation = |resume_cursor, unresolved| DeferredFrontierRoute {
+            source_unavailable: None,
             source: source_snapshot.as_ref().clone(),
             candidate: FrontierCandidate { support_xyz: robot_support, gain: 0.0, travel_cost: 0.0 },
             start_body: deferred_start_body, start_orientation: deferred_start_orientation,
@@ -322,6 +323,7 @@ impl SurfaceGoalSourceAdapter {
                     let upper = nuwax_nav_pct::SearchLimits::default().max_states;
                     let terminal = route_budget.last_domain_limited.get() || state_limit >= upper;
                     next_deferred = Some(DeferredFrontierRoute {
+            source_unavailable: None,
                         source: source_snapshot.as_ref().clone(),
                         candidate: candidate.clone(), start_body: deferred_start_body,
                         start_orientation: deferred_start_orientation,

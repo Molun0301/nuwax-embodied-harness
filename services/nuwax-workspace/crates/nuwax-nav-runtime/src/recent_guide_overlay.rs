@@ -89,6 +89,7 @@ mod tests {
     #[test]
     fn measured_contact_on_a_higher_floor_does_not_hide_an_obstacle_on_the_lower_floor() {
         let body=nuwax_nav_mls_planner::SurfaceBodyEnvelope {
+            fixed_collision: None,
             footprint_xy_m:vec![[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],
             z_bounds_m:[-0.45,0.2],body_to_support_z_m:0.4,
             max_step_up_m:0.2,max_step_down_m:0.2,max_cross_slope_deg:18.0,support_uncertainty_m:0.0,

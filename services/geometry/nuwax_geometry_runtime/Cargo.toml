@@ -83,6 +83,8 @@ async-trait = "0.1"
 nalgebra = { version = "0.33", features = ["serde-serialize"] }
 
 [dev-dependencies]
+# Tests transfer real captured objects through Receiver and Store before Reader build.
+nuwax-nav-stack = { path = "../../nuwax-workspace/crates/nuwax-nav-stack", default-features = false, features = ["surface-source-qualification"] }
 nuwax-nav-visual-servoing = { path = "../../nuwax-workspace/crates/nuwax-nav-visual-servoing" }
 
 # Phase 4 `[features]`(2026-07-07 codex rework lane-2):

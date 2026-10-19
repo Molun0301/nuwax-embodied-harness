@@ -58,11 +58,11 @@ impl Store {
         }
         Ok(())
     }
-    /// Legacy-only producer adapter. Never use to wrap an AR2/AR3/AR4 archive.
+    /// Legacy-only producer adapter. Never use to wrap an AR2/AR3/AR4/AR5 archive.
     pub fn insert_legacy(&mut self, mut file: File, size: u64, sha: [u8; 32]) -> Result<GraphArtifactRef, String> {
         file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
         let mut magic = [0; 8]; file.read_exact(&mut magic).map_err(|e| e.to_string())?;
-        if matches!(&magic, b"NUWAXAR2" | b"NUWAXAR3" | b"NUWAXAR4" | b"NWS2D002") { return Err("AR2/AR3/AR4/NWS2D002编号档案不能包装为旧摘要制品".into()); }
+        if matches!(&magic, b"NUWAXAR2" | b"NUWAXAR3" | b"NUWAXAR4" | b"NUWAXAR5" | b"NWS2D002") { return Err("AR2/AR3/AR4/AR5/NWS2D002编号档案不能包装为旧摘要制品".into()); }
         file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
         if crate::dense_cloud::hash_reader(&mut file)? != (size, sha) { return Err("旧制品导入摘要变化".into()); }
         self.admit_file(file, GraphArtifactRef { id: uuid::Uuid::new_v4().simple().to_string(), size, sha256: sha.to_vec(), ..Default::default() })
@@ -112,8 +112,8 @@ impl Store {
                 }
                 if scan { crate::dense_cloud::validate_archive(file)?; }
             }
-            b"NUWAXAR1" | b"NUWAXAR2" | b"NUWAXAR3" | b"NUWAXAR4" => {
-                if matches!(&magic, b"NUWAXAR2" | b"NUWAXAR3" | b"NUWAXAR4") && r.identity_schema_version != 2 { return Err("AR2/AR3/AR4需要新制品身份".into()); }
+            b"NUWAXAR1" | b"NUWAXAR2" | b"NUWAXAR3" | b"NUWAXAR4" | b"NUWAXAR5" => {
+                if matches!(&magic, b"NUWAXAR2" | b"NUWAXAR3" | b"NUWAXAR4" | b"NUWAXAR5") && r.identity_schema_version != 2 { return Err("AR2/AR3/AR4/AR5需要新制品身份".into()); }
                 // Assigned outer ownership may retain AR1 source bytes. The
                 // real installation commit, not import, establishes its new baseline.
                 let mut fine = nuwax_map_chunks::ArchiveReader::open(file)?;
@@ -309,6 +309,35 @@ mod assigned_identity_tests {
         let legacy=GraphArtifactRef {id:"legacy-ar4".into(),size,sha256:vec![9;32],..Default::default()};
         request(&mut store,&legacy,1,0,&[]).unwrap();request(&mut store,&legacy,2,0,&source).unwrap();
         assert!(request(&mut store,&legacy,3,0,&[]).unwrap_err().contains("AR4"));
+    }
+    #[test]
+    fn assigned_v2_store_ar5_heightfield_uses_original_identity_and_transfer() {
+        crate::dense_cloud::FORBID_ARCHIVE_HASH.with(|v|v.set(true));
+        let repo=nuwax_map_chunks::Repository::temporary().unwrap();
+        let mut writer=nuwax_map_chunks::Writer::new(repo.clone(),0.05,4*1024*1024).unwrap();
+        writer.observe([[0,0,0],[0,0,32]],100).unwrap();
+        let field=nuwax_map_chunks::heightfield_observations::HeightfieldColumn::from_counts([0,0],0.05,
+            [(0,[1,0,0,0,0,0,0,0]),(32,[1,0,0,0,0,0,0,0])].into()).unwrap().unwrap();
+        writer.replace_ground_column([0,0],&nuwax_map_chunks::ColumnGroundRecords {classified_empty: false, legacy:vec![],heightfields:vec![
+            nuwax_map_chunks::HeightfieldSurface {column:field.clone(),samples:vec![]}]}).unwrap();
+        let root=writer.snapshot(nuwax_map_chunks::Domain {session:"source".into(),generation:2,frame_generation:4,producer_generation:6},9,100).unwrap();
+        let(file,size)=nuwax_map_chunks::archive_file(&root,&repo).unwrap();let source=bytes(file);
+        assert_eq!(&source[..8],b"NUWAXAR5");
+        let r=reference(size,CheckpointMemberRole::FineMap);let mut store=Store::default();
+        request(&mut store,&r,1,0,&[]).unwrap();request(&mut store,&r,2,0,&source).unwrap();
+        assert!(request(&mut store,&r,3,0,&[]).unwrap().sealed);
+        assert_eq!(bytes(store.open(&r).unwrap()),source);
+        let mut archive=nuwax_map_chunks::ArchiveReader::open(store.open(&r).unwrap()).unwrap();
+        let destination=nuwax_map_chunks::Repository::temporary().unwrap();
+        let imported=archive.import(&destination).unwrap();
+        let mut restored=nuwax_map_chunks::Writer::new(destination,0.05,4*1024*1024).unwrap();
+        restored.restore_archived(&imported).unwrap();
+        assert_eq!(restored.ground_column([0,0]).unwrap().heightfields[0].column,field);
+        let(file,size)=nuwax_map_chunks::archive_file(&root,&repo).unwrap();
+        assert!(store.insert_legacy(file,size,[9;32]).unwrap_err().contains("AR5"));
+        let legacy=GraphArtifactRef {id:"legacy-ar5".into(),size,sha256:vec![9;32],..Default::default()};
+        request(&mut store,&legacy,1,0,&[]).unwrap();request(&mut store,&legacy,2,0,&source).unwrap();
+        assert!(request(&mut store,&legacy,3,0,&[]).unwrap_err().contains("AR5"));
     }
     #[test]
     fn assigned_v2_store_still_reads_ar2_ar3_without_source_claims() {

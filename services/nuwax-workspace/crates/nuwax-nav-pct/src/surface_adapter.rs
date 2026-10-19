@@ -20,6 +20,7 @@ mod body_route_cancellation_tests {
 
     fn source() -> SurfaceSnapshot {
         crate::sampling_tests::sampled_room(true, false).with_body_envelope(SurfaceBodyEnvelope {
+            fixed_collision: None,
             footprint_xy_m: vec![[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],
             z_bounds_m: [-0.05,0.2], body_to_support_z_m: 0.4,
             max_step_up_m: 0.15, max_step_down_m: 0.15,
@@ -257,21 +258,30 @@ impl PctPlanner {
             regions=costs.len(),"局部接续反馈已加入当前目标的路线代价");
     }
     pub fn map(&self, source: &SurfaceSnapshot) -> Result<Arc<Tomogram>, String> {
+        self.map_with_delta(source, crate::SurfaceDelta::Rebuild)
+    }
+    /// Consume the source owner's complete delta using the existing immutable cache.
+    pub fn map_with_delta(&self, source: &SurfaceSnapshot, delta: crate::SurfaceDelta<'_>)
+        -> Result<Arc<Tomogram>, String>
+    {
         crate::cancellation::checkpoint()?;
-        {
+        let previous = {
             let cached = self.cached.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some((previous, map)) = cached
+            if let Some((_, map)) = cached
                 .as_ref()
                 .filter(|(previous, _)| same_source_geometry(previous, source))
             {
-                let _ = previous;
                 crate::cancellation::checkpoint()?;
                 return Ok(Arc::clone(map));
             }
-        }
+            cached.as_ref().map(|(_, map)| Arc::clone(map))
+        };
         // 构建在锁外执行；缓存只负责交付，不阻塞另一个已取得快照的搜索。
         let began = std::time::Instant::now();
-        let map = Arc::new(Tomogram::from_surface(source)?);
+        let map = Arc::new(match previous {
+            Some(previous) => previous.updated_from_surface(source, delta)?.0,
+            None => Tomogram::from_surface(source)?,
+        });
         tracing::info!(target: "navigation.pct", event="navigation.pct.map", cells=map.cells.len(),
             elapsed_ms=began.elapsed().as_secs_f64()*1000.0, "层析地图构建完成");
         crate::cancellation::checkpoint()?;
@@ -282,5 +292,210 @@ impl PctPlanner {
             .replace((source.clone(), Arc::clone(&map)));
         drop(old);
         Ok(map)
+    }
+}
+
+#[cfg(test)]
+mod delta_cache_tests {
+    use super::*;
+    use crate::{Cell, PlanningCancellation, SurfaceDelta};
+    use nuwax_nav_mls_planner::{SurfaceObservation, SurfaceObservations, mls_planner::Config};
+    use nuwax_nav_mls_planner::surface::GroundKey;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const Q: f32 = 0.125;
+    type Values = BTreeMap<[i32; 3], SurfaceObservation>;
+    type Identity = ([i32; 2], u64, Option<GroundKey>);
+
+    fn fixture() -> (SurfaceSnapshot, SurfaceObservations, Values) {
+        let values: Values = (0..8).flat_map(|x| (0..8).map(move |y| {
+            ([x,y,0], SurfaceObservation {observed_ns:10,hits:2})
+        })).collect();
+        let points: Vec<_> = values.keys().map(|key| (
+            (key[0] as f32+0.5)*Q,(key[1] as f32+0.5)*Q,(key[2] as f32+0.5)*Q,
+        )).collect();
+        let config = Config {
+            world_frame:"map".into(),voxel_size:0.25,robot_height:0.5,
+            surface_closing_radius:0.0,node_spacing_m:0.5,wall_clearance_m:0.0,
+            wall_buffer_m:0.0,wall_buffer_weight:0.0,max_slope_deg:0.0,
+            step_threshold_m:0.0,min_step_tread_depth_m:0.5,step_penalty_weight:1.0,
+            goal_tolerance:0.1,viz_publish_hz:0.0,
+        };
+        let base=SurfaceSnapshot::from_points(&points,config,Q).unwrap();
+        let mut observations=SurfaceObservations::new(Q,32).unwrap();
+        observations.replace_block([0,0,0],values.clone()).unwrap();
+        observations.mark_complete_geometry_source();
+        (base.with_observations(Some(Arc::new(observations.clone()))),observations,values)
+    }
+
+    fn replace(source:&SurfaceSnapshot,observations:&mut SurfaceObservations,values:&Values)
+        -> (SurfaceSnapshot,Vec<[i32;2]>) {
+        let changed=observations.replace_block_with_geometry_changes([0,0,0],values.clone()).unwrap();
+        observations.mark_complete_geometry_source();
+        (source.with_observations(Some(Arc::new(observations.clone()))),changed)
+    }
+    fn identity(cell:&Cell)->Identity {(cell.column,cell.ground.to_bits(),cell.source_ground)}
+    fn identities(map:&Tomogram)->Vec<Identity> {map.cells.iter().map(identity).collect()}
+
+    // Dense IDs may move during deletion. Compare all graph values by source identity,
+    // preserving column/neighbor/FIFO order and exact floating bits, then the real route.
+    fn exact(actual:&Tomogram,cold:&Tomogram) {
+        let parameters=|m:&Tomogram|[m.resolution,m.source_quantum,m.body_height,m.half_width,
+            m.step_up,m.step_down,m.slope,m.clearance_radius,m.minimum_cost].map(f64::to_bits);
+        assert_eq!(parameters(actual),parameters(cold));
+        assert_eq!(actual.occupied_volume,cold.occupied_volume);
+        assert_eq!(actual.known_columns,cold.known_columns);
+        assert_eq!(actual.xy_bounds,cold.xy_bounds);
+        assert_eq!(actual.ground_bounds.map(|v|v.map(f64::to_bits)),cold.ground_bounds.map(|v|v.map(f64::to_bits)));
+        assert_eq!(actual.window,cold.window);
+        let a=identities(actual);let b=identities(cold);
+        let indexed=|ids:&[Identity]|ids.iter().copied().enumerate().map(|(id,key)|(key,id)).collect::<BTreeMap<_,_>>();
+        let ai=indexed(&a);let bi=indexed(&b);
+        assert_eq!(ai.len(),a.len());assert_eq!(bi.len(),b.len());
+        assert_eq!(ai.keys().collect::<Vec<_>>(),bi.keys().collect::<Vec<_>>());
+        for (key,&id) in &ai {
+            let left=&actual.cells[id];let right=&cold.cells[bi[key]];
+            let bits=|c:&Cell|[c.ground,c.ground_interval[0],c.ground_interval[1],c.ceiling,
+                c.clearance,c.support_clearance,c.cost,c.terrain,c.terrain_upper].map(f64::to_bits);
+            assert_eq!((left.layer,left.ground_approximation,bits(left)),
+                (right.layer,right.ground_approximation,bits(right)),"{key:?}");
+            assert_eq!(left.neighbors.iter().map(|&id|a[id]).collect::<Vec<_>>(),
+                right.neighbors.iter().map(|&id|b[id]).collect::<Vec<_>>(),"{key:?}");
+        }
+        let columns=|m:&Tomogram,ids:&[Identity]|m.columns.iter().map(|(&xy,values)|
+            (xy,values.iter().map(|&id|ids[id]).collect::<Vec<_>>())).collect::<BTreeMap<_,_>>();
+        assert_eq!(columns(actual,&a),columns(cold,&b));
+        let occupancy=|m:&Tomogram|m.occupancy.iter().map(|(&xy,bands)|
+            (xy,bands.iter().map(|v|v.map(f64::to_bits)).collect::<Vec<_>>())).collect::<BTreeMap<_,_>>();
+        assert_eq!(occupancy(actual),occupancy(cold));
+        for (map,ids) in [(actual,&a),(cold,&b)] {
+            assert_eq!(map.seed_order.ids().collect::<BTreeSet<_>>(),(0..ids.len()).collect());
+        }
+        assert_eq!(actual.seed_order.ids().map(|id|a[id]).collect::<Vec<_>>(),
+            cold.seed_order.ids().map(|id|b[id]).collect::<Vec<_>>());
+        let point=|xy:[i32;2]|[(f64::from(xy[0])+0.5)*f64::from(Q),
+            (f64::from(xy[1])+0.5)*f64::from(Q),f64::from(Q)];
+        let start=point([1,1]);let goal=point([6,6]);
+        let ar=actual.plan(start,goal,0.001,&[],None).unwrap();
+        let br=cold.plan(start,goal,0.001,&[],None).unwrap();
+        assert_eq!(ar.points.iter().map(|p|p.map(f64::to_bits)).collect::<Vec<_>>(),
+            br.points.iter().map(|p|p.map(f64::to_bits)).collect::<Vec<_>>());
+        assert_eq!((ar.stats.expanded,ar.stats.cells),(br.stats.expanded,br.stats.cells));
+        for (map,route) in [(actual,&ar),(cold,&br)] {
+            assert!(route.points.windows(2).all(|pair|map.segment_clear(pair[0],pair[1],&[])));
+        }
+    }
+
+    fn retained(planner:&PctPlanner,source:&SurfaceSnapshot,map:&Arc<Tomogram>) {
+        let cached=planner.cached.lock().unwrap();
+        let (cached_source,cached_map)=cached.as_ref().expect("完整旧缓存仍在");
+        assert!(same_source_geometry(cached_source,source));
+        assert!(Arc::ptr_eq(cached_map,map));
+    }
+
+    #[test]
+    fn cache_complete_column_delta_includes_deletion_and_matches_cold_graph_and_route() {
+        let (source,mut observations,mut values)=fixture();
+        let planner=PctPlanner::default();let old=planner.map(&source).unwrap();
+        let frozen=old.as_ref().clone();
+        let deleted_id=old.columns[&[0,0]][0];
+        let last=identity(&old.cells[old.cells.len()-1]);
+        assert_ne!(last.0,[0,0]);assert_ne!(last.0,[3,3]);
+        values.remove(&[0,0,0]);
+        values.insert([3,3,2],SurfaceObservation{observed_ns:20,hits:2});
+        let (next_source,changed)=replace(&source,&mut observations,&values);
+        assert_eq!(changed,vec![[0,0],[3,3]]);
+        let next=planner.map_with_delta(&next_source,SurfaceDelta::Columns {
+            basis:&source,resolution:f64::from(Q),columns:&changed,
+        }).unwrap();
+        assert!(!Arc::ptr_eq(&old,&next));
+        assert_eq!(identity(&next.cells[deleted_id]),last,
+            "适配器必须消费旧图的真实删除/ID搬移，不能总是静默冷建");
+        assert!(!next.known_columns.contains(&[0,0]));
+        assert!(!next.occupancy.contains_key(&[0,0]));
+        assert_eq!(next_source.observations().unwrap().column_levels(0,0),None);
+        assert_eq!(next_source.observations().unwrap().column_levels(3,3),Some([0,2].as_slice()));
+        assert!(next.matches_surface(&next_source));
+        exact(&next,&Tomogram::from_surface(&next_source).unwrap());
+        exact(&old,&frozen);
+        retained(&planner,&next_source,&next);
+        assert!(Arc::ptr_eq(&next,&planner.map(&next_source).unwrap()));
+    }
+
+    #[test]
+    fn cache_metadata_only_delta_reuses_arc_then_accepts_the_current_basis() {
+        let (source,mut observations,mut values)=fixture();
+        let planner=PctPlanner::default();let old=planner.map(&source).unwrap();
+        for value in values.values_mut() {value.observed_ns=900;value.hits=17;}
+        let (timed,changed)=replace(&source,&mut observations,&values);
+        assert!(changed.is_empty());assert!(same_source_geometry(&source,&timed));
+        assert_eq!(timed.observations().unwrap().get([3,3,0]).unwrap().observed_ns,900);
+        let reused=planner.map_with_delta(&timed,SurfaceDelta::Unchanged{basis:&source}).unwrap();
+        assert!(Arc::ptr_eq(&old,&reused));
+        exact(&reused,&Tomogram::from_surface(&timed).unwrap());
+        values.insert([3,3,2],SurfaceObservation{observed_ns:901,hits:2});
+        let (next_source,changed)=replace(&timed,&mut observations,&values);
+        let next=planner.map_with_delta(&next_source,SurfaceDelta::Columns {
+            basis:&timed,resolution:f64::from(Q),columns:&changed,
+        }).unwrap();
+        assert!(!Arc::ptr_eq(&reused,&next));
+        exact(&next,&Tomogram::from_surface(&next_source).unwrap());
+        retained(&planner,&next_source,&next);
+    }
+
+    #[test]
+    fn cache_wrong_delta_basis_rebuilds_all_current_columns() {
+        let (source,mut observations,mut values)=fixture();
+        let planner=PctPlanner::default();let old=planner.map(&source).unwrap();
+        values.insert([3,3,2],SurfaceObservation{observed_ns:20,hits:2});
+        let (skipped,changed)=replace(&source,&mut observations,&values);
+        assert_eq!(changed,vec![[3,3]]);
+        assert!(!old.matches_surface(&skipped));
+        values.remove(&[0,0,0]);
+        let (next_source,changed)=replace(&skipped,&mut observations,&values);
+        assert_eq!(changed,vec![[0,0]],"delta相对被跳过基底是完整的，但不包含此前变化");
+        let next=planner.map_with_delta(&next_source,SurfaceDelta::Columns {
+            basis:&skipped,resolution:f64::from(Q),columns:&changed,
+        }).unwrap();
+        let cold=Tomogram::from_surface(&next_source).unwrap();
+        assert_eq!(identities(&next),identities(&cold),"错误基底必须实际冷建");
+        assert_eq!(next.occupancy[&[3,3]].len(),2,"不能丢掉不在本次delta内的先前变化");
+        assert!(!next.known_columns.contains(&[0,0]));
+        exact(&next,&cold);
+        retained(&planner,&next_source,&next);
+    }
+
+    #[test]
+    fn cache_cancelled_delta_keeps_complete_previous_map_and_fresh_retry_matches_cold() {
+        let (source,mut observations,mut values)=fixture();
+        values.remove(&[0,0,0]);
+        values.insert([3,3,2],SurfaceObservation{observed_ns:20,hits:2});
+        let (next_source,changed)=replace(&source,&mut observations,&values);
+        let cold=Tomogram::from_surface(&next_source).unwrap();
+        // 0 是入口；8/64 确定性覆盖已消费 delta 后的真实构图工作。
+        // 不把依赖实现的计数冒称某一固定内部阶段。
+        for count in [0,8,64] {
+            let planner=PctPlanner::default();let old=planner.map(&source).unwrap();
+            let frozen=old.as_ref().clone();
+            let flag=Arc::new(AtomicBool::new(false));let flip=flag.clone();
+            let token=PlanningCancellation::from_flag(flag.clone());
+            let result=crate::cancellation::after_checkpoint_action(count,
+                move||flip.store(true,Ordering::Release),||crate::with_planning_cancellation(&token,||
+                    planner.map_with_delta(&next_source,SurfaceDelta::Columns {
+                        basis:&source,resolution:f64::from(Q),columns:&changed,
+                    })));
+            assert!(flag.load(Ordering::Acquire),"未到达取消检查点 {count}");
+            assert_eq!(result.unwrap_err(),"层析规划已取消","checkpoint={count}");
+            assert!(!crate::planning_cancelled());
+            retained(&planner,&source,&old);exact(&old,&frozen);
+            let fresh=PlanningCancellation::from_flag(Arc::new(AtomicBool::new(false)));
+            let retry=crate::with_planning_cancellation(&fresh,||planner.map_with_delta(&next_source,
+                SurfaceDelta::Columns{basis:&source,resolution:f64::from(Q),columns:&changed})).unwrap();
+            assert!(!Arc::ptr_eq(&old,&retry));
+            exact(&retry,&cold);exact(&old,&frozen);
+            retained(&planner,&next_source,&retry);
+            assert!(Arc::ptr_eq(&retry,&planner.map(&next_source).unwrap()));
+        }
     }
 }

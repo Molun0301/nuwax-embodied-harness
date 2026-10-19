@@ -19,6 +19,8 @@ pub struct HeightfieldFragment {
 pub enum GroundRecord {
     LegacyPlane(LayerObservation),
     HeightfieldV1(HeightfieldFragment),
+    /// Classified XY with no ground claim. Occupancy remains solid evidence.
+    ClassifiedEmptyColumn {},
 }
 /// One original decode-cache value. Legacy readers retain their original Arc.
 #[derive(Clone, Debug, PartialEq)]
@@ -30,6 +32,7 @@ pub enum GroundRecords {
 pub enum GroundRecordRef<'a> {
     LegacyPlane(&'a LayerObservation),
     HeightfieldV1(&'a HeightfieldFragment),
+    ClassifiedEmptyColumn,
 }
 pub enum GroundRecordIter<'a> {
     Legacy(std::collections::btree_map::Iter<'a, u16, LayerObservation>),
@@ -43,6 +46,7 @@ impl<'a> Iterator for GroundRecordIter<'a> {
             Self::Versioned(iter) => iter.next().map(|(&k, v)| (k, match v {
                 GroundRecord::LegacyPlane(v) => GroundRecordRef::LegacyPlane(v),
                 GroundRecord::HeightfieldV1(v) => GroundRecordRef::HeightfieldV1(v),
+                GroundRecord::ClassifiedEmptyColumn {} => GroundRecordRef::ClassifiedEmptyColumn,
             })),
         }
     }
@@ -71,6 +75,7 @@ impl GroundRecords {
             Self::Versioned(v) => v.get(&key).map(|r| match r {
                 GroundRecord::LegacyPlane(v) => GroundRecordRef::LegacyPlane(v),
                 GroundRecord::HeightfieldV1(v) => GroundRecordRef::HeightfieldV1(v),
+                GroundRecord::ClassifiedEmptyColumn {} => GroundRecordRef::ClassifiedEmptyColumn,
             }),
         }
     }
@@ -78,12 +83,15 @@ impl GroundRecords {
         if matches!(self, Self::Legacy(_)) { *self = Self::Versioned(Arc::new(self.owned_versioned())); }
         match self { Self::Versioned(v) => Arc::make_mut(v), Self::Legacy(_) => unreachable!() }
     }
-    pub(crate) fn compact(self) -> Self {
+    pub(crate) fn compact(self, block: &Block) -> Self {
         match self {
-            Self::Versioned(v) if v.values().all(|r| matches!(r, GroundRecord::LegacyPlane(_))) => {
+            Self::Versioned(v) if v.values().all(|r| match r {
+                GroundRecord::LegacyPlane(layer) => layer.latest_timestamp_ns() <= layer.members.iter().map(|k| block[k].observed_ns).max().unwrap_or(0),
+                GroundRecord::HeightfieldV1(_) | GroundRecord::ClassifiedEmptyColumn {} => false,
+            }) => {
                 let records = Arc::try_unwrap(v).unwrap_or_else(|v| v.as_ref().clone());
                 Self::Legacy(Arc::new(records.into_iter().filter_map(|(k,r)| match r {
-                    GroundRecord::LegacyPlane(v) => Some((k,v)), GroundRecord::HeightfieldV1(_) => None,
+                    GroundRecord::LegacyPlane(v) => Some((k,v)), GroundRecord::HeightfieldV1(_) | GroundRecord::ClassifiedEmptyColumn {} => None,
                 }).collect()))
             }
             other => other,
@@ -106,6 +114,7 @@ impl GroundRecords {
     pub(crate) fn bytes(&self) -> usize {
         self.iter().map(|(_, r)| match r {
             GroundRecordRef::LegacyPlane(v) => terrain_observations::layer_bytes(v),
+            GroundRecordRef::ClassifiedEmptyColumn => 128,
             GroundRecordRef::HeightfieldV1(v) => {
                 let mut sources = BTreeSet::new();
                 128 + v.members.len() * (8 * 8 + 2) + v.samples.len() * 64
@@ -123,6 +132,7 @@ impl GroundRecords {
                     (GroundRecordRef::HeightfieldV1(a), GroundRecordRef::HeightfieldV1(b)) =>
                         a.anchor == b.anchor && a.height_m == b.height_m && a.occupied_bounds == b.occupied_bounds
                             && a.members.iter().map(|p| p.0).eq(b.members.iter().map(|p| p.0)),
+                    (GroundRecordRef::ClassifiedEmptyColumn, GroundRecordRef::ClassifiedEmptyColumn) => true,
                     _ => false,
                 };
                 if !same { return false; }
@@ -139,6 +149,8 @@ pub struct HeightfieldSurface {
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct ColumnGroundRecords {
+    /// Mutually exclusive with actual ground records. No height or permission.
+    pub classified_empty: bool,
     pub legacy: Vec<(Key, LayerObservation)>,
     pub heightfields: Vec<HeightfieldSurface>,
 }
@@ -146,14 +158,19 @@ pub struct ColumnGroundRecords {
 pub(crate) fn validate_records(records: &GroundRecords, block: &Block) -> Result<(), String> {
     if let GroundRecords::Legacy(v) = records { return terrain_observations::validate_layers(v, block); }
     if records.iter().count() > MAX_LAYERS_PER_BLOCK { return Err("ground record count exceeds block budget".into()); }
+    let mut latest = None;
     let mut claimed = BTreeSet::new();
+    let mut empty_columns = BTreeSet::new();
+    let mut ground_columns = BTreeSet::new();
     for (key, record) in records.iter() {
         match record {
             GroundRecordRef::LegacyPlane(v) => {
-                terrain_observations::validate_layers(&BTreeMap::from([(key, v.clone())]), block)?;
+                ground_columns.insert(key % 1024);
+                terrain_observations::validate_versioned_legacy(&BTreeMap::from([(key, v.clone())]), block, *latest.get_or_insert_with(|| block.values().map(|v| v.observed_ns).max().unwrap_or(0)))?;
                 if v.members.iter().any(|m| !claimed.insert(*m)) { return Err("overlapping ground record members".into()); }
             }
             GroundRecordRef::HeightfieldV1(v) => {
+                ground_columns.insert(key % 1024);
                 if v.members.is_empty() || v.members.len() > MAX_LAYER_MEMBERS || v.members[0].0 != key
                     || v.members.windows(2).any(|w| w[0].0 >= w[1].0)
                     || !v.height_m.is_finite() || !v.occupied_bounds.iter().all(|n| n.is_finite())
@@ -169,6 +186,38 @@ pub(crate) fn validate_records(records: &GroundRecords, block: &Block) -> Result
                     return Err("heightfield sample exceeds occupancy evidence".into());
                 }
             }
+            GroundRecordRef::ClassifiedEmptyColumn => {
+                if key >= 1024 || !(0..32_u16).any(|z| block.contains_key(&(key + z*1024))) {
+                    return Err("classified empty column lacks local occupancy".into());
+                }
+                empty_columns.insert(key);
+            }
+        }
+    }
+    if !empty_columns.is_disjoint(&ground_columns) {
+        return Err("classified empty column conflicts with ground records".into());
+    }
+    Ok(())
+}
+
+/// Only the new BL4 variant can retain a diagnostic detached from ground
+/// membership. Original members already prove the old contract. Any newer
+/// diagnostic must be backed by its own actual occupied voxel in this block.
+pub(crate) fn validate_legacy_sample_occupancy(records: &GroundRecords, block: &Block, key: Key, q: f32) -> Result<(), String> {
+    let GroundRecords::Versioned(records) = records else { return Ok(()); };
+    let reciprocal = 1.0 / f64::from(q);
+    for record in records.values() {
+        let GroundRecord::LegacyPlane(layer) = record else { continue; };
+        let member_time = layer.members.iter().map(|k| block[k].observed_ns).max().unwrap_or(0);
+        for sample in layer.samples.iter().filter(|s| s.source_timestamp_ns > member_time) {
+            let cells = sample.point.map(|v| (v * reciprocal).floor());
+            if cells.iter().any(|v| !v.is_finite() || *v < f64::from(i32::MIN) || *v > f64::from(i32::MAX)) {
+                return Err("legacy diagnostic lacks actual occupancy evidence".into());
+            }
+            let actual = cells.map(|v| v as i32);
+            if block_key(actual) != key || !block.get(&local_key(actual)).is_some_and(|v| sample.source_timestamp_ns <= v.observed_ns) {
+                return Err("legacy diagnostic lacks actual occupancy evidence".into());
+            }
         }
     }
     Ok(())
@@ -180,6 +229,7 @@ pub(crate) fn assemble_column(
     xy: [i32; 2], q: f32, blocks: &[(Key, GroundRecords)],
 ) -> Result<ColumnGroundRecords, String> {
     let mut legacy = Vec::new();
+    let mut classified_empty = false;
     let mut groups: BTreeMap<Key, Vec<(Key, &HeightfieldFragment)>> = BTreeMap::new();
     let local_xy = local_key([xy[0], xy[1], 0]) % 1024;
     for (block, records) in blocks {
@@ -192,9 +242,16 @@ pub(crate) fn assemble_column(
                     if v.anchor[..2] != xy { return Err("heightfield anchor changes XY".into()); }
                     groups.entry(v.anchor).or_default().push((*block, v));
                 }
+                Some(GroundRecordRef::ClassifiedEmptyColumn) => {
+                    if classified_empty { return Err("duplicate classified empty column".into()); }
+                    classified_empty = true;
+                }
                 None => {},
             }
         }
+    }
+    if classified_empty && (!legacy.is_empty() || !groups.is_empty()) {
+        return Err("classified empty column conflicts with ground records".into());
     }
     let mut heightfields = Vec::new();
     for (anchor, fragments) in groups {
@@ -220,10 +277,14 @@ pub(crate) fn assemble_column(
         samples.truncate(MAX_LAYER_SAMPLES);
         heightfields.push(HeightfieldSurface { column, samples });
     }
-    Ok(ColumnGroundRecords { legacy, heightfields })
+    Ok(ColumnGroundRecords { classified_empty, legacy, heightfields })
 }
 
 pub(crate) fn split_column(xy: [i32; 2], q: f32, column: &ColumnGroundRecords) -> Result<BTreeMap<Key, BTreeMap<u16, GroundRecord>>, String> {
+    if column.classified_empty && (!column.legacy.is_empty() || !column.heightfields.is_empty()) {
+        return Err("classified empty column conflicts with ground records".into());
+    }
+    // The Writer attaches an empty declaration to one actual occupied shard.
     let mut out: BTreeMap<Key, BTreeMap<u16, GroundRecord>> = BTreeMap::new();
     for (block, layer) in &column.legacy {
         let key = global_key(*block, *layer.members.first().ok_or("empty legacy column")?)?;
@@ -281,10 +342,10 @@ pub(crate) fn validate_root_columns(
     Ok(())
 }
 pub(crate) fn heightfield_columns(block: Key, records: &GroundRecords, out: &mut BTreeSet<[i32; 2]>) -> Result<(), String> {
-    for (key, record) in records.iter() {
-        if matches!(record, GroundRecordRef::HeightfieldV1(_)) {
-            let global = global_key(block, key)?; out.insert([global[0], global[1]]);
-        }
+    // In root5 a changed Legacy record may conflict with an unchanged empty
+    // marker in another z shard. Collect all records in only the touched block.
+    for (key, _) in records.iter() {
+        let global = global_key(block, key)?; out.insert([global[0], global[1]]);
     }
     Ok(())
 }

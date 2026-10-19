@@ -43,3 +43,6 @@ tokio = { workspace = true, optional = true, features = ["time"] }
 serde = { workspace = true, features = ["derive"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+nuwax-map-chunks = { path = "../nuwax-map-chunks" }

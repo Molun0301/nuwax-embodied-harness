@@ -29,6 +29,20 @@ pub enum SurfaceGeometryChanges {
     Unknown,
 }
 
+/// 将既有完整变更证据借给 PCT；不复制列，不从当前占据反推删除。
+/// 基准与查询参数是否匹配由持有旧层析图的 PCT 拥有方再次核验。
+pub fn pct_surface_delta<'a>(basis:Option<&'a SurfaceSnapshot>,changes:&'a SurfaceGeometryChanges)
+    ->nuwax_nav_pct::SurfaceDelta<'a> {
+    let Some(basis)=basis else {return nuwax_nav_pct::SurfaceDelta::Rebuild;};
+    match changes {
+        SurfaceGeometryChanges::Empty=>nuwax_nav_pct::SurfaceDelta::Unchanged {basis},
+        SurfaceGeometryChanges::Columns {fine_size,fine,..}=>nuwax_nav_pct::SurfaceDelta::Columns {
+            basis,resolution:f64::from(*fine_size),columns:fine.as_slice(),
+        },
+        SurfaceGeometryChanges::Unknown=>nuwax_nav_pct::SurfaceDelta::Rebuild,
+    }
+}
+
 // Source owners classify map/relocation/mask changes as Unknown. Independently
 // enforce model, frame and query-configuration semantics when coalescing too, so
 // a transient change followed by a reversal cannot be lost before delivery.
@@ -143,7 +157,9 @@ impl SurfaceJobTicket {
         // admission still validates the candidate against the latest guard.
         if self.changes.is_empty() {return true;}
         let Some(model)=latest.body_envelope() else {return false;};
-        let work=model.footprint_xy_m.len().checked_add(path.poses.len()).and_then(|n|n.checked_add(self.columns));
+        let work=model.footprint_xy_m.len().checked_add(path.poses.len())
+            .and_then(|n|n.checked_add(model.fixed_collision.as_ref().map_or(0,|g|g.primitives.len())))
+            .and_then(|n|n.checked_add(self.columns));
         if work.is_none_or(|n|n>MAX_REFERENCE_SCOPE_WORK) {return false;}
         let Some(corridor)=ReferenceCorridor::new(latest,path) else {return false;};
         self.changes.iter().all(|change|match change.as_ref() {

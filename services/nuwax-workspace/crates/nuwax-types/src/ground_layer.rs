@@ -18,6 +18,8 @@ pub enum GroundEvidence {
 pub enum GroundApproximation {
     /// Representative plane from bounded, associated actual return samples.
     ObservedLayer,
+    /// 源端同一 XY 列的固定地表高度；成员和可选方向仍由原始源记录拥有。
+    ObservedHeightfield,
     /// Midpoint of the quantized contact-height interval, not an observed mean.
     LegacyContactInterval,
     /// Exposed top of an occupied volume, not a measured surface statistic.

@@ -87,6 +87,9 @@ pub struct SurfaceObservations {
     pub(super) legacy_reference_cache: Arc<std::sync::Mutex<super::body::reference_field::LegacyReferenceCache>>,
 }
 impl SurfaceObservations {
+    /// Resolution of this observation source, in metres.
+    pub fn voxel_size_m(&self) -> f32 { self.size_m }
+
     pub(super) fn fork_for_planning(&self) -> Self {
         Self {
             size_m: self.size_m,
@@ -280,6 +283,12 @@ impl SurfaceObservations {
     pub fn ground_records(&self,column:[i32;2])->impl Iterator<Item=SourceGroundRecord<'_>> {
         self.ground_layers(column).map(SourceGroundRecord::LegacyPlane)
             .chain(self.native_ground.records(column))
+    }
+
+    /// This admitted XY was classified with no ground declaration. This is
+    /// neither a support requirement nor an obstacle; actual occupancy is separate.
+    pub fn classified_empty_ground(&self,column:[i32;2])->bool {
+        self.native_ground.classified_empty(column)
     }
 
     pub fn ground_record(&self,key:GroundKey)->Option<SourceGroundRecord<'_>> {

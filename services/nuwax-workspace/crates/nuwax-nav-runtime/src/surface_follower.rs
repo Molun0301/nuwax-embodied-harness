@@ -979,12 +979,24 @@ fn closest_in_window(
 
 // Carry provenance when the projection is selected; do not recover an index
 // afterwards from s, which cannot distinguish same-position yaw waypoints.
+struct PathProjection {progress:f64,pose:PoseStamped,index:usize,fraction:f64}
 fn closest_in_window_with_segment(
+    path:&Path3D,cumulative:&[f64],position:Point3,begin:f64,end:f64,
+)->(f64,PoseStamped,usize) {
+    let selected=closest_in_window_with_address::<false>(path,cumulative,position,begin,end);
+    (selected.progress,selected.pose,selected.index)
+}
+fn closest_in_window_with_address<const XY:bool>(
     path: &Path3D, cumulative: &[f64], position: Point3, begin: f64, end: f64,
-) -> (f64, PoseStamped, usize) {
+) -> PathProjection {
+    let distance=|a:Point3,b:Point3|if XY {(a.x-b.x).hypot(a.y-b.y)}else{a.distance(b)};
     let mut best_s = begin;
     let (mut best,mut best_index) = pose_at_distance_with_segment(path, cumulative, begin);
-    let mut best_distance = best.pose.position.distance(position);
+    let mut best_distance = distance(best.pose.position,position);
+    let mut best_fraction=if best_index>0 && best_index<cumulative.len()
+        && cumulative[best_index]>cumulative[best_index-1] {
+        ((begin-cumulative[best_index-1])/(cumulative[best_index]-cumulative[best_index-1])).clamp(0.0,1.0)
+    }else{0.0};
     let first_segment = cumulative
         .partition_point(|distance| *distance < begin)
         .saturating_sub(1);
@@ -1001,30 +1013,32 @@ fn closest_in_window_with_segment(
         let a = path.poses[index].pose.position;
         let b = path.poses[index + 1].pose.position;
         // 完整三维端点已经到达时吸收浮点余量，避免一直指向数值上同位置的折点。
-        if b.distance(position) <= 1e-6 && end_s >= begin && end_s <= end + 1e-6 {
+        if distance(b,position) <= 1e-6 && end_s >= begin && end_s <= end + 1e-6 {
             best_s = end_s;
             best = path.poses[index + 1].clone();
             best_index = index + 1;
-            best_distance = b.distance(position);
+            best_fraction = 1.0;
+            best_distance = distance(b,position);
             continue;
         }
-        let delta = [b.x - a.x, b.y - a.y, b.z - a.z];
-        let offset = [position.x - a.x, position.y - a.y, position.z - a.z];
+        let delta = [b.x - a.x, b.y - a.y, if XY {0.0}else{b.z-a.z}];
+        let offset = [position.x - a.x, position.y - a.y, if XY {0.0}else{position.z-a.z}];
         let ratio = (delta.iter().zip(offset).map(|(x, y)| x * y).sum::<f64>() / (length * length))
             .clamp(
                 ((begin - start_s) / length).max(0.0),
                 ((end - start_s) / length).min(1.0),
             );
         let candidate = interpolate_pose(&path.poses[index], &path.poses[index + 1], ratio);
-        let distance = candidate.pose.position.distance(position);
+        let distance = distance(candidate.pose.position,position);
         if distance < best_distance {
             best_distance = distance;
             best_s = start_s + ratio * length;
             best = candidate;
             best_index = index + 1;
+            best_fraction = ratio;
         }
     }
-    (best_s, best, best_index)
+    PathProjection {progress:best_s,pose:best,index:best_index,fraction:best_fraction}
 }
 
 #[cfg(test)]

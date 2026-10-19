@@ -31,6 +31,44 @@ struct GroundActualProposal {
 fn checkpoint(cancelled:Option<&AtomicBool>)->Result<(),String> {
     if cancelled.is_some_and(|flag|flag.load(Ordering::Relaxed)) {Err("ground consumption cancelled".into())}else{Ok(())}
 }
+fn ground_xy_lengths(path:&Path3D)->Vec<f64> {
+    let mut cumulative=Vec::with_capacity(path.poses.len());cumulative.push(0.0);
+    for pair in path.poses.windows(2) {
+        cumulative.push(cumulative.last().unwrap()+(pair[1].pose.position.x-pair[0].pose.position.x)
+            .hypot(pair[1].pose.position.y-pair[0].pose.position.y));
+    }
+    cumulative
+}
+fn zero_admission_connector(binding:&GroundCandidateBinding,edge:usize)->bool {
+    binding.edges().get(edge).is_some_and(|edge|
+        edge.origin()==nuwax_nav_scan::CandidateEdgeOrigin::AdmissionConnector
+            && edge.motion()[0]==edge.motion()[1])
+}
+fn validate_ground_seam(candidate:&nuwax_nav_pct::ground_route::GroundCandidateReference,right:usize,
+    query:&nuwax_nav_mls_planner::surface::SurfaceBodyQueryView,pose:([f64;3],[f64;4]),
+    ground:&nuwax_nav_mls_planner::surface::BodyGroundState,boundary:&[[f64;2]])
+    ->Result<nuwax_nav_mls_planner::surface::BodyGroundState,String> {
+    let mut witness=None;
+    candidate.with_body_navigation_seam(right,[pose.0[0],pose.0[1]],|navigation|
+        query.validate_motion_with_navigation(pose,pose,ground,navigation,boundary,&mut witness))
+        .map_err(|e|e.to_string())?.map_err(|e|format!("ground splice: {e}; {witness:?}"))
+}
+#[cfg(test)]
+thread_local! {static ADMISSION_CANCEL:std::cell::RefCell<Option<(&'static str,usize,Arc<AtomicBool>)>>=
+    const {std::cell::RefCell::new(None)};}
+#[cfg(test)]
+fn admission_cancel_probe(stage:&'static str) {
+    ADMISSION_CANCEL.with_borrow_mut(|slot|if let Some((target,remaining,flag))=slot {
+        if *target==stage && *remaining>0 {*remaining-=1;if *remaining==0 {flag.store(true,Ordering::Relaxed);}}
+    });
+}
+#[cfg(test)]
+pub(super) fn cancel_ground_admission_at_for_test<T>(stage:&'static str,occurrence:usize,
+    flag:Arc<AtomicBool>,run:impl FnOnce()->T)->T {
+    struct Restore(Option<(&'static str,usize,Arc<AtomicBool>)>);
+    impl Drop for Restore {fn drop(&mut self) {ADMISSION_CANCEL.with_borrow_mut(|slot|*slot=self.0.take());}}
+    let _restore=Restore(ADMISSION_CANCEL.replace(Some((stage,occurrence,flag))));run()
+}
 fn pose_at(path:&Path3D,cursor:GroundCursor)->PoseStamped {
     if path.poses.len()==1 {return path.poses[0].clone();}
     let a=&path.poses[cursor.edge];let b=&path.poses[cursor.edge+1];
@@ -46,11 +84,13 @@ impl GroundExecution {
     pub(super) fn basis(&self)->GroundActualBasis {self.basis_at(self.cursor,&self.last_actual)}
 }
 impl SurfaceFollower {
-    /// An explicit new candidate starts at its own first actual pose. A retained
-    /// resume token is owner-coupled; there is no nearest-route reattachment.
-    pub(crate) fn admit_ground_candidate(&mut self,path:Path3D,goal:PoseStamped,
-        binding:Arc<GroundCandidateBinding>,resume:Option<GroundResume>,cancelled:Option<&AtomicBool>)
+    /// Exact initial installation, retained resume, and moving replacement
+    /// share one commit. A moving replacement begins with a real, unconsumed
+    /// connector from the current actual basis, then retains the original grid.
+    pub(crate) fn admit_ground_candidate(&mut self,mut path:Path3D,goal:PoseStamped,
+        mut binding:Arc<GroundCandidateBinding>,resume:Option<GroundResume>,cancelled:Option<&AtomicBool>)
         ->Result<(),String> {
+        self.last_command_dispatch_bound=None;
         checkpoint(cancelled)?;
         self.refresh_current_body_view();
         if path.poses.len()!=binding.edges().len()+1 {
@@ -78,31 +118,74 @@ impl SurfaceFollower {
         if !binding.candidate().matches_source(map) {return Err("ground candidate source retired".into());}
         let actual=self.odometry.as_ref().ok_or("ground candidate has no actual pose")?;
         crate::validate_map_pose(actual,"ground candidate actual").map_err(|e|e.to_string())?;
-        // A new candidate owns its exact first full pose. Even ratio-zero
-        // interpolation normalizes the quaternion and may change its bits.
-        let selected=resume.as_ref().map_or_else(||path.poses[0].clone(),|resume|resume.actual.clone());
-        // A nonzero connector must be a real candidate edge. Admission cannot
-        // consume an unexecuted bridge between actual and an old route address.
-        if actual.pose!=selected.pose {return Err("resume requires an explicit unconsumed connector".into());}
         let (_,ground)=self.current_ground_query_owned()?;
+        if resume.is_some() {
+            if actual.pose!=resume.as_ref().unwrap().actual.pose {
+                return Err("resume requires an explicit unconsumed connector".into());
+            }
+        } else if self.ground_execution.is_some() || actual.pose!=path.poses[0].pose {
+            // Read the latest real observation without first committing the old
+            // candidate's progress. A new predicted prefix is never an actual seed.
+            let proposal=self.propose_ground_actual(cancelled)?;
+            let incoming=proposal.basis.walk_state()?;
+            let owner=binding.original_window().owner();
+            if !incoming.same_reference_owner(owner) {return Err("moving candidate reference owner changed".into());}
+            if binding.edges().is_empty() {return Err("moving singleton has no directed suffix".into());}
+            let xy_lengths=ground_xy_lengths(&path);
+            let selected=if path.poses[0].pose.position.x==actual.pose.position.x
+                && path.poses[0].pose.position.y==actual.pose.position.y {
+                super::PathProjection {progress:0.0,pose:path.poses[0].clone(),index:1,fraction:0.0}
+            }else {
+                super::closest_in_window_with_address::<true>(&path,&xy_lengths,actual.pose.position,
+                    0.0,self.config.max_path_deviation_m)
+            };
+            if (selected.pose.pose.position.x-actual.pose.position.x)
+                .hypot(selected.pose.pose.position.y-actual.pose.position.y)>self.config.max_path_deviation_m {
+                return Err("new ground suffix is outside the original connection window".into());
+            }
+            let query=incoming.bind_body_query(map).map_err(|e|e.to_string())?;
+            let connector=body_control::record_ground_connector(map,&query,body_control::body(actual),&ground,
+                incoming,&selected.pose,&self.boundary,cancelled,|| {
+                    #[cfg(test)] admission_cancel_probe("connector");
+                    checkpoint(cancelled).is_ok()
+                });
+            checkpoint(cancelled)?;
+            let (connector,end_ground)=connector.ok_or("new ground suffix has no valid actual connector")?;
+            let prefix=owner.freeze_candidate_from(incoming,connector.segments).map_err(|e|e.to_string())?;
+            let seam=prefix.connection_count();
+            let joined=binding.prepend_admission_connector(prefix,&connector.poses,
+                selected.index-1,selected.fraction)?;
+            let at=*connector.poses.last().expect("real connector has its actual start");
+            let seam_ground=validate_ground_seam(joined.candidate(),seam,&query,at,&end_ground,&self.boundary)?;
+            let target=joined.edges()[seam].motion()[1];
+            let xy=[target.0[0],target.0[1]];
+            let q=target.1;let yaw=Quaternion{x:q[0],y:q[1],z:q[2],w:q[3]}.yaw();
+            let mut witness=None;
+            let projected=joined.candidate().with_body_navigation_slice(seam,0.0,1.0,[at.0[0],at.0[1]],xy,
+                |navigation|query.project_motion_with_navigation(at,&seam_ground,xy,yaw,navigation,&mut witness))
+                .map_err(|e|e.to_string())?.map_err(|e|format!("ground suffix projection: {e}; {witness:?}"))?;
+            query.validate_projected_motion(at,&projected,&self.boundary,&mut witness)
+                .map_err(|e|format!("ground suffix sweep: {e}; {witness:?}"))?;
+            // Original suffix XY/yaw/grid are guidance. Never teleport the real
+            // connector endpoint to the old candidate's planned Z or attitude.
+            let stamped=|body:([f64;3],[f64;4])| {
+                let mut pose=actual.clone();pose.pose.position=Point3::new(body.0[0],body.0[1],body.0[2]);
+                pose.pose.orientation=Quaternion{x:body.1[0],y:body.1[1],z:body.1[2],w:body.1[3]};pose
+            };
+            let mut poses=Vec::with_capacity(joined.edges().len()+1);
+            poses.push(actual.clone());poses.extend(joined.edges().iter().map(|edge|stamped(edge.motion()[1])));
+            path=Path3D {poses};binding=Arc::new(joined);
+        }
         let navigation=binding.candidate().walk_state_at(cursor.edge,cursor.fraction,
             [actual.pose.position.x,actual.pose.position.y]).ok_or("invalid candidate address")?;
         let query=navigation.bind_body_query(map).map_err(|e|e.to_string())?;
         body_control::validate_control_actual_pose(&query,body_control::body(actual),&ground,
             Some(navigation),&self.boundary)?;
         let cumulative=cumulative_lengths(&path);
-        let mut xy_cumulative=Vec::with_capacity(path.poses.len());xy_cumulative.push(0.0);
-        for pair in path.poses.windows(2) {
-            xy_cumulative.push(xy_cumulative.last().unwrap()+(pair[1].pose.position.x-pair[0].pose.position.x)
-                .hypot(pair[1].pose.position.y-pair[0].pose.position.y));
-        }
+        let xy_cumulative=ground_xy_lengths(&path);
+        #[cfg(test)] admission_cancel_probe("commit");
         checkpoint(cancelled)?;
-        // A retained resume already owns the actual target-switching state.
-        // Its waypoint target may be ahead of the still-partial geometric edge.
-        if resume.is_none() {
-            self.progress_m=0.0;
-            self.path_index=1;
-        }
+        if resume.is_none() {self.progress_m=0.0;self.path_index=1;}
         self.alignment_target_index=None;
         self.selected_body_command=None;
         self.last_tracked_pose=Some(actual.clone());
@@ -110,6 +193,10 @@ impl SurfaceFollower {
         self.path=Some(path);self.goal=Some(goal);self.cumulative=cumulative;
         self.invalid_input=None;self.controller.reset_errors();
         Ok(())
+    }
+    #[cfg(test)]
+    pub(super) fn ground_binding_for_test(&self)->Option<Arc<GroundCandidateBinding>> {
+        self.ground_execution.as_ref().map(|execution|Arc::clone(&execution.binding))
     }
     pub(crate) fn ground_resume(&self)->Option<GroundResume> {
         self.ground_execution.as_ref().map(|execution|GroundResume {
@@ -140,7 +227,8 @@ impl SurfaceFollower {
         let path=self.path.as_ref().ok_or("no candidate path")?;
         let goal=self.goal.as_ref().ok_or("no candidate goal")?;
         let (_,ground)=self.current_ground_query_owned()?;
-        if actual.pose==execution.last_actual.pose {
+        if actual.pose==execution.last_actual.pose
+            && !zero_admission_connector(&execution.binding,execution.cursor.edge) {
             let basis=execution.basis_at(execution.cursor,actual);
             let navigation=basis.walk_state()?;
             let query=navigation.bind_body_query(map).map_err(|e|e.to_string())?;
@@ -166,7 +254,20 @@ impl SurfaceFollower {
             let a=&path.poses[cursor.edge];let b=&path.poses[cursor.edge+1];
             let dx=b.pose.position.x-a.pose.position.x;let dy=b.pose.position.y-a.pose.position.y;
             let length2=dx*dx+dy*dy;
-            let t=if length2>0.0 {
+            let t=if zero_admission_connector(&execution.binding,cursor.edge) {
+                // A real zero-geometry connector needs no invented displacement,
+                // but its recorded semantic event is checked against THIS actual
+                // pose before retiring it. Other duplicates/yaw edges keep their
+                // original progress rule; preparation never executes this branch.
+                let basis=execution.basis_at(cursor,actual);
+                let query=basis.walk_state()?.bind_body_query(map).map_err(|e|e.to_string())?;
+                let pose=body_control::body(actual);let xy=[pose.0[0],pose.0[1]];let mut witness=None;
+                execution.binding.candidate().with_body_navigation_slice(cursor.edge,cursor.fraction,1.0,xy,xy,
+                    |navigation|query.validate_motion_with_navigation(pose,pose,&ground,navigation,
+                        &self.boundary,&mut witness)).map_err(|e|e.to_string())?
+                    .map_err(|e|format!("zero ground connector: {e}; {witness:?}"))?;
+                1.0
+            }else if length2>0.0 {
                 (((actual.pose.position.x-a.pose.position.x)*dx+(actual.pose.position.y-a.pose.position.y)*dy)/length2)
                     .clamp(cursor.fraction,1.0)
             } else {
@@ -182,7 +283,15 @@ impl SurfaceFollower {
                 return Err("actual pose left its adjacent candidate segment".into());
             }
             if cursor.fraction<1.0 || cursor.edge+1==execution.binding.edges().len() {break;}
-            cursor=GroundCursor {edge:cursor.edge+1,fraction:0.0};
+            let right=cursor.edge+1;
+            if execution.binding.candidate().is_splice_boundary(right) {
+                let left_basis=execution.basis_at(cursor,actual);
+                let left=left_basis.walk_state()?;
+                let query=left.bind_body_query(map).map_err(|e|e.to_string())?;
+                validate_ground_seam(execution.binding.candidate(),right,&query,
+                    body_control::body(actual),&ground,&self.boundary)?;
+            }
+            cursor=GroundCursor {edge:right,fraction:0.0};
         }
         let mut adjacent=body_control::AdjacentWaypointProgress {path_index:self.path_index,progress_m:self.progress_m};
         // Ground consumption is XY-geometric advice, not a claimed actual layer.
@@ -196,7 +305,8 @@ impl SurfaceFollower {
                 checkpoint(cancelled)?;
                 let edge=index-1;
                 Ok(edge<=cursor.edge && match event {
-                    body_control::AdjacentWaypointAdvance::Duplicate=>execution.binding.candidate().constant_association(edge),
+                    body_control::AdjacentWaypointAdvance::Duplicate=>execution.binding.candidate().constant_association(edge)
+                        || zero_admission_connector(&execution.binding,edge),
                     body_control::AdjacentWaypointAdvance::Reached {..}=>true,
                 })
             })?;
@@ -230,8 +340,8 @@ impl SurfaceFollower {
         execution.cursor=proposal.cursor;execution.last_actual=proposal.actual;
         Ok(proposal.outcome)
     }
-    /// Explicit finite-window control seam. Normal RouteFollower admission and
-    /// public step do not invoke this until rolling connector/suffix is wired.
+    /// Explicit finite-window control seam. The normal RouteFollower/public
+    /// Ground lifecycle is a separate activation step.
     pub(crate) fn step_ground_internal(&mut self,robot_width_m:f64,cancelled:Option<&AtomicBool>)
         ->Result<GroundControlStep,String> {
         self.last_command_dispatch_bound=None;

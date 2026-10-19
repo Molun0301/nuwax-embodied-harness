@@ -280,6 +280,10 @@ impl GroundRouteReference {
         let mut connections=Vec::with_capacity(segments.len());let mut changes=Vec::new();
         let mut previous:Option<GroundWalkState<'_>>=None;
         for segment in segments {
+            if previous.is_none() && initial.is_some_and(|(reference,xy,actual)|
+                (reference,xy,actual)!=(segment.from.reference,segment.from.reference_sample_xy,segment.from.xy)) {
+                return Err("candidate first segment differs from its actual incoming address".into());
+            }
             if !std::ptr::eq(segment.from.map,self.map.as_ref()) {return Err("candidate reference owner changed".into());}
             if previous.is_some_and(|end|end.reference!=segment.from.reference || end.xy!=segment.from.xy
                 || end.reference_sample_xy!=segment.from.reference_sample_xy) {
@@ -292,7 +296,7 @@ impl GroundRouteReference {
                 steps:segment.trace.steps,changes:start..changes.len()});
         }
         Ok(GroundCandidateReference {map:Arc::clone(&self.map),
-            trace:Arc::new(GroundCandidateTrace {connections,changes,initial})})
+            recording:CandidateRecording::Recorded(Arc::new(GroundCandidateTrace {connections,changes,initial}))})
     }
 }
 impl<'a> GroundRoutePosition<'a> {
@@ -422,15 +426,7 @@ impl<'a> GroundWalkSegment<'a> {
     pub(crate) fn navigation_at(&self,t:f64)->NavigationGroundSample<'a> {
         let (index,_)=original_grid_sample(self.trace.steps,t).expect("bounded navigation fraction");
         let reference=self.reference_at(index);let xy=self.sample_xy(index);
-        match reference {
-            Reference::Known(id)=>match self.from.map.source_ground_record(id) {
-                Some(record)=>NavigationGroundSample::KnownNative {record,reference_xy:xy},
-                None=>NavigationGroundSample::KnownLegacy {reference_xy:xy,
-                    height:self.from.map.reference_height_at(reference,xy).expect("recorded known sample")},
-            },
-            Reference::Unknown{height,..}=>NavigationGroundSample::Carried {height:f64::from_bits(height)},
-            Reference::Unanchored{..}=>NavigationGroundSample::Unanchored,
-        }
+        navigation_sample(self.from.map,reference,xy)
     }
     pub(crate) fn navigation_changes(&self)->Vec<f64> {
         let mut changes:Vec<_>=self.trace.changes.iter().skip(1)
@@ -509,45 +505,119 @@ impl GroundWalkConnection {
 #[derive(Debug)]
 struct GroundCandidateTrace {connections:Vec<GroundWalkConnection>,changes:Vec<crate::reference::TraceChange>,
     initial:Option<(Reference,[f64;2],[f64;2])>}
-/// The selected candidate's own planned walk. It does not assert actual layer or clearance.
+// A leaf always owns an original recording, never another composition.
 #[derive(Clone,Debug)]
-pub struct GroundCandidateReference {map:Arc<Tomogram>,trace:Arc<GroundCandidateTrace>}
+struct RecordedSlice {trace:Arc<GroundCandidateTrace>,edge:usize,from:f64,to:f64}
+#[derive(Clone,Debug)]
+enum CandidateRecording {Recorded(Arc<GroundCandidateTrace>),Slices(Arc<[RecordedSlice]>)}
+#[derive(Clone,Copy)]
+struct BorrowedSlice<'a> {trace:&'a Arc<GroundCandidateTrace>,edge:usize,from:f64,to:f64}
+impl<'a> BorrowedSlice<'a> {
+    fn connection(self)->&'a GroundWalkConnection {&self.trace.connections[self.edge]}
+    fn reference(self,index:usize)->Reference {
+        let c=self.connection();let changes=&self.trace.changes[c.changes.clone()];
+        changes[changes.partition_point(|v|v.sample_index<=index)-1].reference
+    }
+    fn owned(self)->RecordedSlice {RecordedSlice {trace:Arc::clone(self.trace),edge:self.edge,from:self.from,to:self.to}}
+    fn original_fraction(self,t:f64)->f64 {
+        if t==0.0 {self.from}else if t==1.0 {self.to}else {self.from+t*(self.to-self.from)}
+    }
+    // Compare boundaries in the caller's cropped coordinate system. Mapping an
+    // exact event back through affine arithmetic can otherwise round below it.
+    fn decode(self,t:f64)->Option<(usize,f64)> {
+        if !t.is_finite() || !(0.0..=1.0).contains(&t) {return None;}
+        let steps=self.connection().steps;
+        if t==0.0 || t==1.0 || self.from==self.to {
+            return original_grid_sample(steps,self.original_fraction(t));
+        }
+        let span=self.to-self.from;let mut lo=0;let mut hi=steps;
+        while lo<hi {
+            let mid=lo+(hi-lo)/2+1;let at=mid as f64/steps as f64;
+            if at<=self.from || at<=self.to && (at-self.from)/span<=t {lo=mid;}else {hi=mid-1;}
+        }
+        if lo==steps {return Some((lo,0.0));}
+        let at=(lo as f64/steps as f64-self.from)/span;
+        let next=((lo+1) as f64/steps as f64-self.from)/span;
+        let fraction=((t-at)/(next-at)).clamp(0.0,1.0_f64.next_down());
+        Some((lo,fraction))
+    }
+    fn crop(self,from:f64,to:f64)->Option<Self> {
+        if !from.is_finite() || !to.is_finite() || from<0.0 || from>to || to>1.0 {return None;}
+        let exact=|t| {
+            let (index,fraction)=self.decode(t)?;
+            let steps=self.connection().steps as f64;
+            let at=index as f64/steps;
+            // Affine rounding can put a just-left cut exactly on the next
+            // gridpoint. Retain its decoded side at the nearest representable
+            // original fraction; actual cut geometry is carried separately.
+            Some(if fraction==0.0 {at}else {
+                self.original_fraction(t).clamp(at.next_up(),((index+1) as f64/steps).next_down())
+            })
+        };
+        Some(Self {from:exact(from)?,to:exact(to)?,..self})
+    }
+}
+fn navigation_sample(map:&Tomogram,reference:Reference,xy:[f64;2])->NavigationGroundSample<'_> {
+    match reference {
+        Reference::Known(id)=>match map.source_ground_record(id) {
+            Some(record)=>NavigationGroundSample::KnownNative {record,reference_xy:xy},
+            None=>NavigationGroundSample::KnownLegacy {reference_xy:xy,
+                height:map.reference_height_at(reference,xy).expect("recorded known sample")},
+        },
+        Reference::Unknown{height,..}=>NavigationGroundSample::Carried {height:f64::from_bits(height)},
+        Reference::Unanchored{..}=>NavigationGroundSample::Unanchored,
+    }
+}
+/// Original planned recordings, optionally retained as flat directed slices.
+/// Neither an original recording nor a splice asserts actual layer or clearance.
+#[derive(Clone,Debug)]
+pub struct GroundCandidateReference {map:Arc<Tomogram>,recording:CandidateRecording}
 impl GroundCandidateReference {
-    pub fn connection_count(&self)->usize {self.trace.connections.len()}
+    fn leaf(&self,edge:usize)->Option<BorrowedSlice<'_>> {
+        match &self.recording {
+            CandidateRecording::Recorded(trace)=>trace.connections.get(edge)
+                .map(|_|BorrowedSlice {trace,edge,from:0.0,to:1.0}),
+            CandidateRecording::Slices(leaves)=>leaves.get(edge)
+                .map(|v|BorrowedSlice {trace:&v.trace,edge:v.edge,from:v.from,to:v.to}),
+        }
+    }
+    pub fn connection_count(&self)->usize {match &self.recording {
+        CandidateRecording::Recorded(trace)=>trace.connections.len(),CandidateRecording::Slices(v)=>v.len(),
+    }}
+    /// Original recording geometry/grid for diagnostics. On a cropped edge,
+    /// these are NOT newly sampled execution endpoints or execution steps.
     pub fn connection(&self,index:usize)->Option<([f64;2],[f64;2],usize)> {
-        let c=self.trace.connections.get(index)?;Some((c.from,c.to,c.steps))
+        let c=self.leaf(index)?.connection();Some((c.from,c.to,c.steps))
     }
-    /// Decode an address on the retained evaluator grid. Slices and future
-    /// continuations use this same right-continuous decoder.
-    pub fn original_sample(&self,edge:usize,fraction:f64)->Option<(usize,f64)> {
-        original_grid_sample(self.trace.connections.get(edge)?.steps,fraction)
+    pub fn original_range(&self,edge:usize)->Option<(usize,[f64;2])> {
+        let v=self.leaf(edge)?;Some((v.edge,[v.from,v.to]))
     }
-    /// Borrow an accepted candidate address for one control invocation. This
-    /// does not move its cursor or choose another layer from actual geometry.
+    pub fn original_sample(&self,edge:usize,fraction:f64)->Option<(usize,f64)> {self.leaf(edge)?.decode(fraction)}
+    pub fn original_slice_sample(&self,edge:usize,from:f64,to:f64,progress:f64)->Option<(usize,f64)> {
+        self.leaf(edge)?.crop(from,to)?.decode(progress)
+    }
     pub fn walk_state_at(&self,edge:usize,fraction:f64,actual_xy:[f64;2])->Option<GroundWalkState<'_>> {
         if !actual_xy.into_iter().all(f64::is_finite) {return None;}
-        if self.trace.connections.is_empty() && edge==0 && fraction==0.0 {
-            let (reference,reference_sample_xy,_)=self.trace.initial?;
-            return Some(GroundWalkState {map:&self.map,reference,reference_sample_xy,xy:actual_xy});
+        if let CandidateRecording::Recorded(trace)=&self.recording {
+            if trace.connections.is_empty() && edge==0 && fraction==0.0 {
+                let (reference,reference_sample_xy,_)=trace.initial?;
+                return Some(GroundWalkState {map:&self.map,reference,reference_sample_xy,xy:actual_xy});
+            }
         }
-        let c=self.trace.connections.get(edge)?;
-        let (index,_)=original_grid_sample(c.steps,fraction)?;
-        let reference=self.trace.changes[c.changes.clone()].iter().rev()
-            .find(|change|change.sample_index<=index)?.reference;
-        Some(GroundWalkState {map:&self.map,reference,reference_sample_xy:c.sample_xy(index),xy:actual_xy})
+        let leaf=self.leaf(edge)?;let (index,_)=leaf.decode(fraction)?;
+        Some(GroundWalkState {map:&self.map,reference:leaf.reference(index),
+            reference_sample_xy:leaf.connection().sample_xy(index),xy:actual_xy})
     }
-    /// Freeze only when the seed must outlive the borrowed original candidate.
     pub fn continuation_at(&self,edge:usize,fraction:f64,actual_xy:[f64;2])->Option<OwnedGroundWalkState> {
         let state=self.walk_state_at(edge,fraction,actual_xy)?;
         Some(OwnedGroundWalkState {map:Arc::clone(&self.map),reference:state.reference,
             reference_sample_xy:state.reference_sample_xy,actual_xy})
     }
+    /// A diagnostic sample on the original leaf grid, including portions which
+    /// a retained execution range may not consume.
     pub fn sample(&self,connection:usize,index:usize)->Option<PlannedGroundSample<'_>> {
-        let c=self.trace.connections.get(connection)?;
-        if index>c.steps {return None;}
-        let reference=self.trace.changes[c.changes.clone()].iter().rev()
-            .find(|change|change.sample_index<=index)?.reference;
-        let xy=c.sample_xy(index);
+        let leaf=self.leaf(connection)?;let c=leaf.connection();if index>c.steps {return None;}
+        let reference=leaf.reference(index);let xy=c.sample_xy(index);
         let association=match reference {
             Reference::Known(id)=>PlannedGroundAssociation::Known {source:self.map.source_ground_record(id)},
             Reference::Unknown {..}=>PlannedGroundAssociation::Carried,
@@ -556,26 +626,83 @@ impl GroundCandidateReference {
         Some(PlannedGroundSample {point:GroundRoutePoint {xy,ground_z:self.map.reference_height_at(reference,xy)},association})
     }
     pub fn constant_association(&self,connection:usize)->bool {
-        self.trace.connections.get(connection).is_some_and(|c| {
+        let Some(leaf)=self.leaf(connection)else{return false;};
+        let c=leaf.connection();
+        if leaf.from==0.0 && leaf.to==1.0 {
+            // The unchanged full edge keeps its original constant-cost check.
             if c.changes.len()!=1 {return false;}
-            let reference=self.trace.changes[c.changes.start].reference;
+            let reference=leaf.trace.changes[c.changes.start].reference;
             let first=self.map.reference_height_at(reference,c.sample_xy(0));
-            first==self.map.reference_height_at(reference,c.sample_xy(1))
-                && first==self.map.reference_height_at(reference,c.sample_xy(c.steps))
-        })
+            return first==self.map.reference_height_at(reference,c.sample_xy(1))
+                && first==self.map.reference_height_at(reference,c.sample_xy(c.steps));
+        }
+        let (first,_)=leaf.decode(0.0).unwrap();let (last,_)=leaf.decode(1.0).unwrap();
+        let reference=leaf.reference(first);
+        let height=self.map.reference_height_at(reference,leaf.connection().sample_xy(first));
+        (first..=last).all(|i|leaf.reference(i)==reference
+            && self.map.reference_height_at(reference,leaf.connection().sample_xy(i))==height)
     }
     pub fn matches_source(&self,source:&SurfaceSnapshot)->bool {self.map.matches_surface(source)}
-    /// Source-local equality for joins, not a floating-height floor comparison.
+    /// Keep prefix and suffix leaves, without querying or re-recording either.
+    pub fn prepend_to_suffix(&self,prefix:&Self,edge:usize,fraction:f64)->Result<Self,PlanningFailure> {
+        if !Arc::ptr_eq(&self.map,&prefix.map) {return Err("splice reference owner changed".into());}
+        let first=self.leaf(edge).and_then(|v|v.crop(fraction,1.0)).ok_or("invalid retained suffix address")?;
+        let mut leaves=Vec::with_capacity(prefix.connection_count()+self.connection_count()-edge);
+        for i in 0..prefix.connection_count() {leaves.push(prefix.leaf(i).unwrap().owned());}
+        leaves.push(first.owned());
+        for i in edge+1..self.connection_count() {leaves.push(self.leaf(i).unwrap().owned());}
+        Ok(Self {map:Arc::clone(&self.map),recording:CandidateRecording::Slices(leaves.into())})
+    }
+    /// A boundary between separately recorded/cropped pieces is not discarded
+    /// merely because its two geometric poses happen to be equal.
+    pub fn is_splice_boundary(&self,right:usize)->bool {
+        if right==0 {return false;}
+        let Some(a)=self.leaf(right-1)else{return false;};let Some(b)=self.leaf(right)else{return false;};
+        !Arc::ptr_eq(a.trace,b.trace) || a.edge+1!=b.edge || a.to!=1.0 || b.from!=0.0
+    }
+    /// Borrow original samples for actual physical geometry. No evaluator walk.
+    pub fn with_body_navigation_slice<R>(&self,edge:usize,from:f64,to:f64,
+        actual_from_xy:[f64;2],actual_to_xy:[f64;2],
+        run:impl FnOnce(&BodyNavigationSegment<'_,'_>)->R)->Result<R,PlanningFailure> {
+        let leaf=self.leaf(edge).and_then(|v|v.crop(from,to)).ok_or("invalid retained navigation slice")?;
+        let source=self.map.source.as_ref().ok_or("recorded navigation has no physical source")?;
+        let c=leaf.connection();let (first,_)=leaf.decode(0.0).unwrap();let (last,_)=leaf.decode(1.0).unwrap();
+        let mut changes=Vec::new();let mut previous=(leaf.reference(first),
+            self.map.reference_height_at(leaf.reference(first),c.sample_xy(first)));
+        for index in first+1..=last {
+            let next=(leaf.reference(index),self.map.reference_height_at(leaf.reference(index),c.sample_xy(index)));
+            if next!=previous && leaf.to>leaf.from {
+                changes.push((index as f64/c.steps as f64-leaf.from)/(leaf.to-leaf.from));
+            }
+            previous=next;
+        }
+        let sample=|t| {let (index,_)=leaf.decode(t).expect("bounded original sample");
+            navigation_sample(&self.map,leaf.reference(index),c.sample_xy(index))};
+        let navigation=BodyNavigationSegment::from_recorded(source,actual_from_xy,actual_to_xy,&changes,&sample);
+        Ok(run(&navigation))
+    }
+    /// Explicit left→right transition at the same actual pose. The original H3
+    /// kernel, not a new equality/height gate, decides whether it can be used.
+    pub fn with_body_navigation_seam<R>(&self,right:usize,xy:[f64;2],
+        run:impl FnOnce(&BodyNavigationSegment<'_,'_>)->R)->Result<R,PlanningFailure> {
+        let left=right.checked_sub(1).and_then(|e|self.walk_state_at(e,1.0,xy)).ok_or("invalid splice left address")?;
+        let right=self.walk_state_at(right,0.0,xy).ok_or("invalid splice right address")?;
+        let source=self.map.source.as_ref().ok_or("recorded navigation has no physical source")?;
+        let sample=|t| {let s=if t<1.0 {left}else {right};navigation_sample(s.map,s.reference,s.reference_sample_xy)};
+        let changes=[1.0];let navigation=BodyNavigationSegment::from_recorded(source,xy,xy,&changes,&sample);
+        Ok(run(&navigation))
+    }
     pub fn end_matches(&self,original:GroundRoutePosition<'_>)->bool {
         let target=original.walk_state();
-        std::ptr::eq(self.map.as_ref(),original.owner.map.as_ref()) &&
-            if self.trace.connections.is_empty() {
-                self.trace.initial.is_some_and(|(reference,sample_xy,xy)|reference==target.reference
-                    && sample_xy==target.reference_sample_xy && xy==target.xy)
-            } else {
-                self.trace.changes.last().is_some_and(|last|last.reference==target.reference)
-                    && self.trace.connections.last().is_some_and(|last|last.to==target.xy)
-            }
+        if !std::ptr::eq(self.map.as_ref(),original.owner.map.as_ref()) {return false;}
+        if self.connection_count()==0 {
+            return self.walk_state_at(0,0.0,target.xy).is_some_and(|state|
+                state.reference==target.reference && state.reference_sample_xy==target.reference_sample_xy
+                    && match &self.recording {CandidateRecording::Recorded(t)=>t.initial.is_some_and(|v|v.2==target.xy),_=>false});
+        }
+        let leaf=self.leaf(self.connection_count()-1).unwrap();let c=leaf.connection();
+        let xy=if leaf.to==1.0 {c.to}else {std::array::from_fn(|i|c.from[i]+leaf.to*(c.to[i]-c.from[i]))};
+        self.walk_state_at(self.connection_count()-1,1.0,xy).is_some_and(|s|s.reference==target.reference && xy==target.xy)
     }
 }
 

@@ -282,3 +282,99 @@ fn c1b_02_candidate_own_walk_and_cancel() {
             "cancelled scratch/scopes cannot poison a later independent walk");
     }
 }
+
+#[test]
+fn c1c4_01_retained_slices_keep_original_grid_boundaries() {
+    // The same 1.1 m / q=.1 straight evaluator grid as C3-02: this source-less
+    // map isolates addressing, not native physical admission.
+    let owner=c1b_direct_owner(c1b_columns(true),false);
+    let start=owner.full_window().unwrap().from().walk_state();
+    let segment=start.walk_xy([1.15,0.15],&C1B_BOUNDARY,None).unwrap();
+    assert_eq!(segment.trace.steps,28);
+    let original=owner.freeze_candidate_from(start,vec![segment]).unwrap();
+    let leaf=original.leaf(0).unwrap().crop(0.2,0.9).unwrap();
+    let cropped=GroundCandidateReference {map:Arc::clone(&original.map),
+        recording:CandidateRecording::Slices(vec![leaf.owned()].into())};
+    assert_eq!(cropped.original_range(0),Some((0,[0.2,0.9])));
+    assert_eq!(cropped.connection(0),original.connection(0),"diagnostic grid is not resampled");
+    let actual=[0.21,0.17];
+    for index in 6..=25 {
+        let at=index as f64/28.0;
+        let u=(at-0.2)/(0.9-0.2);
+        for (t,expected) in [(u.next_down(),index-1),(u,index),(u.next_up(),index)] {
+            let decoded=cropped.original_sample(0,t).unwrap();
+            assert_eq!(decoded.0,expected,"index={index} t={t:?}");
+            assert_eq!(original.original_slice_sample(0,0.2,0.9,t),Some(decoded));
+            let nested=leaf.crop(t,1.0).unwrap();
+            assert_eq!(nested.decode(0.0).unwrap().0,expected,"nested crop preserves side at {index}/{t:?}");
+            let singleton=leaf.crop(t,t).unwrap();
+            assert_eq!(singleton.decode(0.0).unwrap().0,expected);
+            assert_eq!(singleton.decode(1.0).unwrap().0,expected);
+            let state=cropped.walk_state_at(0,t,actual).unwrap();
+            assert_eq!(state.reference,original.leaf(0).unwrap().reference(expected));
+            assert_eq!(state.reference_sample_xy(),original.sample(0,expected).unwrap().point.xy);
+            assert_eq!(state.xy(),actual);
+        }
+        assert_eq!(cropped.original_sample(0,u),Some((index,0.0)));
+    }
+    let u:f64=(13.0/28.0-0.2)/0.7;
+    eprintln!("C4 original steps=28 range=[.2,.9] index13 u={u:?} before={:?} exact={:?} after={:?}",
+        cropped.original_sample(0,u.next_down()),cropped.original_sample(0,u),cropped.original_sample(0,u.next_up()));
+    for t in [0.0,1.0] {
+        let expected=original.original_sample(0,if t==0.0 {0.2}else {0.9});
+        assert_eq!(cropped.original_sample(0,t),expected);
+    }
+    let zero=original.leaf(0).unwrap().crop(13.0/28.0,13.0/28.0).unwrap();
+    for t in [0.0,0.5,1.0] {assert_eq!(zero.decode(t),Some((13,0.0)));}
+    for t in [-0.1,1.1,f64::NAN] {assert!(cropped.original_sample(0,t).is_none());}
+    assert!(cropped.with_body_navigation_slice(0,0.0,1.0,actual,actual,|_|()).is_err(),
+        "source-less address fixture cannot fabricate physical evidence");
+    let stationary=owner.freeze_candidate_from(start,vec![]).unwrap();
+    assert_eq!(stationary.connection_count(),0);
+    assert_eq!(stationary.walk_state_at(0,0.0,start.xy()).unwrap().semantic_key(),start.semantic_key());
+}
+
+#[test]
+fn c1c4_02_flat_splices_keep_original_trace_owners() {
+    let owner=c1b_direct_owner(c1b_columns(true),false);
+    let initial=owner.full_window().unwrap().from().walk_state();
+    let mut state=initial;let mut segments=Vec::new();
+    for xy in [[0.05,0.25],[1.95,0.25],[1.95,0.15]] {
+        let edge=state.walk_xy(xy,&C1B_BOUNDARY,None).unwrap();state=edge.end();segments.push(edge);
+    }
+    let original=owner.freeze_candidate_from(initial,segments).unwrap();
+    let trace=match &original.recording {CandidateRecording::Recorded(trace)=>Arc::clone(trace),_=>unreachable!()};
+    let old_changes=trace.changes.clone();
+    let actual=original.walk_state_at(1,0.1,[0.20,0.23]).unwrap();
+    let first_cut=[0.05+0.25*(1.95-0.05),0.25];
+    let connector=actual.walk_xy(first_cut,&C1B_BOUNDARY,None).unwrap();
+    let prefix=owner.freeze_candidate_from(actual,vec![connector]).unwrap();
+    let prefix_trace=match &prefix.recording {CandidateRecording::Recorded(t)=>Arc::clone(t),_=>unreachable!()};
+    let first=original.prepend_to_suffix(&prefix,1,0.25).unwrap();
+    let CandidateRecording::Slices(leaves)=&first.recording else {panic!("flat slices required")};
+    assert_eq!(leaves.len(),3);assert!(Arc::ptr_eq(&leaves[0].trace,&prefix_trace));
+    assert!(leaves[1..].iter().all(|leaf|Arc::ptr_eq(&leaf.trace,&trace)));
+    assert_eq!(first.original_range(1),Some((1,[0.25,1.0])));
+    assert!(first.is_splice_boundary(1));assert!(!first.is_splice_boundary(2));
+    // A second splice retains the original trace directly, never the first
+    // composed object. Both connector recordings come from the same evaluator.
+    let incoming=first.walk_state_at(1,0.1,[0.60,0.23]).unwrap();
+    let new_cut=0.25+0.5*(1.0-0.25);
+    let segment=incoming.walk_xy([0.05+new_cut*(1.95-0.05),0.25],&C1B_BOUNDARY,None).unwrap();
+    let second_prefix=owner.freeze_candidate_from(incoming,vec![segment]).unwrap();
+    let second=first.prepend_to_suffix(&second_prefix,1,0.5).unwrap();
+    let CandidateRecording::Slices(leaves)=&second.recording else {panic!("flat slices required")};
+    assert_eq!(leaves.len(),3);assert!(leaves[1..].iter().all(|leaf|Arc::ptr_eq(&leaf.trace,&trace)));
+    assert_eq!(second.original_range(1),Some((1,[new_cut,1.0])));
+    assert_eq!(trace.changes,old_changes);
+    assert!(second.end_matches(owner.full_window().unwrap().to()));
+    let wrong_initial=owner.position(0,1,0.0).unwrap().walk_state();
+    assert!(owner.freeze_candidate_from(wrong_initial,vec![initial.walk_xy([0.05,0.25],&C1B_BOUNDARY,None).unwrap()]).is_err());
+    let foreign=c1b_direct_owner(c1b_columns(true),false);
+    let foreign_start=foreign.full_window().unwrap().from().walk_state();
+    let foreign_prefix=foreign.freeze_candidate_from(foreign_start,
+        vec![foreign_start.walk_xy([0.05,0.25],&C1B_BOUNDARY,None).unwrap()]).unwrap();
+    assert!(original.prepend_to_suffix(&foreign_prefix,1,0.25).is_err());
+    eprintln!("C4 two flat splices: original leaves={}, final leaves={}, original changes={} unchanged",
+        original.connection_count(),second.connection_count(),old_changes.len());
+}

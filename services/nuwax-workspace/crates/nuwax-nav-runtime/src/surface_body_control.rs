@@ -166,8 +166,18 @@ pub(super) fn control_project_edge<'a>(
     navigation:Option<GroundWalkState<'a>>,xy:[f64;2],yaw:f64,boundary:&[[f64;2]],
     profile:ControlEdgeProfile,
 )->Result<ControlMotionSuccess<'a>,BodyMotionFailure> {
+    control_project_edge_recorded(query,from,ground,navigation,xy,yaw,boundary,profile,None,None)
+}
+#[allow(clippy::too_many_arguments)]
+fn control_project_edge_recorded<'a>(
+    query:&SurfaceBodyQueryView,from:BodyPose,ground:&BodyGroundState,
+    navigation:Option<GroundWalkState<'a>>,xy:[f64;2],yaw:f64,boundary:&[[f64;2]],
+    profile:ControlEdgeProfile,
+    recorded:Option<&mut Vec<nuwax_nav_pct::ground_route::GroundWalkSegment<'a>>>,
+    cancelled:Option<&std::sync::atomic::AtomicBool>,
+)->Result<ControlMotionSuccess<'a>,BodyMotionFailure> {
     #[cfg(test)] if navigation.is_some() {count_navigation_walk();}
-    let segment=navigation.map(|state|state.walk_xy(xy,boundary,None)).transpose()
+    let segment=navigation.map(|state|state.walk_xy(xy,boundary,cancelled)).transpose()
         .map_err(|error|BodyMotionFailure::Navigation(error.to_string()))?;
     let mut witness=None;
     #[cfg(test)] if !matches!(profile,ControlEdgeProfile::Preview) {
@@ -199,9 +209,11 @@ pub(super) fn control_project_edge<'a>(
         motion_failure(result,witness)?;
     }
     #[cfg(not(test))] let _=profile;
+    let navigation=segment.as_ref().map(|segment|segment.end());
+    if let Some(recorded)=recorded {recorded.extend(segment);}
     Ok(ControlMotionSuccess {
         body:BodyMotionSuccess {pose:projected.pose(),ground:Some(projected.ground().clone()),latest_start_ns:None},
-        navigation:segment.as_ref().map(|segment|segment.end()),
+        navigation,
     })
 }
 
@@ -211,16 +223,28 @@ fn control_validate_edge(
     query:&SurfaceBodyQueryView,from:BodyPose,to:BodyPose,ground:&BodyGroundState,
     navigation:Option<GroundWalkState<'_>>,boundary:&[[f64;2]],
 )->Result<(),BodyMotionFailure> {
+    control_validate_edge_recorded(query,from,to,ground,navigation,boundary,None,None).map(|_|())
+}
+#[allow(clippy::too_many_arguments)]
+fn control_validate_edge_recorded<'a>(
+    query:&SurfaceBodyQueryView,from:BodyPose,to:BodyPose,ground:&BodyGroundState,
+    navigation:Option<GroundWalkState<'a>>,boundary:&[[f64;2]],
+    recorded:Option<&mut Vec<nuwax_nav_pct::ground_route::GroundWalkSegment<'a>>>,
+    cancelled:Option<&std::sync::atomic::AtomicBool>,
+)->Result<(BodyGroundState,Option<GroundWalkState<'a>>),BodyMotionFailure> {
     let mut witness=None;
-    let result=if let Some(navigation)=navigation {
-        #[cfg(test)] count_navigation_walk();
-        let segment=navigation.walk_xy([to.0[0],to.0[1]],boundary,None)
-            .map_err(|error|BodyMotionFailure::Navigation(error.to_string()))?;
+    #[cfg(test)] if navigation.is_some() {count_navigation_walk();}
+    let segment=navigation.map(|state|state.walk_xy([to.0[0],to.0[1]],boundary,cancelled)).transpose()
+        .map_err(|error|BodyMotionFailure::Navigation(error.to_string()))?;
+    let result=if let Some(segment)=&segment {
         segment.with_body_navigation(|_,navigation|
             query.validate_motion_with_navigation(from,to,ground,navigation,boundary,&mut witness))
-            .map_err(|error|BodyMotionFailure::Navigation(error.to_string()))?.map(|_|())
-    }else {query.validate_motion_from_ground(from,to,ground,boundary,&mut witness).map(|_|())};
-    motion_failure(result,witness)
+            .map_err(|error|BodyMotionFailure::Navigation(error.to_string()))?
+    }else {query.validate_motion_from_ground(from,to,ground,boundary,&mut witness)};
+    let state=motion_failure(result,witness)?;
+    let navigation=segment.as_ref().map(|segment|segment.end());
+    if let Some(recorded)=recorded {recorded.extend(segment);}
+    Ok((state,navigation))
 }
 
 pub(super) fn validate_control_actual_pose(
@@ -325,6 +349,28 @@ pub(super) fn connection_endpoint_in_query(map:&SurfaceSnapshot,query:&SurfaceBo
 pub(super) fn connection_endpoint_with_navigation<'a>(map:&SurfaceSnapshot,query:&SurfaceBodyQueryView,
     from:BodyPose,ground:&BodyGroundState,navigation:Option<GroundWalkState<'a>>,next:&PoseStamped)
     ->Option<(BodyPose,BodyGroundState,Option<GroundWalkState<'a>>)> {
+    connection_endpoint_impl(map,query,from,ground,navigation,next,&[],None,None,||true)
+}
+pub(super) struct GroundConnectorRecording<'a> {
+    pub(super) poses:Vec<BodyPose>,
+    pub(super) segments:Vec<nuwax_nav_pct::ground_route::GroundWalkSegment<'a>>,
+}
+#[allow(clippy::too_many_arguments)]
+pub(super) fn record_ground_connector<'a>(map:&SurfaceSnapshot,query:&SurfaceBodyQueryView,
+    from:BodyPose,ground:&BodyGroundState,navigation:GroundWalkState<'a>,next:&PoseStamped,
+    boundary:&[[f64;2]],cancelled:Option<&std::sync::atomic::AtomicBool>,check:impl FnMut()->bool)
+    ->Option<(GroundConnectorRecording<'a>,BodyGroundState)> {
+    let mut recording=GroundConnectorRecording {poses:vec![from],segments:Vec::new()};
+    let (_,end,_)=connection_endpoint_impl(map,query,from,ground,Some(navigation),next,
+        boundary,cancelled,Some(&mut recording),check)?;
+    Some((recording,end))
+}
+#[allow(clippy::too_many_arguments)]
+fn connection_endpoint_impl<'a>(map:&SurfaceSnapshot,query:&SurfaceBodyQueryView,
+    from:BodyPose,ground:&BodyGroundState,navigation:Option<GroundWalkState<'a>>,next:&PoseStamped,
+    boundary:&[[f64;2]],cancelled:Option<&std::sync::atomic::AtomicBool>,
+    mut recording:Option<&mut GroundConnectorRecording<'a>>,mut check:impl FnMut()->bool)
+    ->Option<(BodyPose,BodyGroundState,Option<GroundWalkState<'a>>)> {
     #[cfg(test)] let _profile=crate::control_profile::guard(crate::control_profile::Stage::ConnectionEndpoint);
     let model=map.body_envelope()?;
     let q=from.1;
@@ -335,16 +381,29 @@ pub(super) fn connection_endpoint_with_navigation<'a>(map:&SurfaceSnapshot,query
     let count=((distance+model.radius()*turn.abs())/(f64::from(map.source_voxel_size_m())*0.5))
         .max(turn.abs()/0.05).ceil().max(1.0) as usize;
     if count>4096 {return None;}
+    if recording.is_some() && distance==0.0 && turn==0.0 {
+        // Ground's genuinely motionless connector validates the supplied full
+        // actual pose instead of normalizing it via a stationary projection.
+        // In particular q and -q must not manufacture an unexecutable yaw edge.
+        if !check() {return None;}
+        #[cfg(test)] crate::control_profile::count(crate::control_profile::Counter::ConnectionSubsteps);
+        let (ground,navigation)=control_validate_edge_recorded(query,from,from,ground,navigation,
+            boundary,recording.as_deref_mut().map(|r|&mut r.segments),cancelled).ok()?;
+        recording.as_deref_mut().unwrap().poses.push(from);
+        return Some((from,ground,navigation));
+    }
     let mut previous=from;
     let mut ground=ground.clone();
     let mut navigation=navigation;
     for index in 1..=count {
+        if !check() {return None;}
         #[cfg(test)] crate::control_profile::count(crate::control_profile::Counter::ConnectionSubsteps);
         let fraction=index as f64/count as f64;
-        let checked=control_project_edge(query,previous,&ground,navigation,
+        let checked=control_project_edge_recorded(query,previous,&ground,navigation,
             [from.0[0]+dx*fraction,from.0[1]+dy*fraction],initial_yaw+turn*fraction,
-            &[],ControlEdgeProfile::Connector).ok()?;
+            boundary,ControlEdgeProfile::Connector,recording.as_deref_mut().map(|r|&mut r.segments),cancelled).ok()?;
         previous=checked.body.pose;
+        if let Some(recording)=recording.as_deref_mut() {recording.poses.push(previous);}
         ground=checked.body.ground.expect("successful connector keeps physical ground");
         navigation=checked.navigation;
     }

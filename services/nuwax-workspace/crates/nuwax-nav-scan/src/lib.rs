@@ -155,7 +155,7 @@ pub struct LocalTrajectory {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CandidateFamily { Direct, StepTurn, Rejoin, Spline { optimized: bool }, Polyline, Passage, Search }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CandidateEdgeOrigin { Family(CandidateFamily), Departure, Parent { node:usize }, Connector { node:usize } }
+pub enum CandidateEdgeOrigin { Family(CandidateFamily), Departure, Parent { node:usize }, Connector { node:usize }, AdmissionConnector }
 #[derive(Debug)]
 struct CandidatePart { edges:std::ops::Range<usize>, origin:CandidateEdgeOrigin }
 struct CandidateOrigins { family:CandidateFamily, parts:Vec<CandidatePart> }
@@ -189,6 +189,30 @@ impl GroundCandidateBinding {
     pub fn stationary_pose(&self)->Option<BodyPose> {self.stationary_pose}
     pub fn planned_join(&self)->bool {self.planned_join}
     pub fn covers_original_goal(&self)->bool {self.planned_join && self.original.window().to().is_terminal()}
+    /// Assemble execution guidance over the actual checked connector and the
+    /// original directed candidate suffix. Physical Z/attitude at the new join
+    /// come from the connector; old suffix poses remain guidance, not a claim
+    /// that the actual body has already adopted those heights or attitudes.
+    pub fn prepend_admission_connector(&self,prefix:nuwax_nav_pct::ground_route::GroundCandidateReference,
+        prefix_poses:&[BodyPose],edge:usize,fraction:f64)
+        ->Result<Self,String> {
+        if prefix_poses.len()!=prefix.connection_count()+1 || prefix_poses.is_empty() {
+            return Err("connector geometry and recording differ".into());
+        }
+        self.edges.get(edge).ok_or("invalid candidate suffix edge")?;
+        let candidate=self.candidate.prepend_to_suffix(&prefix,edge,fraction).map_err(|e|e.to_string())?;
+        let mut edges=Vec::with_capacity(candidate.connection_count());
+        for pair in prefix_poses.windows(2) {
+            edges.push(GroundMotionBinding {motion:[pair[0],pair[1]],origin:CandidateEdgeOrigin::AdmissionConnector});
+        }
+        let mut first=self.edges[edge].clone();
+        // The old cut's XY/yaw remains the target. Never teleport to its old Z
+        // or roll/pitch: the preceding real connector is the physical origin.
+        first.motion[0]=*prefix_poses.last().unwrap();edges.push(first);
+        edges.extend_from_slice(&self.edges[edge+1..]);
+        Ok(Self {original:self.original.clone(),candidate,edges,family:self.family,
+            planned_join:self.planned_join,stationary_pose:None})
+    }
     /// Cropping retains the original connection and sampling grid. No source
     /// query or shortened-segment re-walk takes place here.
     pub fn slice(&self,edge:usize,from:f64,to:f64)->Option<GroundMotionSlice<'_>> {
@@ -205,8 +229,7 @@ impl<'a> GroundMotionSlice<'a> {
     pub fn range(self)->[f64;2] {[self.from,self.to]}
     pub fn original_sample(self,progress:f64)->Option<(usize,f64)> {
         if !progress.is_finite() || !(0.0..=1.0).contains(&progress) {return None;}
-        let t=self.from+progress*(self.to-self.from);
-        self.binding.candidate.original_sample(self.edge,t)
+        self.binding.candidate.original_slice_sample(self.edge,self.from,self.to,progress)
     }
 }
 #[derive(Debug)]

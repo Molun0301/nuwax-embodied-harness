@@ -593,3 +593,22 @@ fn classified_empty_low_occupancy_is_unknown_not_a_fabricated_drop() {
     assert!(map.observations().unwrap().get([1,0,-10]).is_some());
     eprintln!("H3_EMPTY_UNKNOWN_DROP h={h:?} raw_top={raw_top:?} from={from:?} to={to:?} witness={witness:?}");
 }
+
+#[test]
+fn p0_unanchored_admitted_heightfield_matches_original_core_cold_and_warm() {
+    // Independently admitted Writer/Receiver owners; no hand-built HF descriptor.
+    let old=scene(0,false);let new=scene(0,false);
+    let pose=([0.025,0.025,0.425],[0.0,0.0,0.0,1.0]);
+    assert!(old.observations.as_ref().unwrap().has_measured_ground_layers());
+    assert!(!Arc::ptr_eq(&old.observations.as_ref().unwrap().legacy_reference_cache,
+        &new.observations.as_ref().unwrap().legacy_reference_cache));
+    for phase in ["cold","warm"] {
+        let mut a=None;let mut b=None;
+        let ar=old.check_body_pose_in_context_impl::<false>(pose.0,pose.1,QuerySample::Unanchored,&mut a);
+        let br=new.check_body_pose_in_context_impl::<true>(pose.0,pose.1,QuerySample::Unanchored,&mut b);
+        assert_eq!(ar,Ok(()));assert_eq!(br,ar);assert_eq!(a,None);assert_eq!(b,None);
+        eprintln!("P0_NATIVE phase={phase} actual_height={:?} result={ar:?}",old.query_ground([0.025,0.025],0.0).height);
+    }
+    let view=new.body_query();
+    view.validate_unanchored_motion(pose,([0.075,0.025,0.425],pose.1),&[],&mut None).unwrap();
+}

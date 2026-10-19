@@ -1387,6 +1387,12 @@ impl SurfaceSnapshot {
 
     fn check_body_pose_in_context(&self,body:[f64;3],quaternion:[f64;4],sample:QuerySample<'_>,
         slot:&mut Option<BodyRejection>)->Result<(),SurfaceError> {
+        self.check_body_pose_in_context_impl::<true>(body,quaternion,sample,slot)
+    }
+
+    // The false specialization is used only by tests to retain the original kernel.
+    fn check_body_pose_in_context_impl<const SKIP_UNUSED_HEIGHTS:bool>(&self,body:[f64;3],quaternion:[f64;4],sample:QuerySample<'_>,
+        slot:&mut Option<BodyRejection>)->Result<(),SurfaceError> {
         *slot=None;
         // Declared before all kernel locals so normal/error cleanup stays inside T.
         #[cfg(feature = "body-query-profile")]
@@ -1553,6 +1559,10 @@ impl SurfaceSnapshot {
                     !(f64::from(bounds[0])>max[2] || f64::from(bounds[1])<min[2])
                 }));
                 if !has_vertical_overlap {
+                    // Unanchored never fits ground_points. With observations the
+                    // height-only selector has no error/fallback result to preserve.
+                    if SKIP_UNUSED_HEIGHTS && matches!(sample,QuerySample::Unanchored)
+                        && self.observations.is_some() {continue;}
                     // Same ordered height selection/reduction, without unused contact membership.
                     // Some(all-missing rows) still falls back inside fine_ground_height;
                     // only a genuine None permits the original precise-ground precedence.
@@ -3499,7 +3509,10 @@ mod tests {
     #[cfg(feature = "body-query-profile")]
     mod cache_profile_counter_tests { include!("body_cache_profile_counter_tests.rs"); }
     mod recent_query_tests { include!("body_recent_query_tests.rs"); }
-    mod assigned_z_equivalence_tests { include!("body_assigned_z_equivalence_tests.rs"); }
+    mod assigned_z_equivalence_tests {
+        include!("body_assigned_z_equivalence_tests.rs");
+        include!("body_unanchored_height_tests.rs");
+    }
     mod live_geometry_tests { include!("body_live_geometry_tests.rs"); }
     include!("body_observation_vec_tests.rs");
     include!("body_motion_reference_tests.rs");

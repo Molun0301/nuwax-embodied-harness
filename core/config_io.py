@@ -435,12 +435,14 @@ def _robot_geometry_preview(file_values: Dict[str, str]) -> Dict[str, object]:
     source_label = "＋".join(labels.get(part, part) for part in geometry.source.split("+"))
     center = geometry.center_xyz_m
     display_center = tuple(0.0 if abs(value) < 1e-12 else value for value in center)
-    summary = ("外形预览（保存配置＋当前环境）：长{:.4g}米，宽{:.4g}米，高{:.4g}米；中心({:.4g},{:.4g},{:.4g})米；"
-               "高度范围[{:.4g},{:.4g}]米；来源：{}。重启几何/导航后生效，当前未核实外部进程。"
+    summary = ("外形预览：长{:.4g}米、宽{:.4g}米、高{:.4g}米；中心({:.4g}, {:.4g}, {:.4g})米，"
+               "高度范围{:.4g}～{:.4g}米；来源：{}"
                .format(geometry.length_m, geometry.width_m, geometry.height_m, *display_center,
                        geometry.z_min_m, geometry.z_max_m, source_label))
     if geometry.model_path:
-        summary += " 模型文件：{}，机体基准：{}。".format(Path(geometry.model_path).name, geometry.model_base_link)
+        summary += "（{}，机体基准{}）".format(Path(geometry.model_path).name, geometry.model_base_link)
+    # 预览按已保存配置和当前环境计算，外部几何与导航进程重启后才采用。
+    summary += "。重启几何与导航后采用。"
     return dict(base, status="resolved", summary=summary, source_label=source_label,
                 length_m=geometry.length_m, width_m=geometry.width_m, height_m=geometry.height_m,
                 center_xyz_m=list(center), model_base_link=geometry.model_base_link,
@@ -588,11 +590,8 @@ def _build_schema(location, *, profile_snapshot=None, revision_owner=None, runti
         sections[f.section_id]["fields"].append({
             "key": f.key,
             "zh_name": f.zh_name,
-            "description": (
-                f.description + " " + str(robot_geometry_preview["summary"])
-                + " ".join(robot_geometry_preview.get("warnings", ()))
-                if f.key == "NUWAX_ROBOT_MODEL_PATH" else f.description
-            ),
+            # 外形预览由顶层 robot_geometry_preview 单独返回，页面另行展示，不拼进说明。
+            "description": f.description,
             "type": f.type,
             "advanced": f.advanced,
             "sensitive": f.sensitive,
@@ -628,7 +627,7 @@ def _build_schema(location, *, profile_snapshot=None, revision_owner=None, runti
     return {
         "sections": ordered,
         "field_count": sum(len(section["fields"]) for section in ordered),
-        "effect_note": "显示、监控及支持在线调整的参数保存后热加载；算法状态、设备和通信设置按提示重启。已保存值与进程读取值分别展示。",
+        "effect_note": "显示和监控类参数保存后立即生效，其它参数按各项提示重启后生效。",
         "geometry_backend_structure_matrix": [status.as_dict() for status in geometry_statuses],
         "geometry_backend_matrix": [status.as_dict() for status in geometry_statuses if status.enabled],
         "robot_geometry_preview": robot_geometry_preview,

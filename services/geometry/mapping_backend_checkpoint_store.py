@@ -1754,7 +1754,7 @@ def _validate_checkpoint_artifacts(checkpoint):
             cloud_revision=checkpoint.cloud_receipt["cloud_revision"],
             source_timestamp_ns=checkpoint.cloud_receipt["source_timestamp_ns"])
         if role == "fine_map":
-            if payload[:8] not in (b"NUWAXAR1", b"NUWAXAR2", b"NUWAXAR3", b"NUWAXAR4"):
+            if payload[:8] not in (b"NUWAXAR1", b"NUWAXAR2", b"NUWAXAR3", b"NUWAXAR4", b"NUWAXAR5"):
                 raise MappingBackendCheckpointValidationError("assigned fine member requires a supported archive")
             validate_fine_archive(payload, **keywords,
                 frame_generation=reference.member_identity.frame_generation,
@@ -1827,7 +1827,7 @@ def assign_legacy_cloud_checkpoint(stored_checkpoint, *, canonical_occupancy_dat
             previous.cloud_receipt, frame)
     fine_reference = None
     if previous.fine_archive is not None:
-        if previous.fine_archive[:8] not in (b"NUWAXAR1", b"NUWAXAR2", b"NUWAXAR3", b"NUWAXAR4"):
+        if previous.fine_archive[:8] not in (b"NUWAXAR1", b"NUWAXAR2", b"NUWAXAR3", b"NUWAXAR4", b"NUWAXAR5"):
             raise ValueError("assigned fine import requires a supported archive")
         # Only read the bounded root here; final bundle admission validates all
         # blocks and binds these source generations to the original receipts.

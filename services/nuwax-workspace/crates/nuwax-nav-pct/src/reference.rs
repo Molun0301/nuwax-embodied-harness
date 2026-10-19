@@ -9,6 +9,30 @@ pub(crate) enum Reference {
     Known(usize),
     Unknown { column: [i32; 2], height: u64 },
 }
+/// A change in the original discrete reference walk, not an execution witness.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TraceChange {
+    pub sample_index: usize,
+    pub reference: Reference,
+}
+#[derive(Debug, Default)]
+pub(crate) struct SegmentTrace {
+    pub steps: usize,
+    pub changes: Vec<TraceChange>,
+}
+impl SegmentTrace {
+    fn record(&mut self, sample_index: usize, reference: Reference) {
+        #[cfg(test)]
+        crate::search::trace_tests::record_trace_work("visit", 1);
+        if self.changes.last().is_none_or(|last| last.reference != reference) {
+            #[cfg(test)]
+            if self.changes.len() == self.changes.capacity() {
+                crate::search::trace_tests::record_trace_work("growth", 1);
+            }
+            self.changes.push(TraceChange { sample_index, reference });
+        }
+    }
+}
 impl Tomogram {
     pub(crate) fn reference_inside_window(&self, xy: [f64; 2]) -> bool {
         self.window.is_none_or(|(center, radius)| (0..2).all(|axis|
@@ -239,6 +263,14 @@ impl Tomogram {
     }
     pub(crate) fn reference_segment_evidence(&self, a: [f64; 3], b: [f64; 3], boundary: &[[f64; 2]],
         cancelled: Option<&AtomicBool>) -> Option<(f64, bool)> {
+        self.reference_segment_recorded::<false>(a, b, boundary, cancelled, &mut None)
+    }
+    pub(crate) fn reference_segment_recorded<const RECORD: bool>(&self,
+        a: [f64; 3], b: [f64; 3], boundary: &[[f64; 2]],
+        cancelled: Option<&AtomicBool>, scratch: &mut Option<SegmentTrace>) -> Option<(f64, bool)> {
+        #[cfg(test)]
+        crate::search::trace_tests::record_evaluation(a, b);
+        if RECORD { scratch.as_mut().expect("recording scratch").changes.clear(); }
         if !a.into_iter().chain(b).all(f64::is_finite)
             || !self.reference_inside_window([a[0],a[1]])
             || !self.reference_inside_window([b[0],b[1]])
@@ -247,6 +279,11 @@ impl Tomogram {
         let mut observed = matches!(reference, Reference::Known(_));
         let length = distance(a, b);
         let steps = ((a[0] - b[0]).hypot(a[1] - b[1]) / (self.resolution * 0.4)).ceil().max(1.0) as usize;
+        if RECORD {
+            let trace = scratch.as_mut().expect("recording scratch");
+            trace.steps = steps;
+            trace.record(0, reference);
+        }
         let mut cost = 0.0;
         for i in 1..=steps {
             crate::search::checkpoint(cancelled).ok()?;
@@ -273,7 +310,10 @@ impl Tomogram {
             };
             if (z - p[2]).abs() > tolerance { return None; }
             cost += self.reference_cost(reference) * length / steps as f64;
+            if RECORD { scratch.as_mut().expect("recording scratch").record(i, reference); }
         }
+        #[cfg(test)]
+        crate::search::trace_tests::record_segment_cost(cost);
         Some((cost, observed))
     }
 }

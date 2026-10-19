@@ -733,6 +733,20 @@ final-summary clear改按真实publish=True边界注入且确认实际触发，�
 
 A只是迁移基础。实际路径段消费、不同楼层独立关联、stop前到达见证、全未知XY同搜索绕障、协议及公共默认切换仍待后续批次；本批不能证明这些生产行为，更不宣称实机导航问题解决。
 
+## 第五十七阶段：PCT地面参考来源B1，旧搜索默认零采集
+
+接受PCT两生产源与一个定向测试模块。单一evaluator/search/reducer通过const RECORD选择采集：所有旧wrapper为false，新crate-private traced入口为true；原公开Route/SearchState/SearchStats/Queue/SearchDomain逐字不变，私有SearchOutput拆回旧Route，trace只由独立TracedRoute用Arc持有。尚无生产ground调用、跨owner来源消费或公共默认切换。
+
+trace记录每条原实际评价的from/to、steps、Reference变化及最终point_span；仅planned主walk，不代表完整footprint/精确crossing/执行或实测地面。Known仍是当次Tomogram id，不把原observed bool冒作ObservedLayer。真实direct/center/precise、短路、parent、prefix和胜出shortcut各保留自身评价，完整去重尾链映射最终last；不为取来源重复任何段几何查询。旧每段reseed/成本/预算/顺序保留。
+
+原固定99列前提真实1PASS：expanded12、3次更优parent、2次stale pop。候选10组加23旧exact首次33PASS，后补center/precise明确出口仅2PASS；总36执行，最终33distinct，原核旧名改名另存（跨阶段34个selector字符串，不冒称34场景）。44对实际规划的points bits、expanded/cells、accepts/checkpoint/evaluator/neighbor/成本/parent/stale有序共同事件相等；elapsed不比较。false七项trace source-site计数全0，不是全局allocator无分配。
+
+实际Reference24B、TraceChange32B、原SearchState40B、原Route48B；ParentEvidence及Option均80B，65536槽元素约5MiB，仅true路径承担，不是RSS峰值。只存当前胜出parent，失败尝试复用scratch、无历史轨迹；合法Overflow处理变化数量或sample/steps超过内联容量，不增加拒绝门。Overflow为真实segment控制，非全搜索压力；多微尾链为生产共同装配helper控制，非真实A*自然生成所有微尾链的证明。
+
+同原target release opt3/fatLTO/CGU1/locked/offline/-j4，仅PCT lib及正常依赖。原核1轮、候选4轮各check/no-run全0；中间静审补装配helper与stale实际sidecar观察，两轮未执行测试；首33后只增加cfgtest center/precise观察与定向2项，shipping代码保持。所有中间版本/构建保留，无失败后改fixture/预算或重跑33。新增未接通接口4项dead-code warning及原warning如实保留。
+
+这是地面路线来源不再丢失的内部基础，非耗时优化结论。true有新元数据成本；未做CPU/RSS/延时AB，未接真正无锚XY、MLS关联、Scan/worker/停车、wire或实机。公共迁移仍须后续各批闭合。
+
 ## 后续持续检查
 
 1. 墙前晚到路径的实际恢复与初始 full/partial/PCT 顺序，保留及时移动和真实避障

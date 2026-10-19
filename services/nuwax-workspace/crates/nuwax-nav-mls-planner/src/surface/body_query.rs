@@ -8,6 +8,14 @@ pub struct SurfaceBodyQueryView {
     snapshot: SurfaceSnapshot,
 }
 impl SurfaceBodyQueryView {
+    /// Sweep the supplied actual poses without deriving a navigation reference
+    /// from body Z or calibration. Existing occupancy/contact checks still run.
+    pub fn validate_unanchored_motion(&self,from:([f64;3],[f64;4]),to:([f64;3],[f64;4]),
+        boundary:&[[f64;2]],witness:&mut Option<BodyFailureWitness>)->Result<(),SurfaceError> {
+        let reference=BodyQueryReference::Unanchored;
+        self.snapshot.validate_body_motion_in_context(from,to,boundary,
+            QuerySegment::for_reference(&reference),witness)
+    }
     /// Associate the initial actual support point with this immutable owner.
     /// Later transitions consume the returned state, never the changing body Z.
     pub fn start_ground_state(&self,from:([f64;3],[f64;4]))->Result<BodyGroundState,SurfaceError> {

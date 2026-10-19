@@ -12,6 +12,8 @@ enum FootprintFailure {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) enum Reference {
     Known(usize),
+    /// No navigation height. Physical query coordinates live in the request.
+    Unanchored { column: [i32; 2] },
     Unknown { column: [i32; 2], height: u64 },
 }
 /// A change in the original discrete reference walk, not an execution witness.
@@ -46,12 +48,13 @@ impl Tomogram {
     pub(crate) fn reference_column(&self, reference: Reference) -> [i32; 2] {
         match reference {
             Reference::Known(id) => self.cells[id].column,
-            Reference::Unknown { column, .. } => column,
+            Reference::Unknown { column, .. } | Reference::Unanchored { column } => column,
         }
     }
     pub(crate) fn reference_position(&self, reference: Reference) -> [f64; 3] {
         match reference {
             Reference::Known(id) => self.position(id),
+            Reference::Unanchored { .. } => unreachable!("unanchored position requires the request physical coordinate"),
             Reference::Unknown { column, height } => [
                 (f64::from(column[0]) + 0.5) * self.resolution,
                 (f64::from(column[1]) + 0.5) * self.resolution,
@@ -64,17 +67,19 @@ impl Tomogram {
     pub(crate) fn reference_height_at(&self, reference: Reference, xy: [f64; 2]) -> Option<f64> {
         match reference {
             Reference::Known(id) => self.ground_height_at(id, xy),
+            Reference::Unanchored { .. } => None,
             Reference::Unknown { height, .. } => Some(f64::from_bits(height)),
         }
     }
     pub(crate) fn reference_cost(&self, reference: Reference) -> f64 {
         // Match the existing maximum missing-support-edge surcharge (1 + 3),
         // so absence is traversable without rewarding it over observed terrain.
-        match reference { Reference::Known(id) => self.cells[id].cost, Reference::Unknown { .. } => UNKNOWN_COST }
+        match reference { Reference::Known(id) => self.cells[id].cost, Reference::Unknown { .. } | Reference::Unanchored { .. } => UNKNOWN_COST }
     }
     fn reference_ceiling(&self, reference: Reference) -> f64 {
         match reference {
             Reference::Known(id) => self.cells[id].ceiling,
+            Reference::Unanchored { .. } => unreachable!("unanchored has no terrain ceiling"),
             Reference::Unknown { column, height } => self.occupancy.get(&column)
                 .into_iter().flatten().filter(|band| band[0] > f64::from_bits(height))
                 .map(|band| band[0]).fold(f64::INFINITY, f64::min),
@@ -320,7 +325,22 @@ impl Tomogram {
             .or_else(|| self.unknown_at(column, ground)
                 .filter(|&to| self.references_compatible_from_height(from, to, span, ground)))
     }
+    pub(crate) fn unanchored_at(&self, column: [i32; 2]) -> Option<Reference> {
+        self.column_allowed(column).then_some(Reference::Unanchored { column })
+    }
     pub(crate) fn reference_neighbor(&self, from: Reference, column: [i32; 2]) -> Option<Reference> {
+        if let Reference::Unanchored { column: old } = from {
+            let dx = i64::from(column[0]) - i64::from(old[0]);
+            let dy = i64::from(column[1]) - i64::from(old[1]);
+            if dx.abs() > 1 || dy.abs() > 1 { return None; }
+            if dx != 0 && dy != 0 {
+                self.unanchored_at([column[0], old[1]])?;
+                self.unanchored_at([old[0], column[1]])?;
+            }
+            // Occupancy is checked with the actual complete BodyPose by the
+            // request's original MLS swept query, not an invented support Z.
+            return self.unanchored_at(column);
+        }
         self.reference_neighbor_with_height(from,column,self.reference_position(from)[2])
     }
     fn reference_neighbor_with_height(&self, from: Reference, column: [i32; 2],
@@ -353,6 +373,15 @@ impl Tomogram {
     pub(crate) fn reference_segment_recorded<const RECORD: bool>(&self,
         a: [f64; 3], b: [f64; 3], boundary: &[[f64; 2]],
         cancelled: Option<&AtomicBool>, scratch: &mut Option<SegmentTrace>) -> Option<(f64, bool)> {
+        self.reference_segment_from_recorded::<RECORD>(a,b,boundary,cancelled,scratch,None)
+            .map(|(cost,observed,_)|(cost,observed))
+    }
+    /// Ground callers retain the admitted source reference through search and
+    /// reduction. The compatibility entry above still reseeds exactly as before.
+    pub(crate) fn reference_segment_from_recorded<const RECORD: bool>(&self,
+        a: [f64; 3], b: [f64; 3], boundary: &[[f64; 2]],
+        cancelled: Option<&AtomicBool>, scratch: &mut Option<SegmentTrace>,
+        initial: Option<Reference>) -> Option<(f64, bool, Reference)> {
         #[cfg(test)]
         crate::search::trace_tests::record_evaluation(a, b);
         if RECORD { scratch.as_mut().expect("recording scratch").changes.clear(); }
@@ -360,7 +389,7 @@ impl Tomogram {
             || !self.reference_inside_window([a[0],a[1]])
             || !self.reference_inside_window([b[0],b[1]])
             || !crate::segment_inside_boundary([a[0], a[1]], [b[0], b[1]], boundary) { return None; }
-        let mut reference = self.reference_start(a)?;
+        let mut reference = match initial { Some(reference)=>reference, None=>self.reference_start(a)? };
         let mut observed = matches!(reference, Reference::Known(_));
         let length = distance(a, b);
         let steps = ((a[0] - b[0]).hypot(a[1] - b[1]) / (self.resolution * 0.4)).ceil().max(1.0) as usize;
@@ -378,12 +407,18 @@ impl Tomogram {
             // LegacyPlane 跨缺测仍携带原图中心参考，连续物理输运归投影。
             reference = self.reference_neighbor(reference, self.point_column(p))?;
             observed |= matches!(reference, Reference::Known(_));
+            if matches!(reference, Reference::Unanchored { .. }) {
+                cost += UNKNOWN_COST * length / steps as f64;
+                if RECORD { scratch.as_mut().expect("recording scratch").record(i, reference); }
+                continue;
+            }
             let z = self.reference_height_at(reference,[p[0],p[1]])?;
             if matches!(reference, Reference::Unknown { .. })
                 && !self.unknown_footprint_clear([p[0], p[1]], z) { return None; }
             // A shortcut may approximate a known step/ramp, but it cannot invent
             // a rising/falling plane while passing through absent observations.
             let tolerance = match reference {
+                Reference::Unanchored { .. } => unreachable!("handled without a navigation height"),
                 Reference::Known(_) => self.step_up.max(self.step_down).max(self.resolution) * 1.5 + 1e-6,
                 Reference::Unknown { .. } => {
                     let col = self.reference_column(reference);
@@ -401,6 +436,6 @@ impl Tomogram {
         }
         #[cfg(test)]
         crate::search::trace_tests::record_segment_cost(cost);
-        Some((cost, observed))
+        Some((cost, observed, reference))
     }
 }

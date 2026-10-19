@@ -1022,3 +1022,6 @@ fn classified_empty_native_column_does_not_fabricate_legacy_ground() {
     assert_eq!(f.source.query_ground([0.075,0.025],0.025).state,
         nuwax_nav_mls_planner::surface::GroundQueryState::LegacyGeometry);
 }
+
+#[path = "ground_route_tests.rs"]
+mod ground_route_tests;

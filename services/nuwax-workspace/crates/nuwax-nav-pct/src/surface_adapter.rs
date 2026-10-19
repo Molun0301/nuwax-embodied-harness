@@ -399,23 +399,34 @@ mod delta_cache_tests {
         let (source,mut observations,mut values)=fixture();
         let planner=PctPlanner::default();let old=planner.map(&source).unwrap();
         let frozen=old.as_ref().clone();
-        let deleted_id=old.columns[&[0,0]][0];
         let last=identity(&old.cells[old.cells.len()-1]);
-        assert_ne!(last.0,[0,0]);assert_ne!(last.0,[3,3]);
-        values.remove(&[0,0,0]);
-        values.insert([3,3,2],SurfaceObservation{observed_ns:20,hits:2});
+        // Dense IDs follow the actual build, not a fixed XY order. Select two
+        // existing non-tail columns while preserving the route endpoints. The
+        // first column is retired first; its slot survives both removals, so the
+        // original last cell must really move there (a cold rebuild cannot pass).
+        let mut candidates=old.cells.iter().enumerate()
+            .filter(|(id,cell)| *id<old.cells.len()-2
+                && cell.column!=[1,1] && cell.column!=[6,6])
+            .map(|(id,cell)|(cell.column,id)).collect::<Vec<_>>();
+        candidates.sort_unstable();
+        let (deleted_xy,deleted_id)=candidates[0];
+        let (occupied_xy,_)=candidates[1];
+        assert_ne!(last.0,deleted_xy);assert_ne!(last.0,occupied_xy);
+        eprintln!("dense relocation: delete={deleted_xy:?}/id={deleted_id}, change={occupied_xy:?}, last={last:?}");
+        values.remove(&[deleted_xy[0],deleted_xy[1],0]);
+        values.insert([occupied_xy[0],occupied_xy[1],2],SurfaceObservation{observed_ns:20,hits:2});
         let (next_source,changed)=replace(&source,&mut observations,&values);
-        assert_eq!(changed,vec![[0,0],[3,3]]);
+        assert_eq!(changed,vec![deleted_xy,occupied_xy]);
         let next=planner.map_with_delta(&next_source,SurfaceDelta::Columns {
             basis:&source,resolution:f64::from(Q),columns:&changed,
         }).unwrap();
         assert!(!Arc::ptr_eq(&old,&next));
         assert_eq!(identity(&next.cells[deleted_id]),last,
             "适配器必须消费旧图的真实删除/ID搬移，不能总是静默冷建");
-        assert!(!next.known_columns.contains(&[0,0]));
-        assert!(!next.occupancy.contains_key(&[0,0]));
-        assert_eq!(next_source.observations().unwrap().column_levels(0,0),None);
-        assert_eq!(next_source.observations().unwrap().column_levels(3,3),Some([0,2].as_slice()));
+        assert!(!next.known_columns.contains(&deleted_xy));
+        assert!(!next.occupancy.contains_key(&deleted_xy));
+        assert_eq!(next_source.observations().unwrap().column_levels(deleted_xy[0],deleted_xy[1]),None);
+        assert_eq!(next_source.observations().unwrap().column_levels(occupied_xy[0],occupied_xy[1]),Some([0,2].as_slice()));
         assert!(next.matches_surface(&next_source));
         exact(&next,&Tomogram::from_surface(&next_source).unwrap());
         exact(&old,&frozen);

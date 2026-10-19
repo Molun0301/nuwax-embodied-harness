@@ -2,6 +2,8 @@
 //! 采用CPU稀疏列实现，未移植原论文的CUDA及GPMP优化器。
 #[cfg(feature = "mls-adapter")]
 mod body_route;
+#[cfg(feature = "mls-adapter")]
+pub mod ground_route;
 mod boundary;
 #[cfg(feature = "mls-adapter")]
 mod surface_adapter;

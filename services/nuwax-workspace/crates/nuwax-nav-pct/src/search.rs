@@ -59,6 +59,53 @@ pub(crate) struct TracedRoute {
     pub trace: Arc<RouteReferenceTrace>,
 }
 struct SearchOutput { route: Route, trace: Option<Arc<RouteReferenceTrace>> }
+/// Request-local interpretation; no source mutation, second search or ground
+/// height is inferred from an Unanchored physical coordinate.
+#[derive(Clone, Copy)]
+enum SearchGeometry {
+    Body,
+    Ground { unanchored_z: Option<f64>, target: Option<usize> },
+}
+impl SearchGeometry {
+    fn ground(self) -> bool { matches!(self,Self::Ground { .. }) }
+    fn initial(self,map:&Tomogram,start:[f64;3])->Option<Reference> {
+        match self {
+            Self::Ground {unanchored_z:Some(_),..}=>map.unanchored_at(map.point_column(start)),
+            _=>map.reference_start(start),
+        }
+    }
+    fn position(self,map:&Tomogram,reference:Reference)->[f64;3] {
+        match (self,reference) {
+            (Self::Ground {unanchored_z:Some(z),..},Reference::Unanchored {column})=>[
+                (f64::from(column[0])+0.5)*map.resolution,
+                (f64::from(column[1])+0.5)*map.resolution,z],
+            _=>map.reference_position(reference),
+        }
+    }
+    fn height(self,map:&Tomogram,reference:Reference,xy:[f64;2])->Option<f64> {
+        match (self,reference) {
+            (Self::Ground {unanchored_z:Some(z),..},Reference::Unanchored {..})=>Some(z),
+            _=>map.reference_height_at(reference,xy),
+        }
+    }
+    fn goal_height(self,map:&Tomogram,goal:[f64;3])->Option<f64> {
+        match self {
+            Self::Ground {unanchored_z:Some(_),..}=>None,
+            Self::Ground {target:Some(id),..}=>map.ground_height_at(id,[goal[0],goal[1]]),
+            _=>map.cell_at(goal).and_then(|id|map.ground_height_at(id,[goal[0],goal[1]])),
+        }
+    }
+    fn arrival_distance(self,a:[f64;3],b:[f64;3])->f64 {
+        if self.ground() {(a[0]-b[0]).hypot(a[1]-b[1])} else {distance(a,b)}
+    }
+    fn initial_for_segment(self,reference:Reference)->Option<Reference> {
+        self.ground().then_some(reference)
+    }
+    fn goal_matches(self,reference:Reference)->bool {
+        match self { Self::Ground {target:Some(id),..}=>reference==Reference::Known(id), _=>true }
+    }
+}
+
 // The original output de-duplication, shared by real backtracking and its
 // metadata oracle. No geometry query is performed here.
 fn push_reference_point<const RECORD: bool>(points: &mut Vec<[f64; 3]>, point: [f64; 3],
@@ -318,6 +365,34 @@ impl Tomogram {
         accepts: &dyn Fn([f64; 3], [f64; 3]) -> bool,
         limits: SearchLimits,
     ) -> Result<SearchOutput, PlanningFailure> {
+        self.plan_bounded_impl_in::<RECORD>(start,goal,tolerance,boundary,cancelled,radius,
+            penalties,accepts,limits,SearchGeometry::Body)
+    }
+    pub(crate) fn plan_ground_traced(
+        &self,start:[f64;3],goal:[f64;3],tolerance:f64,boundary:&[[f64;2]],
+        cancelled:Option<&AtomicBool>,radius:Option<f64>,penalties:&[crate::RoutePenalty],
+        accepts:&dyn Fn([f64;3],[f64;3])->bool,limits:SearchLimits,
+        unanchored_z:Option<f64>,target:Option<usize>,
+    )->Result<TracedRoute,PlanningFailure> {
+        checkpoint(cancelled)?;
+        let result=self.plan_bounded_impl_in::<true>(start,goal,tolerance,boundary,cancelled,radius,
+            penalties,accepts,limits,SearchGeometry::Ground {unanchored_z,target});
+        checkpoint(cancelled)?;
+        result.map(|output|TracedRoute {route:output.route,trace:output.trace.expect("Ground records its admitted trace")})
+    }
+    fn plan_bounded_impl_in<const RECORD: bool>(
+        &self,
+        start: [f64; 3],
+        goal: [f64; 3],
+        tolerance: f64,
+        boundary: &[[f64; 2]],
+        cancelled: Option<&AtomicBool>,
+        radius: Option<f64>,
+        penalties: &[crate::RoutePenalty],
+        accepts: &dyn Fn([f64; 3], [f64; 3]) -> bool,
+        limits: SearchLimits,
+        geometry: SearchGeometry,
+    ) -> Result<SearchOutput, PlanningFailure> {
         let began = std::time::Instant::now();
         if !start.into_iter().chain(goal).all(f64::is_finite)
             || !tolerance.is_finite() || tolerance < 0.0
@@ -331,17 +406,16 @@ impl Tomogram {
         if !self.reference_inside_window([start[0],start[1]]) {
             return Err(PlanningFailure::SearchDomainLimited("起点超出本次地图物化范围；未证明物理无路".into()));
         }
-        let initial = self.reference_start(start).ok_or("层析起点存在已知障碍或不兼容地形")?;
+        let initial = geometry.initial(self,start).ok_or("层析起点存在已知障碍或不兼容地形")?;
         let goal_column = self.point_column(goal);
-        let initial_height = self.reference_height_at(initial,[start[0],start[1]])
+        let initial_height = geometry.height(self,initial,[start[0],start[1]])
             .ok_or("层析起点地表来源与实际查询列不一致")?;
-        let goal_height = self.cell_at(goal)
-            .and_then(|id|self.ground_height_at(id,[goal[0],goal[1]]));
+        let goal_height = geometry.goal_height(self,goal);
         let [low, high] = self.ground_bounds.unwrap_or([initial_height; 2]);
         let low = low.min(initial_height).min(goal_height.unwrap_or(initial_height));
         let high = high.max(initial_height).max(goal_height.unwrap_or(initial_height));
-        if goal[2] + tolerance + 1e-6 < low
-            || goal[2] - tolerance - 1e-6 > high {
+        if !geometry.ground() && (goal[2] + tolerance + 1e-6 < low
+            || goal[2] - tolerance - 1e-6 > high) {
             // Every reachable height is either an observed cell reference or
             // inherited from one/start. No unknown node can invent a new height.
             // A crop can conclude only that its own reference domain is limited.
@@ -358,11 +432,12 @@ impl Tomogram {
         let mut scratch = RECORD.then(SegmentTrace::default);
         #[cfg(test)]
         if RECORD { trace_tests::record_trace_work("scratch", 1); }
-        if distance(direct, goal) <= tolerance + 1e-6
+        if geometry.arrival_distance(direct, goal) <= tolerance + 1e-6
             && radius.is_none_or(|r| (direct[0] - start[0]).hypot(direct[1] - start[1]) <= r)
             && penalties.is_empty() && accepts(start, direct)
-            && self.reference_segment_recorded::<RECORD>(start, direct, boundary, cancelled, &mut scratch)
-                .is_some_and(|(cost, observed)| limits.max_states == 0 || !observed || cost <= distance(start, direct) + 1e-6) {
+            && self.reference_segment_from_recorded::<RECORD>(start, direct, boundary, cancelled, &mut scratch,
+                geometry.initial_for_segment(initial)).is_some_and(|(cost, observed, end)| geometry.goal_matches(end)
+                    && (limits.max_states == 0 || !observed || cost <= distance(start, direct) + 1e-6)) {
             checkpoint(cancelled)?;
             let points = if distance(start, direct) <= 1e-6 { vec![start] } else { vec![start, direct] };
             let trace = if RECORD {
@@ -383,9 +458,9 @@ impl Tomogram {
         let mut domain = SearchDomain::new(self, start, goal, boundary, radius);
         let order = |reference| {
             let column = self.reference_column(reference);
-            [column[0], column[1], (self.reference_position(reference)[2] / self.body_height.max(self.resolution)).floor() as i32]
+            [column[0], column[1], (geometry.position(self,reference)[2] / self.body_height.max(self.resolution)).floor() as i32]
         };
-        let heuristic = |reference| (distance(self.reference_position(reference), goal) - tolerance).max(0.0) * self.minimum_cost;
+        let heuristic = |reference| (geometry.arrival_distance(geometry.position(self,reference), goal) - tolerance).max(0.0) * self.minimum_cost;
         let mut states = vec![SearchState { reference: initial, cost: 0.0, parent: usize::MAX }];
         let mut parents: Option<Vec<Option<ParentEvidence>>> = RECORD.then(|| vec![None]);
         let mut best_trace = RECORD.then(SegmentTrace::default);
@@ -449,20 +524,21 @@ impl Tomogram {
             }
             expanded += 1;
             let from = states[id].reference;
-            let a = self.reference_position(from);
+            let a = geometry.position(self,from);
             let actual_a = if id == 0 { start } else { a };
             let precise = (self.reference_column(from) == goal_column)
-                .then(||self.reference_height_at(from,[goal[0],goal[1]]))
+                .then(||geometry.height(self,from,[goal[0],goal[1]]))
                 .flatten().map(|height|[goal[0],goal[1],height]);
             // Keep the cell-center arrival candidate as well: the exact goal XY
             // can be just outside a boundary while its arrival ball overlaps it.
             let center = if precise.is_some_and(|p| distance(p,a) <= 1e-6) { None } else { Some(a) };
             for candidate in [center, precise].into_iter().flatten() {
-                if distance(candidate, goal) <= tolerance + 1e-6
+                if geometry.arrival_distance(candidate, goal) <= tolerance + 1e-6
                     && radius.is_none_or(|r| (candidate[0] - start[0]).hypot(candidate[1] - start[1]) <= r)
                     && accepts(actual_a, candidate)
-                    && self.reference_segment_recorded::<RECORD>(actual_a, candidate, boundary, cancelled, &mut scratch).is_some() {
-                    let total = cost + 2.0 * distance(candidate, goal);
+                    && self.reference_segment_from_recorded::<RECORD>(actual_a, candidate, boundary, cancelled, &mut scratch,
+                        geometry.initial_for_segment(from)).is_some_and(|(_,_,end)|geometry.goal_matches(end)) {
+                    let total = cost + 2.0 * geometry.arrival_distance(candidate, goal);
                     if best.is_none_or(|(_, _, old)| total < old) {
                         best = Some((id, candidate, total));
                         if RECORD { std::mem::swap(&mut best_trace, &mut scratch); }
@@ -490,14 +566,15 @@ impl Tomogram {
                     if !outside_radius { continue; }
                 }
                 let Some(next) = self.reference_neighbor(from, [x, y]) else { continue; };
-                let b = self.reference_position(next);
+                let b = geometry.position(self,next);
                 if !accepts(actual_a, b) { continue; }
                 if outside_radius {
                     // 只有整段可接纳的越界边才证明人工半径截断；仅有邻点
                     // 不能把真实障碍或高度不连续改写成搜索范围不足。
                     #[cfg(test)]
                     tests::record_neighbor_validation(b);
-                    if self.reference_segment(actual_a, b, boundary, cancelled).is_some() {
+                    if self.reference_segment_from_recorded::<false>(actual_a,b,boundary,cancelled,&mut None,
+                        geometry.initial_for_segment(from)).is_some() {
                         radius_clipped = true;
                     }
                     continue;
@@ -524,7 +601,8 @@ impl Tomogram {
                 // 侧格可能不同。所有可能改善路线的边仍复用输出段检查。
                 #[cfg(test)]
                 tests::record_neighbor_validation(b);
-                if self.reference_segment_recorded::<RECORD>(actual_a, b, boundary, cancelled, &mut scratch).is_none() { continue; }
+                if self.reference_segment_from_recorded::<RECORD>(actual_a,b,boundary,cancelled,&mut scratch,
+                    geometry.initial_for_segment(from)).is_none_or(|(_,_,end)|geometry.ground()&&end!=next) { continue; }
                 let next_id = match existing {
                     Some(id) => id,
                     None => {
@@ -595,11 +673,15 @@ impl Tomogram {
         let mut tail_start = 0;
         let mut previous_raw = start;
         points.push(start);
+        let mut point_references=geometry.ground().then(||vec![initial]);
         for id in ids.into_iter().skip(1) {
             checkpoint(cancelled)?;
-            let p = self.reference_position(states[id].reference);
+            let p = geometry.position(self,states[id].reference);
             let (span, from) = push_reference_point::<RECORD>(&mut points, p, &mut previous_raw,
                 raw_trace.as_ref().map_or(0, |trace| trace.connections.len() + 1), &mut tail_start);
+            if let Some(references)=point_references.as_mut() {
+                if span[0]!=span[1] {references.push(states[id].reference);}
+            }
             if RECORD {
                 let trace = raw_trace.as_mut().unwrap();
                 parents.as_ref().unwrap()[id].as_ref().expect("admitted parent evidence")
@@ -610,6 +692,9 @@ impl Tomogram {
             raw_trace.as_ref().map_or(0, |trace| trace.connections.len() + 1), &mut tail_start);
         if RECORD {
             let segment = best_trace.take().expect("best connector evidence");
+            if let Some(references)=point_references.as_mut() {
+                if span[0]!=span[1] {references.push(segment.changes.last().unwrap().reference);}
+            }
             let trace = raw_trace.as_mut().unwrap();
             trace.append(span, from, endpoint, segment.steps, segment.changes);
             // Parent evidence is no longer needed; do not overlap its peak with
@@ -617,8 +702,8 @@ impl Tomogram {
             drop(parents.take());
             drop(states);
         }
-        let (points, trace) = self.reduce_recorded::<RECORD>(points, boundary, penalties, cancelled,
-            accepts, raw_trace, tail_start, &mut scratch)?;
+        let (points, trace) = self.reduce_recorded_in::<RECORD>(points, boundary, penalties, cancelled,
+            accepts, raw_trace, tail_start, &mut scratch,point_references.as_deref())?;
         #[cfg(test)]
         if RECORD { trace_tests::record_trace_work("arc", 1); }
         Ok(SearchOutput { route: Route { points, stats: SearchStats { expanded,
@@ -634,12 +719,15 @@ impl Tomogram {
         cancelled: Option<&AtomicBool>,
         accepts: &dyn Fn([f64; 3], [f64; 3]) -> bool,
         scratch: &mut Option<SegmentTrace>,
+        references: Option<[Reference;2]>,
     ) -> Option<f64> {
         if !accepts(a, b) || !crate::segment_inside_boundary([a[0], a[1]], [b[0], b[1]], boundary)
         {
             return None;
         }
-        let base = self.reference_segment_recorded::<RECORD>(a, b, boundary, cancelled, scratch)?.0;
+        let (base,_,end)=self.reference_segment_from_recorded::<RECORD>(a,b,boundary,cancelled,scratch,
+            references.map(|r|r[0]))?;
+        if references.is_some_and(|r|r[1]!=end) {return None;}
         let length = distance(a, b);
         let n = (length / (self.resolution * 0.5)).ceil().max(1.0) as usize;
         let mut extra = 0.0;
@@ -671,6 +759,15 @@ impl Tomogram {
         cancelled: Option<&AtomicBool>, accepts: &dyn Fn([f64; 3], [f64; 3]) -> bool,
         raw_trace: Option<RouteReferenceTrace>, tail_start: usize, scratch: &mut Option<SegmentTrace>,
     ) -> Result<(Vec<[f64; 3]>, Option<RouteReferenceTrace>), String> {
+        self.reduce_recorded_in::<RECORD>(points,boundary,penalties,cancelled,accepts,
+            raw_trace,tail_start,scratch,None)
+    }
+    fn reduce_recorded_in<const RECORD: bool>(
+        &self, points: Vec<[f64; 3]>, boundary: &[[f64; 2]], penalties: &[crate::RoutePenalty],
+        cancelled: Option<&AtomicBool>, accepts: &dyn Fn([f64; 3], [f64; 3]) -> bool,
+        raw_trace: Option<RouteReferenceTrace>, tail_start: usize, scratch: &mut Option<SegmentTrace>,
+        point_references: Option<&[Reference]>,
+    ) -> Result<(Vec<[f64; 3]>, Option<RouteReferenceTrace>), String> {
         checkpoint(cancelled)?;
         if points.len() < 3 {
             return Ok((points, raw_trace));
@@ -678,9 +775,10 @@ impl Tomogram {
         let mut prefix_trace = RECORD.then(RouteReferenceTrace::default);
         let mut output_trace = RECORD.then(RouteReferenceTrace::default);
         let mut prefix = vec![0.0];
-        for pair in points.windows(2) {
+        for (index,pair) in points.windows(2).enumerate() {
             checkpoint(cancelled)?;
-            let Some(cost) = self.segment_cost_recorded::<RECORD>(pair[0], pair[1], boundary, penalties, cancelled, accepts, scratch) else {
+            let Some(cost) = self.segment_cost_recorded::<RECORD>(pair[0], pair[1], boundary, penalties, cancelled, accepts, scratch,
+                point_references.map(|r|[r[index],r[index+1]])) else {
                 checkpoint(cancelled)?;
                 return Err(format!("层析参考相邻段未通过一致的障碍/地形验证：{:?} -> {:?}", pair[0], pair[1]));
             };
@@ -706,7 +804,8 @@ impl Tomogram {
             for next in (anchor + 2..=far).rev() {
                 checkpoint(cancelled)?;
                 if self
-                    .segment_cost_recorded::<RECORD>(points[anchor], points[next], boundary, penalties, cancelled, accepts, scratch)
+                    .segment_cost_recorded::<RECORD>(points[anchor], points[next], boundary, penalties, cancelled, accepts, scratch,
+                        point_references.map(|r|[r[anchor],r[next]]))
                     .is_some_and(|cost| cost <= (prefix[next] - prefix[anchor]) * 1.1 + 1e-6)
                 {
                     chosen = next;

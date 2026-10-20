@@ -418,36 +418,70 @@ impl Tomogram {
             let xy=std::array::from_fn(|axis|from[axis]+t*(to[axis]-from[axis]));
             reference=self.reference_neighbor(reference,xy.map(|v|(v/self.resolution).floor() as i32))?;
             observed|=matches!(reference,Reference::Known(_));
-            if matches!(reference,Reference::Unanchored {..}) {
-                cost+=UNKNOWN_COST*length/steps as f64;
-                if RECORD {scratch.as_mut().expect("recording scratch").record(i,reference);}
-                continue;
-            }
-            let z=self.reference_height_at(reference,xy)?;
-            if matches!(reference,Reference::Unknown {..}) && !self.unknown_footprint_clear(xy,z) {return None;}
-            // The existing segment leaf keeps its exact line-height tolerance.
-            // The candidate-XY leaf has no prescribed z line to compare against.
-            if let Some([az,bz])=heights {
-                let end_point=[to[0],to[1],bz];
-                let tolerance=match reference {
-                    Reference::Unanchored {..}=>unreachable!("handled without a navigation height"),
-                    Reference::Known(_)=>self.step_up.max(self.step_down).max(self.resolution)*1.5+1e-6,
-                    Reference::Unknown {..}=> {
-                        let col=self.reference_column(reference);let end=self.point_column(end_point);
-                        if (i64::from(col[0])-i64::from(end[0])).abs()<=1
-                            && (i64::from(col[1])-i64::from(end[1])).abs()<=1
-                            && self.cell_at(end_point).is_some() {
-                            self.step_up.max(self.step_down).max(self.resolution)+1e-6
-                        }else{1e-6}
-                    },
-                };
-                if (z-(az+t*(bz-az))).abs()>tolerance {return None;}
-            }
-            cost+=self.reference_cost(reference)*length/steps as f64;
+            let z=if matches!(reference,Reference::Unanchored {..}) {None}
+                else {Some(self.reference_height_at(reference,xy)?)};
+            if matches!(reference,Reference::Unknown {..}) && !self.unknown_footprint_clear(xy,z?) {return None;}
+            cost+=self.reference_line_sample_cost(reference,z,t,to,heights,length,steps)?;
             if RECORD {scratch.as_mut().expect("recording scratch").record(i,reference);}
         }
         #[cfg(test)]
         crate::search::trace_tests::record_segment_cost(cost);
         Some((cost, observed, reference))
+    }
+
+    /// Apply the original line-height/cost leaf to an already selected source
+    /// walk. The XY walk already checked boundary, footprint and corner rules.
+    /// Replaying never chooses a reference or repeats those physical checks.
+    pub(crate) fn reference_segment_replay(&self,a:[f64;3],b:[f64;3],
+        cancelled:Option<&AtomicBool>,trace:&SegmentTrace)->Option<(f64,bool,Reference)> {
+        #[cfg(test)]
+        crate::search::trace_tests::record_evaluation(a,b);
+        let from=[a[0],a[1]];let to=[b[0],b[1]];
+        let heights=Some([a[2],b[2]]);let length=distance(a,b);let steps=trace.steps;
+        let mut changes=trace.changes.iter().peekable();
+        let mut reference=changes.next()?.reference;
+        let mut observed=matches!(reference,Reference::Known(_));let mut cost=0.0;
+        for i in 1..=steps {
+            crate::search::checkpoint(cancelled).ok()?;
+            while changes.peek().is_some_and(|change|change.sample_index<=i) {
+                reference=changes.next().unwrap().reference;
+            }
+            let t=i as f64/steps as f64;
+            let xy=std::array::from_fn(|axis|from[axis]+t*(to[axis]-from[axis]));
+            observed|=matches!(reference,Reference::Known(_));
+            let z=if matches!(reference,Reference::Unanchored {..}) {None}
+                else {Some(self.reference_height_at(reference,xy)?)};
+            cost+=self.reference_line_sample_cost(reference,z,t,to,heights,length,steps)?;
+        }
+        #[cfg(test)]
+        crate::search::trace_tests::record_segment_cost(cost);
+        Some((cost,observed,reference))
+    }
+    // Kept as one numerical leaf so continued-root replay cannot silently use
+    // the looser XY-only rule. Old callers keep their original checkpoint and
+    // source-selection order; the root polls once per selection/replay sample.
+    fn reference_line_sample_cost(&self,reference:Reference,z:Option<f64>,t:f64,
+        to:[f64;2],heights:Option<[f64;2]>,length:f64,steps:usize)->Option<f64> {
+        if matches!(reference,Reference::Unanchored {..}) {
+            return Some(UNKNOWN_COST*length/steps as f64);
+        }
+        let z=z?;
+        if let Some([az,bz])=heights {
+            let end_point=[to[0],to[1],bz];
+            let tolerance=match reference {
+                Reference::Unanchored {..}=>unreachable!("handled without a navigation height"),
+                Reference::Known(_)=>self.step_up.max(self.step_down).max(self.resolution)*1.5+1e-6,
+                Reference::Unknown {..}=> {
+                    let col=self.reference_column(reference);let end=self.point_column(end_point);
+                    if (i64::from(col[0])-i64::from(end[0])).abs()<=1
+                        && (i64::from(col[1])-i64::from(end[1])).abs()<=1
+                        && self.cell_at(end_point).is_some() {
+                        self.step_up.max(self.step_down).max(self.resolution)+1e-6
+                    }else{1e-6}
+                },
+            };
+            if (z-(az+t*(bz-az))).abs()>tolerance {return None;}
+        }
+        Some(self.reference_cost(reference)*length/steps as f64)
     }
 }

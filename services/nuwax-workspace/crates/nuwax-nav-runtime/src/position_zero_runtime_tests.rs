@@ -30,7 +30,7 @@ async fn zero_position_surface_scheduler() -> (
         costmap: ExecutionMap::Surface(map), source_timestamp_ns: goal.stamp.nanos,
     }, Instant::now()).unwrap();
     let mut request = session();
-    request.goal_pose = goal.clone();
+    request.goal = ExecutionGoal::Body(goal.clone());
     request.options = zero_position_options();
     scheduler.start_session(&status, request).await.unwrap();
     let mut route = path();

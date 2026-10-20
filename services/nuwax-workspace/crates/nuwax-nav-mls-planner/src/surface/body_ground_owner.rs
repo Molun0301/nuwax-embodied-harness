@@ -1,7 +1,7 @@
 //! Owner-bound scalar ground transport. Heights belong to actual support XY;
 //! the calibrated offset participates only in body/support geometry conversion.
 use super::*;
-use crate::surface::body_query::{BodyGroundState,BodyMotionProjection,BodyQueryReference,
+use crate::surface::body_query::{BodyGroundEvidence,BodyGroundState,BodyMotionProjection,BodyQueryReference,
     BodyNavigationSegment,NavigationGroundSample,GroundSample,GroundSampleMode,LocalGroundReference};
 
 fn transport_attitude(actual:[f64;4],before:Option<[f64;3]>,after:Option<[f64;3]>,yaw:f64)
@@ -27,6 +27,15 @@ fn transport_attitude(actual:[f64;4],before:Option<[f64;3]>,after:Option<[f64;3]
 }
 
 impl SurfaceSnapshot {
+    /// Describe an already selected endpoint at its actual support XY. This
+    /// computes only the existing body/support transform, never another query.
+    pub(in crate::surface) fn owned_ground_evidence(&self,actual:([f64;3],[f64;4]),
+        sample:&GroundSample,carry_intact:bool)->Result<BodyGroundEvidence,SurfaceError> {
+        let model=self.body_envelope().ok_or(SurfaceError::InvalidPose)?;
+        let support=self.support_position_from_body(actual.0,actual.1,model.body_to_support_z_m)?;
+        Ok(BodyGroundEvidence::from_sample(self,[support[0],support[1]],sample,carry_intact))
+    }
+
     pub(in crate::surface) fn validate_owned_actual_support(&self,pose:([f64;3],[f64;4]),
         ground:&GroundSample)->Result<(),SurfaceError> {
         let model=self.body_envelope().ok_or(SurfaceError::InvalidPose)?;
@@ -115,10 +124,15 @@ impl SurfaceSnapshot {
 
     pub(in crate::surface) fn navigation_initial_support(&self,from:([f64;3],[f64;4]),
         ground:&BodyGroundState,navigation:&BodyNavigationSegment<'_,'_>)->Result<BodyGroundState,SurfaceError> {
+        self.navigation_support_at(from,ground,navigation,0.0)
+    }
+
+    pub(in crate::surface) fn navigation_support_at(&self,actual:([f64;3],[f64;4]),
+        ground:&BodyGroundState,navigation:&BodyNavigationSegment<'_,'_>,at:f64)->Result<BodyGroundState,SurfaceError> {
         let model=self.body_envelope().ok_or(SurfaceError::InvalidPose)?;
-        let support=self.support_position_from_body(from.0,from.1,model.body_to_support_z_m)?;
+        let support=self.support_position_from_body(actual.0,actual.1,model.body_to_support_z_m)?;
         Ok(BodyGroundState {sample:self.advance_navigation_ground([support[0],support[1]],
-            &ground.sample,navigation.at(0.0))?})
+            &ground.sample,navigation.at(at))?})
     }
 
     pub(in crate::surface) fn owned_ground_motion_reference(&self,from:([f64;3],[f64;4]),

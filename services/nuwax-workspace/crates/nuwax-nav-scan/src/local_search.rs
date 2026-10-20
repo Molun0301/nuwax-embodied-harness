@@ -521,6 +521,7 @@ pub fn plan(
 #[derive(Debug)]
 pub(super) struct SearchPath<'a> {
     pub navigation:Option<Vec<GroundWalkSegment<'a>>>,
+    pub end_ground:Option<BodyGroundState>,
     pub poses: Vec<BodyPose>,
     pub partial: bool,
 }
@@ -833,7 +834,8 @@ pub(super) fn plan_progress_state<'a,const N:usize>(
                 #[cfg(feature="profile")] if let Some(phase)=root_phase.as_mut() {
                     phase.finish("full"); phase.selected(if turn.abs()<1e-8 {"line"} else {"arc"});
                 }
-                connection=Some((prefix,connection_segments));break;
+                connection=Some((prefix,connection_segments,
+                    connection_ground.navigation.map(|_|connection_ground.physical)));break;
             }
         }
         if reached || connection.is_some() {
@@ -861,7 +863,9 @@ pub(super) fn plan_progress_state<'a,const N:usize>(
                         origin:super::CandidateEdgeOrigin::Parent {node:id}});
                 }
             }
-            if let Some((connection,segments))=connection {
+            let end_ground;
+            if let Some((connection,segments,physical))=connection {
+                end_ground=physical;
                 if let (Some(out),Some(accepted))=(&mut navigation,segments) {out.extend(accepted);}
                 let edge_start=path.len()-1;
                 path.extend(connection.into_iter().skip(1));
@@ -869,9 +873,11 @@ pub(super) fn plan_progress_state<'a,const N:usize>(
                     parts.push(super::CandidatePart {edges:edge_start+*offset..path.len()-1+*offset,
                         origin:super::CandidateEdgeOrigin::Connector {node:id}});
                 }
+            }else {
+                end_ground=start_ground.navigation.map(|_|nodes[id].ground.clone());
             }
             super::cancellation::checkpoint()?;
-            return Ok(SearchPath {poses:path,partial:false,navigation});
+            return Ok(SearchPath {poses:path,partial:false,navigation,end_ground});
         }
         #[cfg(feature="profile")] {
             if let Some(phase)=root_phase.as_mut() {phase.finish("miss");}
@@ -1012,7 +1018,8 @@ pub(super) fn plan_progress_state<'a,const N:usize>(
             #[cfg(feature="profile")] if let Some(phase)=remaining_phase.as_mut() {
                 phase.finish(if partial {"partial"} else {"full"});
             }
-            return Ok(SearchPath {poses,partial,navigation});
+            return Ok(SearchPath {poses,partial,navigation,
+                end_ground:start_ground.navigation.map(|_|nodes[id].ground.clone())});
         }
     }
     #[cfg(feature="profile")] if let Some(phase)=remaining_phase.as_mut() {

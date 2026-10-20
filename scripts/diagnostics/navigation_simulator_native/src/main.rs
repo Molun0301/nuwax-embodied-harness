@@ -6,7 +6,7 @@ use nuwax_nav_mls_planner::{
     SurfaceMapBuilder, SurfaceObservation, SurfaceObservations, SurfaceSnapshot,
 };
 use nuwax_nav_mls_planner::surface::{BodyGroundState, GroundEvidence};
-use nuwax_nav_runtime::{ExecutionMap, ExecutionPath, NavPlanner, PlannerStep, RouteFollower};
+use nuwax_nav_runtime::{ExecutionGoal, ExecutionMap, ExecutionPath, NavPlanner, PlannerStep, RouteFollower};
 use nuwax_nav_runtime::replan_feedback::{ActualExecutionContext, SurfaceReplanInput, SuccessfulReplanMemo};
 use nuwax_nav_stack::{surface_config::SurfaceNavigationConfig};
 use nuwax_nav_types_messages::{
@@ -1041,9 +1041,10 @@ impl Simulation {
         // Reassociate only actual observation/ground. Never step while waiting.
         let input=SurfaceReplanInput {
             source:Arc::clone(&scene.map), start:stamped(self.current,self.time),
-            goal:stamped(self.goal,self.time), options:self.options,
+            goal:ExecutionGoal::Body(stamped(self.goal,self.time)), options:self.options,
             boundary:Arc::new(vec![]),
             actual:self.follower.refresh_execution_context(as_twist(self.applied)),
+            ground_intent:None,
             limits,
             offset:scene.map.body_envelope().map_or(scene.config.follower.body_to_support_z_m,
                 |body|body.body_to_support_z_m),
@@ -1123,6 +1124,10 @@ impl Simulation {
                 self.message = reason;
                 self.braking_for_replan = true;
                 self.status = "planning".into();
+            }
+            PlannerStep::GroundArrival(_) => {
+                self.command = [0.; 3];
+                return Err("Ground arrival is unsupported in the Body-only diagnostic simulator".into());
             }
             PlannerStep::Failed(reason) => return Err(reason),
         }

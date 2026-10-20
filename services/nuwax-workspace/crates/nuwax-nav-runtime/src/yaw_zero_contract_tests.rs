@@ -49,7 +49,7 @@ async fn yaw_zero_surface_scheduler(
         costmap: ExecutionMap::Surface(map), source_timestamp_ns: actual.stamp.nanos,
     }, Instant::now()).unwrap();
     let mut request = session();
-    request.goal_pose = goal.clone();
+    request.goal = ExecutionGoal::Body(goal.clone());
     request.options = nuwax_nav_types_messages::GoalOptions {
         position_tolerance_m: 0.0, yaw_tolerance_rad: 0.0, allow_reverse: false,
     };
@@ -123,7 +123,7 @@ async fn zero_yaw_stopped_real_surface_arrival_rejects_nonzero_yaw_drift() {
     let (mut scheduler, status, motion, mut drift) = yaw_zero_surface_scheduler(goal, goal).await;
     drift.pose.orientation = nuwax_nav_types_messages::Quaternion::from_yaw(1e-7);
     validate_map_pose(&drift, "odometry").unwrap();
-    assert_eq!(drift.pose.position, scheduler.session.as_ref().unwrap().goal_pose.pose.position);
+    assert_eq!(drift.pose.position, scheduler.session.as_ref().unwrap().goal.as_body().expect("Body fixture goal").pose.position);
     let error = drift.pose.orientation.yaw() - goal.yaw();
     assert!(error > 0.0 && error < 1e-6);
     yaw_zero_record("actual post-stop yaw drift", goal, drift.pose.orientation);

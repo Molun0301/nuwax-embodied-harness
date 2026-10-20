@@ -29,7 +29,7 @@ pub use body::{BodyGroundRelation, GroundQuery, GroundQueryState, SurfaceBodyEnv
 mod passage;
 pub use passage::SurfaceBodyPassageCandidate;
 mod body_query;
-pub use body_query::{BodyGroundState, BodyMotionProjection, BodyNavigationSegment,
+pub use body_query::{BodyGroundEvidence, BodyGroundSourceRelation, BodyGroundState, BodyMotionProjection, BodyNavigationSegment,
     NavigationGroundSample, NavigationPlanningFork, SurfaceBodyQueryView, same_source_geometry};
 mod body_witness;
 pub use body_witness::{BodyFailureWitness, BodyRejection, CollisionCheck, OccupancySource};

@@ -31,6 +31,7 @@ fn run_first_delivery_pose_falsifier(change_before_publication:bool) {
         assert!(!config.controller.simulation);
         let (computed,receive)=std::sync::mpsc::channel();let (release,wait)=std::sync::mpsc::channel();
         let mut harness=RouteWorkerHarness{worker:PlannerWorker::new(GatedRouteFollower{
+            refresh_gate: None,
             inner:RouteFollower::new(config).unwrap(),computed,release:wait,map:None,boundary:Vec::new(),
             odometry:None,goal_updates:0,path_updates:0}).unwrap(),computed:receive,release,clear:source.clone()};
         let start=stamped(0.533);let goal=stamped(2.0);

@@ -302,7 +302,7 @@ async fn held_real_pct_wakes_after_real_nonzero_applied_and_new_path() {
     let second=held.input_after(n+1,|_|true).await;
     assert!(same_penalties(&first.penalties,&second.penalties));
     assert!(first.source.same_body_query_view(&second.source));
-    assert!(same_pose(&first.start,&second.start)&&same_pose(&first.goal,&second.goal));
+    assert!(same_pose(&first.start,&second.start)&&same_pose(first.goal.as_body().unwrap(),second.goal.as_body().unwrap()));
     // State and feedback watches can race. Any available context must still
     // be one of this test's two actual receipts at the identical physical input.
     if let Some(actual)=&second.actual {
@@ -421,7 +421,7 @@ async fn held_changed_goal_late_old_feedback_is_missing_actual_not_old_owner_reu
         let captures = hh.probe.captures.lock().unwrap();
         assert_eq!(captures.len(), captures_before + 1);
         assert!(captures[captures_before].actual.is_none());
-        assert!(same_pose(&captures[captures_before].goal, &pose_from_schema(&hh.goal.goal).unwrap()));
+        assert!(same_pose(captures[captures_before].goal.as_body().unwrap(), &pose_from_schema(&hh.goal.goal).unwrap()));
         let events = hh.probe.events.lock().unwrap();
         assert!(events[events_before..].contains(&Event::Dispatch { complete: false }));
         assert!(!events[events_before..].contains(&Event::Reuse { complete: true }));

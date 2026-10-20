@@ -340,7 +340,9 @@ fn c1c2_08_original_grid_zero_motion_and_body_no_navigation_work() {
     assert_eq!(slice.original_sample(1.0),Some((steps,0.0)));
     let zero=plan_driven_ground(&map,&tomo,start,&ground,&[reference[0]],&motion(),&ScanConfig::default(),None,
         Some((reference[0],0.0)),&[],false,false,None,route.reference.full_window().unwrap()).unwrap();
-    assert!(zero.trajectory.poses.iter().all(|p|*p==start));assert_eq!(zero.binding.edges().len(),1);
+    // C1-c5 validates an actual singleton without inventing a duplicate edge.
+    // The old one-edge expectation is retained as a D1 qualification failure.
+    assert_eq!(zero.trajectory.poses,vec![start]);assert_eq!(zero.binding.edges().len(),0);
     assert!(!zero.binding.covers_original_goal());
     GROUND_EDGE_WORK.set([0;3]);spline::take_ground_proposal_walks();GROUND_MAPPING_WORK.set(0);
     plan_with_progress_from_ground(&map,&tomo,start,&ground,&[[-1.,0.2,0.0],[0.1,0.2,0.0]],&motion(),&ScanConfig::default(),

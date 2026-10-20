@@ -8,7 +8,9 @@ use nuwax_nav_pct::{RoutePenalty, SearchLimits};
 use nuwax_nav_pct::ground_route::{GroundRouteGoal, GroundRouteWindow, GroundWalkState, OwnedGroundRouteWindow, OwnedGroundWalkState};
 use nuwax_nav_scan::GroundCandidateBinding;
 use nuwax_nav_types_messages::{GoalOptions, PoseStamped, Twist2};
-use crate::PathExecutionIdentity;
+use crate::{ExecutionGoal, PathExecutionIdentity};
+use nuwax_nav_mls_planner::surface::BodyGroundEvidence;
+use nuwax_nav_types_messages::GroundLayerResult;
 
 /// A source-owned address actually consumed by the executor. This is not an
 /// arrival proof; its binding retains the original candidate sampling grid.
@@ -44,6 +46,28 @@ impl GroundActualBasis {
                 .ok_or_else(||"ground actual address is outside its retained candidate".into()),
         }
     }
+    pub(crate) fn is_terminal_for(&self,intent:&GroundIntent)->bool {
+        let window=intent.window();
+        if !window.to().is_terminal() {return false;}
+        match &self.address {
+            GroundActualAddress::Initial(state)=>window.from().indices()==window.to().indices()
+                && state.same_reference_owner(window.owner())
+                && state.semantic_key()==window.to().walk_state().semantic_key(),
+            GroundActualAddress::Candidate {binding,edge,fraction,..}=>
+                binding.planned_join() && binding.covers_original_goal()
+                && GroundIntent::new(binding.original_window()).same_intent(intent)
+                && (binding.edges().is_empty() || *edge+1==binding.edges().len() && *fraction==1.0),
+        }
+    }
+    pub(crate) fn completed_original_window(&self)->Option<OwnedGroundRouteWindow> {
+        match &self.address {
+            GroundActualAddress::Candidate {binding,edge,fraction,..}
+                if binding.planned_join() && (binding.edges().is_empty()
+                    || *edge+1==binding.edges().len() && *fraction==1.0) =>
+                Some(binding.original_window().freeze()),
+            _=>None,
+        }
+    }
     pub(crate) fn matches_binding(&self,binding:&Arc<GroundCandidateBinding>)->bool {
         matches!(&self.address,GroundActualAddress::Candidate {binding:current,..} if Arc::ptr_eq(current,binding))
     }
@@ -67,17 +91,14 @@ impl Eq for GroundActualBasis {}
 #[derive(Clone, Debug)]
 pub struct GroundIntent {
     window: OwnedGroundRouteWindow,
-    goal: GroundRouteGoal,
-    resolved_ground_z: Option<f64>,
 }
 impl GroundIntent {
-    pub(crate) fn new(window: GroundRouteWindow<'_>, goal: GroundRouteGoal,
-        resolved_ground_z: Option<f64>) -> Self {
-        Self { window:window.freeze(), goal, resolved_ground_z }
-    }
+    pub(crate) fn new(window: GroundRouteWindow<'_>) -> Self { Self {window:window.freeze()} }
     pub(crate) fn window(&self) -> GroundRouteWindow<'_> { self.window.window() }
-    pub(crate) fn goal(&self) -> GroundRouteGoal { self.goal }
-    pub(crate) fn resolved_ground_z(&self) -> Option<f64> { self.resolved_ground_z }
+    pub(crate) fn goal(&self) -> GroundRouteGoal { self.window().owner().original_goal() }
+    pub(crate) fn resolved_ground_z(&self) -> Option<f64> {
+        self.window().owner().target_sample().and_then(|sample|sample.point.ground_z)
+    }
     pub(crate) fn same_intent(&self, other: &Self) -> bool {
         let a=self.window(); let b=other.window();
         let address=|p:nuwax_nav_pct::ground_route::GroundRoutePosition<'_>| {
@@ -85,15 +106,24 @@ impl GroundIntent {
         };
         a.from().window_to(b.from()).is_some()
             && address(a.from())==address(b.from()) && address(a.to())==address(b.to())
-            && self.goal.xy.map(f64::to_bits)==other.goal.xy.map(f64::to_bits)
-            && self.goal.requested_ground_z.map(f64::to_bits)==other.goal.requested_ground_z.map(f64::to_bits)
-            && self.resolved_ground_z.map(f64::to_bits)==other.resolved_ground_z.map(f64::to_bits)
+            && self.goal().xy.map(f64::to_bits)==other.goal().xy.map(f64::to_bits)
+            && self.goal().requested_ground_z.map(f64::to_bits)==other.goal().requested_ground_z.map(f64::to_bits)
+            && self.resolved_ground_z().map(f64::to_bits)==other.resolved_ground_z().map(f64::to_bits)
     }
 }
 impl PartialEq for GroundIntent {
     fn eq(&self, other: &Self) -> bool { self.same_intent(other) }
 }
 impl Eq for GroundIntent {}
+
+/// Actual observation interval since the last committed navigation address.
+/// Context-only refresh can invalidate continuity, never mint a layer match.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroundActualEvidence {
+    pub(crate) observation: BodyGroundEvidence,
+    pub(crate) carry_intact: bool,
+    pub(crate) relation: GroundLayerResult,
+}
 
 /// Actual inputs consumed by the execution owner, including its recent overlay
 /// and carried ground. A candidate command is never an applied observation.
@@ -105,6 +135,8 @@ pub struct ActualExecutionContext {
     pub odometry: PoseStamped,
     /// Existing carried association, including unknown-ground continuation.
     pub ground: BodyGroundState,
+    /// Present only for explicit Ground execution; no Body memo cost.
+    pub ground_evidence: Option<GroundActualEvidence>,
     /// Committed navigation address; predicting a command never advances it.
     pub navigation: Option<GroundActualBasis>,
     /// Actual APPLIED value already consumed by the execution owner. Admission
@@ -146,7 +178,7 @@ pub struct SurfaceReplanInput {
     /// Global search start, including full quaternion and frame.
     pub start: PoseStamped,
     /// Sealed goal pose and frame.
-    pub goal: PoseStamped,
+    pub goal: ExecutionGoal,
     /// Original goal options.
     pub options: GoalOptions,
     /// Original boundary, in original order.
@@ -184,11 +216,25 @@ pub fn same_penalties(a: &[RoutePenalty], b: &[RoutePenalty]) -> bool {
 /// Complete actual state comparison; no hash, pose rounding or tolerances.
 pub fn same_actual(a: &ActualExecutionContext, b: &ActualExecutionContext) -> bool {
     a.source.same_body_query_view(&b.source) && same_pose(&a.odometry, &b.odometry)
-        && a.ground == b.ground && a.navigation == b.navigation
+        && a.ground == b.ground && a.navigation == b.navigation && a.ground_evidence == b.ground_evidence
         && [a.applied.linear.x,a.applied.linear.y,a.applied.angular_z].map(f64::to_bits)
             == [b.applied.linear.x,b.applied.linear.y,b.applied.angular_z].map(f64::to_bits)
 }
 impl SurfaceReplanInput {
+    /// Compute from the exact paired execution publication; the original
+    /// requested height remains independent of actual body Z and physical carry.
+    pub fn compute_ground_route(&self, planner:&nuwax_nav_pct::PctPlanner,
+        cancelled:Option<&std::sync::atomic::AtomicBool>,radius:Option<f64>)
+        ->Result<nuwax_nav_pct::ground_route::PlannedGroundRoute,String> {
+        let goal=self.goal.as_ground().ok_or("global input is not a Ground goal")?;
+        let actual=self.actual.as_ref().ok_or("Ground actual publication is not ready")?;
+        if !same_pose(&self.start,&actual.odometry) {return Err("Ground actual publication is not paired".into());}
+        let incoming=actual.navigation.as_ref().ok_or("Ground actual address is not ready")?.continuation()?;
+        planner.ground_route_from_basis(&self.source,crate::route_planning::body(&self.start),&incoming,
+            GroundRouteGoal {xy:goal.xy,requested_ground_z:goal.requested_ground_z},
+            self.options.position_tolerance_m,&self.boundary,cancelled,radius,self.limits,&self.penalties)
+            .map_err(|error|format!("{error:?}"))
+    }
     /// Missing actual context is deliberately inconclusive, not a new gate.
     pub fn same_complete_input(&self, other: &Self) -> bool {
         let actual_equal = self.actual.as_ref().zip(other.actual.as_ref())
@@ -196,7 +242,7 @@ impl SurfaceReplanInput {
                 || a.navigation.is_some() && b.navigation.is_some()));
         actual_equal && self.ground_intent == other.ground_intent
             && self.source.same_body_query_view(&other.source)
-            && same_pose(&self.start, &other.start) && same_pose(&self.goal, &other.goal)
+            && same_pose(&self.start, &other.start) && self.goal.same_geometry(&other.goal)
             && self.options.allow_reverse == other.options.allow_reverse
             && self.options.position_tolerance_m.to_bits() == other.options.position_tolerance_m.to_bits()
             && self.options.yaw_tolerance_rad.to_bits() == other.options.yaw_tolerance_rad.to_bits()
@@ -260,8 +306,8 @@ mod tests {
         let start = PoseStamped { frame_id:NavFrameId::Map, stamp:Timestamp::default(),
             pose:Pose3 { position:Point3::new(0.5,1.0,0.5), orientation:Quaternion::IDENTITY } };
         let ground = source.body_query().start_ground_state(([0.5,1.0,0.5],[0.,0.,0.,1.])).unwrap();
-        let actual = Arc::new(ActualExecutionContext { source:source.clone(), odometry:start.clone(), ground, navigation:None, applied:Twist2::ZERO });
-        SurfaceReplanInput { source, start:start.clone(), goal:start, options:GoalOptions::default(),
+        let actual = Arc::new(ActualExecutionContext { source:source.clone(), odometry:start.clone(), ground, ground_evidence:None, navigation:None, applied:Twist2::ZERO });
+        SurfaceReplanInput { source, start:start.clone(), goal:ExecutionGoal::Body(start), options:GoalOptions::default(),
             boundary:Arc::new(vec![]), actual:Some(actual), ground_intent:None, limits:SearchLimits{max_states:256},
             offset:0.4, local_planning_enabled:false, penalties:Arc::new(vec![]) }
     }

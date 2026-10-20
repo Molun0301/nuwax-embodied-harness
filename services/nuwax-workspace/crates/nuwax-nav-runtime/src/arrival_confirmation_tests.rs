@@ -322,7 +322,7 @@ async fn arrival_surface_worker_replays_current_map_and_goal_after_stopping_drif
         costmap: surface_follower::prepared_test_surface(surface_follower::test_snapshot(0.0, false)),
         source_timestamp_ns: 1_000_000_000,
     }).await.unwrap();
-    let mut goal = session(); goal.goal_pose = goal_pose.clone(); goal.options.position_tolerance_m = 0.15;
+    let mut goal = session(); goal.goal = ExecutionGoal::Body(goal_pose.clone()); goal.options.position_tolerance_m = 0.15;
     handle.start_session(goal).await.unwrap();
     let mut route = path();
     route.path = ExecutionPath::Surface(Path3D { poses: vec![start, goal_pose] });

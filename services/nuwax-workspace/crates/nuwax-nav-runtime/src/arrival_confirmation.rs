@@ -6,6 +6,49 @@ pub(super) struct ArrivalConfirmation {
     pub(super) confirmed_at: Instant,
     pub(super) resume_requested: bool,
     pub(super) execution_identity: Option<Arc<PathExecutionIdentity>>,
+    pub(super) kind: ArrivalKind,
+}
+
+pub(super) enum ArrivalKind {
+    Body,
+    Ground {
+        evidence: Arc<GroundArrivalEvidence>,
+        source: Arc<SurfaceSnapshot>,
+        retired: bool,
+    },
+}
+impl ArrivalKind {
+    pub(super) fn ground(evidence: Arc<GroundArrivalEvidence>) -> Self {
+        let source = Arc::clone(&evidence.actual().source);
+        Self::Ground { evidence, source, retired: false }
+    }
+}
+impl ArrivalConfirmation {
+    /// Call only after the original map setter accepts the publication. Every
+    /// accepted ingress is observed, including changes later coalesced away.
+    pub(super) fn observe_accepted_map(&mut self, map: &ExecutionMap) {
+        let ArrivalKind::Ground { source, retired, .. } = &mut self.kind else { return; };
+        let next = match map {
+            ExecutionMap::Surface(next) => {
+                *retired |= !nuwax_nav_pct::same_source_geometry(source, next)
+                    || !surface_changes::same_query_semantics(source, next);
+                next
+            }
+            ExecutionMap::SurfaceUpdate(update) => {
+                let linked = update.change_basis.as_ref().is_some_and(|basis|
+                    nuwax_nav_pct::same_source_geometry(source, basis));
+                let unchanged = matches!(update.changes.as_ref(), surface_changes::SurfaceGeometryChanges::Empty)
+                    && nuwax_nav_pct::same_source_geometry(source, &update.snapshot);
+                *retired |= !linked || !unchanged
+                    || !surface_changes::same_query_semantics(source, &update.snapshot);
+                &update.snapshot
+            }
+            ExecutionMap::Planar(_) => { *retired = true; return; }
+        };
+        // Retirement is absorbing. The latest accepted source still supplies
+        // freshness qualification; a later restore cannot revive old relation.
+        *source = Arc::clone(next);
+    }
 }
 
 impl<M: NavMotionPort, P: NavPlanner> NavScheduler<M, P> {
@@ -42,6 +85,7 @@ impl<M: NavMotionPort, P: NavPlanner> NavScheduler<M, P> {
             self.publish_status(status);
             return Ok(());
         }
+        let pending = self.arrival_confirmation.as_ref().unwrap();
         let (Some(session), Some(pose)) = (&self.session, &self.latest_pose) else {
             return Err(self
                 .fail_closed(
@@ -50,27 +94,66 @@ impl<M: NavMotionPort, P: NavPlanner> NavScheduler<M, P> {
                 )
                 .await);
         };
-        let actual = pose.pose.position;
-        let target = session.goal_pose.pose.position;
-        let position_ok = if session.options.position_tolerance_m == 0.0 {
-            nuwax_nav_types_messages::same_finite_position(
-                [actual.x, actual.y, actual.z], [target.x, target.y, target.z])
-        } else {
-            pose.pose.position.distance(session.goal_pose.pose.position)
-                <= session.options.position_tolerance_m
+        let assessment = match (&session.goal, &pending.kind) {
+            (ExecutionGoal::Body(goal), ArrivalKind::Body) => {
+                let actual = pose.pose.position;
+                let target = goal.pose.position;
+                let position_ok = if session.options.position_tolerance_m == 0.0 {
+                    nuwax_nav_types_messages::same_finite_position(
+                        [actual.x, actual.y, actual.z], [target.x, target.y, target.z])
+                } else {
+                    pose.pose.position.distance(goal.pose.position)
+                        <= session.options.position_tolerance_m
+                };
+                let orientation_ok = !session.options.requires_orientation()
+                    || if session.options.yaw_tolerance_rad == 0.0 {
+                        nuwax_nav_types_messages::same_finite_yaw(
+                            pose.pose.orientation.yaw(), goal.pose.orientation.yaw())
+                    } else {
+                        let yaw = pose.pose.orientation.yaw() - goal.pose.orientation.yaw();
+                        yaw.sin().atan2(yaw.cos()).abs() <= session.options.yaw_tolerance_rad
+                    };
+                if position_ok && orientation_ok {
+                    nuwax_nav_types_messages::GoalRegionAssessment::WithinRegion
+                } else { nuwax_nav_types_messages::GoalRegionAssessment::OutsideRegion }
+            }
+            (ExecutionGoal::Ground(goal), ArrivalKind::Ground { evidence, source, retired })
+                if goal == evidence.goal() => {
+                let Some(context) = self.planner.refresh_execution_context(Twist2::ZERO) else {
+                    self.status.message = "已确认停稳，等待与当前输入配对的实际地面观察".into();
+                    self.publish_status(status);
+                    return Ok(());
+                };
+                // A timestamp-only fresh sample deliberately keeps the worker's
+                // geometry version. Match full pose/frame, excluding stamp only.
+                if !replan_feedback::same_pose(&context.odometry, pose)
+                    || !nuwax_nav_pct::same_source_geometry(&context.source, source)
+                    || !surface_changes::same_query_semantics(&context.source, source) {
+                    self.status.message = "已确认停稳，等待当前来源与完整位姿的地面复核".into();
+                    self.publish_status(status);
+                    return Ok(());
+                }
+                evidence.assess(&context, session.options,
+                    nuwax_nav_types_messages::ArrivalBoundary::Closed, *retired)
+            }
+            _ => return Err(self.fail_closed(status,
+                RuntimeError::Planner("停车复核的原目标类型或来源已失配".into())).await),
         };
-        let orientation_ok = !session.options.requires_orientation()
-            || if session.options.yaw_tolerance_rad == 0.0 {
-                nuwax_nav_types_messages::same_finite_yaw(
-                    pose.pose.orientation.yaw(), session.goal_pose.pose.orientation.yaw())
-            } else {
-                let yaw = pose.pose.orientation.yaw() - session.goal_pose.pose.orientation.yaw();
-                yaw.sin().atan2(yaw.cos()).abs() <= session.options.yaw_tolerance_rad
-            };
-        if position_ok && orientation_ok {
-            return self
-                .finish_terminal(status, TerminalOutcome::Succeeded, SchedulerPhase::Idle)
-                .await;
+        match assessment {
+            nuwax_nav_types_messages::GoalRegionAssessment::WithinRegion => {
+                return self.finish_terminal(status, TerminalOutcome::Succeeded, SchedulerPhase::Idle).await;
+            }
+            nuwax_nav_types_messages::GoalRegionAssessment::TargetLayerUnresolved => {
+                return self.finish_terminal(status, TerminalOutcome::GoalIncomplete {
+                    reason: GoalIncompleteReason::TargetLayerUnresolved, xy_reached: true,
+                }, SchedulerPhase::Idle).await;
+            }
+            nuwax_nav_types_messages::GoalRegionAssessment::KnownLayerConflict => {
+                return self.finish_terminal(status, TerminalOutcome::GoalIncomplete {
+                    reason: GoalIncompleteReason::KnownLayerConflict, xy_reached: true,
+                }, SchedulerPhase::Idle).await;
+            }
+            nuwax_nav_types_messages::GoalRegionAssessment::OutsideRegion => {}
         }
         self.arrival_confirmation.as_mut().unwrap().resume_requested = true;
         self.status.phase = SchedulerPhase::Acquiring;
@@ -136,10 +219,14 @@ impl<M: NavMotionPort, P: NavPlanner> NavScheduler<M, P> {
         self.status.last_terminal = None;
         self.local_intent_sequence = 0;
         self.planner.set_goal_log_context(&session.session_id);
-        if let Err(error) = self
-            .planner
-            .configure_goal(&session.goal_pose, session.options)
-        {
+        let initial = match &previous.kind {
+            ArrivalKind::Body => None,
+            ArrivalKind::Ground { evidence, .. } => match evidence.initial_capture() {
+                Ok(capture) => Some(capture),
+                Err(error) => return Err(self.fail_closed(status, error).await),
+            },
+        };
+        if let Err(error) = self.planner.configure_execution_goal(&session.goal, session.options, initial) {
             return Err(self.fail_closed(status, error).await);
         }
         self.planner.configure_boundary(&session.boundary);
@@ -148,7 +235,7 @@ impl<M: NavMotionPort, P: NavPlanner> NavScheduler<M, P> {
         {
             match self
                 .planner
-                .replace_execution_path(path.clone(), yaws.clone(), session.goal_pose)
+                .replace_typed_execution_path(path.clone(), yaws.clone(), session.goal)
             {
                 Ok(()) => {
                     // 新的指令身份对象阻止停车前已经选出的意图跨租约复活。

@@ -399,6 +399,7 @@ impl N2NoHoldCase {
             PlannerStep::Command(_) => (N2StepKind::Zero, None, None),
             PlannerStep::Pending(_) => (N2StepKind::Pending, None, None),
             PlannerStep::Succeeded => (N2StepKind::Succeeded, None, Some("unexpected arrival at fixed start".to_owned())),
+            PlannerStep::GroundArrival(_) => return Err("Ground arrival is unsupported in this Body-only qualification".into()),
             PlannerStep::Failed(e) => (N2StepKind::Failed, None, Some(format!("planner failed: {e}"))),
             PlannerStep::ReplanRequired(e) => (N2StepKind::ReplanRequired, None, Some(format!("planner requested global replan: {e}"))),
         };

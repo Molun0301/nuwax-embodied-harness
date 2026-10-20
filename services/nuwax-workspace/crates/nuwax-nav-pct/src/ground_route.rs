@@ -2,7 +2,7 @@
 //! A planned association is neither an actual observation nor arrival evidence.
 use crate::{PctPlanner, PlanningFailure, RoutePenalty, SearchLimits, SearchStats, Tomogram};
 use crate::reference::Reference;
-use crate::search::{RouteReferenceTrace, checkpoint};
+use crate::search::{GroundSearchOrigin, RouteReferenceTrace, checkpoint};
 use nuwax_nav_mls_planner::{SurfaceSnapshot, surface::{BodyNavigationSegment,
     NavigationGroundSample, NavigationPlanningFork, SourceGroundRecord, SurfaceBodyQueryView}};
 use nuwax_types::navigation::{GroundHeightIntent, GroundLayerResult};
@@ -25,8 +25,12 @@ pub(crate) struct GroundPhysicalAdmitter<'a> {
 impl GroundPhysicalAdmitter<'_> {
     fn physical(&self,p:[f64;3])->BodyPose {
         if p==self.from {self.actual} else {
-            ([self.actual.0[0]+(p[0]-self.start_xy[0]),self.actual.0[1]+(p[1]-self.start_xy[1]),
-                self.actual.0[2]+if self.anchored {p[2]-self.initial_z}else{0.0}],self.actual.1)
+            // The ordinary same-origin request already owns these exact XY.
+            // Translating by a numeric zero can otherwise move an exact goal.
+            let xy=if self.actual.0[..2]==self.start_xy { [p[0],p[1]] } else {
+                [self.actual.0[0]+(p[0]-self.start_xy[0]),self.actual.0[1]+(p[1]-self.start_xy[1])]
+            };
+            ([xy[0],xy[1],self.actual.0[2]+if self.anchored {p[2]-self.initial_z}else{0.0}],self.actual.1)
         }
     }
     pub(crate) fn accepts(&self,a:[f64;3],b:[f64;3])->bool {
@@ -61,12 +65,28 @@ pub struct GroundRouteStart {
     pub xy: [f64;2],
     pub ground_z: Option<f64>,
 }
-/// Only the factory creates this exact initial sampling address. General
-/// consumed continuations may have a different original sample XY and are not
-/// silently reinterpreted as a new global search origin by this entry point.
+/// Only the factory creates this exact initial sampling address. Prepared
+/// starts keep their original root mode; consumed continuations enter through
+/// ground_route_from_basis with their independently retained sample XY.
 #[derive(Clone,Debug)]
 pub struct PreparedGroundStart {state:OwnedGroundWalkState}
 impl PreparedGroundStart {pub fn basis(&self)->&OwnedGroundWalkState {&self.state}}
+#[derive(Clone,Copy)]
+enum GroundRouteOrigin<'a> {
+    Factory(Option<&'a OwnedGroundWalkState>),
+    Continued(&'a OwnedGroundWalkState),
+}
+impl<'a> GroundRouteOrigin<'a> {
+    fn incoming(self)->Option<&'a OwnedGroundWalkState> {match self {
+        Self::Factory(incoming)=>incoming,Self::Continued(incoming)=>Some(incoming),
+    }}
+    fn search(self)->GroundSearchOrigin {match self {
+        Self::Factory(incoming)=>GroundSearchOrigin::Factory(incoming.map(|v|v.reference)),
+        Self::Continued(incoming)=>GroundSearchOrigin::Continued {reference:incoming.reference,
+            reference_sample_xy:incoming.reference_sample_xy},
+    }}
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct GroundRouteGoal {
     pub xy: [f64;2],
@@ -152,8 +172,9 @@ impl GroundRouteReference {
             Reference::Unknown {..}=>PlannedGroundAssociation::Carried,
             Reference::Unanchored {..}=>PlannedGroundAssociation::Unanchored,
         };
+        let sample_xy=if connection==0 && index==0 {self.trace.root_sample_xy.unwrap_or(xy)}else{xy};
         Some(PlannedGroundSample {point:GroundRoutePoint {xy,
-            ground_z:self.map.reference_height_at(reference,xy)},association})
+            ground_z:self.map.reference_height_at(reference,sample_xy)},association})
     }
     pub fn matches_source(&self,source:&SurfaceSnapshot)->bool {self.map.matches_surface(source)}
 }
@@ -177,7 +198,7 @@ impl PctPlanner {
         xy_tolerance:f64,boundary:&[[f64;2]],cancelled:Option<&AtomicBool>,radius:Option<f64>,
         limits:SearchLimits,penalties:&[RoutePenalty],
     )->Result<PlannedGroundRoute,GroundRouteFailure> {
-        self.ground_route_impl::<true>(source,actual,start,None,goal,xy_tolerance,boundary,cancelled,radius,limits,penalties)
+        self.ground_route_impl::<true>(source,actual,start,GroundRouteOrigin::Factory(None),goal,xy_tolerance,boundary,cancelled,radius,limits,penalties)
     }
     #[cfg(test)]
     pub(crate) fn ground_route_original_order(
@@ -185,7 +206,7 @@ impl PctPlanner {
         xy_tolerance:f64,boundary:&[[f64;2]],cancelled:Option<&AtomicBool>,radius:Option<f64>,
         limits:SearchLimits,penalties:&[RoutePenalty],
     )->Result<PlannedGroundRoute,GroundRouteFailure> {
-        self.ground_route_impl::<false>(source,actual,start,None,goal,xy_tolerance,boundary,cancelled,radius,limits,penalties)
+        self.ground_route_impl::<false>(source,actual,start,GroundRouteOrigin::Factory(None),goal,xy_tolerance,boundary,cancelled,radius,limits,penalties)
     }
     /// Establish the independent initial association before waiting for a plan.
     /// None remains Unanchored even when the source has a floor below the body.
@@ -212,12 +233,22 @@ impl PctPlanner {
         limits:SearchLimits,penalties:&[RoutePenalty])->Result<PlannedGroundRoute,GroundRouteFailure> {
         let incoming=prepared.basis();
         let start=GroundRouteStart {xy:incoming.actual_xy,ground_z:incoming.walk_state().planned_ground_z()};
-        self.ground_route_impl::<true>(source,actual,start,Some(incoming),goal,xy_tolerance,
+        self.ground_route_impl::<true>(source,actual,start,GroundRouteOrigin::Factory(Some(incoming)),goal,xy_tolerance,
             boundary,cancelled,radius,limits,penalties)
+    }
+    /// Continue from a committed, paired actual basis. Its source-local sample
+    /// remains independent of the actual origin, and this call consumes neither.
+    pub fn ground_route_from_basis(&self,source:&SurfaceSnapshot,actual:BodyPose,
+        incoming:&OwnedGroundWalkState,goal:GroundRouteGoal,xy_tolerance:f64,
+        boundary:&[[f64;2]],cancelled:Option<&AtomicBool>,radius:Option<f64>,
+        limits:SearchLimits,penalties:&[RoutePenalty])->Result<PlannedGroundRoute,GroundRouteFailure> {
+        let start=GroundRouteStart {xy:incoming.actual_xy,ground_z:incoming.walk_state().planned_ground_z()};
+        self.ground_route_impl::<true>(source,actual,start,GroundRouteOrigin::Continued(incoming),goal,
+            xy_tolerance,boundary,cancelled,radius,limits,penalties)
     }
     fn ground_route_impl<const EARLY:bool>(
         &self,source:&SurfaceSnapshot,actual:BodyPose,start:GroundRouteStart,
-        prepared:Option<&OwnedGroundWalkState>,goal:GroundRouteGoal,
+        origin:GroundRouteOrigin<'_>,goal:GroundRouteGoal,
         xy_tolerance:f64,boundary:&[[f64;2]],cancelled:Option<&AtomicBool>,radius:Option<f64>,
         limits:SearchLimits,penalties:&[RoutePenalty],
     )->Result<PlannedGroundRoute,GroundRouteFailure> {
@@ -226,6 +257,11 @@ impl PctPlanner {
             .any(|value|!value.is_finite()) {
             return Err("Ground reference height must be finite when present".into());
         }
+        if matches!(origin,GroundRouteOrigin::Continued(_))
+            && [actual.0[0],actual.0[1]]!=start.xy {
+            return Err("continued Ground basis is not paired with this actual XY".into());
+        }
+        let prepared=origin.incoming();
         let body=source.body_query();
         // Actual geometry validation uses the complete pose, with no navigation
         // height inferred from its Z. This also validates the original model.
@@ -236,7 +272,14 @@ impl PctPlanner {
             Arc::clone(&incoming.map)
         }else {self.map(source)?};
         checkpoint(cancelled)?;
-        let initial_z=if let Some(incoming)=prepared {
+        let unanchored=match origin {
+            GroundRouteOrigin::Continued(incoming)=>matches!(incoming.reference,Reference::Unanchored {..}),
+            GroundRouteOrigin::Factory(_)=>start.ground_z.is_none(),
+        };
+        let initial_z=if let GroundRouteOrigin::Continued(incoming)=origin {
+            if unanchored {actual.0[2]}else {incoming.walk_state().planned_ground_z()
+                .ok_or("continued Ground reference has no source-local sample height")?}
+        }else if let Some(incoming)=prepared {
             incoming.walk_state().planned_ground_z().unwrap_or(actual.0[2])
         }else {match start.ground_z {
             Some(h)=>map.cell_at([start.xy[0],start.xy[1],h])
@@ -254,7 +297,7 @@ impl PctPlanner {
         let from=[start.xy[0],start.xy[1],initial_z];
         let to=[goal.xy[0],goal.xy[1],goal.requested_ground_z.unwrap_or(initial_z)];
         let admitter=GroundPhysicalAdmitter {body:&body,actual,from,start_xy:start.xy,
-            initial_z,anchored:start.ground_z.is_some(),boundary};
+            initial_z,anchored:!unanchored,boundary};
         // Existing penalties are in actual body coordinates. Convert this one
         // captured snapshot once, without reading the planner's mutable costs.
         let penalties:Vec<_>=penalties.iter().map(|p|RoutePenalty {
@@ -262,8 +305,8 @@ impl PctPlanner {
                 p.center[2]-actual.0[2]+initial_z],radius:p.radius,weight:p.weight,
         }).collect();
         let traced=map.plan_ground_physical::<EARLY>(from,to,xy_tolerance,boundary,cancelled,radius,&penalties,
-            &admitter,limits,start.ground_z.is_none().then_some(actual.0[2]),
-            if start.ground_z.is_some(){target}else{None},prepared.map(|v|v.reference))?;
+            &admitter,limits,unanchored.then_some(actual.0[2]),
+            if !unanchored{target}else{None},origin.search())?;
         let last=traced.trace.changes.last().expect("successful recorded route has an initial sample").reference;
         let end=*traced.route.points.last().unwrap();
         let resolved_ground_z=match last {
@@ -280,11 +323,19 @@ impl PctPlanner {
             _=>GroundLayerResult::Unresolved,
         };
         let points=traced.route.points.iter().map(|p|GroundRoutePoint {xy:[p[0],p[1]],
-            ground_z:start.ground_z.map(|_|p[2])}).collect();
+            ground_z:(!unanchored).then_some(p[2])}).collect();
         let guide_body_poses=traced.route.points.iter().copied().map(|p|admitter.physical(p)).collect();
+        let reference=GroundRouteReference {map,trace:traced.trace,
+            target:GroundRouteTarget {goal,reference:target.map(Reference::Known)}};
+        if let GroundRouteOrigin::Continued(incoming)=origin {
+            // Preservation only: the original physical/source walk already
+            // decided passage. A returned plan never advances actual progress.
+            debug_assert_eq!(reference.full_window().expect("successful Ground route has a trace")
+                .from().walk_state().semantic_key(),incoming.semantic_key());
+        }
         Ok(PlannedGroundRoute {points,guide_body_poses,
             height:GroundHeightIntent {requested_ground_z:goal.requested_ground_z,resolved_ground_z},
-            planned_layer,reference:GroundRouteReference {map,trace:traced.trace,target:GroundRouteTarget {goal,reference:target.map(Reference::Known)}},stats:traced.route.stats})
+            planned_layer,reference,stats:traced.route.stats})
     }
 }
 
@@ -366,9 +417,17 @@ impl<'a> GroundRoutePosition<'a> {
             .find(|change|change.sample_index<=self.sample).expect("valid original sample").reference;
         let sample_t=self.sample as f64/c.steps as f64;
         let t=(self.sample as f64+self.fraction)/c.steps as f64;
+        let inherited=(self.connection==0 && self.sample==0)
+            .then_some(self.owner.trace.root_sample_xy).flatten();
         GroundWalkState {map:&self.owner.map,reference,
-            reference_sample_xy:std::array::from_fn(|i|c.evaluated_from[i]+sample_t*(c.evaluated_to[i]-c.evaluated_from[i])),
-            xy:std::array::from_fn(|i|c.evaluated_from[i]+t*(c.evaluated_to[i]-c.evaluated_from[i]))}
+            reference_sample_xy:inherited.unwrap_or_else(||std::array::from_fn(|i|
+                c.evaluated_from[i]+sample_t*(c.evaluated_to[i]-c.evaluated_from[i]))),
+            // Actual endpoints retain the evaluator's endpoint bits, exactly
+            // as walk_xy does. The discrete reference sample above stays on
+            // the original arithmetic/grid and may legitimately differ by ULP.
+            xy:if self.sample==0 && self.fraction==0.0 {[c.evaluated_from[0],c.evaluated_from[1]]}
+                else if self.sample==c.steps {[c.evaluated_to[0],c.evaluated_to[1]]}
+                else {std::array::from_fn(|i|c.evaluated_from[i]+t*(c.evaluated_to[i]-c.evaluated_from[i]))}}
     }
     /// Capture an original address for a request. Actual XY is independent of
     /// the evaluator sample used by the retained navigation association.
@@ -457,6 +516,19 @@ impl<'a> GroundWalkState<'a> {
     pub fn semantic_key(self)->GroundWalkKey {
         GroundWalkKey {owner:std::ptr::from_ref(self.map) as usize,reference:self.reference,
             reference_sample_xy:self.reference_sample_xy.map(f64::to_bits),xy:self.xy.map(f64::to_bits)}
+    }
+    /// Borrow one original navigation sample for an independent actual-support
+    /// comparison. This stationary decoder neither walks nor consumes progress.
+    pub fn with_body_navigation_at<R>(self,actual_xy:[f64;2],
+        run:impl FnOnce(&BodyNavigationSegment<'_,'_>)->R)->Result<R,PlanningFailure> {
+        if !actual_xy.into_iter().all(f64::is_finite) {return Err("invalid actual Ground XY".into());}
+        let source=self.map.source.as_ref().ok_or("recorded navigation has no physical source")?;
+        if matches!(self.reference,Reference::Known(_)) && self.planned_ground_z().is_none() {
+            return Err("recorded navigation start has no source-local sample height".into());
+        }
+        let sample=|_|navigation_sample(self.map,self.reference,self.reference_sample_xy);
+        let navigation=BodyNavigationSegment::from_recorded(source,actual_xy,actual_xy,&[],&sample);
+        Ok(run(&navigation))
     }
     pub fn walk_xy(self,to:[f64;2],boundary:&[[f64;2]],cancelled:Option<&AtomicBool>)
         ->Result<GroundWalkSegment<'a>,PlanningFailure> {
@@ -723,10 +795,21 @@ impl GroundCandidateReference {
     /// Keep prefix and suffix leaves, without querying or re-recording either.
     pub fn prepend_to_suffix(&self,prefix:&Self,edge:usize,fraction:f64)->Result<Self,PlanningFailure> {
         if !Arc::ptr_eq(&self.map,&prefix.map) {return Err("splice reference owner changed".into());}
-        let first=self.leaf(edge).and_then(|v|v.crop(fraction,1.0)).ok_or("invalid retained suffix address")?;
+        let first=if let Some(point)=self.point(edge) {
+            if !fraction.is_finite() || !(0.0..=1.0).contains(&fraction) {
+                return Err("invalid retained point address".into());
+            }
+            // A point has no shortened grid to re-walk. Retain its original
+            // owner/sample, including when a moving connector reaches the tail.
+            RecordedLeaf::Point(Arc::clone(point))
+        }else {
+            let first=self.leaf(edge).and_then(|v|v.crop(fraction,1.0))
+                .ok_or("invalid retained suffix address")?;
+            RecordedLeaf::Slice(first.owned())
+        };
         let mut leaves=Vec::with_capacity(prefix.connection_count()+self.connection_count()-edge);
         for i in 0..prefix.connection_count() {leaves.push(prefix.owned_leaf(i).unwrap());}
-        leaves.push(RecordedLeaf::Slice(first.owned()));
+        leaves.push(first);
         for i in edge+1..self.connection_count() {leaves.push(self.owned_leaf(i).unwrap());}
         Ok(Self {map:Arc::clone(&self.map),recording:CandidateRecording::Slices(leaves.into())})
     }

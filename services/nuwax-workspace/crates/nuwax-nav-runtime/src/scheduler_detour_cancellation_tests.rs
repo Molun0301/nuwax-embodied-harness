@@ -646,7 +646,7 @@ mod scheduler_detour_cancellation {
             .await
             .unwrap();
         let mut session = session();
-        session.goal_pose = goal.clone();
+        session.goal = ExecutionGoal::Body(goal.clone());
         let options = session.options;
         handle.start_session(session).await.unwrap();
         let mut route = path();
@@ -842,7 +842,7 @@ mod scheduler_detour_cancellation {
                         for pair in witness.windows(2) {map.validate_body_motion(crate::route_planning::body(&pair[0]),
                             crate::route_planning::body(&pair[1]),&[]).expect("replacement goal has independent full-body feasible route");}
                         session_id="goal-2";
-                        let mut next_session=session_for(session_id);next_session.goal_pose=goal.clone();
+                        let mut next_session=session_for(session_id);next_session.goal=ExecutionGoal::Body(goal.clone());
                         assert_eq!(next_session.options,options,"replacement retains original tolerances");
                         handle.start_session(next_session).await.unwrap();
                         let mut next_route=path_for(session_id,1);

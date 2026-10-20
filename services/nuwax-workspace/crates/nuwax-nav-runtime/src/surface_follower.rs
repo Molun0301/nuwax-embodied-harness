@@ -4,7 +4,9 @@ use std::sync::Arc;
 #[path="surface_body_control.rs"]
 mod body_control;
 #[path="ground_reference_cursor.rs"]
-mod ground_cursor;
+pub(crate) mod ground_cursor;
+#[path="arrival_evidence.rs"]
+pub(crate) mod arrival_evidence;
 #[cfg(test)]
 #[path="surface_rejoin_probe.rs"]
 pub(crate) mod rejoin_probe;
@@ -157,6 +159,12 @@ pub struct SurfaceFollower {
     body_view_dirty: bool,
     body_query: Option<nuwax_nav_mls_planner::surface::SurfaceBodyQueryView>,
     ground_execution: Option<ground_cursor::GroundExecution>,
+    ground_target: Option<(crate::GroundExecutionGoal, f64)>,
+    ground_initial: Option<crate::GroundInitialCapture>,
+    ground_relation: nuwax_nav_types_messages::GroundLayerResult,
+    ground_navigation_evidence: Option<nuwax_nav_mls_planner::surface::BodyGroundEvidence>,
+    actual_ground_evidence: Option<nuwax_nav_mls_planner::surface::BodyGroundEvidence>,
+    actual_ground_carry_intact: bool,
     actual_ground: Option<(nuwax_nav_types_messages::Pose3, Result<nuwax_nav_mls_planner::surface::BodyGroundState, String>)>,
 }
 
@@ -194,6 +202,12 @@ impl SurfaceFollower {
             body_query: None,
             actual_ground: None,
             ground_execution: None,
+            ground_target: None,
+            ground_initial: None,
+            ground_relation: nuwax_nav_types_messages::GroundLayerResult::Unresolved,
+            ground_navigation_evidence: None,
+            actual_ground_evidence: None,
+            actual_ground_carry_intact: false,
         })
     }
 
@@ -203,10 +217,35 @@ impl SurfaceFollower {
         self.last_command_dispatch_bound.take()
     }
 
+    fn configure_execution_options(&mut self,options:nuwax_nav_types_messages::GoalOptions)->Result<(),RuntimeError> {
+        self.last_command_dispatch_bound=None;
+        options.validate().map_err(|reason|RuntimeError::InvalidInput {field:"goal_options",reason})?;
+        self.selected_body_command=None;
+        // 新目标执行仍须取得守卫准入；旧规划器内部状态不能代替该证明。
+        self.braking_deadline = None;
+        self.last_command = Twist2::ZERO;
+        // 目标授权是上限，旧目标允许倒车也不能恢复自主导航已禁用的运动方向。
+        self.options=nuwax_nav_types_messages::GoalOptions {allow_reverse:false,..options};
+        self.config.controller.goal_tolerance=options.position_tolerance_m.max(1e-6);
+        self.config.controller.orientation_tolerance=options.yaw_tolerance_rad.max(1e-6);
+        Ok(())
+    }
+    /// Installed Ground geometry, including the real admission connector.
+    pub(crate) fn ground_execution_path(&self) -> Option<&Path3D> {
+        self.ground_execution.as_ref()?;
+        self.path.as_ref()
+    }
+
     /// 当前累计三维进度，供状态诊断与行为回归使用。
     #[must_use]
     pub fn progress_m(&self) -> f64 {
         self.progress_m
+    }
+
+    fn same_actual_ground_source(&self,source:&SurfaceSnapshot)->bool {
+        if self.ground_target.is_some() {
+            self.body_query.as_ref().is_some_and(|query|query.same_ground_evidence_source(source))
+        } else {self.body_query.as_ref().is_some_and(|query|query.same_ground_source(source))}
     }
 
     fn refresh_current_body_view(&mut self) {
@@ -214,20 +253,39 @@ impl SurfaceFollower {
         if !self.body_view_dirty && self.actual_ground.as_ref().map(|(pose,_)|pose)
             ==self.odometry.as_ref().map(|pose|&pose.pose) { return; }
         self.body_view_dirty = false;
+        let same_ground_source=self.source_map.as_ref().is_some_and(|source|self.same_actual_ground_source(source));
         self.map = self.source_map.clone();
         let Some(map)=self.map.as_ref().filter(|map|map.body_envelope().is_some()) else {
-            self.body_query=None;self.actual_ground=None;return;
+            self.body_query=None;self.actual_ground=None;self.actual_ground_evidence=None;
+            self.actual_ground_carry_intact=false;return;
         };
         // 新近期障碍要求重建碰撞视图，但不抹去同一地面来源的实际关联。
-        let same_ground_source=self.body_query.as_ref().is_some_and(|query|query.same_ground_source(map));
         if self.body_query.as_ref().is_none_or(|query|!query.same_body_query_view(map)) {
             self.body_query=Some(map.body_query());
         }
         // 只沿实际里程计携带地面；预测末点始终留在各自局部轨迹。
-        self.actual_ground=self.odometry.as_ref().map(|pose| {
-            (pose.pose.clone(),self.ground_state_at_actual_pose(
-                self.body_query.as_ref().unwrap(),pose,same_ground_source))
-        });
+        if let Some(pose)=self.odometry.as_ref() {
+            if self.ground_target.is_some() {
+                let new_interval=!same_ground_source || self.actual_ground.as_ref()
+                    .is_none_or(|(previous,_)|previous!=&pose.pose) || self.actual_ground_evidence.is_none();
+                let result=self.ground_state_evidence_at_actual_pose(self.body_query.as_ref().unwrap(),pose,same_ground_source);
+                match result {
+                    Ok((ground,evidence))=>{
+                        // A same-pose metadata/recent refresh reuses the endpoint,
+                        // not its already consumed pre-commit interval flag.
+                        if new_interval {self.actual_ground_carry_intact &= same_ground_source && evidence.carry_intact();}
+                        self.actual_ground_evidence=Some(evidence);
+                        self.actual_ground=Some((pose.pose.clone(),Ok(ground)));
+                    },
+                    Err(error)=>{self.actual_ground=Some((pose.pose.clone(),Err(error)));
+                        self.actual_ground_evidence=None;self.actual_ground_carry_intact=false;},
+                }
+            } else {
+                self.actual_ground=Some((pose.pose.clone(),self.ground_state_at_actual_pose(
+                    self.body_query.as_ref().unwrap(),pose,same_ground_source)));
+            }
+        } else {self.actual_ground=None;self.actual_ground_evidence=None;self.actual_ground_carry_intact=false;}
+
     }
 
     /// 当前站姿自身被拒绝时，全局改道不能恢复运动；保留目标等待实际输入恢复。
@@ -722,6 +780,9 @@ impl NavPlanner for SurfaceFollower {
         let ground = self.actual_ground.as_ref()?.1.as_ref().ok()?.clone();
         Some(Arc::new(crate::replan_feedback::ActualExecutionContext {
             source, odometry, ground, applied, navigation:self.paired_ground_basis(),
+            ground_evidence:self.actual_ground_evidence.clone().filter(|_|self.ground_target.is_some())
+                .map(|observation|crate::replan_feedback::GroundActualEvidence {observation,
+                    carry_intact:self.actual_ground_carry_intact,relation:self.ground_relation}),
         }))
     }
     fn revalidate_selected_command(&mut self,command:Twist2)->Option<PlannerStep> {
@@ -742,19 +803,43 @@ impl NavPlanner for SurfaceFollower {
         self.boundary=boundary.to_vec();
     }
     fn configure_goal(&mut self, _goal:&PoseStamped, options:nuwax_nav_types_messages::GoalOptions)->Result<(),RuntimeError> {
-        self.last_command_dispatch_bound = None;
-        options.validate().map_err(|reason|RuntimeError::InvalidInput {field:"goal_options",reason})?;
-        self.selected_body_command=None;
+        self.configure_execution_options(options)?;
+        self.ground_target=None;self.ground_initial=None;
+        self.ground_relation=nuwax_nav_types_messages::GroundLayerResult::Unresolved;
+        self.ground_navigation_evidence=None;self.actual_ground_evidence=None;self.actual_ground_carry_intact=false;
         if self.ground_execution.take().is_some() {
             self.path=None;self.goal=None;self.cumulative.clear();self.progress_m=0.0;self.last_tracked_pose=None;
         }
-        // 新目标执行仍须取得守卫准入；旧规划器内部状态不能代替该证明。
-        self.braking_deadline = None;
-        self.last_command = Twist2::ZERO;
-        // 目标授权是上限，旧目标允许倒车也不能恢复自主导航已禁用的运动方向。
-        self.options=nuwax_nav_types_messages::GoalOptions {allow_reverse:false,..options};
-        self.config.controller.goal_tolerance=options.position_tolerance_m.max(1e-6);
-        self.config.controller.orientation_tolerance=options.yaw_tolerance_rad.max(1e-6);
+        Ok(())
+    }
+    fn configure_execution_goal(&mut self,goal:&crate::ExecutionGoal,options:nuwax_nav_types_messages::GoalOptions,
+        initial:Option<crate::GroundInitialCapture>)->Result<(),RuntimeError> {
+        match goal {
+            crate::ExecutionGoal::Body(goal)=>self.configure_goal(goal,options),
+            crate::ExecutionGoal::Ground(goal)=>{
+                self.configure_execution_options(options)?;
+                self.ground_execution=None;self.path=None;self.goal=None;self.cumulative.clear();
+                self.progress_m=0.0;self.last_tracked_pose=None;
+                // Preserve raw intent, but compare the same extracted target
+                // yaw the existing quaternion-based controller will execute.
+                let target_yaw=Quaternion::from_yaw(goal.yaw).yaw();
+                self.ground_target=Some((goal.clone(),target_yaw));self.ground_initial=initial;
+                self.ground_relation=nuwax_nav_types_messages::GroundLayerResult::Unresolved;
+                self.ground_navigation_evidence=None;self.actual_ground_evidence=None;
+                self.actual_ground_carry_intact=false;self.body_view_dirty=true;
+                Ok(())
+            },
+        }
+    }
+    fn consume_initial_actual_for_planning(&mut self)->Result<(),RuntimeError> {
+        let Some(capture)=self.ground_initial.clone() else {return Ok(());};
+        // A is a captured observation, never a replacement for latest odometry B.
+        self.refresh_current_body_view();
+        if self.ground_execution.is_none() {
+            self.initialize_captured_ground_actual(&capture).map_err(RuntimeError::Planner)?;
+        }
+        self.consume_ground_actual(None).map_err(RuntimeError::Planner)?;
+        self.ground_initial=None;
         Ok(())
     }
 
@@ -828,7 +913,10 @@ impl NavPlanner for SurfaceFollower {
                     self.body_view_dirty = true;
                 }
                 if self.ground_execution.as_ref().is_some_and(|execution|!execution.matches_source(&map)) {
-                    self.ground_execution=None;
+                    self.ground_execution=None;self.ground_initial=None;
+                    self.ground_relation=nuwax_nav_types_messages::GroundLayerResult::Unresolved;
+                    self.ground_navigation_evidence=None;self.actual_ground_evidence=None;
+                    self.actual_ground_carry_intact=false;
                     self.selected_body_command=None;
                     self.path=None;self.goal=None;self.cumulative.clear();
                     self.progress_m=0.0;self.last_tracked_pose=None;
@@ -866,7 +954,9 @@ impl NavPlanner for SurfaceFollower {
 
     fn stop(&mut self) {
         self.begin_braking();
-        self.ground_execution=None;
+        self.ground_execution=None;self.ground_initial=None;
+        self.ground_relation=nuwax_nav_types_messages::GroundLayerResult::Unresolved;
+        self.ground_navigation_evidence=None;
         self.selected_body_command=None;
         self.path = None;
         self.goal = None;
@@ -2459,4 +2549,4 @@ mod stair_tests {
 
 #[cfg(test)]
 #[path="ground_owner_tests.rs"]
-mod ground_owner_tests;
+pub(crate) mod ground_owner_tests;

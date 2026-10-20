@@ -20,6 +20,69 @@ impl NavigationPlanningFork {
     pub fn body_query(&self)->&SurfaceBodyQueryView {&self.query}
 }
 
+/// Result-only relationship between two independent, directly selected support
+/// sources. Unknown or unrelated owners/coordinates never establish a match.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BodyGroundSourceRelation { Same, KnownDifferent, Unresolved }
+
+/// Small, opaque evidence from selections that the body query already made.
+/// It owns no source members, query state, trajectory or motion permission.
+#[derive(Clone)]
+pub struct BodyGroundEvidence {
+    data: Arc<SurfaceData>,
+    observations: Option<Arc<SurfaceObservations>>,
+    interpretation: GroundEvidence,
+    support_xy: [u64;2],
+    endpoint: Option<NativeGroundSource>,
+    carry_intact: bool,
+}
+impl BodyGroundEvidence {
+    pub(in crate::surface) fn from_sample(source:&SurfaceSnapshot,xy:[f64;2],
+        sample:&GroundSample,carry_intact:bool)->Self {
+        Self {data:Arc::clone(&source.data),observations:source.observations.clone(),
+            interpretation:source.ground_evidence,support_xy:xy.map(f64::to_bits),
+            endpoint:sample.direct_source().cloned(),carry_intact}
+    }
+    /// The existing source-geometry compatibility relation permits metadata and
+    /// recent-cloud refreshes, but not a new geometry owner or delete/re-add.
+    pub fn same_source(&self,other:&Self)->bool {
+        self.interpretation==other.interpretation && Arc::ptr_eq(&self.data,&other.data)
+            && match (&self.observations,&other.observations) {
+                (Some(a),Some(b))=>a.same_geometry(b),(None,None)=>true,_=>false,
+            }
+    }
+    /// Compare the complete selected source at the same actual support point.
+    /// Neither a retained Unknown key nor equal heights can establish Same.
+    pub fn relation_to(&self,other:&Self)->BodyGroundSourceRelation {
+        if !self.same_source(other) || self.support_xy!=other.support_xy {
+            return BodyGroundSourceRelation::Unresolved;
+        }
+        match (&self.endpoint,&other.endpoint) {
+            (Some(a),Some(b)) if a==b=>BodyGroundSourceRelation::Same,
+            (Some(_),Some(_))=>BodyGroundSourceRelation::KnownDifferent,
+            _=>BodyGroundSourceRelation::Unresolved,
+        }
+    }
+    /// An interval without reassociation; this can preserve a prior relationship
+    /// after actual consumption, but cannot create one. Callers AND all refresh
+    /// intervals since the last successful actual commit.
+    pub fn carry_intact(&self)->bool {self.carry_intact}
+    pub fn is_direct(&self)->bool {self.endpoint.is_some()}
+}
+impl PartialEq for BodyGroundEvidence {
+    fn eq(&self,other:&Self)->bool {
+        self.same_source(other) && self.support_xy==other.support_xy
+            && self.endpoint==other.endpoint && self.carry_intact==other.carry_intact
+    }
+}
+impl Eq for BodyGroundEvidence {}
+impl std::fmt::Debug for BodyGroundEvidence {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {
+        f.debug_struct("BodyGroundEvidence").field("support_xy",&self.support_xy.map(f64::from_bits))
+            .field("direct",&self.is_direct()).field("carry_intact",&self.carry_intact).finish()
+    }
+}
+
 /// Original PCT geometry-reuse predicate, shared with explicit navigation
 /// binding. Metadata and recent obstacles remain current-query inputs.
 pub fn same_source_geometry(a: &SurfaceSnapshot, b: &SurfaceSnapshot) -> bool {
@@ -58,6 +121,39 @@ impl<'source,'trace> BodyNavigationSegment<'source,'trace> {
     }
     pub(in crate::surface) fn at(&self,t:f64)->NavigationGroundSample<'source> {(self.sample)(t)}
     pub(in crate::surface) fn changes(&self)->&[f64] {self.changes}
+    fn direct_endpoint(&self)->bool {
+        matches!(self.at(1.0),NavigationGroundSample::KnownNative{..}|NavigationGroundSample::KnownLegacy{..})
+    }
+    /// Inspect only this recorded edge's existing semantic change addresses.
+    /// Repeated baseline Known followed by its carried scalar is continuous;
+    /// a new source/height, Unanchored, or Known after a gap breaks continuity.
+    /// This cannot establish a relationship or authorize/consume any motion.
+    pub fn preserves_carried_association(&self)->bool {
+        let height=|sample|match sample {
+            NavigationGroundSample::KnownNative{record,reference_xy}=>record.height_at(reference_xy),
+            NavigationGroundSample::KnownLegacy{height,..}|NavigationGroundSample::Carried{height}=>Some(height),
+            NavigationGroundSample::Unanchored=>None,
+        };
+        let initial=self.at(0.0);
+        let Some(baseline)=height(initial) else {return false;};
+        let mut was_carried=matches!(initial,NavigationGroundSample::Carried{..});
+        for sample in self.changes.iter().filter(|&&at|at>0.0 && at<=1.0)
+            .map(|&at|self.at(at)).chain(std::iter::once(self.at(1.0))) {
+            if height(sample).is_none_or(|h|h.to_bits()!=baseline.to_bits()) {return false;}
+            match sample {
+                NavigationGroundSample::Carried{..}=>was_carried=true,
+                NavigationGroundSample::KnownNative{record,..} if !was_carried=> {
+                    if !matches!(initial,NavigationGroundSample::KnownNative{record:old,..}
+                        if old.key()==record.key()) {return false;}
+                }
+                NavigationGroundSample::KnownLegacy{..} if !was_carried=> {
+                    if !matches!(initial,NavigationGroundSample::KnownLegacy{..}) {return false;}
+                }
+                _=>return false,
+            }
+        }
+        true
+    }
     fn matches(&self,view:&SurfaceBodyQueryView,from:[f64;2],to:[f64;2])->bool {
         self.from==from && self.to==to && view.same_navigation_source(self.source)
     }
@@ -85,18 +181,56 @@ impl SurfaceBodyQueryView {
     pub fn validate_motion_with_navigation(&self,from:([f64;3],[f64;4]),to:([f64;3],[f64;4]),
         ground:&BodyGroundState,navigation:&BodyNavigationSegment<'_,'_>,boundary:&[[f64;2]],
         witness:&mut Option<BodyFailureWitness>)->Result<BodyGroundState,SurfaceError> {
+        self.validate_navigation_actual_impl(from,to,ground,navigation,boundary,witness,false)
+            .map(|(ground,_)|ground)
+    }
+    /// The same single source walk and complete sweep, additionally returning
+    /// the selected support source and interval continuity for result assessment.
+    pub fn validate_motion_with_navigation_and_evidence(&self,from:([f64;3],[f64;4]),
+        to:([f64;3],[f64;4]),ground:&BodyGroundState,navigation:&BodyNavigationSegment<'_,'_>,
+        boundary:&[[f64;2]],witness:&mut Option<BodyFailureWitness>)
+        ->Result<(BodyGroundState,BodyGroundEvidence),SurfaceError> {
+        self.validate_navigation_actual_impl(from,to,ground,navigation,boundary,witness,true)
+            .map(|(ground,evidence)|(ground,evidence.expect("requested successful source evidence")))
+    }
+    fn validate_navigation_actual_impl(&self,from:([f64;3],[f64;4]),to:([f64;3],[f64;4]),
+        ground:&BodyGroundState,navigation:&BodyNavigationSegment<'_,'_>,boundary:&[[f64;2]],
+        witness:&mut Option<BodyFailureWitness>,with_evidence:bool)
+        ->Result<(BodyGroundState,Option<BodyGroundEvidence>),SurfaceError> {
         *witness=None;
         if !navigation.matches(self,[from.0[0],from.0[1]],[to.0[0],to.0[1]]) {return Err(SurfaceError::InvalidPose);}
         self.snapshot.validate_complete_source_resolution()?;
-        let ground=self.snapshot.navigation_initial_support(from,ground,navigation)?;
-        self.snapshot.validate_owned_actual_support(from,&ground.sample)?;
-        let reference=self.snapshot.navigation_ground_motion_reference(from,to,&ground,navigation)?;
+        let initial=self.snapshot.navigation_initial_support(from,ground,navigation)?;
+        self.snapshot.validate_owned_actual_support(from,&initial.sample)?;
+        let reference=self.snapshot.navigation_ground_motion_reference(from,to,&initial,navigation)?;
         let next=BodyGroundState {sample:reference.at(1.0).clone()};
         self.snapshot.validate_owned_actual_support(to,&next.sample)?;
+        let evidence=if with_evidence {
+            let mut evidence=self.snapshot.owned_ground_evidence(to,&next.sample,
+                reference.carry_intact_from(&initial.sample) && navigation.preserves_carried_association())?;
+            // Carried and Unanchored are not independent navigation anchors,
+            // even if the physical query happened to find terrain underneath.
+            if !navigation.direct_endpoint() {evidence.endpoint=None;}
+            Some(evidence)
+        } else {None};
         let reference=BodyQueryReference::Ground(Arc::new(reference));
         self.snapshot.validate_body_motion_in_context(from,to,boundary,
             QuerySegment {reference:Some(&reference),samples:[0.0,1.0]},witness)?;
-        Ok(next)
+        Ok((next,evidence))
+    }
+    /// Re-select only the frozen navigation association at one actual support
+    /// point. This is result evidence after stopping, never a motion check or
+    /// cursor advance. The stationary adapter retains the original source bind.
+    pub fn navigation_evidence_at(&self,actual:([f64;3],[f64;4]),physical:&BodyGroundState,
+        navigation:&BodyNavigationSegment<'_,'_>)->Result<BodyGroundEvidence,SurfaceError> {
+        let xy=[actual.0[0],actual.0[1]];
+        if !navigation.matches(self,xy,xy) {return Err(SurfaceError::InvalidPose);}
+        self.snapshot.validate_complete_source_resolution()?;
+        let ground=self.snapshot.navigation_support_at(actual,physical,navigation,1.0)?;
+        let mut evidence=self.snapshot.owned_ground_evidence(actual,&ground.sample,
+            ground.sample.query_state==GroundQueryState::Unknown && navigation.preserves_carried_association())?;
+        if !navigation.direct_endpoint() {evidence.endpoint=None;}
+        Ok(evidence)
     }
     /// Sweep the supplied actual poses without deriving a navigation reference
     /// from body Z or calibration. Existing occupancy/contact checks still run.
@@ -111,23 +245,51 @@ impl SurfaceBodyQueryView {
     pub fn start_ground_state(&self,from:([f64;3],[f64;4]))->Result<BodyGroundState,SurfaceError> {
         self.snapshot.start_owned_ground_state(from)
     }
+    /// Exactly the original initial source selection, with its result evidence.
+    pub fn start_ground_state_with_evidence(&self,from:([f64;3],[f64;4]))
+        ->Result<(BodyGroundState,BodyGroundEvidence),SurfaceError> {
+        let ground=self.start_ground_state(from)?;
+        let evidence=self.snapshot.owned_ground_evidence(from,&ground.sample,false)?;
+        Ok((ground,evidence))
+    }
     /// Reassociate an already observed actual pose without granting a motion
     /// permission or changing its geometry. Unknown samples carry prior h.
     /// The previous state must belong to this same ground source.
     pub fn observe_actual_ground(&self,from:([f64;3],[f64;4]),previous:&BodyGroundState,
         actual:([f64;3],[f64;4]))->Result<BodyGroundState,SurfaceError> {
+        self.observe_actual_ground_impl(from,previous,actual,false).map(|(ground,_)|ground)
+    }
+    /// The original actual observation path, with no second source query or
+    /// sweep. Unknown endpoints retain intervening reassociation in the summary.
+    pub fn observe_actual_ground_with_evidence(&self,from:([f64;3],[f64;4]),
+        previous:&BodyGroundState,actual:([f64;3],[f64;4]))
+        ->Result<(BodyGroundState,BodyGroundEvidence),SurfaceError> {
+        self.observe_actual_ground_impl(from,previous,actual,true)
+            .map(|(ground,evidence)|(ground,evidence.expect("requested successful source evidence")))
+    }
+    fn observe_actual_ground_impl(&self,from:([f64;3],[f64;4]),previous:&BodyGroundState,
+        actual:([f64;3],[f64;4]),with_evidence:bool)
+        ->Result<(BodyGroundState,Option<BodyGroundEvidence>),SurfaceError> {
         // An actual observation may already be on another observed floor. Its
         // support Z selects a source layer; the returned height still comes only
         // from that layer. This is reassociation, not permission to move there.
         let observed=self.snapshot.start_owned_ground_state(actual)?;
         if matches!(observed.query_state(),GroundQueryState::Observed|GroundQueryState::LegacyGeometry) {
-            return Ok(observed);
+            let evidence=if with_evidence {
+                Some(self.snapshot.owned_ground_evidence(actual,&observed.sample,false)?)
+            } else {None};
+            return Ok((observed,evidence));
         }
         // A fresh unknown start carries actual support Z as its initial seed.
         // Do not adopt that seed here: retain the previous actual trajectory's
         // last known h (including any known columns crossed before this gap).
         let reference=self.snapshot.owned_ground_motion_reference(from,actual,previous)?;
-        Ok(BodyGroundState {sample:reference.at(1.0).clone()})
+        let ground=BodyGroundState {sample:reference.at(1.0).clone()};
+        let evidence=if with_evidence {
+            Some(self.snapshot.owned_ground_evidence(actual,&ground.sample,
+                reference.carry_intact_from(&previous.sample))?)
+        } else {None};
+        Ok((ground,evidence))
     }
     /// Ground association can survive a new recent cloud, while collision
     /// proofs must still retire. No value comparison or content hash is used.
@@ -137,6 +299,11 @@ impl SurfaceBodyQueryView {
         };
         self.snapshot.ground_evidence==other.ground_evidence
             && Arc::ptr_eq(&self.snapshot.data,&other.data) && observations
+    }
+    /// The result-evidence source relation also accepts geometry-identical
+    /// observation metadata refreshes. The legacy Body carry entry stays as-is.
+    pub fn same_ground_evidence_source(&self,other:&SurfaceSnapshot)->bool {
+        same_source_geometry(&self.snapshot,other)
     }
     /// Transport the actual pose using source height at the actual support XY.
     /// The result retains the same segment interpretation for its swept check.
@@ -400,6 +567,12 @@ pub(in crate::surface) enum GroundSampleMode {
     NavigationPlane,
 }
 impl GroundSample {
+    fn direct_source(&self)->Option<&NativeGroundSource> {
+        if !matches!(self.query_state,GroundQueryState::Observed|GroundQueryState::LegacyGeometry) {
+            return None;
+        }
+        match self.reference_sources.as_slice() {[source]=>Some(source),_=>None}
+    }
     pub(in crate::surface) fn height_normal(&self)->Option<[f64;3]> {
         if self.mode==GroundSampleMode::NavigationScalar {None} else {self.reference_normal}
     }
@@ -415,6 +588,19 @@ pub(in crate::surface) struct LocalGroundReference {
     pub changes: Vec<(f64, GroundSample)>,
 }
 impl LocalGroundReference {
+    fn carry_intact_from(&self,previous:&GroundSample)->bool {
+        let mut unknown=previous.query_state==GroundQueryState::Unknown;
+        let source=previous.direct_source();
+        for sample in std::iter::once(&self.first).chain(self.changes.iter().map(|(_,sample)|sample)) {
+            if sample.query_state==GroundQueryState::Unknown {
+                unknown=true;
+                if sample.reference_sources!=previous.reference_sources {return false;}
+            } else if unknown || sample.direct_source()!=source || source.is_none() {
+                return false;
+            }
+        }
+        true
+    }
     pub(in crate::surface) fn at(&self, t: f64) -> &GroundSample {
         // The owner supplies this one segment's ordered changes. Right-continuous
         // lookup has an explicit first sample, never an inferred layer/sample 0.

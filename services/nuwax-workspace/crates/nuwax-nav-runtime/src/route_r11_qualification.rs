@@ -382,6 +382,7 @@ impl R11NoHoldCase {
             PlannerStep::Command(_) => (R11StepKind::Zero, None, None),
             PlannerStep::Pending(_) => (R11StepKind::Pending, None, None),
             PlannerStep::Succeeded => (R11StepKind::Succeeded, None, Some("unexpected arrival at fixed start".to_owned())),
+            PlannerStep::GroundArrival(_) => return Err("Ground arrival is unsupported in this Body-only qualification".into()),
             PlannerStep::Failed(e) => (R11StepKind::Failed, None, Some(format!("planner failed: {e}"))),
             PlannerStep::ReplanRequired(e) => (R11StepKind::ReplanRequired, None, Some(format!("planner requested global replan: {e}"))),
         };

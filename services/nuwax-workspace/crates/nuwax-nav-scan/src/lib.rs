@@ -155,7 +155,7 @@ pub struct LocalTrajectory {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CandidateFamily { Direct, StepTurn, Rejoin, Spline { optimized: bool }, Polyline, Passage, Search }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CandidateEdgeOrigin { Family(CandidateFamily), Departure, Parent { node:usize }, Connector { node:usize }, AdmissionConnector, AdmissionTerminal }
+pub enum CandidateEdgeOrigin { Family(CandidateFamily), Departure, Parent { node:usize }, Connector { node:usize }, AdmissionConnector, AdmissionTerminal, WindowJoin }
 #[derive(Debug)]
 struct CandidatePart { edges:std::ops::Range<usize>, origin:CandidateEdgeOrigin }
 struct CandidateOrigins { family:CandidateFamily, parts:Vec<CandidatePart> }
@@ -208,8 +208,16 @@ impl GroundCandidateBinding {
         let mut first=self.edges[edge].clone();
         // The old cut's XY/yaw remains the target. Never teleport to its old Z
         // or roll/pitch: the preceding real connector is the physical origin.
-        first.motion[0]=*prefix_poses.last().unwrap();edges.push(first);
-        edges.extend_from_slice(&self.edges[edge+1..]);
+        first.motion[0]=*prefix_poses.last().unwrap();
+        if self.candidate.connection(edge).is_none() {first.motion[1]=first.motion[0];}
+        edges.push(first);
+        for (index,retained) in self.edges.iter().enumerate().skip(edge+1) {
+            let mut retained=retained.clone();
+            if self.candidate.connection(index).is_none() {
+                let at=edges.last().unwrap().motion[1];retained.motion=[at,at];
+            }
+            edges.push(retained);
+        }
         Ok(Self {original:self.original.clone(),candidate,edges,family:self.family,
             planned_join:self.planned_join,stationary_pose:None})
     }
@@ -381,26 +389,67 @@ fn plan_driven_ground_with_extent(
     let progress=progress.map(|p|ProgressPolicy {reference:p.reference,minimum_distance_m:p.minimum_distance_m});
     validate_progress(progress).map_err(GroundCandidateError::Planning)?;
     let mut origins=CandidateOrigins {family:CandidateFamily::Direct,parts:Vec::new()};
-    let mut navigation=None;
+    let mut navigation=GroundPublication::default();
+    // Keep the exact paired source query through both the selected physical
+    // winner and its optional semantic join; never reselect from body height.
+    let ordinary_query;
+    let query=if let Some(query)=paired_query {query} else {
+        ordinary_query=incoming.bind_body_query(map)
+            .map_err(|error|GroundCandidateError::MappingInput(error.to_string()))?;
+        &ordinary_query
+    };
     let outcome=plan_impl(map,tomogram,start,reference,kinematics,config,final_yaw,arrival,boundary,
         follow_reference,prefer_straight,progress,extent,Some(start_ground),Some(&mut origins),
-        Some(incoming),&mut navigation,paired_query).map_err(GroundCandidateError::Planning)?;
-    let trajectory=match outcome {
+        Some(incoming),&mut navigation,Some(query)).map_err(GroundCandidateError::Planning)?;
+    let mut trajectory=match outcome {
         PlanOutcome::Trajectory(trajectory)=>trajectory,
         PlanOutcome::ReferenceMiss=>return Ok(None),
     };
     let result=(|| ->Result<GroundCandidateBinding,LocalPlanError> {
         cancellation::checkpoint()?;
-        let segments=navigation.unwrap_or_default();
+        let segments=navigation.navigation.take().unwrap_or_default();
         if segments.len()!=trajectory.poses.len().saturating_sub(1) {
             return Err("accepted candidate lost a navigation edge".into());
         }
         #[cfg(test)] GROUND_EDGE_WORK.set({let mut n=GROUND_EDGE_WORK.get();n[2]+=1;n});
-        let candidate=window.owner().freeze_candidate_from(incoming,segments).map_err(|e|LocalPlanError::from(e.to_string()))?;
-        let edges=trajectory.poses.windows(2).enumerate().map(|(edge,pair)|GroundMotionBinding {
+        let mut candidate=window.owner().freeze_candidate_from(incoming,segments).map_err(|e|LocalPlanError::from(e.to_string()))?;
+        let mut edges:Vec<_>=trajectory.poses.windows(2).enumerate().map(|(edge,pair)|GroundMotionBinding {
             motion:[pair[0],pair[1]],origin:origins.parts.iter().find(|part|part.edges.contains(&edge))
                 .map_or(CandidateEdgeOrigin::Family(origins.family),|part|part.origin),
         }).collect();
+        let end=*trajectory.poses.last().ok_or("selected Ground candidate is empty")?;
+        let end_xy=[end.0[0],end.0[1]];
+        if !trajectory.partial && end_xy==window.to().walk_state().xy()
+            && !candidate.end_matches(window.to()) {
+            let physical=navigation.end_ground.as_ref()
+                .ok_or("selected Ground candidate lost its physical endpoint")?;
+            // A point stores the original address, not a fresh zero-length walk.
+            // Materialize an already validated singleton's incoming point first
+            // so that its left address also survives the explicit seam.
+            let singleton=candidate.connection_count()==0;
+            let prefix=if singleton {
+                candidate.prepend_to_stationary(&candidate)
+                    .map_err(|error|LocalPlanError::from(error.to_string()))?
+            }else{candidate.clone()};
+            let point=window.owner().freeze_candidate_from(window.to().walk_state(),Vec::new())
+                .map_err(|error|LocalPlanError::from(error.to_string()))?;
+            let joined=point.prepend_to_stationary(&prefix)
+                .map_err(|error|LocalPlanError::from(error.to_string()))?;
+            let seam=prefix.connection_count();let mut witness=None;
+            cancellation::checkpoint()?;
+            joined.with_body_navigation_seam(seam,end_xy,|navigation|
+                query.validate_motion_with_navigation(end,end,physical,navigation,boundary,&mut witness))
+                .map_err(|error|LocalPlanError::from(error.to_string()))?
+                .map_err(|error|LocalPlanError::from_surface(error,witness))?;
+            cancellation::checkpoint()?;
+            // Do not alter the selected winner before the new same-pose seam
+            // passes. A refusal remains Mapping below, never a second search.
+            candidate=joined;
+            for _ in 0..if singleton {2}else{1} {
+                trajectory.poses.push(end);
+                edges.push(GroundMotionBinding {motion:[end,end],origin:CandidateEdgeOrigin::WindowJoin});
+            }
+        }
         let planned_join=!trajectory.partial && candidate.end_matches(window.to());
         cancellation::checkpoint()?;
         let stationary_pose=(trajectory.poses.len()==1).then_some(trajectory.poses[0]);
@@ -429,10 +478,20 @@ impl<'a> MotionEdge<'a> {
         MotionState {physical:self.physical.ground().clone(),navigation:self.navigation.as_ref().map(GroundWalkSegment::end)}
     }
 }
-struct MotionPath<'a> { poses:Vec<BodyPose>, navigation:Option<Vec<GroundWalkSegment<'a>>> }
+// Ground alone retains the already computed final physical association. Body
+// publications remain None and add no physical-state clone or source query.
+#[derive(Default)]
+struct GroundPublication<'a> {
+    navigation:Option<Vec<GroundWalkSegment<'a>>>,
+    end_ground:Option<BodyGroundState>,
+}
+struct MotionPath<'a> {
+    poses:Vec<BodyPose>, navigation:Option<Vec<GroundWalkSegment<'a>>>,
+    end_ground:Option<BodyGroundState>,
+}
 impl<'a> MotionPath<'a> {
-    fn publish(self, target:&mut Option<Vec<GroundWalkSegment<'a>>>) -> Vec<BodyPose> {
-        *target=self.navigation; self.poses
+    fn publish(self, target:&mut GroundPublication<'a>) -> Vec<BodyPose> {
+        target.navigation=self.navigation;target.end_ground=self.end_ground;self.poses
     }
 }
 #[derive(Clone,Copy)]
@@ -710,6 +769,7 @@ fn project_to_region_state<'a,const N:usize>(
         if (point[0] - start.0[0]).hypot(point[1] - start.0[1]) > 1e-5 { valid.push(point); }
     }
     if valid.is_empty() {
+        let mut stationary_end_ground=None;
         if let Some(navigation)=ground.navigation {
             // A stationary candidate validates the supplied actual pose. It does
             // not publish a duplicate edge or consume a predicted association.
@@ -719,7 +779,9 @@ fn project_to_region_state<'a,const N:usize>(
             let result=segment.with_body_navigation(|_,nav|
                 query.validate_motion_with_navigation(start,start,&ground.physical,nav,boundary,&mut witness))
                 .map_err(|error|LocalPlanError::from(error.to_string()))?;
-            result.map_err(|error|LocalPlanError::from_surface(error,witness))?;
+            // Retain the successful existing validation result without
+            // changing the original rotation/projection input below.
+            stationary_end_ground=Some(result.map_err(|error|LocalPlanError::from_surface(error,witness))?);
             cancellation::checkpoint()?;
         }
         if arrival.is_some_and(|(goal, tolerance)| if tolerance == 0.0 {
@@ -735,7 +797,9 @@ fn project_to_region_state<'a,const N:usize>(
             && !goal_exact(poses.last().unwrap().0, goal)) {
             return Err("地形投影后的末点尚未到达原三维目标区域".into());
         }
-        return Ok(MotionPath {poses,navigation:segments});
+        let end_ground=if segments.as_ref().is_some_and(Vec::is_empty) {stationary_end_ground}
+            else {ground.navigation.map(|_|ground.physical)};
+        return Ok(MotionPath {poses,navigation:segments,end_ground});
     }
     let first = valid[0];
     rotate_state(
@@ -844,7 +908,8 @@ fn project_to_region_state<'a,const N:usize>(
         return Err("地形投影后的末点尚未到达原三维目标区域".into());
     }
     cancellation::checkpoint()?;
-    Ok(MotionPath {poses,navigation:segments})
+    Ok(MotionPath {poses,navigation:segments,
+            end_ground:ground.navigation.map(|_|ground.physical)})
 }
 #[cfg(test)]
 fn project(map: &SurfaceSnapshot, start: BodyPose, points: &[[f64; 3]],
@@ -959,7 +1024,7 @@ fn plan_with_extent_recorded(
     cancellation::checkpoint()?;
     validate_progress(progress.map(Into::into))?;
     let result = plan_impl(map, tomogram, start, reference, kinematics, config, final_yaw,
-        arrival, boundary, follow_reference, prefer_straight,progress.map(Into::into),extent,initial_ground,origins,None,&mut None,None);
+        arrival, boundary, follow_reference, prefer_straight,progress.map(Into::into),extent,initial_ground,origins,None,&mut GroundPublication::default(),None);
     cancellation::checkpoint()?;
     result.map_err(|mut failure| {
         if let Some(witness)=failure.body_witness.take() {
@@ -1078,7 +1143,7 @@ fn plan_impl<'a,const N:usize>(
     initial_ground: Option<&BodyGroundState>,
     mut origins: Option<&mut CandidateOrigins>,
     initial_navigation:Option<GroundWalkState<'a>>,
-    navigation_output:&mut Option<Vec<GroundWalkSegment<'a>>>,
+    navigation_output:&mut GroundPublication<'a>,
     paired_query:Option<&SurfaceBodyQueryView>,
 ) -> Result<PlanOutcome, LocalPlanError> {
     #[cfg(feature="profile")]
@@ -1443,7 +1508,7 @@ fn plan_impl<'a,const N:usize>(
         .map(|result| {
             prefix.extend(result.poses.into_iter().skip(1));
             if let (Some(out),Some(accepted))=(&mut prefix_navigation,result.navigation) {out.extend(accepted);}
-            (MotionPath {poses:prefix,navigation:prefix_navigation},result.partial)
+            (MotionPath {poses:prefix,navigation:prefix_navigation,end_ground:result.end_ground},result.partial)
         }), polyline, failures.first())?
         },
     };

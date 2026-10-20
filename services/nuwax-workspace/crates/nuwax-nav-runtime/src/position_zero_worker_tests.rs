@@ -8,6 +8,7 @@ fn zero_position_real_arrival_requalification_preserves_exact_xyz_only() {
         let (computed, receive) = std::sync::mpsc::channel();
         let (release, wait) = std::sync::mpsc::channel();
         let worker = PlannerWorker::new(GatedRouteFollower {
+            refresh_gate: None,
             inner: crate::RouteFollower::new(config).unwrap(),
             computed, release: wait, map: None, boundary: Vec::new(), odometry: None,
             goal_updates: 0, path_updates: 0,

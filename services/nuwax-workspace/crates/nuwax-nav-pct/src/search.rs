@@ -29,6 +29,9 @@ pub(crate) struct ConnectionRecord {
 }
 #[derive(Debug, Default)]
 pub(crate) struct RouteReferenceTrace {
+    /// Only sample zero of a continued root differs from its geometry. All
+    /// remaining sample addresses come from their original connection grid.
+    pub root_sample_xy: Option<[f64; 2]>,
     pub connections: Vec<ConnectionRecord>,
     pub changes: Vec<TraceChange>,
 }
@@ -49,6 +52,9 @@ impl RouteReferenceTrace {
             evaluated_from: from, evaluated_to: to, steps, changes: first..self.changes.len() });
     }
     fn append_record(&mut self, source: &Self, record: &ConnectionRecord, span: [usize; 2]) {
+        if self.connections.is_empty() && record.changes.start == 0 {
+            self.root_sample_xy = source.root_sample_xy;
+        }
         self.append(span, record.evaluated_from, record.evaluated_to, record.steps,
             source.changes[record.changes.clone()].iter().copied());
     }
@@ -62,19 +68,29 @@ struct SearchOutput { route: Route, trace: Option<Arc<RouteReferenceTrace>> }
 /// Request-local interpretation; no source mutation, second search or ground
 /// height is inferred from an Unanchored physical coordinate.
 #[derive(Clone, Copy)]
+pub(crate) enum GroundSearchOrigin {
+    Factory(Option<Reference>),
+    Continued { reference: Reference, reference_sample_xy: [f64; 2] },
+}
+#[derive(Clone, Copy)]
 enum SearchGeometry {
     Body,
-    Ground { unanchored_z: Option<f64>, target: Option<usize>, initial: Option<Reference> },
+    Ground { unanchored_z: Option<f64>, target: Option<usize>, origin: GroundSearchOrigin },
 }
 impl SearchGeometry {
     fn ground(self) -> bool { matches!(self,Self::Ground { .. }) }
     fn initial(self,map:&Tomogram,start:[f64;3])->Option<Reference> {
         match self {
-            Self::Ground {initial:Some(reference),..}=>Some(reference),
+            Self::Ground {origin:GroundSearchOrigin::Factory(Some(reference))
+                | GroundSearchOrigin::Continued {reference,..},..}=>Some(reference),
             Self::Ground {unanchored_z:Some(_),..}=>map.unanchored_at(map.point_column(start)),
             _=>map.reference_start(start),
         }
     }
+    fn root_sample_xy(self)->Option<[f64;2]> {match self {
+        Self::Ground {origin:GroundSearchOrigin::Continued {reference_sample_xy,..},..}=>Some(reference_sample_xy),
+        _=>None,
+    }}
     fn position(self,map:&Tomogram,reference:Reference)->[f64;3] {
         match (self,reference) {
             (Self::Ground {unanchored_z:Some(z),..},Reference::Unanchored {column})=>[
@@ -377,7 +393,7 @@ impl Tomogram {
     )->Result<TracedRoute,PlanningFailure> {
         checkpoint(cancelled)?;
         let result=self.plan_bounded_impl_in::<true, false>(start,goal,tolerance,boundary,cancelled,radius,
-            penalties,accepts,limits,SearchGeometry::Ground {unanchored_z,target,initial:None});
+            penalties,accepts,limits,SearchGeometry::Ground {unanchored_z,target,origin:GroundSearchOrigin::Factory(None)});
         checkpoint(cancelled)?;
         result.map(|output|TracedRoute {route:output.route,trace:output.trace.expect("Ground records its admitted trace")})
     }
@@ -387,11 +403,11 @@ impl Tomogram {
         &self,start:[f64;3],goal:[f64;3],tolerance:f64,boundary:&[[f64;2]],
         cancelled:Option<&AtomicBool>,radius:Option<f64>,penalties:&[crate::RoutePenalty],
         admitter:&crate::ground_route::GroundPhysicalAdmitter<'_>,limits:SearchLimits,
-        unanchored_z:Option<f64>,target:Option<usize>,initial:Option<Reference>,
+        unanchored_z:Option<f64>,target:Option<usize>,origin:GroundSearchOrigin,
     )->Result<TracedRoute,PlanningFailure> {
         checkpoint(cancelled)?;
         let result=self.plan_bounded_impl_in::<true,EARLY>(start,goal,tolerance,boundary,cancelled,radius,
-            penalties,&|a,b|admitter.accepts(a,b),limits,SearchGeometry::Ground {unanchored_z,target,initial});
+            penalties,&|a,b|admitter.accepts(a,b),limits,SearchGeometry::Ground {unanchored_z,target,origin});
         checkpoint(cancelled)?;
         result.map(|output|TracedRoute {route:output.route,trace:output.trace.expect("Ground records its admitted trace")})
     }
@@ -423,7 +439,9 @@ impl Tomogram {
         }
         let initial = geometry.initial(self,start).ok_or("层析起点存在已知障碍或不兼容地形")?;
         let goal_column = self.point_column(goal);
-        let initial_height = geometry.height(self,initial,[start[0],start[1]])
+        let root_sample_xy = geometry.root_sample_xy();
+        let continued = root_sample_xy.is_some();
+        let initial_height = geometry.height(self,initial,root_sample_xy.unwrap_or([start[0],start[1]]))
             .ok_or("层析起点地表来源与实际查询列不一致")?;
         let goal_height = geometry.goal_height(self,goal);
         let [low, high] = self.ground_bounds.unwrap_or([initial_height; 2]);
@@ -457,7 +475,7 @@ impl Tomogram {
             let points = if distance(start, direct) <= 1e-6 { vec![start] } else { vec![start, direct] };
             let trace = if RECORD {
                 let segment = scratch.take().expect("recording scratch");
-                let mut trace = RouteReferenceTrace::default();
+                let mut trace = RouteReferenceTrace {root_sample_xy,..RouteReferenceTrace::default()};
                 trace.append([0, points.len() - 1], start, direct, segment.steps, segment.changes);
                 #[cfg(test)]
                 trace_tests::record_trace_work("arc", 1);
@@ -485,9 +503,16 @@ impl Tomogram {
             trace_tests::record_trace_work("growth", 1);
         }
         let mut indexes = ahash::AHashMap::new();
-        indexes.insert(initial, 0);
+        // A continued actual origin is transient, not the ordinary center for
+        // this Reference. A later center state must receive its own index.
+        if !continued { indexes.insert(initial, 0); }
+        let root_column = self.point_column(start);
+        let root_order = [root_column[0], root_column[1],
+            (initial_height / self.body_height.max(self.resolution)).floor() as i32];
+        let root_heuristic = (geometry.arrival_distance(start, goal) - tolerance).max(0.0) * self.minimum_cost;
         let mut queue = BinaryHeap::new();
-        queue.push(Queue { score: heuristic(initial), cost: 0.0, id: 0, order: order(initial) });
+        queue.push(Queue { score: if continued {root_heuristic}else{heuristic(initial)},
+            cost: 0.0, id: 0, order: if continued {root_order}else{order(initial)} });
         // 起终点都有观测参考时，先沿有限的已观测连接寻找首条路线。
         // 同层噪声也会产生多个缺测高程平面，不能按端点高差或半数预算
         // 提前放弃观测进展。缺测候选共用状态、代价和预算，仍可桥接断点；
@@ -517,8 +542,8 @@ impl Tomogram {
                 // Only states clipped by the previous artificial edge are revisited.
                 for id in edge_states.drain() {
                     let state = &states[id];
-                    queue.push(Queue { score: state.cost + heuristic(state.reference), cost: state.cost,
-                        id, order: order(state.reference) });
+                    queue.push(Queue { score: state.cost + if continued && id==0 {root_heuristic}else{heuristic(state.reference)},
+                        cost: state.cost, id, order: if continued && id==0 {root_order}else{order(state.reference)} });
                 }
                 continue;
             };
@@ -539,35 +564,53 @@ impl Tomogram {
             }
             expanded += 1;
             let from = states[id].reference;
-            let a = geometry.position(self,from);
+            let continued_root = continued && id == 0;
+            let a = if continued_root {start}else{geometry.position(self,from)};
             let actual_a = if id == 0 { start } else { a };
-            let precise = (self.reference_column(from) == goal_column)
+            let precise = if continued_root {
+                // Only XY is proposed here. The one recorded walk below owns
+                // the endpoint association and its actual navigation height.
+                (root_column == goal_column).then_some([goal[0],goal[1],initial_height])
+            } else {(self.reference_column(from) == goal_column)
                 .then(||geometry.height(self,from,[goal[0],goal[1]]))
-                .flatten().map(|height|[goal[0],goal[1],height]);
+                .flatten().map(|height|[goal[0],goal[1],height])};
             // Keep the cell-center arrival candidate as well: the exact goal XY
             // can be just outside a boundary while its arrival ball overlaps it.
             let center = if precise.is_some_and(|p| distance(p,a) <= 1e-6) { None } else { Some(a) };
-            for candidate in [center, precise].into_iter().flatten() {
-                if geometry.arrival_distance(candidate, goal) <= tolerance + 1e-6
-                    && radius.is_none_or(|r| (candidate[0] - start[0]).hypot(candidate[1] - start[1]) <= r)
-                    && accepts(actual_a, candidate)
-                    && self.reference_segment_from_recorded::<RECORD>(actual_a, candidate, boundary, cancelled, &mut scratch,
-                        geometry.initial_for_segment(from)).is_some_and(|(_,_,end)|geometry.goal_matches(end)) {
+            for proposed in [center, precise].into_iter().flatten() {
+                if geometry.arrival_distance(proposed, goal) <= tolerance + 1e-6
+                    && radius.is_none_or(|r| (proposed[0] - start[0]).hypot(proposed[1] - start[1]) <= r) {
+                    let mut candidate=proposed;
+                    if continued_root {
+                        let xy=[candidate[0],candidate[1]];
+                        let Some((_,_,end))=self.reference_walk_recorded::<true>([actual_a[0],actual_a[1]],xy,
+                            None,boundary,cancelled,&mut scratch,Some(from)) else {continue;};
+                        let Some(height)=geometry.height(self,end,xy) else {continue;};
+                        candidate[2]=height;
+                        if !accepts(actual_a,candidate) || self.reference_segment_replay(actual_a,candidate,cancelled,
+                            scratch.as_ref().expect("continued root records its source walk"))
+                            .is_none_or(|(_,_,end)|!geometry.goal_matches(end)) {continue;}
+                    } else if !accepts(actual_a, candidate)
+                        || self.reference_segment_from_recorded::<RECORD>(actual_a,candidate,boundary,cancelled,&mut scratch,
+                            geometry.initial_for_segment(from)).is_none_or(|(_,_,end)|!geometry.goal_matches(end)) {continue;}
                     let total = cost + 2.0 * geometry.arrival_distance(candidate, goal);
                     if best.is_none_or(|(_, _, old)| total < old) {
                         best = Some((id, candidate, total));
                         if RECORD { std::mem::swap(&mut best_trace, &mut scratch); }
                         #[cfg(test)]
-                        trace_tests::record_best_cost(total, precise == Some(candidate), actual_a, candidate);
+                        trace_tests::record_best_cost(total, precise == Some(proposed), actual_a, candidate);
                     }
                 }
             }
-            let column = self.reference_column(from);
-            let mut candidates = [None; 8];
+            let column = if continued_root {root_column}else{self.reference_column(from)};
+            let mut candidates = [None; 9];
+            // Root recordings survive preference sorting. Ordinary candidates
+            // still share the original single scratch and eight-neighbor path.
+            let mut root_segments: [Option<SegmentTrace>;9] = std::array::from_fn(|_|None);
             let mut candidate_count = 0;
             for dx in -1..=1 { for dy in -1..=1 {
                 checkpoint(cancelled)?;
-                if dx == 0 && dy == 0 { continue; }
+                if dx == 0 && dy == 0 && !continued_root { continue; }
                 let Some(x) = column[0].checked_add(dx) else { continue; };
                 let Some(y) = column[1].checked_add(dy) else { continue; };
                 let xy = [x,y].map(|v|(f64::from(v)+0.5)*self.resolution);
@@ -580,7 +623,14 @@ impl Tomogram {
                     }
                     if !outside_radius { continue; }
                 }
-                let Some(next) = self.reference_neighbor(from, [x, y]) else { continue; };
+                let next = if continued_root {
+                    let Some((_,_,end))=self.reference_walk_recorded::<true>([actual_a[0],actual_a[1]],xy,
+                        None,boundary,cancelled,&mut scratch,Some(from)) else {continue;};
+                    end
+                } else {
+                    let Some(next)=self.reference_neighbor(from,[x,y]) else {continue;};
+                    next
+                };
                 let b = geometry.position(self,next);
                 // One unchanged g expression; arbitrary callbacks still run
                 // before evaluating it. Only the internal deterministic MLS
@@ -592,43 +642,55 @@ impl Tomogram {
                     let existing = indexes.get(&next).copied();
                     (next_cost, existing)
                 };
-                let early = if EARLY && !outside_radius {
+                let early = if EARLY && !outside_radius && !continued_root {
                     let (next_cost, existing) = cost_and_index();
                     if existing.is_some_and(|next_id| !(next_cost < states[next_id].cost)) { continue; }
                     Some((next_cost, existing))
                 } else { None };
                 if !accepts(actual_a, b) { continue; }
+                if continued_root && self.reference_segment_replay(actual_a,b,cancelled,
+                    scratch.as_ref().expect("continued root records its source walk")).is_none() {continue;}
                 if outside_radius {
                     // 只有整段可接纳的越界边才证明人工半径截断；仅有邻点
                     // 不能把真实障碍或高度不连续改写成搜索范围不足。
                     #[cfg(test)]
                     tests::record_neighbor_validation(b);
-                    if self.reference_segment_from_recorded::<false>(actual_a,b,boundary,cancelled,&mut None,
+                    if continued_root || self.reference_segment_from_recorded::<false>(actual_a,b,boundary,cancelled,&mut None,
                         geometry.initial_for_segment(from)).is_some() {
                         radius_clipped = true;
                     }
                     continue;
                 }
-                let (next_cost, existing) = if EARLY { early.expect("in-radius candidate") }
+                let (next_cost, existing) = if EARLY && !continued_root { early.expect("in-radius candidate") }
                     else { cost_and_index() };
                 // 新状态仍在完整段验证之后才占用状态预算。
-                if !EARLY && existing.is_some_and(|next_id| !(next_cost < states[next_id].cost)) { continue; }
-                candidates[candidate_count] = Some((next, b, next_cost, existing));
+                if (!EARLY || continued_root) && existing.is_some_and(|next_id| !(next_cost < states[next_id].cost)) { continue; }
+                let recording = continued_root.then_some(candidate_count);
+                if continued_root {
+                    root_segments[candidate_count]=scratch.take();
+                    scratch=Some(SegmentTrace::default());
+                }
+                candidates[candidate_count] = Some((next, b, next_cost, existing, recording));
                 candidate_count += 1;
             }}
             // 先保持过滤回调的原邻居顺序，再让观测优先也作用于状态接纳。
-            // 最多八个栈上候选；同类保持原次序，未知仍由原延后队列接续。
+            // 普通节点仍为原八邻居；continued root 另有可选同格中心。
+            // 同类保持原次序，未知仍由原延后队列接续。
             if prefer_observed {
                 candidates[..candidate_count].sort_by_key(|candidate| candidate.is_some_and(
-                    |(next, _, _, _)| matches!(next, crate::reference::Reference::Unknown { .. })));
+                    |(next, _, _, _, _)| matches!(next, crate::reference::Reference::Unknown { .. })));
             }
-            for (next, b, next_cost, existing) in candidates.into_iter().flatten() {
+            for (next, b, next_cost, existing, recording) in candidates.into_iter().flatten() {
                 checkpoint(cancelled)?;
                 // 邻接成立不代表整段成立：缺测格继承的高度与斜向段内经过的
                 // 侧格可能不同。所有可能改善路线的边仍复用输出段检查。
                 #[cfg(test)]
                 tests::record_neighbor_validation(b);
-                if self.reference_segment_from_recorded::<RECORD>(actual_a,b,boundary,cancelled,&mut scratch,
+                if let Some(recording)=recording {
+                    // Already selected and numerically checked exactly once;
+                    // retain that recording rather than choosing a source again.
+                    std::mem::swap(&mut scratch,&mut root_segments[recording]);
+                } else if self.reference_segment_from_recorded::<RECORD>(actual_a,b,boundary,cancelled,&mut scratch,
                     geometry.initial_for_segment(from)).is_none_or(|(_,_,end)|geometry.ground()&&end!=next) { continue; }
                 let next_id = match existing {
                     Some(id) => id,
@@ -695,13 +757,26 @@ impl Tomogram {
             ids.push(current);
         }
         ids.reverse();
+        // Keep the first continued root edge as an immutable prefix, even if
+        // output geometry would deduplicate it. Reduction begins at the true
+        // ordinary center and its own reference, never at the inherited root.
+        let first_normal = continued.then(||ids.get(1).copied()).flatten();
+        let mut root_prefix = first_normal.map(|id| {
+            let mut trace=RouteReferenceTrace {root_sample_xy,..RouteReferenceTrace::default()};
+            parents.as_ref().unwrap()[id].as_ref().expect("root parent evidence")
+                .append(&mut trace,[0,0],start,geometry.position(self,states[id].reference));
+            trace
+        });
+        let reduction_start=first_normal.map_or(start,|id|geometry.position(self,states[id].reference));
+        let reduction_reference=first_normal.map_or(initial,|id|states[id].reference);
         let mut points = Vec::with_capacity(ids.len() + 2);
-        let mut raw_trace = RECORD.then(RouteReferenceTrace::default);
+        let mut raw_trace = RECORD.then(||RouteReferenceTrace {
+            root_sample_xy:if first_normal.is_none(){root_sample_xy}else{None},..RouteReferenceTrace::default()});
         let mut tail_start = 0;
-        let mut previous_raw = start;
-        points.push(start);
-        let mut point_references=geometry.ground().then(||vec![initial]);
-        for id in ids.into_iter().skip(1) {
+        let mut previous_raw = reduction_start;
+        points.push(reduction_start);
+        let mut point_references=geometry.ground().then(||vec![reduction_reference]);
+        for id in ids.into_iter().skip(if first_normal.is_some(){2}else{1}) {
             checkpoint(cancelled)?;
             let p = geometry.position(self,states[id].reference);
             let (span, from) = push_reference_point::<RECORD>(&mut points, p, &mut previous_raw,
@@ -729,8 +804,24 @@ impl Tomogram {
             drop(parents.take());
             drop(states);
         }
-        let (points, trace) = self.reduce_recorded_in::<RECORD>(points, boundary, penalties, cancelled,
+        let (mut points, mut trace) = self.reduce_recorded_in::<RECORD>(points, boundary, penalties, cancelled,
             accepts, raw_trace, tail_start, &mut scratch,point_references.as_deref())?;
+        if let Some(mut prefix)=root_prefix.take() {
+            let mut joined=Vec::with_capacity(points.len()+1);
+            joined.push(start);
+            // Do not fold a small positive prefix into the first suffix edge:
+            // each retained recording keeps its checked geometric endpoints.
+            if start!=points[0] {joined.push(points[0]);}
+            let offset=joined.len()-1;
+            prefix.connections[0].point_span=[0,offset];
+            joined.extend(points.into_iter().skip(1));
+            let suffix=trace.take().expect("continued ordinary suffix records its trace");
+            for record in &suffix.connections {
+                checkpoint(cancelled)?;
+                prefix.append_record(&suffix,record,record.point_span.map(|index|index+offset));
+            }
+            points=joined;trace=Some(prefix);
+        }
         #[cfg(test)]
         if RECORD { trace_tests::record_trace_work("arc", 1); }
         Ok(SearchOutput { route: Route { points, stats: SearchStats { expanded,

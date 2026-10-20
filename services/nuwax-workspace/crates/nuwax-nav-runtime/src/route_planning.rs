@@ -111,6 +111,93 @@ impl ReferenceSource {
         Ok((result, end, at_end, global_straight))
     }
 }
+/// One unfinished original window. Its end is advanced only by RouteFollower
+/// after a current binding's actual committed join; candidate coverage never
+/// changes this state. XY lengths below are scheduling/display values only.
+#[derive(Clone)]
+pub(crate) struct GroundFiniteWindow {
+    pub intent: crate::replan_feedback::GroundIntent,
+    pub xy_reference: Arc<Vec<[f64;2]>>,
+    pub from_distance: f64,
+    pub to_distance: f64,
+    pub straight: bool,
+}
+impl GroundFiniteWindow {
+    pub(crate) fn new(reference:&nuwax_nav_pct::ground_route::GroundRouteReference,
+        from:(usize,usize,f64),from_distance:f64,horizon:f64)->Result<Self,String> {
+        let begin=reference.position(from.0,from.1,from.2).ok_or("invalid original Ground window start")?;
+        let mut end=begin;
+        let mut xy=vec![begin.walk_state().xy()];
+        let mut distance=0.0;
+        let mut direction:Option<[f64;2]>=None;
+        let mut straight=true;
+        for (index,connection) in reference.connections().enumerate().skip(from.0) {
+            let start=if index==from.0 {begin}else {
+                reference.position(index,0,0.0).ok_or("invalid Ground connection start")?
+            };
+            let terminal=reference.position(index,connection.steps,0.0)
+                .ok_or("invalid Ground connection end")?;
+            let a=start.walk_state().xy();let b=terminal.walk_state().xy();
+            let delta=[b[0]-a[0],b[1]-a[1]];let length=delta[0].hypot(delta[1]);
+            if length>1e-9 {
+                let next=delta.map(|v|v/length);
+                if let Some(first)=direction {straight &= first[0]*next[0]+first[1]*next[1]>0.0
+                    && (first[0]*next[1]-first[1]*next[0]).abs()<1e-9;}
+                else {direction=Some(next);}
+            }
+            let remaining=(horizon-distance).max(0.0);
+            if length>remaining && length>0.0 {
+                let (_,sample,fraction)=start.indices();
+                let at=sample as f64+fraction
+                    +(connection.steps as f64-sample as f64-fraction)*remaining/length;
+                let sample=(at.floor() as usize).min(connection.steps);
+                let fraction=if sample==connection.steps {0.0}else{at-sample as f64};
+                end=reference.position(index,sample,fraction).ok_or("invalid clipped Ground window end")?;
+                xy.push(end.walk_state().xy());distance+=remaining;
+                break;
+            }
+            end=terminal;xy.push(b);distance+=length;
+            if end.is_terminal() || distance>=horizon {break;}
+        }
+        let window=begin.window_to(end).ok_or("Ground window owner changed")?;
+        Ok(Self {intent:crate::replan_feedback::GroundIntent::new(window),
+            xy_reference:Arc::new(xy),from_distance,to_distance:from_distance+distance,straight})
+    }
+    pub(crate) fn matches(&self,window:nuwax_nav_pct::ground_route::GroundRouteWindow<'_>)->bool {
+        self.intent.same_intent(&crate::replan_feedback::GroundIntent::new(window))
+    }
+    pub(crate) fn capture(&self,incoming:nuwax_nav_pct::ground_route::OwnedGroundWalkState,
+        arrival_tolerance_m:f64)->GroundPlanInput {
+        let mut xy=self.xy_reference.as_ref().clone();
+        if let Some(first)=xy.first_mut() {*first=incoming.walk_state().xy();}
+        GroundPlanInput {incoming,intent:self.intent.clone(),xy_reference:Arc::new(xy),
+            arrival_tolerance_m:Some(arrival_tolerance_m)}
+    }
+}
+
+/// Explicit Ground OFF has no local-search owner. It still uses the production
+/// reference-only Scan branch to form a genuine navigation-driven walk/H3
+/// binding, then the same actual connector admission. A miss stays a miss.
+/// Body OFF continues through its original direct Surface branch unchanged.
+pub(crate) fn direct_ground_candidate(config:&SurfaceFollowerConfig,r:&PlanRequest)
+    ->Result<Candidate,Vec<LocalPlanError>> {
+    let input=r.ground.as_ref().ok_or_else(||vec![LocalPlanError::from("missing explicit Ground input")])?;
+    let physical=r.start_ground.as_ref().map_err(|e|vec![LocalPlanError::from(e.clone())])?;
+    let fork=input.incoming.planning_fork(&r.source).map_err(|e|vec![LocalPlanError::from(e.to_string())])?;
+    let tomogram=nuwax_nav_pct::Tomogram::local_from_surface(fork.snapshot(),
+        [r.pose.pose.position.x,r.pose.pose.position.y],local_map_radius(r.scan.horizon_m,fork.snapshot()))
+        .map_err(|e|vec![LocalPlanError::from(e.to_string())])?;
+    let kinematics=config.kinematics().ok_or_else(||vec![LocalPlanError::from("近场执行缺少运动能力")])?;
+    match nuwax_nav_scan::probe_ground_reference_candidates_on_fork(&fork,&tomogram,body(&r.pose),physical,
+        input.incoming.walk_state(),&input.xy_reference,&kinematics,&r.scan,r.final_yaw,input.arrival(),
+        &r.boundary,false,r.straight,None,input.intent.window()).map_err(|e|vec![ground_plan_error(e)])? {
+        nuwax_nav_scan::GroundReferenceCandidateOutcome::Complete(mapped)=>
+            Ok(candidate_from_mapped_trajectory(&r.pose,mapped)),
+        nuwax_nav_scan::GroundReferenceCandidateOutcome::Miss=>
+            Err(vec![LocalPlanError::from("Ground direct reference has no admissible candidate")]),
+    }
+}
+
 /// Frozen, explicit input for one internal Ground window. The incoming address
 /// is actual consumed navigation; the intent and XY guide are planned inputs.
 /// None on PlanRequest preserves the existing Body execution path.

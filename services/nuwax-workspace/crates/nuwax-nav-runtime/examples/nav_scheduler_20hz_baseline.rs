@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use nuwax_nav_astar::navigation_map::CostMap2D;
 use nuwax_nav_runtime::{
-    spawn_scheduler, AppliedProof, CostmapObservation, ExecutionMap, ExecutionPath,
+    spawn_scheduler, AppliedProof, CostmapObservation, ExecutionGoal, ExecutionMap, ExecutionPath,
     FenceLeaseState, FenceProof, LeaseProof, MotionPortError, NavMotionAdmission, NavMotionPort,
     NavPlanner, NavScheduler, NavSession, PathExecutionIdentity, PlannerStep, RuntimeError,
     SchedulerConfig, SchedulerStatus, VersionedPath,
@@ -141,7 +141,8 @@ fn session() -> NavSession {
     NavSession {
         boundary: Vec::new(),
             options: Default::default(),
-        goal_pose: nuwax_nav_astar::helpers::make_pose_stamped("map", 2.0, 0.0, 0.0),
+        goal: ExecutionGoal::Body(nuwax_nav_astar::helpers::make_pose_stamped("map", 2.0, 0.0, 0.0)),
+        ground_initial: None,
         session_id: "nav_scheduler_20hz_baseline-nav".to_string(),
         execution_identity: identity("nav_scheduler_20hz_baseline-nav", 0),
         local_owner_runtime_generation: 1,

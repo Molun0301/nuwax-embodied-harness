@@ -259,6 +259,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 braking = true;
                 [0.; 3]
             }
+            PlannerStep::GroundArrival(_) => {
+                outcome = "unsupported_ground_arrival";
+                failure = Some("Ground arrival is unsupported in the Body-only analytic world".into());
+                break;
+            }
             PlannerStep::Failed(reason) => {
                 outcome = "controller_failure";
                 failure = Some(reason);

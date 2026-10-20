@@ -600,7 +600,8 @@ fn surface_replan_input(
     let matching = feedback.filter(|feedback| feedback.path_identity
         .has_same_goal_identity(&guarded_goal_execution_identity(goal)));
     Ok(SurfaceReplanInput {
-        source: Arc::clone(surface), start:start.clone(), goal:pose_from_schema(&goal.goal)?,
+        source: Arc::clone(surface), start:start.clone(),
+        goal:nuwax_nav_runtime::ExecutionGoal::Body(pose_from_schema(&goal.goal)?),
         options:goal.options,
         boundary:Arc::new(goal.boundary_points.iter().map(|p|[p[0],p[1]]).collect()),
         actual:matching.and_then(|feedback|feedback.current_context.clone()),
@@ -1502,6 +1503,9 @@ mod tests {
                         "yaw":actual.pose.orientation.yaw(),"step":format!("{step:?}")}));
                     match step {
                         nuwax_nav_runtime::PlannerStep::Succeeded => {outcome="到达".into(); break;}
+                        nuwax_nav_runtime::PlannerStep::GroundArrival(_) => {
+                            outcome="Ground arrival is unsupported in this Body-only diagnostic".into(); break;
+                        }
                         nuwax_nav_runtime::PlannerStep::Command(command) => {
                             follower.observe_applied_command(command);
                             commands += usize::from(command.linear.x != 0.0);
@@ -1678,6 +1682,7 @@ mod tests {
                     follower.update_odometry(actual.clone());
                     match follower.step(config.robot_width_m) {
                         PlannerStep::Succeeded => { completed=true;break; }
+                        PlannerStep::GroundArrival(_) => panic!("Ground arrival is unsupported in this Body-only diagnostic"),
                         PlannerStep::Command(twist) => {
                             follower.observe_applied_command(twist);
                             let mut actual_twist=twist;

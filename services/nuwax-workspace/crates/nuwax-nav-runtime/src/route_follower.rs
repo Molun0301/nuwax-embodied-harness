@@ -1,6 +1,6 @@
 //! 3DMR式持续路线执行：全局参考留存，Scan只更新前方轨迹，原控制器继续唯一生成速度。
 use crate::{
-    ExecutionMap, ExecutionPath, NavPlanner, PlannerStep, RuntimeError, SurfaceFollower,
+    ExecutionGoal, ExecutionMap, ExecutionPath, GroundExecutionGoal, GroundInitialCapture, NavPlanner, PlannerStep, RuntimeError, SurfaceFollower,
     SurfaceFollowerConfig, SurfaceSnapshot,
 };
 use nuwax_nav_astar::navigation_map::CostMap2D;
@@ -13,7 +13,8 @@ use std::sync::Arc;
 use crate::surface_changes::{SurfaceGeometryChanges, SurfaceJobTicket, SurfaceMapUpdate};
 
 use crate::planning_owner::PlanningOwner;
-use crate::route_planning::{body, pose_bits, exact_points, PlanKernel, PlanRequest, PlanResult, ReferenceSource};
+use crate::route_planning::{body, pose_bits, exact_points, direct_ground_candidate, Candidate, GroundFiniteWindow, GroundPlanInput, PlanKernel, PlanRequest, PlanResult, ReferenceSource};
+use crate::surface_follower::ground_cursor::{GroundConsumption, GroundControlStep};
 use std::time::{Duration,Instant};
 
 #[cfg(any(test, feature = "surface-recovery-qualification"))]
@@ -31,7 +32,15 @@ pub struct RouteFollower {
     changes: Arc<SurfaceGeometryChanges>,
     pose: Option<PoseStamped>,
     route: Option<Arc<Path3D>>,
+    // Body-only compatibility state. Ground has no fabricated PoseStamped target.
     goal: Option<PoseStamped>,
+    ground_goal: Option<GroundExecutionGoal>,
+    ground_reference: Option<nuwax_nav_pct::ground_route::GroundRouteReference>,
+    ground_window: Option<GroundFiniteWindow>,
+    ground_completed_binding: Option<Arc<nuwax_nav_scan::GroundCandidateBinding>>,
+    // One-shot frozen address from an already consumed arrival being resumed.
+    // It is not a live cursor or a second original target.
+    ground_restore_window: Option<nuwax_nav_pct::ground_route::OwnedGroundRouteWindow>,
     options: GoalOptions,
     cumulative: Arc<Vec<f64>>,
     progress: f64,
@@ -95,6 +104,11 @@ impl RouteFollower {
             pose: None,
             route: None,
             goal: None,
+            ground_goal: None,
+            ground_reference: None,
+            ground_window: None,
+            ground_completed_binding: None,
+            ground_restore_window: None,
             options: GoalOptions::default(),
             cumulative: Arc::new(Vec::new()),
             progress: 0.0,
@@ -119,6 +133,144 @@ impl RouteFollower {
             admitted_generation: None,
             local_failures: Vec::new(),
         })
+    }
+    #[cfg(test)]
+    pub(crate) fn ground_cursor_for_test(&self)->Option<(usize,f64)> {
+        self.controller.ground_cursor().map(|cursor|(cursor.edge,cursor.fraction))
+    }
+    #[cfg(test)]
+    pub(crate) fn ground_binding_for_test(&self)->Option<Arc<nuwax_nav_scan::GroundCandidateBinding>> {
+        self.controller.current_ground_binding()
+    }
+    #[cfg(test)]
+    pub(crate) fn ground_window_for_test(&self)->Option<nuwax_nav_pct::ground_route::OwnedGroundRouteWindow> {
+        self.ground_window.as_ref().map(|window|window.intent.window().freeze())
+    }
+    fn ground_horizon(&self)->f64 {
+        self.scan.horizon_m
+            .max(self.map.as_ref().and_then(|map|map.body_envelope()).map_or(0.0,|body|body.radius()*2.0))
+            .max(self.config.kinematics().map_or(0.0,|k|k.minimum_turning_radius_m*2.0))
+            .max(self.config.lookahead_m*2.0)
+    }
+    fn capture_ground_input(&self)->Option<GroundPlanInput> {
+        let incoming=self.controller.paired_ground_basis()?.continuation().ok()?;
+        let window=self.ground_window.as_ref()?;
+        incoming.same_reference_owner(window.intent.window().owner()).then(||
+            window.capture(incoming,self.options.position_tolerance_m))
+    }
+    fn ground_planning_request(&self,map:&Arc<SurfaceSnapshot>,pose:&PoseStamped,detour:bool,
+        start_ground:Result<nuwax_nav_mls_planner::surface::BodyGroundState,String>,ground:GroundPlanInput)
+        ->PlanRequest {
+        #[cfg(any(test, feature = "surface-recovery-qualification"))]
+        PLANNING_REQUEST_BUILDS_FOR_QUALIFICATION.with(|count| count.set(count.get() + 1));
+        let window=self.ground_window.as_ref().expect("captured original Ground window");
+        let final_yaw=if window.intent.window().to().is_terminal() && self.options.requires_orientation() {
+            self.controller.ground_control_yaw()
+        }else{None};
+        let mut scan=self.scan.clone();scan.horizon_m=self.ground_horizon();
+        PlanRequest {ground:Some(ground),start_ground,source:Arc::clone(map),change_basis:self.change_basis.clone(),
+            changes:Arc::clone(&self.changes),pose:pose.clone(),boundary:Arc::clone(&self.boundary),
+            reference:Vec::new(),reference_source:None,final_yaw,arrival:None,
+            end:window.to_distance,progress:window.from_distance,generation:self.route_generation,
+            straight:window.straight,detour,scan}
+    }
+    /// Candidate mapping is already complete. SurfaceFollower alone admits its
+    /// real connector and keeps the original unexecuted suffix sampling grid.
+    fn admit_ground_plan(&mut self,request:&PlanRequest,candidate:Candidate)->Result<(),String> {
+        let binding=candidate.ground_binding.ok_or("Ground winner has no navigation binding")?;
+        let window=self.ground_window.as_ref().ok_or("Ground original window retired")?;
+        if !window.matches(binding.original_window()) || request.ground.as_ref().is_none_or(|ground|
+            !window.intent.same_intent(&ground.intent)) {
+            return Err("Ground winner belongs to a retired original window".into());
+        }
+        let steering=candidate.path.poses.last().cloned().ok_or("Ground candidate is empty")?;
+        self.controller.admit_ground_candidate(candidate.path.clone(),steering,binding,None,None)?;
+        // Admission may prepend a connector, so only the installed binding can
+        // later establish an actual local end. Never cache the pre-admit pointer.
+        self.local_path=self.controller.ground_execution_path().cloned();
+        self.admitted_generation=Some(self.route_generation);
+        self.local_failures.clear();self.qualified_failure=None;
+        self.local_progress_at_plan=request.progress;self.local_end=request.end;
+        self.local_start=Some(request.pose.pose.position);
+        self.dirty=false;self.local_plans+=1;
+        Ok(())
+    }
+    fn consume_direct_ground_plan(&mut self) {
+        if !self.dirty || Instant::now()<self.retry_after {return;}
+        let (Some(map),Some(pose),Some(ground))=(&self.map,&self.pose,self.capture_ground_input()) else {return;};
+        let start_ground=self.controller.current_ground_query_owned().map(|(_,ground)|ground);
+        let request=self.ground_planning_request(map,pose,false,start_ground,ground);
+        self.local_planning_calls+=1;
+        match direct_ground_candidate(&self.config,&request) {
+            Ok(candidate)=>if let Err(reason)=self.admit_ground_plan(&request,candidate) {
+                self.local_failures=vec![reason.into()];self.dirty=true;
+            },
+            Err(failures)=>{self.local_failures=failures;self.dirty=true;},
+        }
+        self.retry_after=Instant::now()+Duration::from_millis(250);
+    }
+    /// Only a committed actual local end may move the retained original window.
+    /// A partial/no-join candidate leaves that exact window unchanged for retry.
+    fn complete_ground_window(&mut self)->Result<Option<PlannerStep>,String> {
+        if self.admitted_generation!=Some(self.route_generation) {return Ok(None);}
+        let binding=self.controller.current_ground_binding().ok_or("missing admitted Ground binding")?;
+        if self.ground_completed_binding.as_ref().is_some_and(|old|Arc::ptr_eq(old,&binding)) {return Ok(None);}
+        let window=self.ground_window.as_ref().ok_or("missing original Ground window")?;
+        if !window.matches(binding.original_window()) {return Err("actual Ground end has a different original window".into());}
+        if binding.planned_join() && binding.original_window().to().is_terminal() {
+            if let Some(arrival)=self.controller.ground_arrival_step(&window.intent)? {return Ok(Some(arrival));}
+            // Semantic terminal consumption alone is not strict XY/yaw arrival.
+            // Replan only this original terminal, never replay earlier corners.
+            let end=window.intent.window().to().indices();let distance=window.to_distance;
+            let reference=self.ground_reference.as_ref().ok_or("Ground route owner retired")?;
+            let terminal=GroundFiniteWindow::new(reference,end,distance,self.ground_horizon())?;
+            self.progress=distance;self.ground_window=Some(terminal);
+        } else if binding.planned_join() {
+            let end=window.intent.window().to().indices();let distance=window.to_distance;
+            let reference=self.ground_reference.as_ref().ok_or("Ground route owner retired")?;
+            let next=GroundFiniteWindow::new(reference,end,distance,self.ground_horizon())?;
+            self.progress=distance;self.ground_window=Some(next);
+        }
+        self.ground_completed_binding=Some(binding);
+        self.admitted_generation=None;self.dirty=true;
+        // Retire work captured for the completed binding before using latest
+        // actual incoming with either the next or the retained partial window.
+        self.cancel_planning();
+        self.retry_after=Instant::now();
+        Ok(None)
+    }
+    fn step_ground_route(&mut self,width:f64)->PlannerStep {
+        let consumed=match self.controller.consume_ground_actual(None) {
+            Ok(consumed)=>consumed,Err(reason)=>return self.current_rejection(reason),
+        };
+        if matches!(consumed,GroundConsumption::LocalReferenceEnd {..}) {
+            match self.complete_ground_window() {Ok(Some(step))=>return step,Ok(None)=>{},Err(reason)=>return self.current_rejection(reason)}
+        }
+        if self.config.local_planning_enabled {
+            self.coalesce_pending_source();self.consume_plan();
+            if self.owner.as_ref().is_some_and(|owner|owner.faulted()) {
+                return PlannerStep::Failed("local planning owner terminated unexpectedly".into());
+            }
+            let moved=self.pose.as_ref().zip(self.local_start).is_some_and(|(pose,start)|
+                pose.pose.position.distance(start)>=self.scan.refresh_distance_m);
+            if self.dirty || moved {self.schedule(self.local_path.is_some() && self.admitted_generation.is_none());}
+        }else{self.consume_direct_ground_plan();}
+        if let Some(reason)=&self.permanent_fault {return PlannerStep::Failed(reason.clone());}
+        if let Some(reason)=&self.preparation_fault {return PlannerStep::ReplanRequired(reason.clone());}
+        if self.admitted_generation!=Some(self.route_generation) {
+            if let Some(reason)=&self.qualified_failure {return PlannerStep::ReplanRequired(reason.clone());}
+            self.wait_reason=Some("Ground 当前原窗口等待真实局部接续，保持零速".into());
+            return PlannerStep::Pending(self.local_failures.clone());
+        }
+        match self.controller.step_ground_internal(width,None) {
+            Ok(GroundControlStep::Control(PlannerStep::ReplanRequired(reason)))=>self.current_rejection(reason),
+            Ok(GroundControlStep::Control(step))=>step,
+            Ok(GroundControlStep::LocalReferenceEnd {..})=>match self.complete_ground_window() {
+                Ok(Some(step))=>step,Ok(None)=>PlannerStep::Pending(self.local_failures.clone()),
+                Err(reason)=>self.current_rejection(reason),
+            },
+            Err(reason)=>self.current_rejection(reason),
+        }
     }
     /// 已执行的全局路线弧长，不受近场轨迹替换重置。
     pub fn progress_m(&self) -> f64 {
@@ -151,6 +303,7 @@ impl RouteFollower {
         self.dirty = true;
     }
     fn advance_progress(&mut self) {
+        if self.ground_goal.is_some() {return;}
         let (Some(route), Some(pose)) = (&self.route, &self.pose) else {
             return;
         };
@@ -313,9 +466,14 @@ impl RouteFollower {
         // Resolve actual ground outside the owner exchange lock; geometry must
         // never run inside the pending-slot factory. The request remains lazy.
         let start_ground=self.controller.current_ground_query_owned().map(|(_,ground)|ground);
+        let ground=if self.ground_goal.is_some() {
+            let Some(ground)=self.capture_ground_input() else {return;};Some(ground)
+        }else{None};
         // No request construction until the original lock matches P.
-        let retired=owner.replace_pending_with_retired(pending_id,owner.epoch(),id,
-            ||self.planning_request(map,pose,route,detour,start_ground));
+        let retired=owner.replace_pending_with_retired(pending_id,owner.epoch(),id,||match ground {
+            Some(ground)=>self.ground_planning_request(map,pose,detour,start_ground,ground),
+            None=>self.planning_request(map,pose,route,detour,start_ground),
+        });
         if let Some(retired)=retired {
             self.record_submission(id,start,detour,Some(retired));
             // This updates the already queued slot, not the normal submit cadence.
@@ -334,7 +492,10 @@ impl RouteFollower {
         let Some(route)=&self.route else {return;};
         let Some(id)=self.next_request.checked_add(1) else {self.permanent_fault=Some("planning request IDs exhausted".into());return;};
         let start_ground=self.controller.current_ground_query_owned().map(|(_,ground)|ground);
-        let request=self.planning_request(map,pose,route,detour,start_ground);
+        let request=if self.ground_goal.is_some() {
+            let Some(ground)=self.capture_ground_input() else {return;};
+            self.ground_planning_request(map,pose,detour,start_ground,ground)
+        }else{self.planning_request(map,pose,route,detour,start_ground)};
         let start=pose.pose.position;
         if let Some(retired)=self.owner.as_ref().unwrap().submit_with_retired(id,request) {
             if self.record_submission(id,start,detour,retired) {
@@ -351,7 +512,7 @@ impl RouteFollower {
         // for a global path here would stop this owner and cancel that same job.
         let local_recovery = self.config.local_planning_enabled
             && self.owner.as_ref().is_some_and(|owner| !owner.faulted())
-            && self.route.is_some() && self.goal.is_some() && self.map.is_some()
+            && self.route.is_some() && (self.goal.is_some() || self.ground_goal.is_some()) && self.map.is_some()
             && self.pose.as_ref().is_some_and(|pose| nuwax_nav_pct::inside_boundary(
                 [pose.pose.position.x, pose.pose.position.y], &self.boundary))
             && self.preparation_fault.is_none() && self.permanent_fault.is_none()
@@ -384,8 +545,34 @@ impl RouteFollower {
                 (Some(proof),Ok(candidate)) => !proof.permits_path(map,&candidate.path),
                 _ => !nuwax_nav_pct::same_source_geometry(map,&request.source),
             }) {self.dirty=true;return;}
+        if self.ground_goal.is_some() && request.ground.as_ref().is_none_or(|ground|
+            self.ground_window.as_ref().is_none_or(|window|!window.intent.same_intent(&ground.intent))) {
+            self.dirty=true;return;
+        }
         match result.outcome {
             Ok(candidate)=> {
+                if self.ground_goal.is_some() {
+                    let elapsed_ms=candidate.elapsed_ms;
+                    let partial=candidate.partial;
+                    let covered_end=if candidate.ground_binding.as_ref().is_some_and(|binding|binding.planned_join()) {
+                        request.end
+                    } else {request.progress};
+                    match self.admit_ground_plan(&request,candidate) {
+                        Ok(())=>{
+                            tracing::info!(target:"navigation.scan",event="navigation.scan.candidate_admitted",
+                                elapsed_ms,request_id=completion.id,partial,covered_end,requested_end=request.end,
+                                "Ground geometry candidate admitted; current guard remains authoritative");
+                        },
+                        Err(reason)=> {
+                            let fresh=self.map.as_ref().is_some_and(|map|map.same_body_query_view(&request.source))
+                                && self.pose.as_ref().is_some_and(|pose|pose.frame_id==request.pose.frame_id
+                                    && pose_bits(body(pose))==pose_bits(body(&request.pose)));
+                            if fresh {self.qualified_failure=Some(reason.clone());}
+                            self.local_failures=vec![reason.into()];self.dirty=true;
+                        },
+                    }
+                    return;
+                }
                 if request.end+1e-6<self.progress {self.dirty=true;return;}
                 let covered_end=if candidate.partial {
                     if self.config.motion_limits.is_none() {self.dirty=true;return;}
@@ -446,6 +633,58 @@ impl RouteFollower {
 
 }
 impl NavPlanner for RouteFollower {
+    fn configure_execution_goal(&mut self,goal:&ExecutionGoal,options:GoalOptions,
+        initial:Option<GroundInitialCapture>)->Result<(),RuntimeError> {
+        match goal {
+            ExecutionGoal::Body(body)=> {
+                if initial.is_some() {return Err(error("Body goal cannot install a Ground initial capture"));}
+                self.configure_goal(body,options)
+            },
+            ExecutionGoal::Ground(ground)=> {
+                goal.validate()?;
+                if self.config.local_planning_enabled {self.planner.clear_local_costs();}
+                let restored=initial.as_ref().and_then(|capture|capture.actual().navigation.as_ref())
+                    .and_then(crate::replan_feedback::GroundActualBasis::completed_original_window);
+                self.controller.configure_execution_goal(goal,options,initial)?;
+                self.revoke_local_admission();self.route=None;self.goal=None;
+                self.ground_goal=Some(ground.clone());self.ground_reference=None;
+                self.ground_window=None;self.ground_completed_binding=None;self.ground_restore_window=restored;
+                self.options=options;self.progress=0.0;self.progress_pose=None;
+                Ok(())
+            },
+        }
+    }
+    fn consume_initial_actual_for_planning(&mut self)->Result<(),RuntimeError> {
+        self.controller.consume_initial_actual_for_planning()
+    }
+    fn replace_typed_execution_path(&mut self,path:ExecutionPath,yaws:Option<Vec<f64>>,
+        goal:ExecutionGoal)->Result<(),RuntimeError> {
+        match (path,goal) {
+            (path,ExecutionGoal::Body(goal))=>self.replace_execution_path(path,yaws,goal),
+            (ExecutionPath::Ground(path),ExecutionGoal::Ground(goal))=> {
+                ExecutionGoal::Ground(goal.clone()).validate()?;
+                if yaws.is_some() || path.body_guidance.poses.is_empty() {
+                    return Err(error("Ground route is empty or has a second yaw source"));
+                }
+                if !goal.matches_reference(&path.reference) {return Err(error("Ground route target differs from the typed goal"));}
+                if self.ground_goal.as_ref()!=Some(&goal) {return Err(error("Ground route has no matching configured typed goal"));}
+                for pose in &path.body_guidance.poses {crate::validate_map_pose(pose,"ground.route.payload")?;}
+                let full=path.reference.full_window().ok_or_else(||error("Ground route has no original address"))?;
+                let from=self.ground_restore_window.as_ref().map(|window|window.window()).filter(|window|
+                    window.to().window_to(full.from()).is_some()).map_or(full.from().indices(),|window|window.to().indices());
+                let window=GroundFiniteWindow::new(&path.reference,from,0.0,self.ground_horizon()).map_err(error)?;
+                // Capture/consume was installed by the worker after its original
+                // map/pose inputs. Path acceptance never seeds actual from a winner.
+                self.revoke_local_admission();self.goal=None;
+                self.ground_reference=Some(path.reference);self.ground_window=Some(window);
+                self.ground_completed_binding=None;self.ground_restore_window=None;self.route=Some(Arc::new(path.body_guidance));
+                self.cumulative=Arc::new(Vec::new());self.progress=0.0;self.progress_pose=None;
+                self.local_end=0.0;self.local_progress_at_plan=0.0;self.dirty=true;
+                Ok(())
+            },
+            (_,ExecutionGoal::Ground(_))=>Err(error("Ground execution requires its typed navigation reference")),
+        }
+    }
     fn refresh_execution_context(&mut self, applied: Twist2) -> Option<Arc<crate::replan_feedback::ActualExecutionContext>> {
         // Do not schedule/consume a route job while recovering without a path.
         self.controller.refresh_execution_context(applied)
@@ -480,6 +719,7 @@ impl NavPlanner for RouteFollower {
         self.controller.configure_goal(goal, options)?;
         self.revoke_local_admission();
         self.route = None;
+        self.ground_goal=None;self.ground_reference=None;self.ground_window=None;self.ground_completed_binding=None;self.ground_restore_window=None;
         self.options = options;
         self.goal = Some(goal.clone());
         Ok(())
@@ -520,6 +760,7 @@ impl NavPlanner for RouteFollower {
         }
         self.cumulative=Arc::new(cumulative);
         self.route = Some(Arc::new(route));
+        self.ground_goal=None;self.ground_reference=None;self.ground_window=None;self.ground_completed_binding=None;self.ground_restore_window=None;
         self.goal = Some(goal);
         self.progress = 0.0;
         self.progress_pose = None;
@@ -605,7 +846,12 @@ impl NavPlanner for RouteFollower {
             self.local_failures=vec!["local planning owner terminated unexpectedly".into()];
             return PlannerStep::Failed(self.local_failures[0].to_string());
         }
+        if let Err(reason)=self.consume_initial_actual_for_planning() {
+            self.wait_reason=Some(reason.to_string());
+            return PlannerStep::Pending(Vec::new());
+        }
         if self.route.is_none() { return PlannerStep::Pending(Vec::new()); }
+        if self.ground_goal.is_some() {return self.step_ground_route(width);}
         if self
             .map
             .as_ref()
@@ -679,6 +925,7 @@ impl NavPlanner for RouteFollower {
         self.controller.stop();
         self.route = None;
         self.goal = None;
+        self.ground_goal=None;self.ground_reference=None;self.ground_window=None;self.ground_completed_binding=None;self.ground_restore_window=None;
         self.cumulative=Arc::new(Vec::new());
         self.progress = 0.0;
         self.progress_pose = None;

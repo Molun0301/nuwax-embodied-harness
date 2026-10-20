@@ -223,7 +223,7 @@ fn control_validate_edge(
     query:&SurfaceBodyQueryView,from:BodyPose,to:BodyPose,ground:&BodyGroundState,
     navigation:Option<GroundWalkState<'_>>,boundary:&[[f64;2]],
 )->Result<(),BodyMotionFailure> {
-    control_validate_edge_recorded(query,from,to,ground,navigation,boundary,None,None).map(|_|())
+    control_validate_edge_recorded(query,from,to,ground,navigation,boundary,None,None,None).map(|_|())
 }
 #[allow(clippy::too_many_arguments)]
 fn control_validate_edge_recorded<'a>(
@@ -231,15 +231,19 @@ fn control_validate_edge_recorded<'a>(
     navigation:Option<GroundWalkState<'a>>,boundary:&[[f64;2]],
     recorded:Option<&mut Vec<nuwax_nav_pct::ground_route::GroundWalkSegment<'a>>>,
     cancelled:Option<&std::sync::atomic::AtomicBool>,
+    evidence:Option<&mut Option<nuwax_nav_mls_planner::surface::BodyGroundEvidence>>,
 )->Result<(BodyGroundState,Option<GroundWalkState<'a>>),BodyMotionFailure> {
     let mut witness=None;
     #[cfg(test)] if navigation.is_some() {count_navigation_walk();}
     let segment=navigation.map(|state|state.walk_xy([to.0[0],to.0[1]],boundary,cancelled)).transpose()
         .map_err(|error|BodyMotionFailure::Navigation(error.to_string()))?;
     let result=if let Some(segment)=&segment {
-        segment.with_body_navigation(|_,navigation|
-            query.validate_motion_with_navigation(from,to,ground,navigation,boundary,&mut witness))
-            .map_err(|error|BodyMotionFailure::Navigation(error.to_string()))?
+        segment.with_body_navigation(|_,navigation| {
+            if let Some(slot)=evidence {
+                query.validate_motion_with_navigation_and_evidence(from,to,ground,navigation,boundary,&mut witness)
+                    .map(|(state,observed)|{*slot=Some(observed);state})
+            }else {query.validate_motion_with_navigation(from,to,ground,navigation,boundary,&mut witness)}
+        }).map_err(|error|BodyMotionFailure::Navigation(error.to_string()))?
     }else {query.validate_motion_from_ground(from,to,ground,boundary,&mut witness)};
     let state=motion_failure(result,witness)?;
     let navigation=segment.as_ref().map(|segment|segment.end());
@@ -254,21 +258,33 @@ pub(super) fn validate_control_actual_pose(
     control_validate_edge(query,pose,pose,ground,navigation,boundary).map_err(|error|error.to_string())
 }
 
+pub(super) fn validate_control_actual_pose_with_evidence(
+    query:&SurfaceBodyQueryView,pose:BodyPose,ground:&BodyGroundState,
+    navigation:GroundWalkState<'_>,boundary:&[[f64;2]],
+)->Result<nuwax_nav_mls_planner::surface::BodyGroundEvidence,String> {
+    let mut evidence=None;
+    control_validate_edge_recorded(query,pose,pose,ground,Some(navigation),boundary,None,None,Some(&mut evidence))
+        .map_err(|error|error.to_string())?;
+    Ok(evidence.expect("navigation validation produced its selected-source evidence"))
+}
+
 /// Actual-only Initial transition. Reuse the same full-pose H3 edge and own
 /// its recorded end; predicted body height/state is deliberately discarded.
 pub(super) fn observe_initial_ground_actual(
     query:&SurfaceBodyQueryView,incoming:&nuwax_nav_pct::ground_route::OwnedGroundWalkState,
     from:BodyPose,to:BodyPose,physical:&BodyGroundState,boundary:&[[f64;2]],
     cancelled:Option<&std::sync::atomic::AtomicBool>,
-)->Result<nuwax_nav_pct::ground_route::OwnedGroundWalkState,String> {
+)->Result<(nuwax_nav_pct::ground_route::OwnedGroundWalkState,nuwax_nav_mls_planner::surface::BodyGroundEvidence),String> {
     if from==to {
-        validate_control_actual_pose(query,to,physical,Some(incoming.walk_state()),boundary)?;
-        return Ok(incoming.clone());
+        let evidence=validate_control_actual_pose_with_evidence(query,to,physical,incoming.walk_state(),boundary)?;
+        return Ok((incoming.clone(),evidence));
     }
     let mut recorded=Vec::with_capacity(1);
+    let mut evidence=None;
     control_validate_edge_recorded(query,from,to,physical,Some(incoming.walk_state()),boundary,
-        Some(&mut recorded),cancelled).map_err(|error|error.to_string())?;
-    incoming.recorded_successor(&recorded[0]).ok_or_else(||"initial actual walk changed owner".into())
+        Some(&mut recorded),cancelled,Some(&mut evidence)).map_err(|error|error.to_string())?;
+    let next=incoming.recorded_successor(&recorded[0]).ok_or("initial actual walk changed owner")?;
+    Ok((next,evidence.expect("recorded navigation validation produced evidence")))
 }
 
 pub(super) fn body(p: &PoseStamped) -> ([f64; 3], [f64; 4]) {
@@ -405,7 +421,7 @@ fn connection_endpoint_impl<'a>(map:&SurfaceSnapshot,query:&SurfaceBodyQueryView
         if !check() {return None;}
         #[cfg(test)] crate::control_profile::count(crate::control_profile::Counter::ConnectionSubsteps);
         let (ground,navigation)=control_validate_edge_recorded(query,from,from,ground,navigation,
-            boundary,recording.as_deref_mut().map(|r|&mut r.segments),cancelled).ok()?;
+            boundary,recording.as_deref_mut().map(|r|&mut r.segments),cancelled,None).ok()?;
         recording.as_deref_mut().unwrap().poses.push(from);
         return Some((from,ground,navigation));
     }
@@ -746,12 +762,27 @@ impl SurfaceFollower {
         }
         query.start_ground_state(body(pose)).map_err(|error|error.to_string())
     }
+    pub(super) fn ground_state_evidence_at_actual_pose(&self,query:&SurfaceBodyQueryView,
+        pose:&PoseStamped,same_ground_source:bool)
+        ->Result<(BodyGroundState,nuwax_nav_mls_planner::surface::BodyGroundEvidence),String> {
+        if same_ground_source {
+            if let Some((previous,Ok(ground)))=&self.actual_ground {
+                if previous==&pose.pose {
+                    if let Some(evidence)=&self.actual_ground_evidence {return Ok((ground.clone(),evidence.clone()));}
+                }
+                let q=previous.orientation;
+                return query.observe_actual_ground_with_evidence((xyz(previous.position),[q.x,q.y,q.z,q.w]),
+                    ground,body(pose)).map_err(|error|error.to_string());
+            }
+        }
+        query.start_ground_state_with_evidence(body(pose)).map_err(|error|error.to_string())
+    }
     /// 只读入口也必须使用当前来源和实际位姿；一次调用内绑定后跨全部采样复用。
     /// setters 的延迟刷新不能使直接复核读到旧障碍答案或旧起始地面层。
     pub(crate) fn current_ground_query_owned(&self)->Result<(SurfaceBodyQueryView,BodyGroundState),String> {
         let source=self.source_map.as_ref().ok_or("缺少当前机体几何来源")?;
         let pose=self.odometry.as_ref().ok_or("缺少实际位姿")?;
-        let same_ground_source=self.body_query.as_ref().is_some_and(|query|query.same_ground_source(source));
+        let same_ground_source=self.same_actual_ground_source(source);
         let matching=self.body_query.as_ref().filter(|query|query.same_body_query_view(source));
         let query=matching.cloned().unwrap_or_else(||source.body_query());
         let ground=self.ground_state_at_actual_pose(&query,pose,same_ground_source)?;
@@ -1518,7 +1549,7 @@ impl SurfaceFollower {
         // A current-state check's freshly derived view remains valid for the
         // next step; source/pose setters still invalidate it normally.
         let saved_view=(!current_state).then(||(self.map.clone(),self.body_view_dirty,
-            self.body_query.clone(),self.actual_ground.clone()));
+            self.body_query.clone(),self.actual_ground.clone(),self.actual_ground_evidence.clone(),self.actual_ground_carry_intact));
         let saved_command=self.last_command;
         self.last_command=selected.current;
         self.body_view_dirty=true;
@@ -1532,8 +1563,9 @@ impl SurfaceFollower {
             (valid,last_failure.take(),bound)
         });
         self.odometry=saved_pose;
-        if let Some((map,dirty,query,ground))=saved_view {
+        if let Some((map,dirty,query,ground,evidence,carry))=saved_view {
             self.map=map;self.body_view_dirty=dirty;self.body_query=query;self.actual_ground=ground;
+            self.actual_ground_evidence=evidence;self.actual_ground_carry_intact=carry;
         }
         self.last_command=saved_command;
         match checked {

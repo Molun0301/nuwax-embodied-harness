@@ -2352,7 +2352,8 @@ where
                         let session = nuwax_nav_runtime::NavSession {
             boundary: buffered_goal.boundary_points.iter().map(|p|[p[0],p[1]]).collect(),
             options: buffered_goal.options,
-                            goal_pose: pose_from_schema(&buffered_goal.goal)?,
+                            goal: nuwax_nav_runtime::ExecutionGoal::Body(pose_from_schema(&buffered_goal.goal)?),
+                            ground_initial: None,
                             session_id: session_id.clone(),
                             execution_identity: guarded_goal_execution_identity(&buffered_goal),
                             local_owner_runtime_generation: process_runtime_generation,
@@ -2647,7 +2648,8 @@ async fn activate_guarded_goal(
         .start_session(nuwax_nav_runtime::NavSession {
             boundary: goal_envelope.boundary_points.iter().map(|p|[p[0],p[1]]).collect(),
             options: goal_envelope.options,
-            goal_pose: pose_from_schema(&goal_envelope.goal)?,
+            goal: nuwax_nav_runtime::ExecutionGoal::Body(pose_from_schema(&goal_envelope.goal)?),
+            ground_initial: None,
             session_id: goal_envelope.session_id.clone(),
             execution_identity: guarded_goal_execution_identity(&goal_envelope),
             local_owner_runtime_generation: runtime_generation(),
@@ -9772,7 +9774,8 @@ mod guarded_tests {
             .start_session(nuwax_nav_runtime::NavSession {
             boundary: Vec::new(),
             options: Default::default(),
-                goal_pose: pose_from_schema(&blocker.goal).expect("valid goal pose"),
+                goal: nuwax_nav_runtime::ExecutionGoal::Body(pose_from_schema(&blocker.goal).expect("valid goal pose")),
+                ground_initial: None,
                 session_id: blocker.session_id.clone(),
                 execution_identity: guarded_goal_execution_identity(&blocker),
                 local_owner_runtime_generation: runtime_generation(),
@@ -10768,7 +10771,8 @@ mod guarded_tests {
             .start_session(nuwax_nav_runtime::NavSession {
             boundary: Vec::new(),
             options: Default::default(),
-                goal_pose: pose_from_schema(&goal_a.goal).expect("valid goal pose"),
+                goal: nuwax_nav_runtime::ExecutionGoal::Body(pose_from_schema(&goal_a.goal).expect("valid goal pose")),
+                ground_initial: None,
                 session_id: goal_a.session_id.clone(),
                 execution_identity: guarded_goal_execution_identity(&goal_a),
                 local_owner_runtime_generation: runtime_generation(),

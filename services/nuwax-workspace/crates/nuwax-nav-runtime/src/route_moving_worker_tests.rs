@@ -342,6 +342,7 @@ impl NavPlanner for Measured {
             held_before,held_after,held_phase_before,held_phase_after,
             outcome:match &result {PlannerStep::Command(v)=>if nonzero(*v){"command_nonzero"}else{"command_zero"},
                 PlannerStep::Pending(_)=>"pending",PlannerStep::Succeeded=>"succeeded",
+                PlannerStep::GroundArrival(_)=>"unsupported_ground_arrival",
                 PlannerStep::ReplanRequired(_)=>"replan_required",PlannerStep::Failed(_)=>"failed"}};
         // One existing stats lock after the measured step. New records never
         // reallocate; overflow is visible and cannot silently qualify a run.
@@ -815,6 +816,7 @@ fn run_with_source_layout(enabled:bool,resolution:f32,scenario:Scenario,factory:
         let before=command;command=match result {
             PlannerStep::Command(v) if permitted_until>receipt_at&&!dispatch_expired=>{accepted+=1;if nonzero(v){if dispatch_bound.is_some(){consumer_waits.finite_bound_nonzero+=1;}else{consumer_waits.unbounded_nonzero+=1;}nonzero_count+=1;if held.load(Ordering::Acquire)&&frames>hold_frame_count&&hold_start.is_some_and(|start|now.duration_since(start)>DEFAULT_CONTROL_HORIZON+PERIOD){held_nonzero+=1;}}v},
             PlannerStep::Succeeded=>{succeeded=true;Twist2::ZERO},
+            PlannerStep::GroundArrival(_)=>panic!("Ground arrival is unsupported in this Body-only worker qualification"),
             negative @ (PlannerStep::ReplanRequired(_)|PlannerStep::Failed(_))=>{
                 expected_current_rejection=changed&&matches!(scenario,Scenario::ReplaceBoundary|Scenario::ReplaceGeometry)
                     &&matches!(&negative,PlannerStep::ReplanRequired(_));

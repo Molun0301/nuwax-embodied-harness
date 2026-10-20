@@ -78,6 +78,13 @@ fn fixed_go2_model()->SurfaceBodyEnvelope {
 
 fn scene(step:i32,high_member:bool)->SurfaceSnapshot {scene_with_roughness(step,high_member,0)}
 
+// Shared by the original actual-support and navigation-support controls and D03.
+// This is the same admitted step fixture and the same measured pitch.
+fn tilted_support_fixture()->(SurfaceSnapshot,[f64;4]) {
+    let angle=0.5_f64;
+    (scene(3,false),[0.0,(angle*0.5).sin(),0.0,(angle*0.5).cos()])
+}
+
 fn scene_with_roughness(step:i32,high_member:bool,rough:i32)->SurfaceSnapshot {
     scene_with_counts(|x,y| {
         let z=if x>=0 {step}else{0};
@@ -348,8 +355,7 @@ fn native_height_survives_absent_direction_and_sparse_real_members() {
 
 #[test]
 fn native_projection_samples_offset_support_xy_and_preserves_real_tilt() {
-    let map=scene(3,false);let owner=map.body_query();
-    let angle=0.5_f64;let q=[0.0,(angle*0.5).sin(),0.0,(angle*0.5).cos()];
+    let (map,q)=tilted_support_fixture();let owner=map.body_query();
     let from=([0.075,0.025,0.5],q);
     let state=owner.start_ground_state(from).unwrap();
     let support=map.support_position_from_body(from.0,q,0.4).unwrap();
@@ -627,8 +633,7 @@ fn c1c1_native<'a>(map:&'a SurfaceSnapshot,xy:[i32;2])->NavigationGroundSample<'
 
 #[test]
 fn c1c1_navigation_selects_actual_support_column_and_preserves_bias() {
-    let map=scene(3,false);let owner=map.body_query();
-    let angle=0.5_f64;let q=[0.0,(angle*0.5).sin(),0.0,(angle*0.5).cos()];
+    let (map,q)=tilted_support_fixture();let owner=map.body_query();
     let selected=c1c1_native(&map,[1,0]);let decode=|_|selected;
     let navigation=BodyNavigationSegment::from_recorded(&map,[0.075,0.025],[0.275,0.025],&[],&decode);
     // A real prior state on the upper side must not be subtracted from the new
@@ -656,6 +661,89 @@ fn c1c1_navigation_selects_actual_support_column_and_preserves_bias() {
     let turn=owner.project_motion_with_navigation(from,&previous,[0.075,0.025],0.2,&stationary,&mut None).unwrap();
     assert_eq!(turn.pose().0,from.0);owner.validate_projected_motion(from,&turn,&[],&mut None).unwrap();
     assert_eq!(previous,saved);
+}
+
+#[test]
+fn d03_support_column_relation_is_source_owned() {
+    use crate::surface::body_query::BodyGroundSourceRelation;
+    let (map,q)=tilted_support_fixture();let owner=map.body_query();
+    let from=([0.075,0.025,0.5],q);
+    let (initial,actual_start)=owner.start_ground_state_with_evidence(from).unwrap();
+    assert_eq!(initial,owner.start_ground_state(from).unwrap());
+    let support=map.support_position_from_body(from.0,q,0.4).unwrap();
+    let xy=[support[0],support[1]];
+    let column=xy.map(|v|(v/f64::from(Q)).floor() as i32);
+    let support_record=map.observations().unwrap().ground_records(column).next().unwrap();
+    let selected=c1c1_native(&map,[1,0]);let decode=|_|selected;
+    let NavigationGroundSample::KnownNative{record:body_record,..}=selected else {unreachable!()};
+    assert!(support[0]<0.0 && from.0[0]>0.0);
+    assert_ne!(support_record.key(),body_record.key());
+    assert_eq!(initial.ground_key(),Some(support_record.key()));
+    assert_eq!(initial.height(),support_record.height_at(xy).unwrap());
+
+    // A body-centre record names the upper column. The original selection still
+    // resolves the physical support column, rather than extending that HF value.
+    let stationary=BodyNavigationSegment::from_recorded(&map,[0.075,0.025],[0.075,0.025],&[],&decode);
+    let navigation_start=owner.navigation_evidence_at(from,&initial,&stationary).unwrap();
+    assert_eq!(actual_start.relation_to(&navigation_start),BodyGroundSourceRelation::Same);
+
+    let navigation=BodyNavigationSegment::from_recorded(&map,[0.075,0.025],[0.275,0.025],&[],&decode);
+    let projection=owner.project_motion_with_navigation(from,&initial,[0.275,0.025],0.0,
+        &navigation,&mut None).unwrap();
+    let actual=projection.pose();
+    let (physical,nav_evidence)=owner.validate_motion_with_navigation_and_evidence(
+        from,actual,&initial,&navigation,&[],&mut None).unwrap();
+    let (observed,actual_evidence)=owner.observe_actual_ground_with_evidence(from,&initial,actual).unwrap();
+    assert_eq!(physical,owner.validate_motion_with_navigation(from,actual,&initial,&navigation,&[],&mut None).unwrap());
+    assert_eq!(observed,owner.observe_actual_ground(from,&initial,actual).unwrap());
+    assert_eq!(actual_evidence.relation_to(&nav_evidence),BodyGroundSourceRelation::Same);
+    assert_eq!(nav_evidence.relation_to(&actual_evidence),BodyGroundSourceRelation::Same);
+
+    // The same-height neighbouring source is real, but a different support XY
+    // does not allow a cross-column key comparison to prove Same or Different.
+    let other_pose=([actual.0[0],actual.0[1]+f64::from(Q),actual.0[2]],actual.1);
+    let (other,other_evidence)=owner.start_ground_state_with_evidence(other_pose).unwrap();
+    assert_eq!(other.height(),observed.height());assert_ne!(other.ground_key(),observed.ground_key());
+    assert_eq!(actual_evidence.relation_to(&other_evidence),BodyGroundSourceRelation::Unresolved);
+
+    // Equal public keys in a different original owner do not establish a match.
+    let fork=map.fork_for_planning();
+    let (copied_key,foreign)=fork.body_query().start_ground_state_with_evidence(actual).unwrap();
+    assert_eq!(copied_key.ground_key(),observed.ground_key());
+    assert!(!actual_evidence.same_source(&foreign));
+    assert_eq!(actual_evidence.relation_to(&foreign),BodyGroundSourceRelation::Unresolved);
+
+    // Original geometry compatibility survives a metadata-only observation
+    // refresh. Collision/observation freshness remains the caller's own input.
+    let mut metadata=map.observations().unwrap().as_ref().clone();metadata.set_source_timestamp_ns(21);
+    let refreshed=map.with_observations(Some(Arc::new(metadata)));
+    let (_,fresh)=refreshed.body_query().start_ground_state_with_evidence(actual).unwrap();
+    assert!(actual_evidence.same_source(&fresh));
+    assert_eq!(actual_evidence.relation_to(&fresh),BodyGroundSourceRelation::Same);
+
+    // A carried navigation scalar does not become an independent Known just
+    // because the physical lookup under it returned this same observed record.
+    let carried=|_|NavigationGroundSample::Carried{height:observed.height()};
+    let actual_xy=[actual.0[0],actual.0[1]];
+    let carried=BodyNavigationSegment::from_recorded(&map,actual_xy,actual_xy,&[],&carried);
+    let carried=owner.navigation_evidence_at(actual,&physical,&carried).unwrap();
+    assert!(!carried.is_direct());
+    assert_eq!(actual_evidence.relation_to(&carried),BodyGroundSourceRelation::Unresolved);
+
+    // The same original fixture crosses the real step before ending outside
+    // observed columns. Retaining its last key does not retain direct evidence.
+    let gap=([1.0,0.025,actual.0[2]],q);
+    let (unknown,gap_evidence)=owner.observe_actual_ground_with_evidence(from,&initial,gap).unwrap();
+    assert_eq!(unknown.query_state(),GroundQueryState::Unknown);
+    assert!(unknown.ground_key().is_some());assert_eq!(unknown.height(),observed.height());
+    assert!(!gap_evidence.is_direct());assert!(!gap_evidence.carry_intact());
+    assert_eq!(gap_evidence.relation_to(&gap_evidence),BodyGroundSourceRelation::Unresolved);
+    assert_eq!(unknown,owner.observe_actual_ground(from,&initial,gap).unwrap());
+    let beyond=([1.1,0.025,actual.0[2]],q);
+    let (_,pure_carry)=owner.observe_actual_ground_with_evidence(gap,&unknown,beyond).unwrap();
+    assert!(pure_carry.carry_intact());
+    eprintln!("D03 actual_support={xy:?} selected_body_key={:?} actual_key={:?} relation={:?}",
+        body_record.key(),support_record.key(),actual_evidence.relation_to(&nav_evidence));
 }
 
 #[test]

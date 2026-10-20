@@ -205,7 +205,7 @@ mod zero_goal_on_integration {
         }).await;
         response.await.unwrap().unwrap();
         let mut request = session();
-        request.goal_pose = goal.clone(); request.options = options;
+        request.goal = ExecutionGoal::Body(goal.clone()); request.options = options;
         scheduler.start_session(&status, request.clone()).await.unwrap();
         let mut versioned = path(); versioned.path = ExecutionPath::Surface(route.clone());
         scheduler.submit_path(&status, versioned).await.unwrap();

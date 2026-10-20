@@ -64,7 +64,7 @@ fn received_observations(mut writer: Writer, q: f32) -> (SurfaceObservations, Ob
 // Exact historical C1-c2 Direct points, q, model, start and goal. Initial fine
 // observations describe precisely those occupied keys, allowing an actual
 // metadata-only refresh instead of pretending a newly allocated Arc is one.
-fn c3_direct_source() -> (SurfaceSnapshot, ObservationBlocks) {
+pub(crate) fn c3_direct_source() -> (SurfaceSnapshot, ObservationBlocks) {
     let q = 0.1_f32;
     let mut writer = Writer::new(Repository::temporary().unwrap(), q, 4 * 1024 * 1024).unwrap();
     let keys: Vec<_> = (-15..20).flat_map(|x| (-8..15).map(move |y| [x, y, -1])).collect();
@@ -88,7 +88,7 @@ fn c3_direct_source() -> (SurfaceSnapshot, ObservationBlocks) {
 
 // Approved third C1-c2 fixture, unchanged: q=.05; lower member0/bin7;
 // upper member11/bin0 -> bin7 at x>=1. No fourth two-layer fixture.
-fn c3_bin_shift_source() -> SurfaceSnapshot {
+pub(crate) fn c3_bin_shift_source() -> SurfaceSnapshot {
     let q = 0.05_f32;
     let mut writer = Writer::new(Repository::temporary().unwrap(), q, 4 * 1024 * 1024).unwrap();
     let mut points = Vec::new();
@@ -129,15 +129,15 @@ fn c3_motion() -> MotionKinematics {
         max_reverse_mps: 0.0, max_lateral_mps: 0.0, max_angular_rps: 0.8,
         minimum_turning_radius_m: 0.0, can_rotate_in_place: true }
 }
-fn c3_config() -> SurfaceFollowerConfig {
+pub(crate) fn c3_config() -> SurfaceFollowerConfig {
     let mut config = SurfaceFollowerConfig::new(0.4);
     config.controller.simulation = true;
     config.basic_kinematics = Some(c3_motion());
     config
 }
-fn c3_start() -> BodyPose { ([-1.0, 0.2, 0.4], [0.0, 0.0, 0.0, 1.0]) }
+pub(crate) fn c3_start() -> BodyPose { ([-1.0, 0.2, 0.4], [0.0, 0.0, 0.0, 1.0]) }
 fn c3_xy_reference() -> Vec<[f64; 2]> { vec![[-1.0, 0.2], [0.1, 0.2]] }
-fn c3_stamped(body: BodyPose) -> PoseStamped {
+pub(crate) fn c3_stamped(body: BodyPose) -> PoseStamped {
     PoseStamped { frame_id: NavFrameId::Map, stamp: Timestamp::from_unix(1, 0),
         pose: Pose3 { position: Point3::new(body.0[0], body.0[1], body.0[2]),
             orientation: Quaternion { x: body.1[0], y: body.1[1], z: body.1[2], w: body.1[3] } } }
@@ -322,9 +322,7 @@ fn c3_request(source: Arc<SurfaceSnapshot>, route: &PlannedGroundRoute, generati
     PlanRequest {
         ground: Some(GroundPlanInput {
             incoming: window.from().continuation([start.0[0], start.0[1]]).unwrap(),
-            intent: GroundIntent::new(window, GroundRouteGoal {
-                xy: [0.1, 0.2], requested_ground_z: None,
-            }, route.points.last().unwrap().ground_z),
+            intent: GroundIntent::new(window),
             xy_reference: Arc::new(c3_xy_reference()), arrival_tolerance_m: Some(0.1),
         }),
         start_ground: source.body_query().start_ground_state(start).map_err(|error| error.to_string()),
@@ -571,7 +569,7 @@ fn c3_pose(x: f64, y: f64, yaw: f64) -> PoseStamped {
     pose.pose.orientation = Quaternion::from_yaw(yaw);
     pose
 }
-fn c3_limits() -> MotionLimits {
+pub(crate) fn c3_limits() -> MotionLimits {
     // Original runtime_ground_owner_* complete-stop calibration.
     MotionLimits { model: MotionModel::Differential, max_forward_mps: 0.5,
         max_reverse_mps: 0.0, max_lateral_mps: 0.0, max_angular_rps: 0.8,
@@ -838,12 +836,13 @@ fn c1c3_08_navigation_context_and_selected_basis_retire_together() {
     let pose = owner.odometry.as_ref().unwrap().clone();
     let actual = Arc::new(ActualExecutionContext { source: source.clone(), odometry: pose.clone(),
         ground: source.body_query().start_ground_state(body_control::body(&pose)).unwrap(),
-        navigation: owner.committed_ground_basis(), applied: Twist2::ZERO });
+        ground_evidence: None, navigation: owner.committed_ground_basis(), applied: Twist2::ZERO });
     let window = route.reference.full_window().unwrap();
     let goal = GroundRouteGoal { xy: [1.55, 1.05], requested_ground_z: None };
-    let input = SurfaceReplanInput { source: source.clone(), start: pose.clone(), goal: path.poses.last().unwrap().clone(),
+    let input = SurfaceReplanInput { source: source.clone(), start: pose.clone(), goal: crate::ExecutionGoal::Ground(crate::GroundExecutionGoal {frame_id:pose.frame_id,xy:goal.xy,
+            yaw:0.0,requested_ground_z:goal.requested_ground_z}),
         options: GoalOptions::default(), boundary: Arc::new(vec![]), actual: Some(actual.clone()),
-        ground_intent: Some(GroundIntent::new(window, goal, None)), limits: SearchLimits::default(),
+        ground_intent: Some(GroundIntent::new(window)), limits: SearchLimits::default(),
         offset: 0.3, local_planning_enabled: true, penalties: Arc::new(vec![]) };
     let mut memo = SuccessfulReplanMemo::default();
     memo.published(7, input.clone());
@@ -856,16 +855,17 @@ fn c1c3_08_navigation_context_and_selected_basis_retire_together() {
     changed.actual = Some(Arc::new(shifted.clone()));
     assert!(!input.same_complete_input(&changed));
     assert!(!memo.should_reuse(Some((&7, &shifted)), &changed));
-    for (requested, resolved) in [(Some(0.0), None), (None, Some(0.0))] {
-        let mut changed = input.clone();
-        changed.ground_intent = Some(GroundIntent::new(window,
-            GroundRouteGoal { requested_ground_z: requested, ..goal }, resolved));
-        assert!(!input.same_complete_input(&changed));
-        assert!(!memo.should_reuse(Some((&7, &actual)), &changed));
-    }
+    let mut changed_height = input.clone();
+    if let crate::ExecutionGoal::Ground(goal)=&mut changed_height.goal { goal.requested_ground_z=Some(0.0); }
+    assert!(!input.same_complete_input(&changed_height));
+    assert!(!memo.should_reuse(Some((&7, &actual)), &changed_height));
+    // Resolved height is now derived from the immutable original owner, not a
+    // second mutable intent field that could contradict its source recording.
+    assert_eq!(input.ground_intent.as_ref().unwrap().resolved_ground_z(),
+        route.reference.target_sample().and_then(|sample|sample.point.ground_z));
     let connector = window.from().window_to(window.from()).unwrap();
     let mut changed = input.clone();
-    changed.ground_intent = Some(GroundIntent::new(connector, goal, None));
+    changed.ground_intent = Some(GroundIntent::new(connector));
     assert!(!input.same_complete_input(&changed));
     assert!(!memo.should_reuse(Some((&7, &actual)), &changed));
     // Same predicates used by FailedLocalPlan: no private cache state is exposed
@@ -1729,7 +1729,7 @@ fn c1c4_08_rolling_lifecycle_and_source_keep_body_compatibility() {
     let committed = owner.committed_ground_basis().unwrap();
     let pose = owner.odometry.as_ref().unwrap().clone();
     let context = ActualExecutionContext { source: source.clone(), odometry: pose.clone(),
-        ground: owner.current_ground_query_owned().unwrap().1, navigation: Some(committed.clone()), applied: Twist2::ZERO };
+        ground: owner.current_ground_query_owned().unwrap().1, ground_evidence:None, navigation: Some(committed.clone()), applied: Twist2::ZERO };
     let xy = [pose.pose.position.x, pose.pose.position.y];
     let mut changed = context.clone();
     changed.navigation = Some(GroundActualBasis::new(rolling.clone(), 0, 0.25, xy));
@@ -1961,7 +1961,7 @@ fn i02_initial_context_never_pairs_new_pose_with_old_navigation() {
     let original=owner.initial_ground_for_test().unwrap();
     let route=owner.config.pct.ground_route_from_start(&source,c3_start(),&seed,
         GroundRouteGoal {xy:[0.1,0.2],requested_ground_z:None},0.0,&[],None,None,SearchLimits::default(),&[]).unwrap();
-    let intent=GroundIntent::new(route.reference.full_window().unwrap(),route.reference.original_goal(),route.height.resolved_ground_z);
+    let intent=GroundIntent::new(route.reference.full_window().unwrap());
     let mut last=None;
     for x in [-0.95,-0.90] {
         let actual=c3_stamped(([x,0.2,0.4],c3_start().1));owner.update_odometry(actual.clone());
@@ -1971,7 +1971,7 @@ fn i02_initial_context_never_pairs_new_pose_with_old_navigation() {
     }
     let context=last.unwrap();
     assert!(GroundPlanInput::from_actual(&context,intent.clone(),Arc::new(c3_xy_reference()),Some(0.1)).is_none());
-    let input=SurfaceReplanInput {source:source.clone(),start:context.odometry.clone(),goal:c3_stamped(([0.1,0.2,0.4],c3_start().1)),
+    let input=SurfaceReplanInput {source:source.clone(),start:context.odometry.clone(),goal:crate::ExecutionGoal::Body(c3_stamped(([0.1,0.2,0.4],c3_start().1))),
         options:nuwax_nav_types_messages::GoalOptions::default(),boundary:Arc::new(vec![]),actual:Some(context.clone()),ground_intent:Some(intent),
         limits:SearchLimits::default(),offset:0.4,local_planning_enabled:true,penalties:Arc::new(vec![])};
     assert!(!input.same_complete_input(&input));let mut body=input.clone();body.ground_intent=None;
@@ -2166,4 +2166,688 @@ fn i08_initial_candidate_stationary_lifecycle_keeps_body() {
     let to=[-0.95,0.2];let expected=query.project_motion(c3_start(),&physical,to,0.0,&mut None).unwrap();
     let (actual,walks)=body_control::capture_navigation_walks(||body_control::control_project_edge(&query,c3_start(),&physical,None,to,0.0,&[],body_control::ControlEdgeProfile::Preview));
     let actual=actual.unwrap();assert_eq!(actual.body.pose,expected.pose());assert!(actual.navigation.is_none());assert_eq!(walks,0);
+}
+
+// D1 appended qualification only. Append after the existing C1-c3/c4/c5 tests.
+// NOT BUILT / NOT LISTED / NOT RUN. Existing helpers and fixtures remain intact.
+
+fn d1_goal(xy: [f64; 2], requested_ground_z: Option<f64>) -> crate::ExecutionGoal {
+    crate::ExecutionGoal::Ground(crate::GroundExecutionGoal {
+        frame_id: NavFrameId::Map, xy, yaw: 0.0, requested_ground_z,
+    })
+}
+fn d1_options() -> nuwax_nav_types_messages::GoalOptions {
+    nuwax_nav_types_messages::GoalOptions {
+        position_tolerance_m: 0.0, yaw_tolerance_rad: 0.0, allow_reverse: false,
+    }
+}
+fn d1_initial_capture(source: Arc<SurfaceSnapshot>, actual: BodyPose,
+    basis: nuwax_nav_pct::ground_route::OwnedGroundWalkState) -> crate::GroundInitialCapture {
+    let mut observer = SurfaceFollower::new(c3_config()).unwrap();
+    observer.update_execution_map(ExecutionMap::Surface(source)).unwrap();
+    observer.update_odometry(c3_stamped(actual));
+    let context = observer.refresh_execution_context(Twist2::ZERO).unwrap();
+    assert!(context.navigation.is_none());
+    crate::GroundInitialCapture::from_actual(basis, context).unwrap()
+}
+fn d1_typed_initial(source: Arc<SurfaceSnapshot>, actual: BodyPose,
+    height: Option<f64>, goal: crate::ExecutionGoal) -> SurfaceFollower {
+    let prepared = PctPlanner::default().prepare_ground_start(&source,
+        GroundRouteStart { xy: [actual.0[0], actual.0[1]], ground_z: height }, None).unwrap();
+    d1_captured_owner(source, actual, prepared.basis().clone(), goal)
+}
+fn d1_captured_owner(source: Arc<SurfaceSnapshot>, actual: BodyPose,
+    basis: nuwax_nav_pct::ground_route::OwnedGroundWalkState, goal: crate::ExecutionGoal) -> SurfaceFollower {
+    let capture = d1_initial_capture(source.clone(), actual, basis);
+    let mut owner = SurfaceFollower::new(c3_config()).unwrap();
+    owner.configure_execution_goal(&goal, d1_options(), Some(capture)).unwrap();
+    owner.update_execution_map(ExecutionMap::Surface(source)).unwrap();
+    owner.update_odometry(c3_stamped(actual));
+    owner.consume_initial_actual_for_planning().unwrap();
+    owner
+}
+fn d1_input(actual: Arc<crate::replan_feedback::ActualExecutionContext>,
+    goal: crate::ExecutionGoal, penalties: Vec<nuwax_nav_pct::RoutePenalty>)
+    -> crate::replan_feedback::SurfaceReplanInput {
+    crate::replan_feedback::SurfaceReplanInput {
+        source: actual.source.clone(), start: actual.odometry.clone(), goal,
+        options: d1_options(), boundary: Arc::new(vec![]), actual: Some(actual),
+        ground_intent: None, limits: SearchLimits::default(), offset: 0.4,
+        local_planning_enabled: true, penalties: Arc::new(penalties),
+    }
+}
+fn d1_path(route: &PlannedGroundRoute) -> crate::ExecutionPath {
+    crate::ExecutionPath::Ground(crate::GroundExecutionPath {
+        reference: route.reference.clone(),
+        body_guidance: Path3D { poses: route.guide_body_poses.iter().copied().map(c3_stamped).collect() },
+    })
+}
+fn d1_relation(owner: &mut SurfaceFollower) -> nuwax_nav_types_messages::GroundLayerResult {
+    owner.refresh_execution_context(Twist2::ZERO).unwrap().ground_evidence.as_ref()
+        .expect("typed owner publishes actual source evidence").relation
+}
+fn d1_consume_fraction(owner: &mut SurfaceFollower, path: &Path3D, edge: usize, fraction: f64) {
+    for pose in path.poses.iter().take(edge + 1).skip(1) {
+        owner.update_odometry(pose.clone()); owner.consume_ground_actual(None).unwrap();
+    }
+    let actual = c4_fractional_actual(path, edge, fraction, 0.001, 0.0);
+    owner.update_odometry(actual); owner.consume_ground_actual(None).unwrap();
+}
+
+// Panic cleanup cancels the real scheduler task; normal teardown awaits its
+// original shutdown/drop, which in turn joins PlannerWorker/PlanningOwner.
+struct D1SpawnCleanup(Option<tokio::task::JoinHandle<Result<(), crate::RuntimeError>>>);
+impl Drop for D1SpawnCleanup {
+    fn drop(&mut self) { if let Some(task) = self.0.take() { task.abort(); } }
+}
+async fn d1_handle_round_trip(owner: &mut SurfaceFollower, goal: crate::ExecutionGoal,
+    penalties: Vec<nuwax_nav_pct::RoutePenalty>, expect_search: bool) -> PlannedGroundRoute {
+    use crate::tests::ground_arrival_qualification::observed_worker;
+    let before = owner.refresh_execution_context(Twist2::ZERO).unwrap();
+    let incoming = before.navigation.as_ref().unwrap().continuation().unwrap();
+    let key = incoming.semantic_key();
+    let cursor = owner.ground_cursor();
+    let capture = crate::GroundInitialCapture::from_actual(incoming, before.clone()).unwrap();
+    let (worker, audit, dropped) = observed_worker(c3_config());
+    let motion = crate::tests::FakeMotion(Arc::new(std::sync::Mutex::new(
+        crate::tests::FakeMotionState::default())));
+    let (handle, task) = crate::spawn_scheduler(crate::NavScheduler::new(
+        motion, worker, crate::SchedulerConfig::default()).unwrap());
+    let mut cleanup = D1SpawnCleanup(Some(task));
+    handle.update_costmap(crate::CostmapObservation { costmap: ExecutionMap::Surface(before.source.clone()),
+        source_timestamp_ns: 1 }).await.unwrap();
+    handle.update_odometry(before.odometry.clone()).await.unwrap();
+    let mut session = crate::tests::session_for("d01-consumed");
+    session.goal = goal.clone(); session.options = d1_options(); session.ground_initial = Some(capture);
+    let identity = session.execution_identity.clone();
+    handle.start_session(session).await.unwrap();
+    let published = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(actual) = handle.capture_planning_actual(identity.clone()).await.unwrap() {
+                break actual;
+            }
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("real handle must publish the consumed Initial without a fake path identity");
+    assert!(crate::replan_feedback::same_pose(&published.odometry, &before.odometry));
+    assert_eq!(published.navigation.as_ref().unwrap().continuation().unwrap().semantic_key(), key);
+    assert!(audit.lock().unwrap().snapshots.is_empty(), "publication must precede any local winner");
+    let input = d1_input(published, goal, penalties);
+    let route = input.compute_ground_route(&PctPlanner::default(), None, None)
+        .expect("fixed consumed global request must remain feasible");
+    let root = route.reference.full_window().unwrap().from().walk_state();
+    assert_eq!(root.semantic_key(), key, "continued root retains source, original sample and actual XY");
+    if expect_search {
+        assert!(route.stats.expanded > 0, "the fixed nonempty penalty must enter the same original search");
+        assert!(route.reference.connections().next().is_some(), "recorded root prefix survives reduction");
+    }
+    for pair in route.guide_body_poses.windows(2) {
+        before.source.body_query().validate_unanchored_motion(pair[0], pair[1], &[], &mut None).unwrap();
+    }
+    assert_eq!(owner.ground_cursor(), cursor);
+    assert_eq!(owner.refresh_execution_context(Twist2::ZERO).unwrap().navigation.as_ref()
+        .unwrap().continuation().unwrap().semantic_key(), key, "planning never commits the original actual owner");
+    let mut versioned = crate::tests::path_for("d01-consumed", 1);
+    versioned.path = d1_path(&route);
+    handle.submit_path(versioned).await.unwrap();
+    let snapshot_result = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(snapshot) = audit.lock().unwrap().snapshots.last().cloned() { break snapshot; }
+            assert!(handle.status().last_terminal.is_none(), "a terminal failure is not a real admission");
+            tokio::task::yield_now().await;
+        }
+    }).await;
+    if snapshot_result.is_err() {
+        let observed = { audit.lock().unwrap().clone() };
+        eprintln!("D01 fixed admission diagnostic actual={:?} target={:?} route={:?} requests={:?} admissions={} snapshots={} commands={:?} events={} status={:?}",
+            before.odometry, input.goal, route.guide_body_poses, observed.requests, observed.admissions.len(),
+            observed.snapshots.len(), observed.commands, observed.events.len(), handle.status());
+    }
+    let snapshot = snapshot_result.expect("typed VersionedPath must reach real RouteFollower/PlanningOwner/Scan");
+    {
+        let observed = { audit.lock().unwrap().clone() };
+        assert!(!observed.requests.is_empty());
+        assert!(observed.requests.iter().all(|(_, ticket, ground)| ticket.is_some() && *ground));
+        assert!(!observed.overflow);
+        assert!(observed.events.is_empty());
+        assert_eq!(observed.body_successes, 0);
+    }
+    assert_eq!(snapshot.path.poses.len(), snapshot.binding.edges().len() + 1);
+    for (edge, pair) in snapshot.path.poses.windows(2).enumerate() {
+        assert_eq!(snapshot.binding.edges()[edge].motion(),
+            [body_control::body(&pair[0]), body_control::body(&pair[1])]);
+    }
+    let (edge, fraction) = snapshot.cursor.expect("real admitted owner has a cursor");
+    for consumed in snapshot.binding.edges().iter().take(edge) {
+        assert_eq!(consumed.motion()[0], consumed.motion()[1],
+            "without odometry movement only real zero-motion semantic edges may be consumed");
+    }
+    if let Some(current) = snapshot.binding.edges().get(edge) {
+        assert!(fraction == 0.0 || current.motion()[0] == current.motion()[1],
+            "admission and planned coverage cannot consume nonzero actual motion");
+    }
+    assert_eq!(snapshot.binding.original_window().owner().original_goal().requested_ground_z,
+        route.reference.original_goal().requested_ground_z);
+    handle.cancel("d01-consumed").await.unwrap();
+    handle.shutdown().await.unwrap();
+    cleanup.0.take().unwrap().await.unwrap().unwrap();
+    assert!(dropped.load(std::sync::atomic::Ordering::Acquire));
+    route
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn d01_typed_ground_route_reaches_real_planning_owner() {
+    use nuwax_nav_pct::ground_route::PlannedGroundAssociation as A;
+    // Factory origin retains the old root mode. This is an existing exact
+    // numerical comparison, called inside D01 rather than adding a selector.
+    i07_prepared_start_and_original_target_keep_presence();
+    let (source, _) = c3_direct_source();
+    let q = f64::from(source.source_voxel_size_m());
+    let (mut known, _, path, _) = c3_install(Arc::new(source), c3_start(), [0.1, 0.2], Some(0.0), c3_config());
+    let edge = c4_first_motion(&path);
+    d1_consume_fraction(&mut known, &path, edge, 0.5);
+    let original = known.refresh_execution_context(Twist2::ZERO).unwrap();
+    let state = original.navigation.as_ref().unwrap().continuation().unwrap();
+    let sample = state.walk_state().reference_sample_xy();
+    let actual_xy = state.walk_state().xy();
+    assert_ne!(sample.map(|v| (v / q).floor() as i32), actual_xy.map(|v| (v / q).floor() as i32),
+        "fixed Known midpoint +0.001 must actually cross a source column; do not retune");
+    assert!(state.walk_state().planned_ground_z().is_some());
+    let exact_route=d1_handle_round_trip(&mut known, d1_goal([0.1, 0.2], None), vec![], false).await;
+    let end=exact_route.reference.full_window().unwrap().to();
+    let (connection,sample,_)=end.indices();
+    assert_eq!(exact_route.points.last().unwrap().xy,[0.1,0.2]);
+    assert_eq!(exact_route.guide_body_poses.last().unwrap().0[..2],[0.1,0.2]);
+    assert_eq!(end.walk_state().xy(),[0.1,0.2]);
+    assert_eq!(end.walk_state().reference_sample_xy(),
+        exact_route.reference.sample(connection,sample).unwrap().point.xy);
+    assert_ne!(end.walk_state().reference_sample_xy(),end.walk_state().xy(),
+        "fixed negative-to-positive endpoint separates original sample arithmetic from actual endpoint");
+    let mut body_z_only = original.odometry.clone(); body_z_only.pose.position.z += 0.001;
+    known.update_odometry(body_z_only); known.consume_ground_actual(None).unwrap();
+    let after = known.refresh_execution_context(Twist2::ZERO).unwrap();
+    assert_eq!(after.navigation.as_ref().unwrap().continuation().unwrap().semantic_key(), state.semantic_key());
+    d1_handle_round_trip(&mut known, d1_goal([0.1, 0.2], None), vec![], false).await;
+
+    let (source, height) = c3_known_gap_source();
+    let q = f64::from(0.05_f32);
+    let actual = ([0.5 * q, 0.5 * q, height + 0.46],
+        [(0.1_f64 / 2.0).sin(), 0.0, 0.0, (0.1_f64 / 2.0).cos()]);
+    let goal = [8.5 * q, 0.5 * q];
+    let (mut carried, binding, path, _) = c3_install(Arc::new(source), actual, goal, Some(height), c3_config());
+    let edge = (0..binding.candidate().connection_count()).find(|&edge|
+        matches!(binding.candidate().sample(edge, 0).unwrap().association, A::Carried)
+            && path.poses[edge].pose.position != path.poses[edge + 1].pose.position)
+        .expect("unchanged known-gap winner has a real carried motion edge");
+    d1_consume_fraction(&mut carried, &path, edge, 0.25);
+    let penalties = vec![nuwax_nav_pct::RoutePenalty {
+        center: [4.5 * q, 0.5 * q, height + 0.46], radius: q, weight: 1.0,
+    }];
+    let replanned = d1_handle_round_trip(&mut carried, d1_goal(goal, None), penalties.clone(), true).await;
+    let connections: Vec<_> = replanned.reference.connections().collect();
+    eprintln!("D01 CARRIED expansions={} connections={} guide_points={}; reducer shortcut only if real output demonstrates it",
+        replanned.stats.expanded, connections.len(), replanned.guide_body_poses.len());
+    // Fixed same-column center subcase: consume that actual pose through the
+    // existing owner before replanning. No synthetic Reference/witness insertion.
+    let current = carried.refresh_execution_context(Twist2::ZERO).unwrap();
+    let mut center = current.odometry.clone();
+    center.pose.position.x = (center.pose.position.x / q).floor().mul_add(q, 0.5 * q);
+    center.pose.position.y = (center.pose.position.y / q).floor().mul_add(q, 0.5 * q);
+    carried.update_odometry(center); carried.consume_ground_actual(None).unwrap();
+    let center_basis=carried.refresh_execution_context(Twist2::ZERO).unwrap()
+        .navigation.as_ref().unwrap().continuation().unwrap();
+    let center_route = d1_handle_round_trip(&mut carried, d1_goal(goal, None), penalties, true).await;
+    let prefix = center_route.reference.connections().next().unwrap();
+    // The old zero-length-winner premise failed in execution-17 after actual
+    // endpoint bits were preserved. Keep this input and qualify its real first
+    // parent record; no particular equally legal winner shape is required.
+    eprintln!("D01 real root prefix span={:?} steps={}",prefix.point_span,prefix.steps);
+    assert_eq!(prefix.point_span[0],0);assert!(prefix.steps>0);
+    let root = center_route.reference.full_window().unwrap().from().walk_state();
+    assert_eq!(root.semantic_key(),center_basis.semantic_key());
+    assert_eq!(root.reference_sample_xy(),center_basis.walk_state().reference_sample_xy());
+    let ordinary = center_route.reference.position(0, prefix.steps, 0.0).unwrap().walk_state();
+    assert_ne!(root.semantic_key(), ordinary.semantic_key(), "transient root and ordinary center cannot alias");
+
+    let (source, mut metadata_blocks) = c3_direct_source();
+    let actual = ([100.0, 100.0, 0.55], [0.0, 0.0, 0.0, 1.0]);
+    let (mut unknown, _, path, _) = c3_install(Arc::new(source), actual, [100.1, 100.0], None, c3_config());
+    d1_consume_fraction(&mut unknown, &path, c4_first_motion(&path), 0.25);
+    for z in [0.55, 0.56] {
+        let mut actual = unknown.odometry.clone().unwrap(); actual.pose.position.z = z;
+        unknown.update_odometry(actual); unknown.consume_ground_actual(None).unwrap();
+        for requested in [None, Some(0.0)] {
+            let route = d1_handle_round_trip(&mut unknown, d1_goal([100.1, 100.0], requested), vec![], false).await;
+            assert_eq!(route.reference.original_goal().requested_ground_z, requested);
+            assert!(route.points.iter().all(|point| point.ground_z.is_none()));
+            for (edge, connection) in route.reference.connections().enumerate() {
+                for index in 0..=connection.steps {
+                    assert!(matches!(route.reference.sample(edge, index).unwrap().association, A::Unanchored));
+                }
+            }
+            let context = unknown.refresh_execution_context(Twist2::ZERO).unwrap();
+            let key = context.navigation.as_ref().unwrap().continuation().unwrap().semantic_key();
+            let mut input = d1_input(context, d1_goal([100.1, 100.0], requested), vec![]);
+            let cancelled = std::sync::atomic::AtomicBool::new(true);
+            assert!(input.compute_ground_route(&PctPlanner::default(), Some(&cancelled), None).is_err());
+            let original_source = input.source.clone();
+            let mut observations = original_source.observations().unwrap().as_ref().clone();
+            for (&block, values) in &mut metadata_blocks {
+                for value in values.values_mut() { value.observed_ns = 900; value.hits = 17; }
+                assert!(observations.replace_block_with_geometry_changes(block, values.clone()).unwrap().is_empty());
+            }
+            observations.mark_complete_geometry_source();
+            input.source = Arc::new(original_source.with_observations(Some(Arc::new(observations.clone()))));
+            assert!(nuwax_nav_pct::same_source_geometry(&original_source, &input.source));
+            let compatible = input.compute_ground_route(&PctPlanner::default(), None, None).unwrap();
+            assert_eq!(compatible.reference.full_window().unwrap().from().walk_state().semantic_key(), key);
+            let changed_key = [0_i32, 2, 4];
+            let block_key = changed_key.map(|v| v.div_euclid(32));
+            let mut changed_block = metadata_blocks.get(&block_key).cloned().unwrap_or_default();
+            changed_block.insert(changed_key, SurfaceObservation { observed_ns: 901, hits: 2 });
+            assert!(!observations.replace_block_with_geometry_changes(block_key, changed_block).unwrap().is_empty());
+            observations.mark_complete_geometry_source();
+            input.source = Arc::new(original_source.with_observations(Some(Arc::new(observations))));
+            assert!(input.compute_ground_route(&PctPlanner::default(), None, None).is_err(), "true source retirement rejects the retained basis");
+            input.source = Arc::new(c3_direct_source().0);
+            assert!(input.compute_ground_route(&PctPlanner::default(), None, None).is_err(), "foreign source cannot reopen a retained owner");
+            assert_eq!(unknown.refresh_execution_context(Twist2::ZERO).unwrap().navigation.as_ref()
+                .unwrap().continuation().unwrap().semantic_key(), key);
+        }
+    }
+}
+
+#[test]
+fn d02_actual_source_distinguishes_two_feasible_navigation_states() {
+    use nuwax_nav_types_messages::GroundLayerResult as R;
+    // Exact approved third fixture: q=.05; lower member0/bin7; upper member11
+    // bin0 -> bin7 at x>=1; physical z=.705; offset=.4; step=.21.
+    let source = Arc::new(c3_bin_shift_source());
+    let xy = [0.025, 0.025]; let to = [0.125, 0.025];
+    let actual = ([xy[0], xy[1], 0.705], [0.0, 0.0, 0.0, 1.0]);
+    let records: Vec<_> = source.observations().unwrap().ground_records([0, 0]).collect();
+    assert_eq!(records.len(), 2);
+    let heights = [records[0].height_at(xy).unwrap(), records[1].height_at(xy).unwrap()];
+    assert!(heights[0] < heights[1]);
+    let planner = PctPlanner::default();
+    let lower = c3_route(&planner, &source, actual, Some(heights[0]), to);
+    let upper = c3_route(&planner, &source, actual, Some(heights[1]), to);
+    let low = lower.reference.full_window().unwrap().from().walk_state();
+    let high = upper.reference.full_window().unwrap().from().walk_state();
+    assert_ne!(low.semantic_key(), high.semantic_key());
+    let query = low.bind_body_query(&source).unwrap();
+    let (physical, independent) = query.start_ground_state_with_evidence(actual).unwrap();
+    assert!(independent.is_direct(), "original fixture must independently select a real actual source");
+    let low_response = c3_project(&query, low, actual, &physical, to);
+    let high_response = c3_project(&query, high, actual, &physical, to);
+    assert_ne!(low_response.pose(), high_response.pose());
+    // The real owner compares independent actual-source selection only after
+    // the original physical validation; neither planner layer is an authority.
+    let mut low_owner = d1_typed_initial(source.clone(), actual, Some(heights[0]), d1_goal(to, None));
+    let mut high_owner = d1_typed_initial(source.clone(), actual, Some(heights[1]), d1_goal(to, None));
+    let relations = [d1_relation(&mut low_owner), d1_relation(&mut high_owner)];
+    assert_eq!(relations.iter().filter(|&&r| r == R::Matched).count(), 1);
+    assert_eq!(relations.iter().filter(|&&r| r == R::KnownConflict).count(), 1,
+        "both sweeps are feasible but only the independent actual association may match");
+    let actuals = [low_owner.refresh_execution_context(Twist2::ZERO).unwrap(),
+        high_owner.refresh_execution_context(Twist2::ZERO).unwrap()];
+    assert_eq!(actuals[0].ground, actuals[1].ground);
+    assert_eq!(actuals[0].ground_evidence.as_ref().unwrap().observation,
+        actuals[1].ground_evidence.as_ref().unwrap().observation);
+    assert_eq!(actuals[0].ground_evidence.as_ref().unwrap().observation, independent);
+    // On this same original third geometry, consume the unchanged association
+    // through each actual known column before taking one adjacent step outside
+    // its y=-8 boundary. This checks symmetric carried retention without a new
+    // two-layer fixture or manufactured result evidence.
+    for (owner, expected) in [(&mut low_owner, relations[0]), (&mut high_owner, relations[1])] {
+        for column in (-8..=0).rev() {
+            let pose = ([actual.0[0], (f64::from(column) + 0.5) * f64::from(0.05_f32), actual.0[2]], actual.1);
+            owner.update_odometry(c3_stamped(pose)); owner.consume_ground_actual(None).unwrap();
+            assert_eq!(d1_relation(owner), expected);
+        }
+        let outside = ([actual.0[0], -8.5 * f64::from(0.05_f32), actual.0[2]], actual.1);
+        owner.update_odometry(c3_stamped(outside)); owner.consume_ground_actual(None).unwrap();
+        let context = owner.refresh_execution_context(Twist2::ZERO).unwrap();
+        assert_eq!(context.ground.query_state(), nuwax_nav_mls_planner::surface::GroundQueryState::Unknown);
+        assert_eq!(context.ground_evidence.as_ref().unwrap().relation, expected,
+            "pure carried omission preserves a proven KnownConflict as well as Same");
+    }
+}
+
+// Exact original MLS actual-ground fixture, copied without numeric changes.
+fn d1_original_actual_step_scene(levels:impl Fn(i32)->Vec<i32>,measured:bool)->SurfaceSnapshot {
+    use nuwax_map_chunks::{LayerObservation,LayerObservations,LayerSample,block_key,local_key};
+    const Q:f32=0.125;
+    let mut points=Vec::new();
+    let mut blocks=BTreeMap::<[i32;3],BTreeMap<[i32;3],SurfaceObservation>>::new();
+    let mut layers=BTreeMap::<[i32;3],LayerObservations>::new();
+    for x in 0..16 {for y in 0..8 {for z in levels(x) {
+        let key=[x,y,z];let local=local_key(key);
+        let origin=key.map(|v|(f64::from(v)+0.5)*f64::from(Q));
+        points.push((origin[0] as f32,origin[1] as f32,origin[2] as f32));
+        blocks.entry(block_key(key)).or_default().insert(key,SurfaceObservation{observed_ns:100,hits:3});
+        if measured {
+            layers.entry(block_key(key)).or_default().insert(local,LayerObservation {
+                members:vec![local],normal:[0.0,0.0,1.0],plane_origin:origin,
+                samples:(0..3).map(|i|LayerSample {source:Default::default(),point:origin,
+                    source_sequence:i+1,source_timestamp_ns:100+i,point_index:u32::from(local)}).collect(),
+            });
+        }
+    }}}
+    let config=Config {world_frame:"map".into(),voxel_size:0.25,robot_height:0.2,
+        surface_closing_radius:0.0,node_spacing_m:0.5,wall_clearance_m:0.0,
+        wall_buffer_m:0.0,wall_buffer_weight:0.0,max_slope_deg:18.0,
+        step_threshold_m:0.2,min_step_tread_depth_m:0.5,step_penalty_weight:1.0,
+        goal_tolerance:0.1,viz_publish_hz:0.0};
+    let model=SurfaceBodyEnvelope {fixed_collision:None,
+        footprint_xy_m:vec![[-0.08,-0.06],[0.08,-0.06],[0.08,0.06],[-0.08,0.06]],
+        z_bounds_m:[-0.1,0.1],body_to_support_z_m:0.4,max_step_up_m:0.2,max_step_down_m:0.2,
+        max_cross_slope_deg:18.0,support_uncertainty_m:0.0};
+    let mut observations=SurfaceObservations::new(Q,32).unwrap();
+    for (block,values) in blocks {observations.replace_block(block,values).unwrap();}
+    for (block,values) in layers {observations.replace_ground_layers(block,Arc::new(values)).unwrap();}
+    observations.mark_complete_geometry_source();
+    SurfaceSnapshot::from_points(&points,config,Q).unwrap().with_body_envelope(model).unwrap()
+        .with_observations(Some(Arc::new(observations)))
+}
+
+
+// Exact original Scan scene_with_extra_cells; called only with (Some(0),0,&[]).
+    fn d1_original_prefix_scene(door: Option<i32>, slope: f64, extra: &[[i32; 3]]) -> SurfaceSnapshot {
+        let size = 0.01_f32;
+        let max_step = if slope == 0.0 { 0.0 } else { 0.15 };
+        let mut cells: Vec<[i32; 3]> = (-130..131)
+            .flat_map(|x| {
+                (-70..100).map(move |y| [x, y, ((f64::from(x) + 0.5) * slope - 0.5).floor() as i32])
+            })
+            .collect();
+        if let Some(width) = door {
+            cells.extend((0..4).flat_map(|x| {
+                (-70..100)
+                    .filter(move |&y| y < 0 || y >= width)
+                    .flat_map(move |y| (0..65).map(move |z| [x, y, z]))
+            }));
+        }
+        cells.extend_from_slice(extra);
+        let points: Vec<_> = cells
+            .iter()
+            .map(|p| {
+                (
+                    (p[0] as f32 + 0.5) * size,
+                    (p[1] as f32 + 0.5) * size,
+                    (p[2] as f32 + 0.5) * size,
+                )
+            })
+            .collect();
+        let mut blocks = BTreeMap::<[i32; 3], BTreeMap<[i32; 3], SurfaceObservation>>::new();
+        for key in cells {
+            blocks
+                .entry(key.map(|v| v.div_euclid(32)))
+                .or_default()
+                .insert(
+                    key,
+                    SurfaceObservation {
+                        observed_ns: 1,
+                        hits: 2,
+                    },
+                );
+        }
+        let mut observations = SurfaceObservations::new(size, 32).unwrap();
+        for (key, values) in blocks {
+            observations.replace_block(key, values).unwrap();
+        }
+        observations.mark_complete_geometry_source();
+        let cfg = Config {
+            world_frame: "map".into(),
+            voxel_size: 0.1,
+            robot_height: 0.55,
+            surface_closing_radius: 0.0,
+            node_spacing_m: 0.3,
+            wall_clearance_m: 0.0,
+            wall_buffer_m: 0.1,
+            wall_buffer_weight: 2.0,
+            max_slope_deg: 18.0,
+            step_threshold_m: max_step,
+            min_step_tread_depth_m: 0.2,
+            step_penalty_weight: 1.0,
+            goal_tolerance: 0.1,
+            viz_publish_hz: 0.0,
+        };
+        SurfaceSnapshot::from_points(&points, cfg, size)
+            .unwrap()
+            .with_body_envelope(SurfaceBodyEnvelope {
+                fixed_collision: None,
+                footprint_xy_m: vec![[-0.3, -0.16], [0.3, -0.16], [0.3, 0.16], [-0.3, 0.16]],
+                z_bounds_m: [-0.15, 0.15],
+                body_to_support_z_m: 0.4,
+                max_step_up_m: f64::from(max_step),
+                max_step_down_m: f64::from(max_step),
+                max_cross_slope_deg: 18.0,
+                support_uncertainty_m: 0.0,
+            })
+            .unwrap()
+            .with_observations(Some(Arc::new(observations)))
+    }
+
+#[test]
+fn d04_unknown_continuity_and_height_presence_remain_distinct() {
+    use nuwax_nav_mls_planner::surface::GroundQueryState;
+    use nuwax_nav_types_messages::GroundLayerResult as R;
+    use crate::replan_feedback::{same_actual, SuccessfulReplanMemo};
+    let (source, height) = c3_known_gap_source();
+    let source = Arc::new(source); let q = f64::from(0.05_f32);
+    // The existing gap source needs actual support in its thin [0,0] column.
+    // D01 retains its original roll=.1 control; this relation control uses
+    // the existing identity attitude so the independent source is really Known.
+    let actual = ([0.5 * q, 0.5 * q, height + 0.46], [0.0, 0.0, 0.0, 1.0]);
+    let goal = d1_goal([8.5 * q, 0.5 * q], None);
+    let mut carried = d1_typed_initial(source.clone(), actual, Some(height), goal.clone());
+    assert_eq!(d1_relation(&mut carried), R::Matched);
+    let mut unknown = actual; unknown.0[0] = 2.5 * q;
+    carried.update_odometry(c3_stamped(unknown)); carried.consume_ground_actual(None).unwrap();
+    let context = carried.refresh_execution_context(Twist2::ZERO).unwrap();
+    assert_eq!(context.ground.query_state(), GroundQueryState::Unknown);
+    assert_eq!(context.ground.height().to_bits(), height.to_bits());
+    assert_eq!(context.ground_evidence.as_ref().unwrap().relation, R::Matched,
+        "a real pure carry retains the earlier independently proven match");
+    assert!(context.ground_evidence.as_ref().unwrap().carry_intact);
+    let mut unanchored = d1_typed_initial(source, unknown, None, goal);
+    assert_eq!(d1_relation(&mut unanchored), R::Unresolved,
+        "same physical Unknown pose without an independent navigation anchor cannot mint a match");
+    assert!(unanchored.refresh_execution_context(Twist2::ZERO).unwrap().navigation.as_ref()
+        .unwrap().continuation().unwrap().walk_state().planned_ground_z().is_none());
+
+    // Exact original actual_unknown_after_crossing_known_step input, including
+    // legacy and measured versions. Intermediate actual source is preserved
+    // even though endpoint query_state is Unknown.
+    for measured in [false, true] {
+        let map = Arc::new(d1_original_actual_step_scene(|x| vec![if x < 8 { 0 } else { 1 }], measured));
+        let from = ([0.5625, 0.4375, 0.5], [0.0, 0.0, 0.0, 1.0]);
+        let crossed_pose = ([1.5625, 0.4375, 0.65], from.1);
+        let endpoint = ([2.4375, 0.4375, 0.75], from.1);
+        let query = map.body_query();
+        let (initial, _) = query.start_ground_state_with_evidence(from).unwrap();
+        let crossed = query.start_ground_state(crossed_pose).unwrap();
+        let fresh = query.start_ground_state(endpoint).unwrap();
+        let (observed, summary) = query.observe_actual_ground_with_evidence(from, &initial, endpoint).unwrap();
+        assert_eq!(fresh.query_state(), GroundQueryState::Unknown);
+        assert_ne!(fresh.height().to_bits(), crossed.height().to_bits());
+        assert_eq!(observed.query_state(), GroundQueryState::Unknown);
+        assert_eq!(observed.height().to_bits(), crossed.height().to_bits());
+        assert_ne!(observed.height().to_bits(), initial.height().to_bits());
+        assert!(!summary.carry_intact(), "endpoint Unknown cannot hide the real crossed Known step");
+
+        let goal = d1_goal([endpoint.0[0], endpoint.0[1]], None);
+        let mut owner = d1_typed_initial(map, from, Some(initial.height()), goal.clone());
+        // Only native/observed full-source identity can prove Same. Legacy
+        // identity-free records deliberately remain unresolved.
+        if measured { assert_eq!(d1_relation(&mut owner), R::Matched); }
+        let before = owner.refresh_execution_context(Twist2::ZERO).unwrap();
+        let before_input = d1_input(before.clone(), goal.clone(), vec![]);
+        let mut memo = SuccessfulReplanMemo::default();
+        memo.published(7_u64, before_input.clone());
+        assert!(memo.should_reuse(Some((&7_u64, before.as_ref())), &before_input));
+        owner.update_odometry(c3_stamped(crossed_pose));
+        let at_b = owner.refresh_execution_context(Twist2::ZERO).unwrap();
+        assert!(at_b.navigation.is_none(), "context refresh does not consume A to B");
+        assert!(!at_b.ground_evidence.as_ref().unwrap().carry_intact);
+        owner.update_odometry(c3_stamped(endpoint));
+        let at_c = owner.refresh_execution_context(Twist2::ZERO).unwrap();
+        assert_eq!(at_c.ground.height().to_bits(), crossed.height().to_bits());
+        assert_eq!(at_c.ground.query_state(), GroundQueryState::Unknown);
+        assert!(!at_c.ground_evidence.as_ref().unwrap().carry_intact,
+            "A->B->C read-only refresh must AND the intermediate reassociation");
+        assert!(at_c.navigation.is_none());
+        // Return to the exact original actual pose without a nav commit. All
+        // old memo inputs now agree except the genuinely observed interval
+        // summary. No test fabricates Matched or edits evidence fields.
+        owner.update_odometry(c3_stamped(from));
+        let returned = owner.refresh_execution_context(Twist2::ZERO).unwrap();
+        assert!(crate::replan_feedback::same_pose(&returned.odometry, &before.odometry));
+        assert_eq!(returned.ground, before.ground);
+        assert_eq!(returned.navigation, before.navigation);
+        assert_eq!(returned.applied, before.applied);
+        assert!(returned.source.same_body_query_view(&before.source));
+        assert_ne!(returned.ground_evidence, before.ground_evidence);
+        assert!(!same_actual(&returned, &before));
+        let returned_input = d1_input(returned.clone(), goal.clone(), vec![]);
+        assert!(!memo.should_reuse(Some((&7_u64, returned.as_ref())), &returned_input),
+            "changed real evidence invalidates Ground memo even at the same physical/nav pose");
+        // Repeat the same fixed B/C observations and finally use the sole
+        // actual-consumption path. The old Matched evidence cannot survive.
+        owner.update_odometry(c3_stamped(crossed_pose)); owner.refresh_execution_context(Twist2::ZERO).unwrap();
+        owner.update_odometry(c3_stamped(endpoint)); owner.refresh_execution_context(Twist2::ZERO).unwrap();
+        owner.consume_ground_actual(None).unwrap();
+        assert_eq!(d1_relation(&mut owner), R::Unresolved);
+    }
+
+    // Requested None/0/positive/negative are distinct original inputs on the
+    // existing Unanchored scene; none becomes body Z minus calibration.
+    let (source, _) = c3_direct_source(); let source = Arc::new(source);
+    let actual = ([100.0, 100.0, 0.55], [0.0, 0.0, 0.0, 1.0]);
+    let mut owner = d1_typed_initial(source, actual, None, d1_goal([100.1, 100.0], None));
+    let context = owner.refresh_execution_context(Twist2::ZERO).unwrap();
+    let mut inputs = Vec::new();
+    for requested in [None, Some(0.0), Some(0.3), Some(-0.3)] {
+        let input = d1_input(context.clone(), d1_goal([100.1, 100.0], requested), vec![]);
+        let route = input.compute_ground_route(&PctPlanner::default(), None, None).unwrap();
+        assert_eq!(route.reference.original_goal().requested_ground_z, requested);
+        assert!(route.points.iter().all(|point| point.ground_z.is_none()));
+        assert_eq!(GroundIntent::new(route.reference.full_window().unwrap()).goal().requested_ground_z, requested);
+        for earlier in &inputs { assert!(!input.same_complete_input(earlier)); }
+        inputs.push(input);
+    }
+}
+
+#[test]
+fn d05_only_consumed_original_terminal_emits_arrival() {
+    use nuwax_nav_scan::{GroundProgressPrefixPolicy, CandidateEdgeOrigin};
+    // Original progress_prefix_fixture, its original long Scan reference,
+    // boundary, arrival, default 256 budget and +.375m real PCT owner. Never
+    // prepare the historical 53,280-expansion full global goal.
+    let source = Arc::new(d1_original_prefix_scene(Some(0), 0.0, &[]));
+    let tomo = Tomogram::from_surface(&source).unwrap();
+    let actual = c3_start(); let reference = [[-1.0, 0.2], [1.0, 0.2]];
+    let boundary = [[-1.5, -0.5], [1.5, -0.5], [1.5, 0.9], [-1.5, 0.9]];
+    let route = c3_route(&PctPlanner::default(), &source, actual, None, [actual.0[0] + 0.375, actual.0[1]]);
+    let intent = GroundIntent::new(route.reference.full_window().unwrap());
+    let initial_key = intent.window().from().walk_state().semantic_key();
+    let physical = source.body_query().start_ground_state(actual).unwrap();
+    assert_eq!(ScanConfig::default().search_expansion_limit, 256);
+    let mapped = nuwax_nav_scan::plan_driven_ground(&source, &tomo, actual, &physical,
+        &reference, &c3_motion(), &ScanConfig::default(), None, Some(([1.0, 0.2], 0.1)),
+        &boundary, false, false, Some(GroundProgressPrefixPolicy {
+            reference: &reference, minimum_distance_m: 0.375,
+        }), intent.window()).expect("fixed unchanged short-window partial prerequisite");
+    assert!(mapped.trajectory.partial); assert_eq!(mapped.binding.family(), CandidateFamily::Search);
+    assert!(!mapped.binding.planned_join()); assert!(!mapped.binding.covers_original_goal());
+    assert!(mapped.binding.edges().iter().any(|edge| matches!(edge.origin(), CandidateEdgeOrigin::Parent { .. })));
+    assert!(!mapped.binding.edges().iter().any(|edge| matches!(edge.origin(), CandidateEdgeOrigin::Connector { .. })));
+    assert_eq!(intent.window().from().walk_state().semantic_key(), initial_key);
+    let binding = Arc::new(mapped.binding);
+    let path = Path3D { poses: mapped.trajectory.poses.into_iter().map(c3_stamped).collect() };
+    let initial = intent.window().from().continuation([actual.0[0], actual.0[1]]).unwrap();
+    let mut owner = d1_captured_owner(source, actual, initial,
+        d1_goal(route.reference.original_goal().xy, None));
+    owner.configure_boundary(&boundary);
+    owner.admit_ground_candidate(path.clone(), path.poses.last().unwrap().clone(), binding.clone(), None, None).unwrap();
+    assert!(owner.ground_arrival_step(&intent).unwrap().is_none(), "planned coverage is never an actual terminal");
+    let installed = c4_binding(&owner);
+    assert!(!installed.planned_join());
+    c5_consume_path(&mut owner, &path);
+    assert!(matches!(owner.step_ground_internal(0.2, None).unwrap(),
+        ground_cursor::GroundControlStep::LocalReferenceEnd { covers_original_goal: false }));
+    assert!(owner.ground_arrival_step(&intent).unwrap().is_none(), "real partial local end is still not original terminal");
+    assert!(GroundIntent::new(installed.original_window()).same_intent(&intent));
+    let end = owner.ground_cursor();
+    for _ in 0..2 {
+        owner.consume_ground_actual(None).unwrap();
+        assert_eq!(owner.ground_cursor(), end);
+        assert!(owner.ground_arrival_step(&intent).unwrap().is_none());
+    }
+
+    // Separate genuine RouteFollower window-advance control. This does not
+    // claim partial -> full-goal/ReferenceOnly coverage. Freeze a 1m horizon
+    // before running on the original 1.1m c3 straight; budget/model unchanged.
+    let (source, _) = c3_direct_source(); let source = Arc::new(source);
+    let mut config = c3_config(); config.scan.horizon_m = 1.0;
+    // Window advancement executes the real controller; the earlier no-motion-
+    // calibration failure is retained. Use the existing complete calibration.
+    config.motion_limits=Some(c3_limits());
+    assert_eq!(config.lookahead_m, 0.5);
+    let prepared = config.pct.prepare_ground_start(&source,
+        GroundRouteStart { xy: [-1.0, 0.2], ground_z: None }, None).unwrap();
+    let capture = d1_initial_capture(source.clone(), actual, prepared.basis().clone());
+    let route = config.pct.ground_route_from_start(&source, actual, &prepared,
+        GroundRouteGoal { xy: [0.1, 0.2], requested_ground_z: None }, 0.0,
+        &[], None, None, SearchLimits::default(), &[]).unwrap();
+    let goal = d1_goal([0.1, 0.2], None);
+    let mut route_owner = crate::RouteFollower::new(config).unwrap();
+    route_owner.configure_execution_goal(&goal, d1_options(), Some(capture)).unwrap();
+    route_owner.update_execution_map(ExecutionMap::Surface(source)).unwrap();
+    route_owner.update_odometry(c3_stamped(actual));
+    route_owner.consume_initial_actual_for_planning().unwrap();
+    route_owner.replace_typed_execution_path(d1_path(&route), None, goal).unwrap();
+    let first = route_owner.ground_window_for_test().unwrap();
+    assert!(!first.window().to().is_terminal(), "fixed 1m horizon must cut the original 1.1m route");
+    let initial_progress = route_owner.progress_m();
+    c3_until(|| {
+        let step = route_owner.step(0.2);
+        assert!(!matches!(step, PlannerStep::GroundArrival(_) | PlannerStep::Succeeded));
+        route_owner.ground_binding_for_test().is_some()
+    });
+    let binding = route_owner.ground_binding_for_test().unwrap();
+    eprintln!("D05 fixed window diagnostic from={:?} to={:?} planned_join={} family={:?} partial_path={:?} wait={:?}",
+        first.window().from().walk_state().xy(), first.window().to().walk_state().xy(),
+        binding.planned_join(), binding.family(), route_owner.local_path(), route_owner.execution_wait_reason());
+    let last=binding.edges().last().unwrap().motion()[1].0;
+    let candidate_end=binding.candidate().walk_state_at(binding.candidate().connection_count()-1,1.0,[last[0],last[1]]).unwrap();
+    eprintln!("D05 exact join diagnostic end_matches={} candidate={:?} original={:?} candidate_sample={:?} original_sample={:?}",
+        binding.candidate().end_matches(first.window().to()),candidate_end.semantic_key(),
+        first.window().to().walk_state().semantic_key(),candidate_end.reference_sample_xy(),
+        first.window().to().walk_state().reference_sample_xy());
+    assert!(binding.planned_join());
+    assert!(GroundIntent::new(binding.original_window()).same_intent(&GroundIntent::new(first.window())));
+    assert_eq!(route_owner.progress_m(), initial_progress, "planned join cannot advance an unfinished window");
+    let path = route_owner.local_path().cloned().unwrap();
+    assert_eq!(path.poses.len(), binding.edges().len() + 1);
+    // A future original segment is nearby at the first endpoint but cannot
+    // become arrival before actual adjacent consumption of its own window.
+    for pose in path.poses.iter().skip(1) {
+        route_owner.update_odometry(pose.clone());
+        let step = route_owner.step(0.2);
+        assert!(!matches!(step, PlannerStep::GroundArrival(_) | PlannerStep::Succeeded));
+    }
+    let second = route_owner.ground_window_for_test().unwrap();
+    assert_eq!(second.window().from().indices(), first.window().to().indices());
+    assert!(route_owner.progress_m() > initial_progress);
+    let progress = route_owner.progress_m();
+    for _ in 0..2 {
+        let step = route_owner.step(0.2);
+        assert!(!matches!(step, PlannerStep::GroundArrival(_) | PlannerStep::Succeeded));
+        assert_eq!(route_owner.progress_m(), progress, "the completed actual binding advances exactly once");
+        assert_eq!(route_owner.ground_window_for_test().unwrap().window().from().indices(),
+            second.window().from().indices());
+    }
+    route_owner.stop(); // original worker cancellation/join remains in Drop
 }

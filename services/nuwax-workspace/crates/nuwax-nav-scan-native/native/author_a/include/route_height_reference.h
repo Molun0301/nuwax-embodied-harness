@@ -33,6 +33,16 @@ class RouteHeightReference {
   bool ready()const{return points.size()>1&&!times.empty();}
   // The ordered parameter, not nearest XY, disambiguates repeated coordinates
   // and remains continuous at corners and vertical route segments.
+  Eigen::Vector3d positionAtArc(double arc) const {
+    if(points.empty())return Eigen::Vector3d::Zero();
+    if(arc<=arcs.front())return points.front();
+    for(size_t i=1;i<points.size();++i)if(arc<=arcs[i]) {
+      const double length=arcs[i]-arcs[i-1];
+      const double f=length>0.?(arc-arcs[i-1])/length:1.;
+      return points[i-1]+f*(points[i]-points[i-1]);
+    }
+    return points.back();
+  }
   double heightAtArc(double arc)const {
     if(points.empty())return 0.;
     if(arc<=arcs.front())return points.front().z();

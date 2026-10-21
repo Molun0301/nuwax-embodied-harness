@@ -110,6 +110,10 @@ namespace scan_planner
                                         Eigen::Vector3d local_target_vel, bool flag_polyInit, bool flag_randomPolyTraj)
   {
 
+    // Only the existing deterministic fallback changes its interior seed.
+    // First initialization, historical reuse, forced historical regeneration,
+    // and random initialization retain their existing behavior.
+    const bool ordered_xyz_fallback = !flag_first_call && flag_polyInit && !flag_randomPolyTraj;
     // ROS node-local lifetime becomes native session lifetime.
     std::cerr << endl
               << "[rebo replan]: -------------------------------------" << count++ << std::endl;
@@ -118,7 +122,7 @@ namespace scan_planner
          << endl;
 
     if(authorTraceEnabled()) {
-      auto out=authorTraceStream();out<<"{\"event\":\"rebound_input\",\"attempt\":"<<count-1<<",\"time\":"<<ros::Time::now().toSec()<<",\"poly_init\":"<<flag_polyInit<<",\"random_init\":"<<flag_randomPolyTraj;
+      auto out=authorTraceStream();out<<"{\"event\":\"rebound_input\",\"attempt\":"<<count-1<<",\"time\":"<<ros::Time::now().toSec()<<",\"poly_init\":"<<flag_polyInit<<",\"random_init\":"<<flag_randomPolyTraj<<",\"ordered_xyz_fallback\":"<<(ordered_xyz_fallback && route_height_.ready());
       out<<",\"start_p\":";traceMatrix(out,start_pt);out<<",\"start_v\":";traceMatrix(out,start_vel);out<<",\"start_a\":";traceMatrix(out,start_acc);
       out<<",\"target_p\":";traceMatrix(out,local_target_pt);out<<",\"target_v\":";traceMatrix(out,local_target_vel);out<<",\"route_height_ready\":"<<route_height_.ready()<<",\"route_begin_arc\":"<<route_height_.begin_arc<<",\"route_end_arc\":"<<route_height_.end_arc<<"}\n";
     }
@@ -288,7 +292,10 @@ namespace scan_planner
       for(size_t i=0;i<point_set.size();++i){
         const double fraction=length>0.?height_sample_arcs[i]/length:double(i)/double(point_set.size()-1);
         height_sample_arcs[i]=route_height_.begin_arc+fraction*(route_height_.end_arc-route_height_.begin_arc);
-        point_set[i].z()=route_height_.heightAtArc(height_sample_arcs[i]);
+        if(ordered_xyz_fallback && i>0 && i+1<point_set.size())
+          point_set[i]=route_height_.positionAtArc(height_sample_arcs[i]);
+        else
+          point_set[i].z()=route_height_.heightAtArc(height_sample_arcs[i]);
       }
       // Retain requested boundary positions and the original LS derivatives.
       point_set.front().z()=start_pt.z();point_set.back().z()=local_target_pt.z();

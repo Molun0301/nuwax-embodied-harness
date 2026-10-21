@@ -5,7 +5,7 @@ using scan_planner::RouteHeightReference;
 void prepare(RouteHeightReference& h,std::vector<Eigen::Vector3d> p){h.set(p);h.times=h.arcs;h.timed_arcs=h.arcs;h.window(0,h.arcs.back());}
 int main(){
  RouteHeightReference h;prepare(h,{{0,0,0},{2,0,0},{2,1,1},{0,1,1},{0,0,2},{2,0,2}});
- assert(h.heightAtArc(1)==0.);assert(h.heightAtArc(h.arcs[4]+1)==2.);double a=h.heightAtArc(h.arcs[4]+1);for(int i=0;i<20;++i)assert(h.heightAtArc(h.arcs[4]+1)==a);
+ assert(h.positionAtArc(1)==Eigen::Vector3d(1,0,0));assert(h.positionAtArc(h.arcs[4]+1)==Eigen::Vector3d(1,0,2));assert(h.heightAtArc(1)==0.);assert(h.heightAtArc(h.arcs[4]+1)==2.);double a=h.heightAtArc(h.arcs[4]+1);for(int i=0;i<20;++i)assert(h.heightAtArc(h.arcs[4]+1)==a);
  prepare(h,{{0,0,0},{1,0,1},{1,1,2}});double corner=h.arcs[1];
  for(double e:{.1,.001,.000001})assert(std::abs(h.heightAtArc(corner+e)-h.heightAtArc(corner-e))<2*e);
  prepare(h,{{0,0,0},{0,0,2}});assert(h.heightAtArc(1)==1.);

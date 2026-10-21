@@ -17,3 +17,8 @@ for test in vertical_query_oracle route_height_reference_test route_height_entry
 done
 "$OUT/vertical_query_oracle" .11 .23
 "$OUT/vertical_query_oracle" .23 .11
+
+"${CXX:-c++}" -std=c++17 -O2 "${INC[@]}" "$TESTS/fallback_branch_test.cpp" "$SCAN_NATIVE_LIBRARY" -lpthread -o "$OUT/fallback_branch_test"
+: > "$OUT/fallback-branches.jsonl"
+NEH_SCAN_A_TRACE="$OUT/fallback-branches.jsonl" "$OUT/fallback_branch_test"
+python3 "$TESTS/verify_fallback_trace.py" "$OUT/fallback-branches.jsonl"

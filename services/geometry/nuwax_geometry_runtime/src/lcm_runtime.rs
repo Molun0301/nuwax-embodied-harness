@@ -11724,6 +11724,55 @@ async fn handoff_registered_lio_cloud_with_correction_for_test(
     handoff_registered_lio_cloud_with_correction(handle, &accepted, correction).await
 }
 
+/// 只从同一不可变准入帧导出位姿；不得借用当前定位或融合地图补全原点。
+fn encode_admitted_recent_cloud(
+    producer_runtime_generation: i64,
+    boot: [u8; 16],
+    accepted: &crate::lio_ingress::AcceptedRegisteredCloud,
+    ground: &[u32],
+) -> Result<Vec<u8>, String> {
+    use nuwax_codec::lcm::recent_cloud::{self, RegisteredCloudPose};
+    let binding = accepted.binding();
+    let cloud = accepted.envelope();
+    if binding.runtime_generation != cloud.runtime_generation
+        || binding.cloud_source_sequence != cloud.source_sequence
+        || binding.correlated_odometry.source_sequence != cloud.correlated_odometry_source_sequence
+        || binding.correlated_odometry.source_timestamp_ns
+            != cloud.correlated_odometry_source_timestamp_ns
+    {
+        return Err("recent cloud registration binding identity mismatch".into());
+    }
+    let registration = binding
+        .sensor_origin_map
+        .map(|sensor_origin_map| -> Result<RegisteredCloudPose, String> {
+            let map_from_body = binding.registration_map_from_odom * binding.frozen_odom_from_body;
+            let quaternion = map_from_body.rotation.quaternion();
+            Ok(RegisteredCloudPose {
+                sensor_origin_map,
+                body_position_map: map_from_body.translation.vector.into(),
+                body_orientation_xyzw: [quaternion.i, quaternion.j, quaternion.k, quaternion.w],
+                registration_correction_revision: i64::try_from(
+                    binding.registration_correction_revision,
+                )
+                .map_err(|_| "recent registration correction revision overflow")?,
+            })
+        })
+        .transpose()?;
+    recent_cloud::encode_borrowed(
+        producer_runtime_generation,
+        &binding.mapping_session_id,
+        i64::try_from(binding.mapping_session_generation)
+            .map_err(|_| "recent source session overflow")?,
+        i64::try_from(binding.map_frame_generation)
+            .map_err(|_| "recent frame generation overflow")?,
+        boot,
+        Some(cloud),
+        registration.as_ref(),
+        ground,
+    )
+    .map_err(|error| error.to_string())
+}
+
 /// Emit only live admitted source evidence, independent of map publication cadence.
 /// Caller holds the existing mapping lifecycle fence through domain check/publish.
 async fn publish_recent_cloud_while_lifecycle_fenced(
@@ -11742,16 +11791,13 @@ async fn publish_recent_cloud_while_lifecycle_fenced(
         // occupancy fanout may not have installed its first authority yet.
         mapping.mapping_commit_boot_nonce().to_be_bytes()
     };
-    let generation = i64::try_from(binding.mapping_session_generation).map_err(|_| "recent source session overflow")?;
     let scan = accepted.scan();
     let ground = handle.cloud_map_writer.lock().as_ref()
         .and_then(|writer| writer.latest_ground_point_indices(scan)).unwrap_or_else(|| Arc::from([]));
-    let payload = recent_cloud::encode_borrowed(
+    let payload = encode_admitted_recent_cloud(
         i64::try_from(handle.nav.producer_runtime_generation()).map_err(|_| "recent producer generation overflow")?,
-        &binding.mapping_session_id, generation,
-        i64::try_from(binding.map_frame_generation).map_err(|_| "recent frame generation overflow")?,
-        boot, Some(accepted.envelope()), &ground,
-    ).map_err(|error| error.to_string())?;
+        boot, accepted, &ground,
+    )?;
     let topic = crate::channel_registry::channel_for(crate::channel_registry::ChannelKey::RecentCloud3D);
     let message_type = LcmMessageType::new(recent_cloud::TYPE_NAME).map_err(|error|error.to_string())?;
     let frame = crate::typed_codec::build_typed_frame(topic, message_type, payload, accepted.source_identity().source_sequence as u64);
@@ -18513,6 +18559,178 @@ pub(crate) mod mapping_feed_tests {
                 corrected.1
             );
         }
+    }
+
+    #[tokio::test]
+    async fn recent_cloud_publisher_preserves_frozen_registration_world_points_and_unknown_origin() {
+        use nuwax_codec::lcm::recent_cloud;
+        let backend = MappingFeedRecordingBackend::new(LcmTopic::new("/unused/recent-pose").unwrap());
+        let handle = build_test_handle_parts(
+            false,
+            Some(crate::mapping_backend::MappingBackendSpec::Voxel),
+            Some(LcmTransport::new(Arc::new(backend.clone()))),
+        )
+        .await
+        .unwrap();
+        let (snapshot, frame_generation, boot) = {
+            let mut mapping = handle.mapping_adapter.as_ref().unwrap().lock();
+            mapping
+                .start_session("paired-recent-session", "paired-recent-map")
+                .unwrap();
+            (
+                mapping.snapshot(),
+                mapping.global_frame_generation(),
+                mapping.mapping_commit_boot_nonce().to_be_bytes(),
+            )
+        };
+        let binding = crate::lio_ingress::RegistrationBinding {
+            runtime_generation: 41,
+            cloud_source_sequence: 7,
+            correlated_odometry: crate::lio_ingress::CorrelatedOdometry {
+                source_sequence: 6,
+                source_timestamp_ns: 8_765_432_000,
+            },
+            mapping_session_id: snapshot.session_id,
+            mapping_session_generation: snapshot.session_generation,
+            map_frame_generation: frame_generation,
+            frozen_odom_from_body: nalgebra::Isometry3::from_parts(
+                nalgebra::Translation3::new(0.5, 0.25, -0.1),
+                nalgebra::UnitQuaternion::from_euler_angles(0.1, -0.2, 0.3),
+            ),
+            base_anchor_map_from_odom: nalgebra::Isometry3::identity(),
+            registration_map_from_odom: nalgebra::Isometry3::from_parts(
+                nalgebra::Translation3::new(12.0, -3.0, 0.6),
+                nalgebra::UnitQuaternion::from_euler_angles(-0.2, 0.1, 0.4),
+            ),
+            registration_correction_revision: 9,
+            sensor_origin_map: Some([12.7, -2.4, 0.9]),
+            frame_capture_relocalization_epoch: Some(0),
+        };
+        let world_points = vec![
+            Point3::new(13.011, -2.489, 0.011),
+            Point3::new(13.011, -2.489, 0.041),
+            Point3::new(13.7, -2.3, 0.2),
+        ];
+        let accepted = crate::lio_ingress::AcceptedRegisteredCloud::from_map_points_for_test(
+            world_points.clone(),
+            99_000_000_000,
+            8_765_432_100,
+            "map",
+            "base_link",
+            binding.clone(),
+        );
+        // 与冻结帧明显不同的当前定位，不能影响编码值或原始源戳。
+        handle.state.write().await.pose.x = 900.0;
+        let _lifecycle = handle.mapping_lifecycle_lock.lock().await;
+        assert!(
+            publish_recent_cloud_while_lifecycle_fenced(&handle, &accepted)
+                .await
+                .unwrap()
+        );
+        let mut unknown_binding = binding.clone();
+        unknown_binding.sensor_origin_map = None;
+        unknown_binding.cloud_source_sequence += 1;
+        let unknown = crate::lio_ingress::AcceptedRegisteredCloud::from_map_points_for_test(
+            world_points,
+            100_000_000_000,
+            8_765_432_200,
+            "map",
+            "base_link",
+            unknown_binding,
+        );
+        assert!(
+            publish_recent_cloud_while_lifecycle_fenced(&handle, &unknown)
+                .await
+                .unwrap()
+        );
+        let frames = backend.published.lock().unwrap();
+        let recent = frames
+            .iter()
+            .filter(|frame| frame.topic.channel() == recent_cloud::DEFAULT_TOPIC)
+            .map(|frame| recent_cloud::decode_body(&frame.payload).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(recent.len(), 2);
+        let packet = &recent[0];
+        assert_eq!(
+            packet.cloud.as_ref().unwrap(),
+            accepted.envelope(),
+            "world 点及全部源身份逐字保留，不二次变换或过滤"
+        );
+        assert_eq!(packet.commit_boot_nonce, boot);
+        assert_eq!(packet.session_id, binding.mapping_session_id);
+        assert_eq!(
+            packet.session_generation,
+            binding.mapping_session_generation as i64
+        );
+        assert_eq!(
+            packet.map_frame_generation,
+            binding.map_frame_generation as i64
+        );
+        let pose = packet.registration.as_ref().unwrap();
+        let expected = binding.registration_map_from_odom * binding.frozen_odom_from_body;
+        assert_eq!(pose.sensor_origin_map, binding.sensor_origin_map.unwrap());
+        assert_eq!(
+            pose.body_position_map,
+            <[f64; 3]>::from(expected.translation.vector)
+        );
+        let q = expected.rotation.quaternion();
+        assert_eq!(pose.body_orientation_xyzw, [q.i, q.j, q.k, q.w]);
+        assert_eq!(
+            pose.registration_correction_revision,
+            binding.registration_correction_revision as i64
+        );
+        assert_eq!(
+            recent[1].registration, None,
+            "缺少真实 sensor origin 时不补零、不借用机体原点"
+        );
+        assert_eq!(recent[1].cloud.as_ref().unwrap(), unknown.envelope());
+        drop(frames);
+        // 同一路径的 ground 标签只作索引声明，不能删改已注册点。
+        let tagged = recent_cloud::decode_body(
+            &encode_admitted_recent_cloud(packet.producer_runtime_generation, boot, &accepted, &[0, 1])
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            tagged.cloud.as_ref().unwrap().cloud.data,
+            accepted.envelope().cloud.data
+        );
+        assert_eq!(tagged.ground_point_indices, [0, 1]);
+        let mut overflow_binding = binding.clone();
+        overflow_binding.registration_correction_revision = u64::MAX;
+        let overflow = crate::lio_ingress::AcceptedRegisteredCloud::from_map_points_for_test(
+            accepted.map_points().to_vec(),
+            99_000_000_000,
+            8_765_432_100,
+            "map",
+            "base_link",
+            overflow_binding,
+        );
+        assert!(
+            publish_recent_cloud_while_lifecycle_fenced(&handle, &overflow)
+                .await
+                .is_err()
+        );
+        let mut invalid_binding = binding;
+        invalid_binding.sensor_origin_map = Some([f64::NAN, 0.0, 0.0]);
+        let invalid = crate::lio_ingress::AcceptedRegisteredCloud::from_map_points_for_test(
+            accepted.map_points().to_vec(),
+            99_000_000_000,
+            8_765_432_100,
+            "map",
+            "base_link",
+            invalid_binding,
+        );
+        assert!(
+            publish_recent_cloud_while_lifecycle_fenced(&handle, &invalid)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            backend.published.lock().unwrap().len(),
+            2,
+            "非法位姿不能发出部分消息"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

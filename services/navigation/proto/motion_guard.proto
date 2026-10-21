@@ -336,9 +336,24 @@ message MotionGuardRequest {
   reserved "latch_safety_stop", "get_safety_state", "reset_safe_stop";
 }
 
+// 同一真实设备样本；速度属于 frame_id 机体参考点，不能由命令回执构造。
+// 接收/到期时间属于守卫主机的单调时钟，读取缓存或去重重放不能刷新它们。
+message MeasuredMotionFeedback {
+  string source_id = 1;
+  uint64 source_timestamp_ns = 2;
+  uint64 received_monotonic_ns = 3;
+  uint64 valid_until_monotonic_ns = 4;
+  string frame_id = 5;
+  repeated double body_linear_xyz = 6; // 必须恰好3项，单位米/秒。
+  repeated double body_angular_xyz = 7; // 必须恰好3项，单位弧度/秒。
+  repeated double orientation_wxyz = 8; // 可缺失；提供时必须恰好4项。
+}
+
 message MotionGuardResponse {
   uint32 api_version = 1;
   string request_id = 2;
+  // 可选旁路测量，不属于 outcome，也不代表 APPLIED 或任何准入条件。
+  MeasuredMotionFeedback measured_motion_feedback = 3;
   oneof outcome {
     AcquireLeaseResponse acquire_lease = 10;
     RenewLeaseResponse renew_lease = 11;

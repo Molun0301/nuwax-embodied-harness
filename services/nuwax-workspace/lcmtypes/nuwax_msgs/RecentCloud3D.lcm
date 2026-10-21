@@ -8,6 +8,9 @@ struct RecentCloud3D {
     int64_t map_frame_generation;
     byte commit_boot_nonce[16];
     int8_t cleared;
+    // v2: 0 表示原点未知或撤销；1 表示同帧真实配对，禁止补零。
+    int32_t registration_count;
+    RegisteredCloudPose registration[registration_count];
     int32_t ground_point_count;
     int32_t ground_point_indices[ground_point_count];
     int32_t cloud_bytes_count;

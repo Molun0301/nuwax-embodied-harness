@@ -1,4 +1,3 @@
-// 本地无 ROS 提取与真实感知/机身适配；改动范围和上游归属见 native/NOTICE。
 #ifndef _POLYNOMIAL_TRAJ_H
 #define _POLYNOMIAL_TRAJ_H
 
@@ -195,7 +194,7 @@ public:
 
   double getMeanVel()
   {
-    return length / time_sum;
+    double mean_vel = length / time_sum;
   }
 
   double getAccCost()
@@ -335,3 +334,4 @@ public:
 };
 
 #endif
+

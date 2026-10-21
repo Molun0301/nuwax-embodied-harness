@@ -36,6 +36,14 @@ impl Default for GoalOptions {
     fn default()->Self {Self {allow_reverse:false,position_tolerance_m:0.35,yaw_tolerance_rad:0.35}}
 }
 impl GoalOptions {
+    /// 在权威入口一次解析缺省；旧 bool 消息及显式选择不被 profile 改写。
+    pub fn resolve_reverse_request(allow_reverse: bool, use_profile_default: bool, profile_default: bool) -> Result<bool, String> {
+        if use_profile_default && allow_reverse {
+            return Err("allow_reverse=true 与 use_profile_reverse_default=true 矛盾".into());
+        }
+        Ok(if use_profile_default { profile_default } else { allow_reverse })
+    }
+
     /// 容差覆盖整个圆周时，不约束最终朝向；仍保留沿途机体方向。
     pub fn requires_orientation(&self) -> bool { self.yaw_tolerance_rad < std::f64::consts::PI }
 
@@ -98,4 +106,33 @@ pub enum ArrivalBoundary {
     Strict,
     /// 误差小于或等于正容差。
     Closed,
+}
+
+#[cfg(test)]
+mod reverse_request_tests {
+    use super::GoalOptions;
+    #[test]
+    fn new_missing_choice_uses_only_authoritative_profile_default() {
+        assert!(GoalOptions::resolve_reverse_request(false, true, true).unwrap());
+        assert!(!GoalOptions::resolve_reverse_request(false, true, false).unwrap());
+    }
+    #[test]
+    fn explicit_false_and_true_survive_every_profile() {
+        for default in [false, true] {
+            assert!(!GoalOptions::resolve_reverse_request(false, false, default).unwrap());
+            assert!(GoalOptions::resolve_reverse_request(true, false, default).unwrap());
+        }
+    }
+    #[test]
+    fn legacy_false_and_legacy_2d_default_are_unchanged() {
+        assert!(!GoalOptions::default().allow_reverse);
+        assert!(!GoalOptions::resolve_reverse_request(false, false, true).unwrap());
+        assert!(!GoalOptions::resolve_reverse_request(false, true, false).unwrap());
+    }
+    #[test]
+    fn contradictory_explicit_true_and_default_marker_is_rejected() {
+        for default in [false, true] {
+            assert!(GoalOptions::resolve_reverse_request(true, true, default).is_err());
+        }
+    }
 }

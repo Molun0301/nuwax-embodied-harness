@@ -485,6 +485,7 @@ fn recent_frame(authority: &GuardedMapAuthority, source: i64, sequence: i64) -> 
         data: [0.5_f32, 1.0, 0.5].into_iter().flat_map(f32::to_le_bytes).collect(), is_dense: true,
     };
     let packet = recent_cloud::RecentCloud3D {
+        registration:None,
         producer_runtime_generation: authority.producer_runtime_generation,
         session_id: authority.committed_map.session_id.clone(), session_generation: authority.committed_map.session_generation,
         map_frame_generation: authority.map_frame_generation, commit_boot_nonce: authority.commit_boot_nonce,

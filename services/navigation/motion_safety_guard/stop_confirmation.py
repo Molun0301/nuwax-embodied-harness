@@ -13,6 +13,9 @@ from core.source_time import SourceTimeError, acquired_times, acquired_after
 from .go2_actuator import ActuatorError
 
 
+_FEEDBACK_VALIDITY_NS = 250_000_000
+
+
 @dataclass(frozen=True)
 class StopEvidence:
     stationary_confirmed: bool
@@ -97,17 +100,27 @@ class StopConfirmation:
         if acquired_mono is None and acquired_unix > now + 50_000_000:
             raise ActuatorError("MOTION_FEEDBACK_STALE", "执行器反馈过期或位于未来。")
         if feedback.received_monotonic_ns is None:
-            stale = acquired_mono is None and now - acquired_unix > 250_000_000
+            stale = acquired_mono is None and now - acquired_unix > _FEEDBACK_VALIDITY_NS
         else:
             # 接收年龄与实际采集年龄分别核对；原样本时间继续用于递增证明。
             age = round(self._monotonic() * 1_000_000_000) - feedback.received_monotonic_ns
-            stale = age < 0 or age > 250_000_000
+            stale = age < 0 or age > _FEEDBACK_VALIDITY_NS
         if acquired_mono is not None:
             acquisition_age = round(self._monotonic() * 1_000_000_000) - acquired_mono
-            stale = stale or acquisition_age < -50_000_000 or acquisition_age > 250_000_000
+            stale = stale or acquisition_age < -50_000_000 or acquisition_age > _FEEDBACK_VALIDITY_NS
         if stale:
             raise ActuatorError("MOTION_FEEDBACK_STALE", "执行器反馈接收已过期。")
         return feedback
+
+    def feedback_valid_until_monotonic_ns(self, feedback: MotionExecutionFeedback) -> Optional[int]:
+        """复用反馈校验的有效期；不把当前读取时刻当成新的接收时刻。"""
+        if feedback.received_monotonic_ns is None:
+            return None
+        deadline = feedback.received_monotonic_ns + _FEEDBACK_VALIDITY_NS
+        _, acquired_mono = acquired_times(feedback.source_timestamp_ns)
+        if acquired_mono is not None:
+            deadline = min(deadline, acquired_mono + _FEEDBACK_VALIDITY_NS)
+        return deadline
 
     def start(self, actuator, started):
         start, issued_ns = started
@@ -178,3 +191,4 @@ class StopConfirmation:
         self._last_evidence = evidence
         self._motion_since_confirmation = False
         return evidence
+

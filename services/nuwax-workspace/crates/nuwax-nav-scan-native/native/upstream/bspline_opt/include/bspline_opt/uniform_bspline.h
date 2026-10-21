@@ -48,8 +48,8 @@ namespace scan_planner
 
     // compute position / derivative
 
-    Eigen::VectorXd evaluateDeBoor(const double &u) const;                                               // use u \in [up, u_mp]
-    inline Eigen::VectorXd evaluateDeBoorT(const double &t) const { return evaluateDeBoor(t + u_(p_)); } // use t \in [0, duration]
+    Eigen::VectorXd evaluateDeBoor(const double &u);                                               // use u \in [up, u_mp]
+    inline Eigen::VectorXd evaluateDeBoorT(const double &t) { return evaluateDeBoor(t + u_(p_)); } // use t \in [0, duration]
     UniformBspline getDerivative();
 
     // 3D B-spline interpolation of points in point_set, with boundary vel&acc
@@ -78,3 +78,4 @@ namespace scan_planner
   };
 } // namespace scan_planner
 #endif
+

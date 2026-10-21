@@ -1,20 +1,47 @@
-// 本地无 ROS 提取与真实感知/机身适配；改动范围和上游归属见 native/NOTICE。
 #include "path_searching/dyn_a_star.h"
 #include <algorithm>
-#include <chrono>
 #include <cmath>
+#include <chrono>
+// Host adaptation: planning elapsed-time budget uses monotonic wall time, not simulation time.
 
 using namespace std;
 using namespace Eigen;
 
-AStar::~AStar() = default;
+AStar::~AStar()
+{
+    for (int i = 0; i < POOL_SIZE_(0); i++)
+    {
+        for (int j = 0; j < POOL_SIZE_(1); j++)
+        {
+            for (int k = 0; k < POOL_SIZE_(2); k++)
+                delete GridNodeMap_[i][j][k];
+            delete[] GridNodeMap_[i][j];
+        }
+        delete[] GridNodeMap_[i];
+    }
+    delete[] GridNodeMap_;
+}
 
 void AStar::initGridMap(GridMap::Ptr occ_map, const Eigen::Vector3i pool_size)
 {
-    POOL_SIZE_=pool_size;
-    CENTER_IDX_=pool_size/2;
-    grid_map_=occ_map;
-    grid_nodes_.clear();
+    POOL_SIZE_ = pool_size;
+    CENTER_IDX_ = pool_size / 2;
+
+    GridNodeMap_ = new GridNodePtr **[POOL_SIZE_(0)];
+    for (int i = 0; i < POOL_SIZE_(0); i++)
+    {
+        GridNodeMap_[i] = new GridNodePtr *[POOL_SIZE_(1)];
+        for (int j = 0; j < POOL_SIZE_(1); j++)
+        {
+            GridNodeMap_[i][j] = new GridNodePtr[POOL_SIZE_(2)];
+            for (int k = 0; k < POOL_SIZE_(2); k++)
+            {
+                GridNodeMap_[i][j][k] = new GridNode;
+            }
+        }
+    }
+
+    grid_map_ = occ_map;
 }
 
 double AStar::getDiagHeu(GridNodePtr node1, GridNodePtr node2)
@@ -72,7 +99,7 @@ vector<GridNodePtr> AStar::retrievePath(GridNodePtr current)
     return path;
 }
 
-bool AStar::ConvertToIndexAndAdjustStartEndPoints(Vector3d start_pt, Vector3d end_pt, Vector3i &start_idx, Vector3i &end_idx, double start_yaw)
+bool AStar::ConvertToIndexAndAdjustStartEndPoints(Vector3d start_pt, Vector3d end_pt, Vector3i &start_idx, Vector3i &end_idx)
 {
     if (!Coord2Index(start_pt, start_idx) || !Coord2Index(end_pt, end_idx))
         return false;
@@ -83,8 +110,7 @@ bool AStar::ConvertToIndexAndAdjustStartEndPoints(Vector3d start_pt, Vector3d en
     const double path_yaw = std::atan2(start_to_end(1), start_to_end(0));
     start_to_end.normalize();
 
-    const double actual_start_yaw=std::isfinite(start_yaw)?start_yaw:path_yaw;
-    int occ = checkOccupancy(start_pt, actual_start_yaw);
+    int occ = checkOccupancy(Index2Coord(start_idx), path_yaw);
     if (occ)
     {
         //ROS_WARN("Start point is insdide an obstacle.");
@@ -94,10 +120,10 @@ bool AStar::ConvertToIndexAndAdjustStartEndPoints(Vector3d start_pt, Vector3d en
             if (!Coord2Index(start_pt, start_idx))
                 return false;
 
-            occ = checkOccupancy(Index2Coord(start_idx), actual_start_yaw);
+            occ = checkOccupancy(Index2Coord(start_idx), path_yaw);
             if (occ == -1)
             {
-                SCAN_WARN( "[Astar] Start point outside the map region.");
+                ROS_WARN("[Astar] Start point outside the map region.");
                 return false;
             }
         } while (occ);
@@ -116,7 +142,7 @@ bool AStar::ConvertToIndexAndAdjustStartEndPoints(Vector3d start_pt, Vector3d en
             occ = checkOccupancy(Index2Coord(end_idx), path_yaw);
             if (occ == -1)
             {
-                SCAN_WARN( "[Astar] End point outside the map region.");
+                ROS_WARN("[Astar] End point outside the map region.");
                 return false;
             }
         } while (occ);
@@ -125,25 +151,19 @@ bool AStar::ConvertToIndexAndAdjustStartEndPoints(Vector3d start_pt, Vector3d en
     return true;
 }
 
-ASTAR_RET AStar::AstarSearch(const double step_size, Vector3d start_pt, Vector3d end_pt, double start_yaw)
+ASTAR_RET AStar::AstarSearch(const double step_size, Vector3d start_pt, Vector3d end_pt)
 {
     const auto time_1 = std::chrono::steady_clock::now();
     ++rounds_;
-    grid_nodes_.clear();
-    gridPath_.clear();
 
     step_size_ = step_size;
     inv_step_size_ = 1 / step_size;
     center_ = (start_pt + end_pt) / 2;
-    // 搜索位置与已有占据格心同相位，保留窄门中的真实可行通道。
-    center_.x()=(std::floor(center_.x()/step_size_)+0.5)*step_size_;
-    center_.y()=(std::floor(center_.y()/step_size_)+0.5)*step_size_;
 
     Vector3i start_idx, end_idx;
-    if (!ConvertToIndexAndAdjustStartEndPoints(start_pt, end_pt, start_idx, end_idx, start_yaw))
+    if (!ConvertToIndexAndAdjustStartEndPoints(start_pt, end_pt, start_idx, end_idx))
     {
-        SCAN_ERROR(
-                     "Unable to handle the initial or end point, force return!");
+        ROS_ERROR("Unable to handle the initial or end point, force return!");
         return ASTAR_RET::INIT_ERR;
     }
 
@@ -153,7 +173,7 @@ ASTAR_RET AStar::AstarSearch(const double step_size, Vector3d start_pt, Vector3d
     const Eigen::Vector2d search_xy_delta = search_end.head<2>() - search_start_xy;
     const double search_xy_len2 = search_xy_delta.squaredNorm();
 
-    auto interpolateZIndexOnSearchPlane = [&](const int x_idx, const int y_idx, const double previous_z) -> int {
+    auto interpolateZIndexOnSearchPlane = [&](const int x_idx, const int y_idx) -> int {
         if (search_xy_len2 < 1e-8)
             return start_idx(2);
 
@@ -162,25 +182,15 @@ ASTAR_RET AStar::AstarSearch(const double step_size, Vector3d start_pt, Vector3d
         double ratio = (sample_xy - search_start_xy).dot(search_xy_delta) / search_xy_len2;
         ratio = std::max(0.0, std::min(1.0, ratio));
 
-        const double reference_z = search_start(2) + ratio * (search_end(2) - search_start(2));
-        Eigen::Vector3d terrain_sample(sample_xy.x(),sample_xy.y(),previous_z);
-        double ground;
-        // 相邻搜索格按当前层的实测地形接续；起终点弦高会把平台与楼梯折点压入实体。
-        // 缺测列仍使用已有参考高度，不由地面缺测拒绝搜索。
-        const double z = grid_map_->measuredGround(terrain_sample,ground)
-            ? grid_map_->bodyHeight(terrain_sample) : reference_z;
-        return static_cast<int>(std::floor((z - center_(2)) * inv_step_size_ + 0.5)) + CENTER_IDX_(2);
+        const double z = search_start(2) + ratio * (search_end(2) - search_start(2));
+        return static_cast<int>((z - center_(2)) * inv_step_size_ + 0.5) + CENTER_IDX_(2);
     };
 
-    // 起终点和所有邻接使用同一实测高度索引；否则坡面终点永远不可能命中。
-    start_idx(2)=interpolateZIndexOnSearchPlane(start_idx(0),start_idx(1),start_pt.z());
-    end_idx(2)=interpolateZIndexOnSearchPlane(end_idx(0),end_idx(1),end_pt.z());
-
     // if ( start_pt(0) > -1 && start_pt(0) < 0 )
-    //     cerr << "start_pt=" << start_pt.transpose() << " end_pt=" << end_pt.transpose() << endl;
+    //     std::cerr << "start_pt=" << start_pt.transpose() << " end_pt=" << end_pt.transpose() << endl;
 
-    GridNodePtr startPtr = gridNode(start_idx);
-    GridNodePtr endPtr = gridNode(end_idx);
+    GridNodePtr startPtr = GridNodeMap_[start_idx(0)][start_idx(1)][start_idx(2)];
+    GridNodePtr endPtr = GridNodeMap_[end_idx(0)][end_idx(1)][end_idx(2)];
 
     std::priority_queue<GridNodePtr, std::vector<GridNodePtr>, NodeComparator> empty;
     openSet_.swap(empty);
@@ -208,13 +218,14 @@ ASTAR_RET AStar::AstarSearch(const double step_size, Vector3d start_pt, Vector3d
         openSet_.pop();
 
         // if ( num_iter < 10000 )
-        //     cerr << "current=" << current->index.transpose() << endl;
+        //     std::cerr << "current=" << current->index.transpose() << endl;
 
         if (current->index(0) == endPtr->index(0) && current->index(1) == endPtr->index(1) && current->index(2) == endPtr->index(2))
         {
-            // printf("\033[34mA star iter:%d, time:%.3f\033[0m\n",num_iter, (time_2 - time_1).toSec()*1000);
-            // if((time_2 - time_1).toSec() > 0.1)
-            //     ROS_WARN("Time consume in A star path finding is %f", (time_2 - time_1).toSec() );
+            // const auto time_2 = std::chrono::steady_clock::now();
+            // std::fprintf(stderr,"\033[34mA star iter:%d, time:%.3f\033[0m\n",num_iter, std::chrono::duration<double>(time_2 - time_1).count()*1000);
+            // if(std::chrono::duration<double>(time_2 - time_1).count() > 0.1)
+            //     ROS_WARN("Time consume in A star path finding is %f", std::chrono::duration<double>(time_2 - time_1).count() );
             gridPath_ = retrievePath(current);
             return ASTAR_RET::SUCCESS;
         }
@@ -229,16 +240,14 @@ ASTAR_RET AStar::AstarSearch(const double step_size, Vector3d start_pt, Vector3d
                 Vector3i neighborIdx;
                 neighborIdx(0) = (current->index)(0) + dx;
                 neighborIdx(1) = (current->index)(1) + dy;
-                neighborIdx(2) = interpolateZIndexOnSearchPlane(
-                    neighborIdx(0), neighborIdx(1),
-                    current == startPtr ? start_pt.z() : Index2Coord(current->index).z());
+                neighborIdx(2) = interpolateZIndexOnSearchPlane(neighborIdx(0), neighborIdx(1));
 
                 if (neighborIdx(0) < 1 || neighborIdx(0) >= POOL_SIZE_(0) - 1 || neighborIdx(1) < 1 || neighborIdx(1) >= POOL_SIZE_(1) - 1 || neighborIdx(2) < 1 || neighborIdx(2) >= POOL_SIZE_(2) - 1)
                 {
                     continue;
                 }
 
-                neighborPtr = gridNode(neighborIdx);
+                neighborPtr = GridNodeMap_[neighborIdx(0)][neighborIdx(1)][neighborIdx(2)];
                 neighborPtr->index = neighborIdx;
 
                 bool flag_explored = neighborPtr->rounds == rounds_;
@@ -248,19 +257,16 @@ ASTAR_RET AStar::AstarSearch(const double step_size, Vector3d start_pt, Vector3d
                     continue; //in closed set.
                 }
 
-                // 起点只代表实测位置；第一条边的航向由实际起点到格心求出。
-                const Eigen::Vector3d from=current==startPtr?start_pt:Index2Coord(current->index);
-                const Eigen::Vector3d to=Index2Coord(neighborPtr->index);
-                const double neighbor_yaw = std::atan2(to.y()-from.y(),to.x()-from.x());
-                if (!grid_map_->traversable(from,to) || checkOccupancy(to, neighbor_yaw))
+                neighborPtr->rounds = rounds_;
+
+                const double neighbor_yaw = std::atan2(static_cast<double>(dy), static_cast<double>(dx));
+                if (checkOccupancy(Index2Coord(neighborPtr->index), neighbor_yaw))
                 {
                     continue;
                 }
-                // 矩形机身的占据取决于入边航向；失败入边不能把同格的其他可行方向标成已发现。
-                neighborPtr->rounds = rounds_;
 
                 const int dz = neighborIdx(2) - current->index(2);
-                double static_cost = current==startPtr?(to-from).norm()*inv_step_size_:sqrt(dx * dx + dy * dy + dz * dz);
+                double static_cost = sqrt(dx * dx + dy * dy + dz * dz);
                 tentative_gScore = current->gScore + static_cost;
 
                 if (!flag_explored)
@@ -282,18 +288,15 @@ ASTAR_RET AStar::AstarSearch(const double step_size, Vector3d start_pt, Vector3d
         const auto time_2 = std::chrono::steady_clock::now();
         if (std::chrono::duration<double>(time_2 - time_1).count() > 0.2)
         {
-            SCAN_WARN(
-                        "Failed in A-star path search: 0.2 second time limit exceeded");
+            ROS_WARN("Failed in A star path searching !!! 0.2 seconds time limit exceeded.");
             return ASTAR_RET::SEARCH_ERR;
         }
     }
 
     const auto time_2 = std::chrono::steady_clock::now();
 
-    const double elapsed = std::chrono::duration<double>(time_2 - time_1).count();
-    if (elapsed > 0.1)
-        SCAN_WARN(
-                    "A-star path search took %.3fs, iter=%d", elapsed, num_iter);
+    if (std::chrono::duration<double>(time_2 - time_1).count() > 0.1)
+        ROS_WARN("Time consume in A star path finding is %.3fs, iter=%d", std::chrono::duration<double>(time_2 - time_1).count(), num_iter);
 
     return ASTAR_RET::SEARCH_ERR;
 }
@@ -308,3 +311,4 @@ vector<Vector3d> AStar::getPath()
     reverse(path.begin(), path.end());
     return path;
 }
+

@@ -44,6 +44,7 @@ fn packet(map:&schema::NavigationMap3D,sequence:i32,stamp:i64,pose_stamp:i64,
         is_bigendian:false,point_step:12,row_step:(count*12) as i32,data,is_dense:true,
     };
     recent_cloud::RecentCloud3D {
+        registration:None,
         producer_runtime_generation:map.producer_runtime_generation,
         session_id:map.committed_map.session_id.clone(),
         session_generation:map.committed_map.session_generation,

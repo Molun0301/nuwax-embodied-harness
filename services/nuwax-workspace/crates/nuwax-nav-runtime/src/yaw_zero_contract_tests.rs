@@ -40,7 +40,7 @@ async fn yaw_zero_surface_scheduler(
         map.validate_body_pose([p.x, p.y, p.z], [q.x, q.y, q.z, q.w]).unwrap();
     }
     let motion = Arc::new(Mutex::new(FakeMotionState::default()));
-    let follower = SurfaceFollower::new(config).unwrap();
+    let follower = crate::native_test_helpers::author_static_map_follower(config);
     let mut scheduler = NavScheduler::new(FakeMotion(motion.clone()), follower,
         SchedulerConfig::default()).unwrap();
     let (status, _) = watch::channel(scheduler.status.clone());

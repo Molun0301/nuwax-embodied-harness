@@ -7,11 +7,11 @@ fn zero_yaw_real_arrival_requalification_accepts_unchanged_yaw_after_translation
     let (computed, receive) = std::sync::mpsc::channel();
     let (release, wait) = std::sync::mpsc::channel();
     let worker = PlannerWorker::new(GatedRouteFollower {
-        inner: crate::RouteFollower::new(config).unwrap(),
+        inner: crate::native_test_helpers::author_static_map_follower(config),
         computed, release: wait, map: None, boundary: Vec::new(), odometry: None,
         goal_updates: 0, path_updates: 0,
     }).unwrap();
-    let mut harness = RouteWorkerHarness { worker, computed: receive, release, clear };
+    let mut harness = RouteWorkerHarness { worker, computed: receive, release, clear, observation_tick: 0 };
     let goal = route_pose(0.5, 0);
     let options = GoalOptions {
         position_tolerance_m: 0.1, yaw_tolerance_rad: 0.0, ..Default::default()

@@ -505,7 +505,7 @@ def main(argv=None):
     parser.add_argument("--request", type=Path, help="自动执行请求JSON，可自定义起点/目标/障碍")
     parser.add_argument("--speed", type=float, default=1.0)
     parser.add_argument("--no-local-planning", action="store_true",
-                        help="自动执行的对照组：关闭局部规划，直接跟随全局路线")
+                        help="仅保留旧版对照请求字段；作者 A 执行链不支持关闭局部规划，会明确拒绝")
     parser.add_argument("--timeout", type=float, default=120, help="自动执行的墙钟上限秒数，超时失败并保留结果")
     args = parser.parse_args(argv)
     try:

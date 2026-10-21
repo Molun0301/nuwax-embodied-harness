@@ -26,6 +26,12 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{interval_at, Instant, MissedTickBehavior};
 
+pub use nuwax_motion_safety_guard::MeasuredMotion;
+/// 保留来源时点的实测运动边界转换。
+pub mod motion_feedback;
+/// 同帧注册点云原始输入，不是融合地图。
+pub mod registered_frame;
+pub use registered_frame::{RegisteredFrame, RegisteredFrameDomain, RegisteredFrameIdentity};
 mod arrival_confirmation;
 use arrival_confirmation::{ArrivalConfirmation, ArrivalKind};
 mod command_dispatch;
@@ -563,6 +569,8 @@ pub enum BoundedTwistOutcome {
 /// Mutable motion boundary owned by exactly one scheduler task.
 #[async_trait]
 pub trait NavMotionPort: Send + 'static {
+    /// 最新原期限内的真实测速；None 不等于已停车，不得由命令回执构造。
+    fn measured_motion(&self) -> Option<MeasuredMotion> { None }
     /// 服务端截止推导出的提前续租时刻；模拟或外部实现可使用配置周期。
     fn renewal_due_at(&self) -> Option<Instant> { None }
     /// Acquire the NAV lease directly from the request's admission proof.
@@ -602,6 +610,7 @@ pub trait NavMotionPort: Send + 'static {
 
 #[async_trait]
 impl NavMotionPort for MotionGuardClient {
+    fn measured_motion(&self) -> Option<MeasuredMotion> { MotionGuardClient::measured_motion(self) }
     fn renewal_due_at(&self) -> Option<Instant> { self.renewal_due_at() }
     async fn acquire(
         &mut self,
@@ -749,6 +758,9 @@ impl ProductionNavMotionPort {
 
 #[async_trait]
 impl NavMotionPort for ProductionNavMotionPort {
+    fn measured_motion(&self) -> Option<MeasuredMotion> {
+        self.normal.as_ref().and_then(MotionGuardClient::measured_motion)
+    }
     fn renewal_due_at(&self) -> Option<Instant> {
         self.normal.as_ref().and_then(MotionGuardClient::renewal_due_at)
     }
@@ -952,6 +964,12 @@ pub trait NavPlanner: Send + 'static {
     }
     /// 接收运动端确认已应用的命令值，供下一拍规划接续；候选在回执前不进入该状态。
     fn observe_applied_command(&mut self, _command: Twist2) {}
+    /// 独立实测运动快照；保留缺失，与 pose 不假定同一采样。
+    fn observe_measured_motion(&mut self, _motion: Option<MeasuredMotion>) {}
+    /// 已准入的同帧 world 点云；None 撤销旧原帧，不借用最新定位补齐。
+    fn observe_registered_frame(&mut self, _frame: Option<Arc<RegisteredFrame>>) {}
+    /// 本次原算法执行周期结束，不是实际几何拒绝；只用于反馈原因分类。
+    fn execution_cycle_complete(&self) -> bool { false }
     /// 计算未完成或控制许可过期时的等待原因；命令回执不能覆盖该执行阶段。
     fn execution_wait_reason(&self) -> Option<String> { None }
     /// 只读展示当前局部规划，不改变速度或路径许可。
@@ -989,7 +1007,13 @@ impl BasicInProcessLocalBackend {
 
     fn set_navigation_motion_limits(&mut self, physical: nuwax_nav_types_messages::MotionLimits) -> Result<(),RuntimeError> {
         physical.validate().map_err(|reason|RuntimeError::InvalidInput{field:"navigation_capabilities",reason})?;
-        self.0.set_motion_limits(surface_follower::forward_navigation_limits(&physical))
+        // 旧二维后端保持原前向合同；本轮原生 SCAN 不经过这个适配器。
+        let mut legacy=physical;
+        if legacy.model==nuwax_nav_types_messages::MotionModel::Omnidirectional {
+            legacy.model=nuwax_nav_types_messages::MotionModel::Differential;
+        }
+        legacy.max_reverse_mps=0.;legacy.max_lateral_mps=0.;
+        self.0.set_motion_limits(legacy)
             .map_err(|reason|RuntimeError::InvalidInput{field:"navigation_capabilities",reason})
     }
 
@@ -1336,6 +1360,7 @@ where
                         }
                     }
                     SchedulerEvent::Tick | SchedulerEvent::ControlReady => {
+                        self.planner.observe_measured_motion(self.motion.measured_motion());
                         let previous = deferred_control.take();
                         let deadline = previous.as_ref().map_or_else(
                             || Instant::now() + self.config.tick_interval, |wait| wait.deadline);
@@ -1463,14 +1488,14 @@ where
                 InputKind::UpdateOdometry(pose, _, _) => ("scheduler.input.pose", pose.stamp.nanos),
                 InputKind::UpdateCostmap(map, _) => ("scheduler.input.map", map.source_timestamp_ns),
                 // Runtime owns no recent source timestamp; record its actual incoming bound.
-                InputKind::UpdateObstacleSource(_, _, _) => ("scheduler.input.recent", 0),
+                InputKind::UpdateObstacleSource(_, _, _, _) => ("scheduler.input.recent", 0),
                 InputKind::PlanningDiagnostic(_, _, _) => ("scheduler.input.planning_diagnostic", 0),
                 InputKind::CapturePlanningActual(_, _) => ("scheduler.input.capture_actual", 0),
             };
             sink.mark("scheduler.input.dequeue", source);
             match &command.kind {
                 InputKind::SubmitPath(path) => sink.count("scheduler.input.path_revision", source, path.path_revision),
-                InputKind::UpdateObstacleSource(_, available, bound) => {
+                InputKind::UpdateObstacleSource(_, available, bound, _) => {
                     sink.count("scheduler.input.recent_available", 0, u64::from(*available));
                     sink.bound("scheduler.input.recent_bound", 0, *bound);
                 }
@@ -1487,7 +1512,8 @@ where
             InputKind::UpdateCostmap(observation, received_at) => {
                 self.observe_costmap(status_tx, observation, received_at)
             }
-            InputKind::UpdateObstacleSource(map, available, bound) => (|| {
+            InputKind::UpdateObstacleSource(map, available, bound, registered) => (|| {
+                if let Some(frame) = registered { self.planner.observe_registered_frame(frame); }
                 if let Some(map)=map {
                     self.planner.update_execution_map(map.clone())?;
                 }
@@ -1732,6 +1758,7 @@ where
                     && proof.guard_generation == motion_admission.guard_generation =>
             {
                 self.lease_active = true;
+                self.planner.observe_measured_motion(self.motion.measured_motion());
                 self.status.motion_sink_ready = true;
                 self.status.guard_generation = proof.guard_generation;
                 self.path_wait_started_at = Some(Instant::now());
@@ -2088,6 +2115,7 @@ where
             }
             self.status.applied_commands=self.status.applied_commands.saturating_add(1);
             self.status.last_applied_twist=Some(applied_twist);
+            self.planner.observe_measured_motion(self.motion.measured_motion());
             self.planner.observe_applied_command(applied_twist);
             if let Some(feedback)=&mut self.status.surface_replan_feedback {
                 if feedback.current_context.as_ref().is_some_and(|context|
@@ -2249,6 +2277,7 @@ where
             .renew(&operation_id)
             .await
             .map_err(|error| RuntimeError::Motion(error.message));
+        self.planner.observe_measured_motion(self.motion.measured_motion());
         #[cfg(feature = "surface-recovery-qualification")]
         self.qualification_snapshot(if result.is_ok() { "scheduler.renew.ok" }
             else { "scheduler.renew.error" }, self.status.pose_source_timestamp_ns, None, 0);
@@ -2529,7 +2558,13 @@ impl NavSchedulerHandle {
     /// Persistent terrain receipts and planning geometry versions are unchanged.
     pub async fn update_obstacle_source(&self,map:Option<ExecutionMap>,available:bool,
         bound:Option<CommandDispatchBound>)->Result<(),RuntimeError> {
-        self.send_input(InputKind::UpdateObstacleSource(map,available,bound)).await
+        self.send_input(InputKind::UpdateObstacleSource(map,available,bound,(!available).then_some(None))).await
+    }
+
+    /// 原子交付现有障碍来源资格与同帧原始注册输入，不增加另一个时钟。
+    pub async fn update_registered_obstacle_source(&self, map:Option<ExecutionMap>, available:bool,
+        bound:Option<CommandDispatchBound>, frame:Option<Arc<RegisteredFrame>>)->Result<(),RuntimeError> {
+        self.send_input(InputKind::UpdateObstacleSource(map,available,bound,Some(frame))).await
     }
 
     /// 保留实际地图接收时刻，表面构建完成或队列等待不能延长输入有效期。
@@ -2623,11 +2658,11 @@ impl NavSchedulerHandle {
                 InputKind::SubmitPath(_) => ("scheduler.send.path", 0),
                 InputKind::UpdateOdometry(pose, _, _) => ("scheduler.send.pose", pose.stamp.nanos),
                 InputKind::UpdateCostmap(map, _) => ("scheduler.send.map", map.source_timestamp_ns),
-                InputKind::UpdateObstacleSource(_, _, _) => ("scheduler.send.recent", 0),
+                InputKind::UpdateObstacleSource(_, _, _, _) => ("scheduler.send.recent", 0),
                 InputKind::PlanningDiagnostic(_, _, _) => ("scheduler.send.planning_diagnostic", 0),
                 InputKind::CapturePlanningActual(_, _) => ("scheduler.send.capture_actual", 0),
             };
-            if let InputKind::UpdateObstacleSource(_, _, bound) = &kind {
+            if let InputKind::UpdateObstacleSource(_, _, bound, _) = &kind {
                 sink.bound("scheduler.input.send.recent_bound", 0, *bound);
             }
             sink.mark("scheduler.input.send.begin", source);
@@ -2770,7 +2805,7 @@ enum InputKind {
     SubmitPath(VersionedPath),
     UpdateOdometry(PoseStamped, Option<Instant>, Instant),
     UpdateCostmap(CostmapObservation, Instant),
-    UpdateObstacleSource(Option<ExecutionMap>,bool,Option<CommandDispatchBound>),
+    UpdateObstacleSource(Option<ExecutionMap>,bool,Option<CommandDispatchBound>,Option<Option<Arc<RegisteredFrame>>>),
     PlanningDiagnostic(String, GoalKey, String),
     CapturePlanningActual(PathExecutionIdentity, oneshot::Sender<Option<Arc<ActualExecutionContext>>>),
 }
@@ -3038,6 +3073,7 @@ mod tests {
     include!("position_zero_runtime_tests.rs");
     include!("yaw_zero_contract_tests.rs");
     include!("recent_source_health_tests.rs");
+    include!("registered_frame_stream_tests.rs");
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -3440,7 +3476,8 @@ mod tests {
         (
             operation,
             MotionGuardResponse {
-                api_version: API_VERSION,
+                measured_motion_feedback: None,
+            api_version: API_VERSION,
                 request_id: request.request_id.clone(),
                 outcome: Some(outcome),
             },
@@ -4915,7 +4952,7 @@ mod tests {
         local_config.controller.goal_tolerance = 0.12;
         let scheduler = NavScheduler::new(
             FakeMotion(Arc::new(Mutex::new(FakeMotionState::default()))),
-            planner_worker::PlannerWorker::new(SurfaceFollower::new(local_config).unwrap()).unwrap(),
+            planner_worker::PlannerWorker::new(crate::native_test_helpers::author_static_map_follower(local_config)).unwrap(),
             SchedulerConfig {
                 tick_interval: Duration::from_millis(5),
                 pose_ttl: Duration::from_secs(1),

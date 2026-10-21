@@ -7,14 +7,16 @@ DO NOT MODIFY BY HAND!!!!
 from io import BytesIO
 import struct
 
+import nuwax_msgs
+
 class RecentCloud3D(object):
     """ Independent live admitted observations; never a persistent map revision. """
 
-    __slots__ = ["schema_version", "producer_runtime_generation", "session_id", "session_generation", "map_frame_generation", "commit_boot_nonce", "cleared", "ground_point_count", "ground_point_indices", "cloud_bytes_count", "cloud_bytes"]
+    __slots__ = ["schema_version", "producer_runtime_generation", "session_id", "session_generation", "map_frame_generation", "commit_boot_nonce", "cleared", "registration_count", "registration", "ground_point_count", "ground_point_indices", "cloud_bytes_count", "cloud_bytes"]
 
-    __typenames__ = ["int32_t", "int64_t", "string", "int64_t", "int64_t", "byte", "int8_t", "int32_t", "int32_t", "int32_t", "byte"]
+    __typenames__ = ["int32_t", "int64_t", "string", "int64_t", "int64_t", "byte", "int8_t", "int32_t", "nuwax_msgs.RegisteredCloudPose", "int32_t", "int32_t", "int32_t", "byte"]
 
-    __dimensions__ = [None, None, None, None, None, [16], None, None, ["ground_point_count"], None, ["cloud_bytes_count"]]
+    __dimensions__ = [None, None, None, None, None, [16], None, None, ["registration_count"], None, ["ground_point_count"], None, ["cloud_bytes_count"]]
 
     def __init__(self):
         self.schema_version = 0
@@ -31,6 +33,14 @@ class RecentCloud3D(object):
         """ LCM Type: byte[16] """
         self.cleared = 0
         """ LCM Type: int8_t """
+        self.registration_count = 0
+        """
+        v2: 0 表示原点未知或撤销；1 表示同帧真实配对，禁止补零。
+        LCM Type: int32_t
+        """
+
+        self.registration = []
+        """ LCM Type: nuwax_msgs.RegisteredCloudPose[registration_count] """
         self.ground_point_count = 0
         """ LCM Type: int32_t """
         self.ground_point_indices = []
@@ -54,7 +64,11 @@ class RecentCloud3D(object):
         buf.write(b"\0")
         buf.write(struct.pack(">qq", self.session_generation, self.map_frame_generation))
         buf.write(bytearray(self.commit_boot_nonce[:16]))
-        buf.write(struct.pack(">bi", self.cleared, self.ground_point_count))
+        buf.write(struct.pack(">bi", self.cleared, self.registration_count))
+        for i0 in range(self.registration_count):
+            assert self.registration[i0]._get_packed_fingerprint() == nuwax_msgs.RegisteredCloudPose._get_packed_fingerprint()
+            self.registration[i0]._encode_one(buf)
+        buf.write(struct.pack(">i", self.ground_point_count))
         buf.write(struct.pack('>%di' % self.ground_point_count, *self.ground_point_indices[:self.ground_point_count]))
         buf.write(struct.pack(">i", self.cloud_bytes_count))
         buf.write(bytearray(self.cloud_bytes[:self.cloud_bytes_count]))
@@ -77,7 +91,11 @@ class RecentCloud3D(object):
         self.session_id = buf.read(__session_id_len)[:-1].decode('utf-8', 'replace')
         self.session_generation, self.map_frame_generation = struct.unpack(">qq", buf.read(16))
         self.commit_boot_nonce = buf.read(16)
-        self.cleared, self.ground_point_count = struct.unpack(">bi", buf.read(5))
+        self.cleared, self.registration_count = struct.unpack(">bi", buf.read(5))
+        self.registration = []
+        for i0 in range(self.registration_count):
+            self.registration.append(nuwax_msgs.RegisteredCloudPose._decode_one(buf))
+        self.ground_point_count = struct.unpack(">i", buf.read(4))[0]
         self.ground_point_indices = struct.unpack('>%di' % self.ground_point_count, buf.read(self.ground_point_count * 4))
         self.cloud_bytes_count = struct.unpack(">i", buf.read(4))[0]
         self.cloud_bytes = buf.read(self.cloud_bytes_count)
@@ -86,7 +104,8 @@ class RecentCloud3D(object):
     @staticmethod
     def _get_hash_recursive(parents):
         if RecentCloud3D in parents: return 0
-        tmphash = (0xff7e222461914a0c) & 0xffffffffffffffff
+        newparents = parents + [RecentCloud3D]
+        tmphash = (0x7fb76b6a7b9abea7+ nuwax_msgs.RegisteredCloudPose._get_hash_recursive(newparents)) & 0xffffffffffffffff
         tmphash  = (((tmphash<<1)&0xffffffffffffffff) + (tmphash>>63)) & 0xffffffffffffffff
         return tmphash
     _packed_fingerprint = None
@@ -100,3 +119,4 @@ class RecentCloud3D(object):
     def get_hash(self):
         """Get the LCM hash of the struct"""
         return struct.unpack(">Q", RecentCloud3D._get_packed_fingerprint())[0]
+

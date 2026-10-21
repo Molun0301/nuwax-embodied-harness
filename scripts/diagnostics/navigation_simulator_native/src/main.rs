@@ -1,5 +1,6 @@
 //! 开发机导航模拟工作进程：复用生产规划与跟随，环境运动独立积分速度命令。
 mod captured_source;
+mod native_door_scenarios;
 mod scenarios;
 mod terrain_reference;
 mod world_motion;
@@ -48,6 +49,28 @@ fn unit_orientation(q: [f64; 4]) -> [f64; 4] {
 fn yaw(p: Body) -> f64 {
     let [x, y, z, w] = unit_orientation(p.1);
     (2. * (w * z + x * y)).atan2(1. - 2. * (y * y + z * z))
+}
+// Independent physics state observation. The held-body XY model has an exact
+// endpoint planar velocity; terrain tilt derivatives come from actual poses.
+// This synchronous snapshot is replaced on the next physical step, not a live
+// production stream, so it has no invented wall-clock sensor TTL.
+fn physics_motion(previous:Body,current:Body,v:[f64;3],time:f64)->nuwax_nav_runtime::MeasuredMotion {
+    let q=unit_orientation(current.1);let heading=yaw(current);
+    let z_velocity=if time>0. {(current.0[2]-previous.0[2])/DT}else{0.};
+    let world=[heading.cos()*v[0]-heading.sin()*v[1],heading.sin()*v[0]+heading.cos()*v[1],z_velocity];
+    let body=world_motion::rotate([-q[0],-q[1],-q[2],q[3]],world);
+    let [roll,pitch]=tilt(q);let before=tilt(previous.1);
+    let wrap=|a:f64|a.sin().atan2(a.cos());
+    let rd=if time>0. {wrap(roll-before[0])/DT}else{0.};
+    let pd=if time>0. {wrap(pitch-before[1])/DT}else{0.};
+    let gyro=[rd-v[2]*pitch.sin(),pd*roll.cos()+v[2]*roll.sin()*pitch.cos(),-pd*roll.sin()+v[2]*roll.cos()*pitch.cos()];
+    let mut ts=libc::timespec {tv_sec:0,tv_nsec:0};
+    unsafe {libc::clock_gettime(libc::CLOCK_MONOTONIC,&mut ts);}
+    let now=ts.tv_sec as u64*1_000_000_000+ts.tv_nsec as u64;
+    nuwax_nav_runtime::MeasuredMotion {source_id:"simulator:independent-physics-state".into(),
+        source_timestamp_ns:stamped(current,time).stamp.nanos as u64,received_monotonic_ns:now,
+        valid_until_monotonic_ns:u64::MAX,frame_id:"base_link".into(),body_linear_xyz:body,
+        body_angular_xyz:gyro,orientation_wxyz:Some([q[3],q[0],q[1],q[2]])}
 }
 fn quaternion(roll: f64, pitch: f64, yaw: f64) -> [f64; 4] {
     let (sr, cr) = (roll / 2.).sin_cos();
@@ -976,7 +999,7 @@ impl Simulation {
             can_rotate_in_place: true,
         });
         let options = GoalOptions {
-            allow_reverse: false,
+            allow_reverse: request["allow_reverse"].as_bool().unwrap_or(true),
             position_tolerance_m: 0.35,
             yaw_tolerance_rad: if request["requires_orientation"].as_bool().unwrap_or(false) {
                 0.15
@@ -1017,6 +1040,8 @@ impl Simulation {
             current.1=q;
         }
         let mut follower = RouteFollower::new(config).map_err(|e| e.to_string())?;
+        // Explicit original-A static occupancy fixture, not synthetic LiDAR rays.
+        follower.enable_author_static_map_fixture(true);
         follower
             .update_execution_map(ExecutionMap::Surface(scene.map.clone()))
             .map_err(|e| e.to_string())?;
@@ -1024,6 +1049,7 @@ impl Simulation {
         follower
             .configure_goal(&stamped(goal, 0.), options)
             .map_err(|e| e.to_string())?;
+        follower.observe_measured_motion(Some(physics_motion(current,current,[0.;3],0.)));
         Ok(Self {
             scene: scene.id.clone(),
             follower,
@@ -1155,6 +1181,7 @@ impl Simulation {
         self.max_reverse_command_mps=self.max_reverse_command_mps.max(-self.command[0]);
         self.max_lateral_command_mps=self.max_lateral_command_mps.max(self.command[1].abs());
         let old = self.applied;
+        let previous_body = self.current;
         let dx = self.command[0] - old[0];
         let dy = self.command[1] - old[1];
         let change = dx.hypot(dy);
@@ -1212,6 +1239,7 @@ impl Simulation {
             .observe_applied_command(as_twist(self.applied));
         self.follower
             .update_odometry(stamped(self.current, self.time));
+        self.follower.observe_measured_motion(Some(physics_motion(previous_body,self.current,self.applied,self.time)));
         if arriving
             && self.applied[0].hypot(self.applied[1]) < STOP_LINEAR_MPS
             && self.applied[2].abs() < STOP_ANGULAR_RPS
@@ -1235,7 +1263,7 @@ impl Simulation {
     fn state(&mut self, scene: &Scene) -> Value {
         let local:Vec<_>=self.follower.local_path().map_or_else(Vec::new,|path|path.poses.iter()
             .map(|pose|[pose.pose.position.x,pose.pose.position.y,pose.pose.position.z]).collect());
-        json!({"status":self.status,"sim_time_sec":self.time,"pose":pose4(self.current),"orientation":self.current.1,"goal":pose4(self.goal),"goal_options":{"position_tolerance_m":self.options.position_tolerance_m,"yaw_tolerance_rad":self.options.yaw_tolerance_rad,"requires_orientation":self.options.requires_orientation()},"stopping_criteria":{"linear_speed_below_mps":STOP_LINEAR_MPS,"angular_speed_below_rps":STOP_ANGULAR_RPS,"comparison":"strictly_less"},"command":self.command,"velocity":self.applied,"global_path":self.path.iter().map(|p|p.0).collect::<Vec<_>>(),"path_revision":self.plans,"path_history":self.history,"local_path":local,"frames":std::mem::take(&mut self.pending_frames),"obstacles":scene.obstacles,"world_model":self.pose_mode,"terrain_response":scene.metadata["terrain_response"],"motion_failure":self.motion_failure,"metrics":{"speed_mps":self.applied[0].hypot(self.applied[1]),"configured_speed_mps":self.speed,"distance_remaining_m":distance(self.current,self.goal),"global_plans":self.plans,"local_plans":self.follower.local_plans(),"last_plan_ms":self.last_plan_ms,"last_control_ms":self.last_control_ms,"max_rss_mb":rss_mb(),"motion_validation_failures":self.motion_failures,"reverse_travel_m":self.reverse_travel_m,"lateral_travel_m":self.lateral_travel_m,"max_reverse_command_mps":self.max_reverse_command_mps,"max_lateral_command_mps":self.max_lateral_command_mps},"motion_policy":"forward_only","local_planning":self.local_planning,"message":self.message})
+        json!({"status":self.status,"sim_time_sec":self.time,"pose":pose4(self.current),"orientation":self.current.1,"goal":pose4(self.goal),"goal_options":{"position_tolerance_m":self.options.position_tolerance_m,"yaw_tolerance_rad":self.options.yaw_tolerance_rad,"requires_orientation":self.options.requires_orientation()},"stopping_criteria":{"linear_speed_below_mps":STOP_LINEAR_MPS,"angular_speed_below_rps":STOP_ANGULAR_RPS,"comparison":"strictly_less"},"command":self.command,"velocity":self.applied,"global_path":self.path.iter().map(|p|p.0).collect::<Vec<_>>(),"path_revision":self.plans,"path_history":self.history,"local_path":local,"frames":std::mem::take(&mut self.pending_frames),"obstacles":scene.obstacles,"world_model":self.pose_mode,"terrain_response":scene.metadata["terrain_response"],"motion_failure":self.motion_failure,"metrics":{"speed_mps":self.applied[0].hypot(self.applied[1]),"configured_speed_mps":self.speed,"distance_remaining_m":distance(self.current,self.goal),"global_plans":self.plans,"local_plans":self.follower.local_plans(),"last_plan_ms":self.last_plan_ms,"last_control_ms":self.last_control_ms,"max_rss_mb":rss_mb(),"motion_validation_failures":self.motion_failures,"reverse_travel_m":self.reverse_travel_m,"lateral_travel_m":self.lateral_travel_m,"max_reverse_command_mps":self.max_reverse_command_mps,"max_lateral_command_mps":self.max_lateral_command_mps},"motion_policy":"forward_preferred_omnidirectional","local_planning":self.local_planning,"message":self.message})
     }
 }
 fn synthetic(blocked: bool) -> Vec<(f32, f32, f32)> {
@@ -1382,6 +1410,7 @@ fn run() -> Result<(), String> {
         catalog["scenes"].as_array_mut().unwrap().push(scene.metadata.clone());
         scenes.insert(specification.id.into(),scene);
     }
+    native_door_scenarios::register(&config, &data, &mut scenes, &mut catalog)?;
         catalog
     };
     fs::write(

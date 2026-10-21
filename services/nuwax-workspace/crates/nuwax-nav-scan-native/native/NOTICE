@@ -1,3 +1,28 @@
+Current SCAN production algorithm source (author A):
+  https://github.com/wuyi2121/SCAN-Planner
+  fixed commit 348e8a590a50a5a6bbab8d8c6dcfd171f009be26
+
+The Cargo and CMake production targets now compile author_a FSM, manager,
+container, original map core and time-domain controller, plus the author-A
+bspline/A*/polynomial files under upstream/. Old native/src and legacy include
+implementations are retained for provenance, not compiled into this target.
+
+Explicit user exceptions: do not freeze translation at a fixed 0.8 rad heading
+error; do not replace the final business goal with an earlier free point.
+
+Necessary host adaptations: ROS transport/time/parameter/visualization removal;
+persistent per-navigation-session state; real platform limits and calibrated
+body reference; original-author step-aware collision-band parameter mapping;
+independent pre-existing business boundary/forbidden constraints; real registered
+world frames and separately labelled static occupancy fixtures; cancellation,
+source validity and physical stop evidence remain outside the author algorithm.
+Original A calculation timeouts use steady wall time, trajectory time uses one
+injected host clock. Console diagnostics go to stderr, preserving the host JSON
+protocol. Full physical standing dimensions and simulation judge are unchanged.
+
+The historical integrated-B notice below is retained because its retired source
+and attribution are still present. It is not the current SCAN algorithm source.
+
 PCT-SCAN-ROS2
 Copyright 2026 PCT-SCAN-ROS2 contributors
 
@@ -53,3 +78,18 @@ L-BFGS、多项式初始化、Mode3 参考窗口和闭环执行控制。
 平台实测厚地面适配：同列当前可接续测量支撑所属体素及其下方实体
 允许足端接触；保留完整占据数据和支撑层以上、未知支撑、禁行及其它楼层碰撞。
 该分类修复位于本地 GridMap 接口，不改变上游优化器参数或终止条件。
+
+原 SCAN 控制机制恢复（2026-10-21，新的验证阶段）：
+撤销本轮 q3 正射线、额外差速时间参数化、空间执行游标，以及固定0.8rad
+冻结门槛。恢复原时间参考与实际位置闭环、独立机身vx/vy/角速度输出、
+完整局部样条发布。真实硬件能力限幅保留；前向只是姿态追随偏好，
+并非侧移或倒退硬禁令。用户明确关闭NEH额外命令准入与矩形细裁决，
+其函数保留未调用；原双圆柱占据、周期曲线检查及独立模拟裁判保留。
+上层实测地面实体分类继续保留，避免来源拆分ground/obstacles丢失楼板。
+恢复原单次refine及原优化软参数，不将优化容差视为执行超速权限。
+保留等间隔终点采样修复和全局折线精确投影修复；不改变PCT语义。
+缺失速度/加速度明确区别于实测零：历史计划仅作接续，命令估计仅作
+无测量时的执行参考并标来源，不宣称已取得传感器测量。
+
+此前失败候选和验证证据独立保留。当前恢复候选尚未通过完整验收，
+不得以组件成功替代实录、极窄门与完整闭环结果。

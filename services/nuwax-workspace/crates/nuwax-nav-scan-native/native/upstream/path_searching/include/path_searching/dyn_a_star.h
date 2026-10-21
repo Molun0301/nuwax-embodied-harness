@@ -1,15 +1,14 @@
-// 本地无 ROS 提取与真实感知/机身适配；改动范围和上游归属见 native/NOTICE。
 #ifndef _DYN_A_STAR_H_
 #define _DYN_A_STAR_H_
 
 #include <iostream>
-#include <scan_native_log.h>
+#include <author_host.h>
+
 #include <Eigen/Eigen>
 #include <plan_env/grid_map.h>
 #include <queue>
-#include <limits>
 
-constexpr double inf = std::numeric_limits<double>::infinity();
+constexpr double inf = 1 >> 20;
 struct GridNode;
 typedef GridNode *GridNodePtr;
 
@@ -61,7 +60,7 @@ private:
 	double getEuclHeu(GridNodePtr node1, GridNodePtr node2);
 	inline double getHeu(GridNodePtr node1, GridNodePtr node2);
 
-	bool ConvertToIndexAndAdjustStartEndPoints(const Eigen::Vector3d start_pt, const Eigen::Vector3d end_pt, Eigen::Vector3i &start_idx, Eigen::Vector3i &end_idx, double start_yaw);
+	bool ConvertToIndexAndAdjustStartEndPoints(const Eigen::Vector3d start_pt, const Eigen::Vector3d end_pt, Eigen::Vector3i &start_idx, Eigen::Vector3i &end_idx);
 
 	inline Eigen::Vector3d Index2Coord(const Eigen::Vector3i &index) const;
 	inline bool Coord2Index(const Eigen::Vector3d &pt, Eigen::Vector3i &idx) const;
@@ -74,18 +73,12 @@ private:
 
 	double step_size_, inv_step_size_;
 	Eigen::Vector3d center_;
-	Eigen::Vector3i CENTER_IDX_, POOL_SIZE_{0, 0, 0};
+	Eigen::Vector3i CENTER_IDX_, POOL_SIZE_;
 	const double tie_breaker_ = 1.0 + 1.0 / 10000;
 
 	std::vector<GridNodePtr> gridPath_;
 
-	// 仅分配实际访问的原 GridNode，精细地图不会先物化整个三维节点池。
-    std::unordered_map<GridMap::Key,std::unique_ptr<GridNode>,GridMap::Hash> grid_nodes_;
-    GridNodePtr gridNode(const Eigen::Vector3i& index) {
-        auto& node=grid_nodes_[{index.x(),index.y(),index.z()}];
-        if(!node) node=std::make_unique<GridNode>();
-        return node.get();
-    }
+	GridNodePtr ***GridNodeMap_;
 	std::priority_queue<GridNodePtr, std::vector<GridNodePtr>, NodeComparator> openSet_;
 
 	int rounds_{0};
@@ -98,7 +91,7 @@ public:
 
 	void initGridMap(GridMap::Ptr occ_map, const Eigen::Vector3i pool_size);
 
-	ASTAR_RET AstarSearch(const double step_size, Eigen::Vector3d start_pt, Eigen::Vector3d end_pt, double start_yaw = std::numeric_limits<double>::quiet_NaN());
+	ASTAR_RET AstarSearch(const double step_size, Eigen::Vector3d start_pt, Eigen::Vector3d end_pt);
 
 	std::vector<Eigen::Vector3d> getPath();
 };
@@ -115,12 +108,11 @@ inline Eigen::Vector3d AStar::Index2Coord(const Eigen::Vector3i &index) const
 
 inline bool AStar::Coord2Index(const Eigen::Vector3d &pt, Eigen::Vector3i &idx) const
 {
-	idx = ((pt - center_) * inv_step_size_ + Eigen::Vector3d(0.5, 0.5, 0.5)).array().floor().cast<int>().matrix() + CENTER_IDX_;
+	idx = ((pt - center_) * inv_step_size_ + Eigen::Vector3d(0.5, 0.5, 0.5)).cast<int>() + CENTER_IDX_;
 
 	if (idx(0) < 0 || idx(0) >= POOL_SIZE_(0) || idx(1) < 0 || idx(1) >= POOL_SIZE_(1) || idx(2) < 0 || idx(2) >= POOL_SIZE_(2))
 	{
-		SCAN_ERROR(
-		             "Ran out of pool, index=%d %d %d", idx(0), idx(1), idx(2));
+		ROS_ERROR("Ran out of pool, index=%d %d %d", idx(0), idx(1), idx(2));
 		return false;
 	}
 
@@ -128,3 +120,4 @@ inline bool AStar::Coord2Index(const Eigen::Vector3d &pt, Eigen::Vector3i &idx) 
 };
 
 #endif
+

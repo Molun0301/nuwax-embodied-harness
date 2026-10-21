@@ -7094,8 +7094,12 @@ impl GeometryRuntime for GeometryRuntimeService {
             ng.motion_stop_generation,
         )
         .map_err(Status::invalid_argument)?;
+        let allow_reverse = nuwax_nav_types_messages::GoalOptions::resolve_reverse_request(
+            ng.allow_reverse, ng.use_profile_reverse_default,
+            self.bridge.nav.configured_profile() == crate::nav_runtime::PROFILE_MLS3D,
+        ).map_err(Status::invalid_argument)?;
         let input = SetGoalInput {
-            options: nuwax_nav_types_messages::GoalOptions {allow_reverse:ng.allow_reverse,position_tolerance_m:ng.position_tolerance_m.unwrap_or(0.35),yaw_tolerance_rad:ng.yaw_tolerance_rad.unwrap_or(0.3)},
+            options: nuwax_nav_types_messages::GoalOptions {allow_reverse,position_tolerance_m:ng.position_tolerance_m.unwrap_or(0.35),yaw_tolerance_rad:ng.yaw_tolerance_rad.unwrap_or(0.3)},
             goal_id: goal_id.clone(),
             owner_kind,
             parent_request_id,

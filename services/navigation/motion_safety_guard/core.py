@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 import hashlib
 import hmac
+import math
 import secrets
 import threading
 import time
@@ -1377,6 +1378,36 @@ class MotionGuardCore:
         if self._pending_stop is not None and record.zero_ack_id == self._last_zero_confirmation.zero_ack_id:
             self._pending_zero_records.append((priority, key, envelope.operation_id))
 
+    def _measured_motion_feedback(self) -> Optional[pb.MeasuredMotionFeedback]:
+        """附带已有真实样本，不代表当前命令后的观测，也不影响命令结果。"""
+        try:
+            feedback = self._read_execution_feedback()
+            if feedback is None or not feedback.source_id or not feedback.source_id.strip():
+                return None
+            linear = (feedback.linear_x_mps, feedback.linear_y_mps, feedback.linear_z_mps)
+            angular = (feedback.angular_x_rps, feedback.angular_y_rps, feedback.angular_z_rps)
+            if any(value is None or not math.isfinite(value) for value in linear + angular):
+                return None
+            orientation = feedback.orientation_wxyz
+            if orientation is not None and not 0.9 <= math.sqrt(sum(v * v for v in orientation)) <= 1.1:
+                return None
+            deadline = self._stop_confirmation.feedback_valid_until_monotonic_ns(feedback)
+            if deadline is None or self._monotonic_ns() > deadline:
+                return None
+            return pb.MeasuredMotionFeedback(
+                source_id=feedback.source_id,
+                source_timestamp_ns=feedback.source_timestamp_ns,
+                received_monotonic_ns=feedback.received_monotonic_ns,
+                valid_until_monotonic_ns=deadline,
+                frame_id=feedback.frame_id,
+                body_linear_xyz=linear,
+                body_angular_xyz=angular,
+                orientation_wxyz=orientation or (),
+            )
+        except Exception:
+            # 旁路测量不可用仅表示未知，不能阻塞租约、指令、停车或错误回执。
+            return None
+
     def _response(self, request: pb.MotionGuardRequest):
         operation = request.WhichOneof("operation")
         if operation is None:
@@ -1387,6 +1418,9 @@ class MotionGuardCore:
         )
         outcome = getattr(response, operation)
         outcome.SetInParent()
+        measured = self._measured_motion_feedback()
+        if measured is not None:
+            response.measured_motion_feedback.CopyFrom(measured)
         return response, outcome
 
     def _error_response(

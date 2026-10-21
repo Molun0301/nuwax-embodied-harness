@@ -13,7 +13,7 @@ namespace lbfgs
 
     /**
      *  Return values of lbfgs_optimize().
-     *
+     * 
      * Roughly speaking, a negative value indicates an error.
      */
 
@@ -175,7 +175,7 @@ namespace lbfgs
          *  iteration (which is sometimes the case when solving very large
          *  problems) it may be advantageous to set this parameter to a small
          *  value. A typical small value is 0.1. This parameter shuold be
-         *  greater than the f_dec_coeff parameter (1e-4)
+         *  greater than the f_dec_coeff parameter (1e-4) 
          *  and smaller than 1.0.
          */
         double s_curv_coeff;
@@ -197,7 +197,7 @@ namespace lbfgs
      *  function and its gradients when needed. A client program must implement
      *  this function to evaluate the values of the objective function and its
      *  gradients, given current values of variables.
-     *
+     *  
      *  @param  instance    The user data sent for lbfgs_optimize() function by the client.
      *  @param  x           The current values of variables.
      *  @param  g           The gradient vector. The callback function must compute
@@ -216,10 +216,10 @@ namespace lbfgs
      *
      *  The lbfgs_optimize() function call this function to obtain the values of the
      *  upperbound of the stepsize to search in, provided with the beginning values of
-     *  variables before the linear search, and the current step vector (can be descent direction).
-     *  A client program can implement this function for more efficient linesearch.
+     *  variables before the linear search, and the current step vector (can be descent direction). 
+     *  A client program can implement this function for more efficient linesearch. 
      *  If it is not used, just set it NULL or nullptr.
-     *
+     *  
      *  @param  instance    The user data sent for lbfgs_optimize() function by the client.
      *  @param  xp          The values of variables before current line search.
      *  @param  d           The step vector. It can be the descent direction.
@@ -497,7 +497,7 @@ namespace lbfgs
      *  @param  brackt  The pointer to the predicate if the trial value is
      *                  bracketed.
      *  @retval int     Status value. Zero indicates a normal termination.
-     *
+     *  
      *  @see
      *      Jorge J. More and David J. Thuente. Line search algorithm with
      *      guaranteed sufficient decrease. ACM Transactions on Mathematical
@@ -658,7 +658,7 @@ namespace lbfgs
             x <- x, y <- t.
         - Case b: if f(t) <= f(x) && f'(t)*f'(x) > 0,
             x <- t, y <- y.
-        - Case c: if f(t) <= f(x) && f'(t)*f'(x) < 0,
+        - Case c: if f(t) <= f(x) && f'(t)*f'(x) < 0, 
             x <- t, y <- x.
          */
         if (*fx < *ft)
@@ -969,19 +969,19 @@ namespace lbfgs
     /**
      * Start a L-BFGS optimization.
      * A user must implement a function compatible with ::lbfgs_evaluate_t (evaluation
-     * callback) and pass the pointer to the callback function to lbfgs_optimize()
-     * arguments. Similarly, a user can implement a function compatible with
-     * ::lbfgs_stepbound_t to provide an external upper bound for stepsize, and
-     * ::lbfgs_progress_t (progress callback) to obtain the current progress
-     * (e.g., variables, function value, ||G||, etc) and to cancel the iteration
-     * process if necessary. Implementation of the stepbound and the progress callback
+     * callback) and pass the pointer to the callback function to lbfgs_optimize() 
+     * arguments. Similarly, a user can implement a function compatible with 
+     * ::lbfgs_stepbound_t to provide an external upper bound for stepsize, and 
+     * ::lbfgs_progress_t (progress callback) to obtain the current progress 
+     * (e.g., variables, function value, ||G||, etc) and to cancel the iteration 
+     * process if necessary. Implementation of the stepbound and the progress callback 
      * is optional: a user can pass NULL if progress notification is not necessary.
-     *
+     * 
      * This algorithm terminates an optimization
      * when:
      *
      *   ||G|| < g_epsilon \cdot \max(1, ||x||) .
-     *
+     * 
      * In this formula, ||.|| denotes the Euclidean norm.
      *
      *  @param  n           The number of variables.
@@ -995,13 +995,13 @@ namespace lbfgs
      *  @param  proc_evaluate   The callback function to provide function and
      *                          gradient evaluations given a current values of
      *                          variables. A client program must implement a
-     *                          callback function compatible with
+     *                          callback function compatible with 
      *                          lbfgs_evaluate_t and pass the pointer to the
      *                          callback function.
      *  @param  proc_stepbound  The callback function to provide values of the
      *                          upperbound of the stepsize to search in, provided
-     *                          with the beginning values of variables before the
-     *                          linear search, and the current step vector (can
+     *                          with the beginning values of variables before the 
+     *                          linear search, and the current step vector (can 
      *                          be negative gradient). A client program can implement
      *                          this function for more efficient linesearch. If it is
      *                          not used, just set it NULL or nullptr.
@@ -1015,7 +1015,7 @@ namespace lbfgs
      *  @param  param       The pointer to a structure representing parameters for
      *                      L-BFGS optimization. A client program can set this
      *                      parameter to NULL to use the default parameters.
-     *                      Call lbfgs_load_default_parameters() function to
+     *                      Call lbfgs_load_default_parameters() function to 
      *                      fill a structure with the default values.
      *  @retval int         The status code. This function returns zero if the
      *                      minimization process terminates without an error. A

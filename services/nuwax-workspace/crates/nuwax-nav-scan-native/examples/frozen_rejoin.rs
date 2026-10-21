@@ -1,4 +1,5 @@
-//! 原严格迟到接回场景的原生闭环；真值碰撞只使用实体墙与旋转矩形。
+//! 历史差速迟到接回诊断，不是新全向控制的完整闭环验收。
+//! 保留原差速物理模型、实体墙与旋转矩形碰撞检查；侧移和倒退能力显式为零。
 use nuwax_nav_scan_native::{Config, PlanRequest, Planner};
 use serde_json::{json, Value};
 use std::{collections::BTreeSet, fs, path::PathBuf, time::Instant};
@@ -103,6 +104,8 @@ fn config() -> Config {
         max_step_down: 0.0,
         max_slope: 18.0_f64.to_radians(),
         max_yaw_acceleration: 2.0,
+        max_reverse_velocity: 0.0,
+        max_lateral_velocity: 0.0,
     }
 }
 fn run_case(
@@ -137,10 +140,10 @@ fn run_case(
             ground,
             reference: route,
             start_position: [pose.x, pose.y, pose.z],
-            start_velocity: velocity,
-            start_acceleration: acceleration,
+            start_velocity: Some(velocity),
+            start_acceleration: Some(acceleration),
             start_yaw: pose.yaw,
-            start_yaw_rate: applied[1],
+            start_yaw_rate: Some(applied[1]),
             odometry_timestamp_ns: tick as i64 * 100_000_000,
             config: config(),
             boundary: &boundary,
@@ -209,7 +212,7 @@ fn run_case(
         }
     }
     let blocked_before_motion = !nonzero && failure.is_some();
-    let summary = json!({"case":name,"initial_pose":[start.x,start.y,start.z,start.yaw],"initial_body_clear":true,
+    let summary = json!({"diagnostic_model":"legacy_differential_not_omni_acceptance","case":name,"initial_pose":[start.x,start.y,start.z,start.yaw],"initial_body_clear":true,
         "first_turn_then_translation":translated,"rejected_before_nonzero_motion":blocked_before_motion,"collision_count":collisions,
         "failure":failure,"final_pose":[pose.x,pose.y,pose.z,pose.yaw],"final_applied":applied,"wall_seconds":began.elapsed().as_secs_f64(),"trace_frames":trace.len()});
     fs::write(

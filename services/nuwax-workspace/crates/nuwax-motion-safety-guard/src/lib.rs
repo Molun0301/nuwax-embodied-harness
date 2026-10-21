@@ -48,6 +48,8 @@ pub mod constants;
 mod crypto;
 pub mod epoch;
 pub mod namespace;
+pub mod measured_motion;
+pub use measured_motion::MeasuredMotion;
 pub mod persistence;
 pub mod state;
 pub mod wire;

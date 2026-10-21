@@ -112,6 +112,7 @@ fn packet(
         }
     }
     recent_cloud::RecentCloud3D {
+        registration:None,
         producer_runtime_generation: 17,
         session_id: "recent-ingestion-diagnostic".into(),
         session_generation: 1,

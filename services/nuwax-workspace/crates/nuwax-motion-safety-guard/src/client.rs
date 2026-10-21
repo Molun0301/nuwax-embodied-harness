@@ -243,6 +243,7 @@ pub struct MotionGuardClient {
     sequence: u64,
     poison_reason: Option<String>,
     require_stationary: bool,
+    measured_motion: crate::measured_motion::MeasurementCache,
     renewal_due_at: Option<tokio::time::Instant>,
 }
 
@@ -272,6 +273,7 @@ impl MotionGuardClient {
             lease_tuple: None,
             sequence: 0,
             renewal_due_at: None,
+            measured_motion: Default::default(),
             poison_reason: None,
             require_stationary: std::env::var("NUWAX_NAV_CAPABILITIES_JSON").ok().is_some_and(|v| !v.trim().is_empty()),
         })
@@ -432,6 +434,11 @@ impl MotionGuardClient {
     #[must_use]
     pub fn is_poisoned(&self) -> bool {
         self.poison_reason.is_some()
+    }
+
+    /// 取得原期限内的真实运动快照，与 APPLIED 命令证明互不替代。
+    pub fn measured_motion(&self) -> Option<crate::MeasuredMotion> {
+        if self.is_poisoned() { None } else { self.measured_motion.current() }
     }
 
     /// Returns the active lease tuple, if acquisition succeeded and fencing has not.
@@ -987,6 +994,8 @@ impl MotionGuardClient {
             self.poison(message.clone());
             MotionGuardClientError::Protocol(message)
         })?;
+        // 拒绝运动也可能携带新的真实观测；采样并不表示发生于 APPLIED 之后。
+        self.measured_motion.update(response.measured_motion_feedback, monotonic_ns()?);
         if let Some(remote) = result.error.as_ref() {
             if remote.code.trim().is_empty() {
                 return self.protocol_error("GuardResult error has an empty code");
@@ -1582,6 +1591,47 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "本云端 Unix socket 操作受环境限制；在支持本地 UDS 的环境单列运行"]
+    async fn real_uds_measurement_is_independent_of_applied_and_updates_on_rejection() {
+        let (stream,mut peer)=UnixStream::pair().unwrap();
+        let mut client=MotionGuardClient {stream:Some(stream),config:ClientConfig::default(),
+            lease_tuple:Some(LeaseTuple{generation:9,boot_nonce:vec![7;BOOT_NONCE_BYTES],lease_id:41}),
+            sequence:0,poison_reason:None,require_stationary:false,renewal_due_at:None,
+            measured_motion:Default::default()};
+        let server=tokio::spawn(async move {
+            for index in 0..3 {
+                let size=peer.read_u32().await.unwrap();let mut bytes=vec![0;size as usize];
+                peer.read_exact(&mut bytes).await.unwrap();
+                let request=MotionGuardRequest::decode(bytes.as_slice()).unwrap();
+                let now=super::monotonic_ns().unwrap();
+                let motion=(index<2).then(||crate::wire::MeasuredMotionFeedback {
+                    source_id:"test:actual-device".into(),source_timestamp_ns:100+index,
+                    received_monotonic_ns:now,valid_until_monotonic_ns:now+1_000_000_000,
+                    frame_id:"base_link".into(),body_linear_xyz:vec![index as f64*0.1,0.,0.],
+                    body_angular_xyz:vec![0.,0.,0.],orientation_wxyz:vec![1.,0.,0.,0.],
+                });
+                let result=GuardResult {ack:if index==0 {AckCode::Applied as i32}else{AckCode::Received as i32},
+                    lease:crate::wire::LeaseState::Active as i32,
+                    error:(index==1).then(||crate::wire::ErrorDetail{code:"TEST_REJECT".into(),message:"rejected but observed".into(),retryable:false})};
+                let outcome=if index==0 {
+                    motion_guard_response::Outcome::SubmitMotionCommand(crate::wire::SubmitMotionCommandResponse {
+                        result:Some(result),applied_monotonic_ns:now,zero_ack:None})
+                } else {motion_guard_response::Outcome::GetReadiness(crate::wire::GetReadinessResponse {
+                    result:Some(result),generation:9,boot_nonce:vec![7;BOOT_NONCE_BYTES],..Default::default()})};
+                let reply=MotionGuardResponse {api_version:API_VERSION,request_id:request.request_id,
+                    measured_motion_feedback:motion,outcome:Some(outcome)}.encode_to_vec();
+                peer.write_u32(reply.len() as u32).await.unwrap();peer.write_all(&reply).await.unwrap();
+            }
+        });
+        client.submit_twist("measured-vs-command",TwistCommand{linear_x_mps:0.8,linear_y_mps:0.,angular_z_rps:0.3}).await.unwrap();
+        assert_eq!(client.measured_motion().unwrap().body_linear_xyz,[0.;3]);
+        assert!(matches!(client.get_readiness().await,Err(MotionGuardClientError::Remote{code,..}) if code=="TEST_REJECT"));
+        assert_eq!(client.measured_motion().unwrap().body_linear_xyz,[0.1,0.,0.]);
+        client.get_readiness().await.unwrap();assert!(client.measured_motion().is_none());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn preexpired_dispatch_sends_no_bytes_and_does_not_poison_connection() {
         let (stream, peer) = UnixStream::pair().unwrap();
         let config = ClientConfig::default();
@@ -1598,6 +1648,7 @@ mod tests {
             poison_reason: None,
             require_stationary: false,
             renewal_due_at: None,
+            measured_motion: Default::default(),
         };
         let error = client
             .submit_twist_before(

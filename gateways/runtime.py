@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from core.config_values import runtime_value
-from contracts.navigation_capabilities import reverse_navigation_default
 
 from collections import OrderedDict
 from contextlib import ExitStack, contextmanager
@@ -3537,7 +3536,7 @@ class GatewayRuntime:
                         "yaw_rad": {"type": "number", "description": "可选最终朝向（弧度）；省略时仅要求到达位置。"},
                         "tolerance_position_m": {"type": "number", "minimum": 0.0, "default": 0.35},
                         "tolerance_yaw_rad": {"type": "number", "minimum": 0.0, "default": 0.3},
-                        "allow_reverse": {"type": "boolean", "default": reverse_navigation_default(runtime_value("NUWAX_NAV_CAPABILITIES_JSON", ""), runtime_value("_NUWAX_NAV_ACTUATOR_MOTION_MODEL", "")), "description": "是否允许使用执行器已声明的倒退通道；显式关闭时只使用前进和允许的横移。"},
+                        "allow_reverse": {"type": "boolean", "description": "是否允许使用执行器已声明的倒退通道；省略由权威导航profile解析，SCAN允许倒退，显式false始终禁止。"},
                         "poll_interval_sec": {"type": "number", "exclusiveMinimum": 0.0, "default": 0.1},
                         "timeout_sec": {"type": "number", "exclusiveMinimum": 0.0},
                     },
@@ -7064,7 +7063,7 @@ class GatewayRuntime:
             tolerance_position_m=self._float(arguments, "tolerance_position_m", 0.35),
             tolerance_yaw_rad=self._float(arguments, "tolerance_yaw_rad", 0.3),
             require_goal_orientation="yaw_rad" in arguments,
-            allow_reverse=bool(arguments.get("allow_reverse", reverse_navigation_default(runtime_value("NUWAX_NAV_CAPABILITIES_JSON", ""), runtime_value("_NUWAX_NAV_ACTUATOR_MOTION_MODEL", "")))),
+            allow_reverse=arguments.get("allow_reverse"),
             metadata=goal_metadata,
         )
         if not pending:

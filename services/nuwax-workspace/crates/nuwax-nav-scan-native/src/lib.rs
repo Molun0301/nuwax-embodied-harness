@@ -22,6 +22,8 @@ pub struct Config {
     pub max_step_down: f64,
     pub max_slope: f64,
     pub max_yaw_acceleration: f64,
+    pub max_reverse_velocity: f64,
+    pub max_lateral_velocity: f64,
 }
 
 pub struct PlanRequest<'a> {
@@ -32,10 +34,10 @@ pub struct PlanRequest<'a> {
     /// PCT（点云地形规划器）输出的世界坐标机体中心参考路径。
     pub reference: &'a [[f64; 3]],
     pub start_position: [f64; 3],
-    pub start_velocity: [f64; 3],
-    pub start_acceleration: [f64; 3],
+    pub start_velocity: Option<[f64; 3]>,
+    pub start_acceleration: Option<[f64; 3]>,
     pub start_yaw: f64,
-    pub start_yaw_rate: f64,
+    pub start_yaw_rate: Option<f64>,
     /// 里程计采样时间；重复同一采样不得推进原控制器时钟。
     pub odometry_timestamp_ns: i64,
     pub config: Config,
@@ -55,6 +57,9 @@ pub struct TrajectorySample {
     pub yaw_rate: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MotionBoundarySource { Measured, PreviousTrajectory, InitialZeroAssumption, PreviousControlEstimate, AuthorDirectionReset }
+
 #[derive(Debug, Clone)]
 pub struct PlanResult {
     pub samples: Vec<TrajectorySample>,
@@ -64,9 +69,15 @@ pub struct PlanResult {
     pub reference_duration: f64,
     pub local_target: [f64; 3],
     pub command_forward: f64,
+    pub command_lateral: f64,
     pub command_yaw_rate: f64,
     pub command_duration: f64,
     pub replanned: bool,
+    /// Original normal trajectory cycle ended; outer goal may still require a new path.
+    pub execution_cycle_complete: bool,
+    pub execution_failed: bool,
+    /// Velocity, acceleration, yaw-rate provenance; never equates missing measurement with measured zero.
+    pub motion_boundary_sources: [MotionBoundarySource; 3],
 }
 
 #[repr(C)]
@@ -76,16 +87,26 @@ struct NativeOutput {
     reference_duration: f64,
     local_target: [f64; 3],
     command_forward: f64,
+    command_lateral: f64,
     command_yaw_rate: f64,
     command_duration: f64,
     samples: *mut TrajectorySample,
     sample_count: usize,
     replanned: u32,
+    execution_cycle_complete: u32,
+    execution_failed: u32,
+    motion_boundary_sources: [u32; 3],
 }
 extern "C" {
+    fn nuwax_scan_session_set_static_fixture(session:*mut std::ffi::c_void,enabled:std::ffi::c_int);
+    fn nuwax_scan_session_ingest_registered_frame(session:*mut std::ffi::c_void,config:*const Config,points:*const f64,count:usize,
+        origin:*const f64,body_position:*const f64,timestamp_ns:i64)->std::ffi::c_int;
     fn nuwax_scan_session_create() -> *mut std::ffi::c_void;
     fn nuwax_scan_session_destroy(session: *mut std::ffi::c_void);
     fn nuwax_scan_session_reset(session: *mut std::ffi::c_void);
+    fn nuwax_scan_session_notify_source_changed(session: *mut std::ffi::c_void);
+    fn nuwax_scan_session_reset_execution(session: *mut std::ffi::c_void);
+    fn nuwax_scan_session_configure(session: *mut std::ffi::c_void,config: *const Config,map_rebuilt: *mut i32,error: *mut std::ffi::c_char,capacity: usize)->i32;
     fn nuwax_scan_session_set_local_planning(session: *mut std::ffi::c_void, enabled: i32);
     fn nuwax_scan_session_plan_count(session: *const std::ffi::c_void) -> u64;
     fn nuwax_scan_session_plan(
@@ -125,6 +146,8 @@ pub fn plan(request: &PlanRequest<'_>) -> Result<PlanResult, String> {
 pub struct Planner {
     handle: *mut std::ffi::c_void,
     local_planning: bool,
+    static_map_fixture: bool,
+    pending_source_change: bool,
 }
 // 句柄只由 &mut self 串行调用，可随原 PlannerWorker 移交；不实现 Sync。
 unsafe impl Send for Planner {}
@@ -138,30 +161,71 @@ impl Planner {
         Self {
             handle: std::ptr::null_mut(),
             local_planning: true,
+            static_map_fixture: false,
+            pending_source_change: false,
         }
     }
-    /// 实验台对照开关，默认开启。关闭后跳过局部 A* 与避障优化，直接跟随全局参考；
-    /// 原闭环控制器、实测障碍输入与实际机身检查不变，被挡时返回错误交原链停车重规划。
+    /// Author A requires local planning; disabling it returns an explicit unsupported-comparison error.
     pub fn set_local_planning(&mut self, enabled: bool) {
         self.local_planning = enabled;
         if !self.handle.is_null() {
             unsafe { nuwax_scan_session_set_local_planning(self.handle, i32::from(enabled)) }
         }
     }
-    pub fn step(&mut self, request: &PlanRequest<'_>) -> Result<PlanResult, String> {
+    fn ensure_session(&mut self)->Result<(),String> {
         if self.handle.is_null() {
-            self.handle = unsafe { nuwax_scan_session_create() };
-            if self.handle.is_null() {
-                return Err("无法分配 SCAN 原生规划器".into());
+            self.handle=unsafe{nuwax_scan_session_create()};
+            if self.handle.is_null(){return Err("无法分配 SCAN 原生规划器".into());}
+            unsafe{
+                nuwax_scan_session_set_local_planning(self.handle,i32::from(self.local_planning));
+                nuwax_scan_session_set_static_fixture(self.handle,i32::from(self.static_map_fixture));
+                if self.pending_source_change { nuwax_scan_session_notify_source_changed(self.handle); self.pending_source_change=false; }
             }
-            unsafe { nuwax_scan_session_set_local_planning(self.handle, i32::from(self.local_planning)) }
         }
-        call_native(request, self.handle)
+        Ok(())
+    }
+    pub fn step(&mut self, request:&PlanRequest<'_>)->Result<PlanResult,String>{
+        self.ensure_session()?;
+        call_native(request,self.handle)
+    }
+    /// Notify an accepted map or explicit business-constraint event without advancing odometry.
+    pub fn notify_source_changed(&mut self) {
+        if self.handle.is_null() { self.pending_source_change=true; }
+        else { unsafe { nuwax_scan_session_notify_source_changed(self.handle) } }
     }
     pub fn reset(&mut self) {
+        self.pending_source_change=false;
         if !self.handle.is_null() {
             unsafe { nuwax_scan_session_reset(self.handle) }
         }
+    }
+    /// Retire only the current task, retaining the original map and consumed-frame watermark.
+    pub fn reset_execution(&mut self) {
+        self.pending_source_change=false;
+        if !self.handle.is_null() { unsafe { nuwax_scan_session_reset_execution(self.handle) } }
+    }
+    /// Synchronize parameters before ingest. True means an existing map was rebuilt;
+    /// only the caller's still-valid paired frame may then be replayed, without renewing its deadline.
+    pub fn configure(&mut self,config:&Config)->Result<bool,String> {
+        self.ensure_session()?;
+        let mut rebuilt=0;let mut error=[0 as std::ffi::c_char;1024];
+        let status=unsafe {nuwax_scan_session_configure(self.handle,config,&mut rebuilt,error.as_mut_ptr(),error.len())};
+        if status==0 {Ok(rebuilt!=0)} else {Err(unsafe {std::ffi::CStr::from_ptr(error.as_ptr())}.to_string_lossy().into_owned())}
+    }
+    /// Static occupancy only, for named simulation/test fixtures. Production remains
+    /// registered-frame mode; fused SurfaceSnapshot data is not a LiDAR observation.
+    pub fn set_static_map_fixture(&mut self, enabled:bool) {
+        self.static_map_fixture=enabled;
+        if !self.handle.is_null(){unsafe { nuwax_scan_session_set_static_fixture(self.handle, i32::from(enabled)) }}
+    }
+    /// Feed one already-authorized, lifecycle-checked registered map frame together
+    /// with the sensor origin and body position from the same registration binding.
+    pub fn ingest_registered_frame(&mut self, config:&Config, points:&[[f64;3]], origin:[f64;3],
+        body_position:[f64;3], timestamp_ns:i64)->Result<(),String> {
+        self.ensure_session()?;
+        let status=unsafe {nuwax_scan_session_ingest_registered_frame(self.handle,config,points.as_ptr().cast(),points.len(),
+            origin.as_ptr(),body_position.as_ptr(),timestamp_ns)};
+        if status==0 {Ok(())} else {Err("invalid paired registered frame for author SCAN map".into())}
     }
     pub fn plan_count(&self) -> u64 {
         unsafe { nuwax_scan_session_plan_count(self.handle) }
@@ -185,11 +249,15 @@ fn call_native(
         reference_duration: 0.0,
         local_target: [0.0; 3],
         command_forward: 0.0,
+        command_lateral: 0.0,
         command_yaw_rate: 0.0,
         command_duration: 0.0,
         samples: std::ptr::null_mut(),
         sample_count: 0,
         replanned: 0,
+        execution_cycle_complete: 0,
+        execution_failed: 0,
+        motion_boundary_sources: [2; 3],
     };
     let mut error = [0 as c_char; 512];
     // 输入切片存活至同步 C 接口返回，输出由 C++ 分配并由配套接口释放。
@@ -204,10 +272,10 @@ fn call_native(
             request.reference.as_ptr().cast(),
             request.reference.len(),
             request.start_position.as_ptr(),
-            request.start_velocity.as_ptr(),
-            request.start_acceleration.as_ptr(),
+            request.start_velocity.as_ref().map_or(std::ptr::null(), |v| v.as_ptr()),
+            request.start_acceleration.as_ref().map_or(std::ptr::null(), |a| a.as_ptr()),
             request.start_yaw,
-            request.start_yaw_rate,
+            request.start_yaw_rate.unwrap_or(f64::NAN),
             request.boundary.as_ptr().cast(),
             request.boundary.len(),
             request.forbidden_columns.as_ptr().cast(),
@@ -238,9 +306,18 @@ fn call_native(
         reference_duration: output.reference_duration,
         local_target: output.local_target,
         command_forward: output.command_forward,
+        command_lateral: output.command_lateral,
         command_yaw_rate: output.command_yaw_rate,
         command_duration: output.command_duration,
         replanned: output.replanned != 0,
+        execution_cycle_complete: output.execution_cycle_complete != 0,
+        execution_failed: output.execution_failed != 0,
+        motion_boundary_sources: output.motion_boundary_sources.map(|source| match source {
+            0 => MotionBoundarySource::Measured, 1 => MotionBoundarySource::PreviousTrajectory,
+            3 => MotionBoundarySource::PreviousControlEstimate,
+            4 => MotionBoundarySource::AuthorDirectionReset,
+            _ => MotionBoundarySource::InitialZeroAssumption,
+        }),
     };
     unsafe { nuwax_scan_free(&mut output) };
     Ok(result)
@@ -249,6 +326,16 @@ fn call_native(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // These component fixtures provide static occupancy, not live sensor frames.
+    // One call remains one real FSM tick; no synthetic catch-up ticks are added.
+    fn fixture_planner() -> Planner {
+        let mut planner=Planner::new();
+        planner.set_static_map_fixture(true);
+        planner
+    }
+    fn plan(request:&PlanRequest<'_>)->Result<PlanResult,String> {
+        fixture_planner().step(request)
+    }
     fn config() -> Config {
         Config {
             resolution: 0.1,
@@ -269,6 +356,8 @@ mod tests {
             max_step_down: 0.2,
             max_slope: 0.5,
             max_yaw_acceleration: 2.0,
+            max_reverse_velocity: 0.6,
+            max_lateral_velocity: 0.6,
         }
     }
     fn request<'a>(reference: &'a [[f64; 3]], obstacles: &'a [[f64; 3]]) -> PlanRequest<'a> {
@@ -277,10 +366,10 @@ mod tests {
             obstacles,
             ground: &[],
             start_position: [0.0, 0.0, 0.35],
-            start_velocity: [0.0; 3],
-            start_acceleration: [0.0; 3],
+            start_velocity: Some([0.0; 3]),
+            start_acceleration: Some([0.0; 3]),
             start_yaw: 0.0,
-            start_yaw_rate: 0.0,
+            start_yaw_rate: Some(0.0),
             odometry_timestamp_ns: 0,
             config: config(),
             boundary: &[],
@@ -324,13 +413,13 @@ mod tests {
     fn measured_velocity_and_acceleration_are_preserved() {
         let route = [[0.0, 0.0, 0.35], [5.0, 0.0, 0.35]];
         let mut req = request(&route, &[]);
-        req.start_velocity = [0.25, 0.03, 0.0];
-        req.start_acceleration = [0.1, 0.0, 0.0];
+        req.start_velocity = Some([0.25, 0.03, 0.0]);
+        req.start_acceleration = Some([0.1, 0.0, 0.0]);
         let result = plan(&req).unwrap();
         let first = &result.samples[0];
         for i in 0..3 {
-            assert!((first.velocity[i] - req.start_velocity[i]).abs() < 1e-7);
-            assert!((first.acceleration[i] - req.start_acceleration[i]).abs() < 1e-7);
+            assert!((first.velocity[i] - req.start_velocity.unwrap()[i]).abs() < 1e-7);
+            assert!((first.acceleration[i] - req.start_acceleration.unwrap()[i]).abs() < 1e-7);
         }
         assert!(
             (result.command_forward - 0.25).abs()
@@ -343,12 +432,43 @@ mod tests {
         let mut req = request(&route, &[]);
         let first = plan(&req).unwrap();
         req.start_position = first.local_target;
-        req.start_velocity = [0.3, 0.0, 0.0];
+        req.start_velocity = Some([0.3, 0.0, 0.0]);
         let second = plan(&req).unwrap();
         assert!(second.reference_progress > first.reference_progress);
         req.start_position = second.local_target;
         let third = plan(&req).unwrap();
         assert!((third.reference_progress - third.reference_duration).abs() < 1e-6);
+    }
+    #[test]
+    #[ignore = "retired candidate q3 contract; user restored independent XY/yaw"]
+    fn resting_spline_preserves_actual_initial_heading() {
+        let route = [[0.0, 0.0, 0.35], [0.025, -0.025, 0.35], [7.0, -0.025, 0.35]];
+        let mut req = request(&route, &[]);
+        // 此具名边界单测采样起步极限；原完整闭环仍用原控制周期。
+        req.config.sample_dt = 0.001;
+        let result = plan(&req).unwrap();
+        let first_moving = result.samples.iter()
+            .find(|s| s.velocity[0].hypot(s.velocity[1]) > 1e-8).unwrap();
+        let heading = first_moving.velocity[1].atan2(first_moving.velocity[0]);
+        assert!((heading - req.start_yaw).abs() < 1e-7,
+            "zero measured v/a must not erase actual heading: {heading}");
+        assert!(result.samples[0].velocity.iter().all(|v| v.abs() < 1e-7));
+        assert!(result.samples[0].acceleration.iter().all(|a| a.abs() < 1e-7));
+    }
+    #[test]
+    #[ignore = "retired candidate spatial cursor; user restored original time reference"]
+    fn stationary_feedback_does_not_consume_unexecuted_spline() {
+        let route = [[0.0, 0.0, 0.35], [7.0, 0.0, 0.35]];
+        let mut req = request(&route, &[]);
+        let mut planner = fixture_planner();
+        // 新时间戳不等于真实移动：执行反馈保持原地、零速，不能把未走样条丢掉。
+        for tick in 0..20 {
+            req.odometry_timestamp_ns = 1_000_000_000 + tick * 100_000_000;
+            let result = planner.step(&req).unwrap();
+            let first = result.samples.first().unwrap();
+            assert!((first.position[0] - req.start_position[0]).abs() < 1e-8,
+                "tick {tick}: unexecuted prefix consumed at {:?}", first.position);
+        }
     }
     #[test]
     fn true_body_width_changes_obstacle_collision() {
@@ -384,7 +504,7 @@ mod tests {
             .flat_map(|y| (1..=7).map(move |z| [x, y as f64 * 0.1, z as f64 * 0.1]))
             .collect()
     }
-    /// 按差动命令积分实际运动，返回到达目标时的控制拍及最大|y|偏离。
+    /// 按用户恢复的完整机身XY+角速度积分，保留原场景/预算/到达断言。
     fn drive(
         planner: &mut Planner,
         req: &mut PlanRequest<'_>,
@@ -399,22 +519,27 @@ mod tests {
                     req.start_position, req.start_yaw, req.start_velocity
                 )
             })?;
-            let next_v = result.command_forward;
+            let next = [result.command_forward, result.command_lateral];
             let next_w = result.command_yaw_rate;
-            let v = (req.start_velocity[0].hypot(req.start_velocity[1]) + next_v) / 2.0;
-            let w = (req.start_yaw_rate + next_w) / 2.0;
-            let dt = result.command_duration;
             let yaw = req.start_yaw;
-            if w.abs() > 1e-9 {
-                req.start_position[0] += v / w * ((yaw + w * dt).sin() - yaw.sin());
-                req.start_position[1] += v / w * (yaw.cos() - (yaw + w * dt).cos());
-            } else {
-                req.start_position[0] += v * dt * yaw.cos();
-                req.start_position[1] += v * dt * yaw.sin();
-            }
-            req.start_yaw += w * dt;
-            req.start_yaw_rate = next_w;
-            req.start_velocity = [v * req.start_yaw.cos(), v * req.start_yaw.sin(), 0.0];
+            let world = req.start_velocity.unwrap();
+            let previous = [yaw.cos()*world[0]+yaw.sin()*world[1], -yaw.sin()*world[0]+yaw.cos()*world[1]];
+            let dt = result.command_duration;
+            assert!((next[0]-previous[0]).hypot(next[1]-previous[1])
+                <= req.config.max_acceleration*dt+1e-8);
+            assert!((next_w-req.start_yaw_rate.unwrap()).abs()
+                <= req.config.max_yaw_acceleration*dt+1e-8);
+            let v=[(previous[0]+next[0])/2.,(previous[1]+next[1])/2.];
+            let w=(req.start_yaw_rate.unwrap()+next_w)/2.;
+            let (a,b)=if w.abs()>1e-9 {((w*dt).sin()/w,(1.-(w*dt).cos())/w)}else{(dt,0.)};
+            let dx=a*v[0]-b*v[1];let dy=b*v[0]+a*v[1];
+            req.start_position[0]+=yaw.cos()*dx-yaw.sin()*dy;
+            req.start_position[1]+=yaw.sin()*dx+yaw.cos()*dy;
+            req.start_yaw+=w*dt;
+            req.start_yaw_rate=Some(next_w);
+            req.start_velocity=Some([next[0]*req.start_yaw.cos()-next[1]*req.start_yaw.sin(),next[0]*req.start_yaw.sin()+next[1]*req.start_yaw.cos(),0.]);
+            // Model exposes endpoint velocity; no fabricated acceleration observation.
+            req.start_acceleration=None;
             lateral = lateral.max(req.start_position[1].abs());
             if (req.start_position[0] - goal[0]).hypot(req.start_position[1] - goal[1]) < 0.15 {
                 return Ok((Some(tick), lateral));
@@ -428,7 +553,7 @@ mod tests {
         let obstacles = wall(1.5);
         let mut req = request(&route, &obstacles);
         let (arrived, _) =
-            drive(&mut Planner::new(), &mut req, [4.0, 0.0]).unwrap_or_else(|error| panic!("{error}"));
+            drive(&mut fixture_planner(), &mut req, [4.0, 0.0]).unwrap_or_else(|error| panic!("{error}"));
         assert!(arrived.is_some(), "final position {:?}", req.start_position);
     }
     #[test]
@@ -436,7 +561,7 @@ mod tests {
         // 全局参考机身高度与实测起点差2.5厘米，竖向不能压慢水平跟随。
         let route = [[0.0, 0.0, 0.35], [0.08, 0.0, 0.325], [4.0, 0.0, 0.325]];
         let mut req = request(&route, &[]);
-        let mut planner = Planner::new();
+        let mut planner = fixture_planner();
         planner.set_local_planning(false);
         let (arrived, lateral) =
             drive(&mut planner, &mut req, [4.0, 0.0]).unwrap_or_else(|error| panic!("{error}"));
@@ -454,7 +579,7 @@ mod tests {
         req.config.planning_horizon = 5.0;
         req.config.max_velocity = 1.0;
         req.config.max_acceleration = 1.0;
-        let mut planner = Planner::new();
+        let mut planner = fixture_planner();
         planner.set_local_planning(false);
         let (arrived, _) =
             drive(&mut planner, &mut req, [7.0, 0.0]).unwrap_or_else(|error| panic!("{error}"));
@@ -466,7 +591,7 @@ mod tests {
         let route = [[0.0, 0.0, 0.35], [4.0, 0.0, 0.35]];
         let obstacles = wall(1.5);
         let mut req = request(&route, &obstacles);
-        let mut planner = Planner::new();
+        let mut planner = fixture_planner();
         planner.set_local_planning(false);
         let error = drive(&mut planner, &mut req, [4.0, 0.0]).unwrap_err();
         assert!(error.contains("local planning disabled"), "{error}");
@@ -518,16 +643,16 @@ mod tests {
         for _ in 0..100 {
             let result = plan(&req).unwrap();
             assert!(
-                (result.command_yaw_rate - req.start_yaw_rate).abs()
+                (result.command_yaw_rate - req.start_yaw_rate.unwrap()).abs()
                     <= req.config.max_yaw_acceleration * req.config.sample_dt + 1e-8
             );
             req.start_yaw += result.command_yaw_rate * result.command_duration;
-            req.start_yaw_rate = result.command_yaw_rate;
-            if (req.start_yaw - 1.0).abs() < 0.001 && req.start_yaw_rate.abs() < 0.01 {
+            req.start_yaw_rate = Some(result.command_yaw_rate);
+            if (req.start_yaw - 1.0).abs() < 0.001 && req.start_yaw_rate.unwrap().abs() < 0.01 {
                 return;
             }
         }
-        panic!("yaw {}, rate {}", req.start_yaw, req.start_yaw_rate);
+        panic!("yaw {}, rate {:?}", req.start_yaw, req.start_yaw_rate);
     }
     #[test]
     fn original_time_allocation_preserves_feasible_oblique_thin_door() {
@@ -582,4 +707,131 @@ mod tests {
             assert!((sample.position[1] - expected).abs() < 1e-7);
         }
     }
+    #[test]
+    fn repeated_sample_reference_is_exact_but_new_motion_still_limits_output() {
+        let route = [[0.0, 0.0, 0.35], [5.0, 0.0, 0.35]];
+        let mut req = request(&route, &[]);
+        req.start_velocity = None;
+        req.start_acceleration = None;
+        req.start_yaw_rate = None;
+        let mut planner = fixture_planner();
+        planner.step(&req).unwrap();
+        req.odometry_timestamp_ns = 100_000_000;
+        req.start_position[0] = -0.5; // Existing position feedback activates the acceleration limit.
+        let first = planner.step(&req).unwrap();
+        let repeated = planner.step(&req).unwrap();
+        assert_eq!(first.command_forward, repeated.command_forward);
+        assert_eq!(first.command_lateral, repeated.command_lateral);
+        assert_eq!(first.command_yaw_rate, repeated.command_yaw_rate);
+        req.start_velocity = Some([0.5, 0.0, 0.0]);
+        let changed = planner.step(&req).unwrap();
+        assert_eq!(changed.motion_boundary_sources[0], MotionBoundarySource::Measured);
+        assert!(changed.command_forward >= 0.5 - req.config.max_acceleration * req.config.sample_dt);
+        assert_ne!(changed.command_forward, repeated.command_forward);
+    }
+
+    #[test]
+    fn author_static_fixture_survives_lazy_creation_and_explicit_reset() {
+        let route=[[0.,0.,0.35],[2.,0.,0.35]];
+        let req=request(&route,&[]);
+        let mut p=Planner::new();
+        p.set_static_map_fixture(true);
+        assert!(p.step(&req).is_ok(),"explicit static fixture must survive lazy handle allocation");
+        p.reset();
+        assert!(p.step(&req).is_ok(),"same explicit fixture mode survives goal reset");
+    }
+    #[test]
+    fn author_registered_frame_initializes_real_session_and_reset_discards_map() {
+        let route=[[0.,0.,0.35],[2.,0.,0.35]];
+        let req=request(&route,&[]);
+        let mut p=Planner::new();
+        assert!(p.step(&req).unwrap_err().contains("registered source frame"));
+        p.reset();
+        p.ingest_registered_frame(&req.config,&[[0.,0.,-1.]],[0.,0.,1.],[0.,0.,0.35],req.odometry_timestamp_ns).unwrap();
+        assert!(p.step(&req).is_ok(),"registered frame must be retained before first planner initialization");
+        p.reset();
+        assert!(p.step(&req).unwrap_err().contains("registered source frame"),"reset cannot replay the retired frame or select static fallback");
+    }
+
+    #[test]
+    fn author_rejected_first_frames_do_not_initialize_map_or_replace_valid_frame() {
+        let route=[[0.,0.,0.35],[2.,0.,0.35]];
+        let req=request(&route,&[]);
+        // A local Z range is 2.5m and ray maximum 5m: z=4 at origin z=1
+        // is deliberately filtered by the original input rule, not a new gate.
+        let bad_frames:Vec<Vec<[f64;3]>>=vec![vec![],vec![[f64::NAN,0.,0.]],vec![[0.,0.,4.]]];
+        for points in bad_frames {
+            let mut p=Planner::new();
+            assert!(p.ingest_registered_frame(&req.config,&points,[0.,0.,1.],[0.,0.,0.35],req.odometry_timestamp_ns).is_err());
+            assert!(p.step(&req).unwrap_err().contains("registered source frame"));
+            p.ingest_registered_frame(&req.config,&[[0.,0.,-1.]],[0.,0.,1.],[0.,0.,0.35],req.odometry_timestamp_ns).unwrap();
+            assert!(p.ingest_registered_frame(&req.config,&points,[0.,0.,1.],[0.,0.,0.35],req.odometry_timestamp_ns+1).is_err());
+            assert!(p.step(&req).is_ok(),"rejected input cannot clear the previous accepted map");
+        }
+    }
+
+    #[test]
+    fn author_normal_cycle_completion_is_latched_not_arrival_and_reset_clears_it() {
+        let route=[[0.,0.,0.35],[2.,0.,0.35]];
+        let mut req=request(&route,&[]);
+        req.odometry_timestamp_ns=1_000_000_000;
+        let mut p=fixture_planner();
+        assert!(!p.step(&req).unwrap().execution_cycle_complete,"initial WAIT is not completed execution");
+        let mut completed=false;
+        for tick in 1..400 {
+            req.odometry_timestamp_ns=1_000_000_000+tick*100_000_000;
+            let result=p.step(&req).unwrap();
+            if result.execution_cycle_complete {
+                completed=true;
+                assert!(result.samples.is_empty(),"expired curve must not be re-exported");
+                assert_eq!([result.command_forward,result.command_lateral,result.command_yaw_rate],[0.;3]);
+                assert!(p.step(&req).unwrap().execution_cycle_complete,"repeat sample must retain event until outer lifecycle acknowledges it");
+                break;
+            }
+        }
+        assert!(completed,"original timed cycle must be surfaced even though actual pose remains at original start");
+        req.reference=&[];req.goal_yaw=Some(0.5);
+        assert!(!p.step(&req).unwrap().execution_cycle_complete,"explicit final yaw is not a request to restart a path");
+        p.reset();req.reference=&route;req.goal_yaw=None;
+        assert!(!p.step(&req).unwrap().execution_cycle_complete,"cancel/new session cannot retain completion");
+    }
+
+    #[test]
+    fn author_execution_retirement_retains_frame_and_refreshes_only_retired_parameters() {
+        let route=[[0.,0.,0.35],[2.,0.,0.35]];
+        let mut req=request(&route,&[]);req.odometry_timestamp_ns=1_000_000_000;
+        let mut p=Planner::new();
+        assert!(!p.configure(&req.config).unwrap());
+        p.ingest_registered_frame(&req.config,&[[0.,0.,-1.]],[0.,0.,1.],[0.,0.,0.35],req.odometry_timestamp_ns).unwrap();
+        p.step(&req).unwrap();
+        let mut changed=req.config;changed.max_reverse_velocity*=0.5;
+        assert!(p.configure(&changed).unwrap_err().contains("unretired"));
+        p.reset_execution();
+        assert!(!p.configure(&changed).unwrap(),"capability refresh must preserve map");
+        req.config=changed;
+        let result=p.step(&req).unwrap();
+        assert!(!result.execution_cycle_complete&&!result.execution_failed);
+        assert!(result.samples.is_empty(),"retired curve cannot escape on next INIT");
+        p.reset_execution();
+        req.config.body_width+=0.01;
+        assert!(p.configure(&req.config).unwrap(),"real map shape changes require rebuild");
+        assert!(p.step(&req).unwrap_err().contains("registered source frame"),"no silent stored-frame replay after map invalidation");
+    }
+
+    #[test]
+    fn author_terminal_yaw_honors_explicit_business_masks() {
+        let mut req=request(&[],&[]);req.goal_yaw=Some(0.5);
+        let free=fixture_planner().step(&req).unwrap();
+        assert!(free.command_yaw_rate>0.0&&free.samples.is_empty());
+        let allowed=[[-2.,-2.],[2.,-2.],[2.,2.],[-2.,2.]];
+        req.boundary=&allowed;
+        let accepted=fixture_planner().step(&req).unwrap();
+        assert_eq!(accepted.command_yaw_rate,free.command_yaw_rate);
+        let outside=[[2.,2.],[3.,2.],[3.,3.],[2.,3.]];
+        req.boundary=&outside;
+        assert!(fixture_planner().step(&req).unwrap_err().contains("explicit user boundary"));
+        req.boundary=&[];req.forbidden_columns=&[[0,0]];
+        assert!(fixture_planner().step(&req).unwrap_err().contains("forbidden mask"));
+    }
+
 }

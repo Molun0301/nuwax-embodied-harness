@@ -15,6 +15,7 @@
 extern "C" {
 #endif
 
+#include "nuwax_msgs_RegisteredCloudPose.h"
 /// Independent live admitted observations; never a persistent map revision.
 typedef struct _nuwax_msgs_RecentCloud3D nuwax_msgs_RecentCloud3D;
 struct _nuwax_msgs_RecentCloud3D
@@ -34,6 +35,16 @@ struct _nuwax_msgs_RecentCloud3D
      */
     uint8_t    commit_boot_nonce[16];
     int8_t     cleared;
+
+    /**
+     * v2: 0 表示原点未知或撤销；1 表示同帧真实配对，禁止补零。
+     */
+    int32_t    registration_count;
+
+    /**
+     * LCM Type: nuwax_msgs.RegisteredCloudPose[registration_count]
+     */
+    nuwax_msgs_RegisteredCloudPose *registration;
     int32_t    ground_point_count;
 
     /**

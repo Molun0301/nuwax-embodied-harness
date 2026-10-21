@@ -222,3 +222,4 @@ PolynomialTraj PolynomialTraj::one_segment_traj_gen(const Eigen::Vector3d &start
 
   return poly_traj;
 }
+

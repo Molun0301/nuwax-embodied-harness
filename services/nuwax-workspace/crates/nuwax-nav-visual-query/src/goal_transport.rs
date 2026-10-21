@@ -43,6 +43,9 @@ pub struct NavigationAdmission {
     pub motion_guard_boot_nonce_hex: String,
     /// 调用者观察到的全局停止代次。
     pub motion_stop_generation: u64,
+    /// 显式倒退选择；缺省交 Geometry 的实际 profile，不能在视觉入口伪装为用户禁止。
+    #[serde(default)]
+    pub allow_reverse: Option<bool>,
 }
 
 /// 已取得的唯一 Batch02 GoalLease（目标租约）身份。
@@ -339,7 +342,8 @@ fn adapt_observation(
         motion_guard_generation: admission.motion_guard_generation,
         motion_guard_boot_nonce: nonce.to_vec(),
         motion_stop_generation: admission.motion_stop_generation,
-        allow_reverse: false,
+        allow_reverse: admission.allow_reverse.unwrap_or(false),
+        use_profile_reverse_default: admission.allow_reverse.is_none(),
         position_tolerance_m: None,
         yaw_tolerance_rad: None,
     })
@@ -451,6 +455,33 @@ mod tests {
             motion_guard_generation: 7,
             motion_guard_boot_nonce_hex: "00112233445566778899aabbccddeeff".into(),
             motion_stop_generation: 4,
+            allow_reverse: None,
+        }
+    }
+
+    #[test]
+    fn visual_missing_false_true_survive_protobuf_without_guessing_profile() {
+        use prost::Message;
+        for choice in [None, Some(false), Some(true)] {
+            let mut request = serde_json::json!({
+                "transform": {"source_frame_id":"camera_optical_frame", "target_frame_id":"map",
+                    "source_timestamp_ns":1000000000_u64, "calibration_id":"calibration-1",
+                    "translation_xyz":[2.,3.,0.], "rotation_xyzw":[0.,0.,0.,1.]},
+                "motion_guard_generation":7, "motion_guard_boot_nonce_hex":"00112233445566778899aabbccddeeff",
+                "motion_stop_generation":4
+            });
+            if let Some(value) = choice { request["allow_reverse"] = value.into(); }
+            let input: NavigationAdmission = serde_json::from_value(request).unwrap();
+            assert_eq!(input.allow_reverse, choice);
+            let goal = adapt_observation(&observation(TargetObservationState::Tracked), &input, false).unwrap();
+            let decoded = NavigationGoal::decode(goal.encode_to_vec().as_slice()).unwrap();
+            assert_eq!(decoded.allow_reverse, choice.unwrap_or(false));
+            assert_eq!(decoded.use_profile_reverse_default, choice.is_none());
+            for profile_default in [false, true] {
+                assert_eq!(nuwax_nav_types_messages::GoalOptions::resolve_reverse_request(
+                    decoded.allow_reverse, decoded.use_profile_reverse_default, profile_default).unwrap(),
+                    choice.unwrap_or(profile_default));
+            }
         }
     }
 

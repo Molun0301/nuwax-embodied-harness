@@ -256,6 +256,9 @@ class Go2Actuator:
         self._feedback_supported = factories.motion_state_subscriber is not None
         self._motion_controller = None
         self._feedback_frame = runtime_value("NUWAX_BASE_FRAME", "").strip() or "base_link"
+        self._feedback_source_id = "unitree_sdk2py:" + runtime_value(
+            "GO2_DIRECT_DDS_POSE_TOPIC", "rt/sportmodestate"
+        )
         self._motion_state_subscriber = (
             factories.motion_state_subscriber(self._observe_motion_state)
             if factories.motion_state_subscriber is not None else None
@@ -315,7 +318,10 @@ class Go2Actuator:
                 received_monotonic_ns=received_monotonic_ns,
                 linear_x_mps=(1-2*(y*y+z*z))*vx + 2*(x*y+w*z)*vy + 2*(x*z-w*y)*vz,
                 linear_y_mps=2*(x*y-w*z)*vx + (1-2*(x*x+z*z))*vy + 2*(y*z+w*x)*vz,
-                angular_z_rps=gyro[2],
+                # 延续既有机体参考点约定；世界速度仅旋转坐标轴，不叠加传感器杆臂。
+                linear_z_mps=2*(x*z+w*y)*vx + 2*(y*z-w*x)*vy + (1-2*(x*x+y*y))*vz,
+                angular_x_rps=gyro[0], angular_y_rps=gyro[1], angular_z_rps=gyro[2],
+                orientation_wxyz=(w, x, y, z), source_id=self._feedback_source_id,
             )
         except (AttributeError, TypeError, ValueError, OverflowError):
             with self._feedback_lock:

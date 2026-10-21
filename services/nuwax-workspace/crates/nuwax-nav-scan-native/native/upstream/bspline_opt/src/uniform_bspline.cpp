@@ -1,5 +1,5 @@
-// 本地无 ROS 提取与真实感知/机身适配；改动范围和上游归属见 native/NOTICE。
 #include "bspline_opt/uniform_bspline.h"
+#include <author_host.h>
 
 namespace scan_planner
 {
@@ -58,7 +58,7 @@ namespace scan_planner
 
   Eigen::MatrixXd UniformBspline::getControlPoint() { return control_points_; }
 
-  Eigen::VectorXd UniformBspline::evaluateDeBoor(const double &u) const
+  Eigen::VectorXd UniformBspline::evaluateDeBoor(const double &u)
   {
 
     double ub = min(max(u_(p_), u), u_(m_ - p_));
@@ -77,7 +77,7 @@ namespace scan_planner
     for (int i = 0; i <= p_; ++i)
     {
       d.push_back(control_points_.col(k - p_ + i));
-      // cerr << d[i].transpose() << endl;
+      // std::cerr << d[i].transpose() << endl;
     }
 
     for (int r = 1; r <= p_; ++r)
@@ -85,7 +85,7 @@ namespace scan_planner
       for (int i = p_; i >= r; --i)
       {
         double alpha = (ub - u_[i + k - p_]) / (u_[i + 1 + k - r] - u_[i + k - p_]);
-        // cerr << "alpha: " << alpha << endl;
+        // std::cerr << "alpha: " << alpha << endl;
         d[i] = (1 - alpha) * d[i - 1] + alpha * d[i];
       }
     }
@@ -137,8 +137,7 @@ namespace scan_planner
     bool fea = true;
 
     Eigen::MatrixXd P = control_points_;
-    // 当前执行接口只有平面线速度与偏航；地形Z是参考层高，不能套用平面指令加速度。
-    constexpr int dimension = 2;
+    int dimension = control_points_.rows();
 
     /* check vel feasibility and insert points */
     double max_vel = -1.0;
@@ -147,11 +146,12 @@ namespace scan_planner
     {
       Eigen::VectorXd vel = p_ * (P.col(i + 1) - P.col(i)) / (u_(i + p_ + 1) - u_(i + 1));
 
-      if (fabs(vel(0)) > enlarged_vel_lim || fabs(vel(1)) > enlarged_vel_lim)
+      if (fabs(vel(0)) > enlarged_vel_lim || fabs(vel(1)) > enlarged_vel_lim ||
+          fabs(vel(2)) > enlarged_vel_lim)
       {
 
         if (show)
-          cerr << "[Check]: Infeasible vel " << i << " :" << vel.transpose() << endl;
+          std::cerr << "[Check]: Infeasible vel " << i << " :" << vel.transpose() << endl;
         fea = false;
 
         for (int j = 0; j < dimension; ++j)
@@ -172,11 +172,12 @@ namespace scan_planner
                              (P.col(i + 1) - P.col(i)) / (u_(i + p_ + 1) - u_(i + 1))) /
                             (u_(i + p_ + 1) - u_(i + 2));
 
-      if (fabs(acc(0)) > enlarged_acc_lim || fabs(acc(1)) > enlarged_acc_lim)
+      if (fabs(acc(0)) > enlarged_acc_lim || fabs(acc(1)) > enlarged_acc_lim ||
+          fabs(acc(2)) > enlarged_acc_lim)
       {
 
         if (show)
-          cerr << "[Check]: Infeasible acc " << i << " :" << acc.transpose() << endl;
+          std::cerr << "[Check]: Infeasible acc " << i << " :" << acc.transpose() << endl;
         fea = false;
 
         for (int j = 0; j < dimension; ++j)
@@ -212,19 +213,19 @@ namespace scan_planner
   {
     if (ts <= 0)
     {
-      cerr << "[B-spline]:time step error." << endl;
+      std::cerr << "[B-spline]:time step error." << endl;
       return;
     }
 
     if (point_set.size() <= 3)
     {
-      cerr << "[B-spline]:point set have only " << point_set.size() << " points." << endl;
+      std::cerr << "[B-spline]:point set have only " << point_set.size() << " points." << endl;
       return;
     }
 
     if (start_end_derivative.size() != 4)
     {
-      cerr << "[B-spline]:derivatives error." << endl;
+      std::cerr << "[B-spline]:derivatives error." << endl;
     }
 
     int K = point_set.size();
@@ -246,7 +247,7 @@ namespace scan_planner
     A.block(K + 2, 0, 1, 3) = (1 / ts / ts) * arow.transpose();
     A.block(K + 3, K - 1, 1, 3) = (1 / ts / ts) * arow.transpose();
 
-    //cerr << "A" << endl << A << endl << endl;
+    //std::cerr << "A" << endl << A << endl << endl;
 
     // write b
     Eigen::VectorXd bx(K + 4), by(K + 4), bz(K + 4);
@@ -275,7 +276,7 @@ namespace scan_planner
     ctrl_pts.row(1) = py.transpose();
     ctrl_pts.row(2) = pz.transpose();
 
-    // cerr << "[B-spline]: parameterization ok." << endl;
+    // std::cerr << "[B-spline]: parameterization ok." << endl;
   }
 
   double UniformBspline::getTimeSum()
@@ -373,3 +374,4 @@ namespace scan_planner
     max_a = max_acc;
   }
 } // namespace scan_planner
+

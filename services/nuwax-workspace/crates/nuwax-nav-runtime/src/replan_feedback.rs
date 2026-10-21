@@ -11,6 +11,8 @@ pub struct ActualExecutionContext {
     pub odometry: PoseStamped,
     /// 运动端确认应用的命令值；生产来源为已应用回执，不代表测速传感器读数。
     pub applied: Twist2,
+    /// 独立实测状态及原来源时点；None 不代表零速。
+    pub measured_motion: Option<crate::MeasuredMotion>,
 }
 /// 对应原路径身份的执行失败与实际上下文。
 #[derive(Clone, Debug, PartialEq)]
@@ -63,6 +65,7 @@ pub fn same_pose(a: &PoseStamped, b: &PoseStamped) -> bool {
 pub fn same_actual(a: &ActualExecutionContext, b: &ActualExecutionContext) -> bool {
     a.source.same_body_query_view(&b.source)
         && same_pose(&a.odometry, &b.odometry)
+        && a.measured_motion == b.measured_motion
         && [a.applied.linear.x, a.applied.linear.y, a.applied.angular_z].map(f64::to_bits)
             == [b.applied.linear.x, b.applied.linear.y, b.applied.angular_z].map(f64::to_bits)
 }

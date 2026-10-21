@@ -3,6 +3,13 @@ use crate::{SurfaceFollowerConfig, SurfaceSnapshot};
 use nuwax_nav_types_messages::{MotionLimits, MotionModel};
 use std::sync::Arc;
 
+/// 显式声明本测试只提供静态地图，不冒充生产注册点云原帧。
+pub(crate) fn author_static_map_follower(config: SurfaceFollowerConfig) -> crate::SurfaceFollower {
+    let mut follower = crate::SurfaceFollower::new(config).unwrap();
+    follower.enable_author_static_map_fixture(true);
+    follower
+}
+
 pub(crate) fn fixture() -> (SurfaceFollowerConfig, Arc<SurfaceSnapshot>) {
     let source = Arc::new(
         crate::surface_follower::test_snapshot(0.0, false)

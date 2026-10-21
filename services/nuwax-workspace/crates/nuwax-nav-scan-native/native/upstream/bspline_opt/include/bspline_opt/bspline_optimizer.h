@@ -1,4 +1,3 @@
-// 本地无 ROS 提取与真实感知/机身适配；改动范围和上游归属见 native/NOTICE。
 #ifndef _BSPLINE_OPTIMIZER_H_
 #define _BSPLINE_OPTIMIZER_H_
 
@@ -6,7 +5,7 @@
 #include <path_searching/dyn_a_star.h>
 #include <bspline_opt/uniform_bspline.h>
 #include <plan_env/grid_map.h>
-#include <scan_native_log.h>
+#include <author_host.h>
 #include "bspline_opt/lbfgs.hpp"
 
 // Gradient and elastic band optimization
@@ -54,7 +53,7 @@ namespace scan_planner
 
     /* main API */
     void setEnvironment(const GridMap::Ptr &env);
-    void setParam(double max_velocity, double max_acceleration, double clearance);
+    void setParam(ros::NodeHandle &nh);
     Eigen::MatrixXd BsplineOptimizeTraj(const Eigen::MatrixXd &points, const double &ts,
                                         const int &cost_function, int max_num_id, int max_time_id);
 
@@ -161,3 +160,4 @@ namespace scan_planner
 
 } // namespace scan_planner
 #endif
+

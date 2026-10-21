@@ -34,7 +34,7 @@ from contracts.frame_semantics import infer_frame_role
 from contracts.geometry import FrameTree, Pose, Quaternion, Transform, Vector3
 from contracts.geometry_runtime import DEFAULT_MAP_FRAME
 from contracts.maps import OccupancyGrid
-from contracts.navigation import NavigationGoal, NavigationState, NavigationStatus
+from contracts.navigation import NavigationGoal, NavigationState, NavigationStatus, navigation_reverse_wire_fields
 from contracts.map_activation import (
     AssignedActivationReceipt,
     _commit as _admit_assigned_commit,
@@ -9407,7 +9407,7 @@ class GeometryRuntimeProvider:
             proto_goal = pb2.NavigationGoal(
                 pose=proto_pose,
                 frame_id=target_frame_id,
-                allow_reverse=bool(getattr(goal, "allow_reverse", False)),
+                **navigation_reverse_wire_fields(getattr(goal, "allow_reverse", None)),
                 position_tolerance_m=float(getattr(goal, "tolerance_position_m", 0.35)),
                 yaw_tolerance_rad=(float(getattr(goal, "tolerance_yaw_rad", 0.3))
                     if getattr(goal, "require_goal_orientation", True) else math.pi),

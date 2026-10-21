@@ -164,7 +164,7 @@ def main(argv=None) -> int:
     parser.add_argument("--startup-timeout", type=float, default=180)
     parser.add_argument("--speed", type=float, default=1.0)
     parser.add_argument("--no-local-planning", action="store_true",
-                        help="对照组：关闭局部规划，直接跟随全局路线；实际机身检查与停车重规划不变")
+                        help="仅保留旧版对照请求字段；作者 A 执行链不支持关闭局部规划，会明确拒绝")
     args = parser.parse_args(argv)
     if not all(math.isfinite(value) and value > 0 for value in
                (args.timeout, args.sim_seconds, args.startup_timeout, args.speed)):

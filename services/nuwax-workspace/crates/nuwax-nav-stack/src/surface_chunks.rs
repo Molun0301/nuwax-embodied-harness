@@ -786,6 +786,7 @@ mod tests {
                     config.controller.control_frequency=20.0;config.controller.simulation=true;
                     config.motion_limits=Some(motion);config.max_angular_speed_rps=0.8;
                     let mut follower=SurfaceFollower::new(config).unwrap();
+                    follower.enable_author_static_map_fixture(true); // Explicit static test input, never a production fallback.
                     follower.configure_goal(&stamped(goal,time),options).unwrap();
                     follower.update_execution_map(ExecutionMap::Surface(Arc::clone(&map))).unwrap();
                     follower.update_odometry(stamped(current,time));

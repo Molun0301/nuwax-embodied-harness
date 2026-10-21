@@ -13,7 +13,7 @@ fn fixture() -> (Arc<SurfaceSnapshot>,PoseStamped,schema::GoalEnvelope,SurfaceNa
         .with_body_envelope(config.body_envelope.clone().unwrap()).unwrap());
     let goal=goal_for(&map_message(1,"feedback"),1,[2.,1.,0.5]);
     let mut start=pose_from_schema(&goal.goal).unwrap();start.pose.position.x=0.5;
-    let actual=Arc::new(ActualExecutionContext {source:surface.clone(),odometry:start.clone(),
+    let actual=Arc::new(ActualExecutionContext {measured_motion:None,source:surface.clone(),odometry:start.clone(),
         applied:Twist2::ZERO});
     let feedback=SurfaceReplanFeedback {path_identity:Arc::new(published_surface_identity(&goal,31,7)),
         rejected_context:Some(actual.clone()),current_context:Some(actual),zero_confirmed_rejection:true};

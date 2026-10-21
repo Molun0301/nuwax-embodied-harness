@@ -39,6 +39,13 @@ impl CommandDispatchBound {
             source_timestamp_ns,anchor.unix_ns).ok().map(|stamp|stamp.saturating_add(age)).unwrap_or(0);
         Self::from_anchor(anchor,latest)
     }
+    /// 保留同宿主来源拥有方的单调截止，不以每次读取重新给时效。
+    pub(crate) fn from_same_host_monotonic_deadline(deadline:u64)->Self {
+        let anchor=ObservationClockAnchor::capture();
+        let now=nuwax_motion_safety_guard::measured_motion::monotonic_ns();
+        let latest=deadline.checked_sub(now).and_then(|left|anchor.unix_ns.checked_add(left)).unwrap_or(0);
+        Self::from_anchor(anchor,latest)
+    }
     pub(crate) fn earliest(self,other:Self)->Self {
         Self {
             anchor_unix_ns:self.anchor_unix_ns.max(other.anchor_unix_ns),

@@ -21,7 +21,7 @@ async fn zero_position_surface_scheduler() -> (
 ) {
     let (config, map, goal) = zero_position_surface_parts();
     let motion = Arc::new(Mutex::new(FakeMotionState::default()));
-    let follower = SurfaceFollower::new(config).unwrap();
+    let follower = crate::native_test_helpers::author_static_map_follower(config);
     let mut scheduler = NavScheduler::new(FakeMotion(motion.clone()), follower,
         SchedulerConfig::default()).unwrap();
     let (status, _) = watch::channel(scheduler.status.clone());
@@ -104,7 +104,7 @@ fn zero_position_terminal_group_distinguishes_original_goal_from_wrong_height() 
         let mut actual = endpoint.clone();
         if !wrong_height { actual.pose.position.x -= 5e-7; }
         actual.stamp.nanos += 1;
-        let mut follower = SurfaceFollower::new(config).unwrap();
+        let mut follower = crate::native_test_helpers::author_static_map_follower(config);
         follower.configure_goal(&goal, zero_position_options()).unwrap();
         follower.update_execution_map(ExecutionMap::Surface(map)).unwrap();
         follower.update_odometry(start.clone());

@@ -777,6 +777,9 @@ message NavigationGoal {
   bool allow_reverse = 12;
   optional double position_tolerance_m = 13;
   optional double yaw_tolerance_rad = 14;
+  // New producers opt in to the authoritative profile default only for an omitted choice.
+  // Legacy messages retain allow_reverse; true+true is contradictory and rejected.
+  bool use_profile_reverse_default = 15;
 }
 message CancelNavigationRequest {
   string goal_id = 1;

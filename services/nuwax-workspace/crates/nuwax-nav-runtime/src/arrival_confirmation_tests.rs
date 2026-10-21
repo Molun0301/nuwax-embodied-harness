@@ -309,7 +309,7 @@ async fn arrival_surface_worker_replays_current_map_and_goal_after_stopping_drif
     let motion = Arc::new(Mutex::new(FakeMotionState::default()));
     let mut config = SurfaceFollowerConfig::new(0.4);
     config.controller.speed = 0.2;
-    let planner = planner_worker::PlannerWorker::new(SurfaceFollower::new(config).unwrap()).unwrap();
+    let planner = planner_worker::PlannerWorker::new(crate::native_test_helpers::author_static_map_follower(config)).unwrap();
     let (handle, task) = spawn_scheduler(NavScheduler::new(FakeMotion(motion.clone()), planner,
         SchedulerConfig { tick_interval: Duration::from_millis(5), ..Default::default() }).unwrap());
     let mut start = nuwax_nav_astar::helpers::make_pose_stamped("map", 4.1, 1.55, 0.0);

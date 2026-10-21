@@ -21,7 +21,7 @@ uint64_t __nuwax_msgs_RecentCloud3D_hash_recursive(const __lcm_hash_ptr *p)
     cp.v = __nuwax_msgs_RecentCloud3D_get_hash;
     (void) cp;
 
-    uint64_t hash = (uint64_t)0xff7e222461914a0cLL
+    uint64_t hash = (uint64_t)0x7fb76b6a7b9abea7LL
          + __int32_t_hash_recursive(&cp)
          + __int64_t_hash_recursive(&cp)
          + __string_hash_recursive(&cp)
@@ -29,6 +29,8 @@ uint64_t __nuwax_msgs_RecentCloud3D_hash_recursive(const __lcm_hash_ptr *p)
          + __int64_t_hash_recursive(&cp)
          + __byte_hash_recursive(&cp)
          + __int8_t_hash_recursive(&cp)
+         + __int32_t_hash_recursive(&cp)
+         + __nuwax_msgs_RegisteredCloudPose_hash_recursive(&cp)
          + __int32_t_hash_recursive(&cp)
          + __int32_t_hash_recursive(&cp)
          + __int32_t_hash_recursive(&cp)
@@ -74,6 +76,12 @@ int __nuwax_msgs_RecentCloud3D_encode_array(void *buf, int offset, int maxlen, c
         if (thislen < 0) return thislen; else pos += thislen;
 
         thislen = __int8_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].cleared), 1);
+        if (thislen < 0) return thislen; else pos += thislen;
+
+        thislen = __int32_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].registration_count), 1);
+        if (thislen < 0) return thislen; else pos += thislen;
+
+        thislen = __nuwax_msgs_RegisteredCloudPose_encode_array(buf, offset + pos, maxlen - pos, p[element].registration, p[element].registration_count);
         if (thislen < 0) return thislen; else pos += thislen;
 
         thislen = __int32_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].ground_point_count), 1);
@@ -125,6 +133,10 @@ int __nuwax_msgs_RecentCloud3D_encoded_array_size(const nuwax_msgs_RecentCloud3D
 
         size += __int8_t_encoded_array_size(&(p[element].cleared), 1);
 
+        size += __int32_t_encoded_array_size(&(p[element].registration_count), 1);
+
+        size += __nuwax_msgs_RegisteredCloudPose_encoded_array_size(p[element].registration, p[element].registration_count);
+
         size += __int32_t_encoded_array_size(&(p[element].ground_point_count), 1);
 
         size += __int32_t_encoded_array_size(p[element].ground_point_indices, p[element].ground_point_count);
@@ -169,6 +181,13 @@ int __nuwax_msgs_RecentCloud3D_decode_array(const void *buf, int offset, int max
         thislen = __int8_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].cleared), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
+        thislen = __int32_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].registration_count), 1);
+        if (thislen < 0) return thislen; else pos += thislen;
+
+        p[element].registration = (nuwax_msgs_RegisteredCloudPose*) lcm_malloc(sizeof(nuwax_msgs_RegisteredCloudPose) * p[element].registration_count);
+        thislen = __nuwax_msgs_RegisteredCloudPose_decode_array(buf, offset + pos, maxlen - pos, p[element].registration, p[element].registration_count);
+        if (thislen < 0) return thislen; else pos += thislen;
+
         thislen = __int32_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].ground_point_count), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
@@ -206,6 +225,11 @@ int __nuwax_msgs_RecentCloud3D_decode_array_cleanup(nuwax_msgs_RecentCloud3D *p,
         __byte_decode_array_cleanup(p[element].commit_boot_nonce, 16);
 
         __int8_t_decode_array_cleanup(&(p[element].cleared), 1);
+
+        __int32_t_decode_array_cleanup(&(p[element].registration_count), 1);
+
+        __nuwax_msgs_RegisteredCloudPose_decode_array_cleanup(p[element].registration, p[element].registration_count);
+        if (p[element].registration) free(p[element].registration);
 
         __int32_t_decode_array_cleanup(&(p[element].ground_point_count), 1);
 
@@ -260,6 +284,11 @@ int __nuwax_msgs_RecentCloud3D_clone_array(const nuwax_msgs_RecentCloud3D *p, nu
         __byte_clone_array(p[element].commit_boot_nonce, q[element].commit_boot_nonce, 16);
 
         __int8_t_clone_array(&(p[element].cleared), &(q[element].cleared), 1);
+
+        __int32_t_clone_array(&(p[element].registration_count), &(q[element].registration_count), 1);
+
+        q[element].registration = (nuwax_msgs_RegisteredCloudPose*) lcm_malloc(sizeof(nuwax_msgs_RegisteredCloudPose) * q[element].registration_count);
+        __nuwax_msgs_RegisteredCloudPose_clone_array(p[element].registration, q[element].registration, p[element].registration_count);
 
         __int32_t_clone_array(&(p[element].ground_point_count), &(q[element].ground_point_count), 1);
 

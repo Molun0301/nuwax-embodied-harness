@@ -65,6 +65,7 @@ mod tests {
     #[test]
     fn typed_fence_response_carries_zero_ack() {
         let response = MotionGuardResponse {
+            measured_motion_feedback: None,
             api_version: API_VERSION,
             request_id: "request-2".to_string(),
             outcome: Some(motion_guard_response::Outcome::RevokeAndZero(

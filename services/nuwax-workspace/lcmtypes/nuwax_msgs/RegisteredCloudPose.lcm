@@ -1,0 +1,9 @@
+package nuwax_msgs;
+// 与同一帧已注册点云冻结配对；四元数是机体姿态，不是传感器姿态。
+struct RegisteredCloudPose {
+    double sensor_origin_map[3];
+    double body_position_map[3];
+    double body_orientation_xyzw[4];
+    // 同帧注册绑定携带的修正代次，不从当前状态推算。
+    int64_t registration_correction_revision;
+}

@@ -11,6 +11,13 @@ from contracts.exploration_mission import ExplorationReturnPolicy
 from typing import List, Optional, Tuple
 
 
+def navigation_reverse_wire_fields(value: Optional[bool]) -> dict[str, bool]:
+    """保留请求三态；旧 bool wire 的 false 不被解释为新缺省。"""
+    if value is not None and type(value) is not bool:
+        raise ValueError("allow_reverse 必须是 bool 或缺省")
+    return {"allow_reverse": value is True, "use_profile_reverse_default": value is None}
+
+
 class NavigationStatus(StrEnum):
     """导航状态。"""
 
@@ -34,7 +41,7 @@ class NavigationGoal(TimestampedContract):
     tolerance_position_m: float = Field(default=0.35, ge=0.0, description="位置容差。")
     tolerance_yaw_rad: float = Field(default=0.3, ge=0.0, description="朝向容差。")
     require_goal_orientation: bool = Field(default=True, description="是否要求最终朝向；仅位置选点为否。")
-    allow_reverse: bool = Field(default=False, description="是否允许倒车。")
+    allow_reverse: Optional[bool] = Field(default=None, description="是否允许倒车；缺省由权威导航 profile 解析，显式 false 禁止倒退。")
     metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")
 
     @model_validator(mode="after")

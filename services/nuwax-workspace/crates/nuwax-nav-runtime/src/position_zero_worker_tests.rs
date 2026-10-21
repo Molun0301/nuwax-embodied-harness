@@ -3,12 +3,11 @@
 #[test]
 fn zero_position_real_arrival_requalification_preserves_exact_xyz_only() {
     for nearby in [false, true] {
-        let (config, clear, _) = crate::route_moving_worker_tests::fixture(false, 0.05, 6.0);
+        let (config, clear) = crate::native_test_helpers::fixture();
         assert!(!config.controller.simulation);
         let (computed, receive) = std::sync::mpsc::channel();
         let (release, wait) = std::sync::mpsc::channel();
         let worker = PlannerWorker::new(GatedRouteFollower {
-            refresh_gate: None,
             inner: crate::RouteFollower::new(config).unwrap(),
             computed, release: wait, map: None, boundary: Vec::new(), odometry: None,
             goal_updates: 0, path_updates: 0,

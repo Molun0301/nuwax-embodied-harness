@@ -76,7 +76,7 @@ fn mask_only_surface_update_changes_map_without_renewing_source_health() {
     let bound=CommandDispatchBound::from_source_timestamp(1,Duration::from_nanos(1));
     scheduler.obstacle_source_bound=Some(bound);
     scheduler.observe_costmap(&status,CostmapObservation {
-        costmap:ExecutionMap::SurfaceUpdate(crate::surface_changes::SurfaceMapUpdate {planar_reference:None,
+        costmap:ExecutionMap::SurfaceUpdate(crate::surface_changes::SurfaceMapUpdate {
             snapshot:map.clone(),change_basis:Some(map),
             changes:Arc::new(crate::surface_changes::SurfaceGeometryChanges::Unknown),
         }),source_timestamp_ns:1_000_000_000,

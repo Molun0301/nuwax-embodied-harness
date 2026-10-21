@@ -163,6 +163,8 @@ def main(argv=None) -> int:
     parser.add_argument("--sim-seconds", type=float, default=180, help="每例模拟时间预算秒数")
     parser.add_argument("--startup-timeout", type=float, default=180)
     parser.add_argument("--speed", type=float, default=1.0)
+    parser.add_argument("--no-local-planning", action="store_true",
+                        help="对照组：关闭局部规划，直接跟随全局路线；实际机身检查与停车重规划不变")
     args = parser.parse_args(argv)
     if not all(math.isfinite(value) and value > 0 for value in
                (args.timeout, args.sim_seconds, args.startup_timeout, args.speed)):
@@ -191,6 +193,9 @@ def main(argv=None) -> int:
                         requests.append({**case, "case_id": case["id"], "scene_id": scene["id"], "speed_mps": args.speed})
         if not requests:
             raise ValueError("筛选后没有导航用例")
+        if args.no_local_planning:
+            for request in requests:
+                request["local_planning"] = False
         write_json(data / "矩阵请求.json", requests)
         for index, request in enumerate(requests, 1):
             if worker.process.poll() is not None:
@@ -199,6 +204,7 @@ def main(argv=None) -> int:
             summary = run_one(worker, request, directory, args.timeout, args.sim_seconds)
             results.append(summary)
             write_json(data / "矩阵结果.json", {"recording_name": recording_name,
+                "local_planning": not args.no_local_planning,
                 "elapsed_wall_sec": time.monotonic() - began, "cases": results,
                 "passed": sum(item["passed"] for item in results), "total": len(requests)})
             print(json.dumps({"index": index, "total": len(requests), **summary}, ensure_ascii=False), flush=True)

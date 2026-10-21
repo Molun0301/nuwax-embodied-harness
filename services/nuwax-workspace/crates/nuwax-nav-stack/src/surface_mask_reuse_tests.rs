@@ -2,7 +2,7 @@
 // Included by surface_dataflow::tests; no transport, controller, or actuator.
 use super::*;
 use nuwax_map_chunks::{Repository, Transfer, Writer, MAX_BLOCK_BYTES};
-use nuwax_nav_pct::Tomogram;
+use nuwax_nav_runtime::native_map::{NativeMap,from_surface};
 use std::collections::BTreeSet;
 
 const SOURCE_NS: i64 = 1_700_000_000_000_000_000;
@@ -77,21 +77,24 @@ fn route_request(message: &schema::NavigationMap3D, wide: bool, height: f64)
     goal.source_timestamp_ns = SOURCE_NS;
     goal.goal.header.stamp_sec = (SOURCE_NS / 1_000_000_000) as i32;
     goal.goal.header.stamp_nsec = 0;
+    goal.owner_kind=schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD;
+    goal.boundary_frame_id="map".into();
+    goal.boundary_id="mask-test".into();
+    let (width,height)=if wide {(8.,6.)} else {(4.,3.)};
+    goal.boundary_points=vec![[0.,0.,0.],[width,0.,0.],[width,height,0.],[0.,height,0.]];
     schema::validate_goal_envelope(&goal).unwrap();
     let mut start = pose_from_schema(&goal.goal).unwrap();
     start.pose.position.x = from_x;
     (start, goal)
 }
 
-type CellBits = ([i32; 2], i32, [u64; 6]);
-fn canonical_cells(map: &Tomogram) -> Vec<CellBits> {
-    let mut cells: Vec<_> = map.cells.iter().map(|cell| {
-        (cell.column, cell.layer,
-            [cell.ground, cell.ground_interval[0], cell.ground_interval[1],
-             cell.ceiling, cell.clearance, cell.cost].map(f64::to_bits))
-    }).collect();
-    cells.sort_unstable();
-    cells
+type CellBits=([i32;2],u8,[u64;2]);
+fn native_input(surface:&SurfaceSnapshot)->Result<NativeMap,String> {from_surface(surface)}
+fn canonical_cells(map:&NativeMap)->Vec<CellBits> {
+    let mut records:Vec<_>=map.cells.iter().map(|cell|([cell.x,cell.y],0,[cell.ground,cell.ceiling].map(f64::to_bits)))
+        .chain(map.bands.iter().map(|band|([band.x,band.y],1,[band.low,band.high].map(f64::to_bits))))
+        .chain(map.forbidden_columns.iter().map(|&column|(column,2,[0;2]))).collect();
+    records.sort_unstable();records
 }
 
 fn canonical_columns(surface: &SurfaceSnapshot) -> Vec<([i32; 2], Vec<[u64; 2]>)> {
@@ -112,16 +115,6 @@ fn path_bits(path: &Path3D) -> Vec<([u64; 3], [u64; 4])> {
     }).collect()
 }
 
-fn pct_route_bits(map: &Tomogram, start: &PoseStamped, goal: &schema::GoalEnvelope)
-    -> Result<Vec<[u64; 3]>, String>
-{
-    let p = start.pose.position;
-    let to = goal.goal.pose.position;
-    map.plan_bounded([p.x,p.y,p.z-0.4], [to[0],to[1],to[2]-0.4],
-        goal.options.position_tolerance_m, &[], None, None, &[])
-        .map(|route| route.points.into_iter().map(|point| point.map(f64::to_bits)).collect())
-}
-
 // Independent from every incremental owner: consume only the current complete
 // message in a fresh production cache and a separately constructed PCT owner.
 fn assert_current_message_oracle(
@@ -134,16 +127,13 @@ fn assert_current_message_oracle(
     let cold = SurfaceGeometryCache::configured(&cold_config).build(message).unwrap();
     assert_eq!(actual.cell_keys().collect::<BTreeSet<_>>(), cold.cell_keys().collect());
     assert_eq!(canonical_columns(actual), canonical_columns(&cold));
-    let actual_pct = configured.follower.pct.map(actual).unwrap();
-    let cold_pct = cold_config.follower.pct.map(&cold).unwrap();
+    let actual_pct = native_input(actual).unwrap();
+    let cold_pct = native_input(&cold).unwrap();
     assert_eq!(actual_pct.resolution.to_bits(), cold_pct.resolution.to_bits());
     assert_eq!(canonical_cells(&actual_pct), canonical_cells(&cold_pct));
     if compare_routes {
         let height = if message.fine.is_some() { 0.45 } else { 0.5 };
         let (start, goal) = route_request(message, message.cloud.width > 1200, height);
-        let actual_pct_path = pct_route_bits(&actual_pct, &start, &goal).unwrap();
-        let cold_pct_path = pct_route_bits(&cold_pct, &start, &goal).unwrap();
-        assert_eq!(actual_pct_path, cold_pct_path);
         let actual_body = body_path(actual, &start, &goal, configured).unwrap();
         let cold_body = body_path(&cold, &start, &goal, &cold_config).unwrap();
         assert_eq!(path_bits(&actual_body), path_bits(&cold_body));
@@ -161,14 +151,12 @@ fn occupancy_only_same_mask_reuses_surface_and_pct_with_current_receipt() {
     let first = prepare_surface_map(first_message.clone(), first_received, &configured, &mut cache);
     let old = first.snapshot.as_ref().unwrap();
     let physical = cache.physical_snapshot().unwrap();
-    let old_pct = configured.follower.pct.map(old).unwrap();
     let mut next_message = next_occupancy(&first_message);
     let next_received = first_received + Duration::from_millis(250);
     let next = prepare_surface_map(next_message.clone(), next_received, &configured, &mut cache);
     let current = next.snapshot.as_ref().unwrap();
     assert!(Arc::ptr_eq(old, current));
     assert!(Arc::ptr_eq(&physical, &cache.physical_snapshot().unwrap()));
-    assert!(Arc::ptr_eq(&old_pct, &configured.follower.pct.map(current).unwrap()));
     assert!(old.same_body_query_view(current));
     assert_eq!(next.authority, map_authority(&next_message));
     assert_ne!(next.authority, first.authority);
@@ -188,7 +176,6 @@ fn occupancy_only_same_mask_reuses_surface_and_pct_with_current_receipt() {
     let third_message = next_occupancy(&next_message);
     let third = cache.build(&third_message).unwrap();
     assert!(Arc::ptr_eq(current, &third));
-    assert!(Arc::ptr_eq(&old_pct, &configured.follower.pct.map(&third).unwrap()));
 }
 
 #[test]
@@ -201,7 +188,7 @@ fn mask_cells_presence_extent_and_layout_bits_use_cold_current_message_geometry(
         let first_message = flat_message(40, 30, "mask-layout");
         let old = cache.build(&first_message).unwrap();
         let physical = cache.physical_snapshot().unwrap();
-        let old_pct = configured.follower.pct.map(&old).unwrap();
+        let old_pct = native_input(&old).unwrap();
         let mut next = next_occupancy(&first_message);
         if variant == "none" {
             next.virtual_obstacles = None;
@@ -230,19 +217,12 @@ fn mask_cells_presence_extent_and_layout_bits_use_cold_current_message_geometry(
         let current = cache.build(&next).unwrap();
         assert!(Arc::ptr_eq(&physical, &cache.physical_snapshot().unwrap()), "{variant}");
         assert!(!old.same_geometry(&current), "{variant} must not reuse the old derived graph");
-        let current_pct = configured.follower.pct.map(&current).unwrap();
-        assert!(!Arc::ptr_eq(&old_pct, &current_pct), "{variant}");
+        let current_pct = native_input(&current).unwrap();
         assert_current_message_oracle(&current, &next, &configured, false);
         assert!(Arc::ptr_eq(&current, &cache.build(&next).unwrap()), "{variant}");
-        if variant == "extent" {
-            assert!(current_pct.cells.len() < old_pct.cells.len());
-            let mut absent = next_occupancy(&next);
-            absent.virtual_obstacles = None;
-            let absent_surface = cache.build(&absent).unwrap();
-            let absent_pct = configured.follower.pct.map(&absent_surface).unwrap();
-            assert!(absent_pct.cells.len() > current_pct.cells.len(),
-                "an all-zero finite mask retains its boundary; None has no mask boundary");
-            assert_current_message_oracle(&absent_surface, &absent, &configured, true);
+        if variant=="extent" {
+            assert_eq!(current_pct.cells.len(),old_pct.cells.len(),"空掩码范围外仍保持未知可规划");
+            assert!(current_pct.forbidden_columns.is_empty());
         }
     }
 }
@@ -256,7 +236,7 @@ fn changed_mask_and_removal_restore_current_routes_without_mutating_retained_sna
     let blocked = cache.build(&blocked_message).unwrap();
     let (start, goal) = route_request(&blocked_message, false, 0.5);
     assert!(body_path(&blocked, &start, &goal, &configured).is_err());
-    let blocked_cells = canonical_cells(&configured.follower.pct.map(&blocked).unwrap());
+    let blocked_cells = canonical_cells(&native_input(&blocked).unwrap());
     let mut zero_message = next_occupancy(&blocked_message);
     zero_message.virtual_obstacles.as_mut().unwrap().data.fill(0);
     let zero = cache.build(&zero_message).unwrap();
@@ -272,7 +252,7 @@ fn changed_mask_and_removal_restore_current_routes_without_mutating_retained_sna
     let restored = cache.build(&restored_message).unwrap();
     assert!(!absent.same_geometry(&restored));
     assert_current_message_oracle(&restored, &restored_message, &configured, true);
-    assert_eq!(blocked_cells, canonical_cells(&configured.follower.pct.map(&blocked).unwrap()));
+    assert_eq!(blocked_cells, canonical_cells(&native_input(&blocked).unwrap()));
     assert!(body_path(&blocked, &start, &goal, &configured).is_err());
 }
 
@@ -322,7 +302,6 @@ fn fine_mask_reuse_keeps_original_evidence_and_refresh_retires_only_body_query_v
     let first_observations = Arc::clone(first.observations().unwrap());
     let evidence = first_observations.get([40,30,0]).unwrap();
     let physical = cache.physical_snapshot().unwrap();
-    let pct = configured.follower.pct.map(&first).unwrap();
     let occupied_message = next_occupancy(&first_message);
     let receipt = Instant::now() - Duration::from_secs(3);
     let occupied = prepare_surface_map(occupied_message.clone(), receipt, &configured, &mut cache);
@@ -333,7 +312,6 @@ fn fine_mask_reuse_keeps_original_evidence_and_refresh_retires_only_body_query_v
     assert_eq!(occupied.received_at, receipt);
     assert_eq!(occupied.source_timestamp_ns, first_message.source_timestamp_ns);
     assert_eq!(occupied.authority, map_authority(&occupied_message));
-    assert!(Arc::ptr_eq(&pct, &configured.follower.pct.map(occupied_surface).unwrap()));
     assert_current_message_oracle(occupied_surface, &occupied_message, &configured, true);
 
     let refreshed_message = fixture.message(&cells, 3);
@@ -349,7 +327,6 @@ fn fine_mask_reuse_keeps_original_evidence_and_refresh_retires_only_body_query_v
     assert!(fresh_evidence.observed_ns > evidence.observed_ns);
     assert!(fresh_evidence.hits > evidence.hits);
     assert_eq!(first_observations.get([40,30,0]), Some(evidence));
-    assert!(Arc::ptr_eq(&pct, &configured.follower.pct.map(&refreshed).unwrap()));
     assert_current_message_oracle(&refreshed, &refreshed_message, &configured, true);
 }
 
@@ -362,7 +339,7 @@ fn fine_geometry_change_inside_one_coarse_cell_invalidates_pct_despite_mask_reus
     let first_message = fixture.message(&cells, 1);
     let first = cache.build(&first_message).unwrap();
     let physical = cache.physical_snapshot().unwrap();
-    let pct = configured.follower.pct.map(&first).unwrap();
+    let pct = native_input(&first).unwrap();
     // Three samples in the same 0.1 m coarse column still retain exactly the
     // same coarse occupied cell and height band. The 0.05 m source has a hole.
     assert!(cells.remove(&[10,10,0]));
@@ -375,10 +352,9 @@ fn fine_geometry_change_inside_one_coarse_cell_invalidates_pct_despite_mask_reus
     assert!(!first.observations().unwrap().same_geometry(next.observations().unwrap()));
     assert!(first.observations().unwrap().get([10,10,0]).is_some());
     assert!(next.observations().unwrap().get([10,10,0]).is_none());
-    let next_pct = configured.follower.pct.map(&next).unwrap();
-    assert!(!Arc::ptr_eq(&pct, &next_pct));
+    let next_pct = native_input(&next).unwrap();
     assert_ne!(canonical_cells(&pct), canonical_cells(&next_pct));
-    assert_eq!(pct.cells.len(), next_pct.cells.len() + 1);
+    assert_eq!(pct.bands.len(), next_pct.bands.len() + 1);
     assert_current_message_oracle(&next, &next_message, &configured, true);
 }
 
@@ -389,7 +365,6 @@ fn reset_clear_and_domain_changes_discard_derived_mask_reuse() {
         let mut cache = SurfaceGeometryCache::configured(&configured);
         let first_message = flat_message(40, 30, "mask-reset");
         let first = cache.build(&first_message).unwrap();
-        let pct = configured.follower.pct.map(&first).unwrap();
         let mut next_message = next_occupancy(&first_message);
         match variant {
             "reset" => cache.reset(),
@@ -418,90 +393,7 @@ fn reset_clear_and_domain_changes_discard_derived_mask_reuse() {
         schema::validate_navigation_map_3d(&next_message).unwrap();
         let next = cache.build(&next_message).unwrap();
         assert!(!first.same_geometry(&next), "{variant}");
-        assert!(!Arc::ptr_eq(&pct, &configured.follower.pct.map(&next).unwrap()), "{variant}");
         assert_current_message_oracle(&next, &next_message, &configured, true);
-    }
-}
-
-#[test]
-#[ignore = "manual repeated occupancy-mask cost diagnostic; no transport or movement qualification"]
-fn calibrated_repeated_occupancy_mask_reuse_cost_baseline() {
-    // Freeze dimensions, counts, order, messages and changed-mask placement
-    // before timing. This selector uses only baseline production public APIs.
-    const WARMUP_UPDATES: usize = 3;
-    const MEASURED_UPDATES: usize = 16;
-    let base = flat_message(80, 60, "mask-reuse-budget");
-    let sequences: Vec<_> = [("unchanged", false), ("changed", true)].into_iter().map(|(name, changed)| {
-        let mut sequence = vec![Arc::new(base.clone())];
-        for index in 0..WARMUP_UPDATES + MEASURED_UPDATES {
-            let mut next = next_occupancy(sequence.last().unwrap());
-            if changed {
-                // Off-route patch changes exact cells while retaining a clear
-                // y=3 direct reference route for comparable path evidence.
-                let value = if index % 2 == 0 { 100 } else { 0 };
-                for x in 39..41 { for y in 9..13 {
-                    next.virtual_obstacles.as_mut().unwrap().data[y * 80 + x] = value;
-                }}
-            }
-            schema::validate_navigation_map_3d(&next).unwrap();
-            sequence.push(Arc::new(next));
-        }
-        (name, sequence)
-    }).collect();
-    for (name, sequence) in sequences {
-        let configured = calibrated_config();
-        let mut cache = SurfaceGeometryCache::configured(&configured);
-        let began = Instant::now();
-        let mut surface = cache.build(&sequence[0]).unwrap();
-        let cold_surface_ns = began.elapsed().as_nanos();
-        let began = Instant::now();
-        let mut pct = configured.follower.pct.map(&surface).unwrap();
-        let cold_pct_ns = began.elapsed().as_nanos();
-        for message in sequence.iter().skip(1).take(WARMUP_UPDATES) {
-            surface = cache.build(message).unwrap();
-            pct = configured.follower.pct.map(&surface).unwrap();
-        }
-        let mut measurements = Vec::new();
-        let mut pct_rebuilds = 0;
-        let mut surface_replacements = 0;
-        for message in sequence.iter().skip(1 + WARMUP_UPDATES) {
-            let began = Instant::now();
-            let next = cache.build(std::hint::black_box(message.as_ref())).unwrap();
-            let surface_ns = began.elapsed().as_nanos();
-            let began = Instant::now();
-            let next_pct = configured.follower.pct.map(std::hint::black_box(&next)).unwrap();
-            let pct_ns = began.elapsed().as_nanos();
-            pct_rebuilds += usize::from(!Arc::ptr_eq(&pct, &next_pct));
-            surface_replacements += usize::from(!Arc::ptr_eq(&surface, &next));
-            measurements.push(serde_json::json!({"surface_ns":surface_ns, "pct_ns":pct_ns}));
-            surface = next;
-            pct = next_pct;
-        }
-        // Actual returned routes and independent current-message correctness
-        // checks stay outside every timed interval. Never assert a reuse count:
-        // unchanged production is intentionally a valid benchmark target.
-        let last_message = sequence.last().unwrap();
-        assert_current_message_oracle(&surface, last_message, &configured, true);
-        let (start, goal) = route_request(last_message, true, 0.5);
-        let body = body_path(&surface, &start, &goal, &configured).unwrap();
-        let pct_path = pct_route_bits(&pct, &start, &goal).unwrap();
-        let length_m: f64 = body.poses.windows(2)
-            .map(|pair| pair[0].pose.position.distance(pair[1].pose.position)).sum();
-        let target = goal.goal.pose.position;
-        let endpoint_error_m = body.poses.last().unwrap().pose.position
-            .distance(Point3::new(target[0],target[1],target[2]));
-        assert!(endpoint_error_m <= goal.options.position_tolerance_m + 1e-6);
-        // The fixed direct fixture has a bounded route; do not dump any map.
-        assert!(body.poses.len() <= 128 && pct_path.len() <= 128);
-        eprintln!("MASK_REUSE {}", serde_json::json!({
-            "case":name, "fixture":"80x60 flat 0.1m; calibrated square 0.3m; static cloud revision 1",
-            "warmup_updates":WARMUP_UPDATES, "measured_updates":MEASURED_UPDATES,
-            "cold_surface_ns":cold_surface_ns, "cold_pct_ns":cold_pct_ns,
-            "updates":measurements, "pct_arc_rebuilds":pct_rebuilds,
-            "surface_arc_replacements":surface_replacements, "pct_cells":pct.cells.len(),
-            "body_path_bits":path_bits(&body), "pct_path_bits":pct_path,
-            "quality":{"poses":body.poses.len(),"length_m":length_m,"endpoint_error_m":endpoint_error_m}
-        }));
     }
 }
 

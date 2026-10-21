@@ -67,11 +67,11 @@ fn wait_for_stopped_iteration(worker: &PlannerWorker, outer: &std::sync::Weak<Ro
 
 #[test]
 fn real_route_idle_stop_retires_last_outer_path_arc() {
-    let mut harness = RouteWorkerHarness::new(true);
+    let mut harness = RouteWorkerHarness::new();
     let shared = Arc::clone(&harness.worker.shared); // Inputs owner only; never clone Route.
     harness.worker.step(0.3);
     let computed = harness.next_computation();
-    assert_positive_route_computation(&computed, true);
+    assert_positive_route_computation(&computed);
     assert_eq!(computed.goal_updates, 1);
     assert_eq!(computed.path_updates, 1);
     let initial_path = {
@@ -124,11 +124,11 @@ fn real_route_idle_stop_retires_last_outer_path_arc() {
 
 #[test]
 fn real_route_inflight_stop_defers_outer_path_retirement_to_worker() {
-    let mut harness = RouteWorkerHarness::new(true);
+    let mut harness = RouteWorkerHarness::new();
     let shared = Arc::clone(&harness.worker.shared);
     harness.worker.step(0.3);
     let computed = harness.next_computation();
-    assert_positive_route_computation(&computed, true);
+    assert_positive_route_computation(&computed);
     assert_eq!(computed.goal_updates, 1);
     assert_eq!(computed.path_updates, 1);
     let initial_path = {

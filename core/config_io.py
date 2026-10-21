@@ -676,8 +676,6 @@ def _validate(key: str, value: str, typ: str) -> Optional[str]:
     """返回规范化后的值；非法返回 None（由调用方记入 rejected）。"""
 
     v = value.strip()
-    if key == "NUWAX_NAV_LOCAL_PLANNING_ENABLED" and not v:
-        return "true"
     if key in {"NUWAX_NAV_MAX_STEP_UP_M", "NUWAX_NAV_MAX_STEP_DOWN_M"}:
         # 留空继承已有能力；显式零表示该方向不允许离散台阶。
         if not v:

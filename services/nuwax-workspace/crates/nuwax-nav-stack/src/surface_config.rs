@@ -19,10 +19,8 @@ pub struct SurfaceNavigationConfig {
     pub robot_width_m: f64,
     /// 当前后台搜索的取消信号；不进入机器人标定或地图身份。
     pub(crate) planning_cancelled: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    /// Owner-local work budget for this attempt; never part of calibration/map identity.
-    pub(crate) planning_search_budget: Option<usize>,
-    /// This attempt consumes this exact PCT cost snapshot; no second mutex read.
-    pub(crate) planning_penalties: Option<std::sync::Arc<Vec<nuwax_nav_pct::RoutePenalty>>>,
+    /// 原生全局地图缓存与搜索实例，由导航拥有方共享。
+    pub planner: std::sync::Arc<crate::surface_oriented::PctPlanner>,
 }
 
 impl SurfaceNavigationConfig {
@@ -61,27 +59,9 @@ impl SurfaceNavigationConfig {
             optional_step("NUWAX_NAV_MAX_STEP_DOWN_M")?,
             capabilities.as_ref(),
         )?;
-        config.follower.local_planning_enabled = configured_bool("NUWAX_NAV_LOCAL_PLANNING_ENABLED", true)?;
-        config.follower.scan.horizon_m = configured_number(
-            "NUWAX_NAV_LOCAL_HORIZON_M", config.follower.scan.horizon_m,
+        config.follower.scan.planning_horizon = configured_number(
+            "NUWAX_NAV_LOCAL_HORIZON_M", config.follower.scan.planning_horizon,
         )?;
-        config.follower.scan.refresh_distance_m = configured_number("NUWAX_NAV_LOCAL_REFRESH_DISTANCE_M", 1.0)?;
-        let iterations = configured_number("NUWAX_NAV_SPLINE_ITERATIONS", 12.0)?;
-        if iterations.fract() != 0.0 || !(0.0..=100.0).contains(&iterations) {
-            return Err(NavStackError::InvalidConfig("近场样条迭代次数需要0—100的整数".into()));
-        }
-        config.follower.scan.optimization_iterations = iterations as usize;
-        let expansion_limit = configured_number(
-            "NUWAX_NAV_LOCAL_SEARCH_EXPANSIONS",
-            config.follower.scan.search_expansion_limit as f64,
-        )?;
-        if expansion_limit.fract() != 0.0 || expansion_limit < 1.0 || expansion_limit > 1_000_000.0 {
-            return Err(NavStackError::InvalidConfig(
-                "近场搜索展开上限需要1—1000000的整数".into(),
-            ));
-        }
-        config.follower.scan.search_expansion_limit = expansion_limit as usize;
-        config.follower.scan.validate().map_err(NavStackError::InvalidConfig)?;
         if let Ok(value) = std::env::var("_NUWAX_NAV_ACTUATOR_MAX_LINEAR_MPS") {
             if !value.trim().is_empty() {
                 let limit = parse_number("_NUWAX_NAV_ACTUATOR_MAX_LINEAR_MPS", &value)?;
@@ -123,11 +103,9 @@ impl SurfaceNavigationConfig {
             }
         }
         tracing::info!(target:"navigation.config",event="navigation.config.loaded",profile="pct-scan-3d",
-            local_planning_enabled=config.follower.local_planning_enabled,
-            voxel_m=config.geometry.voxel_size,local_horizon_m=config.follower.scan.horizon_m,
+            voxel_m=config.geometry.voxel_size,local_horizon_m=config.follower.scan.planning_horizon,
             max_step_up_m=config.body_envelope.as_ref().map(|body|body.max_step_up_m),
             max_step_down_m=config.body_envelope.as_ref().map(|body|body.max_step_down_m),
-            local_refresh_m=config.follower.scan.refresh_distance_m,spline_iterations=config.follower.scan.optimization_iterations,
             "三维导航已读取统一配置");
         Ok(config)
     }
@@ -238,8 +216,7 @@ impl SurfaceNavigationConfig {
             follower,
             robot_width_m,
             planning_cancelled: None,
-            planning_search_budget: None,
-            planning_penalties: None,
+            planner: Default::default(),
         })
     }
     /// 两端用同一已验证标定物化外形和运动约束。
@@ -336,19 +313,6 @@ fn optional_step(key: &str) -> NavStackResult<Option<f64>> {
     }
 }
 
-fn configured_bool(key: &str, default: bool) -> NavStackResult<bool> {
-    match std::env::var(key) {
-        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
-            "" => Ok(default),
-            "true" | "1" | "yes" | "on" => Ok(true),
-            "false" | "0" | "no" | "off" => Ok(false),
-            _ => Err(NavStackError::InvalidConfig(format!("{key} must be a boolean"))),
-        },
-        Err(std::env::VarError::NotPresent) => Ok(default),
-        Err(_) => Err(NavStackError::InvalidConfig(format!("{key} must be valid Unicode"))),
-    }
-}
-
 fn parse_number(key: &str, value: &str) -> NavStackResult<f64> {
     value
         .trim()
@@ -415,28 +379,6 @@ mod tests {
             if let Some(value) = std::env::var_os(key) { command.env(key,value); }
         }
         command
-    }
-
-    #[test]
-    fn local_planning_boolean_uses_the_actual_environment_loader() {
-        const CHILD: &str = "NUWAX_TEST_LOCAL_PLANNING_BOOL";
-        if let Ok(expected) = std::env::var(CHILD) {
-            let result = SurfaceNavigationConfig::from_env();
-            if expected == "invalid" { assert!(result.is_err()); }
-            else { assert_eq!(result.unwrap().follower.local_planning_enabled, expected == "true"); }
-            return;
-        }
-        for (value, expected) in [(None, "true"), (Some(""), "true"), (Some("  "), "true"),
-            (Some("true"), "true"), (Some("1"), "true"), (Some(" YES "), "true"), (Some("on"), "true"),
-            (Some("false"), "false"), (Some("0"), "false"), (Some(" No "), "false"), (Some("OFF"), "false"),
-            (Some("enabled"), "invalid"), (Some("2"), "invalid")] {
-            let mut command = isolated_loader_process();
-            command.args(["--exact", "surface_config::tests::local_planning_boolean_uses_the_actual_environment_loader", "--nocapture"])
-                .env(CHILD, expected).env("NUWAX_NAV_BODY_TO_SUPPORT_Z_M", "0.4");
-            if let Some(value) = value { command.env("NUWAX_NAV_LOCAL_PLANNING_ENABLED", value); }
-            let result = command.output().unwrap();
-            assert!(result.status.success(), "{value:?}: {} {}", String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
-        }
     }
 
     #[test]

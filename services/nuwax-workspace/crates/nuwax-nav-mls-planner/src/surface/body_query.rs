@@ -450,7 +450,7 @@ impl SurfaceSnapshot {
         fn same<T>(a:&Option<Arc<T>>,b:&Option<Arc<T>>)->bool {
             match(a,b){(None,None)=>true,(Some(a),Some(b))=>Arc::ptr_eq(a,b),_=>false}
         }
-        self.ground_evidence==other.ground_evidence && Arc::ptr_eq(&self.data,&other.data)&&same(&self.observations,&other.observations)
+        self.same_geometry(other) && same(&self.observations,&other.observations)
             &&same(&self.recent_obstacles,&other.recent_obstacles)
     }
 
@@ -469,8 +469,7 @@ impl SurfaceSnapshot {
             (Some(left),Some(right))=>Arc::ptr_eq(left,right),
             _=>false,
         };
-        self.ground_evidence==other.ground_evidence && Arc::ptr_eq(&self.data,&other.data)
-            && observations && recent
+        self.same_geometry(other) && observations && recent
     }
 
     pub(super) fn can_defer_body_query_edges(&self)->bool {

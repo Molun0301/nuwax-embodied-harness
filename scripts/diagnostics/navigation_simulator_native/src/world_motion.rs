@@ -159,6 +159,66 @@ fn intersects(
     }
     true
 }
+
+/// 使用独立积分得到的两端位姿检查机体扫掠；不调用导航器或其地面预测。
+pub fn check_swept_boxes(from: Body, to: Body, solids: &[Solid], footprint: &[[f64; 2]],
+    z: [f64; 2], resolution: f64) -> Result<(), String> {
+    let radius = footprint.iter().map(|point| point[0].hypot(point[1]))
+        .fold(0.0, f64::max).hypot(z[0].abs().max(z[1].abs()));
+    let length = from.0.iter().zip(to.0).map(|(a,b)|(a-b).powi(2)).sum::<f64>().sqrt();
+    let quaternion_dot = from.1.iter().zip(to.1).map(|(a,b)|a*b).sum::<f64>();
+    let angle = 2.0 * quaternion_dot.abs().clamp(0.0, 1.0).acos();
+    let travel = length + radius * angle;
+    let count = (travel / (resolution * 0.25)).ceil().max(1.0) as usize;
+    let pose = |fraction: f64| {
+        let sign = if quaternion_dot < 0.0 {-1.0} else {1.0};
+        let orientation = std::array::from_fn::<_,4,_>(|axis|
+            from.1[axis] * (1.0-fraction) + sign * to.1[axis] * fraction);
+        let norm = orientation.iter().map(|value|value*value).sum::<f64>().sqrt();
+        (std::array::from_fn(|axis|from.0[axis]*(1.0-fraction)+to.0[axis]*fraction),
+            orientation.map(|value|value/norm))
+    };
+    let angular_distance = |a: [f64; 4], b: [f64; 4]| {
+        let sign = if a.iter().zip(b).map(|(a,b)|a*b).sum::<f64>() < 0.0 {-1.0} else {1.0};
+        let chord = a.iter().zip(b).map(|(a,b)|(a-sign*b).powi(2)).sum::<f64>().sqrt();
+        4.0*(chord*0.5).clamp(0.0,1.0).asin()
+    };
+    for body in [pose(0.0), pose(1.0)] {
+        for (solid_index, solid) in solids.iter().enumerate() {
+            if intersects(body, footprint, z, *solid, 0.0) {
+                return Err(format!("独立机体扫掠与实体{solid_index}相交"));
+            }
+        }
+    }
+    for index in 0..count {
+        let mut pending = vec![(index as f64/count as f64,(index+1) as f64/count as f64,
+            (0..solids.len()).collect::<Vec<_>>())];
+        while let Some((low,high,candidates))=pending.pop() {
+            let middle=(low+high)*0.5;
+            let body=pose(middle);
+            // 中点到区间端点的最大刚体位移包住整段；粗查相交只触发细分，不冒充实际碰撞。
+            let expansion=length*(high-low)*0.5+radius*angular_distance(body.1,pose(low).1)
+                .max(angular_distance(body.1,pose(high).1));
+            let mut unresolved=Vec::new();
+            for solid_index in candidates {
+                let solid=solids[solid_index];
+                if intersects(body,footprint,z,solid,0.0) {
+                    return Err(format!("独立机体扫掠与实体{solid_index}相交"));
+                }
+                if intersects(body,footprint,z,solid,expansion) {
+                    unresolved.push(solid_index);
+                }
+            }
+            if unresolved.is_empty() {continue;}
+            if middle==low||middle==high {
+                return Err(format!("独立机体扫掠与实体{}的边界接触无法消解",unresolved[0]));
+            }
+            pending.push((middle,high,unresolved.clone()));
+            pending.push((low,middle,unresolved));
+        }
+    }
+    Ok(())
+}
 impl World {
     pub fn check_motion(
         &self,
@@ -238,6 +298,23 @@ mod tests {
         }
     }
     const FOOT: [[f64; 2]; 4] = [[-0.3, -0.15], [0.3, -0.15], [0.3, 0.15], [-0.3, 0.15]];
+    #[test]
+    fn refined_sweep_keeps_a_real_gap_without_growing_the_obstacle() {
+        let from=([0.,0.,0.4],[0.,0.,0.,1.]);
+        let to=([0.01,0.,0.4],[0.,0.,0.,1.]);
+        let solid=Solid {low:[-0.5,0.151,0.2],high:[0.5,0.2,0.6]};
+        assert!(intersects(from,&FOOT,[-0.1,0.1],solid,0.005));
+        assert!(check_swept_boxes(from,to,&[solid],&FOOT,[-0.1,0.1],0.05).is_ok());
+    }
+    #[test]
+    fn refined_sweep_detects_a_thin_obstacle_between_clear_endpoints() {
+        let from=([-0.5,0.,0.4],[0.,0.,0.,1.]);
+        let to=([0.5,0.,0.4],[0.,0.,0.,1.]);
+        let solid=Solid {low:[-0.001,-0.1,0.3],high:[0.001,0.1,0.5]};
+        assert!(!intersects(from,&FOOT,[-0.1,0.1],solid,0.));
+        assert!(!intersects(to,&FOOT,[-0.1,0.1],solid,0.));
+        assert!(check_swept_boxes(from,to,&[solid],&FOOT,[-0.1,0.1],0.05).is_err());
+    }
     #[test]
     fn plane_geometry_at_multiple_headings() {
         for plane in [

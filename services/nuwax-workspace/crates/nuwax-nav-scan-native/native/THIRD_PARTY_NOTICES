@@ -1,0 +1,38 @@
+本文件原样保留上游聚合仓库第三方清单。当前无 ROS 的 SCAN 原生组件仅包含 NOTICE 所列 Apache-2.0 源码；下列 PCT、地图资产及其他 ROS 软件包未随此组件引入。
+
+# Third-party and license audit
+
+Audit date: 2026-08-08. This is an engineering inventory, not legal advice.
+
+| Component | Upstream | License evidence | Repository treatment |
+|---|---|---|---|
+| SCAN-Planner planner packages | <https://github.com/wuyi2121/SCAN-Planner> | upstream root `LICENSE`, Apache-2.0 | kept Apache-2.0; original attribution retained in `NOTICE` |
+| PCT planner and tomography | <https://github.com/byangw/PCT_planner> | root GPL v2 text; `NOTICE` says GPL v2 or any later version | vendored under `src/pct`, marked GPL-2.0-or-later, original `LICENSE` and `NOTICE` retained |
+| PCT ROS 2 port lineage | <https://github.com/2473o/PCT_planner/tree/feat/ros2pkg> | derived from PCT; the examined ROS 2 package metadata had incomplete/TODO declarations | provenance and GPL declaration repaired in the vendored packages |
+| `pct_scan_bridge` | local derivative importing/subclassing PCT Python code | derivative of GPL PCT integration | GPL-2.0-or-later |
+| `local_sensing_node`, `mockamap` | inherited through SCAN tree | current ROS package metadata declares GPL-3.0-only | retained as GPL-3.0-only; not represented as Apache code |
+| Go2 description and utility packages | inherited through SCAN tree | current ROS package metadata declares BSD-3-Clause | retained as BSD-3-Clause |
+| GTSAM 4.2 | <https://github.com/borglab/gtsam> | BSD license in upstream source | downloaded and built into ignored `.deps/`; not vendored |
+| OSQP 1.0 | <https://github.com/osqp/osqp> | Apache-2.0 in upstream source | downloaded and built into ignored `.deps/`; not vendored |
+
+## Asset policy
+
+- Building and Plaza are distributed through the official PCT resources and
+  are included with the PCT attribution and GPL terms.
+- Spiral is linked by PCT to the 3D2M planner repository. No explicit license
+  was found in that repository during this audit. The PCD, generated tomogram,
+  and route are therefore Git-ignored; users download/generate them locally.
+
+## Why the former root Apache license was misleading
+
+The SCAN-only ROS 2 repository could correctly point its root `LICENSE` at
+Apache-2.0. After vendoring PCT and directly deriving the Python bridge from it,
+that statement no longer described every source file. PCT-SCAN-ROS2 now uses a
+root license map plus `LICENSES/` and package-level SPDX expressions. This does
+not relicense Apache/BSD files and does not weaken GPL obligations.
+
+For source publication, preserve this file, `NOTICE`, `src/pct/NOTICE`, all
+license texts, and the source corresponding to distributed GPL binaries. A
+closed-source or commercial product incorporating the PCT-derived process needs
+separate legal review; the PCT README asks commercial users to contact its
+authors.

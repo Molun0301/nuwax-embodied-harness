@@ -12,12 +12,14 @@ pub struct HeightfieldFragment {
     /// Local member plus its share of the whole-column distribution.
     pub members: Vec<(u16, [f64; HEIGHT_SUB_BINS])>,
     /// Bounded original diagnostics; never the distribution or contact extent.
+    #[serde(with = "sample_encoding")]
     pub samples: Vec<LayerSample>,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "representation", content = "data", rename_all = "snake_case", deny_unknown_fields)]
 pub enum GroundRecord {
     LegacyPlane(LayerObservation),
+    #[serde(rename = "heightfield_v1_compact", alias = "heightfield_v1")]
     HeightfieldV1(HeightfieldFragment),
     /// Classified XY with no ground claim. Occupancy remains solid evidence.
     ClassifiedEmptyColumn {},
@@ -153,6 +155,122 @@ pub struct ColumnGroundRecords {
     pub classified_empty: bool,
     pub legacy: Vec<(Key, LayerObservation)>,
     pub heightfields: Vec<HeightfieldSurface>,
+}
+
+/// 来源描述按值共享，逐样本仍保留原始坐标、序号、纳秒和点下标。
+/// 旧BL4对象数组继续可读；新记录标签使旧读器明确拒绝紧凑表示。
+mod sample_encoding {
+    use super::*;
+    use serde::de::{Error, MapAccess, SeqAccess, Visitor};
+
+    type NumericSample = (u32, [f64; 3], u64, u64, u32);
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Compact {
+        sources: Vec<Arc<LayerSource>>,
+        values: Vec<NumericSample>,
+    }
+
+    pub fn serialize<S: serde::Serializer>(
+        samples: &[LayerSample],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        if samples.len() > MAX_LAYER_SAMPLES {
+            return Err(serde::ser::Error::custom(
+                "heightfield sample count exceeds budget",
+            ));
+        }
+        let sources: Vec<_> = samples
+            .iter()
+            .map(|s| s.source.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let values = samples
+            .iter()
+            .map(|sample| {
+                (
+                    sources
+                        .binary_search(&sample.source)
+                        .expect("sample source was collected") as u32,
+                    sample.point,
+                    sample.source_sequence,
+                    sample.source_timestamp_ns,
+                    sample.point_index,
+                )
+            })
+            .collect();
+        Compact { sources, values }.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<LayerSample>, D::Error> {
+        struct Samples;
+        impl<'de> Visitor<'de> for Samples {
+            type Value = Vec<LayerSample>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("heightfield samples or a compact source table")
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut input: A) -> Result<Self::Value, A::Error> {
+                let mut samples = Vec::new();
+                let mut sources = BTreeSet::new();
+                while let Some(mut sample) = input.next_element::<LayerSample>()? {
+                    if samples.len() == MAX_LAYER_SAMPLES {
+                        return Err(A::Error::custom("heightfield sample count exceeds budget"));
+                    }
+                    // 旧数据的来源值相同也只拥有一个不可变描述，不改变任一样本身份。
+                    if let Some(source) = sources.get(&sample.source) {
+                        sample.source = Arc::clone(source);
+                    } else {
+                        sources.insert(sample.source.clone());
+                    }
+                    samples.push(sample);
+                }
+                Ok(samples)
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, input: A) -> Result<Self::Value, A::Error> {
+                let compact =
+                    Compact::deserialize(serde::de::value::MapAccessDeserializer::new(input))?;
+                if compact.values.len() > MAX_LAYER_SAMPLES
+                    || compact.sources.len() > MAX_LAYER_SAMPLES
+                    || compact.sources.windows(2).any(|v| v[0] >= v[1])
+                {
+                    return Err(A::Error::custom("invalid compact heightfield source table"));
+                }
+                for source in &compact.sources {
+                    source.validate().map_err(A::Error::custom)?;
+                }
+                let mut used = vec![false; compact.sources.len()];
+                let mut samples = Vec::with_capacity(compact.values.len());
+                for (index, point, source_sequence, source_timestamp_ns, point_index) in
+                    compact.values
+                {
+                    let source = compact
+                        .sources
+                        .get(index as usize)
+                        .ok_or_else(|| A::Error::custom("heightfield source index out of range"))?;
+                    used[index as usize] = true;
+                    samples.push(LayerSample {
+                        source: source.clone(),
+                        point,
+                        source_sequence,
+                        source_timestamp_ns,
+                        point_index,
+                    });
+                }
+                if used.iter().any(|value| !value) {
+                    return Err(A::Error::custom("unreferenced heightfield source"));
+                }
+                Ok(samples)
+            }
+        }
+        deserializer.deserialize_any(Samples)
+    }
 }
 
 pub(crate) fn validate_records(records: &GroundRecords, block: &Block) -> Result<(), String> {

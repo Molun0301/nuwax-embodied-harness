@@ -13,8 +13,7 @@ fn fixture() -> (Scene,Simulation,PathBuf) {
     fs::create_dir_all(&directory).unwrap();
     let scene=Scene::make("same-input-feedback","adapter fixture",points,vec![],config,true,
         GroundEvidence::MeasuredSurface,&directory).unwrap();
-    let mut session=Simulation::new(&scene,&json!({"start":[0.,0.,0.4,0.],"goal":[1.5,0.,0.4,0.],
-        "local_planning_enabled":false})).unwrap();
+    let mut session=Simulation::new(&scene,&json!({"start":[0.,0.,0.4,0.],"goal":[1.5,0.,0.4,0.]})).unwrap();
     session.plan(&scene).unwrap();
     session.rejected_plan=Some(session.plans);
     session.rejected_context=session.follower.refresh_execution_context(as_twist(session.applied));
@@ -38,7 +37,7 @@ fn identical_stopped_refusal_reuses_success_without_stepping_but_real_pose_chang
     CANCEL.store(true,Ordering::Relaxed);
     let cancelled=session.plan(&scene);
     CANCEL.store(false,Ordering::Relaxed);
-    assert!(cancelled.unwrap_err().contains("层析规划已取消"),"memo cannot swallow existing cancellation");
+    assert!(cancelled.unwrap_err().contains("取消"),"memo cannot swallow existing cancellation");
     assert_eq!(session.plans,plans+1,"preserve original failed-attempt accounting");
     session.current.0[2]=f64::from_bits(session.current.0[2].to_bits()+1);
     session.follower.update_odometry(stamped(session.current,session.time));

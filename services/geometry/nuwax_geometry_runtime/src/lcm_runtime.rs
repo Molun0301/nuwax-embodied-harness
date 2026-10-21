@@ -15318,11 +15318,16 @@ pub(crate) mod mapping_feed_tests {
         let free = build_exploration_surface_map(&unmasked, geometry.clone()).unwrap();
         let protected = build_exploration_surface_map(&message, geometry.clone()).unwrap();
         for z in [0.0, 3.0] {
-            let start = free.locate_support([-2.0, 0.0, z]).unwrap().support_xyz;
-            let goal = free.locate_support([2.0, 0.0, z]).unwrap().support_xyz;
-            assert!(free.plan(start, goal).is_ok(), "物理三维图原本连通");
+            let start = ([-2.0, 0.0, z + 0.5], [0.0, 0.0, 0.0, 1.0]);
+            let goal = ([2.0, 0.0, z + 0.5], start.1);
+            // 明确请求边界，避免未知可通行语义允许从有限禁区线外绕行。
+            let boundary = [[-3.0,-3.0],[3.0,-3.0],[3.0,3.0],[-3.0,3.0]];
+            let options = nuwax_nav_types_messages::GoalOptions::default();
+            assert!(nuwax_nav_stack::surface_oriented::plan(
+                &free,start,goal,options,0.5,&boundary).is_ok(), "物理三维图原本连通");
             assert!(
-                protected.plan(start, goal).is_err(),
+                nuwax_nav_stack::surface_oriented::plan(
+                    &protected,start,goal,options,0.5,&boundary).is_err(),
                 "纯虚拟细线必须阻断两层路径"
             );
         }

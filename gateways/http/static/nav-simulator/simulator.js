@@ -293,7 +293,7 @@ class SimulationView {
 }
 
 function initialize() {
-  const ids = ['scene', 'case', 'scene-description', 'cloud-count', 'scene-name', 'height-hint', 'speed', 'speed-value', 'run', 'pause', 'reset', 'export', 'status', 'message', 'history-note', 'timeline', 'playback-play', 'playback-speed', 'live', 'replay-time', 'frame-count', 'replay-badge', 'pick-hint', 'viewport-empty', 'requires-orientation', 'goal-yaw-label'];
+  const ids = ['scene', 'case', 'scene-description', 'cloud-count', 'scene-name', 'height-hint', 'speed', 'speed-value', 'run', 'pause', 'reset', 'export', 'status', 'message', 'history-note', 'timeline', 'playback-play', 'playback-speed', 'live', 'replay-time', 'frame-count', 'replay-badge', 'pick-hint', 'viewport-empty', 'requires-orientation', 'goal-yaw-label', 'local-planning'];
   const el = Object.fromEntries(ids.map(id => [id, document.getElementById(id)]));
   const store = { scene: null, scenes: [], cases: [], caseId: null, cloudLoaded: false, loadToken: 0, start: [0, 0, 0.4, 0], goal: [7, 0, 0.4, 0], id: null, snapshot: null, frames: [], paths: new Map(), locals: new Map(), lastGlobal: null, obstacles: [], pollTimer: null, pollRequest: null, pollingEpoch: 0, busy: false, operationError: null, replay: false, replayTime: 0, playing: false, playbackRaf: null, pickMode: null };
   let view;
@@ -323,6 +323,7 @@ function initialize() {
     el.reset.disabled = store.busy;
     el.scene.disabled = locked; el.case.disabled = locked || !store.cases.length;
     el.speed.disabled = locked;
+    el['local-planning'].disabled = locked;
     document.querySelectorAll('.coordinate-grid input, [data-pick="start"], [data-pick="goal"]').forEach(node => { node.disabled = locked; });
     el['requires-orientation'].disabled = locked;
     document.getElementById('goal-yaw').disabled = locked || !el['requires-orientation'].checked;
@@ -420,6 +421,9 @@ function initialize() {
     setText(document.getElementById('metric-distance'), number(distance));
     setText(document.getElementById('metric-time'), number(currentTime, 1));
     setText(document.getElementById('metric-plans'), metrics.global_plans ?? 0);
+    // 模式取原生本轮状态，运行中改动开关不影响已创建的模拟。
+    const localPlanning = snapshot?.local_planning;
+    setText(document.getElementById('local-planning-mode'), localPlanning === undefined ? '—' : localPlanning ? `开启 · ${metrics.local_plans ?? 0} 次` : '关闭 · 直接跟随');
     setText(document.getElementById('wall-sec'), `${number(metrics.elapsed_wall_sec, 1)} 秒`);
     setText(document.getElementById('validation-failures'), `${metrics.motion_validation_failures ?? 0} 次`);
     setText(document.getElementById('plan-ms'), `${number(metrics.last_plan_ms, 2)} 毫秒`);
@@ -561,9 +565,10 @@ function initialize() {
   el.run.addEventListener('click', () => action(async () => {
     const start = poseInputs('start'), goal = poseInputs('goal');
     clearSimulation(); store.start = start; store.goal = goal; setPick(null); view.focusRoute(start, goal);
-    feedback('正在创建模拟，等待原生算法首轮规划…');
+    const localPlanning = el['local-planning'].checked;
+    feedback(`正在创建模拟（局部规划${localPlanning ? '开启' : '关闭'}），等待原生算法首轮规划…`);
     const obstacles = store.obstacles.map(({ x, y, radius, height }) => ({ x, y, radius, height }));
-    const result = await post('/api/simulations', { scene_id: store.scene.id, case_id: store.caseId, start, goal, requires_orientation: el['requires-orientation'].checked, speed_mps: Number(el.speed.value), obstacles });
+    const result = await post('/api/simulations', { scene_id: store.scene.id, case_id: store.caseId, start, goal, requires_orientation: el['requires-orientation'].checked, speed_mps: Number(el.speed.value), local_planning: localPlanning, obstacles });
     if (!result.id) throw new Error('模拟服务没有返回本轮标识');
     store.id = String(result.id);
     if (result.state && typeof result.state === 'object') ingest(result.state);
@@ -601,7 +606,8 @@ function initialize() {
     const result = await json(`/api/simulations/${encodeURIComponent(store.id)}/result`);
     const blob = new Blob([JSON.stringify(result, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob), link = document.createElement('a');
-    link.href = url; link.download = `导航模拟结果-${store.id}.json`; link.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+    const mode = result.local_planning === false ? '局部规划关闭' : '局部规划开启';
+    link.href = url; link.download = `导航模拟结果-${mode}-${store.id}.json`; link.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
     feedback('本轮完整模拟结果已导出。');
   }));
   window.addEventListener('beforeunload', () => { stopPolling(); stopPlayback(); });

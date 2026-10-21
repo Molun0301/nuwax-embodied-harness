@@ -36,6 +36,244 @@ fn artifact(name: &str, bytes: &[u8]) {
     }
 }
 
+fn old_heightfield_block(block: &Block, records: &GroundRecords) -> Vec<u8> {
+    let mut entries = Vec::new();
+    for (key, record) in records.iter() {
+        let GroundRecordRef::HeightfieldV1(fragment) = record else {
+            panic!("heightfield fixture");
+        };
+        let mut value = serde_json::to_value(fragment).unwrap();
+        value["samples"] = serde_json::to_value(&fragment.samples).unwrap();
+        entries.push(serde_json::json!([key, {"representation":"heightfield_v1","data":value}]));
+    }
+    let json = serde_json::to_vec(&entries).unwrap();
+    let mut bytes = encode_block(block).unwrap();
+    bytes[..8].copy_from_slice(b"NUWAXBL4");
+    bytes[12..16].copy_from_slice(&(json.len() as u32).to_le_bytes());
+    bytes.extend(json);
+    bytes
+}
+
+#[test]
+fn compact_heightfield_reads_old_bl4_and_preserves_logical_identity_and_float_bits() {
+    let source = Arc::new(LayerSource::Lidar {
+        backend: 1,
+        runtime_generation: i64::MAX,
+        sensor_frame_id: "sensor-原始".into(),
+    });
+    let mut value = column(surface([0, 0], &[0]));
+    value.heightfields[0].samples = (0..3)
+        .map(|i| LayerSample {
+            source: Arc::new(source.as_ref().clone()),
+            point: [
+                -0.0,
+                f64::from_bits(1),
+                f64::from_bits(0x3f847ae147ae147b + i),
+            ],
+            source_sequence: u64::MAX - i,
+            source_timestamp_ns: u64::MAX,
+            point_index: u32::MAX - i as u32,
+        })
+        .collect();
+    value.heightfields[0].samples.extend([
+        LayerSample {
+            source: Arc::new(LayerSource::Auxiliary {
+                sensor_id: "sensor-原始".into(),
+                clock_id: "独立时钟".into(),
+                runtime_generation: u64::MAX,
+                session_generation: u64::MAX,
+            }),
+            point: [0.001; 3],
+            source_sequence: 0,
+            source_timestamp_ns: u64::MAX,
+            point_index: u32::MAX,
+        },
+        LayerSample {
+            source: Arc::new(LayerSource::Legacy),
+            point: [0.001; 3],
+            source_sequence: 1,
+            source_timestamp_ns: u64::MAX,
+            point_index: u32::MAX,
+        },
+    ]);
+    let mut w = writer();
+    install(&mut w, &value, u64::MAX);
+    w.record_source_watermark(source.clone(), u64::MAX, u64::MAX)
+        .unwrap();
+    let root = w.snapshot(domain(), 1, u64::MAX).unwrap();
+    let compact = w
+        .repository()
+        .read_object(root.blocks[0].object, MAX_BLOCK_BYTES)
+        .unwrap();
+    let (block, actual) = decode_block_parts(&compact).unwrap();
+    let old = old_heightfield_block(&block, &actual);
+    let legacy = decode_ground_records(&old).unwrap();
+    assert_eq!(legacy, actual);
+    assert!(legacy.geometry_eq(&actual));
+    for records in [&legacy, &actual] {
+        let GroundRecordRef::HeightfieldV1(decoded) = records.iter().next().unwrap().1 else {
+            panic!();
+        };
+        for (original, decoded) in value.heightfields[0].samples.iter().zip(&decoded.samples) {
+            assert_eq!(
+                original.point.map(f64::to_bits),
+                decoded.point.map(f64::to_bits)
+            );
+            assert_eq!(original, decoded);
+        }
+        assert!(Arc::ptr_eq(
+            &decoded.samples[0].source,
+            &decoded.samples[1].source
+        ));
+    }
+    // 两种字节表示使用独立接收库；同一清单、来源水位及完整逻辑记录相同。
+    for (name, payload) in [("旧高度场.ar5", old), ("紧凑高度场.ar5", compact)] {
+        let repository = Repository::temporary().unwrap();
+        let mut receiver = Receiver::new(repository.clone());
+        let received = receiver
+            .receive(
+                &Transfer {
+                    root: root.encode().unwrap(),
+                    included: BTreeMap::from([(root.blocks[0].object, payload)]),
+                },
+                &root.domain,
+                |_, _| Err("included fixture".into()),
+            )
+            .unwrap();
+        assert_eq!(*received, *root);
+        assert_eq!(assembled(&mut receiver, &received, [0, 0]), value);
+        let bytes = archive_bytes(&received, &repository);
+        artifact(name, &bytes);
+        let restored_repository = Repository::temporary().unwrap();
+        let restored = ArchiveReader::open(Cursor::new(bytes))
+            .unwrap()
+            .import(&restored_repository)
+            .unwrap();
+        let mut copy = Writer::new(restored_repository, Q, BUDGET).unwrap();
+        copy.restore_archived(&restored).unwrap();
+        assert_eq!(copy.ground_column([0, 0]).unwrap(), value);
+        assert_eq!(copy.source_watermark(&source), Some((u64::MAX, u64::MAX)));
+    }
+}
+
+#[test]
+fn compact_heightfield_full_block_retains_all_32_samples_with_original_byte_budget() {
+    let stamp = 1_792_583_310_123_456_789;
+    let mut block = Block::new();
+    let mut records = BTreeMap::new();
+    for local in 0..1024_u16 {
+        let xy = [i32::from(local % 32), i32::from(local / 32)];
+        block.insert(
+            local,
+            Evidence {
+                observed_ns: stamp,
+                hits: 32,
+            },
+        );
+        records.insert(
+            local,
+            GroundRecord::HeightfieldV1(HeightfieldFragment {
+                anchor: [xy[0], xy[1], 0],
+                height_m: f64::from(Q) / 16.0,
+                occupied_bounds: [0.0, f64::from(Q)],
+                members: vec![(local, [1., 0., 0., 0., 0., 0., 0., 0.])],
+                samples: (0..32)
+                    .map(|i| LayerSample {
+                        source: Arc::new(LayerSource::Lidar {
+                            backend: 1,
+                            runtime_generation: 1,
+                            sensor_frame_id: "sensor".into(),
+                        }),
+                        point: [
+                            (f64::from(xy[0]) + 0.5) * f64::from(Q),
+                            (f64::from(xy[1]) + 0.5) * f64::from(Q),
+                            0.001,
+                        ],
+                        source_sequence: i + 1,
+                        source_timestamp_ns: stamp - 32 + i,
+                        point_index: u32::from(local),
+                    })
+                    .collect(),
+            }),
+        );
+    }
+    let records = GroundRecords::Versioned(Arc::new(records));
+    let old = old_heightfield_block(&block, &records);
+    assert!(old.len() > MAX_BLOCK_BYTES, "复现原持续采样会超出块预算");
+    let encoded = encode_ground_block(&block, &records).unwrap();
+    assert!(encoded.len() < MAX_BLOCK_BYTES);
+    assert_eq!(decode_ground_records(&encoded).unwrap(), records);
+    assert_eq!(block_summary(&encoded).unwrap(), (1024, stamp));
+    eprintln!(
+        "COMPACT full_columns=1024 samples_per_column=32 old_bytes={} new_bytes={}",
+        old.len(),
+        encoded.len()
+    );
+}
+
+#[test]
+fn compact_heightfield_rejects_invalid_source_tables_and_keeps_sample_validation() {
+    let fragment = HeightfieldFragment {
+        anchor: [0, 0, 0],
+        height_m: 0.001,
+        occupied_bounds: [0., f64::from(Q)],
+        members: vec![(0, [1., 0., 0., 0., 0., 0., 0., 0.])],
+        samples: vec![LayerSample {
+            source: Arc::new(LayerSource::Lidar {
+                backend: 1,
+                runtime_generation: 1,
+                sensor_frame_id: "sensor".into(),
+            }),
+            point: [0.001; 3],
+            source_sequence: 1,
+            source_timestamp_ns: 20,
+            point_index: 0,
+        }],
+    };
+    let original = serde_json::to_value(&fragment).unwrap();
+    for case in 0..6 {
+        let mut value = original.clone();
+        let samples = &mut value["samples"];
+        let first_source = samples["sources"][0].clone();
+        match case {
+            0 => samples["sources"]
+                .as_array_mut()
+                .unwrap()
+                .push(first_source),
+            1 => samples["values"][0][0] = 1.into(),
+            2 => samples["values"] = serde_json::json!([]),
+            3 => samples["values"] = serde_json::json!(vec![samples["values"][0].clone(); 33]),
+            4 => samples["sources"][0]["runtime_generation"] = 0.into(),
+            _ => samples["extra"] = true.into(),
+        }
+        assert!(
+            serde_json::from_value::<HeightfieldFragment>(value).is_err(),
+            "case={case}"
+        );
+    }
+    let mut value = original;
+    value["samples"]["values"][0][2] = 0.into();
+    let invalid: HeightfieldFragment = serde_json::from_value(value).unwrap();
+    let block = BTreeMap::from([(
+        0,
+        Evidence {
+            observed_ns: 20,
+            hits: 1,
+        },
+    )]);
+    assert!(
+        encode_ground_block(
+            &block,
+            &GroundRecords::Versioned(Arc::new(BTreeMap::from([(
+                0,
+                GroundRecord::HeightfieldV1(invalid)
+            ),])))
+        )
+        .is_err(),
+        "紧凑编码不跳过原始样本身份验证"
+    );
+}
+
 #[test]
 fn heightfield_cross_block_writer_receiver_archive_restore_exact_members() {
     let mut w = writer();

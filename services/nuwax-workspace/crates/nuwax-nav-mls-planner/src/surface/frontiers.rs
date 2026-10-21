@@ -456,3 +456,46 @@ mod bounds_tests {
         assert!(broad.column_ranges(usize::MAX).is_none());
     }
 }
+
+// 前沿可达距离保留在前沿组件，不再维护独立导航路线缓存。
+
+impl SurfaceSnapshot {
+    pub(super) fn frontier_distances(
+        &self,
+        start: CellId,
+        boundary: &[[f64; 2]],
+    ) -> Vec<f64> {
+        let cells = &self.data.graph.cells;
+        nuwax_explore_routing::shortest_costs(
+            cells.slot_capacity(),
+            start as usize,
+            None,
+            |id, output| {
+                if boundary.is_empty() {
+                    output.extend(
+                        cells
+                            .neighbors(id as CellId)
+                            .iter()
+                            .filter(|edge| edge.cost.is_finite())
+                            .map(|edge| (edge.dest as usize, f64::from(edge.base_cost))),
+                    );
+                    return;
+                }
+                let from = self.cell_position(cells.coord(id as CellId));
+                for edge in cells.neighbors(id as CellId) {
+                    if !edge.cost.is_finite() {
+                        continue;
+                    }
+                    let to = self.cell_position(cells.coord(edge.dest));
+                    if segment_inside_boundary([from[0], from[1]], [to[0], to[1]], boundary) {
+                        output.push((edge.dest as usize, f64::from(edge.base_cost)));
+                    }
+                }
+            },
+        )
+    }
+}
+
+pub(super) fn frontier_point_distance(a: [f64; 3], b: [f64; 3]) -> f64 {
+    ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
+}

@@ -631,20 +631,6 @@
     "apply_scope": "重启几何运行时后生效",
     "description": ""
   },
-  "NUWAX_NAV_LOCAL_PLANNING_ENABLED": {
-    "zh_name": "启用局部规划",
-    "type": "bool",
-    "default": true,
-    "section_id": "nav_stack",
-    "advanced": false,
-    "target_file": "core_env",
-    "consumers": [
-      "services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_config.rs"
-    ],
-    "apply_scope": "保存后重启导航后端生效",
-    "effective_value_scope": "external_process",
-    "description": "三维导航时在全局路线附近实时规划避障轨迹；关闭后直接沿全局路线行驶，停车与安全约束不变。二维执行链不使用此项。"
-  },
   "NUWAX_NAV_STACK_STATE_TTL_MS": {
     "zh_name": "导航状态有效时间（毫秒）",
     "type": "int",
@@ -1838,7 +1824,7 @@
   "NUWAX_NAV_LOCAL_HORIZON_M": {
     "zh_name": "近场轨迹视距（米）",
     "type": "float",
-    "default": 5.0,
+    "default": 0.8,
     "section_id": "nav_stack",
     "target_file": "core_env",
     "consumers": [
@@ -1847,33 +1833,6 @@
     "apply_scope": "重启导航栈后生效",
     "description": "局部规划沿全局路线向前取参考路段的长度（米）。",
     "minimum": 0.01
-  },
-  "NUWAX_NAV_LOCAL_REFRESH_DISTANCE_M": {
-    "zh_name": "近场轨迹更新距离（米）",
-    "type": "float",
-    "default": 1.0,
-    "section_id": "nav_stack",
-    "target_file": "core_env",
-    "consumers": [
-      "services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_config.rs"
-    ],
-    "apply_scope": "重启导航栈后生效",
-    "description": "机器人沿路线前进这段距离后重新计算局部轨迹（米）。",
-    "minimum": 0.01
-  },
-  "NUWAX_NAV_SPLINE_ITERATIONS": {
-    "zh_name": "近场样条优化次数",
-    "type": "int",
-    "default": 12,
-    "section_id": "nav_stack",
-    "target_file": "core_env",
-    "consumers": [
-      "services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_config.rs"
-    ],
-    "apply_scope": "重启导航栈后生效",
-    "description": "局部轨迹样条优化的最多迭代次数，0～100的整数。",
-    "minimum": 0,
-    "maximum": 100
   },
   "NUWAX_GEOMETRY_TRAVERSABILITY_MAX_STEP_HEIGHT_M": {
     "zh_name": "可通行最大台阶高度（米）",

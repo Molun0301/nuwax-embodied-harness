@@ -3,6 +3,40 @@
 use super::*;
 use nuwax_map_chunks::{Domain, Repository};
 const Q: f32 = 0.05;
+
+#[test]
+fn dilation_bits_match_geometric_neighborhood_at_coordinate_limits() {
+    for c in [[0, 0], [i32::MIN, i32::MAX], [i32::MAX - 2, i32::MIN + 3]] {
+        let columns: Vec<_> = window(c).collect();
+        for phase in 0..32 {
+            let input: BTreeSet<_> = columns
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| (i * 17 + phase * 11) % 31 < phase)
+                .map(|(_, &xy)| xy)
+                .collect();
+            let expected: BTreeSet<_> = columns
+                .iter()
+                .copied()
+                .filter(|xy| {
+                    input.iter().any(|p| {
+                        (i64::from(xy[0]) - i64::from(p[0])).abs() <= 1
+                            && (i64::from(xy[1]) - i64::from(p[1])).abs() <= 1
+                    })
+                })
+                .collect();
+            let actual = dilate(c, &input);
+            assert_eq!(actual.count_ones() as usize, expected.len());
+            for xy in &columns {
+                let bit = (i64::from(xy[0]) - i64::from(c[0]) + 4) * 9 + i64::from(xy[1])
+                    - i64::from(c[1])
+                    + 4;
+                assert_eq!((actual >> bit) & 1 != 0, expected.contains(xy));
+            }
+        }
+    }
+}
+
 fn writer() -> Writer {
     Writer::new(Repository::temporary().unwrap(), Q, 4 * 1024 * 1024).unwrap()
 }

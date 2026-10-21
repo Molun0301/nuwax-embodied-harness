@@ -1,4 +1,4 @@
-//! 可复现的跨层点云场景；所有表面显式采样到源体素中心。
+//! 可复现的跨层点云场景；输出是已占据体素中心，地面取这些体素的暴露顶。
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 
@@ -18,8 +18,8 @@ pub struct PhysicalSurface {
     pub bounds: [f64; 4],
 }
 
-/// Explicit diagnostic assumption for the original C observation dropout.
-/// The finite plane belongs only to the simulator world, never to its map.
+/// 原C组缺测场景的显式诊断假设。
+/// 有限平面仅属于模拟世界，不写入导航地图。
 pub const MISSING_PATCH_FLAT_FLOOR: &str = "c-missing-patch-flat-floor-v1";
 pub fn declared_world_fixture(id: &str) -> Result<PhysicalSurface, String> {
     if id != MISSING_PATCH_FLAT_FLOOR {
@@ -83,7 +83,7 @@ pub fn multilevel() -> Vec<Scenario> {
     ramp.sheet([10.0, 12.0, -0.9, 2.3], |_, _| 2.0, false);
     ramp.sheet([2.0, 10.0, 1.0, 2.3], |_, _| 2.0, false);
     result.push(Scenario {
-        occupied_volume: false,
+        occupied_volume: true,
         id: "stacked-ramp",
         name: "双层重叠 · 外侧坡道",
         description:
@@ -130,7 +130,7 @@ pub fn multilevel() -> Vec<Scenario> {
             }
         }
     }
-    result.push(Scenario{occupied_volume:false,id:"stairs",name:"双层楼梯 · 表面点云",
+    result.push(Scenario{occupied_volume:true,id:"stairs",name:"双层楼梯 · 表面点云",
         description:"20级楼梯连接2米高差，阶高0.10米、踏面0.50米；仅采样踏面与立面，按点云地形更新机体姿态。",
         points:surfaces.points(),cases:vec![
             case("stairs-up","表面楼梯上行",[-1.0,0.0,0.4,0.0],[12.0,0.0,2.4,0.0],true),
@@ -156,7 +156,7 @@ pub fn multilevel() -> Vec<Scenario> {
         disconnected.sheet([-2.0, 2.0, -2.0, 2.0], |_, _| z, false);
     }
     result.push(Scenario {
-        occupied_volume: false,
+        occupied_volume: true,
         id: "disconnected-floors",
         name: "双层断开 · 禁止跳层",
         description: "上下层XY完全重叠但没有楼梯或坡道；跨层目标应报告无可连接路线，同层仍可通行。",
@@ -217,7 +217,7 @@ pub fn multilevel() -> Vec<Scenario> {
     ceiling.sheet([-2.0, 2.0, -1.2, 1.2], |_, _| 0.0, false);
     ceiling.sheet([0.0, 2.0, -1.2, 1.2], |_, _| 0.30, false);
     result.push(Scenario {
-        occupied_volume: false,
+        occupied_volume: true,
         id: "low-ceiling",
         name: "低净空 · 不可穿楼板",
         description: "目标位于30厘米高的楼板下方，低于原机体所需净空；不能从下层穿入或误选板顶。",
@@ -276,7 +276,7 @@ pub fn complex_ground() -> Vec<Scenario> {
                 [start[0], start[1], z(start[0], start[1]), heading],
                 [goal[0], goal[1], z(goal[0], goal[1]), heading], true));
         }
-        scenes.push(Scenario { id, name, description, points: cloud, cases, occupied_volume: false });
+        scenes.push(Scenario { id, name, description, points: cloud, cases, occupied_volume: true });
     }
     scenes
 }
@@ -296,10 +296,10 @@ pub fn complex_ground_metadata(id: &str) -> Value {
         "ramp_gradient":if id=="rough-ramp-obstacle" {0.15}else{0.0},
         "obstacle_height_m":if id=="rough-ramp-obstacle" {0.8}else{0.0},
         "normal_source":"independent_weighted_fit_of_declared_physical_surface",
-        "navigation_ground_source":"unmodified_pointcloud_geometry_without_measured_layers",
+        "navigation_ground_source":"occupied_voxel_intervals_and_exposed_tops",
         "physical_surface_source":"complex_ground_height",
         "physical_surface_used_by_navigation":false,
-        "measurement_provenance":"synthetic_observations_not_sensor_capture", "seed":"integer_xy_73_151_mod_997"})
+        "measurement_provenance":"synthetic_voxel_centers_not_sensor_returns", "seed":"integer_xy_73_151_mod_997"})
 }
 
 #[cfg(test)]

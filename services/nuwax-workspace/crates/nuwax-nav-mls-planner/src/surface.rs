@@ -11,8 +11,7 @@ use imageproc::integral_image::{integral_image, sum_image_pixels};
 use validator::Validate;
 
 use crate::adjacency::{
-    build_surface_cells, build_surface_lookup, CellId, SurfaceCells, SurfaceLookup,
-};
+    build_surface_cells, build_surface_lookup, CellId, SurfaceLookup};
 use crate::edges::PlannerGraph;
 use crate::mls_planner::Config;
 use crate::nodes::penalty_of;
@@ -35,12 +34,8 @@ mod body_witness;
 pub use body_witness::{BodyFailureWitness, BodyRejection, CollisionCheck, OccupancySource};
 mod frontiers;
 pub use frontiers::SurfaceFrontierCacheStats;
-mod routing;
-mod centering;
-mod regions;
 mod wall;
-use routing::frontier_point_distance;
-pub use routing::SurfaceGoalCosts;
+use frontiers::frontier_point_distance;
 mod update;
 pub use update::{SurfaceBuildKind, SurfaceBuildStats, SurfaceColumnUpdate, SurfaceMapBuild, SurfaceMapBuilder};
 
@@ -75,19 +70,7 @@ pub enum SurfaceError {
     /// 当前列没有可返回的地面观测；事实查询结果，不是运动许可门槛。
     #[error("no ground observation in the requested column")]
     MissingSupport,
-    /// 新进入的精细位置缺少合格观察。
-    #[error("近场支撑{cell:?}不可用：{reason}，采样={observed_ns}，检查={checked_ns}")]
-    #[cfg(test)]
-    NearFieldObservation {
-        /// 固定精度的实际三维格。
-        cell: [i32; 3],
-        /// 缺失、质量或时效原因。
-        reason: &'static str,
-        /// 已有真实采样时间，未知为零。
-        observed_ns: u64,
-        /// 包含制动到达时间的检查时刻。
-        checked_ns: u64,
-    },
+
     /// 保留旧枚举名以兼容调用者；当前运动检查仅在实际占据与机体体积相交时返回。
     #[error("occupied geometry intersects the configured body volume")]
     InsufficientClearance,
@@ -149,9 +132,7 @@ struct SurfaceData {
     height_bounds: Arc<HeightBounds>,
     frontier_cache: frontiers::CacheSlot,
     body_cache: body::CacheSlot,
-    routing_cache: std::sync::Mutex<routing::RoutingCache>,
     graph: Arc<PlannerGraph>,
-    regions: Arc<regions::RegionGraph>,
     physical_graph: Arc<PlannerGraph>,
     occupied_columns: Arc<ColumnIz>,
     occupied_voxels: usize,
@@ -285,6 +266,8 @@ pub use nuwax_types::ground_layer::{GroundApproximation, GroundEvidence, GroundL
 #[derive(Clone)]
 pub struct SurfaceSnapshot {
     data: Arc<SurfaceData>,
+    /// 原始点输入的源体素均值；保留实际高度，避免以格顶替代测量。
+    navigation_measurements: Option<Arc<Vec<[f64; 3]>>>,
     observations: Option<Arc<SurfaceObservations>>,
     recent_obstacles: Option<Arc<recent::RecentObstacles>>,
     /// 同一不可变快照与精确位姿的检查缓存；任何几何或观察替换均清空。
@@ -305,6 +288,39 @@ impl std::fmt::Debug for SurfaceSnapshot {
 }
 
 impl SurfaceSnapshot {
+    /// 原始点输入已有体素降采样，原生规划器直接消费这些实测坐标。
+    pub fn navigation_measured_points(&self) -> Option<&[[f64; 3]]> {
+        self.navigation_measurements
+            .as_ref()
+            .map(|points| points.as_slice())
+    }
+
+    fn with_navigation_measurements(mut self, points: &[(f32, f32, f32)]) -> Self {
+        if points.is_empty() {
+            self.navigation_measurements = None;
+            return self;
+        }
+        let size = f64::from(self.source_voxel_size_m());
+        let mut voxels = std::collections::BTreeMap::<[i32; 3], ([f64; 3], usize)>::new();
+        for &(x, y, z) in points {
+            let point = [f64::from(x), f64::from(y), f64::from(z)];
+            let key = point.map(|value| (value / size).floor() as i32);
+            let (sum, count) = voxels.entry(key).or_default();
+            for axis in 0..3 {
+                sum[axis] += point[axis];
+            }
+            *count += 1;
+        }
+        let measured: Vec<_> = voxels
+            .into_values()
+            .map(|(sum, count)| sum.map(|value| value / count as f64))
+            .collect();
+        if self.navigation_measurements.as_deref() != Some(&measured) {
+            self.navigation_measurements = Some(Arc::new(measured));
+        }
+        self
+    }
+
     /// Share immutable geometry and evidence, with private disposable planning caches.
     ///
     /// This does not preserve snapshot-owner identity: retain the original request
@@ -313,14 +329,13 @@ impl SurfaceSnapshot {
     /// traversed. Source observation payloads stay shared; query caches are local.
     pub fn fork_for_planning(&self) -> Self {
         Self {
+            navigation_measurements: self.navigation_measurements.clone(),
             data: Arc::new(SurfaceData {
                 body_envelope: self.data.body_envelope.clone(),
                 height_bounds: self.data.height_bounds.clone(),
                 frontier_cache: Default::default(),
                 body_cache: Default::default(),
-                routing_cache: Default::default(),
                 graph: self.data.graph.clone(),
-                regions: self.data.regions.clone(),
                 physical_graph: self.data.physical_graph.clone(),
                 occupied_columns: self.data.occupied_columns.clone(),
                 occupied_voxels: self.data.occupied_voxels,
@@ -429,6 +444,33 @@ impl SurfaceSnapshot {
         })
     }
 
+    /// 显式禁区只输出实际标记的格子；遮罩范围外的缺测空间保持未知。
+    pub fn navigation_forbidden_columns(&self, resolution: f64) -> Vec<[i32; 2]> {
+        let mut columns = std::collections::BTreeSet::new();
+        if let Some(mask) = &self.data.virtual_obstacles {
+            for y in 0..mask.height {
+                for x in 0..mask.width {
+                    if sum_image_pixels(&mask.integral, x, y, x, y)[0] == 0 {
+                        continue;
+                    }
+                    let lower = [
+                        mask.origin[0] + f64::from(x) * mask.resolution,
+                        mask.origin[1] + f64::from(y) * mask.resolution,
+                    ];
+                    let upper = lower.map(|value| value + mask.resolution);
+                    let first = lower.map(|value| (value / resolution).floor() as i32);
+                    let last = upper.map(|value| (value / resolution).ceil() as i32);
+                    for ix in first[0]..last[0] {
+                        for iy in first[1]..last[1] {
+                            columns.insert([ix, iy]);
+                        }
+                    }
+                }
+            }
+        }
+        columns.into_iter().collect()
+    }
+
     /// 使用已提交的真实点云建立表面；来源身份与清空语义由外层拥有方处理。
     pub fn from_points(
         points: &[(f32, f32, f32)],
@@ -439,6 +481,7 @@ impl SurfaceSnapshot {
         let columns = update::voxel_columns(points, config.voxel_size)?;
         let heights=update::height_bounds(points, config.voxel_size, source_voxel_size_m);
         update::from_columns(columns, heights, config, source_voxel_size_m,None)
+            .map(|snapshot| snapshot.with_navigation_measurements(points))
     }
 
     /// 从同一物理图基底应用当前完整纯虚拟障碍层，覆盖全部楼层。
@@ -496,25 +539,17 @@ impl SurfaceSnapshot {
                 )
             })
             .collect();
-        let (graph, regions) = if excluded.is_empty() {
-            // The finite mask still applies to later body and boundary queries.
-            // Reuse the region index only when the physical graph is unchanged.
-            let regions = if Arc::ptr_eq(&self.data.graph, &physical)
-            {
-                Arc::clone(&self.data.regions)
-            } else {
-                Arc::new(regions::RegionGraph::full(&physical, self.config().voxel_size))
-            };
-            (Arc::clone(&physical), regions)
+        let graph= if excluded.is_empty() {
+            Arc::clone(&physical)
         } else {
             let mut graph = physical.as_ref().clone();
             for (id, edges) in graph.cells.iter_edges_mut() {
                 edges.retain(|edge| !excluded.contains(&id) && !excluded.contains(&edge.dest));
             }
-            let regions = Arc::new(regions::RegionGraph::full(&graph, self.config().voxel_size));
-            (Arc::new(graph), regions)
+            Arc::new(graph)
         };
         let result=Self {
+            navigation_measurements: self.navigation_measurements.clone(),
             ground_evidence:self.ground_evidence,
             recent_obstacles:self.recent_obstacles.clone(),
             observations: self.observations.clone(),
@@ -522,11 +557,9 @@ impl SurfaceSnapshot {
             data: Arc::new(SurfaceData {
                 frontier_cache: Default::default(),
                 body_cache: Default::default(),
-                routing_cache: Default::default(),
                 body_envelope: self.data.body_envelope.clone(),
                 height_bounds: Arc::clone(&self.data.height_bounds),
                 graph,
-                regions,
                 physical_graph: physical,
                 occupied_columns: Arc::clone(&self.data.occupied_columns),
                 occupied_voxels: self.data.occupied_voxels,
@@ -820,186 +853,6 @@ impl SurfaceSnapshot {
         Ok(())
     }
 
-    /// 在原有向支撑图上选路；软偏好启用时按公开乘子的累计代价比较，仍执行原共享段校验。
-    pub fn plan(&self, start: [f64; 3], goal: [f64; 3]) -> Result<Vec<[f64; 3]>, SurfaceError> {
-        let start_location = self.locate_support(start)?;
-        let goal_location = self.locate_support(goal)?;
-        if self.config().wall_buffer_m>0.0 && self.config().wall_buffer_weight>0.0 {
-            let path=self.plan_on_cells(start_location,goal_location,&[])?;
-            return self.simplify_flat_path(path,&[]);
-        }
-        let cells=&self.data.graph.cells;
-        let start_id=cells.id(start_location.cell).ok_or(SurfaceError::NoPath)?;
-        let goal_id=cells.id(goal_location.cell).ok_or(SurfaceError::NoPath)?;
-        let (ids,_)=self.data.regions.path(cells,start_id,goal_id,self.config().voxel_size)?;
-        let path=self.path_with_actual_endpoints(ids.into_iter().map(|id|self.cell_position(cells.coord(id))).collect(),start,goal)?;
-        self.simplify_flat_path(path,&[])
-
-    }
-
-    /// 只沿边界内的真实邻接规划，凹边界不能被连线捷径穿过。
-    pub fn plan_in_boundary(
-        &self,
-        start: [f64; 3],
-        goal: [f64; 3],
-        boundary: &[[f64; 2]],
-    ) -> Result<Vec<[f64; 3]>, SurfaceError> {
-        validate_boundary(boundary)?;
-        if boundary.is_empty() {
-            return self.plan(start, goal);
-        }
-        if !inside_boundary([start[0], start[1]], boundary)
-            || !inside_boundary([goal[0], goal[1]], boundary)
-        {
-            return Err(SurfaceError::InvalidBoundary);
-        }
-        let start_location = self.locate_support(start)?;
-        let goal_location = self.locate_support(goal)?;
-        let path = self.plan_on_cells(start_location, goal_location, boundary)?;
-        if path.windows(2).all(|pair| {
-            segment_inside_boundary([pair[0][0], pair[0][1]], [pair[1][0], pair[1][1]], boundary)
-        }) {
-            self.simplify_flat_path(path, boundary)
-        } else {
-            Err(SurfaceError::NoPath)
-        }
-    }
-
-    /// 仅简化同一支撑高度层；复用原规划器的净空代价，保留精确端点与台阶。
-    fn simplify_flat_path(
-        &self,
-        path: Vec<[f64; 3]>,
-        boundary: &[[f64; 2]],
-    ) -> Result<Vec<[f64; 3]>, SurfaceError> {
-        if path.len() <= 2 {
-            return Ok(path);
-        }
-        let cells = path.iter().map(|point| self.locate_support(*point).map(|location| location.cell))
-            .collect::<Result<Vec<_>, _>>()?;
-        let config = self.config();
-        let wall = crate::planner::WallCost {
-            clearance_m: config.wall_clearance_m,
-            buffer_m: config.wall_buffer_m,
-            buffer_weight: config.wall_buffer_weight,
-            voxel_size: config.voxel_size,
-        };
-        let metrics = |from, to| crate::planner::segment_metrics(
-            &self.data.graph, from, to, self.data.candidate_step_cells, &wall,
-        );
-        let Some(penalties) = cells.windows(2).map(|pair| metrics(pair[0], pair[1]).map(|value| value.0))
-            .collect::<Option<Vec<_>>>() else {
-                // 无法取得原路线软代价时保留已验证路径，不放宽净空偏好。
-                return Ok(path);
-            };
-        let Some(edge_costs)=path.windows(2).map(|pair|self.soft_segment_cost(pair[0],pair[1]))
-            .collect::<Option<Vec<_>>>() else {return Ok(path);};
-        let mut accumulated=Vec::with_capacity(path.len());accumulated.push(0.0);
-        for cost in edge_costs {accumulated.push(accumulated.last().copied().unwrap()+cost);}
-        let permits = |from: usize, to: usize| {
-            cells[from..=to].iter().all(|cell| cell.2 == cells[from].2)
-                && segment_inside_boundary(
-                    [path[from][0], path[from][1]], [path[to][0], path[to][1]], boundary,
-                )
-                && metrics(cells[from], cells[to]).is_some_and(|(penalty, rise)| {
-                    rise <= 1e-6 && penalty <= penalties[from..to].iter().copied().fold(1.0_f32, f32::max) + 1e-3
-                })
-                // 起终点贴墙时两条路线可以有相同峰值，但贴墙长直线的累计代价更高。
-                && self.soft_segment_cost(path[from],path[to]).is_some_and(|cost| {
-                    let original=accumulated[to]-accumulated[from];
-                    cost<=original+1e-9*original.max(1.0)
-                })
-                // 代价不授予许可，真实端点连线仍通过原完整支撑段核验。
-                && self.validate_segment(path[from], path[to]).is_ok()
-        };
-        if permits(0, path.len() - 1) {
-            return Ok(vec![path[0], path[path.len() - 1]]);
-        }
-        // 全路径直连只尝试一次，后续限定64个节点窗口，避免大图平方级搜索。
-        let mut result = vec![path[0]];
-        let mut anchor = 0;
-        while anchor + 1 < path.len() {
-            let limit = (anchor + 64).min(path.len() - 1);
-            let next = (anchor + 2..=limit).rev().find(|&next| permits(anchor, next))
-                .unwrap_or(anchor + 1);
-            result.push(path[next]);
-            anchor = next;
-        }
-        Ok(result)
-    }
-
-    /// 按实际线段穿过各格的长度积累有限软代价，避免峰值或端点抽样抹掉居中收益。
-    fn soft_segment_cost(&self,from:[f64;3],to:[f64;3])->Option<f64> {
-        let delta: [f64;3]=std::array::from_fn(|i|to[i]-from[i]);
-        let length=delta[0].hypot(delta[1]).hypot(delta[2]);
-        if !length.is_finite() {return None;}
-        if length==0.0 || self.config().wall_buffer_m<=0.0 || self.config().wall_buffer_weight<=0.0 {
-            return Some(length);
-        }
-        let size=f64::from(self.config().voxel_size);let mut events=vec![0.0,1.0];
-        for axis in 0..2 {
-            if delta[axis]==0.0 {continue;}
-            let low=(from[axis].min(to[axis])/size).floor() as i64+1;
-            let high=(from[axis].max(to[axis])/size).floor() as i64;
-            if high-low>MAX_SEGMENT_CELLS {return None;}
-            for index in low..=high {
-                let t=(index as f64*size-from[axis])/delta[axis];
-                if t>0.0 && t<1.0 {events.push(t);}
-            }
-        }
-        events.sort_by(f64::total_cmp);events.dedup();
-        let mut cost=0.0;
-        for pair in events.windows(2) {
-            let t=(pair[0]+pair[1])*0.5;
-            let point=std::array::from_fn(|i|from[i]*(1.0-t)+to[i]*t);
-            let location=self.locate_near_support(point,
-                f64::from(self.config().step_threshold_m+self.config().voxel_size)).ok()?;
-            cost+=length*(pair[1]-pair[0])*self.soft_traversal_multiplier(location.cell);
-        }
-        cost.is_finite().then_some(cost)
-    }
-
-    fn plan_on_cells(
-        &self,
-        start_location: SurfaceLocation,
-        goal_location: SurfaceLocation,
-        boundary: &[[f64; 2]],
-    ) -> Result<Vec<[f64; 3]>, SurfaceError> {
-        let start = start_location.support_xyz;
-        let goal = goal_location.support_xyz;
-        let graph = &self.data.graph;
-        let cells = &graph.cells;
-        let start_id = cells.id(start_location.cell).ok_or(SurfaceError::NoPath)?;
-        let goal_id = cells.id(goal_location.cell).ok_or(SurfaceError::NoPath)?;
-        let permits=|from,to| {
-            let a=self.cell_position(cells.coord(from));let b=self.cell_position(cells.coord(to));
-            segment_inside_boundary([a[0],a[1]],[b[0],b[1]],boundary)
-        };
-        let (path,_)=if self.config().wall_buffer_m>0.0 && self.config().wall_buffer_weight>0.0 {
-            let weights=std::cell::RefCell::new(AHashMap::new());
-            let multiplier=|id| {
-                if let Some(value)=weights.borrow().get(&id).copied() {return value;}
-                let value=self.soft_traversal_multiplier(cells.coord(id));weights.borrow_mut().insert(id,value);value
-            };
-            regions::weighted_path_edges(cells,start_id,goal_id,self.config().voxel_size,permits,|id,edge| {
-                (f64::from(edge.base_cost)*(multiplier(id)+multiplier(edge.dest))*0.5
-                    +f64::from(self.config().step_penalty_weight)*f64::from(edge.rise)).max(f64::from(edge.cost))
-            })?
-        } else {regions::sparse_path_edges(cells,start_id,goal_id,self.config().voxel_size,permits)?};
-        self.path_with_actual_endpoints(
-            path.into_iter().map(|cell| self.cell_position(cells.coord(cell))).collect(),
-            start, goal,
-        )
-    }
-
-    fn path_with_actual_endpoints(&self, mut path:Vec<[f64;3]>,start:[f64;3],goal:[f64;3])->Result<Vec<[f64;3]>,SurfaceError> {
-        if path.is_empty() {return Err(SurfaceError::NoPath);}
-        if path.len()==1 {path=vec![start,goal];}
-        else {path[0]=start;*path.last_mut().unwrap()=goal;}
-        path.dedup();
-        self.validate_path(&path)?;
-        Ok(path)
-    }
-
     /// 查询边界内从当前支撑面实际可达、且能观察未知支撑的安全停留点。
     /// 空边界表示不额外限制；未知列只计增益，永不成为运动端点。
     pub fn reachable_frontiers(
@@ -1018,7 +871,7 @@ impl SurfaceSnapshot {
             .cells
             .id(location.cell)
             .ok_or(SurfaceError::MissingSupport)?;
-        let distances = self.frontier_distances(start_id, boundary, None);
+        let distances = self.frontier_distances(start_id, boundary);
         let start_offset = frontier_point_distance(start, self.cell_position(location.cell));
         let index = self.frontier_index(boundary);
         let mut frontiers = Vec::new();
@@ -1554,30 +1407,31 @@ fn plane_from(a: [f64; 3], b: [f64; 3], c: [f64; 3]) -> Option<[f64; 3]> {
 }
 
 #[cfg(test)]
+impl SurfaceSnapshot {
+    // 构图回归只验证真实邻接的可达性，不恢复已退休的路径搜索与平滑入口。
+    fn test_connected(&self, start: [f64; 3], goal: [f64; 3]) -> bool {
+        let (Ok(start), Ok(goal)) = (self.locate_support(start), self.locate_support(goal)) else {
+            return false;
+        };
+        let mut pending = vec![start.cell];
+        let mut seen = AHashSet::from_iter([start.cell]);
+        while let Some(cell) = pending.pop() {
+            if cell == goal.cell {
+                return true;
+            }
+            for next in self.neighbors(cell) {
+                if seen.insert(next) {
+                    pending.push(next);
+                }
+            }
+        }
+        false
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn flat_simplification_preserves_integrated_center_preference_between_wall_endpoints() {
-        let mut cfg=config();cfg.voxel_size=0.1;cfg.robot_height=0.35;cfg.wall_clearance_m=0.0;
-        cfg.wall_buffer_m=0.6;cfg.wall_buffer_weight=3.0;
-        let mut points=Vec::new();
-        for x in -22..23 {for y in -6..=5 {for z in if y==-6 || y==5 {0..10}else{0..1} {
-            points.push(((x as f32+0.5)*0.1,(y as f32+0.5)*0.1,(z as f32+0.5)*0.1));
-        }}}
-        let map=SurfaceSnapshot::from_points(&points,cfg,0.1).unwrap();
-        let start=[-1.5,-0.3,0.1];let goal=[1.5,-0.3,0.1];
-        map.validate_segment(start,goal).unwrap();
-        let path=map.plan_in_boundary(start,goal,&[]).unwrap();
-        assert!(path.iter().any(|p|p[1].abs()<0.2),"原居中路线不能被同峰值贴墙直线覆盖: {path:?}");
-        let cost=path.windows(2).map(|p|map.soft_segment_cost(p[0],p[1]).unwrap()).sum::<f64>();
-        let direct=map.soft_segment_cost(start,goal).unwrap();
-        assert!(cost<direct,"完整软代价应保留居中收益: {cost} >= {direct}");
-        map.validate_path(&path).unwrap();
-        let boundary=[[-2.0,-0.48],[2.0,-0.48],[2.0,0.48],[-2.0,0.48]];
-        let bounded=map.plan_in_boundary(start,goal,&boundary).unwrap();
-        assert!(bounded.iter().any(|p|p[1].abs()<0.2));
-    }
 
     #[test]
     fn overlapping_ground_band_keeps_local_connection_without_bridging_a_separated_step() {
@@ -1652,7 +1506,7 @@ mod tests {
         let low=map.cell_position((20,12,0));let high=map.cell_position((60,12,1));
         assert!((low[2]-0.025).abs()<1e-6);assert!((high[2]-0.175).abs()<1e-6);
         assert!((high[2]-low[2]-0.15).abs()<1e-6,"水平粗格不能把15厘米台阶改成10厘米");
-        map.plan(low,high).unwrap();map.plan(high,low).unwrap();
+        assert!(map.test_connected(low,high));assert!(map.test_connected(high,low));
         for (_,edges) in map.data.graph.cells.iter() {assert!(edges.iter().all(|edge|!edge.cost.is_finite() || edge.cost>=0.0));}
     }
 
@@ -1698,9 +1552,13 @@ mod tests {
         let lower = support(6, 10, 0);
         let upper = support(65, 10, 18);
         for (start, goal) in [(lower, upper), (upper, lower)] {
-            let path = map.plan(start, goal).expect("合法楼梯须存在连续支撑路径");
-            assert_eq!(path.first(), Some(&start));
-            assert_eq!(path.last(), Some(&goal));
+            assert!(map.test_connected(start, goal));
+            let mut path: Vec<_> = (6..=65)
+                .map(|x| support(x as i32, 10, heights[x]))
+                .collect();
+            if start == upper {
+                path.reverse();
+            }
             map.validate_path(&path).unwrap();
             for pair in path.windows(2) {
                 for ratio in [0.2, 0.5, 0.8] {
@@ -1737,10 +1595,12 @@ mod tests {
         let gentle: Vec<_> = (0..80).map(|x| x / 4).collect();
         let map =
             SurfaceSnapshot::from_points(&points_for_profile(&gentle, 20), config(), SIZE).unwrap();
-        let path = map
-            .plan(support(10, 10, 2), support(70, 10, 17))
-            .expect("约14度坡道应通过25度上限");
-        map.validate_path(&path).unwrap();
+        assert!(
+            map
+            .test_connected(support(10, 10, 2), support(70, 10, 17))
+            ,
+            "约14度坡道的地形邻接应连通"
+        );
         assert_eq!(
             map.transition((11, 10, 2), (12, 10, 3)),
             Some(SurfaceTransition::Ramp)
@@ -1750,7 +1610,7 @@ mod tests {
         let mut cfg = config();
         cfg.wall_clearance_m = 0.0;
         let map = SurfaceSnapshot::from_points(&points_for_profile(&steep, 20), cfg, SIZE).unwrap();
-        assert!(map.plan(support(10, 10, 10), support(70, 10, 70)).is_err());
+        assert!(!map.test_connected(support(10, 10, 10), support(70, 10, 70)));
         assert!(map
             .validate_segment(support(10, 10, 10), support(70, 10, 70))
             .is_err());
@@ -1779,9 +1639,8 @@ mod tests {
             cfg.wall_clearance_m = 0.0;
             let map =
                 SurfaceSnapshot::from_points(&points_for_profile(&heights, 20), cfg, SIZE).unwrap();
-            assert!(map
-                .plan(support(6, 10, heights[6]), support(65, 10, heights[65]))
-                .is_err());
+            assert!(!map
+                .test_connected(support(6, 10, heights[6]), support(65, 10, heights[65])));
         }
         let heights: Vec<_> = (0..72).map(|x| if x < 36 { 0 } else { 3 }).collect();
         let mut cfg = config();
@@ -1791,7 +1650,7 @@ mod tests {
         let map =
             SurfaceSnapshot::from_points(&points_for_profile(&heights, 20), cfg, SIZE).unwrap();
         assert!(
-            map.plan(support(6, 10, 0), support(65, 10, 3)).is_err(),
+            !map.test_connected(support(6, 10, 0), support(65, 10, 3)),
             "有明确踏面的15厘米台阶不能借80度坡度上限绕过10厘米步高限制"
         );
     }
@@ -1807,7 +1666,7 @@ mod tests {
         let mut points = points_for_profile(&vec![0; 72], 20);
         points.retain(|point| voxelize(*point, SIZE).0 != 36);
         let map = SurfaceSnapshot::from_points(&points, config(), SIZE).unwrap();
-        assert!(map.plan(support(10, 10, 0), support(60, 10, 0)).is_err());
+        assert!(!map.test_connected(support(10, 10, 0), support(60, 10, 0)));
         assert!(map
             .validate_segment(support(10, 10, 0), support(60, 10, 0))
             .is_err());
@@ -1878,29 +1737,6 @@ mod tests {
         assert!(hole.validate_contour(&contour).is_err());
     }
 
-    #[test]
-    fn regional_surface_costs_follow_detours_boundaries_and_isolate_overlapping_layers() {
-        let mut points = points_for_profile(&vec![0; 60], 60);
-        points.retain(|point| {
-            let cell = voxelize(*point, SIZE);
-            !(28..=32).contains(&cell.0) || cell.1 >= 48
-        });
-        points.extend(points_for_profile(&vec![60; 60], 60));
-        let map = SurfaceSnapshot::from_points(&points, config(), SIZE).unwrap();
-        let start = support(20, 15, 0);
-        let goal = support(40, 15, 0);
-        let costs = map.frontier_travel_costs(start, &[goal, support(20, 15, 60)], &[]).unwrap();
-        assert!(costs[0] > 3.5, "一米直线必须绕过未知支撑缺口");
-        assert!(costs[1].is_infinite(), "上下叠层没有连接时不能混用代价");
-        let boundary = [[0.0, 0.0], [3.0, 0.0], [3.0, 2.0], [0.0, 2.0]];
-        assert!(map.frontier_travel_costs(start, &[goal], &boundary).unwrap()[0].is_infinite(), "边界切断开口后不能绕出边界");
-        let frontiers = map.reachable_frontiers(start, &[]).unwrap();
-        let targets: Vec<_> = frontiers.iter().map(|candidate| candidate.support_xyz).collect();
-        let costs = map.frontier_travel_costs(start, &targets, &[]).unwrap();
-        for (candidate, cost) in frontiers.iter().zip(costs) {
-            assert!((candidate.travel_cost - cost).abs() < 1e-9, "初筛与区域间成本必须一致");
-        }
-    }
 
     #[test]
     fn frontiers_stay_in_the_reachable_layer_and_inside_requested_boundary() {
@@ -1911,7 +1747,7 @@ mod tests {
         assert!(!frontiers.is_empty());
         for frontier in &frontiers {
             assert_eq!(frontier.cell.2, 0, "无楼层连接时不能发布上层前沿");
-            map.plan(support(10, 10, 0), frontier.support_xyz).unwrap();
+            assert!(map.test_connected(support(10, 10, 0), frontier.support_xyz));
             assert!(frontier.gain > 0.0);
         }
         let boundary = [[0.2, 0.2], [0.8, 0.2], [0.8, 0.8], [0.2, 0.8]];
@@ -1919,47 +1755,7 @@ mod tests {
             .reachable_frontiers(support(10, 10, 0), &boundary)
             .unwrap()
             .is_empty());
-        assert!(map.plan(support(10, 10, 0), support(10, 10, 30)).is_err());
-    }
-
-    #[test]
-    fn bounded_flat_route_removes_grid_turns_and_keeps_measured_endpoints() {
-        let map = SurfaceSnapshot::from_points(&points_for_profile(&vec![0; 40], 40), config(), SIZE).unwrap();
-        let boundary = [[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [0.0, 2.0]];
-        let start = [0.31, 0.37, 0.0];
-        let goal = [1.61, 1.47, 0.0];
-        let path = map.plan_in_boundary(start, goal, &boundary).unwrap();
-        assert_eq!(path, vec![start, goal]);
-        map.validate_path(&path).unwrap();
-    }
-
-    #[test]
-    fn bounded_route_simplification_preserves_holes_and_stair_heights() {
-        let mut points = points_for_profile(&vec![0; 40], 40);
-        points.retain(|point| {
-            let cell = voxelize(*point, SIZE);
-            !(18..=22).contains(&cell.0) || !(18..=22).contains(&cell.1)
-        });
-        let map = SurfaceSnapshot::from_points(&points, config(), SIZE).unwrap();
-        let boundary = [[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [0.0, 2.0]];
-        let start = support(6, 20, 0);
-        let goal = support(34, 20, 0);
-        assert!(map.validate_segment(start, goal).is_err());
-        let path = map.plan_in_boundary(start, goal, &boundary).unwrap();
-        assert!(path.len() > 2);
-        map.validate_path(&path).unwrap();
-
-        let heights: Vec<_> = (0..72).map(|x| {
-            if x < 12 { 0 } else if x < 48 { ((x - 12) / 6 + 1) * 3 } else { 18 }
-        }).collect();
-        let stairs = SurfaceSnapshot::from_points(&points_for_profile(&heights, 20), config(), SIZE).unwrap();
-        let boundary = [[0.0, 0.0], [3.6, 0.0], [3.6, 1.0], [0.0, 1.0]];
-        for (start, goal) in [(support(6, 10, 0), support(65, 10, 18)), (support(65, 10, 18), support(6, 10, 0))] {
-            let path = stairs.plan_in_boundary(start, goal, &boundary).unwrap();
-            stairs.validate_path(&path).unwrap();
-            let levels: std::collections::BTreeSet<_> = path.iter().map(|point| stairs.locate_support(*point).unwrap().cell.2).collect();
-            assert_eq!(levels, (0..=6).map(|level| level * 3).collect());
-        }
+        assert!(!map.test_connected(support(10, 10, 0), support(10, 10, 30)));
     }
 
     #[test]
@@ -1978,14 +1774,11 @@ mod tests {
             [0.1, 1.9],
         ];
         let start = support(10, 30, 0);
-        let goal = support(30, 30, 0);
-        let path = map.plan_in_boundary(start, goal, &boundary).unwrap();
-        assert!(path.iter().any(|point| point[1] < 0.8));
-        assert!(path.windows(2).all(|pair| segment_inside_boundary(
-            [pair[0][0], pair[0][1]],
-            [pair[1][0], pair[1][1]],
+        assert!(!segment_inside_boundary(
+            [0.5, 1.5],
+            [1.5, 1.5],
             &boundary
-        )));
+        ));
         let narrow_notch = [
             [0.0, 0.0],
             [2.0, 0.0],
@@ -2026,8 +1819,8 @@ mod tests {
         for z in [0, 60] {
             let start = support(10, 20, z);
             let goal = support(80, 20, z);
-            physical.plan(start, goal).unwrap();
-            assert!(blocked.plan(start, goal).is_err());
+            assert!(physical.test_connected(start, goal));
+            assert!(!blocked.test_connected(start, goal));
             assert!(blocked.validate_segment(start, goal).is_err());
             assert!(matches!(
                 blocked.locate_support(support(48, 20, z)),
@@ -2042,9 +1835,9 @@ mod tests {
             .with_virtual_obstacles([0.0, 0.0], 0.02, width, height, &vec![false; mask.len()])
             .unwrap();
         for z in [0, 60] {
-            restored
-                .plan(support(10, 20, z), support(80, 20, z))
-                .unwrap();
+            assert!(restored
+                .test_connected(support(10, 20, z), support(80, 20, z))
+                );
         }
     }
 
@@ -2060,14 +1853,9 @@ mod tests {
             .with_virtual_obstacles([0.0, 0.0], f64::from(SIZE), width, height, &mask)
             .unwrap();
         for z in [0, 60] {
-            let path = constrained
-                .plan(support(10, 12, z), support(80, 12, z))
-                .unwrap();
-            constrained.validate_path(&path).unwrap();
-            assert!(
-                path.iter().any(|point| point[1] > 1.3),
-                "应沿虚拟线端部保留足迹余量绕行"
-            );
+            assert!(constrained
+                .test_connected(support(10, 12, z), support(80, 12, z))
+                );
             constrained.locate_support(support(46, 12, z)).unwrap();
             assert!(!constrained.cell_is_clear((46,12,z)),
                 "terrain lookup stays factual while graph routing retains configured mask clearance");
@@ -2093,9 +1881,8 @@ mod tests {
             .unwrap();
         for z in [0, 60] {
             assert!(blocked.locate_support(support(40, 20, z)).is_err());
-            assert!(blocked
-                .plan(support(10, 20, z), support(80, 20, z))
-                .is_err());
+            assert!(!blocked
+                .test_connected(support(10, 20, z), support(80, 20, z)));
             assert!(blocked
                 .reachable_frontiers(support(40, 20, z), &[])
                 .is_err());

@@ -322,7 +322,6 @@ fn dense_rough_rejection_attribution_diagnostic() {
     eprintln!("ATTRIBUTION endpoints={:?}/{:?} dense_poses={dense_poses:?} contact_events={contact_events:?} transition={:?} segment={:?} sweep={:?}",
         map.validate_body_pose(from.0,from.1),map.validate_body_pose(to.0,to.1),map.transition(a.cell,b.cell),
         map.validate_segment(a.support_xyz,b.support_xyz),map.validate_body_motion(from,to,&[]));
-    eprintln!("ATTRIBUTION unchanged_coarse_global_plan={:?}",map.plan(a.support_xyz,b.support_xyz));
     for planner in [0.05,0.1] {for width in 3..=8 {for phase in [0,1] {
         let keys:BTreeSet<_>=(-32_i32..32).flat_map(|x|(-20_i32..20).map(move|y|
             [x,y,((x-phase).div_euclid(width)+y.div_euclid(width)).rem_euclid(3)-1])).collect();

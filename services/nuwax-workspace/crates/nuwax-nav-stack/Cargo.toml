@@ -35,8 +35,6 @@ description = "Navigation stack orchestration for the nuwax robot platform (prof
 default = []
 # Explicit in-process immutable-source integration qualification only.
 surface-source-qualification = ["mls"]
-# Explicit ignored qualification selectors, never a navigation default.
-local-guidance-qualification = ["surface-recovery-qualification", "nuwax-nav-runtime/local-guidance-qualification"]
 # Opt-in real-owner/worker recovery qualification; absent from default builds.
 surface-recovery-qualification = [
     "mls",
@@ -119,7 +117,7 @@ click-goal = ["lcm-runtime", "dep:nuwax-nav-click-goal-bridge"]
 # ---- 3D / 探索(可选,本 crate 默认不引入 explore)----
 mls = [
     "dep:base64",
-    "dep:nuwax-nav-pct",
+    "dep:nuwax-nav-pct-native",
     "guard-runtime",
     "dep:nuwax-map-chunks",
     "dep:nuwax-rpc",
@@ -170,7 +168,7 @@ full = [
 
 [dependencies]
 base64 = { version = "0.22.1", optional = true }
-nuwax-nav-pct = { path = "../nuwax-nav-pct", optional = true }
+nuwax-nav-pct-native = { path = "../nuwax-nav-pct-native", optional = true }
 nuwax-nav-control = { path = "../nuwax-nav-control" }
 nuwax-core = { path = "../nuwax-core" }
 # ---- Foundation(协议层与基础类型):不直接使用,留给上游 crate 各自引用
@@ -231,8 +229,9 @@ futures = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["rt", "time", "macros", "process", "io-util", "signal"] }
 
 [dev-dependencies]
+# 公共通信测试使用生产同一规划工作线程，避免同步计算阻塞采样。
+nuwax-nav-runtime = { path = "../nuwax-nav-runtime", features = ["surface-recovery-qualification"] }
 # Offline frozen-source diagnostic; no runtime dependency or new external package.
-nuwax-nav-scan = { path = "../nuwax-nav-scan" }
 async-trait = { workspace = true }
 # 单元测试可读 fixture / JSON
 serde_json = { workspace = true }
@@ -248,9 +247,3 @@ nuwax-nav-test-fixtures = { path = "../nuwax-nav-test-fixtures" }
 name = "nuwax-nav-stack"
 path = "src/bin/nuwax_nav_stack.rs"
 required-features = []
-
-
-[[example]]
-name = "frozen_unknown_pipeline"
-path = "examples/frozen_unknown_pipeline.rs"
-required-features = ["mls"]

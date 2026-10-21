@@ -142,7 +142,6 @@ fn session() -> NavSession {
         boundary: Vec::new(),
             options: Default::default(),
         goal: ExecutionGoal::Body(nuwax_nav_astar::helpers::make_pose_stamped("map", 2.0, 0.0, 0.0)),
-        ground_initial: None,
         session_id: "nav_scheduler_20hz_baseline-nav".to_string(),
         execution_identity: identity("nav_scheduler_20hz_baseline-nav", 0),
         local_owner_runtime_generation: 1,

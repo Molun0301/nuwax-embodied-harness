@@ -87,8 +87,6 @@ const DEFAULT_LCM_URL: &str = "udpm://239.255.76.67:7667?ttl=0";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(any(feature = "cmu-native", feature = "explore"))]
 static FAR_READY_GENERATION: AtomicI64 = AtomicI64::new(0);
-#[cfg(feature = "mls")]
-static MLS_READY_GENERATION: AtomicI64 = AtomicI64::new(0);
 #[cfg(feature = "patrolling")]
 const PLANNER_CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -285,32 +283,15 @@ async fn planar_navigation_stream(transport:&LcmTransport,topic:LcmTopic)->NavSt
 
 #[cfg(all(
     feature = "native-runner",
-    any(feature = "cmu-native", feature = "explore", feature = "mls")
+    any(feature = "cmu-native", feature = "explore")
 ))]
 #[derive(Clone)]
 pub(crate) enum NativePlannerReadyContract {
     #[cfg(any(feature = "cmu-native", feature = "explore"))]
     Far(nuwax_nav_far_planner_bridge::worker::FarReadyContract),
-    #[cfg(feature = "mls")]
-    Mls(nuwax_nav_mls_planner::lcm_worker::ReadyContract),
 }
 
-#[cfg(all(feature = "native-runner", feature = "mls"))]
-fn mls_ready_contract_matches(
-    expected: &nuwax_nav_mls_planner::lcm_worker::ReadyContract,
-    backend: &str,
-    event_generation: i64,
-    expected_generation: i64,
-    event: &nuwax_nav_mls_planner::lcm_worker::WorkerEvent,
-) -> bool {
-    matches!(
-        event,
-        nuwax_nav_mls_planner::lcm_worker::WorkerEvent::Ready(contract)
-            if backend == "mls3d"
-                && event_generation == expected_generation
-                && contract == expected
-    )
-}
+
 
 #[cfg(all(
     feature = "native-runner",
@@ -333,7 +314,7 @@ fn far_ready_contract_matches(
 
 #[cfg(all(
     feature = "native-runner",
-    any(feature = "cmu-native", feature = "explore", feature = "mls")
+    any(feature = "cmu-native", feature = "explore")
 ))]
 pub(crate) fn native_planner_readiness(
     expected: NativePlannerReadyContract,
@@ -351,11 +332,7 @@ pub(crate) fn native_planner_readiness(
                 FAR_READY_GENERATION.store(0, Ordering::Release);
                 contract.worker_event.clone()
             }
-            #[cfg(feature = "mls")]
-            NativePlannerReadyContract::Mls(contract) => {
-                MLS_READY_GENERATION.store(0, Ordering::Release);
-                contract.events.clone()
-            }
+
         };
         let provider = std::env::var("NUWAX_LCM_URL").unwrap_or_else(|_| DEFAULT_LCM_URL.into());
         let transport = LcmTransport::new_real(&provider)
@@ -375,25 +352,7 @@ pub(crate) fn native_planner_readiness(
                 .await
                 .map_err(|error| SupervisedReadyError::Transport(error.to_string()))?;
             match &expected {
-                #[cfg(feature = "mls")]
-                NativePlannerReadyContract::Mls(expected_contract) => {
-                    use nuwax_nav_mls_planner::lcm_worker::decode_worker_event_body;
-                    let (event_backend, event_generation, event) =
-                        match decode_worker_event_body(&frame.payload) {
-                            Ok(event) => event,
-                            Err(_) => continue,
-                        };
-                    if mls_ready_contract_matches(
-                        expected_contract,
-                        &event_backend,
-                        event_generation,
-                        generation,
-                        &event,
-                    ) {
-                        MLS_READY_GENERATION.store(generation, Ordering::Release);
-                        return Ok(());
-                    }
-                }
+
                 #[cfg(any(feature = "cmu-native", feature = "explore"))]
                 NativePlannerReadyContract::Far(expected_contract) => {
                     let state = match schema::decode_navigation_state_body(&frame.payload) {
@@ -1877,14 +1836,13 @@ where
                                 continue;
                             }
                         };
-                        let surface=recent_source.attach_terrain(surface, update.planar_reference.clone());
+                        let surface=recent_source.attach_terrain(surface);
                         (
                             OwnerInput::Accepted(GuardedCostmapInput {
                                 map_frame: update.authority.committed_map.frame_id.clone(),
                                 observation: nuwax_nav_runtime::CostmapObservation {
                                     costmap: nuwax_nav_runtime::ExecutionMap::SurfaceUpdate(nuwax_nav_runtime::surface_changes::SurfaceMapUpdate {
                                         snapshot: surface, change_basis: update.change_basis, changes: update.geometry_changes,
-                                        planar_reference: update.planar_reference,
                                     }),
                                     source_timestamp_ns: update.source_timestamp_ns,
                                 },
@@ -2353,7 +2311,6 @@ where
             boundary: buffered_goal.boundary_points.iter().map(|p|[p[0],p[1]]).collect(),
             options: buffered_goal.options,
                             goal: nuwax_nav_runtime::ExecutionGoal::Body(pose_from_schema(&buffered_goal.goal)?),
-                            ground_initial: None,
                             session_id: session_id.clone(),
                             execution_identity: guarded_goal_execution_identity(&buffered_goal),
                             local_owner_runtime_generation: process_runtime_generation,
@@ -2649,7 +2606,6 @@ async fn activate_guarded_goal(
             boundary: goal_envelope.boundary_points.iter().map(|p|[p[0],p[1]]).collect(),
             options: goal_envelope.options,
             goal: nuwax_nav_runtime::ExecutionGoal::Body(pose_from_schema(&goal_envelope.goal)?),
-            ground_initial: None,
             session_id: goal_envelope.session_id.clone(),
             execution_identity: guarded_goal_execution_identity(&goal_envelope),
             local_owner_runtime_generation: runtime_generation(),
@@ -4808,33 +4764,13 @@ fn apply_astar_planner_goal(
     Ok(OwnerInput::Accepted((envelope, boundary, map_resolution)))
 }
 
-#[cfg(any(feature = "cmu-native", feature = "explore", feature = "mls"))]
+#[cfg(any(feature = "cmu-native", feature = "explore"))]
 pub(crate) fn invalidate_native_planner_generation(node_id: &str) {
-    if node_id == "mls_planner" {
-        #[cfg(feature = "mls")]
-        MLS_READY_GENERATION.store(0, Ordering::Release);
-    } else if node_id == "far_planner" {
-        #[cfg(any(feature = "cmu-native", feature = "explore"))]
-        FAR_READY_GENERATION.store(0, Ordering::Release);
-    }
+    if node_id == "far_planner" { FAR_READY_GENERATION.store(0, Ordering::Release); }
 }
 
-#[cfg(any(feature = "cmu-native", feature = "explore", feature = "mls"))]
-fn native_ready_generation(far: bool) -> i64 {
-    #[cfg(any(feature = "cmu-native", feature = "explore"))]
-    let far_generation = FAR_READY_GENERATION.load(Ordering::Acquire);
-    #[cfg(not(any(feature = "cmu-native", feature = "explore")))]
-    let far_generation = 0;
-    #[cfg(feature = "mls")]
-    let mls_generation = MLS_READY_GENERATION.load(Ordering::Acquire);
-    #[cfg(not(feature = "mls"))]
-    let mls_generation = 0;
-    if far {
-        far_generation
-    } else {
-        mls_generation
-    }
-}
+#[cfg(any(feature = "cmu-native", feature = "explore"))]
+fn native_ready_generation() -> i64 { FAR_READY_GENERATION.load(Ordering::Acquire) }
 
 #[cfg(any(feature = "cmu-native", feature = "explore"))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -4921,7 +4857,7 @@ fn take_far_join(
     Some(path)
 }
 
-#[cfg(any(feature = "cmu-native", feature = "explore", feature = "mls"))]
+#[cfg(any(feature = "cmu-native", feature = "explore"))]
 fn native_path_respects_goal(path: &Path2D, goal: &schema::GoalEnvelope) -> bool {
     goal.committed_map_frame_id == "map"
         && goal.goal.header.frame_id == goal.committed_map_frame_id
@@ -4933,22 +4869,9 @@ fn native_path_respects_goal(path: &Path2D, goal: &schema::GoalEnvelope) -> bool
             })
 }
 
-#[cfg(feature = "mls")]
-fn mls_result_matches_goal(
-    backend: &str,
-    generation: i64,
-    accepted_generation: i64,
-    result: &nuwax_nav_mls_planner::lcm_worker::PlannerResult,
-    goal: &schema::GoalEnvelope,
-) -> bool {
-    backend == "mls3d"
-        && generation > 0
-        && generation == accepted_generation
-        && result.backend_generation == generation
-        && planner_goal_identity_matches(&result.goal, goal)
-}
 
-#[cfg(any(feature = "cmu-native", feature = "explore", feature = "mls"))]
+
+#[cfg(any(feature = "cmu-native", feature = "explore"))]
 fn admit_native_adapter_goal(
     latest_goal: &mut Option<schema::GoalEnvelope>,
     candidate: schema::GoalEnvelope,
@@ -4969,7 +4892,7 @@ fn admit_native_adapter_goal(
     true
 }
 
-#[cfg(any(feature = "cmu-native", feature = "explore", feature = "mls"))]
+#[cfg(any(feature = "cmu-native", feature = "explore"))]
 pub(crate) fn native_planner_path_adapter_owner(
     node: &ModuleNode, body_reference_frame_id: Arc<str>) -> NavStackResult<Box<dyn InProcessNode>> {
     if node.inputs.len() < 2 || node.inputs.len() > 3 || node.outputs.len() != 1 {
@@ -4988,7 +4911,7 @@ pub(crate) fn native_planner_path_adapter_owner(
     ))
 }
 
-#[cfg(any(feature = "cmu-native", feature = "explore", feature = "mls"))]
+#[cfg(any(feature = "cmu-native", feature = "explore"))]
 async fn run_native_planner_path_adapter(
     node: ModuleNode,
     body_reference_frame_id: Arc<str>,
@@ -4999,7 +4922,7 @@ async fn run_native_planner_path_adapter(
     run_native_planner_path_adapter_with_transport(node, body_reference_frame_id, transport, shutdown, ready).await
 }
 
-#[cfg(any(feature = "cmu-native", feature = "explore", feature = "mls"))]
+#[cfg(any(feature = "cmu-native", feature = "explore"))]
 async fn run_native_planner_path_adapter_with_transport(
     node: ModuleNode,
     body_reference_frame_id: Arc<str>,
@@ -5024,8 +4947,6 @@ async fn run_native_planner_path_adapter_with_transport(
     let mut consumed_far_results: HashSet<FarJoinKey> = HashSet::new();
     #[cfg(any(feature = "cmu-native", feature = "explore"))]
     let mut observed_far_generation = 0_i64;
-    #[cfg(feature = "mls")]
-    let mut path_revision = 0_i64;
     signal_ready(ready)?;
 
     loop {
@@ -5061,7 +4982,7 @@ async fn run_native_planner_path_adapter_with_transport(
                 #[cfg(any(feature = "cmu-native", feature = "explore"))]
                 {
                     let frame = required_frame(_frame, "native_planner_path_adapter.far_result")?;
-                    let accepted_generation = native_ready_generation(true);
+                    let accepted_generation = native_ready_generation();
                     if accepted_generation != observed_far_generation {
                         pending_results.clear();
                         pending_terminals.clear();
@@ -5124,7 +5045,7 @@ async fn run_native_planner_path_adapter_with_transport(
                             Ok(state) => state,
                             Err(_) => continue,
                         };
-                        let accepted_generation = native_ready_generation(true);
+                        let accepted_generation = native_ready_generation();
                         if accepted_generation != observed_far_generation {
                             pending_results.clear();
                             pending_terminals.clear();
@@ -5164,50 +5085,6 @@ async fn run_native_planner_path_adapter_with_transport(
                                 boundary_safe: native_path_respects_goal(&path, goal),
                             },
                         ).await?;
-                    }
-                } else {
-                    #[cfg(feature = "mls")]
-                    {
-                        use nuwax_nav_mls_planner::lcm_worker::{decode_worker_event_body, WorkerEvent};
-                        let (backend, generation, event) = match decode_worker_event_body(&frame.payload) {
-                            Ok(decoded) => decoded,
-                            Err(_) => continue,
-                        };
-                        if backend != "mls3d" || generation <= 0 {
-                            continue;
-                        }
-                        match event {
-                            WorkerEvent::Ready(_) => {}
-                            WorkerEvent::Planned(result) => {
-                                let Some(goal) = latest_goal.as_ref() else { continue; };
-                                if !mls_result_matches_goal(
-                                    &backend,
-                                    generation,
-                                    native_ready_generation(false),
-                                    &result,
-                                    goal,
-                                ) {
-                                    continue;
-                                }
-                                let path = match path_from_schema(&result.path) {
-                                    Ok(path) => path,
-                                    Err(_) => continue,
-                                };
-                                path_revision = path_revision.saturating_add(1);
-                                let _ = publish_versioned_path(
-                                    &transport,
-                                    &node.outputs[0],
-                                    VersionedPathPublication {
-                    path_yaws: None,                                        goal,
-                                        planner_runtime_generation: generation,
-                                        path_revision,
-                                        path: &path,
-                                        boundary_safe: native_path_respects_goal(&path, goal),
-                                    },
-                                ).await?;
-                            }
-                            _ => {}
-                        }
                     }
                 }
             }
@@ -9775,7 +9652,6 @@ mod guarded_tests {
             boundary: Vec::new(),
             options: Default::default(),
                 goal: nuwax_nav_runtime::ExecutionGoal::Body(pose_from_schema(&blocker.goal).expect("valid goal pose")),
-                ground_initial: None,
                 session_id: blocker.session_id.clone(),
                 execution_identity: guarded_goal_execution_identity(&blocker),
                 local_owner_runtime_generation: runtime_generation(),
@@ -10772,7 +10648,6 @@ mod guarded_tests {
             boundary: Vec::new(),
             options: Default::default(),
                 goal: nuwax_nav_runtime::ExecutionGoal::Body(pose_from_schema(&goal_a.goal).expect("valid goal pose")),
-                ground_initial: None,
                 session_id: goal_a.session_id.clone(),
                 execution_identity: guarded_goal_execution_identity(&goal_a),
                 local_owner_runtime_generation: runtime_generation(),
@@ -12260,7 +12135,7 @@ mod boundary_tests {
 
 #[cfg(all(
     test,
-    any(feature = "cmu-native", feature = "explore", feature = "mls")
+    any(feature = "cmu-native", feature = "explore")
 ))]
 mod native_adapter_tests {
     static NATIVE_GENERATION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -12385,39 +12260,7 @@ mod native_adapter_tests {
         assert!(!far_ready_contract_matches(&expected, 12, &state));
     }
 
-    #[cfg(all(feature = "native-runner", feature = "mls"))]
-    #[test]
-    fn mls_readiness_rejects_one_wrong_channel() {
-        use nuwax_nav_mls_planner::lcm_worker::{ReadyContract, WorkerEvent};
 
-        let expected = ReadyContract {
-            global_map: "/global".into(),
-            local_map: "/local".into(),
-            region_bounds: "/bounds".into(),
-            start_pose: "/start".into(),
-            goal: "/goal".into(),
-            cancel: "/cancel".into(),
-            events: "/events".into(),
-        };
-        assert!(mls_ready_contract_matches(
-            &expected,
-            "mls3d",
-            12,
-            12,
-            &WorkerEvent::Ready(expected.clone()),
-        ));
-        let wrong = ReadyContract {
-            region_bounds: "/wrong-bounds".into(),
-            ..expected.clone()
-        };
-        assert!(!mls_ready_contract_matches(
-            &expected,
-            "mls3d",
-            12,
-            12,
-            &WorkerEvent::Ready(wrong),
-        ));
-    }
 
     #[cfg(any(feature = "cmu-native", feature = "explore"))]
     #[test]
@@ -12840,160 +12683,9 @@ mod native_adapter_tests {
             .expect("FAR adapter shutdown");
     }
 
-    #[cfg(feature = "mls")]
-    #[test]
-    fn mls_result_gate_rejects_old_future_and_mutated_goal_contract() {
-        use nuwax_nav_mls_planner::lcm_worker::PlannerResult;
 
-        let goal = goal();
-        let result = PlannerResult {
-            goal: goal.clone(),
-            backend_generation: 12,
-            path: schema::Path {
-                header: goal.goal.header.clone(),
-                poses: vec![goal.goal.clone()],
-            },
-        };
-        assert!(mls_result_matches_goal("mls3d", 12, 12, &result, &goal));
-        assert!(!mls_result_matches_goal("mls3d", 11, 12, &result, &goal));
-        assert!(!mls_result_matches_goal("mls3d", 13, 12, &result, &goal));
-        assert!(!mls_result_matches_goal("other", 12, 12, &result, &goal));
 
-        let mut wrong_result = result;
-        wrong_result.goal.boundary_id = "other-boundary".into();
 
-        schema::validate_goal_envelope(&wrong_result.goal).expect("reseal wrong MLS goal");
-        assert!(!mls_result_matches_goal(
-            "mls3d",
-            12,
-            12,
-            &wrong_result,
-            &goal,
-        ));
-    }
-
-    #[cfg(feature = "mls")]
-    #[tokio::test]
-    async fn mls_real_lcm_adapter_rejects_old_and_future_before_canonical_publish() {
-        let _generation_guard=NATIVE_GENERATION_TEST_LOCK.lock().unwrap();
-        use nuwax_nav_mls_planner::lcm_worker::{
-            encode_worker_event_body, PlannerResult, WorkerEvent,
-        };
-
-        static NEXT_ADAPTER_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let id = NEXT_ADAPTER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let prefix = format!("/test/native-adapter/{}/{id}", std::process::id());
-        let node = ModuleNode::new(
-            format!("native-adapter-{id}"),
-            "Native adapter real LCM regression",
-            crate::graph::ModuleKind::Coordinator,
-        )
-        .add_input(format!("{prefix}/goal"))
-        .add_input(format!("{prefix}/event"))
-        .add_output(format!("{prefix}/path"));
-        let transport = LcmTransport::new_real("memq://").expect("real LCM memq transport");
-        let mut paths = typed_stream(&transport, &node.outputs[0], "nuwax_msgs.PathEnvelope")
-            .await
-            .expect("canonical path subscription");
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
-        let owner = tokio::spawn(run_native_planner_path_adapter_with_transport(
-            node.clone(),
-            Arc::from("base_link"),
-            transport.clone(),
-            shutdown_rx,
-            ready_tx,
-        ));
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                match ready_rx.try_recv() {
-                    Ok(Ok(())) => break,
-                    Ok(Err(reason)) => panic!("native adapter startup failed: {reason}"),
-                    Err(std_mpsc::TryRecvError::Empty) => {
-                        assert!(!owner.is_finished(), "native adapter exited before ready");
-                        tokio::time::sleep(Duration::from_millis(5)).await;
-                    }
-                    Err(std_mpsc::TryRecvError::Disconnected) => {
-                        panic!("native adapter dropped readiness channel")
-                    }
-                }
-            }
-        })
-        .await
-        .expect("native adapter readiness timeout");
-
-        let goal = goal();
-        publish_body(
-            &transport,
-            &node.inputs[0],
-            "nuwax_msgs.GoalEnvelope",
-            schema::encode_goal_envelope_body(&goal).expect("encode native goal"),
-        )
-        .await
-        .expect("publish native goal");
-        MLS_READY_GENERATION.store(12, Ordering::Release);
-
-        for generation in [11, 13] {
-            let result = PlannerResult {
-                goal: goal.clone(),
-                backend_generation: generation,
-                path: schema::Path {
-                    header: goal.goal.header.clone(),
-                    poses: vec![goal.goal.clone()],
-                },
-            };
-            let body = encode_worker_event_body("mls3d", generation, &WorkerEvent::Planned(result))
-                .expect("encode rejected MLS result");
-            publish_body(
-                &transport,
-                &node.inputs[1],
-                "nuwax_msgs.NavigationState",
-                body,
-            )
-            .await
-            .expect("publish rejected MLS result");
-            assert!(
-                tokio::time::timeout(Duration::from_millis(100), paths.next())
-                    .await
-                    .is_err(),
-                "stale or future generation must not publish a canonical path"
-            );
-        }
-
-        let result = PlannerResult {
-            goal: goal.clone(),
-            backend_generation: 12,
-            path: schema::Path {
-                header: goal.goal.header.clone(),
-                poses: vec![goal.goal.clone()],
-            },
-        };
-        let body = encode_worker_event_body("mls3d", 12, &WorkerEvent::Planned(result))
-            .expect("encode accepted MLS result");
-        publish_body(
-            &transport,
-            &node.inputs[1],
-            "nuwax_msgs.NavigationState",
-            body,
-        )
-        .await
-        .expect("publish accepted MLS result");
-        let frame = tokio::time::timeout(Duration::from_secs(2), paths.next())
-            .await
-            .expect("canonical path timeout")
-            .expect("canonical path stream closed")
-            .expect("canonical path transport");
-        let envelope = schema::decode_path_envelope_body(&frame.payload)
-            .expect("decode canonical PathEnvelope");
-        assert_eq!(envelope.goal_key(), goal.goal_key());
-        assert_eq!(envelope.planner_runtime_generation, 12);
-
-        shutdown_tx.send(()).expect("shutdown native adapter");
-        owner
-            .await
-            .expect("join native adapter")
-            .expect("native adapter shutdown");
-    }
 
     #[test]
     fn restart_generation_is_cleared_before_a_new_ready_generation() {
@@ -13001,20 +12693,12 @@ mod native_adapter_tests {
         #[cfg(any(feature = "cmu-native", feature = "explore"))]
         {
             FAR_READY_GENERATION.store(12, Ordering::Release);
-            assert_eq!(native_ready_generation(true), 12);
+            assert_eq!(native_ready_generation(), 12);
             invalidate_native_planner_generation("far_planner");
-            assert_eq!(native_ready_generation(true), 0);
+            assert_eq!(native_ready_generation(), 0);
             FAR_READY_GENERATION.store(13, Ordering::Release);
-            assert_eq!(native_ready_generation(true), 13);
+            assert_eq!(native_ready_generation(), 13);
         }
-        #[cfg(feature = "mls")]
-        {
-            MLS_READY_GENERATION.store(22, Ordering::Release);
-            assert_eq!(native_ready_generation(false), 22);
-            invalidate_native_planner_generation("mls_planner");
-            assert_eq!(native_ready_generation(false), 0);
-            MLS_READY_GENERATION.store(23, Ordering::Release);
-            assert_eq!(native_ready_generation(false), 23);
-        }
+
     }
 }

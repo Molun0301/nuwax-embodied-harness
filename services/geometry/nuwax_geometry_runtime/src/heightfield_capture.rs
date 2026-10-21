@@ -22,8 +22,9 @@ fn mask(c: Xy, residual: Bin, bins: &Bins, seeds: &Seeds) -> BTreeSet<Xy> {
         })
         .collect()
 }
-fn dilate(c: Xy, input: &BTreeSet<Xy>) -> BTreeSet<Xy> {
-    input
+fn dilate(c: Xy, input: &BTreeSet<Xy>) -> u128 {
+    let mut mask = 0;
+    for xy in input
         .iter()
         .flat_map(|xy| {
             (-1..=1).flat_map(move |x| {
@@ -34,7 +35,13 @@ fn dilate(c: Xy, input: &BTreeSet<Xy>) -> BTreeSet<Xy> {
             (i64::from(xy[0]) - i64::from(c[0])).abs() <= 4
                 && (i64::from(xy[1]) - i64::from(c[1])).abs() <= 4
         })
-        .collect()
+    {
+        // 原窗口最多81列；相对整数坐标一一对应，不改变膨胀边界或溢出语义。
+        let x = i64::from(xy[0]) - i64::from(c[0]) + 4;
+        let y = i64::from(xy[1]) - i64::from(c[1]) + 4;
+        mask |= 1_u128 << (x * 9 + y);
+    }
+    mask
 }
 fn edge(upper: &BTreeSet<Xy>, lower: &BTreeSet<Xy>) -> bool {
     for d in [[1, 0], [-1, 0], [0, 1], [0, -1]] {
@@ -116,13 +123,26 @@ impl Shape {
 fn shape(c: Xy, base_residual: Bin, residual: Bin, bins: &Bins, seeds: &Seeds) -> Shape {
     let lower = mask(c, base_residual, bins, seeds);
     let upper = mask(c, residual, bins, seeds);
-    let a = dilate(c, &lower);
-    let b = dilate(c, &upper);
+    compare_masks(c, &lower, &upper, bins)
+}
+fn compare_masks(c: Xy, lower: &BTreeSet<Xy>, upper: &BTreeSet<Xy>, bins: &Bins) -> Shape {
+    let a = dilate(c, lower);
+    // 相同集合的交并仍为自身，且不存在只属于下层的边缘；无需重复膨胀和查边。
+    let (intersection, union, has_edge) = if lower == upper {
+        (a.count_ones() as usize, a.count_ones() as usize, false)
+    } else {
+        let b = dilate(c, upper);
+        (
+            (a & b).count_ones() as usize,
+            (a | b).count_ones() as usize,
+            edge(upper, lower),
+        )
+    };
     Shape {
-        intersection: a.intersection(&b).count(),
-        union: a.union(&b).count(),
-        edge: residual != base_residual && edge(&upper, &lower),
-        upright: upright(c, &lower, bins),
+        intersection,
+        union,
+        edge: has_edge,
+        upright: upright(c, lower, bins),
     }
 }
 
@@ -158,7 +178,8 @@ impl Return {
 }
 fn empty_column() -> ColumnGroundRecords {
     ColumnGroundRecords {
-        classified_empty: false, legacy: vec![],
+        classified_empty: false,
+        legacy: vec![],
         heightfields: vec![],
     }
 }
@@ -269,7 +290,7 @@ fn groups(
     let Some(&first) = seeds.get(&xy) else {
         return vec![];
     };
-    if shape(xy, 0, 0, bins, seeds).upright {
+    if upright(xy, &mask(xy, 0, bins, seeds), bins) {
         return vec![];
     }
     let values = &bins[&xy];
@@ -336,7 +357,7 @@ fn legacy_shape(
     central: Old<'_>,
     bins: &Bins,
     seeds: &Seeds,
-    old: &BTreeMap<Xy, ColumnGroundRecords>,
+    reference_heights: &BTreeMap<Xy, f64>,
     q: f64,
 ) -> Option<Shape> {
     let centre = central.height(xy, q)?;
@@ -350,26 +371,8 @@ fn legacy_shape(
             refs.insert(n, centre);
             continue;
         }
-        let Some(records) = old.get(&n) else { continue };
-        let all: Vec<_> = old_records(records).collect();
-        let associated: Vec<_> = all
-            .iter()
-            .copied()
-            .filter(|r| {
-                seeds
-                    .get(&n)
-                    .is_some_and(|z| r.contains(z.div_euclid(8) as i32))
-            })
-            .collect();
-        let reference = if associated.len() == 1 {
-            Some(associated[0])
-        } else if associated.is_empty() && all.len() == 1 {
-            Some(all[0])
-        } else {
-            None
-        };
-        if let Some(h) = reference.and_then(|r| r.height(n, q)) {
-            refs.insert(n, h);
+        if let Some(&height) = reference_heights.get(&n) {
+            refs.insert(n, height);
         }
     }
     if refs.is_empty() {
@@ -388,14 +391,44 @@ fn legacy_shape(
         })
         .map(|(n, _)| *n)
         .collect();
-    let a = dilate(xy, &lower);
-    let b = dilate(xy, &upper);
-    Some(Shape {
-        intersection: a.intersection(&b).count(),
-        union: a.union(&b).count(),
-        edge: edge(&upper, &lower),
-        upright: upright(xy, &lower, bins),
-    })
+    Some(compare_masks(xy, &lower, &upper, bins))
+}
+
+/// 邻列参考选择只依赖本帧固定输入，所有中心列可以共享同一结果。
+/// 中心列仍在legacy_shape中使用正在比较的具体旧记录覆盖。
+fn legacy_reference_heights(
+    bins: &Bins,
+    seeds: &Seeds,
+    old: &BTreeMap<Xy, ColumnGroundRecords>,
+    q: f64,
+) -> BTreeMap<Xy, f64> {
+    let mut references = BTreeMap::new();
+    for (&n, records) in old {
+        if !bins.contains_key(&n) {
+            continue;
+        }
+        let all: Vec<_> = old_records(records).collect();
+        let associated: Vec<_> = all
+            .iter()
+            .copied()
+            .filter(|r| {
+                seeds
+                    .get(&n)
+                    .is_some_and(|z| r.contains(z.div_euclid(8) as i32))
+            })
+            .collect();
+        let reference = if associated.len() == 1 {
+            Some(associated[0])
+        } else if associated.is_empty() && all.len() == 1 {
+            Some(all[0])
+        } else {
+            None
+        };
+        if let Some(h) = reference.and_then(|r| r.height(n, q)) {
+            references.insert(n, h);
+        }
+    }
+    references
 }
 
 // Existing independent surfaces cannot be joined by a frame that sees only a
@@ -541,6 +574,7 @@ pub(super) fn capture(
         );
     }
     let seeds = select_seeds(&bins, &old, q);
+    let reference_heights = legacy_reference_heights(&bins, &seeds, &old, q);
     let mut updates = BTreeMap::new();
     let mut historical = None;
     let mut indices = Vec::new();
@@ -574,6 +608,18 @@ pub(super) fn capture(
         }
         let previous = old.get(&xy);
         let olds: Vec<_> = previous.into_iter().flat_map(old_records).collect();
+        // 两轮关联读取同一列、本帧不可变上下文，复用判断而不复用观察或样本。
+        let mut compatibility = BTreeMap::new();
+        let mut compatible = |index: usize, seed: Bin| {
+            *compatibility.entry((index, seed)).or_insert_with(|| {
+                let record = olds[index];
+                record
+                    .height(xy, q)
+                    .is_some_and(|h| ((seed as f64 + 0.5) * q / 8.0 - h).abs() <= 4.0 * q)
+                    && legacy_shape(xy, seed, record, &bins, &seeds, &reference_heights, q)
+                        .is_none_or(Shape::joins)
+            })
+        };
         let mut withheld = BTreeSet::new();
         for (g, group) in grouping
             .iter()
@@ -583,12 +629,9 @@ pub(super) fn capture(
             let candidates: Vec<_> = olds
                 .iter()
                 .copied()
-                .filter(|r| {
-                    r.height(xy, q)
-                        .is_some_and(|h| ((group.seed as f64 + 0.5) * q / 8.0 - h).abs() <= 4.0 * q)
-                        && legacy_shape(xy, group.seed, *r, &bins, &seeds, &old, q)
-                            .is_none_or(Shape::joins)
-                })
+                .enumerate()
+                .filter(|(index, _)| compatible(*index, group.seed))
+                .map(|(_, record)| record)
                 .collect();
             if candidates.iter().enumerate().any(|(i, &a)| {
                 candidates[i + 1..].iter().any(|&b| {
@@ -632,14 +675,7 @@ pub(super) fn capture(
                 .collect();
             let matching: Vec<_> = frames
                 .iter()
-                .filter(|(_, (g, _, _))| {
-                    let compatible_height = record
-                        .height(xy, q)
-                        .is_some_and(|h| ((g.seed as f64 + 0.5) * q / 8.0 - h).abs() <= 4.0 * q);
-                    compatible_height
-                        && legacy_shape(xy, g.seed, record, &bins, &seeds, &old, q)
-                            .is_none_or(Shape::joins)
-                })
+                .filter(|(_, (g, _, _))| compatible(i, g.seed))
                 .map(|(&g, _)| g)
                 .collect();
             if matching.len() == 1 {

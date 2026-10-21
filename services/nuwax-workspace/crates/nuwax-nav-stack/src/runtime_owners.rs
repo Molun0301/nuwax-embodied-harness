@@ -8,7 +8,7 @@ use crate::runner::StackRunner;
 
 #[cfg(all(
     feature = "native-runner",
-    any(feature = "cmu-native", feature = "explore", feature = "mls")
+    any(feature = "cmu-native", feature = "explore")
 ))]
 fn native_topic(node: &crate::graph::ModuleNode, port: &str) -> Option<String> {
     node.native_spec.as_ref()?.spec.topics.get(port).cloned()
@@ -44,7 +44,7 @@ pub(crate) fn register_compiled_owners(_runner: &mut StackRunner) {
     let body_reference = crate::lcm_dataflow::capture_body_reference();
     #[cfg(all(
         feature = "native-runner",
-        any(feature = "cmu-native", feature = "explore", feature = "mls")
+        any(feature = "cmu-native", feature = "explore")
     ))]
     {
         #[cfg(any(feature = "cmu-native", feature = "explore"))]
@@ -81,7 +81,7 @@ pub(crate) fn register_compiled_owners(_runner: &mut StackRunner) {
     #[cfg(feature = "replanning-astar")]
     _runner.register_in_process_factory("astar_planner", { let body = body_reference.clone(); move |node: &crate::graph::ModuleNode| crate::lcm_dataflow::astar_planner_owner(node, crate::lcm_dataflow::captured_body_reference(&body)?) });
 
-    #[cfg(any(feature = "cmu-native", feature = "explore", feature = "mls"))]
+    #[cfg(any(feature = "cmu-native", feature = "explore"))]
     _runner.register_in_process_factory(
         "native_planner_path_adapter",
         { let body = body_reference.clone(); move |node: &crate::graph::ModuleNode| crate::lcm_dataflow::native_planner_path_adapter_owner(node, crate::lcm_dataflow::captured_body_reference(&body)?) },
@@ -221,14 +221,6 @@ mod tests {
         let planner = graph.find("far_planner").expect("FAR planner graph node");
         let ready_contract =
             super::far_ready_contract(planner).expect("derived FAR READY contract");
-        #[cfg(feature = "mls")]
-        let contract = match ready_contract {
-            crate::lcm_dataflow::NativePlannerReadyContract::Far(contract) => contract,
-            crate::lcm_dataflow::NativePlannerReadyContract::Mls(_) => {
-                panic!("FAR node derived MLS contract")
-            }
-        };
-        #[cfg(not(feature = "mls"))]
         let crate::lcm_dataflow::NativePlannerReadyContract::Far(contract) = ready_contract;
         let topics = &planner
             .native_spec

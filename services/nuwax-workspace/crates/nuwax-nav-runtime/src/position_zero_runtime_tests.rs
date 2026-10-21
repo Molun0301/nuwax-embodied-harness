@@ -2,7 +2,7 @@
 // only the existing in-memory motion-port proof fixture stands in for hardware.
 // No planner success is injected, no simulation/deadband/TTL override is used.
 fn zero_position_surface_parts() -> (SurfaceFollowerConfig, Arc<SurfaceSnapshot>, PoseStamped) {
-    let (config, map, _) = crate::route_moving_worker_tests::fixture(true, 0.05, 6.0);
+    let (config, map) = crate::native_test_helpers::fixture();
     assert!(!config.controller.simulation);
     assert!(config.motion_limits.is_some());
     let mut goal = map_pose_at(1);

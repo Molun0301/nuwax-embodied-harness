@@ -1,4 +1,4 @@
-//! 固定一列变化扩大远场，独立报告首建、更新和近场路径查询。
+//! 固定一列变化扩大远场，独立报告首建、更新和近场高度查询。
 use nuwax_nav_mls_planner::{
     mls_planner::Config, SurfaceBodyEnvelope, SurfaceColumnUpdate, SurfaceMapBuilder,
 };
@@ -59,19 +59,19 @@ fn main() {
                 .unwrap();
             let update_ms = now.elapsed().as_secs_f64() * 1000.0;
             let now = Instant::now();
-            let path = next
+            let location = next
                 .snapshot
-                .plan([0.85, 0.85, 0.025], [1.85, 0.85, 0.025])
+                .locate_support([0.85, 0.85, 0.025])
                 .unwrap();
             let near_ms = now.elapsed().as_secs_f64() * 1000.0;
             println!(
                 "{}",
-                serde_json::json!({"side":side,"cells":points.len(),"iteration":iteration,"first_ms":first_ms,"update_ms":update_ms,"near_ms":near_ms,"near_points":path.len(),"checked_cells":next.stats.checked_cells,"global_refresh":next.stats.global_cost_refresh})
+                serde_json::json!({"side":side,"cells":points.len(),"iteration":iteration,"first_ms":first_ms,"update_ms":update_ms,"near_ms":near_ms,"near_ground":location.support_xyz[2],"checked_cells":next.stats.checked_cells,"global_refresh":next.stats.global_cost_refresh})
             );
         }
         assert!(first
             .snapshot
-            .plan([0.85, 0.85, 0.025], [1.85, 0.85, 0.025])
+            .locate_support([0.85, 0.85, 0.025])
             .is_ok());
     }
 }

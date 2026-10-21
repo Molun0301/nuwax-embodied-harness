@@ -2,10 +2,11 @@
 mod captured_source;
 mod scenarios;
 mod terrain_reference;
+mod world_motion;
 use nuwax_nav_mls_planner::{
     SurfaceMapBuilder, SurfaceObservation, SurfaceObservations, SurfaceSnapshot,
 };
-use nuwax_nav_mls_planner::surface::{BodyGroundState, GroundEvidence};
+use nuwax_nav_mls_planner::surface::GroundEvidence;
 use nuwax_nav_runtime::{ExecutionGoal, ExecutionMap, ExecutionPath, NavPlanner, PlannerStep, RouteFollower};
 use nuwax_nav_runtime::replan_feedback::{ActualExecutionContext, SurfaceReplanInput, SuccessfulReplanMemo};
 use nuwax_nav_stack::{surface_config::SurfaceNavigationConfig};
@@ -760,6 +761,43 @@ impl Scene {
         });
         Ok(())
     }
+    /// 世界响应和碰撞仅读取环境点云及实体，完全独立于规划路线和预测高度。
+    fn validate_world_motion(&self, from: Body, to: Body) -> Result<(), String> {
+        let model = self.config.body_envelope.as_ref().ok_or("模拟机体尺寸缺失")?;
+        let q = self.terrain.source_voxel_m;
+        let radius = model.footprint_xy_m.iter().map(|point|point[0].hypot(point[1])).fold(0.0,f64::max);
+        let ground = contact_reference(from, model.body_to_support_z_m)
+            .max(contact_reference(to, model.body_to_support_z_m));
+        let lower = [(from.0[0].min(to.0[0])-radius)/q,(from.0[1].min(to.0[1])-radius)/q].map(|v|v.floor() as i32);
+        let upper = [(from.0[0].max(to.0[0])+radius)/q,(from.0[1].max(to.0[1])+radius)/q].map(|v|v.ceil() as i32);
+        let mut solids = Vec::new();
+        for x in lower[0]..=upper[0] {
+            for y in lower[1]..=upper[1] {
+                if let Some(bands) = self.terrain.columns.get(&(x,y)) {
+                    for &(low, high) in bands {
+                        // 环境已按真实阶高承载机体，接地实体不作为机身障碍重复否决。
+                        if high <= ground + model.max_step_up_m + q { continue; }
+                        solids.push(world_motion::Solid {low:[f64::from(x)*q,f64::from(y)*q,low-q],
+                            high:[f64::from(x+1)*q,f64::from(y+1)*q,high]});
+                    }
+                }
+            }
+        }
+        for obstacle in &self.obstacles {
+            let x=obstacle["x"].as_f64().unwrap();let y=obstacle["y"].as_f64().unwrap();
+            let radius=obstacle["radius"].as_f64().unwrap_or(0.3);let height=obstacle["height"].as_f64().unwrap_or(0.8);
+            let base=obstacle["z"].as_f64().unwrap_or(ground);
+            for ix in ((x-radius)/q).floor() as i32..=((x+radius)/q).ceil() as i32 {
+                for iy in ((y-radius)/q).floor() as i32..=((y+radius)/q).ceil() as i32 {
+                    if (((f64::from(ix)+0.5)*q-x).hypot((f64::from(iy)+0.5)*q-y)) > radius {continue;}
+                    solids.push(world_motion::Solid {low:[f64::from(ix)*q,f64::from(iy)*q,base],
+                        high:[f64::from(ix+1)*q,f64::from(iy+1)*q,base+height]});
+                }
+            }
+        }
+        world_motion::check_swept_boxes(from,to,&solids,&model.footprint_xy_m,model.z_bounds_m,q)
+    }
+
     fn change_obstacles(&mut self, values: Vec<Value>) -> Result<(), String> {
         if values == self.obstacles {
             return Ok(());
@@ -864,7 +902,6 @@ struct Simulation {
     options: GoalOptions,
     current: Body,
     // Only publication scenes own an actual ground association across unknown columns.
-    actual_ground: Option<BodyGroundState>,
     goal: Body,
     applied: [f64; 3],
     command: [f64; 3],
@@ -893,25 +930,24 @@ struct Simulation {
     successful_replan: SuccessfulReplanMemo<u64>,
     rejected_plan: Option<u64>,
     rejected_context: Option<Arc<ActualExecutionContext>>,
-    local_planning_enabled: bool,
+    local_planning: bool,
 }
-fn request_local_planning_enabled(request: &Value, startup: bool) -> Result<bool, String> {
-    request.get("local_planning_enabled").map_or(Ok(startup), |value|
-        value.as_bool().ok_or_else(|| "local_planning_enabled must be a boolean".into()))
-}
-
 impl Simulation {
     fn new(scene: &Scene, request: &Value) -> Result<Self, String> {
         let start = body4(&request["start"])?;
         let goal = body4(&request["goal"])?;
         let speed = request["speed_mps"].as_f64().unwrap_or(1.).clamp(0.1, 1.5);
         let mut config = scene.config.follower.clone();
-        config.local_planning_enabled = request_local_planning_enabled(request, config.local_planning_enabled)?;
         // 同一原生程序逐请求对照局部视距，保持控制与物理参数一致。
         if let Some(value) = request.get("local_horizon_m") {
-            config.scan.horizon_m = value.as_f64().filter(|v| v.is_finite() && *v > 0.0)
+            config.scan.planning_horizon = value.as_f64().filter(|v| v.is_finite() && *v > 0.0)
                 .ok_or("局部规划视距必须为正有限数值")?;
         }
+        // 局部规划开关只供实验台逐请求对照，缺省开启。
+        if let Some(value) = request.get("local_planning") {
+            config.local_planning = value.as_bool().ok_or("局部规划开关必须为布尔值")?;
+        }
+        let local_planning = config.local_planning;
         config.controller.speed = speed;
         config.controller.control_frequency = 1. / DT;
         config.controller.simulation = true;
@@ -980,10 +1016,6 @@ impl Simulation {
             if q.iter().map(|v|v*v).sum::<f64>()<1e-12 {return Err("起点朝向不能为零四元数".into());}
             current.1=q;
         }
-        let actual_ground = if matches!(&scene.source,SceneSource::Publication {..}) {
-            Some(scene.map.body_query().start_ground_state(current).map_err(|e|e.to_string())?)
-        } else {None};
-        let local_planning_enabled=config.local_planning_enabled;
         let mut follower = RouteFollower::new(config).map_err(|e| e.to_string())?;
         follower
             .update_execution_map(ExecutionMap::Surface(scene.map.clone()))
@@ -997,7 +1029,6 @@ impl Simulation {
             follower,
             options,
             current,
-            actual_ground,
             goal,
             applied: [0.; 3],
             command: [0.; 3],
@@ -1032,24 +1063,18 @@ impl Simulation {
             successful_replan: SuccessfulReplanMemo::default(),
             rejected_plan: None,
             rejected_context: None,
-            local_planning_enabled,
+            local_planning,
         })
     }
     fn plan(&mut self, scene: &Scene) -> Result<(), String> {
-        let penalties=Arc::new(scene.config.follower.pct.local_costs());
-        let limits=scene.config.follower.pct.search_limits();
         // Reassociate only actual observation/ground. Never step while waiting.
         let input=SurfaceReplanInput {
             source:Arc::clone(&scene.map), start:stamped(self.current,self.time),
             goal:ExecutionGoal::Body(stamped(self.goal,self.time)), options:self.options,
             boundary:Arc::new(vec![]),
             actual:self.follower.refresh_execution_context(as_twist(self.applied)),
-            ground_intent:None,
-            limits,
             offset:scene.map.body_envelope().map_or(scene.config.follower.body_to_support_z_m,
                 |body|body.body_to_support_z_m),
-            local_planning_enabled:self.local_planning_enabled,
-            penalties:Arc::clone(&penalties),
         };
         let rejected=(!self.braking_for_replan)
             .then(|| self.rejected_plan.as_ref().zip(self.rejected_context.as_deref())).flatten();
@@ -1062,8 +1087,8 @@ impl Simulation {
             return Ok(());
         }
         let started = Instant::now();
-        let route = scene.config.follower.pct.body_route_with_limits_and_penalties_typed(
-            &scene.map, self.current, self.goal, self.options, &[], Some(&CANCEL),limits,&penalties,
+        let route = scene.config.planner.route(
+            &scene.map, self.current, self.goal, self.options, &[], scene.config.follower.body_to_support_z_m, Some(&CANCEL),
         ).map_err(|error|error.to_string());
         self.last_plan_ms = started.elapsed().as_secs_f64() * 1000.;
         self.plans += 1;
@@ -1125,10 +1150,6 @@ impl Simulation {
                 self.braking_for_replan = true;
                 self.status = "planning".into();
             }
-            PlannerStep::GroundArrival(_) => {
-                self.command = [0.; 3];
-                return Err("Ground arrival is unsupported in the Body-only diagnostic simulator".into());
-            }
             PlannerStep::Failed(reason) => return Err(reason),
         }
         self.max_reverse_command_mps=self.max_reverse_command_mps.max(-self.command[0]);
@@ -1166,44 +1187,14 @@ impl Simulation {
             after_ground,
             scene.config.follower.body_to_support_z_m,
         );
-        let mut actual_witness = None;
-        let checked = if let Some(ground) = &self.actual_ground {
-            // Validate the independently integrated world pose; do not replace it
-            // with a planner projection or reseed Unknown from changing body Z.
-            scene.map.body_query().validate_motion_from_ground(
-                self.current,next,ground,&[],&mut actual_witness).map(Some)
-        } else {
-            scene.map.with_current_body_support(self.current.0,self.current.1)
-                .and_then(|m|m.validate_body_motion(self.current,next,&[])).map(|()|None)
-        };
-        let next_ground = match checked {
-            Ok(ground) => ground,
-            Err(error) => {
-                self.motion_failures += 1;
-                let (predicted,predicted_check) = if let Some(ground) = &self.actual_ground {
-                    let query=scene.map.body_query();
-                    let projection=query.project_motion(self.current,ground,[planar.0[0],planar.0[1]],heading,&mut None);
-                    let checked=projection.as_ref().ok().map(|projection|
-                        query.validate_projected_motion(self.current,projection,&[],&mut None).map_err(|e|e.to_string()));
-                    (projection.map(|projection|projection.pose()).map_err(|e|e.to_string()),checked)
-                } else {
-                    let predicted=scene.map.with_current_body_support(self.current.0,self.current.1)
-                        .and_then(|map|map.body_pose_after_motion(self.current,[planar.0[0],planar.0[1]],heading));
-                    let checked=predicted.as_ref().ok().map(|next|scene.map
-                        .with_current_body_support(self.current.0,self.current.1)
-                        .and_then(|map|map.validate_body_motion(self.current,*next,&[])).map_err(|e|e.to_string()));
-                    (predicted.map_err(|e|e.to_string()),checked)
-                };
-                self.motion_failure=Some(json!({"from":self.current,"next":next,
-                    "previous_velocity":old,"velocity":applied,"command":self.command,
-                    "model_ground_from":before_ground,"model_ground_next":after_ground,
-                    "production_prediction":predicted,"prediction_check":predicted_check,
-                    "actual_check_kind":if self.actual_ground.is_some(){"owned_ground"}else{"legacy"},
-                    "actual_witness":format!("{actual_witness:?}")}));
-                return Err(format!("模拟实际运动与几何检查不一致：{error}，位置 {:?} → {:?}",self.current.0,next.0));
-            }
-        };
-        self.actual_ground=next_ground;
+        if let Err(error) = scene.validate_world_motion(self.current, next) {
+            self.motion_failures += 1;
+            self.motion_failure = Some(json!({"from":self.current,"next":next,
+                "previous_velocity":old,"velocity":applied,"command":self.command,
+                "model_ground_from":before_ground,"model_ground_next":after_ground,
+                "actual_check_kind":"independent_convex_body_sweep"}));
+            return Err(format!("模拟实际运动碰撞：{error}"));
+        }
         // 按真实机体速度统计；圆弧的世界坐标横向位移不等于机器狗横着走。
         self.reverse_travel_m+=(-mean[0]).max(0.0)*DT;
         self.lateral_travel_m+=mean[1].abs()*DT;
@@ -1244,7 +1235,7 @@ impl Simulation {
     fn state(&mut self, scene: &Scene) -> Value {
         let local:Vec<_>=self.follower.local_path().map_or_else(Vec::new,|path|path.poses.iter()
             .map(|pose|[pose.pose.position.x,pose.pose.position.y,pose.pose.position.z]).collect());
-        json!({"status":self.status,"sim_time_sec":self.time,"pose":pose4(self.current),"orientation":self.current.1,"goal":pose4(self.goal),"goal_options":{"position_tolerance_m":self.options.position_tolerance_m,"yaw_tolerance_rad":self.options.yaw_tolerance_rad,"requires_orientation":self.options.requires_orientation()},"stopping_criteria":{"linear_speed_below_mps":STOP_LINEAR_MPS,"angular_speed_below_rps":STOP_ANGULAR_RPS,"comparison":"strictly_less"},"command":self.command,"velocity":self.applied,"global_path":self.path.iter().map(|p|p.0).collect::<Vec<_>>(),"path_revision":self.plans,"path_history":self.history,"local_path":local,"frames":std::mem::take(&mut self.pending_frames),"obstacles":scene.obstacles,"world_model":self.pose_mode,"terrain_response":scene.metadata["terrain_response"],"motion_failure":self.motion_failure,"metrics":{"speed_mps":self.applied[0].hypot(self.applied[1]),"configured_speed_mps":self.speed,"distance_remaining_m":distance(self.current,self.goal),"global_plans":self.plans,"local_plans":self.follower.local_plans(),"last_plan_ms":self.last_plan_ms,"last_control_ms":self.last_control_ms,"max_rss_mb":rss_mb(),"motion_validation_failures":self.motion_failures,"reverse_travel_m":self.reverse_travel_m,"lateral_travel_m":self.lateral_travel_m,"max_reverse_command_mps":self.max_reverse_command_mps,"max_lateral_command_mps":self.max_lateral_command_mps},"motion_policy":"forward_only","message":self.message})
+        json!({"status":self.status,"sim_time_sec":self.time,"pose":pose4(self.current),"orientation":self.current.1,"goal":pose4(self.goal),"goal_options":{"position_tolerance_m":self.options.position_tolerance_m,"yaw_tolerance_rad":self.options.yaw_tolerance_rad,"requires_orientation":self.options.requires_orientation()},"stopping_criteria":{"linear_speed_below_mps":STOP_LINEAR_MPS,"angular_speed_below_rps":STOP_ANGULAR_RPS,"comparison":"strictly_less"},"command":self.command,"velocity":self.applied,"global_path":self.path.iter().map(|p|p.0).collect::<Vec<_>>(),"path_revision":self.plans,"path_history":self.history,"local_path":local,"frames":std::mem::take(&mut self.pending_frames),"obstacles":scene.obstacles,"world_model":self.pose_mode,"terrain_response":scene.metadata["terrain_response"],"motion_failure":self.motion_failure,"metrics":{"speed_mps":self.applied[0].hypot(self.applied[1]),"configured_speed_mps":self.speed,"distance_remaining_m":distance(self.current,self.goal),"global_plans":self.plans,"local_plans":self.follower.local_plans(),"last_plan_ms":self.last_plan_ms,"last_control_ms":self.last_control_ms,"max_rss_mb":rss_mb(),"motion_validation_failures":self.motion_failures,"reverse_travel_m":self.reverse_travel_m,"lateral_travel_m":self.lateral_travel_m,"max_reverse_command_mps":self.max_reverse_command_mps,"max_lateral_command_mps":self.max_lateral_command_mps},"motion_policy":"forward_only","local_planning":self.local_planning,"message":self.message})
     }
 }
 fn synthetic(blocked: bool) -> Vec<(f32, f32, f32)> {
@@ -1328,7 +1319,7 @@ fn run() -> Result<(), String> {
             name,
             synthetic(blocked),
             Vec::new(),
-            config.clone(),true,GroundEvidence::MeasuredSurface,
+            config.clone(),true,GroundEvidence::OccupiedVolume,
             &data,
         )?;
         scenes.insert(id.to_owned(), scene);
@@ -1358,7 +1349,7 @@ fn run() -> Result<(), String> {
                 .collect();
             let scene = Scene::make(
                 "recorded",
-                "9月18日最新代码遥控建图-1512",
+                "导入点云与参考位姿",
                 points,
                 poses,
                 config.clone(),false,GroundEvidence::MeasuredSurface,
@@ -1433,8 +1424,8 @@ fn run() -> Result<(), String> {
                     let scene=scenes.get(request["scene_id"].as_str().ok_or("场景缺失")?).ok_or("场景不存在")?;
                     let session=Simulation::new(scene,&request)?;
                     let began=Instant::now();
-                    let route=scene.config.follower.pct.body_route(&scene.map,session.current,
-                        session.goal,session.options,&[],Some(&CANCEL));
+                    let route=scene.config.planner.route(&scene.map,session.current,
+                        session.goal,session.options,&[],scene.config.follower.body_to_support_z_m,Some(&CANCEL));
                     Ok(json!({"route":route,"elapsed_ms":began.elapsed().as_secs_f64()*1000.0,
                         "world_model":session.pose_mode}))
                 }
@@ -1442,17 +1433,14 @@ fn run() -> Result<(), String> {
                     let scene=scenes.get(request["scene_id"].as_str().ok_or("场景缺失")?).ok_or("场景不存在")?;
                     let path:Vec<Body>=serde_json::from_value(request["path"].clone()).map_err(|e|e.to_string())?;
                     if path.is_empty(){return Err("检查路径为空".into());}
-                    let first=path[0];
-                    let initial=scene.map.body_query_with_current_support(first.0,first.1)
-                        .and_then(|view|view.validate_body_motion(first,first,&[]));
-                    let mut failure=initial.err().map(|error|json!({"index":0,"reason":error.to_string(),"from":first,"to":first}));
-                    let mut checked=0;
-                    for (index,pair) in path.windows(2).enumerate() {
-                        if failure.is_some(){break;}
-                        let result=scene.map.body_query_with_current_support(pair[0].0,pair[0].1)
-                            .and_then(|view|view.validate_body_motion(pair[0],pair[1],&[]));
-                        checked+=1;
-                        if let Err(error)=result {failure=Some(json!({"index":index,"reason":error.to_string(),"from":pair[0],"to":pair[1]}));break;}
+                    let mut failure = None;
+                    let mut checked = 0;
+                    for (index, pair) in path.windows(2).enumerate() {
+                        checked += 1;
+                        if let Err(error) = scene.validate_world_motion(pair[0], pair[1]) {
+                            failure = Some(json!({"index":index,"reason":error,"from":pair[0],"to":pair[1]}));
+                            break;
+                        }
                     }
                     Ok(json!({"accepted":failure.is_none(),"checked":checked,"failure":failure}))
                 }
@@ -1460,6 +1448,9 @@ fn run() -> Result<(), String> {
                     CANCEL.store(false, Ordering::Relaxed);
                     let id = request["scene_id"].as_str().ok_or("场景缺失")?;
                     let scene = scenes.get_mut(id).ok_or("场景不存在")?;
+                    if let Some(world) = request["world_fixture"].as_str() {
+                        scene.select_world_fixture(world)?;
+                    }
                     scene.change_obstacles(
                         request["obstacles"].as_array().cloned().unwrap_or_default(),
                     )?;
@@ -1514,42 +1505,20 @@ fn run() -> Result<(), String> {
                     let scene=scenes.get(request["scene_id"].as_str().ok_or("场景缺失")?).ok_or("场景不存在")?;
                     let from:Body=serde_json::from_value(request["from"].clone()).map_err(|e|e.to_string())?;
                     let to:Body=serde_json::from_value(request["to"].clone()).map_err(|e|e.to_string())?;
-                    let mut initial_witness=None;
-                    let initial_pose_check=scene.map.validate_body_pose_with_witness(from.0,from.1,&mut initial_witness)
-                        .map_err(|e|e.to_string());
-                    let mut witness=None;
-                    let full=scene.map.with_current_body_support(from.0,from.1)
-                        .and_then(|m|m.validate_body_motion_with_witness(from,to,&[],&mut witness)).map_err(|e|e.to_string());
-                    let query=scene.map.body_query_with_current_support(from.0,from.1)
-                        .and_then(|m|m.validate_body_motion(from,to,&[])).map_err(|e|e.to_string());
-                    Ok(json!({"full":full,"query":query,"witness":format!("{witness:?}"),
-                        "initial_pose_check":initial_pose_check,"initial_witness":format!("{initial_witness:?}")}))
-                }
-                "inspect_motions" => {
-                    let scene=scenes.get(request["scene_id"].as_str().ok_or("场景缺失")?).ok_or("场景不存在")?;
-                    let pose:Body=serde_json::from_value(request["body"].clone()).map_err(|e|e.to_string())?;
-                    let mut samples=Vec::new();
-                    for length in [0.0,0.0025,0.005,0.01,0.025,0.05,0.1] {
-                        for turn in [-0.08,-0.04,-0.02,-0.01,-0.005,0.0,0.005,0.01,0.02,0.04,0.08] {
-                            let path=nuwax_nav_scan::probe_motion(&scene.map,pose,length,turn,&[]);
-                            samples.push(json!({"length":length,"turn":turn,"end":path.and_then(|p|p.last().copied())}));
-                        }
-                    }
-                    Ok(json!({"samples":samples}))
+                    Ok(json!({"world_check":scene.validate_world_motion(from,to)}))
                 }
                 "inspect_terrain" => {
-                    let id=request["scene_id"].as_str().ok_or("场景缺失")?;
-                    let scene=scenes.get(id).ok_or("场景不存在")?;
-                    let x=request["x"].as_f64().ok_or("X缺失")?;
-                    let y=request["y"].as_f64().ok_or("Y缺失")?;
-                    let radius=request["radius"].as_f64().unwrap_or(2.0).clamp(0.1,5.0);
-                    let map=scene.config.follower.pct.map(&scene.map)?;
-                    let cells:Vec<_>=map.cells.iter().enumerate().filter_map(|(i,cell)| {
-                        let p=map.position(i);
-                        ((p[0]-x).hypot(p[1]-y)<=radius).then(||json!({"position":p,"ground_interval":cell.ground_interval,"cost":cell.cost,
-                            "clearance":cell.clearance,"ceiling":if cell.ceiling.is_finite(){Some(cell.ceiling)}else{None}}))
+                    let scene = scenes.get(request["scene_id"].as_str().ok_or("场景缺失")?).ok_or("场景不存在")?;
+                    let input = nuwax_nav_runtime::native_map::from_surface(&scene.map)?;
+                    let x = request["x"].as_f64().ok_or("X缺失")?;
+                    let y = request["y"].as_f64().ok_or("Y缺失")?;
+                    let radius = request["radius"].as_f64().unwrap_or(2.0);
+                    let cells: Vec<_> = input.cells.iter().filter_map(|cell| {
+                        let point = [(f64::from(cell.x)+0.5)*input.resolution,(f64::from(cell.y)+0.5)*input.resolution,cell.ground];
+                        ((point[0]-x).hypot(point[1]-y)<=radius).then(||json!({"position":point,
+                            "ceiling":if cell.ceiling.is_finite(){Some(cell.ceiling)}else{None}}))
                     }).collect();
-                    Ok(json!({"cells":cells,"resolution":map.resolution}))
+                    Ok(json!({"cells":cells,"resolution":input.resolution}))
                 }
                 "pose" => {
                     let id = request["scene_id"].as_str().ok_or("场景缺失")?;
@@ -1600,19 +1569,6 @@ fn main() {
 mod tests {
     mod replan_feedback_tests { include!("replan_feedback_tests.rs"); }
     use super::*;
-
-    #[test]
-    fn local_planning_request_inherits_startup_or_accepts_only_a_boolean() {
-        for startup in [true,false] {
-            assert_eq!(request_local_planning_enabled(&json!({}),startup).unwrap(),startup);
-            for enabled in [true,false] {
-                assert_eq!(request_local_planning_enabled(&json!({"local_planning_enabled":enabled}),startup).unwrap(),enabled);
-            }
-            for invalid in [json!("false"),json!(0),json!(null)] {
-                assert!(request_local_planning_enabled(&json!({"local_planning_enabled":invalid}),startup).is_err());
-            }
-        }
-    }
 
     #[test]
     fn quaternion_scale_does_not_change_environment_orientation_or_motion() {

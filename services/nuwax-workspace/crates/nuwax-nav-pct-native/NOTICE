@@ -1,0 +1,38 @@
+Copyright (c) 2024 Bowen Yang <byangar@connect.ust.hk>, Jie Cheng <jchengai@connect.ust.hk>
+
+PCT_planner contains several third party libraries, with documentation of licensing
+and modifications as follows:
+
+- gtsam 4.1.1: Georgia Tech Smoothing and Mapping Library
+    - Removed unused cmake files and example data
+    - Licenced under BSD, provided in PCT_planner/planner/lib/3rdparty/gtsam-4.1.1/LICENSE.BSD
+- osqp: The Operator Splitting QP Solver
+    - Modified osqp/include/constants.h, osqp/include/osqp_configure.h
+    - Licenced under Apache License v 2.0, provided in PCT_planner/planner/lib/3rdparty/osqp/LICENSE
+- pybind11: Seamless operability between C++11 and Python
+    - Licenced provided in PCT_planner/planner/lib/3rdparty/pybind11/LICENSE
+
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation; either version 2 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License along
+with this program; if not, write to the Free Software Foundation, Inc.,
+51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+Nuwax本地适配（2026-10-20）：从PCT-SCAN-ROS2提交
+1cf45a1c12ca785ce533293302be09d51daf0ccb提取A*及公共路径数据类型；
+修改搜索状态、队列键、层连接、取消及真实机体输入适配。
+2026-10-21：删除本地查询期间生成未知参考面的扩展，只允许有效实测地面参与连通。
+本次直接复制a_star_search.h、a_star_search.cc及common/data_types.h；
+本地适配保留GPL-2.0-or-later许可。来源：https://github.com/yagami-light7/PCT-SCAN-ROS2。
+同一上游提交的pct_scan_bridge/clearance_cost.py净空软代价已移植为原生等价距离变换，
+保留preferred_clearance=0.5、clearance_cost=20.0、cost_threshold=20.0和步代价权重1.0；
+只影响既有可通行单元的搜索代价，不关闭窄通道。18组与原Python函数逐值一致。
+稀疏存储保留原空哨兵值，省略全空节点并裁去请求矩形中实际地面和原端点以外的空白；
+搜索邻居次序、层高、软代价、碰撞规则与路径判定不变。

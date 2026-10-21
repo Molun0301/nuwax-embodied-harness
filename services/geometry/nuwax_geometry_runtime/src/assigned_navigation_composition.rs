@@ -237,6 +237,7 @@ fn scene() -> Vec<Point3<f64>> {
 struct LiveSensor {
     stop: Arc<AtomicBool>, cloud_enabled: Arc<AtomicBool>,
     integrated: Arc<StdMutex<IntegratedActuator>>, task: Option<tokio::task::JoinHandle<()>>,
+    cloud_task: Option<tokio::task::JoinHandle<()>>,
 }
 impl LiveSensor {
     fn start(handle: GeometryRuntimeHandle, common: Arc<crate::lio_ingress::CommonLioIngress>,
@@ -247,6 +248,20 @@ impl LiveSensor {
         let cloud_enabled = Arc::new(AtomicBool::new(true));
         let integrated = Arc::new(StdMutex::new(IntegratedActuator::new()));
         let (stopping, clouds, simulation) = (stop.clone(),cloud_enabled.clone(),integrated.clone());
+        // 里程计保持实际采样节拍；点云处理消费最新真实帧，不串行拖住运动反馈。
+        let (cloud_tx, mut cloud_rx)=tokio::sync::watch::channel::<Option<crate::lio_ingress::AcceptedRegisteredCloud>>(None);
+        let cloud_handle=handle.clone();
+        let cloud_correction=correction.clone();
+        let cloud_task=tokio::spawn(async move {
+            while cloud_rx.changed().await.is_ok() {
+                let accepted=cloud_rx.borrow_and_update().clone();
+                if let Some(accepted)=accepted {
+                    crate::lcm_runtime::handoff_registered_lio_cloud_with_correction(
+                        &cloud_handle,&accepted,&cloud_correction).await
+                        .expect("真实点云经生产校正入口处理");
+                }
+            }
+        });
         let task = tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_millis(50));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -259,24 +274,45 @@ impl LiveSensor {
                     integrated.pose_at(monotonic_ns())
                 };
                 sequence += 1;
-                sensor_frame(&handle, &common, &correction, &applier, &world, pose, sequence,
-                    clouds.load(Ordering::Acquire)).await;
+                if let Some(accepted)=prepare_sensor_frame(&handle, &common, &applier, &world,
+                    pose,sequence,clouds.load(Ordering::Acquire)).await {
+                    cloud_tx.send_replace(Some(accepted));
+                }
             }
         });
-        Self { stop, cloud_enabled, integrated, task:Some(task) }
+        Self { stop, cloud_enabled, integrated, task:Some(task), cloud_task:Some(cloud_task) }
     }
     fn pose(&self) -> [f64;3] { self.integrated.lock().unwrap().pose_at(monotonic_ns()) }
     async fn finish(mut self) -> Result<(),String> {
         self.stop.store(true,Ordering::Release);
-        self.task.take().unwrap().await.map_err(|error|format!("live sensor failed: {error}"))
+        let pose=self.task.take().unwrap().await;
+        let cloud=self.cloud_task.take().unwrap().await;
+        pose.map_err(|error|format!("live sensor failed: {error}"))?;
+        cloud.map_err(|error|format!("live cloud failed: {error}"))
     }
 }
-impl Drop for LiveSensor { fn drop(&mut self) { self.stop.store(true,Ordering::Release); if let Some(task)=&self.task {task.abort();} } }
+impl Drop for LiveSensor {
+    fn drop(&mut self) {
+        self.stop.store(true,Ordering::Release);
+        if let Some(task)=&self.task {task.abort();}
+        if let Some(task)=&self.cloud_task {task.abort();}
+    }
+}
 
 async fn sensor_frame(handle: &GeometryRuntimeHandle, common: &crate::lio_ingress::CommonLioIngress,
     correction: &crate::correction_coordinator::CorrectionFrameIngress,
     applier: &crate::lcm_runtime::GeometryCanonicalCorrectionApplier,
     world: &[Point3<f64>], integrated: [f64;3], sequence: u64, cloud: bool) {
+    if let Some(accepted)=prepare_sensor_frame(handle,common,applier,world,integrated,sequence,cloud).await {
+        crate::lcm_runtime::handoff_registered_lio_cloud_with_correction(handle,&accepted,correction)
+            .await.expect("fresh registered sensor cloud through production correction ingress");
+    }
+}
+
+async fn prepare_sensor_frame(handle: &GeometryRuntimeHandle, common: &crate::lio_ingress::CommonLioIngress,
+    applier: &crate::lcm_runtime::GeometryCanonicalCorrectionApplier,
+    world: &[Point3<f64>], integrated: [f64;3], sequence: u64, cloud: bool)
+    -> Option<crate::lio_ingress::AcceptedRegisteredCloud> {
     let stamp = now_ns();
     let [x,y,yaw] = integrated;
     let mut odometry = schema::Odometry::default();
@@ -311,8 +347,9 @@ async fn sensor_frame(handle: &GeometryRuntimeHandle, common: &crate::lio_ingres
                 &handle.mapping_adapter.as_ref().unwrap().lock()).unwrap()
         };
         let accepted = common.accept_public_cloud(prepared.encoded_for_test().as_ref(),stamp as i64+2).unwrap();
-        crate::lcm_runtime::handoff_registered_lio_cloud_with_correction(handle,&accepted,correction)
-            .await.expect("fresh registered sensor cloud through production correction ingress");
+        Some(accepted)
+    } else {
+        None
     }
 }
 
@@ -417,7 +454,7 @@ async fn moving_evidence(ledger:&Arc<StdMutex<Ledger>>,sensor:&LiveSensor,guard:
     }
 }
 
-async fn run_composition(local_planning:bool,root:&Path) {
+async fn run_composition(root:&Path) {
     use crate::lcm_runtime::{prepare_geometry_runtime_for_pipeline,spawn_geometry_runtime,LcmBackendKind,ValidatedFrameBindings};
     use crate::proto::geometry_runtime_client::GeometryRuntimeClient;
     use crate::proto::geometry_runtime_server::GeometryRuntimeServer;
@@ -444,6 +481,11 @@ async fn run_composition(local_planning:bool,root:&Path) {
     service.activation_receipts=owner.phase_a_control().activated_target_receipts();
     service.relocalization_ingress=owner.relocalization_ingress();
     service.canonical_correction=Some(applier.clone());
+    // 与生产主入口一致，精细地图缺块通过同一LCM远程接口补取。
+    let rpc_context=handle.transport.shared_lcm_context().expect("真实LCM上下文");
+    let map_rpc=crate::rpc_runtime::serve_geometry_rpc(service.clone(),
+        Arc::new(nuwax_rpc::LcmRpcTransport::from_context(rpc_context)))
+        .await.expect("生产地图块远程接口");
     let source=CanonicalResetFixture::new().await;
     let observer=LcmTransport::new_real(&std::env::var("NUWAX_LCM_URL").unwrap()).unwrap();
     let readers=EvidenceReaders::start(&observer).await;
@@ -480,7 +522,7 @@ async fn run_composition(local_planning:bool,root:&Path) {
         let mut dense_input=source.service.graph_artifacts.lock().open(dense).unwrap();
         let mut dense_output=std::fs::File::create(root.join("dense-target.dc1")).unwrap();
         std::io::copy(&mut dense_input,&mut dense_output).unwrap();
-        transfer_assigned_checkpoint_member(&source.service,&service,fine,b"NUWAXAR2").await;
+        transfer_assigned_checkpoint_member(&source.service,&service,fine,b"NUWAXAR4").await;
         transfer_assigned_checkpoint_member(&source.service,&service,dense,b"NUWAXDC1").await;
         let activated=client.activate_map(ActivateMapRequest {
             activation_contract_version:2,activation_request_id:"composition-activate".into(),
@@ -522,7 +564,7 @@ async fn run_composition(local_planning:bool,root:&Path) {
         // Two fresh sensor observations of each footprint cell are mandatory;
         // readiness alone can become true before the second observed hit.
         tokio::time::sleep(Duration::from_millis(350)).await;
-        let id=if local_planning {"restored-on-arrival"} else {"restored-off-arrival"};
+        let id="restored-scan-arrival";
         let baseline=read_records::<Actuation>(&guard.root.join("actuator.jsonl")).len();
         let _admitted=submit_goal(&mut client,&guard.socket(),id,1.2,0.35).await;
         let goal=observed_goal(&readers.ledger,id).await;
@@ -554,8 +596,8 @@ async fn run_composition(local_planning:bool,root:&Path) {
         {
             let ledger=readers.ledger.lock().unwrap();
             let matching=ledger.states.iter().filter(|s|goal_state_matches(s,&goal)).collect::<Vec<_>>();
-            assert_eq!(matching.iter().any(|s|!s.local_path.is_empty()),local_planning,
-                "ON must admit an actual PlannerWorker/Scan candidate; OFF cannot display one");
+            assert!(matching.iter().any(|s|!s.local_path.is_empty()),
+                "必须显示原生SCAN实际计算的局部轨迹");
             assert!(ledger.paths.iter().any(|p|p.session_id==id && p.producer_runtime_generation==goal.producer_runtime_generation
                 && p.path_revision==arrived.path_revision && p.planner_runtime_generation==arrived.planner_runtime_generation),
                 "arrival consumes the exact production path identity");
@@ -563,12 +605,12 @@ async fn run_composition(local_planning:bool,root:&Path) {
                 "planner consumes restored fine-root publications");
         }
         let (path_count,map_count)={let ledger=readers.ledger.lock().unwrap();(ledger.paths.len(),ledger.maps.len())};
-        eprintln!("ASSIGNED_COMPOSITION arrival local_planning={local_planning} simulated_pose={actual:?} zero_ack={} paths={path_count} maps={map_count}",arrived.zero_ack_id);
+        eprintln!("ASSIGNED_COMPOSITION arrival local_planning=true simulated_pose={actual:?} zero_ack={} paths={path_count} maps={map_count}",arrived.zero_ack_id);
 
-        // A separate moving goal proves expiry stopping before cancellation.
+        // 独立移动目标证明来源自然到期会进入真实安全围栏。
         wait_ready(&mut client).await;
         let baseline=read_records::<Actuation>(&guard.root.join("actuator.jsonl")).len();
-        let admitted=submit_goal(&mut client,&guard.socket(),"restored-expiry",2.4,0.35).await;
+        let _admitted=submit_goal(&mut client,&guard.socket(),"restored-expiry",2.4,0.35).await;
         let expiry_goal=observed_goal(&readers.ledger,"restored-expiry").await;
         moving_evidence(&readers.ledger,live,&guard,&expiry_goal,baseline).await;
         let cut_time=now_ns();
@@ -576,12 +618,11 @@ async fn run_composition(local_planning:bool,root:&Path) {
         live.cloud_enabled.store(false,Ordering::Release);
         let cut=read_records::<Actuation>(&guard.root.join("actuator.jsonl")).len();
         let deadline=tokio::time::Instant::now()+Duration::from_secs_f64(OBSERVATION_TTL+5.0);
-        // Production receipt TTLs use a zero/indefinite sentinel. The finite
-        // observation guard can correctly hold an APPLIED zero twist without
-        // retiring the goal. Require that actual hold before requesting cancel.
-        let (held,zero_event)=loop {
+        // 近期来源到期沿生产SafetyFailed围栏终止目标，执行器通过zero()归零。
+        // 不能要求它伪造一条非空操作身份的普通零速命令。
+        let (expired,zero_event,last_source,maturity)=loop {
             let events:Vec<Actuation>=read_records(&guard.root.join("actuator.jsonl"));
-            let (maturity,state)={
+            let (last_source,maturity,state)={
                 let ledger=readers.ledger.lock().unwrap();
                 // Re-read the actual publication ledger each time: a final
                 // sensor frame already in flight at cutoff may publish later.
@@ -591,23 +632,27 @@ async fn run_composition(local_planning:bool,root:&Path) {
                 let maturity=last_source.saturating_add((OBSERVATION_TTL*1e9) as u64);
                 let state=ledger.states.iter().rev().find(|state| {
                     let stamp=state.stamp_sec as u64*1_000_000_000+state.stamp_nsec as u64;
-                    let expiry=state.message.to_lowercase().contains("stale") || state.message.contains("过期")
-                        || state.message.contains("时效") || state.message.contains("观察");
-                    goal_state_matches(state,&expiry_goal) && stamp>=cut_time && stamp>=maturity && expiry
-                        && (state.message.contains("零速") || state.message.contains("等待") || state.state==4)
+                    goal_state_matches(state,&expiry_goal) && stamp>=cut_time && stamp>=maturity
+                        && state.state==4
+                        && state.message=="SafetyFailed cause=StaleInput: recent obstacle source deadline elapsed"
+                        && !state.zero_ack_id.is_empty() && state.zero_applied_monotonic_ns>0
                 }).cloned();
-                (maturity,state)
+                (last_source,maturity,state)
             };
             let mature_monotonic=cut_monotonic.saturating_add(maturity.saturating_sub(cut_time));
             let zero=events.iter().skip(cut).rev().find(|event|event.twist==[0.0;3]
-                && !event.operation_id.is_empty() && event.at>=mature_monotonic).cloned();
+                && event.at>=mature_monotonic).cloned();
             if now_ns()>=maturity {
-                if let (Some(state),Some(zero))=(state,zero) {break (state,zero);}
+                if let (Some(state),Some(zero))=(state,zero) {
+                    assert!(state.zero_applied_monotonic_ns as u64>=zero.at,
+                        "精确停车回执不能早于实际执行器归零");
+                    break (state,zero,last_source,maturity);
+                }
             }
-            assert!(tokio::time::Instant::now()<deadline,"freshness expiry must hold zero before cancellation: {}",diagnostic(&readers.ledger,live));
+            assert!(tokio::time::Instant::now()<deadline,"来源到期必须完成真实安全围栏和精确归零: {}",diagnostic(&readers.ledger,live));
             tokio::time::sleep(Duration::from_millis(10)).await;
         };
-        assert_applied(&guard.socket(),&zero_event).await;
+        assert_exact_zero(&guard.socket(),&expired).await;
         tokio::time::sleep(Duration::from_millis(150)).await;
         live.integrated.lock().unwrap().consume(&guard.root.join("actuator.jsonl"));
         assert_eq!(live.integrated.lock().unwrap().command,[0.0;3],"expiry holds zero before cancel");
@@ -615,6 +660,25 @@ async fn run_composition(local_planning:bool,root:&Path) {
         assert!(quiet_events.iter().filter(|event|event.at>=zero_event.at)
             .all(|event|event.twist==[0.0;3]),"no nonzero burst is allowed after expiry hold and before cancellation");
         assert!((live.pose()[0]-2.4).abs()>POSITION_TOLERANCE,"expiry goal must not be mistaken for arrival");
+        eprintln!("ASSIGNED_COMPOSITION observation_expiry_fence source_ns={last_source} deadline_ns={maturity} terminal_ns={} actual_zero_monotonic_ns={} exact_zero_monotonic_ns={} reason={:?} exact_zero={}",
+            expired.stamp_sec as u64*1_000_000_000+expired.stamp_nsec as u64,zero_event.at,
+            expired.zero_applied_monotonic_ns,expired.message,expired.zero_ack_id);
+
+        // 真实新云恢复后另发活动目标，独立验证取消，不能取消已终止的到期目标冒充成功。
+        live.cloud_enabled.store(true,Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(5),async {
+            loop {
+                if readers.ledger.lock().unwrap().maps.iter().any(|map|!map.cleared
+                    && map.committed_map.session_id=="composition-restored"
+                    && map.source_timestamp_ns as u64>maturity) {break;}
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("恢复后的真实点云必须完成新来源发布");
+        wait_ready(&mut client).await;
+        let baseline=read_records::<Actuation>(&guard.root.join("actuator.jsonl")).len();
+        let admitted=submit_goal(&mut client,&guard.socket(),"restored-cancel",2.4,0.35).await;
+        let cancel_goal=observed_goal(&readers.ledger,"restored-cancel").await;
+        moving_evidence(&readers.ledger,live,&guard,&cancel_goal,baseline).await;
         let cancel=CancelNavigationRequest {goal_id:admitted.goal_id,
             owner_kind:admitted.owner_kind,parent_request_id:admitted.parent_request_id,
             goal_generation:admitted.goal_generation,producer_runtime_generation:admitted.producer_runtime_generation};
@@ -623,19 +687,20 @@ async fn run_composition(local_planning:bool,root:&Path) {
         let deadline=tokio::time::Instant::now()+Duration::from_secs(5);
         let terminal=loop {
             if let Some(state)=readers.ledger.lock().unwrap().states.iter().rev().find(|state|
-                goal_state_matches(state,&expiry_goal) && state.state==0 && state.message.starts_with("CANCELLED:")
+                goal_state_matches(state,&cancel_goal) && state.state==0 && state.message.starts_with("CANCELLED:")
                 && state.cancel_generation==pending.cancel_generation as i64
                 && !state.zero_ack_id.is_empty() && state.zero_applied_monotonic_ns>0).cloned() {break state;}
             assert!(tokio::time::Instant::now()<deadline,"cancel must produce exact terminal fence after prior zero hold: {}",diagnostic(&readers.ledger,live));
             tokio::time::sleep(Duration::from_millis(10)).await;
         };
         assert_exact_zero(&guard.socket(),&terminal).await;
+        assert_ne!(terminal.zero_ack_id,expired.zero_ack_id,"取消必须取得其独立围栏的精确停车回执");
         let cancelled=client.cancel_navigation(cancel).await.unwrap().into_inner();
         assert!(cancelled.actuator_zeroed,"cancel replay resolves only with actual zero: {cancelled:?}");
         assert_eq!(cancelled.zero_ack_id,terminal.zero_ack_id,"cancel replays exact terminal fence");
         assert_eq!(cancelled.zero_applied_monotonic_ns,terminal.zero_applied_monotonic_ns as u64);
-        eprintln!("ASSIGNED_COMPOSITION observation_expiry_hold local_planning={local_planning} reason={:?} applied_zero_operation={} cancellation_exact_zero={}",
-            held.message,zero_event.operation_id,terminal.zero_ack_id);
+        eprintln!("ASSIGNED_COMPOSITION cancellation_after_fresh_cloud local_planning=true cancellation_exact_zero={}",
+            terminal.zero_ack_id);
     }).catch_unwind().await;
     // Always settle the production resources, including on assertion failure.
     let mut cleanup_errors=Vec::new();
@@ -643,6 +708,7 @@ async fn run_composition(local_planning:bool,root:&Path) {
     let _=rpc_stop.send(());
     match rpc.await {Ok(Ok(()))=>{},other=>cleanup_errors.push(format!("tonic shutdown: {other:?}"))}
     if let Err(error)=runner.shutdown().await {cleanup_errors.push(format!("navigation shutdown: {error}"));}
+    if let Err(error)=crate::stop_rpc_servers(map_rpc).await {cleanup_errors.push(format!("地图块接口关闭: {error}"));}
     if let Err(error)=owner.shutdown().await {cleanup_errors.push(format!("correction shutdown: {error}"));}
     let shutdown=destination.task_owner.shutdown().await;
     if !shutdown.producers_settled() {cleanup_errors.push("geometry producers did not settle".into());}
@@ -667,7 +733,7 @@ async fn run_composition(local_planning:bool,root:&Path) {
 }
 async fn sample_position_x(handle:&GeometryRuntimeHandle)->f64 {handle.state.read().await.pose.x}
 
-fn isolated_case(name:&str,local_planning:bool) {
+fn isolated_case(name:&str) {
     if std::env::var(CHILD_MODE).as_deref()==Ok(name) {
         let _=tracing_subscriber::fmt().with_env_filter("warn,nuwax_nav_runtime=info,nuwax_nav_stack=info").try_init();
         let root=std::env::temp_dir().join(format!("assigned-nav-{}",uuid::Uuid::new_v4()));
@@ -681,11 +747,10 @@ fn isolated_case(name:&str,local_planning:bool) {
             ("NUWAX_FORBIDDEN_ZONES_PATH",root.join("forbidden.json").display().to_string()),
             ("NUWAX_NAV_BODY_TO_SUPPORT_Z_M","0.4".into()),("NUWAX_NAV_ROBOT_WIDTH_M","0.3".into()),
             ("NUWAX_NAV_ROBOT_HEIGHT_M","0.55".into()),("NUWAX_NAV_SURFACE_VOXEL_SIZE_M","0.1".into()),
-            ("NUWAX_ROBOT_GEOMETRY_JSON",BODY.into()),("NUWAX_NAV_CAPABILITIES_JSON",CAPABILITIES.into()),
-            ("NUWAX_NAV_LOCAL_PLANNING_ENABLED",local_planning.to_string())];
+            ("NUWAX_ROBOT_GEOMETRY_JSON",BODY.into()),("NUWAX_NAV_CAPABILITIES_JSON",CAPABILITIES.into())];
         for (key,value) in config {std::env::set_var(key,value);}
         let result=std::panic::catch_unwind(||tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap()
-            .block_on(run_composition(local_planning,&root)));
+            .block_on(run_composition(&root)));
         if result.is_ok() {std::fs::remove_dir_all(&root).unwrap();}
         else {eprintln!("ASSIGNED_COMPOSITION failure evidence retained at {}",root.display());}
         if let Err(panic)=result {std::panic::resume_unwind(panic);}
@@ -703,10 +768,6 @@ fn isolated_case(name:&str,local_planning:bool) {
     assert!(result.status.success(),"restored production composition subprocess failed: {}",result.status);
 }
 #[test]
-fn assigned_v2_restored_production_navigation_local_off_arrives_and_expiry_stops() {
-    isolated_case("assigned_v2_restored_production_navigation_local_off_arrives_and_expiry_stops",false);
-}
-#[test]
-fn assigned_v2_restored_production_navigation_local_on_arrives_and_expiry_stops() {
-    isolated_case("assigned_v2_restored_production_navigation_local_on_arrives_and_expiry_stops",true);
+fn assigned_v2_restored_production_navigation_scan_arrives_and_expiry_stops() {
+    isolated_case("assigned_v2_restored_production_navigation_scan_arrives_and_expiry_stops");
 }

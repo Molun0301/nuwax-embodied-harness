@@ -43,7 +43,7 @@ fn surface_view_ownership_profile() {
         // Full oracle/state comparisons are outside timing. This also verifies
         // score, ordering and all selected-view metadata against the frozen path.
         let mut reference = configure();
-        let expected = reference.legacy_poll_goal(&current);
+        let expected = reference.poll_goal(&current);
         let mut accepted = configure();
         let planning = receiver.freeze().unwrap().fork_for_planning();
         let before = committed(&accepted);

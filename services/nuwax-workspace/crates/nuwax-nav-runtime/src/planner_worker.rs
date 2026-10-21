@@ -32,17 +32,16 @@ struct Inputs {
     boundary: Vec<[f64;2]>,
     boundary_version: u64,
     path_version: u64,
-    goal: Option<(ExecutionGoal, nuwax_nav_types_messages::GoalOptions, Option<GroundInitialCapture>)>,
+    goal: Option<(ExecutionGoal, nuwax_nav_types_messages::GoalOptions)>,
     path: Option<Arc<Route>>,
     map: Option<ExecutionMap>,
     map_version: u64,
     map_pending: bool,
-    terrain_generation: u64,
-    result_terrain_generation: u64,
     pose: Option<PoseStamped>,
     pose_version: u64,
     requested: Option<f64>,
     control_width: Option<f64>,
+    control_period: Option<Duration>,
     applied: Twist2,
     applied_version: u64,
     result: Option<(std::time::Instant, PlannerStep)>,
@@ -62,24 +61,6 @@ struct Inputs {
     lifecycle_update: bool,
 }
 
-// A complete, continuous surface update can recheck the selected stopping
-// trajectory against its latest geometry instead of ranking every candidate
-// again. This never reuses an old collision answer or crosses an Unknown gap.
-fn recheckable_surface_update(previous:Option<&ExecutionMap>,next:&ExecutionMap)->bool {
-    let Some(previous)=previous else {return false;};
-    let previous=match previous {ExecutionMap::Surface(map)=>map,
-        ExecutionMap::SurfaceUpdate(update)=>&update.snapshot,_=>return false};
-    let ExecutionMap::SurfaceUpdate(update)=next else {return false;};
-    update.change_basis.as_ref().is_some_and(|basis|nuwax_nav_pct::same_source_geometry(previous,basis))
-        && surface_changes::same_query_semantics(previous,&update.snapshot)
-        && match update.changes.as_ref() {
-            surface_changes::SurfaceGeometryChanges::Empty =>
-                nuwax_nav_pct::same_source_geometry(previous,&update.snapshot),
-            surface_changes::SurfaceGeometryChanges::Columns {..} => true,
-            surface_changes::SurfaceGeometryChanges::Unknown => false,
-        }
-}
-
 // Only timestamps may advance without changing pose-derived authority. Preserve
 // signed-zero distinctions too: geometric projections can branch on their bits.
 fn same_pose(a: &PoseStamped, b: &PoseStamped) -> bool {
@@ -96,7 +77,7 @@ fn same_pose(a: &PoseStamped, b: &PoseStamped) -> bool {
 // body footprint and never grants motion. Source/path/goal/applied fences still
 // apply; Pending and negative outcomes cannot become success through this check.
 fn arrival_event_still_in_goal(input: &Inputs) -> bool {
-    let (Some(pose), Some((goal, options, _)), Some(path)) =
+    let (Some(pose), Some((goal, options)), Some(path)) =
         (&input.pose, &input.goal, &input.path) else { return false; };
     let (Some(goal),Some(path_goal))=(goal.as_body(),path.2.as_body()) else {return false;};
     if input.map.is_none() || validate_map_pose(pose, "odometry").is_err()
@@ -120,16 +101,6 @@ fn arrival_event_still_in_goal(input: &Inputs) -> bool {
             nuwax_nav_types_messages::same_finite_yaw(actual_yaw, goal_yaw)
         } else { yaw < options.yaw_tolerance_rad };
     position_ok && orientation_ok
-}
-
-fn requalify_ground_arrival(evidence:&Arc<GroundArrivalEvidence>,current:&ActualExecutionContext,
-    options:nuwax_nav_types_messages::GoalOptions)->PlannerStep {
-    let retired=!nuwax_nav_pct::same_source_geometry(&evidence.actual().source,&current.source)
-        || !surface_changes::same_query_semantics(&evidence.actual().source,&current.source);
-    match evidence.assess(current,options,nuwax_nav_types_messages::ArrivalBoundary::Strict,retired) {
-        nuwax_nav_types_messages::GoalRegionAssessment::OutsideRegion=>PlannerStep::Pending(Vec::new()),
-        _=>PlannerStep::GroundArrival(Arc::clone(evidence)),
-    }
 }
 
 /// 计算线程没有运动端，结果须经原调度器核对目标身份再执行。
@@ -178,15 +149,13 @@ impl PlannerWorker {
                         boundary_seq,
                         path,
                         map,
-                        mut map_seq,
-                        terrain_seq,
-                        replay,
-                        ground_replay,
+                        map_seq,
                         pose,
-                        mut pose_seq,
+                        pose_seq,
                         width,
+                        control_period,
                         applied,
-                        mut applied_seq,
+                        applied_seq,
                         admission_applied,
                     ) = {
                         let mut input = lock.lock().unwrap();
@@ -209,19 +178,6 @@ impl PlannerWorker {
                         }
                         input.lifecycle_update=false;
                         input.map_pending=false;
-                        let replay=input.result.as_ref().and_then(|(started,step)| {
-                            let PlannerStep::Command(command)=step else {return None;};
-                            (*command!=Twist2::ZERO && started.elapsed()<=DEFAULT_CONTROL_HORIZON
-                                && (input.result_map_version!=input.map_version
-                                    || input.result_pose_version!=input.pose_version
-                                    || input.result_applied_version!=input.applied_version)
-                                && input.result_terrain_generation==input.terrain_generation
-                                && input.result_boundary_version==input.boundary_version)
-                                .then_some((*started,*command,
-                                    input.result_pose_version!=input.pose_version
-                                        || input.result_applied_version!=input.applied_version,
-                                    input.result_dispatch_bound))
-                        });
                         (
                             input.epoch,
                             input.goal_id.clone(),
@@ -236,17 +192,10 @@ impl PlannerWorker {
                             // Planar maps own their cells; unchanged inputs need no deep copy.
                             if input.map_version != map_version { input.map.clone() } else { None },
                             input.map_version,
-                            input.terrain_generation,
-                            replay,
-                            input.result.as_ref().and_then(|(_,step)|match step {
-                                PlannerStep::GroundArrival(evidence)
-                                    if input.result_map_version==input.map_version
-                                        && input.result_boundary_version==input.boundary_version=>Some(Arc::clone(evidence)),
-                                _=>None,
-                            }),
-                            input.pose.clone(),
+                                input.pose.clone(),
                             input.pose_version,
                             input.requested.take(),
+                            input.control_period,
                             input.applied,
                             input.applied_version,
                             // A replacement may reject before this iteration's
@@ -262,11 +211,11 @@ impl PlannerWorker {
                             } else {None},
                         )
                     };
-                    let mut started = replay.map_or_else(std::time::Instant::now,|(started,_,_,_)|started);
-                    let mut rechecked=false;
+                    if let Some(period)=control_period {planner.set_control_period(period);}
+                    let started = std::time::Instant::now();
                     let mut inputs_consumed=false;
                     let mut admission_refusal_context=None;
-                    let mut consumed_applied=applied;
+                    let consumed_applied=applied;
                     #[cfg(test)] let compute_trace=width.map(|_| {
                         result_id=result_id.checked_add(1).expect("test worker result ID exhausted");
                         crate::command_proof_trace::ComputeScope::begin(crate::command_proof_trace::ComputeInputTrace {
@@ -280,11 +229,11 @@ impl PlannerWorker {
                     });
                     let span=tracing::info_span!("navigation.local",goal_id=%goal_id);
                     let _entered=span.enter();
-                    let mut computed = (|| -> Result<PlannerStep, RuntimeError> {
+                    let computed = (|| -> Result<PlannerStep, RuntimeError> {
                         if goal_seq != goal_version {
                             planner.stop();
-                            if let Some((goal, options, initial)) = &goal {
-                                planner.configure_execution_goal(goal, *options, initial.clone())?;
+                            if let Some((goal, options)) = &goal {
+                                planner.configure_execution_goal(goal, *options)?;
                             }
                             goal_version = goal_seq;
                             path_version = u64::MAX;
@@ -305,7 +254,7 @@ impl PlannerWorker {
                         if let Some(pose) = pose {
                             planner.update_odometry(pose);
                         }
-                        planner.consume_initial_actual_for_planning()?;
+
                         // 同一目标的新路径只替换路线，保留速度、制动及跟随状态。
                         if path_seq != path_version {
                             if let Some(path) = &path {
@@ -329,97 +278,10 @@ impl PlannerWorker {
                         }
                         planner.observe_applied_command(applied);
                         inputs_consumed=true;
-                        if let Some(evidence)=ground_replay.as_ref().filter(|_|width.is_some()) {
-                            let Some(context)=planner.refresh_execution_context(applied) else {
-                                return Ok(PlannerStep::Pending(Vec::new()));
-                            };
-                            let options=goal.as_ref().map(|(_,options,_)|*options)
-                                .ok_or_else(||RuntimeError::Planner("Ground arrival lost its goal".into()))?;
-                            return Ok(requalify_ground_arrival(evidence,&context,options));
-                        }
-                        if let Some((_,command,current_state,_))=replay.filter(|_| width.is_some()) {
-                            let checked=if current_state {planner.revalidate_selected_command_at_current_state(command)}
-                                else {planner.revalidate_selected_command(command)};
-                            if let Some(result)=checked {
-                                rechecked=true;return Ok(result);
-                            }
-                            // Unsupported planners retain their ordinary full-compute semantics.
-                            started=std::time::Instant::now();
-                        }
                         Ok(width.map_or(PlannerStep::Pending(Vec::new()),|width|planner.step(width)))
                     })()
                     .unwrap_or_else(|error| PlannerStep::ReplanRequired(error.to_string()));
-                    // Keep the original source bound even when later rechecks use
-                    // fresher evidence. A selected trajectory never renews its lease.
-                    let candidate_bound=planner.take_command_dispatch_bound();
-                    let mut dispatch_bound=match (replay.and_then(|r|r.3),candidate_bound) {
-                        (Some(a),Some(b))=>Some(a.earliest(b)),(a,b)=>a.or(b),
-                    };
-                    // Catch up only this selected trajectory, not candidate ranking.
-                    // Input reception remains independent of this geometry work.
-                    while matches!(computed,PlannerStep::Command(v) if v!=Twist2::ZERO)
-                        && started.elapsed()<=DEFAULT_CONTROL_HORIZON {
-                        let latest={
-                            let mut input=lock.lock().unwrap();
-                            if input.epoch==version && input.boundary_version==boundary_seq && !input.closed
-                                && input.terrain_generation==terrain_seq
-                                && (input.map_version!=map_seq || input.pose_version!=pose_seq
-                                    || input.applied_version!=applied_seq) {
-                                input.map_pending=false;
-                                Some((input.map_version,
-                                    if input.map_version != map_seq { input.map.clone() } else { None },
-                                    input.pose_version,input.pose.clone(),
-                                    input.applied_version,input.applied))
-                            } else {None}
-                        };
-                        let Some((sequence,map,latest_pose_seq,pose,latest_applied_seq,applied))=latest else {break;};
-                        if sequence!=map_seq {
-                            if let Some(map)=map {if let Err(error)=planner.update_execution_map(map) {
-                                computed=PlannerStep::ReplanRequired(error.to_string());break;
-                            }}
-                            map_version=sequence;
-                        }
-                        let current_state=latest_pose_seq!=pose_seq || latest_applied_seq!=applied_seq;
-                        if current_state {
-                            if let Some(pose)=pose {planner.update_odometry(pose);}
-                            planner.observe_applied_command(applied);
-                        }
-                        let PlannerStep::Command(command)=computed else {unreachable!()};
-                        let checked=if current_state {planner.revalidate_selected_command_at_current_state(command)}
-                            else {planner.revalidate_selected_command(command)};
-                        let Some(checked)=checked else {break;};
-                        if let Some(bound)=planner.take_command_dispatch_bound() {
-                            dispatch_bound=Some(dispatch_bound.map_or(bound,|old|old.earliest(bound)));
-                        }
-                        computed=checked;map_seq=sequence;pose_seq=latest_pose_seq;applied_seq=latest_applied_seq;
-                        consumed_applied=applied;rechecked=true;
-                    }
-                    // Ground terminal requalification uses the existing compute
-                    // thread. Only immutable snapshots cross the input lock;
-                    // source selection never runs while that lock is held.
-                    while matches!(computed,PlannerStep::GroundArrival(_)) {
-                        let latest={
-                            let input=lock.lock().unwrap();
-                            // Keep the original map/boundary fences. A source
-                            // update retires this result instead of relabelling
-                            // its old terminal/capture as a new-source event.
-                            if input.epoch==version && input.boundary_version==boundary_seq && !input.closed
-                                && input.map_version==map_seq
-                                && (input.pose_version!=pose_seq || input.applied_version!=applied_seq) {
-                                Some((input.pose_version,input.pose.clone(),input.applied_version,input.applied))
-                            } else {None}
-                        };
-                        let Some((latest_pose_seq,pose,latest_applied_seq,applied))=latest else {break;};
-                        if let Some(pose)=pose {planner.update_odometry(pose);}
-                        planner.observe_applied_command(applied);
-                        let PlannerStep::GroundArrival(evidence)=&computed else {unreachable!()};
-                        computed=match planner.refresh_execution_context(applied).zip(goal.as_ref()) {
-                            Some((context,(_,options,_)))=>requalify_ground_arrival(evidence,&context,*options),
-                            None=>PlannerStep::Pending(Vec::new()),
-                        };
-                        pose_seq=latest_pose_seq;applied_seq=latest_applied_seq;
-                        consumed_applied=applied;
-                    }
+                    let mut dispatch_bound=planner.take_command_dispatch_bound();
                     #[cfg(test)] let computed_proof=compute_trace.and_then(|trace|trace.finish(&computed));
                     if !matches!(&computed,PlannerStep::Command(v) if *v!=Twist2::ZERO) {dispatch_bound=None;}
                     // Geometry stays on this worker, outside the input lock. Bind
@@ -460,11 +322,10 @@ impl PlannerWorker {
                         && input.applied_version == applied_seq
                         && input.map_version == map_seq
                         && input.boundary_version == boundary_seq
-                        && (!(rechecked || matches!(computed,PlannerStep::Command(v) if v!=Twist2::ZERO))
+                        && (!matches!(computed,PlannerStep::Command(v) if v!=Twist2::ZERO)
                             || input.pose_version == pose_seq)
                         && (!matches!(computed, PlannerStep::ReplanRequired(_) | PlannerStep::Failed(_))
                             || input.pose_version == pose_seq)
-                        && (!matches!(computed,PlannerStep::GroundArrival(_)) || input.pose_version==pose_seq)
                         && !input.closed;
                     // 换目标、换路径、取消或来源撤销后的迟到结果一律退休。
                     if current {
@@ -489,10 +350,6 @@ impl PlannerWorker {
                         input.result_pose_version = pose_seq;
                         input.result_applied_version = applied_seq;
                         input.result_map_version = map_seq;
-                        input.result_terrain_generation=terrain_seq;
-                        if rechecked && input.pose_version==pose_seq {
-                            input.requested=None;input.lifecycle_update=false;
-                        }
                         input.result_boundary_version = boundary_seq;
                         input.result_wait_reason = wait_reason;
                         input.display_path = display_path;
@@ -526,6 +383,9 @@ impl PlannerWorker {
     }
 }
 impl NavPlanner for PlannerWorker {
+    fn set_control_period(&mut self,period:Duration) {
+        self.shared.0.lock().unwrap().control_period=Some(period);
+    }
     fn refresh_execution_context(&mut self, applied: Twist2) -> Option<Arc<ActualExecutionContext>> {
         // Setters/stop already request the lifecycle refresh. Reading a snapshot
         // never runs terrain work or creates another timer/control request.
@@ -556,10 +416,10 @@ impl NavPlanner for PlannerWorker {
         goal: &PoseStamped,
         options: nuwax_nav_types_messages::GoalOptions,
     ) -> Result<(), RuntimeError> {
-        self.configure_execution_goal(&ExecutionGoal::Body(goal.clone()),options,None)
+        self.configure_execution_goal(&ExecutionGoal::Body(goal.clone()),options)
     }
     fn configure_execution_goal(&mut self,goal:&ExecutionGoal,
-        options:nuwax_nav_types_messages::GoalOptions,initial:Option<GroundInitialCapture>)
+        options:nuwax_nav_types_messages::GoalOptions)
         ->Result<(),RuntimeError> {
         self.delivered_dispatch_bound=None;
         self.delivered_execution_context=None;
@@ -576,7 +436,7 @@ impl NavPlanner for PlannerWorker {
         input.path = None;
         input.goal_version += 1;
         input.path_version += 1;
-        input.goal = Some((goal.clone(), options, initial));
+        input.goal = Some((goal.clone(), options));
         input.lifecycle_update = true;
         self.shared.1.notify_one();
         Ok(())
@@ -620,8 +480,7 @@ impl NavPlanner for PlannerWorker {
             // Refresh an unissued selection ahead of the next control tick.
             // This is one trajectory check; unchanged timestamp-only receipts
             // neither invalidate nor re-enumerate the selected candidate.
-            if input.result.as_ref().is_some_and(|(_,step)|matches!(step,PlannerStep::Command(c) if *c!=Twist2::ZERO)
-                || matches!(step,PlannerStep::GroundArrival(_))) {
+            if input.result.as_ref().is_some_and(|(_,step)|matches!(step,PlannerStep::Command(c) if *c!=Twist2::ZERO)) {
                 input.requested=input.control_width;
             }
             input.lifecycle_update=true;
@@ -636,7 +495,6 @@ impl NavPlanner for PlannerWorker {
         self.delivered_dispatch_bound=None;
         self.delivered_execution_context=None;
         let mut input = self.shared.0.lock().unwrap();
-        let recheckable=recheckable_surface_update(input.map.as_ref(),&map);
         let map = match (input.map_pending, input.map.as_ref(), map) {
             (true, Some(ExecutionMap::SurfaceUpdate(previous)), ExecutionMap::SurfaceUpdate(next)) => {
                 let mut merged=previous.clone();merged.append(next);ExecutionMap::SurfaceUpdate(merged)
@@ -649,13 +507,6 @@ impl NavPlanner for PlannerWorker {
             }
             (_, _, map) => map,
         };
-        // Individually complete batches may coalesce beyond the existing delta
-        // budget, or span an unconsumed legacy snapshot. Fence that resulting
-        // Unknown too; the current check cannot inherit a lost source chain.
-        if !recheckable || matches!(&map,ExecutionMap::SurfaceUpdate(update)
-            if matches!(update.changes.as_ref(),surface_changes::SurfaceGeometryChanges::Unknown)) {
-            input.terrain_generation+=1;
-        }
         input.map = Some(map);
         input.map_pending = true;
         input.map_version += 1;
@@ -744,12 +595,11 @@ impl NavPlanner for PlannerWorker {
                     || input.result_applied_version!=input.applied_version));
         let arrival_changed = input.result.as_ref().is_some_and(|(_, step)|
             (matches!(step, PlannerStep::Succeeded) && input.result_pose_version != input.pose_version
-                && !arrival_event_still_in_goal(&input))
-                || (matches!(step,PlannerStep::GroundArrival(_)) && input.result_pose_version!=input.pose_version));
+                && !arrival_event_still_in_goal(&input)));
         let terminal_changed = input.result.as_ref().is_some_and(|(_, step)|
             (matches!(step, PlannerStep::ReplanRequired(_) | PlannerStep::Failed(_))
                 && input.result_pose_version != input.pose_version)
-            || (matches!(step, PlannerStep::Succeeded | PlannerStep::GroundArrival(_) | PlannerStep::ReplanRequired(_) | PlannerStep::Failed(_))
+            || (matches!(step, PlannerStep::Succeeded | PlannerStep::ReplanRequired(_) | PlannerStep::Failed(_))
                 && input.result_applied_version != input.applied_version));
         // A stored result authorizes only the exact map and boundary it consumed.
         let source_changed = input.result.is_some()
@@ -771,7 +621,7 @@ impl NavPlanner for PlannerWorker {
                 // 不能因计算慢而把这些结论吞成永远运行中的零速度。
                 match step {
                     PlannerStep::Command(_) => started.elapsed() <= DEFAULT_CONTROL_HORIZON,
-                    PlannerStep::Succeeded | PlannerStep::GroundArrival(_) => !arrival_changed,
+                    PlannerStep::Succeeded => !arrival_changed,
                     _ => true,
                 }
             })
@@ -901,10 +751,7 @@ mod tests {
     include!("yaw_zero_worker_tests.rs");
     use super::*;
     mod path_retirement_facts { include!("worker_path_retirement_facts.rs"); }
-    include!("worker_first_delivery_tests.rs");
-    include!("worker_geometry_recheck_tests.rs");
     mod snapshot_tests { use super::*; include!("worker_snapshot_tests.rs"); }
-    include!("worker_recent_recheck_tests.rs");
     use nuwax_nav_mls_planner::SurfaceBodyEnvelope;
     use nuwax_nav_types_messages::{
         GoalOptions, MotionKinematics, MotionModel, NavFrameId, Path3D, Point3, Pose3,
@@ -1000,7 +847,7 @@ mod tests {
         }
         fn replace_with_disconnected_path(&mut self) {
             self.worker.replace_execution_path(ExecutionPath::Surface(Path3D {
-                poses:vec![route_pose(100.0,1),route_pose(101.0,1)],
+                poses:vec![],
             }),None,route_pose(3.0,1)).unwrap();
             let _=self.worker.step(0.3);
         }
@@ -1009,7 +856,7 @@ mod tests {
             wait_for_source_result(&self.worker);
             let result=self.worker.step(0.3);
             assert!(matches!(result,PlannerStep::ReplanRequired(ref reason)
-                if reason.contains("新路径首段不能与当前三维机体位置连续接续")),"{result:?}");
+                if reason.contains("参考路径为空")),"{result:?}");
             assert_eq!(self.steps.load(std::sync::atomic::Ordering::SeqCst),0);
             assert!(!self.events.lock().unwrap().contains(&"applied"),
                 "admission refusal must still precede this iteration's observe_applied");
@@ -1142,7 +989,7 @@ mod tests {
         assert!(worker.refresh_execution_context(moving).is_none());
         worker.observe_applied_command(Twist2::ZERO);
         let stopped_lifecycle=wait_for_feedback(&mut worker,0.5,Twist2::ZERO);
-        assert_eq!(before.ground,stopped_lifecycle.ground,"stop must retain carried ground");
+        assert_eq!(before.odometry,stopped_lifecycle.odometry,"停止保留实际位姿");
         worker.update_odometry(route_pose(0.6,1));
         let actual=wait_for_feedback(&mut worker,0.6,Twist2::ZERO);
         assert!(actual.source.same_body_query_view(&before.source));
@@ -1225,7 +1072,7 @@ mod tests {
         assert_eq!(stopped,rejected);
         worker.stop();
         assert_eq!(stopped.applied,Twist2::ZERO);
-        assert_eq!(stopped.ground,rejected.ground);
+        assert_eq!(stopped.odometry,rejected.odometry);
     }
 
     #[test]
@@ -1267,12 +1114,12 @@ mod tests {
     #[test]
     fn selective_worker_coalesces_undelivered_related_and_far_columns() {
         use crate::surface_changes::{SurfaceGeometryChanges,SurfaceMapUpdate};
-        let mut harness=RouteWorkerHarness::new(true);
+        let mut harness=RouteWorkerHarness::new();
         let _=harness.worker.step(0.3);
         let _=harness.next_computation(); // Owner is now held after a real guarded step.
         let source=harness.clear.clone();
         for columns in [vec![[10,10]],vec![[100,100]],vec![[110,100]]] {
-            harness.worker.update_execution_map(ExecutionMap::SurfaceUpdate(SurfaceMapUpdate {planar_reference:None,
+            harness.worker.update_execution_map(ExecutionMap::SurfaceUpdate(SurfaceMapUpdate {
                 snapshot:source.clone(),change_basis:Some(source.clone()),
                 changes:Arc::new(SurfaceGeometryChanges::Columns {fine_size:source.source_voxel_size_m(),
                     fine:columns,planner_size:source.config().voxel_size,coarse:vec![]}),
@@ -1301,7 +1148,6 @@ mod tests {
     // Only publication is gated. Every input, actual geometry query, route update
     // and command below goes through the production RouteFollower/SurfaceFollower.
     struct GatedRouteFollower {
-        refresh_gate: Option<D06RefreshGate>,
         inner: crate::RouteFollower,
         computed: std::sync::mpsc::Sender<RouteComputation>,
         release: std::sync::mpsc::Receiver<()>,
@@ -1313,9 +1159,8 @@ mod tests {
     }
     impl NavPlanner for GatedRouteFollower {
 
-        fn configure_execution_goal(&mut self, goal: &ExecutionGoal, options: GoalOptions,
-            initial: Option<GroundInitialCapture>) -> Result<(), RuntimeError> {
-            self.inner.configure_execution_goal(goal, options, initial)?;
+        fn configure_execution_goal(&mut self, goal: &ExecutionGoal, options: GoalOptions) -> Result<(), RuntimeError> {
+            self.inner.configure_execution_goal(goal, options)?;
             self.goal_updates += 1;
             Ok(())
         }
@@ -1325,26 +1170,10 @@ mod tests {
             self.path_updates += 1;
             Ok(())
         }
-        fn consume_initial_actual_for_planning(&mut self) -> Result<(), RuntimeError> {
-            self.inner.consume_initial_actual_for_planning()
-        }
+
         fn refresh_execution_context(&mut self, applied: Twist2)
             -> Option<Arc<ActualExecutionContext>> {
-            // The one-shot barrier surrounds only this genuine delegated refresh. It
-            // neither supplies a context nor changes the result/event/owner relation.
-            let gated = self.refresh_gate.as_ref().is_some_and(|gate|
-                gate.armed.swap(false, std::sync::atomic::Ordering::AcqRel));
-            if gated {
-                let gate = self.refresh_gate.as_ref().unwrap();
-                let _ = gate.entered.send(std::thread::current().id());
-                // Disconnection or timeout releases cleanup; neither changes geometry.
-                let _ = gate.release.recv_timeout(Duration::from_secs(15));
-            }
-            let context = self.inner.refresh_execution_context(applied);
-            if gated {
-                let _ = self.refresh_gate.as_ref().unwrap().returned.send(context.clone());
-            }
-            context
+            self.inner.refresh_execution_context(applied)
         }
 
         fn take_command_dispatch_bound(&mut self)->Option<CommandDispatchBound> {self.inner.take_command_dispatch_bound()}
@@ -1382,9 +1211,6 @@ mod tests {
         fn observe_applied_command(&mut self, command: Twist2) {
             self.inner.observe_applied_command(command);
         }
-        fn revalidate_selected_command_at_current_state(&mut self,c:Twist2)->Option<PlannerStep> {
-            self.inner.revalidate_selected_command_at_current_state(c)
-        }
         fn execution_wait_reason(&self) -> Option<String> { self.inner.execution_wait_reason() }
         fn local_path_for_display(&self) -> Vec<[f64; 3]> { self.inner.local_path_for_display() }
         fn step(&mut self, width: f64) -> PlannerStep {
@@ -1420,7 +1246,7 @@ mod tests {
         clear: Arc<SurfaceSnapshot>,
     }
     impl RouteWorkerHarness {
-        fn new(local_planning_enabled: bool) -> Self {
+        fn new() -> Self {
             let clear = Arc::new(crate::surface_follower::test_snapshot(0.0, false)
                 .with_body_envelope(SurfaceBodyEnvelope {
                     fixed_collision: None,
@@ -1430,7 +1256,6 @@ mod tests {
                     max_cross_slope_deg: 18.0, support_uncertainty_m: 0.0,
                 }).unwrap());
             let mut config = crate::SurfaceFollowerConfig::new(0.4);
-            config.local_planning_enabled = local_planning_enabled;
             config.controller.simulation = true;
             config.basic_kinematics = Some(MotionKinematics {
                 model: MotionModel::Differential, max_forward_mps: 1.0,
@@ -1440,7 +1265,6 @@ mod tests {
             let (computed, receive) = std::sync::mpsc::channel();
             let (release, wait) = std::sync::mpsc::channel();
             let mut worker = PlannerWorker::new(GatedRouteFollower {
-                refresh_gate: None,
                 inner: crate::RouteFollower::new(config).unwrap(),
                 computed, release: wait, map: None, boundary: Vec::new(), odometry: None,
                 goal_updates: 0, path_updates: 0,
@@ -1489,30 +1313,29 @@ mod tests {
             pose: Pose3 { position: Point3::new(x, 1.0, 0.5), orientation: Quaternion::IDENTITY },
         }
     }
-    fn assert_positive_route_computation(computed: &RouteComputation, local_planning_enabled: bool) {
+    fn assert_positive_route_computation(computed: &RouteComputation) {
         assert!(matches!(computed.outcome, PlannerStep::Command(command) if command.linear.x > 0.0),
-            "clear terrain must actually produce forward motion in mode {local_planning_enabled}: {:?}", computed.outcome);
-        assert_eq!(computed.local_planning_calls > 0, local_planning_enabled);
-        assert_eq!(!computed.display_path.is_empty(), local_planning_enabled);
+            "原生执行必须在可行场景产生前进命令：{:?}", computed.outcome);
+        assert!(computed.local_planning_calls > 0);
+        assert!(!computed.display_path.is_empty());
     }
-    fn assert_blocked_route_computation(computed: &RouteComputation, harness: &RouteWorkerHarness, map_changed: bool, local_planning_enabled: bool) {
+    fn assert_blocked_route_computation(computed: &RouteComputation, harness: &RouteWorkerHarness, map_changed: bool) {
         assert!(matches!(computed.outcome, PlannerStep::Command(command) if command == Twist2::ZERO)
             || matches!(computed.outcome, PlannerStep::Pending(_) | PlannerStep::ReplanRequired(_)),
             "the real follower must not move through the replacement source: {:?}", computed.outcome);
         assert_eq!(computed.odometry.stamp.nanos, route_pose(0.5, 1).stamp.nanos);
         assert_eq!(Arc::ptr_eq(&computed.map, &harness.clear), !map_changed);
         assert_eq!(computed.boundary.is_empty(), map_changed);
-        if !local_planning_enabled { assert_eq!(computed.local_planning_calls, 0); }
     }
 
     #[test]
-    fn both_route_modes_reject_stored_positive_commands_after_map_or_boundary_changes() {
-        for local_planning_enabled in [true, false] {
+    fn native_route_reject_stored_positive_commands_after_map_or_boundary_changes() {
+        {
             for map_changed in [true, false] {
-                let mut harness = RouteWorkerHarness::new(local_planning_enabled);
+                let mut harness = RouteWorkerHarness::new();
                 harness.worker.step(0.3);
                 let clear = harness.next_computation();
-                assert_positive_route_computation(&clear, local_planning_enabled);
+                assert_positive_route_computation(&clear);
                 harness.release.send(()).unwrap();
                 wait_for_source_result(&harness.worker);
                 // Keep this positive publication unconsumed: this test isolates
@@ -1521,7 +1344,7 @@ mod tests {
                 let goal_version = harness.worker.shared.0.lock().unwrap().goal_version;
                 harness.change_source(map_changed);
                 let blocked = harness.next_computation();
-                assert_blocked_route_computation(&blocked, &harness, map_changed, local_planning_enabled);
+                assert_blocked_route_computation(&blocked, &harness, map_changed);
                 {
                     let mut input = harness.worker.shared.0.lock().unwrap();
                     assert_eq!(input.goal_version, goal_version, "a source update must preserve the goal");
@@ -1538,21 +1361,21 @@ mod tests {
     }
 
     #[test]
-    fn both_route_modes_retire_inflight_results_after_map_or_boundary_changes() {
-        for local_planning_enabled in [true, false] {
+    fn native_route_retire_inflight_results_after_map_or_boundary_changes() {
+        {
             for map_changed in [true, false] {
-                let mut harness = RouteWorkerHarness::new(local_planning_enabled);
+                let mut harness = RouteWorkerHarness::new();
                 harness.worker.step(0.3);
                 let clear = harness.next_computation();
-                assert_positive_route_computation(&clear, local_planning_enabled);
+                assert_positive_route_computation(&clear);
                 harness.change_source(map_changed);
                 harness.release.send(()).unwrap();
                 // No new step/applied-command call: source replacement itself
                 // must wake the worker and retire the already-computed command.
                 let blocked = harness.next_computation();
-                assert_blocked_route_computation(&blocked, &harness, map_changed, local_planning_enabled);
+                assert_blocked_route_computation(&blocked, &harness, map_changed);
                 assert!(harness.worker.shared.0.lock().unwrap().result.is_none(),
-                    "late command from the old source was published in mode {local_planning_enabled}");
+                    "旧来源的迟到命令不得发布");
                 assert!(harness.worker.local_path_for_display().is_empty());
                 harness.release.send(()).unwrap();
                 wait_for_source_result(&harness.worker);
@@ -1563,12 +1386,12 @@ mod tests {
     }
 
     #[test]
-    fn both_route_modes_retire_inflight_commands_on_cancel_without_replacement() {
-        for local_planning_enabled in [true, false] {
-            let mut harness = RouteWorkerHarness::new(local_planning_enabled);
+    fn native_route_retire_inflight_commands_on_cancel_without_replacement() {
+        {
+            let mut harness = RouteWorkerHarness::new();
             harness.worker.step(0.3);
             let old = harness.next_computation();
-            assert_positive_route_computation(&old, local_planning_enabled);
+            assert_positive_route_computation(&old);
             harness.worker.stop();
             {
                 let input = harness.worker.shared.0.lock().unwrap();
@@ -1589,7 +1412,6 @@ mod tests {
             assert_eq!(cancelled.goal_updates, 1);
             assert_eq!(cancelled.path_updates, 1);
             assert!(cancelled.odometry.stamp.nanos > old.odometry.stamp.nanos);
-            if !local_planning_enabled { assert_eq!(cancelled.local_planning_calls, 0); }
             let input = harness.worker.shared.0.lock().unwrap();
             assert_eq!(input.epoch, cancelled_epoch);
             assert!(input.result.is_none(), "the cancelled route's late command was published");
@@ -1598,12 +1420,12 @@ mod tests {
     }
 
     #[test]
-    fn both_route_modes_retire_inflight_commands_on_same_goal_path_replacement() {
-        for local_planning_enabled in [true, false] {
-            let mut harness = RouteWorkerHarness::new(local_planning_enabled);
+    fn native_route_retire_inflight_commands_on_same_goal_path_replacement() {
+        {
+            let mut harness = RouteWorkerHarness::new();
             harness.worker.step(0.3);
             let old = harness.next_computation();
-            assert_positive_route_computation(&old, local_planning_enabled);
+            assert_positive_route_computation(&old);
             let old_epoch = harness.worker.shared.0.lock().unwrap().epoch;
             let goal = route_pose(3.0, 1);
             let start = route_pose(0.5, 1);
@@ -1615,7 +1437,7 @@ mod tests {
             assert_eq!(harness.worker.step(0.3), PlannerStep::Pending(Vec::new()));
             harness.release.send(()).unwrap();
             let replacement = harness.next_computation();
-            assert_positive_route_computation(&replacement, local_planning_enabled);
+            assert_positive_route_computation(&replacement);
             assert_eq!(replacement.goal_updates, 1);
             assert_eq!(replacement.path_updates, 2);
             assert!(replacement.odometry.stamp.nanos > old.odometry.stamp.nanos);
@@ -1632,10 +1454,10 @@ mod tests {
     // release. The timeout only bounds a failed test's Drop; ordering uses channels.
     #[test]
     fn stop_then_new_goal_and_path_before_old_compute_returns_installs_latest_inputs() {
-        for enabled in [false,true] {
-            let mut harness=RouteWorkerHarness::new(enabled);
+        {
+            let mut harness=RouteWorkerHarness::new();
             harness.worker.step(0.3);
-            let old=harness.next_computation();assert_positive_route_computation(&old,enabled);
+            let old=harness.next_computation();assert_positive_route_computation(&old);
             harness.worker.stop();
             let goal=route_pose(4.0,1);
             harness.worker.configure_goal(&goal,GoalOptions::default()).unwrap();
@@ -1645,7 +1467,7 @@ mod tests {
             harness.worker.step(0.3);
             harness.release.send(()).unwrap();
             let latest=harness.next_computation();
-            assert_positive_route_computation(&latest,enabled);
+            assert_positive_route_computation(&latest);
             assert_eq!(latest.goal_updates,old.goal_updates+1);
             assert_eq!(latest.path_updates,old.path_updates+1);
             harness.release.send(()).unwrap();
@@ -2310,7 +2132,7 @@ mod tests {
 
     #[test]
     fn real_computed_arrival_survives_in_tolerance_pose_jitter() {
-        let mut harness = RouteWorkerHarness::new(false);
+        let mut harness = RouteWorkerHarness::new();
         harness.worker.step(0.3);
         harness.next_computation();
         harness.release.send(()).unwrap();
@@ -2533,41 +2355,24 @@ mod tests {
     }
     #[test]
     fn lifecycle_stop_reaches_inner_owner_without_another_control_tick() {
-        use crate::planning_owner::PlanningOwner;
-        struct Probe {
-            owner: PlanningOwner<(),()>,
-            stopped: std::sync::mpsc::Sender<()>,
-            steps: Arc<std::sync::atomic::AtomicUsize>,
-        }
+        struct Probe {stopped:std::sync::mpsc::Sender<()>,steps:Arc<std::sync::atomic::AtomicUsize>}
         impl NavPlanner for Probe {
             fn replace_path(&mut self,_:Path2D) {}
             fn update_odometry(&mut self,_:PoseStamped) {}
             fn update_costmap(&mut self,_:CostMap2D) {}
-            fn step(&mut self,_:f64)->PlannerStep {
-                self.steps.fetch_add(1,Ordering::SeqCst);self.owner.submit(1,());PlannerStep::Pending(Vec::new())
-            }
-            fn stop(&mut self) {self.owner.cancel();let _=self.stopped.send(());}
+            fn step(&mut self,_:f64)->PlannerStep {self.steps.fetch_add(1,Ordering::SeqCst);PlannerStep::Pending(Vec::new())}
+            fn stop(&mut self) {let _=self.stopped.send(());}
         }
-        let (started,starts)=std::sync::mpsc::channel();
-        let (cancelled,cancels)=std::sync::mpsc::channel();
         let (stopped,stops)=std::sync::mpsc::channel();
         let steps=Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let owner=PlanningOwner::new(move |_,token:&crate::planning_owner::Cancellation| {
-            started.send(()).unwrap();
-            let deadline=std::time::Instant::now()+Duration::from_secs(3);
-            while !token.cancelled() && std::time::Instant::now()<deadline {std::thread::sleep(Duration::from_millis(1));}
-            assert!(token.cancelled());cancelled.send(()).unwrap();
-        }).unwrap();
-        let mut worker=PlannerWorker::new(Probe{owner,stopped,steps:steps.clone()}).unwrap();
-        worker.step(0.3);starts.recv_timeout(Duration::from_secs(1)).unwrap();
+        let mut worker=PlannerWorker::new(Probe{stopped,steps:steps.clone()}).unwrap();
+        worker.step(0.3);wait_for_source_result(&worker);
         while stops.try_recv().is_ok() {}
-        worker.stop();
-        stops.recv_timeout(Duration::from_secs(1)).unwrap();
-        cancels.recv_timeout(Duration::from_secs(1)).unwrap();
+        worker.stop();stops.recv_timeout(Duration::from_secs(1)).unwrap();
         worker.update_costmap(CostMap2D::new_all_free("map",2,2,0.1));
-        worker.configure_boundary(&[[0.0,0.0],[1.0,0.0],[0.0,1.0]]);
+        worker.configure_boundary(&[[0.,0.],[1.,0.],[0.,1.]]);
         std::thread::sleep(Duration::from_millis(20));
-        assert_eq!(steps.load(Ordering::SeqCst),1,"source updates cannot restart stopped control");
+        assert_eq!(steps.load(Ordering::SeqCst),1,"来源更新不能重启已停止的控制");
         assert!(worker.shared.0.lock().unwrap().result.is_none());
     }
 
@@ -2617,98 +2422,6 @@ mod tests {
 
     /// Diagnostic falsifier: static evidence and a held next publication isolate
     /// command replay from source construction rate and from planner CPU work.
-    fn run_replay_proof_falsifier(initial_speed:f64) {
-        use nuwax_nav_mls_planner::{SurfaceObservation,SurfaceObservations};
-        use nuwax_nav_types_messages::{MotionLimits,Point2};
-        use nuwax_nav_control::PlanarPose;
-        let unix_ns=||std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64;
-        let stamped=|x:f64| {let mut p=route_pose(x,0);let ns=unix_ns();p.stamp=Timestamp::from_unix((ns/1_000_000_000)as i64,(ns%1_000_000_000)as u32);p};
-        let limits=MotionLimits{model:MotionModel::Differential,max_forward_mps:0.5,max_reverse_mps:0.0,
-            max_lateral_mps:0.0,max_angular_rps:0.8,linear_acceleration_mps2:1.0,guaranteed_braking_mps2:1.0,
-            angular_acceleration_rps2:2.0,guaranteed_angular_braking_rps2:2.0,reaction_time_sec:0.05,
-            minimum_turning_radius_m:0.0,can_rotate_in_place:true};
-        let source=crate::surface_follower::test_snapshot(0.0,false).with_body_envelope(SurfaceBodyEnvelope{
-            fixed_collision: None,
-            footprint_xy_m:vec![[-0.15,-0.15],[0.15,-0.15],[0.15,0.15],[-0.15,0.15]],
-            z_bounds_m:[-0.05,0.2],body_to_support_z_m:0.4,max_step_up_m:0.2,max_step_down_m:0.2,
-            max_cross_slope_deg:18.0,support_uncertainty_m:0.0}).unwrap();
-        let sampled=unix_ns();
-        let mut blocks=std::collections::BTreeMap::<_,std::collections::BTreeMap<_,_>>::new();
-        for (x,y,z) in source.cell_keys(){let key=[x,y,z];blocks.entry(key.map(|v|v.div_euclid(32))).or_default().insert(key,
-            SurfaceObservation{observed_ns:if x>=7{sampled.saturating_sub(2_000_000_000)}else{sampled},hits:2});}
-        let mut observations=SurfaceObservations::new(source.source_voxel_size_m(),32).unwrap();
-        for (key,block) in blocks{observations.replace_block(key,block).unwrap();}
-        observations.mark_complete_geometry_source();
-        let source=Arc::new(source.with_observations(Some(Arc::new(observations)))
-            .with_recent_obstacle_points(1,sampled,0,&[],[(0,[0.75,1.0,0.5])]).unwrap());
-        let mut config=SurfaceFollowerConfig::new(0.4);config.local_planning_enabled=false;
-        config.controller.control_frequency=20.0;config.controller.speed=0.5;
-        config.motion_limits=Some(limits.clone());config.max_observation_age_sec=Some(1.0);
-        assert!(!config.controller.simulation);
-        let (computed,receive)=std::sync::mpsc::channel();let (release,wait)=std::sync::mpsc::channel();
-        let mut harness=RouteWorkerHarness{worker:PlannerWorker::new(GatedRouteFollower{
-            refresh_gate:None,
-            inner:RouteFollower::new(config).unwrap(),computed,release:wait,map:None,boundary:Vec::new(),
-            odometry:None,goal_updates:0,path_updates:0}).unwrap(),computed:receive,release,clear:source.clone()};
-        let start=stamped(0.533);let goal=stamped(2.0);
-        source.validate_body_pose([0.533,1.0,0.5],[0.0,0.0,0.0,1.0]).unwrap();
-        assert!(source.validate_body_pose([0.56,1.0,0.5],[0.0,0.0,0.0,1.0]).is_err(),
-            "real forward obstacle must separate initial clearance from unsafe continued travel");
-        let previous=Twist2{linear:Point2::new(initial_speed,0.0),angular_z:0.0};
-        harness.worker.update_execution_map(ExecutionMap::Surface(source.clone())).unwrap();
-        harness.worker.configure_goal(&goal,GoalOptions::default()).unwrap();
-        harness.worker.update_odometry(start.clone());
-        harness.worker.replace_execution_path(ExecutionPath::Surface(Path3D{poses:vec![start.clone(),goal.clone()]}),None,goal).unwrap();
-        harness.worker.observe_applied_command(previous);harness.worker.step(0.3);
-        let initial=harness.next_computation();
-        let PlannerStep::Command(first)=initial.outcome else{panic!("initial guarded command missing: {:?}",initial.outcome);};
-        assert!(first.linear.x>=0.09 && first.angular_z.abs()<1e-9,"fixture must establish the maximal safe initial command: {first:?}");
-        harness.release.send(()).unwrap();wait_for_source_result(&harness.worker);
-        assert_eq!(harness.worker.step(0.3),PlannerStep::Command(first));
-        let first_deadline=harness.worker.delivered_command_deadline_for_test().unwrap();
-        // Actual calibrated midpoint transition over one real wall-clock period.
-        std::thread::sleep(Duration::from_millis(50));
-        let current=stamped(start.pose.position.x+(previous.linear.x+first.linear.x)*0.5*0.05);
-        harness.worker.update_odometry(current.clone());harness.worker.observe_applied_command(first);
-        let latest=harness.next_computation(); // hold the new guard outcome before publication
-        let replay=harness.worker.step(0.3);
-        let remaining=first_deadline.saturating_duration_since(std::time::Instant::now());
-        eprintln!("REPLAY before={previous:?} initial={first:?} fresh_computed={:?} delivered={replay:?} x={} remaining_ms={}",latest.outcome,current.pose.position.x,remaining.as_secs_f64()*1000.0);
-        assert!(remaining>Duration::from_millis(50),"fresh 50ms oracle must fit inside the selected original remaining lease");
-        let command=match replay {
-            PlannerStep::Command(command)=>command,
-            PlannerStep::Pending(_)|PlannerStep::ReplanRequired(_)=>{
-                // Correct retirement is also a successful desired-safety outcome.
-                harness.worker.stop();harness.release.send(()).unwrap();return;
-            }
-            other=>panic!("unexpected replay diagnostic outcome: {other:?}"),
-        };
-        let pose=PlanarPose{x:current.pose.position.x,y:1.0,yaw:0.0};
-        let body=|p:PlanarPose|([p.x,p.y,0.5],[0.0,0.0,0.0,1.0]);
-        let view=source.with_current_body_support(body(pose).0,body(pose).1).unwrap();
-        assert!(view.same_body_query_view(&source),"flat source must need no different current-body permission");
-        let failure=std::cell::RefCell::new(None);
-        let check=|a:PlanarPose,b:PlanarPose,_elapsed:f64| {
-            let projected=view.body_pose_after_motion(body(a),[b.x,b.y],b.yaw).unwrap();
-            assert!((projected.0[2]-0.5).abs()<1e-9,"oracle/source projection must agree");
-            match view.validate_body_motion(body(a),projected,&[]) {
-                Ok(())=>true,Err(e)=>{if failure.borrow().is_none(){*failure.borrow_mut()=Some(e.to_string());}false}
-            }
-        };
-        let safe=nuwax_nav_control::check_stopping_trajectory_with_period_check(pose,first,command,&limits,0.05,
-            f64::from(source.source_voxel_size_m())*0.5,source.body_envelope().unwrap().radius(),check,check).is_some();
-        eprintln!("REPLAY oracle_safe={safe} reason={:?}",failure.borrow());
-        harness.worker.stop();harness.release.send(()).unwrap();
-        assert!(safe,"a retained command delivered inside its lease still needs current full braking permission");
-    }
-
-    #[test]
-    #[ignore="real-clock geometry regression for single-consumption containment"]
-    fn retained_command_replay_requires_current_full_braking_permission() {run_replay_proof_falsifier(0.05);}
-    #[test]
-    #[ignore="real-clock geometry regression with unchanged actual applied velocity"]
-    fn retained_steady_command_replay_requires_current_full_braking_permission() {run_replay_proof_falsifier(0.1);}
-
     struct DispatchProbe {
         started:std::sync::mpsc::Sender<()>,
         finish:std::sync::mpsc::Receiver<(PlannerStep,Option<CommandDispatchBound>)>,
@@ -2804,257 +2517,5 @@ mod tests {
     // Append inside planner_worker.rs's existing mod tests, before its final `}`.
     // Requires only gated_route_delegation.rs's existing-wrapper additions.
     // Exactly one new selector. NOT BUILT / NOT LISTED / NOT RUN.
-
-    struct D06RefreshGate {
-        armed: Arc<std::sync::atomic::AtomicBool>,
-        entered: std::sync::mpsc::Sender<std::thread::ThreadId>,
-        release: std::sync::mpsc::Receiver<()>,
-        returned: std::sync::mpsc::Sender<Option<Arc<ActualExecutionContext>>>,
-    }
-    // Declare after the RouteWorkerHarness so panic cleanup releases a held refresh
-    // before the original harness stops/joins its real worker and planning owner.
-    struct D06RefreshRelease(std::sync::mpsc::Sender<()>);
-    impl Drop for D06RefreshRelease {
-        fn drop(&mut self) { let _ = self.0.send(()); }
-    }
-
-    #[test]
-    fn d06_worker_requalifies_ground_event_at_current_actual() {
-        use crate::surface_follower::ground_owner_tests as fixed;
-        use nuwax_nav_pct::ground_route::{GroundRouteGoal, GroundRouteStart};
-        use nuwax_nav_pct::SearchLimits;
-        use nuwax_nav_types_messages::{ArrivalBoundary, GoalRegionAssessment, GroundLayerResult, Point2};
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        // Three bounded controls of the SAME original single-layer Writer/Receiver
-        // fixture. No new two-association scene and no changed physical threshold.
-        for case in ["inside", "outside", "cancel"] {
-            let (source, _) = fixed::c3_direct_source();
-            let source = Arc::new(source);
-            let config = fixed::c3_config();
-            assert!(config.local_planning_enabled);
-            let a = fixed::c3_stamped(fixed::c3_start());
-            let xy = [a.pose.position.x, a.pose.position.y];
-            let goal = ExecutionGoal::Ground(GroundExecutionGoal {
-                frame_id: NavFrameId::Map, xy, yaw: 0.0, requested_ground_z: Some(0.0),
-            });
-            // Fixed strict arrival region: B's measured Z shift exceeds this XY
-            // tolerance, so a Body XYZ recheck would fail the positive control.
-            let options = GoalOptions {
-                position_tolerance_m: 0.0001, yaw_tolerance_rad: 0.001, allow_reverse: false,
-            };
-            let prepared = config.pct.prepare_ground_start(&source,
-                GroundRouteStart { xy, ground_z: Some(0.0) }, None).unwrap();
-            let mut observer = SurfaceFollower::new(config.clone()).unwrap();
-            observer.update_execution_map(ExecutionMap::Surface(source.clone())).unwrap();
-            observer.update_odometry(a.clone());
-            let initial_actual = observer.refresh_execution_context(Twist2::ZERO).unwrap();
-            assert!(initial_actual.navigation.is_none());
-            let initial = GroundInitialCapture::from_actual(prepared.basis().clone(), initial_actual).unwrap();
-            let route = config.pct.ground_route_from_start(&source, fixed::c3_start(), &prepared,
-                GroundRouteGoal { xy, requested_ground_z: Some(0.0) }, 0.0, &[], None, None,
-                SearchLimits::default(), &[]).expect("fixed real stationary PCT prerequisite");
-            assert_eq!(route.guide_body_poses.len(), 1,
-                "do not replace a failed stationary prerequisite with a fabricated candidate");
-            let path = ExecutionPath::Ground(GroundExecutionPath {
-                reference: route.reference.clone(),
-                body_guidance: Path3D { poses: route.guide_body_poses.iter().copied()
-                    .map(fixed::c3_stamped).collect() },
-            });
-
-            let (computed, receive) = std::sync::mpsc::channel();
-            let (release, wait) = std::sync::mpsc::channel();
-            let armed = Arc::new(AtomicBool::new(false));
-            let (entered_tx, entered) = std::sync::mpsc::channel();
-            let (refresh_release, refresh_wait) = std::sync::mpsc::channel();
-            let (returned_tx, returned) = std::sync::mpsc::channel();
-            let mut harness = RouteWorkerHarness {
-                worker: PlannerWorker::new(GatedRouteFollower {
-                    inner: RouteFollower::new(config).unwrap(), computed, release: wait,
-                    map: None, boundary: Vec::new(), odometry: None,
-                    goal_updates: 0, path_updates: 0,
-                    refresh_gate: Some(D06RefreshGate {
-                        armed: armed.clone(), entered: entered_tx, release: refresh_wait, returned: returned_tx,
-                    }),
-                }).unwrap(),
-                computed: receive, release, clear: source.clone(),
-            };
-            let refresh_release = D06RefreshRelease(refresh_release);
-            harness.worker.configure_execution_goal(&goal, options, Some(initial)).unwrap();
-            harness.worker.update_execution_map(ExecutionMap::Surface(source.clone())).unwrap();
-            harness.worker.update_odometry(a.clone());
-            harness.worker.replace_typed_execution_path(path, None, goal.clone()).unwrap();
-            assert!(matches!(harness.worker.step(0.3), PlannerStep::Pending(_)));
-            let computed = harness.next_computation();
-            let PlannerStep::GroundArrival(original) = &computed.outcome else {
-                panic!("{case}: real stationary owner must emit GroundArrival: {:?}", computed.outcome);
-            };
-            let original = original.clone();
-            assert_eq!((computed.goal_updates, computed.path_updates), (1, 1));
-            assert!(computed.local_planning_calls > 0, "event must follow the genuine PlanningOwner/Scan path");
-            assert_eq!(computed.odometry, a);
-            assert!(Arc::ptr_eq(&computed.map, &source));
-            assert_eq!(original.goal(), goal.as_ground().unwrap());
-            assert_eq!(original.actual().odometry, a);
-            assert!(Arc::ptr_eq(&original.actual().source, &source));
-            assert!(original.actual().navigation.as_ref().unwrap().is_terminal_for(original.intent()));
-            assert_eq!(original.actual().ground_evidence.as_ref().unwrap().relation,
-                GroundLayerResult::Matched, "the sole actual owner must establish the real source relation");
-            assert_eq!(original.assess(original.actual(), options, ArrivalBoundary::Strict, false),
-                GoalRegionAssessment::WithinRegion);
-            // Copy observations under Inputs, then release it before every
-            // assertion so a qualification failure cannot poison teardown's lock.
-            let (old_result, old_versions) = {
-                let input = harness.worker.shared.0.lock().unwrap();
-                (input.result.clone(), (input.epoch, input.goal_version, input.path_version,
-                    input.map_version, input.pose_version, input.applied_version, input.boundary_version))
-            };
-            assert!(old_result.is_none(), "real event is held before its first publication");
-
-            // Keep the original map/boundary fence. A source update retires this
-            // event; only pose/APPLIED catch-up requalifies its same-source actual.
-            let current_source = source.clone();
-            let mut b = a.clone();
-            b.stamp = Timestamp::from_unix(1, 50_000_000);
-            b.pose.position.x += if case == "outside" { 0.001 } else { 0.000001 };
-            b.pose.position.z += 0.001;
-            b.pose.orientation = Quaternion::from_yaw(0.000001);
-            let applied = Twist2 { linear: Point2::new(0.01, 0.0), angular_z: 0.0 };
-            assert!(b.pose.position.distance(a.pose.position) > options.position_tolerance_m);
-            source.validate_body_pose([b.pose.position.x, b.pose.position.y, b.pose.position.z],
-                [b.pose.orientation.x, b.pose.orientation.y, b.pose.orientation.z, b.pose.orientation.w])
-                .expect("fixed body-Z change must retain real physical validity; do not retune");
-            harness.worker.update_odometry(b.clone());
-            harness.worker.observe_applied_command(applied);
-            armed.store(true, Ordering::Release);
-            harness.release.send(()).unwrap();
-            let compute_thread = entered.recv_timeout(Duration::from_secs(5))
-                .expect("Ground catch-up must enter real execution-context refresh");
-            assert_ne!(compute_thread, std::thread::current().id());
-            let (held_result, held_pose, held_applied, held_versions) = {
-                // This succeeds while the worker is held immediately before its real
-                // source/pose refresh. Geometry and assessment are outside Inputs.
-                let input = harness.worker.shared.0.try_lock()
-                    .expect("Ground requalification must never hold the worker input mutex");
-                (input.result.clone(), input.pose.clone(), input.applied,
-                    (input.epoch, input.goal_version, input.path_version, input.map_version,
-                        input.pose_version, input.applied_version, input.boundary_version))
-            };
-            assert!(held_result.is_none(), "A cannot publish while B awaits requalification");
-            assert_eq!(held_pose.as_ref(), Some(&b));
-            assert!(same_applied(held_applied, applied));
-            assert_eq!((held_versions.0, held_versions.1, held_versions.2, held_versions.6),
-                (old_versions.0, old_versions.1, old_versions.2, old_versions.6));
-            assert_eq!(held_versions.3, old_versions.3, "Ground event cannot cross a map fence");
-            assert!(held_versions.4 > old_versions.4 && held_versions.5 > old_versions.5);
-            let versions = (held_versions.0, held_versions.3, held_versions.4, held_versions.5, held_versions.6);
-            if case == "cancel" {
-                // Real cancellation races with a genuine, already-produced event.
-                // The blocked refresh cannot hold cancellation behind a geometry lock.
-                harness.worker.stop();
-                let (epoch, result, goal, path) = {
-                    let input = harness.worker.shared.0.lock().unwrap();
-                    (input.epoch, input.result.clone(), input.goal.clone(), input.path.clone())
-                };
-                assert!(epoch > versions.0);
-                assert!(result.is_none() && goal.is_none() && path.is_none());
-            }
-            refresh_release.0.send(()).unwrap();
-            let refreshed = returned.recv_timeout(Duration::from_secs(5)).unwrap()
-                .expect("the real current physical observation remains available");
-            assert_eq!(refreshed.odometry, b);
-            assert!(Arc::ptr_eq(&refreshed.source, &current_source));
-            assert!(same_applied(refreshed.applied, applied));
-            assert!(refreshed.ground_evidence.as_ref().unwrap().observation.is_direct());
-            assert!(refreshed.navigation.is_none(),
-                "a read-only recheck cannot relabel A's consumed navigation as actual B");
-            assert_eq!(original.actual().odometry, a,
-                "requalification retains the captured committed actual, including body Z and yaw");
-            assert!(Arc::ptr_eq(&original.actual().source, &source));
-            assert_eq!(original.assess(&refreshed, options, ArrivalBoundary::Strict, false),
-                if case == "outside" { GoalRegionAssessment::OutsideRegion }
-                else { GoalRegionAssessment::WithinRegion });
-
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            if case == "cancel" {
-                // Await the original stop plus following current lifecycle-context
-                // publication, rather than sleeping and guessing the late event died.
-                loop {
-                    let (result, goal, path, current_versions, publication_versions, closed) = {
-                        let input = harness.worker.shared.0.lock().unwrap();
-                        (input.result.clone(), input.goal.clone(), input.path.clone(),
-                            (input.epoch, input.map_version, input.pose_version,
-                                input.applied_version, input.boundary_version),
-                            input.execution_context.as_ref().map(|publication|
-                                (publication.epoch, publication.map_version, publication.pose_version,
-                                    publication.applied_version, publication.boundary_version)), input.closed)
-                    };
-                    assert!(result.is_none(), "cancelled Ground event must not revive");
-                    assert!(goal.is_none() && path.is_none());
-                    if !closed && publication_versions.is_some_and(|publication|
-                        publication == current_versions && publication.0 > versions.0) { break; }
-                    assert!(std::time::Instant::now() < deadline, "cancel lifecycle did not settle");
-                    std::thread::yield_now();
-                }
-                continue;
-            }
-            loop {
-                let (result, result_versions, current, current_versions, publication_versions, closed) = {
-                    let input = harness.worker.shared.0.lock().unwrap();
-                    (input.result.clone(), (input.result_map_version, input.result_pose_version,
-                        input.result_applied_version, input.result_boundary_version),
-                        input.result_execution_context.clone(),
-                        (input.epoch, input.map_version, input.pose_version,
-                            input.applied_version, input.boundary_version),
-                        input.execution_context.as_ref().map(|publication|
-                            (publication.epoch, publication.map_version, publication.pose_version,
-                                publication.applied_version, publication.boundary_version)), input.closed)
-                };
-                if result.is_some() && result_versions == (versions.1, versions.2, versions.3, versions.4) {
-                    assert_eq!(current_versions.0, versions.0);
-                    let current = current.unwrap();
-                    assert_eq!(current.odometry, b);
-                    assert!(Arc::ptr_eq(&current.source, &current_source));
-                    assert!(same_applied(current.applied, applied));
-                    assert_eq!(current.ground, refreshed.ground);
-                    assert_eq!(current.ground_evidence, refreshed.ground_evidence);
-                    assert!(current.navigation.is_none());
-                    assert!(!closed && publication_versions.unwrap() == current_versions);
-                    match &result.as_ref().unwrap().1 {
-                        PlannerStep::GroundArrival(published) if case == "inside" => {
-                            assert!(Arc::ptr_eq(published, &original), "worker retains the exact owner event");
-                            assert_eq!(published.actual().odometry, a);
-                        }
-                        PlannerStep::Pending(_) if case == "outside" => {}
-                        other => panic!("{case}: wrong real requalification outcome: {other:?}"),
-                    }
-                    break;
-                }
-                assert!(std::time::Instant::now() < deadline, "{case}: latest full-context result not published");
-                std::thread::yield_now();
-            }
-            let delivered = harness.worker.step(0.3);
-            match delivered {
-                PlannerStep::GroundArrival(event) if case == "inside" => {
-                    assert!(Arc::ptr_eq(&event, &original));
-                    let current = harness.worker.take_step_execution_context(applied).unwrap();
-                    assert_eq!(current.odometry, b);
-                    assert!(Arc::ptr_eq(&current.source, &current_source));
-                    assert!(same_applied(current.applied, applied));
-                }
-                PlannerStep::Pending(_) if case == "outside" => {}
-                other => panic!("{case}: retrieval changed the current outcome: {other:?}"),
-            }
-            assert!(harness.worker.take_command_dispatch_bound().is_none(),
-                "terminal requalification grants no command authority");
-            harness.worker.stop();
-            let _ = harness.release.send(());
-            let stopped_result = {
-                let input = harness.worker.shared.0.lock().unwrap();
-                input.result.clone()
-            };
-            assert!(stopped_result.is_none());
-        }
-    }
 
 }

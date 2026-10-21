@@ -5,9 +5,7 @@ fn unchanged_mask_work_counts_preserve_revision_fast_path_and_skip_derived_maps(
     let mut message = map_message(1, "mask-work");
     message.virtual_obstacles = Some(virtual_mask(&message, false));
     let mut cache = SurfaceGeometryCache::new(config().geometry);
-    let planner = nuwax_nav_pct::PctPlanner::default();
     let first = cache.build(&message).unwrap();
-    let tomogram = planner.map(&first).unwrap();
     let initial = cache.mask_work();
     assert_eq!((initial.compared_cells, initial.derivations), (0, 1));
     for _ in 0..8 {
@@ -19,7 +17,6 @@ fn unchanged_mask_work_counts_preserve_revision_fast_path_and_skip_derived_maps(
         advance_mask(&mut message, false);
         let source = cache.build(&message).unwrap();
         assert!(Arc::ptr_eq(&first, &source));
-        assert!(Arc::ptr_eq(&tomogram, &planner.map(&source).unwrap()));
     }
     assert_eq!(cache.mask_work().compared_cells, 8 * cells);
     assert_eq!(cache.mask_work().derivations, 1);
@@ -27,7 +24,6 @@ fn unchanged_mask_work_counts_preserve_revision_fast_path_and_skip_derived_maps(
     message.virtual_obstacles.as_mut().unwrap().data[0] = 100;
     let changed = cache.build(&message).unwrap();
     assert!(!changed.same_geometry(&first));
-    assert!(!Arc::ptr_eq(&tomogram, &planner.map(&changed).unwrap()));
     assert_eq!(cache.mask_work().compared_cells, 8 * cells + 1);
     assert_eq!(cache.mask_work().derivations, 2);
     eprintln!("MASK_WORK unchanged_updates=8 compared_cells={} derived_builds=1 pct_builds=1 same_revision_updates=8 same_revision_comparisons=0 changed_first_cell_comparisons=1 changed_derivations=1", 8 * cells);

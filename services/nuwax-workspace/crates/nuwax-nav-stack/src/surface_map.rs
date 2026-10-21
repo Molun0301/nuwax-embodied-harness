@@ -191,7 +191,6 @@ pub struct SurfaceMapCache {
     fine: Option<crate::surface_chunks::FineMapReader>,
     lcm_url: String,
     fine_built_root: Option<Arc<nuwax_map_chunks::Manifest>>,
-    observation_enabled: bool,
     fine_observed_root: Option<Arc<nuwax_map_chunks::Manifest>>,
     observations: Option<Arc<nuwax_nav_mls_planner::SurfaceObservations>>,
     #[cfg(test)]
@@ -209,7 +208,6 @@ impl SurfaceMapCache {
             last_stats: None,
             fine: None,
             fine_built_root: None,
-            observation_enabled: false,
             fine_observed_root: None,
             observations: None,
             #[cfg(test)]
@@ -222,8 +220,6 @@ impl SurfaceMapCache {
     /// 使用启动时捕获的同一完整模型构建消费者缓存。
     pub fn configured(config: &crate::surface_config::SurfaceNavigationConfig) -> Self {
         let mut cache = Self::new(config.geometry.clone());
-        cache.observation_enabled = config.body_envelope.is_some()
-            || config.follower.max_observation_age_sec.is_some();
         cache.builder =
             SurfaceMapBuilder::configured(config.geometry.clone(), config.body_envelope.clone());
         cache
@@ -353,16 +349,15 @@ impl SurfaceMapCache {
         } else {
             None
         };
-        let (observations, fine_changes) = if self.observation_enabled {
-            match fine_root.as_ref() {
-                Some(root) => {
-                    let (observations, changes) = self.fine.as_mut().unwrap().observations_with_changes(root,
-                        self.fine_observed_root.as_deref().zip(self.observations.as_ref()))?;
-                    (Some(observations), changes)
-                }
-                None => (None, self.observations.is_none().then(Vec::new)),
+        // 原生规划始终消费完整精细几何和地面记录，与旧机体复核开关无关。
+        let (observations, fine_changes) = match fine_root.as_ref() {
+            Some(root) => {
+                let (observations, changes) = self.fine.as_mut().unwrap().observations_with_changes(root,
+                    self.fine_observed_root.as_deref().zip(self.observations.as_ref()))?;
+                (Some(observations), changes)
             }
-        } else { (None, Some(Vec::new())) };
+            None => (None, self.observations.is_none().then(Vec::new)),
+        };
         let domain = schema::navigation_map_3d_domain(message);
         let physical_revision = match fine_root.as_ref() {
             Some(root) => GeometryRevision::Fine {
@@ -452,7 +447,7 @@ impl SurfaceMapCache {
             .is_some_and(|old| Arc::ptr_eq(&old.physical, &physical));
         let changes = |snapshot: &Arc<SurfaceSnapshot>| {
             if !intact_basis { return SurfaceGeometryChanges::Unknown; }
-            if change_basis.as_ref().is_some_and(|old| nuwax_nav_pct::same_source_geometry(old, snapshot)) {
+            if change_basis.as_ref().is_some_and(|old| nuwax_nav_runtime::native_map::same_source_geometry(old, snapshot)) {
                 return SurfaceGeometryChanges::Empty;
             }
             if !same_mask || change_basis.as_ref().is_none_or(|old|
@@ -513,9 +508,7 @@ impl SurfaceMapCache {
         if let (Some(changes), Some(previous)) = (frontier_changes, self.latest.as_ref()) {
             snapshot.inherit_frontier_cache(&previous.snapshot, &changes);
         }
-        let snapshot = if self.observation_enabled {
-            Arc::new(snapshot.with_observations(observations.clone()))
-        } else { snapshot };
+        let snapshot = Arc::new(snapshot.with_observations(observations.clone()));
         self.observations = observations;
         self.fine_observed_root = fine_root;
         self.latest = Some(DerivedSurface { mask_revision, mask_layout, physical, snapshot: Arc::clone(&snapshot) });

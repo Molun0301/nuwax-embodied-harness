@@ -917,3 +917,24 @@ body[data-picking=true] #viewport canvas {
   width:13px;
   height:13px;
 }
+.planning-option {
+  display:flex;
+  align-items:flex-start;
+  gap:7px;
+  margin-top:18px;
+  color:var(--muted);
+  font-size:11px;
+  line-height:1.6
+}
+.planning-option input {
+  flex:none;
+  margin:3px 0 0;
+  width:13px;
+  height:13px
+}
+.planning-option strong {
+  display:block;
+  color:var(--text);
+  font-size:12px;
+  font-weight:600
+}

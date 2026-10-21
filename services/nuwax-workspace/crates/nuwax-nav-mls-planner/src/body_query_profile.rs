@@ -55,18 +55,6 @@ pub enum Stage {
     DenseOrderedEmission,
     /// Acquire the existing dense batch-read cache lock, including poison recovery.
     DenseBandCacheAcquire,
-    /// Complete raw observation footprint construction, including local cleanup.
-    ObservationFootprint,
-    /// Locate the actual support used by observation footprint construction.
-    ObservationFootprintSupport,
-    /// Construct footprint hull and bounds, including existing validation.
-    ObservationFootprintShape,
-    /// Construct the existing coarse ground patch for this footprint.
-    ObservationFootprintPatch,
-    /// Build exact fine-cell geometry, including support/evidence-membership lookups.
-    ObservationFootprintCells,
-    /// Check occupied exemptions, exact evidence, time/hits and finite expiry.
-    ObservationEvidence,
     /// Complete known-terrain validation, including early errors.
     KnownTerrainTotal,
     /// Existing common-band helper, including early None; excludes caller Vec cleanup.
@@ -92,7 +80,7 @@ pub enum Stage {
 
 impl Stage {
     /// Number of fixed timing categories.
-    pub const COUNT: usize = 32;
+    pub const COUNT: usize = 26;
     /// Every timing category, in record-array order.
     pub const ALL: [Self; Self::COUNT] = [
         Self::MotionTotal,
@@ -112,12 +100,6 @@ impl Stage {
         Self::DenseConnectivityBfs,
         Self::DenseOrderedEmission,
         Self::DenseBandCacheAcquire,
-        Self::ObservationFootprint,
-        Self::ObservationFootprintSupport,
-        Self::ObservationFootprintShape,
-        Self::ObservationFootprintPatch,
-        Self::ObservationFootprintCells,
-        Self::ObservationEvidence,
         Self::KnownTerrainTotal,
         Self::KnownCommonBand,
         Self::KnownTreadGeometry,
@@ -149,12 +131,6 @@ impl Stage {
             Self::DenseConnectivityBfs => "dense_connectivity_bfs",
             Self::DenseOrderedEmission => "dense_ordered_emission",
             Self::DenseBandCacheAcquire => "dense_band_cache_acquire",
-            Self::ObservationFootprint => "observation_footprint",
-            Self::ObservationFootprintSupport => "observation_footprint_support",
-            Self::ObservationFootprintShape => "observation_footprint_shape",
-            Self::ObservationFootprintPatch => "observation_footprint_patch",
-            Self::ObservationFootprintCells => "observation_footprint_cells",
-            Self::ObservationEvidence => "observation_evidence",
             Self::KnownTerrainTotal => "known_terrain_total",
             Self::KnownCommonBand => "known_common_band",
             Self::KnownTreadGeometry => "known_tread_geometry",
@@ -200,25 +176,6 @@ pub enum Counter {
     DenseCacheSingleBandColumns,
     /// Visited-table slots requested only after a valid dense seed exists.
     DenseVisitedTableSlots,
-    /// Exact-pose cell-set cache hits within the original immutable checker.
-    ObservationFootprintCacheHits,
-    /// Exact-pose cell-set cache misses, including failed constructions.
-    ObservationFootprintCacheMisses,
-    /// Fine cells returned by successful raw footprint constructions, repeated encounters.
-    ObservationFootprintCellsBuilt,
-    /// Keys entering the evidence loop; ordered difference has already removed exemptions.
-    ObservationVisitedCells,
-    /// Non-exempt cells whose evidence is checked, including a failing last cell.
-    ObservationCheckedCells,
-    /// Exact footprint cardinality supplied to each evidence callback, including
-    /// exempt cells and cells after a possible early evidence error.
-    ObservationInputCells,
-    /// Fine XY columns entering the original bounded height-selection loop.
-    ObservationHeightColumns,
-    /// Actual integer-Z membership probes, including rejected and absent candidates.
-    ObservationHeightProbes,
-    /// Height probes whose exact fine observation key is absent.
-    ObservationHeightAbsent,
     /// Persistent observation block-root lookups by short-lived borrowed accessors.
     ObservationBlockRootResolutions,
     /// Original exact-pose lookup returned an entry, including cached failures.
@@ -251,7 +208,7 @@ pub enum Counter {
 
 impl Counter {
     /// Number of fixed counter categories.
-    pub const COUNT: usize = 34;
+    pub const COUNT: usize = 25;
     /// Every counter category, in record-array order.
     pub const ALL: [Self; Self::COUNT] = [
         Self::PlaneCacheHits,
@@ -266,15 +223,6 @@ impl Counter {
         Self::DenseVisitedColumns,
         Self::DenseCacheSingleBandColumns,
         Self::DenseVisitedTableSlots,
-        Self::ObservationFootprintCacheHits,
-        Self::ObservationFootprintCacheMisses,
-        Self::ObservationFootprintCellsBuilt,
-        Self::ObservationVisitedCells,
-        Self::ObservationCheckedCells,
-        Self::ObservationInputCells,
-        Self::ObservationHeightColumns,
-        Self::ObservationHeightProbes,
-        Self::ObservationHeightAbsent,
         Self::ObservationBlockRootResolutions,
         Self::PoseCacheHits,
         Self::PoseCacheMisses,
@@ -305,15 +253,6 @@ impl Counter {
             Self::DenseVisitedColumns => "dense_visited_columns",
             Self::DenseCacheSingleBandColumns => "dense_cache_single_band_columns",
             Self::DenseVisitedTableSlots => "dense_visited_table_slots",
-            Self::ObservationFootprintCacheHits => "observation_footprint_cache_hits",
-            Self::ObservationFootprintCacheMisses => "observation_footprint_cache_misses",
-            Self::ObservationFootprintCellsBuilt => "observation_footprint_cells_built",
-            Self::ObservationVisitedCells => "observation_visited_cells",
-            Self::ObservationCheckedCells => "observation_checked_cells",
-            Self::ObservationInputCells => "observation_input_cells",
-            Self::ObservationHeightColumns => "observation_height_columns",
-            Self::ObservationHeightProbes => "observation_height_probes",
-            Self::ObservationHeightAbsent => "observation_height_absent",
             Self::ObservationBlockRootResolutions => "observation_block_root_resolutions",
             Self::PoseCacheHits => "pose_cache_hits",
             Self::PoseCacheMisses => "pose_cache_misses",

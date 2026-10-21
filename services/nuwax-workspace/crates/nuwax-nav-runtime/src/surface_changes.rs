@@ -29,20 +29,6 @@ pub enum SurfaceGeometryChanges {
     Unknown,
 }
 
-/// 将既有完整变更证据借给 PCT；不复制列，不从当前占据反推删除。
-/// 基准与查询参数是否匹配由持有旧层析图的 PCT 拥有方再次核验。
-pub fn pct_surface_delta<'a>(basis:Option<&'a SurfaceSnapshot>,changes:&'a SurfaceGeometryChanges)
-    ->nuwax_nav_pct::SurfaceDelta<'a> {
-    let Some(basis)=basis else {return nuwax_nav_pct::SurfaceDelta::Rebuild;};
-    match changes {
-        SurfaceGeometryChanges::Empty=>nuwax_nav_pct::SurfaceDelta::Unchanged {basis},
-        SurfaceGeometryChanges::Columns {fine_size,fine,..}=>nuwax_nav_pct::SurfaceDelta::Columns {
-            basis,resolution:f64::from(*fine_size),columns:fine.as_slice(),
-        },
-        SurfaceGeometryChanges::Unknown=>nuwax_nav_pct::SurfaceDelta::Rebuild,
-    }
-}
-
 // Source owners classify map/relocation/mask changes as Unknown. Independently
 // enforce model, frame and query-configuration semantics when coalescing too, so
 // a transient change followed by a reversal cannot be lost before delivery.
@@ -63,29 +49,23 @@ pub(crate) fn same_query_semantics(a:&SurfaceSnapshot,b:&SurfaceSnapshot)->bool 
 pub struct SurfaceMapUpdate {
     /// Latest immutable source for the execution guard.
     pub snapshot: Arc<SurfaceSnapshot>,
-    /// Static planar query artifact prepared off the control thread for this exact source.
-    /// Recent obstacle frames are intentionally checked on the live snapshot separately.
-    pub planar_reference: Option<Arc<nuwax_nav_pct::Tomogram>>,
     /// Successful source immediately preceding these differences.
     pub change_basis: Option<Arc<SurfaceSnapshot>>,
     /// Complete geometry differences, never inferred from a revision number alone.
     pub changes: Arc<SurfaceGeometryChanges>,
 }
 impl SurfaceMapUpdate {
-    /// Prepare a raw immutable surface before handing it to an execution owner.
-    /// This can derive a tomogram and must run on the existing background map or
-    /// planning owner, never inside update_execution_map or a controller tick.
-    /// Callers with complete deltas may replace the default Unknown change proof.
-    pub fn prepare(snapshot:Arc<SurfaceSnapshot>,planner:&nuwax_nav_pct::PctPlanner)->Result<Self,String> {
-        let planar_reference=if snapshot.body_envelope().is_none() {Some(planner.map(&snapshot)?)} else {None};
-        Ok(Self {snapshot,planar_reference,change_basis:None,changes:Arc::new(SurfaceGeometryChanges::Unknown)})
+    /// 传递不可变感知与变更来源；原生地图由现有计算线程准备。
+    /// 持有完整差异的调用者可替换默认未知变更描述。
+    pub fn prepare(snapshot:Arc<SurfaceSnapshot>)->Result<Self,String> {
+        Ok(Self {snapshot,change_basis:None,changes:Arc::new(SurfaceGeometryChanges::Unknown)})
     }
 
     /// Coalesce undelivered publications without dropping intermediate deletions or additions.
     /// This only joins the existing bounded column sets; a gap remains Unknown.
     pub fn append(&mut self, next: Self) {
         let linked = next.change_basis.as_ref().is_some_and(|basis|
-            nuwax_nav_pct::same_source_geometry(&self.snapshot, basis))
+            crate::native_map::same_source_geometry(&self.snapshot, basis))
             && same_query_semantics(&self.snapshot,&next.snapshot);
         let merged = if !linked { Arc::new(SurfaceGeometryChanges::Unknown) } else {
             use SurfaceGeometryChanges::*;
@@ -105,7 +85,6 @@ impl SurfaceMapUpdate {
             }
         };
         self.snapshot=next.snapshot;
-        self.planar_reference=next.planar_reference;
         self.changes=merged;
     }
 }
@@ -133,7 +112,7 @@ impl SurfaceJobTicket {
         changes: &Arc<SurfaceGeometryChanges>) {
         if self.unknown { return; }
         let Some(basis)=self.basis.as_ref() else {return;};
-        if previous.is_none_or(|old|!nuwax_nav_pct::same_source_geometry(basis,old))
+        if previous.is_none_or(|old|!crate::native_map::same_source_geometry(basis,old))
             || !same_query_semantics(basis,current) {
             self.unknown=true;return;
         }
@@ -152,7 +131,7 @@ impl SurfaceJobTicket {
     /// False includes Unknown. This proof never replaces the latest execution guard.
     pub fn permits_path(&self, latest:&SurfaceSnapshot, path:&Path3D)->bool {
         if self.unknown || self.basis.as_ref().is_none_or(|basis|
-            !nuwax_nav_pct::same_source_geometry(basis,latest)) {return false;}
+            !crate::native_map::same_source_geometry(basis,latest)) {return false;}
         // A continuous chain containing no spatial changes needs no corridor;
         // admission still validates the candidate against the latest guard.
         if self.changes.is_empty() {return true;}

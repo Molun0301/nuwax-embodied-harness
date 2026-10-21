@@ -1192,35 +1192,23 @@ name = "nuwax-nav-mls-planner"
 version = "0.1.0"
 dependencies = [
  "ahash",
- "futures",
  "im",
  "image",
  "imageproc",
- "nuwax-codec",
  "nuwax-explore-routing",
  "nuwax-map-chunks",
- "nuwax-protocol",
- "nuwax-transport",
  "nuwax-types",
  "rayon",
- "serde",
- "serde_json",
  "thiserror",
- "tokio",
  "tracing",
  "validator",
 ]
 
 [[package]]
-name = "nuwax-nav-pct"
+name = "nuwax-nav-pct-native"
 version = "0.1.0"
 dependencies = [
- "im",
- "ahash",
- "nuwax-nav-mls-planner",
- "nuwax-nav-types-messages",
- "nuwax-types",
- "tracing",
+ "cc",
 ]
 
 [[package]]
@@ -1230,10 +1218,9 @@ dependencies = [
  "async-trait",
  "nuwax-motion-safety-guard",
  "nuwax-nav-astar",
- "nuwax-nav-control",
  "nuwax-nav-mls-planner",
- "nuwax-nav-pct",
- "nuwax-nav-scan",
+ "nuwax-nav-pct-native",
+ "nuwax-nav-scan-native",
  "nuwax-nav-types-messages",
  "thiserror",
  "tokio",
@@ -1241,14 +1228,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "nuwax-nav-scan"
+name = "nuwax-nav-scan-native"
 version = "0.1.0"
 dependencies = [
- "nuwax-nav-mls-planner",
- "nuwax-nav-pct",
- "nuwax-nav-types-messages",
- "serde_json",
- "tracing",
+ "cc",
 ]
 
 [[package]]
@@ -1266,7 +1249,7 @@ dependencies = [
  "nuwax-nav-click-goal-bridge",
  "nuwax-nav-control",
  "nuwax-nav-mls-planner",
- "nuwax-nav-pct",
+ "nuwax-nav-pct-native",
  "nuwax-nav-runtime",
  "nuwax-nav-types-messages",
  "nuwax-protocol",
@@ -1305,8 +1288,8 @@ dependencies = [
  "nuwax-core",
  "nuwax-map-chunks",
  "nuwax-nav-mls-planner",
+ "nuwax-nav-pct-native",
  "nuwax-nav-runtime",
- "nuwax-nav-scan",
  "nuwax-nav-stack",
  "nuwax-nav-types-messages",
  "serde_json",

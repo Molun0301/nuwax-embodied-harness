@@ -59,6 +59,62 @@ class FineArchiveChecks(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_fine_archive(archive(root, **kwargs))
 
+    @staticmethod
+    def heightfield_block(fragment, *, compact):
+        raw = json.dumps([[0, dict(
+            representation="heightfield_v1_compact" if compact else "heightfield_v1",
+            data=fragment)]], separators=(',', ':')).encode()
+        return b'NUWAXBL4' + struct.pack('<II', 1, len(raw)) + struct.pack('<HQH', 0, 100, 2) + raw
+
+    def heightfield_fixture(self):
+        root = manifest(5)
+        root['blocks'][0].update(key=[0, 0, 0], points=1)
+        source = dict(kind="lidar", backend=1, runtime_generation=2**63-1, sensor_frame_id="sensor-原始")
+        sample = dict(source=source, point=[-0.0, 5e-324, 0.001],
+                      source_sequence=U64_MAX, source_timestamp_ns=100, point_index=2**32-1)
+        original = dict(anchor=[0, 0, 0], height_m=0.125/16, occupied_bounds=[0.0, 0.125],
+                        members=[[0, [1.0, 0, 0, 0, 0, 0, 0, 0]]], samples=[sample])
+        compact = copy.deepcopy(original)
+        compact['samples'] = dict(sources=[source], values=[
+            [0, sample['point'], sample['source_sequence'], sample['source_timestamp_ns'], sample['point_index']]])
+        root['source_watermarks'] = [dict(source=source, source_timestamp_ns=100, source_sequence=U64_MAX)]
+        return root, original, compact
+
+    def test_ar5_old_and_compact_heightfield_keep_same_logical_identity(self):
+        root, original, compact = self.heightfield_fixture()
+        for fragment, new in [(original, False), (compact, True)]:
+            payload = archive(root, blocks=[self.heightfield_block(fragment, compact=new)])
+            self.assertEqual(validate_fine_archive(payload), root)
+            self.assertEqual(validate_fine_archive(FrozenPayload([payload])), root)
+        # JSON浮点和大整数不经过截断、舍入或来源重建。
+        value = json.loads(json.dumps(compact))['samples']['values'][0]
+        for before, after in zip(original['samples'][0]['point'], value[1]):
+            self.assertEqual(struct.pack('<d', before), struct.pack('<d', after))
+        self.assertEqual(value[2:], [U64_MAX, 100, 2**32-1])
+
+    def test_ar5_compact_heightfield_rejects_malformed_sources_and_samples(self):
+        root, _, compact = self.heightfield_fixture()
+        for case in range(8):
+            changed = copy.deepcopy(compact)
+            samples = changed['samples']
+            if case == 0:
+                samples['sources'].append(samples['sources'][0])
+            elif case == 1:
+                samples['values'][0][0] = 1
+            elif case == 2:
+                samples['values'] = []
+            elif case == 3:
+                samples['values'] *= 33
+            elif case == 4:
+                samples['values'][0][0] = True
+            elif case == 5:
+                samples['extra'] = 1
+            elif case == 6:
+                samples['values'][0][2] = 0
+            else:
+                samples['sources'][0]['runtime_generation'] = 0
+            self.reject(root, blocks=[self.heightfield_block(changed, compact=True)])
+
     def test_ar1_literal_aliases_are_preserved_without_hashing(self):
         root = manifest(1)
         raw = ('  \n' + json.dumps(root, ensure_ascii=False, indent=2) + '\n ').encode()
@@ -117,7 +173,7 @@ class FineArchiveChecks(unittest.TestCase):
             changed = copy.deepcopy(layer)
             changed['samples'][0][field] = value
             self.reject(root, blocks=[self.layer_block(json.dumps([[0, changed]]).encode())])
-        self.reject(root, blocks=[self.layer_block(json.dumps([[0, layer]] * 257).encode())])
+        self.reject(root, blocks=[self.layer_block(json.dumps([[0, layer]] * 32769).encode())])
 
     def test_ar3_vector_records_exclude_json_tail(self):
         root, _, layer = self.layer_fixture()
@@ -219,7 +275,7 @@ class FineArchiveChecks(unittest.TestCase):
     def test_new_provenance_requires_explicit_supported_archive_and_block_versions(self):
         root, layer = self.provenance_fixture()
         body = self.layer_block(json.dumps([[0, layer]]).encode(), 3)
-        for version in (1, 2, 3, 5):
+        for version in (1, 2, 3, 6):
             self.reject(dict(root, version=version), blocks=[body])
         self.reject(root, blocks=[self.layer_block(json.dumps([[0, layer]]).encode(), 2)])
         self.reject(root, blocks=[body[:7] + b'4' + body[8:]])

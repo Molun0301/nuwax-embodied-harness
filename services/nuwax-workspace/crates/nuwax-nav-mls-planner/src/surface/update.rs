@@ -121,14 +121,32 @@ impl SurfaceMapBuilder {
         changes.sort_unstable();
         changes.dedup();
         let count = columns.values().map(Vec::len).sum();
-        self.install_columns(
+        let mut result = self.install_columns(
             columns,
             heights,
             changes,
             source_voxel_size_m,
             points.len(),
             count,
-        )
+        )?;
+        let snapshot = result
+            .snapshot
+            .as_ref()
+            .clone()
+            .with_navigation_measurements(points);
+        let same_measurements = match (
+            &snapshot.navigation_measurements,
+            &result.snapshot.navigation_measurements,
+        ) {
+            (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+            (None, None) => true,
+            _ => false,
+        };
+        if !same_measurements {
+            result.snapshot = Arc::new(snapshot);
+            self.current = Some(Arc::clone(&result.snapshot));
+        }
+        Ok(result)
     }
 
     /// 适配由同一完整根导出的脏列。重置用于首次输入、切域和精度变化。
@@ -319,7 +337,7 @@ pub(super) fn voxel_columns(
     points: &[(f32, f32, f32)],
     size: f32,
 ) -> Result<ColumnIz, SurfaceError> {
-    if points.is_empty() || points.len() > MAX_SOURCE_POINTS {
+    if points.len() > MAX_SOURCE_POINTS {
         return Err(SurfaceError::InvalidPointCloud);
     }
     let mut columns = ColumnIz::default();
@@ -477,10 +495,10 @@ pub(super) fn from_columns(
             &ids,
         );
     }
-    let regions = Arc::new(regions::RegionGraph::full(&graph, config.voxel_size));
     let graph = Arc::new(graph);
     let occupied_voxels = columns.values().map(Vec::len).sum();
     Ok(SurfaceSnapshot {
+        navigation_measurements: None,
         ground_evidence:GroundEvidence::MeasuredSurface,
         recent_obstacles:None,
         observations: None,
@@ -488,12 +506,10 @@ pub(super) fn from_columns(
         data: Arc::new(SurfaceData {
             frontier_cache: Default::default(),
             body_cache: Default::default(),
-            routing_cache: Default::default(),
             body_envelope: model.cloned().map(Arc::new),
             height_bounds: Arc::new(heights),
             physical_graph: Arc::clone(&graph),
             graph,
-            regions,
             occupied_columns: Arc::new(columns),
             occupied_voxels,
             virtual_obstacles: None,
@@ -552,7 +568,6 @@ fn update_columns(
             .flatten()
             .any(|&z| previous.data.height_bounds.get(&(x, y, z)) != heights.get(&(x, y, z)))
     });
-    let mut regions = Arc::clone(&previous.data.regions);
     let mut global_refresh = false;
     let changed_wall_geometry=changes.iter().any(|&(x,y)|DIRECTIONS.iter().any(|&(dx,dy)| {
         old_graph.surface_lookup.get(&(x+dx,y+dy)).into_iter().flatten().any(|&z| {
@@ -678,16 +693,10 @@ fn update_columns(
                 &ids,
             );
         }
-        let tiles = regions::RegionGraph::tiles_for_columns(cost_columns);
-        regions = Arc::new(
-            previous
-                .data
-                .regions
-                .updated(&graph, &tiles, config.voxel_size),
-        );
         Arc::new(graph)
     };
     let snapshot = SurfaceSnapshot {
+        navigation_measurements: None,
         ground_evidence:previous.ground_evidence,
         recent_obstacles:previous.recent_obstacles.clone(),
         observations: None,
@@ -695,12 +704,10 @@ fn update_columns(
         data: Arc::new(SurfaceData {
             frontier_cache: Default::default(),
             body_cache: Default::default(),
-            routing_cache: Default::default(),
             body_envelope: previous.data.body_envelope.clone(),
             height_bounds: Arc::new(heights),
             physical_graph: Arc::clone(&graph),
             graph,
-            regions,
             occupied_columns: Arc::new(columns),
             occupied_voxels,
             virtual_obstacles: None,
@@ -829,8 +836,8 @@ mod tests {
         let old = builder.build(&points, 0.05).unwrap().snapshot;
         let low = [1.05, 1.05, 0.05];
         let high = [5.05, 1.05, 0.25];
-        assert!(old.plan(low, high).is_ok());
-        assert!(old.plan(high, low).is_err());
+        assert!(old.test_connected(low, high));
+        assert!(!old.test_connected(high, low));
         points.retain(|&p| voxelize(p, SIZE) != (50, 12, 2));
         let updated = builder.build(&points, 0.05).unwrap();
         assert!(!updated.stats.global_cost_refresh);
@@ -839,12 +846,12 @@ mod tests {
             .with_body_envelope(model.clone())
             .unwrap();
         assert_equivalent(&updated.snapshot, &reference);
-        assert!(updated.snapshot.plan(high, low).is_err());
+        assert!(!updated.snapshot.test_connected(high, low));
         let mut replacement = model;
         replacement.max_step_down_m = 0.3;
         let replaced = updated.snapshot.with_body_envelope(replacement).unwrap();
-        assert!(replaced.plan(high, low).is_ok());
-        assert!(old.plan(high, low).is_err());
+        assert!(replaced.test_connected(high, low));
+        assert!(!old.test_connected(high, low));
     }
 
     #[test]
@@ -1021,8 +1028,10 @@ mod tests {
         // The authoritative column API accepts a complete first empty root too.
         let mut fresh=SurfaceMapBuilder::new(config());
         assert_eq!(fresh.build_column_updates(&[],SIZE,true,0).unwrap().snapshot.cell_keys().count(),0);
-        // Unverified raw point-cloud input retains its original validity contract.
-        assert!(builder.build(&[],SIZE).is_err());
+        // 有效空点数组同样表示未知地图，显式来源清空由外层拥有方撤销。
+        let raw_empty=builder.build(&[],SIZE).unwrap().snapshot;
+        assert_eq!(raw_empty.data.occupied_voxels,0);
+        assert_eq!(raw_empty.cell_keys().count(),0);
         assert!(builder.build_column_updates(&[SurfaceColumnUpdate {
             column:[0,0],cells:vec![(0,[f32::NAN,SIZE])],
         }],SIZE,true,1).is_err());
@@ -1094,7 +1103,7 @@ mod tests {
     }
 
     #[test]
-    fn reordered_and_subvoxel_points_reuse_snapshot_without_refreshing_graph() {
+    fn changed_measurements_keep_source_heights_and_reuse_unchanged_graph() {
         let data = points(&scene());
         let mut builder = SurfaceMapBuilder::new(config());
         let first = builder.build(&data, SIZE).unwrap();
@@ -1106,7 +1115,15 @@ mod tests {
         reordered.extend_from_slice(&data[..20]);
         let next = builder.build(&reordered, SIZE).unwrap();
         assert_eq!(next.stats.kind, SurfaceBuildKind::Reused);
-        assert!(Arc::ptr_eq(&first.snapshot, &next.snapshot));
+        assert!(!Arc::ptr_eq(&first.snapshot, &next.snapshot));
+        assert!(Arc::ptr_eq(&first.snapshot.data.graph, &next.snapshot.data.graph));
+        let before=first.snapshot.navigation_measured_points().unwrap();
+        let after=next.snapshot.navigation_measured_points().unwrap();
+        assert_eq!(before.len(),data.len());assert_eq!(after.len(),before.len());
+        assert_eq!(before[0],[f64::from(data[0].0),f64::from(data[0].1),f64::from(data[0].2)]);
+        let expected_x=(f64::from(data[0].0)+f64::from(data[0].0+0.01))*0.5;
+        assert!((after[0][0]-expected_x).abs()<1e-12,"保留同源体素内两次实测点的均值");
+        assert_ne!(before[0],after[0]);
         assert!(!next.stats.global_cost_refresh);
     }
 
@@ -1144,8 +1161,8 @@ mod tests {
                 let from = [1.05, 1.05, z];
                 let to = [4.55, 2.05, z];
                 assert_eq!(
-                    updated.snapshot.plan(from, to).is_ok(),
-                    full.plan(from, to).is_ok()
+                    updated.snapshot.test_connected(from, to),
+                    full.test_connected(from, to)
                 );
                 assert_eq!(
                     updated

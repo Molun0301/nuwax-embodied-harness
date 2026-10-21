@@ -28,18 +28,18 @@ fn cold_reference(input: &SurfaceSnapshot, mask: Arc<VirtualObstacleMask>) -> Su
     for (id, edges) in graph.cells.iter_edges_mut() {
         edges.retain(|edge| !excluded.contains(&id) && !excluded.contains(&edge.dest));
     }
-    let regions = Arc::new(regions::RegionGraph::full(&graph, input.config().voxel_size));
     SurfaceSnapshot {
         recent_obstacles:input.recent_obstacles.clone(),
         ground_evidence: input.ground_evidence,
         observations: input.observations.clone(),
         body_query_cache: Default::default(),
+        navigation_measurements: None,
         data: Arc::new(SurfaceData {
             frontier_cache: Default::default(),
-            body_cache: Default::default(), routing_cache: Default::default(),
+            body_cache: Default::default(),
             body_envelope: input.data.body_envelope.clone(),
             height_bounds: Arc::clone(&input.data.height_bounds),
-            graph: Arc::new(graph), regions,
+            graph: Arc::new(graph),
             physical_graph: Arc::clone(&input.data.physical_graph),
             occupied_columns: Arc::clone(&input.data.occupied_columns),
             occupied_voxels: input.data.occupied_voxels,
@@ -66,20 +66,18 @@ fn equivalent(actual: &SurfaceSnapshot, expected: &SurfaceSnapshot) {
     assert_eq!(actual.data.virtual_blocked_cells, expected.data.virtual_blocked_cells);
     for (from, to) in [((3, 8, 0), (20, 8, 0)), ((3, 5, 0), (7, 10, 0))] {
         let start = actual.cell_position(from); let goal = actual.cell_position(to);
-        let a = actual.plan(start, goal); let b = expected.plan(start, goal);
-        assert_eq!(a.is_ok(), b.is_ok());
-        if let Ok(path) = a { expected.validate_path(&path).unwrap(); }
-        if let Ok(path) = b { actual.validate_path(&path).unwrap(); }
-    }
+        assert_eq!(
+            actual.test_connected(start, goal),
+            expected.test_connected(start, goal));
+        }
 }
 
 #[test]
-fn empty_exclusion_reuses_physical_graph_and_matching_regions_without_edge_writes() {
+fn empty_exclusion_reuses_physical_graph_without_edge_writes() {
     let input = scene(0.1); let mask = wide_mask(false);
     let actual = input.with_virtual_mask(mask.clone()).unwrap();
     assert!(actual.data.virtual_blocked_cells.is_empty());
     assert!(Arc::ptr_eq(&actual.data.graph, &input.data.physical_graph));
-    assert!(Arc::ptr_eq(&actual.data.regions, &input.data.regions));
     assert!(!Arc::ptr_eq(&actual.data, &input.data));
     assert!(Arc::ptr_eq(actual.data.virtual_obstacles.as_ref().unwrap(), &mask));
     for id in input.data.graph.cells.ids() {
@@ -88,25 +86,23 @@ fn empty_exclusion_reuses_physical_graph_and_matching_regions_without_edge_write
     }
     let repeated = actual.with_virtual_mask(wide_mask(false)).unwrap();
     assert!(Arc::ptr_eq(&repeated.data.graph, &input.data.physical_graph));
-    assert!(Arc::ptr_eq(&repeated.data.regions, &input.data.regions));
     let extended_mask = Arc::new(VirtualObstacleMask::new([-3.0, -3.0], 0.1,
         80, 80, &vec![false; 80 * 80]).unwrap());
     let extended = actual.with_virtual_mask(extended_mask.clone()).unwrap();
     assert!(Arc::ptr_eq(&extended.data.graph, &actual.data.graph));
-    assert!(Arc::ptr_eq(&extended.data.regions, &actual.data.regions));
     assert!(!Arc::ptr_eq(&extended.data, &actual.data));
     // Both masks permit all current graph cells, but their finite domains differ.
     assert!(!actual.data.virtual_obstacles.as_ref().unwrap().permits_cell((-25, 0, 0), 0.1, 0.1));
     assert!(extended.data.virtual_obstacles.as_ref().unwrap().permits_cell((-25, 0, 0), 0.1, 0.1));
     assert!(Arc::ptr_eq(extended.data.virtual_obstacles.as_ref().unwrap(), &extended_mask));
     equivalent(&actual, &cold_reference(&input, mask));
-    eprintln!("empty exclusion structural work: {} slots, {} live edges; graph/edge storage and regions reused",
+    eprintln!("empty exclusion structural work: {} slots, {} live edges; graph/edge storage reused",
         input.data.graph.cells.slot_capacity(),
         input.data.graph.cells.ids().map(|id| input.data.graph.cells.neighbors(id).len()).sum::<usize>());
 }
 
 #[test]
-fn empty_exclusion_after_masked_source_restores_physical_edges_and_rebuilds_regions() {
+fn empty_exclusion_after_masked_source_restores_physical_edges() {
     let physical = scene(0.1);
     let blocked = physical.with_virtual_mask(wide_mask(true)).unwrap();
     assert!(!blocked.data.virtual_blocked_cells.is_empty());
@@ -115,22 +111,19 @@ fn empty_exclusion_after_masked_source_restores_physical_edges_and_rebuilds_regi
     let mask = wide_mask(false); let restored = blocked.with_virtual_mask(mask.clone()).unwrap();
     assert!(restored.data.virtual_blocked_cells.is_empty());
     assert!(Arc::ptr_eq(&restored.data.graph, &physical.data.physical_graph));
-    assert!(!Arc::ptr_eq(&restored.data.regions, &blocked.data.regions));
     assert_eq!(edge_bits(&restored), edge_bits(&physical));
     assert_eq!(edge_bits(&blocked), retained);
     equivalent(&restored, &cold_reference(&blocked, mask));
 }
 
 #[test]
-fn empty_exclusion_body_query_shares_unchanged_geometry_and_regions() {
+fn empty_exclusion_body_query_shares_unchanged_geometry() {
     let physical = scene(0.0);
     let query = physical.clone();
     assert!(Arc::ptr_eq(&query.data.graph, &physical.data.graph));
-    assert!(Arc::ptr_eq(&query.data.regions, &physical.data.regions));
     let mask = wide_mask(false); let actual = query.with_virtual_mask(mask.clone()).unwrap();
     assert!(actual.data.virtual_blocked_cells.is_empty());
     assert!(Arc::ptr_eq(&actual.data.graph, &query.data.physical_graph));
-    assert!(Arc::ptr_eq(&actual.data.regions, &query.data.regions));
     equivalent(&actual, &cold_reference(&query, mask));
 }
 
@@ -153,7 +146,6 @@ fn nonempty_exclusion_keeps_cold_edge_and_route_behavior() {
     let actual = input.with_virtual_mask(mask.clone()).unwrap();
     assert!(!actual.data.virtual_blocked_cells.is_empty());
     assert!(!Arc::ptr_eq(&actual.data.graph, &input.data.physical_graph));
-    assert!(!Arc::ptr_eq(&actual.data.regions, &input.data.regions));
     equivalent(&actual, &cold_reference(&input, mask));
 }
 
@@ -224,7 +216,6 @@ fn retained_mask_rederives_new_physical_graph_exactly_like_full_construction() {
         assert!(Arc::ptr_eq(&actual.data.height_bounds, &physical.data.height_bounds));
         assert!(Arc::ptr_eq(&actual.data.occupied_columns, &physical.data.occupied_columns));
         assert!(!Arc::ptr_eq(&actual.data.graph, &old.data.graph));
-        assert!(!Arc::ptr_eq(&actual.data.regions, &old.data.regions));
         assert!(!Arc::ptr_eq(&actual.data.virtual_blocked_cells, &old.data.virtual_blocked_cells));
         assert_eq!(actual.ground_evidence(), physical.ground_evidence());
         assert_eq!(actual.data.occupied_voxels, physical.data.occupied_voxels);
@@ -241,28 +232,12 @@ fn retained_mask_rederives_new_physical_graph_exactly_like_full_construction() {
             assert_eq!(actual.data.graph.wall_state.dist[id as usize].to_bits(),
                 expected.data.graph.wall_state.dist[expected_id as usize].to_bits());
         }
-        // Exercise both within-tile and cross-tile region routing on the new graph.
         for (from, to) in [((3, 8, 0), (42, 8, 0)), ((20, 5, 0), (42, 10, 0)),
             ((3, 5, 0), (7, 10, 0))] {
-            let a = actual.data.graph.cells.id(from).unwrap();
-            let b = actual.data.graph.cells.id(to).unwrap();
-            let c = expected.data.graph.cells.id(from).unwrap();
-            let d = expected.data.graph.cells.id(to).unwrap();
-            let route_a = actual.data.regions.path(&actual.data.graph.cells, a, b, 0.1);
-            let route_b = expected.data.regions.path(&expected.data.graph.cells, c, d, 0.1);
-            assert_eq!(route_a.is_ok(), route_b.is_ok());
-            if let (Ok((a, _)), Ok((b, _))) = (route_a, route_b) {
-                // Equal-cost portals may be visited in a different hash iteration order.
-                for (route, map) in [(&a, &actual), (&b, &expected)] {
-                    assert_eq!(map.data.graph.cells.coord(*route.first().unwrap()), from);
-                    assert_eq!(map.data.graph.cells.coord(*route.last().unwrap()), to);
-                    for edge in route.windows(2) {
-                        assert!(map.has_edge(map.data.graph.cells.coord(edge[0]),
-                            map.data.graph.cells.coord(edge[1])));
+            assert_eq!(
+                actual.test_connected(actual.cell_position(from), actual.cell_position(to)),
+                expected.test_connected(expected.cell_position(from), expected.cell_position(to)));
                     }
-                }
-            }
-        }
     }
 }
 

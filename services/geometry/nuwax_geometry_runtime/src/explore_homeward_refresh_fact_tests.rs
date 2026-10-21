@@ -45,29 +45,28 @@ fn homeward_fact_cold_oracle(
     retained: &FrozenSurfacePlanningInput,
 ) {
     let ComputeInput::Surface { config, .. } = &context.input else { unreachable!() };
-    let tested_pct = config.follower.pct.clone();
-    assert!(tested_pct.local_costs().is_empty(), "oracle fixture has no local penalties");
+    let tested_pct = config.planner.clone();
     let mut cold = context.clone();
     let ComputeInput::Surface { config, .. } = &mut cold.input else { unreachable!() };
-    config.follower.pct = Default::default();
-    assert!(!Arc::ptr_eq(&config.follower.pct, &tested_pct));
+    config.planner = Default::default();
+    assert!(!Arc::ptr_eq(&config.planner, &tested_pct));
     let fresh_planning = cold.input.fork_for_planning();
     let fresh_routes = cold.routes(fresh_planning.as_ref()).unwrap();
     let mut retained_routes = context.routes(Some(retained)).unwrap();
     let MissionRoutes::Surface { config, .. } = &mut retained_routes else { unreachable!() };
-    assert!(Arc::ptr_eq(&config.follower.pct, &tested_pct),
+    assert!(Arc::ptr_eq(&config.planner, &tested_pct),
         "routes initially binds the current navigation config, not selection's private PCT");
-    config.follower.pct = Default::default();
+    config.planner = Default::default();
     let MissionRoutes::Surface { config: fresh_config, .. } = &fresh_routes else { unreachable!() };
-    assert!(!Arc::ptr_eq(&config.follower.pct, &fresh_config.follower.pct));
-    assert!(!Arc::ptr_eq(&config.follower.pct, &tested_pct));
+    assert!(!Arc::ptr_eq(&config.planner, &fresh_config.planner));
+    assert!(!Arc::ptr_eq(&config.planner, &tested_pct));
     let start = mission_pose_from_stamped(&context.robot_pose);
     let options = home_goal_options();
     let complete_path = |routes: &MissionRoutes| {
         let MissionRoutes::Surface { map, config, boundary } = routes else { unreachable!() };
-        nuwax_nav_stack::surface_oriented::plan_reference_cancellable(map, &config.follower.pct,
+        nuwax_nav_stack::surface_oriented::plan_reference_cancellable(map, &config.planner,
             (start.position, start.orientation_xyzw), (progress.home.position, progress.home.orientation_xyzw),
-            options, config.follower.motion_limits.as_ref(), boundary, 30_000, None).unwrap()
+            options, config.follower.body_to_support_z_m, boundary, None).unwrap()
     };
     let fresh_path = complete_path(&fresh_routes);
     let retained_path = complete_path(&retained_routes);
@@ -138,7 +137,7 @@ fn surface_homeward_same_context_reuses_actual_tomogram() {
     Arc::make_mut(&mut context.config).return_policy.maximum_distance_m = Some(100.0);
     let ComputeInput::Surface { original, config } = &context.input else { unreachable!() };
     let original = original.clone();
-    let pct = config.follower.pct.clone();
+    let pct = config.planner.clone();
     let explore_config = context.config.clone();
     let receiver = SurfaceInputReceiver::new();
     receiver.observe(original.snapshot().unwrap().clone()).unwrap();
@@ -149,7 +148,7 @@ fn surface_homeward_same_context_reuses_actual_tomogram() {
     for label in ["same_first", "same_second"] {
         let ComputeInput::Surface { original: current, config } = &context.input else { unreachable!() };
         assert!(Arc::ptr_eq(&context.config, &explore_config));
-        assert!(Arc::ptr_eq(&config.follower.pct, &pct));
+        assert!(Arc::ptr_eq(&config.planner, &pct));
         assert!(Arc::ptr_eq(current.snapshot().unwrap(), original.snapshot().unwrap()));
         assert_eq!(current.notification(), original.notification());
         work.push(homeward_fact_prepare(&mut backend, &context, &progress, label));
@@ -171,7 +170,7 @@ fn surface_homeward_between_selections_preserves_original_source_progress() {
     Arc::make_mut(&mut context.config).return_policy.maximum_distance_m = Some(100.0);
     let ComputeInput::Surface { original, config } = &context.input else { unreachable!() };
     let snapshot = original.snapshot().unwrap().clone();
-    let pct = config.follower.pct.clone();
+    let pct = config.planner.clone();
     let explore_config = context.config.clone();
     let receiver = SurfaceInputReceiver::new();
     receiver.observe(snapshot.clone()).unwrap();
@@ -204,7 +203,7 @@ fn surface_homeward_between_selections_preserves_original_source_progress() {
     assert_eq!(refreshed.notification(), original.notification() + 1);
     assert!(original.same_source_view(&refreshed));
     *original = refreshed;
-    assert!(Arc::ptr_eq(&config.follower.pct, &pct));
+    assert!(Arc::ptr_eq(&config.planner, &pct));
     assert!(Arc::ptr_eq(&context.config, &explore_config));
     let (second, _, _, second_maps, second_cells) = capture_surface_owner_work(||
         backend.prepare_request(None, selection_request(&context), || false));
@@ -233,7 +232,7 @@ fn surface_homeward_real_writer_metadata_reuses_and_scatter_invalidates() {
     // Same bounded real-Writer fixture as the existing metadata/scatter tests:
     // 50 x 30 occupied columns and exactly one two-sample measured record.
     let config = watermark_owner_config();
-    let pct = config.follower.pct.clone();
+    let pct = config.planner.clone();
     let repository = nuwax_map_chunks::Repository::temporary().unwrap();
     let mut writer = nuwax_map_chunks::Writer::new(repository, 0.1, 4 * 1024 * 1024).unwrap();
     let source = watermark_owner_source();
@@ -312,7 +311,7 @@ fn surface_homeward_real_writer_metadata_reuses_and_scatter_invalidates() {
     assert!(!metadata_input.same_planning_query_view(&changed));
     let ComputeInput::Surface { original, config } = &mut context.input else { unreachable!() };
     *original = changed;
-    assert!(Arc::ptr_eq(&config.follower.pct, &pct));
+    assert!(Arc::ptr_eq(&config.planner, &pct));
     assert!(Arc::ptr_eq(&context.config, &explore_config));
     work.push(homeward_fact_prepare(&mut backend, &context, &progress, "writer_scatter_changed"));
     let scatter_planning = backend.surface_planning.as_ref().unwrap().1.clone();
@@ -336,63 +335,43 @@ fn surface_homeward_real_writer_metadata_reuses_and_scatter_invalidates() {
 
 
 #[test]
-fn surface_homeward_warm_route_keeps_current_limits_and_cancel_nesting() {
-    use nuwax_nav_types_messages::{MotionLimits, MotionModel};
-    for invalid_limits in [false, true] {
-        let mut context = homeward_fact_unknown_context(cancellable_surface_context());
-        Arc::make_mut(&mut context.config).return_policy.maximum_distance_m = Some(100.0);
-        let ComputeInput::Surface { original, .. } = &context.input else { unreachable!() };
-        let receiver = SurfaceInputReceiver::new();
-        receiver.observe(original.snapshot().unwrap().clone()).unwrap();
-        let mut backend = ExploreComputeBackend::new(surface_controller(receiver));
-        let progress = homeward_fact_progress(&context);
-        assert_eq!(homeward_fact_prepare(&mut backend, &context, &progress, "warm_before_error").2, 1);
-        let query = Arc::downgrade(backend.surface_planning.as_ref().unwrap().1.query_snapshot().unwrap());
-        let config_owner = context.config.clone();
-        let history = checkpoint_payloads(&backend.controller);
-        let expected_error = if invalid_limits {
-            // Exactly the existing invalid-limits fixture. Only this request's
-            // navigation config changes; the Explore config/Q stay identical.
-            let limits = MotionLimits {
-                model: MotionModel::Differential,
-                max_forward_mps: 0.5, max_reverse_mps: 0.3, max_lateral_mps: 0.0,
-                max_angular_rps: 0.7, linear_acceleration_mps2: 1.0,
-                guaranteed_braking_mps2: 0.0,
-                angular_acceleration_rps2: 2.0, guaranteed_angular_braking_rps2: 2.0,
-                reaction_time_sec: 0.1, minimum_turning_radius_m: 0.0, can_rotate_in_place: true,
-            };
-            let error = limits.validate().unwrap_err();
-            assert!(limits.kinematics().validate().is_ok());
-            let ComputeInput::Surface { config, .. } = &mut context.input else { unreachable!() };
-            config.follower.motion_limits = Some(limits);
-            error
-        } else { "三维规划已取消".to_owned() };
-        let cancellation = std::sync::atomic::AtomicBool::new(false);
-        let checks = Cell::new(0);
-        let (projection, rebuilds, cells, maps, map_cells) = capture_surface_owner_work(||
-            backend.prepare_request(Some(&cancellation),
-                ComputeRequest::HomewardBudget(HomewardBudgetRequest {
-                    context: context.clone(), progress: progress.clone(),
-                }), || {
-                    checks.set(checks.get() + 1);
-                    if checks.get() == 3 { cancellation.store(true, Ordering::Release); }
-                    false
-                }));
-        assert_eq!(checks.get(), 3);
-        assert!(cancellation.load(Ordering::Acquire));
-        assert!(matches!(projection, ComputeProjection::HomewardBudget(Err(MissionRouteError::Failed(ref error)))
-            if error == &expected_error));
-        assert!(!backend.prepared.as_ref().unwrap().controller_prepared);
-        assert_eq!((rebuilds, cells, maps, map_cells), (0, 0, 0, 0));
-        let (config, planning) = backend.surface_planning.as_ref().unwrap();
-        assert!(Arc::ptr_eq(config, &config_owner));
-        assert!(std::sync::Weak::ptr_eq(&query, &Arc::downgrade(planning.query_snapshot().unwrap())));
-        assert_eq!(checkpoint_payloads(&backend.controller), history);
-        // Route Err retains its original nesting and slot until explicit Discard.
-        assert!(matches!(backend.resolve(Decision::Discard), Settlement::Discarded));
-        assert!(backend.prepared.is_none() && backend.surface_planning.is_none());
-        assert!(query.upgrade().is_none());
-        assert_eq!(checkpoint_payloads(&backend.controller), history);
-        backend.lifecycle(ComputeLifecycle::Stop(ExplorationStopReason::UserCancelled)).result.unwrap();
-    }
+fn surface_homeward_warm_route_cancellation_keeps_cache_and_nesting() {
+    let mut context = homeward_fact_unknown_context(cancellable_surface_context());
+    Arc::make_mut(&mut context.config).return_policy.maximum_distance_m = Some(100.0);
+    let ComputeInput::Surface { original, .. } = &context.input else { unreachable!() };
+    let receiver = SurfaceInputReceiver::new();
+    receiver.observe(original.snapshot().unwrap().clone()).unwrap();
+    let mut backend = ExploreComputeBackend::new(surface_controller(receiver));
+    let progress = homeward_fact_progress(&context);
+    assert_eq!(homeward_fact_prepare(&mut backend, &context, &progress, "warm_before_error").2, 1);
+    let query = Arc::downgrade(backend.surface_planning.as_ref().unwrap().1.query_snapshot().unwrap());
+    let config_owner = context.config.clone();
+    let history = checkpoint_payloads(&backend.controller);
+    let cancellation = std::sync::atomic::AtomicBool::new(false);
+    let checks = Cell::new(0);
+    let (projection, rebuilds, cells, maps, map_cells) = capture_surface_owner_work(||
+        backend.prepare_request(Some(&cancellation),
+            ComputeRequest::HomewardBudget(HomewardBudgetRequest {
+                context: context.clone(), progress: progress.clone(),
+            }), || {
+                checks.set(checks.get() + 1);
+                if checks.get() == 3 { cancellation.store(true, Ordering::Release); }
+                false
+            }));
+    assert_eq!(checks.get(), 3);
+    assert!(cancellation.load(Ordering::Acquire));
+    assert!(matches!(projection, ComputeProjection::HomewardBudget(Err(MissionRouteError::Inconclusive(ref error)))
+        if error == "PCT规划已取消"));
+    assert!(!backend.prepared.as_ref().unwrap().controller_prepared);
+    assert_eq!((rebuilds, cells, maps, map_cells), (0, 0, 0, 0));
+    let (config, planning) = backend.surface_planning.as_ref().unwrap();
+    assert!(Arc::ptr_eq(config, &config_owner));
+    assert!(std::sync::Weak::ptr_eq(&query, &Arc::downgrade(planning.query_snapshot().unwrap())));
+    assert_eq!(checkpoint_payloads(&backend.controller), history);
+    // 原生取消保留未定结果及原缓存拥有关系，直到显式丢弃。
+    assert!(matches!(backend.resolve(Decision::Discard), Settlement::Discarded));
+    assert!(backend.prepared.is_none() && backend.surface_planning.is_none());
+    assert!(query.upgrade().is_none());
+    assert_eq!(checkpoint_payloads(&backend.controller), history);
+    backend.lifecycle(ComputeLifecycle::Stop(ExplorationStopReason::UserCancelled)).result.unwrap();
 }

@@ -422,13 +422,12 @@ impl MissionRoutes {
             Self::Surface { map, config, boundary } => {
                 let path = nuwax_nav_stack::surface_oriented::plan_reference_typed(
                     map,
-                    &config.follower.pct,
+                    &config.planner,
                     (from.position, from.orientation_xyzw),
                     (to.position, to.orientation_xyzw),
                     options,
-                    config.follower.motion_limits.as_ref(),
+                    config.follower.body_to_support_z_m,
                     boundary,
-                    30_000,
                     cancellation,
                 )?;
                 let end = path.last().ok_or("返航路线为空")?;

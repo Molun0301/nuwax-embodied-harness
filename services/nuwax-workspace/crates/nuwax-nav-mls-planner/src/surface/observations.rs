@@ -865,6 +865,14 @@ impl SurfaceSnapshot {
     /// 几何相同即可继续复用静态路线；观察层由局部执行独立检查。
     pub fn same_geometry(&self, previous: &Self) -> bool {
         Arc::ptr_eq(&self.data, &previous.data) && self.ground_evidence==previous.ground_evidence
+    && match (
+                &self.navigation_measurements,
+                &previous.navigation_measurements,
+            ) {
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                (None, None) => true,
+                _ => false,
+            }
     }
 
     /// 将同一次完整提交的观察附到已有几何上。
@@ -879,6 +887,7 @@ impl SurfaceSnapshot {
             return self.clone();
         }
         Self {
+            navigation_measurements: self.navigation_measurements.clone(),
             ground_evidence:self.ground_evidence,recent_obstacles:self.recent_obstacles.clone(),
             data: Arc::clone(&self.data),
             observations,

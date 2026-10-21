@@ -6,16 +6,12 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 publish.workspace = true
-description = "Pure Rust multi-level surface (MLS) 3D path planner, migrated from dimos-mls-planner without pyo3/lcm/dimos-module."
+description = "共享三维体素、实测地面、机体几何及前沿数据组件。"
 
 [lib]
 name = "nuwax_nav_mls_planner"
 path = "src/lib.rs"
 crate-type = ["rlib"]
-
-[[bin]]
-name = "mls_planner_native"
-path = "src/bin/mls_planner_native.rs"
 
 [dependencies]
 nuwax-map-chunks = { path = "../nuwax-map-chunks" }
@@ -33,22 +29,14 @@ validator = { workspace = true, features = ["derive"] }
 image = { workspace = true }
 imageproc = { workspace = true }
 rayon = { workspace = true }
-# P0-16: stamp_pair + bin 需要 thiserror/serde/serde_json
+# 地图错误类型与本地诊断使用的序列化支持。
 thiserror = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-futures = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
-nuwax-codec = { path = "../nuwax-codec" }
-nuwax-protocol = { path = "../nuwax-protocol" }
-nuwax-transport = { path = "../nuwax-transport", features = ["real-lcm"] }
 
 [dev-dependencies]
+serde_json = { workspace = true }
 approx = { workspace = true }
 
 [features]
 default = []
 # Opt-in fixed-size, thread-local wall-time attribution for body queries.
 body-query-profile = []
-# 占位 feature:不再实际启用 pyo3,保留以兼容 stack 的 feature 约定
-python-bindings = []

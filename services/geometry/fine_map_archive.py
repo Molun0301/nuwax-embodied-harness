@@ -305,6 +305,36 @@ def _validate_layer_structure(layers, integer, *, sourced=False):
                     integer(sample["source_sequence"], 1 if source[0] == "lidar" else 0, 2 ** 64 - 1)
 
 
+def _heightfield_samples(encoded, integer):
+    """读取旧样本数组或紧凑来源表，保留每个原始数值字段。"""
+    if isinstance(encoded, list):
+        return encoded
+    if not isinstance(encoded, dict) or set(encoded) != {"sources", "values"}:
+        raise ValueError("精细地图紧凑样本字段错误")
+    sources, values = encoded["sources"], encoded["values"]
+    if (not isinstance(sources, list) or not isinstance(values, list)
+            or len(sources) > 32 or len(values) > 32):
+        raise ValueError("精细地图紧凑样本预算错误")
+    identities = []
+    for source in sources:
+        identity = (("legacy",) if source == {"kind": "legacy"}
+                    else _validate_observation_source(source, integer))
+        identities.append(({"legacy": 0, "lidar": 1, "auxiliary": 2}[identity[0]], *identity[1:]))
+    if identities != sorted(set(identities)):
+        raise ValueError("精细地图紧凑来源重复或无序")
+    used, samples = set(), []
+    for value in values:
+        if not isinstance(value, list) or len(value) != 5:
+            raise ValueError("精细地图紧凑样本数值字段错误")
+        index = integer(value[0], 0, len(sources) - 1)
+        used.add(index)
+        samples.append(dict(source=sources[index], point=value[1], source_sequence=value[2],
+                            source_timestamp_ns=value[3], point_index=value[4]))
+    if len(used) != len(sources):
+        raise ValueError("精细地图紧凑来源未被引用")
+    return samples
+
+
 def _validate_ground_records(records, integer, block_key, evidence, columns, resolution,
                              empty_columns, declared_columns):
     """BL4 data boundary; current root members define the declared surface."""
@@ -332,10 +362,11 @@ def _validate_ground_records(records, integer, block_key, evidence, columns, res
         if tagged["representation"] == "legacy_plane":
             _validate_layer_structure([[local, value]], integer, sourced=True)
             members = value["members"]
-        elif tagged["representation"] == "heightfield_v1":
+        elif tagged["representation"] in {"heightfield_v1", "heightfield_v1_compact"}:
             if not isinstance(value, dict) or set(value) != {"anchor", "height_m", "occupied_bounds", "members", "samples"}:
                 raise ValueError("精细地图高程片字段错误")
             anchor, bounds, pairs, samples = (value[k] for k in ("anchor", "occupied_bounds", "members", "samples"))
+            samples = _heightfield_samples(samples, integer)
             if not isinstance(anchor, list) or len(anchor) != 3:
                 raise ValueError("精细地图高程锚错误")
             anchor = tuple(integer(v, -(2 ** 31), 2 ** 31 - 1) for v in anchor)

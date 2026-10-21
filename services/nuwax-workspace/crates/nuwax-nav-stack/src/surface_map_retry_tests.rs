@@ -46,7 +46,6 @@ impl Probe {
                     source_timestamp_ns: message.source_timestamp_ns,
                     awaiting_build: !probe.invalid.load(Ordering::Acquire),
                     snapshot: Err("injected typed fine-source failure".into()),
-                    planar_reference: None,
                     change_basis: None,
                     geometry_changes: Arc::new(SurfaceGeometryChanges::Unknown),
                 };
@@ -83,7 +82,6 @@ async fn active(
         Duration::from_millis(25),
         config(),
         true,
-        None,
         Some(probe.computer()),
         nuwax_nav_runtime::SchedulerConfig {
             costmap_ttl: ttl,

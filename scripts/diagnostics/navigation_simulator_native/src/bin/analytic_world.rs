@@ -50,19 +50,15 @@ fn distance(a: Body, b: Body) -> f64 {
 }
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().collect();
-    if args.len() != 4 {
+    if !(3..=4).contains(&args.len()) {
         return Err(
-            "usage: analytic_world straight|obstacle|slope off|on OUTPUT (new directory)".into(),
+            "usage: analytic_world straight|obstacle|slope|unknown|discovered_wall OUTPUT [RESUME_JSON] (new directory)".into(),
         );
     }
     let case = &args[1];
-    let enabled = match args[2].as_str() {
-        "off" => false,
-        "on" => true,
-        _ => return Err("mode must be off/on".into()),
-    };
+    let resume: Option<serde_json::Value> = args.get(3).map(|path|fs::read(path).map(|bytes|serde_json::from_slice(&bytes).unwrap())).transpose()?;
     let world = match case.as_str() {
-        "straight" => World {
+        "straight" | "unknown" => World {
             plane: Plane {
                 a: 0.,
                 b: 0.,
@@ -70,7 +66,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
             solids: vec![],
         },
-        "obstacle" => World {
+        "obstacle" | "discovered_wall" => World {
             plane: Plane {
                 a: 0.,
                 b: 0.,
@@ -91,7 +87,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         _ => return Err("unknown fixed world".into()),
     };
-    let out = PathBuf::from(&args[3]);
+    let out = PathBuf::from(&args[2]);
     fs::create_dir(&out)?;
     let mut config = SurfaceNavigationConfig::from_env()?;
     let body = config
@@ -99,9 +95,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .clone()
         .ok_or("missing calibrated body")?;
     let d = config.follower.body_to_support_z_m;
-    let start = world.plane.body([0., 0.], 0., d);
+    let start = resume.as_ref().map_or_else(||world.plane.body([0.,0.],0.,d),|value|serde_json::from_value(value["pose"].clone()).unwrap());
     let goal = world.plane.body([7., 0.], 0., d);
-    let points = world.observations();
+    let full_observations = world.observations();
+    let progressive = matches!(case.as_str(), "unknown" | "discovered_wall");
+    let perception_center: Body = resume.as_ref().map_or(start,|value|serde_json::from_value(value["perception_center"].clone()).unwrap());
+    let mut points = if progressive {
+        if resume.is_some() { full_observations.iter().copied().filter(|&(x,y,_)|
+            (f64::from(x)-perception_center.0[0]).hypot(f64::from(y)-perception_center.0[1])<=1.5).collect() }
+        else {Vec::new()}
+    } else {full_observations.clone()};
     let q = f64::from(0.05_f32);
     let mut blocks = BTreeMap::<[i32; 3], BTreeMap<[i32; 3], SurfaceObservation>>::new();
     for &(x, y, z) in &points {
@@ -124,16 +127,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     obs.mark_complete_geometry_source();
     let mut builder =
         SurfaceMapBuilder::configured(config.geometry.clone(), config.body_envelope.clone());
-    let map = Arc::new(
-        builder
-            .build(&points, 0.05)?
-            .snapshot
-            .with_observations(Some(Arc::new(obs)))
+    let built = if points.is_empty() {builder.build_column_updates(&[],0.05,true,0)?}
+        else {builder.build(&points,0.05)?};
+    let mut map = Arc::new(
+        built.snapshot
+            .with_observations(if progressive && resume.is_some() {None} else {Some(Arc::new(obs))})
             .with_ground_evidence(GroundEvidence::MeasuredSurface),
     );
     // Same actuator/simulation configuration as the retained native driver;
     // planner budgets, costs and geometry tolerances remain at loaded values.
-    config.follower.local_planning_enabled = enabled;
     config.follower.controller.speed = 0.5;
     config.follower.controller.control_frequency = 1. / DT;
     config.follower.controller.simulation = true;
@@ -164,7 +166,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     fs::write(
         out.join("case.json"),
         serde_json::to_vec_pretty(
-            &json!({"case":case,"local_planning":enabled,"world":format!("{world:?}"),"start":start,"goal":goal,"source_voxel_m":q,"point_count":points.len(),"max_ticks":1200,"max_wall_seconds":90,"dt":DT,"speed_mps":0.5,"geometry":{"voxel_size":config.geometry.voxel_size,"step_threshold_m":config.geometry.step_threshold_m,"max_slope_deg":config.geometry.max_slope_deg,"wall_clearance_m":config.geometry.wall_clearance_m,"min_step_tread_depth_m":config.geometry.min_step_tread_depth_m},"scan":format!("{:?}",config.follower.scan),"body":format!("{body:?}"),"collision_scope":"plane nominal support constraint plus full calibrated convex envelope versus solid boxes; no leg/gait ground penetration claim","quantization":"ground nearest source top face <= half source voxel; solids conservative occupied cells"}),
+            &json!({"case":case,"local_planning":true,"world":format!("{world:?}"),"start":start,"goal":goal,"source_voxel_m":q,"point_count":points.len(),"max_ticks":1200,"max_wall_seconds":90,"dt":DT,"speed_mps":0.5,"geometry":{"voxel_size":config.geometry.voxel_size,"step_threshold_m":config.geometry.step_threshold_m,"max_slope_deg":config.geometry.max_slope_deg,"wall_clearance_m":config.geometry.wall_clearance_m,"min_step_tread_depth_m":config.geometry.min_step_tread_depth_m},"scan":format!("{:?}",config.follower.scan),"body":format!("{body:?}"),"collision_scope":"plane nominal support constraint plus full calibrated convex envelope versus solid boxes; no leg/gait ground penetration claim","quantization":"ground nearest source top face <= half source voxel; solids conservative occupied cells"}),
         )?,
     )?;
     let options = GoalOptions {
@@ -183,7 +185,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .open(out.join("ticks.jsonl"))?;
     let began = Instant::now();
     let mut current = start;
-    let mut applied = [0.; 3];
+    let mut applied = resume.as_ref().map_or([0.;3],|value|serde_json::from_value(value["applied"].clone()).unwrap());
     let mut need_plan = true;
     let mut braking = false;
     let mut plans = 0;
@@ -195,21 +197,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut plan_times = Vec::new();
     let mut world_checks = 0;
     let mut world_failures = 0;
-    let mut production_checks = 0;
-    let mut production_failures = 0;
+    let mut sensed_at = perception_center;
+    let mut perception_updates = 0;
+    let mut unknown_departure = false;
+    if let Some(value)=&resume {
+        let route: Vec<Body> = serde_json::from_value(value["reference"].clone())?;
+        follower.observe_applied_command(twist(applied));
+        follower.replace_execution_path(ExecutionPath::Surface(Path3D {
+            poses: route.into_iter().map(|pose|stamped(pose,0.)).collect(),
+        }),None,stamped(goal,0.))?;
+        need_plan=false;
+    }
     for tick in 0..1200 {
         let tick_start = Instant::now();
         if began.elapsed().as_secs_f64() > 90. {
             outcome = "wall_time_limit";
             break;
         }
+        if progressive && distance(current,sensed_at)>0.1 {
+            // 感知只看到当前位置半径内的观测，独立世界仍保留全部实体。
+            points = full_observations.iter().copied().filter(|&(x,y,_)|
+                (f64::from(x)-current.0[0]).hypot(f64::from(y)-current.0[1])<=1.5).collect();
+            map = Arc::new(builder.build(&points,0.05)?.snapshot.as_ref().clone());
+            follower.update_execution_map(ExecutionMap::Surface(map.clone()))?;
+            sensed_at=current; perception_updates+=1;
+        }
         if need_plan {
             let p = Instant::now();
-            let route =
-                config
-                    .follower
-                    .pct
-                    .body_route(&map, current, goal, options, &[], Some(&cancel));
+            let route = config.planner.route(&map, current, goal, options, &[], d, Some(&cancel));
             plan_times.push(p.elapsed().as_secs_f64() * 1000.);
             plans += 1;
             match route {
@@ -259,11 +274,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 braking = true;
                 [0.; 3]
             }
-            PlannerStep::GroundArrival(_) => {
-                outcome = "unsupported_ground_arrival";
-                failure = Some("Ground arrival is unsupported in the Body-only analytic world".into());
-                break;
-            }
             PlannerStep::Failed(reason) => {
                 outcome = "controller_failure";
                 failure = Some(reason);
@@ -275,25 +285,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         world_checks += 1;
         let physical =
             world.check_motion(current, mean, DT, d, &body.footprint_xy_m, body.z_bounds_m);
-        production_checks += 1;
-        let production = map
-            .with_current_body_support(current.0, current.1)
-            .and_then(|m| m.validate_body_motion(current, next, &[]));
-        if physical.is_err() {
-            world_failures += 1;
-        }
-        if production.is_err() {
-            production_failures += 1;
-        }
+        if physical.is_err() { world_failures += 1; }
+        if progressive && perception_updates==0 && command[0]>0.0 {unknown_departure=true;}
         writeln!(
             states,
             "{}",
-            json!({"event":"motion","tick":tick,"time":time,"from":current,"next":next,"command":command,"applied":next_velocity,"held_mean_twist":mean,"world_check":physical,"production_check":production.as_ref().map(|_|()).map_err(|e|e.to_string()),"control_ms":control_times.last(),"note":note})
+            json!({"event":"motion","tick":tick,"time":time,"from":current,"next":next,"command":command,"applied":next_velocity,"held_mean_twist":mean,"world_check":physical,"control_ms":control_times.last(),"note":note})
         )?;
         ticks = tick + 1;
-        if world_failures > 0 || production_failures > 0 {
+        if world_failures > 0 {
             outcome = "motion_disagreement_or_collision";
-            failure = Some(format!("world={physical:?}; production={production:?}"));
+            failure = Some(format!("world={physical:?}"));
             break;
         }
         current = next;
@@ -316,7 +318,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if tick % 200 == 0 {
             eprintln!(
                 "ANALYTIC_PROGRESS {case} {} tick={tick} remaining={:.3}",
-                args[2],
+                "SCAN",
                 distance(current, goal)
             );
         }
@@ -328,7 +330,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let median = control_times.get(control_times.len() / 2);
     let p95 = control_times
         .get((control_times.len() * 95 / 100).min(control_times.len().saturating_sub(1)));
-    let summary = json!({"case":case,"local_planning":enabled,"outcome":outcome,"failure":failure,"ticks":ticks,"sim_seconds":time,"wall_seconds":began.elapsed().as_secs_f64(),"final_pose":current,"distance_remaining_m":distance(current,goal),"world_checks":world_checks,"world_failures":world_failures,"production_checks":production_checks,"production_failures":production_failures,"global_plans":plans,"local_planning_calls":follower.local_planning_calls(),"control_ms":{"median":median,"p95":p95,"max":control_times.last(),"over50ms":control_times.iter().filter(|v|**v>50.).count()},"global_plan_ms":plan_times});
+    let summary = json!({"case":case,"local_planning":true,"outcome":outcome,"failure":failure,"ticks":ticks,"sim_seconds":time,"wall_seconds":began.elapsed().as_secs_f64(),"final_pose":current,"distance_remaining_m":distance(current,goal),"world_checks":world_checks,"world_failures":world_failures,"perception_updates":perception_updates,"unknown_departure":unknown_departure,"global_plans":plans,"local_planning_calls":follower.local_planning_calls(),"control_ms":{"median":median,"p95":p95,"max":control_times.last(),"over50ms":control_times.iter().filter(|v|**v>50.).count()},"global_plan_ms":plan_times});
     fs::write(
         out.join("summary.json"),
         serde_json::to_vec_pretty(&summary)?,

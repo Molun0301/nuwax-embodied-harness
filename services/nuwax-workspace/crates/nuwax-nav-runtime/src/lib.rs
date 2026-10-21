@@ -28,7 +28,6 @@ use tokio::time::{interval_at, Instant, MissedTickBehavior};
 
 mod arrival_confirmation;
 use arrival_confirmation::{ArrivalConfirmation, ArrivalKind};
-pub use surface_follower::arrival_evidence::GroundArrivalEvidence;
 mod command_dispatch;
 pub use command_dispatch::CommandDispatchBound;
 /// Explicit elapsed-time observer seam for bounded recovery qualifications.
@@ -43,148 +42,33 @@ pub use nuwax_nav_mls_planner::SurfaceSnapshot;
 pub use surface_follower::{SurfaceFollower, SurfaceFollowerConfig};
 /// Shared ON/OFF source-change proofs.
 pub mod surface_changes;
-mod route_follower;
-mod planning_owner;
-mod route_planning;
-/// Explicit, bounded real-input capture for ignored cross-crate qualifications.
-#[cfg(feature="local-guidance-qualification")]
-pub mod local_guidance_qualification;
+/// 原生地图输入适配。
+pub mod native_map;
+/// 三维路线与局部执行共用同一个原生内核拥有者。
+pub type RouteFollower = SurfaceFollower;
 #[cfg(test)]
-mod route_moving_worker_tests;
+mod native_test_helpers;
 #[cfg(test)]
 mod control_profile;
 #[cfg(test)]
 mod command_proof_trace;
-pub use route_follower::RouteFollower;
-#[cfg(feature = "surface-recovery-qualification")]
-pub use route_follower::route_change_scope_qualification;
-#[cfg(feature = "surface-recovery-qualification")]
-pub use route_follower::route_completed_slot_qualification;
-#[cfg(feature = "surface-recovery-qualification")]
-pub use route_follower::route_pending_source_qualification;
-#[cfg(feature = "surface-recovery-qualification")]
-pub use route_follower::route_r11_qualification;
-#[cfg(feature = "surface-recovery-qualification")]
-pub use route_follower::route_pending_only_nohold_qualification;
 
-/// Explicit in-process target. Public/wire producers continue to construct Body.
+/// 平台机体参考目标。
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExecutionGoal {
-    /// Existing full body-reference pose.
+    /// 完整机体位置和姿态。
     Body(PoseStamped),
-    /// Independent Ground XY/yaw/height-presence request.
-    Ground(GroundExecutionGoal),
-}
-
-/// Ground does not contain a synthetic body Z or a resolved-height shadow.
-#[derive(Debug, Clone, PartialEq)]
-pub struct GroundExecutionGoal {
-    /// Authoritative request frame.
-    pub frame_id: nuwax_nav_types_messages::NavFrameId,
-    /// Requested horizontal position.
-    pub xy: [f64; 2],
-    /// Requested yaw, with the original orientation option deciding its use.
-    pub yaw: f64,
-    /// Requested Ground height; absent and explicit zero remain distinct.
-    pub requested_ground_z: Option<f64>,
 }
 impl ExecutionGoal {
-    /// Explicit compatibility access; Ground never supplies a placeholder Body.
-    pub fn as_body(&self) -> Option<&PoseStamped> {
-        match self { Self::Body(pose) => Some(pose), Self::Ground(_) => None }
+    /// 读取机体目标。
+    pub fn as_body(&self) -> Option<&PoseStamped> { let Self::Body(pose)=self; Some(pose) }
+    /// 修改机体目标。
+    pub fn as_body_mut(&mut self) -> Option<&mut PoseStamped> { let Self::Body(pose)=self; Some(pose) }
+    /// 比较原机体目标的实际几何，忽略传输时刻。
+    pub fn same_geometry(&self, other:&Self)->bool {
+        replan_feedback::same_pose(self.as_body().unwrap(),other.as_body().unwrap())
     }
-    /// Mutable Body access for existing explicitly Body-only producers.
-    pub fn as_body_mut(&mut self) -> Option<&mut PoseStamped> {
-        match self { Self::Body(pose) => Some(pose), Self::Ground(_) => None }
-    }
-    /// Explicit typed Ground access.
-    pub fn as_ground(&self) -> Option<&GroundExecutionGoal> {
-        match self { Self::Ground(goal) => Some(goal), Self::Body(_) => None }
-    }
-    pub(crate) fn same_geometry(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Body(a), Self::Body(b)) => replan_feedback::same_pose(a,b),
-            (Self::Ground(a), Self::Ground(b)) => a.frame_id==b.frame_id
-                && a.xy.map(f64::to_bits)==b.xy.map(f64::to_bits)
-                && a.yaw.to_bits()==b.yaw.to_bits()
-                && a.requested_ground_z.map(f64::to_bits)==b.requested_ground_z.map(f64::to_bits),
-            _ => false,
-        }
-    }
-    pub(crate) fn validate(&self) -> Result<(), RuntimeError> {
-        match self {
-            Self::Body(pose) => validate_map_pose(pose, "goal_pose"),
-            Self::Ground(goal) => {
-                if goal.frame_id != nuwax_nav_types_messages::NavFrameId::Map
-                    || goal.xy.into_iter().chain([goal.yaw]).chain(goal.requested_ground_z)
-                        .any(|v| !v.is_finite())
-                    {
-                    return Err(RuntimeError::InvalidInput { field: "ground_goal",
-                        reason: "Ground requires finite map XY/yaw and optional finite height".into() });
-                }
-                Ok(())
-            }
-        }
-    }
-}
-impl GroundExecutionGoal {
-    pub(crate) fn matches_reference(&self, reference: &nuwax_nav_pct::ground_route::GroundRouteReference) -> bool {
-        let target = reference.original_goal();
-        self.xy.map(f64::to_bits) == target.xy.map(f64::to_bits)
-            && self.requested_ground_z.map(f64::to_bits) == target.requested_ground_z.map(f64::to_bits)
-    }
-}
-
-/// One captured Initial at A, retained before asynchronous planning can wait.
-/// Fields stay private; installing it never overwrites latest odometry at B.
-#[derive(Clone, Debug, PartialEq)]
-pub struct GroundInitialCapture {
-    basis: nuwax_nav_pct::ground_route::OwnedGroundWalkState,
-    actual: Arc<ActualExecutionContext>,
-}
-impl GroundInitialCapture {
-    /// Pair a legal source-owned basis with the already observed physical input.
-    /// The execution owner validates and consumes A to the current observation.
-    pub fn from_actual(basis: nuwax_nav_pct::ground_route::OwnedGroundWalkState,
-        actual: Arc<ActualExecutionContext>) -> Result<Self, RuntimeError> {
-        validate_map_pose(&actual.odometry, "ground_initial.actual")?;
-        let p = actual.odometry.pose.position;
-        if basis.walk_state().xy() != [p.x, p.y]
-            || !basis.matches_source(&actual.source)
-            || actual.navigation.as_ref().is_some_and(|navigation|
-                navigation.continuation().map_or(true, |state| state != basis)) {
-            return Err(RuntimeError::InvalidInput { field: "ground_initial",
-                reason: "Initial must pair the captured actual pose with its legal source-owned basis".into() });
-        }
-        Ok(Self { basis, actual })
-    }
-    /// Original captured basis, never a route endpoint synthesized after a wait.
-    pub fn basis(&self) -> &nuwax_nav_pct::ground_route::OwnedGroundWalkState { &self.basis }
-    /// Complete captured physical observation and source.
-    pub fn actual(&self) -> &Arc<ActualExecutionContext> { &self.actual }
-}
-
-/// Original PCT reference and its body guidance; neither can erase the other.
-#[derive(Clone, Debug)]
-pub struct GroundExecutionPath {
-    /// Immutable original navigation owner, including its original target.
-    pub reference: nuwax_nav_pct::ground_route::GroundRouteReference,
-    /// Full physical guidance, not the target's Ground height.
-    pub body_guidance: Path3D,
-}
-impl PartialEq for GroundExecutionPath {
-    fn eq(&self, other: &Self) -> bool {
-        let a = self.reference.original_goal(); let b = other.reference.original_goal();
-        self.reference.position(0, 0, 0.0).zip(other.reference.position(0, 0, 0.0))
-            .is_some_and(|(a,b)| a.window_to(b).is_some())
-            && a.xy.map(f64::to_bits) == b.xy.map(f64::to_bits)
-            && a.requested_ground_z.map(f64::to_bits) == b.requested_ground_z.map(f64::to_bits)
-            && same_surface_geometry(&self.body_guidance, &other.body_guidance)
-    }
-}
-fn same_surface_geometry(left: &Path3D, right: &Path3D) -> bool {
-    left.poses.len() == right.poses.len() && left.poses.iter().zip(&right.poses)
-        .all(|(left,right)| replan_feedback::same_pose(left,right))
+    pub(crate) fn validate(&self)->Result<(),RuntimeError> { validate_map_pose(self.as_body().unwrap(),"goal_pose") }
 }
 
 /// 局部执行保留路径维度，三维路径不能通过默认适配静默丢弃高度。
@@ -194,8 +78,6 @@ pub enum ExecutionPath {
     Planar(Path2D),
     /// 完整机体参考位置与姿态路径。
     Surface(Path3D),
-    /// Typed Ground retains the original immutable reference and physical guidance.
-    Ground(GroundExecutionPath),
 }
 
 // Resend timestamps do not change the route actually consumed by a follower.
@@ -207,7 +89,6 @@ fn same_execution_path(left: &ExecutionPath, right: &ExecutionPath) -> bool {
         (ExecutionPath::Surface(left), ExecutionPath::Surface(right)) =>
             left.poses.len() == right.poses.len() && left.poses.iter().zip(&right.poses)
                 .all(|(left, right)| left.frame_id == right.frame_id && left.pose == right.pose),
-        (ExecutionPath::Ground(left), ExecutionPath::Ground(right)) => left == right,
         _ => false,
     }
 }
@@ -377,8 +258,6 @@ pub struct NavSession {
     pub motion_admission: NavMotionAdmission,
     /// One authoritative typed request; wire callers explicitly choose Body.
     pub goal: ExecutionGoal,
-    /// One-time actual Initial captured before the first asynchronous wait.
-    pub ground_initial: Option<GroundInitialCapture>,
 }
 
 /// A planner path with the correlation fields required for safe cutover.
@@ -423,28 +302,12 @@ pub enum TerminalOutcome {
     Cancelled,
     /// 规划到达、租约已围栏，停车后采样仍满足原目标。
     Succeeded,
-    /// Verified stop and fresh XY/yaw, but the requested Ground layer is incomplete.
-    GoalIncomplete {
-        /// Typed non-success reason, never translated into NoPath.
-        reason: GoalIncompleteReason,
-        /// Horizontal goal region reached after the verified stop.
-        xy_reached: bool,
-    },
     /// Planner failed and the lease was fenced.
     PlannerFailed,
     /// A versioned-path protocol violation was fenced.
     SafetyFailed,
     /// Scheduler shutdown fenced the active lease.
     Shutdown,
-}
-
-/// Ground terminal reason carried inside the existing verified terminal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GoalIncompleteReason {
-    /// No current independent target-layer association was established.
-    TargetLayerUnresolved,
-    /// Independent current sources establish a different layer.
-    KnownLayerConflict,
 }
 
 /// Observable state published by the scheduler task.
@@ -980,9 +843,7 @@ pub enum PlannerStep {
     /// Continue controlling with this twist.
     Command(Twist2),
     /// No admitted control result yet; retain route/goal and the existing wait deadline.
-    Pending(Vec<nuwax_nav_scan::LocalPlanError>),
-    /// Ground original terminal actually consumed; stop confirmation is still required.
-    GroundArrival(Arc<GroundArrivalEvidence>),
+    Pending(Vec<String>),
     /// Goal arrival detected.
     Succeeded,
     /// Planner cannot safely continue.
@@ -1004,8 +865,7 @@ struct LocalExecutionCommandIntent {
 #[derive(Debug, Clone, PartialEq)]
 enum LocalExecutionPayload {
     Command(Twist2),
-    Pending(Vec<nuwax_nav_scan::LocalPlanError>),
-    GroundArrival(Arc<GroundArrivalEvidence>),
+    Pending(Vec<String>),
     Succeeded,
     Failed(String),
     ReplanRequired(String),
@@ -1013,6 +873,8 @@ enum LocalExecutionPayload {
 
 /// Synchronous deterministic planner boundary.
 pub trait NavPlanner: Send + 'static {
+    /// 由调度器在启动时传入实际控制周期。
+    fn set_control_period(&mut self, _period: Duration) {}
     /// Refresh only actual source/pose/carried-ground observations. This must
     /// neither step a controller nor validate a predicted motion or issue a command.
     /// `applied` is the caller's consumed actuator feedback, never a candidate.
@@ -1027,12 +889,6 @@ pub trait NavPlanner: Send + 'static {
     /// Take observation timing metadata belonging only to the immediately returned command.
     /// None means that this result has no finite observation-time dependency.
     fn take_command_dispatch_bound(&mut self)->Option<CommandDispatchBound> {None}
-    /// Recheck the previous selected full stopping trajectory against the latest
-    /// complete surface update. None keeps the legacy full-computation behavior.
-    fn revalidate_selected_command(&mut self,_command:Twist2)->Option<PlannerStep> {None}
-    /// Recheck the unissued selected command from latest odometry and actual
-    /// applied velocity, without selecting another candidate or renewing its lease.
-    fn revalidate_selected_command_at_current_state(&mut self,_command:Twist2)->Option<PlannerStep> {None}
     /// 传递既有导航会话标识用于计算线程日志，不参与运动准入。
     fn set_goal_log_context(&mut self, _goal_id: &str) {}
     /// 接续局部路线时保留已受理任务边界；无局部重规划的后端可沿原全局路径。
@@ -1043,29 +899,12 @@ pub trait NavPlanner: Send + 'static {
         if options.allow_reverse {return Err(RuntimeError::InvalidInput {field:"allow_reverse",reason:"执行后端未声明倒车能力".into()});}
         Ok(())
     }
-    /// Typed internal entry. Unsupported backends explicitly reject Ground.
-    fn configure_execution_goal(&mut self, goal: &ExecutionGoal,
-        options: nuwax_nav_types_messages::GoalOptions, initial: Option<GroundInitialCapture>)
-        -> Result<(), RuntimeError> {
-        match (goal, initial) {
-            (ExecutionGoal::Body(pose), None) => self.configure_goal(pose, options),
-            _ => Err(RuntimeError::InvalidInput { field: "execution_goal",
-                reason: "backend does not support typed Ground initialization".into() }),
-        }
-    }
-    /// Consume the retained Initial after source, boundary and pose installation.
-    /// This is a commit hook; refresh_execution_context remains read-only.
-    fn consume_initial_actual_for_planning(&mut self) -> Result<(), RuntimeError> { Ok(()) }
-    /// Typed path adapter retains Body numerical and controller behavior.
-    fn replace_typed_execution_path(&mut self, path: ExecutionPath, yaws: Option<Vec<f64>>,
-        goal: ExecutionGoal) -> Result<(), RuntimeError> {
-        match goal {
-            ExecutionGoal::Body(pose) if !matches!(&path, ExecutionPath::Ground(_)) =>
-                self.replace_execution_path(path, yaws, pose),
-            _ => Err(RuntimeError::InvalidInput { field: "execution_path",
-                reason: "backend does not support typed Ground paths".into() }),
-        }
-    }
+    /// 目标配置沿平台机体语义传递。
+    fn configure_execution_goal(&mut self, goal:&ExecutionGoal, options:nuwax_nav_types_messages::GoalOptions)
+        -> Result<(),RuntimeError> { self.configure_goal(goal.as_body().unwrap(),options) }
+    /// 路径保留三维机体参考。
+    fn replace_typed_execution_path(&mut self,path:ExecutionPath,yaws:Option<Vec<f64>>,goal:ExecutionGoal)
+        ->Result<(),RuntimeError> { self.replace_execution_path(path,yaws,goal.as_body().unwrap().clone()) }
     /// Replace the active plan after version validation.
     fn replace_path(&mut self, path: Path2D);
     /// 替换路径与可选朝向；不使用朝向的兼容后端仍沿原接口运行。
@@ -1084,7 +923,7 @@ pub trait NavPlanner: Send + 'static {
                 self.replace_path_with_orientations(path, yaws);
                 Ok(())
             }
-            ExecutionPath::Surface(_) | ExecutionPath::Ground(_) => Err(RuntimeError::InvalidInput {
+            ExecutionPath::Surface(_) => Err(RuntimeError::InvalidInput {
                 field: "execution_path",
                 reason: "当前局部后端不支持三维路径".into(),
             }),
@@ -1111,7 +950,7 @@ pub trait NavPlanner: Send + 'static {
     fn invalidate_execution_map(&mut self) {
         self.stop();
     }
-    /// 接收唯一运动端已确认的指令；后台计算不能把未执行候选当作当前速度。
+    /// 接收运动端确认已应用的命令值，供下一拍规划接续；候选在回执前不进入该状态。
     fn observe_applied_command(&mut self, _command: Twist2) {}
     /// 计算未完成或控制许可过期时的等待原因；命令回执不能覆盖该执行阶段。
     fn execution_wait_reason(&self) -> Option<String> { None }
@@ -1293,8 +1132,9 @@ where
     P: NavPlanner,
 {
     /// Construct a scheduler without starting a task.
-    pub fn new(motion: M, planner: P, config: SchedulerConfig) -> Result<Self, RuntimeError> {
+    pub fn new(motion: M, mut planner: P, config: SchedulerConfig) -> Result<Self, RuntimeError> {
         validate_config(config)?;
+        planner.set_control_period(config.tick_interval);
         let status = SchedulerStatus {
             motion_sink_ready: true,
             message: "motion scheduler ready".into(),
@@ -1650,7 +1490,6 @@ where
             InputKind::UpdateObstacleSource(map, available, bound) => (|| {
                 if let Some(map)=map {
                     self.planner.update_execution_map(map.clone())?;
-                    if let Some(pending)=&mut self.arrival_confirmation {pending.observe_accepted_map(&map);}
                 }
                 self.obstacle_source_available=available;
                 self.obstacle_source_bound=bound;
@@ -1668,8 +1507,7 @@ where
                     self.planner.refresh_execution_context(self.status.last_applied_twist.unwrap_or(Twist2::ZERO))
                         .filter(|context| self.latest_pose.as_ref().is_some_and(|pose|
                             replan_feedback::same_pose(pose, &context.odometry)))
-                        .filter(|context| self.session.as_ref().is_some_and(|session|
-                            !matches!(&session.goal, ExecutionGoal::Ground(_)) || context.navigation.is_some()))
+
                 } else { None };
                 let _ = reply.send(context);
                 Ok(())
@@ -1775,9 +1613,6 @@ where
             validate_source_timestamp("costmap.source_timestamp_ns",observation.source_timestamp_ns,self.costmap_receipt)?;
         }
         self.planner.update_execution_map(observation.costmap.clone())?;
-        if let Some(pending)=&mut self.arrival_confirmation {
-            pending.observe_accepted_map(&observation.costmap);
-        }
         if !unchanged_surface_source {
             self.costmap_receipt = Some(PlannerInputReceipt {
                 source_timestamp_ns: observation.source_timestamp_ns, received_at,
@@ -1859,7 +1694,7 @@ where
         let guard_generation = motion_admission.guard_generation;
         self.planner.stop();
         self.planner.set_goal_log_context(&session.session_id);
-        self.planner.configure_execution_goal(&session.goal,session.options,session.ground_initial.clone())?;
+        self.planner.configure_execution_goal(&session.goal,session.options)?;
         self.planner.configure_boundary(&session.boundary);
         self.session = Some(session);
         self.current_path_revision = 0;
@@ -2158,22 +1993,7 @@ where
                 self.publish_status(status_tx);
                 Ok(())
             }
-            LocalExecutionPayload::GroundArrival(evidence) => {
-                if self.session.as_ref().and_then(|session|session.goal.as_ground())
-                    != Some(evidence.goal()) {
-                    return Err(self.fail_closed(status_tx,
-                        RuntimeError::Planner("Ground arrival belongs to a different target".into())).await);
-                }
-                // The same fence implementation freezes evidence before its first
-                // planner.stop clears the original consumed cursor.
-                self.finish_terminal_with_arrival(status_tx, TerminalOutcome::Succeeded,
-                    SchedulerPhase::Idle, Some(evidence)).await
-            }
             LocalExecutionPayload::Succeeded => {
-                if self.session.as_ref().is_some_and(|session| matches!(&session.goal, ExecutionGoal::Ground(_))) {
-                    return Err(self.fail_closed(status_tx,
-                        RuntimeError::Planner("Ground requires owner-issued typed arrival evidence".into())).await);
-                }
                 self.finish_terminal(status_tx, TerminalOutcome::Succeeded, SchedulerPhase::Idle)
                     .await
             }
@@ -2310,7 +2130,6 @@ where
         let payload = match step {
             PlannerStep::Command(twist) => LocalExecutionPayload::Command(twist),
             PlannerStep::Pending(failures) => LocalExecutionPayload::Pending(failures),
-            PlannerStep::GroundArrival(evidence) => LocalExecutionPayload::GroundArrival(evidence),
             PlannerStep::Succeeded => LocalExecutionPayload::Succeeded,
             PlannerStep::Failed(reason) => LocalExecutionPayload::Failed(reason),
             PlannerStep::ReplanRequired(reason) => LocalExecutionPayload::ReplanRequired(reason),
@@ -2483,16 +2302,6 @@ where
         terminal: TerminalOutcome,
         phase_after: SchedulerPhase,
     ) -> Result<(), RuntimeError> {
-        self.finish_terminal_with_arrival(status_tx, terminal, phase_after, None).await
-    }
-
-    async fn finish_terminal_with_arrival(
-        &mut self,
-        status_tx: &watch::Sender<SchedulerStatus>,
-        terminal: TerminalOutcome,
-        phase_after: SchedulerPhase,
-        ground_arrival: Option<Arc<GroundArrivalEvidence>>,
-    ) -> Result<(), RuntimeError> {
         #[cfg(feature = "surface-recovery-qualification")]
         let _qualification_span = self.qualification_span("scheduler.finish_terminal", self.status.pose_source_timestamp_ns);
         #[cfg(feature = "surface-recovery-qualification")]
@@ -2545,6 +2354,8 @@ where
                 return Err(error);
             }
             self.lease_active = false;
+            // 已验证的归零证明同步到规划器命令边界，下一目标从已确认零速命令接续。
+            self.planner.observe_applied_command(Twist2::ZERO);
             verified_fence = Some(proof);
         } else if terminal == TerminalOutcome::Shutdown && self.status.last_terminal.is_some() {
             self.status.phase = SchedulerPhase::Idle;
@@ -2558,7 +2369,7 @@ where
                 proof: verified_fence.take().expect("已确认真实停车"),
                 confirmed_at: Instant::now(), resume_requested: false,
                 execution_identity: arrived_identity,
-                kind: ground_arrival.map_or(ArrivalKind::Body, ArrivalKind::ground),
+                kind: ArrivalKind::Body,
             });
             self.status.phase = SchedulerPhase::Fencing;
             self.status.last_applied_twist = Some(Twist2::ZERO);
@@ -3052,10 +2863,6 @@ fn stale_receipt_reason(
 fn validate_session(session: &NavSession) -> Result<(), RuntimeError> {
     session.options.validate().map_err(|reason| RuntimeError::InvalidInput {field:"goal_options",reason})?;
     session.goal.validate()?;
-    if matches!(&session.goal, ExecutionGoal::Ground(_)) != session.ground_initial.is_some() {
-        return Err(RuntimeError::InvalidInput { field: "ground_initial",
-            reason: "Ground requires its captured Initial; Body must not carry one".into() });
-    }
     if session.session_id.trim().is_empty() {
         return Err(RuntimeError::InvalidInput {
             field: "session_id",
@@ -3107,14 +2914,8 @@ fn validate_session(session: &NavSession) -> Result<(), RuntimeError> {
 }
 
 fn validate_goal_path_pair(goal: &ExecutionGoal, path: &ExecutionPath) -> Result<(), RuntimeError> {
-    match (goal,path) {
-        (ExecutionGoal::Ground(goal), ExecutionPath::Ground(path))
-            if goal.matches_reference(&path.reference)
-                && path.body_guidance.poses.iter().all(|pose|pose.frame_id==goal.frame_id) => Ok(()),
-        (ExecutionGoal::Body(_), ExecutionPath::Planar(_) | ExecutionPath::Surface(_)) => Ok(()),
-        _ => Err(RuntimeError::InvalidInput { field: "execution_path.goal",
-            reason: "path reference and original typed target differ".into() }),
-    }
+    let _ = (goal,path);
+    Ok(())
 }
 
 fn validate_path_shape(path: &VersionedPath) -> Result<(), RuntimeError> {
@@ -3141,7 +2942,7 @@ fn validate_path_shape(path: &VersionedPath) -> Result<(), RuntimeError> {
                 });
             }
         }
-        ExecutionPath::Surface(surface) | ExecutionPath::Ground(GroundExecutionPath { body_guidance: surface, .. }) => {
+        ExecutionPath::Surface(surface) => {
             if surface.poses.is_empty() || path.path_yaws.is_some() {
                 return Err(RuntimeError::InvalidInput {
                     field: "path.payload",
@@ -3234,12 +3035,9 @@ fn path_rejected(reason: impl Into<String>) -> RuntimeError {
 mod tests {
     include!("scheduler_delivery_gap_tests.rs");
     include!("arrival_confirmation_tests.rs");
-    include!("ground_arrival_tests.rs");
     include!("position_zero_runtime_tests.rs");
     include!("yaw_zero_contract_tests.rs");
-    include!("zero_goal_on_integration_tests.rs");
     include!("recent_source_health_tests.rs");
-    include!("scheduler_detour_cancellation_tests.rs");
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -3947,7 +3745,6 @@ mod tests {
                 motion_stop_generation: 1,
             },
             goal: ExecutionGoal::Body(nuwax_nav_astar::helpers::make_pose_stamped("map", 2.0, 0.0, 0.0)),
-            ground_initial: None,
         }
     }
 
@@ -4735,7 +4532,7 @@ mod tests {
             }
         })
         .await
-        .expect("调度阶段等待超时");
+        .unwrap_or_else(|_|panic!("调度阶段等待超时: {:?}",handle.status()));
     }
 
     #[tokio::test]
@@ -4749,10 +4546,7 @@ mod tests {
             fn update_costmap(&mut self, _: CostMap2D) {}
             fn step(&mut self, _: f64) -> PlannerStep {
                 if let Some(release) = self.release.take() { release.recv().unwrap(); }
-                PlannerStep::Pending(vec![nuwax_nav_scan::LocalPlanError { body_witness: None,
-                    kind: nuwax_nav_scan::LocalPlanFailureKind::BudgetExhausted,
-                    reason: "finite search budget".into(), closest_pose: None, blocked: None,
-                }])
+                PlannerStep::Pending(vec!["BudgetExhausted: finite search budget".into()])
             }
             fn execution_wait_reason(&self) -> Option<String> { Some("typed search pending".into()) }
             fn stop(&mut self) {}
@@ -4805,12 +4599,7 @@ mod tests {
             for has_failures in [false, true] {
                 let planner = FakePlanner::commanding();
                 let failures = if has_failures {
-                    vec![nuwax_nav_scan::LocalPlanError { body_witness: None,
-                        kind: nuwax_nav_scan::LocalPlanFailureKind::BudgetExhausted,
-                        reason: "finite search budget; observation expired; required clearance".into(),
-                        closest_pose: None,
-                        blocked: None,
-                    }]
+                    vec!["BudgetExhausted: finite search budget; observation expired; required clearance".into()]
                 } else { vec![] };
                 {
                     let mut state = planner.state.lock().unwrap();
@@ -5099,6 +4888,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn verified_fence_resets_the_native_command_boundary_before_the_next_goal() {
+        let (mut scheduler,status,_motion,start)=zero_position_surface_scheduler().await;
+        scheduler.apply_controller_twist(&status,Twist2 {linear:Point2::new(0.2,0.),angular_z:0.}).await.unwrap();
+        scheduler.finish_terminal(&status,TerminalOutcome::Cancelled,SchedulerPhase::Idle).await.unwrap();
+        let mut goal=start.clone();goal.pose.position.x+=1.;
+        let mut request=session_for("after-fence");request.goal=ExecutionGoal::Body(goal.clone());
+        scheduler.start_session(&status,request).await.unwrap();
+        let mut route=path_for("after-fence",1);route.path=ExecutionPath::Surface(Path3D {poses:vec![start.clone(),goal]});
+        scheduler.submit_path(&status,route).await.unwrap();
+        scheduler.control_tick(&status).await.unwrap();
+        let command=scheduler.status.last_applied_twist.expect("应交付新目标首拍");
+        assert!(command.linear.x>=0.&&command.linear.x<=0.5*0.05+1e-9,
+            "已确认停车后不能沿用上一目标0.2m/s命令边界：{command:?}");
+        let mut next=start;next.stamp.nanos+=50_000_000;
+        scheduler.observe_odometry(&status,next,None).unwrap();
+        scheduler.control_tick(&status).await.unwrap();
+        let following=scheduler.status.last_applied_twist.unwrap();
+        assert!(following.linear.x>0.&&following.linear.x<=command.linear.x+0.5*0.05+1e-9);
+    }
+
+    #[tokio::test]
     async fn actual_surface_backend_stops_for_changed_map_and_resumes_only_new_path() {
         let mut local_config = SurfaceFollowerConfig::new(0.4);
         local_config.controller.speed = 0.2;
@@ -5163,7 +4973,7 @@ mod tests {
         handle
             .update_costmap(CostmapObservation {
                 costmap: surface_follower::prepared_test_surface(Arc::new(surface_follower::test_snapshot(0.0, true)
-                    .with_recent_obstacle_points(1,1,0,&[],[(0,[0.8,1.55,0.3])]).unwrap())),
+                    .with_recent_obstacle_points(1,1,0,&[],[(0,[0.55,1.55,0.5])]).unwrap())),
                 source_timestamp_ns: 2_000_000_000,
             })
             .await

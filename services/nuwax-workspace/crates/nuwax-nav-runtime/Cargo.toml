@@ -8,10 +8,9 @@ authors.workspace = true
 description = "nuwax 导航运行时 Tokio 调度器与 controller 流水线(20Hz tick + cancel epoch + guard client)"
 
 [dependencies]
-nuwax-nav-pct = { path = "../nuwax-nav-pct" }
-nuwax-nav-scan = { path = "../nuwax-nav-scan" }
+nuwax-nav-pct-native = { path = "../nuwax-nav-pct-native" }
+nuwax-nav-scan-native = { path = "../nuwax-nav-scan-native" }
 tracing.workspace = true
-nuwax-nav-control = { path = "../nuwax-nav-control" }
 # Foundation 类型与安全边界
 nuwax-nav-types-messages = { path = "../nuwax-nav-types-messages" }
 
@@ -35,7 +34,5 @@ serde_json.workspace = true
 default = []
 # Opt-in construction seam for cross-crate recovery qualification tests.
 surface-recovery-qualification = []
-# Bounded capture of one actual owner request for offline h-only qualification.
-local-guidance-qualification = ["surface-recovery-qualification", "nuwax-nav-scan/local-guidance-qualification"]
 # Opt-in wall-time attribution only; no production navigation option.
 body-query-profile = ["nuwax-nav-mls-planner/body-query-profile"]

@@ -17,6 +17,28 @@ pub(super) struct RecentObstacles {
     pub frames:Vec<Arc<RecentFrame>>,
 }
 impl SurfaceSnapshot {
+    /// 导出原生规划器使用的近期观测；实测地面保留原高度，其余占据按源体素输出。
+    pub fn navigation_recent_samples(&self) -> (Vec<[f64; 3]>, Vec<[f64; 3]>) {
+        let mut ground = Vec::new();
+        let mut obstacles = Vec::new();
+        if let Some(recent) = &self.recent_obstacles {
+            for frame in &recent.frames {
+                for (&[x, y], heights) in &frame.columns {
+                    for &z in heights {
+                        if let Some(measured) = frame.surface_points.get(&[x, y, z]) {
+                            ground.extend_from_slice(measured);
+                        } else {
+                            obstacles.push(
+                                [x, y, z].map(|value| (f64::from(value) + 0.5) * recent.size),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        (ground, obstacles)
+    }
+
     /// Replace the live obstacle view from one admitted, fully domain-checked cloud.
     /// Indices are original PointCloud2 indices. Zero retention keeps only this frame.
     /// At most eight immutable frames are retained, independently of terrain identity.

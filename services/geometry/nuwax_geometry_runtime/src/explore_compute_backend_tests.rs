@@ -1095,9 +1095,9 @@ fn mission_surface_route_carries_real_projected_endpoint_into_home_query() {
     let options = frontier_goal_options(&goal, true, Some(config));
     let candidate = mission_pose_from_stamped(&goal.pose);
     let MissionRoutes::Surface { map, config, boundary } = &routes else { unreachable!() };
-    let path = nuwax_nav_stack::surface_oriented::plan_reference_cancellable(map, &config.follower.pct,
+    let path = nuwax_nav_stack::surface_oriented::plan_reference_cancellable(map, &config.planner,
         (start.position, start.orientation_xyzw), (candidate.position, candidate.orientation_xyzw),
-        options, config.follower.motion_limits.as_ref(), boundary, 30_000, None).unwrap();
+        options, config.follower.body_to_support_z_m, boundary, None).unwrap();
     let expected_end = path.last().unwrap();
     let expected_length: f64 = path.windows(2).map(|p|
         p[0].0.iter().zip(p[1].0).map(|(a, b)| (a - b).powi(2)).sum::<f64>().sqrt()).sum();

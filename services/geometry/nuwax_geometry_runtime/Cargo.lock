@@ -1470,7 +1470,8 @@ dependencies = [
  "nuwax-explore-wavefront",
  "nuwax-nav-base",
  "nuwax-nav-mls-planner",
- "nuwax-nav-pct",
+ "nuwax-nav-pct-native",
+ "nuwax-nav-runtime",
  "nuwax-nav-types-messages",
  "serde",
  "serde_json",
@@ -1739,21 +1740,14 @@ name = "nuwax-nav-mls-planner"
 version = "0.1.0"
 dependencies = [
  "ahash",
- "futures",
  "im",
  "image",
  "imageproc",
- "nuwax-codec",
  "nuwax-explore-routing",
  "nuwax-map-chunks",
- "nuwax-protocol",
- "nuwax-transport",
  "nuwax-types",
  "rayon",
- "serde",
- "serde_json",
  "thiserror 1.0.69",
- "tokio",
  "tracing",
  "validator",
 ]
@@ -1786,15 +1780,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "nuwax-nav-pct"
+name = "nuwax-nav-pct-native"
 version = "0.1.0"
 dependencies = [
- "im",
- "ahash",
- "nuwax-nav-mls-planner",
- "nuwax-nav-types-messages",
- "nuwax-types",
- "tracing",
+ "cc",
 ]
 
 [[package]]
@@ -1820,10 +1809,9 @@ dependencies = [
  "async-trait",
  "nuwax-motion-safety-guard",
  "nuwax-nav-astar",
- "nuwax-nav-control",
  "nuwax-nav-mls-planner",
- "nuwax-nav-pct",
- "nuwax-nav-scan",
+ "nuwax-nav-pct-native",
+ "nuwax-nav-scan-native",
  "nuwax-nav-types-messages",
  "thiserror 1.0.69",
  "tokio",
@@ -1831,13 +1819,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "nuwax-nav-scan"
+name = "nuwax-nav-scan-native"
 version = "0.1.0"
 dependencies = [
- "nuwax-nav-mls-planner",
- "nuwax-nav-pct",
- "nuwax-nav-types-messages",
- "tracing",
+ "cc",
 ]
 
 [[package]]
@@ -1868,7 +1853,7 @@ dependencies = [
  "nuwax-nav-control",
  "nuwax-nav-mls-planner",
  "nuwax-nav-patrolling",
- "nuwax-nav-pct",
+ "nuwax-nav-pct-native",
  "nuwax-nav-runtime",
  "nuwax-nav-simple-planner",
  "nuwax-nav-types-messages",

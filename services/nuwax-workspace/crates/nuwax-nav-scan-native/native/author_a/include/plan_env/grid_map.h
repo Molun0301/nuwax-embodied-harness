@@ -385,7 +385,23 @@ inline int GridMap::getInflateOccupancyFromBuffer(Eigen::Vector3d pos, const std
   Eigen::Vector3i id;
   posToIndex(pos, id);
 
-  return int(buffer[toAddress(id)]);
+  if (!buffer[toAddress(id)]) return 0;
+
+  // The original ceil-based dilation is a conservative candidate index. Its
+  // query-cell phase must not enlarge the calibrated vertical collision band.
+  // Preserve the original XY stencil and probability threshold, but resolve
+  // each candidate against its original occupied half-open voxel volume.
+  // Positive-volume intersection is required; no epsilon or shifted surface.
+  const double low = pos.z() - mp_.obstacles_inflation_z_up;
+  const double high = pos.z() + mp_.obstacles_inflation_z_down;
+  for (const auto& offset : md_.inflate_offsets_) {
+    const Eigen::Vector3i occupied = id - offset;
+    const double cell_low = occupied.z() * mp_.resolution_;
+    const double cell_high = (occupied.z() + 1.0) * mp_.resolution_;
+    if (cell_high > low && cell_low < high && getOccupancy(occupied) == 1)
+      return 1;
+  }
+  return 0;
 }
 
 inline int GridMap::getOccupancy(Eigen::Vector3i id) {

@@ -182,7 +182,14 @@ ASTAR_RET AStar::AstarSearch(const double step_size, Vector3d start_pt, Vector3d
         double ratio = (sample_xy - search_start_xy).dot(search_xy_delta) / search_xy_len2;
         ratio = std::max(0.0, std::min(1.0, ratio));
 
-        const double z = search_start(2) + ratio * (search_end(2) - search_start(2));
+        double z = search_start(2) + ratio * (search_end(2) - search_start(2));
+        if(route_height_query_) {
+            // Same ordered-route height as initialization. Preserve adjusted
+            // search endpoint heights with only their boundary residuals.
+            z=route_height_query_(ratio)
+              +(1.-ratio)*(search_start.z()-route_height_query_(0.))
+              +ratio*(search_end.z()-route_height_query_(1.));
+        }
         return static_cast<int>((z - center_(2)) * inv_step_size_ + 0.5) + CENTER_IDX_(2);
     };
 

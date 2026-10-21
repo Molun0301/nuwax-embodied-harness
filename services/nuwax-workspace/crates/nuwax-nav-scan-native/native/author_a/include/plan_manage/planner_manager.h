@@ -3,6 +3,7 @@
 #define _PLANNER_MANAGER_H_
 
 #include <stdlib.h>
+#include <route_height_reference.h>
 
 #include <bspline_opt/bspline_optimizer.h>
 #include <bspline_opt/uniform_bspline.h>
@@ -38,6 +39,7 @@ namespace scan_planner
     void refreshParameters(ros::NodeHandle &nh);
     void retireExecution();
 
+    RouteHeightReference route_height_;
     PlanParameters pp_;
     LocalTrajData local_data_;
     GlobalTrajData global_data_;

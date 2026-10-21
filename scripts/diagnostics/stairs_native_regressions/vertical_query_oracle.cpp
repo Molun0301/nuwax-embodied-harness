@@ -1,0 +1,8 @@
+#include <author_parameters.h>
+#include <plan_env/grid_map.h>
+#include <iostream>
+#include <iomanip>
+int main(int argc,char** argv){ScanConfig c{};c.resolution=double(float(.05));c.body_length=.5794;c.body_width=.328;c.body_to_ground=.4;c.body_center_x=.0503;c.body_z_min=-.448;c.body_z_max=.057;c.max_step_up=.15;c.max_step_down=.15;c.max_slope=1.;c.max_velocity=1.;c.max_acceleration=1.;c.max_yaw_rate=.8;c.max_yaw_acceleration=2.;c.sample_dt=.05;c.planning_horizon=3.5;c.max_reverse_velocity=1.;c.max_lateral_velocity=1.;auto n=scan_planner::authorParameters(c);const double up=argc>1?std::stod(argv[1]):.1535;const double down=argc>2?std::stod(argv[2]):.1535;n.setParam("grid_map/obstacles_inflation_z_up",up);n.setParam("grid_map/obstacles_inflation_z_down",down);GridMap m;m.initMap(n);int checked=0; const double half=(c.body_z_max-(c.max_step_up-c.body_to_ground))/2.;const double center=(c.body_z_max+c.max_step_up-c.body_to_ground)/2.;
+for(int j=-12;j<=12;++j){m.importStaticOccupied({Eigen::Vector3d(.175,0,(j+.5)*c.resolution)},Eigen::Vector3d::Zero());for(int k=-8;k<=8;++k)for(double phase:{0.,.001,.07,.25,.5,.93,.999}){Eigen::Vector3d p(0,0,(k+phase)*c.resolution-center);double low=p.z()+center-up,high=p.z()+center+down;bool expected=(j+1)*c.resolution>low&&j*c.resolution<high;int actual=m.getInflateOccupancy(p,0);if(actual!=int(expected)){std::cerr<<"mismatch "<<j<<" "<<k<<" "<<phase<<" "<<actual<<" "<<expected<<std::endl;return 1;}++checked;}}
+m.importStaticOccupied({},Eigen::Vector3d::Zero());if(m.getInflateOccupancy(Eigen::Vector3d(0,0,.2),0)!=0)return 2;
+std::cout<<"checked="<<checked<<" positive-volume oracle cases; clear=pass\n";}

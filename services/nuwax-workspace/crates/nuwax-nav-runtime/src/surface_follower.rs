@@ -386,7 +386,7 @@ impl SurfaceFollower {
             .copied()
             .collect();
         let ground: Vec<_> = input
-            .ground
+            .static_collision_ground
             .iter()
             .chain(recent_ground.iter())
             .filter(|p| nearby(p))

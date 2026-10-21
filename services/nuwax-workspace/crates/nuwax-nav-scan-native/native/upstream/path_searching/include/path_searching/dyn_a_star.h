@@ -84,6 +84,7 @@ private:
 	int rounds_{0};
 
 public:
+    std::function<double(double)> route_height_query_;
 	typedef std::shared_ptr<AStar> Ptr;
 
 	AStar(){};

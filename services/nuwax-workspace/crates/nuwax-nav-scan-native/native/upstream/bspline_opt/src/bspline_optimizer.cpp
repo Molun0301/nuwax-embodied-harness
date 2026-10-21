@@ -131,6 +131,7 @@ namespace scan_planner
     {
       //std::cerr << "in=" << in.transpose() << " out=" << out.transpose() << endl;
       Eigen::Vector3d in(init_points.col(segment_ids[i].first)), out(init_points.col(segment_ids[i].second));
+      if(bind_route_segment_)bind_route_segment_(segment_ids[i].first,segment_ids[i].second);
       ASTAR_RET ret = a_star_->AstarSearch(grid_map_->getResolution(), in, out);
       if (ret == ASTAR_RET::SUCCESS)
       {
@@ -790,7 +791,8 @@ namespace scan_planner
       {
         /*** a star search ***/
         Eigen::Vector3d in(cps_.points.col(segment_ids[i].first)), out(cps_.points.col(segment_ids[i].second));
-        ASTAR_RET ret = a_star_->AstarSearch(grid_map_->getResolution(), in, out);
+        if(bind_route_segment_)bind_route_segment_(segment_ids[i].first,segment_ids[i].second);
+      ASTAR_RET ret = a_star_->AstarSearch(grid_map_->getResolution(), in, out);
         if (ret == ASTAR_RET::SUCCESS)
         {
           vector<Eigen::Vector3d> path = a_star_->getPath();

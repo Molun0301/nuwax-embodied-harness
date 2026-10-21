@@ -10,6 +10,9 @@ pub struct NativeMap {
     pub resolution: f64,
     /// 真实地面代表点，缺测列不补高度。
     pub ground: Vec<[f64; 3]>,
+    /// SCAN 静态夹具的真实表面点；不重复注入实体 band 的人工暴露顶边界。
+    /// PCT 的 ground/cells/bands 保持原语义；真实注册雷达帧不经过此视图。
+    pub static_collision_ground: Vec<[f64; 3]>,
     /// 非地面占据的体素中心。
     pub obstacles: Vec<[f64; 3]>,
     /// 全局层析输入。
@@ -77,6 +80,7 @@ pub fn from_surface_window(
     let mut result = NativeMap {
         resolution,
         ground: Vec::new(),
+        static_collision_ground: Vec::new(),
         obstacles: Vec::new(),
         cells: Vec::new(),
         bands: Vec::new(),
@@ -164,6 +168,7 @@ pub fn from_surface_window(
             if let Some((cells, measured_bands)) = raw.remove(&column) {
                 for cell in &cells {
                     result.ground.push([xy[0], xy[1], cell.ground]);
+                    result.static_collision_ground.push([xy[0], xy[1], cell.ground]);
                 }
                 for band in &measured_bands {
                     // 薄表面沿原生共享分类归入地面；高实体保留整带，不生成墙中间楼层。
@@ -231,6 +236,9 @@ pub fn from_surface_window(
                 ceiling,
             });
             result.ground.push([xy[0], xy[1], height]);
+            if !(occupied_volume && !classified) {
+                result.static_collision_ground.push([xy[0], xy[1], height]);
+            }
             // 地面成员只保留真实表面，量化厚度不作为机身障碍。
             result.bands.push(Band {
                 x: column[0],
@@ -262,6 +270,7 @@ pub fn append_recent(map: &SurfaceSnapshot, input: &mut NativeMap) {
             high: p[2],
         });
         input.ground.push(p);
+        input.static_collision_ground.push(p);
     }
     for p in obstacles {
         let x = (p[0] / input.resolution).floor() as i32;
@@ -373,6 +382,8 @@ mod tests {
         let input = from_surface(&volume).unwrap();
         let q = f64::from(0.05_f32);
         assert_eq!(measured.ground.len(), 2);
+        assert_eq!(measured.static_collision_ground, measured.ground);
+        assert!(input.static_collision_ground.is_empty());
         assert!((measured.ground[0][2] - 0.125).abs() < 1e-8);
         assert!((measured.ground[1][2] - 0.575).abs() < 1e-7);
         assert_eq!(
@@ -393,6 +404,7 @@ mod tests {
         assert_eq!(occupied, BTreeSet::from([0, 1, 2, 10, 11]));
         let local = from_surface_window(&volume, Some(([0., 0.], 0.1))).unwrap();
         assert_eq!(local.ground, input.ground);
+        assert_eq!(local.static_collision_ground, input.static_collision_ground);
         assert_eq!(local.obstacles, input.obstacles);
         let (config, cells, bands) = pct_input(&volume, 0.4, &[]).unwrap();
         assert_eq!(config.resolution, q);
@@ -459,6 +471,7 @@ mod tests {
         let mut input = NativeMap {
             resolution: 0.1,
             ground: vec![],
+            static_collision_ground: vec![],
             obstacles: vec![],
             cells: vec![],
             bands: vec![],
@@ -466,6 +479,7 @@ mod tests {
         };
         append_recent(&map, &mut input);
         assert_eq!(input.ground, vec![[0.5, 1., 0.04]]);
+        assert_eq!(input.static_collision_ground, input.ground);
         assert_eq!(input.obstacles.len(), 1);
         assert!(input
             .bands

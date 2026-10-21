@@ -82,6 +82,11 @@ namespace scan_planner
 
   void SCANPlannerManager::retireExecution()
   {
+    route_height_.clear();
+    if(bspline_optimizer_rebound_) {
+      bspline_optimizer_rebound_->bind_route_segment_={};
+      if(bspline_optimizer_rebound_->a_star_)bspline_optimizer_rebound_->a_star_->route_height_query_={};
+    }
     local_data_ = LocalTrajData{};
     local_data_.start_pos_.setZero();
     global_data_.global_traj_ = PolynomialTraj{};
@@ -115,7 +120,7 @@ namespace scan_planner
     if(authorTraceEnabled()) {
       auto out=authorTraceStream();out<<"{\"event\":\"rebound_input\",\"attempt\":"<<count-1<<",\"time\":"<<ros::Time::now().toSec()<<",\"poly_init\":"<<flag_polyInit<<",\"random_init\":"<<flag_randomPolyTraj;
       out<<",\"start_p\":";traceMatrix(out,start_pt);out<<",\"start_v\":";traceMatrix(out,start_vel);out<<",\"start_a\":";traceMatrix(out,start_acc);
-      out<<",\"target_p\":";traceMatrix(out,local_target_pt);out<<",\"target_v\":";traceMatrix(out,local_target_vel);out<<"}\n";
+      out<<",\"target_p\":";traceMatrix(out,local_target_pt);out<<",\"target_v\":";traceMatrix(out,local_target_vel);out<<",\"route_height_ready\":"<<route_height_.ready()<<",\"route_begin_arc\":"<<route_height_.begin_arc<<",\"route_end_arc\":"<<route_height_.end_arc<<"}\n";
     }
     if ((start_pt - local_target_pt).norm() < 0.2)
     {
@@ -274,10 +279,41 @@ namespace scan_planner
       }
     } while (flag_regenerate);
 
-    applyLinearZReference(point_set, start_pt(2), local_target_pt(2));
+    std::vector<double> height_sample_arcs;
+    if(route_height_.ready()) {
+      height_sample_arcs.assign(point_set.size(),0.);
+      for(size_t i=1;i<point_set.size();++i)
+        height_sample_arcs[i]=height_sample_arcs[i-1]+(point_set[i].head<2>()-point_set[i-1].head<2>()).norm();
+      const double length=height_sample_arcs.back();
+      for(size_t i=0;i<point_set.size();++i){
+        const double fraction=length>0.?height_sample_arcs[i]/length:double(i)/double(point_set.size()-1);
+        height_sample_arcs[i]=route_height_.begin_arc+fraction*(route_height_.end_arc-route_height_.begin_arc);
+        point_set[i].z()=route_height_.heightAtArc(height_sample_arcs[i]);
+      }
+      // Retain requested boundary positions and the original LS derivatives.
+      point_set.front().z()=start_pt.z();point_set.back().z()=local_target_pt.z();
+    } else {
+      applyLinearZReference(point_set, start_pt(2), local_target_pt(2));
+      bspline_optimizer_rebound_->a_star_->route_height_query_={};
+      bspline_optimizer_rebound_->bind_route_segment_={};
+    }
 
     Eigen::MatrixXd ctrl_pts;
     UniformBspline::parameterizeToBspline(ts, point_set, start_end_derivatives, ctrl_pts);
+    if(!height_sample_arcs.empty()) {
+      // Cubic Greville index j corresponds to sample j-1; boundary extensions
+      // keep the endpoint arc. This mapping stays fixed throughout the solve.
+      std::vector<double> cp_arcs(ctrl_pts.cols());
+      for(int j=0;j<ctrl_pts.cols();++j)
+        cp_arcs[j]=height_sample_arcs[std::clamp(j-1,0,int(height_sample_arcs.size())-1)];
+      bspline_optimizer_rebound_->bind_route_segment_=[this,cp_arcs](int first,int last){
+        const double a=cp_arcs.at(first),b=cp_arcs.at(last);
+        bspline_optimizer_rebound_->a_star_->route_height_query_=[this,a,b](double ratio){
+          return route_height_.heightAtArc(a+ratio*(b-a));
+        };
+      };
+    }
+
 
     if(authorTraceEnabled()) {
       auto out=authorTraceStream();out<<"{\"event\":\"initial_control_points\",\"attempt\":"<<count-1<<",\"ts\":"<<ts<<",\"points\":";traceMatrix(out,ctrl_pts);out<<"}\n";
@@ -370,6 +406,9 @@ namespace scan_planner
 
     vector<Eigen::Vector3d> points;
     points.push_back(start_pos);
+    // The original FSM passes the first waypoint separately as start_pos.
+    const std::vector<double>& point_arcs=route_height_.waypoint_arcs;
+    const bool have_height=point_arcs.size()==waypoints.size()+1;
 
     for (size_t wp_i = 0; wp_i < waypoints.size(); wp_i++)
     {
@@ -384,11 +423,13 @@ namespace scan_planner
 
     // insert intermediate points if too far
     vector<Eigen::Vector3d> inter_points;
+    std::vector<double> inter_arcs;
     double dist_thresh = max(total_len / 8, 4.0);
 
     for (size_t i = 0; i < points.size() - 1; ++i)
     {
       inter_points.push_back(points.at(i));
+      if(have_height)inter_arcs.push_back(point_arcs[i]);
       double dist = (points.at(i + 1) - points.at(i)).norm();
 
       if (dist > dist_thresh)
@@ -400,11 +441,13 @@ namespace scan_planner
           Eigen::Vector3d inter_pt =
               points.at(i) * (1.0 - double(j) / id_num) + points.at(i + 1) * double(j) / id_num;
           inter_points.push_back(inter_pt);
+          if(have_height)inter_arcs.push_back(point_arcs[i]+double(j)/id_num*(point_arcs[i+1]-point_arcs[i]));
         }
       }
     }
 
     inter_points.push_back(points.back());
+    if(have_height)inter_arcs.push_back(point_arcs.back());
 
     // for ( int i=0; i<inter_points.size(); i++ )
     // {
@@ -427,6 +470,10 @@ namespace scan_planner
     time(0) *= 2.0;
     time(time.rows() - 1) *= 2.0;
 
+    if(have_height){
+      route_height_.times.assign(1,0.);route_height_.timed_arcs=inter_arcs;
+      for(int i=0;i<time.size();++i)route_height_.times.push_back(route_height_.times.back()+time(i));
+    }
     PolynomialTraj gl_traj;
     if (pos.cols() >= 3)
       gl_traj = PolynomialTraj::minSnapTraj(pos, start_vel, end_vel, start_acc, end_acc, time);
@@ -535,6 +582,10 @@ namespace scan_planner
     local_data_.start_pos_ = local_data_.position_traj_.evaluateDeBoorT(0.0);
     local_data_.duration_ = local_data_.position_traj_.getTimeSum();
     local_data_.traj_id_ += 1;
+    if(authorTraceEnabled()) {
+      auto out=authorTraceStream();out<<"{\"event\":\"published_spline\",\"attempt\":"<<count-1<<",\"time\":"<<time_now.toSec()<<",\"duration\":"<<local_data_.duration_<<",\"control_points\":";
+      traceMatrix(out,local_data_.position_traj_.getControlPoint());out<<",\"knots\":";traceMatrix(out,local_data_.position_traj_.getKnot());out<<"}\n";
+    }
   }
 
   bool SCANPlannerManager::checkDynamicFeasibility(UniformBspline position_traj)

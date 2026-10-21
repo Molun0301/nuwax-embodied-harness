@@ -20,6 +20,23 @@ Original A calculation timeouts use steady wall time, trajectory time uses one
 injected host clock. Console diagnostics go to stderr, preserving the host JSON
 protocol. Full physical standing dimensions and simulation judge are unchanged.
 
+Additional documented stairs corrections (2026-10-21): retain the original
+ceil/XY inflation broadphase and original occupied-cell probability source,
+but resolve vertical candidates against positive-volume intersection with the
+calibrated collision band. This removes query-cell phase enlargement without
+shrinking the candidate stencil. Explicit static occupied-volume fixtures do
+not inject their already-represented exposed top boundary as another voxel;
+real measured ground and registered LiDAR returns remain unchanged.
+
+Local height initialization and A* search guidance retain the complete ordered
+PCT route before author waypoint decimation, with global-reference time/route-
+arc association and collision-segment-local parameter binding. This replaces
+straight start-to-end height interpolation, not the author optimizer objective,
+Z-gradient freeze, search budget, or controller. Boundary LS fitting and search
+endpoint residuals remain; guidance is not a proof of exact terrain adherence.
+The original unknown-space policy is unchanged. All real physical dimensions,
+independent motion validation, target and acceptance tolerances are unchanged.
+
 The historical integrated-B notice below is retained because its retired source
 and attribution are still present. It is not the current SCAN algorithm source.
 

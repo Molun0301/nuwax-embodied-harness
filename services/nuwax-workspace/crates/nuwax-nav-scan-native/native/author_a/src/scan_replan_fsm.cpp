@@ -319,6 +319,11 @@ namespace scan_planner
         msg->poses.back().pose.position.y,
         msg->poses.back().pose.position.z + body_height_;
 
+    std::vector<Eigen::Vector3d> full_height_route;
+    for (const auto &p : msg->poses)
+      full_height_route.emplace_back(p.pose.position.x,p.pose.position.y,p.pose.position.z+body_height_);
+    planner_manager_->route_height_.set(full_height_route);
+    size_t height_index=0;
     std::vector<Eigen::Vector3d> waypoints;
     waypoints.reserve(msg->poses.size());
     constexpr double min_dist = 0.5;
@@ -335,13 +340,17 @@ namespace scan_planner
       if (first || (wp - last_wp).norm() >= min_dist)
       {
         waypoints.push_back(wp);
+        planner_manager_->route_height_.waypoint_arcs.push_back(planner_manager_->route_height_.arcs[height_index]);
         last_wp = wp;
         first = false;
       }
+      ++height_index;
     }
 
-    if ((waypoints.back() - end_pt_).norm() > 1e-6)
+    if ((waypoints.back() - end_pt_).norm() > 1e-6) {
       waypoints.push_back(end_pt_);
+      planner_manager_->route_height_.waypoint_arcs.push_back(planner_manager_->route_height_.arcs.back());
+    }
 
     bool success = planGlobalTrajByWaypoints(waypoints);
 
@@ -982,6 +991,8 @@ namespace scan_planner
         ROS_WARN_THROTTLE(1.0, "Local target in collision and no nearby collision-free target was found.");
       }
     }
+
+    planner_manager_->route_height_.window(t_proj,target_t);
 
     if ((end_pt_ - local_target_pt_).norm() < (max_vel * max_vel) / (2 * max_acc))
     {

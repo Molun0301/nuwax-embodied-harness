@@ -75,6 +75,7 @@ namespace scan_planner
     Eigen::MatrixXd getControlPoints();
 
     AStar::Ptr a_star_;
+    std::function<void(int,int)> bind_route_segment_;
     std::vector<Eigen::Vector3d> ref_pts_;
 
     std::vector<std::vector<Eigen::Vector3d>> initControlPoints(Eigen::MatrixXd &init_points, bool flag_first_init = true);

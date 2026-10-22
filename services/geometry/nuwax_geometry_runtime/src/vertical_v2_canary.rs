@@ -4396,12 +4396,6 @@ async fn post_quiet_tf_window_uses_formal_readiness() {
     for (sink_ready, map_frame, pose_frame, expected) in [
         (true, "map", "map", NavigationReadinessCode::TfIncomplete),
         (
-            false,
-            "map",
-            "map",
-            NavigationReadinessCode::MotionSinkNotReady,
-        ),
-        (
             true,
             "map",
             "odom",
@@ -4446,6 +4440,9 @@ async fn post_quiet_tf_window_uses_formal_readiness() {
         .blockers
         .contains(&NavigationReadinessCode::TfUnobserved));
 
+    // 本用例显式启用有效期限，默认零期限表示不按年龄失效。
+    let _env_lock = ENV_LOCK.lock().await;
+    let tf_ttl_override = EnvRestore::set(&[("NUWAX_NAV_TF_TTL_MS", "1000")]);
     let stale_nav = crate::nav_runtime::NavRuntimeState::from_env();
     let stale_handle = canary_readiness_handle(&stale_nav);
     observe_canary_ready_inputs(&stale_nav, true, "map", "map").await;
@@ -4461,6 +4458,7 @@ async fn post_quiet_tf_window_uses_formal_readiness() {
     let stale = crate::nav_runtime::compute_readiness(&stale_handle, &stale_nav).await;
     assert!(!stale.ready);
     assert!(stale.blockers.contains(&NavigationReadinessCode::TfStale));
+    drop(tf_ttl_override);
 
     let old_ready_nav = crate::nav_runtime::NavRuntimeState::from_env();
     let old_ready_handle = canary_readiness_handle(&old_ready_nav);
@@ -5153,14 +5151,6 @@ async fn initial_readiness_uses_typed_feedback_generation() {
             GateCase::PlannerMissing,
             NavigationReadinessCode::PlannerInputUnobserved,
         ),
-        (
-            GateCase::SinkMissing,
-            NavigationReadinessCode::MotionSinkUnobserved,
-        ),
-        (
-            GateCase::SinkFalse,
-            NavigationReadinessCode::MotionSinkNotReady,
-        ),
     ] {
         let failure = run_case(case, stamp_ns)
             .await
@@ -5176,6 +5166,11 @@ async fn initial_readiness_uses_typed_feedback_generation() {
             InitialReadinessDispatchLedger::default()
         );
         assert!(failure.cleanup_required);
+    }
+
+    for case in [GateCase::SinkMissing, GateCase::SinkFalse] {
+        let ready = run_case(case, stamp_ns).await.expect("运动输出只作诊断，导航输入仍可接纳");
+        assert_eq!(ready.release_count, 1);
     }
 
     let reaped = Arc::new(Mutex::new(0_usize));

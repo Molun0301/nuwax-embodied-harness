@@ -6087,10 +6087,7 @@ fn classify_exploration_submit_rejection(
     let retryable = match retry_reason {
         Some(SetGoalRetryReason::NavigationNotReady(code)) => matches!(
             code,
-            NavigationReadinessCode::MotionSinkUnobserved
-                | NavigationReadinessCode::MotionSinkStale
-                | NavigationReadinessCode::MotionSinkNotReady
-                | NavigationReadinessCode::StackStateUnobserved
+            NavigationReadinessCode::StackStateUnobserved
                 | NavigationReadinessCode::StackStateStale
                 | NavigationReadinessCode::TfUnobserved
                 | NavigationReadinessCode::TfStale
@@ -6443,6 +6440,9 @@ async fn apply_typed_navigation_feedback(
     nav: &crate::nav_runtime::NavRuntimeState,
     mut update: NavigationUpdate,
 ) -> Option<NavigationUpdate> {
+    if update.feedback.reason_code == "LEASE_NOT_GRANTED" {
+        return nav.retire_unleased_goal(update).await;
+    }
     let source_terminal = matches!(update.state.status.as_str(), "SUCCEEDED" | "FAILED");
     normalize_pending_cancel_zero_ack_path_identity(nav, &mut update);
     let planner_observation = if update.feedback.runtime_generation > 0 {
@@ -23902,24 +23902,101 @@ async fn scheme_a_real_bridge_frozen_request_mismatch_is_before_publish() {
     assert!(bridge.nav.terminal_receipts().await.is_empty());
 }
 
+fn unleased_rejection_message(lease: &crate::nav_runtime::GoalLease) -> schema::NavigationState {
+    schema::NavigationState {
+        stamp_sec: 1,
+        state: 4,
+        message: "LEASE_NOT_GRANTED: STALE_STOP_GENERATION".into(),
+        session_id: lease.session_id.clone(),
+        owner_kind: lease.owner_kind,
+        parent_request_id: lease.parent_request_id.clone(),
+        goal_generation: lease.goal_generation as i64,
+        producer_runtime_generation: lease.producer_runtime_generation as i64,
+        guard_generation: 7,
+        sink_ready: 1,
+        ..schema::NavigationState::default()
+    }
+}
+
+async fn apply_unleased_wire_rejection(
+    nav: &crate::nav_runtime::NavRuntimeState, message: &schema::NavigationState,
+) -> Option<NavigationUpdate> {
+    let bytes = schema::encode_navigation_state_body(message).unwrap();
+    let update = crate::typed_codec::decode_nav_state_payload(&bytes)?;
+    apply_typed_navigation_feedback(nav, update).await
+}
+
 #[tokio::test]
-async fn scheme_a_real_bridge_none_readiness_is_not_promoted_to_permanent() {
+async fn guard_rejection_does_not_block_the_next_geometry_goal() {
+    let (bridge, backend) = configured_bridge().await;
+    let first = scheme_a_child_request(&bridge, "guard-rejected-first");
+    let admitted = scheme_a_real_admission(&bridge, &first).await;
+    assert_eq!(admitted.state.status, "ACCEPTED");
+    let lease = admitted.lease.unwrap();
+    {
+        let slot = bridge.nav.inner();
+        let mut slot = slot.write().await;
+        // 路径可以先完成，执行租约仍未授予；拒绝回执不携带路径执行身份。
+        slot.goal.as_mut().unwrap().lease.path_revision = 3;
+        slot.goal.as_mut().unwrap().lease.planner_runtime_generation = 9;
+        slot.phase = crate::nav_runtime::NavPhase::Planning;
+    }
+    let rejection = unleased_rejection_message(&lease);
+    let failed = apply_unleased_wire_rejection(&bridge.nav, &rejection).await
+        .expect("具名无租约拒绝按同目标收敛");
+    assert_eq!(failed.feedback.reason_code, "LEASE_NOT_GRANTED");
+    assert!(!failed.feedback.actuator_zeroed);
+    assert!(failed.feedback.zero_ack_id.is_empty());
+    assert_eq!(failed.feedback.zero_applied_monotonic_ns, 0);
+    assert!(bridge.nav.active_goal_lease().await.is_none());
+    assert_eq!(bridge.nav.terminal_receipts().await.len(), 1);
+    bridge.nav.observe_idle_motion_sink(false).expect("空闲输出诊断不得阻断后续目标");
+
+    let second = scheme_a_child_request(&bridge, "guard-rejected-next");
+    let admitted = scheme_a_real_admission(&bridge, &second).await;
+    assert_eq!(admitted.state.status, "ACCEPTED", "{}", admitted.state.message);
+    let second_lease = admitted.lease.unwrap();
+    assert_eq!(scheme_a_goal_frame_count(&backend), 2);
+    assert!(apply_unleased_wire_rejection(&bridge.nav, &rejection).await.is_none(), "迟到的旧目标拒绝不得清除新目标");
+    assert_eq!(bridge.nav.active_goal_lease().await, Some(second_lease));
+}
+
+#[tokio::test]
+async fn unleased_rejection_does_not_retire_foreign_or_running_goals() {
+    let (bridge, _, lease) = start_goal("unleased-rejection-identity").await;
+    let message = unleased_rejection_message(&lease);
+    let mut foreign = message.clone();
+    foreign.goal_generation += 1;
+    assert!(apply_unleased_wire_rejection(&bridge.nav, &foreign).await.is_none());
+    assert_eq!(bridge.nav.active_goal_lease().await, Some(lease.clone()));
+    let mut unknown = message.clone();
+    unknown.message = "guard lease outcome unknown".into();
+    apply_unleased_wire_rejection(&bridge.nav, &unknown).await.expect("普通失败仍保留拥有方");
+    assert_eq!(bridge.nav.active_goal_lease().await, Some(lease.clone()));
+    bridge.nav.inner().write().await.phase = crate::nav_runtime::NavPhase::Running;
+    assert!(apply_unleased_wire_rejection(&bridge.nav, &message).await.is_none());
+    assert_eq!(bridge.nav.active_goal_lease().await, Some(lease));
+}
+
+#[tokio::test]
+async fn scheme_a_real_bridge_planner_not_ready_remains_retryable() {
     use crate::explore_runtime::{ChildNavigationSubmitError, ExploreNavigationSink};
-    use crate::nav_runtime::{MotionSinkObservation, NavigationReadinessCode, SetGoalRetryReason};
+    use crate::nav_runtime::{PlannerInputObservation, NavigationReadinessCode, SetGoalRetryReason};
 
     let (bridge, backend) = configured_bridge().await;
-    let request = scheme_a_child_request(&bridge, "scheme-a-motion-not-ready");
-    bridge.nav.observe_motion_sink(MotionSinkObservation { generation: 2, ready: false })
-        .expect("actual typed not-ready observation");
+    let request = scheme_a_child_request(&bridge, "scheme-a-planner-not-ready");
+    bridge.nav.observe_planner_input(PlannerInputObservation {
+        generation: 2, map_revision: 1, map_frame: "map".into(), pose_frame: "map".into(), ready: false,
+    }).expect("规划器明确报告输入未就绪");
     let cancel_before = bridge.nav.cancel_snapshot();
     let raw = scheme_a_real_admission(&bridge, &request).await;
     assert_eq!(raw.state.status, "FAILED");
     assert!(raw.lease.is_none());
     assert_eq!(raw.retry_reason, Some(SetGoalRetryReason::NavigationNotReady(
-        NavigationReadinessCode::MotionSinkNotReady,
+        NavigationReadinessCode::PlannerNotReady,
     )));
     assert_eq!(raw.reject_reason, None);
-    assert_eq!(bridge.submit(request).await.expect_err("typed readiness rejection"),
+    assert_eq!(bridge.submit(request).await.expect_err("规划输入缺失允许重试"),
         ChildNavigationSubmitError::RetryableReadiness(raw.state.message));
     assert!(bridge.nav.active_goal_lease().await.is_none());
     assert_eq!(scheme_a_goal_frame_count(&backend), 0);
@@ -25732,14 +25809,11 @@ mod exploration_lcm_smoke_tests {
 
 
 #[test]
-fn scheme_a_all_thirteen_typed_readiness_causes_keep_retry_policy() {
+fn scheme_a_navigation_input_readiness_causes_keep_retry_policy() {
     use crate::explore_runtime::ChildNavigationSubmitError;
     use crate::nav_runtime::{NavigationReadinessCode as Code, SetGoalRetryReason};
 
     let retryable_codes = [
-        Code::MotionSinkUnobserved,
-        Code::MotionSinkStale,
-        Code::MotionSinkNotReady,
         Code::StackStateUnobserved,
         Code::StackStateStale,
         Code::TfUnobserved,
@@ -25751,7 +25825,7 @@ fn scheme_a_all_thirteen_typed_readiness_causes_keep_retry_policy() {
         Code::CostmapUnavailable,
         Code::PlannerNotReady,
     ];
-    assert_eq!(retryable_codes.len(), 13);
+    assert_eq!(retryable_codes.len(), 10);
     for code in retryable_codes {
         // Intentionally unrelated diagnostic text. The typed cause, not text,
         // decides retry policy. Exact reason preservation is checked separately.

@@ -25,12 +25,7 @@ impl<M: NavMotionPort, P: NavPlanner> NavScheduler<M, P> {
     ) -> Result<(), RuntimeError> {
         self.check_path_wait_timeout(status).await?;
         if self.arrival_confirmation.is_some() && !self.obstacle_source_available {
-            return Err(self
-                .fail_closed(
-                    status,
-                    RuntimeError::StaleInput("停车复核期间近期障碍来源已撤销".into()),
-                )
-                .await);
+            return self.wait_for_fresh_input(status, "停车复核期间近期障碍来源暂不可用".into()).await;
         }
         let Some(pending) = self.arrival_confirmation.as_ref() else {
             return Ok(());
@@ -108,9 +103,7 @@ impl<M: NavMotionPort, P: NavPlanner> NavScheduler<M, P> {
     ) -> Result<(), RuntimeError> {
         // 尚未重新取租约时保持原停车证明；来源失效不能恢复运动。
         if let Some(reason) = self.stale_input_reason(Instant::now()) {
-            return Err(self
-                .fail_closed(status, RuntimeError::StaleInput(reason))
-                .await);
+            return self.wait_for_fresh_input(status, reason).await;
         }
         let Some(session) = self.session.clone() else {
             return Err(RuntimeError::Planner("停车接续缺少原目标".into()));

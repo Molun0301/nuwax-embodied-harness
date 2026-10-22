@@ -149,7 +149,8 @@ async fn arrival_confirmation_cancellation_invalidation_and_shutdown_use_the_exi
         } else {
             let (reply, response) = oneshot::channel();
             let command = if action == "invalidate" {
-                UrgentCommand::InvalidateMap { reason: "来源已撤销".into(), invalidated_at: Instant::now(), reply }
+                UrgentCommand::InvalidateMap { reason: "来源已撤销".into(), invalidated_at: Instant::now(),
+                    kind: MapInvalidationKind::Invalidated, reply }
             } else { UrgentCommand::Shutdown { reply } };
             let result = scheduler.handle_urgent(&status, command).await;
             if let Some(result) = result { result.unwrap(); }
@@ -177,14 +178,30 @@ async fn arrival_wait_preserves_the_original_wait_deadline() {
 }
 
 #[tokio::test]
-async fn arrival_source_revocation_retires_the_goal_without_readmission() {
+async fn arrival_source_pause_keeps_confirmed_stop_and_resumes_only_after_fresh_input() {
     let (mut scheduler, status, motion) = stopped_arrival_fixture().await;
     scheduler.obstacle_source_available = false;
-    assert!(scheduler.session_tick(&status).await.is_err());
-    assert_eq!(scheduler.status.last_terminal, Some(TerminalOutcome::SafetyFailed));
-    assert_eq!(scheduler.status.last_zero_ack_id.as_deref(), Some("zero-ack"));
-    assert!(scheduler.session.is_none());
+    scheduler.session_tick(&status).await.unwrap();
+    assert!(scheduler.status.last_terminal.is_none());
+    assert_eq!(scheduler.arrival_confirmation.as_ref().unwrap().proof.zero_ack_id, "zero-ack");
+    assert!(scheduler.session.is_some() && !scheduler.lease_active);
     assert_eq!(motion.lock().unwrap().calls.iter().filter(|v| v.starts_with("acquire:")).count(), 1);
+    scheduler.obstacle_source_available = true;
+    let mut outside = map_pose_at(2); outside.pose.position.x = 1.7;
+    scheduler.observe_odometry(&status, outside.clone(), None).unwrap();
+    scheduler.session_tick(&status).await.unwrap();
+    assert!(scheduler.arrival_resume_requested());
+    scheduler.pose_valid_until = Some(Instant::now() - Duration::from_millis(1));
+    scheduler.session_tick(&status).await.unwrap();
+    assert!(scheduler.arrival_confirmation.is_some() && !scheduler.lease_active);
+    assert_eq!(motion.lock().unwrap().calls.iter().filter(|v| v.starts_with("acquire:")).count(), 1);
+    outside.stamp.nanos += 1;
+    scheduler.observe_odometry(&status, outside, Some(Instant::now() + Duration::from_millis(500))).unwrap();
+    scheduler.session_tick(&status).await.unwrap();
+    assert!(scheduler.lease_active && scheduler.arrival_confirmation.is_none());
+    assert_eq!(scheduler.current_path_revision, 1);
+    assert_eq!(motion.lock().unwrap().calls.iter().filter(|v| v.starts_with("acquire:")).count(), 2);
+    scheduler.cancel(&status, "goal-1").await.unwrap();
 }
 
 struct ArrivalAdmissionMotion {

@@ -468,7 +468,6 @@ _ASYNC_GEOMETRY_TASK_POLLING_GUIDANCE["explore_area_v2"] = dict(
 _SAFETY_WATCHDOG_REFRESH_INTERVAL_SEC = 1.5
 _RUNTIME_ACTIVATION_TIMEOUT_SEC = 95.0
 _PERSON_FOLLOW_TARGET_MAX_PERIOD_SEC = 0.2
-_PERSON_FOLLOW_TARGET_WATCHDOG_SEC = 1.5
 _PERSON_FOLLOW_DEFAULT_LOST_TIMEOUT_SEC = 2.0
 _PERSON_FOLLOW_PREFLIGHT_TIMEOUT_SEC = 3.0
 _GEOMETRY_ONLY_CAPABILITY_NAMES = frozenset(
@@ -4609,9 +4608,6 @@ class GatewayRuntime:
             capability_name,
             robot_model=self.robot.manifest.robot_model,
         )
-        if registration.handler is None:
-            raise GatewayError(f"能力 {capability_name} 尚未绑定处理器。")
-
         started_at = time.perf_counter()
         context = self._build_capability_request_context(
             request_context,
@@ -8670,14 +8666,6 @@ class GatewayRuntime:
                 http_status=422,
                 jsonrpc_code=-32602,
             )
-        if lost_timeout_sec < _PERSON_FOLLOW_TARGET_WATCHDOG_SEC:
-            raise GatewayError(
-                "lost_timeout_sec 不得短于 1.5 秒的 PersonFollow bridge watchdog。",
-                error_code="invalid_params",
-                http_status=422,
-                jsonrpc_code=-32602,
-            )
-
         def runner(context) -> Dict[str, Any]:
             session_id = "follow:%s" % uuid.uuid4().hex
             bridge = getattr(self, "person_follow_bridge", None)
@@ -8824,7 +8812,6 @@ class GatewayRuntime:
                             session_id,
                             session,
                             fence_session=self.motion_guard.stop_and_fence,
-                            target_timeout_sec=_PERSON_FOLLOW_TARGET_WATCHDOG_SEC,
                         )
                     except BaseException:
                         self.motion_guard.stop_and_fence(session)
@@ -11908,20 +11895,6 @@ class GatewayRuntime:
         with transaction_lock:
             transaction = ledger.get(operation_id)
             if transaction is None:
-                while len(ledger) >= _EXPLORATION_STOP_TRANSACTION_CAPACITY:
-                    completed_id = next(
-                        (
-                            key
-                            for key, value in ledger.items()
-                            if value.phase == _ExplorationStopPhase.DONE
-                        ),
-                        None,
-                    )
-                    if completed_id is None:
-                        raise RuntimeError(
-                            "exploration stop transaction capacity exhausted"
-                        )
-                    del ledger[completed_id]
                 try:
                     self.motion_guard.start()
                 except GatewayMotionGuardUnavailable:
@@ -11933,14 +11906,6 @@ class GatewayRuntime:
                         raise
                     self._request_geometry_runtime_activation("stop_all_motion", "guard")
                     self.motion_guard.start()
-                transaction = _ExplorationStopTransaction(
-                    operation_id=operation_id,
-                    stop_reason=stop_reason,
-                    ordinary_confirmation=None,
-                    cancelled_task_ids=(),
-                    ordinary_confirmed=False,
-                )
-                ledger[operation_id] = transaction
                 confirmation = self.motion_guard.stop_all_motion(
                     stop_reason,
                     operation_id=operation_id,
@@ -11957,10 +11922,15 @@ class GatewayRuntime:
                     raise RuntimeError(
                         "ordinary global stop exposed a private recovery fence token"
                     )
-                transaction.ordinary_confirmation = confirmation
-                transaction.ordinary_confirmed = True
-            elif transaction.stop_reason != stop_reason:
-                raise RuntimeError("operation_id replay changed the stop reason")
+                transaction = _ExplorationStopTransaction(
+                    operation_id=operation_id,
+                    stop_reason=stop_reason,
+                    ordinary_confirmation=confirmation,
+                    cancelled_task_ids=(),
+                    ordinary_confirmed=True,
+                )
+                ledger[operation_id] = transaction
+            stop_reason = transaction.stop_reason
             ledger.move_to_end(operation_id)
             if not transaction.ordinary_confirmed:
                 return {
@@ -12029,6 +11999,8 @@ class GatewayRuntime:
             except Exception as error:
                 RUNTIME_LOGGER.exception("全局停车后导航资源对账失败 operation_id=%s", operation_id)
                 navigation_reconciliation = {"attempted": True, "pending": True, "error": str(error)}
+            while len(ledger) > _EXPLORATION_STOP_TRANSACTION_CAPACITY:
+                ledger.popitem(last=False)
             return {
                 "cancelled_task_ids": list(transaction.cancelled_task_ids),
                 "cancelled_task_count": len(transaction.cancelled_task_ids),
@@ -12638,14 +12610,6 @@ class GatewayRuntime:
                                 "target_name": goal.target_name,
                             },
                         )
-                    if status == NavigationStatus.FAILED and str(last_context.navigation_state.message or "").startswith("SafetyFailed cause=StaleInput:"):
-                        proof = self._navigation_terminal_proof(last_context, goal_id=goal.goal_id,
-                            allowed_statuses={NavigationStatus.FAILED.value})
-                        if proof:
-                            context.update(stage="waiting_navigation_inputs", message="输入暂时失鲜，已确认停车；保留目标等待恢复。")
-                            last_context, generation_snapshot = wait_and_submit()
-                            self._record_task_generation_snapshot(context, generation_snapshot)
-                            continue
                     if status == NavigationStatus.FAILED:
                         raise GatewayError(
                             last_context.navigation_state.message or "导航执行失败。",
@@ -12918,6 +12882,17 @@ class GatewayRuntime:
             and not bool(getattr(navigation_context, "goal_reached", False))
         ):
             return {}
+        metadata = state.metadata
+        if (
+            status in {NavigationStatus.FAILED.value, NavigationStatus.CANCELLED.value}
+            and metadata.get("reason_code") == "LEASE_NOT_GRANTED"
+        ):
+            # 原生端已关联到本目标的明确租约拒绝；目标未执行，不冒充归零回执。
+            return {
+                "goal_id": goal_id,
+                "terminal_status": status,
+                "lease_not_granted": True,
+            }
         zero_proof = cls._navigation_zero_proof(navigation_context)
         if not zero_proof:
             return {}
@@ -14259,7 +14234,7 @@ class GatewayRuntime:
                 RUNTIME_LOGGER.exception("SafetyGuard watchdog 巡检失败。")
 
     def _ensure_geometry_runtime_for_invoke(self, capability_name: str) -> None:
-        """invoke 入口的几何运行时门禁：仅做快速检查，不阻塞启动。
+        """同步能力等待运行时启动，异步能力由任务执行器按需启动。
 
         - 不在白名单：直接放行。
         - SYNC 类几何 capability（白名单子集）：必须等就绪；若已有线程在 start 则等同一事件。
@@ -14281,13 +14256,6 @@ class GatewayRuntime:
                     jsonrpc_code=-32000,
                     details={"capability_name": capability_name},
                 )
-        provider_ready = False
-        if activation_level in {"geometry", "motion", "person_follow"}:
-            provider_ready, _ = self._geometry_runtime_provider_ready()
-        if activation_level == "geometry" and provider_ready and (
-            not self._requires_runtime_input_bridge(capability_name) or self._runtime_input_bridge_ready()
-        ):
-            return
         if capability_name in _SYNC_GEOMETRY_CAPABILITY_NAMES:
             self._ensure_geometry_runtime_started(capability_name)
             return

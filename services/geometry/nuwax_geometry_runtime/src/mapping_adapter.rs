@@ -3317,19 +3317,10 @@ impl MappingAdapter {
                     true,
                 )
             };
-        let candidate_count = map_points.len().min(self.session.capacity());
-        let candidate_points = &map_points[map_points.len() - candidate_count..];
-        self.mapping_backend
-            .validate_frame_input(self.last_sensor_origin, candidate_points)
-            .map_err(
-                |reason| nuwax_mapping::SessionError::FrameTransformUnavailable {
-                    source_frame_id: source_frame_id.clone(),
-                    target_frame_id: self.map_frame_id.clone(),
-                    reason,
-                },
-            )?;
         #[cfg(test)]
         if compatibility_kernel {
+            let candidate_count = map_points.len().min(self.session.capacity());
+            let candidate_points = &map_points[map_points.len() - candidate_count..];
             self.mapping_kernel
                 .prepare_map_frame(self.last_sensor_origin, candidate_points)
                 .map_err(

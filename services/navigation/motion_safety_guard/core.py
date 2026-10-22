@@ -14,7 +14,8 @@ from services.navigation.proto_gen import motion_guard_pb2 as pb
 
 from .constants import (
     API_VERSION,
-    DEDUP_CAPACITY_DEFAULT,
+    OPERATION_RECORD_CAPACITY,
+    RETRY_HORIZON_NS,
     LEASE_RENEWAL_WINDOW_NS,
     MAX_COMMAND_DEADLINE_NS,
     OWNER_TIMEOUT_NS,
@@ -25,7 +26,7 @@ from .constants import (
 from .epoch import EpochError, EpochRecord, EpochStore, MAX_GENERATION
 from .go2_actuator import ActuatorBackend, ActuatorError
 from .peer_auth import PeerCredentials
-from .stop_confirmation import StopConfirmation, StopEvidence, StopProgress
+from .stop_confirmation import StopConfirmation, StopEvidence
 from .wire import (
     WireContractError,
     operation_envelope,
@@ -58,6 +59,7 @@ class OperationRecord:
     zero_applied_ns: int
     motion_stop_generation: int
     namespace: str
+    recorded_monotonic_ns: int
     recovery_fence_token: bytes = b""
     recovery_fence_held: bool = False
     acquire: bool = False
@@ -125,11 +127,8 @@ class MotionGuardCore:
         actuator: ActuatorBackend,
         monotonic_ns: Callable[[], int] = time.monotonic_ns,
         lease_id_factory: Optional[Callable[[], int]] = None,
-        dedup_capacity: int = DEDUP_CAPACITY_DEFAULT,
         stop_confirmation: Optional[StopConfirmation] = None,
     ) -> None:
-        if dedup_capacity < 4:
-            raise ValueError("dedup_capacity must reserve normal and priority entries")
         self.epoch = epoch
         self._epoch_store = epoch_store
         self._actuator = actuator
@@ -163,8 +162,6 @@ class MotionGuardCore:
         self._zero_retry_not_before_ns = 0
         self._zero_retry_delay_ns = ZERO_RETRY_INITIAL_NS
         self._state_lock = threading.RLock()
-        self._ordinary_capacity = dedup_capacity - max(1, dedup_capacity // 4)
-        self._priority_capacity = dedup_capacity - self._ordinary_capacity
         self._ordinary_records: Dict[Tuple[object, ...], OperationRecord] = {}
         self._priority_records: Dict[Tuple[object, ...], OperationRecord] = {}
         # 全局停车可先于原运动拥有方到达；保留被撤租者的精确归零票据供其收尾。
@@ -654,7 +651,6 @@ class MotionGuardCore:
             peer,
             source,
             namespace="lease",
-            priority=True,
         )
         if cached is not None:
             return cached
@@ -682,7 +678,6 @@ class MotionGuardCore:
             peer,
             source,
             namespace="lease",
-            priority=True,
         )
         if cached is not None:
             return cached
@@ -859,6 +854,7 @@ class MotionGuardCore:
             )
         response, outcome = self._response(request)
         outcome.target_operation_id = operation_id
+        self._prune_operation_records()
         records = self._operation_index.get(operation_id, ())
         record = next(
             (
@@ -900,7 +896,6 @@ class MotionGuardCore:
         source: str,
         *,
         namespace: str,
-        priority: bool = False,
     ) -> Optional[pb.MotionGuardResponse]:
         verify_payload_sha256(request)
         envelope = operation_envelope(request)
@@ -909,6 +904,7 @@ class MotionGuardCore:
         if not envelope.operation_id:
             raise GuardFailure("INVALID_ARGUMENT", "operation_id is required")
         self._validate_epoch_tuple(envelope, namespace=namespace)
+        self._prune_operation_records()
         key = self._dedup_key(envelope, peer, source, namespace)
         record = self._ordinary_records.get(key) or self._priority_records.get(key)
         if record is not None:
@@ -923,11 +919,6 @@ class MotionGuardCore:
             response.request_id = request.request_id
             return response
         self._validate_deadline(envelope)
-        target = self._priority_records if priority else self._ordinary_records
-        capacity = self._priority_capacity if priority else self._ordinary_capacity
-        if len(target) >= capacity:
-            self._cache_exhausted()
-            raise GuardFailure("RESOURCE_EXHAUSTED", "dedup cache is exhausted")
         return None
 
     def _prepare_global_stop(
@@ -940,6 +931,7 @@ class MotionGuardCore:
         envelope = request.stop_all_motion.envelope
         if not envelope.operation_id:
             raise GuardFailure("INVALID_ARGUMENT", "operation_id is required")
+        self._prune_operation_records()
         key = self._dedup_key(envelope, peer, source, "global_stop")
         record = self._ordinary_records.get(key) or self._priority_records.get(key)
         if record is not None:
@@ -954,9 +946,6 @@ class MotionGuardCore:
             response.request_id = request.request_id
             return response
         self._validate_deadline(envelope)
-        if len(self._priority_records) >= self._priority_capacity:
-            self._cache_exhausted()
-            raise GuardFailure("RESOURCE_EXHAUSTED", "priority dedup cache is exhausted")
         return None
 
     def _validate_epoch_tuple(self, envelope: pb.RequestEnvelope, *, namespace: str) -> None:
@@ -1187,7 +1176,11 @@ class MotionGuardCore:
             record = target.get(key)
             if record is None or record.zero_ack_id != self._last_zero_confirmation.zero_ack_id:
                 continue
-            updated = replace(record, stationary_zero_ack_bytes=encoded)
+            updated = replace(
+                record,
+                stationary_zero_ack_bytes=encoded,
+                recorded_monotonic_ns=self._monotonic_ns(),
+            )
             target[key] = updated
             self._operation_index[operation_id] = [updated if item is record else item for item in self._operation_index.get(operation_id, ())]
         if self._last_zero_confirmation.stationary_confirmed:
@@ -1203,22 +1196,6 @@ class MotionGuardCore:
             confirmation_kind=evidence.confirmation_kind,
             feedback_source_timestamp_ns=evidence.feedback_source_timestamp_ns,
         )
-
-    def _cache_exhausted(self) -> None:
-        self.lease_state = pb.LEASE_STATE_REVOKING
-        try:
-            zero_ack = self._zero()
-            self._clear_lease()
-            self._commit_epoch(
-                lease=pb.LEASE_STATE_IDLE,
-                fenced=True,
-                last_zero_ack_id=zero_ack.zero_ack_id,
-                startup_zero_confirmed=True,
-            )
-        except ActuatorError as exc:
-            self._mark_zero_unconfirmed(exc)
-        except EpochError:
-            self._startup_zero_confirmed = False
 
     def _commit_epoch(
         self,
@@ -1264,7 +1241,7 @@ class MotionGuardCore:
                 and self._last_zero_confirmation.applied_monotonic_ns > 0):
             self._externally_fenced_leases[self._pending_retired_lease] = self._last_zero_confirmation.SerializeToString()
             self._pending_retired_lease = None
-            while len(self._externally_fenced_leases) > self._priority_capacity:
+            while len(self._externally_fenced_leases) > OPERATION_RECORD_CAPACITY:
                 del self._externally_fenced_leases[next(iter(self._externally_fenced_leases))]
 
     def _clear_lease(self) -> None:
@@ -1338,6 +1315,15 @@ class MotionGuardCore:
         priority: bool = False,
         acquire: bool = False,
     ) -> None:
+        self._prune_operation_records()
+        operation = request.WhichOneof("operation")
+        if operation == "submit_motion_command":
+            if request.submit_motion_command.WhichOneof("command") != "stop":
+                return
+        elif operation not in {
+            "acquire_lease", "revoke_and_zero", "revoke_zero_and_switch_mode", "stop_all_motion",
+        }:
+            return
         envelope = operation_envelope(request)
         if envelope is None:
             return
@@ -1364,6 +1350,7 @@ class MotionGuardCore:
             ),
             motion_stop_generation=getattr(outcome, "motion_stop_generation", 0),
             namespace=namespace,
+            recorded_monotonic_ns=self._monotonic_ns(),
             recovery_fence_token=bytes(
                 getattr(outcome, "recovery_fence_token", b"")
             ),
@@ -1377,6 +1364,35 @@ class MotionGuardCore:
         self._operation_index.setdefault(envelope.operation_id, []).append(record)
         if self._pending_stop is not None and record.zero_ack_id == self._last_zero_confirmation.zero_ack_id:
             self._pending_zero_records.append((priority, key, envelope.operation_id))
+        self._prune_operation_records()
+
+    def _prune_operation_records(self) -> None:
+        """只淘汰已完成的历史结果，停车待确认记录留给原操作查询。"""
+        pending = {(priority, key) for priority, key, _ in self._pending_zero_records}
+        cutoff = self._monotonic_ns() - RETRY_HORIZON_NS
+        completed = []
+        for priority, target in ((False, self._ordinary_records), (True, self._priority_records)):
+            for key, record in tuple(target.items()):
+                if (priority, key) in pending:
+                    continue
+                if record.recorded_monotonic_ns < cutoff:
+                    self._forget_operation_record(target, key, record)
+                else:
+                    completed.append((record.recorded_monotonic_ns, priority, key, record))
+        excess = len(self._ordinary_records) + len(self._priority_records) - OPERATION_RECORD_CAPACITY
+        if excess > 0:
+            completed.sort(key=lambda entry: entry[0])
+            for _, priority, key, record in completed[:excess]:
+                target = self._priority_records if priority else self._ordinary_records
+                self._forget_operation_record(target, key, record)
+
+    def _forget_operation_record(self, target, key, record: OperationRecord) -> None:
+        del target[key]
+        retained = [item for item in self._operation_index[record.operation_id] if item.key != key]
+        if retained:
+            self._operation_index[record.operation_id] = retained
+        else:
+            del self._operation_index[record.operation_id]
 
     def _measured_motion_feedback(self) -> Optional[pb.MeasuredMotionFeedback]:
         """附带已有真实样本，不代表当前命令后的观测，也不影响命令结果。"""

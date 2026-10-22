@@ -341,7 +341,7 @@ pub struct NavRuntimeSlot {
     path_candidates: VecDeque<nuwax_nav_types_messages::PathKey>,
     /// 最近同目标的计算路径，仅用于展示，不能替代执行回执。
     display_path: Option<(GoalLease, Vec<[f64; 3]>)>,
-    /// 已核验的停车终态独立于展示缓存，供取消重试和订阅重连读取。
+    /// 已核验的停车终态和明确无租约拒绝，供取消重试和订阅重连读取。
     terminal_receipts: VecDeque<RetainedTerminalReceipt>,
     /// Highest goal generation ever reserved by this runtime.
     pub last_goal_generation: u64,
@@ -817,6 +817,54 @@ impl NavRuntimeState {
     /// 读内部 slot 句柄(给 server.rs 写 diagnostics 用)。
     pub fn inner(&self) -> Arc<RwLock<NavRuntimeSlot>> {
         self.inner.clone()
+    }
+
+    /// 收敛接收边界已解码的明确无租约拒绝；它不生成停车证明。
+    pub(crate) async fn retire_unleased_goal(
+        &self, mut update: NavigationUpdate,
+    ) -> Option<NavigationUpdate> {
+        let _transaction_guard = self.transaction_gate.lock().await;
+        let mut slot = self.inner.write().await;
+        let active = slot.goal.as_ref()?;
+        let lease = &active.lease;
+        if lease.session_id != update.state.goal_id
+            || lease.owner_kind != update.feedback.owner_kind
+            || lease.parent_request_id != update.feedback.parent_request_id
+            || lease.goal_generation != update.feedback.goal_generation
+            || lease.producer_runtime_generation != update.feedback.producer_runtime_generation
+            || matches!(slot.phase, NavPhase::Running | NavPhase::Succeeded)
+        {
+            return None;
+        }
+        // 规划路径可能先于租约请求返回；明确无租约终态按目标关联，不借路径生成停车凭据。
+        let mut cancel = self.cancel.lock().ok()?;
+        let same_cancel = cancel.lease.as_ref().is_some_and(|cancelled| cancelled.identity_matches(lease));
+        if update.feedback.cancel_generation > 0
+            && (!same_cancel || cancel.generation != update.feedback.cancel_generation)
+        {
+            return None;
+        }
+        if same_cancel {
+            *cancel = CancelTracker::default();
+        }
+        update.producer_runtime_generation = lease.producer_runtime_generation;
+        update.feedback.cancel_phase = "IDLE".into();
+        update.feedback.actuator_zeroed = false;
+        slot.phase = NavPhase::Failed;
+        slot.message = update.state.message.clone();
+        slot.goal = None;
+        slot.path_candidate_goal = None;
+        slot.path_candidates.clear();
+        slot.display_path = None;
+        slot.terminal_receipts.push_back(RetainedTerminalReceipt {
+            update: update.clone(),
+            retired_naturally: true,
+        });
+        while slot.terminal_receipts.len() > 32 { slot.terminal_receipts.pop_front(); }
+        drop(cancel);
+        drop(slot);
+        self.observe_unowned_stack_heartbeat(update.state.clone());
+        Some(update)
     }
 
     /// 只保留已经沿执行输入校验的停车证明，不从本地错误构造终态。
@@ -2190,7 +2238,7 @@ pub async fn compute_readiness(
             "Unknown"
         }
     };
-    let ready = lcm_backend && tf && costmap && planner && cmd_vel_sink_ready;
+    let ready = lcm_backend && tf && costmap && planner;
     let mut blockers = Vec::new();
     if !planar_admitted {blockers.push(NavigationReadinessCode::PlannerNotReady);}
     if !lcm_backend {
@@ -2276,7 +2324,7 @@ fn compute_admission_readiness<'a>(
             .copied()
             .unwrap_or(NavigationReadinessCode::Ready);
         NavigationReadinessDetail {
-            ready: lcm_backend && tf && costmap && planner && cmd_vel_sink_ready,
+            ready: lcm_backend && tf && costmap && planner,
             reason: readiness_reason(reason_code).to_string(),
             reason_code,
             blockers,
@@ -2319,13 +2367,6 @@ fn observation_blockers(
     observations: &RuntimeObservationSnapshot,
 ) -> Vec<NavigationReadinessCode> {
     let mut blockers = Vec::new();
-    if !observations.motion_sink_observed {
-        blockers.push(NavigationReadinessCode::MotionSinkUnobserved);
-    } else if !observations.motion_sink_fresh {
-        blockers.push(NavigationReadinessCode::MotionSinkStale);
-    } else if !observations.motion_sink_ready {
-        blockers.push(NavigationReadinessCode::MotionSinkNotReady);
-    }
     if !stack_health.observed {
         blockers.push(NavigationReadinessCode::StackStateUnobserved);
     } else if !stack_health.fresh {
@@ -2361,7 +2402,7 @@ fn observation_blockers(
 fn readiness_reason(code: NavigationReadinessCode) -> &'static str {
     match code {
         NavigationReadinessCode::Unknown => "UNKNOWN: readiness payload lacks a typed code",
-        NavigationReadinessCode::Ready => "READY: guard-backed navigation chain is ready",
+        NavigationReadinessCode::Ready => "READY: navigation inputs are ready",
         NavigationReadinessCode::LcmBackendUnavailable => {
             "LCM_BACKEND_UNAVAILABLE: real LCM backend unavailable"
         }
@@ -4786,6 +4827,43 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn unleased_rejection_settles_pending_cancel_without_a_zero_receipt() {
+        let state = NavRuntimeState::from_env();
+        let mut lease = test_lease("cancel-before-lease", 1);
+        lease.path_revision = 3;
+        lease.planner_runtime_generation = 8;
+        {
+            let mut slot = state.inner.write().await;
+            slot.phase = NavPhase::Planning;
+            slot.goal = Some(test_active_goal_with_lease(lease.clone()));
+        }
+        let CancelStart::Publish { generation, .. } = state.begin_cancel(&cancel_input(&lease)).await else {
+            panic!("原目标可以进入待取消状态");
+        };
+        let update = NavigationUpdate {
+            state: NavState { status: "FAILED".into(), goal_id: lease.session_id.clone(),
+                message: "LEASE_NOT_GRANTED: STALE_STOP_GENERATION".into(), timestamp_ns: now_ns(),
+                ..NavState::default() },
+            feedback: crate::lcm_runtime::NavigationFeedback {
+                reason_code: "LEASE_NOT_GRANTED".into(), owner_kind: lease.owner_kind,
+                parent_request_id: lease.parent_request_id.clone(), goal_generation: lease.goal_generation,
+                producer_runtime_generation: lease.producer_runtime_generation,
+                cancel_generation: generation, guard_generation: 7, ..Default::default()
+            },
+            producer_runtime_generation: lease.producer_runtime_generation,
+        };
+        let result = state.retire_unleased_goal(update).await.expect("明确无租约终态结束目标和同目标取消");
+        assert!(state.active_goal_lease().await.is_none());
+        assert_eq!(state.cancel_snapshot().phase, CancelPhase::Idle);
+        assert!(!result.feedback.actuator_zeroed);
+        assert!(result.feedback.zero_ack_id.is_empty());
+        assert_eq!(result.feedback.zero_applied_monotonic_ns, 0);
+        let retained = state.terminal_receipt_for(&cancel_input(&lease)).await.unwrap();
+        assert_eq!(retained.feedback.reason_code, "LEASE_NOT_GRANTED");
+        assert_eq!(retained.feedback.path_revision, 0, "未取得路径执行资格的拒绝不虚构路径确认");
+    }
+
     fn test_goal_input(goal_id: &str) -> SetGoalInput {
         SetGoalInput {
             options: Default::default(),
@@ -5173,7 +5251,7 @@ mod tests {
         handle.set_cmd_vel_sink_ready(true);
         let d = compute_readiness(&handle, &state).await;
         assert!(!d.cmd_vel_sink_ready);
-        assert_eq!(d.reason_code, NavigationReadinessCode::MotionSinkUnobserved);
+        assert_eq!(d.reason_code, NavigationReadinessCode::StackStateUnobserved);
     }
 
     #[tokio::test]
@@ -7983,8 +8061,10 @@ mod tests {
 
         state.expire_motion_sink_for_test();
         let stale = compute_readiness(&handle, &state).await;
-        assert!(!stale.ready);
-        assert_eq!(stale.reason_code, NavigationReadinessCode::MotionSinkStale);
+        assert!(stale.ready);
+        assert!(!stale.cmd_vel_sink_ready);
+        assert!(!stale.motion_sink_fresh);
+        assert_eq!(stale.reason_code, NavigationReadinessCode::Ready);
 
         state
             .observe_motion_sink(MotionSinkObservation {

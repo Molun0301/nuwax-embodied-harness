@@ -10,7 +10,6 @@ import queue
 import re
 import struct
 import threading
-import time
 from typing import Any, Callable, Mapping, Optional, Tuple
 
 
@@ -296,8 +295,6 @@ class _SessionBinding:
     session_id: str
     session: Any
     fence_session: Callable[[Any], Any]
-    target_timeout_sec: float
-    last_target_at: float
     next_target_seq: int
     cloud_revision: int
     last_source_stamp: Tuple[int, int]
@@ -655,7 +652,6 @@ class GatewayPersonFollowBridge:
         target_channel: Optional[str] = None,
         command_channel: Optional[str] = None,
         lcm_factory: Callable[[str], Any] = _default_lcm_factory,
-        monotonic: Callable[[], float] = time.monotonic,
         operation_timeout_sec: float = 1.0,
         barrier_timeout_sec: float = 1.0,
         poll_timeout_ms: int = 20,
@@ -683,7 +679,6 @@ class GatewayPersonFollowBridge:
         if isinstance(poll_timeout_ms, bool) or not 1 <= int(poll_timeout_ms) <= 1000:
             raise PersonFollowBridgeError("poll_timeout_ms must be in [1, 1000]")
         self._lcm_factory = lcm_factory
-        self._monotonic = monotonic
         self._operation_timeout_sec = float(operation_timeout_sec)
         self._barrier_timeout_sec = float(barrier_timeout_sec)
         self._poll_timeout_ms = int(poll_timeout_ms)
@@ -702,6 +697,8 @@ class GatewayPersonFollowBridge:
         self._prepared: Optional[_PreparedSession] = None
         self._binding: Optional[_SessionBinding] = None
         self._session_error: Optional[Tuple[str, PersonFollowBridgeError]] = None
+        self._discarded_commands = 0
+        self._discarded_targets = 0
 
     @property
     def started(self) -> bool:
@@ -792,25 +789,21 @@ class GatewayPersonFollowBridge:
         session: Any,
         *,
         fence_session: Callable[[Any], Any],
-        target_timeout_sec: float,
     ) -> None:
-        if not math.isfinite(target_timeout_sec) or target_timeout_sec <= 0.0:
-            raise PersonFollowBridgeError("target_timeout_sec must be positive")
         self._call(
             lambda: self._bind_session(
                 str(session_id).strip(),
                 session,
                 fence_session,
-                float(target_timeout_sec),
             )
         )
 
-    def publish_tracked(self, target: PersonFollowTarget) -> PersonFollowTarget:
+    def publish_tracked(self, target: PersonFollowTarget) -> Optional[PersonFollowTarget]:
         if target.tracking_state != PERSON_FOLLOW_TRACKED:
             raise PersonFollowBridgeError("publish_tracked requires a TRACKED target")
         return self._call(lambda: self._publish_tracked(target))
 
-    def publish_lost(self, target: PersonFollowTarget) -> PersonFollowTarget:
+    def publish_lost(self, target: PersonFollowTarget) -> Optional[PersonFollowTarget]:
         if target.tracking_state != PERSON_FOLLOW_LOST:
             raise PersonFollowBridgeError("publish_lost requires a LOST target")
         return self._call(lambda: self._publish_lost(target))
@@ -879,7 +872,6 @@ class GatewayPersonFollowBridge:
                 if self._stop_requested.is_set():
                     break
                 lcm_context.handle_timeout(self._poll_timeout_ms)
-                self._check_target_timeout()
         except BaseException as exc:
             self._set_fatal(exc)
         finally:
@@ -1019,7 +1011,6 @@ class GatewayPersonFollowBridge:
         session_id: str,
         session: Any,
         fence_session: Callable[[Any], Any],
-        target_timeout_sec: float,
     ) -> None:
         if not session_id:
             raise PersonFollowBridgeError("session_id must be non-empty")
@@ -1036,8 +1027,6 @@ class GatewayPersonFollowBridge:
             session_id=session_id,
             session=session,
             fence_session=fence_session,
-            target_timeout_sec=target_timeout_sec,
-            last_target_at=self._monotonic(),
             next_target_seq=prepared.last_target_seq + 1,
             cloud_revision=prepared.cloud_revision,
             last_source_stamp=prepared.source_stamp,
@@ -1046,7 +1035,7 @@ class GatewayPersonFollowBridge:
         self._prepared = None
         self._session_error = None
 
-    def _publish_tracked(self, target: PersonFollowTarget) -> PersonFollowTarget:
+    def _publish_tracked(self, target: PersonFollowTarget) -> Optional[PersonFollowTarget]:
         self._assert_session_healthy(target.session_id)
         binding = self._binding
         if binding is None or binding.session_id != target.session_id:
@@ -1055,10 +1044,8 @@ class GatewayPersonFollowBridge:
         if source_stamp == binding.last_source_stamp and binding.allow_preflight_stamp_once:
             binding.allow_preflight_stamp_once = False
         elif source_stamp <= binding.last_source_stamp:
-            self._fail_active_session(
-                PersonFollowBridgeError("PersonFollow target source timestamps must strictly increase")
-            )
-            raise self._session_error[1]
+            self._discarded_targets += 1
+            return binding.current_target
         else:
             binding.allow_preflight_stamp_once = False
         correlated = replace(
@@ -1071,20 +1058,17 @@ class GatewayPersonFollowBridge:
         binding.current_target = correlated
         binding.next_target_seq += 1
         binding.last_source_stamp = source_stamp
-        binding.last_target_at = self._monotonic()
         return correlated
 
-    def _publish_lost(self, target: PersonFollowTarget) -> PersonFollowTarget:
+    def _publish_lost(self, target: PersonFollowTarget) -> Optional[PersonFollowTarget]:
         self._assert_session_healthy(target.session_id)
         binding = self._binding
         if binding is None or binding.session_id != target.session_id:
             raise PersonFollowBridgeError("LOST target has no matching guard session")
         source_stamp = (target.stamp_sec, target.stamp_nsec)
         if source_stamp <= binding.last_source_stamp:
-            self._fail_active_session(
-                PersonFollowBridgeError("PersonFollow target source timestamps must strictly increase")
-            )
-            raise self._session_error[1]
+            self._discarded_targets += 1
+            return binding.current_target
         correlated = replace(
             target,
             target_seq=binding.next_target_seq,
@@ -1096,7 +1080,6 @@ class GatewayPersonFollowBridge:
         binding.next_target_seq += 1
         binding.last_source_stamp = source_stamp
         binding.allow_preflight_stamp_once = False
-        binding.last_target_at = self._monotonic()
         return correlated
 
     def _end_session(
@@ -1158,14 +1141,11 @@ class GatewayPersonFollowBridge:
             return
         preflight = self._preflight
         if preflight is not None:
-            error = self._validate_command(
-                command,
-                preflight.target,
-                preflight.last_command_seq,
-                preflight=True,
-            )
-            if error is not None:
-                self._abort_preflight(error)
+            try:
+                if not self._validate_command(command, preflight.target, preflight.last_command_seq, preflight=True):
+                    return
+            except PersonFollowBridgeError as exc:
+                self._abort_preflight(exc)
                 return
             preflight.last_command_seq = command.command_seq
             if command.state == PERSON_FOLLOW_WAITING_DATA:
@@ -1177,19 +1157,16 @@ class GatewayPersonFollowBridge:
             return
         target = binding.current_target
         if target is None:
-            self._fail_active_session(PersonFollowBridgeError("PersonFollow command has no active target"))
-            return
-        error = self._validate_command(
-            command,
-            target,
-            binding.last_command_seq,
-            preflight=False,
-        )
-        if error is not None:
-            self._fail_active_session(error)
+            self._discarded_commands += 1
             return
         try:
-            if command.state in {PERSON_FOLLOW_COMMAND_LOST, PERSON_FOLLOW_STOPPED}:
+            if not self._validate_command(command, target, binding.last_command_seq, preflight=False):
+                return
+        except PersonFollowBridgeError as exc:
+            self._fail_active_session(exc)
+            return
+        try:
+            if command.state in {PERSON_FOLLOW_COMMAND_LOST, PERSON_FOLLOW_STOPPED, PERSON_FOLLOW_WAITING_DATA}:
                 binding.session.stop()
             else:
                 binding.session.twist(
@@ -1212,32 +1189,35 @@ class GatewayPersonFollowBridge:
         last_command_seq: int,
         *,
         preflight: bool,
-    ) -> Optional[PersonFollowBridgeError]:
+    ) -> bool:
+        if (command.session_id != target.session_id or command.target_seq < target.target_seq
+                or command.command_seq <= last_command_seq):
+            self._discarded_commands += 1
+            return False
         if (
-            command.session_id != target.session_id
-            or command.target_seq != target.target_seq
+            command.target_seq != target.target_seq
             or command.target_stamp_sec != target.stamp_sec
             or command.target_stamp_nsec != target.stamp_nsec
         ):
-            return PersonFollowBridgeError("PersonFollow command correlation mismatch")
-        if command.command_seq <= last_command_seq:
-            return PersonFollowBridgeError("PersonFollow command_seq is not strictly increasing")
+            raise PersonFollowBridgeError("PersonFollow command correlation mismatch")
         if command.state == PERSON_FOLLOW_WAITING_DATA:
-            if preflight:
-                return None
-            return PersonFollowBridgeError("WAITING_DATA is only valid during preflight")
+            if preflight or target.tracking_state == PERSON_FOLLOW_TRACKED:
+                return True
+            raise PersonFollowBridgeError("PersonFollow command state does not match target")
         if command.state == PERSON_FOLLOW_FAILED:
-            return PersonFollowBridgeError(f"PersonFollow owner reported FAILED: {command.reason}")
+            raise PersonFollowBridgeError(f"PersonFollow owner reported FAILED: {command.reason}")
         if command.cloud_revision < target.required_cloud_revision:
-            return PersonFollowBridgeError("PersonFollow command correlation mismatch")
+            raise PersonFollowBridgeError("PersonFollow command correlation mismatch")
+        if not preflight and target.tracking_state == PERSON_FOLLOW_TRACKED and command.state == PERSON_FOLLOW_COMMAND_LOST:
+            return True
         expected = {
             PERSON_FOLLOW_TRACKED: PERSON_FOLLOW_TRACKING,
             PERSON_FOLLOW_LOST: PERSON_FOLLOW_COMMAND_LOST,
             PERSON_FOLLOW_STOP: PERSON_FOLLOW_STOPPED,
         }[target.tracking_state]
         if command.state != expected:
-            return PersonFollowBridgeError("PersonFollow command state does not match target")
-        return None
+            raise PersonFollowBridgeError("PersonFollow command state does not match target")
+        return True
 
     def _abort_preflight(self, error: PersonFollowBridgeError) -> None:
         preflight = self._preflight
@@ -1246,16 +1226,6 @@ class GatewayPersonFollowBridge:
         self._preflight = None
         preflight.error = error
         preflight.completed.set()
-
-    def _check_target_timeout(self) -> None:
-        binding = self._binding
-        if binding is None:
-            return
-        if self._monotonic() - binding.last_target_at <= binding.target_timeout_sec:
-            return
-        self._fail_active_session(
-            PersonFollowBridgeTimeout("PersonFollow target updates timed out; motion session was fenced")
-        )
 
     def _fail_active_session(
         self,

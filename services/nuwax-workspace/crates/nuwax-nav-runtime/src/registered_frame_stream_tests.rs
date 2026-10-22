@@ -101,9 +101,11 @@ async fn registered_stream_diagnostic(occlusion_consistent:bool) {
         if status.last_terminal.is_some() {break;}
     }
     handle.update_registered_obstacle_source(None,false,None,None).await.unwrap();
-    let terminal=wait_for_terminal(&handle,TerminalOutcome::SafetyFailed).await;
+    let terminal=wait_for_input_pause(&handle).await;
     assert_eq!(terminal.last_applied_twist,Some(Twist2::ZERO));
-    assert!(terminal.last_zero_ack_id.is_some());
+    assert!(terminal.last_zero_ack_id.is_none());
+    handle.cancel("goal-1").await.unwrap();
+    assert!(handle.status().last_zero_ack_id.is_some());
     handle.shutdown().await.unwrap();task.await.unwrap().unwrap();
     let samples=issued.lock().unwrap();
     let positive:Vec<_>=samples.iter().filter(|(_,c)|*c!=Twist2::ZERO).collect();

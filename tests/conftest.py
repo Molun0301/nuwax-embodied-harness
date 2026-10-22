@@ -215,3 +215,27 @@ class LoaderStub(TransferStub):
         if request.action == 5 and self.cleanup_error:
             raise RuntimeError('release unavailable')
         return super().TransferGraphArtifact(request, timeout)
+
+
+def isolated_gateway_config(tmp_path):
+    """真实网关测试共用隔离路径，只关闭设备与模型的自动启动。"""
+    from core.settings import load_config
+
+    config = load_config()
+    config.robot.active_robot = "customrobot"
+    config.geometry.enabled = False
+    config.relay.enabled = False
+    config.runtime_data.map_active_restore_on_start = False
+    config.runtime_data.map_catalog_root = str(tmp_path / "maps")
+    config.runtime_data.memory_db_path = str(tmp_path / "memory.db")
+    config.runtime_data.memory_embedding_model = "disabled"
+    config.runtime_data.memory_image_embedding_model = "disabled"
+    config.gateway.artifact_dir = str(tmp_path / "artifacts")
+    config.logging.log_dir = str(tmp_path / "logs")
+    config.logging.log_file = str(tmp_path / "logs/gateway.log")
+    config.perception.yolo_world.enabled = False
+    config.perception.openai_vision.enabled = False
+    config.perception.segmentation.enabled = False
+    config.perception.stream_runtime.enabled = False
+    config.perception.stream_runtime.auto_start = False
+    return config

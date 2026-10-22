@@ -596,7 +596,7 @@ def install(args):
     if install_dir != home:
         print("管理入口目录：" + str(home), flush=True)
     home.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if home.stat().st_uid != os.getuid() or home.stat().st_mode & 0o022:
+    if home.stat().st_uid != os.getuid() or home.stat().st_mode & 0o002:
         raise BootstrapError("安装目录必须归当前用户持有且其它用户不可写")
     manager = home / "manager"
     versions = manager / "versions"

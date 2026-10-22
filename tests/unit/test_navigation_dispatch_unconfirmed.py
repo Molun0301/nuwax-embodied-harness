@@ -1351,3 +1351,44 @@ def test_rejected_wire_materializes_after_delivery_command_and_state_unlock(tran
     assert not backend._nav_set_precommit_candidates
     assert backend._nav_inflight_command_token is None
     assert backend._nav_set_transaction_context.result is None
+
+
+@pytest.mark.parametrize("delivery", ["unary", "precommit", "stream"])
+def test_unleased_guard_rejection_releases_obligation_without_zero_proof(delivery):
+    rejection = wire("failed", reason="LEASE_NOT_GRANTED", timestamp=100, path=0, planner=0)
+    rejection.message = "LEASE_NOT_GRANTED: STALE_STOP_GENERATION"
+    backend = provider(rejection if delivery == "unary" else wire())
+    if delivery == "precommit":
+        precommit(backend, rejection)
+    accepted, result = submit(backend)
+    if delivery == "stream":
+        assert not accepted and result["ownership_retained"]
+        assert stream(backend, rejection)
+    else:
+        assert not accepted and result["disposition"] == "resolved"
+        assert result["reason_code"] == "LEASE_NOT_GRANTED"
+    state = snapshot(backend)
+    assert state.status == NavigationStatus.FAILED
+    assert state.metadata["reason_code"] == "LEASE_NOT_GRANTED"
+    assert state.metadata["lease_not_granted"]
+    assert not state.metadata["ownership_retained"]
+    assert not state.metadata["actuator_zeroed"]
+    assert not state.metadata["zero_ack_id"]
+    assert state.metadata["zero_applied_monotonic_ns"] == 0
+    assert "dispatch_obligation" not in state.metadata
+    backend._stub.response = wire("accepted", goal_id="next-after-rejection", reason="ACCEPTED", path=0, planner=0, generation=3)
+    assert backend.set_goal(goal("next-after-rejection"))
+    assert len(backend._stub.set_calls) == 2
+
+
+def test_unleased_rejection_retires_only_the_matching_goal():
+    backend = provider()
+    submit(backend)
+    foreign = wire("failed", reason="LEASE_NOT_GRANTED", timestamp=100, path=0, planner=0,
+                   goal_id="another-goal")
+    assert not stream(backend, foreign)
+    assert snapshot(backend).metadata["ownership_retained"]
+    generic = wire("failed", reason="GUARD_ERROR", timestamp=100)
+    generic.message = "LEASE_NOT_GRANTED: 文本不能代替原生具名结果"
+    assert stream(backend, generic)
+    assert snapshot(backend).metadata["ownership_retained"]

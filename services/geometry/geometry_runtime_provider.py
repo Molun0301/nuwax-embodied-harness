@@ -3796,6 +3796,17 @@ def _navigation_update_has_complete_zero_proof(update) -> bool:
     )
 
 
+def _navigation_update_is_unleased_rejection(update) -> bool:
+    """原生接收边界已确认目标未取得租约，失败不需要停车证明。"""
+    return (update.reason_code == "LEASE_NOT_GRANTED"
+            and update.status.strip().lower() in {"failed", "cancelled"})
+
+
+def _navigation_update_is_resolved_terminal(update) -> bool:
+    return (_navigation_update_has_complete_zero_proof(update)
+            or _navigation_update_is_unleased_rejection(update))
+
+
 _NAV_DISPATCH_UNCONFIRMED_REASONS = frozenset({
     "GOAL_PUBLISH_UNCONFIRMED", "GOAL_TERMINAL_PROOF_PENDING",
 })
@@ -3826,10 +3837,12 @@ def _navigation_wire_document(update) -> Dict[str, Any]:
 
 
 def _navigation_complete_proof_upgrade(previous_metadata, previous_timestamp_ns, update) -> bool:
-    """A proof may complete an observed terminal only on its original path/source."""
+    """停车证明核对原路径；明确无租约拒绝按已关联的目标和源时间结束。"""
+    if _navigation_update_is_unleased_rejection(update):
+        return previous_timestamp_ns <= 0 or update.timestamp_ns >= previous_timestamp_ns
     return bool(
         str(getattr(update, "status", "") or "").strip().lower() in _NAV_TERMINAL_STATUS
-        and _navigation_update_has_complete_zero_proof(update)
+        and _navigation_update_is_resolved_terminal(update)
         and int(getattr(update, "path_revision", 0) or 0)
             == int(previous_metadata.get("path_revision") or 0)
         and int(getattr(update, "planner_runtime_generation", 0) or 0)
@@ -3843,7 +3856,7 @@ def _navigation_precommit_proof_upgrade(previous, update) -> bool:
     return bool(
         _navigation_lease_from_message(previous) == _navigation_lease_from_message(update)
         and str(getattr(previous, "status", "") or "").strip().lower() in _NAV_TERMINAL_STATUS
-        and not _navigation_update_has_complete_zero_proof(previous)
+        and not _navigation_update_is_resolved_terminal(previous)
         and _navigation_complete_proof_upgrade(
             {"path_revision": int(getattr(previous, "path_revision", 0) or 0),
              "planner_runtime_generation": int(getattr(previous, "planner_runtime_generation", 0) or 0)},
@@ -4615,10 +4628,12 @@ class GeometryRuntimeProvider:
         raw_status = str(getattr(update, "status", "") or "").strip().lower()
         inherited = self._navigation_obligation_locked(lease)
         complete_terminal = (raw_status in _NAV_TERMINAL_STATUS
-                             and _navigation_update_has_complete_zero_proof(update))
+                             and _navigation_update_is_resolved_terminal(update))
         metadata["authority_current"] = _is_canonical_public_navigation_lease(lease)
         metadata["ownership_retained"] = False
         if complete_terminal:
+            if _navigation_update_is_unleased_rejection(update):
+                metadata["lease_not_granted"] = True
             return raw_status, metadata
         obligation = copy.deepcopy(inherited) if inherited is not None else None
         if trusted_origin_reason in _NAV_DISPATCH_UNCONFIRMED_REASONS:
@@ -4653,6 +4668,8 @@ class GeometryRuntimeProvider:
         obligation = self._navigation_obligation_locked()
         if obligation is None:
             return True
+        if _navigation_update_is_unleased_rejection(update):
+            return self._last_nav_timestamp_ns <= 0 or update.timestamp_ns >= self._last_nav_timestamp_ns
         if obligation.get("terminal_observed"):
             return _navigation_complete_proof_upgrade(
                 self._last_nav_metadata,
@@ -4742,7 +4759,7 @@ class GeometryRuntimeProvider:
                 origin = reason if (canonical and reason in _NAV_DISPATCH_UNCONFIRMED_REASONS
                                     and raw_status in {"unconfirmed", "accepted", "pending", "planning", "running"}) else ""
                 terminal_proof = (canonical and raw_status in _NAV_TERMINAL_STATUS
-                                  and _navigation_update_has_complete_zero_proof(resp))
+                                  and _navigation_update_is_resolved_terminal(resp))
                 may_commit = canonical and (_status_means_accepted(raw_status) or bool(origin) or terminal_proof)
                 staged = self._take_navigation_set_precommit_locked(command_token=command_token, ack_lease=lease)
                 self._nav_inflight_command_token = None
@@ -4772,7 +4789,7 @@ class GeometryRuntimeProvider:
                             and int(getattr(staged, "path_revision", 0) or 0) == int(getattr(resp, "path_revision", 0) or 0)
                             and int(getattr(staged, "planner_runtime_generation", 0) or 0) == int(getattr(resp, "planner_runtime_generation", 0) or 0))
                         staged_complete = (staged_status in _NAV_TERMINAL_STATUS
-                                           and _navigation_update_has_complete_zero_proof(staged))
+                                           and _navigation_update_is_resolved_terminal(staged))
                         projection_stamp = int(getattr(resp, "timestamp_ns", 0) or 0)
                         staged_stamp = int(getattr(staged, "timestamp_ns", 0) or 0)
                         staged_source_path_current = bool(
@@ -4782,9 +4799,12 @@ class GeometryRuntimeProvider:
                         # Complete ZERO is not sufficient by itself: a same-owner old-path
                         # receipt must not settle the newer unary path. Same-path terminal
                         # bodies also need the exact planner generation.
-                        staged_body_current = bool(staged_source_path_current and (
+                        staged_body_current = bool((
+                            _navigation_update_is_unleased_rejection(staged)
+                            and (projection_stamp <= 0 or staged_stamp >= projection_stamp)
+                        ) or (staged_source_path_current and (
                             staged_status not in _NAV_TERMINAL_STATUS
-                            or staged_path > projection_path or staged_planner == projection_planner))
+                            or staged_path > projection_path or staged_planner == projection_planner)))
                         if (staged_body_current and (projection_is_stale or staged_complete
                                 or (pending_terminal and (proof_for_pending or same_terminal_path))
                                 or (not pending_terminal and (
@@ -4820,7 +4840,7 @@ class GeometryRuntimeProvider:
                     self._last_nav_current_pose = None
                     self._last_nav_timestamp_ns = int(getattr(committed, "timestamp_ns", 0) or 0)
                     self._last_nav_metadata = metadata
-                    resolved = status in _NAV_TERMINAL_STATUS and _navigation_update_has_complete_zero_proof(committed)
+                    resolved = status in _NAV_TERMINAL_STATUS and _navigation_update_is_resolved_terminal(committed)
                     # Preserve the old ordinary accepted-then-terminal contract. Only
                     # a trusted unresolved lineage changes an unproved terminal to unknown.
                     accepted = (_status_means_accepted(status) or (
@@ -8844,7 +8864,7 @@ class GeometryRuntimeProvider:
             return False
         if (
             normalized_status == "cancelled"
-            and not _navigation_update_has_complete_zero_proof(update)
+            and not _navigation_update_is_resolved_terminal(update)
         ):
             LOGGER.warning(
                 "丢弃缺少完整 ZERO proof 的 CANCELLED navigation stream frame"
@@ -8980,7 +9000,7 @@ class GeometryRuntimeProvider:
                     and inflight_token[3] == self._nav_connection_epoch
                     # 同租约已停车的自然/外部终态也能结束在途取消；新目标仍由完整身份隔离。
                     and incoming_status in terminal_statuses
-                    and _navigation_update_has_complete_zero_proof(update)
+                    and _navigation_update_is_resolved_terminal(update)
                 )
                 command_generation_is_current = bool(
                     self._last_nav_goal_command_generation
@@ -9608,10 +9628,10 @@ class GeometryRuntimeProvider:
             success = bool(
                 (_status_means_cancel_success(raw_status)
                  or (str(raw_status).strip().lower() in _NAV_TERMINAL_STATUS
-                     and _navigation_update_has_complete_zero_proof(resp)))
+                     and _navigation_update_is_resolved_terminal(resp)))
                 and (
                     not terminal
-                    or _navigation_update_has_complete_zero_proof(resp)
+                    or _navigation_update_is_resolved_terminal(resp)
                 )
             )
             cancel_message = getattr(resp, "message", "") or None

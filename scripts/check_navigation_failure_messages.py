@@ -96,14 +96,16 @@ class NavigationFailureMessageTests(unittest.TestCase):
             self.manager.wait_for_task(task.task_id, timeout=2)
         self.assertEqual(raised.exception.error_code, 'arrival_not_confirmed')
 
-    def test_stale_input_retry_and_real_task_success_remain_separate(self):
-        task = self.submit([self.state('SafetyFailed cause=StaleInput: pose expired'),
+    def test_stale_input_wait_keeps_the_same_task_and_goal(self):
+        task = self.submit([self.state('位姿短时过期，保持零速等待', NavigationStatus.RUNNING),
                             self.state('arrived', NavigationStatus.SUCCEEDED, True)])
         self.manager.wait_for_task(task.task_id, timeout=2)
         snapshot = self.runtime.get_task_snapshot(task.task_id)
         self.assertEqual(snapshot['status'].state.value, 'succeeded')
-        self.assertEqual(self.set_calls, ['offline-goal', 'offline-goal'])
-        self.assertTrue(any(event.payload.get('stage') == 'waiting_navigation_inputs' for event in snapshot['events']))
+        self.assertEqual(self.set_calls, ['offline-goal'])
+        self.assertTrue(any(event.payload.get('stage') == 'navigation_running'
+                            and event.message == '位姿短时过期，保持零速等待'
+                            for event in snapshot['events']))
 
 
 if __name__ == '__main__':

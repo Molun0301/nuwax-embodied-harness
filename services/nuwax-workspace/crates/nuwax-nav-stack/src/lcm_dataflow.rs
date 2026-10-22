@@ -977,6 +977,7 @@ struct GuardedPoseInput {
     pose: PoseStamped,
     frame_id: String,
     current: [f64; 3],
+    source_deadline: Option<tokio::time::Instant>,
 }
 
 #[cfg(feature = "guard-runtime")]
@@ -993,7 +994,7 @@ fn drain_guarded_pose_input(
     for index in 0..MAX_REPLACEABLE_POSE_BATCH {
         let frame = required_frame(next, "guarded_nav_scheduler.map_pose")?;
         match decode_guarded_pose_input(&frame.payload)? {
-            OwnerInput::Accepted(candidate) => {
+            OwnerInput::Accepted(mut candidate) => {
                 let valid = source_max_age
                     .map(|maximum| {
                         guarded_pose_source_deadline(
@@ -1004,13 +1005,14 @@ fn drain_guarded_pose_input(
                         )
                     })
                     .transpose();
-                if let Err(reason) = valid {
-                    diagnostics.reject("guarded_nav_scheduler.map_pose", &reason);
-                } else if newest
-                    .as_ref()
-                    .is_none_or(|value| candidate.pose.stamp.nanos > value.pose.stamp.nanos)
-                {
-                    newest = Some(candidate);
+                match valid {
+                    Err(reason) => diagnostics.reject("guarded_nav_scheduler.map_pose", &reason),
+                    Ok(deadline) => {
+                        candidate.source_deadline = deadline;
+                        if newest.as_ref().is_none_or(|value| candidate.pose.stamp.nanos > value.pose.stamp.nanos) {
+                            newest = Some(candidate);
+                        }
+                    }
                 }
             }
             OwnerInput::Rejected(reason) => {
@@ -1105,6 +1107,7 @@ fn decode_guarded_pose_input(payload: &[u8]) -> OwnerInputResult<GuardedPoseInpu
         pose,
         frame_id: pose_message.header.frame_id,
         current,
+        source_deadline: None,
     }))
 }
 
@@ -1631,22 +1634,7 @@ where
                 else {
                     continue;
                 };
-                let source_deadline = if let Some(max_age) = source_max_age {
-                    match guarded_pose_source_deadline(
-                        input.pose.stamp.nanos,
-                        max_age,
-                        std::time::SystemTime::now(),
-                        tokio::time::Instant::now(),
-                    ) {
-                        Ok(deadline) => Some(deadline),
-                        Err(reason) => {
-                            diagnostics.reject("guarded_nav_scheduler.map_pose", &reason);
-                            continue;
-                        }
-                    }
-                } else {
-                    None
-                };
+                let source_deadline = input.source_deadline;
                 #[cfg(all(test,feature="surface-recovery-qualification"))]
                 if let Some(t)=scheduler.qualification_timing() {t.mark("bridge.pose.drained",input.pose.stamp.nanos);}
                 let mut candidate_telemetry = telemetry.clone();
@@ -1754,7 +1742,8 @@ where
                                 // 切域的同一输入共享来源时间基准，避免首帧被自己的处理时刻拒绝。
                                 // 显式清空继续建立当前水位，清空前采样不能迟到恢复执行。
                                 let invalidated_at=if value.cleared {Instant::now()} else {source_received_at.unwrap_or_else(Instant::now)};
-                                scheduler.invalidate_map_received("二维导航来源已撤销或切换",tokio::time::Instant::from_std(invalidated_at)).await
+                                scheduler.invalidate_map_received("二维导航来源已撤销或切换",tokio::time::Instant::from_std(invalidated_at),
+                                    nuwax_nav_runtime::MapInvalidationKind::Invalidated).await
                                     .map_err(|e|module_error("planar map invalidation",e))?;
                                 goal_buffer.costmap_observed=false;
                                 goal_buffer.active_goal_applied = false;
@@ -1790,6 +1779,11 @@ where
                                         .cloned()
                                         .unwrap_or_else(|| "surface map domain changed".into()),
                                     tokio::time::Instant::from_std(update.received_at),
+                                    if changed_domain || !update.awaiting_build {
+                                        nuwax_nav_runtime::MapInvalidationKind::Invalidated
+                                    } else {
+                                        nuwax_nav_runtime::MapInvalidationKind::TemporaryUnavailable
+                                    },
                                 )
                                 .await
                                 .map_err(|error| module_error("surface map invalidation", error))?;
@@ -2327,6 +2321,14 @@ where
                             },
                         };
                         if let Err(error) = scheduler.start_session(session).await {
+                            if matches!(error, nuwax_nav_runtime::RuntimeError::LeaseNotGranted(_)) {
+                                publish_guarded_nav_state(
+                                    transport, &node.outputs[1], scheduler.status(),
+                                    &buffered_telemetry, None,
+                                ).await?;
+                                goal_buffer.clear_pending_goal_for(&buffered_goal);
+                                continue;
+                            }
                             match runtime_input_error::<()>(
                                 "guarded_nav_scheduler.buffered_cancel_acquire",
                                 error,
@@ -2502,7 +2504,7 @@ async fn activate_or_defer_guarded_goal(
     }
 
     let applied_goal = goal_envelope.clone();
-    if activate_guarded_goal(
+    match activate_guarded_goal(
         node,
         transport,
         scheduler,
@@ -2510,17 +2512,24 @@ async fn activate_or_defer_guarded_goal(
         active_session,
         goal_envelope,
     )
-    .await?
-    {
-        if !goal_buffer.mark_applied(&applied_goal) {
-            return Err(NavStackError::Internal(
-                "guarded scheduler applied a superseded GoalEnvelope".into(),
-            ));
+    .await? {
+        GuardedGoalActivation::Activated => {
+            if !goal_buffer.mark_applied(&applied_goal) {
+                return Err(NavStackError::Internal(
+                    "guarded scheduler applied a superseded GoalEnvelope".into(),
+                ));
+            }
         }
-    } else if !goal_buffer.defer_ready_goal(applied_goal) {
-        return Err(NavStackError::Internal(
-            "guarded scheduler lost a GoalEnvelope after deferred activation".into(),
-        ));
+        GuardedGoalActivation::Deferred => {
+            if !goal_buffer.defer_ready_goal(applied_goal) {
+                return Err(NavStackError::Internal(
+                    "guarded scheduler lost a GoalEnvelope after deferred activation".into(),
+                ));
+            }
+        }
+        GuardedGoalActivation::LeaseRejected => {
+            goal_buffer.clear_pending_goal_for(&applied_goal);
+        }
     }
     Ok(())
 }
@@ -2537,6 +2546,13 @@ fn guarded_goal_inputs_ready(
 }
 
 #[cfg(feature = "guard-runtime")]
+enum GuardedGoalActivation {
+    Activated,
+    Deferred,
+    LeaseRejected,
+}
+
+#[cfg(feature = "guard-runtime")]
 async fn activate_guarded_goal(
     node: &ModuleNode,
     transport: &LcmTransport,
@@ -2544,7 +2560,7 @@ async fn activate_guarded_goal(
     telemetry: &mut GuardedNavTelemetry,
     active_session: &mut Option<schema::GoalEnvelope>,
     goal_envelope: schema::GoalEnvelope,
-) -> NavStackResult<bool> {
+) -> NavStackResult<GuardedGoalActivation> {
     let goal = match pose_from_schema(&goal_envelope.goal).and_then(|goal| {
         require_map_pose(&goal, "guarded_nav_scheduler.goal")?;
         Ok(goal)
@@ -2560,7 +2576,7 @@ async fn activate_guarded_goal(
                 &error.to_string(),
             )
             .await?;
-            return Ok(false);
+            return Ok(GuardedGoalActivation::Deferred);
         }
     };
     if telemetry.map_frame.is_empty()
@@ -2576,13 +2592,13 @@ async fn activate_guarded_goal(
             "planner pose/costmap inputs are not ready or use different frames",
         )
         .await?;
-        return Ok(false);
+        return Ok(GuardedGoalActivation::Deferred);
     }
 
     if !preempt_guarded_active_session(node, transport, scheduler, telemetry, active_session)
         .await?
     {
-        return Ok(false);
+        return Ok(GuardedGoalActivation::Deferred);
     }
 
     let mut candidate_telemetry = telemetry.clone();
@@ -2597,6 +2613,7 @@ async fn activate_guarded_goal(
     candidate_telemetry.parent_request_id = goal_envelope.parent_request_id.clone();
     candidate_telemetry.goal_generation = goal_envelope.goal_generation;
     candidate_telemetry.producer_runtime_generation = goal_envelope.producer_runtime_generation;
+    candidate_telemetry.cancel_generation = 0;
     candidate_telemetry.path_revision = 0;
     candidate_telemetry.planner_runtime_generation = 0;
     candidate_telemetry.initial_distance = telemetry_distance(&candidate_telemetry);
@@ -2619,6 +2636,13 @@ async fn activate_guarded_goal(
         })
         .await
     {
+        if matches!(error, nuwax_nav_runtime::RuntimeError::LeaseNotGranted(_)) {
+            // 明确未授予的拒绝属于本次候选目标，不能发布旧目标或空闲心跳。
+            publish_guarded_nav_state(
+                transport, &node.outputs[1], scheduler.status(), &candidate_telemetry, None,
+            ).await?;
+            return Ok(GuardedGoalActivation::LeaseRejected);
+        }
         match runtime_input_error::<()>("guarded_nav_scheduler.goal", error)? {
             OwnerInput::Rejected(reason) => {
                 publish_guarded_rejection(
@@ -2630,14 +2654,14 @@ async fn activate_guarded_goal(
                     &reason,
                 )
                 .await?;
-                return Ok(false);
+                return Ok(GuardedGoalActivation::Deferred);
             }
             OwnerInput::Accepted(()) => unreachable!("error classifier accepted an error"),
         }
     }
     *telemetry = candidate_telemetry;
     *active_session = Some(goal_envelope);
-    Ok(true)
+    Ok(GuardedGoalActivation::Activated)
 }
 
 #[cfg(feature = "guard-runtime")]
@@ -7682,7 +7706,7 @@ mod guarded_tests {
 
     use super::*;
     use futures::channel::mpsc::{unbounded, UnboundedSender};
-    use nuwax_nav_runtime::{NavSchedulerHandle, RuntimeError, SchedulerPhase, TerminalOutcome};
+    use nuwax_nav_runtime::{NavMotionPort, NavSchedulerHandle, RuntimeError, SchedulerPhase, TerminalOutcome};
     use tokio::task::JoinHandle;
 
     #[cfg(feature = "surface-recovery-qualification")]
@@ -8377,6 +8401,41 @@ mod guarded_tests {
     #[derive(Clone)]
     pub(super) struct RecordingMotion(pub(super) Arc<Mutex<Vec<String>>>);
 
+    struct FirstAcquireMotion {
+        inner: RecordingMotion,
+        reject_first: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl nuwax_nav_runtime::NavMotionPort for FirstAcquireMotion {
+        async fn acquire(&mut self, operation_id: &str, admission: &nuwax_nav_runtime::NavMotionAdmission)
+            -> Result<nuwax_nav_runtime::LeaseProof, nuwax_nav_runtime::MotionPortError>
+        {
+            if self.reject_first {
+                self.reject_first = false;
+                self.inner.0.lock().unwrap().push(format!("rejected_acquire:{operation_id}"));
+                return Err(nuwax_nav_runtime::MotionPortError::definite_no_lease("STALE_STOP_GENERATION"));
+            }
+            self.inner.acquire(operation_id, admission).await
+        }
+
+        async fn renew(&mut self, operation_id: &str) -> Result<(), nuwax_nav_runtime::MotionPortError> {
+            self.inner.renew(operation_id).await
+        }
+
+        async fn submit_twist(&mut self, operation_id: &str, twist: Twist2)
+            -> Result<nuwax_nav_runtime::AppliedProof, nuwax_nav_runtime::MotionPortError>
+        {
+            self.inner.submit_twist(operation_id, twist).await
+        }
+
+        async fn revoke_and_zero(&mut self, operation_id: &str)
+            -> Result<nuwax_nav_runtime::FenceProof, nuwax_nav_runtime::MotionPortError>
+        {
+            self.inner.revoke_and_zero(operation_id).await
+        }
+    }
+
     impl nuwax_nav_runtime::NavMotionPort for RecordingMotion {
         fn acquire<'life0, 'life1, 'life2, 'async_trait>(
             &'life0 mut self,
@@ -8856,6 +8915,10 @@ mod guarded_tests {
         }
 
         async fn spawn_with_reference(planar_mode:bool, body_reference: &'static str, support: Option<f64>) -> Self {
+            Self::spawn_with_first_acquire(planar_mode, body_reference, support, false).await
+        }
+
+        async fn spawn_with_first_acquire(planar_mode:bool, body_reference: &'static str, support: Option<f64>, reject_first: bool) -> Self {
             static NEXT_LOOP_ID: std::sync::atomic::AtomicU64 =
                 std::sync::atomic::AtomicU64::new(0);
             let loop_id = NEXT_LOOP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -8870,7 +8933,7 @@ mod guarded_tests {
                 angular_z: 0.1,
             }));
             let scheduler = nuwax_nav_runtime::NavScheduler::new(
-                RecordingMotion(Arc::clone(&motion_calls)),
+                FirstAcquireMotion { inner: RecordingMotion(Arc::clone(&motion_calls)), reject_first },
                 CommandingPlanner {
                     succeeds: Arc::clone(&planner_succeeds),
                     twist: Arc::clone(&planner_twist),
@@ -9404,6 +9467,51 @@ mod guarded_tests {
         send_guarded_test_body(&harness.costmaps,planar_navigation::TYPE_NAME,body);
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert!(!harness.scheduler.status().planner_inputs_fresh);
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn rejected_lease_publishes_candidate_failure_and_owner_accepts_next_goal() {
+        let mut harness = GuardedLoopHarness::spawn_with_first_acquire(false, "base_link", None, true).await;
+        harness.send_pose(1);
+        harness.wait_for_pose(1).await;
+        harness.send_costmap(11);
+        harness.wait_for_costmap(11).await;
+        let rejected = sealed_goal("rejected-lease");
+        harness.send_goal_and_wait_dequeued(&rejected).await;
+        let failure = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let frame = harness.states.next().await.unwrap().unwrap();
+                let state = schema::decode_navigation_state_body(&frame.payload).unwrap();
+                if state.session_id == rejected.session_id && state.state == 4 { break state; }
+            }
+        }).await.expect("必须实际发布被拒绝候选目标的失败");
+        assert_eq!(failure.message, "LEASE_NOT_GRANTED: STALE_STOP_GENERATION");
+        assert_eq!(failure.owner_kind, rejected.owner_kind);
+        assert_eq!(failure.parent_request_id, rejected.parent_request_id);
+        assert_eq!(failure.goal_generation, rejected.goal_generation);
+        assert_eq!(failure.producer_runtime_generation, rejected.producer_runtime_generation);
+        assert_eq!(failure.path_revision, 0);
+        assert_eq!(failure.planner_runtime_generation, 0);
+        assert!(failure.zero_ack_id.is_empty());
+        assert_eq!(failure.zero_applied_monotonic_ns, 0);
+        assert_ne!(failure.sink_ready, 0);
+        harness.send_pose(2);
+        harness.wait_for_pose(2).await;
+        harness.send_costmap(12);
+        harness.wait_for_costmap(12).await;
+        harness.assert_no_session().await;
+        assert_eq!(harness.motion_call_count("rejected_acquire:"), 1);
+        assert_eq!(harness.motion_call_count("acquire:"), 0, "失败目标不能被新输入自动复活");
+        assert_eq!(harness.motion_call_count("zero:"), 0, "未取得租约不能伪造归零");
+        let mut next = sealed_goal("lease-recovered");
+        next.goal_generation = rejected.goal_generation + 1;
+        next.motion_stop_generation = rejected.motion_stop_generation + 1;
+        harness.send_goal_and_wait_dequeued(&next).await;
+        harness.wait_for_session(&next.session_id).await;
+        assert_eq!(harness.motion_call_count("acquire:"), 1);
+        harness.send_cancel(&next, 1);
+        harness.wait_for_correlated_zero(&next, 1).await;
         harness.shutdown().await;
     }
 

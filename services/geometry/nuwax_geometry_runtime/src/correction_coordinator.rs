@@ -13,7 +13,7 @@
 )]
 mod preflight_only_contract {
 
-    use std::collections::{HashMap, HashSet};
+    use std::collections::{HashMap, HashSet, VecDeque};
     use std::ffi::OsString;
     use std::fs::{self, File, OpenOptions};
     use std::io::{Read, Write};
@@ -6909,6 +6909,8 @@ mod preflight_only_contract {
     struct RelocalizationTerminalStoreState {
         terminals: HashMap<String, DurableRelocalizationTerminal>,
         pending: HashMap<String, RelocalizationRequestIdentity>,
+        // 打开时按修改时间排序，运行中按终态提交顺序追加。
+        retained_order: VecDeque<(String, PathBuf)>,
     }
 
     struct RelocalizationTerminalOwnerLease {
@@ -7379,41 +7381,40 @@ mod preflight_only_contract {
                 for owner_token in owner_tokens {
                     cleanup_terminal_owner(&root, &owner_token, &cleanup_lock)?;
                 }
-                let retained_temporary_count = fs::read_dir(&root)
-                    .map_err(|error| format!("RELOCALIZATION_TERMINAL_STORE_READ_FAILED:{error}"))?
-                    .filter_map(Result::ok)
-                    .filter(|entry| {
-                        entry
-                            .file_name()
-                            .to_str()
-                            .map(is_owned_terminal_temporary_name)
-                            .unwrap_or(false)
-                    })
-                    .count();
-                if retained_temporary_count > RELOCALIZATION_MAX_COMMAND_RECORDS {
-                    return Err("RELOCALIZATION_TERMINAL_STORE_TEMP_RETENTION_EXCEEDED".to_owned());
-                }
             }
-            let mut terminals = HashMap::new();
-            let entries = fs::read_dir(&root)
+            let mut entries = Vec::new();
+            for entry in fs::read_dir(&root)
                 .map_err(|error| format!("RELOCALIZATION_TERMINAL_STORE_READ_FAILED:{error}"))?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|error| format!("RELOCALIZATION_TERMINAL_STORE_READ_FAILED:{error}"))?;
-            for entry in entries {
+            {
+                let entry = entry.map_err(|error| format!("RELOCALIZATION_TERMINAL_STORE_READ_FAILED:{error}"))?;
                 let path = entry.path();
-                let filename = entry.file_name();
-                let filename = filename.to_str().ok_or("RELOCALIZATION_TERMINAL_STORE_FILENAME_INVALID")?;
-                let assigned = filename.starts_with("assigned-") || path.extension().and_then(|value| value.to_str()) == Some("terminal");
+                let filename = entry.file_name().into_string()
+                    .map_err(|_| "RELOCALIZATION_TERMINAL_STORE_FILENAME_INVALID")?;
+                let assigned = filename.starts_with("assigned-")
+                    || path.extension().and_then(|value| value.to_str()) == Some("terminal");
                 if !assigned && path.extension().and_then(|value| value.to_str()) != Some("json") {
                     continue;
                 }
-                if terminals.len() >= RELOCALIZATION_MAX_COMMAND_RECORDS {
-                    return Err("RELOCALIZATION_TERMINAL_STORE_RETENTION_EXCEEDED".into());
-                }
+                let modified = entry.metadata().and_then(|metadata| metadata.modified())
+                    .map_err(|error| format!("RELOCALIZATION_TERMINAL_STORE_READ_FAILED:{error}"))?;
+                entries.push((modified, filename, path, assigned));
+            }
+            entries.sort_by(|left, right| (&left.0, &left.1).cmp(&(&right.0, &right.1)));
+            let excess = entries.len().saturating_sub(RELOCALIZATION_MAX_COMMAND_RECORDS);
+            for (_, _, path, _) in entries.drain(..excess) {
+                fs::remove_file(path)
+                    .map_err(|error| format!("RELOCALIZATION_TERMINAL_STORE_EVICT_FAILED:{error}"))?;
+            }
+            if excess > 0 {
+                fsync_directory(&root)?;
+            }
+            let mut terminals = HashMap::new();
+            let mut retained_order = VecDeque::new();
+            for (_, filename, path, assigned) in entries {
                 let bytes = read_terminal_record(&path)?;
                 let (request_id, durable) = if assigned {
                     let terminal = AssignedRelocalizationTerminalV2::decode_durable_named(
-                        filename, &bytes, Some(&validate_assigned_terminal_retained),
+                        &filename, &bytes, Some(&validate_assigned_terminal_retained),
                     )?;
                     (terminal.request().request_id().to_owned(), DurableRelocalizationTerminal {
                         identity: RelocalizationRequestIdentity::Assigned(terminal.request().clone()),
@@ -7422,9 +7423,10 @@ mod preflight_only_contract {
                 } else {
                     read_legacy_relocalization_terminal(&bytes)?
                 };
-                if terminals.insert(request_id, durable).is_some() {
+                if terminals.insert(request_id.clone(), durable).is_some() {
                     return Err("RELOCALIZATION_TERMINAL_STORE_DUPLICATE".into());
                 }
+                retained_order.push_back((request_id, path));
             }
             let cleanup_lock = lock_terminal_cleanup(&root)?;
             let (owner_token, owner_lock) = create_terminal_owner_lease(&root, &cleanup_lock)?;
@@ -7441,10 +7443,33 @@ mod preflight_only_contract {
                 state: Arc::new(parking_lot::Mutex::new(RelocalizationTerminalStoreState {
                     terminals,
                     pending: HashMap::new(),
+                    retained_order,
                 })),
                 #[cfg(test)]
                 _test_root: None,
             })
+        }
+
+        fn remove_terminal_locked(
+            &self, state: &mut RelocalizationTerminalStoreState, request_id: &str,
+        ) -> Result<(), String> {
+            let Some(index) = state.retained_order.iter().position(|(id, _)| id == request_id) else {
+                return Ok(());
+            };
+            let path = &state.retained_order[index].1;
+            match fs::remove_file(path) {
+                Ok(()) => {},
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+                Err(error) => return Err(format!("RELOCALIZATION_TERMINAL_STORE_EVICT_FAILED:{error}")),
+            }
+            fsync_directory(&self.root)?;
+            state.retained_order.remove(index);
+            state.terminals.remove(request_id);
+            Ok(())
+        }
+
+        fn remove_terminal(&self, request_id: &str) -> Result<(), String> {
+            self.remove_terminal_locked(&mut self.state.lock(), request_id)
         }
 
         fn mark_pending(&self, request: &ValidatedRelocalizeRequest) -> Result<(), String> {
@@ -7479,7 +7504,8 @@ mod preflight_only_contract {
                 } else { Err("RELOCALIZATION_TERMINAL_STORE_IDENTITY_CONFLICT".into()) };
             }
             if state.terminals.len() >= RELOCALIZATION_MAX_COMMAND_RECORDS {
-                return Err("RELOCALIZATION_TERMINAL_STORE_RETENTION_EXCEEDED".into());
+                let oldest = state.retained_order.front().expect("终态顺序与存储一致").0.clone();
+                self.remove_terminal_locked(&mut state, &oldest)?;
             }
             if state.pending.get(request_id).is_some_and(|existing| existing != identity) {
                 return Err("RELOCALIZATION_TERMINAL_STORE_IDENTITY_CONFLICT".into());
@@ -7514,6 +7540,7 @@ mod preflight_only_contract {
             state.terminals.insert(request_id.to_owned(), DurableRelocalizationTerminal {
                 identity: identity.clone(), terminal: terminal.clone(),
             });
+            state.retained_order.push_back((request_id.to_owned(), final_path));
             state.pending.remove(request_id);
             Ok(())
         }
@@ -7599,7 +7626,6 @@ mod preflight_only_contract {
         waiter_ids: HashSet<u64>,
         terminal: Option<StoredRelocalizationResult>,
         conflicts: Vec<(RelocalizationRequestIdentity, StoredRelocalizationResult)>,
-        conflict_overflow: Option<(RelocalizationRequestIdentity, StoredRelocalizationResult)>,
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -7620,9 +7646,7 @@ mod preflight_only_contract {
         },
         Replay(StoredRelocalizationResult),
         Conflict(StoredRelocalizationResult),
-        ConflictOverflow(StoredRelocalizationResult),
         Busy,
-        CapacityExceeded(&'static str),
     }
 
     struct RelocalizationTerminalWaiters {
@@ -7632,6 +7656,8 @@ mod preflight_only_contract {
 
     struct RelocalizationCommandLedger {
         records: HashMap<String, RelocalizationLedgerRecord>,
+        terminal_store: RelocalizationTerminalStore,
+        retained_order: VecDeque<String>,
         active_request_id: Option<String>,
         next_admission_ordinal: u64,
         admitted_command_count: u64,
@@ -7640,12 +7666,31 @@ mod preflight_only_contract {
         relocalization_mode: Arc<RelocalizationModeFence>,
     }
 
+    #[cfg(test)]
     impl Default for RelocalizationCommandLedger {
         fn default() -> Self {
+            Self::from_terminal_store(&RelocalizationTerminalStore::open().expect("测试终态存储"))
+        }
+    }
+
+    impl RelocalizationCommandLedger {
+        fn from_terminal_store(store: &RelocalizationTerminalStore) -> Self {
+            let state = store.state.lock();
             let mut epoch_bytes = [0_u8; 8];
             epoch_bytes.copy_from_slice(&uuid::Uuid::new_v4().as_bytes()[..8]);
             Self {
-                records: HashMap::new(),
+                records: state.terminals.iter().map(|(request_id, durable)| (
+                    request_id.clone(),
+                    RelocalizationLedgerRecord {
+                        origin: RelocalizationLedgerOrigin::RestoredTerminal,
+                        identity: durable.identity.clone(),
+                        waiter_ids: HashSet::new(),
+                        terminal: Some(durable.terminal.clone()),
+                        conflicts: Vec::new(),
+                    },
+                )).collect(),
+                terminal_store: store.clone(),
+                retained_order: state.retained_order.iter().map(|(request_id, _)| request_id.clone()).collect(),
                 active_request_id: None,
                 next_admission_ordinal: 0,
                 admitted_command_count: 0,
@@ -7654,36 +7699,6 @@ mod preflight_only_contract {
                 relocalization_mode: Arc::new(RelocalizationModeFence::default()),
             }
         }
-    }
-
-    impl RelocalizationCommandLedger {
-        fn from_terminal_store(store: &RelocalizationTerminalStore) -> Self {
-            let mut ledger = Self::default();
-            // open_at has already verified canonical bytes, exact bindings,
-            // uniqueness, and the existing command-record retention bound.
-            // Restore into the same bounded ledger before any admission can
-            // activate the mode fence, including conflict-first retries.
-            ledger.records = store
-                .state
-                .lock()
-                .terminals
-                .iter()
-                .map(|(request_id, durable)| {
-                    (
-                        request_id.clone(),
-                        RelocalizationLedgerRecord {
-                            origin: RelocalizationLedgerOrigin::RestoredTerminal,
-                            identity: durable.identity.clone(),
-                            waiter_ids: HashSet::new(),
-                            terminal: Some(durable.terminal.clone()),
-                            conflicts: Vec::new(),
-                            conflict_overflow: None,
-                        },
-                    )
-                })
-                .collect();
-            ledger
-        }
 
         fn admit<F>(
             &mut self,
@@ -7691,12 +7706,12 @@ mod preflight_only_contract {
             waiter_id: u64,
             now: Instant,
             conflict_result: F,
-        ) -> Result<RelocalizationLedgerAdmission, &'static str>
+        ) -> Result<RelocalizationLedgerAdmission, String>
         where
             F: FnOnce() -> StoredRelocalizationResult,
         {
             if waiter_id == 0 {
-                return Err("RELOCALIZATION_WAITER_ID_INVALID");
+                return Err("RELOCALIZATION_WAITER_ID_INVALID".into());
             }
             if let Some(record) = self.records.get(request.request_id()) {
                 if record.identity == request.key()
@@ -7705,7 +7720,7 @@ mod preflight_only_contract {
                         return Ok(RelocalizationLedgerAdmission::Replay(terminal.clone()));
                     }
                     let RelocalizationLedgerOrigin::Admitted(metadata) = &record.origin else {
-                        return Err("RELOCALIZATION_RESTORED_TERMINAL_MISSING");
+                        return Err("RELOCALIZATION_RESTORED_TERMINAL_MISSING".into());
                     };
                     let admission_ordinal = metadata.admission_ordinal;
                     let logical_deadline = metadata.logical_deadline;
@@ -7722,21 +7737,9 @@ mod preflight_only_contract {
                 if let Some(conflict) = record.conflicts.iter().find(|(identity, _)| identity == &request.key()).map(|(_, terminal)| terminal) {
                     return Ok(RelocalizationLedgerAdmission::Conflict(conflict.clone()));
                 }
-                if let Some((overflow_identity, conflict)) = &record.conflict_overflow {
-                    if *overflow_identity == request.key() {
-                        return Ok(RelocalizationLedgerAdmission::Conflict(conflict.clone()));
-                    }
-                    return Ok(RelocalizationLedgerAdmission::CapacityExceeded(
-                        "RELOCALIZATION_COMMAND_CONFLICT_OVERFLOW_CLOSED",
-                    ));
-                }
                 if record.conflicts.len() >= RELOCALIZATION_MAX_CONFLICTS_PER_RECORD {
-                    let conflict = conflict_result();
-                    self.records
-                        .get_mut(request.request_id())
-                        .expect("relocalization record remains present")
-                        .conflict_overflow = Some((request.key(), conflict.clone()));
-                    return Ok(RelocalizationLedgerAdmission::ConflictOverflow(conflict));
+                    self.records.get_mut(request.request_id()).expect("冲突请求记录存在")
+                        .conflicts.remove(0);
                 }
                 let conflict = conflict_result();
                 self.records
@@ -7750,13 +7753,12 @@ mod preflight_only_contract {
             if self.active_request_id.is_some() {
                 return Ok(RelocalizationLedgerAdmission::Busy);
             }
-            // Keep one bounded record slot reserved for the typed capacity
-            // terminal. That terminal closes this runtime generation after
-            // it is written, so retries remain replayable without eviction.
-            if self.records.len() >= RELOCALIZATION_MAX_COMMAND_RECORDS.saturating_sub(1) {
-                return Ok(RelocalizationLedgerAdmission::CapacityExceeded(
-                    "RELOCALIZATION_COMMAND_LEDGER_CAPACITY_EXCEEDED",
-                ));
+            if self.records.len() >= RELOCALIZATION_MAX_COMMAND_RECORDS {
+                let oldest = self.retained_order.front().expect("空闲账本中的记录均已终结").clone();
+                // 磁盘删除成功后才移除两份内存索引；当前活动请求在上方已返回繁忙。
+                self.terminal_store.remove_terminal(&oldest)?;
+                self.retained_order.pop_front();
+                self.records.remove(&oldest);
             }
             let admission_ordinal = self
                 .next_admission_ordinal
@@ -7788,54 +7790,12 @@ mod preflight_only_contract {
                     waiter_ids: HashSet::from([waiter_id]),
                     terminal: None,
                     conflicts: Vec::new(),
-                    conflict_overflow: None,
                 },
             );
             Ok(RelocalizationLedgerAdmission::Started {
                 admission_ordinal,
                 logical_deadline,
             })
-        }
-
-        fn store_capacity_terminal(
-            &mut self,
-            request: &ValidatedRelocalizeRequest,
-            now: Instant,
-            terminal: StoredRelocalizationResult,
-        ) -> Result<(), &'static str> {
-            if self.records.contains_key(request.request_id()) {
-                return Err("RELOCALIZATION_COMMAND_CAPACITY_RECORD_ALREADY_EXISTS");
-            }
-            if self.active_request_id.is_some() {
-                return Err("RELOCALIZATION_COMMAND_CAPACITY_WHILE_ACTIVE");
-            }
-            if self.records.len() >= RELOCALIZATION_MAX_COMMAND_RECORDS {
-                return Err("RELOCALIZATION_COMMAND_LEDGER_CAPACITY_EXCEEDED");
-            }
-            let admitted_command_count = self
-                .admitted_command_count
-                .checked_add(1)
-                .ok_or("RELOCALIZATION_ADMITTED_COMMAND_COUNT_EXHAUSTED")?;
-            self.records.insert(
-                request.request_id().to_owned(),
-                RelocalizationLedgerRecord {
-                    origin: RelocalizationLedgerOrigin::Admitted(
-                        RelocalizationLedgerAdmissionMetadata {
-                            request: request.clone(),
-                            admission_ordinal: 0,
-                            logical_deadline: now,
-                            claim_phase: RelocalizationClaimPhase::Preclaim,
-                        },
-                    ),
-                    identity: request.key(),
-                    waiter_ids: HashSet::new(),
-                    terminal: Some(terminal),
-                    conflicts: Vec::new(),
-                    conflict_overflow: None,
-                },
-            );
-            self.admitted_command_count = admitted_command_count;
-            Ok(())
         }
 
         fn mark_postclaim(
@@ -7907,6 +7867,7 @@ mod preflight_only_contract {
                 return Err("RELOCALIZATION_TERMINAL_CONFLICT");
             }
             record.terminal = Some(terminal.clone());
+            self.retained_order.push_back(request_id.to_owned());
             let mut waiter_ids = record.waiter_ids.drain().collect::<Vec<_>>();
             waiter_ids.sort_unstable();
             if self.active_request_id.as_deref() == Some(request_id) {
@@ -8622,7 +8583,6 @@ mod preflight_only_contract {
                 .admit(&request, waiter_id, Instant::now(), || conflict)
                 .map_err(|detail| CorrectionRuntimeError::Apply(detail.to_owned()))?;
             let mut started = None;
-            let mut close_after_reply = false;
             let waiter = match outcome {
                 RelocalizationLedgerAdmission::Started {
                     admission_ordinal,
@@ -8658,84 +8618,12 @@ mod preflight_only_contract {
                     Arc::clone(&capacity_lease),
                     detached_tx,
                 ),
-                RelocalizationLedgerAdmission::ConflictOverflow(result) => {
-                    close_after_reply = true;
-                    Self::immediate_waiter(
-                        waiter_id,
-                        result.to_wire(),
-                        Arc::clone(&capacity_lease),
-                        detached_tx,
-                    )
-                }
                 RelocalizationLedgerAdmission::Busy => Self::immediate_waiter(
                     waiter_id,
                     self.busy_result(&request)?,
                     Arc::clone(&capacity_lease),
                     detached_tx,
                 ),
-                RelocalizationLedgerAdmission::CapacityExceeded(detail) => {
-                    if detail == "RELOCALIZATION_COMMAND_WAITER_CAPACITY_EXCEEDED" {
-                        let admission_ordinal = self
-                            .ledger
-                            .records
-                            .get(request.request_id())
-                            .and_then(|record| match &record.origin {
-                                RelocalizationLedgerOrigin::Admitted(metadata) => {
-                                    Some(metadata.admission_ordinal)
-                                }
-                                RelocalizationLedgerOrigin::RestoredTerminal => None,
-                            })
-                            .ok_or_else(|| {
-                                CorrectionRuntimeError::Apply(
-                                    "relocalization waiter capacity record missing".to_owned(),
-                                )
-                            })?;
-                        let terminal = self.terminal_result(
-                            &request,
-                            Some(admission_ordinal),
-                            crate::proto::RelocalizeDisposition::OwnerFailed,
-                            detail,
-                        )?;
-                        let pending = self.settle_terminal_durable(
-                            request.request_id(),
-                            &request.key(),
-                            terminal,
-                        )?;
-                        let result = pending.result.to_wire();
-                        self.notify_terminal(pending);
-                        self.drop_synchronous_preclaim_execution();
-                        Self::immediate_waiter(
-                            waiter_id,
-                            result,
-                            Arc::clone(&capacity_lease),
-                            detached_tx,
-                        )
-                    } else {
-                        let terminal = self.terminal_result(
-                            &request,
-                            None,
-                            crate::proto::RelocalizeDisposition::OwnerFailed,
-                            detail,
-                        )?;
-                        self.terminal_store
-                            .persist_terminal(
-                                request.request_id(),
-                                &request.key(),
-                                &terminal,
-                            )
-                            .map_err(CorrectionRuntimeError::Apply)?;
-                        self.ledger
-                            .store_capacity_terminal(&request, Instant::now(), terminal.clone())
-                            .map_err(|detail| CorrectionRuntimeError::Apply(detail.to_owned()))?;
-                        close_after_reply = true;
-                        Self::immediate_waiter(
-                            waiter_id,
-                            terminal.to_wire(),
-                            Arc::clone(&capacity_lease),
-                            detached_tx,
-                        )
-                    }
-                }
             };
             if let Some((ordinal, epoch, deadline)) = started {
                 if let Some(work) = planar_work {
@@ -8752,9 +8640,6 @@ mod preflight_only_contract {
             }
             let _ = response.send(Ok(waiter));
             drop(claim_guard);
-            if close_after_reply {
-                phase_a.begin();
-            }
             Ok(())
         }
 
@@ -12693,170 +12578,66 @@ mod preflight_only_contract {
         }
 
         #[test]
-        fn relocalization_command_ledger_caps_fail_closed_without_consuming_ordinal() {
+        fn relocalization_command_ledger_evicts_only_settled_records_and_keeps_replay() {
             let mut ledger = RelocalizationCommandLedger::default();
-            for index in 0..RELOCALIZATION_MAX_COMMAND_RECORDS.saturating_sub(1) {
+            for index in 0..RELOCALIZATION_MAX_COMMAND_RECORDS {
                 let request = validate_relocalize_request(relocalization_command_request(
-                    &format!("req-cap-{index}"),
-                    7,
-                ))
-                .expect("bounded request is valid");
-                let admission = ledger
-                    .admit(&request, index as u64 + 1, Instant::now(), || {
-                        unreachable!("new request cannot conflict")
-                    })
-                    .expect("bounded request admits");
-                assert!(matches!(
-                    admission,
-                    RelocalizationLedgerAdmission::Started { .. }
-                ));
-                let terminal = relocalization_command_terminal(
-                    &request,
-                    crate::proto::RelocalizeDisposition::Cancelled,
-                    "RELOCALIZATION_CAP_FIXTURE_SETTLED",
-                );
-                ledger
-                    .settle_terminal(
-                        request.request_id(),
-                        &request.key(),
-                        terminal,
-                    )
-                    .expect("bounded request settles");
+                    &format!("bounded-{index:04}"), 7,
+                )).unwrap();
+                assert!(matches!(ledger.admit(&request, index as u64 + 1, Instant::now(), || unreachable!()).unwrap(),
+                    RelocalizationLedgerAdmission::Started { .. }));
+                let terminal = relocalization_command_terminal(&request,
+                    crate::proto::RelocalizeDisposition::Cancelled, "cancelled");
+                ledger.terminal_store.persist_terminal(request.request_id(), &request.key(), &terminal).unwrap();
+                ledger.settle_terminal(request.request_id(), &request.key(), terminal).unwrap();
             }
-            let ordinal_at_capacity = ledger.next_admission_ordinal;
-            let overflow =
-                validate_relocalize_request(relocalization_command_request("req-cap-overflow", 7))
-                    .expect("overflow request is valid");
-            for waiter_id in [10_000_u64, 10_001] {
-                assert!(matches!(
-                    ledger
-                        .admit(&overflow, waiter_id, Instant::now(), || {
-                            unreachable!("capacity overflow cannot conflict")
-                        })
-                        .expect("capacity overflow is typed"),
-                    RelocalizationLedgerAdmission::CapacityExceeded(
-                        "RELOCALIZATION_COMMAND_LEDGER_CAPACITY_EXCEEDED"
-                    )
-                ));
-            }
-            let overflow_terminal = relocalization_command_terminal(
-                &overflow,
-                crate::proto::RelocalizeDisposition::OwnerFailed,
-                "RELOCALIZATION_COMMAND_LEDGER_CAPACITY_EXCEEDED",
-            );
-            ledger
-                .store_capacity_terminal(&overflow, Instant::now(), overflow_terminal.clone())
-                .expect("capacity terminal is retained in reserved slot");
-            let replay = ledger
-                .admit(&overflow, 10_002, Instant::now(), || {
-                    unreachable!("stored capacity terminal must replay")
-                })
-                .expect("capacity terminal replays");
-            match replay {
-                RelocalizationLedgerAdmission::Replay(result) => {
-                    assert_eq!(result.encoded(), overflow_terminal.encoded())
-                }
-                _ => panic!("capacity terminal must replay"),
-            }
-            assert_eq!(ledger.next_admission_ordinal, ordinal_at_capacity);
+            let first = validate_relocalize_request(relocalization_command_request("bounded-0000", 7)).unwrap();
+            let recent = validate_relocalize_request(relocalization_command_request("bounded-1023", 7)).unwrap();
+            assert!(matches!(ledger.admit(&recent, 2000, Instant::now(), || unreachable!()).unwrap(),
+                RelocalizationLedgerAdmission::Replay(_)));
+            let active = validate_relocalize_request(relocalization_command_request("active-after-capacity", 7)).unwrap();
+            assert!(matches!(ledger.admit(&active, 2001, Instant::now(), || unreachable!()).unwrap(),
+                RelocalizationLedgerAdmission::Started { admission_ordinal: 1025, .. }));
+            assert_eq!(ledger.records.len(), RELOCALIZATION_MAX_COMMAND_RECORDS);
+            assert!(!ledger.records.contains_key(first.request_id()));
+            assert!(matches!(ledger.terminal_store.snapshot_exact(first.request_id(), &first.key()),
+                RelocalizationTerminalSnapshot::NotFound));
+            assert!(!ledger.terminal_store.root.join(assigned_terminal_filename_v2(first.request_id()).unwrap()).exists());
+            assert_eq!(ledger.terminal_store.state.lock().terminals.len(), RELOCALIZATION_MAX_COMMAND_RECORDS - 1);
+            assert!(matches!(ledger.admit(&active, 2002, Instant::now(), || unreachable!()).unwrap(),
+                RelocalizationLedgerAdmission::Joined { admission_ordinal: 1025, .. }));
+            assert!(matches!(ledger.admit(&first, 2003, Instant::now(), || unreachable!()).unwrap(),
+                RelocalizationLedgerAdmission::Busy));
+            assert_eq!(ledger.active_request_id.as_deref(), Some(active.request_id()));
+            assert!(ledger.records.contains_key("bounded-0001"), "繁忙请求不能淘汰其他终态");
+        }
 
-            let base =
-                validate_relocalize_request(relocalization_command_request("req-conflict-cap", 7))
-                    .expect("base conflict request is valid");
-            let mut conflicts = RelocalizationCommandLedger::default();
-            conflicts
-                .admit(&base, 1, Instant::now(), || unreachable!("base is new"))
-                .expect("base request admits");
-            for index in 0..RELOCALIZATION_MAX_CONFLICTS_PER_RECORD {
-                let conflicting = validate_relocalize_request(relocalization_command_request(
-                    "req-conflict-cap",
-                    index as u64 + 8,
-                ))
-                .expect("conflicting request is valid");
-                assert!(matches!(
-                    conflicts
-                        .admit(&conflicting, index as u64 + 2, Instant::now(), || {
-                            relocalization_command_terminal(
-                                &conflicting,
-                                crate::proto::RelocalizeDisposition::ReplayConflict,
-                                "RELOCALIZATION_REPLAY_CONFLICT",
-                            )
-                        })
-                        .expect("bounded conflict is typed"),
-                    RelocalizationLedgerAdmission::Conflict(_)
-                ));
+        #[test]
+        fn relocalization_command_conflicts_evict_oldest_without_closing_the_request() {
+            let mut ledger = RelocalizationCommandLedger::default();
+            let base = validate_relocalize_request(relocalization_command_request("bounded-conflicts", 7)).unwrap();
+            ledger.admit(&base, 1, Instant::now(), || unreachable!()).unwrap();
+            let terminal = relocalization_command_terminal(&base,
+                crate::proto::RelocalizeDisposition::Cancelled, "cancelled");
+            ledger.settle_terminal(base.request_id(), &base.key(), terminal.clone()).unwrap();
+            for index in 0..RELOCALIZATION_MAX_CONFLICTS_PER_RECORD + 6 {
+                let conflict = validate_relocalize_request(relocalization_command_request(base.request_id(), index as u64 + 8)).unwrap();
+                let result = relocalization_command_terminal(&conflict,
+                    crate::proto::RelocalizeDisposition::ReplayConflict, "conflict");
+                assert!(matches!(ledger.admit(&conflict, index as u64 + 2, Instant::now(), || result).unwrap(),
+                    RelocalizationLedgerAdmission::Conflict(_)));
             }
-            let overflow_conflict = validate_relocalize_request(relocalization_command_request(
-                "req-conflict-cap",
-                RELOCALIZATION_MAX_CONFLICTS_PER_RECORD as u64 + 8,
-            ))
-            .expect("overflow conflict is valid");
-            let overflow_conflict_terminal = relocalization_command_terminal(
-                &overflow_conflict,
-                crate::proto::RelocalizeDisposition::ReplayConflict,
-                "RELOCALIZATION_REPLAY_CONFLICT",
-            );
-            let first_overflow = conflicts
-                .admit(&overflow_conflict, 100, Instant::now(), || {
-                    overflow_conflict_terminal.clone()
-                })
-                .expect("conflict overflow is typed");
-            let second_overflow = conflicts
-                .admit(&overflow_conflict, 101, Instant::now(), || {
-                    overflow_conflict_terminal.clone()
-                })
-                .expect("overflow conflict remains permanent");
-            let (first_overflow, second_overflow) = match (first_overflow, second_overflow) {
-                (
-                    RelocalizationLedgerAdmission::ConflictOverflow(first),
-                    RelocalizationLedgerAdmission::Conflict(second),
-                ) => (first, second),
-                _ => panic!("overflow identity must remain a permanent conflict"),
-            };
-            assert_eq!(first_overflow.encoded(), second_overflow.encoded());
-            assert_eq!(
-                first_overflow.encoded(),
-                second_overflow.encoded()
-            );
-            let record = conflicts
-                .records
-                .get("req-conflict-cap")
-                .expect("base record remains");
-            let (stored_identity, stored_overflow) = record
-                .conflict_overflow
-                .as_ref()
-                .expect("overflow terminal is retained before reply");
-            assert_eq!(*stored_identity, overflow_conflict.key());
-            assert_eq!(stored_overflow.encoded(), first_overflow.encoded());
-            assert_eq!(
-                stored_overflow.encoded(),
-                first_overflow.encoded()
-            );
-            let next_conflict = validate_relocalize_request(relocalization_command_request(
-                "req-conflict-cap",
-                RELOCALIZATION_MAX_CONFLICTS_PER_RECORD as u64 + 9,
-            ))
-            .expect("next overflow conflict is valid");
-            assert!(matches!(
-                conflicts
-                    .admit(&next_conflict, 102, Instant::now(), || {
-                        panic!("bounded overflow must not build another terminal")
-                    })
-                    .expect("overflow closes at the bounded slot"),
-                RelocalizationLedgerAdmission::CapacityExceeded(
-                    "RELOCALIZATION_COMMAND_CONFLICT_OVERFLOW_CLOSED"
-                )
-            ));
-            assert_eq!(
-                conflicts
-                    .records
-                    .get("req-conflict-cap")
-                    .expect("base record remains")
-                    .conflicts
-                    .len(),
-                RELOCALIZATION_MAX_CONFLICTS_PER_RECORD
-            );
-            assert_eq!(conflicts.next_admission_ordinal, 1);
+            let retained = &ledger.records[base.request_id()].conflicts;
+            assert_eq!(retained.len(), RELOCALIZATION_MAX_CONFLICTS_PER_RECORD);
+            let oldest = validate_relocalize_request(relocalization_command_request(base.request_id(), 14)).unwrap();
+            assert_eq!(retained[0].0, oldest.key());
+            match ledger.admit(&base, 1000, Instant::now(), || unreachable!()).unwrap() {
+                RelocalizationLedgerAdmission::Replay(result) => assert_eq!(result.encoded(), terminal.encoded()),
+                _ => panic!("原请求保留窗口内仍返回原终态"),
+            }
+            let next = validate_relocalize_request(relocalization_command_request("after-conflicts", 7)).unwrap();
+            assert!(matches!(ledger.admit(&next, 1001, Instant::now(), || unreachable!()).unwrap(),
+                RelocalizationLedgerAdmission::Started { .. }));
         }
 
         #[test]
@@ -12872,7 +12653,7 @@ mod preflight_only_contract {
 
             assert!(matches!(
                 ledger.admit(&request, 1, Instant::now(), || unreachable!("new request")),
-                Err("RELOCALIZATION_MODE_EPOCH_EXHAUSTED")
+                Err(error) if error == "RELOCALIZATION_MODE_EPOCH_EXHAUSTED"
             ));
             assert!(ledger.active_request_id.is_none());
             assert!(ledger.records.is_empty());
@@ -12880,7 +12661,7 @@ mod preflight_only_contract {
         }
 
         #[tokio::test]
-        async fn relocalization_conflict_overflow_is_stored_before_actor_reply() {
+        async fn relocalization_conflict_eviction_keeps_actor_admission_open() {
             let phase_a = CorrectionPhaseAControl::for_tests();
             let mut actor = RelocalizationCommandActor::new(
                 owner_identity(),
@@ -12949,7 +12730,7 @@ mod preflight_only_contract {
                 .ledger
                 .records
                 .get("req-conflict-overflow-actor")
-                .and_then(|record| record.conflict_overflow.as_ref())
+                .and_then(|record| record.conflicts.last())
                 .expect("overflow terminal is stored before reply consumption");
             assert_eq!(stored.0, overflow.key());
             let stored_encoded = stored.1.encoded().to_vec();
@@ -12961,7 +12742,7 @@ mod preflight_only_contract {
             let reply = waiter.wait().await.expect("overflow terminal is delivered");
             assert_eq!(reply.encode_to_vec(), stored_encoded);
             assert_eq!(reply.encode_to_vec(), stored_encoded_bytes);
-            assert!(!phase_a.is_open(), "overflow closes further admission");
+            assert!(phase_a.is_open(), "冲突缓存增长不能关闭命令拥有方");
 
             let replay = actor
                 .ledger
@@ -13009,250 +12790,58 @@ mod preflight_only_contract {
         }
 
         #[test]
-        fn relocalization_restored_ledger_preserves_binding_conflicts_overflow_and_capacity() {
+        fn relocalization_restored_store_evicts_oldest_and_accepts_new_commands() {
             let root = RelocalizationTerminalTestRoot::new();
-            let request = validate_relocalize_request(relocalization_command_request(
-                "req-restored-bounds",
-                7,
-            ))
-            .unwrap();
-            let terminal = relocalization_command_terminal(
-                &request,
-                crate::proto::RelocalizeDisposition::Cancelled,
-                "RELOCALIZATION_CANCELLED",
-            );
-            {
-                let store =
-                    RelocalizationTerminalStore::open_at(root.path().to_path_buf()).unwrap();
-                store
-                    .persist_terminal(
-                        request.request_id(),
-                        &request.key(),
-                        &terminal,
-                    )
-                    .unwrap();
+            fs::create_dir_all(root.path()).unwrap();
+            for index in 0..1100 {
+                let request = validate_relocalize_request(relocalization_command_request(
+                    &format!("restored-{index:04}"), 7,
+                )).unwrap();
+                let terminal = relocalization_command_terminal(&request,
+                    crate::proto::RelocalizeDisposition::Cancelled, "cancelled");
+                let StoredRelocalizationResult::Assigned(terminal) = terminal else { unreachable!() };
+                let path = root.path().join(assigned_terminal_filename_v2(request.request_id()).unwrap());
+                fs::write(&path, terminal.encode_durable().unwrap()).unwrap();
+                File::open(path).unwrap().set_times(std::fs::FileTimes::new().set_modified(
+                    std::time::UNIX_EPOCH + Duration::from_secs(index + 1),
+                )).unwrap();
             }
-            let store = RelocalizationTerminalStore::open_at(root.path().to_path_buf()).unwrap();
+            let store = RelocalizationTerminalStore::open_at(root.path().into()).unwrap();
             let mut ledger = RelocalizationCommandLedger::from_terminal_store(&store);
-            let before = ledger.observation().unwrap();
-            let mode_before = ledger.relocalization_mode.snapshot();
-            assert!(ledger.request(request.request_id()).is_none());
-            assert!(ledger.active_identity().is_none());
-            assert!(matches!(
-                &ledger.records[request.request_id()].origin,
-                RelocalizationLedgerOrigin::RestoredTerminal
-            ));
-            assert_eq!(before.admitted_command_count, 0);
-            assert_eq!(before.claimed_command_count, 0);
-            assert_eq!(before.terminal_record_count, 0);
-            assert!(ledger
-                .mark_postclaim(request.request_id(), &request.key())
-                .is_err());
-            assert!(ledger
-                .detach_waiter(request.request_id(), &request.key(), 1)
-                .is_err());
-
-            for index in 0..RELOCALIZATION_MAX_CONFLICTS_PER_RECORD {
-                let changed = validate_relocalize_request(relocalization_command_request(
-                    request.request_id(),
-                    index as u64 + 8,
-                ))
-                .unwrap();
-                let conflict = relocalization_command_terminal(
-                    &changed,
-                    crate::proto::RelocalizeDisposition::ReplayConflict,
-                    "RELOCALIZATION_REPLAY_CONFLICT",
-                );
-                let first = ledger
-                    .admit(&changed, index as u64 + 1, Instant::now(), || {
-                        conflict.clone()
-                    })
-                    .unwrap();
-                let repeat = ledger
-                    .admit(&changed, index as u64 + 1, Instant::now(), || {
-                        panic!("restored conflict must be retained")
-                    })
-                    .unwrap();
-                match (first, repeat) {
-                    (
-                        RelocalizationLedgerAdmission::Conflict(first),
-                        RelocalizationLedgerAdmission::Conflict(repeat),
-                    ) => {
-                        assert_eq!(first.encoded(), conflict.encoded());
-                        assert_eq!(repeat.encoded(), first.encoded());
-                    }
-                    _ => panic!("restored binding must retain each bounded conflict"),
-                }
+            assert_eq!(ledger.records.len(), RELOCALIZATION_MAX_COMMAND_RECORDS);
+            assert_eq!(store.state.lock().terminals.len(), RELOCALIZATION_MAX_COMMAND_RECORDS);
+            assert_eq!(ledger.retained_order.front().map(String::as_str), Some("restored-0076"));
+            for index in 0..76 {
+                assert!(!root.path().join(assigned_terminal_filename_v2(&format!("restored-{index:04}")).unwrap()).exists());
             }
-            let overflow = validate_relocalize_request(relocalization_command_request(
-                request.request_id(),
-                RELOCALIZATION_MAX_CONFLICTS_PER_RECORD as u64 + 8,
-            ))
-            .unwrap();
-            let overflow_terminal = relocalization_command_terminal(
-                &overflow,
-                crate::proto::RelocalizeDisposition::ReplayConflict,
-                "RELOCALIZATION_REPLAY_CONFLICT",
-            );
-            assert!(matches!(
-                ledger
-                    .admit(&overflow, 100, Instant::now(), || overflow_terminal.clone())
-                    .unwrap(),
-                RelocalizationLedgerAdmission::ConflictOverflow(_)
-            ));
-            match ledger
-                .admit(&overflow, 101, Instant::now(), || {
-                    panic!("overflow must replay")
-                })
-                .unwrap()
-            {
-                RelocalizationLedgerAdmission::Conflict(replayed) => {
-                    assert_eq!(replayed.encoded(), overflow_terminal.encoded())
-                }
-                _ => panic!("restored overflow identity must remain permanent"),
-            }
-            let next_conflict = validate_relocalize_request(relocalization_command_request(
-                request.request_id(),
-                RELOCALIZATION_MAX_CONFLICTS_PER_RECORD as u64 + 9,
-            ))
-            .unwrap();
-            assert!(matches!(
-                ledger
-                    .admit(&next_conflict, 102, Instant::now(), || panic!(
-                        "overflow is bounded"
-                    ))
-                    .unwrap(),
-                RelocalizationLedgerAdmission::CapacityExceeded(
-                    "RELOCALIZATION_COMMAND_CONFLICT_OVERFLOW_CLOSED"
-                )
-            ));
-            for waiter_id in [103, 104] {
-                match ledger
-                    .admit(&request, waiter_id, Instant::now(), || {
-                        panic!("exact retry is not a conflict")
-                    })
-                    .unwrap()
-                {
-                    RelocalizationLedgerAdmission::Replay(replayed) => {
-                        assert_eq!(replayed.encoded(), terminal.encoded())
-                    }
-                    _ => panic!("exact restored terminal survives conflict overflow"),
-                }
-            }
-            assert_eq!(
-                ledger.observation().unwrap().encode_to_vec(),
-                before.encode_to_vec()
-            );
-            assert_eq!(ledger.relocalization_mode.snapshot(), mode_before);
+            let recent = validate_relocalize_request(relocalization_command_request("restored-1099", 7)).unwrap();
+            assert!(matches!(ledger.admit(&recent, 1, Instant::now(), || unreachable!()).unwrap(),
+                RelocalizationLedgerAdmission::Replay(_)));
+            let changed = validate_relocalize_request(relocalization_command_request(recent.request_id(), 8)).unwrap();
+            assert!(matches!(ledger.admit(&changed, 2, Instant::now(), || relocalization_command_terminal(
+                &changed, crate::proto::RelocalizeDisposition::ReplayConflict, "conflict",
+            )).unwrap(), RelocalizationLedgerAdmission::Conflict(_)));
+            assert_eq!(ledger.admitted_command_count, 0);
             assert_eq!(ledger.next_admission_ordinal, 0);
-            assert_eq!(
-                ledger.records[request.request_id()].conflicts.len(),
-                RELOCALIZATION_MAX_CONFLICTS_PER_RECORD
-            );
-
-            // The store binds the full assigned descriptor. A same-ID retry
-            // cannot substitute the activation lifecycle binding.
-            let mut activation_ledger = RelocalizationCommandLedger::from_terminal_store(&store);
-            let mut changed_wire = request.identity.to_wire();
-            relocalization_request_body(&mut changed_wire).target.as_mut().unwrap().activation.as_mut().unwrap().lifecycle_epoch += 1;
-            let changed_activation = validate_relocalize_request(changed_wire).unwrap();
-            assert!(matches!(
-                activation_ledger
-                    .admit(&changed_activation, 1, Instant::now(), || terminal.clone())
-                    .unwrap(),
-                RelocalizationLedgerAdmission::Conflict(_)
-            ));
-            assert_eq!(activation_ledger.admitted_command_count, 0);
-            assert_eq!(activation_ledger.claimed_command_count, 0);
-
-            // One restored record consumes one existing slot; only the first
-            // genuinely new command consumes ordinal 1 and a fresh deadline.
-            let mut bounded = RelocalizationCommandLedger::from_terminal_store(&store);
-            for index in 0..RELOCALIZATION_MAX_COMMAND_RECORDS.saturating_sub(2) {
-                let new_request = validate_relocalize_request(relocalization_command_request(
-                    &format!("req-restored-cap-{index}"),
-                    7,
-                ))
-                .unwrap();
-                let now = Instant::now();
-                let (ordinal, deadline) = match bounded
-                    .admit(&new_request, index as u64 + 1, now, || unreachable!())
-                    .unwrap()
-                {
-                    RelocalizationLedgerAdmission::Started {
-                        admission_ordinal,
-                        logical_deadline,
-                    } => (admission_ordinal, logical_deadline),
-                    _ => panic!("remaining bounded slot must admit"),
-                };
-                assert_eq!(ordinal, index as u64 + 1);
-                assert_eq!(deadline, now + Duration::from_secs(1));
-                assert!(
-                    matches!(bounded.admit(&new_request, index as u64 + 2, now + Duration::from_millis(900), || unreachable!()).unwrap(),
-                    RelocalizationLedgerAdmission::Joined { admission_ordinal, logical_deadline }
-                    if admission_ordinal == ordinal && logical_deadline == deadline)
-                );
-                bounded
-                    .settle_terminal(
-                        new_request.request_id(),
-                        &new_request.key(),
-                        relocalization_command_terminal(
-                            &new_request,
-                            crate::proto::RelocalizeDisposition::Cancelled,
-                            "RELOCALIZATION_CANCELLED",
-                        ),
-                    )
-                    .unwrap();
-            }
-            let at_capacity = bounded.next_admission_ordinal;
-            let capacity_request = validate_relocalize_request(relocalization_command_request(
-                "req-restored-capacity",
-                7,
-            ))
-            .unwrap();
-            assert!(matches!(
-                bounded
-                    .admit(&capacity_request, 10_000, Instant::now(), || unreachable!())
-                    .unwrap(),
-                RelocalizationLedgerAdmission::CapacityExceeded(
-                    "RELOCALIZATION_COMMAND_LEDGER_CAPACITY_EXCEEDED"
-                )
-            ));
-            let capacity_terminal = relocalization_command_terminal(
-                &capacity_request,
-                crate::proto::RelocalizeDisposition::OwnerFailed,
-                "RELOCALIZATION_COMMAND_LEDGER_CAPACITY_EXCEEDED",
-            );
-            bounded
-                .store_capacity_terminal(
-                    &capacity_request,
-                    Instant::now(),
-                    capacity_terminal.clone(),
-                )
-                .unwrap();
-            assert_eq!(bounded.records.len(), RELOCALIZATION_MAX_COMMAND_RECORDS);
-            assert_eq!(bounded.next_admission_ordinal, at_capacity);
-            assert_eq!(
-                bounded.admitted_command_count,
-                RELOCALIZATION_MAX_COMMAND_RECORDS as u64 - 1
-            );
-            assert_eq!(bounded.claimed_command_count, 0);
-            let observation = bounded.observation().unwrap();
-            assert_eq!(observation.terminal_record_count, observation.admitted_command_count);
-            assert_eq!(observation.pending_record_count, 0);
-            for (request, expected) in [
-                (&request, &terminal),
-                (&capacity_request, &capacity_terminal),
-            ] {
-                match bounded
-                    .admit(request, 10_001, Instant::now(), || unreachable!())
-                    .unwrap()
-                {
-                    RelocalizationLedgerAdmission::Replay(replayed) => {
-                        assert_eq!(replayed.encoded(), expected.encoded())
-                    }
-                    _ => panic!("full ledger must still replay existing terminals"),
-                }
+            let next = validate_relocalize_request(relocalization_command_request("new-after-reopen", 7)).unwrap();
+            assert!(matches!(ledger.admit(&next, 3, Instant::now(), || unreachable!()).unwrap(),
+                RelocalizationLedgerAdmission::Started { admission_ordinal: 1, .. }));
+            assert!(!ledger.records.contains_key("restored-0076"));
+            assert!(!root.path().join(assigned_terminal_filename_v2("restored-0076").unwrap()).exists());
+            let terminal = relocalization_command_terminal(&next,
+                crate::proto::RelocalizeDisposition::Cancelled, "cancelled");
+            store.persist_terminal(next.request_id(), &next.key(), &terminal).unwrap();
+            ledger.settle_terminal(next.request_id(), &next.key(), terminal.clone()).unwrap();
+            assert_eq!(ledger.records.len(), RELOCALIZATION_MAX_COMMAND_RECORDS);
+            assert_eq!(store.state.lock().terminals.len(), RELOCALIZATION_MAX_COMMAND_RECORDS);
+            drop(ledger);
+            drop(store);
+            let reopened = RelocalizationTerminalStore::open_at(root.path().into()).unwrap();
+            assert_eq!(reopened.state.lock().terminals.len(), RELOCALIZATION_MAX_COMMAND_RECORDS);
+            assert_eq!(reopened.state.lock().retained_order.front().unwrap().0, "restored-0077");
+            match reopened.snapshot_exact(next.request_id(), &next.key()) {
+                RelocalizationTerminalSnapshot::AssignedTerminal(result) => assert_eq!(result.encoded(), terminal.encoded()),
+                other => panic!("新命令重开后可重放：{other:?}"),
             }
         }
 

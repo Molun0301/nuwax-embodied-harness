@@ -8,7 +8,7 @@ fn recent_health_scheduler()->(NavSchedulerHandle,JoinHandle<Result<(),RuntimeEr
 }
 // Included inside runtime tests to use the existing real scheduler/fence fixtures.
 #[tokio::test]
-async fn frozen_cloud_fences_despite_live_pose_and_map_updates() {
+async fn frozen_cloud_pauses_despite_live_pose_and_map_updates() {
     let (handle,task)=recent_health_scheduler();
     handle.update_costmap(costmap_at(1_000_000_000)).await.unwrap();
     handle.update_odometry(map_pose()).await.unwrap();
@@ -23,16 +23,16 @@ async fn frozen_cloud_fences_despite_live_pose_and_map_updates() {
         handle.update_costmap(costmap_at(sequence*1_000_000_000)).await.unwrap();
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    let terminal=wait_for_terminal(&handle,TerminalOutcome::SafetyFailed).await;
+    let terminal=wait_for_input_pause(&handle).await;
     assert!(terminal.applied_commands>0);
     assert!(terminal.message.contains("recent obstacle source deadline"));
     assert_eq!(terminal.last_applied_twist,Some(Twist2::ZERO));
-    assert!(terminal.last_zero_ack_id.is_some());
+    assert!(terminal.last_zero_ack_id.is_none());
     handle.shutdown().await.unwrap();task.await.unwrap().unwrap();
 }
 
 #[tokio::test]
-async fn live_cloud_renews_execution_health_and_explicit_revoke_fences() {
+async fn live_cloud_renews_execution_health_and_explicit_revoke_pauses() {
     let (handle,task)=recent_health_scheduler();
     handle.update_costmap(costmap_at(1_000_000_000)).await.unwrap();
     handle.update_odometry(map_pose()).await.unwrap();
@@ -45,9 +45,9 @@ async fn live_cloud_renews_execution_health_and_explicit_revoke_fences() {
         assert!(handle.status().last_terminal.is_none());
     }
     handle.update_obstacle_source(None,false,None).await.unwrap();
-    let terminal=wait_for_terminal(&handle,TerminalOutcome::SafetyFailed).await;
+    let terminal=wait_for_input_pause(&handle).await;
     assert!(terminal.message.contains("recent obstacle source revoked"));
-    assert!(terminal.last_zero_ack_id.is_some());
+    assert!(terminal.last_zero_ack_id.is_none());
     handle.shutdown().await.unwrap();task.await.unwrap().unwrap();
 }
 

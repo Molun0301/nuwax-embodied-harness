@@ -88,7 +88,8 @@ async fn delivery_gap_red_pose_expiry_during_wait_must_not_issue_nonzero() {
     handle.shutdown().await.unwrap(); task.await.unwrap().unwrap();
     eprintln!("DELIVERY_GAP expired_pose elapsed_ms={} applied={applied:?} terminal={terminal:?}", elapsed.as_secs_f64()*1000.0);
     assert_ne!(applied, Some(delivery_gap_command()), "source deadline expired during worker wait before nonzero submission");
-    assert_eq!(terminal, Some(TerminalOutcome::SafetyFailed));
+    assert_eq!(applied, Some(Twist2::ZERO));
+    assert_eq!(terminal, None);
 }
 
 #[tokio::test]

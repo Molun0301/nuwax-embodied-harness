@@ -383,6 +383,13 @@ pub fn decode_nav_state_payload(payload: &[u8]) -> Option<NavigationUpdate> {
     {
         return None;
     }
+    // 只有调度器明确的未授予租约终态可以省略停车证明；后半段保留守卫原始原因。
+    let lease_not_granted = message.state == 4 && message.message.starts_with("LEASE_NOT_GRANTED: ");
+    if lease_not_granted && (!has_session || guard_generation == 0 || path_revision != 0
+        || planner_runtime_generation != 0 || !message.zero_ack_id.is_empty()
+        || zero_applied_monotonic_ns != 0) {
+        return None;
+    }
     let state = NavState {
         status: navigation_state_name(message.state, &message.message),
         message: message.message,
@@ -393,7 +400,8 @@ pub fn decode_nav_state_payload(payload: &[u8]) -> Option<NavigationUpdate> {
     Some(NavigationUpdate {
         producer_runtime_generation,
         feedback: NavigationFeedback {
-            reason_code: navigation_state_name(message.state, &state.message),
+            reason_code: if lease_not_granted { "LEASE_NOT_GRANTED".into() }
+                else { navigation_state_name(message.state, &state.message) },
             runtime_generation,
             guard_generation,
             sink_ready,

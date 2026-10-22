@@ -1231,38 +1231,6 @@ impl MappingBackendSpec {
         }
     }
 
-    pub(crate) fn validate_frame_input(
-        self,
-        sensor_origin: [f64; 3],
-        points: &[Point3<f64>],
-    ) -> Result<(), String> {
-        if sensor_origin.into_iter().any(|value| !value.is_finite())
-            || points
-                .iter()
-                .any(|point| !point.x.is_finite() || !point.y.is_finite() || !point.z.is_finite())
-        {
-            return Err(
-                "MAPPING_BACKEND_COMPUTE_REJECTED: input contains non-finite coordinates"
-                    .to_owned(),
-            );
-        }
-        let Self::Raytracing(spec) = self else {
-            return Ok(());
-        };
-        let mut validation = RaytracingKernel {
-            config: spec.config(),
-            map: VoxelMap::default(),
-            prepared_update: None,
-            input: Vec::new(),
-            last_occupancy: None,
-            last_candidate_point_count: 0,
-            last_candidate_received_at_ns: 0,
-            dirty_since_candidate: false,
-            dynamic_scene: Default::default(),
-        };
-        validation.prepare_map_frame(sensor_origin, points)
-    }
-
     pub(crate) fn into_kernel(self, window_capacity: usize) -> MappingKernel {
         match self {
             Self::SlamToolbox => unreachable!("二维进程不能进入点云内核"),
@@ -2218,19 +2186,6 @@ pub(crate) fn validate_backend_input(
         || input.registered_frame_id.trim().is_empty()
     {
         return Err("MAPPING_BACKEND_COMPUTE_REJECTED: invalid input identity".to_owned());
-    }
-    if input
-        .sensor_origin_map
-        .into_iter()
-        .any(|value| !value.is_finite())
-        || input
-            .registered_points_map
-            .iter()
-            .any(|point| !point.x.is_finite() || !point.y.is_finite() || !point.z.is_finite())
-    {
-        return Err(
-            "MAPPING_BACKEND_COMPUTE_REJECTED: input contains non-finite coordinates".to_owned(),
-        );
     }
     Ok(())
 }
@@ -3234,19 +3189,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn non_finite_input_is_rejected_before_backend_state_changes() {
-        let mut kernel = MappingBackendSpec::Voxel.into_kernel(1024);
-        let mut invalid = input(1);
-        invalid.registered_points_map[0].x = f64::NAN;
-        let error = compute_candidate(&mut kernel, &invalid, compute_config())
-            .expect_err("non-finite point must fail closed");
-        assert!(error.contains("non-finite"));
-        let MappingKernel::Voxel(voxel) = kernel else {
-            panic!("voxel kernel expected");
-        };
-        assert!(voxel.current_window.is_empty());
-    }
+
 }
 
 #[cfg(test)]

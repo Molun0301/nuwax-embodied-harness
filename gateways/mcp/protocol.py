@@ -296,18 +296,8 @@ def _build_collection_catalogs(
 ) -> Dict[str, Dict[str, Dict[str, Any]]]:
     catalogs: Dict[str, Dict[str, Dict[str, Any]]] = {name: {} for name in _MCP_COLLECTIONS}
     descriptors = runtime.skill_registry.list_descriptors()
-    refresh = getattr(runtime, "_refresh_dynamic_capability_matrix", None)
-    if refresh_availability and callable(refresh):
-        if tool_names is None:
-            refresh()
-        else:
-            refresh(capability_names=tuple(descriptor.capability_name for descriptor in descriptors if descriptor.name in tool_names))
-    get_availability = getattr(runtime.capability_registry, "get_availability", None)
-    robot_model = getattr(
-        getattr(getattr(runtime, "robot", None), "manifest", None),
-        "robot_model",
-        None,
-    )
+    if refresh_availability:
+        runtime._refresh_dynamic_capability_matrix()
     for descriptor in descriptors:
         # 调用只读取候选能力，避免为无关工具重复查询支持矩阵和组装参数模式。
         if tool_names is not None and descriptor.name not in tool_names:
@@ -321,21 +311,16 @@ def _build_collection_catalogs(
         )
         if collection_name is None:
             continue
-        try:
-            registration = runtime.capability_registry.get_registration(descriptor.capability_name)
-        except Exception:
-            continue
-        if not registration.runnable:
-            continue
-        if callable(get_availability):
+        if refresh_availability:
             try:
-                availability = get_availability(
+                registration = runtime.capability_registry.get_registration(descriptor.capability_name)
+                availability = runtime.capability_registry.get_availability(
                     descriptor.capability_name,
-                    robot_model=robot_model,
+                    robot_model=runtime.robot.manifest.robot_model,
                 )
             except Exception:
                 continue
-            if not availability.supported:
+            if not registration.runnable or not availability.supported:
                 continue
         catalogs[collection_name][descriptor.name] = _tool_catalog_item(runtime, descriptor, layer)
     return catalogs
@@ -382,8 +367,7 @@ def _build_standalone_platform_tools(platform_catalog: Dict[str, Dict[str, Any]]
         target_name = _MCP_STANDALONE_TOOL_TARGETS[tool_name]
         item = platform_catalog.get(target_name)
         fallback_schema = _MCP_STANDALONE_TOOL_SCHEMAS.get(tool_name)
-        # tools/list 与 tools/call 共享同一个 runnable catalog。Schema fallback
-        # 只能补充已存在目标的参数描述，不能凭空广告不可调用工具。
+        # 目录只发布当前可调用目标；参数模式只能补充已存在目标的描述。
         if item is None:
             continue
         tools.append(
@@ -439,7 +423,7 @@ def _resolve_tool_invocation(
 
     target_name = _MCP_STANDALONE_TOOL_TARGETS.get(tool_name)
     candidates = (tool_name,) if target_name is None else (tool_name, target_name)
-    catalogs = _build_collection_catalogs(runtime, tool_names=candidates)
+    catalogs = _build_collection_catalogs(runtime, tool_names=candidates, refresh_availability=False)
     if target_name is not None and target_name in catalogs["platform"]:
         item = catalogs["platform"][target_name]
         schema = (
@@ -561,9 +545,9 @@ def _resolve_collection_call(runtime: GatewayRuntime, collection_name: str, argu
             http_status=422,
             jsonrpc_code=-32602,
         )
-    catalog = _build_collection_catalogs(runtime, tool_names=(function_name,))[collection_name]
+    catalog = _build_collection_catalogs(runtime, tool_names=(function_name,), refresh_availability=False)[collection_name]
     if function_name not in catalog:
-        # 错误诊断需要完整功能清单，复用本次已经刷新的支持矩阵。
+        # 错误诊断列出已公开注册的功能名，不触发执行准入或可用性刷新。
         available_catalog = _build_collection_catalogs(runtime, refresh_availability=False)[collection_name]
         raise GatewayError(
             f"功能 {function_name} 不属于 {collection_name} 集合。",
@@ -758,7 +742,7 @@ def build_mcp_router(runtime: GatewayRuntime, access_manager: GatewayAccessManag
                         jsonrpc_code=-32602,
                         details={"tool_name": name},
                     )
-                # 动态支持检查可能探测后端状态，不能阻塞其他连接的事件循环。
+                # 参数模式解析仍在工作线程执行，避免阻塞其它连接的事件循环。
                 function_name, function_arguments = await run_in_threadpool(
                     _resolve_tool_invocation,
                     runtime,

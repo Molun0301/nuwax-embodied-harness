@@ -2519,7 +2519,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn surface_execution_fences_when_pose_freezes_despite_live_map() {
+    async fn surface_execution_pauses_when_pose_freezes_and_resumes_after_fresh_pose() {
         let mut harness = Harness::start().await;
         harness.wait_ready().await;
         let goal = goal_for(&harness.feed.lock().unwrap().map, 1, [3.2, 1.55, 2.5]);
@@ -2528,17 +2528,27 @@ mod tests {
         let frozen = harness.scheduler.status().pose_source_timestamp_ns;
         harness.feed.lock().unwrap().frozen_pose_stamp = Some(frozen);
         let started = Instant::now();
-        harness.terminal(TerminalOutcome::SafetyFailed).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let status = harness.scheduler.status();
+                if !status.planner_inputs_fresh && status.last_applied_twist == Some(Twist2::ZERO) { break; }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("冻结位姿必须在原期限内停车等待");
         let stopped = harness.scheduler.status();
         assert!(started.elapsed() < Duration::from_secs(2));
         assert_eq!(stopped.pose_source_timestamp_ns, frozen);
         assert!(!stopped.planner_inputs_fresh);
         assert_eq!(stopped.last_applied_twist, Some(Twist2::ZERO));
-        assert!(stopped.last_zero_ack_id.is_some());
-        let count = stopped.applied_commands;
+        assert!(stopped.last_zero_ack_id.is_none() && stopped.last_terminal.is_none());
         tokio::time::sleep(Duration::from_millis(150)).await;
-        assert_eq!(harness.scheduler.status().applied_commands, count,
-            "持续新地图与重放旧位姿不能恢复已退休目标");
+        assert_eq!(harness.scheduler.status().last_applied_twist, Some(Twist2::ZERO),
+            "持续新地图不能替代被冻结的位姿");
+        harness.feed.lock().unwrap().frozen_pose_stamp = None;
+        harness.wait_controlling().await;
+        assert_eq!(harness.scheduler.status().session_id.as_deref(), Some(goal.session_id.as_str()));
+        harness.cancel(&goal).await;
+        harness.terminal(TerminalOutcome::Cancelled).await;
         harness.shutdown().await;
     }
 

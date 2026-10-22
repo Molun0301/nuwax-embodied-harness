@@ -352,7 +352,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn navigation_readiness_requires_real_execution_chain_observations() {
+    async fn navigation_readiness_requires_navigation_inputs_only() {
         use crate::lcm_runtime::NavState;
         use crate::nav_runtime::{
             MotionSinkObservation, PlannerInputObservation, TfChainObservation,
@@ -416,6 +416,7 @@ mod tests {
             })
             .expect("motion sink observation");
 
+        handle.nav.observe_idle_motion_sink(false).expect("守卫拒绝后的空闲观察");
         let ready = navigation_readiness(&handle);
         assert!(ready.ready, "{}", ready.reason);
         assert_eq!(ready.code, ComponentReadinessCode::Ready);

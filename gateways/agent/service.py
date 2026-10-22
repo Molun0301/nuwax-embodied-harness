@@ -242,15 +242,17 @@ class AgentToolService:
         else:
             record, _ = self.store.begin(request_id, tool_name, existing["capability_name"], arguments)
             return self._call_receipt(record)
-        views = self.runtime.list_tools(exposed_only=True, include_unsupported=False)
-        view = next((item for item in views if item.descriptor.name == tool_name
-                     and item.supported and item.runnable and item.descriptor.exposed_to_agent), None)
-        if view is None:
-            raise GatewayError("工具未公开或当前不可调用，请刷新工具目录。",
-                               error_code="capability_not_registered", http_status=404)
-        self.access_manager.authorize_capability(self.runtime.capability_registry.get_descriptor(view.capability_name))
-        validate_arguments(arguments, view.input_schema)
-        record, owner = self.store.begin(request_id, tool_name, view.capability_name, arguments)
+        try:
+            descriptor = self.runtime.get_tool_descriptor(tool_name)
+        except KeyError as exc:
+            raise GatewayError("工具未注册，请刷新工具目录。",
+                               error_code="capability_not_registered", http_status=404) from exc
+        if not descriptor.exposed_to_agent:
+            raise GatewayError("工具未向智能体公开。", error_code="access_denied", http_status=403)
+        capability = self.runtime.capability_registry.get_descriptor(descriptor.capability_name)
+        self.access_manager.authorize_capability(capability)
+        validate_arguments(arguments, capability.input_schema)
+        record, owner = self.store.begin(request_id, tool_name, descriptor.capability_name, arguments)
         if not owner:
             return self._call_receipt(record)
         error = None
@@ -261,7 +263,7 @@ class AgentToolService:
                                                 project_result=False)
         except Exception as exc:
             error = build_public_error_payload(as_gateway_error(exc), request_id=request_id,
-                                               capability_name=view.capability_name)
+                                               capability_name=descriptor.capability_name)
         try:
             try:
                 response = checked_json(response)
@@ -269,7 +271,7 @@ class AgentToolService:
                 if error is not None:
                     raise
                 response, error = self._known_task_acceptance(
-                    response, request_id=request_id, capability_name=view.capability_name,
+                    response, request_id=request_id, capability_name=descriptor.capability_name,
                     encoding_error=encoding_error)
             record = self.store.finish(request_id, response, error)
         except Exception:

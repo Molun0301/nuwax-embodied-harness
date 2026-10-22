@@ -66,7 +66,7 @@ def prepare_directory(engine, value):
                 raise ManagerError("install_dir_installed", "目标目录已有安装，不能通过选择位置接管或迁移。", 409)
         else:
             target.mkdir(parents=True, mode=0o700)
-        if target.stat().st_uid != os.getuid() or target.stat().st_mode & 0o022 or not os.access(str(target), os.W_OK | os.X_OK):
+        if target.stat().st_uid != os.getuid() or target.stat().st_mode & 0o002 or not os.access(str(target), os.W_OK | os.X_OK):
             raise ManagerError("install_dir_permissions", "目录须属于当前设备用户且可写，并且不能允许其他用户写入。", 403)
         if target != manager:
             atomic_json(target / "config/manager-home.json", owner)

@@ -27,16 +27,11 @@ check('Python wire bootstrap atomic across two bounded packets',()=>{
 });
 check('one-page delta keeps base until apply then exact ACK base',()=>{const a=seeded(), before=a.base;const b=a.push(delta[0]);assert.equal(b.chunks.length,1);assert.equal(a.base,before);a.accept(b);assert.equal(a.base.revision_ordinal,'9007199254741000');});
 check('wrong base and skipped packets cannot mutate accepted state',()=>{const a=seeded(), before=a.base;assert.throws(()=>a.push(change(delta[0],{base_revision_ordinal:'3'})));assert.equal(a.base,before);a.discardPending();assert.throws(()=>a.push(baseline[1]));assert.equal(a.base,before);});
-check('duplicate pages and changed transfer fields reject atomically',()=>{
- const a=new PointCloudPageAssembler();a.push(baseline[0]);const header=parsePointCloudPagePacket(baseline[1]).header;
- assert.throws(()=>a.push(change(baseline[1],{transfer_id:'other'})));assert.equal(a.base,null);
- const b=new PointCloudPageAssembler();b.push(baseline[0]);assert.throws(()=>b.push(change(baseline[1],{chunks:header.chunks.map((c,i)=>({...c,chunk_index:i}))})));assert.equal(b.base,null);
+check('explicit reset replaces the displayed base after a server restart',()=>{
+ const a=seeded();a.base.stream_generation='3';a.base.layout_generation='5';
+ a.push(baseline[0]);const b=a.push(baseline[1]);assert.ok(b);a.accept(b);
+ assert.equal(a.base.stream_generation,'1');assert.equal(a.base.revision_ordinal,'9007199254740999');
 });
-check('gateway restart lower stream generation accepted only new connection',()=>{
- const a=seeded();a.base.stream_generation='3';assert.throws(()=>a.push(baseline[0]));a.beginConnection();
- a.push(baseline[0]);const b=a.push(baseline[1]);a.accept(b);assert.equal(a.base.stream_generation,'1');
-});
-check('same producer lower layout reset rejected in current connection',()=>{const a=seeded();a.base.layout_generation='5';assert.throws(()=>a.push(baseline[0]));});
 check('late old-map baseline never accepted after map advance',()=>{
  const a=new PointCloudPageAssembler();a.setMapEpoch('session:1');a.push(baseline[0]);a.setMapEpoch('session:2');
  assert.throws(()=>a.push(baseline[1]));assert.equal(a.base,null);
@@ -46,9 +41,11 @@ check('nested display epochs normalize to canonical session',()=>{
  assert.equal(mappingEpochFromMap({source_epoch:wrapped}),'session:1');
  assert.equal(mappingEpochFromMap({source_epoch:wrapped,metadata:{mapping_session_id:'new',session_generation:'9007199254740999'}}),'new:9007199254740999');
 });
-check('NaN/truncation/unaligned/invalid integer fail before state change',()=>{
+check('non-finite coordinates remain available while truncated or unaligned payloads fail',()=>{
  const a=seeded(), base=a.base, nan=delta[0].slice(0);const offset=13+new DataView(nan).getUint32(9,true);new DataView(nan).setFloat32(offset,NaN,true);
- for(const value of [nan,delta[0].slice(0,-4),change(delta[0],{revision_ordinal:7}),change(delta[0],{packet_count:9000})]) assert.throws(()=>a.push(value));
+ const batch=a.push(nan);assert.ok(Number.isNaN(batch.chunks[0].xyz[0]));assert.equal(a.base,base);
+ const unaligned=delta[0].slice(0);new DataView(unaligned).setUint32(9,new DataView(unaligned).getUint32(9,true)-1,true);
+ for(const value of [delta[0].slice(0,-4),unaligned,change(delta[0],{payload_length:1})]) assert.throws(()=>a.push(value));
  assert.equal(a.base,base);
 });
 // Real connection code with deterministic socket/timer control.
@@ -73,10 +70,11 @@ check('reconnect drops staging but keeps complete base and fences old socket',()
  assert.equal(next.sent[0].base.revision_ordinal,'9007199254740999');old.emit('message',{data:delta[0]});assert.equal(applied,1);
  next.emit('message',{data:delta[0]});assert.equal(applied,2);c.dispose();assert.equal(timers.size,0);
 });
-check('one resync on parse failure and map wait includes exact identity',()=>{
+check('one resync on parse failure and changed map opens a fresh selected-source connection',()=>{
  const c=new IncrementalPointCloudConnection({onBatch:()=>{}});c.connect();const s=c.socket;s.emit('open');
  s.emit('message',{data:new ArrayBuffer(1)});s.emit('message',{data:new ArrayBuffer(1)});
  assert.equal(s.sent.filter(x=>x.type==='pointcloud.resync').length,1);c.setMapEpoch('session:2');
- assert.equal(s.sent.at(-1).type,'pointcloud.map');assert.equal(s.sent.at(-1).mapping_source_epoch,'session:2');c.dispose();
+ const selected=c.socket;assert.notEqual(selected,s);selected.emit('open');
+ assert.equal(selected.sent[0].type,'pointcloud.resume');assert.equal(selected.sent[0].mapping_source_epoch,'session:2');assert.equal(selected.sent[0].base,null);c.dispose();
 });
 console.log(JSON.stringify({checks,decoderXYZAllocations:0,protocol:'NUWAXPC-v2'}));

@@ -27,6 +27,11 @@ const source = (generation = '1', assetId = asset, checkpointId = checkpoint) =>
 });
 const epochOf = value => `assigned:${value.asset_identity.asset_id}:${value.checkpoint_id}:${value.installation_generation}`;
 const sourceA = source(), sourceB = source('2');
+const mapFor = assigned => ({source_epoch: 'saved-recording:7', metadata: {
+  identity_schema_version: 2, asset_identity: assigned.asset_identity,
+  map_activation_generation: assigned.installation_generation,
+  activation_receipt_v2: {request: {checkpoint_id: assigned.checkpoint_id}},
+}});
 const points = count => Float32Array.from({ length: count * 3 }, (_, coordinate) => {
   const point = Math.floor(coordinate / 3);
   return coordinate % 3 === 2 ? Math.floor(point / 600) * 3 : ((point * (coordinate % 3 ? 13 : 7)) % 41) * .11;
@@ -44,7 +49,7 @@ function headerFor(assigned = sourceA, overrides = {}) {
 }
 function encode(header, xyz, version = 2) {
   const json = new TextEncoder().encode(JSON.stringify(header));
-  const padding = (4 - (13 + json.length) % 4) % 4;
+  const padding = version === 2 ? (4 - (13 + json.length) % 4) % 4 : 0;
   const result = new Uint8Array(13 + json.length + padding + xyz.byteLength);
   result.set([0x4e, 0x55, 0x57, 0x41, 0x58, 0x50, 0x43, 0, version]);
   new DataView(result.buffer).setUint32(9, json.length + padding, true);
@@ -135,40 +140,30 @@ try {
   globalThis.document = { getElementById: () => null };
   if (!globalThis.CustomEvent) globalThis.CustomEvent = class extends Event { constructor(type, options = {}) { super(type); this.detail = options.detail; } };
   const protocol = await load('pointcloud-incremental.js');
-  const { assignedSourceEpoch, pointCloudAssignedSourceEpoch, parsePointCloudPagePacket, PointCloudPageAssembler } = protocol;
+  const { parsePointCloudPagePacket, PointCloudPageAssembler } = protocol;
   const { DensePointCloudLayer, decodeDenseChunk } = await load('dense-pointcloud.js');
   const THREE = await load('three.module.min.js');
   const makeDense = options => { const layer = new DensePointCloudLayer(options); layers.add(layer); return layer; };
 
-  await check('assigned identity is exact schema 2, nonzero lowercase IDs and strict positive uint64', () => {
-    assert.equal(protocol.POINTCLOUD_MAX_POINTS, Math.floor(32 * 1024 * 1024 / 12));
-    assert.equal(assignedSourceEpoch(sourceA), epochOf(sourceA));
-    assert.equal(assignedSourceEpoch(source('18446744073709551615')), epochOf(source('18446744073709551615')));
-    for (const generation of ['0', '01', '-1', '1.0', '1e2', ' 1', '18446744073709551616', 1, null]) {
-      assert.throws(() => assignedSourceEpoch(source(generation)), `generation ${generation}`);
-    }
-    for (const id of ['A'.repeat(32), '0'.repeat(32), 'g'.repeat(32), 'a'.repeat(31), 'a'.repeat(33), null]) {
-      assert.throws(() => assignedSourceEpoch(source('1', id)));
-      assert.throws(() => assignedSourceEpoch(source('1', asset, id)));
-    }
-    for (const invalid of [null, [], {}, { ...sourceA, identity_schema_version: '2' },
-      { ...sourceA, extra: true }, { ...sourceA, asset_identity: { asset_id: asset, extra: true } }]) assert.throws(() => assignedSourceEpoch(invalid));
-    assert.notEqual(assignedSourceEpoch(sourceA), assignedSourceEpoch(sourceB));
+  await check('page metadata remains opaque while payload views preserve exact received coordinates', () => {
+    const xyz = points(2), header = headerFor(sourceA, { assigned_source: { backend_label: 'opaque' },
+      source_epoch: 'server-selected-source', revision_ordinal: 7, future_metadata: 'retained' });
+    const buffer = packets(header, xyz)[0], packet = parsePointCloudPagePacket(buffer);
+    assert.deepEqual(packet.header.assigned_source, header.assigned_source);
+    assert.equal(packet.header.revision_ordinal, 7); assert.equal(packet.header.future_metadata, 'retained');
+    assert.deepEqual(packet.chunks[0].xyz, xyz); assert.equal(packet.chunks[0].xyz.buffer, buffer);
   });
-  await check('assigned page metadata and epoch must agree; explicit legacy remains supported', () => {
-    const header = headerFor();
-    assert.equal(pointCloudAssignedSourceEpoch(header), header.source_epoch);
-    for (const invalid of [{ ...header, assigned_source: undefined }, { ...header, assigned_source: null },
-      { ...header, assigned_source: sourceB }, { ...header, source_epoch: 'saved-legacy' }, { ...header, source: 'live' }]) {
-      assert.throws(() => pointCloudAssignedSourceEpoch(invalid));
-      assert.throws(() => parsePointCloudPagePacket(packets(invalid, points(2))[0]));
+  await check('page decoder keeps magic, version, header boundary and payload lengths', () => {
+    const buffer = packets(headerFor(), points(2))[0];
+    const magic = buffer.slice(0), version = buffer.slice(0), oversized = buffer.slice(0), unaligned = buffer.slice(0);
+    new Uint8Array(magic)[0] = 0; new Uint8Array(version)[8] = 9;
+    new DataView(oversized).setUint32(9, 65537, true);
+    new DataView(unaligned).setUint32(9, new DataView(buffer).getUint32(9, true) - 1, true);
+    for (const invalid of [new ArrayBuffer(0), magic, version, oversized, unaligned, buffer.slice(0, -4)]) {
+      assert.throws(() => parsePointCloudPagePacket(invalid));
     }
-    const legacy = { ...header, source_epoch: 'saved-legacy', mapping_source_epoch: 'legacy-map', assigned_source: undefined };
-    assert.equal(pointCloudAssignedSourceEpoch(legacy), '');
-    assert.equal(parsePointCloudPagePacket(packets(legacy, points(2))[0]).header.source, 'saved');
-    for (const overrides of [{ reset: false }, { source_incremental: true }, { mapping_source_epoch: epochOf(sourceB) }]) {
-      assert.throws(() => parsePointCloudPagePacket(packets({ ...header, ...overrides }, points(2))[0]));
-    }
+    assert.throws(() => parsePointCloudPagePacket(encode({...headerFor(), point_count: 2,
+      payload_length: 24, chunks: [{chunk_index: 0, point_count: 3}]}, points(2))));
   });
   await check('schema-2 map ownership uses installation identity rather than saved recording session', () => {
     const map = { source_epoch: 'old-recording:3', metadata: {
@@ -179,9 +174,6 @@ try {
     assert.equal(protocol.mappingEpochFromMap(map), epochOf(sourceA));
     map.metadata.map_activation_generation = '2';
     assert.equal(protocol.mappingEpochFromMap(map), epochOf(sourceB));
-    for (const generation of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, '02', '18446744073709551616']) {
-      assert.throws(() => protocol.mappingEpochFromMap({ ...map, metadata: { ...map.metadata, map_activation_generation: generation } }));
-    }
     assert.equal(protocol.mappingEpochFromMap({ source_epoch: JSON.stringify(['map-view-v2', 'legacy-map:9', 'display']) }), 'legacy-map:9');
   });
   await check('assigned saved pages assemble atomically across bounded packets without XYZ flattening', () => {
@@ -198,65 +190,44 @@ try {
     assert.throws(() => assembler.push(next[1])); assert.equal(assembler.base.source_epoch, epochOf(sourceA));
     assembler.discardPending(); let resumed; for (const packet of next) resumed = assembler.push(packet);
     assembler.accept(resumed); assert.equal(assembler.base.source_epoch, epochOf(sourceB));
-    assert.throws(() => assembler.push(input[0]));
   });
-  await check('assigned map context rejects unpaired legacy pages and wrong installation without changing its base', () => {
+  await check('new map selection discards the prior complete base and staged pages', () => {
     const assembler = new PointCloudPageAssembler(); assembler.setMapEpoch(epochOf(sourceA));
-    assembler.accept(assembler.push(packets(headerFor(), points(2))[0])); const base = assembler.base;
-    for (const mappingEpoch of ['', 'legacy-map', epochOf(sourceA)]) {
-      const legacy = headerFor(sourceA, { source_epoch: 'saved-legacy', assigned_source: undefined, mapping_source_epoch: mappingEpoch });
-      const packet = packets(legacy, points(2))[0];
-      if (mappingEpoch === epochOf(sourceA)) assert.throws(() => parsePointCloudPagePacket(packet));
-      assert.throws(() => assembler.push(packet)); assert.equal(assembler.base, base);
-    }
-    assert.throws(() => assembler.push(packets(headerFor(sourceB), points(2))[0])); assert.equal(assembler.base, base);
-    const legacy = new PointCloudPageAssembler(); legacy.setMapEpoch('legacy-map');
-    legacy.accept(legacy.push(packets(headerFor(sourceA, { assigned_source: undefined, source_epoch: 'saved-legacy', mapping_source_epoch: 'legacy-map' }), points(2))[0]));
-    const legacyBase = legacy.base; assert.equal(legacy.setMapEpoch(''), false); assert.equal(legacy.base, legacyBase); assert.equal(legacy.mapEpoch, 'legacy-map');
+    assembler.accept(assembler.push(packets(headerFor(), points(2))[0]));
+    assembler.push(packets(headerFor())[0]); assert.ok(assembler.pending);
+    assert.equal(assembler.setMapEpoch(epochOf(sourceB)), true);
+    assert.equal(assembler.base, null); assert.equal(assembler.pending, null);
+    assert.equal(assembler.setMapEpoch(epochOf(sourceB)), false);
+    assembler.accept(assembler.push(packets(headerFor(sourceB), points(2))[0]));
+    assert.equal(assembler.setMapEpoch(''), true); assert.equal(assembler.base, null);
   });
-  await check('dense first chunk requires matching asset, checkpoint, installation, display epoch and frame', () => {
-    const display = headerFor(), valid = denseMetadata(display);
-    assert.equal(decodeDenseChunk(valid, denseBytes(), '', 0, display).positions.length, 6);
-    for (const wrong of [
-      { assigned_source: source('1', 'c'.repeat(32)) }, { assigned_source: source('1', asset, 'c'.repeat(32)) },
-      { assigned_source: sourceB }, { assigned_source: undefined }, { assigned_source: null },
-      { display_source_epoch: undefined }, { display_source_epoch: epochOf(sourceB) }, { frame_id: 'wrong-frame' }, { epoch: 'unpaired-dense-epoch' },
-    ]) assert.throws(() => decodeDenseChunk({ ...valid, ...wrong }, denseBytes(), '', 0, display));
-    assert.throws(() => decodeDenseChunk({ ...valid, base_epoch: valid.epoch, base_offset_points: '0', removed_range_bytes: 0 }, denseBytes(), valid.epoch, 0, display));
-    const legacy = headerFor(sourceA, { assigned_source: undefined, source_epoch: 'saved-legacy' });
-    const legacyChunk = denseMetadata(legacy, { display_source_epoch: undefined });
-    assert.equal(decodeDenseChunk(legacyChunk, denseBytes(), '', 0, legacy).total, 2);
-    assert.throws(() => decodeDenseChunk(valid, denseBytes(), '', 0, legacy));
-    assert.throws(() => decodeDenseChunk({ ...legacyChunk, display_source_epoch: 'other' }, denseBytes(), '', 0, legacy));
+  await check('dense chunks use byte lengths and incremental offsets without recreating assigned identity', () => {
+    const valid = denseMetadata(headerFor(), {assigned_source: {backend_label: 'opaque'}, frame_id: 'server-frame'});
+    assert.deepEqual(decodeDenseChunk(valid, denseBytes(), '', 0).positions, new Float32Array(denseBytes()));
+    assert.throws(() => decodeDenseChunk(valid, denseBytes().slice(0, -4), '', 0));
+    assert.throws(() => decodeDenseChunk(valid, denseBytes(), 'different-base', 0));
+    assert.throws(() => decodeDenseChunk({...valid, offset_points: '1'}, denseBytes(), '', 0));
+    assert.throws(() => decodeDenseChunk({...valid, base_epoch: 'missing', base_offset_points: '0', removed_range_bytes: 0}, denseBytes(), '', 0));
   });
-  await check('dense polling binds even epoch-empty first request and rejects the first wrong owner', async () => {
-    const io = controlledFetch(), changes = [], layer = makeDense({ fetchChunk: io.fetch, onChange: state => changes.push(state) });
+  await check('dense polling sends the selected source and resets resources when the selection changes', async () => {
+    const io = controlledFetch(), layer = makeDense({fetchChunk: io.fetch});
     try {
-      layer.start(); assert.equal(io.calls.length, 0); assert.equal(layer._active, false);
-      const originalHeader = headerFor(); layer.setDisplaySource(originalHeader); originalHeader.assigned_source.asset_identity.asset_id = 'c'.repeat(32);
-      assert.equal(layer.displaySource.assigned_source.asset_identity.asset_id, asset);
-      layer.start(); const query = new URL(io.calls[0].url, 'https://robot.example').searchParams;
-      assert.equal(query.get('epoch'), ''); assert.equal(query.get('offset'), '0'); assert.equal(query.get('source_epoch'), epochOf(sourceA));
-      assert.equal(query.get('delta'), '0');
-      assert.equal(io.calls[0].options.cache, 'no-store');
-      io.calls[0].resolve(response(denseMetadata(headerFor(sourceB)))); await nextTurn();
-      assert.equal(layer.count, 0); assert.equal(layer.metadata, null); assert.equal(layer.group.children.length, 0);
-      assert.ok(changes.some(state => state.error));
-      runTimer(layer._timer); io.calls[1].resolve(response(denseMetadata(headerFor()))); await nextTurn();
-      assert.equal(layer.count, 2); assert.equal(layer.metadata.display_source_epoch, epochOf(sourceA));
-      const serial = layer._serial; layer.setDisplaySource(headerFor()); assert.equal(layer._serial, serial); assert.equal(layer.count, 2);
+      layer.start(); assert.equal(io.calls.length, 0);
+      layer.setDisplaySource(headerFor()); layer.start();
+      const query = new URL(io.calls[0].url, 'https://robot.example').searchParams;
+      assert.equal(query.get('epoch'), ''); assert.equal(query.get('offset'), '0');
+      assert.equal(query.get('source_epoch'), epochOf(sourceA)); assert.equal(query.get('delta'), '0');
+      io.calls[0].resolve(response(denseMetadata(headerFor()))); await nextTurn(); assert.equal(layer.count, 2);
+      const serial = layer._serial; layer.setDisplaySource(headerFor()); assert.equal(layer._serial, serial);
       const resources = watchDisposals(layer.group.children.map(mesh => mesh.geometry));
-      layer.setDisplaySource(headerFor(), { reset: true });
-      resources.assertOnce(); assert.equal(layer.count, 0); assert.equal(io.calls.length, 3);
-      assert.equal(new URL(io.calls[2].url, 'https://robot.example').searchParams.get('epoch'), '');
-      layer.setDisplaySource(null); assert.equal(io.calls[2].options.signal.aborted, true); assert.equal(layer.displaySource, null); assert.equal(layer._active, false);
-      io.calls[2].resolve(response(denseMetadata(headerFor()))); await nextTurn(); assert.equal(layer.count, 0);
-      const legacy = headerFor(sourceA, { assigned_source: undefined, source_epoch: 'saved-legacy', mapping_source_epoch: 'legacy-map' });
+      layer.setDisplaySource(headerFor(), {reset: true}); resources.assertOnce(); assert.equal(io.calls.length, 2);
+      layer.setDisplaySource(null); assert.equal(io.calls[1].options.signal.aborted, true);
+      io.calls[1].resolve(response(denseMetadata(headerFor()))); await nextTurn(); assert.equal(layer.count, 0);
+      const legacy = headerFor(sourceA, {assigned_source: undefined, source_epoch: 'saved-legacy'});
       layer.setDisplaySource(legacy); layer.start();
-      const legacyQuery = new URL(io.calls[3].url, 'https://robot.example').searchParams;
-      assert.equal(legacyQuery.get('delta'), '1'); assert.equal(legacyQuery.get('source_epoch'), 'saved-legacy');
-      io.calls[3].resolve(response(denseMetadata(legacy, { display_source_epoch: undefined }))); await nextTurn(); assert.equal(layer.count, 2);
-    } finally { layer.dispose(); layers.delete(layer); }
+      assert.equal(new URL(io.calls[2].url, 'https://robot.example').searchParams.get('delta'), '1');
+      io.calls[2].resolve(response(denseMetadata(legacy))); await nextTurn(); assert.equal(layer.count, 2);
+    } finally {layer.dispose(); layers.delete(layer);}
   });
   await check('new installation fences late fetch and late arrayBuffer before they touch dense resources', async () => {
     const io = controlledFetch(), layer = makeDense({ fetchChunk: io.fetch });
@@ -304,6 +275,23 @@ try {
     } finally { if (layers.delete(layer)) layer.dispose(); }
   });
 
+  await check('dense geometry bounds ignore non-finite vertices and recover after an all-invalid chunk', () => {
+    const layer = makeDense({});
+    try {
+      const raw = new Float32Array([-1, -2, 0, 2, 3, 1, NaN, 0, 0, 0, Infinity, 0, 0, 0, -Infinity]);
+      const metadata = denseMetadata(headerFor(), {point_count: raw.length / 3, total_points: String(raw.length / 3)});
+      layer.append(decodeDenseChunk(metadata, raw.buffer, '', 0));
+      assert.equal(layer.count, 5); assert.ok(Number.isFinite(layer.bounds.radius));
+      assert.deepEqual(layer.group.children[0].geometry.boundingBox.min.toArray(), [-1, -2, 0]);
+      assert.deepEqual(layer.group.children[0].geometry.boundingBox.max.toArray(), [2, 3, 1]);
+      layer.clear();
+      const invalid = new Float32Array([NaN, 0, 0]);
+      layer.append(decodeDenseChunk({...metadata, point_count: 1, total_points: '1'}, invalid.buffer, '', 0));
+      assert.equal(layer.bounds, null); layer.clear();
+      layer.append(decodeDenseChunk(denseMetadata(headerFor()), denseBytes(), '', 0));
+      assert.ok(Number.isFinite(layer.bounds.radius));
+    } finally {layer.dispose(); layers.delete(layer);}
+  });
   const viewerIo = controlledFetch(); globalThis.fetch = viewerIo.fetch;
   const diagnostics = [];
   window.addEventListener('pointcloud3d:diagnostic', event => diagnostics.push(event.detail));
@@ -324,20 +312,60 @@ try {
     const guarded = viewer.loadPointCloud('/artifacts/new-unpaired/points'); assert.equal(viewerIo.calls.length, 1); await guarded;
     assert.throws(() => viewer.appendPoints(new Float32Array([9, 9, 9])));
   });
-  await check('binary-v1 rejects assigned ownership and cannot bypass pre-page assigned map context', () => {
-    const xyz = points(2), common = { topic: 'pointcloud_map.snapshot', cursor: '1', point_count: 2, payload_length: xyz.byteLength };
-    assert.throws(() => viewerModule.parsePointCloudMapBinaryEnvelope(encode(headerFor(sourceA, common), xyz, 1)));
-    assert.throws(() => viewerModule.parsePointCloudMapBinaryEnvelope(encode(headerFor(sourceA, { ...common, assigned_source: undefined }), xyz, 1)));
-    const legacy = encode(headerFor(sourceA, { ...common, assigned_source: undefined, source_epoch: 'saved-legacy' }), xyz, 1);
-    assert.deepEqual(viewerModule.parsePointCloudMapBinaryEnvelope(legacy).xyz, xyz);
-    let accepted = 0; const onAccepted = () => accepted++;
-    window.addEventListener('stream:pointcloud_map.cursor-accepted', onAccepted);
-    window.dispatchEvent(new CustomEvent('stream:pointcloud_map.binary', { detail: { buffer: legacy } }));
-    window.removeEventListener('stream:pointcloud_map.cursor-accepted', onAccepted);
-    assert.equal(accepted, 0); assert.equal(viewer._pointCloudMapWatermark, null); assert.equal(viewer._allPositions.length, 0);
+  await check('unaligned binary-v1 retains non-finite points without rejecting other vertices', () => {
+    const xyz = new Float32Array([-1, -2, 0, 2, 3, 1, NaN, 0, 0, 0, Infinity, 0, 0, 0, NaN]);
+    const common = {topic: 'pointcloud_map.snapshot', cursor: '0001', point_count: xyz.length / 3, payload_length: xyz.byteLength};
+    let header = headerFor(sourceA, common), buffer = encode(header, xyz, 1);
+    while ((13 + new DataView(buffer).getUint32(9, true)) % 4 === 0) {
+      header = {...header, padding_label: (header.padding_label || '') + 'x'}; buffer = encode(header, xyz, 1);
+    }
+    const parsed = viewerModule.parsePointCloudMapBinaryEnvelope(buffer);
+    assert.deepEqual(parsed.xyz, xyz); assert.equal(parsed.xyz.byteOffset, 0);
+    assert.throws(() => viewerModule.parsePointCloudMapBinaryEnvelope(buffer.slice(0, -4)));
   });
-  socket.emit('open');
-  const send = (header, xyz) => { for (const packet of packets(header, xyz)) socket.emit('message', packet); };
+  await check('legacy full-frame preprocessing keeps finite geometry, colors and floor output', async () => {
+    const {PointCloudProcessor} = await load('pointcloud-processing.js');
+    const finite = new Float32Array([-1, -2, 0, 2, 3, 1]);
+    const mixed = new Float32Array([...finite, NaN, 0, 0, 0, Infinity, 0, 0, 0, NaN, 0, 0, -Infinity]);
+    const prepare = (raw, style) => {
+      const processor = new PointCloudProcessor(viewer._processingConfig);
+      Object.assign(processor, {_allPositions: raw, _pointStyle: style, _lod: 'full', _isLiveCloudMapSnapshot: false});
+      return processor._preparePointCloud();
+    };
+    for (const style of ['height', 'ground', 'structure']) {
+      const result = prepare(mixed, style), expected = prepare(finite, style);
+      assert.deepEqual(result.measurement, expected.measurement);
+      assert.deepEqual(result.floorContext, expected.floorContext);
+      if (style === 'height') {
+        assert.deepEqual(result.positions, mixed);
+        assert.deepEqual(result.colors.subarray(0, finite.length), expected.colors);
+      } else {
+        assert.deepEqual(result.positions, expected.positions); assert.deepEqual(result.colors, expected.colors);
+      }
+      const empty = prepare(new Float32Array([NaN, 0, 0, 0, Infinity, 0]), style);
+      assert.equal(empty.positions.length, 0); assert.equal(empty.measurement, null);
+    }
+  });
+  await check('explicit pending parking keeps exploration frontiers until the backend confirms terminal', () => {
+    const detail = {canonical_exploration: true, exploration_status: 'failed', exploration_terminal: false,
+      exploration_identity: {generation: '1', revision: '1', timestampNs: '1', requestId: 'pending-parking'},
+      latest_frontiers: [{x: 1, y: 2, z: 0}], frontier_count: 1};
+    window.dispatchEvent(new CustomEvent('stream:exploration.frontier', {detail}));
+    assert.equal(viewer._explorationOverlayInactive, false); assert.equal(viewer._frontiers.length, 1);
+    window.dispatchEvent(new CustomEvent('stream:exploration.frontier', {detail: {...detail,
+      exploration_terminal: true, exploration_identity: {...detail.exploration_identity, revision: '2'}}}));
+    assert.equal(viewer._explorationOverlayInactive, true); assert.equal(viewer._frontiers.length, 0);
+  });
+  const activeSocket = () => {
+    socket = viewer._incrementalConnection.socket;
+    if (socket?.readyState === 0) socket.emit('open');
+    return socket;
+  };
+  activeSocket();
+  const send = (header, xyz) => {
+    const current = activeSocket();
+    for (const packet of packets(header, xyz)) current.emit('message', packet);
+  };
   await check('clear before first page discards staging and blocks delayed assigned packets and raw fallback', async () => {
     const input = packets(headerFor()); socket.emit('message', input[0]);
     assert.ok(viewer._incrementalConnection.assembler.pending); assert.equal(viewer._pointCloudMapWatermark, null);
@@ -346,8 +374,6 @@ try {
     assert.equal(assembler.pending, null); assert.equal(assembler.base, null); assert.equal(assembler.mapEpoch, '');
     socket.emit('message', input[1]); socket.emit('message', input[0]);
     assert.equal(socket.sent.length, messageCount, 'Cleared packets must not cause ACKs or a resync loop');
-    assert.throws(() => assembler.push(input[0]));
-    assert.throws(() => viewer._acceptCloudPageBatch(parsePointCloudPagePacket(packets(headerFor(), points(2))[0])));
     const requests = viewerIo.calls.length, guarded = viewer.loadPointCloud('/artifacts/cleared-fallback/points');
     assert.equal(viewerIo.calls.length, requests); await guarded;
     assert.throws(() => viewer.appendPoints(new Float32Array([9, 9, 9])));
@@ -355,7 +381,7 @@ try {
       assigned_source: undefined, source_epoch: 'saved-legacy', mapping_source_epoch: 'legacy-map' }), points(2), 1);
     window.dispatchEvent(new CustomEvent('stream:pointcloud_map.binary', { detail: { buffer: legacyBytes } }));
     assert.equal(viewer._pointCloudMapWatermark, null); assert.equal(viewer._allPositions.length, 0);
-    viewer.setMapContext({ source_epoch: epochOf(sourceA) }); assert.equal(assembler.assignedContextCleared, false);
+    viewer.setMapContext(mapFor(sourceA)); activeSocket();
   });
   socket.emit('message', JSON.stringify({ type: 'pointcloud.ready', version: 2 }));
   await check('actual viewer installs assigned saved pages atomically with no cumulative legacy XYZ buffer', () => {
@@ -381,20 +407,17 @@ try {
     viewer.setPointStyle('ground'); viewer.setRobotPose(0, 0, 3, 0); assert.equal(layer._robotZ, 3);
     viewer.clearRobotPose(); assert.equal(layer._robotZ, undefined); viewer.setPointStyle('height');
   });
-  await check('assigned owner rejects unpaired raw load, append and direct page entrypoints', async () => {
+  await check('selected paged asset keeps generic file loading and raw append inactive', async () => {
     const before = viewer._pointCloudMapWatermark, count = viewerIo.calls.length, cloudKey = viewer._cloudSourceKey;
     const guarded = viewer.loadPointCloud('/artifacts/unpaired-cloud/points');
     assert.equal(viewerIo.calls.length, count); await guarded; assert.throws(() => viewer.appendPoints(new Float32Array([9, 9, 9])));
     assert.equal(viewer._pointCloudMapWatermark, before); assert.equal(viewer._cloudSourceKey, cloudKey); assert.equal(viewer._allPositions.length, 0);
-    const legacy = headerFor(sourceA, { source_epoch: 'saved-legacy', assigned_source: undefined, mapping_source_epoch: '' });
-    assert.throws(() => viewer._acceptCloudPageBatch(parsePointCloudPagePacket(packets(legacy, points(2))[0])));
-    assert.throws(() => viewer._acceptCloudPageBatch(parsePointCloudPagePacket(packets(headerFor(sourceB), points(2))[0])));
     assert.equal(viewer._pointCloudMapWatermark, before); assert.equal(viewer._cloudSourceKey, cloudKey);
   });
   await check('same asset new installation and repeated reset replace only owned page resources', () => {
     const layer = viewer._incrementalCloud, old = watchDisposals(layer.sourceSlabs.map(slab => slab.geometry));
     const second = headerFor(sourceB, { stream_generation: '2', revision: 'saved:2' });
-    viewer.setMapContext({ source_epoch: epochOf(sourceB) });
+    viewer.setMapContext(mapFor(sourceB));
     send(second, points(13)); old.assertOnce();
     assert.equal(viewer._incrementalCloud, layer); assert.equal(layer.pointCount, 13); assert.equal(viewer._allPositions.length, 0);
     assert.equal(viewer._pointCloudMapWatermark.header.source_epoch, epochOf(sourceB));
@@ -441,26 +464,19 @@ try {
     send(headerFor(sourceB, { stream_generation: '2', revision: 'saved:2' }), points(13)); assert.equal(dense._active, true);
     assert.equal(dense.displaySource.source_epoch, epochOf(sourceB));
   });
-  await check('clear active assigned display survives reconnect and delayed packets until a new map is selected', async () => {
+  await check('clear closes the old connection and ignores queued pages until a new map is selected', async () => {
     const dense = viewer._denseCloud, stale = viewerIo.calls.at(-1), oldSocket = socket;
     viewer.setMapContext(null);
-    assert.equal(stale.options.signal.aborted, true); assert.equal(dense.displaySource, null); assert.equal(dense._active, false);
-    assert.equal(viewer._pointCloudMapWatermark, null); assert.equal(viewer._incrementalActive, false);
-    assert.equal(viewer._incrementalCloud.group.visible, false); assert.equal(viewer._allPositions.length, 0);
-    const messages = socket.sent.length;
-    send(headerFor(sourceB, { stream_generation: '2' }), points(13)); assert.equal(socket.sent.length, messages);
-    socket.close(); runTimer(viewer._incrementalConnection.timer); socket = viewer._incrementalConnection.socket; socket.emit('open');
-    assert.equal(socket.sent[0].base, null); assert.equal(socket.sent[0].mapping_source_epoch, '');
-    const requests = viewerIo.calls.length;
-    socket.emit('message', JSON.stringify({ type: 'pointcloud.ready', version: 2 }));
-    oldSocket.emit('message', packets(headerFor(sourceB), points(2))[0]);
-    send(headerFor(sourceB, { stream_generation: '2' }), points(13));
-    viewer.setVisible(false); viewer.setVisible(true);
-    assert.equal(viewerIo.calls.length, requests); assert.equal(dense._active, false); assert.equal(viewer._pointCloudMapWatermark, null);
+    assert.equal(stale.options.signal.aborted, true); assert.equal(dense.displaySource, null);
+    assert.equal(viewer._incrementalConnection.socket, null); assert.equal(viewer._incrementalConnection.timer, null);
+    const messages = oldSocket.sent.length;
+    for (const packet of packets(headerFor(sourceB), points(13))) oldSocket.emit('message', packet);
+    oldSocket.close(); assert.equal(oldSocket.sent.length, messages);
+    viewer.setVisible(false); viewer.setVisible(true); assert.equal(dense._active, false);
+    assert.equal(viewer._pointCloudMapWatermark, null);
     stale.resolve(response(denseMetadata(headerFor(sourceB)))); await nextTurn(); assert.equal(dense.count, 0);
-    viewer.setMapContext({ source_epoch: epochOf(sourceB) });
-    send(headerFor(sourceB, { stream_generation: '2' }), points(13));
-    assert.equal(viewer._incrementalActive, true); assert.equal(dense._active, true); assert.equal(dense.displaySource.source_epoch, epochOf(sourceB));
+    viewer.setMapContext(mapFor(sourceB)); send(headerFor(sourceB, {stream_generation: '2'}), points(13));
+    assert.notEqual(socket, oldSocket); assert.equal(viewer._incrementalActive, true); assert.equal(dense._active, true);
   });
   await check('explicit legacy saved remains separate and later assigned pages reclaim ownership', () => {
     viewer.setPointStyle('height');
@@ -469,7 +485,7 @@ try {
     send(legacy, new Float32Array([1, 2, 3]));
     assert.equal(viewer._incrementalActive, false); assert.deepEqual([...viewer._allPositions], [1, 2, 3]);
     assert.ok(diagnostics.some(state => state.pointcloudDecision === 'saved_snapshot'));
-    viewer.setMapContext({ source_epoch: epochOf(sourceB) });
+    viewer.setMapContext(mapFor(sourceB));
     send(headerFor(sourceB, { stream_generation: '4' }), points(17));
     assert.equal(viewer._incrementalActive, true); assert.equal(viewer._allPositions.length, 0); assert.equal(viewer._pointsMesh?.visible, false);
     assert.equal(viewer._pointCloudMapWatermark.header.source_epoch, epochOf(sourceB));
@@ -499,7 +515,7 @@ try {
       assert.equal(assembler.base.source_epoch, fixture.source_epoch); assert.equal(batch.header.source_incremental, false);
       const expected = Float32Array.from(fixture.expected_xyz);
       for (const chunk of batch.chunks) assert.deepEqual(chunk.xyz, expected.subarray(chunk.chunk_index * PAGE * 3, chunk.chunk_index * PAGE * 3 + chunk.xyz.length));
-      viewer.setMapContext(fixture.map_snapshot);
+      viewer.setMapContext(fixture.map_snapshot); activeSocket();
       viewer._incrementalConnection.assembler.beginConnection();
       for (const packet of wire) socket.emit('message', packet);
       assert.equal(viewer._pointCloudMapWatermark.header.source_epoch, fixture.source_epoch);

@@ -3,7 +3,7 @@ import { SemanticRegionLayer } from './semantic-regions3d.js?v=20261013-region-r
 import { SceneGraphLayer } from './scene-graph3d.js?v=20261013-graph-camera';
 import { OrbitControls } from './OrbitControls.js';
 import { PointCloudProcessor } from './pointcloud-processing.js?v=20261014-measure-reuse';
-import { IncrementalPointCloudConnection, mappingEpochFromMap, pointCloudAssignedSourceEpoch } from './pointcloud-incremental.js?v=20261006-assigned-pages';
+import { IncrementalPointCloudConnection, mappingEpochFromMap } from './pointcloud-incremental.js?v=20261006-assigned-pages';
 import { IncrementalPointCloudLayer } from './pointcloud-pages.js?v=20261002-pages';
 import { DensePointCloudLayer } from './dense-pointcloud.js?v=20261013-dense-saved-complete';
 
@@ -246,20 +246,6 @@ const POINTCLOUD_BINARY_MAGIC = Object.freeze([0x4e, 0x55, 0x57, 0x41, 0x58, 0x5
 const POINTCLOUD_BINARY_VERSION = 1;
 const POINTCLOUD_BINARY_PREFIX_BYTES = 13;
 const POINTCLOUD_BINARY_MAX_HEADER_BYTES = 64 * 1024;
-const POINTCLOUD_MAX_U64 = 18446744073709551615n;
-const POINTCLOUD_BINARY_TOPICS = new Set(['pointcloud_map.snapshot', 'pointcloud_map.live_chunk']);
-
-function pointCloudIdentityBigInt(value, fieldName) {
-  if (typeof value !== 'string' || !/^(0|[1-9]\d*)$/.test(value)) {
-    throw new Error(`${fieldName} 必须是规范十进制 u64 字符串`);
-  }
-  const parsed = BigInt(value);
-  if (parsed > POINTCLOUD_MAX_U64) {
-    throw new Error(`${fieldName} 超出 u64 范围`);
-  }
-  return parsed;
-}
-
 export function parsePointCloudMapBinaryEnvelope(buffer) {
   if (!(buffer instanceof ArrayBuffer) || buffer.byteLength < POINTCLOUD_BINARY_PREFIX_BYTES) {
     throw new Error('点云二进制信封被截断');
@@ -285,41 +271,15 @@ export function parsePointCloudMapBinaryEnvelope(buffer) {
   } catch (_) {
     throw new Error('点云 JSON header 非法');
   }
-  if (!header || typeof header !== 'object' || !POINTCLOUD_BINARY_TOPICS.has(header.topic)) {
-    throw new Error('点云 binary topic 非法');
-  }
-  if (!['live', 'saved'].includes(header.source)) throw new Error('点云 source 非法');
-  if (typeof header.source_epoch !== 'string' || !header.source_epoch) throw new Error('点云 source_epoch 缺失');
-  if (pointCloudAssignedSourceEpoch(header)) throw new Error('指定点云资产必须使用分页协议');
-  if (typeof header.revision !== 'string' || !header.revision) throw new Error('点云 revision 缺失');
-  if (typeof header.frame_id !== 'string' || !header.frame_id) throw new Error('点云 frame_id 缺失');
-  if (header.format !== 'float32-xyz-le') throw new Error('点云 format 非法');
-  const cursor = pointCloudIdentityBigInt(header.cursor, 'cursor');
-  const streamGeneration = pointCloudIdentityBigInt(header.stream_generation, 'stream_generation');
-  const revisionOrdinal = pointCloudIdentityBigInt(header.revision_ordinal, 'revision_ordinal');
-  const sourceTimestampNs = pointCloudIdentityBigInt(header.source_timestamp_ns, 'source_timestamp_ns');
-  if (!Number.isSafeInteger(header.point_count) || header.point_count < 0 || header.point_count > MAX_POINTS) {
-    throw new Error('点云 point_count 非法');
-  }
-  if (!Number.isSafeInteger(header.payload_length) || header.payload_length < 0) {
-    throw new Error('点云 payload_length 非法');
-  }
   const expectedPayloadLength = header.point_count * 12;
   if (header.payload_length !== expectedPayloadLength) throw new Error('点云 header 点数与载荷长度不一致');
   if (buffer.byteLength !== payloadOffset + header.payload_length) throw new Error('点云信封总长度不一致');
-  const payloadView = new DataView(buffer, payloadOffset, header.payload_length);
-  const xyz = new Float32Array(header.point_count * 3);
-  for (let index = 0; index < xyz.length; index += 1) {
-    const coordinate = payloadView.getFloat32(index * 4, true);
-    if (!Number.isFinite(coordinate)) throw new Error('点云 XYZ 坐标必须全部有限');
-    xyz[index] = coordinate;
-  }
+  // 旧全帧头不保证四字节对齐，切片后直接使用浮点数组。
+  const xyz = new Float32Array(buffer.slice(payloadOffset, payloadOffset + header.payload_length));
   return {
     header,
-    cursor,
-    streamGeneration,
-    revisionOrdinal,
-    sourceTimestampNs,
+    streamGeneration: BigInt(header.stream_generation),
+    revisionOrdinal: BigInt(header.revision_ordinal),
     xyz,
   };
 }
@@ -334,22 +294,14 @@ export function shouldAcceptPointCloudMapEnvelope(current, next) {
   return next.revisionOrdinal > current.revisionOrdinal;
 }
 
-function explorationOverlayInteger(value, fieldName) {
-  if (typeof value === 'number') {
-    if (!Number.isSafeInteger(value) || value < 0) throw new Error(`${fieldName} 必须是安全非负整数`);
-    return BigInt(value);
-  }
-  return pointCloudIdentityBigInt(value, fieldName);
-}
-
 export function parseExplorationOverlayIdentity(detail) {
   const raw = detail?.exploration_identity;
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  if (!raw) return null;
   return {
-    generation: explorationOverlayInteger(raw.generation, 'exploration_generation'),
-    revision: explorationOverlayInteger(raw.revision, 'exploration_revision'),
-    timestampNs: explorationOverlayInteger(raw.timestampNs, 'exploration_timestamp_ns'),
-    requestId: String(raw.requestId || ''),
+    generation: BigInt(raw.generation),
+    revision: BigInt(raw.revision),
+    timestampNs: BigInt(raw.timestampNs),
+    requestId: raw.requestId,
   };
 }
 
@@ -369,21 +321,16 @@ export function shouldAcceptExplorationOverlay(current, next) {
 }
 
 function explorationOverlayIsInactive(detail) {
+  if (typeof detail?.exploration_terminal === 'boolean') return detail.exploration_terminal;
   const status = String(detail?.exploration_status || '').toLowerCase();
   const sessionMode = String(detail?.geometry_session_mode || '').toLowerCase();
-  return detail?.exploration_terminal === true
-    || ['succeeded', 'failed', 'cancelled', 'idle'].includes(status)
+  return ['succeeded', 'failed', 'cancelled', 'idle'].includes(status)
     || (sessionMode && sessionMode !== 'explore');
 }
 
 function navigationEventMatchesExploration(detail, identity) {
   if (detail?.navigation_exploration_validated !== true || !identity) return false;
-  let eventIdentity;
-  try {
-    eventIdentity = parseExplorationOverlayIdentity(detail);
-  } catch (_) {
-    return false;
-  }
+  const eventIdentity = parseExplorationOverlayIdentity(detail);
   return eventIdentity !== null
     && eventIdentity.generation === identity.generation
     && eventIdentity.requestId === identity.requestId;
@@ -475,21 +422,17 @@ class PointCloud3DViewer extends PointCloudProcessor {
     this._assetCloudUrl = null;
     this._assetCloudSourceKey = null;
     this._assetCloudLoadingUrl = null;
+    this._mapEpoch = null;
     this._assignedMapEpoch = '';
     this._assignedContextCleared = false;
   }
 
   setMapContext(snapshot) {
     const epoch = mappingEpochFromMap(snapshot);
-    if (!epoch && (this._assignedMapEpoch || pointCloudAssignedSourceEpoch(this._pointCloudMapWatermark?.header)
-        || pointCloudAssignedSourceEpoch(this._incrementalConnection?.assembler.pending?.header))) {
-      this._assignedContextCleared = true;
-      this._invalidateCloudSource();
-    } else if (epoch) this._assignedContextCleared = false;
-    this._assignedMapEpoch = epoch.startsWith('assigned:') ? epoch : '';
-    // 元数据可先于首个页面到达；同时撤销尚未完成的无身份文件读取。
-    if (this._assignedMapEpoch && this._pointCloudMapWatermark?.header.source_epoch !== epoch
-        && (this._hasPointCloudSnapshot || this._assetCloudLoadingUrl)) this._invalidateCloudSource();
+    if (epoch !== this._mapEpoch) this._invalidateCloudSource();
+    this._mapEpoch = epoch;
+    this._assignedContextCleared = !epoch;
+    this._assignedMapEpoch = snapshot?.metadata?.identity_schema_version === 2 ? epoch : '';
     this._incrementalConnection?.setMapEpoch(epoch);
   }
 
@@ -532,16 +475,13 @@ class PointCloud3DViewer extends PointCloudProcessor {
       onError: error => this._pointCloudComputeError(String(error?.message || error)),
       onInvalidate: () => this._invalidateCloudSource(),
     });
-    this._incrementalConnection.connect();
+    if (this._mapEpoch) this._incrementalConnection.setMapEpoch(this._mapEpoch);
+    else if (this._mapEpoch === null) this._incrementalConnection.connect();
   }
 
   _acceptCloudPageBatch(batch) {
     if (this._cloudDisposed) return;
-    const assigned = pointCloudAssignedSourceEpoch(batch.header);
-    if (this._assignedContextCleared && assigned) throw new Error('指定地图已清除');
-    if (this._assignedMapEpoch && assigned !== this._assignedMapEpoch) throw new Error('点云不属于当前指定地图');
-    if (assigned && (!batch.header.reset || batch.header.source_incremental !== false
-        || batch.header.mapping_source_epoch !== assigned)) throw new Error('指定保存资产必须是同安装来源的不可变完整快照');
+    const assigned = batch.header.assigned_source;
     if (batch.header.source === 'saved' && !assigned) {
       // 明确的旧保存资产路径保留原有 LOD/楼层样式语义。
       const positions = new Float32Array(batch.header.point_count * 3);
@@ -550,7 +490,7 @@ class PointCloud3DViewer extends PointCloudProcessor {
       this._incrementalCloud?.setVisible(false);
       const header = batch.header;
       const identity = {header, streamGeneration: BigInt(header.stream_generation),
-        revisionOrdinal: BigInt(header.revision_ordinal), sourceTimestampNs: BigInt(header.source_timestamp_ns)};
+        revisionOrdinal: BigInt(header.revision_ordinal)};
       this._replaceCloudMapBuffer(positions, identity);
       window.dispatchEvent(new CustomEvent('pointcloud3d:diagnostic', {detail: {
         pointcloudDecision: 'saved_snapshot', pointcloudSourceIncremental: false,
@@ -582,7 +522,7 @@ class PointCloud3DViewer extends PointCloudProcessor {
       header.stream_generation, header.layout_generation]);
     this._lastCloudMapRevision = header.revision;
     this._pointCloudMapWatermark = {header, streamGeneration: BigInt(header.stream_generation),
-      revisionOrdinal: BigInt(header.revision_ordinal), sourceTimestampNs: BigInt(header.source_timestamp_ns)};
+      revisionOrdinal: BigInt(header.revision_ordinal)};
     this._hasPointCloudSnapshot = true;
     this._isLiveCloudMapSnapshot = header.source === 'live';
     this._pointCloudSourcePoints = header.point_count;
@@ -602,7 +542,7 @@ class PointCloud3DViewer extends PointCloudProcessor {
       pointcloudSnapshotMaterializedBytes: 0,
     }}));
     window.dispatchEvent(new CustomEvent('pointcloud3d:map-frame', {detail: {
-      source: header.source, sourceTime: header.source === 'saved' ? null : Number(BigInt(header.source_timestamp_ns) / 1000000n),
+      source: header.source, sourceTime: header.source === 'saved' ? null : Number(header.source_timestamp_ns) / 1000000,
       frameKey: `${header.stream_generation}:${header.revision_ordinal}:${header.revision}`,
       sourceKey: this._cloudSourceKey,
     }}));
@@ -1398,7 +1338,7 @@ class PointCloud3DViewer extends PointCloudProcessor {
   async loadPointCloud(url, lod = 'preview') {
     if (this._cloudDisposed) return;
     // 指定资产只能由带完整身份的页面接纳，不能回退到通用配置 PCD。
-    if (this._assignedMapEpoch || this._assignedContextCleared || pointCloudAssignedSourceEpoch(this._pointCloudMapWatermark?.header)) return;
+    if (this._assignedMapEpoch || this._assignedContextCleared || this._pointCloudMapWatermark?.header.assigned_source) return;
     // 制品标识对应不可变内容，视图切换重放同一元数据时复用已有点云。
     if (String(url).includes('/artifacts/') && this._assetCloudUrl === url && this._hasPointCloudSnapshot
         && this._cloudSourceKey === this._assetCloudSourceKey) {
@@ -1416,7 +1356,7 @@ class PointCloud3DViewer extends PointCloudProcessor {
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const buf = await resp.arrayBuffer();
       if (this._cloudDisposed || token !== this._cloudLoadToken || this._assignedMapEpoch || this._assignedContextCleared
-          || pointCloudAssignedSourceEpoch(this._pointCloudMapWatermark?.header)) return;
+          || this._pointCloudMapWatermark?.header.assigned_source) return;
       if (buf.byteLength > MAX_BUFFER_BYTES || buf.byteLength % 12 !== 0) throw new Error('点云文件超过容量或XYZ长度不完整');
       this._cloudSourceKey = JSON.stringify(['asset', url, token]);
       this._lastCloudMapRevision = null;
@@ -1442,7 +1382,7 @@ class PointCloud3DViewer extends PointCloudProcessor {
 
   appendPoints(float32Array) {
     if (this._cloudDisposed) return;
-    if (this._assignedMapEpoch || this._assignedContextCleared || pointCloudAssignedSourceEpoch(this._pointCloudMapWatermark?.header)) throw new Error('指定点云资产不接受无身份追加');
+    if (this._assignedMapEpoch || this._assignedContextCleared || this._pointCloudMapWatermark?.header.assigned_source) throw new Error('指定点云资产不接受无身份追加');
     if (float32Array.length % 3 !== 0 || this._allPositions.byteLength + float32Array.byteLength > MAX_BUFFER_BYTES) {
       throw new Error('追加点云超过显示容量或XYZ长度不完整');
     }
@@ -2879,7 +2819,7 @@ window.addEventListener('stream:pointcloud_map.binary', (e) => {
     }));
     return;
   }
-  // 完整信封通过严格解析后才确认 transport cursor；语义旧帧仍可确认传输进度。
+  // 完整信封解析后确认传输游标，同一内容的重发仍推进传输进度。
   window.dispatchEvent(new CustomEvent('stream:pointcloud_map.cursor-accepted', {
     detail: { cursor: envelope.header.cursor },
   }));
@@ -2908,7 +2848,7 @@ window.addEventListener('stream:pointcloud_map.binary', (e) => {
   window.dispatchEvent(new CustomEvent('pointcloud3d:map-frame', {
     detail: {
       source: envelope.header.source,
-      sourceTime: Number(envelope.sourceTimestampNs / 1000000n),
+      sourceTime: Number(envelope.header.source_timestamp_ns) / 1000000,
       frameKey: `${envelope.streamGeneration}:${envelope.revisionOrdinal}:${envelope.header.revision}`,
       sourceKey,
     },

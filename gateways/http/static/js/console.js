@@ -2304,7 +2304,7 @@
         // V2 boundary draw tick：每帧画完后通知 SVG overlay 同步 viewBox，
         // 这样线段跟着机器人 pose / 缩放 / pan 移动。
         if (typeof window.__nuwaxMapDrawTick === 'function') {
-          try { window.__nuwaxMapDrawTick(); } catch (_) { /* boundary 模块出错不影响主循环 */ }
+          try { window.__nuwaxMapDrawTick(); } catch (error) { console.error(error); }
         }
       }
       function pointFromFrontier(frontier) {
@@ -2749,7 +2749,7 @@
       }
       function syncPointcloud3dState() {
         if (PLANAR_PIPELINE) return;
-        window.pointcloud3d?.setMapContext(state.latestStreamFrames["map.frame"]?.payload);
+        window.pointcloud3d?.setMapContext(state.lastMapEnvelope?.data);
         const navigationFrame = state.latestStreamFrames["navigation.state"];
         const navigationContext = navigationFrame && navigationFrame.payload;
         const navigationExplorationValidated = navigationGoalMatchesExploration(
@@ -3440,7 +3440,7 @@
         openSemanticDialog(dialog);
       }
       function updateMap(envelope) {
-        if (!acceptAppliedMapIdentity(envelope)) return;
+        if (!acceptAppliedMapIdentity(envelope)) return false;
         state.lastMapEnvelope = envelope;
         const status = statusOf(envelope);
         const data = envelope.data || {};
@@ -3749,7 +3749,7 @@
       }
       function navigationContextIsPublic(context) {
         const nav = context && context.navigation_state || {};
-        const owner = Number(nav.metadata?.owner_kind || nav.metadata?.historical_navigation_identity?.owner_kind || 0);
+        const owner = Number(nav.metadata?.owner_kind || 0);
         if (owner) return owner === 1;
         const goalId = nav.current_goal_id || nav.metadata?.observed_goal_id || context?.current_goal?.goal_id;
         return state.navigationDisplay?.isPublic === true && (!goalId || goalId === state.navigationDisplay.goalId);
@@ -3778,12 +3778,6 @@
         const stateObj = context && context.navigation_state ? context.navigation_state : {};
         const stateMetadata = stateObj && stateObj.metadata ? stateObj.metadata : {};
         if (Array.isArray(stateMetadata.planned_path)) {
-          const display = state.navigationDisplay;
-          const goalId = stateObj.current_goal_id || stateMetadata.observed_goal_id || context?.current_goal?.goal_id;
-          if (stateMetadata.planned_path.length && display?.path.length && display.goalId === goalId
-            && Number(stateMetadata.path_revision) > 0 && Number(stateMetadata.path_revision) === display.pathRevision
-            && (!stateMetadata.producer_runtime_generation || Number(stateMetadata.producer_runtime_generation) === display.producer)
-            && (!stateMetadata.goal_generation || Number(stateMetadata.goal_generation) === display.generation)) return display.path;
           return stateMetadata.planned_path.map(pathPointFromValue).filter(point => point && [point.x, point.y, point.z].every(Number.isFinite));
         }
         const explorationMetadata = explorationStateMetadata(explorationContext);
@@ -3937,116 +3931,34 @@
           }
         }
         if (els.navigationPathStatus) {
-          const warning = state.navigationDisplay?.warning || "";
-          const route = !hasPath ? "" : retained ? "保留全局路线（橙色），等待执行更新" : "全局路线（浅绿） · 局部路线（青色）";
-          const text = [warning, route].filter(Boolean).join(" · ");
-          els.navigationPathStatus.dataset.level = warning ? "warn" : "";
+          const text = !hasPath ? "" : retained ? "保留全局路线（橙色），等待执行更新" : "全局路线（浅绿） · 局部路线（青色）";
           if (els.navigationPathStatus.textContent !== text) els.navigationPathStatus.textContent = text;
         }
       }
-      function navigationControlWarning(context) {
-        const nav = context?.navigation_state || {};
-        const metadata = nav.metadata || {};
-        if (metadata.ownership_retained === true && metadata.authority_current === false) {
-          return "原目标尚未结算；当前连接没有取消资格，不能确认已停车";
-        }
-        if (metadata.ownership_retained === true && metadata.dispatch_obligation?.terminal_observed === true) {
-          return "已观察到终态，仍在等待原目标的完整停车证明";
-        }
-        if (String(nav.status || "").toLowerCase() === "unconfirmed") {
-          return "目标发送结果未确认，仍需按原目标取消并确认停车";
-        }
-        return "";
-      }
       function mergeNavigationDisplay(previous, context, goal, path, clear = false) {
+        if (clear) return null;
         const nav = context?.navigation_state || {};
         const metadata = nav.metadata || {};
         const goalId = String(nav.current_goal_id || metadata.observed_goal_id || context?.current_goal?.goal_id || "");
+        const pathRevision = Number(metadata.path_revision || 0);
         const status = String(nav.status || "").toLowerCase();
         const terminal = ["succeeded", "failed", "cancelled", "timeout"].includes(status);
-        const history = metadata.authority_current === false ? metadata.historical_navigation_identity : null;
-        const ownerKind = Number(metadata.owner_kind || history?.owner_kind || 0);
-        const parentRequestId = String(metadata.parent_request_id || history?.parent_request_id || "");
-        const producer = Number(metadata.producer_runtime_generation || history?.producer_runtime_generation || 0);
-        const generation = Number(metadata.goal_generation || history?.goal_generation || 0);
-        const revision = Number(metadata.path_revision || 0);
-        const planner = Number(metadata.planner_runtime_generation || 0);
-        const terminalObserved = metadata.dispatch_obligation?.terminal_observed === true;
-        const withoutSource = metadata.command_projection_without_source === true;
-        const timestamp = withoutSource ? 0 : Date.parse(nav.updated_at || nav.timestamp || context?.timestamp || "") || 0;
-        const sameGoal = previous && goalId && previous.goalId === goalId
-          && (!producer || !previous.producer || producer === previous.producer)
-          && (!generation || !previous.generation || generation === previous.generation);
-        if (clear) return null;
-        if (previous && producer && previous.producer && producer < previous.producer) return previous;
-        if (previous && (!producer || !previous.producer || producer === previous.producer)
-          && generation && previous.generation && generation < previous.generation) return previous;
-        // 空闲/缺测快照不表示原目标已结束，也不能把保留路线显示为正在执行。
-        if (!goalId) return previous && !previous.terminal
-          ? { ...previous, localPath: [], mode: "retained" } : previous;
-        if (sameGoal && previous.terminal && !terminal) return previous;
-        // Only an already retained typed-dispatch lineage gets the narrow
-        // terminal proof upgrade gate. Ordinary terminal display stays unchanged.
-        // Planner IDs come from SystemTime: only path revisions have ordering.
-        if (terminal && previous?.dispatchObligationRetained && previous.goalId === goalId && (
-          ownerKind !== previous.ownerKind || parentRequestId !== previous.parentRequestId
-          || producer !== previous.producer || generation !== previous.generation
-          || revision < previous.revision
-          || (revision === previous.revision && planner !== previous.planner))) return previous;
+        const sameGoal = previous && previous.goalId === goalId;
         if (terminal) return {
-          goalId, ownerKind, parentRequestId, producer, generation, revision, planner,
-          terminal: true, goal: null, path: [], localPath: [], mode: "none",
+          goalId, pathRevision, terminal: true, goal: null, path: [], localPath: [], mode: "none",
           isPublic: Number(metadata.owner_kind) === 1 || (sameGoal && previous.isPublic === true),
         };
-        const base = sameGoal ? previous : null;
-        // Epoch loss revokes authority independently of execution timestamps.
-        // Preserve the last observed path instead of treating history as new proof.
-        if (base && metadata.ownership_retained === true && metadata.authority_current === false) return {
-          ...base, localPath: [], mode: base.path.length ? "retained" : "none",
-          warning: navigationControlWarning(context), authorityCurrent: false, historicalIdentity: history || null,
-        };
-        // A typed terminal-seen projection is awaiting proof, not fresh execution.
-        if (base?.terminalObserved && status !== "unconfirmed") return base;
-        const olderPath = base && revision > 0 && base.revision > revision;
-        // 迟到状态不能把较新路线切回等待颜色，也不能替换同修订的新局部轨迹。
-        if (olderPath || (base && timestamp && base.timestamp && timestamp < base.timestamp)) return base;
-        // Terminal-seen without source time must retain exact owner identity.
-        // Older paths lose; the same path requires the exact planner. A newer
-        // path may use another planner ID, including a numerically smaller one.
-        if (base && withoutSource && terminalObserved && (
-          ownerKind !== base.ownerKind || parentRequestId !== base.parentRequestId
-          || producer !== base.producer || generation !== base.generation
-          || revision < base.revision
-          || (revision === base.revision && planner !== base.planner))) return base;
-        // A late source-less command projection cannot downgrade observed execution.
-        // A lost connection authority is still visible, even after real progress.
-        if (base && withoutSource && !base.withoutSource && base.timestamp && metadata.authority_current !== false
-          && metadata.dispatch_obligation?.terminal_observed !== true) return base;
-        const nextPath = path.length ? path : (base?.path || []);
+        if (sameGoal && pathRevision < previous.pathRevision) return previous;
         const rawGoal = context?.current_goal;
-        const nextGoal = rawGoal?.goal_id && rawGoal.goal_id !== goalId ? base?.goal || null : goal || base?.goal || null;
         return {
-          goalId, ownerKind, parentRequestId,
-          producer: producer || base?.producer || 0, generation: generation || base?.generation || 0,
-          revision: Math.max(revision, base?.revision || 0),
-          planner: planner || base?.planner || 0,
-          timestamp: timestamp || base?.timestamp || 0,
-          withoutSource,
-          terminalObserved: terminalObserved || base?.terminalObserved === true,
-          dispatchObligationRetained: (metadata.ownership_retained === true && Boolean(metadata.dispatch_obligation))
-            || base?.dispatchObligationRetained === true,
-          warning: navigationControlWarning(context),
-          authorityCurrent: metadata.authority_current,
-          historicalIdentity: history || null,
-          pathRevision: path.length ? revision : (base?.pathRevision || 0),
-          terminal: false,
-          isPublic: Number(metadata.owner_kind || history?.owner_kind) === 1 || (base?.isPublic === true && !Number(metadata.owner_kind)),
-          goal: nextGoal,
-          goalData: rawGoal?.goal_id === goalId ? rawGoal : base?.goalData || null,
-          path: nextPath,
+          goalId, pathRevision, terminal: false,
+          isPublic: Number(metadata.owner_kind) === 1 || (sameGoal && previous.isPublic === true && !Number(metadata.owner_kind)),
+          goal,
+          goalData: rawGoal?.goal_id === goalId ? rawGoal : (sameGoal ? previous.goalData : null),
+          path,
           localPath: status === "running" && Array.isArray(metadata.local_path)
             ? metadata.local_path.map(pathPointFromValue).filter(point => point && [point.x, point.y, point.z].every(Number.isFinite)) : [],
-          mode: nextPath.length ? (path.length && status === "running" ? "executing" : "retained") : "none",
+          mode: path.length ? (status === "running" ? "executing" : "retained") : "none",
         };
       }
       function updateNavigation(envelope) {
@@ -4093,9 +4005,9 @@
         let explorerStatus = data.explorer_status_text
           || explorationMetadata.status_text
           || explorationMetadata.explorer_status_text;
-        const explorationTerminal = data.exploration_terminal
-          || explorationMetadata.exploration_terminal
-          || (explorationState && ["succeeded", "failed", "cancelled"].includes(String(explorationState.status || "")));
+        const explorationTerminal = explorationMetadata.exploration_terminal
+          ?? data.exploration_terminal
+          ?? (explorationState && ["succeeded", "failed", "cancelled"].includes(String(explorationState.status || "")));
         if (explorationTerminal && explorerStatus && !isTerminalExplorerStatus(explorerStatus)) {
           explorerStatus = explorationMetadata.status_text && isTerminalExplorerStatus(explorationMetadata.status_text)
             ? explorationMetadata.status_text
@@ -4160,12 +4072,9 @@
         }
         state.navigationLocalPath = state.navigationDisplay?.localPath || [];
         renderNavigationPathStatus();
-        const navigationWarning = state.navigationDisplay?.warning || "";
         const cancelButton = document.querySelector('#navigation-container [data-role="nav-cancel"]');
-        if (cancelButton) cancelButton.title = navigationWarning || "按原任务或当前权威目标取消，等待停车确认";
-        if (navigationWarning) setPill(els.navigationStatus, "unconfirmed");
+        if (cancelButton) cancelButton.title = "取消当前目标，等待停车确认";
         setKv(els.navigationMeta, [
-          ["导航责任", navigationWarning || "--"],
           ["导航", summarizeContext(data.navigation_context, "navigation_state")],
           ["探索", summarizeContext(data.exploration_context, "exploration_state")],
           ["探索器状态", explorerStatus ? normalizeExplorerStatusText(explorerStatus) : "--"],
@@ -5086,8 +4995,8 @@
           requestId: String(exploration.current_request_id || metadata.request_id || "").trim(),
           status: String(exploration.status || "").trim().toLowerCase(),
           sessionMode: String(metadata.geometry_session_mode || "").trim().toLowerCase(),
-          terminal: metadata.exploration_terminal === true
-            || ["succeeded", "failed", "cancelled"].includes(String(exploration.status || "").trim().toLowerCase()),
+          terminal: metadata.exploration_terminal
+            ?? ["succeeded", "failed", "cancelled"].includes(String(exploration.status || "").trim().toLowerCase()),
           frontierCount: Number.isSafeInteger(exploration.frontier_count) && exploration.frontier_count >= 0
             ? exploration.frontier_count
             : null,
@@ -5124,28 +5033,14 @@
         try {
           const message = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(13, 13 + headerLength)));
           const frame = message.frame;
-          const payload = frame?.payload;
-          const grid = payload?.occupancy_grid;
-          if (message.type !== "stream.frame" || frame?.topic !== "map.frame" || !grid || typeof payload.map_name !== "string" || !payload.map_name) return null;
-          const revision = window.__nuwaxMapRevision(payload.update_sequence);
-          if (!revision || ![payload.source_name, payload.source_epoch, payload.frame_id].every(value => typeof value === "string" && value.length > 0)) return null;
-          if (payload.map_name !== grid.map_id || payload.frame_id !== grid.frame_id) return null;
-          if (bytes[8] === 3 && payload.schema_version !== 2) return null;
+          const payload = frame.payload;
+          const grid = payload.occupancy_grid;
           // 版本2只作为旧格式读取，不重新计算或传播其旧摘要。
           delete payload.content_sha256;
           payload.schema_version = 2;
-          payload.update_sequence = revision;
           const cells = grid.width * grid.height;
-          // 与服务器二进制地图的16MiB载荷预算一致；不得套用JSON展示的200万格限制。
-          if (![grid.width, grid.height, cells].every(Number.isSafeInteger) || grid.width < 1 || grid.height < 1 || cells > 16 * 1024 * 1024) return null;
-          if (!Number.isFinite(grid.resolution_m) || grid.resolution_m <= 0 || !grid.frame_id || !grid.origin) return null;
-          const origin = grid.origin.position;
-          const orientation = grid.origin.orientation;
-          if (!origin || !orientation || ![origin.x, origin.y, origin.z, orientation.x, orientation.y, orientation.z, orientation.w].every(Number.isFinite)) return null;
           if (bytes.byteLength - 13 - headerLength !== cells) return null;
-          const data = new Int8Array(buffer, 13 + headerLength, cells);
-          if (data.some((value) => value < -1 || value > 100)) return null;
-          grid.data = data; // 保留已校验的字节视图，不展开为逐格 JavaScript 数字数组。
+          grid.data = new Int8Array(buffer, 13 + headerLength, cells);
           return frame;
         } catch (_) {
           return null;
@@ -5503,7 +5398,7 @@
         if (frame.topic === "robot.state") {
           updateOverviewForFrame = updateRobotStateFrame(frame);
         } else if (frame.topic === "map.frame") {
-          updateMap(envelopeFromFrame(frame));
+          if (updateMap(envelopeFromFrame(frame)) === false) return;
         } else if (frame.topic === "map.heartbeat") {
           if (updateMapHeartbeat(envelopeFromFrame(frame)) === false) return;
         } else if (frame.topic === "localization.pose") {

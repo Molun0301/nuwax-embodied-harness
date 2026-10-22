@@ -118,14 +118,38 @@ check('append and producer dense-slot swap removal preserve exact source',()=>{
   layer.apply(transaction(removed,[0]));assert.deepEqual(source(layer),removed);
   assert.equal(layer.pages.length,3);assert.equal(layer.pages[2].count,PAGE);
 });
-check('all validation is atomic including missing growth, duplicates and bad last coordinate',()=>{
+check('incomplete page transactions leave displayed buffers unchanged',()=>{
   const layer=new IncrementalPointCloudLayer(),raw=make(PAGE+5);layer.apply(transaction(raw,null,true));
   const pages=layer.pages.slice(),before=source(layer),stats=JSON.stringify(layer.stats),count=layer.pointCount;
-  const invalid=[transaction(make(PAGE*3),[2]),transaction(raw,[0,0]),transaction(raw,[0])];
-  invalid[2].chunks[0].xyz=invalid[2].chunks[0].xyz.slice();invalid[2].chunks[0].xyz[PAGE*3-1]=NaN;
+  const invalid=[transaction(make(PAGE*3),[2]),transaction(raw,[0,0])];
   for(const tx of invalid) assert.throws(()=>layer.apply(tx));
   assert.deepEqual(layer.pages,pages);assert.deepEqual(source(layer),before);assert.equal(layer.pointCount,count);assert.equal(JSON.stringify(layer.stats),stats);
   assert.throws(()=>new IncrementalPointCloudLayer().apply(transaction(raw,[1],true)),/Incomplete/);
+});
+check('non-finite points leave finite bounds, floor colors and voxels visible across page updates',()=>{
+  const finite = new Float32Array([-1, -1, 0, 1, 1, 0, 0, 0, 0.6, 0, 0, 1.2]);
+  const mixed = new Float32Array([...finite, NaN, 2, 0, 1, Infinity, 0, 0, 0, -Infinity, 0, 0, NaN]);
+  const layer = new IncrementalPointCloudLayer({config:freshConfig()});
+  layer.apply(transaction(mixed,null,true));
+  assert.deepEqual(source(layer),mixed);
+  assert.deepEqual(layer.sourceMeasurement,oracle(finite,'height').measurement);
+  assert.equal([...layer._histogram.values()].reduce((sum,entry)=>sum+entry.count,0),finite.length/3);
+  assert.ok(Number.isFinite(layer.sourceSlabs[0].geometry.boundingSphere.radius));
+  for (const style of ['singleFloor','ground','structure']) {
+    layer.setStyle(style);
+    const expected=oracle(finite,style);
+    assert.deepEqual(layer.floorContext,expected.floorContext);
+    assert.deepEqual(orderedRows(displayed(layer),cpuShaderColors(layer)),orderedRows(expected.positions,expected.colors));
+    assert.ok(displayed(layer).every(Number.isFinite));
+  }
+  layer.setStyle('height');
+  const invalid = new Float32Array([NaN, 0, 0, 0, Infinity, 0]);
+  layer.apply(transaction(invalid,[0]));
+  assert.equal(layer.measurement,null); assert.equal(layer.bounds,null); assert.equal(layer.displayedPointCount,0);
+  assert.equal(layer._histogram.size,0); assert.equal(layer._voxels.size,0);
+  layer.apply(transaction(finite,[0]));
+  equivalent(layer,finite); assert.equal(layer.displayedPointCount,finite.length/3);
+  layer.dispose();
 });
 check('prepared transactions commit once and stale preparations are revalidated',()=>{
   const layer=new IncrementalPointCloudLayer(),raw=make(PAGE*2),tx=transaction(raw,null,true),prepared=layer.prepare(tx);

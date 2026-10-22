@@ -139,9 +139,10 @@ function deliver(wire, next) {
     connection.socket.emit('message', wire[i]);
     const pending = connection.assembler.pending;
     if (pending) {
-      metrics.maxPendingBytes = Math.max(metrics.maxPendingBytes, pending.bytes);
+      const pendingBytes = pending.chunks.reduce((sum, chunk) => sum + chunk.xyz.byteLength, 0);
+      metrics.maxPendingBytes = Math.max(metrics.maxPendingBytes, pendingBytes);
       metrics.maxPendingChunks = Math.max(metrics.maxPendingChunks, pending.chunks.length);
-      assert.ok(pending.bytes <= next.byteLength); assert.ok(pending.chunks.length <= Math.ceil(next.length / 3 / PAGE));
+      assert.ok(pendingBytes <= next.byteLength); assert.ok(pending.chunks.length <= Math.ceil(next.length / 3 / PAGE));
     }
     if (i + 1 < wire.length) { assert.equal(accepted, count); assert.equal(connection.assembler.base, before); }
   }
@@ -198,9 +199,12 @@ try {
     assert.equal(connection.assembler.base, prior); assert.equal(connection.assembler.pending, null); verify();
     connection.socket.emit('message', outOfOrder[1]); assert.equal(errors, oldErrors + 1);
     deliver(outOfOrder, reference); assert.equal(connection.awaitingReset, false);
-    // Same-connection earlier generation reset must be refused, without accepting stale data.
-    const beforeStale = errors; connection.socket.emit('message', interrupted[0]);
-    assert.equal(errors, beforeStale + 1); assert.equal(connection.awaitingReset, true); verify();
+    // 实际基线错配必须请求完整重置；不再对自家完整帧重复代际排序。
+    const mismatch = packets(reference, [0]);
+    const candidate = parsePointCloudPagePacket(mismatch[0]);
+    const beforeMismatch = errors;
+    connection.socket.emit('message', encode({...candidate.header, base_revision_ordinal: '0'}, candidate.chunks[0].xyz));
+    assert.equal(errors, beforeMismatch + 1); assert.equal(connection.awaitingReset, true); verify();
     commit(reference, [], true);
   }
   commit(new Float32Array(), []); assert.equal(layer.sourceSlabs.length, 0);

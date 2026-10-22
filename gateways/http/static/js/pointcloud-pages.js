@@ -291,7 +291,8 @@ export class IncrementalPointCloudLayer {
     const bounds = EMPTY(), histogram = new Map(), voxels = withVoxels ? new Map() : null;
     for (let i = 0; i < count; i++) {
       const offset = i * 3, x = xyz[offset], y = xyz[offset + 1], z = xyz[offset + 2];
-      if (![x, y, z].every(Number.isFinite)) throw new Error('Canonical pointcloud contains non-finite XYZ');
+      // 不可显示的点不参与范围、楼层或体素统计，其余页和原始槽位照常显示。
+      if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) continue;
       extend(bounds, x, y, z);
       const bin = Math.round(z / BIN), entry = histogram.get(bin);
       if (entry) entry.count++; else histogram.set(bin, { count: 1, first: i });
@@ -305,7 +306,7 @@ export class IncrementalPointCloudLayer {
         if (raw) raw.count++; else cell.raw.set(rawKey, { x, y, z, count: 1 });
       }
     }
-    return { bounds: count ? bounds : null, histogram, voxels };
+    return { bounds: bounds[0] === Infinity ? null : bounds, histogram, voxels };
   }
   prepare(transaction) {
     if (this._disposed) throw new Error('Canonical pointcloud layer is disposed');
@@ -613,7 +614,7 @@ export class IncrementalPointCloudLayer {
     this.derivedGroup.visible = derived && !preset.denseSource;
     this.group.visible = this._visible && !preset.denseSource;
     this.measurement = derived ? measured(this._derivedExtents.bounds) : this.sourceMeasurement;
-    this.displayedPointCount = preset.denseSource ? 0 : derived ? this._slots.length : this.pointCount;
+    this.displayedPointCount = preset.denseSource || !this.measurement ? 0 : derived ? this._slots.length : this.pointCount;
     const b = this.measurement?.bounds;
     this.bounds = b ? new THREE.Sphere(new THREE.Vector3(b.center.x, b.center.y, b.center.z), b.radius) : null;
     this.uniforms.pcMode.value = preset.colorMode === 'height' ? 0 : preset.colorMode === 'mono' ? 1 : preset.colorMode === 'structure' ? 3 : 2;

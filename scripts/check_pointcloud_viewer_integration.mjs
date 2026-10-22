@@ -13,8 +13,8 @@ globalThis.WebSocket=Socket;globalThis.window=new EventTarget();Object.assign(wi
 let viewer;
 try{
  await import(pathToFileURL(path.join(temporary,'pointcloud3d.js')));
- viewer=window.pointcloud3d;assert.ok(viewer);const socket=viewer._incrementalConnection.socket;
- viewer.setMapContext({source_epoch:JSON.stringify(['map-view-v2','mapping-actual:7','display'])});socket.emit('open');socket.emit('message',JSON.stringify({type:'pointcloud.ready',version:2}));
+ viewer=window.pointcloud3d;assert.ok(viewer);
+ viewer.setMapContext({source_epoch:JSON.stringify(['map-view-v2','mapping-actual:7','display'])});const socket=viewer._incrementalConnection.socket;socket.emit('open');socket.emit('message',JSON.stringify({type:'pointcloud.ready',version:2}));
  assert.equal(socket.sent[0].mapping_source_epoch,'mapping-actual:7');
  const input=JSON.parse(fs.readFileSync(path.join(process.env.NEH_POINTCLOUD_FIXTURE_DIR||path.join(os.tmpdir(),'neh-pointcloud-fixtures'),'pointcloud_native_wire_fixtures.json'),'utf8'));
  for(const step of input){for(const encoded of step.packets){const b=Buffer.from(encoded,'base64');socket.emit('message',b.buffer.slice(b.byteOffset,b.byteOffset+b.byteLength));}assert.equal(viewer._pointCloudSourcePoints,step.point_count);}

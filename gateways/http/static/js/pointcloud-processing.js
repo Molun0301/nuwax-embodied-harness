@@ -26,6 +26,8 @@ export class PointCloudProcessor {
       const x = positions[i];
       const y = positions[i + 1];
       const z = positions[i + 2];
+      // 显示范围只由能绘制的点决定，保留原始数组中的槽位。
+      if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) continue;
       if (x < minX) minX = x;
       if (x > maxX) maxX = x;
       if (y < minY) minY = y;
@@ -33,6 +35,7 @@ export class PointCloudProcessor {
       if (z < minZ) minZ = z;
       if (z > maxZ) maxZ = z;
     }
+    if (minX === Infinity) return null;
     const center = { x: (minX + maxX) / 2, y: (minY + maxY) / 2, z: (minZ + maxZ) / 2 };
     const radius = Math.hypot(maxX - minX, maxY - minY, maxZ - minZ) / 2;
     return {
@@ -56,6 +59,7 @@ export class PointCloudProcessor {
       ? zMin + blueBandHeightM
       : zMin + range * (0.5 - 0.5 / scale);
     for (let i = 0; i < count; i++) {
+      if (!Number.isFinite(positions[i * 3 + 2])) continue;
       const t = clamp(
         (positions[i * 3 + 2] - gradientStart) * scale / range,
         0,
@@ -83,8 +87,8 @@ export class PointCloudProcessor {
     const pointCount = Math.floor(positions.length / 3);
     const analysisStride = Math.max(1, Math.ceil(pointCount / FLOOR_ANALYSIS_MAX_POINTS));
     for (let pointIndex = 0; pointIndex < pointCount; pointIndex += analysisStride) {
-      const z = positions[pointIndex * 3 + 2];
-      if (!Number.isFinite(z)) continue;
+      const offset = pointIndex * 3, x = positions[offset], y = positions[offset + 1], z = positions[offset + 2];
+      if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) continue;
       const bin = Math.round(z / FLOOR_BIN_SIZE_M);
       histogram.set(bin, (histogram.get(bin) || 0) + 1);
     }
@@ -301,6 +305,10 @@ export class PointCloudProcessor {
       return this._preparedResult(new Float32Array(0), null, null);
     }
     const sourceMeasurement = this._measurePointCloud(src);
+    if (!sourceMeasurement) {
+      this._activeFloorZ = null;
+      return this._preparedResult(new Float32Array(0), null, null);
+    }
     const floorContext = preset.floorFilter
       ? this._activeFloorContext(src, sourceMeasurement)
       : null;

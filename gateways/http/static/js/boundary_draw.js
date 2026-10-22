@@ -813,7 +813,7 @@
   }
 
   function setV2ActiveFlag(active) {
-    try { window.__nuwaxBoundaryActive = Boolean(active); } catch (_) {}
+    window.__nuwaxBoundaryActive = Boolean(active);
   }
 
   function requestMapDraw() {
@@ -848,8 +848,8 @@
       state.activePointerId = null;
       state.dragStart = null;
       state.dragCurrent = null;
-      try { window.__nuwaxMapFreeze = false; } catch (_) {}
-      try { delete window.__nuwaxMapFreezeCenter; } catch (_) {}
+      window.__nuwaxMapFreeze = false;
+      delete window.__nuwaxMapFreezeCenter;
     }
     if (state.btnToggle) {
       state.btnToggle.textContent = next ? '停止绘制' : '开始绘制';

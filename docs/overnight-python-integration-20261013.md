@@ -46,7 +46,6 @@ The scripts directory must be on PYTHONPATH because some existing script modules
 Additional checks:
 
 ```sh
-bash scripts/ci/no_ros2_residual.sh
 bash scripts/check_layering.sh
 python -B scripts/ci/check_pep604.py services/geometry/__init__.py \
   services/geometry/loop_closure_state.py services/geometry/runtime.py \

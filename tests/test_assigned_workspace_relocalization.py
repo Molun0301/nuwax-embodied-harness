@@ -15,11 +15,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import test_assigned_workspace_save as save_fixtures
-from test_assigned_activation_loader import LostReply
-from test_assigned_asset_storage import MAP_NAME
-from test_assigned_relocalization_contract import terminal_dict
-from test_assigned_workspace_save import SaveNativeStub
+import tests.test_assigned_workspace_save as save_fixtures
+from tests.conftest import LostReply
+from tests.test_assigned_asset_storage import MAP_NAME
+from tests.test_assigned_relocalization_contract import terminal_dict
+from tests.test_assigned_workspace_save import SaveNativeStub
 
 from contracts.map_activation import AssignedActivationReceipt
 from contracts.map_relocalization import (

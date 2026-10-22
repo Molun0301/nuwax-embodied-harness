@@ -208,8 +208,7 @@ class ExternalGeometryDebugObserver:
 
         调用方契约（spec 运行时核心 §外部公开入口）：
         - 仅允许在 session 边界事件入口调用；
-        - 其它调用视为 bug，CI 守门 ``scripts/ci/check_reset_call_site.py``
-          会扫描所有调用点，命中非白名单函数名即 fail。
+        - 调用方在会话边界核对重置顺序。
 
         实现：清零 ``_loop_closure_state_buffer`` + ``_explore_status_done``
         + ``_last_loop_closure_emit_monotonic`` +

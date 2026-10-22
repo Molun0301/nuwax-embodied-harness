@@ -4,7 +4,7 @@ import unittest
 from contextlib import contextmanager
 from dataclasses import replace
 
-from test_assigned_asset_storage import checkpoint_fixture
+from tests.test_assigned_asset_storage import checkpoint_fixture
 from services.geometry.checkpoint_payload import CHUNK_BYTES, FrozenPayload
 from services.geometry.mapping_backend_checkpoint_store import (
     MappingBackendCheckpointStore,

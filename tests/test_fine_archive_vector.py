@@ -7,7 +7,7 @@ from unittest.mock import patch
 from services.geometry import fine_map_archive as fine_module
 from services.geometry.fine_map_archive import validate_fine_archive as candidate
 from services.geometry.checkpoint_payload import FrozenPayload
-from fine_scalar_oracle import validate_fine_archive as oracle
+from tests.fine_scalar_oracle import validate_fine_archive as oracle
 
 U64=2**64-1
 ERROR='精细地图块观察证据错误'

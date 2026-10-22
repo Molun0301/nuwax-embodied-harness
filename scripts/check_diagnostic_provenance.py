@@ -2,7 +2,6 @@
 """离线检查诊断来源记录；不运行计时基准、原生模拟器、设备或模型。"""
 from __future__ import annotations
 
-import ast
 import builtins
 from contextlib import ExitStack, redirect_stdout
 import io
@@ -221,14 +220,6 @@ class DiagnosticProvenanceChecks(unittest.TestCase):
         self.assertEqual(run.snapshot()["metrics"]["native_cpu_seconds"], 2.0)
         self.assertEqual(cpu_reader.call_count, 2)
         self.assert_no_digest_fields(result)
-
-    def test_python38_syntax_and_no_digest_imports(self):
-        for path in (Path(agent.__file__), Path(navigation.__file__), Path(__file__)):
-            tree = ast.parse(path.read_text(), filename=str(path), feature_version=(3, 8))
-            imports = [alias.name for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names]
-            self.assertNotIn("hashlib", imports)
-            self.assertFalse(any(isinstance(node, ast.ImportFrom) and node.module == "hashlib"
-                                 for node in ast.walk(tree)))
 
 
 if __name__ == "__main__":

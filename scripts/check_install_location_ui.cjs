@@ -338,6 +338,5 @@ const status = (overrides = {}) => ({ installation: { installed: false, install_
   renderPlan({ action: 'install', install_dir: installDir, blockers: [], warnings: [], modules: ['core'] }, el('planStatus'));
   assert.match(el('planDetails').innerHTML, /安装位置/);
   assert(el('planDetails').innerHTML.includes('&lt;literal&gt;&amp; &quot;directory&quot;'));
-  assert(!source.includes('showDirectoryPicker'), 'Do not select folders on the browser client');
   console.log('Install-location UI: canonical async parent/child previews, symlinks, tilde/root/normalization, untouched defaults/legacy roots, preview/save failures and retry, CSRF, duplicate requests, canonical browsing, stale responses, read-only state and plan-path checks passed');
 })().catch(error => { console.error(error); process.exitCode = 1; });

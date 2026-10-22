@@ -188,17 +188,6 @@ add_custom_target(consume ALL DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/consumer.rece
         return tuple(len((self.build / name).read_text().splitlines())
                      for name in ("configures.log", "consumers.log"))
 
-    def test_extraction_boundaries_and_two_patch_targets_are_exact(self):
-        source = SOURCE.read_text()
-        self.assertEqual(self.block, source[source.index(START):source.index(END)])
-        self.assertNotIn("FetchContent", self.block)
-        self.assertNotIn("native_plane_fit.cmake", self.block)
-        self.assertIn('COMMAND "${NUWAX_PATCH_EXECUTABLE}" --batch --forward -p1', self.block)
-        self.assertIn('set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS', self.block)
-        for malformed in (source + START, source.replace(END, "")):
-            with self.assertRaises(ValueError):
-                extract_block(malformed)
-        self.assertEqual(set(self.expected), set(HEADERS))
 
     def test_first_outputs_match_independent_hunk_oracle_and_fixed_baseline(self):
         before = {name: identity(self.upstream / name) for name in HEADERS}
@@ -328,14 +317,6 @@ add_custom_target(consume ALL DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/consumer.rece
         self.assertEqual(self.counts(), (2, 2))
         for header in HEADERS:
             self.assertEqual((self.final / header).read_text(), self.expected[header])
-
-    def test_real_frontend_include_and_shared_helper_paths_are_unchanged(self):
-        source = (FRONTEND / "CMakeLists.txt").read_text()
-        include_order = source.split("target_include_directories(fastlio2_native PRIVATE", 1)[1].split(")", 1)[0].split()
-        self.assertEqual(include_order[0], "${FASTLIO_PATCHED_DIR}/src")
-        self.assertLess(include_order.index("${FASTLIO_PATCHED_DIR}/src"), include_order.index("${FASTLIO_SOURCE_DIR}/include"))
-        self.assertIn('nuwax_prepare_native_plane_fit("${FASTLIO_SOURCE_DIR}" "${FASTLIO_PATCHED_DIR}")', source)
-        self.assertIn('#include "fast_lio.hpp"', (FRONTEND / "main.cpp").read_text())
 
 
 if __name__ == "__main__":

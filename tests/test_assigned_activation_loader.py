@@ -1,4 +1,6 @@
 """显式 schema-2 加载边界：真实 protobuf/存储、假 RPC，不启动设备或原生进程。"""
+
+from tests.conftest import (request_dict, predecessor, ack, LostReply, LoaderStub)
 import hashlib
 import struct
 import tempfile
@@ -11,111 +13,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 import grpc
-from test_checkpoint_identity_v2 import TransferStub, dense_bytes, fine_bytes, response_fixture
+from tests.conftest import TransferStub, dense_bytes, fine_bytes, response_fixture
 
 from contracts.map_relocalization import current_assigned_relocalization_policy
 from services.geometry import geometry_runtime_provider as module
 
 pb = module.pb2
-
-
-def request_dict():
-    return {'activation_request_id': 'activate:retained', 'session_id': 'loaded:retained',
-            'map_name': 'room', 'asset_identity': {'asset_id': 'd' * 32},
-            'checkpoint_id': 'a' * 32, 'expected_runtime_generation': 7}
-
-
-def predecessor(active=False):
-    return pb.MappingSessionState(success=True, phase='ACTIVE' if active else 'IDLE', active=active,
-        session_id='predecessor' if active else '', map_name='previous' if active else '',
-        session_generation=3 if active else 0, runtime_generation=7, mapping_backend_kind='voxel')
-
-
-def ack(request, *, replay=False, available=True):
-    retained = pb.ActivationRequestMetadataV2(activation_request_id=request.activation_request_id,
-        session_id=request.session_id, map_name=request.map_name, asset_identity=request.asset_identity,
-        checkpoint_id=request.mapping_backend_checkpoint.checkpoint_id,
-        expected_runtime_generation=request.expected_runtime_generation)
-    activation = pb.InstalledActivationIdentityV2(request=retained, runtime_generation=7,
-        lifecycle_epoch=5, session_generation=6, backend_kind='voxel', backend_generation=8)
-    occupancy = deepcopy(request.mapping_backend_checkpoint.occupancy_receipt)
-    occupancy.commit_id.boot_nonce = b'Z' * 16
-    occupancy.commit_id.sequence = 20
-    occupancy.session_id = request.session_id
-    occupancy.session_generation = 6
-    occupancy.occupancy_revision = 10
-    occupancy.backend_generation = 8
-    cloud = deepcopy(request.mapping_backend_checkpoint.cloud_receipt)
-    cloud.commit_id.CopyFrom(occupancy.commit_id)
-    cloud.session_generation = 6
-    cloud.occupancy_revision = 10
-    cloud.cloud_revision = 11
-    target = pb.InstalledTargetReceiptV2(activation=activation,
-        source_cloud_member=request.mapping_backend_checkpoint.canonical_cloud_checkpoint.member_identity,
-        occupancy_receipt=occupancy, cloud_receipt=cloud)
-    policy = current_assigned_relocalization_policy()
-    policy = {key: bytes.fromhex(value) if key.endswith('parameters') else value for key, value in policy.items()}
-    return pb.MappingSessionState(success=True, phase='ACTIVE', active=True,
-        session_id=request.session_id, map_name=request.map_name, session_generation=6, revision=10,
-        idempotent_replay=replay, mapping_backend_kind='voxel', runtime_generation=7, backend_generation=8,
-        activation_request_id=request.activation_request_id, activation_receipt_schema_version=2,
-        activation_receipt_disposition=3 if replay else 2, relocalization_target_available=available,
-        activation_receipt_v2=pb.ActivationReceiptV2(request=retained, activation=activation, target=target),
-        relocalization_policy_v2=pb.RelocalizationPolicyDescriptorV2(**policy))
-
-
-class LostReply(grpc.RpcError):
-    def code(self):
-        return grpc.StatusCode.UNAVAILABLE
-
-
-class LoaderStub(TransferStub):
-    def __init__(self, response):
-        super().__init__(response)
-        self.entries.clear()
-        self.state = predecessor()
-        self.calls = []
-        self.owner = None
-        self.during = None
-        self.reply = None
-        self.error = None
-        self.cleanup_error = False
-        self.installs = 0
-
-    def visit(self, method):
-        self.calls.append(method)
-        if self.owner is not None:
-            assert not self.owner._map_state_lock.locked()
-            assert not self.owner._map_delivery_lock._is_owned()
-        if self.during is not None:
-            self.during(method)
-
-    def GetMappingState(self, request, timeout):
-        self.visit('GetMappingState')
-        return deepcopy(self.state)
-
-    def StopMapping(self, request, timeout):
-        self.visit('StopMapping')
-        assert request.session_id == self.state.session_id
-        self.state.active = False
-        self.state.phase = 'STOPPED'
-        return deepcopy(self.state)
-
-    def ActivateMap(self, request, timeout):
-        self.visit('ActivateMap')
-        self.last_request = deepcopy(request)
-        replay = self.installs > 0
-        self.installs += int(not replay)
-        self.state = ack(request, replay=replay)
-        if self.error:
-            raise self.error
-        return self.reply(request) if self.reply is not None else deepcopy(self.state)
-
-    def TransferGraphArtifact(self, request, timeout):
-        self.visit(f'Transfer:{request.action}')
-        if request.action == 5 and self.cleanup_error:
-            raise RuntimeError('release unavailable')
-        return super().TransferGraphArtifact(request, timeout)
 
 
 class AssignedActivationLoaderTests(unittest.TestCase):

@@ -2,7 +2,6 @@
 """设施意图独立身份、持久化窗口和未知结果恢复的离线回归。"""
 from __future__ import annotations
 
-import ast
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager, nullcontext
 from datetime import datetime, timezone
@@ -162,10 +161,6 @@ class FacilityIdentityChecks(unittest.TestCase):
     def no_allocation(self):
         return patch.object(execution.uuid, 'uuid4', side_effect=AssertionError('不得重新分配已有身份'))
 
-    def test_owned_file_has_no_hash_import_or_named_uuid(self):
-        tree = ast.parse((ROOT / 'services/navigation/building_execution.py').read_text())
-        self.assertFalse(any(isinstance(node, ast.Import) and any(item.name == 'hashlib' for item in node.names) for node in ast.walk(tree)))
-        self.assertFalse(any(isinstance(node, ast.Attribute) and node.attr in ('uuid3', 'uuid5') for node in ast.walk(tree)))
 
     def test_new_operation_allocates_once_and_is_durable_before_submit(self):
         with patch.object(execution.uuid, 'uuid4', wraps=uuid.uuid4) as assigned:

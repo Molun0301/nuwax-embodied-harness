@@ -4,10 +4,10 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-import test_legacy_cloud_import as legacy
-from test_legacy_cloud_import import fine_archive, inventory
-from test_assigned_activation_loader import LoaderStub
-from test_checkpoint_identity_v2 import response_fixture
+import tests.test_legacy_cloud_import as legacy
+from tests.test_legacy_cloud_import import fine_archive, inventory
+from tests.conftest import LoaderStub
+from tests.conftest import response_fixture
 from services.geometry import geometry_runtime_provider as provider
 from services.geometry import runtime as runtime_module
 from services.mapping import asset_store

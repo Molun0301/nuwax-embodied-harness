@@ -10,9 +10,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from test_assigned_activation_loader import LoaderStub, LostReply, predecessor
-from test_assigned_asset_storage import bundle_fixture, checkpoint_fixture
-from test_checkpoint_identity_v2 import response_fixture
+from tests.conftest import LoaderStub, LostReply, predecessor
+from tests.test_assigned_asset_storage import bundle_fixture, checkpoint_fixture
+from tests.conftest import response_fixture
 
 from contracts.map_identity import AssetIdentityV2
 from contracts.runtime_views import MapSnapshot

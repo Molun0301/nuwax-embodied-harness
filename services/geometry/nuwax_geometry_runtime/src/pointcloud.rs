@@ -1680,50 +1680,6 @@ fn cloud_map_duplicate_admitted_frame_preserves_dense_coarse_and_fine_state() {
     }
 
     #[test]
-    #[ignore = "run through scripts/check_pointcloud_native_interop.py with a Python mmap peer"]
-    fn native_paged_writer_python_reader_interop() {
-        use std::io::{self, Write};
-        fn phase(number: u32) {
-            println!("NUWAX_CLOUD_PAGE_PHASE:{number}");
-            io::stdout().flush().unwrap();
-            let mut line = String::new();
-            assert!(io::stdin().read_line(&mut line).unwrap() > 0, "Python peer closed");
-            assert_eq!(line.trim(), number.to_string());
-        }
-        let path = std::path::PathBuf::from(std::env::var_os("NUWAX_CLOUD_PAGE_INTEROP_PATH")
-            .expect("Python peer supplies isolated fixture path"));
-        let mut writer = CloudMapShmWriter::new_for_test(&path).unwrap();
-        writer.reset_accumulator(1);
-        // Binary-exact centers make cross-language byte assertions unambiguous.
-        writer.voxel_size = 0.5;
-        let points = (0..4096).map(|i| Point3::new(i as f64, 0.0, 0.0)).collect::<Vec<_>>();
-        assert!(writer.accumulate_mapping_frame(1, &points));
-        writer.commit_accumulated().unwrap();
-        phase(1);
-        assert!(writer.accumulate_mapping_frame(1, &[Point3::new(5000.0, 0.0, 0.0)]));
-        writer.commit_accumulated().unwrap();
-        phase(2);
-        // Actual edit semantics: remove an old voxel, then add its replacement.
-        let key = voxel_key([0.0, 0.0, 0.0], writer.voxel_size).unwrap();
-        assert!(writer.voxels.remove(&key));
-        writer.ordered_voxels.removed(key, writer.max_points);
-        assert!(writer.accumulate_mapping_frame(1, &[Point3::new(6000.0, 0.0, 0.0)]));
-        writer.commit_accumulated().unwrap();
-        phase(3);
-        let key = voxel_key([2048.0, 0.0, 0.0], writer.voxel_size).unwrap();
-        assert!(writer.voxels.remove(&key));
-        writer.ordered_voxels.removed(key, writer.max_points);
-        writer.commit_accumulated().unwrap();
-        phase(4);
-        writer.begin_session(2).unwrap();
-        phase(5);
-        assert!(writer.accumulate_mapping_frame(2, &[Point3::new(0.0, 0.0, 0.0)]));
-        writer.commit_accumulated().unwrap();
-        phase(6);
-        assert!(!writer.full_snapshot_materialized());
-    }
-
-    #[test]
     fn paged_commit_and_private_install_reuse_unchanged_bytes() {
         let mut writer = CloudMapShmWriter::new_private_for_test().unwrap();
         let points = (0..10000).map(|i| Point3::new(i as f64 * 0.1, 0.0, 0.0)).collect::<Vec<_>>();

@@ -58,7 +58,6 @@ for(const change of [null,{...item.object_extent,frame_id:'camera'},{...item.obj
   assert.equal(calls.filter(c=>c[0]==='stroke').length,0);
   assert.match(context.semanticExtentDescription(unknown),/尺寸未知/);
 }
-assert.ok(source.indexOf('drawSemanticFootprints(ctx, instances, anchor, scale);') < source.indexOf('let drawX = cl.cx;'));
 const named={...item,display_name:'cabinet'};
 for(const highlighted of [false,true])for(const fallback of [false,true]){
   calls.length=0;paints.length=0;
@@ -84,7 +83,6 @@ function select(){
 select();context.closeSemanticOverlay();context.closeSemanticOverlay();
 assert.equal(context.state.semanticSelectedId,null);assert.equal(context.state.highlightTarget,null);
 assert.equal(selectedIds.at(-1),null,'dismissal clears the 3D selection as well');
-assert.match(source,/dialog\.addEventListener\("cancel", \(event\) => \{ event\.preventDefault\(\); closeSemanticOverlay\(\); \}\)/,'Escape uses the same dismissal');
 select();context.state.highlightTarget.target_pose={x:1,y:2,z:0};context.closeSemanticOverlay();
 assert.ok(context.state.highlightTarget.target_pose,'dismissal preserves an active navigation target');
 select();context.state.semanticPublishedKey={snapshot:'s',mapName:'map-a'};

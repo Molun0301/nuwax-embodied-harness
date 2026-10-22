@@ -9,7 +9,7 @@ import unittest
 from copy import deepcopy
 from unittest.mock import Mock, patch
 
-from test_assigned_activation_catalog import receipt as old_receipt
+from tests.test_assigned_activation_catalog import receipt as old_receipt
 
 from contracts.map_activation import AssignedActivationReceipt
 from contracts.map_relocalization import current_assigned_relocalization_policy

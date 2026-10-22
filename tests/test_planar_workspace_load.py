@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import patch
 from datetime import datetime
 from typing import Dict, Optional
-import test_planar_asset_catalog as assets
+import tests.test_planar_asset_catalog as assets
 from contracts.map_workspace import MapAssetBundle
 from services.mapping.asset_store import MapAssetBundleError
 
@@ -43,7 +43,7 @@ node.body = [method for method in node.body if isinstance(method, ast.FunctionDe
 module = ast.Module(body=[ast.ImportFrom(module='__future__', names=[ast.alias(name='annotations', asname=None)], level=0, lineno=1, col_offset=0), node], type_ignores=[])
 namespace = dict(MapAssetBundle=MapAssetBundle, MapAssetBundleError=MapAssetBundleError,
     GatewayError=GatewayError, StateNamespace=core.StateNamespace, datetime=datetime)
-exec(compile(module, str(path), 'exec'), namespace)
+exec(compile(ast.fix_missing_locations(module), str(path), 'exec'), namespace)
 Workspace = namespace['MapWorkspaceService']
 
 class RecordingState:

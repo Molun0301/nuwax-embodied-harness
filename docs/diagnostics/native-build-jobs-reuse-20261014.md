@@ -1,5 +1,7 @@
 # Native build parallelism invalidation
 
+> 历史验证记录：文中一次性实验及已失效检查入口已于2026-10-22防御性编码优化中退役；下列旧命令仅说明当时证据，不作为当前运行入口。
+
 Date: 2026-10-14. Source baseline: `29591a15066de734c9f060daa1837bd8a0f5f61e`.
 
 ## Finding and scope

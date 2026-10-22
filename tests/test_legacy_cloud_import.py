@@ -313,7 +313,7 @@ class LegacyCloudImportTests(unittest.TestCase):
     def test_fine_root_helper_preserves_validator_results_and_error_order(self):
         from services.geometry import fine_map_archive as parser
         from fine_scalar_oracle import validate_fine_archive as original
-        from test_fine_archive_vector import Borrowed
+        from tests.test_fine_archive_vector import Borrowed
         def outcome(function, payload):
             try:
                 return ('ok', function(payload))

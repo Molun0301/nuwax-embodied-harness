@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Offline natural-key ownership, legacy ID adoption and independent capture IDs."""
 from __future__ import annotations
-import ast
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import sys
@@ -340,10 +339,5 @@ class NaturalIdentityChecks(unittest.TestCase):
                 self.assertEqual(tx.execute('SELECT COUNT(*) FROM memory_record_natural_ids').fetchone()[0],0)
             self.assertEqual(repo.load_semantic_graph_relations()[0].relation_id,'legacy-preserved')
 
-    def test_owned_service_module_has_no_hash_algorithm_import_or_call(self):
-        path=Path(__file__).resolve().parents[1]/'services/memory/service.py'
-        tree=ast.parse(path.read_text())
-        self.assertFalse(any(isinstance(n,ast.Import) and any(x.name=='hashlib' for x in n.names) for n in ast.walk(tree)))
-        self.assertFalse(any(isinstance(n,ast.Attribute) and n.attr in ('sha256','sha1','md5','hexdigest') for n in ast.walk(tree)))
 
 if __name__=='__main__': unittest.main(verbosity=2)

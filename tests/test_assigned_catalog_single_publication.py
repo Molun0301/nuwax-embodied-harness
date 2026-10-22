@@ -2,7 +2,7 @@
 import unittest
 from unittest.mock import patch
 
-import test_assigned_workspace_activation as fixture
+import tests.test_assigned_workspace_activation as fixture
 
 
 class CatalogSinglePublicationTests(unittest.TestCase):

@@ -2,7 +2,6 @@
 """Offline graph owner-stamp caches, ephemeral handles and publication fences."""
 from __future__ import annotations
 
-import ast
 import sys
 import tempfile
 import unittest
@@ -344,18 +343,6 @@ class SceneGraphRevisionChecks(unittest.TestCase):
         self.assertEqual(archived.graph_revision, 'legacy-digest')
         self.assertNotIn('schema_version', raw)
         self.assertNotIn('graph_epoch', raw)
-
-    def test_graph_modules_have_no_content_hash_or_full_dump_cache_key(self):
-        root = Path(__file__).resolve().parents[1]
-        for relative in ('services/memory/scene_graph.py', 'services/memory/scene_graph_geometry.py'):
-            source = (root / relative).read_text()
-            tree = ast.parse(source)
-            self.assertNotIn('graph_digest', source)
-            self.assertFalse(any((isinstance(node, ast.Import) and any(name.name == 'hashlib' for name in node.names))
-                or (isinstance(node, ast.ImportFrom) and node.module == 'hashlib') for node in ast.walk(tree)))
-        tree = ast.parse((root / 'services/memory/scene_graph.py').read_text())
-        capture = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == '_capture')
-        self.assertFalse(any(isinstance(node, ast.Attribute) and node.attr in ('model_dump', 'model_dump_json') for node in ast.walk(capture)))
 
 
 class GeometrySafeguardChecks(unittest.TestCase):

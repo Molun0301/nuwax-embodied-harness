@@ -84,7 +84,7 @@ Tests and measurement:
 - scripts/measure_checkpoint_listing.py
 
 Separate verification-only fix:
-- scripts/check_checkpoint_v2_projection.py
+- 历史检查入口已于2026-10-22退役；对应业务测试留在tests目录。
 
 
 ## Verification commands
@@ -95,7 +95,7 @@ Run from the checkout with the project dependencies available:
 PYTHONPATH=.:tests python -m unittest test_assigned_exploration_checkpoint_store test_assigned_exploration_cycle -q
 python scripts/check_navigation_file_identity.py
 python scripts/check_navigation_map_snapshot_identity.py
-python scripts/check_checkpoint_v2_projection.py
+python -m pytest -q tests/test_checkpoint_identity_v2.py
 PYTHONPATH=.:tests python -m unittest test_assigned_cloud_exchange -q
 python -m py_compile services/mapping/asset_store.py services/navigation/exploration_checkpoint.py tests/test_assigned_exploration_checkpoint_store.py scripts/measure_checkpoint_listing.py
 git diff --check

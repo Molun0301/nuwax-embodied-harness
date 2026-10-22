@@ -10,13 +10,13 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
-from test_checkpoint_identity_v2 import (
+from tests.conftest import (
     TransferStub,
     dense_bytes,
     fine_bytes,
     response_fixture,
 )
-from test_checkpoint_identity_v2 import (
+from tests.conftest import (
     runtime as provider_fixture,
 )
 

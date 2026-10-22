@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
-import test_legacy_cloud_import as fixtures
+import tests.test_legacy_cloud_import as fixtures
 
 
 class BackendQueryReached(RuntimeError):

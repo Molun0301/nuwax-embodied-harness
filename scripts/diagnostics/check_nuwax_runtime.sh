@@ -48,7 +48,6 @@ miss(){ printf '  [MISSING] %s\n' "$1"; }
 nr()  { printf '  [NOT RUN] %s\n' "$1"; }
 
 bar "1. 诊断输入"
-ok "部署后诊断不依赖未跟踪的 scripts/ci/no_ros2_residual.sh"
 printf '  deployment profile = %s\n' "${PROFILE_FILE}"
 
 bar "2. motion guard:module / UDS / durable records"

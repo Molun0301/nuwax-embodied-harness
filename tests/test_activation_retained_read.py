@@ -9,8 +9,8 @@ from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import patch
 
-import test_assigned_workspace_activation as workspace_tests
-from test_checkpoint_identity_v2 import response_fixture, fine_bytes, dense_bytes
+import tests.test_assigned_workspace_activation as workspace_tests
+from tests.conftest import response_fixture, fine_bytes, dense_bytes
 from services.geometry import geometry_runtime_provider as provider_module
 from services.geometry import mapping_backend_checkpoint_store as checkpoint
 from services.geometry.checkpoint_payload import FrozenPayload

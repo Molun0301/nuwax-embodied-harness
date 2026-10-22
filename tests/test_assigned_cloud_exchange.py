@@ -8,7 +8,7 @@ from dataclasses import replace
 from datetime import timedelta
 from unittest.mock import patch
 
-import test_assigned_asset_storage as fixtures
+import tests.test_assigned_asset_storage as fixtures
 
 from contracts.map_workspace import AssetIdentityV2, MapAsset, MapAssetBundle
 from services.geometry.mapping_backend_checkpoint_store import MappingBackendCheckpointStore

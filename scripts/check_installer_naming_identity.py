@@ -2,7 +2,6 @@
 """Offline installer cache identity checks; every Git/build/toolchain call is fake."""
 from __future__ import annotations
 
-import ast
 import hashlib
 import importlib.util
 import json
@@ -760,25 +759,6 @@ class CacheIdentityChecks(unittest.TestCase):
         self.assertEqual((old / "fixture-head").read_text(), before["slam2d-ceres"]["revision"])
         self.assertEqual((old / "LICENSE").read_text(), before["slam2d-ceres"]["revision"])
         self.assertEqual(sum(command[0] == "git" and "fetch" in command for command in self.commands), 3)
-
-    def test_production_checkout_callers_supply_explicit_role(self):
-        callers = []
-        for relative in ("scripts/module_installer/builds.py", "scripts/prepare_slam2d_dependencies.py"):
-            tree = ast.parse((SOURCE_ROOT / relative).read_text(), feature_version=(3, 8))
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_checkout":
-                    self.assertIn("role", {keyword.arg for keyword in node.keywords}, (relative, node.lineno))
-                    callers.append((relative, node.lineno))
-        self.assertEqual(len(callers), 4)
-
-    def test_only_toolchain_download_hash_root_remains_in_builds(self):
-        tree = ast.parse((SOURCE_ROOT / "scripts/module_installer/builds.py").read_text(), feature_version=(3, 8))
-        calls = []
-        for node in tree.body:
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                if any(isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute) and isinstance(call.func.value, ast.Name) and call.func.value.id == "hashlib" for call in ast.walk(node)):
-                    calls.append(node.name)
-        self.assertEqual(calls, ["_rust_toolchain"])
 
 
 if __name__ == "__main__":

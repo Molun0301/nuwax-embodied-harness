@@ -3,8 +3,8 @@ from dataclasses import replace
 import unittest
 from unittest.mock import patch
 
-from test_assigned_asset_storage import checkpoint_fixture
-from test_checkpoint_finite_scan import payload_owner
+from tests.test_assigned_asset_storage import checkpoint_fixture
+from tests.test_checkpoint_finite_scan import payload_owner
 from services.geometry.checkpoint_payload import CHUNK_BYTES, FrozenPayload
 from services.geometry import mapping_backend_checkpoint_store as store
 

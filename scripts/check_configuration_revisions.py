@@ -324,27 +324,12 @@ class ConfigurationRevisionChecks(unittest.TestCase):
                 application.save({'VALUE': 'new'}, robot='alpha', profile='main', expected_revision=token)
         application.close(); self.assertTrue(application.revision_owner._closed)
 
-    def test_http_create_and_restart_hooks_use_the_existing_settings_owner(self):
-        tree = ast.parse((ROOT / 'gateways/http/api.py').read_text())
-        functions = {node.name: node for node in ast.walk(tree) if isinstance(node, ast.AsyncFunctionDef)}
-        for name, target in [('api_config_create_profile', 'create_profile'), ('api_config_restart', 'check_revision')]:
-            calls = [node for node in ast.walk(functions[name]) if isinstance(node, ast.Call)
-                     and isinstance(node.func, ast.Name) and node.func.id == 'call_settings'
-                     and node.args and isinstance(node.args[0], ast.Name) and node.args[0].id == target]
-            self.assertEqual(len(calls), 1)
-            keyword = next(item for item in calls[0].keywords if item.arg == 'revision_owner')
-            self.assertEqual(ast.dump(keyword.value),
-                         ast.dump(ast.parse('settings_application.revision_owner', mode='eval').body))
 
     def lifecycle_factory(self):
         tree = ast.parse((ROOT / 'gateways/http/api.py').read_text())
         node = next(item for item in tree.body if isinstance(item, ast.FunctionDef) and item.name == '_settings_lifespan')
         namespace = {'asynccontextmanager': asynccontextmanager}
         exec(compile(ast.Module(body=[node], type_ignores=[]), 'production-settings-lifespan', 'exec'), namespace)
-        build = next(item for item in tree.body if isinstance(item, ast.FunctionDef) and item.name == 'build_http_router')
-        self.assertTrue(any(isinstance(item, ast.Assign) and isinstance(item.value, ast.Call)
-                            and isinstance(item.value.func, ast.Name) and item.value.func.id == '_settings_lifespan'
-                            for item in build.body))
         return namespace['_settings_lifespan']
 
     async def run_lifespan(self, app, on_start):

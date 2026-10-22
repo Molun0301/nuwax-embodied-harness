@@ -12,9 +12,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from test_assigned_activation_loader import LoaderStub
-from test_assigned_asset_storage import bundle_fixture, checkpoint_fixture
-from test_checkpoint_identity_v2 import dense_bytes, response_fixture
+from tests.conftest import LoaderStub
+from tests.test_assigned_asset_storage import bundle_fixture, checkpoint_fixture
+from tests.conftest import dense_bytes, response_fixture
 
 from contracts.map_identity import AssetIdentityV2
 from services.geometry import checkpoint_payload, dense_cloud, geometry_runtime_provider, runtime

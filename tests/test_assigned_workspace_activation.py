@@ -15,8 +15,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from test_assigned_activation_loader import LoaderStub, LostReply, ack, predecessor
-from test_assigned_asset_storage import (
+from tests.conftest import LoaderStub, LostReply, ack, predecessor
+from tests.test_assigned_asset_storage import (
     ASSET_ID,
     CHECKPOINT_ID,
     MAP_NAME,
@@ -25,7 +25,7 @@ from test_assigned_asset_storage import (
     checkpoint_fixture,
     write,
 )
-from test_checkpoint_identity_v2 import response_fixture
+from tests.conftest import response_fixture
 
 from contracts.geometry import Pose
 from contracts.map_relocalization import AssignedRelocalizationRequest, current_assigned_relocalization_policy

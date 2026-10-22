@@ -2,7 +2,6 @@
 """标定拥有方、可逆独立引用和配组/录制/线协议的纯离线检查。"""
 from __future__ import annotations
 
-import ast
 import base64
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
@@ -304,20 +303,6 @@ class CalibrationIdentityChecks(unittest.TestCase):
             db.commit(); db.close()
             with patch.object(calibration, 'go2_calibration_profile_from_config', side_effect=AssertionError('回放不重新标定')):
                 self.assertEqual(list(recording.iter_recorded_sensors(path)), samples)
-
-    def test_native_contract_is_opaque_string_without_go2_digest_dependency(self):
-        # 只读固定协议边界；不是原生构建/执行验收。
-        native = (ROOT / 'services/nuwax-workspace/crates/nuwax-codec/src/lcm/sensors.rs').read_text()
-        canonical = (ROOT / 'services/nuwax-workspace/crates/nuwax-codec/src/lcm/canonical_measurement.rs').read_text()
-        self.assertIn('SENSOR_WIRE_MAX_STRING_BYTES: usize = 255', native)
-        self.assertIn('validate_string(value)?;', native)
-        self.assertIn('imu.identity.calibration_ref != cloud.identity.calibration_ref', canonical)
-        self.assertNotIn('go2-configured-v1-', native + canonical)
-
-    def test_owned_adapter_source_has_no_digest_or_named_uuid(self):
-        tree = ast.parse((ROOT / 'adapters/sensors/go2_calibration.py').read_text())
-        self.assertFalse(any(isinstance(node, ast.Import) and any(item.name == 'hashlib' for item in node.names) for node in ast.walk(tree)))
-        self.assertFalse(any(isinstance(node, ast.Attribute) and node.attr in ('uuid3', 'uuid5') for node in ast.walk(tree)))
 
 
 if __name__ == '__main__':

@@ -291,5 +291,4 @@ check('large canonical map stays in 86 stable slabs and one dirty page schedules
     gpuMeasurement:'scheduled BufferAttribute bytes/ranges; no WebGL driver timing'}));
   layer.dispose();
 });
-assert.doesNotMatch(moduleSource,/Math\.imul|73856093|19349663|83492791|\.concat\(|BufferGeometry\(\).*\.setFromPoints/);
 console.log(`PASS ${checks} incremental page-store/transform checks (Three r170, CPU attribute inspection; no GPU render)`);

@@ -10,10 +10,10 @@ from datetime import datetime, timezone
 from unittest.mock import patch
 
 import grpc
-import test_assigned_localization_session as session_fixtures
-from test_assigned_relocalization_contract import terminal_dict
-from test_assigned_relocalization_provider import query_response
-from test_runtime_assigned_relocalization import capture, install, request_owner, runtime_owner
+import tests.test_assigned_localization_session as session_fixtures
+from tests.test_assigned_relocalization_contract import terminal_dict
+from tests.test_assigned_relocalization_provider import query_response
+from tests.test_runtime_assigned_relocalization import capture, install, request_owner, runtime_owner
 
 from contracts.map_relocalization import AssignedRelocalizationRequest, AssignedRelocalizationTerminal
 from contracts.runtime_views import LocalizationSessionStatus

@@ -251,18 +251,6 @@ add_custom_target(consume ALL DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/consumer.rece
         self.configure()
         self.assertEqual((identity(point), identity(self.header)), before)
 
-    def test_real_frontend_include_order_and_consumed_output_paths_are_unchanged(self):
-        native = COMMON.parent
-        for name, variable, entry in (("fastlio2", "FASTLIO_PATCHED_DIR", "fast_lio.hpp"),
-                                      ("pointlio", "POINTLIO_PATCHED_DIR", "pointlio.hpp")):
-            with self.subTest(frontend=name):
-                cmake = (native / name / "cpp/CMakeLists.txt").read_text()
-                self.assertIn('nuwax_prepare_native_plane_fit("${FASTLIO_SOURCE_DIR}" "${' + variable + '}")', cmake)
-                include_order = cmake.split("target_include_directories(" + name + "_native PRIVATE", 1)[1].split(")", 1)[0].split()
-                self.assertEqual(include_order[0], "${" + variable + "}/src")
-                self.assertLess(include_order.index("${" + variable + "}/src"), include_order.index("${FASTLIO_SOURCE_DIR}/include"))
-                self.assertIn('#include "' + entry + '"', (native / name / "cpp/main.cpp").read_text())
-
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

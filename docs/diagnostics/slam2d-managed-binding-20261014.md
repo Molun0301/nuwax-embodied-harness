@@ -1,5 +1,7 @@
 # Managed slam2d dependency binding
 
+> 历史验证记录：文中一次性实验及已失效检查入口已于2026-10-22防御性编码优化中退役；下列旧命令仅说明当时证据，不作为当前运行入口。
+
 Date: 2026-10-14. Coupled with [source-owned CMake build directories](slam2d-source-build-reuse-20261014.md).
 
 ## Why the source-cache correction needs this binding

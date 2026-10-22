@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-import test_assigned_workspace_relocalization as owned_fixtures
+import tests.test_assigned_workspace_relocalization as owned_fixtures
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 

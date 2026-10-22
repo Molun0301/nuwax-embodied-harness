@@ -13,9 +13,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import test_checkpoint_identity_v2 as identity
-import test_heightfield_archive as heightfield
-import test_legacy_cloud_import as legacy
+import tests.test_checkpoint_identity_v2 as identity
+import tests.test_heightfield_archive as heightfield
+import tests.test_legacy_cloud_import as legacy
 from services.geometry import geometry_runtime_provider as provider
 from services.geometry import mapping_backend_checkpoint_store as checkpoint_store
 from services.geometry.checkpoint_payload import FrozenPayload

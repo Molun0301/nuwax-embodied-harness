@@ -1,7 +1,7 @@
 """Real durable catalog evidence admission for planar and cloud, with hashes forbidden."""
 import copy
 import unittest
-import test_planar_asset_catalog as assets
+import tests.test_planar_asset_catalog as assets
 from contracts.map_activation import AssignedActivationReceipt
 from contracts.map_relocalization import current_assigned_relocalization_policy, current_assigned_planar_relocalization_policy
 

@@ -11,7 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import test_assigned_saved_cloud_sources as fixtures
+import tests.test_assigned_saved_cloud_sources as fixtures
 
 from contracts.streams import StreamFrame, StreamPayloadKind
 from gateways.runtime import GatewayRuntime, _GatewayObservedPointCloudMapSource, _GatewaySavedPointCloudMapSource

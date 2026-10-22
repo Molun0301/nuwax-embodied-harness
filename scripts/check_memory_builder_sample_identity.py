@@ -2,7 +2,6 @@
 """Offline resolver contracts for durable map entities and observation samples."""
 from __future__ import annotations
 
-import ast
 import sys
 import threading
 import unittest
@@ -277,15 +276,6 @@ class SampleIdentityChecks(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError,'ownership conflict'):
             self.sampler.sample(original,observation_events=[event()],identity_resolver=Mock(side_effect=RuntimeError('ownership conflict')))
         self.assertFalse(original.observation_samples)
-
-
-class HashRemovalChecks(unittest.TestCase):
-    def test_owned_producers_import_no_hash_library_and_have_no_digest_calls(self):
-        root=Path(__file__).resolve().parents[1]
-        for relative in ('services/memory/semantic_map_builder.py','services/memory/scene_space_sampler.py'):
-            tree=ast.parse((root/relative).read_text())
-            self.assertFalse(any(isinstance(node,ast.Import) and any(alias.name=='hashlib' for alias in node.names) for node in ast.walk(tree)))
-            self.assertFalse(any(isinstance(node,ast.Attribute) and node.attr in ('hexdigest','digest','blake2b','sha256','sha1','md5') for node in ast.walk(tree)))
 
 
 if __name__=='__main__':

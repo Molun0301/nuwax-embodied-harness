@@ -39,13 +39,8 @@ runtime_data/
 /tests/deployment/**/*.pyc
 scripts/ci/*
 # 已跟踪的工作流依赖这些检查入口，不能随本地试验脚本一起忽略。
-!scripts/ci/no_ros2_residual.sh
 !scripts/ci/check_pep604.py
 !scripts/ci/check_deployment_installer.sh
-!scripts/ci/release_gates/
-scripts/ci/release_gates/*
-!scripts/ci/release_gates/common.py
-!scripts/ci/release_gates/static_neg_gate.py
 
 # 开发文档与测试默认仅留本地；具名回归例外见下方。
 /docs/开发文档/
@@ -78,8 +73,7 @@ scripts/ci/release_gates/*
 !/docs/公开文档/双LIO建图与回环纠偏.md
 services/geometry/nuwax_geometry_runtime/src/bin/nuwax-lio-test-child.rs
 
-# 本轮本地 release gate 与格式说明不入库。
-.github/workflows/release-gates.yml
+# 本地格式说明不入库。
 services/nuwax-workspace/crates/nuwax-mapping-cli/FORMAT.md
 .vscode/
 .pytest_cache

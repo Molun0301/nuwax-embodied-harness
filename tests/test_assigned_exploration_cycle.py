@@ -15,10 +15,10 @@ from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import test_assigned_workspace_save as save_fixtures
-from test_assigned_asset_storage import MAP_NAME
-from test_assigned_workspace_relocalization import RelocalizationNativeStub
-from test_checkpoint_identity_v2 import dense_bytes, fine_bytes
+import tests.test_assigned_workspace_save as save_fixtures
+from tests.test_assigned_asset_storage import MAP_NAME
+from tests.test_assigned_workspace_relocalization import RelocalizationNativeStub
+from tests.conftest import dense_bytes, fine_bytes
 
 from contracts.map_relocalization import AssignedRelocalizationQuery, AssignedRelocalizationRequest
 from contracts.map_workspace import AssetIdentityV2

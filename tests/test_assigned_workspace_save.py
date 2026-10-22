@@ -17,10 +17,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from test_assigned_activation_loader import LostReply
-from test_assigned_asset_storage import LEGACY_BUNDLE, LEGACY_MANIFEST, LEGACY_SHA, MAP_NAME, bundle_fixture, write
-from test_assigned_workspace_activation import MemoryEndpoint, WorkspaceNativeStub
-from test_checkpoint_identity_v2 import TransferStub, response_fixture
+from tests.conftest import LostReply
+from tests.test_assigned_asset_storage import LEGACY_BUNDLE, LEGACY_MANIFEST, LEGACY_SHA, MAP_NAME, bundle_fixture, write
+from tests.test_assigned_workspace_activation import MemoryEndpoint, WorkspaceNativeStub
+from tests.conftest import TransferStub, response_fixture
 
 from contracts.geometry import Pose
 from contracts.map_workspace import AssetIdentityV2, MapAssetBundle, MapAssetStatus

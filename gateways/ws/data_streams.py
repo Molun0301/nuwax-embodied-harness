@@ -501,20 +501,6 @@ def _normalize_after_cursor(after_cursor: int, latest_cursor: int) -> int:
     return after_cursor
 
 
-def _replay_stream_frames(
-    runtime: GatewayRuntime,
-    *,
-    after_cursor: int,
-    topics: Optional[Iterable[str]],
-) -> Tuple[StreamFrame, ...]:
-    _, frames = _build_replay_batch(
-        runtime,
-        after_cursor=after_cursor,
-        topics=topics,
-    )
-    return frames
-
-
 def _build_replay_batch(
     runtime: GatewayRuntime,
     *,

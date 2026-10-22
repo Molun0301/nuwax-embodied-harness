@@ -271,10 +271,6 @@ fn canary_mapping() -> MappingAdapter {
     let mut adapter = MappingAdapter::new_with_frames(
         MappingAdapterConfig {
             resolution: 0.5,
-            width_cells: 20,
-            height_cells: 20,
-            origin_xy: (-5.0, -5.0),
-            voxel_size: 0.05,
             initial_safe_radius_meters: 2.0,
         },
         "map",
@@ -2680,7 +2676,7 @@ async fn vertical_v2_mapping_exploration_simple_planner_canary() {
     let periodic_live_pose = live_pose.clone();
     let periodic_cadence_summary = live_input_cadence_summary.clone();
     let periodic_receipt_shaper = live_input_receipt_shaper.clone();
-    let mut live_input_task = tokio::spawn(async move {
+    let live_input_task = tokio::spawn(async move {
         let mut sequence = 10_000_u64;
         let mut last_timestamp_ns = 0_u64;
         let mut acknowledged_phase = None;
@@ -4004,7 +4000,7 @@ fn acceptance_test_path(
     ordinal: u64,
     revision: i64,
 ) -> PathLedgerEntry {
-    let mut path = schema::PathEnvelope {
+    let path = schema::PathEnvelope {
         schema_version: goal.schema_version,
         session_id: goal.session_id.clone(),
         owner_kind: goal.owner_kind,

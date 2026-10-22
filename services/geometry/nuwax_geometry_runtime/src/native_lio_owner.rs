@@ -544,7 +544,6 @@ impl BoundedTail {
         self.bytes.extend(chunk.iter().copied());
     }
 
-    #[allow(dead_code)]
     fn snapshot(&self) -> Vec<u8> {
         self.bytes.iter().copied().collect()
     }
@@ -562,9 +561,9 @@ pub(crate) struct NativeProcessOwner {
     group_cleanup_confirmed: bool,
     observed_status: Option<ExitStatus>,
     reaped_status: Option<ExitStatus>,
-    #[allow(dead_code)]
+
     stdout_tail: SharedTail,
-    #[allow(dead_code)]
+
     stderr_tail: SharedTail,
     stdout_drain: Option<DrainTask>,
     stderr_drain: Option<DrainTask>,
@@ -615,23 +614,21 @@ impl NativeProcessOwner {
         })
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn pid(&self) -> u32 {
         self.pid
     }
 
-    #[allow(dead_code)]
     pub(crate) fn stdout_tail(&self) -> Vec<u8> {
         self.stdout_tail.lock().snapshot()
     }
 
-    #[allow(dead_code)]
     pub(crate) fn stderr_tail(&self) -> Vec<u8> {
         self.stderr_tail.lock().snapshot()
     }
 
     /// Returns `Some` for every exit; a native backend is expected to remain alive.
-    #[allow(dead_code)]
+
     pub(crate) fn poll_unexpected_exit(&mut self) -> Result<Option<ExitStatus>, String> {
         if let Some(status) = self.reaped_status.or(self.observed_status) {
             return Ok(Some(status));

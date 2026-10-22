@@ -1,6 +1,6 @@
 //! Exact assigned relocalization metadata for the paired production actor.
 //! This module never owns point/cloud payloads, allocates request IDs, or hashes content.
-#![cfg_attr(not(test), allow(dead_code))]
+
 
 use std::sync::{Arc, OnceLock};
 use crate::activation_contract::{InstalledActivationIdentityV2, InstalledTargetReceiptV2};
@@ -189,6 +189,7 @@ impl PartialEq for AssignedCloudRelocalizeRequestIdentityV2 {
 impl Eq for AssignedCloudRelocalizeRequestIdentityV2 {}
 
 impl AssignedCloudRelocalizeRequestIdentityV2 {
+    #[cfg(test)]
     /// Durable identities must already use the canonical normalized descriptor.
     /// Public request/query admission still accepts the defined zero timeout.
     pub(crate) fn admit_canonical(request: proto::RelocalizeRequest) -> Result<Self, String> {

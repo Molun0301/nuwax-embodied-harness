@@ -136,43 +136,6 @@ class GeometryTimestampQualityConfig:
 
 
 @dataclass
-class GeometryPointCloudPreprocessConfig:
-    """旧点云预处理声明，仅兼容保存；当前内置输入执行链不消费这些字段。"""
-
-    enabled: bool = True
-    voxel_size_m: float = 0.05
-    min_range_m: float = 0.15
-    max_range_m: float = 8.0
-    max_points_per_scan: int = 1200
-    crop_min_z_m: float = -0.6
-    crop_max_z_m: float = 1.6
-    crop_forward_min_m: float = -0.5
-    crop_forward_max_m: float = 6.0
-    crop_lateral_m: float = 3.0
-
-
-@dataclass
-class GeometryOdometryQualityConfig:
-    """平台几何里程计输入质量配置。"""
-
-    source: str = "topic_covariance"
-    require_covariance: bool = False
-    max_linear_covariance: float = 1.0
-    max_angular_covariance: float = 1.0
-
-
-@dataclass
-class GeometryTraversabilityFilterConfig:
-    """平台几何可通行过滤配置。"""
-
-    enabled: bool = True
-    max_slope_deg: float = 18.0
-    max_step_height_m: float = 0.15
-    min_traversability_score: float = 0.5
-    output_layer: str = "traversability"
-
-
-@dataclass
 class MappingOutputConfig:
     """nuwax-mapping 输出资产与诊断摘要配置。"""
 
@@ -196,12 +159,7 @@ class MappingBackendConfig:
     pcd_root: str = field(default_factory=build_default_mapping_pcd_root)
     mapping_crate: str = "nuwax-mapping"
     occupancy_projection: str = "projected_occupancy"
-    input_contract: str = "platform_geometry_inputs"
-    output_contract: str = "map_asset_bundle_geometry_asset"
     timestamp_quality: GeometryTimestampQualityConfig = field(default_factory=GeometryTimestampQualityConfig)
-    point_cloud_preprocess: GeometryPointCloudPreprocessConfig = field(default_factory=GeometryPointCloudPreprocessConfig)
-    odometry_quality: GeometryOdometryQualityConfig = field(default_factory=GeometryOdometryQualityConfig)
-    traversability_filter: GeometryTraversabilityFilterConfig = field(default_factory=GeometryTraversabilityFilterConfig)
     outputs: MappingOutputConfig = field(default_factory=MappingOutputConfig)
 
 
@@ -430,39 +388,17 @@ class PlatformGeometryConfig:
                 "imu_frame": self.frames.imu_frame,
             },
             "input_contract": {
-                "name": self.mapping.input_contract,
                 "point_cloud": {
                     "topic": self.topics.point_cloud_topic,
                     "frame": self.frames.lidar_frame,
                     "timestamp_source": self.mapping.timestamp_quality.source,
                     "max_age_sec": self.mapping.timestamp_quality.max_point_cloud_age_sec,
-                    "preprocess": {
-                        "status": "inactive",
-                        "reason": "legacy_configuration_not_consumed",
-                        "value_semantics": "requested_configuration",
-                        "enabled": self.mapping.point_cloud_preprocess.enabled,
-                        "voxel_size_m": self.mapping.point_cloud_preprocess.voxel_size_m,
-                        "min_range_m": self.mapping.point_cloud_preprocess.min_range_m,
-                        "max_range_m": self.mapping.point_cloud_preprocess.max_range_m,
-                        "max_points_per_scan": self.mapping.point_cloud_preprocess.max_points_per_scan,
-                        "crop_min_z_m": self.mapping.point_cloud_preprocess.crop_min_z_m,
-                        "crop_max_z_m": self.mapping.point_cloud_preprocess.crop_max_z_m,
-                        "crop_forward_min_m": self.mapping.point_cloud_preprocess.crop_forward_min_m,
-                        "crop_forward_max_m": self.mapping.point_cloud_preprocess.crop_forward_max_m,
-                        "crop_lateral_m": self.mapping.point_cloud_preprocess.crop_lateral_m,
-                    },
                 },
                 "odometry": {
                     "primary_topic": self.topics.odom_topic,
                     "secondary_topics": self.topics.secondary_odom_topics,
                     "frame": self.frames.odom_frame,
                     "max_age_sec": self.mapping.timestamp_quality.max_odom_age_sec,
-                    "quality": {
-                        "source": self.mapping.odometry_quality.source,
-                        "require_covariance": self.mapping.odometry_quality.require_covariance,
-                        "max_linear_covariance": self.mapping.odometry_quality.max_linear_covariance,
-                        "max_angular_covariance": self.mapping.odometry_quality.max_angular_covariance,
-                    },
                 },
                 "tf": {
                     "topic": self.topics.tf_topic,
@@ -474,31 +410,6 @@ class PlatformGeometryConfig:
                     "max_age_sec": self.mapping.timestamp_quality.max_tf_age_sec,
                     "max_sensor_skew_sec": self.mapping.timestamp_quality.max_sensor_skew_sec,
                     "require_monotonic": self.mapping.timestamp_quality.require_monotonic,
-                },
-            },
-            "preprocessing": {
-                "point_cloud": {
-                    "status": "inactive",
-                    "reason": "legacy_configuration_not_consumed",
-                    "value_semantics": "requested_configuration",
-                    "enabled": self.mapping.point_cloud_preprocess.enabled,
-                    "voxel_size_m": self.mapping.point_cloud_preprocess.voxel_size_m,
-                    "crop_z_m": (
-                        self.mapping.point_cloud_preprocess.crop_min_z_m,
-                        self.mapping.point_cloud_preprocess.crop_max_z_m,
-                    ),
-                    "crop_forward_m": (
-                        self.mapping.point_cloud_preprocess.crop_forward_min_m,
-                        self.mapping.point_cloud_preprocess.crop_forward_max_m,
-                    ),
-                    "crop_lateral_m": self.mapping.point_cloud_preprocess.crop_lateral_m,
-                },
-                "traversability_filter": {
-                    "enabled": self.mapping.traversability_filter.enabled,
-                    "max_slope_deg": self.mapping.traversability_filter.max_slope_deg,
-                    "max_step_height_m": self.mapping.traversability_filter.max_step_height_m,
-                    "min_traversability_score": self.mapping.traversability_filter.min_traversability_score,
-                    "output_layer": self.mapping.traversability_filter.output_layer,
                 },
             },
             "mapping": {
@@ -540,7 +451,6 @@ class PlatformGeometryConfig:
                 ),
             },
             "output_contract": {
-                "name": self.mapping.output_contract,
                 "database_asset_name": self.mapping.outputs.database_asset_name,
                 "pcd_asset_name": self.mapping.outputs.pcd_asset_name,
                 "occupancy_layer": self.mapping.outputs.occupancy_layer,

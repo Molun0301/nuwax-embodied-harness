@@ -1,7 +1,6 @@
-//! Small SHA-256 primitive used for persistent-state integrity.
+//! 当前生产客户端的请求摘要及恢复围栏核验使用此SHA-256实现。
 //!
-//! The workspace intentionally does not carry a direct SHA-256 dependency.
-//! This implementation follows FIPS 180-4 and is covered by standard vectors.
+//! 随批次5移除对应协议核验后再删除；现有标准向量覆盖摘要算法。
 
 const INITIAL_STATE: [u32; 8] = [
     0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
@@ -39,18 +38,6 @@ pub fn sha256(input: &[u8]) -> [u8; 32] {
         digest[index * 4..index * 4 + 4].copy_from_slice(&word.to_be_bytes());
     }
     digest
-}
-
-/// Computes a lowercase SHA-256 hexadecimal string.
-#[must_use]
-pub fn sha256_hex(input: &[u8]) -> String {
-    let digest = sha256(input);
-    let mut output = String::with_capacity(64);
-    for byte in digest {
-        use std::fmt::Write as _;
-        let _ = write!(output, "{byte:02x}");
-    }
-    output
 }
 
 /// Constant-time equality for integrity values of the same expected length.
@@ -122,14 +109,13 @@ mod tests {
 
     #[test]
     fn standard_vectors() {
-        assert_eq!(
-            sha256_hex(b""),
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        );
-        assert_eq!(
-            sha256_hex(b"abc"),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
+        for (input, expected) in [
+            (b"".as_slice(), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+            (b"abc".as_slice(), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
+        ] {
+            let actual = sha256(input).iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+            assert_eq!(actual, expected);
+        }
     }
 
     #[test]

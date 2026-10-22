@@ -181,6 +181,7 @@ impl AssignedRelocalizationTerminalQueryV2 {
 
     pub(crate) fn request(&self) -> &AssignedCloudRelocalizeRequestIdentityV2 { &self.request }
 
+    #[cfg(test)]
     pub(crate) fn to_wire(&self) -> proto::GetRelocalizationTerminalRequest {
         proto::GetRelocalizationTerminalRequest {
             schema_version: 2, request_id: self.request.request_id().to_owned(),
@@ -205,6 +206,7 @@ impl AssignedRelocalizationTerminalQueryV2 {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn validate_response(
         &self,
         response: proto::GetRelocalizationTerminalResponse,

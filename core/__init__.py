@@ -3,7 +3,7 @@
 from core.capability_registry import CapabilityRegistry, CapabilityRuntimeView, RegisteredCapability
 from core.event_bus import EventBus, EventSubscription
 from core.resource_lock import ResourceConflict, ResourceConflictError, ResourceLease, ResourceLockManager, RuntimeResource
-from core.safety_guard import SafetyGuard, WatchdogRegistration
+from core.safety_guard import SafetyGuard
 from core.state_store import StateEntry, StateNamespace, StateStore
 from core.stream_bus import StreamBus, StreamSubscription
 from core.task_manager import (
@@ -36,5 +36,4 @@ __all__ = [
     "TaskManager",
     "TaskRecord",
     "TaskTimeoutError",
-    "WatchdogRegistration",
 ]

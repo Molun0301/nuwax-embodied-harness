@@ -382,66 +382,42 @@ class AgentToolService:
         # 完整投影版本与当前限制共同决定可编码性；不缓存权限或动态注册表错误。
         return (1, public_feedback.MCP_RESULT_MAX_BYTES, agent_feedback.FULL_RESULT_MAX_BYTES)
 
-    def _task_snapshot(self, task_id: str) -> Dict[str, Any]:
+    def _task_snapshot(self, task_id: str) -> _VersionedTaskSnapshot:
         manager = self.runtime.task_manager
         try:
-            if callable(getattr(manager, "capture_task_receipt", None)):
-                # 授权在每次读取执行，不能因缓存命中而继承上一次读取者的权限。
-                capability = manager.get_task_capability_name(task_id)
-                self.access_manager.authorize_capability(self.runtime.capability_registry.get_descriptor(capability))
-                source_id, revision = manager.task_receipt_version(task_id)
-                projection_context = self._projection_context()
-                encoded = self._cached_terminal_projection((task_id, source_id, revision, projection_context))
-                if encoded is not None:
-                    return _VersionedTaskSnapshot(json.loads(encoded), source_id=source_id, revision=revision)
-                capture = manager.capture_task_receipt(task_id)
-                failure = capture.projection_failure(projection_context)
-                if failure is not None:
-                    raise GatewayError(**failure)
-                if callable(getattr(self.runtime, "get_task_snapshot", None)):
-                    snapshot = self.runtime.get_task_snapshot(task_id, captured_task=capture)
-                else:
-                    from gateways.feedback_messages import build_task_feedback
-                    snapshot = capture.snapshot()
-                    events = snapshot["events"]
-                    snapshot["feedback"] = capture.feedback(
-                        lambda: build_task_feedback(self.runtime, events[-1]) if events else None)
-                try:
-                    public = checked_json(build_mcp_tool_result(snapshot, max_total_bytes=projection_context[1])["structuredContent"],
-                                          max_bytes=projection_context[2])
-                except GatewayError as error:
-                    if (self._projection_context() == projection_context
-                            and error.error_code in {"mcp_result_unavailable", "mcp_response_too_large", "agent_payload_too_large", "agent_result_unavailable"}
-                            and len(error.message) <= 512 and set(error.details) <= {"reason", "max_bytes"}
-                            and all(type(value) in (str, int, bool, type(None))
-                                    and (not isinstance(value, str) or len(value) <= 128)
-                                    for value in error.details.values())):
-                        capture.remember_projection_failure(projection_context, {"message": error.message, "error_code": error.error_code,
-                                                            "http_status": error.http_status, "jsonrpc_code": error.jsonrpc_code,
-                                                            "details": error.details})
-                    raise
-                # 公共投影/编码都在任务锁外。缓存不可变字节，响应使用独立解码对象。
-                if public["status"]["state"] in TERMINAL_STATES and self._projection_context() == projection_context:
-                    encoded = json.dumps(public, ensure_ascii=False, allow_nan=False,
-                                         separators=(",", ":")).encode("utf-8")
-                    self._cache_terminal_projection((task_id, capture.source_id, capture.revision, projection_context), encoded)
-                return _VersionedTaskSnapshot(public, source_id=capture.source_id, revision=capture.revision)
-
-            # 兼容注入的旧只读/测试运行时；真实 AgentCallStore 不接受无版本写入。
-            with manager._lock:
-                spec = manager.get_task_spec(task_id)
-                self.access_manager.authorize_capability(self.runtime.capability_registry.get_descriptor(spec.capability_name))
-                snapshot = {"task_id": task_id, "task": spec,
-                            "status": manager.get_task_status(task_id),
-                            "events": manager.get_task_events(task_id), "result": manager.get_task_result(task_id),
-                            "error": manager.get_task_error(task_id),
-                            "error_payload": manager.get_task_error_payload(task_id)}
-                if callable(getattr(self.runtime, "get_task_snapshot", None)):
-                    snapshot = self.runtime.get_task_snapshot(task_id)
-                else:
-                    from gateways.feedback_messages import build_task_feedback
-                    events = snapshot["events"]
-                    snapshot["feedback"] = build_task_feedback(self.runtime, events[-1]) if events else None
+            # 授权在每次读取执行，不能因缓存命中而继承上一次读取者的权限。
+            capability = manager.get_task_capability_name(task_id)
+            self.access_manager.authorize_capability(self.runtime.capability_registry.get_descriptor(capability))
+            source_id, revision = manager.task_receipt_version(task_id)
+            projection_context = self._projection_context()
+            encoded = self._cached_terminal_projection((task_id, source_id, revision, projection_context))
+            if encoded is not None:
+                return _VersionedTaskSnapshot(json.loads(encoded), source_id=source_id, revision=revision)
+            capture = manager.capture_task_receipt(task_id)
+            failure = capture.projection_failure(projection_context)
+            if failure is not None:
+                raise GatewayError(**failure)
+            snapshot = self.runtime.get_task_snapshot(task_id, captured_task=capture)
+            try:
+                public = checked_json(build_mcp_tool_result(snapshot, max_total_bytes=projection_context[1])["structuredContent"],
+                                      max_bytes=projection_context[2])
+            except GatewayError as error:
+                if (self._projection_context() == projection_context
+                        and error.error_code in {"mcp_result_unavailable", "mcp_response_too_large", "agent_payload_too_large", "agent_result_unavailable"}
+                        and len(error.message) <= 512 and set(error.details) <= {"reason", "max_bytes"}
+                        and all(type(value) in (str, int, bool, type(None))
+                                and (not isinstance(value, str) or len(value) <= 128)
+                                for value in error.details.values())):
+                    capture.remember_projection_failure(projection_context, {"message": error.message, "error_code": error.error_code,
+                                                        "http_status": error.http_status, "jsonrpc_code": error.jsonrpc_code,
+                                                        "details": error.details})
+                raise
+            # 公共投影/编码都在任务锁外。缓存不可变字节，响应使用独立解码对象。
+            if public["status"]["state"] in TERMINAL_STATES and self._projection_context() == projection_context:
+                encoded = json.dumps(public, ensure_ascii=False, allow_nan=False,
+                                     separators=(",", ":")).encode("utf-8")
+                self._cache_terminal_projection((task_id, capture.source_id, capture.revision, projection_context), encoded)
+            return _VersionedTaskSnapshot(public, source_id=capture.source_id, revision=capture.revision)
         except TaskReceiptUnavailableError as exc:
             raise GatewayError(str(exc), error_code="task_receipt_unsupported", http_status=500,
                                details={"status_source": "live_task", "receipt_capture": "unsupported",
@@ -451,7 +427,6 @@ class AgentToolService:
                                error_code="not_found", http_status=404,
                                details={"status_source": "live_task", "gateway_instance_id": self.gateway_instance_id,
                                         "historical_record_path": "/api/agent/tasks/%s/record" % quote(task_id, safe="")}) from exc
-        return checked_json(build_mcp_tool_result(snapshot)["structuredContent"])
 
     def get_task(self, task_id: str) -> Dict[str, Any]:
         snapshot = self._task_snapshot(task_id)
@@ -483,9 +458,6 @@ class AgentToolService:
     def _wait_status(self, task_id: str):
         """只读授权与有界状态；普通进度唤醒不复制历史或重做完整投影。"""
         manager = self.runtime.task_manager
-        if not callable(getattr(manager, "task_receipt_header", None)):
-            snapshot = self._task_snapshot(task_id)
-            return snapshot["status"], snapshot
         try:
             header = manager.task_receipt_header(task_id)
             self.access_manager.authorize_capability(
@@ -602,13 +574,10 @@ class AgentToolService:
         self.runtime._handle_cancel_task({"task_id": task_id}, requested_by="local")
         return self.get_task(task_id)
 
-    def _save_terminal(self, snapshot: Dict[str, Any]) -> None:
+    def _save_terminal(self, snapshot: _VersionedTaskSnapshot) -> None:
         if snapshot["status"]["state"] in TERMINAL_STATES:
-            if isinstance(snapshot, _VersionedTaskSnapshot):
-                self.store.save_terminal(snapshot["task_id"], snapshot,
-                                         source_id=snapshot.receipt_source_id, revision=snapshot.receipt_revision)
-            else:
-                self.store.save_terminal(snapshot["task_id"], snapshot)
+            self.store.save_terminal(snapshot["task_id"], snapshot,
+                                     source_id=snapshot.receipt_source_id, revision=snapshot.receipt_revision)
 
     def _on_task_terminal(self, event) -> None:
         # 同步回调仅交付小型 ID，完整源读取、投影和 SQLite 均由独立拥有者处理。

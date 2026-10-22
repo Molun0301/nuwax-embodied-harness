@@ -1,7 +1,4 @@
-// Phase 6 (codex-round3 R3-4)：build_handle_for_tests 是 #[cfg(test)] 内部
-// 用的 helper,dead_code 是预期行为;needless_range_loop 与 too_many_arguments
-// 是 typed_codec 长 payload 拼接的合理选择,不强行收敛。
-#![allow(dead_code, clippy::needless_range_loop, clippy::too_many_arguments)]
+#![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
 
 //! LCM-first geometry runtime state loop。
 //!
@@ -46,7 +43,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::mapping_adapter::{
     MappingCloudSource,
-    finish_backend_retirement, MappingAdapter, MappingAdapterConfig, MappingBackendRetirement,
+    finish_backend_retirement, MappingAdapter, MappingAdapterConfig,
 };
 use crate::mapping_backend::MappingBackendSpec;
 use crate::occupancy_shm::OccupancyGridShmWriter;
@@ -499,6 +496,7 @@ impl PreparedMapRevisionEvent {
 }
 
 impl<P> MapRevisionEvent<P> {
+    #[cfg(test)]
     pub fn to_map_state(&self) -> MapState {
         MapState { width: self.width, height: self.height, resolution: self.resolution,
             origin_x: self.origin_x, origin_y: self.origin_y, frame_id: self.frame_id.clone(),
@@ -586,6 +584,7 @@ pub struct OccupancyShmSnapshot {
     pub active_slot: usize,
 }
 
+#[cfg(test)]
 fn encode_occupancy_revision(event: &MapRevisionEvent) -> Result<Vec<u8>, String> {
     encode_occupancy_revision_in_frame(event, "map")
 }
@@ -680,6 +679,7 @@ pub(crate) fn committed_map_identity_from_receipt(receipt: &crate::mapping_commi
     })
 }
 
+#[cfg(test)]
 fn exploration_costmap_from_revision(
     event: &MapRevisionEvent,
 ) -> Result<crate::explore_runtime::ExploreCostmapSnapshot, String> {
@@ -1421,6 +1421,7 @@ impl GeometryRuntimeTaskControl {
             .map_err(|error| error.detail())
     }
 
+    #[cfg(test)]
     fn register_persistent(
         &self,
         name: &'static str,
@@ -1437,39 +1438,6 @@ impl GeometryRuntimeTaskControl {
         self.register(name, GeometryTaskClass::Retained, future)
     }
 
-    pub(crate) fn register_mapping_backend_retirement(
-        &self,
-        adapter: Arc<parking_lot::Mutex<MappingAdapter>>,
-        lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
-        retirement: MappingBackendRetirement,
-    ) -> Result<(), (String, MappingBackendRetirement)> {
-        let retained = Arc::new(parking_lot::Mutex::new(Some(retirement)));
-        let task_retained = Arc::clone(&retained);
-        let task = async move {
-            let retirement = task_retained
-                .lock()
-                .take()
-                .ok_or_else(|| "mapping backend rejection retirement owner was empty".to_owned())?;
-            finish_backend_retirement(&adapter, &lifecycle_lock, Some(retirement))
-                .await
-                .map_err(|error| error.to_string())
-        };
-        let registration = Self::registration(
-            "mapping-backend-rejection-retirement",
-            GeometryTaskClass::Retained,
-            task,
-        );
-        match self.try_register(registration) {
-            Ok(()) => Ok(()),
-            Err(rejected) => {
-                let retirement = retained
-                    .lock()
-                    .take()
-                    .expect("rejected retirement registration must retain its capability");
-                Err((rejected.detail(), retirement))
-            }
-        }
-    }
 
     #[cfg(test)]
     fn register_injected_terminal(
@@ -1551,9 +1519,6 @@ impl GeometryRuntimeTaskOwner {
         }
     }
 
-    pub(crate) fn control(&self) -> GeometryRuntimeTaskControl {
-        self.control.clone()
-    }
 
     pub(crate) fn close_admission(&self) {
         self.control.close_admission();
@@ -3248,16 +3213,13 @@ pub struct GeometryRuntimeHandle {
     pub occupancy_shm: Option<Arc<parking_lot::Mutex<OccupancyGridShmWriter>>>,
     /// 与 `occupancy_shm` 同时创建的权威路径；gRPC 返回的 `ShmRef.key`
     /// 必须使用该值，不能在请求时重新读取可能已变化的环境变量。
-    pub occupancy_shm_path: Option<String>,
+    #[cfg(test)] pub occupancy_shm_path: Option<String>,
     /// Reference to the latest revision successfully committed by the sole
     /// occupancy SHM writer task.
     pub occupancy_shm_current: Arc<RwLock<Option<OccupancyShmSnapshot>>>,
     /// Exactly one background exploration scheduler belongs to the process.
     pub explore_scheduler:
         Arc<tokio::sync::Mutex<Option<crate::explore_runtime::ExploreSchedulerHandle>>>,
-    /// Monotonic generation assigned to typed runtime observations received by
-    /// the gRPC facade (for example guard-backed motion-sink health).
-    pub runtime_observation_generation: Arc<std::sync::atomic::AtomicU64>,
     /// Production-only cloneable admission token. Test facades intentionally
     /// leave this unset so they do not require a root supervisor.
     pub(crate) task_control: Option<GeometryRuntimeTaskControl>,
@@ -3495,6 +3457,7 @@ impl GeometryRuntimeHandle {
         }
     }
 
+    #[cfg(test)]
     /// Read the deprecated compatibility bit. This value is diagnostic only.
     pub fn cmd_vel_sink_ready(&self) -> bool {
         self.cmd_vel_sink_ready
@@ -3507,11 +3470,6 @@ impl GeometryRuntimeHandle {
             .store(ready, std::sync::atomic::Ordering::Release);
     }
 
-    pub fn next_runtime_observation_generation(&self) -> u64 {
-        self.runtime_observation_generation
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
-            .saturating_add(1)
-    }
 
     pub async fn shutdown_explore_scheduler(&self) -> Result<(), String> {
         if let Some(scheduler) = self.explore_scheduler.lock().await.take() {
@@ -3526,6 +3484,7 @@ impl GeometryRuntimeHandle {
     /// - adapter 未构造 → false
     /// - adapter 已构造 + occupancy revision + global frame/anchor ready → true
     /// - 缺点云、revision 或 frame contract 任一项 → false
+    #[cfg(test)]
     pub fn mapping_ready_poll(&self) -> bool {
         match &self.mapping_adapter {
             Some(adapter) => {
@@ -3542,11 +3501,6 @@ impl GeometryRuntimeHandle {
         }
     }
 
-    /// navigation 板块 readiness：必须有可用 backend，且最近收到真实
-    /// stack 的 `/nav/state` heartbeat/state。
-    pub fn nav_ready_poll(&self) -> bool {
-        self.lcm_backend_available && self.nav.stack_is_live()
-    }
 
     /// exploration 板块 readiness。
     /// Phase 7:从 `ExploreRuntimeHandle::readiness_cache` 取真实聚合
@@ -3558,6 +3512,7 @@ impl GeometryRuntimeHandle {
     /// await 内层 `tokio::Mutex`,cache 由 `ingest_costmap / start / stop
     /// / tick` 在变更状态后刷新,以及 `refresh_readiness_cache_with_backend`
     /// 在 backend 切换时刷新。
+    #[cfg(test)]
     pub fn explore_ready_poll(&self) -> bool {
         if !self.lcm_backend_available {
             return false;
@@ -3772,6 +3727,7 @@ impl ValidatedFrameBindings {
         })
     }
 
+    #[cfg(test)]
     fn from_values(
         map_frame: impl Into<String>,
         odom_frame: impl Into<String>,
@@ -3880,6 +3836,7 @@ fn base_frame_ids_semantically_equal(left: &str, right: &str) -> bool {
     true
 }
 
+#[cfg(test)]
 fn resolve_base_frame_alias(preferred: Option<&str>, legacy: Option<&str>) -> String {
     preferred
         .and_then(|value| (!value.trim().is_empty()).then(|| value.trim().to_string()))
@@ -3950,69 +3907,13 @@ fn resolve_transform(transforms: &[TransformEntry], source: &str, target: &str) 
     None
 }
 
-fn mat_to_quat(m: &Mat4) -> (f64, f64, f64, f64) {
-    let trace = m[0][0] + m[1][1] + m[2][2];
-    if trace > 0.0 {
-        let s = (trace + 1.0).sqrt() * 2.0;
-        (
-            (m[2][1] - m[1][2]) / s,
-            (m[0][2] - m[2][0]) / s,
-            (m[1][0] - m[0][1]) / s,
-            0.25 * s,
-        )
-    } else if m[0][0] > m[1][1] && m[0][0] > m[2][2] {
-        let s = (1.0 + m[0][0] - m[1][1] - m[2][2]).sqrt() * 2.0;
-        (
-            0.25 * s,
-            (m[0][1] + m[1][0]) / s,
-            (m[0][2] + m[2][0]) / s,
-            (m[2][1] - m[1][2]) / s,
-        )
-    } else if m[1][1] > m[2][2] {
-        let s = (1.0 + m[1][1] - m[0][0] - m[2][2]).sqrt() * 2.0;
-        (
-            (m[0][1] + m[1][0]) / s,
-            0.25 * s,
-            (m[1][2] + m[2][1]) / s,
-            (m[0][2] - m[2][0]) / s,
-        )
-    } else {
-        let s = (1.0 + m[2][2] - m[0][0] - m[1][1]).sqrt() * 2.0;
-        (
-            (m[0][2] + m[2][0]) / s,
-            (m[1][2] + m[2][1]) / s,
-            0.25 * s,
-            (m[0][1] - m[1][0]) / s,
-        )
-    }
-}
 
+#[cfg(test)]
 /// (x, y, z, qx, qy, qz, qw, normalized_base_frame)
 type PoseWithFrame = (f64, f64, f64, f64, f64, f64, f64, String);
 
-fn resolve_map_pose(
-    transforms: &[TransformEntry],
-    map_frame: &str,
-    base_frames: &[&str],
-) -> Option<PoseWithFrame> {
-    for base in base_frames {
-        if let Some(m) = resolve_transform(transforms, base, map_frame) {
-            let (qx, qy, qz, qw) = mat_to_quat(&m);
-            return Some((
-                m[0][3],
-                m[1][3],
-                m[2][3],
-                qx,
-                qy,
-                qz,
-                qw,
-                normalize_frame(base),
-            ));
-        }
-    }
-    None
-}
 
+#[cfg(test)]
 fn resolve_map_pose_tree(
     tree: &TfTree,
     map_frame: &str,
@@ -4068,33 +3969,11 @@ fn header_stamp_ns(header: &schema::Header) -> Option<u64> {
         .checked_add(header.stamp_nsec as u64)
 }
 
+#[cfg(test)]
 fn parse_odom_payload(payload: &[u8]) -> Option<PoseState> {
     crate::typed_codec::decode_odometry_payload(payload)
 }
 
-fn parse_pose_stamped_payload(payload: &[u8]) -> Option<PoseState> {
-    let message = decode_generated(
-        schema::POSE_STAMPED_FINGERPRINT,
-        payload,
-        schema::decode_pose_stamped,
-    )?;
-    let timestamp_ns = header_stamp_ns(&message.header)?;
-    let frame_id = normalize_frame(&message.header.frame_id);
-    if frame_id.is_empty() {
-        return None;
-    }
-    Some(PoseState {
-        x: message.pose.position[0],
-        y: message.pose.position[1],
-        z: message.pose.position[2],
-        qx: message.pose.orientation_xyzw[0],
-        qy: message.pose.orientation_xyzw[1],
-        qz: message.pose.orientation_xyzw[2],
-        qw: message.pose.orientation_xyzw[3],
-        frame_id,
-        timestamp_ns,
-    })
-}
 
 pub(crate) struct CanonicalMappingObservation {
     map_pose: PoseState,
@@ -4126,10 +4005,6 @@ fn normalized_quaternion_and_yaw(pose: &PoseState) -> Result<([f64; 4], f64), St
     Ok((quaternion, yaw))
 }
 
-fn yaw_quaternion(yaw_radians: f64) -> [f64; 4] {
-    let half_yaw = yaw_radians * 0.5;
-    [0.0, 0.0, half_yaw.sin(), half_yaw.cos()]
-}
 
 fn canonical_mapping_observation(
     transform: &crate::mapping_adapter::MapOdomTransformSnapshot,
@@ -4340,6 +4215,7 @@ fn canonical_mapping_observation_for_odom(
     canonical_mapping_observation(&transform, odom_pose, base_frame).map(|observation| (observation, rehomed))
 }
 
+#[cfg(test)]
 async fn apply_canonical_mapping_observation(
     state: &Arc<RwLock<SharedState>>,
     observation: &CanonicalMappingObservation,
@@ -5320,6 +5196,7 @@ fn canonical_isometry_near(
         && left.rotation.angle_to(&right.rotation) <= 1.0e-9
 }
 
+#[cfg(test)]
 /// 单次 /map/occupancy frame 允许的 width/height 上限(防御性)。
 ///
 /// 2000×2000 = 4M cells = 4 MiB(0.05m/cell 覆盖 100×100 m),已是物理合理
@@ -5327,11 +5204,6 @@ fn canonical_isometry_near(
 /// 决定后续 `data` 字节数,这一项炸掉会直接 175 GB。
 const OCCUPANCY_MAX_DIMENSION: u32 = 8192;
 
-/// 单次 /explore/frontiers frame 允许的最大 frontier 条目数(防御性上限)。
-///
-/// 与 `TF_MAX_ENTRIES_PER_FRAME` 同源:防止异常帧的 count 字段触发
-/// Vec::with_capacity 申请上百 GB。
-const FRONTIERS_MAX_ENTRIES_PER_FRAME: usize = 16384;
 
 /// 单次 /tf frame 允许的最大 transform 条目数(防御性上限)。
 ///
@@ -5355,6 +5227,7 @@ fn parse_tf_payload(payload: &[u8]) -> Option<Vec<TransformEntry>> {
     Some(transforms)
 }
 
+#[cfg(test)]
 fn parse_occupancy_payload(payload: &[u8]) -> Option<MapState> {
     let message = decode_generated(
         schema::OCCUPANCY_GRID_FINGERPRINT,
@@ -5402,8 +5275,8 @@ fn parse_occupancy_payload(payload: &[u8]) -> Option<MapState> {
 struct ParsedPointCloudPayload {
     data: Vec<u8>,
     point_step: u32,
-    frame_id: String,
-    timestamp_ns: u64,
+    #[cfg(test)] frame_id: String,
+    #[cfg(test)] timestamp_ns: u64,
 }
 
 fn parse_pointcloud_payload(payload: &[u8]) -> Option<ParsedPointCloudPayload> {
@@ -5412,7 +5285,8 @@ fn parse_pointcloud_payload(payload: &[u8]) -> Option<ParsedPointCloudPayload> {
         payload,
         schema::decode_point_cloud2,
     )?;
-    let timestamp_ns = header_stamp_ns(&message.header)?;
+    let _timestamp_ns = header_stamp_ns(&message.header)?;
+    #[cfg(test)]
     let frame_id = message.header.frame_id.clone();
     let point_step = u32::try_from(message.point_step).ok()?;
     // 防御性 sanity cap:见 POINTCLOUD_MAX_POINT_STEP_BYTES 注释。
@@ -5479,8 +5353,8 @@ fn parse_pointcloud_payload(payload: &[u8]) -> Option<ParsedPointCloudPayload> {
     Some(ParsedPointCloudPayload {
         data: message.data,
         point_step,
-        frame_id,
-        timestamp_ns,
+        #[cfg(test)] frame_id,
+        #[cfg(test)] timestamp_ns: _timestamp_ns,
     })
 }
 
@@ -5568,34 +5442,7 @@ fn attempt_real_lcm_startup<T, E>(
     }
 }
 
-fn parse_expected_typed_channel(
-    channel: &str,
-    expected_type: &str,
-) -> Result<(LcmTopic, LcmMessageType), String> {
-    let (topic, suffix) = crate::nav_runtime::parse_channel_with_suffix(channel)?;
-    let suffix = suffix.ok_or_else(|| format!("typed channel {channel} 缺少 #message suffix"))?;
-    let actual = LcmMessageType::new(&suffix)
-        .map_err(|error| format!("typed channel {channel} message type 无效: {error}"))?;
-    let expected = LcmMessageType::new(expected_type)
-        .map_err(|error| format!("expected message type {expected_type} 无效: {error}"))?;
-    if actual != expected {
-        return Err(format!(
-            "typed channel {channel} 的 message type={}，期望 {}",
-            actual.fqn(),
-            expected.fqn()
-        ));
-    }
-    Ok((topic, actual))
-}
 
-fn binding_for_key(
-    key: ChannelKey,
-    expected_type: &str,
-) -> Result<(LcmTopic, LcmMessageType), String> {
-    let (topic, suffix) = channel_registry::channel_for_with_suffix(key);
-    let suffix = suffix.ok_or_else(|| format!("channel_for_with_suffix({key:?}) 缺少 suffix"))?;
-    parse_expected_typed_channel(&format!("{}#{suffix}", topic.channel()), expected_type)
-}
 
 #[derive(Clone)]
 struct SharedStatePoseProvider {
@@ -5700,6 +5547,7 @@ struct ExploreNavigationBridge {
     cmd_vel_sink_ready: Arc<std::sync::atomic::AtomicBool>,
     nav: crate::nav_runtime::NavRuntimeState,
     exploration_producer_epoch: Arc<std::sync::atomic::AtomicU64>,
+    #[cfg(test)]
     runtime_observation_generation: Arc<std::sync::atomic::AtomicU64>,
     orphan_cancellations: Arc<crate::explore_runtime::OrphanCancellationRegistry>,
     #[cfg(not(test))]
@@ -5783,10 +5631,9 @@ impl ExploreNavigationBridge {
             mapping_adapter: self.mapping_adapter.clone(),
             mapping_lifecycle_lock: self.mapping_lifecycle_lock.clone(),
             occupancy_shm: None,
-            occupancy_shm_path: None,
+            #[cfg(test)] occupancy_shm_path: None,
             occupancy_shm_current: Arc::new(RwLock::new(None)),
             explore_scheduler: Arc::new(tokio::sync::Mutex::new(None)),
-            runtime_observation_generation: self.runtime_observation_generation.clone(),
             task_control: self.geometry_task_control(),
         }
     }
@@ -6743,17 +6590,6 @@ fn exploration_navigation_terminal_result(
     }
 }
 
-fn spawn_cancel_timeout_task(
-    nav: crate::nav_runtime::NavRuntimeState,
-    state: Arc<RwLock<SharedState>>,
-    nav_state_tx: broadcast::Sender<NavigationUpdate>,
-    explore: crate::explore_runtime::ExploreRuntimeHandle,
-) -> JoinHandle<()> {
-    let future = cancel_timeout_future(nav, state, nav_state_tx, explore);
-    tokio::spawn(async move {
-        let _ = future.await;
-    })
-}
 
 fn cancel_timeout_future(
     nav: crate::nav_runtime::NavRuntimeState,
@@ -6775,6 +6611,7 @@ fn cancel_timeout_future(
     })
 }
 
+#[cfg(test)]
 fn spawn_path_envelope_consumer(
     transport: LcmTransport,
     nav: crate::nav_runtime::NavRuntimeState,
@@ -6839,11 +6676,6 @@ fn stable_frontier_id(value: &str) -> i64 {
     hash as i64
 }
 
-fn encode_frontier_snapshot(
-    snapshot: &crate::explore_runtime::FrontierSnapshot,
-) -> Result<Vec<u8>, String> {
-    encode_frontier_snapshot_in_frame(snapshot, "map")
-}
 
 fn encode_frontier_snapshot_in_frame(
     snapshot: &crate::explore_runtime::FrontierSnapshot,
@@ -6898,6 +6730,7 @@ fn encode_frontier_snapshot_in_frame(
     .map_err(|error| format!("encode frontier snapshot failed: {error}"))
 }
 
+#[cfg(test)]
 fn spawn_map_revision_coalescer(
     map_revision_rx: broadcast::Receiver<MapRevisionEvent>,
     map_revision_latest_tx: watch::Sender<Option<MapRevisionEvent>>,
@@ -6926,6 +6759,7 @@ enum OccupancyShmCommitMode {
     },
 }
 
+#[cfg(test)]
 fn spawn_map_revision_coalescer_in_frame(
     map_revision_rx: broadcast::Receiver<MapRevisionEvent>,
     map_revision_latest_tx: watch::Sender<Option<MapRevisionEvent>>,
@@ -7162,6 +6996,7 @@ fn map_revision_coalescer_future_in_frame(
     })
 }
 
+#[cfg(test)]
 fn spawn_map_revision_fanout(
     map_revision_rx: broadcast::Receiver<MapRevisionEvent>,
     map_revision_latest_tx: watch::Sender<Option<MapRevisionEvent>>,
@@ -7195,6 +7030,7 @@ fn spawn_map_revision_fanout(
     )
 }
 
+#[cfg(test)]
 fn spawn_map_revision_fanout_in_frame(
     map_revision_rx: broadcast::Receiver<MapRevisionEvent>,
     map_revision_latest_tx: watch::Sender<Option<MapRevisionEvent>>,
@@ -7496,22 +7332,6 @@ fn map_revision_fanout_futures_in_frame(
     vec![coalescer_task, lcm_task, explore_task]
 }
 
-fn spawn_forbidden_zone_watcher(
-    state: Arc<RwLock<SharedState>>,
-    mapping_adapter: Arc<parking_lot::Mutex<MappingAdapter>>,
-    map_revision_tx: broadcast::Sender<MapRevisionEvent>,
-    mapping_lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
-) -> JoinHandle<()> {
-    let future = forbidden_zone_watcher_future(
-        state,
-        mapping_adapter,
-        map_revision_tx,
-        mapping_lifecycle_lock,
-    );
-    tokio::spawn(async move {
-        let _ = future.await;
-    })
-}
 
 fn forbidden_zone_watcher_future(
     state: Arc<RwLock<SharedState>>,
@@ -7556,23 +7376,8 @@ fn forbidden_zone_watcher_future(
     })
 }
 
-fn spawn_frontier_fanout(
-    explore: crate::explore_runtime::ExploreRuntimeHandle,
-    state: Arc<RwLock<SharedState>>,
-    frontiers_tx: broadcast::Sender<Vec<FrontierEntry>>,
-    transport: LcmTransport,
-    frontier_binding: Option<(LcmTopic, LcmMessageType)>,
-) -> JoinHandle<()> {
-    spawn_frontier_fanout_in_frame(
-        explore,
-        state,
-        frontiers_tx,
-        transport,
-        frontier_binding,
-        Arc::from("map"),
-    )
-}
 
+#[cfg(test)]
 fn spawn_frontier_fanout_in_frame(
     explore: crate::explore_runtime::ExploreRuntimeHandle,
     state: Arc<RwLock<SharedState>>,
@@ -7707,6 +7512,7 @@ impl PublicTfHistory {
     }
 }
 
+#[cfg(test)]
 /// Observe public TF frames for navigation telemetry without granting the
 /// public channel write authority over canonical geometry state.
 async fn observe_public_tf_stream(
@@ -8432,13 +8238,6 @@ impl PreparedGeometryRuntime {
     }
 }
 
-pub(crate) fn prepare_geometry_runtime(
-    backend: LcmBackendKind,
-) -> Result<PreparedGeometryRuntime, RealLcmBackendUnavailable> {
-    let pipeline = nuwax_nav_stack::ProductionPipeline::from_env()
-        .map_err(|error| RealLcmBackendUnavailable::configuration(error.to_string()))?;
-    prepare_geometry_runtime_for_pipeline(backend, pipeline)
-}
 
 /// 使用预检捕获的完整链路，不在分配资源后重新读取导航配置。
 pub(crate) fn prepare_geometry_runtime_for_pipeline(
@@ -8571,6 +8370,7 @@ pub async fn spawn_geometry_runtime(
         ))
         .into());
     }
+    #[cfg(test)]
     let runtime_observation_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     info!(
@@ -8827,10 +8627,9 @@ pub async fn spawn_geometry_runtime(
         mapping_adapter: mapping_adapter.clone(),
         mapping_lifecycle_lock: mapping_lifecycle_lock.clone(),
         occupancy_shm: occupancy_shm.clone(),
-        occupancy_shm_path: occupancy_shm_path.clone(),
+        #[cfg(test)] occupancy_shm_path: occupancy_shm_path.clone(),
         occupancy_shm_current: occupancy_shm_current.clone(),
         explore_scheduler: explore_scheduler.clone(),
-        runtime_observation_generation: runtime_observation_generation.clone(),
         task_control: Some(task_control.clone()),
     };
 
@@ -9020,7 +8819,7 @@ pub async fn spawn_geometry_runtime(
             cmd_vel_sink_ready,
             nav: handle.nav.clone(),
             exploration_producer_epoch: explore_runtime.producer_epoch_projection(),
-            runtime_observation_generation,
+            #[cfg(test)] runtime_observation_generation,
             orphan_cancellations: explore_runtime.orphan_cancellation_registry(),
             #[cfg(not(test))]
             task_control: Some(task_control.clone()),
@@ -10881,6 +10680,7 @@ fn latest_canonical_cloud_publication(
     )))
 }
 
+#[cfg(test)]
 async fn publish_latest_canonical_cloud_map(
     transport: &LcmTransport,
     writer: &Arc<parking_lot::Mutex<Option<CloudMapShmWriter>>>,
@@ -11659,6 +11459,7 @@ async fn handoff_lio_odometry_inner(
     Ok(true)
 }
 
+#[cfg(test)]
 /// 接纳已注册到地图坐标的实时LIO点云；返回值表示点被接纳，不表示本帧一定发布新修订。
 /// 发布节流期间仍保留已接纳点，等后续候选按原有地图/共享内存边界发布。
 ///
@@ -11686,6 +11487,7 @@ pub(crate) async fn handoff_registered_lio_cloud(
     .await
 }
 
+#[cfg(test)]
 pub(crate) async fn handoff_registered_lio_cloud_fenced(
     handle: &GeometryRuntimeHandle,
     points: &[nalgebra::Point3<f64>],
@@ -12536,6 +12338,7 @@ async fn registered_lio_read_only_correction_frame(
     })
 }
 
+#[cfg(test)]
 async fn handoff_registered_lio_cloud_inner(
     handle: &GeometryRuntimeHandle,
     points: &[nalgebra::Point3<f64>],
@@ -12664,6 +12467,7 @@ async fn publish_registered_lio_commit(
     .await
 }
 
+#[cfg(test)]
 /// Phase 3: 把 LCM `/odom` 与 `/lidar/points` typed channel 喂给 mapping adapter。
 ///
 /// MappingAdapter 是 occupancy revision 的唯一 writer；`/map/occupancy` 仅为
@@ -12902,9 +12706,8 @@ fn spawn_mapping_feed_tasks(
 /// TTL=0 限制在本机；不同组播组和端口隔离默认生产总线，但不是安全沙箱，
 /// 不能阻止显式加入同一测试端点的本机进程。有限端口空间也不保证跨进程唯一。
 ///
-/// 不加 `#[cfg(test)]`:函数本身只返回 String(无 test-only 依赖),
-/// 公开供 `build_handle_for_tests` 跨 #[cfg(test)] 模块引用,且允许 binary
-/// 在测试场景外显式构造测试 URL 用。
+/// 仅供本地组件测试构造隔离端点。
+#[cfg(test)]
 pub fn test_lcm_url() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -12912,6 +12715,7 @@ pub fn test_lcm_url() -> String {
     test_lcm_url_for(std::process::id(), counter)
 }
 
+#[cfg(test)]
 fn test_lcm_url_for(pid: u32, counter: u64) -> String {
     const PORT_COUNT: u64 = 16_384;
     let offset = (u64::from(pid) * 257 + counter % PORT_COUNT) % PORT_COUNT;
@@ -12944,6 +12748,7 @@ mod test_lcm_endpoint_tests {
     }
 }
 
+#[cfg(test)]
 /// 单元测试 helper:构造一个最简 `GeometryRuntimeHandle`。
 ///
 /// 不会启动订阅任务,只提供 real-lcm backend(test_lcm_url 隔离端口) +
@@ -12958,12 +12763,14 @@ pub async fn build_handle_for_tests() -> Result<GeometryRuntimeHandle, RealLcmBa
     build_handle_for_tests_with_cloud_writer(true, None).await
 }
 
+#[cfg(test)]
 /// 构造测试句柄并显式禁用 cloud-map writer，覆盖 fail-closed 路径。
 pub async fn build_handle_for_tests_without_cloud_writer(
 ) -> Result<GeometryRuntimeHandle, RealLcmBackendUnavailable> {
     build_handle_for_tests_with_cloud_writer(false, None).await
 }
 
+#[cfg(test)]
 async fn build_handle_for_tests_with_cloud_writer(
     with_cloud_writer: bool,
     backend_override: Option<crate::mapping_backend::MappingBackendSpec>,
@@ -13059,6 +12866,7 @@ pub(crate) async fn build_handle_for_tests_with_unit_transport(
 
 // The optional transport is exclusively for separately named in-process unit
 // tests. Existing real-LCM integration constructors always pass None.
+#[cfg(test)]
 async fn build_test_handle_parts(
     with_cloud_writer: bool,
     backend_override: Option<crate::mapping_backend::MappingBackendSpec>,
@@ -13074,6 +12882,7 @@ async fn build_test_handle_parts(
     }
 }
 
+#[cfg(test)]
 async fn build_test_handle_parts_owned(
     with_cloud_writer: bool,
     backend_override: Option<crate::mapping_backend::MappingBackendSpec>,
@@ -13203,10 +13012,9 @@ async fn build_test_handle_parts_owned(
         mapping_adapter,
         mapping_lifecycle_lock,
         occupancy_shm,
-        occupancy_shm_path,
+        #[cfg(test)] occupancy_shm_path,
         occupancy_shm_current,
         explore_scheduler: Arc::new(tokio::sync::Mutex::new(None)),
-        runtime_observation_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         task_control: None,
     })
 }
@@ -14186,10 +13994,6 @@ pub(crate) mod mapping_feed_tests {
     fn mapping_config() -> MappingAdapterConfig {
         MappingAdapterConfig {
             resolution: 0.5,
-            width_cells: 20,
-            height_cells: 20,
-            origin_xy: (-5.0, -5.0),
-            voxel_size: 0.05,
             initial_safe_radius_meters: 0.0,
         }
     }
@@ -21059,7 +20863,6 @@ mod typed_navigation_feedback_tests {
                 id: lease.session_id.clone(),
                 frame_id: "map".to_string(),
                 target: PoseState::default(),
-                accepted_at_ns: 1,
                 lease: lease.clone(),
             });
         }
@@ -21164,7 +20967,6 @@ mod typed_navigation_feedback_tests {
                     id: lease_b.session_id.clone(),
                     frame_id: "map".to_string(),
                     target: PoseState::default(),
-                    accepted_at_ns: 1,
                     lease: lease_b.clone(),
                 });
             }
@@ -21206,7 +21008,6 @@ mod typed_navigation_feedback_tests {
                     id: lease_b.session_id.clone(),
                     frame_id: "map".to_string(),
                     target: PoseState::default(),
-                    accepted_at_ns: 1,
                     lease: lease_b.clone(),
                 });
             }
@@ -21443,7 +21244,6 @@ mod typed_navigation_feedback_tests {
                 id: lease.session_id.clone(),
                 frame_id: "map".to_string(),
                 target: PoseState::default(),
-                accepted_at_ns: 1,
                 lease: lease.clone(),
             });
         }
@@ -21671,7 +21471,6 @@ mod typed_navigation_feedback_tests {
                 id: lease.session_id.clone(),
                 frame_id: "map".to_string(),
                 target: PoseState::default(),
-                accepted_at_ns: 1,
                 lease,
             });
         }
@@ -21703,7 +21502,6 @@ mod typed_navigation_feedback_tests {
                 id: lease.session_id.clone(),
                 frame_id: "map".to_string(),
                 target: PoseState::default(),
-                accepted_at_ns: 1,
                 lease: lease.clone(),
             });
         });
@@ -21765,7 +21563,6 @@ mod typed_navigation_feedback_tests {
                 id: lease_a.session_id.clone(),
                 frame_id: "map".to_string(),
                 target: PoseState::default(),
-                accepted_at_ns: 1,
                 lease: lease_a.clone(),
             });
         }
@@ -21824,7 +21621,6 @@ mod typed_navigation_feedback_tests {
             id: lease_b.session_id.clone(),
             frame_id: "map".to_string(),
             target: PoseState::default(),
-            accepted_at_ns: 2,
             lease: lease_b.clone(),
         };
         let nav_b = handle.nav.clone();
@@ -21881,7 +21677,6 @@ mod typed_navigation_feedback_tests {
                 id: lease.session_id.clone(),
                 frame_id: "map".to_string(),
                 target: PoseState::default(),
-                accepted_at_ns: 1,
                 lease: lease.clone(),
             });
         }
@@ -21922,7 +21717,7 @@ mod typed_navigation_feedback_tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(nav.active_goal_lease().await.unwrap().path_revision, 0);
 
-        let mut path = schema::PathEnvelope {
+        let path = schema::PathEnvelope {
             schema_version: schema::NAVIGATION_ENVELOPE_SCHEMA_VERSION,
             session_id: lease.session_id.clone(),
             owner_kind: lease.owner_kind,
@@ -25605,7 +25400,7 @@ mod payload_sanity_tests {
 
     use super::{
         parse_occupancy_payload, parse_pointcloud_payload, parse_tf_payload,
-        FRONTIERS_MAX_ENTRIES_PER_FRAME, OCCUPANCY_MAX_DIMENSION, TF_MAX_ENTRIES_PER_FRAME,
+        OCCUPANCY_MAX_DIMENSION, TF_MAX_ENTRIES_PER_FRAME,
     };
     use nuwax_codec::lcm::schema;
 
@@ -25680,9 +25475,6 @@ mod payload_sanity_tests {
         // 这里改用 const_assertions 风格:`const _: () = assert!(...);` 是
         // 编译期验证,运行时无开销。
         const _: () = assert!(TF_MAX_ENTRIES_PER_FRAME > 0 && TF_MAX_ENTRIES_PER_FRAME < 1_000_000);
-        const _: () = assert!(
-            FRONTIERS_MAX_ENTRIES_PER_FRAME > 0 && FRONTIERS_MAX_ENTRIES_PER_FRAME < 1_000_000
-        );
         const _: () = assert!(OCCUPANCY_MAX_DIMENSION > 0 && OCCUPANCY_MAX_DIMENSION < 100_000);
         const _: () =
             assert!((OCCUPANCY_MAX_DIMENSION as usize).saturating_pow(2) < 100 * 1024 * 1024);

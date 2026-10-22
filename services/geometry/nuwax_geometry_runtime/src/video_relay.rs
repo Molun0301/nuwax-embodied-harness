@@ -1,4 +1,4 @@
-#![allow(dead_code, clippy::uninlined_format_args)]
+#![allow(clippy::uninlined_format_args)]
 
 use memmap2::MmapMut;
 use nix::fcntl::{Flock, FlockArg};
@@ -11,11 +11,13 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{fence, AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard};
+#[cfg(test)]
+use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
-use tracing::{error, info};
+use tracing::error;
 
 const SHM_MAGIC: u64 = 0x4E55_5741_5856_4944;
 const SHM_VERSION: u32 = 1;
@@ -62,26 +64,11 @@ const CLEANUP_RENAME_ATTEMPTS: usize = 32;
 
 static CLEANUP_NAME_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-#[repr(C)]
-struct ShmHeader {
-    magic: u64,
-    version: u32,
-    _pad0: u32,
-    sequence: u64,
-    frame_size: u32,
-    width: u16,
-    height: u16,
-    timestamp_ns: u64,
-    active_buffer: u32,
-    _pad1: [u8; 20],
-}
 
 #[derive(Clone)]
+#[cfg(test)]
 pub struct VideoRelayHandle {
-    pub shm_path: PathBuf,
-    pub uds_path: PathBuf,
     pub sequence: Arc<AtomicU64>,
-    pub notify: Arc<Notify>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -746,7 +733,6 @@ impl OwnedEntry {
         if !self.identity_matches(&initial) {
             return VideoRelayPathCleanup::ReplacementPreserved;
         }
-        maybe_pause_before_cleanup_quarantine(&self.anchor.public_path, self.role);
 
         let quarantine = match reserve_cleanup_name(&self.anchor.directory, self.role) {
             Ok(name) => name,
@@ -1272,6 +1258,7 @@ mod process_helper {
                 .store(sequence, Ordering::Release);
         }
 
+        #[cfg(test)]
         pub(super) fn helper_phase(&self) -> u32 {
             self.atomic_u32(CONTROL_HELPER_PHASE_OFFSET)
                 .load(Ordering::Acquire)
@@ -1301,11 +1288,13 @@ mod process_helper {
             }
         }
 
+        #[cfg(test)]
         pub(super) fn add_test_fault(&self, mask: u64) {
             self.atomic_u64(CONTROL_TEST_FAULTS_OFFSET)
                 .fetch_or(mask, Ordering::AcqRel);
         }
 
+        #[cfg(test)]
         pub(super) fn resume_test_gate(&self) {
             self.atomic_u32(CONTROL_TEST_RESUME_OFFSET)
                 .store(1, Ordering::Release);
@@ -3450,6 +3439,7 @@ mod process_helper {
             self.shared.request_stop(deadline)
         }
 
+        #[cfg(test)]
         pub(super) fn try_terminal(&self) -> Option<VideoRelayTerminal> {
             self.shared.terminal_signal.try_get()
         }
@@ -4233,177 +4223,12 @@ pub fn run_requested_helper() -> io::Result<bool> {
     Ok(true)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RelayPhase {
-    Open,
-    Stopping,
-    Terminal,
-}
 
-struct RelayState {
-    phase: RelayPhase,
-    next_claim: u64,
-    active_claim: Option<u64>,
-    committed_sequence: u64,
-}
 
-struct FrameClaim {
-    id: u64,
-}
 
-struct RelayControl {
-    state: Mutex<RelayState>,
-    stop_requested: AtomicBool,
-    wake: Condvar,
-}
 
-impl RelayControl {
-    fn new() -> Self {
-        Self {
-            state: Mutex::new(RelayState {
-                phase: RelayPhase::Open,
-                next_claim: 0,
-                active_claim: None,
-                committed_sequence: 0,
-            }),
-            stop_requested: AtomicBool::new(false),
-            wake: Condvar::new(),
-        }
-    }
 
-    fn request_stop(&self) -> bool {
-        let mut state = lock_unpoisoned(&self.state);
-        let first = state.phase == RelayPhase::Open;
-        if first {
-            state.phase = RelayPhase::Stopping;
-        }
-        self.stop_requested.store(true, Ordering::Release);
-        drop(state);
-        self.wake.notify_all();
-        first
-    }
 
-    fn is_stop_requested(&self) -> bool {
-        self.stop_requested.load(Ordering::Acquire)
-    }
-
-    fn wait_poll_interval(&self) {
-        if self.is_stop_requested() {
-            return;
-        }
-        let state = lock_unpoisoned(&self.state);
-        let _ = self
-            .wake
-            .wait_timeout_while(state, ACCEPT_POLL_INTERVAL, |state| {
-                state.phase == RelayPhase::Open
-            });
-    }
-
-    fn claim_frame(&self) -> Result<FrameClaim, ()> {
-        let mut state = lock_unpoisoned(&self.state);
-        if state.phase != RelayPhase::Open || state.active_claim.is_some() {
-            return Err(());
-        }
-        state.next_claim = state.next_claim.wrapping_add(1);
-        let claim = FrameClaim {
-            id: state.next_claim,
-        };
-        state.active_claim = Some(claim.id);
-        Ok(claim)
-    }
-
-    fn abandon_claim(&self, claim: &FrameClaim) {
-        let mut state = lock_unpoisoned(&self.state);
-        if state.active_claim == Some(claim.id) {
-            state.active_claim = None;
-        }
-    }
-
-    fn commit_frame(
-        &self,
-        claim: FrameClaim,
-        mmap: &mut MmapMut,
-        payload: &[u8],
-        sequence: &AtomicU64,
-        fault_key: &Path,
-    ) -> Result<u64, VideoRelayFailure> {
-        maybe_pause_before_commit(fault_key);
-        let mut state = lock_unpoisoned(&self.state);
-        if state.phase != RelayPhase::Open || state.active_claim != Some(claim.id) {
-            if state.active_claim == Some(claim.id) {
-                state.active_claim = None;
-            }
-            return Err(VideoRelayFailure::new(
-                "提交视频帧",
-                io::ErrorKind::Interrupted,
-                "视频停止已在线性化点先于帧提交",
-            ));
-        }
-
-        let sequence_number = state.committed_sequence.wrapping_add(1);
-        let active_buffer = (sequence_number % 2) as u32;
-        let buffer_offset = HEADER_SIZE + active_buffer as usize * MAX_FRAME_SIZE;
-        mmap[buffer_offset..buffer_offset + payload.len()].copy_from_slice(payload);
-        let now_ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
-        mmap[24..28].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-        mmap[32..40].copy_from_slice(&now_ns.to_le_bytes());
-        mmap[40..44].copy_from_slice(&active_buffer.to_le_bytes());
-
-        let flush_result = if take_test_fault(fault_key, TestFaultPoint::CommitFlush) {
-            Err(io::Error::other("注入视频帧提交刷新失败"))
-        } else {
-            mmap.flush_range(0, buffer_offset + payload.len())
-        };
-        if let Err(error) = flush_result {
-            state.active_claim = None;
-            state.phase = RelayPhase::Terminal;
-            self.stop_requested.store(true, Ordering::Release);
-            self.wake.notify_all();
-            return Err(VideoRelayFailure::from_error("提交视频共享内存", &error));
-        }
-
-        fence(Ordering::Release);
-        mmap[16..24].copy_from_slice(&sequence_number.to_le_bytes());
-        state.committed_sequence = sequence_number;
-        state.active_claim = None;
-        sequence.store(sequence_number, Ordering::Release);
-        Ok(sequence_number)
-    }
-
-    fn mark_terminal(&self) {
-        let mut state = lock_unpoisoned(&self.state);
-        state.phase = RelayPhase::Terminal;
-        state.active_claim = None;
-        self.stop_requested.store(true, Ordering::Release);
-        drop(state);
-        self.wake.notify_all();
-    }
-}
-
-#[derive(Default)]
-struct ActiveConnectionControl {
-    stream: Mutex<Option<UnixStream>>,
-}
-
-impl ActiveConnectionControl {
-    fn install(&self, stream: &UnixStream) -> io::Result<()> {
-        *lock_unpoisoned(&self.stream) = Some(stream.try_clone()?);
-        Ok(())
-    }
-
-    fn clear(&self) {
-        lock_unpoisoned(&self.stream).take();
-    }
-
-    fn interrupt(&self) {
-        if let Some(stream) = lock_unpoisoned(&self.stream).as_ref() {
-            let _ = stream.shutdown(std::net::Shutdown::Both);
-        }
-    }
-}
 
 struct TerminalSignal {
     terminal: Mutex<Option<VideoRelayTerminal>>,
@@ -4464,32 +4289,12 @@ impl TerminalSignal {
     }
 }
 
-struct ResourceLedger {
-    mmap_created: bool,
-    shm: Option<OwnedEntry>,
-    uds: Option<OwnedEntry>,
-    stale_uds_cleanup: Option<VideoRelayPathCleanup>,
-}
 
-impl ResourceLedger {
-    fn new() -> Self {
-        Self {
-            mmap_created: false,
-            shm: None,
-            uds: None,
-            stale_uds_cleanup: None,
-        }
-    }
-}
 
-enum StartupSignal {
-    Ready,
-    Failed(Box<VideoRelayTerminal>),
-}
 
 /// helper 进程、pidfd、终态和全部路径租约的唯一父侧所有者。
 pub struct VideoRelayOwner {
-    handle: VideoRelayHandle,
+    #[cfg(test)] handle: VideoRelayHandle,
     process: process_helper::ProcessOwner,
 }
 
@@ -4507,25 +4312,25 @@ impl VideoRelayOwner {
             helper_start_faults(shm_path),
         )?;
         Ok(Self {
-            handle: VideoRelayHandle {
-                shm_path: shm_path.to_path_buf(),
-                uds_path: uds_path.to_path_buf(),
+            #[cfg(test)] handle: VideoRelayHandle {
                 sequence,
-                notify,
             },
             process,
         })
     }
 
+    #[cfg(test)]
     pub fn handle(&self) -> VideoRelayHandle {
         self.handle.clone()
     }
 
+    #[cfg(test)]
     pub fn stop(&self) -> bool {
         self.process
             .request_stop(Instant::now() + DEFAULT_STOP_TIMEOUT)
     }
 
+    #[cfg(test)]
     pub fn try_terminal(&self) -> Option<VideoRelayTerminal> {
         self.process.try_terminal()
     }
@@ -4538,6 +4343,7 @@ impl VideoRelayOwner {
         self.process.wait_terminal().await
     }
 
+    #[cfg(test)]
     pub fn join(&mut self, timeout: Duration) -> io::Result<VideoRelayTerminal> {
         self.process.join_until(Instant::now() + timeout)
     }
@@ -4613,557 +4419,19 @@ pub fn spawn_video_relay(
     spawn_video_relay_owner(shm_path, uds_path)
 }
 
-fn terminal_primary(terminal: &VideoRelayTerminal, fallback: &'static str) -> VideoRelayFailure {
-    match &terminal.reason {
-        VideoRelayTerminalReason::Failed(failure) => failure.clone(),
-        VideoRelayTerminalReason::KillUnreaped(failure) => failure.clone(),
-        VideoRelayTerminalReason::ThreadPanicked(detail) => {
-            VideoRelayFailure::new("视频中转线程恐慌", io::ErrorKind::Other, detail.clone())
-        }
-        VideoRelayTerminalReason::StopRequested => VideoRelayFailure::new(
-            fallback,
-            io::ErrorKind::Interrupted,
-            "启动完成前收到停止请求",
-        ),
-    }
-}
 
-fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
-    if let Some(message) = payload.downcast_ref::<&str>() {
-        (*message).to_string()
-    } else if let Some(message) = payload.downcast_ref::<String>() {
-        message.clone()
-    } else {
-        "未知线程恐慌载荷".to_string()
-    }
-}
 
-fn init_shm(
-    leases: &PairLeases,
-    ledger: &mut ResourceLedger,
-    fault_key: &Path,
-) -> io::Result<MmapMut> {
-    if let Some(metadata) = leases.shm_anchor.metadata()? {
-        if !metadata.is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!(
-                    "拒绝替换非普通文件视频共享内存: {}",
-                    leases.shm_anchor.public_path.display()
-                ),
-            ));
-        }
-        // 已取得路径对的排他租约，说明没有活动中继拥有该 SHM；按 inode 身份
-        // 隔离并删除上次异常退出留下的普通文件，避免高频重启永久卡在 AlreadyExists。
-        let identity_file = leases.shm_anchor.directory.open_at(
-            &leases.shm_anchor.name,
-            nix::libc::O_PATH | nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC,
-            None,
-        )?;
-        let stale = OwnedEntry::from_metadata(
-            leases.shm_anchor.clone(),
-            leases.shm_anchor.name.clone(),
-            &metadata,
-            identity_file,
-            EntryRole::Shm,
-        )?;
-        let cleanup = stale.cleanup();
-        if !matches!(
-            cleanup,
-            VideoRelayPathCleanup::Removed | VideoRelayPathCleanup::AlreadyAbsent
-        ) {
-            return Err(io::Error::other(format!(
-                "清理失效视频共享内存未完成: {cleanup:?}"
-            )));
-        }
-    }
-    let candidate_name = reserve_cleanup_name(&leases.shm_anchor.directory, EntryRole::Shm)?;
-    let file = leases.shm_anchor.directory.create_new(&candidate_name)?;
-    let mut unpublished = UnpublishedEntry::new(
-        leases.shm_anchor.directory.clone(),
-        candidate_name.clone(),
-        leases.shm_anchor.public_path.clone(),
-        file,
-    );
-    if take_test_fault(fault_key, TestFaultPoint::ShmMetadata) {
-        return Err(io::Error::other("注入共享内存 metadata 失败"));
-    }
-    let metadata = unpublished.file().metadata()?;
-    if take_test_fault(fault_key, TestFaultPoint::ShmTryClone) {
-        return Err(io::Error::other("注入共享内存 try_clone 失败"));
-    }
-    let identity_file = unpublished.file().try_clone()?;
-    if take_test_fault(fault_key, TestFaultPoint::ShmIdentity) {
-        return Err(io::Error::other("注入共享内存身份建立失败"));
-    }
-    let candidate_anchor = PathAnchor {
-        directory: leases.shm_anchor.directory.clone(),
-        name: candidate_name.clone(),
-        public_path: leases.shm_anchor.public_path.clone(),
-    };
-    let owned = OwnedEntry::from_metadata(
-        candidate_anchor,
-        candidate_name.clone(),
-        &metadata,
-        identity_file,
-        EntryRole::Shm,
-    )?;
-    if take_test_fault(fault_key, TestFaultPoint::ShmPermissions) {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "注入共享内存权限设置失败",
-        ));
-    }
-    unpublished
-        .file()
-        .set_permissions(std::fs::Permissions::from_mode(0o660))?;
-    unpublished.file().set_len(BUFFER_SIZE as u64)?;
-    let mut mmap = unsafe { MmapMut::map_mut(unpublished.file())? };
-    mmap[..HEADER_SIZE].fill(0);
-    mmap[0..8].copy_from_slice(&SHM_MAGIC.to_le_bytes());
-    mmap[8..12].copy_from_slice(&SHM_VERSION.to_le_bytes());
-    if take_test_fault(fault_key, TestFaultPoint::StartupHeaderFlush) {
-        return Err(io::Error::other("注入共享内存初始化刷新失败"));
-    }
-    mmap.flush_range(0, HEADER_SIZE)?;
-    leases.shm_anchor.directory.revalidate_public_path()?;
-    if take_test_fault(fault_key, TestFaultPoint::ShmPublishReplacement) {
-        std::fs::write(
-            &leases.shm_anchor.public_path,
-            b"replacement-before-shm-publish",
-        )?;
-    }
-    leases
-        .shm_anchor
-        .directory
-        .rename_noreplace(&candidate_name, &leases.shm_anchor.name)?;
-    ledger.shm = Some(owned.retarget(leases.shm_anchor.clone(), leases.shm_anchor.name.clone()));
-    unpublished.disarm();
-    ledger.mmap_created = true;
-    leases.shm_anchor.directory.sync()?;
-    Ok(mmap)
-}
 
-fn bind_uds(
-    leases: &PairLeases,
-    ledger: &mut ResourceLedger,
-    fault_key: &Path,
-) -> io::Result<UnixListener> {
-    if take_test_fault(fault_key, TestFaultPoint::BindUds) {
-        return Err(io::Error::new(
-            io::ErrorKind::AddrNotAvailable,
-            "注入视频 UDS 绑定失败",
-        ));
-    }
-    if let Some(metadata) = leases.uds_anchor.metadata()? {
-        if !metadata.file_type().is_socket() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!(
-                    "拒绝替换非套接字视频 UDS 路径: {}",
-                    leases.uds_anchor.public_path.display()
-                ),
-            ));
-        }
-        match UnixStream::connect(
-            leases
-                .uds_anchor
-                .directory
-                .child_path(&leases.uds_anchor.name),
-        ) {
-            Ok(stream) => {
-                drop(stream);
-                return Err(io::Error::new(
-                    io::ErrorKind::AddrInUse,
-                    "视频 UDS 已有活动监听者",
-                ));
-            }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
-                ) =>
-            {
-                let identity_file = leases.uds_anchor.directory.open_at(
-                    &leases.uds_anchor.name,
-                    nix::libc::O_PATH | nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC,
-                    None,
-                )?;
-                let stale = OwnedEntry::from_metadata(
-                    leases.uds_anchor.clone(),
-                    leases.uds_anchor.name.clone(),
-                    &metadata,
-                    identity_file,
-                    EntryRole::Uds,
-                )?;
-                let cleanup = stale.cleanup();
-                if !cleanup.is_complete() {
-                    ledger.stale_uds_cleanup = Some(cleanup);
-                    return Err(io::Error::other("清理失效视频 UDS 未完成"));
-                }
-            }
-            Err(error) => return Err(error),
-        }
-    }
 
-    let listener = UnixListener::bind(
-        leases
-            .uds_anchor
-            .directory
-            .child_path(&leases.uds_anchor.name),
-    )?;
-    let identity_file = leases.uds_anchor.directory.open_at(
-        &leases.uds_anchor.name,
-        nix::libc::O_PATH | nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC,
-        None,
-    )?;
-    let metadata = identity_file.metadata()?;
-    if !metadata.file_type().is_socket() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "绑定后视频 UDS 不是套接字",
-        ));
-    }
-    ledger.uds = Some(OwnedEntry::from_metadata(
-        leases.uds_anchor.clone(),
-        leases.uds_anchor.name.clone(),
-        &metadata,
-        identity_file,
-        EntryRole::Uds,
-    )?);
-    listener.set_nonblocking(true)?;
-    leases.uds_anchor.directory.sync()?;
-    Ok(listener)
-}
 
-fn finish_terminal(
-    mut reason: VideoRelayTerminalReason,
-    mmap: Option<MmapMut>,
-    ledger: &mut ResourceLedger,
-    leases: &mut PairLeases,
-    fault_key: &Path,
-) -> VideoRelayTerminal {
-    let mmap_cleanup = match mmap {
-        Some(mmap) => {
-            let flush = if take_test_fault(fault_key, TestFaultPoint::CleanupFlush) {
-                Err(io::Error::other("注入终态共享内存刷新失败"))
-            } else {
-                mmap.flush()
-            };
-            drop(mmap);
-            match flush {
-                Ok(()) => VideoRelayMmapCleanup::FlushedAndReleased,
-                Err(error) => VideoRelayMmapCleanup::FlushFailed(error.to_string()),
-            }
-        }
-        None if ledger.mmap_created => VideoRelayMmapCleanup::ReleasedWithoutFlushAfterFailure,
-        None => VideoRelayMmapCleanup::NotCreated,
-    };
-    ledger.mmap_created = false;
-    let owned_uds = ledger
-        .uds
-        .take()
-        .map_or(VideoRelayPathCleanup::NotCreated, OwnedEntry::cleanup);
-    let uds = if matches!(owned_uds, VideoRelayPathCleanup::NotCreated) {
-        ledger.stale_uds_cleanup.take().unwrap_or(owned_uds)
-    } else {
-        owned_uds
-    };
-    let shm = ledger
-        .shm
-        .take()
-        .map_or(VideoRelayPathCleanup::NotCreated, OwnedEntry::cleanup);
-    let (uds_lease, shm_lease) = leases.cleanup();
-    let cleanup = VideoRelayCleanup {
-        mmap: mmap_cleanup,
-        uds,
-        shm,
-        uds_lease,
-        shm_lease,
-    };
-    if matches!(reason, VideoRelayTerminalReason::StopRequested) && !cleanup.is_complete() {
-        reason = VideoRelayTerminalReason::Failed(VideoRelayFailure::new(
-            "回收视频中转资源",
-            io::ErrorKind::Other,
-            format!("停止后的资源回收不完整: {cleanup:?}"),
-        ));
-    }
-    VideoRelayTerminal { reason, cleanup }
-}
 
-#[allow(clippy::too_many_arguments)]
-fn video_relay_loop(
-    leases: &mut PairLeases,
-    ledger: &mut ResourceLedger,
-    sequence: Arc<AtomicU64>,
-    notify: Arc<Notify>,
-    control: Arc<RelayControl>,
-    active_connection: Arc<ActiveConnectionControl>,
-    startup_tx: mpsc::Sender<StartupSignal>,
-    ready_published: Arc<AtomicBool>,
-    fault_key: &Path,
-) -> VideoRelayTerminal {
-    if take_test_fault(fault_key, TestFaultPoint::StartupTimeout) {
-        while !control.is_stop_requested() {
-            control.wait_poll_interval();
-        }
-        control.mark_terminal();
-        return finish_terminal(
-            VideoRelayTerminalReason::StopRequested,
-            None,
-            ledger,
-            leases,
-            fault_key,
-        );
-    }
 
-    let mut mmap = match init_shm(leases, ledger, fault_key) {
-        Ok(mmap) => mmap,
-        Err(error) => {
-            control.mark_terminal();
-            return finish_terminal(
-                VideoRelayTerminalReason::Failed(VideoRelayFailure::from_error(
-                    "初始化视频共享内存",
-                    &error,
-                )),
-                None,
-                ledger,
-                leases,
-                fault_key,
-            );
-        }
-    };
-    info!(
-        "视频共享内存已创建: {:?} ({} bytes)",
-        leases.shm_anchor.public_path, BUFFER_SIZE
-    );
 
-    if take_test_fault(fault_key, TestFaultPoint::PanicAfterShm) {
-        panic!("注入共享内存创建后线程恐慌");
-    }
 
-    let listener = match bind_uds(leases, ledger, fault_key) {
-        Ok(listener) => listener,
-        Err(error) => {
-            control.mark_terminal();
-            return finish_terminal(
-                VideoRelayTerminalReason::Failed(VideoRelayFailure::from_error(
-                    "绑定视频 UDS",
-                    &error,
-                )),
-                Some(mmap),
-                ledger,
-                leases,
-                fault_key,
-            );
-        }
-    };
-    info!("视频 UDS 监听: {:?}", leases.uds_anchor.public_path);
-    ready_published.store(true, Ordering::Release);
-    if startup_tx.send(StartupSignal::Ready).is_err() {
-        control.request_stop();
-    }
 
-    let reason = loop {
-        if control.is_stop_requested() {
-            break VideoRelayTerminalReason::StopRequested;
-        }
-        match listener.accept() {
-            Ok((mut connection, _)) => {
-                if let Err(error) = connection.set_read_timeout(Some(CONNECTION_READ_TIMEOUT)) {
-                    break VideoRelayTerminalReason::Failed(VideoRelayFailure::from_error(
-                        "配置视频连接读取超时",
-                        &error,
-                    ));
-                }
-                if let Err(error) = active_connection.install(&connection) {
-                    break VideoRelayTerminalReason::Failed(VideoRelayFailure::from_error(
-                        "登记活动视频连接",
-                        &error,
-                    ));
-                }
-                if control.is_stop_requested() {
-                    active_connection.interrupt();
-                }
-                let outcome = handle_video_connection(
-                    &mut connection,
-                    &mut mmap,
-                    &sequence,
-                    &notify,
-                    &control,
-                    fault_key,
-                );
-                active_connection.clear();
-                match outcome {
-                    ConnectionOutcome::Stopped => {
-                        break VideoRelayTerminalReason::StopRequested;
-                    }
-                    ConnectionOutcome::Client(error) => {
-                        info!("视频客户端连接结束: {}", error);
-                    }
-                    ConnectionOutcome::Resource(failure) => {
-                        break VideoRelayTerminalReason::Failed(failure);
-                    }
-                }
-            }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                control.wait_poll_interval();
-            }
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) => {
-                error!("UDS accept 失败: {}", error);
-                break VideoRelayTerminalReason::Failed(VideoRelayFailure::from_error(
-                    "接受视频 UDS 连接",
-                    &error,
-                ));
-            }
-        }
-    };
 
-    active_connection.clear();
-    drop(listener);
-    control.mark_terminal();
-    finish_terminal(reason, Some(mmap), ledger, leases, fault_key)
-}
 
-enum InterruptibleReadError {
-    Stopped,
-    Client(io::Error),
-}
 
-fn read_exact_interruptible(
-    connection: &mut UnixStream,
-    buffer: &mut [u8],
-    control: &RelayControl,
-) -> Result<(), InterruptibleReadError> {
-    let mut offset = 0;
-    while offset < buffer.len() {
-        if control.is_stop_requested() {
-            return Err(InterruptibleReadError::Stopped);
-        }
-        match connection.read(&mut buffer[offset..]) {
-            Ok(0) => {
-                return Err(InterruptibleReadError::Client(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "视频连接在完整帧到达前关闭",
-                )));
-            }
-            Ok(read) => offset += read,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::WouldBlock
-                        | io::ErrorKind::TimedOut
-                        | io::ErrorKind::Interrupted
-                ) => {}
-            Err(_error) if control.is_stop_requested() => {
-                return Err(InterruptibleReadError::Stopped);
-            }
-            Err(error) => return Err(InterruptibleReadError::Client(error)),
-        }
-    }
-    Ok(())
-}
-
-enum ConnectionOutcome {
-    Stopped,
-    Client(io::Error),
-    Resource(VideoRelayFailure),
-}
-
-fn handle_video_connection(
-    connection: &mut UnixStream,
-    mmap: &mut MmapMut,
-    sequence: &Arc<AtomicU64>,
-    notify: &Arc<Notify>,
-    control: &RelayControl,
-    fault_key: &Path,
-) -> ConnectionOutcome {
-    let mut length_bytes = [0_u8; 4];
-    loop {
-        match read_exact_interruptible(connection, &mut length_bytes, control) {
-            Ok(()) => {}
-            Err(InterruptibleReadError::Stopped) => return ConnectionOutcome::Stopped,
-            Err(InterruptibleReadError::Client(error)) => {
-                return ConnectionOutcome::Client(error);
-            }
-        }
-        let frame_length = u32::from_le_bytes(length_bytes) as usize;
-        if frame_length == 0 || frame_length > MAX_FRAME_SIZE {
-            return ConnectionOutcome::Client(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("帧大小无效: {frame_length}"),
-            ));
-        }
-        let claim = match control.claim_frame() {
-            Ok(claim) => claim,
-            Err(()) => return ConnectionOutcome::Stopped,
-        };
-        let mut payload = vec![0_u8; frame_length];
-        match read_exact_interruptible(connection, &mut payload, control) {
-            Ok(()) => {}
-            Err(InterruptibleReadError::Stopped) => {
-                control.abandon_claim(&claim);
-                return ConnectionOutcome::Stopped;
-            }
-            Err(InterruptibleReadError::Client(error)) => {
-                control.abandon_claim(&claim);
-                return ConnectionOutcome::Client(error);
-            }
-        }
-        match control.commit_frame(claim, mmap, &payload, sequence, fault_key) {
-            Ok(_) => notify.notify_waiters(),
-            Err(failure) if failure.kind == io::ErrorKind::Interrupted => {
-                return ConnectionOutcome::Stopped;
-            }
-            Err(failure) => return ConnectionOutcome::Resource(failure),
-        }
-    }
-}
-
-#[cfg(not(test))]
-#[derive(Clone, Copy)]
-enum TestFaultPoint {
-    BindUds,
-    StartupHeaderFlush,
-    StartupTimeout,
-    PanicAfterShm,
-    CommitFlush,
-    CleanupFlush,
-    ShmCleanup,
-    MsyncHang,
-    IpcTruncated,
-    WrongGeneration,
-    PauseBeforeInvalidate,
-    PauseAfterInvalidate,
-    PauseAfterFlush,
-    PauseShmCleanup,
-    SupervisorSpawn,
-    ParentTryWaitStartup,
-    ParentTryWaitSupervisor,
-    PauseBeforeUdsBind,
-    PauseAfterUdsBind,
-    PauseBeforeParentTerminal,
-    PauseAfterParentTerminal,
-    PauseAfterUdsBindBeforeIdentity,
-    PauseAfterUdsIdentityBeforePublish,
-    ShmPermissions,
-    ShmMetadata,
-    ShmTryClone,
-    ShmIdentity,
-    ShmPublishReplacement,
-}
-
-#[cfg(not(test))]
-fn take_test_fault(_path: &Path, _point: TestFaultPoint) -> bool {
-    false
-}
-
-#[cfg(not(test))]
-fn maybe_pause_before_commit(_path: &Path) {}
-
-#[cfg(not(test))]
-fn maybe_pause_before_cleanup_quarantine(_path: &Path, _role: EntryRole) {}
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -5311,10 +4579,6 @@ fn install_commit_gate(path: &Path) -> Arc<TestCommitGate> {
     })
 }
 
-#[cfg(test)]
-fn maybe_pause_before_commit(path: &Path) {
-    let _ = path;
-}
 
 #[cfg(test)]
 fn install_cleanup_gate(path: &Path) -> Arc<TestCommitGate> {
@@ -5326,74 +4590,10 @@ fn install_cleanup_gate(path: &Path) -> Arc<TestCommitGate> {
     })
 }
 
-#[cfg(test)]
-struct LocalCleanupGate {
-    state: Mutex<(bool, bool)>,
-    changed: Condvar,
-}
 
-#[cfg(test)]
-fn local_cleanup_gates() -> &'static Mutex<std::collections::HashMap<PathBuf, Arc<LocalCleanupGate>>>
-{
-    static GATES: std::sync::OnceLock<
-        Mutex<std::collections::HashMap<PathBuf, Arc<LocalCleanupGate>>>,
-    > = std::sync::OnceLock::new();
-    GATES.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
-}
 
-#[cfg(test)]
-fn install_local_cleanup_gate(path: &Path) -> Arc<LocalCleanupGate> {
-    let gate = Arc::new(LocalCleanupGate {
-        state: Mutex::new((false, false)),
-        changed: Condvar::new(),
-    });
-    lock_unpoisoned(local_cleanup_gates()).insert(path.to_path_buf(), gate.clone());
-    gate
-}
 
-#[cfg(test)]
-fn maybe_pause_before_cleanup_quarantine(path: &Path, role: EntryRole) {
-    if role != EntryRole::Shm {
-        return;
-    }
-    let gate = lock_unpoisoned(local_cleanup_gates()).remove(path);
-    let Some(gate) = gate else {
-        return;
-    };
-    let mut state = lock_unpoisoned(&gate.state);
-    state.0 = true;
-    gate.changed.notify_all();
-    while !state.1 {
-        state = gate
-            .changed
-            .wait(state)
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-    }
-}
 
-#[cfg(test)]
-impl LocalCleanupGate {
-    fn wait_entered(&self) {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let mut state = lock_unpoisoned(&self.state);
-        while !state.0 {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            assert!(!remaining.is_zero(), "本地清理 gate 未进入");
-            let (next, timeout) = self
-                .changed
-                .wait_timeout(state, remaining)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            state = next;
-            assert!(!timeout.timed_out() || state.0, "本地清理 gate 等待超时");
-        }
-    }
-
-    fn release(&self) {
-        let mut state = lock_unpoisoned(&self.state);
-        state.1 = true;
-        self.changed.notify_all();
-    }
-}
 
 #[cfg(test)]
 impl TestCommitGate {
@@ -5997,108 +5197,7 @@ mod tests {
         assert_eq!(std::fs::read_dir(&paths.root).unwrap().count(), 0);
     }
 
-    #[test]
-    fn compatibility_shm_prepublication_failures_and_replacement_are_bounded() {
-        for (label, point) in [
-            ("metadata", TestFaultPoint::ShmMetadata),
-            ("try-clone", TestFaultPoint::ShmTryClone),
-            ("identity", TestFaultPoint::ShmIdentity),
-            ("permissions", TestFaultPoint::ShmPermissions),
-        ] {
-            let paths = TestPaths::new(&format!("compat-shm-prepublish-{label}"));
-            let mut leases = PairLeases::acquire(&paths.shm, &paths.uds).unwrap();
-            let mut ledger = ResourceLedger::new();
-            inject_test_fault(&paths.shm, point);
-            assert!(init_shm(&leases, &mut ledger, &paths.shm).is_err());
-            assert!(ledger.shm.is_none());
-            assert!(!paths.shm.exists());
-            let (uds_lease, shm_lease) = leases.cleanup();
-            assert!(uds_lease.is_complete() && shm_lease.is_complete());
-            assert_eq!(std::fs::read_dir(&paths.root).unwrap().count(), 0);
 
-            let mut owner = spawn_video_relay_owner(&paths.shm, &paths.uds).unwrap();
-            assert!(owner
-                .shutdown(Duration::from_secs(1))
-                .unwrap()
-                .is_expected_shutdown());
-        }
-
-        let paths = TestPaths::new("compat-shm-publish-replacement");
-        let mut leases = PairLeases::acquire(&paths.shm, &paths.uds).unwrap();
-        let mut ledger = ResourceLedger::new();
-        inject_test_fault(&paths.shm, TestFaultPoint::ShmPublishReplacement);
-        assert!(init_shm(&leases, &mut ledger, &paths.shm).is_err());
-        assert!(ledger.shm.is_none());
-        assert_eq!(
-            std::fs::read(&paths.shm).unwrap(),
-            b"replacement-before-shm-publish"
-        );
-        assert_eq!(std::fs::read_dir(&paths.root).unwrap().count(), 3);
-        let (uds_lease, shm_lease) = leases.cleanup();
-        assert!(uds_lease.is_complete() && shm_lease.is_complete());
-        std::fs::remove_file(&paths.shm).unwrap();
-        assert_eq!(std::fs::read_dir(&paths.root).unwrap().count(), 0);
-    }
-
-    #[test]
-    fn unpublished_guard_quarantines_before_identity_recheck_in_group_writable_directory() {
-        let paths = TestPaths::new("unpublished-cleanup-race");
-        std::fs::set_permissions(&paths.root, std::fs::Permissions::from_mode(0o770)).unwrap();
-        let mode = std::fs::metadata(&paths.root).unwrap().mode();
-        assert_eq!(mode & 0o777, 0o770);
-        assert_eq!(mode & nix::libc::S_ISVTX as u32, 0);
-
-        let gate = install_local_cleanup_gate(&paths.shm);
-        inject_test_fault(&paths.shm, TestFaultPoint::ShmMetadata);
-        let shm = paths.shm.clone();
-        let uds = paths.uds.clone();
-        let runner = thread::spawn(move || {
-            let mut leases = PairLeases::acquire(&shm, &uds).unwrap();
-            let mut ledger = ResourceLedger::new();
-            let error = init_shm(&leases, &mut ledger, &shm).unwrap_err();
-            assert!(ledger.shm.is_none());
-            let (uds_lease, shm_lease) = leases.cleanup();
-            assert!(uds_lease.is_complete() && shm_lease.is_complete());
-            error
-        });
-
-        gate.wait_entered();
-        let candidate = std::fs::read_dir(&paths.root)
-            .unwrap()
-            .filter_map(Result::ok)
-            .find(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(".nuwax-video-cleanup-")
-            })
-            .expect("guard 暂停时私有候选必须存在")
-            .path();
-        std::fs::remove_file(&candidate).unwrap();
-        std::fs::write(&candidate, b"private-candidate-replacement").unwrap();
-        let replacement_inode = std::fs::metadata(&candidate).unwrap().ino();
-        gate.release();
-
-        assert_eq!(runner.join().unwrap().kind(), io::ErrorKind::Other);
-        assert!(!paths.shm.exists());
-        assert_eq!(
-            std::fs::read(&candidate).unwrap(),
-            b"private-candidate-replacement"
-        );
-        assert_eq!(
-            std::fs::metadata(&candidate).unwrap().ino(),
-            replacement_inode
-        );
-        assert_eq!(std::fs::read_dir(&paths.root).unwrap().count(), 1);
-        std::fs::remove_file(&candidate).unwrap();
-
-        let mut owner = spawn_video_relay_owner(&paths.shm, &paths.uds).unwrap();
-        assert!(owner
-            .shutdown(Duration::from_secs(1))
-            .unwrap()
-            .is_expected_shutdown());
-        assert_eq!(std::fs::read_dir(&paths.root).unwrap().count(), 0);
-    }
 
     #[test]
     fn startup_timeout_stops_joins_and_returns_clean_typed_terminal() {

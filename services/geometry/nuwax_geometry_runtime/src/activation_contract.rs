@@ -2,7 +2,7 @@
 //!
 //! Assigned identities retain only validated metadata and existing generation/commit receipts.
 //! No conversion maps them into a legacy digest. Payload ownership remains outside these types.
-#![cfg_attr(not(test), allow(dead_code))]
+
 
 use crate::activation_identity::CheckpointMemberIdentityV2;
 use crate::activation_request::{ActivationRequestMetadataV2, CanonicalCheckpointOwnerV2};
@@ -132,7 +132,7 @@ pub(crate) enum ActivationJournalStep {
     TypedGlobalMap,
     RetirementPrepared,
     Seal,
-    TargetReceiptVerification,
+    #[cfg(test)] TargetReceiptVerification,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -157,8 +157,8 @@ pub(crate) enum ActivationJournalVerifierV2 {
     Occupancy(OccupancyCommitReceipt),
     Cloud(CloudCommitReceipt),
     Activation(InstalledActivationIdentityV2),
-    Target(InstalledTargetReceiptV2),
-    CompletedStep(ActivationJournalKey),
+    #[cfg(test)] Target(InstalledTargetReceiptV2),
+    #[cfg(test)] CompletedStep(ActivationJournalKey),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -182,16 +182,11 @@ pub(crate) enum ActivationTargetSource {
 }
 
 impl ActivationTargetSource {
+    #[cfg(test)]
     pub(crate) fn legacy_digest(&self) -> Option<[u8; 32]> {
         match self {
             Self::Legacy(value) => Some(value.xyz_sha256),
             Self::Assigned(_) => None,
-        }
-    }
-    pub(crate) fn frame_id(&self) -> &str {
-        match self {
-            Self::Legacy(value) => &value.frame_id,
-            Self::Assigned(value) => value.source_member().frame_id(),
         }
     }
     pub(crate) fn source_revision(&self) -> u64 {

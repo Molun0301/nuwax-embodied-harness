@@ -53,7 +53,6 @@ fn preparation_probe_accumulation(
         request: validate_relocalize_request(request.clone()).unwrap(),
         admission_ordinal: 1,
         mode_epoch: boundary.relocalization_mode_epoch.unwrap(),
-        logical_deadline: Instant::now() + Duration::from_secs(30),
         accumulation_deadline: Instant::now() + Duration::from_secs(2),
         snapshot: snapshot.clone(), arm_watermark: None, armed_map_watermarks: HashMap::new(),
         accepted: frames.iter().rev().map(|frame| AccumulatedRelocalizationFrame {input: Arc::clone(frame)}).collect(),

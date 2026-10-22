@@ -1800,17 +1800,11 @@ dependencies = [
 name = "nuwax-motion-safety-guard"
 version = "0.1.0"
 dependencies = [
- "chrono",
- "pretty_assertions",
  "prost",
  "rustix",
- "serde",
- "serde_json",
- "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tonic-build",
- "tracing",
  "uuid",
 ]
 

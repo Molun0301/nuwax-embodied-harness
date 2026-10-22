@@ -40,7 +40,6 @@ _SCHEMA = """
                     updated_at TEXT NOT NULL
                 );
 
-                CREATE TABLE IF NOT EXISTS agent_scope_tokens (scope TEXT PRIMARY KEY);
                 CREATE TABLE IF NOT EXISTS agent_terminal_layout (
                     singleton INTEGER PRIMARY KEY CHECK(singleton=1), ledger_id TEXT NOT NULL,
                     origin TEXT NOT NULL, layout_state TEXT NOT NULL,
@@ -65,22 +64,13 @@ class PreparedTerminalReceipt:
 class AgentCallStore:
     """以请求标识原子占位，同键重试永不重复提交设备动作。"""
 
-    def __init__(self, path: Path, *, gateway_instance_id: str, scope: Optional[str] = None,
-                 robot_identity: Optional[Dict[str, Any]] = None, artifact_dir: Optional[Path] = None,
+    def __init__(self, path: Path, *, gateway_instance_id: str,
+                 robot_identity: Dict[str, Any], artifact_dir: Path,
                  fresh_layout: str = "split") -> None:
         if fresh_layout not in ("combined", "split"):
             raise ValueError("新账本布局只允许 combined 或 split。")
-        if robot_identity is not None:
-            if artifact_dir is None or scope is not None:
-                raise ValueError("身份作用域需要 artifact_dir，且不能同时传入原始 scope。")
-            scope_identity = self._identity_json(robot_identity, artifact_dir)
-        else:
-            if scope is None:
-                raise ValueError("必须指定作用域或完整机器人身份。")
-            scope_identity = None
+        scope_identity = self._identity_json(robot_identity, artifact_dir)
         self.path = Path(path).expanduser().resolve()
-        self.scope = scope or ""
-        self._registered_scope = scope_identity is not None
         self.gateway_instance_id = gateway_instance_id
         self._terminal_preparation_token = object()
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -124,11 +114,7 @@ class AgentCallStore:
                                        "(singleton,ledger_id,origin,layout_state,terminal_path,pair_id) VALUES (1,?,?,?,?,?)",
                                        (ledger_id, "fresh" if fresh else "legacy", "pending" if split_new else "combined",
                                         target, uuid4().hex if split_new else None))
-                # 原始 token 的保留不是身份绑定；只防止后续分配与它碰撞。
-                if scope_identity is None and self.scope:
-                    connection.execute("INSERT OR IGNORE INTO agent_scope_tokens(scope) VALUES (?)", (self.scope,))
-                if scope_identity is not None:
-                    self.scope = self._resolve_owner(connection, scope_identity)
+                self.scope = self._resolve_owner(connection, scope_identity)
                 connection.commit()
             except BaseException:
                 connection.rollback()
@@ -274,7 +260,7 @@ class AgentCallStore:
     @classmethod
     def for_identity(cls, path: Path, *, robot_identity: Dict[str, Any], artifact_dir: Path,
                      gateway_instance_id: str, fresh_layout: str = "split"):
-        """按精确身份选择持久分配的作用域；旧作用域只能显式核对绑定。"""
+        """按精确机器人身份选择已持久分配的作用域。"""
         return cls(path, gateway_instance_id=gateway_instance_id,
                    robot_identity=robot_identity, artifact_dir=artifact_dir, fresh_layout=fresh_layout)
 
@@ -290,9 +276,8 @@ class AgentCallStore:
                 "SELECT scope_id FROM agent_scope_owners WHERE scope_id=? UNION ALL "
                 "SELECT scope FROM agent_scope_bindings WHERE scope=? UNION ALL "
                 "SELECT scope FROM agent_calls WHERE scope=? UNION ALL "
-                "SELECT scope FROM agent_task_terminals WHERE scope=? UNION ALL "
-                "SELECT scope FROM agent_scope_tokens WHERE scope=? LIMIT 1",
-                (scope, scope, scope, scope, scope)).fetchone()
+                "SELECT scope FROM agent_task_terminals WHERE scope=? LIMIT 1",
+                (scope, scope, scope, scope)).fetchone()
             if occupied is not None:
                 continue
             connection.execute("INSERT INTO agent_scope_owners(scope_id,identity_json) VALUES (?,?)",
@@ -302,81 +287,13 @@ class AgentCallStore:
         raise GatewayError("无法分配独立调用作用域；原调用记录保持不变。",
                            error_code="agent_scope_identity_conflict", http_status=409)
 
-    @classmethod
-    def list_legacy_scopes(cls, path: Path) -> Tuple[str, ...]:
-        """只读维护清单；仅列出尚未绑定的原始标识，不推断其机器人身份。"""
-        connection = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True)
-        try:
-            tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-            sources = ["SELECT scope FROM " + name for name in ("agent_calls", "agent_task_terminals") if name in tables]
-            if not sources:
-                return ()
-            sql = "SELECT scope FROM (" + " UNION ".join(sources) + ")"
-            if "agent_scope_bindings" in tables:
-                sql += " WHERE scope NOT IN (SELECT scope FROM agent_scope_bindings)"
-            scopes = {row[0] for row in connection.execute(sql)}
-            if "agent_terminal_layout" in tables:
-                layout = cls.terminal_storage_status(path)
-                if layout["layout_state"] == "active":
-                    if not layout["legacy_sealed"]:
-                        raise pair_conflict()
-                    with AgentTerminalStore(None, layout)._connection() as target:
-                        target_scopes = {row[0] for row in target.execute("SELECT DISTINCT scope FROM agent_task_terminals")}
-                    bindings = {row[0] for row in connection.execute("SELECT scope FROM agent_scope_bindings")}
-                    scopes.update(target_scopes - bindings)
-            return tuple(sorted(scopes))
-        finally:
-            connection.close()
-
-    @classmethod
-    def bind_verified_legacy_scope(cls, path: Path, *, legacy_scope: str,
-                                   robot_identity: Dict[str, Any], artifact_dir: Path) -> str:
-        """可信维护入口：调用方须已核实指定身份；单凭历史标识不构成授权。"""
-        store = cls(path, scope="", gateway_instance_id="scope-binding-maintenance")
-        identity_json = cls._identity_json(robot_identity, artifact_dir)
-        target_exists = False
-        backend = store._terminal_backend()
-        if backend is not None:
-            with backend._connection() as target:
-                target_exists = target.execute("SELECT 1 FROM agent_task_terminals WHERE scope=? LIMIT 1",
-                                               (legacy_scope,)).fetchone() is not None
-        with store._connection() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            try:
-                binding = connection.execute(
-                    "SELECT b.owner_scope,o.identity_json FROM agent_scope_bindings b "
-                    "JOIN agent_scope_owners o ON o.scope_id=b.owner_scope WHERE b.scope=?",
-                    (legacy_scope,)).fetchone()
-                if binding is not None:
-                    if binding["identity_json"] != identity_json:
-                        raise GatewayError("历史作用域已绑定另一身份；必须核对原记录，不能重新认领。",
-                                           error_code="agent_scope_binding_conflict", http_status=409)
-                    connection.commit()
-                    return binding["owner_scope"]
-                exists = connection.execute(
-                    "SELECT scope FROM agent_calls WHERE scope=? UNION ALL "
-                    "SELECT scope FROM agent_task_terminals WHERE scope=? LIMIT 1",
-                    (legacy_scope, legacy_scope)).fetchone()
-                if exists is None and not target_exists:
-                    raise GatewayError("没有待绑定的历史作用域记录。", error_code="not_found", http_status=404)
-                owner = cls._resolve_owner(connection, identity_json)
-                connection.execute("INSERT INTO agent_scope_bindings(scope,owner_scope) VALUES (?,?)", (legacy_scope, owner))
-                connection.commit()
-                return owner
-            except BaseException:
-                connection.rollback()
-                raise
 
     def _assert_scope(self, connection, scope: str, *, error_code: str, message: str) -> None:
         if scope == self.scope:
             return
-        if self._registered_scope:
-            row = connection.execute("SELECT owner_scope FROM agent_scope_bindings WHERE scope=?", (scope,)).fetchone()
-            if row is not None and row["owner_scope"] == self.scope:
-                return
-            if row is None:
-                raise GatewayError("原记录的历史作用域尚未核实绑定；原请求不能被重新认领或重放。",
-                                   error_code="agent_scope_binding_required", http_status=409)
+        row = connection.execute("SELECT owner_scope FROM agent_scope_bindings WHERE scope=?", (scope,)).fetchone()
+        if row is not None and row["owner_scope"] == self.scope:
+            return
         raise GatewayError(message, error_code=error_code, http_status=404 if error_code == "not_found" else 409)
 
     @contextmanager
@@ -457,9 +374,9 @@ class AgentCallStore:
         with self._connection() as connection:
             row = connection.execute(
                 "SELECT * FROM agent_calls WHERE task_id=? AND (scope=? OR "
-                "(? AND scope IN (SELECT scope FROM agent_scope_bindings WHERE owner_scope=?))) "
+                "scope IN (SELECT scope FROM agent_scope_bindings WHERE owner_scope=?)) "
                 "ORDER BY created_at LIMIT 1",
-                (task_id, self.scope, self._registered_scope, self.scope),
+                (task_id, self.scope, self.scope),
             ).fetchone()
         return self._decode(row) if row else None
 
@@ -468,9 +385,9 @@ class AgentCallStore:
         with self._connection() as connection:
             row = connection.execute(
                 "SELECT request_id,tool_name FROM agent_calls WHERE task_id=? AND (scope=? OR "
-                "(? AND scope IN (SELECT scope FROM agent_scope_bindings WHERE owner_scope=?))) "
+                "scope IN (SELECT scope FROM agent_scope_bindings WHERE owner_scope=?)) "
                 "ORDER BY created_at LIMIT 1",
-                (task_id, self.scope, self._registered_scope, self.scope),
+                (task_id, self.scope, self.scope),
             ).fetchone()
         return dict(row) if row else None
 

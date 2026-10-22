@@ -21,6 +21,7 @@ from fastapi import FastAPI
 
 from contracts.building_navigation import BuildingExplorationRequest, FloorRecord
 from core.agent_call_store import AgentCallStore
+from tests.conftest import identity_call_store, insert_historical_scope_binding, create_isolated_gateway
 from core.errors import GatewayError
 from core.event_bus import EventBus
 from core.task_manager import TaskManager
@@ -62,7 +63,7 @@ class TaskCallIdentityStoreTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.path = self.root / "calls.sqlite3"
-        self.store = AgentCallStore(self.path, scope="scope-a", gateway_instance_id="gateway-a")
+        self.store = identity_call_store(self.path, identity_name='scope-a', gateway_instance_id='gateway-a')
 
     def record(self, request_id="request-a", *, store=None, task_id="task-a", tool="tool-a", error=None):
         store = store or self.store
@@ -103,19 +104,19 @@ class TaskCallIdentityStoreTests(unittest.TestCase):
                          {key: expected[key] for key in ("request_id", "tool_name")})
 
     def test_missing_and_foreign_scopes_are_not_returned(self):
-        other = AgentCallStore(self.path, scope="scope-b", gateway_instance_id="gateway-b")
+        other = identity_call_store(self.path, identity_name='scope-b', gateway_instance_id='gateway-b')
         self.record(store=other)
         self.assertIsNone(self.store.find_task_call_identity("task-a"))
         self.assertIsNone(self.store.find_task_call_identity("missing"))
         self.assertIsNone(self.store.find_by_task("task-a"))
 
-    def test_explicit_legacy_binding_and_restart_preserve_identity(self):
+    def test_existing_legacy_binding_and_restart_preserve_identity(self):
         self.record()
         identity = {"robot_model": "offline", "robot_name": "robot", "robot_id": "one"}
         options = {"robot_identity": identity, "artifact_dir": self.root / "artifacts"}
         registered = AgentCallStore.for_identity(self.path, gateway_instance_id="current", **options)
         self.assertIsNone(registered.find_task_call_identity("task-a"))
-        AgentCallStore.bind_verified_legacy_scope(self.path, legacy_scope="scope-a", **options)
+        insert_historical_scope_binding(self.path, legacy_scope=self.store.scope, owner_scope=registered.scope)
         before = self.raw_rows()
         for gateway in ("current", "restarted"):
             reader = AgentCallStore.for_identity(self.path, gateway_instance_id=gateway, **options)
@@ -144,9 +145,9 @@ class TaskCallIdentityStoreTests(unittest.TestCase):
                    "artifact_dir": self.root / "artifacts"}
         registered = AgentCallStore.for_identity(self.path, gateway_instance_id="current", **options)
         self.record("current", store=registered)
-        foreign = AgentCallStore(self.path, scope="foreign", gateway_instance_id="foreign")
+        foreign = identity_call_store(self.path, identity_name='foreign', gateway_instance_id='foreign')
         self.record("foreign", store=foreign)
-        AgentCallStore.bind_verified_legacy_scope(self.path, legacy_scope="scope-a", **options)
+        insert_historical_scope_binding(self.path, legacy_scope=self.store.scope, owner_scope=registered.scope)
         with sqlite3.connect(self.path) as db:
             db.execute("UPDATE agent_calls SET created_at='2026-10-07T01:00:00Z'")
             db.execute("UPDATE agent_calls SET created_at='2026-10-07T00:00:00Z' WHERE request_id='foreign'")
@@ -194,11 +195,7 @@ class TaskCallIdentityEndpointTests(unittest.TestCase):
             input_payload=request.model_dump(mode="json"), metadata={"request_id": "fallback-request"})
         self.task_id = self.spec.task_id
         self.assertTrue(self.entered.wait(2))
-        runtime = GatewayRuntime.__new__(GatewayRuntime)
-        runtime.task_manager, runtime.event_bus = self.manager, self.bus
-        runtime.robot = NS(manifest=NS(robot_model="offline"), defaults=NS(parameters={}))
-        runtime.config = NS(gateway=NS(artifact_dir=str(Path(self.temp.name) / "artifacts")))
-        runtime._task_status_last_polled_at = {}
+        runtime = create_isolated_gateway(Path(self.temp.name), event_bus=self.bus, task_manager=self.manager)
         runtime.capability_registry = NS(get_descriptor=lambda name: NS(display_name="offline"))
 
         def authorize(descriptor):
@@ -221,6 +218,7 @@ class TaskCallIdentityEndpointTests(unittest.TestCase):
         self.manager.shutdown(wait=True)
         closed = self.service.close(2, source_fenced=True)
         self.assertTrue(closed["owner_closed"], closed)
+        self.service.runtime.stop()
         self.assertTrue(self.bus.shutdown(2))
         self.assertEqual(self.actions, [1])
         self.temp.cleanup()

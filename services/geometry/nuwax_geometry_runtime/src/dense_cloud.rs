@@ -111,6 +111,7 @@ fn temporary_file() -> Result<File, String> {
 }
 
 impl DenseCloud {
+    #[cfg(test)]
     pub fn new() -> Result<Self, String> {
         Self::with_voxel_size(crate::pointcloud::VOXEL_SIZE)
     }

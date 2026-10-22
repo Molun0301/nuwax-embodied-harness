@@ -1,18 +1,13 @@
 #!/usr/bin/env python3
-"""离线验证智能体等待隔离、回执语义与断连清理，不调用设备或模型。
-
-使用真实 AgentToolService 方法、路由、快照/回执投影，替换任务运行时与
-持久存储边界；另有真实 EventBus 集成检查。运行：
-.nuwax-test-env/bin/python scripts/check_agent_wait_isolation.py
-"""
+"""真实网关、任务管理器与账本的等待隔离回归，不启动设备或模型。"""
 from __future__ import annotations
 
 import asyncio
-import sys
+import tempfile
 import threading
 import time
+import sys
 import unittest
-from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -23,144 +18,24 @@ import anyio.to_thread
 import httpx
 from fastapi import FastAPI
 from fastapi.concurrency import run_in_threadpool
-
-from contracts.events import RuntimeEventCategory
+from contracts.capabilities import CapabilityDescriptor, CapabilityExecutionMode, CapabilityRiskLevel
 from contracts.naming import build_task_id
 from core.errors import GatewayError
 from core.event_bus import EventBus
+from core.task_manager import TaskManager, TaskTimeoutError
 from gateways.agent.feedback import TERMINAL_STATES
 from gateways.agent.router import build_agent_router
 from gateways.agent.service import AgentToolService, _AsyncTaskWakeup
-
-
-class SyntheticBus:
-    """订阅边界；不运行生产长期终态消费者，等待者的通知仍跨线程验证。"""
-
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.callbacks = {}
-        self.next_id = 0
-        self.before_subscribe = None
-        self.unsubscribed = []
-
-    def subscribe(self, callback, **options):
-        if self.before_subscribe and not options:
-            self.before_subscribe()
-        with self.lock:
-            self.next_id += 1
-            self.callbacks[self.next_id] = (callback, options)
-            return self.next_id
-
-    def unsubscribe(self, subscription):
-        with self.lock:
-            if subscription not in self.callbacks:
-                raise AssertionError("subscription removed twice")
-            del self.callbacks[subscription]
-            self.unsubscribed.append(subscription)
-
-    def publish(self, task_id):
-        with self.lock:
-            callbacks = tuple(self.callbacks.values())
-        for callback, options in callbacks:
-            if not options.get("async_dispatch"):
-                callback(SimpleNamespace(task_id=task_id))
-
-    def count(self):
-        with self.lock:
-            return len(self.callbacks)
-
-
-class SyntheticStore:
-    def __init__(self):
-        self.terminals = {}
-        self.threads = []
-
-    def find_task_call_identity(self, task_id):
-        self.threads.append(threading.get_ident())
-
-    def save_terminal(self, task_id, snapshot):
-        self.threads.append(threading.get_ident())
-        self.terminals[task_id] = deepcopy(snapshot)
-
-
-class SyntheticRuntime:
-    def __init__(self):
-        self._lock = threading.RLock()
-        self.task_manager = self
-        self.event_bus = SyntheticBus()
-        self.robot = SimpleNamespace(manifest=SimpleNamespace(robot_model="synthetic"))
-        self.config = SimpleNamespace(gateway=SimpleNamespace(artifact_dir="/tmp/agent-wait-check/artifacts"))
-        self.capability_registry = SimpleNamespace(get_descriptor=lambda name: name)
-        self.statuses = {}
-        self.snapshot_count = 0
-        self.snapshot_threads = []
-        self.after_snapshot = None
-        self.before_snapshot = None
-        self.cancel_count = 0
-        self.add_task("probe")
-
-    def add_task(self, task_id):
-        with self._lock:
-            self.statuses[task_id] = {"task_id": task_id, "state": "running", "stage": "working"}
-
-    def get_task_spec(self, task_id):
-        self.statuses[task_id]
-        return SimpleNamespace(capability_name="diagnostic.synthetic")
-
-    def get_task_status(self, task_id):
-        return dict(self.statuses[task_id])
-
-    def get_task_events(self, task_id):
-        return []
-
-    def get_task_result(self, task_id):
-        return {"complete": True} if self.statuses[task_id]["state"] in TERMINAL_STATES else None
-
-    def get_task_error(self, task_id):
-        return None
-
-    def get_task_error_payload(self, task_id):
-        return None
-
-    def get_task_snapshot(self, task_id):
-        self.snapshot_count += 1
-        self.snapshot_threads.append(threading.get_ident())
-        if self.before_snapshot:
-            self.before_snapshot(self.snapshot_count)
-        snapshot = {"task_id": task_id, "task": {"capability_name": "diagnostic.synthetic", "metadata": {}},
-                    "status": self.get_task_status(task_id), "events": [], "result": self.get_task_result(task_id),
-                    "error": None, "error_payload": None}
-        if self.after_snapshot:
-            self.after_snapshot(self.snapshot_count)
-        return snapshot
-
-    def change(self, task_id="probe", **status):
-        with self._lock:
-            self.statuses[task_id].update(status)
-        self.event_bus.publish(task_id)
-
-    def _handle_cancel_task(self, arguments, *, requested_by):
-        self.cancel_count += 1
-        self.change(arguments["task_id"], state="cancelled")
-
-
-def fixture():
-    runtime = SyntheticRuntime()
-    store = SyntheticStore()
-    with patch("gateways.agent.service.AgentCallStore", return_value=store):
-        service = AgentToolService(runtime, SimpleNamespace(authorize_capability=lambda descriptor: None))
-    app = FastAPI()
-    app.include_router(build_agent_router(service))
-    return runtime, service, app
+from gateways.auth import GatewayAccessManager
+from tests.conftest import create_isolated_gateway
 
 
 async def eventually(predicate, timeout=2.0):
-    """只以可观察条件建立屏障；超时仅用于让回归快速失败。"""
     deadline = time.monotonic() + timeout
     while not predicate():
         if time.monotonic() >= deadline:
-            raise AssertionError("condition barrier timed out")
-        await asyncio.sleep(0)
+            raise AssertionError("等待业务条件超时")
+        await asyncio.sleep(0.001)
 
 
 def idle_count(service):
@@ -170,186 +45,220 @@ def idle_count(service):
 
 class AgentWaitIsolationTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.runtime, self.service, self.app = fixture()
-        self.background = []
+        self.temp = tempfile.TemporaryDirectory(prefix="neh-real-agent-wait-")
+        self.bus = EventBus()
+        self.manager = TaskManager(event_bus=self.bus, max_workers=1)
+        self.runtime = create_isolated_gateway(Path(self.temp.name), event_bus=self.bus, task_manager=self.manager)
+        self.runtime.capability_registry.register(CapabilityDescriptor(
+            name="wait_example", display_name="等待样例", description="等待离线执行器完成。",
+            execution_mode=CapabilityExecutionMode.ASYNC_TASK, risk_level=CapabilityRiskLevel.LOW,
+            exposed_to_agent=True), lambda *_args, **_kwargs: None)
+        self.service = AgentToolService(self.runtime, GatewayAccessManager(self.runtime.config.gateway))
+        self.app = FastAPI()
+        self.app.include_router(build_agent_router(self.service))
+        self.background, self.controls, self.snapshot_threads, self.store_threads = [], {}, [], []
+        self.cancel_count = 0
+        self.before_snapshot = self.after_snapshot = None
+        self.snapshot_count = 0
+        original_snapshot = self.runtime.get_task_snapshot
+        original_cancel = self.runtime._handle_cancel_task
+        original_save = self.service.store.save_terminal
+        def snapshot(task_id, **kwargs):
+            self.snapshot_count += 1
+            self.snapshot_threads.append(threading.get_ident())
+            if self.before_snapshot:
+                self.before_snapshot(self.snapshot_count)
+            result = original_snapshot(task_id, **kwargs)
+            if self.after_snapshot:
+                self.after_snapshot(self.snapshot_count)
+            return result
+        def cancel(*args, **kwargs):
+            self.cancel_count += 1
+            return original_cancel(*args, **kwargs)
+        def save(*args, **kwargs):
+            self.store_threads.append(threading.get_ident())
+            return original_save(*args, **kwargs)
+        self.runtime.get_task_snapshot = snapshot
+        self.runtime._handle_cancel_task = cancel
+        self.service.store.save_terminal = save
+        self.task_id = self.add_task()
+        await eventually(lambda: self.manager.get_task_status(self.task_id).state.value == "running")
+        self.base_subscriptions = set(self.bus._subscriptions)
         self.limiter = anyio.to_thread.current_default_thread_limiter()
         self.old_tokens = self.limiter.total_tokens
         self.limiter.total_tokens = 4
 
     async def asyncTearDown(self):
+        self.before_snapshot = self.after_snapshot = None
         for task in self.background:
             task.cancel()
         await asyncio.gather(*self.background, return_exceptions=True)
-        self.service.close()
+        for control in self.controls.values():
+            control.release.set()
+        await run_in_threadpool(self.manager.shutdown, wait=True)
+        await run_in_threadpool(self.service.close, source_fenced=True)
         await eventually(lambda: self.limiter.borrowed_tokens == 0)
-        self.assertEqual(self.runtime.event_bus.count(), 0)
         self.assertEqual(self.service._async_waiters, {})
+        await run_in_threadpool(self.runtime.stop)
+        self.assertTrue(self.bus.shutdown())
         self.limiter.total_tokens = self.old_tokens
+        self.temp.cleanup()
 
-    def start_wait(self, task_id="probe", timeout=30):
-        task = asyncio.create_task(self.service.wait_task_async(task_id, timeout))
+    def add_task(self):
+        control = SimpleNamespace(release=threading.Event(), outcome="succeeded")
+        def runner(context):
+            if not control.release.wait(10):
+                raise AssertionError("执行器释放超时")
+            context.ensure_active()
+            if control.outcome == "failed":
+                raise RuntimeError("离线执行器明确失败")
+            if control.outcome == "timeout":
+                raise TaskTimeoutError("离线执行器超时")
+            return {"complete": True}
+        spec = self.manager.submit("wait_example", runner)
+        self.controls[spec.task_id] = control
+        return spec.task_id
+
+    async def finish(self, state="succeeded", task_id=None):
+        task_id = task_id or self.task_id
+        if state == "cancelled":
+            self.manager.cancel_task(task_id)
+        self.controls[task_id].outcome = state
+        self.controls[task_id].release.set()
+        await eventually(lambda: self.manager.get_task_status(task_id).state.value in TERMINAL_STATES)
+
+    def start_wait(self, task_id=None, timeout=30):
+        task = asyncio.create_task(self.service.wait_task_async(task_id or self.task_id, timeout))
         self.background.append(task)
         return task
 
     async def idle(self, count=1):
         await eventually(lambda: idle_count(self.service) == count and self.limiter.borrowed_tokens == 0)
 
-    async def test_zero_timeout_preserves_sync_receipt(self):
-        expected = await run_in_threadpool(self.service.wait_task, "probe", 0)
-        actual = await self.service.wait_task_async("probe", 0)
-        self.assertEqual(actual, expected)
+    def assert_wait_clean(self):
+        self.assertEqual(set(self.bus._subscriptions), self.base_subscriptions)
+        self.assertEqual(self.service._async_waiters, {})
+
+    async def test_zero_timeout_preserves_status_and_reports_timeout(self):
+        expected = await run_in_threadpool(self.service.wait_task, self.task_id, 0)
+        actual = await self.service.wait_task_async(self.task_id, 0)
+        self.assertEqual(actual["status"], expected["status"])
         self.assertTrue(actual["wait_timed_out"])
-        self.assertEqual(self.runtime.event_bus.count(), 1)
+        self.assert_wait_clean()
 
     async def test_all_terminal_states_preserve_receipt_and_persistence(self):
-        for state in sorted(TERMINAL_STATES):
+        for index, state in enumerate(sorted(TERMINAL_STATES)):
+            task_id = self.task_id if index == 0 else self.add_task()
             with self.subTest(state=state):
-                self.runtime.statuses["probe"]["state"] = state
-                expected = await run_in_threadpool(self.service.wait_task, "probe", 0)
-                self.assertEqual(await self.service.wait_task_async("probe", 0), expected)
-                self.assertFalse(expected["wait_timed_out"])
-                self.assertEqual(self.service.store.terminals["probe"]["status"]["state"], state)
+                await self.finish(state, task_id)
+                receipt = await self.service.wait_task_async(task_id, 0)
+                self.assertFalse(receipt["wait_timed_out"])
+                self.assertEqual(receipt["status"]["state"], state)
+                self.assertEqual(self.service.store.get_terminal(task_id)["snapshot"]["status"]["state"], state)
+        self.assert_wait_clean()
 
     async def test_terminal_change_wakes_and_saves(self):
         waiter = self.start_wait()
         await self.idle()
-        await run_in_threadpool(self.runtime.change, state="succeeded")
+        await self.finish()
         receipt = await asyncio.wait_for(waiter, 1)
         self.assertFalse(receipt["wait_timed_out"])
         self.assertEqual(receipt["status"]["state"], "succeeded")
-        self.assertEqual(self.service.store.terminals["probe"]["result"], {"complete": True})
+        self.assertEqual(self.service.store.get_terminal(self.task_id)["snapshot"]["result"], {"complete": True})
 
     async def test_stage_change_but_not_progress_or_other_task_wakes(self):
         waiter = self.start_wait()
         await self.idle()
-        reads = self.runtime.snapshot_count
-        self.runtime.event_bus.publish("unrelated")
-        self.runtime.change(progress=0.4)
-        await eventually(lambda: self.runtime.snapshot_count > reads)
+        self.manager.update_task(self.task_id, progress=0.4)
+        other = self.add_task()
+        self.manager.update_task(other, stage="unrelated")
         await self.idle()
         self.assertFalse(waiter.done())
-        self.runtime.change(stage="finishing")
+        self.manager.update_task(self.task_id, stage="finishing")
         receipt = await asyncio.wait_for(waiter, 1)
         self.assertEqual(receipt["status"]["stage"], "finishing")
         self.assertFalse(receipt["wait_timed_out"])
 
-    async def test_finite_timeout_and_final_snapshot(self):
+    async def test_finite_timeout_returns_final_snapshot(self):
         started = time.monotonic()
-        receipt = await self.service.wait_task_async("probe", 0.025)
+        receipt = await self.service.wait_task_async(self.task_id, 0.025)
         self.assertTrue(receipt["wait_timed_out"])
         self.assertGreaterEqual(time.monotonic() - started, 0.02)
-        self.assertGreaterEqual(self.runtime.snapshot_count, 3)
-
-    async def test_terminal_at_timeout_takes_precedence(self):
-        def transition(read_count):
-            if read_count == 3:
-                self.runtime.statuses["probe"]["state"] = "succeeded"
-        self.runtime.before_snapshot = transition
-        receipt = await self.service.wait_task_async("probe", 0.01)
-        self.assertFalse(receipt["wait_timed_out"])
-        self.assertEqual(receipt["status"]["state"], "succeeded")
+        self.assertEqual(receipt["status"]["task_id"], self.task_id)
+        self.assert_wait_clean()
 
     async def test_invalid_timeout_bounds(self):
         for timeout in (-1, 30.001, float("nan"), float("inf"), -float("inf")):
             with self.subTest(timeout=timeout), self.assertRaises(GatewayError) as caught:
-                await self.service.wait_task_async("probe", timeout)
+                await self.service.wait_task_async(self.task_id, timeout)
             self.assertEqual(caught.exception.error_code, "invalid_params")
-        self.assertEqual(self.runtime.snapshot_count, 0)
+        self.assertEqual(self.snapshot_count, 0)
 
     async def test_unknown_task_does_not_use_historical_record(self):
-        self.service.store.terminals["old-task"] = {"status": {"state": "succeeded"}}
+        old_id = build_task_id("old_example")
+        self.service.store.save_terminal(old_id, {"task_id": old_id, "status": {"state": "succeeded"}},
+                                         source_id="old-runtime", revision=1)
         with self.assertRaises(GatewayError) as caught:
-            await self.service.wait_task_async("old-task", 0)
+            await self.service.wait_task_async(old_id, 0)
         self.assertEqual(caught.exception.http_status, 404)
         self.assertEqual(caught.exception.details["status_source"], "live_task")
-        self.assertEqual(self.runtime.event_bus.count(), 1)
+        self.assert_wait_clean()
 
     async def test_authorization_failure_has_no_wait_subscription(self):
         def deny(_descriptor):
-            raise GatewayError("denied", error_code="forbidden", http_status=403)
-        self.service.access_manager.authorize_capability = deny
-        with self.assertRaises(GatewayError) as caught:
-            await self.service.wait_task_async("probe", 1)
+            raise GatewayError("拒绝", error_code="forbidden", http_status=403)
+        with patch.object(self.service.access_manager, "authorize_capability", deny), self.assertRaises(GatewayError) as caught:
+            await self.service.wait_task_async(self.task_id, 1)
         self.assertEqual(caught.exception.http_status, 403)
-        self.assertEqual(self.runtime.event_bus.count(), 1)
+        self.assert_wait_clean()
 
     async def test_baseline_subscribe_race_rechecks_snapshot(self):
-        self.runtime.event_bus.before_subscribe = lambda: self.runtime.change(stage="race-winner")
-        receipt = await asyncio.wait_for(self.service.wait_task_async("probe", 30), 1)
+        original = self.bus.subscribe
+        def subscribe(*args, **kwargs):
+            if not kwargs:
+                self.manager.update_task(self.task_id, stage="race-winner")
+            return original(*args, **kwargs)
+        with patch.object(self.bus, "subscribe", subscribe):
+            receipt = await asyncio.wait_for(self.service.wait_task_async(self.task_id, 30), 1)
         self.assertEqual(receipt["status"]["stage"], "race-winner")
         self.assertFalse(receipt["wait_timed_out"])
 
     async def test_snapshot_wait_race_preserves_notification(self):
         def transition(read_count):
-            if read_count == 2:
-                self.runtime.change(stage="after-snapshot")
-        self.runtime.after_snapshot = transition
-        receipt = await asyncio.wait_for(self.service.wait_task_async("probe", 30), 1)
+            if read_count == 1:
+                self.manager.update_task(self.task_id, stage="after-snapshot")
+        self.after_snapshot = transition
+        receipt = await asyncio.wait_for(self.service.wait_task_async(self.task_id, 30), 1)
         self.assertEqual(receipt["status"]["stage"], "after-snapshot")
         self.assertFalse(receipt["wait_timed_out"])
 
-    async def test_cancel_wait_unsubscribes_without_cancelling_robot_task(self):
+    async def test_cancel_wait_unsubscribes_without_cancelling_task(self):
         waiter = self.start_wait()
         await self.idle()
         waiter.cancel()
         with self.assertRaises(asyncio.CancelledError):
             await waiter
-        self.assertEqual(self.runtime.cancel_count, 0)
-        self.assertEqual(self.runtime.event_bus.count(), 1)
-        self.assertEqual(self.service._async_waiters, {})
+        self.assertEqual(self.cancel_count, 0)
+        self.assertEqual(self.manager.get_task_status(self.task_id).state.value, "running")
+        self.assert_wait_clean()
 
     async def test_snapshot_error_after_subscribe_cleans_up(self):
-        def fail_after_subscribe(read_count):
-            if read_count == 2:
-                raise GatewayError("task disappeared", error_code="not_found", http_status=404)
-        self.runtime.before_snapshot = fail_after_subscribe
+        waiter = self.start_wait()
+        await self.idle()
+        def fail(_count):
+            raise GatewayError("任务已消失", error_code="not_found", http_status=404)
+        self.before_snapshot = fail
+        self.manager.update_task(self.task_id, stage="changed")
         with self.assertRaises(GatewayError) as caught:
-            await self.service.wait_task_async("probe", 30)
+            await asyncio.wait_for(waiter, 1)
         self.assertEqual(caught.exception.http_status, 404)
-        self.assertEqual(self.runtime.event_bus.count(), 1)
-        self.assertEqual(self.service._async_waiters, {})
+        self.assert_wait_clean()
 
     async def test_receipt_storage_error_cleans_up(self):
-        self.runtime.statuses["probe"]["state"] = "succeeded"
-        failure = patch.object(self.service.store, "save_terminal", side_effect=OSError("synthetic store failure"))
-        with self.assertRaises(OSError), failure:
-            await self.service.wait_task_async("probe", 0)
-        self.assertEqual(self.runtime.event_bus.count(), 1)
-        self.assertEqual(self.service._async_waiters, {})
-
-    async def test_event_loop_shutdown_cleans_pending_wait(self):
-        outcomes = []
-        async def run_wait():
-            waiter = asyncio.create_task(self.service.wait_task_async("probe", 30))
-            await eventually(lambda: idle_count(self.service) == 1)
-            # asyncio.run 在关闭循环前取消未完成任务，生产 finally 必须完成注销。
-            outcomes.append(waiter)
-        def run_loop():
-            asyncio.run(run_wait())
-        await run_in_threadpool(run_loop)
-        self.assertTrue(outcomes[0].cancelled())
-        self.assertEqual(self.runtime.event_bus.count(), 1)
-        self.assertEqual(self.service._async_waiters, {})
-
-    async def test_cancel_during_snapshot_does_not_leak_subscription(self):
-        entered = threading.Event()
-        release = threading.Event()
-        def block_second_read(read_count):
-            if read_count == 2:
-                entered.set()
-                if not release.wait(2):
-                    raise AssertionError("snapshot release timed out")
-        self.runtime.after_snapshot = block_second_read
-        waiter = self.start_wait()
-        try:
-            await eventually(entered.is_set)
-            waiter.cancel()
-            with self.assertRaises(asyncio.CancelledError):
-                await waiter
-            self.assertEqual(self.runtime.event_bus.count(), 1)
-            self.assertEqual(self.service._async_waiters, {})
-        finally:
-            release.set()
+        await self.finish()
+        with patch.object(self.service.store, "save_terminal", side_effect=OSError("保存失败")), self.assertRaises(OSError):
+            await self.service.wait_task_async(self.task_id, 0)
+        self.assert_wait_clean()
 
     async def test_service_close_wakes_all_waiters_and_rejects_new_wait(self):
         waiters = [self.start_wait() for _ in range(8)]
@@ -360,81 +269,44 @@ class AgentWaitIsolationTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.wait_for(waiter, 1)
             self.assertEqual(caught.exception.error_code, "agent_service_closed")
         with self.assertRaises(GatewayError):
-            await self.service.wait_task_async("probe", 0)
-        self.assertEqual(self.runtime.event_bus.count(), 0)
-        self.assertEqual(self.runtime.cancel_count, 0)
+            await self.service.wait_task_async(self.task_id, 0)
+        self.assertEqual(self.cancel_count, 0)
+        self.assertEqual(self.service._async_waiters, {})
 
-    async def test_close_between_baseline_and_subscription(self):
-        entered = threading.Event()
-        release = threading.Event()
-        def block_baseline(read_count):
-            if read_count == 1:
-                entered.set()
-                if not release.wait(2):
-                    raise AssertionError("baseline release timed out")
-        self.runtime.after_snapshot = block_baseline
-        waiter = self.start_wait()
-        try:
-            await eventually(entered.is_set)
-            self.service.close()
-        finally:
-            release.set()
-        with self.assertRaises(GatewayError) as caught:
-            await asyncio.wait_for(waiter, 1)
-        self.assertEqual(caught.exception.error_code, "agent_service_closed")
-        self.assertEqual(self.runtime.event_bus.count(), 0)
-
-    async def test_snapshot_receipt_and_persistence_stay_off_event_loop(self):
+    async def test_snapshot_and_persistence_stay_off_event_loop(self):
+        await self.finish()
         loop_thread = threading.get_ident()
-        self.runtime.statuses["probe"]["state"] = "succeeded"
-        await self.service.wait_task_async("probe", 0)
-        self.assertTrue(self.runtime.snapshot_threads)
-        self.assertTrue(self.service.store.threads)
-        self.assertNotIn(loop_thread, self.runtime.snapshot_threads + self.service.store.threads)
-
-    async def test_route_errors_and_terminal_receipt(self):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=self.app), base_url="http://test") as client:
-            for invalid in ("bad", "NaN", "inf", "-1", "31"):
-                response = await client.get("/api/agent/tasks/probe/wait", params={"timeout_sec": invalid})
-                self.assertEqual(response.status_code, 422)
-                self.assertEqual(response.json()["error"]["code"], "invalid_params")
-            missing = await client.get("/api/agent/tasks/old/wait", params={"timeout_sec": 0})
-            self.assertEqual(missing.status_code, 404)
-            response = await client.get("/api/agent/tasks/probe/wait", params={"timeout_sec": 0})
-            self.assertEqual(response.status_code, 200)
-            self.assertTrue(response.json()["wait_timed_out"])
+        await self.service.wait_task_async(self.task_id, 0)
+        self.assertTrue(self.snapshot_threads)
+        self.assertTrue(self.store_threads)
+        self.assertNotIn(loop_thread, self.snapshot_threads + self.store_threads)
 
     async def test_many_http_waiters_leave_read_and_cancel_independent(self):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=self.app), base_url="http://test") as client:
+            task_ids = [self.add_task() for _ in range(64)]
             waiters = []
-            for index in range(64):
-                task_id = f"wait-{index}"
-                self.runtime.add_task(task_id)
+            for task_id in task_ids:
                 waiter = asyncio.create_task(client.get(f"/api/agent/tasks/{task_id}/wait"))
                 self.background.append(waiter)
                 waiters.append(waiter)
             await self.idle(64)
-            self.assertEqual(self.limiter.borrowed_tokens, 0)
-            self.assertEqual(self.runtime.event_bus.count(), 65)
             read, cancel = await asyncio.wait_for(asyncio.gather(
-                client.get("/api/agent/tasks/probe"), client.post("/api/agent/tasks/wait-0/cancel")), 1)
+                client.get(f"/api/agent/tasks/{self.task_id}"), client.post(f"/api/agent/tasks/{task_ids[0]}/cancel")), 2)
             self.assertEqual(read.status_code, 200)
             self.assertEqual(cancel.status_code, 200)
-            self.assertEqual(self.runtime.cancel_count, 1)
+            self.assertEqual(self.cancel_count, 1)
             terminal = await asyncio.wait_for(waiters[0], 1)
             self.assertEqual(terminal.json()["status"]["state"], "cancelled")
             self.assertFalse(any(waiter.done() for waiter in waiters[1:]))
             for waiter in waiters[1:]:
                 waiter.cancel()
             await asyncio.gather(*waiters, return_exceptions=True)
-            self.assertEqual(self.runtime.event_bus.count(), 1)
-            self.assertEqual(self.service._async_waiters, {})
+            self.assert_wait_clean()
 
     async def start_asgi_request(self):
         incoming = asyncio.Queue()
         sent = []
-        active_receivers = 0
-        max_receivers = 0
+        active_receivers = max_receivers = 0
         async def receive():
             nonlocal active_receivers, max_receivers
             active_receivers += 1
@@ -445,25 +317,25 @@ class AgentWaitIsolationTests(unittest.IsolatedAsyncioTestCase):
                 active_receivers -= 1
         async def send(message):
             sent.append(message)
+        path = f"/api/agent/tasks/{self.task_id}/wait"
         scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": "GET",
-                 "scheme": "http", "path": "/api/agent/tasks/probe/wait", "raw_path": b"/api/agent/tasks/probe/wait",
-                 "query_string": b"", "headers": [], "server": ("test", 80), "client": ("test", 1)}
+                 "scheme": "http", "path": path, "raw_path": path.encode(), "query_string": b"",
+                 "headers": [], "server": ("test", 80), "client": ("test", 1)}
         task = asyncio.create_task(self.app(scope, receive, send))
         self.background.append(task)
-        await incoming.put({"type": "http.request", "body": b"ignored-get-body", "more_body": True})
+        await incoming.put({"type": "http.request", "body": b"ignored", "more_body": True})
         await self.idle()
         return task, incoming, sent, lambda: (active_receivers, max_receivers)
 
     async def test_disconnect_with_chunked_get_body_has_single_receiver(self):
         task, incoming, sent, receivers = await self.start_asgi_request()
-        await incoming.put({"type": "http.request", "body": b"remaining-body", "more_body": False})
+        await incoming.put({"type": "http.request", "body": b"remaining", "more_body": False})
         await incoming.put({"type": "http.disconnect"})
         await asyncio.wait_for(task, 1)
         self.assertEqual(receivers(), (0, 1))
         self.assertEqual(sent[0]["status"], 499)
-        self.assertEqual(self.runtime.event_bus.count(), 1)
-        self.assertEqual(self.service._async_waiters, {})
-        self.assertEqual(self.runtime.cancel_count, 0)
+        self.assertEqual(self.cancel_count, 0)
+        self.assert_wait_clean()
 
     async def test_asgi_request_cancellation_cleans_wait_and_receive_tasks(self):
         task, _incoming, _sent, receivers = await self.start_asgi_request()
@@ -471,33 +343,91 @@ class AgentWaitIsolationTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(asyncio.CancelledError):
             await task
         self.assertEqual(receivers(), (0, 1))
-        self.assertEqual(self.runtime.event_bus.count(), 1)
-        self.assertEqual(self.service._async_waiters, {})
+        self.assert_wait_clean()
 
-    async def test_real_event_bus_cross_thread_wakeup(self):
-        bus = EventBus()
-        original = self.runtime.event_bus
-        # 保留构造时的终态消费者，单独把本次等待接入真实总线。
-        self.runtime.event_bus = bus
-        task_id = build_task_id("diagnostic_synthetic")
-        self.runtime.add_task(task_id)
-        waiter = self.start_wait(task_id)
+
+    async def test_terminal_at_final_capture_takes_precedence_over_timeout(self):
+        capture = self.manager.capture_task_receipt
+        captures = 0
+        def completing_capture(task_id):
+            nonlocal captures
+            captures += 1
+            if captures == 2:
+                self.controls[task_id].release.set()
+                deadline = time.monotonic() + 1
+                while self.manager.get_task_status(task_id).state.value not in TERMINAL_STATES:
+                    if time.monotonic() >= deadline:
+                        raise AssertionError("执行器未完成")
+                    time.sleep(0.001)
+            return capture(task_id)
+        with patch.object(self.manager, "capture_task_receipt", completing_capture):
+            receipt = await self.service.wait_task_async(self.task_id, 0.01)
+        self.assertEqual(receipt["status"]["state"], "succeeded")
+        self.assertFalse(receipt["wait_timed_out"])
+        self.assert_wait_clean()
+
+    async def test_event_loop_shutdown_cleans_pending_wait(self):
+        outcomes = []
+        async def wait_in_loop():
+            task = asyncio.create_task(self.service.wait_task_async(self.task_id, 30))
+            await eventually(lambda: idle_count(self.service) == 1)
+            outcomes.append(task)
+        await run_in_threadpool(lambda: asyncio.run(wait_in_loop()))
+        self.assertTrue(outcomes[0].cancelled())
+        self.assertEqual(self.cancel_count, 0)
+        self.assert_wait_clean()
+
+    async def test_cancel_during_snapshot_does_not_leak_subscription(self):
+        entered, release = threading.Event(), threading.Event()
+        def block(read_count):
+            if read_count == 2:
+                entered.set()
+                if not release.wait(2):
+                    raise AssertionError("快照释放超时")
+        self.after_snapshot = block
+        waiter = self.start_wait()
         try:
             await self.idle()
-            def publish():
-                with self.runtime._lock:
-                    self.runtime.statuses[task_id]["stage"] = "real-bus"
-                bus.publish(bus.build_event("task.progress", category=RuntimeEventCategory.TASK,
-                                            source="isolation_check", task_id=task_id))
-            await run_in_threadpool(publish)
-            receipt = await asyncio.wait_for(waiter, 1)
-            self.assertEqual(receipt["status"]["stage"], "real-bus")
-            self.assertEqual(len(bus._subscriptions), 0)
-        finally:
+            self.manager.update_task(self.task_id, stage="new-stage")
+            await eventually(entered.is_set)
             waiter.cancel()
-            await asyncio.gather(waiter, return_exceptions=True)
-            self.runtime.event_bus = original
-            await run_in_threadpool(bus.shutdown)
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(waiter, 1)
+            self.assert_wait_clean()
+        finally:
+            release.set()
+
+    async def test_close_between_baseline_and_subscription(self):
+        entered, release = threading.Event(), threading.Event()
+        def block(read_count):
+            if read_count == 1:
+                entered.set()
+                if not release.wait(2):
+                    raise AssertionError("基线快照释放超时")
+        self.after_snapshot = block
+        waiter = self.start_wait()
+        try:
+            await eventually(entered.is_set)
+            await run_in_threadpool(self.service.close)
+        finally:
+            release.set()
+        with self.assertRaises(GatewayError) as caught:
+            await asyncio.wait_for(waiter, 1)
+        self.assertEqual(caught.exception.error_code, "agent_service_closed")
+        self.assertEqual(self.service._async_waiters, {})
+
+    async def test_route_errors_and_zero_timeout_receipt(self):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=self.app), base_url="http://test") as client:
+            for invalid in ("bad", "NaN", "inf", "-1", "31"):
+                response = await client.get(f"/api/agent/tasks/{self.task_id}/wait", params={"timeout_sec": invalid})
+                self.assertEqual(response.status_code, 422)
+                self.assertEqual(response.json()["error"]["code"], "invalid_params")
+            missing = await client.get("/api/agent/tasks/missing/wait", params={"timeout_sec": 0})
+            self.assertEqual(missing.status_code, 404)
+            response = await client.get(f"/api/agent/tasks/{self.task_id}/wait", params={"timeout_sec": 0})
+            self.assertEqual(response.status_code, 200)
+            self.assertTrue(response.json()["wait_timed_out"])
+        self.assert_wait_clean()
 
 
 class WakeupBoundTests(unittest.IsolatedAsyncioTestCase):

@@ -4,13 +4,6 @@
 //! fail-closed candidate boundary and adds the Geometry-owned canonical apply
 //! transaction plus the retained production transport lifecycle.
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the correction contract retains validation helpers beyond the production call surface"
-    )
-)]
 mod preflight_only_contract {
 
     use std::collections::{HashMap, HashSet, VecDeque};
@@ -80,6 +73,7 @@ mod preflight_only_contract {
     const CORRECTION_PHASE_A_PROCESS_STOP_SUCCEEDED: u8 = 4;
     const CORRECTION_PUBLISH_TIMEOUT: Duration = Duration::from_secs(2);
     const CORRECTION_APPLY_ACK_TIMEOUT: Duration = Duration::from_secs(5);
+    #[cfg(test)]
     const CORRECTION_WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(3);
     const CORRECTION_SHUTDOWN_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
     const CORRECTION_DISCARD_TIMEOUT: Duration = Duration::from_millis(250);
@@ -104,11 +98,11 @@ mod preflight_only_contract {
     const RELOCALIZATION_MAX_FRAME_PROOF_SCOPES: usize = 8;
     const RELOCALIZATION_MAX_FRAME_PROOFS_PER_SCOPE: usize = 16;
     const RELOCALIZATION_MAX_FRAME_PROOFS_TOTAL: usize = 64;
-    const RELOCALIZATION_SCHEMA_VERSION_V1: u32 = 1;
     const RELOCALIZATION_MIN_LOGICAL_TIMEOUT_MS: u64 = 250;
     const RELOCALIZATION_MAX_LOGICAL_TIMEOUT_MS: u64 = 30_000;
     const RELOCALIZATION_ACCUMULATION_TIMEOUT: Duration = Duration::from_secs(2);
     pub(crate) const RELOCALIZATION_MAX_FRAMES: usize = 8;
+    #[cfg(test)]
     const RELOCALIZATION_MIN_AGGREGATE_POINTS: usize = 50_000;
     // 原匹配算法的数学输入下限；五万点只是收集目标，不代表几何质量。
     const RELOCALIZATION_MIN_SOURCE_POINTS: usize = 3;
@@ -119,37 +113,34 @@ mod preflight_only_contract {
     pub(crate) const RELOCALIZATION_MAX_PROOF_BYTES: usize = 4_096;
     const RELOCALIZATION_MAX_ENVELOPE_DATA_BYTES: usize = 25_600_000;
     const RELOCALIZATION_TARGET_POLL_INTERVAL: Duration = Duration::from_millis(10);
-    const RELOCALIZATION_EVIDENCE_DOMAIN_V1: &[u8] = b"nuwax.geometry.relocalize.evidence.v1\0";
+    #[cfg(test)]
     const RELOCALIZATION_EVIDENCE_DISCLOSURE_DOMAIN_V1: &[u8] =
         b"nuwax.geometry.relocalize.evidence-disclosure.v1\0";
-    const RELOCALIZATION_EVIDENCE_COMPOSITE_DOMAIN_V1: &[u8] =
-        b"nuwax.geometry.relocalize.evidence-composite.v1\0";
-    const RELOCALIZATION_SOURCE_COMMITMENT_DOMAIN_V1: &[u8] =
-        b"nuwax.geometry.relocalize.source-commitment.v1\0";
-    const RELOCALIZATION_TERMINAL_PROOF_DOMAIN_V1: &[u8] =
-        b"nuwax.geometry.relocalize.terminal-proof.v1\0";
     pub(crate) const RELOCALIZATION_MAX_CANDIDATE_PREIMAGE_BYTES: usize = 4096;
+    #[cfg(test)]
     const RELOCALIZATION_MAX_INLINE_EVIDENCE_PREIMAGE_BYTES: usize = 4_096;
     pub(crate) const RELOCALIZATION_MAX_EVIDENCE_PREFIX_BYTES: usize = 16_384;
     pub(crate) const RELOCALIZATION_MAX_EVIDENCE_SUFFIX_BYTES: usize = 4_096;
-    const RELOCALIZATION_MAX_CANONICAL_SOURCE_BYTES: usize =
-        8 + RELOCALIZATION_MAX_EMITTED_POINTS * 3 * std::mem::size_of::<f64>();
     pub(crate) const RELOCALIZATION_MAX_EVIDENCE_DISCLOSURE_BYTES: usize =
         RELOCALIZATION_MAX_EVIDENCE_PREFIX_BYTES + RELOCALIZATION_MAX_EVIDENCE_SUFFIX_BYTES + 256;
+    #[cfg(test)]
     const RELOCALIZATION_MAX_INLINE_EVIDENCE_DISCLOSURE_BYTES: usize =
         RELOCALIZATION_EVIDENCE_DISCLOSURE_DOMAIN_V1.len()
             + std::mem::size_of::<u32>()
             + std::mem::size_of::<u8>()
             + std::mem::size_of::<u64>()
             + RELOCALIZATION_MAX_INLINE_EVIDENCE_PREIMAGE_BYTES;
+    #[cfg(test)]
     const RELOCALIZATION_MAX_DISCLOSURE_BYTES_PER_TERMINAL: usize =
         RELOCALIZATION_MAX_CANDIDATE_PREIMAGE_BYTES + RELOCALIZATION_MAX_EVIDENCE_DISCLOSURE_BYTES;
+    #[cfg(test)]
     const RELOCALIZATION_MAX_DISCLOSURE_BYTES_PER_COMMAND_RECORD: usize =
         RELOCALIZATION_MAX_DISCLOSURE_BYTES_PER_TERMINAL
             + (RELOCALIZATION_MAX_CONFLICTS_PER_RECORD + 1)
                 * RELOCALIZATION_MAX_INLINE_EVIDENCE_DISCLOSURE_BYTES;
     // StoredRelocalizationResult keeps both the protobuf value and its exact
     // encoded replay bytes, so disclosure payloads have a conservative 2x cap.
+    #[cfg(test)]
     const RELOCALIZATION_MAX_RETAINED_DISCLOSURE_BYTES: usize = 2
         * RELOCALIZATION_MAX_COMMAND_RECORDS
         * RELOCALIZATION_MAX_DISCLOSURE_BYTES_PER_COMMAND_RECORD;
@@ -408,18 +399,6 @@ mod preflight_only_contract {
                 &self.0
             }
 
-            #[cfg(test)]
-            pub(super) fn from_unvalidated_test_parts(
-                identity: CorrectionCandidateIdentity,
-                transform: CorrectionTransform,
-                trajectory: Vec<native_pgo_codec::OptimizedKeyframe>,
-            ) -> Self {
-                Self(Arc::new(CorrectionCandidateData {
-                    identity,
-                    transform,
-                    trajectory,
-                }))
-            }
 
             // 反例必须建立新的拥有方，不能修改已经发布或共享的候选。
             #[cfg(test)]
@@ -443,7 +422,7 @@ mod preflight_only_contract {
             pub(crate) fn encode_body(&self) -> Result<Vec<u8>, CorrectionWireError> {
                 self.validate_integrity()
                     .map_err(|reason| CorrectionWireError::Invalid(reason.to_string()))?;
-                let mut out = self
+                let out = self
                     .encode_body_prefix()
                     .map_err(|reason| CorrectionWireError::Invalid(reason.to_string()))?;
                 if out.len() > MAX_WIRE_PAYLOAD_BYTES - CORRECTION_CANDIDATE_FINGERPRINT_V3.len() {
@@ -454,6 +433,7 @@ mod preflight_only_contract {
                 Ok(out)
             }
 
+            #[cfg(test)]
             /// Encode a complete generated LCM message: one fingerprint plus body.
             pub(crate) fn encode_wire(&self) -> Result<Vec<u8>, CorrectionWireError> {
                 let body = self.encode_body()?;
@@ -464,6 +444,7 @@ mod preflight_only_contract {
                 Ok(out)
             }
 
+            #[cfg(test)]
             pub(crate) fn decode_wire(encoded: &[u8]) -> Result<Self, CorrectionWireError> {
                 if encoded.len() > MAX_WIRE_PAYLOAD_BYTES {
                     return Err(CorrectionWireError::Invalid(
@@ -963,9 +944,6 @@ mod preflight_only_contract {
         Ok(())
     }
 
-    fn digest_is_present(digest: &[u8; 32]) -> bool {
-        digest.iter().any(|byte| *byte != 0)
-    }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub(crate) enum CorrectionRejectReason {
@@ -1243,7 +1221,6 @@ mod preflight_only_contract {
         ReceiptMismatch,
     }
 
-    #[cfg_attr(test, allow(dead_code))]
     #[derive(Clone, Debug)]
     pub(crate) enum CorrectionOwnerSpec {
         None,
@@ -1264,7 +1241,7 @@ mod preflight_only_contract {
             odom_frame_id: String,
             body_frame_id: String,
         },
-        Deferred {
+        #[cfg(test)] Deferred {
             backend: CorrectionBackend,
         },
     }
@@ -1362,9 +1339,11 @@ mod preflight_only_contract {
                 Self::None | Self::LibraryPgo { .. } => CorrectionCandidateBackend::LibraryPgo,
                 Self::NativePgo { .. } => CorrectionCandidateBackend::NativePgo,
                 Self::Relocalization { .. } => CorrectionCandidateBackend::Relocalization,
+                #[cfg(test)]
                 Self::Deferred {
                     backend: CorrectionBackend::Relocalization,
                 } => CorrectionCandidateBackend::Relocalization,
+                #[cfg(test)]
                 Self::Deferred { .. } => CorrectionCandidateBackend::LibraryPgo,
             }
         }
@@ -1678,6 +1657,7 @@ mod preflight_only_contract {
                 CorrectionOwnerSpec::Relocalization { .. } => {
                     Err(CorrectionOwnerError::BackendDeferred("relocalization"))
                 }
+                #[cfg(test)]
                 CorrectionOwnerSpec::Deferred { backend, .. } => {
                     Err(CorrectionOwnerError::BackendDeferred(backend.stable_name()))
                 }
@@ -2312,10 +2292,6 @@ mod preflight_only_contract {
             self.inner.known_finalized.load(Ordering::Acquire)
         }
 
-        #[cfg_attr(test, allow(dead_code))]
-        fn start_handoff_watchdog(&self, deadline: Instant) {
-            self.start_watchdog_once(deadline);
-        }
 
         fn start_watchdog_once(&self, deadline: Instant) {
             let mut watchdog_slot = self.inner.watchdog.lock();
@@ -2726,6 +2702,7 @@ mod preflight_only_contract {
     }
 
     impl GeometryCorrectionSink {
+        #[cfg(test)]
         pub(crate) fn new(
             owner_identity: CorrectionOwnerRuntimeIdentity,
             map_frame_id: impl Into<String>,
@@ -3442,6 +3419,7 @@ mod preflight_only_contract {
             }
         }
 
+        #[cfg(test)]
         fn cancellation(&self, key: CandidateApplyKey) -> Option<CorrectionRequestCancellation> {
             self.pending
                 .lock()
@@ -3498,30 +3476,8 @@ mod preflight_only_contract {
         out.extend_from_slice(value.as_bytes());
     }
 
-    fn canonical_push_bytes(out: &mut Vec<u8>, value: &[u8]) {
-        let length = u64::try_from(value.len()).expect("frozen canonical bytes fit u64");
-        out.extend_from_slice(&length.to_be_bytes());
-        out.extend_from_slice(value);
-    }
 
-    fn canonical_push_present_bytes(out: &mut Vec<u8>, value: &[u8]) {
-        if value.is_empty() {
-            out.push(0);
-        } else {
-            out.push(1);
-            canonical_push_bytes(out, value);
-        }
-    }
 
-    fn canonical_push_optional_digest(out: &mut Vec<u8>, value: Option<[u8; 32]>) {
-        match value {
-            Some(value) => {
-                out.push(1);
-                out.extend_from_slice(&value);
-            }
-            None => out.push(0),
-        }
-    }
 
     pub(crate) fn relocalization_source_policy_preimage_v1() -> Vec<u8> {
         let mut out = b"nuwax.geometry.relocalize.source-policy.v1\0".to_vec();
@@ -3650,7 +3606,8 @@ mod preflight_only_contract {
     }
 
     #[derive(Clone, Debug)]
-    #[cfg_attr(not(test), allow(dead_code))]
+
+    #[cfg(test)]
     pub(crate) struct SealedActivatedTargetSnapshot {
         pub(crate) runtime_generation: u64,
         pub(crate) lifecycle_epoch: u64,
@@ -3672,7 +3629,7 @@ mod preflight_only_contract {
     /// owner together. Capturing or cloning a snapshot never copies checkpoint/cloud bytes.
     /// This internal read surface does not enable assigned relocalization availability.
     #[derive(Clone, Debug)]
-    #[cfg_attr(not(test), allow(dead_code))]
+
     pub(crate) struct SealedAssignedActivatedTargetSnapshot {
         pub(crate) activation_identity: InstalledActivationIdentityV2,
         pub(crate) target_receipt: InstalledTargetReceiptV2,
@@ -4409,6 +4366,7 @@ mod preflight_only_contract {
             .flatten()
         }
 
+        #[cfg(test)]
         pub(crate) fn bind_assigned_activation_identity(
             &self,
             token: &ActivationToken,
@@ -4436,6 +4394,7 @@ mod preflight_only_contract {
             )
         }
 
+        #[cfg(test)]
         pub(crate) fn activation_identity(
             &self,
             token: &ActivationToken,
@@ -4564,6 +4523,7 @@ mod preflight_only_contract {
                     record.activation_identity.as_ref()
                         == Some(&ActivationIdentity::Assigned(value.clone()))
                 }
+                #[cfg(test)]
                 (Step::TargetReceiptVerification, Verifier::Target(value)) => {
                     record.target_receipt.as_ref() == Some(&TargetReceipt::Assigned(value.clone()))
                 }
@@ -4689,6 +4649,7 @@ mod preflight_only_contract {
             }
             Some((record.seed.planar_target.clone()?, record.terminal.clone()?))
         }
+        #[cfg(test)]
         pub(crate) fn immutable_target(
             &self,
             token: &ActivationToken,
@@ -4699,6 +4660,7 @@ mod preflight_only_contract {
                 .map(|target| (*target).clone())
         }
 
+        #[cfg(test)]
         pub(crate) fn checkpoint_owner(
             &self,
             token: &ActivationToken,
@@ -4726,7 +4688,7 @@ mod preflight_only_contract {
             .flatten()
         }
 
-        #[cfg_attr(not(test), allow(dead_code))]
+        #[cfg(test)]
         pub(crate) fn current_sealed_target_snapshot(
             &self,
         ) -> Option<SealedActivatedTargetSnapshot> {
@@ -4812,7 +4774,6 @@ mod preflight_only_contract {
             Some(snapshot)
         }
 
-        #[cfg_attr(not(test), allow(dead_code))]
         pub(crate) fn current_sealed_assigned_target_snapshot(
             &self,
         ) -> Option<SealedAssignedActivatedTargetSnapshot> {
@@ -5358,6 +5319,7 @@ mod preflight_only_contract {
     }
 
     impl CorrectionPhaseAControl {
+        #[cfg(test)]
         fn new(
             admission_open: Arc<AtomicBool>,
             admission_tx: watch::Sender<bool>,
@@ -6195,7 +6157,6 @@ mod preflight_only_contract {
         worker: Option<tokio::task::JoinHandle<Result<(), CorrectionRuntimeError>>>,
     }
 
-    #[allow(dead_code)]
     impl CorrectionCleanupSupervisor {
         fn start(sink: Arc<dyn CorrectionCandidateSink>) -> Self {
             let (sender, receiver) = mpsc::channel(CORRECTION_CLEANUP_QUEUE_CAPACITY);
@@ -6226,22 +6187,6 @@ mod preflight_only_contract {
             self.shutdown_tx.send_replace(true);
         }
 
-        async fn shutdown(&mut self) -> Result<(), CorrectionRuntimeError> {
-            self.request_shutdown();
-            let Some(worker) = self.worker.as_mut() else {
-                return Ok(());
-            };
-            let deadline = Instant::now() + CORRECTION_WORKER_STOP_TIMEOUT;
-            match settle_retained_correction_worker("correction cleanup", worker, deadline).await {
-                Some(result) => {
-                    self.worker.take();
-                    result
-                }
-                None => Err(CorrectionRuntimeError::WorkerStopTimeout(
-                    "correction cleanup",
-                )),
-            }
-        }
     }
 
     impl Drop for CorrectionCleanupSupervisor {
@@ -6351,6 +6296,7 @@ mod preflight_only_contract {
             self.shutdown_tx.send_replace(true);
         }
 
+        #[cfg(test)]
         async fn shutdown(&mut self) -> Result<(), CorrectionRuntimeError> {
             self.request_shutdown();
             let Some(worker) = self.worker.as_mut() else {
@@ -6567,6 +6513,7 @@ mod preflight_only_contract {
             Ok(result)
         }
 
+        #[cfg(test)]
         pub(crate) fn cancel_preclaim(&self) {
             if !self.signal.detached.swap(true, Ordering::AcqRel) {
                 let _ = self
@@ -6630,7 +6577,7 @@ mod preflight_only_contract {
         owner_identity: Option<CorrectionOwnerRuntimeIdentity>,
         sender: mpsc::Sender<RelocalizationAdmissionRequest>,
         terminal_query_sender: mpsc::Sender<RelocalizationTerminalQueryRequest>,
-        terminal_store: RelocalizationTerminalStore,
+        #[cfg(test)] terminal_store: RelocalizationTerminalStore,
         admission_open: Arc<AtomicBool>,
         admission_rx: watch::Receiver<bool>,
         waiter_capacity: Arc<Semaphore>,
@@ -6645,6 +6592,7 @@ mod preflight_only_contract {
                     && owner.correction_lease.boot_nonce.to_be_bytes().as_slice() == receipt.correction_lease_boot_nonce.as_slice()
             })
         }
+        #[cfg(test)]
         pub(crate) async fn admit(
             &self,
             request: crate::proto::RelocalizeRequest,
@@ -6767,7 +6715,7 @@ mod preflight_only_contract {
                 owner_identity: None,
                 sender,
                 terminal_query_sender,
-                terminal_store,
+                #[cfg(test)] terminal_store,
                 admission_open: Arc::new(AtomicBool::new(true)),
                 admission_rx,
                 waiter_capacity: Arc::new(Semaphore::new(RELOCALIZATION_MAX_WAITERS)),
@@ -6957,6 +6905,7 @@ mod preflight_only_contract {
         _test_root: Option<Arc<tests::RelocalizationTerminalTestRoot>>,
     }
 
+    #[cfg(test)]
     fn encode_hex(bytes: &[u8]) -> String {
         const HEX: &[u8; 16] = b"0123456789abcdef";
         let mut out = String::with_capacity(bytes.len() * 2);
@@ -7153,6 +7102,7 @@ mod preflight_only_contract {
         .then_some(owner)
     }
 
+    #[cfg(test)]
     fn is_owned_terminal_temporary_name(file_name: &str) -> bool {
         terminal_owner_token_from_temporary_name(file_name).is_some()
     }
@@ -7564,6 +7514,7 @@ mod preflight_only_contract {
             }
         }
 
+        #[cfg(test)]
         /// Explicit historical read. Aliases are opaque and never recomputed.
         pub(crate) fn snapshot(&self, request_id: &str, request_alias: [u8; 32], activation_alias: [u8; 32])
             -> RelocalizationTerminalSnapshot
@@ -7641,8 +7592,8 @@ mod preflight_only_contract {
             logical_deadline: Instant,
         },
         Joined {
-            admission_ordinal: u64,
-            logical_deadline: Instant,
+            #[cfg(test)] admission_ordinal: u64,
+            #[cfg(test)] logical_deadline: Instant,
         },
         Replay(StoredRelocalizationResult),
         Conflict(StoredRelocalizationResult),
@@ -7719,19 +7670,21 @@ mod preflight_only_contract {
                     if let Some(terminal) = &record.terminal {
                         return Ok(RelocalizationLedgerAdmission::Replay(terminal.clone()));
                     }
-                    let RelocalizationLedgerOrigin::Admitted(metadata) = &record.origin else {
+                    let RelocalizationLedgerOrigin::Admitted(_metadata) = &record.origin else {
                         return Err("RELOCALIZATION_RESTORED_TERMINAL_MISSING".into());
                     };
-                    let admission_ordinal = metadata.admission_ordinal;
-                    let logical_deadline = metadata.logical_deadline;
+                    #[cfg(test)]
+                    let admission_ordinal = _metadata.admission_ordinal;
+                    #[cfg(test)]
+                    let logical_deadline = _metadata.logical_deadline;
                     let record = self
                         .records
                         .get_mut(request.request_id())
                         .expect("relocalization record remains present");
                     record.waiter_ids.insert(waiter_id);
                     return Ok(RelocalizationLedgerAdmission::Joined {
-                        admission_ordinal,
-                        logical_deadline,
+                        #[cfg(test)] admission_ordinal,
+                        #[cfg(test)] logical_deadline,
                     });
                 }
                 if let Some(conflict) = record.conflicts.iter().find(|(identity, _)| identity == &request.key()).map(|(_, terminal)| terminal) {
@@ -8008,7 +7961,6 @@ mod preflight_only_contract {
         request: ValidatedRelocalizeRequest,
         admission_ordinal: u64,
         mode_epoch: u64,
-        logical_deadline: Instant,
         accumulation_deadline: Instant,
         snapshot: SealedAssignedActivatedTargetSnapshot,
         arm_watermark: Option<RelocalizationFrameKey>,
@@ -8022,7 +7974,6 @@ mod preflight_only_contract {
     struct RelocalizationComputedCommand {
         request: ValidatedRelocalizeRequest,
         admission_ordinal: u64,
-        logical_deadline: Instant,
         source: SealedRelocalizationSource,
         output: RelocalizationComputeOutput,
     }
@@ -8039,7 +7990,6 @@ mod preflight_only_contract {
         Computing {
             request: Box<ValidatedRelocalizeRequest>,
             admission_ordinal: u64,
-            logical_deadline: Instant,
             source_receipts: Vec<crate::proto::RelocalizationSourceReceiptV2>,
         },
         Reserving {
@@ -8078,6 +8028,7 @@ mod preflight_only_contract {
     }
 
     impl RelocalizationOwnerSupervisor {
+        #[cfg(test)]
         fn start(
             phase_a: CorrectionPhaseAControl,
             owner_identity: CorrectionOwnerRuntimeIdentity,
@@ -8153,7 +8104,7 @@ mod preflight_only_contract {
                 owner_identity: Some(owner_identity.clone()),
                 sender,
                 terminal_query_sender,
-                terminal_store: terminal_store.clone(),
+                #[cfg(test)] terminal_store: terminal_store.clone(),
                 admission_open: Arc::clone(&phase_a.admission_open),
                 admission_rx: phase_a.admission_tx.subscribe(),
                 waiter_capacity: Arc::new(Semaphore::new(RELOCALIZATION_MAX_WAITERS)),
@@ -8189,6 +8140,7 @@ mod preflight_only_contract {
                 .is_none_or(tokio::task::JoinHandle::is_finished)
         }
 
+        #[cfg(test)]
         async fn shutdown(&mut self) -> Result<(), CorrectionRuntimeError> {
             let Some(worker) = self.worker.as_mut() else {
                 return Ok(());
@@ -8230,6 +8182,7 @@ mod preflight_only_contract {
     }
 
     impl RelocalizationCommandActor {
+        #[cfg(test)]
         fn new(
             owner_identity: CorrectionOwnerRuntimeIdentity,
             map_frame_id: String,
@@ -8491,7 +8444,6 @@ mod preflight_only_contract {
                     request,
                     admission_ordinal,
                     mode_epoch,
-                    logical_deadline,
                     accumulation_deadline,
                     snapshot,
                     arm_watermark: None,
@@ -8888,7 +8840,6 @@ mod preflight_only_contract {
             let request_id = request_metadata.request_id().to_owned();
             let identity = request_metadata.key();
             let admission_ordinal = accumulation.admission_ordinal;
-            let logical_deadline = accumulation.logical_deadline;
             Self::reply_frame(request.response, CorrectionSubmitDisposition::NoCandidate);
             let source = match seal_relocalization_source(
                 *accumulation,
@@ -8906,7 +8857,7 @@ mod preflight_only_contract {
                 &self.map_frame_id, &self.odom_frame_id, &self.body_frame_id)).collect::<Result<Vec<_>, _>>()
                 .map_err(CorrectionRuntimeError::Apply)?;
             self.execution = Some(RelocalizationExecution::Computing {
-                request: Box::new(request_metadata), admission_ordinal, logical_deadline, source_receipts,
+                request: Box::new(request_metadata), admission_ordinal, source_receipts,
             });
             let source_points = Arc::clone(&source.source_points);
             let target_points = Arc::clone(&source.target_points);
@@ -9081,7 +9032,6 @@ mod preflight_only_contract {
                     let Some(RelocalizationExecution::Computing {
                         request,
                         admission_ordinal,
-                        logical_deadline,
                         ..
                     }) = self.execution.take()
                     else {
@@ -9098,7 +9048,6 @@ mod preflight_only_contract {
                     let computed = RelocalizationComputedCommand {
                         request: *request,
                         admission_ordinal,
-                        logical_deadline,
                         source: *source,
                         output,
                     };
@@ -10316,8 +10265,8 @@ mod preflight_only_contract {
         cleanup: CorrectionCleanupSupervisor,
         producer_worker: Option<tokio::task::JoinHandle<Result<(), CorrectionRuntimeError>>>,
         relocalization: Option<RelocalizationOwnerSupervisor>,
-        binding: Option<(LcmTopic, LcmMessageType)>,
-        independent_real_contexts: bool,
+        #[cfg(test)] binding: Option<(LcmTopic, LcmMessageType)>,
+        #[cfg(test)] independent_real_contexts: bool,
         #[cfg(test)]
         apply_waiters: Arc<CandidateApplyWaiters>,
         #[cfg(test)]
@@ -10330,6 +10279,7 @@ mod preflight_only_contract {
     }
 
     impl CorrectionTransportOwner {
+        #[cfg(test)]
         pub(crate) async fn start(
             spec: CorrectionOwnerSpec,
             identity: CorrectionOwnerRuntimeIdentity,
@@ -10394,7 +10344,7 @@ mod preflight_only_contract {
                         .await?,
                 )
             };
-            let (binding, publisher, subscription, independent_real_contexts) = match spec {
+            let (binding, publisher, subscription, _independent_real_contexts) = match spec {
                 CorrectionOwnerSpec::None => (None, None, None, false),
                 CorrectionOwnerSpec::LibraryPgo { .. } => {
                     if provider.is_empty() || provider.trim() != provider || provider.contains('\0')
@@ -10446,6 +10396,7 @@ mod preflight_only_contract {
                 }
                 CorrectionOwnerSpec::NativePgo { .. }
                 | CorrectionOwnerSpec::Relocalization { .. } => (None, None, None, true),
+                #[cfg(test)]
                 CorrectionOwnerSpec::Deferred { backend } => {
                     return Err(CorrectionRuntimeError::CandidateOwner(
                         CorrectionOwnerError::BackendDeferred(backend.stable_name()),
@@ -10566,8 +10517,8 @@ mod preflight_only_contract {
                 cleanup,
                 producer_worker,
                 relocalization,
-                binding,
-                independent_real_contexts,
+                #[cfg(test)] binding,
+                #[cfg(test)] independent_real_contexts: _independent_real_contexts,
                 #[cfg(test)]
                 apply_waiters,
                 #[cfg(test)]
@@ -10608,10 +10559,12 @@ mod preflight_only_contract {
                 .store(panic, Ordering::Release);
         }
 
+        #[cfg(test)]
         pub(crate) fn binding(&self) -> Option<(LcmTopic, LcmMessageType)> {
             self.binding.clone()
         }
 
+        #[cfg(test)]
         pub(crate) fn has_independent_real_contexts(&self) -> bool {
             self.independent_real_contexts
         }
@@ -11120,15 +11073,6 @@ mod preflight_only_contract {
         }
     }
 
-    fn digest_hex(digest: &[u8; 32]) -> String {
-        use std::fmt::Write as _;
-
-        let mut encoded = String::with_capacity(64);
-        for byte in digest {
-            write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
-        }
-        encoded
-    }
 
     fn respond_and_report_candidate_finalization(
         response: oneshot::Sender<Result<CorrectionSubmitDisposition, CorrectionRuntimeError>>,
@@ -14623,7 +14567,6 @@ mod preflight_only_contract {
             let accumulation = RelocalizationAccumulation {
                 request: validate_relocalize_request(request).unwrap(),
                 admission_ordinal: 1, mode_epoch: epoch,
-                logical_deadline: Instant::now() + Duration::from_secs(1),
                 accumulation_deadline: Instant::now() + Duration::from_secs(1),
                 snapshot, arm_watermark: None, armed_map_watermarks: HashMap::new(),
                 accepted: vec![AccumulatedRelocalizationFrame { input: Arc::new(first) },
@@ -14682,7 +14625,6 @@ mod preflight_only_contract {
             boundary.relocalization_mode_epoch = Some(epoch);
             let accumulation = RelocalizationAccumulation {
                 request: validate_relocalize_request(request).unwrap(), admission_ordinal: 1, mode_epoch: epoch,
-                logical_deadline: Instant::now() + Duration::from_secs(1),
                 accumulation_deadline: Instant::now() + Duration::from_secs(1),
                 snapshot, arm_watermark: None, armed_map_watermarks: HashMap::new(),
                 accepted: vec![AccumulatedRelocalizationFrame { input: Arc::new(boundary.clone()) }],
@@ -18384,10 +18326,6 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             let mut adapter = crate::mapping_adapter::MappingAdapter::new_with_frames(
                 crate::mapping_adapter::MappingAdapterConfig {
                     resolution: 0.05,
-                    width_cells: 101,
-                    height_cells: 79,
-                    origin_xy: (-3.25, 4.5),
-                    voxel_size: 0.05,
                     initial_safe_radius_meters: 0.0,
                 },
                 "robot_map", "robot_odom",

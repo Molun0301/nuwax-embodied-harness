@@ -936,26 +936,9 @@ class MemoryService(SceneMappingMemoryMixin):
         }
 
     def list_memory_libraries(self) -> Tuple[Dict[str, object], ...]:
-        """列出当前仓库内可见的命名记忆库。
+        """从已完成初始化迁移的仓库聚合命名记忆库。"""
+        return self._list_memory_libraries_lightweight()
 
-        —— speed-up-list-maps-summary ——
-        默认走轻量快路径：仅依赖 SQL GROUP BY 聚合，不反序列化 payload。
-        - 当 8 张记忆表的 library_name 列均已就绪（has_library_name_columns()）时走轻量路径；
-        - 否则回退到原全量反序列化实现（_list_memory_libraries_legacy）；
-        - 通过环境变量 NX_MEMORY_LIGHTWEIGHT_LIBRARY_STATS=0 可强制回退到旧实现。
-        """
-
-        if self._use_lightweight_library_stats() and self._repository.has_library_name_columns():
-            return self._list_memory_libraries_lightweight()
-        return self._list_memory_libraries_legacy()
-
-    @staticmethod
-    def _use_lightweight_library_stats() -> bool:
-        """轻量快路径开关；HIL 验证前默认开启，回退开关 NX_MEMORY_LIGHTWEIGHT_LIBRARY_STATS=0。"""
-
-        import os
-        flag = runtime_value("NX_MEMORY_LIGHTWEIGHT_LIBRARY_STATS", "1").strip().lower()
-        return flag not in ("0", "false", "no", "off")
 
     def _list_memory_libraries_lightweight(self) -> Tuple[Dict[str, object], ...]:
         """轻量快路径：仅 SQL GROUP BY 聚合，不反序列化 payload。"""
@@ -1028,104 +1011,6 @@ class MemoryService(SceneMappingMemoryMixin):
             )
         return tuple(libraries)
 
-    def _list_memory_libraries_legacy(self) -> Tuple[Dict[str, object], ...]:
-        """旧全量实现：逐行 model_validate_json 反序列化 payload；保留作为回退路径。"""
-
-        stats_by_name: Dict[str, _MemoryLibraryStats] = {
-            item.library_name: _MemoryLibraryStats(
-                library_name=item.library_name,
-                last_updated_at=datetime.fromisoformat(item.updated_at),
-            )
-            for item in self._repository.load_memory_libraries()
-        }
-
-        def _touch(name: str, *, record_kind: str, timestamp: datetime) -> None:
-            current = stats_by_name.get(name)
-            if current is None:
-                current = _MemoryLibraryStats(library_name=name)
-            updated_at = current.last_updated_at
-            if updated_at is None or timestamp > updated_at:
-                updated_at = timestamp
-            stats_by_name[name] = _MemoryLibraryStats(
-                library_name=name,
-                tagged_location_count=current.tagged_location_count + (1 if record_kind == "tagged_location" else 0),
-                semantic_memory_count=current.semantic_memory_count + (1 if record_kind == "semantic_memory" else 0),
-                semantic_instance_count=current.semantic_instance_count + (1 if record_kind == "semantic_instance" else 0),
-                observation_event_count=current.observation_event_count + (1 if record_kind == "observation_event" else 0),
-                scene_space_count=current.scene_space_count + (1 if record_kind == "scene_space" else 0),
-                navigation_trajectory_count=current.navigation_trajectory_count + (1 if record_kind == "navigation_trajectory" else 0),
-                semantic_graph_relation_count=current.semantic_graph_relation_count + (1 if record_kind == "semantic_graph_relation" else 0),
-                semantic_summary_count=current.semantic_summary_count + (1 if record_kind == "semantic_summary" else 0),
-                last_updated_at=updated_at,
-            )
-
-        for location in self._repository.load_tagged_locations():
-            _touch(
-                self._record_library_name(location),
-                record_kind="tagged_location",
-                timestamp=location.timestamp,
-            )
-        for entry in self._repository.load_semantic_memories():
-            _touch(
-                self._record_library_name(entry),
-                record_kind="semantic_memory",
-                timestamp=entry.timestamp,
-            )
-        for instance in self._repository.load_semantic_instances():
-            _touch(
-                self._record_library_name(instance),
-                record_kind="semantic_instance",
-                timestamp=instance.last_seen_ts,
-            )
-        for event in self._repository.load_observation_events():
-            _touch(
-                self._record_library_name(event),
-                record_kind="observation_event",
-                timestamp=event.timestamp,
-            )
-        for scene_space in self._repository.load_scene_spaces():
-            _touch(
-                self._record_library_name(scene_space),
-                record_kind="scene_space",
-                timestamp=scene_space.semantic_updated_at or scene_space.timestamp,
-            )
-        for trajectory_event in self._repository.load_navigation_trajectory_events():
-            _touch(
-                self._record_library_name(trajectory_event),
-                record_kind="navigation_trajectory",
-                timestamp=trajectory_event.timestamp,
-            )
-        for relation in self._repository.load_semantic_graph_relations():
-            _touch(
-                self._record_library_name(relation),
-                record_kind="semantic_graph_relation",
-                timestamp=relation.timestamp,
-            )
-        for summary_node in self._repository.load_semantic_summary_nodes():
-            _touch(
-                self._record_library_name(summary_node),
-                record_kind="semantic_summary",
-                timestamp=summary_node.timestamp,
-            )
-
-        libraries: List[Dict[str, object]] = []
-        for stats in sorted(stats_by_name.values(), key=lambda item: (item.library_name.lower(), item.library_name)):
-            libraries.append(
-                {
-                    "library_name": stats.library_name,
-                    "active": stats.library_name == self._active_library_name,
-                    "tagged_location_count": stats.tagged_location_count,
-                    "semantic_memory_count": stats.semantic_memory_count,
-                    "semantic_instance_count": stats.semantic_instance_count,
-                    "observation_event_count": stats.observation_event_count,
-                    "scene_space_count": stats.scene_space_count,
-                    "navigation_trajectory_count": stats.navigation_trajectory_count,
-                    "semantic_graph_relation_count": stats.semantic_graph_relation_count,
-                    "semantic_summary_count": stats.semantic_summary_count,
-                    "last_updated_at": stats.last_updated_at.isoformat() if stats.last_updated_at is not None else None,
-                }
-            )
-        return tuple(libraries)
 
     def _ensure_embedders_initialized(self, *, nonblocking=False) -> None:
         """Single-flight construction; queries may skip an occupied provider."""
@@ -2217,8 +2102,6 @@ class MemoryService(SceneMappingMemoryMixin):
             "confidence_decay": round(decay_amount, 6),
         }
 
-    def _navigation_candidate_failure_penalty(self, candidate: MemoryNavigationCandidate) -> float:
-        return float(self._navigation_candidate_failure_evidence(candidate).get("penalty") or 0.0)
 
     def apply_candidate_confidence_decay(
         self,
@@ -5326,11 +5209,6 @@ class MemoryService(SceneMappingMemoryMixin):
                     for hold in adoption:
                         hold.release()
 
-    def _safe_upsert_persisted_vector(self, *, record_id: str, action) -> None:
-        try:
-            action()
-        except Exception as exc:
-            LOGGER.warning("历史记忆向量重建失败，已跳过。record_id=%s error=%s", record_id, exc)
 
     def _upsert_vector_point_for_location(self, location: TaggedLocation) -> None:
         self._durable_index.wake.set()
@@ -5859,8 +5737,6 @@ class MemoryService(SceneMappingMemoryMixin):
         # committed work atomically. No payload queue or synchronous fallback.
         self._durable_index.wake.set()
 
-    def _enqueue_vectorization(self, **task) -> None:
-        self._durable_index.wake.set()
 
     def _upsert_vector_point_for_scene_space(self, scene_space: SceneSpace) -> None:
         self._durable_index.wake.set()
@@ -6346,36 +6222,6 @@ class MemoryService(SceneMappingMemoryMixin):
         ]
         return " ".join(segment for segment in segments if segment).strip()
 
-    def _iter_lexical_candidate_ids(
-        self,
-        normalized_query: str,
-        record_kind: MemoryRecordKind,
-    ) -> Iterable[Tuple[str, float]]:
-        if record_kind == MemoryRecordKind.TAGGED_LOCATION:
-            for location in self._tagged_locations_by_id.values():
-                lexical_score, _ = self._score_location(normalized_query, location)
-                yield location.location_id, lexical_score
-            return
-        if record_kind == MemoryRecordKind.OBJECT_INSTANCE:
-            for instance in self._semantic_instances_by_id.values():
-                lexical_score, _ = self._score_semantic_instance(normalized_query, instance)
-                yield instance.instance_id, lexical_score
-            return
-        if record_kind == MemoryRecordKind.OBSERVATION_EVENT:
-            for event in self._observation_events_by_id.values():
-                lexical_score, _ = self._score_observation_event(normalized_query, event)
-                yield event.event_id, lexical_score
-            return
-        if record_kind == MemoryRecordKind.SCENE_SPACE:
-            for scene_space in self._scene_spaces_by_id.values():
-                lexical_score, _ = self._score_scene_space(normalized_query, scene_space)
-                yield scene_space.scene_space_id, lexical_score
-            return
-        for entry in self._semantic_entries_by_id.values():
-            if entry.kind != record_kind:
-                continue
-            lexical_score, _ = self._score_semantic_entry(normalized_query, entry)
-            yield entry.memory_id, lexical_score
 
     def _score_location(self, normalized_query: str, location: TaggedLocation) -> Tuple[float, str]:
         exact_candidates = [
@@ -7654,16 +7500,6 @@ class MemoryService(SceneMappingMemoryMixin):
             return SCENE_SPACES_COLLECTION
         return EPISODIC_OBSERVATIONS_COLLECTION
 
-    def _collections_for_record_kinds(
-        self,
-        record_kinds: Tuple[MemoryRecordKind, ...],
-    ) -> Tuple[str, ...]:
-        collections: List[str] = []
-        for record_kind in record_kinds:
-            collection_name = self._collection_for_record_kind(record_kind)
-            if collection_name not in collections:
-                collections.append(collection_name)
-        return tuple(collections)
 
     def _resolve_anchor_id_for_pose(
         self,
@@ -8734,14 +8570,6 @@ class MemoryService(SceneMappingMemoryMixin):
                         details={"retryable": True, "map_binding": snapshot_binding(latest)}) from exc
                 snapshot = latest
 
-    def _load_primary_image_bytes(self, artifact_ids: List[str]) -> Optional[bytes]:
-        if self._artifact_store is None:
-            return None
-        for artifact_id in artifact_ids:
-            data = self._load_image_bytes(artifact_id)
-            if data is not None:
-                return data
-        return None
 
     def _load_image_bytes(self, artifact_id: str) -> Optional[bytes]:
         if self._artifact_store is None or not artifact_id:

@@ -34,6 +34,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from core.agent_call_store import AgentCallStore
+from tests.conftest import identity_call_store, insert_historical_scope_binding, create_isolated_gateway
 from gateways.agent.service import AgentToolService
 from scripts.module_installer import hardware, lifecycle, manager, runtime
 
@@ -684,7 +685,7 @@ class RolloutFixture(unittest.TestCase):
 
 class CreationPolicyTests(RolloutFixture):
     def test_low_level_default_and_identity_factory_remain_split(self):
-        for constructor in (lambda path: AgentCallStore(path, scope="fixture", gateway_instance_id="low-level"),
+        for constructor in (lambda path: identity_call_store(path, identity_name='fixture', gateway_instance_id='low-level'),
                             lambda path: AgentCallStore.for_identity(path, robot_identity=IDENTITY,
                                 artifact_dir=self.artifacts, gateway_instance_id="identity")):
             path = self.base / ("direct-" + str(len(list(self.base.glob("direct-*.sqlite3")))) + ".sqlite3")

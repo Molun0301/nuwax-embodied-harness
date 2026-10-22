@@ -585,20 +585,6 @@ impl ComputeState {
             .as_ref()
             .is_some_and(ComputeControlRecord::pending)
     }
-    pub(super) fn busy(&self) -> bool {
-        self.start_reservation.is_some()
-            || self.control_pending()
-            || self.job.is_some()
-            || self
-                .feedback
-                .as_ref()
-                .is_some_and(|record| record.result.is_none())
-            || self
-                .lifecycle
-                .as_ref()
-                .is_some_and(|record| record.result.is_none())
-            || self.desired_stop.is_some()
-    }
     fn next_lifecycle(&mut self) -> Result<u64, String> {
         self.lifecycle_sequence = self
             .lifecycle_sequence

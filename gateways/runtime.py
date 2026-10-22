@@ -465,7 +465,6 @@ _ASYNC_GEOMETRY_TASK_POLLING_GUIDANCE: Dict[str, Dict[str, object]] = {
 _ASYNC_GEOMETRY_TASK_POLLING_GUIDANCE["explore_area_v2"] = dict(
     _ASYNC_GEOMETRY_TASK_POLLING_GUIDANCE["explore_area"]
 )
-_SAFETY_WATCHDOG_REFRESH_INTERVAL_SEC = 1.5
 _RUNTIME_ACTIVATION_TIMEOUT_SEC = 95.0
 _PERSON_FOLLOW_TARGET_MAX_PERIOD_SEC = 0.2
 _PERSON_FOLLOW_DEFAULT_LOST_TIMEOUT_SEC = 2.0
@@ -1267,8 +1266,6 @@ class GatewayRuntime:
         self._geometry_provider_identity_initialized = False
         self._geometry_provider_identity: Any = None
         self._geometry_provider_generation = 0
-        self._safety_watchdog_stop = threading.Event()
-        self._safety_watchdog_thread: Optional[threading.Thread] = None
         self._robot_state_stream_subscription_id: Optional[int] = None
         self._localization_stream_subscription_id: Optional[int] = None
         self._localization_stream_unsubscriber = None
@@ -1416,7 +1413,6 @@ class GatewayRuntime:
                     self.perception_video_runtime.start()
             except Exception:
                 RUNTIME_LOGGER.exception("自动启动持续视频感知运行时失败。")
-            self._start_safety_watchdog_loop()
             self._start_data_frame_stream_sources()
             # 地图工作区仅由 MCP activate_map 显式切换，启动时不自动恢复。
             if self.config.runtime_data.map_active_restore_on_start and pending_floor is None:
@@ -1552,7 +1548,6 @@ class GatewayRuntime:
                     raise RuntimeError("事件分发或日志输出尚未关闭，相关依赖已保留；请稍后重试停止。")
                 return
             RUNTIME_LOGGER.info("宿主机运行时开始停止。")
-            self._stop_safety_watchdog_loop()
             try:
                 # 只读网关没有建立过运动连接时，关闭不应反向启动运动服务。
                 # 曾建立连接后故障仍须停车，不能仅用当前 started 判断。
@@ -1985,10 +1980,6 @@ class GatewayRuntime:
             self._start_system_telemetry_stream()
         except Exception:
             RUNTIME_LOGGER.debug("启动性能监控采集线程失败。", exc_info=True)
-        try:
-            self.platform_geometry_runtime.start_external_debug_observers()
-        except Exception:
-            RUNTIME_LOGGER.debug("启动外部几何 debug observer 失败。", exc_info=True)
         if getattr(self.config.geometry, "pipeline", "lio_3d") != "slam_2d" and self._pointcloud_map_stream_subscription_id is None:
             self._pointcloud_map_stream_subscription_id = self.stream_bus.subscribe(
                 self._handle_map_frame_for_pointcloud_map_stream,
@@ -14204,34 +14195,6 @@ class GatewayRuntime:
 
     def _person_follow_readiness(self) -> PersonFollowReadiness:
         return read_person_follow_readiness()
-
-    def _start_safety_watchdog_loop(self) -> None:
-        if self._safety_watchdog_thread is not None:
-            return
-        self._safety_watchdog_stop.clear()
-        thread = threading.Thread(
-            target=self._run_safety_watchdog_loop,
-            name="nuwax-safety-watchdog",
-            daemon=True,
-        )
-        self._safety_watchdog_thread = thread
-        thread.start()
-
-    def _stop_safety_watchdog_loop(self) -> None:
-        thread = self._safety_watchdog_thread
-        if thread is None:
-            return
-        self._safety_watchdog_stop.set()
-        if thread.is_alive():
-            thread.join(timeout=2.0)
-        self._safety_watchdog_thread = None
-
-    def _run_safety_watchdog_loop(self) -> None:
-        while not self._safety_watchdog_stop.wait(_SAFETY_WATCHDOG_REFRESH_INTERVAL_SEC):
-            try:
-                self.safety_guard.check_watchdogs()
-            except Exception:
-                RUNTIME_LOGGER.exception("SafetyGuard watchdog 巡检失败。")
 
     def _ensure_geometry_runtime_for_invoke(self, capability_name: str) -> None:
         """同步能力等待运行时启动，异步能力由任务执行器按需启动。

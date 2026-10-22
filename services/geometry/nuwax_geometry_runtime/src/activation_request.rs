@@ -3,7 +3,7 @@
 //! Request metadata is small and independent of checkpoint ownership. A live checkpoint owns
 //! each incoming payload allocation once; the interner owns only weak references. In particular,
 //! retaining request metadata after retirement does not retain backend, occupancy or cloud bytes.
-#![cfg_attr(not(test), allow(dead_code))]
+
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -233,9 +233,11 @@ struct CanonicalCheckpointDataV2 {
 #[derive(Clone, Debug)]
 pub(crate) struct CanonicalCheckpointOwnerV2(Arc<CanonicalCheckpointDataV2>);
 
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub(crate) struct WeakCheckpointOwnerV2(Weak<CanonicalCheckpointDataV2>);
 
+#[cfg(test)]
 impl WeakCheckpointOwnerV2 {
     pub(crate) fn upgrade(&self) -> Option<CanonicalCheckpointOwnerV2> {
         self.0.upgrade().map(CanonicalCheckpointOwnerV2)
@@ -358,15 +360,14 @@ impl CanonicalCheckpointOwnerV2 {
     pub(crate) fn backend_kind(&self) -> MappingBackendKind {
         self.0.backend_kind
     }
-    pub(crate) fn backend_payload_schema_version(&self) -> u32 {
-        self.0.backend_payload_schema_version
-    }
+    #[cfg(test)]
     pub(crate) fn created_at_ns(&self) -> u64 {
         self.0.created_at_ns
     }
     pub(crate) fn backend_member(&self) -> &CheckpointMemberIdentityV2 {
         self.0.backend_member.as_ref().expect("spatial checkpoint backend member")
     }
+    #[cfg(test)]
     pub(crate) fn occupancy_member(&self) -> &CheckpointMemberIdentityV2 {
         &self.0.occupancy_member
     }
@@ -402,6 +403,7 @@ impl CanonicalCheckpointOwnerV2 {
     pub(crate) fn dense_cloud(&self) -> Option<&SealedArtifactOwnerV2> {
         self.0.dense_cloud.as_ref()
     }
+    #[cfg(test)]
     pub(crate) fn downgrade(&self) -> WeakCheckpointOwnerV2 {
         WeakCheckpointOwnerV2(Arc::downgrade(&self.0))
     }
@@ -478,6 +480,7 @@ impl CheckpointOwnerInternerV2 {
         Ok(retained)
     }
 
+    #[cfg(test)]
     pub(crate) fn prune_expired(&self) {
         self.owners
             .lock()
@@ -528,15 +531,18 @@ impl ValidatedActivationRequestV2 {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn metadata(&self) -> &ActivationRequestMetadataV2 {
         &self.metadata
     }
+    #[cfg(test)]
     pub(crate) fn checkpoint(&self) -> &CanonicalCheckpointOwnerV2 {
         &self.checkpoint
     }
     pub(crate) fn into_parts(self) -> (ActivationRequestMetadataV2, CanonicalCheckpointOwnerV2) {
         (self.metadata, self.checkpoint)
     }
+    #[cfg(test)]
     pub(crate) fn validate_replay(&self, candidate: &Self) -> Result<(), String> {
         if self.metadata != candidate.metadata {
             return Err("activation v2 request replay conflict".into());

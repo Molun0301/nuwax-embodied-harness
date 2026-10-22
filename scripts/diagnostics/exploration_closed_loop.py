@@ -81,7 +81,6 @@ def configure(output, calibrated_motion=False, pipeline="lio_3d", calibrated_obs
         "NUWAX_LOG_LEVEL": "INFO",
         "RUST_LOG": "info,nuwax_nav_stack::surface_chunks=debug",
         "NUWAX_MAPPING_RESOLUTION": ".1",
-        "NUWAX_MAPPING_VOXEL_SIZE": ".05",
         "NUWAX_MAPPING_RAYTRACING_VOXEL_SIZE": ".05",
         "NUWAX_MAPPING_RAYTRACING_RAY_SUBSAMPLE": "1",
         "NUWAX_MAPPING_WIDTH_CELLS": "70",

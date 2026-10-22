@@ -2806,38 +2806,6 @@ def _open_regular_file(path: Path, description: str) -> Tuple[int, int]:
     return descriptor, int(path_stat.st_size)
 
 
-def _regular_file_size(path: Path, description: str) -> int:
-    descriptor, size = _open_regular_file(path, description)
-    os.close(descriptor)
-    return size
-
-
-def _hash_regular_file(path: Path, description: str) -> Tuple[int, str]:
-    descriptor, expected_size = _open_regular_file(path, description)
-    digest = hashlib.sha256()
-    observed_size = 0
-    try:
-        while True:
-            chunk = os.read(descriptor, 1024 * 1024)
-            if not chunk:
-                break
-            observed_size += len(chunk)
-            digest.update(chunk)
-    finally:
-        os.close(descriptor)
-    if observed_size != expected_size:
-        raise MapAssetBundleValidationError("%s在校验期间发生变化：%s" % (description, path))
-    return observed_size, digest.hexdigest()
-
-
-def _read_regular_file_prefix(path: Path, description: str, size: int) -> bytes:
-    descriptor, _expected_size = _open_regular_file(path, description)
-    try:
-        return os.read(descriptor, max(0, int(size)))
-    finally:
-        os.close(descriptor)
-
-
 def _parse_json_object(payload: bytes, description: str) -> Dict[str, object]:
     def reject_duplicates(pairs):
         result: Dict[str, object] = {}
@@ -3082,26 +3050,6 @@ def _atomic_write_relative(
                 pass
         for descriptor in reversed(descriptors):
             os.close(descriptor)
-
-
-def _atomic_write_bytes(path: Path, payload: bytes) -> None:
-    temporary = path.with_name(".%s.%s.tmp" % (path.name, uuid.uuid4().hex))
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    try:
-        with os.fdopen(descriptor, "wb", closefd=True) as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        descriptor = -1
-        os.replace(temporary, path)
-        _fsync_directory(path.parent)
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-        try:
-            temporary.unlink(missing_ok=True)
-        except OSError:
-            pass
 
 
 def _fsync_tree(tree: _StableDirectoryTree) -> None:

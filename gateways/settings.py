@@ -135,17 +135,13 @@ class SettingsApplication:
                 config_profiles.activate_profile(root=self._root, robot=location["robot"], profile=location["profile"],
                                                  revision_owner=self.revision_owner)
             applied = self._apply_hot(values, written) if active and (location is None or location["robot"] == self.started_robot) else []
-            inactive_keys = sorted(key for key in written if apply_mode(key) == "inactive")
-            restart_keys = sorted(key for key in written if key not in inactive_keys
-                                  and (key not in applied or apply_mode(key) == "hot_and_restart"))
+            restart_keys = sorted(key for key in written
+                                  if key not in applied or apply_mode(key) == "hot_and_restart")
             effect_note = "可热加载项已应用；其它参数可立即重启或稍后生效。" if active else "方案已保存，选择应用后才改变运行设置。"
-            if inactive_keys:
-                effect_note = ("兼容配置已保存，当前流水线不使用这些参数。" if not applied and not restart_keys
-                               else effect_note + " 兼容保留项不参与当前执行。")
             return {"written": result.written, "skipped": result.skipped, "rejected": result.rejected,
                     "backups": {}, "hot_applied": applied, "apply_errors": dict(self._apply_errors),
                     "restart_keys": restart_keys, "restart_required": active and bool(restart_keys),
-                    "inactive_keys": inactive_keys, "is_active": active, "effect_note": effect_note}
+                    "is_active": active, "effect_note": effect_note}
 
     def activate(self, *, robot, profile, expected_revision=None):
         with self._lock:
@@ -168,8 +164,6 @@ class SettingsApplication:
             defaults = config_io._default_values()
             restart_keys = []
             for field in config_registry.build_registry():
-                if apply_mode(field.key) == "inactive":
-                    continue
                 if apply_mode(field.key) == "hot" and field.key in applied:
                     continue
                 before = self._startup_files.get(field.key, defaults.get(field.key, ""))

@@ -29,6 +29,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
+#[cfg(test)]
 use std::time::Duration;
 use tokio::sync::Notify;
 
@@ -465,6 +466,7 @@ impl<B: Backend> OwnerHandle<B> {
         }
     }
 
+    #[cfg(test)]
     /// Blocking observer for native supervision/tests; never call under outer locks.
     pub fn wait_changed(&self, observed_epoch: u64, timeout: Duration) -> Status {
         let state = self.shared.lock();

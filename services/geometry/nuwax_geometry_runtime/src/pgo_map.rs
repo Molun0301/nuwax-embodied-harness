@@ -197,6 +197,7 @@ impl ScanHistory {
             .collect())
     }
 
+    #[cfg(test)]
     pub fn snapshot(&self) -> Result<Vec<ArchivedScan>, RebuildError> {
         if self.incomplete {
             return Err(RebuildError::HistoryUnavailable);

@@ -5,7 +5,7 @@ use nuwax_rpc::{
     RpcArgs, RpcBroker, RpcHandler, RpcRequest, RpcResponse, RpcResult, RpcServerGroup,
     RpcTransport,
 };
-use serde::{de::DeserializeOwned, Serialize};
+use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 use std::sync::Arc;
 use tonic::Request;
@@ -14,123 +14,7 @@ use crate::proto::geometry_runtime_server::GeometryRuntime;
 use crate::proto::*;
 use crate::server::GeometryRuntimeService;
 
-const RPC_MODULE_NAME: &str = "GeometryRuntimeService";
-
-// Streaming gRPC methods stay on their native stream/typed-LCM paths. Exposing
-// them as one-shot pickle RPC would discard cancellation and backpressure.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum GeometryRpcMethod {
-    Start,
-    Stop,
-    GetStatus,
-    HealthCheck,
-    GetCurrentPose,
-    Relocalize,
-    GetRelocalizationTerminal,
-    GetAssignedLocalizationSample,
-    GetFrameTree,
-    GetOccupancyGrid,
-    GetOccupancyGridData,
-    GetOccupancyGridShm,
-    StartMapping,
-    StopMapping,
-    GetMappingState,
-    GetNavigationMapBlock,
-    ActivateMap,
-    SetNavigationGoal,
-    CancelNavigation,
-    GetNavigationReadiness,
-    GetMappingReadiness,
-    GetExplorationReadiness,
-    SetCmdVelSinkReady,
-    GetFrontiers,
-    StartExploration,
-    StopExploration,
-    GetExplorationState,
-    GetExplorationDiagnostics,
-    PublishLaserScan,
-    PublishOdom,
-    PublishPointCloud,
-    ReportNativeInputFailure,
-}
-
-const RPC_METHODS: &[GeometryRpcMethod] = &[
-    GeometryRpcMethod::Start,
-    GeometryRpcMethod::Stop,
-    GeometryRpcMethod::GetStatus,
-    GeometryRpcMethod::HealthCheck,
-    GeometryRpcMethod::GetCurrentPose,
-    GeometryRpcMethod::Relocalize,
-    GeometryRpcMethod::GetRelocalizationTerminal,
-    GeometryRpcMethod::GetAssignedLocalizationSample,
-    GeometryRpcMethod::GetFrameTree,
-    GeometryRpcMethod::GetOccupancyGrid,
-    GeometryRpcMethod::GetOccupancyGridData,
-    GeometryRpcMethod::GetOccupancyGridShm,
-    GeometryRpcMethod::StartMapping,
-    GeometryRpcMethod::StopMapping,
-    GeometryRpcMethod::GetMappingState,
-    GeometryRpcMethod::GetNavigationMapBlock,
-    GeometryRpcMethod::ActivateMap,
-    GeometryRpcMethod::SetNavigationGoal,
-    GeometryRpcMethod::CancelNavigation,
-    GeometryRpcMethod::GetNavigationReadiness,
-    GeometryRpcMethod::GetMappingReadiness,
-    GeometryRpcMethod::GetExplorationReadiness,
-    GeometryRpcMethod::SetCmdVelSinkReady,
-    GeometryRpcMethod::GetFrontiers,
-    GeometryRpcMethod::StartExploration,
-    GeometryRpcMethod::StopExploration,
-    GeometryRpcMethod::GetExplorationState,
-    GeometryRpcMethod::GetExplorationDiagnostics,
-    GeometryRpcMethod::PublishLaserScan,
-    GeometryRpcMethod::PublishOdom,
-    GeometryRpcMethod::PublishPointCloud,
-    GeometryRpcMethod::ReportNativeInputFailure,
-];
-
-impl GeometryRpcMethod {
-    const fn method_name(self) -> &'static str {
-        match self {
-            Self::Start => "start",
-            Self::Stop => "stop",
-            Self::GetStatus => "get_status",
-            Self::HealthCheck => "health_check",
-            Self::GetCurrentPose => "get_current_pose",
-            Self::Relocalize => "relocalize",
-            Self::GetRelocalizationTerminal => "get_relocalization_terminal",
-            Self::GetAssignedLocalizationSample => "get_assigned_localization_sample",
-            Self::GetFrameTree => "get_frame_tree",
-            Self::GetOccupancyGrid => "get_occupancy_grid",
-            Self::GetOccupancyGridData => "get_occupancy_grid_data",
-            Self::GetOccupancyGridShm => "get_occupancy_grid_shm",
-            Self::StartMapping => "start_mapping",
-            Self::StopMapping => "stop_mapping",
-            Self::GetMappingState => "get_mapping_state",
-            Self::GetNavigationMapBlock => "get_navigation_map_block",
-            Self::ActivateMap => "activate_map",
-            Self::SetNavigationGoal => "set_navigation_goal",
-            Self::CancelNavigation => "cancel_navigation",
-            Self::GetNavigationReadiness => "get_navigation_readiness",
-            Self::GetMappingReadiness => "get_mapping_readiness",
-            Self::GetExplorationReadiness => "get_exploration_readiness",
-            Self::SetCmdVelSinkReady => "set_cmd_vel_sink_ready",
-            Self::GetFrontiers => "get_frontiers",
-            Self::StartExploration => "start_exploration",
-            Self::StopExploration => "stop_exploration",
-            Self::GetExplorationState => "get_exploration_state",
-            Self::GetExplorationDiagnostics => "get_exploration_diagnostics",
-            Self::PublishLaserScan => "publish_laser_scan",
-            Self::PublishOdom => "publish_odom",
-            Self::PublishPointCloud => "publish_point_cloud",
-            Self::ReportNativeInputFailure => "report_native_input_failure",
-        }
-    }
-
-    fn rpc_name(self) -> String {
-        format!("{RPC_MODULE_NAME}/{}", self.method_name())
-    }
-}
+const RPC_NAME: &str = "GeometryRuntimeService/get_navigation_map_block";
 
 #[derive(Debug)]
 struct InvocationError {
@@ -190,11 +74,6 @@ fn decode_request<T: DeserializeOwned>(args: RpcArgs) -> Result<T, InvocationErr
         .map_err(|error| InvocationError::invalid_arguments(error.to_string()))
 }
 
-fn encode_response<T: Serialize>(response: T) -> Result<Value, InvocationError> {
-    serde_json::to_value(response)
-        .map_err(|error| InvocationError::serialization(error.to_string()))
-}
-
 fn encode_navigation_map_block_response(response: NavigationMapBlockResponse) -> Result<Value, InvocationError> {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     match response.schema_version {
@@ -219,96 +98,14 @@ fn encode_navigation_map_block_response(response: NavigationMapBlockResponse) ->
 
 struct GeometryRpcHandler {
     service: Arc<GeometryRuntimeService>,
-    method: GeometryRpcMethod,
 }
 
 impl GeometryRpcHandler {
     async fn invoke(&self, args: RpcArgs) -> Result<Value, InvocationError> {
-        macro_rules! call_unary {
-            ($request_type:ty, $method:ident) => {{
-                let request = decode_request::<$request_type>(args)?;
-                let response = GeometryRuntime::$method(&*self.service, Request::new(request))
-                    .await
-                    .map_err(InvocationError::status)?;
-                encode_response(response.into_inner())
-            }};
-        }
-
-        match self.method {
-            GeometryRpcMethod::Start => call_unary!(StartRequest, start),
-            GeometryRpcMethod::Stop => call_unary!(StopRequest, stop),
-            GeometryRpcMethod::GetStatus => call_unary!(Empty, get_status),
-            GeometryRpcMethod::HealthCheck => call_unary!(HealthCheckRequest, health_check),
-            GeometryRpcMethod::GetCurrentPose => call_unary!(PoseRequest, get_current_pose),
-            GeometryRpcMethod::Relocalize => call_unary!(RelocalizeRequest, relocalize),
-            GeometryRpcMethod::GetRelocalizationTerminal => call_unary!(GetRelocalizationTerminalRequest, get_relocalization_terminal),
-            GeometryRpcMethod::GetAssignedLocalizationSample => call_unary!(RelocalizeRequest, get_assigned_localization_sample),
-            GeometryRpcMethod::GetFrameTree => call_unary!(Empty, get_frame_tree),
-            GeometryRpcMethod::GetOccupancyGrid => call_unary!(Empty, get_occupancy_grid),
-            GeometryRpcMethod::GetOccupancyGridData => {
-                call_unary!(Empty, get_occupancy_grid_data)
-            }
-            GeometryRpcMethod::GetOccupancyGridShm => {
-                call_unary!(Empty, get_occupancy_grid_shm)
-            }
-            GeometryRpcMethod::StartMapping => {
-                call_unary!(StartMappingRequest, start_mapping)
-            }
-            GeometryRpcMethod::StopMapping => {
-                call_unary!(StopMappingRequest, stop_mapping)
-            }
-            GeometryRpcMethod::GetMappingState => {
-                call_unary!(Empty, get_mapping_state)
-            }
-            GeometryRpcMethod::GetNavigationMapBlock => {
-                let request = decode_request::<NavigationMapBlockRequest>(args)?;
-                let response = GeometryRuntime::get_navigation_map_block(&*self.service, Request::new(request))
-                    .await.map_err(InvocationError::status)?;
-                encode_navigation_map_block_response(response.into_inner())
-            }
-            GeometryRpcMethod::ActivateMap => {
-                call_unary!(ActivateMapRequest, activate_map)
-            }
-            GeometryRpcMethod::SetNavigationGoal => {
-                call_unary!(NavigationGoal, set_navigation_goal)
-            }
-            GeometryRpcMethod::CancelNavigation => {
-                call_unary!(CancelNavigationRequest, cancel_navigation)
-            }
-            GeometryRpcMethod::GetNavigationReadiness => {
-                call_unary!(Empty, get_navigation_readiness)
-            }
-            GeometryRpcMethod::GetMappingReadiness => {
-                call_unary!(Empty, get_mapping_readiness)
-            }
-            GeometryRpcMethod::GetExplorationReadiness => {
-                call_unary!(Empty, get_exploration_readiness)
-            }
-            GeometryRpcMethod::SetCmdVelSinkReady => {
-                call_unary!(CmdVelSinkReadyRequest, set_cmd_vel_sink_ready)
-            }
-            GeometryRpcMethod::GetFrontiers => call_unary!(Empty, get_frontiers),
-            GeometryRpcMethod::StartExploration => {
-                call_unary!(ExploreRequest, start_exploration)
-            }
-            GeometryRpcMethod::StopExploration => {
-                call_unary!(StopExplorationRequest, stop_exploration)
-            }
-            GeometryRpcMethod::GetExplorationState => {
-                call_unary!(Empty, get_exploration_state)
-            }
-            GeometryRpcMethod::GetExplorationDiagnostics => {
-                call_unary!(Empty, get_exploration_diagnostics)
-            }
-            GeometryRpcMethod::PublishLaserScan => call_unary!(PublishLaserScanRequest, publish_laser_scan),
-            GeometryRpcMethod::PublishOdom => call_unary!(PublishOdomRequest, publish_odom),
-            GeometryRpcMethod::ReportNativeInputFailure => {
-                call_unary!(NativeInputFailureRequest, report_native_input_failure)
-            }
-            GeometryRpcMethod::PublishPointCloud => {
-                call_unary!(PublishPointCloudRequest, publish_point_cloud)
-            }
-        }
+        let request = decode_request::<NavigationMapBlockRequest>(args)?;
+        let response = GeometryRuntime::get_navigation_map_block(&*self.service, Request::new(request))
+            .await.map_err(InvocationError::status)?;
+        encode_navigation_map_block_response(response.into_inner())
     }
 }
 
@@ -323,28 +120,14 @@ impl RpcHandler for GeometryRpcHandler {
     }
 }
 
-/// Start every unary geometry method over the production LCM RPC transport.
+/// 保留导航栈实际消费的地图块接口，沿原RPC服务组拥有方启动和关闭。
 pub async fn serve_geometry_rpc(
     service: GeometryRuntimeService,
     transport: Arc<dyn RpcTransport>,
 ) -> RpcResult<RpcServerGroup> {
-    let service = Arc::new(service);
     let broker = RpcBroker::new();
-    let mut names = Vec::with_capacity(RPC_METHODS.len());
-    for method in RPC_METHODS.iter().copied() {
-        let name = method.rpc_name();
-        broker
-            .register(
-                name.clone(),
-                Box::new(GeometryRpcHandler {
-                    service: Arc::clone(&service),
-                    method,
-                }),
-            )
-            .await?;
-        names.push(name);
-    }
-    broker.serve_many(transport, names).await
+    broker.register(RPC_NAME, Box::new(GeometryRpcHandler { service: Arc::new(service) })).await?;
+    broker.serve_many(transport, [RPC_NAME]).await
 }
 
 #[cfg(test)]
@@ -376,75 +159,46 @@ mod tests {
     }
 
     #[test]
-    fn names_follow_original_module_class_method_contract() {
-        let names = RPC_METHODS
-            .iter()
-            .copied()
-            .map(GeometryRpcMethod::rpc_name)
-            .collect::<Vec<_>>();
-        assert_eq!(names.len(), 32);
-        assert!(names.contains(&"GeometryRuntimeService/get_assigned_localization_sample".to_string()));
-        assert!(names.contains(&"GeometryRuntimeService/report_native_input_failure".to_string()));
-        assert!(names.contains(&"GeometryRuntimeService/health_check".to_string()));
-        assert!(names.contains(&"GeometryRuntimeService/stop".to_string()));
-        assert!(names
-            .iter()
-            .all(|name| name.starts_with("GeometryRuntimeService/")));
-    }
-
-    #[test]
-    fn request_decoder_accepts_keyword_fields_and_rejects_mixed_arguments() {
-        let request = decode_request::<PoseRequest>((
-            Vec::new(),
-            HashMap::from([
-                ("target_frame".to_string(), Value::from("map")),
-                ("source_frame".to_string(), Value::from("base_link")),
-            ]),
-        ))
-        .unwrap();
-        assert_eq!(request.target_frame, "map");
-        assert_eq!(request.source_frame, "base_link");
-
-        let error = decode_request::<PoseRequest>((
-            vec![serde_json::json!({"target_frame": "map"})],
-            HashMap::from([("source_frame".to_string(), Value::from("base_link"))]),
-        ))
-        .unwrap_err();
+    fn map_block_request_decoder_accepts_positional_or_keyword_fields() {
+        let body = serde_json::to_value(NavigationMapBlockRequest {
+            schema_version: 3, max_bytes: 7, ..Default::default()
+        }).unwrap();
+        let request = decode_request::<NavigationMapBlockRequest>((
+            Vec::new(), body.as_object().unwrap().iter().map(|(key, value)| (key.clone(), value.clone())).collect(),
+        )).unwrap();
+        assert_eq!(request.schema_version, 3);
+        assert_eq!(request.max_bytes, 7);
+        assert!(decode_request::<NavigationMapBlockRequest>((vec![body.clone()], HashMap::new())).is_ok());
+        let error = decode_request::<NavigationMapBlockRequest>((
+            vec![body], HashMap::from([("schema_version".to_string(), Value::from(3))]),
+        )).unwrap_err();
         assert_eq!(error.type_name, "InvalidArguments");
     }
 
     #[tokio::test]
-    async fn handler_dispatches_to_real_geometry_service_and_serializes_errors() {
-        let handle = crate::lcm_runtime::build_handle_for_tests()
-            .await
-            .expect("real LCM test handle");
-        let service = Arc::new(GeometryRuntimeService::new(handle));
-        let handler = GeometryRpcHandler {
-            service,
-            method: GeometryRpcMethod::HealthCheck,
-        };
-
-        let response = handler
-            .handle(RpcRequest {
-                name: GeometryRpcMethod::HealthCheck.rpc_name(),
-                args: (Vec::new(), HashMap::new()),
-                id: Some(7.0),
-            })
-            .await;
-        assert_eq!(response.id, Some(7.0));
-        assert_eq!(response.res.as_ref().unwrap()["healthy"], Value::Bool(true));
-        assert_eq!(response.res.as_ref().unwrap()["phase"], "running");
-
-        let error = handler
-            .handle(RpcRequest {
-                name: GeometryRpcMethod::HealthCheck.rpc_name(),
-                args: (vec![Value::String("not-a-request".into())], HashMap::new()),
-                id: Some(8.0),
-            })
-            .await;
-        assert_eq!(
-            error.exception.as_ref().unwrap()["type_name"],
-            "InvalidArguments"
-        );
+    async fn map_block_rpc_uses_real_service_errors_and_closes_its_transport() {
+        use nuwax_rpc::{LcmRpcTransport, RpcClient, RpcError};
+        use std::time::Duration;
+        let handle = crate::lcm_runtime::build_handle_for_tests().await.expect("真实服务句柄");
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let url = format!("udpm://239.255.76.67:{port}?ttl=0");
+        let transport: Arc<dyn RpcTransport> = Arc::new(LcmRpcTransport::from_provider(&url).unwrap());
+        let group = serve_geometry_rpc(GeometryRuntimeService::new(handle), transport.clone()).await.unwrap();
+        assert_eq!(group.service_names(), &[RPC_NAME.to_owned()]);
+        let client = RpcClient::new(transport, RPC_NAME).unwrap();
+        let body = serde_json::to_value(NavigationMapBlockRequest {
+            schema_version: 3, max_bytes: 7, ..Default::default()
+        }).unwrap();
+        let error = client.call((vec![body.clone()], HashMap::new()), Duration::from_secs(2)).await.unwrap_err();
+        let RpcError::RemoteException(error) = error else { panic!("真实服务错误应经RPC返回") };
+        assert_eq!(error["type_name"], "GeometryRuntimeStatus");
+        assert!(error["args"][0].as_str().unwrap().contains("missing retained root"));
+        let error = client.call((vec![Value::String("invalid".into())], HashMap::new()), Duration::from_secs(2)).await.unwrap_err();
+        assert!(matches!(error, RpcError::RemoteException(error) if error["type_name"] == "InvalidArguments"));
+        group.stop().await.expect("原拥有方等待实际退订完成");
+        assert!(matches!(client.call((vec![body], HashMap::new()), Duration::from_millis(50)).await,
+            Err(RpcError::Timeout { .. } | RpcError::Transport(_))));
     }
 }

@@ -1,7 +1,6 @@
 """配置生效策略；只有具备实际更新入口的参数才声明热加载。"""
 from __future__ import annotations
 
-from core.config_registry import runtime_catalog
 
 # 配置键 → 运行配置属性。调用方按消费组件分组，原子替换对应设置。
 HOT_FIELDS = {
@@ -35,8 +34,6 @@ HOT_LOG_KEYS = frozenset(LOG_FIELDS) | {"NUWAX_LOG_LEVEL_" + part for part in LO
 
 
 def apply_mode(key):
-    if runtime_catalog().get(key, {}).get("effective_value_scope") == "inactive":
-        return "inactive"
     if key in HOT_LOG_KEYS:
         return "hot_and_restart" if key in LOG_FIELDS and key != "NUWAX_LOG_FORMAT" else "hot"
     return "hot" if key in HOT_FIELDS else "restart"

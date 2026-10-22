@@ -601,19 +601,6 @@
         state.latestOverview = data || {};
         renderServiceStatus();
       }
-      function serviceStatusValue(summary, fallback) {
-        if (summary && summary.status) return summary.status;
-        if (fallback !== undefined && fallback !== null && fallback !== "") return fallback;
-        return "missing";
-      }
-      function serviceEvidenceFromSummary(summary, positiveText) {
-        if (!summary) return "缺少健康字段";
-        if (summary.status === "missing") return "未上报健康字段";
-        if (summary.status === "stale") return "最近上报已过期";
-        if (summary.status === "error") return summary.source_message || "服务报告错误";
-        const latency = summary.latency_ms === null || summary.latency_ms === undefined ? "" : `，延迟 ${fmt(summary.latency_ms, " ms")}`;
-        return `${positiveText || "最近有上报"}${latency}`;
-      }
       function serviceAdvice(status, fallback) {
         const cls = statusClass(status);
         if (cls === "available") return fallback || "无需处理";
@@ -621,11 +608,6 @@
         if (cls === "error") return fallback || "查看运行日志定位错误";
         if (String(status || "").toLowerCase() === "unsupported") return "当前环境不支持该服务";
         return fallback || "检查服务是否启用并查看运行日志";
-      }
-      function processByRole(...roles) {
-        const snap = state.latestSystemMetrics || {};
-        const processes = Array.isArray(snap.processes) ? snap.processes : [];
-        return processes.find((proc) => roles.includes(proc.role));
       }
       const SERVICE_SOURCE_LABELS = {
         gateway_runtime: "网关运行时",
@@ -639,12 +621,12 @@
         platform_geometry_runtime: "统一几何运行时",
         robot_assembly: "机器人数据面",
         "system.metrics": "系统进程采集",
-        frontend_fallback: "前端兼容推断",
+        frontend_request: "网页请求",
       };
       // 常显实际连接与运行组件，其余能力状态按需查看；不改变后端健康结论。
-      const SERVICE_PRIMARY_IDS = new Set(["gateway_web", "gateway_web_fallback", "robot_data_plane", "geometry_runtime"]);
+      const SERVICE_PRIMARY_IDS = new Set(["gateway_web", "robot_data_plane", "geometry_runtime"]);
       const SERVICE_DISPLAY_NAMES = {
-        gateway_web: "网页网关", gateway_web_fallback: "网页网关",
+        gateway_web: "网页网关",
         robot_data_plane: "机器人数据接入", geometry_runtime: "几何运行进程",
         person_follow: "人物跟随", artifacts: "记忆与文件存储",
       };
@@ -992,99 +974,25 @@
         };
         return map[reason] || String(reason);
       }
-      function buildLegacyServiceHealthFallback() {
-        const overview = state.latestOverview || {};
-        const governance = state.latestGovernance || {};
-        const metrics = state.latestSystemMetrics || {};
-        const entries = [{
-          service_id: "service_health_bootstrap",
-          display_name: "服务健康链路",
-          status: "degraded",
-          summary: "等待后端权威 service_health 快照",
-          evidence: "当前为前端兼容推断，不能作为验收成功状态",
-          source: "frontend_fallback",
-          advice: "检查 /api/health 与 runtime.governance 是否返回 service_health",
-          order: 0,
-        }];
-        const health = overview.health || {};
-        entries.push({
-          service_id: "gateway_web_fallback",
-          display_name: "网关 Web 服务",
-          status: serviceStatusValue(health, metrics.psutil_available === false ? "unsupported" : "available"),
-          summary: health.status ? "网关健康流已上报" : "前端已连接调试流",
-          evidence: health.status ? serviceEvidenceFromSummary(health, "网关健康流已上报") : "等待 /api/health 首屏健康快照",
-          source: "frontend_fallback",
-          advice: "异常时查看网关运行日志",
-          order: 10,
-        });
-        const map = overview.map || {};
-        entries.push({
-          service_id: "map_fallback",
-          display_name: "地图服务",
-          status: serviceStatusValue(map, "idle"),
-          summary: map.status ? "地图流已上报" : "地图服务空闲或未上报",
-          evidence: serviceEvidenceFromSummary(map, "地图流已上报"),
-          source: "frontend_fallback",
-          advice: "需要地图时启动建图或加载地图",
-          order: 40,
-        });
-        const localization = overview.localization || {};
-        const session = governance.localization_session || {};
-        entries.push({
-          service_id: "localization_fallback",
-          display_name: "定位服务",
-          status: serviceStatusValue(localization, session.status || "idle"),
-          summary: localization.status ? "定位流已上报" : "定位服务空闲或未上报",
-          evidence: localization.status ? serviceEvidenceFromSummary(localization, "定位流已上报") : (session.available ? "定位会话字段已上报" : "等待定位健康字段"),
-          source: "frontend_fallback",
-          advice: "检查定位服务和运行日志",
-          order: 50,
-        });
-        const navigation = overview.navigation || {};
-        entries.push({
-          service_id: "navigation_fallback",
-          display_name: "导航/探索服务",
-          status: serviceStatusValue(navigation, "idle"),
-          summary: navigation.status ? "导航流已上报" : "导航服务空闲或未上报",
-          evidence: serviceEvidenceFromSummary(navigation, "导航流已上报"),
-          source: "frontend_fallback",
-          advice: "检查导航服务和运行日志",
-          order: 60,
-        });
-        const video = overview.video || {};
-        const videoProc = processByRole("go2_video_streamer");
-        entries.push({
-          service_id: "perception_video_fallback",
-          display_name: "感知/视频服务",
-          status: videoProc ? "available" : serviceStatusValue(video, "idle"),
-          summary: videoProc ? "视频推流进程已匹配" : "视频/感知等待上报",
-          evidence: videoProc ? `进程运行中 PID ${videoProc.pid}` : serviceEvidenceFromSummary(video, "视频/感知流已上报"),
-          source: "frontend_fallback",
-          advice: videoProc ? "无需处理" : "检查摄像头输入和感知日志",
-          order: 70,
-        });
-        return {
-          status: worstStatus(entries),
-          authoritative: false,
-          generated_at: new Date().toISOString(),
-          entries,
-          source: "frontend_fallback",
-          metadata: { attention_count: entries.filter((entry) => SERVICE_ATTENTION_STATUSES.has(entry.status)).length },
-        };
-      }
       function renderServiceStatus() {
         if (!els.governanceMeta) return;
         state.serviceCardNodes ||= new Map();
         const scrollHost = els.governanceMeta.parentElement;
         const scrollTop = scrollHost.scrollTop;
         const focused = document.activeElement;
-        const summary = state.latestServiceHealth || buildLegacyServiceHealthFallback();
+        const summary = state.latestServiceHealth;
+        if (!summary) {
+          state.serviceCardNodes.clear();
+          state.serviceGroupLabels?.clear();
+          setText(els.connectionText, "正在读取服务状态");
+          setPill(els.governanceStatus, "idle", "读取中");
+          setKv(els.governanceMeta, [["服务状态", "正在读取服务状态"]]);
+          return;
+        }
         const entries = Array.isArray(summary.entries) ? summary.entries : [];
         const status = summary.status || worstStatus(entries);
         const attention = serviceHealthAttentionCount(summary);
-        const gatewayService = entries.find((entry) => entry.service_id === "gateway_web")
-          || entries.find((entry) => entry.service_id === "gateway_web_fallback")
-          || entries.find((entry) => entry.display_name === "网关 Web 服务");
+        const gatewayService = entries.find((entry) => entry.service_id === "gateway_web");
         setText(els.connectionText, displayStatus(gatewayService ? gatewayService.status : "missing"));
         setPill(els.governanceStatus, status, attention ? `${attention} 项需处理` : "服务");
         // 只剔除没有独立诊断价值的重复项，其余全部展示：
@@ -1106,7 +1014,6 @@
           source: summary.source,
           generated_at: summary.generated_at,
           timestamp: summary.timestamp,
-          compatibleFallback: summary.authoritative === false,
           deferAppend: true,
         };
         const ordered = [];
@@ -1425,10 +1332,10 @@
             status: "error",
             summary: "服务健康数据读取失败",
             evidence: message,
-            source: "frontend_fallback",
+            source: "frontend_request",
             advice: "检查 /api/health、runtime.governance 和网关运行日志",
             updated_at: new Date().toISOString(),
-          }, { compatibleFallback: true, source: "frontend_fallback" });
+          }, { source: "frontend_request" });
         } else if (kind === "map") {
           setPill(els.mapStatus, "error", "地图");
           els.mapEmpty.hidden = false;

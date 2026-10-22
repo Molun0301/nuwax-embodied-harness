@@ -1,47 +1,20 @@
-// Phase 6 (codex-round3 R3-4):POSE_STAMPED_PAYLOAD_HEADER_BYTES /
-// decode_odometry_payload / decode_nav_state_payload / decode_tf_payload /
-// decode_frontiers_payload 是 typed_codec payload 解码入口,目前 typed_codec
-// 走 Encode-only contract(写入侧),解码侧留给 Phase 6.1 WebSocket 接管。
-#![allow(dead_code)]
-
-//! LCM typed encode/decode —— 替换 `server.rs` / `lcm_runtime.rs` 中的
-//! ad-hoc bytes 段。
-//!
-//! ## 设计口径
-//! - 默认协议层 = LCM(`nuwax-protocol::RawLcmFrame`)
-//! - typed payload 编码与 `lcm_runtime.rs` 中各 `parse_*_payload` 镜像
-//!   对账;布局保持完全一致,只把字节构造从内联 `extend_from_slice` 收敛
-//!   到此处
-//! - fingerprint 仍走 FNV-1a 64-bit(等价于
-//!   `nuwax_protocol::LcmMessageType::fingerprint`);P1 切 MurmurHash64A
-//!   时本模块作为唯一迁移入口
-//! - 禁止 `server.rs` / `lcm_runtime.rs` 继续写裸
-//!   `payload.extend_from_slice(...)`;新增 typed message 必须在本文件
-//!   加 `encode_*` / `decode_*` 函数并被对应位置调用
-//!
-//! ## 与 `nuwax-codec::lcm::golden_*` 的关系
-//! `golden_pose_stamped` / `golden_odometry` / `golden_point_cloud2` 是
-//! **测试 fixture**(确定性 bytes,用于跨模块 byte-for-byte 对账测试);
-//! 运行时 typed payload 不复用 fixture 路径(那只是 12 字节 marker),而是
-//! 用本文件的 typed encode 真实序列化。
-//!
-//! ## P1 切换入口
-//! 当上游 `nuwax-codec` 切换到 MurmurHash64A 时,把本模块 fingerprint
-//! 计算从 `LcmMessageType::fingerprint` 切到 `nuwax_codec::compute_hash`;
-//! 调用方接口不变。
+//! LCM消息边界编解码：复用生成模式，并向运行时交付类型化帧。
 
 use nuwax_codec::lcm::schema;
 use nuwax_codec::{CodecError, CodecResult};
 use nuwax_protocol::{LcmFrameHeader, LcmMessageType, LcmTopic, RawLcmFrame, LCM_MAGIC};
 
+#[cfg(test)]
+use crate::lcm_runtime::FrontierEntry;
 use crate::lcm_runtime::{
-    FrontierEntry, NavState, NavigationFeedback, NavigationUpdate, PoseState, TransformEntry,
+    NavState, NavigationFeedback, NavigationUpdate, PoseState, TransformEntry,
 };
 
 // ============================================================================
 // typed payload layout 常量(必须与 lcm_runtime.rs parse_*_payload 一致)
 // ============================================================================
 
+#[cfg(test)]
 /// `/cmd_vel` typed payload 布局:
 /// `6×f64` (linear xyz + angular xyz)，与生成的 `geometry_msgs.Twist` 一致。
 pub const CMD_VEL_PAYLOAD_BYTES: usize = 48;
@@ -75,6 +48,7 @@ pub fn encode_odometry_payload(pose: &PoseState, child_frame_id: &str) -> CodecR
     })
 }
 
+#[cfg(test)]
 /// 把 PointCloud2 raw bytes + point_step 编码成 typed payload。
 ///
 /// 字节布局:`u32 point_step + raw_point_cloud_bytes`。
@@ -82,15 +56,6 @@ pub fn encode_pointcloud_payload(points: &[u8], point_step: u32) -> CodecResult<
     encode_pointcloud_payload_with_header(points, point_step, 0, 0, "map")
 }
 
-/// Encode a committed cumulative map snapshot for the canonical typed
-/// `/global_map#sensor_msgs.PointCloud2` transport boundary.
-pub fn encode_global_map_pointcloud_payload(
-    xyz_f32_le: &[u8],
-    revision: u64,
-    timestamp_ns: u64,
-) -> CodecResult<Vec<u8>> {
-    encode_global_map_pointcloud_payload_in_frame(xyz_f32_le, revision, timestamp_ns, "map")
-}
 
 pub fn encode_global_map_pointcloud_payload_in_frame(
     xyz_f32_le: &[u8],
@@ -169,6 +134,7 @@ fn encode_pointcloud_payload_with_header(
     })
 }
 
+#[cfg(test)]
 /// 把 `geometry_msgs/Twist` 编码成 typed payload bytes。
 pub fn encode_cmd_vel_payload(linear: [f32; 3], angular: [f32; 3], _stamp_ns: u64) -> Vec<u8> {
     schema::encode_twist_body(&schema::Twist {
@@ -235,6 +201,7 @@ pub fn encode_goal_envelope_payload(message: &schema::GoalEnvelope) -> CodecResu
     schema::encode_goal_envelope_body(message)
 }
 
+#[cfg(test)]
 /// Decode and validate a `nuwax_msgs.GoalEnvelope` generated-C body.
 pub fn decode_goal_envelope_payload(payload: &[u8]) -> CodecResult<schema::GoalEnvelope> {
     schema::decode_goal_envelope_body(payload)
@@ -245,6 +212,7 @@ pub fn decode_path_envelope_payload(payload: &[u8]) -> CodecResult<schema::PathE
     schema::decode_path_envelope_body(payload)
 }
 
+#[cfg(test)]
 /// 把 `geometry_msgs/PoseStamped` 编码成 typed payload bytes(复用 odom 布局)。
 pub fn encode_pose_stamped_payload(pose: &PoseState) -> CodecResult<Vec<u8>> {
     schema::encode_pose_stamped_body(&schema::PoseStamped {
@@ -308,6 +276,7 @@ pub fn build_typed_frame(
 // decode 端
 // ============================================================================
 
+#[cfg(test)]
 /// 把 raw bytes 解析成 `PoseState`。失败返回 `None`,调用方按需 warn。
 ///
 /// 镜像 `lcm_runtime::parse_odom_payload`;`server.rs` 旧逻辑完全迁移到
@@ -452,6 +421,7 @@ pub fn decode_tf_payload(payload: &[u8]) -> Option<Vec<TransformEntry>> {
         .collect()
 }
 
+#[cfg(test)]
 /// 把 raw bytes 解析成 `Vec<FrontierEntry>`(给 /explore/frontiers typed channel 用)。
 pub fn decode_frontiers_payload(payload: &[u8]) -> Option<Vec<FrontierEntry>> {
     let message = schema::decode_frontier_list_body(payload).ok()?;

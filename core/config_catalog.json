@@ -143,19 +143,6 @@
     "apply_scope": "重启几何运行时后生效",
     "description": "三维链实时建图时占据栅格的单格边长（米），栅格范围随点云自动扩展；二维链使用二维扫描与算法配置中的分辨率。"
   },
-  "NUWAX_MAPPING_VOXEL_SIZE": {
-    "zh_name": "旧建图适配器体素声明",
-    "type": "float",
-    "default": 0.05,
-    "section_id": "mapping",
-    "target_file": "core_env",
-    "consumers": [
-      "services/geometry/nuwax_geometry_runtime/src/mapping_adapter.rs"
-    ],
-    "apply_scope": "仅兼容保存，当前内置执行链不使用",
-    "description": "旧建图适配器声明的体素下采样边长（米）；当前执行链不读取，仅为兼容旧配置保留，精细地图分辨率以地图元数据为准。",
-    "effective_value_scope": "inactive"
-  },
   "NUWAX_MAPPING_WIDTH_CELLS": {
     "zh_name": "栅格宽度（格）",
     "type": "int",
@@ -1329,18 +1316,6 @@
     "apply_scope": "重启相关服务后生效",
     "description": ""
   },
-  "NX_MEMORY_LIGHTWEIGHT_LIBRARY_STATS": {
-    "zh_name": "启用记忆库轻量统计",
-    "type": "bool",
-    "default": true,
-    "section_id": "runtime_data",
-    "target_file": "core_env",
-    "consumers": [
-      "services/memory/service.py"
-    ],
-    "apply_scope": "重启网关后生效",
-    "description": ""
-  },
   "NUWAX_PCD_MIN_POINTS": {
     "zh_name": "保存点云地图的最少点数",
     "type": "int",
@@ -2411,96 +2386,6 @@
     "apply_scope": "重启网关后生效",
     "description": "候选名称达到分数、分数差和视角数门槛时自动写入区域；关闭后只保留为候选。手动命名优先。",
     "advanced": false
-  },
-  "NUWAX_GEOMETRY_POINT_CLOUD_PREPROCESS_ENABLED": {
-    "zh_name": "旧点云预处理开关",
-    "effective_value_scope": "inactive",
-    "apply_scope": "仅兼容保存，当前内置执行链不使用",
-    "description": "旧点云预处理总开关；当前执行链不读取，仅为兼容旧配置保留。",
-    "type": "bool",
-    "default": true,
-    "target_file": "core_env"
-  },
-  "NUWAX_GEOMETRY_POINT_CLOUD_VOXEL_SIZE_M": {
-    "zh_name": "旧点云预处理体素",
-    "effective_value_scope": "inactive",
-    "apply_scope": "仅兼容保存，当前内置执行链不使用",
-    "description": "旧点云预处理的体素下采样边长（米）；当前执行链不读取，仅为兼容旧配置保留，精细地图分辨率以地图元数据为准。",
-    "type": "float",
-    "default": 0.05,
-    "target_file": "core_env"
-  },
-  "NUWAX_GEOMETRY_POINT_CLOUD_MIN_RANGE_M": {
-    "zh_name": "旧点云最小距离",
-    "effective_value_scope": "inactive",
-    "apply_scope": "仅兼容保存，当前内置执行链不使用",
-    "description": "旧点云预处理保留的最近距离（米）；当前执行链不读取，仅为兼容旧配置保留。",
-    "type": "float",
-    "default": 0.15,
-    "target_file": "core_env"
-  },
-  "NUWAX_GEOMETRY_POINT_CLOUD_MAX_RANGE_M": {
-    "zh_name": "旧点云最大距离",
-    "effective_value_scope": "inactive",
-    "apply_scope": "仅兼容保存，当前内置执行链不使用",
-    "description": "旧点云预处理保留的最远距离（米）；当前执行链不读取，仅为兼容旧配置保留。",
-    "type": "float",
-    "default": 8.0,
-    "target_file": "core_env"
-  },
-  "NUWAX_GEOMETRY_POINT_CLOUD_MAX_POINTS": {
-    "zh_name": "旧点云最大点数",
-    "effective_value_scope": "inactive",
-    "apply_scope": "仅兼容保存，当前内置执行链不使用",
-    "description": "旧点云预处理每帧最多保留的点数；当前执行链不读取，仅为兼容旧配置保留。",
-    "type": "int",
-    "default": 1200,
-    "target_file": "core_env"
-  },
-  "NUWAX_GEOMETRY_POINT_CLOUD_CROP_MIN_Z_M": {
-    "zh_name": "旧点云裁剪最低高度",
-    "effective_value_scope": "inactive",
-    "apply_scope": "仅兼容保存，当前内置执行链不使用",
-    "description": "旧点云预处理保留的最低高度（米）；当前执行链不读取，仅为兼容旧配置保留。",
-    "type": "float",
-    "default": -0.6,
-    "target_file": "core_env"
-  },
-  "NUWAX_GEOMETRY_POINT_CLOUD_CROP_MAX_Z_M": {
-    "zh_name": "旧点云裁剪最高高度",
-    "effective_value_scope": "inactive",
-    "apply_scope": "仅兼容保存，当前内置执行链不使用",
-    "description": "旧点云预处理保留的最高高度（米）；当前执行链不读取，仅为兼容旧配置保留。",
-    "type": "float",
-    "default": 1.6,
-    "target_file": "core_env"
-  },
-  "NUWAX_GEOMETRY_POINT_CLOUD_CROP_FORWARD_MIN_M": {
-    "zh_name": "旧点云裁剪前向起点",
-    "effective_value_scope": "inactive",
-    "apply_scope": "仅兼容保存，当前内置执行链不使用",
-    "description": "旧点云预处理中前向保留范围的起点（米），负值表示机体后方；当前执行链不读取，仅为兼容旧配置保留。",
-    "type": "float",
-    "default": -0.5,
-    "target_file": "core_env"
-  },
-  "NUWAX_GEOMETRY_POINT_CLOUD_CROP_FORWARD_MAX_M": {
-    "zh_name": "旧点云裁剪前向终点",
-    "effective_value_scope": "inactive",
-    "apply_scope": "仅兼容保存，当前内置执行链不使用",
-    "description": "旧点云预处理中前向保留范围的终点（米）；当前执行链不读取，仅为兼容旧配置保留。",
-    "type": "float",
-    "default": 6.0,
-    "target_file": "core_env"
-  },
-  "NUWAX_GEOMETRY_POINT_CLOUD_CROP_LATERAL_M": {
-    "zh_name": "旧点云裁剪侧向范围",
-    "effective_value_scope": "inactive",
-    "apply_scope": "仅兼容保存，当前内置执行链不使用",
-    "description": "旧点云预处理中左右两侧各自保留的宽度（米）；当前执行链不读取，仅为兼容旧配置保留。",
-    "type": "float",
-    "default": 3.0,
-    "target_file": "core_env"
   },
   "NUWAX_NAV_ACTUATOR_MOTION_MODEL": {
     "type": "str",

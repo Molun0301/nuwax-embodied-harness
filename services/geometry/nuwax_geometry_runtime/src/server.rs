@@ -9340,7 +9340,7 @@ mod frame_tree_tests {
 #[cfg(test)]
 mod subscription_shutdown_tests {
     use super::*;
-    use crate::lcm_runtime::{MapRevisionEvent, MapState};
+    use crate::lcm_runtime::MapState;
     use tokio_stream::StreamExt;
 
     fn erase_item<T: Send + 'static>(stream: SubscriptionStream<T>) -> SubscriptionStream<()> {
@@ -9610,7 +9610,7 @@ mod subscription_shutdown_tests {
 #[cfg(test)]
 mod map_update_tests {
     use super::*;
-    use crate::lcm_runtime::{MapRevisionEvent, MapState};
+    use crate::lcm_runtime::MapState;
     use tokio_stream::StreamExt;
 
     fn test_mapping_event(map: MapState) -> MapRevisionEvent {
@@ -10388,7 +10388,7 @@ async fn assigned_mapping_cloud_boundary_slice(
         ExploreCostmapSnapshot, ExploreNavigationSink, ExplorePoseProvider, ExploreRobotPose,
         STATUS_ACCEPTED, STATUS_ACTIVE, STATUS_FAILED, STATUS_STOPPING,
     };
-    use crate::lcm_runtime::{MapRevisionEvent, MapState};
+    use crate::lcm_runtime::MapState;
     use crate::pointcloud::CloudMapShmWriter;
     use nalgebra::Point3;
     use nuwax_nav_types_messages::grid::{OccupancyCell, OccupancyGrid2D};
@@ -12966,10 +12966,6 @@ async fn assigned_mapping_cloud_boundary_slice(
         crate::mapping_adapter::MappingAdapter::new_with_backend_for_tests(
             crate::mapping_adapter::MappingAdapterConfig {
                 resolution: 0.1,
-                width_cells: 20,
-                height_cells: 20,
-                origin_xy: (-1.0, -1.0),
-                voxel_size: 0.1,
                 initial_safe_radius_meters: 0.0,
             },
             crate::mapping_backend::MappingBackendSpec::raytracing_defaults(),
@@ -15445,10 +15441,6 @@ async fn assigned_mapping_cloud_boundary_slice(
             crate::mapping_adapter::MappingAdapter::new_with_backend_for_tests(
                 crate::mapping_adapter::MappingAdapterConfig {
                     resolution: 0.1,
-                    width_cells: 40,
-                    height_cells: 40,
-                    origin_xy: (-2.0, -2.0),
-                    voxel_size: 0.1,
                     initial_safe_radius_meters: 0.0,
                 },
                 crate::mapping_backend::MappingBackendSpec::Voxel,

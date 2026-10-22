@@ -398,7 +398,6 @@ class ServiceRegressionChecks(unittest.TestCase):
         runtime.task_manager=SimpleNamespace(shutdown=action('tasks'))
         runtime._join_exploration_finalizers=action('finalizers')
         runtime._close_dispatch_resources=action('dispatch')
-        runtime._stop_safety_watchdog_loop=action('watchdog')
         runtime._settle_relocalization_owner_before_geometry_stop=action('relocalization')
         runtime._stop_runtime_input_bridge=action('inputs')
         runtime._stop_data_frame_stream_sources=action('frames')

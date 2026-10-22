@@ -5,7 +5,6 @@
 //! [`ExploreSchedulerHandle`]. Mapping and navigation wiring are injected through
 //! typed interfaces so the module never silently discards a selected goal.
 
-#![allow(dead_code)]
 
 #[cfg(test)]
 #[path = "explore_attribution.rs"]
@@ -35,9 +34,11 @@ use nuwax_codec::lcm::schema;
 use nuwax_exploration::conversions::frontier_goal_to_navigation_goal;
 use nuwax_exploration::surface_adapter::{SurfaceGoalSourceAdapter, SurfaceInputReceiver};
 use nuwax_exploration::wavefront_adapter::WavefrontGoalSourceAdapter;
+#[cfg(test)]
+use nuwax_exploration::ExplorationGoalSource;
 use nuwax_exploration::{
     ExplorationArbitrationPolicy, ExplorationBoundary, ExplorationController,
-    ExplorationGoalFeedback, ExplorationGoalSource, ExplorationPoll, ExplorationStateSnapshot,
+    ExplorationGoalFeedback, ExplorationPoll, ExplorationStateSnapshot,
     ExplorationStopReason, ExplorationTerminalKind,
 };
 use nuwax_explore_wavefront::WavefrontConfig;
@@ -64,12 +65,10 @@ pub const STATUS_ACCEPTED: &str = "ACCEPTED";
 pub const STATUS_REJECTED: &str = "REJECTED";
 pub const STATUS_PENDING: &str = "PENDING";
 pub const STATUS_STOPPING: &str = "STOPPING";
-pub const STATUS_STOPPED: &str = "STOPPED";
 pub const STATUS_ACTIVE: &str = "ACTIVE";
 pub const STATUS_SUCCEEDED: &str = "SUCCEEDED";
 pub const STATUS_CANCELLED: &str = "CANCELLED";
 pub const STATUS_FAILED: &str = "FAILED";
-pub const STATUS_UNIMPLEMENTED: &str = "UNIMPLEMENTED";
 
 const POLICY_PREFER_WAVEFRONT: &str = "prefer_wavefront";
 const POLICY_PREFER_TARE: &str = "prefer_tare";
@@ -101,6 +100,7 @@ const ORPHAN_RECONCILE_ENTRY_TIMEOUT: Duration = Duration::from_millis(50);
 #[cfg(test)]
 const ORPHAN_RECONCILE_ENTRY_TIMEOUT: Duration = Duration::from_millis(10);
 
+#[cfg(test)]
 pub fn parse_arbitration_policy(s: &str) -> ExplorationArbitrationPolicy {
     try_parse_arbitration_policy(s).unwrap_or(ExplorationArbitrationPolicy::PreferWavefront)
 }
@@ -137,7 +137,6 @@ pub fn stop_reason_str(r: ExplorationStopReason) -> &'static str {
         ExplorationStopReason::MaxGoalsReached => "max_goals_reached",
         ExplorationStopReason::DistanceBudgetReached => "distance_budget_reached",
         ExplorationStopReason::MapRevisionChanged => "map_revision_changed",
-        _ => "unsupported_stop_reason",
     }
 }
 
@@ -174,19 +173,6 @@ pub fn now_monotonic_nanos() -> u64 {
         + 1
 }
 
-pub fn pose_stamped_from_robot(x: f64, y: f64, _frame_id: &str) -> PoseStamped {
-    PoseStamped {
-        frame_id: NavFrameId::Map,
-        stamp: Timestamp {
-            nanos: now_unix_nanos() as i64,
-            clock: ClockKind::Unix,
-        },
-        pose: Pose3 {
-            position: Point3 { x, y, z: 0.0 },
-            orientation: Quaternion::IDENTITY,
-        },
-    }
-}
 
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -796,9 +782,6 @@ impl RecoveryFenceToken {
         Self(value)
     }
 
-    pub fn as_slice(&self) -> &[u8] {
-        &self.0
-    }
 
     fn is_valid(&self) -> bool {
         self.0.len() == 32 && self.0.iter().any(|byte| *byte != 0)
@@ -911,8 +894,6 @@ struct CompletedGlobalStopReconciliation {
 
 #[derive(Debug, Clone)]
 struct CompletedExactChildZeroed {
-    recovery_correlation: String,
-    request_identity: AssignedTransitionIdentity,
     receipt: ExplorationOwnershipReconciliationReceipt,
 }
 
@@ -2166,6 +2147,7 @@ impl ExploreRuntimeHandle {
         Ok(())
     }
 
+    #[cfg(test)]
     /// 接收新消息身份并立即处理清空/域变化；表面计算由外部受管工作执行。
     pub(crate) async fn begin_surface_map_update(
         &self,
@@ -2379,6 +2361,7 @@ impl ExploreRuntimeHandle {
         self.refresh_readiness_cache_with_backend(backend);
     }
 
+    #[cfg(test)]
     pub fn default_with_wavefront() -> Self {
         Self::new_with_validated_map_frame(Arc::from("map"))
     }
@@ -2401,13 +2384,13 @@ impl ExploreRuntimeHandle {
             expected_map_frame,
             readiness_cache: Arc::new(SyncMutex::new(ExplorationReadinessDetail {
                 ready: false,
-                reason: "exploration controller not started".to_string(),
+                #[cfg(test)] reason: "exploration controller not started".to_string(),
                 backend_available: false,
                 controller_active: false,
                 source_count: 1,
                 frontier_source_ready: false,
                 costmap_input_ready: false,
-                navigation_sink_ready: false,
+                #[cfg(test)] navigation_sink_ready: false,
                 active_source: "wavefront".to_string(),
                 arbitration: POLICY_PREFER_WAVEFRONT.to_string(),
             })),
@@ -2419,6 +2402,7 @@ impl ExploreRuntimeHandle {
         }
     }
 
+    #[cfg(test)]
     pub fn expected_map_frame(&self) -> &str {
         self.expected_map_frame.as_ref()
     }
@@ -2504,6 +2488,7 @@ impl ExploreRuntimeHandle {
             .expect("production exploration navigation sink")
     }
 
+    #[cfg(test)]
     pub fn clear_navigation_sink(&self) {
         *self.navigation_sink.write() = None;
     }
@@ -2512,6 +2497,7 @@ impl ExploreRuntimeHandle {
         self.frontier_tx.subscribe()
     }
 
+    #[cfg(test)]
     pub fn frontier_snapshot(&self) -> FrontierSnapshot {
         self.frontier_tx.borrow().clone()
     }
@@ -2611,9 +2597,6 @@ impl ExploreRuntimeHandle {
         }
     }
 
-    pub async fn arbitration(&self) -> ExplorationArbitrationPolicy {
-        self.inner.lock().await.arbitration
-    }
 
     #[cfg(test)]
     pub async fn start(&self, request_id: &str, arbitration: &str) -> ExploreRuntimeSnapshot {
@@ -3713,6 +3696,7 @@ impl ExploreRuntimeHandle {
         snapshot
     }
 
+    #[cfg(test)]
     pub async fn tick(&self, robot_xy: (f64, f64)) -> ExploreRuntimeSnapshot {
         let now_monotonic_ns = now_monotonic_nanos();
         self.tick_with_pose(ExploreRobotPose {
@@ -4904,8 +4888,6 @@ impl ExploreRuntimeHandle {
                     }
                     guard.completed_rollover_recovery = Some(
                         CompletedOwnershipTransition::ExactChildZeroed(CompletedExactChildZeroed {
-                            recovery_correlation,
-                            request_identity,
                             receipt,
                         }),
                     );
@@ -4975,15 +4957,8 @@ impl ExploreRuntimeHandle {
         Ok(self.snapshot())
     }
 
-    pub async fn ingest_costmap(&self, costmap: OccupancyGrid2D) -> bool {
-        self.ingest_costmap_snapshot(ExploreCostmapSnapshot {
-            grid: costmap,
-            frame_id: self.expected_map_frame.to_string(),
-        })
-        .await
-        .unwrap_or(false)
-    }
 
+    #[cfg(test)]
     pub async fn ingest_costmap_snapshot(
         &self,
         snapshot: ExploreCostmapSnapshot,
@@ -4991,6 +4966,7 @@ impl ExploreRuntimeHandle {
         self.ingest_costmap_with_identity(snapshot, None, 0, None).await
     }
 
+    #[cfg(test)]
     pub async fn ingest_committed_costmap_snapshot(
         &self,
         snapshot: ExploreCostmapSnapshot,
@@ -5152,22 +5128,8 @@ impl ExploreRuntimeHandle {
         detail
     }
 
-    pub fn readiness_sync(&self, backend_available: bool) -> ExplorationReadinessDetail {
-        let cached = self.readiness_cache.lock().clone();
-        if let Ok(guard) = self.inner.try_lock() {
-            let detail = Self::compute_readiness_locked(
-                &guard,
-                self.expected_map_frame.as_ref(),
-                backend_available,
-                self.navigation_sink.read().is_some(),
-            );
-            *self.readiness_cache.lock() = detail.clone();
-            detail
-        } else {
-            cached
-        }
-    }
 
+    #[cfg(test)]
     pub fn cached_readiness(&self) -> ExplorationReadinessDetail {
         self.readiness_cache.lock().clone()
     }
@@ -5201,6 +5163,7 @@ impl ExploreRuntimeHandle {
             && frontier_source_ready
             && costmap_input_ready
             && navigation_sink_ready;
+        #[cfg(test)]
         let reason = if !backend_available {
             "LCM backend unavailable"
         } else if let Some(error) = guard
@@ -5226,13 +5189,13 @@ impl ExploreRuntimeHandle {
         };
         ExplorationReadinessDetail {
             ready,
-            reason: reason.to_string(),
+            #[cfg(test)] reason: reason.to_string(),
             backend_available,
             controller_active,
             source_count,
             frontier_source_ready,
             costmap_input_ready,
-            navigation_sink_ready,
+            #[cfg(test)] navigation_sink_ready,
             active_source: guard.committed.diagnostics.clone()
                 .selected_source
                 .unwrap_or_else(|| {
@@ -5409,7 +5372,7 @@ fn evaluate_stop_conditions(
     {
         return Some(ExplorationStopReason::MaxGoalsReached);
     }
-    if let (Some(max_coverage), Some(costmap)) =
+    if let (Some(max_coverage), Some(_)) =
         (conditions.max_coverage_pct, guard.costmap_input.as_ref())
     {
         if guard.committed_map.is_some()
@@ -5864,13 +5827,13 @@ impl ExploreSchedulerHandle {
 #[derive(Debug, Clone)]
 pub struct ExplorationReadinessDetail {
     pub ready: bool,
-    pub reason: String,
+    #[cfg(test)] pub reason: String,
     pub backend_available: bool,
     pub controller_active: bool,
     pub source_count: usize,
     pub frontier_source_ready: bool,
     pub costmap_input_ready: bool,
-    pub navigation_sink_ready: bool,
+    #[cfg(test)] pub navigation_sink_ready: bool,
     pub active_source: String,
     pub arbitration: String,
 }

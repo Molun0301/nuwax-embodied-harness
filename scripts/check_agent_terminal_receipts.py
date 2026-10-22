@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from contracts.capabilities import CapabilityExecutionMode
 from contracts.tasks import TaskSpec
 from core.agent_call_store import AgentCallStore
+from tests.conftest import identity_call_store, insert_historical_scope_binding, create_isolated_gateway
 from core.errors import GatewayError
 from core.event_bus import EventBus
 from core.task_manager import TaskManager
@@ -29,7 +30,7 @@ class TerminalStoreChecks(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="neh-terminal-cas-")
         self.path = Path(self.temp.name) / "calls.sqlite3"
-        self.store = AgentCallStore(self.path, scope="robot-a", gateway_instance_id="gateway-a")
+        self.store = identity_call_store(self.path, identity_name='robot-a', gateway_instance_id='gateway-a')
 
     def tearDown(self):
         self.temp.cleanup()
@@ -58,7 +59,7 @@ class TerminalStoreChecks(unittest.TestCase):
     def test_scope_source_and_missing_version_are_explicit(self):
         self.save(1, 1)
         self.conflict("agent_terminal_source_conflict", lambda: self.save(2, 2, source="other-source"))
-        other = AgentCallStore(self.path, scope="robot-b", gateway_instance_id="gateway-a")
+        other = identity_call_store(self.path, identity_name='robot-b', gateway_instance_id='gateway-a')
         self.conflict("agent_terminal_scope_conflict", lambda: self.save(2, 2, store=other))
         self.conflict("agent_terminal_version_required", lambda: self.store.save_terminal("task-a", self.snapshot()))
         self.conflict("agent_terminal_identity_conflict", lambda: self.store.save_terminal("other", self.snapshot(), source_id="source-a", revision=2))
@@ -66,7 +67,7 @@ class TerminalStoreChecks(unittest.TestCase):
 
     def test_two_store_readers_preserve_initial_gateway_identity(self):
         self.save(1, 1)
-        other = AgentCallStore(self.path, scope="robot-a", gateway_instance_id="gateway-b")
+        other = identity_call_store(self.path, identity_name='robot-a', gateway_instance_id='gateway-b')
         self.assertEqual(self.save(1, 1, store=other)["disposition"], "unchanged")
         self.assertEqual(self.save(2, 2, store=other)["disposition"], "updated")
         self.assertEqual(other.get_terminal("task-a")["gateway_instance_id"], "gateway-a")
@@ -77,7 +78,8 @@ class TerminalStoreChecks(unittest.TestCase):
             db.execute("CREATE TABLE agent_task_terminals (task_id TEXT PRIMARY KEY, scope TEXT NOT NULL, gateway_instance_id TEXT NOT NULL, snapshot_json TEXT NOT NULL, updated_at TEXT NOT NULL)")
             db.execute("INSERT INTO agent_task_terminals VALUES (?,?,?,?,?)", ("task-a", "robot-a", "gateway-a", json.dumps(self.snapshot(9)), "legacy-time"))
         for gateway in ("gateway-a", "restarted-gateway"):
-            store = AgentCallStore(legacy_path, scope="robot-a", gateway_instance_id=gateway)
+            store = identity_call_store(legacy_path, identity_name='robot-a', gateway_instance_id=gateway)
+            insert_historical_scope_binding(legacy_path, legacy_scope="robot-a", owner_scope=store.scope)
             before = store.get_terminal("task-a")
             self.assertEqual(before["snapshot"]["result"], {"value": 9})
             self.conflict("agent_terminal_legacy_conflict", lambda store=store: self.save(10, 1, store=store))
@@ -96,7 +98,7 @@ class TerminalStoreChecks(unittest.TestCase):
             actions.append(1)
         self.assertEqual(actions, [1])
         self.store.begin("pending", "tool-a", "activate_map", {})
-        reopened = AgentCallStore(self.path, scope="robot-a", gateway_instance_id="gateway-b")
+        reopened = identity_call_store(self.path, identity_name='robot-a', gateway_instance_id='gateway-b')
         record, owner = reopened.begin("pending", "tool-a", "activate_map", {})
         self.assertFalse(owner)
         self.assertEqual(record["delivery_state"], "unknown")
@@ -155,12 +157,7 @@ class AgentReceiptChecks(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix="neh-agent-receipt-")
         self.bus = EventBus()
         self.manager = TaskManager(event_bus=self.bus)
-        self.runtime = GatewayRuntime.__new__(GatewayRuntime)
-        self.runtime.task_manager = self.manager
-        self.runtime.event_bus = self.bus
-        self.runtime.robot = NS(manifest=NS(robot_model="offline"), defaults=NS(parameters={}))
-        self.runtime.config = NS(gateway=NS(artifact_dir=str(Path(self.temp.name) / "artifacts")))
-        self.runtime._task_status_last_polled_at = {}
+        self.runtime = create_isolated_gateway(Path(self.temp.name), event_bus=self.bus, task_manager=self.manager)
         self.label = "标签 A"
         def descriptor(name):
             self.assertFalse(self.manager._lock._is_owned())
@@ -183,9 +180,10 @@ class AgentReceiptChecks(unittest.TestCase):
         for release in self.releases:
             release.set()
         self.manager.shutdown(wait=True)
-        self.assertTrue(self.bus.shutdown(2))
         for service in self.services:
-            service.close()
+            service.close(source_fenced=True)
+        self.runtime.stop()
+        self.assertTrue(self.bus.shutdown(2))
         self.temp.cleanup()
 
     def require(self, event):
@@ -368,17 +366,24 @@ class AgentReceiptChecks(unittest.TestCase):
             def __deepcopy__(self, memo):
                 raise TypeError("unused metadata")
         capability, tool_name = "offline_task", "offline_tool"
-        descriptor = NS(name=capability, display_name="离线任务", execution_mode=CapabilityExecutionMode.ASYNC_TASK)
+        from contracts.capabilities import CapabilityDescriptor, CapabilityRiskLevel
+        from contracts.skills import SkillDescriptor, SkillCategory
+        from core.capability_registry import CapabilityRegistry
+        from skills.registry import SkillRegistry
+        descriptor = CapabilityDescriptor(name=capability, display_name="离线任务", description="离线任务。",
+            execution_mode=CapabilityExecutionMode.ASYNC_TASK, risk_level=CapabilityRiskLevel.LOW,
+            exposed_to_agent=True, input_schema={"type": "object"})
         def handler(payload, *, requested_by, request_context):
             task = self.manager.submit(capability, lambda context: self.actions.append(1) or {"known": True},
                                        metadata={"unused": Opaque()})
             self.manager.wait_for_task(task.task_id, timeout=2)
             return task
-        self.runtime.capability_registry = NS(get_registration=lambda name: NS(descriptor=descriptor, handler=handler),
-                                             get_descriptor=lambda name: descriptor, assert_supported=lambda *a, **kw: None)
-        self.runtime.skill_registry = NS(get_descriptor=lambda name: NS(capability_name=capability))
-        self.runtime.list_tools = lambda **kwargs: [NS(supported=True, runnable=True, capability_name=capability,
-            descriptor=NS(name=tool_name, exposed_to_agent=True), input_schema={"type": "object"})]
+        self.runtime.capability_registry = CapabilityRegistry()
+        self.runtime.capability_registry.register(descriptor, handler)
+        self.runtime.capability_registry.assert_supported = lambda *args, **kwargs: None
+        self.runtime.skill_registry = SkillRegistry()
+        self.runtime.skill_registry.register(SkillDescriptor(name=tool_name, display_name="离线工具", description="离线任务。",
+            category=SkillCategory.TASK, capability_name=capability))
         self.runtime._refresh_dynamic_capability_matrix = lambda **kwargs: None
         self.runtime._requires_motion_admission = lambda descriptor: False
         self.runtime._ensure_geometry_runtime_for_invoke = lambda name: None

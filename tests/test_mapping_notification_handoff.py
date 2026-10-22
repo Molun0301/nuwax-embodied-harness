@@ -102,7 +102,6 @@ class MappingNotificationTests(unittest.TestCase):
         runtime._started, runtime._closed=started,False
         runtime.task_manager=NS(shutdown=lambda **kwargs: None)
         runtime._join_exploration_finalizers=lambda: None
-        runtime._stop_safety_watchdog_loop=lambda: None
         runtime.motion_guard=NS(has_connected=False,close=lambda: None)
         runtime._settle_relocalization_owner_before_geometry_stop=lambda **kw: {}
         runtime._stop_runtime_input_bridge=lambda: True

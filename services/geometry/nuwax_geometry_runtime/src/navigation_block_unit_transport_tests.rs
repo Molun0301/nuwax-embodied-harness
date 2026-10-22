@@ -13,10 +13,6 @@ mod navigation_block_unit_transport_tests {
             crate::mapping_adapter::MappingAdapter::new_with_backend_for_tests(
                 crate::mapping_adapter::MappingAdapterConfig {
                     resolution: 0.1,
-                    width_cells: 40,
-                    height_cells: 40,
-                    origin_xy: (-2.0, -2.0),
-                    voxel_size: 0.1,
                     initial_safe_radius_meters: 0.0,
                 },
                 crate::mapping_backend::MappingBackendSpec::Voxel,

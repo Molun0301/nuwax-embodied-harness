@@ -893,21 +893,6 @@ class MappingService:
             "%s:%s" % (self._service_epoch, source_name),
         )
 
-    def _resolve_snapshot_frame_id(
-        self,
-        occupancy_grid,
-        cost_map,
-        semantic_map,
-    ) -> Optional[str]:
-        frame_ids = {
-            str(getattr(layer, "frame_id", "") or "").strip()
-            for layer in (occupancy_grid, cost_map, semantic_map)
-            if layer is not None
-            and str(getattr(layer, "frame_id", "") or "").strip()
-        }
-        # 信任第一个 frame_id，删除"所有图层 frame_id 必须一致"的校验
-        # Rust 侧已保证图层间的一致性
-        return next(iter(frame_ids), None)
 
     def _get_map_provider(self) -> MapProvider:
         provider = self._find_map_provider()

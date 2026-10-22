@@ -1,74 +1,16 @@
-//! nuwax-motion-safety-guard 时序常量 + UDS 路径常量(§P0B #10/#14/#23)
-//!
-//! 与 `services/navigation/motion_safety_guard/constants.py` 保持一致。
+//! 运动守卫客户端使用的请求时限、帧大小和默认连接参数。
 
-/// 有效续租后滚动延长的租约窗口；短周期拥有方失联期限独立生效。
-///
-/// 对齐 Python `LEASE_RENEWAL_WINDOW_NS`。
-pub const LEASE_RENEWAL_WINDOW_MS: u64 = 600_000;
-
-/// §P0B #23 NAV owner 每 250ms Renew 一次。
-///
-/// 对齐 Python `RENEW_INTERVAL_MS = 250`。
+/// 客户端续租调度的最长期限；实际时刻还会扣除服务端剩余时间与通信余量。
 pub const RENEW_INTERVAL_MS: u64 = 250;
 
-/// §P0B #23 guard owner_timeout 阈值:3 倍 renew interval 冗余。
-///
-/// 对齐 Python `OWNER_TIMEOUT_MS = 750`。
-pub const OWNER_TIMEOUT_MS: u64 = 750;
-
-/// §P0B #23 MotionCommand deadline 上限 300ms。
-///
-/// 对齐 Python `COMMAND_DEADLINE_MS = 300`。
+/// 单个运动请求的服务端截止上限。
 pub const COMMAND_DEADLINE_MS: u32 = 300;
 
-/// Private UDS protobuf frame upper bound (16 MiB).
-///
-/// This matches Python `MAX_FRAME_BYTES` and includes only the protobuf body,
-/// excluding the four-byte big-endian prefix.
+/// 私有Unix套接字中Protobuf（协议结构编码）帧体的大小上限，不含长度前缀。
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
-/// Default timeout for one correlated UDS request/response exchange.
+/// 普通关联请求的默认传输等待时间。
 pub const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 1_000;
 
-/// owner_timeout / renew_interval 推导(3 倍冗余)。
-///
-/// 对齐 Python `RENEW_TO_OWNER_TIMEOUT_RATIO = 3`。
-pub const RENEW_TO_OWNER_TIMEOUT_RATIO: u64 = 3;
-
-/// §P0B #14 / #10 UDS 默认路径。
-///
-/// 对齐 Python `UDS_PATH = "/run/nuwax/motion-guard.sock"`。
+/// 生产守卫的默认私有Unix套接字路径。
 pub const DEFAULT_UDS_PATH: &str = "/run/nuwax/motion-guard.sock";
-
-/// §P0B #15 / #15 epoch.json 默认路径。
-///
-/// 对齐 Python `EPOCH_JSON_PATH = "/var/lib/nuwax/motion-guard/epoch.json"`。
-pub const DEFAULT_EPOCH_PATH: &str = "/var/lib/nuwax/motion-guard/epoch.json";
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// §P0B #23 时序常量 FROZEN 锁定。
-    #[test]
-    fn timing_constants_frozen() {
-        assert_eq!(LEASE_RENEWAL_WINDOW_MS, 600_000);
-        assert_eq!(RENEW_INTERVAL_MS, 250);
-        assert_eq!(OWNER_TIMEOUT_MS, 750);
-        assert_eq!(COMMAND_DEADLINE_MS, 300);
-        assert_eq!(MAX_FRAME_BYTES, 16 * 1024 * 1024);
-        assert_eq!(DEFAULT_REQUEST_TIMEOUT_MS, 1_000);
-        assert_eq!(
-            RENEW_TO_OWNER_TIMEOUT_RATIO,
-            OWNER_TIMEOUT_MS / RENEW_INTERVAL_MS
-        );
-    }
-
-    /// §P0B #10/#15 默认路径 FROZEN 锁定。
-    #[test]
-    fn default_paths_frozen() {
-        assert_eq!(DEFAULT_UDS_PATH, "/run/nuwax/motion-guard.sock");
-        assert_eq!(DEFAULT_EPOCH_PATH, "/var/lib/nuwax/motion-guard/epoch.json");
-    }
-}

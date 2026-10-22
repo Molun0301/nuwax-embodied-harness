@@ -594,10 +594,8 @@ function buildConfigRow(f, applying = false) {
   meta.append(source, scope);
   if (f.effective_value_known === false) {
     const unknown = document.createElement("span");
-    unknown.textContent = f.effective_value_scope === 'inactive'
-      ? '当前执行链不使用此项'
-      : f.effective_value_scope === 'external_process'
-        ? '由外部进程读取，页面无法确认其实际采用值' : "未采集当前进程的取值";
+    unknown.textContent = f.effective_value_scope === 'external_process'
+      ? '由外部进程读取，页面无法确认其实际采用值' : "未采集当前进程的取值";
     meta.appendChild(unknown);
   }
   explain.appendChild(meta);

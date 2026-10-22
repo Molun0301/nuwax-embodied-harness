@@ -1,9 +1,4 @@
-// Phase 6 (codex-round3 R3-4):frame_id / target / accepted_at_ns / inner /
-// build_nav_stack_handle / render_dry_run / readiness_from_reason 是 Phase 4
-// nav RuntimeDiagnostics platform API 预留(共享 nuwax-nav-stack handle 与
-// 探测日志 trace 入口)。uninlined_format_args 是 debug log 模板代码风格,
-// 不动语义。
-#![allow(dead_code, clippy::uninlined_format_args)]
+#![allow(clippy::uninlined_format_args)]
 
 //! Phase 4:nav runtime adapter —— 把 `SetNavigationGoal` / `CancelNavigation` /
 //! `SubscribeNavigationState` / `GetNavigationReadiness` 从 `UNIMPLEMENTED` 变成
@@ -41,8 +36,10 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use nuwax_codec::lcm::schema;
+#[cfg(test)]
+use nuwax_nav_stack::{NavStackHandle, NavStackPreset};
 use nuwax_nav_stack::{
-    graph::ModuleNode, NavStackBuilder, NavStackHandle, NavStackPreset, NavStackProfile,
+    graph::ModuleNode, NavStackBuilder, NavStackProfile,
 };
 use nuwax_protocol::{LcmMessageType, LcmTopic, RawLcmFrame};
 use nuwax_transport::{LcmTransport, TransportError};
@@ -70,9 +67,8 @@ pub const PROFILE_EXPLORATION_NATIVE: &str = "exploration-native";
 /// 测试中 `text.contains(p)` 会失败。
 pub const PROFILE_MLS3D: &str = "pct-scan-3d";
 
-/// 未选择执行链时使用三维完整链；非法显式配置不会回退。
-pub const DEFAULT_PROFILE: &str = PROFILE_MLS3D;
 
+#[cfg(test)]
 static NEXT_NAV_RUNTIME_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// 目标准入只需持有地图生命周期 fence、唯一已提交地图权威与只读地图名称投影。
@@ -188,16 +184,13 @@ pub const PATH_CHANNEL_RUNTIME: &str = "NUWAX_GEOMETRY_RUNTIME_NAV_PATH_CHANNEL"
 /// `/nav/path` immutable envelope default.
 pub const PATH_CHANNEL_DEFAULT: &str = "/nav/path#nuwax_msgs.PathEnvelope";
 
+#[cfg(test)]
 /// GoalEnvelope message type validated once at startup.
 /// 失败应直接 panic(因为这是 typed protocol 层,不可能 fail)。
 fn goal_msg_type() -> LcmMessageType {
     LcmMessageType::new("nuwax_msgs.GoalEnvelope").expect("typed nuwax_msgs.GoalEnvelope")
 }
 
-/// PathEnvelope message type validated once at startup.
-fn path_msg_type() -> LcmMessageType {
-    LcmMessageType::new("nuwax_msgs.PathEnvelope").expect("typed nuwax_msgs.PathEnvelope")
-}
 
 /// 单一目标状态机阶段。`status` 字段直接对应 gRPC `NavigationState.status`,
 /// 这样 Python 侧 `get_navigation_state` 不用再翻译。
@@ -295,8 +288,6 @@ pub struct ActiveGoal {
     pub frame_id: String,
     /// 目标位姿(在 `frame_id` 坐标系下)。
     pub target: PoseState,
-    /// 收到 `set_goal` 的本地墙钟(ns),给 `timestamp_ns` 字段用。
-    pub accepted_at_ns: u64,
     pub options: nuwax_nav_types_messages::GoalOptions,
     pub producer: String,
     pub producer_epoch: i64,
@@ -647,7 +638,6 @@ enum CancelStart {
         lease: GoalLease,
         generation: u64,
         goal_id: String,
-        message: String,
     },
     Rejected {
         goal_id: String,
@@ -691,6 +681,7 @@ struct RuntimeObservationSnapshot {
 }
 
 impl NavRuntimeState {
+    #[cfg(test)]
     /// 新建 nav runtime:读 env profile、build module graph、把节点 ID
     /// 写入 slot。
     pub fn from_env() -> Self {
@@ -706,6 +697,7 @@ impl NavRuntimeState {
         Self::with_profile_and_producer_runtime_generation(profile, producer_runtime_generation)
     }
 
+    #[cfg(test)]
     /// Construct the production runtime only after durably reserving a producer
     /// epoch that remains newer after a geometry process restart.
     pub(crate) fn try_from_sequence_store(
@@ -814,6 +806,7 @@ impl NavRuntimeState {
         slot.goal = Some(goal);
     }
 
+    #[cfg(test)]
     /// 读内部 slot 句柄(给 server.rs 写 diagnostics 用)。
     pub fn inner(&self) -> Arc<RwLock<NavRuntimeSlot>> {
         self.inner.clone()
@@ -1173,6 +1166,7 @@ impl NavRuntimeState {
         ).map(|(_, points)| points.clone()).unwrap_or_default()
     }
 
+    #[cfg(test)]
     /// Correlate a typed NavigationState with either the active or retained
     /// cancellation lease. Empty-session heartbeats are accepted as unowned.
     #[allow(clippy::too_many_arguments)]
@@ -1379,18 +1373,8 @@ impl NavRuntimeState {
         self.inner.read().await.module_nodes.clone()
     }
 
-    /// 当前阶段 + message(转成 NavState 返回值)。
-    pub async fn snapshot(&self, goal_id: String, distance_remaining: f32) -> NavState {
-        let slot = self.inner.read().await;
-        NavState {
-            status: slot.phase.as_str().to_string(),
-            message: slot.message.clone(),
-            goal_id,
-            distance_remaining,
-            timestamp_ns: now_ns(),
-        }
-    }
 
+    #[cfg(test)]
     /// Record one state emitted by the real stack and normalize an omitted
     /// session id to the facade's currently active goal.
     pub async fn observe_stack_state(&self, observed: NavState) -> NavState {
@@ -1534,10 +1518,6 @@ impl NavRuntimeState {
         }
     }
 
-    /// Synchronous liveness poll used by process-level diagnostics.
-    pub fn stack_is_live(&self) -> bool {
-        self.stack_health_snapshot().fresh
-    }
 
     /// Record a real TF consumer observation.
     pub fn observe_tf_chain(
@@ -1633,6 +1613,7 @@ impl NavRuntimeState {
     }
 
     /// 同步诊断与实际缺失项使用同一份观察判断。
+    #[cfg(test)]
     pub fn execution_chain_is_live(&self) -> bool {
         self.execution_chain_blockers().is_empty()
     }
@@ -1801,7 +1782,6 @@ impl NavRuntimeState {
                 lease,
                 generation: cancel.generation,
                 goal_id,
-                message: cancel.message.clone(),
             };
         }
         if cancel.phase == CancelPhase::Pending {
@@ -1995,6 +1975,7 @@ fn reject_stale_generation(current: Option<u64>, received: u64) -> Result<(), Ob
     }
 }
 
+#[cfg(test)]
 /// 解析固定执行链；显式错配或非法值保留错误。
 pub fn resolve_profile_from_env() -> Result<&'static str, nuwax_nav_stack::NavStackError> {
     nuwax_nav_stack::ProductionPipeline::from_env()
@@ -2013,6 +1994,7 @@ fn profile_enum(profile: &str) -> NavStackProfile {
     }
 }
 
+#[cfg(test)]
 /// 启动时构造 module graph,返回 `NavStackHandle` 给 diagnostics 渲染用。
 ///
 /// 失败时返回 `None`,调用方按 not_ready 处理。
@@ -2027,6 +2009,7 @@ pub fn build_nav_stack_handle(profile: &str) -> Option<NavStackHandle> {
     }
 }
 
+#[cfg(test)]
 /// 把 `NavStackHandle` 渲染成 dry-run 字符串(给 diagnostics 字段用)。
 pub fn render_dry_run(handle: &NavStackHandle) -> String {
     handle.dry_run()
@@ -2633,7 +2616,7 @@ pub struct SetGoalOutcome {
     /// Trusted source of the lease in this result.
     pub lease_origin: GoalLeaseOrigin,
     /// Local transport completion fact.
-    pub dispatch_effect: GoalDispatchEffect,
+    #[cfg(test)] pub dispatch_effect: GoalDispatchEffect,
     /// Typed command-only reason when no complete original receipt is available.
     pub diagnostic: Option<GoalSubmissionDiagnostic>,
     /// Controls only local command projection, never authoritative consumer fanout.
@@ -3553,7 +3536,6 @@ async fn admit_goal_input(
             id: input.goal_id.clone(),
             frame_id: input.frame_id.clone(),
             target: input.target.clone(),
-            accepted_at_ns: now_ns(),
             options: input.options,
             producer,
             producer_epoch,
@@ -3613,7 +3595,7 @@ async fn admit_goal_input(
         },
         lease: Some(lease),
         lease_origin: GoalLeaseOrigin::Installed,
-        dispatch_effect: GoalDispatchEffect::LocallyCompleted,
+        #[cfg(test)] dispatch_effect: GoalDispatchEffect::LocallyCompleted,
         ..SetGoalOutcome::default()
     }
 }
@@ -3656,7 +3638,7 @@ async fn project_installed_goal_completion(
         };
         return SetGoalOutcome {
             state: receipt.state.clone(), lease: Some(lease),
-            lease_origin: GoalLeaseOrigin::Installed, dispatch_effect,
+            lease_origin: GoalLeaseOrigin::Installed, #[cfg(test)] dispatch_effect,
             publication: GoalPublicationPolicy::NoPublish,
             resolved_receipt: Some(receipt), ..SetGoalOutcome::default()
         };
@@ -3675,7 +3657,7 @@ async fn project_installed_goal_completion(
                 state: NavState { status: "FAILED".into(), message, goal_id: attempted.session_id.clone(),
                     distance_remaining, timestamp_ns: now_ns() },
                 lease: Some(attempted.clone()), lease_origin: GoalLeaseOrigin::InstalledReleased,
-                dispatch_effect, ..SetGoalOutcome::default()
+                #[cfg(test)] dispatch_effect, ..SetGoalOutcome::default()
             };
         }
         // A poisoned tracker is not permission to erase a physical responsibility.
@@ -3710,7 +3692,7 @@ async fn project_installed_goal_completion(
             timestamp_ns: 0,
         },
         lease: Some(lease), lease_origin: GoalLeaseOrigin::InstalledUnresolved,
-        dispatch_effect, diagnostic: Some(diagnostic),
+        #[cfg(test)] dispatch_effect, diagnostic: Some(diagnostic),
         publication: GoalPublicationPolicy::NoPublish, ..SetGoalOutcome::default()
     }
 }
@@ -4026,15 +4008,6 @@ async fn distance_to_target_from_state(
     dx.hypot(dy).hypot(dz) as f32
 }
 
-/// 按当前后端计算目标距离；多层表面保留高度，二维后端只计平面距离。
-pub async fn distance_to_target(handle: &GeometryRuntimeHandle, target: &PoseState) -> f32 {
-    distance_to_target_from_state(
-        &handle.state,
-        target,
-        handle.nav.configured_profile() == PROFILE_MLS3D,
-    )
-    .await
-}
 
 /// 生成或保留 goal_id。空字符串时生成 UUID v4。
 pub fn ensure_goal_id(provided: &str) -> String {
@@ -4056,6 +4029,7 @@ pub fn readiness_to_reason(detail: &NavigationReadinessDetail) -> String {
     })
 }
 
+#[cfg(test)]
 /// 把 readiness JSON 解析回来(Python 侧也用,这里给 Rust 单元测试用)。
 pub fn readiness_from_reason(reason: &str) -> Option<NavigationReadinessDetail> {
     serde_json::from_str(reason).ok()
@@ -4141,15 +4115,6 @@ pub fn path_envelope_binding() -> Result<(LcmTopic, LcmMessageType), String> {
     strict_typed_binding(&channel, "nuwax_msgs.PathEnvelope")
 }
 
-async fn publish_goal_frame_from_transport(
-    transport: &LcmTransport,
-    envelope: &schema::GoalEnvelope,
-) -> Result<(), TransportError> {
-    let payload = typed_codec::encode_goal_envelope_payload(envelope)
-        .map_err(|e| TransportError::NotDispatched(Box::new(
-            TransportError::LcmBackend(format!("GoalEnvelope LCM encode failed: {e}")))))?;
-    publish_encoded_goal_frame_from_transport(transport, payload).await
-}
 
 async fn publish_encoded_goal_frame_from_transport(
     transport: &LcmTransport,
@@ -4162,13 +4127,6 @@ async fn publish_encoded_goal_frame_from_transport(
     transport.publish(frame).await
 }
 
-/// publish `/nav/goal` typed frame。
-async fn publish_goal_frame(
-    handle: &GeometryRuntimeHandle,
-    envelope: &schema::GoalEnvelope,
-) -> Result<(), TransportError> {
-    publish_goal_frame_from_transport(&handle.transport, envelope).await
-}
 
 /// publish `/nav/cancel` typed frame。
 async fn publish_cancel_frame(
@@ -4484,10 +4442,6 @@ mod tests {
         let adapter = Arc::new(parking_lot::Mutex::new(
             crate::mapping_adapter::MappingAdapter::new(crate::mapping_adapter::MappingAdapterConfig {
                 resolution: 0.1,
-                width_cells: 4,
-                height_cells: 4,
-                origin_xy: (0.0, 0.0),
-                voxel_size: 0.1,
                 initial_safe_radius_meters: 0.0,
             }),
         ));
@@ -4911,7 +4865,6 @@ mod tests {
                 timestamp_ns: now_ns(),
                 ..PoseState::default()
             },
-            accepted_at_ns: now_ns(),
             lease,
         }
     }
@@ -4943,7 +4896,7 @@ mod tests {
     }
 
     fn sealed_path(lease: &GoalLease, path_revision: u64, x: f64) -> schema::PathEnvelope {
-        let mut path = schema::PathEnvelope {
+        let path = schema::PathEnvelope {
             schema_version: schema::NAVIGATION_ENVELOPE_SCHEMA_VERSION,
             session_id: lease.session_id.clone(),
             owner_kind: lease.owner_kind,

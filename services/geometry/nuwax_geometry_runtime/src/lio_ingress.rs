@@ -303,7 +303,6 @@ impl AdmittedRegisteredScan {
     pub(crate) fn binding(&self) -> &RegistrationBinding { &self.0.binding }
     pub(crate) fn source_timestamp_ns(&self) -> u64 { self.0.source.source_timestamp_ns as u64 }
     pub(crate) fn sensor_frame_id(&self) -> &str { &self.0.frames[0] }
-    pub(crate) fn map_frame_id(&self) -> &str { &self.0.frames[3] }
     pub(crate) fn body_frame_id(&self) -> &str { &self.0.frames[1] }
     pub(crate) fn body_points(&self) -> &crate::correction_points::CorrectionPoints { &self.0.body_points }
 
@@ -595,6 +594,7 @@ impl StreamCursor {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommonLioIngressSnapshot {
     pub(crate) runtime_generation: i64,
@@ -693,7 +693,7 @@ pub(crate) struct ValidatedStartupPairData {
     registered_odom_points: crate::correction_points::CorrectionPoints,
     source_point_count: usize,
     emitted_point_count: usize,
-    encoded_odometry: Bytes,
+    #[cfg(test)] encoded_odometry: Bytes,
 }
 
 impl std::ops::Deref for ValidatedStartupPair {
@@ -704,7 +704,7 @@ impl std::ops::Deref for ValidatedStartupPair {
 enum NativeProbePhase {
     Probing,
     Retained(Box<Option<ValidatedStartupPair>>),
-    Transferred,
+    #[cfg(test)] Transferred,
     Runtime,
     Closed,
 }
@@ -774,11 +774,11 @@ pub(crate) struct CorrectionAwareLioIngress {
 
 enum LioRoutingState {
     Preparing,
-    StartupOdometry {
+    #[cfg(test)] StartupOdometry {
         active: Arc<dyn LioIngressSink>,
         token: u64,
     },
-    DeferredCloud {
+    #[cfg(test)] DeferredCloud {
         active: Arc<dyn LioIngressSink>,
         token: u64,
     },
@@ -808,8 +808,8 @@ struct ClaimedStartupReplay {
 }
 
 enum NativeDeferredReplayPhase {
-    Startup(Option<ValidatedStartupPair>),
-    Deferred(Option<ValidatedStartupPair>),
+    #[cfg(test)] Startup(Option<ValidatedStartupPair>),
+    #[cfg(test)] Deferred(Option<ValidatedStartupPair>),
     Claimed(Option<ClaimedStartupReplay>),
     CloudReplaying(DeferredMappingIdentity, bool),
     Complete(DeferredMappingIdentity),
@@ -842,7 +842,7 @@ pub(crate) struct LioIngressRoutingGate {
     probe: Arc<dyn LioIngressSink>,
     state: Mutex<LioRoutingState>,
     state_changed: Notify,
-    next_replay_token: std::sync::atomic::AtomicU64,
+    #[cfg(test)] next_replay_token: std::sync::atomic::AtomicU64,
 }
 
 impl LioIngressRoutingGate {
@@ -851,7 +851,7 @@ impl LioIngressRoutingGate {
             probe,
             state: Mutex::new(LioRoutingState::Preparing),
             state_changed: Notify::new(),
-            next_replay_token: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)] next_replay_token: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -870,16 +870,18 @@ impl LioIngressRoutingGate {
                 self.state_changed.notify_waiters();
                 Ok(())
             }
+            #[cfg(test)]
             LioRoutingState::StartupOdometry { .. }
             | LioRoutingState::DeferredCloud { .. }
-            | LioRoutingState::CloudReplaying { .. }
-            | LioRoutingState::Active(_) => Err("LIO routing gate is already active".to_owned()),
+            => Err("LIO routing gate is already active".to_owned()),
+            LioRoutingState::CloudReplaying { .. } | LioRoutingState::Active(_) => Err("LIO routing gate is already active".to_owned()),
             LioRoutingState::Poisoned | LioRoutingState::Closed => {
                 Err("LIO routing gate is closed".to_owned())
             }
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn bind_deferred(
         &self,
         active: Arc<dyn LioIngressSink>,
@@ -901,20 +903,23 @@ impl LioIngressRoutingGate {
                 self.state_changed.notify_waiters();
                 Ok(LioReplayToken(token))
             }
+            #[cfg(test)]
             LioRoutingState::StartupOdometry { .. }
             | LioRoutingState::DeferredCloud { .. }
-            | LioRoutingState::CloudReplaying { .. }
-            | LioRoutingState::Active(_) => Err("LIO routing gate is already active".to_owned()),
+            => Err("LIO routing gate is already active".to_owned()),
+            LioRoutingState::CloudReplaying { .. } | LioRoutingState::Active(_) => Err("LIO routing gate is already active".to_owned()),
             LioRoutingState::Poisoned | LioRoutingState::Closed => {
                 Err("LIO routing gate is closed".to_owned())
             }
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn finish_startup_odometry(&self, token: LioReplayToken) -> Result<(), String> {
         let mut state = self.state.lock();
         let previous = std::mem::replace(&mut *state, LioRoutingState::Closed);
         match previous {
+            #[cfg(test)]
             LioRoutingState::StartupOdometry {
                 active,
                 token: actual,
@@ -927,6 +932,7 @@ impl LioIngressRoutingGate {
                 self.state_changed.notify_waiters();
                 Ok(())
             }
+            #[cfg(test)]
             LioRoutingState::StartupOdometry {
                 active,
                 token: actual,
@@ -944,14 +950,15 @@ impl LioIngressRoutingGate {
         }
     }
 
-    pub(crate) fn begin_cloud_replay(&self, token: LioReplayToken) -> Result<(), String> {
+    pub(crate) fn begin_cloud_replay(&self, _token: LioReplayToken) -> Result<(), String> {
         let mut state = self.state.lock();
         let previous = std::mem::replace(&mut *state, LioRoutingState::Closed);
         match previous {
+            #[cfg(test)]
             LioRoutingState::DeferredCloud {
                 active,
                 token: actual,
-            } if actual == token.0 => {
+            } if actual == _token.0 => {
                 *state = LioRoutingState::CloudReplaying {
                     active,
                     token: actual,
@@ -960,6 +967,7 @@ impl LioIngressRoutingGate {
                 self.state_changed.notify_waiters();
                 Ok(())
             }
+            #[cfg(test)]
             LioRoutingState::DeferredCloud {
                 active,
                 token: actual,
@@ -1011,10 +1019,11 @@ impl LioIngressRoutingGate {
         let active = {
             let mut state = self.state.lock();
             match std::mem::replace(&mut *state, LioRoutingState::Poisoned) {
+                #[cfg(test)]
                 LioRoutingState::StartupOdometry { active, .. }
                 | LioRoutingState::DeferredCloud { active, .. }
-                | LioRoutingState::CloudReplaying { active, .. }
-                | LioRoutingState::Active(active) => Some(active),
+                => Some(active),
+                LioRoutingState::CloudReplaying { active, .. } | LioRoutingState::Active(active) => Some(active),
                 LioRoutingState::Preparing
                 | LioRoutingState::Poisoned
                 | LioRoutingState::Closed => None,
@@ -1042,8 +1051,10 @@ impl LioIngressRoutingGate {
     fn public_target(&self) -> Option<Arc<dyn LioIngressSink>> {
         match &*self.state.lock() {
             LioRoutingState::Preparing => Some(Arc::clone(&self.probe)),
-            LioRoutingState::StartupOdometry { active, .. }
-            | LioRoutingState::CloudReplaying { active, .. } => Some(Arc::clone(active)),
+            #[cfg(test)]
+            LioRoutingState::StartupOdometry { active, .. } => Some(Arc::clone(active)),
+            LioRoutingState::CloudReplaying { active, .. } => Some(Arc::clone(active)),
+            #[cfg(test)]
             LioRoutingState::DeferredCloud { .. } => None,
             LioRoutingState::Active(ingress) => Some(Arc::clone(ingress)),
             LioRoutingState::Poisoned | LioRoutingState::Closed => None,
@@ -1061,9 +1072,10 @@ impl LioIngressRoutingGate {
             let changed = self.state_changed.notified();
             match &*self.state.lock() {
                 LioRoutingState::Preparing => return Some(Arc::clone(&self.probe)),
+                #[cfg(test)]
                 LioRoutingState::StartupOdometry { .. }
-                | LioRoutingState::DeferredCloud { .. }
-                | LioRoutingState::CloudReplaying { .. } => {}
+                | LioRoutingState::DeferredCloud { .. } => {},
+                LioRoutingState::CloudReplaying { .. } => {},
                 LioRoutingState::Active(active) => return Some(Arc::clone(active)),
                 LioRoutingState::Poisoned | LioRoutingState::Closed => return None,
             }
@@ -1233,6 +1245,7 @@ impl CommonLioIngress {
         Ok(envelope)
     }
 
+    #[cfg(test)]
     fn transfer_startup_odometry_cursor(&self, identity: SourceIdentity) -> Result<(), String> {
         let mut state = self.state.lock();
         self.check_identity(&state, identity)
@@ -1428,7 +1441,7 @@ impl CommonLioIngress {
         }
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn register_cloud(
         &self,
         identity: SourceIdentity,
@@ -1448,6 +1461,7 @@ impl CommonLioIngress {
         )
     }
 
+    #[cfg(test)]
     fn register_cloud_with_mode_token(
         &self,
         identity: SourceIdentity,
@@ -1493,8 +1507,9 @@ impl CommonLioIngress {
         )
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
-    #[allow(dead_code)]
+
     pub(crate) fn register_odom_points(
         &self,
         identity: SourceIdentity,
@@ -1812,6 +1827,7 @@ impl CommonLioIngress {
         state.pending_registrations.clear();
     }
 
+    #[cfg(test)]
     pub(crate) fn snapshot(&self) -> CommonLioIngressSnapshot {
         let state = self.state.lock();
         CommonLioIngressSnapshot {
@@ -2042,6 +2058,7 @@ impl NativeLioIngress {
                         map_frame_id: self.common.spec.map_frame_id.clone(),
                         odometry: pair.odometry.odometry.clone(),
                     };
+                    #[cfg(test)]
                     let encoded_odometry =
                         encode_lio_odometry_envelope(&odometry).map_err(|error| error.to_string())?;
                     let emitted_point_count = odom_points.len();
@@ -2054,15 +2071,15 @@ impl NativeLioIngress {
                         registered_odom_points: odom_points.into(),
                         source_point_count: pair.cloud.source_point_count,
                         emitted_point_count,
-                        encoded_odometry: Bytes::from(encoded_odometry),
+                        #[cfg(test)] encoded_odometry: Bytes::from(encoded_odometry),
                     }));
                     state.probe_phase = NativeProbePhase::Retained(Box::new(Some(retained)));
                     self.source_pair_ready_tx.send_replace(true);
                     return Ok(());
                 }
-                NativeProbePhase::Retained(_)
-                | NativeProbePhase::Transferred
-                | NativeProbePhase::Closed => return Ok(()),
+                #[cfg(test)]
+                NativeProbePhase::Transferred => return Ok(()),
+                NativeProbePhase::Retained(_) | NativeProbePhase::Closed => return Ok(()),
                 NativeProbePhase::Runtime => {}
             }
         }
@@ -2126,6 +2143,7 @@ impl NativeLioIngress {
         publish_result
     }
 
+    #[cfg(test)]
     pub(crate) fn take_validated_startup_pair(&self) -> Result<ValidatedStartupPair, String> {
         let mut state = self.pair_state.lock();
         let retained = match &mut state.probe_phase {
@@ -2135,6 +2153,7 @@ impl NativeLioIngress {
             NativeProbePhase::Probing => {
                 return Err("native LIO startup pair is not ready".to_owned())
             }
+            #[cfg(test)]
             NativeProbePhase::Transferred => {
                 return Err("native LIO startup pair was already transferred".to_owned())
             }
@@ -2338,6 +2357,7 @@ fn decode_public_replay_identity(
 }
 
 impl NativeDeferredReplayControl {
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         ingress: Arc<NativeLioIngress>,
@@ -2368,10 +2388,12 @@ impl NativeDeferredReplayControl {
         self.readiness.clone()
     }
 
+    #[cfg(test)]
     pub(crate) async fn publish_startup_odometry(&self) -> Result<(), String> {
         let pair = {
             let phase = self.phase.lock();
             match &*phase {
+                #[cfg(test)]
                 NativeDeferredReplayPhase::Startup(Some(pair)) => pair.clone(),
                 NativeDeferredReplayPhase::Poisoned(detail) => return Err(detail.clone()),
                 NativeDeferredReplayPhase::Closed => {
@@ -2436,6 +2458,7 @@ impl NativeDeferredReplayControl {
         let mut phase = self.phase.lock();
         let previous = std::mem::replace(&mut *phase, NativeDeferredReplayPhase::Closed);
         match previous {
+            #[cfg(test)]
             NativeDeferredReplayPhase::Startup(Some(pair)) => {
                 let startup_identity = pair.odometry_identity;
                 *phase = NativeDeferredReplayPhase::Deferred(Some(pair));
@@ -2467,12 +2490,12 @@ impl NativeDeferredReplayControl {
 
     pub(crate) fn begin_phase_a(&self) {
         self.stop_requested.store(true, Ordering::Release);
-        let mut phase = self.phase.lock();
-        if matches!(
-            *phase,
-            NativeDeferredReplayPhase::Startup(_) | NativeDeferredReplayPhase::Deferred(_)
-        ) {
-            *phase = NativeDeferredReplayPhase::Closed;
+        #[cfg(test)]
+        {
+            let mut phase = self.phase.lock();
+            if matches!(*phase, NativeDeferredReplayPhase::Startup(_) | NativeDeferredReplayPhase::Deferred(_)) {
+                *phase = NativeDeferredReplayPhase::Closed;
+            }
         }
     }
 
@@ -2509,48 +2532,36 @@ impl NativeDeferredReplayControl {
         {
             return Err("native deferred replay Mapping identity changed before claim".to_owned());
         }
-        let pair = {
-            let mut phase = self.phase.lock();
-            match &mut *phase {
-                NativeDeferredReplayPhase::Deferred(pair) => {
-                    let pair = pair
-                        .take()
-                        .ok_or_else(|| "native retained pair was already consumed".to_owned())?;
-                    *phase = NativeDeferredReplayPhase::Claimed(None);
-                    pair
-                }
-                NativeDeferredReplayPhase::Complete(current) if *current == identity => {
-                    return Ok(DeferredSessionClaim::Complete)
-                }
-                NativeDeferredReplayPhase::Complete(_)
-                | NativeDeferredReplayPhase::Claimed(_)
-                | NativeDeferredReplayPhase::CloudReplaying(..) => {
-                    return Err(
-                        "native retained pair is bound to another Mapping transition".to_owned(),
-                    )
-                }
-                NativeDeferredReplayPhase::Poisoned(detail) => return Err(detail.clone()),
-                NativeDeferredReplayPhase::Startup(_) => {
-                    return Err("startup odometry ACK is not complete".to_owned())
-                }
-                NativeDeferredReplayPhase::Closed => {
-                    return Err("native deferred replay is closed".to_owned())
-                }
-            }
-        };
-        if let Err(error) = validate_startup_pair(&pair) {
-            self.poison(error.clone());
-            return Err(error);
-        }
         let mut phase = self.phase.lock();
-        if !matches!(*phase, NativeDeferredReplayPhase::Claimed(None)) {
-            drop(phase);
-            let detail = "deferred cloud claim lost its single-flight phase";
-            self.poison(detail);
-            return Err(detail.to_owned());
+        match &mut *phase {
+            #[cfg(test)]
+            NativeDeferredReplayPhase::Deferred(pair) => {
+                let pair = pair.take().ok_or_else(|| "native retained pair was already consumed".to_owned())?;
+                *phase = NativeDeferredReplayPhase::Claimed(None);
+                drop(phase);
+                if let Err(error) = validate_startup_pair(&pair) {
+                    self.poison(error.clone());
+                    return Err(error);
+                }
+                let mut phase = self.phase.lock();
+                if !matches!(*phase, NativeDeferredReplayPhase::Claimed(None)) {
+                    drop(phase);
+                    let detail = "deferred cloud claim lost its single-flight phase";
+                    self.poison(detail);
+                    return Err(detail.to_owned());
+                }
+                *phase = NativeDeferredReplayPhase::Claimed(Some(ClaimedStartupReplay { identity, pair }));
+                Ok(DeferredSessionClaim::Claimed)
+            }
+            NativeDeferredReplayPhase::Complete(current) if *current == identity => Ok(DeferredSessionClaim::Complete),
+            NativeDeferredReplayPhase::Complete(_)
+            | NativeDeferredReplayPhase::Claimed(_)
+            | NativeDeferredReplayPhase::CloudReplaying(..) => Err("native retained pair is bound to another Mapping transition".to_owned()),
+            NativeDeferredReplayPhase::Poisoned(detail) => Err(detail.clone()),
+            #[cfg(test)]
+            NativeDeferredReplayPhase::Startup(_) => Err("startup odometry ACK is not complete".to_owned()),
+            NativeDeferredReplayPhase::Closed => Err("native deferred replay is closed".to_owned()),
         }
-        *phase = NativeDeferredReplayPhase::Claimed(Some(ClaimedStartupReplay { identity, pair }));
-        Ok(DeferredSessionClaim::Claimed)
     }
 
     pub(crate) fn is_complete_for(
@@ -3669,9 +3680,10 @@ impl LioIngressSink for LioIngressRoutingGate {
         let active = {
             let mut state = self.state.lock();
             match std::mem::replace(&mut *state, LioRoutingState::Closed) {
+                #[cfg(test)]
                 LioRoutingState::StartupOdometry { active, .. }
-                | LioRoutingState::DeferredCloud { active, .. }
-                | LioRoutingState::CloudReplaying { active, .. } => Some(active),
+                | LioRoutingState::DeferredCloud { active, .. } => Some(active),
+                LioRoutingState::CloudReplaying { active, .. } => Some(active),
                 LioRoutingState::Active(active) => Some(active),
                 LioRoutingState::Preparing
                 | LioRoutingState::Poisoned
@@ -4788,9 +4800,11 @@ mod tests {
                     NativeDeferredReplayPhase::Claimed(_) => {
                         panic!("exact claimed cloud Mapping returned to Claimed before callback")
                     }
+                    #[cfg(test)]
                     NativeDeferredReplayPhase::Startup(_) => {
                         panic!("exact claimed cloud Mapping returned to Startup before callback")
                     }
+                    #[cfg(test)]
                     NativeDeferredReplayPhase::Deferred(_) => {
                         panic!("exact claimed cloud Mapping returned to Deferred before callback")
                     }
@@ -6158,10 +6172,6 @@ mod tests {
     fn mapping_config() -> MappingAdapterConfig {
         MappingAdapterConfig {
             resolution: 0.5,
-            width_cells: 20,
-            height_cells: 20,
-            origin_xy: (-5.0, -5.0),
-            voxel_size: 0.05,
             initial_safe_radius_meters: 0.0,
         }
     }

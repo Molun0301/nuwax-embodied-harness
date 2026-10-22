@@ -22,6 +22,7 @@ from fastapi import APIRouter
 import gateways.feedback as public_feedback
 from contracts.events import RuntimeEventCategory
 from core.agent_call_store import AgentCallStore
+from tests.conftest import create_isolated_gateway
 from core.errors import GatewayError
 from core.event_bus import EventBus
 from core.settings import GatewayServerConfig
@@ -37,11 +38,7 @@ class RecoveryChecks(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix="neh-terminal-owner-")
         self.bus = EventBus(retention_limit=1, async_queue_limit=1)
         self.manager = TaskManager(event_bus=self.bus)
-        self.runtime = GatewayRuntime.__new__(GatewayRuntime)
-        self.runtime.task_manager, self.runtime.event_bus = self.manager, self.bus
-        self.runtime.robot = NS(manifest=NS(robot_model="offline"))
-        self.runtime.config = NS(gateway=NS(artifact_dir=Path(self.temp.name) / "artifacts"))
-        self.runtime._task_status_last_polled_at = {}
+        self.runtime = create_isolated_gateway(Path(self.temp.name), event_bus=self.bus, task_manager=self.manager)
         self.runtime.capability_registry = NS(get_descriptor=lambda name: NS(display_name="offline"))
         self.allowed = True
         def authorize(descriptor):
@@ -58,6 +55,7 @@ class RecoveryChecks(unittest.TestCase):
         for service in self.services:
             closed = service.close(2, source_fenced=True)
             self.assertTrue(closed["owner_closed"], closed)
+        self.runtime.stop()
         self.assertTrue(self.bus.shutdown(2))
         self.temp.cleanup()
 
@@ -451,7 +449,8 @@ class RecoveryChecks(unittest.TestCase):
         snapshot = {"task_id": "offline-receipt", "result": {"value": 1}}
         prepared = service.store.prepare_terminal("offline-receipt", snapshot, source_id="offline-source", revision=1)
         snapshot["result"]["value"] = 2
-        other = AgentCallStore(service.store.path, scope=service.store.scope, gateway_instance_id="other")
+        other = AgentCallStore(service.store.path, robot_identity=service.robot_identity,
+                               artifact_dir=Path(service.runtime.config.gateway.artifact_dir), gateway_instance_id="other")
         for store, candidate in ((other, prepared), (service.store, replace(prepared, revision=0))):
             with self.assertRaises(GatewayError) as caught:
                 store.save_prepared_terminal(candidate)

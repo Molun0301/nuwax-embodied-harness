@@ -1062,6 +1062,7 @@ impl CloudMapShmWriter {
             .ok_or("fine-map owner is unavailable")?.pin_root(identity, reference)
     }
 
+    #[cfg(test)]
     /// Source carried by the most recent successful nonempty fine accumulation.
     /// Empty/rejected inputs do not replace it. This is neither the newest input
     /// nor evidence attached to the current published root, and is not ground.
@@ -1153,6 +1154,7 @@ impl CloudMapShmWriter {
             .ok_or_else(|| "PGO点云发布失败".into())
     }
 
+    #[cfg(test)]
     /// Restore one persisted map-frame cloud checkpoint into the live voxel
     /// accumulator and publish it as the first non-empty revision of the new
     /// mapping generation. Subsequent lidar frames continue from these voxels.
@@ -1166,6 +1168,7 @@ impl CloudMapShmWriter {
         self.install_checkpoint_with_fine(occupancy_receipt, voxel_size, point_count, xyz_f32_le, None)
     }
 
+    #[cfg(test)]
     pub(crate) fn install_checkpoint_with_fine(
         &mut self, occupancy_receipt: &OccupancyCommitReceipt, voxel_size: f32, point_count: u32,
         xyz_f32_le: &[u8], fine: Option<PreparedFineCloud>,

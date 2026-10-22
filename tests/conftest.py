@@ -239,3 +239,35 @@ def isolated_gateway_config(tmp_path):
     config.perception.stream_runtime.enabled = False
     config.perception.stream_runtime.auto_start = False
     return config
+
+
+def create_isolated_gateway(directory, *, event_bus=None, task_manager=None, robot_id="offline-robot"):
+    """真实构造隔离网关；调用方必须在finally或清理钩子中执行stop。"""
+    from dataclasses import replace
+    from drivers.customrobot import create_customrobot_assembly
+    from gateways.runtime import GatewayRuntime
+
+    config = isolated_gateway_config(Path(directory))
+    robot = create_customrobot_assembly(config)
+    robot.defaults = replace(robot.defaults, parameters={**robot.defaults.parameters, "robot_id": robot_id})
+    return GatewayRuntime(config=config, robot=robot, event_bus=event_bus, task_manager=task_manager,
+                          register_default_capabilities=False)
+
+
+def identity_call_store(path, *, identity_name="scope", gateway_instance_id="owner", fresh_layout="split"):
+    """用真实机器人身份构造测试账本，identity_name不是原始数据库scope。"""
+    from core.agent_call_store import AgentCallStore
+
+    path = Path(path)
+    return AgentCallStore(path, robot_identity={"robot_model": "offline", "robot_id": identity_name},
+                          artifact_dir=path.parent / "artifacts", gateway_instance_id=gateway_instance_id,
+                          fresh_layout=fresh_layout)
+
+
+def insert_historical_scope_binding(path, *, legacy_scope, owner_scope):
+    """直接准备已存在的历史绑定行；只用于本次测试自行创建的SQLite数据。"""
+    import sqlite3
+
+    with sqlite3.connect(path) as connection:
+        connection.execute("INSERT OR REPLACE INTO agent_scope_bindings(scope,owner_scope) VALUES (?,?)",
+                           (legacy_scope, owner_scope))

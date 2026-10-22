@@ -3,11 +3,8 @@
 from services.geometry.config import (
     ExternalGeometryStackConfig,
     GeometryFrameConfig,
-    GeometryOdometryQualityConfig,
-    GeometryPointCloudPreprocessConfig,
     GeometryTimestampQualityConfig,
     GeometryTopicsConfig,
-    GeometryTraversabilityFilterConfig,
     LcmChannelConfig,
     MappingBackendConfig,
     MappingOutputConfig,
@@ -35,11 +32,8 @@ from services.geometry.pointcloud_map import (
 __all__ = [
     "ExternalGeometryStackConfig",
     "GeometryFrameConfig",
-    "GeometryOdometryQualityConfig",
-    "GeometryPointCloudPreprocessConfig",
     "GeometryTimestampQualityConfig",
     "GeometryTopicsConfig",
-    "GeometryTraversabilityFilterConfig",
     "LcmChannelConfig",
     "MappingBackendConfig",
     "MappingOutputConfig",

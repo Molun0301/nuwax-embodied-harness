@@ -9,7 +9,9 @@
 use super::*;
 use crate::explore_mission::{frontier_goal_options, home_goal_options, MissionRoute, MissionRouteError};
 use nuwax_nav_types_messages::GoalOptions;
-use crate::explore_compute_owner::{self as owner, Backend, Cancellation, Decision, Settlement};
+#[cfg(test)]
+use crate::explore_compute_owner as owner;
+use crate::explore_compute_owner::{Backend, Cancellation, Decision, Settlement};
 use nuwax_exploration::mission::SourceCheckpoint;
 use nuwax_exploration::{
     ExplorationControllerDiagnostics, ExploreError, ExploreResult, FrozenSurfaceInput,
@@ -101,7 +103,7 @@ pub(super) enum ComputeProjection {
 /// Cheap committed status only. A checkpoint is a separate explicit operation.
 #[derive(Clone, Debug)]
 pub(super) struct CommittedView {
-    pub active: bool,
+    #[cfg(test)] pub active: bool,
     pub source_count: usize,
     pub diagnostics: ExplorationControllerDiagnostics,
     pub frontiers: Vec<FrontierGoal>,
@@ -110,7 +112,7 @@ pub(super) struct CommittedView {
 impl CommittedView {
     pub(super) fn capture(controller: &ExplorationController) -> Self {
         Self {
-            active: controller.is_active(),
+            #[cfg(test)] active: controller.is_active(),
             source_count: controller.source_count(),
             diagnostics: controller.diagnostics(),
             frontiers: controller.frontier_snapshot(),
@@ -747,7 +749,9 @@ fn prepare_homeward_budget(
     ComputeProjection::HomewardBudget(result)
 }
 
+#[cfg(test)]
 pub(super) type ExplorationComputeOwner = owner::ComputeOwner<ExploreComputeBackend>;
+#[cfg(test)]
 pub(super) type ExplorationComputeClient = owner::OwnerHandle<ExploreComputeBackend>;
 
 #[cfg(test)]

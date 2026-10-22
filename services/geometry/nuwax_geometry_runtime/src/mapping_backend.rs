@@ -1,6 +1,5 @@
 //! Geometry-owned mapping kernels selected by the validated owner profile.
 
-#![allow(dead_code)]
 
 #[path = "mapping_backend_sidecar.rs"]
 mod sidecar;
@@ -1278,10 +1277,6 @@ impl MappingKernel {
         }
     }
 
-    pub(crate) const fn is_raytracing(&self) -> bool {
-        matches!(self, Self::Raytracing(_))
-    }
-
     pub(crate) fn ready_to_build(&self) -> bool {
         match self {
             Self::Voxel(_) => true,
@@ -1397,6 +1392,7 @@ impl RaytracingKernel {
         Ok(())
     }
 
+    #[cfg(test)]
     fn commit_prepared_map_frame(&mut self) -> Result<(), String> {
         self.commit_prepared_map_frame_with_parallelism(true)
     }

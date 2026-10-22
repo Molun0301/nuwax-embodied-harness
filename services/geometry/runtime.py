@@ -10,17 +10,12 @@ import logging
 import math
 import os
 from pathlib import Path, PurePosixPath
-import re
-import shlex
 import shutil
-import signal
-import subprocess
 import threading
 import time
 import uuid
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, FrozenSet, Iterator, List, Mapping, Optional, Protocol, Set, Tuple, TYPE_CHECKING, runtime_checkable
-from urllib.parse import quote
+from typing import Any, Callable, Dict, FrozenSet, Iterator, List, Mapping, Optional, Protocol, Tuple, TYPE_CHECKING, runtime_checkable
 
 import grpc
 
@@ -28,7 +23,6 @@ from contracts.geometry import Pose, Vector3
 from contracts.maps import OccupancyGrid
 from contracts.occupancy_cells import PackedOccupancyCells
 from core.errors import GatewayError
-from core.logging_utils import JsonLineFormatter
 from contracts.map_activation import AssignedActivationReceipt, _request as _assigned_activation_request
 from contracts.map_relocalization import (
     AssignedRelocalizationQuery,
@@ -48,7 +42,6 @@ from contracts.navigation import (
     ExplorationState,
     ExplorationStatus,
     ExploreAreaRequest,
-    NavigationGoal,
     NavigationStatus,
 )
 from contracts.runtime_views import MapSnapshot
@@ -62,11 +55,9 @@ from providers.data_plane import (
 from providers.exploration import ExplorationProvider
 from providers.localization import LocalizationProvider
 from providers.maps import MapProvider
-from providers.motion import MotionControl
 from providers.navigation import NavigationProvider
 from providers.pointcloud import PointCloudProvider
 from services.geometry.config import PlatformGeometryConfig
-from services.geometry.external_debug_observer import ExternalGeometryDebugObserver
 from services.geometry.geometry_runtime_client import GeometryRuntimeSubprocess
 from services.geometry.geometry_runtime_provider import (
     GeometryRuntimeProvider,
@@ -80,7 +71,6 @@ from services.geometry.geometry_runtime_provider import (
     _assigned_mapping_predecessor,
     _AssignedNativeLocalizationSample,
 )
-from services.geometry.loop_closure_state import read_loop_closure_from_db
 from services.geometry.checkpoint_payload import payload_chunks
 from services.mapping.service import _committed_occupancy_identity, _receipt_source_epoch
 
@@ -448,31 +438,11 @@ def _live_map_layer_descriptor(
             "mapping_identity": mapping_identity, "identity_status": "committed"}
 
 _LIVE_MAPPING_DIAGNOSTICS_TTL_SEC = 0.5
-_EXTERNAL_EXPLORATION_LOG_SCAN_MIN_INTERVAL_SEC = 2.0
 
 
-_GEOMETRY_SIDE_CAR_RESTART_LIMIT = 2
 _GEOMETRY_MONITOR_INTERVAL_SEC = 1.0
 _GEOMETRY_STREAMING_WINDOW_SEC = 3.0
 # 平台几何运行时由 Rust nuwax-geometry-runtime 子进程、gRPC 和 LCM 驱动。
-_GEOMETRY_STACK_NAME = "nuwax_geometry_runtime"
-_MAIN_LOG_APPEND_LOCK = threading.Lock()
-_GO2_SH_MAIN_LOG_LOGGER = "nuwax_robot_bridge.geometry.go2.sh"
-_SUBPROCESS_LOG_LEVEL_NAMES = frozenset(
-    {"DEBUG", "INFO", "WARN", "WARNING", "ERROR", "FATAL", "CRITICAL"}
-)
-_ROS2_NODE_LOG_RE = re.compile(
-    r"^\[(?P<proc>[^\]]+)\]\s+"
-    r"\[(?P<level>DEBUG|INFO|WARN(?:ING)?|ERROR|FATAL|CRITICAL)\]\s+"
-    r"\[(?P<stamp>[\d.]+)\]\s+"
-    r"(?P<rest>.+)$",
-    re.IGNORECASE,
-)
-_LAUNCH_LOG_RE = re.compile(
-    r"^\[(?P<level>DEBUG|INFO|WARN(?:ING)?|ERROR|FATAL|CRITICAL)\]\s+"
-    r"(?P<rest>.+)$",
-    re.IGNORECASE,
-)
 
 
 _RemoteOperationToken = Tuple[object, Optional[int]]
@@ -686,312 +656,8 @@ def _commit_remote_exploration_state_under_owner_lock(
     return True
 
 
-def _canonical_main_log_level(level: str) -> str:
-    upper = str(level or "INFO").strip().upper()
-    if upper in {"WARN", "WARNING"}:
-        return "WARNING"
-    if upper in {"FATAL", "CRITICAL"}:
-        return "ERROR"
-    if upper in _SUBPROCESS_LOG_LEVEL_NAMES:
-        return upper
-    return "INFO"
-
-
-def _main_log_level_to_logging(level: str) -> int:
-    canonical = _canonical_main_log_level(level)
-    return {
-        "DEBUG": logging.DEBUG,
-        "INFO": logging.INFO,
-        "WARNING": logging.WARNING,
-        "ERROR": logging.ERROR,
-    }.get(canonical, logging.INFO)
-
-
-def _normalize_subprocess_log_line(message: str) -> Tuple[str, str]:
-    """解析 go2.sh / ros2 launch 子进程行，提取真实等级并去掉重复前缀。"""
-
-    text = str(message or "").strip()
-    if not text:
-        return "INFO", text
-
-    node_match = _ROS2_NODE_LOG_RE.match(text)
-    if node_match:
-        level = _canonical_main_log_level(node_match.group("level"))
-        proc = node_match.group("proc")
-        rest = node_match.group("rest")
-        return level, "[%s] %s" % (proc, rest)
-
-    launch_match = _LAUNCH_LOG_RE.match(text)
-    if launch_match:
-        level = _canonical_main_log_level(launch_match.group("level"))
-        return level, launch_match.group("rest").strip()
-
-    lowered = text.lower()
-    if (
-        "deprecationwarning" in lowered
-        or ": warning:" in lowered
-        or lowered.startswith("warning:")
-        or lowered.startswith("go2.sh: warning:")
-    ):
-        return "WARNING", text
-
-    return "INFO", text
-
-
-def _project_log_file() -> Path:
-    repo_root = Path(__file__).resolve().parents[2]
-    log_dir = Path(os.environ.get("NUWAX_LOG_DIR", str(repo_root))).expanduser()
-    configured = str(os.environ.get("NUWAX_LOG_FILE", "") or "").strip()
-    if configured:
-        return Path(configured).expanduser()
-    return log_dir / "nuwax_robot_bridge.log"
-
-
-def _append_main_log_line(logger_name: str, message: str) -> None:
-    """子进程输出进入统一日志链，保留 Rust 事件字段与原始等级。"""
-    text = str(message or "").rstrip("\r\n")
-    if not text:
-        return
-    level, normalized = _normalize_subprocess_log_line(text)
-    extra = {"source": "native", "event": "process.output"}
-    try:
-        native = json.loads(text)
-    except (ValueError, TypeError):
-        native = None
-    if isinstance(native, dict) and "fields" in native:
-        fields = dict(native.get("fields") or {})
-        normalized = str(fields.pop("message", text))
-        logger_name = str(native.get("target") or logger_name)
-        level = str(native.get("level") or level).upper()
-        extra.update(fields)
-        for span in [*(native.get("spans") or []), native.get("span") or {}]:
-            if isinstance(span, dict):
-                for key in ("request_id", "task_id", "capability_name"):
-                    if span.get(key):
-                        extra.setdefault(key, span[key])
-        extra.update(source="rust", process_timestamp=native.get("timestamp"))
-    logger = logging.getLogger(logger_name)
-    # 工作区脚本可能单独调用本函数；未初始化平台日志时仍留下结构化记录。
-    if not logging.getLogger().handlers:
-        path = _project_log_file()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        record = logger.makeRecord(logger.name, _main_log_level_to_logging(level), __file__, 0, normalized, (), None, extra=extra)
-        with _MAIN_LOG_APPEND_LOCK, path.open("a", encoding="utf-8") as handle:
-            handle.write(JsonLineFormatter().format(record) + "\n")
-        return
-    logger.log(_main_log_level_to_logging(level), normalized, extra=extra)
-
-
-@dataclass
-class _ManagedProcess:
-    name: str
-    command: List[str]
-    log_path: Path
-    cwd: Path
-    process_title: Optional[str] = None
-    display_name: Optional[str] = None
-    mirror_main_log: bool = False
-    process: Optional[subprocess.Popen] = None
-    started_at: Optional[float] = None
-    started_at_iso: Optional[str] = None
-    exit_code: Optional[int] = None
-    last_error: Optional[str] = None
-    restart_count: int = 0
-    _output_thread: Optional[threading.Thread] = field(default=None, repr=False)
-
-    def start(self, *, restart: bool = False) -> None:
-        self.log_path.parent.mkdir(parents=True, exist_ok=True)
-        if restart:
-            self.restart_count += 1
-        banner = "\n[%s] start %s\n" % (_utc_now_iso(), self.command_display())
-        if self.mirror_main_log:
-            with self.log_path.open("ab") as log_file:
-                log_file.write(banner.encode("utf-8"))
-            _append_main_log_line(self._main_log_logger_name(), banner.strip())
-            self.process = subprocess.Popen(
-                self.launch_command(),
-                cwd=str(self.cwd),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-                bufsize=0,
-            )
-            self._output_thread = threading.Thread(
-                target=self._pump_output_to_logs,
-                name="nuwax-managed-process-%s" % self.name,
-                daemon=True,
-            )
-            self._output_thread.start()
-        else:
-            with self.log_path.open("ab") as log_file:
-                log_file.write(banner.encode("utf-8"))
-                self.process = subprocess.Popen(
-                    self.launch_command(),
-                    cwd=str(self.cwd),
-                    stdout=log_file,
-                    stderr=subprocess.STDOUT,
-                    start_new_session=True,
-                )
-        self.started_at = time.monotonic()
-        self.started_at_iso = _utc_now_iso()
-        self.exit_code = None
-        self.last_error = None
-
-    def _main_log_logger_name(self) -> str:
-        if self.name in {"nuwax-geometry-runtime", "nuwax_geometry_runtime"}:
-            return _GO2_SH_MAIN_LOG_LOGGER
-        return "nuwax_robot_bridge.geometry.%s" % self.name
-
-    def _pump_output_to_logs(self) -> None:
-        process = self.process
-        if process is None or process.stdout is None:
-            return
-        logger_name = self._main_log_logger_name()
-        try:
-            with self.log_path.open("ab") as sidecar:
-                while True:
-                    chunk = process.stdout.readline()
-                    if not chunk:
-                        break
-                    sidecar.write(chunk)
-                    sidecar.flush()
-                    text = chunk.decode("utf-8", errors="replace").rstrip("\r\n")
-                    if text:
-                        _append_main_log_line(logger_name, text)
-        except Exception:
-            LOGGER.debug("托管进程日志同步到主日志失败 process=%s", self.name, exc_info=True)
-
-    def poll(self) -> Optional[int]:
-        if self.process is None:
-            return self.exit_code
-        code = self.process.poll()
-        if code is not None:
-            self.exit_code = int(code)
-            if code != 0:
-                self.last_error = _read_recent_log(self.log_path)
-        return self.exit_code
-
-    def is_running(self) -> bool:
-        return self.process is not None and self.process.poll() is None
-
-    def stop(
-        self,
-        *,
-        timeout_sec: float = 5.0,
-        graceful_launch_shutdown: bool = False,
-        graceful_timeout_sec: float = 20.0,
-    ) -> None:
-        process = self.process
-        if process is None or process.poll() is not None:
-            self.poll()
-            return
-
-        def _signal_process_group(sig: signal.Signals) -> None:
-            # 先验证进程是否仍在运行，避免 PID 回收竞态：
-            # 旧进程退出后新进程恰好分配相同 PID，os.killpg 会误杀新进程。
-            if process.poll() is not None:
-                return
-            try:
-                os.killpg(os.getpgid(process.pid), sig)
-            except Exception:
-                try:
-                    # 再次确认进程仍在运行后再发信号
-                    if process.poll() is not None:
-                        return
-                    if sig == signal.SIGINT:
-                        process.send_signal(signal.SIGINT)
-                    elif sig == signal.SIGTERM:
-                        process.terminate()
-                    else:
-                        process.kill()
-                except Exception:
-                    pass
-
-        if graceful_launch_shutdown:
-            _signal_process_group(signal.SIGINT)
-            try:
-                process.wait(timeout=max(1.0, float(graceful_timeout_sec)))
-                self.poll()
-                return
-            except subprocess.TimeoutExpired:
-                pass
-
-        _signal_process_group(signal.SIGTERM)
-        try:
-            process.wait(timeout=timeout_sec)
-        except subprocess.TimeoutExpired:
-            _signal_process_group(signal.SIGKILL)
-            try:
-                process.wait(timeout=1.0)
-            except Exception:
-                pass
-        self.poll()
-
-    def status(self) -> Dict[str, object]:
-        self.poll()
-        return {
-            "name": self.name,
-            "process_title": self.process_title,
-            "display_name": self.display_name,
-            "running": self.is_running(),
-            "pid": self.process.pid if self.process is not None and self.is_running() else None,
-            "command": self.command,
-            "command_display": self.command_display(),
-            "log_path": str(self.log_path),
-            "started_at": self.started_at_iso,
-            "exit_code": self.exit_code,
-            "restart_count": self.restart_count,
-            "last_error": self.last_error,
-        }
-
-    def command_display(self) -> str:
-        return " ".join(shlex.quote(str(part)) for part in self.command)
-
-    def launch_command(self) -> List[str]:
-        title = str(self.process_title or "").strip()
-        if not title:
-            return list(self.command)
-        return ["bash", "-c", 'exec -a "$0" "$@"', title, *self.command]
-
-
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-
-def _read_recent_log(path: Path, *, max_bytes: int = 4096) -> str:
-    try:
-        with path.open("rb") as handle:
-            handle.seek(0, os.SEEK_END)
-            size = handle.tell()
-            handle.seek(max(0, size - max_bytes), os.SEEK_SET)
-            data = handle.read().decode("utf-8", errors="replace")
-    except Exception as exc:
-        return "读取日志失败：%s" % exc
-    lines = [line.strip() for line in data.splitlines() if line.strip()]
-    return "\n".join(lines[-20:])
-
-
-def _read_log_from_offset(path: Path, offset: int, *, max_bytes: int = 8 * 1024 * 1024) -> str:
-    """Read log bytes from offset (used to scan the current exploration session)."""
-    try:
-        safe_offset = max(0, int(offset))
-        with path.open("rb") as handle:
-            handle.seek(0, os.SEEK_END)
-            size = handle.tell()
-            if safe_offset >= size:
-                return ""
-            handle.seek(safe_offset, os.SEEK_SET)
-            data = handle.read(max(1, min(max_bytes, size - safe_offset))).decode("utf-8", errors="replace")
-    except Exception as exc:
-        return "读取日志失败：%s" % exc
-    return data
-
-
-def _capture_log_file_offset(path: Path) -> int:
-    try:
-        return int(path.stat().st_size)
-    except Exception:
-        return 0
 
 
 def _parse_iso_timestamp(value: object) -> Optional[datetime]:
@@ -1085,19 +751,13 @@ class PlatformGeometryRuntime:
         self._next_subscription_delivery_ticket_id = 1
         self._runtime_stop_event = threading.Event()
         self._runtime_monitor_thread: Optional[threading.Thread] = None
-        self._managed_processes: Dict[str, _ManagedProcess] = {}
         self._runtime_diagnostics: List[Dict[str, object]] = []
         self._map_stream_tracker: Dict[str, object] = {}
-        self._external_live_pose: Optional[Pose] = None
-        self._external_live_pose_at_monotonic = 0.0
-        self._external_live_pose_lock = threading.Lock()
         # 正式导航后端由 `_remote_provider`（GeometryRuntimeProvider）持有。
         self._cmd_vel_bridge = None
         self._geometry_runtime_subprocess: Optional[GeometryRuntimeSubprocess] = None
         self._remote_provider: Optional[GeometryRuntimeProvider] = None
         self._rosout_bridge = None
-        self._external_debug_observer: Optional[ExternalGeometryDebugObserver] = None
-        self._external_debug_frontier_payload: Optional[Dict[str, object]] = None
         self._exploration_loop_lock = threading.RLock()
         self._exploration_delivery_context = threading.local()
         self._exploration_update_subscribers: Dict[int, Callable[[ExplorationState], None]] = {}
@@ -1105,13 +765,7 @@ class PlatformGeometryRuntime:
         self._next_exploration_subscription_id = 1
         self._external_exploration_request: Optional[ExploreAreaRequest] = None
         self._remote_exploration_ownership_lock = threading.RLock()
-        self._external_exploration_started_at_monotonic: Optional[float] = None
-        self._external_exploration_started_at_iso: Optional[str] = None
-        self._external_exploration_deadline_monotonic: Optional[float] = None
-        self._external_exploration_database_path: Optional[str] = None
         self._external_exploration_terminal_state: Optional[ExplorationState] = None
-        self._external_exploration_log_offset: Optional[int] = None
-        self._external_exploration_last_log_scan_at = 0.0
         self._live_mapping_diagnostics_cache: Optional[Dict[str, object]] = None
         self._live_mapping_diagnostics_cache_at = 0.0
         self._external_geometry_session_mode: Optional[str] = None
@@ -1398,7 +1052,6 @@ class PlatformGeometryRuntime:
             self._runtime_started = True
             self._runtime_stop_event.clear()
             self._runtime_diagnostics = []
-            self._managed_processes = {}
             self._map_stream_tracker = {}
         if not self._is_geometry_profile_enabled():
             self._set_runtime_state("disabled", "平台几何运行时或几何 profile 已禁用。")
@@ -1413,7 +1066,6 @@ class PlatformGeometryRuntime:
                 return
             self._set_runtime_state("starting_external", "正在挂接 canonical nuwax-geometry-runtime 并建立 gRPC 连接。")
             self._start_geometry_runtime_subprocess()
-            self._ensure_external_geometry_observers_started()
             self._set_runtime_state(
                 "starting_external",
                 "已挂接 canonical nuwax-geometry-runtime，等待 gRPC HealthCheck/READY 与 LCM 通道。",
@@ -1428,11 +1080,6 @@ class PlatformGeometryRuntime:
                 self._runtime_started = False
             # Phase 3 目标态：不再 raise，统一交给上层显式查询 /api/geometry/status。
 
-    def _get_motion_provider(self) -> Optional[MotionControl]:
-        providers = getattr(self.robot, "providers", None)
-        if providers is not None and isinstance(providers, MotionControl):
-            return providers
-        return None
 
     def get_geometry_runtime_provider(
         self, *, deadline_monotonic: Optional[float] = None,
@@ -1541,12 +1188,6 @@ class PlatformGeometryRuntime:
         self._set_runtime_state("stopping", "正在停止平台几何侧车进程。")
         self._runtime_stop_event.set()
         # Phase 3 目标态：cmd_vel 桥已下线，平台内建速度桥不再启动/停止
-        if self._external_debug_observer is not None:
-            try:
-                self._external_debug_observer.stop()
-            except Exception:
-                pass
-            self._external_debug_observer = None
         try:
             self.stop_platform_exploration()
         except Exception:
@@ -1584,113 +1225,13 @@ class PlatformGeometryRuntime:
     def _repo_root(self) -> Path:
         return Path(__file__).resolve().parents[2]
 
-    def _geometry_script(self, name: str) -> Path:
-        return Path(__file__).resolve().parent / name
-
-    def _geometry_log_dir(self) -> Path:
-        return self._repo_root() / "runtime_data" / "geometry" / "logs"
-
-    def _geometry_stack(self) -> str:
-        # 与 contracts/geometry_runtime.py 的 GEOMETRY_STACK_NAME 对齐。
-        return _GEOMETRY_STACK_NAME
-
-    def _uses_external_geometry_stack(self) -> bool:
-        # 平台几何运行时由 nuwax-geometry-runtime 子进程承担。手动
-        # mapping/explore/localization 仍用
-        # `start_external_mapping` / `_start_external_script_exploration` / `_launch_external_localization`
-        # 走外部脚本，但它们不再受此标志门控（启动路径已显式使用 go2.sh 命令构造）。
-        # 保留方法名是为了兼容历史 caller 的导入和诊断信息，逻辑上始终返回 False。
-        return False
-
-    def _removed_internal_stack_message(self) -> str:
-        return "当前运行时使用 nuwax-geometry-runtime + gRPC + LCM 链路。"
 
     def _external_process_name(self) -> str:
         name = str(getattr(self.config.external, "process_name", "") or "").strip()
         return name or "nuwax-geometry-runtime"
 
-    def _external_log_name(self) -> str:
-        log_name = str(getattr(self.config.external, "log_name", "") or "").strip()
-        return log_name or "nuwax_geometry_runtime.log"
 
-    def _managed_process_identity(self, name: str) -> Tuple[str, str]:
-        if name == self._external_process_name():
-            return "nuwax-geometry-external", "统一几何服务"
-        if name == "external_odom_tf_bridge":
-            return "nuwax-odom-tf-bridge", "里程计 TF 桥"
-        safe = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "-" for ch in str(name or "geometry")).strip("-_")
-        return f"nuwax-{safe or 'geometry'}", "项目几何进程"
 
-    def _external_script_path(self) -> Path:
-        # R-N13 修复:从 `script_path`(ExternalGeometryStackConfig 中不存在)
-        # 改为 `binary_path`(实存在,settings.py:887),9 处调用面全获正确路径
-        # 与 `_launch_runtime_binary()` 行为对齐。
-        return Path(str(getattr(self.config.external, "binary_path", "") or "")).expanduser()
-
-    def _external_args(self) -> List[str]:
-        raw_args = getattr(self.config.external, "args", ())
-        if isinstance(raw_args, str):
-            return shlex.split(raw_args)
-        return [str(item) for item in raw_args if str(item or "").strip()]
-
-    # go2.sh mode 标志集合
-    _GO2_MODE_FLAGS: frozenset = frozenset({"-m", "--new", "--mapping", "-l", "--loc", "--localization", "-e", "--explore", "--exploration"})
-
-    def _build_external_geometry_command(self) -> List[str]:
-        script_path = self._external_script_path()
-        args = self._external_args()
-        # 不再默认添加 --mapping：mapping 是手动建图专用，平台自动场景不启动。
-        # 如果 go2.sh 且未配置 mode，让 go2.sh 自己报错退出(code=2)。
-        return [str(script_path), *args]
-
-    def _build_external_exploration_command(self, request: Optional[ExploreAreaRequest] = None) -> List[str]:
-        mode_flags = {"-m", "--new", "--mapping", "-l", "--loc", "--localization", "-e", "--explore", "--exploration"}
-        passthrough_args = [arg for arg in self._external_args() if arg not in mode_flags]
-        db_path = self._external_exploration_database_path_for_request(request)
-        return [str(self._external_script_path()), "--explore", *passthrough_args, str(db_path)]
-
-    def _build_external_mapping_command(self, *, map_name: Optional[str] = None) -> List[str]:
-        mode_flags = {"-m", "--new", "--mapping", "-l", "--loc", "--localization", "-e", "--explore", "--exploration"}
-        passthrough_args = [arg for arg in self._external_args() if arg not in mode_flags]
-        request = ExploreAreaRequest(
-            request_id="manual_mapping",
-            map_name=str(map_name or "").strip() or None,
-            strategy="manual",
-        )
-        db_path = self._external_exploration_database_path_for_request(request)
-        command: List[str] = [str(self._external_script_path()), "--mapping", *passthrough_args, str(db_path)]
-        # 第 5.3 task：boundary JSON 写入后由 start_external_mapping 拼接 --boundary
-        boundary_path = self._maybe_persist_boundary_for_external_command(
-            command=command,
-            session="mapping",
-        )
-        if boundary_path is not None:
-            command = [*command, "--boundary", str(boundary_path)]
-        return command
-
-    def _external_exploration_database_path_for_request(self, request: Optional[ExploreAreaRequest]) -> Path:
-        del request
-        return self._default_external_exploration_database_path()
-
-    def plan_external_exploration(self, request: ExploreAreaRequest) -> Dict[str, object]:
-        """返回无副作用的 geometry-runtime gRPC 探索计划。"""
-
-        stop_conditions = dict(request.stop_conditions or {})
-        request_metadata = dict(request.metadata or {})
-        return {
-            "exploration_launch_mode": "nuwax_geometry_runtime",
-            "exploration_transport": "grpc",
-            "exploration_script": None,
-            "exploration_command": None,
-            "exploration_database_path": None,
-            "request_id": request.request_id,
-            "strategy": str(request.strategy or "wavefront"),
-            "arbitration": str(
-                request_metadata.get("arbitration")
-                or stop_conditions.get("arbitration")
-                or "prefer_wavefront"
-            ),
-        }
 
     def get_mapping_session_context(self) -> Optional[Dict[str, object]]:
         lock = getattr(self, "_mapping_lifecycle_lock", None)
@@ -1874,107 +1415,6 @@ class PlatformGeometryRuntime:
             source_generation,
         ) == current_identity
 
-    def clear_exploration_mapping_context(self) -> None:
-        with self._exploration_loop_lock:
-            self._external_exploration_database_path = None
-
-    def clear_external_exploration_state(self, *, reason: str = "") -> None:
-        del reason
-        with self._exploration_loop_lock:
-            self._external_exploration_request = None
-            self._external_exploration_started_at_monotonic = None
-            self._external_exploration_started_at_iso = None
-            self._external_exploration_deadline_monotonic = None
-            self._external_exploration_database_path = None
-            self._external_exploration_terminal_state = None
-            self._external_exploration_log_offset = None
-            self._external_debug_frontier_payload = None
-            self._external_geometry_session_mode = None
-
-    def _default_external_exploration_database_path(self) -> Path:
-        raw_path = (os.environ.get("NUWAX_MAPPING_DATABASE_PATH") or "").strip()
-        if raw_path:
-            path = Path(raw_path).expanduser()
-        else:
-            path = Path(self.config.mapping.database_root).expanduser() / "live_mapping.db"
-        if not path.is_absolute():
-            path = self._repo_root() / path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        return path
-
-    @staticmethod
-    def _env_truthy(*names: str, default: str = "false") -> bool:
-        value = default
-        for name in names:
-            candidate = os.environ.get(name)
-            if candidate is not None:
-                value = candidate
-                break
-        return str(value).strip().lower() in {"1", "true", "yes", "on"}
-
-    def _external_localization_uses_static_map_yaml(self) -> bool:
-        # GO2 几何栈 localize_only/restart_map/slam_mode 模式已下线；legacy GO2_NAV_* keys are deprecated.
-        return self._env_truthy("NUWAX_NAV2_USE_STATIC_MAP_YAML")
-
-    @staticmethod
-    def _command_uses_external_exploration(command: List[str]) -> bool:
-        return any(str(part) in {"-e", "--explore", "--exploration"} for part in command)
-
-    def _external_geometry_process_is_exploration(self) -> bool:
-        process = self._managed_processes.get(self._external_process_name())
-        return bool(
-            process is not None
-            and process.is_running()
-            and self._command_uses_external_exploration(process.command)
-        )
-
-    @staticmethod
-    def _command_uses_external_mapping(command: List[str]) -> bool:
-        return any(str(part) in {"-m", "--new", "--mapping"} for part in command)
-
-    def _external_geometry_process_is_mapping(self) -> bool:
-        process = self._managed_processes.get(self._external_process_name())
-        return bool(
-            process is not None
-            and process.is_running()
-            and self._command_uses_external_mapping(process.command)
-        )
-
-    def _external_geometry_stack_is_running(self) -> bool:
-        process = self._managed_processes.get(self._external_process_name())
-        return bool(process is not None and process.is_running())
-
-    @staticmethod
-    def _command_uses_external_localization(command: List[str]) -> bool:
-        return any(str(part) in {"-l", "--loc", "--localization"} for part in command)
-
-    def _command_has_mode_flag(self, command: List[str]) -> bool:
-        """检查命令是否包含任何 go2.sh mode 标志（explore/localization/mapping）。"""
-        return any(str(part) in self._GO2_MODE_FLAGS for part in command)
-
-    def _external_geometry_process_is_localization(self) -> bool:
-        process = self._managed_processes.get(self._external_process_name())
-        return bool(
-            process is not None
-            and process.is_running()
-            and self._command_uses_external_localization(process.command)
-        )
-
-    def _external_input_bridge_enabled(self) -> bool:
-        return bool(getattr(self.config.external, "input_bridge_enabled", False))
-
-    def _external_point_cloud_bridge_enabled(self) -> bool:
-        return self._external_input_bridge_enabled() or bool(
-            getattr(self.config.external, "point_cloud_bridge_enabled", False)
-        )
-
-    def _platform_odom_tf_bridge_enabled(self) -> bool:
-        return self._external_input_bridge_enabled() or bool(
-            getattr(self.config.external, "platform_odom_tf_bridge_enabled", False)
-        )
-
-    def _platform_cmd_vel_bridge_enabled(self) -> bool:
-        return bool(getattr(self.config.external, "platform_cmd_vel_bridge_enabled", False))
 
     def _run_preflight_checks(self) -> List[str]:
         # 目标态：主预检检查 nuwax-geometry-runtime 子进程可达性；
@@ -2053,14 +1493,6 @@ class PlatformGeometryRuntime:
                 errors.append("缺少 TF frame 配置 %s" % name)
         return errors
 
-    def _start_required_processes(self) -> None:
-        # 目标态：平台几何运行时启动链路已切到 `_start_geometry_runtime_subprocess()` +
-        # `_ensure_external_geometry_observers_started()`；旧 ROS2 odom_tf_bridge / cmd_vel_bridge /
-        # 外部 SLAM/Nav2 脚本兼容启动入口已下线，保留本方法为 no-op shim 以兼容历史 caller 的引用。
-        LOGGER.debug(
-            "_start_required_processes 已下线为目标态 no-op；请改用 _start_geometry_runtime_subprocess。"
-        )
-        return None
 
     def _start_monitor_thread(self) -> None:
         if self._runtime_monitor_thread is not None and self._runtime_monitor_thread.is_alive():
@@ -2072,80 +1504,8 @@ class PlatformGeometryRuntime:
         )
         self._runtime_monitor_thread.start()
 
-    def _build_launch_prefix(self) -> List[str]:
-        # 目标态：ROS2 bash 前置脚本已下线（共享 nuwax-geometry-runtime 子进程内置 LCM 通道，无需环境探测）。
-        # 保留方法为 no-op shim 以兼容历史 caller；platform 启动走 _start_geometry_runtime_subprocess。
-        return []
-
-    def _build_odom_tf_bridge_command(self) -> List[str]:
-        # 目标态：odom_tf_bridge.py + odom/cmd_vel 兼容桥已下线（外部 SLAM/Nav2 不再
-        # 通过独立 Python 进程转译 ROS2 话题；nuwax-geometry-runtime 子进程内置 LCM channel
-        # 处理）。保留方法为 no-op shim 以兼容历史 caller。
-        return []
-
-    def _start_managed_process(self, name: str, command: List[str], log_name: str, *, restart: bool = False) -> None:
-        current = self._managed_processes.get(name)
-        if name == self._external_process_name():
-            with self._exploration_loop_lock:
-                exploration_active = (
-                    self._external_exploration_request is not None
-                    and self._external_exploration_terminal_state is None
-                )
-            if (
-                exploration_active
-                and current is not None
-                and current.is_running()
-                and self._command_uses_external_exploration(current.command)
-                and not self._command_uses_external_exploration(command)
-            ):
-                LOGGER.info(
-                    "外部探索运行中，忽略非探索模式进程切换请求。current=%s incoming=%s",
-                    current.command,
-                    list(command),
-                )
-                return
-        if current is not None and current.is_running():
-            if current.command == list(command):
-                return
-            current.stop(
-                timeout_sec=12.0,
-                graceful_launch_shutdown=(name == self._external_process_name()),
-                graceful_timeout_sec=15.0,
-            )
-            time.sleep(3.0)
-            restart = True
-        mirror_main_log = name == self._external_process_name()
-        process = current or _ManagedProcess(
-            name=name,
-            command=list(command),
-            log_path=self._geometry_log_dir() / log_name,
-            cwd=self._repo_root(),
-            mirror_main_log=mirror_main_log,
-        )
-        process_title, display_name = self._managed_process_identity(name)
-        process.command = list(command)
-        process.process_title = process_title
-        process.display_name = display_name
-        process.mirror_main_log = mirror_main_log
-        process.start(restart=restart)
-        if mirror_main_log:
-            LOGGER.info(
-                "外部几何脚本日志已同步到主日志：process=%s main_log=%s sidecar=%s",
-                name,
-                _project_log_file(),
-                process.log_path,
-            )
-        self._managed_processes[name] = process
 
     def _stop_managed_processes(self) -> None:
-        for process in list(self._managed_processes.values()):
-            process.stop()
-        if self._external_debug_observer is not None:
-            try:
-                self._external_debug_observer.stop()
-            except Exception:
-                pass
-            self._external_debug_observer = None
         if self._geometry_runtime_subprocess is not None:
             self._geometry_runtime_subprocess.stop()
             self._geometry_runtime_subprocess = None
@@ -2840,19 +2200,6 @@ class PlatformGeometryRuntime:
                 self._set_runtime_state("failed", "平台几何运行时监控失败：%s" % exc, blocked=True)
                 # Phase 3 目标态：监控循环遇错仅置 failed，不中断轮询；web 仪表可见即可。
 
-    def _should_suppress_external_process_autorestart(self) -> bool:
-        """探索/建图会话或探索完成后保留几何时，禁止 monitor 自动重启 go2.sh。"""
-
-        with self._exploration_loop_lock:
-            if self._external_exploration_request is not None:
-                return True
-            if self._external_exploration_terminal_state is not None:
-                return True
-            if self._external_geometry_session_mode in {"mapping", "explore"}:
-                return True
-            if self._external_exploration_database_path:
-                return True
-        return False
 
     def _monitor_processes_once(self) -> None:
         if (
@@ -2867,24 +2214,6 @@ class PlatformGeometryRuntime:
                 provider = getattr(self, "_remote_provider", None)
             if _remote_is_connected(provider):
                 self._replay_active_mapping_session_after_attach()
-
-        for name, process in list(self._managed_processes.items()):
-            exit_code = process.poll()
-            if exit_code is None or process.is_running():
-                continue
-            if name == self._external_process_name() and self._should_suppress_external_process_autorestart():
-                continue
-            if process.restart_count < _GEOMETRY_SIDE_CAR_RESTART_LIMIT:
-                self._set_runtime_state("recovering", "%s 进程异常退出，正在尝试恢复。" % name)
-                self._record_runtime_diagnostic("process_exit", "%s exit_code=%s\n%s" % (name, exit_code, process.last_error or ""))
-                process.start(restart=True)
-                continue
-            self._set_runtime_state(
-                "failed",
-                "%s 进程异常退出且恢复次数耗尽，exit_code=%s。" % (name, exit_code),
-                blocked=True,
-            )
-            self._record_runtime_diagnostic("process_failed", "%s exit_code=%s\n%s" % (name, exit_code, process.last_error or ""))
 
     def _advance_runtime_state_from_inputs(self) -> None:
         # 目标态：runtime ready 由 nuwax-geometry-runtime 子进程存活 + gRPC HealthCheck/READY +
@@ -2940,7 +2269,7 @@ class PlatformGeometryRuntime:
             ExplorationStatus.ACCEPTED.value,
             ExplorationStatus.RUNNING.value,
         }:
-            explore_message = exploration_state.message or "平台探索任务运行中（外部脚本由 start_external_mapping 拉起）。"
+            explore_message = exploration_state.message or "平台原生探索任务运行中。"
             self._set_runtime_state("exploring", explore_message)
             return
         if not bool(readiness.get("localization_ready")):
@@ -2994,18 +2323,6 @@ class PlatformGeometryRuntime:
             return False, "nuwax-geometry-runtime 未知状态 phase=%s" % raw_phase
         return True, str(status.get("message") or "")
 
-    def _blocking_process_failure(self) -> Optional[str]:
-        for name, process in self._managed_processes.items():
-            if process.is_running():
-                continue
-            if name == self._external_process_name() and self._should_suppress_external_process_autorestart():
-                continue
-            exit_code = process.poll()
-            if exit_code is None:
-                continue
-            if process.restart_count >= _GEOMETRY_SIDE_CAR_RESTART_LIMIT:
-                return "%s 进程已退出，exit_code=%s。" % (name, exit_code)
-        return None
 
     def _build_mapping_readiness(
         self,
@@ -3023,15 +2340,6 @@ class PlatformGeometryRuntime:
         point_cloud_status = point_cloud_status or self._clone_metadata(self._geometry_runtime_status_stub("point_cloud_publisher"))
         point_cloud_source = point_cloud_source or self._build_point_cloud_source_status()
         data_plane_status = data_plane_status or self._build_data_plane_status()
-        if self._uses_external_geometry_stack():
-            return self._build_external_geometry_readiness(
-                live_map_status=live_map_status,
-                tf_localization_status=tf_localization_status,
-                odometry_status=odometry_status,
-                point_cloud_status=point_cloud_status,
-                point_cloud_source=point_cloud_source,
-                data_plane_status=data_plane_status,
-            )
         return self._build_geometry_runtime_readiness(
             live_map_status=live_map_status,
             tf_localization_status=tf_localization_status,
@@ -3051,13 +2359,7 @@ class PlatformGeometryRuntime:
         point_cloud_source: Optional[Dict[str, object]] = None,
         data_plane_status: Optional[Dict[str, object]] = None,
     ) -> Dict[str, object]:
-        """目标态 readiness 聚合：nuwax-geometry-runtime gRPC + 观察器 + LCM 通道。
-
-        与 _build_external_geometry_readiness 的差异：
-        - 使用 live_map_status.occupancy_grid_ready（观察器首帧） +
-          self._map_stream_tracker.streaming（连续流式更新） +
-          tf_chain.ready（map→odom→base TF 链）+ bridge alive + HealthCheck.healthy。
-        """
+        """聚合原生健康、地图首帧/连续流和真实坐标链。"""
         odometry_status = odometry_status or self._clone_metadata(self._geometry_runtime_status_stub("odometry_publisher"))
         point_cloud_status = point_cloud_status or self._clone_metadata(self._geometry_runtime_status_stub("point_cloud_publisher"))
         point_cloud_source = point_cloud_source or self._build_point_cloud_source_status()
@@ -3074,8 +2376,7 @@ class PlatformGeometryRuntime:
         )
         activation_snapshot = self._map_activation_snapshot_read()
         localization_process = bool(
-            self._external_geometry_process_is_localization()
-            or str(self._activation_result_from_snapshot(activation_snapshot).get("backend_mode") or "") == "mapping_localization"
+            str(self._activation_result_from_snapshot(activation_snapshot).get("backend_mode") or "") == "mapping_localization"
         )
         streaming_ready = bool(first_frame_ready and map_stream.get("streaming"))
         # 二维图按关键帧变化，连续扫描和坐标就绪不要求静止地图制造新修订。
@@ -3126,164 +2427,25 @@ class PlatformGeometryRuntime:
             "odom_tf_bridge_process": None,
         }
 
-    def _build_external_geometry_readiness(
-        self,
-        *,
-        live_map_status: Dict[str, object],
-        tf_localization_status: Dict[str, object],
-        odometry_status: Optional[Dict[str, object]] = None,
-        point_cloud_status: Optional[Dict[str, object]] = None,
-        point_cloud_source: Optional[Dict[str, object]] = None,
-        data_plane_status: Optional[Dict[str, object]] = None,
-    ) -> Dict[str, object]:
-        odometry_status = odometry_status or self._clone_metadata(self._geometry_runtime_status_stub("odometry_publisher"))
-        point_cloud_status = point_cloud_status or self._clone_metadata(self._geometry_runtime_status_stub("point_cloud_publisher"))
-        point_cloud_source = point_cloud_source or self._build_point_cloud_source_status()
-        data_plane_status = data_plane_status or self._build_data_plane_status()
-        process_name = self._external_process_name()
-        external_process = self._managed_processes.get(process_name)
-        odom_tf_bridge = self._managed_processes.get("external_odom_tf_bridge")
-        map_stream = dict(self._map_stream_tracker)
-        tf_chain = self._build_tf_chain_status(tf_localization_status=tf_localization_status)
-        process_running = bool(external_process is not None and external_process.is_running())
-        input_bridge_enabled = self._external_input_bridge_enabled()
-        point_cloud_bridge_enabled = self._external_point_cloud_bridge_enabled()
-        input_bridge_ready = True
-        if input_bridge_enabled:
-            input_bridge_ready = bool(
-                odom_tf_bridge is not None
-                and odom_tf_bridge.is_running()
-                and int(odometry_status.get("published_count") or 0) > 0
-                and int(point_cloud_status.get("published_count") or 0) > 0
-                and (point_cloud_source.get("timestamp") or data_plane_status.get("started") is not False)
-            )
-        elif point_cloud_bridge_enabled:
-            input_bridge_ready = bool(
-                int(point_cloud_status.get("published_count") or 0) > 0
-                and (point_cloud_source.get("timestamp") or data_plane_status.get("started") is not False)
-            )
-        first_frame_ready = bool(
-            live_map_status.get("occupancy_grid_ready")
-            and int(live_map_status.get("occupancy_message_count") or 0) > 0
-            and live_map_status.get("occupancy_has_publisher") is not False
-        )
-        activation_snapshot = self._map_activation_snapshot_read()
-        localization_process = bool(
-            self._external_geometry_process_is_localization()
-            or str(self._activation_result_from_snapshot(activation_snapshot).get("backend_mode") or "") == "mapping_localization"
-        )
-        streaming_ready = bool(first_frame_ready and map_stream.get("streaming"))
-        streaming_required = not localization_process
-        map_ready = bool(first_frame_ready and (streaming_ready or not streaming_required))
-        localization_ready = bool(process_running and input_bridge_ready and map_ready and tf_chain.get("ready"))
-        if not process_running:
-            message = "外部几何脚本尚未运行。"
-            waiting_for = "external_process"
-        elif not input_bridge_ready:
-            message = (
-                "外部几何点云输入桥未就绪；需要平台发布点云输入。"
-                if point_cloud_bridge_enabled and not input_bridge_enabled
-                else "外部几何输入桥未就绪；需要平台发布 /odom、点云输入和坐标变换。"
-            )
-            waiting_for = "external_input_bridge"
-        elif not first_frame_ready:
-            message = "等待外部几何后端发布首帧占据栅格。"
-            waiting_for = "external_map"
-        elif streaming_required and not streaming_ready:
-            message = "外部几何后端已发布首帧，正在确认连续 streaming。"
-            waiting_for = "external_map_streaming"
-        elif not tf_chain.get("ready"):
-            if localization_process:
-                message = "外部定位模式已收到首帧地图，等待坐标变换链就绪。"
-            else:
-                message = "外部占据栅格已 streaming，等待坐标变换链就绪。"
-            waiting_for = "external_tf"
-        else:
-            if localization_process:
-                message = "外部定位地图首帧与坐标变换链均已就绪。"
-            else:
-                message = "外部占据栅格 streaming 与坐标变换链均已就绪。"
-            waiting_for = None
-        return {
-            "ready": localization_ready,
-            "go2_odom_ready": bool(process_running and input_bridge_ready),
-            "input_bridge_ready": bool(input_bridge_ready),
-            "first_frame_ready": first_frame_ready,
-            "streaming_ready": streaming_ready,
-            "streaming_required": streaming_required,
-            "map_ready": map_ready,
-            "external_launch_mode": "localization" if localization_process else "mapping_or_exploration",
-            "localization_ready": localization_ready,
-            "relocalization_ready": localization_ready,
-            "waiting_for": waiting_for,
-            "message": message,
-            "map_stream": map_stream,
-            "tf_chain": tf_chain,
-            "tf_localization_provider": self._clone_metadata(tf_localization_status),
-            "odometry_publisher": odometry_status,
-            "point_cloud_publisher": point_cloud_status,
-            "point_cloud_source": point_cloud_source,
-            "data_plane": data_plane_status,
-            "odom_tf_bridge_process": odom_tf_bridge.status() if odom_tf_bridge is not None else None,
-            "external_geometry": {
-                "stack": self.config.stack,
-                "process_name": process_name,
-                "script_path": str(self._external_script_path()),
-                "args": tuple(self._external_args()),
-                "provides_map": bool(getattr(self.config.external, "provides_map", True)),
-                "provides_navigation": bool(self.config.external.provides_navigation),
-                "provides_tf": bool(getattr(self.config.external, "provides_tf", True)),
-                "input_bridge_enabled": input_bridge_enabled,
-                "point_cloud_bridge_enabled": point_cloud_bridge_enabled,
-                "platform_odom_tf_bridge_enabled": self._platform_odom_tf_bridge_enabled(),
-                "platform_cmd_vel_bridge_enabled": self._platform_cmd_vel_bridge_enabled(),
-            },
-            "external_process": external_process.status() if external_process is not None else None,
-        }
 
     def _build_tf_chain_status(self, *, tf_localization_status: Optional[Dict[str, object]] = None) -> Dict[str, object]:
-        tf_localization_status = tf_localization_status or self._clone_metadata(self._geometry_runtime_status_stub("tf_localization_provider"))
-        removed_internal_stack = not self._uses_external_geometry_stack()
-        if self._uses_external_geometry_stack():
-            required_processes = [self._external_process_name()]
-            if self._platform_odom_tf_bridge_enabled():
-                required_processes.append("external_odom_tf_bridge")
-        else:
-            required_processes = []
-        required_process_names = tuple(required_processes)
-        process_status = {
-            name: self._managed_processes[name].status()
-            for name in required_process_names
-            if name in self._managed_processes
-        }
-        missing = [name for name in required_process_names if name not in self._managed_processes]
-        stopped = [name for name, status in process_status.items() if not bool(status.get("running"))]
-        pose_ready = bool(tf_localization_status.get("pose_ready") or tf_localization_status.get("pose_available"))
-        map_to_base_ready = bool(tf_localization_status.get("map_to_base_ready"))
-        chain_ready = bool(not removed_internal_stack and not missing and not stopped and pose_ready and map_to_base_ready)
+        """坐标链就绪使用当前原生提供器的位姿和坐标树观察。"""
+        status = tf_localization_status or self._clone_metadata(self._geometry_runtime_status_stub("tf_localization_provider"))
+        pose_ready = bool(status.get("pose_ready") or status.get("pose_available"))
+        map_to_base_ready = bool(status.get("map_to_base_ready"))
         return {
-            "ready": chain_ready,
-            "process_ready": bool(not removed_internal_stack and not missing and not stopped),
+            "ready": pose_ready and map_to_base_ready,
             "pose_ready": pose_ready,
             "map_to_base_ready": map_to_base_ready,
-            "map_to_odom_ready": bool(tf_localization_status.get("map_to_odom_ready")),
-            "odom_to_base_ready": bool(tf_localization_status.get("odom_to_base_ready")),
+            "map_to_odom_ready": bool(status.get("map_to_odom_ready")),
+            "odom_to_base_ready": bool(status.get("odom_to_base_ready")),
             "map_frame": self.config.frames.map_frame,
             "odom_frame": self.config.frames.odom_frame,
             "base_frame": self.config.frames.base_frame,
             "lidar_frame": self.config.frames.lidar_frame,
             "imu_frame": getattr(self.config.frames, "imu_frame", None),
-            "required_processes": required_process_names,
-            "missing_processes": missing,
-            "stopped_processes": stopped,
-            "processes": process_status,
-            "tf_localization_provider": self._clone_metadata(tf_localization_status),
-            "removed_internal_stack": removed_internal_stack,
-            "validation": (
-                "geometry_runtime_tf_provider_must_resolve_map_to_base_pose"
-                if self._uses_external_geometry_stack()
-                else "geometry_runtime_tf_chain"
-            ),
+            "tf_localization_provider": self._clone_metadata(status),
+            "validation": "geometry_runtime_tf_chain",
         }
 
     def _update_stream_tracker(self, live_map_status: Dict[str, object]) -> None:
@@ -3459,14 +2621,12 @@ class PlatformGeometryRuntime:
             "blocked": blocked,
             "started": started,
             "live_geometry_start_attempted": self._live_geometry_start_attempted,
-            "processes": {name: process.status() for name, process in self._managed_processes.items()},
             "navigation_backend_policy": self._navigation_backend_policy(),
             "map_stream": dict(self._map_stream_tracker),
             "mapping_readiness": self._build_mapping_readiness(),
             "navigation": self._build_navigation_status(),
             "external_geometry": self.config.build_metadata().get("external_geometry"),
-            "external_debug_observer": self._external_debug_observer_status(),
-            "tf_localization_provider": self._geometry_runtime_status_stub("tf_localization_provider"),
+                "tf_localization_provider": self._geometry_runtime_status_stub("tf_localization_provider"),
             "diagnostics": diagnostics,
             "mapping_stack": {
                 "script": str(
@@ -3480,41 +2640,13 @@ class PlatformGeometryRuntime:
             },
         }
 
-    def _external_debug_observer_status(self) -> Dict[str, object]:
-        observer = self._external_debug_observer
-        with self._exploration_loop_lock:
-            frontier_payload = self._clone_metadata(self._external_debug_frontier_payload or {})
-        return {
-            "running": bool(observer is not None and observer.is_running),
-            "last_error": observer.last_error if observer is not None else None,
-            "frontier_count": frontier_payload.get("frontier_count"),
-            "frontier_updated_at": frontier_payload.get("updated_at"),
-        }
-
-    def _ensure_live_geometry_started(self) -> None:
-        if not self._is_geometry_profile_enabled():
-            return
-        if not self._uses_external_geometry_stack():
-            raise RuntimeError(self._removed_internal_stack_message())
-        self._ensure_external_geometry_observers_started()
-
-    def start_external_debug_observers(self) -> None:
-        """Start read-only observers for externally launched GO2 map/frontier streams."""
-
-        if not self._is_geometry_profile_enabled() or not self._uses_external_geometry_stack():
-            return
-        self._ensure_external_geometry_observers_started()
 
     def _resolve_external_tf_localization_status(
         self,
         *,
         base_stub: Optional[Dict[str, object]] = None,
     ) -> Dict[str, object]:
-        """合成 GO2 几何栈外部 TF 就绪状态。
-
-        Rust bridge GetStatus 不含 pose_ready/map_to_base_ready；探索/建图时 nuwax-geometry-runtime
-        通过 /go2/pose_map 与 /tf 提供 map 系位姿，须合并 debug observer 与 gRPC 信号。
-        """
+        """从当前原生提供器读取位姿和坐标树，补齐定位就绪状态。"""
         status = dict(base_stub or {})
         map_frame = str(self.config.frames.map_frame or "map").strip().lstrip("/")
         odom_frame = str(self.config.frames.odom_frame or "odom").strip().lstrip("/")
@@ -3535,14 +2667,6 @@ class PlatformGeometryRuntime:
         map_to_odom_ready = bool(status.get("map_to_odom_ready"))
         odom_to_base_ready = bool(status.get("odom_to_base_ready"))
         source_kind = status.get("source_kind")
-
-        live_pose = self.get_external_live_pose(max_age_sec=3.0)
-        if live_pose is not None:
-            frame_id = str(live_pose.frame_id or "").strip().lstrip("/")
-            if not frame_id or frame_id == map_frame:
-                pose_ready = True
-                map_to_base_ready = True
-                source_kind = source_kind or "external_pose_topic"
 
         if not map_to_base_ready and self._remote_provider is not None and self._remote_provider.is_connected:
             bridge_pose = self._remote_provider.get_current_pose()
@@ -3636,134 +2760,6 @@ class PlatformGeometryRuntime:
             and self._remote_provider.is_connected
         )
 
-    def _ensure_external_geometry_observers_started(self) -> None:
-        if not self._is_geometry_profile_enabled():
-            return
-        with self._live_geometry_start_lock:
-            self._ensure_external_debug_observer_started_locked()
-            input_bridge_enabled = self._external_input_bridge_enabled()
-            point_cloud_bridge_enabled = self._external_point_cloud_bridge_enabled()
-            geometry_runtime_active = self._geometry_runtime_handles_input_bridge()
-            if geometry_runtime_active:
-                LOGGER.debug("Rust bridge 活跃，跳过 Python odom/pointcloud publishers")
-            input_bridge_ready = True
-            if geometry_runtime_active:
-                input_bridge_ready = True  # Rust bridge 已处理 odom/pointcloud 输入
-            elif input_bridge_enabled:
-                input_bridge_ready = False  # Python publishers 已移除，由 Rust bridge 替代
-            elif point_cloud_bridge_enabled:
-                input_bridge_ready = False  # Python publishers 已移除，由 Rust bridge 替代
-            if geometry_runtime_active and input_bridge_ready:
-                return
-            self._live_geometry_start_attempted = True
-            try:
-                pass  # Python providers 已移除，由 Rust bridge (GeometryRuntimeProvider) 替代
-            except Exception:
-                self._live_geometry_start_attempted = False
-                raise
-
-    def _ensure_external_debug_observer_started_locked(self) -> None:
-        observer = self._external_debug_observer
-        if observer is None:
-            observer = ExternalGeometryDebugObserver(
-                config=self.config,
-                frontier_callback=self._handle_external_debug_frontier_update,
-                pose_callback=self._handle_external_debug_pose_update,
-            )
-            self._external_debug_observer = observer
-        if not observer.is_running:
-            observer.start()
-        with self._exploration_loop_lock:
-            session_mode = self._external_geometry_session_mode
-        observer.set_session_mode(session_mode)
-        # commit 2 §2.2：localization 模式默认启动后必须立即 emit_initial_heartbeat，
-        # 顶掉前端 SSE 滞留的 cleared 信号，避免复现 Symptom 2（地图变空白视觉表现）。
-        if session_mode == "localization":
-            try:
-                self._map_stream.emit_initial_heartbeat()
-            except Exception:
-                LOGGER.debug("emit_initial_heartbeat 失败，忽略（localization 模式启动路径）。", exc_info=True)
-
-    def _on_external_geometry_session_mode_changed(self, mode: Optional[str]) -> None:
-        """同步 debug observer 会话模式，并在非 explore 时清空前沿缓存。
-
-        commit 2 §2.1 扩展：接受 ``"localization"`` 入参；仅触发 observer
-        ``set_session_mode("localization")``，不再清空 ``_external_debug_frontier_payload``
-        （避免与 commit 1 set_session_mode 双清；该清空责任在 set_session_mode 内）。
-        """
-        observer = self._external_debug_observer
-        if observer is not None:
-            observer.set_session_mode(mode)
-        if mode != "explore":
-            with self._exploration_loop_lock:
-                self._external_debug_frontier_payload = None
-            try:
-                self._notify_exploration_update(self.get_platform_exploration_state())
-            except Exception:
-                LOGGER.debug("清空非 explore 前沿缓存后通知失败。", exc_info=True)
-
-    def get_external_live_pose(self, *, max_age_sec: float = 2.0) -> Optional[Pose]:
-        """返回 GO2 debug observer /go2/pose_map 缓存的 map 系位姿，供 Nav2 下发目标。"""
-
-        with self._external_live_pose_lock:
-            pose = self._external_live_pose
-            updated_at = self._external_live_pose_at_monotonic
-        if pose is None:
-            return None
-        if max_age_sec > 0.0 and (time.monotonic() - updated_at) > max_age_sec:
-            return None
-        return pose.model_copy(deep=True)
-
-    def _handle_external_debug_pose_update(
-        self,
-        pose: Any,
-        frame_tree: Any = None,
-        metadata: Optional[Dict[str, object]] = None,
-    ) -> None:
-        resolved_pose = pose
-        if pose is not None and hasattr(pose, "model_copy"):
-            resolved_pose = pose.model_copy(deep=True)
-            with self._external_live_pose_lock:
-                self._external_live_pose = resolved_pose.model_copy(deep=True)
-                self._external_live_pose_at_monotonic = time.monotonic()
-        provider_attach_lock = getattr(
-            self,
-            "_provider_attach_lock",
-            self._runtime_state_lock,
-        )
-        with provider_attach_lock:
-            deliveries = []
-            for subscription_id, callback in tuple(
-                self._localization_update_subscribers.items()
-            ):
-                ticket = self._new_subscription_delivery_ticket(
-                    kind="localization",
-                    subscription_id=subscription_id,
-                    callback=callback,
-                    provider=None,
-                )
-                self._publish_subscription_delivery_ticket(ticket)
-                deliveries.append(ticket)
-        meta = dict(metadata or {})
-        for ticket in deliveries:
-            try:
-                self._invoke_subscription_delivery(
-                    ticket,
-                    resolved_pose,
-                    frame_tree,
-                    meta,
-                    retire=True,
-                )
-            except Exception:
-                LOGGER.debug("投递外部 GO2 位姿 debug update 失败。", exc_info=True)
-
-    def _handle_external_debug_frontier_update(self, payload: Dict[str, object]) -> None:
-        """缓存调试前沿；探索任务状态只接受 native runtime 快照。"""
-
-        with self._exploration_loop_lock:
-            if self._external_geometry_session_mode != "explore":
-                return
-            self._external_debug_frontier_payload = self._clone_metadata(payload)
 
     def _activation_result_from_snapshot(
         self,
@@ -4008,20 +3004,6 @@ class PlatformGeometryRuntime:
         ):
             return sample
 
-    def get_validated_assigned_relocalization_receipt(
-        self, result, *, assigned_request_v2,
-        expected_target: _AssignedMapActivationTarget,
-    ) -> Dict[str, object]:
-        """Canonical projection with an instantaneous exact-current check.
-
-        This alone does not fence a later write. A sample-backed session
-        installation uses the private result guard and the same admitted sample.
-        """
-        with self._assigned_relocalization_result_guard(
-            result, assigned_request_v2=assigned_request_v2,
-            expected_target=expected_target,
-        ) as receipt:
-            return receipt
 
     def relocalize_assigned_active_map(
         self, *, assigned_request_v2, expected_target: _AssignedMapActivationTarget,
@@ -4643,15 +3625,6 @@ class PlatformGeometryRuntime:
         if live_map_error:
             return "live_map_provider_error", "实时地图订阅错误：%s" % live_map_error
         occupancy_grid_ready = bool(live_map_status.get("occupancy_grid_ready"))
-        if self._uses_external_geometry_stack() and not self._external_point_cloud_bridge_enabled():
-            occupancy_topic = str(live_map_status.get("occupancy_topic") or self.config.topics.occupancy_topic)
-            if not occupancy_grid_ready:
-                return (
-                    "external_occupancy_grid",
-                    "等待外部几何后端在 %s 发布首帧占据栅格。"
-                    % occupancy_topic,
-                )
-            return None, "外部建图链路已收到 %s 首帧占据栅格。" % occupancy_topic
         point_cloud_error = str(point_cloud_status.get("last_error") or "").strip()
         if point_cloud_error:
             return "point_cloud_bridge_error", "点云桥错误：%s" % point_cloud_error
@@ -4689,140 +3662,6 @@ class PlatformGeometryRuntime:
         occupancy_topic = str(live_map_status.get("occupancy_topic") or self.config.topics.occupancy_topic)
         return None, "外部建图链路已收到 %s 首帧占据栅格。" % occupancy_topic
 
-    def _attach_live_mapping_diagnostics_to_request(self, request):
-        metadata = dict(getattr(request, "metadata", {}) or {})
-        metadata["initial_mapping_chain_diagnostics"] = self.get_live_mapping_diagnostics()
-        copier = getattr(request, "model_copy", None)
-        if callable(copier):
-            return request.model_copy(update={"metadata": metadata}, deep=True)
-        request.metadata = metadata
-        return request
-
-    @staticmethod
-    def _resolve_explorer_status_text(frontier_meta: Dict[str, object]) -> str:
-        status_text = str((frontier_meta or {}).get("status_text") or "").strip()
-        if not status_text:
-            return ""
-        upper = status_text.upper()
-        observer_meta = (frontier_meta or {}).get("external_frontier_debug_observer")
-        observer_payload = (
-            observer_meta.get("metadata")
-            if isinstance(observer_meta, dict) and isinstance(observer_meta.get("metadata"), dict)
-            else {}
-        )
-        plan_fresh = bool(observer_payload.get("plan_fresh"))
-        plan_points = int(observer_payload.get("plan_point_count") or 0)
-        if plan_fresh and plan_points > 0 and any(
-            term in upper for term in ("WARMING UP", "WAITING (NO REACHABLE")
-        ):
-            return "[explorer] NAVIGATING"
-        return status_text
-
-    @staticmethod
-    def _external_explorer_headline_message(
-        frontier_meta: Dict[str, object],
-        *,
-        frontier_count: Optional[int] = None,
-    ) -> Optional[str]:
-        status_text = PlatformGeometryRuntime._resolve_explorer_status_text(frontier_meta)
-        observer_meta = (frontier_meta or {}).get("external_frontier_debug_observer")
-        observer_payload = (
-            observer_meta.get("metadata")
-            if isinstance(observer_meta, dict) and isinstance(observer_meta.get("metadata"), dict)
-            else {}
-        )
-        plan_fresh = bool(observer_payload.get("plan_fresh"))
-        plan_points = int(observer_payload.get("plan_point_count") or 0)
-        if not status_text:
-            if frontier_count is not None and frontier_count > 0:
-                return "正在探索：%d 个前沿点" % int(frontier_count)
-            if plan_fresh and plan_points > 0:
-                return "正在探索：已规划路径（%d 点）" % plan_points
-            return None
-        cleaned = re.sub(r"^\[explorer\]\s*", "", status_text, flags=re.IGNORECASE).strip()
-        if not cleaned:
-            if frontier_count is not None and frontier_count > 0:
-                return "正在探索：%d 个前沿点" % int(frontier_count)
-            return None
-        upper = cleaned.upper()
-        if "DONE (EXPLORATION FINISHED)" in upper:
-            return "GO2 几何栈原生探索已完成：%s" % cleaned
-        if upper.startswith("STRATEGY:"):
-            return "探索换策略中：%s" % cleaned
-        if frontier_count is not None and frontier_count > 0:
-            return "正在探索（%s）：%d 个前沿点" % (cleaned, int(frontier_count))
-        return "正在探索：%s" % cleaned
-
-    def _augment_exploration_state_with_mapping_diagnostics(self, state):
-        diagnostics = self.get_live_mapping_diagnostics()
-        metadata = dict(getattr(state, "metadata", {}) or {})
-        current_waiting_for = str(metadata.get("waiting_for") or "").strip() or None
-        diagnostic_waiting_for = diagnostics.get("waiting_for")
-        active = getattr(state.status, "value", state.status) in {
-            ExplorationStatus.ACCEPTED.value,
-            ExplorationStatus.RUNNING.value,
-        }
-        # scheme(b): 直接读外部 frontier observer 数据（不依赖 state 上尚未合并的字段）。
-        # _external_debug_frontier_metadata 持 RLock，可重入；返回 (metadata, frontier_count)。
-        frontier_meta, frontier_count = self._external_debug_frontier_metadata()
-        frontier_status_text = str((frontier_meta or {}).get("status_text") or "").upper()
-        explorer_message = self._external_explorer_headline_message(
-            frontier_meta,
-            frontier_count=frontier_count,
-        )
-        observer_meta = (frontier_meta or {}).get("external_frontier_debug_observer")
-        observer_payload = (
-            observer_meta.get("metadata")
-            if isinstance(observer_meta, dict) and isinstance(observer_meta.get("metadata"), dict)
-            else {}
-        )
-        explorer_actually_running = bool(
-            active
-            and "DONE (EXPLORATION FINISHED)" not in frontier_status_text
-            and (
-                explorer_message is not None
-                or (frontier_count is not None and frontier_count > 0)
-                or bool(observer_payload.get("plan_fresh"))
-            )
-        )
-        # 安全条款：_error 结尾的诊断必须始终覆写 headline（真实错误不被遮蔽）。
-        is_error_diagnostic = bool(
-            diagnostic_waiting_for and str(diagnostic_waiting_for).endswith("_error")
-        )
-        # 覆写条件：错误诊断恒覆写；非错误诊断仅在 explorer 尚未实际运行时覆写。
-        override_waiting = bool(
-            active
-            and diagnostic_waiting_for
-            and (
-                is_error_diagnostic
-                or (
-                    not explorer_actually_running
-                    and current_waiting_for in {
-                        None, "occupancy_grid", "mapping_ready",
-                        "point_cloud_input", "external_occupancy_grid",
-                    }
-                )
-            )
-        )
-        metadata["mapping_chain_diagnostics"] = diagnostics  # 始终保留诊断
-        updates = {"metadata": metadata}
-        if override_waiting:
-            if diagnostic_waiting_for:
-                metadata["waiting_for"] = diagnostic_waiting_for
-            metadata["waiting_detail"] = diagnostics.get("message")
-            if diagnostics.get("message"):
-                updates["message"] = diagnostics.get("message")
-        elif explorer_actually_running and not is_error_diagnostic:
-            updates["message"] = explorer_message or updates.get("message")
-            metadata["waiting_for"] = None
-            metadata.pop("waiting_detail", None)
-            status_text = str((frontier_meta or {}).get("status_text") or "").strip()
-            if status_text:
-                metadata["status_text"] = status_text
-        with self._exploration_loop_lock:
-            metadata["geometry_session_mode"] = self._external_geometry_session_mode
-        updates["metadata"] = metadata
-        return state.model_copy(update=updates, deep=True)
 
     def clear_active_map_asset(self, *, reason: str = "") -> None:
         """清空当前激活的 finalized 地图资产包上下文。"""
@@ -4920,13 +3759,6 @@ class PlatformGeometryRuntime:
             str(payload.get("activation_request_id") or "").strip(),
         )
 
-    def _clear_map_asset_activation_fence(self) -> None:
-        state_lock = getattr(self, "_runtime_state_lock", None)
-        if state_lock is None:
-            self._map_asset_activation_fence = None
-            return
-        with state_lock:
-            self._map_asset_activation_fence = None
 
     def _map_asset_activation_fence_snapshot(self) -> Optional[Dict[str, object]]:
         state_lock = getattr(self, "_runtime_state_lock", None)
@@ -5819,39 +4651,6 @@ class PlatformGeometryRuntime:
         )
         return db_path is not None and self._is_usable_mapping_db_file(db_path)
 
-    def activate_assigned_backend_checkpoint(
-        self,
-        *,
-        activation_request: Mapping[str, object],
-        bundle_root: Path,
-        backend_kind: str,
-    ) -> Dict[str, object]:
-        """Explicitly dispatch an exact assigned checkpoint to the backend only.
-
-        Retain the caller's six-field request before storage I/O. Its assigned
-        ID and expected runtime generation are never inferred or refreshed.
-        This entry does not install a Python activation snapshot, seed a pose,
-        or enable the workspace/default activation path. Ambiguous outcomes
-        propagate unchanged so the caller can explicitly replay the same request.
-        A different active owner must be explicitly stopped by the caller first.
-        """
-        request = _assigned_activation_request(activation_request)
-        if not isinstance(backend_kind, str) or backend_kind not in {"voxel", "raytracing"}:
-            raise ValueError("assigned backend activation requires voxel or raytracing")
-        provider = self.get_geometry_runtime_provider()
-        activate = getattr(provider, "activate_assigned_platform_map", None)
-        if not callable(activate):
-            raise RuntimeError("Geometry runtime does not support assigned backend activation")
-
-        from services.geometry.mapping_backend_checkpoint_store import MappingBackendCheckpointStore
-
-        # The store admits exact schema-2 ownership; never reconstruct or fall
-        # back to a legacy checkpoint. Neither I/O nor RPC holds the state lock.
-        stored = MappingBackendCheckpointStore(bundle_root).load(
-            backend_kind, schema_version=2,
-            expected_checkpoint_id=request["checkpoint_id"],
-        )
-        return activate(activation_request=request, stored_checkpoint=stored)
 
     def _require_prepared_assigned_origin_locked(self, prepared) -> None:
         if not isinstance(prepared, _PreparedAssignedMapActivation) or prepared._owner is not self:
@@ -6618,8 +5417,7 @@ class PlatformGeometryRuntime:
         if exploration_active or mapping_active:
             pass  # 探索模式下不抑制 live map（新建地图从小到大增长是正常的）
         elif (
-            self._external_geometry_process_is_localization()
-            or str(
+            str(
                 self._activation_result_from_snapshot(activation_snapshot).get(
                     "backend_mode"
                 )
@@ -7298,11 +6096,6 @@ class PlatformGeometryRuntime:
             return providers
         return None
 
-    def _resolve_geometry_backend(self) -> Optional[GeometryBackend]:
-        backend = self._resolve_backend(GeometryBackend, NavigationProvider)
-        if backend is not None and isinstance(backend, GeometryBackend):
-            return backend
-        return None
 
     def _resolve_raw_localization_backend(self):
         return self._resolve_backend(LocalizationDataPlane, LocalizationProvider)
@@ -7344,13 +6137,6 @@ class PlatformGeometryRuntime:
             return remote
         return None
 
-    def _safe_map_dir(self, map_name: str) -> Path:
-        primary = self._catalog_root / build_safe_dir_segment(map_name)
-        if not primary.exists():
-            legacy = self._catalog_root / quote(str(map_name or "").strip(), safe="")
-            if legacy.exists():
-                return legacy
-        return primary
 
     @staticmethod
     def _require_bundle_root(bundle_root: Path) -> Path:
@@ -7552,10 +6338,6 @@ class PlatformGeometryRuntime:
     def _build_parameter_summary(self) -> Dict[str, object]:
         return self._clone_metadata(self.config.build_metadata())
 
-    def _materialize_mapping_database(self, target_path: Path) -> Dict[str, object]:
-        """Deprecated alias —— 转向 _materialize_backend_state。"""
-
-        return self._materialize_backend_state(target_path)
 
     def _materialize_backend_state(self, target_path: Path) -> Dict[str, object]:
         """持久化 RTAB-Map .db 状态到候选资产包。"""
@@ -7702,19 +6484,6 @@ class PlatformGeometryRuntime:
                 return candidate
         return None
 
-    def _locate_active_exploration_backend_state(self) -> Optional[Path]:
-        """定位当前探索会话写入的 .db。"""
-
-        with self._exploration_loop_lock:
-            raw_path = self._external_exploration_database_path
-        if not raw_path:
-            return None
-        candidate = Path(str(raw_path)).expanduser()
-        if not candidate.is_absolute():
-            candidate = self._repo_root() / candidate
-        if candidate.suffix == ".db" and self._is_usable_mapping_db_file(candidate):
-            return candidate
-        return None
 
     def _db_file_size_bytes(self, path: Path) -> int:
         try:
@@ -7723,32 +6492,15 @@ class PlatformGeometryRuntime:
             return 0
 
     def _resolve_db_materialization_source(self, target_path: Path) -> Tuple[Optional[Path], str]:
-        """按优先级选择 .db 落盘来源，探索产物优先于共享 live_rtabmap.db。"""
+        """选择已有持久后端资产或当前有效后端状态。"""
 
-        exploration_source = self._locate_external_exploration_backend_state_for_target(target_path)
-        if exploration_source is not None:
-            return exploration_source, "exploration_target"
-
-        active_exploration_source = self._locate_active_exploration_backend_state()
         resolved_target = target_path.expanduser().resolve(strict=False)
-        if active_exploration_source is not None:
-            resolved_active = active_exploration_source.expanduser().resolve(strict=False)
-            if resolved_active != resolved_target:
-                return active_exploration_source, "exploration_runtime"
-            return active_exploration_source, "exploration_target"
-
         if self._is_usable_mapping_db_file(resolved_target):
             return resolved_target, "persisted_target"
 
         runtime_source = self._locate_runtime_backend_state_for_materialize(resolved_target)
         if runtime_source is not None:
-            if active_exploration_source is not None and self._db_file_size_bytes(
-                active_exploration_source
-            ) > self._db_file_size_bytes(runtime_source):
-                return active_exploration_source, "exploration_runtime"
             return runtime_source, "live_runtime"
-        if active_exploration_source is not None:
-            return active_exploration_source, "exploration_runtime"
         return None, "unavailable"
 
     def _materialize_mapping_db(self, target_path: Path) -> Dict[str, object]:
@@ -7823,22 +6575,6 @@ class PlatformGeometryRuntime:
             ),
         }
 
-    def _locate_external_exploration_backend_state_for_target(self, target_path: Path) -> Optional[Path]:
-        with self._exploration_loop_lock:
-            raw_path = self._external_exploration_database_path
-        if not raw_path:
-            return None
-        candidate = Path(str(raw_path)).expanduser()
-        if not candidate.is_absolute():
-            candidate = self._repo_root() / candidate
-        try:
-            if candidate.resolve(strict=False) != target_path.resolve(strict=False):
-                return None
-        except Exception:
-            return None
-        if candidate.suffix == ".db" and candidate.exists() and candidate.is_file():
-            return candidate
-        return None
 
     def _pcd_min_points(self) -> int:
         from services.geometry.cloud_map_fetcher import default_min_points
@@ -8099,11 +6835,10 @@ class PlatformGeometryRuntime:
         planar_graph = database_metadata.get("database_source_kind") == "planar_graph"
         nav2_map_metadata = dict(nav2_map_metadata or {})
         database_present = bool(database_metadata.get("database_present", False))
-        external_stack = self._uses_external_geometry_stack()
         nav2_map_present = bool(nav2_map_metadata.get("present", False))
         remote_provider = getattr(self, "_remote_provider", None)
         native_checkpoint_switch_supported = bool(
-            not external_stack
+            True
             and remote_provider is not None
             and getattr(remote_provider, "is_connected", False)
             and callable(
@@ -8113,7 +6848,7 @@ class PlatformGeometryRuntime:
         native_checkpoint_ready = bool(
             native_checkpoint_switch_supported and nav2_map_present and (not planar_graph or database_present)
         )
-        database_required = not external_stack and not native_checkpoint_ready
+        database_required = True and not native_checkpoint_ready
         pcd_present = bool(pcd_metadata.get("pcd_present", False))
         readiness = self._build_mapping_readiness()
         live_source = database_metadata.get("database_source_kind") == "live_runtime"
@@ -8134,14 +6869,6 @@ class PlatformGeometryRuntime:
                     "level": "error",
                     "code": "mapping_database_missing",
                     "message": "地图资产包缺少建图数据库资产。",
-                }
-            )
-        if external_stack and not nav2_map_present:
-            diagnostics.append(
-                {
-                    "level": "error",
-                    "code": "navigation_map_asset_missing",
-                    "message": "地图资产包缺少导航地图资产，无法加载定位状态。",
                 }
             )
         if native_checkpoint_ready and not database_present:
@@ -8200,15 +6927,6 @@ class PlatformGeometryRuntime:
         if native_checkpoint_ready:
             backend_checkpoint_ready = True
             status = "ready"
-        elif external_stack:
-            backend_checkpoint_ready = bool(database_present)
-            ready_for_load = backend_checkpoint_ready and nav2_map_present
-            if ready_for_load:
-                status = "ready"
-            elif nav2_map_present:
-                status = "snapshot_only"
-            else:
-                status = "snapshot_only"
         else:
             backend_checkpoint_ready = bool(database_present)
             status = "ready" if backend_checkpoint_ready else "failed"
@@ -8222,14 +6940,11 @@ class PlatformGeometryRuntime:
                 nav2_map_present and not backend_checkpoint_ready
             ),
             "backend_switch_supported": bool(
-                native_checkpoint_switch_supported or external_stack
+                native_checkpoint_switch_supported
             ),
             "source_mode": (
                 "planar_graph_checkpoint" if planar_graph else "live_streaming_checkpoint" if live_streaming_ready
                 else "native_occupancy_checkpoint" if native_checkpoint_ready
-                else "mapping_database_checkpoint" if external_stack and backend_checkpoint_ready
-                else "navigation_map_checkpoint" if external_stack and nav2_map_present
-                else "platform_snapshot_only" if external_stack
                 else "offline_checkpoint"
             ),
             "streaming_readiness": readiness,
@@ -8258,7 +6973,7 @@ class PlatformGeometryRuntime:
             },
             "navigation_map": {
                 **self._clone_metadata(nav2_map_metadata),
-                "required": bool(external_stack),
+                "required": False,
                 "quality": "loadable" if nav2_map_present else "missing",
             },
             "diagnostics": diagnostics,
@@ -8335,26 +7050,19 @@ class PlatformGeometryRuntime:
             return "<unknown>"
 
     def _build_mapping_run_metadata(self) -> Dict[str, object]:
-        process_name = self._external_process_name()
-        process = self._managed_processes.get(process_name)
         db_path = self._locate_live_mapping_database()
-        started_at = process.started_at_iso if process is not None else None
-        pid = process.process.pid if process is not None and process.process is not None and process.is_running() else None
         source = str(db_path.resolve()) if db_path is not None else None
-        run_id = (
-            "nuwax_geometry_runtime:" + json.dumps([source, started_at, pid], separators=(",", ":"))
-            if any(value is not None for value in (source, started_at, pid)) else None
-        )
+        run_id = "nuwax_geometry_runtime:" + json.dumps([source, None, None], separators=(",", ":")) if source else None
         return {
             "session_id": run_id,
             "run_id": run_id,
             "database_path": source,
-            "started_at": started_at,
-            "pid": pid,
-            "node_name": process_name,
+            "started_at": None,
+            "pid": None,
+            "node_name": self._external_process_name(),
             "source_stack": self.config.stack,
-            "log_path": str(process.log_path) if process is not None else None,
-            "process_running": process.is_running() if process is not None else False,
+            "log_path": None,
+            "process_running": _remote_is_connected(self._remote_provider),
         }
 
     def is_assigned_saved_cloud_selected(self) -> bool:
@@ -8603,46 +7311,6 @@ class PlatformGeometryRuntime:
         summary["reason"] = "%s_missing" % source_kind
         return summary
 
-    def _locate_live_pcd_asset(self) -> Optional[Path]:
-        if self.is_map_asset_activation_recovery_pending():
-            return None
-        resolved_candidate = None
-        activation_snapshot = self._map_activation_snapshot_read()
-        active_bundle = activation_snapshot.bundle
-        active_root = activation_snapshot.bundle_root
-        if (
-            active_bundle is not None
-            and active_bundle.geometry_asset is not None
-            and active_root is not None
-        ):
-            current_path = active_bundle.geometry_asset.pcd_path
-            if current_path:
-                current_pcd = self._resolve_bundle_asset_path(
-                    active_root,
-                    current_path,
-                )
-                if self._is_usable_pcd_file(current_pcd):
-                    resolved_candidate = current_pcd
-
-        if resolved_candidate is None:
-            mapping_backend = self._resolve_mapping_backend()
-            if mapping_backend is not None:
-                getter = getattr(mapping_backend, "get_pcd_map_path", None)
-                if callable(getter):
-                    candidate = str(getter() or "").strip()
-                    if candidate:
-                        candidate_path = Path(candidate).expanduser()
-                        if self._is_usable_pcd_file(candidate_path):
-                            resolved_candidate = candidate_path
-
-        if resolved_candidate is None:
-            for candidate in self._configured_pcd_asset_candidates():
-                if self._is_usable_pcd_file(candidate):
-                    resolved_candidate = candidate
-                    break
-        if self.is_map_asset_activation_recovery_pending():
-            return None
-        return resolved_candidate
 
     def _locate_live_mapping_database(self) -> Optional[Path]:
         """定位当前活跃的建图数据库。"""
@@ -8923,12 +7591,6 @@ class PlatformGeometryRuntime:
                 "reason": "backend_missing_activate_platform_map",
                 "backend": type(mapping_backend).__name__,
             }
-        if self._uses_external_geometry_stack():
-            return self._activate_external_nav2_map_bundle(
-                bundle,
-                bundle_root=bundle_root,
-                activation_payload=activation_payload,
-            )
         if mapping_backend is None:
             return {
                 **activation_payload,
@@ -8943,252 +7605,6 @@ class PlatformGeometryRuntime:
             "reason": "backend_missing_activate_platform_map",
         }
 
-    def _activate_external_nav2_map_bundle(
-        self,
-        bundle: MapAssetBundle,
-        *,
-        bundle_root: Path,
-        activation_payload: Dict[str, object],
-    ) -> Dict[str, object]:
-        # RTAB-Map activation: restart the managed process with the bundle's .db.
-        # Use mapping mode for empty/new DBs, localization mode for populated DBs.
-        db_path = self._resolve_existing_bundle_mapping_db(
-            bundle,
-            bundle_root=bundle_root,
-        )
-        nav2_map_metadata = self._resolve_nav2_map_metadata(bundle)
-        nav2_yaml_path = self._resolve_existing_nav2_map_yaml_path(
-            bundle,
-            bundle_root=bundle_root,
-            nav2_map_metadata=nav2_map_metadata,
-        )
-        if nav2_yaml_path is not None:
-            nav2_yaml_path = nav2_yaml_path.expanduser().resolve(strict=False)
-        if db_path is not None and db_path.exists():
-            self._ensure_external_geometry_observers_started()
-            process_name = self._external_process_name()
-            current_process = self._managed_processes.get(process_name)
-            resolved_db = db_path.expanduser().resolve()
-            db_has_map_data = db_path.stat().st_size > 4096
-            backend_mode = "mapping_localization" if db_has_map_data else "mapping"
-            use_static_map_yaml = self._external_localization_uses_static_map_yaml()
-            static_map_yaml_path = (
-                nav2_yaml_path
-                if db_has_map_data and nav2_yaml_path is not None and use_static_map_yaml
-                else None
-            )
-            static_map_requested = static_map_yaml_path is not None
-            if db_has_map_data:
-                self.clear_external_exploration_state(reason="activate_mapping_localization")
-            # 空数据库时不启动 --mapping：mapping 是手动建图专用。
-            # 新地图（空数据库）激活时只需停止当前外部进程，等待 explore 时再启动 --explore。
-            if not db_has_map_data:
-                try:
-                    if current_process is not None and current_process.is_running():
-                        current_process.stop(
-                            timeout_sec=12.0,
-                            graceful_launch_shutdown=True,
-                            graceful_timeout_sec=15.0,
-                        )
-                        time.sleep(3.0)
-                        self._managed_processes.pop(process_name, None)
-                except Exception as exc:
-                    raise MapAssetBackendActivationOutcomeUnknown(
-                        bundle.map_name
-                    ) from exc
-                self._map_stream_tracker = {}
-                return {
-                    **activation_payload,
-                    "backend_switch_applied": True,
-                    "backend_activation_disposition": "applied",
-                    "backend_map_loaded": False,
-                    "backend_mode": "unavailable",
-                    "active_map_name": bundle.map_name,
-                    "reason": "mapping_database_empty_no_auto_mapping",
-                    "mapping": {
-                        "switch_method": "stop_previous_no_start",
-                        "database_path": str(resolved_db),
-                        "note": "mapping is manual-only; use explore_area to start --explore",
-                    },
-                    "navigation_map": {
-                        **nav2_map_metadata,
-                        "map_yaml_path": str(nav2_yaml_path) if nav2_yaml_path is not None else None,
-                        "used_for_static_map": False,
-                    },
-                }
-            # 有数据的数据库：走 --localization
-            if (
-                current_process is not None
-                and current_process.is_running()
-                and self._external_process_serves_database(current_process.command, resolved_db, localization=True)
-                and (
-                    not static_map_requested
-                    or self._external_process_uses_map_yaml(current_process.command, static_map_yaml_path)
-                )
-            ):
-                return {
-                    **activation_payload,
-                    "backend_switch_applied": True,
-                    "backend_activation_disposition": "applied",
-                    "backend_map_loaded": True,
-                    "backend_mode": backend_mode,
-                    "active_map_name": bundle.map_name,
-                    "reason": "mapping_localization_already_active",
-                    "mapping": {
-                        "switch_method": "reuse_running_localization",
-                        "database_path": str(resolved_db),
-                    },
-                    "navigation_map": {
-                        **nav2_map_metadata,
-                        "map_yaml_path": str(nav2_yaml_path) if nav2_yaml_path is not None else None,
-                        "used_for_static_map": static_map_requested,
-                    },
-                }
-            restart = current_process is not None
-            try:
-                if current_process is not None and current_process.is_running():
-                    current_process.stop(
-                        timeout_sec=12.0,
-                        graceful_launch_shutdown=True,
-                        graceful_timeout_sec=15.0,
-                    )
-                    time.sleep(3.0)
-                self._map_stream_tracker = {}
-                command = [
-                    str(self._external_script_path()),
-                    "--localization",
-                    str(db_path),
-                ]
-                if static_map_yaml_path is not None:
-                    command.extend(["--map-yaml", str(static_map_yaml_path)])
-                # GO2 几何栈 localization reads the passed .db directly (localize_only:=true).
-                # Static map_server is opt-in via NUWAX_NAV2_USE_STATIC_MAP_YAML=true (legacy GO2_NAV_* deprecated).
-                self._start_managed_process(
-                    process_name,
-                    command,
-                    self._external_log_name(),
-                    restart=restart,
-                )
-            except Exception as exc:
-                raise MapAssetBackendActivationOutcomeUnknown(
-                    bundle.map_name
-                ) from exc
-            try:
-                process = self._managed_processes.get(process_name)
-                process_running = bool(
-                    process is not None and process.is_running()
-                )
-            except Exception as exc:
-                raise MapAssetBackendActivationOutcomeUnknown(
-                    bundle.map_name
-                ) from exc
-            if process_running:
-                return {
-                    **activation_payload,
-                    "backend_switch_applied": True,
-                    "backend_activation_disposition": "applied",
-                    "backend_map_loaded": True,
-                    "backend_mode": backend_mode,
-                    "active_map_name": bundle.map_name,
-                    "reason": f"{backend_mode}_started",
-                    "mapping": {
-                        "switch_method": "process_restart_localization",
-                        "database_path": str(db_path),
-                    },
-                    "navigation_map": {
-                        **nav2_map_metadata,
-                        "map_yaml_path": str(nav2_yaml_path) if nav2_yaml_path is not None else None,
-                        "used_for_static_map": static_map_requested,
-                    },
-                }
-            return {
-                **activation_payload,
-                "backend_switch_applied": False,
-                "backend_activation_disposition": "unknown",
-                "reason": "mapping_localization_start_failed",
-                "backend_mode": "unavailable",
-                "mapping": {"database_path": str(db_path)},
-                "navigation_map": {
-                    **nav2_map_metadata,
-                    "map_yaml_path": str(nav2_yaml_path) if nav2_yaml_path is not None else None,
-                    "used_for_static_map": False,
-                },
-            }
-
-        # Fallback: try the external localization process with map.yaml.
-        if nav2_yaml_path is None:
-            return {
-                **activation_payload,
-                "backend_switch_applied": False,
-                "backend_activation_disposition": "not_attempted",
-                "reason": "navigation_map_and_mapping_database_missing",
-                "backend_mode": "unavailable",
-                "navigation_map": nav2_map_metadata,
-            }
-        pcd_path = self._resolve_existing_bundle_pcd_path(
-            bundle,
-            bundle_root=bundle_root,
-        )
-        command = self._build_nav2_map_activation_command(
-            map_yaml_path=nav2_yaml_path,
-            pcd_path=pcd_path,
-        )
-        self._ensure_external_geometry_observers_started()
-        process_name = self._external_process_name()
-        current_process = self._managed_processes.get(process_name)
-        restart = current_process is not None
-        try:
-            if current_process is not None:
-                current_process.stop()
-            self._map_stream_tracker = {}
-            self._start_managed_process(
-                process_name,
-                command,
-                self._external_log_name(),
-                restart=restart,
-            )
-        except Exception as exc:
-            raise MapAssetBackendActivationOutcomeUnknown(bundle.map_name) from exc
-        try:
-            process = self._managed_processes.get(process_name)
-            process_status = process.status() if process is not None else None
-            process_running = bool(process is not None and process.is_running())
-        except Exception as exc:
-            raise MapAssetBackendActivationOutcomeUnknown(bundle.map_name) from exc
-        if not process_running:
-            return {
-                **activation_payload,
-                "backend_switch_applied": False,
-                "backend_activation_disposition": "unknown",
-                "reason": "external_localization_start_failed",
-                "backend_mode": "amcl_localization_only",
-                "navigation_map": nav2_map_metadata,
-                "navigation": {
-                    "switch_method": "managed_localization_process",
-                    "map_yaml_path": str(nav2_yaml_path),
-                    "pcd_path": str(pcd_path) if pcd_path is not None else None,
-                    "pcd_present": bool(pcd_path is not None),
-                    "command": command,
-                    "process": process_status,
-                },
-            }
-        return {
-            **activation_payload,
-            "backend_switch_applied": True,
-            "backend_activation_disposition": "applied",
-            "backend_map_loaded": True,
-            "backend_mode": "amcl_localization_only",
-            "active_map_name": bundle.map_name,
-            "reason": "external_localization_started",
-            "navigation": {
-                "switch_method": "managed_localization_process",
-                "map_yaml_path": str(nav2_yaml_path),
-                "pcd_path": str(pcd_path) if pcd_path is not None else None,
-                "pcd_present": bool(pcd_path is not None),
-                "command": command,
-                "process": process_status,
-            },
-        }
 
     def _resolve_nav2_map_metadata(
         self,
@@ -9245,86 +7661,6 @@ class PlatformGeometryRuntime:
                 return path
         return None
 
-    def _resolve_existing_bundle_pcd_path(
-        self,
-        bundle: MapAssetBundle,
-        *,
-        bundle_root: Path,
-    ) -> Optional[Path]:
-        geometry_asset = bundle.geometry_asset
-        candidates: List[object] = []
-        if geometry_asset is not None:
-            candidates.append(geometry_asset.pcd_path)
-            for asset_ref in geometry_asset.assets:
-                if asset_ref.asset_type == MapGeometryAssetType.PCD:
-                    candidates.append(asset_ref.path)
-        candidates.append(
-            self._bundle_relative_path(
-                bundle_root,
-                self._bundle_pcd_asset_path(bundle_root),
-            )
-        )
-        for candidate in candidates:
-            if not candidate:
-                continue
-            try:
-                path = self._resolve_bundle_asset_path(
-                    bundle_root,
-                    str(candidate),
-                )
-            except RuntimeError:
-                continue
-            if path.exists() and path.is_file():
-                return path.resolve(strict=False)
-        return None
-
-    def _build_nav2_map_activation_command(self, *, map_yaml_path: Path, pcd_path: Optional[Path]) -> List[str]:
-        # 直接复用外部 SLAM/Nav2 脚本；平台只连接外部 Nav2 action。
-        return self._build_external_geometry_command()
-
-    def _ensure_amcl_initialized(self) -> None:
-        """等待 AMCL 发布 map→odom TF；超时后发布 identity initialpose 作为 fallback。"""
-        deadline = time.monotonic() + 15.0
-        while time.monotonic() < deadline:
-            try:
-                pose = self._remote_provider.get_current_pose() if self._remote_provider is not None else None
-            except Exception:
-                pose = None
-            if pose is not None:
-                LOGGER.info("AMCL 已初始化，map→odom TF 可用。")
-                return
-            time.sleep(0.5)
-        LOGGER.warning("AMCL 15 秒内未发布 TF，发布 identity initialpose 作为 fallback。")
-        self._publish_initialpose_fallback()
-        deadline2 = time.monotonic() + 5.0
-        while time.monotonic() < deadline2:
-            try:
-                pose = self._remote_provider.get_current_pose() if self._remote_provider is not None else None
-            except Exception:
-                pose = None
-            if pose is not None:
-                LOGGER.info("AMCL 在 initialpose fallback 后成功初始化。")
-                return
-            time.sleep(0.5)
-        LOGGER.warning("AMCL 在 initialpose fallback 后仍未发布 TF，定位栈可能未就绪。")
-
-    def _publish_initialpose_fallback(self) -> None:
-        """显式报告 relocalize 未接入，禁止把无调用方的 hasattr 分支当成功。"""
-
-        message = (
-            "geometry runtime proto 当前没有 Relocalize/PublishInitialPose RPC；"
-            "Python 不会用 PublishOdom 冒充初始位姿。"
-        )
-        self._record_runtime_diagnostic("relocalize_unsupported", message)
-        LOGGER.warning(message)
-
-    def _wait_for_geometry_snapshot(self, *, timeout_sec: float) -> Optional[MapSnapshot]:
-        deadline = time.monotonic() + max(0.0, float(timeout_sec))
-        snapshot = self.get_map_snapshot()
-        while snapshot is None and time.monotonic() < deadline:
-            time.sleep(0.05)
-            snapshot = self.get_map_snapshot()
-        return snapshot
 
     def _wait_for_activated_map_snapshot(
         self,
@@ -9414,14 +7750,6 @@ class PlatformGeometryRuntime:
                 return None
             time.sleep(0.05)
 
-    def _read_live_map_layer(self, layer_name: str):
-        backend = self._resolve_mapping_backend()
-        if backend is None:
-            return None
-        getter = getattr(backend, f"get_{layer_name}", None)
-        if not callable(getter):
-            return None
-        return getter()
 
     def _has_live_or_seed_map(self) -> bool:
         return bool(
@@ -9446,9 +7774,7 @@ class PlatformGeometryRuntime:
             self._next_localization_subscription_id += 1
             self._localization_update_subscribers[subscription_id] = callback
             self._pending_localization_callbacks.append(callback)
-            # External observer owns delivery for the external stack.
-            if self._uses_external_geometry_stack():
-                return subscription_id
+            # 当前提供器沿原订阅票据交付gRPC位姿流。
             provider = self._remote_provider
             if provider is not None and bool(
                 getattr(provider, "is_connected", False)
@@ -9778,8 +8104,7 @@ class PlatformGeometryRuntime:
                     current_id or None,
                 )
                 return False
-            frontier_metadata, _ = self._external_debug_frontier_metadata()
-            metadata = {**frontier_metadata, **dict(state.metadata)}
+            metadata = dict(state.metadata)
             strategy = state.strategy or str(
                 getattr(current, "strategy", "") or ""
             ).strip() or None
@@ -9882,10 +8207,6 @@ class PlatformGeometryRuntime:
             )
             return False
 
-    def sync_platform_exploration_after_task(self) -> bool:
-        """兼容平台入口；只同步 native runtime 已给出的终态。"""
-
-        return bool(self.providers.sync_exploration_after_task())
 
     def report_platform_exploration_hit_stop(self, reason: str):
         """请求停止当前探索，但绝不合成后端尚未给出的终态。"""
@@ -9978,183 +8299,6 @@ class PlatformGeometryRuntime:
             "native geometry remote 已失联，hit-stop 拒绝回退 legacy 终态。"
         )
 
-    @staticmethod
-    def _remove_mapping_database_files(db_path: Path) -> None:
-        resolved = db_path.expanduser()
-        for candidate in (
-            resolved,
-            Path(str(resolved) + "-journal"),
-            Path(str(resolved) + "-wal"),
-            Path(str(resolved) + "-shm"),
-        ):
-            try:
-                if candidate.is_file():
-                    candidate.unlink()
-            except Exception:
-                LOGGER.debug("删除建图数据库文件失败：%s", candidate, exc_info=True)
-
-    def _start_external_script_exploration(self, request: ExploreAreaRequest) -> bool:
-        """【Phase 6 legacy/manual】外部脚本探索启动入口。
-
-        平台默认探索路径已切到 `_remote_provider` (GeometryRuntimeProvider) →
-        gRPC `StartExploration` → Rust `nuwax-exploration` controller。本方法
-        仅在显式 legacy/manual 入口（如历史验收脚本、外部硬件桥接）时被
-        `_handle_explore_area` 走 legacy 路径时调用。不再作为默认路径。
-        """
-        process_name = self._external_process_name()
-        current_process = self._managed_processes.get(process_name)
-        command = self._build_external_exploration_command(request)
-        db_path = self._extract_external_exploration_database_path(command)
-        if db_path:
-            self._remove_mapping_database_files(Path(str(db_path)))
-        duration_limit = self._external_exploration_duration_limit_sec(request)
-        now = time.monotonic()
-        with self._exploration_loop_lock:
-            self._external_exploration_request = request.model_copy(deep=True)
-            self._external_exploration_started_at_monotonic = now
-            self._external_exploration_started_at_iso = _utc_now_iso()
-            self._external_exploration_deadline_monotonic = None if duration_limit is None else now + duration_limit
-            self._external_exploration_database_path = db_path
-            self._external_exploration_terminal_state = None
-            self._external_geometry_session_mode = "explore"
-        # 第 8 条判据 reset 同步（spec exploration-completion-criteria "reset 同步"）：
-        # 探索会话切换时必须 reset loop_closure_state + explore_status_done +
-        # external_exploration_terminal_state，避免上一会话缓存串味。
-        self._reset_exploration_completion_state()
-        # commit 2 §2.4：幂等校验——若 observer 当前 session_mode 已为 "explore"，
-        # 跳过显式 set_session_mode("explore") 副作用（避免重复 reset loop_closure_state）；
-        # 第二次双调按原规约保留，确保 caller 端语义稳定。
-        _observer_for_idempotent_explore = self._external_debug_observer
-        if _observer_for_idempotent_explore is None or _observer_for_idempotent_explore.get_current_session_mode() != "explore":
-            self._on_external_geometry_session_mode_changed("explore")
-        self._on_external_geometry_session_mode_changed("explore")
-        if current_process is not None:
-            self._managed_processes.pop(process_name, None)
-            current_process.stop()
-            time.sleep(3.0)
-        self._map_stream_tracker = {}
-        self._start_managed_process(process_name, command, self._external_log_name(), restart=True)
-        process = self._managed_processes.get(process_name)
-        if process is not None:
-            with self._exploration_loop_lock:
-                self._external_exploration_log_offset = _capture_log_file_offset(process.log_path)
-        if process is None or not process.is_running():
-            self._finish_external_script_exploration(
-                status=ExplorationStatus.FAILED,
-                reason="external_explore_start_failed",
-                message="GO2 几何栈原生探索脚本启动失败。",
-                notify_compat=False,
-                process_status=process.status() if process is not None else None,
-                kill_geometry_process=True,
-            )
-            return False
-        self._record_runtime_diagnostic(
-            "external_go2_exploration_started",
-            "explore_area 已委托 GO2 几何栈脚本执行：%s" % process.command_display(),
-        )
-        return True
-
-    def _stop_external_script_exploration(self, *, cancel_navigation: bool, notify_compat: bool) -> bool:
-        with self._exploration_loop_lock:
-            has_request = self._external_exploration_request is not None
-            terminal_state = self._external_exploration_terminal_state
-        if not has_request and terminal_state is None and not self._external_geometry_process_is_exploration():
-            return False
-        if terminal_state is not None:
-            return True
-        if cancel_navigation:
-            self._cancel_platform_exploration_navigation()
-        self._finish_external_script_exploration(
-            status=ExplorationStatus.CANCELLED,
-            reason="manual_cancel",
-            message="GO2 几何栈原生探索任务已取消；共享 nuwax-geometry-runtime 仍保持运行，请使用 stop_mapping 结束几何栈。",
-            notify_compat=notify_compat,
-            kill_geometry_process=False,
-        )
-        return True
-
-    def _kill_external_geometry_process(self) -> Optional[Dict[str, object]]:
-        process_name = self._external_process_name()
-        process = self._managed_processes.pop(process_name, None)
-        if process is None:
-            return None
-        process_status = process.status()
-        if process.is_running():
-            process.stop(
-                timeout_sec=15.0,
-                graceful_launch_shutdown=True,
-                graceful_timeout_sec=25.0,
-            )
-            time.sleep(3.0)
-            process_status = process.status()
-        with self._exploration_loop_lock:
-            self._external_geometry_session_mode = None
-        return process_status
-
-    def _finish_external_script_exploration(
-        self,
-        *,
-        status: ExplorationStatus,
-        reason: str,
-        message: str,
-        notify_compat: bool,
-        process_status: Optional[Dict[str, object]] = None,
-        kill_geometry_process: bool = False,
-        completion_reasons: Optional[List[str]] = None,
-    ) -> ExplorationState:
-        process_name = self._external_process_name()
-        process = self._managed_processes.get(process_name)
-        if kill_geometry_process:
-            process_status = self._kill_external_geometry_process() or process_status
-            process = None
-        elif process_status is None and process is not None:
-            process_status = process.status()
-        with self._exploration_loop_lock:
-            request = self._external_exploration_request
-        metadata = self._build_external_exploration_metadata(
-            request=request,
-            process_status=process_status,
-            waiting_for=None,
-            reason=reason,
-            terminal=True,
-        )
-        frontier_metadata, _ = self._external_debug_frontier_metadata()
-        if frontier_metadata:
-            metadata.update(frontier_metadata)
-        metadata["exploration_terminal"] = True
-        metadata["terminal_status"] = str(getattr(status, "value", status) or "succeeded")
-        metadata["status_text"] = self._terminal_explorer_status_text(str(reason or ""), message)
-        # 第 8 条判据新增：reasons 命名空间前缀（spec exploration-completion-criteria）
-        # 仅当显式传入 completion_reasons 时覆盖；旧调用点不传则留空 list，保留兼容。
-        if completion_reasons is not None:
-            metadata["reasons"] = list(completion_reasons)
-        else:
-            metadata.setdefault("reasons", [])
-        metadata.pop("waiting_for", None)
-        metadata.pop("waiting_detail", None)
-        if not kill_geometry_process and self._external_geometry_stack_is_running():
-            metadata["geometry_stack_kept_alive"] = True
-            metadata["geometry_stack_stop_via"] = "stop_mapping"
-            metadata["geometry_stack_running"] = True
-        else:
-            metadata["geometry_stack_running"] = False
-        state = ExplorationState(
-            current_request_id=request.request_id if request is not None else None,
-            status=status,
-            strategy=request.strategy if request is not None else "frontier",
-            message=message,
-            metadata=metadata,
-        )
-        with self._exploration_loop_lock:
-            self._external_exploration_terminal_state = state
-            self._external_exploration_request = None
-            self._external_exploration_deadline_monotonic = None
-            self._external_exploration_log_offset = None
-            if kill_geometry_process:
-                self._external_geometry_session_mode = None
-        if notify_compat:
-            self._notify_compat_exploration_stopped()
-        return state
 
     def _ensure_mapping_lifecycle_fields(self) -> None:
         if not hasattr(self, "_mapping_lifecycle_lock"):
@@ -10320,28 +8464,16 @@ class PlatformGeometryRuntime:
         return self.start_mapping(map_name=map_name)
 
     def get_geometry_stack_status(self) -> Dict[str, object]:
-        """返回 go2.sh 几何栈运行态，供 Agent 区分工作区 mapping 与真实 SLAM 进程。"""
+        """返回原生几何连接和实际建图/探索会话状态。"""
 
-        process = self._managed_processes.get(self._external_process_name())
-        process_status = process.status() if process is not None else None
-        provider = getattr(self, "_remote_provider", None)
-        sidecar_running = bool(
-            provider is not None and getattr(provider, "is_connected", False)
-        )
-        running = sidecar_running or bool(process is not None and process.is_running())
-        command = list(process.command) if process is not None else []
+        sidecar_running = _remote_is_connected(self._remote_provider)
+        running = sidecar_running
         launch_mode = None
-        if self._command_uses_external_exploration(command):
-            launch_mode = "explore"
-        elif self._command_uses_external_mapping(command):
-            launch_mode = "mapping"
-        elif self._command_uses_external_localization(command):
-            launch_mode = "localization"
         with self._exploration_loop_lock:
             session_mode = self._external_geometry_session_mode
             terminal_state = self._external_exploration_terminal_state
             has_active_exploration = self._external_exploration_request is not None
-            mapping_database_path = self._external_exploration_database_path
+            mapping_database_path = None
         mapping_context = self.get_mapping_session_context()
         mapping_active = bool(mapping_context and mapping_context.get("active"))
         exploration_active = bool(
@@ -10358,7 +8490,7 @@ class PlatformGeometryRuntime:
             guidance = (
                 "几何栈未运行。遥控建图请调用 start_mapping(map_name)；"
                 "自主探索请调用 explore_area(map_name)。"
-                "activate_map 仅切换工作区，不会启动 go2.sh。"
+                "activate_map 用于切换地图工作区。"
             )
         elif launch_mode == "mapping":
             guidance = "遥控建图进行中：用户可遥控移动，完成后 finalize_active_map，再 stop_mapping。"
@@ -10377,7 +8509,7 @@ class PlatformGeometryRuntime:
             "geometry_stack_running": running,
             "launch_mode": launch_mode,
             "session_mode": session_mode,
-            "process_running": bool(process is not None and process.is_running()),
+            "process_running": sidecar_running,
             "sidecar_running": sidecar_running,
             "mapping_active": mapping_active,
             "mapping_session_id": (
@@ -10386,7 +8518,7 @@ class PlatformGeometryRuntime:
             "session_generation": (
                 mapping_context.get("session_generation") if mapping_context else None
             ),
-            "process_status": process_status,
+            "process_status": None,
             "mapping_database_path": mapping_database_path,
             "map_name": (
                 mapping_context.get("map_name") if mapping_context else None
@@ -10498,7 +8630,7 @@ class PlatformGeometryRuntime:
 
         with self._exploration_loop_lock:
             session_mode = self._external_geometry_session_mode
-            mapping_database_path = self._external_exploration_database_path
+            mapping_database_path = None
             self._external_geometry_session_mode = None
         self._record_runtime_diagnostic(
             "native_mapping_stopped",
@@ -10522,140 +8654,6 @@ class PlatformGeometryRuntime:
             "mapping_database_path": mapping_database_path,
         }
 
-    def _external_exploration_duration_limit_sec(self, request: ExploreAreaRequest) -> Optional[float]:
-        limits: List[float] = []
-        if request.max_duration_sec is not None:
-            limits.append(float(request.max_duration_sec))
-        stop_conditions = dict(getattr(request, "stop_conditions", {}) or {})
-        value = stop_conditions.get("max_duration_sec")
-        if value is not None and not isinstance(value, bool):
-            try:
-                parsed = float(value)
-            except (TypeError, ValueError):
-                parsed = 0.0
-            if math.isfinite(parsed) and parsed > 0.0:
-                limits.append(parsed)
-        return min(limits) if limits else None
-
-    def _external_exploration_elapsed_sec(self) -> float:
-        with self._exploration_loop_lock:
-            started = self._external_exploration_started_at_monotonic
-        if started is None:
-            return 0.0
-        return max(0.0, time.monotonic() - started)
-
-    @staticmethod
-    def _external_process_serves_database(
-        command: List[str],
-        database_path: Path,
-        *,
-        localization: bool = False,
-    ) -> bool:
-        if not command:
-            return False
-        if localization and not PlatformGeometryRuntime._command_uses_external_localization(command):
-            return False
-        extracted = PlatformGeometryRuntime._extract_external_exploration_database_path(command)
-        if extracted is None and command:
-            extracted = str(command[-1])
-        if not extracted:
-            return False
-        try:
-            return Path(str(extracted)).expanduser().resolve() == database_path.expanduser().resolve()
-        except OSError:
-            return False
-
-    @staticmethod
-    def _external_process_uses_map_yaml(command: List[str], map_yaml_path: Optional[Path]) -> bool:
-        if map_yaml_path is None or not command:
-            return False
-        idx = 0
-        extracted = None
-        while idx < len(command):
-            item = str(command[idx])
-            if item in {"--map-yaml", "--map-yaml-path"} and idx + 1 < len(command):
-                extracted = str(command[idx + 1])
-                break
-            idx += 1
-        if not extracted:
-            return False
-        try:
-            return Path(str(extracted)).expanduser().resolve() == map_yaml_path.expanduser().resolve()
-        except OSError:
-            return False
-
-    @staticmethod
-    def _extract_external_exploration_database_path(command: List[str]) -> Optional[str]:
-        if not command:
-            return None
-        idx = 0
-        result = None
-        while idx < len(command):
-            item = str(command[idx])
-            if item == "--database-path" and idx + 1 < len(command):
-                result = str(command[idx + 1])
-                idx += 2
-                continue
-            if item in {"--map-yaml", "--map-yaml-path"} and idx + 1 < len(command):
-                idx += 2
-                continue
-            if idx > 0 and not item.startswith("-") and ":=" not in item:
-                result = item
-            idx += 1
-        return result
-
-    def _build_external_exploration_metadata(
-        self,
-        *,
-        request: Optional[ExploreAreaRequest],
-        process_status: Optional[Dict[str, object]],
-        waiting_for: Optional[str],
-        reason: Optional[str] = None,
-        terminal: bool = False,
-    ) -> Dict[str, object]:
-        duration_limit = self._external_exploration_duration_limit_sec(request) if request is not None else None
-        elapsed = self._external_exploration_elapsed_sec()
-        with self._exploration_loop_lock:
-            started_at = self._external_exploration_started_at_iso
-            deadline = self._external_exploration_deadline_monotonic
-            database_path = self._external_exploration_database_path
-        remaining = None
-        if deadline is not None:
-            remaining = max(0.0, deadline - time.monotonic())
-        metadata: Dict[str, object] = {
-            "exploration_mode": "go2_rtabnav2_script",
-            "exploration_runtime": "external_go2_rtabnav2",
-            "exploration_script": str(self._external_script_path()),
-            "exploration_process_name": self._external_process_name(),
-            "exploration_database_path": database_path,
-            "exploration_launch_mode": "explore",
-            "started_at": started_at,
-            "elapsed_time_sec": elapsed,
-            "max_duration_sec": duration_limit,
-            "remaining_time_sec": remaining,
-            "terminal": bool(terminal),
-            "exploration_terminal": bool(terminal),
-            "terminal_reason": reason,
-            "waiting_for": waiting_for,
-            "external_process": process_status,
-            "platform_frontier_runtime_bypassed": True,
-            "native_go2_explore_lite": True,
-            "native_go2_frontier_explorer": False,
-        }
-        if request is not None:
-            metadata.update(
-                {
-                    "map_name": request.map_name,
-                    "center_pose": request.center_pose.model_dump(mode="json") if request.center_pose is not None else None,
-                    "radius_m": request.radius_m,
-                    "target_name": request.target_name,
-                    "stop_conditions": dict(request.stop_conditions),
-                }
-            )
-        if process_status is not None:
-            metadata["exploration_command"] = process_status.get("command")
-            metadata["exploration_log_path"] = process_status.get("log_path")
-        return metadata
 
     def _notify_remote_exploration_update(
         self,
@@ -10895,13 +8893,6 @@ class PlatformGeometryRuntime:
             current_request = self._external_exploration_request
 
         metadata = dict(state.metadata)
-        if (
-            deadline_monotonic is None
-            and hasattr(self, "_external_debug_frontier_payload")
-        ):
-            frontier_metadata, _ = self._external_debug_frontier_metadata()
-            metadata = {**frontier_metadata, **metadata}
-
         current_request_id = str(
             getattr(current_request, "request_id", "") or ""
         ).strip()
@@ -10927,562 +8918,8 @@ class PlatformGeometryRuntime:
             deep=True,
         )
 
-    def _external_debug_frontier_metadata(self) -> Tuple[Dict[str, object], Optional[int]]:
-        with self._exploration_loop_lock:
-            if getattr(self, "_external_geometry_session_mode", None) != "explore":
-                return {}, None
-            payload = self._clone_metadata(
-                getattr(self, "_external_debug_frontier_payload", None) or {}
-            )
-        if not payload:
-            return {}, None
-        latest_frontiers = payload.get("latest_frontiers") if isinstance(payload.get("latest_frontiers"), list) else []
-        current_frontier = payload.get("current_frontier") if isinstance(payload.get("current_frontier"), dict) else None
-        try:
-            frontier_count = int(payload.get("frontier_count")) if payload.get("frontier_count") is not None else len(latest_frontiers)
-        except (TypeError, ValueError):
-            frontier_count = len(latest_frontiers)
-        payload_metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
-        raw_status_text = str(payload_metadata.get("status_text") or "").strip()
-        provisional_meta = {
-            "status_text": raw_status_text,
-            "external_frontier_debug_observer": {
-                "metadata": payload_metadata,
-            },
-        }
-        resolved_status_text = self._resolve_explorer_status_text(provisional_meta) or raw_status_text
-        metadata = {
-            "latest_frontiers": latest_frontiers,
-            "current_frontier": current_frontier,
-            "frontier_source": payload.get("source") or "go2_rtabnav2_debug_observer",
-            "native_go2_explore_lite": True,
-            "native_go2_frontier_explorer": False,
-            "status_text": resolved_status_text,
-            "exploration_terminal": bool(payload_metadata.get("exploration_terminal")),
-            "terminal_status": payload_metadata.get("terminal_status"),
-            "planned_path": payload.get("planned_path") if isinstance(payload.get("planned_path"), list) else payload_metadata.get("planned_path"),
-            "plan_point_count": payload_metadata.get("plan_point_count"),
-            "plan_fresh": payload_metadata.get("plan_fresh"),
-            # current_goal 已在源头解析为 NavigationGoal|None，直接透传，不做 dict 类型过滤。
-            "current_goal": payload.get("current_goal") if isinstance(payload.get("current_goal"), NavigationGoal) else None,
-            "external_frontier_debug_observer": {
-                "source_name": payload.get("source_name"),
-                "updated_at": payload.get("updated_at"),
-                "sequence": payload.get("sequence"),
-                "frontier_count": frontier_count,
-                "metadata": payload_metadata,
-            },
-        }
-        return metadata, frontier_count
 
-    def _metadata_indicates_exploration_done(
-        self, metadata: Dict[str, object]
-    ) -> Tuple[bool, List[str]]:
-        """判断探索任务是否已结束，并返回 reasons 命名空间前缀列表。
 
-        原 7 条判据路径（marker DONE / explore.status exploration_complete /
-        max_duration_sec / external_process_completed / external_process_exited /
-        日志扫描 / stop_mapping / hit_stop / manual_cancel） MUST NOT 破坏；
-        新增第 8 条：地图已形成闭环（主路径闭环状态 + 辅助信号
-        `explore/status exploration_complete`，任一触发即 stop）。
-
-        返回：
-        - (False, []) —— 未结束；
-        - (True, [reasons...]) —— 已结束，reasons 命名空间前缀（见 spec
-          exploration-completion-criteria "reasons 命名空间前缀"）。
-        """
-
-        # 原有 7 条判据路径（保持原状，reasons 用旧命名以保持向后兼容）
-        if bool(metadata.get("exploration_terminal")) or bool(metadata.get("terminal")):
-            return True, ["explorer:exploration_terminal"]
-        status_text = str(metadata.get("status_text") or "").upper()
-        if "DONE (EXPLORATION FINISHED)" in status_text:
-            return True, ["explorer:exploration_finished"]
-        observer_meta = metadata.get("external_frontier_debug_observer")
-        if isinstance(observer_meta, dict):
-            observer_payload = observer_meta.get("metadata") if isinstance(observer_meta.get("metadata"), dict) else {}
-            if bool(observer_payload.get("exploration_terminal")):
-                return True, ["explorer:exploration_terminal"]
-            observer_status = str(observer_payload.get("status_text") or "").upper()
-            if "DONE (EXPLORATION FINISHED)" in observer_status:
-                return True, ["explorer:exploration_finished"]
-
-        # 第 8 条判据：地图已形成闭环（双信号源，任一触发即 stop）
-        # 主路径：observer._loop_closure_state.loop_closure_count >= threshold
-        # 辅助信号：observer._explore_status_done（explore/status == "exploration_complete"）
-        return self._check_loop_closure_completion()
-
-    def _check_loop_closure_completion(self) -> Tuple[bool, List[str]]:
-        """第 8 条判据：双信号源检查（spec exploration-completion-criteria）。"""
-
-        reasons: List[str] = []
-        observer = self._external_debug_observer
-        # 主路径：/rtabmap/info topic；缺失时降级到 DB SQLite fallback
-        if observer is not None:
-            state = observer.loop_closure_state
-            threshold = self._resolve_loop_closure_threshold()
-            if state.loop_closure_count >= threshold and state.source in {"topic", "db_sqlite"}:
-                if "mapping:loop_closed" not in reasons:
-                    reasons.append("mapping:loop_closed")
-        else:
-            # 无 observer 时尝试 DB fallback
-            count = self._read_loop_closure_count_from_db_with_fallback()
-            threshold = self._resolve_loop_closure_threshold()
-            if count >= threshold and count > 0:
-                if "mapping:loop_closed" not in reasons:
-                    reasons.append("mapping:loop_closed")
-
-        # 辅助信号：explore/status == "exploration_complete"
-        if observer is not None and observer.explore_status_done:
-            if "explorer:no_frontiers" not in reasons:
-                reasons.append("explorer:no_frontiers")
-
-        return (bool(reasons), reasons)
-
-    @staticmethod
-    def _resolve_loop_closure_threshold() -> int:
-        """从 core.settings 解析 threshold；缺失或异常时 fallback 3。"""
-
-        try:
-            from core.settings import (
-                NAV_LOOP_CLOSURE_THRESHOLD,  # type: ignore
-            )
-            value = int(NAV_LOOP_CLOSURE_THRESHOLD)
-        except Exception:
-            value = 3
-        if value <= 0:
-            return 3
-        return value
-
-    def _read_loop_closure_count_from_db_with_fallback(self) -> int:
-        """DB SQLite fallback：HIL 第 1 步验证 /rtabmap/info 不存在时启用。"""
-
-        db_path = self._resolve_loop_closure_db_path()
-        if db_path is None:
-            return 0
-        try:
-            return int(
-                read_loop_closure_from_db(
-                    db_path,
-                    threshold=self._resolve_loop_closure_threshold(),
-                )
-            )
-        except Exception:
-            LOGGER.debug("loop_closure DB fallback 失败。", exc_info=True)
-            return 0
-
-    def _resolve_loop_closure_db_path(self) -> Optional[Path]:
-        """解析当前探索会话的 RTAB-Map DB 路径。"""
-
-        with self._exploration_loop_lock:
-            db_path = self._external_exploration_database_path
-        if not db_path:
-            return None
-        try:
-            candidate = Path(str(db_path)).expanduser()
-        except Exception:
-            return None
-        return candidate
-
-    def _reset_exploration_completion_state(self) -> None:
-        """重置第 8 条判据相关状态（spec exploration-completion-criteria "reset 同步"）。
-
-        触发时机：`_start_external_script_exploration` 启动新会话时。
-        同时清零：observer._loop_closure_state、observer._explore_status_done、
-        `external_exploration_terminal_state`。
-        """
-
-        observer = self._external_debug_observer
-        if observer is not None and hasattr(observer, "reset_loop_closure_state"):
-            try:
-                observer.reset_loop_closure_state()
-            except Exception:
-                LOGGER.debug("observer reset_loop_closure_state 失败。", exc_info=True)
-        # _external_exploration_terminal_state 已在 _start_external_script_exploration
-        # 内部 `_exploration_loop_lock` 段同步置 None；这里做防御性二次清零。
-
-    # ------------------------------------------------------------------
-    # 手划探索范围 boundary JSON 写入（spec exploration-boundary §go2.sh --boundary）
-    # ------------------------------------------------------------------
-
-    _BOUNDARY_JSON_PATH = Path("/tmp/go2_boundary.json")
-
-    def _maybe_persist_boundary_for_external_command(
-        self,
-        *,
-        command: List[str],
-        session: str,
-    ) -> Optional[Path]:
-        """调用 observer 的 `_compute_boundary_polygon`，把结果序列化到 `/tmp/go2_boundary.json`。
-
-        返回：
-        - `Path`: 写入成功且非空 polygon 时返回 `/tmp/go2_boundary.json`；
-        - `None`: 无 observer / 无 boundary 缓存 / 异常 / 空 polygon 时返回 None。
-
-        行为约定：
-        - 复用 observer 单订阅者约束（不另起订阅 `/map_obstacles`）；
-        - 原子写：先写 `.tmp` 再 rename，避免 go2.sh 读到半截文件；
-        - 写入失败仅记 warning 日志，不抛异常（避免 mapping 启动被 boundary 失败连累）。
-        """
-
-        observer = self._external_debug_observer
-        if observer is None:
-            LOGGER.debug(
-                "boundary_persist_skipped reason=observer_not_started session=%s", session
-            )
-            return None
-        try:
-            polygon = observer.latest_boundary_polygon
-        except Exception:
-            LOGGER.debug("读取 observer.latest_boundary_polygon 失败。", exc_info=True)
-            polygon = []
-        if not polygon:
-            LOGGER.debug(
-                "boundary_persist_skipped reason=empty_polygon session=%s", session
-            )
-            return None
-        payload = {
-            "polygon": [{"x": float(x), "y": float(y)} for (x, y) in polygon],
-            "session": str(session),
-            "command_preview": list(command)[:8],
-            "generated_at": _utc_now_iso(),
-        }
-        target = self._BOUNDARY_JSON_PATH
-        tmp_path = Path(str(target) + ".tmp")
-        try:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            with open(tmp_path, "w", encoding="utf-8") as fp:
-                json.dump(payload, fp, ensure_ascii=False, indent=2)
-                fp.flush()
-                try:
-                    os.fsync(fp.fileno())
-                except Exception:
-                    pass
-            tmp_path.replace(target)
-        except Exception:
-            LOGGER.warning(
-                "boundary JSON 写入失败 path=%s session=%s",
-                target,
-                session,
-                exc_info=True,
-            )
-            try:
-                if tmp_path.exists():
-                    tmp_path.unlink()
-            except Exception:
-                pass
-            return None
-        LOGGER.info(
-            "boundary JSON 已写入 path=%s vertices=%d session=%s",
-            target,
-            len(payload["polygon"]),
-            session,
-        )
-        return target
-
-    def _external_exploration_terminal_from_frontier_observer(self) -> Optional[ExplorationState]:
-        with self._exploration_loop_lock:
-            request = self._external_exploration_request
-            payload = self._clone_metadata(self._external_debug_frontier_payload or {})
-        if request is None or not payload:
-            return None
-        payload_metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
-        frontier_metadata, _ = self._external_debug_frontier_metadata()
-        done, reasons = self._metadata_indicates_exploration_done({**frontier_metadata, **payload_metadata})
-        if not done:
-            return None
-        terminal_status = str(payload_metadata.get("terminal_status") or "succeeded").lower()
-        status = ExplorationStatus.SUCCEEDED if terminal_status == "succeeded" else ExplorationStatus.FAILED
-        status_text = str(payload_metadata.get("status_text") or "").strip()
-        message = "GO2 几何栈原生探索已完成。"
-        if reasons:
-            message = "GO2 几何栈原生探索已完成：%s" % ", ".join(reasons)
-        elif status_text:
-            message = "GO2 几何栈原生探索已完成：%s" % status_text
-        process = self._managed_processes.get(self._external_process_name())
-        process_status = process.status() if process is not None else None
-        return self._finish_external_script_exploration(
-            status=status,
-            reason="external_explorer_frontier_done",
-            message=message,
-            notify_compat=False,
-            process_status=process_status,
-            kill_geometry_process=False,
-            completion_reasons=reasons,
-        )
-
-    def _should_scan_external_exploration_log(self) -> bool:
-        now = time.monotonic()
-        if now - self._external_exploration_last_log_scan_at < _EXTERNAL_EXPLORATION_LOG_SCAN_MIN_INTERVAL_SEC:
-            return False
-        self._external_exploration_last_log_scan_at = now
-        return True
-
-    def _build_fast_external_exploration_state_from_frontier(self) -> ExplorationState:
-        """从已缓存的 frontier observer payload 构建轻量探索态，供 ROS 热路径推送。"""
-
-        with self._exploration_loop_lock:
-            request = self._external_exploration_request
-            terminal_state = self._external_exploration_terminal_state
-        if terminal_state is not None:
-            return terminal_state.model_copy(deep=True)
-        if request is None:
-            return ExplorationState(status=ExplorationStatus.IDLE)
-
-        frontier_metadata, frontier_count = self._external_debug_frontier_metadata()
-        explorer_message = self._external_explorer_headline_message(
-            frontier_metadata,
-            frontier_count=frontier_count,
-        )
-        process = self._managed_processes.get(self._external_process_name())
-        process_status = process.status() if process is not None else None
-        waiting_for = None
-        message = explorer_message or "GO2 几何栈原生 frontier 探索运行中。"
-        metadata = self._build_external_exploration_metadata(
-            request=request,
-            process_status=process_status,
-            waiting_for=waiting_for,
-            reason=None,
-            terminal=False,
-        )
-        if frontier_metadata:
-            metadata.update(frontier_metadata)
-        return ExplorationState(
-            current_request_id=request.request_id,
-            status=ExplorationStatus.RUNNING,
-            strategy=request.strategy,
-            frontier_count=frontier_count,
-            message=message,
-            metadata=metadata,
-        )
-
-    def _get_external_script_exploration_state(self) -> ExplorationState:
-        with self._exploration_loop_lock:
-            request = self._external_exploration_request
-            terminal_state = self._external_exploration_terminal_state
-            deadline = self._external_exploration_deadline_monotonic
-        if terminal_state is not None:
-            return self._augment_exploration_state_with_mapping_diagnostics(terminal_state)
-        if request is None:
-            return ExplorationState(status=ExplorationStatus.IDLE)
-
-        frontier_terminal_state = self._external_exploration_terminal_from_frontier_observer()
-        if frontier_terminal_state is not None:
-            return self._augment_exploration_state_with_mapping_diagnostics(frontier_terminal_state)
-
-        process = self._managed_processes.get(self._external_process_name())
-        process_status = process.status() if process is not None else None
-        process_running = bool(process is not None and process.is_running())
-        elapsed = self._external_exploration_elapsed_sec()
-        if deadline is not None and time.monotonic() >= deadline:
-            state = self._finish_external_script_exploration(
-                status=ExplorationStatus.SUCCEEDED,
-                reason="max_duration_sec",
-                message="GO2 几何栈原生探索已达到最大时长，任务已结束。",
-                notify_compat=False,
-                process_status=process_status,
-                kill_geometry_process=False,
-            )
-            return self._augment_exploration_state_with_mapping_diagnostics(state)
-
-        if not process_running:
-            exit_code = process_status.get("exit_code") if isinstance(process_status, dict) else None
-            if exit_code == 0:
-                state = self._finish_external_script_exploration(
-                    status=ExplorationStatus.SUCCEEDED,
-                    reason="external_process_completed",
-                    message="GO2 几何栈原生探索脚本已正常退出。",
-                    notify_compat=False,
-                    process_status=process_status,
-                    kill_geometry_process=False,
-                )
-                return self._augment_exploration_state_with_mapping_diagnostics(state)
-            state = self._finish_external_script_exploration(
-                status=ExplorationStatus.FAILED,
-                reason="external_process_exited",
-                message="GO2 几何栈原生探索脚本已退出，exit_code=%s。" % exit_code,
-                notify_compat=False,
-                process_status=process_status,
-                kill_geometry_process=False,
-            )
-            return self._augment_exploration_state_with_mapping_diagnostics(state)
-
-        log_terminal = None
-        if self._should_scan_external_exploration_log():
-            log_terminal = self._external_exploration_terminal_from_process_log(process)
-        if log_terminal is not None:
-            state = self._finish_external_script_exploration(
-                status=log_terminal["status"],
-                reason=str(log_terminal["reason"]),
-                message=str(log_terminal["message"]),
-                notify_compat=False,
-                process_status=process_status,
-                kill_geometry_process=False,
-            )
-            return self._augment_exploration_state_with_mapping_diagnostics(state)
-
-        frontier_metadata, frontier_count = self._external_debug_frontier_metadata()
-        explorer_message = self._external_explorer_headline_message(
-            frontier_metadata,
-            frontier_count=frontier_count,
-        )
-
-        diagnostics = self.get_live_mapping_diagnostics()
-        runtime_status = diagnostics.get("runtime_status") if isinstance(diagnostics.get("runtime_status"), dict) else {}
-        mapping_readiness = diagnostics.get("mapping_readiness")
-        if not isinstance(mapping_readiness, dict):
-            mapping_readiness = {}
-        navigation_status = (
-            runtime_status.get("navigation")
-            if isinstance(runtime_status.get("navigation"), dict)
-            else self._build_navigation_status()
-        )
-        waiting_for = None
-        message = "GO2 几何栈原生 frontier 探索运行中。"
-        exploration_signals_active = bool(
-            explorer_message is not None
-            or (frontier_count is not None and frontier_count > 0)
-            or bool((frontier_metadata or {}).get("plan_fresh"))
-        )
-        if exploration_signals_active:
-            message = explorer_message or message
-        elif diagnostics.get("waiting_for"):
-            waiting_for = str(diagnostics.get("waiting_for"))
-            message = str(diagnostics.get("message") or "等待 GO2 几何栈探索输入链路 ready。")
-        elif not bool(mapping_readiness.get("localization_ready")):
-            waiting_for = str(mapping_readiness.get("waiting_for") or "geometry_runtime_localization")
-            message = str(mapping_readiness.get("message") or "等待 GO2 几何栈 SLAM/TF ready。")
-        elif not bool(navigation_status.get("ready")):
-            waiting_for = self._normalize_exploration_waiting_for(
-                navigation_status.get("waiting_for") or "nuwax_navigation_runtime"
-            )
-            message = str(navigation_status.get("message") or "等待 nuwax-geometry-runtime nav_runtime ready。")
-        elif explorer_message:
-            message = explorer_message
-
-        metadata = self._build_external_exploration_metadata(
-            request=request,
-            process_status=process_status,
-            waiting_for=waiting_for,
-            reason=None,
-            terminal=False,
-        )
-        metadata["mapping_chain_diagnostics"] = diagnostics
-        metadata["mapping_readiness"] = self._clone_metadata(mapping_readiness)
-        metadata["navigation_readiness"] = self._clone_metadata(navigation_status)
-        metadata["elapsed_time_sec"] = elapsed
-        if waiting_for:
-            metadata["waiting_detail"] = message
-        if frontier_metadata:
-            metadata.update(frontier_metadata)
-        return self._augment_exploration_state_with_mapping_diagnostics(
-            ExplorationState(
-                current_request_id=request.request_id,
-                status=ExplorationStatus.RUNNING,
-                strategy=request.strategy,
-                frontier_count=frontier_count,
-                message=message,
-                metadata=metadata,
-            )
-        )
-
-    def _read_external_exploration_log_texts(self, process: Optional[_ManagedProcess]) -> List[str]:
-        if process is None:
-            return []
-        texts: List[str] = []
-        with self._exploration_loop_lock:
-            log_offset = self._external_exploration_log_offset
-        try:
-            if log_offset is not None:
-                texts.append(_read_log_from_offset(process.log_path, log_offset))
-            texts.append(_read_recent_log(process.log_path, max_bytes=65536))
-        except Exception:
-            return texts
-        deduped: List[str] = []
-        seen: Set[str] = set()
-        for text in texts:
-            normalized = str(text or "")
-            if not normalized or normalized in seen:
-                continue
-            seen.add(normalized)
-            deduped.append(normalized)
-        for text in list(deduped):
-            deduped.extend(self._read_external_frontier_ros_logs(text))
-        return deduped
-
-    def _external_exploration_terminal_from_process_log(self, process: Optional[_ManagedProcess]) -> Optional[Dict[str, object]]:
-        best: Optional[Dict[str, object]] = None
-        for candidate in self._read_external_exploration_log_texts(process):
-            terminal = self._external_exploration_terminal_from_log_text(candidate)
-            if terminal is None:
-                continue
-            if terminal.get("reason") == "external_explorer_log_complete":
-                return terminal
-            best = terminal
-        return best
-
-    @staticmethod
-    def _terminal_explorer_status_text(reason: str, message: str) -> str:
-        normalized_message = str(message or "").lower()
-        if "done" in normalized_message or "exploration finished" in normalized_message:
-            return "DONE (exploration finished)"
-        if reason in {
-            "external_explorer_frontier_done",
-            "external_explorer_log_complete",
-            "external_explorer_terminal_status",
-        }:
-            return "DONE (exploration finished)"
-        if reason == "external_explorer_log_navigation_failures_terminal":
-            return "DONE (exploration finished)"
-        return "DONE (exploration finished)"
-
-    def _read_external_frontier_ros_logs(self, launch_log_text: str) -> List[str]:
-        pids: List[str] = []
-        pid_patterns = (
-            r"\[frontier_explorer\.py-\d+\]: process started with pid \[(\d+)\]",
-            r"\[explore-\d+\]: process started with pid \[(\d+)\]",
-            r"\[explore_node-\d+\]: process started with pid \[(\d+)\]",
-        )
-        for pattern in pid_patterns:
-            for match in re.finditer(pattern, launch_log_text or ""):
-                pids.append(match.group(1))
-        if not pids:
-            return []
-        ros_log_root = Path.home() / ".ros" / "log"
-        texts: List[str] = []
-        for pid in dict.fromkeys(pids):
-            for path in sorted(ros_log_root.glob(f"python3_{pid}_*.log"), key=lambda item: item.stat().st_mtime if item.exists() else 0.0, reverse=True)[:2]:
-                try:
-                    texts.append(_read_recent_log(path, max_bytes=65536))
-                except Exception:
-                    continue
-        return texts
-
-    def _external_exploration_terminal_from_log_text(self, text: str) -> Optional[Dict[str, object]]:
-        if not text:
-            return None
-        latest_start = text.rfind("] start ")
-        if latest_start >= 0:
-            text = text[latest_start:]
-        normalized = text.lower()
-        complete_markers = (
-            "exploration complete",
-            "exploration_complete",
-            "exploration reached a terminal state",
-            "done (exploration finished)",
-            "no frontiers found. exploration complete",
-            "所有前沿已尝试完毕",
-            "frontier_explorer is idle",
-            "shutting down frontier_explorer node",
-        )
-        complete_pos = max((normalized.rfind(marker) for marker in complete_markers), default=-1)
-        if complete_pos >= 0:
-            return {
-                "status": ExplorationStatus.SUCCEEDED,
-                "reason": "external_explorer_log_complete",
-                "message": "GO2 几何栈原生探索已完成。",
-            }
-        return None
 
     def _read_exploration_pose(self):
         navigation_backend = self._resolve_navigation_backend()
@@ -11499,60 +8936,6 @@ class PlatformGeometryRuntime:
         except Exception:
             return None
 
-    def _normalize_exploration_waiting_for(self, value: object) -> str:
-        normalized = str(value or "").strip() or "navigation_backend"
-        return {
-            "lifecycle": "nav2_lifecycle",
-            "action": "nav2_action",
-            "ros2_action": "nav2_action",
-            "tf": "tf",
-            "costmap": "costmap",
-            "backend": "navigation_backend",
-            "navigation": "navigation_backend",
-        }.get(normalized, normalized)
-
-    def _notify_compat_exploration_stopped(self) -> None:
-        backend = self._resolve_backend(ExplorationDataPlane, ExplorationProvider)
-        if backend is None:
-            return
-        stopper = getattr(backend, "stop_exploration", None)
-        if not callable(stopper):
-            return
-        try:
-            stopper()
-        except Exception:
-            pass
-
-    def _notify_compat_navigation_cancelled(self) -> None:
-        backend = self._resolve_backend(NavigationDataPlane, NavigationProvider)
-        if backend is None:
-            return
-        canceller = getattr(backend, "cancel_goal", None)
-        if not callable(canceller):
-            return
-        try:
-            state = backend.get_navigation_state()
-            goal_id = str(getattr(state, "current_goal_id", "") or "").strip()
-            if goal_id:
-                canceller(request_id=goal_id)
-        except Exception:
-            pass
-
-    def _cancel_platform_exploration_navigation(self, *, current_goal=None) -> None:
-        goal = current_goal
-        if goal is None:
-            return
-        navigation_backend = self._resolve_navigation_backend()
-        if navigation_backend is None:
-            return
-        navigation_state = navigation_backend.get_navigation_state()
-        if navigation_state.current_goal_id == goal.goal_id and navigation_state.status not in {
-            NavigationStatus.IDLE,
-            NavigationStatus.SUCCEEDED,
-            NavigationStatus.FAILED,
-            NavigationStatus.CANCELLED,
-        }:
-            navigation_backend.cancel_goal(request_id=goal.goal_id)
 
     @staticmethod
     def _clone_contract(value):

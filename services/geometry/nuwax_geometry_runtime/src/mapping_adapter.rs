@@ -1,34 +1,4 @@
-// Phase 6 (codex-round3 R3-4)：voxel_size / feed_pointcloud / accumulated_count
-// / cost_mapper_config / reset_accumulator / current_revision 是 Phase 3 mapping
-// adapter 对外 platform API 预留（SharedState.map / cloud_map 走 fetcher 而不
-// 直接调 FeedOnlyAccumulator.method），删了会破坏 Phase 4/5 调用面。
-#![allow(dead_code)]
-
-//! Phase 3: nuwax-mapping 接入 adapter。
-//!
-//! 目标:把 `nuwax-mapping::PointCloudAccumulator` / `OccupancyGrid` / `CostMapper`
-//! 接成本仓 `MapProvider`/occupancy/costmap/cloud_map 的真实数据源。
-//!
-//! ## 数据流
-//! 1. 订阅 `/odom` (odometry) + `/tf` (transform) + `/lidar/points` (point cloud)
-//! 2. 用 `MappingSession` 的有界滚动窗口累积点云
-//! 3. 用 `nuwax_mapping::PointCloudOccupancyBuilder` 把累积点云 + 当前 odom pose
-//!    生成 `OccupancyGrid`
-//! 4. 用 `nuwax_mapping::CostMapper` (nav2_default) 把 occupancy → costmap
-//! 5. 把 occupancy → costmap 推入 `SharedState.map` (`MapState` 字段复用)
-//!
-//! ## readiness 语义
-//! - `mapping_ready_poll()` 真实判定:`accumulator_has_data && lcm_backend_available`
-//!   之前 Phase 2 baseline 恒 `false`,本次实装后改 true (有数据时)
-//! - `readiness()` 暴露 odom_count / pointcloud_count / last_occupancy_revision
-//!   + `mapping_ready` 综合判定;参考 `00_最终执行方案.md` §5 Phase 7 任务 1。
-//!     缺 pointcloud (count==0) → mapping_ready=false,即便 odom_count > 0 也不算 ready。
-//!
-//! ## LCM typed channel 解析
-//! - 优先用 `channel_registry::resolve_channel` 解析 `/odom` `/tf`
-//!   `/lidar/points`;不重读 `std::env::var`
-//! - 该 adapter 是 `lcm_runtime.rs` 启动时调用的 `spawn_*` 之一,
-//!   接收的 channel 字符串由调用方决定,这里只在 missing 时回退到 default
+//! Geometry建图拥有方：接纳已解析帧，协调后端计算、规范地图提交与关闭。
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -37,18 +7,23 @@ use std::time::{Duration, Instant};
 use nalgebra::Point3;
 #[cfg(test)]
 use nuwax_mapping::cost_mapper::SimplePointCloud2;
+#[cfg(test)]
+use nuwax_mapping::cost_mapper::PointCloud2Like;
+#[cfg(test)]
 use nuwax_mapping::cost_mapper::{
-    CostMapperConfig, OccupancyConfig, PointCloud2Like,
+    CostMapperConfig, OccupancyConfig,
 };
 #[cfg(test)]
 use nuwax_mapping::pointclouds::occupancy::MappingError;
-use nuwax_mapping::{CostMapper, MappingSession, OccupancyGrid, PointCloudAccumulator};
+#[cfg(test)]
+use nuwax_mapping::CostMapper;
+use nuwax_mapping::{MappingSession, OccupancyGrid, PointCloudAccumulator};
 use nuwax_mapping::mapping_session::AdmittedFrameKey;
 use thiserror::Error;
 use tokio::sync::{broadcast, RwLock};
 use tracing::warn;
 
-#[allow(unused_imports)]
+#[cfg(test)]
 use nuwax_mapping::SessionStats as MappingSessionStats;
 
 use crate::lcm_runtime::{MapRevisionEvent, MapState, SharedState};
@@ -58,11 +33,13 @@ use crate::mapping_backend::{
     mapping_backend_process_exit_retains_thread_for_tests, MappingBackendRetirementTestGate,
     MappingBackendTestGate, MappingKernel,
 };
+#[cfg(test)]
+use crate::mapping_backend::MAPPING_CANDIDATE_INTERVAL_NS;
 use crate::mapping_backend::{
     MappingBackendCandidate, MappingBackendClient, MappingBackendCommitHandle,
     MappingBackendCompletion, MappingBackendComputeConfig, MappingBackendInput,
     MappingBackendJoinHandle, MappingBackendKind, MappingBackendSpec, MappingBackendWorker,
-    MappingComputeToken, MAPPING_CANDIDATE_INTERVAL_NS,
+    MappingComputeToken,
 };
 use crate::mapping_commit::{MappingCommitClock, OccupancyCommitReceipt};
 #[cfg(test)]
@@ -123,7 +100,7 @@ pub(crate) struct InitialFrameEstablishment {
     backend_kind: MappingBackendKind,
     backend_generation: u64,
     boot_nonce: u128,
-    map_frame_id: String,
+    #[cfg(test)] map_frame_id: String,
     current_occupancy_receipt: Option<OccupancyCommitReceipt>,
     prepared_transform: Option<MapOdomTransformSnapshot>,
 }
@@ -145,6 +122,7 @@ impl InitialFrameEstablishment {
         self.session_generation
     }
 
+    #[cfg(test)]
     pub(crate) fn map_frame_id(&self) -> &str {
         &self.map_frame_id
     }
@@ -288,6 +266,7 @@ fn normalize_yaw(yaw_radians: f64) -> f64 {
     (yaw_radians + std::f64::consts::PI).rem_euclid(two_pi) - std::f64::consts::PI
 }
 
+#[cfg(test)]
 struct BorrowedPointCloud<'a> {
     points: &'a [Point3<f64>],
     sensor_origin: Point3<f64>,
@@ -295,6 +274,7 @@ struct BorrowedPointCloud<'a> {
     timestamp: f64,
 }
 
+#[cfg(test)]
 impl PointCloud2Like for BorrowedPointCloud<'_> {
     fn points(&self) -> &[Point3<f64>] {
         self.points
@@ -321,16 +301,9 @@ impl PointCloud2Like for BorrowedPointCloud<'_> {
 ///
 /// 关键参数:
 /// - `resolution` —— occupancy 栅格分辨率 (m/cell);默认 0.05
-/// - `width_cells` / `height_cells` —— 栅格尺寸;默认 200×200 (10m × 10m)
-/// - `voxel_size` —— 体素降采样边长;默认 0.05,与 `pointcloud.rs::VOXEL_SIZE` 对齐
-/// - `origin_xy` —— 旧 fixed-bounds 兼容配置;production 使用点云四周 1 m auto bounds
 #[derive(Debug, Clone, Copy)]
 pub struct MappingAdapterConfig {
     pub resolution: f64,
-    pub width_cells: u32,
-    pub height_cells: u32,
-    pub origin_xy: (f64, f64),
-    pub voxel_size: f64,
     pub initial_safe_radius_meters: f32,
 }
 
@@ -338,21 +311,10 @@ impl MappingAdapterConfig {
     /// 从 env 探测,带 default。
     ///
     /// - `NUWAX_MAPPING_RESOLUTION` (默认 0.05)
-    /// - `NUWAX_MAPPING_WIDTH_CELLS` (默认 200)
-    /// - `NUWAX_MAPPING_HEIGHT_CELLS` (默认 200)
-    /// - `NUWAX_MAPPING_VOXEL_SIZE` (默认 0.05)
-    /// - `NUWAX_MAPPING_ORIGIN_X` / `NUWAX_MAPPING_ORIGIN_Y` (默认 -5 / -5)
     /// - `NUWAX_MAPPING_INITIAL_SAFE_RADIUS_METERS` (默认 0)
     pub fn from_env() -> Self {
         Self {
             resolution: parse_env_f64("NUWAX_MAPPING_RESOLUTION", 0.05),
-            width_cells: parse_env_u32("NUWAX_MAPPING_WIDTH_CELLS", 200),
-            height_cells: parse_env_u32("NUWAX_MAPPING_HEIGHT_CELLS", 200),
-            origin_xy: (
-                parse_env_f64("NUWAX_MAPPING_ORIGIN_X", -5.0),
-                parse_env_f64("NUWAX_MAPPING_ORIGIN_Y", -5.0),
-            ),
-            voxel_size: parse_env_f64("NUWAX_MAPPING_VOXEL_SIZE", 0.05),
             initial_safe_radius_meters: parse_env_nonnegative_f32(
                 "NUWAX_MAPPING_INITIAL_SAFE_RADIUS_METERS",
                 0.0,
@@ -376,12 +338,7 @@ fn parse_env_f64(key: &str, default: f64) -> f64 {
         .unwrap_or(default)
 }
 
-fn parse_env_u32(key: &str, default: u32) -> u32 {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.trim().parse::<u32>().ok())
-        .unwrap_or(default)
-}
+
 
 // ============================================================================
 // FeedOnlyAccumulator —— 本地实现 nuwax_mapping::PointCloudAccumulator trait
@@ -409,6 +366,7 @@ impl FeedOnlyAccumulator {
     pub fn new() -> Self {
         Self { points: Vec::new() }
     }
+    #[cfg(test)]
     /// 返回当前累积的点的克隆(用于 occupancy builder 输入)
     pub fn clone_points(&self) -> Vec<Point3<f64>> {
         self.points.clone()
@@ -526,8 +484,8 @@ pub(crate) struct RegisteredMapCloud {
 /// comes from the immutable registered cloud, never an arrival counter.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum MappingCloudSource {
-    Legacy,
-    SourceFencedCompatibility,
+    #[cfg(test)] Legacy,
+    #[cfg(test)] SourceFencedCompatibility,
     /// 已按采集姿态注册的辅助传感器，只参与地图，不构造LiDAR准入身份。
     Auxiliary,
     Canonical(AdmittedFrameKey),
@@ -702,8 +660,6 @@ pub(crate) struct CommittedMappingCandidate {
     pub(crate) event: Option<MapRevisionEvent>,
     pub(crate) session_generation: u64,
     pub(crate) source_timestamp_ns: u64,
-    pub(crate) backend_kind: MappingBackendKind,
-    pub(crate) backend_generation: u64,
     pub(crate) occupancy_receipt: Option<OccupancyCommitReceipt>,
 }
 
@@ -1315,7 +1271,7 @@ pub struct MappingAdapter {
     /// **W37 直持 `MappingSession`**:与上游 `nuwax_mapping::MappingSession`
     /// 完全对齐;`feed_*` 走 `&mut self`,`session_stats` 走 `&self`。
     pub(crate) session: MappingSession,
-    cost_mapper: CostMapper,
+    #[cfg(test)] cost_mapper: CostMapper,
     pub(crate) last_sensor_origin: [f64; 3],
     /// `has_data` 字段需要 `pub(crate)` 让 `lcm_runtime::spawn_mapping_feed_tasks`
     /// 在 feed 路径同步置 true;`mapping_ready_poll` 通过 `has_data()` 方法访问。
@@ -1394,11 +1350,13 @@ impl ForbiddenZoneRefresh {
 }
 
 impl MappingAdapter {
+    #[cfg(test)]
     /// 构造 adapter;配置从 env 探测,`CostMapper` 使用原版 occupancy selector。
     pub fn new(config: MappingAdapterConfig) -> Self {
         Self::new_with_frames(config, "map", "odom")
     }
 
+    #[cfg(test)]
     /// 构造带显式 frame 契约的 adapter。
     ///
     /// LCM owner 应把运行时 canonical map/odom frame 传入此入口，避免各层独立
@@ -1433,6 +1391,7 @@ impl MappingAdapter {
         )
     }
 
+    #[cfg(test)]
     /// Construct a production adapter backed by the process-exclusive durable
     /// map-revision allocator shared with the GoalEnvelope producer.
     pub(crate) fn new_with_frames_and_sequence_store(
@@ -1479,6 +1438,7 @@ impl MappingAdapter {
         odom_frame_id: impl Into<String>,
         sequence_store: Option<Arc<SequenceStateStore>>,
     ) -> Self {
+        #[cfg(test)]
         let cost_mapper = CostMapper::new(CostMapperConfig {
             config: OccupancyConfig {
                 initial_safe_radius_meters: config.initial_safe_radius_meters,
@@ -1530,7 +1490,7 @@ impl MappingAdapter {
             #[allow(deprecated)]
             accumulator: FeedOnlyAccumulator::new(),
             session,
-            cost_mapper,
+            #[cfg(test)] cost_mapper,
             last_sensor_origin: [0.0, 0.0, 0.0],
             has_data: false,
             revision: 0,
@@ -1842,6 +1802,7 @@ impl MappingAdapter {
         }
     }
 
+    #[cfg(test)]
     pub fn stop_session(
         &mut self,
         session_id: &str,
@@ -2232,11 +2193,13 @@ impl MappingAdapter {
         }
 
         let stats = match source {
+            #[cfg(test)]
             MappingCloudSource::Legacy => self.feed_pointcloud_session_impl(
                 points, odom_xy, point_step, received_at_ns, frame_id,
                 source_timestamp_ns, false, None,
             )?,
-            MappingCloudSource::SourceFencedCompatibility | MappingCloudSource::Auxiliary | MappingCloudSource::Canonical(_) => {
+            #[cfg(test)]
+            MappingCloudSource::SourceFencedCompatibility => {
                 let key = match source {
                     MappingCloudSource::Canonical(key) => Some(key),
                     _ => None,
@@ -2245,7 +2208,17 @@ impl MappingAdapter {
                     points, odom_xy, point_step, received_at_ns, frame_id,
                     source_timestamp_ns, false, key,
                 )?
-            }
+            },
+            MappingCloudSource::Auxiliary | MappingCloudSource::Canonical(_) => {
+                let key = match source {
+                    MappingCloudSource::Canonical(key) => Some(key),
+                    _ => None,
+                };
+                self.feed_pointcloud_session_after_source_fence_impl(
+                    points, odom_xy, point_step, received_at_ns, frame_id,
+                    source_timestamp_ns, false, key,
+                )?
+            },
         };
         if stats.accepted == 0 {
             return Ok(None);
@@ -2362,8 +2335,6 @@ impl MappingAdapter {
                 event: None,
                 session_generation: token.session_generation,
                 source_timestamp_ns: token.source_timestamp_ns,
-                backend_kind: self.mapping_backend.kind(),
-                backend_generation: token.backend_generation,
                 occupancy_receipt: None,
             }));
         };
@@ -2464,8 +2435,7 @@ impl MappingAdapter {
         Ok(CommittedMappingCandidate {
             token: token.clone(), resolution, accepted_map_points: candidate.accepted_points_map,
             event: Some(event), session_generation: token.session_generation,
-            source_timestamp_ns: token.source_timestamp_ns, backend_kind: candidate.backend_kind,
-            backend_generation: candidate.backend_generation, occupancy_receipt: Some(occupancy_receipt),
+            source_timestamp_ns: token.source_timestamp_ns,  occupancy_receipt: Some(occupancy_receipt),
         })
     }
 
@@ -2939,6 +2909,7 @@ impl MappingAdapter {
         Ok(Some(VirtualObstacleSource { raw, loaded }))
     }
 
+    #[cfg(test)]
     pub(crate) fn virtual_obstacles_snapshot(&self) -> Result<Option<MapState>, String> {
         Ok(self.virtual_obstacles_source()?.map(VirtualObstacleSource::rasterize))
     }
@@ -3049,6 +3020,7 @@ impl MappingAdapter {
         self.apply_forbidden_zone_refresh(loaded, state, map_revision_tx)
     }
 
+    #[cfg(test)]
     pub fn refresh_forbidden_zones(
         &mut self,
         state: &Arc<RwLock<SharedState>>,
@@ -3215,6 +3187,7 @@ impl MappingAdapter {
         })
     }
 
+    #[cfg(test)]
     /// 喂入一帧点云到 `MappingSession`(RALPLAN §Phase M #1 主入口)。
     ///
     /// 与 `feed_pointcloud` 的差异:
@@ -3369,6 +3342,7 @@ impl MappingAdapter {
         Ok(stats)
     }
 
+    #[cfg(test)]
     /// Feed a point cloud whose source identity has already been fenced by the
     /// generation owner. The adapter receipt clock drives session freshness,
     /// while canonical output metadata retains the exact source timestamp,
@@ -3422,6 +3396,7 @@ impl MappingAdapter {
         Ok(stats)
     }
 
+    #[cfg(test)]
     /// 更新 sensor_origin (odom pose 平移部分)。
     ///
     /// **W37** 同步更新 `session.last_pose`,让 session 的 `last_pose` 与
@@ -3431,6 +3406,7 @@ impl MappingAdapter {
         let _ = self.feed_pose_in_frame(x, y, z, 0.0, &odom_frame_id);
     }
 
+    #[cfg(test)]
     /// 接收带 frame/yaw 的 pose，并把 session sensor origin 统一转换到 map frame。
     ///
     /// - 首个 odom pose 固定 `T_map_odom = inverse(T_odom_base)`；后续不漂移锚点。
@@ -3568,7 +3544,7 @@ impl MappingAdapter {
                 backend_kind: self.mapping_backend.kind(),
                 backend_generation: self.backend_generation,
                 boot_nonce: self.commit_clock.boot_nonce(),
-                map_frame_id: self.map_frame_id.clone(),
+                #[cfg(test)] map_frame_id: self.map_frame_id.clone(),
                 current_occupancy_receipt: self.last_occupancy_commit_receipt.clone(),
                 prepared_transform: next_transform.clone(),
             };
@@ -3595,6 +3571,7 @@ impl MappingAdapter {
         Ok(map_pose)
     }
 
+    #[cfg(test)]
     /// session 快照(Phase M readiness 暴露)。
     pub fn session_stats(&self) -> MappingSessionStats {
         self.session.snapshot_stats()
@@ -3698,10 +3675,6 @@ impl MappingAdapter {
         self.frame_generation
     }
 
-    /// 当前 adapter 持有的 costmap 配置。
-    pub fn cost_mapper_config(&self) -> &CostMapperConfig {
-        self.cost_mapper.config()
-    }
 
     /// 把当前累积的点云 + sensor_origin 转换为 occupancy grid。
     ///
@@ -3754,6 +3727,7 @@ impl MappingAdapter {
         Ok((mapper, occupancy, latest_grid))
     }
 
+    #[cfg(test)]
     fn should_rebuild(&self) -> bool {
         let generation = self.session.generation();
         if generation == self.last_built_generation {
@@ -3997,6 +3971,7 @@ impl MappingAdapter {
         self.revision
     }
 
+    #[cfg(test)]
     /// 进程级最后提交 revision。仅用于跨会话 fencing/诊断，不投影为新会话当前地图。
     pub fn global_revision(&self) -> u64 {
         self.global_revision
@@ -4062,8 +4037,6 @@ impl MappingAdapter {
 pub struct MappingReadiness {
     /// 综合 ready(`global_consumer_ready && pointcloud_count > 0`)
     pub ready: bool,
-    /// 顶层 reason(中文 + 关键 blocker 标签)
-    pub reason: String,
     /// LCM backend 是否可用
     pub lcm_backend: bool,
     /// adapter 是否已构造
@@ -4158,16 +4131,8 @@ impl MappingReadiness {
                 && (pointcloud_count > 0 || checkpoint_ready)
                 && last_occupancy_revision > 0;
         }
-        let reason = if ready {
-            "mapping 已就绪".to_string()
-        } else {
-            last_error
-                .clone()
-                .unwrap_or_else(|| "mapping 未就绪".to_string())
-        };
         Self {
             ready,
-            reason,
             lcm_backend: lcm_backend_available,
             adapter_present,
             odom_count,
@@ -4181,6 +4146,7 @@ impl MappingReadiness {
     }
 }
 
+#[cfg(test)]
 fn merge_checkpoint_grid(
     checkpoint: &OccupancyGrid,
     live: &OccupancyGrid,
@@ -4268,6 +4234,7 @@ fn merge_checkpoint_grid(
     Ok(merged)
 }
 
+#[cfg(test)]
 /// nuwax-mapping CostMapper 输出的 u8 → MapState i8 转换。
 ///
 /// CostMapper 约定:
@@ -4308,10 +4275,6 @@ mod tests {
     fn sample_config() -> MappingAdapterConfig {
         MappingAdapterConfig {
             resolution: 0.1,
-            width_cells: 20,
-            height_cells: 20,
-            origin_xy: (-1.0, -1.0),
-            voxel_size: 0.1,
             initial_safe_radius_meters: 0.0,
         }
     }
@@ -5906,8 +5869,6 @@ mod tests {
         // 不污染环境;直接调 from_env,应走 default
         let cfg = MappingAdapterConfig::from_env();
         assert!(cfg.resolution > 0.0);
-        assert!(cfg.width_cells > 0);
-        assert!(cfg.height_cells > 0);
     }
 
     // ~~cost_mapper_config_is_nav2_default~~ —— W41 删除:

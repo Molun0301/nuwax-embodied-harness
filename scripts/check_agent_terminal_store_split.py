@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import core.agent_call_store as call_module
 from core.agent_call_store import AgentCallStore
+from tests.conftest import identity_call_store, insert_historical_scope_binding, create_isolated_gateway
 from core.errors import GatewayError
 from gateways.feedback import build_public_error_payload
 
@@ -172,7 +173,13 @@ class SplitFixture(unittest.TestCase):
         if identity:
             return AgentCallStore.for_identity(path or self.path, robot_identity=IDENTITY,
                                               artifact_dir=self.artifacts, gateway_instance_id=gateway)
-        return AgentCallStore(path or self.path, scope=scope, gateway_instance_id=gateway)
+        store = identity_call_store(path or self.path, identity_name=scope, gateway_instance_id=gateway)
+        # 仅给本脚本生成的旧行准备已存在的绑定；无此行时不添加别名。
+        with CONNECT(str(store.path)) as db:
+            exists = db.execute("SELECT 1 FROM agent_task_terminals WHERE scope=? LIMIT 1", (scope,)).fetchone()
+        if exists is not None:
+            insert_historical_scope_binding(store.path, legacy_scope=scope, owner_scope=store.scope)
+        return store
 
     def old(self, rows=None, *, identity=False):
         legacy_database(self.path, (legacy_row(),) if rows is None else rows)
@@ -200,9 +207,10 @@ class SplitFixture(unittest.TestCase):
         return store.save_terminal(task, snapshot(task, revision if value is None else value),
                                    source_id=source, revision=revision)
 
-    def bind(self, scope, *, identity=None):
-        return AgentCallStore.bind_verified_legacy_scope(self.path, legacy_scope=scope,
-                                                         robot_identity=identity or IDENTITY, artifact_dir=self.artifacts)
+    def seed_binding(self, scope):
+        owner = self.store(identity=True).scope
+        insert_historical_scope_binding(self.path, legacy_scope=scope, owner_scope=owner)
+        return owner
 
 
 class LayoutAndPairingChecks(SplitFixture):
@@ -268,23 +276,6 @@ class LayoutAndPairingChecks(SplitFixture):
         self.assertEqual(len({row[1]["terminal_path"] for row in results}), 1)
         self.assertEqual(sum(row[2] for row in results), 1)
 
-    def test_raw_token_reservation_blocks_assigned_collision_without_granting_binding(self):
-        raw = self.store(scope="scope_reserved")
-        self.save(raw, 8)
-        self.store(scope="scope_unused")
-        self.assertEqual(raw_rows(self.path), [])
-        self.assertEqual(raw_rows(target_path(self.path))[0][1], "scope_reserved")
-        self.assertEqual(AgentCallStore.list_legacy_scopes(self.path), ("scope_reserved",))
-        self.error("not_found", lambda: self.bind("scope_unused"))
-        with patch.object(call_module, "uuid4", side_effect=(SimpleNamespace(hex="reserved"),
-                                                            SimpleNamespace(hex="allocated"))):
-            assigned = self.store(identity=True)
-        self.assertEqual(assigned.scope, "scope_allocated")
-        self.error("agent_scope_binding_required", lambda: assigned.get_terminal("task"))
-        self.assertEqual(AgentCallStore.list_legacy_scopes(self.path), ("scope_reserved",))
-        with CONNECT(str(self.path)) as db:
-            self.assertIsNone(db.execute("SELECT owner_scope FROM agent_scope_bindings WHERE scope='scope_unused'").fetchone())
-            self.assertEqual(db.execute("SELECT COUNT(*) FROM agent_scope_owners").fetchone()[0], 1)
 
     def test_cutover_requires_quiescence_and_exact_ledger(self):
         self.old()
@@ -378,10 +369,9 @@ class LegacyMergeChecks(SplitFixture):
     def test_multiple_opaque_aliases_preserve_original_scope_and_gateway(self):
         rows = [legacy_row("a", "opaque-a"), legacy_row("b", "opaque-b")]
         store = self.old(rows, identity=True)
-        owner = self.bind("opaque-a")
-        self.assertEqual(self.bind("opaque-b"), owner)
-        self.assertEqual(self.bind("opaque-a"), owner)
-        self.error("agent_scope_binding_conflict", lambda: self.bind("opaque-a", identity=dict(IDENTITY, robot_id="two")))
+        owner = self.seed_binding("opaque-a")
+        self.assertEqual(self.seed_binding("opaque-b"), owner)
+        self.assertEqual(self.seed_binding("opaque-a"), owner)
         activate(self.path)
         for task in ("a", "b"):
             self.assertEqual(self.save(store, 9, task)["revision"], 9)
@@ -396,27 +386,11 @@ class LegacyMergeChecks(SplitFixture):
 
     def test_unbound_terminal_only_scope_stays_blocked(self):
         store = self.split([legacy_row(scope="opaque-unbound")], identity=True)
-        self.error("agent_scope_binding_required", lambda: store.get_terminal("task"))
-        self.error("agent_scope_binding_required", lambda: self.save(store, 9))
-        self.assertEqual(store.terminal_versions(["task"])["task"]["error_code"], "agent_scope_binding_required")
+        self.error("not_found", lambda: store.get_terminal("task"))
+        self.error("agent_terminal_scope_conflict", lambda: self.save(store, 9))
+        self.assertEqual(store.terminal_versions(["task"])["task"]["error_code"], "agent_terminal_scope_conflict")
         self.assertEqual(raw_rows(target_path(self.path)), [])
-        self.assertEqual(AgentCallStore.list_legacy_scopes(self.path), ("opaque-unbound",))
 
-    def test_split_terminal_only_raw_scope_can_be_discovered_and_explicitly_bound(self):
-        raw = self.store(scope="terminal-only-opaque")
-        self.save(raw, 8)
-        self.assertEqual(raw_rows(self.path), [])
-        self.assertEqual(AgentCallStore.list_legacy_scopes(self.path), ("terminal-only-opaque",))
-        registered = self.store(identity=True)
-        self.error("agent_scope_binding_required", lambda: registered.get_terminal("task"))
-        self.assertEqual(self.bind("terminal-only-opaque"), registered.scope)
-        self.assertEqual(self.bind("terminal-only-opaque"), registered.scope)
-        self.assertEqual(AgentCallStore.list_legacy_scopes(self.path), ())
-        self.assertEqual(registered.get_terminal("task")["snapshot"], snapshot())
-        self.assertEqual(self.save(registered, 9)["revision"], 9)
-        self.assertEqual(raw_rows(target_path(self.path))[0][1], "terminal-only-opaque")
-        self.error("agent_scope_binding_conflict", lambda: self.bind(
-            "terminal-only-opaque", identity=dict(IDENTITY, robot_id="wrong")))
 
     def test_concurrent_first_seed_reverse_revision_and_equal_content_services(self):
         self.split()
@@ -634,7 +608,7 @@ class IsolationAndAuthorityChecks(SplitFixture):
 
     def test_terminal_runtime_never_opens_intent_writer_or_holds_read_at_target_begin(self):
         store = self.old([legacy_row(scope="opaque")], identity=True)
-        self.bind("opaque")
+        self.seed_binding("opaque")
         activate(self.path)
         terminal = target_path(self.path)
         encoded = []
@@ -660,16 +634,18 @@ class IsolationAndAuthorityChecks(SplitFixture):
 
     def test_new_target_scope_race_rechecks_authority_outside_writer_and_finishes_bounded(self):
         store = self.old([legacy_row(scope="opaque")], identity=True)
-        self.bind("opaque")
+        self.seed_binding("opaque")
         activate(self.path)
-        alias = self.store(gateway="alias-first-writer", scope="opaque")
         injected = [False]
         starts = []
         def race(db):
             starts.append(1)
             if not injected[0]:
                 injected[0] = True
-                self.assertEqual(self.save(alias, 1, "new")["disposition"], "inserted")
+                row = list(legacy_row("new", "opaque", revision=1))
+                row[2] = "alias-first-writer"
+                with CONNECT(str(target_path(self.path))) as target:
+                    target.execute("INSERT INTO agent_task_terminals VALUES (?,?,?,?,?,?,?)", row)
         with observed_connections(self.path, target_path(self.path), before_begin=race,
                                   reject_intent_writes=True):
             self.assertEqual(self.save(store, 2, "new")["revision"], 2)
@@ -780,7 +756,7 @@ def child(operation, phase, folder):
     folder = Path(folder)
     path = folder / "agent_calls.sqlite3"
     if operation == "intent":
-        store = AgentCallStore(path, scope="scope", gateway_instance_id="original")
+        store = identity_call_store(path, identity_name='scope', gateway_instance_id='original')
         assert store.begin("request", "tool", "cap", {})[1]
         if phase == "after_begin":
             child_exit(folder, phase)
@@ -815,7 +791,7 @@ def child(operation, phase, folder):
         if timing == "after" and db.role == "terminal" and kind:
             commits["terminal"] += 1
     # Construct before instrumenting save, so constructor verification is not a candidate.
-    store = AgentCallStore(path, scope="scope", gateway_instance_id="writer") if operation == "save" else None
+    store = identity_call_store(path, identity_name='scope', gateway_instance_id='writer') if operation == "save" else None
     with observed_connections(path, terminal, before_commit=lambda db: point(db, "before"),
                               after_commit=lambda db: point(db, "after")):
         if operation == "cutover":

@@ -1459,18 +1459,6 @@ class MemoryRepository:
                     f"CREATE INDEX IF NOT EXISTS {index_name} ON {table_name}(library_name)"
                 )
 
-    def has_library_name_columns(self) -> bool:
-        """检测所有记忆表是否都已具备 library_name 列（用于轻量快路径就绪判定）。"""
-
-        with self._read_snapshot() as transaction:
-            for table_name in self._LIBRARY_NAME_TABLES:
-                columns = {
-                    str(row["name"])
-                    for row in transaction.execute(f"PRAGMA table_info({table_name})").fetchall()
-                }
-                if "library_name" not in columns:
-                    return False
-        return True
 
     def count_records_by_library(self) -> Dict[str, Dict[str, int]]:
         """按库聚合各记忆表的轻量计数（不反序列化 payload）。

@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+
 
 //! 占据栅格进程间共享映射。
 //!
@@ -9,11 +9,15 @@
 use std::io::{Error, ErrorKind};
 use std::sync::atomic::{fence, AtomicU64, Ordering};
 
-use memmap2::{Mmap, MmapMut};
+#[cfg(test)]
+use memmap2::Mmap;
+use memmap2::MmapMut;
 use tracing::info;
 
 use crate::lcm_runtime::MapRevisionEvent;
-use crate::mapping_commit::{MappingCommitId, OccupancyCommitReceipt};
+#[cfg(test)]
+use crate::mapping_commit::MappingCommitId;
+use crate::mapping_commit::OccupancyCommitReceipt;
 #[cfg(test)]
 use crate::lcm_runtime::MapState;
 use crate::pointcloud::{
@@ -667,34 +671,38 @@ impl OccupancyGridShmWriter {
         Ok(())
     }
 
-    pub fn shm_path(&self) -> &std::path::Path {
-        &self.shm_path
-    }
 
+    #[cfg(test)]
     pub fn layout_version(&self) -> u32 {
         OCCUPANCY_SHM_LAYOUT_VERSION
     }
 
+    #[cfg(test)]
     pub fn published_generation(&self) -> u64 {
         self.published_generation
     }
 
+    #[cfg(test)]
     pub fn active_slot(&self) -> Option<usize> {
         self.active_slot
     }
 
+    #[cfg(test)]
     pub fn last_revision(&self) -> u64 {
         self.last_revision
     }
 
+    #[cfg(test)]
     pub fn capacity(&self) -> usize {
         self.capacity
     }
 
+    #[cfg(test)]
     pub fn physical_write_count(&self) -> u64 {
         self.physical_write_count
     }
 
+    #[cfg(test)]
     pub(crate) fn session_generation(&self) -> u64 {
         self.session_generation
     }
@@ -705,6 +713,7 @@ impl OccupancyGridShmWriter {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct OccupancyGridShmSnapshot {
     pub layout_version: u32,
@@ -724,12 +733,14 @@ pub(crate) struct OccupancyGridShmSnapshot {
     pub data: Vec<i8>,
 }
 
+#[cfg(test)]
 /// Read-only helper that owns a separate mmap, matching another process' access pattern.
 pub(crate) struct OccupancyGridShmReader {
     file: std::fs::File,
     mmap: Mmap,
 }
 
+#[cfg(test)]
 impl OccupancyGridShmReader {
     pub(crate) fn open(path: &std::path::Path) -> std::io::Result<Self> {
         let file = std::fs::OpenOptions::new().read(true).open(path)?;
@@ -854,6 +865,7 @@ impl OccupancyGridShmReader {
     }
 }
 
+#[cfg(test)]
 struct SlotHeader {
     schema_version: u32,
     generation: u64,
@@ -870,6 +882,7 @@ struct SlotHeader {
     session_generation: u64,
 }
 
+#[cfg(test)]
 fn parse_slot_header(
     buf: &[u8],
     slot_offset: usize,
@@ -947,6 +960,7 @@ fn parse_slot_header(
     })
 }
 
+#[cfg(test)]
 fn validate_global_header(buf: &[u8]) -> std::io::Result<()> {
     if buf.len() < GLOBAL_HEADER_BYTES {
         return Err(Error::new(
@@ -1043,6 +1057,7 @@ fn encode_published_state(generation: u64, active_slot: usize) -> std::io::Resul
     Ok((generation << 1) | active_slot as u64)
 }
 
+#[cfg(test)]
 fn decode_published_state(state: u64) -> std::io::Result<(u64, usize)> {
     let generation = state >> 1;
     let slot = (state & 1) as usize;
@@ -1091,6 +1106,7 @@ fn atomic_store_u64(
     Ok(())
 }
 
+#[cfg(test)]
 fn atomic_load_u64(buf: &[u8], offset: usize, ordering: Ordering) -> std::io::Result<u64> {
     Ok(atomic_u64_at(buf, offset)?.load(ordering))
 }
@@ -1111,6 +1127,7 @@ fn write_f64(buf: &mut [u8], offset: usize, value: f64) {
     write_u64(buf, offset, value.to_bits());
 }
 
+#[cfg(test)]
 fn read_u32(buf: &[u8], offset: usize) -> std::io::Result<u32> {
     let bytes = buf
         .get(offset..offset + 4)
@@ -1120,6 +1137,7 @@ fn read_u32(buf: &[u8], offset: usize) -> std::io::Result<u32> {
     ))
 }
 
+#[cfg(test)]
 fn read_u64(buf: &[u8], offset: usize) -> std::io::Result<u64> {
     let bytes = buf
         .get(offset..offset + 8)
@@ -1129,10 +1147,12 @@ fn read_u64(buf: &[u8], offset: usize) -> std::io::Result<u64> {
     ))
 }
 
+#[cfg(test)]
 fn read_f32(buf: &[u8], offset: usize) -> std::io::Result<f32> {
     Ok(f32::from_bits(read_u32(buf, offset)?))
 }
 
+#[cfg(test)]
 fn read_f64(buf: &[u8], offset: usize) -> std::io::Result<f64> {
     Ok(f64::from_bits(read_u64(buf, offset)?))
 }

@@ -611,11 +611,4 @@ class ExplorationContext(TimestampedContract):
     current_request: Optional[ExploreAreaRequest] = Field(default=None, description="当前探索请求。")
     exploration_state: ExplorationState = Field(description="探索状态。")
     backend_name: Optional[str] = Field(default=None, description="探索后端名称。")
-    loop_closure_state: Optional[MetadataDict] = Field(
-        default=None,
-        description=(
-            "闭环判据状态快照（worker-C 填充）；典型字段 loop_closure_count / confidence / last_check_at。"
-            "闭环完成路径 ``mapping:loop_closed`` 依赖此字段。"
-        ),
-    )
     metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")

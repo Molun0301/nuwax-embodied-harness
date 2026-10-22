@@ -241,7 +241,6 @@ drivers/.active_robot.lock
 !/tests/test_dense_legacy_epoch.py
 !/tests/test_legacy_cloud_import.py
 !/tests/test_observation_photo_v18.py
-!/tests/test_offline_cli_identity_v4.py
 !/tests/test_perception_snapshot_v18.py
 !/tests/test_planar_asset_catalog.py
 !/tests/test_planar_catalog_evidence.py

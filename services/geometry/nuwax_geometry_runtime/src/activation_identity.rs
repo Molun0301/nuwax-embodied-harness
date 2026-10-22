@@ -1,7 +1,7 @@
 //! 激活 v2 的只读身份与目标准入基础；尚未接入默认激活路径。
 //!
 //! 身份由生产方分配，不能由内容推导。旧 v1 摘要及准入守卫保持独立。
-#![cfg_attr(not(test), allow(dead_code))]
+
 
 use std::sync::Arc;
 
@@ -228,6 +228,7 @@ impl CheckpointMemberIdentityV2 {
 
 /// 有限点的实际坐标范围；不添加地图物理尺寸上限。
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg(test)]
 pub(crate) struct CanonicalCloudBoundsV2 {
     pub(crate) min: [f32; 3],
     pub(crate) max: [f32; 3],
@@ -240,7 +241,7 @@ struct CanonicalCloudTargetDataV2 {
     point_count: u32,
     voxel_size: f32,
     payload_schema_version: u32,
-    bounds: CanonicalCloudBoundsV2,
+    #[cfg(test)] bounds: CanonicalCloudBoundsV2,
     xyz_f32_le: Vec<u8>,
 }
 
@@ -331,6 +332,7 @@ impl CanonicalCloudTargetV2 {
             expected_map_frame_id,
         )?;
 
+        #[cfg(test)]
         let mut bounds = CanonicalCloudBoundsV2 {
             min: [f32::INFINITY; 3],
             max: [f32::NEG_INFINITY; 3],
@@ -340,7 +342,7 @@ impl CanonicalCloudTargetV2 {
             .chunks_exact(CM_POINT_SIZE_BYTES)
             .enumerate()
         {
-            for (axis, coordinate) in point.chunks_exact(4).enumerate() {
+            for (_axis, coordinate) in point.chunks_exact(4).enumerate() {
                 let value = f32::from_le_bytes(
                     coordinate
                         .try_into()
@@ -349,8 +351,11 @@ impl CanonicalCloudTargetV2 {
                 if !value.is_finite() {
                     return Err(format!("immutable target point {index} is non-finite"));
                 }
-                bounds.min[axis] = bounds.min[axis].min(value);
-                bounds.max[axis] = bounds.max[axis].max(value);
+                #[cfg(test)]
+                {
+                    bounds.min[_axis] = bounds.min[_axis].min(value);
+                    bounds.max[_axis] = bounds.max[_axis].max(value);
+                }
             }
         }
         Ok(Self(Arc::new(CanonicalCloudTargetDataV2 {
@@ -359,7 +364,7 @@ impl CanonicalCloudTargetV2 {
             point_count: checkpoint.point_count,
             voxel_size: checkpoint.voxel_size,
             payload_schema_version: checkpoint.payload_schema_version,
-            bounds,
+            #[cfg(test)] bounds,
             xyz_f32_le: checkpoint.xyz_f32_le,
         })))
     }
@@ -376,9 +381,11 @@ impl CanonicalCloudTargetV2 {
     pub(crate) fn voxel_size(&self) -> f32 {
         self.0.voxel_size
     }
+    #[cfg(test)]
     pub(crate) fn payload_schema_version(&self) -> u32 {
         self.0.payload_schema_version
     }
+    #[cfg(test)]
     pub(crate) fn bounds(&self) -> CanonicalCloudBoundsV2 {
         self.0.bounds
     }
@@ -386,6 +393,7 @@ impl CanonicalCloudTargetV2 {
         &self.0.xyz_f32_le
     }
 
+    #[cfg(test)]
     /// 相同分配身份不能覆盖不同描述或字节；同一共享对象免除重复字节比较。
     pub(crate) fn validate_replay(&self, candidate: &Self) -> Result<(), String> {
         if self != candidate {

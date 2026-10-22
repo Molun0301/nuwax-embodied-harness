@@ -57,6 +57,7 @@ impl FineCloud {
     pub(super) fn latest_ground_indices(&self, source: &crate::lio_ingress::AdmittedRegisteredScan) -> Option<Arc<[u32]>> {
         self.latest_ground_source.as_ref().filter(|old| old.matches(source)).map(|_| self.latest_ground_indices.clone())
     }
+    #[cfg(test)]
     pub(super) fn latest_unclassified_scan(&self) -> Option<&crate::lio_ingress::AdmittedRegisteredScan> {
         self.latest_unclassified_scan.as_ref()
     }

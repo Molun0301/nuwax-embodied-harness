@@ -17,6 +17,7 @@ from tests.test_assigned_asset_storage import bundle_fixture, checkpoint_fixture
 from tests.conftest import dense_bytes, response_fixture
 
 from contracts.map_identity import AssetIdentityV2
+from contracts.geometry_runtime import PlatformGeometryConfig
 from services.geometry import checkpoint_payload, dense_cloud, geometry_runtime_provider, runtime
 from services.geometry.assigned_saved_cloud import AssignedSavedCloudHandle
 from services.geometry.checkpoint_payload import FrozenPayload
@@ -64,10 +65,8 @@ class AssignedSavedCloudTests(unittest.TestCase):
         self.provider._connected = True
         self.provider._stub = LoaderStub(response_fixture())
         self.provider._stub.owner = self.provider
-        self.runtime = object.__new__(runtime.PlatformGeometryRuntime)
-        self.runtime._runtime_state_lock = threading.RLock()
-        self.runtime._mapping_lifecycle_lock = threading.RLock()
-        self.runtime._provider_attach_lock = threading.RLock()
+        self.runtime = runtime.PlatformGeometryRuntime(config=PlatformGeometryConfig(),
+            catalog_root=str(self.root), robot=SimpleNamespace(providers=SimpleNamespace()))
         self.runtime._provider_attach_epoch = 2
         self.runtime._remote_provider = self.provider
         self.runtime._provider_attach_stopping = False
@@ -89,7 +88,7 @@ class AssignedSavedCloudTests(unittest.TestCase):
                              (checkpoint_payload, 'payload_digest')):
             self.stack.enter_context(patch.object(target, name, side_effect=AssertionError(name)))
         for name in ('_resolve_mapping_backend', '_configured_pcd_asset_candidates', '_is_usable_pcd_file',
-                     '_materialize_assigned_checkpoint_pcd_asset'):
+                     '_materialize_checkpoint_pcd_asset'):
             self.stack.enter_context(patch.object(self.runtime, name, side_effect=AssertionError(name)))
 
     def handle(self):
@@ -199,7 +198,8 @@ class AssignedSavedCloudTests(unittest.TestCase):
 
     def test_fence_missing_origin_and_stale_snapshot_never_fall_back(self):
         handle = self.handle()
-        self.runtime._map_asset_activation_fence = {'map_name': self.bundle.map_name}
+        self.runtime._map_asset_activation_fence = {'map_name': self.bundle.map_name,
+            'assigned_activation_request': self.runtime._map_activation_snapshot.activation_result['activation_receipt_v2'].to_dict()['request']}
         self.assertIsNone(self.handle())
         self.assertIsNone(self.runtime.get_saved_dense_cloud_source())
         self.assertFalse(self.runtime.get_live_pointcloud_map_asset_summary()['available'])
@@ -340,7 +340,8 @@ class AssignedSavedCloudTests(unittest.TestCase):
         source = AssignedSavedPointCloudMapSource(self.handle())
         original = FrozenPayload.view
         def view(payload, start=0, stop=None):
-            self.runtime._map_asset_activation_fence = {'map_name': self.bundle.map_name}
+            self.runtime._map_asset_activation_fence = {'map_name': self.bundle.map_name,
+            'assigned_activation_request': self.runtime._map_activation_snapshot.activation_result['activation_receipt_v2'].to_dict()['request']}
             return original(payload, start, stop)
         with patch.object(FrozenPayload, 'view', view), self.assertRaises(PointCloudMapSourceError):
             source.read()
@@ -403,46 +404,7 @@ class AssignedSavedCloudTests(unittest.TestCase):
             self.assertIsNone(source.read())
 
 
-class LegacySavedCloudTests(unittest.TestCase):
-    def test_legacy_dense_reuses_retained_alias_and_installation_generation(self):
-        payload = dense_bytes()
-        source = {'bundle_root': Path('/unused/legacy'), 'backend_kind': 'voxel',
-                  'manifest_sha256': 'f' * 64, 'frame_id': 'map', 'activation_generation': 7}
-        stored = SimpleNamespace(manifest_sha256='f' * 64, checkpoint=SimpleNamespace(dense_archive=payload))
-        cache = SavedDenseCloudCache()
-        self.addCleanup(cache.close)
-        with ExitStack() as guards:
-            for name in hashlib.algorithms_guaranteed | {'new', 'file_digest'}:
-                if hasattr(hashlib, name):
-                    guards.enter_context(patch.object(hashlib, name, side_effect=AssertionError('hash called')))
-            guards.enter_context(patch.object(checkpoint_payload, 'payload_digest', side_effect=AssertionError('digest called')))
-            load = guards.enter_context(patch.object(MappingBackendCheckpointStore, 'load', return_value=stored))
-            metadata, data = cache.read(source)
-            final, empty = cache.read(source, expected_epoch=metadata['epoch'], offset_points=2)
-            self.assertEqual(load.call_count, 1)
-            self.assertEqual(metadata['epoch'], 'saved-legacy:voxel:' + 'f' * 64 + ':7')
-            self.assertNotIn('assigned_source', metadata)
-            self.assertEqual(data, struct.pack('<ffffff', 1, 2, 3, 4, 5, 6))
-            self.assertEqual((final['point_count'], empty), (0, b''))
-            reinstalled = dict(source, activation_generation=8)
-            with self.assertRaisesRegex(RuntimeError, 'DENSE_CLOUD_SOURCE_CHANGED'):
-                cache.read(reinstalled, expected_epoch=metadata['epoch'])
-            current, unchanged = cache.read(reinstalled)
-            self.assertEqual(load.call_count, 2)
-            self.assertEqual(current['epoch'], 'saved-legacy:voxel:' + 'f' * 64 + ':8')
-            self.assertEqual(unchanged, data)
 
-    def test_legacy_switch_suppresses_equal_revision_and_advances_on_source_change(self):
-        switch = PointCloudMapSourceSwitch(None, None)
-        snapshot = PointCloudMapSnapshot(source='saved', source_epoch='legacy:one', revision='asset:one',
-            revision_ordinal=7, frame_id='map', source_timestamp_ns=11, point_count=1,
-            format='float32-xyz-le', xyz_bytes=struct.pack('<fff', 1, 2, 3), stream_generation=0, provenance={})
-        first = switch._accept(snapshot)
-        self.assertEqual(first.stream_generation, 1)
-        self.assertIsNone(first.assigned_source_owner)
-        self.assertIsNone(switch._accept(snapshot))
-        second = switch._accept(replace(snapshot, source_epoch='legacy:two'))
-        self.assertEqual(second.stream_generation, 2)
 
 
 class FrozenPayloadViewTests(unittest.TestCase):

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import heapq
+import json
 import math
 from pathlib import Path
 from typing import Callable, Iterable, Optional
@@ -27,7 +28,10 @@ class BuildingCatalog:
 
     @staticmethod
     def _read(path: Path) -> BuildingTopology:
-        return BuildingTopology.model_validate_json(read_record_text(path))
+        document = json.loads(read_record_text(path))
+        if not isinstance(document, dict) or type(document.get("schema_version")) is not int or document["schema_version"] != 2:
+            raise ValueError("旧楼层目录依赖已退役的摘要身份，请导入资产并重新登记楼层。")
+        return BuildingTopology.model_validate(document)
 
     def get(self, building_id: str) -> Optional[BuildingTopology]:
         path = self._path(building_id)
@@ -49,15 +53,15 @@ class BuildingCatalog:
         return tuple(values)
 
     def validate_floor_asset(self, floor: FloorRecord, *, require_finalized: bool = True) -> None:
-        if floor.asset_manifest_sha256 is None:
+        if floor.asset_identity is None:
             if require_finalized:
                 raise ValueError(f"楼层 {floor.display_name} 尚未保存完整图。")
             return
         asset = self.maps.get_map_asset(floor.map_name)
-        if asset is None or not asset.finalized or asset.asset_manifest_sha256 != floor.asset_manifest_sha256:
-            raise ValueError(f"楼层 {floor.display_name} 的地图目录或完整图摘要已改变。")
+        if asset is None or not asset.finalized or asset.identity_schema_version != 2 or asset.asset_identity != floor.asset_identity:
+            raise ValueError(f"楼层 {floor.display_name} 的地图目录或完整图身份已改变。")
         snapshot = self.assets.get_validated_map_asset_bundle_snapshot(
-            floor.map_name, expected_manifest_sha256=floor.asset_manifest_sha256
+            floor.map_name, expected_asset_identity=floor.asset_identity
         )
         if snapshot is None or snapshot.bundle.geometry_asset is None or snapshot.bundle.geometry_asset.metadata.get("target_kind") != "planar_graph":
             raise ValueError(f"楼层 {floor.display_name} 需要可恢复和定位的二维完整图。")
@@ -100,7 +104,7 @@ class BuildingCatalog:
             for connection in topology.connections:
                 if connection.connection_id in route:
                     used.update((connection.from_floor_id, connection.to_floor_id))
-            creating = target.asset_manifest_sha256 is None and allow_unmapped_target
+            creating = target.asset_identity is None and allow_unmapped_target
             for floor_id in used:
                 self.validate_floor_asset(floors[floor_id], require_finalized=not (creating and floor_id==target.floor_id))
             if creating:
@@ -110,7 +114,7 @@ class BuildingCatalog:
             return FloorNavigationRequest(
                 request_id=request_id, building_id=building_id, topology_revision=topology.revision,
                 source_floor_id=source.floor_id, target_floor_id=target.floor_id, target_map_name=target.map_name,
-                target_manifest_sha256=target.asset_manifest_sha256, create_target_map=creating, target_pose=target_pose,
+                target_asset_identity=target.asset_identity, create_target_map=creating, target_pose=target_pose,
                 route=route, timeout_sec=timeout_sec,
             )
 
@@ -119,7 +123,7 @@ class BuildingCatalog:
         if topology is None or topology.revision != request.topology_revision:
             raise ValueError("执行所绑定的建筑目录修订已改变。")
         target = next((f for f in topology.floors if f.floor_id == request.target_floor_id), None)
-        if target is None or target.map_name != request.target_map_name or target.asset_manifest_sha256 != request.target_manifest_sha256:
+        if target is None or target.map_name != request.target_map_name or target.asset_identity != request.target_asset_identity:
             raise ValueError("冻结的目标楼层或地图身份已改变。")
         return topology
 

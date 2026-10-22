@@ -40,10 +40,7 @@ mod self_cloud;
 mod lio_owner;
 mod native_lio_owner;
 mod native_input_delivery;
-// W41 (Bug #2 fix): `map_checksum` 模块是 W37 (RALPLAN §Phase M #3) 新增
-// 的 SHA-256 helper,供 `mapping_adapter::build_and_publish` 算 checksum
-// 并通过 `MapRevisionEvent.checksum` 广播;untracked 状态下 main.rs 漏
-// 声明,补回 `mod map_checksum;`。
+#[cfg(test)]
 mod map_checksum;
 mod mapping_adapter;
 mod slam2d_owner;
@@ -108,15 +105,6 @@ const PROCESS_STOP_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const MAPPING_CLOUD_STOP_TIMEOUT: Duration = Duration::from_secs(3);
 #[cfg(test)]
 const MAPPING_CLOUD_STOP_TIMEOUT: Duration = Duration::from_millis(250);
-const FINAL_OWNER_ATTEMPT_LIMIT: usize = 3;
-#[cfg(not(test))]
-const FINAL_OWNER_ATTEMPT_BACKOFF: Duration = Duration::from_millis(50);
-#[cfg(test)]
-const FINAL_OWNER_ATTEMPT_BACKOFF: Duration = Duration::from_millis(1);
-
-static GEOMETRY_RETAINED_EXIT_SELECTED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
 type GrpcServerResult = Result<Result<(), tonic::transport::Error>, tokio::task::JoinError>;
 
 #[cfg(unix)]
@@ -162,90 +150,9 @@ enum StartupHealth {
     ShutdownInProgress,
 }
 
-#[derive(Default)]
-struct FinalOwnerAttemptBudget {
-    attempts: usize,
-}
-
-impl FinalOwnerAttemptBudget {
-    fn next_attempt(&mut self) -> Option<usize> {
-        if self.attempts == FINAL_OWNER_ATTEMPT_LIMIT {
-            return None;
-        }
-        self.attempts += 1;
-        Some(self.attempts)
-    }
-
-    fn exhausted(&self) -> bool {
-        self.attempts == FINAL_OWNER_ATTEMPT_LIMIT
-    }
-}
-
-enum GeometryProcessExitRetention {
-    Production(Box<GeometryProductionOwner>),
-    MappingAndLio {
-        owner: Box<lio_owner::GeometryRuntimeOwner>,
-        ingress_gate: Arc<lio_ingress::LioIngressRoutingGate>,
-    },
-    StartupRollbackAndLio {
-        geometry: Box<lcm_runtime::GeometryRuntimeStartupRollbackOwner>,
-        lio: lio_owner::LioOwnerHandle,
-    },
-}
-
-#[cfg(not(test))]
-fn retain_geometry_owner_until_process_exit(retention: GeometryProcessExitRetention) {
-    GEOMETRY_RETAINED_EXIT_SELECTED.store(true, std::sync::atomic::Ordering::Release);
-    let _: &'static mut GeometryProcessExitRetention = Box::leak(Box::new(retention));
-}
-
-#[cfg(test)]
-fn geometry_process_exit_retention_for_tests(
-) -> &'static std::sync::Mutex<Vec<GeometryProcessExitRetention>> {
-    static RETAINED: std::sync::OnceLock<std::sync::Mutex<Vec<GeometryProcessExitRetention>>> =
-        std::sync::OnceLock::new();
-    RETAINED.get_or_init(|| std::sync::Mutex::new(Vec::new()))
-}
-
-#[cfg(test)]
-fn retain_geometry_owner_until_process_exit(retention: GeometryProcessExitRetention) {
-    geometry_process_exit_retention_for_tests()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .push(retention);
-    GEOMETRY_RETAINED_EXIT_SELECTED.store(true, std::sync::atomic::Ordering::Release);
-}
-
-#[cfg(test)]
-fn take_geometry_process_exit_retention_for_tests() -> GeometryProcessExitRetention {
-    geometry_process_exit_retention_for_tests()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .pop()
-        .expect("Geometry process-exit retention is populated")
-}
-
-#[cfg(test)]
-fn reset_geometry_retained_exit_after_test_settlement() {
-    assert!(
-        geometry_process_exit_retention_for_tests()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_empty(),
-        "retained-exit signal may reset only after all test retention is settled"
-    );
-    assert!(
-        GEOMETRY_RETAINED_EXIT_SELECTED.swap(false, std::sync::atomic::Ordering::AcqRel,),
-        "test settlement must clear a selected retained-exit signal"
-    );
-}
-
 fn finalize_geometry_runtime(runtime: tokio::runtime::Runtime, exit_code: ExitCode) -> ExitCode {
-    if GEOMETRY_RETAINED_EXIT_SELECTED.load(std::sync::atomic::Ordering::Acquire) {
-        runtime.shutdown_background();
-    } else {
-        drop(runtime);
-    }
+    // 拥有方已完成一次有界收尾；运行时不再等待未完成的阻塞任务。
+    runtime.shutdown_background();
     exit_code
 }
 
@@ -256,19 +163,15 @@ enum RuntimeTerminal {
     Correction(Result<(), String>),
     GeometryTasks(Result<(), String>),
     ProcessStopFailed,
-    ReplayPoison(String),
 }
 
 fn prefer_sticky_runtime_terminal(
     candidate: RuntimeTerminal,
     process_stop_failed: bool,
-    replay_poison: Option<String>,
     geometry_task_failure: Option<String>,
 ) -> RuntimeTerminal {
     if process_stop_failed {
         RuntimeTerminal::ProcessStopFailed
-    } else if let Some(detail) = replay_poison {
-        RuntimeTerminal::ReplayPoison(detail)
     } else if let Some(error) = geometry_task_failure {
         RuntimeTerminal::GeometryTasks(Err(error))
     } else {
@@ -663,7 +566,6 @@ struct GeometryProductionOwner {
     correction: Option<correction_coordinator::CorrectionTransportOwner>,
     ingress_gate: Arc<lio_ingress::LioIngressRoutingGate>,
     correction_phase_a: correction_coordinator::CorrectionPhaseAControl,
-    deferred_replay: Option<Arc<lio_ingress::NativeDeferredReplayControl>>,
     mapping_cloud_owner: Option<Arc<nuwax_mapping_cloud::MappingCloudOwner>>,
     shutdown_events: Option<lio_owner::GeometryShutdownEventEmitter>,
     geometry_task_settlement: Option<lcm_runtime::GeometryTaskSettlement>,
@@ -672,9 +574,7 @@ struct GeometryProductionOwner {
     correction_failure: Option<String>,
     correction_settled_emitted: bool,
     #[cfg(test)]
-    replay_poison_for_terminal_tests: Option<String>,
-    #[cfg(test)]
-    shutdown_attempts_for_tests: usize,
+    shutdown_attempts_for_tests: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 struct GeometryProductionShutdownFailure {
@@ -713,6 +613,7 @@ impl GeometryProductionShutdownFailure {
         }
     }
 
+    #[cfg(test)]
     fn into_pending_owner(self) -> Option<Box<GeometryProductionOwner>> {
         self.pending_owner
     }
@@ -724,14 +625,12 @@ impl GeometryProductionOwner {
         correction: correction_coordinator::CorrectionTransportOwner,
         ingress_gate: Arc<lio_ingress::LioIngressRoutingGate>,
         correction_phase_a: correction_coordinator::CorrectionPhaseAControl,
-        deferred_replay: Option<Arc<lio_ingress::NativeDeferredReplayControl>>,
     ) -> Self {
         Self {
             runtime,
             correction: Some(correction),
             ingress_gate,
             correction_phase_a,
-            deferred_replay,
             mapping_cloud_owner: None,
             shutdown_events: None,
             geometry_task_settlement: None,
@@ -740,9 +639,7 @@ impl GeometryProductionOwner {
             correction_failure: None,
             correction_settled_emitted: false,
             #[cfg(test)]
-            replay_poison_for_terminal_tests: None,
-            #[cfg(test)]
-            shutdown_attempts_for_tests: 0,
+            shutdown_attempts_for_tests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -765,9 +662,6 @@ impl GeometryProductionOwner {
 
     fn close_ingress(&self) {
         self.runtime.close_task_admission();
-        if let Some(deferred_replay) = &self.deferred_replay {
-            deferred_replay.begin_phase_a();
-        }
         lio_owner::LioIngressSink::close(self.ingress_gate.as_ref());
         self.correction_phase_a.begin();
     }
@@ -806,26 +700,14 @@ impl GeometryProductionOwner {
             .correction
             .as_mut()
             .expect("running Geometry production owner retains Correction owner");
-        match &self.deferred_replay {
-            Some(deferred_replay) => tokio::select! {
-                biased;
-                () = self.correction_phase_a.wait_process_stop_failed() => RuntimeTerminal::ProcessStopFailed,
-                detail = deferred_replay.wait_poison() => RuntimeTerminal::ReplayPoison(detail),
-                owned = self.runtime.wait_terminal() => match owned {
-                    lio_owner::GeometryOwnedTerminal::Tasks(result) => RuntimeTerminal::GeometryTasks(result),
-                    lio_owner::GeometryOwnedTerminal::Lio(result) => RuntimeTerminal::Lio(result),
-                },
-                result = correction.wait_terminal() => RuntimeTerminal::Correction(result),
+        tokio::select! {
+            biased;
+            () = self.correction_phase_a.wait_process_stop_failed() => RuntimeTerminal::ProcessStopFailed,
+            owned = self.runtime.wait_terminal() => match owned {
+                lio_owner::GeometryOwnedTerminal::Tasks(result) => RuntimeTerminal::GeometryTasks(result),
+                lio_owner::GeometryOwnedTerminal::Lio(result) => RuntimeTerminal::Lio(result),
             },
-            None => tokio::select! {
-                biased;
-                () = self.correction_phase_a.wait_process_stop_failed() => RuntimeTerminal::ProcessStopFailed,
-                owned = self.runtime.wait_terminal() => match owned {
-                    lio_owner::GeometryOwnedTerminal::Tasks(result) => RuntimeTerminal::GeometryTasks(result),
-                    lio_owner::GeometryOwnedTerminal::Lio(result) => RuntimeTerminal::Lio(result),
-                },
-                result = correction.wait_terminal() => RuntimeTerminal::Correction(result),
-            },
+            result = correction.wait_terminal() => RuntimeTerminal::Correction(result),
         }
     }
 
@@ -833,7 +715,6 @@ impl GeometryProductionOwner {
         prefer_sticky_runtime_terminal(
             candidate,
             self.correction_phase_a.process_stop_failed(),
-            self.replay_poison_detail(),
             self.runtime.geometry_completed_failure(),
         )
     }
@@ -841,8 +722,6 @@ impl GeometryProductionOwner {
     fn completed_failure_terminal(&self) -> Option<RuntimeTerminal> {
         if self.correction_phase_a.process_stop_failed() {
             Some(RuntimeTerminal::ProcessStopFailed)
-        } else if let Some(detail) = self.replay_poison_detail() {
-            Some(RuntimeTerminal::ReplayPoison(detail))
         } else {
             self.runtime
                 .geometry_completed_failure()
@@ -850,25 +729,10 @@ impl GeometryProductionOwner {
         }
     }
 
-    fn replay_poison_detail(&self) -> Option<String> {
-        let detail = self
-            .deferred_replay
-            .as_ref()
-            .and_then(|replay| replay.poison_detail());
-        #[cfg(test)]
-        let detail = detail.or_else(|| self.replay_poison_for_terminal_tests.clone());
-        detail
-    }
-
-    #[cfg(test)]
-    fn inject_replay_poison_for_terminal_tests(&mut self, detail: impl Into<String>) {
-        self.replay_poison_for_terminal_tests = Some(detail.into());
-    }
-
     async fn shutdown(mut self) -> Result<(), GeometryProductionShutdownFailure> {
         #[cfg(test)]
         {
-            self.shutdown_attempts_for_tests += 1;
+            self.shutdown_attempts_for_tests.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         }
         self.close_ingress();
         if let Some(mapping_cloud_owner) = &self.mapping_cloud_owner {
@@ -996,82 +860,31 @@ impl GeometryProductionOwner {
 }
 
 async fn shutdown_runtime_owner(
-    mut owner: GeometryProductionOwner,
+    owner: GeometryProductionOwner,
     intended_exit: ExitCode,
 ) -> ExitCode {
-    let mut observed_pending = false;
-    let mut budget = FinalOwnerAttemptBudget::default();
-    while let Some(attempt) = budget.next_attempt() {
-        match owner.shutdown().await {
-            Ok(()) if observed_pending => return ExitCode::from(7),
-            Ok(()) => return intended_exit,
-            Err(error) => {
-                let detail = error.to_string();
-                let Some(pending_owner) = error.into_pending_owner() else {
-                    error!("Geometry production owner shutdown 失败: {}", detail);
-                    return ExitCode::from(7);
-                };
-                observed_pending = true;
-                error!(
-                    attempt,
-                    attempt_limit = FINAL_OWNER_ATTEMPT_LIMIT,
-                    "Geometry production owner shutdown 未完成，保留同一 owner: {}",
-                    detail,
-                );
-                if budget.exhausted() {
-                    retain_geometry_owner_until_process_exit(
-                        GeometryProcessExitRetention::Production(pending_owner),
-                    );
-                    return ExitCode::from(7);
-                }
-                owner = *pending_owner;
-                tokio::time::sleep(FINAL_OWNER_ATTEMPT_BACKOFF).await;
-            }
+    match owner.shutdown().await {
+        Ok(()) => intended_exit,
+        Err(error) => {
+            error!("Geometry production owner shutdown 未完成或失败: {}", error);
+            ExitCode::from(7)
         }
     }
-    unreachable!("final-owner attempt budget is checked after every pending result")
 }
 
 async fn rollback_mapping_and_lio(
-    mut owner: lio_owner::GeometryRuntimeOwner,
+    owner: lio_owner::GeometryRuntimeOwner,
     ingress_gate: Arc<lio_ingress::LioIngressRoutingGate>,
     intended_exit: ExitCode,
 ) -> ExitCode {
     lio_owner::LioIngressSink::close(ingress_gate.as_ref());
-    let mut observed_pending = false;
-    let mut budget = FinalOwnerAttemptBudget::default();
-    while let Some(attempt) = budget.next_attempt() {
-        match owner.shutdown().await {
-            Ok(()) if observed_pending => return ExitCode::from(7),
-            Ok(()) => return intended_exit,
-            Err(error) => {
-                let detail = error.to_string();
-                let Some(pending_owner) = error.into_pending_owner() else {
-                    error!("Geometry Mapping/LIO rollback 失败: {}", detail);
-                    return ExitCode::from(7);
-                };
-                observed_pending = true;
-                error!(
-                    attempt,
-                    attempt_limit = FINAL_OWNER_ATTEMPT_LIMIT,
-                    "Geometry Mapping/LIO rollback 未 settled，保留同一 owner: {}",
-                    detail,
-                );
-                if budget.exhausted() {
-                    retain_geometry_owner_until_process_exit(
-                        GeometryProcessExitRetention::MappingAndLio {
-                            owner: pending_owner,
-                            ingress_gate,
-                        },
-                    );
-                    return ExitCode::from(7);
-                }
-                owner = *pending_owner;
-                tokio::time::sleep(FINAL_OWNER_ATTEMPT_BACKOFF).await;
-            }
+    match owner.shutdown().await {
+        Ok(()) => intended_exit,
+        Err(error) => {
+            error!("Geometry Mapping/LIO rollback 未完成或失败: {}", error);
+            ExitCode::from(7)
         }
     }
-    unreachable!("final-owner attempt budget is checked after every pending result")
 }
 
 async fn rollback_geometry_startup_and_lio(
@@ -1083,36 +896,12 @@ async fn rollback_geometry_startup_and_lio(
     error!(event = "process.failed", "{error}");
     let mut rollback_failed = false;
     if let Some(rollback_owner) = rollback_owner {
-        let mut rollback_owner = *rollback_owner;
-        let mut budget = FinalOwnerAttemptBudget::default();
-        while let Some(attempt) = budget.next_attempt() {
-            match rollback_owner.shutdown().await {
-                Ok(()) => break,
-                Err(rollback_error) => {
-                    rollback_failed = true;
-                    let detail = rollback_error.to_string();
-                    let Some(pending_owner) = rollback_error.into_pending_owner() else {
-                        error!("Geometry startup task final join 失败: {}", detail);
-                        break;
-                    };
-                    error!(
-                        attempt,
-                        attempt_limit = FINAL_OWNER_ATTEMPT_LIMIT,
-                        "Geometry startup task final join 未完成，保留同一 owner: {}",
-                        detail,
-                    );
-                    if budget.exhausted() {
-                        retain_geometry_owner_until_process_exit(
-                            GeometryProcessExitRetention::StartupRollbackAndLio {
-                                geometry: pending_owner,
-                                lio,
-                            },
-                        );
-                        return ExitCode::from(7);
-                    }
-                    rollback_owner = *pending_owner;
-                    tokio::time::sleep(FINAL_OWNER_ATTEMPT_BACKOFF).await;
-                }
+        if let Err(rollback_error) = rollback_owner.shutdown().await {
+            rollback_failed = true;
+            error!("Geometry startup task final join 未完成或失败: {}", rollback_error);
+            if rollback_error.into_pending_owner().is_some() {
+                // 上游任务尚未排空，不能把后续资源收尾记录为完成。
+                return ExitCode::from(7);
             }
         }
     }
@@ -1353,11 +1142,6 @@ async fn runtime_terminal_exit_code(
         }
         RuntimeTerminal::ProcessStopFailed => {
             error!("Geometry Process Stop 在 tonic response drain 前失败或被取消");
-            force_grpc_server_shutdown(server_task, shutdown).await;
-            ExitCode::from(7)
-        }
-        RuntimeTerminal::ReplayPoison(detail) => {
-            error!(detail, "Geometry deferred LIO replay poisoned");
             force_grpc_server_shutdown(server_task, shutdown).await;
             ExitCode::from(7)
         }
@@ -1905,7 +1689,6 @@ async fn run(lcm_backend: lcm_runtime::LcmBackendKind, preflight: StartupPreflig
                     correction_owner,
                     ingress_gate,
                     correction_phase_a,
-                    None,
                 ),
                 ExitCode::from(4),
             )
@@ -1924,20 +1707,17 @@ async fn run(lcm_backend: lcm_runtime::LcmBackendKind, preflight: StartupPreflig
                 correction_owner,
                 ingress_gate,
                 correction_phase_a,
-                None,
             ),
             ExitCode::from(4),
         )
         .await;
     }
     }
-    let deferred_replay = None;
     let mut runtime_owner = GeometryProductionOwner::new(
         runtime_owner,
         correction_owner,
         ingress_gate.clone(),
         correction_phase_a.clone(),
-        deferred_replay.clone(),
     )
     .with_shutdown_events(lio_owner::GeometryShutdownEventEmitter::new(
         runtime_generation as u64,
@@ -1965,7 +1745,6 @@ async fn run(lcm_backend: lcm_runtime::LcmBackendKind, preflight: StartupPreflig
     let (shutdown, shutdown_listener) = server::production_shutdown_channel_with_task_control(
         ingress_gate,
         correction_phase_a,
-        deferred_replay.clone(),
         geometry_task_control,
     );
     let rpc_context = match bridge.transport.shared_lcm_context() {
@@ -2240,8 +2019,6 @@ pub(crate) mod lifecycle_tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    static PROCESS_EXIT_RETENTION_TEST_LOCK: tokio::sync::Mutex<()> =
-        tokio::sync::Mutex::const_new(());
 
     struct LifecycleCorrectionSink {
         block_stop: bool,
@@ -2718,7 +2495,6 @@ pub(crate) mod lifecycle_tests {
         let (shutdown, shutdown_listener) = server::production_shutdown_channel_with_task_control(
             ingress_gate.clone(),
             correction_phase_a.clone(),
-            None,
             handle
                 .task_control()
                 .expect("lifecycle fixture owns Geometry task admission"),
@@ -2731,7 +2507,6 @@ pub(crate) mod lifecycle_tests {
             correction_owner,
             ingress_gate.clone(),
             correction_phase_a,
-            None,
         )
         .with_shutdown_events(shutdown_emitter);
 
@@ -3035,23 +2810,13 @@ pub(crate) mod lifecycle_tests {
         let geometry = prefer_sticky_runtime_terminal(
             RuntimeTerminal::Grpc(Ok(Ok(()))),
             false,
-            None,
             Some("Geometry task failed".to_owned()),
         );
         assert!(matches!(geometry, RuntimeTerminal::GeometryTasks(Err(_))));
 
-        let replay = prefer_sticky_runtime_terminal(
-            RuntimeTerminal::Grpc(Ok(Ok(()))),
-            false,
-            Some("deferred replay poisoned".to_owned()),
-            Some("Geometry task failed".to_owned()),
-        );
-        assert!(matches!(replay, RuntimeTerminal::ReplayPoison(_)));
-
         let process_stop = prefer_sticky_runtime_terminal(
             RuntimeTerminal::Grpc(Ok(Ok(()))),
             true,
-            Some("deferred replay poisoned".to_owned()),
             Some("Geometry task failed".to_owned()),
         );
         assert!(matches!(process_stop, RuntimeTerminal::ProcessStopFailed));
@@ -3167,23 +2932,6 @@ pub(crate) mod lifecycle_tests {
             startup_terminal,
             RuntimeTerminal::GeometryTasks(Err(_))
         ));
-
-        priority
-            .owner
-            .as_mut()
-            .expect("ready priority owner remains available")
-            .inject_replay_poison_for_terminal_tests("deferred replay poisoned");
-        let ready_terminal = completed_runtime_terminal(
-            &mut simultaneous_clean_server,
-            &priority_video,
-            priority
-                .owner
-                .as_mut()
-                .expect("ready priority owner remains available"),
-        )
-        .await
-        .expect("ready-before-publication sticky probe");
-        assert!(matches!(ready_terminal, RuntimeTerminal::ReplayPoison(_)));
 
         let priority_shutdown = priority.shutdown_coordinator();
         drop(
@@ -3325,7 +3073,7 @@ pub(crate) mod lifecycle_tests {
         let lio_sink = Arc::new(LifecycleLioSink::new(correction.ingress(), false));
         let lio_gate = Arc::new(lio_ingress::LioIngressRoutingGate::new(lio_sink));
         let (shutdown, _listener) =
-            server::production_shutdown_channel(lio_gate, correction_phase_a, None);
+            server::production_shutdown_channel(lio_gate, correction_phase_a);
         let stop_attempt = shutdown
             .begin_process_stop_phase_a()
             .expect("production correction Stop attempt");
@@ -3453,7 +3201,7 @@ pub(crate) mod lifecycle_tests {
         let probe = Arc::new(PreCorrectionLioSink::new(false));
         let lio_gate = Arc::new(lio_ingress::LioIngressRoutingGate::new(probe));
         let (shutdown, listener) =
-            server::production_shutdown_channel(lio_gate, phase_a.clone(), None);
+            server::production_shutdown_channel(lio_gate, phase_a.clone());
         drop(listener);
         shutdown
             .request_and_wait_for_listener()
@@ -3466,7 +3214,6 @@ pub(crate) mod lifecycle_tests {
         let selected = prefer_sticky_runtime_terminal(
             RuntimeTerminal::Correction(Ok(())),
             phase_a.process_stop_failed(),
-            None,
             None,
         );
         assert!(matches!(selected, RuntimeTerminal::Correction(Ok(()))));
@@ -3845,369 +3592,142 @@ pub(crate) mod lifecycle_tests {
         fixture.assert_shutdown_complete();
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn shutdown_runtime_owner_exhausts_budget_and_retains_complete_root_until_mapping_settles(
-    ) {
-        let _retention_guard = PROCESS_EXIT_RETENTION_TEST_LOCK.lock().await;
-        assert!(
-            geometry_process_exit_retention_for_tests()
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_empty(),
-            "production retention test must start without retained-owner residue"
-        );
-        let mut fixture =
-            lifecycle_production_fixture(60, "shutdown-budget-retention", false).await;
-        let retirement_gate = mapping_backend::MappingBackendRetirementTestGate::blocked();
-        fixture
-            .mapping
-            .lock()
-            .replace_worker_with_retirement_test_gate(retirement_gate.clone())
-            .expect("install blocked Mapping retirement worker");
-
-        let exit = shutdown_runtime_owner(fixture.take_owner(), ExitCode::SUCCESS).await;
-        assert_eq!(exit, ExitCode::from(7));
-        assert!(retirement_gate.entered());
-        assert_eq!(
-            fixture.mapping.lock().backend_owner_state_for_tests(),
-            (false, true),
-            "budget exhaustion must retain the unjoined Mapping worker"
-        );
-        assert!(
-            !fixture.lio_shutdown.is_shutdown_requested(),
-            "pending Mapping retirement must withhold LIO teardown"
-        );
-        assert!(fixture.cloud_path.exists());
-        assert!(fixture.occupancy_path.exists());
-        assert_eq!(
-            fixture.shutdown_stages(),
-            vec![
-                lio_owner::GeometryShutdownStage::GeometryTasksSettled,
-                lio_owner::GeometryShutdownStage::CorrectionSettled,
-            ]
-        );
-        assert_eq!(
-            geometry_process_exit_retention_for_tests()
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .len(),
-            1,
-            "the complete pending root must remain owned by process-exit retention"
-        );
-
-        let retained_exit_runtime =
-            tokio::runtime::Runtime::new().expect("retained-exit finalizer test runtime");
-        let (blocking_entered_tx, blocking_entered_rx) = tokio::sync::oneshot::channel();
-        let (blocking_release_tx, blocking_release_rx) = std::sync::mpsc::channel();
-        let blocking_completed = Arc::new(AtomicBool::new(false));
-        let task_completed = blocking_completed.clone();
-        let blocking_task = retained_exit_runtime.spawn_blocking(move || {
-            let _ = blocking_entered_tx.send(());
-            blocking_release_rx
-                .recv()
-                .expect("release retained-exit blocking task");
-            task_completed.store(true, Ordering::Release);
-        });
-        tokio::time::timeout(Duration::from_secs(1), blocking_entered_rx)
-            .await
-            .expect("retained-exit blocking task entry deadline")
-            .expect("retained-exit blocking task entry signal");
-
-        let (finalizer_tx, finalizer_rx) = tokio::sync::oneshot::channel();
-        let finalizer_thread = std::thread::spawn(move || {
-            let exit = finalize_geometry_runtime(retained_exit_runtime, ExitCode::from(7));
-            let _ = finalizer_tx.send(exit);
-        });
-        let finalizer_result = tokio::time::timeout(Duration::from_secs(1), finalizer_rx).await;
-        assert!(
-            !blocking_completed.load(Ordering::Acquire),
-            "blocking task must remain unreleased when retained-exit finalizer returns"
-        );
-        blocking_release_tx
-            .send(())
-            .expect("release retained-exit blocking task after finalizer probe");
-        tokio::time::timeout(Duration::from_secs(1), blocking_task)
-            .await
-            .expect("retained-exit blocking task completion deadline")
-            .expect("retained-exit blocking task join");
-        assert!(blocking_completed.load(Ordering::Acquire));
-        finalizer_thread
-            .join()
-            .expect("retained-exit finalizer thread");
-        assert_eq!(
-            finalizer_result
-                .expect("retained-exit finalizer must return before task release")
-                .expect("retained-exit finalizer result signal"),
-            ExitCode::from(7)
-        );
-        assert!(GEOMETRY_RETAINED_EXIT_SELECTED.load(Ordering::Acquire));
-
-        let pending_owner = match take_geometry_process_exit_retention_for_tests() {
-            GeometryProcessExitRetention::Production(owner) => owner,
-            GeometryProcessExitRetention::MappingAndLio { .. } => {
-                panic!("top-level production shutdown retained only a Mapping/LIO owner")
-            }
-            GeometryProcessExitRetention::StartupRollbackAndLio { .. } => {
-                panic!("top-level production shutdown retained a startup rollback owner")
-            }
-        };
-        assert_eq!(
-            pending_owner.shutdown_attempts_for_tests, FINAL_OWNER_ATTEMPT_LIMIT,
-            "top-level shutdown must exhaust the complete final-owner attempt budget"
-        );
-        retirement_gate.release();
-        pending_owner
-            .shutdown()
-            .await
-            .expect("released retained root settles Mapping, LIO, and product resources");
-
-        assert_eq!(
-            fixture.mapping.lock().backend_owner_state_for_tests(),
-            (false, false),
-            "released Mapping worker must be joined and precisely retired"
-        );
-        fixture.assert_shutdown_complete();
-        assert!(
-            geometry_process_exit_retention_for_tests()
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_empty(),
-            "test retrieval must leave no retained-owner residue"
-        );
-        reset_geometry_retained_exit_after_test_settlement();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn rollback_mapping_and_lio_exhausts_budget_and_retains_bare_owner_until_mapping_settles()
-    {
-        let _retention_guard = PROCESS_EXIT_RETENTION_TEST_LOCK.lock().await;
-        assert!(
-            geometry_process_exit_retention_for_tests()
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_empty(),
-            "bare rollback retention test must start without retained-owner residue"
-        );
-
-        let setup = lcm_runtime::ProductionTopologyTestSetup::prepare(|_| {}).await;
-        let product_paths = setup.product_paths();
-        let lio_probe = Arc::new(PreCorrectionLioSink::new(false));
-        let ingress_gate = Arc::new(lio_ingress::LioIngressRoutingGate::new(lio_probe.clone()));
-        let lio = lio_owner::LioOwnerHandle::start(
-            setup.transport(),
-            lifecycle_lio_spec("mapping-lio-budget-retention"),
-            62,
-            ingress_gate.clone(),
-        )
-        .await
-        .expect("LIO READY before bare Mapping/LIO rollback fixture");
-        assert!(!lio_probe.ready_seen.load(Ordering::Acquire));
-        let lio_shutdown = lio.shutdown_control_for_tests();
-        let mut topology = match setup.spawn().await {
-            Ok(topology) => topology,
-            Err(mut failure) => {
-                let detail = failure.take_failure().to_string();
-                lio.shutdown()
-                    .await
-                    .expect("unexpected Geometry startup failure still settles LIO");
-                panic!("bare Mapping/LIO topology startup failed: {detail}")
-            }
-        };
-        assert!(product_paths.0.exists());
-        assert!(product_paths.1.exists());
-        let spawned = topology.take_spawned();
-        let mapping = spawned
-            .handle
-            .mapping_adapter
-            .as_ref()
-            .expect("production Mapping adapter")
-            .clone();
-        mapping
-            .lock()
-            .start_session("mapping-lio-budget-session", "mapping-lio-budget-map")
-            .expect("start Mapping before bare rollback");
-        let retirement_gate = mapping_backend::MappingBackendRetirementTestGate::blocked();
-        mapping
-            .lock()
-            .replace_worker_with_retirement_test_gate(retirement_gate.clone())
-            .expect("install blocked Mapping retirement worker");
-
-        let exit = rollback_mapping_and_lio(
-            lio_owner::GeometryRuntimeOwner::new(spawned, lio),
-            ingress_gate.clone(),
-            ExitCode::from(4),
-        )
-        .await;
-        assert_eq!(exit, ExitCode::from(7));
-        assert!(retirement_gate.entered());
-        assert_eq!(
-            mapping.lock().backend_owner_state_for_tests(),
-            (false, true)
-        );
-        assert!(!lio_shutdown.is_shutdown_requested());
-        assert!(ingress_gate.is_closed());
-        assert!(lio_probe.closed.load(Ordering::Acquire));
-        assert!(product_paths.0.exists());
-        assert!(product_paths.1.exists());
-        assert_eq!(
-            geometry_process_exit_retention_for_tests()
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .len(),
-            1
-        );
-
-        let (pending_owner, retained_ingress_gate) =
-            match take_geometry_process_exit_retention_for_tests() {
-                GeometryProcessExitRetention::MappingAndLio {
-                    owner,
-                    ingress_gate,
-                } => (owner, ingress_gate),
-                GeometryProcessExitRetention::Production(_) => {
-                    panic!("bare Mapping/LIO rollback retained a production owner")
+    #[test]
+    fn root_shutdown_process_boundaries_preserve_exit_and_do_not_retry_pending_owners() {
+        for (scenario, expected) in [("complete", 4), ("production", 7), ("mapping", 7), ("startup", 7)] {
+            let manifest = std::env::temp_dir().join(format!(
+                "nuwax-root-shutdown-{}-{}.txt", std::process::id(), uuid::Uuid::new_v4()
+            ));
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "lifecycle_tests::root_shutdown_process_child", "--nocapture"])
+                .env("NUWAX_TEST_ROOT_SHUTDOWN_SCENARIO", scenario)
+                .env("NUWAX_TEST_ROOT_SHUTDOWN_MANIFEST", &manifest)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn().expect("启动真实退出边界子进程");
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            let timed_out = loop {
+                if child.try_wait().expect("检查子进程退出").is_some() { break false; }
+                if std::time::Instant::now() >= deadline {
+                    child.kill().expect("停止超时子进程");
+                    break true;
                 }
-                GeometryProcessExitRetention::StartupRollbackAndLio { .. } => {
-                    panic!("bare Mapping/LIO rollback retained a startup owner pair")
-                }
+                std::thread::sleep(Duration::from_millis(10));
             };
-        assert!(Arc::ptr_eq(&retained_ingress_gate, &ingress_gate));
-        assert!(retained_ingress_gate.is_closed());
-        assert!(geometry_process_exit_retention_for_tests()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_empty());
-
-        retirement_gate.release();
-        pending_owner
-            .shutdown()
-            .await
-            .expect("released bare owner settles Mapping, LIO, and product resources");
-        assert_eq!(
-            mapping.lock().backend_owner_state_for_tests(),
-            (false, false)
-        );
-        assert!(lio_shutdown.is_shutdown_requested());
-        assert!(!product_paths.0.exists());
-        assert!(!product_paths.1.exists());
-        assert!(
-            geometry_process_exit_retention_for_tests()
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_empty(),
-            "bare rollback test must leave no retained-owner residue"
-        );
-        reset_geometry_retained_exit_after_test_settlement();
+            let output = child.wait_with_output().expect("回收退出边界子进程");
+            if let Ok(root) = std::fs::read_to_string(&manifest) {
+                let root = PathBuf::from(root);
+                assert_eq!(root.parent(), Some(std::env::temp_dir().as_path()));
+                assert!(root.file_name().unwrap().to_string_lossy().starts_with("nuwax-geometry-production-topology-"));
+                if root.exists() { std::fs::remove_dir_all(root).expect("清理子进程测试目录"); }
+            }
+            let _ = std::fs::remove_file(manifest);
+            let logs = format!("{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            assert!(!timed_out, "{scenario} 超过有界退出期限: {logs}");
+            assert_eq!(output.status.code(), Some(expected), "{scenario}: {logs}");
+            eprintln!("根关闭真实进程 {scenario}: exit={expected}");
+        }
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn rollback_geometry_startup_and_lio_exhausts_budget_and_retains_owner_pair_until_scheduler_settles(
-    ) {
-        let _retention_guard = PROCESS_EXIT_RETENTION_TEST_LOCK.lock().await;
-        assert!(
-            geometry_process_exit_retention_for_tests()
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_empty(),
-            "startup rollback retention test must start without retained-owner residue"
-        );
-
-        let setup = lcm_runtime::ProductionTopologyTestSetup::prepare(|control| {
-            control.reject_registration("map-revision-coalescer");
-            control.enable_scheduler_block();
-        })
-        .await;
-        let product_paths = setup.product_paths();
-        let control = setup.control.clone();
-        let (lio, lio_shutdown) =
-            start_lio_before_geometry_for_tests(setup.transport(), 63, "startup-budget-retention")
-                .await;
-        let mut failed = match setup.spawn().await {
-            Err(failed) => failed,
-            Ok(mut topology) => {
-                let spawned = topology.take_spawned();
-                let _ = lio_owner::GeometryRuntimeOwner::new(spawned, lio)
-                    .shutdown()
-                    .await;
-                panic!("map-revision-coalescer registration unexpectedly succeeded")
-            }
+    #[test]
+    fn root_shutdown_process_child() {
+        let Ok(scenario) = std::env::var("NUWAX_TEST_ROOT_SHUTDOWN_SCENARIO") else { return; };
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4).enable_all().build().expect("退出边界运行时");
+        // 真实阻塞线程保持未完成，验证统一 finalizer 不再等待运行时隐式排空。
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (_release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let blocking_completed = Arc::new(AtomicBool::new(false));
+        let completed = Arc::clone(&blocking_completed);
+        let _blocking = runtime.spawn_blocking(move || {
+            entered_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+            completed.store(true, Ordering::Release);
+        });
+        entered_rx.recv_timeout(Duration::from_secs(1)).expect("阻塞线程已经运行");
+        let record_paths = |paths: &(PathBuf, PathBuf)| {
+            let manifest = std::env::var_os("NUWAX_TEST_ROOT_SHUTDOWN_MANIFEST").unwrap();
+            std::fs::write(manifest, paths.0.parent().unwrap().to_string_lossy().as_bytes()).unwrap();
         };
-        assert_eq!(failed.product_paths(), product_paths);
-        let failure = failed.take_failure();
-        assert!(failure.has_rollback_owner_for_tests());
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while !control.scheduler_block_entered() {
-                tokio::task::yield_now().await;
+        let exit = runtime.block_on(Box::pin(async {
+            match scenario.as_str() {
+                "complete" | "production" => {
+                    let mut fixture = lifecycle_production_fixture(60, "single-root-shutdown", false).await;
+                    record_paths(&fixture.product_paths());
+                    let attempts = Arc::clone(&fixture.owner.as_ref().unwrap().shutdown_attempts_for_tests);
+                    let gate = mapping_backend::MappingBackendRetirementTestGate::blocked();
+                    if scenario == "production" {
+                        fixture.mapping.lock().replace_worker_with_retirement_test_gate(gate.clone()).unwrap();
+                    }
+                    let exit = shutdown_runtime_owner(fixture.take_owner(), ExitCode::from(4)).await;
+                    assert_eq!(attempts.load(Ordering::Acquire), 1, "根只调用一次实际拥有方关闭");
+                    if scenario == "production" {
+                        assert_eq!(exit, ExitCode::from(7));
+                        assert!(gate.entered());
+                        assert_eq!(fixture.mapping.lock().backend_owner_state_for_tests(), (false, true));
+                        assert_eq!(fixture.shutdown_stages(), vec![
+                            lio_owner::GeometryShutdownStage::GeometryTasksSettled,
+                            lio_owner::GeometryShutdownStage::CorrectionSettled,
+                        ]);
+                        assert!(fixture.cloud_path.exists() && fixture.occupancy_path.exists());
+                    } else {
+                        assert_eq!(exit, ExitCode::from(4));
+                        fixture.assert_shutdown_complete();
+                    }
+                    exit
+                }
+                "mapping" => {
+                    let setup = lcm_runtime::ProductionTopologyTestSetup::prepare(|_| {}).await;
+                    record_paths(&setup.product_paths());
+                    let probe = Arc::new(PreCorrectionLioSink::new(false));
+                    let gate = Arc::new(lio_ingress::LioIngressRoutingGate::new(probe));
+                    let lio = lio_owner::LioOwnerHandle::start(
+                        setup.transport(), lifecycle_lio_spec("single-mapping-rollback"), 62, gate.clone()
+                    ).await.unwrap();
+                    let mut topology = setup.spawn().await.unwrap_or_else(|_| panic!("建立回滚拓扑"));
+                    let spawned = topology.take_spawned();
+                    let mapping = spawned.handle.mapping_adapter.as_ref().unwrap().clone();
+                    mapping.lock().start_session("single-mapping-session", "single-mapping-map").unwrap();
+                    let retirement = mapping_backend::MappingBackendRetirementTestGate::blocked();
+                    mapping.lock().replace_worker_with_retirement_test_gate(retirement.clone()).unwrap();
+                    let exit = rollback_mapping_and_lio(
+                        lio_owner::GeometryRuntimeOwner::new(spawned, lio), gate.clone(), ExitCode::from(4)
+                    ).await;
+                    assert_eq!(exit, ExitCode::from(7));
+                    assert!(retirement.entered() && gate.is_closed());
+                    assert_eq!(mapping.lock().backend_owner_state_for_tests(), (false, true));
+                    let paths = topology.product_paths();
+                    assert!(paths.0.exists() && paths.1.exists());
+                    exit
+                }
+                "startup" => {
+                    let setup = lcm_runtime::ProductionTopologyTestSetup::prepare(|control| {
+                        control.reject_registration("map-revision-coalescer");
+                        control.enable_scheduler_block();
+                    }).await;
+                    record_paths(&setup.product_paths());
+                    let control = setup.control.clone();
+                    let (lio, _) = start_lio_before_geometry_for_tests(
+                        setup.transport(), 63, "single-startup-rollback"
+                    ).await;
+                    let mut failed = match setup.spawn().await {
+                        Err(failed) => failed,
+                        Ok(_) => panic!("注册失败必须进入启动回滚"),
+                    };
+                    let exit = rollback_geometry_startup_and_lio(failed.take_failure(), lio).await;
+                    assert_eq!(exit, ExitCode::from(7));
+                    assert!(control.scheduler_block_entered());
+                    assert!(control.startup_shutdown_stages().is_empty());
+                    let paths = failed.product_paths();
+                    assert!(paths.0.exists() && paths.1.exists());
+                    exit
+                }
+                _ => panic!("未知退出边界场景"),
             }
-        })
-        .await
-        .expect("pre-spawned scheduler entered its rollback block");
-        assert!(control.startup_shutdown_stages().is_empty());
-        assert!(!lio_shutdown.is_shutdown_requested());
-        assert!(product_paths.0.exists());
-        assert!(product_paths.1.exists());
-
-        let exit = rollback_geometry_startup_and_lio(failure, lio).await;
-        assert_eq!(exit, ExitCode::from(7));
-        assert!(control.startup_shutdown_stages().is_empty());
-        assert!(!lio_shutdown.is_shutdown_requested());
-        assert!(product_paths.0.exists());
-        assert!(product_paths.1.exists());
-        assert_eq!(
-            geometry_process_exit_retention_for_tests()
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .len(),
-            1
-        );
-
-        let (geometry, lio) = match take_geometry_process_exit_retention_for_tests() {
-            GeometryProcessExitRetention::StartupRollbackAndLio { geometry, lio } => {
-                (geometry, lio)
-            }
-            GeometryProcessExitRetention::Production(_) => {
-                panic!("startup rollback retained a production owner")
-            }
-            GeometryProcessExitRetention::MappingAndLio { .. } => {
-                panic!("startup rollback retained only a Mapping/LIO owner")
-            }
-        };
-        assert!(geometry_process_exit_retention_for_tests()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_empty());
-
-        control.release_scheduler_block();
-        match geometry.shutdown().await {
-            Ok(()) => {}
-            Err(error) => {
-                let detail = error.to_string();
-                assert!(
-                    error.into_pending_owner().is_none(),
-                    "released startup rollback remained pending: {detail}"
-                );
-            }
-        }
-        lio.shutdown()
-            .await
-            .expect("LIO joins after retained startup rollback settles");
-        assert!(lio_shutdown.is_shutdown_requested());
-        assert!(!product_paths.0.exists());
-        assert!(!product_paths.1.exists());
-        assert_eq!(
-            control.startup_shutdown_stages(),
-            vec![
-                lio_owner::GeometryShutdownStage::GeometryTasksSettled,
-                lio_owner::GeometryShutdownStage::ResourceCleanupComplete,
-            ]
-        );
-        assert!(
-            geometry_process_exit_retention_for_tests()
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_empty(),
-            "startup rollback test must leave no retained-owner residue"
-        );
-        reset_geometry_retained_exit_after_test_settlement();
+        }));
+        let exit = finalize_geometry_runtime(runtime, exit);
+        assert!(!blocking_completed.load(Ordering::Acquire), "运行时 finalizer 应在阻塞任务释放前返回");
+        std::process::exit(if exit == ExitCode::from(4) { 4 } else { 7 });
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -4,20 +4,17 @@ use super::*;
 
 struct NoHash {
     map: bool,
-    archive: bool,
 }
 impl NoHash {
     fn enter() -> Self {
         Self {
             map: crate::map_checksum::FORBID_HASH.with(|flag| flag.replace(true)),
-            archive: crate::dense_cloud::FORBID_ARCHIVE_HASH.with(|flag| flag.replace(true)),
         }
     }
 }
 impl Drop for NoHash {
     fn drop(&mut self) {
         crate::map_checksum::FORBID_HASH.with(|flag| flag.set(self.map));
-        crate::dense_cloud::FORBID_ARCHIVE_HASH.with(|flag| flag.set(self.archive));
     }
 }
 
@@ -89,14 +86,11 @@ fn python_legacy_fine_import_admits_exact_bytes_and_replays_after_release_withou
     for fixture in fixtures() {
         let request = proto::ActivateMapRequest::decode(fixture.request).unwrap();
         assert_eq!(request.activation_contract_version, 2);
-        assert!(request.asset_manifest_sha256.is_empty());
-        assert!(request.asset_bundle_sha256.is_empty());
         let checkpoint = request.mapping_backend_checkpoint.as_ref().unwrap();
         let fine_reference = checkpoint.fine_map_artifact.clone().unwrap();
         let dense_reference = checkpoint.dense_cloud_artifact.clone();
         let member = fine_reference.member_identity.as_ref().unwrap();
         assert_eq!(fine_reference.identity_schema_version, 2);
-        assert!(fine_reference.sha256.is_empty());
         assert_eq!(member.checkpoint_id, checkpoint.checkpoint_id);
         assert_eq!(member.role, proto::CheckpointMemberRole::FineMap as i32);
         assert_eq!(
@@ -148,7 +142,7 @@ fn python_legacy_fine_import_admits_exact_bytes_and_replays_after_release_withou
             &interner,
         )
         .unwrap();
-        admitted.validate_replay(&replay).unwrap();
+        assert_eq!(admitted.metadata(), replay.metadata());
         assert!(admitted
             .checkpoint()
             .shares_source_with(replay.checkpoint()));
@@ -161,15 +155,9 @@ fn python_legacy_fine_import_admits_exact_bytes_and_replays_after_release_withou
             .as_mut()
             .unwrap()
             .xyz_f32_le[0] ^= 1;
-        assert!(ValidatedActivationRequestV2::admit(
-            changed,
-            17,
-            fixture.backend,
-            "map",
-            |_| panic!("conflicting replay must use its retained source"),
-            &interner,
-        )
-        .is_err());
+        let replay=ValidatedActivationRequestV2::admit(changed,17,fixture.backend,"map",
+            |_|panic!("存活编号不重新打开制品"),&interner).unwrap();
+        assert!(admitted.checkpoint().shares_source_with(replay.checkpoint()));
     }
 }
 

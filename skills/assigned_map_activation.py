@@ -312,10 +312,8 @@ def _activate(owner, bundle, load_memory_history, metadata, allow_dispatch, publ
             journal = repository.begin_assigned_map_activation(
                 previous_map_name=repository.get_active_map_name(), target_map_name=bundle.map_name,
                 target_asset_identity=prepared.asset_identity, target_checkpoint_id=prepared.checkpoint_id,
-                load_memory_history=bool(load_memory_history), reuse_completed_request_id=False,
+                load_memory_history=bool(load_memory_history),
                 activation_request=request, predecessor=predecessor)
-    elif 'activation_request' not in journal:
-        raise _problem('旧分配式日志缺少原 session/runtime 字段，不能推测后重执行。', journal)
     request = _request(journal['activation_request'])
     if not runtime.arm_assigned_map_activation_fence(activation_request=request, reason='assigned_workspace_activation'):
         raise _problem('运行态已有不同的激活拥有方。', journal)

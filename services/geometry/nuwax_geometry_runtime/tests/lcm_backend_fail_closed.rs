@@ -651,10 +651,22 @@ fn runtime_command(backend: &str, probe: &ProbeDir) -> Command {
             "NUWAX_FORBIDDEN_ZONES_PATH",
             probe.path().join("forbidden-zones.json"),
         )
+        .env("NUWAX_RUNTIME_DATA_DIR", probe.path().join("runtime-data"))
+        .env("NUWAX_LOG_DIR", probe.path().join("logs"))
+        .env("RUST_LOG", "warn,nuwax_geometry_runtime::lio_owner=info,nuwax_geometry_runtime::correction_finalization=info")
         .env("NUWAX_REAL_LCM_REQUIRED", "true")
+        .env("NUWAX_GEOMETRY_LEGACY_GLOBAL_MAP_FULL", "true")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     command
+}
+
+fn child_log_messages(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).lines().map(|line| {
+        serde_json::from_str::<serde_json::Value>(line).ok()
+            .and_then(|value| value.get("fields")?.get("message")?.as_str().map(str::to_owned))
+            .unwrap_or_else(|| line.to_owned())
+    }).collect::<Vec<_>>().join("\n")
 }
 
 fn assert_preflight_failure(
@@ -667,7 +679,7 @@ fn assert_preflight_failure(
     let child = ChildGuard::new(command.spawn().expect("spawn preflight failure probe"));
     let output = collect_bounded_output(child, scenario);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = child_log_messages(&output.stderr);
     assert_eq!(output.status.code(), Some(1), "{scenario}: {stderr}");
     assert!(
         stderr.contains(expected_detail),
@@ -694,7 +706,7 @@ fn assert_native_preflight_failure(
 ) {
     let child = ChildGuard::new(command.spawn().expect("spawn native preflight probe"));
     let output = collect_bounded_output(child, scenario);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = child_log_messages(&output.stderr);
     assert_eq!(output.status.code(), Some(1), "{scenario}: {stderr}");
     assert!(
         stderr.contains(expected_detail),
@@ -905,7 +917,7 @@ fn native_owner_profiles_reach_selected_preflight_before_startup_side_effects() 
                 &mut command,
                 &artifacts,
                 &scenario,
-                "NATIVE_LIO_PREFLIGHT_FAILED env=NUWAX_GEOMETRY_NATIVE_LIO_EXECUTABLE is_required",
+                "NATIVE_LIO_PREFLIGHT_FAILED env=NUWAX_GEOMETRY_LIO_BODY_FROM_SENSOR is_required",
             );
         }
     }
@@ -941,12 +953,6 @@ fn native_owner_preflight_matrix_preserves_startup_sentinels() {
             "NUWAX_GEOMETRY_NATIVE_LIO_PRIVATE_PREFIX",
             "/",
             "invalid_private_prefix",
-        ),
-        (
-            "native-host-ip",
-            "NUWAX_GEOMETRY_NATIVE_LIO_HOST_IP",
-            "not-an-ip",
-            "invalid_ipv4",
         ),
         (
             "native-first-pair-timeout-zero",
@@ -1021,15 +1027,6 @@ fn native_owner_preflight_matrix_preserves_startup_sentinels() {
             );
         },
         "value_is_not_unicode",
-    );
-    assert_native_preflight_case(
-        "native-identical-ip-pair",
-        |command, _probe| {
-            command
-                .env("NUWAX_GEOMETRY_NATIVE_LIO_HOST_IP", "192.0.2.10")
-                .env("NUWAX_GEOMETRY_NATIVE_LIO_LIDAR_IP", "192.0.2.10");
-        },
-        "addresses_must_be_distinct",
     );
     assert_native_preflight_case(
         "native-pair-skew-exceeds-first-pair",
@@ -1385,18 +1382,6 @@ fn real_lcm_backend_passes_preflight_and_enters_runtime_startup() {
     let output = child.terminate_and_collect();
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stdout.contains(&cloud_map_path.display().to_string()),
-        "runtime did not report the isolated cloud-map SHM path: {stdout}"
-    );
-    assert!(
-        stdout.contains(&occupancy_path.display().to_string()),
-        "runtime did not report the isolated occupancy SHM path: {stdout}"
-    );
-    assert!(
-        stdout.contains("LCM backend = real-lcm (available=true)"),
-        "runtime did not report the required real-LCM backend: {stdout}"
-    );
     assert!(
         !stdout.contains(PRODUCTION_LCM_PROVIDER),
         "isolated startup unexpectedly reported the production LCM provider: {stdout}"
@@ -2705,23 +2690,7 @@ fn independent_candidate_body_points(
         .collect()
 }
 
-#[cfg(feature = "nuwax-lio-test-child")]
-fn independent_body_points_sha256(points: &[nalgebra::Point3<f64>]) -> [u8; 32] {
-    assert!(!points.is_empty(), "body-point digest source is empty");
-    let mut preimage = b"nuwax.correction.body-points.v1\0".to_vec();
-    preimage.extend_from_slice(
-        &u64::try_from(points.len())
-            .expect("body-point count fits u64")
-            .to_be_bytes(),
-    );
-    for point in points {
-        assert!(point.coords.iter().all(|value| value.is_finite()));
-        preimage.extend_from_slice(&point.x.to_be_bytes());
-        preimage.extend_from_slice(&point.y.to_be_bytes());
-        preimage.extend_from_slice(&point.z.to_be_bytes());
-    }
-    nuwax_codec::sha256_bytes(&preimage)
-}
+
 
 #[cfg(feature = "nuwax-lio-test-child")]
 #[derive(Clone, Debug)]
@@ -2733,27 +2702,28 @@ struct DecodedCorrectionCandidate {
     candidate_sequence: u64,
     mapping_session_id: String,
     mapping_session_generation: u64,
+    mapping_backend_kind: String,
+    mapping_backend_generation: u64,
     map_frame_generation: u64,
     mapping_commit_boot_nonce: [u8; 16],
     mapping_commit_sequence: u64,
     occupancy_revision: u64,
     cloud_revision: u64,
     committed_map_source_timestamp_ns: u64,
+    registered_cloud_backend: i32,
+    registered_cloud_runtime_generation: u64,
     registered_cloud_source_sequence: u64,
     registered_cloud_source_timestamp_ns: u64,
     registered_cloud_point_count: u64,
-    registered_cloud_envelope_sha256: [u8; 32],
-    body_points_sha256: [u8; 32],
     correlated_odom_source_sequence: u64,
     correlated_odom_source_timestamp_ns: u64,
-    correlated_odom_pose_sha256: [u8; 32],
+    correlated_odom_translation_m: [f64; 3],
+    correlated_odom_rotation_xyzw: [f64; 4],
     committed_map_width: u64,
     committed_map_height: u64,
     committed_map_resolution_m: f64,
     committed_map_origin_x_m: f64,
     committed_map_origin_y_m: f64,
-    committed_map_payload_sha256: [u8; 32],
-    committed_map_boundary_sha256: [u8; 32],
     source_timestamp_ns: u64,
     map_frame_id: String,
     odom_frame_id: String,
@@ -2763,8 +2733,6 @@ struct DecodedCorrectionCandidate {
     correction_lease_generation: u64,
     translation_m: [f64; 3],
     rotation_xyzw: [f64; 4],
-    trajectory: Vec<native_pgo::OptimizedKeyframe>,
-    payload_sha256: [u8; 32],
 }
 
 #[cfg(feature = "nuwax-lio-test-child")]
@@ -2856,32 +2824,9 @@ impl<'a> CandidateWireCursor<'a> {
     }
 }
 
-#[cfg(feature = "nuwax-lio-test-child")]
-fn encode_candidate_lcm_string(value: &str, encoded: &mut Vec<u8>) {
-    let length = i32::try_from(value.len() + 1).expect("candidate identity string length fits i32");
-    encoded.extend_from_slice(&length.to_be_bytes());
-    encoded.extend_from_slice(value.as_bytes());
-    encoded.push(0);
-}
 
-#[cfg(feature = "nuwax-lio-test-child")]
-fn encode_candidate_trajectory(nodes: &[native_pgo::OptimizedKeyframe], encoded: &mut Vec<u8>) {
-    // 按私有第二版列式数组独立重编码，摘要覆盖整个优化轨迹。
-    encoded.extend_from_slice(&(nodes.len() as i32).to_be_bytes());
-    for node in nodes {
-        encoded.extend_from_slice(&node.source_timestamp_ns.to_be_bytes());
-    }
-    for node in nodes {
-        for value in node.translation_m {
-            encoded.extend_from_slice(&value.to_be_bytes());
-        }
-    }
-    for node in nodes {
-        for value in node.rotation_xyzw {
-            encoded.extend_from_slice(&value.to_be_bytes());
-        }
-    }
-}
+
+
 
 #[cfg(feature = "nuwax-lio-test-child")]
 fn assert_native_candidate_finalization_receipt(
@@ -2934,7 +2879,7 @@ fn decode_correction_candidate(frame: &RawLcmFrame) -> DecodedCorrectionCandidat
     );
     let mut cursor = CandidateWireCursor::new(&frame.payload);
     let schema_version = cursor.read_i32("schema_version").unwrap();
-    assert_eq!(schema_version, 2, "unsupported correction candidate schema");
+    assert_eq!(schema_version, 3, "unsupported correction candidate schema");
     let backend = cursor.read_i32("backend").unwrap();
     assert!(
         (1..=3).contains(&backend),
@@ -2952,6 +2897,8 @@ fn decode_correction_candidate(frame: &RawLcmFrame) -> DecodedCorrectionCandidat
     let mapping_session_generation = cursor
         .read_positive_u64("mapping_session_generation")
         .unwrap();
+    let mapping_backend_kind = cursor.read_string("mapping_backend_kind").unwrap();
+    let mapping_backend_generation = cursor.read_positive_u64("mapping_backend_generation").unwrap();
     let map_frame_generation = cursor.read_positive_u64("map_frame_generation").unwrap();
     let mapping_commit_boot_nonce = cursor.take("mapping_commit_boot_nonce").unwrap();
     let mapping_commit_sequence = cursor.read_positive_u64("mapping_commit_sequence").unwrap();
@@ -2960,6 +2907,8 @@ fn decode_correction_candidate(frame: &RawLcmFrame) -> DecodedCorrectionCandidat
     let committed_map_source_timestamp_ns = cursor
         .read_nonnegative_u64("committed_map_source_timestamp_ns")
         .unwrap();
+    let registered_cloud_backend = cursor.read_i32("registered_cloud_backend").unwrap();
+    let registered_cloud_runtime_generation = cursor.read_positive_u64("registered_cloud_runtime_generation").unwrap();
     let registered_cloud_source_sequence = cursor
         .read_positive_u64("registered_cloud_source_sequence")
         .unwrap();
@@ -2969,22 +2918,19 @@ fn decode_correction_candidate(frame: &RawLcmFrame) -> DecodedCorrectionCandidat
     let registered_cloud_point_count = cursor
         .read_positive_u64("registered_cloud_point_count")
         .unwrap();
-    let registered_cloud_envelope_sha256 = cursor.take("registered_cloud_envelope_sha256").unwrap();
-    let body_points_sha256 = cursor.take("body_points_sha256").unwrap();
     let correlated_odom_source_sequence = cursor
         .read_positive_u64("correlated_odom_source_sequence")
         .unwrap();
     let correlated_odom_source_timestamp_ns = cursor
         .read_nonnegative_u64("correlated_odom_source_timestamp_ns")
         .unwrap();
-    let correlated_odom_pose_sha256 = cursor.take("correlated_odom_pose_sha256").unwrap();
+    let correlated_odom_translation_m = std::array::from_fn(|_| cursor.read_f64("correlated_odom_translation_m").unwrap());
+    let correlated_odom_rotation_xyzw = std::array::from_fn(|_| cursor.read_f64("correlated_odom_rotation_xyzw").unwrap());
     let committed_map_width = cursor.read_positive_u64("committed_map_width").unwrap();
     let committed_map_height = cursor.read_positive_u64("committed_map_height").unwrap();
     let committed_map_resolution_m = cursor.read_f64("committed_map_resolution_m").unwrap();
     let committed_map_origin_x_m = cursor.read_f64("committed_map_origin_x_m").unwrap();
     let committed_map_origin_y_m = cursor.read_f64("committed_map_origin_y_m").unwrap();
-    let committed_map_payload_sha256 = cursor.take("committed_map_payload_sha256").unwrap();
-    let committed_map_boundary_sha256 = cursor.take("committed_map_boundary_sha256").unwrap();
     let source_timestamp_ns = cursor.read_nonnegative_u64("source_timestamp_ns").unwrap();
     let map_frame_id = cursor.read_string("map_frame_id").unwrap();
     let odom_frame_id = cursor.read_string("odom_frame_id").unwrap();
@@ -3032,39 +2978,10 @@ fn decode_correction_candidate(frame: &RawLcmFrame) -> DecodedCorrectionCandidat
             Some(source_timestamp_ns)
         );
     }
-    let payload_sha256 = cursor.take("payload_sha256").unwrap();
     cursor.finish().unwrap();
 
-    for (name, digest) in [
-        (
-            "mapping_commit_boot_nonce",
-            mapping_commit_boot_nonce.as_slice(),
-        ),
-        (
-            "registered_cloud_envelope_sha256",
-            registered_cloud_envelope_sha256.as_slice(),
-        ),
-        ("body_points_sha256", body_points_sha256.as_slice()),
-        (
-            "correlated_odom_pose_sha256",
-            correlated_odom_pose_sha256.as_slice(),
-        ),
-        (
-            "committed_map_payload_sha256",
-            committed_map_payload_sha256.as_slice(),
-        ),
-        (
-            "committed_map_boundary_sha256",
-            committed_map_boundary_sha256.as_slice(),
-        ),
-        (
-            "correction_lease_boot_nonce",
-            correction_lease_boot_nonce.as_slice(),
-        ),
-        ("payload_sha256", payload_sha256.as_slice()),
-    ] {
-        assert!(digest.iter().any(|byte| *byte != 0), "{name} is absent");
-    }
+    assert!(mapping_commit_boot_nonce.iter().any(|byte| *byte != 0));
+    assert!(correction_lease_boot_nonce.iter().any(|byte| *byte != 0));
     assert!(registered_cloud_point_count <= 100_000);
     assert!(correlated_odom_source_timestamp_ns <= registered_cloud_source_timestamp_ns);
     if backend == 3 {
@@ -3111,37 +3028,6 @@ fn decode_correction_candidate(frame: &RawLcmFrame) -> DecodedCorrectionCandidat
         "correction quaternion is not unit length: norm_squared={rotation_norm_squared}"
     );
 
-    let payload_prefix_len = frame
-        .payload
-        .len()
-        .checked_sub(payload_sha256.len())
-        .expect("candidate body includes its payload digest");
-    assert_eq!(
-        nuwax_codec::sha256_bytes(&frame.payload[..payload_prefix_len]),
-        payload_sha256,
-        "correction candidate payload SHA-256 mismatch"
-    );
-    let mut map_boundary = b"nuwax.correction.committed-map-boundary.v1\0".to_vec();
-    encode_candidate_lcm_string(&map_frame_id, &mut map_boundary);
-    map_boundary.extend_from_slice(
-        &i64::try_from(committed_map_width)
-            .expect("committed map width fits int64")
-            .to_be_bytes(),
-    );
-    map_boundary.extend_from_slice(
-        &i64::try_from(committed_map_height)
-            .expect("committed map height fits int64")
-            .to_be_bytes(),
-    );
-    map_boundary.extend_from_slice(&committed_map_resolution_m.to_be_bytes());
-    map_boundary.extend_from_slice(&committed_map_origin_x_m.to_be_bytes());
-    map_boundary.extend_from_slice(&committed_map_origin_y_m.to_be_bytes());
-    assert_eq!(
-        nuwax_codec::sha256_bytes(&map_boundary),
-        committed_map_boundary_sha256,
-        "correction committed-map boundary SHA-256 mismatch"
-    );
-
     DecodedCorrectionCandidate {
         backend,
         transform_semantics,
@@ -3150,27 +3036,28 @@ fn decode_correction_candidate(frame: &RawLcmFrame) -> DecodedCorrectionCandidat
         candidate_sequence,
         mapping_session_id,
         mapping_session_generation,
+        mapping_backend_kind,
+        mapping_backend_generation,
         map_frame_generation,
         mapping_commit_boot_nonce,
         mapping_commit_sequence,
         occupancy_revision,
         cloud_revision,
         committed_map_source_timestamp_ns,
+        registered_cloud_backend,
+        registered_cloud_runtime_generation,
         registered_cloud_source_sequence,
         registered_cloud_source_timestamp_ns,
         registered_cloud_point_count,
-        registered_cloud_envelope_sha256,
-        body_points_sha256,
         correlated_odom_source_sequence,
         correlated_odom_source_timestamp_ns,
-        correlated_odom_pose_sha256,
+        correlated_odom_translation_m,
+        correlated_odom_rotation_xyzw,
         committed_map_width,
         committed_map_height,
         committed_map_resolution_m,
         committed_map_origin_x_m,
         committed_map_origin_y_m,
-        committed_map_payload_sha256,
-        committed_map_boundary_sha256,
         source_timestamp_ns,
         map_frame_id,
         odom_frame_id,
@@ -3180,8 +3067,6 @@ fn decode_correction_candidate(frame: &RawLcmFrame) -> DecodedCorrectionCandidat
         correction_lease_generation,
         translation_m,
         rotation_xyzw,
-        trajectory,
-        payload_sha256,
     }
 }
 
@@ -3522,28 +3407,9 @@ fn assert_frame_tree_map_from_odom(
     );
 }
 
-#[cfg(feature = "nuwax-lio-test-child")]
-fn correlated_odom_pose_sha256(odometry: &lio::LioOdometryEnvelope) -> [u8; 32] {
-    let mut canonical = b"nuwax.correction.odom-from-body.v1\0".to_vec();
-    for value in odometry.odometry.pose.position {
-        canonical.extend_from_slice(&value.to_be_bytes());
-    }
-    for value in odometry.odometry.pose.orientation_xyzw {
-        canonical.extend_from_slice(&value.to_be_bytes());
-    }
-    nuwax_codec::sha256_bytes(&canonical)
-}
 
-#[cfg(feature = "nuwax-lio-test-child")]
-fn digest_hex(digest: &[u8]) -> String {
-    use std::fmt::Write as _;
 
-    let mut encoded = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
-    }
-    encoded
-}
+
 
 #[cfg(feature = "nuwax-lio-test-child")]
 #[derive(Debug, serde::Deserialize, PartialEq, Eq)]
@@ -3572,34 +3438,9 @@ struct ObservedCandidateFinalization {
 
 #[cfg(feature = "nuwax-lio-test-child")]
 fn candidate_finalization_events(output: &Output) -> Vec<ObservedCandidateFinalization> {
-    let event_prefix = format!(r#"{{"event":"{CORRECTION_FINALIZATION_EVENT}""#);
-    output
-        .stdout
-        .iter()
-        .chain(output.stderr.iter())
-        .copied()
-        .collect::<Vec<_>>()
-        .split(|byte| *byte == b'\n')
-        .filter_map(|line| {
-            let line = String::from_utf8_lossy(line);
-            let start = line.find(&event_prefix)?;
-            let end = line[start..]
-                .rfind('}')
-                .map(|offset| start + offset + 1)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "{CORRECTION_FINALIZATION_TARGET}: structured finalizer event is truncated: {line}"
-                    )
-                });
-            Some(
-                serde_json::from_str(&line[start..end]).unwrap_or_else(|error| {
-                    panic!(
-                        "{CORRECTION_FINALIZATION_TARGET}: decode structured finalizer event: {error}; line={line}"
-                    )
-                }),
-            )
-        })
-        .collect()
+    let bytes=output.stdout.iter().chain(output.stderr.iter()).copied().collect::<Vec<_>>();
+    child_log_messages(&bytes).lines().filter(|line| line.starts_with(&format!(r#"{{"event":"{CORRECTION_FINALIZATION_EVENT}""#)))
+        .map(|line| serde_json::from_str(line).expect("真实结构化候选终结事件")).collect()
 }
 
 #[cfg(feature = "nuwax-lio-test-child")]
@@ -3801,6 +3642,7 @@ fn spawn_native_cycle(
         .env("NUWAX_GEOMETRY_CORRECTION_BACKEND", correction_backend)
         .env("NUWAX_GEOMETRY_CANONICAL_MAP_WRITER", "geometry")
         .env("NUWAX_GEOMETRY_CANONICAL_CORRECTION_WRITER", "geometry")
+        .env("NUWAX_GEOMETRY_LIO_BODY_FROM_IMU", r#"{"translation_m":[0.0,0.0,0.0],"rotation_row_major":[1.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,1.0]}"#)
         .env("NUWAX_GEOMETRY_NATIVE_LIO_EXECUTABLE", &executable)
         .env(
             "NUWAX_GEOMETRY_LIO_BODY_FROM_SENSOR",
@@ -3862,8 +3704,6 @@ fn spawn_native_cycle(
         contract["extrinsic_rotation_row_major"],
         serde_json::json!([0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0])
     );
-    assert_eq!(contract["host_ip"], "192.0.2.10");
-    assert_eq!(contract["lidar_ip"], "192.0.2.11");
     assert_eq!(
         contract["recorded_fixture"].as_str(),
         fixture_path.to_str(),
@@ -4250,53 +4090,34 @@ struct CloudMapShmSnapshot {
 
 #[cfg(all(feature = "nuwax-lio-test-child", unix))]
 fn read_cloud_map_shm(path: &Path) -> CloudMapShmSnapshot {
-    const HEADER_SIZE: usize = 64;
-    const SLOT_SIZE: usize = 16 * 1024 * 1024;
-    let bytes = fs::read(path)
-        .unwrap_or_else(|error| panic!("read cloud-map SHM {}: {error}", path.display()));
-    assert!(bytes.len() >= HEADER_SIZE + 2 * SLOT_SIZE);
-    assert_eq!(
-        u64::from_le_bytes(bytes[0..8].try_into().expect("cloud-map magic")),
-        0x4E55_5741_584D_4150
-    );
-    assert_eq!(
-        u32::from_le_bytes(bytes[8..12].try_into().expect("cloud-map version")),
-        2
-    );
-    let active_slot = u32::from_le_bytes(bytes[12..16].try_into().expect("cloud-map active slot"));
-    assert!(active_slot <= 1, "cloud-map active slot must be 0 or 1");
-    let point_count = u32::from_le_bytes(bytes[16..20].try_into().expect("cloud-map point count"));
-    let revision = u64::from_le_bytes(bytes[28..36].try_into().expect("cloud-map revision"));
-    let (slot_revision_offset, slot_count_offset) =
-        if active_slot == 0 { (40, 48) } else { (52, 60) };
-    assert_eq!(
-        u64::from_le_bytes(
-            bytes[slot_revision_offset..slot_revision_offset + 8]
-                .try_into()
-                .expect("cloud-map slot revision")
-        ),
-        revision
-    );
-    assert_eq!(
-        u32::from_le_bytes(
-            bytes[slot_count_offset..slot_count_offset + 4]
-                .try_into()
-                .expect("cloud-map slot count")
-        ),
-        point_count
-    );
-    let payload_len = usize::try_from(point_count)
-        .expect("cloud-map point count fits usize")
-        .checked_mul(12)
-        .expect("cloud-map payload length");
-    let start =
-        HEADER_SIZE + usize::try_from(active_slot).expect("active slot fits usize") * SLOT_SIZE;
-    let end = start + payload_len;
-    CloudMapShmSnapshot {
-        revision,
-        point_count,
-        payload: bytes[start..end].to_vec(),
+    let bytes=fs::read(path).unwrap_or_else(|error| panic!("read cloud-map SHM {}: {error}",path.display()));
+    decode_cloud_map_shm(&bytes)
+}
+
+#[cfg(all(feature = "nuwax-lio-test-child", unix))]
+fn decode_cloud_map_shm(bytes: &[u8]) -> CloudMapShmSnapshot {
+    assert_eq!(matrix_read_u64_le(bytes,0,"magic"),0x4E55_5741_584D_4150);
+    assert_eq!(matrix_read_u32_le(bytes,8,"layout version"),3);
+    assert_eq!(matrix_read_u32_le(bytes,12,"header bytes"),512);
+    let sequence=matrix_read_u64_le(bytes,16,"publication sequence");
+    assert!(sequence>0 && sequence%2==0,"共享内存必须是已完成发布");
+    let revision=matrix_read_u64_le(bytes,24,"cloud revision");
+    assert!(revision>0);
+    let point_count=matrix_read_u32_le(bytes,64,"point count");
+    let capacity=matrix_read_u32_le(bytes,68,"point capacity");
+    let chunk_points=matrix_read_u32_le(bytes,72,"chunk points") as usize;
+    let capacity_chunks=matrix_read_u32_le(bytes,76,"chunk capacity") as usize;
+    assert!(point_count<=capacity && chunk_points>0);
+    let page_table=matrix_read_u64_le(bytes,96,"page table offset") as usize;
+    let payload=matrix_read_u64_le(bytes,104,"payload offset") as usize;
+    assert_eq!(matrix_read_u64_le(bytes,112,"total bytes") as usize,bytes.len());
+    assert!(page_table>=512 && page_table+capacity_chunks*8<=payload);
+    assert!(payload+capacity as usize*12<=bytes.len());
+    for page in 0..(point_count as usize).div_ceil(chunk_points) {
+        let version=matrix_read_u64_le(bytes,page_table+page*8,"page revision");
+        assert!(version>0 && version<=revision);
     }
+    CloudMapShmSnapshot {revision,point_count,payload:bytes[payload..payload+point_count as usize*12].to_vec()}
 }
 
 #[cfg(all(feature = "nuwax-lio-test-child", unix))]
@@ -4377,7 +4198,7 @@ fn assert_recorded_contract_complete(contract: &serde_json::Value, backend: &str
 }
 
 #[cfg(all(feature = "nuwax-lio-test-child", unix))]
-fn assert_deferred_replay_outputs(
+fn assert_first_registered_pair_outputs(
     scenario: &str,
     odometry: &lio::LioOdometryEnvelope,
     cloud: &lio::LioCloudEnvelope,
@@ -4403,13 +4224,13 @@ fn assert_deferred_replay_outputs(
         tf.transforms.iter().any(|transform| {
             transform.header.frame_id == "map" && transform.child_frame_id == "odom"
         }),
-        "{scenario}: deferred replay canonical map->odom TF missing"
+        "{scenario}: first active pair canonical map->odom TF missing"
     );
     assert!(
         tf.transforms.iter().any(|transform| {
             transform.header.frame_id == "odom" && transform.child_frame_id == "base_link"
         }),
-        "{scenario}: deferred replay canonical odom->base TF missing"
+        "{scenario}: first active pair canonical odom->base TF missing"
     );
 }
 
@@ -4641,13 +4462,13 @@ fn native_owner_profiles_complete_two_cycle_recorded_mapping_and_generation_fenc
     assert!(first_mapping.success && first_mapping.active);
     assert!(first_mapping.session_generation > 0);
     assert_eq!(first_mapping.revision, 1);
-    let first_replay_tf = next_frame(&runtime, &mut observers.tf, "fastlio2 deferred replay TF");
+    let first_replay_tf = next_frame(&runtime, &mut observers.tf, "fastlio2 first active pair TF");
     let first_replay_cloud = decode_public_cloud(&next_frame(
         &runtime,
         &mut observers.public_cloud,
-        "fastlio2 deferred replay cloud",
+        "fastlio2 first active pair cloud",
     ));
-    assert_deferred_replay_outputs(
+    assert_first_registered_pair_outputs(
         &first.scenario,
         &inactive_odometry,
         &first_replay_cloud,
@@ -4656,12 +4477,12 @@ fn native_owner_profiles_complete_two_cycle_recorded_mapping_and_generation_fenc
     let _first_replay_global_map = next_nonempty_global_map(
         &runtime,
         &mut observers.global_map,
-        "fastlio2 deferred replay global map",
+        "fastlio2 first active pair global map",
     );
     assert_stream_silent(
         &runtime,
         &mut observers.public_odometry,
-        "fastlio2 deferred replay duplicate odometry",
+        "fastlio2 first active pair duplicate odometry",
     );
     write_publish_permit(&permit_path, 2);
     let first_odometry_frame = next_frame(
@@ -4814,13 +4635,13 @@ fn native_owner_profiles_complete_two_cycle_recorded_mapping_and_generation_fenc
         second_mapping.session_generation > 0,
         "restart did not allocate a process-local MappingAdapter generation"
     );
-    let second_replay_tf = next_frame(&runtime, &mut observers.tf, "pointlio deferred replay TF");
+    let second_replay_tf = next_frame(&runtime, &mut observers.tf, "pointlio first active pair TF");
     let second_replay_cloud = decode_public_cloud(&next_frame(
         &runtime,
         &mut observers.public_cloud,
-        "pointlio deferred replay cloud",
+        "pointlio first active pair cloud",
     ));
-    assert_deferred_replay_outputs(
+    assert_first_registered_pair_outputs(
         &second.scenario,
         &second_inactive_odometry,
         &second_replay_cloud,
@@ -4829,7 +4650,7 @@ fn native_owner_profiles_complete_two_cycle_recorded_mapping_and_generation_fenc
     let _second_replay_global_map = next_nonempty_global_map(
         &runtime,
         &mut observers.global_map,
-        "pointlio deferred replay global map",
+        "pointlio first active pair global map",
     );
     let mapping_before_stale = get_mapping_state(&runtime, &mut second_client, &second.scenario);
     let occupancy_before_stale = read_file_prefix(&probe.path().join("occupancy.mmap"), 4096);
@@ -4987,14 +4808,14 @@ fn library_pgo_production_binary_real_lcm_v2_closes_hostile_and_lifecycle_fences
     let first_replay_tf = next_frame(
         &runtime,
         &mut observers.tf,
-        "library PGO deferred replay TF",
+        "library PGO first active pair TF",
     );
     let first_replay_cloud = decode_public_cloud(&next_frame(
         &runtime,
         &mut observers.public_cloud,
-        "library PGO deferred replay cloud",
+        "library PGO first active pair cloud",
     ));
-    assert_deferred_replay_outputs(
+    assert_first_registered_pair_outputs(
         &first.scenario,
         &inactive_odometry,
         &first_replay_cloud,
@@ -5003,7 +4824,7 @@ fn library_pgo_production_binary_real_lcm_v2_closes_hostile_and_lifecycle_fences
     let _first_replay_global_map = next_nonempty_global_map(
         &runtime,
         &mut observers.global_map,
-        "library PGO deferred replay global map",
+        "library PGO first active pair global map",
     );
     assert_stream_silent(
         &runtime,
@@ -5159,14 +4980,7 @@ fn library_pgo_production_binary_real_lcm_v2_closes_hostile_and_lifecycle_fences
         private_cloud_timestamp_ns,
         first_candidate.registered_cloud_source_timestamp_ns
     );
-    assert_eq!(
-        first_candidate.registered_cloud_envelope_sha256,
-        nuwax_codec::sha256_bytes(&with_fingerprint(
-            lio::LIO_CLOUD_ENVELOPE_FINGERPRINT_V1,
-            &final_cloud_frame.payload,
-        )),
-        "candidate did not bind the complete registered-cloud envelope"
-    );
+
     let independent_body_points = independent_candidate_body_points(
         &inactive_odometry,
         &final_private_odometry,
@@ -5177,18 +4991,7 @@ fn library_pgo_production_binary_real_lcm_v2_closes_hostile_and_lifecycle_fences
         first_candidate.registered_cloud_point_count,
         "independent body-point reconstruction changed point count/order"
     );
-    let independent_body_digest = independent_body_points_sha256(&independent_body_points);
-    assert_eq!(
-        first_candidate.body_points_sha256,
-        independent_body_digest,
-        "candidate body-point digest is not bound to the independently decoded source cloud: candidate={} independent={} source_sequence={} source_timestamp_ns={} point_count={} first_body_points={:?}",
-        digest_hex(&first_candidate.body_points_sha256),
-        digest_hex(&independent_body_digest),
-        first_candidate.registered_cloud_source_sequence,
-        first_candidate.registered_cloud_source_timestamp_ns,
-        independent_body_points.len(),
-        independent_body_points.iter().take(3).collect::<Vec<_>>(),
-    );
+
     assert_eq!(
         first_candidate.correlated_odom_source_sequence,
         u64::try_from(final_odometry.source_sequence).expect("odometry sequence is positive")
@@ -5198,11 +5001,8 @@ fn library_pgo_production_binary_real_lcm_v2_closes_hostile_and_lifecycle_fences
         u64::try_from(final_odometry.source_timestamp_ns)
             .expect("odometry timestamp is nonnegative")
     );
-    assert_eq!(
-        first_candidate.correlated_odom_pose_sha256,
-        correlated_odom_pose_sha256(&final_odometry),
-        "candidate did not bind the frozen correlated odometry pose"
-    );
+    assert_eq!(first_candidate.correlated_odom_translation_m.map(f64::to_bits), final_odometry.odometry.pose.position.map(f64::to_bits));
+    assert_eq!(first_candidate.correlated_odom_rotation_xyzw.map(f64::to_bits), final_odometry.odometry.pose.orientation_xyzw.map(f64::to_bits));
     let occupancy_meta = occupancy_before_correction
         .meta
         .as_ref()
@@ -5233,15 +5033,8 @@ fn library_pgo_production_binary_real_lcm_v2_closes_hostile_and_lifecycle_fences
         1.0e-12,
         "candidate committed-map origin y",
     );
-    assert_eq!(
-        first_candidate.committed_map_payload_sha256,
-        nuwax_codec::sha256_bytes(&occupancy_before_correction.data),
-        "candidate did not bind the committed occupancy payload"
-    );
-    assert!(first_candidate
-        .committed_map_boundary_sha256
-        .iter()
-        .any(|byte| *byte != 0));
+
+
     assert_eq!(
         first_candidate.source_timestamp_ns,
         u64::try_from(final_cloud.source_timestamp_ns).expect("cloud timestamp is nonnegative")
@@ -5587,14 +5380,14 @@ fn library_pgo_production_binary_real_lcm_v2_closes_hostile_and_lifecycle_fences
     let second_replay_tf = next_frame(
         &runtime,
         &mut observers.tf,
-        "restarted library PGO deferred replay TF",
+        "restarted library PGO first active pair TF",
     );
     let second_replay_cloud = decode_public_cloud(&next_frame(
         &runtime,
         &mut observers.public_cloud,
-        "restarted library PGO deferred replay cloud",
+        "restarted library PGO first active pair cloud",
     ));
-    assert_deferred_replay_outputs(
+    assert_first_registered_pair_outputs(
         &second.scenario,
         &second_inactive_odometry,
         &second_replay_cloud,
@@ -5603,7 +5396,7 @@ fn library_pgo_production_binary_real_lcm_v2_closes_hostile_and_lifecycle_fences
     let _second_replay_global_map = next_nonempty_global_map(
         &runtime,
         &mut observers.global_map,
-        "restarted library PGO deferred replay global map",
+        "restarted library PGO first active pair global map",
     );
     let mapping_before_old_generation =
         get_mapping_state(&runtime, &mut second_client, &second.scenario);
@@ -5741,13 +5534,13 @@ fn raytracing_profile_real_lcm_v2_preserves_generation_and_stop_fences() {
 
     let mut first_client = connect_geometry(&runtime, &probe, &first.scenario);
     let first_started = start_mapping(&runtime, &mut first_client, &first.scenario);
-    let first_replay_tf = next_frame(&runtime, &mut observers.tf, "G015 first deferred replay TF");
+    let first_replay_tf = next_frame(&runtime, &mut observers.tf, "G015 first first active pair TF");
     let first_replay_cloud = decode_public_cloud(&next_frame(
         &runtime,
         &mut observers.public_cloud,
-        "G015 first deferred replay cloud",
+        "G015 first first active pair cloud",
     ));
-    assert_deferred_replay_outputs(
+    assert_first_registered_pair_outputs(
         &first.scenario,
         &first_inactive_odometry,
         &first_replay_cloud,
@@ -5756,7 +5549,7 @@ fn raytracing_profile_real_lcm_v2_preserves_generation_and_stop_fences() {
     let _first_replay_global_map = next_nonempty_global_map(
         &runtime,
         &mut observers.global_map,
-        "G015 first deferred replay global map",
+        "G015 first first active pair global map",
     );
     std::thread::sleep(RAYTRACING_CANDIDATE_CADENCE_WAIT);
     write_publish_permit(&permit_path, 2);
@@ -5841,14 +5634,14 @@ fn raytracing_profile_real_lcm_v2_preserves_generation_and_stop_fences() {
     let second_replay_tf = next_frame(
         &runtime,
         &mut observers.tf,
-        "G015 second deferred replay TF",
+        "G015 second first active pair TF",
     );
     let second_replay_cloud = decode_public_cloud(&next_frame(
         &runtime,
         &mut observers.public_cloud,
-        "G015 second deferred replay cloud",
+        "G015 second first active pair cloud",
     ));
-    assert_deferred_replay_outputs(
+    assert_first_registered_pair_outputs(
         &second.scenario,
         &second_inactive_odometry,
         &second_replay_cloud,
@@ -5857,7 +5650,7 @@ fn raytracing_profile_real_lcm_v2_preserves_generation_and_stop_fences() {
     let _second_replay_global_map = next_nonempty_global_map(
         &runtime,
         &mut observers.global_map,
-        "G015 second deferred replay global map",
+        "G015 second first active pair global map",
     );
     std::thread::sleep(RAYTRACING_CANDIDATE_CADENCE_WAIT);
     #[cfg(target_os = "linux")]
@@ -6220,13 +6013,13 @@ fn native_pgo_production_binary_real_lcm_v2_reaches_canonical_applier() {
     );
     let mut first_client = connect_geometry(&runtime, &probe, &first.scenario);
     let first_started = start_mapping(&runtime, &mut first_client, &first.scenario);
-    let first_replay_tf = next_frame(&runtime, &mut observers.tf, "native PGO deferred replay TF");
+    let first_replay_tf = next_frame(&runtime, &mut observers.tf, "native PGO first active pair TF");
     let first_replay_cloud = decode_public_cloud(&next_frame(
         &runtime,
         &mut observers.public_cloud,
-        "native PGO deferred replay cloud",
+        "native PGO first active pair cloud",
     ));
-    assert_deferred_replay_outputs(
+    assert_first_registered_pair_outputs(
         &first.scenario,
         &inactive_odometry,
         &first_replay_cloud,
@@ -6240,7 +6033,7 @@ fn native_pgo_production_binary_real_lcm_v2_reaches_canonical_applier() {
     let _first_replay_global_map = next_nonempty_global_map(
         &runtime,
         &mut observers.global_map,
-        "native PGO deferred replay global map",
+        "native PGO first active pair global map",
     );
     let rejected = observe_native_pgo_exchange(
         &runtime,
@@ -6967,14 +6760,14 @@ fn native_pgo_production_binary_real_lcm_v2_reaches_canonical_applier() {
     let second_replay_tf = next_frame(
         &runtime,
         &mut observers.tf,
-        "restarted native PGO deferred replay TF",
+        "restarted native PGO first active pair TF",
     );
     let second_replay_cloud = decode_public_cloud(&next_frame(
         &runtime,
         &mut observers.public_cloud,
-        "restarted native PGO deferred replay cloud",
+        "restarted native PGO first active pair cloud",
     ));
-    assert_deferred_replay_outputs(
+    assert_first_registered_pair_outputs(
         &second.scenario,
         &second_inactive_odometry,
         &second_replay_cloud,
@@ -6983,7 +6776,7 @@ fn native_pgo_production_binary_real_lcm_v2_reaches_canonical_applier() {
     let _second_replay_global_map = next_nonempty_global_map(
         &runtime,
         &mut observers.global_map,
-        "restarted native PGO deferred replay global map",
+        "restarted native PGO first active pair global map",
     );
     let current_rejected = observe_native_pgo_exchange(
         &runtime,
@@ -7504,29 +7297,21 @@ fn matrix_prime_mapping(
 ) -> (GeometryClient, native_fixture_proto::MappingSessionState) {
     match cycle {
         MatrixCycle::Native(native) => {
-            write_publish_permit(permit_path, 1);
-            matrix_wait_native_publication_ack(native, 1);
             wait_cycle_ready(native, probe);
             assert_cycle_starting_and_ready(runtime, observers, native);
-            let inactive_odometry = decode_public_odometry(&next_frame(
-                runtime,
-                &mut observers.public_odometry,
-                "matrix bootstrap inactive odometry",
-            ));
-            assert_stream_silent(
-                runtime,
-                &mut observers.public_cloud,
-                "matrix bootstrap inactive cloud",
-            );
             let mut client = connect_geometry(runtime, probe, native.scenario.as_str());
             let started = start_mapping(runtime, &mut client, native.scenario.as_str());
+            write_publish_permit(permit_path, 1);
+            matrix_wait_native_publication_ack(native, 1);
+            let inactive_odometry = decode_public_odometry(&next_frame(runtime,
+                &mut observers.public_odometry, "matrix first active source odometry"));
             let replay_tf = next_frame(runtime, &mut observers.tf, "matrix bootstrap replay TF");
             let replay_cloud = decode_public_cloud(&next_frame(
                 runtime,
                 &mut observers.public_cloud,
                 "matrix bootstrap replay cloud",
             ));
-            assert_deferred_replay_outputs(
+            assert_first_registered_pair_outputs(
                 &native.scenario,
                 &inactive_odometry,
                 &replay_cloud,
@@ -7888,117 +7673,30 @@ fn assert_matrix_occupancy_mmap_frame_transition(
 
 #[cfg(all(feature = "nuwax-lio-test-child", unix))]
 fn assert_matrix_cloud_mmap_frame_transition(
-    before: &[u8],
-    after: &[u8],
-    candidate: &DecodedCorrectionCandidate,
-    global_map_frame: &RawLcmFrame,
-    scenario: &str,
+    before: &[u8], after: &[u8], candidate: &DecodedCorrectionCandidate,
+    global_map_frame: &RawLcmFrame, scenario: &str,
 ) {
-    const HEADER_SIZE: usize = 64;
-    const SLOT_SIZE: usize = 16 * 1024 * 1024;
-    const CLOUD_MAP_MAGIC: u64 = 0x4E55_5741_584D_4150;
-
-    assert_eq!(before.len(), HEADER_SIZE + 2 * SLOT_SIZE, "{scenario}");
-    assert_eq!(
-        after.len(),
-        before.len(),
-        "{scenario}: cloud-map SHM resized"
-    );
-    assert_eq!(
-        matrix_read_u64_le(before, 0, "cloud-map magic"),
-        CLOUD_MAP_MAGIC
-    );
-    assert_eq!(matrix_read_u32_le(before, 8, "cloud-map version"), 2);
-    let before_revision = matrix_read_u64_le(before, 28, "cloud-map revision");
-    assert_eq!(
-        candidate.cloud_revision, before_revision,
-        "{scenario}: candidate changed the activation cloud-map revision"
-    );
-    let active_slot = usize::try_from((candidate.cloud_revision - 1) % 2)
-        .expect("matrix cloud-map active slot fits usize");
-    let global_map = decode_global_map(global_map_frame);
-    assert_eq!(
-        global_map.header.frame_id, candidate.map_frame_id,
-        "{scenario}"
-    );
-    assert_eq!(global_map.height, 1, "{scenario}");
-    assert_eq!(global_map.point_step, 12, "{scenario}");
-    let point_count = u32::try_from(global_map.width)
-        .unwrap_or_else(|_| panic!("{scenario}: global-map width is negative"));
-    assert_eq!(
-        global_map.data.len(),
-        usize::try_from(point_count).expect("global-map width fits usize") * 12,
-        "{scenario}: global-map payload length drifted"
-    );
-    assert_eq!(
-        u64::try_from(global_map.header.seq).expect("global-map revision is positive"),
-        candidate.cloud_revision,
-        "{scenario}: published global map is not the candidate boundary"
-    );
-    let published_timestamp_ns = i64::from(global_map.header.stamp_sec)
-        .checked_mul(1_000_000_000)
-        .and_then(|seconds| seconds.checked_add(i64::from(global_map.header.stamp_nsec)))
-        .and_then(|timestamp| u64::try_from(timestamp).ok())
-        .expect("matrix global-map timestamp is nonnegative");
-    assert_eq!(
-        published_timestamp_ns, candidate.committed_map_source_timestamp_ns,
-        "{scenario}: global-map timestamp is not candidate-bound"
-    );
-
-    let before_wall_timestamp = matrix_read_u64_le(before, 20, "cloud-map wall timestamp");
-    let after_wall_timestamp = matrix_read_u64_le(after, 20, "cloud-map wall timestamp");
-    assert_eq!(
-        after_wall_timestamp, before_wall_timestamp,
-        "{scenario}: APPLIED changed the cloud-map publication timestamp"
-    );
-    assert!(
-        after_wall_timestamp > 0,
-        "{scenario}: cloud-map is unpublished"
-    );
-    assert_eq!(
-        &after[36..40],
-        &before[36..40],
-        "{scenario}: active frame changed cloud-map voxel size"
-    );
-
-    let (slot_revision_offset, slot_count_offset) =
-        if active_slot == 0 { (40, 48) } else { (52, 60) };
-    let payload_offset = HEADER_SIZE + active_slot * SLOT_SIZE;
-    let mut expected = before.to_vec();
-    expected[payload_offset..payload_offset + global_map.data.len()]
-        .copy_from_slice(&global_map.data);
-    matrix_write_u64_le(
-        &mut expected,
-        slot_revision_offset,
-        candidate.cloud_revision,
-        "cloud-map slot revision",
-    );
-    matrix_write_u32_le(
-        &mut expected,
-        slot_count_offset,
-        point_count,
-        "cloud-map slot point count",
-    );
-    matrix_write_u32_le(
-        &mut expected,
-        12,
-        u32::try_from(active_slot).expect("cloud-map slot fits u32"),
-        "cloud-map active slot",
-    );
-    matrix_write_u32_le(&mut expected, 16, point_count, "cloud-map point count");
-    matrix_write_u64_le(
-        &mut expected,
-        20,
-        after_wall_timestamp,
-        "cloud-map wall timestamp",
-    );
-    matrix_write_u64_le(
-        &mut expected,
-        28,
-        candidate.cloud_revision,
-        "cloud-map revision",
-    );
-    assert_matrix_bytes_eq(after, &expected, "cloud-map SHM frame transition", scenario);
+    assert_matrix_bytes_eq(after,before,"重定位保持完整点云共享内存",scenario);
+    let snapshot=decode_cloud_map_shm(after);
+    assert_eq!(snapshot.revision,candidate.cloud_revision);
+    assert_eq!(matrix_read_u64_le(after,32,"source timestamp"),candidate.committed_map_source_timestamp_ns);
+    assert_eq!(matrix_read_u64_le(after,88,"session generation"),candidate.mapping_session_generation);
+    let nonce=u128::from_le_bytes(after[128..144].try_into().unwrap()).to_be_bytes();
+    assert_eq!(nonce,candidate.mapping_commit_boot_nonce);
+    assert_eq!(matrix_read_u64_le(after,144,"commit sequence"),candidate.mapping_commit_sequence);
+    assert_eq!(matrix_read_u64_le(after,152,"occupancy revision"),candidate.occupancy_revision);
+    let id_len=matrix_read_u32_le(after,160,"session ID length") as usize;
+    assert!(id_len<=256);
+    assert_eq!(std::str::from_utf8(&after[164..164+id_len]).unwrap(),candidate.mapping_session_id);
+    let global_map=decode_global_map(global_map_frame);
+    assert_eq!(global_map.header.frame_id,candidate.map_frame_id);
+    assert_eq!(global_map.header.seq as u64,candidate.cloud_revision);
+    assert_eq!(global_map.height,1);
+    assert_eq!(global_map.point_step,12);
+    assert_eq!(global_map.width as u32,snapshot.point_count);
+    assert_eq!(global_map.data,snapshot.payload);
+    let timestamp_ns=i64::from(global_map.header.stamp_sec)*1_000_000_000+i64::from(global_map.header.stamp_nsec);
+    assert_eq!(timestamp_ns as u64,candidate.committed_map_source_timestamp_ns);
 }
 
 #[cfg(all(feature = "nuwax-lio-test-child", unix))]
@@ -8071,11 +7769,7 @@ fn assert_matrix_relocalization_observable_transition(
         "{scenario}"
     );
     assert_eq!(after_meta.frame_id, candidate.map_frame_id, "{scenario}");
-    assert_eq!(
-        nuwax_codec::sha256_bytes(&after.occupancy.data),
-        candidate.committed_map_payload_sha256,
-        "{scenario}: occupancy payload is not the candidate-bound committed map"
-    );
+
     assert_matrix_occupancy_mmap_frame_transition(
         &before.occupancy_mmap,
         &after.occupancy_mmap,
@@ -8192,12 +7886,11 @@ fn assert_matrix_activation_global_map(
         i32::try_from(cloud.xyz_f32_le.len()).expect("matrix activation row size fits i32"),
         "{scenario}: activation map row size changed"
     );
-    assert_eq!(global_map.data, cloud.xyz_f32_le, "{scenario}");
-    assert_eq!(
-        nuwax_codec::sha256_bytes(&global_map.data),
-        matrix_hex_digest(&cloud.xyz_sha256, "activation cloud xyz_sha256"),
-        "{scenario}: activation map payload digest changed"
-    );
+    let mut installed_points=global_map.data.chunks_exact(12).collect::<Vec<_>>();
+    let mut source_points=cloud.xyz_f32_le.chunks_exact(12).collect::<Vec<_>>();
+    installed_points.sort_unstable();source_points.sort_unstable();
+    assert_eq!(installed_points,source_points,"{scenario}: 安装必须保留全部点的精确坐标与重数");
+
     assert!(global_map.is_dense, "{scenario}");
 }
 
@@ -8330,67 +8023,21 @@ fn finish_device_cycle(
 }
 
 #[cfg(all(feature = "nuwax-lio-test-child", target_os = "linux"))]
-fn assert_matrix_shutdown_stdout(output: &Output, runtime_generation: u64, scenario: &str) {
-    let stdout = std::str::from_utf8(&output.stdout)
-        .unwrap_or_else(|error| panic!("{scenario}: Geometry stdout is not UTF-8: {error}"));
-    let expected = [
-        (
-            "nuwax.geometry.runtime.shutdown.correction_settled.v1",
-            "correction_settled",
-            1_u64,
-        ),
-        (
-            "nuwax.geometry.runtime.shutdown.mapping_retired.v1",
-            "mapping_retired",
-            2_u64,
-        ),
-        (
-            "nuwax.geometry.runtime.shutdown.lio_joined.v1",
-            "lio_joined",
-            3_u64,
-        ),
-        (
-            "nuwax.geometry.runtime.shutdown.resource_cleanup_complete.v1",
-            "resource_cleanup_complete",
-            4_u64,
-        ),
-    ];
-    let event_lines = stdout
-        .lines()
-        .enumerate()
-        .filter(|(_, line)| line.contains("geometry runtime shutdown stage completed"))
+fn assert_matrix_shutdown_events(output: &Output, runtime_generation: u64, scenario: &str) {
+    let bytes=output.stdout.iter().chain(output.stderr.iter()).copied().collect::<Vec<_>>();
+    let records=String::from_utf8_lossy(&bytes).lines().filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|record| record.get("fields").cloned())
+        .filter(|fields| fields.get("message").and_then(serde_json::Value::as_str)==Some("geometry runtime shutdown stage completed"))
         .collect::<Vec<_>>();
-    assert_eq!(
-        event_lines.len(),
-        expected.len(),
-        "{scenario}: shutdown event count drifted; stdout={stdout}"
-    );
-    for ((_, line), (event_name, stage, ordinal)) in event_lines.iter().zip(expected) {
-        let tokens = line.split_whitespace().collect::<Vec<_>>();
-        for token in [
-            format!("event_name=\"{event_name}\""),
-            "event_schema_version=1".to_owned(),
-            format!("runtime_generation={runtime_generation}"),
-            format!("stage_ordinal={ordinal}"),
-            format!("stage=\"{stage}\""),
-            "status=\"completed\"".to_owned(),
-        ] {
-            assert_eq!(
-                tokens
-                    .iter()
-                    .filter(|value| **value == token.as_str())
-                    .count(),
-                1,
-                "{scenario}: shutdown event token {token:?} was not exact once; line={line}"
-            );
-        }
-    }
-    for (event_name, _, _) in expected {
-        assert_eq!(
-            stdout.matches(event_name).count(),
-            1,
-            "{scenario}: shutdown event {event_name} was not emitted exactly once"
-        );
+    let stages=["geometry_tasks_settled","correction_settled","mapping_retired","lio_joined","resource_cleanup_complete"];
+    assert_eq!(records.len(),stages.len(),"{scenario}:真实关闭阶段必须逐一完成: {records:?}");
+    for (index,(record,stage)) in records.iter().zip(stages).enumerate() {
+        assert_eq!(record["event_name"],format!("nuwax.geometry.runtime.shutdown.{stage}.v1"));
+        assert_eq!(record["event_schema_version"],2);
+        assert_eq!(record["runtime_generation"],runtime_generation);
+        assert_eq!(record["stage_ordinal"],index+1);
+        assert_eq!(record["stage"],stage);
+        assert_eq!(record["status"],"completed");
     }
 }
 
@@ -8423,7 +8070,7 @@ fn finish_matrix_cycle(
         MatrixCycle::Device(cycle) => finish_device_cycle(runtime, observers, client, cycle),
         MatrixCycle::Native(cycle) => finish_native_cycle(runtime, observers, client, cycle),
     };
-    assert_matrix_shutdown_stdout(&output, runtime_generation, &scenario);
+    assert_matrix_shutdown_events(&output, runtime_generation, &scenario);
     for (pid, start_time) in process_identities {
         assert_ne!(
             process_start_time(pid),
@@ -8448,184 +8095,23 @@ fn finish_matrix_cycle(
     output
 }
 
-#[cfg(all(feature = "nuwax-lio-test-child", unix))]
-fn matrix_push_string(out: &mut Vec<u8>, value: &str) {
-    out.extend_from_slice(
-        &u32::try_from(value.len())
-            .expect("matrix canonical string length fits u32")
-            .to_be_bytes(),
-    );
-    out.extend_from_slice(value.as_bytes());
-}
 
-#[cfg(all(feature = "nuwax-lio-test-child", unix))]
-fn matrix_push_optional_digest(out: &mut Vec<u8>, digest: Option<[u8; 32]>) {
-    match digest {
-        Some(digest) => {
-            out.push(1);
-            out.extend_from_slice(&digest);
-        }
-        None => out.push(0),
-    }
-}
 
-#[cfg(all(feature = "nuwax-lio-test-child", unix))]
-fn matrix_digest32(value: &[u8], label: &str) -> [u8; 32] {
-    value
-        .try_into()
-        .unwrap_or_else(|_| panic!("{label} must contain exactly 32 bytes"))
-}
 
-#[cfg(all(feature = "nuwax-lio-test-child", unix))]
-fn matrix_hex_digest(value: &str, label: &str) -> [u8; 32] {
-    assert_eq!(
-        value.len(),
-        64,
-        "{label} must contain 64 lowercase hex bytes"
-    );
-    let mut digest = [0_u8; 32];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
-        assert!(
-            pair.iter()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte)),
-            "{label} is not canonical lowercase hex"
-        );
-        let encoded = std::str::from_utf8(pair).expect("hex pair is UTF-8");
-        digest[index] = u8::from_str_radix(encoded, 16).expect("decode canonical hex pair");
-    }
-    digest
-}
 
-#[cfg(all(feature = "nuwax-lio-test-child", unix))]
-fn matrix_occupancy_sha256(checkpoint: &native_fixture_proto::OccupancyGridData) -> [u8; 32] {
-    let meta = checkpoint.meta.as_ref().expect("matrix occupancy metadata");
-    let mut out = b"nuwax.geometry.occupancy-checkpoint.v1\0".to_vec();
-    out.extend_from_slice(&1_u32.to_be_bytes());
-    out.extend_from_slice(&meta.width.to_be_bytes());
-    out.extend_from_slice(&meta.height.to_be_bytes());
-    out.extend_from_slice(&meta.resolution.to_be_bytes());
-    out.extend_from_slice(
-        &(if meta.origin_x == 0.0 {
-            0.0
-        } else {
-            meta.origin_x
-        })
-        .to_be_bytes(),
-    );
-    out.extend_from_slice(
-        &(if meta.origin_y == 0.0 {
-            0.0
-        } else {
-            meta.origin_y
-        })
-        .to_be_bytes(),
-    );
-    matrix_push_string(&mut out, &meta.frame_id);
-    out.extend_from_slice(&meta.revision.to_be_bytes());
-    out.extend_from_slice(&meta.timestamp_ns.to_be_bytes());
-    out.extend_from_slice(
-        &u64::try_from(checkpoint.data.len())
-            .expect("matrix occupancy data length fits u64")
-            .to_be_bytes(),
-    );
-    out.extend_from_slice(&nuwax_codec::sha256_bytes(&checkpoint.data));
-    nuwax_codec::sha256_bytes(&out)
-}
 
-#[cfg(all(feature = "nuwax-lio-test-child", unix))]
-fn matrix_cloud_sha256(checkpoint: &native_fixture_proto::CloudMapCheckpoint) -> [u8; 32] {
-    let mut out = b"nuwax.geometry.cloud-checkpoint.v1\0".to_vec();
-    matrix_push_string(&mut out, &checkpoint.frame_id);
-    out.extend_from_slice(&checkpoint.source_revision.to_be_bytes());
-    out.extend_from_slice(&checkpoint.point_count.to_be_bytes());
-    out.extend_from_slice(&checkpoint.voxel_size.to_be_bytes());
-    out.extend_from_slice(
-        &u64::try_from(checkpoint.xyz_f32_le.len())
-            .expect("matrix cloud data length fits u64")
-            .to_be_bytes(),
-    );
-    out.extend_from_slice(&matrix_hex_digest(
-        &checkpoint.xyz_sha256,
-        "cloud checkpoint xyz_sha256",
-    ));
-    out.extend_from_slice(&checkpoint.payload_schema_version.to_be_bytes());
-    nuwax_codec::sha256_bytes(&out)
-}
 
-#[cfg(all(feature = "nuwax-lio-test-child", unix))]
-fn matrix_append_commit_identity(
-    out: &mut Vec<u8>,
-    identity: Option<&native_fixture_proto::MappingCommitIdentity>,
-) {
-    let identity = identity.expect("matrix mapping commit identity");
-    assert_eq!(identity.boot_nonce.len(), 16);
-    out.extend_from_slice(&identity.boot_nonce);
-    out.extend_from_slice(&identity.sequence.to_be_bytes());
-}
 
-#[cfg(all(feature = "nuwax-lio-test-child", unix))]
-fn matrix_backend_sha256(checkpoint: &native_fixture_proto::MappingBackendCheckpoint) -> [u8; 32] {
-    let occupancy_receipt = checkpoint
-        .occupancy_receipt
-        .as_ref()
-        .expect("matrix checkpoint occupancy receipt");
-    let cloud_receipt = checkpoint
-        .cloud_receipt
-        .as_ref()
-        .expect("matrix checkpoint cloud receipt");
-    let occupancy = checkpoint
-        .canonical_occupancy_checkpoint
-        .as_ref()
-        .expect("matrix canonical occupancy checkpoint");
-    let cloud = checkpoint
-        .canonical_cloud_checkpoint
-        .as_ref()
-        .expect("matrix canonical cloud checkpoint");
-    let mut out = b"nuwax.geometry.backend-checkpoint.v1\0".to_vec();
-    out.extend_from_slice(&checkpoint.schema_version.to_be_bytes());
-    matrix_push_string(&mut out, &checkpoint.backend_kind);
-    out.extend_from_slice(&checkpoint.source_session_generation.to_be_bytes());
-    out.extend_from_slice(&matrix_digest32(
-        &checkpoint.content_sha256,
-        "backend content_sha256",
-    ));
-    out.extend_from_slice(&checkpoint.payload_size.to_be_bytes());
-    out.extend_from_slice(&checkpoint.created_at_ns.to_be_bytes());
-    out.extend_from_slice(&nuwax_codec::sha256_bytes(&checkpoint.payload));
-    matrix_push_string(&mut out, &checkpoint.source_session_id);
-    matrix_append_commit_identity(&mut out, occupancy_receipt.commit_id.as_ref());
-    matrix_push_string(&mut out, &occupancy_receipt.session_id);
-    out.extend_from_slice(&occupancy_receipt.session_generation.to_be_bytes());
-    out.extend_from_slice(&occupancy_receipt.occupancy_revision.to_be_bytes());
-    out.extend_from_slice(&occupancy_receipt.source_timestamp_ns.to_be_bytes());
-    matrix_push_string(&mut out, &occupancy_receipt.backend_kind);
-    out.extend_from_slice(&occupancy_receipt.backend_generation.to_be_bytes());
-    matrix_append_commit_identity(&mut out, cloud_receipt.commit_id.as_ref());
-    out.extend_from_slice(&cloud_receipt.session_generation.to_be_bytes());
-    out.extend_from_slice(&cloud_receipt.occupancy_revision.to_be_bytes());
-    out.extend_from_slice(&cloud_receipt.cloud_revision.to_be_bytes());
-    out.extend_from_slice(&cloud_receipt.source_timestamp_ns.to_be_bytes());
-    out.extend_from_slice(&cloud_receipt.point_count.to_be_bytes());
-    out.extend_from_slice(&matrix_occupancy_sha256(occupancy));
-    out.extend_from_slice(&matrix_cloud_sha256(cloud));
-    nuwax_codec::sha256_bytes(&out)
-}
 
-#[cfg(all(feature = "nuwax-lio-test-child", unix))]
-fn matrix_asset_bundle_sha256(
-    manifest: [u8; 32],
-    occupancy: [u8; 32],
-    cloud: [u8; 32],
-    backend: [u8; 32],
-) -> [u8; 32] {
-    let mut out = b"nuwax.geometry.asset-bundle.v1\0".to_vec();
-    out.extend_from_slice(&1_u32.to_be_bytes());
-    out.extend_from_slice(&manifest);
-    out.extend_from_slice(&occupancy);
-    matrix_push_optional_digest(&mut out, Some(cloud));
-    matrix_push_optional_digest(&mut out, Some(backend));
-    nuwax_codec::sha256_bytes(&out)
-}
+
+
+
+
+
+
+
+
+
 
 #[cfg(all(feature = "nuwax-lio-test-child", unix))]
 fn export_matrix_checkpoint(
@@ -8638,8 +8124,6 @@ fn export_matrix_checkpoint(
             NATIVE_FIXTURE_TIMEOUT,
             client.export_mapping_backend_checkpoint(
                 native_fixture_proto::ExportMappingBackendCheckpointRequest {
-                    // This retained matrix explicitly exercises the legacy envelope.
-                    checkpoint_schema_version: 1,
                 },
             ),
         )
@@ -8661,36 +8145,15 @@ fn activate_matrix_checkpoint(
     checkpoint: &native_fixture_proto::MappingBackendCheckpoint,
 ) -> native_fixture_proto::MappingSessionState {
     let scenario = profile.scenario();
-    let occupancy = checkpoint
-        .canonical_occupancy_checkpoint
-        .clone()
-        .expect("matrix activation occupancy checkpoint");
-    let cloud = checkpoint
-        .canonical_cloud_checkpoint
-        .clone()
-        .expect("matrix activation cloud checkpoint");
-    let manifest = nuwax_codec::sha256_bytes(
-        format!("nuwax.matrix.asset-manifest.v1\0{}", profile.row_id()).as_bytes(),
-    );
-    let bundle = matrix_asset_bundle_sha256(
-        manifest,
-        matrix_occupancy_sha256(&occupancy),
-        matrix_cloud_sha256(&cloud),
-        matrix_backend_sha256(checkpoint),
-    );
+    let asset_identity = native_fixture_proto::AssetIdentityV2 { asset_id: uuid::Uuid::new_v4().simple().to_string() };
     let request = native_fixture_proto::ActivateMapRequest {
         session_id: format!("{scenario}-activated"),
         map_name: format!("{scenario}-map"),
-        checkpoint: Some(occupancy),
-        cloud_checkpoint: Some(cloud),
         mapping_backend_checkpoint: Some(checkpoint.clone()),
         activation_request_id: format!("{scenario}-activate"),
-        asset_manifest_sha256: manifest.to_vec(),
-        asset_bundle_sha256: bundle.to_vec(),
         expected_runtime_generation: runtime_generation,
-        activation_contract_version: 1,
-        // Contract 1 has no assigned asset identity; do not invent a V2 receipt.
-        asset_identity: None,
+        activation_contract_version: 2,
+        asset_identity: Some(asset_identity.clone()),
     };
     let activated = runtime.block_on(async {
         tokio::time::timeout(NATIVE_FIXTURE_TIMEOUT, client.activate_map(request))
@@ -8709,65 +8172,30 @@ fn activate_matrix_checkpoint(
     assert!(activated.relocalization_target_available);
     assert_eq!(activated.runtime_generation, runtime_generation);
     assert_eq!(activated.mapping_backend_kind, profile.mapping);
-    assert_eq!(activated.asset_manifest_sha256, manifest);
-    assert_eq!(activated.asset_bundle_sha256, bundle);
+    let receipt = activated.activation_receipt_v2.as_ref().expect("assigned activation receipt");
+    assert_eq!(receipt.request.as_ref().unwrap().asset_identity, Some(asset_identity));
+    assert_eq!(receipt.request.as_ref().unwrap().checkpoint_id, checkpoint.checkpoint_id);
     activated
 }
 
-#[cfg(all(feature = "nuwax-lio-test-child", unix))]
-fn matrix_policy_digest(value: &str, label: &str) -> Vec<u8> {
-    matrix_hex_digest(value, label).to_vec()
-}
+
 
 #[cfg(all(feature = "nuwax-lio-test-child", unix))]
 fn matrix_relocalize_request(
     profile: MatrixProfile,
     activated: &native_fixture_proto::MappingSessionState,
-    checkpoint: &native_fixture_proto::MappingBackendCheckpoint,
+    _checkpoint: &native_fixture_proto::MappingBackendCheckpoint,
 ) -> native_fixture_proto::RelocalizeRequest {
-    let cloud = checkpoint
-        .canonical_cloud_checkpoint
-        .as_ref()
-        .expect("matrix relocalization cloud checkpoint");
     native_fixture_proto::RelocalizeRequest {
-        schema_version: 1,
+        schema_version: 2,
         request_id: format!("{}-relocalize", profile.scenario()),
-        runtime_generation: activated.runtime_generation,
-        session_id: activated.session_id.clone(),
-        map_name: activated.map_name.clone(),
-        session_generation: activated.session_generation,
-        backend_generation: activated.backend_generation,
-        activation_identity_sha256: activated.activation_identity_sha256.clone(),
-        target_receipt_sha256: activated.target_receipt_sha256.clone(),
-        target_cloud_revision: cloud.source_revision,
-        target_cloud_sha256: matrix_hex_digest(
-            &cloud.xyz_sha256,
-            "relocalization target cloud digest",
-        )
-        .to_vec(),
-        asset_manifest_sha256: activated.asset_manifest_sha256.clone(),
-        asset_bundle_sha256: activated.asset_bundle_sha256.clone(),
-        source_policy_version: 1,
-        source_policy_sha256: matrix_policy_digest(
-            "b0e3c49266e73179cee77207a64680ee719e497886db18ea2267093c94a76aa8",
-            "source policy digest",
-        ),
-        deadline_policy_version: 1,
-        deadline_policy_sha256: matrix_policy_digest(
-            "cf2793085656ef81fadf12a80fb1147973ec71a77735a4a3e600ac1345b59c70",
-            "deadline policy digest",
-        ),
-        logical_timeout_ms: 30_000,
-        algorithm_options_version: 1,
-        algorithm_options_sha256: matrix_policy_digest(
-            "f8b5ef8b359eeb0129f6d523244ea8bca35102143f3bce28e619598749276090",
-            "algorithm policy digest",
-        ),
-        target_kind: activated.target_kind.clone(),
-        target_graph_sha256: activated.target_graph_sha256.clone(),
-        // This is the existing schema-1 cloud request, without an assigned branch.
-        planar_seed: None,
-        assigned_target: None,
+        assigned_target: Some(native_fixture_proto::relocalize_request::AssignedTarget::AssignedCloudV2(
+            native_fixture_proto::AssignedCloudRelocalizeRequestV2 {
+                target: activated.activation_receipt_v2.as_ref().unwrap().target.clone(),
+                policy: activated.relocalization_policy_v2.clone(),
+                logical_timeout_ms: 30_000,
+            }
+        )),
     }
 }
 
@@ -8904,1618 +8332,99 @@ fn matrix_relocalization_failure_diagnostic(
 }
 
 #[cfg(all(feature = "nuwax-lio-test-child", unix))]
-const MATRIX_EVIDENCE_DOMAIN_V1: &[u8] = b"nuwax.geometry.relocalize.evidence.v1\0";
-#[cfg(all(feature = "nuwax-lio-test-child", unix))]
-const MATRIX_EVIDENCE_DISCLOSURE_DOMAIN_V1: &[u8] =
-    b"nuwax.geometry.relocalize.evidence-disclosure.v1\0";
-#[cfg(all(feature = "nuwax-lio-test-child", unix))]
-const MATRIX_EVIDENCE_COMPOSITE_DOMAIN_V1: &[u8] =
-    b"nuwax.geometry.relocalize.evidence-composite.v1\0";
-#[cfg(all(feature = "nuwax-lio-test-child", unix))]
-const MATRIX_SOURCE_COMMITMENT_DOMAIN_V1: &[u8] =
-    b"nuwax.geometry.relocalize.source-commitment.v1\0";
-#[cfg(all(feature = "nuwax-lio-test-child", unix))]
-const MATRIX_TERMINAL_PROOF_DOMAIN_V1: &[u8] = b"nuwax.geometry.relocalize.terminal-proof.v1\0";
-
-#[cfg(all(feature = "nuwax-lio-test-child", unix))]
-struct MatrixProofCursor<'a> {
-    bytes: &'a [u8],
-    offset: usize,
-    label: &'static str,
+fn matrix_cloud_result(result: &native_fixture_proto::RelocalizeResult) -> &native_fixture_proto::AssignedCloudRelocalizeResultV2 {
+    assert_eq!(result.schema_version, 2);
+    assert!(result.assigned_planar_v2.is_none());
+    result.assigned_cloud_v2.as_ref().expect("assigned cloud result")
 }
 
 #[cfg(all(feature = "nuwax-lio-test-child", unix))]
-impl<'a> MatrixProofCursor<'a> {
-    fn new(bytes: &'a [u8], label: &'static str) -> Self {
-        Self {
-            bytes,
-            offset: 0,
-            label,
-        }
-    }
-
-    fn take_slice(&mut self, length: usize, field: &str) -> &'a [u8] {
-        let end = self
-            .offset
-            .checked_add(length)
-            .unwrap_or_else(|| panic!("matrix proof {} {field} offset overflow", self.label));
-        let value = self.bytes.get(self.offset..end).unwrap_or_else(|| {
-            panic!(
-                "matrix proof {} {field} truncated at byte {}",
-                self.label, self.offset
-            )
-        });
-        self.offset = end;
-        value
-    }
-
-    fn take<const N: usize>(&mut self, field: &str) -> [u8; N] {
-        self.take_slice(N, field)
-            .try_into()
-            .unwrap_or_else(|_| panic!("matrix proof {} {field} width drifted", self.label))
-    }
-
-    fn literal(&mut self, expected: &[u8], field: &str) {
-        assert_eq!(
-            self.take_slice(expected.len(), field),
-            expected,
-            "matrix proof {} {field} literal drifted",
-            self.label
-        );
-    }
-
-    fn u8(&mut self, field: &str) -> u8 {
-        self.take::<1>(field)[0]
-    }
-
-    fn flag(&mut self, field: &str) -> bool {
-        match self.u8(field) {
-            0 => false,
-            1 => true,
-            value => panic!(
-                "matrix proof {} {field} flag is not canonical: {value}",
-                self.label
-            ),
-        }
-    }
-
-    fn u32(&mut self, field: &str) -> u32 {
-        u32::from_be_bytes(self.take(field))
-    }
-
-    fn i32(&mut self, field: &str) -> i32 {
-        i32::from_be_bytes(self.take(field))
-    }
-
-    fn u64(&mut self, field: &str) -> u64 {
-        u64::from_be_bytes(self.take(field))
-    }
-
-    fn f32(&mut self, field: &str) -> f32 {
-        f32::from_be_bytes(self.take(field))
-    }
-
-    fn f64(&mut self, field: &str) -> f64 {
-        f64::from_be_bytes(self.take(field))
-    }
-
-    fn digest(&mut self, field: &str) -> [u8; 32] {
-        let digest = self.take(field);
-        assert!(
-            digest.iter().any(|byte| *byte != 0),
-            "matrix proof {} {field} digest is absent",
-            self.label
-        );
-        digest
-    }
-
-    fn string(&mut self, field: &str) -> String {
-        let length = usize::try_from(self.u32(&format!("{field} length")))
-            .expect("matrix proof string length fits usize");
-        assert!(
-            length <= 4_096,
-            "matrix proof {} {field} string exceeds v1 bounds",
-            self.label
-        );
-        std::str::from_utf8(self.take_slice(length, field))
-            .unwrap_or_else(|error| {
-                panic!("matrix proof {} {field} is not UTF-8: {error}", self.label)
-            })
-            .to_owned()
-    }
-
-    fn tag(&mut self, expected: u32) {
-        assert_eq!(
-            self.u32(&format!("field tag {expected}")),
-            expected,
-            "matrix proof {} field tag order drifted",
-            self.label
-        );
-    }
-
-    fn finish(self) {
-        assert_eq!(
-            self.offset,
-            self.bytes.len(),
-            "matrix proof {} has {} trailing bytes",
-            self.label,
-            self.bytes.len() - self.offset
-        );
-    }
+fn assert_matrix_relocalize_identity_echo(request: &native_fixture_proto::RelocalizeRequest, result: &native_fixture_proto::RelocalizeResult, scenario: &str) {
+    assert_eq!(result.request_id, request.request_id, "{scenario}");
+    assert_eq!(matrix_cloud_result(result).request.as_ref(), Some(request), "{scenario}");
 }
 
 #[cfg(all(feature = "nuwax-lio-test-child", unix))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct MatrixRelocalizationFrameKey {
-    mapping_commit_boot_nonce: [u8; 16],
-    mapping_commit_sequence: u64,
-    occupancy_revision: u64,
-    cloud_revision: u64,
-    registered_cloud_source_timestamp_ns: u64,
-    registered_cloud_source_sequence: u64,
-    correlated_odom_source_sequence: u64,
-}
-
-#[cfg(all(feature = "nuwax-lio-test-child", unix))]
-fn matrix_read_frame_key(
-    cursor: &mut MatrixProofCursor<'_>,
-    field: &str,
-) -> MatrixRelocalizationFrameKey {
-    let key = MatrixRelocalizationFrameKey {
-        mapping_commit_boot_nonce: cursor.take(&format!("{field} mapping_commit_boot_nonce")),
-        mapping_commit_sequence: cursor.u64(&format!("{field} mapping_commit_sequence")),
-        occupancy_revision: cursor.u64(&format!("{field} occupancy_revision")),
-        cloud_revision: cursor.u64(&format!("{field} cloud_revision")),
-        registered_cloud_source_timestamp_ns: cursor
-            .u64(&format!("{field} registered_cloud_source_timestamp_ns")),
-        registered_cloud_source_sequence: cursor
-            .u64(&format!("{field} registered_cloud_source_sequence")),
-        correlated_odom_source_sequence: cursor
-            .u64(&format!("{field} correlated_odom_source_sequence")),
-    };
-    assert!(key.mapping_commit_boot_nonce.iter().any(|byte| *byte != 0));
-    assert!(key.mapping_commit_sequence > 0);
-    assert!(key.occupancy_revision > 0);
-    assert!(key.cloud_revision > 0);
-    assert!(key.registered_cloud_source_sequence > 0);
-    assert!(key.correlated_odom_source_sequence > 0);
-    key
-}
-
-#[cfg(all(feature = "nuwax-lio-test-child", unix))]
-fn matrix_read_optional_frame_key(
-    cursor: &mut MatrixProofCursor<'_>,
-    field: &str,
-) -> Option<MatrixRelocalizationFrameKey> {
-    cursor
-        .flag(&format!("{field} present"))
-        .then(|| matrix_read_frame_key(cursor, field))
-}
-
-#[cfg(all(feature = "nuwax-lio-test-child", unix))]
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct MatrixProofTransform {
-    translation_m: [f64; 3],
-    rotation_xyzw: [f64; 4],
-    encoded: [u8; 56],
-}
-
-#[cfg(all(feature = "nuwax-lio-test-child", unix))]
-impl MatrixProofTransform {
-    fn isometry(self) -> nalgebra::Isometry3<f64> {
-        nalgebra::Isometry3::from_parts(
-            nalgebra::Translation3::new(
-                self.translation_m[0],
-                self.translation_m[1],
-                self.translation_m[2],
-            ),
-            nalgebra::UnitQuaternion::new_unchecked(nalgebra::Quaternion::new(
-                self.rotation_xyzw[3],
-                self.rotation_xyzw[0],
-                self.rotation_xyzw[1],
-                self.rotation_xyzw[2],
-            )),
-        )
-    }
-}
-
-#[cfg(all(feature = "nuwax-lio-test-child", unix))]
-fn matrix_read_proof_transform(
-    cursor: &mut MatrixProofCursor<'_>,
-    field: &str,
-) -> MatrixProofTransform {
-    let encoded = cursor.take::<56>(field);
-    let mut translation_m = [0.0; 3];
-    let mut rotation_xyzw = [0.0; 4];
-    for (index, value) in translation_m.iter_mut().enumerate() {
-        let start = index * 8;
-        *value = f64::from_be_bytes(encoded[start..start + 8].try_into().unwrap());
-    }
-    for (index, value) in rotation_xyzw.iter_mut().enumerate() {
-        let start = 24 + index * 8;
-        *value = f64::from_be_bytes(encoded[start..start + 8].try_into().unwrap());
-    }
-    assert!(
-        translation_m
-            .iter()
-            .chain(rotation_xyzw.iter())
-            .all(|value| value.is_finite()),
-        "matrix proof {field} contains a non-finite transform"
-    );
-    let norm_squared = rotation_xyzw.iter().map(|value| value * value).sum::<f64>();
-    assert!(
-        (norm_squared - 1.0).abs() <= 1.0e-6,
-        "matrix proof {field} quaternion is not unit length"
-    );
-    MatrixProofTransform {
-        translation_m,
-        rotation_xyzw,
-        encoded,
-    }
-}
-
-#[cfg(all(feature = "nuwax-lio-test-child", unix))]
-fn matrix_reencode_candidate_preimage(candidate: &DecodedCorrectionCandidate) -> Vec<u8> {
-    let mut encoded = Vec::with_capacity(512);
-    encoded.extend_from_slice(&2_i32.to_be_bytes());
-    encoded.extend_from_slice(&candidate.backend.to_be_bytes());
-    encoded.extend_from_slice(&candidate.transform_semantics.to_be_bytes());
-    encoded.extend_from_slice(&candidate.runtime_generation.to_be_bytes());
-    encoded.extend_from_slice(&candidate.backend_generation.to_be_bytes());
-    encoded.extend_from_slice(&candidate.candidate_sequence.to_be_bytes());
-    encode_candidate_lcm_string(&candidate.mapping_session_id, &mut encoded);
-    encoded.extend_from_slice(&candidate.mapping_session_generation.to_be_bytes());
-    encoded.extend_from_slice(&candidate.map_frame_generation.to_be_bytes());
-    encoded.extend_from_slice(&candidate.mapping_commit_boot_nonce);
-    encoded.extend_from_slice(&candidate.mapping_commit_sequence.to_be_bytes());
-    encoded.extend_from_slice(&candidate.occupancy_revision.to_be_bytes());
-    encoded.extend_from_slice(&candidate.cloud_revision.to_be_bytes());
-    encoded.extend_from_slice(&candidate.committed_map_source_timestamp_ns.to_be_bytes());
-    encoded.extend_from_slice(&candidate.registered_cloud_source_sequence.to_be_bytes());
-    encoded.extend_from_slice(&candidate.registered_cloud_source_timestamp_ns.to_be_bytes());
-    encoded.extend_from_slice(&candidate.registered_cloud_point_count.to_be_bytes());
-    encoded.extend_from_slice(&candidate.registered_cloud_envelope_sha256);
-    encoded.extend_from_slice(&candidate.body_points_sha256);
-    encoded.extend_from_slice(&candidate.correlated_odom_source_sequence.to_be_bytes());
-    encoded.extend_from_slice(&candidate.correlated_odom_source_timestamp_ns.to_be_bytes());
-    encoded.extend_from_slice(&candidate.correlated_odom_pose_sha256);
-    encoded.extend_from_slice(&candidate.committed_map_width.to_be_bytes());
-    encoded.extend_from_slice(&candidate.committed_map_height.to_be_bytes());
-    encoded.extend_from_slice(&candidate.committed_map_resolution_m.to_be_bytes());
-    encoded.extend_from_slice(&candidate.committed_map_origin_x_m.to_be_bytes());
-    encoded.extend_from_slice(&candidate.committed_map_origin_y_m.to_be_bytes());
-    encoded.extend_from_slice(&candidate.committed_map_payload_sha256);
-    encoded.extend_from_slice(&candidate.committed_map_boundary_sha256);
-    encoded.extend_from_slice(&candidate.source_timestamp_ns.to_be_bytes());
-    encode_candidate_lcm_string(&candidate.map_frame_id, &mut encoded);
-    encode_candidate_lcm_string(&candidate.odom_frame_id, &mut encoded);
-    encode_candidate_lcm_string(&candidate.body_frame_id, &mut encoded);
-    encode_candidate_lcm_string(&candidate.points_frame_id, &mut encoded);
-    encoded.extend_from_slice(&candidate.correction_lease_boot_nonce);
-    encoded.extend_from_slice(&candidate.correction_lease_generation.to_be_bytes());
-    for value in candidate
-        .translation_m
-        .iter()
-        .chain(candidate.rotation_xyzw.iter())
-    {
-        encoded.extend_from_slice(&value.to_be_bytes());
-    }
-    encode_candidate_trajectory(&candidate.trajectory, &mut encoded);
-    encoded
-}
-
-#[cfg(all(feature = "nuwax-lio-test-child", unix))]
-fn matrix_validate_candidate_proof(
-    result: &native_fixture_proto::RelocalizeResult,
-    scenario: &str,
-) -> DecodedCorrectionCandidate {
-    let preimage = result.candidate_payload_preimage_v1.as_slice();
-    assert!(
-        !preimage.is_empty() && preimage.len() <= 4_096,
-        "{scenario}: field 29 is outside the candidate preimage bound"
-    );
-    let expected_digest = matrix_digest32(
-        &result.candidate_payload_sha256,
-        "matrix candidate payload digest",
-    );
-    assert_eq!(
-        nuwax_codec::sha256_bytes(preimage),
-        expected_digest,
-        "{scenario}: field 24 does not hash the complete field 29"
-    );
-    let mut body = preimage.to_vec();
-    body.extend_from_slice(&expected_digest);
-    let binding = typed_binding(
-        "/matrix/relocalization/candidate-proof",
-        "nuwax_msgs.CorrectionCandidate",
-    );
-    let frame = nuwax_protocol::RawLcmFrameBuilder::new(binding.0, binding.1)
-        .seqno(1)
-        .payload(body)
-        .build();
+fn matrix_validate_assigned_candidate(result: &native_fixture_proto::RelocalizeResult, playback: &MatrixPlayback, published: &MatrixPublishedFrame, scenario: &str) -> DecodedCorrectionCandidate {
+    let body = matrix_cloud_result(result);
+    assert!(!body.candidate_payload_v3.is_empty() && body.candidate_payload_v3.len() <= 4096);
+    let binding = typed_binding("/matrix/relocalization/candidate", "nuwax_msgs.CorrectionCandidate");
+    let frame = nuwax_protocol::RawLcmFrameBuilder::new(binding.0, binding.1).seqno(1).payload(body.candidate_payload_v3.clone()).build();
     let candidate = decode_correction_candidate(&frame);
     assert_eq!(candidate.backend, 3, "{scenario}");
-    assert_eq!(candidate.transform_semantics, 1, "{scenario}");
-    assert!(candidate.committed_map_width <= u64::from(u32::MAX));
-    assert!(candidate.committed_map_height <= u64::from(u32::MAX));
-    assert_eq!(
-        matrix_reencode_candidate_preimage(&candidate),
-        preimage,
-        "{scenario}: field 29 is not the canonical literal LCM prefix"
-    );
-    assert_eq!(candidate.payload_sha256, expected_digest, "{scenario}");
-    assert_eq!(
-        candidate.runtime_generation, result.runtime_generation,
-        "{scenario}"
-    );
-    assert_eq!(
-        candidate.candidate_sequence, result.candidate_sequence,
-        "{scenario}"
-    );
-    assert_eq!(
-        candidate.mapping_session_id, result.session_id,
-        "{scenario}"
-    );
-    assert_eq!(
-        candidate.mapping_session_generation, result.session_generation,
-        "{scenario}"
-    );
+    assert_eq!(candidate.candidate_sequence, 1, "{scenario}");
+    let request = body.request.as_ref().unwrap();
+    let native_fixture_proto::relocalize_request::AssignedTarget::AssignedCloudV2(assigned) = request.assigned_target.as_ref().unwrap() else { panic!("cloud request required") };
+    let activation = assigned.target.as_ref().unwrap().activation.as_ref().unwrap();
+    let metadata = activation.request.as_ref().unwrap();
+    assert_eq!(candidate.runtime_generation, activation.runtime_generation);
+    assert_eq!(candidate.mapping_session_id, metadata.session_id);
+    assert_eq!(candidate.mapping_session_generation, activation.session_generation);
+    assert_eq!(candidate.mapping_backend_kind, activation.backend_kind);
+    assert_eq!(candidate.mapping_backend_generation, activation.backend_generation);
+    let evidence = body.evidence.as_ref().expect("typed source and outcome evidence");
+    assert_eq!(evidence.schema_version, 2);
+    assert_eq!(evidence.phase, native_fixture_proto::AssignedRelocalizationEvidencePhaseV2::Finalized as i32);
+    assert!(evidence.admission_ordinal.is_some_and(|ordinal| ordinal > 0));
+    let owner = evidence.owner.as_ref().unwrap();
+    assert_eq!(owner.runtime_generation, candidate.runtime_generation);
+    assert_eq!(owner.correction_backend_generation, candidate.backend_generation);
+    assert_eq!(owner.correction_lease_boot_nonce, candidate.correction_lease_boot_nonce);
+    assert_eq!(owner.correction_lease_generation, candidate.correction_lease_generation);
+    assert_eq!(owner.map_frame_id, candidate.map_frame_id);
+    assert_eq!(owner.odom_frame_id, candidate.odom_frame_id);
+    assert_eq!(owner.body_frame_id, candidate.body_frame_id);
+    assert!(!evidence.source_frames.is_empty());
+    for source in &evidence.source_frames {
+        let input = &playback.source_frames[usize::try_from(source.source_sequence - 1).unwrap()];
+        assert_eq!(source.admitted_point_count, input.cloud.points.len() as u64);
+        assert_eq!(source.runtime_generation, candidate.runtime_generation);
+        assert_eq!(source.runtime_generation, candidate.registered_cloud_runtime_generation);
+        assert_eq!(source.lio_backend, candidate.registered_cloud_backend);
+    }
+    let source = evidence.source_frames.last().unwrap();
+    let receipt = source.occupancy_receipt.as_ref().unwrap();
+    let commit = receipt.commit_id.as_ref().unwrap();
+    assert_eq!(commit.boot_nonce, candidate.mapping_commit_boot_nonce);
+    assert_eq!(commit.sequence, candidate.mapping_commit_sequence);
+    assert_eq!(receipt.session_id, candidate.mapping_session_id);
+    assert_eq!(receipt.session_generation, candidate.mapping_session_generation);
+    assert_eq!(receipt.backend_kind, candidate.mapping_backend_kind);
+    assert_eq!(receipt.backend_generation, candidate.mapping_backend_generation);
+    assert_eq!(receipt.occupancy_revision, candidate.occupancy_revision);
+    assert_eq!(receipt.source_timestamp_ns, candidate.committed_map_source_timestamp_ns);
+    assert_eq!(source.cloud_revision, candidate.cloud_revision);
+    assert_eq!(source.map_frame_generation, candidate.map_frame_generation);
+    assert_eq!(source.source_sequence, candidate.registered_cloud_source_sequence);
+    assert_eq!(source.source_timestamp_ns, candidate.registered_cloud_source_timestamp_ns);
+    assert_eq!(source.admitted_point_count, candidate.registered_cloud_point_count);
+    assert_eq!(source.correlated_odom_source_sequence, candidate.correlated_odom_source_sequence);
+    assert_eq!(source.correlated_odom_source_timestamp_ns, candidate.correlated_odom_source_timestamp_ns);
+    assert_eq!(source.points_frame_id, candidate.points_frame_id);
+    let frozen = source.odom_from_body.as_ref().unwrap();
+    assert_eq!(frozen.translation_m_bits, candidate.correlated_odom_translation_m.map(f64::to_bits));
+    assert_eq!(frozen.rotation_xyzw_bits, candidate.correlated_odom_rotation_xyzw.map(f64::to_bits));
+    let actual_odom = decode_public_odometry(&published.odometry);
+    assert_eq!(frozen.translation_m_bits, actual_odom.odometry.pose.position.map(f64::to_bits));
+    assert_eq!(frozen.rotation_xyzw_bits, actual_odom.odometry.pose.orientation_xyzw.map(f64::to_bits));
+    let actual_cloud = decode_public_cloud(&published.cloud);
+    assert_eq!(source.source_sequence, actual_cloud.source_sequence as u64);
+    assert_eq!(source.source_timestamp_ns, actual_cloud.source_timestamp_ns as u64);
+    assert_eq!(source.admitted_point_count, actual_cloud.emitted_point_count as u64);
+    let geometry = source.map_geometry.as_ref().unwrap();
+    assert_eq!(geometry.width, candidate.committed_map_width);
+    assert_eq!(geometry.height, candidate.committed_map_height);
+    assert_eq!(geometry.resolution_m_bits, candidate.committed_map_resolution_m.to_bits());
+    assert_eq!(geometry.origin_x_m_bits, candidate.committed_map_origin_x_m.to_bits());
+    assert_eq!(geometry.origin_y_m_bits, candidate.committed_map_origin_y_m.to_bits());
+    let algorithm = evidence.algorithm.as_ref().unwrap();
+    assert!(algorithm.converged && algorithm.accepted);
+    assert!(f64::from_bits(algorithm.mse_bits).is_finite());
+    assert!(f64::from_bits(algorithm.fitness_bits).is_finite());
+    let correction = algorithm.proposed_correction.as_ref().unwrap();
+    assert_eq!(correction.translation_m_bits, candidate.translation_m.map(f64::to_bits));
+    assert_eq!(correction.rotation_xyzw_bits, candidate.rotation_xyzw.map(f64::to_bits));
     candidate
-}
-
-#[cfg(all(feature = "nuwax-lio-test-child", unix))]
-fn matrix_candidate_frame_key(
-    candidate: &DecodedCorrectionCandidate,
-) -> MatrixRelocalizationFrameKey {
-    MatrixRelocalizationFrameKey {
-        mapping_commit_boot_nonce: candidate.mapping_commit_boot_nonce,
-        mapping_commit_sequence: candidate.mapping_commit_sequence,
-        occupancy_revision: candidate.occupancy_revision,
-        cloud_revision: candidate.cloud_revision,
-        registered_cloud_source_timestamp_ns: candidate.registered_cloud_source_timestamp_ns,
-        registered_cloud_source_sequence: candidate.registered_cloud_source_sequence,
-        correlated_odom_source_sequence: candidate.correlated_odom_source_sequence,
-    }
-}
-
-#[cfg(all(feature = "nuwax-lio-test-child", unix))]
-fn matrix_map_boundary_sha256(
-    map_frame_id: &str,
-    width: u64,
-    height: u64,
-    resolution_m: f64,
-    origin_x_m: f64,
-    origin_y_m: f64,
-) -> [u8; 32] {
-    let mut preimage = b"nuwax.correction.committed-map-boundary.v1\0".to_vec();
-    encode_candidate_lcm_string(map_frame_id, &mut preimage);
-    preimage.extend_from_slice(
-        &i64::try_from(width)
-            .expect("matrix map width fits signed LCM integer")
-            .to_be_bytes(),
-    );
-    preimage.extend_from_slice(
-        &i64::try_from(height)
-            .expect("matrix map height fits signed LCM integer")
-            .to_be_bytes(),
-    );
-    preimage.extend_from_slice(&resolution_m.to_be_bytes());
-    preimage.extend_from_slice(&origin_x_m.to_be_bytes());
-    preimage.extend_from_slice(&origin_y_m.to_be_bytes());
-    nuwax_codec::sha256_bytes(&preimage)
-}
-
-#[cfg(all(feature = "nuwax-lio-test-child", unix))]
-#[derive(Debug)]
-struct MatrixEvidenceTarget {
-    runtime_generation: u64,
-    session_id: String,
-    map_name: String,
-    session_generation: u64,
-    backend_generation: u64,
-    activation_identity_sha256: [u8; 32],
-    target_receipt_sha256: [u8; 32],
-    asset_manifest_sha256: Option<[u8; 32]>,
-    asset_bundle_sha256: Option<[u8; 32]>,
-    frame_id: String,
-    source_revision: u64,
-    xyz_sha256: [u8; 32],
-}
-
-#[cfg(all(feature = "nuwax-lio-test-child", unix))]
-#[derive(Debug)]
-struct MatrixEvidenceFrame {
-    key: MatrixRelocalizationFrameKey,
-    mapping_session_id: String,
-    mapping_session_generation: u64,
-    map_frame_generation: u64,
-    point_count: u64,
-    envelope_sha256: [u8; 32],
-    body_points_sha256: [u8; 32],
-    odom_source_timestamp_ns: u64,
-    odom_pose_sha256: [u8; 32],
-    map_source_timestamp_ns: u64,
-    map_width: u64,
-    map_height: u64,
-    map_resolution_m: f64,
-    map_origin_x_m: f64,
-    map_origin_y_m: f64,
-    map_payload_sha256: [u8; 32],
-    map_boundary_sha256: [u8; 32],
-    points_frame_id: String,
-    odom_from_body: MatrixProofTransform,
-    base_anchor_map_from_odom: MatrixProofTransform,
-}
-
-#[cfg(all(feature = "nuwax-lio-test-child", unix))]
-#[derive(Debug)]
-struct MatrixEvidenceAlgorithm {
-    accepted: bool,
-    correction: Option<MatrixProofTransform>,
-}
-
-#[cfg(all(feature = "nuwax-lio-test-child", unix))]
-#[derive(Debug)]
-struct MatrixEvidenceCandidate {
-    backend: i32,
-    transform_semantics: i32,
-    runtime_generation: u64,
-    backend_generation: u64,
-    candidate_sequence: u64,
-    mapping_session_id: String,
-    mapping_session_generation: u64,
-    map_frame_generation: u64,
-    frame_key: MatrixRelocalizationFrameKey,
-    correction_lease_boot_nonce: [u8; 16],
-    correction_lease_generation: u64,
-    transform: MatrixProofTransform,
-    payload_sha256: [u8; 32],
-}
-
-#[cfg(all(feature = "nuwax-lio-test-child", unix))]
-#[derive(Debug)]
-struct MatrixEvidenceAnchors {
-    request_identity_sha256: [u8; 32],
-    admission_ordinal: Option<u64>,
-    normalized_logical_timeout_ms: Option<u64>,
-    runtime_generation: u64,
-    activated_mapping_backend_generation: u64,
-    correction_owner_backend_generation: u64,
-    session_id: String,
-    map_name: String,
-    session_generation: u64,
-    map_frame_id: String,
-    odom_frame_id: String,
-    body_frame_id: String,
-    activation_identity_sha256: [u8; 32],
-    target_receipt_sha256: [u8; 32],
-    asset_manifest_sha256: [u8; 32],
-    asset_bundle_sha256: [u8; 32],
-    source_policy_version: u32,
-    source_policy_sha256: [u8; 32],
-    deadline_policy_version: u32,
-    deadline_policy_sha256: [u8; 32],
-    algorithm_options_version: u32,
-    algorithm_options_sha256: [u8; 32],
-    target: MatrixEvidenceTarget,
-    frames: Vec<MatrixEvidenceFrame>,
-    aggregate_input_points: u64,
-    post_transform_points: u64,
-    emitted_points: u64,
-    boundary_key: MatrixRelocalizationFrameKey,
-    source_length: usize,
-    source_sha256: [u8; 32],
-    algorithm: MatrixEvidenceAlgorithm,
-    candidate: Option<MatrixEvidenceCandidate>,
-    terminal_disposition: i32,
-    correction_revision: u64,
-    detail: String,
-}
-
-#[cfg(all(feature = "nuwax-lio-test-child", unix))]
-fn matrix_parse_mode1_evidence(
-    prefix: &[u8],
-    source_length: usize,
-    source_sha256: [u8; 32],
-    suffix: &[u8],
-) -> MatrixEvidenceAnchors {
-    let mut prefix_cursor = MatrixProofCursor::new(prefix, "prefix");
-    prefix_cursor.literal(MATRIX_EVIDENCE_DOMAIN_V1, "domain");
-    assert_eq!(prefix_cursor.u32("schema_version"), 1);
-
-    prefix_cursor.tag(1);
-    let request_identity_sha256 = prefix_cursor.digest("request_identity_sha256");
-    prefix_cursor.tag(2);
-    let admission_ordinal = prefix_cursor
-        .flag("admission_ordinal present")
-        .then(|| prefix_cursor.u64("admission_ordinal"));
-    prefix_cursor.tag(3);
-    let normalized_logical_timeout_ms = prefix_cursor
-        .flag("normalized_logical_timeout_ms present")
-        .then(|| prefix_cursor.u64("normalized_logical_timeout_ms"));
-    prefix_cursor.tag(4);
-    let runtime_generation = prefix_cursor.u64("runtime_generation");
-    prefix_cursor.tag(5);
-    let activated_mapping_backend_generation =
-        prefix_cursor.u64("activated_mapping_backend_generation");
-    prefix_cursor.tag(6);
-    let correction_owner_backend_generation =
-        prefix_cursor.u64("correction_owner_backend_generation");
-    prefix_cursor.tag(7);
-    let session_id = prefix_cursor.string("session_id");
-    prefix_cursor.tag(8);
-    let map_name = prefix_cursor.string("map_name");
-    prefix_cursor.tag(9);
-    let session_generation = prefix_cursor.u64("session_generation");
-    prefix_cursor.tag(10);
-    let map_frame_id = prefix_cursor.string("map_frame_id");
-    prefix_cursor.tag(11);
-    let odom_frame_id = prefix_cursor.string("odom_frame_id");
-    prefix_cursor.tag(12);
-    let body_frame_id = prefix_cursor.string("body_frame_id");
-    assert!(!map_frame_id.is_empty() && !odom_frame_id.is_empty() && !body_frame_id.is_empty());
-    assert_ne!(map_frame_id, odom_frame_id);
-    assert_ne!(map_frame_id, body_frame_id);
-    assert_ne!(odom_frame_id, body_frame_id);
-    prefix_cursor.tag(13);
-    let activation_identity_sha256 = prefix_cursor.digest("activation_identity_sha256");
-    prefix_cursor.tag(14);
-    let target_receipt_sha256 = prefix_cursor.digest("target_receipt_sha256");
-    prefix_cursor.tag(15);
-    let asset_manifest_sha256 = prefix_cursor.digest("asset_manifest_sha256");
-    prefix_cursor.tag(16);
-    let asset_bundle_sha256 = prefix_cursor.digest("asset_bundle_sha256");
-    prefix_cursor.tag(17);
-    let source_policy_version = prefix_cursor.u32("source_policy_version");
-    let source_policy_sha256 = prefix_cursor.digest("source_policy_sha256");
-    prefix_cursor.tag(18);
-    let deadline_policy_version = prefix_cursor.u32("deadline_policy_version");
-    let deadline_policy_sha256 = prefix_cursor.digest("deadline_policy_sha256");
-    prefix_cursor.tag(19);
-    let algorithm_options_version = prefix_cursor.u32("algorithm_options_version");
-    let algorithm_options_sha256 = prefix_cursor.digest("algorithm_options_sha256");
-
-    prefix_cursor.tag(20);
-    assert!(prefix_cursor.flag("target present"));
-    prefix_cursor.literal(b"target.v1\0", "target domain");
-    let target_runtime_generation = prefix_cursor.u64("target runtime_generation");
-    let target_lifecycle_epoch = prefix_cursor.u64("target lifecycle_epoch");
-    let target_session_id = prefix_cursor.string("target session_id");
-    let target_map_name = prefix_cursor.string("target map_name");
-    let target_session_generation = prefix_cursor.u64("target session_generation");
-    let target_backend_generation = prefix_cursor.u64("target backend_generation");
-    let _activation_request_id = prefix_cursor.string("activation_request_id");
-    let _activation_request_identity_sha256 =
-        prefix_cursor.digest("activation_request_identity_sha256");
-    let target_activation_identity_sha256 =
-        prefix_cursor.digest("target activation_identity_sha256");
-    let target_target_receipt_sha256 = prefix_cursor.digest("target target_receipt_sha256");
-    let target_asset_manifest_sha256 = prefix_cursor
-        .flag("target asset_manifest_sha256 present")
-        .then(|| prefix_cursor.digest("target asset_manifest_sha256"));
-    let target_asset_bundle_sha256 = prefix_cursor
-        .flag("target asset_bundle_sha256 present")
-        .then(|| prefix_cursor.digest("target asset_bundle_sha256"));
-    let target_frame_id = prefix_cursor.string("target frame_id");
-    let target_source_revision = prefix_cursor.u64("target source_revision");
-    let target_point_count = prefix_cursor.u32("target point_count");
-    let target_voxel_size = prefix_cursor.f32("target voxel_size");
-    let target_payload_schema_version = prefix_cursor.u32("target payload_schema_version");
-    let target_xyz_length = prefix_cursor.u64("target xyz length");
-    let target_xyz_sha256 = prefix_cursor.digest("target xyz_sha256");
-    let target_decoded_point_count = prefix_cursor.u64("target decoded_point_count");
-    let target_decoded_f64_bytes = prefix_cursor.u64("target decoded_f64_bytes");
-    let _target_decoded_sha256 = prefix_cursor.digest("target decoded_sha256");
-    let publication_source_timestamp_ns =
-        prefix_cursor.u64("target publication source_timestamp_ns");
-    let publication_cloud_revision = prefix_cursor.u64("target publication cloud_revision");
-    let publication_point_count = prefix_cursor.u32("target publication point_count");
-    let publication_voxel_size = prefix_cursor.f32("target publication voxel_size");
-    let publication_mapping_commit_boot_nonce =
-        prefix_cursor.take::<16>("target publication mapping_commit_boot_nonce");
-    let publication_mapping_commit_sequence =
-        prefix_cursor.u64("target publication mapping_commit_sequence");
-    let publication_session_generation = prefix_cursor.u64("target publication session_generation");
-    let publication_occupancy_revision = prefix_cursor.u64("target publication occupancy_revision");
-    let publication_receipt_cloud_revision =
-        prefix_cursor.u64("target publication receipt cloud_revision");
-    let publication_receipt_source_timestamp_ns =
-        prefix_cursor.u64("target publication receipt source_timestamp_ns");
-    let publication_receipt_point_count =
-        prefix_cursor.u32("target publication receipt point_count");
-    let publication_target_receipt_sha256 =
-        prefix_cursor.digest("target publication target_receipt_sha256");
-    assert!(target_runtime_generation > 0);
-    assert!(target_lifecycle_epoch > 0);
-    assert!(target_session_generation > 0);
-    assert!(target_backend_generation > 0);
-    assert!(target_source_revision > 0);
-    assert!(target_point_count > 0);
-    assert!(target_voxel_size.is_finite() && target_voxel_size > 0.0);
-    assert_eq!(target_payload_schema_version, 1);
-    assert_eq!(target_xyz_length, u64::from(target_point_count) * 12);
-    assert_eq!(target_decoded_point_count, u64::from(target_point_count));
-    assert_eq!(target_decoded_f64_bytes, u64::from(target_point_count) * 24);
-    assert!(publication_cloud_revision > 0);
-    assert_eq!(publication_point_count, target_point_count);
-    assert_eq!(
-        publication_voxel_size.to_bits(),
-        target_voxel_size.to_bits()
-    );
-    assert!(publication_mapping_commit_boot_nonce
-        .iter()
-        .any(|byte| *byte != 0));
-    assert!(publication_mapping_commit_sequence > 0);
-    assert_eq!(publication_session_generation, target_session_generation);
-    assert!(publication_occupancy_revision > 0);
-    assert_eq!(
-        publication_receipt_cloud_revision,
-        publication_cloud_revision
-    );
-    assert_eq!(
-        publication_receipt_source_timestamp_ns,
-        publication_source_timestamp_ns
-    );
-    assert_eq!(publication_receipt_point_count, publication_point_count);
-    assert_eq!(
-        publication_target_receipt_sha256,
-        target_target_receipt_sha256
-    );
-    let target = MatrixEvidenceTarget {
-        runtime_generation: target_runtime_generation,
-        session_id: target_session_id,
-        map_name: target_map_name,
-        session_generation: target_session_generation,
-        backend_generation: target_backend_generation,
-        activation_identity_sha256: target_activation_identity_sha256,
-        target_receipt_sha256: target_target_receipt_sha256,
-        asset_manifest_sha256: target_asset_manifest_sha256,
-        asset_bundle_sha256: target_asset_bundle_sha256,
-        frame_id: target_frame_id,
-        source_revision: target_source_revision,
-        xyz_sha256: target_xyz_sha256,
-    };
-
-    prefix_cursor.tag(21);
-    assert!(prefix_cursor.flag("source present"));
-    prefix_cursor.literal(b"source.v1\0", "source domain");
-    let _arm_watermark = matrix_read_optional_frame_key(&mut prefix_cursor, "source arm_watermark");
-    let cutoff_reason = prefix_cursor.u32("source cutoff_reason");
-    let last_accepted_key =
-        matrix_read_optional_frame_key(&mut prefix_cursor, "source last_accepted_key");
-    let frame_count = usize::try_from(prefix_cursor.u32("source frame_count"))
-        .expect("matrix source frame count fits usize");
-    assert!((1..=8).contains(&frame_count));
-    let mut frames = Vec::with_capacity(frame_count);
-    for index in 0..frame_count {
-        let frame_name = format!("source frame {index}");
-        prefix_cursor.literal(b"frame.v1\0", &format!("{frame_name} domain"));
-        let key = matrix_read_frame_key(&mut prefix_cursor, &format!("{frame_name} key"));
-        let mapping_session_id = prefix_cursor.string(&format!("{frame_name} mapping_session_id"));
-        let mapping_session_generation =
-            prefix_cursor.u64(&format!("{frame_name} mapping_session_generation"));
-        let map_frame_generation = prefix_cursor.u64(&format!("{frame_name} map_frame_generation"));
-        let point_count = prefix_cursor.u64(&format!("{frame_name} point_count"));
-        let envelope_sha256 = prefix_cursor.digest(&format!("{frame_name} envelope_sha256"));
-        let body_points_sha256 = prefix_cursor.digest(&format!("{frame_name} body_points_sha256"));
-        let odom_source_timestamp_ns =
-            prefix_cursor.u64(&format!("{frame_name} odom_source_timestamp_ns"));
-        let odom_pose_sha256 = prefix_cursor.digest(&format!("{frame_name} odom_pose_sha256"));
-        let map_source_timestamp_ns =
-            prefix_cursor.u64(&format!("{frame_name} map_source_timestamp_ns"));
-        let map_width = prefix_cursor.u64(&format!("{frame_name} map_width"));
-        let map_height = prefix_cursor.u64(&format!("{frame_name} map_height"));
-        let map_resolution_m = prefix_cursor.f64(&format!("{frame_name} map_resolution_m"));
-        let map_origin_x_m = prefix_cursor.f64(&format!("{frame_name} map_origin_x_m"));
-        let map_origin_y_m = prefix_cursor.f64(&format!("{frame_name} map_origin_y_m"));
-        let map_payload_sha256 = prefix_cursor.digest(&format!("{frame_name} map_payload_sha256"));
-        let map_boundary_sha256 =
-            prefix_cursor.digest(&format!("{frame_name} map_boundary_sha256"));
-        let points_frame_id = prefix_cursor.string(&format!("{frame_name} points_frame_id"));
-        let odom_from_body = matrix_read_proof_transform(
-            &mut prefix_cursor,
-            &format!("{frame_name} odom_from_body"),
-        );
-        let base_anchor_map_from_odom = matrix_read_proof_transform(
-            &mut prefix_cursor,
-            &format!("{frame_name} base_anchor_map_from_odom"),
-        );
-        let _frame_evidence_sha256 = prefix_cursor.digest(&format!("{frame_name} evidence_sha256"));
-        assert_eq!(mapping_session_id, session_id);
-        assert_eq!(mapping_session_generation, session_generation);
-        assert!(map_frame_generation > 0);
-        assert!((1..=100_000).contains(&point_count));
-        assert!(odom_source_timestamp_ns <= key.registered_cloud_source_timestamp_ns);
-        assert!(map_source_timestamp_ns <= key.registered_cloud_source_timestamp_ns);
-        assert!((1..=u64::from(u32::MAX)).contains(&map_width));
-        assert!((1..=u64::from(u32::MAX)).contains(&map_height));
-        assert!(map_width.checked_mul(map_height).is_some());
-        assert!(map_resolution_m.is_finite() && map_resolution_m > 0.0);
-        assert!(map_origin_x_m.is_finite() && map_origin_y_m.is_finite());
-        assert_eq!(points_frame_id, body_frame_id);
-        assert_eq!(
-            matrix_map_boundary_sha256(
-                &map_frame_id,
-                map_width,
-                map_height,
-                map_resolution_m,
-                map_origin_x_m,
-                map_origin_y_m,
-            ),
-            map_boundary_sha256
-        );
-        frames.push(MatrixEvidenceFrame {
-            key,
-            mapping_session_id,
-            mapping_session_generation,
-            map_frame_generation,
-            point_count,
-            envelope_sha256,
-            body_points_sha256,
-            odom_source_timestamp_ns,
-            odom_pose_sha256,
-            map_source_timestamp_ns,
-            map_width,
-            map_height,
-            map_resolution_m,
-            map_origin_x_m,
-            map_origin_y_m,
-            map_payload_sha256,
-            map_boundary_sha256,
-            points_frame_id,
-            odom_from_body,
-            base_anchor_map_from_odom,
-        });
-    }
-    let aggregate_input_points = prefix_cursor.u64("source aggregate_input_points");
-    let aggregate_input_f64_bytes = prefix_cursor.u64("source aggregate_input_f64_bytes");
-    let post_transform_points = prefix_cursor.u64("source post_transform_points");
-    let post_transform_f64_bytes = prefix_cursor.u64("source post_transform_f64_bytes");
-    let emitted_points = prefix_cursor.u64("source emitted_points");
-    prefix_cursor.literal(
-        MATRIX_SOURCE_COMMITMENT_DOMAIN_V1,
-        "source commitment domain",
-    );
-    assert_eq!(prefix_cursor.u32("source commitment version"), 1);
-    let committed_source_length = usize::try_from(prefix_cursor.u64("source commitment length"))
-        .expect("matrix committed source length fits usize");
-    let committed_source_sha256 = prefix_cursor.digest("source commitment sha256");
-    prefix_cursor.finish();
-
-    let frame_keys = frames.iter().map(|frame| frame.key).collect::<Vec<_>>();
-    let mut sorted_keys = frame_keys.clone();
-    sorted_keys.sort_unstable();
-    sorted_keys.dedup();
-    assert_eq!(frame_keys, sorted_keys);
-    assert!((1..=14).contains(&cutoff_reason));
-    assert_eq!(last_accepted_key, frame_keys.last().copied());
-    assert_eq!(
-        aggregate_input_points,
-        frames.iter().map(|frame| frame.point_count).sum::<u64>()
-    );
-    assert_eq!(aggregate_input_f64_bytes, aggregate_input_points * 24);
-    assert_eq!(post_transform_points, aggregate_input_points);
-    assert_eq!(post_transform_f64_bytes, post_transform_points * 24);
-    assert!((50_000..=100_000).contains(&emitted_points));
-    assert!(emitted_points <= post_transform_points);
-    assert_eq!(committed_source_length, source_length);
-    assert_eq!(
-        source_length,
-        8 + usize::try_from(emitted_points).unwrap() * 24
-    );
-    assert_eq!(committed_source_sha256, source_sha256);
-
-    let mut suffix_cursor = MatrixProofCursor::new(suffix, "suffix");
-    let boundary_key = matrix_read_frame_key(&mut suffix_cursor, "source boundary_key");
-    let boundary_base_anchor_map_from_odom = matrix_read_proof_transform(
-        &mut suffix_cursor,
-        "source boundary_base_anchor_map_from_odom",
-    );
-    let boundary_frame = frames.last().expect("matrix evidence boundary frame");
-    assert_eq!(boundary_key, boundary_frame.key);
-    assert_eq!(
-        boundary_base_anchor_map_from_odom.encoded,
-        boundary_frame.base_anchor_map_from_odom.encoded
-    );
-
-    suffix_cursor.tag(22);
-    assert!(suffix_cursor.flag("algorithm present"));
-    suffix_cursor.literal(b"algorithm.v1\0", "algorithm domain");
-    let converged = suffix_cursor.flag("algorithm converged");
-    let mse = suffix_cursor.f64("algorithm mse");
-    let _iterations = suffix_cursor.u64("algorithm iterations");
-    let _feature_matches = suffix_cursor.u64("algorithm feature_matches");
-    let _ransac_inliers = suffix_cursor.u64("algorithm ransac_inliers");
-    let fitness = suffix_cursor.f64("algorithm fitness");
-    let _algorithm_transform =
-        matrix_read_proof_transform(&mut suffix_cursor, "algorithm transform");
-    let accepted = suffix_cursor.flag("algorithm accepted");
-    let correction = suffix_cursor
-        .flag("algorithm correction present")
-        .then(|| matrix_read_proof_transform(&mut suffix_cursor, "algorithm correction"));
-    assert!(!mse.is_nan() && mse >= 0.0);
-    assert!(mse.is_finite() || (!converged && !accepted));
-    assert!(fitness.is_finite() && (0.0..=1.0).contains(&fitness));
-    assert_eq!(accepted, correction.is_some());
-    assert!(!accepted || converged);
-    let algorithm = MatrixEvidenceAlgorithm {
-        accepted,
-        correction,
-    };
-
-    suffix_cursor.tag(23);
-    let candidate = suffix_cursor.flag("candidate present").then(|| {
-        suffix_cursor.literal(b"candidate.v1\0", "candidate domain");
-        let candidate = MatrixEvidenceCandidate {
-            backend: suffix_cursor.i32("candidate backend"),
-            transform_semantics: suffix_cursor.i32("candidate transform_semantics"),
-            runtime_generation: suffix_cursor.u64("candidate runtime_generation"),
-            backend_generation: suffix_cursor.u64("candidate backend_generation"),
-            candidate_sequence: suffix_cursor.u64("candidate candidate_sequence"),
-            mapping_session_id: suffix_cursor.string("candidate mapping_session_id"),
-            mapping_session_generation: suffix_cursor.u64("candidate mapping_session_generation"),
-            map_frame_generation: suffix_cursor.u64("candidate map_frame_generation"),
-            frame_key: matrix_read_frame_key(&mut suffix_cursor, "candidate frame_key"),
-            correction_lease_boot_nonce: suffix_cursor
-                .take("candidate correction_lease_boot_nonce"),
-            correction_lease_generation: suffix_cursor.u64("candidate correction_lease_generation"),
-            transform: matrix_read_proof_transform(&mut suffix_cursor, "candidate transform"),
-            payload_sha256: suffix_cursor.digest("candidate payload_sha256"),
-        };
-        assert_eq!(candidate.backend, 3);
-        assert_eq!(candidate.transform_semantics, 1);
-        assert!(candidate.runtime_generation > 0);
-        assert!(candidate.backend_generation > 0);
-        assert!(candidate.candidate_sequence > 0);
-        assert!(candidate.mapping_session_generation > 0);
-        assert!(candidate.map_frame_generation > 0);
-        assert!(candidate.correction_lease_generation > 0);
-        assert!(candidate
-            .correction_lease_boot_nonce
-            .iter()
-            .any(|byte| *byte != 0));
-        assert!(accepted);
-        candidate
-    });
-    suffix_cursor.tag(24);
-    let terminal_disposition = suffix_cursor.i32("terminal disposition");
-    suffix_cursor.tag(25);
-    let correction_revision = suffix_cursor.u64("correction revision");
-    suffix_cursor.tag(26);
-    let detail = suffix_cursor.string("detail");
-    suffix_cursor.tag(27);
-    suffix_cursor.literal(b"terminal-proof-follows\0", "terminal proof marker");
-    suffix_cursor.tag(28);
-    assert_eq!(suffix_cursor.u8("terminal proof placeholder"), 0);
-    suffix_cursor.finish();
-
-    MatrixEvidenceAnchors {
-        request_identity_sha256,
-        admission_ordinal,
-        normalized_logical_timeout_ms,
-        runtime_generation,
-        activated_mapping_backend_generation,
-        correction_owner_backend_generation,
-        session_id,
-        map_name,
-        session_generation,
-        map_frame_id,
-        odom_frame_id,
-        body_frame_id,
-        activation_identity_sha256,
-        target_receipt_sha256,
-        asset_manifest_sha256,
-        asset_bundle_sha256,
-        source_policy_version,
-        source_policy_sha256,
-        deadline_policy_version,
-        deadline_policy_sha256,
-        algorithm_options_version,
-        algorithm_options_sha256,
-        target,
-        frames,
-        aggregate_input_points,
-        post_transform_points,
-        emitted_points,
-        boundary_key,
-        source_length,
-        source_sha256,
-        algorithm,
-        candidate,
-        terminal_disposition,
-        correction_revision,
-        detail,
-    }
-}
-
-#[cfg(all(feature = "nuwax-lio-test-child", unix))]
-fn matrix_canonical_source_from_playback(
-    playback: &MatrixPlayback,
-    frames: &[MatrixEvidenceFrame],
-) -> Vec<u8> {
-    let by_sequence = playback
-        .source_frames
-        .iter()
-        .enumerate()
-        .map(|(index, input)| {
-            (
-                u64::try_from(index + 1).expect("matrix fixture sequence fits u64"),
-                input,
-            )
-        })
-        .collect::<std::collections::BTreeMap<_, _>>();
-    let mut ordered = Vec::new();
-    for frame in frames {
-        let input = by_sequence
-            .get(&frame.key.registered_cloud_source_sequence)
-            .unwrap_or_else(|| {
-                panic!(
-                    "matrix fixture omitted evidence frame sequence {}",
-                    frame.key.registered_cloud_source_sequence
-                )
-            });
-        assert_eq!(
-            u64::try_from(input.cloud.points.len()).expect("matrix point count fits u64"),
-            frame.point_count
-        );
-        for point in &input.cloud.points {
-            let sensor_point = nalgebra::Point3::new(
-                f64::from(point.x as f32),
-                f64::from(point.y as f32),
-                f64::from(point.z as f32),
-            );
-            let body_point = nalgebra::Point3::new(
-                -sensor_point.y + 0.25,
-                sensor_point.x - 0.5,
-                sensor_point.z + 1.0,
-            );
-            let odom_point = frame.odom_from_body.isometry().transform_point(&body_point);
-            assert!(odom_point.coords.iter().all(|value| value.is_finite()));
-            ordered.push(odom_point);
-        }
-    }
-    let emitted_count = ordered.len().min(100_000);
-    assert!((50_000..=100_000).contains(&emitted_count));
-    let mut canonical = Vec::with_capacity(8 + emitted_count * 24);
-    canonical.extend_from_slice(
-        &u64::try_from(emitted_count)
-            .expect("matrix emitted point count fits u64")
-            .to_be_bytes(),
-    );
-    for index in 0..emitted_count {
-        let source_index = index
-            .checked_mul(ordered.len())
-            .expect("matrix source sampling index does not overflow")
-            / emitted_count;
-        let point = ordered[source_index];
-        canonical.extend_from_slice(&point.x.to_be_bytes());
-        canonical.extend_from_slice(&point.y.to_be_bytes());
-        canonical.extend_from_slice(&point.z.to_be_bytes());
-    }
-    canonical
-}
-
-#[cfg(all(feature = "nuwax-lio-test-child", unix))]
-fn matrix_composite_evidence_sha256(
-    prefix: &[u8],
-    source_length: usize,
-    source_sha256: [u8; 32],
-    suffix: &[u8],
-) -> [u8; 32] {
-    let full_length = prefix
-        .len()
-        .checked_add(source_length)
-        .and_then(|length| length.checked_add(suffix.len()))
-        .expect("matrix evidence full length does not overflow");
-    let mut composite = MATRIX_EVIDENCE_COMPOSITE_DOMAIN_V1.to_vec();
-    composite.extend_from_slice(&1_u32.to_be_bytes());
-    composite.extend_from_slice(&0_u32.to_be_bytes());
-    composite.extend_from_slice(&u64::try_from(full_length).unwrap().to_be_bytes());
-    composite.extend_from_slice(&1_u32.to_be_bytes());
-    composite.extend_from_slice(&u64::try_from(prefix.len()).unwrap().to_be_bytes());
-    composite.extend_from_slice(prefix);
-    composite.extend_from_slice(&2_u32.to_be_bytes());
-    composite.extend_from_slice(&u64::try_from(source_length).unwrap().to_be_bytes());
-    composite.extend_from_slice(&source_sha256);
-    composite.extend_from_slice(&3_u32.to_be_bytes());
-    composite.extend_from_slice(&u64::try_from(suffix.len()).unwrap().to_be_bytes());
-    composite.extend_from_slice(suffix);
-    nuwax_codec::sha256_bytes(&composite)
-}
-
-#[cfg(all(feature = "nuwax-lio-test-child", unix))]
-fn matrix_validate_evidence_proof(
-    result: &native_fixture_proto::RelocalizeResult,
-    candidate: &DecodedCorrectionCandidate,
-    playback: &MatrixPlayback,
-    scenario: &str,
-) -> [u8; 32] {
-    let expected = matrix_digest32(&result.evidence_sha256, "matrix evidence digest");
-    let disclosure = result.evidence_disclosure_v1.as_slice();
-    assert!(
-        !disclosure.is_empty() && disclosure.len() <= 20_736,
-        "{scenario}: field 30 is outside the retained disclosure bound"
-    );
-    let mut cursor = MatrixProofCursor::new(disclosure, "disclosure");
-    cursor.literal(MATRIX_EVIDENCE_DISCLOSURE_DOMAIN_V1, "domain");
-    assert_eq!(cursor.u32("version"), 1, "{scenario}");
-    match cursor.u8("mode") {
-        0 => {
-            let preimage_length = usize::try_from(cursor.u64("inline preimage length"))
-                .expect("matrix inline preimage length fits usize");
-            assert!(preimage_length <= 4_096, "{scenario}");
-            let preimage = cursor.take_slice(preimage_length, "inline preimage");
-            assert_eq!(nuwax_codec::sha256_bytes(preimage), expected, "{scenario}");
-            cursor.finish();
-        }
-        1 => {
-            let full_length = usize::try_from(cursor.u64("full preimage length"))
-                .expect("matrix full evidence length fits usize");
-            let prefix_length = usize::try_from(cursor.u64("prefix length"))
-                .expect("matrix evidence prefix length fits usize");
-            let source_length = usize::try_from(cursor.u64("source length"))
-                .expect("matrix evidence source length fits usize");
-            let suffix_length = usize::try_from(cursor.u64("suffix length"))
-                .expect("matrix evidence suffix length fits usize");
-            assert!(prefix_length <= 16_384, "{scenario}");
-            assert!((1..=2_400_008).contains(&source_length), "{scenario}");
-            assert!(suffix_length <= 4_096, "{scenario}");
-            assert_eq!(full_length, prefix_length + source_length + suffix_length);
-            let prefix = cursor.take_slice(prefix_length, "prefix");
-            let disclosed_source_sha256 = cursor.take::<32>("source digest");
-            let suffix = cursor.take_slice(suffix_length, "suffix");
-            cursor.finish();
-            let mut source_commitment = MATRIX_SOURCE_COMMITMENT_DOMAIN_V1.to_vec();
-            source_commitment.extend_from_slice(&1_u32.to_be_bytes());
-            source_commitment
-                .extend_from_slice(&u64::try_from(source_length).unwrap().to_be_bytes());
-            source_commitment.extend_from_slice(&disclosed_source_sha256);
-            assert!(
-                prefix.ends_with(&source_commitment),
-                "{scenario}: evidence prefix does not end in the literal source commitment"
-            );
-            let anchors =
-                matrix_parse_mode1_evidence(prefix, source_length, disclosed_source_sha256, suffix);
-            let source = matrix_canonical_source_from_playback(playback, &anchors.frames);
-            assert_eq!(source.len(), source_length, "{scenario}");
-            let rebuilt_source_sha256 = nuwax_codec::sha256_bytes(&source);
-            assert_eq!(
-                rebuilt_source_sha256, disclosed_source_sha256,
-                "{scenario}: disclosure source digest is not bound to the real fixture frames"
-            );
-            assert_eq!(anchors.source_length, source_length);
-            assert_eq!(anchors.source_sha256, rebuilt_source_sha256);
-            assert_eq!(
-                usize::try_from(anchors.aggregate_input_points).unwrap(),
-                anchors
-                    .frames
-                    .iter()
-                    .map(|frame| usize::try_from(frame.point_count).unwrap())
-                    .sum::<usize>()
-            );
-            assert_eq!(
-                anchors.post_transform_points,
-                anchors.aggregate_input_points
-            );
-            assert_eq!(
-                usize::try_from(anchors.emitted_points).unwrap(),
-                (source_length - 8) / 24
-            );
-            assert_eq!(
-                anchors.request_identity_sha256,
-                matrix_digest32(&result.request_identity_sha256, "result request identity")
-            );
-            assert!(anchors.admission_ordinal.is_some());
-            assert_eq!(
-                anchors.normalized_logical_timeout_ms,
-                Some(result.logical_timeout_ms)
-            );
-            assert_eq!(anchors.runtime_generation, result.runtime_generation);
-            assert_eq!(
-                anchors.activated_mapping_backend_generation,
-                result.backend_generation
-            );
-            assert_eq!(anchors.session_id, result.session_id);
-            assert_eq!(anchors.map_name, result.map_name);
-            assert_eq!(anchors.session_generation, result.session_generation);
-            assert_eq!(
-                anchors.activation_identity_sha256,
-                matrix_digest32(
-                    &result.activation_identity_sha256,
-                    "result activation identity"
-                )
-            );
-            assert_eq!(
-                anchors.target_receipt_sha256,
-                matrix_digest32(&result.target_receipt_sha256, "result target receipt")
-            );
-            assert_eq!(
-                anchors.asset_manifest_sha256,
-                matrix_digest32(&result.asset_manifest_sha256, "result asset manifest")
-            );
-            assert_eq!(
-                anchors.asset_bundle_sha256,
-                matrix_digest32(&result.asset_bundle_sha256, "result asset bundle")
-            );
-            assert_eq!(anchors.source_policy_version, result.source_policy_version);
-            assert_eq!(
-                anchors.source_policy_sha256,
-                matrix_digest32(&result.source_policy_sha256, "result source policy")
-            );
-            assert_eq!(
-                anchors.deadline_policy_version,
-                result.deadline_policy_version
-            );
-            assert_eq!(
-                anchors.deadline_policy_sha256,
-                matrix_digest32(&result.deadline_policy_sha256, "result deadline policy")
-            );
-            assert_eq!(
-                anchors.algorithm_options_version,
-                result.algorithm_options_version
-            );
-            assert_eq!(
-                anchors.algorithm_options_sha256,
-                matrix_digest32(&result.algorithm_options_sha256, "result algorithm policy")
-            );
-            assert_eq!(anchors.terminal_disposition, result.disposition);
-            assert_eq!(anchors.correction_revision, result.correction_revision);
-            assert_eq!(anchors.detail, result.detail);
-            assert_eq!(anchors.target.runtime_generation, result.runtime_generation);
-            assert_eq!(anchors.target.session_id, result.session_id);
-            assert_eq!(anchors.target.map_name, result.map_name);
-            assert_eq!(anchors.target.session_generation, result.session_generation);
-            assert_eq!(anchors.target.backend_generation, result.backend_generation);
-            assert_eq!(
-                anchors.target.activation_identity_sha256,
-                matrix_digest32(
-                    &result.activation_identity_sha256,
-                    "target activation identity"
-                )
-            );
-            assert_eq!(
-                anchors.target.target_receipt_sha256,
-                matrix_digest32(&result.target_receipt_sha256, "target receipt")
-            );
-            assert_eq!(
-                anchors.target.asset_manifest_sha256,
-                Some(matrix_digest32(
-                    &result.asset_manifest_sha256,
-                    "target manifest"
-                ))
-            );
-            assert_eq!(
-                anchors.target.asset_bundle_sha256,
-                Some(matrix_digest32(
-                    &result.asset_bundle_sha256,
-                    "target bundle"
-                ))
-            );
-            assert_eq!(anchors.target.frame_id, anchors.map_frame_id);
-            assert_eq!(anchors.target.source_revision, result.target_cloud_revision);
-            assert_eq!(
-                anchors.target.xyz_sha256,
-                matrix_digest32(&result.target_cloud_sha256, "target cloud")
-            );
-            assert!(anchors.algorithm.accepted);
-            let evidence_candidate = anchors
-                .candidate
-                .as_ref()
-                .expect("matrix applied evidence must contain a candidate");
-            let candidate_key = matrix_candidate_frame_key(candidate);
-            assert_eq!(evidence_candidate.backend, candidate.backend);
-            assert_eq!(
-                evidence_candidate.transform_semantics,
-                candidate.transform_semantics
-            );
-            assert_eq!(
-                evidence_candidate.runtime_generation,
-                candidate.runtime_generation
-            );
-            assert_eq!(
-                evidence_candidate.backend_generation,
-                candidate.backend_generation
-            );
-            assert_eq!(
-                anchors.correction_owner_backend_generation,
-                candidate.backend_generation
-            );
-            assert_eq!(
-                evidence_candidate.candidate_sequence,
-                candidate.candidate_sequence
-            );
-            assert_eq!(
-                evidence_candidate.mapping_session_id,
-                candidate.mapping_session_id
-            );
-            assert_eq!(
-                evidence_candidate.mapping_session_generation,
-                candidate.mapping_session_generation
-            );
-            assert_eq!(
-                evidence_candidate.map_frame_generation,
-                candidate.map_frame_generation
-            );
-            assert_eq!(evidence_candidate.frame_key, candidate_key);
-            assert_eq!(anchors.boundary_key, candidate_key);
-            assert_eq!(
-                evidence_candidate.correction_lease_boot_nonce,
-                candidate.correction_lease_boot_nonce
-            );
-            assert_eq!(
-                evidence_candidate.correction_lease_generation,
-                candidate.correction_lease_generation
-            );
-            assert_eq!(
-                evidence_candidate.transform.translation_m,
-                candidate.translation_m
-            );
-            assert_eq!(
-                evidence_candidate.transform.rotation_xyzw,
-                candidate.rotation_xyzw
-            );
-            assert_eq!(evidence_candidate.payload_sha256, candidate.payload_sha256);
-            let algorithm_correction = anchors
-                .algorithm
-                .correction
-                .expect("matrix applied algorithm must disclose its correction");
-            assert_eq!(
-                algorithm_correction.encoded,
-                evidence_candidate.transform.encoded
-            );
-            let boundary = anchors
-                .frames
-                .last()
-                .expect("matrix evidence boundary frame");
-            assert_eq!(boundary.key, candidate_key);
-            assert_eq!(boundary.mapping_session_id, candidate.mapping_session_id);
-            assert_eq!(
-                boundary.mapping_session_generation,
-                candidate.mapping_session_generation
-            );
-            assert_eq!(
-                boundary.map_frame_generation,
-                candidate.map_frame_generation
-            );
-            assert_eq!(boundary.point_count, candidate.registered_cloud_point_count);
-            assert_eq!(
-                boundary.envelope_sha256,
-                candidate.registered_cloud_envelope_sha256
-            );
-            assert_eq!(boundary.body_points_sha256, candidate.body_points_sha256);
-            assert_eq!(
-                boundary.odom_source_timestamp_ns,
-                candidate.correlated_odom_source_timestamp_ns
-            );
-            assert_eq!(
-                boundary.odom_pose_sha256,
-                candidate.correlated_odom_pose_sha256
-            );
-            assert_eq!(
-                boundary.map_source_timestamp_ns,
-                candidate.committed_map_source_timestamp_ns
-            );
-            assert_eq!(boundary.map_width, candidate.committed_map_width);
-            assert_eq!(boundary.map_height, candidate.committed_map_height);
-            assert_eq!(
-                boundary.map_resolution_m.to_bits(),
-                candidate.committed_map_resolution_m.to_bits()
-            );
-            assert_eq!(
-                boundary.map_origin_x_m.to_bits(),
-                candidate.committed_map_origin_x_m.to_bits()
-            );
-            assert_eq!(
-                boundary.map_origin_y_m.to_bits(),
-                candidate.committed_map_origin_y_m.to_bits()
-            );
-            assert_eq!(
-                boundary.map_payload_sha256,
-                candidate.committed_map_payload_sha256
-            );
-            assert_eq!(
-                boundary.map_boundary_sha256,
-                candidate.committed_map_boundary_sha256
-            );
-            assert_eq!(boundary.points_frame_id, candidate.points_frame_id);
-            assert_eq!(candidate.map_frame_id, anchors.map_frame_id);
-            assert_eq!(candidate.odom_frame_id, anchors.odom_frame_id);
-            assert_eq!(candidate.body_frame_id, anchors.body_frame_id);
-            assert_eq!(
-                matrix_composite_evidence_sha256(
-                    prefix,
-                    source_length,
-                    rebuilt_source_sha256,
-                    suffix,
-                ),
-                expected,
-                "{scenario}: independently rebuilt evidence composite did not match field 25"
-            );
-        }
-        mode => panic!("{scenario}: unsupported field 30 disclosure mode {mode}"),
-    }
-    expected
-}
-
-#[cfg(all(feature = "nuwax-lio-test-child", unix))]
-fn matrix_assert_evidence_golden() -> [u8; 32] {
-    const EXPECTED_SOURCE_SHA256: [u8; 32] = [
-        0x38, 0x7a, 0xb2, 0xa6, 0x58, 0x5f, 0x41, 0xb1, 0x13, 0x53, 0xaf, 0xc1, 0x15, 0x3a, 0x68,
-        0x20, 0x18, 0x5c, 0x29, 0xe8, 0x2c, 0xff, 0x1f, 0x14, 0x19, 0xe6, 0xb2, 0xcc, 0x2a, 0xb7,
-        0x9a, 0x98,
-    ];
-    const EXPECTED_FIELD25: [u8; 32] = [
-        0x9b, 0xcf, 0x73, 0x0f, 0xd6, 0x9d, 0xc9, 0x4f, 0xf8, 0x20, 0x71, 0x24, 0x4b, 0x25, 0x1e,
-        0xf8, 0xdf, 0xb9, 0x6a, 0x52, 0xe8, 0xa1, 0xfa, 0x3c, 0x4e, 0x5e, 0x61, 0xf4, 0xe8, 0x1b,
-        0x1d, 0xc1,
-    ];
-    let mut source = Vec::with_capacity(8 + 50_000 * 24);
-    source.extend_from_slice(&50_000_u64.to_be_bytes());
-    for index in 0..50_000_usize {
-        let unique_index = index % 512;
-        let x = unique_index % 32;
-        let y = unique_index / 32;
-        let hash = (unique_index as u32)
-            .wrapping_mul(0x9e37_79b9)
-            .rotate_left(13)
-            ^ 0xa5a5_5a5a;
-        let x_voxel = x * 4 + (hash as usize & 1);
-        let y_voxel = y * 4 + ((hash as usize >> 1) & 1);
-        let z_voxel = (hash as usize >> 2) & 31;
-        let sensor_x = f64::from(((x_voxel as f64 + 0.5) * f64::from(0.05_f32)) as f32);
-        let sensor_y = f64::from(((y_voxel as f64 + 0.5) * f64::from(0.05_f32)) as f32);
-        let sensor_z = f64::from(((z_voxel as f64 + 0.5) * f64::from(0.05_f32)) as f32);
-        for value in [-sensor_y + 0.25, sensor_x - 0.5, sensor_z + 1.0] {
-            source.extend_from_slice(&value.to_be_bytes());
-        }
-    }
-    let source_sha256 = nuwax_codec::sha256_bytes(&source);
-    assert_eq!(
-        source_sha256, EXPECTED_SOURCE_SHA256,
-        "matrix 50k real-source recipe golden drifted"
-    );
-    let mut prefix = MATRIX_EVIDENCE_DOMAIN_V1.to_vec();
-    prefix.extend_from_slice(&1_u32.to_be_bytes());
-    prefix.extend_from_slice(b"matrix-stage-a-50000-source-golden\0");
-    prefix.extend_from_slice(MATRIX_SOURCE_COMMITMENT_DOMAIN_V1);
-    prefix.extend_from_slice(&1_u32.to_be_bytes());
-    prefix.extend_from_slice(&u64::try_from(source.len()).unwrap().to_be_bytes());
-    prefix.extend_from_slice(&source_sha256);
-    let suffix = b"matrix-stage-a-evidence-suffix-golden\0";
-    let field25 = matrix_composite_evidence_sha256(&prefix, source.len(), source_sha256, suffix);
-    assert_eq!(field25, EXPECTED_FIELD25, "matrix field 25 golden drifted");
-    field25
-}
-
-#[cfg(all(feature = "nuwax-lio-test-child", unix))]
-fn matrix_push_present_bytes(out: &mut Vec<u8>, value: &[u8]) {
-    if value.is_empty() {
-        out.push(0);
-    } else {
-        out.push(1);
-        out.extend_from_slice(&u64::try_from(value.len()).unwrap().to_be_bytes());
-        out.extend_from_slice(value);
-    }
-}
-
-#[cfg(all(feature = "nuwax-lio-test-child", unix))]
-fn matrix_terminal_proof_preimage(result: &native_fixture_proto::RelocalizeResult) -> Vec<u8> {
-    let mut out = MATRIX_TERMINAL_PROOF_DOMAIN_V1.to_vec();
-    out.extend_from_slice(&1_u32.to_be_bytes());
-    macro_rules! tag {
-        ($value:expr) => {
-            out.extend_from_slice(&$value.to_be_bytes())
-        };
-    }
-    tag!(1_u32);
-    out.extend_from_slice(&result.schema_version.to_be_bytes());
-    tag!(2_u32);
-    matrix_push_string(&mut out, &result.request_id);
-    tag!(3_u32);
-    matrix_push_present_bytes(&mut out, &result.request_identity_sha256);
-    tag!(4_u32);
-    out.extend_from_slice(&result.runtime_generation.to_be_bytes());
-    tag!(5_u32);
-    matrix_push_string(&mut out, &result.session_id);
-    tag!(6_u32);
-    matrix_push_string(&mut out, &result.map_name);
-    tag!(7_u32);
-    out.extend_from_slice(&result.session_generation.to_be_bytes());
-    tag!(8_u32);
-    out.extend_from_slice(&result.backend_generation.to_be_bytes());
-    tag!(9_u32);
-    matrix_push_present_bytes(&mut out, &result.activation_identity_sha256);
-    tag!(10_u32);
-    matrix_push_present_bytes(&mut out, &result.target_receipt_sha256);
-    tag!(11_u32);
-    out.extend_from_slice(&result.target_cloud_revision.to_be_bytes());
-    tag!(12_u32);
-    matrix_push_present_bytes(&mut out, &result.target_cloud_sha256);
-    tag!(13_u32);
-    matrix_push_present_bytes(&mut out, &result.asset_manifest_sha256);
-    tag!(14_u32);
-    matrix_push_present_bytes(&mut out, &result.asset_bundle_sha256);
-    tag!(15_u32);
-    out.extend_from_slice(&result.source_policy_version.to_be_bytes());
-    tag!(16_u32);
-    matrix_push_present_bytes(&mut out, &result.source_policy_sha256);
-    tag!(17_u32);
-    out.extend_from_slice(&result.deadline_policy_version.to_be_bytes());
-    tag!(18_u32);
-    matrix_push_present_bytes(&mut out, &result.deadline_policy_sha256);
-    tag!(19_u32);
-    out.extend_from_slice(&result.logical_timeout_ms.to_be_bytes());
-    tag!(20_u32);
-    out.extend_from_slice(&result.algorithm_options_version.to_be_bytes());
-    tag!(21_u32);
-    matrix_push_present_bytes(&mut out, &result.algorithm_options_sha256);
-    tag!(22_u32);
-    out.extend_from_slice(&result.disposition.to_be_bytes());
-    tag!(23_u32);
-    out.extend_from_slice(&result.candidate_sequence.to_be_bytes());
-    tag!(24_u32);
-    matrix_push_present_bytes(&mut out, &result.candidate_payload_sha256);
-    tag!(25_u32);
-    matrix_push_present_bytes(&mut out, &result.evidence_sha256);
-    tag!(26_u32);
-    out.extend_from_slice(&result.correction_revision.to_be_bytes());
-    tag!(27_u32);
-    out.push(0);
-    tag!(28_u32);
-    matrix_push_string(&mut out, &result.detail);
-    out
-}
-
-#[cfg(all(feature = "nuwax-lio-test-child", unix))]
-fn matrix_assert_terminal_proof_golden() -> [u8; 32] {
-    const EXPECTED: [u8; 32] = [
-        0xc6, 0x4d, 0xac, 0x3b, 0xa8, 0x05, 0x65, 0x5b, 0x26, 0x24, 0x90, 0xa0, 0xdb, 0x37, 0x65,
-        0x52, 0xbf, 0xe4, 0x1c, 0x10, 0x43, 0xa7, 0x49, 0xea, 0xf4, 0x81, 0x9e, 0xf3, 0x06, 0xa0,
-        0x03, 0x58,
-    ];
-    let result = native_fixture_proto::RelocalizeResult {
-        schema_version: 1,
-        request_id: "req-golden".to_owned(),
-        request_identity_sha256: vec![1; 32],
-        runtime_generation: 2,
-        session_id: "session-golden".to_owned(),
-        map_name: "map-golden".to_owned(),
-        session_generation: 3,
-        backend_generation: 4,
-        activation_identity_sha256: vec![5; 32],
-        target_receipt_sha256: vec![6; 32],
-        target_cloud_revision: 7,
-        target_cloud_sha256: vec![8; 32],
-        asset_manifest_sha256: vec![9; 32],
-        asset_bundle_sha256: vec![10; 32],
-        source_policy_version: 1,
-        source_policy_sha256: vec![11; 32],
-        deadline_policy_version: 1,
-        deadline_policy_sha256: vec![12; 32],
-        logical_timeout_ms: 30_000,
-        algorithm_options_version: 1,
-        algorithm_options_sha256: vec![13; 32],
-        disposition: native_fixture_proto::RelocalizeDisposition::Applied as i32,
-        candidate_sequence: 14,
-        candidate_payload_sha256: vec![15; 32],
-        evidence_sha256: vec![16; 32],
-        correction_revision: 17,
-        terminal_proof_sha256: vec![0xaa; 32],
-        detail: "APPLIED".to_owned(),
-        candidate_payload_preimage_v1: vec![0x29; 19],
-        evidence_disclosure_v1: vec![0x30; 23],
-        // Frozen V1 golden: these later target/assigned fields were absent.
-        target_kind: String::new(),
-        target_graph_sha256: Vec::new(),
-        assigned_cloud_v2: None,
-        assigned_planar_v2: None,
-    };
-    let preimage = matrix_terminal_proof_preimage(&result);
-    assert_eq!(
-        preimage.len(),
-        745,
-        "matrix terminal proof golden length drifted"
-    );
-    assert_eq!(
-        nuwax_codec::sha256_bytes(&preimage),
-        EXPECTED,
-        "matrix terminal proof cross-language golden drifted"
-    );
-    EXPECTED
-}
-
-#[cfg(all(feature = "nuwax-lio-test-child", unix))]
-fn matrix_validate_terminal_proof(
-    result: &native_fixture_proto::RelocalizeResult,
-    scenario: &str,
-) -> [u8; 32] {
-    let expected = nuwax_codec::sha256_bytes(&matrix_terminal_proof_preimage(result));
-    assert_eq!(
-        expected,
-        matrix_digest32(
-            &result.terminal_proof_sha256,
-            "matrix terminal proof digest"
-        ),
-        "{scenario}: independently recomputed field 27 does not match"
-    );
-    expected
-}
-
-#[cfg(all(feature = "nuwax-lio-test-child", unix))]
-fn assert_matrix_relocalize_identity_echo(
-    request: &native_fixture_proto::RelocalizeRequest,
-    result: &native_fixture_proto::RelocalizeResult,
-    scenario: &str,
-) {
-    assert_eq!(result.schema_version, request.schema_version, "{scenario}");
-    assert_eq!(result.request_id, request.request_id, "{scenario}");
-    assert_eq!(
-        result.runtime_generation, request.runtime_generation,
-        "{scenario}"
-    );
-    assert_eq!(result.session_id, request.session_id, "{scenario}");
-    assert_eq!(result.map_name, request.map_name, "{scenario}");
-    assert_eq!(
-        result.session_generation, request.session_generation,
-        "{scenario}"
-    );
-    assert_eq!(
-        result.backend_generation, request.backend_generation,
-        "{scenario}"
-    );
-    assert_eq!(
-        result.activation_identity_sha256, request.activation_identity_sha256,
-        "{scenario}"
-    );
-    assert_eq!(
-        result.target_receipt_sha256, request.target_receipt_sha256,
-        "{scenario}"
-    );
-    assert_eq!(
-        result.target_cloud_revision, request.target_cloud_revision,
-        "{scenario}"
-    );
-    assert_eq!(
-        result.target_cloud_sha256, request.target_cloud_sha256,
-        "{scenario}"
-    );
-    assert_eq!(
-        result.asset_manifest_sha256, request.asset_manifest_sha256,
-        "{scenario}"
-    );
-    assert_eq!(
-        result.asset_bundle_sha256, request.asset_bundle_sha256,
-        "{scenario}"
-    );
-    assert_eq!(
-        result.source_policy_version, request.source_policy_version,
-        "{scenario}"
-    );
-    assert_eq!(
-        result.source_policy_sha256, request.source_policy_sha256,
-        "{scenario}"
-    );
-    assert_eq!(
-        result.deadline_policy_version, request.deadline_policy_version,
-        "{scenario}"
-    );
-    assert_eq!(
-        result.deadline_policy_sha256, request.deadline_policy_sha256,
-        "{scenario}"
-    );
-    assert_eq!(
-        result.logical_timeout_ms, request.logical_timeout_ms,
-        "{scenario}"
-    );
-    assert_eq!(
-        result.algorithm_options_version, request.algorithm_options_version,
-        "{scenario}"
-    );
-    assert_eq!(
-        result.algorithm_options_sha256, request.algorithm_options_sha256,
-        "{scenario}"
-    );
-    assert_eq!(result.request_identity_sha256.len(), 32, "{scenario}");
 }
 
 #[cfg(all(feature = "nuwax-lio-test-child", unix))]
@@ -10525,58 +8434,39 @@ fn start_proven_active_relocalization(
     request: &native_fixture_proto::RelocalizeRequest,
     scenario: &str,
 ) -> tokio::task::JoinHandle<native_fixture_proto::RelocalizeResult> {
-    let mut active_command = None;
     runtime.block_on(async {
-        for attempt in 0..8_u32 {
-            let mut command_client = client.clone();
-            let command_request = request.clone();
-            let mut command = tokio::spawn(async move {
-                command_client
-                    .relocalize(command_request)
-                    .await
-                    .expect("matrix Relocalize command RPC")
-                    .into_inner()
-            });
+        let mut command_client=client.clone();let command_request=request.clone();
+        let command=tokio::spawn(async move {
+            command_client.relocalize(command_request).await.expect("matrix Relocalize command RPC").into_inner()
+        });
+        let deadline=tokio::time::Instant::now()+Duration::from_millis(500);
+        loop {
+            let query=client.get_relocalization_terminal(native_fixture_proto::GetRelocalizationTerminalRequest {
+                schema_version:2,request_id:request.request_id.clone(),assigned_request_v2:Some(request.clone()),
+            }).await.expect("read actual admitted command").into_inner();
+            if query.status==native_fixture_proto::RelocalizationTerminalStatus::Pending as i32 {break;}
+            assert_eq!(query.status,native_fixture_proto::RelocalizationTerminalStatus::NotFound as i32,"{scenario}: command settled before real source");
+            assert!(tokio::time::Instant::now()<deadline,"{scenario}: command did not become pending");
             tokio::task::yield_now().await;
-            tokio::task::yield_now().await;
-            let mut probe = request.clone();
-            probe.request_id = format!("{}-busy-{attempt}", request.request_id);
-            match tokio::time::timeout(Duration::from_millis(500), client.relocalize(probe)).await {
-                Ok(Ok(response)) => {
-                    let result = response.into_inner();
-                    if result.disposition
-                        == native_fixture_proto::RelocalizeDisposition::Busy as i32
-                    {
-                        assert_eq!(result.candidate_sequence, 0, "{scenario}");
-                        assert!(result.terminal_proof_sha256.is_empty(), "{scenario}");
-                        active_command = Some(command);
-                        return;
-                    }
-                    panic!(
-                        "{scenario}: BUSY probe returned disposition={} detail={}",
-                        result.disposition, result.detail
-                    );
-                }
-                Ok(Err(error)) => panic!("{scenario}: BUSY probe RPC failed: {error}"),
-                Err(_) => {
-                    let raced = tokio::time::timeout(Duration::from_millis(500), &mut command)
-                        .await
-                        .unwrap_or_else(|_| {
-                            panic!("{scenario}: neither command nor BUSY probe settled")
-                        })
-                        .unwrap_or_else(|error| panic!("{scenario}: command join failed: {error}"));
-                    assert_eq!(
-                        raced.disposition,
-                        native_fixture_proto::RelocalizeDisposition::Busy as i32,
-                        "{scenario}: probe won admission but command was not BUSY"
-                    );
+        }
+        let mut probe=request.clone();probe.request_id=format!("{}-busy",request.request_id);
+        loop {
+            match client.relocalize(probe.clone()).await {
+                Ok(response)=>{
+                    let result=response.into_inner();let body=matrix_cloud_result(&result);
+                    assert_eq!(body.disposition,native_fixture_proto::RelocalizeDisposition::Busy as i32,"{scenario}: {}",body.detail);
+                    assert!(body.candidate_payload_v3.is_empty(),"{scenario}");
+                    return command;
+                },
+                Err(error) if error.code()==tonic::Code::FailedPrecondition
+                    && error.message()=="mapping backend checkpoint export is already pending" => {
+                    assert!(tokio::time::Instant::now()<deadline,"{scenario}: original admission did not release its drain barrier");
                     tokio::task::yield_now().await;
-                }
+                },
+                Err(error)=>panic!("{scenario}: BUSY probe RPC failed: {error}"),
             }
         }
-        panic!("{scenario}: could not prove an active Relocalize command")
-    });
-    active_command.expect("active Relocalize command")
+    })
 }
 
 #[cfg(all(feature = "nuwax-lio-test-child", target_os = "linux"))]
@@ -10632,20 +8522,53 @@ fn assert_matrix_native_pgo_not_spawned(cycle: &mut MatrixCycle, scenario: &str)
 }
 
 #[cfg(all(feature = "nuwax-lio-test-child", unix))]
-fn assert_relocalization_owner_unselected(
-    runtime: &tokio::runtime::Runtime,
-    client: &mut GeometryClient,
-    scenario: &str,
-) {
-    let error = runtime
-        .block_on(client.relocalize(native_fixture_proto::RelocalizeRequest::default()))
-        .expect_err("unselected relocalization owner must reject the RPC");
-    assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{scenario}");
-    assert_eq!(
-        error.message(),
-        "RELOCALIZATION_OWNER_NOT_SELECTED",
-        "{scenario}"
-    );
+fn matrix_unselected_owner_request(policy: native_fixture_proto::RelocalizationPolicyDescriptorV2) -> native_fixture_proto::RelocalizeRequest {
+        let metadata = native_fixture_proto::ActivationRequestMetadataV2 { activation_request_id: "mapload:fixture".into(),
+            session_id: "installed".into(), map_name: "room".into(),
+            asset_identity: Some(native_fixture_proto::AssetIdentityV2 { asset_id: "a".repeat(32) }),
+            checkpoint_id: "b".repeat(32), expected_runtime_generation: 3 };
+        let activation = native_fixture_proto::InstalledActivationIdentityV2 { request: Some(metadata), runtime_generation: 3,
+            lifecycle_epoch: 4, session_generation: 5, backend_kind: "voxel".into(), backend_generation: 6 };
+        let source_occupancy = native_fixture_proto::CanonicalOccupancyCommitReceipt {
+            commit_id: Some(native_fixture_proto::MappingCommitIdentity { boot_nonce: vec![7;16], sequence: 9 }),
+            session_id: "source".into(), session_generation: 8, occupancy_revision: 10,
+            source_timestamp_ns: 11, backend_kind: "voxel".into(), backend_generation: 2 };
+        let source_cloud = native_fixture_proto::CanonicalCloudCommitReceipt { commit_id: source_occupancy.commit_id.clone(),
+            session_generation: 8, occupancy_revision: 10, cloud_revision: 12, source_timestamp_ns: 11, point_count: 2 };
+        let installed_occupancy = native_fixture_proto::CanonicalOccupancyCommitReceipt {
+            commit_id: Some(native_fixture_proto::MappingCommitIdentity { boot_nonce: vec![1;16], sequence: 2 }),
+            session_id: "installed".into(), session_generation: 5, occupancy_revision: 3,
+            source_timestamp_ns: 22, backend_kind: "voxel".into(), backend_generation: 6 };
+        let installed_cloud = native_fixture_proto::CanonicalCloudCommitReceipt { commit_id: installed_occupancy.commit_id.clone(),
+            session_generation: 5, occupancy_revision: 3, cloud_revision: 4, source_timestamp_ns: 22, point_count: 2 };
+        native_fixture_proto::RelocalizeRequest { schema_version: 2, request_id: "reloc:exact".into(),
+            assigned_target: Some(native_fixture_proto::relocalize_request::AssignedTarget::AssignedCloudV2(native_fixture_proto::AssignedCloudRelocalizeRequestV2 {
+                target: Some(native_fixture_proto::InstalledTargetReceiptV2 { activation: Some(activation),
+                    source_cloud_member: Some(native_fixture_proto::CheckpointMemberIdentity { checkpoint_id: "b".repeat(32),
+                        role: native_fixture_proto::CheckpointMemberRole::CanonicalCloud as i32,
+                        occupancy_receipt: Some(source_occupancy), cloud_receipt: Some(source_cloud),
+                        frame_id: "map".into(), frame_generation: 0, producer_generation: 0 }),
+                    occupancy_receipt: Some(installed_occupancy), cloud_receipt: Some(installed_cloud), source_graph_member: None }),
+                policy: Some(policy), logical_timeout_ms: 0 })),
+            ..Default::default() }
+    }
+
+#[cfg(all(feature = "nuwax-lio-test-child", unix))]
+fn assert_relocalization_admission_matches_profile(runtime: &tokio::runtime::Runtime,
+    client: &mut GeometryClient, profile: MatrixProfile, scenario: &str) {
+    let policy=get_mapping_state(runtime,client,scenario).relocalization_policy_v2.unwrap();
+    let result=runtime.block_on(client.relocalize(matrix_unselected_owner_request(policy)));
+    if profile.correction=="none" {
+        // 无自动回环的生产选型仍提供按需重定位，虚构的历史运行代次必须被真实围栏拒绝。
+        let result=result.expect("按需重定位拥有方").into_inner();let body=matrix_cloud_result(&result);
+        assert_eq!(body.disposition,native_fixture_proto::RelocalizeDisposition::StaleSession as i32);
+        assert_eq!(body.detail,"RELOCALIZATION_RUNTIME_STALE");
+        assert!(body.candidate_payload_v3.is_empty());assert_eq!(body.correction_revision,0);
+    } else {
+        let error=result.expect_err("自动回环选型没有按需重定位接口");
+        assert_eq!(error.code(),tonic::Code::FailedPrecondition,"{scenario}");
+        assert_eq!(error.message(),"RELOCALIZATION_OWNER_NOT_SELECTED","{scenario}");
+    }
 }
 
 #[cfg(all(feature = "nuwax-lio-test-child", target_os = "linux"))]
@@ -10668,7 +8591,11 @@ fn run_non_relocalization_matrix_profile(profile: MatrixProfile) {
     );
     assert_eq!(cycle.generation(), 1, "{scenario}");
     let native_process = if profile.correction == "native_pgo" {
-        Some(matrix_track_selected_native_pgo(&mut cycle, &scenario))
+        let process=matrix_track_selected_native_pgo(&mut cycle, &scenario);
+        let starting=wait_for_native_pgo_status(&runtime,&mut pgo.status,cycle.generation(),native_pgo::NATIVE_PGO_EVENT_STARTING,None,&scenario);
+        let ready=wait_for_native_pgo_status(&runtime,&mut pgo.status,cycle.generation(),native_pgo::NATIVE_PGO_EVENT_READY,None,&scenario);
+        assert_eq!(starting.status_sequence,1);assert_eq!(ready.status_sequence,2);
+        Some(process)
     } else {
         assert_matrix_native_pgo_not_spawned(&mut cycle, &scenario);
         None
@@ -10681,12 +8608,13 @@ fn run_non_relocalization_matrix_profile(profile: MatrixProfile) {
         &permit_path,
         &mut cycle,
     );
-    assert_relocalization_owner_unselected(&runtime, &mut client, &scenario);
+    assert_relocalization_admission_matches_profile(&runtime, &mut client, profile, &scenario);
 
     let mapping_before_effect;
     let occupancy_before_effect;
     let occupancy_file_before_effect;
     let cloud_file_before_effect;
+    let mut corrected_frame = None;
     let mut selected_candidate = None;
     let mut selected_native_exchange = None;
     match profile.correction {
@@ -10767,6 +8695,7 @@ fn run_non_relocalization_matrix_profile(profile: MatrixProfile) {
                 map_from_odom_in_frame(&corrected).header.seq > 0,
                 "{scenario}"
             );
+            corrected_frame=Some(corrected);
             assert_stream_silent(&runtime, &mut pgo.request, "library native request");
             assert_stream_silent(&runtime, &mut pgo.result, "library native result");
             assert_stream_silent(&runtime, &mut pgo.status, "library native status");
@@ -10829,6 +8758,7 @@ fn run_non_relocalization_matrix_profile(profile: MatrixProfile) {
                 map_from_odom_in_frame(&corrected).header.seq > 0,
                 "{scenario}"
             );
+            corrected_frame=Some(corrected);
             assert_stream_silent(
                 &runtime,
                 &mut pgo.library_candidate,
@@ -10838,6 +8768,7 @@ fn run_non_relocalization_matrix_profile(profile: MatrixProfile) {
         value => panic!("unsupported non-relocalization correction {value}"),
     }
 
+    if profile.correction=="none" {
     assert_eq!(
         get_mapping_state(&runtime, &mut client, &scenario),
         mapping_before_effect,
@@ -10858,6 +8789,37 @@ fn run_non_relocalization_matrix_profile(profile: MatrixProfile) {
         cloud_file_before_effect,
         "{scenario}: correction changed cloud-map SHM"
     );
+
+    } else {
+        // 回环事务会从原始扫描重建地图；捕获候选的提交身份是修订基线。
+        let (occupancy_revision,cloud_revision,source_ns,commit_sequence,commit_nonce)=
+            if let Some(exchange)=selected_native_exchange.as_ref() {
+                let identity=&exchange.request.identity;
+                (identity.occupancy_revision as u64,identity.cloud_revision as u64,identity.source_timestamp_ns as u64,
+                    identity.mapping_commit_id.sequence as u64,identity.mapping_commit_id.boot_nonce)
+            } else {
+                let candidate=decode_correction_candidate(selected_candidate.as_ref().unwrap());
+                (candidate.occupancy_revision,candidate.cloud_revision,candidate.source_timestamp_ns,
+                    candidate.mapping_commit_sequence,candidate.mapping_commit_boot_nonce)
+            };
+        let mut captured=mapping_before_effect.clone();captured.revision=occupancy_revision;
+        let current_cloud=read_cloud_map_shm(&probe.path().join("cloud-map.mmap"));
+        assert_eq!(current_cloud.revision,cloud_revision+1,"{scenario}:校正必须产生一次点云提交");
+        let published=matrix_next_global_map_revision(&runtime,&mut observers.global_map,current_cloud.revision,&scenario);
+        let committed=assert_mapping_outputs(&runtime,&mut client,&probe,&scenario,&captured,
+            corrected_frame.as_ref().unwrap(),&published);
+        assert_eq!(committed.revision,occupancy_revision+1,"{scenario}:校正必须产生一次占据提交");
+        assert_eq!(committed.session_id,captured.session_id);
+        assert_eq!(committed.map_name,captured.map_name);
+        assert_eq!(committed.mapping_backend_kind,captured.mapping_backend_kind);
+        let occupancy=get_occupancy_data(&runtime,&mut client,&scenario);
+        assert_eq!(occupancy.meta.as_ref().unwrap().timestamp_ns,source_ns);
+        let receipt=get_occupancy_commit_receipt_for_snapshot(&runtime,&mut client,&committed,&occupancy,&scenario);
+        assert_eq!(receipt.commit_id.as_ref().unwrap().boot_nonce,commit_nonce);
+        assert_eq!(receipt.commit_id.as_ref().unwrap().sequence,commit_sequence+1);
+        assert_eq!(receipt.source_timestamp_ns,source_ns);
+    }
+    let after_effect=capture_stable_matrix_observable_snapshot(&runtime,&mut client,&probe,"after_effect",&scenario);
 
     if let Some(candidate) = selected_candidate {
         runtime
@@ -10886,6 +8848,8 @@ fn run_non_relocalization_matrix_profile(profile: MatrixProfile) {
         );
     }
 
+    let after_replay=capture_stable_matrix_observable_snapshot(&runtime,&mut client,&probe,"after_replay",&scenario);
+    assert_matrix_observable_snapshots_equal(&after_effect,&after_replay,"重复校正不得再次提交地图",&scenario);
     let output = finish_matrix_cycle(&runtime, &mut observers, client, cycle, &probe);
     let finalizations = candidate_finalization_events(&output);
     match profile.correction {
@@ -10924,8 +8888,6 @@ fn run_non_relocalization_matrix_profile(profile: MatrixProfile) {
 #[cfg(all(feature = "nuwax-lio-test-child", target_os = "linux"))]
 fn run_relocalization_matrix_profile(profile: MatrixProfile) {
     let scenario = profile.scenario();
-    let _evidence_golden = matrix_assert_evidence_golden();
-    let _terminal_golden = matrix_assert_terminal_proof_golden();
     let runtime = tokio::runtime::Runtime::new().expect("create relocalization matrix runtime");
     let probe = ProbeDir::new(&scenario);
     let playback = matrix_playback(profile, &probe);
@@ -11031,21 +8993,15 @@ fn run_relocalization_matrix_profile(profile: MatrixProfile) {
     });
     assert_matrix_relocalize_identity_echo(&request, &result, &scenario);
     assert_eq!(
-        result.disposition,
+        matrix_cloud_result(&result).disposition,
         native_fixture_proto::RelocalizeDisposition::Applied as i32,
         "{scenario}: Relocalize failed disposition={} detail={} diagnostic={}",
-        result.disposition,
-        result.detail,
+        matrix_cloud_result(&result).disposition,
+        matrix_cloud_result(&result).detail,
         matrix_relocalization_failure_diagnostic(&checkpoint, &published),
     );
-    assert_eq!(result.candidate_sequence, 1, "{scenario}");
-    assert_eq!(result.candidate_payload_sha256.len(), 32, "{scenario}");
-    assert_eq!(result.evidence_sha256.len(), 32, "{scenario}");
-    assert_eq!(result.correction_revision, 1, "{scenario}");
-    assert_eq!(result.terminal_proof_sha256.len(), 32, "{scenario}");
-    let candidate = matrix_validate_candidate_proof(&result, &scenario);
-    let _evidence_proof = matrix_validate_evidence_proof(&result, &candidate, &playback, &scenario);
-    let _terminal_proof = matrix_validate_terminal_proof(&result, &scenario);
+    assert_eq!(matrix_cloud_result(&result).correction_revision, 1, "{scenario}");
+    let candidate = matrix_validate_assigned_candidate(&result, &playback, &published, &scenario);
 
     let corrected = next_frame(
         &runtime,
@@ -11055,7 +9011,7 @@ fn run_relocalization_matrix_profile(profile: MatrixProfile) {
     let corrected_map_from_odom = map_from_odom_in_frame(&corrected);
     assert_eq!(
         corrected_map_from_odom.header.seq,
-        i32::try_from(result.correction_revision).expect("correction revision fits i32"),
+        i32::try_from(matrix_cloud_result(&result).correction_revision).expect("correction revision fits i32"),
         "{scenario}"
     );
     let corrected_isometry = transform_isometry(
@@ -11139,7 +9095,8 @@ fn run_relocalization_matrix_profile(profile: MatrixProfile) {
         &scenario,
     );
     let mut conflict = request.clone();
-    conflict.logical_timeout_ms -= 1;
+    let Some(native_fixture_proto::relocalize_request::AssignedTarget::AssignedCloudV2(ref mut body)) = conflict.assigned_target else { panic!("cloud request required") };
+    body.logical_timeout_ms -= 1;
     let conflict = runtime.block_on(async {
         client
             .relocalize(conflict)
@@ -11148,14 +9105,18 @@ fn run_relocalization_matrix_profile(profile: MatrixProfile) {
             .into_inner()
     });
     assert_eq!(
-        conflict.disposition,
+        matrix_cloud_result(&conflict).disposition,
         native_fixture_proto::RelocalizeDisposition::ReplayConflict as i32,
         "{scenario}"
     );
-    assert_eq!(conflict.candidate_sequence, 0, "{scenario}");
+    assert!(matrix_cloud_result(&conflict).candidate_payload_v3.is_empty(), "{scenario}");
     let mut stale = request.clone();
     stale.request_id = format!("{}-stale", request.request_id);
-    stale.session_generation -= 1;
+    let Some(native_fixture_proto::relocalize_request::AssignedTarget::AssignedCloudV2(ref mut body)) = stale.assigned_target else { panic!("cloud request required") };
+    let target = body.target.as_mut().unwrap();
+    target.activation.as_mut().unwrap().session_generation -= 1;
+    target.occupancy_receipt.as_mut().unwrap().session_generation -= 1;
+    target.cloud_receipt.as_mut().unwrap().session_generation -= 1;
     let stale = runtime.block_on(async {
         client
             .relocalize(stale)
@@ -11164,11 +9125,11 @@ fn run_relocalization_matrix_profile(profile: MatrixProfile) {
             .into_inner()
     });
     assert_eq!(
-        stale.disposition,
+        matrix_cloud_result(&stale).disposition,
         native_fixture_proto::RelocalizeDisposition::StaleSession as i32,
         "{scenario}: stale request was not silent"
     );
-    assert_eq!(stale.candidate_sequence, 0, "{scenario}");
+    assert!(matrix_cloud_result(&stale).candidate_payload_v3.is_empty(), "{scenario}");
     assert_eq!(
         get_mapping_state(&runtime, &mut client, &scenario),
         after_apply.mapping

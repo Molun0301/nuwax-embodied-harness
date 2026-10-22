@@ -25,8 +25,8 @@ fn preparation_probe_transform(
 ) -> Result<Vec<Point3<f64>>, String> {
     let mut ordered = Vec::with_capacity(aggregate_input_points);
     for frame in accepted {
-        for body_point in &frame.input.body_points {
-            let odom_point = frame.input.correlated_odom.odom_from_body * body_point;
+        for body_point in frame.input.body_points() {
+            let odom_point = frame.input.correlated_odom().odom_from_body * body_point;
             if !odom_point.x.is_finite()
                 || !odom_point.y.is_finite()
                 || !odom_point.z.is_finite()
@@ -57,7 +57,7 @@ fn preparation_probe_accumulation(
         snapshot: snapshot.clone(), arm_watermark: None, armed_map_watermarks: HashMap::new(),
         accepted: frames.iter().rev().map(|frame| AccumulatedRelocalizationFrame {input: Arc::clone(frame)}).collect(),
         aggregate_input_points: count,
-        session_map_frame_generation: Some(boundary.map_frame_generation),
+        session_map_frame_generation: Some(boundary.map_frame_generation()),
         mapping_commit_boot_nonce: Some(boundary.mapping_commit_id.boot_nonce),
     }
 }
@@ -65,8 +65,8 @@ fn preparation_probe_accumulation(
 fn preparation_probe_expected(frames: &[Arc<CorrectionFrameInput>], total: usize) -> Vec<Point3<f64>> {
     let mut sorted = frames.to_vec();
     sorted.sort_by_key(|f| relocalization_frame_key(f));
-    let ordered: Vec<_> = sorted.iter().flat_map(|frame| frame.body_points.iter()
-        .map(move |point| frame.correlated_odom.odom_from_body * point)).collect();
+    let ordered: Vec<_> = sorted.iter().flat_map(|frame| frame.body_points().iter()
+        .map(move |point| frame.correlated_odom().odom_from_body * point)).collect();
     assert_eq!(ordered.len(), total);
     let count = total.min(RELOCALIZATION_MAX_EMITTED_POINTS);
     (0..count).map(|index| ordered[index * total / count]).collect()
@@ -132,7 +132,7 @@ async fn relocalization_preparation_actual_helpers_profile() {
                     "robot_map","robot_odom","robot_body")).collect::<Result<Vec<_>,_>>().unwrap();
                 let source_arc = Arc::clone(&sealed.source_points);
                 let target_arc = Arc::clone(&sealed.target_points);
-                let _base_anchor = sealed.boundary_input.base_anchor_map_from_odom;
+                let _base_anchor = sealed.boundary_input.base_anchor_map_from_odom();
                 let _registration = sealed.boundary_input.source_owner.binding().registration_map_from_odom;
                 let metadata_ns = receipt_start.elapsed().as_nanos();
                 let prep_ns = began.elapsed().as_nanos();

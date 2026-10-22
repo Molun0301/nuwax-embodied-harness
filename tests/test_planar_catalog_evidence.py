@@ -1,5 +1,6 @@
 """Real durable catalog evidence admission for planar and cloud, with hashes forbidden."""
 import copy
+import json
 import unittest
 import tests.test_planar_asset_catalog as assets
 from contracts.map_activation import AssignedActivationReceipt
@@ -59,15 +60,18 @@ class CatalogEvidenceTests(assets.AssetCatalogTests):
         shared, receipt = self.begin('voxel')
         options = dict(activation_receipt=receipt, relocalization_target_available=True,
             activation_receipt_disposition=2, activation_receipt_disposition_name='sealed')
-        with self.assertRaises((TypeError, ValueError)):
-            self.catalog.record_assigned_map_activation_evidence(**shared, **options,
-                relocalization_policy_v2=None, expected_phases={'backend_dispatching'})
         policy = current_assigned_relocalization_policy()
         result = self.catalog.record_assigned_map_activation_evidence(**shared, **options,
             relocalization_policy_v2=policy, expected_phases={'backend_dispatching'})
         self.assertEqual(result['backend_evidence']['relocalization_policy_v2'], policy)
         self.assertEqual(set(result['backend_evidence']['activation_receipt_v2']['target']),
             {'activation', 'source_cloud_member', 'occupancy_receipt', 'cloud_receipt'})
+
+        document = json.loads(self.catalog._activation_journal_path.read_text())
+        document['backend_evidence']['relocalization_policy_v2'] = None
+        self.catalog._activation_journal_path.write_text(json.dumps(document))
+        with self.assertRaises((TypeError, ValueError)):
+            self.catalog.get_map_activation()
 
 
 if __name__ == '__main__':

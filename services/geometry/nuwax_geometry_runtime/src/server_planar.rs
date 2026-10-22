@@ -11,9 +11,6 @@ impl GeometryRuntimeService {
         mut request: ActivateMapRequest,
         class: ActivationRequestIdentityClass,
     ) -> Result<Response<MappingSessionState>, Status> {
-        if !class.is_modern() {
-            return Err(Status::invalid_argument("二维完整图要求明确的现代激活身份"));
-        }
         let adapter = self
             .bridge
             .mapping_adapter
@@ -25,7 +22,8 @@ impl GeometryRuntimeService {
             .planar
             .clone()
             .ok_or_else(|| Status::unavailable("二维拥有方不可用"))?;
-        let assigned_owner = if let ActivationRequestIdentityClass::Assigned(metadata) = &class {
+        let assigned_owner = {
+            let metadata = &class;
             let current = mapping_session_state(adapter.lock().snapshot(), "二维编号激活准入");
             if let Some(terminal) = self.activation_receipts.assigned_terminal_before_admission(metadata, current) {
                 return Ok(Response::new(terminal));
@@ -39,39 +37,17 @@ impl GeometryRuntimeService {
             ).map_err(Status::invalid_argument)?;
             request.session_id = session_id;
             request.map_name = map_name;
-            Some(admitted.into_parts().1)
-        } else { None };
-        let (occupancy, source_session_id, source_session_generation, reference) = if let Some(owner) = &assigned_owner {
-            let graph = owner.graph().ok_or_else(|| Status::invalid_argument("二维编号检查点缺少图拥有方"))?;
-            (owner.occupancy(), owner.occupancy_receipt().session_id.as_str(), owner.occupancy_receipt().session_generation, graph.reference())
-        } else {
-            let backend = request.mapping_backend_checkpoint.as_ref().ok_or_else(|| Status::invalid_argument("二维图缺少完整检查点"))?;
-            validate_planar_checkpoint(backend).map_err(Status::invalid_argument)?;
-            let occupancy = request.checkpoint.as_ref().ok_or_else(|| Status::invalid_argument("二维图缺少物理栅格"))?;
-            if request.cloud_checkpoint.is_some() || backend.canonical_occupancy_checkpoint.as_ref() != Some(occupancy) {
-                return Err(Status::invalid_argument("二维激活栅格与完整图检查点不一致"));
-            }
-            (occupancy, backend.source_session_id.as_str(), backend.source_session_generation, backend.graph_artifact.as_ref().unwrap())
+            admitted.into_parts().1
         };
+        let graph = assigned_owner.graph().ok_or_else(|| Status::invalid_argument("二维编号检查点缺少图拥有方"))?;
+        let occupancy = assigned_owner.occupancy();
+        let source_session_id = assigned_owner.occupancy_receipt().session_id.as_str();
+        let source_session_generation = assigned_owner.occupancy_receipt().session_generation;
+        let reference = graph.reference();
         if occupancy.meta.as_ref().is_none_or(|meta| meta.frame_id != binding.settings.template.map_frame_id) {
             return Err(Status::invalid_argument("二维图坐标系与运行时不兼容"));
         }
-        let (request_key, manifest, bundle, occupancy_sha, backend_sha) = if let ActivationRequestIdentityClass::Assigned(metadata) = &class {
-            (ActivationRequestKey::Assigned(metadata.clone()), None, None, None, None)
-        } else {
-            let occupancy_sha = canonical_occupancy_sha256(occupancy).map_err(Status::invalid_argument)?;
-            let backend_sha = canonical_backend_sha256(request.mapping_backend_checkpoint.as_ref().unwrap(), &binding.settings.template.map_frame_id).map_err(Status::invalid_argument)?;
-            let manifest = class.asset_manifest_sha256().unwrap();
-            let bundle = class.asset_bundle_sha256().unwrap();
-            if crate::map_checksum::sha256_bytes(&canonical_asset_bundle_preimage(manifest, occupancy_sha, None, Some(backend_sha))) != bundle {
-                return Err(Status::invalid_argument("ACTIVATE_MAP_ASSET_BUNDLE_SHA256_MISMATCH"));
-            }
-            let digest = crate::map_checksum::sha256_bytes(&canonical_activation_request_preimage(
-                &class, self.activation_receipts.runtime_generation(), &request.session_id, &request.map_name,
-                occupancy_sha, None, Some(backend_sha),
-            ).map_err(Status::invalid_argument)?);
-            (ActivationRequestKey::LegacyDigest(digest), Some(manifest), Some(bundle), Some(occupancy_sha), Some(backend_sha))
-        };
+        let request_key = class.clone();
         let _transition = self.mapping_transition.lock().await;
         let _operation = binding.operation.lock().await;
         self.ensure_running_admission("ActivateMap").await?;
@@ -81,16 +57,12 @@ impl GeometryRuntimeService {
         }
         let current = adapter.lock().snapshot();
         let mut seed = crate::correction_coordinator::ActivationReceiptSeed {
-            activation_request_id: class.request_id().into(),
+            activation_request_id: class.activation_request_id().into(),
             request_key: request_key.clone(),
-            checkpoint_owner: assigned_owner.clone(),
-            asset_manifest_sha256: manifest,
-            asset_bundle_sha256: bundle,
-            modern: true,
-            immutable_target: None,
+            checkpoint_owner: Some(assigned_owner.clone()),
             planar_target: None,
         };
-        if self.activation_receipts.has_request(class.request_id()) {
+        if self.activation_receipts.has_request(class.activation_request_id()) {
             return match self.activation_receipts.stage_or_replay(
                 seed,
                 mapping_session_state(current, "二维激活重放"),
@@ -115,10 +87,9 @@ impl GeometryRuntimeService {
             _ => return Err(Status::already_exists("二维激活目标会话已活动")),
         };
         let reference = reference.clone();
-        let mut file = if let Some(owner) = &assigned_owner {
-            use std::os::fd::AsRawFd;
-            std::fs::File::open(format!("/proc/self/fd/{}", owner.graph().unwrap().file().as_raw_fd())).map_err(|error| Status::internal(error.to_string()))?
-        } else { self.graph_artifacts.lock().open(&reference).map_err(Status::failed_precondition)? };
+        use std::os::fd::AsRawFd;
+        let mut file = std::fs::File::open(format!("/proc/self/fd/{}", assigned_owner.graph().unwrap().file().as_raw_fd()))
+            .map_err(|error| Status::internal(error.to_string()))?;
         let (file, metadata, cells) = tokio::task::spawn_blocking(move || {
             let (metadata, cells) = archive::grid_structure(&mut file)?;
             Ok::<_, String>((file, metadata, cells))
@@ -151,7 +122,7 @@ impl GeometryRuntimeService {
         let target = Arc::new(crate::planar_artifacts::Target {
             file: Arc::new(file),
             size: reference.size,
-            identity: if reference.identity_schema_version == 2 { crate::planar_artifacts::TargetIdentity::Assigned(reference.clone()) } else { crate::planar_artifacts::TargetIdentity::Legacy(reference.sha256.as_slice().try_into().unwrap()) },
+            identity: crate::planar_artifacts::TargetIdentity::Assigned(reference.clone()),
             metadata: metadata.clone(),
         });
         let candidate = binding
@@ -219,17 +190,10 @@ impl GeometryRuntimeService {
                 .activation_receipts
                 .reserve_backend_generation(&token, backend_generation)
                 .ok_or("二维激活后端代次预留失败")?;
-            let identity = if let ActivationRequestIdentityClass::Assigned(metadata) = &class {
-                ActivationIdentity::Assigned(InstalledActivationIdentityV2 {
-                    request: metadata.clone(), runtime_generation: self.activation_receipts.runtime_generation(),
-                    lifecycle_epoch: self.activation_receipts.lifecycle_epoch(), session_generation,
-                    backend_kind: crate::mapping_backend::MappingBackendKind::SlamToolbox, backend_generation,
-                })
-            } else {
-                ActivationIdentity::LegacyDigest(crate::map_checksum::sha256_bytes(&canonical_activation_identity_preimage(
-                    request_key.legacy_digest().unwrap(), self.activation_receipts.runtime_generation(), session_generation,
-                    backend_generation, "slam_toolbox", backend_sha, manifest.unwrap(), bundle.unwrap(),
-                )?))
+            let identity = InstalledActivationIdentityV2 {
+                request: class.clone(), runtime_generation: self.activation_receipts.runtime_generation(),
+                lifecycle_epoch: self.activation_receipts.lifecycle_epoch(), session_generation,
+                backend_kind: crate::mapping_backend::MappingBackendKind::SlamToolbox, backend_generation,
             };
             token = self
                 .activation_receipts
@@ -297,18 +261,6 @@ impl GeometryRuntimeService {
                 .activation_receipts
                 .store_planar_proof(&token, receipt.clone())
                 .ok_or("二维目标收据绑定失败")?;
-            record_activation_journal(
-                &self.activation_receipts,
-                &token,
-                request_key.clone(),
-                crate::correction_coordinator::ActivationJournalStep::OccupancyInstall,
-                crate::correction_coordinator::ActivationJournalStatus::Applied,
-                Some(match occupancy_sha {
-                    Some(digest) => digest.into(),
-                    None => crate::activation_contract::ActivationJournalVerifier::Assigned(crate::activation_contract::ActivationJournalVerifierV2::Occupancy(receipt)),
-                }),
-                None,
-            );
             let _ = self.bridge.map_revision_tx.send(event);
             let mut state = mapping_session_state(
                 adapter.lock().snapshot(),
@@ -317,7 +269,7 @@ impl GeometryRuntimeService {
             state.planar_mode = "localization".into();
             let sealed = self
                 .activation_receipts
-                .seal(&token, Some(target_receipt.into()), state)
+                .seal(&token, target_receipt, state)
                 .ok_or("二维激活封存失败")?;
             drop(lifecycle);
             drop(projection);

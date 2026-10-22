@@ -945,11 +945,6 @@ impl PreparedRayUpdate {
         })
     }
 
-    /// 只读访问准备后的点，供拥有方检查保留状态大小。
-    pub fn points(&self) -> &[(f32, f32, f32)] {
-        &self.points
-    }
-
     /// 消费准备结果后归还点缓冲，调用者可在下一帧复用其容量。
     pub fn apply(self, map: &mut VoxelMap) -> Vec<(f32, f32, f32)> {
         update_map_prevalidated(map, self.origin, &self.points, &self.config);

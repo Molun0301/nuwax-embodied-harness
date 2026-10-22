@@ -106,11 +106,11 @@ def main(output,timeout,scenario="complete"):
             else:raise RuntimeError("未取得完整房间扫描地图")
             wait_task(call("finalize_active_map",{"map_name":name,"reason":"双楼层本地资产准备"}))
             asset=runtime.map_workspace_service._repository.get_map_asset(name)
-            assert asset.finalized and asset.asset_manifest_sha256
-            assets.append({"floor_id":floor_id,"display_name":name,"map_name":name,"asset_manifest_sha256":asset.asset_manifest_sha256})
+            assert asset.finalized and asset.asset_identity is not None
+            assets.append({"floor_id":floor_id,"display_name":name,"map_name":name,"asset_identity":asset.asset_identity.model_dump()})
             call("stop_mapping",{"reason":"准备下一层"})
         if scenario=="explore-unmapped":
-            assets.append({"floor_id":"F2","display_name":"模拟二层","map_name":"模拟二层","asset_manifest_sha256":None})
+            assets.append({"floor_id":"F2","display_name":"模拟二层","map_name":"模拟二层","asset_identity":None})
         wait_task(call("activate_map",{"map_name":"模拟一层"}))
         wait_task(call("relocalize_active_map",{"map_name":"模拟一层","planar_seed":[0.0,0.0,0.0],"timeout_sec":20}))
         topology={"building_id":"模拟建筑","display_name":"模拟建筑","revision":1,"floors":assets,"connections":[{
@@ -135,7 +135,7 @@ def main(output,timeout,scenario="complete"):
                 report["terminal"]=wait_task(rpc("tools/call",{"name":"resume_building_exploration","arguments":{"request_id":paused["request"]["request_id"]}}))
             report["building_exploration"]=call("get_building_exploration_state")["state"]
             assert report["building_exploration"]["terminal"] and set(report["building_exploration"]["completed_floors"])=={"F1","F2"}
-            assert runtime._get_building_catalog().get("模拟建筑").floors[1].asset_manifest_sha256
+            assert runtime._get_building_catalog().get("模拟建筑").floors[1].asset_identity is not None
             assert facility.floor=="F2" and not facility.errors
             report["world"]=world.snapshot();report["facility_commands"]=facility.commands;report["passed"]=True;return
         cancelled=False;wrong_since=None

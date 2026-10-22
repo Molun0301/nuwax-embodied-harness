@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from services.geometry.checkpoint_payload import FrozenPayload, payload_digest, payload_chunks, MAX_PLANAR_ARCHIVE_BYTES
+from services.geometry.checkpoint_payload import FrozenPayload, payload_chunks, MAX_PLANAR_ARCHIVE_BYTES
 from services.geometry.planar_archive import read_planar_structure, assign_legacy_planar_archive, MAX_GRID
 from services.geometry.fine_map_archive import MAX_FINE_ARCHIVE_BYTES, read_fine_archive_root, validate_fine_archive
 from services.geometry.dense_cloud import MAX_DENSE_ARCHIVE_BYTES, validate_dense_archive, read_dense_metadata
@@ -10,7 +10,6 @@ from services.geometry.dense_cloud import MAX_DENSE_ARCHIVE_BYTES, validate_dens
 import fcntl
 import ctypes
 import errno
-import hashlib
 import json
 import math
 import os
@@ -278,216 +277,13 @@ class MappingBackendCheckpointStore:
         )
 
     def publish(
-        self,
-        checkpoint: MappingBackendCheckpoint,
-        *,
-        occupancy_asset: Mapping[str, object],
-        cloud_asset: Optional[Mapping[str, object]],
-        fault_injector: Optional[FaultInjector] = None,
+        self, checkpoint: MappingBackendCheckpoint, *, occupancy_asset: Mapping[str, object],
+        cloud_asset: Optional[Mapping[str, object]], fault_injector: Optional[FaultInjector] = None,
     ) -> StoredMappingBackendCheckpoint:
-        """发布已在读取或导出边界解码的包、清单和当前选择器。"""
-
-        if checkpoint.schema_version == 2:
-            return self._publish_v2(checkpoint, occupancy_asset, cloud_asset, fault_injector)
-        validated = checkpoint
-        validated_occupancy_asset, validated_cloud_asset = occupancy_asset, cloud_asset
-        access = self._ensure_layout(validated.backend_kind, exclusive=True)
-        try:
-            paths = access.paths
-            current = self._load_optional(
-                validated.backend_kind,
-                validated.schema_version,
-                access=access,
-            )
-            self._cleanup_paths(
-                access,
-                current=current,
-                now_ns=self._validated_now_ns(),
-            )
-
-            payload_temp_name: Optional[str] = (
-                f".tmp-checkpoint-{uuid.uuid4().hex}.bin"
-            )
-            payload_temp_identity: Optional[_FileIdentity] = None
-            manifest_temp_name: Optional[str] = None
-            manifest_temp_identity: Optional[_FileIdentity] = None
-            selector_temp_name: Optional[str] = None
-            selector_temp_identity: Optional[_FileIdentity] = None
-            try:
-                payload_temp_identity = self._write_temp_file(
-                    access.objects_fd,
-                    payload_temp_name,
-                    paths.objects / payload_temp_name,
-                    validated.payload,
-                    written_phase="payload_temp_written",
-                    fsynced_phase="payload_file_fsynced",
-                    fault_injector=fault_injector,
-                )
-                reopened_payload = _read_regular_file_at(
-                    access.objects_fd,
-                    payload_temp_name,
-                    paths.objects / payload_temp_name,
-                    maximum_bytes=self._payload_limit(validated.backend_kind),
-                    description="temporary checkpoint payload",
-                )
-                reopened_sha256 = payload_digest(reopened_payload)
-                if reopened_sha256 != validated.content_sha256:
-                    raise MappingBackendCheckpointValidationError(
-                        "temporary checkpoint payload SHA-256 changed after fsync"
-                    )
-                if len(reopened_payload) != validated.payload_size:
-                    raise MappingBackendCheckpointValidationError(
-                        "temporary checkpoint payload size changed after fsync"
-                    )
-
-                object_sha256 = validated.content_sha256.hex()
-                object_name = f"sha256-{object_sha256}.bin"
-                object_path = paths.objects / object_name
-                self._install_immutable(
-                    access.objects_fd,
-                    payload_temp_name,
-                    object_name,
-                    object_path,
-                    validated.payload,
-                    temp_identity=payload_temp_identity,
-                    maximum_bytes=self._payload_limit(validated.backend_kind),
-                    description="checkpoint object",
-                )
-                payload_temp_name = None
-                _inject_fault(fault_injector, "object_installed")
-                _fsync_directory_fd(access.objects_fd, paths.objects)
-                _inject_fault(fault_injector, "objects_directory_fsynced")
-
-                if validated.fine_archive is not None:
-                    self._publish_pointcloud_archive(access, validated.fine_archive, fault_injector, MAX_FINE_ARCHIVE_BYTES)
-                if validated.dense_archive is not None:
-                    self._publish_pointcloud_archive(access, validated.dense_archive, fault_injector, MAX_DENSE_ARCHIVE_BYTES)
-
-                manifest_document = self._manifest_document(
-                    validated,
-                    validated_occupancy_asset,
-                    validated_cloud_asset,
-                )
-                manifest_bytes = _encode_json(manifest_document)
-                manifest_temp_name = f".tmp-manifest-{uuid.uuid4().hex}.json"
-                manifest_temp_identity = self._write_temp_file(
-                    access.manifests_fd,
-                    manifest_temp_name,
-                    paths.manifests / manifest_temp_name,
-                    manifest_bytes,
-                    written_phase="manifest_temp_written",
-                    fsynced_phase="manifest_file_fsynced",
-                    fault_injector=fault_injector,
-                )
-                reopened_manifest = _read_regular_file_at(
-                    access.manifests_fd,
-                    manifest_temp_name,
-                    paths.manifests / manifest_temp_name,
-                    maximum_bytes=_MAX_JSON_BYTES,
-                    description="temporary checkpoint manifest",
-                )
-                if reopened_manifest != manifest_bytes:
-                    raise MappingBackendCheckpointValidationError(
-                        "temporary checkpoint manifest changed after fsync"
-                    )
-                manifest_sha256 = hashlib.sha256(reopened_manifest).hexdigest()
-                manifest_relative = _manifest_relative_path(manifest_sha256)
-                manifest_name = f"sha256-{manifest_sha256}.json"
-                manifest_path = paths.manifests / manifest_name
-                self._install_immutable(
-                    access.manifests_fd,
-                    manifest_temp_name,
-                    manifest_name,
-                    manifest_path,
-                    reopened_manifest,
-                    temp_identity=manifest_temp_identity,
-                    maximum_bytes=_MAX_JSON_BYTES,
-                    description="checkpoint manifest",
-                )
-                manifest_temp_name = None
-                _inject_fault(fault_injector, "manifest_installed")
-                _fsync_directory_fd(access.manifests_fd, paths.manifests)
-                _inject_fault(fault_injector, "manifests_directory_fsynced")
-
-                selector_document = {
-                    "schema_version": validated.schema_version,
-                    "backend_kind": validated.backend_kind,
-                    "manifest": {
-                        "sha256": manifest_sha256,
-                        "path": manifest_relative,
-                    },
-                }
-                selector_bytes = _encode_json(selector_document)
-                selector_temp_name = (
-                    f".tmp-checkpoint-v{validated.schema_version}-"
-                    f"{uuid.uuid4().hex}.json"
-                )
-                selector_temp_identity = self._write_temp_file(
-                    access.backend_fd,
-                    selector_temp_name,
-                    paths.backend / selector_temp_name,
-                    selector_bytes,
-                    written_phase="selector_temp_written",
-                    fsynced_phase="selector_file_fsynced",
-                    fault_injector=fault_injector,
-                )
-                reopened_selector = _read_regular_file_at(
-                    access.backend_fd,
-                    selector_temp_name,
-                    paths.backend / selector_temp_name,
-                    maximum_bytes=_MAX_JSON_BYTES,
-                    description="temporary checkpoint selector",
-                )
-                if reopened_selector != selector_bytes:
-                    raise MappingBackendCheckpointValidationError(
-                        "temporary checkpoint selector changed after fsync"
-                    )
-                _verify_access_layout(access)
-                _replace_regular_file_at(
-                    access.backend_fd,
-                    selector_temp_name,
-                    paths.selector.name,
-                    paths.selector,
-                    expected_source=selector_temp_identity,
-                )
-                selector_temp_name = None
-                _inject_fault(fault_injector, "selector_installed")
-                _fsync_directory_fd(access.backend_fd, paths.backend)
-                _verify_access_layout(access)
-                _inject_fault(fault_injector, "backend_directory_fsynced")
-            finally:
-                for directory_fd, temp_name, identity in (
-                    (
-                        access.objects_fd,
-                        payload_temp_name,
-                        payload_temp_identity,
-                    ),
-                    (
-                        access.manifests_fd,
-                        manifest_temp_name,
-                        manifest_temp_identity,
-                    ),
-                    (
-                        access.backend_fd,
-                        selector_temp_name,
-                        selector_temp_identity,
-                    ),
-                ):
-                    if temp_name is not None and identity is not None:
-                        _unlink_at_if_same(directory_fd, temp_name, identity)
-
-            stored = self._load_optional(
-                validated.backend_kind,
-                validated.schema_version,
-                access=access,
-            )
-            if stored is None:
-                raise MappingBackendCheckpointValidationError(
-                    "published checkpoint selector disappeared under the store lock"
-                )
-            return stored
-        finally:
-            access.close()
+        """发布当前分配式检查点；历史数据先从读取边界向前转换。"""
+        if checkpoint.schema_version != 2:
+            raise MappingBackendCheckpointValidationError("只允许发布schema 2检查点；历史检查点须先导入")
+        return self._publish_v2(checkpoint, occupancy_asset, cloud_asset, fault_injector)
 
     def load(
         self,
@@ -538,7 +334,6 @@ class MappingBackendCheckpointStore:
             return CheckpointCleanupResult((), (), ())
         access = self._existing_layout(kind, schema, exclusive=True)
         try:
-            current = None
             cleanup_now_ns = (
                 self._validated_now_ns()
                 if now_ns is None
@@ -546,30 +341,12 @@ class MappingBackendCheckpointStore:
             )
             return self._cleanup_paths(
                 access,
-                current=current,
                 now_ns=cleanup_now_ns,
             )
         finally:
             access.close()
 
-    def _publish_pointcloud_archive(self, access, payload, fault_injector, maximum_bytes):
-        """点云资产先于引用它的清单落盘，失败只留下可回收的无引用对象。"""
-        name = f".tmp-checkpoint-{uuid.uuid4().hex}.bin"
-        identity = None
-        try:
-            identity = self._write_temp_file(
-                access.objects_fd, name, access.paths.objects / name, payload,
-                written_phase="payload_temp_written", fsynced_phase="payload_file_fsynced",
-                fault_injector=fault_injector,
-            )
-            final_name = f"sha256-{payload_digest(payload).hex()}.bin"
-            self._install_immutable(access.objects_fd, name, final_name, access.paths.objects / final_name,
-                payload, temp_identity=identity, maximum_bytes=maximum_bytes, description="点云地图资产")
-            name = None
-            _fsync_directory_fd(access.objects_fd, access.paths.objects)
-        finally:
-            if name is not None and identity is not None:
-                _unlink_at_if_same(access.objects_fd, name, identity)
+
 
     def _validate_checkpoint(
         self, checkpoint: MappingBackendCheckpoint
@@ -662,41 +439,7 @@ class MappingBackendCheckpointStore:
         return validated
 
 
-    def _manifest_document(
-        self,
-        checkpoint: MappingBackendCheckpoint,
-        occupancy_asset: Mapping[str, object],
-        cloud_asset: Optional[Mapping[str, object]],
-    ) -> Dict[str, object]:
-        document = {
-            "schema_version": checkpoint.schema_version,
-            "backend_kind": checkpoint.backend_kind,
-            "source_session_id": checkpoint.source_session_id,
-            "source_session_generation": checkpoint.source_session_generation,
-            "created_at_ns": checkpoint.created_at_ns,
-            "payload": {
-                "sha256": checkpoint.content_sha256.hex(),
-                "path": _object_relative_path(checkpoint.content_sha256.hex()),
-                "size": checkpoint.payload_size,
-            },
-            "canonical_receipts": {
-                "occupancy": _receipt_document(checkpoint.occupancy_receipt),
-                "cloud": _receipt_document(checkpoint.cloud_receipt) if checkpoint.cloud_receipt is not None else None,
-            },
-            "canonical_assets": {
-                "occupancy": _asset_document(
-                    occupancy_asset, sha256_field="raw_data_sha256"
-                ),
-                "cloud": _asset_document(cloud_asset, sha256_field="xyz_sha256") if cloud_asset is not None else None,
-            },
-        }
-        if checkpoint.fine_archive is not None:
-            sha = payload_digest(checkpoint.fine_archive).hex()
-            document["fine_archive"] = {"sha256": sha, "path": _object_relative_path(sha), "size": len(checkpoint.fine_archive)}
-        if checkpoint.dense_archive is not None:
-            sha = payload_digest(checkpoint.dense_archive).hex()
-            document["dense_archive"] = {"sha256": sha, "path": _object_relative_path(sha), "size": len(checkpoint.dense_archive)}
-        return document
+
 
     def _load_optional(
         self,
@@ -746,24 +489,37 @@ class MappingBackendCheckpointStore:
             manifest_relative=manifest_relative,
         )
 
-    def _load_referenced_checkpoint(
-        self,
-        access: "_StoreAccess",
-        *,
-        manifest_sha256: str,
-        manifest_relative: str,
-    ) -> StoredMappingBackendCheckpoint:
-        paths = access.paths
+    def _load_referenced_checkpoint(self, access: "_StoreAccess", *, manifest_sha256: str, manifest_relative: str):
+        def read_member(relative, *, maximum_bytes, description):
+            path = self._version_dir / relative
+            descriptor = access.manifests_fd if path.parent == access.paths.manifests else access.objects_fd
+            return _read_regular_file_at(descriptor, path.name, path,
+                maximum_bytes=maximum_bytes, description=description)
+        return self._decode_legacy_checkpoint(access.paths, manifest_sha256=manifest_sha256,
+            manifest_relative=manifest_relative, read_member=read_member)
+
+    def load_legacy_import(self, backend_kind: str, *, read_member) -> StoredMappingBackendCheckpoint:
+        """读取已由历史资产拥有方固定的文件，不要求旧目录满足新发布目录权限。"""
+        kind = _validate_backend_kind(backend_kind)
+        backend = self._version_dir / "mapping_backend" / kind
+        paths = _StorePaths(kind, 1, backend, backend / "objects", backend / "manifests", backend / "checkpoint-v1.json")
+        selector = _parse_canonical_json(read_member(paths.selector.relative_to(self._version_dir).as_posix(),
+            maximum_bytes=_MAX_JSON_BYTES, description="checkpoint selector"), "checkpoint selector")
+        _require_exact_fields(selector, ("schema_version", "backend_kind", "manifest"), "checkpoint selector")
+        if _validate_schema_version(selector["schema_version"]) != 1 or _validate_backend_kind(selector["backend_kind"]) != kind:
+            raise MappingBackendCheckpointValidationError("历史检查点选择器与目录身份不一致")
+        alias, relative = _validate_manifest_reference(selector["manifest"], "checkpoint selector manifest")
+        return self._decode_legacy_checkpoint(paths, manifest_sha256=alias,
+            manifest_relative=relative, read_member=read_member)
+
+    def _decode_legacy_checkpoint(self, paths, *, manifest_sha256, manifest_relative, read_member):
         expected_manifest_relative = _manifest_relative_path(manifest_sha256)
         if manifest_relative != expected_manifest_relative:
             raise MappingBackendCheckpointValidationError(
                 "checkpoint manifest path is not canonical for its SHA-256"
             )
         manifest_path = paths.backend / expected_manifest_relative
-        manifest_bytes = _read_regular_file_at(
-            access.manifests_fd,
-            manifest_path.name,
-            manifest_path,
+        manifest_bytes = read_member(manifest_path.relative_to(self._version_dir).as_posix(),
             maximum_bytes=_MAX_JSON_BYTES,
             description="checkpoint manifest",
         )
@@ -792,10 +548,7 @@ class MappingBackendCheckpointStore:
             manifest["payload"]
         )
         object_path = paths.backend / payload_relative
-        payload = _read_regular_file_at(
-            access.objects_fd,
-            object_path.name,
-            object_path,
+        payload = read_member(object_path.relative_to(self._version_dir).as_posix(),
             maximum_bytes=self._payload_limit(backend_kind),
             description="checkpoint object",
         )
@@ -843,7 +596,7 @@ class MappingBackendCheckpointStore:
         if "fine_archive" in manifest:
             fine_sha, fine_relative, fine_size = _validate_payload_reference(manifest["fine_archive"])
             fine_path = paths.backend / fine_relative
-            fine_archive = _read_regular_file_at(access.objects_fd, fine_path.name, fine_path,
+            fine_archive = read_member(fine_path.relative_to(self._version_dir).as_posix(),
                 maximum_bytes=MAX_FINE_ARCHIVE_BYTES, description="精细地图资产")
             if len(fine_archive) != fine_size:
                 raise MappingBackendCheckpointValidationError("精细地图资产长度或摘要与清单不符")
@@ -851,7 +604,7 @@ class MappingBackendCheckpointStore:
         if "dense_archive" in manifest:
             dense_sha, dense_relative, dense_size = _validate_payload_reference(manifest["dense_archive"])
             dense_path = paths.backend / dense_relative
-            dense_archive = _read_regular_file_at(access.objects_fd, dense_path.name, dense_path,
+            dense_archive = read_member(dense_path.relative_to(self._version_dir).as_posix(),
                 maximum_bytes=MAX_DENSE_ARCHIVE_BYTES, description="完整点云资产")
             if len(dense_archive) != dense_size:
                 raise MappingBackendCheckpointValidationError("完整点云资产长度或摘要与清单不符")
@@ -886,17 +639,7 @@ class MappingBackendCheckpointStore:
                 **({"dense_cloud": dense_path} if dense_archive is not None else {})},
         )
 
-    def _ensure_layout(
-        self, backend_kind: str, *, exclusive: bool
-    ) -> "_StoreAccess":
-        return _open_store_access(
-            self._version_dir,
-            backend_kind,
-            MAPPING_BACKEND_CHECKPOINT_SCHEMA_VERSION,
-            create=True,
-            exclusive=exclusive,
-            lock_timeout_seconds=self._lock_timeout_seconds,
-        )
+
 
     def _existing_layout(
         self,
@@ -957,47 +700,12 @@ class MappingBackendCheckpointStore:
             if fd is not None:
                 os.close(fd)
 
-    def _install_immutable(
-        self,
-        directory_fd: int,
-        temp_name: str,
-        final_name: str,
-        final_path: Path,
-        expected: bytes,
-        *,
-        temp_identity: "_FileIdentity",
-        maximum_bytes: int,
-        description: str,
-    ) -> None:
-        try:
-            os.stat(final_name, dir_fd=directory_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            _replace_regular_file_at(
-                directory_fd,
-                temp_name,
-                final_name,
-                final_path,
-                expected_source=temp_identity,
-            )
-            return
-        existing = _read_regular_file_at(
-            directory_fd,
-            final_name,
-            final_path,
-            maximum_bytes=maximum_bytes,
-            description=description,
-        )
-        if existing != expected:
-            raise MappingBackendCheckpointValidationError(
-                f"existing immutable {description} content does not match its name"
-            )
-        _unlink_at_if_same(directory_fd, temp_name, temp_identity)
+
 
     def _cleanup_paths(
         self,
         access: "_StoreAccess",
         *,
-        current: Optional[StoredMappingBackendCheckpoint],
         now_ns: int,
     ) -> CheckpointCleanupResult:
         paths = access.paths
@@ -2510,14 +2218,7 @@ def _validate_asset_bindings(
         raise MappingBackendCheckpointValidationError("完整点云与体素地图坐标系不一致")
 
 
-def _asset_document(
-    asset: Mapping[str, object], *, sha256_field: str
-) -> Dict[str, object]:
-    document = dict(asset)
-    document[sha256_field] = _require_bytes(
-        document[sha256_field], sha256_field
-    ).hex()
-    return document
+
 
 
 def _validate_asset_sha256(value: object, name: str, *, encoding: str) -> bytes:

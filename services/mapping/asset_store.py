@@ -275,7 +275,7 @@ class MapAssetBundleRepository:
         """Explicit activation import of eligible schema1 current; old files stay untouched.
 
         Caller holds the existing executor guard and commits catalog ownership.
-        None retains legacy activation for unsupported or ambiguous sources.
+        不支持或缺少同源输入时返回None，由调用方明确拒绝激活。
         """
         self._recover_planar_exchange(map_name)
         current = self._map_dir(map_name) / "current"
@@ -341,7 +341,9 @@ class MapAssetBundleRepository:
                     raise MapAssetBundleValidationError("published cloud import source changed")
                 tree.verify_all()
                 return selected
-            stored = MappingBackendCheckpointStore(current).load(source["backend_kind"], schema_version=1)
+            stored = MappingBackendCheckpointStore(current).load_legacy_import(source["backend_kind"],
+                read_member=lambda relative, maximum_bytes, description:
+                    tree.require_file(relative, description).read(maximum_bytes))
             if (stored.manifest_path.relative_to(current).as_posix() != source["manifest_path"]
                     or stored.manifest_sha256 != source.get("manifest_sha256")
                     or stored.checkpoint.content_sha256.hex() != source.get("object_sha256")):
@@ -355,18 +357,18 @@ class MapAssetBundleRepository:
                     or struct.pack("<f", grid.resolution_m) != struct.pack("<f", occupancy["resolution"])
                     or grid.origin.position.x != occupancy["origin_x"] or grid.origin.position.y != occupancy["origin_y"]
                     or grid.frame_id.strip().lstrip("/") != occupancy["frame_id"]):
-                return None  # Original legacy activation retains its own admission decision.
+                return None  # 保留原资产；不满足转换输入时拒绝激活。
             if geometry.frame_id != occupancy["frame_id"] or bundle.frame_id != occupancy["frame_id"]:
-                return None  # Assigned frame contract is stricter; preserve legacy activation.
+                return None  # 分配式坐标约定要求输入一致。
             from datetime import datetime, timezone
             timestamp = grid.timestamp
             if not isinstance(timestamp, datetime):
-                return None  # Original legacy activation retains its own admission decision.
+                return None  # 保留原资产；不满足转换输入时拒绝激活。
             timestamp = timestamp.replace(tzinfo=timezone.utc) if timestamp.tzinfo is None else timestamp.astimezone(timezone.utc)
             delta = timestamp - datetime(1970, 1, 1, tzinfo=timezone.utc)
             timestamp_ns = delta.days * 86400000000000 + delta.seconds * 1000000000 + delta.microseconds * 1000
             if abs(timestamp_ns - occupancy["timestamp_ns"]) >= 1000:
-                return None  # Original legacy activation retains its own admission decision.
+                return None  # 保留原资产；不满足转换输入时拒绝激活。
             cells = bytes(value if value >= 0 else value + 256 for value in grid.data)
             managed = tree.require_file(geometry.pcd_path, "canonical legacy PCD")
             managed.verify_named_entry()
@@ -386,9 +388,9 @@ class MapAssetBundleRepository:
             managed.verify_named_entry()
             if (header.points > 0 and header.points * 12 != len(xyz)
                     or stored.cloud_asset["frame_id"] != occupancy["frame_id"]):
-                return None  # Original legacy activation retains its own admission decision.
+                return None  # 保留原资产；不满足转换输入时拒绝激活。
             if len(cells) != occupancy["raw_data_size"] or len(xyz) != stored.cloud_asset["xyz_size"]:
-                return None  # Original legacy activation retains its own admission decision.
+                return None  # 保留原资产；不满足转换输入时拒绝激活。
             # These IDs are allocated for a genuine new immutable import owner,
             # only after published-version reuse and source preparation.
             identity = AssetIdentityV2(asset_id=uuid.uuid4().hex)
@@ -467,7 +469,9 @@ class MapAssetBundleRepository:
             for relative, size in expected.items():
                 if tree.require_file(relative, "legacy member").size() != size:
                     raise MapAssetBundleValidationError("legacy planar member size differs")
-            stored = MappingBackendCheckpointStore(current).load("slam_toolbox", schema_version=1)
+            stored = MappingBackendCheckpointStore(current).load_legacy_import("slam_toolbox",
+                read_member=lambda relative, maximum_bytes, description:
+                    tree.require_file(relative, description).read(maximum_bytes))
             checkpoint, occupancy, cloud = assign_legacy_planar_checkpoint(stored,
                 checkpoint_id=uuid.uuid4().hex, artifact_id=uuid.uuid4().hex)
             identity = AssetIdentityV2(asset_id=uuid.uuid4().hex)

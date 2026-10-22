@@ -148,7 +148,7 @@ def finalize_assigned_cloud_map(owner, asset, *, context, reason, metadata, geor
     staging = owner._asset_repository.create_staging_directory(name)
     try:
         prepared = owner._geometry_runtime.prepare_map_asset_bundle(
-            draft, bundle_root=staging, checkpoint_schema_version=2)
+            draft, bundle_root=staging)
         with owner._repository.map_activation_guard():
             require_catalog_owner(owner, asset, captured)
             owner._require_no_map_activation_recovery("finalize_active_map")

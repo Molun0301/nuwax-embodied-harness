@@ -617,7 +617,6 @@ fn encode_occupancy_revision_in_frame(
             event.data.len()
         ));
     }
-    event.validate_provenance()?;
     let wire_revision = i32::try_from(event.revision).map_err(|_| {
         format!(
             "occupancy revision {} exceeds positive LCM i32 domain",
@@ -658,17 +657,11 @@ fn encode_occupancy_revision_in_frame(
 }
 
 pub(crate) fn committed_map_identity_from_revision(event: &MapRevisionEvent) -> Result<schema::CommittedMapIdentity, String> {
-    event.validate_provenance()?;
     committed_map_identity_from_receipt(&event.receipt, &event.frame_id)
 }
 
 pub(crate) fn committed_map_identity_from_receipt(receipt: &crate::mapping_commit::OccupancyCommitReceipt,
     frame_id: &str) -> Result<schema::CommittedMapIdentity, String> {
-    if receipt.commit_id.boot_nonce == 0 || receipt.commit_id.sequence == 0 || receipt.session_id.trim().is_empty()
-        || receipt.session_generation == 0 || receipt.occupancy_revision == 0 || receipt.backend_generation == 0
-        || frame_id.trim().is_empty() {
-        return Err("committed map owner provenance is incomplete".into());
-    }
     Ok(schema::CommittedMapIdentity {
         session_id: receipt.session_id.clone(),
         session_generation: i64::try_from(receipt.session_generation).map_err(|_| "map session generation exceeds i64")?,
@@ -738,7 +731,7 @@ pub(crate) fn map_event_matches_current_session(event: &MapRevisionEvent,
     let snapshot = mapping.snapshot();
     let Some(latest) = mapping.latest_occupancy_commit_receipt() else { return false; };
     let receipt = &event.receipt;
-    event.validate_provenance().is_ok() && snapshot.active
+    snapshot.active
         && event.session_generation == snapshot.session_generation && event.session_id == snapshot.session_id
         && event.map_name == snapshot.map_name && event.frame_id == mapping.configured_map_frame_id()
         && receipt.backend_kind == latest.backend_kind && receipt.backend_generation == latest.backend_generation
@@ -3445,6 +3438,7 @@ impl GeometryRuntimeHandle {
     }
 
     /// Reserve, activate, and await one cloud-map clear session.
+    #[cfg(test)]
     pub(crate) async fn begin_cloud_map_session(
         &self,
         session_generation: u64,
@@ -9703,21 +9697,7 @@ pub(crate) async fn publish_committed_global_map_in_frame(
     Ok(())
 }
 
-pub(crate) fn build_committed_global_map_frame_in_frame(
-    committed: &CommittedMappingCloudMap,
-    xyz_f32_le: &[u8],
-    frame_id: &str,
-) -> Result<RawLcmFrame, String> {
-    if !canonical_cloud_payload_matches(&committed.notification, xyz_f32_le) {
-        return Err("explicit global-map export payload length does not match metadata".into());
-    }
-    build_global_map_snapshot_frame_in_frame(
-        xyz_f32_le,
-        committed.notification.revision,
-        committed.source_timestamp_ns,
-        frame_id,
-    )
-}
+
 
 fn build_global_map_snapshot_frame_in_frame(
     xyz_f32_le: &[u8],
@@ -9752,17 +9732,7 @@ async fn publish_raw_lcm_frame(transport: &LcmTransport, frame: RawLcmFrame) -> 
     }
 }
 
-pub(crate) async fn publish_retained_global_map_frame(
-    handle: &GeometryRuntimeHandle,
-    frame: &RawLcmFrame,
-) -> Result<(), String> {
-    if canonical_cloud_publication_invalidation(&handle.cloud_map_writer)
-        .legacy_full_demand.lock().is_none()
-    {
-        return Ok(());
-    }
-    publish_raw_lcm_frame(&handle.transport, frame.clone()).await
-}
+
 
 async fn publish_global_map_snapshot_in_frame(
     transport: &LcmTransport,
@@ -11647,7 +11617,6 @@ pub(crate) async fn handoff_registered_lio_cloud_with_correction(
     let adapter_timestamp_ns = accepted.adapter_timestamp_ns();
     let source_timestamp_ns = accepted.source_timestamp_ns();
     let map_frame = accepted.map_frame_id();
-    let body_frame = accepted.body_frame_id();
     let binding = accepted.binding();
     let navigation_context = handle.navigation_map_3d_publish_context();
     let initial_mode = correction.relocalization_mode_snapshot();
@@ -11806,27 +11775,7 @@ pub(crate) async fn handoff_registered_lio_cloud_with_correction(
         .cloud_commit
         .as_ref()
         .ok_or_else(|| "registered LIO correction lacks a cloud receipt".to_owned())?;
-    if occupancy_receipt.commit_id != cloud.receipt.commit_id
-        || occupancy_receipt.session_id != binding.mapping_session_id
-        || occupancy_receipt.session_generation != binding.mapping_session_generation
-        || cloud.receipt.session_generation != binding.mapping_session_generation
-        || occupancy_receipt.occupancy_revision != event.revision
-        || cloud.receipt.occupancy_revision != event.revision
-        || cloud.receipt.source_timestamp_ns != source_timestamp_ns
-        || occupancy_receipt.source_timestamp_ns != source_timestamp_ns
-        || event.timestamp_ns != source_timestamp_ns
-    {
-        return Err("registered LIO correction receipt identity mismatch".to_owned());
-    }
-
     let shared = handle.state.read().await;
-    if shared.map.revision != event.revision
-        || shared.map.timestamp_ns != source_timestamp_ns
-        || normalize_frame(&shared.map.frame_id) != normalize_frame(map_frame)
-        || shared.cloud_map_revision != cloud.receipt.cloud_revision
-    {
-        return Err("canonical map/cloud state does not match correction receipts".to_owned());
-    }
     let committed_map = crate::correction_coordinator::CommittedMapProof {
         backend_kind: occupancy_receipt.backend_kind,
         backend_generation: occupancy_receipt.backend_generation,
@@ -11839,31 +11788,25 @@ pub(crate) async fn handoff_registered_lio_cloud_with_correction(
     };
     drop(shared);
     let source = accepted.scan();
-    let body_points = source.body_points().clone();
     let input = crate::correction_coordinator::CorrectionFrameInput {
-        mapping_session_id: binding.mapping_session_id.clone(),
-        mapping_session_generation: binding.mapping_session_generation,
+
+
         mapping_commit_id: occupancy_receipt.commit_id,
         occupancy_revision: occupancy_receipt.occupancy_revision,
         cloud_revision: cloud.receipt.cloud_revision,
         cloud_receipt: cloud.receipt.clone(),
-        map_frame_generation: binding.map_frame_generation,
-        registered_cloud: crate::correction_coordinator::RegisteredCloudProof::from_admitted(source)
-            .map_err(|error| error.to_string())?,
-        correlated_odom: crate::correction_coordinator::FrozenCorrelatedOdom {
-            proof: crate::correction_coordinator::CorrelatedOdomProof::from_registration(binding)
-                .map_err(|error| error.to_string())?,
-            odom_from_body: binding.frozen_odom_from_body,
-        },
+
+
+
         committed_map,
         committed_map_occupancy: Arc::clone(&event.data),
-        points_frame_id: body_frame.to_owned(),
+
         static_point_indices: handle.mapping_adapter.as_ref().ok_or("建图拥有方未就绪")?.lock()
             .pgo_static_point_indices(source)?,
-        body_points,
+
         source_owner: source.clone(),
-        base_anchor_map_from_odom: binding.base_anchor_map_from_odom,
-        frame_capture_relocalization_epoch: frame_capture_epoch,
+
+
         relocalization_mode_epoch: None,
     };
     let submitted = if correction.supports_background_mapping() {
@@ -11882,166 +11825,9 @@ pub(crate) async fn handoff_registered_lio_cloud_with_correction(
     Ok(true)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn handoff_registered_lio_cloud_replay_with_correction(
-    handle: &GeometryRuntimeHandle,
-    accepted: &crate::lio_ingress::AcceptedRegisteredCloud,
-    correction: &crate::correction_coordinator::CorrectionFrameIngress,
-) -> Result<bool, String> {
-    let points = accepted.map_points();
-    let point_step = accepted.point_step();
-    let adapter_timestamp_ns = accepted.adapter_timestamp_ns();
-    let source_timestamp_ns = accepted.source_timestamp_ns();
-    let map_frame = accepted.map_frame_id();
-    let binding = accepted.binding();
-    let navigation_context = handle.navigation_map_3d_publish_context();
-    let initial_mode = correction.relocalization_mode_snapshot();
-    let Some(frame_capture_epoch) = binding.frame_capture_relocalization_epoch else {
-        return Ok(false);
-    };
-    if frame_capture_epoch != initial_mode.epoch {
-        return Ok(false);
-    }
-    if initial_mode.active {
-        let lifecycle_guard = handle.mapping_lifecycle_lock.clone().lock_owned().await;
-        let active_mode = correction.relocalization_mode_snapshot();
-        if active_mode == initial_mode {
-            let frame = registered_lio_read_only_correction_frame(
-                handle,
-                accepted,
-                active_mode.epoch,
-            )
-            .await?;
-            if correction.relocalization_mode_snapshot() != active_mode {
-                return Ok(false);
-            }
-            correction
-                .submit_with_lifecycle_guard(frame.input, lifecycle_guard)
-                .await
-                .map_err(|error| error.to_string())?;
-            let _lifecycle_guard = handle.mapping_lifecycle_lock.lock().await;
-            if correction.relocalization_mode_snapshot() != active_mode {
-                return Ok(false);
-            }
-            publish_read_only_mapping_cloud_while_lifecycle_fenced(
-                handle,
-                map_frame,
-                binding,
-                &frame.cloud,
-                ExpectedRelocalizationMode {
-                    fence: correction.relocalization_mode_fence(),
-                    epoch: active_mode.epoch,
-                    active: active_mode.active,
-                },
-                navigation_context.as_ref(),
-            )
-            .await?;
-            return Ok(true);
-        }
-    }
 
-    let commit = commit_registered_lio_cloud_inner(
-        handle,
-        points,
-        point_step,
-        adapter_timestamp_ns,
-        source_timestamp_ns,
-        map_frame,
-        canonical_mapping_source(accepted)?,
-        Some((
-            binding.mapping_session_generation,
-            binding.map_frame_generation,
-            binding.registration_correction_revision,
-        )),
-        Some(initial_mode.epoch),
-        Some(correction.relocalization_mode_fence()),
-        binding.sensor_origin_map,
-        Some(accepted.clone().into()),
-    )
-    .await?;
-    if !commit.outcome.accepted_map_points.is_empty() {
-        handle.mapping_adapter.as_ref().ok_or("mapping adapter unavailable")?.lock()
-            .record_pgo_scan(accepted)?;
-    }
-    if commit.outcome.occupancy_event.is_none() {
-        return Ok(false);
-    }
 
-    {
-        let _lifecycle_guard = handle.mapping_lifecycle_lock.lock().await;
-        if correction.relocalization_mode_snapshot() != initial_mode {
-            return Ok(false);
-        }
-        ensure_replay_mapping_identity(handle, binding)?;
-    }
-    let mapping = handle
-        .mapping_adapter
-        .as_ref()
-        .ok_or_else(|| "mapping adapter is unavailable".to_owned())?;
-    publish_mapping_ingest_commit_with_lifecycle_fence(
-        &handle.transport,
-        mapping,
-        &handle.mapping_lifecycle_lock,
-        &handle.cloud_map_writer,
-        &handle.state,
-        &handle.cloud_map_tx,
-        &handle.map_revision_tx,
-        map_frame,
-        &commit,
-        Some(binding),
-        Some(ExpectedRelocalizationMode {
-            fence: correction.relocalization_mode_fence(),
-            epoch: initial_mode.epoch,
-            active: initial_mode.active,
-        }),
-        navigation_context.as_ref(),
-    )
-    .await?;
-    let input = registered_lio_correction_input(
-        handle,
-        accepted,
-        &commit,
-    )
-    .await?;
-    if correction.supports_background_mapping() {
-        correction
-            .submit_mapping_background(input)
-            .map_err(|error| error.to_string())?;
-    } else {
-        correction
-            .submit(input)
-            .await
-            .map_err(|error| error.to_string())?;
-    }
-    {
-        let _lifecycle_guard = handle.mapping_lifecycle_lock.lock().await;
-        if correction.relocalization_mode_snapshot() != initial_mode {
-            return Ok(false);
-        }
-        ensure_replay_mapping_identity(handle, binding)?;
-    }
-    Ok(true)
-}
 
-fn ensure_replay_mapping_identity(
-    handle: &GeometryRuntimeHandle,
-    binding: &crate::lio_ingress::RegistrationBinding,
-) -> Result<(), String> {
-    let mapping = handle
-        .mapping_adapter
-        .as_ref()
-        .ok_or_else(|| "mapping adapter is unavailable".to_owned())?;
-    let mapping = mapping.lock();
-    let snapshot = mapping.snapshot();
-    if !snapshot.active
-        || snapshot.session_id != binding.mapping_session_id
-        || snapshot.session_generation != binding.mapping_session_generation
-        || mapping.global_frame_generation() != binding.map_frame_generation
-    {
-        return Err("deferred correction mapping identity changed".to_owned());
-    }
-    Ok(())
-}
 
 /// Revalidate a frozen read-only relocalization payload while the caller owns
 /// `mapping_lifecycle_lock`.  A session/generation check alone is not enough:
@@ -12113,93 +11899,7 @@ async fn ensure_read_only_mapping_identity(
     Ok(())
 }
 
-async fn registered_lio_correction_input(
-    handle: &GeometryRuntimeHandle,
-    accepted: &crate::lio_ingress::AcceptedRegisteredCloud,
-    commit: &MappingIngestCommit,
-) -> Result<crate::correction_coordinator::CorrectionFrameInput, String> {
-    let source_timestamp_ns = accepted.source_timestamp_ns();
-    let map_frame = accepted.map_frame_id();
-    let body_frame = accepted.body_frame_id();
-    let binding = accepted.binding();
-    let frame_capture_epoch = binding
-        .frame_capture_relocalization_epoch
-        .ok_or_else(|| "registered LIO correction lacks frame capture provenance".to_owned())?;
-    let event = commit
-        .outcome
-        .occupancy_event
-        .as_ref()
-        .ok_or_else(|| "registered LIO correction lost its occupancy event".to_owned())?;
-    let occupancy_receipt = commit
-        .outcome
-        .occupancy_receipt
-        .as_ref()
-        .ok_or_else(|| "registered LIO correction lacks an occupancy receipt".to_owned())?;
-    let cloud = commit
-        .cloud_commit
-        .as_ref()
-        .ok_or_else(|| "registered LIO correction lacks a cloud receipt".to_owned())?;
-    if occupancy_receipt.commit_id != cloud.receipt.commit_id
-        || occupancy_receipt.session_id != binding.mapping_session_id
-        || occupancy_receipt.session_generation != binding.mapping_session_generation
-        || cloud.receipt.session_generation != binding.mapping_session_generation
-        || occupancy_receipt.occupancy_revision != event.revision
-        || cloud.receipt.occupancy_revision != event.revision
-        || cloud.receipt.source_timestamp_ns != source_timestamp_ns
-        || occupancy_receipt.source_timestamp_ns != source_timestamp_ns
-        || event.timestamp_ns != source_timestamp_ns
-    {
-        return Err("registered LIO correction receipt identity mismatch".to_owned());
-    }
 
-    let shared = handle.state.read().await;
-    if shared.map.revision != event.revision
-        || shared.map.timestamp_ns != source_timestamp_ns
-        || normalize_frame(&shared.map.frame_id) != normalize_frame(map_frame)
-        || shared.cloud_map_revision != cloud.receipt.cloud_revision
-    {
-        return Err("canonical map/cloud state does not match correction receipts".to_owned());
-    }
-    let committed_map = crate::correction_coordinator::CommittedMapProof {
-        backend_kind: occupancy_receipt.backend_kind,
-        backend_generation: occupancy_receipt.backend_generation,
-        source_timestamp_ns,
-        width: u64::from(shared.map.width),
-        height: u64::from(shared.map.height),
-        resolution_m: f64::from(shared.map.resolution),
-        origin_x_m: shared.map.origin_x,
-        origin_y_m: shared.map.origin_y,
-    };
-    drop(shared);
-    let source = accepted.scan();
-    let body_points = source.body_points().clone();
-    Ok(crate::correction_coordinator::CorrectionFrameInput {
-        mapping_session_id: binding.mapping_session_id.clone(),
-        mapping_session_generation: binding.mapping_session_generation,
-        mapping_commit_id: occupancy_receipt.commit_id,
-        occupancy_revision: occupancy_receipt.occupancy_revision,
-        cloud_revision: cloud.receipt.cloud_revision,
-        cloud_receipt: cloud.receipt.clone(),
-        map_frame_generation: binding.map_frame_generation,
-        registered_cloud: crate::correction_coordinator::RegisteredCloudProof::from_admitted(source)
-            .map_err(|error| error.to_string())?,
-        correlated_odom: crate::correction_coordinator::FrozenCorrelatedOdom {
-            proof: crate::correction_coordinator::CorrelatedOdomProof::from_registration(binding)
-                .map_err(|error| error.to_string())?,
-            odom_from_body: binding.frozen_odom_from_body,
-        },
-        committed_map,
-        committed_map_occupancy: Arc::clone(&event.data),
-        points_frame_id: body_frame.to_owned(),
-        static_point_indices: handle.mapping_adapter.as_ref().ok_or("建图拥有方未就绪")?.lock()
-            .pgo_static_point_indices(source)?,
-        body_points,
-        source_owner: source.clone(),
-        base_anchor_map_from_odom: binding.base_anchor_map_from_odom,
-        frame_capture_relocalization_epoch: frame_capture_epoch,
-        relocalization_mode_epoch: None,
-    })
-}
 
 struct ReadOnlyRegisteredLioCorrectionFrame {
     input: crate::correction_coordinator::CorrectionFrameInput,
@@ -12213,7 +11913,6 @@ async fn registered_lio_read_only_correction_frame(
 ) -> Result<ReadOnlyRegisteredLioCorrectionFrame, String> {
     let source_timestamp_ns = accepted.source_timestamp_ns();
     let map_frame = accepted.map_frame_id();
-    let body_frame = accepted.body_frame_id();
     let binding = accepted.binding();
     if binding.frame_capture_relocalization_epoch != Some(mode_epoch) {
         return Err("relocalization frame capture mode epoch changed".to_owned());
@@ -12280,7 +11979,6 @@ async fn registered_lio_read_only_correction_frame(
 
     // Failed metadata/receipt validation must not demand a full body transform.
     let source = accepted.scan();
-    let body_points = source.body_points().clone();
     let committed_map_occupancy: Arc<[u8]> = map
         .data
         .iter()
@@ -12298,28 +11996,23 @@ async fn registered_lio_read_only_correction_frame(
         origin_y_m: map.origin_y,
     };
     let input = crate::correction_coordinator::CorrectionFrameInput {
-        mapping_session_id: binding.mapping_session_id.clone(),
-        mapping_session_generation: binding.mapping_session_generation,
+
+
         mapping_commit_id: occupancy_receipt.commit_id,
         occupancy_revision: occupancy_receipt.occupancy_revision,
         cloud_revision: cloud_receipt.cloud_revision,
         cloud_receipt: cloud_receipt.clone(),
-        map_frame_generation: binding.map_frame_generation,
-        registered_cloud: crate::correction_coordinator::RegisteredCloudProof::from_admitted(source)
-            .map_err(|error| error.to_string())?,
-        correlated_odom: crate::correction_coordinator::FrozenCorrelatedOdom {
-            proof: crate::correction_coordinator::CorrelatedOdomProof::from_registration(binding)
-                .map_err(|error| error.to_string())?,
-            odom_from_body: binding.frozen_odom_from_body,
-        },
+
+
+
         committed_map,
         committed_map_occupancy,
-        points_frame_id: body_frame.to_owned(),
-        body_points,
+
+
         source_owner: source.clone(),
         static_point_indices: None,
-        base_anchor_map_from_odom: binding.base_anchor_map_from_odom,
-        frame_capture_relocalization_epoch: mode_epoch,
+
+
         relocalization_mode_epoch: Some(mode_epoch),
     };
     Ok(ReadOnlyRegisteredLioCorrectionFrame {
@@ -17839,7 +17532,7 @@ pub(crate) mod mapping_feed_tests {
                             .expect("current admitted scan and producer receipts");
                         assert_eq!(staged_frame.mapping_commit_id, receipt.commit_id);
                         assert_eq!(staged_frame.cloud_revision, previous_cloud);
-                        staged_frame.validate_source_ownership().unwrap();
+
                         let transaction = sealed_canonical_transaction_for_test(
                             crate::correction_coordinator::CorrectionCandidateIdentity {
                                 runtime_generation: 7,
@@ -17859,8 +17552,8 @@ pub(crate) mod mapping_feed_tests {
                                 correction_lease: identity.correction_lease,
                                 transform_semantics: crate::correction_coordinator::CorrectionTransformSemantics::AbsoluteLeftCorrectionSe3,
                                 points_frame_id: "base_link".into(),
-                                registered_cloud: staged_frame.registered_cloud,
-                                correlated_odom: staged_frame.correlated_odom.proof,
+                                registered_cloud: staged_frame.registered_cloud(),
+                                correlated_odom: staged_frame.correlated_odom().proof,
                                 committed_map: staged_frame.committed_map,
                             },
                             revision,
@@ -18689,27 +18382,26 @@ pub(crate) mod mapping_feed_tests {
             .expect("occupancy receipt");
         let shared = handle.state.read().await;
 
-        assert_eq!(frame.mapping_session_id, binding.mapping_session_id);
+        assert_eq!(frame.mapping_session_id(), binding.mapping_session_id);
         assert_eq!(
-            frame.mapping_session_generation,
+            frame.mapping_session_generation(),
             binding.mapping_session_generation
         );
-        assert_eq!(frame.map_frame_generation, binding.map_frame_generation);
+        assert_eq!(frame.map_frame_generation(), binding.map_frame_generation);
         assert_eq!(frame.mapping_commit_id, occupancy_receipt.commit_id);
         assert_eq!(frame.occupancy_revision, event.revision);
         assert_eq!(frame.cloud_revision, shared.cloud_map_revision);
-        assert_eq!(frame.registered_cloud.source_sequence, 7);
+        assert_eq!(frame.registered_cloud().source_sequence, 7);
         assert_eq!(
-            frame.registered_cloud.source_timestamp_ns,
+            frame.registered_cloud().source_timestamp_ns,
             source_timestamp_ns
         );
-        assert_eq!(frame.registered_cloud,
-            crate::correction_coordinator::RegisteredCloudProof::from_admitted(accepted.scan()).unwrap());
-        assert_eq!(frame.registered_cloud.backend, accepted.scan().source_identity().backend);
-        assert_eq!(frame.registered_cloud.runtime_generation, binding.runtime_generation as u64);
-        assert_eq!(frame.registered_cloud.point_count, map_points.len() as u64);
+
+        assert_eq!(frame.registered_cloud().backend, accepted.scan().source_identity().backend);
+        assert_eq!(frame.registered_cloud().runtime_generation, binding.runtime_generation as u64);
+        assert_eq!(frame.registered_cloud().point_count, map_points.len() as u64);
         assert_eq!(&frame.source_owner, accepted.scan());
-        frame.validate_source_ownership().expect("exact admitted source and current cloud receipt");
+
         let cloud_receipt = handle.cloud_map_writer.lock().as_ref().unwrap()
             .last_cloud_receipt().expect("actual producer cloud receipt");
         assert_eq!(frame.cloud_receipt, cloud_receipt);
@@ -18717,18 +18409,17 @@ pub(crate) mod mapping_feed_tests {
         assert_eq!(frame.cloud_receipt.occupancy_revision, occupancy_receipt.occupancy_revision);
         assert_eq!(frame.cloud_receipt.session_generation, occupancy_receipt.session_generation);
         assert_eq!(frame.cloud_receipt.source_timestamp_ns, source_timestamp_ns);
-        assert_eq!(frame.correlated_odom.proof.source_sequence, 6);
+        assert_eq!(frame.correlated_odom().proof.source_sequence, 6);
         assert_eq!(
-            frame.correlated_odom.proof.source_timestamp_ns,
+            frame.correlated_odom().proof.source_timestamp_ns,
             8_765_432_000
         );
-        assert_eq!(frame.correlated_odom.odom_from_body, frozen_odom_from_body);
-        assert_eq!(frame.correlated_odom.proof,
-            crate::correction_coordinator::CorrelatedOdomProof::from_registration(&binding).unwrap());
-        assert_eq!(frame.correlated_odom.proof.translation_m.map(f64::to_bits),
+        assert_eq!(frame.correlated_odom().odom_from_body, frozen_odom_from_body);
+
+        assert_eq!(frame.correlated_odom().proof.translation_m.map(f64::to_bits),
             <[f64; 3]>::from(frozen_odom_from_body.translation.vector).map(f64::to_bits));
         let frozen_q = frozen_odom_from_body.rotation.quaternion();
-        assert_eq!(frame.correlated_odom.proof.rotation_xyzw.map(f64::to_bits),
+        assert_eq!(frame.correlated_odom().proof.rotation_xyzw.map(f64::to_bits),
             [frozen_q.i, frozen_q.j, frozen_q.k, frozen_q.w].map(f64::to_bits));
         assert_eq!(frame.committed_map.source_timestamp_ns, source_timestamp_ns);
         assert_eq!(frame.committed_map.backend_kind, occupancy_receipt.backend_kind);
@@ -18752,8 +18443,8 @@ pub(crate) mod mapping_feed_tests {
                     .transform_point(point)
             })
             .collect::<Vec<_>>();
-        assert_eq!(&*frame.body_points, expected_body_points.as_slice());
-        assert_eq!(frame.body_points.as_ptr(), admitted_body_allocation,
+        assert_eq!(&frame.body_points()[..], expected_body_points.as_slice());
+        assert_eq!(frame.body_points().as_ptr(), admitted_body_allocation,
             "correction staging must share the admitted body allocation");
         assert_eq!(frame.static_point_indices.as_deref(), Some([0, 1, 2].as_slice()));
         assert_eq!(frame.source_owner.body_points().as_ptr(), admitted_body_allocation,
@@ -18947,57 +18638,7 @@ pub(crate) mod mapping_feed_tests {
         exercise_stale_registered_frame_without_body_capture(handle).await;
     }
 
-    #[tokio::test]
-    async fn in_process_current_mode_missing_receipt_rejects_before_lazy_body_capture() {
-        let transport = LcmTransport::new(Arc::new(MappingFeedRecordingBackend::new(
-            LcmTopic::new("/unused/unit-current-mode-registered-frame").unwrap())));
-        let handle = build_test_handle_parts(false, Some(crate::mapping_backend::MappingBackendSpec::Voxel), Some(transport))
-            .await.expect("in-process registered-frame handle");
-        assert_eq!(handle.transport_backend_name, "in-process-unit");
-        assert!(!handle.lcm_backend_available);
-        assert!(handle.mapping_adapter.as_ref().unwrap().lock().latest_occupancy_commit_receipt().is_none());
-        let sink = Arc::new(RecordingCorrectionFrameSink::default());
-        let owner = crate::correction_coordinator::CorrectionTransportOwner::start(
-            crate::correction_coordinator::CorrectionOwnerSpec::None,
-            crate::correction_coordinator::CorrectionOwnerRuntimeIdentity {
-                runtime_generation: 77, backend_generation: 77,
-                correction_lease: crate::correction_coordinator::CorrectionLeaseId { boot_nonce: 0x7755, generation: 77 },
-            }, "unused-by-none", sink.clone()).await.expect("in-process correction owner");
-        let correction = owner.ingress();
-        let current_mode = correction.relocalization_mode_fence().activate_for_tests();
-        assert!(current_mode.active);
-        let binding = crate::lio_ingress::RegistrationBinding {
-            sensor_origin_map: None, runtime_generation: 77, cloud_source_sequence: 9,
-            correlated_odometry: crate::lio_ingress::CorrelatedOdometry { source_sequence: 8, source_timestamp_ns: 800 },
-            mapping_session_id: "no-committed-receipt".into(), mapping_session_generation: 1,
-            map_frame_generation: 1,
-            frozen_odom_from_body: nalgebra::Isometry3::identity(),
-            registration_map_from_odom: nalgebra::Isometry3::identity(), registration_correction_revision: 0,
-            base_anchor_map_from_odom: nalgebra::Isometry3::identity(),
-            frame_capture_relocalization_epoch: Some(current_mode.epoch),
-        };
-        let accepted = crate::lio_ingress::AcceptedRegisteredCloud::from_map_points_for_test(
-            vec![Point3::new(1.0, 2.0, 3.0)], 901, 900, "map", "base_link", binding);
-        {
-            let mut mapping = handle.mapping_adapter.as_ref().unwrap().lock();
-            mapping.record_pgo_scan(&accepted).expect("disabled history ignores the scan");
-            assert!(!accepted.body_points_captured_for_test(), "disabled history must not transform the cloud");
-            mapping.enable_pgo_history();
-            assert_eq!(mapping.record_pgo_scan(&accepted).unwrap_err(), "PGO扫描归档来源已过期");
-            assert!(!accepted.body_points_captured_for_test(), "stale archive rejection must not transform the cloud");
-        }
-        for replay in [false, true] {
-            let result = if replay {
-                handoff_registered_lio_cloud_replay_with_correction(&handle, &accepted, &correction).await
-            } else {
-                handoff_registered_lio_cloud_with_correction(&handle, &accepted, &correction).await
-            };
-            assert_eq!(result.unwrap_err(), "relocalization requires a committed occupancy receipt");
-            assert!(!accepted.body_points_captured_for_test(), "current-mode receipt rejection must not transform the cloud");
-        }
-        assert!(sink.staged.lock().await.is_empty());
-        owner.shutdown().await.expect("correction owner shutdown");
-    }
+
 
     async fn exercise_stale_registered_frame_without_body_capture(handle: GeometryRuntimeHandle) {
         let sink = Arc::new(RecordingCorrectionFrameSink::default());

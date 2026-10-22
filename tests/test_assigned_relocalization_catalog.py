@@ -6,6 +6,7 @@ metadata and a genuine V3 candidate body, never source point/map payloads.
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 import json
+import hashlib
 import multiprocessing
 from pathlib import Path
 import struct
@@ -106,15 +107,26 @@ class AssignedRelocalizationCatalogTests(unittest.TestCase):
             asset_identity=ASSET, finalized=True))
         self.activation_args = dict(target_map_name='room', target_asset_identity=ASSET,
                                     target_checkpoint_id=CHECKPOINT)
-        journal = self.repo.begin_assigned_map_activation(previous_map_name=None,
-            load_memory_history=False, **self.activation_args)
-        self.activation_id = journal['activation_request_id']
+        self.activation_id = ACTIVATION_ID
         self.request = AssignedRelocalizationRequest.admit(request_dict(activation_id=self.activation_id))
         self.activation = self.request.activation_receipt
-        self.repo.complete_assigned_map_activation_durable(**self.activation_args,
-            activation_request_id=self.activation_id, activation_receipt=self.activation,
-            expected_phases=['prepared'], relocalization_target_available=True)
+        self._next_activation = 2
+        self.commit_activation(self.activation, previous_map_name=None)
         self.owner_args = dict(activation_receipt=self.activation, target_asset_identity=ASSET)
+
+    def commit_activation(self, owner, *, previous_map_name):
+        request = owner.to_dict()['request']
+        args = dict(self.activation_args, activation_request_id=owner.request_id, activation_request=request)
+        self.repo.begin_assigned_map_activation(previous_map_name=previous_map_name,
+            load_memory_history=False, activation_request=request, **self.activation_args)
+        self.repo.update_assigned_map_activation_phase('backend_dispatching',
+            expected_phases=['prepared'], **args)
+        self.repo.record_assigned_map_activation_evidence(**args, activation_receipt=owner,
+            relocalization_policy_v2=current_assigned_relocalization_policy(),
+            relocalization_target_available=True, activation_receipt_disposition=2,
+            activation_receipt_disposition_name='sealed', expected_phases=['backend_dispatching'])
+        self.repo.complete_assigned_map_activation_durable(**args, activation_receipt=owner,
+            expected_phases=['backend_applied'], relocalization_target_available=True)
 
     def begin(self, request=None, repo=None):
         return (repo or self.repo).begin_assigned_relocalization_durable(
@@ -142,13 +154,11 @@ class AssignedRelocalizationCatalogTests(unittest.TestCase):
         return self.repo.reopen_assigned_relocalization_query(request_id=self.request.request_id)
 
     def replace_activation(self):
-        transition = self.repo.begin_assigned_map_activation(previous_map_name='room',
-            load_memory_history=False, reuse_completed_request_id=False, **self.activation_args)
+        activation_id = 'mapload:%032x' % self._next_activation
+        self._next_activation += 1
         replacement = AssignedRelocalizationRequest.admit(request_dict(
-            activation_id=transition['activation_request_id'], request_id='relocalize:new')).activation_receipt
-        self.repo.complete_assigned_map_activation_durable(**self.activation_args,
-            activation_request_id=transition['activation_request_id'], activation_receipt=replacement,
-            expected_phases=['prepared'], relocalization_target_available=True)
+            activation_id=activation_id, request_id='relocalize:new')).activation_receipt
+        self.commit_activation(replacement, previous_map_name='room')
         return replacement
 
     def test_unknown_exact_negative_query_releases_without_live_owner(self):
@@ -157,7 +167,7 @@ class AssignedRelocalizationCatalogTests(unittest.TestCase):
         query = self.recovery_query()
         replacement = self.replace_activation()
         response = query.response(1, self.terminal(1))
-        with patch.object(module.hashlib, 'sha256', side_effect=AssertionError('hash forbidden')):
+        with patch.object(hashlib, 'sha256', side_effect=AssertionError('hash forbidden')):
             result = self.repo.settle_assigned_relocalization_query(query=query, response=response)
         self.assertFalse(result['retired'])
         self.assertIsNone(self.reopen().get_relocalization_intent())
@@ -235,7 +245,7 @@ class AssignedRelocalizationCatalogTests(unittest.TestCase):
         self.assertIsNone(self.reopen().get_relocalization_intent())
 
     def test_restart_reopens_exact_request_in_every_phase_and_settles(self):
-        with patch.object(module.hashlib, 'sha256', side_effect=AssertionError('hash forbidden')):
+        with patch.object(hashlib, 'sha256', side_effect=AssertionError('hash forbidden')):
             self.assertEqual(self.begin()['phase'], 'prepared')
             prepared = self.reopen().get_assigned_relocalization_intent()
             self.assertEqual(prepared['assigned_request_v2'], self.request.to_dict())
@@ -334,7 +344,7 @@ class AssignedRelocalizationCatalogTests(unittest.TestCase):
         path.write_text(json.dumps(legacy))
         current = path.parent / 'current'; current.mkdir()
         (current / 'manifest.json').write_text('{"legacy": true}')
-        with patch.object(module.hashlib, 'sha256', side_effect=AssertionError('legacy SHA reconstruction')):
+        with patch.object(hashlib, 'sha256', side_effect=AssertionError('legacy SHA reconstruction')):
             with self.assertRaisesRegex(ValueError, 'asset ownership'):
                 self.begin()
         self.assertFalse(self.repo._relocalization_intent_path.exists())
@@ -342,14 +352,13 @@ class AssignedRelocalizationCatalogTests(unittest.TestCase):
     def test_activation_retirement_fences_mutation_but_keeps_query_identity(self):
         self.begin(); self.dispatch(); self.reconcile()
         intent_bytes = self.repo._relocalization_intent_path.read_bytes()
+        next_request = AssignedRelocalizationRequest.admit(request_dict(activation_id='mapload:'+'e'*32))
         transition = self.repo.begin_assigned_map_activation(previous_map_name='room',
-            load_memory_history=False, reuse_completed_request_id=False, **self.activation_args)
+            load_memory_history=False, activation_request=next_request.activation_receipt.to_dict()['request'],
+            **self.activation_args)
         with self.assertRaisesRegex(ValueError, 'activation transition'):
             self.settle()
-        next_request = AssignedRelocalizationRequest.admit(request_dict(activation_id=transition['activation_request_id']))
-        self.repo.complete_assigned_map_activation_durable(**self.activation_args,
-            activation_request_id=transition['activation_request_id'], activation_receipt=next_request.activation_receipt,
-            expected_phases=['prepared'], relocalization_target_available=True)
+        self.commit_activation(next_request.activation_receipt, previous_map_name='room')
         with self.assertRaisesRegex(ValueError, 'retired'):
             self.settle()
         self.assertEqual(self.repo._relocalization_intent_path.read_bytes(), intent_bytes)
@@ -501,7 +510,8 @@ class AssignedRelocalizationCatalogTests(unittest.TestCase):
             return real(path, text)
         def transition():
             return self.reopen().begin_assigned_map_activation(previous_map_name='room',
-                load_memory_history=False, reuse_completed_request_id=False, **self.activation_args)
+                load_memory_history=False, activation_request=AssignedRelocalizationRequest.admit(
+                    request_dict(activation_id='mapload:'+'e'*32)).activation_receipt.to_dict()['request'], **self.activation_args)
         def settle():
             settling.set(); return self.settle(repo=self.reopen())
         with ThreadPoolExecutor(max_workers=2) as pool, patch.object(module, '_atomic_write_text', side_effect=paused_write):
@@ -526,16 +536,11 @@ class AssignedRelocalizationCatalogTests(unittest.TestCase):
         self.assertEqual({p.name for p in Path(self.directory.name).iterdir() if p.is_file()},
             {'.map_activation.lock', 'map_activation_receipt.json', 'map_relocalization.json', 'map_relocalization_receipt.json'})
 
-    def test_assigned_records_reject_legacy_mutators_and_mixed_schema(self):
+    def test_assigned_records_reject_changed_request_and_mixed_schema(self):
         self.begin()
         before = self.repo._relocalization_intent_path.read_bytes()
-        for method in (self.repo.mark_relocalization_backend_dispatching,
-                       self.repo.mark_relocalization_outcome_unknown,
-                       self.repo.abort_relocalization_before_apply):
-            with self.subTest(method=method), self.assertRaisesRegex(ValueError, 'typed assigned'):
-                method(request_id=self.request.request_id)
         original = json.loads(before)
-        for mutate in (lambda d: d.update(schema_version=1), lambda d: d.update(request_identity_sha256='f' * 64),
+        for mutate in (lambda d: d.update(request_identity_sha256='f' * 64),
                        lambda d: d['assigned_request_v2']['assigned_cloud_v2'].update(logical_timeout_ms=0),
                        lambda d: d.update(request_id='relocalize:wrong')):
             changed = deepcopy(original); mutate(changed)
@@ -543,21 +548,16 @@ class AssignedRelocalizationCatalogTests(unittest.TestCase):
             with self.assertRaises(ValueError): self.reopen().get_relocalization_intent()
         self.repo._relocalization_intent_path.write_bytes(before)
 
-    def test_legacy_pending_without_request_digest_is_readable_never_adopted(self):
+    def test_retired_pending_is_removed_before_current_request(self):
         legacy = dict(schema_version=1, phase='backend_outcome_unknown', request_id='relocalize:legacy',
             logical_timeout_ms=10000, target_map_name='room', target_manifest_sha256='a' * 64,
             activation_request_id=self.activation_id, runtime_generation=3, session_id=self.activation_id,
             session_generation=5, backend_generation=6, activation_identity_sha256='b' * 64,
             target_receipt_sha256='c' * 64, asset_bundle_sha256='d' * 64, terminal_receipt=None)
         self.repo._relocalization_intent_path.write_text(json.dumps(legacy))
-        before = self.repo._relocalization_intent_path.read_bytes()
-        self.assertEqual(self.repo.get_relocalization_intent(), legacy)
-        self.assertNotIn('request_identity_sha256', legacy)
-        with self.assertRaisesRegex(ValueError, 'original recovery lifecycle'):
-            self.begin()
-        with self.assertRaisesRegex(ValueError, 'original recovery lifecycle'):
-            self.repo.reopen_assigned_relocalization_query(request_id=legacy['request_id'])
-        self.assertEqual(before, self.repo._relocalization_intent_path.read_bytes())
+        self.assertIsNone(self.repo.get_relocalization_intent())
+        self.assertFalse(self.repo._relocalization_intent_path.exists())
+        self.assertIsNotNone(self.begin())
 
     def test_provider_convenience_fields_require_explicit_canonical_projection(self):
         raw = self.terminal().to_dict()

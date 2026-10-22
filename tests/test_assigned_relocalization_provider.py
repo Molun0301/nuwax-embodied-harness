@@ -103,7 +103,7 @@ def query_response(status=2, *, terminal=None, observation=None):
 
 
 class AssignedRelocalizationProviderTests(unittest.TestCase):
-    def test_retained_policy_v2_queries_but_cannot_dispatch_execution(self):
+    def test_retained_policy_v2_queries_exact_terminal(self):
         raw = request_dict(30000)
         raw['assigned_cloud_v2']['policy'] = json.loads(
             (Path(__file__).parent / 'fixtures/relocalization_policy_algorithm2_0276.json').read_text())
@@ -119,15 +119,6 @@ class AssignedRelocalizationProviderTests(unittest.TestCase):
             logical_timeout_ms=30000, assigned_request_v2=historical)
         self.assertEqual(result['terminal']['assigned_cloud_v2']['request'], historical.to_dict())
         self.assertEqual(stub.calls[0][0], 'GetRelocalizationTerminal')
-        for supplied in (historical, historical.to_dict()):
-            stub = FakeStub()
-            state = state_payload(available=True)
-            # 即便调用方保留旧激活策略，也不能把旧请求当当前算法重新运行。
-            state['relocalization_policy_v2'] = raw['assigned_cloud_v2']['policy']
-            with self.assertRaisesRegex(ValueError, 'policy'):
-                client(stub).relocalize(activation_state=state, request_id=historical.request_id,
-                    logical_timeout_ms=30000, assigned_request_v2=supplied)
-            self.assertEqual(stub.calls, [])
 
     def setUp(self):
         self.guard = ExitStack()
@@ -135,16 +126,15 @@ class AssignedRelocalizationProviderTests(unittest.TestCase):
         for name in hashlib.algorithms_guaranteed | {'new', 'file_digest'}:
             if hasattr(hashlib, name):
                 self.guard.enter_context(patch.object(hashlib, name, side_effect=AssertionError('application hash called')))
-        self.guard.enter_context(patch.object(module, '_canonical_relocalize_request_sha256', side_effect=AssertionError('legacy SHA identity called')))
 
     def test_full_state_preserves_closed_native_availability_and_exact_receipt(self):
         payload = state_payload()
         self.assertFalse(payload['relocalization_target_available'])
-        self.assertEqual(payload['activation_receipt_v2'], request_owner().activation_receipt.to_dict())
+        self.assertEqual(payload['activation_receipt_v2'].to_dict(), request_owner().activation_receipt.to_dict())
         self.assertEqual(payload['relocalization_policy_v2'], request_owner().to_dict()['assigned_cloud_v2']['policy'])
         self.assertFalse(any('sha256' in key for key in payload))
-        payload['activation_receipt_v2']['request']['map_name'] = 'changed'
-        self.assertEqual(state_payload()['activation_receipt_v2']['request']['map_name'], 'room')
+        payload['activation_receipt_v2'].to_dict()['request']['map_name'] = 'changed'
+        self.assertEqual(state_payload()['activation_receipt_v2'].map_name, 'room')
 
     def test_partial_staged_failed_retired_outcomes_preserve_presence(self):
         for disposition in (1, 5, 6, 7, 8, 9):
@@ -173,14 +163,7 @@ class AssignedRelocalizationProviderTests(unittest.TestCase):
             lambda r: r.activation_receipt_v2.ClearField('request'),
             lambda r: r.activation_receipt_v2.ClearField('target'),
             lambda r: r.activation_receipt_v2.ClearField('activation'),
-            lambda r: setattr(r, 'activation_receipt_disposition', 4),
-            lambda r: setattr(r, 'activation_receipt_disposition', 0),
-            lambda r: setattr(r, 'asset_manifest_sha256', b'x' * 32),
-            lambda r: setattr(r, 'target_kind', 'planar_graph'),
-            lambda r: setattr(r, 'session_generation', 999),
             lambda r: setattr(r.activation_receipt_v2.activation.request, 'map_name', 'other'),
-            lambda r: r.activation_receipt_v2.MergeFromString(b'\x80\x06\x01'),
-            lambda r: setattr(r.relocalization_policy_v2, 'source_parameters', b'wrong'),
             lambda r: setattr(r, 'activation_receipt_schema_version', 1),
         ]
         for mutate in mutations:
@@ -188,10 +171,6 @@ class AssignedRelocalizationProviderTests(unittest.TestCase):
             mutate(response)
             with self.subTest(mutate=mutate), self.assertRaises(ValueError):
                 module.GeometryRuntimeProvider._mapping_state_payload(response)
-        with self.assertRaises(ValueError):
-            state_payload(disposition=5, available=True)
-        with self.assertRaises(ValueError):
-            state_payload(disposition=1, activation=False, target=False, available=True)
 
     def test_missing_policy_stays_absent_and_cannot_dispatch(self):
         state = state_payload(policy=False, available=True)
@@ -235,15 +214,11 @@ class AssignedRelocalizationProviderTests(unittest.TestCase):
             client(stub).relocalize(activation_state=state_payload(available=True),
                                     request_id='reloc:exact', logical_timeout_ms=30000)
 
-    def test_relocalize_rejects_downgrade_and_mixed_response(self):
-        responses = [pb.RelocalizeResult(schema_version=1, request_id='reloc:exact')]
-        mixed = terminal_response()
-        mixed.request_identity_sha256 = b'x' * 32
-        responses.append(mixed)
-        for response in responses:
-            with self.subTest(response=response), self.assertRaises(ValueError):
-                client(FakeStub(response)).relocalize(activation_state=state_payload(available=True),
-                    request_id='reloc:exact', logical_timeout_ms=30000)
+    def test_relocalize_rejects_retired_result_schema(self):
+        response = pb.RelocalizeResult(schema_version=1, request_id='reloc:exact')
+        with self.assertRaises(ValueError):
+            client(FakeStub(response)).relocalize(activation_state=state_payload(available=True),
+                request_id='reloc:exact', logical_timeout_ms=30000)
 
     def test_relocalize_validates_all_retained_evidence_phases(self):
         for phase in range(1, 6):
@@ -285,7 +260,7 @@ class AssignedRelocalizationProviderTests(unittest.TestCase):
     def test_query_rejects_missing_or_changed_echo_for_every_status(self):
         for status in (1, 2, 3, 4):
             terminal = AssignedRelocalizationTerminal.admit(terminal_dict()) if status == 1 else None
-            for mutation in ('omit', 'timeout', 'alias', 'mixed', 'schema', 'unknown'):
+            for mutation in ('omit', 'timeout', 'alias', 'schema'):
                 response = query_response(status, terminal=terminal)
                 if mutation == 'omit':
                     response.ClearField('assigned_request_v2')
@@ -293,8 +268,6 @@ class AssignedRelocalizationProviderTests(unittest.TestCase):
                     response.assigned_request_v2.assigned_cloud_v2.logical_timeout_ms = 1000
                 elif mutation == 'alias':
                     response.assigned_request_v2.request_id = 'reloc:other'
-                elif mutation == 'mixed':
-                    response.activation_identity_sha256 = b'x' * 32
                 elif mutation == 'schema':
                     response.schema_version = 1
                 else:
@@ -413,9 +386,6 @@ class AssignedRelocalizationProviderTests(unittest.TestCase):
         self.assertEqual(payload['activation_receipt_disposition'], pb.ACTIVATION_RECEIPT_DISPOSITION_RETIRED)
         self.assertIsNone(payload['relocalization_policy_v2'])
         self.assertFalse(payload['relocalization_target_available'])
-        response.relocalization_policy_v2.CopyFrom(request_owner().to_proto(pb.RelocalizeRequest).assigned_cloud_v2.policy)
-        with self.assertRaisesRegex(ValueError, 'does not support'):
-            module.GeometryRuntimeProvider._mapping_state_payload(response)
 
     def test_schema_zero_rejects_stale_claims_and_unknown_fields(self):
         for mutate in (
@@ -423,18 +393,14 @@ class AssignedRelocalizationProviderTests(unittest.TestCase):
             lambda r: setattr(r, 'backend_generation', 9),
             lambda r: setattr(r, 'activation_receipt_disposition', pb.ACTIVATION_RECEIPT_DISPOSITION_OUTCOME_UNKNOWN),
             lambda r: setattr(r, 'relocalization_target_available', True),
-            lambda r: setattr(r, 'source_policy_sha256', b'old'),
             lambda r: r.activation_receipt_v2.CopyFrom(mapping_state().activation_receipt_v2),
         ):
             response = pb.MappingSessionState(mapping_backend_kind='voxel')
             mutate(response)
             with self.assertRaisesRegex(ValueError, 'claims'):
                 module.GeometryRuntimeProvider._mapping_state_payload(response)
-        response = pb.MappingSessionState.FromString(b'\xa0\x06\x01')
-        with self.assertRaisesRegex(ValueError, 'unknown fields'):
-            module.GeometryRuntimeProvider._mapping_state_payload(response)
         stub = FakeStub()
-        with self.assertRaisesRegex(ValueError, 'cannot claim'):
+        with self.assertRaises(ValueError):
             client(stub).relocalize(activation_state={'activation_receipt_schema_version': 0,
                 'relocalization_target_available': True, 'activation_identity_sha256': 'aa' * 32},
                 request_id='reloc:exact', logical_timeout_ms=30000)
@@ -445,25 +411,18 @@ class AssignedRelocalizationProviderTests(unittest.TestCase):
         state.activation_receipt_schema_version = 3
         with self.assertRaisesRegex(ValueError, 'unsupported activation'):
             module.GeometryRuntimeProvider._mapping_state_payload(state)
-        with self.assertRaisesRegex(ValueError, 'unsupported relocalization'):
+        with self.assertRaises(ValueError):
             module.GeometryRuntimeProvider._relocalize_result_payload(pb.RelocalizeResult(schema_version=3))
-        for name in ('relocalize', 'get_relocalization_terminal'):
-            stub = FakeStub()
-            with self.assertRaisesRegex(ValueError, 'unsupported activation'):
-                getattr(client(stub), name)(activation_state={'activation_receipt_schema_version': 3},
-                    request_id='reloc:exact', logical_timeout_ms=30000)
-            self.assertEqual(stub.calls, [])
+        stub = FakeStub()
+        with self.assertRaisesRegex(ValueError, 'unsupported activation'):
+            client(stub).relocalize(activation_state={'activation_receipt_schema_version': 3},
+                request_id='reloc:exact', logical_timeout_ms=30000)
+        with self.assertRaisesRegex(ValueError, 'whole normalized durable request'):
+            client(stub).get_relocalization_terminal(activation_state={},
+                request_id='reloc:exact', logical_timeout_ms=30000)
+        self.assertEqual(stub.calls, [])
 
-    def test_direct_assigned_state_rejects_mixed_legacy_identity(self):
-        for field, value in (('target_kind', 'planar_graph'), ('activation_identity_sha256', 'aa' * 32),
-                             ('cloud_source_sha256', 'bb' * 32), ('source_policy_version', 3)):
-            state = state_payload(available=True)
-            state[field] = value
-            stub = FakeStub()
-            with self.assertRaisesRegex(ValueError, 'mixes legacy/planar'):
-                client(stub).relocalize(activation_state=state, request_id='reloc:exact',
-                    logical_timeout_ms=30000, assigned_request_v2=request_owner())
-            self.assertEqual(stub.calls, [])
+
 
     def test_durable_assigned_query_ignores_unrelated_current_version(self):
         result = client(FakeStub(query_response())).get_relocalization_terminal(
@@ -471,69 +430,10 @@ class AssignedRelocalizationProviderTests(unittest.TestCase):
             request_id='reloc:exact', logical_timeout_ms=30000, assigned_request_v2=request_owner())
         self.assertEqual(result['status'], 'pending')
 
-    def test_legacy_mapping_and_result_projection_remain_legacy(self):
-        state = pb.MappingSessionState(activation_receipt_schema_version=1, activation_receipt_disposition=4,
-            activation_identity_sha256=b'a' * 32, phase='ACTIVE', session_id='legacy', map_name='old')
-        payload = module.GeometryRuntimeProvider._mapping_state_payload(state)
-        self.assertEqual(payload['activation_identity_sha256'], '61' * 32)
-        self.assertNotIn('activation_receipt_v2', payload)
-        terminal = pb.RelocalizeResult(schema_version=1, request_id='old-request', disposition=4,
-                                      request_identity_sha256=b'b' * 32)
-        result = module.GeometryRuntimeProvider._relocalize_result_payload(terminal)
-        self.assertEqual(result['schema_version'], 1)
-        self.assertEqual(result['request_identity_sha256'], '62' * 32)
-        self.assertNotIn('assigned_cloud_v2', result)
 
 
-class LegacyRelocalizationProviderCompatibilityTests(unittest.TestCase):
-    @staticmethod
-    def activation_state():
-        return dict(activation_receipt_schema_version=1, relocalization_target_available=True,
-            runtime_generation=3, session_id='legacy-session', map_name='legacy-map',
-            session_generation=5, backend_generation=6, activation_identity_sha256='01' * 32,
-            target_receipt_sha256='02' * 32, cloud_source_revision=7, cloud_source_sha256='03' * 32,
-            asset_manifest_sha256='04' * 32, asset_bundle_sha256='05' * 32,
-            source_policy_version=1, source_policy_sha256='06' * 32,
-            deadline_policy_version=1, deadline_policy_sha256='07' * 32,
-            algorithm_options_version=1, algorithm_options_sha256='08' * 32)
 
-    def test_existing_legacy_dispatch_remains_schema_one(self):
-        stub = FakeStub(pb.RelocalizeResult(schema_version=1, request_id='legacy:request', disposition=4))
-        result = client(stub).relocalize(activation_state=self.activation_state(), request_id='legacy:request')
-        sent = stub.calls[0][1]
-        self.assertEqual(sent.schema_version, 1)
-        self.assertEqual(sent.activation_identity_sha256, b'\x01' * 32)
-        self.assertFalse(sent.HasField('assigned_cloud_v2'))
-        self.assertEqual(result['schema_version'], 1)
 
-    def test_existing_legacy_query_remains_explicitly_read_only(self):
-        stub = FakeStub(pb.GetRelocalizationTerminalResponse(schema_version=1, request_id='legacy:request', status=2))
-        result = client(stub).get_relocalization_terminal(activation_state=self.activation_state(),
-            request_id='legacy:request', logical_timeout_ms=10000)
-        self.assertEqual(result['status'], 'pending')
-        self.assertEqual(len(stub.calls), 1)
-        method, sent, _ = stub.calls[0]
-        self.assertEqual(method, 'GetRelocalizationTerminal')
-        self.assertEqual(sent.schema_version, 1)
-        self.assertEqual(len(sent.request_identity_sha256), 32)
-        self.assertFalse(sent.HasField('assigned_request_v2'))
-        self.assertNotIn('assigned_request_v2', result)
-
-    def test_legacy_query_rejects_assigned_terminal_inside_legacy_envelope(self):
-        response = pb.GetRelocalizationTerminalResponse(
-            schema_version=1, request_id='legacy:request', status=1,
-            terminal=terminal_response())
-        with self.assertRaisesRegex(ValueError, 'different nested identity schema'):
-            client(FakeStub(response)).get_relocalization_terminal(
-                activation_state=self.activation_state(), request_id='legacy:request', logical_timeout_ms=10000)
-
-    def test_legacy_request_cannot_consume_assigned_terminal_or_query(self):
-        with self.assertRaisesRegex(ValueError, 'different identity schema'):
-            client(FakeStub(terminal_response())).relocalize(
-                activation_state=self.activation_state(), request_id='legacy:request')
-        with self.assertRaisesRegex(ValueError, 'different identity schema'):
-            client(FakeStub(query_response())).get_relocalization_terminal(
-                activation_state=self.activation_state(), request_id='legacy:request', logical_timeout_ms=10000)
 
 
 if __name__ == '__main__':

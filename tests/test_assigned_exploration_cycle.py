@@ -291,7 +291,7 @@ class AssignedExplorationCycleTests(unittest.TestCase):
         self.assertEqual(source["origin_frame_generation"], 44)
         self.assertTrue(session.relocalization_terminal_v2.exact_replay_of(self.stub.terminal))
         self.assertIsNotNone(self.service.get_relocalized_pose(MAP_NAME))
-        self.assertEqual(self.stub.exports, [2])
+        self.assertEqual(self.stub.exports, [b''])
         self.assertEqual(len(self.stub.relocalization_requests), 1)
         self.assertTrue(self.stub.sample_requests)
 
@@ -307,7 +307,7 @@ class AssignedExplorationCycleTests(unittest.TestCase):
             self.assertEqual(second.request.request_id, request.request_id)
             self.assertNotIn("motion_admission", second.request.metadata)
             self.assertIsNone(second.request.resume_progress_json)
-            self.assertEqual(self.stub.exports, [2, 2])
+            self.assertEqual(self.stub.exports, [b'', b''])
             self.assertEqual([value.checkpoint_id for value in self.stub.exported_checkpoints],
                 [first.mapping_checkpoint_id, second.mapping_checkpoint_id])
             reopened = self.service.get_map_asset_bundle(map_name=MAP_NAME)
@@ -437,7 +437,7 @@ class AssignedExplorationCycleTests(unittest.TestCase):
             self.assertIn((path.parent,), [call.args for call in retried.call_args_list])
             self.assertEqual(path.read_bytes(), written)
             self.assertEqual(ExplorationCheckpointStore(self.root).load(pending["checkpoint_id"]), retained)
-            self.assertEqual(self.stub.exports, [2])
+            self.assertEqual(self.stub.exports, [b''])
             self.assertEqual(self.tasks.get_task_spec(self.context.task_id).metadata["exploration_checkpoint"]["status"], "succeeded")
 
     def test_second_exchange_fsync_failure_retry_uses_retained_candidate_without_reexport(self):
@@ -458,14 +458,14 @@ class AssignedExplorationCycleTests(unittest.TestCase):
             durable = MapAssetBundleRepository(str(self.root)).get_map_asset_bundle(MAP_NAME)
             self.assertNotEqual(durable.asset_identity, first.asset_identity)
             self.assertEqual(durable.geometry_asset.metadata["mapping_backend_checkpoint"]["checkpoint_id"], self.stub.response.checkpoint_id)
-            self.assertEqual(self.stub.exports, [2, 2])
+            self.assertEqual(self.stub.exports, [b'', b''])
             self.assertFalse(ExplorationCheckpointStore(self.root)._files.direct_path(pending["checkpoint_id"]).exists())
             self.service._asset_repository = MapAssetBundleRepository(str(self.root))
             gateway_checkpoint.save_after_stop(self.gateway, context, request)
             saved = ExplorationCheckpointStore(self.root).load(pending["checkpoint_id"])
             self.assertEqual(saved.asset_identity, durable.asset_identity)
             self.assertEqual(saved.mapping_checkpoint_id, self.stub.response.checkpoint_id)
-            self.assertEqual(self.stub.exports, [2, 2])
+            self.assertEqual(self.stub.exports, [b'', b''])
             self.assertEqual(self.service._repository.get_map_asset(MAP_NAME).asset_identity, durable.asset_identity)
 
     def test_second_catalog_fsync_failure_retry_keeps_new_asset_and_checkpoint(self):
@@ -493,7 +493,7 @@ class AssignedExplorationCycleTests(unittest.TestCase):
             saved = ExplorationCheckpointStore(self.root).load(pending["checkpoint_id"])
             self.assertEqual(saved.asset_identity, durable.asset_identity)
             self.assertEqual(saved.mapping_checkpoint_id, self.stub.response.checkpoint_id)
-            self.assertEqual(self.stub.exports, [2, 2])
+            self.assertEqual(self.stub.exports, [b'', b''])
 
     def test_stale_native_sample_cannot_complete_resume(self):
         import grpc
@@ -578,7 +578,7 @@ class AssignedExplorationCycleTests(unittest.TestCase):
             gateway_checkpoint.save_after_stop(self.gateway, self.context, self.request)
             self.assertEqual(path.read_bytes(), before)
             self.assertEqual(repository.load(saved.checkpoint_id), saved)
-            self.assertEqual(self.stub.exports, [2])
+            self.assertEqual(self.stub.exports, [b''])
 
     def test_missing_native_sample_cannot_complete_resume(self):
         with self.cloud_only():
@@ -606,11 +606,11 @@ class AssignedExplorationCycleTests(unittest.TestCase):
             self.assertEqual(completed.geometry_asset.metadata["mapping_backend_checkpoint"]["checkpoint_id"],
                 self.stub.response.checkpoint_id)
             self.assertNotEqual(self.stub.response.checkpoint_id, first.mapping_checkpoint_id)
-            self.assertEqual(self.stub.exports, [2, 2])
+            self.assertEqual(self.stub.exports, [b'', b''])
             retry = self.gateway._finalize_workspace_assets_after_task(**arguments)
             self.assertNotIn("map_asset_finalize_error", retry)
             self.assertEqual(retry["finalized_map_asset"].asset_identity, completed.asset_identity)
-            self.assertEqual(self.stub.exports, [2, 2])
+            self.assertEqual(self.stub.exports, [b'', b''])
             self.assertEqual(self.service.get_map_asset_bundle(map_name=MAP_NAME).asset_identity, completed.asset_identity)
             self.assertEqual(retry["map_asset_finalize"]["asset_identity"], completed.asset_identity.model_dump())
             self.assertNotIn("manifest_sha256", retry["map_asset_finalize"])

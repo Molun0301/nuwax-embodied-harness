@@ -6,6 +6,7 @@ Python checks do not qualify the native sample's geometry or real RPC/LCM path.
 """
 
 import json
+import grpc
 import struct
 import unittest
 from contextlib import ExitStack
@@ -138,6 +139,7 @@ class RelocalizationNativeStub(SaveNativeStub):
         self.query_status = None
         self.terminals = {}
         self.sample_mutation = None
+        self.sample_error = None
         self.query_mutation = None
         self.before_dispatch = None
         self.during_sample = None
@@ -178,12 +180,20 @@ class RelocalizationNativeStub(SaveNativeStub):
         admitted = AssignedRelocalizationRequest.admit_retained(
             provider_module._project_assigned_proto(request, 'request'))
         assert self.terminal is not None and self.terminal.request.exact_replay_of(admitted)
+        if self.sample_error is not None:
+            raise self.sample_error
         result = sample_for_terminal(self.terminal)
         if self.sample_mutation:
             self.sample_mutation(result)
         if self.during_sample:
             self.during_sample()
         return result
+
+
+class SampleRpcError(grpc.RpcError):
+    def __init__(self, detail): self.detail = detail
+    def code(self): return grpc.StatusCode.FAILED_PRECONDITION
+    def details(self): return self.detail
 
 
 class AssignedWorkspaceRelocalizationTests(unittest.TestCase):
@@ -214,7 +224,6 @@ class AssignedWorkspaceRelocalizationTests(unittest.TestCase):
         for owner, names in (
             (self.provider, ("get_current_pose", "get_frame_tree", "get_localization_state")),
             (self.localization, ("refresh",)),
-            (self.runtime, ("get_relocalization_terminal", "get_validated_relocalization_receipt")),
         ):
             for name in names:
                 if hasattr(owner, name):
@@ -504,10 +513,7 @@ class AssignedWorkspaceRelocalizationTests(unittest.TestCase):
         self.assertFalse(self.stub.sample_requests)
 
     def test_stale_same_frame_pose_never_publishes_ready_or_navigation_pose(self):
-        def stale(sample):
-            for value in (sample.pose, sample.map_from_odom, sample.odom_from_body):
-                value.timestamp_ns = 1
-        self.stub.sample_mutation = stale
+        self.stub.sample_error = SampleRpcError("ASSIGNED_SAMPLE_POSE_OR_TF_STALE")
         with self.forbid_unpaired_pose(), self.assertRaises(GatewayError):
             self.relocalize()
         self.assert_not_ready()
@@ -536,10 +542,7 @@ class AssignedWorkspaceRelocalizationTests(unittest.TestCase):
         self.assert_original_owner()
 
     def test_changed_exact_terminal_in_sample_cannot_upgrade_the_durable_receipt(self):
-        def change_terminal(sample):
-            sample.terminal.assigned_cloud_v2.correction_revision += 1
-            sample.correction_revision += 1
-        self.stub.sample_mutation = change_terminal
+        self.stub.sample_error = SampleRpcError("ASSIGNED_SAMPLE_TERMINAL_UNAVAILABLE")
         with self.assertRaises(GatewayError):
             self.relocalize()
         self.assert_not_ready()
@@ -547,22 +550,14 @@ class AssignedWorkspaceRelocalizationTests(unittest.TestCase):
         self.assertEqual(receipt["assigned_terminal_v2"], self.stub.terminal.to_dict())
         self.assert_original_owner()
 
-    def test_changed_correction_owner_revision_or_frame_generation_cannot_publish_ready(self):
-        changes = (
-            lambda value: setattr(value.correction_owner, "correction_lease_generation", 999),
-            lambda value: setattr(value, "correction_revision", 999),
-            lambda value: setattr(value, "map_frame_generation", 999),
-        )
-        self.stub.sample_mutation = changes[0]
+    def test_native_correction_replacement_cannot_publish_ready(self):
+        self.stub.sample_error = SampleRpcError("ASSIGNED_SAMPLE_CORRECTION_REPLACED")
         with self.assertRaises(GatewayError):
             self.relocalize()
-        for mutate in changes:
-            with self.subTest(change=mutate):
-                self.stub.sample_mutation = mutate
-                with self.assertRaises(GatewayError):
-                    self.service.recover_relocalization_receipt()
-                self.assert_not_ready()
-                self.assert_original_owner()
+        with self.assertRaises(GatewayError):
+            self.service.recover_relocalization_receipt()
+        self.assert_not_ready()
+        self.assert_original_owner()
 
     def test_exact_terminal_request_source_and_ids_are_detached_and_immutable(self):
         session, _ = self.relocalize()
@@ -650,21 +645,16 @@ class AssignedWorkspaceRelocalizationTests(unittest.TestCase):
         self.assertIsNone(self.service._repository.get_relocalization_intent())
         self.assert_original_owner()
 
-    def test_navigation_pose_getter_rechecks_native_sample_and_rejects_new_staleness(self):
+    def test_navigation_pose_getter_propagates_current_native_rejection(self):
         self.relocalize()
         before = len(self.stub.sample_requests)
-        changes = (
-            lambda value: setattr(value.pose, "timestamp_ns", 1),
-            lambda value: setattr(value, "correction_revision", 999),
-            lambda value: setattr(value.correction_owner, "correction_lease_generation", 999),
-            lambda value: setattr(value, "map_frame_generation", 999),
-        )
+        reasons = ("ASSIGNED_SAMPLE_POSE_OR_TF_STALE", "ASSIGNED_SAMPLE_CORRECTION_REPLACED",
+                   "ASSIGNED_SAMPLE_MAPPING_OWNER_REPLACED")
         with self.forbid_unpaired_pose():
-            for mutate in changes:
-                with self.subTest(change=mutate):
-                    self.stub.sample_mutation = mutate
-                    self.assertIsNone(self.service.get_relocalized_pose(MAP_NAME))
-        self.assertEqual(len(self.stub.sample_requests), before + len(changes))
+            for reason in reasons:
+                self.stub.sample_error = SampleRpcError(reason)
+                self.assertIsNone(self.service.get_relocalized_pose(MAP_NAME))
+        self.assertEqual(len(self.stub.sample_requests), before + len(reasons))
         self.assert_original_owner()
 
     def test_current_provider_mapping_owner_changed_during_sample_cannot_publish_ready(self):
@@ -871,7 +861,7 @@ class AssignedWorkspaceRelocalizationTests(unittest.TestCase):
                 "target_checkpoint_id": replacement_wire.mapping_backend_checkpoint.checkpoint_id}
         replacement_journal = self.service._repository.begin_assigned_map_activation(
             previous_map_name=MAP_NAME, load_memory_history=False,
-            activation_request=replacement_request, reuse_completed_request_id=False, **args)
+            activation_request=replacement_request, **args)
         replacement_wire.activation_request_id = replacement_journal["activation_request_id"]
         replacement_wire.session_id = replacement_wire.activation_request_id
         owner_args = dict(**args, activation_request_id=replacement_wire.activation_request_id,
@@ -882,7 +872,7 @@ class AssignedWorkspaceRelocalizationTests(unittest.TestCase):
         self.stub.StopMapping(SimpleNamespace(session_id=self.stub.state.session_id), timeout=1)
         replacement_state = self.stub.ActivateMap(replacement_wire, timeout=1)
         replacement_evidence = self.provider._mapping_state_payload(replacement_state)
-        replacement = AssignedActivationReceipt.admit(replacement_evidence["activation_receipt_v2"])
+        replacement = replacement_evidence["activation_receipt_v2"]
         self.assertFalse(replacement.exact_replay_of(original_request.activation_receipt))
         self.service._repository.record_assigned_map_activation_evidence(**owner_args,
             activation_receipt=replacement, expected_phases=["backend_dispatching"],

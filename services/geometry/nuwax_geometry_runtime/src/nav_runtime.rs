@@ -4335,7 +4335,7 @@ mod tests {
                 revision: map.revision,
                 active: true,
                 idempotent_replay: false,
-                legacy_checkpoint_reconstructed: false,
+
                 mapping_backend_kind: "voxel".into(),
             },
         )

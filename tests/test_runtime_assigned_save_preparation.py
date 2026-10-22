@@ -82,7 +82,7 @@ class RuntimeAssignedSavePreparationTests(unittest.TestCase):
 
     def prepare(self):
         return self.instance.prepare_map_asset_bundle(
-            self.candidate, bundle_root=self.root, checkpoint_schema_version=2)
+            self.candidate, bundle_root=self.root)
 
     def test_v2_keeps_packed_owner_without_whole_model_or_cloud_copies(self):
         with ExitStack() as guard:
@@ -104,11 +104,11 @@ class RuntimeAssignedSavePreparationTests(unittest.TestCase):
                 if hasattr(hashlib, name):
                     guard.enter_context(patch.object(hashlib, name,
                         side_effect=AssertionError('application hash called')))
-            for module in (checkpoint_payload, provider_module, store_module):
+            for module in (checkpoint_payload,):
                 guard.enter_context(patch.object(module, 'payload_digest',
                     side_effect=AssertionError('legacy payload digest called')))
             prepared = self.prepare()
-        self.assertEqual(self.exports, [{'checkpoint_schema_version': 2}])
+        self.assertEqual(self.exports, [{}])
         self.assertEqual(prepared.identity_schema_version, 1)
         cells = prepared.snapshot.occupancy_grid.data
         self.assertIsInstance(cells, PackedOccupancyCells)
@@ -168,7 +168,7 @@ class RuntimeAssignedSavePreparationTests(unittest.TestCase):
                 with self.assertRaisesRegex(TypeError, 'unsealed legacy draft'):
                     self.instance._replace_bundle_occupancy_from_checkpoint(owner, self.exported)
                 with self.assertRaisesRegex(TypeError, 'unsealed legacy draft'):
-                    self.instance.prepare_map_asset_bundle(owner, bundle_root=self.root, checkpoint_schema_version=2)
+                    self.instance.prepare_map_asset_bundle(owner, bundle_root=self.root)
         self.assertEqual(self.exports, [])
         self.assertEqual(list(self.root.iterdir()), [])
 
@@ -184,7 +184,7 @@ class RuntimeAssignedSavePreparationTests(unittest.TestCase):
         self.context['mapping_backend_kind'] = 'slam_toolbox'
         with self.assertRaisesRegex(RuntimeError, 'backend changed during export'):
             self.prepare()
-        self.assertEqual(self.exports, [{'checkpoint_schema_version': 2}])
+        self.assertEqual(self.exports, [{}])
         self.assertEqual(list(self.root.iterdir()), [])
 
     def test_v2_rejects_export_backend_and_session_drift(self):
@@ -244,19 +244,7 @@ class RuntimeAssignedSavePreparationTests(unittest.TestCase):
                         self.assertRaisesRegex(RuntimeError, 'ownership changed|connection changed'):
                     self.prepare()
 
-    def test_schema1_preserves_list_and_independent_snapshot_copy(self):
-        legacy_checkpoint = replace(self.exported.checkpoint, schema_version=1, content_sha256=b'X' * 32)
-        legacy = replace(self.exported, checkpoint=legacy_checkpoint,
-            canonical_occupancy_checkpoint_bytes=self.response.canonical_occupancy_checkpoint.SerializeToString())
-        updated = self.instance._replace_bundle_occupancy_from_checkpoint(self.candidate, legacy)
-        self.assertIs(type(updated.snapshot.occupancy_grid.data), list)
-        self.assertEqual(updated.snapshot.occupancy_grid.data, [-1, 100])
-        self.assertIsNot(updated.snapshot.cost_map, self.candidate.snapshot.cost_map)
-        self.candidate.snapshot.cost_map.data[0] = 99
-        self.assertEqual(updated.snapshot.cost_map.data, [4.0, 5.0])
-        self.assertIn('content_sha256', updated.metadata['mapping_backend_checkpoint'])
-        signature = inspect.signature(PlatformGeometryRuntime.prepare_map_asset_bundle)
-        self.assertEqual(signature.parameters['checkpoint_schema_version'].default, 1)
+
 
 
 class AssignedCheckpointExportOriginTests(unittest.TestCase):
@@ -271,7 +259,7 @@ class AssignedCheckpointExportOriginTests(unittest.TestCase):
             return result
         old.ExportMappingBackendCheckpoint = swap
         with self.assertRaisesRegex(RuntimeError, 'connection changed'):
-            client.export_mapping_backend_checkpoint(checkpoint_schema_version=2)
+            client.export_mapping_backend_checkpoint()
         self.assertEqual([request.action for request in old.requests], [5, 5])
         self.assertEqual(old.entries, {})
         self.assertEqual(new.requests, [])
@@ -288,7 +276,7 @@ class AssignedCheckpointExportOriginTests(unittest.TestCase):
             return result
         old.TransferGraphArtifact = swap
         with self.assertRaisesRegex(RuntimeError, 'connection changed'):
-            client.export_mapping_backend_checkpoint(checkpoint_schema_version=2)
+            client.export_mapping_backend_checkpoint()
         self.assertEqual([request.action for request in old.requests], [4, 5, 5])
         self.assertEqual(new.requests, [])
         self.assertEqual(old.entries, {})
@@ -312,7 +300,7 @@ class AssignedCheckpointExportOriginTests(unittest.TestCase):
         stub.TransferGraphArtifact = fail
         with self.assertLogs(provider_module.LOGGER.name, level='ERROR'), \
                 self.assertRaises(KeyboardInterrupt) as caught:
-            client.export_mapping_backend_checkpoint(checkpoint_schema_version=2)
+            client.export_mapping_backend_checkpoint()
         self.assertIs(caught.exception, cancellation)
         self.assertEqual(released, [response.fine_map_artifact.id, response.dense_cloud_artifact.id])
         self.assertNotIn(response.dense_cloud_artifact.id, stub.entries)
@@ -333,7 +321,7 @@ class AssignedCheckpointExportOriginTests(unittest.TestCase):
         stub.TransferGraphArtifact = fail
         with self.assertLogs(provider_module.LOGGER.name, level='ERROR'), \
                 self.assertRaises(RuntimeError) as caught:
-            client.export_mapping_backend_checkpoint(checkpoint_schema_version=2)
+            client.export_mapping_backend_checkpoint()
         self.assertIs(caught.exception, failure)
         self.assertEqual(released, [response.fine_map_artifact.id, response.dense_cloud_artifact.id])
 
@@ -342,7 +330,7 @@ class AssignedCheckpointExportOriginTests(unittest.TestCase):
         response.dense_cloud_artifact.member_identity.checkpoint_id = 'd' * 32
         stub = TransferStub(response)
         with self.assertRaisesRegex(ValueError, 'checkpoint role'):
-            provider_fixture(stub).export_mapping_backend_checkpoint(checkpoint_schema_version=2)
+            provider_fixture(stub).export_mapping_backend_checkpoint()
         self.assertEqual([(request.action, request.artifact.id) for request in stub.requests],
                          [(5, response.fine_map_artifact.id)])
         self.assertIn(response.dense_cloud_artifact.id, stub.entries)
@@ -352,7 +340,7 @@ class AssignedCheckpointExportOriginTests(unittest.TestCase):
         response.backend_kind = 'slam_toolbox'
         stub = TransferStub(response)
         with self.assertRaisesRegex(ValueError, 'requires field graph_artifact'):
-            provider_fixture(stub).export_mapping_backend_checkpoint(checkpoint_schema_version=2)
+            provider_fixture(stub).export_mapping_backend_checkpoint()
         self.assertEqual(stub.requests, [])
 
     def test_export_rejects_unknown_backend_before_envelope_or_download(self):
@@ -363,7 +351,7 @@ class AssignedCheckpointExportOriginTests(unittest.TestCase):
         with patch.object(provider_module, '_validate_checkpoint_identity_envelope',
                           side_effect=AssertionError('unknown backend reached envelope')):
             with self.assertRaisesRegex(ValueError, 'requires a paired backend'):
-                provider_fixture(stub).export_mapping_backend_checkpoint(checkpoint_schema_version=2)
+                provider_fixture(stub).export_mapping_backend_checkpoint()
         self.assertEqual(stub.requests, [])
 
 

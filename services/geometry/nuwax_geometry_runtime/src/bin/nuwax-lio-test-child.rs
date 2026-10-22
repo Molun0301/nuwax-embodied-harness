@@ -68,6 +68,12 @@ impl NativeChildArgs {
                 return Err(format!("duplicate native flag {flag}"));
             }
             match flag {
+                "--blind" => {
+                    let supplied=parse_number(flag,value)?;
+                    if supplied.to_bits()!=config.minimum_observation_range_m().to_bits() {
+                        return Err("recorded test child requires its existing default minimum range".into());
+                    }
+                }
                 "--lidar" => config.lidar_topic = value.to_owned(),
                 "--input_lidar" => config.input_lidar_topic = Some(value.to_owned()),
                 "--input_imu" => config.input_imu_topic = Some(value.to_owned()),
@@ -108,6 +114,7 @@ impl NativeChildArgs {
         }
 
         let expected_flags = [
+            "--blind",
             "--child_frame_id",
             "--debug",
             "--extrinsic_r",

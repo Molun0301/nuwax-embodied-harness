@@ -1,16 +1,9 @@
 """Explicit assigned durable records; no native process, RPC or payload hash."""
 from copy import deepcopy
-import json
-from pathlib import Path
-import tempfile
-import threading
 import unittest
-from concurrent.futures import ThreadPoolExecutor
-from unittest.mock import patch
 
-from contracts.map_workspace import AssetIdentityV2, MapAsset
+from contracts.map_workspace import AssetIdentityV2
 from contracts.map_activation import AssignedActivationReceipt
-from services.mapping import catalog as module
 
 ASSET = AssetIdentityV2(asset_id='a' * 32)
 CHECKPOINT = 'b' * 32
@@ -91,145 +84,6 @@ class AssignedReceiptTests(unittest.TestCase):
                 AssignedActivationReceipt.admit(candidate)
 
 
-class AssignedCatalogTests(unittest.TestCase):
-    def setUp(self):
-        self.directory = tempfile.TemporaryDirectory()
-        self.addCleanup(self.directory.cleanup)
-        self.repo = module.MapCatalogRepository(self.directory.name)
-        self.args = dict(target_map_name='room', target_asset_identity=ASSET, target_checkpoint_id=CHECKPOINT)
 
-    def begin(self, **overrides):
-        return self.repo.begin_assigned_map_activation(previous_map_name=None, load_memory_history=False,
-                                                      **dict(self.args, **overrides))
-
-    def complete(self, request_id, *, owner=None, **extra):
-        return self.repo.complete_assigned_map_activation_durable(**self.args, activation_request_id=request_id,
-            activation_receipt=owner or AssignedActivationReceipt.admit(receipt(request_id)), expected_phases=['prepared'], **extra)
-
-    def test_reopen_exact_completion_and_reuse_without_hashing(self):
-        with patch.object(module.hashlib, 'sha256', side_effect=AssertionError('application hash')):
-            intent = self.begin(); request_id = intent['activation_request_id']
-            result = self.complete(request_id)
-            raw = self.repo._activation_receipt_path.read_bytes()
-            reopened = module.MapCatalogRepository(self.directory.name)
-            self.assertEqual(reopened.get_last_successful_map_activation_receipt(), result)
-            self.assertIsNone(reopened.get_map_activation())
-            self.assertEqual(self.complete(request_id, idempotent_replay=True), result)
-            self.assertEqual(self.repo._activation_receipt_path.read_bytes(), raw)
-            self.assertEqual(self.begin()['activation_request_id'], request_id)
-
-    def test_same_request_changed_receipt_rejected_without_rewrite(self):
-        request_id = self.begin()['activation_request_id']; self.complete(request_id)
-        raw = self.repo._activation_receipt_path.read_bytes()
-        changed = AssignedActivationReceipt.admit(receipt(request_id, epoch=10))
-        with self.assertRaisesRegex(ValueError, 'conflicting'): self.complete(request_id, owner=changed)
-        self.assertEqual(self.repo._activation_receipt_path.read_bytes(), raw)
-
-    def test_checkpoint_and_asset_binding_precedes_durable_write(self):
-        request_id = self.begin()['activation_request_id']
-        wrong = AssignedActivationReceipt.admit(receipt(request_id, checkpoint='e'*32))
-        with self.assertRaises(ValueError): self.complete(request_id, owner=wrong)
-        self.assertFalse(self.repo._activation_receipt_path.exists())
-        self.assertEqual(self.repo.get_map_activation()['activation_request_id'], request_id)
-
-    def test_receipt_write_failure_keeps_intent_for_exact_retry(self):
-        request_id = self.begin()['activation_request_id']
-        real = module._atomic_write_text
-        def fail(path, text):
-            if path == self.repo._activation_receipt_path: raise OSError('injected receipt failure')
-            return real(path, text)
-        with patch.object(module, '_atomic_write_text', side_effect=fail), self.assertRaises(OSError):
-            self.complete(request_id)
-        self.assertIsNotNone(self.repo.get_map_activation())
-        self.assertIsNone(self.repo.get_last_successful_map_activation_receipt())
-        self.complete(request_id)
-        self.assertIsNone(self.repo.get_map_activation())
-
-    def test_clear_fsync_failure_reopens_both_and_reconciles_exact_receipt(self):
-        request_id = self.begin()['activation_request_id']
-        real = module._fsync_directory; calls = 0
-        def fail_once(path):
-            nonlocal calls
-            calls += 1
-            if calls == 2: raise OSError('injected clear fsync failure')
-            return real(path)
-        with patch.object(module, '_fsync_directory', side_effect=fail_once), self.assertRaises(OSError):
-            self.complete(request_id)
-        raw = self.repo._activation_receipt_path.read_bytes()
-        self.repo = module.MapCatalogRepository(self.directory.name)
-        self.assertIsNotNone(self.repo.get_map_activation())
-        self.assertIsNotNone(self.repo.get_last_successful_map_activation_receipt())
-        self.complete(request_id, idempotent_replay=True)
-        self.assertIsNone(self.repo.get_map_activation())
-        self.assertEqual(self.repo._activation_receipt_path.read_bytes(), raw)
-
-    def test_concurrent_exact_begin_has_one_request_owner(self):
-        barrier = threading.Barrier(2)
-        def run(_):
-            repo = module.MapCatalogRepository(self.directory.name); barrier.wait()
-            return repo.begin_assigned_map_activation(previous_map_name=None, load_memory_history=False, **self.args)
-        with ThreadPoolExecutor(max_workers=2) as pool: results = list(pool.map(run, range(2)))
-        self.assertEqual(results[0], results[1])
-        self.assertEqual(self.repo.get_map_activation(), results[0])
-
-    def test_pending_conflict_and_rotation_do_not_drop_fence(self):
-        request_id = self.begin()['activation_request_id']
-        with self.assertRaises(ValueError): self.begin(target_asset_identity=AssetIdentityV2(asset_id='e'*32))
-        rotated = self.repo.rotate_assigned_map_activation_request_id(**self.args, activation_request_id=request_id)
-        self.assertNotEqual(rotated['activation_request_id'], request_id)
-        with self.assertRaises(ValueError): self.complete(request_id)
-        self.assertEqual(self.repo.get_map_activation(), rotated)
-        self.repo.update_assigned_map_activation_phase('backend_dispatching', **self.args,
-            activation_request_id=rotated['activation_request_id'], expected_phases=['prepared'])
-        with self.assertRaises(ValueError):
-            self.repo.rotate_assigned_map_activation_request_id(**self.args, activation_request_id=rotated['activation_request_id'])
-
-    def test_legacy_intent_phase_rotation_and_clear_keep_original_shape(self):
-        legacy = self.repo.begin_map_activation(previous_map_name=None, target_map_name='room',
-            target_manifest_sha256='f'*64, load_memory_history=False)
-        self.assertEqual(set(legacy), {'schema_version', 'previous_map_name', 'target_map_name',
-            'target_manifest_sha256', 'activation_request_id', 'load_memory_history', 'phase'})
-        self.assertEqual(legacy['schema_version'], 2)
-        rotated = self.repo.rotate_map_activation_request_id(target_map_name='room',
-            target_manifest_sha256='f'*64, activation_request_id=legacy['activation_request_id'])
-        self.repo.update_map_activation_phase('backend_dispatching', target_map_name='room',
-            target_manifest_sha256='f'*64, activation_request_id=rotated['activation_request_id'],
-            expected_phases=['prepared'])
-        self.repo.clear_map_activation(target_map_name='room', target_manifest_sha256='f'*64,
-            activation_request_id=rotated['activation_request_id'], expected_phases=['backend_dispatching'])
-        self.assertIsNone(self.repo.get_map_activation())
-
-    def test_legacy_records_stay_legacy_and_cannot_be_adopted(self):
-        legacy = dict(schema_version=1, target_map_name='room', target_manifest_sha256='f'*64,
-                      activation_request_id='mapload:'+'2'*32)
-        self.repo._activation_receipt_path.write_text(json.dumps(legacy))
-        read = self.repo.get_last_successful_map_activation_receipt()
-        self.assertFalse(read['trusted_identity']); self.assertEqual(read['schema_version'], 1)
-        current = self.begin(); self.assertNotEqual(current['activation_request_id'], legacy['activation_request_id'])
-        with self.assertRaisesRegex(ValueError, 'typed assigned'):
-            self.repo.begin_map_activation(previous_map_name=None, target_map_name='room',
-                target_manifest_sha256='f'*64, load_memory_history=False)
-
-    def test_mixed_durable_schema_and_identity_fail_closed(self):
-        request_id = self.begin()['activation_request_id']; self.complete(request_id)
-        original = json.loads(self.repo._activation_receipt_path.read_text())
-        for mutate in (lambda d: d.update(schema_version=2), lambda d: d.update(activation_receipt_schema_version=1),
-                       lambda d: d.update(target_manifest_sha256='f'*64),
-                       lambda d: d['target_asset_identity'].update(asset_id='0'*32)):
-            candidate = deepcopy(original); mutate(candidate)
-            self.repo._activation_receipt_path.write_text(json.dumps(candidate))
-            with self.assertRaises(ValueError): self.repo.get_last_successful_map_activation_receipt()
-        self.repo._activation_receipt_path.write_text(json.dumps(original))
-
-    def test_assigned_asset_metadata_read_never_infers_digest_or_identity(self):
-        asset = MapAsset(map_name='room', display_name='room', bound_memory_library_name='room',
-                         identity_schema_version=2, asset_identity=ASSET, finalized=True)
-        path = self.repo._metadata_path('room'); path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(asset.model_dump_json())
-        current = path.parent/'current'; current.mkdir(); (current/'manifest.json').write_text('{}')
-        with patch.object(module.hashlib, 'sha256', side_effect=AssertionError('read inferred digest')):
-            loaded = self.repo._load_map_asset(path)
-        self.assertEqual(loaded.asset_identity, ASSET)
-        self.assertIsNone(loaded.asset_manifest_sha256)
 
 if __name__ == '__main__': unittest.main()

@@ -76,7 +76,7 @@ class HeightfieldArchiveConsumerTests(unittest.TestCase):
     def roundtrip(self, payload, directory):
         version = read_fine_archive_root(payload)[1]['version']
         client, stub, response = peer_for(payload, (version,))
-        bundle = client.export_mapping_backend_checkpoint(checkpoint_schema_version=2)
+        bundle = client.export_mapping_backend_checkpoint()
         self.assertIsInstance(bundle.checkpoint.fine_archive, FrozenPayload)
         retained_owner = bundle.checkpoint.fine_archive
         directory.mkdir(exist_ok=True)
@@ -85,7 +85,7 @@ class HeightfieldArchiveConsumerTests(unittest.TestCase):
         reopened = provider.reopen_mapping_backend_checkpoint(directory, 'voxel')
         self.assertEqual(bytes(reopened.checkpoint.fine_archive), payload)
         loaded = checkpoint_store.MappingBackendCheckpointStore(directory).load('voxel', schema_version=2)
-        self.assertEqual(provider._mapping_backend_checkpoint_proto(loaded), response)
+        self.assertEqual(provider._mapping_backend_checkpoint_v2_proto(loaded), response)
         self.assertEqual(loaded.checkpoint.fine_reference, bundle.checkpoint.fine_reference)
         uploaded = client._upload_graph_artifact(reopened.checkpoint,
             payload=reopened.checkpoint.fine_archive, reference=reopened.checkpoint.fine_reference)
@@ -93,7 +93,7 @@ class HeightfieldArchiveConsumerTests(unittest.TestCase):
         downloaded = client._download_graph_artifact(uploaded, provider.MAX_FINE_ARCHIVE_BYTES)
         self.assertEqual(bytes(downloaded), payload)
         self.assertEqual(read_fine_archive_root(downloaded)[1], read_fine_archive_root(payload)[1])
-        self.assertEqual(stub.exports, [2])
+        self.assertEqual(stub.exports, [b''])
 
     def legacy_import(self, payload):
         fixture = legacy.LegacyCloudImportTests()
@@ -145,7 +145,7 @@ class HeightfieldArchiveConsumerTests(unittest.TestCase):
         # Existing AR4 semantics: export/storage are allowed, activation/upload
         # require the connected runtime's advertised reader capability.
         client, stub, _ = peer_for(payload, (1, 2, 3, 4, 99))
-        bundle = client.export_mapping_backend_checkpoint(checkpoint_schema_version=2)
+        bundle = client.export_mapping_backend_checkpoint()
         stored = bundle.publish_to(self.fixture.root)
         origin = client.capture_assigned_activation_origin()
         self.assertFalse(client.supports_assigned_fine_archive_version(5, expected_origin=origin))
@@ -179,7 +179,7 @@ class HeightfieldArchiveConsumerTests(unittest.TestCase):
         for malformed in (payload[:-1], heightfield.archive(heightfield.full()[:-1])):
             client, stub, _ = peer_for(malformed)
             with self.assertRaises(ValueError):
-                client.export_mapping_backend_checkpoint(checkpoint_schema_version=2)
+                client.export_mapping_backend_checkpoint()
             self.assertEqual(stub.entries, {})
         response = response_for(payload)
         response.fine_map_artifact.member_identity.frame_generation += 1
@@ -204,7 +204,7 @@ class HeightfieldArchiveConsumerTests(unittest.TestCase):
         payload = (Path(directory) / 'invalid-rebound.ar5').read_bytes()
         client, stub, _ = peer_for(payload)
         with self.assertRaisesRegex(ValueError, '空间绑定'):
-            client.export_mapping_backend_checkpoint(checkpoint_schema_version=2)
+            client.export_mapping_backend_checkpoint()
         self.assertEqual(stub.entries, {})
 
 

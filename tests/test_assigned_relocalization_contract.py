@@ -288,14 +288,6 @@ class AssignedRelocalizationContractTests(unittest.TestCase):
             message.assigned_cloud_v2.ClearField(missing)
             with self.assertRaisesRegex(ValueError, 'absent'):
                 AssignedRelocalizationRequest.from_proto(message)
-        message = request.to_proto(proto.RelocalizeRequest)
-        message.runtime_generation = 3
-        with self.assertRaisesRegex(ValueError, 'legacy'):
-            AssignedRelocalizationRequest.from_proto(message)
-        message = request.to_proto(proto.RelocalizeRequest)
-        message.MergeFromString(bytes([248, 7, 1]))
-        with self.assertRaisesRegex(ValueError, 'unknown'):
-            AssignedRelocalizationRequest.from_proto(message)
 
     def test_query_proto_response_and_observation_byte_parity(self):
         proto = load_proto()

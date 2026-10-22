@@ -9,17 +9,15 @@ pub(crate) struct CorrectionPoints(Arc<CorrectionPointData>);
 #[derive(Debug)]
 struct CorrectionPointData {
     points: Vec<Point3<f64>>,
-    finite: bool,
 }
 
 impl CorrectionPoints {
-    pub(crate) fn all_finite(&self) -> bool { self.0.finite }
+
 }
 
 impl From<Vec<Point3<f64>>> for CorrectionPoints {
     fn from(points: Vec<Point3<f64>>) -> Self {
-        let finite = points.iter().all(|p| p.x.is_finite() && p.y.is_finite() && p.z.is_finite());
-        Self(Arc::new(CorrectionPointData { points, finite }))
+        Self(Arc::new(CorrectionPointData { points }))
     }
 }
 
@@ -81,20 +79,7 @@ mod tests {
         assert!(weak.upgrade().is_none());
     }
 
-    #[test]
-    fn finite_admission_is_cached_on_the_immutable_owner() {
-        let owner = CorrectionPoints::from(vec![Point3::new(-0.0, 1.0, 2.0)]);
-        let shared = owner.clone();
-        assert!(owner.all_finite());
-        assert!(Arc::ptr_eq(&owner.0, &shared.0));
-        assert!(shared.all_finite());
-        for invalid in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
-            let changed = owner.edited_for_test(|points| points[0].z = invalid);
-            assert!(!changed.all_finite());
-            assert!(!changed.clone().all_finite());
-            assert!(owner.all_finite());
-        }
-    }
+
 
     #[test]
     fn independent_replay_compares_exact_bits_order_and_duplicate_count() {

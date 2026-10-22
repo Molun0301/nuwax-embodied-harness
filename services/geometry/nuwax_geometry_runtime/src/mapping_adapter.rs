@@ -420,7 +420,6 @@ pub struct MappingSessionSnapshot {
     pub revision: u64,
     pub active: bool,
     pub idempotent_replay: bool,
-    pub legacy_checkpoint_reconstructed: bool,
     pub mapping_backend_kind: String,
 }
 
@@ -434,7 +433,6 @@ impl MappingSessionSnapshot {
             revision: 0,
             active: false,
             idempotent_replay: false,
-            legacy_checkpoint_reconstructed: false,
             mapping_backend_kind: mapping_backend_kind.stable_name().to_owned(),
         }
     }
@@ -760,45 +758,7 @@ pub(crate) enum MappingPendingCause {
 }
 
 #[derive(Debug)]
-enum MappingRetirementProof {
-    NoBackend,
-    QuiescentGeneration(u64),
-    ExactGeneration(u64),
-}
-
-#[derive(Debug)]
-pub(crate) struct MappingRetiredCapability {
-    proof: MappingRetirementProof,
-}
-
-impl MappingRetiredCapability {
-    fn no_backend() -> Self {
-        Self {
-            proof: MappingRetirementProof::NoBackend,
-        }
-    }
-
-    fn quiescent(generation: u64) -> Self {
-        Self {
-            proof: MappingRetirementProof::QuiescentGeneration(generation),
-        }
-    }
-
-    fn exact(generation: u64) -> Self {
-        Self {
-            proof: MappingRetirementProof::ExactGeneration(generation),
-        }
-    }
-
-    #[cfg(test)]
-    fn generation(&self) -> Option<u64> {
-        match self.proof {
-            MappingRetirementProof::NoBackend => None,
-            MappingRetirementProof::QuiescentGeneration(generation)
-            | MappingRetirementProof::ExactGeneration(generation) => Some(generation),
-        }
-    }
-}
+pub(crate) struct MappingRetiredCapability;
 
 #[allow(clippy::enum_variant_names)]
 pub(crate) enum MappingFinalOwner {
@@ -921,7 +881,7 @@ impl MappingFinalOwner {
                     let Some(adapter) = adapter else {
                         drop(lifecycle_guard);
                         return MappingFinalAttempt::Settled {
-                            capability: MappingRetiredCapability::no_backend(),
+                            capability: MappingRetiredCapability,
                             terminal: sticky.into_terminal(Ok(())),
                         };
                     };
@@ -1720,7 +1680,6 @@ impl MappingAdapter {
             revision: 0,
             active: true,
             idempotent_replay: false,
-            legacy_checkpoint_reconstructed: false,
             mapping_backend_kind: self.mapping_backend.kind().stable_name().to_owned(),
         };
         Ok(self.snapshot())
@@ -1915,9 +1874,7 @@ impl MappingAdapter {
                         retirement,
                         sticky_error: None,
                     },
-                    None => MappingFinalPreparation::Settled(MappingRetiredCapability::quiescent(
-                        self.backend_generation,
-                    )),
+                    None => MappingFinalPreparation::Settled(MappingRetiredCapability),
                 },
                 Err(MappingLifecycleError::GenerationExhausted) => {
                     let sticky_error = MappingTerminalError::new(
@@ -1953,9 +1910,7 @@ impl MappingAdapter {
                 retirement,
                 sticky_error: None,
             },
-            Ok(None) => MappingFinalPreparation::Settled(MappingRetiredCapability::quiescent(
-                self.backend_generation,
-            )),
+            Ok(None) => MappingFinalPreparation::Settled(MappingRetiredCapability),
             Err(error) => MappingFinalPreparation::Pending(
                 MappingPendingCause::RetirementUnproven(error.to_string()),
             ),
@@ -1973,7 +1928,7 @@ impl MappingAdapter {
             )));
         }
         self.pending_backend_retirement = None;
-        Ok(MappingRetiredCapability::exact(generation))
+        Ok(MappingRetiredCapability)
     }
 
     pub(crate) fn complete_backend_retirement(
@@ -2473,9 +2428,7 @@ impl MappingAdapter {
         self.commit_clock.boot_nonce()
     }
 
-    pub(crate) fn set_legacy_checkpoint_reconstructed(&mut self, reconstructed: bool) {
-        self.lifecycle.legacy_checkpoint_reconstructed = reconstructed;
-    }
+
 
     pub(crate) fn enable_pgo_history(&mut self) {
         self.pgo_history
@@ -2758,12 +2711,12 @@ impl MappingAdapter {
         let (generation,backend)=self.prepare_planar_continuation(session_id,map_name)?;
         self.reset_for_new_session();self.next_session_generation=generation;self.backend_generation=backend;
         self.lifecycle=MappingSessionSnapshot{phase:MappingSessionPhase::Active,session_id:session_id.to_owned(),map_name:map_name.to_owned(),
-            session_generation:generation,revision:0,active:true,idempotent_replay:false,legacy_checkpoint_reconstructed:false,mapping_backend_kind:"slam_toolbox".into()};
+            session_generation:generation,revision:0,active:true,idempotent_replay:false,mapping_backend_kind:"slam_toolbox".into()};
         Ok(self.snapshot())
     }
     pub(crate) fn prepare_planar_activation(&self,snapshot:nuwax_slam_2d_runtime::protocol::Snapshot,data:Vec<i8>,timestamp:u64,backend_generation:u64)->PlanarMapPreparation {
         let session=MappingSessionSnapshot {phase:MappingSessionPhase::Active,session_id:snapshot.session.session_id.clone(),map_name:snapshot.session.map_name.clone(),
-            session_generation:snapshot.session.session_generation,revision:0,active:true,idempotent_replay:false,legacy_checkpoint_reconstructed:false,mapping_backend_kind:"slam_toolbox".into()};
+            session_generation:snapshot.session.session_generation,revision:0,active:true,idempotent_replay:false,mapping_backend_kind:"slam_toolbox".into()};
         let mut preparation=self.prepare_planar_map(snapshot,data,timestamp);
         preparation.has_observation=false;preparation.session=session;preparation.backend_generation=backend_generation;
         preparation
@@ -6371,7 +6324,6 @@ mod tests {
                 capability,
                 terminal,
             } => {
-                assert!(capability.generation().is_some());
                 assert_eq!(terminal, Ok(()));
             }
             MappingFinalAttempt::Pending { cause, .. } => {
@@ -6425,7 +6377,6 @@ mod tests {
                 capability,
                 terminal,
             } => {
-                assert!(capability.generation().is_some());
                 assert_eq!(terminal, Ok(()));
             }
             MappingFinalAttempt::Pending { cause, .. } => {
@@ -6540,7 +6491,7 @@ mod tests {
                 capability,
                 terminal,
             } => {
-                assert_eq!(capability.generation(), Some(exact_generation));
+
                 assert!(terminal.is_err(), "the observed mismatch remains sticky");
             }
             MappingFinalAttempt::Pending { cause, .. } => {
@@ -6571,7 +6522,6 @@ mod tests {
                 capability,
                 terminal,
             } => {
-                assert!(capability.generation().is_some());
                 assert!(terminal.is_err(), "joined panic remains a sticky terminal");
             }
             MappingFinalAttempt::Pending { cause, .. } => {

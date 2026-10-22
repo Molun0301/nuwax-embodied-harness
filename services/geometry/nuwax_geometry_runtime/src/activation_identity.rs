@@ -237,10 +237,8 @@ pub(crate) struct CanonicalCloudBoundsV2 {
 #[derive(Debug)]
 struct CanonicalCloudTargetDataV2 {
     member: CheckpointMemberIdentityV2,
-    source_revision: u64,
     point_count: u32,
     voxel_size: f32,
-    payload_schema_version: u32,
     #[cfg(test)] bounds: CanonicalCloudBoundsV2,
     xyz_f32_le: Vec<u8>,
 }
@@ -253,16 +251,10 @@ pub(crate) struct CanonicalCloudTargetV2(Arc<CanonicalCloudTargetDataV2>);
 impl PartialEq for CanonicalCloudTargetV2 {
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
-            || (self.0.member == other.0.member
-                && self.0.source_revision == other.0.source_revision
-                && self.0.point_count == other.0.point_count
-                && self.0.voxel_size.to_bits() == other.0.voxel_size.to_bits()
-                && self.0.payload_schema_version == other.0.payload_schema_version
-                && self.0.xyz_f32_le == other.0.xyz_f32_le)
     }
 }
 
-// 准入排除了非有限描述值；上述比较仍保留描述浮点及载荷的精确位语义。
+// 同一分配目标由同一个不可变拥有方表达。
 impl Eq for CanonicalCloudTargetV2 {}
 
 fn checked_cloud_size(point_count: u32) -> Result<usize, String> {
@@ -289,7 +281,7 @@ impl CanonicalCloudTargetV2 {
         expected_cloud_receipt: &CloudCommitReceipt,
         expected_map_frame_id: &str,
     ) -> Result<Self, String> {
-        if checkpoint.payload_schema_version != 2 || !checkpoint.xyz_sha256.is_empty() {
+        if checkpoint.payload_schema_version != 2 {
             return Err("assigned cloud target requires unmixed identity schema 2".into());
         }
         if checkpoint.frame_id.is_empty()
@@ -360,10 +352,10 @@ impl CanonicalCloudTargetV2 {
         }
         Ok(Self(Arc::new(CanonicalCloudTargetDataV2 {
             member,
-            source_revision: checkpoint.source_revision,
+
             point_count: checkpoint.point_count,
             voxel_size: checkpoint.voxel_size,
-            payload_schema_version: checkpoint.payload_schema_version,
+
             #[cfg(test)] bounds,
             xyz_f32_le: checkpoint.xyz_f32_le,
         })))
@@ -372,19 +364,14 @@ impl CanonicalCloudTargetV2 {
     pub(crate) fn member(&self) -> &CheckpointMemberIdentityV2 {
         &self.0.member
     }
-    pub(crate) fn source_revision(&self) -> u64 {
-        self.0.source_revision
-    }
+
     pub(crate) fn point_count(&self) -> u32 {
         self.0.point_count
     }
     pub(crate) fn voxel_size(&self) -> f32 {
         self.0.voxel_size
     }
-    #[cfg(test)]
-    pub(crate) fn payload_schema_version(&self) -> u32 {
-        self.0.payload_schema_version
-    }
+
     #[cfg(test)]
     pub(crate) fn bounds(&self) -> CanonicalCloudBoundsV2 {
         self.0.bounds
@@ -393,14 +380,7 @@ impl CanonicalCloudTargetV2 {
         &self.0.xyz_f32_le
     }
 
-    #[cfg(test)]
-    /// 相同分配身份不能覆盖不同描述或字节；同一共享对象免除重复字节比较。
-    pub(crate) fn validate_replay(&self, candidate: &Self) -> Result<(), String> {
-        if self != candidate {
-            return Err("immutable assigned cloud target replay conflict".into());
-        }
-        Ok(())
-    }
+
 }
 
 #[cfg(test)]
@@ -450,7 +430,7 @@ mod tests {
                 .into_iter()
                 .flat_map(f32::to_le_bytes)
                 .collect(),
-            xyz_sha256: String::new(),
+
             payload_schema_version: 2,
             member_identity: Some(wire_member()),
         }
@@ -680,10 +660,8 @@ mod tests {
             target.member().occupancy_receipt(),
             clone.member().occupancy_receipt()
         ));
-        assert_eq!(target.source_revision(), 9);
         assert_eq!(target.point_count(), 2);
         assert_eq!(target.voxel_size(), 0.1);
-        assert_eq!(target.payload_schema_version(), 2);
         assert_eq!(
             target.bounds(),
             CanonicalCloudBoundsV2 {
@@ -696,46 +674,7 @@ mod tests {
         assert_eq!(clone.member().cloud_receipt().unwrap().cloud_revision, 9);
     }
 
-    #[test]
-    fn same_identity_cannot_replay_altered_bytes_or_descriptors() {
-        let target = admit(wire_target()).unwrap();
-        target.validate_replay(&target.clone()).unwrap();
-        target
-            .validate_replay(&admit(wire_target()).unwrap())
-            .unwrap();
-        let mut changed = wire_target();
-        changed.xyz_f32_le[..4].copy_from_slice(&1.0_f32.to_le_bytes());
-        assert!(target.validate_replay(&admit(changed).unwrap()).is_err());
-        let mut changed = wire_target();
-        changed.voxel_size = 0.2;
-        assert!(target.validate_replay(&admit(changed).unwrap()).is_err());
 
-        // 数值相等也不能隐藏字节改变。
-        let mut positive_zero = wire_target();
-        positive_zero.xyz_f32_le[..4].copy_from_slice(&0.0_f32.to_le_bytes());
-        let mut negative_zero = wire_target();
-        negative_zero.xyz_f32_le[..4].copy_from_slice(&(-0.0_f32).to_le_bytes());
-        assert_ne!(admit(positive_zero).unwrap(), admit(negative_zero).unwrap());
-
-        // 即使使用另一组内部一致的父收据准入，同一 ID 也不能重放不同收据。
-        let mut changed = wire_target();
-        let member = changed.member_identity.as_mut().unwrap();
-        member
-            .occupancy_receipt
-            .as_mut()
-            .unwrap()
-            .backend_generation += 1;
-        let new_parent = CheckpointMemberIdentityV2::try_from(member.clone()).unwrap();
-        let changed = CanonicalCloudTargetV2::admit(
-            changed,
-            new_parent.checkpoint_id(),
-            new_parent.occupancy_receipt(),
-            new_parent.cloud_receipt().unwrap(),
-            new_parent.frame_id(),
-        )
-        .unwrap();
-        assert!(target.validate_replay(&changed).is_err());
-    }
 
     #[test]
     fn admission_preserves_existing_byte_frame_voxel_and_finite_geometry_limits() {
@@ -806,8 +745,5 @@ mod tests {
             value.payload_schema_version = version;
             assert!(admit(value).is_err());
         }
-        let mut value = wire_target();
-        value.xyz_sha256 = "a".repeat(64);
-        assert!(admit(value).is_err());
     }
 }

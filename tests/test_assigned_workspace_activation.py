@@ -126,13 +126,11 @@ class AssignedWorkspaceActivationTests(unittest.TestCase):
         self.stub.during = self.assert_unlocked
 
     def new_runtime(self):
-        runtime = object.__new__(runtime_module.PlatformGeometryRuntime)
-        runtime._runtime_state_lock = threading.RLock()
-        runtime._mapping_lifecycle_lock = threading.RLock()
-        runtime._provider_attach_lock = threading.RLock()
+        from contracts.geometry_runtime import PlatformGeometryConfig
+        runtime = runtime_module.PlatformGeometryRuntime(config=PlatformGeometryConfig(),
+            catalog_root=str(self.root), robot=SimpleNamespace(providers=SimpleNamespace()))
         runtime._provider_attach_epoch = 2
         runtime._remote_provider = self.provider
-        runtime._provider_attach_stopping = False
         return runtime
 
     def new_service(self):
@@ -189,13 +187,12 @@ class AssignedWorkspaceActivationTests(unittest.TestCase):
                 stack.enter_context(
                     patch.object(hashlib, name, side_effect=AssertionError("application hash: " + name))
                 )
-        for name in ("_activate_legacy_map", "_build_workspace"):
+        for name in ("_build_workspace",):
             stack.enter_context(
                 patch.object(self.service, name, side_effect=AssertionError("legacy workspace: " + name))
             )
         for name in (
-            "_validate_bundle_manifest",
-            "_materialize_assigned_checkpoint_pcd_asset",
+            "_materialize_checkpoint_pcd_asset",
             "_install_map_activation_snapshot_locked",
             "get_authoritative_mapping_session_state",
             "stop_mapping",
@@ -796,12 +793,7 @@ class AssignedWorkspaceActivationTests(unittest.TestCase):
                     self.service._repository.mark_assigned_relocalization_backend_dispatching(**args)
                 before = self.service._repository._relocalization_intent_path.read_bytes()
                 self.stub.calls.clear()
-                with patch.object(
-                    MapCatalogRepository,
-                    "abort_relocalization_before_apply",
-                    side_effect=AssertionError("legacy abort used for assigned intent"),
-                ):
-                    self.service = self.new_service()
+                self.service = self.new_service()
                 self.assertEqual(self.stub.calls, [])
                 self.assertEqual(self.service._repository._relocalization_intent_path.read_bytes(), before)
                 self.assertEqual(self.service._repository.get_relocalization_intent()["phase"], phase)

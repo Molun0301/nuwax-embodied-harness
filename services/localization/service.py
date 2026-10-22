@@ -13,7 +13,6 @@ from contracts.frame_semantics import frame_ids_semantically_equal
 from contracts.geometry import FrameTree, Pose
 from contracts.map_activation import AssignedActivationReceipt
 from contracts.map_relocalization import AssignedRelocalizationTerminal
-from contracts.geometry_runtime import DEFAULT_MAP_FRAME
 from contracts.runtime_views import (LocalizationSession, LocalizationSessionStatus, LocalizationSnapshot,
                                      RelocalizationCandidate, _copy_assigned_localization_fields,
                                      _copy_assigned_session_descriptor)
@@ -493,8 +492,7 @@ class LocalizationService:
         return token
 
     def _build_assigned_session_id(self, *, map_name, asset_id, frame_id):
-        # Same opaque timestamp label convention; never place an assigned ID in
-        # the legacy asset_manifest_sha256 parameter/field.
+        # 分配式会话标签保留原资产标识。
         timestamp = int(utc_now().timestamp() * 1000)
         return "locsess_%s_assigned_%s_%s_%d" % (map_name, asset_id, frame_id or "unframed", timestamp)
 
@@ -568,7 +566,6 @@ class LocalizationService:
         self,
         *,
         map_name: str,
-        asset_manifest_sha256: Optional[str] = None,
         frame_id: Optional[str] = None,
         metadata: Optional[Dict[str, object]] = None,
         geometry_asset: Optional[Dict[str, object]] = None,
@@ -581,15 +578,9 @@ class LocalizationService:
         resolved_geometry_asset = self._clone_metadata(geometry_asset) if geometry_asset is not None else None
         resolved_map_name = str(map_name or "").strip()
         resolved_frame_id = str(frame_id or "").strip() or None
-        resolved_asset_manifest_sha256 = self._resolve_asset_manifest_sha256(
-            asset_manifest_sha256,
-            geometry_asset=resolved_geometry_asset,
-            metadata=metadata,
-        )
         resolved_metadata = {
             **self._sanitize_session_metadata(metadata),
             "map_name": resolved_map_name,
-            "asset_manifest_sha256": resolved_asset_manifest_sha256,
         }
         asset_failure = self._resolve_geometry_asset_failure(resolved_geometry_asset)
         with self._lock:
@@ -599,7 +590,6 @@ class LocalizationService:
             if (
                 existing is not None
                 and existing.map_name == resolved_map_name
-                and existing.asset_manifest_sha256 == resolved_asset_manifest_sha256
                 and self._live_mapping_identity(existing.metadata)
                 == self._live_mapping_identity(resolved_metadata)
                 and (
@@ -631,12 +621,10 @@ class LocalizationService:
                 session = LocalizationSession(
                     session_id=self._build_session_id(
                         map_name=resolved_map_name,
-                        asset_manifest_sha256=resolved_asset_manifest_sha256,
                         frame_id=resolved_frame_id,
                         live_mapping_identity=self._live_mapping_identity(resolved_metadata),
                     ),
                     map_name=resolved_map_name,
-                    asset_manifest_sha256=resolved_asset_manifest_sha256,
                     frame_id=resolved_frame_id,
                     status=LocalizationSessionStatus.FAILED
                     if asset_failure
@@ -661,7 +649,6 @@ class LocalizationService:
         self,
         *,
         map_name: str,
-        asset_manifest_sha256: Optional[str] = None,
         frame_id: Optional[str] = None,
         metadata: Optional[Dict[str, object]] = None,
         force_relocalize: bool = False,
@@ -677,7 +664,6 @@ class LocalizationService:
 
         Args:
             map_name: 绑定地图名称
-            asset_manifest_sha256: 不可变地图资产清单摘要
             frame_id: 目标坐标系
             metadata: 附加元数据
             force_relocalize: 是否强制触发重定位
@@ -685,7 +671,6 @@ class LocalizationService:
 
         session = self.ensure_active_session(
             map_name=map_name,
-            asset_manifest_sha256=asset_manifest_sha256,
             frame_id=frame_id,
             metadata=metadata,
             geometry_asset=geometry_asset,
@@ -805,7 +790,6 @@ class LocalizationService:
                     **self._sanitize_session_metadata(metadata),
                     "source_kind": "platform_localization_session",
                     "map_name": session.map_name,
-                    "asset_manifest_sha256": session.asset_manifest_sha256,
                     "localization_session_id": session.session_id,
                     "provider_name": provider_name,
                     "machine_state": machine_state,
@@ -872,7 +856,6 @@ class LocalizationService:
         expected_live_mapping_identity: Optional[Tuple[str, str, int]],
         expected_mutation_epoch: int,
         map_name: str,
-        asset_manifest_sha256: Optional[str] = None,
         frame_id: Optional[str] = None,
         metadata: Optional[Dict[str, object]] = None,
         refresh: bool = True,
@@ -911,15 +894,9 @@ class LocalizationService:
         asset_failure = self._resolve_geometry_asset_failure(resolved_geometry_asset)
         resolved_map_name = str(map_name or "").strip()
         resolved_frame_id = str(frame_id or "").strip() or None
-        resolved_asset_manifest_sha256 = self._resolve_asset_manifest_sha256(
-            asset_manifest_sha256,
-            geometry_asset=resolved_geometry_asset,
-            metadata=metadata,
-        )
         resolved_metadata = {
             **self._sanitize_session_metadata(metadata),
             "map_name": resolved_map_name,
-            "asset_manifest_sha256": resolved_asset_manifest_sha256,
         }
         publication = None
         with self._lock:
@@ -938,7 +915,6 @@ class LocalizationService:
                 current is not None
                 and current.status != LocalizationSessionStatus.FAILED
                 and current.map_name == resolved_map_name
-                and current.asset_manifest_sha256 == resolved_asset_manifest_sha256
                 and self._frame_ids_match(current.frame_id, resolved_frame_id)
                 and self._live_mapping_identity(current.metadata)
                 == self._live_mapping_identity(resolved_metadata)
@@ -960,12 +936,10 @@ class LocalizationService:
                 session = LocalizationSession(
                     session_id=self._build_session_id(
                         map_name=resolved_map_name,
-                        asset_manifest_sha256=resolved_asset_manifest_sha256,
                         frame_id=resolved_frame_id,
                         live_mapping_identity=self._live_mapping_identity(resolved_metadata),
                     ),
                     map_name=resolved_map_name,
-                    asset_manifest_sha256=resolved_asset_manifest_sha256,
                     frame_id=resolved_frame_id,
                     status=LocalizationSessionStatus.FAILED
                     if asset_failure
@@ -1112,7 +1086,6 @@ class LocalizationService:
                 **self._sanitize_session_metadata(metadata),
                 "source_kind": "platform_localization_session",
                 "map_name": session.map_name,
-                "asset_manifest_sha256": session.asset_manifest_sha256,
                 "localization_session_id": session.session_id,
                 "provider_name": provider.provider_name,
                 "machine_state": machine_state,
@@ -1260,152 +1233,13 @@ class LocalizationService:
             current and requested and frame_ids_semantically_equal(current, requested)
         )
 
-    def relocalize_active_session(
-        self,
-        *,
-        map_name: str,
-        asset_manifest_sha256: Optional[str] = None,
-        frame_id: Optional[str] = None,
-        metadata: Optional[Dict[str, object]] = None,
-        geometry_asset: Optional[Dict[str, object]] = None,
-    ) -> LocalizationSession:
-        """对当前激活会话执行平台级重定位。
 
-        正式主链：
-        1. 重置状态机到 LOCALIZING 状态
-        2. 向当前几何运行时发布重定位 hint
-        3. 刷新会话并返回最新状态
 
-        Returns:
-            更新后的 LocalizationSession
-        """
 
-        # 触发状态机重定位（清 stale_since 计时、attempts++）
-        with self._lock:
-            if self._is_assigned_session(self._active_session):
-                self._assigned_session_requires_guard()
-            self._state_machine.relocalize()
 
-        # 根据当前 session/asset 解析后端模式并发出重定位指令（锁外执行）。
-        backend_dispatch = self._dispatch_backend_relocalize(
-            geometry_asset=geometry_asset,
-            metadata=metadata,
-        )
 
-        merged_metadata: Dict[str, object] = {
-            "relocalize": True,
-            "backend_relocalize": backend_dispatch,
-            **dict(metadata or {}),
-        }
-        return self.refresh_active_session(
-            map_name=map_name,
-            asset_manifest_sha256=asset_manifest_sha256,
-            frame_id=frame_id,
-            metadata=merged_metadata,
-            force_relocalize=False,  # 状态机已处理重定位
-            geometry_asset=geometry_asset,
-        )
 
-    def _dispatch_backend_relocalize(
-        self,
-        *,
-        geometry_asset: Optional[Dict[str, object]],
-        metadata: Optional[Dict[str, object]],
-    ) -> Dict[str, object]:
-        """向当前定位系统发出重定位 hint。"""
 
-        backend_mode = self._resolve_backend_mode(
-            geometry_asset=geometry_asset,
-            metadata=metadata,
-        )
-        # 取最近 provider pose 作为 /initialpose hint；缺失时让后端用上次 known pose
-        hint_pose: Optional[Pose] = None
-        try:
-            provider = self._find_localization_provider()
-            if provider is not None:
-                hint_pose = provider.get_current_pose()
-        except Exception:
-            hint_pose = None
-
-        result: Dict[str, object] = {
-            "backend_mode": backend_mode,
-            "hint_pose_available": hint_pose is not None,
-            "actions": [],
-            "errors": [],
-        }
-        if backend_mode in {
-            "mapping",
-            "mapping_backend",
-            "mapping_localization",
-            "amcl_localization_only",
-        }:
-            self._publish_initialpose(hint_pose, result)
-        else:
-            result["errors"].append(
-                "未知后端模式 backend_mode=%s，跳过真接入；建议在 mapping 端写入 backend_mode 元数据。"
-                % backend_mode
-            )
-        return result
-
-    @staticmethod
-    def _resolve_backend_mode(
-        *,
-        geometry_asset: Optional[Dict[str, object]],
-        metadata: Optional[Dict[str, object]],
-    ) -> str:
-        """从 metadata / geometry_asset 解析后端模式。"""
-
-        for source in (metadata or {}, geometry_asset or {}):
-            value = str(source.get("backend_mode") or "").strip().lower()
-            if value:
-                return value
-        return "unknown"
-
-    def _publish_initialpose(self, hint_pose: Optional[Pose], result: Dict[str, object]) -> None:
-        """发送初始位姿。
-
-        ``nuwax-geometry-runtime`` 通过 LCM channel
-        ``/localization/initial_pose#geometry_msgs.PoseWithCovarianceStamped``
-        或 ``nuwax-rpc relocalize`` 触发定位栈初始化。
-
-        实际生效路径是记录 actions 给上层（debug UI / console）观察，由 MCP/external 路径发起
-        relocalize 调用，runtime 在收到命令后自行完成 PF 重置 / AMCL 启动。
-        """
-        if hint_pose is None:
-            result["errors"].append("无可用 hint pose，跳过 relocalize 命令。")
-            return
-        try:
-            provider = getattr(self, "_geometry_runtime_provider", None)
-            relocalize_fn = getattr(provider, "relocalize", None) if provider is not None else None
-            if callable(relocalize_fn):
-                relocalize_fn(pose=hint_pose, frame_id=DEFAULT_MAP_FRAME)
-                result["actions"].append(
-                    {"target": "nuwax-geometry-runtime.relocalize", "status": "submitted"}
-                )
-                return
-            # Phase 3 目标态：runtime 暴露 relocalize 之前，本方法只记录 hint。
-            result["actions"].append(
-                {
-                    "target": "localization_hint_staged",
-                    "status": "staged",
-                    "frame_id": DEFAULT_MAP_FRAME,
-                    "pose": {
-                        "position": {
-                            "x": float(hint_pose.position.x),
-                            "y": float(hint_pose.position.y),
-                            "z": float(hint_pose.position.z),
-                        },
-                        "orientation": {
-                            "x": float(hint_pose.orientation.x),
-                            "y": float(hint_pose.orientation.y),
-                            "z": float(hint_pose.orientation.z),
-                            "w": float(hint_pose.orientation.w),
-                        },
-                    },
-                }
-            )
-        except Exception as exc:
-            result["errors"].append("relocalize 命令提交失败：%s" % exc)
 
     def get_localization_diagnostics(self) -> Optional[LocalizationDiagnostics]:
         """返回当前平台定位诊断信息。"""
@@ -1692,7 +1526,6 @@ class LocalizationService:
             expected_live_mapping_identity=self._live_mapping_identity(session.metadata),
             expected_mutation_epoch=mutation_epoch,
             map_name=session.map_name,
-            asset_manifest_sha256=session.asset_manifest_sha256,
             frame_id=session.frame_id,
             metadata={**dict(session.metadata), **dict(metadata or {})},
             refresh=True,
@@ -1941,7 +1774,6 @@ class LocalizationService:
             metadata={
                 "kind": "localization_session",
                 "map_name": session.map_name,
-                "asset_manifest_sha256": session.asset_manifest_sha256,
                 "status": session.status.value,
                 **owner_metadata,
             },
@@ -1955,7 +1787,6 @@ class LocalizationService:
                     message="平台定位会话已更新。",
                     payload={
                         "map_name": session.map_name,
-                        "asset_manifest_sha256": session.asset_manifest_sha256,
                         "status": session.status.value,
                         **owner_metadata,
                     },
@@ -1978,7 +1809,6 @@ class LocalizationService:
         self,
         *,
         map_name: str,
-        asset_manifest_sha256: Optional[str],
         frame_id: Optional[str],
         live_mapping_identity: Optional[Tuple[str, str, int]],
     ) -> str:
@@ -1988,30 +1818,14 @@ class LocalizationService:
             if live_mapping_identity is not None
             else "persistent"
         )
-        return "locsess_%s_%s_%s_%s_%d" % (
+        return "locsess_%s_live_%s_%s_%d" % (
             str(map_name or "").strip(),
-            str(asset_manifest_sha256 or "live").strip(),
             str(frame_id or "unframed").strip(),
             live_identity,
             timestamp,
         )
 
-    @staticmethod
-    def _resolve_asset_manifest_sha256(
-        value: Optional[str],
-        *,
-        geometry_asset: Optional[Dict[str, object]],
-        metadata: Optional[Dict[str, object]],
-    ) -> Optional[str]:
-        for candidate in (
-            value,
-            (geometry_asset or {}).get("asset_manifest_sha256"),
-            (metadata or {}).get("asset_manifest_sha256"),
-        ):
-            resolved = str(candidate or "").strip().lower()
-            if resolved:
-                return resolved
-        return None
+
 
     @staticmethod
     def _sanitize_session_metadata(metadata: Optional[Dict[str, object]]) -> Dict[str, object]:

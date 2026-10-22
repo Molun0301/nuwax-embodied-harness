@@ -45,6 +45,8 @@ def save_after_stop(runtime, context, request):
     except FileNotFoundError:
         retained = None
     if retained is not None:
+        if retained.schema_version != 2:
+            raise ValueError("旧暂停检查点只支持读取，不能重新保存为当前记录")
         if (retained.pipeline != runtime.config.geometry.pipeline or retained.request != frozen
                 or retained.geometry_progress_json != payload):
             raise ValueError("原暂停检查点的请求或进度已改变，不能重写")
@@ -63,14 +65,14 @@ def save_after_stop(runtime, context, request):
     if type(version) is not int or version not in (1, 2) or type(after.get("schema_version")) is not int:
         raise ValueError("探索进度版本无效，检查点未发布")
     identity = ("schema_version", "request_id", "map_name", "map_frame_id", "origin_session_id", "origin_session_generation", "origin_frame_generation")
-    # New progress compares actual settings; v1 values remain opaque legacy metadata.
+    # 新进度比较实际配置；第一版源进度只保留原始元数据。
     settings = ("configuration", "navigation_configuration") if version == 2 else ("configuration_sha256", "navigation_configuration_sha256")
     if any(before[key] != after[key] for key in identity + settings):
         raise ValueError("完整地图保存期间探索坐标或配置改变，检查点未发布")
-    assigned = getattr(bundle, "identity_schema_version", 1) == 2
-    binding = ({"schema_version": 2, "asset_identity": bundle.asset_identity,
-                "mapping_checkpoint_id": bundle.geometry_asset.metadata["mapping_backend_checkpoint"]["checkpoint_id"]}
-               if assigned else {"asset_manifest_sha256": bundle.manifest_sha256})
+    if bundle.identity_schema_version != 2 or bundle.asset_identity is None:
+        raise ValueError("探索暂停必须保存当前分配身份资产")
+    binding = {"schema_version": 2, "asset_identity": bundle.asset_identity,
+               "mapping_checkpoint_id": bundle.geometry_asset.metadata["mapping_backend_checkpoint"]["checkpoint_id"]}
     value = ExplorationCheckpoint(checkpoint_id=checkpoint_id, pipeline=runtime.config.geometry.pipeline, request=frozen,
         geometry_progress_json=payload, localization_seed=seed, **binding)
     catalog.save(value)
@@ -78,9 +80,8 @@ def save_after_stop(runtime, context, request):
 
 
 def _publish_saved(runtime, context, value):
-    binding = ({"schema_version": 2, "asset_identity": value.asset_identity.model_dump(),
-                "mapping_checkpoint_id": value.mapping_checkpoint_id}
-               if value.schema_version == 2 else {"asset_manifest_sha256": value.asset_manifest_sha256})
+    binding = {"schema_version": 2, "asset_identity": value.asset_identity.model_dump(),
+               "mapping_checkpoint_id": value.mapping_checkpoint_id}
     runtime.task_manager.update_task_metadata(context.task_id, {"exploration_checkpoint": {"status": "succeeded", "checkpoint_id": value.checkpoint_id,
         "map_name": value.request.map_name, **binding}})
 
@@ -91,28 +92,12 @@ def prepare_resume(runtime, context, request, checkpoint_id, requested_by):
     saved = catalog.load(checkpoint_id, validate_asset=False)
     if saved.pipeline != runtime.config.geometry.pipeline or saved.request.map_name != request.map_name or saved.geometry_progress_json != request.resume_progress_json:
         raise ValueError("探索恢复请求与检查点或当前链路不一致")
+    if saved.schema_version != 2:
+        raise ValueError("旧探索检查点依赖已退役的摘要身份，不能自动恢复；请重新开始探索")
+    if saved.pipeline == "slam_2d" and saved.localization_seed is None:
+        raise ValueError("二维探索检查点缺少实际定位初始提示")
     snapshot = catalog.validate_asset(saved)
-    if saved.schema_version == 2:
-        return _prepare_assigned_resume(runtime, context, request, saved, snapshot, catalog, requested_by)
-    context.ensure_active()
-    context.update(stage="resume_exploration_localization", message="激活检查点地图并核对实际定位。")
-    runtime.map_workspace_service.activate_map(map_name=request.map_name, create_if_missing=False,
-        metadata={"source": "resume_exploration", "requested_by": requested_by or "unknown"})
-    context.ensure_active()
-    metadata = {"source": "resume_exploration", "business_request_id": "resume-localize-" + uuid.uuid4().hex,
-        "logical_timeout_ms": int(min(30.0, context.timeout_remaining_sec() or 30.0) * 1000)}
-    if saved.pipeline == "slam_2d":
-        pose = saved.localization_seed
-        if pose is None:
-            raise ValueError("二维探索检查点缺少实际定位初始提示")
-        q = pose.orientation
-        metadata["planar_seed"] = [pose.position.x, pose.position.y, math.atan2(2 * (q.w*q.z + q.x*q.y), 1 - 2 * (q.y*q.y + q.z*q.z))]
-    session, workspace = runtime.map_workspace_service.relocalize_active_map(map_name=request.map_name, metadata=metadata)
-    context.ensure_active()
-    catalog.validate_asset(saved)
-    status = getattr(session.status, "value", session.status)
-    if status != "ready" or workspace.active_map_name != request.map_name or workspace.map_asset.asset_manifest_sha256 != saved.asset_manifest_sha256:
-        raise ValueError("探索检查点尚未获得准确资产上的真实定位")
+    return _prepare_assigned_resume(runtime, context, request, saved, snapshot, catalog, requested_by)
 
 
 def _pending_request(catalog, saved):
@@ -155,10 +140,11 @@ def _resume_request(runtime, context, saved, pending):
 
 def _require_assigned_target(saved, snapshot, target):
     receipt = target.activation_receipt
+    source_key = "source_graph_member" if saved.pipeline == "slam_2d" else "source_cloud_member"
     if (receipt.asset_identity != saved.asset_identity or receipt.map_name != saved.request.map_name
             or receipt.to_dict()["request"]["checkpoint_id"] != saved.mapping_checkpoint_id
             or snapshot.assigned_source_member is None
-            or receipt.to_dict()["target"]["source_cloud_member"] != _identity_document(snapshot.assigned_source_member)):
+            or receipt.to_dict()["target"].get(source_key) != _identity_document(snapshot.assigned_source_member)):
         raise ValueError("当前安装的资产或源检查点与探索记录不一致")
 
 
@@ -188,9 +174,14 @@ def _prepare_assigned_resume(runtime, context, request, saved, snapshot, catalog
     if pending is not None and not target.activation_receipt.exact_replay_of(pending.activation_receipt):
         raise ValueError("已恢复重定位与当前安装不是同一拥有方")
     if pending is None or pending_phase == "prepared":
-        session, workspace = service.relocalize_active_map(map_name=request.map_name,
-            metadata={"source": "resume_exploration", "business_request_id": retained["request_id"],
-                      "logical_timeout_ms": retained["logical_timeout_ms"]})
+        metadata = {"source": "resume_exploration", "business_request_id": retained["request_id"],
+                    "logical_timeout_ms": retained["logical_timeout_ms"]}
+        if saved.pipeline == "slam_2d":
+            pose = saved.localization_seed
+            q = pose.orientation
+            metadata["planar_seed"] = [pose.position.x, pose.position.y,
+                math.atan2(2 * (q.w*q.z + q.x*q.y), 1 - 2 * (q.y*q.y + q.z*q.z))]
+        session, workspace = service.relocalize_active_map(map_name=request.map_name, metadata=metadata)
     context.ensure_active()
     token = service._localization_service.get_active_session_token()
     if (session is None or workspace is None or token[0] is not session

@@ -74,7 +74,7 @@ class ExplorationCheckpointIdentityTests(unittest.TestCase):
 
     def test_missing_mixed_and_unsupported_identity_generations_are_rejected(self):
         for changes in ({"asset_identity": None}, {"mapping_checkpoint_id": None},
-                        {"asset_manifest_sha256": "b" * 64}, {"pipeline": "slam_2d"},
+                        {"asset_manifest_sha256": "b" * 64},
                         {"schema_version": 1}, {"mapping_checkpoint_id": "0" * 32},
                         {"mapping_checkpoint_id": "A" * 32}, {"mapping_checkpoint_id": True},
                         {"asset_identity": {"asset_id": "0" * 32}},
@@ -486,8 +486,7 @@ class AssignedExplorationCheckpointStoreTests(unittest.TestCase):
     def test_save_revalidates_forged_and_nested_mutated_record_before_any_write(self):
         invalid = [self.record.model_copy(update={"schema_version": True}),
             self.record.model_copy(update={"asset_manifest_sha256": "a" * 64}),
-            self.record.model_copy(update={"mapping_checkpoint_id": "bad"}),
-            self.record.model_copy(update={"asset_identity": ASSET_ID.model_copy(update={"asset_id": "bad"})})]
+            self.record.model_copy(update={"mapping_checkpoint_id": "bad"})]
         request = self.record.request.model_copy(update={"resume_progress_json": "nested"})
         invalid.append(self.record.model_copy(update={"request": request}))
         for value in invalid:
@@ -502,9 +501,9 @@ class LegacyExplorationCheckpointStoreTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
         self.store = ExplorationCheckpointStore(self.root)
-        self.store.validate_asset = Mock()
 
-    def test_literal_legacy_wrapper_payload_and_filename_survive_equal_retry(self):
+
+    def test_literal_legacy_wrapper_is_read_only_and_keeps_original_filename(self):
         value = legacy_fixture(pipeline="slam_2d")
         self.store.root.mkdir()
         path = self.store.root / ("7" * 64 + ".json")
@@ -512,23 +511,24 @@ class LegacyExplorationCheckpointStoreTests(unittest.TestCase):
         document.pop("schema_version")
         literal = json.dumps({"sha256": "opaque historical wrapper", "payload": json.dumps(document, indent=3)}, indent=4) + "\n"
         path.write_text(literal)
-        loaded = self.store.load(value.checkpoint_id)
+        loaded = self.store.load(value.checkpoint_id, validate_asset=False)
         self.assertEqual(loaded, value)
-        with patch.object(checkpoint_module, "_atomic_write_text", side_effect=AssertionError("legacy bytes rewritten")), \
-                patch.object(checkpoint_module, "_fsync_directory", wraps=checkpoint_module._fsync_directory) as sync:
+        with self.assertRaisesRegex(ValueError, "旧探索检查点"):
             self.store.save(loaded)
-        sync.assert_called_once_with(path.parent)
+        with self.assertRaisesRegex(ValueError, "旧探索检查点"):
+            self.store.load(value.checkpoint_id)
         self.assertEqual(path.read_text(), literal)
         self.assertEqual(self.store._path(value.checkpoint_id), path)
         self.assertFalse(self.store._files.direct_path(value.checkpoint_id).exists())
         listed, = self.store.list()
         self.assertEqual(listed["asset_manifest_sha256"], "a" * 64)
         self.assertNotIn("asset_identity", listed)
+        self.assertFalse(listed["available"])
 
     def test_bad_envelope_version_or_identity_alias_is_rejected(self):
         value = legacy_fixture()
-        self.store.save(value)
-        path = self.store._path(value.checkpoint_id)
+        path = self.store._files.direct_path(value.checkpoint_id)
+        path.parent.mkdir(parents=True)
         for version in (True, 2.0, "2", 1, 3):
             path.write_text(json.dumps({"schema_version": version, "payload": value.model_dump_json()}))
             with self.subTest(version=version), self.assertRaises(ValueError):

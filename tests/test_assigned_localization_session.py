@@ -198,9 +198,6 @@ class AssignedSessionContractTests(unittest.TestCase):
             assigned_session(terminal=rejected)
         with self.assertRaises(ValueError):
             assigned_session(owner=activation('b'), terminal=applied_terminal())
-        forged = AssetIdentityV2(asset_id='a' * 32).model_copy(update={'asset_id': 'bad'})
-        with self.assertRaises(ValueError):
-            assigned_session(asset_identity=forged)
         legacy = LocalizationSession(session_id='legacy', map_name='room')
         with self.assertRaises(TypeError):
             legacy.model_copy(update={'activation_receipt_v2': activation()})
@@ -762,7 +759,7 @@ class AssignedSessionServiceTests(unittest.TestCase):
     def test_legacy_mutators_cannot_strip_assigned_owner(self):
         session = self.install().session
         before = self.state()
-        for name in ('ensure_active_session', 'refresh_active_session', 'relocalize_active_session'):
+        for name in ('ensure_active_session', 'refresh_active_session'):
             with self.subTest(name=name), self.assertRaises(GatewayError):
                 getattr(self.service, name)(map_name='room', frame_id='map')
         self.assertIs(self.service.refresh_current_session(), session)

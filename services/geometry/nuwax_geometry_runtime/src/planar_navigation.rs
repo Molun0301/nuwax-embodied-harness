@@ -388,7 +388,7 @@ mod tests {
             phase: MappingSessionPhase::Active,
             session_id: "planar-receipt".into(), map_name: "test-map".into(),
             session_generation: 3, revision: 7, active: true, idempotent_replay: false,
-            legacy_checkpoint_reconstructed: false, mapping_backend_kind: "slam_toolbox".into(),
+             mapping_backend_kind: "slam_toolbox".into(),
         };
         let receipt = OccupancyCommitReceipt {
             commit_id: MappingCommitId { boot_nonce: 0x1234, sequence: 11 },

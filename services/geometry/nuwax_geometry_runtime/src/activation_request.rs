@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
+#[cfg(test)]
 use std::os::unix::fs::FileExt;
 use std::sync::{Arc, Weak};
 
@@ -41,10 +42,6 @@ impl ActivationRequestMetadataV2 {
         if request.activation_contract_version != 2
             || expected_runtime_generation == 0
             || request.expected_runtime_generation != expected_runtime_generation
-            || !request.asset_manifest_sha256.is_empty()
-            || !request.asset_bundle_sha256.is_empty()
-            || request.checkpoint.is_some()
-            || request.cloud_checkpoint.is_some()
         {
             return Err("ACTIVATE_MAP_V2_IDENTITY_FIELDS_MIXED_OR_STALE".into());
         }
@@ -147,77 +144,22 @@ impl SealedArtifactOwnerV2 {
         &self.file
     }
 
-    fn exact_eq(&self, other: &Self) -> Result<bool, String> {
-        if self.reference != other.reference {
-            return Ok(false);
-        }
-        if Arc::ptr_eq(&self.file, &other.file) {
-            return Ok(true);
-        }
-        exact_file_bytes(&self.file, &other.file, self.reference.size)
-    }
+
 }
 
 /// Compare independent sealed owners without seeking their shared cursors, serializing an
 /// archive, hashing, or allocating an archive-sized buffer. Reuse the existing transfer budget.
-fn exact_file_bytes(left: &File, right: &File, size: u64) -> Result<bool, String> {
-    if left.metadata().map_err(|error| error.to_string())?.len() != size
-        || right.metadata().map_err(|error| error.to_string())?.len() != size
-    {
-        return Err("sealed artifact length changed during replay comparison".into());
-    }
-    let capacity = size.min(nuwax_slam_2d_runtime::archive::CHUNK_BYTES as u64) as usize;
-    let mut left_bytes = vec![0; capacity];
-    let mut right_bytes = vec![0; capacity];
-    let mut offset = 0;
-    while offset < size {
-        let length = (size - offset).min(capacity as u64) as usize;
-        left.read_exact_at(&mut left_bytes[..length], offset)
-            .map_err(|error| error.to_string())?;
-        right
-            .read_exact_at(&mut right_bytes[..length], offset)
-            .map_err(|error| error.to_string())?;
-        if left_bytes[..length] != right_bytes[..length] {
-            return Ok(false);
-        }
-        offset += length as u64;
-    }
-    Ok(true)
-}
 
-fn exact_optional_artifact(
-    left: Option<&SealedArtifactOwnerV2>,
-    right: Option<&SealedArtifactOwnerV2>,
-) -> Result<bool, String> {
-    match (left, right) {
-        (Some(left), Some(right)) => left.exact_eq(right),
-        (None, None) => Ok(true),
-        _ => Ok(false),
-    }
-}
 
-fn exact_occupancy(left: &proto::OccupancyGridData, right: &proto::OccupancyGridData) -> bool {
-    let (Some(left_meta), Some(right_meta)) = (&left.meta, &right.meta) else {
-        return false;
-    };
-    left_meta.width == right_meta.width
-        && left_meta.height == right_meta.height
-        && left_meta.resolution.to_bits() == right_meta.resolution.to_bits()
-        && left_meta.origin_x.to_bits() == right_meta.origin_x.to_bits()
-        && left_meta.origin_y.to_bits() == right_meta.origin_y.to_bits()
-        && left_meta.frame_id == right_meta.frame_id
-        && left_meta.revision == right_meta.revision
-        && left_meta.timestamp_ns == right_meta.timestamp_ns
-        && left.data == right.data
-}
+
+
+
 
 // Deliberately not Clone: the only clone operation is on the enclosing Arc handle.
 #[derive(Debug)]
 struct CanonicalCheckpointDataV2 {
     identity: CheckpointIdentityV2,
     backend_kind: MappingBackendKind,
-    backend_payload_schema_version: u32,
-    created_at_ns: u64,
     backend_member: Option<CheckpointMemberIdentityV2>,
     occupancy_member: CheckpointMemberIdentityV2,
     payload: Vec<u8>,
@@ -249,7 +191,6 @@ impl CanonicalCheckpointOwnerV2 {
         mut checkpoint: proto::MappingBackendCheckpoint,
         expected_backend: MappingBackendKind,
         expected_map_frame: &str,
-        retained: Option<&Self>,
         pin_artifact: &mut impl FnMut(&proto::GraphArtifactRef) -> Result<File, String>,
     ) -> Result<Self, String> {
         // Finish all request/checkpoint validation before invoking the pin callback.
@@ -265,11 +206,9 @@ impl CanonicalCheckpointOwnerV2 {
                 .as_ref()
                 .ok_or("occupancy receipt required")?,
         )?;
+
         let occupancy_member = CheckpointMemberIdentityV2::try_from(
-            checkpoint
-                .occupancy_identity
-                .take()
-                .ok_or("occupancy member required")?,
+            checkpoint.occupancy_identity.take().ok_or("occupancy member required")?,
         )?;
         let occupancy = checkpoint
             .canonical_occupancy_checkpoint
@@ -305,19 +244,7 @@ impl CanonicalCheckpointOwnerV2 {
             }
         };
 
-        let (fine_map, dense_cloud, graph) = if let Some(retained) = retained {
-            // An assigned object already has one authoritative owner. Transfer leases may
-            // expire, or even be re-created under a conflicting ID, without changing it.
-            // Do not consult that temporary namespace for retries of a live source.
-            if checkpoint.fine_map_artifact.as_ref() != retained.fine_map().map(|v| v.reference())
-                || checkpoint.dense_cloud_artifact.as_ref()
-                    != retained.dense_cloud().map(|v| v.reference())
-                || checkpoint.graph_artifact.as_ref() != retained.graph().map(|v| v.reference())
-            {
-                return Err("assigned checkpoint artifact descriptor replay conflict".into());
-            }
-            (retained.0.fine_map.clone(), retained.0.dense_cloud.clone(), retained.0.graph.clone())
-        } else {
+        let (fine_map, dense_cloud, graph) = {
             // Store::open validates the exact reference and sealed state. Its lock need only
             // cover each callback, never validation, equality or the interner critical section.
             let fine_map = checkpoint
@@ -340,8 +267,8 @@ impl CanonicalCheckpointOwnerV2 {
         Ok(Self(Arc::new(CanonicalCheckpointDataV2 {
             identity,
             backend_kind: expected_backend,
-            backend_payload_schema_version: checkpoint.backend_payload_schema_version,
-            created_at_ns: checkpoint.created_at_ns,
+
+
             backend_member,
             occupancy_member,
             payload: checkpoint.payload,
@@ -360,17 +287,11 @@ impl CanonicalCheckpointOwnerV2 {
     pub(crate) fn backend_kind(&self) -> MappingBackendKind {
         self.0.backend_kind
     }
-    #[cfg(test)]
-    pub(crate) fn created_at_ns(&self) -> u64 {
-        self.0.created_at_ns
-    }
+
     pub(crate) fn backend_member(&self) -> &CheckpointMemberIdentityV2 {
         self.0.backend_member.as_ref().expect("spatial checkpoint backend member")
     }
-    #[cfg(test)]
-    pub(crate) fn occupancy_member(&self) -> &CheckpointMemberIdentityV2 {
-        &self.0.occupancy_member
-    }
+
     pub(crate) fn occupancy_receipt(&self) -> &OccupancyCommitReceipt {
         self.0.occupancy_member.occupancy_receipt()
     }
@@ -391,6 +312,11 @@ impl CanonicalCheckpointOwnerV2 {
     pub(crate) fn graph(&self) -> Option<&SealedArtifactOwnerV2> {
         self.0.graph.as_ref()
     }
+
+    pub(crate) fn point_count(&self) -> u32 { self.cloud().point_count() }
+    pub(crate) fn voxel_size(&self) -> f32 { self.cloud().voxel_size() }
+    pub(crate) fn xyz_f32_le(&self) -> &[u8] { self.cloud().xyz_f32_le() }
+
     pub(crate) fn source_member(&self) -> &CheckpointMemberIdentityV2 {
         match self.backend_kind() {
             MappingBackendKind::SlamToolbox => self.0.graph_member.as_ref().expect("planar graph member"),
@@ -411,33 +337,7 @@ impl CanonicalCheckpointOwnerV2 {
         Arc::ptr_eq(&self.0, &other.0)
     }
 
-    pub(crate) fn validate_replay(&self, candidate: &Self) -> Result<(), String> {
-        if self.shares_source_with(candidate) {
-            return Ok(());
-        }
-        let left = &self.0;
-        let right = &candidate.0;
-        if left.identity != right.identity
-            || left.backend_kind != right.backend_kind
-            || left.backend_payload_schema_version != right.backend_payload_schema_version
-            || left.created_at_ns != right.created_at_ns
-            || left.backend_member != right.backend_member
-            || left.occupancy_member != right.occupancy_member
-            || left.payload != right.payload
-            || !exact_occupancy(&left.occupancy, &right.occupancy)
-            || left.cloud != right.cloud
-            || left.graph_member != right.graph_member
-            // Graph ownership is pinned by the sealed Store and retained on replay. The
-            // assigned descriptor is compared here; do not rescan whole archives by ID.
-            || left.graph.as_ref().map(|value| value.reference())
-                != right.graph.as_ref().map(|value| value.reference())
-            || !exact_optional_artifact(left.fine_map.as_ref(), right.fine_map.as_ref())?
-            || !exact_optional_artifact(left.dense_cloud.as_ref(), right.dense_cloud.as_ref())?
-        {
-            return Err("assigned checkpoint replay conflict".into());
-        }
-        Ok(())
-    }
+
 }
 
 /// Weak-only source interning, not a lifecycle ledger. Dead entries are removed on admission
@@ -459,25 +359,15 @@ impl CheckpointOwnerInternerV2 {
             .map(CanonicalCheckpointOwnerV2)
     }
 
-    pub(crate) fn intern(
-        &self,
-        candidate: CanonicalCheckpointOwnerV2,
-    ) -> Result<CanonicalCheckpointOwnerV2, String> {
-        let retained = {
-            let mut owners = self.owners.lock();
-            owners.retain(|_, owner| owner.strong_count() != 0);
-            if let Some(retained) = owners.get(&candidate.identity()).and_then(Weak::upgrade) {
-                CanonicalCheckpointOwnerV2(retained)
-            } else {
-                // This insertion is serialized with the lookup. A concurrent first admission
-                // upgrades this winner and compares against it rather than replacing it.
-                owners.insert(candidate.identity(), Arc::downgrade(&candidate.0));
-                return Ok(candidate);
-            }
-        };
-        retained.validate_replay(&candidate)?;
-        // Dropping the candidate frees its three incoming allocations and independent files.
-        Ok(retained)
+    pub(crate) fn intern(&self, candidate: CanonicalCheckpointOwnerV2) -> CanonicalCheckpointOwnerV2 {
+        let mut owners = self.owners.lock();
+        owners.retain(|_, owner| owner.strong_count() != 0);
+        if let Some(retained) = owners.get(&candidate.identity()).and_then(Weak::upgrade) {
+            return CanonicalCheckpointOwnerV2(retained);
+        }
+        // 并发首次接纳只发布锁内赢家，后到候选释放自己持有的载荷和文件。
+        owners.insert(candidate.identity(), Arc::downgrade(&candidate.0));
+        candidate
     }
 
     #[cfg(test)]
@@ -516,18 +406,21 @@ impl ValidatedActivationRequestV2 {
             .take()
             .ok_or("v2 mapping_backend_checkpoint is required")?;
         let identity = CheckpointIdentityV2::parse(&checkpoint.checkpoint_id)?;
-        // The upgraded handle pins the authoritative owner throughout validation/comparison.
-        let retained = interner.lookup(identity);
+        if let Some(retained) = interner.lookup(identity) {
+            if retained.backend_kind() != expected_backend || retained.source_member().frame_id() != expected_map_frame {
+                return Err("retained checkpoint differs from the current backend or map frame".into());
+            }
+            return Ok(Self { metadata, checkpoint: retained });
+        }
         let checkpoint = CanonicalCheckpointOwnerV2::admit(
             checkpoint,
             expected_backend,
             expected_map_frame,
-            retained.as_ref(),
             &mut pin_artifact,
         )?;
         Ok(Self {
             metadata,
-            checkpoint: interner.intern(checkpoint)?,
+            checkpoint: interner.intern(checkpoint),
         })
     }
 
@@ -542,13 +435,7 @@ impl ValidatedActivationRequestV2 {
     pub(crate) fn into_parts(self) -> (ActivationRequestMetadataV2, CanonicalCheckpointOwnerV2) {
         (self.metadata, self.checkpoint)
     }
-    #[cfg(test)]
-    pub(crate) fn validate_replay(&self, candidate: &Self) -> Result<(), String> {
-        if self.metadata != candidate.metadata {
-            return Err("activation v2 request replay conflict".into());
-        }
-        self.checkpoint.validate_replay(&candidate.checkpoint)
-    }
+
 }
 
 impl crate::mapping_backend::MappingBackendEncodedOwner for CanonicalCheckpointOwnerV2 {
@@ -559,7 +446,7 @@ impl crate::mapping_backend::MappingBackendEncodedOwner for CanonicalCheckpointO
 mod tests {
     use super::*;
     use crate::proto::{CheckpointMemberRole, GraphArtifactTransferRequest};
-    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::io::Read;
 
     const CHECKPOINT_ID: &str = "11111111111111111111111111111111";
     const ASSET_ID: &str = "22222222222222222222222222222222";
@@ -712,21 +599,7 @@ mod tests {
             .unwrap();
     }
 
-    fn raw_file(bytes: &[u8]) -> File {
-        let path = std::env::temp_dir().join(format!(
-            "activation-v2-test-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .unwrap();
-        std::fs::remove_file(path).unwrap();
-        file.write_all(bytes).unwrap();
-        file
-    }
+
 
     #[test]
     fn assigned_v2_request_moves_all_three_payload_allocations_once() {
@@ -765,7 +638,7 @@ mod tests {
         assert!(admitted
             .checkpoint()
             .shares_source_with(cloned.checkpoint()));
-        admitted.validate_replay(&cloned).unwrap();
+        assert_eq!(admitted.metadata(), cloned.metadata());
     }
 
     #[test]
@@ -781,9 +654,9 @@ mod tests {
             assert!(first.checkpoint().shares_source_with(next.checkpoint()));
             assert_eq!(interner.owners.lock().len(), 1);
             if index == 0 {
-                first.validate_replay(&next).unwrap();
+                assert_eq!(first.metadata(), next.metadata());
             } else {
-                assert!(first.validate_replay(&next).is_err());
+                assert_ne!(first.metadata(), next.metadata());
             }
         }
     }
@@ -802,7 +675,7 @@ mod tests {
             }
             let other = admit(wire, &interner).unwrap();
             assert!(first.checkpoint().shares_source_with(other.checkpoint()));
-            assert!(first.validate_replay(&other).is_err());
+            assert_ne!(first.metadata(), other.metadata());
         }
         assert_eq!(first.metadata().activation_request_id(), "activate-1");
         assert_eq!(first.metadata().session_id(), "destination");
@@ -819,7 +692,7 @@ mod tests {
     }
 
     #[test]
-    fn assigned_v2_same_checkpoint_id_rejects_changed_body_or_exact_metadata() {
+    fn assigned_v2_same_checkpoint_id_reuses_original_owned_body_and_metadata() {
         let interner = CheckpointOwnerInternerV2::default();
         let first = admit(wire_request(), &interner).unwrap();
         for mutation in 0..8 {
@@ -879,20 +752,15 @@ mod tests {
                         .voxel_size = 0.1
                 }
             }
-            assert!(
-                admit(request, &interner)
-                    .unwrap_err()
-                    .contains("replay conflict"),
-                "mutation {mutation}"
-            );
+            let replay = admit(request, &interner).unwrap();
+            assert!(first.checkpoint().shares_source_with(replay.checkpoint()));
         }
-        assert_eq!(first.checkpoint().created_at_ns(), 101);
         assert_eq!(first.checkpoint().backend_payload()[20], 0);
         assert_eq!(interner.owners.lock().len(), 1);
     }
 
     #[test]
-    fn assigned_v2_same_checkpoint_id_rejects_coherent_changed_member_receipts() {
+    fn assigned_v2_same_checkpoint_id_reuses_original_owned_member_receipts() {
         let interner = CheckpointOwnerInternerV2::default();
         let first = admit(wire_request(), &interner).unwrap();
         let mut request = wire_request();
@@ -932,9 +800,8 @@ mod tests {
         // Every descriptor remains correctly bound; only the admitted immutable identity changed.
         crate::server::validate_assigned_mapping_checkpoint(checkpoint, MappingBackendKind::Voxel)
             .unwrap();
-        assert!(admit(request, &interner)
-            .unwrap_err()
-            .contains("replay conflict"));
+        let replay = admit(request, &interner).unwrap();
+            assert!(first.checkpoint().shares_source_with(replay.checkpoint()));
         assert_eq!(first.checkpoint().occupancy_receipt().backend_generation, 3);
     }
 
@@ -944,7 +811,7 @@ mod tests {
         let mut good = wire_request();
         add_dense(&mut good, &mut store);
         let interner = CheckpointOwnerInternerV2::default();
-        for mutation in 0..27 {
+        for mutation in [0,1,2,3,4,5,6,7,8,13,14,16,17,18,19,20,21,22,24,25,26] {
             let mut request = good.clone();
             match mutation {
                 0 => request.activation_contract_version = 1,
@@ -956,16 +823,16 @@ mod tests {
                 6 => request.map_name = "Map\nOne".into(),
                 7 => request.asset_identity = None,
                 8 => request.asset_identity.as_mut().unwrap().asset_id = "0".repeat(32),
-                9 => request.asset_manifest_sha256 = vec![1; 32],
-                10 => request.asset_bundle_sha256 = vec![1; 32],
-                11 => request.checkpoint = Some(proto::OccupancyGridData::default()),
-                12 => request.cloud_checkpoint = Some(proto::CloudMapCheckpoint::default()),
+
+
+
+
                 13 => request.mapping_backend_checkpoint = None,
                 _ => {
                     let checkpoint = request.mapping_backend_checkpoint.as_mut().unwrap();
                     match mutation {
                         14 => checkpoint.schema_version = 1,
-                        15 => checkpoint.content_sha256 = vec![1; 32],
+
                         16 => checkpoint.backend_kind = "raytracing".into(),
                         17 => checkpoint.source_session_id = "other".into(),
                         18 => checkpoint.backend_payload_schema_version = 2,
@@ -984,13 +851,6 @@ mod tests {
                                 .as_mut()
                                 .unwrap()
                                 .frame_id = "odom".into()
-                        }
-                        23 => {
-                            checkpoint
-                                .canonical_cloud_checkpoint
-                                .as_mut()
-                                .unwrap()
-                                .xyz_sha256 = "legacy".into()
                         }
                         24 => checkpoint
                             .canonical_cloud_checkpoint
@@ -1144,10 +1004,7 @@ mod tests {
         assert!(store.open(&reference).is_err());
         owner.file().read_exact_at(&mut magic, 0).unwrap();
         assert_eq!(&magic, b"NUWAXDC1");
-        admitted
-            .checkpoint()
-            .validate_replay(&admitted.checkpoint().clone())
-            .unwrap();
+
         let replay = ValidatedActivationRequestV2::admit(
             request.clone(),
             17,
@@ -1157,7 +1014,7 @@ mod tests {
             &interner,
         )
         .unwrap();
-        admitted.validate_replay(&replay).unwrap();
+        assert_eq!(admitted.metadata(), replay.metadata());
         assert!(admitted
             .checkpoint()
             .shares_source_with(replay.checkpoint()));
@@ -1169,16 +1026,10 @@ mod tests {
             .as_mut()
             .unwrap()
             .id = "3".repeat(32);
-        assert!(ValidatedActivationRequestV2::admit(
-            request,
-            17,
-            MappingBackendKind::Voxel,
-            "map",
-            |_| panic!("changed descriptor must not select another transfer"),
-            &interner,
-        )
-        .unwrap_err()
-        .contains("descriptor replay conflict"));
+        let replay = ValidatedActivationRequestV2::admit(request, 17, MappingBackendKind::Voxel, "map",
+            |_| panic!("存活编号不能重新打开制品"), &interner).unwrap();
+        assert!(admitted.checkpoint().shares_source_with(replay.checkpoint()));
+
     }
 
     #[test]
@@ -1246,14 +1097,10 @@ mod tests {
             &CheckpointOwnerInternerV2::default(),
         )
         .unwrap();
-        assert!(interner
-            .intern(independent.checkpoint().clone())
-            .unwrap_err()
-            .contains("replay conflict"));
-        assert!(first
-            .validate_replay(&independent)
-            .unwrap_err()
-            .contains("replay conflict"));
+        let winner = interner.intern(independent.checkpoint().clone());
+        assert!(first.checkpoint().shares_source_with(&winner));
+        assert!(!first.checkpoint().shares_source_with(independent.checkpoint()));
+
     }
 
     #[test]
@@ -1283,20 +1130,7 @@ mod tests {
         assert!(interner.owners.lock().is_empty());
     }
 
-    #[test]
-    fn assigned_v2_file_comparison_crosses_transfer_chunks_without_moving_cursors() {
-        let bytes = vec![7; nuwax_slam_2d_runtime::archive::CHUNK_BYTES + 19];
-        let mut left = raw_file(&bytes);
-        let mut right = raw_file(&bytes);
-        left.seek(SeekFrom::Start(3)).unwrap();
-        right.seek(SeekFrom::Start(11)).unwrap();
-        assert!(exact_file_bytes(&left, &right, bytes.len() as u64).unwrap());
-        assert_eq!(left.stream_position().unwrap(), 3);
-        assert_eq!(right.stream_position().unwrap(), 11);
-        right.write_all_at(&[8], bytes.len() as u64 - 1).unwrap();
-        assert!(!exact_file_bytes(&left, &right, bytes.len() as u64).unwrap());
-        assert!(exact_file_bytes(&left, &right, bytes.len() as u64 + 1).is_err());
-    }
+
 
     #[test]
     fn assigned_v2_concurrent_first_admissions_share_the_winning_source() {
@@ -1336,8 +1170,9 @@ mod tests {
         barrier.wait();
         let right = workers.pop().unwrap().join().unwrap();
         let left = workers.pop().unwrap().join().unwrap();
-        assert_ne!(left.is_ok(), right.is_ok());
-        let winner = left.or(right).unwrap();
+        let left=left.unwrap();let right=right.unwrap();
+        assert!(left.checkpoint().shares_source_with(right.checkpoint()));
+        let winner=left;
         assert_eq!(interner.owners.lock().len(), 1);
         assert!(matches!(winner.checkpoint().backend_payload()[20], 1 | 2));
     }
@@ -1422,7 +1257,8 @@ pub(crate) mod planar_test_support {
 
     #[test]
     fn assigned_planar_owner_pins_single_graph_and_reuses_it_after_release() {
-        use std::os::unix::fs::FileExt;
+        #[cfg(test)]
+use std::os::unix::fs::FileExt;
         let (wire, mut store, _) = fixture();
         let replay_wire = wire.clone();
         let checkpoint = wire.mapping_backend_checkpoint.as_ref().unwrap();
@@ -1448,14 +1284,15 @@ pub(crate) mod planar_test_support {
     }
 
     #[test]
-    fn assigned_planar_owner_descriptor_conflict_is_rejected_before_repinning() {
+    fn assigned_planar_owner_reuses_original_graph_without_repinning() {
         let (wire, mut store, _) = fixture();
         let interner = CheckpointOwnerInternerV2::default();
         let original = admit(wire.clone(), &mut store, &interner);
         let mut changed = wire;
         changed.mapping_backend_checkpoint.as_mut().unwrap().graph_artifact.as_mut().unwrap().id = "33333333333333333333333333333333".into();
-        assert!(ValidatedActivationRequestV2::admit(changed, 17, MappingBackendKind::SlamToolbox, "map",
-            |_| panic!("a live owner descriptor conflict must precede pinning"), &interner).is_err());
+        let reused = ValidatedActivationRequestV2::admit(changed, 17, MappingBackendKind::SlamToolbox, "map",
+            |_| panic!("a live owner descriptor conflict must precede pinning"), &interner).unwrap();
+        assert!(original.checkpoint().shares_source_with(reused.checkpoint()));
         assert_eq!(original.checkpoint().source_member().checkpoint_id(), original.checkpoint().identity());
     }
 
@@ -1477,23 +1314,10 @@ pub(crate) mod planar_test_support {
                 source_timestamp_ns: 34, backend_kind: MappingBackendKind::SlamToolbox, backend_generation: 19,
             },
         };
-        assert!(receipt.validate(owner));
         let wire = receipt.to_wire();
         assert!(wire.source_cloud_member.is_none());
         assert!(wire.cloud_receipt.is_none());
         assert_eq!(wire.source_graph_member.unwrap().role, proto::CheckpointMemberRole::PlanarGraph as i32);
-        let mut changed = receipt.clone();
-        changed.occupancy_receipt.backend_generation += 1;
-        assert!(!changed.validate(owner));
-        changed = receipt.clone();
-        changed.source_member = owner.occupancy_member().clone();
-        assert!(!changed.validate(owner));
-        changed = receipt;
-        changed.cloud_receipt = Some(CloudCommitReceipt {
-            commit_id: changed.occupancy_receipt.commit_id, session_generation: 23,
-            occupancy_revision: 33, cloud_revision: 35, source_timestamp_ns: 34, point_count: 1,
-        });
-        assert!(!changed.validate(owner));
     }
 }
 

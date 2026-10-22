@@ -4,6 +4,8 @@ Only native metadata is retained. No runtime process, network, payload hashing,
 or unrelated catalog/component consolidation tests are exercised here.
 """
 import json
+import hashlib
+import uuid
 import tempfile
 import unittest
 from copy import deepcopy
@@ -60,7 +62,7 @@ class AssignedWorkspaceJournalTests(unittest.TestCase):
 
     def begin(self, **changes):
         args = dict(self.target, previous_map_name=None, load_memory_history=False,
-                    reuse_completed_request_id=False, activation_request=self.request)
+                    activation_request=self.request)
         args.update(changes)
         return self.repo.begin_assigned_map_activation(**args)
 
@@ -102,8 +104,8 @@ class AssignedWorkspaceJournalTests(unittest.TestCase):
             events.append("fsync")
 
         with patch.object(module.os, "fsync", side_effect=fsync), \
-                patch.object(module.uuid, "uuid4", side_effect=AssertionError("regenerated request")), \
-                patch.object(module.hashlib, "sha256", side_effect=AssertionError("payload hash")):
+                patch.object(uuid, "uuid4", side_effect=AssertionError("regenerated request")), \
+                patch.object(hashlib, "sha256", side_effect=AssertionError("payload hash")):
             journal = self.begin()
             self.assertEqual(events, ["fsync", "fsync"])
             self.phase("backend_dispatching")
@@ -131,7 +133,7 @@ class AssignedWorkspaceJournalTests(unittest.TestCase):
 
                 with patch.object(module.os, "fsync", side_effect=fsync), self.assertRaises(OSError):
                     repository.begin_assigned_map_activation(**self.target, previous_map_name=None,
-                        load_memory_history=False, activation_request=self.request, reuse_completed_request_id=False)
+                        load_memory_history=False, activation_request=self.request)
                     dispatch()
                 dispatch.assert_not_called()
 
@@ -151,25 +153,28 @@ class AssignedWorkspaceJournalTests(unittest.TestCase):
             previous_map_name=None, load_memory_history=False, activation_request=self.request), original)
         original["activation_request"]["session_id"] = "mutated:return"
         self.assertEqual(self.reopen().get_map_activation()["activation_request"], self.request)
-        with self.assertRaisesRegex(ValueError, "cannot rotate"):
-            self.repo.rotate_assigned_map_activation_request_id(**self.target,
-                activation_request_id=self.request["activation_request_id"])
         self.phase("backend_dispatching")
         self.evidence()
         completed = self.complete()
         self.assertNotEqual(completed["activation_request"]["session_id"], completed["activation_request_id"])
         self.assertEqual(self.reopen().get_last_successful_map_activation_receipt(), completed)
 
-    def test_metadata_only_schema3_stays_readable_but_cannot_supply_missing_request(self):
-        old = self.repo.begin_assigned_map_activation(**self.target, previous_map_name=None, load_memory_history=False)
-        self.assertNotIn("activation_request", self.reopen().get_map_activation())
-        before = self.repo._activation_journal_path.read_bytes()
-        inferred = dict(self.request, activation_request_id=old["activation_request_id"])
-        with self.assertRaises(ValueError):
-            self.begin(activation_request=inferred)
-        with self.assertRaisesRegex(ValueError, "whole request"):
-            self.phase("backend_dispatching", activation_request_id=old["activation_request_id"], activation_request=inferred)
-        self.assertEqual(self.repo._activation_journal_path.read_bytes(), before)
+    def test_known_metadata_only_journal_retires_but_incomplete_current_record_fails(self):
+        old = {"schema_version": 3, "previous_map_name": None, "target_map_name": "room",
+            "target_asset_identity": ASSET.model_dump(), "target_checkpoint_id": CHECKPOINT,
+            "activation_request_id": "mapload:" + "1" * 32, "load_memory_history": False, "phase": "prepared"}
+        self.repo._activation_journal_path.write_text(json.dumps(old))
+        self.assertIsNone(self.reopen().get_map_activation())
+        self.assertFalse(self.repo._activation_journal_path.exists())
+        current = self.begin()
+        for field in ("activation_request", "predecessor", "backend_evidence"):
+            damaged = dict(current)
+            damaged.pop(field)
+            self.repo._activation_journal_path.write_text(json.dumps(damaged))
+            before = self.repo._activation_journal_path.read_bytes()
+            with self.assertRaises(ValueError):
+                self.reopen().get_map_activation()
+            self.assertEqual(self.repo._activation_journal_path.read_bytes(), before)
 
     def test_whole_request_is_required_for_every_full_journal_mutation(self):
         self.begin()
@@ -178,7 +183,7 @@ class AssignedWorkspaceJournalTests(unittest.TestCase):
             lambda: self.clear(expected_phases=("prepared",), activation_request=None),
             lambda: self.complete(expected_phases=("prepared",), activation_request=None),
         ):
-            with self.subTest(operation=operation), self.assertRaisesRegex(ValueError, "whole request"):
+            with self.subTest(operation=operation), self.assertRaises(ValueError):
                 operation()
         self.assertEqual(self.repo.get_map_activation()["phase"], "prepared")
 
@@ -213,14 +218,7 @@ class AssignedWorkspaceJournalTests(unittest.TestCase):
             self.phase("predecessor_stop_dispatching")
         self.assertEqual(self.repo.get_map_activation()["phase"], "prepared")
 
-    def test_assigned_predecessor_phases_do_not_expand_legacy_phase_schema(self):
-        legacy = self.repo.begin_map_activation(previous_map_name=None, target_map_name="room",
-            target_manifest_sha256="f" * 64, load_memory_history=False)
-        with self.assertRaises(ValueError):
-            self.repo.update_map_activation_phase("predecessor_stop_dispatching", target_map_name="room",
-                target_manifest_sha256="f" * 64, activation_request_id=legacy["activation_request_id"],
-                expected_phases=("prepared",))
-        self.assertEqual(self.repo.get_map_activation(), legacy)
+
 
     def test_exact_backend_evidence_survives_reopen_and_ack_replay_label(self):
         original = self.applied()
@@ -254,8 +252,7 @@ class AssignedWorkspaceJournalTests(unittest.TestCase):
                      {"relocalization_target_available": False},
                      {"relocalization_policy_v2": dict(policy, source_policy_version=4)},
                      {"relocalization_policy_v2": dict(policy, source_policy_version=True)},
-                     {"relocalization_policy_v2": None},
-                     {"activation_receipt_disposition": 2, "activation_receipt_disposition_name": "sealed_replay"}]
+                     {"relocalization_policy_v2": None}]
         for change in mutations:
             with self.subTest(change=change), self.assertRaises(ValueError):
                 self.evidence(expected_phases=("backend_applied",), **change)

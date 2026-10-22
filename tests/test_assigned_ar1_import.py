@@ -11,6 +11,7 @@ from tests.conftest import response_fixture
 from services.geometry import geometry_runtime_provider as provider
 from services.geometry import runtime as runtime_module
 from services.mapping import asset_store
+from contracts.geometry_runtime import PlatformGeometryConfig
 
 
 class AssignedAr1ImportTests(unittest.TestCase):
@@ -19,8 +20,6 @@ class AssignedAr1ImportTests(unittest.TestCase):
         self.fixture = legacy.LegacyCloudImportTests()
         self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
-        self.fixture.guard.enter_context(patch.object(provider, 'payload_digest',
-            side_effect=AssertionError('provider content hash prohibited')))
 
     def source(self, version=1, *, dense=True):
         f = self.fixture
@@ -31,7 +30,7 @@ class AssignedAr1ImportTests(unittest.TestCase):
 
     def connect(self, versions=(1, 2, 3), *, client=None, absent=False):
         stub = LoaderStub(response_fixture())
-        status = (SimpleNamespace(phase='READY', rss_kb=0) if absent else
+        status = (provider.pb2.RuntimeStatus(phase='READY') if absent else
             provider.pb2.RuntimeStatus(phase='READY', supported_assigned_fine_archive_versions=versions))
         stub.GetStatus = Mock(return_value=status)
         if client is None:
@@ -44,13 +43,10 @@ class AssignedAr1ImportTests(unittest.TestCase):
         return client, stub
 
     def runtime(self, client):
-        value = object.__new__(runtime_module.PlatformGeometryRuntime)
-        value._runtime_state_lock = threading.RLock()
-        value._mapping_lifecycle_lock = threading.RLock()
-        value._provider_attach_lock = threading.RLock()
+        value = runtime_module.PlatformGeometryRuntime(config=PlatformGeometryConfig(),
+            catalog_root=str(self.fixture.root), robot=SimpleNamespace(providers=SimpleNamespace()))
         value._remote_provider = client
         value._provider_attach_epoch = 1
-        value._provider_attach_stopping = False
         return value
 
     def workspace(self, client):
@@ -113,7 +109,6 @@ class AssignedAr1ImportTests(unittest.TestCase):
         transmitted = b''.join(bytes(request.data) for request in stub.requests
                                if request.action == 2 and request.artifact.id == fine_id)
         self.assertEqual(transmitted, payload)
-        self.assertEqual(stub.last_request.mapping_backend_checkpoint.fine_map_artifact.sha256, b'')
         self.assertEqual(inventory(self.fixture.current), before)
         self.assertEqual(stub.GetStatus.call_count, 1)
 
@@ -123,8 +118,9 @@ class AssignedAr1ImportTests(unittest.TestCase):
         client = None
         for versions, absent in (((), True), ((), False), ((99,), False), ((2, 3), False)):
             client, _ = self.connect(versions, client=client, absent=absent)
+            workspace = self.workspace(client)
             with patch.object(asset_store.uuid, 'uuid4', side_effect=AssertionError('unsupported allocation')):
-                self.assertIsNone(self.imported(client))
+                self.assertIsNone(workspace._import_legacy_cloud_for_activation('map'))
             self.assertEqual(self.fixture.catalog.get_map_asset('map').identity_schema_version, 1)
             self.assertEqual(list(self.fixture.repository._map_dir('map').glob('assigned-id-*')), [])
             self.assertEqual(inventory(self.fixture.current), before)

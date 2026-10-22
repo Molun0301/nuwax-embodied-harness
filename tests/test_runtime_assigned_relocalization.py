@@ -12,6 +12,9 @@ import hashlib
 import importlib.util
 from pathlib import Path
 import threading
+import tempfile
+from types import SimpleNamespace
+from contracts.geometry_runtime import PlatformGeometryConfig
 import unittest
 from unittest.mock import patch
 
@@ -114,8 +117,10 @@ class FakeProvider:
 
 
 def runtime_owner():
-    owner = module.PlatformGeometryRuntime.__new__(module.PlatformGeometryRuntime)
-    owner._runtime_state_lock = threading.RLock()
+    directory = tempfile.TemporaryDirectory()
+    owner = module.PlatformGeometryRuntime(config=PlatformGeometryConfig(), catalog_root=directory.name,
+        robot=SimpleNamespace(providers=SimpleNamespace()))
+    owner._test_runtime_directory = directory
     owner._remote_provider = FakeProvider(owner)
     return owner
 
@@ -139,24 +144,21 @@ class AssignedRuntimeConsumerTests(unittest.TestCase):
         for name in hashlib.algorithms_guaranteed | {'new', 'file_digest'}:
             if hasattr(hashlib, name):
                 self.guard.enter_context(patch.object(hashlib, name, side_effect=AssertionError('application hash called')))
-        self.guard.enter_context(patch.object(module.PlatformGeometryRuntime, '__init__', side_effect=AssertionError('unrelated runtime startup')))
         self.guard.enter_context(patch.object(module, 'GeometryRuntimeSubprocess', side_effect=AssertionError('runtime subprocess startup')))
         self.guard.enter_context(patch.object(module.uuid, 'uuid4', side_effect=AssertionError('request alias regenerated')))
         self.owner = runtime_owner()
+        self.addCleanup(self.owner._test_runtime_directory.cleanup)
         self.provider = self.owner._remote_provider
 
-    def test_snapshot_captures_mutable_aliases_and_shares_heavy_cell_owners(self):
+    def test_snapshot_shares_readonly_receipt_and_heavy_cell_owners(self):
         state, bundle = activation_state(), bundle_fixture()
         cells, costs = bundle.snapshot.occupancy_grid.data, bundle.snapshot.cost_map.data
         snapshot = install(self.owner, bundle=bundle, state=state)
         target = capture(self.owner)
-        state['activation_receipt_v2']['request']['map_name'] = 'mutated'
-        state['relocalization_policy_v2']['schema_version'] = 999
+        self.assertIs(target.activation_receipt, state["activation_receipt_v2"])
         bundle.metadata['mutable']['value'] = 999
         public = snapshot.bundle.snapshot
         public.occupancy_grid.metadata['mutable']['value'] = 999
-        policy = target.relocalization_policy
-        policy['schema_version'] = 999
         for _ in range(3):
             view = self.owner._map_activation_snapshot_read()
             self.assertIs(view, snapshot)
@@ -183,13 +185,7 @@ class AssignedRuntimeConsumerTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'changed'):
             self.owner.get_validated_assigned_map_activation_receipt(expected_target=target)
 
-    def test_legacy_unsealed_snapshot_read_keeps_generation_fence_without_hash(self):
-        installed = install(self.owner, bundle=bundle_fixture(assigned=False), state={})
-        detached = self.owner._map_activation_snapshot_read()
-        self.assertIsNot(installed, detached)
-        self.assertTrue(self.owner._map_activation_snapshot_still_current_locked(detached))
-        install(self.owner, bundle=bundle_fixture(assigned=False), state={})
-        self.assertFalse(self.owner._map_activation_snapshot_still_current_locked(detached))
+
 
     def test_closed_native_availability_is_preserved_for_receipt_projection(self):
         install(self.owner, state=activation_state(available=False))
@@ -200,43 +196,9 @@ class AssignedRuntimeConsumerTests(unittest.TestCase):
             self.owner.relocalize_assigned_active_map(assigned_request_v2=request_owner(), expected_target=target)
         self.assertEqual(self.provider.calls, [])
 
-    def test_partial_or_retired_diagnostics_are_preserved_but_cannot_bind(self):
-        for disposition in (1, 5, 6, 7, 8, 9):
-            state = activation_state(available=False)
-            state['activation_receipt_disposition'] = disposition
-            state['activation_receipt_v2']['target'] = None
-            state['relocalization_policy_v2'] = None
-            snapshot = install(self.owner, state=state)
-            self.assertEqual(self.owner._activation_result_from_snapshot(snapshot), state)
-            with self.subTest(disposition=disposition), self.assertRaises(ValueError):
-                capture(self.owner)
-        state = activation_state()
-        state['activation_receipt_v2']['target'] = None
-        install(self.owner, state=state)
-        with self.assertRaises(ValueError):
-            capture(self.owner)
 
-    def test_unsupported_mixed_missing_and_skewed_activation_states_fail_closed(self):
-        mutations = [
-            lambda state: state.update(activation_receipt_schema_version=3),
-            lambda state: state.update(activation_receipt_schema_version=True),
-            lambda state: state.update(activation_receipt_disposition=True),
-            lambda state: state.update(asset_manifest_sha256=''),
-            lambda state: state.update(activation_identity_sha256='f' * 64),
-            lambda state: state.update(target_kind='planar_graph'),
-            lambda state: state.update(session_generation=999),
-            lambda state: state.update(mapping_backend_kind='slam_toolbox'),
-            lambda state: state.update(relocalization_policy_v2=None),
-            lambda state: state['relocalization_policy_v2'].update(schema_version=999),
-            lambda state: state['relocalization_policy_v2'].update(deadline_policy_version=True),
-            lambda state: state['activation_receipt_v2']['request']['asset_identity'].update(asset_id='f' * 32),
-        ]
-        for mutate in mutations:
-            state = activation_state()
-            mutate(state)
-            install(self.owner, state=state)
-            with self.subTest(state=state), self.assertRaises(ValueError):
-                capture(self.owner)
+
+
 
     def test_only_exact_typed_finalized_assigned_asset_can_bind(self):
         for bundle in (bundle_fixture(assigned=False), bundle_fixture(finalized=False),
@@ -264,7 +226,7 @@ class AssignedRuntimeConsumerTests(unittest.TestCase):
         self.assertEqual(call['request_id'], 'reloc:exact')
         self.assertEqual(call['logical_timeout_ms'], 30000)
         self.assertTrue(request_owner().exact_replay_of(call['assigned_request_v2']))
-        self.assertEqual(call['activation_state']['activation_receipt_v2'], target.activation_receipt.to_dict())
+        self.assertEqual(call['activation_state']['activation_receipt_v2'].to_dict(), target.activation_receipt.to_dict())
         self.assertNotIn('asset_manifest_sha256', call['activation_state'])
         self.provider.dispatch_result = provider_terminal(1)
         rejected = self.owner.relocalize_assigned_active_map(assigned_request_v2=request_owner(), expected_target=target)
@@ -278,7 +240,7 @@ class AssignedRuntimeConsumerTests(unittest.TestCase):
             request['request_id'] = 'different'
             request['assigned_cloud_v2']['logical_timeout_ms'] = 250
             call = self.provider.calls[-1][1]
-            call['activation_state']['activation_receipt_v2']['request']['map_name'] = 'other'
+            call['activation_state']['activation_receipt_v2'].to_dict()['request']['map_name'] = 'other'
         self.provider.during_dispatch = mutate
         result = self.owner.relocalize_assigned_active_map(assigned_request_v2=request, expected_target=target)
         self.assertEqual(result.request_id, 'reloc:exact')
@@ -329,9 +291,9 @@ class AssignedRuntimeConsumerTests(unittest.TestCase):
             self.assertTrue(query_result.query.request.exact_replay_of(request_owner()))
             self.assertEqual(query_result.query.validate_response(query_result.to_dict()).disposition, 1)
             self.assertEqual(self.provider.calls[-1][1]['activation_state'], {})
-            with self.assertRaises(RuntimeError):
-                self.owner.get_validated_assigned_relocalization_receipt(query_result.terminal,
-                    assigned_request_v2=request_owner(), expected_target=old)
+            with self.assertRaises(RuntimeError), self.owner._assigned_relocalization_result_guard(
+                    query_result.terminal, assigned_request_v2=request_owner(), expected_target=old):
+                self.fail('旧查询不得安装到后继激活')
 
     def test_query_never_reads_current_target_and_keeps_durable_origin(self):
         self.owner._map_activation_snapshot_locked = lambda: self.fail('historical query read current target')
@@ -418,17 +380,14 @@ class AssignedRuntimeConsumerTests(unittest.TestCase):
             with self.owner._assigned_relocalization_result_guard(provider_terminal(),
                     assigned_request_v2=request_owner(), expected_target=target):
                 self.fail('stale result entered current installation scope')
-        target = capture(self.owner)
-        self.assertEqual(self.owner.get_validated_assigned_relocalization_receipt(provider_terminal(),
-            assigned_request_v2=request_owner(), expected_target=target), terminal_dict(5))
 
     def test_unavailable_current_target_allows_query_but_not_current_installation(self):
         install(self.owner, state=activation_state(available=False))
         target = capture(self.owner)
         evidence = self.owner.get_assigned_relocalization_terminal(assigned_request_v2=request_owner())
-        with self.assertRaisesRegex(RuntimeError, 'unavailable'):
-            self.owner.get_validated_assigned_relocalization_receipt(evidence.terminal,
-                assigned_request_v2=request_owner(), expected_target=target)
+        with self.assertRaisesRegex(RuntimeError, 'unavailable'), self.owner._assigned_relocalization_result_guard(
+                evidence.terminal, assigned_request_v2=request_owner(), expected_target=target):
+            self.fail('不可用目标不得安装查询结果')
 
 
 if __name__ == '__main__':

@@ -26,13 +26,16 @@ mod navigation_block_unit_transport_tests {
             .collect();
         let mut request = cloud_activation_request(xyz);
         request
-            .checkpoint
-            .as_mut()
+            .mapping_backend_checkpoint.as_mut().unwrap().canonical_occupancy_checkpoint.as_mut()
             .unwrap()
             .meta
             .as_mut()
             .unwrap()
             .timestamp_ns = SOURCE_NS;
+        let checkpoint=request.mapping_backend_checkpoint.as_mut().unwrap();
+        checkpoint.occupancy_receipt.as_mut().unwrap().source_timestamp_ns=SOURCE_NS;
+        checkpoint.cloud_receipt.as_mut().unwrap().source_timestamp_ns=SOURCE_NS;
+        request.mapping_backend_checkpoint=Some(assemble_mapping_checkpoint_export(request.mapping_backend_checkpoint.take().unwrap()).unwrap());
         let activated = GeometryRuntime::activate_map(&fixture.service, Request::new(request))
             .await
             .expect("explicit in-process cloud activation")

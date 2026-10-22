@@ -42,34 +42,24 @@ impl Store {
     fn collect(&mut self) { self.entries.retain(|_, e| e.touched.elapsed() < Duration::from_secs(600)); }
     pub(crate) fn validate_reference(reference: &GraphArtifactRef) -> Result<(), String> {
         if reference.size == 0 || reference.size > crate::dense_cloud::MAX_ARCHIVE_BYTES { return Err("制品大小非法".into()); }
-        match reference.identity_schema_version {
-            0 | 1 => {
-                if reference.id.is_empty() || reference.id.len() > 128 || reference.sha256.len() != 32
-                    || reference.sha256.iter().all(|v| *v == 0) || reference.member_identity.is_some() { return Err("旧制品身份或混合代际非法".into()); }
-            }
-            2 => {
-                if !assigned_id(&reference.id) || !reference.sha256.is_empty() { return Err("制品新身份混入旧摘要或格式非法".into()); }
-                let member = reference.member_identity.as_ref().ok_or("制品缺少成员身份")?;
-                validate_member_identity(member)?;
-                if !matches!(CheckpointMemberRole::try_from(member.role), Ok(CheckpointMemberRole::FineMap | CheckpointMemberRole::DenseCloud | CheckpointMemberRole::PlanarGraph)) { return Err("可传输制品角色非法".into()); }
-                if member.role == CheckpointMemberRole::FineMap as i32 && reference.size > nuwax_map_chunks::MAX_ARCHIVE_BYTES { return Err("精细制品超过容量".into()); }
-            }
-            _ => return Err("不支持的制品身份代际".into()),
+        if reference.identity_schema_version != 2 || !assigned_id(&reference.id) {
+            return Err("制品编号身份或代际非法".into());
+        }
+        let member = reference.member_identity.as_ref().ok_or("制品缺少成员身份")?;
+        validate_member_identity(member)?;
+        if !matches!(CheckpointMemberRole::try_from(member.role), Ok(CheckpointMemberRole::FineMap | CheckpointMemberRole::DenseCloud | CheckpointMemberRole::PlanarGraph)) {
+            return Err("可传输制品角色非法".into());
+        }
+        if member.role == CheckpointMemberRole::FineMap as i32 && reference.size > nuwax_map_chunks::MAX_ARCHIVE_BYTES {
+            return Err("精细制品超过容量".into());
         }
         Ok(())
     }
     /// Legacy-only producer adapter. Never use to wrap an AR2/AR3/AR4/AR5 archive.
-    pub fn insert_legacy(&mut self, mut file: File, size: u64, sha: [u8; 32]) -> Result<GraphArtifactRef, String> {
-        file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
-        let mut magic = [0; 8]; file.read_exact(&mut magic).map_err(|e| e.to_string())?;
-        if matches!(&magic, b"NUWAXAR2" | b"NUWAXAR3" | b"NUWAXAR4" | b"NUWAXAR5" | b"NWS2D002") { return Err("AR2/AR3/AR4/AR5/NWS2D002编号档案不能包装为旧摘要制品".into()); }
-        file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
-        if crate::dense_cloud::hash_reader(&mut file)? != (size, sha) { return Err("旧制品导入摘要变化".into()); }
-        self.admit_file(file, GraphArtifactRef { id: uuid::Uuid::new_v4().simple().to_string(), size, sha256: sha.to_vec(), ..Default::default() })
-    }
+
     /// Takes ownership of the already frozen creator file; no identity hash/copy/full-body scan.
     pub fn insert(&mut self, mut file: File, size: u64, member: CheckpointMemberIdentity) -> Result<GraphArtifactRef, String> {
-        let reference = GraphArtifactRef { id: uuid::Uuid::new_v4().simple().to_string(), size, sha256: Vec::new(), identity_schema_version: 2, member_identity: Some(member) };
+        let reference = GraphArtifactRef { id: uuid::Uuid::new_v4().simple().to_string(), size,  identity_schema_version: 2, member_identity: Some(member) };
         Self::validate_reference(&reference)?;
         Self::validate_archive_binding(&mut file, &reference, false)?;
         self.admit_file(file, reference)
@@ -194,10 +184,6 @@ impl Store {
                     // Format dispatch precedes every legacy operation: no assigned fine archive hash bridge.
                     Self::validate_archive_binding(&mut e.file, &r, true)?;
                     #[cfg(test)] { e.validation_runs += 1; }
-                    if r.identity_schema_version != 2 {
-                        e.file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
-                        if crate::dense_cloud::hash_reader(&mut e.file)? != (r.size, r.sha256.as_slice().try_into().unwrap()) { return Err("旧上传完整摘要不匹配".into()); }
-                    }
                     e.file.sync_all().map_err(|e| e.to_string())?; e.sealed = true;
                 }
             }
@@ -244,10 +230,10 @@ mod assigned_identity_tests {
         GraphArtifactTransferResponse::decode(response.encode_to_vec().as_slice()).map_err(|e|e.to_string())
     }
     fn bytes(mut file:File)->Vec<u8>{file.seek(SeekFrom::Start(0)).unwrap();let mut bytes=Vec::new();file.read_to_end(&mut bytes).unwrap();bytes}
-    fn reference(size:u64,role:CheckpointMemberRole)->GraphArtifactRef{GraphArtifactRef{id:"22222222222222222222222222222222".into(),size,sha256:Vec::new(),identity_schema_version:2,member_identity:Some(member(role))}}
+    fn reference(size:u64,role:CheckpointMemberRole)->GraphArtifactRef{GraphArtifactRef{id:"22222222222222222222222222222222".into(),size,identity_schema_version:2,member_identity:Some(member(role))}}
     #[test]
     fn assigned_v2_store_dense_exact_retry_descriptor_overlap_seal_and_release() {
-        crate::dense_cloud::FORBID_ARCHIVE_HASH.with(|v|v.set(true));
+
         let (file,size)=dense();let source=bytes(file);let r=reference(size,CheckpointMemberRole::DenseCloud);let mut store=Store::default();
         assert_eq!(request(&mut store,&r,1,0,&[]).unwrap().offset,0);request(&mut store,&r,1,0,&[]).unwrap();
         let mut changed=r.clone();changed.member_identity.as_mut().unwrap().checkpoint_id="3".repeat(32);
@@ -262,7 +248,7 @@ mod assigned_identity_tests {
     }
     #[test]
     fn assigned_v2_store_fine_ar4_source_binding_and_unknown_format() {
-        crate::dense_cloud::FORBID_ARCHIVE_HASH.with(|v|v.set(true));
+
         let (file,size)=fine();let source=bytes(file);assert_eq!(&source[..8],b"NUWAXAR4");
         for field in 0..6 {
             let mut r=reference(size,CheckpointMemberRole::FineMap);let m=r.member_identity.as_mut().unwrap();
@@ -276,7 +262,7 @@ mod assigned_identity_tests {
     }
     #[test]
     fn assigned_v2_store_ar4_layers_keep_identity_and_reject_legacy_envelopes() {
-        crate::dense_cloud::FORBID_ARCHIVE_HASH.with(|v|v.set(true));
+
         let repo=nuwax_map_chunks::Repository::temporary().unwrap();
         let mut writer=nuwax_map_chunks::Writer::new(repo.clone(),0.125,4*1024*1024).unwrap();
         writer.observe([[0,0,0]],100).unwrap();
@@ -305,14 +291,12 @@ mod assigned_identity_tests {
         let inserted=store.insert(file,size,member(CheckpointMemberRole::FineMap)).unwrap();
         assert_eq!(inserted.identity_schema_version,2);
         let(file,size)=nuwax_map_chunks::archive_file(&root,&repo).unwrap();
-        assert!(store.insert_legacy(file,size,[9;32]).unwrap_err().contains("AR4"));
-        let legacy=GraphArtifactRef {id:"legacy-ar4".into(),size,sha256:vec![9;32],..Default::default()};
-        request(&mut store,&legacy,1,0,&[]).unwrap();request(&mut store,&legacy,2,0,&source).unwrap();
-        assert!(request(&mut store,&legacy,3,0,&[]).unwrap_err().contains("AR4"));
+        let legacy=GraphArtifactRef {id:"legacy-ar4".into(),size,..Default::default()};
+        assert!(request(&mut store,&legacy,1,0,&[]).is_err());
     }
     #[test]
     fn assigned_v2_store_ar5_heightfield_uses_original_identity_and_transfer() {
-        crate::dense_cloud::FORBID_ARCHIVE_HASH.with(|v|v.set(true));
+
         let repo=nuwax_map_chunks::Repository::temporary().unwrap();
         let mut writer=nuwax_map_chunks::Writer::new(repo.clone(),0.05,4*1024*1024).unwrap();
         writer.observe([[0,0,0],[0,0,32]],100).unwrap();
@@ -334,14 +318,12 @@ mod assigned_identity_tests {
         restored.restore_archived(&imported).unwrap();
         assert_eq!(restored.ground_column([0,0]).unwrap().heightfields[0].column,field);
         let(file,size)=nuwax_map_chunks::archive_file(&root,&repo).unwrap();
-        assert!(store.insert_legacy(file,size,[9;32]).unwrap_err().contains("AR5"));
-        let legacy=GraphArtifactRef {id:"legacy-ar5".into(),size,sha256:vec![9;32],..Default::default()};
-        request(&mut store,&legacy,1,0,&[]).unwrap();request(&mut store,&legacy,2,0,&source).unwrap();
-        assert!(request(&mut store,&legacy,3,0,&[]).unwrap_err().contains("AR5"));
+        let legacy=GraphArtifactRef {id:"legacy-ar5".into(),size,..Default::default()};
+        assert!(request(&mut store,&legacy,1,0,&[]).is_err());
     }
     #[test]
     fn assigned_v2_store_still_reads_ar2_ar3_without_source_claims() {
-        crate::dense_cloud::FORBID_ARCHIVE_HASH.with(|v|v.set(true));
+
         let repo=nuwax_map_chunks::Repository::temporary().unwrap();
         let mut writer=nuwax_map_chunks::Writer::new(repo.clone(),0.05,4*1024*1024).unwrap();
         writer.observe([[0,0,0]],100).unwrap();
@@ -357,19 +339,19 @@ mod assigned_identity_tests {
     }
     #[test]
     fn assigned_v2_store_mixed_fields_limits_truncation_and_finite_geometry() {
-        crate::dense_cloud::FORBID_ARCHIVE_HASH.with(|v|v.set(true));
+
         let(file,size)=dense();let source=bytes(file);let good=reference(size,CheckpointMemberRole::DenseCloud);
-        for mutation in 0..7 {let mut bad=good.clone();match mutation {0=>bad.sha256=vec![9;32],1=>bad.identity_schema_version=3,2=>bad.id="A".repeat(32),3=>bad.member_identity=None,4=>bad.size=0,5=>bad.member_identity.as_mut().unwrap().role=99,_=>bad.member_identity.as_mut().unwrap().frame_generation=1}assert!(Store::validate_reference(&bad).is_err());}
+        for mutation in 1..7 {let mut bad=good.clone();match mutation {1=>bad.identity_schema_version=3,2=>bad.id="A".repeat(32),3=>bad.member_identity=None,4=>bad.size=0,5=>bad.member_identity.as_mut().unwrap().role=99,_=>bad.member_identity.as_mut().unwrap().frame_generation=1}assert!(Store::validate_reference(&bad).is_err());}
         let mut nan=source.clone();let n=nan.len();nan[n-4..].copy_from_slice(&f32::NAN.to_le_bytes());let mut store=Store::default();request(&mut store,&good,1,0,&[]).unwrap();
         assert!(request(&mut store,&good,2,1,&source[..20]).is_err());assert!(request(&mut store,&good,2,0,&vec![0;archive::CHUNK_BYTES+1]).is_err());
         request(&mut store,&good,2,0,&nan).unwrap();assert!(request(&mut store,&good,3,0,&[]).is_err());assert!(request(&mut store,&good,4,0,&[]).is_err());
     }
     #[test]
     fn assigned_v2_store_rejects_ar4_legacy_bridge_before_hash_and_corrupt_block() {
-        crate::dense_cloud::FORBID_ARCHIVE_HASH.with(|v|v.set(true));let(file,size)=fine();let source=bytes(file);
-        let legacy=GraphArtifactRef{id:"legacy-upload".into(),size,sha256:vec![9;32],..Default::default()};let mut store=Store::default();
-        request(&mut store,&legacy,1,0,&[]).unwrap();request(&mut store,&legacy,2,0,&source).unwrap();assert!(request(&mut store,&legacy,3,0,&[]).unwrap_err().contains("AR4"));
-        let(file,size)=fine();assert!(store.insert_legacy(file,size,[9;32]).unwrap_err().contains("AR4"));
+        let(file,size)=fine();let source=bytes(file);
+        let legacy=GraphArtifactRef{id:"legacy-upload".into(),size,..Default::default()};let mut store=Store::default();
+        assert!(request(&mut store,&legacy,1,0,&[]).is_err());
+        let(_file,size)=fine();
         let r=reference(size,CheckpointMemberRole::FineMap);let mut store=Store::default();let mut corrupt=source;let n=corrupt.len();corrupt[n-2..].fill(0);
         request(&mut store,&r,1,0,&[]).unwrap();request(&mut store,&r,2,0,&corrupt).unwrap();assert!(request(&mut store,&r,3,0,&[]).is_err());
         let(file,size)=dense();let source=bytes(file);let mut r=reference(size,CheckpointMemberRole::DenseCloud);r.member_identity.as_mut().unwrap().frame_id="odom".into();let mut store=Store::default();
@@ -377,7 +359,7 @@ mod assigned_identity_tests {
     }
     #[test]
     fn assigned_v2_store_rejects_one_fine_object_id_with_different_archive_bodies() {
-        crate::dense_cloud::FORBID_ARCHIVE_HASH.with(|v|v.set(true));let(file,_)=fine();let reader=nuwax_map_chunks::ArchiveReader::open(file).unwrap();
+        let(file,_)=fine();let reader=nuwax_map_chunks::ArchiveReader::open(file).unwrap();
         let nuwax_map_chunks::ArchivedRoot::Current(mut root)=reader.root().clone()else{panic!("AR4 expected")};let mut second=root.blocks[0].clone();second.key=[1,0,0];root.blocks.push(second);
         let root_bytes=root.encode().unwrap();let blocks=[100,99].map(|observed_ns|nuwax_map_chunks::encode_block(&nuwax_map_chunks::Block::from([(0,nuwax_map_chunks::Evidence{observed_ns,hits:1})])).unwrap());
         let mut bytes=b"NUWAXAR4".to_vec();bytes.extend_from_slice(&(root_bytes.len()as u64).to_le_bytes());bytes.extend_from_slice(&root_bytes);bytes.extend_from_slice(&2_u64.to_le_bytes());
@@ -386,7 +368,7 @@ mod assigned_identity_tests {
     }
     #[test]
     fn assigned_v2_store_accepts_ar1_source_without_reinterpreting_legacy_aliases() {
-        crate::dense_cloud::FORBID_ARCHIVE_HASH.with(|v|v.set(true));
+
         let root=nuwax_map_chunks::LegacyManifest{version:1,domain:nuwax_map_chunks::Domain{session:"source".into(),generation:2,frame_generation:4,producer_generation:6},revision:9,source_timestamp_ns:100,voxel_size_m:0.05,
             blocks:vec![nuwax_map_chunks::LegacyBlockRef{key:[0;3],sha256:nuwax_map_chunks::LegacyAlias([7;32]),geometry_sha256:nuwax_map_chunks::LegacyAlias([8;32]),points:1}]};
         let json=serde_json::to_vec(&root).unwrap();let block=nuwax_map_chunks::encode_block(&nuwax_map_chunks::Block::from([(0,nuwax_map_chunks::Evidence{observed_ns:100,hits:1})])).unwrap();
@@ -396,7 +378,7 @@ mod assigned_identity_tests {
     }
     #[test]
     fn assigned_v2_store_owned_insert_and_retirement() {
-        crate::dense_cloud::FORBID_ARCHIVE_HASH.with(|v|v.set(true));let mut store=Store::default();let(file,size)=fine();let r=store.insert(file,size,member(CheckpointMemberRole::FineMap)).unwrap();assert!(assigned_id(&r.id));assert!(r.sha256.is_empty());
+        let mut store=Store::default();let(file,size)=fine();let r=store.insert(file,size,member(CheckpointMemberRole::FineMap)).unwrap();assert!(assigned_id(&r.id));
         let original=request(&mut store,&r,4,0,&[]).unwrap().data;
         for _ in 0..8{assert_eq!(request(&mut store,&r,4,0,&[]).unwrap().data,original);assert!(request(&mut store,&r,3,0,&[]).unwrap().sealed);}assert_eq!(store.entries[&r.id].validation_runs,0);
         let reader=store.open(&r).unwrap();store.entries.get_mut(&r.id).unwrap().touched=Instant::now()-Duration::from_secs(601);assert!(store.open(&r).is_err());assert_eq!(bytes(reader),original);
@@ -406,21 +388,17 @@ mod assigned_identity_tests {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum TargetIdentity {
-    Legacy([u8; 32]),
     Assigned(GraphArtifactRef),
 }
 impl TargetIdentity {
     pub fn runtime_identity(&self) -> nuwax_slam_2d_runtime::protocol::ArtifactIdentity {
         match self {
-            Self::Legacy(_) => nuwax_slam_2d_runtime::protocol::ArtifactIdentity::Legacy,
             Self::Assigned(reference) => nuwax_slam_2d_runtime::protocol::ArtifactIdentity::Assigned {
                 checkpoint_id: reference.member_identity.as_ref().expect("validated graph member").checkpoint_id.clone(),
             },
         }
     }
-    pub fn legacy_digest(&self) -> Option<[u8; 32]> {
-        match self { Self::Legacy(sha) => Some(*sha), Self::Assigned(_) => None }
-    }
+
 }
 #[derive(Debug)]
 pub(crate) struct Target {
@@ -442,27 +420,7 @@ impl Target {
         ))
         .map_err(|e| e.to_string())
     }
-    pub fn receipt(
-        &self,
-        activation: [u8; 32],
-        receipt: &crate::mapping_commit::OccupancyCommitReceipt,
-    ) -> [u8; 32] {
-        let mut data = b"nuwax.geometry.planar-target.v1\0".to_vec();
-        data.extend_from_slice(&activation);
-        data.extend_from_slice(&self.identity.legacy_digest().expect("legacy target receipt requires legacy target"));
-        data.extend_from_slice(&receipt.commit_id.boot_nonce.to_be_bytes());
-        for n in [
-            self.size,
-            receipt.commit_id.sequence,
-            receipt.session_generation,
-            receipt.occupancy_revision,
-            receipt.source_timestamp_ns,
-            receipt.backend_generation,
-        ] {
-            data.extend_from_slice(&n.to_be_bytes());
-        }
-        nuwax_codec::hash::sha256_bytes(&data)
-    }
+
 }
 
 #[cfg(test)]
@@ -495,7 +453,7 @@ pub(crate) mod planar_assigned_pair_tests {
             schema_version: 2, backend_kind: "slam_toolbox".into(), source_session_id: "source".into(), source_session_generation: 2,
             created_at_ns: 101, checkpoint_id: metadata.checkpoint_id, backend_payload_schema_version: 2,
             payload_size: bytes.len() as u64, target_kind: "planar_graph".into(), occupancy_receipt: Some(receipt), occupancy_identity: Some(occupancy),
-            graph_artifact: Some(GraphArtifactRef { id: "2".repeat(32), size: bytes.len() as u64, identity_schema_version: 2, member_identity: Some(graph), sha256: Vec::new() }),
+            graph_artifact: Some(GraphArtifactRef { id: "2".repeat(32), size: bytes.len() as u64, identity_schema_version: 2, member_identity: Some(graph), }),
             canonical_occupancy_checkpoint: Some(OccupancyGridData { meta: Some(OccupancyGridMeta { width: 3, height: 1, resolution: 0.05,
                 origin_x: 1.0, origin_y: 2.0, frame_id: "map".into(), revision: 7, timestamp_ns: 100 }), data: vec![0,100,255] }),
             ..Default::default()
@@ -509,7 +467,7 @@ pub(crate) mod planar_assigned_pair_tests {
     }
     #[test]
     fn planar_assigned_pair_seal_retry_and_reader_survive_release_without_hash() {
-        crate::dense_cloud::FORBID_ARCHIVE_HASH.with(|v|v.set(true));
+
         let (checkpoint, bytes) = fixture(); let r=checkpoint.graph_artifact.unwrap(); let mut store=Store::default();
         upload(&mut store,&r,&bytes).unwrap(); transfer(&mut store,&r,3,0,vec![]).unwrap();
         assert_eq!(store.entries[&r.id].validation_runs,1);
@@ -520,7 +478,7 @@ pub(crate) mod planar_assigned_pair_tests {
     }
     #[test]
     fn planar_assigned_pair_binds_graph_role_checkpoint_session_frame_and_source_time() {
-        crate::dense_cloud::FORBID_ARCHIVE_HASH.with(|v|v.set(true));
+
         for change in 0..6 {
             let (checkpoint, bytes)=fixture(); let mut r=checkpoint.graph_artifact.unwrap(); let m=r.member_identity.as_mut().unwrap();
             match change {0=>m.checkpoint_id="3".repeat(32),1=>m.occupancy_receipt.as_mut().unwrap().session_id="other".into(),
@@ -534,9 +492,9 @@ pub(crate) mod planar_assigned_pair_tests {
     }
     #[test]
     fn planar_assigned_pair_legacy_envelope_cannot_hash_an_assigned_archive() {
-        crate::dense_cloud::FORBID_ARCHIVE_HASH.with(|v|v.set(true));
+
         let (_,bytes)=fixture();
-        let r=GraphArtifactRef {id:"legacy".into(),size:bytes.len() as u64,sha256:vec![7;32],..Default::default()};
+        let r=GraphArtifactRef {id:"legacy".into(),size:bytes.len() as u64,..Default::default()};
         assert!(upload(&mut Store::default(),&r,&bytes).unwrap_err().contains("代际"));
     }
 }

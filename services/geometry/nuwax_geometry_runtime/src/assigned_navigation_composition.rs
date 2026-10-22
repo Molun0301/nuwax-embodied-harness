@@ -515,7 +515,7 @@ async fn run_composition(root:&Path) {
             tokio::time::sleep(Duration::from_millis(110)).await;
         }
         let checkpoint=GeometryRuntime::export_mapping_backend_checkpoint(&source.service,Request::new(
-            ExportMappingBackendCheckpointRequest {checkpoint_schema_version:2})).await.unwrap().into_inner();
+            ExportMappingBackendCheckpointRequest {})).await.unwrap().into_inner();
         let fine=checkpoint.fine_map_artifact.as_ref().unwrap();
         let dense=checkpoint.dense_cloud_artifact.as_ref().unwrap();
         std::fs::write(root.join("canonical-target.xyz-f32-le"), &checkpoint.canonical_cloud_checkpoint.as_ref().unwrap().xyz_f32_le).unwrap();

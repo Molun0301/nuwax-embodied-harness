@@ -3,19 +3,17 @@
 use super::*;
 use std::io::{Seek, SeekFrom, Write};
 
-struct NoHash(bool, bool);
+struct NoHash(bool);
 impl NoHash {
     fn enter() -> Self {
         Self(
             crate::map_checksum::FORBID_HASH.with(|flag| flag.replace(true)),
-            crate::dense_cloud::FORBID_ARCHIVE_HASH.with(|flag| flag.replace(true)),
         )
     }
 }
 impl Drop for NoHash {
     fn drop(&mut self) {
         crate::map_checksum::FORBID_HASH.with(|flag| flag.set(self.0));
-        crate::dense_cloud::FORBID_ARCHIVE_HASH.with(|flag| flag.set(self.1));
     }
 }
 fn source(known: bool) -> PreparedFineCloud {

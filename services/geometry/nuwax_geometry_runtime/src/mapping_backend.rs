@@ -1410,44 +1410,6 @@ impl RaytracingKernel {
         Ok(())
     }
 
-    fn validate_retained_state_bound(&self) -> Result<(), String> {
-        let inv = 1.0_f32 / self.config.voxel_size;
-        let mut new_voxels = std::collections::HashSet::new();
-        let points = self
-            .prepared_update
-            .as_ref()
-            .map(|prepared| prepared.points())
-            .unwrap_or(&[]);
-        for point in points {
-            let key = (
-                (point.0 * inv).floor() as i32,
-                (point.1 * inv).floor() as i32,
-                (point.2 * inv).floor() as i32,
-            );
-            if !self.map.voxels.contains_key(&key) {
-                new_voxels.insert(key);
-            }
-        }
-        let retained = self
-            .map
-            .voxels
-            .len()
-            .checked_add(new_voxels.len())
-            .ok_or_else(|| {
-                "RAYTRACING_UPDATE_REJECTED: retained voxel count overflowed".to_owned()
-            })?;
-        let max_voxels = (MAX_MAPPING_BACKEND_CHECKPOINT_BYTES
-            - MAPPING_BACKEND_RAY_HEADER_BYTES
-            - VOXEL_MAP_CHECKPOINT_HEADER_BYTES)
-            / VOXEL_MAP_CHECKPOINT_ENTRY_BYTES;
-        if retained > max_voxels {
-            return Err(format!(
-                "RAYTRACING_UPDATE_REJECTED: retained ray state cannot fit in the {MAX_MAPPING_BACKEND_CHECKPOINT_BYTES}-byte checkpoint budget"
-            ));
-        }
-        Ok(())
-    }
-
     fn validate_checkpoint_budget(&self) -> Result<(), String> {
         // 已拥有的栅格由构图或检查点解码验证；预算只需精确长度，不再逐格检查旧内容。
         let occupancy_len = self
@@ -2128,7 +2090,6 @@ pub(crate) fn flush_candidate(
         }
         MappingKernel::Raytracing(ray) => {
             if !ray.dirty_since_candidate {
-                ray.validate_checkpoint_budget()?;
                 return Ok(None);
             }
             let live = build_occupancy(input, config)?;
@@ -2136,7 +2097,6 @@ pub(crate) fn flush_candidate(
             ray.last_candidate_received_at_ns = input.received_at_ns;
             ray.last_candidate_point_count = ray.map.healthy_count();
             ray.dirty_since_candidate = false;
-            ray.validate_checkpoint_budget()?;
             (MappingBackendKind::Raytracing, live.clone(), live)
         }
     };
@@ -2238,7 +2198,6 @@ fn compute_candidate_with_parallelism(
             #[cfg(test)]
             let phase = Instant::now();
             ray.prepare_map_frame(input.sensor_origin_map, &input.registered_points_map)?;
-            ray.validate_retained_state_bound()?;
             #[cfg(test)]
             let prepare_us = phase.elapsed().as_micros();
             #[cfg(test)]
@@ -2278,7 +2237,6 @@ fn compute_candidate_with_parallelism(
                         ])
                 });
             }
-            ray.validate_checkpoint_budget()?;
             #[cfg(test)]
             if diagnostic {
                 eprintln!("PGO_RAY_PHASE frame={} points={} voxels={} prepare_us={prepare_us} update_us={update_us} dynamic_us={}", input.frame_sequence, input.registered_points_map.len(), ray.map.voxels.len(), phase.elapsed().as_micros());
@@ -2327,7 +2285,6 @@ fn compute_candidate_with_parallelism(
             ray.last_candidate_received_at_ns = input.received_at_ns;
             ray.last_candidate_point_count = point_count;
             ray.dirty_since_candidate = false;
-            ray.validate_checkpoint_budget()?;
             (live.clone(), live)
         }
     };
@@ -3111,6 +3068,69 @@ mod tests {
             .expect("ray checkpoint");
         assert!(payload.len() <= MAX_MAPPING_BACKEND_CHECKPOINT_BYTES);
         worker.stop_and_join().expect("join ray worker");
+    }
+
+    #[test]
+    fn ray_worker_exceeds_real_checkpoint_limit_and_keeps_mapping_after_export_failure() {
+        let worker = MappingBackendWorker::start(
+            MappingBackendSpec::raytracing_defaults(),
+            1,
+            compute_config(),
+        )
+        .expect("启动默认射线工作线程");
+        let client = worker.client();
+        // 92 个互不相交的水平面，每面 92×92 个有限实点；每束射线仍在默认量程内。
+        // 所有状态均由正常输入接纳及射线更新产生，不改预算、计数或检查点数据。
+        for sequence in 1..=92 {
+            let mut frame = input(sequence);
+            let height = sequence as f64 + 0.05;
+            frame.sensor_origin_map = [0.0, 0.0, height];
+            frame.registered_points_map = (0..92)
+                .flat_map(|x| (0..92).map(move |y| {
+                    Point3::new(x as f64 * 0.1 - 4.55, y as f64 * 0.1 - 4.55, height)
+                }))
+                .collect();
+            let mut frame_token = token(sequence);
+            frame_token.source_timestamp_ns = frame.source_timestamp_ns;
+            let result = client.submit(frame_token, frame).unwrap().blocking_recv().unwrap();
+            assert!(commit_completion(result).expect("合法在线帧不能被未来导出大小拒绝").is_some());
+        }
+
+        let mut skipped = input(93);
+        skipped.sensor_origin_map = [0.0, 0.0, 92.05];
+        skipped.registered_points_map = vec![Point3::new(6.05, 6.05, 92.05)];
+        skipped.source_timestamp_ns = 92_000_000_001;
+        skipped.received_at_ns = skipped.source_timestamp_ns;
+        let mut skipped_token = token(93);
+        skipped_token.source_timestamp_ns = skipped.source_timestamp_ns;
+        let completion = client.submit(skipped_token.clone(), skipped).unwrap().blocking_recv().unwrap();
+        assert!(commit_completion(completion).expect("超限后仍按节拍接纳新帧").is_none());
+        let flush = client.flush(skipped_token.clone()).unwrap().blocking_recv().unwrap();
+        assert!(commit_completion(flush).expect("超限后的脏状态仍可刷新").is_some());
+        let flush = client.flush(skipped_token).unwrap().blocking_recv().unwrap();
+        assert!(commit_completion(flush).expect("超限后的已刷新状态不被再次拒绝").is_none());
+
+        let export_error = client.export_checkpoint().unwrap().blocking_recv().unwrap()
+            .expect_err("实际检查点必须超过原 64MiB 上限");
+        assert!(export_error.contains("payload size"), "{export_error}");
+        assert!(export_error.contains(&format!("1..={MAX_MAPPING_BACKEND_CHECKPOINT_BYTES}")), "{export_error}");
+        eprintln!("真实射线超限导出: {export_error}");
+
+        let mut next = input(94);
+        next.sensor_origin_map = [0.0, 0.0, 93.05];
+        next.registered_points_map = vec![Point3::new(1.05, 1.05, 93.05)];
+        let mut next_token = token(94);
+        next_token.source_timestamp_ns = next.source_timestamp_ns;
+        let completion = client.submit(next_token, next).unwrap().blocking_recv().unwrap();
+        let candidate = commit_completion(completion).expect("导出失败后工作线程仍可推进")
+            .expect("新帧达到构图节拍");
+        assert_eq!(candidate.source_frame_sequence, 94);
+        assert_eq!(candidate.source_timestamp_ns, 94_000_000_000);
+        assert_eq!(candidate.accepted_points_map, vec![Point3::new(1.05, 1.05, 93.05)]);
+        assert!(client.export_checkpoint().unwrap().blocking_recv().unwrap().unwrap_err()
+            .contains("payload size"));
+        worker.into_stop_join_handle().expect("请求超限工作线程停止")
+            .join().expect("超限工作线程实际回收");
     }
 
     #[test]

@@ -37,7 +37,7 @@
     elements.target.replaceChildren();
     for (const floor of building()?.floors || []) {
       const option = new Option(floor.display_name + ' · ' + floor.map_name, floor.floor_id);
-      option.disabled = !floor.enabled || !floor.asset_manifest_sha256;
+      option.disabled = !floor.enabled || !floor.asset_identity;
       elements.target.append(option);
     }
     if ([...elements.target.options].some(option => option.value === selected && !option.disabled)) elements.target.value = selected;

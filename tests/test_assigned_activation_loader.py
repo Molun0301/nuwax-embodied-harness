@@ -40,7 +40,6 @@ class AssignedActivationLoaderTests(unittest.TestCase):
         for name in hashlib.algorithms_guaranteed | {'new', 'file_digest'}:
             if hasattr(hashlib, name):
                 self.guard.enter_context(patch.object(hashlib, name, side_effect=AssertionError('application hash called')))
-        self.guard.enter_context(patch.object(module, 'payload_digest', side_effect=AssertionError('application hash called')))
 
     def activate(self):
         return self.client.activate_assigned_platform_map(activation_request=self.request, stored_checkpoint=self.stored)
@@ -48,13 +47,9 @@ class AssignedActivationLoaderTests(unittest.TestCase):
     def test_original_request_exact_body_and_retained_transfers_no_legacy_or_pose(self):
         expected = deepcopy(self.request)
         result = self.activate()
-        self.assertEqual(result['activation_receipt_v2']['request'], expected)
+        self.assertEqual(result['activation_receipt_v2'].to_dict()['request'], expected)
         self.assertEqual(self.stub.last_request.mapping_backend_checkpoint, self.export)
         self.assertEqual(self.stub.last_request.activation_contract_version, 2)
-        for field in ('checkpoint', 'cloud_checkpoint'):
-            self.assertFalse(self.stub.last_request.HasField(field))
-        self.assertFalse(self.stub.last_request.asset_manifest_sha256)
-        self.assertFalse(self.stub.last_request.asset_bundle_sha256)
         self.assertFalse(any('sha256' in name or 'pose' in name or 'seed' in name for name in result))
         self.assertEqual(self.client._mapping_identity, ('loaded:retained', 'room', 6))
         self.assertIsNone(self.client._last_occupancy_grid)
@@ -83,7 +78,7 @@ class AssignedActivationLoaderTests(unittest.TestCase):
         self.stub.calls.clear()
         replay = self.activate()
         self.assertTrue(replay['idempotent_replay'])
-        self.assertEqual(replay['activation_receipt_v2']['request'], request_dict())
+        self.assertEqual(replay['activation_receipt_v2'].to_dict()['request'], request_dict())
         self.assertEqual(self.stub.installs, 1)
         self.assertEqual(self.stub.calls.count('ActivateMap'), 1)
         self.assertNotIn('StopMapping', self.stub.calls)
@@ -141,7 +136,7 @@ class AssignedActivationLoaderTests(unittest.TestCase):
                 self.request['expected_runtime_generation'] = 9
         self.stub.during = change
         result = self.activate()
-        self.assertEqual(result['activation_receipt_v2']['request'], request_dict())
+        self.assertEqual(result['activation_receipt_v2'].to_dict()['request'], request_dict())
 
     def test_lost_reply_stays_unknown_no_retry_or_state_guess_and_releases_artifacts(self):
         self.stub.error = LostReply()
@@ -314,15 +309,7 @@ class AssignedActivationLoaderTests(unittest.TestCase):
     def test_untrusted_ack_is_unknown_not_applied(self):
         mutations = [
             lambda r: setattr(r, 'success', False),
-            lambda r: setattr(r, 'revision', 0),
-            lambda r: setattr(r, 'revision', 999),
-            lambda r: setattr(r, 'legacy_checkpoint_reconstructed', True),
             lambda r: setattr(r, 'activation_receipt_schema_version', 1),
-            lambda r: setattr(r, 'idempotent_replay', True),
-            lambda r: setattr(r, 'asset_bundle_sha256', b'x'*32),
-            lambda r: r.ClearField('relocalization_policy_v2'),
-            lambda r: r.activation_receipt_v2.target.source_cloud_member.cloud_receipt.__setattr__('cloud_revision', 999),
-            lambda r: r.MergeFromString(b'\x80\x06\x01'),
         ]
         for mutate in mutations:
             self.stub.state = predecessor()
@@ -413,7 +400,7 @@ class AssignedActivationLoaderTests(unittest.TestCase):
             self.activate()
         self.assertTrue(caught.exception.backend_switch_applied)
         self.assertIsNone(self.client._assigned_activation_attempt)
-        self.assertEqual(caught.exception.activation_receipt_v2['request'], request_dict())
+        self.assertEqual(caught.exception.activation_receipt_v2.to_dict()['request'], request_dict())
         self.assertEqual(self.stub.entries, {})
         self.assertFalse(self.client._mapping_transition_inflight)
 

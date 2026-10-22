@@ -163,41 +163,13 @@ LOGGER = logging.getLogger("nuwax_robot_bridge.geometry.runtime")
 _LIVE_MAP_SNAPSHOT_MAX_ATTEMPTS = 2
 
 
-class MapAssetBackendActivationRejected(RuntimeError):
-    """The backend explicitly reported that no target map switch was applied."""
-
-    def __init__(self, activation_result: Dict[str, object]) -> None:
-        self.activation_result = dict(activation_result)
-        self.backend_switch_applied = False
-        self.backend_activation_disposition = "not_attempted"
-        super().__init__(
-            "地图后端未确认 current 资产包切换：%s"
-            % str(activation_result.get("reason") or "backend_switch_not_applied")
-        )
 
 
-class MapAssetBackendActivationOutcomeUnknown(RuntimeError):
-    """ActivateMap was dispatched, but the caller cannot prove its outcome."""
-
-    backend_activation_outcome_unknown = True
-    backend_activation_disposition = "unknown"
-
-    def __init__(self, map_name: str) -> None:
-        super().__init__(
-            "地图 %s 的后端激活结果不确定；必须重放同一 current 资产包。"
-            % map_name
-        )
 
 
-class MapAssetBackendActivationAppliedError(RuntimeError):
-    """The backend applied the target, but local materialization failed."""
 
-    backend_activation_applied = True
 
-    def __init__(self, map_name: str) -> None:
-        super().__init__(
-            "地图 %s 的后端已完成激活，但 Python 运行态尚未完成收敛。" % map_name
-        )
+
 
 
 class GeometryRuntimeRelocalizationRejected(RuntimeError):
@@ -710,6 +682,8 @@ class PlatformGeometryRuntime:
         self._catalog_root = Path(catalog_root).expanduser()
         self._catalog_root.mkdir(parents=True, exist_ok=True)
         self._runtime_state_lock = threading.RLock()
+        self._map_asset_activation_fence = None
+        self._map_asset_activation_snapshot_read_state = threading.local()
         self._map_activation_snapshot = _MapActivationSnapshot(
             bundle=None,
             bundle_root=None,
@@ -2769,35 +2743,11 @@ class PlatformGeometryRuntime:
         return snapshot.activation_result
 
     def _map_activation_snapshot_locked(self) -> _MapActivationSnapshot:
-        snapshot = getattr(self, "_map_activation_snapshot", None)
-        if not isinstance(snapshot, _MapActivationSnapshot):
-            snapshot = _MapActivationSnapshot(
-                bundle=None,
-                bundle_root=None,
-                activation_result={},
-                generation=0,
-            )
-            self._map_activation_snapshot = snapshot
-        return snapshot
+        return self._map_activation_snapshot
 
     def _map_activation_snapshot_read(self) -> _MapActivationSnapshot:
-        state_lock = getattr(self, "_runtime_state_lock", None)
-        if state_lock is None:
-            snapshot = self._map_activation_snapshot_locked()
-        else:
-            with state_lock:
-                snapshot = self._map_activation_snapshot_locked()
-        # 已封存资产字段不可改写，嵌套可变数据由契约按读取隔离。
-        # 内部查询只需稳定身份和代次，不复制、重新校验整张地图。
-        if (snapshot.bundle is None or snapshot.bundle.identity_schema_version == 2
-                or snapshot.bundle.manifest_sha256 is not None):
-            return snapshot
-        return _MapActivationSnapshot(
-            bundle=self._clone_contract(snapshot.bundle),
-            bundle_root=snapshot.bundle_root,
-            activation_result=snapshot.activation_result,
-            generation=snapshot.generation,
-        )
+        with self._runtime_state_lock:
+            return self._map_activation_snapshot
 
     def _install_map_activation_snapshot_locked(
         self,
@@ -2807,7 +2757,7 @@ class PlatformGeometryRuntime:
         activation_result: Dict[str, object],
     ) -> _MapActivationSnapshot:
         previous = self._map_activation_snapshot_locked()
-        installed_bundle = self._clone_contract(bundle)
+        installed_bundle = bundle
         installed_result = dict(activation_result or {})
         generation = previous.generation + 1
         snapshot = _MapActivationSnapshot(
@@ -2827,9 +2777,7 @@ class PlatformGeometryRuntime:
         expected: _MapActivationSnapshot,
     ) -> bool:
         current = self._map_activation_snapshot
-        # Legacy unsealed readers receive detached descriptors, but retain this
-        # installation's existing generation. Equal metadata reinstallation is
-        # still a different generation; no content digest is an owner fence.
+        # 相同元数据重新安装也产生新代次。
         return current.generation == expected.generation
 
     def capture_assigned_map_activation_target(
@@ -3027,266 +2975,27 @@ class PlatformGeometryRuntime:
         object.__setattr__(evidence, "_response_json", response_json)
         return evidence
 
-    def _require_map_activation_target_locked(
-        self,
-        *,
-        map_name: str,
-        asset_manifest_sha256: str,
-    ) -> Tuple[_MapActivationSnapshot, Dict[str, object]]:
-        snapshot = self._map_activation_snapshot_locked()
-        bundle = snapshot.bundle
-        activation = self._activation_result_from_snapshot(snapshot)
-        if (
-            bundle is None
-            or bundle.map_name != map_name
-            or str(bundle.manifest_sha256 or "").strip().lower()
-            != asset_manifest_sha256
-            or not bool(activation.get("relocalization_target_available"))
-            or str(activation.get("map_name") or "").strip() != map_name
-            or str(activation.get("asset_manifest_sha256") or "").strip().lower()
-            != asset_manifest_sha256
-        ):
-            raise RuntimeError("重定位目标与当前 sealed 激活资产不一致。")
-        return snapshot, activation
 
-    def get_validated_map_activation_receipt(self) -> Dict[str, object]:
-        """返回 provider 已验证且仍绑定当前资产的 sealed 激活身份。"""
 
-        with self._runtime_state_lock:
-            snapshot = self._map_activation_snapshot_locked()
-            active_bundle = snapshot.bundle
-            activation = self._activation_result_from_snapshot(snapshot)
-            if (
-                active_bundle is None
-                or activation.get("backend_switch_applied") is not True
-                or str(activation.get("backend_activation_disposition") or "")
-                != "applied"
-                or str(activation.get("map_name") or "").strip()
-                != active_bundle.map_name
-                or str(activation.get("asset_manifest_sha256") or "").strip().lower()
-                != str(active_bundle.manifest_sha256 or "").strip().lower()
-            ):
-                raise RuntimeError("当前运行态没有匹配资产的 sealed 激活凭据。")
-            fields = (
-                "activation_receipt_schema_version",
-                "activation_receipt_disposition",
-                "activation_receipt_disposition_name",
-                "runtime_generation",
-                "session_id",
-                "session_generation",
-                "backend_generation",
-                "mapping_backend_kind",
-                "activation_request_identity_sha256",
-                "activation_identity_sha256",
-                "target_receipt_sha256",
-                "asset_bundle_sha256",
-                "relocalization_target_available",
-                "cloud_source_revision",
-                "cloud_source_sha256",
-                "source_policy_version",
-                "source_policy_sha256",
-                "deadline_policy_version",
-                "deadline_policy_sha256",
-                "algorithm_options_version",
-                "algorithm_options_sha256",
-            )
-            if activation.get("target_kind") == "planar_graph":
-                fields += ("target_kind", "target_graph_sha256")
-            return {field_name: activation.get(field_name) for field_name in fields}
 
-    def get_validated_relocalization_receipt(
-        self,
-        result: Dict[str, object],
-        *,
-        map_name: str,
-        asset_manifest_sha256: str,
-        activation_receipt: Dict[str, object],
-        _expected_activation_snapshot: Optional[_MapActivationSnapshot] = None,
-    ) -> Dict[str, object]:
-        """直接投影功能拥有方返回的提交结果，不重复做资格核验。"""
 
-        payload = dict(result or {})
-        fields = (
-            "schema_version",
-            "request_id",
-            "request_identity_sha256",
-            "runtime_generation",
-            "session_id",
-            "map_name",
-            "session_generation",
-            "backend_generation",
-            "activation_identity_sha256",
-            "target_receipt_sha256",
-            "target_cloud_revision",
-            "target_cloud_sha256",
-            "asset_manifest_sha256",
-            "asset_bundle_sha256",
-            "source_policy_version",
-            "source_policy_sha256",
-            "deadline_policy_version",
-            "deadline_policy_sha256",
-            "logical_timeout_ms",
-            "algorithm_options_version",
-            "algorithm_options_sha256",
-            "disposition",
-            "disposition_name",
-            "candidate_sequence",
-            "candidate_payload_sha256",
-            "evidence_sha256",
-            "correction_revision",
-            "terminal_proof_sha256",
-        )
-        if payload.get("target_kind") == "planar_graph":
-            fields += ("target_kind", "target_graph_sha256", "planar_seed")
-        return {field_name: payload.get(field_name) for field_name in fields}
 
-    def get_relocalization_terminal(
-        self,
-        *,
-        request_id: str,
-        logical_timeout_ms: int,
-        planar_seed: Optional[List[float]] = None,
-        map_name: str,
-        asset_manifest_sha256: str,
-        activation_receipt: Dict[str, object],
-    ) -> Dict[str, object]:
-        """两阶段快照查询权威终态，并对 terminal 做完整投影。"""
 
-        provider = self.get_geometry_runtime_provider()
-        if provider is None:
-            raise RuntimeError("Geometry runtime 未连接，无法查询重定位终态。")
-        query = getattr(provider, "get_relocalization_terminal", None)
-        if not callable(query):
-            raise RuntimeError("Geometry runtime 不支持重定位终态查询。")
-        resolved_map_name = str(map_name or "").strip()
-        resolved_manifest = str(asset_manifest_sha256 or "").strip().lower()
-        trusted_activation = dict(activation_receipt or {})
-        identity_fields = (
-            "runtime_generation",
-            "session_id",
-            "session_generation",
-            "backend_generation",
-            "activation_identity_sha256",
-            "target_receipt_sha256",
-            "asset_bundle_sha256",
-        )
-        with self._runtime_state_lock:
-            snapshot = self._map_activation_snapshot_locked()
-            active_bundle = snapshot.bundle
-            activation = self._activation_result_from_snapshot(snapshot)
-            if (
-                trusted_activation.get("trusted_identity") is not True
-                or active_bundle is None
-                or active_bundle.map_name != resolved_map_name
-                or str(active_bundle.manifest_sha256 or "").strip().lower()
-                != resolved_manifest
-                or str(activation.get("map_name") or "").strip()
-                != resolved_map_name
-                or str(activation.get("asset_manifest_sha256") or "")
-                .strip()
-                .lower()
-                != resolved_manifest
-                or any(
-                    activation.get(field_name)
-                    != trusted_activation.get(field_name)
-                    for field_name in identity_fields
-                )
-            ):
-                raise RuntimeError("重定位终态查询时当前激活 target 不一致。")
-        result = query(
-            activation_state=activation,
-            request_id=request_id,
-            logical_timeout_ms=logical_timeout_ms,
-            **({"planar_seed": planar_seed} if planar_seed is not None else {}),
-        )
-        with self._runtime_state_lock:
-            if not self._map_activation_snapshot_still_current_locked(snapshot):
-                raise RuntimeError("重定位终态查询完成前激活身份已变化。")
-        status = str(result.get("status") or "").strip().lower()
-        if status not in {"terminal", "pending", "not_found", "identity_conflict"}:
-            raise RuntimeError("重定位终态查询返回未知状态。")
-        observation = result.get("ledger_observation")
-        observation_fields = (
-            "observation_schema_version",
-            "admitted_command_count",
-            "claimed_command_count",
-            "terminal_record_count",
-            "pending_record_count",
-            "active_waiter_count",
-            "observation_epoch",
-        )
-        ledger_observation = None
-        if isinstance(observation, dict) and all(
-            field_name in observation for field_name in observation_fields
-        ):
-            candidate_observation = {
-                field_name: observation[field_name] for field_name in observation_fields
-            }
-            if not any(
-                isinstance(value, bool) or not isinstance(value, int) or value < 0
-                for value in candidate_observation.values()
-            ) and (
-                candidate_observation["observation_schema_version"] == 1
-                and candidate_observation["observation_epoch"] != 0
-                and candidate_observation["terminal_record_count"]
-                + candidate_observation["pending_record_count"]
-                <= candidate_observation["admitted_command_count"]
-            ):
-                ledger_observation = candidate_observation
-        if status != "terminal":
-            return {
-                "status": status,
-                "request_id": str(result.get("request_id") or ""),
-                "request_identity_sha256": str(
-                    result.get("request_identity_sha256") or ""
-                ),
-                "activation_identity_sha256": str(
-                    result.get("activation_identity_sha256") or ""
-                ),
-                "terminal_receipt": None,
-                "ledger_observation": ledger_observation,
-            }
-        terminal = result.get("terminal")
-        if not isinstance(terminal, dict):
-            raise RuntimeError("重定位 terminal query 缺少完整 proof。")
-        receipt = self.get_validated_relocalization_receipt(
-            terminal,
-            map_name=resolved_map_name,
-            asset_manifest_sha256=resolved_manifest,
-            activation_receipt=trusted_activation,
-            _expected_activation_snapshot=snapshot,
-        )
-        return {
-            "status": "terminal",
-            "request_id": str(result.get("request_id") or ""),
-            "request_identity_sha256": str(
-                result.get("request_identity_sha256") or ""
-            ),
-            "activation_identity_sha256": str(
-                result.get("activation_identity_sha256") or ""
-            ),
-            "terminal_receipt": receipt,
-            "ledger_observation": ledger_observation,
-        }
+
 
     def is_relocalization_available(self) -> bool:
-        if not self._is_geometry_profile_enabled():
-            return False
-        provider = self.get_geometry_runtime_provider()
-        if provider is None or not callable(getattr(provider, "relocalize", None)):
+        if not self._is_geometry_profile_enabled() or self.get_geometry_runtime_provider() is None:
             return False
         with self._runtime_state_lock:
             snapshot = self._map_activation_snapshot_locked()
             if self.is_map_asset_activation_recovery_pending() or snapshot.bundle is None:
                 return False
-            activation = self._activation_result_from_snapshot(snapshot)
-            return bool(
-                activation.get("relocalization_target_available")
-                and str(activation.get("map_name") or "")
-                == snapshot.bundle.map_name
-                and str(activation.get("asset_manifest_sha256") or "").lower()
-                == str(snapshot.bundle.manifest_sha256 or "").lower()
-            )
+            activation = snapshot.activation_result
+            receipt = activation.get("activation_receipt_v2")
+            return (isinstance(receipt, AssignedActivationReceipt)
+                and activation.get("relocalization_target_available") is True
+                and receipt.asset_identity == snapshot.bundle.asset_identity
+                and receipt.map_name == snapshot.bundle.map_name)
 
     def resolve_planar_relocalization_seed(self, value=None):
         with self._runtime_state_lock:
@@ -3313,44 +3022,7 @@ class PlatformGeometryRuntime:
             raise ValueError("二维重定位偏航角应在负π到π范围内")
         return [float(v) for v in value]
 
-    def relocalize_active_map(
-        self,
-        *,
-        map_name: str,
-        asset_manifest_sha256: str,
-        request_id: Optional[str] = None,
-        logical_timeout_ms: int = 10_000,
-        planar_seed: Optional[List[float]] = None,
-    ) -> Dict[str, object]:
-        provider = self.get_geometry_runtime_provider()
-        if provider is None:
-            raise RuntimeError("Geometry runtime 未连接，无法重定位。")
-        resolved_map_name = str(map_name or "").strip()
-        resolved_manifest = str(asset_manifest_sha256 or "").strip().lower()
-        with self._runtime_state_lock:
-            snapshot, activation = self._require_map_activation_target_locked(
-                map_name=resolved_map_name,
-                asset_manifest_sha256=resolved_manifest,
-            )
-        try:
-            result = provider.relocalize(
-                activation_state=activation,
-                request_id=request_id,
-                logical_timeout_ms=logical_timeout_ms,
-                **({"planar_seed": planar_seed} if planar_seed is not None else {}),
-            )
-        except GeometryRuntimeRpcError as error:
-            # 原生端此精确拒绝发生在拥有方和生命周期锁准入之前，没有未决应用事务。
-            if error.rpc_name == "Relocalize" and error.grpc_code == grpc.StatusCode.FAILED_PRECONDITION and error.grpc_details == "RELOCALIZATION_OWNER_NOT_SELECTED":
-                raise GeometryRuntimeRelocalizationRejected({"success": False, "disposition_name": "target_unavailable",
-                    "detail": "未选择重定位拥有方；当前配置只支持建图，无法恢复检查点定位"}) from error
-            raise
-        if not bool(result.get("success")):
-            raise GeometryRuntimeRelocalizationRejected(result)
-        with self._runtime_state_lock:
-            if not self._map_activation_snapshot_still_current_locked(snapshot):
-                raise RuntimeError("重定位完成前当前地图激活身份已经切换。")
-        return self._clone_metadata(result)
+
 
     def is_available(self) -> bool:
         """返回是否存在可供平台消费的几何后端。"""
@@ -3388,8 +3060,8 @@ class PlatformGeometryRuntime:
                 "runtime_status": self.get_runtime_status(),
                 "navigation_backend_policy": self._navigation_backend_policy(),
                 "active_map_name": active_bundle.map_name if active_bundle is not None else None,
-                "asset_manifest_sha256": (
-                    active_bundle.manifest_sha256
+                "asset_identity": (
+                    active_bundle.asset_identity.model_dump()
                     if active_bundle is not None
                     else None
                 ),
@@ -3423,8 +3095,8 @@ class PlatformGeometryRuntime:
             "point_cloud_publisher": self._geometry_runtime_status_stub("point_cloud_publisher"),
             "navigation_backend_policy": self._navigation_backend_policy(),
             "active_map_name": active_bundle.map_name if active_bundle is not None else None,
-            "asset_manifest_sha256": (
-                active_bundle.manifest_sha256
+            "asset_identity": (
+                active_bundle.asset_identity.model_dump()
                 if active_bundle is not None
                 else None
             ),
@@ -3634,54 +3306,7 @@ class PlatformGeometryRuntime:
         with state_lock:
             clear_bundle_context()
 
-    def _set_map_asset_activation_fence(
-        self,
-        bundle: MapAssetBundle,
-        *,
-        activation_request_id: Optional[str],
-        reason: str,
-    ) -> Optional[Dict[str, object]]:
-        fence = {
-            "map_name": str(bundle.map_name or "").strip(),
-            "asset_manifest_sha256": str(
-                bundle.manifest_sha256 or ""
-            ).strip().lower(),
-            "activation_request_id": str(activation_request_id or "").strip()
-            or None,
-            "reason": str(reason or "").strip() or "activation_recovery_pending",
-        }
 
-        def install_fence() -> Optional[Dict[str, object]]:
-            existing = getattr(self, "_map_asset_activation_fence", None)
-            if isinstance(existing, dict):
-                if self._map_asset_activation_fence_identity(
-                    existing
-                ) != self._map_asset_activation_fence_identity(fence):
-                    raise RuntimeError(
-                        "another map asset activation identity is already fenced"
-                    )
-                return dict(existing)
-            self._map_asset_activation_fence = fence
-            return None
-
-        self._ensure_mapping_lifecycle_fields()
-        self._ensure_subscription_delivery_state()
-        delivery_tickets: Tuple[_SubscriptionDeliveryTicket, ...] = ()
-        state_lock = getattr(self, "_runtime_state_lock", None)
-        with self._mapping_lifecycle_lock:
-            if state_lock is None:
-                existing_fence = install_fence()
-                delivery_tickets = (
-                    self._map_asset_activation_delivery_tickets_snapshot()
-                )
-            else:
-                with state_lock:
-                    existing_fence = install_fence()
-                    delivery_tickets = (
-                        self._map_asset_activation_delivery_tickets_snapshot()
-                    )
-        self._wait_for_subscription_deliveries(delivery_tickets)
-        return existing_fence
 
     def _map_asset_activation_delivery_tickets_snapshot(
         self,
@@ -3697,204 +3322,27 @@ class PlatformGeometryRuntime:
             )
 
     @staticmethod
-    def _map_asset_activation_fence_identity(
-        fence: object,
-    ) -> tuple:
-        payload = fence if isinstance(fence, dict) else {}
-        if "assigned_activation_request" in payload:
-            request = _assigned_activation_request(payload["assigned_activation_request"])
-            return ("assigned_v2", json.dumps(request, sort_keys=True, separators=(",", ":")))
-        return (
-            str(payload.get("map_name") or "").strip(),
-            str(payload.get("asset_manifest_sha256") or "").strip().lower(),
-            str(payload.get("activation_request_id") or "").strip(),
-        )
+    def _map_asset_activation_fence_identity(fence: Mapping[str, object]) -> dict:
+        return fence["assigned_activation_request"]
 
 
     def _map_asset_activation_fence_snapshot(self) -> Optional[Dict[str, object]]:
-        state_lock = getattr(self, "_runtime_state_lock", None)
-        if state_lock is None:
-            fence = getattr(self, "_map_asset_activation_fence", None)
-        else:
-            with state_lock:
-                fence = getattr(self, "_map_asset_activation_fence", None)
-        if not isinstance(fence, dict):
-            return None
-        result = dict(fence)
-        if "assigned_activation_request" in result:
-            result["assigned_activation_request"] = _assigned_activation_request(result["assigned_activation_request"])
-        return result
+        with self._runtime_state_lock:
+            fence = self._map_asset_activation_fence
+            if fence is None:
+                return None
+            request = fence["assigned_activation_request"]
+            return {**fence, "assigned_activation_request": {
+                **request, "asset_identity": dict(request["asset_identity"])}}
 
     def is_map_asset_activation_recovery_pending(self) -> bool:
         return self._map_asset_activation_fence_snapshot() is not None
 
-    def arm_map_asset_activation_fence(
-        self,
-        *,
-        map_name: str,
-        asset_manifest_sha256: str,
-        activation_request_id: str,
-        reason: str = "activation_recovery_pending",
-    ) -> bool:
-        fence = {
-            "map_name": str(map_name or "").strip(),
-            "asset_manifest_sha256": str(
-                asset_manifest_sha256 or ""
-            ).strip().lower(),
-            "activation_request_id": str(
-                activation_request_id or ""
-            ).strip(),
-            "reason": str(reason or "").strip()
-            or "activation_recovery_pending",
-        }
-        identity = self._map_asset_activation_fence_identity(fence)
-        if (
-            not identity[0]
-            or len(identity[1]) != 64
-            or any(
-                character not in "0123456789abcdef"
-                for character in identity[1]
-            )
-            or not identity[2]
-        ):
-            return False
 
-        def arm_if_compatible() -> bool:
-            existing = getattr(self, "_map_asset_activation_fence", None)
-            if isinstance(existing, dict):
-                return self._map_asset_activation_fence_identity(
-                    existing
-                ) == identity
-            self._map_asset_activation_fence = fence
-            return True
 
-        self._ensure_mapping_lifecycle_fields()
-        self._ensure_subscription_delivery_state()
-        delivery_tickets: Tuple[_SubscriptionDeliveryTicket, ...] = ()
-        state_lock = getattr(self, "_runtime_state_lock", None)
-        with self._mapping_lifecycle_lock:
-            if state_lock is None:
-                armed = arm_if_compatible()
-                if armed:
-                    delivery_tickets = (
-                        self._map_asset_activation_delivery_tickets_snapshot()
-                    )
-            else:
-                with state_lock:
-                    armed = arm_if_compatible()
-                    if armed:
-                        delivery_tickets = (
-                            self._map_asset_activation_delivery_tickets_snapshot()
-                        )
-        if armed:
-            self._wait_for_subscription_deliveries(delivery_tickets)
-        return armed
 
-    def rotate_map_asset_activation_fence(
-        self,
-        *,
-        map_name: str,
-        asset_manifest_sha256: str,
-        previous_activation_request_id: str,
-        activation_request_id: str,
-    ) -> bool:
-        previous_identity = self._map_asset_activation_fence_identity(
-            {
-                "map_name": map_name,
-                "asset_manifest_sha256": asset_manifest_sha256,
-                "activation_request_id": previous_activation_request_id,
-            }
-        )
-        next_request_id = str(activation_request_id or "").strip()
-        previous_request_suffix = (
-            previous_identity[2][len("mapload:") :]
-            if previous_identity[2].startswith("mapload:")
-            else previous_identity[2]
-        )
-        next_request_suffix = (
-            next_request_id[len("mapload:") :]
-            if next_request_id.startswith("mapload:")
-            else next_request_id
-        )
-        previous_request_valid = bool(
-            previous_identity[2].startswith("mapload:")
-            and len(previous_request_suffix) == 32
-            and all(
-                character in "0123456789abcdef"
-                for character in previous_request_suffix
-            )
-        )
-        next_request_valid = bool(
-            next_request_id.startswith("mapload:")
-            and len(next_request_suffix) == 32
-            and all(
-                character in "0123456789abcdef"
-                for character in next_request_suffix
-            )
-        )
-        if (
-            not previous_identity[0]
-            or len(previous_identity[1]) != 64
-            or any(
-                character not in "0123456789abcdef"
-                for character in previous_identity[1]
-            )
-            or not previous_request_valid
-            or not next_request_valid
-            or next_request_id == previous_identity[2]
-        ):
-            return False
 
-        def rotate_if_matching() -> bool:
-            fence = getattr(self, "_map_asset_activation_fence", None)
-            if not isinstance(fence, dict):
-                return False
-            if (
-                self._map_asset_activation_fence_identity(fence)
-                != previous_identity
-            ):
-                return False
-            self._map_asset_activation_fence = {
-                **fence,
-                "activation_request_id": next_request_id,
-            }
-            return True
 
-        state_lock = getattr(self, "_runtime_state_lock", None)
-        if state_lock is None:
-            return rotate_if_matching()
-        with state_lock:
-            return rotate_if_matching()
-
-    def complete_map_asset_activation(
-        self,
-        *,
-        map_name: str,
-        asset_manifest_sha256: str,
-        activation_request_id: str,
-    ) -> bool:
-        expected_identity = self._map_asset_activation_fence_identity(
-            {
-                "map_name": map_name,
-                "asset_manifest_sha256": asset_manifest_sha256,
-                "activation_request_id": activation_request_id,
-            }
-        )
-
-        def complete_if_matching() -> bool:
-            fence = getattr(self, "_map_asset_activation_fence", None)
-            if not isinstance(fence, dict):
-                return True
-            if self._map_asset_activation_fence_identity(fence) != expected_identity:
-                return False
-            self._map_asset_activation_fence = None
-            return True
-
-        state_lock = getattr(self, "_runtime_state_lock", None)
-        if state_lock is None:
-            return complete_if_matching()
-        with state_lock:
-            return complete_if_matching()
 
     def arm_assigned_map_activation_fence(
         self, *, activation_request, reason: str = "activation_recovery_pending",
@@ -4001,22 +3449,17 @@ class PlatformGeometryRuntime:
     ) -> MapAssetBundle:
         """Install the exported canonical occupancy into the candidate bundle."""
 
-        if checkpoint_bundle.checkpoint.schema_version == 2:
-            if map_bundle.identity_schema_version != 1 or map_bundle.manifest_sha256 is not None:
-                raise TypeError("assigned checkpoint preparation requires an unsealed legacy draft")
-            descriptor = checkpoint_bundle.occupancy_asset
-            meta = SimpleNamespace(
-                width=descriptor["width"], height=descriptor["height"],
-                resolution=descriptor["resolution"], origin_x=descriptor["origin_x"],
-                origin_y=descriptor["origin_y"], frame_id=descriptor["frame_id"],
-                revision=descriptor["source_occupancy_revision"],
-                timestamp_ns=descriptor["timestamp_ns"],
-            )
-            raw_data = checkpoint_bundle.checkpoint.canonical_occupancy_data
-        else:
-            checkpoint = checkpoint_bundle.canonical_occupancy_checkpoint()
-            meta = checkpoint.meta
-            raw_data = bytes(checkpoint.data)
+        if map_bundle.identity_schema_version != 1 or map_bundle.manifest_sha256 is not None:
+            raise TypeError("assigned checkpoint preparation requires an unsealed legacy draft")
+        descriptor = checkpoint_bundle.occupancy_asset
+        meta = SimpleNamespace(
+            width=descriptor["width"], height=descriptor["height"],
+            resolution=descriptor["resolution"], origin_x=descriptor["origin_x"],
+            origin_y=descriptor["origin_y"], frame_id=descriptor["frame_id"],
+            revision=descriptor["source_occupancy_revision"],
+            timestamp_ns=descriptor["timestamp_ns"],
+        )
+        raw_data = checkpoint_bundle.checkpoint.canonical_occupancy_data
         frame_id = str(meta.frame_id or "").strip().lstrip("/")
         if not frame_id:
             raise RuntimeError("canonical mapping checkpoint frame_id is empty")
@@ -4025,24 +3468,16 @@ class PlatformGeometryRuntime:
             raise RuntimeError(
                 "canonical mapping checkpoint occupancy dimensions do not match payload"
             )
-        if checkpoint_bundle.checkpoint.schema_version == 2:
-            try:
-                # Exported bytes already have immutable ownership. Reopened mmap
-                # members need one compact byte capture, never a cell list.
-                values = PackedOccupancyCells(
-                    raw_data if isinstance(raw_data, bytes) else raw_data[:]
-                )
-            except (TypeError, ValueError) as exc:
-                raise RuntimeError(
-                    "canonical mapping checkpoint occupancy contains invalid values"
-                ) from exc
-        else:
-            values = [value if value <= 100 else value - 256
-                      for chunk in payload_chunks(raw_data) for value in chunk]
-            if any(value < -1 or value > 100 for value in values):
-                raise RuntimeError(
-                    "canonical mapping checkpoint occupancy contains invalid values"
-                )
+        try:
+            # Exported bytes already have immutable ownership. Reopened mmap
+            # members need one compact byte capture, never a cell list.
+            values = PackedOccupancyCells(
+                raw_data if isinstance(raw_data, bytes) else raw_data[:]
+            )
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "canonical mapping checkpoint occupancy contains invalid values"
+            ) from exc
         timestamp_ns = int(meta.timestamp_ns)
         timestamp = self._checkpoint_datetime(timestamp_ns)
         occupancy_grid = OccupancyGrid(
@@ -4071,10 +3506,7 @@ class PlatformGeometryRuntime:
             "schema_version": checkpoint_bundle.checkpoint.schema_version,
             "payload_size": checkpoint_bundle.checkpoint.payload_size,
         }
-        if checkpoint_bundle.checkpoint.schema_version == 2:
-            checkpoint_metadata["checkpoint_id"] = checkpoint_bundle.checkpoint.checkpoint_id
-        else:
-            checkpoint_metadata["content_sha256"] = checkpoint_bundle.checkpoint.content_sha256.hex()
+        checkpoint_metadata["checkpoint_id"] = checkpoint_bundle.checkpoint.checkpoint_id
         snapshot_changes = {
             "frame_id": frame_id,
             "occupancy_grid": occupancy_grid,
@@ -4088,14 +3520,11 @@ class PlatformGeometryRuntime:
                 "saved_occupancy_layer": "canonical_physical_raw",
             },
         }
-        if checkpoint_bundle.checkpoint.schema_version == 2:
-            source_snapshot = map_bundle.snapshot
-            snapshot = type(source_snapshot)(**{
-                **{name: getattr(source_snapshot, name) for name in type(source_snapshot).model_fields},
-                **snapshot_changes,
-            })
-        else:
-            snapshot = map_bundle.snapshot.model_copy(update=snapshot_changes, deep=True)
+        source_snapshot = map_bundle.snapshot
+        snapshot = type(source_snapshot)(**{
+            **{name: getattr(source_snapshot, name) for name in type(source_snapshot).model_fields},
+            **snapshot_changes,
+        })
         bundle_changes = {
             "frame_id": frame_id,
             "snapshot": snapshot,
@@ -4104,14 +3533,12 @@ class PlatformGeometryRuntime:
                 "mapping_backend_checkpoint": checkpoint_metadata,
             },
         }
-        if checkpoint_bundle.checkpoint.schema_version == 2:
-            # This is still a mutable draft. The caller captures its assigned
-            # owner once, after all preparation and identity allocation.
-            return type(map_bundle)(**{
-                **{name: getattr(map_bundle, name) for name in type(map_bundle).model_fields},
-                **bundle_changes,
-            })
-        return map_bundle.model_copy(update=bundle_changes, deep=True)
+        # This is still a mutable draft. The caller captures its assigned
+        # owner once, after all preparation and identity allocation.
+        return type(map_bundle)(**{
+            **{name: getattr(map_bundle, name) for name in type(map_bundle).model_fields},
+            **bundle_changes,
+        })
 
     def _validate_checkpoint_mapping_identity(
         self,
@@ -4184,14 +3611,11 @@ class PlatformGeometryRuntime:
         bundle_root: Path,
         skip_pcd_export: bool = False,
         export_backend_checkpoint: bool = True,
-        checkpoint_schema_version: int = 1,
     ) -> MapAssetBundle:
         """在受控 staging 根目录生成一个 finalized 地图的几何资产。"""
 
         resolved_bundle_root = self._require_bundle_root(bundle_root)
-        if type(checkpoint_schema_version) is not int or checkpoint_schema_version not in (1, 2):
-            raise ValueError("unsupported finalized checkpoint schema")
-        assigned_export = export_backend_checkpoint and checkpoint_schema_version == 2
+        assigned_export = export_backend_checkpoint
         if assigned_export and (
                 bundle.identity_schema_version != 1 or bundle.manifest_sha256 is not None):
             raise TypeError("assigned checkpoint preparation requires an unsealed legacy draft")
@@ -4233,21 +3657,7 @@ class PlatformGeometryRuntime:
                 if (not isinstance(mapping_context_before, dict)
                         or mapping_context_before.get("mapping_backend_kind") not in {"voxel", "raytracing", "slam_toolbox"}):
                     raise RuntimeError("assigned checkpoint export requires an active native backend")
-            exporter = getattr(
-                mapping_backend,
-                "export_mapping_backend_checkpoint",
-                None,
-            )
-            if not callable(exporter):
-                raise RuntimeError(
-                    "active native mapping backend does not support checkpoint export"
-                )
-            # Low-level callers retain the legacy default. Public saves
-            # explicitly select the paired, hash-free schema-2 checkpoint.
-            checkpoint_bundle = (
-                exporter() if checkpoint_schema_version == 1
-                else exporter(checkpoint_schema_version=checkpoint_schema_version)
-            )
+            checkpoint_bundle = mapping_backend.export_mapping_backend_checkpoint()
             if assigned_export:
                 require_export_origin()
             if not isinstance(
@@ -4257,7 +3667,7 @@ class PlatformGeometryRuntime:
                 raise RuntimeError(
                     "mapping backend checkpoint export returned an invalid bundle"
                 )
-            if checkpoint_bundle.checkpoint.schema_version != checkpoint_schema_version:
+            if checkpoint_bundle.checkpoint.schema_version != 2:
                 raise RuntimeError("mapping backend checkpoint export changed the requested schema")
             mapping_context_after = self.get_mapping_session_context()
             if assigned_export and (
@@ -4404,19 +3814,12 @@ class PlatformGeometryRuntime:
                 "source_session_generation": (
                     stored_backend_checkpoint.checkpoint.source_session_generation
                 ),
-                "legacy_checkpoint_reconstructed": False,
             }
-            if stored_backend_checkpoint.checkpoint.schema_version == 2:
-                backend_checkpoint_metadata["checkpoint_id"] = stored_backend_checkpoint.checkpoint.checkpoint_id
-                backend_checkpoint_metadata["member_paths"] = {
-                    role: self._bundle_relative_path(resolved_bundle_root, path)
-                    for role, path in stored_backend_checkpoint.member_paths.items()
-                }
-            else:
-                backend_checkpoint_metadata.update(
-                    manifest_sha256=stored_backend_checkpoint.manifest_sha256,
-                    object_sha256=stored_backend_checkpoint.checkpoint.content_sha256.hex(),
-                )
+            backend_checkpoint_metadata["checkpoint_id"] = stored_backend_checkpoint.checkpoint.checkpoint_id
+            backend_checkpoint_metadata["member_paths"] = {
+                role: self._bundle_relative_path(resolved_bundle_root, path)
+                for role, path in stored_backend_checkpoint.member_paths.items()
+            }
         # Geometry carries only the repository's explicit source authority.
         # Keep the richer export/session diagnostics separately on the bundle.
         checkpoint_geometry_source = backend_checkpoint_metadata
@@ -4872,152 +4275,7 @@ class PlatformGeometryRuntime:
                 with prepared._provider.assigned_activation_origin_guard(prepared._provider_origin):
                     yield expected_target.activation_receipt
 
-    def activate_map_asset_bundle(
-        self,
-        bundle: MapAssetBundle,
-        *,
-        bundle_root: Path,
-        require_backend_switch: bool = True,
-        activation_request_id: Optional[str] = None,
-    ) -> MapSnapshot:
-        """从完整性校验后的 ``current/`` 根目录激活唯一地图资产包。"""
 
-        resolved_bundle_root = self._require_bundle_root(bundle_root)
-        self._validate_bundle_manifest(bundle, resolved_bundle_root)
-        previous_activation = self._map_activation_snapshot_read()
-        geometry_asset = bundle.geometry_asset
-        if geometry_asset is None:
-            raise RuntimeError("finalized 地图资产包缺少 geometry_asset。")
-        if not self._bundle_db_ready_for_activation(
-            bundle,
-            bundle_root=resolved_bundle_root,
-        ):
-            raise RuntimeError("finalized 地图资产包缺少可加载的建图数据库。")
-        existing_activation_fence = None
-        if require_backend_switch:
-            existing_activation_fence = self._set_map_asset_activation_fence(
-                bundle,
-                activation_request_id=activation_request_id,
-                reason="activation_in_progress_or_recovery_pending",
-            )
-        try:
-            activation_result = self._activate_backend_map_bundle(
-                bundle,
-                bundle_root=resolved_bundle_root,
-                require_backend_switch=require_backend_switch,
-                activation_request_id=activation_request_id,
-            )
-        except Exception as exc:
-            backend_outcome_unknown = bool(
-                getattr(exc, "backend_activation_outcome_unknown", False)
-            )
-            backend_activation_applied = bool(
-                getattr(exc, "backend_activation_applied", False)
-            )
-            backend_activation_stale_request = bool(
-                getattr(exc, "backend_activation_stale_request", False)
-            )
-            if (
-                require_backend_switch
-                and existing_activation_fence is None
-                and not backend_outcome_unknown
-                and not backend_activation_applied
-                and not backend_activation_stale_request
-            ):
-                self.complete_map_asset_activation(
-                    map_name=bundle.map_name,
-                    asset_manifest_sha256=str(bundle.manifest_sha256 or ""),
-                    activation_request_id=str(activation_request_id or ""),
-                )
-            if backend_outcome_unknown:
-                raise MapAssetBackendActivationOutcomeUnknown(bundle.map_name) from exc
-            raise
-        disposition = str(
-            activation_result.get("backend_activation_disposition") or ""
-        ).strip()
-        backend_activation_applied = bool(
-            activation_result.get("backend_switch_applied") is True
-            and disposition == "applied"
-        )
-        if require_backend_switch:
-            if not backend_activation_applied:
-                if disposition == "not_attempted":
-                    if existing_activation_fence is None:
-                        self.complete_map_asset_activation(
-                            map_name=bundle.map_name,
-                            asset_manifest_sha256=str(
-                                bundle.manifest_sha256 or ""
-                            ),
-                            activation_request_id=str(
-                                activation_request_id or ""
-                            ),
-                        )
-                    raise MapAssetBackendActivationRejected(activation_result)
-                raise MapAssetBackendActivationOutcomeUnknown(bundle.map_name)
-        try:
-            snapshot_error = None
-            try:
-                with self._map_asset_activation_snapshot_read_guard():
-                    ready_snapshot = self._wait_for_activated_map_snapshot(
-                        bundle=bundle,
-                        activation_result=activation_result,
-                        timeout_sec=0.2,
-                    )
-            except Exception as exc:
-                ready_snapshot = None
-                snapshot_error = "%s: %s" % (type(exc).__name__, exc)
-                LOGGER.warning(
-                    "地图 %s 后端已切换，但 live snapshot 关联检查失败；使用 finalized checkpoint。",
-                    bundle.map_name,
-                    exc_info=True,
-                )
-            activation_result = {
-                **activation_result,
-                "backend_snapshot_correlated": ready_snapshot is not None,
-                "backend_snapshot_error": snapshot_error,
-            }
-            with self._runtime_state_lock:
-                if not self._map_activation_snapshot_still_current_locked(
-                    previous_activation
-                ):
-                    raise RuntimeError("地图激活结果提交前资产身份已变化。")
-                self._install_map_activation_snapshot_locked(
-                    bundle=bundle,
-                    bundle_root=resolved_bundle_root,
-                    activation_result=activation_result,
-                )
-                installed_generation = self._map_activation_snapshot_locked().generation
-            if ready_snapshot is not None:
-                return ready_snapshot.model_copy(update={"metadata": {**ready_snapshot.metadata,
-                    "map_activation_generation": installed_generation}})
-            offline_geometry_metadata = self._build_map_snapshot_geometry_metadata(
-                bundle=bundle,
-                geometry_asset=geometry_asset,
-                live_available=False,
-                map_snapshot_kind="offline_checkpoint",
-                source_kind="map_asset_bundle",
-                activation_result=activation_result,
-            )
-            return bundle.snapshot.model_copy(
-                update={
-                    "metadata": {
-                        **dict(bundle.snapshot.metadata),
-                        **offline_geometry_metadata,
-                        "map_activation_generation": installed_generation,
-                        "asset_manifest_sha256": bundle.manifest_sha256,
-                        "source_kind": "map_asset_bundle",
-                        "map_snapshot_kind": "offline_checkpoint",
-                        "live_streaming_ready": False,
-                        "mapping_live_streaming_ready": False,
-                        "backend_snapshot_correlated": False,
-                    }
-                },
-                deep=True,
-            )
-        except Exception as exc:
-            if backend_activation_applied:
-                raise MapAssetBackendActivationAppliedError(bundle.map_name) from exc
-            raise
 
     def subscribe_map_updates(self, callback) -> int:
         if not callable(callback):
@@ -5246,9 +4504,7 @@ class PlatformGeometryRuntime:
                 ),
                 "map_name": activation_fence.get("map_name"),
                 "active_map_name": activation_fence.get("map_name"),
-                "asset_manifest_sha256": activation_fence.get(
-                    "asset_manifest_sha256"
-                ),
+                "asset_identity": activation_fence["assigned_activation_request"]["asset_identity"],
                 "activation_request_id": activation_fence.get(
                     "activation_request_id"
                 ),
@@ -5329,7 +4585,7 @@ class PlatformGeometryRuntime:
                 "display_map_snapshot_kind": "offline_checkpoint",
                 "active_map_name": bundle.map_name,
                 "map_name": bundle.map_name,
-                "asset_manifest_sha256": bundle.manifest_sha256,
+                "asset_identity": bundle.asset_identity.model_dump(),
                 "checkpoint_ready": True,
                 "geometry_ready": True,
                 "backend_mode": "mapping_localization",
@@ -5390,7 +4646,7 @@ class PlatformGeometryRuntime:
             from contracts.events import RuntimeEventCategory
             payload = {
                 "map_name": bundle.map_name,
-                "asset_manifest_sha256": bundle.manifest_sha256,
+                "asset_identity": bundle.asset_identity.model_dump(),
                 "suppressed_live_map_reason": metadata.get("suppressed_live_map_reason"),
                 "live_known_cell_count": live_known_cells,
                 "seed_known_cell_count": seed_known_cells,
@@ -5826,7 +5082,7 @@ class PlatformGeometryRuntime:
                     "live mapping map_name does not match activated map bundle"
                 )
             metadata.update({
-                "asset_manifest_sha256": seed_bundle.manifest_sha256,
+                "asset_identity": seed_bundle.asset_identity.model_dump(),
             })
             metadata.update(self._build_map_snapshot_geometry_metadata(
                 bundle=seed_bundle,
@@ -5899,7 +5155,7 @@ class PlatformGeometryRuntime:
     ) -> Dict[str, object]:
         bundle_metadata = {
             "semantic_reference_identity": bundle.snapshot_identity,
-            "asset_manifest_sha256": bundle.manifest_sha256,
+            "asset_identity": bundle.asset_identity.model_dump(),
         }
         metadata = {
             "source_kind": source_kind,
@@ -6096,20 +5352,7 @@ class PlatformGeometryRuntime:
                     pass
         return value
 
-    @staticmethod
-    def _validate_bundle_manifest(
-        bundle: MapAssetBundle,
-        bundle_root: Path,
-    ) -> None:
-        expected = str(bundle.manifest_sha256 or "").strip().lower()
-        if len(expected) != 64:
-            raise RuntimeError("finalized 地图资产包缺少 manifest_sha256。")
-        manifest_path = bundle_root / "manifest.json"
-        if manifest_path.is_symlink() or not manifest_path.is_file():
-            raise RuntimeError("finalized 地图资产包缺少真实 manifest.json。")
-        actual = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
-        if actual != expected:
-            raise RuntimeError("地图资产包根目录与 asset_manifest_sha256 不一致。")
+
 
     def _bundle_geometry_root(self, bundle_root: Path) -> Path:
         return bundle_root / "geometry" / self.config.stack
@@ -6254,10 +5497,9 @@ class PlatformGeometryRuntime:
             ".%s.%s.tmp" % (resolved_target.name, uuid.uuid4().hex)
         )
         checkpoint = checkpoint_bundle.checkpoint
-        assigned_identity = checkpoint.schema_version == 2
-        identity_column = "backend_checkpoint_id" if assigned_identity else "backend_checkpoint_content_sha256"
+        identity_column = "backend_checkpoint_id"
         identity = {
-            "schema_version": 4 if assigned_identity else 3,
+            "schema_version": 4,
             "map_name": bundle.map_name,
             "source_epoch": bundle.snapshot.source_epoch,
             "update_sequence": int(bundle.snapshot.update_sequence),
@@ -6266,7 +5508,7 @@ class PlatformGeometryRuntime:
             "mapping_session_id": str(mapping_context.get("session_id") or ""),
             "session_generation": int(mapping_context.get("session_generation") or 0),
             "backend_kind": checkpoint_bundle.backend_kind,
-            identity_column: checkpoint.checkpoint_id if assigned_identity else checkpoint.content_sha256.hex(),
+            identity_column: checkpoint.checkpoint_id,
             "created_at": bundle.timestamp.isoformat(),
         }
         connection = None
@@ -6486,82 +5728,9 @@ class PlatformGeometryRuntime:
         except Exception:
             return False
 
+
+
     def _materialize_checkpoint_pcd_asset(
-        self,
-        target_path: Path,
-        bundle: MappingBackendCheckpointExportBundle,
-    ) -> Dict[str, object]:
-        """Write PCD only from the cloud bytes correlated with one export bundle."""
-
-        if bundle.checkpoint.schema_version == 2:
-            return self._materialize_assigned_checkpoint_pcd_asset(target_path, bundle)
-
-        from services.geometry.pointcloud_map import write_pcd_binary_xyz
-        import numpy as np
-
-        checkpoint = bundle.canonical_cloud_checkpoint()
-        descriptor = bundle.cloud_asset
-        point_count = int(checkpoint.point_count)
-        xyz_bytes = bytes(checkpoint.xyz_f32_le)
-        if point_count < self._pcd_min_points():
-            raise RuntimeError(
-                "canonical cloud-map 点数不足：%d < %d"
-                % (point_count, self._pcd_min_points())
-            )
-        if len(xyz_bytes) != point_count * 12:
-            raise RuntimeError(
-                "canonical cloud-map payload 大小不匹配：points=%d bytes=%d"
-                % (point_count, len(xyz_bytes))
-            )
-        xyz_sha256 = hashlib.sha256(xyz_bytes).digest()
-        if xyz_sha256 != bytes(descriptor["xyz_sha256"]):
-            raise RuntimeError("canonical cloud-map descriptor SHA256 mismatch")
-        if str(checkpoint.xyz_sha256 or "") != xyz_sha256.hex():
-            raise RuntimeError("canonical cloud-map protobuf SHA256 mismatch")
-        voxel_size = float(checkpoint.voxel_size)
-        if not np.isfinite(voxel_size) or voxel_size <= 0.0:
-            raise RuntimeError("canonical cloud-map voxel_size 非法。")
-        points_xyz = np.frombuffer(xyz_bytes, dtype="<f4").reshape(point_count, 3)
-        if not bool(np.isfinite(points_xyz).all()):
-            raise RuntimeError("canonical cloud-map 包含非有限坐标。")
-
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        resolved_target = target_path.expanduser().resolve()
-        temporary_path = resolved_target.with_name(
-            ".%s.%d.%d.tmp"
-            % (resolved_target.name, os.getpid(), time.time_ns())
-        )
-        try:
-            write_pcd_binary_xyz(temporary_path, points_xyz)
-            os.replace(temporary_path, resolved_target)
-            if not self._is_usable_pcd_file(resolved_target):
-                raise RuntimeError(
-                    "canonical cloud-map PCD 未通过点数或文件完整性校验。"
-                )
-            pcd_sha256 = hashlib.sha256(resolved_target.read_bytes()).hexdigest()
-            return {
-                "pcd_present": True,
-                "pcd_source_kind": "mapping_backend_checkpoint_export",
-                "pcd_source_path": "grpc:ExportMappingBackendCheckpoint",
-                "pcd_target_path": str(resolved_target),
-                "pcd_target": self._file_metadata(resolved_target),
-                "cloud_revision": int(checkpoint.source_revision),
-                "point_count": point_count,
-                "voxel_size": voxel_size,
-                "xyz_sha256": xyz_sha256.hex(),
-                "pcd_sha256": pcd_sha256,
-            }
-        finally:
-            try:
-                temporary_path.unlink(missing_ok=True)
-            except Exception:
-                LOGGER.debug(
-                    "清理 canonical checkpoint PCD 临时文件失败：%s",
-                    temporary_path,
-                    exc_info=True,
-                )
-
-    def _materialize_assigned_checkpoint_pcd_asset(
         self,
         target_path: Path,
         bundle: MappingBackendCheckpointExportBundle,
@@ -6725,18 +5894,11 @@ class PlatformGeometryRuntime:
         database_present = bool(database_metadata.get("database_present", False))
         nav2_map_present = bool(nav2_map_metadata.get("present", False))
         remote_provider = getattr(self, "_remote_provider", None)
-        native_checkpoint_switch_supported = bool(
-            True
-            and remote_provider is not None
-            and getattr(remote_provider, "is_connected", False)
-            and callable(
-                getattr(remote_provider, "activate_platform_map", None)
-            )
-        )
+        native_checkpoint_switch_supported = bool(remote_provider is not None and remote_provider.is_connected)
         native_checkpoint_ready = bool(
             native_checkpoint_switch_supported and nav2_map_present and (not planar_graph or database_present)
         )
-        database_required = True and not native_checkpoint_ready
+        database_required = not native_checkpoint_ready
         pcd_present = bool(pcd_metadata.get("pcd_present", False))
         readiness = self._build_mapping_readiness()
         live_source = database_metadata.get("database_source_kind") == "live_runtime"
@@ -6996,23 +6158,10 @@ class PlatformGeometryRuntime:
                 raise RuntimeError("ASSIGNED_SAVED_CLOUD_SOURCE_CHANGED")
 
     def get_saved_dense_cloud_source(self):
-        """只返回当前活动资产的权威检查点身份，不打开完整点云文件。"""
+        """返回当前已安装地图的分配式检查点来源。"""
         if self.is_map_asset_activation_recovery_pending():
             return None
-        snapshot = self._map_activation_snapshot_read()
-        bundle = snapshot.bundle
-        if bundle is not None and bundle.identity_schema_version == 2:
-            return self.capture_assigned_saved_cloud_source()
-        if bundle is None or bundle.geometry_asset is None or snapshot.bundle_root is None:
-            return None
-        reference = bundle.geometry_asset.metadata.get("mapping_backend_checkpoint") or {}
-        if not reference.get("present") or not reference.get("manifest_sha256"):
-            return None
-        return {
-            "bundle_root": snapshot.bundle_root, "backend_kind": reference["backend_kind"],
-            "manifest_sha256": reference["manifest_sha256"], "frame_id": bundle.geometry_asset.frame_id or bundle.frame_id,
-            "activation_generation": snapshot.generation,
-        }
+        return self.capture_assigned_saved_cloud_source()
 
     def get_live_pointcloud_map_asset_summary(self) -> Dict[str, object]:
         """返回活动规范点云来源摘要，不读取点云体。"""
@@ -7026,9 +6175,7 @@ class PlatformGeometryRuntime:
                 "pcd_path": None,
                 "path": None,
                 "map_name": activation_fence.get("map_name"),
-                "asset_manifest_sha256": activation_fence.get(
-                    "asset_manifest_sha256"
-                ),
+                "asset_identity": activation_fence["assigned_activation_request"]["asset_identity"],
                 "activation_request_id": activation_fence.get(
                     "activation_request_id"
                 ),
@@ -7038,7 +6185,6 @@ class PlatformGeometryRuntime:
 
             snapshot = self._map_activation_snapshot_read()
             if snapshot.bundle is not None and snapshot.bundle.identity_schema_version == 2:
-                summary.pop("asset_manifest_sha256", None)
                 summary.update(identity_schema_version=2,
                                asset_identity=snapshot.bundle.asset_identity.model_dump())
             return summary
@@ -7054,7 +6200,6 @@ class PlatformGeometryRuntime:
             return activation_fence_summary(activation_fence)
         activation_snapshot = self._map_activation_snapshot_read()
         active_bundle = activation_snapshot.bundle
-        active_root = activation_snapshot.bundle_root
         if active_bundle is not None and active_bundle.identity_schema_version == 2:
             summary = {
                 "available": False, "status": "unavailable",
@@ -7075,29 +6220,6 @@ class PlatformGeometryRuntime:
             except (ValueError, RuntimeError):
                 pass
             return finalize(summary)
-        if (
-            active_bundle is not None
-            and active_bundle.geometry_asset is not None
-            and active_root is not None
-        ):
-            geometry_asset = active_bundle.geometry_asset
-            current_path = (
-                self._resolve_bundle_asset_path(active_root, geometry_asset.pcd_path)
-                if geometry_asset.pcd_path
-                else None
-            )
-            if current_path is not None and self._is_usable_pcd_file(current_path):
-                return finalize(self._pointcloud_map_asset_summary(
-                    current_path,
-                    source_kind="map_asset_bundle_pcd",
-                    priority=1,
-                    map_name=active_bundle.map_name,
-                    asset_manifest_sha256=active_bundle.manifest_sha256,
-                    frame_id=geometry_asset.frame_id or active_bundle.frame_id,
-                    geometry_stack=geometry_asset.geometry_stack,
-                    mapping_database_path=geometry_asset.mapping_database_path,
-                ))
-
         mapping_backend = self._resolve_mapping_backend()
         if mapping_backend is not None:
             getter = getattr(mapping_backend, "get_pcd_map_path", None)
@@ -7169,7 +6291,6 @@ class PlatformGeometryRuntime:
         frame_id: Optional[str] = None,
         geometry_stack: Optional[str] = None,
         map_name: Optional[str] = None,
-        asset_manifest_sha256: Optional[str] = None,
         mapping_database_path: Optional[str] = None,
         expected_candidates: Optional[List[Path]] = None,
     ) -> Dict[str, object]:
@@ -7183,7 +6304,6 @@ class PlatformGeometryRuntime:
             "pcd_path": str(resolved),
             "path": str(resolved),
             "map_name": map_name,
-            "asset_manifest_sha256": asset_manifest_sha256,
             "frame_id": frame_id or self.config.frames.map_frame,
             "geometry_stack": geometry_stack or self.config.stack,
             "mapping_database_path": mapping_database_path,
@@ -7268,230 +6388,7 @@ class PlatformGeometryRuntime:
             return candidate
         return None
 
-    def _activate_backend_map_bundle(
-        self,
-        bundle: MapAssetBundle,
-        *,
-        bundle_root: Path,
-        require_backend_switch: bool = True,
-        activation_request_id: Optional[str] = None,
-    ) -> Dict[str, object]:
-        """切换后端到 finalized 地图资产包。
 
-        require_backend_switch=False 时（activate_map / restore_active_workspace 默认路径）
-        实时栈下不重启 SLAM 进程，仅返回 backend_switch_applied=False 但允许调用方继续 ingest 种子。
-        """
-
-        geometry_asset = bundle.geometry_asset
-        backend_state = geometry_asset.mapping_database_path if geometry_asset is not None else None
-        activation_payload = {
-            "map_name": bundle.map_name,
-            "asset_manifest_sha256": bundle.manifest_sha256,
-            "geometry_stack": self.config.stack,
-            "mapping_database_path": backend_state,
-            "pcd_path": geometry_asset.pcd_path if geometry_asset is not None else None,
-            "frame_id": bundle.frame_id,
-            "geometry_asset_summary": self._summarize_geometry_asset(geometry_asset) if geometry_asset is not None else None,
-            "require_backend_switch": bool(require_backend_switch),
-            "activation_request_id": str(activation_request_id or "").strip() or None,
-        }
-        if not require_backend_switch:
-            return {
-                **activation_payload,
-                "backend_switch_applied": False,
-                "backend_activation_disposition": "not_attempted",
-                "reason": "require_backend_switch_false",
-                "backend_mode": "live_streaming_only",
-            }
-        mapping_backend = self._resolve_mapping_backend()
-        if mapping_backend is not None:
-            activator = getattr(mapping_backend, "activate_platform_map", None)
-            if callable(activator):
-                checkpoint_identity = (
-                    geometry_asset.metadata.get("mapping_backend_checkpoint")
-                    if isinstance(geometry_asset.metadata, dict)
-                    else None
-                )
-                expected_backend_kind = None
-                expected_checkpoint_manifest_sha256 = None
-                expected_checkpoint_object_sha256 = None
-                if isinstance(checkpoint_identity, dict) and checkpoint_identity.get("present") is True:
-                    if checkpoint_identity.get("schema_version") == 2:
-                        raise RuntimeError(
-                            "CHECKPOINT_V2_ACTIVATION_UNAVAILABLE: assigned checkpoint activation "
-                            "requires the paired native activation and relocalization identity contract"
-                        )
-                    expected_backend_kind = str(checkpoint_identity.get("backend_kind") or "").strip()
-                    expected_checkpoint_manifest_sha256 = str(checkpoint_identity.get("manifest_sha256") or "").strip()
-                    expected_checkpoint_object_sha256 = str(checkpoint_identity.get("object_sha256") or "").strip()
-                    if expected_backend_kind not in _SUPPORTED_MAPPING_BACKEND_KINDS:
-                        raise ValueError(
-                            "mapping backend checkpoint identity has unsupported backend_kind"
-                        )
-                    for field_name, value in (
-                        ("manifest_sha256", expected_checkpoint_manifest_sha256),
-                        ("object_sha256", expected_checkpoint_object_sha256),
-                    ):
-                        if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
-                            raise ValueError("mapping backend checkpoint identity has invalid %s" % field_name)
-                nav2_map_metadata = self._resolve_nav2_map_metadata(bundle)
-                nav2_yaml_path = self._resolve_existing_nav2_map_yaml_path(
-                    bundle,
-                    bundle_root=bundle_root,
-                    nav2_map_metadata=nav2_map_metadata,
-                )
-                if nav2_yaml_path is None:
-                    raise RuntimeError("finalized 地图资产包缺少 Nav2 map.yaml。")
-                activation_kwargs = {
-                    "map_name": bundle.map_name,
-                    "bundle_root": bundle_root,
-                    "mapping_database_path": geometry_asset.mapping_database_path,
-                    "pcd_path": geometry_asset.pcd_path,
-                    "nav_map_yaml_path": self._bundle_relative_path(
-                        bundle_root,
-                        nav2_yaml_path,
-                    ),
-                    "asset_manifest_sha256": bundle.manifest_sha256,
-                    "occupancy_grid": bundle.snapshot.occupancy_grid,
-                    "activation_request_id": activation_request_id,
-                    "expected_mapping_backend_kind": expected_backend_kind,
-                    "expected_backend_checkpoint_manifest_sha256": (
-                        expected_checkpoint_manifest_sha256
-                    ),
-                    "expected_backend_checkpoint_object_sha256": (
-                        expected_checkpoint_object_sha256
-                    ),
-                }
-                result = activator(
-                    **activation_kwargs,
-                )
-                if isinstance(result, dict):
-                    cloned_result = self._clone_metadata(result)
-                    raw_disposition = str(
-                        cloned_result.get("backend_activation_disposition") or ""
-                    ).strip()
-                    backend_switch_applied = (
-                        cloned_result.get("backend_switch_applied") is True
-                        and raw_disposition == "applied"
-                    )
-                    disposition = (
-                        "applied"
-                        if backend_switch_applied
-                        else (
-                            "not_attempted"
-                            if raw_disposition == "not_attempted"
-                            and (
-                                cloned_result.get("backend_switch_applied") is False
-                                or "backend_switch_applied" not in cloned_result
-                            )
-                            else "unknown"
-                        )
-                    )
-                    reported_map_name = str(
-                        cloned_result.get("map_name") or ""
-                    ).strip()
-                    reported_manifest = str(
-                        cloned_result.get("asset_manifest_sha256") or ""
-                    ).strip().lower()
-                    if backend_switch_applied and (
-                        reported_map_name != bundle.map_name
-                        or reported_manifest != bundle.manifest_sha256
-                    ):
-                        backend_switch_applied = False
-                        disposition = "unknown"
-                        cloned_result = {
-                            **cloned_result,
-                            "backend_reported_map_name": reported_map_name or None,
-                            "backend_reported_asset_manifest_sha256": (
-                                reported_manifest or None
-                            ),
-                            "reason": "backend_activation_identity_mismatch",
-                        }
-                    activation_result = {
-                        **cloned_result,
-                        **activation_payload,
-                        "backend_switch_applied": backend_switch_applied,
-                        "backend_activation_disposition": disposition,
-                    }
-                    if mapping_backend is self._remote_provider and backend_switch_applied:
-                        session_id = str(
-                            activation_result.get("mapping_session_id")
-                            or activation_result.get("session_id")
-                            or ""
-                        ).strip()
-                        expected_request_id = str(
-                            activation_request_id or ""
-                        ).strip()
-                        try:
-                            session_generation = int(
-                                activation_result.get("session_generation") or 0
-                            )
-                        except (TypeError, ValueError):
-                            session_generation = 0
-                        try:
-                            revision = int(activation_result.get("revision") or 0)
-                        except (TypeError, ValueError):
-                            revision = 0
-                        if (
-                            not session_id
-                            or activation_result.get("active") is not True
-                            or session_generation <= 0
-                            or revision <= 0
-                            or (
-                                expected_request_id
-                                and session_id != expected_request_id
-                            )
-                        ):
-                            return {
-                                **activation_result,
-                                "backend_switch_applied": False,
-                                "backend_activation_disposition": "unknown",
-                                "reason": "backend_activation_session_identity_invalid",
-                            }
-                        try:
-                            self._ensure_mapping_lifecycle_fields()
-                            with self._mapping_lifecycle_lock:
-                                self._mapping_session_context = {
-                                    **dict(activation_result),
-                                    "session_id": session_id,
-                                    "map_name": bundle.map_name,
-                                    "active": True,
-                                }
-                                self._mapping_session_provider_attach_epoch = int(
-                                    getattr(self, "_provider_attach_epoch", 0)
-                                )
-                        except Exception as exc:
-                            raise MapAssetBackendActivationOutcomeUnknown(
-                                bundle.map_name
-                            ) from exc
-                    return activation_result
-                return {
-                    **activation_payload,
-                    "backend_switch_applied": False,
-                    "backend_activation_disposition": "unknown",
-                    "backend_result": result,
-                    "reason": "backend_activation_result_not_mapping",
-                }
-            return {
-                **activation_payload,
-                "backend_switch_applied": False,
-                "backend_activation_disposition": "not_attempted",
-                "reason": "backend_missing_activate_platform_map",
-                "backend": type(mapping_backend).__name__,
-            }
-        if mapping_backend is None:
-            return {
-                **activation_payload,
-                "backend_switch_applied": False,
-                "backend_activation_disposition": "not_attempted",
-                "reason": "mapping_backend_unavailable",
-            }
-        return {
-            **activation_payload,
-            "backend_switch_applied": False,
-            "backend_activation_disposition": "not_attempted",
-            "reason": "backend_missing_activate_platform_map",
-        }
 
 
     def _resolve_nav2_map_metadata(
@@ -7550,93 +6447,7 @@ class PlatformGeometryRuntime:
         return None
 
 
-    def _wait_for_activated_map_snapshot(
-        self,
-        *,
-        bundle: MapAssetBundle,
-        activation_result: Dict[str, object],
-        timeout_sec: float,
-    ) -> Optional[MapSnapshot]:
-        expected_session_id = str(
-            activation_result.get("mapping_session_id")
-            or activation_result.get("session_id")
-            or ""
-        ).strip()
-        try:
-            expected_generation = int(
-                activation_result.get("session_generation") or 0
-            )
-        except (TypeError, ValueError):
-            expected_generation = 0
-        if not expected_session_id or expected_generation <= 0:
-            return None
 
-        deadline = time.monotonic() + max(0.0, float(timeout_sec))
-        while True:
-            snapshot = self.get_map_snapshot(
-                _seed_bundle=bundle,
-                _seed_activation_result=activation_result,
-            )
-            if snapshot is not None:
-                metadata = dict(snapshot.metadata or {})
-                expected_mapping_identity = (
-                    expected_session_id,
-                    bundle.map_name,
-                    expected_generation,
-                )
-                present_layer_count = 0
-                all_present_layers_correlated = True
-                for key, layer in (
-                    ("occupancy_mapping_identity", snapshot.occupancy_grid),
-                    ("cost_map_mapping_identity", snapshot.cost_map),
-                ):
-                    if layer is None:
-                        continue
-                    present_layer_count += 1
-                    raw_identity = metadata.get(key)
-                    if not isinstance(raw_identity, (list, tuple)) or len(
-                        raw_identity
-                    ) != 3:
-                        all_present_layers_correlated = False
-                        break
-                    try:
-                        layer_identity = (
-                            str(raw_identity[0] or "").strip(),
-                            str(raw_identity[1] or "").strip(),
-                            int(raw_identity[2] or 0),
-                        )
-                    except (TypeError, ValueError):
-                        all_present_layers_correlated = False
-                        break
-                    if layer_identity != expected_mapping_identity:
-                        all_present_layers_correlated = False
-                        break
-                try:
-                    snapshot_generation = int(
-                        metadata.get("session_generation") or 0
-                    )
-                except (TypeError, ValueError):
-                    snapshot_generation = 0
-                if (
-                    metadata.get("map_snapshot_kind") == "live_streaming"
-                    and str(metadata.get("map_name") or "").strip()
-                    == bundle.map_name
-                    and str(
-                        metadata.get("asset_manifest_sha256") or ""
-                    ).strip().lower()
-                    == str(bundle.manifest_sha256 or "").strip().lower()
-                    and str(
-                        metadata.get("mapping_session_id") or ""
-                    ).strip()
-                    == expected_session_id
-                    and snapshot_generation == expected_generation
-                    and present_layer_count > 0
-                    and all_present_layers_correlated
-                ):
-                    return snapshot
-            if time.monotonic() >= deadline:
-                return None
-            time.sleep(0.05)
 
 
     def _has_live_or_seed_map(self) -> bool:

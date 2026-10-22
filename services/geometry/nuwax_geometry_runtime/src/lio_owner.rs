@@ -822,9 +822,7 @@ impl GeometryRuntimeOwnerShutdownFailure {
         }
     }
 
-    pub(crate) fn into_pending_owner(self) -> Option<Box<GeometryRuntimeOwner>> {
-        self.pending_owner
-    }
+
 }
 
 impl GeometryRuntimeOwner {

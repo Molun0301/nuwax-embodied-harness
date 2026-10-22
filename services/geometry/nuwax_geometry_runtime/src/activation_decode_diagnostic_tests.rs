@@ -5,17 +5,15 @@ use crate::activation_identity::{CanonicalCloudTargetV2, CheckpointMemberIdentit
 use crate::proto;
 use std::time::Instant;
 
-struct NoHash(bool, bool);
+struct NoHash(bool);
 impl NoHash {
     fn enter() -> Self {
-        Self(crate::map_checksum::FORBID_HASH.with(|v| v.replace(true)),
-            crate::dense_cloud::FORBID_ARCHIVE_HASH.with(|v| v.replace(true)))
+        Self(crate::map_checksum::FORBID_HASH.with(|v| v.replace(true)))
     }
 }
 impl Drop for NoHash {
     fn drop(&mut self) {
         crate::map_checksum::FORBID_HASH.with(|v| v.set(self.0));
-        crate::dense_cloud::FORBID_ARCHIVE_HASH.with(|v| v.set(self.1));
     }
 }
 
@@ -46,7 +44,7 @@ fn target(count: usize) -> CanonicalCloudTargetV2 {
     }
     CanonicalCloudTargetV2::admit(proto::CloudMapCheckpoint {
         frame_id: "map".into(), source_revision: 9, point_count: count as u32,
-        voxel_size: 0.125, xyz_f32_le: bytes, xyz_sha256: String::new(),
+        voxel_size: 0.125, xyz_f32_le: bytes,
         payload_schema_version: 2, member_identity: Some(member),
     }, parent.checkpoint_id(), parent.occupancy_receipt(), parent.cloud_receipt().unwrap(),
         parent.frame_id()).unwrap()

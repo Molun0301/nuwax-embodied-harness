@@ -71,7 +71,7 @@ try:
     stub.entries[response.fine_map_artifact.id][1] = bytearray(fixture)
     client = runtime(stub)
     client._assigned_fine_archive_versions = frozenset([4])
-    bundle = client.export_mapping_backend_checkpoint(checkpoint_schema_version=2)
+    bundle = client.export_mapping_backend_checkpoint()
     assert bytes(bundle.checkpoint.fine_archive) == fixture
     bundle.publish_to(case.root)
     reopened = provider.reopen_mapping_backend_checkpoint(case.root, 'voxel')

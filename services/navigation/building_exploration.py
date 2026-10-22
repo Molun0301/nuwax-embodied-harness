@@ -3,11 +3,13 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import fcntl
+import json
 import time
 from typing import Protocol
 import uuid
 
 from contracts.building_navigation import BuildingExplorationRequest, BuildingExplorationState, FloorRecord
+from contracts.map_identity import AssetIdentityV2
 from services.mapping.catalog import _atomic_write_text
 from services.navigation.building_catalog import BuildingCatalog
 
@@ -38,7 +40,9 @@ class BuildingExplorationService:
     def load(self):
         if not self.path.exists():return None
         if self.path.stat().st_size>1024*1024:raise ValueError("逐层探索记录超出预算。")
-        return BuildingExplorationState.model_validate_json(self.path.read_text(encoding="utf-8"))
+        document=json.loads(self.path.read_text(encoding="utf-8"))
+        if not isinstance(document,dict) or type(document.get("schema_version")) is not int or document["schema_version"]!=2:raise ValueError("旧逐层探索依赖已退役的摘要身份，不能自动恢复；请先对账原子任务。")
+        return BuildingExplorationState.model_validate(document)
 
     def save(self,state,ports):
         with self.catalog.maps.map_activation_guard():
@@ -62,11 +66,12 @@ class BuildingExplorationService:
                 raise ValueError("逐层探索的楼层绑定已改变。")
         return topology,actual
 
-    def _bind_asset(self,state,floor,manifest):
+    def _bind_asset(self,state,floor,identity):
+        identity=AssetIdentityV2.model_validate(identity)
         topology,actual=self._topology(state)
-        updated=floor.model_copy(update={"asset_manifest_sha256":manifest})
+        updated=floor.model_copy(update={"asset_identity":identity})
         self.catalog.validate_floor_asset(updated)
-        if actual[floor.floor_id].asset_manifest_sha256!=manifest:
+        if actual[floor.floor_id].asset_identity!=identity:
             next_topology=topology.model_copy(update={"revision":topology.revision+1,"floors":tuple(updated if f.floor_id==floor.floor_id else f for f in topology.floors)})
             self.catalog.save(next_topology,expected_revision=topology.revision)
             state.topology_revision=next_topology.revision
@@ -109,8 +114,8 @@ class BuildingExplorationService:
                     if state.child_kind=="transfer" and state.child_task_id:
                         result=self._wait_child(state,ports)
                         state.child_succeeded=True;self.save(state,ports)
-                        manifest=result.get("created_manifest")
-                        if manifest:floor=self._bind_asset(state,floor,manifest)
+                        identity=result.get("created_asset_identity")
+                        if identity:floor=self._bind_asset(state,floor,identity)
                         state.child_task_id=None;state.child_request_id=None;state.child_kind=None;state.child_succeeded=False
                         state.stage="accepted";self.save(state,ports)
                     if ports.active_map_name()!=floor.map_name:
@@ -130,8 +135,8 @@ class BuildingExplorationService:
                         state.child_succeeded=True;state.stage="finalizing";state.message=result.get("stop_reason") or "探索终态已确认，等待地图资产。"
                         self.save(state,ports)
                     receipt=ports.asset_receipt(state,floor)
-                    floor=self._bind_asset(state,floor,receipt["manifest_sha256"])
-                    state.completed_floors[floor.floor_id]={"map_name":floor.map_name,"manifest_sha256":receipt["manifest_sha256"],"stop_reason":state.message}
+                    floor=self._bind_asset(state,floor,receipt["asset_identity"])
+                    state.completed_floors[floor.floor_id]={"map_name":floor.map_name,"asset_identity":floor.asset_identity.model_dump(),"stop_reason":state.message}
                     state.next_floor_index+=1;state.child_task_id=None;state.child_request_id=None;state.child_kind=None;state.child_succeeded=False;state.stage="accepted"
                     self.save(state,ports)
                 state.stage="succeeded";state.terminal=True;state.message="设定的楼层探索与地图保存已完成。"
@@ -142,7 +147,7 @@ class BuildingExplorationService:
                 if state.child_kind=="explore":
                     try:
                         _,floors=self._topology(state);floor=floors[request.floors[state.next_floor_index].floor_id]
-                        manifest=ports.checkpoint(floor,state)
-                        if manifest:self._bind_asset(state,floor,manifest)
+                        identity=ports.checkpoint(floor,state)
+                        if identity:self._bind_asset(state,floor,identity)
                     except Exception as save_error:state.message+="；地图检查点未完成："+str(save_error)
                 self.save(state,ports);ports.interrupt_barrier(proof);raise

@@ -3,48 +3,14 @@
 Only core StateNamespace/GatewayError and the state-write callback are boundary
 fakes. No workspace full module/native runtime import is claimed.
 """
-import ast
-import importlib
-import sys
 import types
 import unittest
 from unittest.mock import patch
-from datetime import datetime
-from typing import Dict, Optional
 import tests.test_planar_asset_catalog as assets
-from contracts.map_workspace import MapAssetBundle
-from services.mapping.asset_store import MapAssetBundleError
 
-class GatewayError(RuntimeError):
-    def __init__(self, message, **kwargs):
-        super().__init__(message)
-        self.metadata = kwargs
+from skills.map_workspace import MapWorkspaceService as Workspace
+from skills import assigned_map_save as save
 
-core = types.ModuleType('core')
-core.StateNamespace = types.SimpleNamespace(MAP='map')
-errors = types.ModuleType('core.errors'); errors.GatewayError = GatewayError
-# Load the real save module with explicit boundary fakes without leaking those
-# modules into unrelated test collection or later production imports.
-with patch.dict(sys.modules, {'core': core, 'core.errors': errors}):
-    previous_save = sys.modules.pop('skills.assigned_map_save', None)
-    try:
-        save = importlib.import_module('skills.assigned_map_save')
-    finally:
-        sys.modules.pop('skills.assigned_map_save', None)
-        if previous_save is not None:
-            sys.modules['skills.assigned_map_save'] = previous_save
-
-
-path = assets.ASSET_SOURCE / 'skills/map_workspace.py'
-tree = ast.parse(path.read_text())
-node = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == 'MapWorkspaceService')
-node.body = [method for method in node.body if isinstance(method, ast.FunctionDef) and method.name in
-    {'get_map_asset_bundle', 'finalize_active_map', '_require_map_name', '_sanitize_map_metadata'}]
-module = ast.Module(body=[ast.ImportFrom(module='__future__', names=[ast.alias(name='annotations', asname=None)], level=0, lineno=1, col_offset=0), node], type_ignores=[])
-namespace = dict(MapAssetBundle=MapAssetBundle, MapAssetBundleError=MapAssetBundleError,
-    GatewayError=GatewayError, StateNamespace=core.StateNamespace, datetime=datetime)
-exec(compile(ast.fix_missing_locations(module), str(path), 'exec'), namespace)
-Workspace = namespace['MapWorkspaceService']
 
 class RecordingState:
     def __init__(self):
@@ -58,13 +24,15 @@ class RecordingState:
 class WorkspaceLoadTests(assets.AssetCatalogTests):
     def setUp(self):
         super().setUp()
-        self.guard.enter_context(patch.dict(sys.modules, {'skills.assigned_map_save': save}))
 
     def workspace(self):
-        owner = Workspace.__new__(Workspace)
+        state = RecordingState()
+        owner = Workspace(catalog_root=str(self.repository._root_dir),
+            geometry_runtime=types.SimpleNamespace(capture_assigned_fine_import_origin=lambda: None),
+            mapping_service=types.SimpleNamespace(), localization_service=types.SimpleNamespace(),
+            memory_service=types.SimpleNamespace(), navigation_service=types.SimpleNamespace(), state_store=state)
         owner._repository = self.catalog
         owner._asset_repository = self.repository
-        owner._state_store = RecordingState()
         return owner
 
     def test_normal_workspace_load_imports_once_and_persists_selection(self):
@@ -181,7 +149,7 @@ class WorkspaceLoadTests(assets.AssetCatalogTests):
 
 
 if __name__ == '__main__':
-    print('Workspace method is verbatim AST; assigned_map_save fully imported; core/state boundaries are recording fakes')
+    print('真实工作区构造与地图目录；状态写入为记录端点')
     result = unittest.TextTestRunner(verbosity=2).run(unittest.TestSuite([
         WorkspaceLoadTests(name) for name in WorkspaceLoadTests.__dict__ if name.startswith('test_')]))
     raise SystemExit(not result.wasSuccessful())

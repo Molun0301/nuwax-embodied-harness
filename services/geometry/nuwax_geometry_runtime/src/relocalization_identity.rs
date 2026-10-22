@@ -11,16 +11,7 @@ use crate::proto;
 
 /// Validate the assigned boundary before ingress lookup or any legacy hashing.
 pub(crate) fn validate_live_request_boundary(request: &proto::RelocalizeRequest) -> Result<(), String> {
-    if request.schema_version == 2 {
-        return AssignedCloudRelocalizeRequestIdentityV2::admit(request.clone()).map(|_| ());
-    }
-    if request.schema_version != 1 {
-        return Err("RELOCALIZATION_SCHEMA_VERSION_UNSUPPORTED".into());
-    }
-    if request.assigned_target.is_some() {
-        return Err("RELOCALIZATION_ASSIGNED_FIELDS_MIXED_WITH_LEGACY".into());
-    }
-    Ok(())
+    AssignedCloudRelocalizeRequestIdentityV2::admit(request.clone()).map(|_| ())
 }
 
 #[derive(Clone, Debug)]
@@ -189,27 +180,6 @@ impl PartialEq for AssignedCloudRelocalizeRequestIdentityV2 {
 impl Eq for AssignedCloudRelocalizeRequestIdentityV2 {}
 
 impl AssignedCloudRelocalizeRequestIdentityV2 {
-    #[cfg(test)]
-    /// Durable identities must already use the canonical normalized descriptor.
-    /// Public request/query admission still accepts the defined zero timeout.
-    pub(crate) fn admit_canonical(request: proto::RelocalizeRequest) -> Result<Self, String> {
-        Self::admit_canonical_with(request, false)
-    }
-
-    pub(crate) fn admit_retained_canonical(request: proto::RelocalizeRequest) -> Result<Self, String> {
-        Self::admit_canonical_with(request, true)
-    }
-
-    fn admit_canonical_with(request: proto::RelocalizeRequest, retained: bool) -> Result<Self, String> {
-        use prost::Message;
-        let encoded = request.encode_to_vec();
-        let identity = Self::admit_with(request, retained)?;
-        if identity.to_wire().encode_to_vec() != encoded {
-            return Err("RELOCALIZATION_ASSIGNED_REQUEST_NON_CANONICAL".into());
-        }
-        Ok(identity)
-    }
-
     pub(crate) fn admit(request: proto::RelocalizeRequest) -> Result<Self, String> {
         Self::admit_with(request, false)
     }
@@ -224,18 +194,6 @@ impl AssignedCloudRelocalizeRequestIdentityV2 {
             return Err("RELOCALIZATION_ASSIGNED_SCHEMA_UNSUPPORTED".into());
         }
         crate::correction_coordinator::validate_relocalization_request_id(&request.request_id)?;
-        if request.runtime_generation != 0 || !request.session_id.is_empty() || !request.map_name.is_empty()
-            || request.session_generation != 0 || request.backend_generation != 0
-            || !request.activation_identity_sha256.is_empty() || !request.target_receipt_sha256.is_empty()
-            || request.target_cloud_revision != 0 || !request.target_cloud_sha256.is_empty()
-            || !request.asset_manifest_sha256.is_empty() || !request.asset_bundle_sha256.is_empty()
-            || request.source_policy_version != 0 || !request.source_policy_sha256.is_empty()
-            || request.deadline_policy_version != 0 || !request.deadline_policy_sha256.is_empty()
-            || request.logical_timeout_ms != 0 || request.algorithm_options_version != 0
-            || !request.algorithm_options_sha256.is_empty() || !request.target_kind.is_empty()
-            || !request.target_graph_sha256.is_empty() || request.planar_seed.is_some() {
-            return Err("RELOCALIZATION_ASSIGNED_FIELDS_MIXED_WITH_LEGACY".into());
-        }
         let (target, policy, timeout, planar_seed_bits) = match request.assigned_target {
             Some(proto::relocalize_request::AssignedTarget::AssignedCloudV2(body)) => {
                 let policy = body.policy.ok_or("assigned policy parameters are absent")?;
@@ -318,7 +276,7 @@ pub(crate) mod tests {
         body(&mut historical).policy = Some(historical_policy_fixture());
         body(&mut historical).logical_timeout_ms = 30_000;
         let encoded = historical.encode_to_vec();
-        let retained = AssignedCloudRelocalizeRequestIdentityV2::admit_retained_canonical(historical.clone()).unwrap();
+        let retained = AssignedCloudRelocalizeRequestIdentityV2::admit_retained(historical.clone()).unwrap();
         assert_eq!(retained.to_wire().encode_to_vec(), encoded);
         assert!(AssignedCloudRelocalizeRequestIdentityV2::admit(historical.clone()).is_err());
         assert!(validate_live_request_boundary(&historical).is_err());
@@ -333,7 +291,7 @@ pub(crate) mod tests {
             assert!(AssignedCloudRelocalizeRequestIdentityV2::admit_retained(unknown).is_err());
         }
         body(&mut historical).logical_timeout_ms = 0;
-        assert!(AssignedCloudRelocalizeRequestIdentityV2::admit_retained_canonical(historical).is_err());
+        assert_eq!(AssignedCloudRelocalizeRequestIdentityV2::admit_retained(historical).unwrap().logical_timeout_ms(), 30_000);
     }
 
     pub(crate) fn wire() -> proto::RelocalizeRequest {
@@ -379,11 +337,11 @@ pub(crate) mod tests {
         let mut request = wire();
         assert_eq!(validate_live_request_boundary(&request), Ok(()));
         request.schema_version = 1;
-        assert_eq!(validate_live_request_boundary(&request), Err("RELOCALIZATION_ASSIGNED_FIELDS_MIXED_WITH_LEGACY".into()));
-        request.assigned_target = None;
-        assert_eq!(validate_live_request_boundary(&request), Ok(()));
+        assert_eq!(validate_live_request_boundary(&request), Err("RELOCALIZATION_ASSIGNED_SCHEMA_UNSUPPORTED".into()));
+        request.schema_version = 2; request.assigned_target = None;
+        assert_eq!(validate_live_request_boundary(&request), Err("RELOCALIZATION_ASSIGNED_TARGET_ABSENT_OR_UNSUPPORTED".into()));
         request.schema_version = 3;
-        assert_eq!(validate_live_request_boundary(&request), Err("RELOCALIZATION_SCHEMA_VERSION_UNSUPPORTED".into()));
+        assert_eq!(validate_live_request_boundary(&request), Err("RELOCALIZATION_ASSIGNED_SCHEMA_UNSUPPORTED".into()));
     }
 
     #[test]
@@ -417,10 +375,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn durable_identity_requires_normalization_but_admission_accepts_default() {
-        assert!(AssignedCloudRelocalizeRequestIdentityV2::admit_canonical(wire()).is_err());
+    fn request_admission_normalizes_default_timeout_once() {
         let admitted = AssignedCloudRelocalizeRequestIdentityV2::admit(wire()).unwrap();
-        assert_eq!(AssignedCloudRelocalizeRequestIdentityV2::admit_canonical(admitted.to_wire()).unwrap(), admitted);
+        assert_eq!(admitted.logical_timeout_ms(), 30_000);
+        assert_eq!(AssignedCloudRelocalizeRequestIdentityV2::admit_retained(admitted.to_wire()).unwrap(), admitted);
     }
 
     #[test]
@@ -440,10 +398,6 @@ pub(crate) mod tests {
     #[test]
     fn missing_mixed_and_unsupported_live_descriptors_reject() {
         let mut changed = wire(); changed.schema_version = 1;
-        assert!(AssignedCloudRelocalizeRequestIdentityV2::admit(changed).is_err());
-        let mut changed = wire(); changed.runtime_generation = 3;
-        assert!(AssignedCloudRelocalizeRequestIdentityV2::admit(changed).is_err());
-        let mut changed = wire(); changed.activation_identity_sha256 = vec![1;32];
         assert!(AssignedCloudRelocalizeRequestIdentityV2::admit(changed).is_err());
         let mut changed = wire(); changed.assigned_target = None;
         assert!(AssignedCloudRelocalizeRequestIdentityV2::admit(changed).is_err());

@@ -59,7 +59,7 @@ class GatewayBuildingPorts:
         yaw=math.atan2(2.0*(q.w*q.z+q.x*q.y),1.0-2.0*(q.y*q.y+q.z*q.z))
         self.state.last_pose=FloorPose(x=pose.position.x,y=pose.position.y,yaw_rad=yaw)
         self.state.last_pose_floor_id=floor.floor_id
-        self.state.last_pose_manifest_sha256=floor.asset_manifest_sha256
+        self.state.last_pose_asset_identity=floor.asset_identity
         self.runtime._get_building_navigation_service().journal.save(self.state)
         self._last_pose_save=time.monotonic()
 
@@ -68,8 +68,8 @@ class GatewayBuildingPorts:
         if invariant:
             invariant()
         descriptor=self.runtime.platform_geometry_runtime.describe_backend()
-        if self.state is not None and self.state.attempt>0 and (descriptor.get("active_map_name")!=floor.map_name or descriptor.get("asset_manifest_sha256")!=floor.asset_manifest_sha256):
-            if self.state.last_pose is None or self.state.last_pose_floor_id!=floor.floor_id or self.state.last_pose_manifest_sha256!=floor.asset_manifest_sha256:
+        if self.state is not None and self.state.attempt>0 and (descriptor.get("active_map_name")!=floor.map_name or descriptor.get("asset_identity")!=(floor.asset_identity.model_dump() if floor.asset_identity is not None else None)):
+            if self.state.last_pose is None or self.state.last_pose_floor_id!=floor.floor_id or self.state.last_pose_asset_identity!=floor.asset_identity:
                 raise GatewayError("恢复层内移动前缺少与完整图绑定的最后位姿。",error_code="floor_resume_localization_required")
             if not self.activate_and_localize(floor,self.state.last_pose):
                 raise GatewayError("恢复层内移动前尚未取得有效定位。",error_code="floor_resume_localization_required")
@@ -170,7 +170,8 @@ class GatewayBuildingPorts:
             raise
         self.runtime._refresh_workspace_snapshots(refresh_localization=False)
         return bool(session.status==LocalizationSessionStatus.READY and workspace.active_map_name==floor.map_name
-                    and workspace.map_asset is not None and workspace.map_asset.asset_manifest_sha256==floor.asset_manifest_sha256)
+                    and workspace.map_asset is not None and workspace.map_asset.identity_schema_version==2 and session.asset_identity==floor.asset_identity
+                    and workspace.map_asset.asset_identity==floor.asset_identity)
 
     def start_floor_mapping(self,floor,connection,request_id):
         self.ensure_active()
@@ -182,11 +183,13 @@ class GatewayBuildingPorts:
             if existing is None:
                 self.runtime.map_workspace_service.create_map(map_name=floor.map_name,display_name=floor.display_name,
                     metadata={"floor_creation_request_id":request_id,"floor_id":floor.floor_id})
-            elif existing.finalized and existing.asset_manifest_sha256:
-                restored=floor.model_copy(update={"asset_manifest_sha256":existing.asset_manifest_sha256})
+            elif existing.finalized:
+                if existing.identity_schema_version!=2 or existing.asset_identity is None:
+                    raise GatewayError("旧层图检查点需先导入分配身份，不能按旧摘要恢复。",error_code="floor_legacy_asset_requires_import")
+                restored=floor.model_copy(update={"asset_identity":existing.asset_identity})
                 if not self.activate_and_localize(restored,connection.arrival_pose):
                     raise GatewayError("初始层图已有检查点，但尚未恢复定位。",error_code="floor_new_map_localization_required")
-                return existing.asset_manifest_sha256
+                return existing.asset_identity
         self.runtime._handle_start_mapping({"map_name":floor.map_name},requested_by=self.requested_by)
         while True:
             self.ensure_active()
@@ -196,9 +199,9 @@ class GatewayBuildingPorts:
             time.sleep(min(0.1,self.remaining_sec()))
         bundle=self.runtime.map_workspace_service.finalize_active_map(map_name=floor.map_name,reason="跨层新图初始检查点",
             metadata={"floor_creation_request_id":request_id,"floor_id":floor.floor_id})
-        if not bundle.manifest_sha256:
+        if bundle.identity_schema_version!=2 or bundle.asset_identity is None:
             raise GatewayError("新层初始地图没有保存成功。",error_code="floor_initial_checkpoint_failed")
-        return bundle.manifest_sha256
+        return bundle.asset_identity
 
     def dock_to_exit(self,connection,floor,invariant=None):
         provider=getattr(self.runtime.robot.providers,"bounded_docking_provider",None)

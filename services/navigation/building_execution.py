@@ -4,6 +4,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import fcntl
+import json
 from pathlib import Path
 import time
 import uuid
@@ -13,6 +14,7 @@ from contracts.building_navigation import (
     FacilityOperation, FacilitySnapshot, FloorConnection, FloorExecutionState,
     FloorNavigationRequest, FloorPose, FloorRecord,
 )
+from contracts.map_identity import AssetIdentityV2
 from providers.facilities import FacilityOutcomeUnknown, FacilityProvider, FacilityUnavailable
 from services.mapping.catalog import _atomic_write_text
 from services.navigation.building_catalog import BuildingCatalog
@@ -27,7 +29,7 @@ class BuildingExecutionPorts(Protocol):
     def stop_navigation(self, goal_id: str | None) -> Mapping[str, object]: ...
     def stop_mapping(self) -> None: ...
     def activate_and_localize(self, floor: FloorRecord, seed: FloorPose) -> bool: ...
-    def start_floor_mapping(self, floor: FloorRecord, connection: FloorConnection, request_id: str) -> str: ...
+    def start_floor_mapping(self, floor: FloorRecord, connection: FloorConnection, request_id: str) -> AssetIdentityV2: ...
     def dock_to_exit(self, connection: FloorConnection, floor: FloorRecord, invariant: Callable[[], None] | None = None) -> bool: ...
     def active_map_name(self) -> str | None: ...
     def progress(self, state: FloorExecutionState) -> None: ...
@@ -59,7 +61,10 @@ class BuildingExecutionJournal:
             return None
         if self.path.stat().st_size > 1024 * 1024:
             raise ValueError("跨层任务记录超过大小预算。")
-        return FloorExecutionState.model_validate_json(self.path.read_text(encoding="utf-8"))
+        document = json.loads(self.path.read_text(encoding="utf-8"))
+        if not isinstance(document, dict) or type(document.get("schema_version")) is not int or document["schema_version"] != 2:
+            raise ValueError("旧跨层任务依赖已退役的摘要身份，不能自动恢复；请先对账原设施操作。")
+        return FloorExecutionState.model_validate(document)
 
     def save(self, state: FloorExecutionState) -> None:
         with self.catalog.maps.map_activation_guard():
@@ -185,8 +190,8 @@ class BuildingNavigationService:
 
     @staticmethod
     def _effective_floor(state: FloorExecutionState, floor: FloorRecord) -> FloorRecord:
-        if state.request.create_target_map and floor.floor_id == state.request.target_floor_id and state.created_map_manifest_sha256:
-            return floor.model_copy(update={"asset_manifest_sha256": state.created_map_manifest_sha256})
+        if state.request.create_target_map and floor.floor_id == state.request.target_floor_id and state.created_map_asset_identity:
+            return floor.model_copy(update={"asset_identity": state.created_map_asset_identity})
         return floor
 
     def _navigate(self, state: FloorExecutionState, floor: FloorRecord, pose: FloorPose, ports: BuildingExecutionPorts, invariant: Callable[[], None] | None = None) -> None:
@@ -302,9 +307,9 @@ class BuildingNavigationService:
                 self._operation(state, connection, "hold_door", target.floor_id, ports)
             elif stage == "activating_target":
                 self._await_docked(state, connection, target.floor_id, ports)
-                if state.request.create_target_map and target.asset_manifest_sha256 is None:
-                    if state.created_map_manifest_sha256 is None:
-                        state.created_map_manifest_sha256 = ports.start_floor_mapping(target, connection, state.request.request_id)
+                if state.request.create_target_map and target.asset_identity is None:
+                    if state.created_map_asset_identity is None:
+                        state.created_map_asset_identity = ports.start_floor_mapping(target, connection, state.request.request_id)
                         self._save(state, ports, message="新层已取得真实扫描并保存初始地图检查点。")
                     else:
                         restored=self._effective_floor(state,target)

@@ -3077,9 +3077,10 @@ class NavigationService:
                 if localization_session is not None and (map_name is None or localization_session.map_name == map_name)
                 else None
             ),
-            "asset_manifest_sha256": (
-                localization_session.asset_manifest_sha256
-                if localization_session is not None and (map_name is None or localization_session.map_name == map_name)
+            "asset_identity": (
+                localization_session.asset_identity.model_dump()
+                if localization_session is not None and localization_session.asset_identity is not None
+                and (map_name is None or localization_session.map_name == map_name)
                 else None
             ),
             "waiting_for": waiting_for,

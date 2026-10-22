@@ -15,6 +15,7 @@ from tests.test_assigned_asset_storage import bundle_fixture, checkpoint_fixture
 from tests.conftest import response_fixture
 
 from contracts.map_identity import AssetIdentityV2
+from contracts.geometry_runtime import PlatformGeometryConfig
 from contracts.runtime_views import MapSnapshot
 from services.geometry import geometry_runtime_provider as provider_module
 from services.geometry import runtime as module
@@ -52,10 +53,8 @@ class AssignedRuntimeAdoptionTests(unittest.TestCase):
         self.provider._connected = True
         self.provider._stub = self.stub
         self.stub.owner = self.provider
-        self.runtime = object.__new__(module.PlatformGeometryRuntime)
-        self.runtime._runtime_state_lock = threading.RLock()
-        self.runtime._mapping_lifecycle_lock = threading.RLock()
-        self.runtime._provider_attach_lock = threading.RLock()
+        self.runtime = module.PlatformGeometryRuntime(config=PlatformGeometryConfig(), catalog_root=str(self.root),
+            robot=SimpleNamespace(providers=SimpleNamespace()))
         self.runtime._provider_attach_epoch = 2
         self.runtime._remote_provider = self.provider
         self.runtime._provider_attach_stopping = False
@@ -63,7 +62,7 @@ class AssignedRuntimeAdoptionTests(unittest.TestCase):
         for name in hashlib.algorithms_guaranteed | {"new", "file_digest"}:
             if hasattr(hashlib, name):
                 self.stack.enter_context(patch.object(hashlib, name, side_effect=AssertionError("hash called")))
-        for name in ("_validate_bundle_manifest", "_materialize_assigned_checkpoint_pcd_asset",
+        for name in ("_materialize_checkpoint_pcd_asset",
                      "_install_map_activation_snapshot_locked", "get_authoritative_mapping_session_state",
                      "stop_mapping"):
             self.stack.enter_context(patch.object(self.runtime, name, side_effect=AssertionError(name)))
@@ -411,6 +410,7 @@ class AssignedRuntimeAdoptionTests(unittest.TestCase):
     def test_runtime_attach_swap_waits_for_existing_installation_guard(self):
         self.install()
         runtime = self.runtime
+        runtime._runtime_started = True
         runtime._navigation_update_subscribers = {}
         runtime._remote_navigation_subscription_ids = {}
         runtime._remote_exploration_subscription_id = None
@@ -480,8 +480,6 @@ class AssignedRuntimeAdoptionTests(unittest.TestCase):
                 other = {**self.request, name: changed}
                 self.assertFalse(self.runtime.arm_assigned_map_activation_fence(activation_request=other))
                 self.assertFalse(self.runtime.complete_assigned_map_activation(activation_request=other))
-        self.assertFalse(self.runtime.complete_map_asset_activation(
-            map_name=self.bundle.map_name, asset_manifest_sha256="", activation_request_id="mapload:exact"))
         target, _ = self.install()
         self.assertTrue(self.runtime.complete_assigned_map_activation(
             activation_request=self.request, expected_target=target))

@@ -25,7 +25,7 @@ class ExplorationCheckpoint(BaseModel):
     """保存经过停车确认的源进度和当时实际完成的地图资产身份。"""
 
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
-    schema_version: Literal[1, 2] = 1
+    schema_version: Literal[1, 2] = 2
     checkpoint_id: str = Field(min_length=1, max_length=128)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     pipeline: Literal["slam_2d", "lio_3d"]
@@ -41,14 +41,6 @@ class ExplorationCheckpoint(BaseModel):
     def _check_version(cls, value):
         if type(value) is not int or value not in (1, 2):
             raise ValueError("探索检查点版本必须为整数 1 或 2")
-        return value
-
-    @field_validator("asset_identity", mode="before")
-    @classmethod
-    def _check_asset_identity(cls, value):
-        # 再次准入 typed 对象，拒绝绕过模型校验生成的副本。
-        if isinstance(value, AssetIdentityV2):
-            return AssetIdentityV2(asset_id=value.asset_id)
         return value
 
     @field_validator("mapping_checkpoint_id", mode="before")
@@ -75,8 +67,8 @@ class ExplorationCheckpoint(BaseModel):
         if self.schema_version == 1:
             if self.asset_manifest_sha256 is None or self.asset_identity is not None or self.mapping_checkpoint_id is not None:
                 raise ValueError("旧探索检查点必须且只能绑定原始地图清单摘要")
-        elif self.asset_identity is None or self.mapping_checkpoint_id is None or self.asset_manifest_sha256 is not None or self.pipeline != "lio_3d":
-            raise ValueError("新版探索检查点必须绑定 assigned 三维资产与建图检查点，不能混用清单摘要")
+        elif self.asset_identity is None or self.mapping_checkpoint_id is None or self.asset_manifest_sha256 is not None:
+            raise ValueError("新版探索检查点必须绑定分配身份资产与建图检查点，不能混用清单摘要")
         value = json.loads(self.geometry_progress_json)
         if not isinstance(value, dict) or type(value.get("schema_version")) is not int or value["schema_version"] not in (1, 2) or value.get("map_name") != self.request.map_name or value.get("request_id") != self.request.request_id:
             raise ValueError("探索进度与冻结请求的地图或原任务身份不一致")
@@ -118,28 +110,28 @@ class ExplorationCheckpointStore:
         if not legacy and not current:
             raise ValueError("探索检查点封装版本无效")
         # 旧本地摘要仅作为输入兼容字段忽略；原生进度及地图资产绑定保持原样。
-        return ExplorationCheckpoint.model_validate_json(envelope["payload"])
+        document = json.loads(envelope["payload"])
+        if not isinstance(document, dict):
+            raise ValueError("探索检查点载荷必须是对象")
+        if "schema_version" not in document:
+            document["schema_version"] = 1
+        return ExplorationCheckpoint.model_validate(document)
 
     def _validate_catalog_identity(self, value: ExplorationCheckpoint) -> None:
         asset = self.maps.get_map_asset(value.request.map_name)
-        if asset is None or not asset.finalized or asset.identity_schema_version != value.schema_version:
+        if asset is None or not asset.finalized or asset.identity_schema_version != 2:
             raise ValueError("检查点绑定的完整地图已缺失或改变")
-        if value.schema_version == 2:
-            if asset.asset_identity != value.asset_identity or asset.asset_manifest_sha256 is not None:
-                raise ValueError("检查点绑定的 assigned 地图身份已改变")
-        elif asset.asset_manifest_sha256 != value.asset_manifest_sha256:
-            raise ValueError("检查点绑定的完整地图已缺失或改变")
+        if asset.asset_identity != value.asset_identity:
+            raise ValueError("检查点绑定的 assigned 地图身份已改变")
 
     def validate_asset(self, value: ExplorationCheckpoint, *,
                        _previous: Optional[ValidatedMapAssetBundleSnapshot] = None) -> ValidatedMapAssetBundleSnapshot:
+        if value.schema_version != 2:
+            raise ValueError("旧探索检查点依赖已退役的摘要身份，仅支持读取，不能恢复或重新保存。")
         self._validate_catalog_identity(value)
         try:
-            if value.schema_version == 2:
-                snapshot = self.assets.get_validated_map_asset_bundle_snapshot(value.request.map_name,
-                    expected_asset_identity=value.asset_identity, _previous=_previous)
-            else:
-                snapshot = self.assets.get_validated_map_asset_bundle_snapshot(value.request.map_name,
-                    expected_manifest_sha256=value.asset_manifest_sha256)
+            snapshot = self.assets.get_validated_map_asset_bundle_snapshot(value.request.map_name,
+                expected_asset_identity=value.asset_identity, _previous=_previous)
         except MapAssetBundleValidationError as error:
             raise ValueError("检查点绑定的完整地图已缺失或改变") from error
         if snapshot is None or snapshot.bundle.geometry_asset is None:
@@ -147,21 +139,20 @@ class ExplorationCheckpointStore:
         kind = snapshot.bundle.geometry_asset.metadata.get("target_kind")
         if (value.pipeline == "slam_2d") != (kind == "planar_graph"):
             raise ValueError("检查点地图资产与二维/三维链路不一致")
-        if value.schema_version == 2:
-            progress = json.loads(value.geometry_progress_json)
-            source = snapshot.assigned_source_member
-            if (snapshot.bundle.identity_schema_version != 2
-                    or snapshot.bundle.asset_identity != value.asset_identity
-                    or snapshot.bundle.map_name != progress["map_name"]
-                    or snapshot.bundle.frame_id != progress["map_frame_id"]
-                    or source is None or source.role != "canonical_cloud"
-                    or source.checkpoint_id != value.mapping_checkpoint_id
-                    or source.frame_id != progress["map_frame_id"]
-                    or source.occupancy_receipt.get("session_id") != progress["origin_session_id"]
-                    or source.occupancy_receipt.get("session_generation") != progress["origin_session_generation"]):
-                raise ValueError("探索进度与完整地图的原始建图检查点、会话或坐标不一致")
-            # 原进度坐标代次属于运行态；规范 cloud 成员固定为 0，不能拿来比较。
-            # 外层 metadata 摘要不是源凭据，源身份只取已验证的内部清单。
+        progress = json.loads(value.geometry_progress_json)
+        source = snapshot.assigned_source_member
+        if (snapshot.bundle.identity_schema_version != 2
+                or snapshot.bundle.asset_identity != value.asset_identity
+                or snapshot.bundle.map_name != progress["map_name"]
+                or snapshot.bundle.frame_id != progress["map_frame_id"]
+                or source is None or source.role != ("planar_graph" if value.pipeline == "slam_2d" else "canonical_cloud")
+                or source.checkpoint_id != value.mapping_checkpoint_id
+                or source.frame_id != progress["map_frame_id"]
+                or source.occupancy_receipt.get("session_id") != progress["origin_session_id"]
+                or source.occupancy_receipt.get("session_generation") != progress["origin_session_generation"]):
+            raise ValueError("探索进度与完整地图的原始建图检查点、会话或坐标不一致")
+        # 原进度坐标代次属于运行态；规范地图成员固定为 0，不能拿来比较。
+        # 外层 metadata 摘要不是源凭据，源身份只取已验证的内部清单。
         return snapshot
 
     @staticmethod
@@ -179,6 +170,8 @@ class ExplorationCheckpointStore:
             raise TypeError("探索检查点必须使用完整类型契约")
         value = ExplorationCheckpoint.model_validate({name: getattr(value, name)
             for name in ExplorationCheckpoint.model_fields})
+        if value.schema_version != 2:
+            raise ValueError("旧探索检查点依赖已退役的摘要身份，仅支持读取，不能恢复或重新保存。")
         payload = value.model_dump_json()
         value = ExplorationCheckpoint.model_validate_json(payload)
         snapshot = self.validate_asset(value)

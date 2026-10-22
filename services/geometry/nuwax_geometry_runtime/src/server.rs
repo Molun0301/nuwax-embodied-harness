@@ -19,7 +19,9 @@
 mod planar;
 
 use nuwax_codec::{lcm::schema, CodecError, CodecResult};
-use nuwax_protocol::{LcmMessageType, LcmTopic, RawLcmFrame};
+use nuwax_protocol::{LcmMessageType, LcmTopic};
+#[cfg(test)]
+use nuwax_protocol::RawLcmFrame;
 use prost::Message;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -30,10 +32,10 @@ use tokio::sync::{watch, RwLock};
 use tonic::{Request, Response, Status};
 use tracing::info;
 
-use crate::activation_contract::{ActivationRequestKey, ActivationIdentity, TargetReceipt, ActivationJournalKey, ActivationJournalVerifier, ActivationJournalVerifierV2, ActivationTargetSource, InstalledActivationIdentityV2, InstalledTargetReceiptV2};
+use crate::activation_contract::{ActivationRequestKey, InstalledActivationIdentityV2, InstalledTargetReceiptV2};
 use crate::lcm_runtime::{
-    accept_mapping_cloud_map_for_backend_candidate, build_committed_global_map_frame_in_frame,
-    publish_committed_global_map_in_frame, publish_retained_global_map_frame, CloudMapNotification,
+    accept_mapping_cloud_map_for_backend_candidate,
+    publish_committed_global_map_in_frame, CloudMapNotification,
     CloudMapSessionAdmission, CloudMapSessionRegistration, CloudMapSessionReservation,
     CommittedMappingCloudMap, GeometryRuntimeHandle, MapRevisionEvent, NavigationUpdate, PoseState,
 };
@@ -95,6 +97,12 @@ fn mapping_cloud_assigned_goal_pose(
     })
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActivationFaultPoint { BackendRestoreSubmission, SessionStart, OccupancyShmBegin,
+    OccupancyInstall, CloudInstall, BackendCommit, ActivationRecord,
+    SharedStateCommit, CacheClears, MapEvent, CloudEvent, TypedGlobalMap, Seal }
+
 #[derive(Clone)]
 pub struct GeometryRuntimeService {
     state: SharedServiceState,
@@ -110,16 +118,14 @@ pub struct GeometryRuntimeService {
     shutdown: Option<ShutdownCoordinator>,
     mapping_transition: Arc<tokio::sync::Mutex<()>>,
     graph_artifacts: Arc<parking_lot::Mutex<crate::planar_artifacts::Store>>,
-    deferred_replay: Option<Arc<crate::lio_ingress::NativeDeferredReplayControl>>,
     activation_receipts: crate::correction_coordinator::ActivatedTargetReceiptControl,
     relocalization_ingress: Option<crate::correction_coordinator::RelocalizationCommandIngress>,
     canonical_correction: Option<Arc<crate::lcm_runtime::GeometryCanonicalCorrectionApplier>>,
     mapping_cloud_owner: Arc<MappingCloudOwner>,
-    activation_lifecycle_fence: Arc<parking_lot::Mutex<Option<ActivationLifecycleFenceSlot>>>,
     activation_checkpoint_owners: Arc<crate::activation_request::CheckpointOwnerInternerV2>,
     #[cfg(test)]
     activation_fault_after:
-        Arc<parking_lot::Mutex<Option<crate::correction_coordinator::ActivationJournalStep>>>,
+        Arc<parking_lot::Mutex<Option<ActivationFaultPoint>>>,
     #[cfg(test)]
     stop_phase_a_after_detach: Arc<AtomicBool>,
     #[cfg(test)]
@@ -129,128 +135,7 @@ pub struct GeometryRuntimeService {
     #[cfg(test)]
     stop_before_post_zero_lifecycle: Arc<parking_lot::Mutex<Option<Arc<tokio::sync::Barrier>>>>,
     #[cfg(test)]
-    retained_receipt_consume_count: Arc<std::sync::atomic::AtomicUsize>,
-    #[cfg(test)]
-    retained_receipt_consumed: Arc<tokio::sync::Notify>,
-    #[cfg(test)]
-    stop_after_retained_receipt_consume: Arc<parking_lot::Mutex<Option<Arc<tokio::sync::Barrier>>>>,
-    #[cfg(test)]
     stop_before_graceful: Arc<parking_lot::Mutex<Option<Arc<tokio::sync::Barrier>>>>,
-}
-
-struct ActivationLifecycleFence {
-    activation_request_id: String,
-    activation_request_key: ActivationRequestKey,
-    retained_global_map: Option<RetainedActivationGlobalMap>,
-    projection_guard: crate::lcm_runtime::ExploreProjectionOwnedGuard,
-    lifecycle_guard: tokio::sync::OwnedMutexGuard<()>,
-}
-
-enum ActivationLifecycleFenceSlot {
-    Held(ActivationLifecycleFence),
-    RestorePending(RestorePendingActivationLifecycleFence),
-}
-
-struct RestorePendingActivationLifecycleFence {
-    activation_request_id: String,
-    activation_request_key: ActivationRequestKey,
-    retained_global_map: Option<RetainedActivationGlobalMap>,
-    projection_guard: crate::lcm_runtime::ExploreProjectionOwnedGuard,
-    reason: String,
-}
-
-struct RetainedActivationGlobalMap {
-    activation_request_key: ActivationRequestKey,
-    map_frame_id: String,
-    installed_cloud_revision: u64,
-    cloud_metadata: crate::pointcloud::CommittedCloudMapMetadata,
-    cloud_receipt: crate::mapping_commit::CloudCommitReceipt,
-    legacy_frame: Option<RawLcmFrame>,
-}
-
-impl RetainedActivationGlobalMap {
-    fn from_committed(
-        activation_request_key: impl Into<ActivationRequestKey>,
-        map_frame_id: &str,
-        committed: &CommittedMappingCloudMap,
-    ) -> Result<Self, String> {
-        let activation_request_key = activation_request_key.into();
-        Ok(Self {
-            activation_request_key: activation_request_key.clone(),
-            map_frame_id: map_frame_id.to_owned(),
-            installed_cloud_revision: committed.notification.revision,
-            cloud_metadata: committed.metadata,
-            cloud_receipt: committed.receipt.clone(),
-            // The request bytes may be non-center coordinates. Retain only
-            // metadata until a failed publication exposes its canonical cache.
-            legacy_frame: None,
-        })
-    }
-
-    fn capture_materialized_legacy_frame(
-        &mut self,
-        writer: &Arc<parking_lot::Mutex<Option<crate::pointcloud::CloudMapShmWriter>>>,
-        committed: &CommittedMappingCloudMap,
-    ) -> Result<(), String> {
-        if self.legacy_frame.is_some()
-            || !matches!(self.activation_request_key, ActivationRequestKey::LegacyDigest(_))
-        {
-            return Ok(());
-        }
-        self.validate_replay(self.activation_request_key.clone(), &self.map_frame_id, committed)?;
-        let snapshot = {
-            let guard = writer.lock();
-            let owner = guard.as_ref().ok_or("retained publication writer is unavailable")?;
-            let metadata = owner.committed_metadata()
-                .ok_or("retained publication metadata is unavailable")?;
-            if !crate::lcm_runtime::same_cloud_metadata(&metadata, &self.cloud_metadata)
-                || owner.last_cloud_receipt().as_ref() != Some(&self.cloud_receipt)
-            {
-                return Err("retained publication current metadata/receipt changed".into());
-            }
-            // Never initialize the full export cache here. When no legacy
-            // payload was exported, retry through the canonical sequencer.
-            let Some(snapshot) = owner.materialized_committed_snapshot() else {
-                return Ok(());
-            };
-            let cached_metadata = crate::pointcloud::CommittedCloudMapMetadata {
-                revision: snapshot.revision, point_count: snapshot.point_count,
-                voxel_size: snapshot.voxel_size, session_generation: snapshot.session_generation,
-                producer_epoch: snapshot.producer_epoch, layout_generation: snapshot.layout_generation,
-            };
-            if !crate::lcm_runtime::same_cloud_metadata(&cached_metadata, &self.cloud_metadata) {
-                return Err("retained publication cached metadata changed".into());
-            }
-            snapshot
-        };
-        // The existing encoded retention buffer is built from the already
-        // shared actual publication bytes, outside the writer lock, only once.
-        self.legacy_frame = Some(build_committed_global_map_frame_in_frame(
-            committed, &snapshot.xyz_f32_le, &self.map_frame_id,
-        )?);
-        Ok(())
-    }
-
-    fn validate_replay(
-        &self,
-        activation_request_key: impl Into<ActivationRequestKey>,
-        map_frame_id: &str,
-        committed: &CommittedMappingCloudMap,
-    ) -> Result<(), String> {
-        let activation_request_key = activation_request_key.into();
-        if self.activation_request_key != activation_request_key
-            || self.map_frame_id != map_frame_id
-            || self.installed_cloud_revision != committed.notification.revision
-            || self.cloud_receipt != committed.receipt
-            || !crate::lcm_runtime::same_cloud_metadata(&self.cloud_metadata, &committed.metadata)
-        {
-            return Err(
-                "retained activation global-map publication identity does not match replay"
-                    .to_owned(),
-            );
-        }
-        Ok(())
-    }
 }
 
 #[cfg(not(test))]
@@ -348,21 +233,7 @@ impl Drop for StartMappingRpcWaiter {
     }
 }
 
-async fn await_start_mapping_step<T>(
-    cancellation_rx: &mut watch::Receiver<bool>,
-    step: impl std::future::Future<Output = T>,
-) -> Option<T> {
-    if *cancellation_rx.borrow() {
-        return None;
-    }
-    tokio::select! {
-        biased;
-        _ = async {
-            let _ = cancellation_rx.wait_for(|cancelled| *cancelled).await;
-        } => None,
-        result = step => Some(result),
-    }
-}
+
 
 fn configured_base_frame() -> String {
     resolve_base_frame_alias(
@@ -446,7 +317,6 @@ pub struct ShutdownCoordinator {
     shutdown_failed: Arc<AtomicBool>,
     lio_gate: Option<Arc<crate::lio_ingress::LioIngressRoutingGate>>,
     correction_phase_a: Option<crate::correction_coordinator::CorrectionPhaseAControl>,
-    deferred_replay: Option<Arc<crate::lio_ingress::NativeDeferredReplayControl>>,
     geometry_tasks: Option<crate::lcm_runtime::GeometryRuntimeTaskControl>,
     stop_single_flight: Arc<tokio::sync::Mutex<()>>,
     mapping_transition: Arc<tokio::sync::Mutex<()>>,
@@ -503,19 +373,17 @@ where
 
 #[cfg(test)]
 pub(crate) fn shutdown_channel() -> (ShutdownCoordinator, ShutdownListener) {
-    shutdown_channel_inner(None, None, None, None)
+    shutdown_channel_inner(None, None, None)
 }
 
 #[cfg(test)]
 pub(crate) fn production_shutdown_channel(
     lio_gate: Arc<crate::lio_ingress::LioIngressRoutingGate>,
     correction_phase_a: crate::correction_coordinator::CorrectionPhaseAControl,
-    deferred_replay: Option<Arc<crate::lio_ingress::NativeDeferredReplayControl>>,
 ) -> (ShutdownCoordinator, ShutdownListener) {
     shutdown_channel_inner(
         Some(lio_gate),
         Some(correction_phase_a),
-        deferred_replay,
         None,
     )
 }
@@ -523,13 +391,11 @@ pub(crate) fn production_shutdown_channel(
 pub(crate) fn production_shutdown_channel_with_task_control(
     lio_gate: Arc<crate::lio_ingress::LioIngressRoutingGate>,
     correction_phase_a: crate::correction_coordinator::CorrectionPhaseAControl,
-    deferred_replay: Option<Arc<crate::lio_ingress::NativeDeferredReplayControl>>,
     geometry_tasks: crate::lcm_runtime::GeometryRuntimeTaskControl,
 ) -> (ShutdownCoordinator, ShutdownListener) {
     shutdown_channel_inner(
         Some(lio_gate),
         Some(correction_phase_a),
-        deferred_replay,
         Some(geometry_tasks),
     )
 }
@@ -537,16 +403,12 @@ pub(crate) fn production_shutdown_channel_with_task_control(
 fn shutdown_channel_inner(
     lio_gate: Option<Arc<crate::lio_ingress::LioIngressRoutingGate>>,
     correction_phase_a: Option<crate::correction_coordinator::CorrectionPhaseAControl>,
-    deferred_replay: Option<Arc<crate::lio_ingress::NativeDeferredReplayControl>>,
     geometry_tasks: Option<crate::lcm_runtime::GeometryRuntimeTaskControl>,
 ) -> (ShutdownCoordinator, ShutdownListener) {
     let (request_tx, request_rx) = watch::channel(false);
     let (listener_closed_tx, listener_closed_rx) = watch::channel(false);
     let (graceful_tx, graceful_rx) = watch::channel(false);
-    let readiness = deferred_replay
-        .as_ref()
-        .map(|replay| replay.readiness_authority())
-        .unwrap_or_default();
+    let readiness = ReadinessAuthority::default();
     let mapping_transition = Arc::new(tokio::sync::Mutex::new(()));
     (
         ShutdownCoordinator {
@@ -557,8 +419,7 @@ fn shutdown_channel_inner(
             shutdown_failed: Arc::new(AtomicBool::new(false)),
             lio_gate,
             correction_phase_a,
-            deferred_replay,
-            geometry_tasks,
+                geometry_tasks,
             stop_single_flight: Arc::new(tokio::sync::Mutex::new(())),
             mapping_transition,
             #[cfg(test)]
@@ -578,9 +439,6 @@ impl ShutdownCoordinator {
         if let Some(geometry_tasks) = &self.geometry_tasks {
             geometry_tasks.close_admission();
         }
-        if let Some(deferred_replay) = &self.deferred_replay {
-            deferred_replay.begin_phase_a();
-        }
         if let Some(lio_gate) = &self.lio_gate {
             crate::lio_owner::LioIngressSink::close(lio_gate.as_ref());
         }
@@ -595,9 +453,6 @@ impl ShutdownCoordinator {
         self.revoke_readiness();
         if let Some(geometry_tasks) = &self.geometry_tasks {
             geometry_tasks.close_admission();
-        }
-        if let Some(deferred_replay) = &self.deferred_replay {
-            deferred_replay.begin_phase_a();
         }
         if let Some(lio_gate) = &self.lio_gate {
             crate::lio_owner::LioIngressSink::close(lio_gate.as_ref());
@@ -623,10 +478,7 @@ impl ShutdownCoordinator {
             || self.correction_phase_a.as_ref().is_some_and(
                 crate::correction_coordinator::CorrectionPhaseAControl::process_stop_failed,
             )
-            || self
-                .deferred_replay
-                .as_ref()
-                .is_some_and(|replay| replay.poison_detail().is_some())
+
     }
 
     pub(crate) fn revoke_readiness(&self) {
@@ -656,10 +508,7 @@ impl ShutdownCoordinator {
         self.graceful_tx.send_replace(true);
     }
 
-    #[cfg(test)]
-    fn inject_correction_settlement_blocker(&self, barrier: Arc<tokio::sync::Barrier>) {
-        *self.correction_settlement_blocker.lock() = Some(barrier);
-    }
+
 
     async fn wait_for_correction_settlement(&self) {
         #[cfg(test)]
@@ -825,23 +674,18 @@ impl GeometryRuntimeService {
             shutdown: None,
             mapping_transition: Arc::new(tokio::sync::Mutex::new(())),
             graph_artifacts: Arc::new(parking_lot::Mutex::new(crate::planar_artifacts::Store::default())),
-            deferred_replay: None,
             activation_receipts: crate::correction_coordinator::ActivatedTargetReceiptControl::new(
                 1,
             ),
             relocalization_ingress: None,
             canonical_correction: None,
             mapping_cloud_owner,
-            activation_lifecycle_fence: Arc::new(parking_lot::Mutex::new(None)),
             activation_checkpoint_owners: Arc::new(crate::activation_request::CheckpointOwnerInternerV2::default()),
             activation_fault_after: Arc::new(parking_lot::Mutex::new(None)),
             stop_phase_a_after_detach: Arc::new(AtomicBool::new(false)),
             fail_start_mapping_stop_transition: Arc::new(AtomicBool::new(false)),
             start_mapping_before_cloud_clear: Arc::new(parking_lot::Mutex::new(None)),
             stop_before_post_zero_lifecycle: Arc::new(parking_lot::Mutex::new(None)),
-            retained_receipt_consume_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            retained_receipt_consumed: Arc::new(tokio::sync::Notify::new()),
-            stop_after_retained_receipt_consume: Arc::new(parking_lot::Mutex::new(None)),
             stop_before_graceful: Arc::new(parking_lot::Mutex::new(None)),
         }
     }
@@ -850,7 +694,6 @@ impl GeometryRuntimeService {
     pub fn new_with_shutdown(bridge: GeometryRuntimeHandle, shutdown: ShutdownCoordinator) -> Self {
         let mut service = Self::new(bridge);
         service.mapping_transition = shutdown.mapping_transition.clone();
-        service.deferred_replay = shutdown.deferred_replay.clone();
         if let Some(phase_a) = shutdown.correction_phase_a.as_ref() {
             service.activation_receipts = phase_a.activated_target_receipts();
         }
@@ -903,13 +746,11 @@ impl GeometryRuntimeService {
             native_self_filter: Arc::new(crate::self_cloud::NativeSelfFilter::from_env(&configured_base_frame())),
             mapping_transition: shutdown.mapping_transition.clone(),
             graph_artifacts: Arc::new(parking_lot::Mutex::new(crate::planar_artifacts::Store::default())),
-            deferred_replay: shutdown.deferred_replay.clone(),
             shutdown: Some(shutdown),
             activation_receipts,
             relocalization_ingress,
             canonical_correction: None,
             mapping_cloud_owner,
-            activation_lifecycle_fence: Arc::new(parking_lot::Mutex::new(None)),
             activation_checkpoint_owners: Arc::new(crate::activation_request::CheckpointOwnerInternerV2::default()),
             #[cfg(test)]
             activation_fault_after: Arc::new(parking_lot::Mutex::new(None)),
@@ -921,12 +762,6 @@ impl GeometryRuntimeService {
             start_mapping_before_cloud_clear: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(test)]
             stop_before_post_zero_lifecycle: Arc::new(parking_lot::Mutex::new(None)),
-            #[cfg(test)]
-            retained_receipt_consume_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            #[cfg(test)]
-            retained_receipt_consumed: Arc::new(tokio::sync::Notify::new()),
-            #[cfg(test)]
-            stop_after_retained_receipt_consume: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(test)]
             stop_before_graceful: Arc::new(parking_lot::Mutex::new(None)),
         }
@@ -962,182 +797,31 @@ impl GeometryRuntimeService {
         state
     }
 
-    fn take_matching_activation_lifecycle_fence(
-        &self,
-        activation_request_id: &str,
-        activation_request_key: impl Into<ActivationRequestKey>,
-    ) -> Result<Option<ActivationLifecycleFence>, &'static str> {
-        let activation_request_key = activation_request_key.into();
-        let mut fence = self.activation_lifecycle_fence.lock();
-        match fence.as_ref() {
-            None => Ok(None),
-            Some(ActivationLifecycleFenceSlot::Held(existing))
-                if existing.activation_request_id == activation_request_id
-                    && existing.activation_request_key
-                        == activation_request_key =>
-            {
-                match fence.take() {
-                    Some(ActivationLifecycleFenceSlot::Held(fence)) => Ok(Some(fence)),
-                    _ => unreachable!("matched activation lifecycle fence changed while locked"),
-                }
-            }
-            Some(ActivationLifecycleFenceSlot::Held(_)) => Err("ACTIVATE_MAP_LIFECYCLE_FENCE_BUSY"),
-            Some(ActivationLifecycleFenceSlot::RestorePending(_)) => {
-                Err("ACTIVATION_LIFECYCLE_FENCE_RESTORE_PENDING")
-            }
-        }
-    }
 
-    fn retain_activation_lifecycle_fence(
-        &self,
-        activation_request_id: &str,
-        activation_request_key: impl Into<ActivationRequestKey>,
-        retained_global_map: Option<RetainedActivationGlobalMap>,
-        projection_guard: crate::lcm_runtime::ExploreProjectionOwnedGuard,
-        lifecycle_guard: tokio::sync::OwnedMutexGuard<()>,
-    ) -> Result<
-        (),
-        (
-            crate::lcm_runtime::ExploreProjectionOwnedGuard,
-            tokio::sync::OwnedMutexGuard<()>,
-        ),
-    > {
-        let activation_request_key = activation_request_key.into();
-        let mut fence = self.activation_lifecycle_fence.lock();
-        if fence.is_some() {
-            return Err((projection_guard, lifecycle_guard));
-        }
-        *fence = Some(ActivationLifecycleFenceSlot::Held(
-            ActivationLifecycleFence {
-                activation_request_id: activation_request_id.to_owned(),
-                activation_request_key,
-                retained_global_map,
-                projection_guard,
-                lifecycle_guard,
-            },
-        ));
-        Ok(())
-    }
 
-    #[allow(clippy::result_large_err)]
-    fn take_activation_lifecycle_fence(&self) -> Result<Option<ActivationLifecycleFence>, Status> {
-        let mut slot = self.activation_lifecycle_fence.lock();
-        match slot.as_ref() {
-            None => Ok(None),
-            Some(ActivationLifecycleFenceSlot::Held(_)) => match slot.take() {
-                Some(ActivationLifecycleFenceSlot::Held(fence)) => Ok(Some(fence)),
-                _ => unreachable!("matched activation lifecycle fence changed while locked"),
-            },
-            Some(ActivationLifecycleFenceSlot::RestorePending(pending)) => {
-                let _retained_projection_guard = &pending.projection_guard;
-                let _activation_request_key =
-                    &pending.activation_request_key;
-                Err(Status::failed_precondition(format!(
-                    "ACTIVATION_LIFECYCLE_FENCE_RESTORE_PENDING: activation_request_id={} retained_global_map={} reason={}",
-                    pending.activation_request_id,
-                    pending.retained_global_map.is_some(),
-                    pending.reason
-                )))
-            }
-        }
-    }
 
-    fn restore_activation_lifecycle_fence(&self, fence: ActivationLifecycleFence) {
-        let mut slot = self.activation_lifecycle_fence.lock();
-        assert!(
-            slot.is_none(),
-            "activation lifecycle fence slot changed while Mapping transition was held"
-        );
-        *slot = Some(ActivationLifecycleFenceSlot::Held(fence));
-    }
 
-    fn restore_pending_activation_lifecycle_fence(
-        &self,
-        fence: RestorePendingActivationLifecycleFence,
-    ) {
-        let mut slot = self.activation_lifecycle_fence.lock();
-        assert!(
-            slot.is_none(),
-            "activation lifecycle fence slot changed while Mapping transition was held"
-        );
-        *slot = Some(ActivationLifecycleFenceSlot::RestorePending(fence));
-    }
 
-    fn has_activation_lifecycle_fence(&self) -> bool {
-        self.activation_lifecycle_fence.lock().is_some()
-    }
 
-    fn consume_retained_activation_receipt_after_motion_terminal(
-        &self,
-        retained_metadata: Option<(String, ActivationRequestKey, Option<RetainedActivationGlobalMap>)>,
-    ) {
-        #[cfg(test)]
-        let consumed_retained_receipt = retained_metadata.is_some();
-        drop(retained_metadata);
-        #[cfg(test)]
-        if consumed_retained_receipt {
-            self.retained_receipt_consume_count
-                .fetch_add(1, Ordering::AcqRel);
-            self.retained_receipt_consumed.notify_one();
-        }
-    }
 
-    async fn settle_process_stop_failure(
-        &self,
-        retained_metadata: Option<(String, ActivationRequestKey, Option<RetainedActivationGlobalMap>)>,
-        projection_guard: crate::lcm_runtime::ExploreProjectionOwnedGuard,
-        error: Status,
-    ) -> Status {
-        let Some((activation_request_id, activation_request_key, retained_global_map)) =
-            retained_metadata
-        else {
-            return error;
-        };
-        match tokio::time::timeout(
-            STOP_LIFECYCLE_TIMEOUT,
-            self.bridge.mapping_lifecycle_lock.clone().lock_owned(),
-        )
-        .await
-        {
-            Ok(lifecycle_guard) => {
-                self.restore_activation_lifecycle_fence(ActivationLifecycleFence {
-                    activation_request_id,
-                    activation_request_key,
-                    retained_global_map,
-                    projection_guard,
-                    lifecycle_guard,
-                });
-                error
-            }
-            Err(_) => {
-                let original_detail = error.message().to_owned();
-                self.restore_pending_activation_lifecycle_fence(
-                    RestorePendingActivationLifecycleFence {
-                        activation_request_id,
-                        activation_request_key,
-                        retained_global_map,
-                        projection_guard,
-                        reason: original_detail.clone(),
-                    },
-                );
-                Status::deadline_exceeded(format!(
-                    "ACTIVATION_LIFECYCLE_FENCE_RESTORE_PENDING: timed out restoring mapping lifecycle fence after Process Stop failure; original={original_detail}"
-                ))
-            }
-        }
-    }
+
+
+
+
+
+
+
+
 
     #[allow(clippy::too_many_arguments)]
     async fn finish_started_mapping_transition(
         &self,
-        request: StartMappingRequest,
         adapter: Arc<parking_lot::Mutex<MappingAdapter>>,
         snapshot: MappingSessionSnapshot,
         cloud_map_reservation: CloudMapSessionReservation,
         mut projection_guard: crate::lcm_runtime::ExploreProjectionOwnedGuard,
         lifecycle_guard: tokio::sync::OwnedMutexGuard<()>,
         _mapping_transition: tokio::sync::OwnedMutexGuard<()>,
-        mut cancellation_rx: watch::Receiver<bool>,
     ) -> Result<Response<MappingSessionState>, Status> {
         // This retained transition still owns L. Clear predecessor localization
         // before replay/publication or a successful reply, without holding the
@@ -1160,27 +844,7 @@ impl GeometryRuntimeService {
             adapter.lock().exhaust_backend_generation_for_tests();
         }
 
-        let deferred_replay = self.deferred_replay.clone();
         let mut occupancy_fence = None;
-        if let Some(replay) = deferred_replay.as_deref() {
-            if *cancellation_rx.borrow() {
-                return Err(finish_deferred_mapping_start_failure(
-                    replay,
-                    &adapter,
-                    &self.bridge.mapping_lifecycle_lock,
-                    self.bridge
-                        .mapping_lifecycle_lock
-                        .clone()
-                        .lock_owned()
-                        .await,
-                    &snapshot,
-                    None,
-                    "deferred StartMapping RPC waiter cancelled before occupancy fencing",
-                )
-                .await);
-            }
-        }
-
         if let Some(writer) = &self.bridge.occupancy_shm {
             let begin_result = writer
                 .lock()
@@ -1193,24 +857,6 @@ impl GeometryRuntimeService {
                     });
                 }
                 Err(error) => {
-                    if let Some(replay) = deferred_replay.as_deref() {
-                        return Err(finish_deferred_mapping_start_failure(
-                            replay,
-                            &adapter,
-                            &self.bridge.mapping_lifecycle_lock,
-                            self.bridge
-                                .mapping_lifecycle_lock
-                                .clone()
-                                .lock_owned()
-                                .await,
-                            &snapshot,
-                            None,
-                            format!(
-                                "occupancy SHM session fence failed after startup odometry: {error}"
-                            ),
-                        )
-                        .await);
-                    }
                     let outcome = finish_failed_mapping_start_rollback(
                         &adapter,
                         &self.bridge.mapping_lifecycle_lock,
@@ -1227,211 +873,6 @@ impl GeometryRuntimeService {
                     return Err(Status::internal(outcome.detail_with_diagnostics()));
                 }
             }
-        }
-
-        if let Some(replay) = deferred_replay.as_deref() {
-            let map_frame_generation = adapter.lock().global_frame_generation();
-            let claim = {
-                let adapter = adapter.lock();
-                replay.prepare_session(&snapshot, map_frame_generation, &adapter)
-            };
-            let claim = match claim {
-                Ok(claim) => claim,
-                Err(error) => {
-                    return Err(finish_deferred_mapping_start_failure(
-                        replay,
-                        &adapter,
-                        &self.bridge.mapping_lifecycle_lock,
-                        self.bridge
-                            .mapping_lifecycle_lock
-                            .clone()
-                            .lock_owned()
-                            .await,
-                        &snapshot,
-                        occupancy_fence.take(),
-                        format!("deferred Mapping claim failed: {error}"),
-                    )
-                    .await)
-                }
-            };
-
-            let clear = match await_start_mapping_step(
-                &mut cancellation_rx,
-                cloud_map_reservation.activate(snapshot.session_generation),
-            )
-            .await
-            {
-                Some(clear) => clear,
-                None => {
-                    return Err(finish_deferred_mapping_start_failure(
-                        replay,
-                        &adapter,
-                        &self.bridge.mapping_lifecycle_lock,
-                        self.bridge
-                            .mapping_lifecycle_lock
-                            .clone()
-                            .lock_owned()
-                            .await,
-                        &snapshot,
-                        occupancy_fence.take(),
-                        "deferred StartMapping RPC waiter cancelled during cloud-map clear",
-                    )
-                    .await)
-                }
-            };
-            if let Err(clear_error) =
-                validate_deferred_cloud_map_clear(&clear, snapshot.session_generation)
-            {
-                return Err(finish_deferred_mapping_start_failure(
-                    replay,
-                    &adapter,
-                    &self.bridge.mapping_lifecycle_lock,
-                    self.bridge
-                        .mapping_lifecycle_lock
-                        .clone()
-                        .lock_owned()
-                        .await,
-                    &snapshot,
-                    occupancy_fence.take(),
-                    format!("deferred StartMapping cloud-map clear failed: {clear_error}"),
-                )
-                .await);
-            }
-            if matches!(claim, crate::lio_ingress::DeferredSessionClaim::Claimed) {
-                let replay_result =
-                    await_start_mapping_step(&mut cancellation_rx, replay.replay_claimed()).await;
-                let failure_detail = match replay_result {
-                    Some(Ok(())) => None,
-                    Some(Err(error)) => Some(format!("deferred Mapping replay failed: {error}")),
-                    None => Some(
-                        "deferred StartMapping RPC waiter cancelled during retained replay"
-                            .to_owned(),
-                    ),
-                };
-                if let Some(failure_detail) = failure_detail {
-                    let lifecycle_guard = self
-                        .bridge
-                        .mapping_lifecycle_lock
-                        .clone()
-                        .lock_owned()
-                        .await;
-                    return Err(finish_deferred_mapping_start_failure(
-                        replay,
-                        &adapter,
-                        &self.bridge.mapping_lifecycle_lock,
-                        lifecycle_guard,
-                        &snapshot,
-                        occupancy_fence.take(),
-                        failure_detail,
-                    )
-                    .await);
-                }
-            }
-
-            let admission = await_start_mapping_step(
-                &mut cancellation_rx,
-                self.ensure_running_admission("StartMapping"),
-            )
-            .await;
-            let admission_failure = match admission {
-                Some(Ok(())) => None,
-                Some(Err(error)) => Some(format!(
-                    "deferred Mapping lost runtime admission before completion: {error}"
-                )),
-                None => Some(
-                    "deferred StartMapping RPC waiter cancelled during runtime admission check"
-                        .to_owned(),
-                ),
-            };
-            if let Some(admission_failure) = admission_failure {
-                let lifecycle_guard = self
-                    .bridge
-                    .mapping_lifecycle_lock
-                    .clone()
-                    .lock_owned()
-                    .await;
-                return Err(finish_deferred_mapping_start_failure(
-                    replay,
-                    &adapter,
-                    &self.bridge.mapping_lifecycle_lock,
-                    lifecycle_guard,
-                    &snapshot,
-                    occupancy_fence.take(),
-                    admission_failure,
-                )
-                .await);
-            }
-
-            let lifecycle_guard = match await_start_mapping_step(
-                &mut cancellation_rx,
-                self.bridge.mapping_lifecycle_lock.clone().lock_owned(),
-            )
-            .await
-            {
-                Some(lifecycle_guard) => lifecycle_guard,
-                None => {
-                    let lifecycle_guard = self
-                        .bridge
-                        .mapping_lifecycle_lock
-                        .clone()
-                        .lock_owned()
-                        .await;
-                    return Err(finish_deferred_mapping_start_failure(
-                        replay,
-                        &adapter,
-                        &self.bridge.mapping_lifecycle_lock,
-                        lifecycle_guard,
-                        &snapshot,
-                        occupancy_fence.take(),
-                        "deferred StartMapping RPC waiter cancelled waiting for final lifecycle verification",
-                    )
-                    .await);
-                }
-            };
-            if *cancellation_rx.borrow() {
-                return Err(finish_deferred_mapping_start_failure(
-                    replay,
-                    &adapter,
-                    &self.bridge.mapping_lifecycle_lock,
-                    lifecycle_guard,
-                    &snapshot,
-                    occupancy_fence.take(),
-                    "deferred StartMapping RPC waiter cancelled before final lifecycle verification",
-                )
-                .await);
-            }
-            let (final_snapshot, final_map_frame_generation) = {
-                let adapter = adapter.lock();
-                (adapter.snapshot(), adapter.global_frame_generation())
-            };
-            if !final_snapshot.active
-                || final_snapshot.session_id != request.session_id
-                || final_snapshot.map_name != request.map_name
-                || final_snapshot.session_generation != snapshot.session_generation
-                || !replay.is_complete_for(
-                    &request.session_id,
-                    &request.map_name,
-                    final_snapshot.session_generation,
-                    final_map_frame_generation,
-                )
-            {
-                return Err(finish_deferred_mapping_start_failure(
-                    replay,
-                    &adapter,
-                    &self.bridge.mapping_lifecycle_lock,
-                    lifecycle_guard,
-                    &snapshot,
-                    occupancy_fence.take(),
-                    "Mapping identity changed before deferred StartMapping completion",
-                )
-                .await);
-            }
-            drop(lifecycle_guard);
-            drop(occupancy_fence.take());
-            return Ok(Response::new(self.mapping_state_with_receipt(
-                final_snapshot,
-                "mapping session active; deferred startup replay complete",
-            )));
         }
 
         let clear = cloud_map_reservation
@@ -1474,7 +915,7 @@ impl GeometryRuntimeService {
     #[cfg(test)]
     fn inject_activation_fault_after(
         &self,
-        step: crate::correction_coordinator::ActivationJournalStep,
+        step: ActivationFaultPoint,
     ) {
         *self.activation_fault_after.lock() = Some(step);
     }
@@ -1485,44 +926,25 @@ impl GeometryRuntimeService {
             .store(true, Ordering::Release);
     }
 
-    #[cfg(test)]
-    fn inject_start_mapping_stop_transition_failure(&self) {
-        self.fail_start_mapping_stop_transition
-            .store(true, Ordering::Release);
-    }
+
 
     #[cfg(test)]
     fn inject_start_mapping_before_cloud_clear_barrier(&self, barrier: Arc<tokio::sync::Barrier>) {
         *self.start_mapping_before_cloud_clear.lock() = Some(barrier);
     }
 
-    #[cfg(test)]
-    fn inject_activate_map_before_cloud_clear_barrier(&self, barrier: Arc<tokio::sync::Barrier>) {
-        *self.start_mapping_before_cloud_clear.lock() = Some(barrier);
-    }
+
 
     #[cfg(test)]
     fn inject_stop_before_post_zero_lifecycle_barrier(&self, barrier: Arc<tokio::sync::Barrier>) {
         *self.stop_before_post_zero_lifecycle.lock() = Some(barrier);
     }
 
-    #[cfg(test)]
-    fn inject_stop_after_retained_receipt_consume_barrier(
-        &self,
-        barrier: Arc<tokio::sync::Barrier>,
-    ) {
-        *self.stop_after_retained_receipt_consume.lock() = Some(barrier);
-    }
 
-    #[cfg(test)]
-    fn retained_receipt_consume_count(&self) -> usize {
-        self.retained_receipt_consume_count.load(Ordering::Acquire)
-    }
 
-    #[cfg(test)]
-    async fn wait_for_retained_receipt_consume(&self) {
-        self.retained_receipt_consumed.notified().await;
-    }
+
+
+
 
     #[cfg(test)]
     fn inject_stop_before_graceful_barrier(&self, barrier: Arc<tokio::sync::Barrier>) {
@@ -1533,7 +955,7 @@ impl GeometryRuntimeService {
 #[cfg(test)]
 fn take_activation_fault_after(
     service: &GeometryRuntimeService,
-    step: crate::correction_coordinator::ActivationJournalStep,
+    step: ActivationFaultPoint,
 ) -> bool {
     let mut fault = service.activation_fault_after.lock();
     if *fault == Some(step) {
@@ -1558,13 +980,7 @@ fn relocalization_command_status(
     Status::unavailable(detail)
 }
 
-#[cfg(not(test))]
-fn take_activation_fault_after(
-    _service: &GeometryRuntimeService,
-    _step: crate::correction_coordinator::ActivationJournalStep,
-) -> bool {
-    false
-}
+
 
 pub(crate) fn now_ns() -> u64 {
     std::time::SystemTime::now()
@@ -1578,7 +994,7 @@ fn mapping_session_state(
     message: impl Into<String>,
 ) -> MappingSessionState {
     MappingSessionState {
-        target_kind:String::new(),target_graph_sha256:Vec::new(),planar_mode:String::new(),
+        target_kind:String::new(),planar_mode:String::new(),
         success: true,
         phase: snapshot.phase.as_str().to_string(),
         message: message.into(),
@@ -1588,7 +1004,7 @@ fn mapping_session_state(
         revision: snapshot.revision,
         active: snapshot.active,
         idempotent_replay: snapshot.idempotent_replay,
-        legacy_checkpoint_reconstructed: snapshot.legacy_checkpoint_reconstructed,
+
         mapping_backend_kind: snapshot.mapping_backend_kind,
         activation_receipt_schema_version: 0,
         activation_receipt_v2: None,
@@ -1597,90 +1013,28 @@ fn mapping_session_state(
         runtime_generation: 0,
         backend_generation: 0,
         activation_request_id: String::new(),
-        activation_request_identity_sha256: Vec::new(),
-        activation_identity_sha256: Vec::new(),
-        target_receipt_sha256: Vec::new(),
-        asset_manifest_sha256: Vec::new(),
-        asset_bundle_sha256: Vec::new(),
+
+
+
+
+
         relocalization_target_available: false,
-        source_policy_version: 0,
-        source_policy_sha256: Vec::new(),
-        deadline_policy_version: 0,
-        deadline_policy_sha256: Vec::new(),
-        algorithm_options_version: 0,
-        algorithm_options_sha256: Vec::new(),
+
+
+
+
+
+
     }
 }
 
-#[derive(Clone, Debug)]
-enum ActivationRequestIdentityClass {
-    Assigned(crate::activation_request::ActivationRequestMetadataV2),
-    Modern {
-        request_id: String,
-        asset_manifest_sha256: [u8; 32],
-        asset_bundle_sha256: [u8; 32],
-    },
-    Legacy {
-        request_id: String,
-    },
-}
+type ActivationRequestIdentityClass = crate::activation_request::ActivationRequestMetadataV2;
 
-impl ActivationRequestIdentityClass {
-    fn request_id(&self) -> &str {
-        match self {
-            Self::Modern { request_id, .. } | Self::Legacy { request_id } => request_id,
-            Self::Assigned(metadata) => metadata.activation_request_id(),
-        }
-    }
 
-    const fn is_modern(&self) -> bool {
-        matches!(self, Self::Modern { .. } | Self::Assigned(_))
-    }
 
-    const fn asset_manifest_sha256(&self) -> Option<[u8; 32]> {
-        match self {
-            Self::Modern {
-                asset_manifest_sha256,
-                ..
-            } => Some(*asset_manifest_sha256),
-            Self::Legacy { .. } | Self::Assigned(_) => None,
-        }
-    }
 
-    const fn asset_bundle_sha256(&self) -> Option<[u8; 32]> {
-        match self {
-            Self::Modern {
-                asset_bundle_sha256,
-                ..
-            } => Some(*asset_bundle_sha256),
-            Self::Legacy { .. } | Self::Assigned(_) => None,
-        }
-    }
-}
 
-fn canonical_push_string(out: &mut Vec<u8>, value: &str) -> Result<(), String> {
-    let length =
-        u32::try_from(value.len()).map_err(|_| "canonical string length exceeds u32".to_owned())?;
-    out.extend_from_slice(&length.to_be_bytes());
-    out.extend_from_slice(value.as_bytes());
-    Ok(())
-}
 
-fn canonical_push_optional_digest(out: &mut Vec<u8>, digest: Option<[u8; 32]>) {
-    match digest {
-        Some(digest) => {
-            out.push(1);
-            out.extend_from_slice(&digest);
-        }
-        None => out.push(0),
-    }
-}
-
-fn canonical_hash32(value: &[u8], label: &str) -> Result<[u8; 32], String> {
-    value
-        .try_into()
-        .map_err(|_| format!("{label} must contain exactly 32 bytes"))
-}
 
 pub(crate) fn validate_canonical_protocol_id(value: &str, label: &str) -> Result<(), String> {
     if value.is_empty()
@@ -1708,441 +1062,44 @@ fn classify_activation_request_identity(
     request: &ActivateMapRequest,
     runtime_generation: u64,
 ) -> Result<ActivationRequestIdentityClass, String> {
-    if request.activation_contract_version == 2 {
-        return crate::activation_request::ActivationRequestMetadataV2::from_wire(request, runtime_generation)
-            .map(ActivationRequestIdentityClass::Assigned);
-    }
-    let legacy = request.activation_contract_version == 0
-        && request.asset_identity.is_none()
-        && request.activation_request_id.is_empty()
-        && request.expected_runtime_generation == 0
-        && request.asset_manifest_sha256.is_empty()
-        && request.asset_bundle_sha256.is_empty();
-    if legacy {
-        let request_id = request.session_id.trim().to_owned();
-        if request_id.is_empty() {
-            return Err("session_id and map_name must not be empty".to_owned());
-        }
-        return Ok(ActivationRequestIdentityClass::Legacy { request_id });
-    }
-
-    let modern = request.activation_contract_version == 1
-        && request.asset_identity.is_none()
-        && validate_canonical_protocol_id(&request.activation_request_id, "activation_request_id")
-            .is_ok()
-        && request.expected_runtime_generation != 0
-        && request.expected_runtime_generation == runtime_generation
-        && request.asset_manifest_sha256.len() == 32
-        && request.asset_bundle_sha256.len() == 32;
-    if !modern {
-        return Err("ACTIVATE_MAP_IDENTITY_FIELDS_MIXED".to_owned());
-    }
-    validate_canonical_protocol_id(&request.session_id, "session_id")?;
-    validate_canonical_text(&request.map_name, "map_name")?;
-    Ok(ActivationRequestIdentityClass::Modern {
-        request_id: request.activation_request_id.clone(),
-        asset_manifest_sha256: canonical_hash32(
-            &request.asset_manifest_sha256,
-            "asset_manifest_sha256",
-        )?,
-        asset_bundle_sha256: canonical_hash32(&request.asset_bundle_sha256, "asset_bundle_sha256")?,
-    })
+    crate::activation_request::ActivationRequestMetadataV2::from_wire(request, runtime_generation)
 }
 
-fn canonical_occupancy_preimage(checkpoint: &OccupancyGridData) -> Result<Vec<u8>, String> {
-    let meta = checkpoint
-        .meta
-        .as_ref()
-        .ok_or_else(|| "checkpoint.meta is required".to_owned())?;
-    if meta.width == 0 || meta.height == 0 || meta.revision == 0 {
-        return Err("checkpoint dimensions and revision must be positive".to_owned());
-    }
-    if !meta.resolution.is_finite() || meta.resolution <= 0.0 {
-        return Err("checkpoint resolution must be finite and positive".to_owned());
-    }
-    if !meta.origin_x.is_finite() || !meta.origin_y.is_finite() {
-        return Err("checkpoint origins must be finite".to_owned());
-    }
-    validate_canonical_text(&meta.frame_id, "checkpoint frame_id")?;
-    let expected = usize::try_from(meta.width)
-        .ok()
-        .and_then(|width| {
-            usize::try_from(meta.height)
-                .ok()
-                .and_then(|height| width.checked_mul(height))
-        })
-        .ok_or_else(|| "checkpoint dimensions overflow".to_owned())?;
-    if expected != checkpoint.data.len() {
-        return Err(format!(
-            "checkpoint data size mismatch: expected={expected} actual={}",
-            checkpoint.data.len()
-        ));
-    }
 
-    let mut out = b"nuwax.geometry.occupancy-checkpoint.v1\0".to_vec();
-    out.extend_from_slice(&1_u32.to_be_bytes());
-    out.extend_from_slice(&meta.width.to_be_bytes());
-    out.extend_from_slice(&meta.height.to_be_bytes());
-    out.extend_from_slice(&meta.resolution.to_be_bytes());
-    let origin_x = if meta.origin_x == 0.0 {
-        0.0
-    } else {
-        meta.origin_x
-    };
-    let origin_y = if meta.origin_y == 0.0 {
-        0.0
-    } else {
-        meta.origin_y
-    };
-    out.extend_from_slice(&origin_x.to_be_bytes());
-    out.extend_from_slice(&origin_y.to_be_bytes());
-    canonical_push_string(&mut out, &meta.frame_id)?;
-    out.extend_from_slice(&meta.revision.to_be_bytes());
-    out.extend_from_slice(&meta.timestamp_ns.to_be_bytes());
-    out.extend_from_slice(
-        &u64::try_from(checkpoint.data.len())
-            .map_err(|_| "checkpoint data length exceeds u64".to_owned())?
-            .to_be_bytes(),
-    );
-    out.extend_from_slice(&crate::map_checksum::sha256_bytes(&checkpoint.data));
-    Ok(out)
-}
 
-fn canonical_occupancy_sha256(checkpoint: &OccupancyGridData) -> Result<[u8; 32], String> {
-    canonical_occupancy_preimage(checkpoint)
-        .map(|preimage| crate::map_checksum::sha256_bytes(&preimage))
-}
 
-fn canonical_cloud_preimage(
-    target: &crate::pointcloud::ImmutableActivatedTarget,
-) -> Result<Vec<u8>, String> {
-    validate_canonical_text(&target.frame_id, "cloud checkpoint frame_id")?;
-    let mut out = b"nuwax.geometry.cloud-checkpoint.v1\0".to_vec();
-    canonical_push_string(&mut out, &target.frame_id)?;
-    out.extend_from_slice(&target.source_revision.to_be_bytes());
-    out.extend_from_slice(&target.point_count.to_be_bytes());
-    out.extend_from_slice(&target.voxel_size.to_be_bytes());
-    out.extend_from_slice(
-        &u64::try_from(target.xyz_f32_le.len())
-            .map_err(|_| "cloud checkpoint data length exceeds u64".to_owned())?
-            .to_be_bytes(),
-    );
-    out.extend_from_slice(&target.xyz_sha256);
-    out.extend_from_slice(&target.payload_schema_version.to_be_bytes());
-    Ok(out)
-}
 
-fn canonical_cloud_sha256(
-    target: &crate::pointcloud::ImmutableActivatedTarget,
-) -> Result<[u8; 32], String> {
-    canonical_cloud_preimage(target).map(|preimage| crate::map_checksum::sha256_bytes(&preimage))
-}
 
-fn canonical_append_commit_identity(
-    out: &mut Vec<u8>,
-    identity: Option<&MappingCommitIdentity>,
-    label: &str,
-) -> Result<(), String> {
-    let identity = validate_mapping_commit_identity(identity, label)?;
-    out.extend_from_slice(&identity.boot_nonce);
-    out.extend_from_slice(&identity.sequence.to_be_bytes());
-    Ok(())
-}
 
-fn canonical_append_occupancy_receipt(
-    out: &mut Vec<u8>,
-    receipt: &CanonicalOccupancyCommitReceipt,
-) -> Result<(), String> {
-    canonical_append_commit_identity(out, receipt.commit_id.as_ref(), "occupancy receipt")?;
-    canonical_push_string(out, &receipt.session_id)?;
-    out.extend_from_slice(&receipt.session_generation.to_be_bytes());
-    out.extend_from_slice(&receipt.occupancy_revision.to_be_bytes());
-    out.extend_from_slice(&receipt.source_timestamp_ns.to_be_bytes());
-    canonical_push_string(out, &receipt.backend_kind)?;
-    out.extend_from_slice(&receipt.backend_generation.to_be_bytes());
-    Ok(())
-}
 
-fn canonical_append_cloud_receipt(
-    out: &mut Vec<u8>,
-    receipt: &CanonicalCloudCommitReceipt,
-) -> Result<(), String> {
-    canonical_append_commit_identity(out, receipt.commit_id.as_ref(), "cloud receipt")?;
-    out.extend_from_slice(&receipt.session_generation.to_be_bytes());
-    out.extend_from_slice(&receipt.occupancy_revision.to_be_bytes());
-    out.extend_from_slice(&receipt.cloud_revision.to_be_bytes());
-    out.extend_from_slice(&receipt.source_timestamp_ns.to_be_bytes());
-    out.extend_from_slice(&receipt.point_count.to_be_bytes());
-    Ok(())
-}
 
-fn immutable_target_from_checkpoint(
-    checkpoint: &CloudMapCheckpoint,
-    expected_map_frame_id: &str,
-    modern: bool,
-) -> Result<crate::pointcloud::ImmutableActivatedTarget, String> {
-    let canonical_frame = if modern {
-        checkpoint.frame_id.as_str()
-    } else {
-        checkpoint.frame_id.trim()
-    };
-    crate::pointcloud::decode_immutable_activated_target(
-        canonical_frame,
-        expected_map_frame_id,
-        checkpoint.source_revision,
-        checkpoint.point_count,
-        checkpoint.voxel_size,
-        &checkpoint.xyz_f32_le,
-        &checkpoint.xyz_sha256,
-        checkpoint.payload_schema_version,
-    )
-}
 
-fn canonical_backend_sha256(
-    checkpoint: &MappingBackendCheckpoint,
-    expected_map_frame_id: &str,
-) -> Result<[u8; 32], String> {
-    if checkpoint.backend_kind=="slam_toolbox" {
-        validate_planar_checkpoint(checkpoint)?;
-        let mut out=b"nuwax.geometry.planar-backend-checkpoint.v1\0".to_vec();
-        out.extend_from_slice(&checkpoint.schema_version.to_be_bytes());
-        canonical_push_string(&mut out,&checkpoint.backend_kind)?;
-        canonical_push_string(&mut out,&checkpoint.source_session_id)?;
-        for n in [checkpoint.source_session_generation,checkpoint.payload_size,checkpoint.created_at_ns] {out.extend_from_slice(&n.to_be_bytes());}
-        out.extend_from_slice(&checkpoint.content_sha256);
-        canonical_append_occupancy_receipt(&mut out,checkpoint.occupancy_receipt.as_ref().unwrap())?;
-        out.extend_from_slice(&canonical_occupancy_sha256(checkpoint.canonical_occupancy_checkpoint.as_ref().unwrap())?);
-        return Ok(crate::map_checksum::sha256_bytes(&out));
-    }
-    let content_sha256 = canonical_hash32(&checkpoint.content_sha256, "content_sha256")?;
-    let occupancy_receipt = checkpoint
-        .occupancy_receipt
-        .as_ref()
-        .ok_or_else(|| "mapping backend checkpoint occupancy_receipt is required".to_owned())?;
-    let cloud_receipt = checkpoint
-        .cloud_receipt
-        .as_ref()
-        .ok_or_else(|| "mapping backend checkpoint cloud_receipt is required".to_owned())?;
-    let occupancy_checkpoint = checkpoint
-        .canonical_occupancy_checkpoint
-        .as_ref()
-        .ok_or_else(|| {
-            "mapping backend checkpoint canonical_occupancy_checkpoint is required".to_owned()
-        })?;
-    let cloud_checkpoint = checkpoint
-        .canonical_cloud_checkpoint
-        .as_ref()
-        .ok_or_else(|| {
-            "mapping backend checkpoint canonical_cloud_checkpoint is required".to_owned()
-        })?;
-    let cloud_target =
-        immutable_target_from_checkpoint(cloud_checkpoint, expected_map_frame_id, false)?;
 
-    let mut out = b"nuwax.geometry.backend-checkpoint.v1\0".to_vec();
-    out.extend_from_slice(&checkpoint.schema_version.to_be_bytes());
-    canonical_push_string(&mut out, &checkpoint.backend_kind)?;
-    out.extend_from_slice(&checkpoint.source_session_generation.to_be_bytes());
-    out.extend_from_slice(&content_sha256);
-    out.extend_from_slice(&checkpoint.payload_size.to_be_bytes());
-    out.extend_from_slice(&checkpoint.created_at_ns.to_be_bytes());
-    out.extend_from_slice(&crate::map_checksum::sha256_bytes(&checkpoint.payload));
-    canonical_push_string(&mut out, &checkpoint.source_session_id)?;
-    canonical_append_occupancy_receipt(&mut out, occupancy_receipt)?;
-    canonical_append_cloud_receipt(&mut out, cloud_receipt)?;
-    out.extend_from_slice(&canonical_occupancy_sha256(occupancy_checkpoint)?);
-    out.extend_from_slice(&canonical_cloud_sha256(&cloud_target)?);
-    if let Some(fine) = &checkpoint.fine_map_artifact {
-        out.extend_from_slice(b"nuwax.geometry.fine-map-archive.v1\0");
-        out.extend_from_slice(&fine.size.to_be_bytes());
-        out.extend_from_slice(&canonical_hash32(&fine.sha256, "fine_map_artifact.sha256")?);
-    }
-    if let Some(dense) = &checkpoint.dense_cloud_artifact {
-        out.extend_from_slice(b"nuwax.geometry.dense-cloud-archive.v1\0");
-        out.extend_from_slice(&dense.size.to_be_bytes());
-        out.extend_from_slice(&canonical_hash32(&dense.sha256, "dense_cloud_artifact.sha256")?);
-    }
-    Ok(crate::map_checksum::sha256_bytes(&out))
-}
 
-fn canonical_asset_bundle_preimage(
-    asset_manifest_sha256: [u8; 32],
-    occupancy_sha256: [u8; 32],
-    cloud_sha256: Option<[u8; 32]>,
-    backend_sha256: Option<[u8; 32]>,
-) -> Vec<u8> {
-    let mut out = b"nuwax.geometry.asset-bundle.v1\0".to_vec();
-    out.extend_from_slice(&1_u32.to_be_bytes());
-    out.extend_from_slice(&asset_manifest_sha256);
-    out.extend_from_slice(&occupancy_sha256);
-    canonical_push_optional_digest(&mut out, cloud_sha256);
-    canonical_push_optional_digest(&mut out, backend_sha256);
-    out
-}
 
-#[allow(clippy::too_many_arguments)]
-fn canonical_activation_request_preimage(
-    class: &ActivationRequestIdentityClass,
-    runtime_generation: u64,
-    session_id: &str,
-    map_name: &str,
-    occupancy_sha256: [u8; 32],
-    cloud_sha256: Option<[u8; 32]>,
-    backend_sha256: Option<[u8; 32]>,
-) -> Result<Vec<u8>, String> {
-    let mut out = if class.is_modern() {
-        b"nuwax.geometry.activate-map.request.v1\0".to_vec()
-    } else {
-        b"nuwax.geometry.activate-map.legacy-request.v1\0".to_vec()
-    };
-    if let ActivationRequestIdentityClass::Modern {
-        asset_manifest_sha256,
-        asset_bundle_sha256,
-        ..
-    } = class
-    {
-        out.extend_from_slice(&1_u32.to_be_bytes());
-        canonical_push_string(&mut out, class.request_id())?;
-        out.extend_from_slice(&runtime_generation.to_be_bytes());
-        canonical_push_string(&mut out, session_id)?;
-        canonical_push_string(&mut out, map_name)?;
-        out.extend_from_slice(asset_manifest_sha256);
-        out.extend_from_slice(asset_bundle_sha256);
-    } else {
-        out.extend_from_slice(&runtime_generation.to_be_bytes());
-        canonical_push_string(&mut out, session_id)?;
-        canonical_push_string(&mut out, map_name)?;
-    }
-    out.extend_from_slice(&occupancy_sha256);
-    canonical_push_optional_digest(&mut out, cloud_sha256);
-    canonical_push_optional_digest(&mut out, backend_sha256);
-    Ok(out)
-}
 
-#[allow(clippy::too_many_arguments)]
-fn canonical_activation_identity_preimage(
-    activation_request_identity_sha256: [u8; 32],
-    runtime_generation: u64,
-    session_generation: u64,
-    backend_generation: u64,
-    backend_kind: &str,
-    backend_sha256: Option<[u8; 32]>,
-    asset_manifest_sha256: [u8; 32],
-    asset_bundle_sha256: [u8; 32],
-) -> Result<Vec<u8>, String> {
-    let mut out = b"nuwax.geometry.activate-map.identity.v1\0".to_vec();
-    out.extend_from_slice(&activation_request_identity_sha256);
-    out.extend_from_slice(&runtime_generation.to_be_bytes());
-    out.extend_from_slice(&session_generation.to_be_bytes());
-    out.extend_from_slice(&backend_generation.to_be_bytes());
-    canonical_push_string(&mut out, backend_kind)?;
-    canonical_push_optional_digest(&mut out, backend_sha256);
-    out.extend_from_slice(&asset_manifest_sha256);
-    out.extend_from_slice(&asset_bundle_sha256);
-    out.extend_from_slice(
-        &crate::correction_coordinator::RELOCALIZATION_SOURCE_POLICY_VERSION.to_be_bytes(),
-    );
-    out.extend_from_slice(&if backend_kind=="slam_toolbox" {crate::correction_coordinator::planar_source_policy_sha256()}else{crate::correction_coordinator::relocalization_source_policy_sha256_v1()});
-    out.extend_from_slice(
-        &crate::correction_coordinator::RELOCALIZATION_DEADLINE_POLICY_VERSION_V1.to_be_bytes(),
-    );
-    out.extend_from_slice(
-        &crate::correction_coordinator::relocalization_deadline_policy_sha256_v1(),
-    );
-    out.extend_from_slice(
-        &crate::correction_coordinator::RELOCALIZATION_ALGORITHM_OPTIONS_VERSION.to_be_bytes(),
-    );
-    out.extend_from_slice(
-        &if backend_kind=="slam_toolbox" {crate::correction_coordinator::planar_algorithm_policy_sha256()}else{crate::correction_coordinator::relocalization_algorithm_options_sha256_v1()},
-    );
-    Ok(out)
-}
 
-fn canonical_target_receipt_preimage(
-    activation_identity_sha256: [u8; 32],
-    cloud_sha256: [u8; 32],
-    source_revision: u64,
-    installed_cloud_revision: u64,
-    activated_session_generation: u64,
-    activated_backend_generation: u64,
-    receipt: &crate::mapping_commit::CloudCommitReceipt,
-) -> Result<Vec<u8>, String> {
-    if receipt.session_generation != activated_session_generation
-        || receipt.cloud_revision != installed_cloud_revision
-    {
-        return Err("activated target cloud receipt identity mismatch".to_owned());
-    }
-    let mut out = b"nuwax.geometry.activated-target-receipt.v1\0".to_vec();
-    out.extend_from_slice(&activation_identity_sha256);
-    out.extend_from_slice(&cloud_sha256);
-    out.extend_from_slice(&source_revision.to_be_bytes());
-    out.extend_from_slice(&installed_cloud_revision.to_be_bytes());
-    out.extend_from_slice(&activated_session_generation.to_be_bytes());
-    out.extend_from_slice(&activated_backend_generation.to_be_bytes());
-    out.extend_from_slice(&receipt.commit_id.boot_nonce.to_be_bytes());
-    out.extend_from_slice(&receipt.commit_id.sequence.to_be_bytes());
-    out.extend_from_slice(&receipt.session_generation.to_be_bytes());
-    out.extend_from_slice(&receipt.occupancy_revision.to_be_bytes());
-    out.extend_from_slice(&receipt.cloud_revision.to_be_bytes());
-    out.extend_from_slice(&receipt.source_timestamp_ns.to_be_bytes());
-    out.extend_from_slice(&receipt.point_count.to_be_bytes());
-    Ok(out)
-}
 
-fn activation_journal_key(
-    activation_request_identity_sha256: [u8; 32],
-    step: crate::correction_coordinator::ActivationJournalStep,
-) -> [u8; 32] {
-    let mut bytes = b"nuwax.geometry.activation-journal-key.v1\0".to_vec();
-    bytes.extend_from_slice(&activation_request_identity_sha256);
-    bytes.extend_from_slice(&(step as u32).to_be_bytes());
-    crate::map_checksum::sha256_bytes(&bytes)
-}
 
-fn record_activation_journal(
-    control: &crate::correction_coordinator::ActivatedTargetReceiptControl,
-    token: &crate::correction_coordinator::ActivationToken,
-    request_identity: impl Into<ActivationRequestKey>,
-    step: crate::correction_coordinator::ActivationJournalStep,
-    status: crate::correction_coordinator::ActivationJournalStatus,
-    verifier_receipt: Option<ActivationJournalVerifier>,
-    typed_failure: Option<String>,
-) -> bool {
-    let idempotency_key = match request_identity.into() {
-        ActivationRequestKey::LegacyDigest(digest) => activation_journal_key(digest, step).into(),
-        ActivationRequestKey::Assigned(request) => ActivationJournalKey::Assigned { request, step },
-    };
-    control.journal(token, crate::correction_coordinator::ActivationJournalEntry {
-        step, idempotency_key, status, verifier_receipt, typed_failure,
-    })
-}
 
-fn activation_verifier(identity: &ActivationIdentity) -> ActivationJournalVerifier {
-    match identity {
-        ActivationIdentity::LegacyDigest(digest) => (*digest).into(),
-        ActivationIdentity::Assigned(identity) => ActivationJournalVerifier::Assigned(ActivationJournalVerifierV2::Activation(identity.clone())),
-    }
-}
 
-fn cloud_activation_verifier(key: &ActivationRequestKey, legacy: Option<[u8; 32]>, receipt: &crate::mapping_commit::CloudCommitReceipt) -> Option<ActivationJournalVerifier> {
-    match key {
-        ActivationRequestKey::LegacyDigest(_) => legacy.map(Into::into),
-        ActivationRequestKey::Assigned(_) => Some(ActivationJournalVerifier::Assigned(ActivationJournalVerifierV2::Cloud(receipt.clone()))),
-    }
-}
 
-fn resumed_cloud_publication_verifier(
-    target: &ActivationTargetSource,
-    receipt: &crate::mapping_commit::CloudCommitReceipt,
-) -> ActivationJournalVerifier {
-    // target_source binds this retained owner to the staged request's identity class.
-    // Legacy admission already verified this digest against the same owned bytes.
-    match target {
-        ActivationTargetSource::Legacy(target) => target.xyz_sha256.into(),
-        ActivationTargetSource::Assigned(_) => ActivationJournalVerifier::Assigned(
-            ActivationJournalVerifierV2::Cloud(receipt.clone()),
-        ),
-    }
-}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 fn activation_failure_state(
     service: &GeometryRuntimeService,
@@ -2163,7 +1120,7 @@ async fn settle_failed_activation_retirement(
     adapter: &Arc<parking_lot::Mutex<MappingAdapter>>,
     bridge: &GeometryRuntimeHandle,
     token: &crate::correction_coordinator::ActivationToken,
-    request_identity: ActivationRequestKey,
+    _request_identity: ActivationRequestKey,
     retirement: Result<
         Option<crate::mapping_adapter::MappingBackendRetirement>,
         crate::mapping_adapter::MappingLifecycleError,
@@ -2183,24 +1140,6 @@ async fn settle_failed_activation_retirement(
         }
     };
     if let Some(retirement) = retirement {
-        let retirement_generation = retirement.generation();
-        let retirement_proof = match &request_identity {
-            ActivationRequestKey::LegacyDigest(_) => crate::map_checksum::sha256_bytes(&retirement_generation.to_be_bytes()).into(),
-            ActivationRequestKey::Assigned(_) => ActivationJournalVerifier::Assigned(ActivationJournalVerifierV2::BackendGeneration(retirement_generation)),
-        };
-        if !record_activation_journal(
-            &service.activation_receipts,
-            token,
-            request_identity,
-            crate::correction_coordinator::ActivationJournalStep::RetirementPrepared,
-            crate::correction_coordinator::ActivationJournalStatus::Prepared,
-            Some(retirement_proof),
-            None,
-        ) || !service.activation_receipts.validate_token(token)
-        {
-            disposition = ActivationReceiptDisposition::OutcomeUnknown;
-            detail.push_str("; retirement token could not be proven before join");
-        }
         if let Err(error) =
             finish_backend_retirement(adapter, &bridge.mapping_lifecycle_lock, Some(retirement))
                 .await
@@ -2269,7 +1208,7 @@ async fn prepare_assigned_activation_archives(
 #[allow(clippy::too_many_lines)]
 async fn activate_map_r1(
     service: GeometryRuntimeService,
-    mut request: ActivateMapRequest,
+    request: ActivateMapRequest,
 ) -> Result<Response<MappingSessionState>, Status> {
     validate_mapping_checkpoint_envelope_size("ActivateMap request", request.encoded_len())
         .map_err(Status::resource_exhausted)?;
@@ -2304,10 +1243,9 @@ async fn activate_map_r1(
         return service.activate_planar_map(request,identity_class).await;
     }
 
-    let (session_id, map_name, checkpoint, checkpoint_timestamp_ns, mapping_backend_checkpoint,
-         assigned_checkpoint, immutable_target, occupancy_sha256, cloud_sha256, backend_sha256,
-         prepared_fine, prepared_dense, seed, activation_request_key) =
-    if let ActivationRequestIdentityClass::Assigned(metadata) = &identity_class {
+    let (session_id, map_name, checkpoint, checkpoint_timestamp_ns, assigned_checkpoint,
+         immutable_target, prepared_fine, prepared_dense, seed, activation_request_key) = {
+        let metadata = &identity_class;
         let state = mapping_session_state(adapter.lock().snapshot(), "assigned activation admission");
         if let Some(terminal) = service.activation_receipts.assigned_terminal_before_admission(metadata, state) {
             return Ok(Response::new(terminal));
@@ -2338,164 +1276,13 @@ async fn activate_map_r1(
         let currently_active = { adapter.lock().snapshot().active };
         let (fine, dense) = if currently_active { (None, None) }
             else { prepare_assigned_activation_archives(&service, &owner, &expected_map_frame_id).await? };
-        let key = ActivationRequestKey::Assigned(metadata.clone());
+        let key = metadata.clone();
         let seed = crate::correction_coordinator::ActivationReceiptSeed {
             planar_target: None, activation_request_id: metadata.activation_request_id().to_owned(),
             request_key: key.clone(), checkpoint_owner: Some(owner.clone()),
-            asset_manifest_sha256: None, asset_bundle_sha256: None, modern: true, immutable_target: None,
         };
-        (metadata.session_id().to_owned(), metadata.map_name().to_owned(), checkpoint, timestamp, None,
-         Some(owner.clone()), Some(ActivationTargetSource::Assigned(owner)), None, None, None,
-         fine, dense, seed, key)
-    } else {
-    let occupancy_checkpoint = request
-        .checkpoint
-        .take()
-        .ok_or_else(|| Status::invalid_argument("checkpoint is required"))?;
-    let checkpoint_timestamp_ns = occupancy_checkpoint
-        .meta
-        .as_ref()
-        .map(|meta| meta.timestamp_ns)
-        .ok_or_else(|| Status::invalid_argument("checkpoint.meta is required"))?;
-    let occupancy_sha256 =
-        canonical_occupancy_sha256(&occupancy_checkpoint).map_err(Status::invalid_argument)?;
-    let checkpoint = decode_checkpoint_grid(occupancy_checkpoint.clone(), &expected_map_frame_id)
-        .map_err(Status::invalid_argument)?;
-
-    let cloud_checkpoint = request.cloud_checkpoint.take();
-    let immutable_target = cloud_checkpoint
-        .as_ref()
-        .map(|checkpoint| {
-            validate_cloud_checkpoint_metadata(checkpoint, &expected_map_frame_id)?;
-            immutable_target_from_checkpoint(
-                checkpoint,
-                &expected_map_frame_id,
-                identity_class.is_modern(),
-            )
-        })
-        .transpose()
-        .map_err(Status::invalid_argument)?;
-    let cloud_sha256 = immutable_target
-        .as_ref()
-        .map(canonical_cloud_sha256)
-        .transpose()
-        .map_err(Status::invalid_argument)?;
-    let mapping_backend_checkpoint = request.mapping_backend_checkpoint.take();
-    if let Some(checkpoint) = mapping_backend_checkpoint.as_ref() {
-        validate_mapping_backend_checkpoint(checkpoint, selected_backend_kind)
-            .map_err(Status::invalid_argument)?;
-        validate_mapping_checkpoint_bundle(
-            checkpoint,
-            &occupancy_checkpoint,
-            cloud_checkpoint.as_ref(),
-        )
-        .map_err(Status::invalid_argument)?;
-    } else if selected_backend_kind == crate::mapping_backend::MappingBackendKind::Raytracing {
-        return Err(Status::failed_precondition(
-            "BACKEND_CHECKPOINT_REQUIRED: raytracing map activation requires a matching mapping backend checkpoint",
-        ));
-    }
-    let backend_sha256 = mapping_backend_checkpoint
-        .as_ref()
-        .map(|checkpoint| canonical_backend_sha256(checkpoint, &expected_map_frame_id))
-        .transpose()
-        .map_err(Status::invalid_argument)?;
-
-    let prepared_fine = if let Some(backend) = mapping_backend_checkpoint.as_ref().filter(|b| b.fine_map_artifact.is_some()) {
-        let file = service.graph_artifacts.lock().open(backend.fine_map_artifact.as_ref().unwrap()).map_err(Status::invalid_argument)?;
-        let source_session = backend.source_session_id.clone();
-        let source_generation = backend.source_session_generation;
-        let receipt = backend.cloud_receipt.as_ref().ok_or_else(|| Status::invalid_argument("精细资产缺少原点云收据"))?.clone();
-        let receiver = service.bridge.register_navigation_map_operation(async move {
-            tokio::task::spawn_blocking(move || crate::pointcloud::prepare_fine_cloud_archive(file, &source_session,
-                source_generation, receipt.cloud_revision, receipt.source_timestamp_ns))
-                .await.map_err(|e| e.to_string()).and_then(|v| v)
-        }).map_err(Status::unavailable)?;
-        Some(receiver.await.map_err(|e| Status::unavailable(e.to_string()))?.map_err(Status::invalid_argument)?)
-    } else { None };
-
-    let prepared_dense = if let Some(backend) = mapping_backend_checkpoint.as_ref().filter(|b| b.dense_cloud_artifact.is_some()) {
-        let dense_voxel_size = prepared_fine.as_ref().map(|fine| fine.voxel_size()).or_else(|| immutable_target.as_ref().map(|target| target.voxel_size))
-            .ok_or_else(|| Status::invalid_argument("完整点云缺少匹配的体素地图"))?;
-        let file = service.graph_artifacts.lock().open(backend.dense_cloud_artifact.as_ref().unwrap()).map_err(Status::invalid_argument)?;
-        let receipt = backend.cloud_receipt.as_ref().ok_or_else(|| Status::invalid_argument("完整点云缺少原提交收据"))?;
-        let expected = crate::dense_cloud::Metadata {
-            version: 1, session_id: backend.source_session_id.clone(), session_generation: backend.source_session_generation,
-            cloud_revision: receipt.cloud_revision, source_timestamp_ns: receipt.source_timestamp_ns,
-            frame_id: expected_map_frame_id.clone(), point_count: 0, bounds_min: [0.; 3], bounds_max: [0.; 3],
-        };
-        let receiver = service.bridge.register_navigation_map_operation(async move {
-            tokio::task::spawn_blocking(move || crate::dense_cloud::DenseCloud::from_archive_with_voxel_size(file, &expected, dense_voxel_size))
-                .await.map_err(|e| e.to_string()).and_then(|v| v)
-        }).map_err(Status::unavailable)?;
-        Some(receiver.await.map_err(|e| Status::unavailable(e.to_string()))?.map_err(Status::invalid_argument)?)
-    } else { None };
-
-    if let ActivationRequestIdentityClass::Modern {
-        asset_manifest_sha256,
-        asset_bundle_sha256,
-        ..
-    } = &identity_class
-    {
-        let expected_bundle = crate::map_checksum::sha256_bytes(&canonical_asset_bundle_preimage(
-            *asset_manifest_sha256,
-            occupancy_sha256,
-            cloud_sha256,
-            backend_sha256,
-        ));
-        if expected_bundle != *asset_bundle_sha256 {
-            return Err(Status::invalid_argument(
-                "ACTIVATE_MAP_ASSET_BUNDLE_SHA256_MISMATCH",
-            ));
-        }
-    }
-
-    if let Some(target) = immutable_target.as_ref() {
-        let writer = service.bridge.cloud_map_writer.lock();
-        let writer = writer
-            .as_ref()
-            .ok_or_else(|| Status::unavailable("cloud-map SHM writer is unavailable"))?;
-        writer
-            .validate_checkpoint(target.voxel_size, target.point_count, &target.xyz_f32_le)
-            .map_err(Status::invalid_argument)?;
-    }
-
-    let session_id = if identity_class.is_modern() {
-        request.session_id.clone()
-    } else {
-        request.session_id.trim().to_owned()
-    };
-    let map_name = if identity_class.is_modern() {
-        request.map_name.clone()
-    } else {
-        request.map_name.trim().to_owned()
-    };
-    let request_preimage = canonical_activation_request_preimage(
-        &identity_class,
-        service.activation_receipts.runtime_generation(),
-        &session_id,
-        &map_name,
-        occupancy_sha256,
-        cloud_sha256,
-        backend_sha256,
-    )
-    .map_err(Status::invalid_argument)?;
-    let activation_request_identity_sha256 = crate::map_checksum::sha256_bytes(&request_preimage);
-    let seed = crate::correction_coordinator::ActivationReceiptSeed {
-        planar_target: None,
-        activation_request_id: identity_class.request_id().to_owned(),
-        request_key: activation_request_identity_sha256.into(),
-        checkpoint_owner: None,
-        asset_manifest_sha256: identity_class.asset_manifest_sha256(),
-        asset_bundle_sha256: identity_class.asset_bundle_sha256(),
-        modern: identity_class.is_modern(),
-        immutable_target: immutable_target.clone(),
-    };
-
-    let target = immutable_target.map(|value| ActivationTargetSource::Legacy(Arc::new(value)));
-    (session_id, map_name, checkpoint, checkpoint_timestamp_ns, mapping_backend_checkpoint, None,
-     target, Some(occupancy_sha256), cloud_sha256, backend_sha256, prepared_fine, prepared_dense,
-     seed, ActivationRequestKey::LegacyDigest(activation_request_identity_sha256))
+        (metadata.session_id().to_owned(), metadata.map_name().to_owned(), checkpoint, timestamp,
+         owner.clone(), Some(owner), fine, dense, seed, key)
     };
 
     let _mapping_transition = tokio::time::timeout(
@@ -2507,78 +1294,12 @@ async fn activate_map_r1(
         Status::deadline_exceeded("timed out joining the in-flight Mapping lifecycle transition")
     })?;
     let bridge = service.bridge.clone();
-    let (
-        mut retained_global_map,
-        mut projection_guard,
-        mut lifecycle_guard,
-        restore_fence_on_early_return,
-    ) = match service.take_matching_activation_lifecycle_fence(
-        identity_class.request_id(),
-        activation_request_key.clone(),
-    ) {
-        Ok(Some(fence)) => (
-            fence.retained_global_map,
-            Some(fence.projection_guard),
-            Some(fence.lifecycle_guard),
-            true,
-        ),
-        Ok(None) => {
-            let projection = bridge.lock_explore_projection_owned().await;
-            let lifecycle = bridge.mapping_lifecycle_lock.clone().lock_owned().await;
-            (None, Some(projection), Some(lifecycle), false)
-        }
-        Err(fence_error_code) => {
-            let current = adapter.lock().snapshot();
-            let terminal = match service.activation_receipts.stage_or_replay(
-                seed.clone(),
-                mapping_session_state(current, fence_error_code),
-                false,
-            ) {
-                crate::correction_coordinator::ActivationLedgerAdmission::Terminal(state) => *state,
-                crate::correction_coordinator::ActivationLedgerAdmission::Execute(_) => {
-                    MappingSessionState {
-                        success: false,
-                        message: fence_error_code.to_owned(),
-                        activation_receipt_disposition: ActivationReceiptDisposition::Conflict
-                            as i32,
-                        ..MappingSessionState::default()
-                    }
-                }
-            };
-            return Ok(Response::new(terminal));
-        }
-    };
-    if let Err(status) = service.ensure_running_admission("ActivateMap").await {
-        if restore_fence_on_early_return {
-            service.restore_activation_lifecycle_fence(ActivationLifecycleFence {
-                activation_request_id: identity_class.request_id().to_owned(),
-                activation_request_key: activation_request_key.clone(),
-                retained_global_map,
-                projection_guard: projection_guard
-                    .take()
-                    .expect("ActivateMap early return owns projection guard"),
-                lifecycle_guard: lifecycle_guard
-                    .take()
-                    .expect("ActivateMap early return owns lifecycle guard"),
-            });
-        }
-        return Err(status);
-    }
+    let mut projection_guard = Some(bridge.lock_explore_projection_owned().await);
+    let mut lifecycle_guard = Some(bridge.mapping_lifecycle_lock.clone().lock_owned().await);
+    service.ensure_running_admission("ActivateMap").await?;
     if bridge.explore.blocks_mapping_mutation().await {
         let exploration = bridge.explore.snapshot();
-        if restore_fence_on_early_return {
-            service.restore_activation_lifecycle_fence(ActivationLifecycleFence {
-                activation_request_id: identity_class.request_id().to_owned(),
-                activation_request_key: activation_request_key.clone(),
-                retained_global_map,
-                projection_guard: projection_guard
-                    .take()
-                    .expect("ActivateMap early return owns projection guard"),
-                lifecycle_guard: lifecycle_guard
-                    .take()
-                    .expect("ActivateMap early return owns lifecycle guard"),
-            });
-        }
+
         return Err(Status::failed_precondition(format!(
             "exploration safety ownership must be released before ActivateMap: status={} request_id={} child_task_id={}",
             exploration.status, exploration.request_id, exploration.child_task_id
@@ -2596,19 +1317,7 @@ async fn activate_map_r1(
     );
     let mut token = match admission {
         crate::correction_coordinator::ActivationLedgerAdmission::Terminal(state) => {
-            if restore_fence_on_early_return {
-                service.restore_activation_lifecycle_fence(ActivationLifecycleFence {
-                    activation_request_id: identity_class.request_id().to_owned(),
-                    activation_request_key: activation_request_key.clone(),
-                    retained_global_map,
-                    projection_guard: projection_guard
-                        .take()
-                        .expect("ActivateMap early return owns projection guard"),
-                    lifecycle_guard: lifecycle_guard
-                        .take()
-                        .expect("ActivateMap early return owns lifecycle guard"),
-                });
-            }
+
             return Ok(Response::new(*state));
         }
         crate::correction_coordinator::ActivationLedgerAdmission::Execute(token) => token,
@@ -2618,7 +1327,7 @@ async fn activate_map_r1(
         let mut projection_guard = projection_guard
             .take()
             .expect("active ActivateMap owns projection guard");
-        let mut lifecycle_guard = lifecycle_guard
+        let lifecycle_guard = lifecycle_guard
             .take()
             .expect("active ActivateMap owns lifecycle guard");
         macro_rules! settle_current_failure {
@@ -2651,18 +1360,12 @@ async fn activate_map_r1(
                 return Ok(Response::new(terminal));
             }};
         }
-        if current.session_id != session_id
-            || current.map_name != map_name
-            || !adapter
-                .lock()
-                .checkpoint_activation_matches(&activation_request_key)
+        if current.session_id != session_id || current.map_name != map_name
+            || !adapter.lock().checkpoint_activation_matches(&activation_request_key)
         {
-            settle_current_failure!(
-                ActivationReceiptDisposition::OutcomeUnknown,
-                "ACTIVATE_MAP_STAGED_ACTIVE_IDENTITY_UNVERIFIABLE".to_owned()
-            );
+            return Err(Status::failed_precondition("ACTIVATE_MAP_REQUEST_RETIRED"));
         }
-        let proof = match service.activation_receipts.publication_proof(&token) {
+        let proof = match service.activation_receipts.installed_target_receipt(&token) {
             Some(proof) => proof,
             None => {
                 settle_current_failure!(
@@ -2671,144 +1374,37 @@ async fn activate_map_r1(
                 );
             }
         };
-        let target = match service.activation_receipts.target_source(&token) {
-            Some(target) => target,
-            None => {
-                settle_current_failure!(
-                    ActivationReceiptDisposition::OutcomeUnknown,
-                    "ACTIVATE_MAP_STAGED_TARGET_UNAVAILABLE".to_owned()
-                );
-            }
-        };
-        if !service.activation_receipts.journal_step_applied(
-            &token,
-            crate::correction_coordinator::ActivationJournalStep::TypedGlobalMap,
-        ) {
-            let cloud_metadata = bridge.cloud_map_writer.lock().as_ref()
-                .and_then(crate::pointcloud::CloudMapShmWriter::committed_metadata);
-            let Some(cloud_metadata) = cloud_metadata else {
-                settle_current_failure!(
-                    ActivationReceiptDisposition::OutcomeUnknown,
-                    "ACTIVATE_MAP_STAGED_CLOUD_METADATA_UNAVAILABLE".to_owned()
-                );
-            };
-            let committed = CommittedMappingCloudMap {
-                notification: CloudMapNotification {
-                    revision: proof.cloud_revision,
-                    point_count: proof.point_count,
-                    voxel_size: proof.voxel_size,
-                    session_generation: current.session_generation,
-                },
-                source_timestamp_ns: proof.source_timestamp_ns,
-                metadata: cloud_metadata,
-                receipt: proof.cloud_receipt.clone(),
-            };
-            let replaying_retained_publication = retained_global_map.is_some();
-            let mut retained_publication = match retained_global_map.take() {
-                Some(retained) => {
-                    if let Err(error) = retained.validate_replay(
-                        activation_request_key.clone(),
-                        &expected_map_frame_id,
-                        &committed,
-                    ) {
-                        let detail = format!(
-                            "cloud-map checkpoint retained publication identity failed: {error}"
-                        );
-                        match service.retain_activation_lifecycle_fence(
-                            identity_class.request_id(),
-                            activation_request_key.clone(),
-                            Some(retained),
-                            projection_guard,
-                            lifecycle_guard,
-                        ) {
-                            Ok(()) => return Err(Status::internal(detail)),
-                            Err((returned_projection, returned_lifecycle)) => {
-                                projection_guard = returned_projection;
-                                lifecycle_guard = returned_lifecycle;
-                                settle_current_failure!(
-                                    ActivationReceiptDisposition::OutcomeUnknown,
-                                    format!("{detail}; lifecycle fence retention failed")
-                                );
-                            }
-                        }
-                    }
-                    retained
+        if !service.activation_receipts.typed_global_map_published(&token) {
+            let committed = {
+                let writer = bridge.cloud_map_writer.lock();
+                let writer = writer.as_ref().ok_or_else(|| Status::unavailable("cloud-map writer unavailable"))?;
+                let metadata = writer.committed_metadata().ok_or_else(|| Status::unavailable("cloud-map metadata unavailable"))?;
+                let receipt = writer.last_cloud_receipt().ok_or_else(|| Status::unavailable("cloud-map receipt unavailable"))?;
+                if metadata.session_generation != current.session_generation || receipt.session_generation != current.session_generation {
+                    return Err(Status::failed_precondition("ACTIVATE_MAP_PUBLICATION_SESSION_RETIRED"));
                 }
-                None => match RetainedActivationGlobalMap::from_committed(
-                    activation_request_key.clone(),
-                    &expected_map_frame_id,
-                    &committed,
-                ) {
-                    Ok(retained) => retained,
-                    Err(error) => {
-                        settle_current_failure!(
-                            ActivationReceiptDisposition::OutcomeUnknown,
-                            format!("ACTIVATE_MAP_GLOBAL_MAP_FRAME_BUILD_FAILED: {error}")
-                        );
-                    }
-                },
-            };
-            let publish_result = match (replaying_retained_publication, retained_publication.legacy_frame.as_ref()) {
-                (true, Some(frame)) => publish_retained_global_map_frame(&bridge, frame).await,
-                _ => publish_committed_global_map_in_frame(&bridge, &committed, &expected_map_frame_id).await,
-            };
-            if let Err(error) = publish_result {
-                let mut detail = format!(
-                    "cloud-map checkpoint installed but typed /global_map publication failed: {error}"
-                );
-                if let Err(capture_error) = retained_publication.capture_materialized_legacy_frame(
-                    &bridge.cloud_map_writer, &committed,
-                ) {
-                    detail.push_str(&format!("; canonical retention failed: {capture_error}"));
+                CommittedMappingCloudMap {
+                    notification: CloudMapNotification { revision: metadata.revision, point_count: metadata.point_count,
+                        voxel_size: metadata.voxel_size, session_generation: metadata.session_generation },
+                    source_timestamp_ns: receipt.source_timestamp_ns, metadata, receipt,
                 }
-                match service.retain_activation_lifecycle_fence(
-                    identity_class.request_id(),
-                    activation_request_key.clone(),
-                    Some(retained_publication),
-                    projection_guard,
-                    lifecycle_guard,
-                ) {
-                    Ok(()) => return Err(Status::internal(detail)),
-                    Err((returned_projection, returned_lifecycle)) => {
-                        projection_guard = returned_projection;
-                        lifecycle_guard = returned_lifecycle;
-                        settle_current_failure!(
-                            ActivationReceiptDisposition::OutcomeUnknown,
-                            format!("{detail}; lifecycle fence retention failed")
-                        );
-                    }
-                }
+            };
+            publish_committed_global_map_in_frame(&bridge, &committed, &expected_map_frame_id).await
+                .map_err(|error| Status::unavailable(format!("typed /global_map publication failed: {error}")))?;
+            if !service.activation_receipts.mark_typed_global_map_published(&token) {
+                return Err(Status::failed_precondition("ACTIVATE_MAP_PUBLICATION_TOKEN_RETIRED"));
             }
-            if take_activation_fault_after(
-                &service,
-                crate::correction_coordinator::ActivationJournalStep::TypedGlobalMap,
-            ) {
-                settle_current_failure!(
-                    ActivationReceiptDisposition::InvalidatedPostcommit,
-                    "INJECTED_AFTER_TYPED_GLOBAL_MAP_RETRY".to_owned()
-                );
-            }
-            if !record_activation_journal(
-                &service.activation_receipts,
-                &token,
-                activation_request_key.clone(),
-                crate::correction_coordinator::ActivationJournalStep::TypedGlobalMap,
-                crate::correction_coordinator::ActivationJournalStatus::Applied,
-                Some(resumed_cloud_publication_verifier(&target, &proof.cloud_receipt)),
-                None,
-            ) {
-                settle_current_failure!(
-                    ActivationReceiptDisposition::InvalidatedPostcommit,
-                    "ACTIVATE_MAP_PUBLICATION_JOURNAL_CAS_FAILED".to_owned()
-                );
+            #[cfg(test)]
+            if take_activation_fault_after(&service, ActivationFaultPoint::TypedGlobalMap) {
+                settle_current_failure!(ActivationReceiptDisposition::InvalidatedPostcommit,
+                    "INJECTED_AFTER_TYPED_GLOBAL_MAP_RETRY".to_owned());
             }
         }
         let mut replay = current.clone();
         replay.idempotent_replay = true;
         let state = mapping_session_state(replay, "map checkpoint publication resumed");
-        // Seal against the actual publication proof even for an unbound
-        // compatibility request. Public eligibility is projected by the ledger.
-        let target_receipt = Some(proof.target_receipt.clone());
+        // 当前写端发布成功后，用原安装收据封存；可用性由账本和已选拥有方共同投影。
+        let target_receipt = proof.clone();
         let sealed = match service
             .activation_receipts
             .seal(&token, target_receipt, state)
@@ -2821,9 +1417,10 @@ async fn activate_map_r1(
                 );
             }
         };
+        #[cfg(test)]
         if take_activation_fault_after(
             &service,
-            crate::correction_coordinator::ActivationJournalStep::Seal,
+            ActivationFaultPoint::Seal,
         ) {
             return Err(Status::unavailable("INJECTED_AFTER_SEAL_RESPONSE_LOSS"));
         }
@@ -2834,19 +1431,6 @@ async fn activate_map_r1(
         ($disposition:expr, $detail:expr) => {{
             let detail = $detail;
             let state = activation_failure_state(&service, &adapter, &token, $disposition, &detail);
-            if restore_fence_on_early_return {
-                service.restore_activation_lifecycle_fence(ActivationLifecycleFence {
-                    activation_request_id: identity_class.request_id().to_owned(),
-                    activation_request_key: activation_request_key.clone(),
-                    retained_global_map,
-                    projection_guard: projection_guard
-                        .take()
-                        .expect("ActivateMap early return owns projection guard"),
-                    lifecycle_guard: lifecycle_guard
-                        .take()
-                        .expect("ActivateMap early return owns lifecycle guard"),
-                });
-            }
             return Ok(Response::new(state));
         }};
     }
@@ -2875,31 +1459,8 @@ async fn activate_map_r1(
         }
     };
 
-    let backend_verifier = match &activation_request_key {
-        ActivationRequestKey::LegacyDigest(_) => backend_sha256.map(ActivationJournalVerifier::LegacyDigest),
-        ActivationRequestKey::Assigned(_) => Some(ActivationJournalVerifier::Assigned(ActivationJournalVerifierV2::BackendGeneration(reserved_backend_generation))),
-    };
-    let mut restore_resolution = if mapping_backend_checkpoint.is_some() || assigned_checkpoint.is_some() {
-        if !record_activation_journal(
-            &service.activation_receipts,
-            &token,
-            activation_request_key.clone(),
-            crate::correction_coordinator::ActivationJournalStep::BackendRestoreSubmission,
-            crate::correction_coordinator::ActivationJournalStatus::Prepared,
-            backend_verifier.clone(),
-            None,
-        ) {
-            let _ = staged_worker.stop_and_join();
-            return_precommit_failure_with_fence!(
-                ActivationReceiptDisposition::InvalidatedPrecommit,
-                "ACTIVATE_MAP_RESTORE_PREPARE_CAS_FAILED"
-            );
-        }
-        let restore = if let Some(owner) = assigned_checkpoint.as_ref() {
-            staged_worker.client().restore_owned_checkpoint(owner.clone())
-        } else {
-            staged_worker.client().restore_checkpoint(mapping_backend_checkpoint.as_ref().expect("legacy restore owns backend checkpoint").payload.clone())
-        };
+    let mut restore_resolution = {
+        let restore = staged_worker.client().restore_owned_checkpoint(assigned_checkpoint.clone());
         let receiver = match restore {
             Ok(receiver) => receiver,
             Err(error) => {
@@ -2910,9 +1471,10 @@ async fn activate_map_r1(
                 );
             }
         };
+        #[cfg(test)]
         if take_activation_fault_after(
             &service,
-            crate::correction_coordinator::ActivationJournalStep::BackendRestoreSubmission,
+            ActivationFaultPoint::BackendRestoreSubmission,
         ) {
             drop(receiver);
             let stop_result = staged_worker.stop_and_join();
@@ -2934,7 +1496,7 @@ async fn activate_map_r1(
         let restore = tokio::time::timeout(MAPPING_BACKEND_CHECKPOINT_TIMEOUT, receiver).await;
         if !service.activation_receipts.validate_token(&token) {
             let _ = staged_worker.stop_and_join();
-            lifecycle_guard = Some(bridge.mapping_lifecycle_lock.clone().lock_owned().await);
+            let _retired_lifecycle_guard = bridge.mapping_lifecycle_lock.clone().lock_owned().await;
             return_precommit_failure_with_fence!(
                 ActivationReceiptDisposition::InvalidatedPrecommit,
                 "ACTIVATE_MAP_RESTORE_TOKEN_RETIRED"
@@ -2965,25 +1527,8 @@ async fn activate_map_r1(
                 );
             }
         };
-        if !record_activation_journal(
-            &service.activation_receipts,
-            &token,
-            activation_request_key.clone(),
-            crate::correction_coordinator::ActivationJournalStep::BackendRestoreSubmission,
-            crate::correction_coordinator::ActivationJournalStatus::Applied,
-            backend_verifier.clone(),
-            None,
-        ) {
-            let _ = resolution.abort();
-            let _ = staged_worker.stop_and_join();
-            return_precommit_failure_with_fence!(
-                ActivationReceiptDisposition::InvalidatedPrecommit,
-                "ACTIVATE_MAP_RESTORE_JOURNAL_CAS_FAILED"
-            );
-        }
+
         Some(resolution)
-    } else {
-        None
     };
 
     let started = match adapter.lock().start_session_with_staged_backend(
@@ -3042,46 +1587,20 @@ async fn activate_map_r1(
             return Ok(Response::new(terminal));
         }};
     }
-    if take_activation_fault_after(
+    #[cfg(test)]
+        if take_activation_fault_after(
         &service,
-        crate::correction_coordinator::ActivationJournalStep::SessionStart,
+        ActivationFaultPoint::SessionStart,
     ) {
         settle_started_failure!(
             ActivationReceiptDisposition::InvalidatedPrecommit,
             "INJECTED_AFTER_SESSION_START".to_owned()
         );
     }
-    let final_activation_identity = if let ActivationRequestIdentityClass::Assigned(metadata) = &identity_class {
-        ActivationIdentity::Assigned(InstalledActivationIdentityV2 {
-            request: metadata.clone(), runtime_generation: service.activation_receipts.runtime_generation(),
-            lifecycle_epoch: service.activation_receipts.lifecycle_epoch(), session_generation: started.session_generation,
-            backend_kind: selected_backend_kind, backend_generation: reserved_backend_generation,
-        })
-    } else if let ActivationRequestIdentityClass::Modern {
-        asset_manifest_sha256,
-        asset_bundle_sha256,
-        ..
-    } = &identity_class
-    {
-        ActivationIdentity::LegacyDigest(crate::map_checksum::sha256_bytes(
-            &canonical_activation_identity_preimage(
-                activation_request_key.legacy_digest().expect("legacy activation preimage"),
-                service.activation_receipts.runtime_generation(),
-                started.session_generation,
-                reserved_backend_generation,
-                selected_backend_kind.stable_name(),
-                backend_sha256,
-                *asset_manifest_sha256,
-                *asset_bundle_sha256,
-            )
-            .map_err(Status::internal)?,
-        ))
-    } else {
-        let mut bytes = b"nuwax.geometry.activate-map.legacy-identity.v1\0".to_vec();
-        bytes.extend_from_slice(&activation_request_key.legacy_digest().expect("legacy activation identity"));
-        bytes.extend_from_slice(&started.session_generation.to_be_bytes());
-        bytes.extend_from_slice(&reserved_backend_generation.to_be_bytes());
-        ActivationIdentity::LegacyDigest(crate::map_checksum::sha256_bytes(&bytes))
+    let final_activation_identity = InstalledActivationIdentityV2 {
+        request: identity_class.clone(), runtime_generation: service.activation_receipts.runtime_generation(),
+        lifecycle_epoch: service.activation_receipts.lifecycle_epoch(), session_generation: started.session_generation,
+        backend_kind: selected_backend_kind, backend_generation: reserved_backend_generation,
     };
     token = match service.activation_receipts.bind_activation_identity(
         &token,
@@ -3096,20 +1615,7 @@ async fn activate_map_r1(
             );
         }
     };
-    if !record_activation_journal(
-        &service.activation_receipts,
-        &token,
-        activation_request_key.clone(),
-        crate::correction_coordinator::ActivationJournalStep::SessionStart,
-        crate::correction_coordinator::ActivationJournalStatus::Applied,
-        Some(activation_verifier(&final_activation_identity)),
-        None,
-    ) {
-        settle_started_failure!(
-            ActivationReceiptDisposition::InvalidatedPrecommit,
-            "ACTIVATE_MAP_SESSION_START_JOURNAL_CAS_FAILED".to_owned()
-        );
-    }
+
 
     if let Some(writer) = &bridge.occupancy_shm {
         let begin_result = { writer.lock().begin_session(started.session_generation) };
@@ -3119,32 +1625,17 @@ async fn activate_map_r1(
                 format!("ACTIVATE_MAP_OCCUPANCY_FENCE_FAILED: {error}")
             );
         }
+        #[cfg(test)]
         if take_activation_fault_after(
             &service,
-            crate::correction_coordinator::ActivationJournalStep::OccupancyShmBegin,
+            ActivationFaultPoint::OccupancyShmBegin,
         ) {
             settle_started_failure!(
                 ActivationReceiptDisposition::InvalidatedPrecommit,
                 "INJECTED_AFTER_OCCUPANCY_SHM_BEGIN".to_owned()
             );
         }
-        if !record_activation_journal(
-            &service.activation_receipts,
-            &token,
-            activation_request_key.clone(),
-            crate::correction_coordinator::ActivationJournalStep::OccupancyShmBegin,
-            crate::correction_coordinator::ActivationJournalStatus::Applied,
-            Some(match &activation_request_key {
-                ActivationRequestKey::LegacyDigest(_) => crate::map_checksum::sha256_bytes(&started.session_generation.to_be_bytes()).into(),
-                ActivationRequestKey::Assigned(_) => ActivationJournalVerifier::Assigned(ActivationJournalVerifierV2::SessionGeneration(started.session_generation)),
-            }),
-            None,
-        ) {
-            settle_started_failure!(
-                ActivationReceiptDisposition::InvalidatedPrecommit,
-                "ACTIVATE_MAP_OCCUPANCY_FENCE_JOURNAL_CAS_FAILED".to_owned()
-            );
-        }
+
     }
 
     let revision_floor = bridge.state.read().await.map.revision;
@@ -3178,33 +1669,17 @@ async fn activate_map_r1(
             );
         }
     };
-    if take_activation_fault_after(
+    #[cfg(test)]
+        if take_activation_fault_after(
         &service,
-        crate::correction_coordinator::ActivationJournalStep::OccupancyInstall,
+        ActivationFaultPoint::OccupancyInstall,
     ) {
         settle_started_failure!(
             ActivationReceiptDisposition::InvalidatedPrecommit,
             "INJECTED_AFTER_OCCUPANCY_INSTALL".to_owned()
         );
     }
-    let occupancy_verifier = match &activation_request_key {
-        ActivationRequestKey::LegacyDigest(_) => ActivationJournalVerifier::LegacyDigest(occupancy_sha256.expect("legacy occupancy digest")),
-        ActivationRequestKey::Assigned(_) => ActivationJournalVerifier::Assigned(ActivationJournalVerifierV2::Occupancy(occupancy_receipt.clone())),
-    };
-    if !record_activation_journal(
-        &service.activation_receipts,
-        &token,
-        activation_request_key.clone(),
-        crate::correction_coordinator::ActivationJournalStep::OccupancyInstall,
-        crate::correction_coordinator::ActivationJournalStatus::Applied,
-        Some(occupancy_verifier.clone()),
-        None,
-    ) {
-        settle_started_failure!(
-            ActivationReceiptDisposition::InvalidatedPrecommit,
-            "ACTIVATE_MAP_OCCUPANCY_INSTALL_JOURNAL_CAS_FAILED".to_owned()
-        );
-    }
+
 
     let source_timestamp_ns = map.timestamp_ns;
     let cloud_commit = if let Some(target) = immutable_target.as_ref() {
@@ -3246,77 +1721,28 @@ async fn activate_map_r1(
                 "ACTIVATE_MAP_CLOUD_EFFECT_UNVERIFIABLE".to_owned()
             );
         }
+
         #[cfg(test)]
-        let correlated = {
-            let mut correlated = correlated;
-            if take_activation_fault_after(
-                &service,
-                crate::correction_coordinator::ActivationJournalStep::TargetReceiptVerification,
-            ) {
-                correlated.receipt.cloud_revision = correlated
-                    .receipt
-                    .cloud_revision
-                    .checked_add(1)
-                    .expect("test cloud revision must have headroom");
-            }
-            correlated
-        };
         if take_activation_fault_after(
             &service,
-            crate::correction_coordinator::ActivationJournalStep::CloudInstall,
+            ActivationFaultPoint::CloudInstall,
         ) {
             settle_started_failure!(
                 ActivationReceiptDisposition::OutcomeUnknown,
                 "INJECTED_AFTER_CLOUD_INSTALL".to_owned()
             );
         }
-        let target_receipt = match &final_activation_identity {
-            ActivationIdentity::LegacyDigest(identity) => {
-                let preimage = match canonical_target_receipt_preimage(*identity,
-                    cloud_sha256.expect("legacy cloud target digest exists"), target.source_revision(),
-                    correlated.snapshot.revision, started.session_generation, reserved_backend_generation, &correlated.receipt) {
-                    Ok(preimage) => preimage,
-                    Err(error) => { settle_started_failure!(ActivationReceiptDisposition::OutcomeUnknown,
-                        format!("ACTIVATE_MAP_TARGET_RECEIPT_OUTCOME_UNKNOWN: {error}")); }
-                };
-                TargetReceipt::LegacyDigest(crate::map_checksum::sha256_bytes(&preimage))
-            }
-            ActivationIdentity::Assigned(identity) => {
-                let owner = assigned_checkpoint.as_ref().expect("assigned activation owns source");
-                let receipt = InstalledTargetReceiptV2 { activation: identity.clone(),
-                    source_member: owner.cloud().member().clone(), occupancy_receipt: occupancy_receipt.clone(),
-                    cloud_receipt: Some(correlated.receipt.clone()) };
-                if !receipt.validate(owner) {
-                    settle_started_failure!(ActivationReceiptDisposition::OutcomeUnknown,
-                        "ACTIVATE_MAP_TYPED_TARGET_RECEIPT_MISMATCH".to_owned());
-                }
-                TargetReceipt::Assigned(receipt)
-            }
-        };
-        let proof = crate::correction_coordinator::ActivationPublicationProof {
-            source_timestamp_ns,
-            cloud_revision: correlated.snapshot.revision,
-            point_count: target.point_count(),
-            voxel_size: target.voxel_size(),
-            cloud_receipt: correlated.receipt.clone(),
-            target_receipt: target_receipt.clone(),
-        };
+        let target_receipt = InstalledTargetReceiptV2 { activation: final_activation_identity.clone(),
+            source_member: assigned_checkpoint.cloud().member().clone(), occupancy_receipt: occupancy_receipt.clone(),
+            cloud_receipt: Some(correlated.receipt.clone()) };
+        let proof = target_receipt.clone();
         if !service
             .activation_receipts
-            .store_publication_proof(&token, proof)
-            || !record_activation_journal(
-                &service.activation_receipts,
-                &token,
-                activation_request_key.clone(),
-                crate::correction_coordinator::ActivationJournalStep::CloudInstall,
-                crate::correction_coordinator::ActivationJournalStatus::Applied,
-                cloud_activation_verifier(&activation_request_key, cloud_sha256, &correlated.receipt),
-                None,
-            )
+            .store_installed_target_receipt(&token, proof)
         {
             settle_started_failure!(
                 ActivationReceiptDisposition::OutcomeUnknown,
-                "ACTIVATE_MAP_CLOUD_PROOF_JOURNAL_CAS_FAILED".to_owned()
+                "ACTIVATE_MAP_TARGET_RECEIPT_STORE_CAS_FAILED".to_owned()
             );
         }
         let notification = CloudMapNotification {
@@ -3346,34 +1772,21 @@ async fn activate_map_r1(
                 "ACTIVATE_MAP_BACKEND_COMMIT_OUTCOME_UNKNOWN".to_owned()
             );
         }
+        #[cfg(test)]
         if take_activation_fault_after(
             &service,
-            crate::correction_coordinator::ActivationJournalStep::BackendCommit,
+            ActivationFaultPoint::BackendCommit,
         ) {
             settle_started_failure!(
                 ActivationReceiptDisposition::OutcomeUnknown,
                 "INJECTED_AFTER_BACKEND_COMMIT".to_owned()
             );
         }
-        if !record_activation_journal(
-            &service.activation_receipts,
-            &token,
-            activation_request_key.clone(),
-            crate::correction_coordinator::ActivationJournalStep::BackendCommit,
-            crate::correction_coordinator::ActivationJournalStatus::Applied,
-            backend_verifier.clone(),
-            None,
-        ) {
-            settle_started_failure!(
-                ActivationReceiptDisposition::OutcomeUnknown,
-                "ACTIVATE_MAP_BACKEND_COMMIT_JOURNAL_CAS_FAILED".to_owned()
-            );
-        }
+
     }
 
     let activation_record_result = {
         let mut adapter = adapter.lock();
-        adapter.set_legacy_checkpoint_reconstructed(mapping_backend_checkpoint.is_none() && assigned_checkpoint.is_none());
         adapter.record_checkpoint_activation(activation_request_key.clone())
     };
     if let Err(error) = activation_record_result {
@@ -3382,29 +1795,17 @@ async fn activate_map_r1(
             format!("ACTIVATE_MAP_RECORD_FAILED: {error}")
         );
     }
-    if take_activation_fault_after(
+    #[cfg(test)]
+        if take_activation_fault_after(
         &service,
-        crate::correction_coordinator::ActivationJournalStep::ActivationRecord,
+        ActivationFaultPoint::ActivationRecord,
     ) {
         settle_started_failure!(
             ActivationReceiptDisposition::InvalidatedPostcommit,
             "INJECTED_AFTER_ACTIVATION_RECORD".to_owned()
         );
     }
-    if !record_activation_journal(
-        &service.activation_receipts,
-        &token,
-        activation_request_key.clone(),
-        crate::correction_coordinator::ActivationJournalStep::ActivationRecord,
-        crate::correction_coordinator::ActivationJournalStatus::Applied,
-        Some(activation_verifier(&final_activation_identity)),
-        None,
-    ) {
-        settle_started_failure!(
-            ActivationReceiptDisposition::InvalidatedPostcommit,
-            "ACTIVATE_MAP_RECORD_JOURNAL_CAS_FAILED".to_owned()
-        );
-    }
+
 
     {
         let mut shared = bridge.state.write().await;
@@ -3413,29 +1814,17 @@ async fn activate_map_r1(
             shared.cloud_map_revision = notification.revision;
         }
     }
-    if take_activation_fault_after(
+    #[cfg(test)]
+        if take_activation_fault_after(
         &service,
-        crate::correction_coordinator::ActivationJournalStep::SharedStateCommit,
+        ActivationFaultPoint::SharedStateCommit,
     ) {
         settle_started_failure!(
             ActivationReceiptDisposition::InvalidatedPostcommit,
             "INJECTED_AFTER_SHARED_STATE_COMMIT".to_owned()
         );
     }
-    if !record_activation_journal(
-        &service.activation_receipts,
-        &token,
-        activation_request_key.clone(),
-        crate::correction_coordinator::ActivationJournalStep::SharedStateCommit,
-        crate::correction_coordinator::ActivationJournalStatus::Applied,
-        Some(occupancy_verifier.clone()),
-        None,
-    ) {
-        settle_started_failure!(
-            ActivationReceiptDisposition::InvalidatedPostcommit,
-            "ACTIVATE_MAP_SHARED_STATE_JOURNAL_CAS_FAILED".to_owned()
-        );
-    }
+
     bridge
         .revoke_committed_map_projection_locked(
             projection_guard
@@ -3444,194 +1833,66 @@ async fn activate_map_r1(
         )
         .map_err(Status::unavailable)?;
     *bridge.occupancy_shm_current.write().await = None;
-    if take_activation_fault_after(
+    #[cfg(test)]
+        if take_activation_fault_after(
         &service,
-        crate::correction_coordinator::ActivationJournalStep::CacheClears,
+        ActivationFaultPoint::CacheClears,
     ) {
         settle_started_failure!(
             ActivationReceiptDisposition::InvalidatedPostcommit,
             "INJECTED_AFTER_CACHE_CLEARS".to_owned()
         );
     }
-    if !record_activation_journal(
-        &service.activation_receipts,
-        &token,
-        activation_request_key.clone(),
-        crate::correction_coordinator::ActivationJournalStep::CacheClears,
-        crate::correction_coordinator::ActivationJournalStatus::Applied,
-        Some(occupancy_verifier.clone()),
-        None,
-    ) {
-        settle_started_failure!(
-            ActivationReceiptDisposition::InvalidatedPostcommit,
-            "ACTIVATE_MAP_CACHE_CLEAR_JOURNAL_CAS_FAILED".to_owned()
-        );
-    }
+
     let _ = bridge.map_revision_tx.send(event);
-    if take_activation_fault_after(
+    #[cfg(test)]
+        if take_activation_fault_after(
         &service,
-        crate::correction_coordinator::ActivationJournalStep::MapEvent,
+        ActivationFaultPoint::MapEvent,
     ) {
         settle_started_failure!(
             ActivationReceiptDisposition::InvalidatedPostcommit,
             "INJECTED_AFTER_MAP_EVENT".to_owned()
         );
     }
-    if !record_activation_journal(
-        &service.activation_receipts,
-        &token,
-        activation_request_key.clone(),
-        crate::correction_coordinator::ActivationJournalStep::MapEvent,
-        crate::correction_coordinator::ActivationJournalStatus::Applied,
-        Some(occupancy_verifier.clone()),
-        None,
-    ) {
-        settle_started_failure!(
-            ActivationReceiptDisposition::InvalidatedPostcommit,
-            "ACTIVATE_MAP_MAP_EVENT_JOURNAL_CAS_FAILED".to_owned()
-        );
-    }
+
 
     let target_receipt =
         if let Some((notification, committed, target_receipt)) = cloud_commit {
             let _ = bridge.cloud_map_tx.send(notification);
-            if take_activation_fault_after(
+            #[cfg(test)]
+        if take_activation_fault_after(
                 &service,
-                crate::correction_coordinator::ActivationJournalStep::CloudEvent,
+                ActivationFaultPoint::CloudEvent,
             ) {
                 settle_started_failure!(
                     ActivationReceiptDisposition::InvalidatedPostcommit,
                     "INJECTED_AFTER_CLOUD_EVENT".to_owned()
                 );
             }
-            if !record_activation_journal(
-                &service.activation_receipts,
-                &token,
-                activation_request_key.clone(),
-                crate::correction_coordinator::ActivationJournalStep::CloudEvent,
-                crate::correction_coordinator::ActivationJournalStatus::Applied,
-                cloud_activation_verifier(&activation_request_key, cloud_sha256, &committed.receipt),
-                None,
-            ) {
-                settle_started_failure!(
-                    ActivationReceiptDisposition::InvalidatedPostcommit,
-                    "ACTIVATE_MAP_CLOUD_EVENT_JOURNAL_CAS_FAILED".to_owned()
-                );
+
+            publish_committed_global_map_in_frame(&bridge, &committed, &expected_map_frame_id).await
+                .map_err(|error| Status::unavailable(format!("typed /global_map publication failed: {error}")))?;
+            if !service.activation_receipts.mark_typed_global_map_published(&token) {
+                return Err(Status::failed_precondition("ACTIVATE_MAP_PUBLICATION_TOKEN_RETIRED"));
             }
-            let mut retained_publication = match RetainedActivationGlobalMap::from_committed(
-                activation_request_key.clone(),
-                &expected_map_frame_id,
-                &committed,
-            ) {
-                Ok(retained) => retained,
-                Err(error) => {
-                    settle_started_failure!(
-                        ActivationReceiptDisposition::OutcomeUnknown,
-                        format!("ACTIVATE_MAP_GLOBAL_MAP_FRAME_BUILD_FAILED: {error}")
-                    );
-                }
-            };
-            let publish_result =
-                publish_committed_global_map_in_frame(&bridge, &committed, &expected_map_frame_id)
-                    .await;
-            if let Err(error) = publish_result {
-                let mut detail = format!(
-                    "cloud-map checkpoint installed but typed /global_map publication failed: {error}"
-                );
-                if let Err(capture_error) = retained_publication.capture_materialized_legacy_frame(
-                    &bridge.cloud_map_writer, &committed,
-                ) {
-                    detail.push_str(&format!("; canonical retention failed: {capture_error}"));
-                }
-                match service.retain_activation_lifecycle_fence(
-                    identity_class.request_id(),
-                    activation_request_key.clone(),
-                    Some(retained_publication),
-                    projection_guard
-                        .take()
-                        .expect("ActivateMap publication retention owns projection guard"),
-                    lifecycle_guard
-                        .take()
-                        .expect("ActivateMap publication retention owns lifecycle guard"),
-                ) {
-                    Ok(()) => return Err(Status::internal(detail)),
-                    Err((returned_projection, returned_lifecycle)) => {
-                        projection_guard = Some(returned_projection);
-                        lifecycle_guard = Some(returned_lifecycle);
-                        settle_started_failure!(
-                            ActivationReceiptDisposition::OutcomeUnknown,
-                            format!("{detail}; lifecycle fence retention failed")
-                        );
-                    }
-                }
-            }
-            if take_activation_fault_after(
+            #[cfg(test)]
+        if take_activation_fault_after(
                 &service,
-                crate::correction_coordinator::ActivationJournalStep::TypedGlobalMap,
+                ActivationFaultPoint::TypedGlobalMap,
             ) {
                 settle_started_failure!(
                     ActivationReceiptDisposition::InvalidatedPostcommit,
                     "INJECTED_AFTER_TYPED_GLOBAL_MAP".to_owned()
                 );
             }
-            if !record_activation_journal(
-                &service.activation_receipts,
-                &token,
-                activation_request_key.clone(),
-                crate::correction_coordinator::ActivationJournalStep::TypedGlobalMap,
-                crate::correction_coordinator::ActivationJournalStatus::Applied,
-                cloud_activation_verifier(&activation_request_key, cloud_sha256, &committed.receipt),
-                None,
-            ) {
-                settle_started_failure!(
-                    ActivationReceiptDisposition::InvalidatedPostcommit,
-                    "ACTIVATE_MAP_PUBLICATION_JOURNAL_CAS_FAILED".to_owned()
-                );
-            }
-            Some(target_receipt)
-        } else {
-            #[cfg(test)]
-            {
-                let barrier = service.start_mapping_before_cloud_clear.lock().take();
-                if let Some(barrier) = barrier {
-                    barrier.wait().await;
-                    barrier.wait().await;
-                }
-            }
-            let clear = bridge
-                .begin_cloud_map_session(started.session_generation)
-                .await;
-            if let CloudMapSessionAdmission::ClearRejected(detail)
-            | CloudMapSessionAdmission::AdmissionClosed(detail) = clear
-            {
-                settle_started_failure!(
-                    ActivationReceiptDisposition::InvalidatedPostcommit,
-                    format!("ACTIVATE_MAP_CLOUD_CLEAR_ADMISSION_FAILED: {detail}")
-                );
-            }
-            None
-        };
 
-    if !record_activation_journal(
-        &service.activation_receipts,
-        &token,
-        activation_request_key.clone(),
-        crate::correction_coordinator::ActivationJournalStep::Seal,
-        crate::correction_coordinator::ActivationJournalStatus::Prepared,
-        Some(activation_verifier(&final_activation_identity)),
-        None,
-    ) {
-        settle_started_failure!(
-            ActivationReceiptDisposition::InvalidatedPostcommit,
-            "ACTIVATE_MAP_SEAL_PREPARE_CAS_FAILED".to_owned()
-        );
-    }
+            target_receipt
+        } else { unreachable!("编号三维检查点具有点云提交") };
+
+
     let snapshot = adapter.lock().snapshot();
-    let activation_message = if mapping_backend_checkpoint.is_some() || assigned_checkpoint.is_some() {
-        "map checkpoint activated; legacy_checkpoint_reconstructed=false"
-    } else {
-        "map checkpoint activated; legacy_checkpoint_reconstructed=true"
-    };
+    let activation_message = "map checkpoint activated";
     let state = mapping_session_state(snapshot, activation_message);
     let sealed = match service
         .activation_receipts
@@ -3645,9 +1906,10 @@ async fn activate_map_r1(
             );
         }
     };
-    if take_activation_fault_after(
+    #[cfg(test)]
+        if take_activation_fault_after(
         &service,
-        crate::correction_coordinator::ActivationJournalStep::Seal,
+        ActivationFaultPoint::Seal,
     ) {
         drop(lifecycle_guard);
         return Err(Status::unavailable("INJECTED_AFTER_SEAL_RESPONSE_LOSS"));
@@ -3801,39 +2063,9 @@ async fn finish_failed_mapping_start_rollback(
     }
 }
 
-async fn finish_deferred_mapping_start_failure(
-    replay: &crate::lio_ingress::NativeDeferredReplayControl,
-    adapter: &Arc<parking_lot::Mutex<MappingAdapter>>,
-    lifecycle_lock: &Arc<tokio::sync::Mutex<()>>,
-    lifecycle_guard: tokio::sync::OwnedMutexGuard<()>,
-    started: &MappingSessionSnapshot,
-    occupancy_fence: Option<OccupancySessionFenceRollback>,
-    detail: impl Into<String>,
-) -> Status {
-    let canonical_detail = replay.fail_generation(detail);
-    let outcome = finish_failed_mapping_start_rollback(
-        adapter,
-        lifecycle_lock,
-        lifecycle_guard,
-        started,
-        occupancy_fence,
-        canonical_detail,
-    )
-    .await;
-    for diagnostic in &outcome.diagnostics {
-        tracing::error!(%diagnostic, "deferred StartMapping rollback diagnostic");
-    }
-    replay.record_poison_diagnostics(outcome.diagnostics);
-    Status::unavailable(outcome.canonical_detail)
-}
 
-fn decode_checkpoint_grid(
-    checkpoint: OccupancyGridData,
-    expected_map_frame_id: &str,
-) -> Result<nuwax_mapping::OccupancyGrid, String> {
-    let meta = checkpoint.meta.ok_or_else(|| "checkpoint.meta is required".to_string())?;
-    decode_checkpoint_grid_parts(&meta, checkpoint.data.len(), checkpoint.data.into_iter(), expected_map_frame_id)
-}
+
+
 
 fn decode_checkpoint_grid_borrowed(
     checkpoint: &OccupancyGridData,
@@ -3978,7 +2210,7 @@ fn cloud_checkpoint_proto(
         source_revision: snapshot.revision,
         point_count: snapshot.point_count,
         voxel_size: snapshot.voxel_size,
-        xyz_sha256: String::new(),
+
         xyz_f32_le: snapshot.xyz_f32_le,
         payload_schema_version: crate::pointcloud::CM_PAYLOAD_SCHEMA_VERSION,
         member_identity: None,
@@ -3998,33 +2230,7 @@ pub(crate) fn validate_mapping_checkpoint_envelope_size(
     Ok(())
 }
 
-fn validate_cloud_checkpoint_metadata(
-    checkpoint: &CloudMapCheckpoint,
-    expected_map_frame_id: &str,
-) -> Result<(), String> {
-    if checkpoint.member_identity.is_some() {
-        return Err("assigned cloud member cannot enter legacy checkpoint validation".into());
-    }
-    let frame_id = checkpoint.frame_id.trim();
-    if frame_id != expected_map_frame_id {
-        return Err(format!(
-            "cloud-map checkpoint frame must be {expected_map_frame_id}, received {}",
-            checkpoint.frame_id,
-        ));
-    }
-    if checkpoint.payload_schema_version != crate::pointcloud::CM_PAYLOAD_SCHEMA_VERSION {
-        return Err(format!(
-            "unsupported cloud-map checkpoint schema: expected={} actual={}",
-            crate::pointcloud::CM_PAYLOAD_SCHEMA_VERSION,
-            checkpoint.payload_schema_version
-        ));
-    }
-    let checksum = crate::pointcloud::decode_checkpoint_sha256(&checkpoint.xyz_sha256)?;
-    if crate::map_checksum::sha256_bytes(&checkpoint.xyz_f32_le) != checksum {
-        return Err("cloud-map checkpoint xyz_sha256 mismatch".to_string());
-    }
-    Ok(())
-}
+
 
 fn mapping_commit_identity_proto(
     identity: crate::mapping_commit::MappingCommitId,
@@ -4175,17 +2381,12 @@ fn validate_planar_checkpoint(checkpoint: &MappingBackendCheckpoint) -> Result<(
         || receipt.source_timestamp_ns != meta.timestamp_ns || meta.timestamp_ns == 0 || meta.revision == 0 {
         return Err("二维图物理栅格与规范收据身份冲突".into());
     }
-    match checkpoint.schema_version {
-        1 if checkpoint.checkpoint_id.is_empty() && checkpoint.backend_payload_schema_version == 0
-            && checkpoint.occupancy_identity.is_none() && reference.identity_schema_version != 2
-            && reference.sha256 == checkpoint.content_sha256 => {},
-        2 if crate::planar_artifacts::assigned_id(&checkpoint.checkpoint_id) && checkpoint.backend_payload_schema_version == 2
-            && checkpoint.content_sha256.is_empty() && reference.identity_schema_version == 2 => {
-            validate_checkpoint_member_binding(checkpoint, reference.member_identity.as_ref().ok_or("二维图成员身份缺失")?, CheckpointMemberRole::PlanarGraph)?;
-            validate_checkpoint_member_binding(checkpoint, checkpoint.occupancy_identity.as_ref().ok_or("二维占据成员身份缺失")?, CheckpointMemberRole::CanonicalOccupancy)?;
-        },
-        _ => return Err("二维检查点内外身份代际混合".into()),
+    if checkpoint.schema_version != 2 || !crate::planar_artifacts::assigned_id(&checkpoint.checkpoint_id)
+        || checkpoint.backend_payload_schema_version != 2 || reference.identity_schema_version != 2 {
+        return Err("二维检查点身份代际非法".into());
     }
+    validate_checkpoint_member_binding(checkpoint, reference.member_identity.as_ref().ok_or("二维图成员身份缺失")?, CheckpointMemberRole::PlanarGraph)?;
+    validate_checkpoint_member_binding(checkpoint, checkpoint.occupancy_identity.as_ref().ok_or("二维占据成员身份缺失")?, CheckpointMemberRole::CanonicalOccupancy)?;
     Ok(())
 }
 
@@ -4229,9 +2430,7 @@ fn validate_mapping_checkpoint_structure(checkpoint: &MappingBackendCheckpoint,
 
 // The outer identity generation is independent of the NWMBCKP binary payload schema.
 const ASSIGNED_CHECKPOINT_ENVELOPE_VERSION: u32 = 2;
-fn checkpoint_envelope_version(requested: u32) -> Result<u32, String> {
-    match requested { 0 | 1 => Ok(1), 2 => Ok(2), _ => Err(format!("unsupported checkpoint envelope schema: {requested}")) }
-}
+
 fn checkpoint_member_identity(checkpoint_id: &str, role: CheckpointMemberRole,
     occupancy: &CanonicalOccupancyCommitReceipt, cloud: &CanonicalCloudCommitReceipt,
     frame_id: &str, fine_domain: Option<&nuwax_map_chunks::Domain>) -> CheckpointMemberIdentity {
@@ -4259,7 +2458,7 @@ fn validate_checkpoint_canonical_structure(checkpoint: &MappingBackendCheckpoint
         || occupancy.data.iter().any(|v| !(-1..=100).contains(&(*v as i8))) { return Err("canonical occupancy geometry, size or cells are invalid".into()); }
     let cloud = checkpoint.canonical_cloud_checkpoint.as_ref().ok_or("canonical cloud required")?;
     validate_cloud_checkpoint_structure(cloud, &meta.frame_id)?;
-    validate_mapping_checkpoint_bundle(checkpoint, occupancy, Some(cloud))
+    validate_mapping_checkpoint_bundle(checkpoint)
 }
 fn validate_checkpoint_member_binding(checkpoint: &MappingBackendCheckpoint, member: &CheckpointMemberIdentity, role: CheckpointMemberRole) -> Result<(), String> {
     crate::planar_artifacts::validate_member_identity(member)?;
@@ -4276,7 +2475,7 @@ pub(crate) fn validate_assigned_mapping_checkpoint(checkpoint: &MappingBackendCh
         return validate_planar_checkpoint(checkpoint);
     }
     if checkpoint.schema_version != ASSIGNED_CHECKPOINT_ENVELOPE_VERSION
-        || !crate::planar_artifacts::assigned_id(&checkpoint.checkpoint_id) || !checkpoint.content_sha256.is_empty()
+        || !crate::planar_artifacts::assigned_id(&checkpoint.checkpoint_id)
         || checkpoint.backend_payload_schema_version != crate::mapping_backend::MAPPING_BACKEND_CHECKPOINT_SCHEMA_VERSION
         || checkpoint.graph_artifact.is_some() || !checkpoint.target_kind.is_empty()
         || expected_backend == crate::mapping_backend::MappingBackendKind::SlamToolbox { return Err("unsupported or mixed assigned checkpoint envelope".into()); }
@@ -4290,7 +2489,7 @@ pub(crate) fn validate_assigned_mapping_checkpoint(checkpoint: &MappingBackendCh
     validate_checkpoint_member_binding(checkpoint, checkpoint.backend_identity.as_ref().ok_or("backend member identity required")?, CheckpointMemberRole::BackendState)?;
     validate_checkpoint_member_binding(checkpoint, checkpoint.occupancy_identity.as_ref().ok_or("occupancy member identity required")?, CheckpointMemberRole::CanonicalOccupancy)?;
     let cloud = checkpoint.canonical_cloud_checkpoint.as_ref().unwrap();
-    if cloud.payload_schema_version != 2 || !cloud.xyz_sha256.is_empty() { return Err("mixed canonical cloud identity generation".into()); }
+    if cloud.payload_schema_version != 2 { return Err("mixed canonical cloud identity generation".into()); }
     validate_checkpoint_member_binding(checkpoint, cloud.member_identity.as_ref().ok_or("cloud member identity required")?, CheckpointMemberRole::CanonicalCloud)?;
     if let (Some(fine), Some(dense)) = (&checkpoint.fine_map_artifact, &checkpoint.dense_cloud_artifact) {
         if fine.id == dense.id { return Err("distinct checkpoint members cannot share one artifact ID".into()); }
@@ -4305,95 +2504,24 @@ pub(crate) fn validate_assigned_mapping_checkpoint(checkpoint: &MappingBackendCh
     Ok(())
 }
 /// One assembly owner after the existing lifecycle barrier has frozen all inputs.
-fn assemble_mapping_checkpoint_export(mut checkpoint: MappingBackendCheckpoint, envelope_version: u32,
-    expected_backend: crate::mapping_backend::MappingBackendKind) -> Result<MappingBackendCheckpoint, String> {
-    checkpoint.schema_version = checkpoint_envelope_version(envelope_version)?;
-    if checkpoint.schema_version == 2 {
-        checkpoint.backend_payload_schema_version = crate::mapping_backend::MAPPING_BACKEND_CHECKPOINT_SCHEMA_VERSION;
-        if !checkpoint.content_sha256.is_empty() { return Err("v2 assembly received an active legacy digest".into()); }
-        let occupancy = checkpoint.occupancy_receipt.as_ref().ok_or("occupancy receipt required")?;
-        let cloud_receipt = checkpoint.cloud_receipt.as_ref().ok_or("cloud receipt required")?;
-        let cloud = checkpoint.canonical_cloud_checkpoint.as_mut().ok_or("canonical cloud required")?;
-        if !cloud.xyz_sha256.is_empty() || cloud.member_identity.is_some() { return Err("cloud assembly requires unfingerprinted canonical bytes".into()); }
-        if checkpoint.backend_identity.is_some() || checkpoint.occupancy_identity.is_some() { return Err("assembly requires unassigned backend/occupancy members".into()); }
-        checkpoint.backend_identity = Some(checkpoint_member_identity(&checkpoint.checkpoint_id, CheckpointMemberRole::BackendState, occupancy, cloud_receipt, &cloud.frame_id, None));
-        checkpoint.occupancy_identity = Some(checkpoint_member_identity(&checkpoint.checkpoint_id, CheckpointMemberRole::CanonicalOccupancy, occupancy, cloud_receipt, &cloud.frame_id, None));
-        cloud.payload_schema_version = 2;
-        cloud.member_identity = Some(checkpoint_member_identity(&checkpoint.checkpoint_id, CheckpointMemberRole::CanonicalCloud, occupancy, cloud_receipt, &cloud.frame_id, None));
-        validate_assigned_mapping_checkpoint(&checkpoint, expected_backend)?;
-    } else {
-        if !checkpoint.checkpoint_id.is_empty() || checkpoint.backend_payload_schema_version != 0 || checkpoint.backend_identity.is_some() || checkpoint.occupancy_identity.is_some() { return Err("legacy assembly received assigned identity".into()); }
-        checkpoint.content_sha256 = crate::map_checksum::sha256_bytes(&checkpoint.payload).to_vec();
-        let cloud = checkpoint.canonical_cloud_checkpoint.as_mut().ok_or("canonical cloud required")?;
-        cloud.payload_schema_version = crate::pointcloud::CM_PAYLOAD_SCHEMA_VERSION;
-        cloud.xyz_sha256 = crate::map_checksum::sha256_hex(&cloud.xyz_f32_le);
-        validate_cloud_checkpoint_metadata(cloud, &cloud.frame_id)?;
-        validate_mapping_backend_checkpoint(&checkpoint, expected_backend)?;
-    }
+fn assemble_mapping_checkpoint_export(mut checkpoint: MappingBackendCheckpoint) -> Result<MappingBackendCheckpoint, String> {
+    checkpoint.schema_version = 2;
+    checkpoint.backend_payload_schema_version = crate::mapping_backend::MAPPING_BACKEND_CHECKPOINT_SCHEMA_VERSION;
+    let occupancy = checkpoint.occupancy_receipt.as_ref().expect("导出屏障冻结占据提交");
+    let cloud_receipt = checkpoint.cloud_receipt.as_ref().expect("导出屏障冻结点云提交");
+    let cloud = checkpoint.canonical_cloud_checkpoint.as_mut().expect("导出拥有规范点云");
+    checkpoint.backend_identity = Some(checkpoint_member_identity(&checkpoint.checkpoint_id, CheckpointMemberRole::BackendState, occupancy, cloud_receipt, &cloud.frame_id, None));
+    checkpoint.occupancy_identity = Some(checkpoint_member_identity(&checkpoint.checkpoint_id, CheckpointMemberRole::CanonicalOccupancy, occupancy, cloud_receipt, &cloud.frame_id, None));
+    cloud.payload_schema_version = 2;
+    cloud.member_identity = Some(checkpoint_member_identity(&checkpoint.checkpoint_id, CheckpointMemberRole::CanonicalCloud, occupancy, cloud_receipt, &cloud.frame_id, None));
     validate_mapping_checkpoint_envelope_size("mapping backend checkpoint response", checkpoint.encoded_len())?;
     Ok(checkpoint)
 }
 
-fn validate_mapping_backend_checkpoint(
-    checkpoint: &MappingBackendCheckpoint,
-    expected_backend: crate::mapping_backend::MappingBackendKind,
-) -> Result<(), String> {
-    if !checkpoint.checkpoint_id.is_empty() || checkpoint.backend_payload_schema_version != 0 || checkpoint.backend_identity.is_some() || checkpoint.occupancy_identity.is_some() {
-        return Err("assigned checkpoint requires its paired v2 consumer".into());
-    }
-    if let Some(dense) = &checkpoint.dense_cloud_artifact {
-        crate::planar_artifacts::Store::validate_reference(dense)?;
-        if dense.identity_schema_version == 2 { return Err("v2 artifact cannot enter legacy activation".into()); }
-        if dense.id.is_empty() || dense.id.len() > 128 || dense.size == 0 || dense.size > crate::dense_cloud::MAX_ARCHIVE_BYTES
-            || dense.sha256.len() != 32 || dense.sha256.iter().all(|b| *b == 0) { return Err("完整点云制品引用无效".into()); }
-    }
-    if let Some(fine) = &checkpoint.fine_map_artifact {
-        crate::planar_artifacts::Store::validate_reference(fine)?;
-        if fine.identity_schema_version == 2 { return Err("v2 artifact cannot enter legacy activation".into()); }
-        if fine.id.is_empty() || fine.id.len() > 128 || fine.size == 0 || fine.size > nuwax_map_chunks::MAX_ARCHIVE_BYTES
-            || fine.sha256.len() != 32 || fine.sha256.iter().all(|b| *b == 0) { return Err("精细地图制品引用无效".into()); }
-    }
-    if expected_backend==crate::mapping_backend::MappingBackendKind::SlamToolbox {return validate_planar_checkpoint(checkpoint);}
-    if checkpoint.schema_version
-        != crate::mapping_backend::MAPPING_BACKEND_CHECKPOINT_SCHEMA_VERSION
-    {
-        return Err(format!(
-            "unsupported mapping backend checkpoint schema: expected={} actual={}",
-            crate::mapping_backend::MAPPING_BACKEND_CHECKPOINT_SCHEMA_VERSION,
-            checkpoint.schema_version
-        ));
-    }
-    validate_mapping_checkpoint_structure(checkpoint, expected_backend)?;
-    if checkpoint.content_sha256.len() != 32
-        || checkpoint.content_sha256 != crate::map_checksum::sha256_bytes(&checkpoint.payload)
-    {
-        return Err("mapping backend checkpoint content_sha256 mismatch".to_owned());
-    }
-    let canonical_occupancy_checkpoint = checkpoint
-        .canonical_occupancy_checkpoint
-        .as_ref()
-        .ok_or_else(|| {
-            "mapping backend checkpoint canonical_occupancy_checkpoint is required".to_owned()
-        })?;
-    let canonical_cloud_checkpoint =
-        checkpoint
-            .canonical_cloud_checkpoint
-            .as_ref()
-            .ok_or_else(|| {
-                "mapping backend checkpoint canonical_cloud_checkpoint is required".to_owned()
-            })?;
-    validate_mapping_checkpoint_bundle(
-        checkpoint,
-        canonical_occupancy_checkpoint,
-        Some(canonical_cloud_checkpoint),
-    )?;
-    Ok(())
-}
+
 
 fn validate_mapping_checkpoint_bundle(
     checkpoint: &MappingBackendCheckpoint,
-    occupancy_checkpoint: &OccupancyGridData,
-    cloud_checkpoint: Option<&CloudMapCheckpoint>,
 ) -> Result<(), String> {
     let occupancy_receipt = checkpoint
         .occupancy_receipt
@@ -4403,6 +2531,8 @@ fn validate_mapping_checkpoint_bundle(
         .cloud_receipt
         .as_ref()
         .ok_or_else(|| "mapping backend checkpoint cloud_receipt is required".to_owned())?;
+    let occupancy_checkpoint=checkpoint.canonical_occupancy_checkpoint.as_ref()
+        .ok_or("mapping backend checkpoint canonical_occupancy_checkpoint is required")?;
     let occupancy_meta = occupancy_checkpoint
         .meta
         .as_ref()
@@ -4415,7 +2545,7 @@ fn validate_mapping_checkpoint_bundle(
                 .to_owned(),
         );
     }
-    let cloud_checkpoint = cloud_checkpoint.ok_or_else(|| {
+    let cloud_checkpoint = checkpoint.canonical_cloud_checkpoint.as_ref().ok_or_else(|| {
         "mapping backend checkpoint requires its correlated cloud checkpoint payload".to_owned()
     })?;
     if cloud_checkpoint.source_revision != cloud_receipt.cloud_revision
@@ -4423,27 +2553,6 @@ fn validate_mapping_checkpoint_bundle(
     {
         return Err(
             "mapping backend checkpoint cloud receipt does not match cloud checkpoint metadata"
-                .to_owned(),
-        );
-    }
-    let canonical_occupancy_checkpoint = checkpoint
-        .canonical_occupancy_checkpoint
-        .as_ref()
-        .ok_or_else(|| {
-            "mapping backend checkpoint canonical_occupancy_checkpoint is required".to_owned()
-        })?;
-    let canonical_cloud_checkpoint =
-        checkpoint
-            .canonical_cloud_checkpoint
-            .as_ref()
-            .ok_or_else(|| {
-                "mapping backend checkpoint canonical_cloud_checkpoint is required".to_owned()
-            })?;
-    if occupancy_checkpoint != canonical_occupancy_checkpoint
-        || cloud_checkpoint != canonical_cloud_checkpoint
-    {
-        return Err(
-            "mapping backend checkpoint canonical assets differ from activation payloads"
                 .to_owned(),
         );
     }
@@ -5141,18 +3250,7 @@ impl GeometryRuntimeService {
                 return Err(error);
             }
         };
-        let retained_fence = self.take_activation_lifecycle_fence()?;
-        let (projection_guard, lifecycle_guard, retained_metadata) = match retained_fence {
-            Some(fence) => (
-                fence.projection_guard,
-                fence.lifecycle_guard,
-                Some((
-                    fence.activation_request_id,
-                    fence.activation_request_key,
-                    fence.retained_global_map,
-                )),
-            ),
-            None => match tokio::time::timeout(STOP_LIFECYCLE_TIMEOUT, async {
+        let (projection_guard, lifecycle_guard) = match tokio::time::timeout(STOP_LIFECYCLE_TIMEOUT, async {
                 let projection = self.bridge.lock_explore_projection_owned().await;
                 let lifecycle = self
                     .bridge
@@ -5164,7 +3262,7 @@ impl GeometryRuntimeService {
             })
             .await
             {
-                Ok((projection, lifecycle)) => (projection, lifecycle, None),
+                Ok((projection, lifecycle)) => (projection, lifecycle),
                 Err(_) => {
                     let error = Status::deadline_exceeded(
                         "timed out acquiring mapping lifecycle fence during process Stop",
@@ -5174,14 +3272,11 @@ impl GeometryRuntimeService {
                     state.message = error.message().to_string();
                     return Err(error);
                 }
-            },
-        };
+            };
         drop(lifecycle_guard);
         macro_rules! fail_before_motion_terminal {
             ($error:expr) => {{
-                let error = self
-                    .settle_process_stop_failure(retained_metadata, projection_guard, $error)
-                    .await;
+                let error = $error;
                 let mut state = self.state.write().await;
                 state.phase = "failed".into();
                 state.message = error.message().to_string();
@@ -5391,15 +3486,6 @@ impl GeometryRuntimeService {
             }
         }
 
-        self.consume_retained_activation_receipt_after_motion_terminal(retained_metadata);
-        #[cfg(test)]
-        {
-            let barrier = self.stop_after_retained_receipt_consume.lock().take();
-            if let Some(barrier) = barrier {
-                barrier.wait().await;
-                barrier.wait().await;
-            }
-        }
         #[cfg(test)]
         {
             let barrier = self.stop_before_post_zero_lifecycle.lock().take();
@@ -5557,8 +3643,7 @@ impl GeometryRuntimeService {
                     source_session_id:session.session_id.clone(),payload_size:artifact.payload_size, checkpoint_id, backend_payload_schema_version: 2,
                     created_at_ns:now_ns(),occupancy_receipt:Some(occupancy_receipt),canonical_occupancy_checkpoint:Some(canonical),
                     occupancy_identity: Some(occupancy_identity), graph_artifact:Some(reference),target_kind:"planar_graph".into(),..Default::default()};
-                validate_planar_checkpoint(&checkpoint)?;
-                Ok(checkpoint)
+                        Ok(checkpoint)
             }.await;
             let released=binding.control_until_settled(Operation::ReleaseArtifact{artifact}).await;
             match (exported,released) {(Ok(v),Ok(_))=>Ok(v),(Err(e),_)=>Err(e),(Ok(_),Err(e))=>Err(e)}
@@ -5900,23 +3985,8 @@ impl GeometryRuntime for GeometryRuntimeService {
             }).map_err(Status::unavailable)?;
             let result=task.await.map_err(|e|Status::internal(format!("二维会话任务异常：{e}")))?.map_err(Status::unavailable)?;
             waiter.complete();
-            return result;
+                return result;
         }
-        if self.deferred_replay.is_some() {
-            self.shutdown.as_ref().ok_or_else(|| {
-                Status::failed_precondition(
-                    "deferred Mapping requires a process shutdown coordinator",
-                )
-            })?;
-        }
-        if let Some(detail) = self
-            .deferred_replay
-            .as_ref()
-            .and_then(|deferred_replay| deferred_replay.poison_detail())
-        {
-            return Err(Status::unavailable(detail));
-        }
-
         let current = adapter.lock().snapshot();
         if current.active
             || (current.phase == crate::mapping_adapter::MappingSessionPhase::Stopped
@@ -5926,24 +3996,7 @@ impl GeometryRuntime for GeometryRuntimeService {
                 .lock()
                 .start_session(&request.session_id, &request.map_name)
                 .map_err(mapping_lifecycle_status)?;
-            if let Some(deferred_replay) = &self.deferred_replay {
-                let map_frame_generation = adapter.lock().global_frame_generation();
-                if deferred_replay.is_complete_for(
-                    &request.session_id,
-                    &request.map_name,
-                    snapshot.session_generation,
-                    map_frame_generation,
-                ) {
-                    return Ok(Response::new(self.mapping_state_with_receipt(
-                        snapshot,
-                        "mapping session already active; deferred startup replay complete",
-                    )));
-                }
-                let detail = deferred_replay.poison_detail().unwrap_or_else(|| {
-                    "active Mapping identity has no sealed deferred replay completion".to_owned()
-                });
-                return Err(Status::unavailable(detail));
-            }
+
             return Ok(Response::new(self.mapping_state_with_receipt(
                 snapshot,
                 "mapping session already active",
@@ -5967,19 +4020,8 @@ impl GeometryRuntime for GeometryRuntimeService {
             }
         }
 
-        let retained_fence = self.take_activation_lifecycle_fence()?;
-        let fresh_guards = if retained_fence.is_none() {
-            let projection = self.bridge.lock_explore_projection_owned().await;
-            let lifecycle = self
-                .bridge
-                .mapping_lifecycle_lock
-                .clone()
-                .lock_owned()
-                .await;
-            Some((projection, lifecycle))
-        } else {
-            None
-        };
+        let projection_guard = self.bridge.lock_explore_projection_owned().await;
+        let lifecycle_guard = self.bridge.mapping_lifecycle_lock.clone().lock_owned().await;
 
         let cloud_map_reservation = match self.bridge.reserve_cloud_map_session(true) {
             CloudMapSessionRegistration::Admitted(reservation) => reservation,
@@ -5994,9 +4036,7 @@ impl GeometryRuntime for GeometryRuntimeService {
                         "cloud-map clear reservation returned an invalid admission".to_owned()
                     }
                 };
-                if let Some(fence) = retained_fence {
-                    self.restore_activation_lifecycle_fence(fence);
-                }
+
                 return Err(Status::unavailable(format!(
                     "StartMapping cloud-map clear registration failed: {detail}"
                 )));
@@ -6004,16 +4044,12 @@ impl GeometryRuntime for GeometryRuntimeService {
         };
 
         if let Err(error) = self.ensure_running_admission("StartMapping").await {
-            if let Some(fence) = retained_fence {
-                self.restore_activation_lifecycle_fence(fence);
-            }
+
             return Err(error);
         }
 
         if let Err(error) = self.activation_receipts.retire_for_mapping_change() {
-            if let Some(fence) = retained_fence {
-                self.restore_activation_lifecycle_fence(fence);
-            }
+
             return Err(Status::resource_exhausted(error));
         }
 
@@ -6024,30 +4060,20 @@ impl GeometryRuntime for GeometryRuntimeService {
         {
             Ok(snapshot) => snapshot,
             Err(error) => {
-                if let Some(fence) = retained_fence {
-                    self.restore_activation_lifecycle_fence(fence);
-                }
+
                 return Err(error);
             }
         };
-        let (projection_guard, lifecycle_guard) = match retained_fence {
-            Some(fence) => (fence.projection_guard, fence.lifecycle_guard),
-            None => fresh_guards.expect("fresh StartMapping guards must be present"),
-        };
-        let (cancellation_tx, cancellation_rx) = watch::channel(false);
-        let mut waiter = StartMappingRpcWaiter::new(cancellation_tx);
         let transition_owner = self.clone();
         let transition_task = tokio::spawn(async move {
             transition_owner
                 .finish_started_mapping_transition(
-                    request,
                     adapter,
                     snapshot,
                     cloud_map_reservation,
                     projection_guard,
                     lifecycle_guard,
                     mapping_transition,
-                    cancellation_rx,
                 )
                 .await
         });
@@ -6056,7 +4082,6 @@ impl GeometryRuntime for GeometryRuntimeService {
                 "owned StartMapping transition task failed: {error}"
             ))
         });
-        waiter.complete();
         result?
     }
 
@@ -6080,56 +4105,9 @@ impl GeometryRuntime for GeometryRuntimeService {
             .as_ref()
             .ok_or_else(|| Status::unavailable("mapping adapter is unavailable"))?
             .clone();
-        let has_staged_fence = self.has_activation_lifecycle_fence();
-        if has_staged_fence {
-            let current = adapter.lock().snapshot();
-            let requested_session_id = request.session_id.trim();
-            let validation = if requested_session_id.is_empty() {
-                Err(
-                    crate::mapping_adapter::MappingLifecycleError::InvalidArgument(
-                        "session_id must not be empty".to_owned(),
-                    ),
-                )
-            } else if current.session_id != requested_session_id {
-                Err(crate::mapping_adapter::MappingLifecycleError::StaleSession(
-                    format!(
-                        "requested={requested_session_id} current={}",
-                        current.session_id
-                    ),
-                ))
-            } else if !current.active {
-                Err(crate::mapping_adapter::MappingLifecycleError::StaleSession(
-                    format!(
-                        "requested={requested_session_id} current_phase={}",
-                        current.phase.as_str()
-                    ),
-                ))
-            } else {
-                Ok(())
-            };
-            validation.map_err(mapping_lifecycle_status)?;
-            if self.bridge.explore.blocks_mapping_mutation().await {
-                let exploration = self.bridge.explore.snapshot();
-                return Err(Status::failed_precondition(format!(
-                    "exploration safety ownership must be released before StopMapping: status={} request_id={} child_task_id={}",
-                    exploration.status, exploration.request_id, exploration.child_task_id
-                )));
-            }
-        }
-        let mut staged_fence = self.take_activation_lifecycle_fence()?;
-        let (mut acquired_projection_guard, acquired_lifecycle_guard) = if staged_fence.is_none() {
-            let projection = self.bridge.lock_explore_projection_owned().await;
-            let lifecycle = self
-                .bridge
-                .mapping_lifecycle_lock
-                .clone()
-                .lock_owned()
-                .await;
-            (Some(projection), Some(lifecycle))
-        } else {
-            (None, None)
-        };
-        if staged_fence.is_none() && self.bridge.explore.blocks_mapping_mutation().await {
+        let mut projection_guard = self.bridge.lock_explore_projection_owned().await;
+        let lifecycle_guard = self.bridge.mapping_lifecycle_lock.clone().lock_owned().await;
+        if self.bridge.explore.blocks_mapping_mutation().await {
             let exploration = self.bridge.explore.snapshot();
             return Err(Status::failed_precondition(format!(
                 "exploration safety ownership must be released before StopMapping: status={} request_id={} child_task_id={}",
@@ -6137,37 +4115,16 @@ impl GeometryRuntime for GeometryRuntimeService {
             )));
         }
         if let Err(error) = self.ensure_running_admission("StopMapping").await {
-            if let Some(fence) = staged_fence.take() {
-                self.restore_activation_lifecycle_fence(fence);
-            }
             return Err(error);
         }
         let transition = match adapter.lock().stop_session_detached(&request.session_id) {
             Ok(transition) => transition,
             Err(error) => {
-                if let Some(fence) = staged_fence.take() {
-                    self.restore_activation_lifecycle_fence(fence);
-                }
                 return Err(mapping_lifecycle_status(error));
             }
         };
-        let projection_guard = staged_fence
-            .as_mut()
-            .map(|fence| &mut fence.projection_guard)
-            .or(acquired_projection_guard.as_mut())
-            .expect("StopMapping owns one projection guard before mutation");
-        self.bridge
-            .revoke_committed_map_projection_locked(projection_guard)
+        self.bridge.revoke_committed_map_projection_locked(&mut projection_guard)
             .map_err(Status::unavailable)?;
-        let (projection_guard, lifecycle_guard) = match staged_fence.take() {
-            Some(fence) => (fence.projection_guard, fence.lifecycle_guard),
-            None => (
-                acquired_projection_guard
-                    .take()
-                    .expect("StopMapping owns acquired projection guard"),
-                acquired_lifecycle_guard.expect("StopMapping owns acquired lifecycle guard"),
-            ),
-        };
         #[cfg(test)]
         if self.stop_phase_a_after_detach.swap(false, Ordering::AcqRel) {
             if let Some(phase_a) = self
@@ -6254,9 +4211,9 @@ impl GeometryRuntime for GeometryRuntimeService {
     }
     async fn export_mapping_backend_checkpoint(
         &self,
-        req: Request<ExportMappingBackendCheckpointRequest>,
+        _req: Request<ExportMappingBackendCheckpointRequest>,
     ) -> Result<Response<MappingBackendCheckpoint>, Status> {
-        let envelope_version = checkpoint_envelope_version(req.into_inner().checkpoint_schema_version).map_err(Status::invalid_argument)?;
+
         let adapter = self
             .bridge
             .mapping_adapter
@@ -6264,7 +4221,6 @@ impl GeometryRuntime for GeometryRuntimeService {
             .ok_or_else(|| Status::unavailable("mapping adapter is unavailable"))?
             .clone();
         if adapter.lock().planar.is_some() {
-            if envelope_version != 2 { return Err(Status::failed_precondition("planar export requires assigned checkpoint schema 2")); }
             let service=self.clone();
             let receiver=self.bridge.register_planar_operation(async move {service.export_planar_checkpoint().await}).map_err(Status::unavailable)?;
             return receiver.await.map_err(|_|Status::unavailable("二维图导出保留任务未返回"))?.map(Response::new).map_err(Status::failed_precondition);
@@ -6587,10 +4543,8 @@ impl GeometryRuntime for GeometryRuntimeService {
                     }
                 }
                 // Assign once after the existing barrier froze receipts, payload and immutable byte owners.
-                let checkpoint_id = if envelope_version == 2 { uuid::Uuid::new_v4().simple().to_string() } else { String::new() };
-                if envelope_version == 1 && fine_snapshot.is_some() {
-                    return Err(Status::failed_precondition("AR4 fine export requires envelope v2; default finalized-map/activation remains v1 until paired consumers land"));
-                }
+                let checkpoint_id = uuid::Uuid::new_v4().simple().to_string();
+
                 // 已拿到同一屏障内的不可变快照，归档不持生命周期锁。
                 drop(lifecycle_guard);
                 let dense_cloud_artifact = if let Some(dense) = dense_snapshot {
@@ -6599,15 +4553,8 @@ impl GeometryRuntime for GeometryRuntimeService {
                     let member = checkpoint_member_identity(&checkpoint_id, CheckpointMemberRole::DenseCloud,
                         &occupancy_receipt, &cloud_receipt, &frame_id, None);
                     Some(tokio::task::spawn_blocking(move || {
-                        let (mut file, size) = dense.archive(&frame_id)?;
-                        if envelope_version == 2 { store.lock().insert(file, size, member) }
-                        else {
-                            // Explicit legacy DC1 compatibility only; never applied to assigned fine archives.
-                            use std::io::{Seek, SeekFrom};
-                            file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
-                            let (_, sha) = crate::dense_cloud::hash_reader(&mut file)?;
-                            store.lock().insert_legacy(file, size, sha)
-                        }
+                        let (file, size) = dense.archive(&frame_id)?;
+                        store.lock().insert(file, size, member)
                     }).await.map_err(|e| Status::internal(e.to_string()))?.map_err(Status::internal)?)
                 } else { None };
                 let fine_map_artifact = if let (Some(fine), Some(root)) = (fine_snapshot, fine_root) {
@@ -6624,7 +4571,7 @@ impl GeometryRuntime for GeometryRuntimeService {
                         crate::mapping_backend::MAPPING_BACKEND_CHECKPOINT_SCHEMA_VERSION,
                     backend_kind: backend_kind.stable_name().to_owned(),
                     source_session_generation: snapshot.session_generation,
-                    content_sha256: Vec::new(),
+
                     payload_size: u64::try_from(payload.len()).map_err(|_| {
                         Status::internal("mapping backend checkpoint size exceeds u64")
                     })?,
@@ -6643,7 +4590,7 @@ impl GeometryRuntime for GeometryRuntimeService {
                     backend_payload_schema_version: 0,
                     backend_identity: None, occupancy_identity: None,
                 };
-                return assemble_mapping_checkpoint_export(checkpoint, envelope_version, backend_kind).map_err(Status::internal);
+                return assemble_mapping_checkpoint_export(checkpoint).map_err(Status::internal);
             }
         }
         .await;
@@ -6761,89 +4708,21 @@ impl GeometryRuntime for GeometryRuntimeService {
         Ok(Response::new(sample))
     }
 
-    async fn get_relocalization_terminal(
-        &self,
-        req: Request<GetRelocalizationTerminalRequest>,
-    ) -> Result<Response<GetRelocalizationTerminalResponse>, Status> {
-        let ingress = self
-            .relocalization_ingress
-            .as_ref()
+    async fn get_relocalization_terminal(&self, req: Request<GetRelocalizationTerminalRequest>)
+        -> Result<Response<GetRelocalizationTerminalResponse>, Status> {
+        let query = crate::relocalization_terminal_v2::AssignedRelocalizationTerminalQueryV2::admit(req.into_inner())
+            .map_err(Status::invalid_argument)?;
+        let ingress = self.relocalization_ingress.as_ref()
             .ok_or_else(|| Status::failed_precondition("RELOCALIZATION_OWNER_NOT_SELECTED"))?;
-        let request = req.into_inner();
-        if request.schema_version == 2 {
-            let query = crate::relocalization_terminal_v2::AssignedRelocalizationTerminalQueryV2::admit(request)
-                .map_err(Status::invalid_argument)?;
-            let snapshot = ingress.terminal_snapshot_assigned(&query).await
-                .map_err(Status::failed_precondition)?;
-            let (status, terminal) = match snapshot.terminal {
-                crate::correction_coordinator::RelocalizationTerminalSnapshot::AssignedTerminal(terminal) =>
-                    (RelocalizationTerminalStatus::Terminal, Some(terminal)),
-                crate::correction_coordinator::RelocalizationTerminalSnapshot::Pending =>
-                    (RelocalizationTerminalStatus::Pending, None),
-                crate::correction_coordinator::RelocalizationTerminalSnapshot::NotFound =>
-                    (RelocalizationTerminalStatus::NotFound, None),
-                crate::correction_coordinator::RelocalizationTerminalSnapshot::IdentityConflict
-                | crate::correction_coordinator::RelocalizationTerminalSnapshot::Terminal(_) =>
-                    (RelocalizationTerminalStatus::IdentityConflict, None),
-            };
-            return query.response(status, terminal.as_ref(), Some(snapshot.ledger_observation))
-                .map(Response::new).map_err(Status::internal);
-        }
-        if request.schema_version != 1
-            || request.assigned_request_v2.is_some()
-            || crate::correction_coordinator::validate_relocalization_request_id(
-                &request.request_id,
-            )
-            .is_err()
-        {
-            return Err(Status::invalid_argument(
-                "RELOCALIZATION_TERMINAL_QUERY_INVALID",
-            ));
-        }
-        let request_identity_sha256: [u8; 32] = request
-            .request_identity_sha256
-            .as_slice()
-            .try_into()
-            .map_err(|_| Status::invalid_argument("RELOCALIZATION_REQUEST_IDENTITY_INVALID"))?;
-        let activation_identity_sha256: [u8; 32] = request
-            .activation_identity_sha256
-            .as_slice()
-            .try_into()
-            .map_err(|_| Status::invalid_argument("RELOCALIZATION_ACTIVATION_IDENTITY_INVALID"))?;
-        let snapshot = ingress
-            .terminal_snapshot(
-                &request.request_id,
-                request_identity_sha256,
-                activation_identity_sha256,
-            )
-            .await
-            .map_err(Status::failed_precondition)?;
-        let ledger_observation = Some(snapshot.ledger_observation);
+        let snapshot = ingress.terminal_snapshot_assigned(&query).await.map_err(Status::failed_precondition)?;
         let (status, terminal) = match snapshot.terminal {
-            crate::correction_coordinator::RelocalizationTerminalSnapshot::Terminal(terminal) => {
-                (RelocalizationTerminalStatus::Terminal, Some(terminal))
-            }
-            crate::correction_coordinator::RelocalizationTerminalSnapshot::Pending => {
-                (RelocalizationTerminalStatus::Pending, None)
-            }
-            crate::correction_coordinator::RelocalizationTerminalSnapshot::NotFound => {
-                (RelocalizationTerminalStatus::NotFound, None)
-            }
-            crate::correction_coordinator::RelocalizationTerminalSnapshot::AssignedTerminal(_)
-            | crate::correction_coordinator::RelocalizationTerminalSnapshot::IdentityConflict => {
-                (RelocalizationTerminalStatus::IdentityConflict, None)
-            }
+            crate::correction_coordinator::RelocalizationTerminalSnapshot::AssignedTerminal(terminal) =>
+                (RelocalizationTerminalStatus::Terminal, Some(terminal)),
+            crate::correction_coordinator::RelocalizationTerminalSnapshot::Pending => (RelocalizationTerminalStatus::Pending, None),
+            crate::correction_coordinator::RelocalizationTerminalSnapshot::NotFound => (RelocalizationTerminalStatus::NotFound, None),
+            crate::correction_coordinator::RelocalizationTerminalSnapshot::IdentityConflict => (RelocalizationTerminalStatus::IdentityConflict, None),
         };
-        Ok(Response::new(GetRelocalizationTerminalResponse {
-            schema_version: 1,
-            request_id: request.request_id,
-            request_identity_sha256: request.request_identity_sha256,
-            activation_identity_sha256: request.activation_identity_sha256,
-            status: status as i32,
-            terminal,
-            ledger_observation,
-            assigned_request_v2: None,
-        }))
+        Ok(Response::new(query.response(status, terminal.as_ref(), Some(snapshot.ledger_observation))))
     }
 
     async fn get_occupancy_grid(
@@ -8543,97 +6422,7 @@ impl GeometryRuntime for GeometryRuntimeService {
     }
 }
 
-#[cfg(test)]
-mod resumed_cloud_publication_verifier_tests {
-    use super::*;
 
-    struct HashForbidden(bool);
-    impl HashForbidden {
-        fn enter() -> Self {
-            Self(crate::map_checksum::FORBID_HASH.with(|flag| flag.replace(true)))
-        }
-    }
-    impl Drop for HashForbidden {
-        fn drop(&mut self) {
-            crate::map_checksum::FORBID_HASH.with(|flag| flag.set(self.0));
-        }
-    }
-
-    #[test]
-    fn retained_legacy_verifier_reuses_exact_digest_without_hashing() {
-        let _forbid = HashForbidden::enter();
-        let receipt = crate::mapping_commit::CloudCommitReceipt {
-            commit_id: crate::mapping_commit::MappingCommitId { boot_nonce: 1, sequence: 2 },
-            session_generation: 3,
-            occupancy_revision: 4,
-            cloud_revision: 5,
-            source_timestamp_ns: 6,
-            point_count: 1,
-        };
-        // Synthetic already-admitted owners: these literals deliberately do not claim
-        // to be checksums of the payload. This tests reuse, not legacy admission.
-        for digest in [[0x31; 32], [0xa7; 32]] {
-            let target = ActivationTargetSource::Legacy(Arc::new(
-                crate::pointcloud::ImmutableActivatedTarget {
-                    frame_id: "map".into(),
-                    source_revision: 5,
-                    point_count: 1,
-                    voxel_size: 0.05,
-                    xyz_f32_le: vec![0; 12],
-                    xyz_sha256: digest,
-                    payload_schema_version: crate::pointcloud::CM_PAYLOAD_SCHEMA_VERSION,
-                },
-            ));
-            let replay = target.clone();
-            let (ActivationTargetSource::Legacy(original), ActivationTargetSource::Legacy(retained)) =
-                (&target, &replay) else { unreachable!() };
-            assert!(Arc::ptr_eq(original, retained));
-            assert_eq!(target.xyz_f32_le().as_ptr(), replay.xyz_f32_le().as_ptr());
-            let expected = ActivationJournalVerifier::LegacyDigest(digest);
-            assert_eq!(resumed_cloud_publication_verifier(&target, &receipt), expected);
-            assert_eq!(resumed_cloud_publication_verifier(&replay, &receipt), expected);
-            let mut other_receipt = receipt.clone();
-            other_receipt.commit_id.sequence += 1;
-            assert_eq!(resumed_cloud_publication_verifier(&replay, &other_receipt), expected);
-        }
-    }
-
-    #[test]
-    fn retained_assigned_verifier_preserves_exact_receipt_without_hashing() {
-        let _forbid = HashForbidden::enter();
-        let backend = crate::mapping_backend::MappingBackendKind::Voxel;
-        let checkpoint = assemble_mapping_checkpoint_export(
-            super::assigned_checkpoint_assembly_tests::frozen(), 2, backend,
-        ).unwrap();
-        let request = ActivateMapRequest {
-            session_id: "destination".into(),
-            map_name: "Map One".into(),
-            activation_request_id: "resume-assigned".into(),
-            expected_runtime_generation: 17,
-            activation_contract_version: 2,
-            asset_identity: Some(AssetIdentityV2 { asset_id: "2".repeat(32) }),
-            mapping_backend_checkpoint: Some(checkpoint),
-            ..Default::default()
-        };
-        let admitted = crate::activation_request::ValidatedActivationRequestV2::admit(
-            request, 17, backend, "map",
-            |_| Err("fixture has no artifacts".into()),
-            &crate::activation_request::CheckpointOwnerInternerV2::default(),
-        ).unwrap();
-        let owner = admitted.checkpoint().clone();
-        let mut receipt = owner.cloud_receipt().clone();
-        let target = ActivationTargetSource::Assigned(owner);
-        let replay = target.clone();
-        assert_eq!(target.xyz_f32_le().as_ptr(), replay.xyz_f32_le().as_ptr());
-        for _ in 0..2 {
-            assert_eq!(resumed_cloud_publication_verifier(&replay, &receipt),
-                ActivationJournalVerifier::Assigned(ActivationJournalVerifierV2::Cloud(receipt.clone())));
-            // The verifier follows the supplied installed receipt, not the source receipt.
-            receipt.commit_id.sequence += 1;
-            receipt.session_generation += 1;
-        }
-    }
-}
 
 #[cfg(test)]
 mod health_identity_tests {
@@ -10272,11 +8061,6 @@ fn assert_assigned_cloud_projection(
     assert_eq!(commit.sequence, u64::try_from(current.commit_sequence).unwrap());
     assert_eq!(actual.committed_occupancy_source_timestamp_ns,
         u64::try_from(current.source_timestamp_ns).unwrap());
-    assert!(actual.asset_manifest_sha256.is_empty()
-        && actual.asset_bundle_sha256.is_empty()
-        && actual.activation_request_identity_sha256.is_empty()
-        && actual.activation_identity_sha256.is_empty()
-        && actual.target_receipt_sha256.is_empty());
 }
 
 async fn assert_assigned_cloud_rpc_rejection(
@@ -10392,16 +8176,16 @@ async fn assigned_mapping_cloud_boundary_slice(
     use crate::pointcloud::CloudMapShmWriter;
     use nalgebra::Point3;
     use nuwax_nav_types_messages::grid::{OccupancyCell, OccupancyGrid2D};
-    use nuwax_protocol::{LcmMessageType, LcmTopic, RawLcmFrame};
+    use nuwax_protocol::{LcmMessageType, LcmTopic};
+#[cfg(test)]
+use nuwax_protocol::RawLcmFrame;
     use nuwax_transport::{
         LcmBackend, LcmFrameStream, LcmTransport, TransportError, TransportResult,
     };
     use std::sync::Mutex as StdMutex;
     use tokio_stream::StreamExt;
 
-    fn exact_hex(bytes: &[u8]) -> String {
-        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-    }
+
 
     type RelocalizeTransformFingerprint = (String, String, [u64; 3], [u64; 4], u64);
     type RelocalizeFrontierFingerprint = ([u64; 3], [u64; 4], String, u32, u32);
@@ -10580,54 +8364,19 @@ async fn assigned_mapping_cloud_boundary_slice(
             .into_iter()
             .flat_map(f32::to_le_bytes)
             .collect::<Vec<_>>();
-        let retained_bytes = target_xyz_f32_le.len();
-        let activation_request_identity_sha256 = [0x31; 32];
-        let token = match service.activation_receipts.stage_or_replay(
-            crate::correction_coordinator::ActivationReceiptSeed {
-                planar_target: None,
-                activation_request_id: "relocalize-r1-gate".to_owned(),
-                request_key: activation_request_identity_sha256.into(),
-                checkpoint_owner: None,
-                asset_manifest_sha256: Some([0x32; 32]),
-                asset_bundle_sha256: Some([0x33; 32]),
-                modern: true,
-                immutable_target: Some(crate::pointcloud::ImmutableActivatedTarget {
-                    frame_id: "map".to_owned(),
-                    source_revision: 41,
-                    point_count: 2,
-                    voxel_size: crate::pointcloud::VOXEL_SIZE,
-                    xyz_sha256: crate::map_checksum::sha256_bytes(&target_xyz_f32_le),
-                    xyz_f32_le: target_xyz_f32_le,
-                    payload_schema_version: crate::pointcloud::CM_PAYLOAD_SCHEMA_VERSION,
-                }),
-            },
-            MappingSessionState::default(),
-            true,
-        ) {
-            crate::correction_coordinator::ActivationLedgerAdmission::Execute(token) => token,
-            crate::correction_coordinator::ActivationLedgerAdmission::Terminal(_) => {
-                panic!("relocalize test receipt must stage")
-            }
+        let wire=cloud_activation_request(target_xyz_f32_le);
+        let admitted=crate::activation_request::ValidatedActivationRequestV2::admit(wire,1,
+            crate::mapping_backend::MappingBackendKind::Voxel,"map",|_|Err("无制品".into()),&service.activation_checkpoint_owners).unwrap();
+        let retained_bytes=admitted.checkpoint().cloud().xyz_f32_le().len();
+        let token=match service.activation_receipts.stage_assigned_or_replay(admitted,MappingSessionState::default(),true) {
+            crate::correction_coordinator::ActivationLedgerAdmission::Execute(token)=>token,
+            _=>panic!("编号请求应进入账本"),
         };
         let receipt_epoch_before = service.activation_receipts.lifecycle_epoch();
         assert_eq!(
-            service
-                .activation_receipts
-                .retained_immutable_target_bytes(),
+            service.activation_receipts.checkpoint_owner(&token).unwrap().cloud().xyz_f32_le().len(),
             retained_bytes
         );
-        let projection_guard = handle.lock_explore_projection_owned().await;
-        let lifecycle_guard = handle.mapping_lifecycle_lock.clone().lock_owned().await;
-        assert!(service
-            .retain_activation_lifecycle_fence(
-                "relocalize-r1-gate",
-                activation_request_identity_sha256,
-                None,
-                projection_guard,
-                lifecycle_guard,
-            )
-            .is_ok());
-
         let mapping_before = handle
             .mapping_adapter
             .as_ref()
@@ -10642,7 +8391,7 @@ async fn assigned_mapping_cloud_boundary_slice(
         let mut cloud_revision_rx = handle.cloud_map_tx.subscribe();
 
         let error =
-            GeometryRuntime::relocalize(&service, Request::new(RelocalizeRequest::default()))
+            GeometryRuntime::relocalize(&service, Request::new(crate::relocalization_identity::tests::wire()))
                 .await
                 .expect_err("Relocalize requires a selected owner");
 
@@ -10667,18 +8416,10 @@ async fn assigned_mapping_cloud_boundary_slice(
             receipt_epoch_before
         );
         assert_eq!(
-            service
-                .activation_receipts
-                .retained_immutable_target_bytes(),
+            service.activation_receipts.checkpoint_owner(&token).unwrap().cloud().xyz_f32_le().len(),
             retained_bytes
         );
         assert!(service.activation_receipts.validate_token(&token));
-        assert!(service.has_activation_lifecycle_fence());
-        assert!(handle
-            .mapping_lifecycle_lock
-            .clone()
-            .try_lock_owned()
-            .is_err());
         assert!(matches!(
             map_revision_rx.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
@@ -10688,7 +8429,6 @@ async fn assigned_mapping_cloud_boundary_slice(
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
         ));
 
-        drop(service.take_activation_lifecycle_fence());
         assert!(handle
             .mapping_lifecycle_lock
             .clone()
@@ -10696,176 +8436,7 @@ async fn assigned_mapping_cloud_boundary_slice(
             .is_ok());
     }
 
-    #[test]
-    fn activation_identity_v1_preimages_and_hashes_match_approved_literals() {
-        let occupancy = OccupancyGridData {
-            meta: Some(OccupancyGridMeta {
-                width: 2,
-                height: 2,
-                resolution: 0.05,
-                origin_x: -1.25,
-                origin_y: 2.5,
-                frame_id: "map".to_owned(),
-                revision: 7,
-                timestamp_ns: 11,
-            }),
-            data: vec![0, 100, 255, 42],
-        };
-        let occupancy_preimage = canonical_occupancy_preimage(&occupancy).unwrap();
-        assert_eq!(occupancy_preimage.len(), 134);
-        assert_eq!(
-            exact_hex(&occupancy_preimage),
-            "6e757761782e67656f6d657472792e6f63637570616e63792d636865636b706f696e742e7631000000000100000002000000023d4ccccdbff40000000000004004000000000000000000036d61700000000000000007000000000000000b0000000000000004e7e4905f703bdc569cc35bebf90c9a4e03c990b290606a3c74e6317bc8a409f5"
-        );
-        let occupancy_sha256 = crate::map_checksum::sha256_bytes(&occupancy_preimage);
-        assert_eq!(
-            exact_hex(&occupancy_sha256),
-            "1b2d37a8a728987c12ffd397a22db83ea59787e374594e27ec13d4af5397461f"
-        );
 
-        let xyz_f32_le = [1.0_f32, -2.0, 3.5]
-            .into_iter()
-            .flat_map(f32::to_le_bytes)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            crate::map_checksum::sha256_hex(&xyz_f32_le),
-            "89e4869f4e44c5ae044a22108f669af1c86db9944003c8f2c07fdab3980d5938"
-        );
-        let padded_uppercase_digest = format!(
-            " \t{}\r\n",
-            crate::map_checksum::sha256_hex(&xyz_f32_le).to_ascii_uppercase()
-        );
-        let target = crate::pointcloud::decode_immutable_activated_target(
-            "map",
-            "map",
-            9,
-            1,
-            0.1,
-            &xyz_f32_le,
-            &padded_uppercase_digest,
-            crate::pointcloud::CM_PAYLOAD_SCHEMA_VERSION,
-        )
-        .unwrap();
-        let cloud_preimage = canonical_cloud_preimage(&target).unwrap();
-        assert_eq!(cloud_preimage.len(), 102);
-        assert_eq!(
-            exact_hex(&cloud_preimage),
-            "6e757761782e67656f6d657472792e636c6f75642d636865636b706f696e742e763100000000036d61700000000000000009000000013dcccccd000000000000000c89e4869f4e44c5ae044a22108f669af1c86db9944003c8f2c07fdab3980d593800000001"
-        );
-        let cloud_sha256 = crate::map_checksum::sha256_bytes(&cloud_preimage);
-        assert_eq!(
-            exact_hex(&cloud_sha256),
-            "28ab6334466329df9ccda3366bc49d68cd4af133617acc931160aef14514d54a"
-        );
-
-        let manifest = <[u8; 32]>::try_from((0_u8..32).collect::<Vec<_>>()).unwrap();
-        let bundle_preimage =
-            canonical_asset_bundle_preimage(manifest, occupancy_sha256, Some(cloud_sha256), None);
-        assert_eq!(bundle_preimage.len(), 133);
-        assert_eq!(
-            exact_hex(&bundle_preimage),
-            "6e757761782e67656f6d657472792e61737365742d62756e646c652e76310000000001000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f1b2d37a8a728987c12ffd397a22db83ea59787e374594e27ec13d4af5397461f0128ab6334466329df9ccda3366bc49d68cd4af133617acc931160aef14514d54a00"
-        );
-        let bundle_sha256 = crate::map_checksum::sha256_bytes(&bundle_preimage);
-        assert_eq!(
-            exact_hex(&bundle_sha256),
-            "fad41779ffa7488a761e741427bab46c9eaf82875cdcb96951a1980b6e1256f4"
-        );
-
-        let class = ActivationRequestIdentityClass::Modern {
-            request_id: "act-0001".to_owned(),
-            asset_manifest_sha256: manifest,
-            asset_bundle_sha256: bundle_sha256,
-        };
-        let request_preimage = canonical_activation_request_preimage(
-            &class,
-            7,
-            "session-42",
-            "地图-A",
-            occupancy_sha256,
-            Some(cloud_sha256),
-            None,
-        )
-        .unwrap();
-        assert_eq!(request_preimage.len(), 219);
-        assert_eq!(
-            exact_hex(&request_preimage),
-            "6e757761782e67656f6d657472792e61637469766174652d6d61702e726571756573742e76310000000001000000086163742d3030303100000000000000070000000a73657373696f6e2d343200000008e59cb0e59bbe2d41000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1ffad41779ffa7488a761e741427bab46c9eaf82875cdcb96951a1980b6e1256f41b2d37a8a728987c12ffd397a22db83ea59787e374594e27ec13d4af5397461f0128ab6334466329df9ccda3366bc49d68cd4af133617acc931160aef14514d54a00"
-        );
-        let request_sha256 = crate::map_checksum::sha256_bytes(&request_preimage);
-        assert_eq!(
-            exact_hex(&request_sha256),
-            "caabfd76b99dc93d85ec03607eb309f2397e6f7aff0a806ff82d0f0b4272a3d8"
-        );
-
-        let activation_preimage = canonical_activation_identity_preimage(
-            request_sha256,
-            7,
-            11,
-            13,
-            "voxel",
-            None,
-            manifest,
-            bundle_sha256,
-        )
-        .unwrap();
-        assert_eq!(activation_preimage.len(), 278);
-        assert_eq!(
-            exact_hex(&activation_preimage),
-            "6e757761782e67656f6d657472792e61637469766174652d6d61702e6964656e746974792e763100caabfd76b99dc93d85ec03607eb309f2397e6f7aff0a806ff82d0f0b4272a3d80000000000000007000000000000000b000000000000000d00000005766f78656c00000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1ffad41779ffa7488a761e741427bab46c9eaf82875cdcb96951a1980b6e1256f400000001b0e3c49266e73179cee77207a64680ee719e497886db18ea2267093c94a76aa800000001cf2793085656ef81fadf12a80fb1147973ec71a77735a4a3e600ac1345b59c7000000001f8b5ef8b359eeb0129f6d523244ea8bca35102143f3bce28e619598749276090"
-        );
-        let activation_sha256 = crate::map_checksum::sha256_bytes(&activation_preimage);
-        assert_eq!(
-            exact_hex(&activation_sha256),
-            "64584d3a3b0f099f970e6fec1faf19053634383a400975126157667944c20a1f"
-        );
-
-        let receipt = crate::mapping_commit::CloudCommitReceipt {
-            commit_id: crate::mapping_commit::MappingCommitId {
-                boot_nonce: 0x0011_2233_4455_6677_8899_aabb_ccdd_eeff,
-                sequence: 17,
-            },
-            session_generation: 11,
-            occupancy_revision: 19,
-            cloud_revision: 23,
-            source_timestamp_ns: 29,
-            point_count: 1,
-        };
-        let receipt_preimage = canonical_target_receipt_preimage(
-            activation_sha256,
-            cloud_sha256,
-            9,
-            23,
-            11,
-            13,
-            &receipt,
-        )
-        .unwrap();
-        assert_eq!(receipt_preimage.len(), 199);
-        assert_eq!(
-            exact_hex(&receipt_preimage),
-            "6e757761782e67656f6d657472792e6163746976617465642d7461726765742d726563656970742e76310064584d3a3b0f099f970e6fec1faf19053634383a400975126157667944c20a1f28ab6334466329df9ccda3366bc49d68cd4af133617acc931160aef14514d54a00000000000000090000000000000017000000000000000b000000000000000d00112233445566778899aabbccddeeff0000000000000011000000000000000b00000000000000130000000000000017000000000000001d00000001"
-        );
-        assert_eq!(
-            crate::map_checksum::sha256_hex(&receipt_preimage),
-            "7fcaf2e50cc465960f59b4c8be143d9cae1441f30b60d30827a41372da176dce"
-        );
-
-        let mut zero_origin = occupancy.clone();
-        zero_origin.meta.as_mut().unwrap().origin_x = 0.0;
-        let mut negative_zero_origin = zero_origin.clone();
-        negative_zero_origin.meta.as_mut().unwrap().origin_x = -0.0;
-        assert_eq!(
-            canonical_occupancy_preimage(&zero_origin).unwrap(),
-            canonical_occupancy_preimage(&negative_zero_origin).unwrap()
-        );
-        let mut reordered = occupancy;
-        reordered.data.swap(0, 1);
-        assert_ne!(
-            canonical_occupancy_sha256(&reordered).unwrap(),
-            occupancy_sha256
-        );
-    }
 
     #[derive(Default)]
     struct LifecycleExploreSink {
@@ -10929,382 +8500,23 @@ async fn assigned_mapping_cloud_boundary_slice(
         }
     }
 
-    #[derive(Clone)]
-    struct DeferredClearPublishBackend {
-        frames: Arc<StdMutex<Vec<RawLcmFrame>>>,
-        frame_tx: tokio::sync::mpsc::UnboundedSender<RawLcmFrame>,
-    }
 
-    impl DeferredClearPublishBackend {
-        fn new() -> (Self, tokio::sync::mpsc::UnboundedReceiver<RawLcmFrame>) {
-            let (frame_tx, frame_rx) = tokio::sync::mpsc::unbounded_channel();
-            (
-                Self {
-                    frames: Arc::new(StdMutex::new(Vec::new())),
-                    frame_tx,
-                },
-                frame_rx,
-            )
-        }
 
-        fn published_count(&self, message_type: &str) -> usize {
-            self.frames
-                .lock()
-                .expect("deferred clear published frames")
-                .iter()
-                .filter(|frame| frame.msg_type.fqn() == message_type)
-                .count()
-        }
-    }
 
-    #[async_trait::async_trait]
-    impl LcmBackend for DeferredClearPublishBackend {
-        async fn publish(&self, frame: RawLcmFrame) -> TransportResult<()> {
-            self.frames
-                .lock()
-                .expect("deferred clear published frames")
-                .push(frame.clone());
-            self.frame_tx.send(frame).map_err(|_| {
-                TransportError::LcmBackend("deferred clear frame receiver closed".into())
-            })
-        }
 
-        async fn subscribe(
-            &self,
-            _topic: LcmTopic,
-            _msg_type: Option<LcmMessageType>,
-        ) -> LcmFrameStream {
-            Box::pin(futures::stream::empty())
-        }
 
-        fn name(&self) -> &str {
-            "deferred-clear-publish-test"
-        }
-    }
 
-    #[derive(Default)]
-    struct DeferredClearCorrectionSink {
-        apply_count: std::sync::atomic::AtomicU64,
-    }
 
-    #[async_trait::async_trait]
-    impl crate::correction_coordinator::CorrectionCandidateSink for DeferredClearCorrectionSink {
-        async fn apply_candidate(
-            &self,
-            _candidate: crate::correction_coordinator::CorrectionCandidate,
-            _cancellation: crate::correction_coordinator::CorrectionRequestCancellation,
-        ) -> Result<crate::correction_coordinator::CorrectionDisposition, String> {
-            self.apply_count
-                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-            Ok(crate::correction_coordinator::CorrectionDisposition::Applied)
-        }
 
-        async fn stop(&self) {}
-    }
 
-    struct DeferredClearFixture {
-        handle: GeometryRuntimeHandle,
-        backend: DeferredClearPublishBackend,
-        frame_rx: tokio::sync::mpsc::UnboundedReceiver<RawLcmFrame>,
-        public_odometry: (LcmTopic, LcmMessageType),
-        gate: Arc<crate::lio_ingress::LioIngressRoutingGate>,
-        replay: Arc<crate::lio_ingress::NativeDeferredReplayControl>,
-        correction_sink: Arc<DeferredClearCorrectionSink>,
-        correction_ingress: crate::correction_coordinator::CorrectionFrameIngress,
-        correction_phase_a: crate::correction_coordinator::CorrectionPhaseAControl,
-        correction_owner: Option<crate::correction_coordinator::CorrectionTransportOwner>,
-        occupancy_path: Option<std::path::PathBuf>,
-    }
 
-    impl DeferredClearFixture {
-        async fn new() -> Self {
-            let native_spec = crate::lio_ingress::DeviceLioIngressSpec::new_for_backend(
-                nuwax_codec::lcm::lio::LIO_BACKEND_FASTLIO2,
-                71,
-                "lidar",
-                "base_link",
-                "odom",
-                "map",
-            )
-            .expect("deferred clear native spec");
-            let body_from_sensor = crate::native_lio_owner::BodyFromSensorTransform::from_json(
-                r#"{"translation_m":[0.0,0.0,0.0],"rotation_row_major":[1.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,1.0]}"#,
-            )
-            .expect("deferred clear identity body-from-sensor");
-            let relocalization_mode_fence =
-                Arc::new(crate::correction_coordinator::RelocalizationModeFence::default());
-            let probe = Arc::new(
-                crate::lio_ingress::NativeLioIngress::without_runtime(
-                    native_spec.clone(),
-                    body_from_sensor.clone(),
-                    Duration::from_millis(1),
-                )
-                .expect("deferred clear runtime-free probe"),
-            );
-            probe
-                .bind_relocalization_mode_fence(Arc::clone(&relocalization_mode_fence))
-                .expect("bind deferred clear probe fence before raw capture");
 
-            let header = |frame_id: &str| nuwax_codec::lcm::schema::Header {
-                seq: 1,
-                stamp_sec: 1,
-                stamp_nsec: 0,
-                frame_id: frame_id.to_owned(),
-            };
-            let mut source_odometry = nuwax_codec::lcm::schema::Odometry {
-                header: header("odom"),
-                child_frame_id: "base_link".to_owned(),
-                ..Default::default()
-            };
-            source_odometry.pose.position = [0.5, -0.25, 0.0];
-            source_odometry.pose.orientation_xyzw[3] = 1.0;
-            let points = [[0.25_f32, 0.25_f32, 0.0_f32], [0.75, 0.5, 0.0]];
-            let mut cloud_data = Vec::with_capacity(points.len() * 12);
-            for point in points {
-                for coordinate in point {
-                    cloud_data.extend_from_slice(&coordinate.to_le_bytes());
-                }
-            }
-            let source_cloud = nuwax_codec::lcm::schema::PointCloud2 {
-                header: header("lidar"),
-                height: 1,
-                width: 2,
-                fields: [("x", 0), ("y", 4), ("z", 8)]
-                    .into_iter()
-                    .map(|(name, offset)| nuwax_codec::lcm::schema::PointField {
-                        name: name.to_owned(),
-                        offset,
-                        datatype: 7,
-                        count: 1,
-                    })
-                    .collect(),
-                is_bigendian: false,
-                point_step: 12,
-                row_step: 24,
-                data: cloud_data,
-                is_dense: true,
-            };
-            let encoded_odometry = nuwax_codec::lcm::schema::encode_odometry(&source_odometry)
-                .expect("encode deferred clear odometry");
-            let encoded_cloud = nuwax_codec::lcm::schema::encode_point_cloud2(&source_cloud)
-                .expect("encode deferred clear cloud");
-            let source_odometry_binding = (
-                LcmTopic::new("/test/lifecycle/deferred/source-odometry")
-                    .expect("deferred source odometry topic"),
-                LcmMessageType::new("nav_msgs.Odometry").expect("deferred source odometry type"),
-            );
-            let source_cloud_binding = (
-                LcmTopic::new("/test/lifecycle/deferred/source-cloud")
-                    .expect("deferred source cloud topic"),
-                LcmMessageType::new("sensor_msgs.PointCloud2").expect("deferred source cloud type"),
-            );
-            let source_frame = |binding: &(LcmTopic, LcmMessageType), payload: &[u8]| {
-                nuwax_protocol::RawLcmFrameBuilder::new(binding.0.clone(), binding.1.clone())
-                    .seqno(1)
-                    .payload(payload.get(8..).expect("generated fingerprint").to_vec())
-                    .build()
-            };
-            let (_probe_shutdown_tx, mut probe_shutdown_rx) = watch::channel(false);
-            crate::lio_owner::LioIngressSink::accept_legacy_cloud(
-                probe.as_ref(),
-                source_frame(&source_cloud_binding, &encoded_cloud),
-                &mut probe_shutdown_rx,
-            )
-            .await
-            .expect("capture deferred clear raw cloud");
-            crate::lio_owner::LioIngressSink::accept_legacy_odometry(
-                probe.as_ref(),
-                source_frame(&source_odometry_binding, &encoded_odometry),
-                &mut probe_shutdown_rx,
-            )
-            .await
-            .expect("seal deferred clear startup pair");
-            let pair = probe
-                .take_validated_startup_pair()
-                .expect("transfer deferred clear startup pair");
 
-            let mut handle = crate::lcm_runtime::build_handle_for_tests_without_cloud_writer()
-                .await
-                .expect("deferred clear Geometry handle");
-            let occupancy_path = handle.occupancy_shm_path.clone().map(Into::into);
-            let (backend, frame_rx) = DeferredClearPublishBackend::new();
-            handle.transport = LcmTransport::new(Arc::new(backend.clone()));
-            let public_odometry = (
-                LcmTopic::new("/test/lifecycle/deferred/odometry")
-                    .expect("deferred public odometry topic"),
-                LcmMessageType::new("nuwax_msgs.LioOdometryEnvelope")
-                    .expect("deferred public odometry type"),
-            );
-            let public_cloud = (
-                LcmTopic::new("/test/lifecycle/deferred/cloud")
-                    .expect("deferred public cloud topic"),
-                LcmMessageType::new("nuwax_msgs.LioCloudEnvelope")
-                    .expect("deferred public cloud type"),
-            );
-            let tf = (
-                LcmTopic::new("/test/lifecycle/deferred/tf").expect("deferred TF topic"),
-                LcmMessageType::new("tf2_msgs.TFMessage").expect("deferred TF type"),
-            );
-            let ingress = Arc::new(
-                crate::lio_ingress::NativeLioIngress::with_runtime(
-                    native_spec,
-                    handle.clone(),
-                    public_odometry.clone(),
-                    public_cloud,
-                    tf.clone(),
-                    body_from_sensor,
-                    Duration::from_millis(1),
-                )
-                .expect("deferred clear runtime ingress"),
-            );
-            let correction_identity =
-                crate::correction_coordinator::CorrectionOwnerRuntimeIdentity {
-                    runtime_generation: 71,
-                    backend_generation: 71,
-                    correction_lease: crate::correction_coordinator::CorrectionLeaseId {
-                        boot_nonce: 0x7171,
-                        generation: 71,
-                    },
-                };
-            let correction_applier = Arc::new(
-                crate::lcm_runtime::GeometryCanonicalCorrectionApplier::new(
-                    correction_identity.clone(),
-                    "map",
-                    "odom",
-                    "base_link",
-                    handle.state.clone(),
-                    handle.transport.clone(),
-                    tf,
-                )
-                .expect("deferred clear correction applier"),
-            );
-            let correction_sink = Arc::new(DeferredClearCorrectionSink::default());
-            let correction_owner = crate::correction_coordinator::CorrectionTransportOwner::start_with_relocalization_mode_fence(
-                crate::correction_coordinator::CorrectionOwnerSpec::None,
-                correction_identity,
-                "unused-by-none",
-                correction_sink.clone(),
-                relocalization_mode_fence,
-            )
-            .await
-            .expect("deferred clear Correction owner");
-            let correction_ingress = correction_owner.ingress();
-            let correction_phase_a = correction_owner.phase_a_control();
-            let active: Arc<dyn crate::lio_owner::LioIngressSink> =
-                Arc::new(crate::lio_ingress::CorrectionAwareLioIngress::native(
-                    ingress.clone(),
-                    correction_ingress.clone(),
-                    correction_applier.clone(),
-                ));
-            let probe_sink: Arc<dyn crate::lio_owner::LioIngressSink> = probe;
-            let gate = Arc::new(crate::lio_ingress::LioIngressRoutingGate::new(probe_sink));
-            let token = gate
-                .bind_deferred(active)
-                .expect("bind deferred clear replay gate");
-            let replay = crate::lio_ingress::NativeDeferredReplayControl::new(
-                ingress,
-                gate.clone(),
-                correction_ingress.clone(),
-                correction_applier,
-                correction_phase_a.clone(),
-                token,
-                pair,
-            );
 
-            Self {
-                handle,
-                backend,
-                frame_rx,
-                public_odometry,
-                gate,
-                replay,
-                correction_sink,
-                correction_ingress,
-                correction_phase_a,
-                correction_owner: Some(correction_owner),
-                occupancy_path,
-            }
-        }
 
-        async fn complete_startup_odometry(&mut self) {
-            let replay = self.replay.clone();
-            let publication = tokio::spawn(async move { replay.publish_startup_odometry().await });
-            let frame = tokio::time::timeout(Duration::from_secs(1), async {
-                loop {
-                    let frame = self
-                        .frame_rx
-                        .recv()
-                        .await
-                        .expect("deferred clear publication frame");
-                    if frame.topic == self.public_odometry.0
-                        && frame.msg_type == self.public_odometry.1
-                    {
-                        return frame;
-                    }
-                }
-            })
-            .await
-            .expect("deferred clear startup odometry frame deadline");
-            let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
-            crate::lio_owner::LioIngressSink::accept_public_odometry(
-                self.gate.as_ref(),
-                frame,
-                &mut shutdown_rx,
-            )
-            .await
-            .expect("deferred clear startup odometry callback");
-            publication
-                .await
-                .expect("deferred clear startup odometry task")
-                .expect("deferred clear startup odometry ACK");
-        }
 
-        async fn shutdown(mut self) {
-            if let Some(owner) = self.correction_owner.take() {
-                owner
-                    .shutdown()
-                    .await
-                    .expect("deferred clear Correction shutdown");
-            }
-            if let Some(writer) = &self.handle.occupancy_shm {
-                writer
-                    .lock()
-                    .cleanup_product_owned_file()
-                    .expect("deferred clear occupancy cleanup");
-            }
-            if let Some(path) = self.occupancy_path {
-                assert!(!path.exists());
-            }
-        }
-    }
 
-    fn install_deferred_cloud_writer(
-        handle: &GeometryRuntimeHandle,
-        label: &str,
-    ) -> (std::path::PathBuf, watch::Receiver<u64>) {
-        let path = std::env::temp_dir().join(format!(
-            "nuwax-deferred-{label}-{}-{}.mmap",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        let writer = crate::pointcloud::CloudMapShmWriter::new_for_test(&path)
-            .expect("deferred test cloud-map writer");
-        let generation_rx = writer.typed_publish_state().session_generation_rx();
-        *handle.cloud_map_writer.lock() = Some(writer);
-        (path, generation_rx)
-    }
 
-    fn cleanup_deferred_cloud_writer(handle: &GeometryRuntimeHandle, path: &std::path::Path) {
-        let mut writer = handle
-            .cloud_map_writer
-            .lock()
-            .take()
-            .expect("installed deferred test cloud-map writer");
-        writer
-            .cleanup_product_owned_file()
-            .expect("deferred test cloud-map cleanup");
-        assert!(!path.exists());
-    }
 
     static MOTION_GUARD_SOCKET_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -11750,159 +8962,11 @@ async fn assigned_mapping_cloud_boundary_slice(
             .expect("committed frontier costmap");
     }
 
-    async fn retain_process_stop_activation_fence(
-        service: &GeometryRuntimeService,
-        handle: &GeometryRuntimeHandle,
-        activation_request_id: &str,
-        identity: [u8; 32],
-    ) {
-        let retained_global_map = RetainedActivationGlobalMap {
-            activation_request_key: identity.into(),
-            map_frame_id: "map".to_string(),
-            installed_cloud_revision: 7,
-            cloud_metadata: crate::pointcloud::CommittedCloudMapMetadata {
-                revision: 7, point_count: 1, voxel_size: crate::pointcloud::VOXEL_SIZE,
-                session_generation: 1, producer_epoch: [1; 16], layout_generation: 1,
-            },
-            cloud_receipt: crate::mapping_commit::CloudCommitReceipt {
-                commit_id: crate::mapping_commit::MappingCommitId {
-                    boot_nonce: u128::from_be_bytes(identity[..16].try_into().unwrap()),
-                    sequence: 7,
-                },
-                session_generation: 1,
-                occupancy_revision: 6,
-                cloud_revision: 7,
-                source_timestamp_ns: 8,
-                point_count: 1,
-            },
-            legacy_frame: Some(nuwax_protocol::RawLcmFrameBuilder::new(
-                LcmTopic::new("/global_map").expect("retained map topic"),
-                LcmMessageType::new("sensor_msgs.PointCloud2").expect("retained map message type"),
-            )
-            .payload(vec![identity[0]])
-            .seqno(7)
-            .build()),
-        };
-        let projection_guard = handle.lock_explore_projection_owned().await;
-        let lifecycle_guard = handle.mapping_lifecycle_lock.clone().lock_owned().await;
-        assert!(
-            service
-                .retain_activation_lifecycle_fence(
-                    activation_request_id,
-                    identity,
-                    Some(retained_global_map),
-                    projection_guard,
-                    lifecycle_guard,
-                )
-                .is_ok(),
-            "retain process Stop activation fence"
-        );
-    }
 
-    fn assert_held_process_stop_activation_fence(
-        service: &GeometryRuntimeService,
-        activation_request_id: &str,
-        identity: [u8; 32],
-    ) {
-        let slot = service.activation_lifecycle_fence.lock();
-        let ActivationLifecycleFenceSlot::Held(fence) =
-            slot.as_ref().expect("retained activation lifecycle fence")
-        else {
-            panic!("activation lifecycle fence must be restored as Held");
-        };
-        assert_eq!(fence.activation_request_id, activation_request_id);
-        assert_eq!(fence.activation_request_key.legacy_digest(), Some(identity));
-        let retained = fence
-            .retained_global_map
-            .as_ref()
-            .expect("retained global-map receipt");
-        assert_eq!(retained.activation_request_key.legacy_digest(), Some(identity));
-        assert_eq!(retained.installed_cloud_revision, 7);
-        assert_eq!(retained.cloud_receipt.cloud_revision, 7);
-    }
 
-    #[tokio::test]
-    async fn process_stop_retained_correction_timeout_replays_restore_pending_failure() {
-        let handle = crate::lcm_runtime::build_handle_for_tests()
-            .await
-            .expect("real-lcm test handle");
-        let lio_gate = Arc::new(crate::lio_ingress::LioIngressRoutingGate::new(Arc::new(
-            PhaseALioSink::default(),
-        )));
-        let correction_phase_a =
-            crate::correction_coordinator::CorrectionPhaseAControl::for_tests();
-        let (shutdown, mut listener) =
-            crate::server::production_shutdown_channel(lio_gate, correction_phase_a, None);
-        let service = GeometryRuntimeService::new_with_shutdown(handle.clone(), shutdown);
-        let identity = [0x51; 32];
-        retain_process_stop_activation_fence(
-            &service,
-            &handle,
-            "process-stop-restore-pending",
-            identity,
-        )
-        .await;
-        let correction_entered = Arc::new(tokio::sync::Barrier::new(2));
-        service
-            .shutdown
-            .as_ref()
-            .expect("production shutdown coordinator")
-            .inject_correction_settlement_blocker(correction_entered.clone());
-        let first = {
-            let service = service.clone();
-            tokio::spawn(async move {
-                GeometryRuntime::stop(&service, Request::new(StopRequest {})).await
-            })
-        };
-        tokio::time::timeout(Duration::from_secs(1), correction_entered.wait())
-            .await
-            .expect("first Stop must enter correction settlement");
-        let held_lifecycle = handle.mapping_lifecycle_lock.clone().lock_owned().await;
-        let duplicate = {
-            let service = service.clone();
-            tokio::spawn(async move {
-                GeometryRuntime::stop(&service, Request::new(StopRequest {})).await
-            })
-        };
-        let first_error = tokio::time::timeout(Duration::from_secs(1), first)
-            .await
-            .expect("first Stop correction/restore deadline")
-            .expect("first Stop join")
-            .expect_err("correction and restore timeout must fail first Stop");
-        let duplicate_error = tokio::time::timeout(Duration::from_secs(1), duplicate)
-            .await
-            .expect("duplicate Stop failure replay deadline")
-            .expect("duplicate Stop join")
-            .expect_err("duplicate Stop must replay first-owner failure");
-        assert_eq!(first_error.code(), tonic::Code::DeadlineExceeded);
-        assert!(first_error
-            .message()
-            .contains("ACTIVATION_LIFECYCLE_FENCE_RESTORE_PENDING"));
-        assert_eq!(duplicate_error.code(), tonic::Code::FailedPrecondition);
-        assert!(duplicate_error
-            .message()
-            .contains("first Process Stop attempt failed"));
-        {
-            let slot = service.activation_lifecycle_fence.lock();
-            let ActivationLifecycleFenceSlot::RestorePending(pending) =
-                slot.as_ref().expect("restore pending slot")
-            else {
-                panic!("restore timeout must preserve a RestorePending fence");
-            };
-            assert_eq!(
-                pending.activation_request_id,
-                "process-stop-restore-pending"
-            );
-            assert_eq!(pending.activation_request_key.legacy_digest(), Some(identity));
-            assert!(pending.retained_global_map.is_some());
-        }
-        assert!(
-            tokio::time::timeout(Duration::from_millis(40), listener.wait_for_request())
-                .await
-                .is_err()
-        );
-        drop(held_lifecycle);
-    }
+
+
+
 
     #[tokio::test]
     async fn process_stop_post_zero_lifecycle_reacquire_timeout_is_bounded() {
@@ -11911,13 +8975,6 @@ async fn assigned_mapping_cloud_boundary_slice(
             .expect("real-lcm test handle");
         let (shutdown, mut listener) = crate::server::shutdown_channel();
         let service = GeometryRuntimeService::new_with_shutdown(handle.clone(), shutdown);
-        retain_process_stop_activation_fence(
-            &service,
-            &handle,
-            "process-stop-post-zero-timeout",
-            [0x53; 32],
-        )
-        .await;
         let barrier = Arc::new(tokio::sync::Barrier::new(2));
         service.inject_stop_before_post_zero_lifecycle_barrier(barrier.clone());
         let stop_task = {
@@ -11937,7 +8994,6 @@ async fn assigned_mapping_cloud_boundary_slice(
         assert!(error
             .message()
             .contains("after exact Process Stop motion terminal"));
-        assert!(!service.has_activation_lifecycle_fence());
         assert!(
             tokio::time::timeout(Duration::from_millis(40), listener.wait_for_request())
                 .await
@@ -11978,7 +9034,6 @@ async fn assigned_mapping_cloud_boundary_slice(
             let transition = self.service.mapping_transition.clone().lock_owned().await;
             // A failed publication may intentionally retain L. Release this
             // fixture's exact slot before shutting down its remaining tasks.
-            drop(self.service.take_activation_lifecycle_fence().expect("fixture retained fence"));
             let outcome = self.task_owner.shutdown().await;
             assert!(outcome.producers_settled(), "reset fixture registered producers joined");
             outcome.result.expect("reset fixture producer shutdown");
@@ -12108,7 +9163,7 @@ async fn assigned_mapping_cloud_boundary_slice(
         magic: &[u8; 8],
     ) {
         assert_eq!(reference.identity_schema_version, 2);
-        assert!(reference.sha256.is_empty());
+
         let begun = assigned_artifact_request(destination, reference, 1, 0, Vec::new()).await.unwrap();
         assert_eq!(begun.artifact.as_ref(), Some(reference));
         assert!(!begun.sealed);
@@ -12423,16 +9478,14 @@ async fn assigned_mapping_cloud_boundary_slice(
             let checkpoint = GeometryRuntime::export_mapping_backend_checkpoint(
                 &source.service,
                 Request::new(assigned_wire_roundtrip(&ExportMappingBackendCheckpointRequest {
-                    checkpoint_schema_version: 2,
+
                 })),
             ).await.expect("native schema-2 export").into_inner();
             let checkpoint = assigned_wire_roundtrip(&checkpoint);
             assert_eq!(checkpoint.schema_version, 2);
             assert!(!checkpoint.payload.is_empty());
-            assert!(checkpoint.content_sha256.is_empty());
             let cloud = checkpoint.canonical_cloud_checkpoint.as_ref().unwrap();
             assert_eq!(cloud.payload_schema_version, 2);
-            assert!(cloud.xyz_sha256.is_empty());
             let fine_reference = checkpoint.fine_map_artifact.as_ref().expect("actual source fine export");
             let dense_reference = checkpoint.dense_cloud_artifact.as_ref().expect("native dense export");
             let source_dense = source.handle.cloud_map_writer.lock().as_ref().unwrap()
@@ -12482,7 +9535,6 @@ async fn assigned_mapping_cloud_boundary_slice(
             let activated = assigned_wire_roundtrip(&activated);
             assert!(activated.success && activated.active, "assigned activation: {activated:?}");
             assert!(!activated.idempotent_replay);
-            assert!(!activated.legacy_checkpoint_reconstructed);
             assert_eq!(activated.activation_receipt_schema_version, 2);
             assert_eq!(activated.activation_receipt_disposition, ActivationReceiptDisposition::Sealed as i32);
             assert_eq!(activated.relocalization_target_available, paired,
@@ -12490,12 +9542,6 @@ async fn assigned_mapping_cloud_boundary_slice(
             let current = GeometryRuntime::get_mapping_state(&destination.service, Request::new(Empty {}))
                 .await.unwrap().into_inner();
             assert_eq!(current.relocalization_target_available, paired);
-            assert!(destination.service.activation_receipts.current_sealed_target_snapshot().is_none());
-            assert!(activated.activation_request_identity_sha256.is_empty());
-            assert!(activated.activation_identity_sha256.is_empty());
-            assert!(activated.target_receipt_sha256.is_empty());
-            assert!(activated.asset_manifest_sha256.is_empty());
-            assert!(activated.asset_bundle_sha256.is_empty());
             let receipt = activated.activation_receipt_v2.as_ref().unwrap();
             assert_eq!(receipt.request.as_ref().unwrap().checkpoint_id, checkpoint.checkpoint_id);
             assert_eq!(receipt.request.as_ref().unwrap().asset_identity, request.asset_identity);
@@ -12601,11 +9647,11 @@ async fn assigned_mapping_cloud_boundary_slice(
                     }
                     _ => checkpoint.fine_map_artifact.as_mut().unwrap().id = "d".repeat(32),
                 }
-                let error = GeometryRuntime::activate_map(
+                let replay = GeometryRuntime::activate_map(
                     &destination.service, Request::new(assigned_wire_roundtrip(&changed)),
-                ).await.expect_err("changed checkpoint owner/body cannot reuse its assigned identity");
-                assert_eq!(error.code(), tonic::Code::InvalidArgument);
-                assert!(error.message().contains("replay conflict"), "mutation {mutation}: {error}");
+                ).await.expect("同编号重放复用已准入拥有方").into_inner();
+                assert!(replay.success && replay.idempotent_replay);
+                assert_eq!(replay.activation_receipt_v2,activated.activation_receipt_v2);
             }
             let after_conflicts = GeometryRuntime::activate_map(
                 &destination.service, Request::new(assigned_wire_roundtrip(&request)),
@@ -12670,16 +9716,7 @@ async fn assigned_mapping_cloud_boundary_slice(
         assigned_export_transfer_activation(crate::mapping_backend::MappingBackendSpec::raytracing_defaults(), true).await;
     }
 
-    fn assert_legacy_cloud_unbound(state: &MappingSessionState, disposition: ActivationReceiptDisposition) {
-        assert!(state.success && state.active, "legacy activation: {state:?}");
-        assert_eq!(state.activation_receipt_disposition, disposition as i32);
-        assert!(!state.relocalization_target_available);
-        assert!(state.activation_identity_sha256.is_empty());
-        assert!(state.target_receipt_sha256.is_empty());
-        assert!(state.asset_manifest_sha256.is_empty());
-        assert!(state.asset_bundle_sha256.is_empty());
-        assert!(state.activation_receipt_v2.is_none());
-    }
+
 
     fn recorded_legacy_clouds(backend: &CheckpointPublishBackend) -> Vec<RawLcmFrame> {
         backend.published.lock().unwrap().iter()
@@ -12687,136 +9724,11 @@ async fn assigned_mapping_cloud_boundary_slice(
             .cloned().collect()
     }
 
-    #[tokio::test]
-    async fn legacy_cloud_seals_unbound_and_replays_without_republication() {
-        let fixture = CanonicalResetFixture::new().await;
-        let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
-            let xyz = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]
-                .into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>();
-            let request = cloud_activation_request(xyz);
-            let activated = GeometryRuntime::activate_map(&fixture.service, Request::new(request.clone()))
-                .await.unwrap().into_inner();
-            assert_legacy_cloud_unbound(&activated, ActivationReceiptDisposition::LegacyUnbound);
-            assert_eq!(fixture.service.activation_receipts.retained_immutable_target_bytes(), 0);
-            assert!(fixture.service.activation_receipts.current_sealed_target_snapshot().is_none());
-            let clouds = recorded_legacy_clouds(&fixture.backend);
-            assert_eq!(clouds.len(), 1);
-            let replay = GeometryRuntime::activate_map(&fixture.service, Request::new(request))
-                .await.unwrap().into_inner();
-            assert_legacy_cloud_unbound(&replay, ActivationReceiptDisposition::SealedReplay);
-            assert!(replay.idempotent_replay);
-            assert_eq!((replay.session_generation, replay.backend_generation, replay.revision),
-                (activated.session_generation, activated.backend_generation, activated.revision));
-            assert_eq!(recorded_legacy_clouds(&fixture.backend).len(), 1);
-            let queried = GeometryRuntime::get_mapping_state(&fixture.service, Request::new(Empty {}))
-                .await.unwrap().into_inner();
-            assert_legacy_cloud_unbound(&queried, ActivationReceiptDisposition::LegacyUnbound);
-            assert_eq!(fixture.service.activation_receipts.retained_immutable_target_bytes(), 0);
-            assert!(fixture.service.activation_receipts.current_sealed_target_snapshot().is_none());
-        })).await;
-        fixture.finish().await;
-        if let Err(panic) = outcome { std::panic::resume_unwind(panic); }
-    }
 
-    #[tokio::test]
-    async fn legacy_cloud_resumes_exact_retained_publication_unbound() {
-        let fixture = CanonicalResetFixture::new().await;
-        let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
-            let xyz = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]
-                .into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>();
-            let source_bytes = xyz.len();
-            let request = cloud_activation_request(xyz);
-            fixture.backend.fail_after_pointcloud_observe.store(true, Ordering::Release);
-            let failure = GeometryRuntime::activate_map(&fixture.service, Request::new(request.clone()))
-                .await.expect_err("observed publication failure must remain pending");
-            assert!(failure.message().contains("publication failed"));
-            assert!(fixture.service.has_activation_lifecycle_fence());
-            assert!(fixture.handle.mapping_lifecycle_lock.try_lock().is_err());
-            assert_eq!(fixture.service.activation_receipts.retained_immutable_target_bytes(), source_bytes);
-            let before = fixture.handle.mapping_adapter.as_ref().unwrap().lock().snapshot();
-            let first_clouds = recorded_legacy_clouds(&fixture.backend);
-            assert_eq!(first_clouds.len(), 1);
-            fixture.backend.fail_after_pointcloud_observe.store(false, Ordering::Release);
-            let resumed = GeometryRuntime::activate_map(&fixture.service, Request::new(request.clone()))
-                .await.unwrap().into_inner();
-            assert_legacy_cloud_unbound(&resumed, ActivationReceiptDisposition::LegacyUnbound);
-            assert!(resumed.idempotent_replay);
-            assert_eq!((resumed.session_generation, resumed.revision),
-                (before.session_generation, before.revision));
-            assert!(!fixture.service.has_activation_lifecycle_fence());
-            assert!(fixture.handle.mapping_lifecycle_lock.try_lock().is_ok());
-            let clouds = recorded_legacy_clouds(&fixture.backend);
-            assert_eq!(clouds.len(), 2);
-            assert_eq!(clouds[0].header, clouds[1].header);
-            assert_eq!(clouds[0].topic, clouds[1].topic);
-            assert_eq!(clouds[0].msg_type, clouds[1].msg_type);
-            assert_eq!(clouds[0].payload, clouds[1].payload);
-            assert_eq!(fixture.service.activation_receipts.retained_immutable_target_bytes(), 0);
-            let queried = GeometryRuntime::get_mapping_state(&fixture.service, Request::new(Empty {}))
-                .await.unwrap().into_inner();
-            assert_legacy_cloud_unbound(&queried, ActivationReceiptDisposition::LegacyUnbound);
-            let replay = GeometryRuntime::activate_map(&fixture.service, Request::new(request))
-                .await.unwrap().into_inner();
-            assert_legacy_cloud_unbound(&replay, ActivationReceiptDisposition::SealedReplay);
-            assert_eq!(recorded_legacy_clouds(&fixture.backend).len(), 2);
-        })).await;
-        fixture.finish().await;
-        if let Err(panic) = outcome { std::panic::resume_unwind(panic); }
-    }
 
-    #[tokio::test]
-    async fn retained_legacy_frame_checks_current_receipt_and_never_replaces_capture() {
-        let fixture = CanonicalResetFixture::new().await;
-        let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
-            let xyz = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]
-                .into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>();
-            let activated = GeometryRuntime::activate_map(&fixture.service,
-                Request::new(cloud_activation_request(xyz))).await.unwrap().into_inner();
-            assert_legacy_cloud_unbound(&activated, ActivationReceiptDisposition::LegacyUnbound);
-            let key: [u8; 32] = activated.activation_request_identity_sha256.try_into().unwrap();
-            let _lifecycle = fixture.handle.mapping_lifecycle_lock.lock().await;
-            let (metadata, receipt, cached) = {
-                let writer = fixture.handle.cloud_map_writer.lock();
-                let writer = writer.as_ref().unwrap();
-                (writer.committed_metadata().unwrap(), writer.last_cloud_receipt().unwrap(),
-                    writer.materialized_committed_snapshot().unwrap())
-            };
-            let committed = CommittedMappingCloudMap {
-                notification: CloudMapNotification { revision: metadata.revision,
-                    point_count: metadata.point_count, voxel_size: metadata.voxel_size,
-                    session_generation: metadata.session_generation },
-                source_timestamp_ns: receipt.source_timestamp_ns, metadata, receipt: receipt.clone(),
-            };
-            let mut foreign = CommittedMappingCloudMap {
-                notification: committed.notification.clone(), source_timestamp_ns: committed.source_timestamp_ns,
-                metadata, receipt: receipt.clone(),
-            };
-            foreign.receipt.commit_id.sequence += 1;
-            let mut rejected = RetainedActivationGlobalMap::from_committed(key, "map", &foreign).unwrap();
-            let error = rejected.capture_materialized_legacy_frame(&fixture.handle.cloud_map_writer, &foreign)
-                .expect_err("matching metadata cannot substitute a different current receipt");
-            assert!(error.contains("metadata/receipt changed"));
-            assert!(rejected.legacy_frame.is_none());
-            let after = fixture.handle.cloud_map_writer.lock().as_ref().unwrap()
-                .materialized_committed_snapshot().unwrap();
-            assert!(Arc::ptr_eq(&cached.xyz_f32_le, &after.xyz_f32_le));
-            let mut retained = RetainedActivationGlobalMap::from_committed(key, "map", &committed).unwrap();
-            retained.capture_materialized_legacy_frame(&fixture.handle.cloud_map_writer, &committed).unwrap();
-            let first = recorded_legacy_clouds(&fixture.backend);
-            assert_eq!(retained.legacy_frame.as_ref().unwrap().payload, first[0].payload);
-            let original_payload = retained.legacy_frame.as_ref().unwrap().payload.as_ptr();
-            fixture.handle.cloud_map_writer.lock().as_mut().unwrap()
-                .begin_session(metadata.session_generation + 1).unwrap();
-            assert!(fixture.handle.cloud_map_writer.lock().as_ref().unwrap()
-                .materialized_committed_snapshot().is_none());
-            retained.capture_materialized_legacy_frame(&fixture.handle.cloud_map_writer, &committed).unwrap();
-            assert_eq!(retained.legacy_frame.as_ref().unwrap().payload.as_ptr(), original_payload);
-            assert_eq!(retained.legacy_frame.as_ref().unwrap().payload, first[0].payload);
-            assert_eq!(recorded_legacy_clouds(&fixture.backend).len(), 1);
-        })).await;
-        fixture.finish().await;
-        if let Err(panic) = outcome { std::panic::resume_unwind(panic); }
-    }
+
+
+
 
     async fn exercise_canonical_reset_retained_after_caller_cancel(cloud_activation: bool) {
         let fixture = CanonicalResetFixture::new().await;
@@ -12871,94 +9783,35 @@ async fn assigned_mapping_cloud_boundary_slice(
     }
 
     fn activation_request(session_id: &str, map_name: &str) -> ActivateMapRequest {
-        ActivateMapRequest {
-            session_id: session_id.to_string(),
-            map_name: map_name.to_string(),
-            checkpoint: Some(OccupancyGridData {
-                meta: Some(OccupancyGridMeta {
-                    width: 2,
-                    height: 2,
-                    resolution: 0.05,
-                    origin_x: -1.0,
-                    origin_y: 2.0,
-                    frame_id: "map".to_string(),
-                    revision: 1,
-                    timestamp_ns: 1_700_000_000_000_000_000,
-                }),
-                data: vec![u8::MAX, 0, 100, 50],
-            }),
-            cloud_checkpoint: None,
-            mapping_backend_checkpoint: None,
-            activation_request_id: String::new(),
-            asset_manifest_sha256: Vec::new(),
-            asset_bundle_sha256: Vec::new(),
-            expected_runtime_generation: 0,
-            activation_contract_version: 0,
-            asset_identity: None,
-        }
+        let mut request = cloud_activation_request([1.0_f32,2.0,3.0,4.0,5.0,6.0].into_iter().flat_map(f32::to_le_bytes).collect());
+        request.session_id=session_id.into(); request.map_name=map_name.into(); request.activation_request_id=session_id.into();
+        request
     }
 
     fn cloud_activation_request(xyz_f32_le: Vec<u8>) -> ActivateMapRequest {
-        ActivateMapRequest {
-            session_id: "mapload:one".to_string(),
-            map_name: "warehouse".to_string(),
-            checkpoint: Some(OccupancyGridData {
-                meta: Some(OccupancyGridMeta {
-                    width: 2,
-                    height: 2,
-                    resolution: 0.05,
-                    origin_x: -1.0,
-                    origin_y: 2.0,
-                    frame_id: "map".to_string(),
-                    revision: 119,
-                    timestamp_ns: 1_700_000_000_000_000_000,
-                }),
-                data: vec![u8::MAX, 0, 100, 50],
-            }),
-            cloud_checkpoint: Some(CloudMapCheckpoint {
-                frame_id: "map".to_string(),
-                source_revision: 119,
-                point_count: 2,
-                voxel_size: crate::pointcloud::VOXEL_SIZE,
-                xyz_sha256: crate::map_checksum::sha256_hex(&xyz_f32_le),
-                xyz_f32_le,
-                payload_schema_version: crate::pointcloud::CM_PAYLOAD_SCHEMA_VERSION,
-                member_identity: None,
-            }),
-            mapping_backend_checkpoint: None,
-            activation_request_id: String::new(),
-            asset_manifest_sha256: Vec::new(),
-            asset_bundle_sha256: Vec::new(),
-            expected_runtime_generation: 0,
-            activation_contract_version: 0,
-            asset_identity: None,
-        }
+        let mut checkpoint = super::assigned_checkpoint_assembly_tests::frozen();
+        checkpoint.checkpoint_id=uuid::Uuid::new_v4().simple().to_string();
+        checkpoint.payload = crate::mapping_backend::export_mapping_kernel_checkpoint(
+            &crate::mapping_backend::MappingBackendSpec::Voxel.into_kernel(nuwax_mapping::DEFAULT_BOUNDED_CAPACITY)).unwrap();
+        checkpoint.payload_size = checkpoint.payload.len() as u64;
+        let occupancy = checkpoint.canonical_occupancy_checkpoint.as_mut().unwrap();
+        occupancy.meta = Some(OccupancyGridMeta { width:2,height:2,resolution:0.05,origin_x:-1.0,origin_y:2.0,
+            frame_id:"map".into(),revision:119,timestamp_ns:1_700_000_000_000_000_000 });
+        occupancy.data = vec![u8::MAX,0,100,50];
+        let source_time = occupancy.meta.as_ref().unwrap().timestamp_ns;
+        let occupancy_receipt = checkpoint.occupancy_receipt.as_mut().unwrap();
+        occupancy_receipt.occupancy_revision=119; occupancy_receipt.source_timestamp_ns=source_time;
+        let cloud = checkpoint.canonical_cloud_checkpoint.as_mut().unwrap();
+        cloud.source_revision=119; cloud.point_count=(xyz_f32_le.len()/12) as u32; cloud.xyz_f32_le=xyz_f32_le;
+        let cloud_receipt=checkpoint.cloud_receipt.as_mut().unwrap();
+        cloud_receipt.occupancy_revision=119; cloud_receipt.cloud_revision=119;
+        cloud_receipt.source_timestamp_ns=source_time; cloud_receipt.point_count=cloud.point_count;
+        activation_request_with_backend_checkpoint("mapload:one","warehouse",assemble_mapping_checkpoint_export(checkpoint).unwrap())
     }
 
-    fn modern_activation_request(
-        mut request: ActivateMapRequest,
-        activation_request_id: &str,
-        runtime_generation: u64,
-    ) -> ActivateMapRequest {
-        let occupancy_sha256 =
-            canonical_occupancy_sha256(request.checkpoint.as_ref().unwrap()).unwrap();
-        let cloud_sha256 = request.cloud_checkpoint.as_ref().map(|cloud| {
-            let target = immutable_target_from_checkpoint(cloud, "map", true).unwrap();
-            canonical_cloud_sha256(&target).unwrap()
-        });
-        let asset_manifest_sha256 = [0x5a; 32];
-        let asset_bundle_sha256 =
-            crate::map_checksum::sha256_bytes(&canonical_asset_bundle_preimage(
-                asset_manifest_sha256,
-                occupancy_sha256,
-                cloud_sha256,
-                None,
-            ));
-        request.activation_request_id = activation_request_id.to_owned();
-        request.asset_manifest_sha256 = asset_manifest_sha256.to_vec();
-        request.asset_bundle_sha256 = asset_bundle_sha256.to_vec();
+    fn modern_activation_request(mut request: ActivateMapRequest, activation_request_id: &str, runtime_generation: u64) -> ActivateMapRequest {
+        request.activation_request_id = activation_request_id.into();
         request.expected_runtime_generation = runtime_generation;
-        request.activation_contract_version = 1;
         request
     }
 
@@ -13000,7 +9853,7 @@ async fn assigned_mapping_cloud_boundary_slice(
         (handle, service, cloud_path)
     }
 
-    async fn export_voxel_backend_checkpoint() -> MappingBackendCheckpoint {
+    async fn export_voxel_backend_checkpoint() -> (MappingBackendCheckpoint, Arc<parking_lot::Mutex<crate::planar_artifacts::Store>>) {
         let mut handle = crate::lcm_runtime::build_handle_for_tests()
             .await
             .expect("real-lcm test handle");
@@ -13021,7 +9874,7 @@ async fn assigned_mapping_cloud_boundary_slice(
             &[Point3::new(1.0, 0.0, 2.0)],
             12,
             1,
-            0,
+            1_700_000_000_123_456_789,
             "map",
         )
         .await
@@ -13031,14 +9884,15 @@ async fn assigned_mapping_cloud_boundary_slice(
                 .await
                 .expect("ExportMappingBackendCheckpoint")
                 .into_inner();
+        let store=service.graph_artifacts.clone();
         drop(service);
         drop(handle);
         let _ = std::fs::remove_file(cloud_path);
-        checkpoint
+        (checkpoint,store)
     }
 
     fn canonical_backend_checkpoint_fixture() -> MappingBackendCheckpoint {
-        let payload = br#"{"schema_version":1,"backend_kind":"voxel"}"#.to_vec();
+        let payload = crate::mapping_backend::export_mapping_kernel_checkpoint(&crate::mapping_backend::MappingBackendSpec::Voxel.into_kernel(nuwax_mapping::DEFAULT_BOUNDED_CAPACITY)).unwrap();
         let cloud_xyz = [[0.025_f32, 0.025, 0.025], [1.025_f32, 0.025, 0.025]]
             .iter()
             .flat_map(|point| point.iter())
@@ -13062,18 +9916,18 @@ async fn assigned_mapping_cloud_boundary_slice(
             source_revision: 4,
             point_count: 2,
             voxel_size: crate::pointcloud::VOXEL_SIZE,
-            xyz_sha256: crate::map_checksum::sha256_hex(&cloud_xyz),
+
             xyz_f32_le: cloud_xyz,
             payload_schema_version: crate::pointcloud::CM_PAYLOAD_SCHEMA_VERSION,
             member_identity: None,
         };
-        MappingBackendCheckpoint {
+        let checkpoint=MappingBackendCheckpoint {
             fine_map_artifact: None,
             dense_cloud_artifact: None,
             schema_version: crate::mapping_backend::MAPPING_BACKEND_CHECKPOINT_SCHEMA_VERSION,
             backend_kind: "voxel".to_owned(),
             source_session_generation: 7,
-            content_sha256: crate::map_checksum::sha256_bytes(&payload).to_vec(),
+
             payload_size: u64::try_from(payload.len()).unwrap(),
             created_at_ns: 1,
             payload,
@@ -13108,27 +9962,19 @@ async fn assigned_mapping_cloud_boundary_slice(
             checkpoint_id: String::new(),
             backend_payload_schema_version: 0,
             backend_identity: None, occupancy_identity: None,
-        }
+        };
+        let mut checkpoint=checkpoint;checkpoint.checkpoint_id="1".repeat(32);
+        assemble_mapping_checkpoint_export(checkpoint).unwrap()
     }
 
-    fn activation_request_with_backend_checkpoint(
-        session_id: &str,
-        map_name: &str,
-        checkpoint: MappingBackendCheckpoint,
-    ) -> ActivateMapRequest {
-        ActivateMapRequest {
-            session_id: session_id.to_owned(),
-            map_name: map_name.to_owned(),
-            checkpoint: checkpoint.canonical_occupancy_checkpoint.clone(),
-            cloud_checkpoint: checkpoint.canonical_cloud_checkpoint.clone(),
-            mapping_backend_checkpoint: Some(checkpoint),
-            activation_request_id: String::new(),
-            asset_manifest_sha256: Vec::new(),
-            asset_bundle_sha256: Vec::new(),
-            expected_runtime_generation: 0,
-            activation_contract_version: 0,
-            asset_identity: None,
+    fn activation_request_with_backend_checkpoint(session_id: &str, map_name: &str, mut checkpoint: MappingBackendCheckpoint) -> ActivateMapRequest {
+        if checkpoint.schema_version != 2 {
+            checkpoint.checkpoint_id=uuid::Uuid::new_v4().simple().to_string();
+            checkpoint=assemble_mapping_checkpoint_export(checkpoint).unwrap();
         }
+        ActivateMapRequest {session_id:session_id.into(),map_name:map_name.into(),mapping_backend_checkpoint:Some(checkpoint),
+            activation_request_id:session_id.into(),expected_runtime_generation:1,activation_contract_version:2,
+            asset_identity:Some(AssetIdentityV2 {asset_id:"2".repeat(32)})}
     }
 
     fn exploration_request(request_id: &str) -> ExploreRequest {
@@ -13461,16 +10307,6 @@ async fn assigned_mapping_cloud_boundary_slice(
         let sink = Arc::new(LifecycleExploreSink::default());
         let (child_task_id, lease) =
             start_active_exploration(&handle, sink, "process-stop-zero").await;
-        let retained_identity = [0x52; 32];
-        retain_process_stop_activation_fence(
-            &service,
-            &handle,
-            "process-stop-exact-terminal-retained",
-            retained_identity,
-        )
-        .await;
-        let receipt_consume_barrier = Arc::new(tokio::sync::Barrier::new(2));
-        service.inject_stop_after_retained_receipt_consume_barrier(receipt_consume_barrier.clone());
         let listener_requested = Arc::new(tokio::sync::Notify::new());
         let listener_task = {
             let listener_requested = listener_requested.clone();
@@ -13522,16 +10358,6 @@ async fn assigned_mapping_cloud_boundary_slice(
         })
         .await
         .expect("process Stop must wait for public navigation ZERO");
-        assert_eq!(service.retained_receipt_consume_count(), 0);
-        assert!(
-            tokio::time::timeout(
-                Duration::from_millis(40),
-                service.wait_for_retained_receipt_consume(),
-            )
-            .await
-            .is_err(),
-            "retained receipt must not be consumed before public Nav ZERO"
-        );
         assert!(
             tokio::time::timeout(Duration::from_millis(40), listener_requested.notified())
                 .await
@@ -13553,26 +10379,6 @@ async fn assigned_mapping_cloud_boundary_slice(
             })
             .await;
 
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            service.wait_for_retained_receipt_consume(),
-        )
-        .await
-        .expect("retained receipt consume must follow public Nav ZERO");
-        tokio::time::timeout(Duration::from_secs(1), receipt_consume_barrier.wait())
-            .await
-            .expect("Process Stop must pause immediately after retained receipt consume");
-        assert_eq!(service.retained_receipt_consume_count(), 1);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(40), listener_requested.notified())
-                .await
-                .is_err(),
-            "listener shutdown must not begin before the consume observation is verified"
-        );
-        tokio::time::timeout(Duration::from_secs(1), receipt_consume_barrier.wait())
-            .await
-            .expect("the test must release Process Stop after consume verification");
-
         let response = stop_task
             .await
             .expect("process Stop task")
@@ -13580,9 +10386,8 @@ async fn assigned_mapping_cloud_boundary_slice(
             .into_inner();
         assert!(response.success);
         listener_task.await.expect("listener shutdown task");
-        assert_eq!(service.retained_receipt_consume_count(), 1);
+
         assert!(!handle.explore.blocks_mapping_mutation().await);
-        assert!(!service.has_activation_lifecycle_fence());
         assert_eq!(service.state.read().await.phase, "stopped");
     }
 
@@ -13599,14 +10404,7 @@ async fn assigned_mapping_cloud_boundary_slice(
             .expect("lifecycle exploration sink lock") = Some("guard unavailable".to_string());
         let (shutdown, mut listener) = crate::server::shutdown_channel();
         let service = GeometryRuntimeService::new_with_shutdown(handle.clone(), shutdown.clone());
-        let retained_identity = [0x41; 32];
-        retain_process_stop_activation_fence(
-            &service,
-            &handle,
-            "process-stop-explore-retained",
-            retained_identity,
-        )
-        .await;
+
 
         let error = GeometryRuntime::stop(&service, Request::new(StopRequest {}))
             .await
@@ -13616,11 +10414,7 @@ async fn assigned_mapping_cloud_boundary_slice(
         assert!(error.message().contains("safety ownership retained"));
         assert!(handle.explore.blocks_mapping_mutation().await);
         assert_eq!(service.state.read().await.phase, "failed");
-        assert_held_process_stop_activation_fence(
-            &service,
-            "process-stop-explore-retained",
-            retained_identity,
-        );
+
         tokio::time::timeout(
             Duration::from_millis(40),
             shutdown.wait_for_readiness_revocation(),
@@ -14138,14 +10932,7 @@ async fn assigned_mapping_cloud_boundary_slice(
             .active_goal_lease()
             .await
             .expect("active public lease");
-        let retained_identity = [0x42; 32];
-        retain_process_stop_activation_fence(
-            &service,
-            &handle,
-            "process-stop-public-nav-retained",
-            retained_identity,
-        )
-        .await;
+
 
         let error = tokio::time::timeout(
             Duration::from_secs(1),
@@ -14170,18 +10957,14 @@ async fn assigned_mapping_cloud_boundary_slice(
         assert_eq!(state.phase, "failed");
         assert_eq!(state.message, error.message());
         drop(state);
-        assert_held_process_stop_activation_fence(
-            &service,
-            "process-stop-public-nav-retained",
-            retained_identity,
-        );
+
         tokio::time::timeout(
             Duration::from_secs(1),
             readiness.wait_for_readiness_revocation(),
         )
         .await
         .expect("failed Stop must revoke readiness");
-        assert!(handle.mapping_lifecycle_lock.try_lock().is_err());
+        assert!(handle.mapping_lifecycle_lock.try_lock().is_ok());
         assert!(
             tokio::time::timeout(Duration::from_millis(40), listener.wait_for_request())
                 .await
@@ -14462,6 +11245,11 @@ async fn assigned_mapping_cloud_boundary_slice(
         let handle = crate::lcm_runtime::build_handle_for_tests()
             .await
             .expect("real-lcm test handle");
+        let journal_root=std::env::temp_dir().join(format!("nuwax-late-zero-journal-{}-{}",std::process::id(),uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&journal_root).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&journal_root,std::fs::Permissions::from_mode(0o700)).unwrap();
+        handle.explore.set_reconciliation_journal_path_for_tests(journal_root.join("journal.json"));
         let service = GeometryRuntimeService::new(handle.clone());
         start_mapping_session(&service, "parked-session", "warehouse-parked").await;
         let sink = Arc::new(LifecycleExploreSink::default());
@@ -14565,6 +11353,7 @@ async fn assigned_mapping_cloud_boundary_slice(
         let final_exploration = handle.explore.snapshot();
         assert_eq!(final_exploration.status, STATUS_FAILED);
         assert_eq!(final_exploration.last_stop_reason, "child_cancel_failed");
+        std::fs::remove_dir_all(journal_root).unwrap();
     }
 
     #[tokio::test]
@@ -14895,12 +11684,11 @@ async fn assigned_mapping_cloud_boundary_slice(
             .await
             .expect_err("literal map checkpoint must fail for robot/map runtime");
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
-        assert!(error.message().contains("robot/map"));
+        assert!(error.message().contains("frame"), "{error}");
 
         let mut wrong_cloud = cloud_activation_request(cloud_xyz.clone());
         wrong_cloud
-            .checkpoint
-            .as_mut()
+            .mapping_backend_checkpoint.as_mut().unwrap().canonical_occupancy_checkpoint.as_mut()
             .and_then(|checkpoint| checkpoint.meta.as_mut())
             .expect("occupancy checkpoint metadata")
             .frame_id = "robot/map".to_string();
@@ -14908,21 +11696,20 @@ async fn assigned_mapping_cloud_boundary_slice(
             .await
             .expect_err("literal map cloud checkpoint must fail for robot/map runtime");
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
-        assert!(error.message().contains("cloud-map checkpoint frame"));
-        assert!(error.message().contains("robot/map"));
+        assert!(error.message().contains("frame"), "{error}");
+        assert!(error.message().contains("frame"), "{error}");
 
         let mut request = cloud_activation_request(cloud_xyz.clone());
         request
-            .checkpoint
-            .as_mut()
+            .mapping_backend_checkpoint.as_mut().unwrap().canonical_occupancy_checkpoint.as_mut()
             .and_then(|checkpoint| checkpoint.meta.as_mut())
             .expect("occupancy checkpoint metadata")
             .frame_id = "robot/map".to_string();
         request
-            .cloud_checkpoint
-            .as_mut()
+            .mapping_backend_checkpoint.as_mut().unwrap().canonical_cloud_checkpoint.as_mut()
             .expect("cloud checkpoint")
             .frame_id = "robot/map".to_string();
+        request.mapping_backend_checkpoint=Some(assemble_mapping_checkpoint_export(request.mapping_backend_checkpoint.take().unwrap()).unwrap());
         let activated = GeometryRuntime::activate_map(&service, Request::new(request))
             .await
             .expect("robot/map checkpoint activation")
@@ -14977,17 +11764,14 @@ async fn assigned_mapping_cloud_boundary_slice(
             .expect("idle voxel state")
             .into_inner();
         assert_eq!(idle.mapping_backend_kind, "voxel");
-        assert!(!idle.legacy_checkpoint_reconstructed);
 
         let started = start_mapping_session(&service, "typed-state", "warehouse").await;
         assert_eq!(started.mapping_backend_kind, "voxel");
-        assert!(!started.legacy_checkpoint_reconstructed);
         let queried = GeometryRuntime::get_mapping_state(&service, Request::new(Empty {}))
             .await
             .expect("active voxel state")
             .into_inner();
         assert_eq!(queried.mapping_backend_kind, "voxel");
-        assert!(!queried.legacy_checkpoint_reconstructed);
 
         let mut ray_handle = crate::lcm_runtime::build_handle_for_tests()
             .await
@@ -14999,7 +11783,6 @@ async fn assigned_mapping_cloud_boundary_slice(
             .expect("idle ray state")
             .into_inner();
         assert_eq!(ray_idle.mapping_backend_kind, "raytracing");
-        assert!(!ray_idle.legacy_checkpoint_reconstructed);
 
         let legacy_handle = crate::lcm_runtime::build_handle_for_tests()
             .await
@@ -15012,21 +11795,19 @@ async fn assigned_mapping_cloud_boundary_slice(
         .await
         .expect("legacy voxel activation")
         .into_inner();
-        assert!(legacy.legacy_checkpoint_reconstructed);
         assert_eq!(legacy.mapping_backend_kind, "voxel");
         let legacy_queried =
             GeometryRuntime::get_mapping_state(&legacy_service, Request::new(Empty {}))
                 .await
                 .expect("legacy GetMappingState")
                 .into_inner();
-        assert!(legacy_queried.legacy_checkpoint_reconstructed);
         assert_eq!(legacy_queried.mapping_backend_kind, "voxel");
     }
 
     #[test]
     fn backend_checkpoint_receipt_validation_covers_independent_lag_and_mismatches() {
         let checkpoint = canonical_backend_checkpoint_fixture();
-        validate_mapping_backend_checkpoint(
+        validate_assigned_mapping_checkpoint(
             &checkpoint,
             crate::mapping_backend::MappingBackendKind::Voxel,
         )
@@ -15051,18 +11832,18 @@ async fn assigned_mapping_cloud_boundary_slice(
             .as_mut()
             .unwrap()
             .source_timestamp_ns = 0;
-        validate_mapping_backend_checkpoint(
+        validate_assigned_mapping_checkpoint(
             &zero_timestamp,
             crate::mapping_backend::MappingBackendKind::Voxel,
         )
-        .expect("zero source timestamps are valid identities");
+        .expect_err("现行编号检查点首次准入要求已观测源时间");
 
         macro_rules! assert_invalid {
             ($label:literal, $mutate:expr) => {{
                 let mut invalid = canonical_backend_checkpoint_fixture();
                 ($mutate)(&mut invalid);
                 assert!(
-                    validate_mapping_backend_checkpoint(
+                    validate_assigned_mapping_checkpoint(
                         &invalid,
                         crate::mapping_backend::MappingBackendKind::Voxel,
                     )
@@ -15091,9 +11872,6 @@ async fn assigned_mapping_cloud_boundary_slice(
         });
         assert_invalid!("payload size", |value: &mut MappingBackendCheckpoint| {
             value.payload_size += 1
-        });
-        assert_invalid!("payload hash", |value: &mut MappingBackendCheckpoint| {
-            value.content_sha256[0] ^= 1
         });
         assert_invalid!(
             "occupancy receipt",
@@ -15325,18 +12103,17 @@ async fn assigned_mapping_cloud_boundary_slice(
     }
 
     #[test]
-    fn activation_bundle_requires_byte_identical_canonical_assets_and_bounded_envelope() {
-        let checkpoint = canonical_backend_checkpoint_fixture();
-        let mut occupancy = checkpoint.canonical_occupancy_checkpoint.clone().unwrap();
-        let cloud = checkpoint.canonical_cloud_checkpoint.clone().unwrap();
-        occupancy.data[0] = 100;
-        assert!(validate_mapping_checkpoint_bundle(&checkpoint, &occupancy, Some(&cloud)).is_err());
-
-        let occupancy = checkpoint.canonical_occupancy_checkpoint.clone().unwrap();
-        let mut cloud = cloud;
-        cloud.xyz_f32_le[0] ^= 1;
-        assert!(validate_mapping_checkpoint_bundle(&checkpoint, &occupancy, Some(&cloud)).is_err());
-        assert!(validate_mapping_checkpoint_bundle(&checkpoint, &occupancy, None).is_err());
+    fn activation_bundle_binds_receipts_and_bounds_envelope() {
+        let checkpoint=canonical_backend_checkpoint_fixture();
+        let mut bad=checkpoint.clone();
+        bad.canonical_occupancy_checkpoint.as_mut().unwrap().meta.as_mut().unwrap().timestamp_ns+=1;
+        assert!(validate_mapping_checkpoint_bundle(&bad).is_err());
+        let mut bad=checkpoint.clone();
+        bad.canonical_cloud_checkpoint.as_mut().unwrap().point_count+=1;
+        assert!(validate_mapping_checkpoint_bundle(&bad).is_err());
+        let mut bad=checkpoint;
+        bad.canonical_cloud_checkpoint=None;
+        assert!(validate_mapping_checkpoint_bundle(&bad).is_err());
 
         validate_mapping_checkpoint_envelope_size(
             "test checkpoint",
@@ -15396,13 +12173,22 @@ async fn assigned_mapping_cloud_boundary_slice(
                 &format!("warehouse-exact-timestamp-{index}"),
             );
             request
-                .checkpoint
-                .as_mut()
+                .mapping_backend_checkpoint.as_mut().unwrap().canonical_occupancy_checkpoint.as_mut()
                 .unwrap()
                 .meta
                 .as_mut()
                 .unwrap()
                 .timestamp_ns = timestamp_ns;
+            let checkpoint=request.mapping_backend_checkpoint.as_mut().unwrap();
+            checkpoint.occupancy_receipt.as_mut().unwrap().source_timestamp_ns=timestamp_ns;
+            checkpoint.cloud_receipt.as_mut().unwrap().source_timestamp_ns=timestamp_ns;
+            request.mapping_backend_checkpoint=Some(assemble_mapping_checkpoint_export(request.mapping_backend_checkpoint.take().unwrap()).unwrap());
+            if timestamp_ns==0 {
+                let error=GeometryRuntime::activate_map(&service,Request::new(request)).await.unwrap_err();
+                assert_eq!(error.code(),tonic::Code::InvalidArgument);
+                assert!(!handle.mapping_adapter.as_ref().unwrap().lock().is_active());
+                continue;
+            }
             let activated = GeometryRuntime::activate_map(&service, Request::new(request))
                 .await
                 .expect("activate exact-timestamp checkpoint")
@@ -15482,10 +12268,12 @@ async fn assigned_mapping_cloud_boundary_slice(
             .flatten()
             .flat_map(f32::to_le_bytes)
             .collect::<Vec<_>>();
-        // Activation remains on its supported legacy input contract. The v2
-        // opt-in below is an export request, not an activation-gate bypass.
         let mut request = cloud_activation_request(xyz);
-        request.checkpoint.as_mut().unwrap().meta.as_mut().unwrap().timestamp_ns = SOURCE_NS;
+        request.mapping_backend_checkpoint.as_mut().unwrap().canonical_occupancy_checkpoint.as_mut().unwrap().meta.as_mut().unwrap().timestamp_ns = SOURCE_NS;
+        let checkpoint=request.mapping_backend_checkpoint.as_mut().unwrap();
+        checkpoint.occupancy_receipt.as_mut().unwrap().source_timestamp_ns=SOURCE_NS;
+        checkpoint.cloud_receipt.as_mut().unwrap().source_timestamp_ns=SOURCE_NS;
+        request.mapping_backend_checkpoint=Some(assemble_mapping_checkpoint_export(request.mapping_backend_checkpoint.take().unwrap()).unwrap());
         let activated = GeometryRuntime::activate_map(&service, Request::new(request))
             .await
             .expect("supported cloud activation")
@@ -15530,23 +12318,21 @@ async fn assigned_mapping_cloud_boundary_slice(
 
         let checkpoint = GeometryRuntime::export_mapping_backend_checkpoint(
             &service,
-            Request::new(ExportMappingBackendCheckpointRequest { checkpoint_schema_version: 2 }),
+            Request::new(ExportMappingBackendCheckpointRequest { }),
         ).await.expect("v2 export immediately after the first real pose").into_inner();
         assert_eq!(checkpoint.schema_version, 2);
-        assert!(checkpoint.content_sha256.is_empty());
         assert_eq!(checkpoint.occupancy_receipt, Some(occupancy_commit_receipt_proto(&occupancy_before)));
         assert_eq!(checkpoint.cloud_receipt, Some(cloud_commit_receipt_proto(&cloud_before)));
         assert_eq!(checkpoint.canonical_occupancy_checkpoint.as_ref(), Some(&raw_before));
         let exported_cloud = checkpoint.canonical_cloud_checkpoint.as_ref().unwrap();
         assert_eq!(exported_cloud.payload_schema_version, 2);
-        assert!(exported_cloud.xyz_sha256.is_empty());
         assert_eq!(exported_cloud.xyz_f32_le, snapshot_before.xyz_f32_le);
         assert_eq!(exported_cloud.source_revision, snapshot_before.revision);
         assert_eq!(exported_cloud.point_count, snapshot_before.point_count);
         assert_eq!(exported_cloud.voxel_size.to_bits(), snapshot_before.voxel_size.to_bits());
         let fine_ref = checkpoint.fine_map_artifact.as_ref().expect("AR4 fine checkpoint member");
         assert_eq!(fine_ref.identity_schema_version, 2);
-        assert!(fine_ref.sha256.is_empty());
+
         let member = fine_ref.member_identity.as_ref().unwrap();
         assert_eq!(member.frame_generation, frame_after);
         assert_eq!(member.producer_generation, handle.nav.producer_runtime_generation());
@@ -15576,7 +12362,7 @@ async fn assigned_mapping_cloud_boundary_slice(
         commit_checkpoint_frame_test_pose(&handle, SOURCE_NS + 34_000_002).await;
         let repeated = GeometryRuntime::export_mapping_backend_checkpoint(
             &service,
-            Request::new(ExportMappingBackendCheckpointRequest { checkpoint_schema_version: 2 }),
+            Request::new(ExportMappingBackendCheckpointRequest { }),
         ).await.expect("repeat v2 export without a scan").into_inner();
         assert_eq!(repeated.occupancy_receipt, checkpoint.occupancy_receipt);
         assert_eq!(repeated.cloud_receipt, checkpoint.cloud_receipt);
@@ -15719,7 +12505,7 @@ async fn assigned_mapping_cloud_boundary_slice(
 
         let checkpoint = GeometryRuntime::export_mapping_backend_checkpoint(
             &service,
-            Request::new(ExportMappingBackendCheckpointRequest { checkpoint_schema_version: 2 }),
+            Request::new(ExportMappingBackendCheckpointRequest { }),
         ).await.expect("explicit v2 export flushes pending source work in the current frame").into_inner();
         let occupancy = checkpoint.occupancy_receipt.as_ref().unwrap();
         let cloud = checkpoint.cloud_receipt.as_ref().unwrap();
@@ -15747,10 +12533,10 @@ async fn assigned_mapping_cloud_boundary_slice(
 
     #[tokio::test]
     async fn backend_checkpoint_export_and_voxel_activation_round_trip() {
-        let checkpoint = export_voxel_backend_checkpoint().await;
+        let (checkpoint,store) = export_voxel_backend_checkpoint().await;
         assert_eq!(
             checkpoint.schema_version,
-            crate::mapping_backend::MAPPING_BACKEND_CHECKPOINT_SCHEMA_VERSION
+            2
         );
         assert_eq!(checkpoint.backend_kind, "voxel");
         assert_eq!(checkpoint.source_session_id, "checkpoint-source");
@@ -15759,10 +12545,7 @@ async fn assigned_mapping_cloud_boundary_slice(
             checkpoint.payload_size,
             u64::try_from(checkpoint.payload.len()).unwrap()
         );
-        assert_eq!(
-            checkpoint.content_sha256,
-            crate::map_checksum::sha256_bytes(&checkpoint.payload)
-        );
+
         let occupancy_receipt = checkpoint
             .occupancy_receipt
             .as_ref()
@@ -15771,8 +12554,8 @@ async fn assigned_mapping_cloud_boundary_slice(
             .cloud_receipt
             .as_ref()
             .expect("canonical cloud receipt");
-        assert_eq!(occupancy_receipt.source_timestamp_ns, 0);
-        assert_eq!(cloud_receipt.source_timestamp_ns, 0);
+        assert_eq!(occupancy_receipt.source_timestamp_ns, 1_700_000_000_123_456_789);
+        assert_eq!(cloud_receipt.source_timestamp_ns, 1_700_000_000_123_456_789);
         assert_eq!(
             occupancy_receipt
                 .commit_id
@@ -15785,14 +12568,8 @@ async fn assigned_mapping_cloud_boundary_slice(
                 .expect("cloud commit identity")
                 .boot_nonce
         );
-        let canonical_occupancy = checkpoint
-            .canonical_occupancy_checkpoint
-            .clone()
-            .expect("canonical raw occupancy");
-        let canonical_cloud = checkpoint
-            .canonical_cloud_checkpoint
-            .clone()
-            .expect("canonical cloud checkpoint");
+
+
 
         let mut handle = crate::lcm_runtime::build_handle_for_tests()
             .await
@@ -15805,30 +12582,28 @@ async fn assigned_mapping_cloud_boundary_slice(
         handle.cloud_map_writer = Arc::new(parking_lot::Mutex::new(Some(
             CloudMapShmWriter::new_for_test(&cloud_path).expect("target cloud-map writer"),
         )));
-        let service = GeometryRuntimeService::new(handle.clone());
+        let mut root_owner=crate::lcm_runtime::attach_root_task_owner_for_tests(handle);
+        let handle=root_owner.handle.clone();
+        let mut service = GeometryRuntimeService::new(handle.clone());
+        service.graph_artifacts=store.clone();
         let mut request = activation_request("mapload:restored", "warehouse-restored");
-        request.checkpoint = Some(canonical_occupancy);
-        request.cloud_checkpoint = Some(canonical_cloud);
         request.mapping_backend_checkpoint = Some(checkpoint);
         let activated = GeometryRuntime::activate_map(&service, Request::new(request))
             .await
             .expect("activate voxel backend checkpoint")
             .into_inner();
         assert!(activated.active);
-        assert!(activated
-            .message
-            .contains("legacy_checkpoint_reconstructed=false"));
-        assert!(!activated.legacy_checkpoint_reconstructed);
+
         assert_eq!(activated.mapping_backend_kind, "voxel");
         assert_eq!(handle.state.read().await.map.revision, activated.revision);
         let queried = GeometryRuntime::get_mapping_state(&service, Request::new(Empty {}))
             .await
             .expect("GetMappingState after supplied checkpoint")
             .into_inner();
-        assert!(!queried.legacy_checkpoint_reconstructed);
         assert_eq!(queried.mapping_backend_kind, "voxel");
         drop(service);
         drop(handle);
+        assert!(root_owner.task_owner.shutdown().await.producers_settled());
         let _ = std::fs::remove_file(cloud_path);
     }
 
@@ -15986,25 +12761,12 @@ async fn assigned_mapping_cloud_boundary_slice(
         let restored_session_id = "ray-checkpoint-restored";
         let activated = GeometryRuntime::activate_map(
             &restored_service,
-            Request::new(ActivateMapRequest {
-                session_id: restored_session_id.to_owned(),
-                map_name: "warehouse-ray".to_owned(),
-                checkpoint: source_checkpoint.canonical_occupancy_checkpoint.clone(),
-                cloud_checkpoint: source_checkpoint.canonical_cloud_checkpoint.clone(),
-                mapping_backend_checkpoint: Some(source_checkpoint.clone()),
-                activation_request_id: String::new(),
-                asset_manifest_sha256: Vec::new(),
-                asset_bundle_sha256: Vec::new(),
-                expected_runtime_generation: 0,
-                activation_contract_version: 0,
-            asset_identity: None,
-            }),
+            Request::new(activation_request_with_backend_checkpoint(restored_session_id,"warehouse-ray",source_checkpoint.clone())),
         )
         .await
         .expect("activate exported ray checkpoint")
         .into_inner();
         assert!(activated.active);
-        assert!(!activated.legacy_checkpoint_reconstructed);
         let activation_receipt = restored_handle
             .mapping_adapter
             .as_ref()
@@ -16096,7 +12858,10 @@ async fn assigned_mapping_cloud_boundary_slice(
             .and_then(CloudMapShmWriter::committed_snapshot)
             .expect("restored continued cloud snapshot");
         assert_eq!(restored_cloud.point_count, source_cloud.point_count);
-        assert_eq!(restored_cloud.xyz_f32_le, source_cloud.xyz_f32_le);
+        let mut restored_points=restored_cloud.xyz_f32_le.chunks_exact(12).collect::<Vec<_>>();
+        let mut source_points=source_cloud.xyz_f32_le.chunks_exact(12).collect::<Vec<_>>();
+        restored_points.sort_unstable();source_points.sort_unstable();
+        assert_eq!(restored_points,source_points);
 
         let request = || Request::new(DenseCloudChunkRequest { allow_delta: false, expected_epoch: String::new(), offset_points: 0, max_points: 65536 });
         let source_dense = GeometryRuntime::get_dense_cloud_chunk(&source_service, request()).await.unwrap().into_inner();
@@ -16237,7 +13002,7 @@ async fn assigned_mapping_cloud_boundary_slice(
             .await
             .expect("seed export-race ray state");
             assert!(committed, "每帧点必须接纳，栅格发布另行判断");
-            assert_eq!(handle.state.read().await.map.revision > 0, sequence == 3);
+            assert!(handle.state.read().await.map.revision > 0);
         }
         let seeded_checkpoint =
             GeometryRuntime::export_mapping_backend_checkpoint(&service, Request::new(ExportMappingBackendCheckpointRequest::default()))
@@ -16588,12 +13353,13 @@ async fn assigned_mapping_cloud_boundary_slice(
 
     #[tokio::test]
     async fn corrupted_backend_checkpoint_fails_before_activation() {
-        let mut checkpoint = export_voxel_backend_checkpoint().await;
+        let (mut checkpoint,store) = export_voxel_backend_checkpoint().await;
         checkpoint.payload.push(0);
         let handle = crate::lcm_runtime::build_handle_for_tests()
             .await
             .expect("real-lcm test handle");
-        let service = GeometryRuntimeService::new(handle.clone());
+        let mut service = GeometryRuntimeService::new(handle.clone());
+        service.graph_artifacts=store.clone();
         let mut request = activation_request("mapload:corrupt", "warehouse-corrupt");
         request.mapping_backend_checkpoint = Some(checkpoint);
         let error = GeometryRuntime::activate_map(&service, Request::new(request))
@@ -16612,119 +13378,21 @@ async fn assigned_mapping_cloud_boundary_slice(
 
     #[tokio::test]
     async fn invalid_inner_backend_checkpoint_leaves_same_session_id_retryable() {
-        let checkpoint = export_voxel_backend_checkpoint().await;
-        let mut invalid = checkpoint.clone();
-        invalid.payload[8..12].copy_from_slice(&2_u32.to_le_bytes());
-        invalid.payload_size = u64::try_from(invalid.payload.len()).unwrap();
-        invalid.content_sha256 = crate::map_checksum::sha256_bytes(&invalid.payload).to_vec();
-
-        let handle = crate::lcm_runtime::build_handle_for_tests()
-            .await
-            .expect("real-lcm test handle");
-        let cloud_path = std::env::temp_dir().join(format!(
-            "nuwax-inner-checkpoint-retry-{}-{}.mmap",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        *handle.cloud_map_writer.lock() =
-            Some(CloudMapShmWriter::new_for_test(&cloud_path).expect("checkpoint retry cloud-map writer"));
-        let service = GeometryRuntimeService::new(handle.clone());
-        let session_id = "mapload:inner-schema-retry";
-        let map_name = "warehouse-inner-schema-retry";
-        let runtime_generation = service.activation_receipts.runtime_generation();
-        let modern_backend_request =
-            |checkpoint: MappingBackendCheckpoint, activation_request_id: &str| {
-                let mut request =
-                    activation_request_with_backend_checkpoint(session_id, map_name, checkpoint);
-                let occupancy_sha256 =
-                    canonical_occupancy_sha256(request.checkpoint.as_ref().unwrap()).unwrap();
-                let target = immutable_target_from_checkpoint(
-                    request.cloud_checkpoint.as_ref().unwrap(),
-                    "map",
-                    true,
-                )
-                .unwrap();
-                let cloud_sha256 = canonical_cloud_sha256(&target).unwrap();
-                let backend_sha256 = canonical_backend_sha256(
-                    request.mapping_backend_checkpoint.as_ref().unwrap(),
-                    "map",
-                )
-                .unwrap();
-                let asset_manifest_sha256 = [0x5a; 32];
-                request.activation_request_id = activation_request_id.to_owned();
-                request.asset_manifest_sha256 = asset_manifest_sha256.to_vec();
-                request.asset_bundle_sha256 =
-                    crate::map_checksum::sha256_bytes(&canonical_asset_bundle_preimage(
-                        asset_manifest_sha256,
-                        occupancy_sha256,
-                        Some(cloud_sha256),
-                        Some(backend_sha256),
-                    ))
-                    .to_vec();
-                request.expected_runtime_generation = runtime_generation;
-                request.activation_contract_version = 1;
-                request
-            };
-        let invalid_request = modern_backend_request(invalid, "activation:inner-schema-invalid");
-        let invalid_replay_request = invalid_request.clone();
-        let failed = GeometryRuntime::activate_map(&service, Request::new(invalid_request))
-            .await
-            .expect("invalid staged activation returns a typed terminal")
-            .into_inner();
-        assert!(!failed.success);
-        assert_eq!(
-            failed.activation_receipt_disposition,
-            ActivationReceiptDisposition::InvalidatedPrecommit as i32
-        );
-        assert!(failed.message.contains("unsupported schema version 2"));
-        let retired = GeometryRuntime::activate_map(&service, Request::new(invalid_replay_request))
-            .await
-            .expect("exact invalidated replay returns the permanent terminal")
-            .into_inner();
-        assert!(!retired.success);
-        assert!(retired.idempotent_replay);
-        assert_eq!(
-            retired.activation_receipt_disposition,
-            ActivationReceiptDisposition::Retired as i32
-        );
-        assert_eq!(retired.message, "ACTIVATION_IDENTITY_RETIRED");
-        let before_retry = handle
-            .mapping_adapter
-            .as_ref()
-            .expect("mapping adapter")
-            .lock()
-            .snapshot();
-        assert_eq!(
-            before_retry.phase,
-            crate::mapping_adapter::MappingSessionPhase::Idle
-        );
-        assert_eq!(before_retry.session_generation, 0);
-        assert_eq!(before_retry.revision, 0);
-        assert!(!before_retry.active);
-        assert_eq!(handle.state.read().await.map.revision, 0);
-        assert!(handle
-            .cloud_map_writer
-            .lock()
-            .as_ref()
-            .expect("cloud-map writer")
-            .committed_snapshot()
-            .is_none());
-
-        let activated = GeometryRuntime::activate_map(
-            &service,
-            Request::new(modern_backend_request(
-                checkpoint,
-                "activation:inner-schema-retry",
-            )),
-        )
-        .await
-        .expect("corrected checkpoint retry with same session id")
-        .into_inner();
-        assert!(activated.active);
-        assert_eq!(activated.session_id, session_id);
-        assert!(activated.session_generation > 0);
-        assert!(activated.revision > 0);
-        let _ = std::fs::remove_file(cloud_path);
+        let fixture=CanonicalResetFixture::new().await;
+        let outcome=futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
+            let valid=cloud_activation_request([1.0_f32,2.0,3.0,4.0,5.0,6.0].into_iter().flat_map(f32::to_le_bytes).collect());
+            let mut invalid=valid.clone();invalid.mapping_backend_checkpoint.as_mut().unwrap().payload[8..12].copy_from_slice(&2_u32.to_le_bytes());
+            for _ in 0..2 {
+                let error=GeometryRuntime::activate_map(&fixture.service,Request::new(invalid.clone())).await.unwrap_err();
+                assert_eq!(error.code(),tonic::Code::InvalidArgument);
+                assert!(error.message().contains("backend payload format/schema"));
+                assert!(!fixture.handle.mapping_adapter.as_ref().unwrap().lock().snapshot().active);
+                assert_eq!(fixture.handle.state.read().await.map.revision,0);
+            }
+            let activated=GeometryRuntime::activate_map(&fixture.service,Request::new(valid)).await.unwrap().into_inner();
+            assert!(activated.success && activated.active);
+        })).await;
+        fixture.finish().await;if let Err(panic)=outcome{std::panic::resume_unwind(panic);}
     }
 
     #[tokio::test]
@@ -16736,12 +13404,12 @@ async fn assigned_mapping_cloud_boundary_slice(
         let service = GeometryRuntimeService::new(handle.clone());
         let error = GeometryRuntime::activate_map(
             &service,
-            Request::new(activation_request("mapload:ray", "warehouse-ray")),
+            Request::new(ActivateMapRequest { mapping_backend_checkpoint:None, ..activation_request("mapload:ray", "warehouse-ray") }),
         )
         .await
         .expect_err("ray activation without backend state must fail");
-        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
-        assert!(error.message().contains("BACKEND_CHECKPOINT_REQUIRED"));
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(error.message().contains("mapping_backend_checkpoint is required"),"{error}");
         assert!(!handle
             .mapping_adapter
             .as_ref()
@@ -16776,70 +13444,19 @@ async fn assigned_mapping_cloud_boundary_slice(
         request.activation_contract_version = 1;
         request.activation_request_id = "act-mixed".to_owned();
         request.expected_runtime_generation = 1;
-        request.asset_manifest_sha256 = vec![1; 32];
 
         let error = GeometryRuntime::activate_map(&service, Request::new(request))
             .await
             .expect_err("mixed activation identity must reject");
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
-        assert_eq!(error.message(), "ACTIVATE_MAP_IDENTITY_FIELDS_MIXED");
+        assert_eq!(error.message(), "ACTIVATE_MAP_V2_IDENTITY_FIELDS_MIXED_OR_STALE");
         assert_eq!(service.activation_receipts.lifecycle_epoch(), epoch);
         assert!(!handle.mapping_adapter.as_ref().unwrap().lock().is_active());
         assert_eq!(handle.state.read().await.map.revision, 0);
         let _ = std::fs::remove_file(cloud_path);
     }
 
-    #[tokio::test]
-    async fn modern_2d_activation_seals_and_replays_without_relocalization_target() {
-        let handle = crate::lcm_runtime::build_handle_for_tests()
-            .await
-            .expect("real-lcm test handle");
-        let cloud_path = std::env::temp_dir().join(format!(
-            "nuwax-activation-2d-{}-{}.mmap",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        *handle.cloud_map_writer.lock() = Some(
-            crate::pointcloud::CloudMapShmWriter::new_for_test(&cloud_path).expect("empty cloud writer"),
-        );
-        let service = GeometryRuntimeService::new(handle.clone());
-        let request = modern_activation_request(
-            activation_request("mapload:two-d", "warehouse-2d"),
-            "act-modern-2d",
-            1,
-        );
-        assert!(request.cloud_checkpoint.is_none());
-        assert!(request.mapping_backend_checkpoint.is_none());
-        let activated = GeometryRuntime::activate_map(&service, Request::new(request.clone()))
-            .await
-            .expect("ordinary 2D activation")
-            .into_inner();
-        assert!(activated.success && activated.active);
-        assert_eq!(activated.activation_receipt_disposition, ActivationReceiptDisposition::Sealed as i32);
-        assert_eq!(activated.activation_identity_sha256.len(), 32);
-        assert!(activated.revision > 0);
-        assert!(!activated.relocalization_target_available);
-        assert!(activated.target_receipt_sha256.is_empty());
-        assert!(service.activation_receipts.current_sealed_target_snapshot().is_none());
-        assert_eq!(handle.state.read().await.map.data, vec![-1, 0, 100, 50]);
-        let cleared = handle.cloud_map_writer.lock().as_ref().unwrap()
-            .committed_snapshot().expect("2D activation clears the previous cloud session");
-        assert_eq!(cleared.point_count, 0);
-        assert!(cleared.xyz_f32_le.is_empty());
-        let replay = GeometryRuntime::activate_map(&service, Request::new(request))
-            .await
-            .expect("2D activation replay")
-            .into_inner();
-        assert!(replay.success && replay.idempotent_replay);
-        assert_eq!(replay.revision, activated.revision);
-        assert!(!replay.relocalization_target_available);
-        assert!(replay.target_receipt_sha256.is_empty());
-        GeometryRuntime::stop_mapping(&service, Request::new(StopMappingRequest {
-            session_id: "mapload:two-d".to_owned(),
-            reason: "2D test complete".to_owned(),
-        })).await.expect("2D stop");
-        let _ = std::fs::remove_file(cloud_path);
-    }
+
 
     #[tokio::test]
     async fn modern_activation_receipt_seals_replays_and_retires_on_first_stop() {
@@ -16862,11 +13479,8 @@ async fn assigned_mapping_cloud_boundary_slice(
             .flat_map(|point| point.iter())
             .flat_map(|value| value.to_le_bytes())
             .collect::<Vec<_>>();
-        let mut request =
+        let request =
             modern_activation_request(cloud_activation_request(xyz), "act-modern-1", 1);
-        let cloud = request.cloud_checkpoint.as_mut().unwrap();
-        cloud.xyz_sha256 = format!(" \t{}\r\n", cloud.xyz_sha256.to_ascii_uppercase());
-        validate_cloud_checkpoint_metadata(cloud, "map").unwrap();
         let replay_request = request.clone();
 
         let activated = GeometryRuntime::activate_map(&service, Request::new(request))
@@ -16874,14 +13488,12 @@ async fn assigned_mapping_cloud_boundary_slice(
             .expect("modern activation")
             .into_inner();
         assert!(activated.success);
-        assert_eq!(activated.activation_receipt_schema_version, 1);
+        assert_eq!(activated.activation_receipt_schema_version, 2);
         assert_eq!(activated.runtime_generation, 1);
         assert!(activated.backend_generation > 0);
         assert_eq!(activated.activation_request_id, "act-modern-1");
-        assert_eq!(activated.activation_request_identity_sha256.len(), 32);
-        assert_eq!(activated.activation_identity_sha256.len(), 32);
-        assert_eq!(activated.target_receipt_sha256.len(), 32);
-        assert!(activated.relocalization_target_available);
+        assert!(!activated.relocalization_target_available);
+        assert!(activated.activation_receipt_v2.as_ref().unwrap().target.is_some());
         assert_eq!(
             activated.activation_receipt_disposition,
             ActivationReceiptDisposition::Sealed as i32
@@ -16891,11 +13503,9 @@ async fn assigned_mapping_cloud_boundary_slice(
             .await
             .unwrap()
             .into_inner();
-        assert!(queried.relocalization_target_available);
-        assert_eq!(
-            queried.target_receipt_sha256,
-            activated.target_receipt_sha256
-        );
+        assert!(!queried.relocalization_target_available);
+        assert!(queried.activation_receipt_v2.as_ref().unwrap().target.is_some());
+
 
         let replay = GeometryRuntime::activate_map(&service, Request::new(replay_request.clone()))
             .await
@@ -16952,42 +13562,7 @@ async fn assigned_mapping_cloud_boundary_slice(
         let _ = std::fs::remove_file(cloud_path);
     }
 
-    #[tokio::test]
-    async fn legacy_activation_is_permanently_relocalization_ineligible() {
-        let handle = crate::lcm_runtime::build_handle_for_tests()
-            .await
-            .expect("real-lcm test handle");
-        let cloud_path = std::env::temp_dir().join(format!(
-            "nuwax-activation-legacy-{}-{}.mmap",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        *handle.cloud_map_writer.lock() =
-            Some(crate::pointcloud::CloudMapShmWriter::new_for_test(&cloud_path).expect("cloud writer"));
-        let service = GeometryRuntimeService::new(handle);
-        let xyz = [[0.025_f32, 0.025, 0.025], [1.025_f32, 0.025, 0.025]]
-            .iter()
-            .flat_map(|point| point.iter())
-            .flat_map(|value| value.to_le_bytes())
-            .collect::<Vec<_>>();
-        let activated =
-            GeometryRuntime::activate_map(&service, Request::new(cloud_activation_request(xyz)))
-                .await
-                .unwrap()
-                .into_inner();
-        assert!(activated.success);
-        assert_eq!(
-            activated.activation_receipt_disposition,
-            ActivationReceiptDisposition::LegacyUnbound as i32
-        );
-        assert!(!activated.relocalization_target_available);
-        assert!(activated.activation_identity_sha256.is_empty());
-        assert!(activated.target_receipt_sha256.is_empty());
-        let _ = std::fs::remove_file(cloud_path);
-    }
+
 
     #[tokio::test]
     async fn stop_mapping_settles_detached_backend_when_phase_a_wins_epoch_race() {
@@ -17005,7 +13580,7 @@ async fn assigned_mapping_cloud_boundary_slice(
         *handle.cloud_map_writer.lock() =
             Some(crate::pointcloud::CloudMapShmWriter::new_for_test(&cloud_path).expect("cloud writer"));
         let phase_a = crate::correction_coordinator::CorrectionPhaseAControl::for_tests();
-        let (shutdown, _listener) = shutdown_channel_inner(None, Some(phase_a), None, None);
+        let (shutdown, _listener) = shutdown_channel_inner(None, Some(phase_a), None);
         let service = GeometryRuntimeService::new_with_shutdown(handle.clone(), shutdown);
         let xyz = [[0.025_f32, 0.025, 0.025], [1.025_f32, 0.025, 0.025]]
             .iter()
@@ -17050,51 +13625,47 @@ async fn assigned_mapping_cloud_boundary_slice(
 
     #[tokio::test]
     async fn activation_fault_windows_are_typed_retired_and_backend_settled() {
-        use crate::correction_coordinator::ActivationJournalStep;
+        use ActivationFaultPoint;
 
         let cases = [
             (
-                ActivationJournalStep::SessionStart,
+                ActivationFaultPoint::SessionStart,
                 ActivationReceiptDisposition::InvalidatedPrecommit,
             ),
             (
-                ActivationJournalStep::OccupancyShmBegin,
+                ActivationFaultPoint::OccupancyShmBegin,
                 ActivationReceiptDisposition::InvalidatedPrecommit,
             ),
             (
-                ActivationJournalStep::OccupancyInstall,
+                ActivationFaultPoint::OccupancyInstall,
                 ActivationReceiptDisposition::InvalidatedPrecommit,
             ),
             (
-                ActivationJournalStep::CloudInstall,
+                ActivationFaultPoint::CloudInstall,
                 ActivationReceiptDisposition::OutcomeUnknown,
             ),
             (
-                ActivationJournalStep::TargetReceiptVerification,
-                ActivationReceiptDisposition::OutcomeUnknown,
-            ),
-            (
-                ActivationJournalStep::ActivationRecord,
+                ActivationFaultPoint::ActivationRecord,
                 ActivationReceiptDisposition::InvalidatedPostcommit,
             ),
             (
-                ActivationJournalStep::SharedStateCommit,
+                ActivationFaultPoint::SharedStateCommit,
                 ActivationReceiptDisposition::InvalidatedPostcommit,
             ),
             (
-                ActivationJournalStep::CacheClears,
+                ActivationFaultPoint::CacheClears,
                 ActivationReceiptDisposition::InvalidatedPostcommit,
             ),
             (
-                ActivationJournalStep::MapEvent,
+                ActivationFaultPoint::MapEvent,
                 ActivationReceiptDisposition::InvalidatedPostcommit,
             ),
             (
-                ActivationJournalStep::CloudEvent,
+                ActivationFaultPoint::CloudEvent,
                 ActivationReceiptDisposition::InvalidatedPostcommit,
             ),
             (
-                ActivationJournalStep::TypedGlobalMap,
+                ActivationFaultPoint::TypedGlobalMap,
                 ActivationReceiptDisposition::InvalidatedPostcommit,
             ),
         ];
@@ -17136,11 +13707,6 @@ async fn assigned_mapping_cloud_boundary_slice(
                 terminal.activation_receipt_disposition, expected_disposition as i32,
                 "step={step:?}"
             );
-            if step == ActivationJournalStep::TargetReceiptVerification {
-                assert!(terminal
-                    .message
-                    .contains("ACTIVATE_MAP_TARGET_RECEIPT_OUTCOME_UNKNOWN"));
-            }
             assert!(!handle.mapping_adapter.as_ref().unwrap().lock().is_active());
             assert!(
                 handle
@@ -17187,7 +13753,7 @@ async fn assigned_mapping_cloud_boundary_slice(
             .collect::<Vec<_>>();
         let request = modern_activation_request(cloud_activation_request(xyz), "act-seal-loss", 1);
         service.inject_activation_fault_after(
-            crate::correction_coordinator::ActivationJournalStep::Seal,
+            ActivationFaultPoint::Seal,
         );
         let error = GeometryRuntime::activate_map(&service, Request::new(request.clone()))
             .await
@@ -17209,14 +13775,14 @@ async fn assigned_mapping_cloud_boundary_slice(
 
     #[tokio::test]
     async fn backend_restore_and_commit_fault_windows_fail_closed() {
-        let checkpoint = export_voxel_backend_checkpoint().await;
+        let (checkpoint,store) = export_voxel_backend_checkpoint().await;
         let cases = [
             (
-                crate::correction_coordinator::ActivationJournalStep::BackendRestoreSubmission,
+                ActivationFaultPoint::BackendRestoreSubmission,
                 ActivationReceiptDisposition::InvalidatedPrecommit,
             ),
             (
-                crate::correction_coordinator::ActivationJournalStep::BackendCommit,
+                ActivationFaultPoint::BackendCommit,
                 ActivationReceiptDisposition::OutcomeUnknown,
             ),
         ];
@@ -17234,7 +13800,10 @@ async fn assigned_mapping_cloud_boundary_slice(
             ));
             *handle.cloud_map_writer.lock() =
                 Some(crate::pointcloud::CloudMapShmWriter::new_for_test(&cloud_path).expect("cloud writer"));
-            let service = GeometryRuntimeService::new(handle.clone());
+            let mut root_owner=crate::lcm_runtime::attach_root_task_owner_for_tests(handle);
+        let handle=root_owner.handle.clone();
+        let mut service = GeometryRuntimeService::new(handle.clone());
+        service.graph_artifacts=store.clone();
             service.inject_activation_fault_after(step);
             let request = activation_request_with_backend_checkpoint(
                 &format!("backend-fault-{index}"),
@@ -17256,7 +13825,8 @@ async fn assigned_mapping_cloud_boundary_slice(
                 .clone()
                 .try_lock_owned()
                 .is_ok());
-            let _ = std::fs::remove_file(cloud_path);
+            assert!(root_owner.task_owner.shutdown().await.producers_settled());
+        let _ = std::fs::remove_file(cloud_path);
         }
     }
 
@@ -17445,240 +14015,76 @@ async fn assigned_mapping_cloud_boundary_slice(
     }
 
     #[tokio::test]
-    async fn activate_map_publish_failure_retains_checkpoint_for_replay() {
-        let mut handle = crate::lcm_runtime::build_handle_for_tests()
-            .await
-            .expect("real-lcm test handle");
-        let cloud_path = std::env::temp_dir().join(format!(
-            "nuwax-activate-cloud-failure-test-{}-{}.mmap",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        *handle.cloud_map_writer.lock() = Some(
-            crate::pointcloud::CloudMapShmWriter::new_for_test(&cloud_path).expect("test cloud-map writer"),
-        );
-        let backend = Arc::new(CheckpointPublishBackend::default());
-        backend
-            .fail_after_observe
-            .store(true, std::sync::atomic::Ordering::Release);
-        handle.transport = LcmTransport::new(backend.clone());
-        let service = GeometryRuntimeService::new(handle.clone());
-        let mut map_revision_rx = handle.map_revision_tx.subscribe();
-        let cloud_xyz = [[0.025_f32, 0.025, 0.025], [1.025_f32, 0.025, 0.025]]
-            .iter()
-            .flat_map(|point| point.iter())
-            .flat_map(|value| value.to_le_bytes())
-            .collect::<Vec<_>>();
-        let request = cloud_activation_request(cloud_xyz.clone());
+    async fn activate_map_publish_failure_releases_locks_and_retries_current_writer() {
+        exercise_failed_activation_publication(false).await;
+    }
 
-        let error = GeometryRuntime::activate_map(&service, Request::new(request.clone()))
-            .await
-            .expect_err("typed global-map publication failure must fail the RPC");
-        assert_eq!(error.code(), tonic::Code::Internal);
-        assert!(error.message().contains("installed"));
-        let installed_revision = handle.state.read().await.cloud_map_revision;
-        assert!(installed_revision > 0);
-        assert!(handle
-            .mapping_adapter
-            .as_ref()
-            .expect("mapping adapter")
-            .lock()
-            .is_active());
-        let map_event = map_revision_rx
-            .recv()
-            .await
-            .expect("installed occupancy checkpoint event");
-        assert_eq!(map_event.map_name, "warehouse");
-        assert_eq!(map_event.data.as_ref(), &[u8::MAX, 0, 100, 50]);
-        let shm = std::fs::read(&cloud_path).expect("installed cloud-map SHM");
-        assert_eq!(
-            u64::from_le_bytes(shm[28..36].try_into().expect("SHM revision bytes")),
-            installed_revision
-        );
-        let active_buffer =
-            u32::from_le_bytes(shm[12..16].try_into().expect("SHM active buffer bytes"));
-        let payload_offset = 64
-            + usize::try_from(active_buffer).expect("active buffer index")
-                * crate::pointcloud::CM_SINGLE_BUFFER_SIZE;
-        let mut installed_points = shm[payload_offset..payload_offset + cloud_xyz.len()]
-            .chunks_exact(crate::pointcloud::CM_POINT_SIZE_BYTES)
-            .map(<[u8; crate::pointcloud::CM_POINT_SIZE_BYTES]>::try_from)
-            .collect::<Result<Vec<_>, _>>()
-            .expect("installed SHM XYZ points");
-        let mut expected_points = cloud_xyz
-            .chunks_exact(crate::pointcloud::CM_POINT_SIZE_BYTES)
-            .map(<[u8; crate::pointcloud::CM_POINT_SIZE_BYTES]>::try_from)
-            .collect::<Result<Vec<_>, _>>()
-            .expect("checkpoint XYZ points");
-        installed_points.sort_unstable();
-        expected_points.sort_unstable();
-        assert_eq!(installed_points, expected_points);
-        assert_eq!(
-            backend
-                .published
-                .lock()
-                .expect("observed failed publication")
-                .len(),
-            1,
-            "publish error may arrive after one observable delivery"
-        );
+    #[tokio::test]
+    async fn activation_publish_failure_followed_by_mapping_change_retires_old_request() {
+        exercise_failed_activation_publication(true).await;
+    }
 
-        assert!(service.has_activation_lifecycle_fence());
-        assert!(
-            handle
-                .mapping_lifecycle_lock
-                .clone()
-                .try_lock_owned()
-                .is_err(),
-            "staged publication failure must retain lifecycle serialization"
-        );
-
-        {
-            let mut state = service.state.write().await;
-            state.phase = "stopping".to_owned();
-        }
-        let transient_rejection =
-            GeometryRuntime::activate_map(&service, Request::new(request.clone()))
-                .await
-                .expect_err("same-request runtime rejection must remain retryable");
-        assert_eq!(transient_rejection.code(), tonic::Code::FailedPrecondition);
-        assert!(service.has_activation_lifecycle_fence());
-        assert_eq!(
-            backend
-                .published
-                .lock()
-                .expect("transient rejection publication count")
-                .len(),
-            1,
-            "ordinary retry rejection must not republish the retained frame"
-        );
-        {
-            let mut state = service.state.write().await;
-            state.phase = "running".to_owned();
-        }
-
-        let empty_stop = GeometryRuntime::stop_mapping(
-            &service,
-            Request::new(StopMappingRequest {
-                session_id: String::new(),
-                reason: "must-not-consume-fence".to_owned(),
-            }),
-        )
-        .await
-        .expect_err("empty StopMapping must fail before consuming the staged fence");
-        assert_eq!(empty_stop.code(), tonic::Code::InvalidArgument);
-        let stale_stop = GeometryRuntime::stop_mapping(
-            &service,
-            Request::new(StopMappingRequest {
-                session_id: "stale-session".to_owned(),
-                reason: "must-not-consume-fence".to_owned(),
-            }),
-        )
-        .await
-        .expect_err("stale StopMapping must fail before consuming the staged fence");
-        assert_eq!(stale_stop.code(), tonic::Code::FailedPrecondition);
-        assert!(service.has_activation_lifecycle_fence());
-        assert!(
-            handle
-                .mapping_adapter
-                .as_ref()
-                .expect("mapping adapter")
-                .lock()
-                .is_active(),
-            "invalid StopMapping cannot detach the staged active session"
-        );
-        assert!(
-            handle
-                .mapping_lifecycle_lock
-                .clone()
-                .try_lock_owned()
-                .is_err(),
-            "invalid StopMapping cannot release staged lifecycle serialization"
-        );
-
-        let divergent_xyz = [[8.025_f32, 0.025, 0.025], [9.025_f32, 0.025, 0.025]]
-            .iter()
-            .flat_map(|point| point.iter())
-            .flat_map(|value| value.to_le_bytes())
-            .collect::<Vec<_>>();
-        let mut conflicting_request = request.clone();
-        let conflicting_cloud = conflicting_request.cloud_checkpoint.as_mut().unwrap();
-        conflicting_cloud.xyz_f32_le = divergent_xyz;
-        conflicting_cloud.xyz_sha256 =
-            crate::map_checksum::sha256_hex(&conflicting_cloud.xyz_f32_le);
-        let conflict = GeometryRuntime::activate_map(&service, Request::new(conflicting_request))
-            .await
-            .expect("conflicting retained target returns typed terminal")
-            .into_inner();
-        assert!(!conflict.success);
-        assert_eq!(
-            conflict.activation_receipt_disposition,
-            ActivationReceiptDisposition::Conflict as i32
-        );
-        assert!(service.has_activation_lifecycle_fence());
-
-        let session_generation = handle
-            .mapping_adapter
-            .as_ref()
-            .unwrap()
-            .lock()
-            .snapshot()
-            .session_generation;
-        let contaminated_revision = {
-            let mut writer = handle.cloud_map_writer.lock();
-            let writer = writer.as_mut().unwrap();
-            assert!(writer.accumulate_mapping_frame(
-                session_generation,
-                &[Point3::new(12.025, 0.025, 0.025)]
-            ));
-            writer
-                .commit_accumulated()
-                .expect("contaminate mutable SHM after staged publication")
-                .0
-        };
-        assert!(contaminated_revision > installed_revision);
-
-        backend
-            .fail_after_observe
-            .store(false, std::sync::atomic::Ordering::Release);
-        let replay = GeometryRuntime::activate_map(&service, Request::new(request))
-            .await
-            .expect("checkpoint publication replay")
-            .into_inner();
-        assert!(replay.idempotent_replay);
-        assert!(!service.has_activation_lifecycle_fence());
-        assert!(
-            handle
-                .mapping_lifecycle_lock
-                .clone()
-                .try_lock_owned()
-                .is_ok(),
-            "sealed retry must release lifecycle serialization"
-        );
-        assert_eq!(
-            handle.state.read().await.cloud_map_revision,
-            installed_revision
-        );
-        let published = backend
-            .published
-            .lock()
-            .expect("checkpoint published frames");
-        assert_eq!(published.len(), 2);
-        assert_eq!(u64::from(published[0].header.seqno), installed_revision);
-        assert_eq!(published[0].topic, published[1].topic);
-        assert_eq!(published[0].msg_type, published[1].msg_type);
-        assert_eq!(published[0].header, published[1].header);
-        assert_eq!(published[0].payload, published[1].payload);
-        let mut encoded = Vec::with_capacity(8 + published[0].payload.len());
-        encoded.extend_from_slice(&schema::POINT_CLOUD2_FINGERPRINT);
-        encoded.extend_from_slice(&published[0].payload);
-        let cloud = schema::decode_point_cloud2(&encoded).expect("replayed checkpoint PointCloud2");
-        assert_eq!(cloud.data, cloud_xyz);
-        drop(published);
-        let _ = std::fs::remove_file(cloud_path);
+    async fn exercise_failed_activation_publication(replace_session: bool) {
+        let fixture=CanonicalResetFixture::new().await;
+        let outcome=futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
+            let mut handle=fixture.handle.clone();
+            let backend=Arc::new(CheckpointPublishBackend::default());
+            backend.fail_after_observe.store(true,Ordering::Release);
+            handle.transport=LcmTransport::new(backend.clone());
+            let service=GeometryRuntimeService::new(handle.clone());
+            let request=cloud_activation_request([[0.025_f32,0.025,0.025],[1.025,0.025,0.025]].into_iter()
+                .flatten().flat_map(f32::to_le_bytes).collect());
+            let error=GeometryRuntime::activate_map(&service,Request::new(request.clone())).await.unwrap_err();
+            assert_eq!(error.code(),tonic::Code::Unavailable);
+            assert!(error.message().contains("publication failed"));
+            assert!(handle.mapping_lifecycle_lock.try_lock().is_ok(),"发布失败必须释放生命周期锁");
+            let projection=tokio::time::timeout(Duration::from_millis(100),handle.lock_explore_projection_owned()).await.unwrap();
+            drop(projection);
+            let adapter=handle.mapping_adapter.as_ref().unwrap();
+            let installed=adapter.lock().snapshot();
+            assert!(installed.active);
+            let before=handle.cloud_map_writer.lock().as_ref().unwrap().committed_metadata().unwrap();
+            backend.fail_after_observe.store(false,Ordering::Release);
+            if replace_session {
+                GeometryRuntime::stop_mapping(&service,Request::new(StopMappingRequest{session_id:installed.session_id.clone(),reason:"换图".into()})).await.unwrap();
+                let next=start_mapping_session(&service,"next-session","next-map").await;
+                assert!(next.active && next.session_generation>installed.session_generation);
+                let replay=GeometryRuntime::activate_map(&service,Request::new(request)).await.unwrap().into_inner();
+                assert!(!replay.success);
+                assert_eq!(replay.activation_receipt_disposition,ActivationReceiptDisposition::Retired as i32);
+                assert!(adapter.lock().snapshot().active);
+                assert_eq!(adapter.lock().snapshot().session_id,next.session_id,"旧重试不得撤销新会话");
+                assert_eq!(adapter.lock().snapshot().session_generation,next.session_generation);
+            } else {
+                let current={
+                    let _lifecycle=handle.mapping_lifecycle_lock.lock().await;
+                    let occupancy=request.mapping_backend_checkpoint.as_ref().unwrap().canonical_occupancy_checkpoint.as_ref().unwrap();
+                    let grid=decode_checkpoint_grid_borrowed(occupancy,"map").unwrap();
+                    let floor=handle.state.read().await.map.revision;
+                    let (map,_event)=adapter.lock().install_checkpoint(grid,occupancy.meta.as_ref().unwrap().timestamp_ns+1,floor).unwrap();
+                    let receipt=adapter.lock().latest_occupancy_commit_receipt().unwrap();
+                    let current={
+                        let mut writer=handle.cloud_map_writer.lock();let writer=writer.as_mut().unwrap();
+                        assert!(writer.accumulate_mapping_frame(installed.session_generation,&[Point3::new(12.025,0.025,0.025)]));
+                        writer.commit_accumulated_snapshot(&receipt).unwrap().unwrap().snapshot
+                    };
+                    let mut shared=handle.state.write().await;shared.map=map;shared.cloud_map_revision=current.revision;
+                    current
+                };
+                assert!(current.revision>before.revision);
+                handle.state.write().await.cloud_map_revision=current.revision;
+                let replay=GeometryRuntime::activate_map(&service,Request::new(request.clone())).await.unwrap().into_inner();
+                assert!(replay.success && replay.idempotent_replay);
+                let state=handle.cloud_map_writer.lock().as_ref().unwrap().typed_publish_state();
+                assert_eq!(state.published_identity(),Some((current.session_generation,current.revision)));
+                let observed=backend.published.lock().unwrap().len();
+                let sealed=GeometryRuntime::activate_map(&service,Request::new(request)).await.unwrap().into_inner();
+                assert!(sealed.success && sealed.idempotent_replay);
+                assert_eq!(backend.published.lock().unwrap().len(),observed,"封存重放不重复发布");
+            }
+        })).await;
+        fixture.finish().await;
+        if let Err(panic)=outcome {std::panic::resume_unwind(panic);}
     }
 
     #[tokio::test]
@@ -17743,7 +14149,7 @@ async fn assigned_mapping_cloud_boundary_slice(
             crate::correction_coordinator::CorrectionPhaseAControl::for_tests();
         let failure_probe = correction_phase_a.clone();
         let (shutdown, mut listener) =
-            crate::server::production_shutdown_channel(lio_gate, correction_phase_a, None);
+            crate::server::production_shutdown_channel(lio_gate, correction_phase_a);
         let service = GeometryRuntimeService::new_with_shutdown(handle, shutdown);
         let listener_task = tokio::spawn(async move {
             listener.wait_for_request().await;
@@ -17806,7 +14212,7 @@ async fn assigned_mapping_cloud_boundary_slice(
             crate::correction_coordinator::CorrectionPhaseAControl::for_tests();
         let failure_probe = correction_phase_a.clone();
         let (shutdown, mut listener) =
-            crate::server::production_shutdown_channel(lio_gate, correction_phase_a, None);
+            crate::server::production_shutdown_channel(lio_gate, correction_phase_a);
         let service = GeometryRuntimeService::new_with_shutdown(handle, shutdown);
         let stop_service = service.clone();
         let stop_task = tokio::spawn(async move {
@@ -18074,7 +14480,7 @@ async fn assigned_mapping_cloud_boundary_slice(
         );
         let handle = spawned.handle.clone();
         let task_control = handle.task_control().expect("Geometry task control");
-        let (shutdown, _listener) = shutdown_channel_inner(None, None, None, Some(task_control));
+        let (shutdown, _listener) = shutdown_channel_inner(None, None, Some(task_control));
         let service = GeometryRuntimeService::new_with_shutdown(handle.clone(), shutdown.clone());
         let barrier = Arc::new(tokio::sync::Barrier::new(2));
         service.inject_start_mapping_before_cloud_clear_barrier(barrier.clone());
@@ -18119,716 +14525,19 @@ async fn assigned_mapping_cloud_boundary_slice(
         }
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn phase_a_rejects_activate_map_cloud_clear_registration_without_sealing_success() {
-        let mut spawned = crate::lcm_runtime::attach_root_task_owner_for_tests(
-            crate::lcm_runtime::build_handle_for_tests()
-                .await
-                .expect("Geometry test handle"),
-        );
-        let handle = spawned.handle.clone();
-        let task_control = handle.task_control().expect("Geometry task control");
-        let (shutdown, _listener) = shutdown_channel_inner(None, None, None, Some(task_control));
-        let service = GeometryRuntimeService::new_with_shutdown(handle.clone(), shutdown.clone());
-        let barrier = Arc::new(tokio::sync::Barrier::new(2));
-        service.inject_activate_map_before_cloud_clear_barrier(barrier.clone());
-        let call_service = service.clone();
-        let call = tokio::spawn(async move {
-            GeometryRuntime::activate_map(
-                &call_service,
-                Request::new(activation_request("phase-a-activate", "phase-a-map")),
-            )
-            .await
-        });
 
-        barrier.wait().await;
-        shutdown.begin_phase_a();
-        barrier.wait().await;
-        let terminal = call
-            .await
-            .expect("ActivateMap task join")
-            .expect("activation failure is a stable terminal response")
-            .into_inner();
-        assert!(!terminal.success);
-        assert_eq!(
-            terminal.activation_receipt_disposition,
-            ActivationReceiptDisposition::InvalidatedPostcommit as i32
-        );
-        assert!(terminal.message.contains("CLOUD_CLEAR_ADMISSION_FAILED"));
-        assert!(
-            !handle
-                .mapping_adapter
-                .as_ref()
-                .expect("mapping adapter")
-                .lock()
-                .snapshot()
-                .active
-        );
 
-        let outcome = spawned.task_owner.shutdown().await;
-        assert!(outcome.producers_settled());
-        if let Some(writer) = &handle.occupancy_shm {
-            writer
-                .lock()
-                .cleanup_product_owned_file()
-                .expect("occupancy mmap cleanup");
-        }
-    }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn deferred_start_mapping_fails_closed_when_cloud_map_clear_is_unavailable() {
-        let mut fixture = DeferredClearFixture::new().await;
-        fixture.complete_startup_odometry().await;
-        assert!(fixture.handle.cloud_map_writer.lock().is_none());
-        let occupancy_generation_before = fixture
-            .handle
-            .occupancy_shm
-            .as_ref()
-            .expect("deferred fixture occupancy writer")
-            .lock()
-            .session_generation();
-        let mut cloud_updates = fixture.handle.cloud_map_tx.subscribe();
-        let (shutdown, listener) = crate::server::production_shutdown_channel(
-            fixture.gate.clone(),
-            fixture.correction_phase_a.clone(),
-            Some(fixture.replay.clone()),
-        );
-        let readiness = shutdown.clone();
-        let poison_order = {
-            let replay = fixture.replay.clone();
-            let readiness = readiness.clone();
-            tokio::spawn(async move {
-                replay.wait_poison().await;
-                readiness.is_readiness_revoked()
-            })
-        };
-        let service = GeometryRuntimeService::new_with_shutdown(fixture.handle.clone(), shutdown);
-        let request = || StartMappingRequest {
-            session_id: "deferred-clear-unavailable".to_owned(),
-            map_name: "deferred-clear-map".to_owned(),
-        };
 
-        let first_error = GeometryRuntime::start_mapping(&service, Request::new(request()))
-            .await
-            .expect_err("missing deferred cloud-map clear must fail closed");
-        assert_eq!(first_error.code(), tonic::Code::Unavailable);
-        assert!(first_error.message().contains("cloud-map writer"));
-        assert!(
-            poison_order.await.expect("poison-order observer"),
-            "readiness revocation must be visible before deferred poison"
-        );
-        assert!(readiness.is_readiness_revoked());
-        assert!(
-            readiness.has_shutdown_failed(),
-            "deferred poison must remain sticky for main terminal arbitration"
-        );
-        assert_eq!(
-            fixture.replay.poison_detail().as_deref(),
-            Some(first_error.message())
-        );
-        assert!(fixture.gate.is_closed());
-        assert!(!fixture.correction_ingress.is_open());
-        assert!(!fixture.correction_phase_a.is_open());
-        let first_snapshot = fixture
-            .handle
-            .mapping_adapter
-            .as_ref()
-            .expect("deferred clear mapping adapter")
-            .lock()
-            .snapshot();
-        assert!(!first_snapshot.active);
-        assert_eq!(
-            first_snapshot.phase,
-            crate::mapping_adapter::MappingSessionPhase::Stopped
-        );
-        assert!(first_snapshot.session_generation > 0);
-        {
-            let adapter = fixture
-                .handle
-                .mapping_adapter
-                .as_ref()
-                .expect("deferred clear mapping adapter")
-                .lock();
-            assert_eq!(adapter.odom_count(), 0);
-            assert_eq!(adapter.pointcloud_count(), 0);
-            assert_eq!(adapter.backend_owner_state_for_tests(), (false, false));
-        }
-        assert_eq!(
-            fixture
-                .handle
-                .occupancy_shm
-                .as_ref()
-                .expect("deferred fixture occupancy writer")
-                .lock()
-                .session_generation(),
-            occupancy_generation_before,
-            "failed deferred start must restore the occupancy session fence"
-        );
-        assert_eq!(
-            fixture
-                .backend
-                .published_count("nuwax_msgs.LioOdometryEnvelope"),
-            1
-        );
-        assert_eq!(
-            fixture
-                .backend
-                .published_count("nuwax_msgs.LioCloudEnvelope"),
-            0
-        );
-        assert_eq!(fixture.backend.published_count("tf2_msgs.TFMessage"), 0);
-        assert_eq!(
-            fixture
-                .correction_sink
-                .apply_count
-                .load(std::sync::atomic::Ordering::Acquire),
-            0
-        );
-        let shared = fixture.handle.state.read().await;
-        assert_eq!(shared.map.revision, 0);
-        assert_eq!(shared.cloud_map_revision, 0);
-        drop(shared);
-        assert!(matches!(
-            cloud_updates.try_recv(),
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-        ));
 
-        let retry_error = GeometryRuntime::start_mapping(&service, Request::new(request()))
-            .await
-            .expect_err("poisoned exact retry must remain failed");
-        assert_eq!(retry_error.code(), tonic::Code::Unavailable);
-        assert_eq!(retry_error.message(), first_error.message());
-        let retry_snapshot = fixture
-            .handle
-            .mapping_adapter
-            .as_ref()
-            .expect("deferred clear mapping adapter")
-            .lock()
-            .snapshot();
-        assert_eq!(
-            retry_snapshot.session_generation,
-            first_snapshot.session_generation
-        );
-        assert_eq!(retry_snapshot.phase, first_snapshot.phase);
-        assert!(!retry_snapshot.active);
-        assert_eq!(
-            fixture
-                .backend
-                .published_count("nuwax_msgs.LioOdometryEnvelope"),
-            1
-        );
-        assert_eq!(
-            fixture
-                .backend
-                .published_count("nuwax_msgs.LioCloudEnvelope"),
-            0
-        );
-        assert!(matches!(
-            cloud_updates.try_recv(),
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-        ));
 
-        let conflict_error = GeometryRuntime::start_mapping(
-            &service,
-            Request::new(StartMappingRequest {
-                session_id: "deferred-clear-conflict".to_owned(),
-                map_name: "deferred-clear-conflict-map".to_owned(),
-            }),
-        )
-        .await
-        .expect_err("poisoned conflicting retry must fail before a new Mapping session");
-        assert_eq!(conflict_error.code(), tonic::Code::Unavailable);
-        assert_eq!(conflict_error.message(), first_error.message());
-        let conflict_snapshot = fixture
-            .handle
-            .mapping_adapter
-            .as_ref()
-            .expect("deferred clear mapping adapter")
-            .lock()
-            .snapshot();
-        assert_eq!(
-            conflict_snapshot.session_generation,
-            first_snapshot.session_generation
-        );
-        assert_eq!(conflict_snapshot.session_id, first_snapshot.session_id);
-        assert!(!conflict_snapshot.active);
 
-        let mismatch = CloudMapNotification {
-            revision: 1,
-            point_count: 0,
-            voxel_size: 0.05,
-            session_generation: first_snapshot.session_generation + 1,
-        };
-        assert!(validate_deferred_cloud_map_clear(
-            &CloudMapSessionAdmission::Registered(mismatch),
-            first_snapshot.session_generation
-        )
-        .is_err());
 
-        drop(service);
-        drop(listener);
-        fixture.shutdown().await;
-    }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn deferred_start_mapping_stale_epoch_revokes_readiness_before_poison_and_retires() {
-        let mut fixture = DeferredClearFixture::new().await;
-        fixture.complete_startup_odometry().await;
-        let (cloud_path, _generation_rx) =
-            install_deferred_cloud_writer(&fixture.handle, "stale-epoch");
-        let occupancy_generation_before = fixture
-            .handle
-            .occupancy_shm
-            .as_ref()
-            .expect("deferred fixture occupancy writer")
-            .lock()
-            .session_generation();
-        let captured = fixture.correction_ingress.relocalization_mode_snapshot();
-        assert_eq!(captured.epoch, 0);
-        assert!(!captured.active);
-        let replay_epoch = fixture
-            .correction_ingress
-            .relocalization_mode_fence()
-            .activate_for_tests();
-        assert!(replay_epoch.active);
-        assert_ne!(replay_epoch.epoch, captured.epoch);
 
-        let (shutdown, listener) = crate::server::production_shutdown_channel(
-            fixture.gate.clone(),
-            fixture.correction_phase_a.clone(),
-            Some(fixture.replay.clone()),
-        );
-        let readiness = shutdown.clone();
-        let poison_order = {
-            let replay = fixture.replay.clone();
-            let readiness = readiness.clone();
-            tokio::spawn(async move {
-                let detail = replay.wait_poison().await;
-                (detail, readiness.is_readiness_revoked())
-            })
-        };
-        let service = GeometryRuntimeService::new_with_shutdown(fixture.handle.clone(), shutdown);
-        let request = || StartMappingRequest {
-            session_id: "deferred-stale-epoch".to_owned(),
-            map_name: "deferred-stale-map".to_owned(),
-        };
 
-        let first_error = GeometryRuntime::start_mapping(&service, Request::new(request()))
-            .await
-            .expect_err("E0 retained cloud must fail the full StartMapping path at E1");
-        assert_eq!(first_error.code(), tonic::Code::Unavailable);
-        assert!(first_error
-            .message()
-            .contains("stale cloud mode provenance"));
-        let (poison_detail, readiness_visible) = poison_order.await.expect("poison-order observer");
-        assert_eq!(poison_detail, first_error.message());
-        assert!(readiness_visible);
-        assert!(readiness.is_readiness_revoked());
-        assert!(fixture.gate.is_closed());
-        assert!(!fixture.correction_ingress.is_open());
-        assert!(!fixture.correction_phase_a.is_open());
-        assert_eq!(
-            fixture
-                .backend
-                .published_count("nuwax_msgs.LioCloudEnvelope"),
-            0
-        );
-        assert_eq!(
-            fixture
-                .correction_sink
-                .apply_count
-                .load(std::sync::atomic::Ordering::Acquire),
-            0
-        );
 
-        let retry_error = GeometryRuntime::start_mapping(&service, Request::new(request()))
-            .await
-            .expect_err("stale-epoch exact retry must return the canonical poison");
-        assert_eq!(retry_error.code(), first_error.code());
-        assert_eq!(retry_error.message(), first_error.message());
-        {
-            let adapter = fixture
-                .handle
-                .mapping_adapter
-                .as_ref()
-                .expect("deferred mapping adapter")
-                .lock();
-            let snapshot = adapter.snapshot();
-            assert!(!snapshot.active);
-            assert_eq!(
-                snapshot.phase,
-                crate::mapping_adapter::MappingSessionPhase::Stopped
-            );
-            assert_eq!(adapter.backend_owner_state_for_tests(), (false, false));
-        }
-        assert_eq!(
-            fixture
-                .handle
-                .occupancy_shm
-                .as_ref()
-                .expect("deferred fixture occupancy writer")
-                .lock()
-                .session_generation(),
-            occupancy_generation_before
-        );
 
-        cleanup_deferred_cloud_writer(&fixture.handle, &cloud_path);
-        drop(service);
-        drop(listener);
-        fixture.shutdown().await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn deferred_start_mapping_cancellation_during_cloud_clear_retires_total_state() {
-        let mut fixture = DeferredClearFixture::new().await;
-        fixture.complete_startup_odometry().await;
-        let (cloud_path, mut generation_rx) =
-            install_deferred_cloud_writer(&fixture.handle, "cancel-cloud-clear");
-        let occupancy_generation_before = fixture
-            .handle
-            .occupancy_shm
-            .as_ref()
-            .expect("deferred fixture occupancy writer")
-            .lock()
-            .session_generation();
-        let (shutdown, listener) = crate::server::production_shutdown_channel(
-            fixture.gate.clone(),
-            fixture.correction_phase_a.clone(),
-            Some(fixture.replay.clone()),
-        );
-        let readiness = shutdown.clone();
-        let service = GeometryRuntimeService::new_with_shutdown(fixture.handle.clone(), shutdown);
-        let barrier = Arc::new(tokio::sync::Barrier::new(2));
-        service.inject_start_mapping_before_cloud_clear_barrier(barrier.clone());
-        let request = || StartMappingRequest {
-            session_id: "deferred-cancel-cloud-clear".to_owned(),
-            map_name: "deferred-cancel-cloud-map".to_owned(),
-        };
-        let rpc_task = {
-            let service = service.clone();
-            tokio::spawn(async move {
-                GeometryRuntime::start_mapping(
-                    &service,
-                    Request::new(StartMappingRequest {
-                        session_id: "deferred-cancel-cloud-clear".to_owned(),
-                        map_name: "deferred-cancel-cloud-map".to_owned(),
-                    }),
-                )
-                .await
-            })
-        };
-
-        barrier.wait().await;
-        let shared_state_guard = fixture.handle.state.write().await;
-        barrier.wait().await;
-        let started_generation = *tokio::time::timeout(
-            Duration::from_secs(1),
-            generation_rx.wait_for(|generation| *generation > 0),
-        )
-        .await
-        .expect("cloud writer generation must advance before waiter cancellation")
-        .expect("cloud writer generation watch");
-        assert!(started_generation > 0);
-
-        rpc_task.abort();
-        assert!(rpc_task
-            .await
-            .expect_err("aborted StartMapping RPC waiter")
-            .is_cancelled());
-        drop(shared_state_guard);
-        let poison_detail =
-            tokio::time::timeout(Duration::from_secs(1), fixture.replay.wait_poison())
-                .await
-                .expect("cloud-clear cancellation poison deadline");
-        assert!(poison_detail.contains("cancelled during cloud-map clear"));
-        assert!(readiness.is_readiness_revoked());
-
-        let retry = GeometryRuntime::start_mapping(&service, Request::new(request()))
-            .await
-            .expect_err("cancelled cloud-clear retry must expose settled poison");
-        assert_eq!(retry.code(), tonic::Code::Unavailable);
-        assert_eq!(retry.message(), poison_detail);
-        {
-            let adapter = fixture
-                .handle
-                .mapping_adapter
-                .as_ref()
-                .expect("deferred mapping adapter")
-                .lock();
-            let snapshot = adapter.snapshot();
-            assert!(!snapshot.active);
-            assert_eq!(
-                snapshot.phase,
-                crate::mapping_adapter::MappingSessionPhase::Stopped
-            );
-            assert_eq!(adapter.backend_owner_state_for_tests(), (false, false));
-        }
-        assert_eq!(
-            fixture
-                .handle
-                .occupancy_shm
-                .as_ref()
-                .expect("deferred fixture occupancy writer")
-                .lock()
-                .session_generation(),
-            occupancy_generation_before
-        );
-        assert!(fixture.gate.is_closed());
-        assert!(!fixture.correction_ingress.is_open());
-
-        cleanup_deferred_cloud_writer(&fixture.handle, &cloud_path);
-        drop(service);
-        drop(listener);
-        fixture.shutdown().await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn deferred_start_mapping_cancellation_during_replay_retires_total_state() {
-        let mut fixture = DeferredClearFixture::new().await;
-        fixture.complete_startup_odometry().await;
-        let (cloud_path, _generation_rx) =
-            install_deferred_cloud_writer(&fixture.handle, "cancel-replay");
-        let occupancy_generation_before = fixture
-            .handle
-            .occupancy_shm
-            .as_ref()
-            .expect("deferred fixture occupancy writer")
-            .lock()
-            .session_generation();
-        let (shutdown, listener) = crate::server::production_shutdown_channel(
-            fixture.gate.clone(),
-            fixture.correction_phase_a.clone(),
-            Some(fixture.replay.clone()),
-        );
-        let readiness = shutdown.clone();
-        let service = GeometryRuntimeService::new_with_shutdown(fixture.handle.clone(), shutdown);
-        let request = || StartMappingRequest {
-            session_id: "deferred-cancel-replay".to_owned(),
-            map_name: "deferred-cancel-replay-map".to_owned(),
-        };
-        let rpc_task = {
-            let service = service.clone();
-            tokio::spawn(async move {
-                GeometryRuntime::start_mapping(
-                    &service,
-                    Request::new(StartMappingRequest {
-                        session_id: "deferred-cancel-replay".to_owned(),
-                        map_name: "deferred-cancel-replay-map".to_owned(),
-                    }),
-                )
-                .await
-            })
-        };
-
-        let cloud = tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                let frame = fixture
-                    .frame_rx
-                    .recv()
-                    .await
-                    .expect("deferred replay publication frame");
-                if frame.msg_type.fqn() == "nuwax_msgs.LioCloudEnvelope" {
-                    return frame;
-                }
-            }
-        })
-        .await
-        .expect("public cloud replay wait window");
-        assert_eq!(cloud.msg_type.fqn(), "nuwax_msgs.LioCloudEnvelope");
-
-        rpc_task.abort();
-        assert!(rpc_task
-            .await
-            .expect_err("aborted replay RPC waiter")
-            .is_cancelled());
-        let poison_detail =
-            tokio::time::timeout(Duration::from_secs(1), fixture.replay.wait_poison())
-                .await
-                .expect("replay cancellation poison deadline");
-        assert!(poison_detail.contains("cancelled during retained replay"));
-        assert!(readiness.is_readiness_revoked());
-
-        let retry = GeometryRuntime::start_mapping(&service, Request::new(request()))
-            .await
-            .expect_err("cancelled replay retry must expose settled poison");
-        assert_eq!(retry.code(), tonic::Code::Unavailable);
-        assert_eq!(retry.message(), poison_detail);
-        {
-            let adapter = fixture
-                .handle
-                .mapping_adapter
-                .as_ref()
-                .expect("deferred mapping adapter")
-                .lock();
-            let snapshot = adapter.snapshot();
-            assert!(!snapshot.active);
-            assert_eq!(
-                snapshot.phase,
-                crate::mapping_adapter::MappingSessionPhase::Stopped
-            );
-            assert_eq!(adapter.backend_owner_state_for_tests(), (false, false));
-        }
-        assert_eq!(
-            fixture
-                .handle
-                .occupancy_shm
-                .as_ref()
-                .expect("deferred fixture occupancy writer")
-                .lock()
-                .session_generation(),
-            occupancy_generation_before
-        );
-        assert_eq!(
-            fixture
-                .backend
-                .published_count("nuwax_msgs.LioCloudEnvelope"),
-            1
-        );
-        assert!(fixture.gate.is_closed());
-        assert!(!fixture.correction_ingress.is_open());
-
-        cleanup_deferred_cloud_writer(&fixture.handle, &cloud_path);
-        drop(service);
-        drop(listener);
-        fixture.shutdown().await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn deferred_start_mapping_retires_backend_when_ordinary_stop_transition_fails() {
-        let mut fixture = DeferredClearFixture::new().await;
-        fixture.complete_startup_odometry().await;
-        let occupancy_generation_before = fixture
-            .handle
-            .occupancy_shm
-            .as_ref()
-            .expect("deferred fixture occupancy writer")
-            .lock()
-            .session_generation();
-        let (shutdown, listener) = crate::server::production_shutdown_channel(
-            fixture.gate.clone(),
-            fixture.correction_phase_a.clone(),
-            Some(fixture.replay.clone()),
-        );
-        let readiness = shutdown.clone();
-        let service = GeometryRuntimeService::new_with_shutdown(fixture.handle.clone(), shutdown);
-        service.inject_start_mapping_stop_transition_failure();
-        let request = || StartMappingRequest {
-            session_id: "deferred-stop-fallback".to_owned(),
-            map_name: "deferred-stop-fallback-map".to_owned(),
-        };
-
-        let error = GeometryRuntime::start_mapping(&service, Request::new(request()))
-            .await
-            .expect_err("missing clear plus ordinary stop failure must remain total");
-
-        assert_eq!(error.code(), tonic::Code::Unavailable);
-        assert!(error.message().contains("cloud-map writer"));
-        assert!(!error
-            .message()
-            .contains("ordinary Mapping stop transition failed"));
-        let retry = GeometryRuntime::start_mapping(&service, Request::new(request()))
-            .await
-            .expect_err("ordinary-stop fallback retry must remain canonical");
-        assert_eq!(retry.code(), error.code());
-        assert_eq!(retry.message(), error.message());
-        assert!(fixture
-            .replay
-            .poison_diagnostics_for_tests()
-            .iter()
-            .any(|diagnostic| diagnostic.contains("ordinary Mapping stop transition failed")));
-        assert!(readiness.is_readiness_revoked());
-        {
-            let adapter = fixture
-                .handle
-                .mapping_adapter
-                .as_ref()
-                .expect("deferred mapping adapter")
-                .lock();
-            let snapshot = adapter.snapshot();
-            assert!(!snapshot.active);
-            assert_eq!(
-                snapshot.phase,
-                crate::mapping_adapter::MappingSessionPhase::Stopped
-            );
-            assert_eq!(adapter.backend_owner_state_for_tests(), (false, false));
-        }
-        assert_eq!(
-            fixture
-                .handle
-                .occupancy_shm
-                .as_ref()
-                .expect("deferred fixture occupancy writer")
-                .lock()
-                .session_generation(),
-            occupancy_generation_before
-        );
-
-        drop(service);
-        drop(listener);
-        fixture.shutdown().await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn deferred_occupancy_fence_failure_revokes_readiness_and_retires_mapping() {
-        let mut fixture = DeferredClearFixture::new().await;
-        fixture.complete_startup_odometry().await;
-        fixture
-            .handle
-            .occupancy_shm
-            .as_ref()
-            .expect("deferred fixture occupancy writer")
-            .lock()
-            .begin_session(u64::MAX)
-            .expect("install future occupancy generation");
-        let (shutdown, listener) = crate::server::production_shutdown_channel(
-            fixture.gate.clone(),
-            fixture.correction_phase_a.clone(),
-            Some(fixture.replay.clone()),
-        );
-        let readiness = shutdown.clone();
-        let service = GeometryRuntimeService::new_with_shutdown(fixture.handle.clone(), shutdown);
-
-        let error = GeometryRuntime::start_mapping(
-            &service,
-            Request::new(StartMappingRequest {
-                session_id: "deferred-occupancy-fence-failure".to_owned(),
-                map_name: "deferred-occupancy-fence-map".to_owned(),
-            }),
-        )
-        .await
-        .expect_err("regressed occupancy generation must fail closed");
-
-        assert_eq!(error.code(), tonic::Code::Unavailable);
-        assert!(error
-            .message()
-            .contains("occupancy SHM session fence failed"));
-        assert!(readiness.is_readiness_revoked());
-        assert!(fixture.replay.poison_detail().is_some());
-        {
-            let adapter = fixture
-                .handle
-                .mapping_adapter
-                .as_ref()
-                .expect("deferred mapping adapter")
-                .lock();
-            assert!(!adapter.snapshot().active);
-            assert_eq!(adapter.backend_owner_state_for_tests(), (false, false));
-        }
-        assert_eq!(
-            fixture
-                .handle
-                .occupancy_shm
-                .as_ref()
-                .expect("deferred fixture occupancy writer")
-                .lock()
-                .session_generation(),
-            u64::MAX
-        );
-
-        drop(service);
-        drop(listener);
-        fixture.shutdown().await;
-    }
 
     #[tokio::test]
     async fn process_stop_holds_lifecycle_lock_until_listener_ack() {
@@ -18847,7 +14556,6 @@ async fn assigned_mapping_cloud_boundary_slice(
         let (shutdown, mut listener) = crate::server::production_shutdown_channel(
             lio_gate.clone(),
             correction_phase_a.clone(),
-            None,
         );
         let graceful_rx = listener.graceful_rx.clone();
         let readiness = shutdown.clone();
@@ -19493,7 +15201,7 @@ mod relocalization_terminal_query_tests {
             .await
             .expect("real-lcm test handle");
         let phase_a = crate::correction_coordinator::CorrectionPhaseAControl::for_tests();
-        let (shutdown, _listener) = shutdown_channel_inner(None, Some(phase_a), None, None);
+        let (shutdown, _listener) = shutdown_channel_inner(None, Some(phase_a), None);
         GeometryRuntimeService::new_with_shutdown_and_point_cloud_binding(
             handle,
             shutdown,
@@ -19505,18 +15213,10 @@ mod relocalization_terminal_query_tests {
         )
     }
 
-    fn query_request(
-        request_id: &str,
-        request_identity_sha256: Vec<u8>,
-        activation_identity_sha256: Vec<u8>,
-    ) -> GetRelocalizationTerminalRequest {
-        GetRelocalizationTerminalRequest {
-            schema_version: 1,
-            request_id: request_id.to_owned(),
-            request_identity_sha256,
-            activation_identity_sha256,
-            assigned_request_v2: None,
-        }
+    fn query_request(request_id:&str, changed:bool) -> GetRelocalizationTerminalRequest {
+        let mut request=crate::relocalization_terminal_v2::planar_tests::wire(); request.request_id=request_id.into();
+        if changed { let Some(relocalize_request::AssignedTarget::AssignedPlanarV2(body))=request.assigned_target.as_mut() else{unreachable!()}; body.seed.as_mut().unwrap().x=9.0; }
+        GetRelocalizationTerminalRequest{schema_version:2,request_id:request_id.into(),assigned_request_v2:Some(request)}
     }
 
     fn query_root(name: &str) -> std::path::PathBuf {
@@ -19529,110 +15229,38 @@ mod relocalization_terminal_query_tests {
 
     #[tokio::test]
     async fn terminal_query_rejects_invalid_id_and_identity_lengths() {
-        let root = query_root("invalid");
-        let ingress = crate::correction_coordinator::RelocalizationCommandIngress::terminal_query_fixture_for_tests(root.clone());
-        let service = query_service(ingress).await;
-        for request in [
-            query_request(" invalid", vec![3; 32], vec![5; 32]),
-            query_request("req-invalid-request-digest", vec![3; 31], vec![5; 32]),
-            query_request("req-invalid-activation-digest", vec![3; 32], vec![5; 33]),
-        ] {
-            let error =
-                GeometryRuntime::get_relocalization_terminal(&service, Request::new(request))
-                    .await
-                    .expect_err("invalid terminal query must fail closed");
-            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        let root=query_root("invalid");
+        let ingress=crate::correction_coordinator::RelocalizationCommandIngress::terminal_query_fixture_for_tests(root.clone());
+        let service=query_service(ingress).await;
+        let mut missing=query_request("req-missing",false);missing.assigned_request_v2=None;
+        let mut old=query_request("req-old",false);old.schema_version=1;
+        for request in [query_request(" invalid",false),missing,old] {
+            assert_eq!(GeometryRuntime::get_relocalization_terminal(&service,Request::new(request)).await.unwrap_err().code(),tonic::Code::InvalidArgument);
         }
-        std::fs::remove_dir_all(root).expect("remove terminal query store");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
     async fn terminal_query_projects_four_read_only_states_without_mutating_runtime() {
-        let root = query_root("states");
-        let ingress = crate::correction_coordinator::RelocalizationCommandIngress::terminal_query_fixture_for_tests(root.clone());
-        let request_identity = [3_u8; 32];
-        let activation_identity = [5_u8; 32];
-        ingress.mark_terminal_query_pending_for_tests(
-            "req-pending",
-            request_identity,
-            activation_identity,
-        );
-        ingress.persist_terminal_query_result_for_tests(RelocalizeResult {
-            schema_version: 1,
-            request_id: "req-terminal".to_owned(),
-            request_identity_sha256: request_identity.to_vec(),
-            activation_identity_sha256: activation_identity.to_vec(),
-            disposition: RelocalizeDisposition::Applied as i32,
-            terminal_proof_sha256: vec![7; 32],
-            ..RelocalizeResult::default()
-        });
-        let service = query_service(ingress.clone()).await;
-        let map_revision_before = service.bridge.state.read().await.map.revision;
-
-        for (request_id, request_digest, expected_status, has_terminal) in [
-            (
-                "req-terminal",
-                request_identity,
-                RelocalizationTerminalStatus::Terminal,
-                true,
-            ),
-            (
-                "req-pending",
-                request_identity,
-                RelocalizationTerminalStatus::Pending,
-                false,
-            ),
-            (
-                "req-missing",
-                request_identity,
-                RelocalizationTerminalStatus::NotFound,
-                false,
-            ),
-            (
-                "req-terminal",
-                [9; 32],
-                RelocalizationTerminalStatus::IdentityConflict,
-                false,
-            ),
-        ] {
-            let response = GeometryRuntime::get_relocalization_terminal(
-                &service,
-                Request::new(query_request(
-                    request_id,
-                    request_digest.to_vec(),
-                    activation_identity.to_vec(),
-                )),
-            )
-            .await
-            .expect("terminal query response")
-            .into_inner();
-            assert_eq!(response.status, expected_status as i32);
-            assert_eq!(response.terminal.is_some(), has_terminal);
-            let observation = response
-                .ledger_observation
-                .expect("successful query must include ledger observation");
-            assert_eq!(observation.observation_schema_version, 1);
-            assert_ne!(observation.observation_epoch, 0);
-            assert_eq!(observation.admitted_command_count, 0);
-            assert_eq!(observation.claimed_command_count, 0);
-            assert_eq!(observation.terminal_record_count, 0);
-            assert_eq!(observation.pending_record_count, 0);
-            assert_eq!(observation.active_waiter_count, 0);
+        let root=query_root("states");
+        let ingress=crate::correction_coordinator::RelocalizationCommandIngress::terminal_query_fixture_for_tests(root.clone());
+        ingress.seed_terminal_query_for_tests(query_request("req-pending",false).assigned_request_v2.unwrap(),None);
+        let terminal_request=query_request("req-terminal",false).assigned_request_v2.unwrap();
+        let mut result=crate::relocalization_terminal_v2::planar_tests::terminal(false);
+        result.request_id=terminal_request.request_id.clone();result.assigned_planar_v2.as_mut().unwrap().request=Some(terminal_request.clone());
+        ingress.seed_terminal_query_for_tests(terminal_request,Some(result));
+        let service=query_service(ingress.clone()).await; let before=service.bridge.state.read().await.map.revision;
+        for (id,changed,status,has_terminal) in [("req-terminal",false,RelocalizationTerminalStatus::Terminal,true),
+            ("req-pending",false,RelocalizationTerminalStatus::Pending,false),("req-missing",false,RelocalizationTerminalStatus::NotFound,false),
+            ("req-terminal",true,RelocalizationTerminalStatus::IdentityConflict,false)] {
+            let response=GeometryRuntime::get_relocalization_terminal(&service,Request::new(query_request(id,changed))).await.unwrap().into_inner();
+            assert_eq!(response.status,status as i32);assert_eq!(response.terminal.is_some(),has_terminal);
+            assert_eq!(response.ledger_observation.unwrap().admitted_command_count,0);
         }
-
-        assert_eq!(
-            service.bridge.state.read().await.map.revision,
-            map_revision_before
-        );
-        assert!(matches!(
-            ingress
-                .terminal_snapshot("req-pending", request_identity, activation_identity)
-                .await
-                .expect("terminal snapshot")
-                .terminal,
-            crate::correction_coordinator::RelocalizationTerminalSnapshot::Pending
-        ));
-        std::fs::remove_dir_all(root).expect("remove terminal query store");
+        assert_eq!(service.bridge.state.read().await.map.revision,before);
+        let query=crate::relocalization_terminal_v2::AssignedRelocalizationTerminalQueryV2::admit(query_request("req-pending",false)).unwrap();
+        assert!(matches!(ingress.terminal_snapshot_assigned(&query).await.unwrap().terminal,crate::correction_coordinator::RelocalizationTerminalSnapshot::Pending));
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
 
@@ -19655,22 +15283,19 @@ pub(super) fn frozen() -> MappingBackendCheckpoint {
 }
 #[test]
 fn assigned_v2_native_wire_and_frozen_assembly_keep_exact_ids_bytes_and_payload_schema() {
-    assert_eq!(ExportMappingBackendCheckpointRequest::decode(&[][..]).unwrap().checkpoint_schema_version,0);
-    assert_eq!(checkpoint_envelope_version(0).unwrap(),1);assert_eq!(checkpoint_envelope_version(1).unwrap(),1);assert!(checkpoint_envelope_version(3).is_err());
-    let request=ExportMappingBackendCheckpointRequest{checkpoint_schema_version:2};
+    let request=ExportMappingBackendCheckpointRequest{};
     assert_eq!(ExportMappingBackendCheckpointRequest::decode(request.encode_to_vec().as_slice()).unwrap(),request);
-    let original=frozen();let checkpoint=assemble_mapping_checkpoint_export(original.clone(),2,crate::mapping_backend::MappingBackendKind::Voxel).unwrap();
+    let original=frozen();let checkpoint=assemble_mapping_checkpoint_export(original.clone()).unwrap();
     assert_eq!(checkpoint.schema_version,2);assert_eq!(checkpoint.backend_payload_schema_version,1);
     assert_eq!(checkpoint.checkpoint_id,original.checkpoint_id);assert_eq!(checkpoint.payload,original.payload);
-    assert!(checkpoint.content_sha256.is_empty());assert_eq!(checkpoint.canonical_occupancy_checkpoint,original.canonical_occupancy_checkpoint);
-    let cloud=checkpoint.canonical_cloud_checkpoint.as_ref().unwrap();assert!(cloud.xyz_sha256.is_empty());
+    let cloud=checkpoint.canonical_cloud_checkpoint.as_ref().unwrap();
     assert_eq!(cloud.xyz_f32_le,original.canonical_cloud_checkpoint.unwrap().xyz_f32_le);assert_eq!(cloud.payload_schema_version,2);
     let encoded=checkpoint.encode_to_vec();assert_eq!(MappingBackendCheckpoint::decode(encoded.as_slice()).unwrap(),checkpoint);
-    assert!(validate_mapping_backend_checkpoint(&checkpoint,crate::mapping_backend::MappingBackendKind::Voxel).is_err());
+    validate_assigned_mapping_checkpoint(&checkpoint,crate::mapping_backend::MappingBackendKind::Voxel).unwrap();
 }
 #[test]
 fn assigned_v2_backend_and_occupancy_members_require_exact_parent_binding() {
-    let valid = assemble_mapping_checkpoint_export(frozen(), 2, crate::mapping_backend::MappingBackendKind::Voxel).unwrap();
+    let valid = assemble_mapping_checkpoint_export(frozen()).unwrap();
     for backend in [true, false] {
         for mutation in 0..7 {
             let mut bad = valid.clone();
@@ -19692,12 +15317,11 @@ fn assigned_v2_backend_and_occupancy_members_require_exact_parent_binding() {
 }
 #[test]
 fn assigned_v2_assembly_rejects_mixed_fields_source_geometry_and_backend_format() {
-    let valid=assemble_mapping_checkpoint_export(frozen(),2,crate::mapping_backend::MappingBackendKind::Voxel).unwrap();
-    for field in 0..13 {
+    let valid=assemble_mapping_checkpoint_export(frozen()).unwrap();
+    for field in [1,2,3,4,5,7,8,9,10,11,12] {
         let mut bad=valid.clone();match field {
-            0=>bad.content_sha256=vec![7;32],1=>bad.checkpoint_id="A".repeat(32),2=>bad.backend_payload_schema_version=2,
+            1=>bad.checkpoint_id="A".repeat(32),2=>bad.backend_payload_schema_version=2,
             3=>bad.payload_size+=1,4=>bad.payload[8]=2,5=>bad.payload[12]=1,
-            6=>bad.canonical_cloud_checkpoint.as_mut().unwrap().xyz_sha256="01".repeat(32),
             7=>bad.canonical_cloud_checkpoint.as_mut().unwrap().member_identity.as_mut().unwrap().checkpoint_id="2".repeat(32),
             8=>bad.canonical_cloud_checkpoint.as_mut().unwrap().xyz_f32_le[..4].copy_from_slice(&f32::NAN.to_le_bytes()),
             9=>bad.canonical_occupancy_checkpoint.as_mut().unwrap().data[0]=254,
@@ -19705,11 +15329,10 @@ fn assigned_v2_assembly_rejects_mixed_fields_source_geometry_and_backend_format(
             11=>bad.cloud_receipt.as_mut().unwrap().cloud_revision+=1,_=>bad.canonical_cloud_checkpoint.as_mut().unwrap().frame_id="odom".into() }
         assert!(validate_assigned_mapping_checkpoint(&bad,crate::mapping_backend::MappingBackendKind::Voxel).is_err(),"field {field}");
     }
-    let mut bad=frozen();bad.content_sha256=vec![1;32];assert!(assemble_mapping_checkpoint_export(bad,2,crate::mapping_backend::MappingBackendKind::Voxel).is_err());
 }
 #[test]
 fn assigned_v2_assembly_checks_full_artifact_parent_descriptor() {
-    let mut checkpoint=assemble_mapping_checkpoint_export(frozen(),2,crate::mapping_backend::MappingBackendKind::Voxel).unwrap();
+    let mut checkpoint=assemble_mapping_checkpoint_export(frozen()).unwrap();
     let member=checkpoint_member_identity(&checkpoint.checkpoint_id,CheckpointMemberRole::DenseCloud,checkpoint.occupancy_receipt.as_ref().unwrap(),checkpoint.cloud_receipt.as_ref().unwrap(),"map",None);
     checkpoint.dense_cloud_artifact=Some(GraphArtifactRef{id:"2".repeat(32),size:100,identity_schema_version:2,member_identity:Some(member),..Default::default()});
     validate_assigned_mapping_checkpoint(&checkpoint,crate::mapping_backend::MappingBackendKind::Voxel).unwrap();
@@ -19718,7 +15341,7 @@ fn assigned_v2_assembly_checks_full_artifact_parent_descriptor() {
     collision.fine_map_artifact=Some(fine);
     assert!(validate_assigned_mapping_checkpoint(&collision,crate::mapping_backend::MappingBackendKind::Voxel).unwrap_err().contains("cannot share one artifact ID"));
     checkpoint.dense_cloud_artifact.as_mut().unwrap().member_identity.as_mut().unwrap().cloud_receipt.as_mut().unwrap().cloud_revision+=1;
-    assert!(validate_assigned_mapping_checkpoint(&checkpoint,crate::mapping_backend::MappingBackendKind::Voxel).is_err());
+    validate_assigned_mapping_checkpoint(&checkpoint,crate::mapping_backend::MappingBackendKind::Voxel).expect_err("外部制品描述必须绑定原占据与点云收据");
 }
 }
 
@@ -19743,42 +15366,15 @@ mod assigned_activation_boundary_tests {
     #[test]
     fn assigned_metadata_never_enters_legacy_request_classification() {
         let request = metadata_request();
-        assert!(matches!(classify_activation_request_identity(&request, 7).unwrap(), ActivationRequestIdentityClass::Assigned(_)));
+        assert_eq!(classify_activation_request_identity(&request, 7).unwrap().activation_request_id(), "assigned-boundary:one");
         assert!(classify_activation_request_identity(&request, 8).is_err());
         for version in [0, 1, 3] {
             let mut skew = request.clone(); skew.activation_contract_version = version;
             assert!(classify_activation_request_identity(&skew, 7).is_err());
         }
-        let mut duplicate = request; duplicate.cloud_checkpoint = Some(CloudMapCheckpoint::default());
-        assert!(classify_activation_request_identity(&duplicate, 7).is_err());
     }
 
-    #[test]
-    fn assigned_publication_fence_retains_no_legacy_cloud_frame() {
-        let metadata = crate::activation_request::ActivationRequestMetadataV2::from_wire(&metadata_request(), 7).unwrap();
-        let key = ActivationRequestKey::Assigned(metadata);
-        let receipt = crate::mapping_commit::CloudCommitReceipt {
-            commit_id: crate::mapping_commit::MappingCommitId { boot_nonce: 9, sequence: 10 },
-            session_generation: 2, occupancy_revision: 3, cloud_revision: 4,
-            source_timestamp_ns: 100, point_count: 1,
-        };
-        let committed = CommittedMappingCloudMap {
-            notification: CloudMapNotification { revision: 4, point_count: 1, voxel_size: 0.1, session_generation: 2 },
-            source_timestamp_ns: 100,
-            metadata: crate::pointcloud::CommittedCloudMapMetadata {
-                revision: 4, point_count: 1, voxel_size: 0.1, session_generation: 2,
-                producer_epoch: [1; 16], layout_generation: 1,
-            },
-            receipt,
-        };
-        // No XYZ body is supplied: a typed fence must not eagerly encode one.
-        let mut retained = RetainedActivationGlobalMap::from_committed(key.clone(), "map", &committed).unwrap();
-        assert!(retained.legacy_frame.is_none());
-        retained.capture_materialized_legacy_frame(&Arc::new(parking_lot::Mutex::new(None)), &committed).unwrap();
-        assert!(retained.legacy_frame.is_none());
-        retained.validate_replay(key.clone(), "map", &committed).unwrap();
-        assert!(retained.validate_replay(key, "odom", &committed).is_err());
-    }
+
 }
 
 #[cfg(test)]

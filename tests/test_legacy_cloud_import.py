@@ -3,6 +3,7 @@
 Assigned RPC dispatch is recorded, not a native-runtime integration test.
 """
 import hashlib
+from tests.conftest import asset_document
 import json
 import os
 import shutil
@@ -89,8 +90,8 @@ def fixture(repository, catalog_owner, backend='voxel', dense=True):
     document = dict(schema_version=1, backend_kind=backend, source_session_id='source', source_session_generation=3,
         created_at_ns=12, payload=dict(sha256='50' * 32, path=relative, size=len(payload)),
         canonical_receipts=dict(occupancy=store._receipt_document(occupancy), cloud=store._receipt_document(cloud)),
-        canonical_assets=dict(occupancy=store._asset_document(occupancy_asset, sha256_field='raw_data_sha256'),
-            cloud=store._asset_document(cloud_asset, sha256_field='xyz_sha256')))
+        canonical_assets=dict(occupancy=asset_document(occupancy_asset, sha256_field='raw_data_sha256'),
+            cloud=asset_document(cloud_asset, sha256_field='xyz_sha256')))
     xyz = struct.pack('<ffffff', 1, 2, 3, 4, 5, 6)
     dense_bytes = None
     if dense:
@@ -133,7 +134,7 @@ class LegacyCloudImportTests(unittest.TestCase):
         for name in hashlib.algorithms_guaranteed | {'new', 'file_digest'}:
             if hasattr(hashlib, name):
                 self.guard.enter_context(patch.object(hashlib, name, side_effect=AssertionError('business hash called')))
-        for module in (store, checkpoint_payload):
+        for module in (checkpoint_payload,):
             self.guard.enter_context(patch.object(module, 'payload_digest', side_effect=AssertionError('payload digest called')))
         self.directory=tempfile.TemporaryDirectory();self.addCleanup(self.directory.cleanup)
         self.root=Path(self.directory.name)
@@ -200,9 +201,6 @@ class LegacyCloudImportTests(unittest.TestCase):
                                  (reference.id, len(fine), 2))
                 self.assertEqual((wire.member_identity.frame_generation,
                                   wire.member_identity.producer_generation), (4, 8))
-                self.assertEqual(wire.sha256, b'')
-                self.assertEqual(request.asset_manifest_sha256, b'')
-                self.assertEqual(request.asset_bundle_sha256, b'')
                 self.assertEqual(inventory(self.current), before)
                 with patch.object(asset_store.uuid, 'uuid4', side_effect=AssertionError('retry allocation')):
                     again = self.import_current()
@@ -232,7 +230,7 @@ class LegacyCloudImportTests(unittest.TestCase):
             self.assertEqual(owner.activate_map(map_name='map'), 'assigned fine dispatch')
         self.assertEqual(inventory(self.current), before)
 
-    def test_fine_import_ar1_preserves_existing_fallback_without_allocation(self):
+    def test_fine_import_ar1_requires_runtime_capability_before_allocation(self):
         self.prepare()
         self.add_fine_archive(fine_archive(1))
         before = inventory(self.current)
@@ -263,7 +261,10 @@ class LegacyCloudImportTests(unittest.TestCase):
         self.prepare()
         payload = fine_archive()
         self.add_fine_archive(payload)
-        stored = store.MappingBackendCheckpointStore(self.current).load('voxel', schema_version=1)
+        with asset_store._StableDirectoryTree(self.current) as tree:
+            stored = store.MappingBackendCheckpointStore(self.current).load_legacy_import('voxel',
+                read_member=lambda relative, maximum_bytes, description:
+                    tree.require_file(relative, description).read(maximum_bytes))
         kwargs = dict(canonical_occupancy_data=b'\xff\x64', canonical_cloud_xyz=self.xyz,
                       checkpoint_id='a' * 32, fine_artifact_id='b' * 32, dense_artifact_id='c' * 32)
         assigned, _, _ = store.assign_legacy_cloud_checkpoint(stored, **kwargs)
@@ -312,7 +313,7 @@ class LegacyCloudImportTests(unittest.TestCase):
 
     def test_fine_root_helper_preserves_validator_results_and_error_order(self):
         from services.geometry import fine_map_archive as parser
-        from fine_scalar_oracle import validate_fine_archive as original
+        from tests.fine_scalar_oracle import validate_fine_archive as original
         from tests.test_fine_archive_vector import Borrowed
         def outcome(function, payload):
             try:
@@ -487,7 +488,7 @@ class LegacyCloudImportTests(unittest.TestCase):
         self.prepare();path=self.repository._map_dir('map')/('assigned-id-'+'0'*32);path.mkdir();(path/'bundle.json').write_text('{}')
         self.assertIsNotNone(self.import_current())
 
-    def test_multiple_matching_published_imports_preserve_fallback(self):
+    def test_multiple_matching_published_imports_are_not_selected(self):
         self.prepare();result=self.import_current()
         alternate=self.repository._map_dir('map')/('assigned-id-'+'9'*32)
         shutil.copytree(result.root,alternate)
@@ -502,7 +503,7 @@ class LegacyCloudImportTests(unittest.TestCase):
         self.prepare(dense=False);checkpoint=self.import_current().stored_checkpoint.checkpoint
         self.assertIsNone(checkpoint.dense_archive);self.assertIsNone(checkpoint.dense_reference)
 
-    def test_unsupported_current_without_checkpoint_and_fine_archives_fall_back(self):
+    def test_unsupported_current_is_not_imported(self):
         self.prepare()
         path=self.current/'bundle.json'; document=json.loads(path.read_text()); document['geometry_asset']['metadata']['mapping_backend_checkpoint']['present']=False
         path.write_text(json.dumps(document));top_manifest(self.current)
@@ -512,7 +513,7 @@ class LegacyCloudImportTests(unittest.TestCase):
         checkpoint=json.loads(manifest.read_text());checkpoint['fine_archive']={'historical':'AR1'};manifest.write_bytes(store._encode_json(checkpoint));top_manifest(self.current)
         with patch.object(asset_store.uuid,'uuid4',side_effect=AssertionError('allocation')):self.assertIsNone(self.import_current())
 
-    def test_missing_receipts_and_optional_frame_take_legacy_fallback(self):
+    def test_missing_receipts_and_frame_are_not_imported(self):
         self.prepare();path=self.current/'bundle.json';document=json.loads(path.read_text());document['geometry_asset'].pop('frame_id',None);path.write_text(json.dumps(document));top_manifest(self.current)
         with patch.object(asset_store.uuid,'uuid4',side_effect=AssertionError('allocation')):self.assertIsNone(self.import_current())
         manifest=self.current/document['geometry_asset']['metadata']['mapping_backend_checkpoint']['manifest_path']
@@ -525,9 +526,20 @@ class LegacyCloudImportTests(unittest.TestCase):
         result=self.import_current();self.assertIsNone(result.bundle.metadata['legacy_cloud_import_source']['stored_manifest_alias'])
 
     def service(self):
-        owner=object.__new__(MapWorkspaceService);owner._repository=self.catalog;owner._asset_repository=self.repository
-        owner._state_store=SimpleNamespace(write=Mock(),discard_if_value=Mock());owner._sanitize_map_metadata=lambda value:dict(value or {})
-        owner._require_no_relocalization_recovery=Mock()
+        from contracts.geometry_runtime import PlatformGeometryConfig
+        from core import StateStore
+        from services.geometry.runtime import PlatformGeometryRuntime
+        from services.mapping.service import MappingService
+        from services.localization.service import LocalizationService
+        state = StateStore()
+        runtime = PlatformGeometryRuntime(config=PlatformGeometryConfig(), catalog_root=str(self.root),
+            robot=SimpleNamespace(providers=SimpleNamespace()))
+        owner = MapWorkspaceService(catalog_root=str(self.root), geometry_runtime=runtime,
+            mapping_service=MappingService(provider_owner=SimpleNamespace(), state_store=state),
+            localization_service=LocalizationService(provider_owner=SimpleNamespace(), state_store=state),
+            memory_service=Mock(), navigation_service=Mock(), state_store=state)
+        owner._repository = self.catalog
+        owner._asset_repository = self.repository
         return owner
 
     def test_explicit_activation_adopts_then_releases_executor_before_assigned_dispatch(self):
@@ -542,66 +554,25 @@ class LegacyCloudImportTests(unittest.TestCase):
 
     def restore_service(self):
         owner=self.service();self.catalog.set_active_map_name('map')
-        owner._recover_relocalization_owner_complete_core=Mock(return_value=SimpleNamespace(settled=True))
         owner._arm_map_activation_fence=Mock()
         return owner
 
-    def test_restore_chain_keeps_legacy_dispatch_without_import(self):
-        self.prepare();owner=self.restore_service();before=inventory(self.current)
-        with patch.object(owner,'get_map_asset_bundle',return_value=self.bundle), \
-             patch.object(owner,'_import_legacy_cloud_for_activation',side_effect=AssertionError('startup import')), \
-             patch.object(owner,'_activate_legacy_map',return_value='original legacy boundary') as dispatch:
-            self.assertEqual(owner.restore_active_workspace(load_memory_history=False),'original legacy boundary')
-        self.assertFalse(dispatch.call_args.kwargs['load_memory_history'])
-        self.assertEqual(inventory(self.current),before)
-        self.assertFalse(list(self.repository._map_dir('map').glob('assigned-id-*')))
-        self.assertEqual(self.catalog.get_map_asset('map').identity_schema_version,1)
-
-    def test_restore_stale_retry_keeps_import_disabled_through_real_dispatcher(self):
-        self.prepare();owner=self.restore_service();real_legacy=owner._activate_legacy_map
-        pending=dict(target_map_name='map',target_manifest_sha256=self.bundle.manifest_sha256,
-            activation_request_id='original-request',phase='prepared',load_memory_history=True,previous_map_name='map')
-        owner._geometry_runtime=SimpleNamespace(arm_map_asset_activation_fence=Mock(return_value=True),
-            rotate_map_asset_activation_fence=Mock(return_value=True))
-        owner._should_reuse_completed_activation_request=Mock(return_value=(False,None))
-        owner._activate_map_asset_bundle=Mock(side_effect=RuntimeError('recorded stale backend rejection'))
-        owner._is_stale_backend_activation_request=Mock(return_value=True)
-        seen=[]
-        def legacy(**kwargs):
-            seen.append(kwargs)
-            if kwargs.get('_stale_request_retry_attempted'):
-                return 'retried original legacy boundary'
-            return real_legacy(**kwargs)
-        with patch.object(owner,'get_map_asset_bundle',return_value=self.bundle), \
-             patch.object(owner,'_import_legacy_cloud_for_activation',side_effect=AssertionError('startup retry import')), \
-             patch.object(owner,'_activate_legacy_map',side_effect=legacy), \
-             patch.object(self.catalog,'begin_map_activation',return_value=pending), \
-             patch.object(self.catalog,'update_map_activation_phase',side_effect=lambda phase,**kwargs:dict(pending,phase=phase)), \
-             patch.object(self.catalog,'rotate_map_activation_request_id',return_value=dict(pending,activation_request_id='rotated-request')):
-            self.assertEqual(owner.restore_active_workspace(),'retried original legacy boundary')
-        self.assertEqual(len(seen),2)
-        owner._activate_map_asset_bundle.assert_called_once()
-        owner._geometry_runtime.rotate_map_asset_activation_fence.assert_called_once()
-        self.assertFalse(list(self.repository._map_dir('map').glob('assigned-id-*')))
-
-    def test_ensure_workspace_pending_and_ordinary_paths_do_not_import(self):
+    def test_restore_imports_old_asset_before_assigned_dispatch(self):
         self.prepare()
-        for pending in (None, {'schema_version':1,'target_map_name':'map'}):
-            with self.subTest(pending=pending is not None):
-                owner=self.service()
-                with patch.object(owner,'_read_map_activation',return_value=pending), \
-                     patch.object(owner,'get_active_map_name',return_value=None), \
-                     patch.object(owner,'get_map_asset_bundle',return_value=self.bundle), \
-                     patch.object(owner,'_import_legacy_cloud_for_activation',side_effect=AssertionError('implicit ensure import')), \
-                     patch.object(owner,'_activate_legacy_map',return_value='original ensure boundary') as dispatch:
-                    self.assertEqual(owner.ensure_workspace(map_name='map'),'original ensure boundary')
-                dispatch.assert_called_once()
-                self.assertFalse(list(self.repository._map_dir('map').glob('assigned-id-*')))
+        owner = self.restore_service()
+        before = inventory(self.current)
+        with patch('skills.assigned_map_activation.activate_assigned_workspace', return_value='assigned restored') as dispatch:
+            self.assertEqual(owner.restore_active_workspace(load_memory_history=False), 'assigned restored')
+        self.assertFalse(dispatch.call_args.kwargs['load_memory_history'])
+        self.assertEqual(dispatch.call_args.args[1].identity_schema_version, 2)
+        self.assertEqual(inventory(self.current), before)
+        self.assertEqual(self.catalog.get_map_asset('map').identity_schema_version, 2)
 
-    def test_pending_old_transaction_skips_new_import(self):
-        self.prepare();owner=self.service()
-        with patch.object(self.catalog,'get_map_activation',return_value={'schema_version':1}), patch.object(self.repository,'import_legacy_cloud_bundle',side_effect=AssertionError('new import')):
-            self.assertIsNone(owner._import_legacy_cloud_for_activation('map'))
+
+
+
+
+
 
     def test_catalog_failure_leaves_published_source_for_next_explicit_retry(self):
         self.prepare();owner=self.service()

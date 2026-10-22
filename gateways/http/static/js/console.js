@@ -2041,11 +2041,10 @@
         if (!diagnostics) return false;
         const mapName = String(canonicalMapName || diagnostics.active_map_name || diagnostics.map_name || "").trim();
         if (!mapName) return false;
-        const manifestSha256 = String(diagnostics.asset_manifest_sha256 || "").trim();
         const snapshotKind = String(diagnostics.map_snapshot_kind || "").toLowerCase();
         const sourceKind = String(diagnostics.source_kind || "").toLowerCase();
         return Boolean(
-          manifestSha256 ||
+          diagnostics.asset_identity ||
           snapshotKind === "offline_checkpoint" || snapshotKind === "offline_recording" ||
           sourceKind === "map_asset_bundle" ||
           diagnostics.checkpoint_ready === true ||

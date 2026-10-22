@@ -6,6 +6,7 @@ from typing import Dict, Literal, Optional, Tuple
 
 from pydantic import ConfigDict, Field, field_validator, model_validator
 from contracts.base import ContractModel
+from contracts.map_identity import AssetIdentityV2
 
 
 class FloorPose(ContractModel):
@@ -18,13 +19,13 @@ class FloorPose(ContractModel):
 
 
 class FloorRecord(ContractModel):
-    """建筑内唯一楼层；图摘要为空表示尚未完成该层建图。"""
+    """建筑内唯一楼层；资产身份为空表示尚未完成该层建图。"""
 
     model_config = ConfigDict(frozen=True)
     floor_id: str = Field(min_length=1, max_length=128)
     display_name: str = Field(min_length=1, max_length=128)
     map_name: str = Field(min_length=1, max_length=255)
-    asset_manifest_sha256: Optional[str] = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    asset_identity: Optional[AssetIdentityV2] = None
     enabled: bool = True
 
     @field_validator("floor_id", "display_name", "map_name")
@@ -69,7 +70,7 @@ class BuildingTopology(ContractModel):
     """楼层与连接的一个完整目录修订。"""
 
     model_config = ConfigDict(frozen=True)
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
     building_id: str = Field(min_length=1, max_length=128)
     display_name: str = Field(min_length=1, max_length=128)
     revision: int = Field(ge=1)
@@ -136,7 +137,7 @@ class FloorNavigationRequest(ContractModel):
     source_floor_id: str
     target_floor_id: str
     target_map_name: str
-    target_manifest_sha256: Optional[str] = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    target_asset_identity: Optional[AssetIdentityV2] = None
     create_target_map: bool = False
     target_pose: FloorPose
     route: Tuple[str, ...] = ()
@@ -144,7 +145,7 @@ class FloorNavigationRequest(ContractModel):
 
     @model_validator(mode="after")
     def _target_binding(self) -> "FloorNavigationRequest":
-        if self.create_target_map != (self.target_manifest_sha256 is None):
+        if self.create_target_map != (self.target_asset_identity is None):
             raise ValueError("普通楼层导航必须绑定完整图；新层探索转移必须明确创建新图。")
         return self
 
@@ -152,15 +153,16 @@ class FloorNavigationRequest(ContractModel):
 class FloorExecutionState(ContractModel):
     """跨层流程的持久状态；不确定操作必须经查询收敛。"""
 
+    schema_version: Literal[2] = 2
     request: FloorNavigationRequest
     stage: str = "accepted"
     owner_task_id: Optional[str] = None
     last_pose: Optional[FloorPose] = None
     last_pose_floor_id: Optional[str] = None
-    last_pose_manifest_sha256: Optional[str] = None
+    last_pose_asset_identity: Optional[AssetIdentityV2] = None
     current_floor_id: Optional[str]
     attempt: int = Field(default=0, ge=0)
-    created_map_manifest_sha256: Optional[str] = None
+    created_map_asset_identity: Optional[AssetIdentityV2] = None
     last_zero_proof: dict = Field(default_factory=dict)
     facility_state: Optional[FacilitySnapshot] = None
     connection_index: int = Field(default=0, ge=0)
@@ -226,6 +228,7 @@ class BuildingExplorationRequest(ContractModel):
 class BuildingExplorationState(ContractModel):
     """只持久化编排进度，恢复时重新取得当前运动准入。"""
 
+    schema_version: Literal[2] = 2
     request: BuildingExplorationRequest
     topology_revision: int
     next_floor_index: int = 0

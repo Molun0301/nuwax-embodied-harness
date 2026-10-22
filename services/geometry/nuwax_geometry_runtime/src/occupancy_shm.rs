@@ -1169,7 +1169,7 @@ pub(crate) fn committed_event_for_tests(map: &MapState, session_generation: u64)
         map_name: "occupancy-shm-test-map".into(), session_generation,
         phase: crate::mapping_adapter::MappingSessionPhase::Active,
         revision: map.revision, active: true, idempotent_replay: false,
-        legacy_checkpoint_reconstructed: false, mapping_backend_kind: "voxel".into(),
+         mapping_backend_kind: "voxel".into(),
     };
     let receipt = OccupancyCommitReceipt {
         commit_id: OWNER_CLOCK.with(|clock| clock.borrow_mut().reserve().expect("test owner commit")),

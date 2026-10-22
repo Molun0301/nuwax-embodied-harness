@@ -196,41 +196,6 @@ class SavedDenseCloudCache:
 
     def read(self, source, *, expected_epoch="", offset_points=0):
         from services.geometry.assigned_saved_cloud import AssignedSavedCloudHandle
-        if isinstance(source, AssignedSavedCloudHandle):
-            return self._read_assigned(source, expected_epoch=expected_epoch, offset_points=offset_points)
-        from services.geometry.mapping_backend_checkpoint_store import MappingBackendCheckpointStore
-
-        key = (str(source["bundle_root"]), source["backend_kind"], source["manifest_sha256"],
-               source["frame_id"], source["activation_generation"])
-        with self._lock:
-            if self._closed:
-                raise RuntimeError("完整点云读取已关闭")
-            if key != self._key:
-                self._key = self._payload = self._metadata = self._epoch = self._assigned_source = None
-                stored = MappingBackendCheckpointStore(source["bundle_root"]).load(source["backend_kind"])
-                if stored.manifest_sha256 != source["manifest_sha256"]:
-                    raise ValueError("完整点云检查点与活动资产不一致")
-                payload = stored.checkpoint.dense_archive
-                if payload is None:
-                    raise RuntimeError("当前地图没有完整扫描数据；旧体素地图无法还原全部扫描点")
-                metadata, offset = read_dense_metadata(payload)
-                if metadata["frame_id"] != source["frame_id"]:
-                    raise ValueError("完整点云坐标系与活动资产不一致")
-                self._key, self._payload, self._metadata, self._offset = key, payload, metadata, offset
-                # Historical manifest alias is retained, not recomputed from the body.
-                # The runtime increments this original generation on every installation.
-                self._epoch = "saved-legacy:%s:%s:%s" % (key[1], key[2], key[4])
-            if expected_epoch and expected_epoch != self._epoch:
-                raise RuntimeError("DENSE_CLOUD_SOURCE_CHANGED")
-            metadata = self._metadata
-            if type(offset_points) is not int or not 0 <= offset_points <= metadata["point_count"]:
-                raise ValueError("完整点云分块位置非法")
-            count = min(DENSE_CHUNK_POINTS, metadata["point_count"] - offset_points)
-            start = self._offset + offset_points * 12
-            return {
-                "epoch": self._epoch, "frame_id": metadata["frame_id"], "session_id": metadata["session_id"],
-                "session_generation": str(metadata["session_generation"]), "revision": str(metadata["cloud_revision"]),
-                "source_timestamp_ns": str(metadata["source_timestamp_ns"]), "total_points": str(metadata["point_count"]),
-                "offset_points": str(offset_points), "point_count": count,
-                "bounds_min": metadata["bounds_min"], "bounds_max": metadata["bounds_max"],
-            }, self._payload[start:start + count * 12]
+        if not isinstance(source, AssignedSavedCloudHandle):
+            raise TypeError("完整点云必须绑定当前分配式地图来源")
+        return self._read_assigned(source, expected_epoch=expected_epoch, offset_points=offset_points)

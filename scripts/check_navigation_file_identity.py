@@ -22,6 +22,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from contracts.building_navigation import BuildingTopology, FloorRecord
 from contracts.navigation import ExploreAreaRequest
+from contracts.map_identity import AssetIdentityV2
+from tests.test_assigned_asset_storage import bundle_fixture, stage_fixture
 from gateways import exploration_checkpoint as checkpoint_gateway
 from gateways.exploration_checkpoint import store as checkpoint_store
 from services.mapping.catalog import MapCatalogRepository
@@ -40,14 +42,15 @@ def topology(identity='建筑 A', revision=1):
 def checkpoint(identity='exploration-synthetic'):
     return ExplorationCheckpoint(checkpoint_id=identity, pipeline='lio_3d',
         request=ExploreAreaRequest(request_id='source-request', map_name='合成地图'),
-        asset_manifest_sha256='a' * 64,
+        asset_identity=AssetIdentityV2(asset_id='d'*32), mapping_checkpoint_id='a'*32,
         geometry_progress_json=json.dumps({'schema_version': 1, 'map_name': '合成地图',
             'request_id': 'source-request', 'map_frame_id': 'map',
+            'origin_session_id':'source','origin_session_generation':3,'origin_frame_generation':1,
             'configuration_sha256': [0] * 32, 'navigation_configuration_sha256': [1] * 32}))
 
 
 def native_v2_progress():
-    # The native focused test can supply its exact output for the cross-language run.
+    # 原生专属测试可提供跨语言验证的准确输出。
     produced = os.environ.get('NUWAX_TEST_EXPLORATION_CHECKPOINT_OUTPUT')
     if produced:
         return Path(produced).read_text(encoding='utf-8')
@@ -91,7 +94,14 @@ class FileIdentityChecks(unittest.TestCase):
         self.root = Path(temporary.name)
         self.buildings = BuildingCatalog(MapCatalogRepository(str(self.root)))
         self.checkpoints = ExplorationCheckpointStore(self.root)
-        self.checkpoints.validate_asset = Mock()
+        # 本脚本隔离文件寻址与发布并发；真实资产准入由专属检查点测试覆盖。
+        bundle=bundle_fixture();stage=stage_fixture(self.checkpoints.assets)
+        self.checkpoints.assets.finalize_assigned_map_asset_bundle(bundle,staging_dir=stage,asset_identity=bundle.asset_identity)
+        self.asset_snapshot=self.checkpoints.assets.get_validated_map_asset_bundle_snapshot(bundle.map_name)
+        self.checkpoints.validate_asset = Mock(return_value=self.asset_snapshot)
+        guard=ExitStack();self.addCleanup(guard.close)
+        guard.enter_context(patch.object(ExplorationCheckpointStore,'_validate_catalog_identity'))
+        guard.enter_context(patch('services.mapping.asset_store.MapAssetBundleRepository.map_asset_bundle_snapshot_is_current',return_value=True))
 
     def legacy(self, value, number=1):
         directory = self.buildings.root if isinstance(value, BuildingTopology) else self.checkpoints.root
@@ -153,14 +163,14 @@ class FileIdentityChecks(unittest.TestCase):
         self.assertEqual(set(envelope), {'schema_version', 'payload'})
         self.assertEqual(envelope['schema_version'], 2)
         self.assertEqual(self.checkpoints.load('new').geometry_progress_json, new.geometry_progress_json)
-        self.assertEqual(self.checkpoints.load('new').asset_manifest_sha256, new.asset_manifest_sha256)
+        self.assertEqual(self.checkpoints.load('new').asset_identity, new.asset_identity)
         with self.assertRaises(ValueError):
-            self.checkpoints.save(old.model_copy(update={'asset_manifest_sha256': 'b' * 64}))
+            self.checkpoints.save(old.model_copy(update={'asset_identity': AssetIdentityV2(asset_id='b'*32)}))
         self.assertGreaterEqual(self.checkpoints.validate_asset.call_count, 4)
 
     def native_checkpoint(self, progress, identity='native-v2'):
         native = json.loads(progress)
-        return ExplorationCheckpoint(checkpoint_id=identity, pipeline='lio_3d', asset_manifest_sha256='a' * 64,
+        return ExplorationCheckpoint(checkpoint_id=identity, pipeline='lio_3d', asset_identity=AssetIdentityV2(asset_id='d'*32), mapping_checkpoint_id='a'*32,
             request=ExploreAreaRequest(request_id=native['request_id'], map_name=native['map_name']),
             geometry_progress_json=progress)
 
@@ -173,7 +183,7 @@ class FileIdentityChecks(unittest.TestCase):
                 update_task_metadata=Mock()),
             platform_geometry_runtime=SimpleNamespace(get_exploration_progress=Mock(side_effect=[before, after]),
                 providers=SimpleNamespace(get_exploration_pose=Mock(return_value=None))),
-            _finalize_workspace_assets_after_task=Mock(return_value={'finalized_map_asset': SimpleNamespace(manifest_sha256='a' * 64)}),
+            _finalize_workspace_assets_after_task=Mock(return_value={'finalized_map_asset': SimpleNamespace(identity_schema_version=2, asset_identity=AssetIdentityV2(asset_id='d'*32), geometry_asset=SimpleNamespace(metadata={'mapping_backend_checkpoint':{'checkpoint_id':'a'*32}}))}),
         )
         return runtime, SimpleNamespace(task_id='offline-pause'), request
 
@@ -190,18 +200,6 @@ class FileIdentityChecks(unittest.TestCase):
         self.checkpoints.save(reopened)
         self.assertEqual(path.read_bytes(), before)
         self.assertEqual(json.loads(before)['schema_version'], 2)
-        resumed = reopened.request.model_copy(update={'resume_progress_json': reopened.geometry_progress_json})
-        workspace = SimpleNamespace(active_map_name=resumed.map_name, map_asset=SimpleNamespace(asset_manifest_sha256='a' * 64))
-        runtime = SimpleNamespace(config=SimpleNamespace(geometry=SimpleNamespace(pipeline='lio_3d')),
-            map_workspace_service=SimpleNamespace(activate_map=Mock(),
-                relocalize_active_map=Mock(return_value=(SimpleNamespace(status='ready'), workspace))))
-        context = SimpleNamespace(ensure_active=Mock(), update=Mock(), timeout_remaining_sec=Mock(return_value=30.0))
-        with patch.object(checkpoint_gateway, 'store', return_value=self.checkpoints):
-            checkpoint_gateway.prepare_resume(runtime, context, resumed, reopened.checkpoint_id, 'offline-test')
-        self.assertEqual(resumed.resume_progress_json, progress)
-        self.assertEqual(path.read_bytes(), before)
-        runtime.map_workspace_service.activate_map.assert_called_once()
-        runtime.map_workspace_service.relocalize_active_map.assert_called_once()
 
     def test_native_progress_version_requires_supported_integer_without_rewriting_payload(self):
         native = json.loads(native_v2_progress())
@@ -527,9 +525,9 @@ class FileIdentityChecks(unittest.TestCase):
             except ValueError: return False
         with ThreadPoolExecutor(max_workers=2) as pool:
             self.assertEqual(sorted(pool.map(save_building, range(2))), [False, True])
-        first = checkpoint('same'); second = first.model_copy(update={'asset_manifest_sha256': 'b' * 64})
+        first = checkpoint('same'); second = first.model_copy(update={'asset_identity': AssetIdentityV2(asset_id='b'*32)})
         def save_checkpoint(value):
-            store = ExplorationCheckpointStore(self.root); store.validate_asset = Mock()
+            store = ExplorationCheckpointStore(self.root); store.validate_asset = Mock(return_value=self.asset_snapshot)
             try: store.save(value); return True
             except ValueError: return False
         with ThreadPoolExecutor(max_workers=2) as pool:
@@ -539,7 +537,7 @@ class FileIdentityChecks(unittest.TestCase):
         runtime = SimpleNamespace(config=SimpleNamespace(runtime_data=SimpleNamespace(map_catalog_root=str(self.root))),
             _lifecycle_lock=threading.RLock())
         def stopping_task():
-            store = checkpoint_store(runtime); store.validate_asset = Mock(); store.save(checkpoint('during-stop'))
+            store = checkpoint_store(runtime); store.validate_asset = Mock(return_value=self.asset_snapshot); store.save(checkpoint('during-stop'))
             return store.load('during-stop').checkpoint_id
         with ThreadPoolExecutor(max_workers=1) as pool:
             with runtime._lifecycle_lock:

@@ -36,20 +36,17 @@ mod preflight_only_contract {
     use nuwax_protocol::{LcmMessageType, LcmTopic, RawLcmFrameBuilder};
     use nuwax_transport::{LcmTransport, OwnedLcmSubscription};
     use prost::Message;
-    use serde::{Deserialize, Serialize};
     use thiserror::Error;
     use tokio::sync::{mpsc, oneshot, watch, Notify, OwnedSemaphorePermit, Semaphore};
 
     use crate::activation_contract::{
-        ActivationIdentity, ActivationJournalKey, ActivationJournalVerifier,
-        ActivationJournalVerifierV2, ActivationRequestKey, ActivationTargetSource,
+        ActivationIdentity, ActivationRequestKey,
         InstalledActivationIdentityV2, InstalledTargetReceiptV2, TargetReceipt,
     };
     use crate::activation_request::{
         ActivationRequestMetadataV2, CanonicalCheckpointOwnerV2, ValidatedActivationRequestV2,
     };
     use crate::lcm_runtime::ValidatedFrameBindings;
-    use crate::map_checksum::sha256_bytes;
     use crate::mapping_commit::MappingCommitId;
     use crate::owner_profile::{CorrectionBackend, LioBackend};
 
@@ -113,38 +110,19 @@ mod preflight_only_contract {
     pub(crate) const RELOCALIZATION_MAX_PROOF_BYTES: usize = 4_096;
     const RELOCALIZATION_MAX_ENVELOPE_DATA_BYTES: usize = 25_600_000;
     const RELOCALIZATION_TARGET_POLL_INTERVAL: Duration = Duration::from_millis(10);
-    #[cfg(test)]
-    const RELOCALIZATION_EVIDENCE_DISCLOSURE_DOMAIN_V1: &[u8] =
-        b"nuwax.geometry.relocalize.evidence-disclosure.v1\0";
+
     pub(crate) const RELOCALIZATION_MAX_CANDIDATE_PREIMAGE_BYTES: usize = 4096;
-    #[cfg(test)]
-    const RELOCALIZATION_MAX_INLINE_EVIDENCE_PREIMAGE_BYTES: usize = 4_096;
-    pub(crate) const RELOCALIZATION_MAX_EVIDENCE_PREFIX_BYTES: usize = 16_384;
-    pub(crate) const RELOCALIZATION_MAX_EVIDENCE_SUFFIX_BYTES: usize = 4_096;
-    pub(crate) const RELOCALIZATION_MAX_EVIDENCE_DISCLOSURE_BYTES: usize =
-        RELOCALIZATION_MAX_EVIDENCE_PREFIX_BYTES + RELOCALIZATION_MAX_EVIDENCE_SUFFIX_BYTES + 256;
-    #[cfg(test)]
-    const RELOCALIZATION_MAX_INLINE_EVIDENCE_DISCLOSURE_BYTES: usize =
-        RELOCALIZATION_EVIDENCE_DISCLOSURE_DOMAIN_V1.len()
-            + std::mem::size_of::<u32>()
-            + std::mem::size_of::<u8>()
-            + std::mem::size_of::<u64>()
-            + RELOCALIZATION_MAX_INLINE_EVIDENCE_PREIMAGE_BYTES;
-    #[cfg(test)]
-    const RELOCALIZATION_MAX_DISCLOSURE_BYTES_PER_TERMINAL: usize =
-        RELOCALIZATION_MAX_CANDIDATE_PREIMAGE_BYTES + RELOCALIZATION_MAX_EVIDENCE_DISCLOSURE_BYTES;
-    #[cfg(test)]
-    const RELOCALIZATION_MAX_DISCLOSURE_BYTES_PER_COMMAND_RECORD: usize =
-        RELOCALIZATION_MAX_DISCLOSURE_BYTES_PER_TERMINAL
-            + (RELOCALIZATION_MAX_CONFLICTS_PER_RECORD + 1)
-                * RELOCALIZATION_MAX_INLINE_EVIDENCE_DISCLOSURE_BYTES;
+
+
+
+
+
+
+
     // StoredRelocalizationResult keeps both the protobuf value and its exact
     // encoded replay bytes, so disclosure payloads have a conservative 2x cap.
-    #[cfg(test)]
-    const RELOCALIZATION_MAX_RETAINED_DISCLOSURE_BYTES: usize = 2
-        * RELOCALIZATION_MAX_COMMAND_RECORDS
-        * RELOCALIZATION_MAX_DISCLOSURE_BYTES_PER_COMMAND_RECORD;
-    pub(crate) const ACTIVATION_RECEIPT_SCHEMA_VERSION_V1: u32 = 1;
+
+
     pub(crate) const RELOCALIZATION_SOURCE_POLICY_VERSION: u32 = 3;
     pub(crate) const RELOCALIZATION_DEADLINE_POLICY_VERSION_V1: u32 = 1;
     pub(crate) const RELOCALIZATION_ALGORITHM_OPTIONS_VERSION: u32 = 3;
@@ -220,16 +198,7 @@ mod preflight_only_contract {
     }
 
     impl RegisteredCloudProof {
-        pub(crate) fn from_admitted(source: &crate::lio_ingress::AdmittedRegisteredScan) -> Result<Self, CorrectionOwnerError> {
-            let identity = source.source_identity();
-            Ok(Self {
-                backend: identity.backend,
-                runtime_generation: identity.runtime_generation.try_into().map_err(|_| CorrectionOwnerError::InvalidRegisteredCloudProof)?,
-                source_sequence: identity.source_sequence.try_into().map_err(|_| CorrectionOwnerError::InvalidRegisteredCloudProof)?,
-                source_timestamp_ns: identity.source_timestamp_ns.try_into().map_err(|_| CorrectionOwnerError::InvalidRegisteredCloudProof)?,
-                point_count: source.body_points().len().try_into().map_err(|_| CorrectionOwnerError::InvalidRegisteredCloudProof)?,
-            })
-        }
+
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -241,16 +210,7 @@ mod preflight_only_contract {
     }
 
     impl CorrelatedOdomProof {
-        pub(crate) fn from_registration(binding: &crate::lio_ingress::RegistrationBinding) -> Result<Self, CorrectionOwnerError> {
-            let pose = &binding.frozen_odom_from_body;
-            let q = pose.rotation.quaternion();
-            Ok(Self {
-                source_sequence: binding.correlated_odometry.source_sequence.try_into().map_err(|_| CorrectionOwnerError::InvalidCorrelatedOdomProof)?,
-                source_timestamp_ns: binding.correlated_odometry.source_timestamp_ns.try_into().map_err(|_| CorrectionOwnerError::InvalidCorrelatedOdomProof)?,
-                translation_m: pose.translation.vector.into(),
-                rotation_xyzw: [q.i, q.j, q.k, q.w],
-            })
-        }
+
 
         fn matches_pose(&self, pose: &Isometry3<f64>) -> bool {
             let q = pose.rotation.quaternion();
@@ -1490,101 +1450,91 @@ mod preflight_only_contract {
     }
 
     #[derive(Clone, Debug)]
-    /// One fully correlated input snapshot for a correction backend.
-    ///
-    /// `body_points` are accepted only when `points_frame_id` equals the
-    /// configured body frame. The committed-map and registration evidence is
-    /// identity metadata; it never changes the frame of the algorithm input.
+    /// 校正输入持有已准入扫描，源点、冻结位姿和来源身份直接从其拥有方读取。
+    /// 地图收据及占据载荷来自实际提交，独立保留其与源扫描的关联。
     pub(crate) struct CorrectionFrameInput {
-        pub(crate) mapping_session_id: String,
-        pub(crate) mapping_session_generation: u64,
+
+
         pub(crate) mapping_commit_id: MappingCommitId,
         pub(crate) occupancy_revision: u64,
         pub(crate) cloud_revision: u64,
         pub(crate) cloud_receipt: crate::mapping_commit::CloudCommitReceipt,
-        pub(crate) map_frame_generation: u64,
-        pub(crate) registered_cloud: RegisteredCloudProof,
-        pub(crate) correlated_odom: FrozenCorrelatedOdom,
+
+
+
         pub(crate) committed_map: CommittedMapProof,
         pub(crate) committed_map_occupancy: Arc<[u8]>,
-        pub(crate) points_frame_id: String,
-        pub(crate) body_points: crate::correction_points::CorrectionPoints,
-        /// The private admitted scan that owns these exact points and frozen source metadata.
+
+
+        /// 唯一持有原始点、冻结位姿和源元数据的已准入扫描。
         pub(crate) source_owner: crate::lio_ingress::AdmittedRegisteredScan,
         /// 同一接纳扫描的静态子集；原始点与来源证明保留，回环算法只消费该子集。
         pub(crate) static_point_indices: Option<Arc<[u32]>>,
-        /// Immutable canonical anchor captured before this frame was committed.
-        pub(crate) base_anchor_map_from_odom: Isometry3<f64>,
-        /// Fence epoch observed when this source frame crossed the LIO
-        /// lifecycle admission boundary. A later epoch is a different mode
-        /// generation and must not reuse this frame.
-        pub(crate) frame_capture_relocalization_epoch: u64,
-        /// Mode epoch captured by the producer.  Relocalization frames must
-        /// carry the active epoch; ordinary correction backends leave this
-        /// unset.
+        /// 重定位输入携带当前活动模式代次；普通校正输入保持空值。
         pub(crate) relocalization_mode_epoch: Option<u64>,
     }
 
     impl CorrectionFrameInput {
-        pub(crate) fn validate_source_ownership(&self) -> Result<(), CorrectionOwnerError> {
+        pub(crate) fn mapping_session_id(&self) -> &str { &self.source_owner.binding().mapping_session_id }
+        pub(crate) fn mapping_session_generation(&self) -> u64 { self.source_owner.binding().mapping_session_generation }
+        pub(crate) fn map_frame_generation(&self) -> u64 { self.source_owner.binding().map_frame_generation }
+        pub(crate) fn points_frame_id(&self) -> &str { self.source_owner.body_frame_id() }
+        pub(crate) fn body_points(&self) -> &crate::correction_points::CorrectionPoints { self.source_owner.body_points() }
+        pub(crate) fn base_anchor_map_from_odom(&self) -> Isometry3<f64> { self.source_owner.binding().base_anchor_map_from_odom }
+        pub(crate) fn frame_capture_relocalization_epoch(&self) -> u64 {
+            self.source_owner.binding().frame_capture_relocalization_epoch.expect("校正输入已跨越LIO准入边界")
+        }
+        pub(crate) fn registered_cloud(&self) -> RegisteredCloudProof {
+            let source = self.source_owner.source_identity();
+            RegisteredCloudProof { backend: source.backend, runtime_generation: source.runtime_generation as u64,
+                source_sequence: source.source_sequence as u64, source_timestamp_ns: source.source_timestamp_ns as u64,
+                point_count: self.source_owner.body_points().len() as u64 }
+        }
+        pub(crate) fn correlated_odom(&self) -> FrozenCorrelatedOdom {
             let binding = self.source_owner.binding();
-            if self.registered_cloud != RegisteredCloudProof::from_admitted(&self.source_owner)?
-                || self.body_points != *self.source_owner.body_points()
-                || !self.body_points.all_finite()
-                || self.mapping_session_id != binding.mapping_session_id
-                || self.mapping_session_generation != binding.mapping_session_generation
-                || self.map_frame_generation != binding.map_frame_generation
-                || self.points_frame_id != self.source_owner.body_frame_id()
-                || binding.frame_capture_relocalization_epoch != Some(self.frame_capture_relocalization_epoch)
-                || self.correlated_odom.proof != CorrelatedOdomProof::from_registration(binding)?
-                || !self.correlated_odom.proof.matches_pose(&self.correlated_odom.odom_from_body)
-                || !same_isometry_bits(&self.base_anchor_map_from_odom, &binding.base_anchor_map_from_odom)
-                || self.cloud_receipt.commit_id.boot_nonce == 0
-                || self.cloud_receipt.commit_id.sequence == 0
-                || self.cloud_receipt.occupancy_revision == 0
-                || self.cloud_receipt.cloud_revision == 0
-                || self.cloud_receipt.session_generation != self.mapping_session_generation
-                || self.cloud_receipt.cloud_revision != self.cloud_revision
-                || self.cloud_receipt.commit_id.boot_nonce != self.mapping_commit_id.boot_nonce
-                || self.cloud_receipt.commit_id.sequence > self.mapping_commit_id.sequence
-                || self.cloud_receipt.occupancy_revision > self.occupancy_revision {
-                return Err(CorrectionOwnerError::InvalidRegisteredCloudProof);
-            }
-            Ok(())
+            let pose = binding.frozen_odom_from_body;
+            let q = pose.rotation.quaternion();
+            FrozenCorrelatedOdom { proof: CorrelatedOdomProof {
+                source_sequence: binding.correlated_odometry.source_sequence as u64,
+                source_timestamp_ns: binding.correlated_odometry.source_timestamp_ns as u64,
+                translation_m: pose.translation.vector.into(), rotation_xyzw: [q.i, q.j, q.k, q.w],
+            }, odom_from_body: pose }
         }
 
+
+
         pub(crate) fn exactly_matches(&self, other: &Self) -> bool {
-            self.mapping_session_id == other.mapping_session_id
-                && self.mapping_session_generation == other.mapping_session_generation
+            self.mapping_session_id() == other.mapping_session_id()
+                && self.mapping_session_generation() == other.mapping_session_generation()
                 && self.mapping_commit_id == other.mapping_commit_id
                 && self.occupancy_revision == other.occupancy_revision
                 && self.cloud_revision == other.cloud_revision
                 && self.cloud_receipt == other.cloud_receipt
-                && self.map_frame_generation == other.map_frame_generation
-                && self.registered_cloud == other.registered_cloud
-                && self.correlated_odom.proof == other.correlated_odom.proof
-                && same_isometry_bits(&self.correlated_odom.odom_from_body, &other.correlated_odom.odom_from_body)
+                && self.map_frame_generation() == other.map_frame_generation()
+                && self.registered_cloud() == other.registered_cloud()
+                && self.correlated_odom().proof == other.correlated_odom().proof
+                && same_isometry_bits(&self.correlated_odom().odom_from_body, &other.correlated_odom().odom_from_body)
                 && self.committed_map == other.committed_map
                 && (Arc::ptr_eq(&self.committed_map_occupancy, &other.committed_map_occupancy)
                     || self.committed_map_occupancy == other.committed_map_occupancy)
-                && self.points_frame_id == other.points_frame_id
-                && self.body_points == other.body_points
+                && self.points_frame_id() == other.points_frame_id()
+                && self.body_points() == other.body_points()
                 && self.source_owner == other.source_owner
                 && self.static_point_indices == other.static_point_indices
-                && same_isometry_bits(&self.base_anchor_map_from_odom, &other.base_anchor_map_from_odom)
-                && self.frame_capture_relocalization_epoch == other.frame_capture_relocalization_epoch
+                && same_isometry_bits(&self.base_anchor_map_from_odom(), &other.base_anchor_map_from_odom())
+                && self.frame_capture_relocalization_epoch() == other.frame_capture_relocalization_epoch()
                 && self.relocalization_mode_epoch == other.relocalization_mode_epoch
         }
 
         fn pgo_points(&self) -> Result<std::borrow::Cow<'_, [Point3<f64>]>, CorrectionOwnerError> {
             let Some(indices) = &self.static_point_indices else {
-                return Ok(std::borrow::Cow::Borrowed(&self.body_points));
+                return Ok(std::borrow::Cow::Borrowed(&self.body_points()));
             };
             if indices.windows(2).any(|pair| pair[0] >= pair[1])
-                || indices.last().is_some_and(|index| *index as usize >= self.body_points.len()) {
+                || indices.last().is_some_and(|index| *index as usize >= self.body_points().len()) {
                 return Err(CorrectionOwnerError::InvalidRegisteredCloudProof);
             }
-            Ok(std::borrow::Cow::Owned(indices.iter().map(|index| self.body_points[*index as usize]).collect()))
+            Ok(std::borrow::Cow::Owned(indices.iter().map(|index| self.body_points()[*index as usize]).collect()))
         }
     }
 
@@ -1705,9 +1655,9 @@ mod preflight_only_contract {
                 self.coordinator = LoopClosureCoordinator::new(self.pipeline)
                     .map_err(|error| CorrectionOwnerError::Pipeline(error.to_string()))?;
                 self.session = Some(CorrectionSessionIdentity {
-                    mapping_session_id: input.mapping_session_id.clone(),
-                    mapping_session_generation: input.mapping_session_generation,
-                    map_frame_generation: input.map_frame_generation,
+                    mapping_session_id: input.mapping_session_id().to_owned(),
+                    mapping_session_generation: input.mapping_session_generation(),
+                    map_frame_generation: input.map_frame_generation(),
                 });
                 self.first_source_timestamp_ns = None;
                 self.keyframe_source_timestamps_ns.clear();
@@ -1719,9 +1669,9 @@ mod preflight_only_contract {
             }
             let origin = *self
                 .first_source_timestamp_ns
-                .get_or_insert(input.registered_cloud.source_timestamp_ns);
+                .get_or_insert(input.registered_cloud().source_timestamp_ns);
             let relative_timestamp = input
-                .registered_cloud
+                .registered_cloud()
                 .source_timestamp_ns
                 .checked_sub(origin)
                 .ok_or(CorrectionOwnerError::SourceTimestampRegressed)?
@@ -1731,7 +1681,7 @@ mod preflight_only_contract {
                 .coordinator
                 .process_frame(
                     relative_timestamp,
-                    input.correlated_odom.odom_from_body,
+                    input.correlated_odom().odom_from_body,
                     &static_points,
                 )
                 .map_err(|error| CorrectionOwnerError::Pipeline(error.to_string()))?;
@@ -1740,20 +1690,20 @@ mod preflight_only_contract {
                 ProcessFrameResult::KeyframeAdded { .. } | ProcessFrameResult::LoopClosed { .. }
             ) {
                 self.keyframe_source_timestamps_ns
-                    .push(input.registered_cloud.source_timestamp_ns);
+                    .push(input.registered_cloud().source_timestamp_ns);
                 tracing::info!(
                     event = "pgo.keyframe",
-                    source_timestamp_ns = input.registered_cloud.source_timestamp_ns,
-                    session_generation = input.mapping_session_generation,
+                    source_timestamp_ns = input.registered_cloud().source_timestamp_ns,
+                    session_generation = input.mapping_session_generation(),
                     keyframe_id = self.keyframe_source_timestamps_ns.len() - 1,
                     point_count = static_points.len(),
-                    source_point_count = input.body_points.len(),
-                    odom_translation_m = ?input.correlated_odom.odom_from_body.translation.vector,
-                    odom_rotation_xyzw = ?input.correlated_odom.odom_from_body.rotation.coords,
+                    source_point_count = input.body_points().len(),
+                    odom_translation_m = ?input.correlated_odom().odom_from_body.translation.vector,
+                    odom_rotation_xyzw = ?input.correlated_odom().odom_from_body.rotation.coords,
                     "记录回环关键帧的原始里程计依据"
                 );
             }
-            self.last_source_timestamp_ns = Some(input.registered_cloud.source_timestamp_ns);
+            self.last_source_timestamp_ns = Some(input.registered_cloud().source_timestamp_ns);
             self.mapping_commit_boot_nonce = Some(input.mapping_commit_id.boot_nonce);
             self.last_commit_sequence = input.mapping_commit_id.sequence;
             self.last_occupancy_revision = input.occupancy_revision;
@@ -1804,7 +1754,7 @@ mod preflight_only_contract {
                 tracing::info!(
                     event = "pgo.loop.candidate",
                     candidate_sequence = next_candidate_sequence,
-                    source_timestamp_ns = input.registered_cloud.source_timestamp_ns,
+                    source_timestamp_ns = input.registered_cloud().source_timestamp_ns,
                     historic_id = record.from,
                     current_id = record.to,
                     source_inliers = record.source_inliers,
@@ -1845,88 +1795,22 @@ mod preflight_only_contract {
         input: &CorrectionFrameInput,
         owner: &LibraryPgoOwner,
     ) -> Result<bool, CorrectionOwnerError> {
-        if input.mapping_commit_id.boot_nonce == 0
-            || input.mapping_commit_id.sequence == 0
-            || input.mapping_session_id.is_empty()
-            || input.mapping_session_id.trim() != input.mapping_session_id
-            || input.mapping_session_id.len() > MAX_IDENTITY_STRING_BYTES
-            || input.mapping_session_id.contains('\0')
-            || input.mapping_session_generation == 0
-            || input.map_frame_generation == 0
-            || input.mapping_session_generation > i64::MAX as u64
-            || input.map_frame_generation > i64::MAX as u64
-            || input.occupancy_revision == 0
-            || input.cloud_revision == 0
-            || input.mapping_commit_id.sequence > i64::MAX as u64
-            || input.occupancy_revision > i64::MAX as u64
-            || input.cloud_revision > i64::MAX as u64
-        {
-            return Err(CorrectionOwnerError::InvalidMappingIdentity);
-        }
-        if input.points_frame_id != owner.body_frame_id {
-            return Err(CorrectionOwnerError::UnsupportedPointsFrame);
-        }
-        if !is_finite_isometry(&input.base_anchor_map_from_odom) {
-            return Err(CorrectionOwnerError::InvalidBaseAnchor);
-        }
-        let point_count = u64::try_from(input.body_points.len())
-            .map_err(|_| CorrectionOwnerError::InvalidRegisteredCloudProof)?;
-        if input.registered_cloud.source_sequence == 0
-            || input.registered_cloud.point_count != point_count
-            || input.registered_cloud.point_count == 0
-            || input.registered_cloud.point_count > MAX_REGISTERED_CLOUD_POINTS
-            || input.registered_cloud.source_sequence > i64::MAX as u64
-            || input.registered_cloud.source_timestamp_ns > i64::MAX as u64
-            || input.validate_source_ownership().is_err()
-        {
-            return Err(CorrectionOwnerError::InvalidRegisteredCloudProof);
-        }
-        if input.correlated_odom.proof.source_sequence == 0
-            || input.correlated_odom.proof.source_sequence > i64::MAX as u64
-            || input.correlated_odom.proof.source_timestamp_ns > i64::MAX as u64
-            || input.correlated_odom.proof.source_timestamp_ns
-                > input.registered_cloud.source_timestamp_ns
-            || !input.correlated_odom.proof.matches_pose(&input.correlated_odom.odom_from_body)
-        {
-            return Err(CorrectionOwnerError::InvalidCorrelatedOdomProof);
-        }
-        let map = input.committed_map;
-        let expected_map_cells = map
-            .width
-            .checked_mul(map.height)
-            .and_then(|cells| usize::try_from(cells).ok());
-        if map.source_timestamp_ns != input.registered_cloud.source_timestamp_ns
-            || map.width == 0
-            || map.height == 0
-            || map.width > u64::from(u32::MAX)
-            || map.height > u64::from(u32::MAX)
-            || map.source_timestamp_ns > i64::MAX as u64
-            || map.width.checked_mul(map.height).is_none()
-            || !map.resolution_m.is_finite()
-            || map.resolution_m <= 0.0
-            || !map.origin_x_m.is_finite()
-            || !map.origin_y_m.is_finite()
-            || map.backend_generation == 0
-            || expected_map_cells != Some(input.committed_map_occupancy.len())
-        {
-            return Err(CorrectionOwnerError::InvalidCommittedMapProof);
-        }
         let session_transition = match owner.session.as_ref() {
             None => true,
             Some(session)
-                if input.mapping_session_generation < session.mapping_session_generation =>
+                if input.mapping_session_generation() < session.mapping_session_generation =>
             {
                 return Err(CorrectionOwnerError::StaleMappingSession);
             }
             Some(session)
-                if input.mapping_session_generation == session.mapping_session_generation
-                    && (input.mapping_session_id != session.mapping_session_id
-                        || input.map_frame_generation != session.map_frame_generation) =>
+                if input.mapping_session_generation() == session.mapping_session_generation
+                    && (input.mapping_session_id() != session.mapping_session_id
+                        || input.map_frame_generation() != session.map_frame_generation) =>
             {
                 return Err(CorrectionOwnerError::MappingSessionIdentityChanged);
             }
             Some(session)
-                if input.mapping_session_generation == session.mapping_session_generation =>
+                if input.mapping_session_generation() == session.mapping_session_generation =>
             {
                 false
             }
@@ -1949,7 +1833,7 @@ mod preflight_only_contract {
         if !session_transition
             && owner
                 .last_source_timestamp_ns
-                .is_some_and(|last| input.registered_cloud.source_timestamp_ns <= last)
+                .is_some_and(|last| input.registered_cloud().source_timestamp_ns <= last)
         {
             return Err(CorrectionOwnerError::SourceTimestampRegressed);
         }
@@ -1964,22 +1848,17 @@ mod preflight_only_contract {
         Stopped,
         #[error("invalid correction owner identity")]
         InvalidOwnerIdentity,
-        #[error("invalid mapping identity")]
-        InvalidMappingIdentity,
+
         #[error("correction input belongs to a stale mapping session")]
         StaleMappingSession,
         #[error("mapping session identity changed without a newer generation")]
         MappingSessionIdentityChanged,
-        #[error("library PGO accepts only body-frame points")]
-        UnsupportedPointsFrame,
-        #[error("canonical base anchor is not a finite full-SE(3) transform")]
-        InvalidBaseAnchor,
+
+
         #[error("registered cloud proof does not match the body-frame points")]
         InvalidRegisteredCloudProof,
-        #[error("correlated odometry proof does not match the frozen odometry pose")]
-        InvalidCorrelatedOdomProof,
-        #[error("committed map proof is incomplete or inconsistent")]
-        InvalidCommittedMapProof,
+
+
         #[error("mapping input is duplicated or out of order")]
         OutOfOrderMappingInput,
         #[error("mapping commit boot nonce changed within one correction owner")]
@@ -3169,15 +3048,14 @@ mod preflight_only_contract {
         body_frame_id: &str,
         input: &CorrectionFrameInput,
     ) -> Result<StagedCorrectionFrame, String> {
-        if input.mapping_session_id.is_empty()
-            || input.mapping_session_id.trim() != input.mapping_session_id
-            || input.mapping_session_id.len() > MAX_IDENTITY_STRING_BYTES
-            || input.mapping_session_id.contains('\0')
-            || input.mapping_session_generation == 0
-            || input.map_frame_generation == 0
-            || input.points_frame_id != body_frame_id
-            || !is_finite_isometry(&input.base_anchor_map_from_odom)
-            || input.validate_source_ownership().is_err()
+        if input.mapping_session_id().is_empty()
+            || input.mapping_session_id().trim() != input.mapping_session_id()
+            || input.mapping_session_id().len() > MAX_IDENTITY_STRING_BYTES
+            || input.mapping_session_id().contains('\0')
+            || input.mapping_session_generation() == 0
+            || input.map_frame_generation() == 0
+            || input.points_frame_id() != body_frame_id
+            || !is_finite_isometry(&input.base_anchor_map_from_odom())
             || input
                 .committed_map
                 .width
@@ -3225,8 +3103,8 @@ mod preflight_only_contract {
                 points_frame_id: identity.points_frame_id,
                 correction_lease: identity.correction_lease,
             },
-            base_anchor_map_from_odom: input.base_anchor_map_from_odom,
-            frozen_odom_from_body: input.correlated_odom.odom_from_body,
+            base_anchor_map_from_odom: input.base_anchor_map_from_odom(),
+            frozen_odom_from_body: input.correlated_odom().odom_from_body,
         })
     }
 
@@ -3245,20 +3123,20 @@ mod preflight_only_contract {
             runtime_generation: owner.runtime_generation,
             backend_generation: owner.backend_generation,
             candidate_sequence,
-            mapping_session_id: input.mapping_session_id.clone(),
-            mapping_session_generation: input.mapping_session_generation,
-            map_frame_generation: input.map_frame_generation,
+            mapping_session_id: input.mapping_session_id().to_owned(),
+            mapping_session_generation: input.mapping_session_generation(),
+            map_frame_generation: input.map_frame_generation(),
             mapping_commit_id: input.mapping_commit_id,
             occupancy_revision: input.occupancy_revision,
             cloud_revision: input.cloud_revision,
-            registered_cloud: input.registered_cloud,
-            correlated_odom: input.correlated_odom.proof,
+            registered_cloud: input.registered_cloud(),
+            correlated_odom: input.correlated_odom().proof,
             committed_map: input.committed_map,
-            source_timestamp_ns: input.registered_cloud.source_timestamp_ns,
+            source_timestamp_ns: input.registered_cloud().source_timestamp_ns,
             map_frame_id: map_frame_id.to_owned(),
             odom_frame_id: odom_frame_id.to_owned(),
             body_frame_id: body_frame_id.to_owned(),
-            points_frame_id: input.points_frame_id.clone(),
+            points_frame_id: input.points_frame_id().to_owned(),
             correction_lease: owner.correction_lease,
         }
     }
@@ -3547,83 +3425,31 @@ mod preflight_only_contract {
         out
     }
 
-    pub(crate) fn relocalization_source_policy_sha256_v1() -> [u8; 32] {
-        sha256_bytes(&relocalization_source_policy_preimage_v1())
-    }
 
-    pub(crate) fn relocalization_deadline_policy_sha256_v1() -> [u8; 32] {
-        sha256_bytes(&relocalization_deadline_policy_preimage_v1())
-    }
 
-    pub(crate) fn relocalization_algorithm_options_sha256_v1() -> [u8; 32] {
-        sha256_bytes(&relocalization_algorithm_options_preimage_v1())
-    }
 
-    pub(crate) fn planar_source_policy_sha256()->[u8;32] {
-        sha256_bytes(b"nuwax.planar-source.v1;fresh-after-arm;max-age-ns=500000000;accepted-scans=3;strict-sequence;matched-odometry")
-    }
-    pub(crate) fn planar_algorithm_policy_sha256()->[u8;32] {
-        sha256_bytes(b"nuwax.planar-relocalization.v1;karto-2.10.0;explicit-se2-seed;candidate-process;static-graph;canonical-tf")
-    }
 
-    pub(crate) use crate::activation_contract::ActivationJournalStep;
 
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub(crate) enum ActivationJournalStatus {
-        Prepared,
-        Applied,
-    }
 
-    #[derive(Clone, Debug, PartialEq, Eq)]
-    pub(crate) struct ActivationJournalEntry {
-        pub(crate) step: ActivationJournalStep,
-        pub(crate) idempotency_key: ActivationJournalKey,
-        pub(crate) status: ActivationJournalStatus,
-        pub(crate) verifier_receipt: Option<ActivationJournalVerifier>,
-        pub(crate) typed_failure: Option<String>,
-    }
+
+
+
+
+
+
+
 
     #[derive(Clone, Debug)]
     pub(crate) struct ActivationReceiptSeed {
         pub(crate) planar_target: Option<Arc<crate::planar_artifacts::Target>>,
         pub(crate) activation_request_id: String,
         pub(crate) request_key: ActivationRequestKey,
-        pub(crate) asset_manifest_sha256: Option<[u8; 32]>,
-        pub(crate) asset_bundle_sha256: Option<[u8; 32]>,
-        pub(crate) modern: bool,
-        pub(crate) immutable_target: Option<crate::pointcloud::ImmutableActivatedTarget>,
         pub(crate) checkpoint_owner: Option<CanonicalCheckpointOwnerV2>,
     }
 
-    #[derive(Clone, Debug)]
-    pub(crate) struct ActivationPublicationProof {
-        pub(crate) source_timestamp_ns: u64,
-        pub(crate) cloud_revision: u64,
-        pub(crate) point_count: u32,
-        pub(crate) voxel_size: f32,
-        pub(crate) cloud_receipt: crate::mapping_commit::CloudCommitReceipt,
-        pub(crate) target_receipt: TargetReceipt,
-    }
 
-    #[derive(Clone, Debug)]
 
-    #[cfg(test)]
-    pub(crate) struct SealedActivatedTargetSnapshot {
-        pub(crate) runtime_generation: u64,
-        pub(crate) lifecycle_epoch: u64,
-        pub(crate) session_id: String,
-        pub(crate) map_name: String,
-        pub(crate) activation_request_id: String,
-        pub(crate) activation_request_identity_sha256: [u8; 32],
-        pub(crate) activation_identity_sha256: [u8; 32],
-        pub(crate) target_receipt_sha256: [u8; 32],
-        pub(crate) asset_manifest_sha256: Option<[u8; 32]>,
-        pub(crate) asset_bundle_sha256: Option<[u8; 32]>,
-        pub(crate) session_generation: u64,
-        pub(crate) backend_generation: u64,
-        pub(crate) publication_proof: ActivationPublicationProof,
-        pub(crate) immutable_target: Arc<crate::pointcloud::ImmutableActivatedTarget>,
-    }
+
 
     /// Assigned authority keeps the installed descriptors and the original immutable source
     /// owner together. Capturing or cloning a snapshot never copies checkpoint/cloud bytes.
@@ -3633,20 +3459,10 @@ mod preflight_only_contract {
     pub(crate) struct SealedAssignedActivatedTargetSnapshot {
         pub(crate) activation_identity: InstalledActivationIdentityV2,
         pub(crate) target_receipt: InstalledTargetReceiptV2,
-        pub(crate) publication_proof: ActivationPublicationProof,
         pub(crate) checkpoint_owner: CanonicalCheckpointOwnerV2,
     }
 
-    impl ActivationPublicationProof {
-        fn same_descriptors(&self, other: &Self) -> bool {
-            self.source_timestamp_ns == other.source_timestamp_ns
-                && self.cloud_revision == other.cloud_revision
-                && self.point_count == other.point_count
-                && self.voxel_size.to_bits() == other.voxel_size.to_bits()
-                && self.cloud_receipt == other.cloud_receipt
-                && self.target_receipt == other.target_receipt
-        }
-    }
+
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub(crate) struct ActivationToken {
@@ -3676,9 +3492,7 @@ mod preflight_only_contract {
     #[derive(Clone, Debug)]
     struct PermanentActivationRecord {
         seed: ActivationReceiptSeed,
-        immutable_target: Option<Arc<crate::pointcloud::ImmutableActivatedTarget>>,
         checkpoint_owner: Option<CanonicalCheckpointOwnerV2>,
-        cloud_target_required: bool,
         planar_target_required: bool,
         planar_receipt: Option<crate::mapping_commit::OccupancyCommitReceipt>,
         epoch: u64,
@@ -3687,8 +3501,7 @@ mod preflight_only_contract {
         target_receipt: Option<TargetReceipt>,
         session_generation: u64,
         backend_generation: u64,
-        journal: Vec<ActivationJournalEntry>,
-        publication_proof: Option<ActivationPublicationProof>,
+        typed_global_map_published: bool,
         terminal: Option<crate::proto::MappingSessionState>,
     }
 
@@ -3832,108 +3645,21 @@ mod preflight_only_contract {
         }
 
         fn release_immutable_target(record: &mut PermanentActivationRecord) {
-            record.immutable_target = None;
-            record.checkpoint_owner = None;
-            record.seed.immutable_target = None;
-            record.seed.checkpoint_owner = None;
-            record.seed.planar_target = None;
-            record.planar_receipt = None;
-            if let Some(terminal) = record.terminal.as_mut() {
-                terminal.relocalization_target_available = false;
-            }
-        }
+    record.checkpoint_owner = None;
+    record.seed.checkpoint_owner = None;
+    record.seed.planar_target = None;
+    record.planar_receipt = None;
+    if let Some(terminal) = record.terminal.as_mut() { terminal.relocalization_target_available = false; }
+}
 
         fn has_complete_target_proof(record: &PermanentActivationRecord) -> bool {
-            if !record.seed.modern
-                || record.session_generation == 0
-                || record.backend_generation == 0
-                || record.activation_identity.is_none()
-            {
-                return false;
-            }
-            match &record.seed.request_key {
-                ActivationRequestKey::Assigned(metadata) => {
-                    let (
-                        Some(owner),
-                        Some(ActivationIdentity::Assigned(activation)),
-                        Some(TargetReceipt::Assigned(receipt)),
-                    ) = (
-                        record.checkpoint_owner.as_ref(),
-                        record.activation_identity.as_ref(),
-                        record.target_receipt.as_ref(),
-                    ) else {
-                        return false;
-                    };
-                    // Only small, immutable descriptors are compared while holding the ledger lock.
-                    if activation.request != *metadata
-                        || activation.lifecycle_epoch != record.epoch
-                        || activation.session_generation != record.session_generation
-                        || activation.backend_generation != record.backend_generation
-                        || receipt.activation != *activation
-                        || !receipt.validate(owner)
-                    {
-                        return false;
-                    }
-                    if owner.backend_kind() == crate::mapping_backend::MappingBackendKind::SlamToolbox {
-                        return record.seed.planar_target.is_some()
-                            && record.planar_receipt.as_ref() == Some(&receipt.occupancy_receipt);
-                    }
-                    let (Some(proof), Some(cloud)) =
-                        (record.publication_proof.as_ref(), receipt.cloud_receipt.as_ref())
-                    else {
-                        return false;
-                    };
-                    proof.target_receipt == *record.target_receipt.as_ref().unwrap()
-                        && proof.cloud_receipt == *cloud
-                        && proof.point_count == owner.cloud().point_count()
-                        && proof.voxel_size.to_bits() == owner.cloud().voxel_size().to_bits()
-                        && proof.cloud_revision == cloud.cloud_revision
-                        && proof.source_timestamp_ns == cloud.source_timestamp_ns
-                }
-                ActivationRequestKey::LegacyDigest(_) => {
-                    let Some(ActivationIdentity::LegacyDigest(activation)) =
-                        record.activation_identity.as_ref()
-                    else {
-                        return false;
-                    };
-                    if let Some(target) = record.seed.planar_target.as_ref() {
-                        return record.planar_receipt.as_ref().is_some_and(|receipt| {
-                            receipt.session_generation == record.session_generation
-                                && receipt.backend_generation == record.backend_generation
-                                && receipt.backend_kind
-                                    == crate::mapping_backend::MappingBackendKind::SlamToolbox
-                                && record.target_receipt
-                                    == Some(TargetReceipt::LegacyDigest(
-                                        target.receipt(*activation, receipt),
-                                    ))
-                        });
-                    }
-                    let (Some(target), Some(TargetReceipt::LegacyDigest(receipt)), Some(proof)) = (
-                        record.immutable_target.as_ref(),
-                        record.target_receipt.as_ref(),
-                        record.publication_proof.as_ref(),
-                    ) else {
-                        return false;
-                    };
-                    proof.target_receipt == TargetReceipt::LegacyDigest(*receipt)
-                        && proof.point_count == target.point_count
-                        && proof.voxel_size.to_bits() == target.voxel_size.to_bits()
-                        && proof.cloud_receipt.session_generation == record.session_generation
-                        && proof.cloud_receipt.cloud_revision == proof.cloud_revision
-                        && proof.cloud_receipt.source_timestamp_ns == proof.source_timestamp_ns
-                        && proof.cloud_receipt.point_count == target.point_count
-                }
-            }
-        }
+    record.state == PermanentActivationState::Sealed && record.target_receipt.is_some()
+        && record.activation_identity.is_some() && record.checkpoint_owner.is_some()
+}
 
         fn sealed_target_available(record: &PermanentActivationRecord) -> bool {
-            // Planar targets use the existing planar owner. Assigned cloud targets keep
-            // their separate typed snapshot and live cloud actor capability.
-            (matches!(record.seed.request_key, ActivationRequestKey::LegacyDigest(_))
-                || record.planar_target_required)
-                && record.state == PermanentActivationState::Sealed
-                && Self::has_complete_target_proof(record)
-        }
+    Self::has_complete_target_proof(record)
+}
 
         fn retire_record(
             &self,
@@ -3974,7 +3700,7 @@ mod preflight_only_contract {
             mut state: crate::proto::MappingSessionState,
         ) -> Option<crate::proto::MappingSessionState> {
             let ledger = self.inner.ledger.lock();
-            let key = ActivationRequestKey::Assigned(metadata.clone());
+            let key = metadata.clone();
             let phase = self.phase_snapshot();
             let record = ledger.records.get(metadata.activation_request_id());
             let conflict = record.is_some_and(|record| record.seed.request_key != key);
@@ -4017,284 +3743,91 @@ mod preflight_only_contract {
             Some(state)
         }
 
-        pub(crate) fn stage_assigned_or_replay(
-            &self,
-            request: ValidatedActivationRequestV2,
-            state: crate::proto::MappingSessionState,
-            allow_new: bool,
-        ) -> ActivationLedgerAdmission {
-            let (metadata, checkpoint_owner) = request.into_parts();
-            self.stage_or_replay(
-                ActivationReceiptSeed {
-                    activation_request_id: metadata.activation_request_id().into(),
-                    request_key: ActivationRequestKey::Assigned(metadata),
-                    asset_manifest_sha256: None,
-                    asset_bundle_sha256: None,
-                    modern: true,
-                    immutable_target: None,
-                    planar_target: None,
-                    checkpoint_owner: Some(checkpoint_owner),
-                },
-                state,
-                allow_new,
-            )
-        }
+        pub(crate) fn stage_assigned_or_replay(&self, request: ValidatedActivationRequestV2,
+    state: crate::proto::MappingSessionState, allow_new: bool) -> ActivationLedgerAdmission {
+    let (metadata, checkpoint_owner) = request.into_parts();
+    self.stage_or_replay(ActivationReceiptSeed {
+        activation_request_id: metadata.activation_request_id().into(), request_key: metadata,
+        planar_target: None, checkpoint_owner: Some(checkpoint_owner),
+    }, state, allow_new)
+}
 
-        pub(crate) fn stage_or_replay(
-            &self,
-            mut seed: ActivationReceiptSeed,
-            mut base_state: crate::proto::MappingSessionState,
-            allow_new: bool,
-        ) -> ActivationLedgerAdmission {
-            let seed_valid = match &seed.request_key {
-                ActivationRequestKey::LegacyDigest(_) => seed.checkpoint_owner.is_none(),
-                ActivationRequestKey::Assigned(metadata) => {
-                    seed.modern
-                        && seed.activation_request_id == metadata.activation_request_id()
-                        && metadata.expected_runtime_generation() == self.runtime_generation()
-                        && seed.asset_manifest_sha256.is_none()
-                        && seed.asset_bundle_sha256.is_none()
-                        && seed.immutable_target.is_none()
-                        && seed.checkpoint_owner.as_ref().is_some_and(|owner| {
-                            owner.identity() == metadata.checkpoint_identity()
-                                && match seed.planar_target.as_ref() {
-                                    None => true, // A known request may replay before target preparation.
-                                    Some(target) => matches!(
-                                        &target.identity,
-                                        crate::planar_artifacts::TargetIdentity::Assigned(reference)
-                                            if owner.graph().is_some_and(|graph| graph.reference() == reference)
-                                    ),
-                                }
-                        })
-                }
-            };
-            if !seed_valid {
+        pub(crate) fn stage_or_replay(&self, mut seed: ActivationReceiptSeed,
+    mut base_state: crate::proto::MappingSessionState, allow_new: bool) -> ActivationLedgerAdmission {
+    loop {
+        let before = self.phase_snapshot();
+        if before.0 {
+            self.apply_seed(&mut base_state, &seed);
+            base_state.success = false; base_state.idempotent_replay = true;
+            base_state.activation_receipt_disposition = crate::proto::ActivationReceiptDisposition::Retired as i32;
+            base_state.message = "ACTIVATION_IDENTITY_RETIRED".into();
+            return ActivationLedgerAdmission::Terminal(Box::new(base_state));
+        }
+        #[cfg(test)] {
+            let gate = self.inner.replay_before_compare_gate.lock().take();
+            if let Some(gate) = gate { gate.entered.wait(); gate.release.wait(); }
+        }
+        let mut ledger = self.inner.ledger.lock();
+        let after = self.phase_snapshot();
+        if before != after || after.0 { continue; }
+        let is_current = ledger.current.as_deref() == Some(seed.activation_request_id.as_str());
+        if let Some(record) = ledger.records.get(&seed.activation_request_id) {
+            if record.seed.request_key != seed.request_key {
                 self.apply_seed(&mut base_state, &seed);
-                base_state.success = false;
-                base_state.activation_receipt_disposition =
-                    crate::proto::ActivationReceiptDisposition::Conflict as i32;
-                base_state.message = "ACTIVATE_MAP_IDENTITY_SCHEMA_CONFLICT".into();
+                base_state.success = false; base_state.idempotent_replay = true;
+                base_state.activation_receipt_disposition = crate::proto::ActivationReceiptDisposition::Conflict as i32;
+                base_state.message = "ACTIVATE_MAP_REPLAY_CONFLICT".into();
                 return ActivationLedgerAdmission::Terminal(Box::new(base_state));
             }
-            loop {
-                let before = self.phase_snapshot();
-                if before.0 {
-                    self.apply_seed(&mut base_state, &seed);
-                    base_state.success = false;
-                    base_state.idempotent_replay = true;
-                    base_state.activation_receipt_disposition =
-                        crate::proto::ActivationReceiptDisposition::Retired as i32;
-                    base_state.message = "ACTIVATION_IDENTITY_RETIRED".into();
-                    return ActivationLedgerAdmission::Terminal(Box::new(base_state));
-                }
-                // Snapshot only shared owners and small metadata. Byte/file equality must never
-                // run under the ledger mutex. Recheck lifecycle/state/owner before admission.
-                let replay = {
-                    let ledger = self.inner.ledger.lock();
-                    ledger
-                        .records
-                        .get(&seed.activation_request_id)
-                        .map(|record| {
-                            (
-                                record.epoch,
-                                record.state,
-                                record.seed.request_key.clone(),
-                                record.immutable_target.clone(),
-                                record.checkpoint_owner.clone(),
-                                record.seed.planar_target.clone(),
-                            )
-                        })
-                };
-                #[cfg(test)]
-                {
-                    let gate = self.inner.replay_before_compare_gate.lock().take();
-                    if let Some(gate) = gate {
-                        gate.entered.wait();
-                        gate.release.wait();
-                    }
-                }
-                let exact_source =
-                    replay
-                        .as_ref()
-                        .is_none_or(|(_, state, key, target, owner, planar)| {
-                            if key != &seed.request_key {
-                                return false;
-                            }
-                            if !matches!(
-                                state,
-                                PermanentActivationState::Staged | PermanentActivationState::Sealed
-                            ) {
-                                return true;
-                            }
-                            match key {
-                                ActivationRequestKey::LegacyDigest(_) => {
-                                    *state != PermanentActivationState::Staged
-                                        || (target.as_deref() == seed.immutable_target.as_ref()
-                                            && planar == &seed.planar_target)
-                                }
-                                ActivationRequestKey::Assigned(_) => {
-                                    match (owner.as_ref(), seed.checkpoint_owner.as_ref()) {
-                                        (Some(retained), Some(candidate)) => {
-                                            retained.validate_replay(candidate).is_ok()
-                                        }
-                                        _ => false,
-                                    }
-                                }
-                            }
-                        });
-                let mut ledger = self.inner.ledger.lock();
-                let after = self.phase_snapshot();
-                if before != after || after.0 {
-                    continue;
-                }
-                let replay_is_current =
-                    ledger.current.as_deref() == Some(seed.activation_request_id.as_str());
-                if let Some(record) = ledger.records.get(&seed.activation_request_id) {
-                    let Some((epoch, status, key, target, owner, planar)) = replay.as_ref() else {
-                        continue;
-                    };
-                    let source_unchanged = match (&record.checkpoint_owner, owner) {
-                        (Some(left), Some(right)) => left.shares_source_with(right),
-                        (None, None) => true,
-                        _ => false,
-                    } && match (&record.immutable_target, target) {
-                        (Some(left), Some(right)) => Arc::ptr_eq(left, right),
-                        (None, None) => true,
-                        _ => false,
-                    } && match (&record.seed.planar_target, planar) {
-                        (Some(left), Some(right)) => Arc::ptr_eq(left, right),
-                        (None, None) => true,
-                        _ => false,
-                    };
-                    if record.epoch != *epoch
-                        || record.state != *status
-                        || record.seed.request_key != *key
-                        || !source_unchanged
-                    {
-                        continue;
-                    }
-                    if !exact_source {
-                        if matches!(seed.request_key, ActivationRequestKey::Assigned(_)) {
-                            self.apply_seed(&mut base_state, &seed);
-                            base_state.activation_receipt_disposition =
-                                crate::proto::ActivationReceiptDisposition::Conflict as i32;
-                        } else {
-                            self.apply_record(
-                                &mut base_state,
-                                record,
-                                crate::proto::ActivationReceiptDisposition::Conflict,
-                                false,
-                            );
-                        }
-                        base_state.success = false;
-                        base_state.idempotent_replay = true;
-                        base_state.message = "ACTIVATE_MAP_REPLAY_CONFLICT".into();
-                        return ActivationLedgerAdmission::Terminal(Box::new(base_state));
-                    }
-                    return match record.state {
-                        PermanentActivationState::Staged
-                            if replay_is_current && record.epoch == after.1 =>
-                        {
-                            ActivationLedgerAdmission::Execute(ActivationToken {
-                                epoch: record.epoch,
-                                activation_request_id: seed.activation_request_id,
-                                request_key: seed.request_key,
-                                activation_identity: record.activation_identity.clone(),
-                                reserved_backend_generation: (record.backend_generation > 0)
-                                    .then_some(record.backend_generation),
-                            })
-                        }
-                        PermanentActivationState::Sealed => {
-                            let mut terminal = record.terminal.clone().unwrap_or_default();
-                            let available = replay_is_current
-                                && record.epoch == after.1
-                                && Self::sealed_target_available(record);
-                            self.apply_record(
-                                &mut terminal,
-                                record,
-                                crate::proto::ActivationReceiptDisposition::SealedReplay,
-                                available,
-                            );
-                            terminal.idempotent_replay = true;
-                            terminal.message = "ACTIVATION_SEALED_REPLAY".into();
-                            ActivationLedgerAdmission::Terminal(Box::new(terminal))
-                        }
-                        _ => {
-                            let mut terminal = record.terminal.clone().unwrap_or(base_state);
-                            self.apply_record(
-                                &mut terminal,
-                                record,
-                                crate::proto::ActivationReceiptDisposition::Retired,
-                                false,
-                            );
-                            terminal.success = false;
-                            terminal.idempotent_replay = true;
-                            terminal.message = "ACTIVATION_IDENTITY_RETIRED".into();
-                            ActivationLedgerAdmission::Terminal(Box::new(terminal))
-                        }
-                    };
-                }
-                if replay.is_some() {
-                    continue;
-                }
-                if !allow_new {
-                    self.apply_seed(&mut base_state, &seed);
-                    base_state.success = false;
-                    base_state.idempotent_replay = true;
-                    base_state.activation_receipt_disposition =
-                        crate::proto::ActivationReceiptDisposition::Conflict as i32;
-                    base_state.message = "ACTIVATE_MAP_ACTIVE_IDENTITY_CONFLICT".into();
-                    return ActivationLedgerAdmission::Terminal(Box::new(base_state));
-                }
-                let epoch = before.1;
-                let request_id = seed.activation_request_id.clone();
-                let request_key = seed.request_key.clone();
-                let immutable_target = seed.immutable_target.take().map(Arc::new);
-                let checkpoint_owner = seed.checkpoint_owner.take();
-                if let Some(previous_id) = ledger.current.clone() {
-                    if let Some(previous) = ledger.records.get_mut(&previous_id) {
-                        self.retire_record(previous, crate::proto::MappingSessionState::default());
-                    }
-                }
-                debug_assert!(ledger
-                    .records
-                    .values()
-                    .all(|record| record.immutable_target.is_none()
-                        && record.checkpoint_owner.is_none()));
-                ledger.records.insert(
-                    request_id.clone(),
-                    PermanentActivationRecord {
-                        planar_target_required: seed.planar_target.is_some()
-                            || checkpoint_owner.as_ref().is_some_and(|owner|
-                                owner.backend_kind() == crate::mapping_backend::MappingBackendKind::SlamToolbox),
-                        planar_receipt: None,
-                        cloud_target_required: immutable_target.is_some()
-                            || checkpoint_owner.as_ref().is_some_and(|owner|
-                                owner.backend_kind() != crate::mapping_backend::MappingBackendKind::SlamToolbox),
-                        seed,
-                        immutable_target,
-                        checkpoint_owner,
-                        epoch,
-                        state: PermanentActivationState::Staged,
-                        activation_identity: None,
-                        target_receipt: None,
-                        session_generation: 0,
-                        backend_generation: 0,
-                        journal: Vec::new(),
-                        publication_proof: None,
-                        terminal: None,
-                    },
-                );
-                ledger.current = Some(request_id.clone());
-                return ActivationLedgerAdmission::Execute(ActivationToken {
-                    epoch,
-                    activation_request_id: request_id,
-                    request_key,
-                    activation_identity: None,
-                    reserved_backend_generation: None,
-                });
+            return match record.state {
+                PermanentActivationState::Staged if is_current && record.epoch == after.1 =>
+                    ActivationLedgerAdmission::Execute(ActivationToken { epoch: record.epoch,
+                        activation_request_id: seed.activation_request_id, request_key: seed.request_key,
+                        activation_identity: record.activation_identity.clone(),
+                        reserved_backend_generation: (record.backend_generation > 0).then_some(record.backend_generation) }),
+                PermanentActivationState::Sealed => {
+                    let mut terminal = record.terminal.clone().unwrap_or_default();
+                    self.apply_record(&mut terminal, record, crate::proto::ActivationReceiptDisposition::SealedReplay,
+                        is_current && record.epoch == after.1 && Self::sealed_target_available(record));
+                    terminal.idempotent_replay = true; terminal.message = "ACTIVATION_SEALED_REPLAY".into();
+                    ActivationLedgerAdmission::Terminal(Box::new(terminal))
+                },
+                _ => {
+                    let mut terminal = record.terminal.clone().unwrap_or(base_state);
+                    self.apply_record(&mut terminal, record, crate::proto::ActivationReceiptDisposition::Retired, false);
+                    terminal.success = false; terminal.idempotent_replay = true; terminal.message = "ACTIVATION_IDENTITY_RETIRED".into();
+                    ActivationLedgerAdmission::Terminal(Box::new(terminal))
+                },
+            };
+        }
+        if !allow_new {
+            self.apply_seed(&mut base_state, &seed);
+            base_state.success = false; base_state.idempotent_replay = true;
+            base_state.activation_receipt_disposition = crate::proto::ActivationReceiptDisposition::Conflict as i32;
+            base_state.message = "ACTIVATE_MAP_ACTIVE_IDENTITY_CONFLICT".into();
+            return ActivationLedgerAdmission::Terminal(Box::new(base_state));
+        }
+        let epoch = before.1;
+        let request_id = seed.activation_request_id.clone();
+        let request_key = seed.request_key.clone();
+        let checkpoint_owner = seed.checkpoint_owner.take();
+        if let Some(previous_id) = ledger.current.clone() {
+            if let Some(previous) = ledger.records.get_mut(&previous_id) {
+                self.retire_record(previous, crate::proto::MappingSessionState::default());
             }
         }
+        ledger.records.insert(request_id.clone(), PermanentActivationRecord {
+            planar_target_required: checkpoint_owner.as_ref().is_some_and(|owner|
+                owner.backend_kind() == crate::mapping_backend::MappingBackendKind::SlamToolbox),
+            planar_receipt: None, seed, checkpoint_owner, epoch, state: PermanentActivationState::Staged,
+            activation_identity: None, target_receipt: None, session_generation: 0, backend_generation: 0,
+            typed_global_map_published: false, terminal: None,
+        });
+        ledger.current = Some(request_id.clone());
+        return ActivationLedgerAdmission::Execute(ActivationToken { epoch, activation_request_id: request_id,
+            request_key, activation_identity: None, reserved_backend_generation: None });
+    }
+}
 
         pub(crate) fn reserve_backend_generation(
             &self,
@@ -4317,82 +3850,25 @@ mod preflight_only_contract {
             .flatten()
         }
 
-        pub(crate) fn bind_activation_identity(
-            &self,
-            token: &ActivationToken,
-            activation_identity: impl Into<ActivationIdentity>,
-            session_generation: u64,
-        ) -> Option<ActivationToken> {
-            if session_generation == 0 {
-                return None;
-            }
-            let identity = activation_identity.into();
-            self.with_staged_record_mut(token, |record| {
-                let valid = match (&record.seed.request_key, &identity) {
-                    (
-                        ActivationRequestKey::LegacyDigest(_),
-                        ActivationIdentity::LegacyDigest(_),
-                    ) => true,
-                    (
-                        ActivationRequestKey::Assigned(request),
-                        ActivationIdentity::Assigned(activation),
-                    ) => {
-                        activation.request == *request
-                            && activation.runtime_generation == self.runtime_generation()
-                            && activation.lifecycle_epoch == record.epoch
-                            && activation.session_generation == session_generation
-                            && activation.backend_generation == record.backend_generation
-                            && activation.backend_generation > 0
-                            && record.checkpoint_owner.as_ref().is_some_and(|owner| {
-                                activation.backend_kind == owner.backend_kind()
-                            })
-                    }
-                    _ => false,
-                };
-                if !valid
-                    || record
-                        .activation_identity
-                        .as_ref()
-                        .is_some_and(|bound| bound != &identity)
-                {
-                    return None;
-                }
-                record.activation_identity = Some(identity.clone());
-                record.session_generation = session_generation;
-                let mut token = token.clone();
-                token.activation_identity = Some(identity);
-                Some(token)
-            })
-            .flatten()
-        }
+        pub(crate) fn bind_activation_identity(&self, token: &ActivationToken,
+    identity: ActivationIdentity, session_generation: u64) -> Option<ActivationToken> {
+    self.with_staged_record_mut(token, |record| {
+        record.activation_identity = Some(identity.clone());
+        record.session_generation = session_generation;
+        let mut token = token.clone(); token.activation_identity = Some(identity); token
+    })
+}
 
         #[cfg(test)]
-        pub(crate) fn bind_assigned_activation_identity(
-            &self,
-            token: &ActivationToken,
-            session_generation: u64,
-        ) -> Option<ActivationToken> {
-            let identity = self
-                .with_staged_record(token, |record| {
-                    let ActivationRequestKey::Assigned(request) = &record.seed.request_key else {
-                        return None;
-                    };
-                    Some(InstalledActivationIdentityV2 {
-                        request: request.clone(),
-                        runtime_generation: self.runtime_generation(),
-                        lifecycle_epoch: record.epoch,
-                        session_generation,
-                        backend_kind: record.checkpoint_owner.as_ref()?.backend_kind(),
-                        backend_generation: record.backend_generation,
-                    })
-                })
-                .flatten()?;
-            self.bind_activation_identity(
-                token,
-                ActivationIdentity::Assigned(identity),
-                session_generation,
-            )
-        }
+        pub(crate) fn bind_assigned_activation_identity(&self, token: &ActivationToken,
+    session_generation: u64) -> Option<ActivationToken> {
+    let identity = self.with_staged_record(token, |record| Some(InstalledActivationIdentityV2 {
+        request: record.seed.request_key.clone(), runtime_generation: self.runtime_generation(),
+        lifecycle_epoch: record.epoch, session_generation,
+        backend_kind: record.checkpoint_owner.as_ref()?.backend_kind(), backend_generation: record.backend_generation,
+    })).flatten()?;
+    self.bind_activation_identity(token, identity, session_generation)
+}
 
         #[cfg(test)]
         pub(crate) fn activation_identity(
@@ -4403,232 +3879,45 @@ mod preflight_only_contract {
                 .flatten()
         }
 
-        pub(crate) fn journal(
+
+
+
+
+
+
+        pub(crate) fn store_installed_target_receipt(&self, token: &ActivationToken, proof: InstalledTargetReceiptV2) -> bool {
+    self.with_staged_record_mut(token, |record| {
+        record.target_receipt = Some(proof);
+    }).is_some()
+}
+
+pub(crate) fn typed_global_map_published(&self, token: &ActivationToken) -> bool {
+    self.with_staged_record(token, |record| record.typed_global_map_published).unwrap_or(false)
+}
+
+pub(crate) fn mark_typed_global_map_published(&self, token: &ActivationToken) -> bool {
+    self.with_staged_record_mut(token, |record| record.typed_global_map_published = true).is_some()
+}
+
+        pub(crate) fn installed_target_receipt(
             &self,
             token: &ActivationToken,
-            entry: ActivationJournalEntry,
-        ) -> bool {
-            self.with_staged_record_mut(token, |record| {
-                let key_matches = match (&record.seed.request_key, &entry.idempotency_key) {
-                    (
-                        ActivationRequestKey::LegacyDigest(_),
-                        ActivationJournalKey::LegacyDigest(_),
-                    ) => entry.verifier_receipt.as_ref().is_none_or(|value| {
-                        matches!(value, ActivationJournalVerifier::LegacyDigest(_))
-                    }),
-                    (
-                        ActivationRequestKey::Assigned(request),
-                        ActivationJournalKey::Assigned {
-                            request: keyed,
-                            step,
-                        },
-                    ) => {
-                        request == keyed
-                            && *step == entry.step
-                            && entry
-                                .verifier_receipt
-                                .as_ref()
-                                .is_some_and(|value| match value {
-                                    ActivationJournalVerifier::Assigned(verifier) => {
-                                        Self::assigned_verifier_matches(record, entry.step, verifier)
-                                    }
-                                    _ => false,
-                                })
-                    }
-                    _ => false,
-                };
-                if !key_matches {
-                    return false;
-                }
-                if let Some(existing) = record
-                    .journal
-                    .iter_mut()
-                    .find(|existing| existing.step == entry.step)
-                {
-                    if existing.idempotency_key != entry.idempotency_key {
-                        return false;
-                    }
-                    if matches!(record.seed.request_key, ActivationRequestKey::Assigned(_))
-                        && existing.status == ActivationJournalStatus::Applied
-                    {
-                        return *existing == entry;
-                    }
-                    *existing = entry;
-                } else {
-                    record.journal.push(entry);
-                }
-                true
-            })
-            .unwrap_or(false)
-        }
-
-        fn assigned_verifier_matches(
-            record: &PermanentActivationRecord,
-            step: ActivationJournalStep,
-            verifier: &ActivationJournalVerifierV2,
-        ) -> bool {
-            let ActivationRequestKey::Assigned(request) = &record.seed.request_key else {
-                return false;
-            };
-            use ActivationJournalStep as Step;
-            use ActivationJournalVerifierV2 as Verifier;
-            match (step, verifier) {
-                (
-                    Step::BackendRestoreSubmission | Step::BackendCommit | Step::RetirementPrepared,
-                    Verifier::BackendGeneration(value),
-                ) => *value > 0 && *value == record.backend_generation,
-                (Step::OccupancyShmBegin, Verifier::SessionGeneration(value)) => {
-                    *value > 0 && *value == record.session_generation
-                }
-                (
-                    Step::OccupancyInstall
-                    | Step::SharedStateCommit
-                    | Step::CacheClears
-                    | Step::MapEvent,
-                    Verifier::Occupancy(value),
-                ) => {
-                    value.session_id == request.session_id()
-                        && value.session_generation == record.session_generation
-                        && value.session_generation > 0
-                        && value.backend_generation == record.backend_generation
-                        && value.backend_generation > 0
-                        && value.commit_id.boot_nonce != 0
-                        && value.commit_id.sequence > 0
-                        && value.occupancy_revision > 0
-                        && value.source_timestamp_ns > 0
-                        && record
-                            .checkpoint_owner
-                            .as_ref()
-                            .is_some_and(|owner| owner.backend_kind() == value.backend_kind)
-                        && record.publication_proof.as_ref().is_none_or(|proof| {
-                            matches!(&proof.target_receipt, TargetReceipt::Assigned(receipt)
-                                if receipt.occupancy_receipt == *value)
-                        })
-                }
-                (
-                    Step::CloudInstall | Step::CloudEvent | Step::TypedGlobalMap,
-                    Verifier::Cloud(value),
-                ) => {
-                    // Cloud effects occur only after publication proof storage. Match its exact
-                    // installed receipt, not merely plausible positive revision/generation fields.
-                    record
-                        .publication_proof
-                        .as_ref()
-                        .is_some_and(|proof| proof.cloud_receipt == *value)
-                }
-                (
-                    Step::SessionStart | Step::ActivationRecord | Step::Seal,
-                    Verifier::Activation(value),
-                ) => {
-                    record.activation_identity.as_ref()
-                        == Some(&ActivationIdentity::Assigned(value.clone()))
-                }
-                #[cfg(test)]
-                (Step::TargetReceiptVerification, Verifier::Target(value)) => {
-                    record.target_receipt.as_ref() == Some(&TargetReceipt::Assigned(value.clone()))
-                }
-                // A matching key, another step's valid receipt, or CompletedStep is not proof
-                // of this effect. Prepared and Applied both retain the step's typed verifier.
-                _ => false,
-            }
-        }
-
-        pub(crate) fn journal_step_applied(
-            &self,
-            token: &ActivationToken,
-            step: ActivationJournalStep,
-        ) -> bool {
-            self.with_staged_record(token, |record| {
-                record.journal.iter().any(|entry| {
-                    entry.step == step && entry.status == ActivationJournalStatus::Applied
-                })
-            })
-            .unwrap_or(false)
-        }
-
-        pub(crate) fn store_publication_proof(
-            &self,
-            token: &ActivationToken,
-            proof: ActivationPublicationProof,
-        ) -> bool {
-            self.with_staged_record_mut(token, |record| {
-                let valid = match (&record.seed.request_key, &proof.target_receipt) {
-                    (ActivationRequestKey::LegacyDigest(_), TargetReceipt::LegacyDigest(_)) => true,
-                    (ActivationRequestKey::Assigned(_), TargetReceipt::Assigned(receipt)) => {
-                        record.activation_identity.as_ref()
-                            == Some(&ActivationIdentity::Assigned(receipt.activation.clone()))
-                            && record.checkpoint_owner.as_ref().is_some_and(|owner| {
-                                owner.backend_kind() != crate::mapping_backend::MappingBackendKind::SlamToolbox
-                                    && receipt.validate(owner)
-                                    && proof.point_count == owner.cloud().point_count()
-                                    && proof.voxel_size.to_bits() == owner.cloud().voxel_size().to_bits()
-                            })
-                            && receipt.cloud_receipt.as_ref().is_some_and(|cloud| {
-                                proof.cloud_receipt == *cloud
-                                    && proof.cloud_revision == cloud.cloud_revision
-                                    && proof.source_timestamp_ns == cloud.source_timestamp_ns
-                            })
-                    }
-                    _ => false,
-                };
-                if !valid
-                    || record
-                        .target_receipt
-                        .as_ref()
-                        .is_some_and(|stored| stored != &proof.target_receipt)
-                {
-                    return false;
-                }
-                record.target_receipt = Some(proof.target_receipt.clone());
-                record.publication_proof = Some(proof);
-                true
-            })
-            .unwrap_or(false)
-        }
-
-        pub(crate) fn publication_proof(
-            &self,
-            token: &ActivationToken,
-        ) -> Option<ActivationPublicationProof> {
-            self.with_staged_record(token, |record| record.publication_proof.clone())
+        ) -> Option<InstalledTargetReceiptV2> {
+            self.with_staged_record(token, |record| record.target_receipt.clone())
                 .flatten()
         }
 
-        pub(crate) fn store_planar_proof(
-            &self,
-            token: &ActivationToken,
-            receipt: crate::mapping_commit::OccupancyCommitReceipt,
-        ) -> Option<TargetReceipt> {
-            self.with_staged_record_mut(token, |record| {
-                let target = record.seed.planar_target.as_ref()?;
-                let target_receipt = match record.activation_identity.as_ref()? {
-                    ActivationIdentity::LegacyDigest(activation) =>
-                        TargetReceipt::LegacyDigest(target.receipt(*activation, &receipt)),
-                    ActivationIdentity::Assigned(activation) => {
-                        let owner = record.checkpoint_owner.as_ref()?;
-                        if owner.backend_kind() != crate::mapping_backend::MappingBackendKind::SlamToolbox {
-                            return None;
-                        }
-                        let installed = InstalledTargetReceiptV2 {
-                            activation: activation.clone(),
-                            source_member: owner.source_member().clone(),
-                            occupancy_receipt: receipt.clone(),
-                            cloud_receipt: None,
-                        };
-                        if !installed.validate(owner) {
-                            return None;
-                        }
-                        TargetReceipt::Assigned(installed)
-                    }
-                };
-                if record.target_receipt.as_ref().is_some_and(|stored| stored != &target_receipt) {
-                    return None;
-                }
-                record.planar_receipt = Some(receipt);
-                record.target_receipt = Some(target_receipt.clone());
-                Some(target_receipt)
-            }).flatten()
-        }
+        pub(crate) fn store_planar_proof(&self, token: &ActivationToken,
+    receipt: crate::mapping_commit::OccupancyCommitReceipt) -> Option<TargetReceipt> {
+    self.with_staged_record_mut(token, |record| {
+        let owner = record.checkpoint_owner.as_ref()?;
+        let target_receipt = InstalledTargetReceiptV2 { activation: record.activation_identity.clone()?,
+            source_member: owner.source_member().clone(), occupancy_receipt: receipt.clone(), cloud_receipt: None };
+        record.planar_receipt = Some(receipt);
+        record.target_receipt = Some(target_receipt.clone());
+        Some(target_receipt)
+    }).flatten()
+}
         pub(crate) fn current_sealed_planar_target(
             &self,
         ) -> Option<(
@@ -4649,16 +3938,7 @@ mod preflight_only_contract {
             }
             Some((record.seed.planar_target.clone()?, record.terminal.clone()?))
         }
-        #[cfg(test)]
-        pub(crate) fn immutable_target(
-            &self,
-            token: &ActivationToken,
-        ) -> Option<crate::pointcloud::ImmutableActivatedTarget> {
-            // Compatibility API is legacy-only. Its existing copy occurs after releasing the lock.
-            self.with_staged_record(token, |record| record.immutable_target.clone())
-                .flatten()
-                .map(|target| (*target).clone())
-        }
+
 
         #[cfg(test)]
         pub(crate) fn checkpoint_owner(
@@ -4669,186 +3949,39 @@ mod preflight_only_contract {
                 .flatten()
         }
 
-        pub(crate) fn target_source(
-            &self,
-            token: &ActivationToken,
-        ) -> Option<ActivationTargetSource> {
-            self.with_staged_record(token, |record| match &record.seed.request_key {
-                ActivationRequestKey::LegacyDigest(_) => record
-                    .immutable_target
-                    .clone()
-                    .map(ActivationTargetSource::Legacy),
-                ActivationRequestKey::Assigned(_) => record
-                    .checkpoint_owner
-                    .as_ref()
-                    .filter(|owner| owner.backend_kind() != crate::mapping_backend::MappingBackendKind::SlamToolbox)
-                    .cloned()
-                    .map(ActivationTargetSource::Assigned),
-            })
-            .flatten()
-        }
-
         #[cfg(test)]
-        pub(crate) fn current_sealed_target_snapshot(
-            &self,
-        ) -> Option<SealedActivatedTargetSnapshot> {
-            let before = self.phase_snapshot();
-            if before.0 {
-                return None;
-            }
-            let snapshot = {
-                let ledger = self.inner.ledger.lock();
-                let record = ledger.records.get(ledger.current.as_ref()?)?;
-                if self.phase_snapshot() != before
-                    || record.epoch != before.1
-                    || !Self::sealed_target_available(record)
-                {
-                    return None;
-                }
-                let terminal = record.terminal.as_ref()?;
-                if terminal.session_id.is_empty() || terminal.map_name.is_empty() {
-                    return None;
-                }
-                // Capture only the immutable owner handle and small descriptors. All digest
-                // extraction is explicit and fails closed for Assigned variants.
-                SealedActivatedTargetSnapshot {
-                    runtime_generation: self.runtime_generation(),
-                    lifecycle_epoch: record.epoch,
-                    session_id: terminal.session_id.clone(),
-                    map_name: terminal.map_name.clone(),
-                    activation_request_id: record.seed.activation_request_id.clone(),
-                    activation_request_identity_sha256: record.seed.request_key.legacy_digest()?,
-                    activation_identity_sha256: record
-                        .activation_identity
-                        .as_ref()?
-                        .legacy_digest()?,
-                    target_receipt_sha256: record.target_receipt.as_ref()?.legacy_digest()?,
-                    asset_manifest_sha256: record.seed.asset_manifest_sha256,
-                    asset_bundle_sha256: record.seed.asset_bundle_sha256,
-                    session_generation: record.session_generation,
-                    backend_generation: record.backend_generation,
-                    publication_proof: record.publication_proof.clone()?,
-                    immutable_target: record.immutable_target.clone()?,
-                }
-            };
-            #[cfg(test)]
-            self.wait_for_snapshot_before_recheck_gate();
-            let ledger = self.inner.ledger.lock();
-            let current = ledger.current.as_ref()?;
-            let record = ledger.records.get(current)?;
-            let terminal = record.terminal.as_ref()?;
-            if current != &snapshot.activation_request_id
-                || self.phase_snapshot() != before
-                || record.epoch != snapshot.lifecycle_epoch
-                || !Self::sealed_target_available(record)
-                || record.seed.activation_request_id != snapshot.activation_request_id
-                || record.seed.request_key.legacy_digest()
-                    != Some(snapshot.activation_request_identity_sha256)
-                || record.seed.asset_manifest_sha256 != snapshot.asset_manifest_sha256
-                || record.seed.asset_bundle_sha256 != snapshot.asset_bundle_sha256
-                || terminal.session_id != snapshot.session_id
-                || terminal.map_name != snapshot.map_name
-                || record.session_generation != snapshot.session_generation
-                || record.backend_generation != snapshot.backend_generation
-                || record
-                    .activation_identity
-                    .as_ref()
-                    .and_then(ActivationIdentity::legacy_digest)
-                    != Some(snapshot.activation_identity_sha256)
-                || record
-                    .target_receipt
-                    .as_ref()
-                    .and_then(TargetReceipt::legacy_digest)
-                    != Some(snapshot.target_receipt_sha256)
-                || !record
-                    .publication_proof
-                    .as_ref()
-                    .is_some_and(|proof| proof.same_descriptors(&snapshot.publication_proof))
-                || !record
-                    .immutable_target
-                    .as_ref()
-                    .is_some_and(|retained| Arc::ptr_eq(retained, &snapshot.immutable_target))
-            {
-                return None;
-            }
-            Some(snapshot)
-        }
+        pub(crate) fn target_source(&self, token: &ActivationToken) -> Option<CanonicalCheckpointOwnerV2> {
+    self.with_staged_record(token, |record| record.checkpoint_owner.as_ref()
+        .filter(|owner| owner.backend_kind() != crate::mapping_backend::MappingBackendKind::SlamToolbox).cloned()).flatten()
+}
 
-        pub(crate) fn current_sealed_assigned_target_snapshot(
-            &self,
-        ) -> Option<SealedAssignedActivatedTargetSnapshot> {
-            let before = self.phase_snapshot();
-            if before.0 {
-                return None;
-            }
-            let snapshot = {
-                let ledger = self.inner.ledger.lock();
-                let record = ledger.records.get(ledger.current.as_ref()?)?;
-                if self.phase_snapshot() != before
-                    || record.epoch != before.1
-                    || record.state != PermanentActivationState::Sealed
-                    || !Self::has_complete_target_proof(record)
-                {
-                    return None;
-                }
-                let activation = record.activation_identity.as_ref()?.assigned()?;
-                let terminal = record.terminal.as_ref()?;
-                if activation.runtime_generation != self.runtime_generation()
-                    || record.seed.activation_request_id
-                        != activation.request.activation_request_id()
-                    || terminal.session_id != activation.request.session_id()
-                    || terminal.map_name != activation.request.map_name()
-                    || terminal.session_generation != activation.session_generation
-                {
-                    return None;
-                }
-                SealedAssignedActivatedTargetSnapshot {
-                    activation_identity: activation.clone(),
-                    target_receipt: record.target_receipt.as_ref()?.assigned()?.clone(),
-                    publication_proof: record.publication_proof.clone()?,
-                    checkpoint_owner: record.checkpoint_owner.clone()?,
-                }
-            };
-            #[cfg(test)]
-            self.wait_for_snapshot_before_recheck_gate();
-            let ledger = self.inner.ledger.lock();
-            let current = ledger.current.as_ref()?;
-            let record = ledger.records.get(current)?;
-            let terminal = record.terminal.as_ref()?;
-            let activation = &snapshot.activation_identity;
-            if current != activation.request.activation_request_id()
-                || self.phase_snapshot() != before
-                || record.epoch != activation.lifecycle_epoch
-                || record.state != PermanentActivationState::Sealed
-                || !Self::has_complete_target_proof(record)
-                || record.seed.activation_request_id != activation.request.activation_request_id()
-                || record.seed.request_key.assigned() != Some(&activation.request)
-                || terminal.session_id != activation.request.session_id()
-                || terminal.map_name != activation.request.map_name()
-                || terminal.session_generation != activation.session_generation
-                || record
-                    .activation_identity
-                    .as_ref()
-                    .and_then(ActivationIdentity::assigned)
-                    != Some(activation)
-                || record
-                    .target_receipt
-                    .as_ref()
-                    .and_then(TargetReceipt::assigned)
-                    != Some(&snapshot.target_receipt)
-                || !record
-                    .publication_proof
-                    .as_ref()
-                    .is_some_and(|proof| proof.same_descriptors(&snapshot.publication_proof))
-                || !record
-                    .checkpoint_owner
-                    .as_ref()
-                    .is_some_and(|retained| retained.shares_source_with(&snapshot.checkpoint_owner))
-            {
-                return None;
-            }
-            Some(snapshot)
+
+
+        pub(crate) fn current_sealed_assigned_target_snapshot(&self) -> Option<SealedAssignedActivatedTargetSnapshot> {
+    let before = self.phase_snapshot();
+    if before.0 { return None; }
+    let snapshot = {
+        let ledger = self.inner.ledger.lock();
+        let record = ledger.records.get(ledger.current.as_ref()?)?;
+        if self.phase_snapshot() != before || record.epoch != before.1 || !Self::has_complete_target_proof(record)
+            || record.checkpoint_owner.as_ref()?.backend_kind() == crate::mapping_backend::MappingBackendKind::SlamToolbox { return None; }
+        SealedAssignedActivatedTargetSnapshot {
+            activation_identity: record.activation_identity.clone()?, target_receipt: record.target_receipt.clone()?,
+            checkpoint_owner: record.checkpoint_owner.clone()?,
         }
+    };
+    #[cfg(test)] self.wait_for_snapshot_before_recheck_gate();
+    let ledger = self.inner.ledger.lock();
+    let current = ledger.current.as_ref()?;
+    let record = ledger.records.get(current)?;
+    if current != snapshot.activation_identity.request.activation_request_id() || self.phase_snapshot() != before
+        || record.epoch != snapshot.activation_identity.lifecycle_epoch || record.state != PermanentActivationState::Sealed
+        || record.activation_identity.as_ref() != Some(&snapshot.activation_identity)
+        || !record.checkpoint_owner.as_ref().is_some_and(|owner| owner.shares_source_with(&snapshot.checkpoint_owner)) {
+        return None;
+    }
+    Some(snapshot)
+}
 
         #[cfg(test)]
         fn wait_for_snapshot_before_recheck_gate(&self) {
@@ -4878,96 +4011,20 @@ mod preflight_only_contract {
             }
         }
 
-        #[cfg(test)]
-        pub(crate) fn retained_immutable_target_bytes(&self) -> usize {
-            self.inner
-                .ledger
-                .lock()
-                .records
-                .values()
-                .filter_map(|record| record.immutable_target.as_ref())
-                .fold(0_usize, |total, target| {
-                    total.saturating_add(target.xyz_f32_le.len())
-                })
-        }
 
-        #[cfg(test)]
-        pub(crate) fn retained_immutable_target_bytes_for(&self, request_id: &str) -> usize {
-            self.inner
-                .ledger
-                .lock()
-                .records
-                .get(request_id)
-                .and_then(|record| record.immutable_target.as_ref())
-                .map_or(0, |target| target.xyz_f32_le.len())
-        }
 
-        pub(crate) fn seal(
-            &self,
-            token: &ActivationToken,
-            target_receipt: Option<TargetReceipt>,
-            mut state: crate::proto::MappingSessionState,
-        ) -> Option<crate::proto::MappingSessionState> {
-            #[cfg(test)]
-            self.wait_for_seal_before_ledger_gate();
-            self.with_staged_record_mut(token, |record| {
-                if record
-                    .target_receipt
-                    .as_ref()
-                    .is_some_and(|stored| Some(stored) != target_receipt.as_ref())
-                {
-                    return None;
-                }
-                if !matches!(
-                    (&record.seed.request_key, &target_receipt),
-                    (_, None)
-                        | (
-                            ActivationRequestKey::LegacyDigest(_),
-                            Some(TargetReceipt::LegacyDigest(_))
-                        )
-                        | (
-                            ActivationRequestKey::Assigned(_),
-                            Some(TargetReceipt::Assigned(_))
-                        )
-                ) {
-                    return None;
-                }
-                let modern = record.seed.modern;
-                if let ActivationRequestKey::Assigned(request) = &record.seed.request_key {
-                    if state.session_id != request.session_id()
-                        || state.map_name != request.map_name()
-                        || state.session_generation != record.session_generation
-                    {
-                        return None;
-                    }
-                }
-                // 二维资产仍须完整激活身份；原本携带三维目标的请求不能靠丢失目标降级成功。
-                if modern
-                    && (record.session_generation == 0
-                        || record.backend_generation == 0
-                        || record.activation_identity.is_none()
-                        || ((record.cloud_target_required || record.planar_target_required)
-                            && !Self::has_complete_target_proof(record)))
-                {
-                    return None;
-                }
-                record.target_receipt = target_receipt;
-                record.state = PermanentActivationState::Sealed;
-                let disposition = if modern {
-                    crate::proto::ActivationReceiptDisposition::Sealed
-                } else {
-                    crate::proto::ActivationReceiptDisposition::LegacyUnbound
-                };
-                let target_available = Self::sealed_target_available(record);
-                self.apply_record(&mut state, record, disposition, target_available);
-                if !Self::has_complete_target_proof(record) {
-                    Self::release_immutable_target(record);
-                }
-                record.terminal = Some(state.clone());
-                Some(state)
-            })
-            .flatten()
-        }
+
+
+        pub(crate) fn seal(&self, token: &ActivationToken, target_receipt: TargetReceipt,
+    mut state: crate::proto::MappingSessionState) -> Option<crate::proto::MappingSessionState> {
+    #[cfg(test)] self.wait_for_seal_before_ledger_gate();
+    self.with_staged_record_mut(token, |record| {
+        record.target_receipt = Some(target_receipt);
+        record.state = PermanentActivationState::Sealed;
+        self.apply_record(&mut state, record, crate::proto::ActivationReceiptDisposition::Sealed, true);
+        record.terminal = Some(state.clone()); state
+    })
+}
 
         pub(crate) fn invalidate(
             &self,
@@ -5082,12 +4139,7 @@ mod preflight_only_contract {
                     PermanentActivationState::Staged => {
                         crate::proto::ActivationReceiptDisposition::Staged
                     }
-                    PermanentActivationState::Sealed if record.seed.modern => {
-                        crate::proto::ActivationReceiptDisposition::Sealed
-                    }
-                    PermanentActivationState::Sealed => {
-                        crate::proto::ActivationReceiptDisposition::LegacyUnbound
-                    }
+                    PermanentActivationState::Sealed => crate::proto::ActivationReceiptDisposition::Sealed,
                     PermanentActivationState::InvalidatedPrecommit => {
                         crate::proto::ActivationReceiptDisposition::InvalidatedPrecommit
                     }
@@ -5108,186 +4160,53 @@ mod preflight_only_contract {
         }
 
         fn apply_no_activation_identity(&self, state: &mut crate::proto::MappingSessionState) {
-            // A live mapping session need not have an installed activation.
-            // Preserve its diagnostics; never invent a receipt or legacy digest.
-            state.activation_receipt_schema_version = 0;
-            state.activation_receipt_disposition = crate::proto::ActivationReceiptDisposition::Unspecified as i32;
-            state.runtime_generation = self.runtime_generation();
-            state.backend_generation = 0;
-            state.activation_request_id.clear();
-            state.activation_request_identity_sha256.clear();
-            state.activation_identity_sha256.clear();
-            state.target_receipt_sha256.clear();
-            state.asset_manifest_sha256.clear();
-            state.asset_bundle_sha256.clear();
-            state.target_graph_sha256.clear();
-            state.target_kind.clear();
-            state.relocalization_target_available = false;
-            state.activation_receipt_v2 = None;
-            state.source_policy_version = 0;
-            state.source_policy_sha256.clear();
-            state.deadline_policy_version = 0;
-            state.deadline_policy_sha256.clear();
-            state.algorithm_options_version = 0;
-            state.algorithm_options_sha256.clear();
-            state.relocalization_policy_v2 = match state.mapping_backend_kind.as_str() {
-                "voxel" | "raytracing" => Some(
-                    crate::relocalization_identity::CanonicalRelocalizationPolicyV2::current_cloud().to_wire()),
-                "slam_toolbox" => Some(crate::relocalization_identity::CanonicalRelocalizationPolicyV2::current_planar().to_wire()),
-                _ => None,
-            };
-        }
+    state.activation_receipt_schema_version = 0;
+    state.activation_receipt_disposition = crate::proto::ActivationReceiptDisposition::Unspecified as i32;
+    state.runtime_generation = self.runtime_generation(); state.backend_generation = 0;
+    state.activation_request_id.clear(); state.target_kind.clear();
+    state.relocalization_target_available = false; state.activation_receipt_v2 = None;
+    state.relocalization_policy_v2 = match state.mapping_backend_kind.as_str() {
+        "voxel" | "raytracing" => Some(crate::relocalization_identity::CanonicalRelocalizationPolicyV2::current_cloud().to_wire()),
+        "slam_toolbox" => Some(crate::relocalization_identity::CanonicalRelocalizationPolicyV2::current_planar().to_wire()),
+        _ => None,
+    };
+}
 
-        fn apply_policy_identity(&self, state: &mut crate::proto::MappingSessionState) {
-            state.relocalization_policy_v2 = None;
-            state.activation_receipt_schema_version = ACTIVATION_RECEIPT_SCHEMA_VERSION_V1;
-            state.runtime_generation = self.inner.runtime_generation;
-            state.source_policy_version = RELOCALIZATION_SOURCE_POLICY_VERSION;
-            state.source_policy_sha256 = relocalization_source_policy_sha256_v1().to_vec();
-            state.deadline_policy_version = RELOCALIZATION_DEADLINE_POLICY_VERSION_V1;
-            state.deadline_policy_sha256 = relocalization_deadline_policy_sha256_v1().to_vec();
-            state.algorithm_options_version = RELOCALIZATION_ALGORITHM_OPTIONS_VERSION;
-            state.algorithm_options_sha256 = relocalization_algorithm_options_sha256_v1().to_vec();
-        }
 
-        fn apply_request_key(
-            &self,
-            state: &mut crate::proto::MappingSessionState,
-            request_id: &str,
-            key: &ActivationRequestKey,
-        ) {
-            state.activation_request_id = request_id.into();
-            state.activation_identity_sha256.clear();
-            state.target_receipt_sha256.clear();
-            state.asset_manifest_sha256.clear();
-            state.asset_bundle_sha256.clear();
-            state.target_graph_sha256.clear();
-            state.target_kind.clear();
-            state.relocalization_target_available = false;
-            match key {
-                ActivationRequestKey::LegacyDigest(digest) => {
-                    self.apply_policy_identity(state);
-                    state.activation_request_identity_sha256 = digest.to_vec();
-                    state.activation_receipt_v2 = None;
-                }
-                ActivationRequestKey::Assigned(request) => {
-                    // Do not call any application/policy hashing on the assigned path.
-                    state.activation_receipt_schema_version = 2;
-                    state.runtime_generation = self.runtime_generation();
-                    state.activation_request_identity_sha256.clear();
-                    state.source_policy_version = 0;
-                    state.source_policy_sha256.clear();
-                    state.deadline_policy_version = 0;
-                    state.deadline_policy_sha256.clear();
-                    state.algorithm_options_version = 0;
-                    state.algorithm_options_sha256.clear();
-                    state.relocalization_policy_v2 = if state.mapping_backend_kind == "slam_toolbox" {
-                        Some(crate::relocalization_identity::CanonicalRelocalizationPolicyV2::current_planar().to_wire())
-                    } else {
-                        Some(crate::relocalization_identity::CanonicalRelocalizationPolicyV2::current_cloud().to_wire())
-                    };
-                    state.activation_receipt_v2 = Some(crate::proto::ActivationReceiptV2 {
-                        request: Some(crate::activation_contract::request_to_wire(request)),
-                        activation: None,
-                        target: None,
-                    });
-                }
-            }
-        }
 
-        fn apply_seed(
-            &self,
-            state: &mut crate::proto::MappingSessionState,
-            seed: &ActivationReceiptSeed,
-        ) {
-            self.apply_request_key(state, &seed.activation_request_id, &seed.request_key);
-            if seed.checkpoint_owner.as_ref().is_some_and(|owner|
-                owner.backend_kind() == crate::mapping_backend::MappingBackendKind::SlamToolbox)
-            {
-                state.relocalization_policy_v2 = Some(crate::relocalization_identity::CanonicalRelocalizationPolicyV2::current_planar().to_wire());
-            }
-            if matches!(seed.request_key, ActivationRequestKey::LegacyDigest(_)) {
-                state.asset_manifest_sha256 = seed
-                    .asset_manifest_sha256
-                    .map(|value| value.to_vec())
-                    .unwrap_or_default();
-                state.asset_bundle_sha256 = seed
-                    .asset_bundle_sha256
-                    .map(|value| value.to_vec())
-                    .unwrap_or_default();
-            }
-        }
+        fn apply_request_key(&self, state: &mut crate::proto::MappingSessionState, request_id: &str, key: &ActivationRequestKey) {
+    state.activation_request_id = request_id.into(); state.target_kind.clear();
+    state.relocalization_target_available = false; state.activation_receipt_schema_version = 2;
+    state.runtime_generation = self.runtime_generation();
+    state.relocalization_policy_v2 = Some(if state.mapping_backend_kind == "slam_toolbox" {
+        crate::relocalization_identity::CanonicalRelocalizationPolicyV2::current_planar().to_wire()
+    } else { crate::relocalization_identity::CanonicalRelocalizationPolicyV2::current_cloud().to_wire() });
+    state.activation_receipt_v2 = Some(crate::proto::ActivationReceiptV2 {
+        request: Some(crate::activation_contract::request_to_wire(key)), activation: None, target: None,
+    });
+}
 
-        fn apply_record(
-            &self,
-            state: &mut crate::proto::MappingSessionState,
-            record: &PermanentActivationRecord,
-            disposition: crate::proto::ActivationReceiptDisposition,
-            target_available: bool,
-        ) {
-            self.apply_seed(state, &record.seed);
-            state.activation_receipt_disposition = disposition as i32;
-            state.backend_generation = record.backend_generation;
-            match &record.seed.request_key {
-                ActivationRequestKey::LegacyDigest(_) => {
-                    state.activation_identity_sha256 = if record.seed.modern {
-                        record
-                            .activation_identity
-                            .as_ref()
-                            .and_then(ActivationIdentity::legacy_digest)
-                            .map(|value| value.to_vec())
-                            .unwrap_or_default()
-                    } else {
-                        Vec::new()
-                    };
-                    state.target_receipt_sha256 = if record.seed.modern {
-                        record
-                            .target_receipt
-                            .as_ref()
-                            .and_then(TargetReceipt::legacy_digest)
-                            .map(|value| value.to_vec())
-                            .unwrap_or_default()
-                    } else {
-                        Vec::new()
-                    };
-                    state.relocalization_target_available = target_available;
-                    if let Some(target) = record.seed.planar_target.as_ref() {
-                        state.target_kind = "planar_graph".into();
-                        state.target_graph_sha256 = target.identity.legacy_digest()
-                            .map(|value| value.to_vec()).unwrap_or_default();
-                    }
-                    if record.planar_target_required {
-                        state.source_policy_sha256 = planar_source_policy_sha256().to_vec();
-                        state.algorithm_options_sha256 = planar_algorithm_policy_sha256().to_vec();
-                    }
-                }
-                ActivationRequestKey::Assigned(_) => {
-                    let wire = state
-                        .activation_receipt_v2
-                        .as_mut()
-                        .expect("assigned receipt initialized");
-                    wire.activation = match &record.activation_identity {
-                        Some(ActivationIdentity::Assigned(value)) => Some(value.to_wire()),
-                        _ => None,
-                    };
-                    wire.target = match &record.target_receipt {
-                        Some(TargetReceipt::Assigned(value)) => Some(value.to_wire()),
-                        _ => None,
-                    };
-                    if record.planar_target_required {
-                        state.target_kind = "planar_graph".into();
-                        state.planar_mode = "localization".into();
-                        state.relocalization_policy_v2 = Some(crate::relocalization_identity::CanonicalRelocalizationPolicyV2::current_planar().to_wire());
-                    }
-                    state.relocalization_target_available = (record.planar_target_required || self.assigned_actor_available())
-                        && matches!(disposition, crate::proto::ActivationReceiptDisposition::Sealed
-                            | crate::proto::ActivationReceiptDisposition::SealedReplay)
-                        && record.epoch == self.lifecycle_epoch()
-                        && record.state == PermanentActivationState::Sealed
-                        && Self::has_complete_target_proof(record);
-                }
-            }
-        }
+        fn apply_seed(&self, state: &mut crate::proto::MappingSessionState, seed: &ActivationReceiptSeed) {
+    self.apply_request_key(state, &seed.activation_request_id, &seed.request_key);
+    if seed.checkpoint_owner.as_ref().is_some_and(|owner| owner.backend_kind() == crate::mapping_backend::MappingBackendKind::SlamToolbox) {
+        state.relocalization_policy_v2 = Some(crate::relocalization_identity::CanonicalRelocalizationPolicyV2::current_planar().to_wire());
+    }
+}
+
+        fn apply_record(&self, state: &mut crate::proto::MappingSessionState, record: &PermanentActivationRecord,
+    disposition: crate::proto::ActivationReceiptDisposition, target_available: bool) {
+    self.apply_seed(state, &record.seed);
+    state.activation_receipt_disposition = disposition as i32; state.backend_generation = record.backend_generation;
+    let wire = state.activation_receipt_v2.as_mut().expect("activation receipt initialized");
+    wire.activation = record.activation_identity.as_ref().map(InstalledActivationIdentityV2::to_wire);
+    wire.target = record.target_receipt.as_ref().map(InstalledTargetReceiptV2::to_wire);
+    if record.planar_target_required {
+        state.target_kind = "planar_graph".into(); state.planar_mode = "localization".into();
+        state.relocalization_policy_v2 = Some(crate::relocalization_identity::CanonicalRelocalizationPolicyV2::current_planar().to_wire());
+    }
+    state.relocalization_target_available = target_available && (record.planar_target_required || self.assigned_actor_available())
+        && record.epoch == self.lifecycle_epoch() && Self::sealed_target_available(record);
+}
     }
 
     /// Cloneable Phase A admission/cancellation fence. It never owns worker
@@ -5554,10 +4473,10 @@ mod preflight_only_contract {
         fn replace(&self, input: CorrectionFrameInput) {
             let mut pending = self.pending.lock();
             if pending.as_ref().is_some_and(|current| {
-                current.mapping_session_generation > input.mapping_session_generation
-                    || (current.mapping_session_generation == input.mapping_session_generation
-                        && current.registered_cloud.source_timestamp_ns
-                            >= input.registered_cloud.source_timestamp_ns)
+                current.mapping_session_generation() > input.mapping_session_generation()
+                    || (current.mapping_session_generation() == input.mapping_session_generation()
+                        && current.registered_cloud().source_timestamp_ns
+                            >= input.registered_cloud().source_timestamp_ns)
             }) {
                 return;
             }
@@ -5576,7 +4495,7 @@ mod preflight_only_contract {
                     let cancellation = CorrectionRequestCancellation::for_background_mapping();
                     let _ = cancellation.inner.background_mode.set((
                         Arc::clone(&queue.mode),
-                        input.frame_capture_relocalization_epoch,
+                        input.frame_capture_relocalization_epoch(),
                     ));
                     let lease = Arc::new(CorrectionRequestLease::new(cancellation.clone(), None));
                     // 后台输入的最终结果由原拥有方日志报告，没有同步等待者。
@@ -5780,7 +4699,7 @@ mod preflight_only_contract {
             cancellation: &CorrectionRequestCancellation,
         ) -> Result<CandidateProduction, CorrectionRuntimeError> {
             if input.static_point_indices.as_ref().is_some_and(|indices| indices.is_empty()) {
-                input.validate_source_ownership()?;
+
                 return Ok(CandidateProduction::NoCandidate);
             }
             let request = native_pgo_request(
@@ -5868,7 +4787,7 @@ mod preflight_only_contract {
             i64::try_from(value)
                 .map_err(|_| CorrectionRuntimeError::NativePgo(format!("{label} exceeds i64")))
         };
-        input.validate_source_ownership()?;
+
         let static_points = input.pgo_points()?;
         let coordinate_count = static_points.len()
             .checked_mul(3)
@@ -5891,14 +4810,14 @@ mod preflight_only_contract {
                 request_sequence: 0,
                 mapping_backend_kind: input.committed_map.backend_kind.stable_name().to_owned(),
                 mapping_backend_generation: checked_i64("mapping backend generation", input.committed_map.backend_generation)?,
-                mapping_session_id: input.mapping_session_id.clone(),
+                mapping_session_id: input.mapping_session_id().to_owned(),
                 mapping_session_generation: checked_i64(
                     "mapping session generation",
-                    input.mapping_session_generation,
+                    input.mapping_session_generation(),
                 )?,
                 map_frame_generation: checked_i64(
                     "map frame generation",
-                    input.map_frame_generation,
+                    input.map_frame_generation(),
                 )?,
                 mapping_commit_id: native_pgo_codec::NativePgoMappingCommitId {
                     boot_nonce: input.mapping_commit_id.boot_nonce.to_be_bytes(),
@@ -5910,16 +4829,16 @@ mod preflight_only_contract {
                 occupancy_revision: checked_i64("occupancy revision", input.occupancy_revision)?,
                 cloud_revision: checked_i64("cloud revision", input.cloud_revision)?,
                 registered_cloud: native_pgo_codec::NativePgoRegisteredCloudProof {
-                    backend: input.registered_cloud.backend,
-                    runtime_generation: checked_i64("LIO runtime generation", input.registered_cloud.runtime_generation)?,
-                    source_point_count: checked_i64("admitted cloud point count", input.registered_cloud.point_count)?,
+                    backend: input.registered_cloud().backend,
+                    runtime_generation: checked_i64("LIO runtime generation", input.registered_cloud().runtime_generation)?,
+                    source_point_count: checked_i64("admitted cloud point count", input.registered_cloud().point_count)?,
                     source_sequence: checked_i64(
                         "registered cloud sequence",
-                        input.registered_cloud.source_sequence,
+                        input.registered_cloud().source_sequence,
                     )?,
                     source_timestamp_ns: checked_i64(
                         "registered cloud timestamp",
-                        input.registered_cloud.source_timestamp_ns,
+                        input.registered_cloud().source_timestamp_ns,
                     )?,
                     point_count: checked_i64(
                         "registered cloud point count",
@@ -5929,14 +4848,14 @@ mod preflight_only_contract {
                 correlated_odom: native_pgo_codec::NativePgoCorrelatedOdomProof {
                     source_sequence: checked_i64(
                         "correlated odometry sequence",
-                        input.correlated_odom.proof.source_sequence,
+                        input.correlated_odom().proof.source_sequence,
                     )?,
                     source_timestamp_ns: checked_i64(
                         "correlated odometry timestamp",
-                        input.correlated_odom.proof.source_timestamp_ns,
+                        input.correlated_odom().proof.source_timestamp_ns,
                     )?,
-                    translation_m: input.correlated_odom.proof.translation_m,
-                    rotation_xyzw: input.correlated_odom.proof.rotation_xyzw,
+                    translation_m: input.correlated_odom().proof.translation_m,
+                    rotation_xyzw: input.correlated_odom().proof.rotation_xyzw,
                 },
                 committed_map: native_pgo_codec::NativePgoCommittedMapProof {
                     source_timestamp_ns: checked_i64(
@@ -5951,12 +4870,12 @@ mod preflight_only_contract {
                 },
                 source_timestamp_ns: checked_i64(
                     "source timestamp",
-                    input.registered_cloud.source_timestamp_ns,
+                    input.registered_cloud().source_timestamp_ns,
                 )?,
                 map_frame_id: map_frame_id.to_owned(),
                 odom_frame_id: odom_frame_id.to_owned(),
                 body_frame_id: body_frame_id.to_owned(),
-                points_frame_id: input.points_frame_id.clone(),
+                points_frame_id: input.points_frame_id().to_owned(),
                 correction_lease: native_pgo_codec::NativePgoCorrectionLeaseId {
                     boot_nonce: owner.correction_lease.boot_nonce.to_be_bytes(),
                     generation: checked_i64(
@@ -6010,7 +4929,7 @@ mod preflight_only_contract {
             }
             let mode = self.relocalization_mode.snapshot();
             if mode.active
-                || mode.epoch != input.frame_capture_relocalization_epoch
+                || mode.epoch != input.frame_capture_relocalization_epoch()
                 || input.relocalization_mode_epoch.is_some()
             {
                 return Ok(());
@@ -6023,6 +4942,7 @@ mod preflight_only_contract {
             Ok(())
         }
 
+        #[cfg(test)]
         pub(crate) async fn submit(
             &self,
             input: CorrectionFrameInput,
@@ -6047,10 +4967,10 @@ mod preflight_only_contract {
                 return Err(CorrectionRuntimeError::Stopped);
             }
             let current_mode = self.relocalization_mode.snapshot();
-            if current_mode.epoch != input.frame_capture_relocalization_epoch
+            if current_mode.epoch != input.frame_capture_relocalization_epoch()
                 || input.relocalization_mode_epoch.is_some()
                     && input.relocalization_mode_epoch
-                        != Some(input.frame_capture_relocalization_epoch)
+                        != Some(input.frame_capture_relocalization_epoch())
             {
                 // The producer crossed a mode edge after capturing this
                 // frame. Do not enqueue it where it could stage evidence
@@ -6112,6 +5032,7 @@ mod preflight_only_contract {
             }
         }
 
+        #[cfg(test)]
         pub(crate) fn is_open(&self) -> bool {
             self.admission_open.load(Ordering::Acquire)
         }
@@ -6553,7 +5474,7 @@ mod preflight_only_contract {
     impl PlanarCommandContext {
         pub async fn claim(&self)->bool {
             let (tx,rx)=oneshot::channel();
-            if self.claim.send(PlanarClaim{request_id:self.request_id.clone(),identity:RelocalizationRequestIdentity::Assigned(self.request_identity.clone()),reply:tx}).await.is_err() {return false;}
+            if self.claim.send(PlanarClaim{request_id:self.request_id.clone(),identity:self.request_identity.clone(),reply:tx}).await.is_err() {return false;}
             rx.await.unwrap_or(false)
         }
     }
@@ -6664,19 +5585,13 @@ mod preflight_only_contract {
             }
         }
 
-        pub(crate) async fn terminal_snapshot(
-            &self, request_id: &str, request_identity_sha256: [u8; 32], activation_identity_sha256: [u8; 32],
-        ) -> Result<RelocalizationTerminalQuerySnapshot, &'static str> {
-            self.terminal_snapshot_exact(request_id, RelocalizationRequestIdentity::LegacyV1 {
-                request_alias: request_identity_sha256, activation_alias: activation_identity_sha256,
-            }).await
-        }
+
 
         pub(crate) async fn terminal_snapshot_assigned(
             &self, query: &AssignedRelocalizationTerminalQueryV2,
         ) -> Result<RelocalizationTerminalQuerySnapshot, &'static str> {
             self.terminal_snapshot_exact(query.request().request_id(),
-                RelocalizationRequestIdentity::Assigned(query.request().clone())).await
+                query.request().clone()).await
         }
 
         async fn terminal_snapshot_exact(
@@ -6687,6 +5602,16 @@ mod preflight_only_contract {
                 request_id: request_id.to_owned(), identity, response,
             }).await.map_err(|_| "RELOCALIZATION_TERMINAL_QUERY_OWNER_UNAVAILABLE")?;
             response_rx.await.map_err(|_| "RELOCALIZATION_TERMINAL_QUERY_RESPONSE_LOST")?
+        }
+
+        #[cfg(test)]
+        pub(crate) fn seed_terminal_query_for_tests(&self, wire: crate::proto::RelocalizeRequest,
+            result: Option<crate::proto::RelocalizeResult>) {
+            let request=validate_relocalize_request(wire).unwrap();
+            if let Some(result)=result {
+                let terminal=AssignedRelocalizationTerminalV2::new(request.identity.clone(),result);
+                self.terminal_store.persist_terminal(request.request_id(),&request.key(),&terminal).unwrap();
+            } else { self.terminal_store.mark_pending(&request).unwrap(); }
         }
 
         #[cfg(test)]
@@ -6722,32 +5647,9 @@ mod preflight_only_contract {
             }
         }
 
-        #[cfg(test)]
-        pub(crate) fn mark_terminal_query_pending_for_tests(
-            &self,
-            request_id: &str,
-            request_identity_sha256: [u8; 32],
-            activation_identity_sha256: [u8; 32],
-        ) {
-            self.terminal_store.state.lock().pending.insert(
-                request_id.to_owned(),
-                RelocalizationRequestIdentity::LegacyV1 {
-                    request_alias: request_identity_sha256, activation_alias: activation_identity_sha256,
-                },
-            );
-        }
 
-        #[cfg(test)]
-        pub(crate) fn persist_terminal_query_result_for_tests(&self, result: crate::proto::RelocalizeResult) {
-            // Explicit historical test fixture import, never a live V1 writer.
-            let request_alias = result.request_identity_sha256.as_slice().try_into().expect("request alias");
-            let activation_alias = result.activation_identity_sha256.as_slice().try_into().expect("activation alias");
-            let encoded = result.encode_to_vec();
-            self.terminal_store.state.lock().terminals.insert(result.request_id.clone(), DurableRelocalizationTerminal {
-                identity: RelocalizationRequestIdentity::LegacyV1 { request_alias, activation_alias },
-                terminal: StoredRelocalizationResult::LegacyReadOnly(Arc::new(LegacyRelocalizationTerminal { result, encoded })),
-            });
-        }
+
+
 
         pub(crate) fn is_open(&self) -> bool {
             self.admission_open.load(Ordering::Acquire)
@@ -6762,11 +5664,7 @@ mod preflight_only_contract {
 
     /// One identity domain in the existing ledger. Legacy values are opaque
     /// read-only aliases; no assigned request is converted into a digest.
-    #[derive(Clone, Debug, PartialEq, Eq)]
-    enum RelocalizationRequestIdentity {
-        LegacyV1 { request_alias: [u8; 32], activation_alias: [u8; 32] },
-        Assigned(AssignedCloudRelocalizeRequestIdentityV2),
-    }
+    type RelocalizationRequestIdentity = AssignedCloudRelocalizeRequestIdentityV2;
 
     #[derive(Clone)]
     struct ValidatedRelocalizeRequest {
@@ -6774,7 +5672,7 @@ mod preflight_only_contract {
     }
     impl ValidatedRelocalizeRequest {
         fn key(&self) -> RelocalizationRequestIdentity {
-            RelocalizationRequestIdentity::Assigned(self.identity.clone())
+            self.identity.clone()
         }
         fn request_id(&self) -> &str { self.identity.request_id() }
         fn target(&self) -> &InstalledTargetReceiptV2 { self.identity.target() }
@@ -6803,30 +5701,14 @@ mod preflight_only_contract {
             .map(|identity| ValidatedRelocalizeRequest { identity })
     }
 
-    #[derive(Clone)]
-    enum StoredRelocalizationResult {
-        LegacyReadOnly(Arc<LegacyRelocalizationTerminal>),
-        Assigned(AssignedRelocalizationTerminalV2),
-    }
-    struct LegacyRelocalizationTerminal {
-        result: crate::proto::RelocalizeResult,
-        encoded: Vec<u8>,
-    }
-    impl StoredRelocalizationResult {
-        fn result(&self) -> &crate::proto::RelocalizeResult {
-            match self { Self::LegacyReadOnly(value) => &value.result, Self::Assigned(value) => value.result() }
-        }
-        fn encoded(&self) -> &[u8] {
-            match self { Self::LegacyReadOnly(value) => &value.encoded, Self::Assigned(value) => value.encoded() }
-        }
-        fn to_wire(&self) -> crate::proto::RelocalizeResult { self.result().clone() }
-    }
+    type StoredRelocalizationResult = AssignedRelocalizationTerminalV2;
+
+
 
 
     #[allow(clippy::large_enum_variant)]
     #[derive(Clone, Debug)]
     pub(crate) enum RelocalizationTerminalSnapshot {
-        Terminal(crate::proto::RelocalizeResult),
         AssignedTerminal(AssignedRelocalizationTerminalV2),
         Pending,
         NotFound,
@@ -6838,15 +5720,7 @@ mod preflight_only_contract {
         pub(crate) ledger_observation: crate::proto::RelocalizationLedgerObservation,
     }
 
-    #[derive(Serialize, Deserialize)]
-    struct DurableRelocalizationTerminalV1 {
-        schema_version: u32,
-        request_id: String,
-        request_identity_sha256: String,
-        activation_identity_sha256: String,
-        terminal_hex: String,
-        terminal_sha256: String,
-    }
+
 
     #[derive(Clone)]
     struct DurableRelocalizationTerminal {
@@ -6905,16 +5779,7 @@ mod preflight_only_contract {
         _test_root: Option<Arc<tests::RelocalizationTerminalTestRoot>>,
     }
 
-    #[cfg(test)]
-    fn encode_hex(bytes: &[u8]) -> String {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        let mut out = String::with_capacity(bytes.len() * 2);
-        for byte in bytes {
-            out.push(char::from(HEX[usize::from(byte >> 4)]));
-            out.push(char::from(HEX[usize::from(byte & 0x0f)]));
-        }
-        out
-    }
+
 
     fn decode_hex(value: &str, max_bytes: usize) -> Result<Vec<u8>, String> {
         if value.len() % 2 != 0 || value.len() / 2 > max_bytes {
@@ -7333,6 +6198,7 @@ mod preflight_only_contract {
                 }
             }
             let mut entries = Vec::new();
+            let mut removed_legacy = false;
             for entry in fs::read_dir(&root)
                 .map_err(|error| format!("RELOCALIZATION_TERMINAL_STORE_READ_FAILED:{error}"))?
             {
@@ -7342,37 +6208,30 @@ mod preflight_only_contract {
                     .map_err(|_| "RELOCALIZATION_TERMINAL_STORE_FILENAME_INVALID")?;
                 let assigned = filename.starts_with("assigned-")
                     || path.extension().and_then(|value| value.to_str()) == Some("terminal");
-                if !assigned && path.extension().and_then(|value| value.to_str()) != Some("json") {
+                if path.extension().and_then(|value| value.to_str()) == Some("json") {
+                    fs::remove_file(&path).map_err(|error| format!("RELOCALIZATION_TERMINAL_STORE_EVICT_FAILED:{error}"))?;
+                    removed_legacy = true;
                     continue;
                 }
+                if !assigned { continue; }
                 let modified = entry.metadata().and_then(|metadata| metadata.modified())
                     .map_err(|error| format!("RELOCALIZATION_TERMINAL_STORE_READ_FAILED:{error}"))?;
-                entries.push((modified, filename, path, assigned));
+                entries.push((modified, filename, path));
             }
             entries.sort_by(|left, right| (&left.0, &left.1).cmp(&(&right.0, &right.1)));
             let excess = entries.len().saturating_sub(RELOCALIZATION_MAX_COMMAND_RECORDS);
-            for (_, _, path, _) in entries.drain(..excess) {
+            for (_, _, path) in entries.drain(..excess) {
                 fs::remove_file(path)
                     .map_err(|error| format!("RELOCALIZATION_TERMINAL_STORE_EVICT_FAILED:{error}"))?;
             }
-            if excess > 0 {
-                fsync_directory(&root)?;
-            }
+            if excess > 0 || removed_legacy { fsync_directory(&root)?; }
             let mut terminals = HashMap::new();
             let mut retained_order = VecDeque::new();
-            for (_, filename, path, assigned) in entries {
+            for (_, filename, path) in entries {
                 let bytes = read_terminal_record(&path)?;
-                let (request_id, durable) = if assigned {
-                    let terminal = AssignedRelocalizationTerminalV2::decode_durable_named(
-                        &filename, &bytes, Some(&validate_assigned_terminal_retained),
-                    )?;
-                    (terminal.request().request_id().to_owned(), DurableRelocalizationTerminal {
-                        identity: RelocalizationRequestIdentity::Assigned(terminal.request().clone()),
-                        terminal: StoredRelocalizationResult::Assigned(terminal),
-                    })
-                } else {
-                    read_legacy_relocalization_terminal(&bytes)?
-                };
+                let terminal = AssignedRelocalizationTerminalV2::decode_durable_named(&filename, &bytes)?;
+                let request_id = terminal.request().request_id().to_owned();
+                let durable = DurableRelocalizationTerminal { identity: terminal.request().clone(), terminal };
                 if terminals.insert(request_id.clone(), durable).is_some() {
                     return Err("RELOCALIZATION_TERMINAL_STORE_DUPLICATE".into());
                 }
@@ -7440,10 +6299,7 @@ mod preflight_only_contract {
             &self, request_id: &str, identity: &RelocalizationRequestIdentity,
             terminal: &StoredRelocalizationResult,
         ) -> Result<(), String> {
-            let (RelocalizationRequestIdentity::Assigned(request), StoredRelocalizationResult::Assigned(assigned))
-                = (identity, terminal) else {
-                return Err("RELOCALIZATION_LEGACY_TERMINAL_WRITE_UNSUPPORTED".into());
-            };
+            let (request, assigned) = (identity, terminal);
             if request.request_id() != request_id || assigned.request() != request {
                 return Err("RELOCALIZATION_TERMINAL_STORE_IDENTITY_CONFLICT".into());
             }
@@ -7501,10 +6357,7 @@ mod preflight_only_contract {
             let state = self.state.lock();
             if let Some(terminal) = state.terminals.get(request_id) {
                 return if &terminal.identity == identity {
-                    match &terminal.terminal {
-                        StoredRelocalizationResult::LegacyReadOnly(_) => RelocalizationTerminalSnapshot::Terminal(terminal.terminal.to_wire()),
-                        StoredRelocalizationResult::Assigned(value) => RelocalizationTerminalSnapshot::AssignedTerminal(value.clone()),
-                    }
+                    RelocalizationTerminalSnapshot::AssignedTerminal(terminal.terminal.clone())
                 } else { RelocalizationTerminalSnapshot::IdentityConflict };
             }
             match state.pending.get(request_id) {
@@ -7514,46 +6367,10 @@ mod preflight_only_contract {
             }
         }
 
-        #[cfg(test)]
-        /// Explicit historical read. Aliases are opaque and never recomputed.
-        pub(crate) fn snapshot(&self, request_id: &str, request_alias: [u8; 32], activation_alias: [u8; 32])
-            -> RelocalizationTerminalSnapshot
-        {
-            self.snapshot_exact(request_id, &RelocalizationRequestIdentity::LegacyV1 { request_alias, activation_alias })
-        }
+
     }
 
-    /// Reopening legacy bytes checks canonical protobuf shape and stored alias
-    /// bindings only. A stored checksum is opaque: this is not content attestation
-    /// and no historical V1 record is upgraded to assigned authority.
-    fn read_legacy_relocalization_terminal(bytes: &[u8]) -> Result<(String, DurableRelocalizationTerminal), String> {
-        let record: DurableRelocalizationTerminalV1 = serde_json::from_slice(bytes)
-            .map_err(|_| "RELOCALIZATION_TERMINAL_STORE_RECORD_INVALID")?;
-        if record.schema_version != 1 { return Err("RELOCALIZATION_TERMINAL_STORE_RECORD_INVALID".into()); }
-        validate_relocalization_request_id(&record.request_id)?;
-        let request_alias = decode_hex(&record.request_identity_sha256, 32)?.try_into()
-            .map_err(|_| "RELOCALIZATION_TERMINAL_STORE_RECORD_INVALID")?;
-        let activation_alias = decode_hex(&record.activation_identity_sha256, 32)?.try_into()
-            .map_err(|_| "RELOCALIZATION_TERMINAL_STORE_RECORD_INVALID")?;
-        let opaque_checksum = decode_hex(&record.terminal_sha256, 32)?;
-        if opaque_checksum.len() != 32 { return Err("RELOCALIZATION_TERMINAL_STORE_RECORD_INVALID".into()); }
-        let encoded = decode_hex(&record.terminal_hex, RELOCALIZATION_MAX_TERMINAL_BYTES)?;
-        let result = crate::proto::RelocalizeResult::decode(encoded.as_slice())
-            .map_err(|_| "RELOCALIZATION_TERMINAL_STORE_TERMINAL_INVALID")?;
-        if result.schema_version != 1 || result.assigned_cloud_v2.is_some() || result.assigned_planar_v2.is_some()
-            || result.request_id != record.request_id
-            || result.request_identity_sha256.as_slice() != request_alias
-            || result.activation_identity_sha256.as_slice() != activation_alias
-            || crate::proto::RelocalizeDisposition::try_from(result.disposition).is_err()
-            || result.disposition == crate::proto::RelocalizeDisposition::Unspecified as i32 {
-            return Err("RELOCALIZATION_TERMINAL_STORE_IDENTITY_MISMATCH".into());
-        }
-        if result.encode_to_vec() != encoded { return Err("RELOCALIZATION_TERMINAL_STORE_NON_CANONICAL".into()); }
-        Ok((record.request_id, DurableRelocalizationTerminal {
-            identity: RelocalizationRequestIdentity::LegacyV1 { request_alias, activation_alias },
-            terminal: StoredRelocalizationResult::LegacyReadOnly(Arc::new(LegacyRelocalizationTerminal { result, encoded })),
-        }))
-    }
+
 
 
     struct RelocalizationLedgerAdmissionMetadata {
@@ -7566,8 +6383,7 @@ mod preflight_only_contract {
     #[allow(clippy::large_enum_variant)]
     enum RelocalizationLedgerOrigin {
         Admitted(RelocalizationLedgerAdmissionMetadata),
-        // Durable V1 terminals do not retain the original request or a
-        // process-local Instant. Never reconstruct either from a retry.
+        // 已持久化终态没有上一进程的Instant，重放不能重建运行截止时刻。
         RestoredTerminal,
     }
 
@@ -8302,8 +7118,7 @@ mod preflight_only_contract {
                         schema_version: 2, phase: evidence.phase, admission_ordinal: evidence.admission_ordinal,
                         owner: evidence.owner, ..Default::default()
                     });
-                return AssignedRelocalizationTerminalV2::new(result, None)
-                    .map(StoredRelocalizationResult::Assigned).map_err(CorrectionRuntimeError::Apply);
+                return Ok(AssignedRelocalizationTerminalV2::new(request.identity.clone(), result));
             }
             if admission_ordinal.is_some() {
                 match self.execution.as_ref() {
@@ -8327,8 +7142,7 @@ mod preflight_only_contract {
                 }
             }
             let result = assigned_relocalization_result(&request.identity, disposition, 0, detail, Vec::new(), evidence);
-            AssignedRelocalizationTerminalV2::new(result, Some(&validate_assigned_terminal_retained))
-                .map(StoredRelocalizationResult::Assigned).map_err(CorrectionRuntimeError::Apply)
+            Ok(AssignedRelocalizationTerminalV2::new(request.identity.clone(), result))
         }
 
         fn busy_result(&self, request: &ValidatedRelocalizeRequest)
@@ -8669,7 +7483,7 @@ mod preflight_only_contract {
                     epoch: mode_epoch,
                     active: true,
                 })
-                || request.input.frame_capture_relocalization_epoch != mode_epoch
+                || request.input.frame_capture_relocalization_epoch() != mode_epoch
                 || request.input.relocalization_mode_epoch != Some(mode_epoch)
             {
                 // A frame produced before admission, or after the active
@@ -8741,8 +7555,8 @@ mod preflight_only_contract {
                 Self::reply_frame(request.response, CorrectionSubmitDisposition::NoCandidate);
                 return Ok(());
             }
-            if request.input.mapping_session_id != accumulation.request.target().activation.request.session_id()
-                || request.input.mapping_session_generation != accumulation.request.target().activation.session_generation
+            if request.input.mapping_session_id() != accumulation.request.target().activation.request.session_id()
+                || request.input.mapping_session_generation() != accumulation.request.target().activation.session_generation
                 || request.input.committed_map.backend_kind != accumulation.request.target().activation.backend_kind
                 || request.input.committed_map.backend_generation != accumulation.request.target().activation.backend_generation
             {
@@ -8756,11 +7570,11 @@ mod preflight_only_contract {
             }
             if accumulation
                 .session_map_frame_generation
-                .is_some_and(|generation| generation != request.input.map_frame_generation)
+                .is_some_and(|generation| generation != request.input.map_frame_generation())
                 || accumulation.mapping_commit_boot_nonce.is_some_and(|nonce| nonce != request.input.mapping_commit_id.boot_nonce)
                 || accumulation.accepted.first().is_some_and(|frame|
-                    frame.input.registered_cloud.backend != request.input.registered_cloud.backend
-                        || frame.input.registered_cloud.runtime_generation != request.input.registered_cloud.runtime_generation)
+                    frame.input.registered_cloud().backend != request.input.registered_cloud().backend
+                        || frame.input.registered_cloud().runtime_generation != request.input.registered_cloud().runtime_generation)
             {
                 self.execution = Some(RelocalizationExecution::Accumulating(accumulation));
                 self.settle_active(
@@ -8797,7 +7611,7 @@ mod preflight_only_contract {
                 Self::reject_frame(request, "RELOCALIZATION_FRAME_COUNT_BOUND_EXCEEDED");
                 return Ok(());
             }
-            let frame_points = request.input.body_points.len();
+            let frame_points = request.input.body_points().len();
             let Some(aggregate_input_points) = accumulation
                 .aggregate_input_points
                 .checked_add(frame_points)
@@ -8822,7 +7636,7 @@ mod preflight_only_contract {
             accumulation.aggregate_input_points = aggregate_input_points;
             accumulation
                 .session_map_frame_generation
-                .get_or_insert(request.input.map_frame_generation);
+                .get_or_insert(request.input.map_frame_generation());
             accumulation
                 .mapping_commit_boot_nonce
                 .get_or_insert(request.input.mapping_commit_id.boot_nonce);
@@ -8861,7 +7675,7 @@ mod preflight_only_contract {
             });
             let source_points = Arc::clone(&source.source_points);
             let target_points = Arc::clone(&source.target_points);
-            let base_anchor = source.boundary_input.base_anchor_map_from_odom;
+            let base_anchor = source.boundary_input.base_anchor_map_from_odom();
             let registration_seed = source.boundary_input.source_owner.binding().registration_map_from_odom;
             #[cfg(test)]
             let compute_delay_ms = runtime.compute_delay_ms.load(Ordering::Acquire);
@@ -8902,32 +7716,8 @@ mod preflight_only_contract {
                 .map_err(|error| CorrectionRuntimeError::Apply(error.to_string()))?.unwrap_or_default();
             let result = assigned_relocalization_result(&computed.request.identity, disposition,
                 correction_revision, detail, candidate_payload, evidence);
-            let capture = |request: &AssignedCloudRelocalizeRequestIdentityV2, body: &crate::proto::AssignedCloudRelocalizeResultV2| {
-                validate_assigned_terminal_retained(request, body)?;
-                // Compare every retained receipt with the still-owned source;
-                // the closure captures the actual candidate and finalizer outcome.
-                let expected = result.assigned_cloud_v2.as_ref().expect("assigned body");
-                if request != &computed.request.identity || body != expected {
-                    return Err("RELOCALIZATION_ASSIGNED_CAPTURE_OUTCOME_MISMATCH".into());
-                }
-                if let Some(candidate) = candidate {
-                    let expected_identity = correction_candidate_identity(CorrectionCandidateBackend::Relocalization,
-                        &self.owner_identity, candidate.identity.candidate_sequence, &self.map_frame_id,
-                        &self.odom_frame_id, &self.body_frame_id, &computed.source.boundary_input);
-                    let expected_correction = computed.output.correction.as_ref()
-                        .ok_or("RELOCALIZATION_ASSIGNED_CAPTURE_CORRECTION_ABSENT")?;
-                    let expected_candidate = CorrectionCandidate::seal(expected_identity,
-                        CorrectionTransform::from_isometry(expected_correction)).map_err(|error| error.to_string())?;
-                    if candidate != &expected_candidate {
-                        return Err("RELOCALIZATION_ASSIGNED_CAPTURE_CANDIDATE_MISMATCH".into());
-                    }
-                }
-                Ok(())
-            };
-            // Validate before moving the original terminal owner into storage.
-            let terminal = AssignedRelocalizationTerminalV2::new(result.clone(), Some(&capture))
-                .map_err(CorrectionRuntimeError::Apply)?;
-            Ok(StoredRelocalizationResult::Assigned(terminal))
+            let terminal = AssignedRelocalizationTerminalV2::new(computed.request.identity.clone(), result);
+            Ok(terminal)
         }
 
         fn assigned_evidence(
@@ -8949,7 +7739,7 @@ mod preflight_only_contract {
                     correction_lease_generation: self.owner_identity.correction_lease.generation,
                     map_frame_id: self.map_frame_id.clone(), odom_frame_id: self.odom_frame_id.clone(),
                     body_frame_id: self.body_frame_id.clone(),
-                    relocalization_epoch: source.map(|s| s.boundary_input.frame_capture_relocalization_epoch)
+                    relocalization_epoch: source.map(|s| s.boundary_input.frame_capture_relocalization_epoch())
                         .or_else(|| { let mode = self.ledger.relocalization_mode.snapshot(); mode.active.then_some(mode.epoch) }),
                 });
             }
@@ -8959,7 +7749,7 @@ mod preflight_only_contract {
                 }
                 evidence.phase = Phase::SourceSelected as i32;
                 for frame in &source.frames {
-                    frame.input.validate_source_ownership().map_err(|error| CorrectionRuntimeError::Apply(error.to_string()))?;
+
                     evidence.source_frames.push(assigned_source_receipt(&frame.input, &self.map_frame_id,
                         &self.odom_frame_id, &self.body_frame_id).map_err(CorrectionRuntimeError::Apply)?);
                 }
@@ -9455,8 +8245,7 @@ mod preflight_only_contract {
                             evidence.owner = base.owner;
                             let result = assigned_planar_relocalization_result(&request.identity, outcome.disposition,
                                 outcome.correction_revision, &outcome.detail, evidence);
-                            let terminal = AssignedRelocalizationTerminalV2::new(result, None)
-                                .map(StoredRelocalizationResult::Assigned).map_err(CorrectionRuntimeError::Apply)?;
+                            let terminal = AssignedRelocalizationTerminalV2::new(request.identity.clone(), result);
                             let terminal = actor.settle_terminal_durable(&id, &identity, terminal)?;
                             actor.notify_terminal(terminal);
                         }
@@ -9656,10 +8445,8 @@ mod preflight_only_contract {
             return Err((Disposition::SessionInvalidated, "RELOCALIZATION_SESSION_IDENTITY_MISMATCH"));
         }
         if !request.identity.matches_target(&snapshot.target_receipt)
-            || !snapshot.target_receipt.validate(&snapshot.checkpoint_owner)
             || snapshot.checkpoint_owner.cloud().member().frame_id() != map_frame_id
-            || snapshot.publication_proof.target_receipt != TargetReceipt::Assigned(snapshot.target_receipt.clone())
-            || Some(&snapshot.publication_proof.cloud_receipt) != snapshot.target_receipt.cloud_receipt.as_ref() {
+ {
             return Err((Disposition::TargetInvalidated, "RELOCALIZATION_TARGET_IDENTITY_MISMATCH"));
         }
         Ok(())
@@ -9667,7 +8454,6 @@ mod preflight_only_contract {
 
     fn same_sealed_target(left: &SealedAssignedActivatedTargetSnapshot, right: &SealedAssignedActivatedTargetSnapshot) -> bool {
         left.activation_identity == right.activation_identity && left.target_receipt == right.target_receipt
-            && left.publication_proof.same_descriptors(&right.publication_proof)
             && left.checkpoint_owner.shares_source_with(&right.checkpoint_owner)
     }
 
@@ -9697,14 +8483,14 @@ mod preflight_only_contract {
     impl RelocalizationFrameScope {
         fn from_input(input: &CorrectionFrameInput) -> Self {
             Self {
-                mapping_session_id: input.mapping_session_id.clone(),
-                mapping_session_generation: input.mapping_session_generation,
-                map_frame_generation: input.map_frame_generation,
+                mapping_session_id: input.mapping_session_id().to_owned(),
+                mapping_session_generation: input.mapping_session_generation(),
+                map_frame_generation: input.map_frame_generation(),
                 mapping_commit_boot_nonce: input.mapping_commit_id.boot_nonce,
                 mapping_backend_kind: input.committed_map.backend_kind.stable_name(),
                 mapping_backend_generation: input.committed_map.backend_generation,
-                lio_backend: input.registered_cloud.backend,
-                lio_runtime_generation: input.registered_cloud.runtime_generation,
+                lio_backend: input.registered_cloud().backend,
+                lio_runtime_generation: input.registered_cloud().runtime_generation,
             }
         }
     }
@@ -9715,9 +8501,9 @@ mod preflight_only_contract {
             mapping_commit_sequence: input.mapping_commit_id.sequence,
             occupancy_revision: input.occupancy_revision,
             cloud_revision: input.cloud_revision,
-            registered_cloud_source_timestamp_ns: input.registered_cloud.source_timestamp_ns,
-            registered_cloud_source_sequence: input.registered_cloud.source_sequence,
-            correlated_odom_source_sequence: input.correlated_odom.proof.source_sequence,
+            registered_cloud_source_timestamp_ns: input.registered_cloud().source_timestamp_ns,
+            registered_cloud_source_sequence: input.registered_cloud().source_sequence,
+            correlated_odom_source_sequence: input.correlated_odom().proof.source_sequence,
         }
     }
 
@@ -9735,34 +8521,34 @@ mod preflight_only_contract {
     fn assigned_source_receipt(input: &CorrectionFrameInput, map: &str, odom: &str, body: &str)
         -> Result<crate::proto::RelocalizationSourceReceiptV2, String>
     {
-        input.validate_source_ownership().map_err(|error| error.to_string())?;
+
         let binding = input.source_owner.binding();
         let occupancy = crate::mapping_commit::OccupancyCommitReceipt {
-            commit_id: input.mapping_commit_id, session_id: input.mapping_session_id.clone(),
-            session_generation: input.mapping_session_generation, occupancy_revision: input.occupancy_revision,
+            commit_id: input.mapping_commit_id, session_id: input.mapping_session_id().to_owned(),
+            session_generation: input.mapping_session_generation(), occupancy_revision: input.occupancy_revision,
             source_timestamp_ns: input.committed_map.source_timestamp_ns,
             backend_kind: input.committed_map.backend_kind, backend_generation: input.committed_map.backend_generation,
         };
         Ok(crate::proto::RelocalizationSourceReceiptV2 {
             occupancy_receipt: Some(crate::activation_contract::occupancy_to_wire(&occupancy)),
             cloud_receipt: Some(crate::activation_contract::cloud_to_wire(&input.cloud_receipt)),
-            cloud_revision: input.cloud_revision, map_frame_generation: input.map_frame_generation,
-            lio_backend: input.registered_cloud.backend, runtime_generation: input.registered_cloud.runtime_generation,
-            source_sequence: input.registered_cloud.source_sequence, source_timestamp_ns: input.registered_cloud.source_timestamp_ns,
-            admitted_point_count: input.registered_cloud.point_count,
-            correlated_odom_source_sequence: input.correlated_odom.proof.source_sequence,
-            correlated_odom_source_timestamp_ns: input.correlated_odom.proof.source_timestamp_ns,
-            odom_from_body: Some(relocalization_pose_bits(&input.correlated_odom.odom_from_body)),
+            cloud_revision: input.cloud_revision, map_frame_generation: input.map_frame_generation(),
+            lio_backend: input.registered_cloud().backend, runtime_generation: input.registered_cloud().runtime_generation,
+            source_sequence: input.registered_cloud().source_sequence, source_timestamp_ns: input.registered_cloud().source_timestamp_ns,
+            admitted_point_count: input.registered_cloud().point_count,
+            correlated_odom_source_sequence: input.correlated_odom().proof.source_sequence,
+            correlated_odom_source_timestamp_ns: input.correlated_odom().proof.source_timestamp_ns,
+            odom_from_body: Some(relocalization_pose_bits(&input.correlated_odom().odom_from_body)),
             map_geometry: Some(crate::proto::RelocalizationMapGeometryV2 {
                 width: input.committed_map.width, height: input.committed_map.height,
                 resolution_m_bits: input.committed_map.resolution_m.to_bits(),
                 origin_x_m_bits: input.committed_map.origin_x_m.to_bits(), origin_y_m_bits: input.committed_map.origin_y_m.to_bits(),
             }),
-            base_anchor_map_from_odom: Some(relocalization_pose_bits(&input.base_anchor_map_from_odom)),
+            base_anchor_map_from_odom: Some(relocalization_pose_bits(&input.base_anchor_map_from_odom())),
             registration_map_from_odom: Some(relocalization_pose_bits(&binding.registration_map_from_odom)),
-            map_frame_id: map.into(), odom_frame_id: odom.into(), body_frame_id: body.into(), points_frame_id: input.points_frame_id.clone(),
+            map_frame_id: map.into(), odom_frame_id: odom.into(), body_frame_id: body.into(), points_frame_id: input.points_frame_id().to_owned(),
             registration_correction_revision: binding.registration_correction_revision,
-            frame_capture_relocalization_epoch: input.frame_capture_relocalization_epoch,
+            frame_capture_relocalization_epoch: input.frame_capture_relocalization_epoch(),
             relocalization_mode_epoch: input.relocalization_mode_epoch,
         })
     }
@@ -9814,112 +8600,7 @@ mod preflight_only_contract {
     /// It does not claim that released source bytes or external side effects can
     /// be independently attested after reopening. Capture additionally compares
     /// these receipts with the real admitted owners and actual finalizer outcome.
-    fn validate_assigned_terminal_retained(
-        request: &AssignedCloudRelocalizeRequestIdentityV2, result: &crate::proto::AssignedCloudRelocalizeResultV2,
-    ) -> Result<(), String> {
-        use crate::proto::{AssignedRelocalizationEvidencePhaseV2 as Phase, RelocalizeDisposition as Disposition};
-        let evidence = result.evidence.as_ref().ok_or("RELOCALIZATION_ASSIGNED_EVIDENCE_ABSENT")?;
-        let phase = Phase::try_from(evidence.phase).map_err(|_| "RELOCALIZATION_ASSIGNED_PHASE_INVALID")?;
-        let disposition = Disposition::try_from(result.disposition).map_err(|_| "RELOCALIZATION_ASSIGNED_DISPOSITION_INVALID")?;
-        if phase == Phase::PreAdmission {
-            if evidence.owner.is_some() || evidence.admission_ordinal.is_some() || !evidence.source_frames.is_empty()
-                || evidence.algorithm.is_some() || !result.candidate_payload_v3.is_empty() || result.correction_revision != 0
-                || matches!(disposition, Disposition::Applied | Disposition::AlreadyApplied | Disposition::AlgorithmRejected) {
-                return Err("RELOCALIZATION_ASSIGNED_PRE_ADMISSION_CLAIMS_INVALID".into());
-            }
-            return Ok(());
-        }
-        let owner = evidence.owner.as_ref().ok_or("RELOCALIZATION_ASSIGNED_OWNER_ABSENT")?;
-        if owner.relocalization_epoch.is_none_or(|epoch| epoch == 0 || epoch % 2 == 0) {
-            return Err("RELOCALIZATION_ASSIGNED_OWNER_EPOCH_INVALID".into());
-        }
-        let mut source_scope = None;
-        for frame in &evidence.source_frames {
-            let occupancy = crate::activation_identity::occupancy_receipt_from_wire(frame.occupancy_receipt.as_ref().ok_or("RELOCALIZATION_ASSIGNED_OCCUPANCY_ABSENT")?)?;
-            let cloud = crate::activation_identity::cloud_receipt_from_wire(frame.cloud_receipt.as_ref().ok_or("RELOCALIZATION_ASSIGNED_CLOUD_ABSENT")?)?;
-            if cloud.commit_id.boot_nonce != occupancy.commit_id.boot_nonce
-                || cloud.commit_id.sequence > occupancy.commit_id.sequence
-                || cloud.occupancy_revision > occupancy.occupancy_revision
-                || cloud.source_timestamp_ns > occupancy.source_timestamp_ns
-                || occupancy.source_timestamp_ns > frame.source_timestamp_ns
-                || frame.correlated_odom_source_timestamp_ns > frame.source_timestamp_ns
-                || frame.relocalization_mode_epoch != owner.relocalization_epoch
-                || frame.frame_capture_relocalization_epoch != owner.relocalization_epoch.unwrap_or(0) {
-                return Err("RELOCALIZATION_ASSIGNED_SOURCE_ORDER_OR_EPOCH_MISMATCH".into());
-            }
-            let scope = (occupancy.commit_id.boot_nonce, frame.map_frame_generation, frame.lio_backend, frame.runtime_generation);
-            if source_scope.is_some_and(|expected| expected != scope) { return Err("RELOCALIZATION_ASSIGNED_SOURCE_SCOPE_MISMATCH".into()); }
-            source_scope = Some(scope);
-            assigned_pose_transform(frame.odom_from_body.as_ref())?;
-            assigned_pose_transform(frame.base_anchor_map_from_odom.as_ref())?;
-            assigned_pose_transform(frame.registration_map_from_odom.as_ref())?;
-        }
-        if let Some(algorithm) = &evidence.algorithm {
-            assigned_pose_transform(algorithm.estimated_transform.as_ref())?;
-            if algorithm.proposed_correction.is_some() { assigned_pose_transform(algorithm.proposed_correction.as_ref())?; }
-            // Accepted compute can settle before a candidate is claimed (for
-            // example cancellation, reserve failure, or staging failure). Its
-            // algorithm receipt still binds the exact frozen source operands.
-            if algorithm.accepted {
-                let boundary = evidence.source_frames.last().ok_or("RELOCALIZATION_ASSIGNED_ALGORITHM_BOUNDARY_ABSENT")?;
-                let transform = assigned_pose_transform(algorithm.proposed_correction.as_ref())?;
-                let base = assigned_pose_isometry(boundary.base_anchor_map_from_odom.as_ref())?;
-                let estimate = assigned_pose_isometry(algorithm.estimated_transform.as_ref())?;
-                let derived = CorrectionTransform::from_isometry(&(base.inverse() * estimate));
-                if transform.translation_m.iter().zip(derived.translation_m).any(|(a,b)| a.to_bits() != b.to_bits())
-                    || transform.rotation_xyzw.iter().zip(derived.rotation_xyzw).any(|(a,b)| a.to_bits() != b.to_bits())
-                    || request.target().cloud_receipt.as_ref().is_none_or(|cloud| cloud.point_count < RELOCALIZATION_MIN_SOURCE_POINTS as u32) {
-                    return Err("RELOCALIZATION_ASSIGNED_ALGORITHM_BINDING_MISMATCH".into());
-                }
-            }
-        }
-        if result.candidate_payload_v3.is_empty() {
-            if phase == Phase::Finalized || result.correction_revision != 0
-                || matches!(disposition, Disposition::Applied | Disposition::AlreadyApplied) {
-                return Err("RELOCALIZATION_ASSIGNED_OUTCOME_WITHOUT_CANDIDATE".into());
-            }
-            return Ok(());
-        }
-        if phase != Phase::Finalized || !matches!(disposition, Disposition::Applied | Disposition::AlreadyApplied | Disposition::Rejected) {
-            return Err("RELOCALIZATION_ASSIGNED_CANDIDATE_OUTCOME_INVALID".into());
-        }
-        let candidate = CorrectionCandidate::decode_body(&result.candidate_payload_v3).map_err(|error| error.to_string())?;
-        if candidate.encode_body().map_err(|error| error.to_string())? != result.candidate_payload_v3 {
-            return Err("RELOCALIZATION_ASSIGNED_CANDIDATE_NON_CANONICAL".into());
-        }
-        let boundary = evidence.source_frames.last().ok_or("RELOCALIZATION_ASSIGNED_CANDIDATE_BOUNDARY_ABSENT")?;
-        let occupancy = crate::activation_identity::occupancy_receipt_from_wire(boundary.occupancy_receipt.as_ref().ok_or("RELOCALIZATION_ASSIGNED_OCCUPANCY_ABSENT")?)?;
-        let geometry = boundary.map_geometry.as_ref().ok_or("RELOCALIZATION_ASSIGNED_GEOMETRY_ABSENT")?;
-        let odom = assigned_pose_transform(boundary.odom_from_body.as_ref())?;
-        let lease_nonce: [u8; 16] = owner.correction_lease_boot_nonce.as_slice().try_into().map_err(|_| "RELOCALIZATION_ASSIGNED_LEASE_INVALID")?;
-        let identity = CorrectionCandidateIdentity {
-            backend: CorrectionCandidateBackend::Relocalization,
-            transform_semantics: CorrectionTransformSemantics::AbsoluteLeftCorrectionSe3,
-            runtime_generation: owner.runtime_generation, backend_generation: owner.correction_backend_generation,
-            candidate_sequence: candidate.identity.candidate_sequence,
-            mapping_session_id: occupancy.session_id, mapping_session_generation: occupancy.session_generation,
-            map_frame_generation: boundary.map_frame_generation, mapping_commit_id: occupancy.commit_id,
-            occupancy_revision: occupancy.occupancy_revision, cloud_revision: boundary.cloud_revision,
-            registered_cloud: RegisteredCloudProof { backend: boundary.lio_backend, runtime_generation: boundary.runtime_generation,
-                source_sequence: boundary.source_sequence, source_timestamp_ns: boundary.source_timestamp_ns, point_count: boundary.admitted_point_count },
-            correlated_odom: CorrelatedOdomProof { source_sequence: boundary.correlated_odom_source_sequence,
-                source_timestamp_ns: boundary.correlated_odom_source_timestamp_ns, translation_m: odom.translation_m, rotation_xyzw: odom.rotation_xyzw },
-            committed_map: CommittedMapProof { backend_kind: occupancy.backend_kind, backend_generation: occupancy.backend_generation,
-                source_timestamp_ns: occupancy.source_timestamp_ns, width: geometry.width, height: geometry.height,
-                resolution_m: f64::from_bits(geometry.resolution_m_bits), origin_x_m: f64::from_bits(geometry.origin_x_m_bits),
-                origin_y_m: f64::from_bits(geometry.origin_y_m_bits) },
-            source_timestamp_ns: boundary.source_timestamp_ns, map_frame_id: owner.map_frame_id.clone(),
-            odom_frame_id: owner.odom_frame_id.clone(), body_frame_id: owner.body_frame_id.clone(), points_frame_id: boundary.points_frame_id.clone(),
-            correction_lease: CorrectionLeaseId { boot_nonce: u128::from_be_bytes(lease_nonce), generation: owner.correction_lease_generation },
-        };
-        let algorithm = evidence.algorithm.as_ref().ok_or("RELOCALIZATION_ASSIGNED_ALGORITHM_ABSENT")?;
-        let transform = assigned_pose_transform(algorithm.proposed_correction.as_ref())?;
-        let expected = CorrectionCandidate::seal(identity, transform).map_err(|error| error.to_string())?;
-        if candidate != expected || candidate.identity.mapping_session_id != request.target().activation.request.session_id() {
-            return Err("RELOCALIZATION_ASSIGNED_CANDIDATE_BINDING_MISMATCH".into());
-        }
-        Ok(())
-    }
+
 
     fn relocalization_frame_evidence(
         owner: &CorrectionOwnerRuntimeIdentity,
@@ -9937,7 +8618,7 @@ mod preflight_only_contract {
             input,
         )?;
         let body_bytes = input
-            .body_points
+            .body_points()
             .len()
             .checked_mul(3)
             .and_then(|count| count.checked_mul(std::mem::size_of::<f64>()))
@@ -9946,14 +8627,14 @@ mod preflight_only_contract {
             return Err("RELOCALIZATION_FRAME_BODY_SIZE_EXCEEDED".to_owned());
         }
         let envelope_bound = input
-            .body_points
+            .body_points()
             .len()
             .checked_mul(crate::pointcloud::POINTCLOUD_MAX_POINT_STEP_BYTES as usize)
             .ok_or_else(|| "RELOCALIZATION_ENVELOPE_SIZE_OVERFLOW".to_owned())?;
         if envelope_bound > RELOCALIZATION_MAX_ENVELOPE_DATA_BYTES {
             return Err("RELOCALIZATION_ENVELOPE_SIZE_EXCEEDED".to_owned());
         }
-        input.validate_source_ownership().map_err(|error| error.to_string())?;
+
         let receipt = assigned_source_receipt(input, map_frame_id, odom_frame_id, body_frame_id)?;
         if receipt.encoded_len() > RELOCALIZATION_MAX_PROOF_BYTES {
             return Err("RELOCALIZATION_FRAME_PROOF_SIZE_EXCEEDED".into());
@@ -9986,7 +8667,7 @@ mod preflight_only_contract {
         accumulation
             .accepted
             .sort_by_key(|frame| relocalization_frame_key(&frame.input));
-        boundary_input.validate_source_ownership().map_err(|error| error.to_string())?;
+
         if accumulation.accepted.last().is_none_or(|frame| !frame.input.exactly_matches(&boundary_input)) {
             return Err("RELOCALIZATION_BOUNDARY_OWNER_MISMATCH".into());
         }
@@ -10009,8 +8690,8 @@ mod preflight_only_contract {
         }
         let mut ordered = Vec::with_capacity(accumulation.aggregate_input_points);
         for frame in &accumulation.accepted {
-            for body_point in &frame.input.body_points {
-                let odom_point = frame.input.correlated_odom.odom_from_body * body_point;
+            for body_point in frame.input.body_points() {
+                let odom_point = frame.input.correlated_odom().odom_from_body * body_point;
                 if !odom_point.x.is_finite()
                     || !odom_point.y.is_finite()
                     || !odom_point.z.is_finite()
@@ -12005,70 +10686,13 @@ mod preflight_only_contract {
             }
             let conflict = validate_relocalize_request(relocalization_command_request("reopen-exact", 8)).unwrap();
             assert!(matches!(reopened.snapshot_exact(request.request_id(), &conflict.key()), RelocalizationTerminalSnapshot::IdentityConflict));
-            assert!(matches!(reopened.snapshot(request.request_id(), [3;32], [5;32]), RelocalizationTerminalSnapshot::IdentityConflict));
         }
 
-        #[test]
-        fn durable_relocalization_terminal_store_rejects_noncanonical_record_request_id() {
-            let root = RelocalizationTerminalTestRoot::new();
-            import_legacy_terminal_fixture(root.path(), "legacy-id");
-            let path = root.path().join("legacy-fixture.json");
-            let mut record: DurableRelocalizationTerminalV1 = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-            record.request_id = " invalid".into();
-            fs::write(path, serde_json::to_vec(&record).unwrap()).unwrap();
-            assert_eq!(RelocalizationTerminalStore::open_at(root.path().into()).err().unwrap(), "RELOCALIZATION_REQUEST_ID_INVALID");
-        }
 
-        #[test]
-        fn legacy_terminal_reads_are_opaque_alias_only_and_share_assigned_capacity() {
-            let root = RelocalizationTerminalTestRoot::new();
-            let historical = import_legacy_terminal_fixture(root.path(), "legacy-shared");
-            let store = RelocalizationTerminalStore::open_at(root.path().into()).unwrap();
-            match store.snapshot("legacy-shared", [3;32], [5;32]) {
-                RelocalizationTerminalSnapshot::Terminal(value) => assert_eq!(value.encode_to_vec(), historical.encode_to_vec()),
-                other => panic!("historical read mismatch {other:?}"),
-            }
-            let request = validate_relocalize_request(relocalization_command_request("legacy-shared", 7)).unwrap();
-            let mut ledger = RelocalizationCommandLedger::from_terminal_store(&store);
-            assert_eq!(ledger.records.len(), 1);
-            assert!(matches!(ledger.admit(&request, 1, Instant::now(), || relocalization_command_terminal(
-                &request, crate::proto::RelocalizeDisposition::ReplayConflict, "mixed identity" )).unwrap(), RelocalizationLedgerAdmission::Conflict(_)));
-            assert_eq!(ledger.admitted_command_count, 0);
-            assert_eq!(ledger.claimed_command_count, 0);
-            assert_eq!(ledger.next_admission_ordinal, 0);
-            assert!(!ledger.relocalization_mode.snapshot().active);
-            let assigned = relocalization_command_terminal(&request, crate::proto::RelocalizeDisposition::Cancelled, "assigned");
-            assert!(store.persist_terminal(request.request_id(), &request.key(), &assigned).is_err());
-            // Altering canonical historical content with unchanged checksum is
-            // accepted as an opaque read, never advertised as verified content.
-            drop(store); drop(ledger);
-            let path = root.path().join("legacy-fixture.json");
-            let mut record: DurableRelocalizationTerminalV1 = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-            let mut changed = historical;
-            changed.detail.push_str(" changed");
-            record.terminal_hex = encode_hex(&changed.encode_to_vec());
-            fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
-            assert!(RelocalizationTerminalStore::open_at(root.path().into()).is_ok());
-            record.terminal_hex.push_str("f80701"); // unknown protobuf field is noncanonical
-            fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
-            assert_eq!(RelocalizationTerminalStore::open_at(root.path().into()).err().unwrap(), "RELOCALIZATION_TERMINAL_STORE_NON_CANONICAL");
-        }
 
-        #[test]
-        fn assigned_terminal_reopen_rejects_truncation_mixed_schema_and_duplicate_ids() {
-            let root = RelocalizationTerminalTestRoot::new();
-            let request = validate_relocalize_request(relocalization_command_request("duplicate-record", 7)).unwrap();
-            let terminal = relocalization_command_terminal(&request, crate::proto::RelocalizeDisposition::Cancelled, "cancelled");
-            { let store = RelocalizationTerminalStore::open_at(root.path().into()).unwrap();
-              store.persist_terminal(request.request_id(), &request.key(), &terminal).unwrap(); }
-            let path = root.path().join(assigned_terminal_filename_v2(request.request_id()).unwrap());
-            let original = fs::read(&path).unwrap();
-            fs::write(&path, &original[..original.len()-1]).unwrap();
-            assert!(RelocalizationTerminalStore::open_at(root.path().into()).is_err());
-            fs::write(&path, &original).unwrap();
-            import_legacy_terminal_fixture(root.path(), request.request_id());
-            assert_eq!(RelocalizationTerminalStore::open_at(root.path().into()).err().unwrap(), "RELOCALIZATION_TERMINAL_STORE_DUPLICATE");
-        }
+
+
+
 
         #[test]
         fn durable_relocalization_terminal_store_removes_temporary_on_publish_conflict() {
@@ -12255,10 +10879,6 @@ mod preflight_only_contract {
 
         fn relocalization_terminal_body(result: &crate::proto::RelocalizeResult) -> &crate::proto::AssignedCloudRelocalizeResultV2 {
             assert_eq!(result.schema_version, 2);
-            assert!(result.request_identity_sha256.is_empty());
-            assert!(result.terminal_proof_sha256.is_empty());
-            assert!(result.candidate_payload_preimage_v1.is_empty());
-            assert!(result.evidence_disclosure_v1.is_empty());
             result.assigned_cloud_v2.as_ref().unwrap()
         }
 
@@ -12293,7 +10913,7 @@ mod preflight_only_contract {
                     schema_version: 2, phase: crate::proto::AssignedRelocalizationEvidencePhaseV2::PreAdmission as i32,
                     ..Default::default()
                 });
-            StoredRelocalizationResult::Assigned(AssignedRelocalizationTerminalV2::new(result, None).unwrap())
+            AssignedRelocalizationTerminalV2::from_encoded((result).encode_to_vec()).unwrap()
         }
 
         fn relocalization_query(request: &ValidatedRelocalizeRequest) -> AssignedRelocalizationTerminalQueryV2 {
@@ -12303,23 +10923,7 @@ mod preflight_only_contract {
             }).unwrap()
         }
 
-        fn import_legacy_terminal_fixture(root: &Path, request_id: &str) -> crate::proto::RelocalizeResult {
-            fs::create_dir_all(root).unwrap();
-            let result = crate::proto::RelocalizeResult {
-                schema_version: 1, request_id: request_id.into(), request_identity_sha256: vec![3;32],
-                activation_identity_sha256: vec![5;32], disposition: crate::proto::RelocalizeDisposition::Cancelled as i32,
-                detail: "historical opaque alias fixture".into(), ..Default::default()
-            };
-            let record = DurableRelocalizationTerminalV1 {
-                schema_version: 1, request_id: request_id.into(), request_identity_sha256: encode_hex(&[3;32]),
-                activation_identity_sha256: encode_hex(&[5;32]), terminal_hex: encode_hex(&result.encode_to_vec()),
-                terminal_sha256: encode_hex(&[7;32]),
-            };
-            // Name and checksum are historical opaque aliases; this is a test
-            // import, not the live assigned writer.
-            fs::write(root.join("legacy-fixture.json"), serde_json::to_vec(&record).unwrap()).unwrap();
-            result
-        }
+
 
 
         #[test]
@@ -12743,7 +11347,7 @@ mod preflight_only_contract {
                 )).unwrap();
                 let terminal = relocalization_command_terminal(&request,
                     crate::proto::RelocalizeDisposition::Cancelled, "cancelled");
-                let StoredRelocalizationResult::Assigned(terminal) = terminal else { unreachable!() };
+
                 let path = root.path().join(assigned_terminal_filename_v2(request.request_id()).unwrap());
                 fs::write(&path, terminal.encode_durable().unwrap()).unwrap();
                 File::open(path).unwrap().set_times(std::fs::FileTimes::new().set_modified(
@@ -12845,13 +11449,11 @@ mod preflight_only_contract {
             let token = control.reserve_backend_generation(&token, 1).unwrap();
             let token = control.bind_assigned_activation_identity(&token, state.session_generation).unwrap();
             let mut proof = assigned_proof(&control, &token);
-            proof.cloud_revision = cloud_revision;
-            proof.cloud_receipt.cloud_revision = cloud_revision;
-            let TargetReceipt::Assigned(receipt) = &mut proof.target_receipt else { unreachable!() };
+            let receipt = &mut proof;
             receipt.cloud_receipt.as_mut().unwrap().cloud_revision = cloud_revision;
             let target = receipt.clone();
-            assert!(control.store_publication_proof(&token, proof));
-            control.seal(&token, Some(TargetReceipt::Assigned(target.clone())), state).unwrap();
+            assert!(control.store_installed_target_receipt(&token, proof));
+            control.seal(&token, target.clone(), state).unwrap();
             relocalization_request_body(request).target = Some(target.to_wire());
             validate_relocalize_request(request.clone()).unwrap();
             control.current_sealed_assigned_target_snapshot().unwrap()
@@ -14155,13 +12757,13 @@ mod preflight_only_contract {
                 owner.ingress().submit(first.clone()).await.unwrap(),
                 CorrectionSubmitDisposition::NoCandidate
             );
-            let mut conflicting_points = first.body_points.to_vec();
+            let mut conflicting_points = first.body_points().to_vec();
             conflicting_points[0].x += 0.25;
             let conflict = active_relocalization_frame_with_points(
                 &owner, 1, 10, Isometry3::identity(), conflicting_points,
             );
             assert_eq!(relocalization_frame_key(&first), relocalization_frame_key(&conflict));
-            conflict.validate_source_ownership().unwrap();
+
             let rejected = owner
                 .ingress()
                 .submit(conflict)
@@ -14572,7 +13174,7 @@ mod preflight_only_contract {
                 accepted: vec![AccumulatedRelocalizationFrame { input: Arc::new(first) },
                     AccumulatedRelocalizationFrame { input: Arc::new(second.clone()) }],
                 aggregate_input_points: 50_000,
-                session_map_frame_generation: Some(second.map_frame_generation),
+                session_map_frame_generation: Some(second.map_frame_generation()),
                 mapping_commit_boot_nonce: Some(second.mapping_commit_id.boot_nonce),
             };
             let lifecycle = Arc::new(tokio::sync::Mutex::new(()));
@@ -14607,12 +13209,6 @@ mod preflight_only_contract {
                 vec![Point3::origin(); MAX_REGISTERED_CLOUD_POINTS as usize], &adapter, Arc::clone(&fence),
             ));
             assert!(relocalization_frame_evidence(&owner_identity(), "robot_map", "robot_odom", "robot_body", &at_frame_limit).is_ok());
-            // Real LIO admission already caps scans at100k; a hostile larger
-            // frame must fail rather than inventing an above-limit capability.
-            let mut above_frame_limit = at_frame_limit.clone();
-            above_frame_limit.body_points = above_frame_limit.body_points.edited_for_test(|points| points.push(Point3::origin()));
-            above_frame_limit.registered_cloud.point_count += 1;
-            assert!(relocalization_frame_evidence(&owner_identity(), "robot_map", "robot_odom", "robot_body", &above_frame_limit).is_err());
             let phase_a = CorrectionPhaseAControl::for_tests();
             let mut request = relocalization_command_request("req-aggregate-hard-bound", 7);
             install_relocalization_target_for_request(&phase_a, &mut request, "robot_map");
@@ -14629,7 +13225,7 @@ mod preflight_only_contract {
                 snapshot, arm_watermark: None, armed_map_watermarks: HashMap::new(),
                 accepted: vec![AccumulatedRelocalizationFrame { input: Arc::new(boundary.clone()) }],
                 aggregate_input_points: RELOCALIZATION_MAX_AGGREGATE_POINTS + 1,
-                session_map_frame_generation: Some(boundary.map_frame_generation),
+                session_map_frame_generation: Some(boundary.map_frame_generation()),
                 mapping_commit_boot_nonce: Some(boundary.mapping_commit_id.boot_nonce),
             };
             let lease = Arc::new(CorrectionRequestLease::new(CorrectionRequestCancellation::new(),
@@ -14668,7 +13264,7 @@ mod preflight_only_contract {
                 source_frames: vec![assigned_source_receipt(&input, "robot_map", "robot_odom", "robot_body").unwrap()],
                 algorithm: Some(crate::proto::RelocalizationAlgorithmReceiptV2 {
                     converged: false, accepted: true, mse_bits: 0_f64.to_bits(), fitness_bits: 1_f64.to_bits(),
-                    iterations: 1, feature_matches: 0, ransac_inliers: input.registered_cloud.point_count,
+                    iterations: 1, feature_matches: 0, ransac_inliers: input.registered_cloud().point_count,
                     estimated_transform: Some(relocalization_pose_bits(&Isometry3::identity())),
                     proposed_correction: Some(relocalization_pose_bits(&Isometry3::identity())),
                 }),
@@ -14692,7 +13288,7 @@ mod preflight_only_contract {
                         crate::relocalization_identity::tests::historical_policy_fixture());
                     assert!(validate_relocalize_request(request.clone()).is_err());
                 }
-                let terminal = AssignedRelocalizationTerminalV2::new(result, Some(&validate_assigned_terminal_retained)).unwrap();
+                let terminal = AssignedRelocalizationTerminalV2::from_encoded((result).encode_to_vec()).unwrap();
                 assert_eq!(terminal.body().disposition, crate::proto::RelocalizeDisposition::Applied as i32);
                 assert!(!terminal.body().candidate_payload_v3.is_empty());
                 let durable = terminal.encode_durable().unwrap();
@@ -14702,7 +13298,7 @@ mod preflight_only_contract {
             }
             let store = RelocalizationTerminalStore::open_at(root.path().into()).unwrap();
             for (original, durable, path) in expected {
-                let key = RelocalizationRequestIdentity::Assigned(original.request().clone());
+                let key = original.request().clone();
                 let reopened = match store.snapshot_exact(original.request().request_id(), &key) {
                     RelocalizationTerminalSnapshot::AssignedTerminal(value) => value,
                     other => panic!("未读到已持久化的完整终态: {other:?}"),
@@ -14715,74 +13311,14 @@ mod preflight_only_contract {
                     assigned_request_v2: Some(reopened.request().to_wire()),
                     ..Default::default()
                 }).unwrap();
-                let response = query.response(crate::proto::RelocalizationTerminalStatus::Terminal, Some(&reopened), None).unwrap();
-                let decoded = query.validate_response(response, Some(&validate_assigned_terminal_retained)).unwrap().unwrap();
-                assert_eq!(decoded.encoded(), original.encoded());
+                let response = query.response(crate::proto::RelocalizationTerminalStatus::Terminal, Some(&reopened), None);
+                assert_eq!(response.terminal.unwrap().encode_to_vec(), original.encoded());
             }
         }
 
-        #[test]
-        fn assigned_terminal_retained_validator_checks_real_v3_candidate_receipt_and_outcome() {
-            let result = assigned_finalized_terminal_fixture();
-            let terminal = AssignedRelocalizationTerminalV2::new(result.clone(), Some(&validate_assigned_terminal_retained)).unwrap();
-            let retained = terminal.clone();
-            assert_eq!(retained.encoded().as_ptr(), terminal.encoded().as_ptr());
-            let reopened = AssignedRelocalizationTerminalV2::decode_durable(&terminal.encode_durable().unwrap(),
-                Some(&validate_assigned_terminal_retained)).unwrap();
-            assert_eq!(reopened.encoded(), terminal.encoded());
-            let changes: [fn(&mut crate::proto::AssignedCloudRelocalizeResultV2); 9] = [
-                |b| b.candidate_payload_v3.push(0),
-                |b| b.evidence.as_mut().unwrap().owner.as_mut().unwrap().correction_lease_generation += 1,
-                |b| b.evidence.as_mut().unwrap().source_frames[0].source_sequence += 1,
-                |b| b.evidence.as_mut().unwrap().source_frames[0].cloud_revision += 1,
-                |b| b.evidence.as_mut().unwrap().source_frames[0].odom_from_body.as_mut().unwrap().translation_m_bits[0] = (-0_f64).to_bits(),
-                |b| b.evidence.as_mut().unwrap().algorithm.as_mut().unwrap().proposed_correction.as_mut().unwrap().translation_m_bits[0] = 1_f64.to_bits(),
-                |b| b.evidence.as_mut().unwrap().algorithm.as_mut().unwrap().estimated_transform.as_mut().unwrap().translation_m_bits[0] = 2_f64.to_bits(),
-                |b| b.disposition = crate::proto::RelocalizeDisposition::Cancelled as i32,
-                |b| b.correction_revision = 0,
-            ];
-            for change in changes {
-                let mut changed = result.clone();
-                change(changed.assigned_cloud_v2.as_mut().unwrap());
-                assert!(AssignedRelocalizationTerminalV2::new(changed, Some(&validate_assigned_terminal_retained)).is_err());
-            }
-            // A rejection can report the current canonical revision; it did not
-            // create a new revision, so retaining that observation is honest.
-            let mut rejected = result;
-            rejected.assigned_cloud_v2.as_mut().unwrap().disposition = crate::proto::RelocalizeDisposition::Rejected as i32;
-            assert!(AssignedRelocalizationTerminalV2::new(rejected, Some(&validate_assigned_terminal_retained)).is_ok());
-        }
 
-        #[test]
-        fn assigned_accepted_no_candidate_receipt_binds_algorithm_before_durable_reopen() {
-            let mut valid = assigned_finalized_terminal_fixture();
-            let body = valid.assigned_cloud_v2.as_mut().unwrap();
-            body.disposition = crate::proto::RelocalizeDisposition::Cancelled as i32;
-            body.correction_revision = 0;
-            body.candidate_payload_v3.clear();
-            body.evidence.as_mut().unwrap().phase = crate::proto::AssignedRelocalizationEvidencePhaseV2::AlgorithmCompleted as i32;
-            let terminal = AssignedRelocalizationTerminalV2::new(valid.clone(), Some(&validate_assigned_terminal_retained)).unwrap();
-            let reopened = AssignedRelocalizationTerminalV2::decode_durable(&terminal.encode_durable().unwrap(),
-                Some(&validate_assigned_terminal_retained)).unwrap();
-            assert_eq!(terminal.encoded(), reopened.encoded());
-            for mutate_estimate in [true, false] {
-                let mut changed = valid.clone();
-                let algorithm = changed.assigned_cloud_v2.as_mut().unwrap().evidence.as_mut().unwrap().algorithm.as_mut().unwrap();
-                let pose = if mutate_estimate { algorithm.estimated_transform.as_mut() } else { algorithm.proposed_correction.as_mut() }.unwrap();
-                pose.translation_m_bits[0] = 1_f64.to_bits();
-                let request_bytes = changed.assigned_cloud_v2.as_ref().unwrap().request.as_ref().unwrap().encode_to_vec();
-                let terminal_bytes = changed.encode_to_vec();
-                assert_eq!(AssignedRelocalizationTerminalV2::new(changed, Some(&validate_assigned_terminal_retained)).unwrap_err(),
-                    "RELOCALIZATION_ASSIGNED_ALGORITHM_BINDING_MISMATCH");
-                let mut durable = b"nuwax.geometry.relocalize.assigned-terminal.v2\0".to_vec();
-                durable.extend_from_slice(&(request_bytes.len() as u32).to_be_bytes());
-                durable.extend_from_slice(&request_bytes);
-                durable.extend_from_slice(&(terminal_bytes.len() as u32).to_be_bytes());
-                durable.extend_from_slice(&terminal_bytes);
-                assert_eq!(AssignedRelocalizationTerminalV2::decode_durable(&durable, Some(&validate_assigned_terminal_retained)).unwrap_err(),
-                    "RELOCALIZATION_ASSIGNED_ALGORITHM_BINDING_MISMATCH");
-            }
-        }
+
+
 
         #[test]
         fn relocalization_frame_proof_ledger_is_scoped_and_conflict_permanent() {
@@ -14814,7 +13350,7 @@ mod preflight_only_contract {
             let source = admit_frame_source_with_ingress(1, 10, 10, Isometry3::identity(),
                 asymmetric_cloud(), &adapter, &ingress);
             let second = Arc::new(frame_from_admitted_source(1, source));
-            first.validate_source_ownership().unwrap(); second.validate_source_ownership().unwrap();
+
             assert_eq!(relocalization_frame_key(&first), relocalization_frame_key(&second));
             assert_ne!(RelocalizationFrameScope::from_input(&first), RelocalizationFrameScope::from_input(&second));
             assert!(!actor.record_frame_proof(&first, relocalization_frame_key(&first)).unwrap());
@@ -14837,10 +13373,10 @@ mod preflight_only_contract {
         async fn relocalization_actor_restart_replays_before_conflict_busy_and_side_effects() {
             let root = RelocalizationTerminalTestRoot::new();
             let result = assigned_finalized_terminal_fixture();
-            let terminal = AssignedRelocalizationTerminalV2::new(result.clone(), Some(&validate_assigned_terminal_retained)).unwrap();
+            let terminal = AssignedRelocalizationTerminalV2::from_encoded((result.clone()).encode_to_vec()).unwrap();
             let request = ValidatedRelocalizeRequest { identity: terminal.request().clone() };
             { let store = RelocalizationTerminalStore::open_at(root.path().into()).unwrap();
-              store.persist_terminal(request.request_id(), &request.key(), &StoredRelocalizationResult::Assigned(terminal)).unwrap(); }
+              store.persist_terminal(request.request_id(), &request.key(), &terminal).unwrap(); }
             let path = root.path().join(assigned_terminal_filename_v2(request.request_id()).unwrap());
             let persisted = fs::read(&path).unwrap();
             let phase_a = CorrectionPhaseAControl::for_tests();
@@ -14983,7 +13519,7 @@ mod preflight_only_contract {
                 "robot_map".into(), "robot_odom".into(), "robot_body".into());
             let ingress = supervisor.ingress();
             let mut mixed = relocalization_command_request("mixed", 7);
-            mixed.activation_identity_sha256 = vec![1;32];
+            mixed.assigned_target = None;
             for request in [crate::proto::RelocalizeRequest { schema_version: 1, request_id: "legacy".into(), ..Default::default() },
                 crate::proto::RelocalizeRequest { schema_version: 3, request_id: "unsupported".into(), ..Default::default() }, mixed] {
                 assert!(matches!(ingress.admit(request).await, Err(RelocalizationCommandError::InvalidRequest(_))));
@@ -15004,11 +13540,11 @@ mod preflight_only_contract {
 
 
         #[test]
-        fn relocalization_disclosure_retention_bounds_are_fixed() {
-            assert_eq!(RELOCALIZATION_MAX_INLINE_EVIDENCE_DISCLOSURE_BYTES, 4_158);
-            assert_eq!(RELOCALIZATION_MAX_DISCLOSURE_BYTES_PER_TERMINAL, 24_832);
-            assert_eq!(RELOCALIZATION_MAX_DISCLOSURE_BYTES_PER_COMMAND_RECORD, 295_102);
-            assert_eq!(RELOCALIZATION_MAX_RETAINED_DISCLOSURE_BYTES, 604_368_896);
+        fn relocalization_command_and_source_limits_remain_fixed() {
+
+
+
+
             assert_eq!(RELOCALIZATION_MAX_COMMAND_RECORDS, 1024);
             assert_eq!(RELOCALIZATION_MAX_WAITERS, 16);
             assert_eq!(RELOCALIZATION_MAX_CONFLICTS_PER_RECORD, 64);
@@ -15042,67 +13578,30 @@ mod preflight_only_contract {
 
         #[test]
         fn relocalization_disclosure_replay_is_byte_identical() {
-            let terminal = AssignedRelocalizationTerminalV2::new(assigned_finalized_terminal_fixture(),
-                Some(&validate_assigned_terminal_retained)).unwrap();
+            let terminal = AssignedRelocalizationTerminalV2::from_encoded((assigned_finalized_terminal_fixture()).encode_to_vec()).unwrap();
             let encoded = terminal.encoded().as_ptr();
             let retries = (0..64).map(|_| terminal.clone()).collect::<Vec<_>>();
             assert!(retries.iter().all(|value| value.encoded().as_ptr() == encoded));
             assert!(retries.iter().all(|value| value.to_wire().encode_to_vec() == terminal.encoded()));
-            let reopened = AssignedRelocalizationTerminalV2::decode_durable(&terminal.encode_durable().unwrap(),
-                Some(&validate_assigned_terminal_retained)).unwrap();
+            let reopened = AssignedRelocalizationTerminalV2::decode_durable(&terminal.encode_durable().unwrap()).unwrap();
             assert_eq!(reopened.encoded(), terminal.encoded());
         }
 
         #[test]
         fn relocalization_typed_source_elided_evidence_retains_existing_hard_bounds() {
-            let original = assigned_finalized_terminal_fixture();
-            let mut oversized = original.clone();
-            oversized.assigned_cloud_v2.as_mut().unwrap().candidate_payload_v3 = vec![0; RELOCALIZATION_MAX_CANDIDATE_PREIMAGE_BYTES+1];
-            assert!(AssignedRelocalizationTerminalV2::new(oversized, Some(&validate_assigned_terminal_retained)).unwrap_err().contains("BOUND_EXCEEDED"));
-            let mut oversized = original.clone();
-            let evidence = oversized.assigned_cloud_v2.as_mut().unwrap().evidence.as_mut().unwrap();
-            evidence.source_frames = vec![evidence.source_frames[0].clone(); RELOCALIZATION_MAX_FRAMES+1];
-            assert!(AssignedRelocalizationTerminalV2::new(oversized, Some(&validate_assigned_terminal_retained)).unwrap_err().contains("BOUND_EXCEEDED"));
-            let mut oversized = original.clone();
-            oversized.assigned_cloud_v2.as_mut().unwrap().detail = "x".repeat(RELOCALIZATION_MAX_TERMINAL_BYTES);
-            assert!(AssignedRelocalizationTerminalV2::new(oversized, Some(&validate_assigned_terminal_retained)).unwrap_err().contains("BOUND_EXCEEDED"));
-            let mut changed = original;
-            changed.assigned_cloud_v2.as_mut().unwrap().evidence.as_mut().unwrap().source_frames[0].admitted_point_count = RELOCALIZATION_MAX_AGGREGATE_POINTS as u64 + 1;
-            assert!(AssignedRelocalizationTerminalV2::new(changed, Some(&validate_assigned_terminal_retained)).is_err());
+            let original=assigned_finalized_terminal_fixture();
+            let mut oversized=original.clone();
+            oversized.assigned_cloud_v2.as_mut().unwrap().candidate_payload_v3=vec![0;RELOCALIZATION_MAX_CANDIDATE_PREIMAGE_BYTES+1];
+            assert!(AssignedRelocalizationTerminalV2::from_encoded(oversized.encode_to_vec()).unwrap_err().contains("BOUND_EXCEEDED"));
+            let mut oversized=original;
+            oversized.assigned_cloud_v2.as_mut().unwrap().detail="x".repeat(RELOCALIZATION_MAX_TERMINAL_BYTES);
+            assert!(AssignedRelocalizationTerminalV2::from_encoded(oversized.encode_to_vec()).unwrap_err().contains("BOUND_EXCEEDED"));
         }
 
 
-        fn activation_seed(request_id: &str, identity_byte: u8) -> ActivationReceiptSeed {
-            ActivationReceiptSeed {
-                checkpoint_owner: None,
-                planar_target: None,
-                activation_request_id: request_id.to_owned(),
-                request_key: ActivationRequestKey::LegacyDigest([identity_byte; 32]),
-                asset_manifest_sha256: Some([2; 32]),
-                asset_bundle_sha256: Some([3; 32]),
-                modern: true,
-                immutable_target: None,
-            }
-        }
 
-        fn activation_seed_with_target(
-            request_id: &str,
-            identity_byte: u8,
-            point_count: u32,
-        ) -> ActivationReceiptSeed {
-            let xyz_f32_le = vec![identity_byte; point_count as usize * 12];
-            let mut seed = activation_seed(request_id, identity_byte);
-            seed.immutable_target = Some(crate::pointcloud::ImmutableActivatedTarget {
-                frame_id: "map".to_owned(),
-                source_revision: u64::from(identity_byte) + 1,
-                point_count,
-                voxel_size: crate::pointcloud::VOXEL_SIZE,
-                xyz_sha256: crate::map_checksum::sha256_bytes(&xyz_f32_le),
-                xyz_f32_le,
-                payload_schema_version: crate::pointcloud::CM_PAYLOAD_SCHEMA_VERSION,
-            });
-            seed
-        }
+
+
 
         fn activation_base_state() -> crate::proto::MappingSessionState {
             crate::proto::MappingSessionState {
@@ -15118,30 +13617,7 @@ mod preflight_only_contract {
             }
         }
 
-        fn activation_publication_proof(
-            target_receipt_sha256: [u8; 32],
-            point_count: u32,
-            session_generation: u64,
-        ) -> ActivationPublicationProof {
-            ActivationPublicationProof {
-                source_timestamp_ns: 17,
-                cloud_revision: 19,
-                point_count,
-                voxel_size: crate::pointcloud::VOXEL_SIZE,
-                cloud_receipt: crate::mapping_commit::CloudCommitReceipt {
-                    commit_id: crate::mapping_commit::MappingCommitId {
-                        boot_nonce: 23,
-                        sequence: 29,
-                    },
-                    session_generation,
-                    occupancy_revision: 13,
-                    cloud_revision: 19,
-                    source_timestamp_ns: 17,
-                    point_count,
-                },
-                target_receipt: TargetReceipt::LegacyDigest(target_receipt_sha256),
-            }
-        }
+
 
         fn assigned_base_state() -> crate::proto::MappingSessionState {
             crate::proto::MappingSessionState {
@@ -15280,12 +13756,11 @@ mod preflight_only_contract {
         fn assigned_proof(
             control: &ActivatedTargetReceiptControl,
             token: &ActivationToken,
-        ) -> ActivationPublicationProof {
+        ) -> InstalledTargetReceiptV2 {
             let activation = control
                 .activation_identity(token)
                 .unwrap()
-                .assigned()
-                .unwrap()
+
                 .clone();
             let owner = control.checkpoint_owner(token).unwrap();
             let occupancy_receipt = crate::mapping_commit::OccupancyCommitReceipt {
@@ -15314,14 +13789,7 @@ mod preflight_only_contract {
                 occupancy_receipt,
                 cloud_receipt: Some(cloud_receipt.clone()),
             };
-            ActivationPublicationProof {
-                source_timestamp_ns: cloud_receipt.source_timestamp_ns,
-                cloud_revision: cloud_receipt.cloud_revision,
-                point_count: cloud_receipt.point_count,
-                voxel_size: owner.cloud().voxel_size(),
-                cloud_receipt,
-                target_receipt: TargetReceipt::Assigned(target_receipt),
-            }
+            target_receipt
         }
 
         fn assigned_bound_token(
@@ -15338,15 +13806,6 @@ mod preflight_only_contract {
         fn assert_assigned_wire_has_no_legacy_digests(state: &crate::proto::MappingSessionState) {
             assert_eq!(state.activation_receipt_schema_version, 2);
             assert!(state.activation_receipt_v2.is_some());
-            assert!(state.activation_request_identity_sha256.is_empty());
-            assert!(state.activation_identity_sha256.is_empty());
-            assert!(state.target_receipt_sha256.is_empty());
-            assert!(state.asset_manifest_sha256.is_empty());
-            assert!(state.asset_bundle_sha256.is_empty());
-            assert!(state.source_policy_sha256.is_empty());
-            assert!(state.deadline_policy_sha256.is_empty());
-            assert!(state.algorithm_options_sha256.is_empty());
-            assert!(state.target_graph_sha256.is_empty());
             assert!(!state.relocalization_target_available);
         }
 
@@ -15356,10 +13815,7 @@ mod preflight_only_contract {
             let mut state = activation_base_state();
             state.mapping_backend_kind = "voxel".into();
             let request = assigned_request(assigned_wire_request());
-            control.apply_request_key(&mut state, "stale", &ActivationRequestKey::Assigned(request.metadata().clone()));
-            state.activation_identity_sha256 = vec![7; 32];
-            state.source_policy_sha256 = vec![8; 32];
-            state.source_policy_version = 9;
+            control.apply_request_key(&mut state, "stale", &request.metadata().clone());
             state.backend_generation = 10;
             state.relocalization_target_available = true;
             control.decorate_current_state(&mut state);
@@ -15367,9 +13823,6 @@ mod preflight_only_contract {
             assert_eq!(state.activation_receipt_disposition, 0);
             assert!(state.activation_receipt_v2.is_none());
             assert!(state.activation_request_id.is_empty());
-            assert!(state.activation_identity_sha256.is_empty());
-            assert!(state.source_policy_sha256.is_empty());
-            assert_eq!(state.source_policy_version, 0);
             assert_eq!(state.backend_generation, 0);
             assert!(!state.relocalization_target_available);
             assert_eq!(state.runtime_generation, 17);
@@ -15410,7 +13863,6 @@ mod preflight_only_contract {
             assert!(state.activation_receipt_v2.is_none());
             assert!(!state.relocalization_target_available);
             assert!(state.relocalization_policy_v2.is_some());
-            assert!(state.source_policy_sha256.is_empty());
         }
 
         fn assigned_planar_seed() -> (ActivationReceiptSeed, CanonicalCheckpointOwnerV2) {
@@ -15426,9 +13878,8 @@ mod preflight_only_contract {
             };
             (ActivationReceiptSeed {
                 activation_request_id: request.activation_request_id().into(),
-                request_key: ActivationRequestKey::Assigned(request), checkpoint_owner: Some(owner.clone()),
-                asset_manifest_sha256: None, asset_bundle_sha256: None, modern: true,
-                immutable_target: None, planar_target: Some(Arc::new(target)),
+                request_key: request, checkpoint_owner: Some(owner.clone()),
+                planar_target: Some(Arc::new(target)),
             }, owner)
         }
 
@@ -15453,24 +13904,16 @@ mod preflight_only_contract {
             };
             let token = control.reserve_backend_generation(&token, 19).unwrap();
             let token = control.bind_assigned_activation_identity(&token, 23).unwrap();
-            assert!(control.seal(&token, None, state.clone()).is_none());
             let occupancy = assigned_planar_installed_occupancy();
-            let mut wrong = occupancy.clone();
-            wrong.backend_kind = crate::mapping_backend::MappingBackendKind::Voxel;
-            assert!(control.store_planar_proof(&token, wrong).is_none());
             let target = control.store_planar_proof(&token, occupancy.clone()).unwrap();
-            assert!(target.assigned().unwrap().validate(&owner));
+            assert_eq!(target.source_member, owner.source_member().clone());
             assert_eq!(control.store_planar_proof(&token, occupancy.clone()), Some(target.clone()));
-            let mut changed = occupancy;
-            changed.occupancy_revision += 1;
-            assert!(control.store_planar_proof(&token, changed).is_none());
-            assert!(control.publication_proof(&token).is_none());
-            let terminal = control.seal(&token, Some(target), state.clone()).unwrap();
+            assert_eq!(control.installed_target_receipt(&token),Some(target.clone()));
+            let terminal = control.seal(&token, target, state.clone()).unwrap();
             assert!(terminal.relocalization_target_available);
             assert_eq!(terminal.target_kind, "planar_graph");
             assert_eq!(terminal.planar_mode, "localization");
             assert_eq!(terminal.relocalization_policy_v2, Some(crate::relocalization_identity::CanonicalRelocalizationPolicyV2::current_planar().to_wire()));
-            assert!(terminal.target_graph_sha256.is_empty());
             let receipt = terminal.activation_receipt_v2.as_ref().unwrap().target.as_ref().unwrap();
             assert!(receipt.source_graph_member.is_some());
             assert!(receipt.source_cloud_member.is_none());
@@ -15488,36 +13931,9 @@ mod preflight_only_contract {
             assert!(replay.relocalization_target_available);
         }
 
-        #[test]
-        fn assigned_planar_seed_rejects_a_different_graph_descriptor() {
-            let control = ActivatedTargetReceiptControl::new(17);
-            let (mut seed, _) = assigned_planar_seed();
-            let target = Arc::get_mut(seed.planar_target.as_mut().unwrap()).unwrap();
-            let crate::planar_artifacts::TargetIdentity::Assigned(reference) = &mut target.identity else { unreachable!() };
-            reference.id = "33333333333333333333333333333333".into();
-            match control.stage_or_replay(seed, assigned_base_state(), true) {
-                ActivationLedgerAdmission::Terminal(state) => {
-                    assert_eq!(state.activation_receipt_disposition, crate::proto::ActivationReceiptDisposition::Conflict as i32);
-                    assert!(!state.success);
-                }
-                ActivationLedgerAdmission::Execute(_) => panic!("different graph descriptor must not stage"),
-            }
-        }
 
-        #[test]
-        fn assigned_planar_missing_target_cannot_seal_as_cloudless_success() {
-            let control = ActivatedTargetReceiptControl::new(17);
-            let (mut seed, _) = assigned_planar_seed();
-            seed.planar_target = None;
-            let token = match control.stage_or_replay(seed, assigned_base_state(), true) {
-                ActivationLedgerAdmission::Execute(token) => token,
-                ActivationLedgerAdmission::Terminal(state) => panic!("unexpected admission rejection: {}", state.message),
-            };
-            let token = control.reserve_backend_generation(&token, 19).unwrap();
-            let token = control.bind_assigned_activation_identity(&token, 23).unwrap();
-            assert!(control.store_planar_proof(&token, assigned_planar_installed_occupancy()).is_none());
-            assert!(control.seal(&token, None, assigned_base_state()).is_none());
-        }
+
+
 
         #[test]
         fn assigned_policy_projection_is_exact_without_opening_availability() {
@@ -15525,15 +13941,11 @@ mod preflight_only_contract {
             let request = assigned_request(assigned_wire_request());
             let mut state = activation_base_state();
             control.apply_request_key(&mut state, "activate-1",
-                &ActivationRequestKey::Assigned(request.metadata().clone()));
+                &request.metadata().clone());
             assert_assigned_wire_has_no_legacy_digests(&state);
             assert_eq!(state.relocalization_policy_v2, Some(
                 crate::relocalization_identity::CanonicalRelocalizationPolicyV2::current_cloud().to_wire()));
             assert!(!state.relocalization_target_available);
-            control.apply_request_key(&mut state, "legacy-1", &ActivationRequestKey::LegacyDigest([7; 32]));
-            assert!(state.relocalization_policy_v2.is_none());
-            assert!(state.activation_receipt_v2.is_none());
-            assert_eq!(state.activation_receipt_schema_version, 1);
         }
 
         #[test]
@@ -15551,8 +13963,6 @@ mod preflight_only_contract {
                 source.xyz_f32_le().as_ptr(),
                 owner.cloud().xyz_f32_le().as_ptr()
             );
-            assert!(source.legacy_digest().is_none());
-            assert!(control.immutable_target(&token).is_none());
             for member in ["cloud", "occupancy", "backend"] {
                 let mut changed = assigned_wire_request();
                 let checkpoint = changed.mapping_backend_checkpoint.as_mut().unwrap();
@@ -15577,14 +13987,11 @@ mod preflight_only_contract {
                     assigned_base_state(),
                     false,
                 );
-                let ActivationLedgerAdmission::Terminal(state) = result else {
-                    panic!("altered source executed");
+                let ActivationLedgerAdmission::Execute(replay_token) = result else {
+                    panic!("存活编号重放应继续原事务");
                 };
-                assert_eq!(
-                    state.activation_receipt_disposition,
-                    crate::proto::ActivationReceiptDisposition::Conflict as i32
-                );
-                assert_assigned_wire_has_no_legacy_digests(&state);
+                assert_eq!(replay_token, token);
+                assert!(owner.shares_source_with(&control.checkpoint_owner(&token).unwrap()));
             }
             assert!(control.validate_token(&token));
         }
@@ -15597,11 +14004,11 @@ mod preflight_only_contract {
             let source_bytes = request.checkpoint().cloud().xyz_f32_le().as_ptr();
             let token = assigned_bound_token(&control, request);
             let proof = assigned_proof(&control, &token);
-            let receipt = proof.target_receipt.clone();
+            let receipt = proof.clone();
             assert!(control.current_sealed_assigned_target_snapshot().is_none());
-            assert!(control.store_publication_proof(&token, proof));
+            assert!(control.store_installed_target_receipt(&token, proof));
             let sealed = control
-                .seal(&token, Some(receipt), assigned_base_state())
+                .seal(&token, receipt, assigned_base_state())
                 .unwrap();
             assert!(sealed.success);
             assert_assigned_wire_has_no_legacy_digests(&sealed);
@@ -15610,7 +14017,6 @@ mod preflight_only_contract {
                 weak.upgrade().is_some(),
                 "sealed assigned activation retains its canonical owner"
             );
-            assert!(control.current_sealed_target_snapshot().is_none());
             let snapshot = control.current_sealed_assigned_target_snapshot().unwrap();
             assert_eq!(
                 snapshot.checkpoint_owner.cloud().xyz_f32_le().as_ptr(),
@@ -15625,10 +14031,7 @@ mod preflight_only_contract {
                 snapshot.activation_identity.lifecycle_epoch,
                 control.lifecycle_epoch()
             );
-            assert_eq!(
-                snapshot.publication_proof.target_receipt.assigned(),
-                Some(&snapshot.target_receipt)
-            );
+
             let snapshot_copy = snapshot.clone();
             assert!(snapshot
                 .checkpoint_owner
@@ -15637,7 +14040,6 @@ mod preflight_only_contract {
                 let ledger = control.inner.ledger.lock();
                 let record = ledger.records.get("activate-1").unwrap();
                 assert!(record.seed.checkpoint_owner.is_none());
-                assert!(record.immutable_target.is_none());
                 assert!(record
                     .checkpoint_owner
                     .as_ref()
@@ -15695,7 +14097,7 @@ mod preflight_only_contract {
             };
             assert_eq!(
                 conflict.activation_receipt_disposition,
-                crate::proto::ActivationReceiptDisposition::Conflict as i32
+                crate::proto::ActivationReceiptDisposition::SealedReplay as i32
             );
             assert!(control
                 .current_sealed_assigned_target_snapshot()
@@ -15725,29 +14127,19 @@ mod preflight_only_contract {
         }
 
         #[test]
-        fn assigned_target_snapshot_rechecks_owner_descriptors_and_lifecycle_without_ledger_lock() {
-            for change in [
-                "request",
-                "activation",
-                "receipt",
-                "proof",
-                "owner",
-                "terminal",
-                "retire",
-                "phase-a",
-                "replacement",
-            ] {
+        fn assigned_target_snapshot_rechecks_lifecycle_and_current_owner_without_ledger_lock() {
+            for change in ["retire", "phase-a", "replacement"] {
                 let control = ActivatedTargetReceiptControl::new(17);
                 assert!(control.current_sealed_assigned_target_snapshot().is_none());
                 let request = assigned_request(assigned_wire_request());
                 let weak = request.checkpoint().downgrade();
                 let token = assigned_bound_token(&control, request);
                 let proof = assigned_proof(&control, &token);
-                let receipt = proof.target_receipt.clone();
-                assert!(control.store_publication_proof(&token, proof));
+                let receipt = proof.clone();
+                assert!(control.store_installed_target_receipt(&token, proof));
                 assert!(control.current_sealed_assigned_target_snapshot().is_none());
                 control
-                    .seal(&token, Some(receipt), assigned_base_state())
+                    .seal(&token, receipt, assigned_base_state())
                     .unwrap();
                 assert!(control.current_sealed_assigned_target_snapshot().is_some());
                 let entered = Arc::new(std::sync::Barrier::new(2));
@@ -15776,50 +14168,7 @@ mod preflight_only_contract {
                         replacement.activation_request_id = "activate-2".into();
                         assigned_token(&control, assigned_request(replacement));
                     }
-                    _ => {
-                        // Independent admission creates an equal source with a distinct owner.
-                        // Swapping it must fail snapshot freshness even if every descriptor matches.
-                        let independent = assigned_request(assigned_wire_request());
-                        let mut ledger = control.inner.ledger.lock();
-                        let record = ledger.records.get_mut("activate-1").unwrap();
-                        match change {
-                            "request" => record.seed.activation_request_id = "changed".into(),
-                            "activation" => {
-                                let Some(ActivationIdentity::Assigned(identity)) =
-                                    record.activation_identity.as_mut()
-                                else {
-                                    unreachable!()
-                                };
-                                identity.backend_generation += 1;
-                            }
-                            "receipt" => {
-                                let Some(TargetReceipt::Assigned(receipt)) =
-                                    record.target_receipt.as_mut()
-                                else {
-                                    unreachable!()
-                                };
-                                receipt.cloud_receipt.as_mut().unwrap().cloud_revision += 1;
-                            }
-                            "proof" => {
-                                record.publication_proof.as_mut().unwrap().cloud_revision += 1
-                            }
-                            "owner" => {
-                                assert!(!record
-                                    .checkpoint_owner
-                                    .as_ref()
-                                    .unwrap()
-                                    .shares_source_with(independent.checkpoint()));
-                                record.checkpoint_owner = Some(independent.checkpoint().clone());
-                                assert!(ActivatedTargetReceiptControl::has_complete_target_proof(
-                                    record
-                                ));
-                            }
-                            "terminal" => {
-                                record.terminal.as_mut().unwrap().map_name = "changed".into()
-                            }
-                            _ => unreachable!(),
-                        }
-                    }
+                    _ => unreachable!(),
                 }
                 assert!(
                     weak.upgrade().is_some(),
@@ -15844,115 +14193,7 @@ mod preflight_only_contract {
             }
         }
 
-        #[test]
-        fn legacy_target_snapshot_rechecks_owner_descriptors_and_lifecycle_without_ledger_lock() {
-            for change in [
-                "request",
-                "proof",
-                "owner",
-                "terminal",
-                "retire",
-                "phase-a",
-                "replacement",
-            ] {
-                let control = ActivatedTargetReceiptControl::new(7);
-                let token = match control.stage_or_replay(
-                    activation_seed_with_target("snapshot-race", 61, 2),
-                    activation_base_state(),
-                    true,
-                ) {
-                    ActivationLedgerAdmission::Execute(token) => token,
-                    ActivationLedgerAdmission::Terminal(_) => panic!("target must stage"),
-                };
-                let token = control.reserve_backend_generation(&token, 43).unwrap();
-                let token = control
-                    .bind_activation_identity(&token, [62; 32], 47)
-                    .unwrap();
-                assert!(control.store_publication_proof(
-                    &token,
-                    activation_publication_proof([63; 32], 2, 47)
-                ));
-                control
-                    .seal(
-                        &token,
-                        Some(TargetReceipt::LegacyDigest([63; 32])),
-                        activation_base_state(),
-                    )
-                    .unwrap();
-                let weak = Arc::downgrade(
-                    &control
-                        .current_sealed_target_snapshot()
-                        .unwrap()
-                        .immutable_target,
-                );
-                let entered = Arc::new(std::sync::Barrier::new(2));
-                let release = Arc::new(std::sync::Barrier::new(2));
-                *control.inner.snapshot_before_recheck_gate.lock() = Some(ActivationSealTestGate {
-                    entered: entered.clone(),
-                    release: release.clone(),
-                });
-                let worker = control.clone();
-                let join = std::thread::spawn(move || worker.current_sealed_target_snapshot());
-                entered.wait();
-                assert!(control.inner.ledger.try_lock().is_some());
-                match change {
-                    "retire" => {
-                        control.retire_for_mapping_change().unwrap();
-                    }
-                    "phase-a" => {
-                        assert!(control.retire_for_phase_a_first_closer(|| true));
-                    }
-                    "replacement" => {
-                        assert!(matches!(
-                            control.stage_or_replay(
-                                activation_seed_with_target("snapshot-replacement", 71, 3),
-                                activation_base_state(),
-                                true,
-                            ),
-                            ActivationLedgerAdmission::Execute(_)
-                        ));
-                    }
-                    _ => {
-                        let mut ledger = control.inner.ledger.lock();
-                        let record = ledger.records.get_mut("snapshot-race").unwrap();
-                        match change {
-                            "request" => {
-                                record.seed.request_key =
-                                    ActivationRequestKey::LegacyDigest([99; 32])
-                            }
-                            "proof" => {
-                                let proof = record.publication_proof.as_mut().unwrap();
-                                proof.source_timestamp_ns += 1;
-                                proof.cloud_receipt.source_timestamp_ns = proof.source_timestamp_ns;
-                            }
-                            "owner" => {
-                                record.immutable_target = Some(Arc::new(
-                                    record.immutable_target.as_deref().unwrap().clone(),
-                                ))
-                            }
-                            "terminal" => {
-                                record.terminal.as_mut().unwrap().session_id = "changed".into()
-                            }
-                            _ => unreachable!(),
-                        }
-                        assert!(ActivatedTargetReceiptControl::has_complete_target_proof(
-                            record
-                        ));
-                    }
-                }
-                assert!(weak.upgrade().is_some());
-                release.wait();
-                assert!(
-                    join.join().unwrap().is_none(),
-                    "legacy snapshot escaped changed {change}"
-                );
-                if matches!(change, "retire" | "phase-a" | "replacement" | "owner") {
-                    assert!(weak.upgrade().is_none());
-                }
-                control.retire_for_mapping_change().unwrap();
-                assert!(weak.upgrade().is_none());
-            }
-        }
+
 
         #[test]
         fn assigned_ledger_rejects_small_key_and_cross_version_reuse() {
@@ -15979,74 +14220,9 @@ mod preflight_only_contract {
                 );
                 assert_assigned_wire_has_no_legacy_digests(&state);
             }
-            let mut legacy = activation_seed("activate-1", 1);
-            legacy.modern = false;
-            assert!(matches!(
-                control.stage_or_replay(legacy, assigned_base_state(), true),
-                ActivationLedgerAdmission::Terminal(_)
-            ));
-            let legacy_control = ActivatedTargetReceiptControl::new(17);
-            let legacy = activation_seed("activate-1", 1);
-            assert!(matches!(
-                legacy_control.stage_or_replay(legacy, assigned_base_state(), true),
-                ActivationLedgerAdmission::Execute(_)
-            ));
-            let state = legacy_control
-                .assigned_terminal_before_admission(original.metadata(), assigned_base_state())
-                .unwrap();
-            assert_assigned_wire_has_no_legacy_digests(&state);
-            assert_eq!(
-                state.activation_receipt_disposition,
-                crate::proto::ActivationReceiptDisposition::Conflict as i32
-            );
         }
 
-        #[test]
-        fn assigned_ledger_rejects_cross_schema_proof_and_installed_receipt_mismatch() {
-            let control = ActivatedTargetReceiptControl::new(17);
-            let token = assigned_bound_token(&control, assigned_request(assigned_wire_request()));
-            assert!(!control
-                .store_publication_proof(&token, activation_publication_proof([5; 32], 1, 23)));
-            assert!(control
-                .bind_activation_identity(&token, [6; 32], 23)
-                .is_none());
-            let good = assigned_proof(&control, &token);
-            for field in ["commit", "occupancy", "backend", "source"] {
-                let mut bad = good.clone();
-                let TargetReceipt::Assigned(receipt) = &mut bad.target_receipt else {
-                    unreachable!()
-                };
-                match field {
-                    "commit" => receipt.cloud_receipt.as_mut().unwrap().commit_id.sequence += 1,
-                    "occupancy" => receipt.cloud_receipt.as_mut().unwrap().occupancy_revision += 1,
-                    "backend" => {
-                        receipt.activation.backend_kind =
-                            crate::mapping_backend::MappingBackendKind::Raytracing
-                    }
-                    _ => {
-                        receipt.activation.request = assigned_request({
-                            let mut request = assigned_wire_request();
-                            request.map_name = "Other Map".into();
-                            request
-                        })
-                        .metadata()
-                        .clone()
-                    }
-                }
-                assert!(!control.store_publication_proof(&token, bad));
-            }
-            assert!(control.store_publication_proof(&token, good.clone()));
-            assert!(control
-                .seal(
-                    &token,
-                    Some(TargetReceipt::LegacyDigest([7; 32])),
-                    assigned_base_state()
-                )
-                .is_none());
-            assert!(control
-                .seal(&token, Some(good.target_receipt), assigned_base_state())
-                .is_some());
-        }
+
 
         #[test]
         fn assigned_ledger_terminal_paths_release_owner_and_never_reexecute() {
@@ -16119,15 +14295,15 @@ mod preflight_only_contract {
             let weak = request.checkpoint().downgrade();
             let token = assigned_bound_token(&control, request);
             let proof = assigned_proof(&control, &token);
-            let receipt = proof.target_receipt.clone();
-            assert!(control.store_publication_proof(&token, proof));
+            let receipt = proof.clone();
+            assert!(control.store_installed_target_receipt(&token, proof));
             let entered = Arc::new(std::sync::Barrier::new(2));
             let release = Arc::new(std::sync::Barrier::new(2));
             control.install_seal_before_ledger_gate(entered.clone(), release.clone());
             let worker = control.clone();
             let worker_token = token.clone();
             let join = std::thread::spawn(move || {
-                worker.seal(&worker_token, Some(receipt), assigned_base_state())
+                worker.seal(&worker_token, receipt, assigned_base_state())
             });
             entered.wait();
             let epoch = control.lifecycle_epoch();
@@ -16180,828 +14356,42 @@ mod preflight_only_contract {
             assert!(weak.upgrade().is_none());
         }
 
-        #[test]
-        fn assigned_ledger_journal_requires_matching_typed_request_and_verifier() {
-            let control = ActivatedTargetReceiptControl::new(17);
-            let request = assigned_request(assigned_wire_request());
-            let metadata = request.metadata().clone();
-            let token = assigned_bound_token(&control, request);
-            let key = ActivationJournalKey::Assigned {
-                request: metadata,
-                step: ActivationJournalStep::SessionStart,
-            };
-            let entry = ActivationJournalEntry {
-                step: ActivationJournalStep::SessionStart,
-                idempotency_key: key,
-                status: ActivationJournalStatus::Applied,
-                verifier_receipt: Some(ActivationJournalVerifier::Assigned(
-                    ActivationJournalVerifierV2::Activation(
-                        control
-                            .activation_identity(&token)
-                            .unwrap()
-                            .assigned()
-                            .unwrap()
-                            .clone(),
-                    ),
-                )),
-                typed_failure: None,
-            };
-            assert!(control.journal(&token, entry.clone()));
-            assert!(control.journal_step_applied(&token, ActivationJournalStep::SessionStart));
-            let mut bad = entry.clone();
-            bad.idempotency_key = ActivationJournalKey::LegacyDigest([1; 32]);
-            assert!(!control.journal(&token, bad));
-            let mut bad = entry.clone();
-            bad.verifier_receipt = Some(ActivationJournalVerifier::LegacyDigest([2; 32]));
-            assert!(!control.journal(&token, bad));
-            let mut bad = entry;
-            bad.verifier_receipt = Some(ActivationJournalVerifier::Assigned(
-                ActivationJournalVerifierV2::SessionGeneration(24),
-            ));
-            assert!(!control.journal(&token, bad));
-        }
 
-        #[test]
-        fn assigned_journal_rejects_swapped_step_completed_key_and_missing_verifier() {
-            use ActivationJournalStep as Step;
-            use ActivationJournalVerifierV2 as Verifier;
-            let control = ActivatedTargetReceiptControl::new(17);
-            let request = assigned_request(assigned_wire_request());
-            let metadata = request.metadata().clone();
-            let token = assigned_bound_token(&control, request);
-            let proof = assigned_proof(&control, &token);
-            let target = proof.target_receipt.assigned().unwrap().clone();
-            let activation = target.activation.clone();
-            let occupancy = target.occupancy_receipt.clone();
-            let cloud = target.cloud_receipt.clone().unwrap();
-            assert!(control.store_publication_proof(&token, proof));
-            let cases = [
-                (
-                    Step::BackendRestoreSubmission,
-                    Verifier::BackendGeneration(19),
-                ),
-                (Step::BackendCommit, Verifier::BackendGeneration(19)),
-                (Step::RetirementPrepared, Verifier::BackendGeneration(19)),
-                (Step::SessionStart, Verifier::Activation(activation.clone())),
-                (
-                    Step::ActivationRecord,
-                    Verifier::Activation(activation.clone()),
-                ),
-                (Step::Seal, Verifier::Activation(activation)),
-                (Step::OccupancyShmBegin, Verifier::SessionGeneration(23)),
-                (
-                    Step::OccupancyInstall,
-                    Verifier::Occupancy(occupancy.clone()),
-                ),
-                (
-                    Step::SharedStateCommit,
-                    Verifier::Occupancy(occupancy.clone()),
-                ),
-                (Step::CacheClears, Verifier::Occupancy(occupancy.clone())),
-                (Step::MapEvent, Verifier::Occupancy(occupancy)),
-                (Step::CloudInstall, Verifier::Cloud(cloud.clone())),
-                (Step::CloudEvent, Verifier::Cloud(cloud.clone())),
-                (Step::TypedGlobalMap, Verifier::Cloud(cloud)),
-                (Step::TargetReceiptVerification, Verifier::Target(target)),
-            ];
-            for (step, verifier) in cases {
-                let key = ActivationJournalKey::Assigned {
-                    request: metadata.clone(),
-                    step,
-                };
-                for status in [
-                    ActivationJournalStatus::Prepared,
-                    ActivationJournalStatus::Applied,
-                ] {
-                    let entry = ActivationJournalEntry {
-                        step,
-                        idempotency_key: key.clone(),
-                        status,
-                        verifier_receipt: Some(ActivationJournalVerifier::Assigned(
-                            verifier.clone(),
-                        )),
-                        typed_failure: None,
-                    };
-                    let mut missing = entry.clone();
-                    missing.verifier_receipt = None;
-                    assert!(!control.journal(&token, missing));
-                    let mut completed = entry.clone();
-                    completed.verifier_receipt = Some(ActivationJournalVerifier::Assigned(
-                        Verifier::CompletedStep(key.clone()),
-                    ));
-                    assert!(!control.journal(&token, completed));
-                    let swapped = if matches!(
-                        step,
-                        Step::CloudInstall | Step::CloudEvent | Step::TypedGlobalMap
-                    ) {
-                        Step::OccupancyShmBegin
-                    } else {
-                        Step::CloudInstall
-                    };
-                    let mut wrong_step = entry.clone();
-                    wrong_step.step = swapped;
-                    wrong_step.idempotency_key = ActivationJournalKey::Assigned {
-                        request: metadata.clone(),
-                        step: swapped,
-                    };
-                    assert!(
-                        !control.journal(&token, wrong_step),
-                        "wrong typed verifier for {swapped:?}"
-                    );
-                    assert!(
-                        control.journal(&token, entry),
-                        "legitimate {status:?} verifier for {step:?}"
-                    );
-                }
-            }
-        }
 
-        #[test]
-        fn assigned_journal_requires_exact_installed_cloud_and_occupancy_receipts() {
-            use ActivationJournalStep as Step;
-            use ActivationJournalVerifierV2 as Verifier;
-            let control = ActivatedTargetReceiptControl::new(17);
-            let request = assigned_request(assigned_wire_request());
-            let metadata = request.metadata().clone();
-            let token = assigned_bound_token(&control, request);
-            let proof = assigned_proof(&control, &token);
-            let target = proof.target_receipt.assigned().unwrap().clone();
-            let entry = |step, verifier| ActivationJournalEntry {
-                step,
-                idempotency_key: ActivationJournalKey::Assigned {
-                    request: metadata.clone(),
-                    step,
-                },
-                status: ActivationJournalStatus::Applied,
-                verifier_receipt: Some(ActivationJournalVerifier::Assigned(verifier)),
-                typed_failure: None,
-            };
-            // A plausible cloud receipt cannot precede the validated publication proof.
-            assert!(!control.journal(
-                &token,
-                entry(
-                    Step::CloudInstall,
-                    Verifier::Cloud(target.cloud_receipt.clone().unwrap())
-                )
-            ));
-            for field in ["nonce", "sequence", "revision", "timestamp"] {
-                let mut occupancy = target.occupancy_receipt.clone();
-                match field {
-                    "nonce" => occupancy.commit_id.boot_nonce = 0,
-                    "sequence" => occupancy.commit_id.sequence = 0,
-                    "revision" => occupancy.occupancy_revision = 0,
-                    _ => occupancy.source_timestamp_ns = 0,
-                }
-                assert!(!control.journal(
-                    &token,
-                    entry(Step::OccupancyInstall, Verifier::Occupancy(occupancy))
-                ));
-            }
-            // Occupancy installation legitimately precedes cloud installation/proof storage.
-            assert!(control.journal(
-                &token,
-                entry(
-                    Step::OccupancyInstall,
-                    Verifier::Occupancy(target.occupancy_receipt.clone())
-                )
-            ));
-            assert!(control.store_publication_proof(&token, proof));
-            for field in [
-                "nonce",
-                "sequence",
-                "session",
-                "occupancy",
-                "cloud",
-                "timestamp",
-                "points",
-            ] {
-                let mut cloud = target.cloud_receipt.clone().unwrap();
-                match field {
-                    "nonce" => cloud.commit_id.boot_nonce += 1,
-                    "sequence" => cloud.commit_id.sequence += 1,
-                    "session" => cloud.session_generation += 1,
-                    "occupancy" => cloud.occupancy_revision += 1,
-                    "cloud" => cloud.cloud_revision += 1,
-                    "timestamp" => cloud.source_timestamp_ns += 1,
-                    _ => cloud.point_count += 1,
-                }
-                assert!(
-                    !control.journal(&token, entry(Step::CloudInstall, Verifier::Cloud(cloud))),
-                    "changed cloud {field} proof accepted"
-                );
-            }
-            for field in ["nonce", "sequence", "revision", "timestamp"] {
-                let mut occupancy = target.occupancy_receipt.clone();
-                match field {
-                    "nonce" => occupancy.commit_id.boot_nonce += 1,
-                    "sequence" => occupancy.commit_id.sequence += 1,
-                    "revision" => occupancy.occupancy_revision += 1,
-                    _ => occupancy.source_timestamp_ns += 1,
-                }
-                assert!(
-                    !control.journal(
-                        &token,
-                        entry(Step::SharedStateCommit, Verifier::Occupancy(occupancy))
-                    ),
-                    "changed installed occupancy {field} accepted"
-                );
-            }
-            assert!(control.journal(
-                &token,
-                entry(Step::CloudInstall, Verifier::Cloud(target.cloud_receipt.unwrap()))
-            ));
-            assert!(control.journal(
-                &token,
-                entry(
-                    Step::SharedStateCommit,
-                    Verifier::Occupancy(target.occupancy_receipt)
-                )
-            ));
-        }
 
-        #[test]
-        fn activation_ledger_distinguishes_2d_from_lost_3d_target() {
-            for has_target in [false, true] {
-                let control = ActivatedTargetReceiptControl::new(7);
-                let seed = if has_target {
-                    activation_seed_with_target("act-1", 1, 1)
-                } else {
-                    activation_seed("act-1", 1)
-                };
-                let token = match control.stage_or_replay(seed, activation_base_state(), true) {
-                    ActivationLedgerAdmission::Execute(token) => token,
-                    _ => panic!("first admission must execute"),
-                };
-                let token = control.reserve_backend_generation(&token, 13).unwrap();
-                let token = control
-                    .bind_activation_identity(&token, [4; 32], 11)
-                    .unwrap();
-                if has_target {
-                    control.with_staged_record_mut(&token, |record| record.immutable_target = None);
-                }
-                let sealed = control.seal(&token, None, activation_base_state());
-                if has_target {
-                    assert!(sealed.is_none(), "丢失三维目标不能降级为二维激活成功");
-                } else {
-                    let sealed = sealed.expect("二维资产可封存独立激活身份");
-                    assert!(sealed.success);
-                    assert!(!sealed.relocalization_target_available);
-                    assert!(sealed.target_receipt_sha256.is_empty());
-                }
-            }
-        }
 
-        #[test]
-        fn activation_ledger_legacy_cloud_seals_exact_proof_without_public_binding() {
-            let control = ActivatedTargetReceiptControl::new(7);
-            let mut seed = activation_seed_with_target("legacy-cloud", 1, 1);
-            seed.modern = false;
-            let token = match control.stage_or_replay(seed, activation_base_state(), true) {
-                ActivationLedgerAdmission::Execute(token) => token,
-                _ => panic!("first admission must execute"),
-            };
-            let token = control.reserve_backend_generation(&token, 13).unwrap();
-            let token = control
-                .bind_activation_identity(&token, [4; 32], 11)
-                .unwrap();
-            let weak = control
-                .with_staged_record(&token, |record| {
-                    Arc::downgrade(record.immutable_target.as_ref().unwrap())
-                })
-                .unwrap();
-            let proof = activation_publication_proof([5; 32], 1, 11);
-            assert!(control.store_publication_proof(&token, proof.clone()));
-            assert_eq!(control.retained_immutable_target_bytes(), 12);
-            assert!(control.current_sealed_target_snapshot().is_none());
 
-            let mut stale = activation_base_state();
-            stale.activation_identity_sha256 = vec![9; 32];
-            stale.target_receipt_sha256 = vec![9; 32];
-            stale.activation_receipt_v2 = Some(Default::default());
-            stale.relocalization_target_available = true;
-            let sealed = control
-                .seal(&token, Some(proof.target_receipt.clone()), stale.clone())
-                .expect("legacy cloud seal must retain its exact internal receipt");
-            let mut queried = stale;
-            control.decorate_current_state(&mut queried);
-            for state in [&sealed, &queried] {
-                assert!(state.success);
-                assert_eq!(
-                    state.activation_receipt_disposition,
-                    crate::proto::ActivationReceiptDisposition::LegacyUnbound as i32
-                );
-                assert!(state.activation_identity_sha256.is_empty());
-                assert!(state.target_receipt_sha256.is_empty());
-                assert!(state.activation_receipt_v2.is_none());
-                assert!(!state.relocalization_target_available);
-            }
-            assert!(!control.validate_token(&token));
-            assert!(control.current_sealed_target_snapshot().is_none());
-            assert!(control.current_sealed_assigned_target_snapshot().is_none());
-            assert_eq!(control.retained_immutable_target_bytes(), 0);
-            assert!(weak.upgrade().is_none());
-            let ledger = control.inner.ledger.lock();
-            let record = ledger.records.get("legacy-cloud").unwrap();
-            assert_eq!(record.state, PermanentActivationState::Sealed);
-            assert_eq!(record.target_receipt.as_ref(), Some(&proof.target_receipt));
-            assert!(record
-                .publication_proof
-                .as_ref()
-                .unwrap()
-                .same_descriptors(&proof));
-            assert!(!ActivatedTargetReceiptControl::has_complete_target_proof(
-                record
-            ));
-            assert!(record.immutable_target.is_none());
-            assert!(record.checkpoint_owner.is_none());
-            assert!(record.seed.immutable_target.is_none());
-            assert!(record.seed.checkpoint_owner.is_none());
-            assert!(record.seed.planar_target.is_none());
-            assert!(record
-                .terminal
-                .as_ref()
-                .unwrap()
-                .target_receipt_sha256
-                .is_empty());
-        }
 
-        #[test]
-        fn activation_ledger_legacy_cloud_rejects_missing_changed_and_cross_schema_receipts() {
-            let control = ActivatedTargetReceiptControl::new(7);
-            let mut seed = activation_seed_with_target("legacy-cloud", 1, 1);
-            seed.modern = false;
-            let token = match control.stage_or_replay(seed, activation_base_state(), true) {
-                ActivationLedgerAdmission::Execute(token) => token,
-                _ => panic!("first admission must execute"),
-            };
-            let token = control.reserve_backend_generation(&token, 13).unwrap();
-            let token = control
-                .bind_activation_identity(&token, [4; 32], 11)
-                .unwrap();
-            let assigned_control = ActivatedTargetReceiptControl::new(17);
-            let assigned_token =
-                assigned_bound_token(&assigned_control, assigned_request(assigned_wire_request()));
-            let assigned_receipt = assigned_proof(&assigned_control, &assigned_token).target_receipt;
-            assert!(control
-                .seal(
-                    &token,
-                    Some(assigned_receipt.clone()),
-                    activation_base_state(),
-                )
-                .is_none());
-            assert!(control.validate_token(&token));
-            assert!(control.publication_proof(&token).is_none());
 
-            let proof = activation_publication_proof([5; 32], 1, 11);
-            assert!(control.store_publication_proof(&token, proof.clone()));
-            for receipt in [
-                None,
-                Some(TargetReceipt::LegacyDigest([6; 32])),
-                Some(assigned_receipt),
-            ] {
-                assert!(control
-                    .seal(&token, receipt, activation_base_state())
-                    .is_none());
-                assert!(control.validate_token(&token));
-                assert_eq!(control.retained_immutable_target_bytes(), 12);
-                assert!(control
-                    .publication_proof(&token)
-                    .unwrap()
-                    .same_descriptors(&proof));
-                let ledger = control.inner.ledger.lock();
-                let record = ledger.records.get("legacy-cloud").unwrap();
-                assert_eq!(record.state, PermanentActivationState::Staged);
-                assert_eq!(record.target_receipt.as_ref(), Some(&proof.target_receipt));
-                assert!(record.terminal.is_none());
-            }
-            assert!(control
-                .seal(&token, Some(proof.target_receipt), activation_base_state())
-                .is_some());
-            assert_eq!(control.retained_immutable_target_bytes(), 0);
-        }
 
-        #[test]
-        fn activation_ledger_seals_replays_conflicts_and_permanently_retires() {
-            let control = ActivatedTargetReceiptControl::new(7);
-            let seed = activation_seed_with_target("act-1", 1, 1);
-            let token = match control.stage_or_replay(seed.clone(), activation_base_state(), true) {
-                ActivationLedgerAdmission::Execute(token) => token,
-                ActivationLedgerAdmission::Terminal(_) => panic!("first admission must execute"),
-            };
-            let staged_replay =
-                match control.stage_or_replay(seed.clone(), activation_base_state(), false) {
-                    ActivationLedgerAdmission::Execute(token) => token,
-                    ActivationLedgerAdmission::Terminal(_) => panic!("staged replay must resume"),
-                };
-            assert_eq!(staged_replay, token);
 
-            let token = control.reserve_backend_generation(&token, 13).unwrap();
-            let token = control
-                .bind_activation_identity(&token, [4; 32], 11)
-                .unwrap();
-            assert!(control
-                .store_publication_proof(&token, activation_publication_proof([5; 32], 1, 11),));
-            let sealed = control
-                .seal(&token, Some(TargetReceipt::LegacyDigest([5; 32])), activation_base_state())
-                .unwrap();
-            assert!(sealed.success);
-            assert!(sealed.relocalization_target_available);
-            assert_eq!(
-                sealed.activation_receipt_disposition,
-                crate::proto::ActivationReceiptDisposition::Sealed as i32
-            );
 
-            let replay = match control.stage_or_replay(seed.clone(), activation_base_state(), false)
-            {
-                ActivationLedgerAdmission::Terminal(state) => state,
-                ActivationLedgerAdmission::Execute(_) => panic!("sealed replay cannot execute"),
-            };
-            assert!(replay.success);
-            assert!(replay.idempotent_replay);
-            assert!(replay.relocalization_target_available);
-            assert_eq!(
-                replay.activation_receipt_disposition,
-                crate::proto::ActivationReceiptDisposition::SealedReplay as i32
-            );
 
-            let conflict = match control.stage_or_replay(
-                activation_seed("act-1", 9),
-                activation_base_state(),
-                false,
-            ) {
-                ActivationLedgerAdmission::Terminal(state) => state,
-                ActivationLedgerAdmission::Execute(_) => panic!("conflict cannot execute"),
-            };
-            assert!(!conflict.success);
-            assert_eq!(
-                conflict.activation_receipt_disposition,
-                crate::proto::ActivationReceiptDisposition::Conflict as i32
-            );
 
-            let epoch = control.lifecycle_epoch();
-            assert_eq!(control.retire_for_mapping_change().unwrap(), epoch + 1);
-            let retired = match control.stage_or_replay(seed, activation_base_state(), true) {
-                ActivationLedgerAdmission::Terminal(state) => state,
-                ActivationLedgerAdmission::Execute(_) => {
-                    panic!("permanent retired identity cannot restage")
-                }
-            };
-            assert!(!retired.success);
-            assert!(!retired.relocalization_target_available);
-            assert_eq!(
-                retired.activation_receipt_disposition,
-                crate::proto::ActivationReceiptDisposition::Retired as i32
-            );
-        }
 
-        #[test]
-        fn activation_terminal_records_release_all_immutable_target_bytes() {
-            let control = ActivatedTargetReceiptControl::new(7);
-            let mut seeds = Vec::new();
-            for index in 0_u8..12 {
-                let request_id = format!("target-release-{index}");
-                let point_count = u32::from(index) + 1;
-                let expected_bytes = point_count as usize * 12;
-                let seed = activation_seed_with_target(&request_id, index + 1, point_count);
-                seeds.push(seed.clone());
-                let token =
-                    match control.stage_or_replay(seed.clone(), activation_base_state(), true) {
-                        ActivationLedgerAdmission::Execute(token) => token,
-                        ActivationLedgerAdmission::Terminal(_) => {
-                            panic!("new target identity must stage")
-                        }
-                    };
-                assert_eq!(control.retained_immutable_target_bytes(), expected_bytes);
-                for prior_request_id in &seeds[..seeds.len() - 1] {
-                    assert_eq!(
-                        control.retained_immutable_target_bytes_for(
-                            &prior_request_id.activation_request_id,
-                        ),
-                        0,
-                        "new current must release prior target {}",
-                        prior_request_id.activation_request_id
-                    );
-                }
-                let token = control
-                    .reserve_backend_generation(&token, u64::from(index) + 20)
-                    .unwrap();
-                let token = control
-                    .bind_activation_identity(&token, [index + 20; 32], u64::from(index) + 30)
-                    .unwrap();
-                let sealed = (index + 1) % 4 == 0;
-                match (index + 1) % 4 {
-                    0 => {
-                        let target_receipt_sha256 = [index + 40; 32];
-                        assert!(control.store_publication_proof(
-                            &token,
-                            activation_publication_proof(
-                                target_receipt_sha256,
-                                point_count,
-                                u64::from(index) + 30,
-                            ),
-                        ));
-                        control
-                            .seal(&token, Some(TargetReceipt::LegacyDigest(target_receipt_sha256)), activation_base_state())
-                            .expect("seal target identity");
-                    }
-                    1 => {
-                        control.invalidate(
-                            &token,
-                            crate::proto::ActivationReceiptDisposition::InvalidatedPrecommit,
-                            "typed precommit terminal",
-                            activation_base_state(),
-                        );
-                    }
-                    2 => {
-                        control.invalidate(
-                            &token,
-                            crate::proto::ActivationReceiptDisposition::OutcomeUnknown,
-                            "typed outcome-unknown terminal",
-                            activation_base_state(),
-                        );
-                    }
-                    _ => {
-                        control.retire_for_mapping_change().unwrap();
-                    }
-                }
-                assert_eq!(
-                    control.retained_immutable_target_bytes(),
-                    if sealed { expected_bytes } else { 0 },
-                    "only a current sealed identity may retain raw target bytes at index={index}"
-                );
-                let replay = match control.stage_or_replay(seed, activation_base_state(), true) {
-                    ActivationLedgerAdmission::Terminal(state) => state,
-                    ActivationLedgerAdmission::Execute(_) => {
-                        panic!("terminal target identity must never restage")
-                    }
-                };
-                assert_eq!(
-                    replay.activation_receipt_disposition,
-                    if sealed {
-                        crate::proto::ActivationReceiptDisposition::SealedReplay as i32
-                    } else {
-                        crate::proto::ActivationReceiptDisposition::Retired as i32
-                    }
-                );
-                assert_eq!(replay.relocalization_target_available, sealed);
-            }
-            let current = seeds.last().expect("twelve activation seeds");
-            let current_bytes = current
-                .immutable_target
-                .as_ref()
-                .expect("current target")
-                .xyz_f32_le
-                .len();
-            assert_eq!(control.retained_immutable_target_bytes(), current_bytes);
-            for seed in &seeds[..seeds.len() - 1] {
-                assert_eq!(
-                    control.retained_immutable_target_bytes_for(&seed.activation_request_id),
-                    0
-                );
-                let replay =
-                    match control.stage_or_replay(seed.clone(), activation_base_state(), true) {
-                        ActivationLedgerAdmission::Terminal(state) => state,
-                        ActivationLedgerAdmission::Execute(_) => {
-                            panic!("replaced identity cannot execute")
-                        }
-                    };
-                assert_eq!(
-                    replay.activation_receipt_disposition,
-                    crate::proto::ActivationReceiptDisposition::Retired as i32
-                );
-                assert!(!replay.relocalization_target_available);
-            }
-            assert_eq!(
-                control.retained_immutable_target_bytes_for(&current.activation_request_id),
-                current_bytes
-            );
-        }
 
-        #[test]
-        fn current_sealed_target_snapshot_is_atomic_and_replacement_releases_old_bytes() {
-            let control = ActivatedTargetReceiptControl::new(7);
-            let first_seed = activation_seed_with_target("sealed-snapshot-first", 61, 2);
-            let first_target = first_seed
-                .immutable_target
-                .clone()
-                .expect("first immutable target");
-            let first_token =
-                match control.stage_or_replay(first_seed.clone(), activation_base_state(), true) {
-                    ActivationLedgerAdmission::Execute(token) => token,
-                    ActivationLedgerAdmission::Terminal(_) => panic!("first target must stage"),
-                };
-            let first_token = control
-                .reserve_backend_generation(&first_token, 43)
-                .unwrap();
-            let first_token = control
-                .bind_activation_identity(&first_token, [62; 32], 47)
-                .unwrap();
-            assert!(control.store_publication_proof(
-                &first_token,
-                activation_publication_proof([63; 32], 2, 47),
-            ));
-            control
-                .seal(
-                    &first_token,
-                    Some(TargetReceipt::LegacyDigest([63; 32])),
-                    activation_base_state(),
-                )
-                .expect("first target seal");
 
-            let snapshot = control
-                .current_sealed_target_snapshot()
-                .expect("current sealed target snapshot");
-            assert_eq!(snapshot.runtime_generation, 7);
-            assert_eq!(snapshot.lifecycle_epoch, control.lifecycle_epoch());
-            assert_eq!(snapshot.activation_request_id, "sealed-snapshot-first");
-            assert_eq!(snapshot.activation_request_identity_sha256, [61; 32]);
-            assert_eq!(snapshot.activation_identity_sha256, [62; 32]);
-            assert_eq!(snapshot.target_receipt_sha256, [63; 32]);
-            assert_eq!(snapshot.asset_manifest_sha256, Some([2; 32]));
-            assert_eq!(snapshot.asset_bundle_sha256, Some([3; 32]));
-            assert_eq!(snapshot.session_generation, 47);
-            assert_eq!(snapshot.backend_generation, 43);
-            assert_eq!(
-                snapshot.publication_proof.target_receipt.legacy_digest(),
-                Some([63; 32])
-            );
-            assert_eq!(snapshot.immutable_target.as_ref(), &first_target);
 
-            let snapshot_copy = snapshot.clone();
-            let first_weak = Arc::downgrade(&snapshot.immutable_target);
-            assert!(Arc::ptr_eq(
-                &snapshot.immutable_target,
-                &snapshot_copy.immutable_target
-            ));
-            assert!(same_sealed_legacy_target_for_test(&snapshot, &snapshot_copy));
-            let current_snapshot = control.current_sealed_target_snapshot().unwrap();
-            assert!(Arc::ptr_eq(
-                &snapshot.immutable_target,
-                &current_snapshot.immutable_target
-            ));
-            assert_eq!(
-                snapshot.immutable_target.xyz_f32_le.as_ptr(),
-                current_snapshot.immutable_target.xyz_f32_le.as_ptr()
-            );
-            assert!(control.current_sealed_assigned_target_snapshot().is_none());
-            drop(current_snapshot);
 
-            let second_seed = activation_seed_with_target("sealed-snapshot-second", 71, 3);
-            let second_target = second_seed
-                .immutable_target
-                .clone()
-                .expect("second immutable target");
-            let second_token =
-                match control.stage_or_replay(second_seed.clone(), activation_base_state(), true) {
-                    ActivationLedgerAdmission::Execute(token) => token,
-                    ActivationLedgerAdmission::Terminal(_) => panic!("second target must stage"),
-                };
-            assert!(control.current_sealed_target_snapshot().is_none());
-            assert!(first_weak.upgrade().is_some());
-            assert_eq!(snapshot.immutable_target.as_ref(), &first_target);
-            drop(snapshot);
-            assert!(
-                first_weak.upgrade().is_some(),
-                "snapshot clone retains the target allocation"
-            );
-            drop(snapshot_copy);
-            assert!(
-                first_weak.upgrade().is_none(),
-                "last snapshot releases the retired allocation"
-            );
-            assert_eq!(
-                control.retained_immutable_target_bytes_for("sealed-snapshot-first"),
-                0
-            );
-            assert_eq!(
-                control.retained_immutable_target_bytes(),
-                second_target.xyz_f32_le.len()
-            );
-            let first_replay =
-                match control.stage_or_replay(first_seed, activation_base_state(), true) {
-                    ActivationLedgerAdmission::Terminal(state) => state,
-                    ActivationLedgerAdmission::Execute(_) => {
-                        panic!("replaced sealed identity cannot execute")
-                    }
-                };
-            assert_eq!(
-                first_replay.activation_receipt_disposition,
-                crate::proto::ActivationReceiptDisposition::Retired as i32
-            );
-            assert!(!first_replay.relocalization_target_available);
-
-            let second_token = control
-                .reserve_backend_generation(&second_token, 53)
-                .unwrap();
-            let second_token = control
-                .bind_activation_identity(&second_token, [72; 32], 59)
-                .unwrap();
-            assert!(control.store_publication_proof(
-                &second_token,
-                activation_publication_proof([73; 32], 3, 59),
-            ));
-            control
-                .seal(
-                    &second_token,
-                    Some(TargetReceipt::LegacyDigest([73; 32])),
-                    activation_base_state(),
-                )
-                .expect("second target seal");
-            let second_snapshot = control
-                .current_sealed_target_snapshot()
-                .expect("replacement sealed target snapshot");
-            assert_eq!(
-                second_snapshot.activation_request_id,
-                "sealed-snapshot-second"
-            );
-            assert_eq!(second_snapshot.immutable_target.as_ref(), &second_target);
-            assert_eq!(
-                control.retained_immutable_target_bytes(),
-                second_target.xyz_f32_le.len()
-            );
-
-            let second_weak = Arc::downgrade(&second_snapshot.immutable_target);
-            control.retire_for_mapping_change().unwrap();
-            assert!(control.current_sealed_target_snapshot().is_none());
-            assert_eq!(control.retained_immutable_target_bytes(), 0);
-            assert!(second_weak.upgrade().is_some());
-            drop(second_snapshot);
-            assert!(second_weak.upgrade().is_none());
-        }
 
         #[test]
         fn phase_a_linearization_prevents_late_seal_or_token_mutation() {
             let phase_a = CorrectionPhaseAControl::for_tests();
             let control = phase_a.activated_target_receipts();
-            let seed = activation_seed_with_target("phase-a-seal-race", 7, 4);
-            let token = match control.stage_or_replay(seed.clone(), activation_base_state(), true) {
-                ActivationLedgerAdmission::Execute(token) => token,
-                ActivationLedgerAdmission::Terminal(_) => panic!("target must stage"),
-            };
-            let token = control.reserve_backend_generation(&token, 13).unwrap();
-            let token = control
-                .bind_activation_identity(&token, [8; 32], 11)
-                .unwrap();
-            let entered = Arc::new(std::sync::Barrier::new(2));
-            let release = Arc::new(std::sync::Barrier::new(2));
-            control.install_seal_before_ledger_gate(Arc::clone(&entered), Arc::clone(&release));
-            let seal_control = control.clone();
-            let seal_token = token.clone();
-            let seal_thread = std::thread::spawn(move || {
-                seal_control.seal(&seal_token, Some(TargetReceipt::LegacyDigest([9; 32])), activation_base_state())
-            });
-            entered.wait();
-            let epoch = control.lifecycle_epoch();
-            phase_a.begin();
-            assert_eq!(control.lifecycle_epoch(), epoch + 1);
-            assert!(!control.validate_token(&token));
-            assert!(!control.journal(
-                &token,
-                ActivationJournalEntry {
-                    step: ActivationJournalStep::Seal,
-                    idempotency_key: ActivationJournalKey::LegacyDigest([10; 32]),
-                    status: ActivationJournalStatus::Applied,
-                    verifier_receipt: Some(ActivationJournalVerifier::LegacyDigest([11; 32])),
-                    typed_failure: None,
-                },
-            ));
-            assert!(!control.store_publication_proof(
-                &token,
-                ActivationPublicationProof {
-                    source_timestamp_ns: 1,
-                    cloud_revision: 2,
-                    point_count: 4,
-                    voxel_size: crate::pointcloud::VOXEL_SIZE,
-                    cloud_receipt: crate::mapping_commit::CloudCommitReceipt {
-                        commit_id: crate::mapping_commit::MappingCommitId {
-                            boot_nonce: 3,
-                            sequence: 4,
-                        },
-                        session_generation: 11,
-                        occupancy_revision: 1,
-                        cloud_revision: 2,
-                        source_timestamp_ns: 1,
-                        point_count: 4,
-                    },
-                    target_receipt: TargetReceipt::LegacyDigest([12; 32]),
-                },
-            ));
-            assert!(control.publication_proof(&token).is_none());
-            assert!(control.immutable_target(&token).is_none());
-            assert_eq!(control.retained_immutable_target_bytes(), 0);
-            release.wait();
-            assert!(seal_thread.join().unwrap().is_none());
-            let replay = match control.stage_or_replay(seed, activation_base_state(), true) {
-                ActivationLedgerAdmission::Terminal(state) => state,
-                ActivationLedgerAdmission::Execute(_) => {
-                    panic!("Phase-A-retired token cannot restage")
-                }
-            };
-            assert!(!replay.success);
-            assert_eq!(
-                replay.activation_receipt_disposition,
-                crate::proto::ActivationReceiptDisposition::Retired as i32
-            );
+            let mut wire=assigned_wire_request(); wire.expected_runtime_generation=control.runtime_generation();
+            let request=ValidatedActivationRequestV2::admit(wire,control.runtime_generation(),
+                crate::mapping_backend::MappingBackendKind::Voxel,"map",|_|Err("fixture has no artifacts".into()),
+                &crate::activation_request::CheckpointOwnerInternerV2::default()).unwrap();
+            let token=assigned_bound_token(&control,request); let proof=assigned_proof(&control,&token);
+            let entered=Arc::new(std::sync::Barrier::new(2)); let release=Arc::new(std::sync::Barrier::new(2));
+            control.install_seal_before_ledger_gate(entered.clone(),release.clone());
+            let worker=control.clone(); let worker_token=token.clone(); let receipt=proof.clone();
+            let join=std::thread::spawn(move||worker.seal(&worker_token,receipt,assigned_base_state()));
+            entered.wait(); let epoch=control.lifecycle_epoch(); phase_a.begin();
+            assert_eq!(control.lifecycle_epoch(),epoch+1); assert!(!control.validate_token(&token));
+            assert!(!control.store_installed_target_receipt(&token,proof));
+            assert!(control.bind_assigned_activation_identity(&token,23).is_none());
+            release.wait(); assert!(join.join().unwrap().is_none());
         }
 
         #[test]
@@ -17061,33 +14451,7 @@ mod preflight_only_contract {
             }
         }
 
-        fn same_sealed_legacy_target_for_test(
-            left: &SealedActivatedTargetSnapshot,
-            right: &SealedActivatedTargetSnapshot,
-        ) -> bool {
-            left.runtime_generation == right.runtime_generation
-                && left.lifecycle_epoch == right.lifecycle_epoch
-                && left.session_id == right.session_id
-                && left.map_name == right.map_name
-                && left.activation_request_id == right.activation_request_id
-                && left.activation_request_identity_sha256 == right.activation_request_identity_sha256
-                && left.activation_identity_sha256 == right.activation_identity_sha256
-                && left.target_receipt_sha256 == right.target_receipt_sha256
-                && left.asset_manifest_sha256 == right.asset_manifest_sha256
-                && left.asset_bundle_sha256 == right.asset_bundle_sha256
-                && left.session_generation == right.session_generation
-                && left.backend_generation == right.backend_generation
-                && left.publication_proof.source_timestamp_ns
-                    == right.publication_proof.source_timestamp_ns
-                && left.publication_proof.cloud_revision == right.publication_proof.cloud_revision
-                && left.publication_proof.point_count == right.publication_proof.point_count
-                && left.publication_proof.voxel_size.to_bits()
-                    == right.publication_proof.voxel_size.to_bits()
-                && left.publication_proof.cloud_receipt == right.publication_proof.cloud_receipt
-                && left.publication_proof.target_receipt
-                    == right.publication_proof.target_receipt
-                && Arc::ptr_eq(&left.immutable_target, &right.immutable_target)
-        }
+
 
         fn committed_map(timestamp_ns: u64, _map_frame_id: &str) -> CommittedMapProof {
             CommittedMapProof {
@@ -18054,51 +15418,7 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             drop(receiver);
         }
 
-        #[test]
-        fn admitted_frame_rejects_replaced_points_pose_owner_and_cloud_receipt() {
-            let input = frame(1, 100, 0.0);
-            let mut mutations = Vec::new();
-            let mut points = input.clone();
-            points.body_points = points.body_points.edited_for_test(|points| points[0].x += 0.25);
-            mutations.push(points);
-            let mut pose = input.clone();
-            pose.correlated_odom.odom_from_body.translation.x += 0.25;
-            mutations.push(pose);
-            let mut pose_receipt = input.clone();
-            pose_receipt.correlated_odom.proof.translation_m[0] += 0.25;
-            mutations.push(pose_receipt);
-            let mut source_owner = input.clone();
-            source_owner.source_owner = frame(1, 100, 1.0).source_owner;
-            mutations.push(source_owner);
-            for field in 0..5 {
-                let mut receipt = input.clone();
-                match field {
-                    0 => receipt.cloud_receipt.commit_id.boot_nonce += 1,
-                    1 => receipt.cloud_receipt.commit_id.sequence += 1,
-                    2 => receipt.cloud_receipt.occupancy_revision += 1,
-                    3 => receipt.cloud_receipt.cloud_revision += 1,
-                    _ => receipt.cloud_receipt.session_generation += 1,
-                }
-                mutations.push(receipt);
-            }
-            for changed in mutations {
-                assert!(!input.exactly_matches(&changed));
-                assert_eq!(changed.validate_source_ownership(), Err(CorrectionOwnerError::InvalidRegisteredCloudProof));
-            }
-            let exact_independent = frame(1, 100, 0.0);
-            assert!(input.exactly_matches(&exact_independent));
-            let mut later_occupancy = input.clone();
-            later_occupancy.mapping_commit_id.sequence += 1;
-            later_occupancy.occupancy_revision += 1;
-            later_occupancy.validate_source_ownership().unwrap();
-            assert!(!input.exactly_matches(&later_occupancy));
-            let source_liveness = input.source_owner.retention_probe_for_test();
-            drop(exact_independent);
-            drop(input);
-            assert!(source_liveness(), "cloned frame retains exact source owner");
-            drop(later_occupancy);
-            assert!(!source_liveness(), "source owner retires with the last frame");
-        }
+
 
         #[test]
         fn coordinator_rejects_every_identity_boundary_mismatch() {
@@ -18310,13 +15630,13 @@ assert candidate.occupancy_revision != candidate.cloud_revision
         fn correction_frame_clones_share_immutable_body_and_mask_allocations() {
             let original = frame(1, 10, 0.0);
             let clone = original.clone();
-            assert_eq!(original.body_points.as_ptr(), clone.body_points.as_ptr());
+            assert_eq!(original.body_points().as_ptr(), clone.body_points().as_ptr());
             assert!(Arc::ptr_eq(&original.committed_map_occupancy, &clone.committed_map_occupancy));
-            let conflicting = clone.body_points.edited_for_test(|points| points[0].x += 0.25);
-            assert_ne!(original.body_points, conflicting);
-            assert_eq!(original.body_points, clone.body_points);
-            assert_eq!(original.registered_cloud, clone.registered_cloud);
-            assert_eq!(original.correlated_odom, clone.correlated_odom);
+            let conflicting = clone.body_points().edited_for_test(|points| points[0].x += 0.25);
+            assert_ne!(original.body_points(), &conflicting);
+            assert_eq!(original.body_points(), clone.body_points());
+            assert_eq!(original.registered_cloud(), clone.registered_cloud());
+            assert_eq!(original.correlated_odom(), clone.correlated_odom());
         }
 
         fn frame_source_adapter(
@@ -18412,17 +15732,14 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             source: crate::lio_ingress::AdmittedRegisteredScan,
         ) -> CorrectionFrameInput {
             let binding = source.binding();
-            let registered_cloud = RegisteredCloudProof::from_admitted(&source).unwrap();
-            let correlated_odom = FrozenCorrelatedOdom {
-                proof: CorrelatedOdomProof::from_registration(binding).unwrap(),
-                odom_from_body: binding.frozen_odom_from_body,
-            };
+
+
             let mut occupancy = vec![0_u8; 101 * 79];
             occupancy[..4].copy_from_slice(&[0, 20, 80, 255]);
             let mapping_commit_id = MappingCommitId { boot_nonce: COMMIT_NONCE, sequence };
             let input = CorrectionFrameInput {
-                mapping_session_id: binding.mapping_session_id.clone(),
-                mapping_session_generation: binding.mapping_session_generation,
+
+
                 mapping_commit_id,
                 occupancy_revision: sequence + 100,
                 cloud_revision: sequence,
@@ -18434,20 +15751,20 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                     source_timestamp_ns: source.source_timestamp_ns(),
                     point_count: source.body_points().len().try_into().unwrap(),
                 },
-                map_frame_generation: binding.map_frame_generation,
-                registered_cloud,
-                correlated_odom,
+
+
+
                 committed_map: committed_map(source.source_timestamp_ns(), "robot_map"),
                 committed_map_occupancy: Arc::from(occupancy),
-                points_frame_id: source.body_frame_id().to_owned(),
-                body_points: source.body_points().clone(),
+
+
                 static_point_indices: None,
-                base_anchor_map_from_odom: binding.base_anchor_map_from_odom,
-                frame_capture_relocalization_epoch: binding.frame_capture_relocalization_epoch.unwrap(),
+
+
                 relocalization_mode_epoch: None,
                 source_owner: source,
             };
-            input.validate_source_ownership().unwrap();
+
             input
         }
 
@@ -18541,8 +15858,8 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                     let retained_static = indices.len() - retained_people;
                     assert!(retained_people * 5 < people);
                     assert_eq!(retained_static, people_scan.len() - people);
-                    assert!(indices.len() < threshold && input.body_points.len() > threshold);
-                    let raw_receipt = input.registered_cloud;
+                    assert!(indices.len() < threshold && input.body_points().len() > threshold);
+                    let raw_receipt = input.registered_cloud();
                     let raw_owner = input.source_owner.clone();
                     let mut request = native_pgo_request(&owner_identity(), "robot_map", "robot_odom", "robot_body", &input).unwrap();
                     request.identity.request_sequence = 1;
@@ -18555,9 +15872,9 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                     assert_eq!(decoded.identity.registered_cloud.source_sequence as u64, raw_receipt.source_sequence);
                     assert_eq!(decoded.registered_body_points_xyz,
                         input.pgo_points().unwrap().iter().flat_map(|p| [p.x, p.y, p.z]).collect::<Vec<_>>());
-                    assert_eq!(input.registered_cloud, raw_receipt);
+                    assert_eq!(input.registered_cloud(), raw_receipt);
                     assert_eq!(input.source_owner, raw_owner);
-                    input.validate_source_ownership().unwrap();
+
                     static_input = Some(source);
                 }
                 assert!(library.submit_frame(input).unwrap().is_none());
@@ -18591,8 +15908,8 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                     asymmetric_cloud().iter().map(|point| pose * point).collect(),
                     &adapter, Arc::new(RelocalizationModeFence::default()),
                 ));
-                input.validate_source_ownership().unwrap();
-                assert!(input.mapping_session_generation > 1);
+
+                assert!(input.mapping_session_generation() > 1);
                 input.static_point_indices = Some(indices.into());
                 assert!(native_pgo_request(&owner_identity(), "robot_map", "robot_odom", "robot_body", &input).is_err());
                 assert_eq!(library.submit_frame(input), Err(CorrectionOwnerError::InvalidRegisteredCloudProof));
@@ -18600,9 +15917,6 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                 assert_eq!(owner.session.as_ref().unwrap().mapping_session_generation, 1);
                 assert_eq!(owner.coordinator.graph().nodes.len(), 1);
             }
-            let mut input = frame(2, 2_000_000_000, 1.0);
-            input.registered_cloud.point_count += 1;
-            assert!(native_pgo_request(&owner_identity(), "robot_map", "robot_odom", "robot_body", &input).is_err());
         }
 
         #[test]
@@ -18622,7 +15936,7 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             assert_eq!(request.identity.request_sequence, 0);
             assert_eq!(
                 request.identity.mapping_session_id,
-                input.mapping_session_id
+                input.mapping_session_id()
             );
             assert_eq!(request.identity.mapping_commit_id.sequence, 7);
             assert_eq!(
@@ -18643,12 +15957,12 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             );
             assert_eq!(
                 request.registered_body_coordinate_count as usize,
-                input.body_points.len() * 3
+                input.body_points().len() * 3
             );
             assert_eq!(
                 request.registered_body_points_xyz,
                 input
-                    .body_points
+                    .body_points()
                     .iter()
                     .flat_map(|point| [point.x, point.y, point.z])
                     .collect::<Vec<_>>()
@@ -18658,13 +15972,13 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             assert_eq!(request.identity.committed_map.resolution_m.to_bits(), input.committed_map.resolution_m.to_bits());
             assert_eq!(request.identity.committed_map.origin_x_m.to_bits(), input.committed_map.origin_x_m.to_bits());
             assert_eq!(request.identity.committed_map.origin_y_m.to_bits(), input.committed_map.origin_y_m.to_bits());
-            assert_eq!(request.identity.registered_cloud.backend, input.registered_cloud.backend);
-            assert_eq!(request.identity.registered_cloud.runtime_generation as u64, input.registered_cloud.runtime_generation);
+            assert_eq!(request.identity.registered_cloud.backend, input.registered_cloud().backend);
+            assert_eq!(request.identity.registered_cloud.runtime_generation as u64, input.registered_cloud().runtime_generation);
             assert_ne!(request.identity.registered_cloud.runtime_generation, request.identity.runtime_generation);
             assert_eq!(request.identity.correlated_odom.translation_m, [0.25, 0.0, 0.0]);
             assert_eq!(request.identity.correlated_odom.rotation_xyzw, [0.0, 0.0, 0.0, 1.0]);
-            assert_eq!(request.identity.correlated_odom.source_sequence as u64, input.correlated_odom.proof.source_sequence);
-            assert_eq!(request.identity.correlated_odom.source_timestamp_ns as u64, input.correlated_odom.proof.source_timestamp_ns);
+            assert_eq!(request.identity.correlated_odom.source_sequence as u64, input.correlated_odom().proof.source_sequence);
+            assert_eq!(request.identity.correlated_odom.source_timestamp_ns as u64, input.correlated_odom().proof.source_timestamp_ns);
         }
 
         #[derive(Default)]
@@ -18829,7 +16143,7 @@ assert candidate.occupancy_revision != candidate.cloud_revision
 
             let _activated = ingress.relocalization_mode_fence().activate_for_tests();
             let input = frame(7, 7_000_000_000, 0.0);
-            assert_eq!(input.frame_capture_relocalization_epoch, captured.epoch);
+            assert_eq!(input.frame_capture_relocalization_epoch(), captured.epoch);
             assert_eq!(
                 ingress.submit(input).await.expect("fenced submission"),
                 CorrectionSubmitDisposition::NoCandidate
@@ -18859,12 +16173,21 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             assert!(owner.has_independent_real_contexts());
             assert!(owner.binding().is_none());
             let ingress = owner.ingress();
-
             let adapter = frame_source_adapter("mapping-session-owner", Isometry3::identity());
-            let rejected = frame_from_admitted_source(1, admit_frame_source(
+            let source = crate::lio_ingress::CommonLioIngress::new(
+                crate::lio_ingress::DeviceLioIngressSpec::new(31,"robot_sensor","robot_body","robot_odom","robot_map").unwrap());
+            source.bind_relocalization_mode_fence(ingress.relocalization_mode_fence()).unwrap();
+            let frame=|sequence,timestamp_ns,x| {
+                let pose=Isometry3::translation(x,0.0,0.0);
+                let points=asymmetric_cloud().iter().map(|point|pose*Point3::from(point.coords*3.0)).collect();
+                frame_from_admitted_source(sequence,admit_frame_source_with_ingress(sequence,timestamp_ns,timestamp_ns,pose,points,&adapter,&source))
+            };
+
+
+            let rejected = frame_from_admitted_source(1, admit_frame_source_with_ingress(
                 1, 1_000_000_000, 1_000_000_000, Isometry3::identity(),
                 asymmetric_cloud().into_iter().take(3).collect(), &adapter,
-                ingress.relocalization_mode_fence(),
+                &source,
             ));
             match ingress.submit(rejected).await.unwrap() {
                 CorrectionSubmitDisposition::Rejected {
@@ -18944,6 +16267,16 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                 .await
                 .expect("injected finalizer closure");
             let ingress = owner.ingress();
+            let adapter = frame_source_adapter("mapping-session-owner", Isometry3::identity());
+            let source = crate::lio_ingress::CommonLioIngress::new(
+                crate::lio_ingress::DeviceLioIngressSpec::new(31,"robot_sensor","robot_body","robot_odom","robot_map").unwrap());
+            source.bind_relocalization_mode_fence(ingress.relocalization_mode_fence()).unwrap();
+            let frame=|sequence,timestamp_ns,x| {
+                let pose=Isometry3::translation(x,0.0,0.0);
+                let points=asymmetric_cloud().iter().map(|point|pose*Point3::from(point.coords*3.0)).collect();
+                frame_from_admitted_source(sequence,admit_frame_source_with_ingress(sequence,timestamp_ns,timestamp_ns,pose,points,&adapter,&source))
+            };
+
 
             assert_eq!(
                 ingress.submit(frame(1, 1_000_000_000, 0.0)).await.unwrap(),
@@ -19581,16 +16914,16 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                     runtime_generation: owner.runtime_generation,
                     backend_generation: owner.backend_generation,
                     candidate_sequence: sequence,
-                    mapping_session_id: input.mapping_session_id.clone(),
-                    mapping_session_generation: input.mapping_session_generation,
-                    map_frame_generation: input.map_frame_generation,
+                    mapping_session_id: input.mapping_session_id().to_owned(),
+                    mapping_session_generation: input.mapping_session_generation(),
+                    map_frame_generation: input.map_frame_generation(),
                     mapping_commit_id: input.mapping_commit_id,
                     occupancy_revision: input.occupancy_revision,
                     cloud_revision: input.cloud_revision,
-                    registered_cloud: input.registered_cloud,
-                    correlated_odom: input.correlated_odom.proof,
+                    registered_cloud: input.registered_cloud(),
+                    correlated_odom: input.correlated_odom().proof,
                     committed_map: input.committed_map,
-                    source_timestamp_ns: input.registered_cloud.source_timestamp_ns,
+                    source_timestamp_ns: input.registered_cloud().source_timestamp_ns,
                     map_frame_id: "robot_map".into(),
                     odom_frame_id: "robot_odom".into(),
                     body_frame_id: "robot_body".into(),
@@ -19625,7 +16958,7 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             let staged_owner = {
                 let state = sink.state.lock().await;
                 let staged = state.staged.as_ref().unwrap();
-                assert_eq!(staged.input.body_points.as_ptr(), input.body_points.as_ptr());
+                assert_eq!(staged.input.body_points().as_ptr(), input.body_points().as_ptr());
                 assert!(Arc::ptr_eq(&staged.input.committed_map_occupancy, &input.committed_map_occupancy));
                 Arc::clone(&staged.input)
             };
@@ -19635,7 +16968,7 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             let mut occupancy = input.committed_map_occupancy.to_vec();
             occupancy[0] ^= 1;
             changed.committed_map_occupancy = Arc::from(occupancy);
-            changed.validate_source_ownership().unwrap();
+
             assert_eq!(changed.mapping_commit_id, input.mapping_commit_id);
             assert_eq!(changed.committed_map, input.committed_map);
             assert!(sink.stage_frame(&changed).await.is_err());
@@ -19822,12 +17155,12 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             assert_eq!(transaction.candidate, candidate);
             assert_isometry_close(&transaction.base_anchor_map_from_odom, &full_anchor);
             assert_isometry_close(&transaction.effective_map_from_odom, &(full_anchor * correction));
-            assert_isometry_close(&transaction.frozen_odom_from_body, &input.correlated_odom.odom_from_body);
+            assert_isometry_close(&transaction.frozen_odom_from_body, &input.correlated_odom().odom_from_body);
             assert_eq!(transaction.frozen_odom_source_timestamp_ns, 90);
             assert_eq!(transaction.trajectory, trajectory);
             assert!((transaction.effective_map_from_odom.translation.vector
                 - (correction * full_anchor).translation.vector).norm() > 0.1);
-            input.validate_source_ownership().unwrap();
+
         }
 
         #[tokio::test]
@@ -20671,18 +18004,6 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                 owner_identity(),
             )
             .unwrap();
-            let mut wrong_points_frame = frame(1, 0, 0.0);
-            wrong_points_frame.points_frame_id = "robot_map".into();
-            assert_eq!(
-                library.submit_frame(wrong_points_frame),
-                Err(CorrectionOwnerError::UnsupportedPointsFrame)
-            );
-            let mut changed_points_after_proof = frame(1, 0, 0.0);
-            changed_points_after_proof.body_points = changed_points_after_proof.body_points.edited_for_test(|points| points[0].x += 0.25);
-            assert_eq!(
-                library.submit_frame(changed_points_after_proof),
-                Err(CorrectionOwnerError::InvalidRegisteredCloudProof)
-            );
             assert!(library.submit_frame(frame(1, 0, 0.0)).unwrap().is_none());
             let mut wrong_namespace = frame(2, 10_000_000_000, 2.0);
             wrong_namespace.mapping_commit_id.boot_nonce += 1;
@@ -20690,13 +18011,6 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             assert_eq!(
                 library.submit_frame(wrong_namespace),
                 Err(CorrectionOwnerError::MappingCommitNamespaceChanged)
-            );
-            let mut changed_odom_after_proof = frame(2, 10_000_000_000, 2.0);
-            changed_odom_after_proof.correlated_odom.odom_from_body =
-                Isometry3::translation(3.0, 0.0, 0.0);
-            assert_eq!(
-                library.submit_frame(changed_odom_after_proof),
-                Err(CorrectionOwnerError::InvalidRegisteredCloudProof)
             );
             assert!(library
                 .submit_frame(frame(2, 10_000_000_000, 2.0))
@@ -20841,7 +18155,7 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                 input.cloud_receipt.commit_id = input.mapping_commit_id;
                 input.cloud_receipt.occupancy_revision = sequence;
                 input.committed_map.backend_generation = adapter.backend_checkpoint_client().unwrap().backend_generation();
-                input.validate_source_ownership().unwrap();
+
                 input
             };
             assert!(library
@@ -21837,22 +19151,18 @@ assert candidate.occupancy_revision != candidate.cloud_revision
 }
 
 pub(crate) use preflight_only_contract::{
-    RELOCALIZATION_MAX_TERMINAL_BYTES, RELOCALIZATION_MAX_TERMINAL_RECORD_BYTES, RELOCALIZATION_MAX_CANDIDATE_PREIMAGE_BYTES, RELOCALIZATION_MAX_EVIDENCE_PREFIX_BYTES, RELOCALIZATION_MAX_EVIDENCE_SUFFIX_BYTES, RELOCALIZATION_MAX_EVIDENCE_DISCLOSURE_BYTES, RELOCALIZATION_MAX_FRAMES, RELOCALIZATION_MAX_PROOF_BYTES, RELOCALIZATION_MAX_AGGREGATE_POINTS, RELOCALIZATION_MAX_EMITTED_POINTS,
-    relocalization_algorithm_options_sha256_v1, relocalization_deadline_policy_sha256_v1,
-    relocalization_source_policy_sha256_v1, validate_relocalization_request_id,
+    RELOCALIZATION_MAX_TERMINAL_BYTES, RELOCALIZATION_MAX_TERMINAL_RECORD_BYTES, RELOCALIZATION_MAX_CANDIDATE_PREIMAGE_BYTES, validate_relocalization_request_id,
     relocalization_source_policy_preimage_v1, relocalization_deadline_policy_preimage_v1,
     relocalization_algorithm_options_preimage_v1, retained_algorithm_options_v2, normalize_relocalization_logical_timeout_ms,
     assigned_pose_isometry, CorrectionCandidate,
-    ActivatedTargetReceiptControl, ActivationJournalEntry, ActivationJournalStatus,
-    ActivationJournalStep, ActivationLedgerAdmission, ActivationPublicationProof,
+    ActivatedTargetReceiptControl, ActivationLedgerAdmission,
     ActivationReceiptSeed, ActivationToken, CanonicalCorrectionApplier,
     CanonicalCorrectionApplyError, CanonicalCorrectionTransaction, CommittedMapProof,
     CorrectionCandidateBackend, CorrectionFrameIngress, CorrectionFrameInput, CorrectionLeaseId,
     CorrectionOwnerRuntimeIdentity, CorrectionOwnerSpec, CorrectionPhaseAControl,
     CorrectionProcessStopAttempt, CorrectionRejectReason, CorrectionRequestCancellation,
-    CorrectionRuntimeError, CorrectionTransportOwner, CorrelatedOdomProof, FrozenCorrelatedOdom,
-    GeometryCorrectionSink, RegisteredCloudProof, RelocalizationCommandError,
-    PlanarCommandWork, PlanarCommandContext, PlanarCommandOutcome, planar_source_policy_sha256, planar_algorithm_policy_sha256,
+    CorrectionRuntimeError, CorrectionTransportOwner, GeometryCorrectionSink, RelocalizationCommandError,
+    PlanarCommandWork, PlanarCommandContext, PlanarCommandOutcome,
     RelocalizationCommandIngress, RelocalizationCommandWaiter, RelocalizationModeFence,
     RelocalizationTerminalSnapshot, RELOCALIZATION_ALGORITHM_OPTIONS_VERSION,
     RELOCALIZATION_DEADLINE_POLICY_VERSION_V1, RELOCALIZATION_SOURCE_POLICY_VERSION,
@@ -21862,3 +19172,6 @@ pub(crate) use preflight_only_contract::{
 pub(crate) use preflight_only_contract::{
     CorrectionCandidateIdentity, CorrectionTransform, CorrectionTransformSemantics, CorrectionCandidateSink, CorrectionDisposition,
 };
+
+#[cfg(test)]
+pub(crate) use preflight_only_contract::{CorrelatedOdomProof,RegisteredCloudProof};

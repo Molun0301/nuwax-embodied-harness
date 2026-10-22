@@ -174,7 +174,6 @@ class AssignedWorkspaceSaveTests(unittest.TestCase):
                     side_effect=AssertionError("application hash: " + name)))
         for owner, names in (
             (self.service._asset_repository, ("finalize_map_asset_bundle",)),
-            (self.service, ("_activate_legacy_map",)),
             (provider_module.MappingBackendCheckpointExportBundle,
                 ("canonical_cloud_checkpoint",)),
             (provider_module, ("_canonical_cloud_from_stored",)),
@@ -213,7 +212,7 @@ class AssignedWorkspaceSaveTests(unittest.TestCase):
                 status=LocalizationSessionStatus.READY, pose_available=True)
             self.localization._latest_snapshot = LocalizationSnapshot(source_name="old", current_pose=Pose(frame_id="map"))
             workspace = self.service.activate_map(map_name=MAP_NAME, load_memory_history=False)
-        self.assertEqual(self.stub.exports, [2])
+        self.assertEqual(self.stub.exports, [b''])
         self.assertTrue(workspace.map_loaded)
         self.assertFalse(workspace.localization_ready)
         self.assertIsNone(workspace.latest_localization_snapshot)
@@ -247,7 +246,7 @@ class AssignedWorkspaceSaveTests(unittest.TestCase):
             saved = self.save()
             self.assert_saved(saved)
             workspace = self.service.activate_map(map_name=MAP_NAME)
-        self.assertEqual(self.stub.exports, [2])
+        self.assertEqual(self.stub.exports, [b''])
         self.assertEqual(saved.geometry_asset.metadata["mapping_backend_checkpoint"]["backend_kind"], "raytracing")
         self.assertEqual(workspace.active_localization_session.asset_identity, saved.asset_identity)
 
@@ -268,7 +267,7 @@ class AssignedWorkspaceSaveTests(unittest.TestCase):
             recovered = self.save()
             self.assert_saved(recovered)
         self.assertEqual(recovered.asset_identity, durable.asset_identity)
-        self.assertEqual(self.stub.exports, [2])
+        self.assertEqual(self.stub.exports, [b''])
 
     def test_restart_recovers_catalog_failure_from_same_durable_current(self):
         original = self.service._repository.save_map_asset
@@ -289,7 +288,7 @@ class AssignedWorkspaceSaveTests(unittest.TestCase):
             workspace = self.service.activate_map(map_name=MAP_NAME)
         self.assertEqual(recovered.asset_identity, durable.asset_identity)
         self.assertEqual(workspace.active_localization_session.asset_identity, durable.asset_identity)
-        self.assertEqual(self.stub.exports, [2])
+        self.assertEqual(self.stub.exports, [b''])
 
     def test_finalized_retry_reuses_exact_owner_without_export(self):
         with self.assigned_only():
@@ -301,7 +300,7 @@ class AssignedWorkspaceSaveTests(unittest.TestCase):
                 retry = self.save()
         self.assertEqual(retry.asset_identity, first.asset_identity)
         self.assertEqual(current.stat().st_ino, inode)
-        self.assertEqual(self.stub.exports, [2])
+        self.assertEqual(self.stub.exports, [b''])
 
     def test_rpc_asset_io_and_publication_callbacks_run_outside_catalog_runtime_locks(self):
         self.stub.during = self.assert_unlocked
@@ -343,7 +342,7 @@ class AssignedWorkspaceSaveTests(unittest.TestCase):
             for action in (self.save, lambda: self.service.activate_map(map_name=MAP_NAME)):
                 with self.subTest(action=action), self.assertRaises((GatewayError, MapAssetBundleValidationError)):
                     action()
-        self.assertEqual(self.stub.exports, [2])
+        self.assertEqual(self.stub.exports, [b''])
         self.assertNotIn("ActivateMap", self.stub.calls)
         self.assertEqual((self.service._asset_repository.current_directory(MAP_NAME) / "manifest.json").read_bytes(), before)
         self.assertNotEqual(self.service._repository.get_map_asset(MAP_NAME).asset_identity, saved.asset_identity)
@@ -366,38 +365,38 @@ class AssignedWorkspaceSaveTests(unittest.TestCase):
                 with self.subTest(action=action), self.assertRaises((GatewayError, MapAssetBundleValidationError)):
                     action()
         self.assertEqual(path.read_bytes(), b"BROKEN!!" + original[8:])
-        self.assertEqual(self.stub.exports, [2])
+        self.assertEqual(self.stub.exports, [b''])
         self.assertNotIn("ActivateMap", self.stub.calls)
 
-    def test_low_level_prepare_default_keeps_explicit_legacy_export_contract(self):
+    def test_low_level_prepare_uses_fixed_assigned_export(self):
         seed = self.mapping.get_latest_snapshot()
         draft = MapAssetBundle(map_name=MAP_NAME, source_name=seed.source_name,
             frame_id="map", snapshot=seed, metadata={"mapping_session_id": "source", "session_generation": 3})
         requested = []
         def stop(request, timeout):
-            requested.append(request.checkpoint_schema_version)
+            requested.append(request.SerializeToString())
             raise RuntimeError("stop after observing requested schema")
         stage = self.service._asset_repository.create_staging_directory(MAP_NAME)
         with patch.object(self.stub, "ExportMappingBackendCheckpoint", stop), \
                 self.assertRaisesRegex(RuntimeError, "observing requested schema"):
             self.runtime.prepare_map_asset_bundle(draft, bundle_root=stage)
-        self.assertEqual(requested, [1])
+        self.assertEqual(requested, [b''])
 
-    def test_planar_public_save_preserves_legacy_export_selection(self):
+    def test_planar_public_save_uses_fixed_assigned_export(self):
         self.runtime.config.pipeline = "slam_2d"
         self.runtime.config.mapping_backend = "slam_toolbox"
         self.runtime._mapping_session_context.update(mapping_backend_kind="slam_toolbox", planar_mode="mapping")
         self.stub.state.mapping_backend_kind = "slam_toolbox"
         requested = []
         def stop(request, timeout):
-            requested.append(request.checkpoint_schema_version)
+            requested.append(request.SerializeToString())
             raise RuntimeError("planar fixture export boundary")
         with patch.object(self.stub, "ExportMappingBackendCheckpoint", stop), \
                 patch.object(self.service._asset_repository, "finalize_assigned_map_asset_bundle",
                     side_effect=AssertionError("planar entered assigned cloud finalizer")), \
                 self.assertRaises(GatewayError):
             self.save()
-        self.assertEqual(requested, [1])
+        self.assertEqual(requested, [b''])
         self.assertIsNone(self.service._repository.get_map_asset(MAP_NAME).asset_identity)
 
     def test_unknown_live_backend_never_falls_back_to_legacy_save(self):
@@ -418,7 +417,7 @@ class AssignedWorkspaceSaveTests(unittest.TestCase):
         with self.assigned_only(), patch.object(self.stub, "ExportMappingBackendCheckpoint", changed), \
                 self.assertRaises(GatewayError):
             self.save()
-        self.assertEqual(self.stub.exports, [2])
+        self.assertEqual(self.stub.exports, [b''])
         self.assertFalse(self.service._asset_repository.current_directory(MAP_NAME).exists())
         asset = self.service._repository.get_map_asset(MAP_NAME)
         self.assertFalse(asset.finalized)
@@ -440,7 +439,7 @@ class AssignedWorkspaceSaveTests(unittest.TestCase):
         self.assertFalse(stages[0].exists())
         self.assertFalse(self.service._asset_repository.current_directory(MAP_NAME).exists())
         self.assertFalse(self.service._repository.get_map_asset(MAP_NAME).finalized)
-        self.assertEqual(self.stub.exports, [2])
+        self.assertEqual(self.stub.exports, [b''])
 
     def test_cancellation_after_rename_preserves_durable_owner_for_restart(self):
         cancellation = SaveCancelled("cancel after durable rename")
@@ -462,7 +461,7 @@ class AssignedWorkspaceSaveTests(unittest.TestCase):
             recovered = self.save()
             self.assert_saved(recovered)
         self.assertEqual(recovered.asset_identity, durable.asset_identity)
-        self.assertEqual(self.stub.exports, [2])
+        self.assertEqual(self.stub.exports, [b''])
 
     def test_delete_recreate_same_name_during_preparation_rejects_old_save_owner(self):
         original = self.runtime.prepare_map_asset_bundle
@@ -481,7 +480,7 @@ class AssignedWorkspaceSaveTests(unittest.TestCase):
         self.assertEqual(len(replacements), 1)
         self.assertEqual(self.service._repository.get_map_asset(MAP_NAME), replacements[0])
         self.assertFalse(self.service._asset_repository.current_directory(MAP_NAME).exists())
-        self.assertEqual(self.stub.exports, [2])
+        self.assertEqual(self.stub.exports, [b''])
 
     def test_reentrant_publication_cannot_replace_a_new_same_name_catalog_owner(self):
         original_write = self.store.write
@@ -545,7 +544,7 @@ class AssignedWorkspaceSaveTests(unittest.TestCase):
             recovered = self.save()
             self.assert_saved(recovered)
         self.assertEqual(recovered.asset_identity, durable.asset_identity)
-        self.assertEqual(self.stub.exports, [2])
+        self.assertEqual(self.stub.exports, [b''])
 
     def test_finalized_event_replacement_preserves_the_new_catalog_and_cache(self):
         original = self.service._publish_event
@@ -583,7 +582,7 @@ class AssignedWorkspaceSaveTests(unittest.TestCase):
         with self.assigned_only(), patch.object(self.runtime, "prepare_map_asset_bundle",
                 side_effect=AssertionError("event-cancelled save reexported")):
             self.assertEqual(self.save().asset_identity, durable.asset_identity)
-        self.assertEqual(self.stub.exports, [2])
+        self.assertEqual(self.stub.exports, [b''])
 
     def test_active_saved_asset_uses_actual_active_name_and_does_not_claim_localization_ready(self):
         asset = self.service._repository.get_map_asset(MAP_NAME)
@@ -647,7 +646,7 @@ class AssignedWorkspaceSaveTests(unittest.TestCase):
                 restored = self.service.restore_active_workspace()
         self.assertEqual(self.stub.calls, ["GetMappingState"])
         self.assertEqual(self.stub.installs, 1)
-        self.assertEqual(self.stub.exports, [2])
+        self.assertEqual(self.stub.exports, [b''])
         session = restored.active_localization_session
         self.assertEqual(session.activation_receipt_v2.to_dict()["request"], request)
         self.assertEqual(session.asset_identity, saved.asset_identity)
@@ -679,9 +678,9 @@ class AssignedWorkspaceSaveTests(unittest.TestCase):
         self.assertNotEqual(replacement.asset_identity, saved.asset_identity)
         self.assertFalse(replacement.finalized)
         self.assertFalse(self.service._asset_repository.current_directory(MAP_NAME).exists())
-        self.assertEqual(self.stub.exports, [2])
+        self.assertEqual(self.stub.exports, [b''])
 
-    def test_literal_schema_one_current_public_get_and_save_preserve_original_bytes_and_digest(self):
+    def test_literal_schema_one_current_is_readonly_and_unsupported_save_is_explicit(self):
         current = self.service._asset_repository.current_directory(MAP_NAME)
         geometry = json.loads(LEGACY_BUNDLE)["geometry_asset"]
         files = {
@@ -704,8 +703,10 @@ class AssignedWorkspaceSaveTests(unittest.TestCase):
                 patch.object(self.service._asset_repository, "finalize_assigned_map_asset_bundle",
                     side_effect=AssertionError("existing schema1 map was upgraded")):
             reopened = self.service.get_map_asset_bundle(map_name=MAP_NAME)
-            saved = self.save()
-        for bundle in (reopened, saved):
+            with self.assertRaises(GatewayError) as error:
+                self.save()
+            self.assertEqual(error.exception.error_code, "map_asset_import_unsupported")
+        for bundle in (reopened,):
             self.assertEqual(bundle.identity_schema_version, 1)
             self.assertIsNone(bundle.asset_identity)
             self.assertEqual(bundle.manifest_sha256, LEGACY_SHA)

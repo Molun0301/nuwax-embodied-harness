@@ -6,7 +6,7 @@ Rust 运行时是主要的平台几何交互层（替代旧 nuwax-ros-bridge）�
 from __future__ import annotations
 
 from services.geometry.planar_archive import read_planar_structure
-from services.geometry.checkpoint_payload import FrozenPayload, payload_chunks, payload_digest, MAX_PLANAR_ARCHIVE_BYTES
+from services.geometry.checkpoint_payload import FrozenPayload, payload_chunks, MAX_PLANAR_ARCHIVE_BYTES
 from core.config_values import runtime_value
 from core.source_time import acquired_unix_ns, acquired_times, SourceTimeError
 
@@ -15,7 +15,6 @@ from collections import deque
 import copy
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import hashlib
 import json
 import logging
 import math
@@ -56,7 +55,6 @@ from services.geometry.mapping_backend_checkpoint_store import (
     CheckpointMemberIdentity,
     CheckpointArtifactReference,
     validate_artifact_reference,
-    MappingBackendCheckpointNotFoundError,
     MappingBackendCheckpointStore,
     StoredMappingBackendCheckpoint,
     _identity_document,
@@ -69,7 +67,6 @@ _OCCUPANCY_SCHEMA_VERSION = 2
 _ROLLOVER_RECOVERY_DEADLINE_SEC = 4.0
 
 _MappingIdentity = Tuple[str, str, int]
-_MappingCheckpointProvenance = Tuple[str, bool, str, str]
 _NavigationStreamToken = Tuple[int, int, int]
 _NavigationLease = Tuple[str, int, str, int, int]
 _NavigationCommandToken = Tuple[str, _NavigationLease, int, int]
@@ -98,30 +95,6 @@ _RELOCALIZE_SUCCESS_DISPOSITIONS = frozenset(
         int(pb2.RELOCALIZE_DISPOSITION_ALREADY_APPLIED),
     }
 )
-_RELOCALIZE_SCHEMA_VERSION_V1 = 1
-_RELOCALIZE_INLINE_EVIDENCE_PREIMAGE_MAX_BYTES = 4_096
-_RELOCALIZE_EVIDENCE_PREFIX_MAX_BYTES = 16_384
-_RELOCALIZE_EVIDENCE_SUFFIX_MAX_BYTES = 4_096
-_RELOCALIZE_CANONICAL_SOURCE_MAX_BYTES = 2_400_008
-_RELOCALIZE_EVIDENCE_DISCLOSURE_MAX_BYTES = 20_736
-_RELOCALIZE_EVIDENCE_DOMAIN_V1 = b"nuwax.geometry.relocalize.evidence.v1\0"
-_RELOCALIZE_EVIDENCE_COMPOSITE_DOMAIN_V1 = (
-    b"nuwax.geometry.relocalize.evidence-composite.v1\0"
-)
-_RELOCALIZE_SOURCE_COMMITMENT_DOMAIN_V1 = (
-    b"nuwax.geometry.relocalize.source-commitment.v1\0"
-)
-_RELOCALIZE_TERMINAL_PROOF_DOMAIN_V1 = (
-    b"nuwax.geometry.relocalize.terminal-proof.v1\0"
-)
-_CORRECTION_CANDIDATE_SCHEMA_VERSION_V1 = 1
-_CORRECTION_CANDIDATE_SCHEMA_VERSION_V2 = 2
-_CORRECTION_CANDIDATE_BACKEND_RELOCALIZATION = 3
-_CORRECTION_TRANSFORM_ABSOLUTE_LEFT_SE3 = 1
-_CORRECTION_IDENTITY_STRING_MAX_BYTES = 255
-_CORRECTION_REGISTERED_CLOUD_MAX_POINTS = 100_000
-_CORRECTION_TRANSLATION_MAX_ABS_METERS = 1_000_000.0
-_CORRECTION_QUATERNION_NORM_TOLERANCE = 1.0e-6
 
 
 def _decode_motion_admission_proof(value: object) -> Tuple[int, bytes, int]:
@@ -361,28 +334,18 @@ class MappingBackendCheckpointExportBundle:
     checkpoint: MappingBackendCheckpoint
     occupancy_asset: Mapping[str, object]
     cloud_asset: Optional[Mapping[str, object]]
-    canonical_occupancy_checkpoint_bytes: bytes = b""
-    canonical_cloud_checkpoint_bytes: bytes = b""
 
     @property
     def backend_kind(self) -> str:
         return self.checkpoint.backend_kind
 
     def canonical_occupancy_checkpoint(self):
-        if self.checkpoint.schema_version == 2:
-            return _canonical_occupancy_from_stored(self.checkpoint, self.occupancy_asset)
-        message = pb2.OccupancyGridData()
-        message.ParseFromString(self.canonical_occupancy_checkpoint_bytes)
-        return message
+        return _canonical_occupancy_from_stored(self.checkpoint, self.occupancy_asset)
 
     def canonical_cloud_checkpoint(self):
         if self.checkpoint.backend_kind == "slam_toolbox":
             return None
-        if self.checkpoint.schema_version == 2:
-            return _canonical_cloud_from_stored(self.checkpoint, self.cloud_asset)
-        message = pb2.CloudMapCheckpoint()
-        message.ParseFromString(self.canonical_cloud_checkpoint_bytes)
-        return message
+        return _canonical_cloud_from_stored(self.checkpoint, self.cloud_asset)
 
     def publish_to(
         self,
@@ -397,27 +360,7 @@ class MappingBackendCheckpointExportBundle:
         )
 
 
-def _planar_checkpoint_export_bundle_from_proto(response, payload):
-    if not isinstance(payload, FrozenPayload) or response.target_kind != "planar_graph" or response.payload:
-        raise ValueError("二维完整图导出缺少流式载荷或类型不符")
-    if response.HasField("cloud_receipt") or response.HasField("canonical_cloud_checkpoint"):
-        raise ValueError("二维完整图不能携带三维数据")
-    receipt = _require_proto_message_field(response, "occupancy_receipt")
-    grid = _require_proto_message_field(response, "canonical_occupancy_checkpoint")
-    meta = _require_proto_message_field(grid, "meta")
-    data = bytes(grid.data)
-    if payload_digest(payload) != bytes(response.content_sha256):
-        raise ValueError("content_sha256 does not match checkpoint payload")
-    checkpoint = MappingBackendCheckpoint(schema_version=response.schema_version, backend_kind=response.backend_kind,
-        source_session_id=response.source_session_id, source_session_generation=response.source_session_generation,
-        content_sha256=bytes(response.content_sha256), payload_size=response.payload_size, created_at_ns=response.created_at_ns,
-        payload=payload, occupancy_receipt=_occupancy_receipt_dict(receipt), cloud_receipt=None)
-    asset = dict(raw_data_sha256=hashlib.sha256(data).digest(), raw_data_size=len(data), width=meta.width, height=meta.height,
-        resolution=meta.resolution, origin_x=meta.origin_x, origin_y=meta.origin_y, frame_id=meta.frame_id,
-        source_occupancy_revision=meta.revision, timestamp_ns=meta.timestamp_ns)
-    checkpoint, asset, _ = MappingBackendCheckpointStore.validate_checkpoint_bundle(checkpoint, occupancy_asset=asset, cloud_asset=None)
-    return MappingBackendCheckpointExportBundle(checkpoint, _freeze_checkpoint_value(asset), None,
-        grid.SerializeToString(deterministic=True), b"")
+
 
 
 def _require_proto_message_field(message, field_name: str):
@@ -481,157 +424,28 @@ def _cloud_receipt_dict(message) -> Dict[str, object]:
 
 
 def _validate_checkpoint_identity_envelope(response):
-    """Reject known wire skew before downloading any optional artifact bodies."""
-    if int(response.schema_version) == 2:
-        if response.backend_kind == "slam_toolbox":
-            _require_proto_message_field(response, "occupancy_identity")
-            reference = _artifact_reference_from_proto(_require_proto_message_field(response, "graph_artifact"))
-            if (response.content_sha256 or response.payload or response.backend_payload_schema_version != 2
-                    or response.target_kind != "planar_graph" or reference.identity_schema_version != 2
-                    or reference.member_identity.role != "planar_graph"
-                    or reference.member_identity.checkpoint_id != response.checkpoint_id
-                    or any(response.HasField(name) for name in ("backend_identity", "cloud_receipt", "canonical_cloud_checkpoint", "fine_map_artifact", "dense_cloud_artifact"))):
-                raise ValueError("assigned planar checkpoint envelope mismatch")
-            return
-        _require_proto_message_field(response, "backend_identity")
+    if response.schema_version != 2:
+        raise ValueError("检查点传输只接收schema 2")
+    if response.backend_kind == "slam_toolbox":
         _require_proto_message_field(response, "occupancy_identity")
-        cloud = _require_proto_message_field(response, "canonical_cloud_checkpoint")
-        _require_proto_message_field(cloud, "member_identity")
-        if response.content_sha256 or cloud.xyz_sha256:
-            raise ValueError("assigned checkpoint cannot carry legacy digests")
+        reference = _artifact_reference_from_proto(_require_proto_message_field(response, "graph_artifact"))
+        if (response.payload or response.backend_payload_schema_version != 2
+                or response.target_kind != "planar_graph" or reference.identity_schema_version != 2
+                or reference.member_identity.role != "planar_graph"
+                or reference.member_identity.checkpoint_id != response.checkpoint_id
+                or any(response.HasField(name) for name in ("backend_identity", "cloud_receipt", "canonical_cloud_checkpoint", "fine_map_artifact", "dense_cloud_artifact"))):
+            raise ValueError("assigned planar checkpoint envelope mismatch")
         return
-    if int(response.schema_version) != 1:
-        raise ValueError("unsupported checkpoint envelope schema")
-    if (response.checkpoint_id or response.backend_payload_schema_version
-            or response.HasField("backend_identity") or response.HasField("occupancy_identity")
-            or (response.HasField("canonical_cloud_checkpoint")
-                and response.canonical_cloud_checkpoint.HasField("member_identity"))):
-        raise ValueError("legacy checkpoint cannot carry assigned identity fields")
+    _require_proto_message_field(response, "backend_identity")
+    _require_proto_message_field(response, "occupancy_identity")
+    cloud = _require_proto_message_field(response, "canonical_cloud_checkpoint")
+    _require_proto_message_field(cloud, "member_identity")
+    return
 
 
-def _checkpoint_export_bundle_from_proto(
-    response, payload=None, fine_payload=None, dense_payload=None,
-) -> MappingBackendCheckpointExportBundle:
+def _checkpoint_export_bundle_from_proto(response, payload=None, fine_payload=None, dense_payload=None):
     _validate_checkpoint_identity_envelope(response)
-    if int(response.schema_version) == 2:
-        return _checkpoint_export_bundle_v2(response, payload, fine_payload, dense_payload)
-    if str(response.backend_kind) == "slam_toolbox":
-        if fine_payload is not None or dense_payload is not None:
-            raise ValueError("二维导出不能携带精细三维资产")
-        return _planar_checkpoint_export_bundle_from_proto(response, payload)
-    if payload_digest(response.payload) != bytes(response.content_sha256):
-        raise ValueError("content_sha256 does not match checkpoint payload")
-    has_fine = response.fine_map_artifact is not None and response.HasField("fine_map_artifact")
-    if has_fine != (fine_payload is not None):
-        raise ValueError("精细地图制品引用与下载载荷不一致")
-    if has_fine and (len(fine_payload) != response.fine_map_artifact.size or payload_digest(fine_payload) != bytes(response.fine_map_artifact.sha256)):
-        raise ValueError("精细地图下载载荷与制品摘要不一致")
-    has_dense = response.HasField("dense_cloud_artifact")
-    if has_dense != (dense_payload is not None):
-        raise ValueError("完整点云制品引用与下载载荷不一致")
-    if has_dense and (len(dense_payload) != response.dense_cloud_artifact.size or payload_digest(dense_payload) != bytes(response.dense_cloud_artifact.sha256)):
-        raise ValueError("完整点云下载载荷与制品摘要不一致")
-    occupancy_receipt = _require_proto_message_field(response, "occupancy_receipt")
-    cloud_receipt = _require_proto_message_field(response, "cloud_receipt")
-    occupancy_checkpoint = _require_proto_message_field(
-        response,
-        "canonical_occupancy_checkpoint",
-    )
-    cloud_checkpoint = _require_proto_message_field(
-        response,
-        "canonical_cloud_checkpoint",
-    )
-    occupancy_meta = _require_proto_message_field(occupancy_checkpoint, "meta")
-    occupancy_data = bytes(occupancy_checkpoint.data)
-    if any(value > 100 and value != 255 for value in occupancy_data):
-        raise ValueError(
-            "canonical occupancy checkpoint contains values outside [-1, 100]"
-        )
-    xyz_f32_le = bytes(cloud_checkpoint.xyz_f32_le)
-    if len(xyz_f32_le) % 12 != 0:
-        raise ValueError(
-            "canonical cloud checkpoint xyz_f32_le must contain packed XYZ float32"
-        )
-    if any(
-        not math.isfinite(component)
-        for point in struct.iter_unpack("<fff", xyz_f32_le)
-        for component in point
-    ):
-        raise ValueError("canonical cloud checkpoint contains non-finite XYZ")
-    actual_xyz_sha256 = hashlib.sha256(xyz_f32_le).hexdigest()
-    declared_xyz_sha256 = str(
-        cloud_checkpoint.xyz_sha256
-    )
-    if declared_xyz_sha256 != actual_xyz_sha256:
-        raise ValueError("canonical cloud checkpoint xyz_sha256 mismatch")
-
-    checkpoint = MappingBackendCheckpoint(
-        schema_version=int(response.schema_version),
-        backend_kind=str(response.backend_kind),
-        source_session_id=str(
-            response.source_session_id
-        ),
-        source_session_generation=int(
-            response.source_session_generation
-        ),
-        content_sha256=bytes(
-            response.content_sha256
-        ),
-        payload_size=int(response.payload_size),
-        created_at_ns=int(response.created_at_ns),
-        payload=bytes(response.payload),
-        occupancy_receipt=_occupancy_receipt_dict(occupancy_receipt),
-        cloud_receipt=_cloud_receipt_dict(cloud_receipt),
-        fine_archive=fine_payload,
-        dense_archive=dense_payload,
-    )
-    occupancy_asset = {
-        "raw_data_sha256": hashlib.sha256(occupancy_data).digest(),
-        "raw_data_size": len(occupancy_data),
-        "width": int(occupancy_meta.width),
-        "height": int(occupancy_meta.height),
-        "resolution": float(occupancy_meta.resolution),
-        "origin_x": float(occupancy_meta.origin_x),
-        "origin_y": float(occupancy_meta.origin_y),
-        "frame_id": str(occupancy_meta.frame_id),
-        "source_occupancy_revision": int(
-            occupancy_meta.revision
-        ),
-        "timestamp_ns": int(occupancy_meta.timestamp_ns),
-    }
-    cloud_asset = {
-        "xyz_sha256": bytes.fromhex(actual_xyz_sha256),
-        "xyz_size": len(xyz_f32_le),
-        "frame_id": str(cloud_checkpoint.frame_id),
-        "source_cloud_revision": int(
-            cloud_checkpoint.source_revision
-        ),
-        "point_count": int(cloud_checkpoint.point_count),
-        "voxel_size": float(
-            cloud_checkpoint.voxel_size
-        ),
-        "payload_schema_version": int(
-            cloud_checkpoint.payload_schema_version
-        ),
-    }
-    validated_checkpoint, validated_occupancy, validated_cloud = (
-        MappingBackendCheckpointStore.validate_checkpoint_bundle(
-            checkpoint,
-            occupancy_asset=occupancy_asset,
-            cloud_asset=cloud_asset,
-        )
-    )
-    return MappingBackendCheckpointExportBundle(
-        checkpoint=validated_checkpoint,
-        occupancy_asset=_freeze_checkpoint_value(validated_occupancy),
-        cloud_asset=_freeze_checkpoint_value(validated_cloud),
-        canonical_occupancy_checkpoint_bytes=occupancy_checkpoint.SerializeToString(
-            deterministic=True
-        ),
-        canonical_cloud_checkpoint_bytes=cloud_checkpoint.SerializeToString(
-            deterministic=True
-        ),
-    )
+    return _checkpoint_export_bundle_v2(response, payload, fine_payload, dense_payload)
 
 
 def _mapping_commit_identity_proto(value: Mapping[str, object]):
@@ -641,62 +455,7 @@ def _mapping_commit_identity_proto(value: Mapping[str, object]):
     )
 
 
-def _mapping_backend_checkpoint_proto(
-    stored: StoredMappingBackendCheckpoint,
-    occupancy_checkpoint=None,
-    cloud_checkpoint=None, graph_artifact=None, fine_map_artifact=None, dense_cloud_artifact=None,
-):
-    checkpoint = stored.checkpoint
-    if checkpoint.schema_version == 2:
-        if occupancy_checkpoint is not None or cloud_checkpoint is not None:
-            raise ValueError("v2 reconstruction uses exact stored canonical members")
-        return _mapping_backend_checkpoint_v2_proto(stored, graph_artifact=graph_artifact,
-            fine_map_artifact=fine_map_artifact, dense_cloud_artifact=dense_cloud_artifact)
-    if checkpoint.backend_kind == "slam_toolbox":
-        receipt = checkpoint.occupancy_receipt
-        if graph_artifact is None or cloud_checkpoint is not None:
-            raise ValueError("二维检查点必须使用图制品引用")
-        return pb2.MappingBackendCheckpoint(schema_version=checkpoint.schema_version, backend_kind=checkpoint.backend_kind,
-            source_session_id=checkpoint.source_session_id, source_session_generation=checkpoint.source_session_generation,
-            content_sha256=checkpoint.content_sha256, payload_size=checkpoint.payload_size, created_at_ns=checkpoint.created_at_ns,
-            occupancy_receipt=pb2.CanonicalOccupancyCommitReceipt(commit_id=_mapping_commit_identity_proto(receipt["commit_id"]),
-                **{k:v for k,v in receipt.items() if k != "commit_id"}), canonical_occupancy_checkpoint=occupancy_checkpoint,
-            graph_artifact=graph_artifact, target_kind="planar_graph")
-    occupancy_receipt = checkpoint.occupancy_receipt
-    cloud_receipt = checkpoint.cloud_receipt
-    return pb2.MappingBackendCheckpoint(
-        schema_version=checkpoint.schema_version,
-        backend_kind=checkpoint.backend_kind,
-        source_session_generation=checkpoint.source_session_generation,
-        content_sha256=checkpoint.content_sha256,
-        payload_size=checkpoint.payload_size,
-        created_at_ns=checkpoint.created_at_ns,
-        payload=checkpoint.payload,
-        source_session_id=checkpoint.source_session_id,
-        occupancy_receipt=pb2.CanonicalOccupancyCommitReceipt(
-            commit_id=_mapping_commit_identity_proto(
-                occupancy_receipt["commit_id"]
-            ),
-            session_id=str(occupancy_receipt["session_id"]),
-            session_generation=int(occupancy_receipt["session_generation"]),
-            occupancy_revision=int(occupancy_receipt["occupancy_revision"]),
-            source_timestamp_ns=int(occupancy_receipt["source_timestamp_ns"]),
-            backend_kind=str(occupancy_receipt["backend_kind"]),
-            backend_generation=int(occupancy_receipt["backend_generation"]),
-        ),
-        cloud_receipt=pb2.CanonicalCloudCommitReceipt(
-            commit_id=_mapping_commit_identity_proto(cloud_receipt["commit_id"]),
-            session_generation=int(cloud_receipt["session_generation"]),
-            occupancy_revision=int(cloud_receipt["occupancy_revision"]),
-            cloud_revision=int(cloud_receipt["cloud_revision"]),
-            source_timestamp_ns=int(cloud_receipt["source_timestamp_ns"]),
-            point_count=int(cloud_receipt["point_count"]),
-        ),
-        canonical_occupancy_checkpoint=occupancy_checkpoint,
-        canonical_cloud_checkpoint=cloud_checkpoint,
-        fine_map_artifact=fine_map_artifact,
-        dense_cloud_artifact=dense_cloud_artifact,
-    )
+
 
 _CHECKPOINT_MEMBER_ROLE_NAMES = {
     1: "backend_state", 2: "canonical_occupancy", 3: "canonical_cloud",
@@ -715,9 +474,11 @@ def _member_identity_from_proto(message):
 
 
 def _artifact_reference_from_proto(reference, maximum_bytes=MAX_PLANAR_ARCHIVE_BYTES):
+    if reference.identity_schema_version != 2:
+        raise ValueError("制品传输只接收分配式身份")
     descriptor = _member_identity_from_proto(reference.member_identity) if reference.HasField("member_identity") else None
     return validate_artifact_reference(CheckpointArtifactReference(str(reference.id), int(reference.size),
-        int(reference.identity_schema_version), descriptor, bytes(reference.sha256)), maximum_bytes=maximum_bytes)
+        int(reference.identity_schema_version), descriptor), maximum_bytes=maximum_bytes)
 
 
 def _occupancy_receipt_proto(receipt):
@@ -740,8 +501,7 @@ def _member_identity_proto(identity):
 
 def _artifact_reference_proto(reference):
     return pb2.GraphArtifactRef(id=reference.id, size=reference.size, identity_schema_version=reference.identity_schema_version,
-        member_identity=_member_identity_proto(reference.member_identity) if reference.member_identity is not None else None,
-        sha256=reference.legacy_alias)
+        member_identity=_member_identity_proto(reference.member_identity) if reference.member_identity is not None else None)
 
 
 def _canonical_occupancy_from_stored(checkpoint, asset):
@@ -769,13 +529,13 @@ def _checkpoint_export_bundle_v2(response, payload, fine_payload, dense_payload)
         raise ValueError("cloud checkpoint cannot carry graph artifact")
     if response.target_kind != "":
         raise ValueError("v2 cloud checkpoint target kind mismatch")
-    if response.content_sha256 or response.backend_payload_schema_version != 1:
+    if response.backend_payload_schema_version != 1:
         raise ValueError("v2 checkpoint has mixed identity or unsupported backend bytes")
     occupancy = _require_proto_message_field(response, "canonical_occupancy_checkpoint")
     meta = _require_proto_message_field(occupancy, "meta")
     cloud = _require_proto_message_field(response, "canonical_cloud_checkpoint")
-    if cloud.payload_schema_version != 2 or cloud.xyz_sha256:
-        raise ValueError("v2 cloud checkpoint requires assigned identity with empty legacy digest")
+    if cloud.payload_schema_version != 2:
+        raise ValueError("v2 cloud checkpoint requires assigned identity")
     fine_reference = _artifact_reference_from_proto(response.fine_map_artifact, MAX_FINE_ARCHIVE_BYTES) if response.HasField("fine_map_artifact") else None
     dense_reference = _artifact_reference_from_proto(response.dense_cloud_artifact, MAX_DENSE_ARCHIVE_BYTES) if response.HasField("dense_cloud_artifact") else None
     checkpoint = MappingBackendCheckpoint(schema_version=2, backend_kind=response.backend_kind,
@@ -945,167 +705,25 @@ def _assigned_mapping_predecessor(value):
     return result
 
 
-def _canonical_string_bytes(value: str) -> bytes:
-    encoded = str(value).encode("utf-8")
-    return struct.pack(">I", len(encoded)) + encoded
 
 
-def _require_digest_bytes(value: object, field_name: str) -> bytes:
-    if isinstance(value, str):
-        try:
-            resolved = bytes.fromhex(value)
-        except ValueError as exc:
-            raise ValueError("%s must be hexadecimal" % field_name) from exc
-    else:
-        resolved = bytes(value or b"")
-    if len(resolved) != 32:
-        raise ValueError("%s must contain exactly 32 bytes" % field_name)
-    return resolved
 
 
-def _canonical_occupancy_sha256(checkpoint) -> bytes:
-    meta = _require_proto_message_field(checkpoint, "meta")
-    data = bytes(checkpoint.data)
-    width = int(meta.width)
-    height = int(meta.height)
-    revision = int(meta.revision)
-    resolution = float(meta.resolution)
-    origin_x = float(meta.origin_x)
-    origin_y = float(meta.origin_y)
-    frame_id = str(meta.frame_id)
-    if width <= 0 or height <= 0 or revision <= 0 or len(data) != width * height:
-        raise ValueError("canonical occupancy checkpoint dimensions are invalid")
-    if not math.isfinite(resolution) or resolution <= 0.0:
-        raise ValueError("canonical occupancy checkpoint resolution is invalid")
-    if not math.isfinite(origin_x) or not math.isfinite(origin_y) or not frame_id:
-        raise ValueError("canonical occupancy checkpoint origin/frame is invalid")
-    preimage = bytearray(b"nuwax.geometry.occupancy-checkpoint.v1\0")
-    preimage.extend(struct.pack(">III", 1, width, height))
-    preimage.extend(struct.pack(">f", resolution))
-    preimage.extend(struct.pack(">d", 0.0 if origin_x == 0.0 else origin_x))
-    preimage.extend(struct.pack(">d", 0.0 if origin_y == 0.0 else origin_y))
-    preimage.extend(_canonical_string_bytes(frame_id))
-    preimage.extend(struct.pack(">QQ", revision, int(meta.timestamp_ns)))
-    preimage.extend(struct.pack(">Q", len(data)))
-    preimage.extend(hashlib.sha256(data).digest())
-    return hashlib.sha256(preimage).digest()
 
 
-def _canonical_cloud_sha256(checkpoint) -> bytes:
-    frame_id = str(checkpoint.frame_id)
-    xyz = bytes(checkpoint.xyz_f32_le)
-    xyz_sha256 = _require_digest_bytes(
-        str(checkpoint.xyz_sha256).strip(),
-        "cloud checkpoint xyz_sha256",
-    )
-    if not frame_id or hashlib.sha256(xyz).digest() != xyz_sha256:
-        raise ValueError("canonical cloud checkpoint identity is invalid")
-    preimage = bytearray(b"nuwax.geometry.cloud-checkpoint.v1\0")
-    preimage.extend(_canonical_string_bytes(frame_id))
-    preimage.extend(struct.pack(">Q", int(checkpoint.source_revision)))
-    preimage.extend(struct.pack(">I", int(checkpoint.point_count)))
-    preimage.extend(struct.pack(">f", float(checkpoint.voxel_size)))
-    preimage.extend(struct.pack(">Q", len(xyz)))
-    preimage.extend(xyz_sha256)
-    preimage.extend(struct.pack(">I", int(checkpoint.payload_schema_version)))
-    return hashlib.sha256(preimage).digest()
 
 
-def _canonical_commit_identity_bytes(identity, field_name: str) -> bytes:
-    if identity is None:
-        raise ValueError("%s is required" % field_name)
-    boot_nonce = bytes(identity.boot_nonce)
-    if not boot_nonce:
-        raise ValueError("%s.boot_nonce is required" % field_name)
-    return boot_nonce + struct.pack(">Q", int(identity.sequence))
 
 
-def _canonical_backend_sha256(checkpoint) -> bytes:
-    if checkpoint.backend_kind == "slam_toolbox":
-        receipt = _require_proto_message_field(checkpoint, "occupancy_receipt")
-        preimage = bytearray(b"nuwax.geometry.planar-backend-checkpoint.v1\0")
-        preimage.extend(struct.pack(">I", checkpoint.schema_version))
-        preimage.extend(_canonical_string_bytes(checkpoint.backend_kind))
-        preimage.extend(_canonical_string_bytes(checkpoint.source_session_id))
-        preimage.extend(struct.pack(">QQQ", checkpoint.source_session_generation, checkpoint.payload_size, checkpoint.created_at_ns))
-        preimage.extend(_require_digest_bytes(checkpoint.content_sha256, "content_sha256"))
-        preimage.extend(_canonical_commit_identity_bytes(receipt.commit_id, "occupancy receipt commit_id"))
-        preimage.extend(_canonical_string_bytes(receipt.session_id))
-        preimage.extend(struct.pack(">QQQ", receipt.session_generation, receipt.occupancy_revision, receipt.source_timestamp_ns))
-        preimage.extend(_canonical_string_bytes(receipt.backend_kind))
-        preimage.extend(struct.pack(">Q", receipt.backend_generation))
-        preimage.extend(_canonical_occupancy_sha256(checkpoint.canonical_occupancy_checkpoint))
-        return hashlib.sha256(preimage).digest()
-    occupancy_receipt = _require_proto_message_field(checkpoint, "occupancy_receipt")
-    cloud_receipt = _require_proto_message_field(checkpoint, "cloud_receipt")
-    occupancy_checkpoint = _require_proto_message_field(
-        checkpoint, "canonical_occupancy_checkpoint"
-    )
-    cloud_checkpoint = _require_proto_message_field(
-        checkpoint, "canonical_cloud_checkpoint"
-    )
-    preimage = bytearray(b"nuwax.geometry.backend-checkpoint.v1\0")
-    preimage.extend(struct.pack(">I", int(checkpoint.schema_version)))
-    preimage.extend(_canonical_string_bytes(checkpoint.backend_kind))
-    preimage.extend(struct.pack(">Q", int(checkpoint.source_session_generation)))
-    preimage.extend(_require_digest_bytes(checkpoint.content_sha256, "content_sha256"))
-    preimage.extend(struct.pack(">Q", int(checkpoint.payload_size)))
-    preimage.extend(struct.pack(">Q", int(checkpoint.created_at_ns)))
-    preimage.extend(hashlib.sha256(bytes(checkpoint.payload)).digest())
-    preimage.extend(_canonical_string_bytes(checkpoint.source_session_id))
-    preimage.extend(
-        _canonical_commit_identity_bytes(
-            occupancy_receipt.commit_id, "occupancy receipt commit_id"
-        )
-    )
-    preimage.extend(_canonical_string_bytes(occupancy_receipt.session_id))
-    preimage.extend(struct.pack(">Q", int(occupancy_receipt.session_generation)))
-    preimage.extend(struct.pack(">Q", int(occupancy_receipt.occupancy_revision)))
-    preimage.extend(struct.pack(">Q", int(occupancy_receipt.source_timestamp_ns)))
-    preimage.extend(_canonical_string_bytes(occupancy_receipt.backend_kind))
-    preimage.extend(struct.pack(">Q", int(occupancy_receipt.backend_generation)))
-    preimage.extend(
-        _canonical_commit_identity_bytes(
-            cloud_receipt.commit_id, "cloud receipt commit_id"
-        )
-    )
-    preimage.extend(struct.pack(">Q", int(cloud_receipt.session_generation)))
-    preimage.extend(struct.pack(">Q", int(cloud_receipt.occupancy_revision)))
-    preimage.extend(struct.pack(">Q", int(cloud_receipt.cloud_revision)))
-    preimage.extend(struct.pack(">Q", int(cloud_receipt.source_timestamp_ns)))
-    preimage.extend(struct.pack(">I", int(cloud_receipt.point_count)))
-    preimage.extend(_canonical_occupancy_sha256(occupancy_checkpoint))
-    preimage.extend(_canonical_cloud_sha256(cloud_checkpoint))
-    if checkpoint.fine_map_artifact is not None and checkpoint.HasField("fine_map_artifact"):
-        preimage.extend(b"nuwax.geometry.fine-map-archive.v1\0")
-        preimage.extend(struct.pack(">Q", checkpoint.fine_map_artifact.size))
-        preimage.extend(_require_digest_bytes(checkpoint.fine_map_artifact.sha256, "fine_map_artifact.sha256"))
-    if checkpoint.HasField("dense_cloud_artifact"):
-        preimage.extend(b"nuwax.geometry.dense-cloud-archive.v1\0")
-        preimage.extend(struct.pack(">Q", checkpoint.dense_cloud_artifact.size))
-        preimage.extend(_require_digest_bytes(checkpoint.dense_cloud_artifact.sha256, "dense_cloud_artifact.sha256"))
-    return hashlib.sha256(preimage).digest()
 
 
-def _canonical_asset_bundle_sha256(
-    *,
-    asset_manifest_sha256: bytes,
-    occupancy_checkpoint,
-    cloud_checkpoint,
-    backend_checkpoint,
-) -> bytes:
-    preimage = bytearray(b"nuwax.geometry.asset-bundle.v1\0")
-    preimage.extend(struct.pack(">I", 1))
-    preimage.extend(_require_digest_bytes(asset_manifest_sha256, "asset_manifest_sha256"))
-    preimage.extend(_canonical_occupancy_sha256(occupancy_checkpoint))
-    for digest in (
-        _canonical_cloud_sha256(cloud_checkpoint) if cloud_checkpoint is not None else None,
-        _canonical_backend_sha256(backend_checkpoint) if backend_checkpoint is not None else None,
-    ):
-        preimage.append(1 if digest is not None else 0)
-        if digest is not None:
-            preimage.extend(digest)
-    return hashlib.sha256(preimage).digest()
+
+
+
+
+
+
+
 
 
 def _canonical_relocalization_request_id(
@@ -1130,27 +748,6 @@ def _canonical_relocalization_request_id(
         raise ValueError("request_id must be canonical ASCII [A-Za-z0-9._:-]")
     return resolved
 
-
-_LEGACY_ACTIVATION_IDENTITY_FIELDS = (
-    "activation_request_identity_sha256", "activation_identity_sha256",
-    "target_receipt_sha256", "asset_manifest_sha256", "asset_bundle_sha256",
-    "source_policy_version", "source_policy_sha256", "deadline_policy_version",
-    "deadline_policy_sha256", "algorithm_options_version", "algorithm_options_sha256",
-    "target_graph_sha256", "planar_mode", "target_kind",
-)
-
-
-def _require_supported_activation_schema(state: Mapping[str, object]) -> None:
-    # Schema 0 is the existing pre-receipt/idle diagnostic compatibility shape.
-    version = state.get("activation_receipt_schema_version", 0)
-    if type(version) is not int or version not in {0, 1, 2}:
-        raise ValueError("unsupported activation receipt schema")
-    if version == 0:
-        claims = tuple(name for name in _LEGACY_ACTIVATION_IDENTITY_FIELDS if name != "planar_mode")
-        if (state.get("activation_receipt_v2") is not None or state.get("relocalization_target_available")
-                or state.get("activation_request_id") or state.get("backend_generation")
-                or any(state.get(name) for name in claims)):
-            raise ValueError("schema-0 activation state cannot claim an installed target")
 
 
 def _planar_activation_target_payload(message):
@@ -1218,18 +815,17 @@ def _unactivated_mapping_state_payload(response, disposition: int, disposition_n
     """No activation record is not an idle mapping session or an installed target."""
     if response.DESCRIPTOR.full_name != "nuwax.geometry.MappingSessionState":
         raise ValueError("unactivated mapping state protobuf type differs")
-    identity_fields = tuple(name for name in _LEGACY_ACTIVATION_IDENTITY_FIELDS if name != "planar_mode")
     if (disposition not in {pb2.ACTIVATION_RECEIPT_DISPOSITION_UNSPECIFIED, pb2.ACTIVATION_RECEIPT_DISPOSITION_RETIRED}
             or response.HasField("activation_receipt_v2")
             or response.relocalization_target_available or response.activation_request_id
-            or response.backend_generation or any(getattr(response, name) for name in identity_fields)):
+            or response.backend_generation or response.target_kind):
         raise ValueError("schema-0 mapping state contains activation/target claims")
     policy = None
     if response.HasField("relocalization_policy_v2"):
         policy = _project_assigned_proto(response.relocalization_policy_v2, "policy")
     fields = (
         "success", "phase", "message", "session_id", "map_name", "session_generation",
-        "revision", "active", "idempotent_replay", "legacy_checkpoint_reconstructed",
+        "revision", "active", "idempotent_replay",
         "mapping_backend_kind", "runtime_generation", "planar_mode",
     )
     payload = {name: getattr(response, name) for name in fields}
@@ -1252,7 +848,7 @@ def _assigned_mapping_state_payload(response, disposition: int, disposition_name
               if response.HasField("relocalization_policy_v2") else None)
     fields = (
         "success", "phase", "message", "session_id", "map_name", "session_generation",
-        "revision", "active", "idempotent_replay", "legacy_checkpoint_reconstructed",
+        "revision", "active", "idempotent_replay",
         "mapping_backend_kind", "runtime_generation", "backend_generation", "activation_request_id",
         "relocalization_target_available",
     )
@@ -1282,6 +878,8 @@ def _assigned_request_for_rpc(
     request_id: Optional[str], logical_timeout_ms: int, query_only: bool, planar_seed=None,
 ) -> AssignedRelocalizationRequest:
     """查询必须使用持久化精确请求；不从旧 SHA 或缺失别名重建身份。"""
+    if not query_only and activation_state.get("activation_receipt_schema_version") != 2:
+        raise ValueError("unsupported activation schema for assigned relocalization")
     if assigned_request_v2 is not None:
         request = (
             assigned_request_v2 if isinstance(assigned_request_v2, AssignedRelocalizationRequest)
@@ -1318,12 +916,6 @@ def _assigned_request_for_rpc(
         if not request.exact_replay_of(AssignedRelocalizationRequest.admit_retained(replay)):
             raise ValueError("assigned planar retry changed its seed")
     if not query_only:
-        if any(activation_state.get(name) for name in
-               _LEGACY_ACTIVATION_IDENTITY_FIELDS + ("cloud_source_sha256",)
-               if not (planar and name in {"planar_mode", "target_kind"})):
-            raise ValueError("assigned activation state mixes legacy/planar identity")
-        if activation_state.get("activation_receipt_schema_version") != 2:
-            raise ValueError("assigned request requires an assigned activation state")
         receipt = activation_state["activation_receipt_v2"]
         if not request.activation_receipt.exact_replay_of(receipt):
             raise ValueError("assigned request target differs from activation receipt")
@@ -1357,62 +949,6 @@ def _assigned_terminal_payload(terminal: AssignedRelocalizationTerminal) -> Dict
     return payload
 
 
-def _canonical_relocalize_request_sha256(request) -> bytes:
-    """Encode the R2 request identity in the same order as the Rust owner."""
-
-    preimage = bytearray(b"nuwax.geometry.relocalize.request.v1\0")
-    preimage.extend(struct.pack(">I", int(request.schema_version)))
-    preimage.extend(_canonical_string_bytes(request.request_id))
-    preimage.extend(struct.pack(">Q", int(request.runtime_generation)))
-    preimage.extend(_canonical_string_bytes(request.session_id))
-    preimage.extend(_canonical_string_bytes(request.map_name))
-    preimage.extend(struct.pack(">Q", int(request.session_generation)))
-    preimage.extend(struct.pack(">Q", int(request.backend_generation)))
-    preimage.extend(
-        _require_digest_bytes(
-            request.activation_identity_sha256,
-            "activation_identity_sha256",
-        )
-    )
-    preimage.extend(
-        _require_digest_bytes(request.target_receipt_sha256, "target_receipt_sha256")
-    )
-    preimage.extend(struct.pack(">Q", int(request.target_cloud_revision)))
-    preimage.extend(
-        bytes(32) if request.target_kind == "planar_graph" else _require_digest_bytes(request.target_cloud_sha256, "target_cloud_sha256")
-    )
-    preimage.extend(
-        _require_digest_bytes(request.asset_manifest_sha256, "asset_manifest_sha256")
-    )
-    preimage.extend(
-        _require_digest_bytes(request.asset_bundle_sha256, "asset_bundle_sha256")
-    )
-    preimage.extend(struct.pack(">I", int(request.source_policy_version)))
-    preimage.extend(
-        _require_digest_bytes(request.source_policy_sha256, "source_policy_sha256")
-    )
-    preimage.extend(struct.pack(">I", int(request.deadline_policy_version)))
-    preimage.extend(
-        _require_digest_bytes(
-            request.deadline_policy_sha256,
-            "deadline_policy_sha256",
-        )
-    )
-    preimage.extend(struct.pack(">Q", int(request.logical_timeout_ms)))
-    preimage.extend(struct.pack(">I", int(request.algorithm_options_version)))
-    preimage.extend(
-        _require_digest_bytes(
-            request.algorithm_options_sha256,
-            "algorithm_options_sha256",
-        )
-    )
-    if request.target_kind == "planar_graph":
-        if request.target_cloud_revision or request.target_cloud_sha256 or not request.HasField("planar_seed"):
-            raise ValueError("二维重定位请求身份非法")
-        preimage.extend(b"nuwax.geometry.planar-relocalize.v1\0")
-        preimage.extend(_require_digest_bytes(request.target_graph_sha256, "target_graph_sha256"))
-        preimage.extend(struct.pack(">ddd", request.planar_seed.x, request.planar_seed.y, request.planar_seed.yaw))
-    return hashlib.sha256(preimage).digest()
 
 
 
@@ -1443,133 +979,20 @@ def _canonical_relocalize_request_sha256(request) -> bytes:
 
 
 
-def _datetime_exact_microsecond_ns(value: object) -> Optional[int]:
-    if not isinstance(value, datetime):
-        return None
-    normalized = value
-    if normalized.tzinfo is None:
-        normalized = normalized.replace(tzinfo=timezone.utc)
-    else:
-        normalized = normalized.astimezone(timezone.utc)
-    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
-    delta = normalized - epoch
-    return (
-        delta.days * 86_400_000_000_000
-        + delta.seconds * 1_000_000_000
-        + delta.microseconds * 1_000
-    )
 
 
-def _require_float_match(actual: float, expected: float, field_name: str) -> None:
-    if (
-        not math.isfinite(actual)
-        or not math.isfinite(expected)
-        or actual != expected
-    ):
-        raise ValueError(
-            "map asset occupancy %s does not match backend checkpoint descriptor"
-            % field_name
-        )
 
 
-def _require_float32_match(
-    actual: float,
-    expected: float,
-    field_name: str,
-) -> None:
-    try:
-        matches = (
-            math.isfinite(actual)
-            and math.isfinite(expected)
-            and struct.pack("<f", actual) == struct.pack("<f", expected)
-        )
-    except (OverflowError, struct.error):
-        matches = False
-    if not matches:
-        raise ValueError(
-            "map asset occupancy %s does not match backend checkpoint descriptor"
-            % field_name
-        )
 
 
-def _validate_asset_occupancy_checkpoint(
-    occupancy_grid: OccupancyGrid,
-    encoded: bytes,
-    descriptor: Mapping[str, object],
-) -> None:
-    expected_sha256 = bytes(descriptor["raw_data_sha256"])
-    if hashlib.sha256(encoded).digest() != expected_sha256:
-        raise ValueError(
-            "map asset occupancy payload SHA-256 does not match backend checkpoint"
-        )
-    if len(encoded) != int(descriptor["raw_data_size"]):
-        raise ValueError(
-            "map asset occupancy payload size does not match backend checkpoint"
-        )
-    if (
-        int(occupancy_grid.width) != int(descriptor["width"])
-        or int(occupancy_grid.height) != int(descriptor["height"])
-    ):
-        raise ValueError(
-            "map asset occupancy dimensions do not match backend checkpoint"
-        )
-    _require_float32_match(
-        float(occupancy_grid.resolution_m),
-        float(descriptor["resolution"]),
-        "resolution",
-    )
-    origin = occupancy_grid.origin.position
-    _require_float_match(float(origin.x), float(descriptor["origin_x"]), "origin_x")
-    _require_float_match(float(origin.y), float(descriptor["origin_y"]), "origin_y")
-    frame_id = str(occupancy_grid.frame_id or "").strip().lstrip("/")
-    if frame_id != str(descriptor["frame_id"]):
-        raise ValueError(
-            "map asset occupancy frame does not match backend checkpoint"
-        )
-    timestamp_ns = _datetime_exact_microsecond_ns(
-        getattr(occupancy_grid, "timestamp", None)
-    )
-    exact_timestamp_ns = int(descriptor["timestamp_ns"])
-    if timestamp_ns is None or abs(timestamp_ns - exact_timestamp_ns) >= 1_000:
-        raise ValueError(
-            "map asset occupancy timestamp does not match backend checkpoint"
-        )
 
 
-def _resolve_map_bundle_asset(
-    bundle_root: Path,
-    relative_path: object,
-    field_name: str,
-    *,
-    allow_missing: bool = False,
-) -> Path:
-    requested_root = Path(bundle_root).expanduser()
-    if not requested_root.is_absolute():
-        raise ValueError("bundle_root must be an absolute path")
-    resolved_root = requested_root.resolve(strict=True)
-    if not resolved_root.is_dir():
-        raise ValueError("bundle_root must be a directory")
 
-    path_text = str(relative_path or "").strip()
-    if not path_text:
-        raise ValueError("%s must not be empty" % field_name)
-    if "\\" in path_text:
-        raise ValueError("%s must use a POSIX relative path" % field_name)
-    relative = Path(path_text)
-    if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
-        raise ValueError("%s must be a canonical bundle-relative path" % field_name)
 
-    candidate = resolved_root / relative
-    if candidate.is_symlink():
-        raise ValueError("%s must not be a symlink" % field_name)
-    resolved = candidate.resolve(strict=not allow_missing)
-    try:
-        resolved.relative_to(resolved_root)
-    except ValueError as exc:
-        raise ValueError("%s escapes bundle_root" % field_name) from exc
-    if not resolved.is_file() and not (allow_missing and not resolved.exists()):
-        raise ValueError("%s is not a regular file" % field_name)
-    return resolved
+
+
+
+
 
 
 class _NavigationNotificationTicket:
@@ -2934,9 +2357,6 @@ class GeometryRuntimeProvider:
         self._last_map_stream_observation = None
         self._mapping_identity: Optional[_MappingIdentity] = None
         self._planar_input_active = False
-        self._mapping_checkpoint_provenance: Optional[
-            _MappingCheckpointProvenance
-        ] = None
         self._map_connection_epoch = 0
         self._mapping_transition_epoch = 0
         self._mapping_transition_inflight = False
@@ -3954,191 +3374,15 @@ class GeometryRuntimeProvider:
             activation_disposition_name = activation_disposition_name.lower()
         except ValueError:
             activation_disposition_name = "unknown"
-        _require_supported_activation_schema({"activation_receipt_schema_version":
-            int(response.activation_receipt_schema_version)})
-        if int(response.activation_receipt_schema_version) == 0:
+        if response.activation_receipt_schema_version == 0:
             return _unactivated_mapping_state_payload(response, activation_disposition, activation_disposition_name)
-        if int(response.activation_receipt_schema_version) == 2:
+        if response.activation_receipt_schema_version == 2:
             return _assigned_mapping_state_payload(response, activation_disposition, activation_disposition_name)
-        has_field = response.HasField
-        if has_field("activation_receipt_v2") or has_field("relocalization_policy_v2"):
-            raise ValueError("legacy mapping state contains assigned metadata")
-        return {
-            "planar_mode": str(response.planar_mode),
-            "target_kind": str(response.target_kind),
-            "target_graph_sha256": bytes(response.target_graph_sha256).hex(),
-            "success": bool(response.success),
-            "phase": str(response.phase),
-            "message": str(response.message),
-            "session_id": str(response.session_id),
-            "map_name": str(response.map_name),
-            "session_generation": int(
-                response.session_generation
-            ),
-            "revision": int(response.revision),
-            "active": bool(response.active),
-            "idempotent_replay": bool(
-                response.idempotent_replay
-            ),
-            "legacy_checkpoint_reconstructed": bool(
-                response.legacy_checkpoint_reconstructed
-            ),
-            "mapping_backend_kind": str(
-                response.mapping_backend_kind
-            ),
-            "activation_receipt_schema_version": int(
-                response.activation_receipt_schema_version
-            ),
-            "activation_receipt_disposition": activation_disposition,
-            "activation_receipt_disposition_name": activation_disposition_name,
-            "runtime_generation": int(
-                response.runtime_generation
-            ),
-            "backend_generation": int(
-                response.backend_generation
-            ),
-            "activation_request_id": str(
-                response.activation_request_id
-            ),
-            "activation_request_identity_sha256": bytes(
-                response.activation_request_identity_sha256
-            ).hex(),
-            "activation_identity_sha256": bytes(
-                response.activation_identity_sha256
-            ).hex(),
-            "target_receipt_sha256": bytes(
-                response.target_receipt_sha256
-            ).hex(),
-            "asset_manifest_sha256": bytes(
-                response.asset_manifest_sha256
-            ).hex(),
-            "asset_bundle_sha256": bytes(
-                response.asset_bundle_sha256
-            ).hex(),
-            "relocalization_target_available": bool(
-                response.relocalization_target_available
-            ),
-            "source_policy_version": int(
-                response.source_policy_version
-            ),
-            "source_policy_sha256": bytes(
-                response.source_policy_sha256
-            ).hex(),
-            "deadline_policy_version": int(
-                response.deadline_policy_version
-            ),
-            "deadline_policy_sha256": bytes(
-                response.deadline_policy_sha256
-            ).hex(),
-            "algorithm_options_version": int(
-                response.algorithm_options_version
-            ),
-            "algorithm_options_sha256": bytes(
-                response.algorithm_options_sha256
-            ).hex(),
-        }
+        raise ValueError("unsupported activation receipt schema")
 
     @staticmethod
     def _relocalize_result_payload(response) -> Dict[str, Any]:
-        if int(response.schema_version) not in {1, 2}:
-            raise ValueError("unsupported relocalization result schema")
-        if int(response.schema_version) == 2:
-            return _assigned_terminal_payload(AssignedRelocalizationTerminal.from_proto(response))
-        if (response.HasField("assigned_cloud_v2") or response.HasField("assigned_planar_v2")):
-            raise ValueError("legacy relocalization result contains assigned metadata")
-        disposition = int(response.disposition)
-        try:
-            disposition_name = pb2.RelocalizeDisposition.Name(disposition)
-            disposition_prefix = "RELOCALIZE_DISPOSITION_"
-            if disposition_name.startswith(disposition_prefix):
-                disposition_name = disposition_name[len(disposition_prefix) :]
-            disposition_name = disposition_name.lower()
-        except ValueError:
-            disposition_name = "unknown"
-        return {
-            "target_kind": str(response.target_kind),
-            "target_graph_sha256": bytes(response.target_graph_sha256).hex(),
-            "success": disposition in _RELOCALIZE_SUCCESS_DISPOSITIONS,
-            "schema_version": int(response.schema_version),
-            "request_id": str(response.request_id),
-            "request_identity_sha256": bytes(
-                response.request_identity_sha256
-            ).hex(),
-            "runtime_generation": int(
-                response.runtime_generation
-            ),
-            "session_id": str(response.session_id),
-            "map_name": str(response.map_name),
-            "session_generation": int(
-                response.session_generation
-            ),
-            "backend_generation": int(
-                response.backend_generation
-            ),
-            "activation_identity_sha256": bytes(
-                response.activation_identity_sha256
-            ).hex(),
-            "target_receipt_sha256": bytes(
-                response.target_receipt_sha256
-            ).hex(),
-            "target_cloud_revision": int(
-                response.target_cloud_revision
-            ),
-            "target_cloud_sha256": bytes(
-                response.target_cloud_sha256
-            ).hex(),
-            "asset_manifest_sha256": bytes(
-                response.asset_manifest_sha256
-            ).hex(),
-            "asset_bundle_sha256": bytes(
-                response.asset_bundle_sha256
-            ).hex(),
-            "source_policy_version": int(
-                response.source_policy_version
-            ),
-            "source_policy_sha256": bytes(
-                response.source_policy_sha256
-            ).hex(),
-            "deadline_policy_version": int(
-                response.deadline_policy_version
-            ),
-            "deadline_policy_sha256": bytes(
-                response.deadline_policy_sha256
-            ).hex(),
-            "logical_timeout_ms": int(
-                response.logical_timeout_ms
-            ),
-            "algorithm_options_version": int(
-                response.algorithm_options_version
-            ),
-            "algorithm_options_sha256": bytes(
-                response.algorithm_options_sha256
-            ).hex(),
-            "disposition": disposition,
-            "disposition_name": disposition_name,
-            "candidate_sequence": int(
-                response.candidate_sequence
-            ),
-            "candidate_payload_sha256": bytes(
-                response.candidate_payload_sha256
-            ).hex(),
-            "candidate_payload_preimage_v1": bytes(
-                response.candidate_payload_preimage_v1
-            ).hex(),
-            "evidence_sha256": bytes(
-                response.evidence_sha256
-            ).hex(),
-            "evidence_disclosure_v1": bytes(
-                response.evidence_disclosure_v1
-            ).hex(),
-            "correction_revision": int(
-                response.correction_revision
-            ),
-            "terminal_proof_sha256": bytes(
-                response.terminal_proof_sha256
-            ).hex(),
-            "detail": str(response.detail),
-        }
+        return _assigned_terminal_payload(AssignedRelocalizationTerminal.from_proto(response))
 
     @staticmethod
     def _mapping_identity_from_payload(payload: Dict[str, Any]) -> _MappingIdentity:
@@ -4196,8 +3440,6 @@ class GeometryRuntimeProvider:
         *,
         identity: Optional[_MappingIdentity] = None,
         input_active: Optional[bool] = None,
-        checkpoint_provenance: Optional[_MappingCheckpointProvenance] = None,
-        preserve_checkpoint_provenance: bool = False,
         expected_origin=None,
         deadline_monotonic: Optional[float] = None,
     ) -> bool:
@@ -4227,8 +3469,6 @@ class GeometryRuntimeProvider:
                         self._last_occupancy_grid = None
                         self._last_occupancy_grid_identity = None
                     self._mapping_identity = identity
-                    if not preserve_checkpoint_provenance:
-                        self._mapping_checkpoint_provenance = checkpoint_provenance
                 if input_active is not None:
                     self._planar_input_active = input_active
                 self._mapping_transition_inflight = False
@@ -4244,7 +3484,6 @@ class GeometryRuntimeProvider:
         self._mapping_transition_inflight = False
         self._mapping_identity = None
         self._planar_input_active = False
-        self._mapping_checkpoint_provenance = None
         self._last_occupancy_grid = None
         self._last_occupancy_grid_identity = None
         return retired_attempt
@@ -4383,8 +3622,6 @@ class GeometryRuntimeProvider:
             transition_epoch,
             identity=identity,
             input_active=True,
-            checkpoint_provenance=None,
-            preserve_checkpoint_provenance=bool(payload["idempotent_replay"]),
             deadline_monotonic=deadline_monotonic,
         ):
             raise RuntimeError(
@@ -4411,7 +3648,7 @@ class GeometryRuntimeProvider:
     def _download_graph_artifact(self, reference, maximum_bytes=MAX_PLANAR_ARCHIVE_BYTES, *, validate_structure=True,
                                  _stub_override=None, _release_on_completion=True):
         retained = _artifact_reference_from_proto(reference, maximum_bytes)
-        if retained.identity_schema_version == 2 and retained.member_identity.role not in ("planar_graph", "fine_map", "dense_cloud"):
+        if retained.member_identity.role not in ("planar_graph", "fine_map", "dense_cloud"):
             raise ValueError("unpaired assigned artifact role")
         transfer_options = {"stub": _stub_override} if _stub_override is not None else {}
         def chunks():
@@ -4427,7 +3664,7 @@ class GeometryRuntimeProvider:
             payload = FrozenPayload(chunks(), maximum_bytes=maximum_bytes)
             if len(payload) != reference.size:
                 raise ValueError("artifact downloaded size mismatch")
-            if retained.identity_schema_version == 2 and validate_structure:
+            if validate_structure:
                 identity = retained.member_identity
                 if identity.role == "planar_graph":
                     read_planar_structure(payload, checkpoint_id=identity.checkpoint_id,
@@ -4452,7 +3689,6 @@ class GeometryRuntimeProvider:
                     validate_dense_archive(payload, **keywords, frame_id=identity.frame_id)
                 else:
                     raise ValueError("unpaired assigned artifact role")
-            # Legacy aliases remain opaque on read after capture too.
             return payload
         finally:
             if _release_on_completion:
@@ -4462,39 +3698,35 @@ class GeometryRuntimeProvider:
                                expected_origin=None):
         transfer = self._graph_transfer if transfer is None else transfer
         payload = checkpoint.payload if payload is None else payload
-        if checkpoint.schema_version == 2:
-            if reference is None:
-                reference = (checkpoint.graph_reference if checkpoint.backend_kind == "slam_toolbox" and payload is checkpoint.payload
-                    else checkpoint.fine_reference if payload is checkpoint.fine_archive
-                    else checkpoint.dense_reference if payload is checkpoint.dense_archive else None)
-            if reference is None:
-                raise ValueError("v2 upload requires the retained artifact reference")
-            if not isinstance(reference, CheckpointArtifactReference):
-                reference = _artifact_reference_from_proto(reference, max(MAX_DENSE_ARCHIVE_BYTES, len(payload)))
-            validate_artifact_reference(reference, checkpoint=checkpoint, maximum_bytes=MAX_DENSE_ARCHIVE_BYTES)
-            if reference == checkpoint.graph_reference:
-                retained_payload = checkpoint.payload
-                if not isinstance(payload, FrozenPayload) or payload is not retained_payload:
-                    raise ValueError("planar upload requires its retained immutable payload owner")
-            elif reference == checkpoint.fine_reference:
-                retained_payload = checkpoint.fine_archive
-                if retained_payload[:8] in (b"NUWAXAR1", b"NUWAXAR4", b"NUWAXAR5"):
-                    self.require_assigned_fine_archive_support(checkpoint,
-                        expected_origin=expected_origin or self.capture_assigned_activation_origin())
-            elif reference == checkpoint.dense_reference:
-                retained_payload = checkpoint.dense_archive
-            else:
-                raise ValueError("upload reference is not a retained checkpoint artifact")
-            if (not isinstance(payload, (bytes, FrozenPayload)) or len(payload) != reference.size
-                    or not isinstance(retained_payload, (bytes, FrozenPayload)) or len(retained_payload) != reference.size):
-                raise ValueError("artifact upload or retained owner type/size mismatch")
-            if payload is not retained_payload and any(left != right for left, right in zip(
-                    payload_chunks(payload), payload_chunks(retained_payload))):
-                raise ValueError("upload bytes differ from the retained immutable artifact")
-            reference = _artifact_reference_proto(reference)
+        if reference is None:
+            reference = (checkpoint.graph_reference if checkpoint.backend_kind == "slam_toolbox" and payload is checkpoint.payload
+                else checkpoint.fine_reference if payload is checkpoint.fine_archive
+                else checkpoint.dense_reference if payload is checkpoint.dense_archive else None)
+        if reference is None:
+            raise ValueError("v2 upload requires the retained artifact reference")
+        if not isinstance(reference, CheckpointArtifactReference):
+            reference = _artifact_reference_from_proto(reference, max(MAX_DENSE_ARCHIVE_BYTES, len(payload)))
+        validate_artifact_reference(reference, checkpoint=checkpoint, maximum_bytes=MAX_DENSE_ARCHIVE_BYTES)
+        if reference == checkpoint.graph_reference:
+            retained_payload = checkpoint.payload
+            if not isinstance(payload, FrozenPayload) or payload is not retained_payload:
+                raise ValueError("planar upload requires its retained immutable payload owner")
+        elif reference == checkpoint.fine_reference:
+            retained_payload = checkpoint.fine_archive
+            if retained_payload[:8] in (b"NUWAXAR1", b"NUWAXAR4", b"NUWAXAR5"):
+                self.require_assigned_fine_archive_support(checkpoint,
+                    expected_origin=expected_origin or self.capture_assigned_activation_origin())
+        elif reference == checkpoint.dense_reference:
+            retained_payload = checkpoint.dense_archive
         else:
-            # Explicit residual legacy writer, retired with activation-v1.
-            reference = pb2.GraphArtifactRef(id=uuid.uuid4().hex, size=len(payload), sha256=payload_digest(payload))
+            raise ValueError("upload reference is not a retained checkpoint artifact")
+        if (not isinstance(payload, (bytes, FrozenPayload)) or len(payload) != reference.size
+                or not isinstance(retained_payload, (bytes, FrozenPayload)) or len(retained_payload) != reference.size):
+            raise ValueError("artifact upload or retained owner type/size mismatch")
+        if payload is not retained_payload and any(left != right for left, right in zip(
+                payload_chunks(payload), payload_chunks(retained_payload))):
+            raise ValueError("upload bytes differ from the retained immutable artifact")
+        reference = _artifact_reference_proto(reference)
         try:
             admitted = transfer(1, reference)
             frontier = int(admitted.offset)
@@ -4524,89 +3756,80 @@ class GeometryRuntimeProvider:
             raise
 
     def export_mapping_backend_checkpoint(
-        self, *, checkpoint_schema_version: int = 1,
+        self,
     ) -> MappingBackendCheckpointExportBundle:
-        """Retain the legacy default; workspace saves opt into paired cloud v2."""
+        """导出当前分配式检查点，并将制品读取固定在原连接。"""
 
-        if type(checkpoint_schema_version) is not int or checkpoint_schema_version not in (1, 2):
-            raise ValueError("unsupported requested checkpoint envelope schema")
         self._raise_if_stopping("export_mapping_backend_checkpoint")
         if not self._connected or not self._stub:
             raise RuntimeError("Geometry runtime 未连接。")
-        origin = self.capture_assigned_activation_origin() if checkpoint_schema_version == 2 else None
-        origin_stub = origin[0] if origin is not None else self._stub
-        rpc = getattr(origin_stub, "ExportMappingBackendCheckpoint", None)
-        if not callable(rpc):
-            raise RuntimeError("Geometry runtime 不支持 backend checkpoint 导出。")
+        origin = self.capture_assigned_activation_origin()
+        origin_stub = origin[0]
+        rpc = origin_stub.ExportMappingBackendCheckpoint
         try:
-            response = rpc(pb2.ExportMappingBackendCheckpointRequest(checkpoint_schema_version=checkpoint_schema_version), timeout=_heavy_deadline_sec())
+            response = rpc(pb2.ExportMappingBackendCheckpointRequest(), timeout=_heavy_deadline_sec())
         except grpc.RpcError as exc:
             raise GeometryRuntimeRpcError.from_rpc_error(
                 "ExportMappingBackendCheckpoint",
                 exc,
             ) from exc
-        if response.schema_version != checkpoint_schema_version:
+        if response.schema_version != 2:
             raise ValueError("server returned a different checkpoint schema; downgrade is forbidden")
-        if origin is not None and response.backend_kind not in {"voxel", "raytracing", "slam_toolbox"}:
+        if response.backend_kind not in {"voxel", "raytracing", "slam_toolbox"}:
             raise ValueError("assigned checkpoint export requires a paired backend")
         _validate_checkpoint_identity_envelope(response)
-        if origin is not None:
-            # The export owns all returned leases. Pin reads and cleanup to its
-            # origin even if this provider is replaced before the first read.
-            references = {}
-            completed = False
-            cleanup_error = None
-            try:
-                for field_name, role, maximum in (
-                    ("graph_artifact", "planar_graph", MAX_PLANAR_ARCHIVE_BYTES),
-                    ("fine_map_artifact", "fine_map", MAX_FINE_ARCHIVE_BYTES),
-                    ("dense_cloud_artifact", "dense_cloud", MAX_DENSE_ARCHIVE_BYTES),
-                ):
-                    if response.HasField(field_name):
-                        reference = getattr(response, field_name)
-                        retained = _artifact_reference_from_proto(reference, maximum)
-                        if (retained.identity_schema_version != 2
-                                or retained.member_identity.checkpoint_id != response.checkpoint_id
-                                or retained.member_identity.role != role):
-                            raise ValueError("assigned export artifact differs from its checkpoint role")
-                        if any(reference.id == previous.id for previous in references.values()):
-                            raise ValueError("distinct checkpoint members cannot reuse one artifact ID")
-                        references[field_name] = reference
-                self.require_assigned_activation_origin(origin)
-                fine_payload = self._download_graph_artifact(
-                    references["fine_map_artifact"], MAX_FINE_ARCHIVE_BYTES,
-                    validate_structure=False, _stub_override=origin_stub, _release_on_completion=False,
-                ) if "fine_map_artifact" in references else None
-                self.require_assigned_activation_origin(origin)
-                dense_payload = self._download_graph_artifact(
-                    references["dense_cloud_artifact"], MAX_DENSE_ARCHIVE_BYTES,
-                    validate_structure=False, _stub_override=origin_stub, _release_on_completion=False,
-                ) if "dense_cloud_artifact" in references else None
-                self.require_assigned_activation_origin(origin)
-                graph_payload = self._download_graph_artifact(
-                    references["graph_artifact"], MAX_PLANAR_ARCHIVE_BYTES,
-                    validate_structure=False, _stub_override=origin_stub, _release_on_completion=False,
-                ) if "graph_artifact" in references else None
-                self.require_assigned_activation_origin(origin)
-                exported = _checkpoint_export_bundle_from_proto(response, graph_payload, fine_payload, dense_payload)
-                self.require_assigned_activation_origin(origin)
-                completed = True
-            finally:
-                for reference in references.values():
-                    try:
-                        self._graph_transfer(5, reference, stub=origin_stub)
-                    except BaseException as error:
-                        if cleanup_error is None:
-                            cleanup_error = error
-                        LOGGER.exception("Assigned export artifact release failed.")
-                if completed and cleanup_error is not None:
-                    raise cleanup_error
+        # The export owns all returned leases. Pin reads and cleanup to its
+        # origin even if this provider is replaced before the first read.
+        references = {}
+        completed = False
+        cleanup_error = None
+        try:
+            for field_name, role, maximum in (
+                ("graph_artifact", "planar_graph", MAX_PLANAR_ARCHIVE_BYTES),
+                ("fine_map_artifact", "fine_map", MAX_FINE_ARCHIVE_BYTES),
+                ("dense_cloud_artifact", "dense_cloud", MAX_DENSE_ARCHIVE_BYTES),
+            ):
+                if response.HasField(field_name):
+                    reference = getattr(response, field_name)
+                    retained = _artifact_reference_from_proto(reference, maximum)
+                    if (retained.identity_schema_version != 2
+                            or retained.member_identity.checkpoint_id != response.checkpoint_id
+                            or retained.member_identity.role != role):
+                        raise ValueError("assigned export artifact differs from its checkpoint role")
+                    if any(reference.id == previous.id for previous in references.values()):
+                        raise ValueError("distinct checkpoint members cannot reuse one artifact ID")
+                    references[field_name] = reference
             self.require_assigned_activation_origin(origin)
-            return exported
-        payload = self._download_graph_artifact(_require_proto_message_field(response, "graph_artifact")) if response.backend_kind == "slam_toolbox" else None
-        fine_payload = self._download_graph_artifact(response.fine_map_artifact, MAX_FINE_ARCHIVE_BYTES) if response.HasField("fine_map_artifact") else None
-        dense_payload = self._download_graph_artifact(response.dense_cloud_artifact, MAX_DENSE_ARCHIVE_BYTES) if response.HasField("dense_cloud_artifact") else None
-        return _checkpoint_export_bundle_from_proto(response, payload, fine_payload, dense_payload)
+            fine_payload = self._download_graph_artifact(
+                references["fine_map_artifact"], MAX_FINE_ARCHIVE_BYTES,
+                validate_structure=False, _stub_override=origin_stub, _release_on_completion=False,
+            ) if "fine_map_artifact" in references else None
+            self.require_assigned_activation_origin(origin)
+            dense_payload = self._download_graph_artifact(
+                references["dense_cloud_artifact"], MAX_DENSE_ARCHIVE_BYTES,
+                validate_structure=False, _stub_override=origin_stub, _release_on_completion=False,
+            ) if "dense_cloud_artifact" in references else None
+            self.require_assigned_activation_origin(origin)
+            graph_payload = self._download_graph_artifact(
+                references["graph_artifact"], MAX_PLANAR_ARCHIVE_BYTES,
+                validate_structure=False, _stub_override=origin_stub, _release_on_completion=False,
+            ) if "graph_artifact" in references else None
+            self.require_assigned_activation_origin(origin)
+            exported = _checkpoint_export_bundle_from_proto(response, graph_payload, fine_payload, dense_payload)
+            self.require_assigned_activation_origin(origin)
+            completed = True
+        finally:
+            for reference in references.values():
+                try:
+                    self._graph_transfer(5, reference, stub=origin_stub)
+                except BaseException as error:
+                    if cleanup_error is None:
+                        cleanup_error = error
+                    LOGGER.exception("Assigned export artifact release failed.")
+            if completed and cleanup_error is not None:
+                raise cleanup_error
+        self.require_assigned_activation_origin(origin)
+        return exported
 
     def get_dense_cloud_chunk(self, *, expected_epoch="", offset_points=0, allow_delta=False):
         """读取当前规范提交中的完整扫描前缀，不触发启动或建图。"""
@@ -4703,7 +3926,6 @@ class GeometryRuntimeProvider:
                 if (self._mapping_transition_epoch == transition
                         and self._stub is stub and self._map_connection_epoch == origin[1]):
                     self._mapping_identity = None
-                    self._mapping_checkpoint_provenance = None
                     self._last_occupancy_grid = None
                     self._last_occupancy_grid_identity = None
                     self._planar_input_active = False
@@ -4805,695 +4027,7 @@ class GeometryRuntimeProvider:
             except BaseException:
                 LOGGER.exception("Assigned activation transition release failed.")
 
-    def activate_platform_map(
-        self,
-        *,
-        map_name: str,
-        bundle_root: Path,
-        mapping_database_path: str,
-        pcd_path: Optional[str],
-        nav_map_yaml_path: str,
-        asset_manifest_sha256: str,
-        occupancy_grid: OccupancyGrid,
-        activation_request_id: Optional[str] = None,
-        expected_mapping_backend_kind: Optional[str] = None,
-        expected_backend_checkpoint_manifest_sha256: Optional[str] = None,
-        expected_backend_checkpoint_object_sha256: Optional[str] = None,
-        expected_backend_checkpoint_schema_version: int = 1,
-        expected_backend_checkpoint_id: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        self._raise_if_stopping("activate_platform_map")
-        if (type(expected_backend_checkpoint_schema_version) is not int
-                or expected_backend_checkpoint_schema_version not in (1, 2)):
-            raise ValueError("unsupported expected backend checkpoint schema")
-        if expected_backend_checkpoint_schema_version == 2:
-            raise RuntimeError(
-                "CHECKPOINT_V2_ACTIVATION_UNAVAILABLE: assigned checkpoint activation "
-                "requires the paired native activation and relocalization identity contract"
-            )
-        if expected_backend_checkpoint_id is not None:
-            raise ValueError("assigned checkpoint identity requires checkpoint schema 2")
-        if not self._connected or not self._stub:
-            raise RuntimeError("Geometry runtime 未连接。")
-        if occupancy_grid is None:
-            raise RuntimeError("地图资产缺少可激活的 OccupancyGrid checkpoint。")
-        map_name = str(map_name or "").strip()
-        if not map_name:
-            raise ValueError("map_name must not be empty")
-        asset_manifest_sha256 = str(asset_manifest_sha256 or "").strip().lower()
-        if len(asset_manifest_sha256) != 64 or any(
-            char not in "0123456789abcdef" for char in asset_manifest_sha256
-        ):
-            raise ValueError("asset_manifest_sha256 must be lowercase SHA-256 hex")
 
-        expected_backend_kind = (
-            str(expected_mapping_backend_kind or "").strip()
-            if expected_mapping_backend_kind is not None
-            else None
-        )
-        if (
-            expected_backend_kind is not None
-            and expected_backend_kind not in _SUPPORTED_MAPPING_BACKEND_KINDS
-        ):
-            raise ValueError(
-                "expected_mapping_backend_kind must identify a supported backend"
-            )
-
-        def normalize_expected_sha256(
-            value: Optional[str],
-            field_name: str,
-        ) -> Optional[str]:
-            if value is None:
-                return None
-            resolved = str(value or "").strip()
-            if len(resolved) != 64 or any(
-                character not in "0123456789abcdef" for character in resolved
-            ):
-                raise ValueError(
-                    "%s must be lowercase SHA-256 hex" % field_name
-                )
-            return resolved
-
-        expected_checkpoint_manifest_sha256 = normalize_expected_sha256(
-            expected_backend_checkpoint_manifest_sha256,
-            "expected_backend_checkpoint_manifest_sha256",
-        )
-        expected_checkpoint_object_sha256 = normalize_expected_sha256(
-            expected_backend_checkpoint_object_sha256,
-            "expected_backend_checkpoint_object_sha256",
-        )
-        if (
-            expected_checkpoint_manifest_sha256 is None
-        ) != (
-            expected_checkpoint_object_sha256 is None
-        ):
-            raise ValueError(
-                "expected backend checkpoint manifest and object SHA-256 "
-                "must be provided together"
-            )
-        if (
-            expected_checkpoint_manifest_sha256 is not None
-            and expected_backend_kind is None
-        ):
-            raise ValueError(
-                "expected_mapping_backend_kind is required with checkpoint identity"
-            )
-
-        _resolve_map_bundle_asset(
-            bundle_root,
-            mapping_database_path,
-            "mapping_database_path",
-            allow_missing=not str(pcd_path or "").strip(),
-        )
-        _resolve_map_bundle_asset(
-            bundle_root,
-            nav_map_yaml_path,
-            "nav_map_yaml_path",
-        )
-        resolved_pcd_path = (
-            _resolve_map_bundle_asset(bundle_root, pcd_path, "pcd_path")
-            if str(pcd_path or "").strip()
-            else None
-        )
-        resolved_bundle_root = Path(bundle_root).expanduser().resolve(strict=True)
-        mapping_state = self._selected_mapping_backend_state()
-        selected_backend_kind = mapping_state["mapping_backend_kind"]
-        if (
-            expected_backend_kind is not None
-            and selected_backend_kind != expected_backend_kind
-        ):
-            raise RuntimeError(
-                "mapping backend kind does not match finalized map asset: "
-                "live=%s expected=%s"
-                % (selected_backend_kind, expected_backend_kind)
-            )
-        frame_id = str(occupancy_grid.frame_id or "").strip().lstrip("/")
-        if not frame_id:
-            raise ValueError("native map checkpoint frame must not be empty")
-        values = [int(value) for value in occupancy_grid.data]
-        if any(value < -1 or value > 100 for value in values):
-            raise ValueError("occupancy checkpoint values must be within [-1, 100]")
-        encoded = bytes(value if value >= 0 else value + 256 for value in values)
-        timestamp = getattr(occupancy_grid, "timestamp", None)
-        timestamp_ns = int(timestamp.timestamp() * 1_000_000_000) if timestamp else 0
-        origin = occupancy_grid.origin.position
-        checkpoint_store = MappingBackendCheckpointStore(resolved_bundle_root)
-        try:
-            stored_backend_checkpoint = checkpoint_store.load(selected_backend_kind)
-        except MappingBackendCheckpointNotFoundError as exc:
-            if expected_checkpoint_manifest_sha256 is not None:
-                raise RuntimeError(
-                    "finalized map asset expected a mapping backend checkpoint "
-                    "that is not available"
-                ) from exc
-            stored_backend_checkpoint = None
-        if stored_backend_checkpoint is not None and expected_backend_kind is not None:
-            loaded_checkpoint = stored_backend_checkpoint.checkpoint
-            loaded_backend_kind = str(loaded_checkpoint.backend_kind or "").strip()
-            if loaded_backend_kind != expected_backend_kind:
-                raise RuntimeError(
-                    "mapping backend checkpoint kind does not match finalized map asset: "
-                    "loaded=%s expected=%s"
-                    % (loaded_backend_kind, expected_backend_kind)
-                )
-            if (
-                expected_checkpoint_manifest_sha256 is not None
-                and stored_backend_checkpoint.manifest_sha256
-                != expected_checkpoint_manifest_sha256
-            ):
-                raise RuntimeError(
-                    "mapping backend checkpoint manifest SHA-256 does not match "
-                    "finalized map asset"
-                )
-            loaded_object_sha256 = bytes(loaded_checkpoint.content_sha256).hex()
-            if (
-                expected_checkpoint_object_sha256 is not None
-                and loaded_object_sha256 != expected_checkpoint_object_sha256
-            ):
-                raise RuntimeError(
-                    "mapping backend checkpoint object SHA-256 does not match "
-                    "finalized map asset"
-                )
-        if (
-            stored_backend_checkpoint is None
-            and selected_backend_kind in {"raytracing", "slam_toolbox"}
-        ):
-            raise RuntimeError(
-                "BACKEND_CHECKPOINT_REQUIRED: raytracing map activation requires "
-                "mapping_backend/raytracing/checkpoint-v1.json"
-            )
-        legacy_checkpoint_reconstructed = stored_backend_checkpoint is None
-        checkpoint_provenance: _MappingCheckpointProvenance = (
-            selected_backend_kind,
-            legacy_checkpoint_reconstructed,
-            asset_manifest_sha256,
-            (
-                stored_backend_checkpoint.manifest_sha256
-                if stored_backend_checkpoint is not None
-                else ""
-            ),
-        )
-
-        cloud_checkpoint = None
-        if stored_backend_checkpoint is not None and resolved_pcd_path is None and selected_backend_kind != "slam_toolbox":
-            raise ValueError(
-                "mapping backend checkpoint requires its contained canonical PCD"
-            )
-        if resolved_pcd_path is not None:
-            import numpy as np
-
-            from services.geometry.pointcloud_map import read_pcd_xyz
-
-            try:
-                _header, points_xyz = read_pcd_xyz(resolved_pcd_path)
-            except Exception as exc:
-                raise RuntimeError(
-                    "读取地图资产 3D PCD checkpoint 失败：%s" % exc
-                ) from exc
-            points_xyz = np.asarray(points_xyz, dtype="<f4", order="C")
-            finite_mask = np.isfinite(points_xyz).all(axis=1)
-            if not bool(finite_mask.all()):
-                if stored_backend_checkpoint is not None:
-                    raise RuntimeError(
-                        "mapping backend checkpoint PCD contains non-finite XYZ"
-                    )
-                points_xyz = np.asarray(
-                    points_xyz[finite_mask],
-                    dtype="<f4",
-                    order="C",
-                )
-            if points_xyz.ndim != 2 or points_xyz.shape[1] != 3 or not points_xyz.size:
-                raise RuntimeError("地图资产 3D PCD checkpoint 没有可用 XYZ 点。")
-            point_count = int(points_xyz.shape[0])
-            if point_count > 0xFFFF_FFFF:
-                raise RuntimeError("地图资产 3D PCD checkpoint 点数超过 uint32。")
-            xyz_f32_le = points_xyz.tobytes(order="C")
-            xyz_sha256 = hashlib.sha256(xyz_f32_le).hexdigest()
-            if stored_backend_checkpoint is not None:
-                cloud_descriptor = stored_backend_checkpoint.cloud_asset
-                if bytes.fromhex(xyz_sha256) != bytes(cloud_descriptor["xyz_sha256"]):
-                    raise ValueError(
-                        "map asset PCD SHA-256 does not match backend checkpoint"
-                    )
-                if len(xyz_f32_le) != int(cloud_descriptor["xyz_size"]):
-                    raise ValueError(
-                        "map asset PCD size does not match backend checkpoint"
-                    )
-                if point_count != int(cloud_descriptor["point_count"]):
-                    raise ValueError(
-                        "map asset PCD point_count does not match backend checkpoint"
-                    )
-                voxel_size = float(cloud_descriptor["voxel_size"])
-                source_revision = int(cloud_descriptor["source_cloud_revision"])
-                cloud_frame_id = str(cloud_descriptor["frame_id"])
-                payload_schema_version = int(
-                    cloud_descriptor["payload_schema_version"]
-                )
-            else:
-                voxel_size = 0.05
-                # 普通资产没有后端历史修订，以首次导入修订标识其真实内容。
-                source_revision = 1
-                cloud_frame_id = frame_id
-                payload_schema_version = 1
-            if cloud_frame_id != frame_id:
-                raise ValueError(
-                    "native cloud checkpoint frame must match occupancy frame %s, "
-                    "received %s" % (frame_id, cloud_frame_id)
-                )
-            cloud_checkpoint = pb2.CloudMapCheckpoint(
-                frame_id=cloud_frame_id,
-                source_revision=source_revision,
-                point_count=point_count,
-                voxel_size=voxel_size,
-                xyz_f32_le=xyz_f32_le,
-                xyz_sha256=xyz_sha256,
-                payload_schema_version=payload_schema_version,
-            )
-        if stored_backend_checkpoint is not None and cloud_checkpoint is None and selected_backend_kind != "slam_toolbox":
-            raise ValueError(
-                "mapping backend checkpoint canonical PCD is missing or unreadable"
-            )
-
-        if stored_backend_checkpoint is not None:
-            occupancy_descriptor = stored_backend_checkpoint.occupancy_asset
-            _validate_asset_occupancy_checkpoint(
-                occupancy_grid,
-                encoded,
-                occupancy_descriptor,
-            )
-            occupancy_checkpoint = pb2.OccupancyGridData(
-                meta=pb2.OccupancyGridMeta(
-                    width=int(occupancy_descriptor["width"]),
-                    height=int(occupancy_descriptor["height"]),
-                    resolution=float(occupancy_descriptor["resolution"]),
-                    origin_x=float(occupancy_descriptor["origin_x"]),
-                    origin_y=float(occupancy_descriptor["origin_y"]),
-                    frame_id=str(occupancy_descriptor["frame_id"]),
-                    revision=int(
-                        occupancy_descriptor["source_occupancy_revision"]
-                    ),
-                    timestamp_ns=int(occupancy_descriptor["timestamp_ns"]),
-                ),
-                data=encoded,
-            )
-        else:
-            occupancy_checkpoint = pb2.OccupancyGridData(
-                meta=pb2.OccupancyGridMeta(
-                    width=int(occupancy_grid.width),
-                    height=int(occupancy_grid.height),
-                    resolution=float(occupancy_grid.resolution_m),
-                    origin_x=float(origin.x),
-                    origin_y=float(origin.y),
-                    frame_id=frame_id,
-                    revision=1,
-                    timestamp_ns=max(0, timestamp_ns),
-                ),
-                data=encoded,
-            )
-        with self._map_state_lock:
-            current_identity = self._mapping_identity
-            current_checkpoint_provenance = self._mapping_checkpoint_provenance
-        if activation_request_id is not None:
-            session_id = str(activation_request_id or "").strip()
-            request_suffix = (
-                session_id[len("mapload:") :]
-                if session_id.startswith("mapload:")
-                else session_id
-            )
-            if (
-                not session_id.startswith("mapload:")
-                or len(request_suffix) != 32
-                or any(
-                    character not in "0123456789abcdef"
-                    for character in request_suffix
-                )
-            ):
-                raise ValueError(
-                    "activation_request_id must be mapload: followed by 32 lowercase hex characters"
-                )
-        else:
-            session_id = (
-                current_identity[0]
-                if (
-                    current_identity is not None
-                    and current_identity[1] == map_name
-                    and current_checkpoint_provenance == checkpoint_provenance
-                )
-                else "mapload:%s" % uuid.uuid4().hex
-            )
-        request = pb2.ActivateMapRequest(
-            session_id=session_id,
-            map_name=map_name,
-            checkpoint=occupancy_checkpoint,
-            activation_request_id=session_id,
-            asset_manifest_sha256=bytes.fromhex(asset_manifest_sha256),
-            activation_contract_version=1,
-        )
-        if cloud_checkpoint is not None:
-            request.cloud_checkpoint.CopyFrom(cloud_checkpoint)
-        graph_artifact = None
-        fine_map_artifact = None
-        dense_cloud_artifact = None
-        if stored_backend_checkpoint is not None:
-            if selected_backend_kind == "slam_toolbox":
-                graph_artifact = self._upload_graph_artifact(stored_backend_checkpoint.checkpoint)
-            if stored_backend_checkpoint.checkpoint.fine_archive is not None:
-                fine_map_artifact = self._upload_graph_artifact(stored_backend_checkpoint.checkpoint, payload=stored_backend_checkpoint.checkpoint.fine_archive)
-            if stored_backend_checkpoint.checkpoint.dense_archive is not None:
-                dense_cloud_artifact = self._upload_graph_artifact(stored_backend_checkpoint.checkpoint, payload=stored_backend_checkpoint.checkpoint.dense_archive)
-            request.mapping_backend_checkpoint.CopyFrom(
-                _mapping_backend_checkpoint_proto(
-                    stored_backend_checkpoint,
-                    occupancy_checkpoint,
-                    cloud_checkpoint, graph_artifact=graph_artifact, fine_map_artifact=fine_map_artifact,
-                    dense_cloud_artifact=dense_cloud_artifact,
-                )
-            )
-        request.asset_bundle_sha256 = _canonical_asset_bundle_sha256(
-            asset_manifest_sha256=request.asset_manifest_sha256,
-            occupancy_checkpoint=request.checkpoint,
-            cloud_checkpoint=(
-                request.cloud_checkpoint if request.HasField("cloud_checkpoint") else None
-            ),
-            backend_checkpoint=(
-                request.mapping_backend_checkpoint
-                if request.HasField("mapping_backend_checkpoint")
-                else None
-            ),
-        )
-        transition_epoch = self._begin_mapping_transition()
-        backend_mutation_dispatched = False
-        backend_stop_confirmed = False
-
-        def invalidate_transition_map_identity() -> None:
-            with self._map_state_lock:
-                if transition_epoch != self._mapping_transition_epoch:
-                    return
-                self._mapping_identity = None
-                self._mapping_checkpoint_provenance = None
-                self._last_occupancy_grid = None
-                self._last_occupancy_grid_identity = None
-
-        def finish_failed_transition(*, invalidate_identity: bool) -> None:
-            if invalidate_identity:
-                invalidate_transition_map_identity()
-            try:
-                self._finish_mapping_transition(transition_epoch)
-            except Exception:
-                LOGGER.exception(
-                    "Map activation transition cleanup failed after RPC failure."
-                )
-
-        def outcome_unknown(message: str) -> GeometryRuntimeMapActivationOutcomeUnknown:
-            error = GeometryRuntimeMapActivationOutcomeUnknown(message)
-            error.backend_changed = bool(backend_mutation_dispatched)
-            error.backend_stop_confirmed = bool(backend_stop_confirmed)
-            error.backend_activation_disposition = "unknown"
-            error.activation_request_id = session_id
-            error.map_name = map_name
-            return error
-
-        try:
-            authoritative_response = self._stub.GetMappingState(
-                pb2.Empty(),
-                timeout=_read_deadline_sec(),
-            )
-            authoritative_state = self._mapping_state_payload(
-                authoritative_response
-            )
-            authoritative_phase = str(
-                authoritative_state["phase"] or ""
-            ).strip().upper()
-            authoritative_backend_kind = str(
-                authoritative_state["mapping_backend_kind"] or ""
-            ).strip()
-            if not authoritative_state["success"]:
-                raise RuntimeError(
-                    "GetMappingState did not return a successful authoritative state"
-                )
-            if authoritative_phase not in {"IDLE", "ACTIVE", "STOPPED"}:
-                raise RuntimeError(
-                    "Geometry runtime returned unsupported mapping phase: %s"
-                    % (authoritative_phase or "<empty>")
-                )
-            if (
-                authoritative_state["active"]
-                and authoritative_phase != "ACTIVE"
-            ):
-                raise RuntimeError(
-                    "GetMappingState returned an inconsistent active mapping state"
-                )
-            if (
-                authoritative_phase == "ACTIVE"
-                and not authoritative_state["active"]
-            ):
-                raise RuntimeError(
-                    "GetMappingState returned ACTIVE without an active session"
-                )
-            authoritative_session_id = str(
-                authoritative_state["session_id"] or ""
-            ).strip()
-            authoritative_map_name = str(
-                authoritative_state["map_name"] or ""
-            ).strip()
-            if (
-                authoritative_phase == "STOPPED"
-                and authoritative_session_id == session_id
-            ):
-                raise GeometryRuntimeMapActivationStaleRequest(
-                    activation_request_id=session_id,
-                    map_name=map_name,
-                    current_phase=authoritative_phase,
-                    current_map_name=authoritative_map_name,
-                )
-            if authoritative_backend_kind != selected_backend_kind:
-                raise RuntimeError(
-                    "mapping backend kind changed while validating map activation: "
-                    "validated=%s authoritative=%s"
-                    % (
-                        selected_backend_kind,
-                        authoritative_backend_kind or "<empty>",
-                    )
-                )
-
-            expected_runtime_generation = int(
-                authoritative_state["runtime_generation"] or 0
-            )
-            if expected_runtime_generation <= 0:
-                raise RuntimeError(
-                    "GetMappingState did not expose a modern runtime generation"
-                )
-            request.expected_runtime_generation = expected_runtime_generation
-
-            stop_session_id = ""
-            if authoritative_state["active"]:
-                if (
-                    not authoritative_session_id
-                    or not authoritative_map_name
-                    or int(authoritative_state["session_generation"] or 0) <= 0
-                ):
-                    raise RuntimeError(
-                        "GetMappingState returned an incomplete ACTIVE identity"
-                    )
-                if authoritative_session_id == session_id:
-                    if authoritative_map_name != map_name:
-                        raise GeometryRuntimeMapActivationStaleRequest(
-                            activation_request_id=session_id,
-                            map_name=map_name,
-                            current_phase=authoritative_phase or "ACTIVE",
-                            current_map_name=authoritative_map_name,
-                        )
-                    # The Rust service verifies the checkpoint digest on replay.
-                else:
-                    stop_session_id = authoritative_session_id
-        except Exception:
-            finish_failed_transition(invalidate_identity=False)
-            raise
-
-        if stop_session_id:
-            backend_mutation_dispatched = True
-            try:
-                stop_response = self._stub.StopMapping(
-                    pb2.StopMappingRequest(
-                        session_id=stop_session_id,
-                        reason="activate platform map %s" % map_name,
-                    ),
-                    timeout=_heavy_deadline_sec(),
-                )
-                stopped_state = self._mapping_state_payload(stop_response)
-                if (
-                    not stopped_state["success"]
-                    or stopped_state["phase"] != "STOPPED"
-                    or stopped_state["active"]
-                    or stopped_state["session_id"] != stop_session_id
-                    or stopped_state["map_name"] != authoritative_map_name
-                    or stopped_state["session_generation"]
-                    != authoritative_state["session_generation"]
-                    or stopped_state["mapping_backend_kind"]
-                    != selected_backend_kind
-                ):
-                    raise RuntimeError(
-                        "StopMapping 未返回匹配的 STOPPED 旧地图会话。"
-                    )
-                backend_stop_confirmed = True
-                invalidate_transition_map_identity()
-            except Exception as exc:
-                finish_failed_transition(invalidate_identity=True)
-                raise outcome_unknown(
-                    "StopMapping dispatch or acknowledgement failed before "
-                    "ActivateMap: %s" % exc
-                ) from exc
-
-        backend_mutation_dispatched = True
-        try:
-            response = self._stub.ActivateMap(
-                request,
-                timeout=_heavy_deadline_sec(),
-            )
-            payload = self._mapping_state_payload(response)
-            if (
-                not payload["success"]
-                or payload["phase"] != "ACTIVE"
-                or not payload["active"]
-                or payload["session_id"] != session_id
-                or payload["map_name"] != map_name
-                or payload["session_generation"] <= 0
-                or payload["revision"] <= 0
-                or payload["mapping_backend_kind"] != selected_backend_kind
-                or payload["legacy_checkpoint_reconstructed"]
-                != legacy_checkpoint_reconstructed
-                or payload["activation_receipt_schema_version"] != 1
-                or payload["activation_receipt_disposition"]
-                not in {
-                    int(pb2.ACTIVATION_RECEIPT_DISPOSITION_SEALED),
-                    int(pb2.ACTIVATION_RECEIPT_DISPOSITION_SEALED_REPLAY),
-                }
-                or payload["runtime_generation"] != expected_runtime_generation
-                or payload["backend_generation"] <= 0
-                or payload["activation_request_id"] != session_id
-                or len(payload["activation_request_identity_sha256"]) != 64
-                or len(payload["activation_identity_sha256"]) != 64
-                or (
-                    (cloud_checkpoint is not None or selected_backend_kind == "slam_toolbox")
-                    and (
-                        len(payload["target_receipt_sha256"]) != 64
-                        or not payload["relocalization_target_available"]
-                    )
-                )
-                or (
-                    cloud_checkpoint is None and selected_backend_kind != "slam_toolbox"
-                    and (
-                        bool(payload["target_receipt_sha256"])
-                        or payload["relocalization_target_available"]
-                    )
-                )
-                or payload["asset_manifest_sha256"] != asset_manifest_sha256
-                or payload["asset_bundle_sha256"]
-                != bytes(request.asset_bundle_sha256).hex()
-                or payload["source_policy_version"] <= 0
-                or len(payload["source_policy_sha256"]) != 64
-                or payload["deadline_policy_version"] <= 0
-                or len(payload["deadline_policy_sha256"]) != 64
-                or payload["algorithm_options_version"] <= 0
-                or len(payload["algorithm_options_sha256"]) != 64
-            ):
-                raise RuntimeError(
-                    "ActivateMap 未返回匹配的 ACTIVE checkpoint 会话。"
-                )
-            identity = self._mapping_identity_from_payload(payload)
-        except Exception as exc:
-            finish_failed_transition(invalidate_identity=True)
-            raise outcome_unknown(
-                "ActivateMap dispatch or acknowledgement failed: %s" % exc
-            ) from exc
-        try:
-            transition_finished = self._finish_mapping_transition(
-                transition_epoch,
-                identity=identity,
-                input_active=selected_backend_kind == "slam_toolbox",
-                checkpoint_provenance=checkpoint_provenance,
-            )
-        except Exception as exc:
-            finish_failed_transition(invalidate_identity=True)
-            raise outcome_unknown(
-                "ActivateMap acknowledgement was valid but transition commit failed: %s"
-                % exc
-            ) from exc
-        if not transition_finished:
-            invalidate_transition_map_identity()
-            raise outcome_unknown(
-                "ActivateMap 完成时 mapping transition 已被断连或新代际取代。"
-            )
-        if graph_artifact is not None:
-            self._graph_transfer(5, graph_artifact)
-        if fine_map_artifact is not None:
-            self._graph_transfer(5, fine_map_artifact)
-        if dense_cloud_artifact is not None:
-            self._graph_transfer(5, dense_cloud_artifact)
-        planar_default_seed = None
-        if selected_backend_kind == "slam_toolbox":
-            graph_payload = stored_backend_checkpoint.checkpoint.payload
-            header_size = int.from_bytes(graph_payload[8:12], "little")
-            if graph_payload[:8] != b"NWS2D001" or not 0 < header_size <= 65536:
-                raise ValueError("二维图档案头无效")
-            planar_default_seed = json.loads(graph_payload[12:12 + header_size])["estimate"]["map_from_base"]
-        return {
-            **payload,
-            "planar_default_seed": planar_default_seed,
-            "asset_manifest_sha256": asset_manifest_sha256,
-            "mapping_database_path": Path(mapping_database_path).as_posix(),
-            "pcd_path": Path(pcd_path).as_posix() if resolved_pcd_path is not None else None,
-            "nav_map_yaml_path": Path(nav_map_yaml_path).as_posix(),
-            "backend_switch_applied": True,
-            "backend_activation_disposition": "applied",
-            "activation_request_id": session_id,
-            "backend_mode": (
-                "native_mapping_backend_checkpoint"
-                if stored_backend_checkpoint is not None
-                else (
-                    "native_map_checkpoint"
-                    if cloud_checkpoint is not None
-                    else "native_occupancy_checkpoint"
-                )
-            ),
-            "checkpoint_kind": (
-                "occupancy_grid+planar_graph" if selected_backend_kind == "slam_toolbox" else
-                "occupancy_grid+cloud_map+mapping_backend"
-                if stored_backend_checkpoint is not None
-                else (
-                    "occupancy_grid+cloud_map"
-                    if cloud_checkpoint is not None
-                    else "occupancy_grid"
-                )
-            ),
-            "backend_checkpoint_present": stored_backend_checkpoint is not None,
-            "backend_checkpoint_manifest_sha256": (
-                stored_backend_checkpoint.manifest_sha256
-                if stored_backend_checkpoint is not None
-                else ""
-            ),
-            "cloud_checkpoint_present": cloud_checkpoint is not None,
-            "cloud_checkpoint_point_count": (
-                int(cloud_checkpoint.point_count)
-                if cloud_checkpoint is not None
-                else 0
-            ),
-            "cloud_source_revision": (
-                int(cloud_checkpoint.source_revision)
-                if cloud_checkpoint is not None
-                else 0
-            ),
-            "cloud_source_sha256": (
-                str(cloud_checkpoint.xyz_sha256)
-                if cloud_checkpoint is not None
-                else ""
-            ),
-            "legacy_checkpoint_reconstructed": payload[
-                "legacy_checkpoint_reconstructed"
-            ],
-            "mapping_backend_kind": payload["mapping_backend_kind"],
-            "mapping_session_id": payload["session_id"],
-        }
 
     def relocalize(
         self,
@@ -5507,112 +4041,22 @@ class GeometryRuntimeProvider:
         self._raise_if_stopping("relocalize")
         if not self._connected or not self._stub:
             raise RuntimeError("Geometry runtime 未连接。")
-        rpc = getattr(self._stub, "Relocalize", None)
-        if not callable(rpc):
-            raise RuntimeError("Geometry runtime 不支持 Relocalize RPC。")
+        rpc = self._stub.Relocalize
 
-        state = dict(activation_state or {})
-        _require_supported_activation_schema(state)
-        if assigned_request_v2 is not None or state.get("activation_receipt_schema_version") == 2:
-            assigned = _assigned_request_for_rpc(
-                activation_state=state, assigned_request_v2=assigned_request_v2,
-                request_id=request_id, logical_timeout_ms=logical_timeout_ms, query_only=False, planar_seed=planar_seed,
-            )
-            request = assigned.to_proto(pb2.RelocalizeRequest)
-            try:
-                response = rpc(request, timeout=max(_heavy_deadline_sec(), assigned.logical_timeout_ms / 1000.0 + 1.0))
-            except grpc.RpcError as exc:
-                raise GeometryRuntimeRpcError.from_rpc_error("Relocalize", exc) from exc
-            terminal = AssignedRelocalizationTerminal.from_proto(response)
-            if not assigned.exact_replay_of(terminal.request):
-                raise ValueError("assigned terminal belongs to a different exact request")
-            return _assigned_terminal_payload(terminal)
-        if state.get("activation_receipt_v2") is not None or state.get("relocalization_policy_v2") is not None:
-            raise ValueError("legacy activation state contains assigned metadata")
-        resolved_request_id = _canonical_relocalization_request_id(
-            request_id, generate_if_missing=True
+        state = dict(activation_state)
+        assigned = _assigned_request_for_rpc(
+            activation_state=state, assigned_request_v2=assigned_request_v2,
+            request_id=request_id, logical_timeout_ms=logical_timeout_ms, query_only=False, planar_seed=planar_seed,
         )
-        timeout_ms = int(logical_timeout_ms)
-        if timeout_ms < 250 or timeout_ms > 30_000:
-            raise ValueError("logical_timeout_ms must be in [250, 30000]")
-        if not bool(state.get("relocalization_target_available")):
-            raise RuntimeError("当前激活地图没有可用的重定位目标回执。")
-
-        request = pb2.RelocalizeRequest(
-            schema_version=1,
-            request_id=resolved_request_id,
-            runtime_generation=int(state.get("runtime_generation") or 0),
-            session_id=str(state.get("session_id") or ""),
-            map_name=str(state.get("map_name") or ""),
-            session_generation=int(state.get("session_generation") or 0),
-            backend_generation=int(state.get("backend_generation") or 0),
-            activation_identity_sha256=_require_digest_bytes(
-                state.get("activation_identity_sha256"),
-                "activation_identity_sha256",
-            ),
-            target_receipt_sha256=_require_digest_bytes(
-                state.get("target_receipt_sha256"), "target_receipt_sha256"
-            ),
-            target_cloud_revision=int(state.get("cloud_source_revision") or 0),
-            target_cloud_sha256=_require_digest_bytes(
-                state.get("cloud_source_sha256"), "target_cloud_sha256"
-            ) if state.get("target_kind") != "planar_graph" else b"",
-            asset_manifest_sha256=_require_digest_bytes(
-                state.get("asset_manifest_sha256"), "asset_manifest_sha256"
-            ),
-            asset_bundle_sha256=_require_digest_bytes(
-                state.get("asset_bundle_sha256"), "asset_bundle_sha256"
-            ),
-            source_policy_version=int(state.get("source_policy_version") or 0),
-            source_policy_sha256=_require_digest_bytes(
-                state.get("source_policy_sha256"), "source_policy_sha256"
-            ),
-            deadline_policy_version=int(state.get("deadline_policy_version") or 0),
-            deadline_policy_sha256=_require_digest_bytes(
-                state.get("deadline_policy_sha256"), "deadline_policy_sha256"
-            ),
-            logical_timeout_ms=timeout_ms,
-            algorithm_options_version=int(
-                state.get("algorithm_options_version") or 0
-            ),
-            algorithm_options_sha256=_require_digest_bytes(
-                state.get("algorithm_options_sha256"), "algorithm_options_sha256"
-            ),
-        )
-        if state.get("target_kind") == "planar_graph":
-            if planar_seed is None:
-                raise ValueError("二维重定位及其终态查询必须提供相同的planar_seed初始位置")
-            values = tuple(float(v) for v in planar_seed)
-            if len(values) != 3 or any(not math.isfinite(v) for v in values) or abs(values[2]) > math.pi:
-                raise ValueError("二维重定位初始位置必须是有限的x、y和偏航角")
-            request.target_kind = "planar_graph"
-            request.target_graph_sha256 = _require_digest_bytes(state.get("target_graph_sha256"), "target_graph_sha256")
-            request.planar_seed.CopyFrom(pb2.PlanarSeed(x=values[0], y=values[1], yaw=values[2]))
-        if (
-            request.runtime_generation <= 0
-            or not request.session_id
-            or not request.map_name
-            or request.session_generation <= 0
-            or request.backend_generation <= 0
-            or (request.target_kind != "planar_graph" and request.target_cloud_revision <= 0)
-            or request.source_policy_version <= 0
-            or request.deadline_policy_version <= 0
-            or request.algorithm_options_version <= 0
-        ):
-            raise ValueError("modern relocalization identity is incomplete")
+        request = assigned.to_proto(pb2.RelocalizeRequest)
         try:
-            response = rpc(
-                request,
-                timeout=max(_heavy_deadline_sec(), timeout_ms / 1000.0 + 1.0),
-            )
+            response = rpc(request, timeout=max(_heavy_deadline_sec(), assigned.logical_timeout_ms / 1000.0 + 1.0))
         except grpc.RpcError as exc:
             raise GeometryRuntimeRpcError.from_rpc_error("Relocalize", exc) from exc
-        if response.schema_version != 1 or response.HasField("assigned_cloud_v2") or response.HasField("assigned_planar_v2"):
-            raise ValueError("legacy relocalization received a different identity schema")
-        payload = self._relocalize_result_payload(response)
-        if request.target_kind == "planar_graph":
-            payload["planar_seed"] = list(values)
-        return payload
+        terminal = AssignedRelocalizationTerminal.from_proto(response)
+        if not assigned.exact_replay_of(terminal.request):
+            raise ValueError("assigned terminal belongs to a different exact request")
+        return _assigned_terminal_payload(terminal)
 
     def get_relocalization_terminal(
         self,
@@ -5628,193 +4072,34 @@ class GeometryRuntimeProvider:
         self._raise_if_stopping("get_relocalization_terminal")
         if not self._connected or not self._stub:
             raise RuntimeError("Geometry runtime 未连接。")
-        rpc = getattr(self._stub, "GetRelocalizationTerminal", None)
-        if not callable(rpc):
-            raise RuntimeError(
-                "Geometry runtime 不支持 GetRelocalizationTerminal RPC。"
-            )
-        state = dict(activation_state or {})
-        if assigned_request_v2 is None:
-            _require_supported_activation_schema(state)
-        if assigned_request_v2 is not None or state.get("activation_receipt_schema_version") == 2:
-            assigned = _assigned_request_for_rpc(
-                activation_state=state, assigned_request_v2=assigned_request_v2,
-                request_id=request_id, logical_timeout_ms=logical_timeout_ms, query_only=True, planar_seed=planar_seed,
-            )
-            query = AssignedRelocalizationQuery.from_dict({
-                "schema_version": 2, "request_id": assigned.request_id,
-                "assigned_request_v2": assigned.to_dict(),
-            })
-            try:
-                response = rpc(query.to_proto(pb2.GetRelocalizationTerminalRequest), timeout=_read_deadline_sec())
-            except grpc.RpcError as exc:
-                raise GeometryRuntimeRpcError.from_rpc_error("GetRelocalizationTerminal", exc) from exc
-            terminal = query.validate_proto_response(response)
-            observation = None
-            if response.HasField("ledger_observation"):
-                candidate = _project_assigned_proto(response.ledger_observation, "observation")
-                if (candidate["observation_schema_version"] == 1 and candidate["observation_epoch"] != 0
-                        and candidate["terminal_record_count"] + candidate["pending_record_count"]
-                        <= candidate["admitted_command_count"]):
-                    observation = candidate
-            return {
-                "schema_version": 2, "request_id": assigned.request_id,
-                "status": {1: "terminal", 2: "pending", 3: "not_found", 4: "identity_conflict"}[response.status],
-                "assigned_request_v2": assigned.to_dict(),
-                "terminal": _assigned_terminal_payload(terminal) if terminal is not None else None,
-                "ledger_observation": observation,
-            }
-        if state.get("activation_receipt_v2") is not None or state.get("relocalization_policy_v2") is not None:
-            raise ValueError("legacy activation state contains assigned metadata")
-        resolved_request_id = _canonical_relocalization_request_id(
-            request_id, generate_if_missing=False
+        rpc = self._stub.GetRelocalizationTerminal
+        state = dict(activation_state)
+        assigned = _assigned_request_for_rpc(
+            activation_state=state, assigned_request_v2=assigned_request_v2,
+            request_id=request_id, logical_timeout_ms=logical_timeout_ms, query_only=True, planar_seed=planar_seed,
         )
-        relocalize_request = pb2.RelocalizeRequest(
-            schema_version=1,
-            request_id=resolved_request_id,
-            runtime_generation=int(state.get("runtime_generation") or 0),
-            session_id=str(state.get("session_id") or ""),
-            map_name=str(state.get("map_name") or ""),
-            session_generation=int(state.get("session_generation") or 0),
-            backend_generation=int(state.get("backend_generation") or 0),
-            activation_identity_sha256=_require_digest_bytes(
-                state.get("activation_identity_sha256"),
-                "activation_identity_sha256",
-            ),
-            target_receipt_sha256=_require_digest_bytes(
-                state.get("target_receipt_sha256"), "target_receipt_sha256"
-            ),
-            target_cloud_revision=int(state.get("cloud_source_revision") or 0),
-            target_cloud_sha256=_require_digest_bytes(
-                state.get("cloud_source_sha256"), "target_cloud_sha256"
-            ) if state.get("target_kind") != "planar_graph" else b"",
-            asset_manifest_sha256=_require_digest_bytes(
-                state.get("asset_manifest_sha256"), "asset_manifest_sha256"
-            ),
-            asset_bundle_sha256=_require_digest_bytes(
-                state.get("asset_bundle_sha256"), "asset_bundle_sha256"
-            ),
-            source_policy_version=int(state.get("source_policy_version") or 0),
-            source_policy_sha256=_require_digest_bytes(
-                state.get("source_policy_sha256"), "source_policy_sha256"
-            ),
-            deadline_policy_version=int(state.get("deadline_policy_version") or 0),
-            deadline_policy_sha256=_require_digest_bytes(
-                state.get("deadline_policy_sha256"), "deadline_policy_sha256"
-            ),
-            logical_timeout_ms=int(logical_timeout_ms),
-            algorithm_options_version=int(
-                state.get("algorithm_options_version") or 0
-            ),
-            algorithm_options_sha256=_require_digest_bytes(
-                state.get("algorithm_options_sha256"),
-                "algorithm_options_sha256",
-            ),
-        )
-        if state.get("target_kind") == "planar_graph":
-            if planar_seed is None:
-                raise ValueError("二维重定位及其终态查询必须提供相同的planar_seed初始位置")
-            values = tuple(float(v) for v in planar_seed)
-            if len(values) != 3 or any(not math.isfinite(v) for v in values) or abs(values[2]) > math.pi:
-                raise ValueError("二维重定位初始位置必须是有限的x、y和偏航角")
-            relocalize_request.target_kind = "planar_graph"
-            relocalize_request.target_graph_sha256 = _require_digest_bytes(state.get("target_graph_sha256"), "target_graph_sha256")
-            relocalize_request.planar_seed.CopyFrom(pb2.PlanarSeed(x=values[0], y=values[1], yaw=values[2]))
-        request_identity = _canonical_relocalize_request_sha256(
-            relocalize_request
-        )
-        activation_identity = bytes(
-            relocalize_request.activation_identity_sha256
-        )
-        request = pb2.GetRelocalizationTerminalRequest(
-            schema_version=1,
-            request_id=resolved_request_id,
-            request_identity_sha256=request_identity,
-            activation_identity_sha256=activation_identity,
-        )
+        query = AssignedRelocalizationQuery.from_dict({
+            "schema_version": 2, "request_id": assigned.request_id,
+            "assigned_request_v2": assigned.to_dict(),
+        })
         try:
-            response = rpc(request, timeout=_read_deadline_sec())
+            response = rpc(query.to_proto(pb2.GetRelocalizationTerminalRequest), timeout=_read_deadline_sec())
         except grpc.RpcError as exc:
-            raise GeometryRuntimeRpcError.from_rpc_error(
-                "GetRelocalizationTerminal", exc
-            ) from exc
-        if response.schema_version != 1 or response.HasField("assigned_request_v2"):
-            raise ValueError("legacy terminal query received a different identity schema")
-        try:
-            raw_status = response.status
-        except Exception:
-            raise RuntimeError(
-                "GetRelocalizationTerminal returned an invalid terminal status"
-            ) from None
-        if isinstance(raw_status, bool) or not isinstance(raw_status, int):
-            raise RuntimeError(
-                "GetRelocalizationTerminal returned an invalid terminal status"
-            )
-        status_name = {
-            1: "terminal",
-            2: "pending",
-            3: "not_found",
-            4: "identity_conflict",
-        }.get(raw_status)
-        if status_name is None:
-            raise RuntimeError(
-                "GetRelocalizationTerminal returned an invalid terminal status"
-            )
-        try:
-            has_observation = response.HasField("ledger_observation")
-        except Exception:
-            has_observation = False
-        ledger_observation = None
-        if has_observation:
-            observation = response.ledger_observation
-            observation_values = {
-                "observation_schema_version": observation.observation_schema_version,
-                "admitted_command_count": observation.admitted_command_count,
-                "claimed_command_count": observation.claimed_command_count,
-                "terminal_record_count": observation.terminal_record_count,
-                "pending_record_count": observation.pending_record_count,
-                "active_waiter_count": observation.active_waiter_count,
-                "observation_epoch": observation.observation_epoch,
-            }
-            if not any(
-                isinstance(value, bool) or not isinstance(value, int) or value < 0
-                for value in observation_values.values()
-            ) and (
-                observation_values["observation_schema_version"] == 1
-                and observation_values["observation_epoch"] != 0
-                and observation_values["terminal_record_count"]
-                + observation_values["pending_record_count"]
-                <= observation_values["admitted_command_count"]
-            ):
-                ledger_observation = dict(observation_values)
-        has_terminal = response.HasField("terminal")
-        if status_name != "terminal":
-            if has_terminal:
-                raise RuntimeError(
-                    "non-terminal query response unexpectedly contained terminal bytes"
-                )
-            return {
-                "status": status_name,
-                "request_id": resolved_request_id,
-                "request_identity_sha256": request_identity.hex(),
-                "activation_identity_sha256": activation_identity.hex(),
-                "terminal": None,
-                "ledger_observation": ledger_observation,
-            }
-        if not has_terminal:
-            raise RuntimeError("terminal query response omitted terminal proof")
-        if response.terminal.schema_version != 1 or response.terminal.HasField("assigned_cloud_v2") or response.terminal.HasField("assigned_planar_v2"):
-            raise ValueError("legacy terminal query contained a different nested identity schema")
-        terminal = self._relocalize_result_payload(response.terminal)
-        if relocalize_request.target_kind == "planar_graph":
-            terminal["planar_seed"] = list(values)
+            raise GeometryRuntimeRpcError.from_rpc_error("GetRelocalizationTerminal", exc) from exc
+        terminal = query.validate_proto_response(response)
+        observation = None
+        if response.HasField("ledger_observation"):
+            candidate = _project_assigned_proto(response.ledger_observation, "observation")
+            if (candidate["observation_schema_version"] == 1 and candidate["observation_epoch"] != 0
+                    and candidate["terminal_record_count"] + candidate["pending_record_count"]
+                    <= candidate["admitted_command_count"]):
+                observation = candidate
         return {
-            "status": status_name,
-            "request_id": resolved_request_id,
-            "request_identity_sha256": request_identity.hex(),
-            "activation_identity_sha256": activation_identity.hex(),
-            "terminal": terminal,
-            "ledger_observation": ledger_observation,
+            "schema_version": 2, "request_id": assigned.request_id,
+            "status": {1: "terminal", 2: "pending", 3: "not_found", 4: "identity_conflict"}[response.status],
+            "assigned_request_v2": assigned.to_dict(),
+            "terminal": _assigned_terminal_payload(terminal) if terminal is not None else None,
+            "ledger_observation": observation,
         }
 
     def capture_assigned_activation_origin(self):
@@ -5986,7 +4271,6 @@ class GeometryRuntimeProvider:
                 # STOPPED 后保留同一身份的最终栅格，供 save-map 收尾读取。
                 self._mapping_identity = stopped_identity
                 self._planar_input_active = False
-                self._mapping_checkpoint_provenance = None
         return payload
 
     def get_mapping_state(self) -> Dict[str, Any]:

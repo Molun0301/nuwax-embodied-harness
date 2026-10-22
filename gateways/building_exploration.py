@@ -6,6 +6,7 @@ import uuid
 from types import SimpleNamespace
 
 from contracts.building_navigation import FloorPose
+from contracts.map_identity import AssetIdentityV2
 from contracts.navigation import ExploreAreaRequest
 from core.errors import GatewayError
 from skills.handlers.motion_skills import MOTION_ADMISSION_ARGUMENT
@@ -56,10 +57,10 @@ class GatewayBuildingExplorationPorts:
 
     def prepare_floor(self,floor):
         self.ensure_active()
-        if floor.asset_manifest_sha256 is not None:
+        if floor.asset_identity is not None:
             descriptor=self.runtime.platform_geometry_runtime.describe_backend()
             session=self.runtime.map_workspace_service.get_active_localization_session()
-            if descriptor.get("active_map_name")!=floor.map_name or session is None or str(session.status.value)!="ready":
+            if descriptor.get("active_map_name")!=floor.map_name or descriptor.get("asset_identity")!=floor.asset_identity.model_dump() or session is None or session.asset_identity!=floor.asset_identity or str(session.status.value)!="ready":
                 self.runtime.map_workspace_service.activate_map(map_name=floor.map_name,create_if_missing=False,metadata={"source":"building_exploration"})
                 self.runtime.map_workspace_service.relocalize_active_map(map_name=floor.map_name,metadata={"business_request_id":"building-localize-"+uuid.uuid4().hex,"logical_timeout_ms":30000})
 
@@ -90,15 +91,15 @@ class GatewayBuildingExplorationPorts:
             result=self.runtime.task_manager.get_task_result(spec.task_id) or {}
             transfer=result.get("building_navigation") if isinstance(result,dict) else None
             if transfer is not None:
-                created=transfer.get("created_map_manifest_sha256") if isinstance(transfer,dict) else transfer.created_map_manifest_sha256
+                created=transfer.get("created_map_asset_identity") if isinstance(transfer,dict) else transfer.created_map_asset_identity
             else:created=None
             context=result.get("exploration_context") if isinstance(result,dict) else None
             stop=getattr(getattr(context,"exploration_state",None),"metadata",{}).get("last_stop_reason") if context is not None else None
-            return {"state":status.state.value,"message":status.message,"created_manifest":created,"stop_reason":stop}
+            return {"state":status.state.value,"message":status.message,"created_asset_identity":created,"stop_reason":stop}
         if self.state is not None and self.state.child_kind=="transfer":
             transfer=self.runtime._get_building_navigation_service().journal.load()
             if transfer is not None and transfer.request.request_id==self.state.child_request_id and transfer.terminal and transfer.stage=="succeeded":
-                return {"state":"succeeded","created_manifest":transfer.created_map_manifest_sha256}
+                return {"state":"succeeded","created_asset_identity":transfer.created_map_asset_identity}
         if self.state is not None and self.state.child_kind=="explore":
             floor=self.state.request.floors[self.state.next_floor_index]
             recovered=self._saved_receipt(self.state,floor)
@@ -107,8 +108,8 @@ class GatewayBuildingExplorationPorts:
 
     def _saved_receipt(self,state,floor):
         bundle=self.runtime._get_building_catalog().assets.get_map_asset_bundle(floor.map_name,migrate_legacy=False)
-        if bundle is not None and bundle.metadata.get("exploration_request_id")==state.child_request_id and bundle.manifest_sha256:
-            return {"status":"succeeded","manifest_sha256":bundle.manifest_sha256}
+        if bundle is not None and bundle.metadata.get("exploration_request_id")==state.child_request_id and bundle.identity_schema_version==2 and bundle.asset_identity is not None:
+            return {"status":"succeeded","asset_identity":bundle.asset_identity.model_dump()}
         return None
 
     def asset_receipt(self,state,floor):
@@ -117,7 +118,7 @@ class GatewayBuildingExplorationPorts:
             spec=self._find_task(state.child_task_id)
             receipt=spec.metadata.get("map_asset_finalize") if spec is not None else self._saved_receipt(state,floor)
             if receipt:
-                if receipt.get("status")!="succeeded" or not receipt.get("manifest_sha256"):
+                if receipt.get("status")!="succeeded" or not receipt.get("asset_identity"):
                     raise GatewayError("该层探索的地图资产尚未成功保存。",details={"asset_receipt":receipt})
                 return receipt
             time.sleep(0.1)
@@ -162,7 +163,7 @@ class GatewayBuildingExplorationPorts:
                 spec=self._find_task(state.child_task_id)
                 receipt=spec.metadata.get("map_asset_finalize") if spec is not None else self._saved_receipt(state,floor)
                 if receipt:
-                    if receipt.get("status")=="succeeded" and receipt.get("manifest_sha256"):return receipt["manifest_sha256"]
+                    if receipt.get("status")=="succeeded" and receipt.get("asset_identity"):return AssetIdentityV2.model_validate(receipt["asset_identity"])
                     raise GatewayError("已结束探索的存图回执未成功。",details={"receipt":receipt})
                 time.sleep(0.05)
             raise GatewayError("已接纳存图仍在处理，不并行覆盖同一地图。")
@@ -171,9 +172,9 @@ class GatewayBuildingExplorationPorts:
             result=self.runtime._finalize_workspace_assets_after_task(map_name=floor.map_name,trigger="explore_building_checkpoint")
             if result.get("map_asset_finalize_error"):raise GatewayError("逐层探索部分地图保存失败。")
             bundle=result.get("finalized_map_asset")
-            if bundle is not None:return bundle.manifest_sha256
+            if bundle is not None:return bundle.asset_identity
         asset=self.runtime._get_building_catalog().maps.get_map_asset(floor.map_name)
-        return asset.asset_manifest_sha256 if asset is not None and asset.finalized else None
+        return asset.asset_identity if asset is not None and asset.finalized and asset.identity_schema_version==2 else None
 
     def interrupt_barrier(self,proof):
         if self.context.is_cancel_requested() or self.context.is_timed_out():self.context.acknowledge_interrupt_barrier(dict(proof))

@@ -1452,9 +1452,6 @@ class GatewayRuntime:
             "phase": 64,
             "recovery_state": 64,
             "target_map_name": 256,
-            "target_manifest_sha256": 64,
-            "request_identity_sha256": 64,
-            "terminal_proof_sha256": 64,
         }
         for key, limit in limits.items():
             value = pending.get(key)
@@ -2764,17 +2761,20 @@ class GatewayRuntime:
                 output_schema=_schema_object(
                     {
                         "task_id": {"type": "string"},
+                        "task": {"type": "object"},
                         "status": {"type": "object"},
                         "events": {"type": "array", "items": {"type": "object"}},
                         "result": {},
                         "error": {"type": ["string", "null"]},
                         "error_payload": {"type": ["object", "null"]},
+                        "feedback": {"type": ["object", "null"]},
+                        "exploration_checkpoint": {"type": "object"},
                         "map_asset_finalize": {"type": "object"},
                         "polling_advisory": {"type": "object"},
                         "next_step_hint": {"type": "string"},
                         "events_truncated": {"type": "boolean"},
                     },
-                    required=("task_id", "status", "events", "result", "error", "error_payload"),
+                    required=("task_id", "task", "status", "events", "result", "error", "error_payload", "feedback"),
                 ),
             ),
             _descriptor(
@@ -5076,24 +5076,25 @@ class GatewayRuntime:
             return {
                 "available": False,
                 "status": "missing",
-                "pose_available": bool(getattr(localization_snapshot, "current_pose", None) is not None),
+                "pose_available": bool(localization_snapshot is not None and localization_snapshot.current_pose is not None),
                 "source": "localization_service",
             }
-        status = getattr(getattr(localization_session, "status", None), "value", getattr(localization_session, "status", None))
         return {
             "available": True,
-            "session_id": getattr(localization_session, "session_id", None),
-            "map_name": getattr(localization_session, "map_name", None),
-            "asset_manifest_sha256": getattr(
-                localization_session, "asset_manifest_sha256", None
+            "session_id": localization_session.session_id,
+            "map_name": localization_session.map_name,
+            "identity_schema_version": localization_session.identity_schema_version,
+            "asset_identity": (
+                localization_session.asset_identity.model_dump(mode="json")
+                if localization_session.asset_identity is not None else None
             ),
-            "frame_id": getattr(localization_session, "frame_id", None),
-            "status": status,
-            "pose_available": bool(getattr(localization_session, "pose_available", False)),
-            "source_name": getattr(localization_session, "source_name", None),
-            "last_localized_at": getattr(localization_session, "last_localized_at", None),
-            "last_error": getattr(localization_session, "last_error", None),
-            "candidate_count": len(getattr(localization_session, "relocalization_candidates", []) or []),
+            "frame_id": localization_session.frame_id,
+            "status": localization_session.status.value,
+            "pose_available": localization_session.pose_available,
+            "source_name": localization_session.source_name,
+            "last_localized_at": localization_session.last_localized_at,
+            "last_error": localization_session.last_error,
+            "candidate_count": len(localization_session.relocalization_candidates),
             "source": "localization_service.active_session",
         }
 
@@ -6056,7 +6057,8 @@ class GatewayRuntime:
                 "map_name",
                 "source_name",
                 "frame_id",
-                "manifest_sha256",
+                "identity_schema_version",
+                "asset_identity",
             )
             if key in data
         }
@@ -6096,7 +6098,8 @@ class GatewayRuntime:
                 "status",
                 "active",
                 "finalized",
-                "asset_manifest_sha256",
+                "identity_schema_version",
+                "asset_identity",
                 "finalized_at",
                 "frame_id",
                 "localization_ready",
@@ -7013,19 +7016,19 @@ class GatewayRuntime:
         )
 
     def _resolve_navigation_goal_height(self, goal: NavigationGoal, *, workspace) -> NavigationGoal:
-        """仅分配式三维地图补充拥有方高度；旧式三维保留数值 0 兼容语义。"""
+        """分配式三维资产补充拥有方高度；未定稿建图会话沿原输入高度。"""
         if not goal.metadata.get("navigation_height_pending"):
             return goal
         schema_version = getattr(getattr(workspace, "map_asset", None), "identity_schema_version", None)
         if schema_version == 1:
-            # 旧式 0 只是输入兼容值，不证明当前地图拥有方的机体高度。
+            # 未定稿建图会话不持有已激活资产的定位样本。
             metadata = dict(goal.metadata)
             metadata.pop("navigation_height_pending")
             return goal.model_copy(update={"metadata": metadata}, deep=False)
         # 该接口核对原生终态、激活、会话和提供器身份；网关只补充选点高度的
         # 坐标系与时间准入。此处不持有状态锁，保留 RPC 样本的原始源时间。
         # 准备后的资产无法分类时明确失败；目录中途降级也不得回落到旧式位姿。
-        current = (self.map_workspace_service.get_relocalized_pose(goal.map_name, require_assigned=True)
+        current = (self.map_workspace_service.get_relocalized_pose(goal.map_name)
                    if schema_version == 2 else None)
         received_at = utc_now()
         now = utc_now()
@@ -9120,9 +9123,9 @@ class GatewayRuntime:
                 "localization_session_status": (
                     localization_session.status.value if localization_session is not None else None
                 ),
-                "asset_manifest_sha256": (
-                    localization_session.asset_manifest_sha256
-                    if localization_session is not None
+                "asset_identity": (
+                    localization_session.asset_identity.model_dump(mode="json")
+                    if localization_session is not None and localization_session.asset_identity is not None
                     else None
                 ),
             },
@@ -14693,7 +14696,7 @@ class GatewayRuntime:
 
     def _record_exploration_finalize_failure(self, *, map_name, exploration_request_id, task_id, status, reason):
         receipt={"status":status,"map_name":map_name,"exploration_request_id":exploration_request_id,"task_id":task_id,
-                 "manifest_sha256":None,"error":{"message":reason}}
+                 "error":{"message":reason}}
         if task_id:
             self.task_manager.update_task_metadata(task_id,{"map_asset_finalize":receipt})
 
@@ -14834,13 +14837,11 @@ class GatewayRuntime:
                 "map_name": map_name,
                 "exploration_request_id": exploration_request_id,
                 "task_id": task_id,
-                "manifest_sha256": getattr(finalized_map_asset, "manifest_sha256", None),
                 "mapping_session_id": asset_metadata.get("mapping_session_id"),
                 "session_generation": asset_metadata.get("session_generation"),
                 "error": finalize_error,
             }
-            if getattr(finalized_map_asset, "identity_schema_version", 1) == 2:
-                receipt.pop("manifest_sha256")
+            if finalized_map_asset is not None:
                 receipt.update(identity_schema_version=2,
                     asset_identity=finalized_map_asset.asset_identity.model_dump(),
                     mapping_checkpoint_id=finalized_map_asset.geometry_asset.metadata["mapping_backend_checkpoint"]["checkpoint_id"])

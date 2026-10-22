@@ -8,6 +8,8 @@ if str(ROOT) not in sys.path:
 
 # 协议传输和加载夹具独立于测试用例，供按包路径运行的各入口共用。
 import copy
+import hashlib
+import os
 import json
 import struct
 import threading
@@ -18,6 +20,7 @@ import pytest
 
 from contracts.map_relocalization import current_assigned_relocalization_policy
 from services.geometry import geometry_runtime_provider as fixture_provider
+from services.geometry.checkpoint_payload import FrozenPayload
 
 fixture_pb = fixture_provider.pb2
 
@@ -80,7 +83,7 @@ class TransferStub:
         self.exports = []
     def ExportMappingBackendCheckpoint(self, request, timeout):
         assert isinstance(request, fixture_pb.ExportMappingBackendCheckpointRequest)
-        self.exports.append(request.checkpoint_schema_version)
+        self.exports.append(request.SerializeToString())
         return copy.deepcopy(self.response)
     def TransferGraphArtifact(self, request, timeout):
         self.requests.append(copy.deepcopy(request))
@@ -302,3 +305,60 @@ def create_navigation_service(directory):
         localization_service=LocalizationService(provider_owner=None, state_store=state),
         mapping_service=MappingService(provider_owner=None, state_store=state), state_store=state,
         forbidden_zone_store=ForbiddenZoneStore(Path(directory) / "navigation-zones.json"))
+
+
+# 历史输入由测试侧明确写入；生产检查点发布器仅写当前格式。
+def asset_document(asset, *, sha256_field):
+    return {**asset, sha256_field: asset[sha256_field].hex()}
+
+
+def _receipt_document(receipt):
+    if receipt is None:
+        return None
+    return {**receipt, "commit_id": {**receipt["commit_id"],
+        "boot_nonce": receipt["commit_id"]["boot_nonce"].hex()}}
+
+
+def _encode(value):
+    return (json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode()
+
+
+def write_private_file(path, data):
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, "wb") as stream:
+        for chunk in data.chunks() if isinstance(data, FrozenPayload) else (data,):
+            stream.write(chunk)
+
+
+def write_legacy_checkpoint(store, bundle):
+    """写入明确的旧selector/manifest/object文件，返回正式历史读取结果。"""
+    checkpoint, occupancy, cloud = bundle
+    backend = store.version_dir / "mapping_backend" / checkpoint.backend_kind
+    for path in (backend.parent, backend, backend / "objects", backend / "manifests"):
+        path.mkdir(mode=0o700, parents=False, exist_ok=True)
+    alias = checkpoint.content_sha256.hex()
+    relative = "objects/sha256-" + alias + ".bin"
+    write_private_file(backend / relative, checkpoint.payload)
+    document = {"schema_version": 1, "backend_kind": checkpoint.backend_kind,
+        "source_session_id": checkpoint.source_session_id,
+        "source_session_generation": checkpoint.source_session_generation,
+        "created_at_ns": checkpoint.created_at_ns,
+        "payload": {"sha256": alias, "path": relative, "size": checkpoint.payload_size},
+        "canonical_receipts": {"occupancy": _receipt_document(checkpoint.occupancy_receipt),
+            "cloud": _receipt_document(checkpoint.cloud_receipt)},
+        "canonical_assets": {"occupancy": asset_document(occupancy, sha256_field="raw_data_sha256"),
+            "cloud": asset_document(cloud, sha256_field="xyz_sha256") if cloud is not None else None}}
+    for name, data in (("fine_archive", checkpoint.fine_archive), ("dense_archive", checkpoint.dense_archive)):
+        if data is not None:
+            payload = bytes(data)
+            alias = hashlib.sha256(payload).hexdigest()
+            relative = "objects/sha256-" + alias + ".bin"
+            write_private_file(backend / relative, payload)
+            document[name] = {"sha256": alias, "path": relative, "size": len(payload)}
+    encoded = _encode(document)
+    manifest_alias = hashlib.sha256(encoded).hexdigest()
+    relative = "manifests/sha256-" + manifest_alias + ".json"
+    write_private_file(backend / relative, encoded)
+    write_private_file(backend / "checkpoint-v1.json", _encode({"schema_version": 1,
+        "backend_kind": checkpoint.backend_kind, "manifest": {"sha256": manifest_alias, "path": relative}}))
+    return store.load(checkpoint.backend_kind, schema_version=1)

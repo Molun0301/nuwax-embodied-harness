@@ -262,10 +262,6 @@ class LocalizationSession(TimestampedContract):
 
     session_id: str = Field(description="平台定位会话标识。")
     map_name: str = Field(description="当前绑定的地图名称。")
-    asset_manifest_sha256: Optional[str] = Field(
-        default=None,
-        description="当前绑定地图资产清单的不可变 SHA-256 摘要。",
-    )
     frame_id: Optional[str] = Field(default=None, description="当前定位会话目标坐标系。")
     status: LocalizationSessionStatus = Field(
         default=LocalizationSessionStatus.LOCALIZING,
@@ -285,17 +281,7 @@ class LocalizationSession(TimestampedContract):
     def _validate_map_name(cls, value: str) -> str:
         return _validate_map_asset_name(value)
 
-    @field_validator("asset_manifest_sha256")
-    @classmethod
-    def _validate_asset_manifest_sha256(cls, value: Optional[str]) -> Optional[str]:
-        if value is None:
-            return None
-        resolved = str(value or "").strip().lower()
-        if len(resolved) != 64 or any(
-            character not in "0123456789abcdef" for character in resolved
-        ):
-            raise ValueError("asset_manifest_sha256 必须为 64 位十六进制字符串。")
-        return resolved
+
 
 
     @model_validator(mode="before")
@@ -323,11 +309,6 @@ class LocalizationSession(TimestampedContract):
                 items = value[key] if key == "relocalization_candidates" else [value[key]]
                 detached = [None if item is None else _copy_assigned_localization_fields(item) for item in items]
                 value[key] = detached if key == "relocalization_candidates" else detached[0]
-        identity = value.get("asset_identity")
-        if type(identity) is AssetIdentityV2:
-            # AssetIdentityV2 semantics remain unchanged; reject unvalidated
-            # model_copy/model_construct values at this new admission boundary.
-            AssetIdentityV2.model_validate({"asset_id": identity.asset_id})
         return value
 
     @model_validator(mode="after")
@@ -337,7 +318,6 @@ class LocalizationSession(TimestampedContract):
         owner = self.activation_receipt_v2
         terminal = self.relocalization_terminal_v2
         if (type(self.asset_identity) is not AssetIdentityV2 or owner is None
-                or self.asset_manifest_sha256 is not None
                 or self.map_name != owner.map_name or self.asset_identity != owner.asset_identity):
             raise ValueError("assigned session requires the exact map, asset and activation owner without digest")
         if terminal is not None and (
@@ -392,7 +372,7 @@ class LocalizationSession(TimestampedContract):
                     raise TypeError("legacy sessions require explicit assigned admission")
             return super().model_copy(update=update, deep=deep)
         owner_fields = {"identity_schema_version", "asset_identity", "activation_receipt_v2",
-                        "relocalization_terminal_v2", "session_id", "map_name", "asset_manifest_sha256", "frame_id"}
+                        "relocalization_terminal_v2", "session_id", "map_name", "frame_id"}
         for name in owner_fields & changes.keys():
             if changes[name] != getattr(self, name):
                 raise TypeError("assigned session owners cannot be rewritten by model_copy")

@@ -3,7 +3,6 @@ use crate::mapping_commit::CloudCommitReceipt;
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use nalgebra::Point3;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::{
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
@@ -531,28 +530,9 @@ impl DenseSnapshot {
     }
 }
 
-#[cfg(test)]
-std::thread_local! { pub(crate) static FORBID_ARCHIVE_HASH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 
 /// Explicit legacy-only adapter; new archive creation returns owned bytes and size.
-pub(crate) fn hash_reader(reader: &mut impl Read) -> Result<(u64, [u8; 32]), String> {
-    #[cfg(test)] FORBID_ARCHIVE_HASH.with(|v| assert!(!v.get(), "legacy archive hash reached v2 path"));
-    let mut hash = Sha256::new();
-    let mut size = 0_u64;
-    let mut buffer = vec![0; 1024 * 1024];
-    loop {
-        let count = reader.read(&mut buffer).map_err(|e| e.to_string())?;
-        if count == 0 {
-            break;
-        }
-        size += count as u64;
-        if size > MAX_ARCHIVE_BYTES {
-            return Err("点云制品超过存储容量".into());
-        }
-        hash.update(&buffer[..count]);
-    }
-    Ok((size, hash.finalize().into()))
-}
+
 
 pub(crate) fn read_metadata(file: &mut File) -> Result<(Metadata, u64), String> {
     file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;

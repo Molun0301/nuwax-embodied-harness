@@ -345,109 +345,11 @@ pub(crate) struct CorrelatedCloudMapCommit {
     pub(crate) receipt: CloudCommitReceipt,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct ImmutableActivatedTarget {
-    pub(crate) frame_id: String,
-    pub(crate) source_revision: u64,
-    pub(crate) point_count: u32,
-    pub(crate) voxel_size: f32,
-    pub(crate) xyz_f32_le: Vec<u8>,
-    pub(crate) xyz_sha256: [u8; 32],
-    pub(crate) payload_schema_version: u32,
-}
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn decode_immutable_activated_target(
-    frame_id: &str,
-    expected_map_frame_id: &str,
-    source_revision: u64,
-    point_count: u32,
-    voxel_size: f32,
-    xyz_f32_le: &[u8],
-    xyz_sha256: &str,
-    payload_schema_version: u32,
-) -> Result<ImmutableActivatedTarget, String> {
-    if payload_schema_version != CM_PAYLOAD_SCHEMA_VERSION {
-        return Err(format!(
-            "unsupported immutable target schema: expected={} actual={payload_schema_version}",
-            CM_PAYLOAD_SCHEMA_VERSION
-        ));
-    }
-    if frame_id.is_empty()
-        || frame_id.len() > 256
-        || frame_id != frame_id.trim()
-        || frame_id != expected_map_frame_id
-    {
-        return Err(format!(
-            "immutable target frame must be canonical {expected_map_frame_id}, received {frame_id}"
-        ));
-    }
-    if source_revision == 0 {
-        return Err("immutable target source_revision must be positive".to_owned());
-    }
-    if point_count == 0 {
-        return Err("immutable target must contain at least one point".to_owned());
-    }
-    if !voxel_size.is_finite() || voxel_size <= 0.0 || voxel_size > MAX_VOXEL_SIZE {
-        return Err("immutable target voxel_size must be finite and positive".to_owned());
-    }
 
-    let expected_size = usize::try_from(point_count)
-        .map_err(|_| "immutable target point_count exceeds usize".to_owned())?
-        .checked_mul(CM_POINT_SIZE_BYTES)
-        .ok_or_else(|| "immutable target payload size overflow".to_owned())?;
-    if expected_size > IMMUTABLE_ACTIVATED_TARGET_MAX_BYTES {
-        return Err(format!(
-            "immutable target exceeds {} bytes: {expected_size}",
-            IMMUTABLE_ACTIVATED_TARGET_MAX_BYTES
-        ));
-    }
-    if xyz_f32_le.len() != expected_size {
-        return Err(format!(
-            "immutable target payload size mismatch: expected={expected_size} actual={}",
-            xyz_f32_le.len()
-        ));
-    }
 
-    let expected_digest = decode_checkpoint_sha256(xyz_sha256)?;
-    let actual_digest = crate::map_checksum::sha256_bytes(xyz_f32_le);
-    if actual_digest != expected_digest {
-        return Err("immutable target xyz_sha256 mismatch".to_owned());
-    }
-    for (index, point) in xyz_f32_le.chunks_exact(CM_POINT_SIZE_BYTES).enumerate() {
-        let coordinates = [
-            f32::from_le_bytes(point[0..4].try_into().unwrap()),
-            f32::from_le_bytes(point[4..8].try_into().unwrap()),
-            f32::from_le_bytes(point[8..12].try_into().unwrap()),
-        ];
-        if coordinates.iter().any(|value| !value.is_finite()) {
-            return Err(format!("immutable target point {index} is non-finite"));
-        }
-    }
 
-    Ok(ImmutableActivatedTarget {
-        frame_id: frame_id.to_owned(),
-        source_revision,
-        point_count,
-        voxel_size,
-        xyz_f32_le: xyz_f32_le.to_vec(),
-        xyz_sha256: actual_digest,
-        payload_schema_version,
-    })
-}
 
-pub(crate) fn decode_checkpoint_sha256(value: &str) -> Result<[u8; 32], String> {
-    let value = value.trim_matches(|character: char| character.is_ascii_whitespace());
-    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err("immutable target xyz_sha256 must be exactly 64 hexadecimal digits".to_owned());
-    }
-    let mut digest = [0_u8; 32];
-    for (index, byte) in digest.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
-            .map_err(|_| "immutable target xyz_sha256 is invalid".to_owned())?;
-    }
-    Ok(digest)
-}
 
 impl CloudMapShmWriter {
     pub fn new(shm_path: &std::path::Path) -> std::io::Result<Self> {
@@ -953,6 +855,7 @@ impl CloudMapShmWriter {
 
     /// Retain an already materialized payload without exporting or copying it.
     /// Descriptor validation remains the caller's responsibility.
+    #[cfg(test)]
     pub(crate) fn materialized_committed_snapshot(&self) -> Option<CommittedCloudMapSnapshot<Arc<[u8]>>> {
         self.committed_snapshot_cache.get().cloned()
     }
@@ -2229,75 +2132,9 @@ fn cloud_map_duplicate_admitted_frame_preserves_dense_coarse_and_fine_state() {
             .expect("repeated missing cleanup");
     }
 
-    #[test]
-    fn immutable_target_decoder_retains_exact_bytes_and_accepts_legacy_hex_formatting() {
-        let xyz_f32_le = [1.0_f32, -2.0, 3.5]
-            .into_iter()
-            .flat_map(f32::to_le_bytes)
-            .collect::<Vec<_>>();
-        let digest = format!(
-            " \t{}\r\n",
-            crate::map_checksum::sha256_hex(&xyz_f32_le).to_ascii_uppercase()
-        );
-        let target = decode_immutable_activated_target(
-            "map",
-            "map",
-            9,
-            1,
-            0.1,
-            &xyz_f32_le,
-            &digest,
-            CM_PAYLOAD_SCHEMA_VERSION,
-        )
-        .expect("strict immutable target");
-        assert_eq!(target.xyz_f32_le, xyz_f32_le);
-        assert_eq!(
-            target.xyz_sha256,
-            crate::map_checksum::sha256_bytes(&target.xyz_f32_le)
-        );
-    }
 
-    #[test]
-    fn immutable_target_decoder_rejects_malformed_and_unbounded_payloads() {
-        let finite = [1.0_f32, 2.0, 3.0]
-            .into_iter()
-            .flat_map(f32::to_le_bytes)
-            .collect::<Vec<_>>();
-        let digest = crate::map_checksum::sha256_hex(&finite);
-        let decode = |frame: &str,
-                      revision: u64,
-                      count: u32,
-                      voxel: f32,
-                      bytes: &[u8],
-                      checksum: &str,
-                      schema: u32| {
-            decode_immutable_activated_target(
-                frame, "map", revision, count, voxel, bytes, checksum, schema,
-            )
-        };
-        assert!(decode("/map", 9, 1, 0.1, &finite, &digest, 1).is_err());
-        assert!(decode("map", 0, 1, 0.1, &finite, &digest, 1).is_err());
-        assert!(decode("map", 9, 0, 0.1, &[], &digest, 1).is_err());
-        assert!(decode("map", 9, 1, -0.0, &finite, &digest, 1).is_err());
-        assert!(decode("map", 9, 1, 0.1, &finite, &digest, 2).is_err());
-        assert!(decode("map", 9, 1, 0.1, &finite, &"00".repeat(32), 1).is_err());
 
-        let mut trailing = finite.clone();
-        trailing.push(0);
-        let trailing_digest = crate::map_checksum::sha256_hex(&trailing);
-        assert!(decode("map", 9, 1, 0.1, &trailing, &trailing_digest, 1).is_err());
 
-        let nonfinite = [f32::INFINITY, 2.0, 3.0]
-            .into_iter()
-            .flat_map(f32::to_le_bytes)
-            .collect::<Vec<_>>();
-        let nonfinite_digest = crate::map_checksum::sha256_hex(&nonfinite);
-        assert!(decode("map", 9, 1, 0.1, &nonfinite, &nonfinite_digest, 1).is_err());
-
-        let over_limit_count =
-            u32::try_from(IMMUTABLE_ACTIVATED_TARGET_MAX_BYTES / CM_POINT_SIZE_BYTES + 1).unwrap();
-        assert!(decode("map", 9, over_limit_count, 0.1, &[], &"00".repeat(32), 1).is_err());
-    }
 
     #[test]
     fn incremental_frames_advance_the_shared_memory_revision() {

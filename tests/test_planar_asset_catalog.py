@@ -7,6 +7,7 @@ ROOT = Path(__file__).resolve().parents[1]
 ASSET_SOURCE = Path(os.environ.get('NEH_PLANAR_ASSET_SOURCE_ROOT', str(ROOT)))
 sys.path.insert(0, str(ROOT))
 import hashlib
+from tests.conftest import asset_document
 import json
 import tempfile
 import unittest
@@ -81,7 +82,7 @@ def install_literal_legacy(repository, catalog_owner, name='map'):
     relative = 'objects/sha256-' + '50' * 32 + '.bin'; (backend / relative).write_bytes(raw)
     checkpoint_manifest = dict(schema_version=1, backend_kind='slam_toolbox', source_session_id='source', source_session_generation=3,
         created_at_ns=12, canonical_receipts=dict(occupancy=store._receipt_document(receipt), cloud=None),
-        canonical_assets=dict(occupancy=store._asset_document(occupancy, sha256_field='raw_data_sha256'), cloud=None),
+        canonical_assets=dict(occupancy=asset_document(occupancy, sha256_field='raw_data_sha256'), cloud=None),
         payload=dict(sha256='50' * 32, path=relative, size=len(raw)))
     manifest_relative = 'manifests/sha256-' + '88' * 32 + '.json'
     (backend / manifest_relative).write_bytes(store._encode_json(checkpoint_manifest))
@@ -136,7 +137,7 @@ class AssetCatalogTests(unittest.TestCase):
         for name in hashlib.algorithms_guaranteed | {'new', 'file_digest'}:
             if hasattr(hashlib, name):
                 self.guard.enter_context(patch.object(hashlib, name, side_effect=AssertionError('hash forbidden')))
-        for module in (store, checkpoint_payload):
+        for module in (checkpoint_payload,):
             self.guard.enter_context(patch.object(module, 'payload_digest', side_effect=AssertionError('digest forbidden')))
         self.guard.enter_context(patch.object(asset_store, '_sha256_bytes', side_effect=AssertionError('legacy outer hash forbidden')))
         self.directory = tempfile.TemporaryDirectory(); self.addCleanup(self.directory.cleanup)

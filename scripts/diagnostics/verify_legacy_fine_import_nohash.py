@@ -11,17 +11,15 @@ from unittest.mock import patch
 def main():
     root = Path(__file__).resolve().parents[2]
     sys.path[:0] = [str(root), str(root / 'tests')]
-    from services.geometry import (
-        checkpoint_payload, mapping_backend_checkpoint_store, geometry_runtime_provider)
+    from services.geometry import checkpoint_payload
 
     with ExitStack() as guard:
         for name in hashlib.algorithms_guaranteed | {'new', 'file_digest'}:
             if hasattr(hashlib, name):
                 guard.enter_context(patch.object(hashlib, name,
                     side_effect=AssertionError('application hash prohibited')))
-        for module in (checkpoint_payload, mapping_backend_checkpoint_store, geometry_runtime_provider):
-            guard.enter_context(patch.object(module, 'payload_digest',
-                side_effect=AssertionError('payload digest prohibited')))
+        guard.enter_context(patch.object(checkpoint_payload, 'payload_digest',
+            side_effect=AssertionError('payload digest prohibited')))
         suite = unittest.defaultTestLoader.loadTestsFromNames([
             'test_legacy_cloud_import', 'test_checkpoint_identity_v2', 'test_fine_archive_vector',
             'test_assigned_ar1_import', 'test_assigned_activation_loader',

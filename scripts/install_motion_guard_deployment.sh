@@ -8,7 +8,6 @@ REPO_ROOT="${NUWAX_REPO_ROOT_OVERRIDE:-${DEFAULT_REPO_ROOT}}"
 RENDER_ROOT="${NUWAX_RENDER_ROOT:-${REPO_ROOT}}"
 [[ "${RENDER_ROOT}" == "/" ]] || RENDER_ROOT="${RENDER_ROOT%/}"
 ACTION="${1:-check-sources}"
-ACTUATOR_SYMBOLS_FILE="${2:-${NUWAX_ACTUATOR_SYMBOLS_FILE:-}}"
 
 BIN_DIR="${NUWAX_BIN_DIR:-${REPO_ROOT}/bin}"
 RENDER_BIN_DIR="${NUWAX_RENDER_BIN_DIR:-${BIN_DIR}}"
@@ -35,7 +34,6 @@ SETTINGS_APPLY_PATH_SOURCE="${REPO_ROOT}/deploy/systemd/nuwax-settings-apply.pat
 GATEWAY_UNIT_SOURCE="${REPO_ROOT}/deploy/systemd/nuwax-host-gateway.service"
 VIDEO_STREAMER_UNIT_SOURCE="${REPO_ROOT}/drivers/go2/systemd/nuwax-go2-video-streamer.service"
 GUARD_MODULE="${REPO_ROOT}/services/navigation/motion_safety_guard/__main__.py"
-PROVISIONER="${REPO_ROOT}/scripts/provision_motion_guard.py"
 LCM_NETWORK_UNIT_SOURCE="${REPO_ROOT}/deploy/systemd/nuwax-lcm-network.service"
 LCM_PREFLIGHT="${REPO_ROOT}/scripts/systemd/check_lcm_multicast.sh"
 PROCESS_IDENTITY_HELPER="${REPO_ROOT}/scripts/systemd/process_identity.sh"
@@ -49,10 +47,8 @@ GEOMETRY_BINARY="${BIN_DIR}/nuwax-geometry-runtime"
 PERSON_FOLLOW_BINARY="${BIN_DIR}/nuwax-person-follow"
 GUARD_SOCKET="${NUWAX_MOTION_GUARD_SOCKET:-/run/nuwax/motion-guard.sock}"
 GUARD_LOCK="${NUWAX_MOTION_GUARD_LOCK:-/run/nuwax/motion-guard.lock}"
-GUARD_STATE_DIR="${NUWAX_MOTION_GUARD_STATE_DIR:-/var/lib/nuwax/motion-guard}"
 SDK_PATH="${NUWAX_GO2_SDK_PATH:-${GO2_SDK_PATH:-/home/unitree/unitree_sdk2_python}}"
 RENDER_SDK_PATH="${NUWAX_RENDER_GO2_SDK_PATH:-${SDK_PATH}}"
-INSTALLED_ACTUATOR_SYMBOLS_FILE="${CONFIG_DIR}/actuator/actuator-symbols.json"
 SYSTEMD_BACKUP_DIR="${NUWAX_SYSTEMD_BACKUP_DIR:-}"
 PERSON_FOLLOW_AUTOSTART_MODE=""
 PROJECT_USER=nuwax
@@ -423,7 +419,7 @@ check_systemd_owned_invariants() {
     || fail "Gateway must remain independent from optional runtime components"
   grep -qx 'After=network-online.target' "${GATEWAY_UNIT_SOURCE}" \
     || fail "Gateway must only order itself after the network"
-  grep -qF 'PathExists=/run/nuwax/gateway/geometry.request' \
+  grep -qF 'PathChanged=/run/nuwax/gateway/geometry.request' \
     "${RUNTIME_ACTIVATION_PATH_SOURCE}" \
     || fail "runtime activation path does not watch the Gateway request file"
   grep -qF 'activate_geometry_runtime.sh' "${RUNTIME_ACTIVATION_UNIT_SOURCE}" \
@@ -487,7 +483,6 @@ check_sources() {
   check_file "${GATEWAY_UNIT_SOURCE}"
   check_file "${VIDEO_STREAMER_UNIT_SOURCE}"
   check_file "${GUARD_MODULE}"
-  check_file "${PROVISIONER}"
   check_file "${LCM_PREFLIGHT}"
   check_file "${LCM_NETWORK_UNIT_SOURCE}"
   check_file "${REPO_ROOT}/scripts/systemd/prepare_lcm_network.py"
@@ -497,8 +492,8 @@ check_sources() {
   check_file "${PERSON_FOLLOW_LAUNCHER}"
   check_file "${PERSON_FOLLOW_READY_HELPER}"
   check_file "${REPO_ROOT}/scripts/systemd/activate_geometry_runtime.sh"
-  grep -qF 'API_VERSION = 2' "${REPO_ROOT}/services/navigation/motion_safety_guard/constants.py" \
-    || fail "motion guard Python API version is not v2"
+  grep -qF 'API_VERSION = 3' "${REPO_ROOT}/services/navigation/motion_safety_guard/constants.py" \
+    || fail "motion guard Python API version is not 3"
   grep -qF 'package nuwax.motion_guard.v2;' "${REPO_ROOT}/services/navigation/proto/motion_guard.proto" \
     || fail "motion guard proto package is not v2"
   grep -qF 'startup_zero_confirmed' "${REPO_ROOT}/services/navigation/proto/motion_guard.proto" \
@@ -593,22 +588,6 @@ check_runtime_binaries() {
     [[ -x "${PERSON_FOLLOW_BINARY}" ]] \
       || fail "person-follow runtime is not executable: ${PERSON_FOLLOW_BINARY}; build the release binary"
   fi
-}
-
-require_actuator_manifest() {
-  [[ -n "${ACTUATOR_SYMBOLS_FILE}" ]] \
-    || fail "set NUWAX_ACTUATOR_SYMBOLS_FILE or pass an actuator manifest path"
-  [[ -s "${ACTUATOR_SYMBOLS_FILE}" ]] \
-    || fail "actuator symbols manifest is missing or empty: ${ACTUATOR_SYMBOLS_FILE}"
-}
-
-check_installed_actuator_manifest() {
-  [[ -f "${INSTALLED_ACTUATOR_SYMBOLS_FILE}" \
-    && ! -L "${INSTALLED_ACTUATOR_SYMBOLS_FILE}" \
-    && -s "${INSTALLED_ACTUATOR_SYMBOLS_FILE}" ]] \
-    || fail "installed actuator symbols manifest is missing, empty, non-regular, or a symlink"
-  [[ "$(stat -c '%U:%G %a' "${INSTALLED_ACTUATOR_SYMBOLS_FILE}")" == "root:nuwax 640" ]] \
-    || fail "installed actuator symbols manifest must be root:nuwax 0640"
 }
 
 check_identity_write_access() {
@@ -878,22 +857,6 @@ restore_systemd_state() {
   done < "${SYSTEMD_BACKUP_DIR}/service-state.tsv"
 }
 
-install_actuator_manifest() {
-  require_actuator_manifest
-  [[ ! -L "${INSTALLED_ACTUATOR_SYMBOLS_FILE}" ]] \
-    || fail "refusing actuator symbols manifest symlink: ${INSTALLED_ACTUATOR_SYMBOLS_FILE}"
-  if [[ -e "${INSTALLED_ACTUATOR_SYMBOLS_FILE}" ]]; then
-    cmp -s "${ACTUATOR_SYMBOLS_FILE}" "${INSTALLED_ACTUATOR_SYMBOLS_FILE}" \
-      || fail "refusing to overwrite installed actuator symbols manifest with different content"
-  else
-    install -D -o root -g nuwax -m 0640 \
-      "${ACTUATOR_SYMBOLS_FILE}" "${INSTALLED_ACTUATOR_SYMBOLS_FILE}"
-  fi
-  chown root:nuwax "${INSTALLED_ACTUATOR_SYMBOLS_FILE}"
-  chmod 0640 "${INSTALLED_ACTUATOR_SYMBOLS_FILE}"
-  check_installed_actuator_manifest
-}
-
 check_service_access() {
   local user="${PROJECT_USER}"
   runuser -u "${user}" -- test -x "${CONFIG_DIR}" \
@@ -949,18 +912,6 @@ check_service_access() {
     || fail "${user} cannot write /tmp/cdds.LOG"
 }
 
-check_record() {
-  local path="$1"
-  local expected_mode="$2"
-  local actual_mode=""
-  [[ -s "${path}" ]] || fail "missing or empty durable record: ${path}"
-  actual_mode="$(stat -c '%a' "${path}")"
-  [[ "${actual_mode}" == "${expected_mode}" ]] \
-    || fail "invalid mode for ${path}: ${actual_mode}, expected ${expected_mode}"
-  [[ "$(stat -c '%U:%G' "${path}")" == "${PROJECT_USER}:${PROJECT_GROUP}" ]] \
-    || fail "invalid owner for ${path}"
-}
-
 verify_installed() {
   local effective_unit=""
   local installed_unit=""
@@ -990,12 +941,6 @@ verify_installed() {
     ! grep -qF "${unit_file}.d/" <<< "${effective_unit}" \
       || fail "unexpected systemd drop-in still overrides ${unit_file}"
   done
-  check_installed_actuator_manifest
-  "${PROVISIONER}" verify \
-    --state-dir "${GUARD_STATE_DIR}" \
-    --actuator-symbols-file "${INSTALLED_ACTUATOR_SYMBOLS_FILE}"
-  check_record "${GUARD_STATE_DIR}/provisioned.json" 400
-  check_record "${GUARD_STATE_DIR}/epoch.json" 600
   require_always_on_unit_file_state nuwax-lcm-network.service
   systemctl is-active --quiet nuwax-lcm-network.service || fail "本机通信网络准备未完成"
   require_always_on_unit_file_state nuwax-host-gateway.service
@@ -1113,15 +1058,11 @@ install_sources() {
   for robot_directory in go2 g1 customrobot raspi_lidar_robot; do
     install -d -o "${PROJECT_USER}" -g "${PROJECT_GROUP}" -m 2770 "${REPO_ROOT}/drivers/${robot_directory}/configs"
   done
-  echo "deployment files installed; provision durable records before enabling the stack"
+  echo "deployment files installed; service stack can be enabled"
 }
 
 enable_stack() {
   require_root
-  check_installed_actuator_manifest
-  "${PROVISIONER}" verify \
-    --state-dir "${GUARD_STATE_DIR}" \
-    --actuator-symbols-file "${INSTALLED_ACTUATOR_SYMBOLS_FILE}"
   systemctl disable nuwax-motion-safety-guard.service
   systemctl disable nuwax-nav-stack.service
   systemctl disable nuwax-geometry-runtime.service
@@ -1140,10 +1081,6 @@ start_stack() {
   check_runtime_config
   check_runtime_config_permissions
   check_runtime_binaries
-  check_installed_actuator_manifest
-  "${PROVISIONER}" verify \
-    --state-dir "${GUARD_STATE_DIR}" \
-    --actuator-symbols-file "${INSTALLED_ACTUATOR_SYMBOLS_FILE}"
   check_project_identity system
   check_service_access
 
@@ -1173,14 +1110,6 @@ stop_stack() {
   echo "stopped stack in reverse dependency order"
 }
 
-provision_records() {
-  require_root
-  install_actuator_manifest
-  "${PROVISIONER}" provision \
-    --state-dir "${GUARD_STATE_DIR}" \
-    --actuator-symbols-file "${INSTALLED_ACTUATOR_SYMBOLS_FILE}"
-}
-
 main() {
   case "${ACTION}" in
     check-sources)
@@ -1197,9 +1126,6 @@ main() {
     install)
       install_sources
       ;;
-    provision)
-      provision_records
-      ;;
     enable)
       enable_stack
       ;;
@@ -1213,7 +1139,7 @@ main() {
       verify_installed
       ;;
     *)
-      echo "usage: $0 [check-sources|snapshot-systemd|restore-systemd|install|provision|enable|start|stop|verify-runtime] [actuator-symbols.json]" >&2
+      echo "usage: $0 [check-sources|snapshot-systemd|restore-systemd|install|enable|start|stop|verify-runtime]" >&2
       exit 2
       ;;
   esac

@@ -108,8 +108,7 @@ _TERMINAL_TASK_EVENT_TYPES = frozenset(
         "task.failed",
         "task.cancelled",
         "task.timeout",
-        "task.resource_quarantined",
-    }
+        }
 )
 
 

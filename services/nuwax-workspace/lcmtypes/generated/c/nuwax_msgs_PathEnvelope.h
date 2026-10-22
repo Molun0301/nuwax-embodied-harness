@@ -25,54 +25,10 @@ struct _nuwax_msgs_PathEnvelope
      * LCM Type: string
      */
     char*      session_id;
-    int32_t    owner_kind;
-
-    /**
-     * LCM Type: string
-     */
-    char*      parent_request_id;
-    int64_t    goal_generation;
-
-    /**
-     * LCM Type: string
-     */
-    char*      producer;
-    int64_t    producer_epoch;
     int64_t    producer_runtime_generation;
-
-    /**
-     * LCM Type: string
-     */
-    char*      committed_map_session_id;
-    int64_t    committed_map_session_generation;
-    int64_t    committed_map_revision;
-
-    /**
-     * LCM Type: byte[16]
-     */
-    uint8_t    committed_map_boot_nonce[16];
-    int64_t    committed_map_commit_sequence;
-    int64_t    committed_map_source_timestamp_ns;
-
-    /**
-     * LCM Type: string
-     */
-    char*      committed_map_frame_id;
-
-    /**
-     * LCM Type: string
-     */
-    char*      boundary_id;
-    int64_t    motion_guard_generation;
-
-    /**
-     * LCM Type: byte[16]
-     */
-    uint8_t    motion_guard_boot_nonce[16];
-    int64_t    motion_stop_generation;
+    int64_t    goal_generation;
     int64_t    planner_runtime_generation;
     int64_t    path_revision;
-    int64_t    source_timestamp_ns;
     nav_msgs_Path path;
 };
 

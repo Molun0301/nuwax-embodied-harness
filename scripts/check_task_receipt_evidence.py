@@ -120,7 +120,7 @@ class ReceiptEvidenceChecks(unittest.TestCase):
             elif event.event_type == "task.started":
                 seen.append(event.payload["request_context"]["request_id"])
         self.bus.subscribe(callback, event_types=("task.accepted", "task.started"))
-        task_id = self.finish({"known": True})
+        self.finish({"known": True})
         self.assertEqual(seen, ["new-request"])
 
 
@@ -300,7 +300,7 @@ class ReceiptEvidenceChecks(unittest.TestCase):
         self.assertEqual(actual["status"]["updated_at"], status.model_dump(mode="json")["updated_at"])
         self.assertEqual(set(actual), {"task_id", "capability_name", "input_payload", "status", "polling_guidance", "next_step_hint"})
 
-    def test_deferred_interrupt_without_proof_still_quarantines(self):
+    def test_deferred_interrupt_without_proof_fails_and_releases(self):
         entered, release = self.gate()
         calls = []
         def runner(context):
@@ -316,10 +316,10 @@ class ReceiptEvidenceChecks(unittest.TestCase):
             self.manager.wait_for_task(task_id, timeout=2)
         self.assertEqual(calls, [1])
         self.assertEqual(self.manager.get_task_status(task_id).state, "failed")
-        self.assertTrue(self.manager._records[task_id].resource_quarantined)
-        self.assertEqual(self.locks.held_resources(task_id), ("map_workspace",))
+        self.assertTrue(self.manager.get_task_error_payload(task_id)["details"]["parking_unconfirmed"])
+        self.assertEqual(self.locks.held_resources(task_id), ())
 
-    def test_quarantine_release_still_requires_exact_original_correlation(self):
+    def test_parking_failure_receipt_preserves_original_correlation(self):
         entered, release = self.gate()
         def runner(context):
             entered.set()
@@ -332,17 +332,12 @@ class ReceiptEvidenceChecks(unittest.TestCase):
         release.set()
         with self.assertRaises(TaskSafetyBarrierError):
             self.manager.wait_for_task(task_id, timeout=2)
-        before = self.manager.get_task_status(task_id)
-        correlation = {"ownership_domain": "navigation", "goal_id": "offline-goal"}
-        with self.assertRaises(ValueError):
-            self.manager.release_resource_quarantine(task_id, proof={"ownership_domain": "navigation", "goal_id": "other"},
-                                                     correlation=correlation)
-        self.assertEqual(self.locks.held_resources(task_id), ("map_workspace",))
-        self.assertTrue(self.manager.release_resource_quarantine(task_id, proof=correlation, correlation=correlation))
-        self.assertEqual(self.manager.get_task_status(task_id), before)
+        error = self.manager.get_task_error_payload(task_id)
+        self.assertEqual(error["code"], "parking_unconfirmed")
+        self.assertEqual(error["details"]["goal_id"], "offline-goal")
         self.assertEqual(self.locks.held_resources(task_id), ())
         self.assertEqual(self.manager.capture_task_receipt(task_id).snapshot()["events"][-1].event_type,
-                         "task.resource_quarantine_released")
+                         "task.failed")
 
     def test_committed_success_and_valid_interrupt_proofs_unchanged(self):
         for commit in (False, True):
@@ -361,7 +356,7 @@ class ReceiptEvidenceChecks(unittest.TestCase):
             release.set()
             self.manager.wait_for_task(task_id, timeout=2)
             self.assertEqual(self.manager.get_task_status(task_id).state, "succeeded" if commit else "cancelled")
-            self.assertFalse(self.manager._records[task_id].resource_quarantined)
+            self.assertTrue(self.manager._records[task_id].resources_released)
 
 
     def test_snapshot_metadata_selected_copies_and_revision_isolation(self):

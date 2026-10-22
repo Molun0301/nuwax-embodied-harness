@@ -25,23 +25,7 @@ use prost::Message;
 mod native_fixture_proto {
     tonic::include_proto!("nuwax.geometry");
 
-    impl std::fmt::Debug for ExplorationRecoveryGuardProof {
-        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str("ExplorationRecoveryGuardProof([REDACTED])")
-        }
-    }
 
-    impl std::fmt::Debug for RecoverExplorationAfterNavigationRolloverRequest {
-        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str("RecoverExplorationAfterNavigationRolloverRequest([REDACTED])")
-        }
-    }
-
-    impl std::fmt::Debug for ReconcileExplorationAfterGlobalStopRequest {
-        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str("ReconcileExplorationAfterGlobalStopRequest([REDACTED])")
-        }
-    }
 }
 
 #[cfg(all(feature = "nuwax-lio-test-child", target_os = "linux"))]

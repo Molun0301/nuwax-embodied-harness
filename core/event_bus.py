@@ -40,7 +40,6 @@ def _has_metadata_value(value: Any) -> bool:
 
 _TERMINAL_EVENT_TYPES = frozenset({
     "task.succeeded", "task.failed", "task.cancelled", "task.timeout",
-    "task.resource_quarantined",
 })
 
 
@@ -483,7 +482,6 @@ class EventBus:
             "task.failed": RuntimeEventSeverity.ERROR,
             "task.timeout": RuntimeEventSeverity.ERROR,
             "task.cancelled": RuntimeEventSeverity.WARNING,
-            "task.resource_quarantined": RuntimeEventSeverity.ERROR,
         }.get(task_event.event_type, RuntimeEventSeverity.INFO)
         if task_event.state is not None:
             payload["state"] = task_event.state.value

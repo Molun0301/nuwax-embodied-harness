@@ -42,7 +42,7 @@ impl NavMotionPort for FakeMotion {
         self.state.lock().expect("fake motion state").acquire_count += 1;
         Ok(LeaseProof {
             lease_id: 1,
-            guard_generation: admission.guard_generation,
+
         })
     }
 
@@ -114,24 +114,10 @@ impl NavPlanner for FakePlanner {
 
 fn identity(session_id: &str, path_revision: i64) -> PathExecutionIdentity {
     PathExecutionIdentity {
+        goal_key: nuwax_nav_types_messages::GoalKey { producer_runtime_generation: (1) as u64, goal_generation: (1) as u64 },
         session_id: session_id.to_string(),
-        owner_kind: 1,
-        parent_request_id: format!("nav_scheduler_20hz_baseline-request-{session_id}"),
-        goal_generation: 1,
-        producer: "nav_scheduler_20hz_baseline".to_string(),
-        producer_epoch: 1,
-        producer_runtime_generation: 1,
-        committed_map_session_id: "nav_scheduler_20hz_baseline-map".to_string(),
-        committed_map_session_generation: 1,
-        committed_map_revision: 1,
-        committed_map_boot_nonce: [3; 16],
-        committed_map_commit_sequence: 1,
-        committed_map_source_timestamp_ns: 1,
-        committed_map_frame_id: "map".to_string(),
-        boundary_id: String::new(),
-        motion_guard_generation: 7,
-        motion_guard_boot_nonce: [7; 16],
-        motion_stop_generation: 1,
+
+
         planner_runtime_generation: if path_revision == 0 { 0 } else { 1 },
         path_revision: path_revision as u64,
     }
@@ -144,9 +130,9 @@ fn session() -> NavSession {
         goal: ExecutionGoal::Body(nuwax_nav_astar::helpers::make_pose_stamped("map", 2.0, 0.0, 0.0)),
         session_id: "nav_scheduler_20hz_baseline-nav".to_string(),
         execution_identity: identity("nav_scheduler_20hz_baseline-nav", 0),
-        local_owner_runtime_generation: 1,
+
         motion_admission: NavMotionAdmission {
-            guard_generation: 7,
+
             guard_boot_nonce: [7; 16],
             motion_stop_generation: 1,
         },

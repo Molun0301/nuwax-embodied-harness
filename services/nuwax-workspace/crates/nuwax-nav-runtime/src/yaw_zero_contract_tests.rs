@@ -72,7 +72,6 @@ async fn yaw_zero_observe_after_real_stop(
     assert!(scheduler.status.last_terminal.is_none());
     assert!(!scheduler.lease_active);
     let pending = scheduler.arrival_confirmation.as_ref().expect("real follower arrival event");
-    validate_fence(&pending.proof).unwrap();
     let confirmed_at = pending.confirmed_at;
     assert_eq!(motion.lock().unwrap().calls.iter().filter(|c| c.starts_with("fence:")).count(), 1);
     scheduler.session_tick(status).await.unwrap();

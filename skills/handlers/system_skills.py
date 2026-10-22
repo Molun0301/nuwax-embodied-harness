@@ -12,10 +12,12 @@ capture_image 归属见 §4 决策（本批暂不下放，归后续感知批 / �
 
 from __future__ import annotations
 
+from skills.handlers.motion_skills import _guard_error
+
 import uuid
 from typing import Any, Dict, Optional
 
-from core.errors import GatewayError
+from core.errors import GatewayError, MotionGuardFacadeError
 from skills.common import params  # noqa: F401  # 供后续下放 handler 复用参数校验
 from skills.common.context import SkillContext
 
@@ -64,7 +66,7 @@ def handle_stop_all_motion(
     *,
     requested_by: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """普通全局停车；成功必须包含关联的 zero/fence 证明。
+    """普通全局停车；保留实际守卫停稳结果与错误。
 
     迁移自 GatewayRuntime._handle_stop_all_motion；self.safety_guard→ctx.safety_guard。
     """
@@ -78,9 +80,13 @@ def handle_stop_all_motion(
             reason,
             operation_id=operation_id,
         )
+    except GatewayError:
+        raise
+    except MotionGuardFacadeError as exc:
+        raise _guard_error("stop_all_motion", exc) from exc
     except Exception as exc:
         raise GatewayError(
-            "已取消本地运动任务，但未能确认机器人完成全局停车。",
+            "未能确认机器人完成全局停车。",
             error_code="MOTION_STOP_UNCONFIRMED",
             http_status=503,
             jsonrpc_code=-32010,
@@ -90,26 +96,4 @@ def handle_stop_all_motion(
                 "error": str(exc),
             },
         ) from exc
-    if result.get("completed") is not True:
-        evidence = dict(result.get("resource_release_evidence") or {})
-        raise GatewayError(
-            "机器人已归零，但运动 ownership 收敛仍待确认。",
-            error_code="MOTION_STOP_RECONCILIATION_PENDING",
-            http_status=503,
-            jsonrpc_code=-32010,
-            details={
-                "reason": reason,
-                "operation_id": operation_id,
-                "motion_stop_generation": result.get(
-                    "motion_stop_generation"
-                ),
-                "reconciliation_pending": True,
-                "resource_release_deferred": bool(
-                    result.get("resource_release_deferred")
-                ),
-                "pending_handlers": list(
-                    evidence.get("pending_handlers") or ()
-                ),
-            },
-        )
     return ctx.serialize(result)

@@ -537,44 +537,6 @@ def _reject_duplicate_keys(pairs):
     return result
 
 
-def validate_actuator_manifest(path: Path) -> bytes:
-    if path.is_symlink() or not path.is_file():
-        raise DeploymentError(f"actuator manifest must be a non-symlink regular file: {path}")
-    payload = path.read_bytes()
-    if not payload or len(payload) > 1024 * 1024:
-        raise DeploymentError("actuator manifest must be between 1 byte and 1 MiB")
-    try:
-        document = json.loads(payload.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
-        raise DeploymentError(f"invalid actuator manifest JSON: {exc}") from exc
-    if not isinstance(document, dict) or not isinstance(document.get("symbols"), list):
-        raise DeploymentError("actuator manifest requires a top-level symbols array")
-    unknown = sorted(set(document) - {"schema_version", "source", "symbols"})
-    if unknown:
-        raise DeploymentError(f"actuator manifest contains unknown field: {unknown[0]}")
-    if "schema_version" in document and document["schema_version"] != 1:
-        raise DeploymentError("actuator manifest schema_version must be 1")
-    if "source" in document and (not isinstance(document["source"], str) or not document["source"].strip()):
-        raise DeploymentError("actuator manifest source must be a non-empty string")
-    symbols = document["symbols"]
-    if not symbols:
-        raise DeploymentError("actuator manifest symbols must not be empty")
-    if not all(
-        isinstance(symbol, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9_.:-]{0,127}", symbol) for symbol in symbols
-    ):
-        raise DeploymentError("actuator manifest contains an invalid symbol")
-    if len(set(symbols)) != len(symbols):
-        raise DeploymentError("actuator manifest symbols must be unique")
-    metadata = path.stat()
-    if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-        raise DeploymentError("actuator manifest must not be group/world writable")
-    allowed_owners = {0}
-    sudo_uid = os.environ.get("SUDO_UID", "")
-    if sudo_uid.isdigit():
-        allowed_owners.add(int(sudo_uid))
-    if os.geteuid() == 0 and metadata.st_uid not in allowed_owners:
-        raise DeploymentError("actuator manifest must be owned by root or the invoking sudo user")
-    return payload
 
 
 def validate_bundle_public_key(profile, options, public_key: Path) -> Path:
@@ -1478,9 +1440,6 @@ def preflight(context: ExecutionContext) -> None:
     if profile.robot == "go2":
         _resolve_go2_artifacts(context)
         _verify_source_artifacts(context)
-    if not options.no_systemd:
-        manifest = _require_file(options.actuator_manifest, "actuator symbols manifest")
-        context.notes["actuator_manifest_payload"] = validate_actuator_manifest(manifest)
     minimum_free_gb = int(profile.metadata.get("minimum_free_gb", 30))
     for label, requested in (
         ("source", options.source_root),
@@ -3765,36 +3724,6 @@ def install_systemd(context: ExecutionContext) -> None:
             os.chmod(path, 0o640)
 
 
-def provision_safety(context: ExecutionContext) -> None:
-    manifest = _require_file(context.options.actuator_manifest, "actuator symbols manifest")
-    expected = context.notes.get("actuator_manifest_payload")
-    snapshot_dir = _prepare_backup_root(context) / "inputs"
-    if snapshot_dir.is_symlink():
-        raise DeploymentError(f"deployment input snapshot path is a symlink: {snapshot_dir}")
-    snapshot_dir.mkdir(parents=True, exist_ok=True)
-    os.chmod(snapshot_dir, 0o700)
-    snapshot = snapshot_dir / "actuator-symbols.json"
-    fd, temp_name = tempfile.mkstemp(prefix=".actuator-symbols.", dir=snapshot_dir)
-    temporary = Path(temp_name)
-    try:
-        with manifest.open("rb") as source, os.fdopen(fd, "wb") as output:
-            shutil.copyfileobj(source, output)
-            output.flush()
-            os.fsync(output.fileno())
-        os.chmod(temporary, 0o600)
-        payload = validate_actuator_manifest(temporary)
-        if expected and payload != expected:
-            raise DeploymentError("actuator manifest changed after preflight")
-        os.replace(temporary, snapshot)
-        fsync_directory(snapshot_dir)
-    finally:
-        temporary.unlink(missing_ok=True)
-    script = _require_file(_deployment_script(context), "release systemd installer")
-    context.runner.run(
-        ("bash", str(script), "provision", str(snapshot)),
-        env=_deployment_env(context),
-        timeout=300,
-    )
 
 
 def _service_activation_contract(profile) -> Tuple[FrozenSet[str], FrozenSet[str]]:

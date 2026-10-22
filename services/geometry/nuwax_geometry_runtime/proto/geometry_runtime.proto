@@ -689,6 +689,8 @@ enum NavigationOwnerKind {
 }
 
 message NavigationGoal {
+  reserved 9;
+  reserved "motion_guard_generation";
   reserved 4, 5;
   reserved "map_revision", "map_version_id";
   Pose pose = 1;
@@ -697,7 +699,6 @@ message NavigationGoal {
   string parent_request_id = 6;
   uint64 goal_generation = 7;
   NavigationOwnerKind owner_kind = 8;
-  uint64 motion_guard_generation = 9;
   bytes motion_guard_boot_nonce = 10;
   uint64 motion_stop_generation = 11;
   bool allow_reverse = 12;
@@ -713,8 +714,12 @@ message CancelNavigationRequest {
   string parent_request_id = 3;
   uint64 goal_generation = 4;
   uint64 producer_runtime_generation = 5;
+  // 复用本次已完成的普通全局停车回执，精确收尾原目标。
+  OrdinaryGlobalStopConfirmation global_stop_confirmation = 6;
 }
 message NavigationState {
+  reserved 11;
+  reserved "guard_generation";
   reserved 13, 22, 23, 24;
   reserved "planner_map_revision", "map_version_id", "goal_payload_sha256", "path_payload_sha256";
   string status = 1;
@@ -727,7 +732,6 @@ message NavigationState {
   bool actuator_zeroed = 8;
   string reason_code = 9;
   uint64 runtime_generation = 10;
-  uint64 guard_generation = 11;
   bool sink_ready = 12;
   string planner_map_frame = 14;
   string planner_pose_frame = 15;
@@ -824,6 +828,8 @@ message ExplorationStopConditions {
 // strategy 取值:`"wavefront"` / `"tare"` / `"highest_score"` / `"first_available"`
 // （与 dimos `ExplorationArbitrationPolicy` enum 字符串名一致）。
 message ExploreRequest {
+  reserved 11;
+  reserved "motion_guard_generation";
   reserved 3, 5;
   reserved "map_version_id", "map_revision";
   string strategy = 1;
@@ -836,7 +842,6 @@ message ExploreRequest {
   double blacklist_radius_m = 9;
   // A request has one authoritative boundary frame; production accepts map.
   string boundary_frame_id = 10;
-  uint64 motion_guard_generation = 11;
   bytes motion_guard_boot_nonce = 12;
   uint64 motion_stop_generation = 13;
   // 总行程是路径预算，不能换算为未标定电池能耗；缺省保持原探索行为。
@@ -849,8 +854,17 @@ message ExplorationReturnPolicy {
   double reserve_distance_m = 2;
   bool return_on_completion = 3;
 }
+// 复用本次普通全局停车的真实结果，不创建另一轮停车或恢复围栏。
+message OrdinaryGlobalStopConfirmation {
+  string operation_id = 1;
+  string zero_ack_id = 2;
+  uint64 applied_monotonic_ns = 3;
+  bool stationary_confirmed = 4;
+}
 message StopExplorationRequest {
   string request_id = 1;
+  OrdinaryGlobalStopConfirmation global_stop_confirmation = 2;
+  uint64 expected_exploration_generation = 3;
 }
 message ExplorationProgressRequest { string request_id = 1; }
 message ExplorationProgressResponse { string checkpoint_json = 1; }
@@ -863,64 +877,9 @@ message ExplorationChildLease {
   reserved 6;
   reserved "goal_payload_sha256";
 }
-message ExplorationRecoveryGuardProof {
-  string stop_operation_id = 1;
-  uint64 guard_generation = 2;
-  bytes guard_boot_nonce = 3;
-  uint64 motion_stop_generation = 4;
-  string zero_ack_id = 5;
-  uint64 zero_applied_monotonic_ns = 6;
-  bytes recovery_fence_token = 7;
-  string recovery_correlation = 8;
-}
-message RecoverExplorationAfterNavigationRolloverRequest {
-  string request_id = 1;
-  uint64 exploration_generation = 2;
-  ExplorationChildLease child_lease = 3;
-  uint64 expected_navigation_runtime_generation = 4;
-  uint64 observed_navigation_runtime_generation = 5;
-  ExplorationRecoveryGuardProof guard_proof = 6;
-}
-message ReconcileExplorationAfterGlobalStopRequest {
-  string request_id = 1;
-  uint64 exploration_generation = 2;
-  ExplorationChildLease child_lease = 3;
-  uint64 cancel_generation = 4;
-  string recovery_correlation = 5;
-  uint64 admission_guard_generation = 6;
-  bytes admission_guard_boot_nonce = 7;
-  uint64 admission_motion_stop_generation = 8;
-  ExplorationRecoveryGuardProof held_guard_proof = 9;
-}
-message ExplorationGlobalStopReconciliation {
-  bool eligible = 1;
-  uint64 cancel_generation = 2;
-  string recovery_correlation = 3;
-  uint64 admission_guard_generation = 4;
-  bytes admission_guard_boot_nonce = 5;
-  uint64 admission_motion_stop_generation = 6;
-}
-message ExplorationOwnershipReconciliationReceipt {
-  string cause = 1;
-  string recovery_correlation = 2;
-  string parent_request_id = 3;
-  uint64 exploration_generation = 4;
-  // Legacy committed receipt only. New receipts use child_lease exclusively.
-  string child_lease_fingerprint = 5;
-  uint64 cancel_generation = 6;
-  string commit_disposition = 7;
-  ExplorationChildLease child_lease = 8;
-}
-message AcknowledgeExplorationOwnershipReconciliationRequest {
-  string recovery_correlation = 1;
-  // Legacy opaque acknowledgement only; never combine with child_lease.
-  string child_lease_fingerprint = 2;
-  ExplorationChildLease child_lease = 3;
-}
-message AcknowledgeExplorationOwnershipReconciliationResult {
-  bool acknowledged = 1;
-}
 message ExplorationState {
+  reserved 14, 15, 16;
+  reserved "rollover_recovery_eligible", "global_stop_reconciliation", "ownership_reconciliation_receipt";
   reserved 10, 11;
   reserved "map_version_id", "map_revision";
   string status = 1;
@@ -934,11 +893,10 @@ message ExplorationState {
   string child_task_id = 9;
   uint64 exploration_generation = 12;
   ExplorationChildLease child_lease = 13;
-  bool rollover_recovery_eligible = 14;
-  ExplorationGlobalStopReconciliation global_stop_reconciliation = 15;
-  ExplorationOwnershipReconciliationReceipt ownership_reconciliation_receipt = 16;
   // 只读版本化采样行程、原起点和返航阶段；没有启用策略时为空。
   string mission_progress_json = 17;
+  // 原请求仍有真实子取消或在途派发等待停车；业务终态不表示停车完成。
+  bool parking_pending = 18;
 }
 message ExplorationSourceDiag {
   string source_name = 1;
@@ -1041,6 +999,8 @@ message MappingCloudAuthority {
 }
 
 message MappingCloudGoalRequest {
+  reserved 16;
+  reserved "motion_guard_generation";
   reserved 7, 8, 10;
   reserved "asset_manifest_sha256", "asset_bundle_sha256", "activation_identity_sha256";
   string query_request_id = 1;
@@ -1056,7 +1016,6 @@ message MappingCloudGoalRequest {
   uint64 committed_occupancy_revision = 14;
   reserved 15;
   reserved "committed_occupancy_sha256";
-  uint64 motion_guard_generation = 16;
   bytes motion_guard_boot_nonce = 17;
   uint64 motion_stop_generation = 18;
   uint32 schema_version = 19;
@@ -1141,9 +1100,6 @@ service GeometryRuntime {
   //   "UNIMPLEMENTED" — Phase 5 stub 暂未接通 nuwax-exploration crate
   rpc StartExploration(ExploreRequest) returns (ExplorationState);
   rpc StopExploration(StopExplorationRequest) returns (ExplorationState);
-  rpc RecoverExplorationAfterNavigationRollover(RecoverExplorationAfterNavigationRolloverRequest) returns (ExplorationState);
-  rpc ReconcileExplorationAfterGlobalStop(ReconcileExplorationAfterGlobalStopRequest) returns (ExplorationState);
-  rpc AcknowledgeExplorationOwnershipReconciliation(AcknowledgeExplorationOwnershipReconciliationRequest) returns (AcknowledgeExplorationOwnershipReconciliationResult);
   rpc GetExplorationState(Empty) returns (ExplorationState);
   rpc GetExplorationProgress(ExplorationProgressRequest) returns (ExplorationProgressResponse);
   rpc GetExplorationDiagnostics(Empty) returns (ExplorationDiagnostics);

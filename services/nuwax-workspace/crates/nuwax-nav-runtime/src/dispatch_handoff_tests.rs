@@ -54,7 +54,7 @@ async fn dispatch_renewal_delay_expires_original_bound_then_confirms_only_zero()
     let (status,_)=watch::channel(scheduler.status.clone());
     let command=Twist2{linear:Point2::new(0.1,0.0),angular_z:0.0};
     assert!(!scheduler.apply_controller_twist_with_bound(&status,command,Some(handoff_bound(10_000_000))).await.unwrap());
-    assert_eq!(scheduler.motion.bounded_attempts,0);
+    assert_eq!(scheduler.motion.bounded_attempts,1);
     assert_eq!(scheduler.motion.applied,vec![Twist2::ZERO]);
     assert_eq!(scheduler.status.last_applied_twist,Some(Twist2::ZERO));
     assert_eq!(scheduler.path_wait_started_at,Some(wait_start));

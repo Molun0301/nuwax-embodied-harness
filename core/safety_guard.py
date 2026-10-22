@@ -1,20 +1,7 @@
 from __future__ import annotations
 
-from collections import OrderedDict
-from contextlib import contextmanager, nullcontext
-from copy import deepcopy
-from dataclasses import dataclass
 import threading
-from typing import (
-    Any,
-    Callable,
-    ContextManager,
-    Dict,
-    Iterable,
-    Iterator,
-    Optional,
-    Tuple,
-)
+from typing import Any, Callable, Dict, Optional
 import uuid
 
 from contracts.base import MetadataDict
@@ -23,42 +10,10 @@ from core.event_bus import EventBus
 from core.resource_lock import ResourceLockManager, RuntimeResource
 
 StopHandler = Callable[[Optional[str], str], Any]
-MotionResourceQuarantineProvider = Callable[
-    [], ContextManager[Iterable[str]]
-]
-
-_STOP_RESULT_CACHE_LIMIT = 128
-
-
-class MotionStopGenerationError(RuntimeError):
-    """A pre-stop request attempted to submit motion after a newer stop."""
-
-    def __init__(self, expected: int, current: int) -> None:
-        self.expected = expected
-        self.current = current
-        super().__init__(
-            "motion request was cancelled by stop generation rollover "
-            f"(expected={expected}, current={current})"
-        )
-
-
-@dataclass(frozen=True)
-class _MotionLeaseIdentity:
-    resource: str
-    task_id: str
-    acquired_at: str
-
-
-@dataclass
-class _PendingStopReconciliation:
-    result: MetadataDict
-    motion_leases: Tuple[_MotionLeaseIdentity, ...]
-    reason: Optional[str] = None
-    pending_handlers: Tuple[str, ...] = ()
 
 
 class SafetyGuard:
-    """无锁存的全局停车协调器。"""
+    """逐调用执行全局停车处理器，并释放本次捕获的原运动资源。"""
 
     def __init__(
         self,
@@ -69,58 +24,12 @@ class SafetyGuard:
         self._event_bus = event_bus
         self._resource_lock_manager = resource_lock_manager
         self._stop_handlers: Dict[str, StopHandler] = {}
-        self._motion_stop_generation = 0
-        self._motion_resource_quarantine_provider: Optional[
-            MotionResourceQuarantineProvider
-        ] = None
-        self._successful_stop_results: OrderedDict[str, MetadataDict] = OrderedDict()
-        self._pending_stop_reconciliations: OrderedDict[
-            str, _PendingStopReconciliation
-        ] = OrderedDict()
-        self._stop_execution_lock = threading.RLock()
         self._lock = threading.RLock()
 
-    @property
-    def motion_stop_generation(self) -> int:
-        """返回用于取消旧运动请求的本地单调代次。"""
-
-        with self._lock:
-            return self._motion_stop_generation
-
-    def begin_motion_admission(self) -> int:
-        """Wait for an in-flight stop, then snapshot the admission generation."""
-
-        with self._stop_execution_lock:
-            with self._lock:
-                return self._motion_stop_generation
-
-    @contextmanager
-    def motion_submission(self, expected_generation: int) -> Iterator[None]:
-        """Serialize the final pre-submit check against ordinary stop-all."""
-
-        with self._stop_execution_lock:
-            with self._lock:
-                current = self._motion_stop_generation
-            if expected_generation != current:
-                raise MotionStopGenerationError(expected_generation, current)
-            yield
-
     def register_stop_handler(self, name: str, handler: StopHandler) -> None:
-        """注册安全停机处理器。"""
-
+        """注册停车处理器；调用时捕获本次注册集合。"""
         with self._lock:
             self._stop_handlers[name] = handler
-
-    def register_motion_resource_quarantine_provider(
-        self,
-        provider: MotionResourceQuarantineProvider,
-    ) -> None:
-        """注册运动资源隔离任务快照提供器。"""
-
-        if not callable(provider):
-            raise TypeError("motion resource quarantine provider 必须可调用。")
-        with self._lock:
-            self._motion_resource_quarantine_provider = provider
 
     def stop_all_motion(
         self,
@@ -128,307 +37,43 @@ class SafetyGuard:
         *,
         operation_id: Optional[str] = None,
     ) -> MetadataDict:
-        """执行一次普通全局停车，不改变后续请求的运动资格。"""
-
-        correlated_operation_id = str(operation_id or uuid.uuid4().hex).strip()
-        if not correlated_operation_id:
-            correlated_operation_id = uuid.uuid4().hex
-
-        result: Optional[MetadataDict] = None
-        stop_error: Optional[Exception] = None
-        stop_traceback = None
-        stop_generation = -1
-        with self._stop_execution_lock:
-            cached = self._successful_stop_results.get(correlated_operation_id)
-            if cached is not None:
-                self._successful_stop_results.move_to_end(correlated_operation_id)
-                result = deepcopy(cached)
-                result["pending_reconciliation_count"] = len(self._pending_stop_reconciliations)
-                return result
-
-            try:
-                pending = self._pending_stop_reconciliations.get(
-                    correlated_operation_id
-                )
-                replay_pending_handlers = pending is not None
-                if pending is None:
-                    with self._lock:
-                        handlers = tuple(self._stop_handlers.items())
-                        self._motion_stop_generation += 1
-                        stop_generation = self._motion_stop_generation
-
-                    motion_leases = self._snapshot_motion_leases()
-                    handler_results: Dict[str, Any] = {}
-                    for name, handler in handlers:
-                        handler_results[name] = handler(
-                            reason, correlated_operation_id
-                        )
-                    result = {
-                        "stopped": True,
-                        "reason": reason,
-                        "operation_id": correlated_operation_id,
-                        "motion_stop_generation": stop_generation,
-                        "handler_results": handler_results,
-                    }
-                    pending_handlers = tuple(
-                        name
-                        for name, handler_result in handler_results.items()
-                        if isinstance(handler_result, dict)
-                        and handler_result.get("reconciliation_pending") is True
-                    )
-                    self._pending_stop_reconciliations[
-                        correlated_operation_id
-                    ] = _PendingStopReconciliation(
-                        result=deepcopy(result),
-                        motion_leases=motion_leases,
-                        reason=reason,
-                        pending_handlers=pending_handlers,
-                    )
-                else:
-                    stop_generation = int(
-                        pending.result["motion_stop_generation"]
-                    )
-                result = self._reconcile_pending_stop(
-                    correlated_operation_id,
-                    replay_pending_handlers=replay_pending_handlers,
-                )
-            except Exception as exc:
-                stop_error = exc
-                stop_traceback = exc.__traceback__
-
-        if stop_error is not None:
-            if self._event_bus is not None:
-                self._event_bus.publish(
-                    self._event_bus.build_event(
-                        "motion.stop_unconfirmed",
-                        category=RuntimeEventCategory.SAFETY,
-                        source="safety_guard",
-                        severity=RuntimeEventSeverity.ERROR,
-                        message=reason or "全局停车未取得确认。",
-                        payload={
-                            "operation_id": correlated_operation_id,
-                            "motion_stop_generation": stop_generation,
-                            "error": str(stop_error),
-                        },
-                    )
-                )
-            raise stop_error.with_traceback(stop_traceback)
-
-        assert result is not None
-        # 未确认票据属于尚未结束的责任，不能挤占新停车的执行资格。
-        # 数量按当前事实报告；仅成功回执使用有界缓存。
-        with self._stop_execution_lock:
-            result["pending_reconciliation_count"] = len(self._pending_stop_reconciliations)
-
-        if self._event_bus is not None and result.get("completed") is True:
-            self._event_bus.publish(
-                self._event_bus.build_event(
-                    "motion.stop_completed",
-                    category=RuntimeEventCategory.SAFETY,
-                    source="safety_guard",
-                    severity=RuntimeEventSeverity.INFO,
-                    message=reason or "全局停车已确认。",
-                    payload=result,
-                )
-            )
-        elif self._event_bus is not None:
-            self._event_bus.publish(
-                self._event_bus.build_event(
-                    "motion.stop_reconciliation_pending",
-                    category=RuntimeEventCategory.SAFETY,
-                    source="safety_guard",
-                    severity=RuntimeEventSeverity.WARNING,
-                    message=reason or "全局停车已归零，所有权收敛仍在等待。",
-                    payload=result,
-                )
-            )
-        return deepcopy(result)
-
-    def _reconcile_pending_stop(
-        self,
-        operation_id: str,
-        *,
-        replay_pending_handlers: bool,
-    ) -> MetadataDict:
-        pending = self._pending_stop_reconciliations[operation_id]
-        result = deepcopy(pending.result)
-        still_pending = list(pending.pending_handlers)
-        if pending.pending_handlers and replay_pending_handlers:
-            still_pending = []
-            with self._lock:
-                handlers = dict(self._stop_handlers)
-            handler_results = dict(result.get("handler_results") or {})
-            for name in pending.pending_handlers:
-                handler = handlers.get(name)
-                if handler is None:
-                    handler_results[name] = {
-                        "reconciliation_pending": True,
-                        "error": "registered stop handler disappeared before replay",
-                    }
-                    still_pending.append(name)
-                    continue
-                try:
-                    handler_result = handler(pending.reason, operation_id)
-                except Exception as exc:
-                    handler_result = {
-                        "reconciliation_pending": True,
-                        "error": str(exc),
-                    }
-                handler_results[name] = handler_result
-                if (
-                    isinstance(handler_result, dict)
-                    and handler_result.get("reconciliation_pending") is True
-                ):
-                    still_pending.append(name)
-            result["handler_results"] = handler_results
-        if still_pending:
-            result["completed"] = False
-            result["reconciliation_pending"] = True
-            result["resource_release_deferred"] = True
-            result["resource_release_evidence"] = {
-                "deferred": True,
-                "pending_handlers": list(still_pending),
-            }
-            self._pending_stop_reconciliations[operation_id] = (
-                _PendingStopReconciliation(
-                    result=deepcopy(result),
-                    motion_leases=pending.motion_leases,
-                    reason=pending.reason,
-                    pending_handlers=tuple(still_pending),
-                )
-            )
-            return result
-        release_evidence = self._release_motion_resources(
-            pending.motion_leases
-        )
-        release_deferred = bool(release_evidence["deferred"])
-        result["completed"] = not release_deferred
-        result["reconciliation_pending"] = release_deferred
-        result["resource_release_deferred"] = release_deferred
-        result["resource_release_evidence"] = release_evidence
-        if release_deferred:
-            self._pending_stop_reconciliations[operation_id] = (
-                _PendingStopReconciliation(
-                    result=deepcopy(result),
-                    motion_leases=pending.motion_leases,
-                    reason=pending.reason,
-                    pending_handlers=(),
-                )
-            )
-            return result
-
-        self._pending_stop_reconciliations.pop(operation_id, None)
-        self._successful_stop_results[operation_id] = deepcopy(result)
-        while len(self._successful_stop_results) > _STOP_RESULT_CACHE_LIMIT:
-            self._successful_stop_results.popitem(last=False)
-        return result
-
-    def _snapshot_motion_leases(self) -> Tuple[_MotionLeaseIdentity, ...]:
-        manager = self._resource_lock_manager
-        if manager is None:
-            return ()
-        resources = {
-            RuntimeResource.BASE_MOTION.value,
-            RuntimeResource.NAVIGATION.value,
-        }
-        return tuple(
-            _MotionLeaseIdentity(
-                resource=lease.resource,
-                task_id=lease.task_id,
-                acquired_at=lease.acquired_at,
-            )
-            for lease in manager.snapshot()
-            if lease.resource in resources
-        )
-
-    def _release_motion_resources(
-        self,
-        motion_leases: Tuple[_MotionLeaseIdentity, ...],
-    ) -> MetadataDict:
-        manager = self._resource_lock_manager
+        operation = str(operation_id or uuid.uuid4().hex).strip() or uuid.uuid4().hex
         with self._lock:
-            provider = self._motion_resource_quarantine_provider
-
-        evidence: MetadataDict = {
-            "quarantine_provider_configured": provider is not None,
-            "quarantine_check_succeeded": True,
-            "quarantined_task_ids": [],
-            "released_leases": [],
-            "retained_leases": [],
-            "already_released_leases": [],
-            "replacement_leases": [],
-            "release_errors": [],
-            "deferred": False,
-        }
-        if manager is None:
-            return evidence
-
-        try:
-            quarantine_context = (
-                provider() if provider is not None else nullcontext(())
-            )
-            with quarantine_context as quarantine_snapshot:
-                quarantined_task_ids = {
-                    str(task_id).strip()
-                    for task_id in quarantine_snapshot
-                    if str(task_id).strip()
-                }
-                current_by_resource = {
-                    lease.resource: lease for lease in manager.snapshot()
-                }
-                evidence["quarantined_task_ids"] = sorted(
-                    quarantined_task_ids
-                )
-                for lease in motion_leases:
-                    lease_evidence = {
-                        "resource": lease.resource,
-                        "task_id": lease.task_id,
-                        "acquired_at": lease.acquired_at,
-                    }
-                    current = current_by_resource.get(lease.resource)
-                    if current is None:
-                        evidence["already_released_leases"].append(
-                            lease_evidence
-                        )
-                        continue
-                    if (
-                        current.task_id != lease.task_id
-                        or current.acquired_at != lease.acquired_at
-                    ):
-                        evidence["replacement_leases"].append(
-                            {
-                                **lease_evidence,
-                                "replacement_task_id": current.task_id,
-                                "replacement_acquired_at": current.acquired_at,
-                            }
-                        )
-                        continue
-                    if lease.task_id in quarantined_task_ids:
-                        evidence["retained_leases"].append(lease_evidence)
-                        continue
-
-                    # The provider's coordination lock remains held across
-                    # this task-scoped ResourceLockManager transaction.
-                    try:
-                        manager.release(lease.task_id, [lease.resource])
-                    except Exception as exc:
-                        evidence["retained_leases"].append(lease_evidence)
-                        evidence["release_errors"].append(
-                            {**lease_evidence, "error": str(exc)}
-                        )
-                    else:
-                        evidence["released_leases"].append(lease_evidence)
-        except Exception as exc:
-            evidence["quarantine_check_succeeded"] = False
-            evidence["quarantine_error"] = str(exc)
-            evidence["retained_leases"] = [
-                {
-                    "resource": lease.resource,
-                    "task_id": lease.task_id,
-                    "acquired_at": lease.acquired_at,
-                }
-                for lease in motion_leases
-            ]
-
-        evidence["deferred"] = bool(evidence["retained_leases"])
-        return evidence
+            handlers = tuple(self._stop_handlers.items())
+        manager = self._resource_lock_manager
+        motion_resources = {RuntimeResource.BASE_MOTION.value, RuntimeResource.NAVIGATION.value}
+        leases = tuple((lease, lease.task_id) for lease in manager.snapshot()
+                       if lease.resource in motion_resources) if manager is not None else ()
+        handler_results: Dict[str, Any] = {}
+        failures = []
+        first_error = None
+        for name, handler in handlers:
+            try:
+                handler_results[name] = handler(reason, operation)
+            except Exception as error:
+                failures.append({"handler": name, "type": type(error).__name__, "message": str(error)})
+                if first_error is None:
+                    first_error = error
+        released = []
+        for lease, task_id in leases:
+            try:
+                if manager.release_if_current(lease, task_id=task_id):
+                    released.append({"resource": lease.resource, "task_id": task_id})
+            except Exception as error:
+                failures.append({"resource": lease.resource, "task_id": task_id,
+                                 "type": type(error).__name__, "message": str(error)})
+                if first_error is None:
+                    first_error = error
+        result = {"stopped": first_error is None, "reason": reason, "operation_id": operation,
+                  "handler_results": handler_results, "released_resources": released}
+        if self._event_bus is not None:
+            self._event_bus.publish(self._event_bus.build_event(
+                "motion.stop_unconfirmed" if first_error is not None else "motion.stop_completed",
+                category=RuntimeEventCategory.SAFETY, source="safety_guard",
+                severity=RuntimeEventSeverity.ERROR if first_error is not None else RuntimeEventSeverity.INFO,
+                message=reason or ("全局停车未取得确认。" if first_error is not None else "全局停车已确认。"),
+                payload={**result, "failures": failures} if failures else result,
+            ))
+        if first_error is not None:
+            raise first_error
+        return result

@@ -91,7 +91,6 @@ def _add_common_flags(parser: argparse.ArgumentParser) -> None:
     cyclone = parser.add_mutually_exclusive_group()
     cyclone.add_argument("--cyclonedds-source", type=Path)
     cyclone.add_argument("--cyclonedds-wheel", type=Path)
-    parser.add_argument("--actuator-manifest", type=Path)
     parser.add_argument("--dds-interface", default="")
     parser.add_argument(
         "--go2-robot-ip",
@@ -237,7 +236,6 @@ def _options(args: argparse.Namespace, *, dry_run: bool) -> DeploymentOptions:
         clip_wheel=args.clip_wheel.expanduser().resolve() if args.clip_wheel else None,
         cyclonedds_source=(args.cyclonedds_source.expanduser().resolve() if args.cyclonedds_source else None),
         cyclonedds_wheel=(args.cyclonedds_wheel.expanduser().resolve() if args.cyclonedds_wheel else None),
-        actuator_manifest=(args.actuator_manifest.expanduser().resolve() if args.actuator_manifest else None),
         dds_interface=args.dds_interface,
         go2_robot_ip=str(args.go2_robot_ip or "").strip(),
         gateway_host=gateway_host,

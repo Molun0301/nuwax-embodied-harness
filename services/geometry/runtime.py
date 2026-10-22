@@ -40,7 +40,6 @@ from contracts.navigation import (
     ExplorationState,
     ExplorationStatus,
     ExploreAreaRequest,
-    NavigationStatus,
 )
 from contracts.runtime_views import MapSnapshot
 from providers.data_plane import (
@@ -63,8 +62,6 @@ from services.geometry.geometry_runtime_provider import (
     GeometryRuntimeMapActivationAppliedError,
     GeometryRuntimeMapActivationOutcomeUnknown,
     MappingBackendCheckpointExportBundle,
-    _exploration_child_lease_address,
-    _exploration_receipt_matches_child,
     _assigned_mapping_predecessor,
     _AssignedNativeLocalizationSample,
     _mapping_state_document,
@@ -156,6 +153,7 @@ _SUPPORTED_MAPPING_BACKEND_KINDS: FrozenSet[str] = frozenset(
 )
 
 if TYPE_CHECKING:
+    from services.navigation.motion_guard_client import StopAllMotionConfirmation
     from core.event_bus import EventBus
 
 LOGGER = logging.getLogger("nuwax_robot_bridge.geometry.runtime")
@@ -525,6 +523,7 @@ def _is_complete_exploration_terminal(
         _exploration_state_request_id(state) == str(request_id or "").strip()
         and status in terminal_statuses
         and metadata.get("exploration_terminal") is True
+        and metadata.get("parking_pending") is not True
         and not _exploration_state_child_task_id(state)
         and metadata.get("child_lease") is None
     )
@@ -8032,7 +8031,9 @@ class PlatformGeometryProviderBundle(
         request_id: Optional[str] = None,
         *,
         deadline_monotonic: Optional[float] = None,
+        global_stop_confirmation: Optional[StopAllMotionConfirmation] = None,
     ) -> bool:
+        """按原目标直达后端；精确身份与停车证明由拥有方裁决。"""
         _exploration_deadline_remaining(deadline_monotonic, "CancelNavigation")
         exact_goal_id = str(request_id or "").strip()
         if not exact_goal_id:
@@ -8043,85 +8044,28 @@ class PlatformGeometryProviderBundle(
         backend = self.runtime._resolve_navigation_backend()
         if backend is None:
             return False
-        state_getter = getattr(backend, "get_navigation_state", None)
-        if not callable(state_getter):
-            return False
-        try:
-            if deadline_monotonic is None:
-                state = state_getter()
-            else:
-                state = state_getter(deadline_monotonic=deadline_monotonic)
-        except GeometryRuntimeRpcError:
-            raise
-        except Exception:
-            LOGGER.exception("导航取消前读取 backend exact goal 失败。")
-            return False
-        active_goal_id = str(
-            getattr(state, "current_goal_id", "") or ""
-        ).strip()
-        raw_status = getattr(state, "status", None)
-        active_status = str(
-            getattr(raw_status, "value", raw_status) or ""
-        ).strip().lower()
-        observed_goal_id = str(
-            dict(getattr(state, "metadata", {}) or {}).get("observed_goal_id") or ""
-        ).strip()
-        control_metadata = dict(getattr(state, "metadata", {}) or {})
-        if (control_metadata.get("ownership_retained") is True
-                and control_metadata.get("authority_current") is False):
-            return False
-        if (
-            active_goal_id != exact_goal_id
-            or (observed_goal_id and observed_goal_id != exact_goal_id)
-            or active_status
-            not in {
-                NavigationStatus.UNCONFIRMED.value,
-                NavigationStatus.ACCEPTED.value,
-                NavigationStatus.PLANNING.value,
-                NavigationStatus.RUNNING.value,
-            }
-        ):
-            LOGGER.warning(
-                "拒绝导航定向取消：requested_goal_id=%s active_goal_id=%s observed_goal_id=%s status=%s",
-                exact_goal_id,
-                active_goal_id or None,
-                observed_goal_id or None,
-                active_status or None,
-            )
-            return False
-        if deadline_monotonic is None:
-            return self._call_navigation_backend(
-                backend,
-                "cancel_goal",
-                request_id=exact_goal_id,
-            )
-        canceller = getattr(backend, "cancel_goal", None)
-        if not callable(canceller):
-            return False
-        return canceller(
-            request_id=exact_goal_id,
-            deadline_monotonic=deadline_monotonic,
-        )
+        options = {"request_id": exact_goal_id}
+        if deadline_monotonic is not None:
+            options["deadline_monotonic"] = deadline_monotonic
+        if global_stop_confirmation is not None:
+            options["global_stop_confirmation"] = global_stop_confirmation
+        return backend.cancel_goal(**options)
 
     def cancel_navigation(
         self,
         *,
         request_id: Optional[str] = None,
         deadline_monotonic: Optional[float] = None,
+        global_stop_confirmation: Optional[StopAllMotionConfirmation] = None,
     ) -> bool:
-        """扩展的导航取消入口（5.5 task）。
-
-        `request_id` 必须是当前 ACTIVE 的 exact goal 标识；缺失或与后端状态不匹配时
-        fail-closed，不发出 CancelNavigation RPC。
-
-        返回：是否成功发出取消请求。
-        """
+        """沿既有精确取消入口转交目标和可选普通全局停车回执。"""
 
         if not self._is_geometry_profile_enabled():
             return False
         return self.cancel_goal(
             request_id=str(request_id or "").strip() or None,
             deadline_monotonic=deadline_monotonic,
+            global_stop_confirmation=global_stop_confirmation,
         )
 
     def navigate(self, goal, timeout_sec: Optional[int] = None) -> str:
@@ -8745,6 +8689,8 @@ class PlatformGeometryProviderBundle(
         request_id: Optional[str] = None,
         *,
         deadline_monotonic: Optional[float] = None,
+        global_stop_confirmation: Optional[StopAllMotionConfirmation] = None,
+        expected_exploration_generation: Optional[int] = None,
     ) -> bool:
         _exploration_deadline_remaining(
             deadline_monotonic,
@@ -8805,7 +8751,13 @@ class PlatformGeometryProviderBundle(
                 deadline_monotonic,
                 "StopExploration",
             )
+            stop_options = {}
+            if global_stop_confirmation is not None:
+                stop_options["global_stop_confirmation"] = global_stop_confirmation
+            if expected_exploration_generation is not None:
+                stop_options["expected_exploration_generation"] = expected_exploration_generation
             result = remote.stop_exploration(
+                **stop_options,
                 request_id=correlated_id,
                 **(
                     {"deadline_monotonic": deadline_monotonic}
@@ -8882,347 +8834,8 @@ class PlatformGeometryProviderBundle(
             )
         return committed
 
-    def recover_exploration_after_navigation_rollover(
-        self,
-        *,
-        request_id: str,
-        exploration_generation: int,
-        child_lease: Dict[str, Any],
-        expected_navigation_runtime_generation: int,
-        observed_navigation_runtime_generation: int,
-        guard_proof: Dict[str, Any],
-    ) -> bool:
-        """Commit the exact safe-abort response for a retained child lease."""
 
-        correlated_id = str(request_id or "").strip()
-        expected_lease = dict(child_lease or {})
-        expected_runtime_generation = int(expected_navigation_runtime_generation)
-        observed_runtime_generation = int(observed_navigation_runtime_generation)
-        lock = getattr(self.runtime, "_exploration_loop_lock", None)
-        if (
-            not correlated_id
-            or lock is None
-            or int(exploration_generation) <= 0
-            or str(expected_lease.get("parent_request_id") or "").strip()
-            != correlated_id
-            or _exploration_child_lease_address(expected_lease) is None
-            or expected_runtime_generation <= 0
-            or observed_runtime_generation <= expected_runtime_generation
-        ):
-            return False
-        with lock:
-            current = getattr(self.runtime, "_external_exploration_request", None)
-            current_id = str(getattr(current, "request_id", "") or "").strip()
-            remote = self._resolve_remote_exploration_provider()
-            remote_token = (
-                _capture_remote_operation_token_locked(self.runtime, remote)
-                if remote is not None
-                else None
-            )
-            if current_id != correlated_id or remote_token is None:
-                return False
-        try:
-            result = remote.recover_exploration_after_navigation_rollover(
-                request_id=correlated_id,
-                exploration_generation=int(exploration_generation),
-                child_lease=expected_lease,
-                expected_navigation_runtime_generation=expected_runtime_generation,
-                observed_navigation_runtime_generation=observed_runtime_generation,
-                guard_proof=dict(guard_proof or {}),
-            )
-        except GeometryRuntimeRpcError:
-            raise
-        except Exception:
-            LOGGER.exception(
-                "Bundle rollover recovery gRPC failed for request_id=%s.",
-                correlated_id,
-            )
-            return False
-        if not isinstance(result, dict):
-            return False
-        exact_response = bool(
-            str(result.get("request_id") or "").strip() == correlated_id
-            and int(result.get("exploration_generation") or 0)
-            == int(exploration_generation)
-            and str(result.get("status") or "").strip().lower() == "failed"
-            and str(result.get("last_stop_reason") or "").strip()
-            == "runtime_rollover_aborted_safe"
-            and not str(result.get("child_task_id") or "").strip()
-            and result.get("child_lease") is None
-            and result.get("rollover_recovery_eligible") is False
-        )
-        if not exact_response:
-            return False
-        state = self._wrap_remote_exploration_state(result)
-        with lock:
-            if not _remote_operation_token_is_current_locked(
-                self.runtime,
-                remote_token,
-            ):
-                return False
-            current = getattr(self.runtime, "_external_exploration_request", None)
-            if str(getattr(current, "request_id", "") or "").strip() != correlated_id:
-                return False
-            committed = _commit_remote_exploration_state_locked(
-                self.runtime,
-                state,
-                request_id=correlated_id,
-            )
-        if committed:
-            self.runtime._notify_exploration_update(state)
-        return committed
 
-    def reconcile_exploration_after_global_stop(
-        self,
-        *,
-        request_id: str,
-        exploration_generation: int,
-        child_lease: Dict[str, Any],
-        cancel_generation: int,
-        recovery_correlation: str,
-        admission_guard_generation: int,
-        admission_guard_boot_nonce: bytes,
-        admission_motion_stop_generation: int,
-        held_guard_proof: Dict[str, Any],
-        deadline_monotonic: Optional[float] = None,
-    ) -> bool:
-        """Commit only an exact durable global-stop ownership receipt."""
-
-        _exploration_deadline_remaining(
-            deadline_monotonic,
-            "ReconcileExplorationAfterGlobalStop",
-        )
-        if not self._is_geometry_profile_enabled():
-            return False
-        correlated_id = str(request_id or "").strip()
-        expected_lease = dict(child_lease or {})
-        expected_generation = int(exploration_generation)
-        expected_cancel_generation = int(cancel_generation)
-        expected_correlation = str(recovery_correlation or "").strip()
-        expected_address = _exploration_child_lease_address(expected_lease)
-        if expected_address is not None:
-            expected_lease = dict(zip((
-                "session_id", "owner_kind", "parent_request_id", "goal_generation",
-                "producer_runtime_generation",
-            ), expected_address))
-        lock = getattr(self.runtime, "_exploration_loop_lock", None)
-        if (
-            not correlated_id
-            or lock is None
-            or expected_generation <= 0
-            or expected_cancel_generation <= 0
-            or not expected_correlation
-            or expected_address is None
-            or str(expected_lease.get("parent_request_id") or "").strip()
-            != correlated_id
-        ):
-            return False
-        with _exploration_deadline_lock(
-            lock,
-            deadline_monotonic,
-            "ReconcileExplorationAfterGlobalStop",
-        ):
-            current = getattr(
-                self.runtime,
-                "_external_exploration_request",
-                None,
-            )
-            current_id = str(
-                getattr(current, "request_id", "") or ""
-            ).strip()
-            remote = self._resolve_remote_exploration_provider()
-            remote_token = (
-                _capture_remote_operation_token_locked(self.runtime, remote)
-                if remote is not None
-                else None
-            )
-            if current_id != correlated_id or remote_token is None:
-                return False
-        try:
-            result = remote.reconcile_exploration_after_global_stop(
-                request_id=correlated_id,
-                exploration_generation=expected_generation,
-                child_lease=expected_lease,
-                cancel_generation=expected_cancel_generation,
-                recovery_correlation=expected_correlation,
-                admission_guard_generation=int(admission_guard_generation),
-                admission_guard_boot_nonce=bytes(
-                    admission_guard_boot_nonce or b""
-                ),
-                admission_motion_stop_generation=int(
-                    admission_motion_stop_generation
-                ),
-                held_guard_proof=dict(held_guard_proof or {}),
-                **(
-                    {"deadline_monotonic": deadline_monotonic}
-                    if deadline_monotonic is not None
-                    else {}
-                ),
-            )
-        except GeometryRuntimeRpcError:
-            raise
-        except Exception:
-            LOGGER.exception(
-                "Bundle global-stop reconciliation gRPC failed for request_id=%s.",
-                correlated_id,
-            )
-            return False
-        if not isinstance(result, dict):
-            return False
-        receipt = result.get("ownership_reconciliation_receipt")
-        global_stop = result.get("global_stop_reconciliation")
-        terminal_profile = (
-            str(result.get("last_stop_reason") or "").strip(),
-            str(receipt.get("cause") or "") if isinstance(receipt, dict) else "",
-            (
-                str(receipt.get("commit_disposition") or "")
-                if isinstance(receipt, dict)
-                else ""
-            ),
-        )
-        exact_response = bool(
-            str(result.get("request_id") or "").strip() == correlated_id
-            and int(result.get("exploration_generation") or 0)
-            == expected_generation
-            and str(result.get("status") or "").strip().lower() == "failed"
-            and not str(result.get("child_task_id") or "").strip()
-            and result.get("child_lease") is None
-            and result.get("rollover_recovery_eligible") is False
-            and isinstance(global_stop, dict)
-            and global_stop.get("eligible") is False
-            and isinstance(receipt, dict)
-            and str(receipt.get("recovery_correlation") or "")
-            == expected_correlation
-            and str(receipt.get("parent_request_id") or "")
-            == correlated_id
-            and int(receipt.get("exploration_generation") or 0)
-            == expected_generation
-            and _exploration_receipt_matches_child(receipt, child_lease=expected_lease)
-            and int(receipt.get("cancel_generation") or 0)
-            == expected_cancel_generation
-            and terminal_profile
-            in (
-                (
-                    "global_stop_reconciled_safe",
-                    "ordinary_global_stop",
-                    "global_stop_reconciled_child_ownership",
-                ),
-                (
-                    "child_cancel_failed",
-                    "late_exact_child_zeroed",
-                    "exact_child_zeroed_released_ownership",
-                ),
-            )
-        )
-        if not exact_response:
-            return False
-        state = self._wrap_remote_exploration_state(result)
-        owner_lock = _remote_exploration_owner_lock(self.runtime)
-        with _exploration_post_rpc_lock(
-            owner_lock,
-            deadline_monotonic,
-            "ReconcileExplorationAfterGlobalStop",
-        ) as deadline_exhausted:
-            if not _remote_operation_token_is_current_locked(
-                self.runtime,
-                remote_token,
-            ):
-                return False
-            current = getattr(
-                self.runtime,
-                "_external_exploration_request",
-                None,
-            )
-            if (
-                str(getattr(current, "request_id", "") or "").strip()
-                != correlated_id
-            ):
-                return False
-            committed = _commit_remote_exploration_state_under_owner_lock(
-                self.runtime,
-                state,
-                request_id=correlated_id,
-            )
-        if committed and deadline_monotonic is None:
-            self.runtime._notify_exploration_update(state)
-        if deadline_exhausted:
-            raise GeometryRuntimeRpcError(
-                rpc_name="ReconcileExplorationAfterGlobalStop",
-                grpc_code=grpc.StatusCode.DEADLINE_EXCEEDED,
-                grpc_details=(
-                    "reconciliation response committed after cooperative deadline"
-                ),
-            )
-        return committed
-
-    def acknowledge_exploration_ownership_reconciliation(
-        self,
-        *,
-        recovery_correlation: str,
-        child_lease_fingerprint: str = "",
-        child_lease: Optional[Dict[str, Any]] = None,
-        deadline_monotonic: Optional[float] = None,
-    ) -> bool:
-        """Acknowledge a receipt without coupling it to reconciliation commit."""
-
-        _exploration_deadline_remaining(
-            deadline_monotonic,
-            "AcknowledgeExplorationOwnershipReconciliation",
-        )
-        if not self._is_geometry_profile_enabled():
-            return False
-        correlation = str(recovery_correlation or "").strip()
-        lock = getattr(self.runtime, "_exploration_loop_lock", None)
-        if not correlation or lock is None:
-            return False
-        with _exploration_deadline_lock(
-            lock,
-            deadline_monotonic,
-            "AcknowledgeExplorationOwnershipReconciliation",
-        ):
-            remote = self._resolve_remote_exploration_provider()
-            remote_token = (
-                _capture_remote_operation_token_locked(self.runtime, remote)
-                if remote is not None
-                else None
-            )
-        if remote_token is None:
-            return False
-        try:
-            acknowledged = remote.acknowledge_exploration_ownership_reconciliation(
-                recovery_correlation=correlation,
-                child_lease=child_lease,
-                child_lease_fingerprint=child_lease_fingerprint,
-                **(
-                    {"deadline_monotonic": deadline_monotonic}
-                    if deadline_monotonic is not None
-                    else {}
-                ),
-            )
-        except GeometryRuntimeRpcError:
-            raise
-        except Exception:
-            LOGGER.exception(
-                "Bundle ownership reconciliation ack gRPC failed for correlation=%s.",
-                correlation,
-            )
-            return False
-        with _exploration_post_rpc_lock(
-            lock,
-            deadline_monotonic,
-            "AcknowledgeExplorationOwnershipReconciliation",
-        ) as deadline_exhausted:
-            current = _remote_operation_token_is_current_locked(
-                self.runtime,
-                remote_token,
-            )
-        if deadline_exhausted:
-            raise GeometryRuntimeRpcError(
-                rpc_name="AcknowledgeExplorationOwnershipReconciliation",
-                grpc_code=grpc.StatusCode.DEADLINE_EXCEEDED,
-                grpc_details="ack response arrived after cooperative deadline",
-            )
-        return bool(current and acknowledged)
 
     def sync_exploration_after_task(self) -> bool:
         if not self._is_geometry_profile_enabled():
@@ -9387,7 +9000,7 @@ class PlatformGeometryProviderBundle(
             ExplorationStatus.SUCCEEDED,
             ExplorationStatus.FAILED,
             ExplorationStatus.CANCELLED,
-        } and not child_task_id and state.get("child_lease") is None
+        } and not child_task_id and state.get("child_lease") is None and not state.get("parking_pending", False)
         metadata = {
             "provider": "geometry_runtime",
             "gRPC_facade": True,
@@ -9408,16 +9021,8 @@ class PlatformGeometryProviderBundle(
                 state.get("exploration_generation") or 0
             ),
             "child_lease": state.get("child_lease"),
-            "rollover_recovery_eligible": bool(
-                state.get("rollover_recovery_eligible", False)
-            ),
+            "parking_pending": bool(state.get("parking_pending", False)),
             "mission_progress": state.get("mission_progress"),
-            "global_stop_reconciliation": state.get(
-                "global_stop_reconciliation"
-            ),
-            "ownership_reconciliation_receipt": state.get(
-                "ownership_reconciliation_receipt"
-            ),
         }
         timestamp = (
             datetime.fromtimestamp(timestamp_ns / 1_000_000_000.0, tz=timezone.utc)

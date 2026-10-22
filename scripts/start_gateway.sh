@@ -940,121 +940,48 @@ write_runtime_activation_result() {
   local temporary="${result_file}.$$"
   STATE="${state}" STAGE="${stage}" MESSAGE="${message}" \
     REQUEST_ID="${RUNTIME_ACTIVATION_REQUEST_ID:-}" \
-    MOTION_STOP_GENERATION="${RUNTIME_ACTIVATION_GENERATION:-0}" ERROR_CODE="${error_code}" \
+    ERROR_CODE="${error_code}" \
     ACTIVATION_LEVEL="${RUNTIME_ACTIVATION_LEVEL:-unknown}" \
     CAPABILITY_NAME="${RUNTIME_ACTIVATION_CAPABILITY:-unknown}" \
-    "${PYTHON_BIN}" -c 'import json, os; payload = {"state": os.environ["STATE"], "stage": os.environ["STAGE"], "message": os.environ["MESSAGE"], "request_id": os.environ["REQUEST_ID"], "motion_stop_generation": int(os.environ["MOTION_STOP_GENERATION"]), "activation_level": os.environ["ACTIVATION_LEVEL"], "capability_name": os.environ["CAPABILITY_NAME"]}; payload.update({"error_code": os.environ["ERROR_CODE"]} if os.environ["ERROR_CODE"] else {}); print(json.dumps(payload, ensure_ascii=True, sort_keys=True))' \
+    "${PYTHON_BIN}" -c 'import json, os; payload = {"state": os.environ["STATE"], "stage": os.environ["STAGE"], "message": os.environ["MESSAGE"], "request_id": os.environ["REQUEST_ID"], "activation_level": os.environ["ACTIVATION_LEVEL"], "capability_name": os.environ["CAPABILITY_NAME"]}; payload.update({"error_code": os.environ["ERROR_CODE"]} if os.environ["ERROR_CODE"] else {}); print(json.dumps(payload, ensure_ascii=True, sort_keys=True))' \
     > "${temporary}"
   chmod 0644 "${temporary}"
   mv -f "${temporary}" "${result_file}"
 }
 
 read_runtime_activation_request() {
-  local request_file="$1"
-  local parsed=""
+  local request_file="$1" parsed=""
   parsed="$("${PYTHON_BIN}" - "${request_file}" <<'PY'
 import json
 import pathlib
 import sys
-
 payload = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 level = str(payload.get("activation_level") or "motion").strip().lower()
 if level not in {"guard", "geometry", "motion", "person_follow"}:
     raise SystemExit("invalid activation_level: %s" % level)
-capability = str(payload.get("capability_name") or "unknown").strip() or "unknown"
-request_id = str(payload.get("request_id") or "-").strip()
-raw_generation = payload.get("motion_stop_generation")
-generation = 0 if raw_generation is None else int(raw_generation)
-if generation < 0 or any(char.isspace() for char in request_id + capability):
+capability = str(payload.get("capability_name") or "unknown").strip()
+request_id = str(payload.get("request_id") or "").strip()
+if not request_id or any(char.isspace() for char in request_id + capability):
     raise SystemExit("invalid activation request identity")
-if request_id != "-" and raw_generation is None and level != "geometry":
-    raise SystemExit("missing motion_stop_generation")
-print("%s\t%s\t%s\t%s" % (level, capability, request_id, generation))
+print("%s\t%s\t%s" % (level, capability, request_id))
 PY
   )" || return 1
-  IFS=$'\t' read -r RUNTIME_ACTIVATION_LEVEL RUNTIME_ACTIVATION_CAPABILITY RUNTIME_ACTIVATION_REQUEST_ID RUNTIME_ACTIVATION_GENERATION <<< "${parsed}"
-  [[ -n "${RUNTIME_ACTIVATION_LEVEL}" && -n "${RUNTIME_ACTIVATION_CAPABILITY}" ]]
+  IFS=$'\t' read -r RUNTIME_ACTIVATION_LEVEL RUNTIME_ACTIVATION_CAPABILITY RUNTIME_ACTIVATION_REQUEST_ID <<< "${parsed}"
 }
 
 runtime_activation_protocol_state() {
-  local phase="${1:-starting}"
-  "${PYTHON_BIN}" - "${NUWAX_RUNTIME_ACTIVATION_REQUEST}" \
-    "${RUNTIME_ACTIVATION_REQUEST_ID}" "${RUNTIME_ACTIVATION_GENERATION}" "${phase}" <<'PY'
-import fcntl
-import json
-import os
-from pathlib import Path
-import sys
-
-request, request_id, generation, phase = sys.argv[1:]
-generation = int(generation)
-try:
-    descriptor = os.open(request + ".lock", os.O_RDONLY | os.O_CREAT | os.O_EXCL, 0o644)
-except FileExistsError:
-    descriptor = os.open(request + ".lock", os.O_RDONLY)
-else:
-    os.fchmod(descriptor, 0o644)
-protocol_lock = os.fdopen(descriptor, "r")
-fcntl.flock(protocol_lock, fcntl.LOCK_SH)
-def read(path):
-    try:
-        value = json.loads(Path(path).read_text(encoding="utf-8"))
-        return value if isinstance(value, dict) else {}
-    except (OSError, ValueError):
-        return {}
-def matches(value, cancel=False):
-    try:
-        marker_generation = int(value.get("motion_stop_generation") or 0)
-    except (ValueError, TypeError):
-        return False
-    return value.get("request_id") == request_id and (
-        marker_generation >= generation if cancel else marker_generation == generation
-    )
-cancel = read(os.environ.get("NUWAX_RUNTIME_ACTIVATION_CANCEL", request + ".cancel.json"))
-ack = read(os.environ.get("NUWAX_RUNTIME_ACTIVATION_ACK", request + ".ack.json"))
-current = read(request)
-if matches(cancel, cancel=True):
-    print("cancelled")
-elif not Path(request).exists():
-    # 提交由网关移除本请求表示；其它请求身份不能冒充提交确认。
-    print("committed" if phase == "ready" else "cancelled")
-elif current.get("request_id") != request_id:
-    print("cancelled")
-elif phase == "prepared" and matches(ack) and ack.get("state") == "acknowledged":
-    print("acknowledged")
-else:
-    print("pending")
-PY
-}
-
-cleanup_runtime_activation_protocol() {
-  # 与网关写入共用短文件锁，在同一临界区检查身份并删除。
   "${PYTHON_BIN}" - "${NUWAX_RUNTIME_ACTIVATION_REQUEST}" "${RUNTIME_ACTIVATION_REQUEST_ID}" <<'PY'
-import fcntl
 import json
-import os
 from pathlib import Path
 import sys
-request, request_id = sys.argv[1:]
 try:
-    descriptor = os.open(request + ".lock", os.O_RDONLY | os.O_CREAT | os.O_EXCL, 0o644)
-except FileExistsError:
-    descriptor = os.open(request + ".lock", os.O_RDONLY)
-else:
-    os.fchmod(descriptor, 0o644)
-protocol_lock = os.fdopen(descriptor, "r")
-fcntl.flock(protocol_lock, fcntl.LOCK_EX)
-for value in (request, os.environ.get("NUWAX_RUNTIME_ACTIVATION_CANCEL", request + ".cancel.json"),
-              os.environ.get("NUWAX_RUNTIME_ACTIVATION_ACK", request + ".ack.json")):
-    path = Path(value)
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        if str(payload.get("request_id") or "-") == (request_id or "-"):
-            path.unlink()
-    except (OSError, ValueError, AttributeError):
-        pass
+    request = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+except (OSError, ValueError):
+    request = {}
+print("pending" if request.get("request_id") == sys.argv[2] else "cancelled")
 PY
 }
+
 
 rollback_runtime_activation() {
   local index component
@@ -1069,7 +996,6 @@ fail_runtime_activation() {
   local state="$1" stage="$2" message="$3" error_code="$4"
   rollback_runtime_activation
   write_runtime_activation_result "${state}" "${stage}" "${message}" "${error_code}"
-  cleanup_runtime_activation_protocol
   RUNTIME_ACTIVATION_REQUEST_ID=""
   return 1
 }
@@ -1083,12 +1009,17 @@ check_runtime_activation_cancelled() {
 
 start_runtime_activation_component() {
   local component="$1" pid_variable="$2" manager="$3"
-  local previous_pid="${!pid_variable}" result=0
+  local previous_pid="${!pid_variable}" result=0 registered=0
   RUNTIME_ACTIVATION_STAGE="${component}"
   check_runtime_activation_cancelled || return 1
   write_runtime_activation_result activating "${component}" "正在启动所需运行组件。"
+  # 启动函数等待期间也可能收到退出信号，先登记本次将拥有的新组件。
+  if ! "${manager}" && { [[ -z "${previous_pid}" ]] || ! is_pid_alive "${previous_pid}"; }; then
+    RUNTIME_ACTIVATION_STARTED+=("${component}")
+    registered=1
+  fi
   "start_${component}" || result=$?
-  if ! "${manager}" && [[ -n "${!pid_variable}" && "${!pid_variable}" != "${previous_pid}" ]]; then
+  if [[ "${registered}" -eq 0 ]] && ! "${manager}" && [[ -n "${!pid_variable}" && "${!pid_variable}" != "${previous_pid}" ]]; then
     RUNTIME_ACTIVATION_STARTED+=("${component}")
   fi
   check_runtime_activation_cancelled || return 1
@@ -1098,34 +1029,6 @@ start_runtime_activation_component() {
   fi
 }
 
-wait_runtime_activation_handshake() {
-  local phase="$1" expected="$2" timeout_sec="$3" attempts attempt state
-  attempts="$("${PYTHON_BIN}" - "${timeout_sec}" <<'PY'
-import math
-import sys
-try:
-    value = float(sys.argv[1])
-    value = max(0.1, value) if math.isfinite(value) else 10.0
-except ValueError:
-    value = 10.0
-print(max(1, math.ceil(value * 10)))
-PY
-)"
-  for ((attempt = 0; attempt < attempts; attempt++)); do
-    state="$(runtime_activation_protocol_state "${phase}")"
-    if [[ "${state}" == "${expected}" ]]; then
-      return 0
-    fi
-    if [[ "${state}" == "cancelled" ]]; then
-      fail_runtime_activation cancelled "${phase}" "网关已取消本次运行组件激活。" activation_cancelled
-      return 1
-    fi
-    sleep 0.1
-  done
-  local error_code="runtime_activation_ack_timeout"
-  [[ "${phase}" != "ready" ]] || error_code="runtime_activation_commit_timeout"
-  fail_runtime_activation failed "${phase}" "等待网关确认运行组件激活超时。" "${error_code}"
-}
 
 activate_requested_runtime_components() {
     RUNTIME_ACTIVATION_STAGE="request"
@@ -1158,16 +1061,12 @@ activate_requested_runtime_components() {
       fi
     fi
     check_runtime_activation_cancelled || return 1
-    write_runtime_activation_result prepared prepared "运行组件已准备，等待网关确认。"
-    wait_runtime_activation_handshake prepared acknowledged "${NUWAX_RUNTIME_ACTIVATION_ACK_TIMEOUT_SEC:-10}" || return 1
+    # 就绪结果发布后，本次组件成为可复用的已启动资源。
     write_runtime_activation_result ready ready "requested runtime components are ready"
-    wait_runtime_activation_handshake ready committed "${NUWAX_RUNTIME_ACTIVATION_COMMIT_TIMEOUT_SEC:-10}" || return 1
     RUNTIME_ACTIVATION_STARTED=()
     if [[ "${RUNTIME_ACTIVATION_LEVEL}" == "person_follow" ]]; then
       start_person_follow_monitor
     fi
-    cleanup_runtime_activation_protocol
-    write_runtime_activation_result committed committed "网关提交已确认，本次激活事务已收尾。"
     RUNTIME_ACTIVATION_REQUEST_ID=""
 }
 
@@ -1187,20 +1086,28 @@ cleanup_runtime_activation_owner() {
 monitor_runtime_activation_requests() {
   local request_file="${NUWAX_RUNTIME_ACTIVATION_REQUEST}"
   local initial_geometry_pid="${GEOMETRY_RUNTIME_PID}" initial_nav_pid="${NAV_STACK_PID}" initial_follow_pid="${PERSON_FOLLOW_PID}"
-  local RUNTIME_ACTIVATION_REQUEST_ID="" RUNTIME_ACTIVATION_GENERATION=0 RUNTIME_ACTIVATION_STAGE="request"
+  local RUNTIME_ACTIVATION_REQUEST_ID="" RUNTIME_ACTIVATION_STAGE="request"
+  local last_handled_request_id="" invalid_reported=0
   local -a RUNTIME_ACTIVATION_STARTED=()
   local next_health_check=$((SECONDS + 5))
   trap cleanup_runtime_activation_owner INT TERM HUP
   while [[ "${STOP_REQUESTED}" -eq 0 ]]; do
     if [[ -f "${request_file}" ]]; then
       RUNTIME_ACTIVATION_REQUEST_ID=""
-      if read_runtime_activation_request "${request_file}" && [[ "${RUNTIME_ACTIVATION_REQUEST_ID}" != "-" ]]; then
-        activate_requested_runtime_components || true
-      else
+      if read_runtime_activation_request "${request_file}"; then
+        invalid_reported=0
+        if [[ "${RUNTIME_ACTIVATION_REQUEST_ID}" != "${last_handled_request_id}" ]]; then
+          last_handled_request_id="${RUNTIME_ACTIVATION_REQUEST_ID}"
+          activate_requested_runtime_components || true
+        fi
+        RUNTIME_ACTIVATION_REQUEST_ID=""
+      elif [[ "${invalid_reported}" -eq 0 ]]; then
         write_runtime_activation_result failed request "激活请求缺少合法的请求身份。" runtime_activation_request_invalid
-        cleanup_runtime_activation_protocol
+        invalid_reported=1
         RUNTIME_ACTIVATION_REQUEST_ID=""
       fi
+    else
+      invalid_reported=0
     fi
     # 监督与启动留在同一拥有方，重启后的 PID 不再遗失在另一个后台 shell 中。
     if ((SECONDS >= next_health_check)); then

@@ -10,7 +10,7 @@
 #
 # 输出段:
 #   1. 诊断输入 — 不依赖仅供开发使用且未部署的 CI 脚本
-#   2. motion guard — production module / UDS / durable record permissions
+#   2. motion guard — production module / UDS / 单实例锁权限
 #   3. 二进制/端口 — nuwax-geometry-runtime 可执行与监听状态
 #   4. ready file — /run/nuwax/geometry/nuwax_geometry_runtime.ready
 #   5. SHM refs — video + cloudmap + occupancy 的真实生产路径
@@ -50,12 +50,10 @@ nr()  { printf '  [NOT RUN] %s\n' "$1"; }
 bar "1. 诊断输入"
 printf '  deployment profile = %s\n' "${PROFILE_FILE}"
 
-bar "2. motion guard:module / UDS / durable records"
+bar "2. motion guard:module / UDS / 单实例锁"
 GUARD_MODULE="${REPO_ROOT}/services/navigation/motion_safety_guard/__main__.py"
 GUARD_SOCKET="${NUWAX_MOTION_GUARD_SOCKET:-/run/nuwax/motion-guard.sock}"
 GUARD_LOCK="${NUWAX_MOTION_GUARD_LOCK:-/run/nuwax/motion-guard.lock}"
-GUARD_STATE_DIR="${NUWAX_MOTION_GUARD_STATE_DIR:-/var/lib/nuwax/motion-guard}"
-ACTUATOR_SYMBOLS_FILE="${NUWAX_ACTUATOR_SYMBOLS_FILE:-/etc/nuwax/actuator/actuator-symbols.json}"
 if [[ -f "${GUARD_MODULE}" ]]; then
   ok "production module: services.navigation.motion_safety_guard"
 else
@@ -63,7 +61,7 @@ else
 fi
 if [[ -S "${GUARD_SOCKET}" ]]; then
   socket_meta="$(stat -c '%U:%G %a' "${GUARD_SOCKET}" 2>/dev/null || echo '<stat-failed>')"
-  if [[ "${socket_meta}" == "nuwax-motion-guard:nuwax-motion-clients 660" ]]; then
+  if [[ "${socket_meta}" == "nuwax:nuwax 660" ]]; then
     ok "guard UDS secured: ${GUARD_SOCKET} (${socket_meta})"
   else
     miss "guard UDS metadata drift: ${GUARD_SOCKET} (${socket_meta})"
@@ -73,38 +71,13 @@ else
 fi
 if [[ -f "${GUARD_LOCK}" && ! -L "${GUARD_LOCK}" ]]; then
   lock_meta="$(stat -c '%U:%G %a' "${GUARD_LOCK}" 2>/dev/null || echo '<stat-failed>')"
-  if [[ "${lock_meta}" == "nuwax-motion-guard:nuwax-motion-guard 600" ]]; then
+  if [[ "${lock_meta}" == "nuwax:nuwax 600" ]]; then
     ok "guard lock secured: ${GUARD_LOCK} (${lock_meta})"
   else
     miss "guard lock metadata drift: ${GUARD_LOCK} (${lock_meta})"
   fi
 else
   nr "guard lock absent/non-regular/symlink: ${GUARD_LOCK}"
-fi
-for record_spec in "provisioned.json:400" "epoch.json:600"; do
-  record_name="${record_spec%%:*}"
-  expected_mode="${record_spec##*:}"
-  record_path="${GUARD_STATE_DIR}/${record_name}"
-  if [[ -s "${record_path}" ]]; then
-    record_meta="$(stat -c '%U:%G %a' "${record_path}" 2>/dev/null || echo '<stat-failed>')"
-    if [[ "${record_meta}" == "nuwax-motion-guard:nuwax-motion-guard ${expected_mode}" ]]; then
-      ok "durable record: ${record_path} (${record_meta})"
-    else
-      miss "durable record metadata drift: ${record_path} (${record_meta})"
-    fi
-  else
-    miss "durable record missing or empty: ${record_path}"
-  fi
-done
-if [[ -s "${ACTUATOR_SYMBOLS_FILE}" ]]; then
-  manifest_meta="$(stat -c '%U:%G %a' "${ACTUATOR_SYMBOLS_FILE}" 2>/dev/null || echo '<stat-failed>')"
-  if [[ "${manifest_meta}" == "root:nuwax-motion-clients 640" ]]; then
-    ok "actuator symbols manifest: ${ACTUATOR_SYMBOLS_FILE} (${manifest_meta})"
-  else
-    miss "actuator symbols manifest metadata drift: ${ACTUATOR_SYMBOLS_FILE} (${manifest_meta})"
-  fi
-else
-  miss "actuator symbols manifest missing or empty: ${ACTUATOR_SYMBOLS_FILE}"
 fi
 
 bar "3. 二进制:nuwax-geometry-runtime"
@@ -346,11 +319,7 @@ if [[ -n "${GUARD_UNIT_TEXT}" ]]; then
   else
     miss "guard unit UDS path drift"
   fi
-  if grep -qE '^Environment=NUWAX_ACTUATOR_SYMBOLS_FILE=.*/actuator/actuator-symbols.json$' <<<"${GUARD_UNIT_TEXT}"; then
-    ok "guard unit actuator manifest path frozen"
-  else
-    miss "guard unit actuator manifest path drift"
-  fi
+
 else
   miss "guard effective unit unavailable"
 fi

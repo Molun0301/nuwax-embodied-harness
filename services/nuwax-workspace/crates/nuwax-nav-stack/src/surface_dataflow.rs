@@ -526,8 +526,7 @@ fn body_path(surface: &SurfaceSnapshot, start: &PoseStamped, goal: &schema::Goal
 fn surface_replan_input(surface: &Arc<SurfaceSnapshot>, start: &PoseStamped,
     goal: &schema::GoalEnvelope, config: &SurfaceNavigationConfig,
     feedback: Option<&SurfaceReplanFeedback>) -> NavStackResult<SurfaceReplanInput> {
-    let matching = feedback.filter(|feedback| feedback.path_identity
-        .has_same_goal_identity(&guarded_goal_execution_identity(goal)));
+    let matching = feedback.filter(|feedback| (feedback.path_identity.session_id == goal.session_id && feedback.path_identity.goal_key == goal.goal_key()));
     Ok(SurfaceReplanInput {
         source: Arc::clone(surface), start: start.clone(),
         goal: nuwax_nav_runtime::ExecutionGoal::Body(pose_from_schema(&goal.goal)?),
@@ -544,7 +543,7 @@ fn surface_replan_rejection<'a>(
     feedback: Option<&'a SurfaceReplanFeedback>, goal: &schema::GoalEnvelope,
 ) -> Option<(&'a nuwax_nav_runtime::PathExecutionIdentity, &'a ActualExecutionContext)> {
     feedback.filter(|feedback| feedback.zero_confirmed_rejection
-        && feedback.path_identity.has_same_goal_identity(&guarded_goal_execution_identity(goal)))
+        && (feedback.path_identity.session_id == goal.session_id && feedback.path_identity.goal_key == goal.goal_key()))
         .and_then(|feedback| feedback.rejected_context.as_deref()
             .map(|rejected| (feedback.path_identity.as_ref(), rejected)))
 }
@@ -608,7 +607,6 @@ fn state_matches_goal(state: &schema::NavigationState, goal: &schema::GoalEnvelo
         && state.parent_request_id == goal.parent_request_id
         && state.goal_generation == goal.goal_generation
         && state.producer_runtime_generation == goal.producer_runtime_generation
-        && state.guard_generation == goal.motion_guard_generation
 }
 
 fn retire_goal(goal: &mut Option<schema::GoalEnvelope>, retired: &mut VecDeque<GoalKey>) {
@@ -772,7 +770,7 @@ async fn run_surface_planner_with_computer(
                 execution_feedback=update;
                 if let (Some(active),Some(feedback))=(&goal,&execution_feedback) {
                     if feedback.zero_confirmed_rejection
-                        && feedback.path_identity.has_same_goal_identity(&guarded_goal_execution_identity(active))
+                        && (feedback.path_identity.session_id == active.session_id && feedback.path_identity.goal_key == active.goal_key())
                         && feedback.path_identity.planner_runtime_generation==generation
                         && feedback.path_identity.path_revision==path_revision as u64 {
                         needs_plan=true;
@@ -1506,7 +1504,7 @@ mod tests {
             committed_map_source_timestamp_ns: map.committed_map.source_timestamp_ns,
             committed_map_frame_id: "map".into(),
             source_timestamp_ns: stamp,
-            motion_guard_generation: 7,
+
             motion_guard_boot_nonce: [7; 16],
             motion_stop_generation: 1,
             goal: schema::PoseStamped {
@@ -2746,9 +2744,9 @@ mod tests {
             let path = schema::decode_path_envelope_body(&frame.unwrap().payload).unwrap();
             panic!(
                 "终态后收到路径：sealed={} terminal_observed={} delta_ns={} revision={}",
-                path.source_timestamp_ns,
+                (i64::from(path.path.header.stamp_sec) * 1_000_000_000 + i64::from(path.path.header.stamp_nsec)),
                 terminal_observed_ns,
-                path.source_timestamp_ns - terminal_observed_ns,
+                (i64::from(path.path.header.stamp_sec) * 1_000_000_000 + i64::from(path.path.header.stamp_nsec)) - terminal_observed_ns,
                 path.path_revision
             );
         }

@@ -47,7 +47,6 @@ async fn zero_position_real_surface_arrival_finishes_only_after_fence_and_fresh_
     assert!(scheduler.status.last_terminal.is_none());
     assert!(!scheduler.lease_active);
     let pending = scheduler.arrival_confirmation.as_ref().expect("real follower arrival event");
-    validate_fence(&pending.proof).unwrap();
     let confirmed_at = pending.confirmed_at;
     assert_eq!(motion.lock().unwrap().calls.iter().filter(|c| c.starts_with("fence:")).count(), 1);
     scheduler.session_tick(&status).await.unwrap();

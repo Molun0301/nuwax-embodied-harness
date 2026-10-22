@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from services.navigation.motion_guard_client import StopAllMotionConfirmation
+
 from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -25,7 +30,6 @@ from services.localization import LocalizationService
 from services.mapping.service import MappingService
 from services.geometry.geometry_runtime_provider import (
     GeometryRuntimeRpcError,
-    _exploration_receipt_matches_child,
 )
 from typing import Deque, Dict, Optional, Sequence, Tuple
 
@@ -129,6 +133,7 @@ def _is_complete_exploration_terminal(
             ExplorationStatus.CANCELLED,
         }
         and metadata.get("exploration_terminal") is True
+        and metadata.get("parking_pending") is not True
         and not str(metadata.get("child_task_id") or "").strip()
         and metadata.get("child_lease") is None
     )
@@ -1318,10 +1323,13 @@ class NavigationService:
             if previous_context is not None:
                 previous = previous_context.navigation_state
                 previous_metadata = dict(previous.metadata or {})
-                if (previous_metadata.get("ownership_retained") is True
-                        and previous_metadata.get("authority_current") is False):
-                    # A late command body cannot restore authority invalidated by a
-                    # connection replacement; automatic recovery is outside this path.
+                incoming_obligation = dict(navigation_state.metadata or {}).get("dispatch_obligation") or {}
+                retired_obligation = previous_metadata.get("dispatch_obligation") or {}
+                if (previous_metadata.get("authority_current") is False
+                        and incoming_obligation and retired_obligation
+                        and incoming_obligation.get("connection_epoch") == retired_obligation.get("connection_epoch")
+                        and incoming_obligation.get("identity") == retired_obligation.get("identity")):
+                    # 仅丢弃失效连接原命令的迟到回包；当前流和后继目标没有这份旧责任。
                     return previous_context
                 def identity(state):
                     metadata = dict(state.metadata or {})
@@ -1614,14 +1622,6 @@ class NavigationService:
             self._raise_forbidden_zone_motion_start_blocked_locked()
             previous_goal = self._current_goal
             previous_context = self._latest_navigation_context
-            if (previous_context is not None
-                    and previous_context.navigation_state.metadata.get("ownership_retained") is True):
-                raise GatewayError("已有导航责任尚未结算，禁止提交新目标。",
-                    error_code="navigation_goal_busy", http_status=409,
-                    details={"goal_id": previous_context.navigation_state.current_goal_id,
-                             "reason_code": "BUSY", "retryable": False,
-                             "ownership_retained": True,
-                             "authority_current": previous_context.navigation_state.metadata.get("authority_current", False)})
             self._current_goal = goal
             self._state_machine.set_goal(goal.goal_id, message="平台导航目标已接受。")
         LOGGER.debug("导航服务转发目标 goal_id=%s provider=%s", goal.goal_id, provider.provider_name)
@@ -1765,8 +1765,9 @@ class NavigationService:
         request_id: Optional[str] = None,
         *,
         deadline_monotonic: Optional[float] = None,
+        global_stop_confirmation: Optional[StopAllMotionConfirmation] = None,
     ) -> NavigationContext:
-        """仅取消与后端当前 ACTIVE 状态匹配的 exact goal。"""
+        """按精确目标标识直接请求后端取消，再读取其控制结果。"""
 
         exact_goal_id = str(request_id or "").strip()
         if not exact_goal_id:
@@ -1775,97 +1776,18 @@ class NavigationService:
                 error_code="navigation_goal_identity_unavailable",
                 http_status=409,
             )
-        if deadline_monotonic is None:
-            provider = self._get_navigation_provider()
-        else:
-            provider = self._get_navigation_provider(
-                deadline_monotonic=deadline_monotonic,
-            )
-        try:
-            state_reader = getattr(provider, "get_navigation_control_state", provider.get_navigation_state)
-            if deadline_monotonic is None:
-                provider_state = state_reader()
-            else:
-                provider_state = state_reader(
-                    deadline_monotonic=deadline_monotonic,
-                )
-        except GeometryRuntimeRpcError:
-            raise
-        except Exception as exc:
-            raise GatewayError(
-                "导航取消前无法读取后端 exact goal 状态。",
-                error_code="navigation_goal_identity_unavailable",
-                http_status=503,
-            ) from exc
-        backend_goal_id = str(
-            getattr(provider_state, "current_goal_id", "") or ""
-        ).strip()
-        raw_status = getattr(provider_state, "status", None)
-        backend_status = str(
-            getattr(raw_status, "value", raw_status) or ""
-        ).strip().lower()
-        observed_goal_id = str(
-            dict(getattr(provider_state, "metadata", {}) or {}).get(
-                "observed_goal_id"
-            )
-            or ""
-        ).strip()
-        control_metadata = dict(getattr(provider_state, "metadata", {}) or {})
-        if (control_metadata.get("ownership_retained") is True
-                and control_metadata.get("authority_current") is False):
-            raise GatewayError("原导航责任尚未结算，当前连接没有原 exact 取消资格。",
-                error_code="navigation_control_authority_unavailable", http_status=409,
-                details={"goal_id": backend_goal_id, "ownership_retained": True,
-                         "authority_current": False, "retryable": False,
-                         "reason_code": control_metadata.get("reason_code"),
-                         "historical_navigation_identity": control_metadata.get("historical_navigation_identity"),
-                         "navigation": control_metadata.get("historical_navigation")})
-        # 目标以完整对象替换，先捕获引用；最终取消仍由后端精确租约再次裁决。
-        # 不等待持有显示聚合锁的线程，避免停车截止被无关读取耗尽。
-        local_goal = self._current_goal
-        local_goal_id = str(getattr(local_goal, "goal_id", "") or "").strip()
-        if (
-            backend_goal_id != exact_goal_id
-            or (observed_goal_id and observed_goal_id != exact_goal_id)
-            or (local_goal_id and local_goal_id != exact_goal_id)
-            or backend_status
-            not in {
-                NavigationStatus.UNCONFIRMED.value,
-                NavigationStatus.ACCEPTED.value,
-                NavigationStatus.PLANNING.value,
-                NavigationStatus.RUNNING.value,
-            }
-        ):
-            raise GatewayError(
-                "导航取消 goal_id 与当前活动 exact goal 不匹配。",
-                error_code="navigation_goal_mismatch",
-                http_status=409,
-                details={
-                    "requested_goal_id": exact_goal_id,
-                    "active_goal_id": backend_goal_id or None,
-                    "observed_goal_id": observed_goal_id or None,
-                    "local_goal_id": local_goal_id or None,
-                    "active_status": backend_status or None,
-                },
-            )
-        if deadline_monotonic is None:
-            accepted = provider.cancel_goal(request_id=exact_goal_id)
-        else:
-            accepted = provider.cancel_goal(
-                request_id=exact_goal_id,
-                deadline_monotonic=deadline_monotonic,
-            )
+        provider = self._find_navigation_provider()
+        if provider is None:
+            raise GatewayError("当前平台几何运行时未提供导航后端。")
+        cancel_options = {}
+        if deadline_monotonic is not None:
+            cancel_options["deadline_monotonic"] = deadline_monotonic
+        if global_stop_confirmation is not None:
+            cancel_options["global_stop_confirmation"] = global_stop_confirmation
+        accepted = provider.cancel_goal(request_id=exact_goal_id, **cancel_options)
         if not accepted:
-            message = (
-                self._navigation_provider_error_message(
-                    provider,
-                    default="导航后端拒绝取消当前目标。",
-                )
-                if deadline_monotonic is None
-                else "导航后端拒绝取消当前目标。"
-            )
             raise GatewayError(
-                message,
+                "导航后端拒绝取消当前目标。",
                 error_code="navigation_cancel_rejected",
                 http_status=409,
             )
@@ -2392,6 +2314,8 @@ class NavigationService:
         request_id: Optional[str] = None,
         *,
         deadline_monotonic: Optional[float] = None,
+        global_stop_confirmation: Optional[StopAllMotionConfirmation] = None,
+        expected_exploration_generation: Optional[int] = None,
     ) -> ExplorationContext:
         """停止当前探索任务。"""
 
@@ -2433,9 +2357,15 @@ class NavigationService:
                     "active_request_id": previous_request.request_id,
                 },
             )
+        stop_options = {}
+        if global_stop_confirmation is not None:
+            stop_options["global_stop_confirmation"] = global_stop_confirmation
+        if expected_exploration_generation is not None:
+            stop_options["expected_exploration_generation"] = expected_exploration_generation
         if correlated_request_id:
             try:
                 accepted = provider.stop_exploration(
+                    **stop_options,
                     request_id=correlated_request_id,
                     **(
                         {"deadline_monotonic": deadline_monotonic}
@@ -2452,9 +2382,10 @@ class NavigationService:
                 ) from exc
         else:
             if deadline_monotonic is None:
-                accepted = provider.stop_exploration()
+                accepted = provider.stop_exploration(**stop_options)
             else:
                 accepted = provider.stop_exploration(
+                    **stop_options,
                     deadline_monotonic=deadline_monotonic,
                 )
         if not accepted:
@@ -2494,233 +2425,8 @@ class NavigationService:
             self._current_explore_request = None
         return context
 
-    def recover_exploration_after_navigation_rollover(
-        self,
-        *,
-        request_id: str,
-        exploration_generation: int,
-        child_lease: Dict[str, object],
-        expected_navigation_runtime_generation: int,
-        observed_navigation_runtime_generation: int,
-        guard_proof: Dict[str, object],
-    ) -> ExplorationContext:
-        """Forward one correlated retained-child recovery and refresh context."""
 
-        provider = self._get_exploration_provider()
-        recovery = getattr(
-            provider,
-            "recover_exploration_after_navigation_rollover",
-            None,
-        )
-        if not callable(recovery):
-            raise GatewayError(
-                "探索后端不支持 navigation rollover recovery。",
-                error_code="exploration_rollover_recovery_unsupported",
-                http_status=501,
-            )
-        accepted = recovery(
-            request_id=str(request_id or "").strip(),
-            exploration_generation=int(exploration_generation),
-            child_lease=dict(child_lease or {}),
-            expected_navigation_runtime_generation=int(
-                expected_navigation_runtime_generation
-            ),
-            observed_navigation_runtime_generation=int(
-                observed_navigation_runtime_generation
-            ),
-            guard_proof=dict(guard_proof or {}),
-        )
-        if not accepted:
-            raise GatewayError(
-                "探索后端拒绝 navigation rollover recovery。",
-                error_code="exploration_rollover_recovery_rejected",
-                http_status=409,
-                details={"request_id": str(request_id or "").strip()},
-            )
-        return self.refresh_exploration()
 
-    def reconcile_exploration_after_global_stop(
-        self,
-        *,
-        request_id: str,
-        exploration_generation: int,
-        child_lease: Dict[str, object],
-        cancel_generation: int,
-        recovery_correlation: str,
-        admission_guard_generation: int,
-        admission_guard_boot_nonce: bytes,
-        admission_motion_stop_generation: int,
-        held_guard_proof: Dict[str, object],
-        deadline_monotonic: Optional[float] = None,
-    ) -> ExplorationContext:
-        """Reconcile one retained child, then require an exact fresh snapshot."""
-
-        rpc_name = "ReconcileExplorationAfterGlobalStop"
-        _exploration_deadline_remaining(deadline_monotonic, rpc_name)
-        if deadline_monotonic is None:
-            provider = self._get_exploration_provider()
-        else:
-            provider = self._get_exploration_provider(
-                deadline_monotonic=deadline_monotonic,
-            )
-        reconcile = getattr(
-            provider,
-            "reconcile_exploration_after_global_stop",
-            None,
-        )
-        if not callable(reconcile):
-            raise GatewayError(
-                "探索后端不支持 global-stop ownership reconciliation。",
-                error_code="exploration_global_stop_reconciliation_unsupported",
-                http_status=501,
-            )
-        correlated_id = str(request_id or "").strip()
-        expected_generation = int(exploration_generation)
-        expected_cancel_generation = int(cancel_generation)
-        expected_correlation = str(recovery_correlation or "").strip()
-        expected_lease = {
-            "session_id": str(child_lease.get("session_id") or ""),
-            "owner_kind": int(child_lease.get("owner_kind") or 0),
-            "parent_request_id": str(child_lease.get("parent_request_id") or ""),
-            "goal_generation": int(child_lease.get("goal_generation") or 0),
-            "producer_runtime_generation": int(
-                child_lease.get("producer_runtime_generation") or 0
-            ),
-        }
-        accepted = reconcile(
-            request_id=correlated_id,
-            exploration_generation=expected_generation,
-            child_lease=dict(child_lease or {}),
-            cancel_generation=expected_cancel_generation,
-            recovery_correlation=expected_correlation,
-            admission_guard_generation=int(admission_guard_generation),
-            admission_guard_boot_nonce=bytes(
-                admission_guard_boot_nonce or b""
-            ),
-            admission_motion_stop_generation=int(
-                admission_motion_stop_generation
-            ),
-            held_guard_proof=dict(held_guard_proof or {}),
-            **(
-                {"deadline_monotonic": deadline_monotonic}
-                if deadline_monotonic is not None
-                else {}
-            ),
-        )
-        if not accepted:
-            raise GatewayError(
-                "探索后端拒绝 global-stop ownership reconciliation。",
-                error_code="exploration_global_stop_reconciliation_rejected",
-                http_status=409,
-                details={"request_id": correlated_id},
-            )
-        _exploration_deadline_remaining(deadline_monotonic, rpc_name)
-        if deadline_monotonic is None:
-            context = self.refresh_exploration()
-        else:
-            context = self.refresh_exploration(
-                deadline_monotonic=deadline_monotonic,
-            )
-        state = context.exploration_state
-        metadata = dict(getattr(state, "metadata", {}) or {})
-        receipt = metadata.get("ownership_reconciliation_receipt")
-        terminal_profile = (
-            str(metadata.get("last_stop_reason") or ""),
-            str(receipt.get("cause") or "") if isinstance(receipt, dict) else "",
-            (
-                str(receipt.get("commit_disposition") or "")
-                if isinstance(receipt, dict)
-                else ""
-            ),
-        )
-        exact_refresh = bool(
-            str(getattr(state, "current_request_id", "") or "").strip()
-            == correlated_id
-            and state.status == ExplorationStatus.FAILED
-            and metadata.get("exploration_terminal") is True
-            and not str(metadata.get("child_task_id") or "").strip()
-            and metadata.get("child_lease") is None
-            and int(metadata.get("exploration_generation") or 0)
-            == expected_generation
-            and isinstance(receipt, dict)
-            and str(receipt.get("recovery_correlation") or "")
-            == expected_correlation
-            and str(receipt.get("parent_request_id") or "")
-            == correlated_id
-            and int(receipt.get("exploration_generation") or 0)
-            == expected_generation
-            and _exploration_receipt_matches_child(receipt, child_lease=expected_lease)
-            and int(receipt.get("cancel_generation") or 0)
-            == expected_cancel_generation
-            and terminal_profile
-            in (
-                (
-                    "global_stop_reconciled_safe",
-                    "ordinary_global_stop",
-                    "global_stop_reconciled_child_ownership",
-                ),
-                (
-                    "child_cancel_failed",
-                    "late_exact_child_zeroed",
-                    "exact_child_zeroed_released_ownership",
-                ),
-            )
-        )
-        if not exact_refresh:
-            raise GatewayError(
-                "global-stop reconciliation 后未获得 exact terminal refresh。",
-                error_code="exploration_global_stop_refresh_unconfirmed",
-                http_status=409,
-                details={"request_id": correlated_id},
-            )
-        return context
-
-    def acknowledge_exploration_ownership_reconciliation(
-        self,
-        *,
-        recovery_correlation: str,
-        child_lease_fingerprint: str = "",
-        child_lease: Optional[Dict[str, object]] = None,
-        deadline_monotonic: Optional[float] = None,
-    ) -> bool:
-        """Explicitly acknowledge a durable receipt after outer release steps."""
-
-        rpc_name = "AcknowledgeExplorationOwnershipReconciliation"
-        _exploration_deadline_remaining(deadline_monotonic, rpc_name)
-        if deadline_monotonic is None:
-            provider = self._get_exploration_provider()
-        else:
-            provider = self._get_exploration_provider(
-                deadline_monotonic=deadline_monotonic,
-            )
-        acknowledge = getattr(
-            provider,
-            "acknowledge_exploration_ownership_reconciliation",
-            None,
-        )
-        if not callable(acknowledge):
-            raise GatewayError(
-                "探索后端不支持 ownership reconciliation ack。",
-                error_code="exploration_ownership_reconciliation_ack_unsupported",
-                http_status=501,
-            )
-        acknowledged = acknowledge(
-            recovery_correlation=str(recovery_correlation or "").strip(),
-            child_lease=child_lease,
-            child_lease_fingerprint=child_lease_fingerprint,
-            **(
-                {"deadline_monotonic": deadline_monotonic}
-                if deadline_monotonic is not None
-                else {}
-            ),
-        )
-        if not acknowledged:
-            raise GatewayError(
-                "ownership reconciliation ack 未确认。",
-                error_code="exploration_ownership_reconciliation_ack_unconfirmed",
-                http_status=409,
-            )
-        return True
 
     def sync_exploration_after_task(self) -> ExplorationContext:
         """探索任务自然结束后的轻量同步：不杀 go2.sh，不标 CANCELLED。"""

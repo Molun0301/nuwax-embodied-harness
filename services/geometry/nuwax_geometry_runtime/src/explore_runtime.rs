@@ -18,12 +18,7 @@ use compute_backend::*;
 use explore_compute_service::*;
 
 use std::collections::{HashMap, VecDeque};
-use std::fmt;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
 #[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
@@ -216,8 +211,6 @@ impl ExploreStartConfig {
     fn validate(&self, surface_mode: bool) -> Result<ExplorationArbitrationPolicy, String> {
         let policy = self.validate_behavior(surface_mode)?;
         if !self.resume_progress_json.is_empty() { ExplorationCheckpoint::parse(&self.resume_progress_json)?; }
-        self.motion_admission.validate()
-            .map_err(|reason| format!("motion admission proof invalid: {reason}"))?;
         Ok(policy)
     }
 
@@ -320,9 +313,6 @@ pub(crate) fn build_wavefront_goal_intent(
     {
         return Err("wavefront goal is not in map-frame semantics".to_string());
     }
-    motion_admission
-        .validate()
-        .map_err(|reason| format!("wavefront motion admission is invalid: {reason}"))?;
     let timestamp_ns = goal.target.stamp.nanos;
     if timestamp_ns <= 0 {
         return Err("wavefront goal timestamp must be positive".to_string());
@@ -376,9 +366,9 @@ pub(crate) fn build_wavefront_goal_intent(
         boundary_id,
         body_to_support_z_m: None,
         boundary_points,
-        motion_guard_generation: motion_admission.guard_generation as i64,
+
         motion_guard_boot_nonce: motion_admission.guard_boot_nonce,
-        motion_stop_generation: motion_admission.motion_stop_generation as i64,
+        motion_stop_generation: i64::try_from(motion_admission.motion_stop_generation).map_err(|_| "motion_stop_generation cannot fit LCM i64".to_string())?,
         goal: goal_pose,
     })
 }
@@ -608,7 +598,15 @@ impl ChildNavigationDispatch {
         if owner.is_some() {
             // Only explicit completion clears this projection. A panic leaves
             // it set and is reported by the original root supervisor.
-            runtime.inner.lock().await.retained_child_dispatch = false;
+            let guard = {
+                let mut guard = runtime.inner.lock().await;
+                guard.retained_child_dispatch = false;
+                guard
+            };
+            let mut current = runtime.snapshot_cache.write();
+            if current.request_id == guard.last_request_id {
+                current.parking_pending = guard.pending_child_cancellation.is_some();
+            }
         }
         snapshot
     }
@@ -714,6 +712,8 @@ pub trait ExplorePoseProvider: Send + Sync {
 
 #[derive(Debug, Clone)]
 pub struct ExploreRuntimeSnapshot {
+    /// 真实子取消或在途派发仍待停车，不由业务FAILED推断停稳。
+    pub parking_pending: bool,
     pub status: &'static str,
     pub message: String,
     pub request_id: String,
@@ -724,15 +724,15 @@ pub struct ExploreRuntimeSnapshot {
     pub child_task_id: String,
     pub exploration_generation: u64,
     pub child_lease: Option<ChildNavigationLease>,
-    pub rollover_recovery_eligible: bool,
-    pub global_stop_reconciliation: ExplorationGlobalStopReconciliationSnapshot,
-    pub ownership_reconciliation_receipt: Option<ExplorationOwnershipReconciliationReceipt>,
+
+
     pub mission_progress_json: String,
 }
 
 impl Default for ExploreRuntimeSnapshot {
     fn default() -> Self {
         Self {
+            parking_pending: false,
             status: STATUS_IDLE,
             message: "exploration idle".to_string(),
             request_id: String::new(),
@@ -743,115 +743,7 @@ impl Default for ExploreRuntimeSnapshot {
             child_task_id: String::new(),
             exploration_generation: 0,
             child_lease: None,
-            rollover_recovery_eligible: false,
-            global_stop_reconciliation: ExplorationGlobalStopReconciliationSnapshot::default(),
-            ownership_reconciliation_receipt: None,
             mission_progress_json: String::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ExplorationGlobalStopReconciliationSnapshot {
-    pub eligible: bool,
-    pub cancel_generation: u64,
-    pub recovery_correlation: String,
-    pub motion_admission: Option<MotionAdmissionProof>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ExplorationOwnershipReconciliationReceipt {
-    pub cause: String,
-    pub recovery_correlation: String,
-    pub parent_request_id: String,
-    pub exploration_generation: u64,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub child_lease_fingerprint: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub child_lease: Option<ChildNavigationLease>,
-    pub cancel_generation: u64,
-    pub commit_disposition: String,
-}
-
-#[derive(Clone, PartialEq, Eq)]
-pub struct RecoveryFenceToken(Vec<u8>);
-
-impl RecoveryFenceToken {
-    pub fn from_wire(value: Vec<u8>) -> Self {
-        Self(value)
-    }
-
-
-    fn is_valid(&self) -> bool {
-        self.0.len() == 32 && self.0.iter().any(|byte| *byte != 0)
-    }
-
-    #[cfg(test)]
-    fn clear(&mut self) {
-        self.0.clear();
-    }
-}
-
-impl fmt::Debug for RecoveryFenceToken {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("RecoveryFenceToken([REDACTED])")
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExplorationRecoveryGuardProof {
-    pub stop_operation_id: String,
-    pub recovery_correlation: String,
-    pub motion_admission: MotionAdmissionProof,
-    pub zero_ack_id: String,
-    pub zero_applied_monotonic_ns: u64,
-    pub recovery_fence_token: RecoveryFenceToken,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExplorationRolloverRecoveryRequest {
-    pub request_id: String,
-    pub exploration_generation: u64,
-    pub child_lease: ChildNavigationLease,
-    pub expected_navigation_runtime_generation: u64,
-    pub observed_navigation_runtime_generation: u64,
-    pub guard_proof: ExplorationRecoveryGuardProof,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExplorationGlobalStopGuardProof {
-    pub stop_operation_id: String,
-    pub recovery_correlation: String,
-    pub original_motion_admission: MotionAdmissionProof,
-    pub held_guard_generation: u64,
-    pub held_guard_boot_nonce: [u8; 16],
-    pub held_motion_stop_generation: u64,
-    pub zero_ack_id: String,
-    pub zero_applied_monotonic_ns: u64,
-    pub recovery_fence_token: RecoveryFenceToken,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExplorationGlobalStopReconciliationRequest {
-    pub request_id: String,
-    pub exploration_generation: u64,
-    pub child_lease: ChildNavigationLease,
-    pub cancel_generation: u64,
-    pub recovery_correlation: String,
-    pub guard_proof: ExplorationGlobalStopGuardProof,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ExplorationRecoveryError {
-    InvalidArgument(String),
-    FailedPrecondition(String),
-}
-
-impl ExplorationRecoveryError {
-    pub fn message(&self) -> &str {
-        match self {
-            Self::InvalidArgument(message) | Self::FailedPrecondition(message) => message,
         }
     }
 }
@@ -878,719 +770,6 @@ struct PendingChildCancellation {
     failure: Option<String>,
     dispatch_in_flight: bool,
     early_terminals: Vec<ChildNavigationResult>,
-}
-
-#[derive(Debug, Clone)]
-struct CompletedRolloverRecovery {
-    request: ExplorationRolloverRecoveryRequest,
-    snapshot: ExploreRuntimeSnapshot,
-}
-
-#[derive(Debug, Clone)]
-struct CompletedGlobalStopReconciliation {
-    request: ExplorationGlobalStopReconciliationRequest,
-    snapshot: ExploreRuntimeSnapshot,
-}
-
-#[derive(Debug, Clone)]
-struct CompletedExactChildZeroed {
-    receipt: ExplorationOwnershipReconciliationReceipt,
-}
-
-#[derive(Debug, Clone)]
-enum CompletedOwnershipTransition {
-    NavigationRollover(CompletedRolloverRecovery),
-    GlobalStop(CompletedGlobalStopReconciliation),
-    ExactChildZeroed(CompletedExactChildZeroed),
-}
-
-const GLOBAL_STOP_RECONCILIATION_CAUSE: &str = "ordinary_global_stop";
-const GLOBAL_STOP_COMMIT_DISPOSITION: &str = "global_stop_reconciled_child_ownership";
-const EXACT_CHILD_ZEROED_CAUSE: &str = "late_exact_child_zeroed";
-const EXACT_CHILD_ZEROED_DISPOSITION: &str = "exact_child_zeroed_released_ownership";
-const RECONCILIATION_JOURNAL_SCHEMA_VERSION: u32 = 2;
-const RECONCILIATION_JOURNAL_CAPACITY: usize = 32;
-const RECONCILIATION_JOURNAL_MAX_BYTES: u64 = 256 * 1024;
-const RECONCILIATION_JOURNAL_MAX_ID_BYTES: usize = 512;
-const RECONCILIATION_JOURNAL_MAX_MESSAGE_BYTES: usize = 4096;
-const PRODUCTION_RECONCILIATION_JOURNAL_PATH: &str =
-    "/var/lib/nuwax/geometry-runtime/exploration_ownership_journal.json";
-const JOURNAL_TEMP_CREATE_ATTEMPTS: usize = 128;
-static NEXT_JOURNAL_TEMP_ID: AtomicU64 = AtomicU64::new(0);
-static RECONCILIATION_JOURNAL_IO_LOCK: OnceLock<SyncMutex<()>> = OnceLock::new();
-static POISONED_RECONCILIATION_JOURNAL_PATHS: OnceLock<
-    SyncMutex<std::collections::HashSet<PathBuf>>,
-> = OnceLock::new();
-
-#[cfg(test)]
-static TEST_RECONCILIATION_JOURNAL_PATHS: OnceLock<
-    SyncMutex<std::collections::HashMap<usize, PathBuf>>,
-> = OnceLock::new();
-#[cfg(test)]
-static TEST_DIRECTORY_SYNC_FAILURES: OnceLock<
-    SyncMutex<std::collections::HashMap<PathBuf, usize>>,
-> = OnceLock::new();
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
-enum DurableOwnershipTransitionKind {
-    GlobalStop,
-    ExactChildZeroed,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-struct DurableReconciliationSnapshot {
-    status: String,
-    message: String,
-    request_id: String,
-    selected_source: String,
-    last_stop_reason: String,
-    frontier_count: u32,
-    revision: u64,
-    exploration_generation: u64,
-}
-
-impl DurableReconciliationSnapshot {
-    fn into_runtime_snapshot(
-        self,
-        receipt: ExplorationOwnershipReconciliationReceipt,
-    ) -> ExploreRuntimeSnapshot {
-        ExploreRuntimeSnapshot {
-            status: STATUS_FAILED,
-            message: self.message,
-            request_id: self.request_id,
-            selected_source: self.selected_source,
-            last_stop_reason: self.last_stop_reason,
-            frontier_count: self.frontier_count,
-            revision: self.revision,
-            child_task_id: String::new(),
-            exploration_generation: self.exploration_generation,
-            child_lease: None,
-            rollover_recovery_eligible: false,
-            global_stop_reconciliation: ExplorationGlobalStopReconciliationSnapshot::default(),
-            ownership_reconciliation_receipt: Some(receipt),
-            mission_progress_json: String::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum AssignedTransitionIdentity {
-    GlobalStop {
-        parent_request_id: String,
-        exploration_generation: u64,
-        child_lease: ChildNavigationLease,
-        cancel_generation: u64,
-        stop_operation_id: String,
-        original_guard_generation: u64,
-        original_guard_boot_nonce: [u8; 16],
-        original_motion_stop_generation: u64,
-        held_guard_generation: u64,
-        held_guard_boot_nonce: [u8; 16],
-        held_motion_stop_generation: u64,
-        zero_ack_id: String,
-        zero_applied_monotonic_ns: u64,
-    },
-    ExactChildZeroed {
-        child_lease: ChildNavigationLease,
-        cancel_generation: u64,
-        zero_ack_id: String,
-        zero_applied_monotonic_ns: u64,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-struct DurableOwnershipTransition {
-    kind: DurableOwnershipTransitionKind,
-    recovery_correlation: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    request_fingerprint: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    request_identity: Option<AssignedTransitionIdentity>,
-    receipt: ExplorationOwnershipReconciliationReceipt,
-    snapshot: DurableReconciliationSnapshot,
-    committed_unix_ns: u64,
-    acknowledged: bool,
-}
-
-impl DurableOwnershipTransition {
-    fn runtime_snapshot(&self) -> ExploreRuntimeSnapshot {
-        self.snapshot
-            .clone()
-            .into_runtime_snapshot(self.receipt.clone())
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-struct DurableOwnershipJournal {
-    schema_version: u32,
-    entries: Vec<DurableOwnershipTransition>,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(tag = "format", content = "transition", rename_all = "snake_case", deny_unknown_fields)]
-enum DurableOwnershipEntryV2 {
-    LegacyV1(DurableOwnershipTransition),
-    AssignedV2(DurableOwnershipTransition),
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DurableOwnershipJournalV2 {
-    schema_version: u32,
-    entries: Vec<DurableOwnershipEntryV2>,
-}
-
-fn decode_ownership_journal(bytes: &[u8]) -> Result<DurableOwnershipJournal, String> {
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct Header { schema_version: u32, entries: Vec<serde_json::Value> }
-    let header: Header = serde_json::from_slice(bytes)
-        .map_err(|error| format!("ownership journal JSON invalid: {error}"))?;
-    let mut entries = Vec::with_capacity(header.entries.len());
-    for value in header.entries {
-        let entry = match header.schema_version {
-            1 => {
-                let entry: DurableOwnershipTransition = serde_json::from_value(value)
-                    .map_err(|error| format!("legacy ownership journal JSON invalid: {error}"))?;
-                if entry.request_identity.is_some() || entry.receipt.child_lease.is_some() {
-                    return Err("legacy journal cannot contain assigned identity".into());
-                }
-                entry
-            }
-            2 => match serde_json::from_value::<DurableOwnershipEntryV2>(value)
-                .map_err(|error| format!("ownership journal v2 JSON invalid: {error}"))? {
-                    DurableOwnershipEntryV2::LegacyV1(entry) if entry.request_identity.is_none()
-                        && entry.receipt.child_lease.is_none() => entry,
-                    DurableOwnershipEntryV2::AssignedV2(entry) if entry.request_identity.is_some()
-                        && entry.receipt.child_lease.is_some() && entry.request_fingerprint.is_empty()
-                        && entry.receipt.child_lease_fingerprint.is_empty() => entry,
-                    _ => return Err("ownership journal mixes legacy and assigned identity".into()),
-                },
-            other => return Err(format!("ownership journal schema {other} is unsupported")),
-        };
-        entries.push(entry);
-    }
-    if !matches!(header.schema_version, 1 | 2) {
-        return Err(format!("ownership journal schema {} is unsupported", header.schema_version));
-    }
-    Ok(DurableOwnershipJournal { schema_version: header.schema_version, entries })
-}
-
-fn encode_ownership_journal(journal: &DurableOwnershipJournal) -> Result<Vec<u8>, serde_json::Error> {
-    if journal.schema_version != 2 {
-        return serde_json::to_vec(journal);
-    }
-    serde_json::to_vec(&DurableOwnershipJournalV2 {
-        schema_version: 2,
-        entries: journal.entries.iter().cloned().map(|entry|
-            if entry.request_identity.is_some() { DurableOwnershipEntryV2::AssignedV2(entry) }
-            else { DurableOwnershipEntryV2::LegacyV1(entry) }).collect(),
-    })
-}
-
-impl Default for DurableOwnershipJournal {
-    fn default() -> Self {
-        Self {
-            schema_version: RECONCILIATION_JOURNAL_SCHEMA_VERSION,
-            entries: Vec::new(),
-        }
-    }
-}
-
-enum DurableCommitOutcome {
-    Committed,
-    ExactReplay(Box<DurableOwnershipTransition>),
-}
-
-fn reconciliation_journal_path_from_env() -> PathBuf {
-    std::env::var_os("NUWAX_GEOMETRY_EXPLORATION_RECONCILIATION_JOURNAL_PATH")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            #[cfg(test)]
-            {
-                std::env::temp_dir()
-                    .join(format!(
-                        "nuwax-exploration-ownership-journal-{}",
-                        std::process::id()
-                    ))
-                    .join("journal.json")
-            }
-            #[cfg(not(test))]
-            PathBuf::from(PRODUCTION_RECONCILIATION_JOURNAL_PATH)
-        })
-}
-
-fn is_bounded_string(value: &str, max_bytes: usize) -> bool {
-    !value.trim().is_empty() && value.len() <= max_bytes
-}
-
-fn is_sha256_hex(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .as_bytes()
-            .iter()
-            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
-}
-
-fn validate_durable_ownership_transition(entry: &DurableOwnershipTransition) -> Result<(), String> {
-    let receipt = &entry.receipt;
-    let snapshot = &entry.snapshot;
-    let identity_valid = match (&entry.request_identity, &receipt.child_lease) {
-        (None, None) => entry.recovery_correlation.strip_prefix("exploration-global-stop:")
-            .is_some_and(is_sha256_hex) && is_sha256_hex(&entry.request_fingerprint)
-            && is_sha256_hex(&receipt.child_lease_fingerprint),
-        (Some(identity), Some(child)) => {
-            let (identity_child, cancel_generation, zero_ack_id, zero_ns, kind_valid) = match identity {
-                AssignedTransitionIdentity::GlobalStop { parent_request_id, exploration_generation,
-                    child_lease, cancel_generation, stop_operation_id, original_guard_generation,
-                    original_guard_boot_nonce, held_guard_generation, held_guard_boot_nonce,
-                    zero_ack_id, zero_applied_monotonic_ns, .. } => (child_lease, *cancel_generation,
-                        zero_ack_id, *zero_applied_monotonic_ns,
-                        entry.kind == DurableOwnershipTransitionKind::GlobalStop
-                        && parent_request_id == &receipt.parent_request_id
-                        && *exploration_generation == receipt.exploration_generation
-                        && is_bounded_string(stop_operation_id, RECONCILIATION_JOURNAL_MAX_ID_BYTES)
-                        && *original_guard_generation > 0 && *original_guard_boot_nonce != [0; 16]
-                        && *held_guard_generation > 0 && *held_guard_boot_nonce != [0; 16]),
-                AssignedTransitionIdentity::ExactChildZeroed { child_lease, cancel_generation,
-                    zero_ack_id, zero_applied_monotonic_ns } => (child_lease, *cancel_generation,
-                        zero_ack_id, *zero_applied_monotonic_ns,
-                        entry.kind == DurableOwnershipTransitionKind::ExactChildZeroed),
-            };
-            kind_valid && identity_child == child && child.parent_request_id == receipt.parent_request_id
-                && valid_child_lease(child) && cancel_generation == receipt.cancel_generation
-                && is_bounded_string(zero_ack_id, RECONCILIATION_JOURNAL_MAX_ID_BYTES) && zero_ns > 0
-                && entry.request_fingerprint.is_empty() && receipt.child_lease_fingerprint.is_empty()
-                && entry.recovery_correlation == assigned_recovery_correlation(child, cancel_generation)
-        }
-        _ => false,
-    };
-    if !identity_valid || !is_bounded_string(&entry.recovery_correlation, RECONCILIATION_JOURNAL_MAX_ID_BYTES)
-        || receipt.recovery_correlation != entry.recovery_correlation
-        || !is_bounded_string(
-            &receipt.parent_request_id,
-            RECONCILIATION_JOURNAL_MAX_ID_BYTES,
-        )
-        || receipt.exploration_generation == 0
-        || receipt.cancel_generation == 0
-        || snapshot.status != STATUS_FAILED
-        || !is_bounded_string(&snapshot.message, RECONCILIATION_JOURNAL_MAX_MESSAGE_BYTES)
-        || !is_bounded_string(&snapshot.request_id, RECONCILIATION_JOURNAL_MAX_ID_BYTES)
-        || snapshot.selected_source.len() > RECONCILIATION_JOURNAL_MAX_ID_BYTES
-        || !is_bounded_string(
-            &snapshot.last_stop_reason,
-            RECONCILIATION_JOURNAL_MAX_ID_BYTES,
-        )
-        || snapshot.request_id != receipt.parent_request_id
-        || snapshot.exploration_generation != receipt.exploration_generation
-        || snapshot.frontier_count != 0
-        || entry.committed_unix_ns == 0
-    {
-        return Err("ownership journal contains an invalid transition".to_string());
-    }
-    let kind_matches = match entry.kind {
-        DurableOwnershipTransitionKind::GlobalStop => {
-            receipt.cause == GLOBAL_STOP_RECONCILIATION_CAUSE
-                && receipt.commit_disposition == GLOBAL_STOP_COMMIT_DISPOSITION
-                && snapshot.last_stop_reason == "global_stop_reconciled_safe"
-        }
-        DurableOwnershipTransitionKind::ExactChildZeroed => {
-            receipt.cause == EXACT_CHILD_ZEROED_CAUSE
-                && receipt.commit_disposition == EXACT_CHILD_ZEROED_DISPOSITION
-                && snapshot.last_stop_reason == "child_cancel_failed"
-        }
-    };
-    if !kind_matches {
-        return Err("ownership journal transition kind is inconsistent".to_string());
-    }
-    Ok(())
-}
-
-fn journal_parent(path: &Path) -> Result<&Path, String> {
-    path.parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .ok_or_else(|| "ownership journal path has no usable parent".to_string())
-}
-
-fn ensure_secure_journal_directory(parent: &Path) -> Result<(), String> {
-    let metadata = match fs::symlink_metadata(parent) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            fs::create_dir_all(parent)
-                .map_err(|error| format!("ownership journal directory create failed: {error}"))?;
-            #[cfg(unix)]
-            fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).map_err(|error| {
-                format!("ownership journal directory permission setup failed: {error}")
-            })?;
-            fs::symlink_metadata(parent)
-                .map_err(|error| format!("ownership journal directory metadata failed: {error}"))?
-        }
-        Err(error) => {
-            return Err(format!(
-                "ownership journal directory metadata failed: {error}"
-            ));
-        }
-    };
-    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
-        return Err("ownership journal parent must be a real directory".to_string());
-    }
-    #[cfg(unix)]
-    if metadata.mode() & 0o777 != 0o700 {
-        return Err("ownership journal directory permissions must be 0700".to_string());
-    }
-    Ok(())
-}
-
-fn validate_existing_journal_file(path: &Path) -> Result<(), String> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
-                return Err("ownership journal must be a regular file".to_string());
-            }
-            #[cfg(unix)]
-            if metadata.mode() & 0o777 != 0o600 {
-                return Err("ownership journal permissions must be 0600".to_string());
-            }
-            Ok(())
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!("ownership journal metadata failed: {error}")),
-    }
-}
-
-fn lock_durable_ownership_journal(path: &Path) -> Result<nix::fcntl::Flock<File>, String> {
-    let parent = journal_parent(path)?;
-    ensure_secure_journal_directory(parent)?;
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| "ownership journal path has no file name".to_string())?;
-    let lock_path = parent.join(format!(".{file_name}.lock"));
-    validate_existing_journal_file(&lock_path)?;
-    let file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .mode(0o600)
-        .custom_flags(nix::libc::O_NOFOLLOW)
-        .open(&lock_path)
-        .map_err(|error| format!("ownership journal lock open failed: {error}"))?;
-    let metadata = file
-        .metadata()
-        .map_err(|error| format!("ownership journal lock metadata failed: {error}"))?;
-    if !metadata.is_file() || metadata.mode() & 0o777 != 0o600 {
-        return Err("ownership journal lock must be a 0600 regular file".to_string());
-    }
-    nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusive)
-        .map_err(|(_, error)| format!("ownership journal lock acquisition failed: {error}"))
-}
-
-fn sync_journal_directory(parent: &Path) -> io::Result<()> {
-    #[cfg(test)]
-    {
-        let mut failures = TEST_DIRECTORY_SYNC_FAILURES
-            .get_or_init(|| SyncMutex::new(std::collections::HashMap::new()))
-            .lock();
-        if let Some(remaining) = failures.get_mut(parent) {
-            if *remaining > 0 {
-                *remaining -= 1;
-                return Err(io::Error::other("injected journal directory sync failure"));
-            }
-        }
-    }
-    File::open(parent)?.sync_all()
-}
-
-fn poison_journal_path(path: &Path) {
-    POISONED_RECONCILIATION_JOURNAL_PATHS
-        .get_or_init(|| SyncMutex::new(std::collections::HashSet::new()))
-        .lock()
-        .insert(path.to_path_buf());
-}
-
-fn recover_poisoned_journal_path(path: &Path) -> Result<(), String> {
-    let poisoned = POISONED_RECONCILIATION_JOURNAL_PATHS
-        .get_or_init(|| SyncMutex::new(std::collections::HashSet::new()))
-        .lock()
-        .contains(path);
-    if !poisoned {
-        return Ok(());
-    }
-    sync_journal_directory(journal_parent(path)?).map_err(|error| {
-        format!("ownership journal remains post-rename durability uncertain: {error}")
-    })?;
-    POISONED_RECONCILIATION_JOURNAL_PATHS
-        .get_or_init(|| SyncMutex::new(std::collections::HashSet::new()))
-        .lock()
-        .remove(path);
-    Ok(())
-}
-
-fn read_durable_ownership_journal(path: &Path) -> Result<DurableOwnershipJournal, String> {
-    recover_poisoned_journal_path(path)?;
-    let parent = journal_parent(path)?;
-    if parent.exists() {
-        ensure_secure_journal_directory(parent)?;
-    }
-    validate_existing_journal_file(path)?;
-    if path.exists() {
-        sync_journal_directory(parent).map_err(|error| {
-            format!("ownership journal directory durability verification failed: {error}")
-        })?;
-    }
-    let file = match OpenOptions::new()
-        .read(true)
-        .custom_flags(nix::libc::O_NOFOLLOW)
-        .open(path)
-    {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(DurableOwnershipJournal::default());
-        }
-        Err(error) => return Err(format!("ownership journal read failed: {error}")),
-    };
-    let metadata = file
-        .metadata()
-        .map_err(|error| format!("ownership journal metadata failed: {error}"))?;
-    if !metadata.is_file() || metadata.len() > RECONCILIATION_JOURNAL_MAX_BYTES {
-        return Err("ownership journal is not a bounded regular file".to_string());
-    }
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.take(RECONCILIATION_JOURNAL_MAX_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| format!("ownership journal read failed: {error}"))?;
-    if bytes.len() as u64 > RECONCILIATION_JOURNAL_MAX_BYTES {
-        return Err("ownership journal exceeds maximum byte size".to_string());
-    }
-    let journal = decode_ownership_journal(&bytes)?;
-    if journal.entries.len() > RECONCILIATION_JOURNAL_CAPACITY {
-        return Err("ownership journal exceeds bounded capacity".to_string());
-    }
-    let mut correlations = std::collections::HashSet::new();
-    for entry in &journal.entries {
-        validate_durable_ownership_transition(entry)?;
-        if !correlations.insert(entry.recovery_correlation.as_str()) {
-            return Err("ownership journal contains an invalid transition".to_string());
-        }
-    }
-    Ok(journal)
-}
-
-fn persist_durable_ownership_journal(
-    path: &Path,
-    journal: &DurableOwnershipJournal,
-) -> Result<(), String> {
-    recover_poisoned_journal_path(path)?;
-    let parent = journal_parent(path)?;
-    ensure_secure_journal_directory(parent)?;
-    validate_existing_journal_file(path)?;
-    let bytes = encode_ownership_journal(journal)
-        .map_err(|error| format!("ownership journal serialization failed: {error}"))?;
-    if bytes.len() as u64 > RECONCILIATION_JOURNAL_MAX_BYTES {
-        return Err("ownership journal exceeds maximum byte size".to_string());
-    }
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| "ownership journal path has no file name".to_string())?;
-    let mut selected = None;
-    for _ in 0..JOURNAL_TEMP_CREATE_ATTEMPTS {
-        let temp_path = parent.join(format!(
-            ".{file_name}.tmp.{}.{}",
-            std::process::id(),
-            NEXT_JOURNAL_TEMP_ID.fetch_add(1, Ordering::Relaxed)
-        ));
-        match OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o600)
-            .custom_flags(nix::libc::O_NOFOLLOW)
-            .open(&temp_path)
-        {
-            Ok(file) => {
-                selected = Some((temp_path, file));
-                break;
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => {
-                return Err(format!("ownership journal temp create failed: {error}"));
-            }
-        }
-    }
-    let (temp_path, mut file) =
-        selected.ok_or_else(|| "ownership journal temp file attempts exhausted".to_string())?;
-    let mut renamed = false;
-    let result = (|| {
-        file.write_all(&bytes)
-            .and_then(|_| file.write_all(b"\n"))
-            .and_then(|_| file.sync_all())
-            .map_err(|error| format!("ownership journal temp sync failed: {error}"))?;
-        fs::rename(&temp_path, path)
-            .map_err(|error| format!("ownership journal atomic rename failed: {error}"))?;
-        renamed = true;
-        if let Err(error) = sync_journal_directory(parent) {
-            poison_journal_path(path);
-            return Err(format!(
-                "ownership journal post-rename durability uncertain: {error}"
-            ));
-        }
-        Ok(())
-    })();
-    if result.is_err() && !renamed {
-        let _ = fs::remove_file(&temp_path);
-    }
-    result
-}
-
-fn commit_durable_ownership_transition(
-    path: &Path,
-    transition: DurableOwnershipTransition,
-) -> Result<DurableCommitOutcome, String> {
-    let _io_guard = RECONCILIATION_JOURNAL_IO_LOCK
-        .get_or_init(|| SyncMutex::new(()))
-        .lock();
-    let _file_guard = lock_durable_ownership_journal(path)?;
-    validate_durable_ownership_transition(&transition)?;
-    let mut journal = read_durable_ownership_journal(path)?;
-    if let Some(existing) = journal
-        .entries
-        .iter()
-        .find(|entry| entry.recovery_correlation == transition.recovery_correlation)
-    {
-        if existing.kind == transition.kind
-            && existing.request_identity == transition.request_identity
-            && existing.receipt.child_lease == transition.receipt.child_lease
-            && existing.request_fingerprint == transition.request_fingerprint
-        {
-            return Ok(DurableCommitOutcome::ExactReplay(Box::new(
-                existing.clone(),
-            )));
-        }
-        return Err("ownership transition already has a different first winner".to_string());
-    }
-    while journal.entries.len() >= RECONCILIATION_JOURNAL_CAPACITY {
-        let Some(position) = journal.entries.iter().position(|entry| entry.acknowledged) else {
-            return Err("ownership journal is full of unacknowledged transitions".to_string());
-        };
-        journal.entries.remove(position);
-    }
-    if transition.request_identity.is_some() { journal.schema_version = 2; }
-    journal.entries.push(transition);
-    persist_durable_ownership_journal(path, &journal)?;
-    Ok(DurableCommitOutcome::Committed)
-}
-
-fn replay_durable_ownership_transition(
-    path: &Path,
-    kind: DurableOwnershipTransitionKind,
-    recovery_correlation: &str,
-    request_identity: &AssignedTransitionIdentity,
-) -> Result<Option<DurableOwnershipTransition>, String> {
-    let _io_guard = RECONCILIATION_JOURNAL_IO_LOCK
-        .get_or_init(|| SyncMutex::new(()))
-        .lock();
-    let _file_guard = lock_durable_ownership_journal(path)?;
-    let journal = read_durable_ownership_journal(path)?;
-    let Some(existing) = journal
-        .entries
-        .iter()
-        .find(|entry| entry.recovery_correlation == recovery_correlation)
-    else {
-        return Ok(None);
-    };
-    if existing.kind == kind && existing.request_identity.as_ref() == Some(request_identity) {
-        return Ok(Some(existing.clone()));
-    }
-    Err("ownership transition replay proof does not match the durable first winner".to_string())
-}
-
-fn acknowledge_durable_ownership_transition(
-    path: &Path,
-    recovery_correlation: &str,
-    child_lease_fingerprint: &str,
-    child_lease: Option<&ChildNavigationLease>,
-) -> Result<bool, String> {
-    let _io_guard = RECONCILIATION_JOURNAL_IO_LOCK
-        .get_or_init(|| SyncMutex::new(()))
-        .lock();
-    let _file_guard = lock_durable_ownership_journal(path)?;
-    let mut journal = read_durable_ownership_journal(path)?;
-    let Some(existing) = journal.entries.iter_mut().find(|entry| {
-        entry.recovery_correlation == recovery_correlation
-            && match (entry.receipt.child_lease.as_ref(), child_lease) {
-                (Some(stored), Some(child)) => child_lease_fingerprint.is_empty() && stored == child,
-                (None, None) => !child_lease_fingerprint.is_empty() && entry.receipt.child_lease_fingerprint == child_lease_fingerprint,
-                _ => false,
-            }
-    }) else {
-        return Ok(false);
-    };
-    if existing.acknowledged {
-        return Ok(true);
-    }
-    existing.acknowledged = true;
-    persist_durable_ownership_journal(path, &journal)?;
-    Ok(true)
-}
-
-fn valid_child_lease(child: &ChildNavigationLease) -> bool {
-    is_bounded_string(&child.session_id, RECONCILIATION_JOURNAL_MAX_ID_BYTES)
-        && is_bounded_string(&child.parent_request_id, RECONCILIATION_JOURNAL_MAX_ID_BYTES)
-        && child.owner_kind == schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD
-        && (1..=i64::MAX as u64).contains(&child.goal_generation)
-        && (1..=i64::MAX as u64).contains(&child.producer_runtime_generation)
-}
-
-fn assigned_recovery_correlation(child: &ChildNavigationLease, cancel_generation: u64) -> String {
-    format!("exploration-global-stop:v2:{}:{}:{}",
-        child.producer_runtime_generation, child.goal_generation, cancel_generation)
-}
-
-fn global_stop_request_identity(request: &ExplorationGlobalStopReconciliationRequest) -> AssignedTransitionIdentity {
-    let proof = &request.guard_proof;
-    AssignedTransitionIdentity::GlobalStop {
-        parent_request_id: request.request_id.clone(),
-        exploration_generation: request.exploration_generation,
-        child_lease: request.child_lease.clone(),
-        cancel_generation: request.cancel_generation,
-        stop_operation_id: proof.stop_operation_id.clone(),
-        original_guard_generation: proof.original_motion_admission.guard_generation,
-        original_guard_boot_nonce: proof.original_motion_admission.guard_boot_nonce,
-        original_motion_stop_generation: proof.original_motion_admission.motion_stop_generation,
-        held_guard_generation: proof.held_guard_generation,
-        held_guard_boot_nonce: proof.held_guard_boot_nonce,
-        held_motion_stop_generation: proof.held_motion_stop_generation,
-        zero_ack_id: proof.zero_ack_id.clone(),
-        zero_applied_monotonic_ns: proof.zero_applied_monotonic_ns,
-    }
-}
-
-fn exact_child_zero_request_identity(proof: &ChildNavigationZeroProof) -> AssignedTransitionIdentity {
-    AssignedTransitionIdentity::ExactChildZeroed {
-        child_lease: proof.lease.clone(), cancel_generation: proof.cancel_generation,
-        zero_ack_id: proof.zero_ack_id.clone(), zero_applied_monotonic_ns: proof.zero_applied_monotonic_ns,
-    }
-}
-
-fn durable_snapshot_from_runtime(
-    snapshot: &ExploreRuntimeSnapshot,
-) -> DurableReconciliationSnapshot {
-    DurableReconciliationSnapshot {
-        status: snapshot.status.to_string(),
-        message: snapshot.message.clone(),
-        request_id: snapshot.request_id.clone(),
-        selected_source: snapshot.selected_source.clone(),
-        last_stop_reason: snapshot.last_stop_reason.clone(),
-        frontier_count: snapshot.frontier_count,
-        revision: snapshot.revision,
-        exploration_generation: snapshot.exploration_generation,
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1685,12 +864,13 @@ pub struct ExploreRuntimeInner {
     // Neither Stop nor Start clears this; only that operation may settle it.
     retained_child_dispatch: bool,
     pending_child_cancellation: Option<PendingChildCancellation>,
-    completed_rollover_recovery: Option<CompletedOwnershipTransition>,
     session_generation: u64,
     generation: u64,
     child_sequence: u64,
     reached_goals: u32,
     started_at_ns: u64,
+    // 与守卫回执共用 CLOCK_MONOTONIC，不改变进度和输入新鲜度的原时钟。
+    started_guard_clock_ns: u64,
     no_frontier_since: Option<Instant>,
     frontiers: Vec<FrontierGoal>,
     frontier_revision: u64,
@@ -1734,12 +914,12 @@ impl ExploreRuntimeInner {
             pending_child_dispatch: None,
             retained_child_dispatch: false,
             pending_child_cancellation: None,
-            completed_rollover_recovery: None,
             session_generation: 0,
             generation: 0,
             child_sequence: 0,
             reached_goals: 0,
             started_at_ns: 0,
+            started_guard_clock_ns: 0,
             no_frontier_since: None,
             frontiers: Vec::new(),
             frontier_revision: 0,
@@ -1764,43 +944,8 @@ impl ExploreRuntimeInner {
 
     fn snapshot(&self, status: &'static str, message: impl Into<String>) -> ExploreRuntimeSnapshot {
         let child_lease = self.active_child.as_ref().map(|child| child.lease.clone());
-        let rollover_recovery_eligible = !self.logical_active
-            && child_lease.is_some()
-            && self
-                .pending_child_cancellation
-                .as_ref()
-                .is_some_and(|pending| pending.failure.is_some() && !pending.dispatch_in_flight);
-        let global_stop_reconciliation = self
-            .pending_child_cancellation
-            .as_ref()
-            .filter(|pending| pending.failure.is_some() && !pending.dispatch_in_flight)
-            .and_then(|pending| pending.ticket.as_ref())
-            .and_then(|ticket| {
-                let child_lease = child_lease.as_ref()?;
-                let motion_admission = self.active_config.as_ref()?.motion_admission;
-                Some(ExplorationGlobalStopReconciliationSnapshot {
-                    eligible: !self.logical_active
-                        && ticket.cancel_generation > 0
-                        && ticket.lease.matches(child_lease),
-                    cancel_generation: ticket.cancel_generation,
-                    recovery_correlation: assigned_recovery_correlation(child_lease, ticket.cancel_generation),
-                    motion_admission: Some(motion_admission),
-                })
-            })
-            .unwrap_or_default();
-        let ownership_reconciliation_receipt =
-            self.completed_rollover_recovery
-                .as_ref()
-                .and_then(|completed| match completed {
-                    CompletedOwnershipTransition::GlobalStop(completed) => {
-                        completed.snapshot.ownership_reconciliation_receipt.clone()
-                    }
-                    CompletedOwnershipTransition::ExactChildZeroed(completed) => {
-                        Some(completed.receipt.clone())
-                    }
-                    CompletedOwnershipTransition::NavigationRollover(_) => None,
-                });
         ExploreRuntimeSnapshot {
+            parking_pending: self.pending_child_cancellation.is_some() || (!self.logical_active && self.retained_child_dispatch),
             status,
             message: message.into(),
             request_id: self.last_request_id.clone(),
@@ -1815,9 +960,8 @@ impl ExploreRuntimeInner {
                 .unwrap_or_default(),
             exploration_generation: self.session_generation,
             child_lease,
-            rollover_recovery_eligible,
-            global_stop_reconciliation,
-            ownership_reconciliation_receipt,
+
+
             mission_progress_json: self.mission.as_ref().map(|p|serde_json::to_string(p).expect("有效行程载荷")).unwrap_or_default(),
         }
     }
@@ -1929,6 +1073,9 @@ impl From<&ChildNavigationLease> for ExactOrphanLeaseKey {
 #[derive(Clone, Debug)]
 struct OrphanCancellationEntry {
     lease: ChildNavigationLease,
+    // 失败业务只等待原停车，不占用后继探索的业务入口。
+    retired_business: bool,
+    cancel_generation: Option<u64>,
     phase: OrphanCancellationPhase,
     queue_token: u64,
 }
@@ -1967,6 +1114,8 @@ impl OrphanCancellationRegistry {
             key.clone(),
             OrphanCancellationEntry {
                 lease,
+                retired_business: false,
+                cancel_generation: None,
                 phase: OrphanCancellationPhase::OwnerRequired,
                 queue_token: token,
             },
@@ -1974,6 +1123,33 @@ impl OrphanCancellationRegistry {
         state
             .queue
             .push_back(OrphanCancellationQueueItem { key, token });
+    }
+
+    fn retain_failed_business(&self, lease: ChildNavigationLease, cancel_generation: Option<u64>) {
+        self.register(lease.clone());
+        let mut state = self.state.lock();
+        let entry = state.entries.get_mut(&ExactOrphanLeaseKey::from(&lease))
+            .expect("刚保存的原取消身份");
+        entry.retired_business = true;
+        entry.cancel_generation = cancel_generation;
+    }
+
+    fn pending_for_parent(&self, parent: &str) -> bool {
+        self.state.lock().entries.values().any(|entry| entry.lease.parent_request_id == parent)
+    }
+
+    fn leases_for_parent(&self, parent: &str) -> Vec<ChildNavigationLease> {
+        self.state.lock().entries.values().filter(|entry| entry.lease.parent_request_id == parent)
+            .map(|entry| entry.lease.clone()).collect()
+    }
+
+    pub(crate) fn contains(&self, lease: &ChildNavigationLease) -> bool {
+        self.state.lock().entries.contains_key(&ExactOrphanLeaseKey::from(lease))
+    }
+
+    fn retired_cancellation(&self, lease: &ChildNavigationLease) -> Option<Option<u64>> {
+        self.state.lock().entries.get(&ExactOrphanLeaseKey::from(lease))
+            .filter(|entry| entry.retired_business).map(|entry| entry.cancel_generation)
     }
 
     pub(crate) fn mark_cancel_pending(&self, lease: &ChildNavigationLease) {
@@ -2061,7 +1237,11 @@ impl OrphanCancellationRegistry {
     }
 
     pub(crate) fn blocks_motion_mutation(&self) -> bool {
-        !self.state.lock().entries.is_empty()
+        self.has_entries()
+    }
+
+    fn blocks_child_dispatch(&self) -> bool {
+        self.state.lock().entries.values().any(|entry| !entry.retired_business)
     }
 }
 
@@ -2473,7 +1653,7 @@ impl ExploreRuntimeHandle {
             while pending.next().await.is_some() {}
         })
         .await;
-        !self.orphan_cancellations.blocks_motion_mutation()
+        !self.orphan_cancellations.has_entries()
     }
 
     pub fn set_navigation_sink(&self, sink: Arc<dyn ExploreNavigationSink>) {
@@ -2503,92 +1683,16 @@ impl ExploreRuntimeHandle {
     }
 
     pub fn snapshot(&self) -> ExploreRuntimeSnapshot {
-        self.snapshot_cache.read().clone()
+        let mut snapshot = self.snapshot_cache.read().clone();
+        snapshot.parking_pending |= self.orphan_cancellations.pending_for_parent(&snapshot.request_id);
+        snapshot
     }
 
-    fn reconciliation_journal_path(&self) -> PathBuf {
-        #[cfg(test)]
-        if let Some(path) = TEST_RECONCILIATION_JOURNAL_PATHS
-            .get_or_init(|| SyncMutex::new(std::collections::HashMap::new()))
-            .lock()
-            .get(&(Arc::as_ptr(&self.inner) as usize))
-            .cloned()
-        {
-            return path;
-        }
-        reconciliation_journal_path_from_env()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_reconciliation_journal_path_for_tests(&self, path: PathBuf) {
-        TEST_RECONCILIATION_JOURNAL_PATHS
-            .get_or_init(|| SyncMutex::new(std::collections::HashMap::new()))
-            .lock()
-            .insert(Arc::as_ptr(&self.inner) as usize, path);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn fail_next_reconciliation_directory_sync_for_tests(&self) {
-        let path = self.reconciliation_journal_path();
-        TEST_DIRECTORY_SYNC_FAILURES
-            .get_or_init(|| SyncMutex::new(std::collections::HashMap::new()))
-            .lock()
-            .insert(path.parent().unwrap().to_path_buf(), 1);
-    }
-
-    pub fn latest_durable_reconciliation_snapshot(
-        &self,
-    ) -> Result<Option<ExploreRuntimeSnapshot>, ExplorationRecoveryError> {
-        let path = self.reconciliation_journal_path();
-        let _io_guard = RECONCILIATION_JOURNAL_IO_LOCK
-            .get_or_init(|| SyncMutex::new(()))
-            .lock();
-        let _file_guard = lock_durable_ownership_journal(&path)
-            .map_err(ExplorationRecoveryError::FailedPrecondition)?;
-        let journal = read_durable_ownership_journal(&path)
-            .map_err(ExplorationRecoveryError::FailedPrecondition)?;
-        Ok(journal
-            .entries
-            .iter()
-            .rev()
-            .find(|entry| !entry.acknowledged)
-            .map(DurableOwnershipTransition::runtime_snapshot))
-    }
-
-    pub fn restore_latest_durable_reconciliation_snapshot(
-        &self,
-    ) -> Result<(), ExplorationRecoveryError> {
-        if let Some(snapshot) = self.latest_durable_reconciliation_snapshot()? {
-            self.store_snapshot(snapshot);
-        }
-        Ok(())
-    }
-
-    pub fn acknowledge_durable_reconciliation(
-        &self,
-        recovery_correlation: &str,
-        child_lease_fingerprint: &str,
-        child_lease: Option<&ChildNavigationLease>,
-    ) -> Result<bool, ExplorationRecoveryError> {
-        if recovery_correlation.trim().is_empty()
-            || (child_lease_fingerprint.is_empty() == child_lease.is_none())
-            || child_lease.is_some_and(|child| !valid_child_lease(child)) {
-            return Err(ExplorationRecoveryError::InvalidArgument(
-                "reconciliation acknowledgement identity is incomplete".to_string(),
-            ));
-        }
-        acknowledge_durable_ownership_transition(
-            &self.reconciliation_journal_path(),
-            recovery_correlation,
-            child_lease_fingerprint,
-            child_lease,
-        )
-        .map_err(ExplorationRecoveryError::FailedPrecondition)
-    }
 
     fn store_snapshot(&self, snapshot: ExploreRuntimeSnapshot) -> ExploreRuntimeSnapshot {
-        *self.snapshot_cache.write() = snapshot.clone();
-        snapshot
+        // 缓存仅保存当前业务投影；原孤儿是否停车由现有拥有方实时提供。
+        *self.snapshot_cache.write() = snapshot;
+        self.snapshot()
     }
 
     fn publish_frontiers(&self, snapshot: Option<FrontierSnapshot>) {
@@ -2620,6 +1724,7 @@ impl ExploreRuntimeHandle {
             let guard = self.inner.lock().await;
             if guard.session_in_progress() {
                 return ExploreRuntimeSnapshot {
+            parking_pending: false,
                     status: STATUS_REJECTED,
                     message: format!(
                         "exploration already active (request_id={})",
@@ -2633,10 +1738,8 @@ impl ExploreRuntimeHandle {
                     child_task_id: String::new(),
                     exploration_generation: guard.session_generation,
                     child_lease: guard.active_child.as_ref().map(|child| child.lease.clone()),
-                    rollover_recovery_eligible: false,
-                    global_stop_reconciliation:
-                        ExplorationGlobalStopReconciliationSnapshot::default(),
-                    ownership_reconciliation_receipt: None,
+
+
             mission_progress_json: String::new(),
                 };
             }
@@ -2664,6 +1767,7 @@ impl ExploreRuntimeHandle {
         let mut guard = self.inner.lock().await;
         if guard.session_in_progress() {
             let snapshot = ExploreRuntimeSnapshot {
+            parking_pending: false,
                 status: STATUS_REJECTED,
                 message: format!(
                     "exploration already active (request_id={})",
@@ -2677,9 +1781,8 @@ impl ExploreRuntimeHandle {
                 child_task_id: String::new(),
                 exploration_generation: guard.session_generation,
                 child_lease: guard.active_child.as_ref().map(|child| child.lease.clone()),
-                rollover_recovery_eligible: false,
-                global_stop_reconciliation: ExplorationGlobalStopReconciliationSnapshot::default(),
-                ownership_reconciliation_receipt: None,
+
+
             mission_progress_json: String::new(),
             };
             drop(guard);
@@ -2820,12 +1923,12 @@ impl ExploreRuntimeHandle {
         guard.active_child = None;
         guard.pending_child_dispatch = None;
         guard.pending_child_cancellation = None;
-        guard.completed_rollover_recovery = None;
         guard.session_generation = generation;
         guard.generation = generation;
         guard.child_sequence = 0;
         guard.reached_goals = 0;
         guard.started_at_ns = now_unix_nanos();
+        guard.started_guard_clock_ns = nuwax_motion_safety_guard::measured_motion::monotonic_ns();
         if let Some(saved)=restored {
             guard.mission=saved.mission;guard.return_reason=saved.return_reason;guard.reached_goals=saved.reached_goals;
             guard.started_at_ns=guard.started_at_ns.saturating_sub(saved.elapsed_ns);
@@ -2863,397 +1966,71 @@ impl ExploreRuntimeHandle {
         .await
     }
 
-    fn validate_rollover_recovery_request(
-        request: &ExplorationRolloverRecoveryRequest,
-    ) -> Result<(), ExplorationRecoveryError> {
-        let request_id = request.request_id.trim();
-        if request_id.is_empty()
-            || request.exploration_generation == 0
-            || request.child_lease.session_id.trim().is_empty()
-            || request.child_lease.parent_request_id.trim() != request_id
-            || request.child_lease.goal_generation == 0
-            || request.child_lease.producer_runtime_generation == 0
-            || request.expected_navigation_runtime_generation == 0
-            || request.observed_navigation_runtime_generation
-                <= request.expected_navigation_runtime_generation
-        {
-            return Err(ExplorationRecoveryError::InvalidArgument(
-                "incomplete exploration rollover recovery identity".to_string(),
-            ));
-        }
-        if request.guard_proof.stop_operation_id.trim().is_empty()
-            || request.guard_proof.recovery_correlation.trim().is_empty()
-            || request.guard_proof.motion_admission.validate().is_err()
-            || request.guard_proof.motion_admission.motion_stop_generation == 0
-            || request.guard_proof.zero_ack_id.trim().is_empty()
-            || request.guard_proof.zero_applied_monotonic_ns == 0
-            || !request.guard_proof.recovery_fence_token.is_valid()
-        {
-            return Err(ExplorationRecoveryError::InvalidArgument(
-                "incomplete motion guard recovery fence proof".to_string(),
-            ));
-        }
-
-        Ok(())
-    }
-
-    pub async fn replay_completed_rollover_recovery(
+    /// 普通全局停车已实际完成后，只收尾回执覆盖的原探索与精确子目标。
+    pub(crate) async fn stop_after_global_confirmation(
         &self,
-        request: &ExplorationRolloverRecoveryRequest,
-    ) -> Result<Option<ExploreRuntimeSnapshot>, ExplorationRecoveryError> {
-        Self::validate_rollover_recovery_request(request)?;
-
-        let guard = self.inner.lock().await;
-        let Some(completed) = guard.completed_rollover_recovery.as_ref() else {
-            return Ok(None);
-        };
-        if let CompletedOwnershipTransition::NavigationRollover(completed) = completed {
-            if completed.request == *request {
-                return Ok(Some(completed.snapshot.clone()));
-            }
-        }
-        Err(ExplorationRecoveryError::FailedPrecondition(
-            "rollover recovery proof does not match the completed transition".to_string(),
-        ))
-    }
-
-    pub async fn recover_after_navigation_rollover(
-        &self,
-        request: ExplorationRolloverRecoveryRequest,
-    ) -> Result<ExploreRuntimeSnapshot, ExplorationRecoveryError> {
-        Self::validate_rollover_recovery_request(&request)?;
-        let request_id = request.request_id.trim();
-
+        request_id: &str,
+        expected_exploration_generation: u64,
+        confirmation: &crate::proto::OrdinaryGlobalStopConfirmation,
+        nav: &crate::nav_runtime::NavRuntimeState,
+    ) -> Result<(ExploreRuntimeSnapshot, Option<crate::lcm_runtime::NavigationUpdate>), String> {
         let mut guard = self.inner.lock().await;
-        if let Some(completed) = guard.completed_rollover_recovery.as_ref() {
-            if let CompletedOwnershipTransition::NavigationRollover(completed) = completed {
-                if completed.request == request {
-                    return Ok(completed.snapshot.clone());
-                }
-            }
-            return Err(ExplorationRecoveryError::FailedPrecondition(
-                "rollover recovery proof does not match the completed transition".to_string(),
-            ));
+        if request_id.is_empty() || request_id != guard.last_request_id
+            || expected_exploration_generation != guard.session_generation
+        {
+            return Err("ordinary stop exploration identity changed".into());
         }
-        if guard.last_request_id != request_id {
-            return Err(ExplorationRecoveryError::FailedPrecondition(format!(
-                "exploration recovery request_id mismatch: active={} received={}",
-                guard.last_request_id, request_id
-            )));
+        if !confirmation.stationary_confirmed || confirmation.operation_id.is_empty()
+            || confirmation.zero_ack_id.is_empty()
+            || guard.started_guard_clock_ns == 0
+            || confirmation.applied_monotonic_ns < guard.started_guard_clock_ns
+        {
+            return Err("ordinary stop does not confirm stationary output after this exploration started".into());
         }
-        if guard.session_generation != request.exploration_generation {
-            return Err(ExplorationRecoveryError::FailedPrecondition(format!(
-                "exploration recovery generation mismatch: active={} received={}",
-                guard.session_generation, request.exploration_generation
-            )));
-        }
-        let active_child = guard.active_child.as_ref().ok_or_else(|| {
-            ExplorationRecoveryError::FailedPrecondition(
-                "exploration recovery has no retained child ownership".to_string(),
-            )
-        })?;
-        if !active_child.lease.matches(&request.child_lease) {
-            return Err(ExplorationRecoveryError::FailedPrecondition(
-                "exploration recovery child lease does not match retained ownership".to_string(),
-            ));
-        }
-        let cancel_failed = guard
-            .pending_child_cancellation
-            .as_ref()
-            .is_some_and(|pending| pending.failure.is_some() && !pending.dispatch_in_flight);
-        if guard.logical_active || !cancel_failed {
-            return Err(ExplorationRecoveryError::FailedPrecondition(
-                "exploration recovery requires a stopped controller and failed child cancellation"
-                    .to_string(),
-            ));
-        }
-
+        let previous = self.snapshot();
+        let preserve_failure = previous.status == STATUS_FAILED;
+        let mut remembered = self.orphan_cancellations.leases_for_parent(request_id);
+        if let Some(child) = guard.active_child.as_ref() { remembered.push(child.lease.clone()); }
         let generation = self.next_exploration_generation(&mut guard);
-        guard.generation = generation;
-        guard.pending_child_dispatch = None;
-        guard.pending_child_cancellation = None;
+        let reason = guard.last_stop.filter(|_| preserve_failure)
+            .unwrap_or(ExplorationStopReason::UserCancelled);
+        self.record_child_action_stop_locked(&mut guard, generation, reason);
+        if preserve_failure { guard.last_stop_reason = previous.last_stop_reason.clone(); }
+        guard.return_after_cancellation = false;
+        let navigation_update = match nav.retire_exploration_after_global_stop(
+            request_id, expected_exploration_generation, &remembered, confirmation,
+        ).await {
+            Ok(update) => update,
+            Err(error) => {
+                drop(guard);
+                // 回执覆盖不了新安装的子目标时，原普通取消仍取得真实停车责任。
+                self.finish_session(Some(request_id), ExplorationStopReason::UserCancelled,
+                    format!("ordinary stop could not retire child: {error}")).await;
+                return Err(error);
+            }
+        };
+        // 原派发任务继续保有在途标志；它随后消费同一份已保存真实终态。
+        for lease in remembered { self.orphan_cancellations.remove_terminal(&lease); }
         guard.active_child = None;
-        guard.no_frontier_since = None;
-        guard.last_stop = Some(ExplorationStopReason::ConsecutiveFailuresExceeded);
-        guard.last_stop_reason = "runtime_rollover_aborted_safe".to_string();
+        guard.pending_child_cancellation = None;
+        guard.progress_stopped_ns.get_or_insert_with(now_unix_nanos);
+        let status = if preserve_failure { STATUS_FAILED } else { STATUS_CANCELLED };
+        let message = if preserve_failure {
+            format!("{}; parking confirmed by ordinary global stop {}", previous.message, confirmation.operation_id)
+        } else {
+            format!("exploration cancelled; parking confirmed by ordinary global stop {}", confirmation.operation_id)
+        };
         let frontier_update = guard.update_frontiers(Vec::new());
-        let snapshot = guard.snapshot(
-            STATUS_FAILED,
-            "RUNTIME_ROLLOVER_ABORTED_SAFE: global stop and durable guard fence released orphaned child ownership",
-        );
-        guard.completed_rollover_recovery = Some(CompletedOwnershipTransition::NavigationRollover(
-            CompletedRolloverRecovery {
-                request,
-                snapshot: snapshot.clone(),
-            },
-        ));
+        let snapshot = guard.snapshot(status, message);
         let backend_available = self.readiness_cache.lock().backend_available;
-        let readiness = Self::compute_readiness_locked(
-            &guard,
-            self.expected_map_frame.as_ref(),
-            backend_available,
-            self.navigation_sink.read().is_some(),
-        );
+        let readiness = Self::compute_readiness_locked(&guard, self.expected_map_frame.as_ref(),
+            backend_available, self.navigation_sink.read().is_some());
         drop(guard);
         *self.readiness_cache.lock() = readiness;
         self.publish_frontiers(frontier_update);
-        Ok(self.store_snapshot(snapshot))
+        Ok((self.store_snapshot(snapshot), navigation_update))
     }
 
-    fn validate_global_stop_reconciliation_request(
-        request: &ExplorationGlobalStopReconciliationRequest,
-    ) -> Result<(), ExplorationRecoveryError> {
-        let request_id = request.request_id.trim();
-        if request_id.is_empty()
-            || request.exploration_generation == 0
-            || request.child_lease.session_id.trim().is_empty()
-            || request.child_lease.parent_request_id.trim() != request_id
-            || request.child_lease.goal_generation == 0
-            || request.child_lease.producer_runtime_generation == 0
-            || request.cancel_generation == 0
-            || request.recovery_correlation.trim().is_empty()
-            || request.guard_proof.recovery_correlation != request.recovery_correlation
-        {
-            return Err(ExplorationRecoveryError::InvalidArgument(
-                "incomplete exploration global-stop reconciliation identity".to_string(),
-            ));
-        }
-        let proof = &request.guard_proof;
-        if proof.stop_operation_id.trim().is_empty()
-            || proof.original_motion_admission.validate().is_err()
-            || proof.held_guard_generation == 0
-            || proof.held_guard_boot_nonce.iter().all(|byte| *byte == 0)
-            || proof.held_motion_stop_generation == 0
-            || proof.zero_ack_id.trim().is_empty()
-            || proof.zero_applied_monotonic_ns == 0
-            || !proof.recovery_fence_token.is_valid()
-        {
-            return Err(ExplorationRecoveryError::InvalidArgument(
-                "incomplete held motion guard recovery fence proof".to_string(),
-            ));
-        }
-        if proof.held_guard_generation != proof.original_motion_admission.guard_generation
-            || proof.held_guard_boot_nonce != proof.original_motion_admission.guard_boot_nonce
-            || proof.held_motion_stop_generation
-                <= proof.original_motion_admission.motion_stop_generation
-        {
-            return Err(ExplorationRecoveryError::FailedPrecondition(
-                "held guard proof does not strictly advance the original motion admission epoch"
-                    .to_string(),
-            ));
-        }
-        Ok(())
-    }
-
-    pub async fn replay_completed_global_stop_reconciliation(
-        &self,
-        request: &ExplorationGlobalStopReconciliationRequest,
-    ) -> Result<Option<ExploreRuntimeSnapshot>, ExplorationRecoveryError> {
-        Self::validate_global_stop_reconciliation_request(request)?;
-        let request_identity = global_stop_request_identity(request);
-        if let Some(durable) = replay_durable_ownership_transition(
-            &self.reconciliation_journal_path(),
-            DurableOwnershipTransitionKind::GlobalStop,
-            &request.recovery_correlation,
-            &request_identity,
-        )
-        .map_err(ExplorationRecoveryError::FailedPrecondition)?
-        {
-            let guard = self.inner.lock().await;
-            let retains_exact_live_ownership = guard.last_request_id == request.request_id
-                && guard.session_generation == request.exploration_generation
-                && guard
-                    .active_child
-                    .as_ref()
-                    .is_some_and(|child| child.lease.matches(&request.child_lease))
-                && guard
-                    .pending_child_cancellation
-                    .as_ref()
-                    .and_then(|pending| pending.ticket.as_ref())
-                    .is_some_and(|ticket| {
-                        ticket.cancel_generation == request.cancel_generation
-                            && ticket.lease.matches(&request.child_lease)
-                    });
-            if retains_exact_live_ownership {
-                return Ok(None);
-            }
-            return Ok(Some(durable.runtime_snapshot()));
-        }
-        let guard = self.inner.lock().await;
-        let Some(completed) = guard.completed_rollover_recovery.as_ref() else {
-            return Ok(None);
-        };
-        if let CompletedOwnershipTransition::GlobalStop(completed) = completed {
-            if completed.request == *request {
-                return Ok(Some(completed.snapshot.clone()));
-            }
-        }
-        Err(ExplorationRecoveryError::FailedPrecondition(
-            "ownership reconciliation proof does not match the completed transition".to_string(),
-        ))
-    }
-
-    pub async fn reconcile_after_global_stop(
-        &self,
-        request: ExplorationGlobalStopReconciliationRequest,
-    ) -> Result<ExploreRuntimeSnapshot, ExplorationRecoveryError> {
-        Self::validate_global_stop_reconciliation_request(&request)?;
-        let request_identity = global_stop_request_identity(&request);
-        let request_id = request.request_id.trim();
-        let mut guard = self.inner.lock().await;
-
-        if let Some(completed) = guard.completed_rollover_recovery.as_ref() {
-            if let CompletedOwnershipTransition::GlobalStop(completed) = completed {
-                if completed.request == request {
-                    return Ok(completed.snapshot.clone());
-                }
-            }
-            return Err(ExplorationRecoveryError::FailedPrecondition(
-                "ownership reconciliation proof does not match the completed transition"
-                    .to_string(),
-            ));
-        }
-        if guard.last_request_id != request_id {
-            return Err(ExplorationRecoveryError::FailedPrecondition(format!(
-                "exploration reconciliation request_id mismatch: active={} received={}",
-                guard.last_request_id, request_id
-            )));
-        }
-        if guard.session_generation != request.exploration_generation {
-            return Err(ExplorationRecoveryError::FailedPrecondition(format!(
-                "exploration reconciliation generation mismatch: active={} received={}",
-                guard.session_generation, request.exploration_generation
-            )));
-        }
-        let active_child = guard.active_child.as_ref().ok_or_else(|| {
-            ExplorationRecoveryError::FailedPrecondition(
-                "exploration reconciliation has no retained child ownership".to_string(),
-            )
-        })?;
-        if !active_child.lease.matches(&request.child_lease) {
-            return Err(ExplorationRecoveryError::FailedPrecondition(
-                "exploration reconciliation child lease does not match retained ownership"
-                    .to_string(),
-            ));
-        }
-        let active_motion_admission = guard
-            .active_config
-            .as_ref()
-            .map(|config| config.motion_admission)
-            .ok_or_else(|| {
-                ExplorationRecoveryError::FailedPrecondition(
-                    "exploration reconciliation has no original motion admission".to_string(),
-                )
-            })?;
-        if active_motion_admission != request.guard_proof.original_motion_admission {
-            return Err(ExplorationRecoveryError::FailedPrecondition(
-                "exploration reconciliation motion admission mismatch".to_string(),
-            ));
-        }
-        let pending = guard.pending_child_cancellation.as_ref().ok_or_else(|| {
-            ExplorationRecoveryError::FailedPrecondition(
-                "exploration reconciliation has no retained cancellation".to_string(),
-            )
-        })?;
-        let ticket = pending.ticket.as_ref().ok_or_else(|| {
-            ExplorationRecoveryError::FailedPrecondition(
-                "exploration reconciliation requires an exact retained cancel ticket".to_string(),
-            )
-        })?;
-        if guard.logical_active
-            || pending.failure.is_none()
-            || pending.dispatch_in_flight
-            || ticket.cancel_generation != request.cancel_generation
-            || !ticket.lease.matches(&request.child_lease)
-        {
-            return Err(ExplorationRecoveryError::FailedPrecondition(
-                "exploration reconciliation requires a stopped controller and exact failed cancellation"
-                    .to_string(),
-            ));
-        }
-        let expected_correlation = assigned_recovery_correlation(&active_child.lease, ticket.cancel_generation);
-        if request.recovery_correlation != expected_correlation {
-            return Err(ExplorationRecoveryError::FailedPrecondition(
-                "exploration reconciliation correlation mismatch".to_string(),
-            ));
-        }
-
-        let receipt = ExplorationOwnershipReconciliationReceipt {
-            cause: GLOBAL_STOP_RECONCILIATION_CAUSE.to_string(),
-            recovery_correlation: expected_correlation,
-            parent_request_id: guard.last_request_id.clone(),
-            exploration_generation: guard.session_generation,
-            child_lease_fingerprint: String::new(),
-            child_lease: Some(active_child.lease.clone()),
-            cancel_generation: ticket.cancel_generation,
-            commit_disposition: GLOBAL_STOP_COMMIT_DISPOSITION.to_string(),
-        };
-        let mut snapshot = guard.snapshot(
-            STATUS_FAILED,
-            "GLOBAL_STOP_RECONCILED_SAFE: held Guard fence reconciled retained child ownership",
-        );
-        snapshot.last_stop_reason = "global_stop_reconciled_safe".to_string();
-        snapshot.frontier_count = 0;
-        if !guard.frontiers.is_empty() {
-            snapshot.revision = snapshot.revision.saturating_add(1);
-        }
-        snapshot.child_task_id.clear();
-        snapshot.child_lease = None;
-        snapshot.rollover_recovery_eligible = false;
-        snapshot.global_stop_reconciliation =
-            ExplorationGlobalStopReconciliationSnapshot::default();
-        snapshot.ownership_reconciliation_receipt = Some(receipt.clone());
-        let durable_transition = DurableOwnershipTransition {
-            kind: DurableOwnershipTransitionKind::GlobalStop,
-            recovery_correlation: request.recovery_correlation.clone(),
-            request_fingerprint: String::new(),
-            request_identity: Some(request_identity),
-            receipt: receipt.clone(),
-            snapshot: durable_snapshot_from_runtime(&snapshot),
-            committed_unix_ns: now_unix_nanos(),
-            acknowledged: false,
-        };
-        match commit_durable_ownership_transition(
-            &self.reconciliation_journal_path(),
-            durable_transition,
-        )
-        .map_err(ExplorationRecoveryError::FailedPrecondition)?
-        {
-            DurableCommitOutcome::Committed => {}
-            DurableCommitOutcome::ExactReplay(existing) => {
-                if existing.receipt != receipt {
-                    return Err(ExplorationRecoveryError::FailedPrecondition(
-                        "global-stop durable replay receipt mismatch".to_string(),
-                    ));
-                }
-                snapshot = existing.runtime_snapshot();
-            }
-        }
-        guard.pending_child_dispatch = None;
-        guard.pending_child_cancellation = None;
-        guard.active_child = None;
-        guard.no_frontier_since = None;
-        guard.last_stop = Some(ExplorationStopReason::ConsecutiveFailuresExceeded);
-        guard.last_stop_reason = "global_stop_reconciled_safe".to_string();
-        let frontier_update = guard.update_frontiers(Vec::new());
-        guard.completed_rollover_recovery = Some(CompletedOwnershipTransition::GlobalStop(
-            CompletedGlobalStopReconciliation {
-                request,
-                snapshot: snapshot.clone(),
-            },
-        ));
-        let backend_available = self.readiness_cache.lock().backend_available;
-        let readiness = Self::compute_readiness_locked(
-            &guard,
-            self.expected_map_frame.as_ref(),
-            backend_available,
-            self.navigation_sink.read().is_some(),
-        );
-        drop(guard);
-        *self.readiness_cache.lock() = readiness;
-        self.publish_frontiers(frontier_update);
-        Ok(self.store_snapshot(snapshot))
-    }
 
     async fn finish_session(
         &self,
@@ -3304,6 +2081,13 @@ impl ExploreRuntimeHandle {
                 snapshot.request_id = requested_id.to_string();
                 return snapshot;
             }
+        }
+        if guard.active_child.is_none()
+            && self.orphan_cancellations.pending_for_parent(&guard.last_request_id)
+            && self.snapshot().status == STATUS_FAILED
+        {
+            // 原停车拥有方继续重试；再次业务停止不能把未知停车改写成取消成功。
+            return self.snapshot();
         }
         if guard.return_after_cancellation {
             // 用户取消、故障或关闭覆盖返航意图，共用已经在途的停车事务。
@@ -3673,9 +2457,16 @@ impl ExploreRuntimeHandle {
             ExplorationStopReason::ConsecutiveFailuresExceeded,
         ));
         let frontier_update = guard.update_frontiers(Vec::new());
+        let pending = guard.pending_child_cancellation.take().expect("原取消仍存在");
+        let cancellation_generation = pending.ticket.as_ref().map(|ticket| ticket.cancel_generation);
+        self.orphan_cancellations.retain_failed_business(child_lease.clone(), cancellation_generation);
+        guard.active_child = None;
+        guard.return_after_cancellation = false;
+        guard.no_frontier_since = None;
+        guard.progress_stopped_ns.get_or_insert_with(now_unix_nanos);
         let snapshot = guard.snapshot(
             STATUS_FAILED,
-            format!("child cancellation failed; safety ownership retained: {error}"),
+            format!("child cancellation failed; parking unconfirmed: {error}"),
         );
         let backend_available = self.readiness_cache.lock().backend_available;
         let readiness = Self::compute_readiness_locked(
@@ -3688,6 +2479,9 @@ impl ExploreRuntimeHandle {
         let snapshot = self.store_snapshot(snapshot);
         drop(guard);
         self.publish_frontiers(frontier_update);
+        if let Some(sink) = self.navigation_sink.read().clone() {
+            let _ = sink.retain_orphan_cancellation(child_lease.clone());
+        }
         if let Some(result) = early_terminal {
             return Box::pin(self.report_navigation_result(&child_lease.session_id, result))
                 .await
@@ -3786,7 +2580,7 @@ impl ExploreRuntimeHandle {
             return self.store_snapshot(snapshot);
         }
 
-        if self.orphan_cancellations.has_entries() {
+        if self.orphan_cancellations.blocks_child_dispatch() {
             let snapshot = guard.snapshot(
                 STATUS_PENDING,
                 "recovering orphan navigation ownership before child dispatch",
@@ -4676,6 +3470,18 @@ impl ExploreRuntimeHandle {
         child_request_id: &str,
         result: ChildNavigationResult,
     ) -> Result<ExploreRuntimeSnapshot, String> {
+        if let ChildNavigationResult::Cancelled(proof) = &result {
+            if let Some(expected_generation) = self.orphan_cancellations.retired_cancellation(&proof.lease) {
+                if proof.lease.session_id != child_request_id || proof.cancel_generation == 0
+                    || proof.zero_ack_id.trim().is_empty() || proof.zero_applied_monotonic_ns == 0
+                    || expected_generation.is_some_and(|expected| expected != proof.cancel_generation)
+                {
+                    return Err("late cancellation result does not prove the original child stopped".into());
+                }
+                self.orphan_cancellations.remove_terminal(&proof.lease);
+                return Ok(self.snapshot());
+            }
+        }
         let mut guard = self.inner.lock().await;
         if let Some(ticket) = self.existing_external_feedback_locked(&guard, child_request_id, &result)? {
             drop(guard);
@@ -4814,82 +3620,6 @@ impl ExploreRuntimeHandle {
                 ChildNavigationResult::Reached(_) | ChildNavigationResult::Failed { .. } => {
                     return Err(
                         "child terminal cannot bypass pending actuator ZEROED proof".to_string()
-                    );
-                }
-            }
-
-            if let ChildNavigationResult::Cancelled(proof) = &result {
-                let pending = guard
-                    .pending_child_cancellation
-                    .as_ref()
-                    .expect("pending child cancellation checked above");
-                if let Some(failure) = pending.failure.as_ref() {
-                    let ticket = pending.ticket.as_ref().ok_or_else(|| {
-                        "late exact ZEROED has no retained cancellation ticket".to_string()
-                    })?;
-                    let _motion_admission = guard
-                        .active_config
-                        .as_ref()
-                        .map(|config| config.motion_admission)
-                        .ok_or_else(|| {
-                            "late exact ZEROED has no original motion admission".to_string()
-                        })?;
-                    let recovery_correlation = assigned_recovery_correlation(&active_child.lease, ticket.cancel_generation);
-                    let request_identity = exact_child_zero_request_identity(proof);
-                    let receipt = ExplorationOwnershipReconciliationReceipt {
-                        cause: EXACT_CHILD_ZEROED_CAUSE.to_string(),
-                        recovery_correlation: recovery_correlation.clone(),
-                        parent_request_id: guard.last_request_id.clone(),
-                        exploration_generation: guard.session_generation,
-                        child_lease_fingerprint: String::new(),
-            child_lease: Some(active_child.lease.clone()),
-                        cancel_generation: ticket.cancel_generation,
-                        commit_disposition: EXACT_CHILD_ZEROED_DISPOSITION.to_string(),
-                    };
-                    let mut durable_snapshot = guard.snapshot(
-                        STATUS_FAILED,
-                        format!("child cancellation failed before late ZEROED proof: {failure}"),
-                    );
-                    durable_snapshot.frontier_count = 0;
-                    if !guard.frontiers.is_empty() {
-                        durable_snapshot.revision = durable_snapshot.revision.saturating_add(1);
-                    }
-                    durable_snapshot.child_task_id.clear();
-                    durable_snapshot.child_lease = None;
-                    durable_snapshot.rollover_recovery_eligible = false;
-                    durable_snapshot.global_stop_reconciliation =
-                        ExplorationGlobalStopReconciliationSnapshot::default();
-                    durable_snapshot.ownership_reconciliation_receipt = Some(receipt.clone());
-                    let transition = DurableOwnershipTransition {
-                        kind: DurableOwnershipTransitionKind::ExactChildZeroed,
-                        recovery_correlation: recovery_correlation.clone(),
-                        request_fingerprint: String::new(),
-                        request_identity: Some(request_identity.clone()),
-                        receipt: receipt.clone(),
-                        snapshot: durable_snapshot_from_runtime(&durable_snapshot),
-                        committed_unix_ns: now_unix_nanos(),
-                        acknowledged: false,
-                    };
-                    match commit_durable_ownership_transition(
-                        &self.reconciliation_journal_path(),
-                        transition,
-                    )
-                    .map_err(|error| {
-                        format!("late exact ZEROED ownership journal commit failed: {error}")
-                    })? {
-                        DurableCommitOutcome::Committed => {}
-                        DurableCommitOutcome::ExactReplay(existing) => {
-                            if existing.receipt != receipt {
-                                return Err(
-                                    "late exact ZEROED durable replay receipt mismatch".to_string()
-                                );
-                            }
-                        }
-                    }
-                    guard.completed_rollover_recovery = Some(
-                        CompletedOwnershipTransition::ExactChildZeroed(CompletedExactChildZeroed {
-                            receipt,
-                        }),
                     );
                 }
             }
@@ -5869,15 +4599,6 @@ mod tests {
 
     static NEXT_RECONCILIATION_TEST_PATH: AtomicU64 = AtomicU64::new(0);
 
-    fn reconciliation_test_path(label: &str) -> PathBuf {
-        std::env::temp_dir()
-            .join(format!(
-                "nuwax-exploration-reconciliation-{}-{}-{label}",
-                std::process::id(),
-                NEXT_RECONCILIATION_TEST_PATH.fetch_add(1, Ordering::Relaxed)
-            ))
-            .join("journal.json")
-    }
 
     #[derive(Default)]
     struct RecordingNavSink {
@@ -6155,8 +4876,9 @@ mod tests {
         assert!(before.is_some());
         let result = handle.finish_already_terminal_child(&lease, terminal_proof(&lease)).await;
         assert_eq!(result.status, STATUS_FAILED);
-        assert_eq!(result.child_task_id, lease.session_id);
-        assert_eq!(handle.inner.lock().await.pending_child_cancellation.as_ref().unwrap().ticket, before);
+        assert!(result.child_task_id.is_empty());
+        assert!(result.parking_pending);
+        assert_eq!(handle.orphan_cancellations.retired_cancellation(&lease), Some(before.as_ref().map(|ticket|ticket.cancel_generation)));
         assert!(handle.blocks_mapping_mutation().await);
         assert_eq!(sink.cancelled.lock().unwrap().len(), 1);
         let ticket = before.expect("original retained cancel ticket");
@@ -6333,7 +5055,6 @@ mod tests {
 
     fn configured_handle() -> (ExploreRuntimeHandle, Arc<RecordingNavSink>) {
         let handle = ExploreRuntimeHandle::default_with_wavefront();
-        handle.set_reconciliation_journal_path_for_tests(reconciliation_test_path("handle"));
         let sink = Arc::new(RecordingNavSink::default());
         handle.set_navigation_sink(sink.clone());
         (handle, sink)
@@ -6891,86 +5612,6 @@ mod tests {
         }
     }
 
-    fn rollover_recovery_request(
-        snapshot: &ExploreRuntimeSnapshot,
-    ) -> ExplorationRolloverRecoveryRequest {
-        ExplorationRolloverRecoveryRequest {
-            request_id: snapshot.request_id.clone(),
-            exploration_generation: snapshot.exploration_generation,
-            child_lease: snapshot.child_lease.clone().expect("retained child lease"),
-            expected_navigation_runtime_generation: 41,
-            observed_navigation_runtime_generation: 42,
-            guard_proof: ExplorationRecoveryGuardProof {
-                stop_operation_id: "exploration-rollover-stop:fixture".to_string(),
-                recovery_correlation: "exploration-rollover:fixture".to_string(),
-                motion_admission: crate::nav_runtime::test_motion_admission(),
-                zero_ack_id: "global-zero-fixture".to_string(),
-                zero_applied_monotonic_ns: now_monotonic_nanos(),
-                recovery_fence_token: RecoveryFenceToken::from_wire(vec![9; 32]),
-            },
-        }
-    }
-
-    fn global_stop_reconciliation_request(
-        snapshot: &ExploreRuntimeSnapshot,
-    ) -> ExplorationGlobalStopReconciliationRequest {
-        let reconciliation = &snapshot.global_stop_reconciliation;
-        assert!(reconciliation.eligible, "fixture must be eligible");
-        let motion_admission = reconciliation
-            .motion_admission
-            .expect("original motion admission");
-        ExplorationGlobalStopReconciliationRequest {
-            request_id: snapshot.request_id.clone(),
-            exploration_generation: snapshot.exploration_generation,
-            child_lease: snapshot.child_lease.clone().expect("retained child lease"),
-            cancel_generation: reconciliation.cancel_generation,
-            recovery_correlation: reconciliation.recovery_correlation.clone(),
-            guard_proof: ExplorationGlobalStopGuardProof {
-                stop_operation_id: "hold:exploration-global-stop-fixture".to_string(),
-                recovery_correlation: reconciliation.recovery_correlation.clone(),
-                original_motion_admission: motion_admission,
-                held_guard_generation: motion_admission.guard_generation,
-                held_guard_boot_nonce: motion_admission.guard_boot_nonce,
-                held_motion_stop_generation: motion_admission
-                    .motion_stop_generation
-                    .saturating_add(1),
-                zero_ack_id: "zero:exploration-global-stop-fixture".to_string(),
-                zero_applied_monotonic_ns: now_monotonic_nanos(),
-                recovery_fence_token: RecoveryFenceToken::from_wire(vec![9; 32]),
-            },
-        }
-    }
-
-    async fn global_stop_reconciliation_fixture(
-        request_id: &str,
-    ) -> (
-        ExploreRuntimeHandle,
-        String,
-        ChildNavigationLease,
-        ExploreRuntimeSnapshot,
-    ) {
-        let (handle, _) = configured_handle();
-        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
-            .await
-            .expect("frontier costmap");
-        handle.start(request_id, "prefer_wavefront").await;
-        let active = handle.tick((2.0, 2.0)).await;
-        let lease = active_child_lease(&handle).await;
-        assert_eq!(handle.stop(request_id).await.status, STATUS_STOPPING);
-        let failed = handle
-            .report_navigation_result(
-                &active.child_task_id,
-                ChildNavigationResult::CancelFailed {
-                    proof: terminal_proof(&lease),
-                    cancel_generation: 1,
-                    reason: "exact child cancellation failed".to_string(),
-                },
-            )
-            .await
-            .expect("exact cancel failure");
-        assert!(failed.global_stop_reconciliation.eligible);
-        (handle, active.child_task_id, lease, failed)
-    }
 
     #[test]
     fn parse_arbitration_policy_round_trip_and_fallback() {
@@ -7750,9 +6391,92 @@ mod tests {
 
         assert_eq!(failed.status, STATUS_FAILED);
         assert_eq!(failed.last_stop_reason, "child_cancel_failed");
-        assert_eq!(failed.child_task_id, active.child_task_id);
-        assert!(handle.is_active().await);
+        assert!(failed.child_task_id.is_empty());
+        assert!(failed.parking_pending);
+        assert!(!handle.inner.lock().await.logical_active);
         assert!(handle.blocks_mapping_mutation().await);
+    }
+
+    async fn install_original_child_for_global_stop(
+        nav: &crate::nav_runtime::NavRuntimeState, child: &ChildNavigationLease, generation: u64,
+    ) {
+        nav.replace_active_goal_for_test(crate::nav_runtime::ActiveGoal {
+            admitted_guard_clock_ns: nuwax_motion_safety_guard::measured_motion::monotonic_ns(),
+            id: child.session_id.clone(), frame_id: "map".into(), target: crate::lcm_runtime::PoseState::default(),
+            options: Default::default(), producer: "wavefront".into(), producer_epoch: generation as i64,
+            body_to_support_z_m: None, boundary_owner: None,
+            lease: crate::nav_runtime::GoalLease {
+                session_id: child.session_id.clone(), owner_kind: child.owner_kind,
+                parent_request_id: child.parent_request_id.clone(), goal_generation: child.goal_generation,
+                producer_runtime_generation: child.producer_runtime_generation, path_revision: 0,
+                planner_runtime_generation: 0,
+            },
+        }).await;
+    }
+
+    #[tokio::test]
+    async fn ordinary_global_stop_settles_failed_exploration_and_rejects_old_receipt_for_successor() {
+        let (handle, sink) = configured_handle();
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1).await.unwrap();
+        let start = handle.start("ordinary-old-explore", "prefer_wavefront").await;
+        let active = handle.tick((2.0, 2.0)).await;
+        let child = active.child_lease.clone().unwrap();
+        let nav = crate::nav_runtime::NavRuntimeState::from_env();
+        install_original_child_for_global_stop(&nav, &child, start.exploration_generation).await;
+        *sink.cancel_error.lock().unwrap() = Some("原NAV已退出".into());
+        let failed = handle.stop(&start.request_id).await;
+        assert!(failed.parking_pending && failed.child_task_id.is_empty());
+        let proof = crate::proto::OrdinaryGlobalStopConfirmation {
+            operation_id: "ordinary-explore-stop".into(), zero_ack_id: "actual-zero-fixture".into(),
+            applied_monotonic_ns: nuwax_motion_safety_guard::measured_motion::monotonic_ns(),
+            stationary_confirmed: true,
+        };
+        let (settled, update) = handle.stop_after_global_confirmation(&start.request_id,
+            start.exploration_generation, &proof, &nav).await.unwrap();
+        assert_eq!(settled.status, STATUS_FAILED);
+        assert_eq!(settled.last_stop_reason, "child_cancel_failed");
+        assert!(!settled.parking_pending);
+        assert!(nav.active_goal_lease().await.is_none());
+        assert_eq!(update.unwrap().feedback.zero_ack_id, proof.zero_ack_id);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while handle.inner.lock().await.session_in_progress() { tokio::task::yield_now().await; }
+        }).await.unwrap();
+        let next = handle.start("ordinary-next-explore", "prefer_wavefront").await;
+        assert_eq!(next.status, STATUS_ACCEPTED);
+        assert!(handle.stop_after_global_confirmation(&start.request_id, start.exploration_generation,
+            &proof, &nav).await.is_err());
+        assert!(handle.stop_after_global_confirmation(&next.request_id, next.exploration_generation,
+            &proof, &nav).await.is_err());
+        assert_eq!(handle.snapshot().request_id, next.request_id);
+        assert!(handle.is_active().await);
+        handle.stop(&next.request_id).await;
+    }
+
+    #[tokio::test]
+    async fn ordinary_stop_before_child_install_returns_to_original_cancel_owner() {
+        let (handle, sink) = configured_handle();
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1).await.unwrap();
+        let start = handle.start("ordinary-too-early", "prefer_wavefront").await;
+        let active = handle.tick((2.0, 2.0)).await;
+        let child = active.child_lease.clone().unwrap();
+        let proof = crate::proto::OrdinaryGlobalStopConfirmation {
+            operation_id: "earlier-stop".into(), zero_ack_id: "actual-earlier-zero".into(),
+            applied_monotonic_ns: nuwax_motion_safety_guard::measured_motion::monotonic_ns(),
+            stationary_confirmed: true,
+        };
+        let nav = crate::nav_runtime::NavRuntimeState::from_env();
+        install_original_child_for_global_stop(&nav, &child, start.exploration_generation).await;
+        assert!(handle.stop_after_global_confirmation(&start.request_id, start.exploration_generation,
+            &proof, &nav).await.is_err());
+        let pending = handle.snapshot();
+        assert_eq!(pending.status, STATUS_STOPPING);
+        assert!(pending.parking_pending);
+        assert_eq!(pending.child_task_id, child.session_id);
+        assert_eq!(*sink.cancelled.lock().unwrap(), vec![child.session_id.clone()]);
+        assert!(nav.active_goal_lease().await.is_some());
+        let settled = handle.report_navigation_result(&child.session_id,
+            ChildNavigationResult::Cancelled(zero_proof(&child, 1))).await.unwrap();
+        assert!(!settled.parking_pending);
     }
 
     #[tokio::test]
@@ -7778,8 +6502,9 @@ mod tests {
         let failed = handle.stop("req-cancel-error-receipt").await;
         assert_eq!(failed.status, STATUS_FAILED);
         assert!(failed.message.contains("uncertain cancel publish error"));
-        assert_eq!(failed.child_task_id, active.child_task_id);
-        assert!(failed.global_stop_reconciliation.eligible);
+        assert!(failed.child_task_id.is_empty());
+        assert!(failed.parking_pending);
+        assert!(failed.parking_pending);
         assert!(handle.blocks_mapping_mutation().await);
 
         let released = handle
@@ -7791,12 +6516,12 @@ mod tests {
             .expect("late exact ZEROED after uncertain publish error");
         assert_eq!(released.status, STATUS_FAILED);
         assert!(released.child_task_id.is_empty());
-        assert!(released.ownership_reconciliation_receipt.is_some());
+        assert!(!released.parking_pending);
         assert!(!handle.blocks_mapping_mutation().await);
     }
 
     #[tokio::test]
-    async fn cancel_dispatch_timeout_is_retryable_and_retains_safety_ownership() {
+    async fn cancel_dispatch_timeout_retires_business_and_keeps_original_parking_owner() {
         let (handle, sink) = configured_handle();
         ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
             .await
@@ -7812,714 +6537,23 @@ mod tests {
 
         assert_eq!(failed.status, STATUS_FAILED);
         assert!(failed.message.contains("dispatch timed out"));
-        assert_eq!(failed.child_task_id, active.child_task_id);
+        assert!(failed.child_task_id.is_empty());
+        assert!(failed.parking_pending);
         assert!(handle.blocks_mapping_mutation().await);
 
         *sink.cancel_release.lock().unwrap() = None;
         let retried = handle.stop("req-cancel-timeout-retry").await;
-        assert_eq!(retried.status, STATUS_STOPPING);
-        assert!(retried.message.contains("CANCEL_RETRY_PENDING"));
-        assert_eq!(retried.child_task_id, active.child_task_id);
+        assert_eq!(retried.status, STATUS_FAILED);
+        assert!(retried.parking_pending);
+        assert!(retried.child_task_id.is_empty());
+        assert_eq!(sink.cancelled.lock().unwrap().len(), 0);
+        assert!(handle.orphan_cancellations.contains(active.child_lease.as_ref().unwrap()));
         assert!(handle.blocks_mapping_mutation().await);
     }
 
-    #[tokio::test]
-    async fn nav_runtime_rollover_requires_durable_guard_fence_before_releasing_child() {
-        let (handle, sink) = configured_handle();
-        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
-            .await
-            .unwrap();
-        handle
-            .start("req-rollover-recovery", "prefer_wavefront")
-            .await;
-        handle.tick((2.0, 2.0)).await;
-        *sink.cancel_error.lock().unwrap() = Some("old runtime lost child".to_string());
-
-        let retained = handle.stop("req-rollover-recovery").await;
-        assert_eq!(retained.status, STATUS_FAILED);
-        assert!(retained.rollover_recovery_eligible);
-        assert!(!retained.child_task_id.is_empty());
-        assert!(handle.blocks_mapping_mutation().await);
-
-        let mut incomplete = rollover_recovery_request(&retained);
-        incomplete.guard_proof.recovery_fence_token.clear();
-        assert!(matches!(
-            handle.recover_after_navigation_rollover(incomplete).await,
-            Err(ExplorationRecoveryError::InvalidArgument(_))
-        ));
-        assert_eq!(handle.snapshot().child_task_id, retained.child_task_id);
-
-        let request = rollover_recovery_request(&retained);
-        let recovered = handle
-            .recover_after_navigation_rollover(request.clone())
-            .await
-            .expect("exact durable recovery proof");
-        assert_eq!(recovered.status, STATUS_FAILED);
-        assert_eq!(recovered.last_stop_reason, "runtime_rollover_aborted_safe");
-        assert!(recovered.child_task_id.is_empty());
-        assert!(!recovered.rollover_recovery_eligible);
-        assert!(!handle.blocks_mapping_mutation().await);
-
-        let replay = handle
-            .replay_completed_rollover_recovery(&request)
-            .await
-            .expect("exact replay probe is idempotent")
-            .expect("completed recovery snapshot");
-        assert_eq!(replay.request_id, recovered.request_id);
-        assert_eq!(replay.last_stop_reason, recovered.last_stop_reason);
-
-        let mut conflicting = request;
-        conflicting
-            .guard_proof
-            .recovery_correlation
-            .push_str(":other");
-        assert!(matches!(
-            handle
-                .replay_completed_rollover_recovery(&conflicting)
-                .await,
-            Err(ExplorationRecoveryError::FailedPrecondition(_))
-        ));
-    }
 
     #[tokio::test]
-    async fn rollover_recovery_rejects_wrong_child_and_nonfailed_cancellation() {
-        let (handle, _sink) = configured_handle();
-        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
-            .await
-            .unwrap();
-        handle.start("req-rollover-wrong", "prefer_wavefront").await;
-        let active = handle.tick((2.0, 2.0)).await;
-        let lease = active_child_lease(&handle).await;
-
-        let stopping = handle.stop("req-rollover-wrong").await;
-        assert_eq!(stopping.status, STATUS_STOPPING);
-        assert!(!stopping.rollover_recovery_eligible);
-        assert!(matches!(
-            handle
-                .recover_after_navigation_rollover(rollover_recovery_request(&stopping))
-                .await,
-            Err(ExplorationRecoveryError::FailedPrecondition(_))
-        ));
-
-        let failed = handle
-            .report_navigation_result(
-                &active.child_task_id,
-                ChildNavigationResult::CancelFailed {
-                    proof: terminal_proof(&lease),
-                    cancel_generation: 1,
-                    reason: "new runtime has no old child".to_string(),
-                },
-            )
-            .await
-            .unwrap();
-        assert!(failed.rollover_recovery_eligible);
-        let mut wrong = rollover_recovery_request(&failed);
-        wrong.child_lease.goal_generation += 1;
-        assert!(matches!(
-            handle.recover_after_navigation_rollover(wrong).await,
-            Err(ExplorationRecoveryError::FailedPrecondition(_))
-        ));
-        assert_eq!(handle.snapshot().child_task_id, failed.child_task_id);
-        assert!(handle.blocks_mapping_mutation().await);
-    }
-
-    #[tokio::test]
-    async fn global_stop_reconciliation_rejects_wrong_identity_and_guard_proof() {
-        let (handle, _, _, retained) =
-            global_stop_reconciliation_fixture("req-global-hostile").await;
-        let exact = global_stop_reconciliation_request(&retained);
-
-        let mut wrong = exact.clone();
-        wrong.child_lease.goal_generation += 1;
-        assert!(matches!(
-            handle.reconcile_after_global_stop(wrong).await,
-            Err(ExplorationRecoveryError::FailedPrecondition(_))
-        ));
-        let mut wrong = exact.clone();
-        wrong.exploration_generation += 1;
-        assert!(matches!(
-            handle.reconcile_after_global_stop(wrong).await,
-            Err(ExplorationRecoveryError::FailedPrecondition(_))
-        ));
-        let mut wrong = exact.clone();
-        wrong.cancel_generation += 1;
-        assert!(matches!(
-            handle.reconcile_after_global_stop(wrong).await,
-            Err(ExplorationRecoveryError::FailedPrecondition(_))
-        ));
-        let mut wrong = exact.clone();
-        wrong.recovery_correlation.push_str(":wrong");
-        wrong.guard_proof.recovery_correlation = wrong.recovery_correlation.clone();
-        assert!(matches!(
-            handle.reconcile_after_global_stop(wrong).await,
-            Err(ExplorationRecoveryError::FailedPrecondition(_))
-        ));
-        let mut wrong = exact;
-        wrong.guard_proof.held_motion_stop_generation = wrong
-            .guard_proof
-            .original_motion_admission
-            .motion_stop_generation;
-        assert!(matches!(
-            handle.reconcile_after_global_stop(wrong).await,
-            Err(ExplorationRecoveryError::FailedPrecondition(_))
-        ));
-        assert_eq!(handle.snapshot().child_task_id, retained.child_task_id);
-        assert!(handle.blocks_mapping_mutation().await);
-    }
-
-    #[tokio::test]
-    async fn global_stop_reconciliation_persists_exact_response_loss_replay() {
-        let (handle, _, _, retained) =
-            global_stop_reconciliation_fixture("req-global-replay").await;
-        let exact = global_stop_reconciliation_request(&retained);
-        let committed = handle
-            .reconcile_after_global_stop(exact.clone())
-            .await
-            .expect("verified held-fence commit");
-        let receipt = committed
-            .ownership_reconciliation_receipt
-            .as_ref()
-            .expect("completed reconciliation receipt");
-        assert_eq!(receipt.cause, GLOBAL_STOP_RECONCILIATION_CAUSE);
-        assert_eq!(receipt.recovery_correlation, exact.recovery_correlation);
-        assert_eq!(receipt.parent_request_id, exact.request_id);
-        assert_eq!(receipt.exploration_generation, exact.exploration_generation);
-        assert_eq!(receipt.cancel_generation, exact.cancel_generation);
-        assert_eq!(
-            receipt.child_lease,
-            Some(exact.child_lease.clone())
-        );
-        assert_eq!(receipt.commit_disposition, GLOBAL_STOP_COMMIT_DISPOSITION);
-
-        let replay = handle
-            .replay_completed_global_stop_reconciliation(&exact)
-            .await
-            .expect("response-loss replay probe")
-            .expect("completed response must persist");
-        assert_eq!(
-            replay.ownership_reconciliation_receipt,
-            committed.ownership_reconciliation_receipt
-        );
-        let direct_replay = handle
-            .reconcile_after_global_stop(exact.clone())
-            .await
-            .expect("exact commit replay");
-        assert_eq!(
-            direct_replay.ownership_reconciliation_receipt,
-            committed.ownership_reconciliation_receipt
-        );
-
-        let mut conflicting = exact;
-        conflicting
-            .guard_proof
-            .zero_ack_id
-            .push_str(":different-proof");
-        assert!(matches!(
-            handle
-                .replay_completed_global_stop_reconciliation(&conflicting)
-                .await,
-            Err(ExplorationRecoveryError::FailedPrecondition(_))
-        ));
-    }
-
-    #[tokio::test]
-    async fn global_stop_response_loss_replays_after_runtime_restart() {
-        let (handle, _, _, retained) =
-            global_stop_reconciliation_fixture("req-global-restart").await;
-        let journal_path = handle.reconciliation_journal_path();
-        let mut exact = global_stop_reconciliation_request(&retained);
-        exact.guard_proof.recovery_fence_token = RecoveryFenceToken::from_wire(vec![0x5a; 32]);
-        let committed = handle
-            .reconcile_after_global_stop(exact.clone())
-            .await
-            .expect("durable global-stop commit");
-        let persisted = fs::read_to_string(&journal_path).expect("durable journal JSON");
-        assert!(!persisted.contains("90,90,90"));
-        assert!(!persisted.contains("recovery_fence_token"));
-        drop(handle);
-
-        let restarted = ExploreRuntimeHandle::default_with_wavefront();
-        restarted.set_reconciliation_journal_path_for_tests(journal_path);
-        restarted
-            .restore_latest_durable_reconciliation_snapshot()
-            .expect("startup journal recovery");
-        assert_eq!(
-            restarted.snapshot().ownership_reconciliation_receipt,
-            committed.ownership_reconciliation_receipt
-        );
-        let replay = restarted
-            .replay_completed_global_stop_reconciliation(&exact)
-            .await
-            .expect("restart replay query")
-            .expect("durable restart replay");
-        assert_eq!(
-            replay.ownership_reconciliation_receipt,
-            committed.ownership_reconciliation_receipt
-        );
-        assert_eq!(
-            restarted
-                .latest_durable_reconciliation_snapshot()
-                .expect("startup recovery")
-                .expect("unacknowledged durable receipt")
-                .ownership_reconciliation_receipt,
-            committed.ownership_reconciliation_receipt
-        );
-    }
-
-    #[tokio::test]
-    async fn new_start_does_not_evict_unacknowledged_reconciliation() {
-        let (handle, _, _, retained) =
-            global_stop_reconciliation_fixture("req-global-unacked").await;
-        let exact = global_stop_reconciliation_request(&retained);
-        let committed = handle
-            .reconcile_after_global_stop(exact.clone())
-            .await
-            .expect("durable global-stop commit");
-        assert_eq!(
-            handle
-                .start("req-after-unacked", "prefer_wavefront")
-                .await
-                .status,
-            STATUS_ACCEPTED
-        );
-        let replay = handle
-            .replay_completed_global_stop_reconciliation(&exact)
-            .await
-            .expect("old durable replay after new start")
-            .expect("unacknowledged receipt must remain");
-        assert_eq!(
-            replay.ownership_reconciliation_receipt,
-            committed.ownership_reconciliation_receipt
-        );
-        let receipt = committed
-            .ownership_reconciliation_receipt
-            .as_ref()
-            .expect("committed receipt");
-        assert!(handle
-            .acknowledge_durable_reconciliation(
-                &receipt.recovery_correlation,
-                &receipt.child_lease_fingerprint, receipt.child_lease.as_ref(),
-)
-            .expect("durable acknowledgement"));
-        assert!(handle
-            .latest_durable_reconciliation_snapshot()
-            .expect("post-ack journal read")
-            .is_none());
-        assert!(handle
-            .replay_completed_global_stop_reconciliation(&exact)
-            .await
-            .expect("acknowledged exact replay remains until bounded eviction")
-            .is_some());
-    }
-
-    #[tokio::test]
-    async fn journal_write_failure_retains_child_for_global_and_exact_zero() {
-        for (request_id, global) in [
-            ("req-global-write-failure", true),
-            ("req-zero-write-failure", false),
-        ] {
-            let (handle, child_request_id, lease, retained) =
-                global_stop_reconciliation_fixture(request_id).await;
-            let blocked_parent = reconciliation_test_path("blocked-parent");
-            fs::create_dir_all(blocked_parent.parent().unwrap()).unwrap();
-            fs::write(&blocked_parent, b"not a directory").unwrap();
-            handle.set_reconciliation_journal_path_for_tests(blocked_parent.join("journal.json"));
-
-            if global {
-                assert!(matches!(
-                    handle
-                        .reconcile_after_global_stop(global_stop_reconciliation_request(&retained))
-                        .await,
-                    Err(ExplorationRecoveryError::FailedPrecondition(_))
-                ));
-            } else {
-                assert!(handle
-                    .report_navigation_result(
-                        &child_request_id,
-                        ChildNavigationResult::Cancelled(zero_proof(&lease, 1)),
-                    )
-                    .await
-                    .is_err());
-            }
-            let unchanged = handle.snapshot();
-            assert_eq!(unchanged.child_task_id, retained.child_task_id);
-            assert!(unchanged.global_stop_reconciliation.eligible);
-            assert!(handle.blocks_mapping_mutation().await);
-        }
-    }
-
-    #[tokio::test]
-    async fn rejected_zero_proof_never_writes_ownership_journal() {
-        let (handle, child_request_id, lease, _) =
-            global_stop_reconciliation_fixture("req-zero-no-write").await;
-        let journal_path = handle.reconciliation_journal_path();
-        let mut invalid = zero_proof(&lease, 1);
-        invalid.zero_ack_id.clear();
-        assert!(handle
-            .report_navigation_result(&child_request_id, ChildNavigationResult::Cancelled(invalid),)
-            .await
-            .is_err());
-        assert!(!journal_path.exists());
-    }
-
-    #[tokio::test]
-    async fn late_exact_zero_persists_first_winner_and_preserves_stop_reason() {
-        let (handle, child_request_id, lease, retained) =
-            global_stop_reconciliation_fixture("req-zero-ledger").await;
-        let global_request = global_stop_reconciliation_request(&retained);
-        let released = handle
-            .report_navigation_result(
-                &child_request_id,
-                ChildNavigationResult::Cancelled(zero_proof(&lease, 1)),
-            )
-            .await
-            .expect("late exact zero durable commit");
-        assert_eq!(released.last_stop_reason, "child_cancel_failed");
-        let receipt = released
-            .ownership_reconciliation_receipt
-            .expect("exact zero reconciliation receipt");
-        assert_eq!(receipt.cause, EXACT_CHILD_ZEROED_CAUSE);
-        assert_eq!(receipt.commit_disposition, EXACT_CHILD_ZEROED_DISPOSITION);
-        let journal = read_durable_ownership_journal(&handle.reconciliation_journal_path())
-            .expect("durable exact-zero journal");
-        assert_eq!(journal.entries.len(), 1);
-        assert_eq!(
-            journal.entries[0].kind,
-            DurableOwnershipTransitionKind::ExactChildZeroed
-        );
-        assert!(matches!(
-            handle.reconcile_after_global_stop(global_request).await,
-            Err(ExplorationRecoveryError::FailedPrecondition(_))
-        ));
-    }
-
-    #[test]
-    fn recovery_fence_token_debug_is_redacted() {
-        let token = RecoveryFenceToken::from_wire(vec![0x5a; 32]);
-        let rendered = format!("{token:?}");
-        assert_eq!(rendered, "RecoveryFenceToken([REDACTED])");
-        assert!(!rendered.contains("90"));
-        assert!(!rendered.contains("5a"));
-    }
-
-    #[test]
-    fn global_stop_request_debug_redacts_recovery_fence_token() {
-        let retained = ExploreRuntimeSnapshot {
-            request_id: "debug-parent".to_string(),
-            exploration_generation: 1,
-            child_lease: Some(ChildNavigationLease {
-                session_id: "debug-parent.nav.1".to_string(),
-                owner_kind: schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD,
-                parent_request_id: "debug-parent".to_string(),
-                goal_generation: 1,
-                producer_runtime_generation: 1,
-
-            }),
-            global_stop_reconciliation: ExplorationGlobalStopReconciliationSnapshot {
-                eligible: true,
-                cancel_generation: 1,
-                recovery_correlation:
-                    "exploration-global-stop:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-                        .to_string(),
-                motion_admission: Some(crate::nav_runtime::test_motion_admission()),
-            },
-            ..ExploreRuntimeSnapshot::default()
-        };
-        let mut request = global_stop_reconciliation_request(&retained);
-        request.guard_proof.recovery_fence_token = RecoveryFenceToken::from_wire(vec![0x5a; 32]);
-        let rendered = format!("{request:?}");
-        assert!(rendered.contains("RecoveryFenceToken([REDACTED])"));
-        assert!(!rendered.contains("90, 90, 90"));
-        assert!(!rendered.contains(&"5a".repeat(32)));
-    }
-
-    fn durable_test_transition(index: usize) -> DurableOwnershipTransition {
-        let correlation = format!("exploration-global-stop:{index:064x}");
-        DurableOwnershipTransition {
-            request_identity: None,
-            kind: DurableOwnershipTransitionKind::GlobalStop,
-            recovery_correlation: correlation.clone(),
-            request_fingerprint: format!("{:064x}", index + 1),
-            receipt: ExplorationOwnershipReconciliationReceipt {
-            child_lease: None,
-                cause: GLOBAL_STOP_RECONCILIATION_CAUSE.to_string(),
-                recovery_correlation: correlation,
-                parent_request_id: format!("parent-{index}"),
-                exploration_generation: index as u64 + 1,
-                child_lease_fingerprint: format!("{:064x}", index + 2),
-                cancel_generation: 1,
-                commit_disposition: GLOBAL_STOP_COMMIT_DISPOSITION.to_string(),
-            },
-            snapshot: DurableReconciliationSnapshot {
-                status: STATUS_FAILED.to_string(),
-                message: "durable fixture".to_string(),
-                request_id: format!("parent-{index}"),
-                selected_source: "wavefront".to_string(),
-                last_stop_reason: "global_stop_reconciled_safe".to_string(),
-                frontier_count: 0,
-                revision: 1,
-                exploration_generation: index as u64 + 1,
-            },
-            committed_unix_ns: index as u64 + 1,
-            acknowledged: false,
-        }
-    }
-
-    fn write_raw_test_journal(path: &Path, bytes: &[u8]) {
-        let parent = path.parent().unwrap();
-        fs::create_dir_all(parent).unwrap();
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).unwrap();
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(0o600)
-            .open(path)
-            .unwrap();
-        file.write_all(bytes).unwrap();
-        file.sync_all().unwrap();
-    }
-
-    #[test]
-    fn journal_rejects_unknown_fields_oversize_and_inconsistent_semantics() {
-        let transition = durable_test_transition(101);
-        let journal = DurableOwnershipJournal {
-            schema_version: RECONCILIATION_JOURNAL_SCHEMA_VERSION,
-            entries: vec![transition.clone()],
-        };
-
-        let unknown_path = reconciliation_test_path("unknown-field");
-        let mut unknown = serde_json::to_value(&journal).unwrap();
-        unknown
-            .as_object_mut()
-            .unwrap()
-            .insert("unexpected".to_string(), serde_json::json!(true));
-        write_raw_test_journal(&unknown_path, &serde_json::to_vec(&unknown).unwrap());
-        assert!(read_durable_ownership_journal(&unknown_path).is_err());
-
-        let oversized_path = reconciliation_test_path("oversized");
-        write_raw_test_journal(
-            &oversized_path,
-            &vec![b' '; RECONCILIATION_JOURNAL_MAX_BYTES as usize + 1],
-        );
-        assert!(read_durable_ownership_journal(&oversized_path).is_err());
-
-        for (label, mut invalid) in [
-            ("bad-request-hex", transition.clone()),
-            ("bad-child-hex", transition.clone()),
-            ("bad-cause", transition.clone()),
-            ("bad-snapshot-parent", transition.clone()),
-            ("bad-correlation", transition),
-        ] {
-            match label {
-                "bad-request-hex" => invalid.request_fingerprint = "g".repeat(64),
-                "bad-child-hex" => invalid.receipt.child_lease_fingerprint = "A".repeat(64),
-                "bad-cause" => invalid.receipt.cause = EXACT_CHILD_ZEROED_CAUSE.to_string(),
-                "bad-snapshot-parent" => invalid.snapshot.request_id.push_str("-other"),
-                "bad-correlation" => {
-                    invalid.recovery_correlation =
-                        format!("exploration-global-stop:{}", "z".repeat(64));
-                    invalid.receipt.recovery_correlation = invalid.recovery_correlation.clone();
-                }
-                _ => unreachable!(),
-            }
-            let path = reconciliation_test_path(label);
-            let bytes = encode_ownership_journal(&DurableOwnershipJournal {
-                schema_version: RECONCILIATION_JOURNAL_SCHEMA_VERSION,
-                entries: vec![invalid],
-            })
-            .unwrap();
-            write_raw_test_journal(&path, &bytes);
-            assert!(read_durable_ownership_journal(&path).is_err(), "{label}");
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn journal_rejects_symlink_nonregular_and_insecure_metadata() {
-        use std::os::unix::fs::symlink;
-
-        let symlink_path = reconciliation_test_path("symlink");
-        let target_path = symlink_path.with_file_name("target.json");
-        write_raw_test_journal(&target_path, b"{}\n");
-        symlink(&target_path, &symlink_path).unwrap();
-        assert!(read_durable_ownership_journal(&symlink_path).is_err());
-
-        let directory_path = reconciliation_test_path("nonregular");
-        fs::create_dir_all(&directory_path).unwrap();
-        assert!(read_durable_ownership_journal(&directory_path).is_err());
-
-        let insecure_path = reconciliation_test_path("insecure-file");
-        write_raw_test_journal(&insecure_path, b"{}\n");
-        fs::set_permissions(&insecure_path, fs::Permissions::from_mode(0o640)).unwrap();
-        assert!(read_durable_ownership_journal(&insecure_path).is_err());
-    }
-
-    #[test]
-    fn journal_uses_an_exclusive_cross_process_file_lock() {
-        let path = reconciliation_test_path("flock");
-        let first = lock_durable_ownership_journal(&path).expect("first journal flock");
-        let parent = path.parent().unwrap();
-        let file_name = path.file_name().unwrap().to_str().unwrap();
-        let second_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(parent.join(format!(".{file_name}.lock")))
-            .unwrap();
-        assert!(
-            nix::fcntl::Flock::lock(second_file, nix::fcntl::FlockArg::LockExclusiveNonblock)
-                .is_err()
-        );
-        drop(first);
-    }
-
-    #[tokio::test]
-    async fn post_rename_directory_sync_failure_poison_retries_then_survives_restart() {
-        let (handle, _, _, retained) =
-            global_stop_reconciliation_fixture("req-post-rename-sync").await;
-        let path = handle.reconciliation_journal_path();
-        let request = global_stop_reconciliation_request(&retained);
-        TEST_DIRECTORY_SYNC_FAILURES
-            .get_or_init(|| SyncMutex::new(std::collections::HashMap::new()))
-            .lock()
-            .insert(path.parent().unwrap().to_path_buf(), 2);
-
-        assert!(matches!(
-            handle.reconcile_after_global_stop(request.clone()).await,
-            Err(ExplorationRecoveryError::FailedPrecondition(message))
-                if message.contains("post-rename durability uncertain")
-        ));
-        assert_eq!(handle.snapshot().child_task_id, retained.child_task_id);
-        assert!(handle.blocks_mapping_mutation().await);
-
-        assert!(matches!(
-            handle
-                .replay_completed_global_stop_reconciliation(&request)
-                .await,
-            Err(ExplorationRecoveryError::FailedPrecondition(message))
-                if message.contains("post-rename durability uncertain")
-        ));
-        assert!(handle
-            .replay_completed_global_stop_reconciliation(&request)
-            .await
-            .expect("directory fsync retry")
-            .is_none());
-
-        let committed = handle
-            .reconcile_after_global_stop(request.clone())
-            .await
-            .expect("exact durable retry clears live ownership");
-        assert!(committed.child_task_id.is_empty());
-        assert!(!handle.blocks_mapping_mutation().await);
-        drop(handle);
-
-        let restarted = ExploreRuntimeHandle::default_with_wavefront();
-        TEST_DIRECTORY_SYNC_FAILURES
-            .get_or_init(|| SyncMutex::new(std::collections::HashMap::new()))
-            .lock()
-            .insert(path.parent().unwrap().to_path_buf(), 1);
-        restarted.set_reconciliation_journal_path_for_tests(path);
-        assert!(matches!(
-            restarted.restore_latest_durable_reconciliation_snapshot(),
-            Err(ExplorationRecoveryError::FailedPrecondition(message))
-                if message.contains("directory durability verification failed")
-        ));
-        restarted
-            .restore_latest_durable_reconciliation_snapshot()
-            .expect("restart restores directory-synced journal");
-        assert_eq!(
-            restarted.snapshot().ownership_reconciliation_receipt,
-            committed.ownership_reconciliation_receipt
-        );
-        assert!(restarted
-            .replay_completed_global_stop_reconciliation(&request)
-            .await
-            .expect("restart exact replay")
-            .is_some());
-    }
-
-    #[test]
-    fn journal_evicts_only_acknowledged_entries_at_bounded_capacity() {
-        let path = reconciliation_test_path("capacity");
-        for index in 0..RECONCILIATION_JOURNAL_CAPACITY {
-            assert!(matches!(
-                commit_durable_ownership_transition(&path, durable_test_transition(index)),
-                Ok(DurableCommitOutcome::Committed)
-            ));
-        }
-        assert!(commit_durable_ownership_transition(
-            &path,
-            durable_test_transition(RECONCILIATION_JOURNAL_CAPACITY)
-        )
-        .is_err());
-        let first = durable_test_transition(0);
-        assert!(acknowledge_durable_ownership_transition(
-            &path,
-            &first.recovery_correlation,
-            &first.receipt.child_lease_fingerprint, first.receipt.child_lease.as_ref(),
-)
-        .unwrap());
-        assert!(matches!(
-            commit_durable_ownership_transition(
-                &path,
-                durable_test_transition(RECONCILIATION_JOURNAL_CAPACITY)
-            ),
-            Ok(DurableCommitOutcome::Committed)
-        ));
-        let journal = read_durable_ownership_journal(&path).unwrap();
-        assert_eq!(journal.entries.len(), RECONCILIATION_JOURNAL_CAPACITY);
-        assert!(journal
-            .entries
-            .iter()
-            .all(|entry| entry.recovery_correlation != first.recovery_correlation));
-    }
-
-    #[tokio::test]
-    async fn late_exact_zero_and_global_reconciliation_have_one_first_winner() {
-        let (handle, child_request_id, lease, retained) =
-            global_stop_reconciliation_fixture("req-global-race").await;
-        let global_request = global_stop_reconciliation_request(&retained);
-        let global_handle = handle.clone();
-        let zero_handle = handle.clone();
-        let zero_child_request_id = child_request_id.clone();
-        let global_task = tokio::spawn(async move {
-            global_handle
-                .reconcile_after_global_stop(global_request)
-                .await
-        });
-        let zero_task = tokio::spawn(async move {
-            zero_handle
-                .report_navigation_result(
-                    &zero_child_request_id,
-                    ChildNavigationResult::Cancelled(zero_proof(&lease, 1)),
-                )
-                .await
-        });
-        let global_result = global_task.await.expect("global task");
-        let zero_result = zero_task.await.expect("late zero task");
-
-        assert_ne!(global_result.is_ok(), zero_result.is_ok());
-        let final_snapshot = handle.snapshot();
-        assert!(final_snapshot.child_task_id.is_empty());
-        assert!(!handle.blocks_mapping_mutation().await);
-        if global_result.is_ok() {
-            assert!(final_snapshot.ownership_reconciliation_receipt.is_some());
-            assert_eq!(
-                final_snapshot.last_stop_reason,
-                "global_stop_reconciled_safe"
-            );
-        } else {
-            let receipt = final_snapshot
-                .ownership_reconciliation_receipt
-                .as_ref()
-                .expect("exact ZEROED first-winner receipt");
-            assert_eq!(receipt.cause, EXACT_CHILD_ZEROED_CAUSE);
-            assert_eq!(final_snapshot.last_stop_reason, "child_cancel_failed");
-        }
-    }
-
-    #[tokio::test]
-    async fn failed_cancel_without_ticket_retries_only_for_the_exact_parent_request() {
+    async fn failed_cancel_without_ticket_keeps_exact_parent_and_original_parking_owner() {
         let (handle, sink) = configured_handle();
         ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
             .await
@@ -8540,10 +6574,10 @@ mod tests {
 
         *sink.cancel_error.lock().unwrap() = None;
         let retry = handle.stop("req-cancel-retry").await;
-        assert_eq!(retry.status, STATUS_STOPPING);
+        assert_eq!(retry.status, STATUS_FAILED);
         assert_eq!(retry.last_stop_reason, "child_cancel_failed");
-        assert!(retry.message.contains("CANCEL_RETRY_PENDING"));
-        assert_eq!(sink.cancelled.lock().unwrap().len(), 2);
+        assert!(retry.parking_pending);
+        assert_eq!(sink.cancelled.lock().unwrap().len(), 1);
 
         let released = handle
             .report_navigation_result(
@@ -8559,7 +6593,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_cancel_with_ticket_retries_with_a_new_generation() {
+    async fn failed_cancel_with_ticket_retains_only_original_cancel_generation() {
         let (handle, sink) = configured_handle();
         ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
             .await
@@ -8585,24 +6619,24 @@ mod tests {
         assert_eq!(failed.status, STATUS_FAILED);
 
         let retry = handle.stop("req-timeout-retry").await;
-        assert_eq!(retry.status, STATUS_STOPPING);
-        assert!(retry.message.contains("cancel_generation=2"));
-        assert_eq!(sink.cancelled.lock().unwrap().len(), 2);
+        assert_eq!(retry.status, STATUS_FAILED);
+        assert!(retry.parking_pending);
+        assert_eq!(sink.cancelled.lock().unwrap().len(), 1);
 
         assert!(handle
             .report_navigation_result(
                 &active.child_task_id,
-                ChildNavigationResult::Cancelled(zero_proof(&lease, 1)),
+                ChildNavigationResult::Cancelled(zero_proof(&lease, 999)),
             )
             .await
             .is_err());
-        assert_eq!(handle.snapshot().status, STATUS_STOPPING);
-        assert_eq!(handle.snapshot().child_task_id, active.child_task_id);
+        assert_eq!(handle.snapshot().status, STATUS_FAILED);
+        assert!(handle.snapshot().child_task_id.is_empty());
 
         let released = handle
             .report_navigation_result(
                 &active.child_task_id,
-                ChildNavigationResult::Cancelled(zero_proof(&lease, 2)),
+                ChildNavigationResult::Cancelled(zero_proof(&lease, 1)),
             )
             .await
             .unwrap();
@@ -8611,7 +6645,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn duplicate_old_cancel_failure_cannot_supersede_an_inflight_retry() {
+    async fn duplicate_old_cancel_failure_cannot_replace_retired_parking_responsibility() {
         let (handle, sink) = configured_handle();
         ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
             .await
@@ -8637,15 +6671,6 @@ mod tests {
             .await
             .unwrap();
 
-        let release = Arc::new(tokio::sync::Notify::new());
-        *sink.cancel_release.lock().unwrap() = Some(release.clone());
-        let retry_task = {
-            let handle = handle.clone();
-            tokio::spawn(async move { handle.stop("req-retry-old-failure").await })
-        };
-        tokio::time::timeout(Duration::from_secs(1), sink.cancel_entered.notified())
-            .await
-            .expect("cancel submit did not enter within one second");
         let duplicate = handle
             .report_navigation_result(
                 &active.child_task_id,
@@ -8655,18 +6680,15 @@ mod tests {
                     reason: "duplicate old timeout".to_string(),
                 },
             )
-            .await
-            .unwrap();
-        assert_eq!(duplicate.status, STATUS_STOPPING);
-        assert!(duplicate.message.contains("OLD_FAILURE_IGNORED"));
-
-        release.notify_one();
-        let retry = retry_task.await.unwrap();
-        assert!(retry.message.contains("cancel_generation=2"));
+            .await;
+        assert!(duplicate.is_err());
+        assert!(handle.snapshot().parking_pending);
+        assert_eq!(handle.snapshot().last_stop_reason, "child_cancel_failed");
+        assert_eq!(sink.cancelled.lock().unwrap().len(), 1);
         let released = handle
             .report_navigation_result(
                 &active.child_task_id,
-                ChildNavigationResult::Cancelled(zero_proof(&lease, 2)),
+                ChildNavigationResult::Cancelled(zero_proof(&lease, 1)),
             )
             .await
             .unwrap();
@@ -8675,7 +6697,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_repeated_stop_dispatches_only_one_cancel_retry() {
+    async fn concurrent_repeated_stop_preserves_one_original_parking_responsibility() {
         let (handle, sink) = configured_handle();
         ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
             .await
@@ -8686,26 +6708,11 @@ mod tests {
         *sink.cancel_error.lock().unwrap() = Some("guard unavailable".to_string());
         assert_eq!(handle.stop("req-single-retry").await.status, STATUS_FAILED);
 
-        *sink.cancel_error.lock().unwrap() = None;
-        let release = Arc::new(tokio::sync::Notify::new());
-        *sink.cancel_release.lock().unwrap() = Some(release.clone());
-        let retry_task = {
-            let handle = handle.clone();
-            tokio::spawn(async move { handle.stop("req-single-retry").await })
-        };
-        tokio::time::timeout(Duration::from_secs(1), sink.cancel_entered.notified())
-            .await
-            .expect("cancel submit did not enter within one second");
-
-        let concurrent = handle.stop("req-single-retry").await;
-        assert_eq!(concurrent.status, STATUS_STOPPING);
-        assert!(concurrent.message.contains("already in flight"));
-
-        release.notify_one();
-        let retry = retry_task.await.unwrap();
-        assert_eq!(retry.status, STATUS_STOPPING);
-        assert!(retry.message.contains("cancel_generation=1"));
-        assert_eq!(sink.cancelled.lock().unwrap().len(), 2);
+        let (first, second) = tokio::join!(handle.stop("req-single-retry"), handle.stop("req-single-retry"));
+        assert_eq!(first.status, STATUS_FAILED);
+        assert_eq!(second.status, STATUS_FAILED);
+        assert!(first.parking_pending && second.parking_pending);
+        assert_eq!(sink.cancelled.lock().unwrap().len(), 1);
 
         let released = handle
             .report_navigation_result(
@@ -8784,8 +6791,9 @@ mod tests {
 
         assert_eq!(failed.status, STATUS_FAILED);
         assert_eq!(failed.last_stop_reason, "child_cancel_failed");
-        assert_eq!(failed.child_task_id, active.child_task_id);
-        assert!(handle.is_active().await);
+        assert!(failed.child_task_id.is_empty());
+        assert!(failed.parking_pending);
+        assert!(!handle.inner.lock().await.logical_active);
         assert!(handle.blocks_mapping_mutation().await);
 
         let released = handle
@@ -11488,180 +9496,7 @@ async fn scheme_a_frontier_rejection_before_publish_preserves_source_failed_ack(
             WavefrontGoalSourceAdapter::with_default_id("wavefront", WavefrontConfig::default());
         assert_eq!(adapter.source_name(), Cow::Borrowed("wavefront"));
     }
-    fn assigned_journal_fixture(index: usize) -> DurableOwnershipTransition {
-        let mut entry = durable_test_transition(index);
-        let child = ChildNavigationLease {
-            session_id: format!("child-{index}"), owner_kind: schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD,
-            parent_request_id: entry.receipt.parent_request_id.clone(), goal_generation: index as u64 + 1,
-            producer_runtime_generation: 77,
-        };
-        entry.kind = DurableOwnershipTransitionKind::ExactChildZeroed;
-        entry.recovery_correlation = assigned_recovery_correlation(&child, 1);
-        entry.request_fingerprint.clear();
-        entry.request_identity = Some(AssignedTransitionIdentity::ExactChildZeroed {
-            child_lease: child.clone(), cancel_generation: 1,
-            zero_ack_id: format!("zero-{index}"), zero_applied_monotonic_ns: 1,
-        });
-        entry.receipt.recovery_correlation = entry.recovery_correlation.clone();
-        entry.receipt.cause = EXACT_CHILD_ZEROED_CAUSE.into();
-        entry.receipt.commit_disposition = EXACT_CHILD_ZEROED_DISPOSITION.into();
-        entry.receipt.child_lease_fingerprint.clear();
-        entry.receipt.child_lease = Some(child);
-        entry.snapshot.last_stop_reason = "child_cancel_failed".into();
-        entry
-    }
 
-    #[test]
-    fn legacy_v1_restore_and_opaque_ack_keep_both_original_receipts() {
-        struct NoHash;
-        impl Drop for NoHash { fn drop(&mut self) { crate::map_checksum::FORBID_HASH.with(|flag| flag.set(false)); } }
-        crate::map_checksum::FORBID_HASH.with(|flag| flag.set(true));
-        let _no_hash = NoHash;
-        // Shape-only constants from the original v1 fixture; no goal/proof body
-        // exists here and no legacy digest is calculated or reconstructed.
-        let bytes = r#"{
-  "schema_version": 1,
-  "entries": [
-    {
-      "kind": "global_stop",
-      "recovery_correlation": "exploration-global-stop:0000000000000000000000000000000000000000000000000000000000000065",
-      "request_fingerprint": "0000000000000000000000000000000000000000000000000000000000000066",
-      "receipt": {
-        "cause": "ordinary_global_stop",
-        "recovery_correlation": "exploration-global-stop:0000000000000000000000000000000000000000000000000000000000000065",
-        "parent_request_id": "parent-101",
-        "exploration_generation": 102,
-        "child_lease_fingerprint": "0000000000000000000000000000000000000000000000000000000000000067",
-        "cancel_generation": 1,
-        "commit_disposition": "global_stop_reconciled_child_ownership"
-      },
-      "snapshot": {
-        "status": "FAILED",
-        "message": "synthetic legacy receipt fixture; no goal or proof payload",
-        "request_id": "parent-101",
-        "selected_source": "wavefront",
-        "last_stop_reason": "global_stop_reconciled_safe",
-        "frontier_count": 0,
-        "revision": 1,
-        "exploration_generation": 102
-      },
-      "committed_unix_ns": 102,
-      "acknowledged": false
-    },
-    {
-      "kind": "exact_child_zeroed",
-      "recovery_correlation": "exploration-global-stop:0000000000000000000000000000000000000000000000000000000000000066",
-      "request_fingerprint": "0000000000000000000000000000000000000000000000000000000000000067",
-      "receipt": {
-        "cause": "late_exact_child_zeroed",
-        "recovery_correlation": "exploration-global-stop:0000000000000000000000000000000000000000000000000000000000000066",
-        "parent_request_id": "parent-102",
-        "exploration_generation": 103,
-        "child_lease_fingerprint": "0000000000000000000000000000000000000000000000000000000000000068",
-        "cancel_generation": 1,
-        "commit_disposition": "exact_child_zeroed_released_ownership"
-      },
-      "snapshot": {
-        "status": "FAILED",
-        "message": "synthetic legacy receipt fixture; no goal or proof payload",
-        "request_id": "parent-102",
-        "selected_source": "wavefront",
-        "last_stop_reason": "child_cancel_failed",
-        "frontier_count": 0,
-        "revision": 1,
-        "exploration_generation": 103
-      },
-      "committed_unix_ns": 103,
-      "acknowledged": false
-    }
-  ]
-}
-"#;
-        let path = reconciliation_test_path("v8-legacy-v1");
-        write_raw_test_journal(&path, bytes.as_bytes());
-        let original = read_durable_ownership_journal(&path).unwrap();
-        assert_eq!(original.schema_version, 1);
-        assert_eq!(original.entries.len(), 2);
-        let latest = original.entries.last().unwrap();
-        assert!(latest.request_identity.is_none());
-        let snapshot = latest.runtime_snapshot();
-        assert!(snapshot.child_lease.is_none());
-        assert_eq!(snapshot.status, STATUS_FAILED);
-        assert_eq!(snapshot.ownership_reconciliation_receipt.as_ref(), Some(&latest.receipt));
-        assert!(!acknowledge_durable_ownership_transition(&path, &latest.recovery_correlation, "wrong-opaque", None).unwrap());
-        for _ in 0..2 {
-            assert!(acknowledge_durable_ownership_transition(&path, &latest.recovery_correlation,
-                &latest.receipt.child_lease_fingerprint, None).unwrap());
-        }
-        let restarted = read_durable_ownership_journal(&path).unwrap();
-        assert_eq!(restarted.schema_version, 1);
-        assert_eq!(restarted.entries[0], original.entries[0]);
-        assert_eq!(restarted.entries[1].request_fingerprint, latest.request_fingerprint);
-        assert_eq!(restarted.entries[1].receipt, latest.receipt);
-        assert!(restarted.entries[1].acknowledged);
-        assert_eq!(restarted.entries.iter().rev().find(|entry| !entry.acknowledged).unwrap(), &original.entries[0]);
-    }
-
-    #[test]
-    fn assigned_journal_v2_keeps_legacy_entries_and_exact_ack_branches() {
-        let path = reconciliation_test_path("v8-mixed-journal");
-        let legacy = durable_test_transition(1);
-        write_raw_test_journal(&path, &encode_ownership_journal(&DurableOwnershipJournal {
-            schema_version: 1, entries: vec![legacy.clone()],
-        }).unwrap());
-        let assigned = assigned_journal_fixture(2);
-        assert!(matches!(commit_durable_ownership_transition(&path, assigned.clone()).unwrap(), DurableCommitOutcome::Committed));
-        let journal = read_durable_ownership_journal(&path).unwrap();
-        assert_eq!(journal.schema_version, 2);
-        assert_eq!(journal.entries, vec![legacy.clone(), assigned.clone()]);
-        let raw: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(raw["entries"][0]["format"], "legacy_v1");
-        assert_eq!(raw["entries"][1]["format"], "assigned_v2");
-        assert!(raw["entries"][1]["transition"].get("request_fingerprint").is_none());
-        assert!(!acknowledge_durable_ownership_transition(&path, &assigned.recovery_correlation,
-            &legacy.receipt.child_lease_fingerprint, assigned.receipt.child_lease.as_ref()).unwrap());
-        assert!(acknowledge_durable_ownership_transition(&path, &assigned.recovery_correlation,
-            "", assigned.receipt.child_lease.as_ref()).unwrap());
-        assert!(acknowledge_durable_ownership_transition(&path, &legacy.recovery_correlation,
-            &legacy.receipt.child_lease_fingerprint, None).unwrap());
-        assert!(read_durable_ownership_journal(&path).unwrap().entries.iter().all(|entry| entry.acknowledged));
-    }
-
-    #[test]
-    fn assigned_journal_first_winner_replays_once_and_rejects_real_changes() {
-        let path = reconciliation_test_path("v8-assigned-first-winner");
-        let entry = assigned_journal_fixture(3);
-        assert!(matches!(commit_durable_ownership_transition(&path, entry.clone()).unwrap(), DurableCommitOutcome::Committed));
-        assert!(matches!(commit_durable_ownership_transition(&path, entry.clone()).unwrap(), DurableCommitOutcome::ExactReplay(_)));
-        let mut changed = entry.clone();
-        if let Some(AssignedTransitionIdentity::ExactChildZeroed { zero_ack_id, .. }) = &mut changed.request_identity {
-            zero_ack_id.push_str("-changed");
-        }
-        assert!(commit_durable_ownership_transition(&path, changed).err().unwrap().contains("first winner"));
-        let mut mixed = entry.clone();
-        mixed.receipt.child_lease_fingerprint = "0".repeat(64);
-        assert!(validate_durable_ownership_transition(&mixed).is_err());
-        assert_eq!(read_durable_ownership_journal(&path).unwrap().entries, vec![entry]);
-    }
-
-    #[test]
-    fn assigned_write_cannot_evict_any_unacknowledged_legacy_receipt() {
-        let path = reconciliation_test_path("v8-mixed-capacity");
-        let entries = (0..RECONCILIATION_JOURNAL_CAPACITY).map(durable_test_transition).collect::<Vec<_>>();
-        write_raw_test_journal(&path, &encode_ownership_journal(&DurableOwnershipJournal {
-            schema_version: 1, entries: entries.clone(),
-        }).unwrap());
-        let assigned = assigned_journal_fixture(50);
-        assert!(commit_durable_ownership_transition(&path, assigned.clone()).is_err());
-        assert_eq!(read_durable_ownership_journal(&path).unwrap().entries, entries);
-        assert!(acknowledge_durable_ownership_transition(&path, &entries[0].recovery_correlation,
-            &entries[0].receipt.child_lease_fingerprint, None).unwrap());
-        assert!(matches!(commit_durable_ownership_transition(&path, assigned.clone()).unwrap(), DurableCommitOutcome::Committed));
-        let migrated = read_durable_ownership_journal(&path).unwrap();
-        assert_eq!(migrated.schema_version, 2);
-        assert_eq!(&migrated.entries[..31], &entries[1..]);
-        assert_eq!(migrated.entries.last(), Some(&assigned));
-    }
 
     #[tokio::test]
     async fn surface_return_keeps_captured_body_home_without_support_contract() {

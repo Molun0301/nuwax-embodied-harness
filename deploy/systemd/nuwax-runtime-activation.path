@@ -2,7 +2,7 @@
 Description=NuwaX on-demand navigation and geometry activation request watcher
 
 [Path]
-PathExists=/run/nuwax/gateway/geometry.request
+# 请求由网关清理；只在变更时触发，避免就绪结果返回后重复启动。
 PathChanged=/run/nuwax/gateway/geometry.request
 Unit=nuwax-runtime-activation.service
 

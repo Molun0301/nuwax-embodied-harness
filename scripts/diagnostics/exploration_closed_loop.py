@@ -177,12 +177,6 @@ def run(output, timeout, scenario="complete", max_goals=None, calibrated_motion=
     from gateways.runtime import GatewayRuntime
     from services.navigation.motion_safety_guard.actor import GuardActor
     from services.navigation.motion_safety_guard.core import MotionGuardCore
-    from services.navigation.motion_safety_guard.epoch import (
-        EpochRecord,
-        EpochStore,
-        ProvisionRecord,
-        atomic_write_record,
-    )
     from services.navigation.motion_safety_guard.server import MotionGuardUnixServer
     from scripts.diagnostics.native_lio_smoke import _stop_process_session
 
@@ -190,7 +184,6 @@ def run(output, timeout, scenario="complete", max_goals=None, calibrated_motion=
         """仅模拟设备：速度积分与有限视距观测，不产生目标、地图或任务终态。"""
 
         is_configured = True
-        actuator_symbols_sha256 = "sha256:" + "4" * 64
 
         def __init__(self):
             self.lock = threading.Lock()
@@ -257,6 +250,8 @@ def run(output, timeout, scenario="complete", max_goals=None, calibrated_motion=
                     self.velocity = velocity
                 self.commands += int(any(abs(v) > 1e-5 for v in velocity))
 
+            return False
+
         def zero(self):
             with self.lock:
                 self.integrate()
@@ -313,13 +308,7 @@ def run(output, timeout, scenario="complete", max_goals=None, calibrated_motion=
             return None
 
     world = World()
-    provision_path, epoch_path = working / "provision.json", working / "epoch.json"
-    atomic_write_record(provision_path, ProvisionRecord.create(instance_id=str(uuid.uuid4())).to_document(), mode=0o400)
-    atomic_write_record(
-        epoch_path, EpochRecord.initial(actuator_symbols_sha256=world.actuator_symbols_sha256).to_document(), mode=0o600
-    )
-    store = EpochStore(provision_path=provision_path, epoch_path=epoch_path)
-    guard_core = MotionGuardCore(epoch=store.advance_boot(), epoch_store=store, actuator=world)
+    guard_core = MotionGuardCore(actuator=world)
     guard_core.initialize_zero_fence()
     guard = MotionGuardUnixServer(
         socket_path=working / "guard.sock", actor=GuardActor(guard_core), socket_gid=os.getegid()

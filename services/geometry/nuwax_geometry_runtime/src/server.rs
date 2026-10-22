@@ -58,9 +58,6 @@ use nuwax_mapping_cloud::{
     CloudQueryIdentityV1, MappingCloudOwner, MappingCloudProvider, MappingCloudRequest,
     MappingCloudTerminal, OsmClient,
 };
-use nuwax_motion_safety_guard::{
-    HeldRecoveryFenceProof, MotionGuardClient, ZeroConfirmation, DEFAULT_UDS_PATH,
-};
 use nuwax_nav_types_messages::geometry::Point2;
 
 // The installed receipt already owns identity; mapping-cloud only projects it.
@@ -232,7 +229,6 @@ impl Drop for StartMappingRpcWaiter {
         }
     }
 }
-
 
 
 fn configured_base_frame() -> String {
@@ -507,7 +503,6 @@ impl ShutdownCoordinator {
     pub(crate) fn publish_graceful_shutdown(&self) {
         self.graceful_tx.send_replace(true);
     }
-
 
 
     async fn wait_for_correction_settlement(&self) {
@@ -798,21 +793,6 @@ impl GeometryRuntimeService {
     }
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     #[allow(clippy::too_many_arguments)]
     async fn finish_started_mapping_transition(
         &self,
@@ -927,23 +907,16 @@ impl GeometryRuntimeService {
     }
 
 
-
     #[cfg(test)]
     fn inject_start_mapping_before_cloud_clear_barrier(&self, barrier: Arc<tokio::sync::Barrier>) {
         *self.start_mapping_before_cloud_clear.lock() = Some(barrier);
     }
 
 
-
     #[cfg(test)]
     fn inject_stop_before_post_zero_lifecycle_barrier(&self, barrier: Arc<tokio::sync::Barrier>) {
         *self.stop_before_post_zero_lifecycle.lock() = Some(barrier);
     }
-
-
-
-
-
 
 
     #[cfg(test)]
@@ -981,7 +954,6 @@ fn relocalization_command_status(
 }
 
 
-
 pub(crate) fn now_ns() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1015,25 +987,13 @@ fn mapping_session_state(
         activation_request_id: String::new(),
 
 
-
-
-
         relocalization_target_available: false,
-
-
-
-
 
 
     }
 }
 
 type ActivationRequestIdentityClass = crate::activation_request::ActivationRequestMetadataV2;
-
-
-
-
-
 
 
 pub(crate) fn validate_canonical_protocol_id(value: &str, label: &str) -> Result<(), String> {
@@ -1064,41 +1024,6 @@ fn classify_activation_request_identity(
 ) -> Result<ActivationRequestIdentityClass, String> {
     crate::activation_request::ActivationRequestMetadataV2::from_wire(request, runtime_generation)
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 fn activation_failure_state(
@@ -2064,9 +1989,6 @@ async fn finish_failed_mapping_start_rollback(
 }
 
 
-
-
-
 fn decode_checkpoint_grid_borrowed(
     checkpoint: &OccupancyGridData,
     expected_map_frame_id: &str,
@@ -2229,7 +2151,6 @@ pub(crate) fn validate_mapping_checkpoint_envelope_size(
     }
     Ok(())
 }
-
 
 
 fn mapping_commit_identity_proto(
@@ -2519,7 +2440,6 @@ fn assemble_mapping_checkpoint_export(mut checkpoint: MappingBackendCheckpoint) 
 }
 
 
-
 fn validate_mapping_checkpoint_bundle(
     checkpoint: &MappingBackendCheckpoint,
 ) -> Result<(), String> {
@@ -2570,39 +2490,8 @@ fn exploration_state_from_snapshot(
         producer_runtime_generation: lease.producer_runtime_generation,
 
     });
-    let global_stop_reconciliation = snapshot.global_stop_reconciliation;
-    let global_stop_reconciliation = Some(ExplorationGlobalStopReconciliation {
-        eligible: global_stop_reconciliation.eligible,
-        cancel_generation: global_stop_reconciliation.cancel_generation,
-        recovery_correlation: global_stop_reconciliation.recovery_correlation,
-        admission_guard_generation: global_stop_reconciliation
-            .motion_admission
-            .map_or(0, |proof| proof.guard_generation),
-        admission_guard_boot_nonce: global_stop_reconciliation
-            .motion_admission
-            .map_or_else(Vec::new, |proof| proof.guard_boot_nonce.to_vec()),
-        admission_motion_stop_generation: global_stop_reconciliation
-            .motion_admission
-            .map_or(0, |proof| proof.motion_stop_generation),
-    });
-    let ownership_reconciliation_receipt =
-        snapshot.ownership_reconciliation_receipt.map(|receipt| {
-            ExplorationOwnershipReconciliationReceipt {
-                cause: receipt.cause,
-                recovery_correlation: receipt.recovery_correlation,
-                parent_request_id: receipt.parent_request_id,
-                exploration_generation: receipt.exploration_generation,
-                child_lease_fingerprint: receipt.child_lease_fingerprint,
-                child_lease: receipt.child_lease.map(|lease| ExplorationChildLease {
-                    session_id: lease.session_id, owner_kind: lease.owner_kind,
-                    parent_request_id: lease.parent_request_id, goal_generation: lease.goal_generation,
-                    producer_runtime_generation: lease.producer_runtime_generation,
-                }),
-                cancel_generation: receipt.cancel_generation,
-                commit_disposition: receipt.commit_disposition,
-            }
-        });
     ExplorationState {
+        parking_pending: snapshot.parking_pending,
         status: snapshot.status.to_string(),
         message: snapshot.message,
         request_id: snapshot.request_id,
@@ -2614,9 +2503,8 @@ fn exploration_state_from_snapshot(
         child_task_id: snapshot.child_task_id,
         exploration_generation: snapshot.exploration_generation,
         child_lease,
-        rollover_recovery_eligible: snapshot.rollover_recovery_eligible,
-        global_stop_reconciliation,
-        ownership_reconciliation_receipt,
+
+
         mission_progress_json: snapshot.mission_progress_json,
     }
 }
@@ -2676,7 +2564,6 @@ fn explore_config_from_request(
         },
         arbitration,
         motion_admission: MotionAdmissionProof::try_from_wire(
-            request.motion_guard_generation,
             &request.motion_guard_boot_nonce,
             request.motion_stop_generation,
         )?,
@@ -3182,7 +3069,7 @@ fn nav_state_to_proto(update: NavigationUpdate) -> NavigationState {
         actuator_zeroed: feedback.actuator_zeroed,
         reason_code: feedback.reason_code,
         runtime_generation: feedback.runtime_generation,
-        guard_generation: feedback.guard_generation,
+
         sink_ready: feedback.sink_ready,
         planner_map_frame: feedback.planner_map_frame,
         planner_pose_frame: feedback.planner_pose_frame,
@@ -4968,7 +4855,6 @@ impl GeometryRuntime for GeometryRuntimeService {
             ng.frame_id.clone()
         };
         let motion_admission = MotionAdmissionProof::try_from_wire(
-            ng.motion_guard_generation,
             &ng.motion_guard_boot_nonce,
             ng.motion_stop_generation,
         )
@@ -5298,12 +5184,7 @@ impl GeometryRuntime for GeometryRuntimeService {
                         boundary_id: String::new(),
                         body_to_support_z_m: None,
                         boundary_points: Vec::new(),
-                        motion_guard_generation: i64::try_from(request.motion_guard_generation)
-                            .map_err(|_| {
-                                Status::invalid_argument(
-                                    "motion guard generation exceeds wire range",
-                                )
-                            })?,
+
                         motion_guard_boot_nonce: request
                             .motion_guard_boot_nonce
                             .as_slice()
@@ -5391,6 +5272,16 @@ impl GeometryRuntime for GeometryRuntimeService {
             goal_generation: request.goal_generation,
             producer_runtime_generation: request.producer_runtime_generation,
         };
+        if let Some(confirmation) = request.global_stop_confirmation.as_ref() {
+            let (update, retired_current) = self.bridge.nav.retire_goal_after_global_stop(&input, confirmation)
+                .await.map_err(Status::failed_precondition)?;
+            if retired_current {
+                self.bridge.nav.publish_global_stop_retirement(
+                    &update, &self.bridge.state, &self.bridge.nav_state_tx,
+                ).await;
+            }
+            return Ok(Response::new(nav_state_to_proto(update)));
+        }
         if let Some(update)=self.bridge.nav.terminal_receipt_for(&input).await {
             return Ok(Response::new(nav_state_to_proto(update)));
         }
@@ -5734,309 +5625,25 @@ impl GeometryRuntime for GeometryRuntimeService {
         req: Request<StopExplorationRequest>,
     ) -> Result<Response<ExplorationState>, Status> {
         let r = req.get_ref();
-        let snapshot = self.bridge.explore.stop(&r.request_id).await;
-        Ok(Response::new(exploration_state_from_snapshot(snapshot)))
-    }
-
-    async fn recover_exploration_after_navigation_rollover(
-        &self,
-        req: Request<RecoverExplorationAfterNavigationRolloverRequest>,
-    ) -> Result<Response<ExplorationState>, Status> {
-        let r = req.into_inner();
-        if r.observed_navigation_runtime_generation <= r.expected_navigation_runtime_generation {
-            return Err(Status::invalid_argument(
-                "observed navigation runtime generation must advance",
-            ));
-        }
-        let child = r
-            .child_lease
-            .ok_or_else(|| Status::invalid_argument("child_lease is required"))?;
-        let guard = r
-            .guard_proof
-            .ok_or_else(|| Status::invalid_argument("guard_proof is required"))?;
-        let motion_admission = MotionAdmissionProof::try_from_wire(
-            guard.guard_generation,
-            &guard.guard_boot_nonce,
-            guard.motion_stop_generation,
-        )
-        .map_err(Status::invalid_argument)?;
-        let request = crate::explore_runtime::ExplorationRolloverRecoveryRequest {
-            request_id: r.request_id,
-            exploration_generation: r.exploration_generation,
-            child_lease: crate::explore_runtime::ChildNavigationLease {
-                session_id: child.session_id,
-                owner_kind: child.owner_kind,
-                parent_request_id: child.parent_request_id,
-                goal_generation: child.goal_generation,
-                producer_runtime_generation: child.producer_runtime_generation,
-            },
-            expected_navigation_runtime_generation: r.expected_navigation_runtime_generation,
-            observed_navigation_runtime_generation: r.observed_navigation_runtime_generation,
-            guard_proof: crate::explore_runtime::ExplorationRecoveryGuardProof {
-                stop_operation_id: guard.stop_operation_id.clone(),
-                recovery_correlation: guard.recovery_correlation.clone(),
-                motion_admission,
-                zero_ack_id: guard.zero_ack_id.clone(),
-                zero_applied_monotonic_ns: guard.zero_applied_monotonic_ns,
-                recovery_fence_token: crate::explore_runtime::RecoveryFenceToken::from_wire(
-                    guard.recovery_fence_token.clone(),
-                ),
-            },
-        };
-        if let Some(snapshot) = self
-            .bridge
-            .explore
-            .replay_completed_rollover_recovery(&request)
-            .await
-            .map_err(|error| match error {
-                crate::explore_runtime::ExplorationRecoveryError::InvalidArgument(message) => {
-                    Status::invalid_argument(message)
-                }
-                crate::explore_runtime::ExplorationRecoveryError::FailedPrecondition(message) => {
-                    Status::failed_precondition(message)
-                }
-            })?
-        {
-            return Ok(Response::new(exploration_state_from_snapshot(snapshot)));
-        }
-
-        let readiness = compute_readiness(&self.bridge, &self.bridge.nav).await;
-        if readiness.planner_generation != request.observed_navigation_runtime_generation {
-            return Err(Status::failed_precondition(format!(
-                "navigation runtime generation mismatch: current={} observed={}",
-                readiness.planner_generation, request.observed_navigation_runtime_generation
-            )));
-        }
-
-        let recovery_fence_token: [u8; 32] = guard
-            .recovery_fence_token
-            .as_slice()
-            .try_into()
-            .map_err(|_| {
-                Status::invalid_argument("recovery_fence_token must contain exactly 32 bytes")
-            })?;
-        let held_proof = HeldRecoveryFenceProof {
-            operation_id: guard.stop_operation_id,
-            recovery_correlation: guard.recovery_correlation,
-            generation: motion_admission.guard_generation,
-            boot_nonce: motion_admission.guard_boot_nonce,
-            motion_stop_generation: motion_admission.motion_stop_generation,
-            zero: ZeroConfirmation {
-                zero_ack_id: guard.zero_ack_id,
-                applied_monotonic_ns: guard.zero_applied_monotonic_ns,
-                ..Default::default()
-            },
-            recovery_fence_token,
-        };
-        let socket_path = std::env::var("NUWAX_MOTION_GUARD_SOCKET")
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| DEFAULT_UDS_PATH.to_string());
-        let mut guard_client = MotionGuardClient::connect(&socket_path)
-            .await
-            .map_err(|error| {
-                Status::unavailable(format!(
-                    "motion guard recovery fence verification unavailable: {error}"
-                ))
-            })?;
-        guard_client
-            .verify_held_recovery_fence(&held_proof)
-            .await
-            .map_err(|error| {
-                Status::failed_precondition(format!(
-                    "motion guard recovery fence verification failed: {error}"
-                ))
-            })?;
-        let snapshot = self
-            .bridge
-            .explore
-            .recover_after_navigation_rollover(request)
-            .await
-            .map_err(|error| match error {
-                crate::explore_runtime::ExplorationRecoveryError::InvalidArgument(message) => {
-                    Status::invalid_argument(message)
-                }
-                crate::explore_runtime::ExplorationRecoveryError::FailedPrecondition(message) => {
-                    Status::failed_precondition(message)
-                }
-            })?;
-        Ok(Response::new(exploration_state_from_snapshot(snapshot)))
-    }
-
-    async fn reconcile_exploration_after_global_stop(
-        &self,
-        req: Request<ReconcileExplorationAfterGlobalStopRequest>,
-    ) -> Result<Response<ExplorationState>, Status> {
-        let r = req.into_inner();
-        let child = r
-            .child_lease
-            .ok_or_else(|| Status::invalid_argument("child_lease is required"))?;
-        let original_motion_admission = MotionAdmissionProof::try_from_wire(
-            r.admission_guard_generation,
-            &r.admission_guard_boot_nonce,
-            r.admission_motion_stop_generation,
-        )
-        .map_err(Status::invalid_argument)?;
-        let held = r
-            .held_guard_proof
-            .ok_or_else(|| Status::invalid_argument("held_guard_proof is required"))?;
-        let held_guard_boot_nonce: [u8; 16] =
-            held.guard_boot_nonce.as_slice().try_into().map_err(|_| {
-                Status::invalid_argument("held guard_boot_nonce must contain exactly 16 bytes")
-            })?;
-        let request = crate::explore_runtime::ExplorationGlobalStopReconciliationRequest {
-            request_id: r.request_id,
-            exploration_generation: r.exploration_generation,
-            child_lease: crate::explore_runtime::ChildNavigationLease {
-                session_id: child.session_id,
-                owner_kind: child.owner_kind,
-                parent_request_id: child.parent_request_id,
-                goal_generation: child.goal_generation,
-                producer_runtime_generation: child.producer_runtime_generation,
-            },
-            cancel_generation: r.cancel_generation,
-            recovery_correlation: r.recovery_correlation,
-            guard_proof: crate::explore_runtime::ExplorationGlobalStopGuardProof {
-                stop_operation_id: held.stop_operation_id.clone(),
-                recovery_correlation: held.recovery_correlation.clone(),
-                original_motion_admission,
-                held_guard_generation: held.guard_generation,
-                held_guard_boot_nonce,
-                held_motion_stop_generation: held.motion_stop_generation,
-                zero_ack_id: held.zero_ack_id.clone(),
-                zero_applied_monotonic_ns: held.zero_applied_monotonic_ns,
-                recovery_fence_token: crate::explore_runtime::RecoveryFenceToken::from_wire(
-                    held.recovery_fence_token.clone(),
-                ),
-            },
-        };
-        if let Some(snapshot) = self
-            .bridge
-            .explore
-            .replay_completed_global_stop_reconciliation(&request)
-            .await
-            .map_err(|error| match error {
-                crate::explore_runtime::ExplorationRecoveryError::InvalidArgument(message) => {
-                    Status::invalid_argument(message)
-                }
-                crate::explore_runtime::ExplorationRecoveryError::FailedPrecondition(message) => {
-                    Status::failed_precondition(message)
-                }
-            })?
-        {
-            return Ok(Response::new(exploration_state_from_snapshot(snapshot)));
-        }
-
-        let recovery_fence_token: [u8; 32] = held
-            .recovery_fence_token
-            .as_slice()
-            .try_into()
-            .map_err(|_| {
-                Status::invalid_argument("recovery_fence_token must contain exactly 32 bytes")
-            })?;
-        let held_proof = HeldRecoveryFenceProof {
-            operation_id: held.stop_operation_id,
-            recovery_correlation: held.recovery_correlation,
-            generation: held.guard_generation,
-            boot_nonce: held_guard_boot_nonce,
-            motion_stop_generation: held.motion_stop_generation,
-            zero: ZeroConfirmation {
-                zero_ack_id: held.zero_ack_id,
-                applied_monotonic_ns: held.zero_applied_monotonic_ns,
-                ..Default::default()
-            },
-            recovery_fence_token,
-        };
-        let socket_path = std::env::var("NUWAX_MOTION_GUARD_SOCKET")
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| DEFAULT_UDS_PATH.to_string());
-        let mut guard_client = MotionGuardClient::connect(&socket_path)
-            .await
-            .map_err(|error| {
-                Status::unavailable(format!(
-                    "motion guard recovery fence verification unavailable: {error}"
-                ))
-            })?;
-        guard_client
-            .verify_held_recovery_fence(&held_proof)
-            .await
-            .map_err(|error| {
-                Status::failed_precondition(format!(
-                    "motion guard recovery fence verification failed: {error}"
-                ))
-            })?;
-        let snapshot = self
-            .bridge
-            .explore
-            .reconcile_after_global_stop(request)
-            .await
-            .map_err(|error| match error {
-                crate::explore_runtime::ExplorationRecoveryError::InvalidArgument(message) => {
-                    Status::invalid_argument(message)
-                }
-                crate::explore_runtime::ExplorationRecoveryError::FailedPrecondition(message) => {
-                    Status::failed_precondition(message)
-                }
-            })?;
-        Ok(Response::new(exploration_state_from_snapshot(snapshot)))
-    }
-
-    async fn acknowledge_exploration_ownership_reconciliation(
-        &self,
-        req: Request<AcknowledgeExplorationOwnershipReconciliationRequest>,
-    ) -> Result<Response<AcknowledgeExplorationOwnershipReconciliationResult>, Status> {
-        let request = req.into_inner();
-        let child_lease = request.child_lease.map(|child| crate::explore_runtime::ChildNavigationLease {
-            session_id: child.session_id, owner_kind: child.owner_kind,
-            parent_request_id: child.parent_request_id, goal_generation: child.goal_generation,
-            producer_runtime_generation: child.producer_runtime_generation,
-        });
-        let acknowledged = self
-            .bridge
-            .explore
-            .acknowledge_durable_reconciliation(
-                &request.recovery_correlation,
-                &request.child_lease_fingerprint,
-                child_lease.as_ref(),
-            )
-            .map_err(|error| match error {
-                crate::explore_runtime::ExplorationRecoveryError::InvalidArgument(message) => {
-                    Status::invalid_argument(message)
-                }
-                crate::explore_runtime::ExplorationRecoveryError::FailedPrecondition(message) => {
-                    Status::failed_precondition(message)
-                }
-            })?;
-        Ok(Response::new(
-            AcknowledgeExplorationOwnershipReconciliationResult { acknowledged },
-        ))
-    }
-
-    async fn get_exploration_state(
-        &self,
-        _req: Request<Empty>,
-    ) -> Result<Response<ExplorationState>, Status> {
-        let live_snapshot = self.bridge.explore.snapshot();
-        let snapshot = if live_snapshot.request_id.is_empty() {
-            self.bridge
-                .explore
-                .latest_durable_reconciliation_snapshot()
-                .map_err(|error| match error {
-                    crate::explore_runtime::ExplorationRecoveryError::InvalidArgument(message) => {
-                        Status::invalid_argument(message)
-                    }
-                    crate::explore_runtime::ExplorationRecoveryError::FailedPrecondition(
-                        message,
-                    ) => Status::failed_precondition(message),
-                })?
-                .unwrap_or(live_snapshot)
+        let snapshot = if let Some(confirmation) = r.global_stop_confirmation.as_ref() {
+            let (snapshot, navigation_update) = self.bridge.explore.stop_after_global_confirmation(
+                &r.request_id, r.expected_exploration_generation, confirmation, &self.bridge.nav,
+            ).await.map_err(Status::failed_precondition)?;
+            if let Some(update) = navigation_update {
+                self.bridge.nav.publish_global_stop_retirement(
+                    &update, &self.bridge.state, &self.bridge.nav_state_tx,
+                ).await;
+            }
+            snapshot
         } else {
-            live_snapshot
+            self.bridge.explore.stop(&r.request_id).await
         };
         Ok(Response::new(exploration_state_from_snapshot(snapshot)))
+    }
+
+
+    async fn get_exploration_state(&self, _req: Request<Empty>) -> Result<Response<ExplorationState>, Status> {
+        Ok(Response::new(exploration_state_from_snapshot(self.bridge.explore.snapshot())))
     }
 
     async fn get_exploration_diagnostics(
@@ -6421,7 +6028,6 @@ impl GeometryRuntime for GeometryRuntimeService {
         }
     }
 }
-
 
 
 #[cfg(test)]
@@ -8186,7 +7792,6 @@ use nuwax_protocol::RawLcmFrame;
     use tokio_stream::StreamExt;
 
 
-
     type RelocalizeTransformFingerprint = (String, String, [u64; 3], [u64; 4], u64);
     type RelocalizeFrontierFingerprint = ([u64; 3], [u64; 4], String, u32, u32);
 
@@ -8437,7 +8042,6 @@ use nuwax_protocol::RawLcmFrame;
     }
 
 
-
     #[derive(Default)]
     struct LifecycleExploreSink {
         last_lease: StdMutex<Option<ChildNavigationLease>>,
@@ -8499,23 +8103,6 @@ use nuwax_protocol::RawLcmFrame;
             Ok(())
         }
     }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
     static MOTION_GUARD_SOCKET_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -8800,7 +8387,7 @@ use nuwax_protocol::RawLcmFrame;
                     boundary_id: String::new(),
                     body_to_support_z_m: None,
                     boundary_points: Vec::new(),
-                    motion_guard_generation: request.motion_admission.guard_generation as i64,
+
                     motion_guard_boot_nonce: request.motion_admission.guard_boot_nonce,
                     motion_stop_generation: request.motion_admission.motion_stop_generation as i64,
                     goal,
@@ -8961,11 +8548,6 @@ use nuwax_protocol::RawLcmFrame;
             .await
             .expect("committed frontier costmap");
     }
-
-
-
-
-
 
 
     #[tokio::test]
@@ -9246,7 +8828,7 @@ use nuwax_protocol::RawLcmFrame;
             assigned_navigation_readiness(&fixture.handle).await;
             let coordinate_goal = |id: &str, pose: Pose| NavigationGoal {
                 pose:Some(pose), frame_id:"map".into(), goal_id:id.into(),
-                motion_guard_generation:7, motion_guard_boot_nonce:vec![7;16], motion_stop_generation:1,
+                 motion_guard_boot_nonce:vec![7;16], motion_stop_generation:1,
                 ..Default::default()
             };
             let unlocalized_pose = client.get_current_pose(PoseRequest::default()).await.unwrap().into_inner();
@@ -9320,7 +8902,6 @@ use nuwax_protocol::RawLcmFrame;
                 let frame=published.iter().find(|frame|frame.msg_type.fqn()=="nuwax_msgs.GoalEnvelope")
                     .expect("coordinate admission publishes the existing typed goal envelope");
                 let goal=schema::decode_goal_envelope_body(&frame.payload).unwrap();
-                assert_eq!(goal.motion_guard_generation,7);
                 assert_eq!(goal.motion_guard_boot_nonce,[7;16]);
                 assert_eq!(goal.motion_stop_generation,1);
                 assert_eq!(goal.goal.header.frame_id,"map");
@@ -9717,17 +9298,11 @@ use nuwax_protocol::RawLcmFrame;
     }
 
 
-
     fn recorded_legacy_clouds(backend: &CheckpointPublishBackend) -> Vec<RawLcmFrame> {
         backend.published.lock().unwrap().iter()
             .filter(|frame| frame.msg_type.fqn() == "sensor_msgs.PointCloud2")
             .cloned().collect()
     }
-
-
-
-
-
 
 
     async fn exercise_canonical_reset_retained_after_caller_cancel(cloud_activation: bool) {
@@ -9982,7 +9557,7 @@ use nuwax_protocol::RawLcmFrame;
             request_id: request_id.to_string(),
             strategy: "wavefront".to_string(),
             arbitration: "prefer_wavefront".to_string(),
-            motion_guard_generation: 7,
+
             motion_guard_boot_nonce: vec![7; 16],
             motion_stop_generation: 1,
             ..ExploreRequest::default()
@@ -10107,7 +9682,7 @@ use nuwax_protocol::RawLcmFrame;
                 }),
                 frame_id: "map".to_string(),
                 goal_id: goal_id.to_string(),
-                motion_guard_generation: 7,
+
                 motion_guard_boot_nonce: vec![7; 16],
                 motion_stop_generation: 1,
                 ..NavigationGoal::default()
@@ -10140,155 +9715,6 @@ use nuwax_protocol::RawLcmFrame;
         (active.child_task_id, lease)
     }
 
-    fn rollover_recovery_proto_request(
-        snapshot: &crate::explore_runtime::ExploreRuntimeSnapshot,
-    ) -> RecoverExplorationAfterNavigationRolloverRequest {
-        let lease = snapshot
-            .child_lease
-            .as_ref()
-            .expect("retained exploration child lease");
-        RecoverExplorationAfterNavigationRolloverRequest {
-            request_id: snapshot.request_id.clone(),
-            exploration_generation: snapshot.exploration_generation,
-            child_lease: Some(ExplorationChildLease {
-                session_id: lease.session_id.clone(),
-                owner_kind: lease.owner_kind,
-                parent_request_id: lease.parent_request_id.clone(),
-                goal_generation: lease.goal_generation,
-                producer_runtime_generation: lease.producer_runtime_generation,
-
-            }),
-            expected_navigation_runtime_generation: 41,
-            observed_navigation_runtime_generation: 42,
-            guard_proof: Some(crate::proto::ExplorationRecoveryGuardProof {
-                stop_operation_id: "hold:geometry-rollover-test".to_string(),
-                guard_generation: 7,
-                guard_boot_nonce: vec![7; 16],
-                motion_stop_generation: 9,
-                zero_ack_id: "zero:geometry-rollover-test".to_string(),
-                zero_applied_monotonic_ns: now_monotonic_nanos(),
-                recovery_fence_token: vec![9; 32],
-                recovery_correlation: "geometry-rollover:test".to_string(),
-            }),
-        }
-    }
-
-    fn rollover_recovery_internal_request(
-        request: &RecoverExplorationAfterNavigationRolloverRequest,
-    ) -> crate::explore_runtime::ExplorationRolloverRecoveryRequest {
-        let child = request.child_lease.as_ref().expect("child lease");
-        let guard = request.guard_proof.as_ref().expect("guard proof");
-        crate::explore_runtime::ExplorationRolloverRecoveryRequest {
-            request_id: request.request_id.clone(),
-            exploration_generation: request.exploration_generation,
-            child_lease: ChildNavigationLease {
-                session_id: child.session_id.clone(),
-                owner_kind: child.owner_kind,
-                parent_request_id: child.parent_request_id.clone(),
-                goal_generation: child.goal_generation,
-                producer_runtime_generation: child.producer_runtime_generation,
-
-            },
-            expected_navigation_runtime_generation: request.expected_navigation_runtime_generation,
-            observed_navigation_runtime_generation: request.observed_navigation_runtime_generation,
-            guard_proof: crate::explore_runtime::ExplorationRecoveryGuardProof {
-                stop_operation_id: guard.stop_operation_id.clone(),
-                recovery_correlation: guard.recovery_correlation.clone(),
-                motion_admission: MotionAdmissionProof::try_from_wire(
-                    guard.guard_generation,
-                    &guard.guard_boot_nonce,
-                    guard.motion_stop_generation,
-                )
-                .expect("motion admission"),
-                zero_ack_id: guard.zero_ack_id.clone(),
-                zero_applied_monotonic_ns: guard.zero_applied_monotonic_ns,
-                recovery_fence_token: crate::explore_runtime::RecoveryFenceToken::from_wire(
-                    guard.recovery_fence_token.clone(),
-                ),
-            },
-        }
-    }
-
-    fn global_stop_reconciliation_proto_request(
-        snapshot: &crate::explore_runtime::ExploreRuntimeSnapshot,
-    ) -> ReconcileExplorationAfterGlobalStopRequest {
-        let lease = snapshot.child_lease.as_ref().expect("retained child lease");
-        let reconciliation = &snapshot.global_stop_reconciliation;
-        let admission = reconciliation
-            .motion_admission
-            .expect("original motion admission");
-        ReconcileExplorationAfterGlobalStopRequest {
-            request_id: snapshot.request_id.clone(),
-            exploration_generation: snapshot.exploration_generation,
-            child_lease: Some(ExplorationChildLease {
-                session_id: lease.session_id.clone(),
-                owner_kind: lease.owner_kind,
-                parent_request_id: lease.parent_request_id.clone(),
-                goal_generation: lease.goal_generation,
-                producer_runtime_generation: lease.producer_runtime_generation,
-
-            }),
-            cancel_generation: reconciliation.cancel_generation,
-            recovery_correlation: reconciliation.recovery_correlation.clone(),
-            admission_guard_generation: admission.guard_generation,
-            admission_guard_boot_nonce: admission.guard_boot_nonce.to_vec(),
-            admission_motion_stop_generation: admission.motion_stop_generation,
-            held_guard_proof: Some(crate::proto::ExplorationRecoveryGuardProof {
-                stop_operation_id: "hold:geometry-global-stop-test".to_string(),
-                guard_generation: admission.guard_generation,
-                guard_boot_nonce: admission.guard_boot_nonce.to_vec(),
-                motion_stop_generation: admission.motion_stop_generation + 1,
-                zero_ack_id: "zero:geometry-global-stop-test".to_string(),
-                zero_applied_monotonic_ns: now_monotonic_nanos(),
-                recovery_fence_token: vec![9; 32],
-                recovery_correlation: reconciliation.recovery_correlation.clone(),
-            }),
-        }
-    }
-
-    fn global_stop_reconciliation_internal_request(
-        request: &ReconcileExplorationAfterGlobalStopRequest,
-    ) -> crate::explore_runtime::ExplorationGlobalStopReconciliationRequest {
-        let child = request.child_lease.as_ref().expect("child lease");
-        let held = request.held_guard_proof.as_ref().expect("held proof");
-        let original_motion_admission = MotionAdmissionProof::try_from_wire(
-            request.admission_guard_generation,
-            &request.admission_guard_boot_nonce,
-            request.admission_motion_stop_generation,
-        )
-        .expect("original motion admission");
-        crate::explore_runtime::ExplorationGlobalStopReconciliationRequest {
-            request_id: request.request_id.clone(),
-            exploration_generation: request.exploration_generation,
-            child_lease: ChildNavigationLease {
-                session_id: child.session_id.clone(),
-                owner_kind: child.owner_kind,
-                parent_request_id: child.parent_request_id.clone(),
-                goal_generation: child.goal_generation,
-                producer_runtime_generation: child.producer_runtime_generation,
-
-            },
-            cancel_generation: request.cancel_generation,
-            recovery_correlation: request.recovery_correlation.clone(),
-            guard_proof: crate::explore_runtime::ExplorationGlobalStopGuardProof {
-                stop_operation_id: held.stop_operation_id.clone(),
-                recovery_correlation: held.recovery_correlation.clone(),
-                original_motion_admission,
-                held_guard_generation: held.guard_generation,
-                held_guard_boot_nonce: held
-                    .guard_boot_nonce
-                    .as_slice()
-                    .try_into()
-                    .expect("16-byte held boot nonce"),
-                held_motion_stop_generation: held.motion_stop_generation,
-                zero_ack_id: held.zero_ack_id.clone(),
-                zero_applied_monotonic_ns: held.zero_applied_monotonic_ns,
-                recovery_fence_token: crate::explore_runtime::RecoveryFenceToken::from_wire(
-                    held.recovery_fence_token.clone(),
-                ),
-            },
-        }
-    }
 
     #[tokio::test]
     async fn process_stop_waits_for_exploration_zero_before_listener_shutdown() {
@@ -10634,189 +10060,6 @@ use nuwax_protocol::RawLcmFrame;
         assert_eq!(service.state.read().await.phase, "stopped");
     }
 
-    #[tokio::test]
-    async fn rollover_recovery_keeps_child_when_guard_verification_is_unavailable() {
-        let handle = crate::lcm_runtime::build_handle_for_tests()
-            .await
-            .expect("real-lcm test handle");
-        let sink = Arc::new(LifecycleExploreSink::default());
-        start_active_exploration(&handle, sink.clone(), "guard-proof-unavailable").await;
-        *sink
-            .cancel_error
-            .lock()
-            .expect("lifecycle exploration sink lock") = Some("old runtime lost child".to_string());
-        let retained = handle.explore.stop("guard-proof-unavailable").await;
-        assert_eq!(retained.status, STATUS_FAILED);
-        assert!(retained.rollover_recovery_eligible);
-        handle
-            .nav
-            .observe_planner_input(crate::nav_runtime::PlannerInputObservation {
-                generation: 42,
-                map_revision: 1,
-                map_frame: "map".to_string(),
-                pose_frame: "map".to_string(),
-                ready: true,
-            })
-            .expect("planner generation");
-        let service = GeometryRuntimeService::new(handle.clone());
-        let request = rollover_recovery_proto_request(&retained);
-
-        let _env_lock = MOTION_GUARD_SOCKET_ENV_LOCK.lock().await;
-        let previous_socket = std::env::var_os("NUWAX_MOTION_GUARD_SOCKET");
-        let missing_socket = std::env::temp_dir().join(format!(
-            "nuwax-motion-guard-missing-{}.sock",
-            uuid::Uuid::new_v4()
-        ));
-        std::env::set_var("NUWAX_MOTION_GUARD_SOCKET", &missing_socket);
-        let result = GeometryRuntime::recover_exploration_after_navigation_rollover(
-            &service,
-            Request::new(request),
-        )
-        .await;
-        if let Some(value) = previous_socket {
-            std::env::set_var("NUWAX_MOTION_GUARD_SOCKET", value);
-        } else {
-            std::env::remove_var("NUWAX_MOTION_GUARD_SOCKET");
-        }
-
-        let error = result.expect_err("unverified recovery fence must fail closed");
-        assert_eq!(error.code(), tonic::Code::Unavailable);
-        assert_eq!(
-            handle.explore.snapshot().child_task_id,
-            retained.child_task_id
-        );
-        assert!(handle.explore.blocks_mapping_mutation().await);
-    }
-
-    #[tokio::test]
-    async fn exact_rollover_replay_precedes_planner_and_guard_checks() {
-        let handle = crate::lcm_runtime::build_handle_for_tests()
-            .await
-            .expect("real-lcm test handle");
-        let sink = Arc::new(LifecycleExploreSink::default());
-        start_active_exploration(&handle, sink.clone(), "exact-rollover-replay").await;
-        *sink
-            .cancel_error
-            .lock()
-            .expect("lifecycle exploration sink lock") = Some("old runtime lost child".to_string());
-        let retained = handle.explore.stop("exact-rollover-replay").await;
-        let proto_request = rollover_recovery_proto_request(&retained);
-        let internal_request = rollover_recovery_internal_request(&proto_request);
-        let committed = handle
-            .explore
-            .recover_after_navigation_rollover(internal_request)
-            .await
-            .expect("seed completed recovery");
-        let service = GeometryRuntimeService::new(handle);
-
-        let replay = GeometryRuntime::recover_exploration_after_navigation_rollover(
-            &service,
-            Request::new(proto_request),
-        )
-        .await
-        .expect("exact replay must not require live planner or guard")
-        .into_inner();
-
-        assert_eq!(replay.status, committed.status);
-        assert_eq!(replay.last_stop_reason, "runtime_rollover_aborted_safe");
-        assert!(replay.child_lease.is_none());
-    }
-
-    #[tokio::test]
-    async fn exact_global_stop_replay_precedes_live_guard_verification() {
-        let (handle, owner) = super::shared_nav_v8_recovery_tests::unit_handle().await;
-        handle.explore.set_reconciliation_journal_path_for_tests(
-            std::env::temp_dir()
-                .join(format!(
-                    "nuwax-server-global-stop-journal-{}",
-                    uuid::Uuid::new_v4()
-                ))
-                .join("journal.json"),
-        );
-        let sink = Arc::new(LifecycleExploreSink::default());
-        let (child_task_id, lease) =
-            start_active_exploration(&handle, sink, "exact-global-stop-replay").await;
-        assert_eq!(
-            handle.explore.stop("exact-global-stop-replay").await.status,
-            STATUS_STOPPING
-        );
-        let retained = handle
-            .explore
-            .report_navigation_result(
-                &child_task_id,
-                ChildNavigationResult::CancelFailed {
-                    proof: ChildNavigationTerminalProof {
-                        lease: lease.clone(),
-                    },
-                    cancel_generation: 1,
-                    reason: "exact cancel failed".to_string(),
-                },
-            )
-            .await
-            .expect("retained failed cancellation");
-        assert!(retained.global_stop_reconciliation.eligible);
-        let proto_request = global_stop_reconciliation_proto_request(&retained);
-        let internal_request = global_stop_reconciliation_internal_request(&proto_request);
-        handle.explore.fail_next_reconciliation_directory_sync_for_tests();
-        assert!(matches!(handle.explore.reconcile_after_global_stop(internal_request.clone()).await,
-            Err(crate::explore_runtime::ExplorationRecoveryError::FailedPrecondition(message))
-                if message.contains("post-rename durability uncertain")));
-        let service = GeometryRuntimeService::new(handle.clone());
-
-        let _env_lock = MOTION_GUARD_SOCKET_ENV_LOCK.lock().await;
-        let previous_socket = std::env::var_os("NUWAX_MOTION_GUARD_SOCKET");
-        let missing_socket = std::env::temp_dir().join(format!(
-            "nuwax-motion-guard-missing-{}.sock",
-            uuid::Uuid::new_v4()
-        ));
-        std::env::set_var("NUWAX_MOTION_GUARD_SOCKET", &missing_socket);
-        // A typed receipt exists on disk, but live custody still requires the
-        // original server Guard verification before ownership can be released.
-        let live_result = GeometryRuntime::reconcile_exploration_after_global_stop(
-            &service, Request::new(proto_request.clone()),
-        ).await;
-        let live_after = handle.explore.snapshot();
-        let committed = handle.explore.reconcile_after_global_stop(internal_request)
-            .await.expect("finish exact live ownership for completed-replay fixture");
-        assert!(committed.ownership_reconciliation_receipt.is_some());
-        let result = GeometryRuntime::reconcile_exploration_after_global_stop(
-            &service,
-            Request::new(proto_request),
-        )
-        .await;
-        if let Some(value) = previous_socket {
-            std::env::set_var("NUWAX_MOTION_GUARD_SOCKET", value);
-        } else {
-            std::env::remove_var("NUWAX_MOTION_GUARD_SOCKET");
-        }
-
-        assert_eq!(live_result.unwrap_err().code(), tonic::Code::Unavailable);
-        assert_eq!(live_after.child_task_id, retained.child_task_id);
-        let replay = result
-            .expect("exact replay must not require live Guard")
-            .into_inner();
-        assert!(replay.child_lease.is_none());
-        let receipt = replay
-            .ownership_reconciliation_receipt
-            .expect("wire reconciliation receipt");
-        assert_eq!(receipt.parent_request_id, "exact-global-stop-replay");
-        assert_eq!(receipt.cancel_generation, 1);
-        let acknowledged = GeometryRuntime::acknowledge_exploration_ownership_reconciliation(
-            &service,
-            Request::new(AcknowledgeExplorationOwnershipReconciliationRequest {
-            child_lease: receipt.child_lease,
-                recovery_correlation: receipt.recovery_correlation,
-                child_lease_fingerprint: receipt.child_lease_fingerprint,
-            }),
-        )
-        .await
-        .expect("reconciliation acknowledgement RPC")
-        .into_inner();
-        assert!(acknowledged.acknowledged);
-        drop(service);
-        drop(handle);
-        owner.finish().await.unwrap();
-    }
 
     #[tokio::test]
     async fn process_stop_timeout_does_not_request_listener_shutdown() {
@@ -11015,7 +10258,7 @@ use nuwax_protocol::RawLcmFrame;
                     &service,
                     Request::new(NavigationGoal {
                         goal_id: "queued-public-after-stop".to_string(),
-                        motion_guard_generation: 7,
+
                         motion_guard_boot_nonce: vec![7; 16],
                         motion_stop_generation: 1,
                         ..NavigationGoal::default()
@@ -11240,16 +10483,105 @@ use nuwax_protocol::RawLcmFrame;
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ordinary_real_guard_receipt_reaches_original_cancel_and_exploration_handlers() {
+        use crate::lcm_runtime::vertical_v2_canary::{GuardChild, ORDINARY_STOP_TEST_CAPABILITIES};
+        let guard = GuardChild::spawn_with_capabilities(&format!("b5-handlers-{}", uuid::Uuid::new_v4()),
+            Some(ORDINARY_STOP_TEST_CAPABILITIES)).await;
+        let mut client = nuwax_motion_safety_guard::MotionGuardClient::connect(&guard.socket_path).await.unwrap();
+        let handle = crate::lcm_runtime::build_handle_for_tests().await.unwrap();
+        let service = GeometryRuntimeService::new(handle.clone());
+        start_mapping_session(&service, "ordinary-handlers-map", "ordinary-handlers-map").await;
+        let request_for = |state: &NavigationState, proof: Option<OrdinaryGlobalStopConfirmation>| CancelNavigationRequest {
+            goal_id: state.goal_id.clone(), owner_kind: state.owner_kind,
+            parent_request_id: state.parent_request_id.clone(), goal_generation: state.goal_generation,
+            producer_runtime_generation: state.producer_runtime_generation, global_stop_confirmation: proof,
+        };
+        let receipt_for = |id: &str, proof: &nuwax_motion_safety_guard::GlobalStopConfirmation| OrdinaryGlobalStopConfirmation {
+            operation_id: id.into(), zero_ack_id: proof.zero.zero_ack_id.clone(),
+            applied_monotonic_ns: proof.zero.applied_monotonic_ns,
+            stationary_confirmed: proof.zero.stationary_confirmed,
+        };
+        // 隔离LCM没有NAV回执消费者；真实守卫租约由此测试客户端持有。
+        let old = start_public_navigation(&service, &handle, "ordinary-unanswered-nav").await;
+        assert_eq!(old.status, "ACCEPTED");
+        let ready = client.get_readiness().await.unwrap();
+        client.acquire_lease("ordinary-unanswered-acquire", &nuwax_motion_safety_guard::MotionAdmissionProof {
+            boot_nonce: ready.boot_nonce.try_into().unwrap(), motion_stop_generation: ready.motion_stop_generation,
+        }).await.unwrap();
+        client.submit_twist("ordinary-unanswered-motion", nuwax_motion_safety_guard::wire::TwistCommand {
+            linear_x_mps: 0.1, linear_y_mps: 0.0, angular_z_rps: 0.0,
+        }).await.unwrap();
+        let pending = GeometryRuntime::cancel_navigation(&service, Request::new(request_for(&old, None))).await.unwrap().into_inner();
+        assert_eq!(pending.cancel_phase, "PENDING");
+        handle.nav.expire_cancel_for_test();
+        assert!(handle.nav.poll_cancel_timeout().await.is_some());
+        let confirmation = client.stop_all_motion("ordinary-handlers-stop", "本机真实回执串接").await.unwrap();
+        let proof = receipt_for("ordinary-handlers-stop", &confirmation);
+        let events_after_zero = guard.actuator_events();
+        let stopped = GeometryRuntime::cancel_navigation(&service, Request::new(request_for(&old, Some(proof.clone())))).await.unwrap().into_inner();
+        assert_eq!(stopped.status, "FAILED");
+        assert_eq!(stopped.reason_code, "GLOBAL_STOP_CONFIRMED");
+        assert_eq!(stopped.zero_ack_id, confirmation.zero.zero_ack_id);
+        assert_eq!(stopped.zero_applied_monotonic_ns, confirmation.zero.applied_monotonic_ns);
+        assert_eq!(guard.actuator_events(), events_after_zero, "几何收尾不发第二次停车");
+        let successor = start_public_navigation(&service, &handle, "ordinary-handler-successor").await;
+        assert_eq!(successor.status, "ACCEPTED");
+        GeometryRuntime::cancel_navigation(&service, Request::new(request_for(&old, Some(proof.clone())))).await.unwrap();
+        assert_eq!(handle.nav.active_goal_lease().await.unwrap().session_id, successor.goal_id);
+        assert!(GeometryRuntime::cancel_navigation(&service, Request::new(request_for(&successor, Some(proof)))).await.is_err());
+        // 下一独立操作清理本测试新目标，仍只沿同次回执处理一次。
+        let cleanup = client.stop_all_motion("ordinary-handlers-next", "清理后继测试目标").await.unwrap();
+        GeometryRuntime::cancel_navigation(&service, Request::new(request_for(&successor,
+            Some(receipt_for("ordinary-handlers-next", &cleanup))))).await.unwrap();
+
+        let sink = Arc::new(LifecycleExploreSink::default());
+        let (child_id, child) = start_active_exploration(&handle, sink.clone(), "ordinary-unanswered-exploration").await;
+        let exploration = handle.explore.snapshot();
+        // 明确无响应的子入口保留与生产相同的精确NAV身份；没有声称启动或杀死NAV进程。
+        handle.nav.replace_active_goal_for_test(crate::nav_runtime::ActiveGoal {
+            admitted_guard_clock_ns: nuwax_motion_safety_guard::measured_motion::monotonic_ns(),
+            id: child_id.clone(), frame_id: "map".into(), target: PoseState::default(),
+            options: Default::default(), producer: "wavefront".into(), producer_epoch: exploration.exploration_generation as i64,
+            body_to_support_z_m: None, boundary_owner: None,
+            lease: crate::nav_runtime::GoalLease {
+                session_id: child_id, owner_kind: child.owner_kind, parent_request_id: child.parent_request_id.clone(),
+                goal_generation: child.goal_generation, producer_runtime_generation: child.producer_runtime_generation,
+                path_revision: 0, planner_runtime_generation: 0,
+            },
+        }).await;
+        *sink.cancel_error.lock().unwrap() = Some("明确无响应子导航".into());
+        assert!(handle.explore.stop(&exploration.request_id).await.parking_pending);
+        let confirmation = client.stop_all_motion("ordinary-handlers-explore", "本机探索普通停车").await.unwrap();
+        let proof = receipt_for("ordinary-handlers-explore", &confirmation);
+        let events_after_zero = guard.actuator_events();
+        GeometryRuntime::cancel_navigation(&service, Request::new(CancelNavigationRequest {
+            goal_id: child.session_id, owner_kind: child.owner_kind, parent_request_id: child.parent_request_id,
+            goal_generation: child.goal_generation, producer_runtime_generation: child.producer_runtime_generation,
+            global_stop_confirmation: Some(proof.clone()),
+        })).await.unwrap();
+        let stopped = GeometryRuntime::stop_exploration(&service, Request::new(StopExplorationRequest {
+            request_id: exploration.request_id, expected_exploration_generation: exploration.exploration_generation,
+            global_stop_confirmation: Some(proof),
+        })).await.unwrap().into_inner();
+        assert_eq!(stopped.status, "FAILED");
+        assert!(!stopped.parking_pending);
+        assert_eq!(guard.actuator_events(), events_after_zero, "两个拥有方消费同一回执不重复归零");
+        let next = GeometryRuntime::start_exploration(&service, Request::new(ExploreRequest {
+            request_id: "ordinary-explore-successor".into(), motion_guard_boot_nonce: vec![7;16],
+            ..ExploreRequest::default()
+        })).await.unwrap().into_inner();
+        assert_eq!(next.status, "ACCEPTED", "{}", next.message);
+        handle.explore.stop(&next.request_id).await;
+        drop(client);
+        guard.shutdown().await;
+    }
+
     #[tokio::test]
     async fn mapping_mutation_waits_for_late_zeroed_after_child_cancel_failure() {
         let handle = crate::lcm_runtime::build_handle_for_tests()
             .await
             .expect("real-lcm test handle");
-        let journal_root=std::env::temp_dir().join(format!("nuwax-late-zero-journal-{}-{}",std::process::id(),uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&journal_root).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&journal_root,std::fs::Permissions::from_mode(0o700)).unwrap();
-        handle.explore.set_reconciliation_journal_path_for_tests(journal_root.join("journal.json"));
         let service = GeometryRuntimeService::new(handle.clone());
         start_mapping_session(&service, "parked-session", "warehouse-parked").await;
         let sink = Arc::new(LifecycleExploreSink::default());
@@ -11288,7 +10620,8 @@ use nuwax_protocol::RawLcmFrame;
             .expect("cancel failure terminal");
         assert_eq!(failed.status, STATUS_FAILED);
         assert_eq!(failed.last_stop_reason, "child_cancel_failed");
-        assert_eq!(failed.child_task_id, active.child_task_id);
+        assert!(failed.child_task_id.is_empty());
+        assert!(failed.parking_pending);
         assert!(handle.explore.blocks_mapping_mutation().await);
 
         let stop_error = GeometryRuntime::stop_mapping(
@@ -11353,7 +10686,6 @@ use nuwax_protocol::RawLcmFrame;
         let final_exploration = handle.explore.snapshot();
         assert_eq!(final_exploration.status, STATUS_FAILED);
         assert_eq!(final_exploration.last_stop_reason, "child_cancel_failed");
-        std::fs::remove_dir_all(journal_root).unwrap();
     }
 
     #[tokio::test]
@@ -12570,7 +11902,6 @@ use nuwax_protocol::RawLcmFrame;
         );
 
 
-
         let mut handle = crate::lcm_runtime::build_handle_for_tests()
             .await
             .expect("restored real-lcm test handle");
@@ -13457,7 +12788,6 @@ use nuwax_protocol::RawLcmFrame;
     }
 
 
-
     #[tokio::test]
     async fn modern_activation_receipt_seals_replays_and_retires_on_first_stop() {
         let handle = crate::lcm_runtime::build_handle_for_tests()
@@ -13561,7 +12891,6 @@ use nuwax_protocol::RawLcmFrame;
         );
         let _ = std::fs::remove_file(cloud_path);
     }
-
 
 
     #[tokio::test]
@@ -14526,19 +13855,6 @@ use nuwax_protocol::RawLcmFrame;
     }
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
     #[tokio::test]
     async fn process_stop_holds_lifecycle_lock_until_listener_ack() {
         let handle = crate::lcm_runtime::build_handle_for_tests()
@@ -14769,7 +14085,7 @@ mod exploration_contract_tests {
             max_navigation_retries: 3,
             blacklist_radius_m: 0.75,
             boundary_frame_id: "map".into(),
-            motion_guard_generation: 7,
+
             motion_guard_boot_nonce: vec![7; 16],
             motion_stop_generation: 1,
         };
@@ -14810,7 +14126,7 @@ mod exploration_contract_tests {
                 },
             ],
             boundary_frame_id: "robot/map".to_string(),
-            motion_guard_generation: 7,
+
             motion_guard_boot_nonce: vec![7; 16],
             motion_stop_generation: 1,
             ..ExploreRequest::default()
@@ -14831,6 +14147,7 @@ mod exploration_contract_tests {
     fn exploration_state_preserves_child_identity() {
         let proto =
             exploration_state_from_snapshot(crate::explore_runtime::ExploreRuntimeSnapshot {
+            parking_pending: false,
                 mission_progress_json: String::new(),
                 status: crate::explore_runtime::STATUS_ACTIVE,
                 message: "moving".into(),
@@ -14849,14 +14166,11 @@ mod exploration_contract_tests {
                     producer_runtime_generation: 5,
 
                 }),
-                rollover_recovery_eligible: true,
-                global_stop_reconciliation:
-                    crate::explore_runtime::ExplorationGlobalStopReconciliationSnapshot::default(),
-                ownership_reconciliation_receipt: None,
+
+
             });
         assert_eq!(proto.child_task_id, "child-3");
         assert_eq!(proto.exploration_generation, 12);
-        assert!(proto.rollover_recovery_eligible);
         let child = proto.child_lease.expect("child lease");
         assert_eq!(child.producer_runtime_generation, 5);
     }
@@ -14886,7 +14200,7 @@ mod navigation_feedback_contract_tests {
                 actuator_zeroed: true,
                 reason_code: "CANCEL_ZEROED".into(),
                 runtime_generation: 7,
-                guard_generation: 11,
+
                 sink_ready: true,
                 planner_map_frame: "map".into(),
                 planner_pose_frame: "map".into(),
@@ -14906,7 +14220,6 @@ mod navigation_feedback_contract_tests {
         assert!(proto.actuator_zeroed);
         assert_eq!(proto.reason_code, "CANCEL_ZEROED");
         assert_eq!(proto.runtime_generation, 7);
-        assert_eq!(proto.guard_generation, 11);
         assert!(proto.sink_ready);
         assert_eq!(proto.planner_map_frame, "map");
         assert_eq!(proto.planner_pose_frame, "map");
@@ -15033,7 +14346,7 @@ mod navigation_feedback_contract_tests {
                 }),
                 frame_id: String::new(),
                 goal_id: "robot-map-default-goal".to_string(),
-                motion_guard_generation: 7,
+
                 motion_guard_boot_nonce: vec![7; 16],
                 motion_stop_generation: 1,
                 ..NavigationGoal::default()
@@ -15113,7 +14426,7 @@ mod navigation_feedback_contract_tests {
                 }),
                 frame_id: "map".to_string(),
                 goal_id: "public-goal".to_string(),
-                motion_guard_generation: 7,
+
                 motion_guard_boot_nonce: vec![7; 16],
                 motion_stop_generation: 1,
                 ..NavigationGoal::default()
@@ -15140,6 +14453,8 @@ mod navigation_feedback_contract_tests {
         let stale_cancel = GeometryRuntime::cancel_navigation(
             &service,
             Request::new(CancelNavigationRequest {
+global_stop_confirmation: None,
+
                 goal_id: goal.goal_id.clone(),
                 owner_kind: goal.owner_kind,
                 parent_request_id: goal.parent_request_id.clone(),
@@ -15157,6 +14472,8 @@ mod navigation_feedback_contract_tests {
         let cancelled = GeometryRuntime::cancel_navigation(
             &service,
             Request::new(CancelNavigationRequest {
+global_stop_confirmation: None,
+
                 goal_id: goal.goal_id.clone(),
                 owner_kind: goal.owner_kind,
                 parent_request_id: goal.parent_request_id.clone(),
@@ -15426,109 +14743,5 @@ mod shared_nav_v8_recovery_tests {
         ).await.unwrap()
     }
 
-    #[tokio::test]
-    async fn legacy_journal_restores_through_real_get_and_ack_without_hash_or_new_goal() {
-        let (handle, owner) = unit_handle().await;
-        let (restarted, restarted_owner) = unit_handle().await;
-        let directory = std::env::temp_dir().join(format!("nuwax-v8-legacy-rpc-{}-{}", std::process::id(), crate::explore_runtime::now_unix_nanos()));
-        std::fs::create_dir_all(&directory).unwrap();
-        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let path = directory.join("journal.json");
-        std::fs::write(&path, r#"{
-  "schema_version": 1,
-  "entries": [
-    {
-      "kind": "global_stop",
-      "recovery_correlation": "exploration-global-stop:0000000000000000000000000000000000000000000000000000000000000065",
-      "request_fingerprint": "0000000000000000000000000000000000000000000000000000000000000066",
-      "receipt": {
-        "cause": "ordinary_global_stop",
-        "recovery_correlation": "exploration-global-stop:0000000000000000000000000000000000000000000000000000000000000065",
-        "parent_request_id": "parent-101",
-        "exploration_generation": 102,
-        "child_lease_fingerprint": "0000000000000000000000000000000000000000000000000000000000000067",
-        "cancel_generation": 1,
-        "commit_disposition": "global_stop_reconciled_child_ownership"
-      },
-      "snapshot": {
-        "status": "FAILED",
-        "message": "synthetic legacy receipt fixture; no goal or proof payload",
-        "request_id": "parent-101",
-        "selected_source": "wavefront",
-        "last_stop_reason": "global_stop_reconciled_safe",
-        "frontier_count": 0,
-        "revision": 1,
-        "exploration_generation": 102
-      },
-      "committed_unix_ns": 102,
-      "acknowledged": false
-    },
-    {
-      "kind": "exact_child_zeroed",
-      "recovery_correlation": "exploration-global-stop:0000000000000000000000000000000000000000000000000000000000000066",
-      "request_fingerprint": "0000000000000000000000000000000000000000000000000000000000000067",
-      "receipt": {
-        "cause": "late_exact_child_zeroed",
-        "recovery_correlation": "exploration-global-stop:0000000000000000000000000000000000000000000000000000000000000066",
-        "parent_request_id": "parent-102",
-        "exploration_generation": 103,
-        "child_lease_fingerprint": "0000000000000000000000000000000000000000000000000000000000000068",
-        "cancel_generation": 1,
-        "commit_disposition": "exact_child_zeroed_released_ownership"
-      },
-      "snapshot": {
-        "status": "FAILED",
-        "message": "synthetic legacy receipt fixture; no goal or proof payload",
-        "request_id": "parent-102",
-        "selected_source": "wavefront",
-        "last_stop_reason": "child_cancel_failed",
-        "frontier_count": 0,
-        "revision": 1,
-        "exploration_generation": 103
-      },
-      "committed_unix_ns": 103,
-      "acknowledged": false
-    }
-  ]
-}
-"#).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        handle.explore.set_reconciliation_journal_path_for_tests(path.clone());
-        restarted.explore.set_reconciliation_journal_path_for_tests(path.clone());
-        struct NoHash;
-        impl Drop for NoHash { fn drop(&mut self) { crate::map_checksum::FORBID_HASH.with(|flag| flag.set(false)); } }
-        crate::map_checksum::FORBID_HASH.with(|flag| flag.set(true));
-        let _no_hash = NoHash;
-        handle.explore.restore_latest_durable_reconciliation_snapshot().unwrap();
-        let service = GeometryRuntimeService::new(handle.clone());
-        let state = GeometryRuntime::get_exploration_state(&service, Request::new(Empty {})).await.unwrap().into_inner();
-        assert_eq!(state.status, "FAILED");
-        assert_eq!(state.request_id, "parent-102");
-        assert!(state.child_lease.is_none());
-        assert!(handle.nav.active_goal_lease().await.is_none());
-        let receipt = state.ownership_reconciliation_receipt.unwrap();
-        assert!(receipt.child_lease.is_none());
-        assert_eq!(receipt.child_lease_fingerprint, format!("{:064x}", 104));
-        for _ in 0..2 {
-            let ack = GeometryRuntime::acknowledge_exploration_ownership_reconciliation(&service,
-                Request::new(AcknowledgeExplorationOwnershipReconciliationRequest {
-                    recovery_correlation: receipt.recovery_correlation.clone(),
-                    child_lease_fingerprint: receipt.child_lease_fingerprint.clone(), child_lease: None,
-                })).await.unwrap().into_inner();
-            assert!(ack.acknowledged);
-        }
-        let restarted_service = GeometryRuntimeService::new(restarted);
-        let next = GeometryRuntime::get_exploration_state(&restarted_service, Request::new(Empty {})).await.unwrap().into_inner();
-        assert_eq!(next.request_id, "parent-101");
-        assert!(next.child_lease.is_none());
-        let stored: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(stored["schema_version"], 1);
-        assert_eq!(stored["entries"][0]["request_fingerprint"], format!("{:064x}", 102));
-        assert_eq!(stored["entries"][1]["acknowledged"], true);
-        drop(service);
-        drop(restarted_service);
-        drop(handle);
-        owner.finish().await.unwrap();
-        restarted_owner.finish().await.unwrap();
-    }
+
 }

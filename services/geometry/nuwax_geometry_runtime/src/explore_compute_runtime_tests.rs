@@ -1293,22 +1293,24 @@ async fn owner_runtime_active_homeward_fault_cancels_exact_child(
     let cancel_generation = if cancel_fails { 37 } else { 1 };
     {
         let guard = handle.inner.lock().await;
-        let pending = guard.pending_child_cancellation.as_ref().unwrap();
-        assert!(!pending.dispatch_in_flight);
-        assert_eq!(pending.failure.is_some(), cancel_fails);
-        assert_eq!(
-            pending.ticket.as_ref().unwrap().cancel_generation,
-            cancel_generation
-        );
-        assert!(pending.ticket.as_ref().unwrap().lease.matches(&lease));
-        assert!(guard.active_child.as_ref().unwrap().lease.matches(&lease));
+        if cancel_fails {
+            assert!(guard.pending_child_cancellation.is_none());
+            assert!(guard.active_child.is_none());
+            assert_eq!(handle.orphan_cancellations.retired_cancellation(&lease), Some(Some(cancel_generation)));
+        } else {
+            let pending = guard.pending_child_cancellation.as_ref().unwrap();
+            assert!(!pending.dispatch_in_flight);
+            assert_eq!(pending.ticket.as_ref().unwrap().cancel_generation, cancel_generation);
+            assert!(pending.ticket.as_ref().unwrap().lease.matches(&lease));
+            assert!(guard.active_child.as_ref().unwrap().lease.matches(&lease));
+        }
         let status = guard.compute.status().unwrap();
         assert_eq!(status.incarnation, incarnation);
         assert!(status.closed);
         assert_eq!(status.high_water.workers, 1);
     }
     let retained = handle.snapshot();
-    assert_eq!(retained.child_task_id, active.child_task_id);
+    assert_eq!(retained.child_task_id, if cancel_fails { String::new() } else { active.child_task_id.clone() });
     assert_eq!(
         retained.status,
         if cancel_fails {
@@ -1319,7 +1321,7 @@ async fn owner_runtime_active_homeward_fault_cancels_exact_child(
     );
     if cancel_fails {
         assert_eq!(retained.last_stop_reason, "child_cancel_failed");
-        assert!(retained.global_stop_reconciliation.eligible);
+        assert!(retained.parking_pending);
     }
     assert!(handle.blocks_mapping_mutation().await);
     assert!(owner_watchdog(handle.report_navigation_result(
@@ -1328,7 +1330,7 @@ async fn owner_runtime_active_homeward_fault_cancels_exact_child(
     ))
     .await
     .is_err());
-    assert_eq!(handle.snapshot().child_task_id, active.child_task_id);
+    assert_eq!(handle.snapshot().child_task_id, if cancel_fails { String::new() } else { active.child_task_id.clone() });
     // This injected acknowledgement checks exact protocol ownership only. It
     // does not establish that any actuator or physical robot actually stopped.
     let released = owner_watchdog(handle.report_navigation_result(
@@ -1349,7 +1351,7 @@ async fn owner_runtime_active_homeward_fault_cancels_exact_child(
     assert!(!handle.blocks_mapping_mutation().await);
     if cancel_fails {
         assert_eq!(released.last_stop_reason, "child_cancel_failed");
-        assert!(released.ownership_reconciliation_receipt.is_some());
+        assert!(!released.parking_pending);
     } else {
         assert_eq!(released.last_stop_reason, "consecutive_failures_exceeded");
     }

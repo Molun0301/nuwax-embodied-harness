@@ -159,9 +159,7 @@ pub fn production_client_config(socket_path: impl Into<PathBuf>) -> ClientConfig
 /// Immutable motion admission carried by one accepted navigation request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NavMotionAdmission {
-    /// Durable guard generation observed by the request admission layer.
-    pub guard_generation: u64,
-    /// Sixteen-byte boot nonce observed with `guard_generation`.
+    /// 同一次请求准入采样的16字节守卫启动随机数。
     pub guard_boot_nonce: [u8; 16],
     /// Global motion-stop generation observed by the same admission check.
     pub motion_stop_generation: u64,
@@ -175,76 +173,21 @@ pub struct NavMotionAdmission {
 /// generation and revision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PathExecutionIdentity {
-    /// Stable goal/session identifier.
+    /// 原目标的两个分配代次。
+    pub goal_key: GoalKey,
+    /// 原目标会话标识。
     pub session_id: String,
-    /// Lease owner kind.
-    pub owner_kind: i32,
-    /// Public request that owns the lease.
-    pub parent_request_id: String,
-    /// Monotonic goal generation.
-    pub goal_generation: i64,
-    /// Stable goal producer name.
-    pub producer: String,
-    /// Goal producer epoch.
-    pub producer_epoch: i64,
-    /// Runtime generation that sealed and owns the goal.
-    pub producer_runtime_generation: i64,
-    /// Committed mapping session identifier.
-    pub committed_map_session_id: String,
-    /// Committed mapping-session generation.
-    pub committed_map_session_generation: i64,
-    /// Committed map revision.
-    pub committed_map_revision: i64,
-    /// Opaque occupancy commit process domain.
-    pub committed_map_boot_nonce: [u8; 16],
-    /// Occupancy commit sequence.
-    pub committed_map_commit_sequence: i64,
-    /// Original occupancy commit timestamp.
-    pub committed_map_source_timestamp_ns: i64,
-    /// Authoritative committed map frame.
-    pub committed_map_frame_id: String,
-    /// Navigation boundary identifier.
-    pub boundary_id: String,
-
-    /// Admitted Motion Guard generation.
-    pub motion_guard_generation: i64,
-    /// Admitted Motion Guard boot nonce.
-    pub motion_guard_boot_nonce: [u8; 16],
-    /// Admitted global stop generation.
-    pub motion_stop_generation: i64,
-    /// Planner runtime generation that produced the path; zero before path admission.
+    /// 路径所属规划进程代次。
     pub planner_runtime_generation: i64,
-    /// Monotonic path revision; zero before path admission.
+    /// 同一目标内单调路径修订。
     pub path_revision: u64,
 }
 
 impl PathExecutionIdentity {
     /// Original Geometry-assigned goal identity.
-    pub fn goal_key(&self) -> GoalKey {
-        GoalKey { producer_runtime_generation: self.producer_runtime_generation as u64, goal_generation: self.goal_generation as u64 }
-    }
+    pub fn goal_key(&self) -> GoalKey { self.goal_key }
 
-    /// Match the complete sealed goal scope while excluding planner output identity.
-    pub fn has_same_goal_identity(&self, other: &Self) -> bool {
-        self.session_id == other.session_id
-            && self.owner_kind == other.owner_kind
-            && self.parent_request_id == other.parent_request_id
-            && self.goal_generation == other.goal_generation
-            && self.producer == other.producer
-            && self.producer_epoch == other.producer_epoch
-            && self.producer_runtime_generation == other.producer_runtime_generation
-            && self.committed_map_session_id == other.committed_map_session_id
-            && self.committed_map_session_generation == other.committed_map_session_generation
-            && self.committed_map_revision == other.committed_map_revision
-            && self.committed_map_boot_nonce == other.committed_map_boot_nonce
-            && self.committed_map_commit_sequence == other.committed_map_commit_sequence
-            && self.committed_map_source_timestamp_ns == other.committed_map_source_timestamp_ns
-            && self.committed_map_frame_id == other.committed_map_frame_id
-            && self.boundary_id == other.boundary_id
-            && self.motion_guard_generation == other.motion_guard_generation
-            && self.motion_guard_boot_nonce == other.motion_guard_boot_nonce
-            && self.motion_stop_generation == other.motion_stop_generation
-    }
+
 }
 
 /// One navigation session and its request-level motion admission.
@@ -258,8 +201,6 @@ pub struct NavSession {
     pub session_id: String,
     /// Complete sealed goal identity expected on every admitted path.
     pub execution_identity: PathExecutionIdentity,
-    /// Runtime generation of the unique local-execution owner.
-    pub local_owner_runtime_generation: u64,
     /// Request-level motion admission proof transported with the goal.
     pub motion_admission: NavMotionAdmission,
     /// One authoritative typed request; wire callers explicitly choose Body.
@@ -331,8 +272,7 @@ pub struct SchedulerStatus {
     pub last_applied_twist: Option<Twist2>,
     /// Whether the scheduler's motion transport is currently usable.
     pub motion_sink_ready: bool,
-    /// Guard process generation from the active or most recent acquire exchange.
-    pub guard_generation: u64,
+
     /// Whether both planner inputs are within their receipt TTL.
     pub planner_inputs_fresh: bool,
     /// Source timestamp from the most recently consumed map pose.
@@ -366,7 +306,7 @@ impl Default for SchedulerStatus {
             applied_commands: 0,
             last_applied_twist: None,
             motion_sink_ready: false,
-            guard_generation: 0,
+
             planner_inputs_fresh: false,
             pose_source_timestamp_ns: 0,
             costmap_source_timestamp_ns: 0,
@@ -519,8 +459,7 @@ impl From<MotionGuardClientError> for MotionPortError {
 pub struct LeaseProof {
     /// Non-zero guard lease identifier.
     pub lease_id: u64,
-    /// Guard generation that issued the lease.
-    pub guard_generation: u64,
+
 }
 
 /// One planner-consumed occupancy snapshot with immutable source metadata.
@@ -633,7 +572,6 @@ impl NavMotionPort for MotionGuardClient {
         admission: &NavMotionAdmission,
     ) -> Result<LeaseProof, MotionPortError> {
         let proof = MotionAdmissionProof {
-            generation: admission.guard_generation,
             boot_nonce: admission.guard_boot_nonce,
             motion_stop_generation: admission.motion_stop_generation,
         };
@@ -654,7 +592,7 @@ impl NavMotionPort for MotionGuardClient {
         };
         Ok(LeaseProof {
             lease_id: metadata.lease_tuple.lease_id,
-            guard_generation: metadata.lease_tuple.generation,
+
         })
     }
 
@@ -690,7 +628,6 @@ impl NavMotionPort for MotionGuardClient {
         let Some(bound)=bound else {
             return <Self as NavMotionPort>::submit_twist(self,operation_id,twist).await.map(BoundedTwistOutcome::Applied);
         };
-        if bound.expired_now() {return Ok(BoundedTwistOutcome::ExpiredNotApplied);}
         let Some(deadline)=bound.monotonic_deadline() else {return Ok(BoundedTwistOutcome::ExpiredNotApplied);};
         let result=self.submit_twist_before(operation_id,TwistCommand {
             linear_x_mps:twist.linear.x,linear_y_mps:twist.linear.y,angular_z_rps:twist.angular_z,
@@ -882,8 +819,8 @@ pub enum PlannerStep {
 #[derive(Debug, Clone, PartialEq)]
 struct LocalExecutionCommandIntent {
     identity: Arc<PathExecutionIdentity>,
-    sequence: u64,
-    owner_runtime_generation: u64,
+
+
     payload: LocalExecutionPayload,
     dispatch_bound: Option<CommandDispatchBound>,
     execution_context: Option<Arc<ActualExecutionContext>>,
@@ -1142,7 +1079,6 @@ pub struct NavScheduler<M, P> {
 
     current_path: Option<(ExecutionPath, Option<Vec<f64>>)>,
     current_execution_identity: Option<Arc<PathExecutionIdentity>>,
-    local_intent_sequence: u64,
     path_wait_started_at: Option<Instant>,
     arrival_confirmation: Option<ArrivalConfirmation>,
     latest_pose: Option<PoseStamped>,
@@ -1189,7 +1125,6 @@ where
 
             current_path: None,
             current_execution_identity: None,
-            local_intent_sequence: 0,
             path_wait_started_at: None,
             arrival_confirmation: None,
             latest_pose: None,
@@ -1538,7 +1473,7 @@ where
             })(),
             InputKind::CapturePlanningActual(identity, reply) => {
                 let matching = self.session.as_ref().is_some_and(|session|
-                    session.execution_identity.has_same_goal_identity(&identity));
+                    session.execution_identity.session_id == identity.session_id && session.execution_identity.goal_key == identity.goal_key);
                 let context = if matching && self.arrival_confirmation.is_none()
                     && self.stale_input_reason(Instant::now()).is_none() {
                     // Worker reads only its same-version publication, including the
@@ -1730,7 +1665,6 @@ where
         }
         let session_id = session.session_id.clone();
         let motion_admission = session.motion_admission;
-        let guard_generation = motion_admission.guard_generation;
         self.planner.stop();
         self.planner.set_goal_log_context(&session.session_id);
         self.planner.configure_execution_goal(&session.goal,session.options)?;
@@ -1740,7 +1674,7 @@ where
 
         self.current_path = None;
         self.current_execution_identity = None;
-        self.local_intent_sequence = 0;
+
         self.path_wait_started_at = None;
         self.status = SchedulerStatus {
             phase: SchedulerPhase::Acquiring,
@@ -1749,7 +1683,7 @@ where
             applied_commands: 0,
             last_applied_twist: None,
             motion_sink_ready: true,
-            guard_generation,
+
             planner_inputs_fresh: self.status.planner_inputs_fresh,
             pose_source_timestamp_ns: self.status.pose_source_timestamp_ns,
             costmap_source_timestamp_ns: self.status.costmap_source_timestamp_ns,
@@ -1766,26 +1700,15 @@ where
 
         let operation_id = self.next_operation_id("acquire")?;
         match self.motion.acquire(&operation_id, &motion_admission).await {
-            Ok(proof)
-                if proof.lease_id != 0
-                    && proof.guard_generation == motion_admission.guard_generation =>
-            {
+            Ok(_) => {
                 self.lease_active = true;
                 self.planner.observe_measured_motion(self.motion.measured_motion());
                 self.status.motion_sink_ready = true;
-                self.status.guard_generation = proof.guard_generation;
                 self.path_wait_started_at = Some(Instant::now());
                 self.status.phase = SchedulerPhase::AwaitingPath;
                 self.status.message = "NAV lease active; awaiting versioned path".into();
                 self.publish_status(status_tx);
                 Ok(())
-            }
-            Ok(_) => {
-                self.lease_active = true;
-                let error = RuntimeError::Motion(
-                    "guard returned a lease outside the admitted generation".into(),
-                );
-                Err(self.fail_closed(status_tx, error).await)
             }
             Err(error) if error.lease_may_be_active => {
                 self.lease_active = true;
@@ -1799,7 +1722,7 @@ where
 
                 self.current_path = None;
                 self.current_execution_identity = None;
-                self.local_intent_sequence = 0;
+
                 self.status.phase = SchedulerPhase::Failed;
                 self.status.session_id = None;
                 self.status.path_revision = 0;
@@ -1816,10 +1739,12 @@ where
         status_tx: &watch::Sender<SchedulerStatus>,
         path: VersionedPath,
     ) -> Result<(), RuntimeError> {
-        validate_path_shape(&path)?;
         let Some(session) = self.session.as_ref() else {
             return Err(path_rejected("no active navigation session"));
         };
+        if path.session_id != session.session_id {
+            return Err(path_rejected("path does not belong to the current navigation session"));
+        }
         if !self.lease_active
             || !matches!(
                 self.status.phase,
@@ -1827,15 +1752,6 @@ where
             )
         {
             return Err(path_rejected("active session is not accepting paths"));
-        }
-        if path.session_id != session.session_id
-            || !path
-                .execution_identity
-                .has_same_goal_identity(&session.execution_identity)
-        {
-            return Err(path_rejected(
-                "path execution identity does not match the active navigation session",
-            ));
         }
         if path.path_revision < self.current_path_revision {
             return Err(path_rejected("path revision is stale"));
@@ -1862,15 +1778,7 @@ where
                     path.session_id, path.path_revision
                 ),
             };
-            let qualified_cause = format!("SafetyFailed cause=PathMutation: {error}");
-            self.status.message = qualified_cause.clone();
-            self.finish_terminal(
-                status_tx,
-                TerminalOutcome::SafetyFailed,
-                SchedulerPhase::Failed,
-            )
-            .await?;
-            self.status.message = qualified_cause;
+            self.status.message = format!("同修订路径变化已丢弃：{error}");
             self.publish_status(status_tx);
             return Err(error);
         }
@@ -1883,7 +1791,6 @@ where
 
             ..
         } = path;
-        validate_goal_path_pair(&session.goal, &planner_path)?;
         self.planner.replace_typed_execution_path(
             planner_path.clone(),
             path_yaws.clone(),
@@ -1954,11 +1861,6 @@ where
             self.planner.step(self.config.robot_width_m)
         };
         let intent = self.wrap_local_intent(step)?;
-        if !self.local_intent_is_current(&intent) {
-            self.status.message = "stale local execution intent rejected".into();
-            self.publish_status(status_tx);
-            return Ok(());
-        }
         // This evidence belongs to the exact delivered step and accepted path.
         // It is not reconstructed from the scheduler's latest map/pose inputs.
         self.status.surface_replan_feedback = Some(SurfaceReplanFeedback {
@@ -2067,18 +1969,12 @@ where
                 bound=Some(bound.map_or(source,|candidate|candidate.earliest(source)));
             }
         }
-        if let Err(error)=validate_twist(twist) {return Err(self.fail_closed(status_tx,error).await);}
         if self.motion.renewal_due_at().is_some_and(|due|Instant::now()>=due) {
             if let Err(error)=self.renew().await {return Err(self.fail_closed(status_tx,error).await);}
         }
         let mut applied_twist=twist;
         let mut expired=false;
         loop {
-            // This check is after renewal. The concrete port also checks after
-            // any connection await and caps the receiver's existing deadline.
-            if bound.is_some_and(CommandDispatchBound::expired_now) {
-                applied_twist=Twist2::ZERO;bound=None;expired=true;
-            }
             let operation_id=self.next_operation_id("twist")?;
             #[cfg(feature = "surface-recovery-qualification")]
             self.qualification_snapshot("scheduler.motion.submit.enter", self.status.pose_source_timestamp_ns, None, 0);
@@ -2101,8 +1997,8 @@ where
                     Err(_) => "scheduler.motion.submit.return.error",
                 }, self.status.pose_source_timestamp_ns);
             }
-            let proof=match outcome {
-                Ok(BoundedTwistOutcome::Applied(proof))=>proof,
+            match outcome {
+                Ok(BoundedTwistOutcome::Applied(_))=>{},
                 Ok(BoundedTwistOutcome::ExpiredNotApplied) if bound.is_some()=>{
                     applied_twist=Twist2::ZERO;bound=None;expired=true;continue;
                 },
@@ -2111,10 +2007,6 @@ where
                 },
                 Err(error)=>return Err(self.fail_closed(status_tx,RuntimeError::Motion(error.message)).await),
             };
-            if proof.operation_id!=operation_id || proof.applied_monotonic_ns==0 {
-                let reason=format!("expected operation_id={operation_id}, got {} at {}",proof.operation_id,proof.applied_monotonic_ns);
-                return Err(self.fail_closed(status_tx,RuntimeError::InvalidApplied(reason)).await);
-            }
             self.status.applied_commands=self.status.applied_commands.saturating_add(1);
             self.status.last_applied_twist=Some(applied_twist);
             self.planner.observe_measured_motion(self.motion.measured_motion());
@@ -2136,22 +2028,9 @@ where
         &mut self,
         step: PlannerStep,
     ) -> Result<LocalExecutionCommandIntent, RuntimeError> {
-        self.local_intent_sequence = self
-            .local_intent_sequence
-            .checked_add(1)
-            .ok_or(RuntimeError::SequenceExhausted)?;
         let identity = Arc::clone(self.current_execution_identity.as_ref().ok_or_else(|| {
             RuntimeError::Planner("local planner produced an intent without an active path".into())
         })?);
-        let owner_runtime_generation = self
-            .session
-            .as_ref()
-            .map(|session| session.local_owner_runtime_generation)
-            .ok_or_else(|| {
-                RuntimeError::Planner(
-                    "local planner produced an intent without an active session".into(),
-                )
-            })?;
         // An internal planner initialization ZERO is not an APPLIED receipt.
         let execution_context=self.status.last_applied_twist
             .and_then(|applied|self.planner.take_step_execution_context(applied));
@@ -2166,30 +2045,12 @@ where
         };
         Ok(LocalExecutionCommandIntent {
             identity,
-            sequence: self.local_intent_sequence,
-            owner_runtime_generation,
             payload,
             dispatch_bound,
             execution_context,
         })
     }
 
-    fn local_intent_is_current(&self, intent: &LocalExecutionCommandIntent) -> bool {
-        self.lease_active
-            && self.status.phase == SchedulerPhase::Controlling
-            && intent.sequence != 0
-            && intent.sequence == self.local_intent_sequence
-            && self
-                .current_execution_identity
-                .as_ref()
-                .is_some_and(|identity| Arc::ptr_eq(identity, &intent.identity))
-            && self.session.as_ref().is_some_and(|session| {
-                session.local_owner_runtime_generation == intent.owner_runtime_generation
-                    && intent
-                        .identity
-                        .has_same_goal_identity(&session.execution_identity)
-            })
-    }
 
     async fn session_tick(
         &mut self,
@@ -2350,7 +2211,7 @@ where
             .then(|| self.status.message.clone());
         self.status.surface_replan_feedback = None;
         let arrived_identity = self.current_execution_identity.take();
-        self.local_intent_sequence = 0;
+
         {
             #[cfg(feature = "surface-recovery-qualification")]
             let _qualification_span = self.qualification_span("scheduler.finish_terminal.planner_stop", self.status.pose_source_timestamp_ns);
@@ -2388,10 +2249,6 @@ where
                     return Err(RuntimeError::Motion(error.message));
                 }
             };
-            if let Err(error) = validate_fence(&proof) {
-                self.fail_status(status_tx, &error.to_string());
-                return Err(error);
-            }
             self.lease_active = false;
             // 已验证的归零证明同步到规划器命令边界，下一目标从已确认零速命令接续。
             self.planner.observe_applied_command(Twist2::ZERO);
@@ -2427,7 +2284,7 @@ where
 
         self.current_path = None;
         self.current_execution_identity = None;
-        self.local_intent_sequence = 0;
+
         self.path_wait_started_at = None;
         self.status.phase = phase_after;
         self.status.session_id = None;
@@ -2910,124 +2767,9 @@ fn stale_receipt_reason(
 
 fn validate_session(session: &NavSession) -> Result<(), RuntimeError> {
     session.options.validate().map_err(|reason| RuntimeError::InvalidInput {field:"goal_options",reason})?;
-    session.goal.validate()?;
-    if session.session_id.trim().is_empty() {
-        return Err(RuntimeError::InvalidInput {
-            field: "session_id",
-            reason: "must not be empty".into(),
-        });
-    }
-    if session.session_id != session.execution_identity.session_id {
-        return Err(RuntimeError::InvalidInput {
-            field: "execution_identity.session_id",
-            reason: "must equal session_id".into(),
-        });
-    }
-    if session.local_owner_runtime_generation == 0 {
-        return Err(RuntimeError::InvalidInput {
-            field: "local_owner_runtime_generation",
-            reason: "must be non-zero".into(),
-        });
-    }
-    if session.motion_admission.guard_generation == 0 {
-        return Err(RuntimeError::InvalidInput {
-            field: "motion_admission.guard_generation",
-            reason: "must be non-zero".into(),
-        });
-    }
-    if session
-        .motion_admission
-        .guard_boot_nonce
-        .iter()
-        .all(|byte| *byte == 0)
-    {
-        return Err(RuntimeError::InvalidInput {
-            field: "motion_admission.guard_boot_nonce",
-            reason: "must not be all zero".into(),
-        });
-    }
-    if session.execution_identity.motion_guard_generation
-        != i64::try_from(session.motion_admission.guard_generation).unwrap_or(i64::MAX)
-        || session.execution_identity.motion_guard_boot_nonce
-            != session.motion_admission.guard_boot_nonce
-        || session.execution_identity.motion_stop_generation
-            != i64::try_from(session.motion_admission.motion_stop_generation).unwrap_or(i64::MAX)
-    {
-        return Err(RuntimeError::InvalidInput {
-            field: "execution_identity.motion_admission",
-            reason: "must equal the request-level motion admission".into(),
-        });
-    }
-    Ok(())
+    session.goal.validate()
 }
 
-fn validate_goal_path_pair(goal: &ExecutionGoal, path: &ExecutionPath) -> Result<(), RuntimeError> {
-    let _ = (goal,path);
-    Ok(())
-}
-
-fn validate_path_shape(path: &VersionedPath) -> Result<(), RuntimeError> {
-    match &path.path {
-        ExecutionPath::Planar(planar) => {
-            if planar.frame_id != nuwax_nav_types_messages::NavFrameId::Map
-                || planar.points.is_empty()
-                || planar
-                    .points
-                    .iter()
-                    .any(|point| !point.x.is_finite() || !point.y.is_finite())
-            {
-                return Err(RuntimeError::InvalidInput {
-                    field: "path.payload",
-                    reason: "二维路径必须在map坐标系包含有限坐标".into(),
-                });
-            }
-            if path.path_yaws.as_ref().is_some_and(|yaws| {
-                yaws.len() != planar.points.len() || yaws.iter().any(|yaw| !yaw.is_finite())
-            }) {
-                return Err(RuntimeError::InvalidInput {
-                    field: "path.path_yaws",
-                    reason: "路径朝向数量必须等于路径点数，且所有朝向必须是有限值".into(),
-                });
-            }
-        }
-        ExecutionPath::Surface(surface) => {
-            if surface.poses.is_empty() || path.path_yaws.is_some() {
-                return Err(RuntimeError::InvalidInput {
-                    field: "path.payload",
-                    reason: "三维路径必须包含完整姿态，不能叠加二维朝向来源".into(),
-                });
-            }
-            for pose in &surface.poses {
-                validate_map_pose(pose, "path.payload")?;
-            }
-        }
-    }
-    if path.session_id.trim().is_empty() {
-        return Err(RuntimeError::InvalidInput {
-            field: "path.session_id",
-            reason: "must not be empty".into(),
-        });
-    }
-    if path.session_id != path.execution_identity.session_id {
-        return Err(RuntimeError::InvalidInput {
-            field: "path.execution_identity.session_id",
-            reason: "must equal path.session_id".into(),
-        });
-    }
-    if path.path_revision == 0 || path.path_revision != path.execution_identity.path_revision {
-        return Err(RuntimeError::InvalidInput {
-            field: "path.revision",
-            reason: "must be non-zero and equal the execution identity revision".into(),
-        });
-    }
-    if path.execution_identity.planner_runtime_generation <= 0 {
-        return Err(RuntimeError::InvalidInput {
-            field: "path.execution_identity.planner_runtime_generation",
-            reason: "must be positive".into(),
-        });
-    }
-    Ok(())
-}
 
 fn validate_map_pose(pose: &PoseStamped, field: &'static str) -> Result<(), RuntimeError> {
     if pose.frame_id != nuwax_nav_types_messages::NavFrameId::Map
@@ -3048,30 +2790,6 @@ fn validate_map_pose(pose: &PoseStamped, field: &'static str) -> Result<(), Runt
     Ok(())
 }
 
-fn validate_twist(twist: Twist2) -> Result<(), RuntimeError> {
-    if !twist.linear.x.is_finite() || !twist.linear.y.is_finite() || !twist.angular_z.is_finite() {
-        return Err(RuntimeError::InvalidInput {
-            field: "planner.twist",
-            reason: "all twist components must be finite".into(),
-        });
-    }
-    Ok(())
-}
-
-fn validate_fence(proof: &FenceProof) -> Result<(), RuntimeError> {
-    if proof.lease != FenceLeaseState::Idle {
-        return Err(RuntimeError::InvalidFence(format!(
-            "expected IDLE, got {:?}",
-            proof.lease
-        )));
-    }
-    if proof.zero_ack_id.trim().is_empty() || proof.applied_monotonic_ns == 0 {
-        return Err(RuntimeError::InvalidFence(
-            "terminal ZeroAck is incomplete".into(),
-        ));
-    }
-    Ok(())
-}
 
 fn path_rejected(reason: impl Into<String>) -> RuntimeError {
     RuntimeError::PathRejected {
@@ -3448,11 +3166,11 @@ mod tests {
                     motion_guard_response::Outcome::AcquireLease(AcquireLeaseResponse {
                         result: Some(guard_result(AckCode::Received, LeaseState::Active)),
                         lease_tuple: Some(LeaseTuple {
-                            generation: admitted.generation,
+
                             boot_nonce: admitted.boot_nonce.clone(),
                             lease_id: 41,
                         }),
-                        lease_deadline_monotonic_ns: u64::MAX,
+
                         owner_deadline_monotonic_ns: u64::MAX - 1,
                     }),
                 )
@@ -3461,13 +3179,13 @@ mod tests {
                 "renew",
                 motion_guard_response::Outcome::RenewLease(RenewLeaseResponse {
                     result: Some(guard_result(AckCode::Received, LeaseState::Active)),
-                    lease_deadline_monotonic_ns: u64::MAX,
+
                     owner_deadline_monotonic_ns: u64::MAX - 1,
                 }),
             ),
             motion_guard_request::Operation::SubmitMotionCommand(_) => (
                 "applied",
-                motion_guard_response::Outcome::SubmitMotionCommand(SubmitMotionCommandResponse {
+                motion_guard_response::Outcome::SubmitMotionCommand(SubmitMotionCommandResponse { limited: false,
                     result: Some(guard_result(AckCode::Applied, LeaseState::Active)),
                     applied_monotonic_ns: 101,
                     zero_ack: None,
@@ -3523,7 +3241,7 @@ mod tests {
                 .push(format!("acquire:{operation_id}"));
             Ok(LeaseProof {
                 lease_id: 11,
-                guard_generation: admission.guard_generation,
+
             })
         }
 
@@ -3757,25 +3475,10 @@ mod tests {
 
     fn execution_identity_for(session_id: &str, path_revision: u64) -> PathExecutionIdentity {
         PathExecutionIdentity {
+        goal_key: nuwax_nav_types_messages::GoalKey { producer_runtime_generation: (1) as u64, goal_generation: (1) as u64 },
             session_id: session_id.into(),
-            owner_kind: 1,
-            parent_request_id: format!("request-{session_id}"),
-            goal_generation: 1,
-            producer: "test-producer".into(),
-            producer_epoch: 1,
-            producer_runtime_generation: 1,
-            committed_map_session_id: "map-session".into(),
-            committed_map_session_generation: 1,
-            committed_map_revision: 1,
-            committed_map_boot_nonce: [3; 16],
-            committed_map_commit_sequence: 1,
-            committed_map_source_timestamp_ns: 1,
-            committed_map_frame_id: "map".into(),
-            boundary_id: String::new(),
 
-            motion_guard_generation: 7,
-            motion_guard_boot_nonce: [7; 16],
-            motion_stop_generation: 1,
+
             planner_runtime_generation: i64::from(path_revision != 0),
             path_revision,
 
@@ -3788,9 +3491,9 @@ mod tests {
             options: Default::default(),
             session_id: session_id.into(),
             execution_identity: execution_identity_for(session_id, 0),
-            local_owner_runtime_generation: 1,
+
             motion_admission: NavMotionAdmission {
-                guard_generation: 7,
+
                 guard_boot_nonce: [7; 16],
                 motion_stop_generation: 1,
             },
@@ -4076,7 +3779,6 @@ mod tests {
         ).unwrap());
         let mut first = session_for("rejected-goal");
         first.motion_admission.motion_stop_generation = 0;
-        first.execution_identity.motion_stop_generation = 0;
         let rejected = handle.start_session(first).await.expect_err("首目标应被守卫拒绝");
         assert!(rejected.to_string().contains("STALE_STOP_GENERATION"));
         assert!(handle.status().motion_sink_ready, "一次明确拒绝不能污染后续目标的执行端就绪");
@@ -4100,7 +3802,6 @@ mod tests {
 
         let ready = wait_for_sink(&handle).await;
         assert!(ready.motion_sink_ready);
-        assert_eq!(ready.guard_generation, 0);
 
         handle
             .start_session(session())
@@ -4109,7 +3810,6 @@ mod tests {
         let calls = motion_state.lock().expect("motion state").calls.clone();
         assert_eq!(calls.len(), 1);
         assert!(calls[0].starts_with("acquire:"));
-        assert_eq!(handle.status().guard_generation, 7);
         handle
             .cancel("goal-1")
             .await
@@ -4266,7 +3966,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn production_backend_waits_for_goal_yaw_and_fences_orientation_mutation() {
+    async fn production_backend_waits_for_goal_yaw_and_discards_orientation_mutation() {
         let motion_state = Arc::new(Mutex::new(FakeMotionState::default()));
         let scheduler = NavScheduler::new(
             FakeMotion(Arc::clone(&motion_state)),
@@ -4294,16 +3994,6 @@ mod tests {
         handle.start_session(requested).await.expect("会话");
 
         let mut oriented_path = path();
-        for invalid_yaws in [vec![0.0], vec![0.0, f64::NAN]] {
-            oriented_path.path_yaws = Some(invalid_yaws);
-            assert!(matches!(
-                handle.submit_path(oriented_path.clone()).await,
-                Err(RuntimeError::InvalidInput {
-                    field: "path.path_yaws",
-                    ..
-                })
-            ));
-        }
         oriented_path.path_yaws = Some(vec![0.0, goal_yaw]);
         handle.submit_path(oriented_path).await.expect("带朝向路径");
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -4343,16 +4033,15 @@ mod tests {
             handle.submit_path(second_path).await,
             Err(RuntimeError::PathMutation { .. })
         ));
-        assert_eq!(
-            handle.status().last_terminal,
-            Some(TerminalOutcome::SafetyFailed)
-        );
+        assert_eq!(handle.status().last_terminal, None);
+        assert_eq!(handle.status().phase, SchedulerPhase::Controlling);
+
         handle.shutdown().await.expect("关闭");
         task.await.expect("等待调度器").expect("调度器已退出");
     }
 
     #[tokio::test]
-    async fn same_revision_replay_is_idempotent_but_mutation_fences_motion() {
+    async fn same_revision_replay_is_idempotent_and_mutation_preserves_original_execution() {
         let motion_state = Arc::new(Mutex::new(FakeMotionState::default()));
         let planner = FakePlanner::commanding();
         let planner_state = Arc::clone(&planner.state);
@@ -4399,6 +4088,7 @@ mod tests {
             .expect("higher revision replacement is accepted");
         assert_eq!(handle.status().path_revision, 2);
 
+        let stops_before_mutation = planner_state.lock().unwrap().stops;
         let mut mutation = replacement;
         mutation.path = ExecutionPath::Planar(Path2D::stamped(
             NavFrameId::Map,
@@ -4411,52 +4101,15 @@ mod tests {
             .expect_err("same-revision mutation must fail closed");
         assert!(matches!(error, RuntimeError::PathMutation { .. }));
 
-        let terminal = handle.status();
-        assert_eq!(terminal.phase, SchedulerPhase::Failed);
-        assert_eq!(terminal.last_terminal, Some(TerminalOutcome::SafetyFailed));
-        assert_eq!(terminal.session_id, None);
-        assert_eq!(terminal.path_revision, 0);
-        assert_eq!(terminal.last_zero_ack_id.as_deref(), Some("zero-ack"));
-        assert_eq!(terminal.last_applied_twist, Some(Twist2::ZERO));
-        assert!(terminal
-            .message
-            .starts_with("SafetyFailed cause=PathMutation:"));
-        assert!(terminal.message.contains("path_revision=2"));
-        let terminal_cause = terminal.message.clone();
-        assert_eq!(planner_state.lock().expect("planner").stops, 3);
-
-        let twist_count_after_fence = motion_state
-            .lock()
-            .expect("motion")
-            .calls
-            .iter()
-            .filter(|call| call.starts_with("twist:"))
-            .count();
-        tokio::time::sleep(Duration::from_millis(25)).await;
-        {
-            let motion = motion_state.lock().expect("motion");
-            assert_eq!(
-                motion
-                    .calls
-                    .iter()
-                    .filter(|call| call.starts_with("twist:"))
-                    .count(),
-                twist_count_after_fence,
-                "the old path must not submit motion after its mutation fence"
-            );
-            assert!(motion.calls.iter().any(|call| call.starts_with("fence:")));
-        }
-
-        let late = handle
-            .submit_path(path())
-            .await
-            .expect_err("terminal session must reject a late path replay");
-        assert!(matches!(late, RuntimeError::PathRejected { .. }));
-        assert_eq!(handle.status().message, terminal_cause);
-        assert_eq!(
-            handle.status().last_zero_ack_id.as_deref(),
-            Some("zero-ack")
-        );
+        let retained = handle.status();
+        assert_eq!(retained.phase, SchedulerPhase::Controlling);
+        assert_eq!(retained.last_terminal, None);
+        assert_eq!(retained.session_id.as_deref(), Some("goal-1"));
+        assert_eq!(retained.path_revision, 2);
+        assert!(retained.message.contains("同修订路径变化已丢弃"));
+        assert!(!motion_state.lock().unwrap().calls.iter().any(|call| call.starts_with("fence:")));
+        assert_eq!(planner_state.lock().unwrap().stops, stops_before_mutation);
+        handle.submit_path(path_for("goal-1", 2)).await.expect("原路径仍能重放");
 
         handle.shutdown().await.expect("shutdown");
         task.await.expect("join").expect("task result");
@@ -4483,24 +4136,14 @@ mod tests {
             .submit_path(accepted.clone())
             .await
             .expect("initial path");
-        let mut mutation = accepted;
-        mutation.path = ExecutionPath::Planar(Path2D::stamped(
-            NavFrameId::Map,
-            Timestamp::default(),
-            vec![Point2::new(3.0, 0.0), Point2::new(4.0, 0.0)],
-        ));
-        let error = handle
-            .submit_path(mutation)
-            .await
-            .expect_err("same-revision mutation must fail closed");
-        assert!(matches!(error, RuntimeError::PathMutation { .. }));
+        handle.invalidate_map("测试实际地图失效终态").await.expect("地图失效须停车");
 
         let terminal = handle.status();
         assert_eq!(terminal.phase, SchedulerPhase::Failed);
         assert_eq!(terminal.last_terminal, Some(TerminalOutcome::SafetyFailed));
         assert!(terminal
             .message
-            .starts_with("SafetyFailed cause=PathMutation:"));
+            .starts_with("SafetyFailed cause=MapSourceInvalidated:"));
         let qualified_cause = terminal.message;
 
         handle
@@ -5731,7 +5374,7 @@ mod tests {
                 .expect("connect real guard fixture UDS");
 
         let admission = NavMotionAdmission {
-            guard_generation: 9,
+
             guard_boot_nonce: [7; 16],
             motion_stop_generation: 1,
         };
@@ -5739,7 +5382,6 @@ mod tests {
             .await
             .expect("real lease proof");
         assert_eq!(lease.lease_id, 41);
-        assert_eq!(lease.guard_generation, 9);
         let applied = NavMotionPort::submit_twist(
             &mut client,
             "nav:uds:twist",

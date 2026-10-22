@@ -70,7 +70,7 @@ use crate::channel_registry::ChannelKey;
 
 #[cfg(test)]
 #[path = "vertical_v2_canary.rs"]
-mod vertical_v2_canary;
+pub(crate) mod vertical_v2_canary;
 #[path = "mapping_observation.rs"]
 pub(crate) mod mapping_observation;
 
@@ -171,7 +171,7 @@ pub struct NavigationFeedback {
     pub actuator_zeroed: bool,
     pub reason_code: String,
     pub runtime_generation: u64,
-    pub guard_generation: u64,
+
     pub sink_ready: bool,
     pub planner_map_frame: String,
     pub planner_pose_frame: String,
@@ -2583,7 +2583,7 @@ fn test_wavefront_goal_intent(
         boundary_id: String::new(),
         body_to_support_z_m: None,
         boundary_points: Vec::new(),
-        motion_guard_generation: motion_admission.guard_generation as i64,
+
         motion_guard_boot_nonce: motion_admission.guard_boot_nonce,
         motion_stop_generation: motion_admission.motion_stop_generation as i64,
         goal,
@@ -5437,7 +5437,6 @@ fn attempt_real_lcm_startup<T, E>(
 }
 
 
-
 #[derive(Clone)]
 struct SharedStatePoseProvider {
     state: Arc<RwLock<SharedState>>,
@@ -5724,6 +5723,7 @@ impl ExploreNavigationBridge {
     ) {
         use crate::explore_runtime::{ChildNavigationCancelOutcome, ExploreNavigationSink};
         loop {
+            if !self.orphan_cancellations.contains(&lease) { return; }
             let terminal = if require_terminal_proof {
                 self.exact_orphan_terminal_proven(&lease).await
             } else {
@@ -6121,7 +6121,7 @@ impl crate::explore_runtime::ExploreNavigationSink for ExploreNavigationBridge {
         &self,
         expected: &crate::explore_runtime::ChildNavigationLease,
     ) -> Option<crate::explore_runtime::ChildNavigationResult> {
-        let update = self.nav.naturally_retired_terminal_for(&crate::nav_runtime::CancelGoalInput {
+        let update = self.nav.settled_without_child_cancel_terminal_for(&crate::nav_runtime::CancelGoalInput {
             goal_id: expected.session_id.clone(),
             owner_kind: expected.owner_kind,
             parent_request_id: expected.parent_request_id.clone(),
@@ -6306,19 +6306,12 @@ async fn apply_typed_navigation_feedback(
         None
     };
 
-    let idle_motion_sink_ready =
-        update.state.goal_id.is_empty() && update.feedback.guard_generation == 0;
-    let motion_sink_observation = if update.feedback.guard_generation > 0 {
-        Some(crate::nav_runtime::MotionSinkObservation {
-            generation: update.feedback.guard_generation,
+    let motion_sink_observation = (update.feedback.runtime_generation > 0).then_some(
+        crate::nav_runtime::MotionSinkObservation {
+            generation: update.feedback.runtime_generation,
             ready: update.feedback.sink_ready,
-        })
-    } else if update.feedback.sink_ready && !idle_motion_sink_ready {
-        warn!("sink_ready=true missing positive guard_generation; fail closed");
-        None
-    } else {
-        None
-    };
+        },
+    );
 
     let mut correlated_lease = None;
     if update.state.goal_id.is_empty() {
@@ -6330,10 +6323,6 @@ async fn apply_typed_navigation_feedback(
         if let Some(observation) = motion_sink_observation {
             if let Err(error) = nav.observe_motion_sink(observation) {
                 warn!(?error, "typed motion-sink observation rejected");
-            }
-        } else if idle_motion_sink_ready {
-            if let Err(error) = nav.observe_idle_motion_sink(update.feedback.sink_ready) {
-                warn!(?error, "idle motion-sink observation rejected");
             }
         }
         update.state = nav.observe_unowned_stack_heartbeat(update.state);
@@ -6397,7 +6386,6 @@ async fn apply_typed_navigation_feedback(
     // 同一完整租约已有终态归零证明，即可完成该取消；不重新取得运动租约。
     // 非终态、不同目标/路径、缺证明或带错误取消代次的帧仍由原校验拒绝。
     if complete_zero_proof && update.feedback.cancel_generation == 0
-        && update.feedback.guard_generation > 0
         && source_terminal
         && matches!(cancel_snapshot.phase, crate::nav_runtime::CancelPhase::Pending
             | crate::nav_runtime::CancelPhase::Failed | crate::nav_runtime::CancelPhase::TimedOut)
@@ -6423,7 +6411,6 @@ async fn apply_typed_navigation_feedback(
 
     let ordinary_terminal_zeroed = complete_zero_proof
         && update.feedback.cancel_generation == 0
-        && update.feedback.guard_generation > 0
         && matches!(update.state.status.as_str(), "SUCCEEDED" | "FAILED")
         && correlated_lease.as_ref().is_some_and(|lease| {
             // 同一取消事务中的终态只能由上方精确取消回执推进。
@@ -8353,17 +8340,6 @@ pub async fn spawn_geometry_runtime(
                 "exploration map frame rejected after startup validation: {error}"
             ))
         })?;
-    if let Err(error) = explore_runtime.restore_latest_durable_reconciliation_snapshot() {
-        error!(
-            reason = error.message(),
-            "exploration ownership journal startup recovery failed closed"
-        );
-        return Err(RealLcmBackendUnavailable::persistence(format!(
-            "exploration ownership journal startup recovery failed closed: {}",
-            error.message()
-        ))
-        .into());
-    }
     #[cfg(test)]
     let runtime_observation_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
@@ -9698,7 +9674,6 @@ pub(crate) async fn publish_committed_global_map_in_frame(
 }
 
 
-
 fn build_global_map_snapshot_frame_in_frame(
     xyz_f32_le: &[u8],
     revision: u64,
@@ -9731,7 +9706,6 @@ async fn publish_raw_lcm_frame(transport: &LcmTransport, frame: RawLcmFrame) -> 
         Err(_) => Err("global-map typed publish timed out".to_string()),
     }
 }
-
 
 
 async fn publish_global_map_snapshot_in_frame(
@@ -11797,7 +11771,6 @@ pub(crate) async fn handoff_registered_lio_cloud_with_correction(
         cloud_receipt: cloud.receipt.clone(),
 
 
-
         committed_map,
         committed_map_occupancy: Arc::clone(&event.data),
 
@@ -11824,9 +11797,6 @@ pub(crate) async fn handoff_registered_lio_cloud_with_correction(
     }
     Ok(true)
 }
-
-
-
 
 
 /// Revalidate a frozen read-only relocalization payload while the caller owns
@@ -11898,7 +11868,6 @@ async fn ensure_read_only_mapping_identity(
     }
     Ok(())
 }
-
 
 
 struct ReadOnlyRegisteredLioCorrectionFrame {
@@ -12002,7 +11971,6 @@ async fn registered_lio_read_only_correction_frame(
         occupancy_revision: occupancy_receipt.occupancy_revision,
         cloud_revision: cloud_receipt.cloud_revision,
         cloud_receipt: cloud_receipt.clone(),
-
 
 
         committed_map,
@@ -18639,7 +18607,6 @@ pub(crate) mod mapping_feed_tests {
     }
 
 
-
     async fn exercise_stale_registered_frame_without_body_capture(handle: GeometryRuntimeHandle) {
         let sink = Arc::new(RecordingCorrectionFrameSink::default());
         let owner = crate::correction_coordinator::CorrectionTransportOwner::start(
@@ -20468,7 +20435,7 @@ mod typed_navigation_feedback_tests {
             },
             feedback: NavigationFeedback {
                 runtime_generation: 7,
-                guard_generation: 11,
+
                 sink_ready: true,
                 planner_map_frame: "map".into(),
                 planner_pose_frame: "map".into(),
@@ -20499,6 +20466,8 @@ mod typed_navigation_feedback_tests {
             let mut slot = inner.write().await;
             slot.phase = crate::nav_runtime::NavPhase::Running;
             slot.goal = Some(crate::nav_runtime::ActiveGoal {
+admitted_guard_clock_ns: nuwax_motion_safety_guard::measured_motion::monotonic_ns(),
+
             options: Default::default(), producer: "public-navigation".into(), producer_epoch: 1,
             body_to_support_z_m: None, boundary_owner: None,
                 id: lease.session_id.clone(),
@@ -20554,12 +20523,12 @@ mod typed_navigation_feedback_tests {
         let readiness = crate::nav_runtime::compute_readiness(&handle, &handle.nav).await;
         assert!(readiness.ready, "{}", readiness.reason);
         assert_eq!(readiness.planner_generation, 7);
-        assert_eq!(readiness.motion_sink_generation, 11);
+        assert_eq!(readiness.motion_sink_generation, 7);
         assert_eq!(readiness.costmap_revision, 0);
     }
 
     #[tokio::test]
-    async fn idle_transport_heartbeat_opens_readiness_without_guard_generation() {
+    async fn idle_transport_heartbeat_uses_observed_nav_runtime_generation() {
         let handle = build_handle_for_tests()
             .await
             .expect("real-lcm test handle");
@@ -20575,7 +20544,6 @@ mod typed_navigation_feedback_tests {
             })
             .expect("TF observation");
         let mut heartbeat = feedback_update("");
-        heartbeat.feedback.guard_generation = 0;
 
         let update = apply_typed_navigation_feedback(&handle.nav, heartbeat)
             .await
@@ -20587,7 +20555,7 @@ mod typed_navigation_feedback_tests {
         assert!(readiness.motion_sink_observed);
         assert!(readiness.motion_sink_fresh);
         assert!(readiness.cmd_vel_sink_ready);
-        assert_eq!(readiness.motion_sink_generation, 0);
+        assert_eq!(readiness.motion_sink_generation, 7);
     }
 
     #[tokio::test]
@@ -20603,6 +20571,8 @@ mod typed_navigation_feedback_tests {
                 slot.phase = crate::nav_runtime::NavPhase::Running;
                 slot.message = "B remains active".into();
                 slot.goal = Some(crate::nav_runtime::ActiveGoal {
+admitted_guard_clock_ns: nuwax_motion_safety_guard::measured_motion::monotonic_ns(),
+
             options: Default::default(), producer: "public-navigation".into(), producer_epoch: 1,
             body_to_support_z_m: None, boundary_owner: None,
                     id: lease_b.session_id.clone(),
@@ -20644,6 +20614,8 @@ mod typed_navigation_feedback_tests {
                 let mut slot = inner.write().await;
                 slot.phase = crate::nav_runtime::NavPhase::Running;
                 slot.goal = Some(crate::nav_runtime::ActiveGoal {
+admitted_guard_clock_ns: nuwax_motion_safety_guard::measured_motion::monotonic_ns(),
+
             options: Default::default(), producer: "public-navigation".into(), producer_epoch: 1,
             body_to_support_z_m: None, boundary_owner: None,
                     id: lease_b.session_id.clone(),
@@ -20727,6 +20699,8 @@ mod typed_navigation_feedback_tests {
             assert_eq!(handle.nav.terminal_receipts().await.len(), 1);
             let service = crate::server::GeometryRuntimeService::new(handle);
             let response = service.cancel_navigation(tonic::Request::new(CancelNavigationRequest {
+global_stop_confirmation: None,
+
                 goal_id: lease.session_id, owner_kind: lease.owner_kind,
                 parent_request_id: lease.parent_request_id, goal_generation: lease.goal_generation,
                 producer_runtime_generation: lease.producer_runtime_generation,
@@ -20785,7 +20759,9 @@ mod typed_navigation_feedback_tests {
         assert!(handle.nav.inner().read().await.goal.is_none());
         let nav=handle.nav.clone();
         let service=crate::server::GeometryRuntimeService::new(handle);
-        let request=CancelNavigationRequest {goal_id:lease.session_id.clone(),owner_kind:lease.owner_kind,
+        let request=CancelNavigationRequest {
+global_stop_confirmation: None,
+goal_id:lease.session_id.clone(),owner_kind:lease.owner_kind,
             parent_request_id:lease.parent_request_id.clone(),goal_generation:lease.goal_generation,
             producer_runtime_generation:lease.producer_runtime_generation};
         let response=service.cancel_navigation(tonic::Request::new(request.clone())).await.unwrap().into_inner();
@@ -20880,6 +20856,8 @@ mod typed_navigation_feedback_tests {
             let mut slot = inner.write().await;
             slot.phase = crate::nav_runtime::NavPhase::Running;
             slot.goal = Some(crate::nav_runtime::ActiveGoal {
+admitted_guard_clock_ns: nuwax_motion_safety_guard::measured_motion::monotonic_ns(),
+
             options: Default::default(), producer: "public-navigation".into(), producer_epoch: 1,
             body_to_support_z_m: None, boundary_owner: None,
                 id: lease.session_id.clone(),
@@ -21107,6 +21085,8 @@ mod typed_navigation_feedback_tests {
             let mut slot = inner.write().await;
             slot.phase = crate::nav_runtime::NavPhase::Running;
             slot.goal = Some(crate::nav_runtime::ActiveGoal {
+admitted_guard_clock_ns: nuwax_motion_safety_guard::measured_motion::monotonic_ns(),
+
             options: Default::default(), producer: "public-navigation".into(), producer_epoch: 1,
             body_to_support_z_m: None, boundary_owner: None,
                 id: lease.session_id.clone(),
@@ -21138,6 +21118,8 @@ mod typed_navigation_feedback_tests {
             let mut slot = inner.write().await;
             slot.phase = crate::nav_runtime::NavPhase::Running;
             slot.goal = Some(crate::nav_runtime::ActiveGoal {
+admitted_guard_clock_ns: nuwax_motion_safety_guard::measured_motion::monotonic_ns(),
+
             options: Default::default(), producer: "public-navigation".into(), producer_epoch: 1,
             body_to_support_z_m: None, boundary_owner: None,
                 id: lease.session_id.clone(),
@@ -21199,6 +21181,8 @@ mod typed_navigation_feedback_tests {
             let mut slot = inner.write().await;
             slot.phase = crate::nav_runtime::NavPhase::Running;
             slot.goal = Some(crate::nav_runtime::ActiveGoal {
+admitted_guard_clock_ns: nuwax_motion_safety_guard::measured_motion::monotonic_ns(),
+
             options: Default::default(), producer: "public-navigation".into(), producer_epoch: 1,
             body_to_support_z_m: None, boundary_owner: None,
                 id: lease_a.session_id.clone(),
@@ -21214,7 +21198,6 @@ mod typed_navigation_feedback_tests {
         stale_a.feedback.runtime_generation = 99;
         stale_a.feedback.planner_map_frame = "map".into();
         stale_a.feedback.planner_pose_frame = "odom".into();
-        stale_a.feedback.guard_generation = 99;
         stale_a.feedback.sink_ready = false;
         let mut lease_b = lease_a.clone();
         lease_b.path_revision = 1;
@@ -21228,7 +21211,7 @@ mod typed_navigation_feedback_tests {
             ready: false,
         };
         let stale_sink = crate::nav_runtime::MotionSinkObservation {
-            generation: stale_a.feedback.guard_generation,
+            generation: stale_a.feedback.runtime_generation,
             ready: stale_a.feedback.sink_ready,
         };
         let correlation_barrier = Arc::new(tokio::sync::Barrier::new(2));
@@ -21257,6 +21240,8 @@ mod typed_navigation_feedback_tests {
             .expect("A transaction must reach the correlation/promotion boundary");
 
         let replacement_goal = crate::nav_runtime::ActiveGoal {
+admitted_guard_clock_ns: nuwax_motion_safety_guard::measured_motion::monotonic_ns(),
+
             options: Default::default(), producer: "public-navigation".into(), producer_epoch: 1,
             body_to_support_z_m: None, boundary_owner: None,
             id: lease_b.session_id.clone(),
@@ -21313,6 +21298,8 @@ mod typed_navigation_feedback_tests {
             let mut slot = inner.write().await;
             slot.phase = crate::nav_runtime::NavPhase::Planning;
             slot.goal = Some(crate::nav_runtime::ActiveGoal {
+admitted_guard_clock_ns: nuwax_motion_safety_guard::measured_motion::monotonic_ns(),
+
             options: Default::default(), producer: "public-navigation".into(), producer_epoch: 1,
             body_to_support_z_m: None, boundary_owner: None,
                 id: lease.session_id.clone(),
@@ -21361,25 +21348,17 @@ mod typed_navigation_feedback_tests {
         let path = schema::PathEnvelope {
             schema_version: schema::NAVIGATION_ENVELOPE_SCHEMA_VERSION,
             session_id: lease.session_id.clone(),
-            owner_kind: lease.owner_kind,
-            parent_request_id: lease.parent_request_id.clone(),
+
+
             goal_generation: lease.goal_generation as i64,
-            producer: "public-navigation".to_string(),
-            producer_epoch: lease.producer_runtime_generation as i64,
+
+
             producer_runtime_generation: lease.producer_runtime_generation as i64,
-            committed_map_session_id: "path-lcm-map".to_string(),
-            committed_map_session_generation: 1,
-            committed_map_revision: 1,
-            committed_map_boot_nonce: [0x41; 16],
-            committed_map_commit_sequence: 1,
-            committed_map_source_timestamp_ns: 10,
-            committed_map_frame_id: "map".to_string(),
-            motion_guard_generation: 1,
-            motion_guard_boot_nonce: [1; 16],
-            motion_stop_generation: 0,
+
+
             planner_runtime_generation: 1,
             path_revision: 1,
-            source_timestamp_ns: 10,
+
 
             path: schema::Path {
                 header: schema::Header {
@@ -21718,7 +21697,7 @@ mod exploration_cancel_retry_tests {
                         .is_some_and(|current| exploration_child_lease(current).matches(&expected));
                     // A raw old-path natural receipt is not a retirement proof.
                     // Use the same authority boundary as the real owner.
-                    let natural = fixture.bridge.nav.naturally_retired_terminal_for(&input).await;
+                    let natural = fixture.bridge.nav.settled_without_child_cancel_terminal_for(&input).await;
                     let natural_proven = natural.as_ref().and_then(exploration_navigation_terminal_result)
                         .is_some_and(|result| match result {
                             ChildNavigationResult::Reached(proof)
@@ -21765,7 +21744,7 @@ mod exploration_cancel_retry_tests {
                 goal_generation: expected.goal_generation,
                 producer_runtime_generation: expected.producer_runtime_generation,
             };
-            let natural = fixture.bridge.nav.naturally_retired_terminal_for(&input).await;
+            let natural = fixture.bridge.nav.settled_without_child_cancel_terminal_for(&input).await;
             let natural = natural.filter(|update|
                 exploration_navigation_terminal_result(update).is_some_and(|result| match result {
                     ChildNavigationResult::Reached(proof)
@@ -22267,7 +22246,7 @@ mod exploration_cancel_retry_tests {
                                 producer_runtime_generation: lease.producer_runtime_generation,
                                 path_revision: lease.path_revision,
                                 planner_runtime_generation: lease.planner_runtime_generation,
-                                guard_generation: crate::nav_runtime::test_motion_admission().guard_generation,
+
                                 sink_ready: true,
                                 zero_ack_id: format!("{}-ISOLATED-MODEL-CLEANUP-{}", lease.session_id, snapshot.generation),
                                 zero_applied_monotonic_ns: crate::explore_runtime::now_monotonic_nanos(),
@@ -22834,7 +22813,7 @@ mod exploration_cancel_retry_tests {
                             owner_kind: active.owner_kind, parent_request_id: active.parent_request_id.clone(),
                             goal_generation: active.goal_generation, producer_runtime_generation: active.producer_runtime_generation,
                             path_revision: active.path_revision, planner_runtime_generation: active.planner_runtime_generation,
-                            guard_generation: crate::nav_runtime::test_motion_admission().guard_generation, sink_ready: true,
+                             sink_ready: true,
                             zero_ack_id: format!("{}-ISOLATED-CLEANUP-{}", active.session_id, pending.generation),
                             zero_applied_monotonic_ns: crate::explore_runtime::now_monotonic_nanos(),
                             ..NavigationFeedback::default() },
@@ -23348,7 +23327,7 @@ fn unleased_rejection_message(lease: &crate::nav_runtime::GoalLease) -> schema::
         parent_request_id: lease.parent_request_id.clone(),
         goal_generation: lease.goal_generation as i64,
         producer_runtime_generation: lease.producer_runtime_generation as i64,
-        guard_generation: 7,
+
         sink_ready: 1,
         ..schema::NavigationState::default()
     }
@@ -23923,7 +23902,7 @@ mod retained_firstfix_proof_controls {
                 producer_runtime_generation: lease.producer_runtime_generation,
                 path_revision: lease.path_revision,
                 planner_runtime_generation: lease.planner_runtime_generation,
-                guard_generation: crate::nav_runtime::test_motion_admission().guard_generation,
+
                 sink_ready: true,
                 zero_ack_id: format!("{parent}-measured-zero"),
                 zero_applied_monotonic_ns: crate::explore_runtime::now_monotonic_nanos(),
@@ -24145,7 +24124,7 @@ mod retained_firstfix_proof_controls {
             producer_runtime_generation: lease.producer_runtime_generation,
         };
         for retained in [bridge.nav.terminal_receipt_for(&input).await,
-            bridge.nav.naturally_retired_terminal_for(&input).await] {
+            bridge.nav.settled_without_child_cancel_terminal_for(&input).await] {
             let retained = retained.expect("original authoritative receipt remains");
             assert_eq!(retained.state.status, terminal.state.status);
             assert_eq!(retained.state.message, terminal.state.message);
@@ -24339,21 +24318,13 @@ mod retained_firstfix_proof_controls {
         };
         let path = schema::PathEnvelope {
             schema_version: schema::NAVIGATION_ENVELOPE_SCHEMA_VERSION,
-            session_id: lease.session_id.clone(), owner_kind: lease.owner_kind,
-            parent_request_id: lease.parent_request_id.clone(), goal_generation: lease.goal_generation as i64,
-            producer: goal.producer.clone(), producer_epoch: goal.producer_epoch,
+            session_id: lease.session_id.clone(),
+             goal_generation: lease.goal_generation as i64,
+
             producer_runtime_generation: lease.producer_runtime_generation as i64,
-            committed_map_session_id: goal.committed_map_session_id.clone(),
-            committed_map_session_generation: goal.committed_map_session_generation,
-            committed_map_revision: goal.committed_map_revision,
-            committed_map_boot_nonce: goal.committed_map_boot_nonce,
-            committed_map_commit_sequence: goal.committed_map_commit_sequence,
-            committed_map_source_timestamp_ns: goal.committed_map_source_timestamp_ns,
-            committed_map_frame_id: goal.committed_map_frame_id.clone(),
-            motion_guard_generation: goal.motion_guard_generation,
-            motion_guard_boot_nonce: goal.motion_guard_boot_nonce,
-            motion_stop_generation: goal.motion_stop_generation,
-            planner_runtime_generation: 17, path_revision: 3, source_timestamp_ns: 10,
+
+
+            planner_runtime_generation: 17, path_revision: 3,
             path: schema::Path {
                 header: schema::Header { frame_id: "map".into(), ..Default::default() },
                 poses: vec![schema::PoseStamped {
@@ -24465,7 +24436,7 @@ mod retained_firstfix_proof_controls {
             let mut stale = measured_natural_terminal(&old, "FAILED");
             stale.feedback.actuator_zeroed = true;
             bridge.nav.retain_terminal_receipt(&stale).await;
-            assert!(bridge.nav.naturally_retired_terminal_for(&crate::nav_runtime::CancelGoalInput {
+            assert!(bridge.nav.settled_without_child_cancel_terminal_for(&crate::nav_runtime::CancelGoalInput {
                 goal_id: old.session_id.clone(), owner_kind: old.owner_kind,
                 parent_request_id: old.parent_request_id.clone(), goal_generation: old.goal_generation,
                 producer_runtime_generation: old.producer_runtime_generation,
@@ -24516,7 +24487,7 @@ mod retained_firstfix_proof_controls {
                 producer_runtime_generation: lease.producer_runtime_generation,
                 path_revision: lease.path_revision,
                 planner_runtime_generation: lease.planner_runtime_generation,
-                guard_generation: crate::nav_runtime::test_motion_admission().guard_generation,
+
                 sink_ready: true,
                 zero_ack_id: format!("{}-natural-zero", lease.session_id),
                 zero_applied_monotonic_ns: crate::explore_runtime::now_monotonic_nanos(),
@@ -24745,7 +24716,8 @@ mod retained_firstfix_proof_controls {
         let stopped = explore.stop(parent).await;
         assert_eq!(stopped.status, crate::explore_runtime::STATUS_FAILED,
             "empty Nav slot cannot promote old path receipt into AlreadyTerminal");
-        assert_eq!(stopped.child_task_id, old.session_id);
+        assert!(stopped.child_task_id.is_empty());
+        assert!(stopped.parking_pending);
         assert!(explore.blocks_mapping_mutation().await);
         assert_eq!(backend.cancel_count(), 0);
         assert_eq!(bridge.nav.cancel_snapshot().generation, 0);

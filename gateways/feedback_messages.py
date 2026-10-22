@@ -8,7 +8,7 @@ from gateways.feedback import build_public_runtime_event, compact_public_data
 
 TERMINAL_EVENTS = frozenset({
     "task.succeeded", "task.failed", "task.cancelled", "task.timeout",
-    "task.resource_quarantined", "capability.invocation.failed",
+    "capability.invocation.failed",
 })
 
 

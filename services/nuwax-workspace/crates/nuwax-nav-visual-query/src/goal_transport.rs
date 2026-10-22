@@ -38,7 +38,7 @@ pub struct NavigationAdmission {
     /// 相机到权威规划坐标系的冻结外参。
     pub transform: FrozenGoalTransform,
     /// Motion Guard（运动保护器）准入代次。
-    pub motion_guard_generation: u64,
+
     /// Motion Guard 启动 nonce，十六进制 16 字节。
     pub motion_guard_boot_nonce_hex: String,
     /// 调用者观察到的全局停止代次。
@@ -175,6 +175,8 @@ impl GeometryGoalTransport {
     /// 通过 Batch02 exact-lease cancel wire 等待零速确认后的类型化终态。
     pub fn cancel(&self, lease: &AdmittedGoalLease) -> Result<NavigationOutcome, String> {
         let request = CancelNavigationRequest {
+global_stop_confirmation: None,
+
             goal_id: lease.goal_id.clone(),
             owner_kind: PUBLIC_NAV_OWNER,
             parent_request_id: lease.parent_request_id.clone(),
@@ -291,9 +293,6 @@ fn adapt_observation(
         return Err("target pose identity does not match observation".into());
     }
     let nonce = decode_nonce(&admission.motion_guard_boot_nonce_hex)?;
-    if admission.motion_guard_generation == 0 {
-        return Err("motion guard generation must be positive".into());
-    }
     let rotation = normalized_quaternion(transform.rotation_xyzw)?;
     let mut point = pose.pose.position;
     if tracker_swaps_axes {
@@ -339,7 +338,7 @@ fn adapt_observation(
         parent_request_id: observation.session_id.clone(),
         goal_generation: 0,
         owner_kind: PUBLIC_NAV_OWNER,
-        motion_guard_generation: admission.motion_guard_generation,
+
         motion_guard_boot_nonce: nonce.to_vec(),
         motion_stop_generation: admission.motion_stop_generation,
         allow_reverse: admission.allow_reverse.unwrap_or(false),
@@ -452,7 +451,7 @@ mod tests {
                 translation_xyz: [2.0, 3.0, 0.0],
                 rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
             },
-            motion_guard_generation: 7,
+
             motion_guard_boot_nonce_hex: "00112233445566778899aabbccddeeff".into(),
             motion_stop_generation: 4,
             allow_reverse: None,
@@ -467,7 +466,7 @@ mod tests {
                 "transform": {"source_frame_id":"camera_optical_frame", "target_frame_id":"map",
                     "source_timestamp_ns":1000000000_u64, "calibration_id":"calibration-1",
                     "translation_xyz":[2.,3.,0.], "rotation_xyzw":[0.,0.,0.,1.]},
-                "motion_guard_generation":7, "motion_guard_boot_nonce_hex":"00112233445566778899aabbccddeeff",
+                "motion_guard_boot_nonce_hex":"00112233445566778899aabbccddeeff",
                 "motion_stop_generation":4
             });
             if let Some(value) = choice { request["allow_reverse"] = value.into(); }

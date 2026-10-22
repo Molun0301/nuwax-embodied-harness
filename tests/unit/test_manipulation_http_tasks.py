@@ -7,11 +7,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from core.capability_registry import CapabilityRegistry
-from core.resource_lock import ResourceConflictError, ResourceLockManager
+from core.resource_lock import ResourceConflictError
 from core.settings import ManipulationConfig, load_config
-from skills import SkillRegistry
-from core.task_manager import TaskManager
+from core.task_manager import TaskSafetyBarrierError
 from gateways.manipulation import NAME, availability, execute, register_capability, register_skill
 from services.manipulation.http_backend import DeviceError, HttpManipulationBackend
 from services.manipulation.service import ManipulationService
@@ -126,10 +124,13 @@ def test_timeout_sends_cancel_and_confirms_terminal(device,runtime):
 
 
 @pytest.mark.parametrize('mode',['wrong_task','wrong_epoch','never_pause','start_lost'])
-def test_uncertain_or_mismatched_stop_quarantines_resources(mode,device,runtime):
+def test_uncertain_or_mismatched_stop_fails_and_releases_task_resources(mode,device,runtime):
     device.mode=mode;task=submit(runtime,timeout_sec=1)
     assert terminal(runtime,task).state.value=='failed'
-    with runtime.task_manager.motion_resource_quarantine_snapshot() as ids:assert task.task_id in ids
+    with pytest.raises(TaskSafetyBarrierError):
+        runtime.task_manager.wait_for_task(task.task_id, timeout=2)
+    assert runtime.task_manager.get_task_error_payload(task.task_id)["code"] == "manipulation_stop_unconfirmed"
+    assert not runtime.resource_lock_manager.held_resources(task.task_id)
     if mode=='start_lost':assert not device.cancelled.is_set()
 
 

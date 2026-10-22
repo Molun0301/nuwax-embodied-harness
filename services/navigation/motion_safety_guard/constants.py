@@ -1,15 +1,11 @@
 from __future__ import annotations
 
-API_VERSION = 2
+API_VERSION = 3
 
 DEFAULT_SOCKET_PATH = "/run/nuwax/motion-guard.sock"
 DEFAULT_LOCK_PATH = "/run/nuwax/motion-guard.lock"
-DEFAULT_PROVISION_PATH = "/var/lib/nuwax/motion-guard/provisioned.json"
-DEFAULT_EPOCH_PATH = "/var/lib/nuwax/motion-guard/epoch.json"
 
 MAX_FRAME_BYTES = 16 * 1024 * 1024
-# 显式续租可滚动延长窗口，拥有方失联仍由短周期看门狗处理。
-LEASE_RENEWAL_WINDOW_NS = 600 * 1_000_000_000
 RENEW_INTERVAL_NS = 250 * 1_000_000
 OWNER_TIMEOUT_NS = 750 * 1_000_000
 MAX_COMMAND_DEADLINE_NS = 300 * 1_000_000
@@ -19,9 +15,7 @@ WATCHDOG_FENCE_LEAD_NS = 425 * 1_000_000
 ZERO_RETRY_INITIAL_NS = 250 * 1_000_000
 ZERO_RETRY_MAX_NS = 5 * 1_000_000_000
 
-EPOCH_SCHEMA_VERSION = 4
-PROVISION_SCHEMA_VERSION = 1
-MAX_GENERATION = (1 << 64) - 1
+MAX_UINT64 = (1 << 64) - 1
 
 OPERATION_RECORD_CAPACITY = 4096
 RETRY_HORIZON_NS = 30 * 1_000_000_000

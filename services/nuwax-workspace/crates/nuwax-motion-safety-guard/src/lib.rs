@@ -8,12 +8,11 @@
 
 pub mod client;
 pub mod constants;
-mod crypto;
 pub mod measured_motion;
 pub mod wire;
 
 pub use client::{
-    ClientConfig, CommandConfirmation, GlobalStopConfirmation, HeldRecoveryFenceProof,
+    ClientConfig, CommandConfirmation, GlobalStopConfirmation,
     LeaseMetadata, MotionAdmissionProof, MotionGuardClient, MotionGuardClientError,
     PriorityFenceRequest, ReadinessStatus, RenewalMetadata, ZeroConfirmation,
 };

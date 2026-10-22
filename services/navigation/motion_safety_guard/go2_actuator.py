@@ -3,7 +3,6 @@ from __future__ import annotations
 from core.config_values import runtime_value
 
 from dataclasses import dataclass
-import hashlib
 import importlib
 import json
 import math
@@ -31,10 +30,7 @@ class ActuatorBackend(Protocol):
     @property
     def is_configured(self) -> bool: ...
 
-    @property
-    def actuator_symbols_sha256(self) -> str: ...
-
-    def apply_motion(self, request: pb.SubmitMotionCommandRequest) -> None: ...
+    def apply_motion(self, request: pb.SubmitMotionCommandRequest) -> bool: ...
 
     def execute_sport(self, command: pb.SportActionCommand) -> None: ...
 
@@ -156,22 +152,6 @@ def _load_sdk_factories(sdk_path: str) -> Go2Factories:
     )
 
 
-def _manifest_digest(path: Path) -> str:
-    try:
-        payload = path.read_bytes()
-    except OSError as exc:
-        raise ActuatorError(
-            "ACTUATOR_MANIFEST_UNAVAILABLE",
-            f"cannot read actuator symbol manifest {path}: {exc}",
-        ) from exc
-    if not payload:
-        raise ActuatorError(
-            "ACTUATOR_MANIFEST_UNAVAILABLE",
-            f"actuator symbol manifest is empty: {path}",
-        )
-    return "sha256:" + hashlib.sha256(payload).hexdigest()
-
-
 def _require_success(code: object, operation: str) -> None:
     if isinstance(code, bool):
         succeeded = code
@@ -197,7 +177,6 @@ class Go2Actuator:
         self,
         *,
         factories: Go2Factories,
-        actuator_symbols_sha256: str,
         dds_iface: Optional[str],
         timeout_seconds: float,
         max_linear_velocity_mps: float = 1.0,
@@ -231,7 +210,6 @@ class Go2Actuator:
                 "yaw_rate_deadband_rps must be finite, non-negative, and less than max_yaw_rate_rps",
             )
         self._factories = factories
-        self._manifest_hash = actuator_symbols_sha256
         self._dds_iface = dds_iface or None
         self._timeout_seconds = timeout_seconds
         self._max_linear_velocity_mps = max_linear_velocity_mps
@@ -368,13 +346,6 @@ class Go2Actuator:
         )
         if not sdk_path:
             raise ActuatorError("SDK_PATH_INVALID", "GO2_SDK_PATH is required")
-        manifest_value = runtime_value("NUWAX_ACTUATOR_SYMBOLS_FILE", "").strip()
-        if not manifest_value:
-            raise ActuatorError(
-                "ACTUATOR_MANIFEST_UNAVAILABLE",
-                "NUWAX_ACTUATOR_SYMBOLS_FILE is required",
-            )
-        manifest_path = Path(manifest_value).expanduser().resolve()
         try:
             timeout = float(runtime_value("GO2_OFFICIAL_CLIENT_TIMEOUT_SEC", "3.0"))
             max_linear = float(
@@ -424,7 +395,6 @@ class Go2Actuator:
         )
         return cls(
             factories=_load_sdk_factories(sdk_path),
-            actuator_symbols_sha256=_manifest_digest(manifest_path),
             dds_iface=iface,
             timeout_seconds=min(timeout, MAX_PRODUCTION_SDK_TIMEOUT_SECONDS),
             max_linear_velocity_mps=max_linear,
@@ -437,14 +407,10 @@ class Go2Actuator:
         return True
 
     @property
-    def actuator_symbols_sha256(self) -> str:
-        return self._manifest_hash
-
-    @property
     def active_mode(self) -> int:
         return self._active_mode
 
-    def apply_motion(self, request: pb.SubmitMotionCommandRequest) -> None:
+    def apply_motion(self, request: pb.SubmitMotionCommandRequest) -> bool:
         command = request.WhichOneof("command")
         if command == "twist":
             twist = request.twist
@@ -455,27 +421,17 @@ class Go2Actuator:
             )
             if not all(math.isfinite(value) for value in values):
                 raise ActuatorError("INVALID_ARGUMENT", "twist values must be finite")
-            linear_norm = math.hypot(values[0], values[1])
-            # 对角限幅跨语言重算可能多出几个浮点末位；只修正舍入误差，
-            # 实际发送值仍收回配置上限内，不把正常限幅指令变成任务失败。
-            rounding_tolerance = 8 * sys.float_info.epsilon
-            if linear_norm > self._max_linear_velocity_mps:
-                if not math.isclose(linear_norm, self._max_linear_velocity_mps,
-                                    rel_tol=rounding_tolerance, abs_tol=0.0):
-                    raise ActuatorError(
-                        "INVALID_ARGUMENT",
-                        f"twist linear velocity exceeds configured limit: {linear_norm!r} > {self._max_linear_velocity_mps!r}",
-                    )
-                scale = self._max_linear_velocity_mps * (1 - rounding_tolerance) / linear_norm
-                values = (values[0] * scale, values[1] * scale, values[2])
+            limited = False
+            if math.hypot(values[0], values[1]) > self._max_linear_velocity_mps:
+                # 原范数即便溢出也只用于比较；归一化后计算实际缩放，避免inf乘零。
+                largest = max(abs(values[0]), abs(values[1]))
+                nx, ny = values[0] / largest, values[1] / largest
+                magnitude = (self._max_linear_velocity_mps / math.hypot(nx, ny)) * (1 - 8 * sys.float_info.epsilon)
+                values = (nx * magnitude, ny * magnitude, values[2])
+                limited = True
             if abs(values[2]) > self._max_yaw_rate_rps:
-                if not math.isclose(abs(values[2]), self._max_yaw_rate_rps,
-                                    rel_tol=rounding_tolerance, abs_tol=0.0):
-                    raise ActuatorError(
-                        "INVALID_ARGUMENT",
-                        "twist yaw rate exceeds configured limit",
-                    )
                 values = (values[0], values[1], math.copysign(self._max_yaw_rate_rps, values[2]))
+                limited = True
             move_values = (
                 values[0],
                 values[1],
@@ -505,10 +461,10 @@ class Go2Actuator:
                 client.Move(*move_values),
                 f"{client.__class__.__name__}.Move",
             )
-            return
+            return limited
         if command == "stop":
             self.zero()
-            return
+            return False
         if command == "body_pose":
             pose = request.body_pose
             values = (
@@ -527,13 +483,13 @@ class Go2Actuator:
                 self._sport.Euler(*values),
                 "SportClient.Euler",
             )
-            return
+            return False
         if command == "speed_level":
             level = int(request.speed_level.level)
             if level not in {1, 2, 3}:
                 raise ActuatorError("INVALID_ARGUMENT", "speed level must be in [1, 3]")
             _require_success(self._sport.SpeedLevel(level), "SportClient.SpeedLevel")
-            return
+            return False
         if command == "obstacle_policy":
             enabled = bool(request.obstacle_policy.enabled)
             _require_success(
@@ -547,7 +503,7 @@ class Go2Actuator:
             self._obstacle_policy_enabled = enabled
             self._obstacle_remote_enabled = enabled
             self._motion_route_ready = False
-            return
+            return False
         raise ActuatorError("INVALID_ARGUMENT", "motion command oneof is missing")
 
     def execute_sport(self, command: pb.SportActionCommand) -> None:

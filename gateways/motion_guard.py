@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import hashlib
-import hmac
 import os
 import threading
 import uuid
@@ -43,54 +41,22 @@ class GatewayCommandConfirmation:
 
 @dataclass(frozen=True)
 class MotionAdmission:
-    """Request-scoped proof created by the sole public readiness check."""
+    """受理时从同一守卫快照捕获、随请求透传的凭据。"""
 
     request_id: str
     capability_name: str
-    generation: int
     boot_nonce: bytes
     motion_stop_generation: int
-    admitted_monotonic_ns: int
-    proof: MotionAdmissionProof
-    guard_motion_stop_generation: Optional[int] = None
 
-    def __post_init__(self) -> None:
-        if not self.request_id or not self.capability_name:
-            raise ValueError("motion admission identity must be non-empty")
-        if self.generation <= 0 or len(self.boot_nonce) != 16:
-            raise ValueError("motion admission epoch is invalid")
-        if self.motion_stop_generation < 0 or self.admitted_monotonic_ns <= 0:
-            raise ValueError("motion admission local generation is invalid")
-        guard_stop_generation = self.guard_motion_stop_generation
-        if guard_stop_generation is None:
-            guard_stop_generation = self.proof.motion_stop_generation
-            object.__setattr__(
-                self,
-                "guard_motion_stop_generation",
-                guard_stop_generation,
-            )
-        if (
-            guard_stop_generation < 0
-            or guard_stop_generation != self.proof.motion_stop_generation
-        ):
-            raise ValueError("motion admission guard generation is invalid")
-        if (
-            self.proof.generation != self.generation
-            or bytes(self.proof.boot_nonce) != bytes(self.boot_nonce)
-        ):
-            raise ValueError("motion admission proof does not match its epoch")
+    @property
+    def proof(self) -> MotionAdmissionProof:
+        return MotionAdmissionProof(boot_nonce=self.boot_nonce,
+                                    motion_stop_generation=self.motion_stop_generation)
 
     def as_metadata(self) -> Dict[str, object]:
-        guard_stop_generation = self.guard_motion_stop_generation
-        assert guard_stop_generation is not None
-        return {
-            "request_id": self.request_id,
-            "capability_name": self.capability_name,
-            "generation": self.generation,
-            "boot_nonce_hex": bytes(self.boot_nonce).hex(),
-            "motion_stop_generation": guard_stop_generation,
-            "admitted_monotonic_ns": self.admitted_monotonic_ns,
-        }
+        return {"request_id": self.request_id, "capability_name": self.capability_name,
+                "boot_nonce_hex": self.boot_nonce.hex(),
+                "motion_stop_generation": self.motion_stop_generation}
 
 
 class GatewayMotionGuard:
@@ -188,7 +154,7 @@ class GatewayMotionGuard:
             ) from exc
 
     def guard_state(self) -> GuardState:
-        """Return the durable Gateway-manual guard state for recovery routing."""
+        """读取守卫当前状态，不据此预判运动是否可执行。"""
 
         client = self._require_client()
         try:
@@ -198,6 +164,12 @@ class GatewayMotionGuard:
             raise GatewayMotionGuardUnavailable(
                 f"motion guard state query failed: {exc}"
             ) from exc
+
+    def admission_snapshot(self) -> MotionAdmissionProof:
+        """从同一次状态回包捕获启动身份和唯一停止代次。"""
+        state = self.guard_state()
+        return MotionAdmissionProof(boot_nonce=state.boot_nonce,
+                                    motion_stop_generation=state.motion_stop_generation)
 
     def acquire_follow_session(
         self,
@@ -287,152 +259,44 @@ class GatewayMotionGuard:
             ) from exc
 
     def stop_all_motion(
-        self,
-        reason: str,
-        *,
-        operation_id: Optional[str] = None,
+        self, reason: str, *, operation_id: Optional[str] = None,
     ) -> StopAllMotionConfirmation:
-        return self._global_stop_with_recovery(
-            "stop_all_motion",
-            reason,
-            operation_id=operation_id,
-        )
-
-    def hold_recovery_fence(
-        self,
-        *,
-        reason: str,
-        correlation_id: str,
-        operation_id: Optional[str] = None,
-    ) -> StopAllMotionConfirmation:
-        return self._global_stop_with_recovery(
-            "hold_recovery_fence",
-            reason,
-            correlation_id,
-            operation_id=operation_id,
-        )
-
-    def release_recovery_fence(
-        self,
-        *,
-        reason: str,
-        correlation_id: str,
-        recovery_fence_token: bytes,
-        operation_id: Optional[str] = None,
-    ) -> StopAllMotionConfirmation:
-        return self._global_stop_with_recovery(
-            "release_recovery_fence",
-            reason,
-            correlation_id,
-            recovery_fence_token,
-            operation_id=operation_id,
-        )
-
-    def _global_stop_with_recovery(
-        self,
-        method_name: str,
-        *args: object,
-        operation_id: Optional[str],
-    ) -> StopAllMotionConfirmation:
-        operation = (
-            operation_id.strip()
-            if isinstance(operation_id, str) and operation_id.strip()
-            else f"{method_name.replace('_', '-')}:{uuid.uuid4()}"
-        )
+        operation = (operation_id.strip() if isinstance(operation_id, str) and operation_id.strip()
+                     else f"stop-all-motion:{uuid.uuid4()}")
         client = self._require_client()
         try:
-            method = getattr(client, method_name)
-            return method(*args, operation_id=operation)
+            return client.stop_all_motion(reason, operation_id=operation)
         except MotionGuardTransportError as exc:
             self._record_error(exc)
-            if not exc.outcome_unknown or (
-                exc.operation_id and exc.operation_id != operation
-            ):
-                raise GatewayMotionGuardError(
-                    "global motion stop did not return a verified zero acknowledgement"
-                ) from exc
+            if not exc.outcome_unknown or (exc.operation_id and exc.operation_id != operation):
+                raise GatewayMotionGuardError("全局停车未取得归零回执。") from exc
             try:
                 self.start()
                 recovery_client = self._require_client()
                 status = recovery_client.get_operation_result(
-                    pb.GUARD_SOURCE_GATEWAY_MANUAL,
-                    operation,
+                    pb.GUARD_SOURCE_GATEWAY_MANUAL, operation,
                     operation_namespace=pb.OPERATION_NAMESPACE_GLOBAL_STOP,
                 )
                 if not status.resolved:
-                    recovery_method = getattr(recovery_client, method_name)
-                    return recovery_method(*args, operation_id=operation)
-                if status.zero is None or status.target_ack not in {
-                    pb.ACK_CODE_ZEROED,
-                    pb.ACK_CODE_RESOURCE_FENCED,
-                }:
-                    raise MotionGuardError(
-                        "resolved global stop has no valid terminal zero result"
-                    )
+                    return recovery_client.stop_all_motion(reason, operation_id=operation)
                 zero = recovery_client.wait_for_stationary(
                     pb.GUARD_SOURCE_GATEWAY_MANUAL, operation, status.zero,
                     operation_namespace=pb.OPERATION_NAMESPACE_GLOBAL_STOP,
                 )
-                state = recovery_client.get_guard_state(
-                    pb.GUARD_SOURCE_GATEWAY_MANUAL
-                )
-                if state.motion_stop_generation != status.motion_stop_generation:
-                    raise MotionGuardError(
-                        "resolved global stop does not match durable guard state"
-                    )
-                token = status.recovery_fence_token
-                held = status.recovery_fence_held
-                if state.recovery_fence_held != held:
-                    raise MotionGuardError(
-                        "resolved global stop recovery state is not durable"
-                    )
-                if method_name == "hold_recovery_fence":
-                    correlation_id = str(args[1]).strip()
-                    if (
-                        not held
-                        or len(token) != 32
-                        or not hmac.compare_digest(
-                            state.recovery_fence_token_sha256,
-                            hashlib.sha256(token).digest(),
-                        )
-                        or not hmac.compare_digest(
-                            state.recovery_fence_correlation_sha256,
-                            hashlib.sha256(
-                                correlation_id.encode("utf-8")
-                            ).digest(),
-                        )
-                    ):
-                        raise MotionGuardError(
-                            "resolved recovery fence hold lacks durable state proof"
-                        )
-                elif method_name == "release_recovery_fence" and (
-                    held or state.recovery_fence_held
-                ):
-                    raise MotionGuardError(
-                        "resolved recovery fence release did not clear durable state"
-                    )
                 return StopAllMotionConfirmation(
-                    operation_id=operation,
-                    result=status.result,
-                    zero=zero,
-                    lease_revoked=status.target_ack
-                    == pb.ACK_CODE_RESOURCE_FENCED,
+                    operation_id=operation, result=status.result, zero=zero,
+                    lease_revoked=status.target_ack == pb.ACK_CODE_RESOURCE_FENCED,
                     motion_stop_generation=status.motion_stop_generation,
-                    recovery_fence_token=status.recovery_fence_token,
-                    recovery_fence_held=status.recovery_fence_held,
-                    generation=state.generation,
-                    boot_nonce=state.boot_nonce,
                 )
             except MotionGuardError as recovery_error:
                 self._record_error(recovery_error)
-                raise GatewayMotionGuardError(
-                    "global motion stop outcome could not be recovered"
-                ) from recovery_error
+                raise GatewayMotionGuardError("全局停车结果恢复失败。") from recovery_error
         except MotionGuardError as exc:
             self._record_error(exc)
-            raise GatewayMotionGuardError(
-                "global motion stop did not return a verified zero acknowledgement"
-            ) from exc
+            raise GatewayMotionGuardError("全局停车未取得归零回执。") from exc
+
+
+
 
     def _one_shot(
         self,

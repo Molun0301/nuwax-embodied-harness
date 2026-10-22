@@ -21,15 +21,14 @@ from core.event_bus import EventBus
 from core.resource_lock import ResourceLockManager
 from core.task_manager import TaskManager, TaskSafetyBarrierError
 from gateways.agent.feedback import build_receipt, checked_json
-from gateways.feedback import build_mcp_tool_result, build_public_error_payload, compact_public_data
+from gateways.feedback import build_mcp_tool_result, build_public_error_payload
 from gateways.http.api import _navigation_state_payload
-from gateways.runtime import GatewayRuntime
+from gateways.motion_guard import MotionAdmission
 from tests.conftest import create_isolated_gateway
 from scripts.check_navigation_map_snapshot_identity import OfflineProvider
 from services.geometry.geometry_runtime_provider import GeometryRuntimeProvider
 from services.geometry.proto_gen import geometry_runtime_pb2 as pb2
 from services.navigation.service import NavigationService
-from skills.map_workspace import MapWorkspaceService
 
 
 IDENTITY = dict(goal_id="owned-goal", owner_kind=1, parent_request_id="owned-goal",
@@ -91,9 +90,8 @@ class PublicUnconfirmedTests(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         runtime = create_isolated_gateway(Path(directory.name))
         self.addCleanup(runtime.stop)
-        self.enterContext(patch.object(runtime, "_run_with_motion_admission", lambda admission, operation: operation()))
-        self.enterContext(patch.object(runtime, "_require_motion_admission", lambda *args: NS(generation=2, boot_nonce=b"x" * 16,
-                                                            guard_motion_stop_generation=4)))
+        self.enterContext(patch.object(runtime, "_ensure_motion_runtime_for_backend_call", lambda *args, **kwargs: None))
+        self.enterContext(patch.object(runtime, "_require_motion_admission", lambda *args: MotionAdmission("test", "navigate_to_pose", b"x" * 16, 4)))
         return runtime
 
     def control_gateway(self):
@@ -155,7 +153,6 @@ class PublicUnconfirmedTests(unittest.TestCase):
         self.enterContext(patch.object(runtime, "task_manager", manager))
         self.enterContext(patch.object(runtime, "capability_registry", NS(get_descriptor=lambda _: NS(required_resources=["navigation"],
                                                                      display_name="isolated"))))
-        self.enterContext(patch.object(runtime, "_reconcile_navigation_quarantine", lambda: {"pending": False}))
         self.enterContext(patch.object(runtime, "_goal_with_motion_admission", lambda goal, admission: goal))
         self.enterContext(patch.object(runtime, "_ensure_motion_runtime_for_backend_call", lambda *args, **kwargs: None))
         self.enterContext(patch.object(runtime, "_capture_task_generation_snapshot", lambda **kwargs: {}))
@@ -189,16 +186,15 @@ class PublicUnconfirmedTests(unittest.TestCase):
         runtime.navigation_service.cancel_goal.assert_called_once()
         self.assertEqual(runtime.navigation_service.cancel_goal.call_args.kwargs["request_id"], IDENTITY["goal_id"])
         self.assertEqual(locks.held_resources(task.task_id), ())
-        self.assertFalse(manager._records[task.task_id].resource_quarantined)
 
-    def test_typed_unknown_missing_zero_uses_original_resource_quarantine(self):
+    def test_typed_unknown_missing_zero_fails_without_inventing_confirmation(self):
         runtime, manager, locks, _ = self.task_gateway(stopped=False)
         with patch("gateways.runtime._EXPLORATION_STOP_BARRIER_TIMEOUT_SEC", 0):
             task = self.submit(runtime)
             with self.assertRaises(TaskSafetyBarrierError):
                 manager.wait_for_task(task.task_id, timeout=2)
-        self.assertTrue(manager._records[task.task_id].resource_quarantined)
-        self.assertEqual(locks.held_resources(task.task_id), ("navigation",))
+        self.assertEqual(manager.get_task_error_payload(task.task_id)["code"], "parking_unconfirmed")
+        self.assertEqual(locks.held_resources(task.task_id), ())
         runtime.navigation_service.set_goal.assert_called_once()
         runtime.navigation_service.cancel_goal.assert_called_once()
 
@@ -267,25 +263,21 @@ class PublicUnconfirmedTests(unittest.TestCase):
         self.assertFalse(result["completed"])
         runtime.navigation_service.cancel_goal.assert_called_once_with(request_id=IDENTITY["goal_id"])
 
-    def test_historical_owner_rejects_both_cancel_forms_without_sending(self):
+    def test_historical_display_does_not_block_exact_backend_cancel(self):
         for args in ({}, {"request_id": IDENTITY["goal_id"]}):
             with self.subTest(args=args):
                 runtime = self.gateway()
-                self.enterContext(patch.object(runtime, "navigation_service", NS(refresh_navigation=Mock(return_value=navigation(historical=True)),
-                    get_navigation_control_context=Mock(return_value=navigation(historical=True)), cancel_goal=Mock(), get_latest_navigation_context=Mock(return_value=None))))
+                failure = GatewayError("后端精确拒绝", error_code="navigation_cancel_rejected", http_status=409)
+                service = NS(refresh_navigation=Mock(side_effect=AssertionError("取消不得预读展示")),
+                    get_navigation_control_context=Mock(return_value=navigation(historical=True)),
+                    cancel_goal=Mock(side_effect=failure), get_latest_navigation_context=Mock(return_value=None))
+                self.enterContext(patch.object(runtime, "navigation_service", service))
                 with self.assertRaises(GatewayError) as raised:
                     runtime._handle_cancel_navigation(args)
-                self.assertEqual(raised.exception.error_code, "navigation_control_authority_unavailable")
-                self.assertFalse(raised.exception.details["authority_current"])
-                self.assertEqual(raised.exception.details["historical_navigation_identity"], IDENTITY)
-                self.assertFalse(build_public_error_payload(raised.exception)["retryable"])
-                runtime.navigation_service.cancel_goal.assert_not_called()
-                if args:
-                    runtime.navigation_service.get_navigation_control_context.assert_called_once_with()
-                    runtime.navigation_service.refresh_navigation.assert_not_called()
-                else:
-                    runtime.navigation_service.refresh_navigation.assert_called_once_with()
-                    runtime.navigation_service.get_navigation_control_context.assert_not_called()
+                self.assertIs(raised.exception, failure)
+                service.cancel_goal.assert_called_once_with(request_id=IDENTITY["goal_id"])
+                self.assertEqual(service.get_navigation_control_context.call_count, 0 if args else 1)
+                service.refresh_navigation.assert_not_called()
 
     def test_explicit_cancel_uses_real_lightweight_control_and_exact_backend_request(self):
         for completed in (False, True):
@@ -301,14 +293,14 @@ class PublicUnconfirmedTests(unittest.TestCase):
                 self.assertEqual(result["completed"], completed)
                 self.assertEqual(result["request_id"], IDENTITY["goal_id"])
                 runtime.navigation_service.cancel_goal.assert_called_once_with(request_id=IDENTITY["goal_id"])
-                self.assertEqual(view.get_navigation_control_state.call_count, 3)
+                self.assertEqual(view.get_navigation_control_state.call_count, 1)
                 backend._stub.CancelNavigation.assert_called_once()
                 request = backend._stub.CancelNavigation.call_args[0][0]
                 for key, expected in IDENTITY.items():
                     self.assertEqual(getattr(request, key), expected)
                 self.assert_control_reads_only(runtime, backend, view)
 
-    def test_explicit_historical_control_keeps_409_before_unavailable_checks(self):
+    def test_explicit_historical_display_defers_to_current_provider(self):
         for available in (False, True):
             with self.subTest(available=available):
                 runtime, backend, view = self.control_gateway()
@@ -319,27 +311,13 @@ class PublicUnconfirmedTests(unittest.TestCase):
                 with self.assertRaises(GatewayError) as raised:
                     runtime._handle_cancel_navigation({"request_id": IDENTITY["goal_id"]})
                 error = raised.exception
-                self.assertEqual(error.error_code, "navigation_control_authority_unavailable")
-                self.assertEqual(error.http_status, 409)
-                self.assertEqual(error.details["historical_navigation_identity"], IDENTITY)
-                self.assertFalse(error.details["authority_current"])
-                # Preserve the Gateway's full state shape, not just the historical wire.
-                self.assertEqual(error.details["navigation"]["current_goal_id"], IDENTITY["goal_id"])
-                self.assertEqual(error.details["navigation"]["metadata"]["historical_navigation_identity"], IDENTITY)
-                public = build_public_error_payload(error)
-                mcp = build_mcp_tool_result({"result": {"ok": False, "error_payload": public}})
-                self.assertTrue(mcp["isError"])
-                for projected in (public, mcp["structuredContent"]["result"]["error_payload"]):
-                    self.assertEqual(projected["code"], error.error_code)
-                    self.assertFalse(projected["retryable"])
-                    self.assertEqual(projected["error_category"], "validation")
-                    self.assertEqual(projected["details"], compact_public_data(error.details))
-                runtime.navigation_service.cancel_goal.assert_not_called()
+                self.assertEqual(error.error_code, "navigation_cancel_rejected")
+                runtime.navigation_service.cancel_goal.assert_called_once_with(request_id=IDENTITY["goal_id"])
+                view.cancel_goal.assert_called_once_with(request_id=IDENTITY["goal_id"])
                 view.is_available.assert_not_called()
-                view.cancel_goal.assert_not_called()
                 old_stub.CancelNavigation.assert_not_called()
                 backend._stub.CancelNavigation.assert_not_called()
-                self.assertEqual(view.get_navigation_control_state.call_count, 1)
+                view.get_navigation_control_state.assert_not_called()
                 self.assert_control_reads_only(runtime, backend, view)
 
     def test_explicit_mismatch_keeps_real_service_409_and_public_mcp_error(self):
@@ -347,43 +325,42 @@ class PublicUnconfirmedTests(unittest.TestCase):
         with self.assertRaises(GatewayError) as raised:
             runtime._handle_cancel_navigation({"request_id": "foreign-goal"})
         error = raised.exception
-        self.assertEqual(error.error_code, "navigation_goal_mismatch")
+        self.assertEqual(error.error_code, "navigation_cancel_rejected")
         self.assertEqual(error.http_status, 409)
-        self.assertEqual(error.details["requested_goal_id"], "foreign-goal")
-        self.assertEqual(error.details["active_goal_id"], IDENTITY["goal_id"])
+        view.cancel_goal.assert_called_once_with(request_id="foreign-goal")
+        backend._stub.CancelNavigation.assert_not_called()
         public = build_public_error_payload(error)
         mcp = build_mcp_tool_result({"result": {"ok": False, "error_payload": public}})
         self.assertTrue(mcp["isError"])
         self.assertEqual(public["error_category"], "validation")
         self.assertEqual(mcp["structuredContent"]["result"]["error_payload"], public)
-        view.cancel_goal.assert_not_called()
         backend._stub.CancelNavigation.assert_not_called()
         self.assert_control_reads_only(runtime, backend, view)
 
-    def test_explicit_control_read_error_does_not_fallback_to_full_refresh_or_cancel(self):
+    def test_explicit_cancel_is_sent_before_control_result_read_error(self):
         runtime, backend, view = self.control_gateway()
         error = GatewayError("control unavailable", error_code="navigation_goal_identity_unavailable", http_status=503)
         runtime.navigation_service.get_navigation_control_context.side_effect = error
         with self.assertRaises(GatewayError) as raised:
             runtime._handle_cancel_navigation({"request_id": IDENTITY["goal_id"]})
         self.assertIs(raised.exception, error)
-        runtime.navigation_service.cancel_goal.assert_not_called()
-        backend._stub.CancelNavigation.assert_not_called()
+        runtime.navigation_service.cancel_goal.assert_called_once_with(request_id=IDENTITY["goal_id"])
+        backend._stub.CancelNavigation.assert_called_once()
         self.assert_control_reads_only(runtime, backend, view)
 
-    def test_noarg_and_blank_cancel_keep_original_refresh_contract(self):
+    def test_noarg_and_blank_cancel_select_goal_from_control_context(self):
         for args in ({}, {"request_id": "   "}):
             for active in (False, True):
                 with self.subTest(args=args, active=active):
                     runtime = self.gateway()
                     context = navigation() if active else NavigationContext(backend_name="isolated",
                         navigation_state=NavigationState(status=NavigationStatus.IDLE))
-                    self.enterContext(patch.object(runtime, "navigation_service", NS(refresh_navigation=Mock(return_value=context),
-                        get_navigation_control_context=Mock(side_effect=AssertionError("noarg control shortcut")),
+                    self.enterContext(patch.object(runtime, "navigation_service", NS(refresh_navigation=Mock(side_effect=AssertionError("无需刷新展示")),
+                        get_navigation_control_context=Mock(return_value=context),
                         cancel_goal=Mock(return_value=context), get_latest_navigation_context=Mock(return_value=None))))
                     result = runtime._handle_cancel_navigation(args)
-                    runtime.navigation_service.refresh_navigation.assert_called_once_with()
-                    runtime.navigation_service.get_navigation_control_context.assert_not_called()
+                    runtime.navigation_service.refresh_navigation.assert_not_called()
+                    runtime.navigation_service.get_navigation_control_context.assert_called_once_with()
                     self.assertEqual(result["cancellation_requested"], active)
                     self.assertEqual(result["completed"], not active)
                     if active:
@@ -548,18 +525,17 @@ class PublicUnconfirmedTests(unittest.TestCase):
 
     def test_authority_unavailable_is_narrowly_nonretryable_across_public_wrappers(self):
         runtime = self.gateway()
-        self.enterContext(patch.object(runtime, "navigation_service", NS(refresh_navigation=Mock(return_value=navigation(historical=True)),
-                                         cancel_goal=Mock(), get_latest_navigation_context=Mock(return_value=None), get_navigation_control_context=Mock(return_value=navigation(historical=True)))))
+        expected = {"goal_id": IDENTITY["goal_id"], "historical_navigation_identity": IDENTITY,
+                    "ownership_retained": True, "authority_current": False, "retryable": False}
+        failure = GatewayError("后端当前资格不可用", error_code="navigation_control_authority_unavailable", http_status=409, details=expected)
+        self.enterContext(patch.object(runtime, "navigation_service", NS(refresh_navigation=Mock(),
+            cancel_goal=Mock(side_effect=failure), get_latest_navigation_context=Mock(return_value=None),
+            get_navigation_control_context=Mock(return_value=navigation(historical=True)))))
         with self.assertRaises(GatewayError) as raised:
             runtime._handle_cancel_navigation({})
         error = raised.exception
-        self.assertEqual(error.error_code, "navigation_control_authority_unavailable")
-        self.assertEqual(error.http_status, 409)
-        runtime.navigation_service.cancel_goal.assert_not_called()
-        expected = {"goal_id": IDENTITY["goal_id"], "historical_navigation_identity": IDENTITY,
-                    "ownership_retained": True, "authority_current": False, "retryable": False}
-        for key, value in expected.items():
-            self.assertEqual(error.details[key], value)
+        self.assertIs(error, failure)
+        runtime.navigation_service.cancel_goal.assert_called_once_with(request_id=IDENTITY["goal_id"])
         public = build_public_error_payload(error)
         self.assertFalse(public["retryable"])
         self.assertEqual(public["error_category"], "validation")

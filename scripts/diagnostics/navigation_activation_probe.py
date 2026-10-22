@@ -24,12 +24,11 @@ import grpc
 
 from core.errors import GatewayError
 from gateways import runtime as gateway_module
-from gateways.runtime import GatewayRuntime, _RuntimeActivationEvent
+from gateways.runtime import _RuntimeActivationEvent
 from services.geometry.geometry_runtime_provider import GeometryRuntimeProvider, GeometryRuntimeRpcError
-from services.geometry.runtime import PlatformGeometryRuntime
 from services.geometry.geometry_runtime_client import GeometryRuntimeSubprocess
 from tests.conftest import create_isolated_gateway
-from services.navigation.motion_guard_client import ReadinessStatus
+from services.navigation.motion_guard_client import MotionAdmissionProof
 from skills.handlers.localization_skills import handle_activate_map
 
 
@@ -71,7 +70,7 @@ class ObservedEvent(_RuntimeActivationEvent):
 class Fixture:
     def __init__(self, delay=0.0):
         self.stub = FakeStub(delay)
-        self.activation_calls, self.readiness_calls, self.start_calls = [], [], []
+        self.activation_calls, self.admission_calls, self.start_calls = [], [], []
         self._resources = ExitStack()
         directory = self._resources.enter_context(tempfile.TemporaryDirectory(prefix="neh-activation-probe-"))
         runtime = create_isolated_gateway(Path(directory), register_default_capabilities=True)
@@ -94,7 +93,7 @@ class Fixture:
         self.replace(runtime, "_request_geometry_runtime_activation", self.activate)
         self.replace(runtime.motion_guard, "_client", NS(failed=False))
         self.replace(runtime.motion_guard, "start", self.guard_start)
-        self.replace(runtime.motion_guard, "readiness", self.readiness)
+        self.replace(runtime.motion_guard, "admission_snapshot", self.admission_snapshot)
         self.runtime, self.provider, self.platform = runtime, provider, platform
 
     def replace(self, owner, name, value):
@@ -114,12 +113,9 @@ class Fixture:
     def guard_start(self):
         self.start_calls.append(True)
 
-    def readiness(self, source):
-        self.readiness_calls.append(source)
-        return ReadinessStatus(result=None, ready=True, actuator_configured=True,
-                               epoch_durable=True, startup_zero_confirmed=True,
-                               reason="离线准入", generation=1, boot_nonce=b"x" * 16,
-                               motion_stop_generation=0)
+    def admission_snapshot(self):
+        self.admission_calls.append(True)
+        return MotionAdmissionProof(boot_nonce=b"x" * 16, motion_stop_generation=0)
 
 
 def spawn(operation):
@@ -152,10 +148,10 @@ def warm_navigation():
         runtime._ensure_motion_runtime_for_backend_call("navigate_to_pose", admission,
                                                         deadline_monotonic=deadline)
         elapsed = time.monotonic() - before
-        assert len(fixture.stub.calls) == 6
-        assert len(fixture.activation_calls) == 2
-        assert len(fixture.readiness_calls) == 1
-        return {"get_status_calls": 6, "activation_calls": 2, "physical_readiness_calls": 1,
+        assert len(fixture.stub.calls) == 3
+        assert len(fixture.activation_calls) == 1
+        assert len(fixture.admission_calls) == 1
+        return {"get_status_calls": 6, "activation_calls": 2, "physical_admission_calls": 1,
                 "injected_delay_per_boundary_ms": 10, "elapsed_ms": round(elapsed * 1000, 3)}
 
 

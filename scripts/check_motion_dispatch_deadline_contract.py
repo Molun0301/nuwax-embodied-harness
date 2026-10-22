@@ -20,10 +20,8 @@ for name in ("contracts", "core", "services", "services.navigation"):
 
 from services.navigation.motion_safety_guard.constants import API_VERSION, MAX_COMMAND_DEADLINE_NS
 from services.navigation.motion_safety_guard.core import MotionGuardCore
-from services.navigation.motion_safety_guard.epoch import EpochRecord
 from services.navigation.motion_safety_guard.peer_auth import PeerCredentials
 from services.navigation.motion_safety_guard.stop_confirmation import StopConfirmation
-from services.navigation.motion_safety_guard.wire import seal_request
 from services.navigation.proto_gen import motion_guard_pb2 as pb
 
 
@@ -38,17 +36,8 @@ class FakeClock:
         return self.ns / 1_000_000_000
 
 
-class MemoryEpochStore:
-    def __init__(self):
-        self.records = []
-
-    def persist(self, record):
-        self.records.append(record)
-
-
 class RecordingActuator:
     is_configured = True
-    actuator_symbols_sha256 = "sha256:" + "4" * 64
 
     def __init__(self):
         self.motion_calls = []
@@ -56,6 +45,7 @@ class RecordingActuator:
 
     def apply_motion(self, request):
         self.motion_calls.append(request.SerializeToString(deterministic=True))
+        return False
 
     def zero(self):
         self.zero_calls += 1
@@ -75,15 +65,8 @@ class MotionDispatchDeadlineContractTests(unittest.TestCase):
     def setUp(self):
         self.clock = FakeClock()
         self.actuator = RecordingActuator()
-        self.store = MemoryEpochStore()
         self.peer = PeerCredentials(pid=17, uid=23, gid=23)
-        epoch = EpochRecord.initial(
-            generation=9,
-            actuator_symbols_sha256=self.actuator.actuator_symbols_sha256,
-        ).with_updates(boot_nonce_hex="07" * 16)
         self.core = MotionGuardCore(
-            epoch=epoch,
-            epoch_store=self.store,
             actuator=self.actuator,
             monotonic_ns=self.clock,
             lease_id_factory=lambda: 41,
@@ -97,23 +80,22 @@ class MotionDispatchDeadlineContractTests(unittest.TestCase):
         self.core.initialize_zero_fence(prepare_mode=False)
         request = pb.MotionGuardRequest(api_version=API_VERSION, request_id="request:acquire")
         request.acquire_lease.envelope.CopyFrom(pb.RequestEnvelope(
-            tuple=pb.LeaseTuple(generation=9, boot_nonce=bytes.fromhex("07" * 16)),
+            tuple=pb.LeaseTuple(boot_nonce=self.core.boot_nonce),
             source=pb.GUARD_SOURCE_NAV,
             action=pb.GUARD_ACTION_UNSPECIFIED,
             operation_id="acquire",
-            sequence=0,
             issued_monotonic_ns=self.clock.ns,
             deadline_monotonic_ns=self.clock.ns + MAX_COMMAND_DEADLINE_NS,
             motion_stop_generation=self.core.motion_stop_generation,
         ))
-        acquired = self.core.handle(seal_request(request), self.peer).acquire_lease
+        acquired = self.core.handle(request, self.peer).acquire_lease
         self.assertFalse(acquired.result.HasField("error"))
         self.assertEqual(acquired.result.ack, pb.ACK_CODE_RECEIVED)
         self.lease = pb.LeaseTuple()
         self.lease.CopyFrom(acquired.lease_tuple)
         self.initial_zero_calls = self.actuator.zero_calls
 
-    def command(self, operation_id, sequence, issued, deadline, *, stop=False):
+    def command(self, operation_id, issued, deadline, *, stop=False):
         request = pb.MotionGuardRequest(
             api_version=API_VERSION, request_id="request:" + operation_id,
         )
@@ -123,7 +105,6 @@ class MotionDispatchDeadlineContractTests(unittest.TestCase):
             source=pb.GUARD_SOURCE_NAV,
             action=pb.GUARD_ACTION_STOP if stop else pb.GUARD_ACTION_TWIST,
             operation_id=operation_id,
-            sequence=sequence,
             issued_monotonic_ns=issued,
             deadline_monotonic_ns=deadline,
         ))
@@ -131,7 +112,7 @@ class MotionDispatchDeadlineContractTests(unittest.TestCase):
             body.stop.SetInParent()
         else:
             body.twist.CopyFrom(pb.TwistCommand(linear_x_mps=0.2, angular_z_rps=0.1))
-        return seal_request(request)
+        return request
 
     def handle(self, request):
         response = self.core.handle(request, self.peer)
@@ -143,7 +124,7 @@ class MotionDispatchDeadlineContractTests(unittest.TestCase):
     def assert_boundary_applied(self, receive_offset):
         issued = self.clock.ns
         deadline = issued + 100
-        request = self.command("twist:boundary", 1, issued, deadline)
+        request = self.command("twist:boundary", issued, deadline)
         self.clock.ns = deadline + receive_offset
         response = self.handle(request)
         self.assertFalse(response.result.HasField("error"))
@@ -153,18 +134,19 @@ class MotionDispatchDeadlineContractTests(unittest.TestCase):
         self.assertEqual(len(self.actuator.motion_calls), 1)
         self.assertEqual(self.actuator.zero_calls, self.initial_zero_calls)
 
-    def assert_following_zero_usable(self, sequence):
+    def assert_following_zero_usable(self):
         now = self.clock.ns
         request = self.command(
-            "stop:after-deadline", sequence, now, now + MAX_COMMAND_DEADLINE_NS, stop=True,
+            "stop:after-deadline", now, now + MAX_COMMAND_DEADLINE_NS, stop=True,
         )
+        zero_calls = self.actuator.zero_calls
         response = self.handle(request)
         self.assertFalse(response.result.HasField("error"))
         self.assertEqual(response.result.ack, pb.ACK_CODE_ZEROED)
         self.assertEqual(response.result.lease, pb.LEASE_STATE_ACTIVE)
         self.assertTrue(response.zero_ack.zero_ack_id)
         self.assertEqual(response.zero_ack.applied_monotonic_ns, now)
-        self.assertEqual(self.actuator.zero_calls, self.initial_zero_calls + 1)
+        self.assertEqual(self.actuator.zero_calls, zero_calls + 1)
 
     def test_receiving_at_deadline_minus_one_ns_applies_once(self):
         self.assert_boundary_applied(-1)
@@ -175,7 +157,7 @@ class MotionDispatchDeadlineContractTests(unittest.TestCase):
     def test_receiving_after_deadline_rejects_without_actuation_and_allows_later_zero(self):
         issued = self.clock.ns
         deadline = issued + 100
-        request = self.command("twist:expired", 1, issued, deadline)
+        request = self.command("twist:expired", issued, deadline)
         self.clock.ns = deadline + 1
         response = self.handle(request)
         self.assertEqual(response.result.error.code, "DEADLINE_EXCEEDED")
@@ -186,19 +168,19 @@ class MotionDispatchDeadlineContractTests(unittest.TestCase):
         self.assertFalse(response.HasField("zero_ack"))
         self.assertEqual(self.actuator.motion_calls, [])
         self.assertEqual(self.actuator.zero_calls, self.initial_zero_calls)
-        self.assert_following_zero_usable(2)
+        self.assert_following_zero_usable()
         self.assertEqual(self.actuator.motion_calls, [])
 
     def test_expiry_recovers_with_exact_zero_twist_applied_path(self):
         issued = self.clock.ns
-        request = self.command("twist:expired-before-zero", 1, issued, issued + 100)
+        request = self.command("twist:expired-before-zero", issued, issued + 100)
         self.clock.ns = issued + 101
         self.assertEqual(self.handle(request).result.error.code, "DEADLINE_EXCEEDED")
         self.assertEqual(self.actuator.motion_calls, [])
-        request = self.command("twist:zero-after-expiry", 2, self.clock.ns,
+        request = self.command("twist:zero-after-expiry", self.clock.ns,
                                self.clock.ns + MAX_COMMAND_DEADLINE_NS)
         request.submit_motion_command.twist.CopyFrom(pb.TwistCommand())
-        response = self.handle(seal_request(request))
+        response = self.handle(request)
         self.assertFalse(response.result.HasField("error"))
         self.assertEqual(response.result.ack, pb.ACK_CODE_APPLIED)
         self.assertEqual(response.result.lease, pb.LEASE_STATE_ACTIVE)
@@ -210,28 +192,26 @@ class MotionDispatchDeadlineContractTests(unittest.TestCase):
         self.assertEqual(applied.twist, pb.TwistCommand())
         self.assertEqual(self.actuator.zero_calls, self.initial_zero_calls)
 
-    def test_expired_duplicate_returns_historical_applied_without_reapplying(self):
+    def test_expired_duplicate_stop_returns_original_zero_without_reapplying(self):
         issued = self.clock.ns
         deadline = issued + 100
-        request = self.command("twist:duplicate", 1, issued, deadline)
+        request = self.command("stop:duplicate", issued, deadline, stop=True)
         self.clock.ns = deadline - 1
         applied = self.handle(request)
-        self.assertEqual(applied.result.ack, pb.ACK_CODE_APPLIED)
+        self.assertEqual(applied.result.ack, pb.ACK_CODE_ZEROED)
         self.assertFalse(applied.result.HasField("error"))
         original_body = request.submit_motion_command.SerializeToString(deterministic=True)
-        original_calls = list(self.actuator.motion_calls)
-        self.assertEqual(len(original_calls), 1)
+        zero_calls = self.actuator.zero_calls
         self.clock.ns = deadline + 1
-        # 仅传输相关标识不同；已密封的操作、截止、序列和命令完全相同。
+        # 停车的已完成操作重试沿原回执，不因新的传输标识再次调用执行器。
         request.request_id = "request:duplicate-after-deadline"
         replay = self.handle(request)
         self.assertEqual(request.submit_motion_command.SerializeToString(deterministic=True), original_body)
         self.assertEqual(replay.SerializeToString(deterministic=True), applied.SerializeToString(deterministic=True))
         self.assertEqual(replay.applied_monotonic_ns, deadline - 1)
-        self.assertEqual(self.actuator.motion_calls, original_calls)
-        self.assertEqual(self.actuator.zero_calls, self.initial_zero_calls)
-        self.assert_following_zero_usable(2)
-        self.assertEqual(self.actuator.motion_calls, original_calls)
+        self.assertEqual(self.actuator.motion_calls, [])
+        self.assertEqual(self.actuator.zero_calls, zero_calls)
+        self.assert_following_zero_usable()
 
 
 if __name__ == "__main__":

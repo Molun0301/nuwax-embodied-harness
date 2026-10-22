@@ -36,11 +36,9 @@ import json, os, signal, sys, threading, time, uuid
 from pathlib import Path
 from services.navigation.motion_safety_guard.actor import GuardActor
 from services.navigation.motion_safety_guard.core import MotionGuardCore
-from services.navigation.motion_safety_guard.epoch import EpochRecord, EpochStore, ProvisionRecord, atomic_write_record
 from services.navigation.motion_safety_guard.server import MotionGuardUnixServer
 
 root = Path(sys.argv[1])
-digest = "sha256:" + "4" * 64
 
 def append(name, value):
     with (root / name).open("a", encoding="ascii") as stream:
@@ -49,12 +47,12 @@ def append(name, value):
 
 class SimulatedActuator:
     is_configured = True
-    actuator_symbols_sha256 = digest
     def apply_motion(self, request):
         assert request.HasField("twist"), "fixture only supports navigation twist"
         t = request.twist
         append("actuator.jsonl", {"at":time.monotonic_ns(), "twist":[t.linear_x_mps,t.linear_y_mps,t.angular_z_rps],
             "operation_id":request.envelope.operation_id,"lease_id":request.envelope.tuple.lease_id})
+        return False
     def zero(self):
         append("actuator.jsonl", {"at":time.monotonic_ns(),"twist":[0.0,0.0,0.0],"operation_id":"","lease_id":0})
     def execute_sport(self, command):
@@ -62,12 +60,7 @@ class SimulatedActuator:
     def switch_mode(self, command):
         raise AssertionError("generic fixture has no vendor mode")
 
-provision = root / "provision.json"
-epoch_path = root / "epoch.json"
-atomic_write_record(provision, ProvisionRecord.create(instance_id=str(uuid.uuid4())).to_document(), mode=0o400)
-atomic_write_record(epoch_path, EpochRecord.initial(actuator_symbols_sha256=digest).to_document(), mode=0o600)
-store = EpochStore(provision_path=provision, epoch_path=epoch_path)
-core = MotionGuardCore(epoch=store.advance_boot(), epoch_store=store, actuator=SimulatedActuator())
+core = MotionGuardCore(actuator=SimulatedActuator())
 core.initialize_zero_fence()
 server = MotionGuardUnixServer(socket_path=root / "guard.sock",actor=GuardActor(core),socket_gid=os.getegid())
 stop = threading.Event()
@@ -422,7 +415,7 @@ async fn submit_goal(client: &mut crate::proto::geometry_runtime_client::Geometr
             orientation:Some(Quat{x:0.0,y:0.0,z:(yaw/2.0).sin(),w:(yaw/2.0).cos()}),
             frame_id:"map".into(),timestamp_ns:now_ns(),..Default::default()}),
         frame_id:"map".into(),goal_id:id.into(),
-        motion_guard_generation:ready.generation,motion_guard_boot_nonce:ready.boot_nonce,
+        motion_guard_boot_nonce:ready.boot_nonce,
         motion_stop_generation:ready.motion_stop_generation,
         position_tolerance_m:Some(POSITION_TOLERANCE),yaw_tolerance_rad:Some(YAW_TOLERANCE),
         ..Default::default()
@@ -679,7 +672,9 @@ async fn run_composition(root:&Path) {
         let admitted=submit_goal(&mut client,&guard.socket(),"restored-cancel",2.4,0.35).await;
         let cancel_goal=observed_goal(&readers.ledger,"restored-cancel").await;
         moving_evidence(&readers.ledger,live,&guard,&cancel_goal,baseline).await;
-        let cancel=CancelNavigationRequest {goal_id:admitted.goal_id,
+        let cancel=CancelNavigationRequest {
+global_stop_confirmation: None,
+goal_id:admitted.goal_id,
             owner_kind:admitted.owner_kind,parent_request_id:admitted.parent_request_id,
             goal_generation:admitted.goal_generation,producer_runtime_generation:admitted.producer_runtime_generation};
         let pending=client.cancel_navigation(cancel.clone()).await.unwrap().into_inner();

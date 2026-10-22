@@ -15,10 +15,9 @@ ctx.motion_guard facade + 参数校验，不持有独立 client 或 driver SDK �
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, Optional, TypeVar
+from typing import Any, Dict, Optional
 
 from core.errors import GatewayError, MotionGuardFacadeError
-from core.safety_guard import MotionStopGenerationError
 from services.navigation.motion_guard_client import ModeSwitchConfirmation
 from services.navigation.proto_gen import motion_guard_pb2 as pb
 from skills.common import params
@@ -59,60 +58,41 @@ _CONTROL_MODES = {
     "low": pb.CONTROL_MODE_LOW_LEVEL,
 }
 MOTION_ADMISSION_ARGUMENT = "_motion_admission"
-_T = TypeVar("_T")
 
 
 def _guard_error(capability_name: str, error: MotionGuardFacadeError) -> GatewayError:
-    return GatewayError(
-        f"motion guard rejected {capability_name}: {error}",
-        error_code="motion_guard_unavailable",
-        http_status=503,
-        jsonrpc_code=-32010,
-        details={
-            "capability_name": capability_name,
-            "guard_error_type": type(error).__name__,
-        },
-    )
+    failures = []
+    pending = [error]
+    seen = set()
+    error_code = None
+    while pending and len(failures) < 8:
+        current = pending.pop(0)
+        if not isinstance(current, BaseException) or id(current) in seen:
+            continue
+        seen.add(id(current))
+        detail = {"type": type(current).__name__, "message": str(current)[:1000]}
+        for name in ("code", "operation", "operation_id"):
+            value = getattr(current, name, None)
+            if value is not None:
+                detail[name] = str(value)[:256]
+        if error_code is None and detail.get("code"):
+            error_code = detail["code"]
+        failures.append(detail)
+        pending.extend((current.__cause__, current.__context__,
+                        getattr(current, "cause", None), getattr(current, "prior_failure", None)))
+    return GatewayError(f"motion guard rejected {capability_name}: {error}",
+        error_code=error_code or "motion_guard_unavailable", http_status=503, jsonrpc_code=-32010,
+        details={"capability_name": capability_name, "guard_error_type": type(error).__name__,
+                 "guard_failures": failures})
 
 
 def _require_motion_admission(payload: Dict[str, Any], capability_name: str):
     admission = payload.get(MOTION_ADMISSION_ARGUMENT)
     if admission is None:
-        raise RuntimeError(
-            f"{capability_name} requires a request-scoped motion admission"
-        )
-    if getattr(admission, "capability_name", None) != capability_name:
-        raise RuntimeError(
-            "motion admission capability mismatch: "
-            f"expected={capability_name} "
-            f"actual={getattr(admission, 'capability_name', None)}"
-        )
-    if getattr(admission, "proof", None) is None:
-        raise RuntimeError("motion admission is missing its guard proof")
+        raise RuntimeError(f"{capability_name} requires a request-scoped motion admission")
     return admission
 
 
-def _submit_with_admission(
-    ctx: SkillContext,
-    admission,
-    operation: Callable[[], _T],
-) -> _T:
-    try:
-        with ctx.safety_guard.motion_submission(
-            admission.motion_stop_generation
-        ):
-            return operation()
-    except MotionStopGenerationError as exc:
-        raise GatewayError(
-            "该运动请求已被更新的全局停车操作取消。",
-            error_code="motion_request_cancelled",
-            http_status=409,
-            jsonrpc_code=-32000,
-            details={
-                "expected_motion_stop_generation": exc.expected,
-                "current_motion_stop_generation": exc.current,
-            },
-        ) from exc
 
 
 def _command_result(confirmation: Any) -> Dict[str, Any]:
@@ -192,15 +172,11 @@ def handle_execute_sport_command(
         )
     admission = _require_motion_admission(payload, "execute_sport_command")
     try:
-        confirmation = _submit_with_admission(
-            ctx,
-            admission,
-            lambda: ctx.motion_guard.execute_sport(
+        confirmation = ctx.motion_guard.execute_sport(
                 action_value,
                 proof=admission.proof,
                 enabled=enabled,
-            ),
-        )
+            )
     except MotionGuardFacadeError as exc:
         raise _guard_error("execute_sport_command", exc) from exc
     return {"code": 0, "result": _command_result(confirmation), "action": action}
@@ -223,16 +199,12 @@ def handle_set_body_pose(
     yaw = params.optional_float(payload, "yaw", 0.0)
     admission = _require_motion_admission(payload, "set_body_pose")
     try:
-        confirmation = _submit_with_admission(
-            ctx,
-            admission,
-            lambda: ctx.motion_guard.set_body_pose(
+        confirmation = ctx.motion_guard.set_body_pose(
                 roll,
                 pitch,
                 yaw,
                 proof=admission.proof,
-            ),
-        )
+            )
     except MotionGuardFacadeError as exc:
         raise _guard_error("set_body_pose", exc) from exc
     return {"code": 0, "result": _command_result(confirmation)}
@@ -260,14 +232,10 @@ def handle_set_speed_level(
         )
     admission = _require_motion_admission(payload, "set_speed_level")
     try:
-        confirmation = _submit_with_admission(
-            ctx,
-            admission,
-            lambda: ctx.motion_guard.set_speed_level(
+        confirmation = ctx.motion_guard.set_speed_level(
                 level,
                 proof=admission.proof,
-            ),
-        )
+            )
     except MotionGuardFacadeError as exc:
         raise _guard_error("set_speed_level", exc) from exc
     return {
@@ -300,14 +268,10 @@ def handle_switch_control_mode(
         )
     admission = _require_motion_admission(payload, "switch_control_mode")
     try:
-        confirmation = _submit_with_admission(
-            ctx,
-            admission,
-            lambda: ctx.motion_guard.switch_mode(
+        confirmation = ctx.motion_guard.switch_mode(
                 mode_value,
                 proof=admission.proof,
-            ),
-        )
+            )
     except MotionGuardFacadeError as exc:
         raise _guard_error("switch_control_mode", exc) from exc
     return {"code": 0, "result": _mode_result(confirmation), "mode": mode}
@@ -335,14 +299,10 @@ def handle_set_obstacle_avoidance(
         )
     admission = _require_motion_admission(payload, "set_obstacle_avoidance")
     try:
-        confirmation = _submit_with_admission(
-            ctx,
-            admission,
-            lambda: ctx.motion_guard.set_obstacle_policy(
+        confirmation = ctx.motion_guard.set_obstacle_policy(
                 enabled,
                 proof=admission.proof,
-            ),
-        )
+            )
     except MotionGuardFacadeError as exc:
         raise _guard_error("set_obstacle_avoidance", exc) from exc
     return {

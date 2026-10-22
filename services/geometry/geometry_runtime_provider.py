@@ -5,6 +5,11 @@ Rust 运行时是主要的平台几何交互层（替代旧 nuwax-ros-bridge）�
 """
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from services.navigation.motion_guard_client import StopAllMotionConfirmation
+
 from services.geometry.planar_archive import read_planar_structure
 from services.geometry.checkpoint_payload import FrozenPayload, payload_chunks, MAX_PLANAR_ARCHIVE_BYTES
 from core.config_values import runtime_value
@@ -87,7 +92,6 @@ _PUBLIC_NAV_OWNER_KIND = int(pb2.NAVIGATION_OWNER_KIND_PUBLIC_NAV)
 _EXPLORATION_CHILD_NAV_OWNER_KIND = int(
     pb2.NAVIGATION_OWNER_KIND_EXPLORATION_CHILD
 )
-_MAX_MOTION_ADMISSION_GENERATION = (1 << 63) - 1
 _SUPPORTED_MAPPING_BACKEND_KINDS = frozenset({"raytracing", "voxel", "slam_toolbox"})
 _RELOCALIZE_SUCCESS_DISPOSITIONS = frozenset(
     {
@@ -97,44 +101,21 @@ _RELOCALIZE_SUCCESS_DISPOSITIONS = frozenset(
 )
 
 
-def _decode_motion_admission_proof(value: object) -> Tuple[int, bytes, int]:
-    """Decode the request-level proof without querying motion readiness again."""
+def _decode_motion_admission_proof(value: object) -> Tuple[bytes, int]:
+    """仅转换传输表示；凭据是否有效由守卫申请租约时判定。"""
+    boot_nonce = bytes.fromhex(value["boot_nonce_hex"])
+    if len(boot_nonce) != 16:
+        raise ValueError("motion_admission.boot_nonce_hex must encode exactly 16 bytes")
+    return boot_nonce, value["motion_stop_generation"]
 
-    if not isinstance(value, dict):
-        raise ValueError("motion_admission metadata is required")
 
-    def require_generation(name: str, *, allow_zero: bool) -> int:
-        raw = value.get(name)
-        if isinstance(raw, bool) or not isinstance(raw, int):
-            raise ValueError("motion_admission.%s must be an integer" % name)
-        minimum = 0 if allow_zero else 1
-        if raw < minimum or raw > _MAX_MOTION_ADMISSION_GENERATION:
-            raise ValueError(
-                "motion_admission.%s must be in [%d, %d]"
-                % (name, minimum, _MAX_MOTION_ADMISSION_GENERATION)
-            )
-        return raw
-
-    boot_nonce_hex = value.get("boot_nonce_hex")
-    if not isinstance(boot_nonce_hex, str) or len(boot_nonce_hex) != 32:
-        raise ValueError(
-            "motion_admission.boot_nonce_hex must encode exactly 16 bytes"
-        )
-    try:
-        boot_nonce = bytes.fromhex(boot_nonce_hex)
-    except ValueError as exc:
-        raise ValueError(
-            "motion_admission.boot_nonce_hex must be hexadecimal"
-        ) from exc
-    if len(boot_nonce) != 16 or not any(boot_nonce):
-        raise ValueError(
-            "motion_admission.boot_nonce_hex must encode a non-zero 16-byte nonce"
-        )
-
-    return (
-        require_generation("generation", allow_zero=False),
-        boot_nonce,
-        require_generation("motion_stop_generation", allow_zero=True),
+def _ordinary_global_stop_confirmation_proto(confirmation: StopAllMotionConfirmation):
+    """把同一次普通全局停车回执无损传给原生拥有方。"""
+    return pb2.OrdinaryGlobalStopConfirmation(
+        operation_id=confirmation.operation_id,
+        zero_ack_id=confirmation.zero.zero_ack_id,
+        applied_monotonic_ns=confirmation.zero.applied_monotonic_ns,
+        stationary_confirmed=confirmation.zero.stationary_confirmed,
     )
 
 
@@ -1101,7 +1082,6 @@ def _coalesced_navigation_updates(call):
             _navigation_lease_from_message(update),
             int(update.planner_runtime_generation),
             int(update.runtime_generation),
-            int(update.guard_generation),
             status if status in _NAV_TERMINAL_STATUS or status not in _NAV_STREAM_STATUS else "progress",
             str(update.cancel_phase),
             int(update.cancel_generation),
@@ -1742,7 +1722,6 @@ def _navigation_state_typed_metadata(update) -> Dict[str, Any]:
         "actuator_zeroed": bool(update.actuator_zeroed),
         "reason_code": str(update.reason_code),
         "runtime_generation": int(update.runtime_generation),
-        "guard_generation": int(update.guard_generation),
         "sink_ready": bool(update.sink_ready),
         "planner_map_frame": str(update.planner_map_frame),
         "planner_pose_frame": str(update.planner_pose_frame),
@@ -1900,26 +1879,6 @@ def _normalize_frame(frame_id: str) -> str:
     return str(frame_id or "").strip().lstrip("/")
 
 
-def _exploration_child_lease_address(lease: Any) -> Optional[_NavigationLease]:
-    """Read the assigned address using the existing RPC scalar normalization."""
-    if not isinstance(lease, dict):
-        return None
-    try:
-        session_id = str(lease.get("session_id") or "")
-        parent_request_id = str(lease.get("parent_request_id") or "")
-        owner_kind = int(lease.get("owner_kind") or 0)
-        goal_generation = int(lease.get("goal_generation") or 0)
-        producer_generation = int(lease.get("producer_runtime_generation") or 0)
-    except (TypeError, ValueError, OverflowError):
-        return None
-    if (
-        not session_id.strip() or not parent_request_id.strip()
-        or owner_kind != _EXPLORATION_CHILD_NAV_OWNER_KIND
-        or not 0 < goal_generation < (1 << 64)
-        or not 0 < producer_generation < (1 << 64)
-    ):
-        return None
-    return (session_id, owner_kind, parent_request_id, goal_generation, producer_generation)
 
 
 def _exploration_child_lease_to_dict(lease: Any) -> Dict[str, Any]:
@@ -1932,53 +1891,8 @@ def _exploration_child_lease_to_dict(lease: Any) -> Dict[str, Any]:
     }
 
 
-def _exploration_reconciliation_ack_fields(
-    *,
-    child_lease: Optional[Dict[str, Any]] = None,
-    child_lease_fingerprint: str = "",
-) -> Dict[str, Any]:
-    """Choose exactly one assigned address or stored legacy opaque identifier."""
-    if child_lease is not None:
-        address = _exploration_child_lease_address(child_lease)
-        if child_lease_fingerprint or address is None:
-            raise ValueError("ownership receipt has an invalid or mixed child identity")
-        return {"child_lease": dict(zip((
-            "session_id", "owner_kind", "parent_request_id", "goal_generation",
-            "producer_runtime_generation",
-        ), address))}
-    if (
-        not isinstance(child_lease_fingerprint, str)
-        or len(child_lease_fingerprint) != 64
-        or any(ch not in "0123456789abcdef" for ch in child_lease_fingerprint)
-    ):
-        raise ValueError("ownership receipt lacks its stored legacy identifier")
-    return {"child_lease_fingerprint": child_lease_fingerprint}
 
 
-def _exploration_receipt_matches_child(
-    receipt: Any,
-    *,
-    child_lease: Optional[Dict[str, Any]] = None,
-    child_lease_fingerprint: str = "",
-) -> bool:
-    """Compare already projected receipt addresses, not a second format gate."""
-    if not isinstance(receipt, dict):
-        return False
-    observed_child = receipt.get("child_lease")
-    observed_legacy = receipt.get("child_lease_fingerprint") or ""
-    if child_lease is not None:
-        return bool(
-            not child_lease_fingerprint and not observed_legacy
-            and isinstance(observed_child, dict)
-            and all(child_lease.get(name) == observed_child.get(name) for name in (
-                "session_id", "owner_kind", "parent_request_id", "goal_generation",
-                "producer_runtime_generation",
-            ))
-        )
-    return bool(
-        observed_child is None and child_lease_fingerprint
-        and observed_legacy == child_lease_fingerprint
-    )
 
 
 def _exploration_state_to_dict(resp: Any) -> Dict[str, Any]:
@@ -1991,48 +1905,6 @@ def _exploration_state_to_dict(resp: Any) -> Dict[str, Any]:
     child_lease = None
     if resp.HasField("child_lease"):
         child_lease = _exploration_child_lease_to_dict(resp.child_lease)
-    global_stop_reconciliation = None
-    if resp.HasField("global_stop_reconciliation"):
-        reconciliation = resp.global_stop_reconciliation
-        global_stop_reconciliation = {
-            "eligible": bool(reconciliation.eligible),
-            "cancel_generation": int(reconciliation.cancel_generation),
-            "recovery_correlation": str(
-                reconciliation.recovery_correlation or ""
-            ),
-            "admission_guard_generation": int(
-                reconciliation.admission_guard_generation
-            ),
-            "admission_guard_boot_nonce": list(
-                reconciliation.admission_guard_boot_nonce
-            ),
-            "admission_motion_stop_generation": int(
-                reconciliation.admission_motion_stop_generation
-            ),
-        }
-    ownership_reconciliation_receipt = None
-    if resp.HasField("ownership_reconciliation_receipt"):
-        receipt = resp.ownership_reconciliation_receipt
-        ownership_reconciliation_receipt = {
-            "cause": str(receipt.cause or ""),
-            "recovery_correlation": str(
-                receipt.recovery_correlation or ""
-            ),
-            "parent_request_id": str(receipt.parent_request_id or ""),
-            "exploration_generation": int(receipt.exploration_generation),
-            "cancel_generation": int(receipt.cancel_generation),
-            "commit_disposition": str(receipt.commit_disposition or ""),
-        }
-        if receipt.HasField("child_lease"):
-            if receipt.child_lease_fingerprint:
-                raise ValueError("ownership receipt has mixed child identities")
-            ownership_reconciliation_receipt["child_lease"] = (
-                _exploration_child_lease_to_dict(receipt.child_lease)
-            )
-        else:
-            ownership_reconciliation_receipt["child_lease_fingerprint"] = str(
-                receipt.child_lease_fingerprint or ""
-            )
     return {
         "mission_progress": json.loads(resp.mission_progress_json) if resp.mission_progress_json else None,
         "status": resp.status,
@@ -2046,11 +1918,7 @@ def _exploration_state_to_dict(resp: Any) -> Dict[str, Any]:
         "child_task_id": str(resp.child_task_id),
         "exploration_generation": int(resp.exploration_generation),
         "child_lease": child_lease,
-        "rollover_recovery_eligible": bool(resp.rollover_recovery_eligible),
-        "global_stop_reconciliation": global_stop_reconciliation,
-        "ownership_reconciliation_receipt": (
-            ownership_reconciliation_receipt
-        ),
+        "parking_pending": bool(resp.parking_pending),
     }
 
 
@@ -2401,9 +2269,9 @@ class GeometryRuntimeProvider:
         return None
 
     def _navigation_has_unsettled_owner_locked(self) -> bool:
-        """Cloud preflight also protects the single historical unresolved fact."""
+        """仅当前连接的真实未决租约阻止另一地点目标。"""
         return bool(
-            self._last_nav_metadata.get("ownership_retained") is True
+            self._navigation_obligation_locked() is not None
             or (_is_canonical_public_navigation_lease(self._current_navigation_lease_locked())
                 and self._last_nav_status.strip().lower()
                     in {"accepted", "pending", "planning", "running", "unconfirmed"})
@@ -5102,7 +4970,6 @@ class GeometryRuntimeProvider:
             committed_occupancy_commit_id=pb2.MappingCommitIdentity(
                 boot_nonce=bytes.fromhex(commit["boot_nonce"]), sequence=commit["sequence"]),
             committed_occupancy_source_timestamp_ns=authority["committed_occupancy_source_timestamp_ns"],
-            motion_guard_generation=int(motion_admission["guard_generation"]),
             motion_guard_boot_nonce=bytes(motion_admission["guard_boot_nonce"]),
             motion_stop_generation=int(motion_admission["motion_stop_generation"]),
         )
@@ -5558,10 +5425,6 @@ class GeometryRuntimeProvider:
             ):
                 return False
             with self._nav_state_lock:
-                if (self._last_nav_metadata.get("ownership_retained") is True
-                        and self._last_nav_metadata.get("authority_current") is False):
-                    # A new stream may not adopt or hide historical responsibility.
-                    return False
                 if (self._navigation_obligation_locked() is not None
                         and incoming_lease != self._current_navigation_lease_locked()):
                     # Includes foreign exploration overlays and their empty-IDLE clear.
@@ -5634,7 +5497,15 @@ class GeometryRuntimeProvider:
 
                 current_lease = self._current_navigation_lease_locked()
                 current_goal_id = current_lease[0] or None
-                lease_is_exact = bool(
+                # 当前流令牌已核验；无在途命令、无当前租约时采纳后端真实初始身份。
+                unbound_current_connection = bool(
+                    not _is_canonical_public_navigation_lease(current_lease)
+                    and self._nav_inflight_command_token is None
+                    and self._last_nav_goal_command_generation == self._nav_command_generation
+                    and (_is_canonical_public_navigation_lease(incoming_lease)
+                         or (incoming_lease == ("", 0, "", 0, 0) and normalized_status == "idle"))
+                )
+                lease_is_exact = bool(unbound_current_connection or (
                     incoming_lease == current_lease
                     and (
                         _is_canonical_public_navigation_lease(current_lease)
@@ -5644,7 +5515,7 @@ class GeometryRuntimeProvider:
                             and self._nav_inflight_command_token is None
                         )
                     )
-                )
+                ))
                 current_status = self._nav_status_to_enum(
                     self._last_nav_status
                 )
@@ -5683,7 +5554,7 @@ class GeometryRuntimeProvider:
                     and _navigation_complete_proof_upgrade(self._last_nav_metadata,
                         int(self._last_nav_timestamp_ns or 0), update))
                 status_is_monotonic = bool(
-                    proof_upgrade or stream_disconnected_placeholder
+                    unbound_current_connection or proof_upgrade or stream_disconnected_placeholder
                     or _navigation_status_can_follow(
                         self._last_nav_status,
                         status,
@@ -6063,7 +5934,6 @@ class GeometryRuntimeProvider:
         command_stub = None
         try:
             (
-                motion_guard_generation,
                 motion_guard_boot_nonce,
                 motion_stop_generation,
             ) = _decode_motion_admission_proof(
@@ -6107,7 +5977,6 @@ class GeometryRuntimeProvider:
                 owner_kind=_PUBLIC_NAV_OWNER_KIND,
                 parent_request_id=canonical_parent_request_id,
                 goal_generation=0,
-                motion_guard_generation=motion_guard_generation,
                 motion_guard_boot_nonce=motion_guard_boot_nonce,
                 motion_stop_generation=motion_stop_generation,
             )
@@ -6197,6 +6066,7 @@ class GeometryRuntimeProvider:
         request_id: Optional[str] = None,
         *,
         deadline_monotonic: Optional[float] = None,
+        global_stop_confirmation: Optional[StopAllMotionConfirmation] = None,
     ) -> bool:
         """NavigationProvider 协议 shim：定向取消当前 exact goal。"""
         self._raise_if_stopping("cancel_goal")
@@ -6241,9 +6111,6 @@ class GeometryRuntimeProvider:
                     return False
                 command_stub = self._stub
                 with self._nav_state_lock:
-                    if (self._last_nav_metadata.get("ownership_retained") is True
-                            and self._last_nav_metadata.get("authority_current") is False):
-                        return False
                     active_lease = self._current_navigation_lease_locked()
                     active_goal_id = active_lease[0]
                     active_status = self._nav_status_to_enum(
@@ -6252,13 +6119,13 @@ class GeometryRuntimeProvider:
                 if (
                     active_goal_id != exact_goal_id
                     or not _is_canonical_public_navigation_lease(active_lease)
-                    or active_status
+                    or (global_stop_confirmation is None and active_status
                     in {
                         NavigationStatus.IDLE,
                         NavigationStatus.SUCCEEDED,
                         NavigationStatus.FAILED,
                         NavigationStatus.CANCELLED,
-                    }
+                    })
                 ):
                     LOGGER.warning(
                         "GeometryRuntimeProvider 拒绝 stale 定向取消：requested_goal_id=%s active_goal_id=%s status=%s",
@@ -6287,6 +6154,9 @@ class GeometryRuntimeProvider:
                 goal_generation=active_lease[3],
                 producer_runtime_generation=active_lease[4],
             )
+            if global_stop_confirmation is not None:
+                req.global_stop_confirmation.CopyFrom(
+                    _ordinary_global_stop_confirmation_proto(global_stop_confirmation))
             rpc_timeout = _exploration_rpc_timeout(
                 deadline_monotonic,
                 "CancelNavigation",
@@ -6676,7 +6546,6 @@ class GeometryRuntimeProvider:
             raise _missing_exploration_stub_error("StartExploration")
         try:
             (
-                motion_guard_generation,
                 motion_guard_boot_nonce,
                 motion_stop_generation,
             ) = _decode_motion_admission_proof(motion_admission)
@@ -6706,7 +6575,6 @@ class GeometryRuntimeProvider:
                 boundary_frame_id=DEFAULT_MAP_FRAME if proto_segments else "",
                 max_navigation_retries=max(0, int(max_navigation_retries)),
                 blacklist_radius_m=max(0.0, float(blacklist_radius_m)),
-                motion_guard_generation=motion_guard_generation,
                 motion_guard_boot_nonce=motion_guard_boot_nonce,
                 motion_stop_generation=motion_stop_generation,
             )
@@ -6772,6 +6640,8 @@ class GeometryRuntimeProvider:
         *,
         request_id: str = "",
         deadline_monotonic: Optional[float] = None,
+        global_stop_confirmation: Optional[StopAllMotionConfirmation] = None,
+        expected_exploration_generation: Optional[int] = None,
     ) -> Dict[str, Any]:
         """停止探索。
 
@@ -6783,6 +6653,11 @@ class GeometryRuntimeProvider:
             raise _missing_exploration_stub_error("StopExploration")
         try:
             req = pb2.StopExplorationRequest(request_id=request_id)
+            if global_stop_confirmation is not None:
+                req.global_stop_confirmation.CopyFrom(
+                    _ordinary_global_stop_confirmation_proto(global_stop_confirmation))
+            if expected_exploration_generation is not None:
+                req.expected_exploration_generation = expected_exploration_generation
             rpc_timeout = _exploration_rpc_timeout(
                 deadline_monotonic,
                 "StopExploration",
@@ -6792,209 +6667,8 @@ class GeometryRuntimeProvider:
         except grpc.RpcError as e:
             raise _exploration_rpc_error("StopExploration", e) from e
 
-    def recover_exploration_after_navigation_rollover(
-        self,
-        *,
-        request_id: str,
-        exploration_generation: int,
-        child_lease: Dict[str, Any],
-        expected_navigation_runtime_generation: int,
-        observed_navigation_runtime_generation: int,
-        guard_proof: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        """Release retained exploration-child ownership after a nav rollover."""
 
-        self._raise_if_stopping("recover_exploration_after_navigation_rollover")
-        stub = self._stub
-        if stub is None:
-            raise _missing_exploration_stub_error(
-                "RecoverExplorationAfterNavigationRollover"
-            )
-        try:
-            req = pb2.RecoverExplorationAfterNavigationRolloverRequest(
-                request_id=str(request_id or ""),
-                exploration_generation=int(exploration_generation),
-                child_lease=pb2.ExplorationChildLease(
-                    session_id=str(child_lease.get("session_id") or ""),
-                    owner_kind=int(child_lease.get("owner_kind") or 0),
-                    parent_request_id=str(child_lease.get("parent_request_id") or ""),
-                    goal_generation=int(child_lease.get("goal_generation") or 0),
-                    producer_runtime_generation=int(
-                        child_lease.get("producer_runtime_generation") or 0
-                    ),
-                ),
-                expected_navigation_runtime_generation=int(
-                    expected_navigation_runtime_generation
-                ),
-                observed_navigation_runtime_generation=int(
-                    observed_navigation_runtime_generation
-                ),
-                guard_proof=pb2.ExplorationRecoveryGuardProof(
-                    stop_operation_id=str(
-                        guard_proof.get("stop_operation_id") or ""
-                    ),
-                    guard_generation=int(
-                        guard_proof.get("guard_generation") or 0
-                    ),
-                    guard_boot_nonce=bytes(
-                        guard_proof.get("guard_boot_nonce") or b""
-                    ),
-                    motion_stop_generation=int(
-                        guard_proof.get("motion_stop_generation") or 0
-                    ),
-                    zero_ack_id=str(guard_proof.get("zero_ack_id") or ""),
-                    zero_applied_monotonic_ns=int(
-                        guard_proof.get("zero_applied_monotonic_ns") or 0
-                    ),
-                    recovery_fence_token=bytes(
-                        guard_proof.get("recovery_fence_token") or b""
-                    ),
-                    recovery_correlation=str(
-                        guard_proof.get("recovery_correlation") or ""
-                    ),
-                ),
-            )
-            resp = stub.RecoverExplorationAfterNavigationRollover(
-                req,
-                timeout=max(
-                    _read_deadline_sec(),
-                    _ROLLOVER_RECOVERY_DEADLINE_SEC,
-                ),
-            )
-            return _exploration_state_to_dict(resp)
-        except grpc.RpcError as e:
-            raise _exploration_rpc_error(
-                "RecoverExplorationAfterNavigationRollover", e
-            ) from e
 
-    def reconcile_exploration_after_global_stop(
-        self,
-        *,
-        request_id: str,
-        exploration_generation: int,
-        child_lease: Dict[str, Any],
-        cancel_generation: int,
-        recovery_correlation: str,
-        admission_guard_generation: int,
-        admission_guard_boot_nonce: bytes,
-        admission_motion_stop_generation: int,
-        held_guard_proof: Dict[str, Any],
-        deadline_monotonic: Optional[float] = None,
-    ) -> Dict[str, Any]:
-        """Reconcile one exact retained child after an ordinary global stop."""
-
-        self._raise_if_stopping("reconcile_exploration_after_global_stop")
-        stub = self._stub
-        if stub is None:
-            raise _missing_exploration_stub_error(
-                "ReconcileExplorationAfterGlobalStop"
-            )
-        try:
-            request = pb2.ReconcileExplorationAfterGlobalStopRequest(
-                request_id=str(request_id or ""),
-                exploration_generation=int(exploration_generation),
-                child_lease=pb2.ExplorationChildLease(
-                    session_id=str(child_lease.get("session_id") or ""),
-                    owner_kind=int(child_lease.get("owner_kind") or 0),
-                    parent_request_id=str(child_lease.get("parent_request_id") or ""),
-                    goal_generation=int(child_lease.get("goal_generation") or 0),
-                    producer_runtime_generation=int(
-                        child_lease.get("producer_runtime_generation") or 0
-                    ),
-                ),
-                cancel_generation=int(cancel_generation),
-                recovery_correlation=str(recovery_correlation or ""),
-                admission_guard_generation=int(admission_guard_generation),
-                admission_guard_boot_nonce=bytes(
-                    admission_guard_boot_nonce or b""
-                ),
-                admission_motion_stop_generation=int(
-                    admission_motion_stop_generation
-                ),
-                held_guard_proof=pb2.ExplorationRecoveryGuardProof(
-                    stop_operation_id=str(
-                        held_guard_proof.get("stop_operation_id") or ""
-                    ),
-                    guard_generation=int(
-                        held_guard_proof.get("guard_generation") or 0
-                    ),
-                    guard_boot_nonce=bytes(
-                        held_guard_proof.get("guard_boot_nonce") or b""
-                    ),
-                    motion_stop_generation=int(
-                        held_guard_proof.get("motion_stop_generation") or 0
-                    ),
-                    zero_ack_id=str(
-                        held_guard_proof.get("zero_ack_id") or ""
-                    ),
-                    zero_applied_monotonic_ns=int(
-                        held_guard_proof.get("zero_applied_monotonic_ns") or 0
-                    ),
-                    recovery_fence_token=bytes(
-                        held_guard_proof.get("recovery_fence_token") or b""
-                    ),
-                    recovery_correlation=str(
-                        held_guard_proof.get("recovery_correlation") or ""
-                    ),
-                ),
-            )
-            rpc_timeout = _exploration_rpc_timeout(
-                deadline_monotonic,
-                "ReconcileExplorationAfterGlobalStop",
-            )
-            response = stub.ReconcileExplorationAfterGlobalStop(
-                request,
-                timeout=rpc_timeout,
-            )
-            return _exploration_state_to_dict(response)
-        except grpc.RpcError as exc:
-            raise _exploration_rpc_error(
-                "ReconcileExplorationAfterGlobalStop",
-                exc,
-            ) from exc
-
-    def acknowledge_exploration_ownership_reconciliation(
-        self,
-        *,
-        recovery_correlation: str,
-        child_lease_fingerprint: str = "",
-        child_lease: Optional[Dict[str, Any]] = None,
-        deadline_monotonic: Optional[float] = None,
-    ) -> bool:
-        """Acknowledge one durable ownership receipt after external release."""
-
-        self._raise_if_stopping(
-            "acknowledge_exploration_ownership_reconciliation"
-        )
-        stub = self._stub
-        if stub is None:
-            raise _missing_exploration_stub_error(
-                "AcknowledgeExplorationOwnershipReconciliation"
-            )
-        try:
-            identity = _exploration_reconciliation_ack_fields(
-                child_lease=child_lease,
-                child_lease_fingerprint=child_lease_fingerprint,
-            )
-            if "child_lease" in identity:
-                identity["child_lease"] = pb2.ExplorationChildLease(**identity["child_lease"])
-            request = pb2.AcknowledgeExplorationOwnershipReconciliationRequest(
-                recovery_correlation=str(recovery_correlation or ""), **identity,
-            )
-            rpc_timeout = _exploration_rpc_timeout(
-                deadline_monotonic,
-                "AcknowledgeExplorationOwnershipReconciliation",
-            )
-            response = stub.AcknowledgeExplorationOwnershipReconciliation(
-                request,
-                timeout=rpc_timeout,
-            )
-            return bool(response.acknowledged)
-        except grpc.RpcError as exc:
-            raise _exploration_rpc_error(
-                "AcknowledgeExplorationOwnershipReconciliation",
-                exc,
-            ) from exc
 
     def get_exploration_state(
         self,
@@ -7034,9 +6708,7 @@ class GeometryRuntimeProvider:
             state.get("child_task_id"),
             state.get("exploration_generation"),
             state.get("child_lease"),
-            state.get("rollover_recovery_eligible"),
-            state.get("global_stop_reconciliation"),
-            state.get("ownership_reconciliation_receipt"),
+            state.get("parking_pending"),
         )
 
     def _ensure_exploration_poll_worker(self) -> None:

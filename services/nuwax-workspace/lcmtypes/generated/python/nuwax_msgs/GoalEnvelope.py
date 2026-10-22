@@ -11,11 +11,11 @@ import geometry_msgs
 
 class GoalEnvelope(object):
 
-    __slots__ = ["schema_version", "session_id", "owner_kind", "parent_request_id", "goal_generation", "producer", "producer_epoch", "producer_runtime_generation", "committed_map_session_id", "committed_map_session_generation", "committed_map_revision", "committed_map_boot_nonce", "committed_map_commit_sequence", "committed_map_source_timestamp_ns", "committed_map_frame_id", "source_timestamp_ns", "boundary_id", "boundary_frame_id", "boundary_points_length", "boundary_points", "motion_guard_generation", "motion_guard_boot_nonce", "motion_stop_generation", "allow_reverse", "position_tolerance_m", "yaw_tolerance_rad", "body_reference_frame_id", "has_body_to_support_z", "body_to_support_z_m", "map_frame_generation", "goal"]
+    __slots__ = ["schema_version", "session_id", "owner_kind", "parent_request_id", "goal_generation", "producer", "producer_epoch", "producer_runtime_generation", "committed_map_session_id", "committed_map_session_generation", "committed_map_revision", "committed_map_boot_nonce", "committed_map_commit_sequence", "committed_map_source_timestamp_ns", "committed_map_frame_id", "source_timestamp_ns", "boundary_id", "boundary_frame_id", "boundary_points_length", "boundary_points", "motion_guard_boot_nonce", "motion_stop_generation", "allow_reverse", "position_tolerance_m", "yaw_tolerance_rad", "body_reference_frame_id", "has_body_to_support_z", "body_to_support_z_m", "map_frame_generation", "goal"]
 
-    __typenames__ = ["int32_t", "string", "int32_t", "string", "int64_t", "string", "int64_t", "int64_t", "string", "int64_t", "int64_t", "byte", "int64_t", "int64_t", "string", "int64_t", "string", "string", "int32_t", "geometry_msgs.Point", "int64_t", "byte", "int64_t", "int8_t", "double", "double", "string", "int8_t", "double", "int64_t", "geometry_msgs.PoseStamped"]
+    __typenames__ = ["int32_t", "string", "int32_t", "string", "int64_t", "string", "int64_t", "int64_t", "string", "int64_t", "int64_t", "byte", "int64_t", "int64_t", "string", "int64_t", "string", "string", "int32_t", "geometry_msgs.Point", "byte", "int64_t", "int8_t", "double", "double", "string", "int8_t", "double", "int64_t", "geometry_msgs.PoseStamped"]
 
-    __dimensions__ = [None, None, None, None, None, None, None, None, None, None, None, [16], None, None, None, None, None, None, None, ["boundary_points_length"], None, [16], None, None, None, None, None, None, None, None, None]
+    __dimensions__ = [None, None, None, None, None, None, None, None, None, None, None, [16], None, None, None, None, None, None, None, ["boundary_points_length"], [16], None, None, None, None, None, None, None, None, None]
 
     def __init__(self):
         self.schema_version = 0
@@ -58,8 +58,6 @@ class GoalEnvelope(object):
         """ LCM Type: int32_t """
         self.boundary_points = []
         """ LCM Type: geometry_msgs.Point[boundary_points_length] """
-        self.motion_guard_generation = 0
-        """ LCM Type: int64_t """
         self.motion_guard_boot_nonce = b""
         """ LCM Type: byte[16] """
         self.motion_stop_generation = 0
@@ -132,7 +130,6 @@ class GoalEnvelope(object):
         for i0 in range(self.boundary_points_length):
             assert self.boundary_points[i0]._get_packed_fingerprint() == geometry_msgs.Point._get_packed_fingerprint()
             self.boundary_points[i0]._encode_one(buf)
-        buf.write(struct.pack(">q", self.motion_guard_generation))
         buf.write(bytearray(self.motion_guard_boot_nonce[:16]))
         buf.write(struct.pack(">qbdd", self.motion_stop_generation, self.allow_reverse, self.position_tolerance_m, self.yaw_tolerance_rad))
         __body_reference_frame_id_encoded = self.body_reference_frame_id.encode('utf-8')
@@ -182,7 +179,6 @@ class GoalEnvelope(object):
         self.boundary_points = []
         for i0 in range(self.boundary_points_length):
             self.boundary_points.append(geometry_msgs.Point._decode_one(buf))
-        self.motion_guard_generation = struct.unpack(">q", buf.read(8))[0]
         self.motion_guard_boot_nonce = buf.read(16)
         self.motion_stop_generation, self.allow_reverse, self.position_tolerance_m, self.yaw_tolerance_rad = struct.unpack(">qbdd", buf.read(25))
         __body_reference_frame_id_len = struct.unpack('>I', buf.read(4))[0]
@@ -195,7 +191,7 @@ class GoalEnvelope(object):
     def _get_hash_recursive(parents):
         if GoalEnvelope in parents: return 0
         newparents = parents + [GoalEnvelope]
-        tmphash = (0x34fd110ceb7cf58f+ geometry_msgs.Point._get_hash_recursive(newparents)+ geometry_msgs.PoseStamped._get_hash_recursive(newparents)) & 0xffffffffffffffff
+        tmphash = (0x2ba3f06255e59501+ geometry_msgs.Point._get_hash_recursive(newparents)+ geometry_msgs.PoseStamped._get_hash_recursive(newparents)) & 0xffffffffffffffff
         tmphash  = (((tmphash<<1)&0xffffffffffffffff) + (tmphash>>63)) & 0xffffffffffffffff
         return tmphash
     _packed_fingerprint = None

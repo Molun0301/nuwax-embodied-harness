@@ -282,6 +282,8 @@ impl GoalLease {
 /// 当前 active goal 的内存表示。`id` 是唯一 public session id。
 #[derive(Clone)]
 pub struct ActiveGoal {
+    /// 原目标安装时的守卫单调时钟，用于限定普通全局停车的覆盖范围。
+    pub admitted_guard_clock_ns: u64,
     /// 目标点 ID(用户传或自动生成 UUID)。
     pub id: String,
     /// frame_id(`map` 默认)。
@@ -297,11 +299,11 @@ pub struct ActiveGoal {
     pub lease: GoalLease,
 }
 
-/// The original validated body owns its natural-retirement fact. An old path
-/// receipt may be retained for display without ever retiring current execution.
+/// 原始终态保存实际退休来源；自然终态和已确认普通停车均不能冒充到达。
+/// 旧路径回执可保留展示，但不会因此退休当前执行。
 struct RetainedTerminalReceipt {
     update: NavigationUpdate,
-    retired_naturally: bool,
+    retired_without_child_cancel: bool,
 }
 
 impl RetainedTerminalReceipt {
@@ -851,7 +853,7 @@ impl NavRuntimeState {
         slot.display_path = None;
         slot.terminal_receipts.push_back(RetainedTerminalReceipt {
             update: update.clone(),
-            retired_naturally: true,
+            retired_without_child_cancel: true,
         });
         while slot.terminal_receipts.len() > 32 { slot.terminal_receipts.pop_front(); }
         drop(cancel);
@@ -885,7 +887,7 @@ impl NavRuntimeState {
         // Keep the existing slot -> cancel lock order. Unknown cancel state is
         // not evidence that no transaction was admitted. This records provenance
         // only; the original measured-ZERO retirement below remains unchanged.
-        let retired_naturally = retires_active
+        let retired_without_child_cancel = retires_active
             && matches!(update.state.status.as_str(), "SUCCEEDED" | "FAILED")
             && update.feedback.cancel_generation == 0
             && self.cancel.lock().ok().is_some_and(|cancel| {
@@ -910,14 +912,14 @@ impl NavRuntimeState {
         }) {
             // A late old-path body must not replace an authoritative retirement,
             // nor inherit its fact. Keep the original body and fact together.
-            if slot.terminal_receipts[index].retired_naturally {
+            if slot.terminal_receipts[index].retired_without_child_cancel {
                 return;
             }
             slot.terminal_receipts.remove(index);
         }
         slot.terminal_receipts.push_back(RetainedTerminalReceipt {
             update: update.clone(),
-            retired_naturally,
+            retired_without_child_cancel,
         });
         while slot.terminal_receipts.len() > 32 { slot.terminal_receipts.pop_front(); }
     }
@@ -933,11 +935,11 @@ impl NavRuntimeState {
             .find(|receipt| receipt.matches(input)).map(|receipt| receipt.update.clone())
     }
 
-    /// Only this exact body actually retired execution without an admitted
-    /// cancellation. Neither an old path receipt nor present absence proves it.
-    pub(crate) async fn naturally_retired_terminal_for(&self, input: &CancelGoalInput) -> Option<NavigationUpdate> {
+    /// 读取已实际退休的原自然终态、明确无租约结果或普通停车结果。
+    /// 旧路径回执及当前目标缺席均不能自行获得此资格。
+    pub(crate) async fn settled_without_child_cancel_terminal_for(&self, input: &CancelGoalInput) -> Option<NavigationUpdate> {
         self.inner.read().await.terminal_receipts.iter().rev()
-            .find(|receipt| receipt.retired_naturally && receipt.matches(input))
+            .find(|receipt| receipt.retired_without_child_cancel && receipt.matches(input))
             .map(|receipt| receipt.update.clone())
     }
 
@@ -1074,6 +1076,135 @@ impl NavRuntimeState {
             .map(|goal| goal.lease.clone())
     }
 
+    /// 用同一次真实普通停车收尾原探索目标；终态明确为失败，不能表示到达。
+    pub(crate) async fn retire_exploration_after_global_stop(
+        &self,
+        parent_request_id: &str,
+        exploration_generation: u64,
+        remembered: &[crate::explore_runtime::ChildNavigationLease],
+        confirmation: &crate::proto::OrdinaryGlobalStopConfirmation,
+    ) -> Result<Option<NavigationUpdate>, String> {
+        let _transaction_guard = self.transaction_gate.lock().await;
+        let mut slot = self.inner.write().await;
+        let Some(active) = slot.goal.as_ref() else { return Ok(None); };
+        let lease = &active.lease;
+        if lease.owner_kind != schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD
+            || lease.parent_request_id != parent_request_id
+        {
+            return Ok(None);
+        }
+        let remembered_child = remembered.iter().any(|old| {
+            old.session_id == lease.session_id && old.owner_kind == lease.owner_kind
+                && old.parent_request_id == lease.parent_request_id
+                && old.goal_generation == lease.goal_generation
+                && old.producer_runtime_generation == lease.producer_runtime_generation
+        });
+        // 在途派发尚未回到探索时，由原 NAV 安装点保存的生产代次限定身份。
+        if !remembered_child && u64::try_from(active.producer_epoch).ok() != Some(exploration_generation) {
+            return Err("ordinary stop does not cover the current exploration child generation".into());
+        }
+        let mut cancel = self.cancel.lock().map_err(|_| "navigation cancel state unavailable".to_string())?;
+        Self::retire_active_with_global_stop(&mut slot, &mut cancel, confirmation).map(Some)
+    }
+
+    /// 原 CancelNavigation 用完整目标身份收尾同一次普通停车覆盖的目标。
+    pub(crate) async fn retire_goal_after_global_stop(
+        &self,
+        input: &CancelGoalInput,
+        confirmation: &crate::proto::OrdinaryGlobalStopConfirmation,
+    ) -> Result<(NavigationUpdate, bool), String> {
+        let _transaction_guard = self.transaction_gate.lock().await;
+        let mut slot = self.inner.write().await;
+        let exact_active = slot.goal.as_ref().is_some_and(|active| {
+            let lease = &active.lease;
+            lease.session_id == input.goal_id && lease.owner_kind == input.owner_kind
+                && lease.parent_request_id == input.parent_request_id
+                && lease.goal_generation == input.goal_generation
+                && lease.producer_runtime_generation == input.producer_runtime_generation
+        });
+        if !exact_active {
+            return slot.terminal_receipts.iter().rev().find(|receipt| receipt.matches(input))
+                .map(|receipt| (receipt.update.clone(), false))
+                .ok_or_else(|| "ordinary stop navigation identity changed".to_string());
+        }
+        let mut cancel = self.cancel.lock().map_err(|_| "navigation cancel state unavailable".to_string())?;
+        Self::retire_active_with_global_stop(&mut slot, &mut cancel, confirmation).map(|update| (update, true))
+    }
+
+    fn retire_active_with_global_stop(
+        slot: &mut NavRuntimeSlot,
+        cancel: &mut CancelTracker,
+        confirmation: &crate::proto::OrdinaryGlobalStopConfirmation,
+    ) -> Result<NavigationUpdate, String> {
+        let active = slot.goal.as_ref().expect("调用者已在原事务锁内选定目标");
+        let lease = &active.lease;
+        if !confirmation.stationary_confirmed || confirmation.operation_id.is_empty()
+            || confirmation.zero_ack_id.is_empty() || confirmation.applied_monotonic_ns == 0
+        {
+            return Err("ordinary stop has no completed stationary confirmation".into());
+        }
+        if confirmation.applied_monotonic_ns < active.admitted_guard_clock_ns {
+            return Err("ordinary stop predates the current navigation goal".into());
+        }
+        let lease = lease.clone();
+        if cancel.lease.as_ref().is_some_and(|old| old.identity_matches(&lease)) {
+            *cancel = CancelTracker { generation: cancel.generation, ..CancelTracker::default() };
+        }
+        let update = NavigationUpdate {
+            state: NavState {
+                status: "FAILED".into(),
+                message: format!("GLOBAL_STOP_CONFIRMED: ordinary operation {} stopped the original goal", confirmation.operation_id),
+                goal_id: lease.session_id.clone(),
+                timestamp_ns: now_ns(),
+                ..NavState::default()
+            },
+            feedback: crate::lcm_runtime::NavigationFeedback {
+                cancel_phase: "IDLE".into(),
+                actuator_zeroed: confirmation.stationary_confirmed,
+                reason_code: "GLOBAL_STOP_CONFIRMED".into(),
+                zero_ack_id: confirmation.zero_ack_id.clone(),
+                zero_applied_monotonic_ns: confirmation.applied_monotonic_ns,
+                owner_kind: lease.owner_kind,
+                parent_request_id: lease.parent_request_id.clone(),
+                goal_generation: lease.goal_generation,
+                producer_runtime_generation: lease.producer_runtime_generation,
+                path_revision: lease.path_revision,
+                planner_runtime_generation: lease.planner_runtime_generation,
+                ..crate::lcm_runtime::NavigationFeedback::default()
+            },
+            producer_runtime_generation: lease.producer_runtime_generation,
+        };
+        slot.phase = NavPhase::Failed;
+        slot.message = update.state.message.clone();
+        slot.goal = None;
+        slot.path_candidate_goal = None;
+        slot.path_candidates.clear();
+        slot.display_path = None;
+        // 沿原有终态保存与精确孤儿消费链传递真实停车，不生成子取消票据。
+        slot.terminal_receipts.push_back(RetainedTerminalReceipt {
+            update: update.clone(), retired_without_child_cancel: true,
+        });
+        while slot.terminal_receipts.len() > 32 { slot.terminal_receipts.pop_front(); }
+        Ok(update)
+    }
+
+    /// 首次停车提交后可能已接纳后继；原事务门内核对后再更新展示和订阅。
+    pub(crate) async fn publish_global_stop_retirement(
+        &self,
+        update: &NavigationUpdate,
+        shared: &Arc<RwLock<SharedState>>,
+        updates: &tokio::sync::broadcast::Sender<NavigationUpdate>,
+    ) -> bool {
+        let _transaction_guard = self.transaction_gate.lock().await;
+        let slot = self.inner.read().await;
+        if slot.goal.is_some() || slot.last_goal_generation != update.feedback.goal_generation {
+            return false;
+        }
+        shared.write().await.nav_state = update.state.clone();
+        let _ = updates.send(update.clone());
+        true
+    }
+
     /// 查询同一目标身份的完整空间目标；真正状态提交仍须通过原租约校验。
     pub(crate) async fn spatial_feedback_target(
         &self,
@@ -1109,8 +1240,6 @@ impl NavRuntimeState {
         let confirmed = slot.goal.as_ref().map(|active| active.lease.clone())
             .ok_or_else(|| "PATH_LEASE_REJECTED: no active goal lease".to_string())?;
         if path.session_id != confirmed.session_id
-            || path.owner_kind != confirmed.owner_kind
-            || path.parent_request_id != confirmed.parent_request_id
             || key.goal.goal_generation != confirmed.goal_generation
             || key.goal.producer_runtime_generation != confirmed.producer_runtime_generation
         {
@@ -1581,11 +1710,8 @@ impl NavRuntimeState {
         Ok(())
     }
 
-    /// Record an unowned scheduler heartbeat after its guard transport connected.
-    ///
-    /// Idle heartbeats do not own a guard lease, so they intentionally carry no
-    /// guard generation. Goal admission still requires a positive request proof,
-    /// and every owned navigation update still requires a positive generation.
+    #[cfg(test)]
+    /// 测试注入无运动观察，验证诊断缺失本身不会阻断有效导航输入。
     pub(crate) fn observe_idle_motion_sink(&self, ready: bool) -> Result<(), ObservationError> {
         let mut runtime = self
             .runtime_observations
@@ -2438,9 +2564,8 @@ fn readiness_reason(code: NavigationReadinessCode) -> &'static str {
 /// Immutable proof produced by the request-level motion admission check.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MotionAdmissionProof {
-    /// Guard generation observed by the request-level admission check.
-    pub guard_generation: u64,
-    /// Guard boot nonce paired with `guard_generation`.
+
+    /// 原守卫状态采样的启动随机数。
     pub guard_boot_nonce: [u8; 16],
     /// Ordinary global-stop generation observed by the request-level check.
     pub motion_stop_generation: u64,
@@ -2448,42 +2573,21 @@ pub struct MotionAdmissionProof {
 
 impl MotionAdmissionProof {
     /// Parse and validate a proof received over a variable-length wire format.
-    pub fn try_from_wire(
-        guard_generation: u64,
-        guard_boot_nonce: &[u8],
-        motion_stop_generation: u64,
-    ) -> Result<Self, String> {
-        let guard_boot_nonce: [u8; 16] = guard_boot_nonce
-            .try_into()
-            .map_err(|_| "motion_guard_boot_nonce must contain exactly 16 bytes".to_string())?;
-        let proof = Self {
-            guard_generation,
-            guard_boot_nonce,
+    pub fn try_from_wire(guard_boot_nonce: &[u8], motion_stop_generation: u64) -> Result<Self, String> {
+        Ok(Self {
+            guard_boot_nonce: guard_boot_nonce.try_into()
+                .map_err(|_| "motion_guard_boot_nonce must contain exactly 16 bytes".to_string())?,
             motion_stop_generation,
-        };
-        proof.validate().map_err(str::to_string)?;
-        Ok(proof)
+        })
     }
 
-    /// Validate that the proof can be transported losslessly in `GoalEnvelope`.
-    pub fn validate(&self) -> Result<(), &'static str> {
-        if self.guard_generation == 0 || self.guard_generation > i64::MAX as u64 {
-            return Err("motion_guard_generation must be in [1, i64::MAX]");
-        }
-        if self.guard_boot_nonce.iter().all(|byte| *byte == 0) {
-            return Err("motion_guard_boot_nonce must not be all zero");
-        }
-        if self.motion_stop_generation > i64::MAX as u64 {
-            return Err("motion_stop_generation must not exceed i64::MAX");
-        }
-        Ok(())
-    }
+
 }
 
 #[cfg(test)]
 pub(crate) const fn test_motion_admission() -> MotionAdmissionProof {
     MotionAdmissionProof {
-        guard_generation: 7,
+
         guard_boot_nonce: [7; 16],
         motion_stop_generation: 1,
     }
@@ -2827,9 +2931,9 @@ async fn goal_intent_from_set_goal(
         boundary_id,
         body_to_support_z_m: None,
         boundary_points,
-        motion_guard_generation: input.motion_admission.guard_generation as i64,
+
         motion_guard_boot_nonce: input.motion_admission.guard_boot_nonce,
-        motion_stop_generation: input.motion_admission.motion_stop_generation as i64,
+        motion_stop_generation: i64::try_from(input.motion_admission.motion_stop_generation).map_err(|_| "motion_stop_generation cannot fit LCM i64".to_string())?,
         goal,
     })
 }
@@ -2983,19 +3087,14 @@ pub(crate) async fn admit_goal_intent(
         return rejected_goal_intent(goal_id, "goal header, frame, timestamp, or pose is invalid");
     }
     let motion_admission = MotionAdmissionProof {
-        guard_generation: match u64::try_from(intent.motion_guard_generation) {
-            Ok(value) => value,
-            Err(_) => return rejected_goal_intent(goal_id, "motion guard generation is invalid"),
-        },
+
         guard_boot_nonce: intent.motion_guard_boot_nonce,
         motion_stop_generation: match u64::try_from(intent.motion_stop_generation) {
             Ok(value) => value,
             Err(_) => return rejected_goal_intent(goal_id, "motion stop generation is invalid"),
         },
     };
-    if let Err(reason) = motion_admission.validate() {
-        return rejected_goal_intent(goal_id, reason);
-    }
+
     if let Err(reason) = intent.options.validate() {
         return rejected_goal_intent(goal_id, nuwax_codec::CodecError::LcmEncode(reason).to_string());
     }
@@ -3168,21 +3267,7 @@ async fn admit_goal_input(
             ..SetGoalOutcome::default()
         };
     }
-    if let Err(reason) = input.motion_admission.validate() {
-        return SetGoalOutcome {
-            state: NavState {
-                status: NavPhase::Failed.as_str().to_string(),
-                message: format!("SET_GOAL_REJECTED[MOTION_ADMISSION_PROOF_INVALID]: {reason}"),
-                goal_id: input.goal_id,
-                distance_remaining: 0.0,
-                timestamp_ns: now_ns(),
-            },
-            lease: None,
-            retry_reason: None,
-            reject_reason: None,
-            ..SetGoalOutcome::default()
-        };
-    }
+
     if input.goal_id.is_empty()
         || input.parent_request_id.is_empty()
         || input.goal_generation > i64::MAX as u64
@@ -3330,6 +3415,15 @@ async fn admit_goal_input(
     let (boundary_frame_id, boundary_points) = boundary
         .map(|boundary| (boundary.frame_id.trim().to_string(), boundary.points))
         .unwrap_or_default();
+    let motion_stop_generation = match i64::try_from(input.motion_admission.motion_stop_generation) {
+        Ok(value) => value,
+        Err(_) => return SetGoalOutcome {
+            state: NavState { status: NavPhase::Failed.as_str().to_string(),
+                message: "SET_GOAL_REJECTED[LCM_ENCODE]: motion_stop_generation cannot fit i64".into(),
+                goal_id: input.goal_id, distance_remaining: 0.0, timestamp_ns: now_ns() },
+            ..SetGoalOutcome::default()
+        },
+    };
     let envelope = schema::GoalEnvelope {
         map_frame_generation,
         body_reference_frame_id: io.body_reference_frame_id.to_string(),
@@ -3352,9 +3446,9 @@ async fn admit_goal_input(
         committed_map_frame_id: committed_map.frame_id,
         source_timestamp_ns: input.target.timestamp_ns as i64,
         boundary_id,
-        motion_guard_generation: input.motion_admission.guard_generation as i64,
+
         motion_guard_boot_nonce: input.motion_admission.guard_boot_nonce,
-        motion_stop_generation: input.motion_admission.motion_stop_generation as i64,
+        motion_stop_generation,
         boundary_frame_id,
         boundary_points,
         goal: schema::PoseStamped {
@@ -3533,6 +3627,7 @@ async fn admit_goal_input(
             slot.profile
         );
         slot.goal = Some(ActiveGoal {
+            admitted_guard_clock_ns: nuwax_motion_safety_guard::measured_motion::monotonic_ns(),
             id: input.goal_id.clone(),
             frame_id: input.frame_id.clone(),
             target: input.target.clone(),
@@ -3619,7 +3714,7 @@ async fn project_installed_goal_completion(
     };
     let exact_active = slot.goal.as_ref().filter(|goal| goal.lease.identity_matches(attempted));
     let receipt = slot.terminal_receipts.iter().rev().find(|receipt| {
-        let settlement_proven = receipt.retired_naturally
+        let settlement_proven = receipt.retired_without_child_cancel
             || (receipt.update.state.status == "CANCELLED" && exact_active.is_none());
         receipt.matches(&input) && settlement_proven && exact_active.is_none_or(|active| {
             active.lease.path_revision == receipt.update.feedback.path_revision
@@ -4775,7 +4870,7 @@ mod tests {
             assert!(state.active_goal_lease().await.is_none(),
                 "retirement itself keeps the existing measured full-lease rule");
             assert!(state.terminal_receipt_for(&cancel_input(&lease)).await.is_some());
-            assert_eq!(state.naturally_retired_terminal_for(&cancel_input(&lease)).await.is_some(),
+            assert_eq!(state.settled_without_child_cancel_terminal_for(&cancel_input(&lease)).await.is_some(),
                 !poison_before_commit,
                 "unknown at commit is no proof; later tracker failure cannot erase an established fact");
         }
@@ -4803,7 +4898,7 @@ mod tests {
                 reason_code: "LEASE_NOT_GRANTED".into(), owner_kind: lease.owner_kind,
                 parent_request_id: lease.parent_request_id.clone(), goal_generation: lease.goal_generation,
                 producer_runtime_generation: lease.producer_runtime_generation,
-                cancel_generation: generation, guard_generation: 7, ..Default::default()
+                cancel_generation: generation,  ..Default::default()
             },
             producer_runtime_generation: lease.producer_runtime_generation,
         };
@@ -4855,6 +4950,7 @@ mod tests {
 
     fn test_active_goal_with_lease(lease: GoalLease) -> ActiveGoal {
         ActiveGoal {
+            admitted_guard_clock_ns: nuwax_motion_safety_guard::measured_motion::monotonic_ns(),
             options: Default::default(), producer: "public-navigation".into(), producer_epoch: 1,
             body_to_support_z_m: None, boundary_owner: None,
             id: lease.session_id.clone(),
@@ -4899,25 +4995,17 @@ mod tests {
         let path = schema::PathEnvelope {
             schema_version: schema::NAVIGATION_ENVELOPE_SCHEMA_VERSION,
             session_id: lease.session_id.clone(),
-            owner_kind: lease.owner_kind,
-            parent_request_id: lease.parent_request_id.clone(),
+
+
             goal_generation: lease.goal_generation as i64,
-            producer: "public-navigation".to_string(),
-            producer_epoch: lease.producer_runtime_generation as i64,
+
+
             producer_runtime_generation: lease.producer_runtime_generation as i64,
-            committed_map_session_id: "geometry-test-map".to_string(),
-            committed_map_session_generation: 1,
-            committed_map_revision: 1,
-            committed_map_boot_nonce: [0x41; 16],
-            committed_map_commit_sequence: 1,
-            committed_map_source_timestamp_ns: 1,
-            committed_map_frame_id: "map".to_string(),
-            motion_guard_generation: 1,
-            motion_guard_boot_nonce: [1; 16],
-            motion_stop_generation: 0,
+
+
             planner_runtime_generation: 1,
             path_revision: path_revision as i64,
-            source_timestamp_ns: now_ns() as i64,
+
 
             path: schema::Path {
                 header: schema::Header {
@@ -5242,23 +5330,12 @@ mod tests {
     }
 
     #[test]
-    fn motion_admission_wire_validation_is_strict() {
-        assert_eq!(
-            MotionAdmissionProof::try_from_wire(7, &[7; 16], 1).unwrap(),
-            test_motion_admission()
-        );
-        assert!(MotionAdmissionProof::try_from_wire(7, &[7; 15], 1)
-            .unwrap_err()
-            .contains("exactly 16 bytes"));
-        assert!(MotionAdmissionProof::try_from_wire(0, &[7; 16], 1)
-            .unwrap_err()
-            .contains("motion_guard_generation"));
-        assert!(MotionAdmissionProof::try_from_wire(7, &[0; 16], 1)
-            .unwrap_err()
-            .contains("must not be all zero"));
-        assert!(MotionAdmissionProof::try_from_wire(7, &[7; 16], u64::MAX)
-            .unwrap_err()
-            .contains("motion_stop_generation"));
+    fn motion_admission_wire_decodes_nonce_without_revalidating_guard_policy() {
+        assert_eq!(MotionAdmissionProof::try_from_wire(&[7; 16], 1).unwrap(), test_motion_admission());
+        assert!(MotionAdmissionProof::try_from_wire(&[7; 15], 1).unwrap_err().contains("16"));
+        let proof = MotionAdmissionProof::try_from_wire(&[0; 16], u64::MAX).unwrap();
+        assert_eq!(proof.guard_boot_nonce, [0; 16]);
+        assert_eq!(proof.motion_stop_generation, u64::MAX);
     }
 
     #[test]
@@ -5645,6 +5722,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ordinary_global_stop_retires_failed_nav_and_cannot_clear_or_publish_over_successor() {
+        let handle = make_handle().await;
+        let state = NavRuntimeState::with_profile_and_producer_runtime_generation(PROFILE_SIMPLE_2D, 1);
+        observe_ready_execution_chain(&state).await;
+        let first = set_goal(&handle, &state, test_goal_input("ordinary-old-nav")).await;
+        assert_eq!(first.state.status, "ACCEPTED", "{}", first.state.message);
+        let old = first.lease.unwrap();
+        let input = cancel_input(&old);
+        let CancelStart::Publish { generation, .. } = state.begin_cancel(&input).await else { panic!("原目标取消接纳"); };
+        let failed = state.observe_cancel_ack(cancel_ack(&old, generation, MotionSinkCancelAckStatus::Failed)).await;
+        assert_eq!(failed.state.status, "FAILED");
+        assert!(state.active_goal_lease().await.is_some());
+        // 此单元测试注入停车事实，只验证原身份和退休流程；真实守卫另有UDS组合。
+        let proof = crate::proto::OrdinaryGlobalStopConfirmation {
+            operation_id: "ordinary-stop".into(), zero_ack_id: "actual-zero-fixture".into(),
+            applied_monotonic_ns: nuwax_motion_safety_guard::measured_motion::monotonic_ns(),
+            stationary_confirmed: true,
+        };
+        let (retired, changed) = state.retire_goal_after_global_stop(&input, &proof).await.unwrap();
+        assert!(changed);
+        assert_eq!(retired.state.status, "FAILED");
+        assert_eq!(retired.feedback.reason_code, "GLOBAL_STOP_CONFIRMED");
+        assert_eq!(retired.feedback.cancel_generation, 0);
+        assert_eq!(retired.feedback.zero_ack_id, proof.zero_ack_id);
+        assert_eq!(state.cancel_snapshot().phase, CancelPhase::Idle);
+        observe_ready_execution_chain(&state).await;
+        let second = set_goal(&handle, &state, test_goal_input("ordinary-successor")).await;
+        assert_eq!(second.state.status, "ACCEPTED", "{}", second.state.message);
+        let successor = second.lease.unwrap();
+        handle.state.write().await.nav_state = second.state.clone();
+        assert!(!state.publish_global_stop_retirement(&retired, &handle.state, &handle.nav_state_tx).await);
+        assert_eq!(handle.state.read().await.nav_state.goal_id, successor.session_id);
+        let (_, replay_changed) = state.retire_goal_after_global_stop(&input, &proof).await.unwrap();
+        assert!(!replay_changed);
+        assert!(state.retire_goal_after_global_stop(&cancel_input(&successor), &proof).await.is_err());
+        assert_eq!(state.active_goal_lease().await, Some(successor));
+    }
+
+    #[tokio::test]
+    async fn ordinary_global_stop_requires_stationary_and_exact_goal_identity() {
+        let state = NavRuntimeState::with_profile_and_producer_runtime_generation(PROFILE_SIMPLE_2D, 1);
+        let lease = test_lease("ordinary-protected", 1);
+        state.replace_active_goal_for_test(test_active_goal_with_lease(lease.clone())).await;
+        let mut proof = crate::proto::OrdinaryGlobalStopConfirmation {
+            operation_id: "ordinary-stop".into(), zero_ack_id: "actual-zero-fixture".into(),
+            applied_monotonic_ns: nuwax_motion_safety_guard::measured_motion::monotonic_ns(),
+            stationary_confirmed: false,
+        };
+        assert!(state.retire_goal_after_global_stop(&cancel_input(&lease), &proof).await.is_err());
+        proof.stationary_confirmed = true;
+        let mut wrong = cancel_input(&lease); wrong.goal_generation += 1;
+        assert!(state.retire_goal_after_global_stop(&wrong, &proof).await.is_err());
+        assert_eq!(state.active_goal_lease().await, Some(lease));
+    }
+
+    #[tokio::test]
     async fn set_goal_only_publishes_goal_and_returns_accepted() {
         use futures::StreamExt;
 
@@ -5709,7 +5842,6 @@ mod tests {
         assert_eq!(goal.session_id, "stack-owned-goal");
         assert_eq!(goal.owner_kind, schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV);
         assert_eq!(goal.parent_request_id, "request-stack-owned-goal");
-        assert_eq!(goal.motion_guard_generation, 7);
         assert_eq!(goal.motion_guard_boot_nonce, [7; 16]);
         assert_eq!(goal.motion_stop_generation, 1);
         assert!(goal.goal_generation > 0);

@@ -59,7 +59,6 @@ class DeploymentOptions:
     clip_wheel: Optional[Path] = None
     cyclonedds_source: Optional[Path] = None
     cyclonedds_wheel: Optional[Path] = None
-    actuator_manifest: Optional[Path] = None
     dds_interface: str = ""
     go2_robot_ip: str = ""
     gateway_host: str = "127.0.0.1"

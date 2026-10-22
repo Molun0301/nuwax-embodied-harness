@@ -13,11 +13,9 @@ from contracts.motion_feedback import MotionExecutionFeedback
 from services.navigation.proto_gen import motion_guard_pb2 as pb
 from services.navigation.motion_safety_guard.constants import API_VERSION
 from services.navigation.motion_safety_guard.core import MotionGuardCore
-from services.navigation.motion_safety_guard.epoch import EpochRecord
 from services.navigation.motion_safety_guard.go2_actuator import Go2Actuator, Go2Factories
 from services.navigation.motion_safety_guard.peer_auth import PeerCredentials
 from services.navigation.motion_safety_guard.stop_confirmation import StopConfirmation
-from services.navigation.motion_safety_guard.wire import seal_request
 
 
 class Clock:
@@ -31,7 +29,6 @@ class Clock:
 
 class Device:
     is_configured = True
-    actuator_symbols_sha256 = 'sha256:' + 'a' * 64
     supports_motion_feedback = True
 
     def __init__(self, feedback=None):
@@ -42,10 +39,11 @@ class Device:
     def get_motion_execution_feedback(self):
         if isinstance(self.feedback, Exception):
             raise self.feedback
-        return self.feedback
+        return self.feedback() if callable(self.feedback) else self.feedback
 
     def apply_motion(self, request):
         self.commands.append(request.SerializeToString())
+        return False
 
     def zero(self):
         self.zeros += 1
@@ -59,12 +57,13 @@ class MeasuredMotionFeedbackTests(unittest.TestCase):
         self.clock = Clock()
         self.device = Device()
         self.stop = StopConfirmation(None, monotonic=lambda: self.clock.mono / 1e9,
-                                     unix_ns=lambda: self.clock.unix)
-        epoch = EpochRecord.initial(generation=1, actuator_symbols_sha256=self.device.actuator_symbols_sha256)
-        epoch = epoch.with_updates(boot_nonce_hex='11' * 16, fenced=False, startup_zero_confirmed=True)
-        self.core = MotionGuardCore(epoch=epoch, epoch_store=SimpleNamespace(persist=lambda value: None),
-                                   actuator=self.device, monotonic_ns=lambda: self.clock.mono,
-                                   stop_confirmation=self.stop, lease_id_factory=lambda: 123)
+            unix_ns=lambda: self.clock.unix, sleep=lambda seconds:self.clock.step(round(seconds*1e9)))
+        self.device.feedback=lambda:self.sample(linear_x_mps=0.,linear_y_mps=0.,linear_z_mps=0.,
+            angular_x_rps=0.,angular_y_rps=0.,angular_z_rps=0.)
+        self.core = MotionGuardCore(actuator=self.device, monotonic_ns=lambda:self.clock.mono,
+            stop_confirmation=self.stop, lease_id_factory=lambda:123)
+        self.core.initialize_zero_fence()
+        self.device.feedback=None
         self.peer = PeerCredentials(1, 2, 3)
 
     def sample(self, **changes):
@@ -81,19 +80,19 @@ class MeasuredMotionFeedbackTests(unittest.TestCase):
         request.get_readiness.source = pb.GUARD_SOURCE_NAV
         return self.core.handle(request, self.peer)
 
-    def mutation(self, operation, sequence=0, lease_id=0, command=None):
-        request = pb.MotionGuardRequest(api_version=API_VERSION, request_id=f'{operation}-{sequence}')
+    def mutation(self, operation, ordinal=0, lease_id=0, command=None):
+        request = pb.MotionGuardRequest(api_version=API_VERSION, request_id=f'{operation}-{ordinal}')
         body = getattr(request, operation)
         body.envelope.CopyFrom(pb.RequestEnvelope(
-            tuple=pb.LeaseTuple(generation=1, boot_nonce=bytes.fromhex('11' * 16), lease_id=lease_id),
+            tuple=pb.LeaseTuple(boot_nonce=self.core.boot_nonce, lease_id=lease_id),
             source=pb.GUARD_SOURCE_NAV, action=pb.GUARD_ACTION_STOP if command == 'stop' else pb.GUARD_ACTION_TWIST,
-            operation_id=request.request_id, sequence=sequence,
+            operation_id=request.request_id,
             issued_monotonic_ns=self.clock.mono, deadline_monotonic_ns=self.clock.mono + 200_000_000))
         if command == 'twist':
             body.twist.CopyFrom(pb.TwistCommand(linear_x_mps=0.8, linear_y_mps=0.7, angular_z_rps=0.6))
         elif command == 'stop':
             body.stop.SetInParent()
-        return seal_request(request)
+        return request
 
     def acquire(self):
         request = self.mutation('acquire_lease')
@@ -111,7 +110,7 @@ class MeasuredMotionFeedbackTests(unittest.TestCase):
         self.assertEqual(list(measured.body_linear_xyz), [0.12, -0.23, 0.34])
         self.assertEqual(list(measured.body_angular_xyz), [-0.45, 0.56, -0.67])
         self.assertLess(measured.source_timestamp_ns, self.clock.unix)
-        self.assertEqual(measured.received_monotonic_ns, 100_000_000_000)
+        self.assertEqual(measured.received_monotonic_ns, self.device.feedback.received_monotonic_ns)
         self.assertEqual(len(self.device.commands), 1)
 
     def go2(self, controller='normal'):
@@ -121,7 +120,7 @@ class MeasuredMotionFeedbackTests(unittest.TestCase):
             low_level_controller=lambda iface: None,
             motion_state_subscriber=lambda callback: SimpleNamespace(Close=lambda: None),
             motion_controller_reader=lambda: controller),
-            actuator_symbols_sha256=self.device.actuator_symbols_sha256, dds_iface=None, timeout_seconds=0.1)
+            dds_iface=None, timeout_seconds=0.1)
         self.addCleanup(actuator.close)
         return actuator
 
@@ -224,7 +223,7 @@ class MeasuredMotionFeedbackTests(unittest.TestCase):
         self.assertEqual(len(self.device.commands), 3)
         stop = self.core.handle(self.mutation('submit_motion_command', 4, 123, 'stop'), self.peer)
         self.assertEqual(stop.submit_motion_command.result.ack, pb.ACK_CODE_ZEROED)
-        self.assertEqual(self.device.zeros, 1)
+        self.assertEqual(self.device.zeros, 2)
         self.assertFalse(stop.HasField('measured_motion_feedback'))
 
     def test_error_response_can_carry_independent_measurement(self):
@@ -238,13 +237,14 @@ class MeasuredMotionFeedbackTests(unittest.TestCase):
     def test_dedup_replay_preserves_original_sample(self):
         self.device.feedback = self.sample()
         self.acquire()
-        request = self.mutation('submit_motion_command', 1, 123, 'twist')
+        request = self.mutation('submit_motion_command', 1, 123, 'stop')
         original = self.core.handle(request, self.peer)
         self.clock.step(100_000_000)
         self.device.feedback = self.sample(linear_x_mps=4.0)
         replay = self.core.handle(request, self.peer)
         self.assertEqual(replay.measured_motion_feedback, original.measured_motion_feedback)
-        self.assertEqual(len(self.device.commands), 1)
+        self.assertEqual(len(self.device.commands), 0)
+        self.assertEqual(self.device.zeros, 2)
         self.assertEqual(self.query().measured_motion_feedback.body_linear_xyz[0], 4.0)
 
     def test_acquisition_mapping_bounds_deadline(self):

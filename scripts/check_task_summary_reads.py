@@ -286,11 +286,10 @@ class TaskSummaryReads(unittest.TestCase):
         positive = GatewayRuntime._handle_get_active_tasks(self.runtime, {"history_limit": 2})
         self.assertEqual([status.task_id for status in positive["history_tasks"]], ids[-2:])
 
-    def test_active_scalar_queries_match_all_states_and_quarantine(self):
+    def test_active_scalar_queries_match_all_states(self):
         active_ids = []
         for state in TaskState:
             task_id = self.record(state, event=False)
-            self.manager._records[task_id].resource_quarantined = True
             if state in (TaskState.ACCEPTED, TaskState.RUNNING):
                 active_ids.append(task_id)
         expected = self.manager.list_active_tasks()
@@ -299,7 +298,6 @@ class TaskSummaryReads(unittest.TestCase):
                 self.assertEqual(self.manager.count_active_tasks(), len(expected))
                 self.assertTrue(self.manager.has_active_tasks())
         self.assertEqual([status.task_id for status in self.manager.list_active_tasks()], active_ids)
-        self.assertEqual(len(self.manager.list_quarantined_tasks()), len(TaskState))
         expected[0].message = "caller edit"
         self.assertEqual(self.manager.get_task_status(active_ids[0]).message, "Synthetic status")
 
@@ -321,17 +319,15 @@ class TaskSummaryReads(unittest.TestCase):
         self.assertEqual(manager.count_active_tasks(), 1)
         self.assertEqual(records.visits, 0)
 
-    def test_active_scalar_queries_follow_real_transitions_and_terminal_quarantine(self):
+    def test_active_scalar_queries_follow_real_transitions(self):
         task_id = self.record(TaskState.ACCEPTED, event=False)
         self.assertEqual(self.manager.count_active_tasks(), 1)
         self.manager._set_running(task_id)
         self.assertTrue(self.manager.has_active_tasks())
         self.manager._set_terminal_state(task_id, TaskState.CANCELLED, "Synthetic cancellation",
                                          release_resources=False)
-        self.manager._records[task_id].resource_quarantined = True
         self.assertEqual(self.manager.count_active_tasks(), 0)
         self.assertFalse(self.manager.has_active_tasks())
-        self.assertEqual([status.task_id for status in self.manager.list_quarantined_tasks()], [task_id])
         self.assertEqual(self.manager.list_active_tasks(), ())
         self.assertEqual(self.manager.capture_task_list(history_limit=0)["active_tasks"], [])
 

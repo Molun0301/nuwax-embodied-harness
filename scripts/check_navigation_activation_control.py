@@ -376,24 +376,21 @@ class ActivationControlChecks(unittest.TestCase):
         self.assertEqual(captured["options"]["input_payload"], {"map_name":"offline"})
         self.assertEqual(captured["runner"](context), {"fake_committed": True})
 
-    def test_motion_admission_cancel_does_not_query_physical_guard(self):
-        fixture, event = self.event_fixture()
-        control = TaskControl()
-        worker = self.worker(lambda: fixture.runtime._admit_motion_request("navigate_to_pose",
-            request_id="offline", check_active=control.ensure_active))
-        self.require(event.entered)
+    def test_cancelled_motion_admission_does_not_read_guard_snapshot(self):
+        fixture, control = self.enterContext(Fixture()), TaskControl()
         control.cancelled.set()
-        self.assertTrue(worker[1].wait(0.5))
-        self.assertIsInstance(join(worker)["error"], TaskCancelledError)
-        self.assertEqual(fixture.readiness_calls, [])
+        with self.assertRaises(TaskCancelledError):
+            fixture.runtime._admit_motion_request("navigate_to_pose", request_id="offline", check_active=control.ensure_active)
+        self.assertEqual(fixture.admission_calls, [])
+        self.assertEqual(fixture.activation_calls, [])
 
-    def test_no_activation_dedup_or_guard_readiness_change_in_this_patch(self):
+    def test_admission_captures_once_and_preparation_activates_once(self):
         fixture = self.enterContext(Fixture())
         admission = fixture.runtime._admit_motion_request("navigate_to_pose", request_id="offline")
         fixture.runtime._ensure_motion_runtime_for_backend_call("navigate_to_pose", admission)
-        self.assertEqual(len(fixture.activation_calls), 2)
-        self.assertEqual(len(fixture.stub.calls), 6)
-        self.assertEqual(len(fixture.readiness_calls), 1)
+        self.assertEqual(len(fixture.activation_calls), 1)
+        self.assertEqual(len(fixture.stub.calls), 3)
+        self.assertEqual(len(fixture.admission_calls), 1)
 
 
 if __name__ == "__main__":

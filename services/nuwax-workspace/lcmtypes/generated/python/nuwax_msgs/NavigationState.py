@@ -9,11 +9,11 @@ import struct
 
 class NavigationState(object):
 
-    __slots__ = ["session_id", "robot_frame", "stamp_sec", "stamp_nsec", "state", "goal_x", "goal_y", "goal_yaw", "current_x", "current_y", "current_yaw", "progress", "message", "runtime_generation", "guard_generation", "pose_source_timestamp_ns", "costmap_source_timestamp_ns", "sink_ready", "planner_map_frame", "planner_pose_frame", "cancel_generation", "zero_ack_id", "zero_applied_monotonic_ns", "owner_kind", "parent_request_id", "goal_generation", "path_revision", "producer_runtime_generation", "planner_runtime_generation", "local_path_count", "local_path"]
+    __slots__ = ["session_id", "robot_frame", "stamp_sec", "stamp_nsec", "state", "goal_x", "goal_y", "goal_yaw", "current_x", "current_y", "current_yaw", "progress", "message", "runtime_generation", "pose_source_timestamp_ns", "costmap_source_timestamp_ns", "sink_ready", "planner_map_frame", "planner_pose_frame", "cancel_generation", "zero_ack_id", "zero_applied_monotonic_ns", "owner_kind", "parent_request_id", "goal_generation", "path_revision", "producer_runtime_generation", "planner_runtime_generation", "local_path_count", "local_path"]
 
-    __typenames__ = ["string", "string", "int64_t", "int32_t", "int32_t", "double", "double", "double", "double", "double", "double", "double", "string", "int64_t", "int64_t", "int64_t", "int64_t", "int8_t", "string", "string", "int64_t", "string", "int64_t", "int32_t", "string", "int64_t", "int64_t", "int64_t", "int64_t", "int32_t", "double"]
+    __typenames__ = ["string", "string", "int64_t", "int32_t", "int32_t", "double", "double", "double", "double", "double", "double", "double", "string", "int64_t", "int64_t", "int64_t", "int8_t", "string", "string", "int64_t", "string", "int64_t", "int32_t", "string", "int64_t", "int64_t", "int64_t", "int64_t", "int32_t", "double"]
 
-    __dimensions__ = [None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, ["local_path_count", 3]]
+    __dimensions__ = [None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, ["local_path_count", 3]]
 
     def __init__(self):
         self.session_id = ""
@@ -43,8 +43,6 @@ class NavigationState(object):
         self.message = ""
         """ LCM Type: string """
         self.runtime_generation = 0
-        """ LCM Type: int64_t """
-        self.guard_generation = 0
         """ LCM Type: int64_t """
         self.pose_source_timestamp_ns = 0
         """ LCM Type: int64_t """
@@ -103,7 +101,7 @@ class NavigationState(object):
         buf.write(struct.pack('>I', len(__message_encoded)+1))
         buf.write(__message_encoded)
         buf.write(b"\0")
-        buf.write(struct.pack(">qqqqb", self.runtime_generation, self.guard_generation, self.pose_source_timestamp_ns, self.costmap_source_timestamp_ns, self.sink_ready))
+        buf.write(struct.pack(">qqqb", self.runtime_generation, self.pose_source_timestamp_ns, self.costmap_source_timestamp_ns, self.sink_ready))
         __planner_map_frame_encoded = self.planner_map_frame.encode('utf-8')
         buf.write(struct.pack('>I', len(__planner_map_frame_encoded)+1))
         buf.write(__planner_map_frame_encoded)
@@ -146,7 +144,7 @@ class NavigationState(object):
         self.stamp_sec, self.stamp_nsec, self.state, self.goal_x, self.goal_y, self.goal_yaw, self.current_x, self.current_y, self.current_yaw, self.progress = struct.unpack(">qiiddddddd", buf.read(72))
         __message_len = struct.unpack('>I', buf.read(4))[0]
         self.message = buf.read(__message_len)[:-1].decode('utf-8', 'replace')
-        self.runtime_generation, self.guard_generation, self.pose_source_timestamp_ns, self.costmap_source_timestamp_ns, self.sink_ready = struct.unpack(">qqqqb", buf.read(33))
+        self.runtime_generation, self.pose_source_timestamp_ns, self.costmap_source_timestamp_ns, self.sink_ready = struct.unpack(">qqqb", buf.read(25))
         __planner_map_frame_len = struct.unpack('>I', buf.read(4))[0]
         self.planner_map_frame = buf.read(__planner_map_frame_len)[:-1].decode('utf-8', 'replace')
         __planner_pose_frame_len = struct.unpack('>I', buf.read(4))[0]
@@ -166,7 +164,7 @@ class NavigationState(object):
     @staticmethod
     def _get_hash_recursive(parents):
         if NavigationState in parents: return 0
-        tmphash = (0x72e1fbd257455e5c) & 0xffffffffffffffff
+        tmphash = (0xcf8a350daa50d92e) & 0xffffffffffffffff
         tmphash  = (((tmphash<<1)&0xffffffffffffffff) + (tmphash>>63)) & 0xffffffffffffffff
         return tmphash
     _packed_fingerprint = None

@@ -18,8 +18,6 @@ Environment=NUWAX_LOG_DIR=/var/log/nuwax/gateway
 # /run/nuwax is shared and provisioned by nuwax-motion.conf tmpfiles. This
 # unit must not claim the parent as RuntimeDirectory: systemd would recursively
 # chown it on start and remove every service's runtime subdirectory on stop.
-StateDirectory=nuwax/motion-guard
-StateDirectoryMode=0700
 UMask=0007
 Environment=NUWAX_BOOTSTRAP_ENV_FILE=@NUWAX_CONFIG_DIR@/nuwax.env
 Environment=GO2_DATA_PLANE_ENV_FILE=@NUWAX_CONFIG_DIR@/go2-data-plane.env
@@ -38,15 +36,12 @@ Environment=PYTHONNOUSERSITE=1
 Environment=NUWAX_MOTION_GUARD_BACKEND=unitree_sdk2py
 Environment=NUWAX_MOTION_GUARD_SOCKET=/run/nuwax/motion-guard.sock
 Environment=NUWAX_MOTION_GUARD_LOCK=/run/nuwax/motion-guard.lock
-Environment=NUWAX_MOTION_GUARD_EPOCH=/var/lib/nuwax/motion-guard/epoch.json
-Environment=NUWAX_MOTION_GUARD_PROVISIONED=/var/lib/nuwax/motion-guard/provisioned.json
-Environment=NUWAX_ACTUATOR_SYMBOLS_FILE=@NUWAX_CONFIG_DIR@/actuator/actuator-symbols.json
 Environment=NUWAX_MOTION_GUARD_START_TIMEOUT_SEC=15
 ExecStartPre=/usr/bin/chgrp nuwax /run/nuwax
 ExecStartPre=/usr/bin/chmod 0750 /run/nuwax
-ExecStartPre=/usr/bin/env NUWAX_REPO_ROOT_OVERRIDE=@NUWAX_REPO_ROOT@ NUWAX_PYTHON_BIN=@NUWAX_PYTHON_BIN@ PYTHONPATH=@NUWAX_REPO_ROOT@:@NUWAX_GO2_SDK_PATH@ PYTHONNOUSERSITE=1 NUWAX_MOTION_GUARD_LOCK=/run/nuwax/motion-guard.lock NUWAX_MOTION_GUARD_EPOCH=/var/lib/nuwax/motion-guard/epoch.json NUWAX_MOTION_GUARD_PROVISIONED=/var/lib/nuwax/motion-guard/provisioned.json NUWAX_ACTUATOR_SYMBOLS_FILE=@NUWAX_CONFIG_DIR@/actuator/actuator-symbols.json /bin/bash @NUWAX_REPO_ROOT@/scripts/systemd/check_motion_guard_python.sh
+ExecStartPre=/usr/bin/env NUWAX_REPO_ROOT_OVERRIDE=@NUWAX_REPO_ROOT@ NUWAX_PYTHON_BIN=@NUWAX_PYTHON_BIN@ PYTHONPATH=@NUWAX_REPO_ROOT@:@NUWAX_GO2_SDK_PATH@ PYTHONNOUSERSITE=1 NUWAX_MOTION_GUARD_LOCK=/run/nuwax/motion-guard.lock /bin/bash @NUWAX_REPO_ROOT@/scripts/systemd/check_motion_guard_python.sh
 ExecStartPre=/usr/bin/rm -f /run/nuwax/motion-guard.sock
-ExecStart=/usr/bin/env PYTHONPATH=@NUWAX_REPO_ROOT@:@NUWAX_GO2_SDK_PATH@ PYTHONNOUSERSITE=1 NUWAX_MOTION_GUARD_LOCK=/run/nuwax/motion-guard.lock NUWAX_MOTION_GUARD_EPOCH=/var/lib/nuwax/motion-guard/epoch.json NUWAX_MOTION_GUARD_PROVISIONED=/var/lib/nuwax/motion-guard/provisioned.json NUWAX_ACTUATOR_SYMBOLS_FILE=@NUWAX_CONFIG_DIR@/actuator/actuator-symbols.json @NUWAX_PYTHON_BIN@ -m services.navigation.motion_safety_guard
+ExecStart=/usr/bin/env PYTHONPATH=@NUWAX_REPO_ROOT@:@NUWAX_GO2_SDK_PATH@ PYTHONNOUSERSITE=1 NUWAX_MOTION_GUARD_LOCK=/run/nuwax/motion-guard.lock @NUWAX_PYTHON_BIN@ -m services.navigation.motion_safety_guard
 ExecStartPost=/usr/bin/env /bin/bash @NUWAX_REPO_ROOT@/scripts/systemd/wait_for_motion_guard_socket.sh wait nuwax nuwax
 ExecStopPost=/usr/bin/rm -f /run/nuwax/motion-guard.sock
 Restart=on-failure
@@ -59,7 +54,7 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/run/nuwax /var/lib/nuwax/motion-guard
+ReadWritePaths=/run/nuwax
 
 [Install]
 WantedBy=multi-user.target

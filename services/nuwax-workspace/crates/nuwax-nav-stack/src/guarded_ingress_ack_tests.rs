@@ -611,9 +611,9 @@ async fn matrix_scheduler(
                 ground_initial: None,
                 session_id: goal.session_id.clone(),
                 execution_identity: guarded_goal_execution_identity(goal),
-                local_owner_runtime_generation: runtime_generation(),
+
                 motion_admission: nuwax_nav_runtime::NavMotionAdmission {
-                    guard_generation: u64::try_from(goal.motion_guard_generation).expect("guard generation"),
+
                     guard_boot_nonce: goal.motion_guard_boot_nonce,
                     motion_stop_generation: u64::try_from(goal.motion_stop_generation).expect("stop generation"),
                 },

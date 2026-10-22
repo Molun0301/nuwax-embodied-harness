@@ -949,7 +949,7 @@ mod tests {
     #[test]
     fn v1_query_cannot_enable_navigation() {
         let command: ServiceCommand = serde_json::from_str(
-            r#"{"type":"query","request_id":"request-v1","session_id":"session-v1","source_timestamp_ns":42,"frame_id":"legacy_camera","width":1,"height":1,"object_description":"chair","image":[0],"navigation":{"transform":{"source_frame_id":"camera_optical_frame","target_frame_id":"map","source_timestamp_ns":42,"calibration_id":"calibration-1","translation_xyz":[0.0,0.0,0.0],"rotation_xyzw":[0.0,0.0,0.0,1.0]},"motion_guard_generation":1,"motion_guard_boot_nonce_hex":"00112233445566778899aabbccddeeff","motion_stop_generation":0}}"#,
+            r#"{"type":"query","request_id":"request-v1","session_id":"session-v1","source_timestamp_ns":42,"frame_id":"legacy_camera","width":1,"height":1,"object_description":"chair","image":[0],"navigation":{"transform":{"source_frame_id":"camera_optical_frame","target_frame_id":"map","source_timestamp_ns":42,"calibration_id":"calibration-1","translation_xyz":[0.0,0.0,0.0],"rotation_xyzw":[0.0,0.0,0.0,1.0]},"motion_guard_boot_nonce_hex":"00112233445566778899aabbccddeeff","motion_stop_generation":0}}"#,
         )
         .unwrap();
         let ServiceCommand::Query(request) = command else {

@@ -317,7 +317,7 @@ pub const STRUCT_SEEDS: &[(&str, u64)] = &[
     ("tf2_msgs.TFMessage", 0x615c_50e1_9d44_91f6_u64),
     ("nuwax_msgs.GoalEnvelope", u64::from_be_bytes(crate::lcm::schema::GOAL_ENVELOPE_FINGERPRINT).rotate_right(1)),
     ("nuwax_msgs.PathEnvelope", u64::from_be_bytes(crate::lcm::schema::PATH_ENVELOPE_FINGERPRINT).rotate_right(1)),
-    ("nuwax_msgs.NavigationState", 0x4f51_f9fa_fead_7ded_u64),
+    ("nuwax_msgs.NavigationState", u64::from_be_bytes(crate::lcm::schema::NAVIGATION_STATE_FINGERPRINT).rotate_right(1)),
     // 复用生成器确认的真实指纹，按既有注册表约定存放逆旋转值。
     (
         "nuwax_msgs.NavigationMap3D",

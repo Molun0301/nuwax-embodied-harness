@@ -1204,7 +1204,7 @@ fn navigation_state(
         progress: f64::from(state == FAR_EVENT_SUCCEEDED),
         message,
         runtime_generation: options.planner_generation,
-        guard_generation: goal.map_or(0, |value| value.motion_guard_generation),
+
         pose_source_timestamp_ns: 0,
         costmap_source_timestamp_ns: 0,
         sink_ready: i8::from(state == FAR_EVENT_READY),

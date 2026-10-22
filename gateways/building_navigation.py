@@ -31,7 +31,6 @@ class GatewayBuildingPorts:
 
     def ensure_active(self) -> None:
         self.context.ensure_active()
-        self.runtime._assert_motion_admission(self.admission, self.admission.capability_name)
 
     def remaining_sec(self) -> float:
         self.context.ensure_active()
@@ -92,8 +91,8 @@ class GatewayBuildingPorts:
         self._remember_pose(floor)
         self.last_goal_id=goal_id
         self.last_zero=None
-        initial=self.runtime._run_with_motion_admission(self.admission,lambda:self.runtime.navigation_service.set_goal(goal,deadline_monotonic=deadline))
-        generation=self.runtime._capture_task_generation_snapshot(navigation_context=initial,motion_admission=self.admission)
+        initial=self.runtime.navigation_service.set_goal(goal,deadline_monotonic=deadline)
+        generation=self.runtime._capture_task_generation_snapshot(navigation_context=initial)
         self.runtime._record_task_generation_snapshot(self.context,generation)
         while True:
             self.ensure_active()
@@ -101,7 +100,7 @@ class GatewayBuildingPorts:
                 invariant()
             navigation=self.runtime.navigation_service.refresh_navigation(deadline_monotonic=deadline)
             self._remember_pose(floor,navigation.navigation_state.current_pose)
-            current=self.runtime._capture_task_generation_snapshot(navigation_context=navigation,motion_admission=self.admission)
+            current=self.runtime._capture_task_generation_snapshot(navigation_context=navigation)
             changes=self.runtime._task_generation_rollovers(generation,current)
             if changes:
                 self.runtime._handle_navigation_generation_rollover(self.context,goal_id=goal_id,expected=generation,current=current,rollovers=changes,deadline_monotonic=time.monotonic()+8.0)
@@ -139,12 +138,6 @@ class GatewayBuildingPorts:
         if not proof["zeroed"]:
             return proof
         self.last_zero=proof
-        if not self.context.is_cancel_requested() and not self.context.is_timed_out():
-            # 只接续本任务刚完成的原生停车代次；上层全局停车或另一原生停车仍终止旧请求。
-            renewed=self.runtime._run_with_motion_admission(self.admission,lambda:self.runtime._admit_motion_request(self.admission.capability_name,request_id=self.admission.request_id,deadline_monotonic=self.context.timeout_deadline_monotonic()))
-            if renewed.guard_motion_stop_generation!=stopped.motion_stop_generation or renewed.generation!=stopped.generation or renewed.boot_nonce!=bytes(stopped.boot_nonce):
-                raise GatewayError("跨层停车后运动代次再次改变，不能继续旧任务。",error_code="motion_request_cancelled")
-            self.admission=renewed
         return proof
 
     def stop_mapping(self):
@@ -211,7 +204,7 @@ class GatewayBuildingPorts:
         if distance>connection.docking_max_distance_m or not connection.allow_docking_without_localization:
             return False
         self.ensure_active()
-        session=self.runtime._run_with_motion_admission(self.admission,lambda:self.runtime.motion_guard.acquire_relative_session(self.admission.proof))
+        session=self.runtime.motion_guard.acquire_relative_session(self.admission.proof)
         try:
             result=provider.execute_docking(connection,guard_session=session,ensure_active=self.ensure_active,remaining_sec=self.remaining_sec,interlock=invariant)
         finally:

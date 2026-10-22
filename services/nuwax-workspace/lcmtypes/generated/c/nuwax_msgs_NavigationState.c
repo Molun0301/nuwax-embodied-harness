@@ -21,7 +21,7 @@ uint64_t __nuwax_msgs_NavigationState_hash_recursive(const __lcm_hash_ptr *p)
     cp.v = __nuwax_msgs_NavigationState_get_hash;
     (void) cp;
 
-    uint64_t hash = (uint64_t)0x72e1fbd257455e5cLL
+    uint64_t hash = (uint64_t)0xcf8a350daa50d92eLL
          + __string_hash_recursive(&cp)
          + __string_hash_recursive(&cp)
          + __int64_t_hash_recursive(&cp)
@@ -35,7 +35,6 @@ uint64_t __nuwax_msgs_NavigationState_hash_recursive(const __lcm_hash_ptr *p)
          + __double_hash_recursive(&cp)
          + __double_hash_recursive(&cp)
          + __string_hash_recursive(&cp)
-         + __int64_t_hash_recursive(&cp)
          + __int64_t_hash_recursive(&cp)
          + __int64_t_hash_recursive(&cp)
          + __int64_t_hash_recursive(&cp)
@@ -115,9 +114,6 @@ int __nuwax_msgs_NavigationState_encode_array(void *buf, int offset, int maxlen,
         if (thislen < 0) return thislen; else pos += thislen;
 
         thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].runtime_generation), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].guard_generation), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
         thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].pose_source_timestamp_ns), 1);
@@ -223,8 +219,6 @@ int __nuwax_msgs_NavigationState_encoded_array_size(const nuwax_msgs_NavigationS
 
         size += __int64_t_encoded_array_size(&(p[element].runtime_generation), 1);
 
-        size += __int64_t_encoded_array_size(&(p[element].guard_generation), 1);
-
         size += __int64_t_encoded_array_size(&(p[element].pose_source_timestamp_ns), 1);
 
         size += __int64_t_encoded_array_size(&(p[element].costmap_source_timestamp_ns), 1);
@@ -318,9 +312,6 @@ int __nuwax_msgs_NavigationState_decode_array(const void *buf, int offset, int m
         thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].runtime_generation), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
-        thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].guard_generation), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
         thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].pose_source_timestamp_ns), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
@@ -412,8 +403,6 @@ int __nuwax_msgs_NavigationState_decode_array_cleanup(nuwax_msgs_NavigationState
         __string_decode_array_cleanup(&(p[element].message), 1);
 
         __int64_t_decode_array_cleanup(&(p[element].runtime_generation), 1);
-
-        __int64_t_decode_array_cleanup(&(p[element].guard_generation), 1);
 
         __int64_t_decode_array_cleanup(&(p[element].pose_source_timestamp_ns), 1);
 
@@ -510,8 +499,6 @@ int __nuwax_msgs_NavigationState_clone_array(const nuwax_msgs_NavigationState *p
         __string_clone_array(&(p[element].message), &(q[element].message), 1);
 
         __int64_t_clone_array(&(p[element].runtime_generation), &(q[element].runtime_generation), 1);
-
-        __int64_t_clone_array(&(p[element].guard_generation), &(q[element].guard_generation), 1);
 
         __int64_t_clone_array(&(p[element].pose_source_timestamp_ns), &(q[element].pose_source_timestamp_ns), 1);
 

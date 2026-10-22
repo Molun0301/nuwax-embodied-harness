@@ -221,21 +221,6 @@ class GeometryRuntimeStub(object):
                 request_serializer=geometry__runtime__pb2.StopExplorationRequest.SerializeToString,
                 response_deserializer=geometry__runtime__pb2.ExplorationState.FromString,
                 _registered_method=True)
-        self.RecoverExplorationAfterNavigationRollover = channel.unary_unary(
-                '/nuwax.geometry.GeometryRuntime/RecoverExplorationAfterNavigationRollover',
-                request_serializer=geometry__runtime__pb2.RecoverExplorationAfterNavigationRolloverRequest.SerializeToString,
-                response_deserializer=geometry__runtime__pb2.ExplorationState.FromString,
-                _registered_method=True)
-        self.ReconcileExplorationAfterGlobalStop = channel.unary_unary(
-                '/nuwax.geometry.GeometryRuntime/ReconcileExplorationAfterGlobalStop',
-                request_serializer=geometry__runtime__pb2.ReconcileExplorationAfterGlobalStopRequest.SerializeToString,
-                response_deserializer=geometry__runtime__pb2.ExplorationState.FromString,
-                _registered_method=True)
-        self.AcknowledgeExplorationOwnershipReconciliation = channel.unary_unary(
-                '/nuwax.geometry.GeometryRuntime/AcknowledgeExplorationOwnershipReconciliation',
-                request_serializer=geometry__runtime__pb2.AcknowledgeExplorationOwnershipReconciliationRequest.SerializeToString,
-                response_deserializer=geometry__runtime__pb2.AcknowledgeExplorationOwnershipReconciliationResult.FromString,
-                _registered_method=True)
         self.GetExplorationState = channel.unary_unary(
                 '/nuwax.geometry.GeometryRuntime/GetExplorationState',
                 request_serializer=geometry__runtime__pb2.Empty.SerializeToString,
@@ -520,24 +505,6 @@ class GeometryRuntimeServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def RecoverExplorationAfterNavigationRollover(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def ReconcileExplorationAfterGlobalStop(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def AcknowledgeExplorationOwnershipReconciliation(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
     def GetExplorationState(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -768,21 +735,6 @@ def add_GeometryRuntimeServicer_to_server(servicer, server):
                     servicer.StopExploration,
                     request_deserializer=geometry__runtime__pb2.StopExplorationRequest.FromString,
                     response_serializer=geometry__runtime__pb2.ExplorationState.SerializeToString,
-            ),
-            'RecoverExplorationAfterNavigationRollover': grpc.unary_unary_rpc_method_handler(
-                    servicer.RecoverExplorationAfterNavigationRollover,
-                    request_deserializer=geometry__runtime__pb2.RecoverExplorationAfterNavigationRolloverRequest.FromString,
-                    response_serializer=geometry__runtime__pb2.ExplorationState.SerializeToString,
-            ),
-            'ReconcileExplorationAfterGlobalStop': grpc.unary_unary_rpc_method_handler(
-                    servicer.ReconcileExplorationAfterGlobalStop,
-                    request_deserializer=geometry__runtime__pb2.ReconcileExplorationAfterGlobalStopRequest.FromString,
-                    response_serializer=geometry__runtime__pb2.ExplorationState.SerializeToString,
-            ),
-            'AcknowledgeExplorationOwnershipReconciliation': grpc.unary_unary_rpc_method_handler(
-                    servicer.AcknowledgeExplorationOwnershipReconciliation,
-                    request_deserializer=geometry__runtime__pb2.AcknowledgeExplorationOwnershipReconciliationRequest.FromString,
-                    response_serializer=geometry__runtime__pb2.AcknowledgeExplorationOwnershipReconciliationResult.SerializeToString,
             ),
             'GetExplorationState': grpc.unary_unary_rpc_method_handler(
                     servicer.GetExplorationState,
@@ -1822,87 +1774,6 @@ class GeometryRuntime(object):
             '/nuwax.geometry.GeometryRuntime/StopExploration',
             geometry__runtime__pb2.StopExplorationRequest.SerializeToString,
             geometry__runtime__pb2.ExplorationState.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def RecoverExplorationAfterNavigationRollover(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/nuwax.geometry.GeometryRuntime/RecoverExplorationAfterNavigationRollover',
-            geometry__runtime__pb2.RecoverExplorationAfterNavigationRolloverRequest.SerializeToString,
-            geometry__runtime__pb2.ExplorationState.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def ReconcileExplorationAfterGlobalStop(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/nuwax.geometry.GeometryRuntime/ReconcileExplorationAfterGlobalStop',
-            geometry__runtime__pb2.ReconcileExplorationAfterGlobalStopRequest.SerializeToString,
-            geometry__runtime__pb2.ExplorationState.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def AcknowledgeExplorationOwnershipReconciliation(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/nuwax.geometry.GeometryRuntime/AcknowledgeExplorationOwnershipReconciliation',
-            geometry__runtime__pb2.AcknowledgeExplorationOwnershipReconciliationRequest.SerializeToString,
-            geometry__runtime__pb2.AcknowledgeExplorationOwnershipReconciliationResult.FromString,
             options,
             channel_credentials,
             insecure,

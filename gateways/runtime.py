@@ -2,13 +2,10 @@ from __future__ import annotations
 
 from core.config_values import runtime_value
 
-from collections import OrderedDict
-from contextlib import ExitStack, contextmanager
-from dataclasses import asdict, dataclass, field, is_dataclass, replace
+from contextlib import ExitStack
+from dataclasses import asdict, is_dataclass, replace
 from datetime import datetime, timezone
-from enum import IntEnum
 from functools import partial
-import fcntl
 import json
 import logging
 import math
@@ -16,7 +13,7 @@ import os
 from pathlib import Path
 import threading
 import time
-from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import uuid
 
 import grpc
@@ -55,7 +52,6 @@ from contracts.runtime_views import (
 )
 from contracts.streams import StreamPayloadKind
 from core import CapabilityRegistry, EventBus, ResourceLockManager, RuntimeResource, SafetyGuard, StateStore, StreamBus, TaskManager
-from core.safety_guard import MotionStopGenerationError
 from core.task_manager import (
     TaskCancelledError,
     TaskSafetyBarrierError,
@@ -102,9 +98,6 @@ from services.geometry import (
 )
 from services.geometry.geometry_runtime_provider import GeometryRuntimeRpcError
 from services.geometry.geometry_runtime_provider import (
-    _exploration_child_lease_address,
-    _exploration_receipt_matches_child,
-    _exploration_reconciliation_ack_fields,
     resolve_direct_static_calibration_edge,
 )
 from services.geometry.pointcloud_map import (
@@ -123,7 +116,6 @@ from skills.map_workspace import MapWorkspaceService
 from services.memory import MemoryService
 from services.navigation import NavigationService
 from services.navigation.motion_guard_client import MotionGuardError
-from services.navigation.proto_gen import motion_guard_pb2 as motion_guard_pb
 from services.observation_service import ObservationService
 from services.perception import PerceptionService, PerceptionVideoRuntime, build_platform_perception_components
 from services.perception.service import VideoFrameSource
@@ -375,21 +367,6 @@ _NAVIGATION_STATUS_STREAM_REFRESH_INTERVAL_SEC = 0.5
 _VIDEO_STREAM_REFRESH_INTERVAL_SEC = 1.0 / 3.0
 _DEFAULT_ASYNC_TASK_TIMEOUT_SEC = 15 * 60
 _EXPLORATION_STOP_BARRIER_TIMEOUT_SEC = 10.0
-_EXPLORATION_STOP_TRANSACTION_CAPACITY = 32
-
-
-@dataclass(frozen=True)
-class _PendingExplorationAdmission:
-    """仅供后台探索启动使用的请求身份；不包含运动执行许可。"""
-
-    capability_name: str
-    request_id: str
-    motion_stop_generation: int
-
-
-@dataclass(frozen=True)
-class _PendingNavigationAdmission(_PendingExplorationAdmission):
-    """选点任务受理身份；后台准备完成后才申请实际运动许可。"""
 
 
 class _RuntimeActivationEvent(threading.Event):
@@ -401,51 +378,6 @@ class _RuntimeActivationEvent(threading.Event):
         self.error: Optional[Exception] = None
 
 
-class _ExplorationStopPhase(IntEnum):
-    ZEROED = 0
-    DISCOVERING = 1
-    TARGETED = 2
-    FENCE_HELD = 3
-    RECEIPT_COMMITTED = 4
-    TERMINAL_REFRESHED = 5
-    FENCE_RELEASED = 6
-    QUARANTINE_RELEASED = 7
-    JOURNAL_ACKED = 8
-    DONE = 9
-
-
-@dataclass
-class _ExplorationStopTransaction:
-    operation_id: str
-    stop_reason: str
-    ordinary_confirmation: Any
-    cancelled_task_ids: Tuple[str, ...]
-    ordinary_confirmed: bool = True
-    post_zero_local_state_complete: bool = False
-    recovery_fence_was_held: bool = False
-    phase: _ExplorationStopPhase = _ExplorationStopPhase.ZEROED
-    request_id: str = ""
-    exploration_generation: int = 0
-    child_lease: MetadataDict = field(default_factory=dict)
-    legacy_child_lease_fingerprint: str = ""
-    receipt_available: bool = False
-    terminal_receipt: MetadataDict = field(default_factory=dict)
-    terminal_stop_reason: str = ""
-    cancel_generation: int = 0
-    recovery_correlation: str = ""
-    admission_guard_generation: int = 0
-    admission_guard_boot_nonce: bytes = b""
-    admission_motion_stop_generation: int = 0
-    fence_token: bytes = field(default=b"", repr=False)
-    fence_generation: int = 0
-    fence_boot_nonce: bytes = b""
-    fence_motion_stop_generation: int = 0
-    fence_zero_ack_id: str = ""
-    fence_zero_applied_monotonic_ns: int = 0
-    release_zero_ack_id: str = ""
-    release_zero_applied_monotonic_ns: int = 0
-    release_motion_stop_generation: int = 0
-    released_task_ids: Tuple[str, ...] = ()
 _ASYNC_GEOMETRY_TASK_POLLING_GUIDANCE: Dict[str, Dict[str, object]] = {
     "activate_map": {
         "initial_wait_sec": 45.0,
@@ -589,29 +521,6 @@ def _has_observability_value(value: Any) -> bool:
     return value is not None and value != ""
 
 
-@contextmanager
-def _runtime_activation_protocol_lock(request_path: Path) -> Iterator[None]:
-    """串行化同一请求路径的跨进程文件变更，不覆盖服务启动或就绪等待。"""
-
-    lock_path = str(request_path) + ".lock"
-    try:
-        descriptor = os.open(lock_path, os.O_RDONLY | os.O_CREAT | os.O_EXCL, 0o644)
-    except FileExistsError:
-        descriptor = os.open(lock_path, os.O_RDONLY)
-    else:
-        # 激活器和网关可由不同账户创建；只读描述符也能持有当前系统的独占文件锁。
-        try:
-            os.fchmod(descriptor, 0o644)
-        except BaseException:
-            os.close(descriptor)
-            raise
-    try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
-        yield
-    finally:
-        os.close(descriptor)
-
-
 def _write_json_file_atomically(path: Path, payload: Dict[str, Any]) -> None:
     """Write a small cross-process protocol payload without exposing partial JSON."""
 
@@ -630,7 +539,7 @@ def _write_json_file_atomically(path: Path, payload: Dict[str, Any]) -> None:
 
 
 def _wake_runtime_activation_request(request_path: Path, request_id: str) -> bool:
-    """调用者持协议锁；只唤醒同一现存请求，不续期或创建新运动授权。"""
+    """调用者持网关状态锁；只唤醒同一现存请求，不续期或创建运动授权。"""
     try:
         payload = json.loads(request_path.read_text(encoding="utf-8"))
     except (FileNotFoundError, ValueError):
@@ -638,7 +547,7 @@ def _wake_runtime_activation_request(request_path: Path, request_id: str) -> boo
     if not isinstance(payload, dict) or payload.get("request_id") != request_id:
         return False
     # 旧版systemd可能漏掉原子替换；关闭可写描述符会产生IN_CLOSE_WRITE。
-    # 不写字节、不改内容、不替换文件，激活器仍须完成原ACK/commit事务。
+    # 不写字节、不改内容、不替换文件，启动器按请求编号返回真实启动结果。
     descriptor = os.open(request_path, os.O_WRONLY | os.O_APPEND)
     os.close(descriptor)
     return True
@@ -1039,15 +948,8 @@ class GatewayRuntime:
             event_bus=self.event_bus,
             resource_lock_manager=self.resource_lock_manager,
         )
-        self.safety_guard.register_motion_resource_quarantine_provider(
-            self.task_manager.motion_resource_quarantine_snapshot
-        )
         self.motion_guard = motion_guard or GatewayMotionGuard()
         self.person_follow_bridge = person_follow_bridge or GatewayPersonFollowBridge()
-        self._exploration_stop_transaction_lock = threading.RLock()
-        self._exploration_stop_transactions: OrderedDict[
-            str, _ExplorationStopTransaction
-        ] = OrderedDict()
         self.artifact_store = artifact_store or LocalArtifactStore(
             config.gateway.artifact_dir,
             config.gateway.public_base_url,
@@ -1544,24 +1446,12 @@ class GatewayRuntime:
                     raise RuntimeError("事件分发或日志输出尚未关闭，相关依赖已保留；请稍后重试停止。")
                 return
             RUNTIME_LOGGER.info("宿主机运行时开始停止。")
+            self._closed = True
             try:
                 # 只读网关没有建立过运动连接时，关闭不应反向启动运动服务。
                 # 曾建立连接后故障仍须停车，不能仅用当前 started 判断。
-                stop_result = (
+                if self.motion_guard.has_connected:
                     self.safety_guard.stop_all_motion("宿主机网关关闭。")
-                    if self.motion_guard.has_connected
-                    else None
-                )
-                if (
-                    isinstance(stop_result, dict)
-                    and (
-                        stop_result.get("completed") is False
-                        or stop_result.get("reconciliation_pending") is True
-                    )
-                ):
-                    stop_error = RuntimeError(
-                        "gateway shutdown motion stop reconciliation is pending"
-                    )
             except Exception as exc:
                 stop_error = exc
                 RUNTIME_LOGGER.exception(
@@ -2808,14 +2698,11 @@ class GatewayRuntime:
                     {
                         "stopped": {"type": "boolean"},
                         "operation_id": {"type": "string"},
-                        "motion_stop_generation": {"type": "integer"},
+                        "reason": {"type": ["string", "null"]},
                         "handler_results": {"type": "object"},
+                        "released_resources": {"type": "array", "items": {"type": "object"}},
                     },
-                    required=(
-                        "stopped",
-                        "operation_id",
-                        "motion_stop_generation",
-                    ),
+                    required=("stopped", "operation_id", "reason", "handler_results", "released_resources"),
                 ),
             ),
             _descriptor(
@@ -4608,30 +4495,11 @@ class GatewayRuntime:
         try:
             if self._requires_motion_admission(descriptor) or descriptor.name in {"activate_map", "start_mapping", "delete_map", "finalize_active_map", "relocalize_active_map"}:
                 self._assert_floor_execution_allows_public_request(descriptor.name)
-            if descriptor.name in {"explore_area", "explore_area_v2"}:
-                self._ensure_geometry_runtime_for_invoke(capability_name)
-                payload[motion_skills.MOTION_ADMISSION_ARGUMENT] = (
-                    _PendingExplorationAdmission(
-                        capability_name=descriptor.name,
-                        request_id=str(context.get("request_id") or ""),
-                        motion_stop_generation=self.safety_guard.begin_motion_admission(),
-                    )
+            if self._requires_motion_admission(descriptor):
+                payload[motion_skills.MOTION_ADMISSION_ARGUMENT] = self._admit_motion_request(
+                    descriptor.name, request_id=str(context.get("request_id") or ""),
                 )
-            elif descriptor.name == "navigate_to_pose":
-                payload[motion_skills.MOTION_ADMISSION_ARGUMENT] = _PendingNavigationAdmission(
-                    capability_name=descriptor.name,
-                    request_id=str(context.get("request_id") or ""),
-                    motion_stop_generation=self.safety_guard.begin_motion_admission(),
-                )
-            elif self._requires_motion_admission(descriptor):
-                payload[motion_skills.MOTION_ADMISSION_ARGUMENT] = (
-                    self._admit_motion_request(
-                        descriptor.name,
-                        request_id=str(context.get("request_id") or ""),
-                    )
-                )
-            else:
-                self._ensure_geometry_runtime_for_invoke(capability_name)
+            self._ensure_geometry_runtime_for_invoke(capability_name)
             if descriptor.execution_mode == CapabilityExecutionMode.ASYNC_TASK:
                 result = registration.handler(payload, requested_by=requested_by, request_context=context)
             else:
@@ -6644,70 +6512,8 @@ class GatewayRuntime:
         exploration_state = getattr(context, "exploration_state", None)
         raw_status = getattr(exploration_state, "status", "")
         terminal_status = str(getattr(raw_status, "value", raw_status) or "").lower()
-        exploration_metadata = dict(
-            getattr(exploration_state, "metadata", {}) or {}
-        )
-        recovery_proof = {
-            "ownership_domain": "exploration",
-            "request_id": request_id,
-            "terminal_status": terminal_status,
-            "exploration_terminal": True,
-            "child_task_id": None,
-            "last_stop_reason": exploration_metadata.get("last_stop_reason"),
-        }
-
         cancelled_parent_task_ids: List[str] = []
-        released_quarantined_task_ids: List[str] = []
-        parent_capabilities = {
-            "explore_area",
-            "explore_area_v2",
-            "explore_and_find_target",
-        }
-        quarantined_tasks = self.task_manager.list_quarantined_tasks()
-        for task_status in quarantined_tasks:
-            task_id = str(getattr(task_status, "task_id", "") or "")
-            if not task_id:
-                continue
-            try:
-                task_spec = self.task_manager.get_task_spec(task_id)
-            except KeyError:
-                continue
-            if str(getattr(task_spec, "capability_name", "")) not in parent_capabilities:
-                continue
-            capability_name = str(getattr(task_spec, "capability_name", ""))
-            input_payload = dict(getattr(task_spec, "input_payload", {}) or {})
-            metadata = dict(getattr(task_spec, "metadata", {}) or {})
-            parent_request_id = str(
-                input_payload.get("request_id")
-                or metadata.get("request_id")
-                or ""
-            ).strip()
-            if capability_name == "explore_and_find_target":
-                try:
-                    error_payload = dict(self.task_manager.get_task_error_payload(task_id) or {})
-                except KeyError:
-                    continue
-                error_details = dict(error_payload.get("details") or {})
-                quarantine_correlation = dict(
-                    error_details.get("resource_quarantine_correlation") or {}
-                )
-                if quarantine_correlation != {
-                    "ownership_domain": "exploration",
-                    "request_id": request_id,
-                }:
-                    continue
-            elif parent_request_id != request_id:
-                continue
-            if self.task_manager.release_resource_quarantine(
-                task_id,
-                proof=recovery_proof,
-                correlation={
-                    "ownership_domain": "exploration",
-                    "request_id": request_id,
-                },
-            ):
-                released_quarantined_task_ids.append(task_id)
-
+        parent_capabilities = {"explore_area", "explore_area_v2", "explore_and_find_target"}
         for task_status in self.task_manager.list_active_tasks():
             task_id = str(getattr(task_status, "task_id", "") or "")
             if not task_id:
@@ -6743,7 +6549,6 @@ class GatewayRuntime:
             "child_navigation_terminal": terminal_status,
             "child_navigation_zeroed": True,
             "cancelled_parent_task_ids": cancelled_parent_task_ids,
-            "released_quarantined_task_ids": released_quarantined_task_ids,
             "mapping_stopped": False,
             "next_step_hint": "探索与其子导航已停止；建图会话保持运行。",
         }
@@ -6853,9 +6658,9 @@ class GatewayRuntime:
             if not context.commit_success({"building_request_id":request.request_id,"completed_floors":list(result.completed_floors),"no_active_child":True}):
                 ports.interrupt_barrier({"no_active_child":True});context.ensure_active()
             return {"request_id":request.request_id,"building_exploration":result}
-        return self._run_with_motion_admission(admission,lambda:self.task_manager.submit(capability,runner,input_payload=request.model_dump(mode="json"),
+        return self.task_manager.submit(capability,runner,input_payload=request.model_dump(mode="json"),
             required_resources=list(descriptor.required_resources),timeout_sec=request.timeout_sec,requested_by=requested_by,deferred_interrupt=True,
-            metadata=self._build_task_request_metadata(capability_name=capability,requested_by=requested_by,request_context=request_context)))
+            metadata=self._build_task_request_metadata(capability_name=capability,requested_by=requested_by,request_context=request_context))
 
     def _handle_list_buildings(self, arguments, *, requested_by=None):
         del arguments,requested_by
@@ -6907,9 +6712,9 @@ class GatewayRuntime:
                 ports.interrupt_barrier(ports.stop_navigation(None),reconciled=True)
                 context.ensure_active()
             return {"request_id":request.request_id,"building_navigation":result}
-        return self._run_with_motion_admission(admission,lambda:self.task_manager.submit(capability,runner,input_payload=request.model_dump(mode="json"),
+        return self.task_manager.submit(capability,runner,input_payload=request.model_dump(mode="json"),
             requested_by=requested_by,required_resources=list(descriptor.required_resources),timeout_sec=request.timeout_sec,deferred_interrupt=True,
-            metadata=self._build_task_request_metadata(capability_name=capability,requested_by=requested_by,request_context=request_context)))
+            metadata=self._build_task_request_metadata(capability_name=capability,requested_by=requested_by,request_context=request_context))
 
     def _handle_navigate_to_pose(
         self,
@@ -6918,18 +6723,11 @@ class GatewayRuntime:
         requested_by: Optional[str] = None,
         request_context: Optional[MetadataDict] = None,
     ):
-        motion_admission = arguments.get(motion_skills.MOTION_ADMISSION_ARGUMENT)
-        pending = isinstance(motion_admission, _PendingNavigationAdmission)
-        if pending and motion_admission.capability_name != "navigate_to_pose":
-            raise RuntimeError("导航准备请求的能力身份不匹配")
-        if not pending:
-            motion_admission = self._require_motion_admission(arguments, "navigate_to_pose")
-        map_name = str(arguments.get("map_name") or "").strip()
+        motion_admission = self._require_motion_admission(arguments, "navigate_to_pose")
+        map_name = str(arguments.get("map_name") or "").strip() or self.map_workspace_service.get_active_map_name()
         workspace = None
-        if pending:
-            map_name = map_name or self.map_workspace_service.get_active_map_name()
-            if not map_name:
-                raise GatewayError("请先选择地图。", error_code="map_not_activated")
+        if not map_name:
+            raise GatewayError("请先选择地图。", error_code="map_not_activated")
 
         def prepare_navigation(context=None):
             nonlocal map_name, workspace, current_localization_session_id
@@ -6976,8 +6774,6 @@ class GatewayRuntime:
             allow_reverse=arguments.get("allow_reverse"),
             metadata=goal_metadata,
         )
-        if not pending:
-            goal = prepare_navigation()
         poll_interval_sec = self._float(arguments, "poll_interval_sec", 0.1)
         # 选点导航持续执行到到达或取消；仅调用者显式提供期限时才启用任务超时。
         timeout_sec = (self._resolve_async_timeout("navigate_to_pose", arguments, minimum_sec=0.1)
@@ -6994,7 +6790,7 @@ class GatewayRuntime:
             timeout_sec=timeout_sec,
             requested_by=requested_by,
             request_context=request_context,
-            **({"prepare_callback": prepare_navigation} if pending else {}),
+            prepare_callback=prepare_navigation,
             completion_callback=(
                 (
                     lambda _navigation_context: self._build_navigation_arrival_result(
@@ -7071,18 +6867,15 @@ class GatewayRuntime:
         query_text = self._require_str(arguments, "query_text")
         query_request_id = str(arguments.get("query_request_id") or "").strip() or self._build_runtime_request_id("place")
         admission = self._require_motion_admission(arguments, "navigate_to_place")
-        result = self._run_with_motion_admission(
-            admission,
-            lambda: self.map_workspace_service.submit_mapping_cloud_goal(
+        self._ensure_motion_runtime_for_backend_call("navigate_to_place", admission)
+        result = self.map_workspace_service.submit_mapping_cloud_goal(
                 query_request_id=query_request_id,
                 query_text=query_text,
                 motion_admission={
-                    "guard_generation": admission.generation,
                     "guard_boot_nonce": admission.boot_nonce,
-                    "motion_stop_generation": admission.guard_motion_stop_generation,
+                    "motion_stop_generation": admission.motion_stop_generation,
                 },
-            ),
-        )
+            )
 
         # The outer query/admission result is distinct from navigation completion.
         # Keep the original wire receipt intact; the existing MCP/Agent wrappers
@@ -7127,32 +6920,11 @@ class GatewayRuntime:
 
         del request_context
         request_id = str(arguments.get("request_id") or "").strip() or None
-        # Exact cancel checks cached control authority before any display aggregation.
-        # The service/provider still revalidate the exact lease at cancellation.
-        navigation_context = (
-            self.navigation_service.get_navigation_control_context()
-            if request_id is not None
-            else self.navigation_service.refresh_navigation()
-        )
-        state = navigation_context.navigation_state
-        metadata = dict(state.metadata or {})
-        if metadata.get("ownership_retained") is True and metadata.get("authority_current") is False:
-            raise GatewayError(
-                "原导航目标尚未结算，当前连接没有该目标的取消资格。",
-                error_code="navigation_control_authority_unavailable",
-                http_status=409,
-                details={
-                    "goal_id": state.current_goal_id,
-                    "navigation": to_jsonable(state),
-                    "reason_code": metadata.get("reason_code"),
-                    "ownership_retained": True,
-                    "authority_current": False,
-                    "historical_navigation_identity": metadata.get("historical_navigation_identity"),
-                    "retryable": False,
-                },
-            )
         cancellation_requested = True
         if request_id is None:
+            # 未指定目标时读取当前目标；精确取消直接交后端裁决。
+            navigation_context = self.navigation_service.get_navigation_control_context()
+            state = navigation_context.navigation_state
             cancellation_requested = state.status in {
                 NavigationStatus.ACCEPTED,
                 NavigationStatus.PLANNING,
@@ -7609,9 +7381,7 @@ class GatewayRuntime:
                         }
                     )
 
-        return self._run_with_motion_admission(
-            motion_admission,
-            lambda: self.task_manager.submit(
+        return self.task_manager.submit(
                 "find_target",
                 runner,
                 input_payload={
@@ -7629,8 +7399,7 @@ class GatewayRuntime:
                     request_context=request_context,
                 ),
                 deferred_interrupt=True,
-            ),
-        )
+            )
 
     def _handle_explore_area(
         self,
@@ -7651,11 +7420,7 @@ class GatewayRuntime:
                 jsonrpc_code=-32602,
                 details={"unsupported_parameters": removed_fields},
             )
-        motion_admission = arguments.get(motion_skills.MOTION_ADMISSION_ARGUMENT)
-        if not isinstance(motion_admission, _PendingExplorationAdmission):
-            motion_admission = self._require_motion_admission(arguments, capability_name)
-        elif motion_admission.capability_name != capability_name:
-            raise RuntimeError("探索启动请求的能力身份不匹配。")
+        motion_admission = self._require_motion_admission(arguments, capability_name)
         # 受理阶段只固定地图名称；创建、激活及后端等待都由任务拥有。
         map_name = str(arguments.get("map_name", "")).strip()
         if not map_name:
@@ -8064,13 +7829,10 @@ class GatewayRuntime:
                     "request_id",
                     active_request.request_id,
                 )
-                exploration_context = self._run_with_motion_admission(
-                    motion_admission,
-                    lambda: self.navigation_service.start_exploration(
+                exploration_context = self.navigation_service.start_exploration(
                         active_request,
                         deadline_monotonic=parent_deadline,
-                    ),
-                )
+                    )
                 active_exploration_request_id = active_request.request_id
                 self._attach_perception_to_exploration()
                 perception_attached = True
@@ -8204,13 +7966,10 @@ class GatewayRuntime:
                             "request_id",
                             active_request.request_id,
                         )
-                        exploration_context = self._run_with_motion_admission(
-                            motion_admission,
-                            lambda: self.navigation_service.start_exploration(
+                        exploration_context = self.navigation_service.start_exploration(
                                 active_request,
                                 deadline_monotonic=parent_deadline,
-                            ),
-                        )
+                            )
                         active_exploration_request_id = active_request.request_id
                         continue
 
@@ -8375,9 +8134,7 @@ class GatewayRuntime:
                 ):
                     acknowledge_interrupted_parking()
 
-        return self._run_with_motion_admission(
-            motion_admission,
-            lambda: self.task_manager.submit(
+        return self.task_manager.submit(
                 "explore_and_find_target",
                 runner,
                 input_payload={
@@ -8404,8 +8161,7 @@ class GatewayRuntime:
                     "request_id": request.request_id,
                 },
                 deferred_interrupt=True,
-            ),
-        )
+            )
 
     def _handle_inspect_target(
         self,
@@ -8507,9 +8263,7 @@ class GatewayRuntime:
                 artifact_owners.enter_context(self.artifact_service.publication_scope(owner="runtime.inspect"))
                 return run_owned(context, artifact_owners)
 
-        return self._run_with_motion_admission(
-            motion_admission,
-            lambda: self.task_manager.submit(
+        return self.task_manager.submit(
                 "inspect_target",
                 runner,
                 input_payload={
@@ -8526,8 +8280,7 @@ class GatewayRuntime:
                     requested_by=requested_by,
                     request_context=request_context,
                 ),
-            ),
-        )
+            )
 
     def _handle_follow_target(
         self,
@@ -8715,12 +8468,9 @@ class GatewayRuntime:
                     context.ensure_active()
                     if time.monotonic() >= deadline:
                         break
-                    session = self._run_with_motion_admission(
-                        motion_admission,
-                        lambda: self.motion_guard.acquire_follow_session(
+                    session = self.motion_guard.acquire_follow_session(
                             motion_admission.proof
-                        ),
-                    )
+                        )
                     try:
                         bridge.bind_session(
                             session_id,
@@ -8844,9 +8594,7 @@ class GatewayRuntime:
                 "last_detection": last_detection,
             }
 
-        return self._run_with_motion_admission(
-            motion_admission,
-            lambda: self.task_manager.submit(
+        return self.task_manager.submit(
                 "follow_target",
                 runner,
                 input_payload={
@@ -8864,8 +8612,7 @@ class GatewayRuntime:
                     requested_by=requested_by,
                     request_context=request_context,
                 ),
-            ),
-        )
+            )
 
     def _relative_move_limits(self) -> Optional[MotionCommandLimits]:
         """目录与调用共用设备声明；空声明表示未知，损坏声明明确失败。"""
@@ -8944,12 +8691,9 @@ class GatewayRuntime:
 
         def runner(context) -> Dict[str, float]:
             try:
-                session = self._run_with_motion_admission(
-                    motion_admission,
-                    lambda: self.motion_guard.acquire_relative_session(
+                session = self.motion_guard.acquire_relative_session(
                         motion_admission.proof
-                    ),
-                )
+                    )
                 start_time = time.monotonic()
                 try:
                     while True:
@@ -8979,9 +8723,7 @@ class GatewayRuntime:
                 "duration_sec": duration_sec,
             }
 
-        return self._run_with_motion_admission(
-            motion_admission,
-            lambda: self.task_manager.submit(
+        return self.task_manager.submit(
                 "relative_move",
                 runner,
                 input_payload={
@@ -8999,8 +8741,7 @@ class GatewayRuntime:
                     requested_by=requested_by,
                     request_context=request_context,
                 ),
-            ),
-        )
+            )
 
     def _build_private_capability_handler(self, spec: PrivateCapabilitySpec):
         """为没有专用 handler 的机器人私有能力构造通用处理器。
@@ -9040,6 +8781,12 @@ class GatewayRuntime:
         requested_by: Optional[str],
         create_if_missing: bool,
     ):
+        # 准入只读取守卫凭据；这些既有同步工作区准备仍需要实际几何组件。
+        # 选点导航已在任务中完成组件启动，随后才调用本入口解析目标。
+        if capability_name != "navigate_to_pose" and (
+            capability_name in _MOTION_STACK_CAPABILITY_NAMES or capability_name == "inspect_target"
+        ):
+            self._ensure_geometry_runtime_started(capability_name)
         explicit_map_name = str(arguments.get("map_name", "")).strip() or None
         if explicit_map_name:
             workspace = self.map_workspace_service.ensure_workspace(
@@ -10285,13 +10032,10 @@ class GatewayRuntime:
                 "导航父任务 deadline 已耗尽。",
                 error_code="navigation_timeout",
             )
-        self._run_with_motion_admission(
-            motion_admission,
-            lambda: self.navigation_service.set_goal(
+        self.navigation_service.set_goal(
                 admitted_goal,
                 deadline_monotonic=deadline_monotonic,
-            ),
-        )
+            )
         deadline = deadline_monotonic
         if deadline is None and timeout_sec is not None and timeout_sec > 0:
             deadline = time.monotonic() + float(timeout_sec)
@@ -10977,7 +10721,7 @@ class GatewayRuntime:
             ))
         return GatewayError(
             f"motion guard rejected {capability_name}: {error}",
-            error_code="motion_guard_unavailable",
+            error_code=next((item["code"] for item in failures if item.get("code")), "motion_guard_unavailable"),
             http_status=503,
             jsonrpc_code=-32010,
             details={
@@ -10990,144 +10734,43 @@ class GatewayRuntime:
     def _runtime_activation_state_lock(self):
         return self._geometry_runtime_lock
 
-    @staticmethod
-    def _runtime_activation_marker_paths(
-        request_path: Path,
-    ) -> Tuple[Path, Path]:
-        cancel_path = Path(
-            os.environ.get(
-                "NUWAX_RUNTIME_ACTIVATION_CANCEL",
-                "%s.cancel.json" % request_path,
-            )
-        )
-        ack_path = Path(
-            os.environ.get(
-                "NUWAX_RUNTIME_ACTIVATION_ACK",
-                "%s.ack.json" % request_path,
-            )
-        )
-        return cancel_path, ack_path
 
-    def _runtime_activation_cancelled_error(
-        self,
-        context: Dict[str, Any],
-    ) -> GatewayError:
-        current_generation = self.safety_guard.motion_stop_generation
+    def _runtime_activation_cancelled_error(self, context: Dict[str, Any]) -> GatewayError:
         return GatewayError(
-            "该运动请求已被更新的全局停车操作取消。",
-            error_code="motion_request_cancelled",
-            http_status=409,
-            jsonrpc_code=-32000,
-            details={
-                "capability_name": context["capability_name"],
-                "activation_level": context["activation_level"],
-                "request_id": context["request_id"],
-                "request_motion_stop_generation": context.get(
-                    "motion_stop_generation"
-                ),
-                "current_motion_stop_generation": current_generation,
-            },
+            "本次组件激活已取消。", error_code="motion_request_cancelled",
+            http_status=409, jsonrpc_code=-32000,
+            details={key: context[key] for key in ("capability_name", "activation_level", "request_id")},
         )
 
     def _cancel_runtime_activation_request(
-        self,
-        context: Dict[str, Any],
-        *,
-        reason: str,
-        error_code: str,
+        self, context: Dict[str, Any], *, reason: str, error_code: str,
     ) -> None:
-        lock = self._runtime_activation_state_lock()
-        with lock:
-            current_generation = self.safety_guard.motion_stop_generation
-            ack_path = Path(context["ack_path"])
-            cancel_path = Path(context["cancel_path"])
+        with self._runtime_activation_state_lock():
+            context["cancelled"] = True
+            context["cancel_reason"] = reason
+            context["cancel_error_code"] = error_code
+            request_path = Path(context["request_path"])
             try:
-                with _runtime_activation_protocol_lock(Path(context["request_path"])):
-                    ack_path.unlink(missing_ok=True)
-                    _write_json_file_atomically(
-                        cancel_path,
-                        {
-                            "request_id": context["request_id"],
-                            "state": "cancel_requested",
-                            "error_code": error_code,
-                            "reason": reason,
-                            "motion_stop_generation": current_generation,
-                            "cancelled_at": utc_now().isoformat(),
-                        },
-                    )
-                    _wake_runtime_activation_request(
-                        Path(context["request_path"]), context["request_id"]
-                    )
-            except OSError:
-                RUNTIME_LOGGER.exception(
-                    "写入按需组件激活取消标记失败 request_id=%s path=%s",
-                    context["request_id"],
-                    cancel_path,
-                )
+                request = json.loads(request_path.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                return
+            if request.get("request_id") == context["request_id"]:
+                request_path.unlink(missing_ok=True)
 
-    def _ack_runtime_activation_request(
-        self,
-        context: Dict[str, Any],
-    ) -> None:
-        lock = self._runtime_activation_state_lock()
-        with lock:
-            current = self._runtime_activation_context
-            expected_generation = context.get("motion_stop_generation")
-            current_generation = self.safety_guard.motion_stop_generation
-            invalidated = (
-                current is None
-                or current.get("request_id") != context["request_id"]
-                or (
-                    expected_generation is not None
-                    and expected_generation != current_generation
-                )
-            )
-            if invalidated:
-                self._cancel_runtime_activation_request(
-                    context,
-                    reason="motion stop invalidated activation before ACK",
-                    error_code="activation_cancelled",
-                )
-                raise self._runtime_activation_cancelled_error(context)
-            with _runtime_activation_protocol_lock(Path(context["request_path"])):
-                _write_json_file_atomically(
-                    Path(context["ack_path"]),
-                    {
-                        "request_id": context["request_id"],
-                        "state": "acknowledged",
-                        "motion_stop_generation": expected_generation,
-                        "acknowledged_at": utc_now().isoformat(),
-                    },
-                )
 
-    def _commit_runtime_activation_request(
-        self,
-        context: Dict[str, Any],
-    ) -> None:
-        lock = self._runtime_activation_state_lock()
-        with lock:
+    def _finish_runtime_activation_request(self, context: Dict[str, Any]) -> None:
+        with self._runtime_activation_state_lock():
             current = self._runtime_activation_context
-            expected_generation = context.get("motion_stop_generation")
-            current_generation = self.safety_guard.motion_stop_generation
-            invalidated = (
-                current is None
-                or current.get("request_id") != context["request_id"]
-                or (
-                    expected_generation is not None
-                    and expected_generation != current_generation
-                )
-            )
-            if invalidated:
-                self._cancel_runtime_activation_request(
-                    context,
-                    reason="motion stop invalidated activation before commit",
-                    error_code="activation_cancelled",
-                )
+            if current is not context or context.get("cancelled"):
                 raise self._runtime_activation_cancelled_error(context)
-            with _runtime_activation_protocol_lock(Path(context["request_path"])):
-                Path(context["request_path"]).unlink(missing_ok=True)
-                Path(context["ack_path"]).unlink(missing_ok=True)
-                Path(context["cancel_path"]).unlink(missing_ok=True)
+            request_path = Path(context["request_path"])
+            try:
+                request = json.loads(request_path.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                raise self._runtime_activation_cancelled_error(context)
+            if request.get("request_id") != context["request_id"]:
+                raise self._runtime_activation_cancelled_error(context)
+            request_path.unlink(missing_ok=True)
             self._runtime_activation_context = None
 
     def _cancel_active_motion_tasks(self, reason: str) -> Tuple[str, ...]:
@@ -11189,566 +10832,6 @@ class GatewayRuntime:
             "protected exploration task lacks an exact request identity"
         )
 
-    def _protected_exploration_requests(self) -> Dict[str, Tuple[str, ...]]:
-        with self.task_manager.motion_resource_quarantine_snapshot() as protected:
-            protected_task_ids = tuple(protected)
-        requests: Dict[str, List[str]] = {}
-        for task_id in protected_task_ids:
-            request_id = self._exploration_request_id_for_task(task_id)
-            if request_id:
-                requests.setdefault(request_id, []).append(task_id)
-        return {
-            request_id: tuple(task_ids)
-            for request_id, task_ids in requests.items()
-        }
-
-    @staticmethod
-    def _assigned_global_stop_correlation(
-        *, child_lease: MetadataDict, cancel_generation: int,
-    ) -> str:
-        return "exploration-global-stop:v2:%d:%d:%d" % (
-            int(child_lease.get("producer_runtime_generation") or 0),
-            int(child_lease.get("goal_generation") or 0), cancel_generation,
-        )
-
-    @staticmethod
-    def _confirmation_zero(confirmation: Any, *, expected_operation_id: str) -> Tuple[str, int]:
-        if str(getattr(confirmation, "operation_id", "") or "") != expected_operation_id:
-            raise RuntimeError("motion guard proof operation_id mismatch")
-        zero = getattr(confirmation, "zero", None)
-        zero_ack_id = str(getattr(zero, "zero_ack_id", "") or "").strip()
-        applied_ns = int(getattr(zero, "applied_monotonic_ns", 0) or 0)
-        if not zero_ack_id or applied_ns <= 0:
-            raise RuntimeError("motion guard proof lacks exact ZEROED confirmation")
-        return zero_ack_id, applied_ns
-
-    @staticmethod
-    def _terminal_receipt(
-        state: Any,
-        *,
-        request_id: str,
-        exploration_generation: int,
-        recovery_correlation: str,
-        child_lease: Optional[MetadataDict],
-        child_lease_fingerprint: str,
-        cancel_generation: int,
-    ) -> Tuple[MetadataDict, str]:
-        metadata = dict(getattr(state, "metadata", {}) or {})
-        receipt = metadata.get("ownership_reconciliation_receipt")
-        status = getattr(state, "status", None)
-        status_value = getattr(status, "value", status)
-        terminal_profile = (
-            str(metadata.get("last_stop_reason") or ""),
-            str(receipt.get("cause") or "") if isinstance(receipt, dict) else "",
-            (
-                str(receipt.get("commit_disposition") or "")
-                if isinstance(receipt, dict)
-                else ""
-            ),
-        )
-        exact = bool(
-            isinstance(receipt, dict)
-            and str(getattr(state, "current_request_id", "") or "").strip()
-            == request_id
-            and str(status_value or "").lower() == "failed"
-            and metadata.get("exploration_terminal") is True
-            and not str(metadata.get("child_task_id") or "").strip()
-            and metadata.get("child_lease") is None
-            and int(metadata.get("exploration_generation") or 0)
-            == exploration_generation
-            and str(receipt.get("parent_request_id") or "") == request_id
-            and int(receipt.get("exploration_generation") or 0)
-            == exploration_generation
-            and str(receipt.get("recovery_correlation") or "")
-            == recovery_correlation
-            and _exploration_receipt_matches_child(
-                receipt, child_lease=child_lease,
-                child_lease_fingerprint=child_lease_fingerprint,
-            )
-            and int(receipt.get("cancel_generation") or 0) == cancel_generation
-            and terminal_profile
-            in (
-                (
-                    "global_stop_reconciled_safe",
-                    "ordinary_global_stop",
-                    "global_stop_reconciled_child_ownership",
-                ),
-                (
-                    "child_cancel_failed",
-                    "late_exact_child_zeroed",
-                    "exact_child_zeroed_released_ownership",
-                ),
-            )
-        )
-        if not exact:
-            raise RuntimeError("global-stop reconciliation lacks exact terminal receipt")
-        return dict(receipt), terminal_profile[0]
-
-    def _record_terminal_receipt(
-        self,
-        transaction: _ExplorationStopTransaction,
-        state: Any,
-    ) -> None:
-        receipt, stop_reason = self._terminal_receipt(
-            state,
-            request_id=transaction.request_id,
-            exploration_generation=transaction.exploration_generation,
-            recovery_correlation=transaction.recovery_correlation,
-            child_lease=transaction.child_lease or None,
-            child_lease_fingerprint=transaction.legacy_child_lease_fingerprint,
-            cancel_generation=transaction.cancel_generation,
-        )
-        if transaction.terminal_receipt and transaction.terminal_receipt != receipt:
-            raise RuntimeError("ownership reconciliation terminal receipt changed")
-        if (
-            transaction.terminal_stop_reason
-            and transaction.terminal_stop_reason != stop_reason
-        ):
-            raise RuntimeError("ownership reconciliation terminal profile changed")
-        transaction.terminal_receipt = receipt
-        transaction.terminal_stop_reason = stop_reason
-
-    def _target_exploration_stop_transaction(
-        self,
-        transaction: _ExplorationStopTransaction,
-        state: Any,
-    ) -> None:
-        metadata = dict(getattr(state, "metadata", {}) or {})
-        candidate = metadata.get("global_stop_reconciliation")
-        receipt = metadata.get("ownership_reconciliation_receipt")
-        candidate = candidate if isinstance(candidate, dict) else None
-        receipt = receipt if isinstance(receipt, dict) else None
-        request_id = str(
-            getattr(state, "current_request_id", "")
-            or metadata.get("request_id")
-            or (receipt or {}).get("parent_request_id")
-            or ""
-        ).strip()
-        exploration_generation = int(
-            metadata.get("exploration_generation")
-            or (receipt or {}).get("exploration_generation")
-            or 0
-        )
-        if not request_id or exploration_generation <= 0:
-            raise RuntimeError("global-stop reconciliation lacks exact parent identity")
-        if str(metadata.get("request_id") or "").strip() != request_id:
-            raise RuntimeError("global-stop reconciliation parent identity mismatch")
-
-        if candidate and candidate.get("eligible") is True:
-            child_lease = metadata.get("child_lease")
-            if not isinstance(child_lease, dict):
-                raise RuntimeError("global-stop reconciliation lacks exact child lease")
-            child_lease = dict(child_lease)
-            child_fingerprint = ""
-            cancel_generation = int(candidate.get("cancel_generation") or 0)
-            admission_generation = int(candidate.get("admission_guard_generation") or 0)
-            admission_nonce = bytes(candidate.get("admission_guard_boot_nonce") or b"")
-            admission_stop_generation = int(
-                candidate.get("admission_motion_stop_generation") or 0
-            )
-            correlation = str(candidate.get("recovery_correlation") or "").strip()
-            expected_correlation = self._assigned_global_stop_correlation(
-                child_lease=child_lease, cancel_generation=cancel_generation,
-            )
-            if (
-                not str(child_lease.get("session_id") or "").strip()
-                or int(child_lease.get("owner_kind") or 0) != 2
-                or str(child_lease.get("parent_request_id") or "") != request_id
-                or _exploration_child_lease_address(child_lease) is None
-                or cancel_generation <= 0
-                or admission_generation <= 0
-                or len(admission_nonce) != 16
-                or not any(admission_nonce)
-                or admission_stop_generation < 0
-                or correlation != expected_correlation
-            ):
-                raise RuntimeError("global-stop reconciliation candidate identity mismatch")
-        elif receipt:
-            identity = _exploration_reconciliation_ack_fields(
-                child_lease=receipt.get("child_lease"),
-                child_lease_fingerprint=receipt.get("child_lease_fingerprint", ""),
-            )
-            child_lease = identity.get("child_lease", {})
-            child_fingerprint = identity.get("child_lease_fingerprint", "")
-            cancel_generation = int(receipt.get("cancel_generation") or 0)
-            correlation = str(receipt.get("recovery_correlation") or "").strip()
-            admission_generation = 0
-            admission_nonce = b""
-            admission_stop_generation = 0
-            if child_lease:
-                valid_correlation = (
-                    child_lease["parent_request_id"] == request_id
-                    and correlation == self._assigned_global_stop_correlation(
-                        child_lease=child_lease, cancel_generation=cancel_generation,
-                    )
-                )
-            else:
-                # The stored legacy value is opaque. Never derive a child from it.
-                prefix = "exploration-global-stop:"
-                valid_correlation = (
-                    correlation.startswith(prefix)
-                    and len(correlation) == len(prefix) + 64
-                    and all(ch in "0123456789abcdef" for ch in correlation[len(prefix):])
-                )
-            if cancel_generation <= 0 or not valid_correlation:
-                raise RuntimeError("global-stop reconciliation receipt identity mismatch")
-        else:
-            raise RuntimeError("global-stop reconciliation target is absent")
-
-        protected = self._protected_exploration_requests()
-        if len(protected) > 1 or (protected and request_id not in protected):
-            raise RuntimeError("global-stop reconciliation has ambiguous protected request ownership")
-        transaction.request_id = request_id
-        transaction.exploration_generation = exploration_generation
-        transaction.child_lease = child_lease
-        transaction.legacy_child_lease_fingerprint = child_fingerprint
-        transaction.cancel_generation = cancel_generation
-        transaction.recovery_correlation = correlation
-        transaction.admission_guard_generation = admission_generation
-        transaction.admission_guard_boot_nonce = admission_nonce
-        transaction.admission_motion_stop_generation = admission_stop_generation
-
-        if receipt:
-            if candidate and candidate.get("eligible") is True:
-                # A durable commit can precede live child cleanup. Re-enter the
-                # authenticated reconciliation path until that owner is gone.
-                if not (
-                    _exploration_receipt_matches_child(receipt, child_lease=child_lease)
-                    and str(receipt.get("parent_request_id") or "") == request_id
-                    and int(receipt.get("exploration_generation") or 0) == exploration_generation
-                    and str(receipt.get("recovery_correlation") or "") == correlation
-                    and int(receipt.get("cancel_generation") or 0) == cancel_generation
-                ):
-                    raise RuntimeError("live ownership receipt identity mismatch")
-            else:
-                self._record_terminal_receipt(transaction, state)
-                transaction.receipt_available = True
-        transaction.phase = _ExplorationStopPhase.TARGETED
-
-    def _release_reconciled_exploration_quarantine(
-        self,
-        *,
-        request_id: str,
-        proof: MetadataDict,
-        deadline_monotonic: float,
-    ) -> Tuple[str, ...]:
-        released: List[str] = []
-        while True:
-            with self.task_manager.motion_resource_quarantine_snapshot() as protected:
-                protected_task_ids = tuple(protected)
-            matching = tuple(
-                task_id
-                for task_id in protected_task_ids
-                if self._task_matches_exploration_request(task_id, request_id)
-            )
-            if not matching:
-                return tuple(released)
-            made_progress = False
-            for task_id in matching:
-                try:
-                    did_release = self.task_manager.release_resource_quarantine(
-                        task_id,
-                        proof=proof,
-                        correlation={
-                            "ownership_domain": "exploration",
-                            "request_id": request_id,
-                        },
-                    )
-                except RuntimeError:
-                    did_release = False
-                if did_release:
-                    released.append(task_id)
-                    made_progress = True
-            if made_progress:
-                continue
-            remaining_sec = deadline_monotonic - time.monotonic()
-            if remaining_sec <= 0.0:
-                raise RuntimeError(
-                    "exploration ownership reconciled but TaskManager quarantine "
-                    "release is still pending"
-                )
-            time.sleep(min(0.02, remaining_sec))
-
-    def _reconcile_exploration_ownership_after_global_stop(
-        self,
-        *,
-        operation_id: str,
-        stop_reason: str,
-        ordinary_confirmation: Any = None,
-        transaction: Optional[_ExplorationStopTransaction] = None,
-    ) -> MetadataDict:
-        deadline = time.monotonic() + _EXPLORATION_STOP_BARRIER_TIMEOUT_SEC
-        if transaction is None:
-            if ordinary_confirmation is None:
-                raise RuntimeError("ordinary stop confirmation is required")
-            transaction = _ExplorationStopTransaction(
-                operation_id=operation_id,
-                stop_reason=stop_reason,
-                ordinary_confirmation=ordinary_confirmation,
-                cancelled_task_ids=(),
-            )
-        hold_operation_id = f"{operation_id}:exploration-reconcile-hold"
-        release_operation_id = f"{operation_id}:exploration-reconcile-release"
-
-        if transaction.phase <= _ExplorationStopPhase.DISCOVERING:
-            transaction.phase = _ExplorationStopPhase.DISCOVERING
-            while True:
-                context = self.navigation_service.refresh_exploration(
-                    deadline_monotonic=deadline,
-                )
-                state = getattr(context, "exploration_state", None)
-                metadata = dict(getattr(state, "metadata", {}) or {})
-                candidate = metadata.get("global_stop_reconciliation")
-                receipt = metadata.get("ownership_reconciliation_receipt")
-                if (isinstance(candidate, dict) and candidate.get("eligible") is True) or isinstance(receipt, dict):
-                    self._target_exploration_stop_transaction(transaction, state)
-                    break
-                protected = self._protected_exploration_requests()
-                if not protected:
-                    if transaction.recovery_fence_was_held:
-                        raise RuntimeError(
-                            "motion guard recovery fence has no matching exploration identity"
-                        )
-                    transaction.phase = _ExplorationStopPhase.DONE
-                    return {"attempted": False, "phase": transaction.phase.name}
-                if len(protected) != 1:
-                    raise RuntimeError("multiple protected exploration requests require reconciliation")
-                if time.monotonic() >= deadline:
-                    raise RuntimeError("protected exploration ownership is still settling")
-                time.sleep(min(0.02, deadline - time.monotonic()))
-
-        if transaction.phase < _ExplorationStopPhase.FENCE_HELD:
-            hold_confirmation = self.motion_guard.hold_recovery_fence(
-                reason=f"{stop_reason}: retain exploration ownership fence",
-                correlation_id=transaction.recovery_correlation,
-                operation_id=hold_operation_id,
-            )
-            hold_zero_ack_id, hold_applied_ns = self._confirmation_zero(
-                hold_confirmation,
-                expected_operation_id=hold_operation_id,
-            )
-            token = bytes(getattr(hold_confirmation, "recovery_fence_token", b"") or b"")
-            fence_generation = int(getattr(hold_confirmation, "generation", 0) or 0)
-            fence_nonce = bytes(getattr(hold_confirmation, "boot_nonce", b"") or b"")
-            fence_stop_generation = int(
-                getattr(hold_confirmation, "motion_stop_generation", 0) or 0
-            )
-            ordinary_stop_generation = int(
-                getattr(transaction.ordinary_confirmation, "motion_stop_generation", 0) or 0
-            )
-            if (
-                not bool(getattr(hold_confirmation, "recovery_fence_held", False))
-                or len(token) != 32
-                or fence_generation <= 0
-                or len(fence_nonce) != 16
-                or not any(fence_nonce)
-                or fence_stop_generation <= 0
-                or (
-                    not transaction.recovery_fence_was_held
-                    and fence_stop_generation <= ordinary_stop_generation
-                )
-            ):
-                raise RuntimeError("recovery fence hold proof identity mismatch")
-            if not transaction.receipt_available and transaction.child_lease and (
-                fence_generation != transaction.admission_guard_generation
-                or fence_nonce != transaction.admission_guard_boot_nonce
-                or fence_stop_generation
-                <= transaction.admission_motion_stop_generation
-            ):
-                raise RuntimeError("recovery fence hold epoch mismatch")
-            transaction.fence_token = token
-            transaction.fence_generation = fence_generation
-            transaction.fence_boot_nonce = fence_nonce
-            transaction.fence_motion_stop_generation = fence_stop_generation
-            transaction.fence_zero_ack_id = hold_zero_ack_id
-            transaction.fence_zero_applied_monotonic_ns = hold_applied_ns
-            transaction.phase = _ExplorationStopPhase.FENCE_HELD
-
-        if (
-            transaction.phase == _ExplorationStopPhase.FENCE_HELD
-            and transaction.receipt_available
-        ):
-            transaction.phase = _ExplorationStopPhase.RECEIPT_COMMITTED
-
-        if transaction.phase < _ExplorationStopPhase.RECEIPT_COMMITTED:
-            held_proof = {
-                "stop_operation_id": hold_operation_id,
-                "guard_generation": transaction.fence_generation,
-                "guard_boot_nonce": transaction.fence_boot_nonce,
-                "motion_stop_generation": transaction.fence_motion_stop_generation,
-                "zero_ack_id": transaction.fence_zero_ack_id,
-                "zero_applied_monotonic_ns": transaction.fence_zero_applied_monotonic_ns,
-                "recovery_fence_token": transaction.fence_token,
-                "recovery_correlation": transaction.recovery_correlation,
-            }
-            try:
-                context = self.navigation_service.reconcile_exploration_after_global_stop(
-                    request_id=transaction.request_id,
-                    exploration_generation=transaction.exploration_generation,
-                    child_lease=transaction.child_lease,
-                    cancel_generation=transaction.cancel_generation,
-                    recovery_correlation=transaction.recovery_correlation,
-                    admission_guard_generation=transaction.admission_guard_generation,
-                    admission_guard_boot_nonce=transaction.admission_guard_boot_nonce,
-                    admission_motion_stop_generation=transaction.admission_motion_stop_generation,
-                    held_guard_proof=held_proof,
-                    deadline_monotonic=deadline,
-                )
-            except Exception:
-                context = self.navigation_service.refresh_exploration(
-                    deadline_monotonic=deadline,
-                )
-                state = getattr(context, "exploration_state", None)
-                self._record_terminal_receipt(transaction, state)
-            state = getattr(context, "exploration_state", None)
-            self._record_terminal_receipt(transaction, state)
-            transaction.phase = _ExplorationStopPhase.RECEIPT_COMMITTED
-
-        if transaction.phase < _ExplorationStopPhase.TERMINAL_REFRESHED:
-            context = self.navigation_service.refresh_exploration(
-                deadline_monotonic=deadline,
-            )
-            self._record_terminal_receipt(
-                transaction,
-                getattr(context, "exploration_state", None),
-            )
-            transaction.phase = _ExplorationStopPhase.TERMINAL_REFRESHED
-
-        if transaction.phase < _ExplorationStopPhase.FENCE_RELEASED:
-            release_confirmation = self.motion_guard.release_recovery_fence(
-                reason=f"{stop_reason}: release reconciled exploration fence",
-                correlation_id=transaction.recovery_correlation,
-                recovery_fence_token=transaction.fence_token,
-                operation_id=release_operation_id,
-            )
-            zero_ack_id, applied_ns = self._confirmation_zero(
-                release_confirmation,
-                expected_operation_id=release_operation_id,
-            )
-            release_generation = int(
-                getattr(release_confirmation, "motion_stop_generation", 0) or 0
-            )
-            if (
-                bool(getattr(release_confirmation, "recovery_fence_held", True))
-                or int(getattr(release_confirmation, "generation", 0) or 0)
-                != transaction.fence_generation
-                or bytes(getattr(release_confirmation, "boot_nonce", b"") or b"")
-                != transaction.fence_boot_nonce
-                or release_generation
-                <= max(
-                    transaction.fence_motion_stop_generation,
-                    int(
-                        getattr(
-                            transaction.ordinary_confirmation,
-                            "motion_stop_generation",
-                            0,
-                        )
-                        or 0
-                    ),
-                )
-            ):
-                raise RuntimeError("recovery fence release proof identity mismatch")
-            transaction.release_zero_ack_id = zero_ack_id
-            transaction.release_zero_applied_monotonic_ns = applied_ns
-            transaction.release_motion_stop_generation = release_generation
-            transaction.fence_token = b""
-            transaction.phase = _ExplorationStopPhase.FENCE_RELEASED
-
-        if not transaction.terminal_receipt or not transaction.terminal_stop_reason:
-            raise RuntimeError("ownership reconciliation terminal receipt is unavailable")
-        release_proof: MetadataDict = {
-            "ownership_domain": "exploration",
-            "request_id": transaction.request_id,
-            "terminal_status": "failed",
-            "exploration_terminal": True,
-            "child_task_id": None,
-            "last_stop_reason": transaction.terminal_stop_reason,
-            "recovery_correlation": transaction.recovery_correlation,
-            **({"child_lease_fingerprint": transaction.legacy_child_lease_fingerprint}
-               if transaction.legacy_child_lease_fingerprint else {}),
-            "ownership_reconciliation_receipt": dict(
-                transaction.terminal_receipt
-            ),
-            "zero_ack_id": transaction.release_zero_ack_id,
-            "zero_applied_monotonic_ns": transaction.release_zero_applied_monotonic_ns,
-            "motion_stop_generation": transaction.release_motion_stop_generation,
-        }
-        if transaction.phase < _ExplorationStopPhase.QUARANTINE_RELEASED:
-            protected = self._protected_exploration_requests()
-            if len(protected) > 1 or (
-                protected and transaction.request_id not in protected
-            ):
-                raise RuntimeError("protected exploration ownership is not exact")
-            transaction.released_task_ids = (
-                self._release_reconciled_exploration_quarantine(
-                    request_id=transaction.request_id,
-                    proof=release_proof,
-                    deadline_monotonic=deadline,
-                )
-            )
-            remaining = self._protected_exploration_requests()
-            if remaining:
-                raise RuntimeError("exploration quarantine release remains pending")
-            transaction.phase = _ExplorationStopPhase.QUARANTINE_RELEASED
-
-        if transaction.phase < _ExplorationStopPhase.JOURNAL_ACKED:
-            self.navigation_service.acknowledge_exploration_ownership_reconciliation(
-                recovery_correlation=transaction.recovery_correlation,
-                child_lease=transaction.child_lease or None,
-                child_lease_fingerprint=transaction.legacy_child_lease_fingerprint,
-                deadline_monotonic=deadline,
-            )
-            transaction.phase = _ExplorationStopPhase.JOURNAL_ACKED
-        transaction.phase = _ExplorationStopPhase.DONE
-        return {
-            "attempted": True,
-            "request_id": transaction.request_id,
-            "recovery_correlation": transaction.recovery_correlation,
-            **({"child_lease": transaction.child_lease}
-               if transaction.child_lease else {
-                   "child_lease_fingerprint": transaction.legacy_child_lease_fingerprint,
-               }),
-            "released_quarantined_task_ids": list(transaction.released_task_ids),
-            "recovery_fence_release_operation_id": release_operation_id,
-            "recovery_release_zero_ack_id": transaction.release_zero_ack_id,
-            "acknowledged": True,
-            "phase": transaction.phase.name,
-        }
-
-    def _exploration_stop_transaction_state(
-        self,
-    ) -> Tuple[threading.RLock, "OrderedDict[str, _ExplorationStopTransaction]"]:
-        return self._exploration_stop_transaction_lock, self._exploration_stop_transactions
-
-    def _reconcile_navigation_quarantine(self) -> MetadataDict:
-        """只依据原目标的真实停车证明释放隔离资源，供停车重试和新目标准入共用。"""
-        candidates = []
-        for status in self.task_manager.list_quarantined_tasks():
-            error = self.task_manager.get_task_error_payload(status.task_id) or {}
-            correlation = dict((error.get("details") or {}).get("resource_quarantine_correlation") or {})
-            if correlation.get("ownership_domain") == "navigation" and correlation.get("goal_id"):
-                candidates.append((status.task_id, correlation))
-        if not candidates:
-            return {"attempted": False, "pending": False, "released_task_ids": []}
-        context = self.navigation_service.get_latest_navigation_context()
-        allowed = {NavigationStatus.SUCCEEDED.value, NavigationStatus.FAILED.value, NavigationStatus.CANCELLED.value}
-        if not all(self._navigation_terminal_proof(context, goal_id=str(item["goal_id"]), allowed_statuses=allowed)
-                   for _, item in candidates):
-            reader = self.navigation_service.get_navigation_control_context
-            context = reader(deadline_monotonic=time.monotonic() + _EXPLORATION_STOP_BARRIER_TIMEOUT_SEC)
-        released, pending = [], []
-        for task_id, correlation in candidates:
-            proof = self._navigation_terminal_proof(context, goal_id=str(correlation["goal_id"]),
-                allowed_statuses={NavigationStatus.SUCCEEDED.value, NavigationStatus.FAILED.value,
-                    NavigationStatus.CANCELLED.value})
-            if not proof:
-                pending.append(task_id)
-                continue
-            if self.task_manager.release_resource_quarantine(task_id,
-                    proof={**proof, "ownership_domain": "navigation"}, correlation=correlation):
-                released.append(task_id)
-        return {"attempted": True, "pending": bool(pending),
-            "released_task_ids": released, "pending_task_ids": pending}
 
     def _stop_robot_motion(
         self,
@@ -11756,120 +10839,90 @@ class GatewayRuntime:
         operation_id: str,
     ) -> MetadataDict:
         stop_reason = reason or "gateway global motion stop"
-        transaction_lock, ledger = self._exploration_stop_transaction_state()
-        with transaction_lock:
-            transaction = ledger.get(operation_id)
-            if transaction is None:
-                try:
-                    self.motion_guard.start()
-                except GatewayMotionGuardUnavailable:
-                    # 已连接的停车走原紧急通道；仅冷启动缺少守卫时沿既有
-                    # 服务激活入口启动守卫，不等待导航/定位，也不要求运动准入。
-                    if self._closed or not os.environ.get(
-                        "NUWAX_RUNTIME_ACTIVATION_REQUEST", ""
-                    ).strip():
-                        raise
-                    self._request_geometry_runtime_activation("stop_all_motion", "guard")
-                    self.motion_guard.start()
-                confirmation = self.motion_guard.stop_all_motion(
-                    stop_reason,
-                    operation_id=operation_id,
-                )
-                self._confirmation_zero(
-                    confirmation,
-                    expected_operation_id=operation_id,
-                )
-                if (
-                    bytes(
-                        getattr(confirmation, "recovery_fence_token", b"") or b""
-                    )
-                ):
-                    raise RuntimeError(
-                        "ordinary global stop exposed a private recovery fence token"
-                    )
-                transaction = _ExplorationStopTransaction(
-                    operation_id=operation_id,
-                    stop_reason=stop_reason,
-                    ordinary_confirmation=confirmation,
-                    cancelled_task_ids=(),
-                    ordinary_confirmed=True,
-                )
-                ledger[operation_id] = transaction
-            stop_reason = transaction.stop_reason
-            ledger.move_to_end(operation_id)
-            if not transaction.ordinary_confirmed:
-                return {
-                    "cancelled_task_ids": list(transaction.cancelled_task_ids),
-                    "cancelled_task_count": len(transaction.cancelled_task_ids),
-                    "motion_guard": None,
-                    "exploration_ownership_reconciliation": {
-                        "attempted": True,
-                        "pending": True,
-                        "phase": transaction.phase.name,
-                        "error": "ordinary_global_stop_confirmation_unavailable",
-                    },
-                    "reconciliation_pending": True,
-                }
+        confirmation = None
+        stop_error = None
+        try:
+            self._ensure_motion_guard_connected("stop_all_motion")
+            confirmation = self.motion_guard.stop_all_motion(
+                stop_reason, operation_id=operation_id,
+            )
+        except Exception as error:
+            stop_error = error
+
+        # 首次归零已调用；后续独立清理失败不覆盖守卫的原始结果。
+        cleanup_errors = []
+        cancelled_task_ids: Tuple[str, ...] = ()
+        try:
+            cancelled_task_ids = self._cancel_active_motion_tasks(stop_reason)
+        except Exception as error:
+            RUNTIME_LOGGER.exception("全局停车后取消任务失败 operation_id=%s", operation_id)
+            cleanup_errors.append({"stage": "cancel_tasks", "error": str(error)})
+        navigation_stop = {}
+        if confirmation is not None:
             try:
-                if not transaction.post_zero_local_state_complete:
-                    guard_state = self.motion_guard.guard_state()
-                    transaction.recovery_fence_was_held = bool(
-                        getattr(
-                            transaction.ordinary_confirmation,
-                            "recovery_fence_held",
-                            False,
+                if self.platform_geometry_runtime.get_geometry_runtime_provider() is not None:
+                    deadline = time.monotonic() + _EXPLORATION_STOP_BARRIER_TIMEOUT_SEC
+                    current = self.navigation_service.get_navigation_control_context(
+                        deadline_monotonic=deadline,
+                    )
+                    goal_id = self._navigation_state_goal_id(current)
+                    if goal_id:
+                        stopped = self.navigation_service.cancel_goal(
+                            request_id=goal_id, deadline_monotonic=deadline,
+                            global_stop_confirmation=confirmation,
                         )
-                        or getattr(guard_state, "recovery_fence_held", False)
-                    )
-                    activation_lock = self._runtime_activation_state_lock()
-                    with activation_lock:
-                        activation_context = self._runtime_activation_context
-                        if (
-                            activation_context is not None
-                            and activation_context.get("motion_stop_generation")
-                            is not None
-                        ):
-                            self._cancel_runtime_activation_request(
-                                activation_context,
-                                reason=stop_reason,
-                                error_code="activation_cancelled",
-                            )
-                    transaction.cancelled_task_ids = (
-                        self._cancel_active_motion_tasks(stop_reason)
-                    )
-                    transaction.post_zero_local_state_complete = True
-                reconciliation = self._reconcile_exploration_ownership_after_global_stop(
-                    operation_id=operation_id,
-                    stop_reason=stop_reason,
-                    transaction=transaction,
-                )
-            except Exception:
-                RUNTIME_LOGGER.exception(
-                    "全局停车后探索资源对账失败：operation_id=%s phase=%s",
-                    operation_id,
-                    transaction.phase.name,
-                )
-                reconciliation = {
-                    "attempted": True,
-                    "pending": True,
-                    "phase": transaction.phase.name,
-                    "error": "exploration_ownership_reconciliation_pending",
-                }
-            try:
-                navigation_reconciliation = self._reconcile_navigation_quarantine()
+                        navigation_stop = {
+                            "goal_id": goal_id,
+                            "status": stopped.navigation_state.status.value,
+                        }
             except Exception as error:
-                RUNTIME_LOGGER.exception("全局停车后导航资源对账失败 operation_id=%s", operation_id)
-                navigation_reconciliation = {"attempted": True, "pending": True, "error": str(error)}
-            while len(ledger) > _EXPLORATION_STOP_TRANSACTION_CAPACITY:
-                ledger.popitem(last=False)
-            return {
-                "cancelled_task_ids": list(transaction.cancelled_task_ids),
-                "cancelled_task_count": len(transaction.cancelled_task_ids),
-                "motion_guard": transaction.ordinary_confirmation,
-                "exploration_ownership_reconciliation": reconciliation,
-                "navigation_ownership_reconciliation": navigation_reconciliation,
-                "reconciliation_pending": bool(reconciliation.get("pending") or navigation_reconciliation.get("pending")),
-            }
+                RUNTIME_LOGGER.exception("全局停车后收尾导航失败 operation_id=%s", operation_id)
+                cleanup_errors.append({"stage": "stop_navigation", "error": str(error)})
+        exploration_stop = {}
+        try:
+            if self.platform_geometry_runtime.get_geometry_runtime_provider() is not None:
+                deadline = time.monotonic() + _EXPLORATION_STOP_BARRIER_TIMEOUT_SEC
+                current = self.navigation_service.refresh_exploration(deadline_monotonic=deadline)
+                request_id = self._exploration_state_request_id(current)
+                if request_id:
+                    stop_options = {}
+                    if confirmation is not None:
+                        stop_options = {
+                            "global_stop_confirmation": confirmation,
+                            "expected_exploration_generation": current.exploration_state.metadata["exploration_generation"],
+                        }
+                    stopped = self.navigation_service.stop_exploration(
+                        request_id=request_id, deadline_monotonic=deadline,
+                        **stop_options,
+                    )
+                    exploration_stop = {
+                        "request_id": request_id,
+                        "status": stopped.exploration_state.status.value,
+                        "parking_pending": stopped.exploration_state.metadata.get("parking_pending") is True,
+                    }
+        except Exception as error:
+            RUNTIME_LOGGER.exception("全局停车后请求探索停止失败 operation_id=%s", operation_id)
+            cleanup_errors.append({"stage": "stop_exploration", "error": str(error)})
+        try:
+            with self._runtime_activation_state_lock():
+                context = self._runtime_activation_context
+                if context is not None and context["activation_level"] in {"motion", "person_follow"}:
+                    self._cancel_runtime_activation_request(
+                        context, reason=stop_reason, error_code="activation_cancelled",
+                    )
+        except Exception as error:
+            RUNTIME_LOGGER.exception("全局停车后取消组件激活失败 operation_id=%s", operation_id)
+            cleanup_errors.append({"stage": "cancel_activation", "error": str(error)})
+        if stop_error is not None:
+            raise stop_error
+        return {
+            "cancelled_task_ids": list(cancelled_task_ids),
+            "cancelled_task_count": len(cancelled_task_ids),
+            "motion_guard": confirmation,
+            "navigation_stop": navigation_stop,
+            "exploration_stop": exploration_stop,
+            "cleanup_errors": cleanup_errors,
+        }
 
     @staticmethod
     def _requires_motion_admission(
@@ -11882,19 +10935,6 @@ class GatewayRuntime:
         # 资源互斥不等于能力具有运动副作用。
         return False
 
-    @staticmethod
-    def _motion_admission_source(capability_name: str) -> int:
-        if capability_name == "follow_target":
-            return motion_guard_pb.GUARD_SOURCE_GATEWAY_FOLLOW
-        if capability_name == "relative_move":
-            return motion_guard_pb.GUARD_SOURCE_GATEWAY_RELATIVE
-        if capability_name in {"execute_sport_command", "switch_control_mode"}:
-            return motion_guard_pb.GUARD_SOURCE_GATEWAY_SPORT
-        if capability_name in _MOTION_STACK_CAPABILITY_NAMES or capability_name == "inspect_target":
-            # The Gateway owns the public readiness query; the nav-stack later
-            # claims NAV when it atomically acquires the execution lease.
-            return motion_guard_pb.GUARD_SOURCE_GATEWAY_MANUAL
-        return motion_guard_pb.GUARD_SOURCE_GATEWAY_MANUAL
 
     def _admit_motion_request(
         self,
@@ -11904,6 +10944,8 @@ class GatewayRuntime:
         deadline_monotonic: Optional[float] = None,
         check_active: Optional[Callable[[], None]] = None,
     ) -> MotionAdmission:
+        if check_active is not None:
+            check_active()
         # 在启动导航进程前报告缺失标定，避免服务反复退出后才返回启动超时。
         geometry = self.config.geometry
         if _runtime_activation_level(capability_name) == "motion" and geometry.pipeline == "lio_3d":
@@ -11915,32 +10957,22 @@ class GatewayRuntime:
                     str(exc), error_code="navigation_calibration_required", http_status=409,
                     details={"setting_key": "NUWAX_NAV_BODY_TO_SUPPORT_Z_M", "pipeline": "lio_3d"},
                 ) from exc
-        self._ensure_geometry_runtime_started(
-            capability_name,
-            **({"deadline_monotonic": deadline_monotonic} if deadline_monotonic is not None else {}),
-            **({"check_active": check_active} if check_active is not None else {}),
-        )
         try:
-            self._ensure_motion_guard_connected(capability_name)
-            stop_generation = self.safety_guard.begin_motion_admission()
-            readiness = self.motion_guard.readiness(
-                self._motion_admission_source(capability_name)
+            self._ensure_motion_guard_connected(
+                capability_name, deadline_monotonic=deadline_monotonic,
+                check_active=check_active,
             )
-            proof = readiness.require_admission_proof()
+            proof = self.motion_guard.admission_snapshot()
+            if check_active is not None:
+                check_active()
         except (GatewayMotionGuardError, MotionGuardError) as exc:
             raise self._motion_guard_gateway_error(capability_name, exc) from exc
-        admission = MotionAdmission(
+        return MotionAdmission(
             request_id=request_id or self._build_runtime_request_id("motion"),
             capability_name=capability_name,
-            generation=proof.generation,
-            boot_nonce=bytes(proof.boot_nonce),
-            motion_stop_generation=stop_generation,
-            guard_motion_stop_generation=proof.motion_stop_generation,
-            admitted_monotonic_ns=time.monotonic_ns(),
-            proof=proof,
+            boot_nonce=proof.boot_nonce,
+            motion_stop_generation=proof.motion_stop_generation,
         )
-        self._run_with_motion_admission(admission, lambda: None)
-        return admission
 
     @staticmethod
     def _require_motion_admission(
@@ -11959,46 +10991,6 @@ class GatewayRuntime:
             )
         return admission
 
-    def _assert_motion_admission(
-        self,
-        admission: MotionAdmission,
-        capability_name: str,
-    ) -> None:
-        if admission.capability_name != capability_name:
-            raise RuntimeError(
-                "motion admission capability mismatch: "
-                f"expected={capability_name} actual={admission.capability_name}"
-            )
-        with self.safety_guard.motion_submission(
-            admission.motion_stop_generation
-        ):
-            pass
-
-    def _run_with_motion_admission(
-        self,
-        admission: Union[MotionAdmission, _PendingExplorationAdmission],
-        operation: Callable[[], Any],
-    ) -> Any:
-        """按原停车代次原子提交；待准入身份只用于任务受理与空操作复核。"""
-
-        try:
-            with self.safety_guard.motion_submission(
-                admission.motion_stop_generation
-            ):
-                return operation()
-        except MotionStopGenerationError as exc:
-            raise GatewayError(
-                "该运动请求已被更新的全局停车操作取消。",
-                error_code="motion_request_cancelled",
-                http_status=409,
-                jsonrpc_code=-32000,
-                details={
-                    "capability_name": admission.capability_name,
-                    "request_id": admission.request_id,
-                    "expected_motion_stop_generation": exc.expected,
-                    "current_motion_stop_generation": exc.current,
-                },
-            ) from exc
 
     @staticmethod
     def _goal_with_motion_admission(
@@ -12038,9 +11030,8 @@ class GatewayRuntime:
         deadline_monotonic: Optional[float] = None,
         check_active: Optional[Callable[[], None]] = None,
     ) -> None:
-        """按需激活运动栈，仅校验请求级 stop generation。"""
+        """按需激活任务所需运动栈，凭据由守卫在申请租约时裁决。"""
 
-        self._run_with_motion_admission(admission, lambda: None)
         self._ensure_geometry_runtime_for_capability(
             capability_name,
             deadline_monotonic=deadline_monotonic,
@@ -12095,7 +11086,6 @@ class GatewayRuntime:
         self,
         *,
         navigation_context: Any = None,
-        motion_admission: Optional[MotionAdmission] = None,
         deadline_monotonic: Optional[float] = None,
     ) -> MetadataDict:
         if navigation_context is None:
@@ -12105,12 +11095,6 @@ class GatewayRuntime:
                 include_readiness=True,
             )
         return {
-            "motion_guard_generation": (
-                motion_admission.generation
-                if motion_admission is not None
-                else None
-            ),
-            "motion_stop_generation": self.safety_guard.motion_stop_generation,
             "navigation_runtime_generation": self._navigation_runtime_generation(
                 navigation_context
             ),
@@ -12124,8 +11108,6 @@ class GatewayRuntime:
     ) -> MetadataDict:
         rollovers: MetadataDict = {}
         for key in (
-            "motion_guard_generation",
-            "motion_stop_generation",
             "navigation_runtime_generation",
             "geometry_provider_generation",
         ):
@@ -12220,20 +11202,7 @@ class GatewayRuntime:
         completion_callback=None,
         prepare_callback=None,
     ):
-        # 旧任务可能已结束，但真实归零回执晚于它的调用期限到达。
-        # 新请求先完成精确对账，不能永久把这类隔离误报为资源冲突。
-        try:
-            recovery = self._reconcile_navigation_quarantine()
-        except Exception as error:
-            raise GatewayError("上一个导航的停车回执暂不可读取，请稍后重试。",
-                error_code="navigation_stop_pending", http_status=409,
-                details={"recovery_pending": True, "reason": str(error)}) from error
-        if recovery.get("pending"):
-            raise GatewayError("上一个导航尚未确认停车，等待原目标回执后可继续导航。",
-                error_code="navigation_stop_pending", http_status=409, details=recovery)
         descriptor = self.capability_registry.get_descriptor(capability_name)
-        if not isinstance(motion_admission, _PendingNavigationAdmission):
-            goal = self._goal_with_motion_admission(goal, motion_admission)
         poll_interval_sec = max(0.02, poll_interval_sec)
 
         def runner(context, goal=goal, motion_admission=motion_admission) -> Dict[str, Any]:
@@ -12242,24 +11211,6 @@ class GatewayRuntime:
             finalized = False
             try:
                 parent_deadline = context.timeout_deadline_monotonic()
-                if isinstance(motion_admission, _PendingNavigationAdmission):
-                    pending = motion_admission
-                    context.ensure_active()
-                    context.update(progress=0.01, stage="prepare_navigation", message="导航请求已受理，正在准备运行时。")
-                    self._run_with_motion_admission(pending, lambda: None)
-                    activation_started=time.monotonic()
-                    motion_admission = self._admit_motion_request(capability_name,
-                        request_id=pending.request_id, deadline_monotonic=parent_deadline,
-                        check_active=context.ensure_active)
-                    RUNTIME_LOGGER.info("导航组件准入已完成 goal_id=%s duration_ms=%.3f", goal.goal_id, (time.monotonic()-activation_started)*1000)
-                    self._run_with_motion_admission(pending, lambda: None)
-                    context.ensure_active()
-                    if prepare_callback is not None:
-                        prepared_goal = prepare_callback(context)
-                        if prepared_goal is not None:
-                            goal = prepared_goal
-                    context.ensure_active()
-                    goal = self._goal_with_motion_admission(goal, motion_admission)
                 self._ensure_motion_runtime_for_backend_call(
                     capability_name,
                     motion_admission,
@@ -12267,6 +11218,13 @@ class GatewayRuntime:
                     check_active=context.ensure_active,
                 )
                 context.ensure_active()
+
+                if prepare_callback is not None:
+                    prepared_goal = prepare_callback(context)
+                    if prepared_goal is not None:
+                        goal = prepared_goal
+                context.ensure_active()
+                goal = self._goal_with_motion_admission(goal, motion_admission)
 
                 def submit_goal():
                     nonlocal goal_dispatched
@@ -12286,7 +11244,6 @@ class GatewayRuntime:
                         raise
                     generation_snapshot = self._capture_task_generation_snapshot(
                         navigation_context=last_context,
-                        motion_admission=motion_admission,
                     )
                     return last_context, generation_snapshot
 
@@ -12295,7 +11252,7 @@ class GatewayRuntime:
                     while True:
                         context.ensure_active()
                         try:
-                            return self._run_with_motion_admission(motion_admission, submit_goal)
+                            return submit_goal()
                         except GatewayError as error:
                             if error.error_code != "navigation_goal_rejected" or error.details.get("backend_code") not in {
                                 "PLANNER_NOT_READY", "PLANNER_INPUT_UNOBSERVED", "PLANNER_INPUT_STALE",
@@ -12329,7 +11286,6 @@ class GatewayRuntime:
                     context.ensure_active()
                     current_generations = self._capture_task_generation_snapshot(
                         navigation_context=last_context,
-                        motion_admission=motion_admission,
                     )
                     if (generation_snapshot.get("navigation_runtime_generation") is None
                             and current_generations.get("navigation_runtime_generation") is not None):
@@ -12508,9 +11464,7 @@ class GatewayRuntime:
         if height_pending and input_pose is not None:
             # 受理回执保留省略语义，不能把尚未解析的高度呈现为显式零值。
             input_pose["position"].pop("z", None)
-        return self._run_with_motion_admission(
-            motion_admission,
-            lambda: self.task_manager.submit(
+        return self.task_manager.submit(
                 capability_name,
                 runner,
                 input_payload={
@@ -12530,8 +11484,7 @@ class GatewayRuntime:
                     requested_by=requested_by,
                     request_context=request_context,
                 ),
-            ),
-        )
+            )
 
     @staticmethod
     def _exploration_state_request_id(exploration_context: Any) -> str:
@@ -12938,7 +11891,6 @@ class GatewayRuntime:
         request_id: str,
         poll_interval_sec: float,
         acknowledge_interrupt: bool = True,
-        allow_rollover_recovery: bool = False,
         parking_deadline_monotonic: Optional[float] = None,
     ) -> Any:
         barrier_started_at = time.monotonic()
@@ -13004,6 +11956,7 @@ class GatewayRuntime:
             ).lower()
             metadata = dict(getattr(state, "metadata", {}) or {})
             observed_request_id = self._exploration_state_request_id(last_context)
+            parking_pending = metadata.get("parking_pending") is True
             child_task_id = str(metadata.get("child_task_id") or "").strip()
             child_lease = metadata.get("child_lease")
             if observed_request_id and observed_request_id != request_id:
@@ -13016,7 +11969,7 @@ class GatewayRuntime:
                 ExplorationStatus.SUCCEEDED.value,
                 ExplorationStatus.FAILED.value,
                 ExplorationStatus.CANCELLED.value,
-            }:
+            } and not parking_pending:
                 if observed_request_id != request_id:
                     raise parking_error(
                         "StopExploration 终态缺少 request_id 关联证明",
@@ -13026,50 +11979,6 @@ class GatewayRuntime:
                 retained_failed_child = bool(
                     status == ExplorationStatus.FAILED.value and child_task_id
                 )
-                if retained_failed_child and allow_rollover_recovery:
-                    if not isinstance(child_lease, dict):
-                        child_lease = {}
-                    try:
-                        exploration_generation = int(
-                            metadata.get("exploration_generation") or 0
-                        )
-                        child_owner_kind = int(
-                            child_lease.get("owner_kind") or 0
-                        )
-                        child_goal_generation = int(
-                            child_lease.get("goal_generation") or 0
-                        )
-                        child_producer_generation = int(
-                            child_lease.get("producer_runtime_generation") or 0
-                        )
-                    except (TypeError, ValueError):
-                        exploration_generation = 0
-                        child_owner_kind = 0
-                        child_goal_generation = 0
-                        child_producer_generation = 0
-                    complete_rollover_identity = bool(
-                        metadata.get("rollover_recovery_eligible") is True
-                        and exploration_generation > 0
-                        and str(child_lease.get("session_id") or "").strip()
-                        == child_task_id
-                        and str(
-                            child_lease.get("parent_request_id") or ""
-                        ).strip()
-                        == request_id
-                        and child_owner_kind > 0
-                        and child_goal_generation > 0
-                        and child_producer_generation > 0
-                        and _exploration_child_lease_address(child_lease) is not None
-                    )
-                    if complete_rollover_identity:
-                        return last_context
-                    raise parking_error(
-                        (
-                            "StopExploration rollover recovery identity 不完整"
-                        ),
-                        phase="validate_rollover",
-                        exploration_context=last_context,
-                    )
                 if (
                     not retained_failed_child
                     and metadata.get("exploration_terminal") is not True
@@ -13101,13 +12010,13 @@ class GatewayRuntime:
                     if acknowledge_interrupt and context is not None:
                         context.acknowledge_interrupt_barrier(proof)
                     return last_context
-            if status == ExplorationStatus.FAILED.value and not child_task_id:
+            if status == ExplorationStatus.FAILED.value and not child_task_id and not parking_pending:
                 raise parking_error(
                     getattr(state, "message", None) or "StopExploration 返回 failed",
                     phase="validate_terminal",
                     exploration_context=last_context,
                 )
-            if status not in {
+            if not parking_pending and status not in {
                 ExplorationStatus.ACCEPTED.value,
                 ExplorationStatus.RUNNING.value,
                 ExplorationStatus.FAILED.value,
@@ -13161,306 +12070,18 @@ class GatewayRuntime:
         }
         context.publish_event(
             "task.generation_rollover_detected",
-            message="探索任务检测到 runtime generation rollover。",
+            message="探索任务检测到运行时代际切换。",
             payload=details,
         )
-        navigation_rollover = rollovers.get("navigation_runtime_generation")
-        navigation_only = bool(
-            navigation_rollover
-            and set(rollovers) == {"navigation_runtime_generation"}
-        )
-        try:
-            expected_navigation_generation = int(
-                dict(navigation_rollover or {}).get("expected") or 0
-            )
-            observed_navigation_generation = int(
-                dict(navigation_rollover or {}).get("current") or 0
-            )
-        except (TypeError, ValueError):
-            expected_navigation_generation = 0
-            observed_navigation_generation = 0
-        forward_navigation_rollover = bool(
-            navigation_only
-            and expected_navigation_generation > 0
-            and observed_navigation_generation > expected_navigation_generation
-        )
-        terminal_context = self._stop_exploration_with_safety_barrier(
-            context,
-            request_id=request_id,
-            poll_interval_sec=poll_interval_sec,
+        terminal = self._stop_exploration_with_safety_barrier(
+            context, request_id=request_id, poll_interval_sec=poll_interval_sec,
             acknowledge_interrupt=False,
-            allow_rollover_recovery=forward_navigation_rollover,
         )
-        terminal_state = getattr(terminal_context, "exploration_state", None)
-        raw_status = getattr(terminal_state, "status", None)
-        safe_terminal_status = str(
-            getattr(raw_status, "value", raw_status) or ""
-        ).lower()
-        details["safe_terminal_status"] = safe_terminal_status
-        terminal_metadata = dict(getattr(terminal_state, "metadata", {}) or {})
-
-        if forward_navigation_rollover and terminal_metadata.get(
-            "rollover_recovery_eligible"
-        ) is True:
-            child_lease = terminal_metadata.get("child_lease")
-            if not isinstance(child_lease, dict):
-                child_lease = {}
-            try:
-                exploration_generation = int(
-                    terminal_metadata.get("exploration_generation") or 0
-                )
-                child_owner_kind = int(child_lease.get("owner_kind") or 0)
-                child_goal_generation = int(
-                    child_lease.get("goal_generation") or 0
-                )
-                child_producer_generation = int(
-                    child_lease.get("producer_runtime_generation") or 0
-                )
-            except (TypeError, ValueError):
-                exploration_generation = 0
-                child_owner_kind = 0
-                child_goal_generation = 0
-                child_producer_generation = 0
-            child_session_id = str(child_lease.get("session_id") or "").strip()
-            child_parent_request_id = str(
-                child_lease.get("parent_request_id") or ""
-            ).strip()
-            complete_identity = bool(
-                safe_terminal_status == ExplorationStatus.FAILED.value
-                and self._exploration_state_request_id(terminal_context) == request_id
-                and exploration_generation > 0
-                and str(terminal_metadata.get("child_task_id") or "").strip()
-                == child_session_id
-                and child_parent_request_id == request_id
-                and child_owner_kind > 0
-                and child_goal_generation > 0
-                and child_producer_generation > 0
-                and _exploration_child_lease_address(child_lease) is not None
-            )
-            if not complete_identity:
-                details["rollover_recovery_identity_complete"] = False
-                raise TaskSafetyBarrierError(
-                    "导航 runtime 代际切换后的探索 ownership 身份不完整。",
-                    details=details,
-                )
-
-            # Reuse the original child and observed runtime domains; do not
-            # allocate a UUID or derive a digest for an already assigned goal.
-            recovery_address = "%d:%d:%d:%d" % (
-                child_producer_generation, child_goal_generation,
-                expected_navigation_generation, observed_navigation_generation,
-            )
-            correlation_id = "exploration-rollover:v2:" + recovery_address
-            hold_operation_id = correlation_id + ":hold"
-            release_operation_id = correlation_id + ":release"
-            details.update(
-                {
-                    "rollover_recovery_identity_complete": True,
-                    "recovery_correlation_id": correlation_id,
-                    "recovery_hold_operation_id": hold_operation_id,
-                    "recovery_release_operation_id": release_operation_id,
-                }
-            )
-
-            try:
-                hold_confirmation = self.motion_guard.hold_recovery_fence(
-                    reason="exploration navigation runtime generation rollover",
-                    correlation_id=correlation_id,
-                    operation_id=hold_operation_id,
-                )
-            except Exception as exc:
-                details["recovery_fence_hold_error"] = str(exc)
-                raise TaskSafetyBarrierError(
-                    "导航 runtime 代际切换后无法确认 durable recovery fence。",
-                    details=details,
-                ) from exc
-
-            hold_zero = getattr(hold_confirmation, "zero", None)
-            recovery_fence_token = bytes(
-                getattr(hold_confirmation, "recovery_fence_token", b"") or b""
-            )
-            guard_generation = int(
-                getattr(hold_confirmation, "generation", 0) or 0
-            )
-            guard_boot_nonce = bytes(
-                getattr(hold_confirmation, "boot_nonce", b"") or b""
-            )
-            hold_motion_stop_generation = int(
-                getattr(hold_confirmation, "motion_stop_generation", 0) or 0
-            )
-            hold_zero_ack_id = str(
-                getattr(hold_zero, "zero_ack_id", "") or ""
-            ).strip()
-            hold_zero_applied_ns = int(
-                getattr(hold_zero, "applied_monotonic_ns", 0) or 0
-            )
-            valid_hold = bool(
-                getattr(hold_confirmation, "operation_id", "")
-                == hold_operation_id
-                and getattr(hold_confirmation, "recovery_fence_held", False)
-                is True
-                and len(recovery_fence_token) == 32
-                and any(recovery_fence_token)
-                and guard_generation > 0
-                and len(guard_boot_nonce) == 16
-                and hold_motion_stop_generation > 0
-                and hold_zero_ack_id
-                and hold_zero_applied_ns > 0
-            )
-            if not valid_hold:
-                details["recovery_fence_hold_confirmed"] = False
-                raise TaskSafetyBarrierError(
-                    "durable recovery fence 返回的零速或 fence proof 不完整。",
-                    details=details,
-                )
-            details.update(
-                {
-                    "recovery_fence_hold_confirmed": True,
-                    "recovery_hold_zero_ack_id": hold_zero_ack_id,
-                    "recovery_hold_motion_stop_generation": (
-                        hold_motion_stop_generation
-                    ),
-                    "recovery_guard_generation": guard_generation,
-                }
-            )
-
-            guard_proof = {
-                "stop_operation_id": hold_operation_id,
-                "guard_generation": guard_generation,
-                "guard_boot_nonce": guard_boot_nonce,
-                "motion_stop_generation": hold_motion_stop_generation,
-                "zero_ack_id": hold_zero_ack_id,
-                "zero_applied_monotonic_ns": hold_zero_applied_ns,
-                "recovery_fence_token": recovery_fence_token,
-                "recovery_correlation": correlation_id,
-            }
-            try:
-                recovered_context = self.navigation_service.recover_exploration_after_navigation_rollover(
-                    request_id=request_id,
-                    exploration_generation=exploration_generation,
-                    child_lease=dict(child_lease),
-                    expected_navigation_runtime_generation=(
-                        expected_navigation_generation
-                    ),
-                    observed_navigation_runtime_generation=(
-                        observed_navigation_generation
-                    ),
-                    guard_proof=guard_proof,
-                )
-            except Exception as exc:
-                details["rollover_recovery_error"] = str(exc)
-                raise TaskSafetyBarrierError(
-                    "探索 rollover recovery 结果不确定，durable fence 保持生效。",
-                    details=details,
-                ) from exc
-
-            recovered_state = getattr(recovered_context, "exploration_state", None)
-            recovered_raw_status = getattr(recovered_state, "status", None)
-            recovered_status = str(
-                getattr(recovered_raw_status, "value", recovered_raw_status) or ""
-            ).lower()
-            recovered_metadata = dict(
-                getattr(recovered_state, "metadata", {}) or {}
-            )
-            recovery_verified = bool(
-                recovered_status == ExplorationStatus.FAILED.value
-                and self._exploration_state_request_id(recovered_context) == request_id
-                and recovered_metadata.get("exploration_terminal") is True
-                and not str(recovered_metadata.get("child_task_id") or "").strip()
-                and recovered_metadata.get("last_stop_reason")
-                == "runtime_rollover_aborted_safe"
-            )
-            if not recovery_verified:
-                details["rollover_recovery_terminal_verified"] = False
-                raise TaskSafetyBarrierError(
-                    "探索 rollover recovery 未返回 exact failed terminal。",
-                    details=details,
-                )
-            details["rollover_recovery_terminal_verified"] = True
-
-            try:
-                release_confirmation = self.motion_guard.release_recovery_fence(
-                    reason="exploration navigation runtime rollover recovered",
-                    correlation_id=correlation_id,
-                    recovery_fence_token=recovery_fence_token,
-                    operation_id=release_operation_id,
-                )
-            except Exception as exc:
-                details["recovery_fence_release_error"] = str(exc)
-                raise TaskSafetyBarrierError(
-                    "探索 rollover recovery 已完成，但无法确认 recovery fence 释放。",
-                    details=details,
-                ) from exc
-            release_zero = getattr(release_confirmation, "zero", None)
-            release_zero_ack_id = str(
-                getattr(release_zero, "zero_ack_id", "") or ""
-            ).strip()
-            release_zero_applied_ns = int(
-                getattr(release_zero, "applied_monotonic_ns", 0) or 0
-            )
-            release_motion_stop_generation = int(
-                getattr(release_confirmation, "motion_stop_generation", 0) or 0
-            )
-            release_guard_generation = int(
-                getattr(release_confirmation, "generation", 0) or 0
-            )
-            release_guard_boot_nonce = bytes(
-                getattr(release_confirmation, "boot_nonce", b"") or b""
-            )
-            valid_release = bool(
-                getattr(release_confirmation, "operation_id", "")
-                == release_operation_id
-                and getattr(release_confirmation, "recovery_fence_held", True)
-                is False
-                and not bytes(
-                    getattr(
-                        release_confirmation,
-                        "recovery_fence_token",
-                        b"",
-                    )
-                    or b""
-                )
-                and release_motion_stop_generation
-                > hold_motion_stop_generation
-                and release_guard_generation == guard_generation
-                and release_guard_boot_nonce == guard_boot_nonce
-                and release_zero_ack_id
-                and release_zero_applied_ns > 0
-            )
-            if not valid_release:
-                details["recovery_fence_release_confirmed"] = False
-                raise TaskSafetyBarrierError(
-                    "recovery fence 释放未返回第二次 exact zero proof。",
-                    details=details,
-                )
-            details.update(
-                {
-                    "safe_terminal_status": recovered_status,
-                    "safe_terminal_reason": "runtime_rollover_aborted_safe",
-                    "recovery_fence_release_confirmed": True,
-                    "recovery_release_zero_ack_id": release_zero_ack_id,
-                    "recovery_release_motion_stop_generation": (
-                        release_motion_stop_generation
-                    ),
-                    "safety_disposition": "ABORTED_SAFE",
-                }
-            )
-        elif forward_navigation_rollover and str(
-            terminal_metadata.get("child_task_id") or ""
-        ).strip():
-            details["rollover_recovery_eligible"] = terminal_metadata.get(
-                "rollover_recovery_eligible"
-            )
-            raise TaskSafetyBarrierError(
-                "导航 runtime 代际切换后仍保留未知 child ownership。",
-                details=details,
-            )
+        details["terminal_status"] = terminal.exploration_state.status.value
         raise GatewayError(
-            "探索 runtime generation 已切换，旧任务已安全停止。",
-            error_code="task_generation_rollover",
-            http_status=503,
-            jsonrpc_code=-32010,
-            details=details,
+            "探索运行时代际已切换，旧任务已停止。",
+            error_code="task_generation_rollover", http_status=503,
+            jsonrpc_code=-32010, details=details,
         )
 
     def _prepare_exploration_mapping(
@@ -13475,14 +12096,12 @@ class GatewayRuntime:
 
         deadline = context.timeout_deadline_monotonic()
         context.ensure_active()
-        self._run_with_motion_admission(motion_admission, lambda: None)
         self.platform_geometry_runtime.start_mapping(
             map_name=request.map_name,
             deadline_monotonic=deadline,
         )
         while True:
             context.ensure_active()
-            self._run_with_motion_admission(motion_admission, lambda: None)
             provider = self.platform_geometry_runtime.get_geometry_runtime_provider()
             if provider is None:
                 raise GatewayError(
@@ -13513,7 +12132,7 @@ class GatewayRuntime:
         self,
         *,
         request: ExploreAreaRequest,
-        motion_admission: Union[MotionAdmission, _PendingExplorationAdmission],
+        motion_admission: MotionAdmission,
         poll_interval_sec: float,
         timeout_sec: float,
         requested_by: Optional[str],
@@ -13538,22 +12157,10 @@ class GatewayRuntime:
                     message="检查并复用探索建图运行时。",
                 )
                 context.ensure_active()
-                if isinstance(motion_admission, _PendingExplorationAdmission):
-                    pending = motion_admission
-                    self._run_with_motion_admission(pending, lambda: None)
-                    motion_admission = self._admit_motion_request(
-                        capability_name,
-                        request_id=pending.request_id,
-                        deadline_monotonic=parent_deadline,
-                    )
-                    # 启动期间的全局停车不能被新取得的许可掩盖。
-                    self._run_with_motion_admission(pending, lambda: None)
-                else:
-                    self._ensure_motion_runtime_for_backend_call(
-                        capability_name,
-                        motion_admission,
-                        deadline_monotonic=parent_deadline,
-                    )
+                self._ensure_motion_runtime_for_backend_call(
+                    capability_name, motion_admission,
+                    deadline_monotonic=parent_deadline, check_active=context.ensure_active,
+                )
                 context.ensure_active()
                 request = self._exploration_with_motion_admission(request, motion_admission)
                 checkpoint_id = (task_metadata or {}).get("resumed_checkpoint_id")
@@ -13595,7 +12202,6 @@ class GatewayRuntime:
                     )
                     generation_snapshot = (
                         self._capture_task_generation_snapshot(
-                            motion_admission=motion_admission,
                             deadline_monotonic=parent_deadline,
                         )
                     )
@@ -13603,10 +12209,7 @@ class GatewayRuntime:
 
                 exploration_start_attempted = True
                 last_context, generation_snapshot = (
-                    self._run_with_motion_admission(
-                        motion_admission,
-                        start_exploration,
-                    )
+                    start_exploration()
                 )
                 backend_started = True
                 self._attach_perception_to_exploration()
@@ -13637,7 +12240,6 @@ class GatewayRuntime:
                         deadline_monotonic=parent_deadline,
                     )
                     current_generations = self._capture_task_generation_snapshot(
-                        motion_admission=motion_admission,
                         deadline_monotonic=parent_deadline,
                     )
                     rollovers = self._task_generation_rollovers(
@@ -13660,7 +12262,6 @@ class GatewayRuntime:
                             deadline_monotonic=parent_deadline,
                         )
                         current_generations = self._capture_task_generation_snapshot(
-                            motion_admission=motion_admission,
                             deadline_monotonic=parent_deadline,
                         )
                         rollovers = self._task_generation_rollovers(
@@ -13847,9 +12448,7 @@ class GatewayRuntime:
                             ),
                         )
 
-        return self._run_with_motion_admission(
-            motion_admission,
-            lambda: self.task_manager.submit(
+        return self.task_manager.submit(
                 capability_name,
                 runner,
                 input_payload={
@@ -13872,8 +12471,7 @@ class GatewayRuntime:
                     request_context=request_context,
                 ),
                 deferred_interrupt=True,
-            ),
-        )
+            )
 
     def _find_scene_object(self, query: str, perception_context):
         normalized_query = self._normalize_query(query)
@@ -14085,313 +12683,145 @@ class GatewayRuntime:
         return bool(ok), str(message or "ready")
 
     def _wait_for_previous_runtime_activation(
-        self,
-        request_path: Path,
-        result_path: Path,
-        *,
-        deadline: float,
+        self, request_path: Path, result_path: Path, *, deadline: float,
         context: Dict[str, Any],
     ) -> None:
-        """等前序拥有方消费提交或取消，不能覆盖仍在收尾的协议文件。"""
-
+        """沿原期限等待前序启动或回滚；启动器只写结果，不删除请求。"""
         def read_payload(path: Path) -> Dict[str, Any]:
             try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
-                return payload if isinstance(payload, dict) else {}
+                value = json.loads(path.read_text(encoding="utf-8"))
+                return value if isinstance(value, dict) else {}
             except (FileNotFoundError, ValueError):
                 return {}
-
         next_wakeup = time.monotonic()
         while True:
-            expected_generation = context.get("motion_stop_generation")
-            if expected_generation is not None and expected_generation != self.safety_guard.motion_stop_generation:
-                raise self._runtime_activation_cancelled_error(context)
             if self._closed:
-                raise GatewayError(
-                    "网关运行时已关闭，不能提交组件激活请求。",
-                    error_code="gateway_runtime_closed",
-                    http_status=503,
-                    jsonrpc_code=-32010,
-                )
-            with _runtime_activation_protocol_lock(request_path):
-                request_exists = request_path.exists()
+                raise GatewayError("网关运行时已关闭，不能提交组件激活请求。",
+                    error_code="gateway_runtime_closed", http_status=503, jsonrpc_code=-32010)
+            with self._runtime_activation_state_lock():
                 previous = read_payload(request_path)
                 result = read_payload(result_path)
                 previous_id = str(previous.get("request_id") or "")
                 state = str(result.get("state") or "")
-                settled = state in {"committed", "failed", "cancelled"} and (
-                    not request_exists or not previous_id or result.get("request_id") == previous_id
+                settled = state in {"ready", "failed", "cancelled"} and (
+                    not previous_id or result.get("request_id") == previous_id
                 )
-                pending = request_exists or state in {"activating", "prepared", "ready"}
-                if settled or not pending:
+                if settled or (not request_path.exists() and state != "activating"):
                     return
                 if previous_id and time.monotonic() >= next_wakeup:
                     _wake_runtime_activation_request(request_path, previous_id)
                     next_wakeup = time.monotonic() + 1.0
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise GatewayError(
-                    "等待前一次组件激活完成收尾超时，保留原请求供拥有方处理。",
-                    error_code="runtime_activation_timeout",
-                    http_status=503,
-                    jsonrpc_code=-32010,
-                    details={
-                        "capability_name": context["capability_name"],
-                        "stage": "previous_activation",
-                        "previous_request_id": previous_id or result.get("request_id"),
-                        "previous_state": state,
-                    },
-                )
+                raise GatewayError("等待前一次组件激活收尾超时。",
+                    error_code="runtime_activation_timeout", http_status=503, jsonrpc_code=-32010,
+                    details={"capability_name": context["capability_name"], "stage": "previous_activation",
+                        "previous_request_id": previous_id or result.get("request_id"), "previous_state": state})
             time.sleep(min(0.05, remaining))
 
     def _request_geometry_runtime_activation(
-        self,
-        capability_name: str,
-        activation_level: str,
-        *,
+        self, capability_name: str, activation_level: str, *,
         deadline_monotonic: Optional[float] = None,
     ) -> None:
-        if activation_level not in {
-            "guard",
-            "geometry",
-            "motion",
-            "person_follow",
-        }:
-            raise ValueError(
-                "unsupported runtime activation_level: %s" % activation_level
-            )
-        activation_started_at = time.monotonic()
-        timeout_sec = _runtime_activation_timeout_sec()
-        deadline = activation_started_at + timeout_sec
+        if activation_level not in {"guard", "geometry", "motion", "person_follow"}:
+            raise ValueError("unsupported runtime activation_level: %s" % activation_level)
+        started_at = time.monotonic()
+        deadline = started_at + _runtime_activation_timeout_sec()
         if deadline_monotonic is not None:
             deadline = min(deadline, float(deadline_monotonic))
-        effective_timeout_sec = max(0.0, deadline - activation_started_at)
-        if effective_timeout_sec <= 0.0:
-            raise GeometryRuntimeRpcError(
-                rpc_name="RuntimeActivation",
+        if deadline <= started_at:
+            raise GeometryRuntimeRpcError(rpc_name="RuntimeActivation",
                 grpc_code=grpc.StatusCode.DEADLINE_EXCEEDED,
-                grpc_details="parent task deadline exhausted before activation request",
-            )
+                grpc_details="parent task deadline exhausted before activation request")
         request_value = os.environ.get("NUWAX_RUNTIME_ACTIVATION_REQUEST", "").strip()
         if not request_value:
             return
         request_path = Path(request_value)
-        result_path = Path(
-            os.environ.get(
-                "NUWAX_RUNTIME_ACTIVATION_RESULT",
-                str(request_path.with_suffix(".result.json")),
-            )
-        )
-        cancel_path, ack_path = self._runtime_activation_marker_paths(request_path)
-        request_id = uuid.uuid4().hex
-        motion_sensitive = activation_level in {
-            "guard",
-            "motion",
-            "person_follow",
-        }
-        state_lock = self._runtime_activation_state_lock()
-        context: Dict[str, Any] = {
-            "request_id": request_id,
-            "capability_name": capability_name,
-            "activation_level": activation_level,
-            "request_path": str(request_path),
+        result_path = Path(os.environ.get("NUWAX_RUNTIME_ACTIVATION_RESULT", str(request_path.with_suffix(".result.json"))))
+        context = {
+            "request_id": uuid.uuid4().hex, "capability_name": capability_name,
+            "activation_level": activation_level, "request_path": str(request_path),
             "result_path": str(result_path),
-            "cancel_path": str(cancel_path),
-            "ack_path": str(ack_path),
-            "motion_stop_generation": None,
         }
         request_written = False
-        committed = False
-        terminal_received = False
-        # 前序收尾期间发生停车也必须使本次旧运动请求失效；暂不接管前序请求上下文。
-        with state_lock:
-            context["motion_stop_generation"] = (
-                self.safety_guard.motion_stop_generation if motion_sensitive else None
-            )
-
         try:
-            self._wait_for_previous_runtime_activation(
-                request_path,
-                result_path,
-                deadline=deadline,
-                context=context,
-            )
-            with state_lock, _runtime_activation_protocol_lock(request_path):
-                expected_generation = context["motion_stop_generation"]
-                if expected_generation is not None and expected_generation != self.safety_guard.motion_stop_generation:
-                    raise self._runtime_activation_cancelled_error(context)
+            self._wait_for_previous_runtime_activation(request_path, result_path, deadline=deadline, context=context)
+            with self._runtime_activation_state_lock():
                 if self._closed:
-                    raise GatewayError(
-                        "网关运行时已关闭，不能提交组件激活请求。",
-                        error_code="gateway_runtime_closed",
-                        http_status=503,
-                        jsonrpc_code=-32010,
-                    )
+                    raise GatewayError("网关运行时已关闭，不能提交组件激活请求。",
+                        error_code="gateway_runtime_closed", http_status=503, jsonrpc_code=-32010)
                 if time.monotonic() >= deadline:
-                    raise GatewayError(
-                        "组件激活期限已耗尽，未提交新请求。",
-                        error_code="runtime_activation_timeout",
-                        http_status=503,
-                        jsonrpc_code=-32010,
-                    )
+                    raise GatewayError("组件激活期限已耗尽，未提交新请求。",
+                        error_code="runtime_activation_timeout", http_status=503, jsonrpc_code=-32010)
                 result_path.unlink(missing_ok=True)
-                cancel_path.unlink(missing_ok=True)
-                ack_path.unlink(missing_ok=True)
                 self._runtime_activation_context = context
-                _write_json_file_atomically(
-                    request_path,
-                    {
-                        "request_id": request_id,
-                        "capability_name": capability_name,
-                        "activation_level": activation_level,
-                        "motion_stop_generation": context[
-                            "motion_stop_generation"
-                        ],
-                        "requested_at": utc_now().isoformat(),
-                    },
-                )
+                _write_json_file_atomically(request_path, {
+                    "request_id": context["request_id"], "capability_name": capability_name,
+                    "activation_level": activation_level, "requested_at": utc_now().isoformat(),
+                })
                 request_written = True
-                _wake_runtime_activation_request(request_path, request_id)
-        except GatewayError:
-            with state_lock:
-                current = self._runtime_activation_context
-                if current is not None and current.get("request_id") == request_id:
-                    self._runtime_activation_context = None
-            raise
-        except OSError as exc:
-            if request_written:
-                self._cancel_runtime_activation_request(
-                    context, reason=str(exc), error_code="activation_cancelled"
-                )
-            with state_lock:
-                current = self._runtime_activation_context
-                if current is not None and current.get("request_id") == request_id:
-                    self._runtime_activation_context = None
-            raise GatewayError(
-                "无法提交按需组件激活请求：%s" % exc,
-                error_code="runtime_activation_request_failed",
-                http_status=503,
-                jsonrpc_code=-32010,
-                details={
-                    "capability_name": capability_name,
-                    "activation_level": activation_level,
-                    "request_path": str(request_path),
-                    "request_id": request_id,
-                },
-            ) from exc
-        ack_written = False
-        next_wakeup = time.monotonic() + 1.0
-        try:
+                _wake_runtime_activation_request(request_path, context["request_id"])
+            next_wakeup = time.monotonic() + 1.0
             while time.monotonic() < deadline:
-                if time.monotonic() >= next_wakeup:
-                    with _runtime_activation_protocol_lock(request_path):
-                        _wake_runtime_activation_request(request_path, request_id)
-                    next_wakeup = time.monotonic() + 1.0
-                try:
-                    payload = json.loads(result_path.read_text(encoding="utf-8"))
-                except FileNotFoundError:
-                    time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
-                    continue
-                except (OSError, json.JSONDecodeError):
-                    time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
-                    continue
-                result_request_id = str(
-                    payload.get("request_id") or ""
-                ).strip()
-                if result_request_id != request_id:
-                    time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
-                    continue
-                state = str(payload.get("state") or "").strip().lower()
-                result_level = str(
-                    payload.get("activation_level") or ""
-                ).strip().lower()
-                if result_level and result_level != activation_level:
-                    time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
-                    continue
-                if state == "prepared":
-                    if not ack_written:
-                        self._ack_runtime_activation_request(context)
-                        ack_written = True
-                    time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
-                    continue
-                if state == "ready":
-                    self._commit_runtime_activation_request(context)
-                    committed = True
-                    return
-                if state == "cancelled":
-                    terminal_received = True
-                    error_code = str(
-                        payload.get("error_code")
-                        or "runtime_activation_cancelled"
-                    )
-                    if error_code == "activation_cancelled":
+                with self._runtime_activation_state_lock():
+                    if self._closed or context.get("cancelled"):
                         raise self._runtime_activation_cancelled_error(context)
-                    raise GatewayError(
-                        str(payload.get("message") or "按需组件激活已取消。"),
-                        error_code=error_code,
-                        http_status=503,
-                        jsonrpc_code=-32010,
-                        details={
-                            "capability_name": capability_name,
-                            "activation_level": activation_level,
-                            "activation": payload,
-                        },
-                    )
-                if state == "failed":
-                    terminal_received = True
-                    raise GatewayError(
-                        str(payload.get("message") or "按需组件激活失败。"),
-                        error_code=str(
-                            payload.get("error_code")
-                            or "runtime_activation_failed"
-                        ),
-                        http_status=503,
-                        jsonrpc_code=-32010,
-                        details={
-                            "capability_name": capability_name,
-                            "activation_level": activation_level,
-                            "activation": payload,
-                        },
-                    )
-                time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
-            raise GatewayError(
-                "等待按需组件激活超时。",
-                error_code="runtime_activation_timeout",
-                http_status=503,
-                jsonrpc_code=-32010,
-                details={
-                    "capability_name": capability_name,
-                    "activation_level": activation_level,
-                    "request_id": request_id,
-                    "request_path": str(request_path),
-                    "result_path": str(result_path),
-                    "timeout_sec": effective_timeout_sec,
-                    "parent_deadline_monotonic": deadline_monotonic,
-                },
-            )
-        except Exception as exc:
-            if request_written and not committed and not terminal_received:
-                self._cancel_runtime_activation_request(
-                    context,
-                    reason=str(exc),
-                    error_code="activation_cancelled",
-                )
-            raise
+                    if time.monotonic() >= next_wakeup:
+                        _wake_runtime_activation_request(request_path, context["request_id"])
+                        next_wakeup = time.monotonic() + 1.0
+                try:
+                    result = json.loads(result_path.read_text(encoding="utf-8"))
+                except (FileNotFoundError, OSError, json.JSONDecodeError):
+                    result = {}
+                if result.get("request_id") == context["request_id"]:
+                    state = result.get("state")
+                    if state == "ready":
+                        self._finish_runtime_activation_request(context)
+                        return
+                    if state in {"failed", "cancelled"}:
+                        if state == "cancelled":
+                            raise self._runtime_activation_cancelled_error(context)
+                        raise GatewayError(str(result.get("message") or "按需组件激活失败。"),
+                            error_code=str(result.get("error_code") or "runtime_activation_failed"),
+                            http_status=503, jsonrpc_code=-32010,
+                            details={"capability_name": capability_name, "activation_level": activation_level, "activation": result})
+                time.sleep(min(0.05, max(0.0, deadline-time.monotonic())))
+            raise GatewayError("等待按需组件激活超时。", error_code="runtime_activation_timeout",
+                http_status=503, jsonrpc_code=-32010,
+                details={"capability_name": capability_name, "activation_level": activation_level,
+                    "request_id": context["request_id"], "timeout_sec": deadline-started_at,
+                    "parent_deadline_monotonic": deadline_monotonic})
+        except OSError as error:
+            raise GatewayError("无法读写按需组件激活请求：%s" % error,
+                error_code="runtime_activation_request_failed", http_status=503, jsonrpc_code=-32010,
+                details={"request_path": str(request_path), "request_id": context["request_id"]}) from error
         finally:
-            if not committed:
-                with state_lock:
-                    current = self._runtime_activation_context
-                    if (
-                        current is not None
-                        and current.get("request_id") == request_id
-                    ):
+            with self._runtime_activation_state_lock():
+                if self._runtime_activation_context is context:
+                    try:
+                        if request_written:
+                            self._cancel_runtime_activation_request(context,
+                                reason="activation caller finished without ready result", error_code="activation_cancelled")
+                    finally:
                         self._runtime_activation_context = None
 
-    def _ensure_motion_guard_connected(self, capability_name: str) -> None:
+    def _ensure_motion_guard_connected(
+        self, capability_name: str, *, deadline_monotonic: Optional[float] = None,
+        check_active: Optional[Callable[[], None]] = None,
+    ) -> None:
         try:
-            self.motion_guard.start()
-        except GatewayMotionGuardError as exc:
-            raise self._motion_guard_gateway_error(capability_name, exc) from exc
+            try:
+                self.motion_guard.start()
+            except GatewayMotionGuardUnavailable:
+                if self._closed or not os.environ.get("NUWAX_RUNTIME_ACTIVATION_REQUEST", "").strip():
+                    raise
+                self._ensure_geometry_runtime_started(
+                    capability_name, activation_level="guard",
+                    deadline_monotonic=deadline_monotonic, check_active=check_active,
+                )
+                self.motion_guard.start()
+        except (GatewayMotionGuardError, MotionGuardError) as error:
+            raise self._motion_guard_gateway_error(capability_name, error) from error
 
     def _ensure_person_follow_bridge_started(self) -> None:
         """首次跟随才创建通信线程，与网关关闭共用既有生命周期边界。"""
@@ -14420,6 +12850,7 @@ class GatewayRuntime:
         self,
         capability_name: str,
         *,
+        activation_level: Optional[str] = None,
         deadline_monotonic: Optional[float] = None,
         check_active: Optional[Callable[[], None]] = None,
     ) -> None:
@@ -14429,7 +12860,7 @@ class GatewayRuntime:
         文件协议和生命周期操作仍使用原有预算；本方法不创建后台协调线程。
         """
 
-        activation_level = _runtime_activation_level(capability_name) or "geometry"
+        activation_level = activation_level or _runtime_activation_level(capability_name) or "geometry"
         requires_geometry = activation_level in {
             "geometry",
             "motion",
@@ -14480,8 +12911,12 @@ class GatewayRuntime:
                 provider_ready and input_bridge_ready()
             )
             ensure_activation_deadline()
-            if activation_level == "guard" and self.motion_guard.started:
-                return
+            if activation_level == "guard":
+                try:
+                    self.motion_guard.start()
+                    return
+                except GatewayMotionGuardUnavailable:
+                    pass
             # 不在协调锁内调用任务检查，避免反向获取 TaskManager 锁。
             while True:
                 ensure_activation_deadline()
@@ -14505,6 +12940,12 @@ class GatewayRuntime:
                 break
             while not event.is_set():
                 ensure_activation_deadline()
+                if activation_level == "guard":
+                    try:
+                        self.motion_guard.start()
+                        return
+                    except GatewayMotionGuardUnavailable:
+                        pass
                 wait_timeout = 0.05
                 if deadline_monotonic is not None:
                     wait_timeout = min(wait_timeout, max(0.0, deadline_monotonic - time.monotonic()))

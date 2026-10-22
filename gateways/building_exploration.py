@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 import uuid
-from types import SimpleNamespace
 
 from contracts.building_navigation import FloorPose
 from contracts.map_identity import AssetIdentityV2
@@ -18,7 +18,7 @@ class GatewayBuildingExplorationPorts:
         self.task_id=context.task_id;self.state=None
 
     def ensure_active(self):
-        self.context.ensure_active();self.runtime._assert_motion_admission(self.admission,self.admission.capability_name)
+        self.context.ensure_active()
 
     def progress(self,state):
         self.state=state
@@ -27,11 +27,9 @@ class GatewayBuildingExplorationPorts:
 
     def active_map_name(self):return self.runtime.map_workspace_service.get_active_map_name()
 
-    def _admit_child(self,capability,business_id):
+    def _admit_child(self, capability, business_id):
         self.ensure_active()
-        admission=self.runtime._admit_motion_request(capability,request_id=business_id,deadline_monotonic=self.context.timeout_deadline_monotonic())
-        self.ensure_active()
-        return admission
+        return replace(self.admission, request_id=business_id, capability_name=capability)
 
     def submit_transfer(self,floor,business_id,*,resume=False):
         service=self.runtime._get_building_navigation_service()
@@ -134,8 +132,6 @@ class GatewayBuildingExplorationPorts:
                 time.sleep(0.05)
             else:raise GatewayError("逐层探索子任务仍未完成停止。",error_code="building_child_stop_pending")
             if status.state.value=="succeeded":state.child_succeeded=True
-            if any(item.task_id==spec.task_id for item in self.runtime.task_manager.list_quarantined_tasks()):
-                raise GatewayError("逐层探索子任务仍保留停车隔离。",error_code="building_child_stop_pending")
             error=self.runtime.task_manager.get_task_error_payload(spec.task_id) or {}
             details=error.get("details") or {}
             if details.get("backend_not_started") is True and details.get("request_id")==state.child_request_id:
@@ -145,7 +141,7 @@ class GatewayBuildingExplorationPorts:
                 proof=event.payload.get("interrupt_barrier_proof") or event.payload.get("completion_proof")
                 if proof:return {"child_task_id":spec.task_id,**dict(proof)}
         if state.child_kind=="explore" and state.child_request_id:
-            result=self.runtime._stop_exploration_with_safety_barrier(self.context,request_id=state.child_request_id,poll_interval_sec=0.05,acknowledge_interrupt=False)
+            self.runtime._stop_exploration_with_safety_barrier(self.context,request_id=state.child_request_id,poll_interval_sec=0.05,acknowledge_interrupt=False)
             return {"request_id":state.child_request_id,"exploration_terminal":True}
         if state.child_kind=="transfer":
             from gateways.building_navigation import GatewayBuildingPorts

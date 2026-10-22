@@ -315,7 +315,6 @@ pub fn decode_nav_state_payload(payload: &[u8]) -> Option<NavigationUpdate> {
         return None;
     }
     let runtime_generation = u64::try_from(message.runtime_generation).ok()?;
-    let guard_generation = u64::try_from(message.guard_generation).ok()?;
     let cancel_generation = u64::try_from(message.cancel_generation).ok()?;
     let zero_applied_monotonic_ns = u64::try_from(message.zero_applied_monotonic_ns).ok()?;
     let goal_generation = u64::try_from(message.goal_generation).ok()?;
@@ -329,8 +328,7 @@ pub fn decode_nav_state_payload(payload: &[u8]) -> Option<NavigationUpdate> {
     };
     let has_session = !message.session_id.trim().is_empty();
     if has_session {
-        if (sink_ready && guard_generation == 0)
-            || !matches!(
+        if !matches!(
                 message.owner_kind,
                 schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV
                     | schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD
@@ -354,7 +352,7 @@ pub fn decode_nav_state_payload(payload: &[u8]) -> Option<NavigationUpdate> {
     }
     // 只有调度器明确的未授予租约终态可以省略停车证明；后半段保留守卫原始原因。
     let lease_not_granted = message.state == 4 && message.message.starts_with("LEASE_NOT_GRANTED: ");
-    if lease_not_granted && (!has_session || guard_generation == 0 || path_revision != 0
+    if lease_not_granted && (!has_session || path_revision != 0
         || planner_runtime_generation != 0 || !message.zero_ack_id.is_empty()
         || zero_applied_monotonic_ns != 0) {
         return None;
@@ -372,7 +370,7 @@ pub fn decode_nav_state_payload(payload: &[u8]) -> Option<NavigationUpdate> {
             reason_code: if lease_not_granted { "LEASE_NOT_GRANTED".into() }
                 else { navigation_state_name(message.state, &state.message) },
             runtime_generation,
-            guard_generation,
+
             sink_ready,
             planner_map_frame: message.planner_map_frame,
             planner_pose_frame: message.planner_pose_frame,
@@ -566,7 +564,7 @@ mod tests {
             progress: 0.5,
             message: "moving".into(),
             runtime_generation: 7,
-            guard_generation: 11,
+
             pose_source_timestamp_ns: 4_000_000_005,
             costmap_source_timestamp_ns: 3_000_000_004,
             sink_ready: 1,
@@ -591,7 +589,6 @@ mod tests {
         assert_eq!(nav.state.distance_remaining, 5.0);
         assert_eq!(nav.state.timestamp_ns, 4_000_000_005);
         assert_eq!(nav.feedback.runtime_generation, 7);
-        assert_eq!(nav.feedback.guard_generation, 11);
         assert!(nav.feedback.sink_ready);
         assert_eq!(nav.feedback.planner_map_frame, "map");
         assert_eq!(nav.feedback.planner_pose_frame, "map");
@@ -661,7 +658,7 @@ mod tests {
             progress: 0.0,
             message: "CANCELLED: stop and zero command published".into(),
             runtime_generation: 9,
-            guard_generation: 12,
+
             pose_source_timestamp_ns: 8_000_000_009,
             costmap_source_timestamp_ns: 7_000_000_008,
             sink_ready: 1,
@@ -706,7 +703,6 @@ mod tests {
         assert_eq!(nav.state.status, "IDLE");
         assert!(nav.state.goal_id.is_empty());
         assert!(nav.feedback.sink_ready);
-        assert_eq!(nav.feedback.guard_generation, 0);
     }
 
     #[test]

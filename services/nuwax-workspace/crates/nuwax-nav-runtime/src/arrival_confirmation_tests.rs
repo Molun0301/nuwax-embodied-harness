@@ -225,7 +225,6 @@ impl NavMotionPort for ArrivalAdmissionMotion {
             match self.failure {
                 Some("denied") => return Err(MotionPortError::definite_no_lease("原准入已被全局停止撤销")),
                 Some("uncertain") => return Err(MotionPortError::new("新租约响应丢失")),
-                Some("wrong_generation") => proof.guard_generation += 1,
                 _ => {}
             }
         }
@@ -248,7 +247,7 @@ impl NavMotionPort for ArrivalAdmissionMotion {
 
 #[tokio::test]
 async fn arrival_readmission_failure_never_reuses_old_fence_for_a_possible_new_lease() {
-    for failure in ["denied", "uncertain", "wrong_generation"] {
+    for failure in ["denied", "uncertain"] {
         let motion = Arc::new(Mutex::new(FakeMotionState::default()));
         let planner = FakePlanner::commanding();
         planner.state.lock().unwrap().step = PlannerStep::Succeeded;

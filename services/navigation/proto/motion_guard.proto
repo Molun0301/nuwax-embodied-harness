@@ -89,25 +89,20 @@ enum OperationNamespace {
   OPERATION_NAMESPACE_GLOBAL_STOP = 3;
 }
 
-enum GlobalStopMode {
-  GLOBAL_STOP_MODE_ORDINARY = 0;
-  GLOBAL_STOP_MODE_HOLD_RECOVERY_FENCE = 1;
-  GLOBAL_STOP_MODE_RELEASE_RECOVERY_FENCE = 2;
-}
-
 message LeaseTuple {
-  uint64 generation = 1;
+  reserved 1;
+  reserved "generation";
   bytes boot_nonce = 2; // Exactly 16 bytes.
   uint64 lease_id = 3;  // Zero only before AcquireLease.
 }
 
 message RequestEnvelope {
+  reserved 5, 6;
+  reserved "payload_sha256", "sequence";
   LeaseTuple tuple = 1;
   GuardSource source = 2;
   GuardAction action = 3;
   string operation_id = 4;
-  bytes payload_sha256 = 5; // Exactly 32 bytes for mutation requests.
-  uint64 sequence = 6;
   uint64 issued_monotonic_ns = 7;
   uint64 deadline_monotonic_ns = 8;
   // Guard-owned barrier sampled by readiness and checked atomically on acquire.
@@ -115,9 +110,10 @@ message RequestEnvelope {
 }
 
 message GlobalStopEnvelope {
+  reserved 3;
+  reserved "payload_sha256";
   GuardSource source = 1;
   string operation_id = 2;
-  bytes payload_sha256 = 3; // Exactly 32 bytes for the typed stop payload.
   uint64 issued_monotonic_ns = 4;
   uint64 deadline_monotonic_ns = 5;
 }
@@ -212,11 +208,11 @@ message RevokeAndZeroRequest {
 }
 
 message StopAllMotionRequest {
+  reserved 3, 4, 5;
+  reserved "mode", "recovery_correlation", "recovery_fence_token";
   GlobalStopEnvelope envelope = 1;
   string reason = 2;
-  GlobalStopMode mode = 3;
-  string recovery_correlation = 4;
-  bytes recovery_fence_token = 5;
+
 }
 
 message GetReadinessRequest {
@@ -234,15 +230,17 @@ message GetOperationResultRequest {
 }
 
 message AcquireLeaseResponse {
+  reserved 3;
+  reserved "lease_deadline_monotonic_ns";
   GuardResult result = 1;
   LeaseTuple lease_tuple = 2;
-  uint64 lease_deadline_monotonic_ns = 3;
   uint64 owner_deadline_monotonic_ns = 4;
 }
 
 message RenewLeaseResponse {
+  reserved 2;
+  reserved "lease_deadline_monotonic_ns";
   GuardResult result = 1;
-  uint64 lease_deadline_monotonic_ns = 2;
   uint64 owner_deadline_monotonic_ns = 3;
 }
 
@@ -250,6 +248,8 @@ message SubmitMotionCommandResponse {
   GuardResult result = 1;
   uint64 applied_monotonic_ns = 2;
   ZeroAck zero_ack = 3; // Present only for StopCommand.
+  // 执行器按配置进行了限幅；不是实测速度。
+  bool limited = 4;
 }
 
 message ExecuteSportCommandResponse {
@@ -270,42 +270,41 @@ message RevokeAndZeroResponse {
 }
 
 message StopAllMotionResponse {
+  reserved 5, 6;
+  reserved "recovery_fence_token", "recovery_fence_held";
   GuardResult result = 1;
   ZeroAck zero_ack = 2;
   bool lease_revoked = 3;
   uint64 motion_stop_generation = 4;
-  bytes recovery_fence_token = 5;
-  bool recovery_fence_held = 6;
+
 }
 
 message GetReadinessResponse {
+  reserved 4, 6, 10;
+  reserved "epoch_durable", "generation", "recovery_fence_held";
   GuardResult result = 1;
   bool ready = 2;
   bool actuator_configured = 3;
-  bool epoch_durable = 4;
   string reason = 5;
-  uint64 generation = 6;
   bytes boot_nonce = 7;
   bool startup_zero_confirmed = 8;
   uint64 motion_stop_generation = 9;
-  bool recovery_fence_held = 10;
+
 }
 
 message GetGuardStateResponse {
+  reserved 2, 4, 5, 8, 9, 10;
+  reserved "generation", "last_zero_ack_id", "fenced", "recovery_fence_held", "recovery_fence_token_sha256", "recovery_fence_correlation_sha256";
   GuardResult result = 1;
-  uint64 generation = 2;
   bytes boot_nonce = 3;
-  string last_zero_ack_id = 4;
-  bool fenced = 5;
   uint64 active_lease_id = 6;
   uint64 motion_stop_generation = 7;
-  bool recovery_fence_held = 8;
-  bytes recovery_fence_token_sha256 = 9;
-  bytes recovery_fence_correlation_sha256 = 10;
   ZeroAck last_zero_confirmation = 11;
 }
 
 message GetOperationResultResponse {
+  reserved 7, 8;
+  reserved "recovery_fence_token", "recovery_fence_held";
   GuardResult result = 1;
   string target_operation_id = 2;
   AckCode target_ack = 3;
@@ -313,8 +312,7 @@ message GetOperationResultResponse {
   ZeroAck zero_ack = 5;
   // Exact guard barrier associated with a resolved global-stop operation.
   uint64 motion_stop_generation = 6;
-  bytes recovery_fence_token = 7;
-  bool recovery_fence_held = 8;
+
 }
 
 message MotionGuardRequest {

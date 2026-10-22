@@ -10,13 +10,11 @@ import threading
 
 from .actor import GuardActor
 from .constants import (
-    DEFAULT_EPOCH_PATH,
     DEFAULT_LOCK_PATH,
-    DEFAULT_PROVISION_PATH,
     DEFAULT_SOCKET_PATH,
 )
 from .core import MotionGuardCore
-from .epoch import EpochStore, SingleInstanceLock
+from .single_instance import SingleInstanceLock
 from .go2_actuator import ActuatorError, Go2Actuator
 from .motion_control_actuator import MotionControlActuator
 from .server import MotionGuardUnixServer
@@ -30,11 +28,6 @@ def _path_from_env(name: str, default: str) -> Path:
 def run() -> None:
     socket_path = _path_from_env("NUWAX_MOTION_GUARD_SOCKET", DEFAULT_SOCKET_PATH)
     lock_path = _path_from_env("NUWAX_MOTION_GUARD_LOCK", DEFAULT_LOCK_PATH)
-    epoch_path = _path_from_env("NUWAX_MOTION_GUARD_EPOCH", DEFAULT_EPOCH_PATH)
-    provision_path = _path_from_env(
-        "NUWAX_MOTION_GUARD_PROVISIONED",
-        DEFAULT_PROVISION_PATH,
-    )
     stop_event = threading.Event()
 
     def request_stop(_signum: int, _frame: object) -> None:
@@ -49,25 +42,11 @@ def run() -> None:
     actuator = None
     try:
         lock.acquire()
-        epoch_store = EpochStore(
-            provision_path=provision_path,
-            epoch_path=epoch_path,
-        )
-        standard_control = runtime_value("NUWAX_MOTION_GUARD_BACKEND", "").strip() == "motion_control"
-        if standard_control:
-            epoch_store.initialize_standard_control()
-        epoch = epoch_store.advance_boot()
-        if standard_control:
-            actuator = MotionControlActuator.from_environment(
-                actuator_symbols_sha256=epoch.actuator_symbols_sha256,
-            )
+        if runtime_value("NUWAX_MOTION_GUARD_BACKEND", "").strip() == "motion_control":
+            actuator = MotionControlActuator.from_environment()
         else:
             actuator = Go2Actuator.from_environment()
-        core = MotionGuardCore(
-            epoch=epoch,
-            epoch_store=epoch_store,
-            actuator=actuator,
-        )
+        core = MotionGuardCore(actuator=actuator)
         if not core.startup_configured:
             raise RuntimeError(core.startup_reason)
         try:

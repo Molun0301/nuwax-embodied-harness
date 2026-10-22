@@ -20,10 +20,7 @@ from fastapi.testclient import TestClient
 
 from contracts.geometry import Pose, Vector3
 from contracts.navigation import NavigationGoal, NavigationStatus
-from contracts.tasks import TaskSpec, TaskState, TaskStatus
-from core.capability_registry import CapabilityRegistry
 from core.event_bus import EventBus
-from core.safety_guard import SafetyGuard
 from core.settings import GatewayServerConfig
 from gateways.auth import GatewayAccessManager
 from gateways.errors import GatewayError
@@ -33,8 +30,6 @@ from gateways.motion_guard import MotionAdmission
 from gateways.runtime import GatewayRuntime
 from services.navigation.motion_guard_client import MotionAdmissionProof
 from skills.handlers import motion_skills
-from skills.map_workspace import MapWorkspaceService
-from skills.registry import SkillRegistry
 
 
 class _ObservedGatewayRuntime(GatewayRuntime):
@@ -144,12 +139,8 @@ class NavigationGoalHeightPublicInputTests(unittest.TestCase):
         self._gateway_overrides[gateway].enter_context(patch.object(gateway, 'height_workspace', SimpleNamespace(
             map_asset=SimpleNamespace(identity_schema_version=schema_version),
             active_localization_session=SimpleNamespace(session_id="height-session")), create=True))
-        proof = MotionAdmissionProof(generation=1, boot_nonce=b"h" * 16)
-        self._gateway_overrides[gateway].enter_context(patch.object(gateway, 'height_admission', MotionAdmission(
-            request_id="height-admission", capability_name="navigate_to_pose", generation=1,
-            boot_nonce=b"h" * 16, motion_stop_generation=gateway.safety_guard.begin_motion_admission(),
-            admitted_monotonic_ns=1, proof=proof,
-        ), create=True))
+        proof = MotionAdmissionProof(boot_nonce=b'h' * 16)
+        self._gateway_overrides[gateway].enter_context(patch.object(gateway, 'height_admission', MotionAdmission(request_id='height-admission', capability_name='navigate_to_pose', boot_nonce=b'h' * 16, motion_stop_generation=proof.motion_stop_generation), create=True))
 
         def admit(*args, **kwargs):
             gateway.height_events.append("admit")
@@ -234,9 +225,9 @@ class NavigationGoalHeightPublicInputTests(unittest.TestCase):
         self.assertNotIn("z", parameters)
         self.assertNotIn("z", gateway.forwarded_arguments[-1][1])
         self.assert_pending_target(gateway)
-        self.assertEqual(gateway.height_events, [])
+        self.assertEqual(gateway.height_events, ["admit"])
         self.run_latest(gateway)
-        self.assertEqual(gateway.height_events, ["admit", "workspace", "localize", "owned_pose", "runtime_ready", "dispatch"])
+        self.assertEqual(gateway.height_events, ["admit", "runtime_ready", "workspace", "localize", "owned_pose", "dispatch"])
         self.assertEqual(gateway.dispatched[0].target_pose.position.z, 7.25)
         self.assertNotIn("navigation_height_pending", gateway.dispatched[0].metadata)
 
@@ -292,7 +283,7 @@ class NavigationGoalHeightPublicInputTests(unittest.TestCase):
                 self.run_latest(gateway)
                 self.assertEqual(gateway.dispatched[-1].target_pose.position.z, expected_z)
                 if after == 2:
-                    getter.assert_called_once_with("height_contract_map", require_assigned=True)
+                    getter.assert_called_once_with("height_contract_map")
                 else:
                     getter.assert_not_called()
 
@@ -503,11 +494,11 @@ class NavigationGoalHeightPublicInputTests(unittest.TestCase):
         self.run_latest(gateway)
         self.assertEqual(gateway.dispatched[0].target_pose.position.z, 3.5)
 
-    def test_synchronous_prepared_call_resolves_before_submission(self):
+    def test_original_admission_call_keeps_height_pending_until_preparation(self):
         gateway = self.configure_runner(self.gateway())
         gateway._handle_navigate_to_pose({"frame_id": "map", "x": 4.25, "y": -1.5,
             motion_skills.MOTION_ADMISSION_ARGUMENT: gateway.height_admission})
-        self.assert_queued_target(gateway, z=7.25)
+        self.assert_pending_target(gateway)
         self.run_latest(gateway)
         self.assertEqual(gateway.dispatched[0].target_pose.position.z, 7.25)
         gateway.map_workspace_service.get_relocalized_pose.assert_called_once()
@@ -547,23 +538,6 @@ class NavigationGoalHeightPublicInputTests(unittest.TestCase):
         self.assertEqual(raised.exception.error_code, "navigation_height_unavailable")
         gateway.navigation_service.set_goal.assert_not_called()
 
-    def test_legacy_getter_default_keeps_unbound_compatibility_for_existing_callers(self):
-        service = object.__new__(MapWorkspaceService)
-        legacy_pose = Pose(frame_id="map", position=Vector3(z=91.5))
-        provider = SimpleNamespace(get_current_pose=Mock(return_value=legacy_pose))
-        service._repository = SimpleNamespace(
-            get_map_asset=Mock(return_value=SimpleNamespace(identity_schema_version=1)),
-            get_last_successful_relocalization_receipt=Mock(return_value={
-                "map_name": "legacy_map", "activation_identity_sha256": "legacy-receipt"}),
-            get_last_successful_map_activation_receipt=Mock(return_value={
-                "activation_identity_sha256": "legacy-receipt"}))
-        service._geometry_runtime = SimpleNamespace(get_geometry_runtime_provider=Mock(return_value=provider))
-        self.assertIs(service.get_relocalized_pose("legacy_map"), legacy_pose)
-        self.assertIs(service.get_relocalized_pose("legacy_map", require_assigned=False), legacy_pose)
-        self.assertEqual(provider.get_current_pose.call_count, 2)
-        self.assertIsNone(service.get_relocalized_pose("legacy_map", require_assigned=True))
-        self.assertEqual(provider.get_current_pose.call_count, 2)
-        self.assertEqual(service._repository.get_last_successful_relocalization_receipt.call_count, 2)
 
 
 class NavigationGoalHeightOwnedSampleTests(unittest.TestCase):
@@ -665,12 +639,6 @@ class NavigationGoalHeightOwnedSampleTests(unittest.TestCase):
         self.fail_after_preparation(lambda: setattr(self.owner.stub, "during_sample",
             lambda: self.owner.localization.clear_active_session(reason="height-test-session-change")))
 
-    def forbid_legacy_receipt_reads(self):
-        # 必须由 assigned-only 守卫拒绝，不能碰巧依赖旧回执不匹配而拒绝。
-        guard = patch.object(self.owner.service._repository, "get_last_successful_relocalization_receipt",
-            side_effect=AssertionError("assigned 高度不得回退读取旧回执"))
-        self.legacy_receipt_getter = guard.start()
-        self.addCleanup(guard.stop)
 
     def test_assigned_catalog_downgrade_after_preparation_rejects_before_pose_rpc(self):
         repository = self.owner.service._repository
@@ -684,12 +652,10 @@ class NavigationGoalHeightOwnedSampleTests(unittest.TestCase):
             repository.save_map_asset(legacy)
             self.assertEqual(repository.get_map_asset(owned_fixtures.MAP_NAME).identity_schema_version, 1)
             self.owner.stub.calls.clear()
-            self.forbid_legacy_receipt_reads()
 
         self.fail_after_preparation(downgrade)
         self.assertEqual(self.owner.stub.calls, [])
         self.owner.provider.get_current_pose.assert_not_called()
-        self.legacy_receipt_getter.assert_not_called()
 
     def test_assigned_catalog_missing_after_preparation_rejects_before_pose_rpc(self):
         def remove_catalog_view():
@@ -697,12 +663,10 @@ class NavigationGoalHeightOwnedSampleTests(unittest.TestCase):
             guard.start()
             self.addCleanup(guard.stop)
             self.owner.stub.calls.clear()
-            self.forbid_legacy_receipt_reads()
 
         self.fail_after_preparation(remove_catalog_view)
         self.assertEqual(self.owner.stub.calls, [])
         self.owner.provider.get_current_pose.assert_not_called()
-        self.legacy_receipt_getter.assert_not_called()
 
 
 if __name__ == "__main__":

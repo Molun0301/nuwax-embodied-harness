@@ -292,7 +292,6 @@ pub(crate) enum NativePlannerReadyContract {
 }
 
 
-
 #[cfg(all(
     feature = "native-runner",
     any(feature = "cmu-native", feature = "explore")
@@ -880,24 +879,10 @@ fn guarded_goal_execution_identity(
     goal: &schema::GoalEnvelope,
 ) -> nuwax_nav_runtime::PathExecutionIdentity {
     nuwax_nav_runtime::PathExecutionIdentity {
+        goal_key: nuwax_nav_types_messages::GoalKey { producer_runtime_generation: (goal.producer_runtime_generation) as u64, goal_generation: (goal.goal_generation) as u64 },
         session_id: goal.session_id.clone(),
-        owner_kind: goal.owner_kind,
-        parent_request_id: goal.parent_request_id.clone(),
-        goal_generation: goal.goal_generation,
-        producer: goal.producer.clone(),
-        producer_epoch: goal.producer_epoch,
-        producer_runtime_generation: goal.producer_runtime_generation,
-        committed_map_session_id: goal.committed_map_session_id.clone(),
-        committed_map_session_generation: goal.committed_map_session_generation,
-        committed_map_revision: goal.committed_map_revision,
-        committed_map_boot_nonce: goal.committed_map_boot_nonce,
-        committed_map_commit_sequence: goal.committed_map_commit_sequence,
-        committed_map_source_timestamp_ns: goal.committed_map_source_timestamp_ns,
-        committed_map_frame_id: goal.committed_map_frame_id.clone(),
-        boundary_id: goal.boundary_id.clone(),
-        motion_guard_generation: goal.motion_guard_generation,
-        motion_guard_boot_nonce: goal.motion_guard_boot_nonce,
-        motion_stop_generation: goal.motion_stop_generation,
+
+
         planner_runtime_generation: 0,
         path_revision: 0,
     }
@@ -908,24 +893,10 @@ fn guarded_path_execution_identity(
     path: &schema::PathEnvelope,
 ) -> nuwax_nav_runtime::PathExecutionIdentity {
     nuwax_nav_runtime::PathExecutionIdentity {
+        goal_key: nuwax_nav_types_messages::GoalKey { producer_runtime_generation: (path.producer_runtime_generation) as u64, goal_generation: (path.goal_generation) as u64 },
         session_id: path.session_id.clone(),
-        owner_kind: path.owner_kind,
-        parent_request_id: path.parent_request_id.clone(),
-        goal_generation: path.goal_generation,
-        producer: path.producer.clone(),
-        producer_epoch: path.producer_epoch,
-        producer_runtime_generation: path.producer_runtime_generation,
-        committed_map_session_id: path.committed_map_session_id.clone(),
-        committed_map_session_generation: path.committed_map_session_generation,
-        committed_map_revision: path.committed_map_revision,
-        committed_map_boot_nonce: path.committed_map_boot_nonce,
-        committed_map_commit_sequence: path.committed_map_commit_sequence,
-        committed_map_source_timestamp_ns: path.committed_map_source_timestamp_ns,
-        committed_map_frame_id: path.committed_map_frame_id.clone(),
-        boundary_id: path.boundary_id.clone(),
-        motion_guard_generation: path.motion_guard_generation,
-        motion_guard_boot_nonce: path.motion_guard_boot_nonce,
-        motion_stop_generation: path.motion_stop_generation,
+
+
         planner_runtime_generation: path.planner_runtime_generation,
         path_revision: u64::try_from(path.path_revision).expect("validated positive path revision"),
     }
@@ -2307,12 +2278,9 @@ where
                             goal: nuwax_nav_runtime::ExecutionGoal::Body(pose_from_schema(&buffered_goal.goal)?),
                             session_id: session_id.clone(),
                             execution_identity: guarded_goal_execution_identity(&buffered_goal),
-                            local_owner_runtime_generation: process_runtime_generation,
+
                             motion_admission: nuwax_nav_runtime::NavMotionAdmission {
-                                guard_generation: u64::try_from(
-                                    buffered_goal.motion_guard_generation,
-                                )
-                                .expect("validated positive motion_guard_generation"),
+
                                 guard_boot_nonce: buffered_goal.motion_guard_boot_nonce,
                                 motion_stop_generation: u64::try_from(
                                     buffered_goal.motion_stop_generation,
@@ -2625,10 +2593,9 @@ async fn activate_guarded_goal(
             goal: nuwax_nav_runtime::ExecutionGoal::Body(pose_from_schema(&goal_envelope.goal)?),
             session_id: goal_envelope.session_id.clone(),
             execution_identity: guarded_goal_execution_identity(&goal_envelope),
-            local_owner_runtime_generation: runtime_generation(),
+
             motion_admission: nuwax_nav_runtime::NavMotionAdmission {
-                guard_generation: u64::try_from(goal_envelope.motion_guard_generation)
-                    .expect("validated positive motion_guard_generation"),
+
                 guard_boot_nonce: goal_envelope.motion_guard_boot_nonce,
                 motion_stop_generation: u64::try_from(goal_envelope.motion_stop_generation)
                     .expect("validated non-negative motion_stop_generation"),
@@ -2753,32 +2720,12 @@ fn planner_generation_is_stale(
 }
 
 #[cfg(feature = "guard-runtime")]
-fn validate_path_goal_correlation(
-    path: &schema::PathEnvelope,
-    goal: &schema::GoalEnvelope,
-) -> Result<(), String> {
-    if path.session_id != goal.session_id
-        || path.owner_kind != goal.owner_kind
-        || path.parent_request_id != goal.parent_request_id
-        || path.goal_generation != goal.goal_generation
-        || path.producer != goal.producer
-        || path.producer_epoch != goal.producer_epoch
-        || path.producer_runtime_generation != goal.producer_runtime_generation
-        || path.committed_map_session_id != goal.committed_map_session_id
-        || path.committed_map_session_generation != goal.committed_map_session_generation
-        || path.committed_map_revision != goal.committed_map_revision
-        || path.committed_map_boot_nonce != goal.committed_map_boot_nonce
-        || path.committed_map_commit_sequence != goal.committed_map_commit_sequence
-        || path.committed_map_source_timestamp_ns != goal.committed_map_source_timestamp_ns
-        || path.committed_map_frame_id != goal.committed_map_frame_id
-        || path.boundary_id != goal.boundary_id
-        || path.motion_guard_generation != goal.motion_guard_generation
-        || path.motion_guard_boot_nonce != goal.motion_guard_boot_nonce
-        || path.motion_stop_generation != goal.motion_stop_generation
-    {
-        return Err(
-            "PathEnvelope goal identity does not match the active GoalEnvelope".into(),
-        );
+fn validate_path_goal_correlation(path: &schema::PathEnvelope, goal: &schema::GoalEnvelope) -> Result<(), String> {
+    if path.session_id != goal.session_id || path.goal_key() != goal.goal_key() {
+        return Err("PathEnvelope goal identity does not match the active GoalEnvelope".into());
+    }
+    if path.path.header.frame_id != goal.goal.header.frame_id {
+        return Err("PathEnvelope frame does not match the active GoalEnvelope".into());
     }
     Ok(())
 }
@@ -3449,11 +3396,7 @@ fn build_guarded_navigation_state(
         message,
         runtime_generation: planner_observation
             .map_or(0, |_| saturating_i64(telemetry.runtime_generation)),
-        guard_generation: if has_public_session {
-            saturating_i64(status.guard_generation)
-        } else {
-            0
-        },
+
         pose_source_timestamp_ns: status.pose_source_timestamp_ns,
         costmap_source_timestamp_ns: status.costmap_source_timestamp_ns,
         sink_ready: i8::from(status.motion_sink_ready),
@@ -4428,7 +4371,6 @@ fn planner_goal_identity_matches(
         && left.body_reference_frame_id == right.body_reference_frame_id
         && left.body_to_support_z_m == right.body_to_support_z_m
         && left.map_frame_generation == right.map_frame_generation
-        && left.motion_guard_generation == right.motion_guard_generation
         && left.motion_guard_boot_nonce == right.motion_guard_boot_nonce
         && left.motion_stop_generation == right.motion_stop_generation
 }
@@ -4892,7 +4834,6 @@ fn native_path_respects_goal(path: &Path2D, goal: &schema::GoalEnvelope) -> bool
                 path_respects_navigation_boundary(path, boundary.as_ref(), 0.025)
             })
 }
-
 
 
 #[cfg(any(feature = "cmu-native", feature = "explore"))]
@@ -6751,26 +6692,17 @@ fn build_versioned_path_from_schema(
     let envelope = schema::PathEnvelope {
         schema_version: schema::NAVIGATION_ENVELOPE_SCHEMA_VERSION,
         session_id: goal.session_id.clone(),
-        owner_kind: goal.owner_kind,
-        parent_request_id: goal.parent_request_id.clone(),
+
+
         goal_generation: goal.goal_generation,
-        producer: goal.producer.clone(),
-        producer_epoch: goal.producer_epoch,
+
+
         producer_runtime_generation: goal.producer_runtime_generation,
-        committed_map_session_id: goal.committed_map_session_id.clone(),
-        committed_map_session_generation: goal.committed_map_session_generation,
-        committed_map_revision: goal.committed_map_revision,
-        committed_map_boot_nonce: goal.committed_map_boot_nonce,
-        committed_map_commit_sequence: goal.committed_map_commit_sequence,
-        committed_map_source_timestamp_ns: goal.committed_map_source_timestamp_ns,
-        committed_map_frame_id: goal.committed_map_frame_id.clone(),
-        boundary_id: goal.boundary_id.clone(),
-        motion_guard_generation: goal.motion_guard_generation,
-        motion_guard_boot_nonce: goal.motion_guard_boot_nonce,
-        motion_stop_generation: goal.motion_stop_generation,
+
+
         planner_runtime_generation: planner_runtime_generation,
         path_revision: path_revision,
-        source_timestamp_ns,
+
         path,
     };
     Ok(envelope)
@@ -6958,7 +6890,7 @@ fn planner_test_goal(session_id: &str, goal_generation: i64) -> schema::GoalEnve
             [0.0, 5.0, 0.0],
             [0.0, 0.0, 0.0],
         ],
-        motion_guard_generation: 7,
+
         motion_guard_boot_nonce: [7; 16],
         motion_stop_generation: 1,
         goal: schema::PoseStamped {
@@ -8275,7 +8207,7 @@ mod guarded_tests {
             committed_map_source_timestamp_ns: 1,
             committed_map_frame_id: "map".into(),
             source_timestamp_ns: 1_000_000_000,
-            motion_guard_generation: 7,
+
             motion_guard_boot_nonce: [7; 16],
             motion_stop_generation: 1,
             goal: schema::PoseStamped {
@@ -8299,26 +8231,17 @@ mod guarded_tests {
         let mut path = schema::PathEnvelope {
             schema_version: schema::NAVIGATION_ENVELOPE_SCHEMA_VERSION,
             session_id: goal.session_id.clone(),
-            owner_kind: goal.owner_kind,
-            parent_request_id: goal.parent_request_id.clone(),
+
+
             goal_generation: goal.goal_generation,
-            producer: goal.producer.clone(),
-            producer_epoch: goal.producer_epoch,
+
+
             producer_runtime_generation: goal.producer_runtime_generation,
-            committed_map_session_id: goal.committed_map_session_id.clone(),
-            committed_map_session_generation: goal.committed_map_session_generation,
-            committed_map_revision: goal.committed_map_revision,
-            committed_map_boot_nonce: goal.committed_map_boot_nonce,
-            committed_map_commit_sequence: goal.committed_map_commit_sequence,
-            committed_map_source_timestamp_ns: goal.committed_map_source_timestamp_ns,
-            committed_map_frame_id: goal.committed_map_frame_id.clone(),
-            boundary_id: goal.boundary_id.clone(),
-            motion_guard_generation: goal.motion_guard_generation,
-            motion_guard_boot_nonce: goal.motion_guard_boot_nonce,
-            motion_stop_generation: goal.motion_stop_generation,
+
+
             planner_runtime_generation: saturating_i64(runtime_generation()),
             path_revision: 1,
-            source_timestamp_ns: 2_000_000_000,
+
                 path: schema::Path {
                 header: schema::Header {
                     stamp_sec: 2,
@@ -8465,7 +8388,7 @@ mod guarded_tests {
                     .push(format!("acquire:{operation_id}"));
                 Ok(nuwax_nav_runtime::LeaseProof {
                     lease_id: 11,
-                    guard_generation: admission.guard_generation,
+
                 })
             })
         }
@@ -9762,10 +9685,9 @@ mod guarded_tests {
                 goal: nuwax_nav_runtime::ExecutionGoal::Body(pose_from_schema(&blocker.goal).expect("valid goal pose")),
                 session_id: blocker.session_id.clone(),
                 execution_identity: guarded_goal_execution_identity(&blocker),
-                local_owner_runtime_generation: runtime_generation(),
+
                 motion_admission: nuwax_nav_runtime::NavMotionAdmission {
-                    guard_generation: u64::try_from(blocker.motion_guard_generation)
-                        .expect("positive blocker guard generation"),
+
                     guard_boot_nonce: blocker.motion_guard_boot_nonce,
                     motion_stop_generation: u64::try_from(blocker.motion_stop_generation)
                         .expect("non-negative blocker stop generation"),
@@ -9868,7 +9790,7 @@ mod guarded_tests {
 
         let mut higher_revision = current;
         higher_revision.path_revision = 2;
-        higher_revision.source_timestamp_ns += 1;
+        higher_revision.path.header.stamp_nsec += 1;
         schema::validate_path_envelope(&higher_revision)
             .expect("seal same-generation higher-revision path");
         harness.send_path(&higher_revision);
@@ -10177,8 +10099,8 @@ mod guarded_tests {
     }
 
     #[tokio::test]
-    async fn guarded_active_same_revision_mutation_remains_safety_failed() {
-        let harness = GuardedLoopHarness::spawn().await;
+    async fn guarded_active_same_revision_mutation_preserves_original_execution() {
+        let mut harness = GuardedLoopHarness::spawn().await;
         let goal = activate_map_a(&harness).await;
         let path = sealed_path(&goal);
         harness.send_path(&path);
@@ -10195,19 +10117,18 @@ mod guarded_tests {
         schema::validate_path_envelope(&mutation).expect("seal same-revision mutation");
         harness.send_path(&mutation);
         tokio::time::timeout(Duration::from_secs(1), async {
-            while harness.scheduler.status().last_terminal != Some(TerminalOutcome::SafetyFailed) {
-                tokio::time::sleep(Duration::from_millis(5)).await;
+            loop {
+                let frame = harness.states.next().await.unwrap().unwrap();
+                let state = schema::decode_navigation_state_body(&frame.payload).unwrap();
+                if state.message.contains("versioned path mutation detected") { break; }
             }
-        })
-        .await
-        .expect("same-revision mutation SafetyFailed");
-        let failed = harness.scheduler.status();
-        assert_eq!(failed.phase, SchedulerPhase::Failed);
-        assert!(!failed
-            .last_zero_ack_id
-            .as_deref()
-            .unwrap_or_default()
-            .is_empty());
+        }).await.expect("同修订变化须通过真实状态流发布拒绝诊断");
+        let retained = harness.scheduler.status();
+        assert_eq!(retained.phase, SchedulerPhase::Controlling);
+        assert_eq!(retained.last_terminal, None);
+        assert_eq!(retained.session_id.as_deref(), Some(goal.session_id.as_str()));
+        assert_eq!(retained.path_revision, 1);
+        assert!(retained.last_zero_ack_id.is_none());
         harness.shutdown().await;
     }
 
@@ -10367,7 +10288,7 @@ mod guarded_tests {
         let terminal = nuwax_nav_runtime::SchedulerStatus {
             phase: SchedulerPhase::Idle,
             motion_sink_ready: true,
-            guard_generation: 98,
+
             last_terminal: Some(TerminalOutcome::Cancelled),
             last_zero_ack_id: Some("zero-ack-a".into()),
             last_fence_monotonic_ns: 123,
@@ -10401,7 +10322,6 @@ mod guarded_tests {
         assert_eq!(terminal_message.producer_runtime_generation, 11);
         assert_eq!(terminal_message.planner_runtime_generation, 22);
         assert_eq!(terminal_message.runtime_generation, 0);
-        assert_eq!(terminal_message.guard_generation, 98);
         assert_eq!(terminal_message.cancel_generation, 2);
         assert_eq!(terminal_message.zero_ack_id, "zero-ack-a");
         assert_eq!(terminal_message.zero_applied_monotonic_ns, 123);
@@ -10422,7 +10342,6 @@ mod guarded_tests {
         assert!(heartbeat.session_id.is_empty());
         assert_eq!(heartbeat.state, 0);
         assert_eq!(heartbeat.message, "IDLE: guard client heartbeat");
-        assert_eq!(heartbeat.guard_generation, 0);
         assert_eq!(heartbeat.sink_ready, 1);
         assert_eq!(heartbeat.cancel_generation, 0);
         assert!(heartbeat.zero_ack_id.is_empty());
@@ -10470,23 +10389,6 @@ mod guarded_tests {
         foreign_path.goal_generation += 1;
         assert!(validate_path_goal_correlation(&foreign_path, &goal).is_err());
 
-        let mut wrong_revision = path.clone();
-        wrong_revision.committed_map_revision += 1;
-        assert!(validate_path_goal_correlation(&wrong_revision, &goal).is_err());
-        let mut wrong_map_nonce = path.clone();
-        wrong_map_nonce.committed_map_boot_nonce[0] ^= 0xff;
-        assert!(validate_path_goal_correlation(&wrong_map_nonce, &goal).is_err());
-        let mut wrong_map_sequence = path.clone();
-        wrong_map_sequence.committed_map_commit_sequence += 1;
-        schema::validate_path_envelope(&wrong_map_sequence).unwrap();
-        assert!(validate_path_goal_correlation(&wrong_map_sequence, &goal).is_err());
-        let mut wrong_map_time = path.clone();
-        wrong_map_time.committed_map_source_timestamp_ns += 1;
-        schema::validate_path_envelope(&wrong_map_time).unwrap();
-        assert!(validate_path_goal_correlation(&wrong_map_time, &goal).is_err());
-        let mut wrong_boundary = path.clone();
-        wrong_boundary.boundary_id.push_str("-other");
-        assert!(validate_path_goal_correlation(&wrong_boundary, &goal).is_err());
         let mut wrong_producer_generation = path.clone();
         wrong_producer_generation.producer_runtime_generation += 1;
         assert!(validate_path_goal_correlation(&wrong_producer_generation, &goal).is_err());
@@ -10758,10 +10660,9 @@ mod guarded_tests {
                 goal: nuwax_nav_runtime::ExecutionGoal::Body(pose_from_schema(&goal_a.goal).expect("valid goal pose")),
                 session_id: goal_a.session_id.clone(),
                 execution_identity: guarded_goal_execution_identity(&goal_a),
-                local_owner_runtime_generation: runtime_generation(),
+
                 motion_admission: nuwax_nav_runtime::NavMotionAdmission {
-                    guard_generation: u64::try_from(goal_a.motion_guard_generation)
-                        .expect("positive guard generation"),
+
                     guard_boot_nonce: goal_a.motion_guard_boot_nonce,
                     motion_stop_generation: u64::try_from(goal_a.motion_stop_generation)
                         .expect("non-negative stop generation"),
@@ -12277,7 +12178,7 @@ mod native_adapter_tests {
                 [0.0, 5.0, 0.0],
                 [0.0, 0.0, 0.0],
             ],
-            motion_guard_generation: 7,
+
             motion_guard_boot_nonce: [0x31; 16],
             motion_stop_generation: 8,
             goal: schema::PoseStamped {
@@ -12367,7 +12268,6 @@ mod native_adapter_tests {
         state.message = published.encode_v2();
         assert!(!far_ready_contract_matches(&expected, 12, &state));
     }
-
 
 
     #[cfg(any(feature = "cmu-native", feature = "explore"))]
@@ -12790,9 +12690,6 @@ mod native_adapter_tests {
             .expect("join FAR adapter")
             .expect("FAR adapter shutdown");
     }
-
-
-
 
 
     #[test]

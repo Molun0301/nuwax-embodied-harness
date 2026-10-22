@@ -105,6 +105,15 @@ class ResourceLockManager:
                 if lease is not None and lease.task_id == task_id:
                     self._leases.pop(normalized, None)
 
+    def release_if_current(self, lease: ResourceLease, *, task_id: str) -> bool:
+        """仅释放捕获的原租约；同一任务后来重新取得的租约不受影响。"""
+        with self._lock:
+            current = self._leases.get(lease.resource)
+            if current is not lease or current.task_id != task_id:
+                return False
+            self._leases.pop(lease.resource)
+            return True
+
     def force_release(self, resources: Union[List[str], Tuple[str, ...]]) -> None:
         """无条件释放指定资源。"""
 

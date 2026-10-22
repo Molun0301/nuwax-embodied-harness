@@ -5,8 +5,6 @@ set -Eeuo pipefail
 REPO_ROOT="${NUWAX_REPO_ROOT:?NUWAX_REPO_ROOT is required}"
 REQUEST_FILE="${NUWAX_RUNTIME_ACTIVATION_REQUEST:-/run/nuwax/gateway/geometry.request}"
 RESULT_FILE="${NUWAX_RUNTIME_ACTIVATION_RESULT:-/run/nuwax/gateway/geometry.result.json}"
-CANCEL_FILE="${NUWAX_RUNTIME_ACTIVATION_CANCEL:-${REQUEST_FILE}.cancel.json}"
-ACK_FILE="${NUWAX_RUNTIME_ACTIVATION_ACK:-${REQUEST_FILE}.ack.json}"
 MOTION_SOCKET="${NUWAX_MOTION_GUARD_SOCKET:-/run/nuwax/motion-guard.sock}"
 NAV_READY_FILE="${NUWAX_NAV_STACK_READY_FILE:-/run/nuwax/navigation/nuwax_nav_stack.ready}"
 GEOMETRY_READY_FILE="${NUWAX_GEOMETRY_RUNTIME_READY_FILE:-/run/nuwax/geometry/nuwax_geometry_runtime.ready}"
@@ -18,7 +16,6 @@ LAST_UNIT=""
 ACTIVATION_LEVEL="motion"
 CAPABILITY_NAME="unknown"
 REQUEST_ID=""
-MOTION_STOP_GENERATION="0"
 STARTED_UNITS=()
 FAILURE_UNIT=""
 FAILURE_UNIT_RESULT=""
@@ -32,12 +29,12 @@ write_result() {
   local temporary="${RESULT_FILE}.$$"
   STATE="${state}" MESSAGE="${message}" STAGE="${LAST_STAGE}" \
     ERROR_CODE="${error_code}" REQUEST_ID="${REQUEST_ID}" \
-    MOTION_STOP_GENERATION="${MOTION_STOP_GENERATION}" ACTIVATION_LEVEL="${ACTIVATION_LEVEL}" \
+    ACTIVATION_LEVEL="${ACTIVATION_LEVEL}" \
     CAPABILITY_NAME="${CAPABILITY_NAME}" FAILURE_UNIT="${FAILURE_UNIT}" \
     FAILURE_UNIT_RESULT="${FAILURE_UNIT_RESULT}" \
     FAILURE_UNIT_EXIT_STATUS="${FAILURE_UNIT_EXIT_STATUS}" \
     FAILURE_DIAGNOSTIC="${FAILURE_DIAGNOSTIC}" \
-    /usr/bin/python3 -c 'import json, os; payload = {"state": os.environ["STATE"], "stage": os.environ["STAGE"], "message": os.environ["MESSAGE"], "request_id": os.environ["REQUEST_ID"], "motion_stop_generation": int(os.environ["MOTION_STOP_GENERATION"]), "activation_level": os.environ["ACTIVATION_LEVEL"], "capability_name": os.environ["CAPABILITY_NAME"]}; optional = {"error_code": os.environ.get("ERROR_CODE", ""), "unit": os.environ.get("FAILURE_UNIT", ""), "unit_result": os.environ.get("FAILURE_UNIT_RESULT", ""), "unit_exit_status": os.environ.get("FAILURE_UNIT_EXIT_STATUS", ""), "diagnostic": os.environ.get("FAILURE_DIAGNOSTIC", "")}; payload.update({key: value for key, value in optional.items() if value}); print(json.dumps(payload, ensure_ascii=True, sort_keys=True))' \
+    /usr/bin/python3 -c 'import json, os; payload = {"state": os.environ["STATE"], "stage": os.environ["STAGE"], "message": os.environ["MESSAGE"], "request_id": os.environ["REQUEST_ID"], "activation_level": os.environ["ACTIVATION_LEVEL"], "capability_name": os.environ["CAPABILITY_NAME"]}; optional = {"error_code": os.environ.get("ERROR_CODE", ""), "unit": os.environ.get("FAILURE_UNIT", ""), "unit_result": os.environ.get("FAILURE_UNIT_RESULT", ""), "unit_exit_status": os.environ.get("FAILURE_UNIT_EXIT_STATUS", ""), "diagnostic": os.environ.get("FAILURE_DIAGNOSTIC", "")}; payload.update({key: value for key, value in optional.items() if value}); print(json.dumps(payload, ensure_ascii=True, sort_keys=True))' \
     > "${temporary}"
   chmod 0644 "${temporary}"
   mv -f "${temporary}" "${RESULT_FILE}"
@@ -53,33 +50,6 @@ rollback_started_units() {
   STARTED_UNITS=()
 }
 
-cleanup_protocol_files() {
-  # 与网关写入共用短文件锁，旧激活不得删除已替换进来的下一请求或标记。
-  /usr/bin/python3 - "${REQUEST_FILE}" "${REQUEST_ID}" "${ACK_FILE}" "${CANCEL_FILE}" <<'PY'
-import fcntl
-import json
-import os
-from pathlib import Path
-import sys
-
-request, request_id, ack, cancel = sys.argv[1:]
-try:
-    descriptor = os.open(request + ".lock", os.O_RDONLY | os.O_CREAT | os.O_EXCL, 0o644)
-except FileExistsError:
-    descriptor = os.open(request + ".lock", os.O_RDONLY)
-else:
-    os.fchmod(descriptor, 0o644)
-protocol_lock = os.fdopen(descriptor, "r")
-fcntl.flock(protocol_lock, fcntl.LOCK_EX)
-for value in (request, ack, cancel):
-    path = Path(value)
-    try:
-        if str(json.loads(path.read_text(encoding="utf-8")).get("request_id") or "") == request_id:
-            path.unlink()
-    except (OSError, ValueError, AttributeError):
-        pass
-PY
-}
 
 capture_unit_failure() {
   local status_detail=""
@@ -111,26 +81,15 @@ fail_activation() {
   fi
   rollback_started_units
   write_result failed "${message}" runtime_activation_failed || true
-  cleanup_protocol_files
   exit "${exit_code}"
 }
 
-fail_activation_with_message() {
-  local error_code="$1"
-  local message="$2"
-  trap - ERR INT TERM HUP
-  rollback_started_units
-  write_result failed "${message}" "${error_code}" || true
-  cleanup_protocol_files
-  exit 1
-}
 
 cancel_activation() {
   local message="$1"
   trap - ERR INT TERM HUP
   rollback_started_units
   write_result cancelled "${message}" activation_cancelled || true
-  cleanup_protocol_files
   exit 0
 }
 
@@ -156,22 +115,12 @@ capability = str(payload.get("capability_name") or "unknown").strip() or "unknow
 request_id = str(payload.get("request_id") or "").strip()
 if not request_id:
     raise SystemExit("missing request_id")
-raw_motion_stop_generation = payload.get("motion_stop_generation")
-if raw_motion_stop_generation is None:
-    if level != "geometry":
-        raise SystemExit("invalid motion_stop_generation")
-    motion_stop_generation = 0
-else:
-    try:
-        motion_stop_generation = int(raw_motion_stop_generation)
-    except (TypeError, ValueError):
-        raise SystemExit("invalid motion_stop_generation")
-if motion_stop_generation < 0:
-    raise SystemExit("invalid motion_stop_generation")
-print("%s\t%s\t%s\t%s" % (level, capability, request_id, motion_stop_generation))
+if any(char.isspace() for char in request_id + capability):
+    raise SystemExit("invalid activation request identity")
+print("%s\t%s\t%s" % (level, capability, request_id))
 PY
   )"; then
-    IFS=$'\t' read -r ACTIVATION_LEVEL CAPABILITY_NAME REQUEST_ID MOTION_STOP_GENERATION <<< "${request_fields}"
+    IFS=$'\t' read -r ACTIVATION_LEVEL CAPABILITY_NAME REQUEST_ID <<< "${request_fields}"
   else
     read_status=$?
     [[ "${read_status}" -ne 3 ]] || exit 0
@@ -179,42 +128,20 @@ PY
   fi
 }
 
-marker_matches_request() {
-  local marker_file="$1"
-  local marker_kind="$2"
-  [[ -f "${marker_file}" ]] || return 1
-  /usr/bin/python3 - "${marker_file}" "${REQUEST_ID}" "${MOTION_STOP_GENERATION}" "${marker_kind}" <<'PY'
-import json
-import pathlib
-import sys
 
-payload = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
-if str(payload.get("request_id") or "").strip() != sys.argv[2]:
-    raise SystemExit(1)
-raw_marker_generation = payload.get("motion_stop_generation")
+activation_cancelled() {
+  /usr/bin/python3 - "${REQUEST_FILE}" "${REQUEST_ID}" <<'PY'
+import json
+from pathlib import Path
+import sys
 try:
-    marker_generation = (
-        0 if raw_marker_generation is None else int(raw_marker_generation)
-    )
-    request_generation = int(sys.argv[3])
-except (TypeError, ValueError):
-    raise SystemExit(1)
-kind = sys.argv[4]
-if kind == "cancel":
-    raise SystemExit(0 if marker_generation >= request_generation else 1)
-if str(payload.get("state") or "").strip().lower() != "acknowledged":
-    raise SystemExit(1)
-raise SystemExit(0 if marker_generation == request_generation else 1)
+    request = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+except (OSError, ValueError):
+    request = {}
+raise SystemExit(0 if request.get("request_id") != sys.argv[2] else 1)
 PY
 }
 
-activation_cancelled() {
-  marker_matches_request "${CANCEL_FILE}" cancel
-}
-
-activation_acknowledged() {
-  marker_matches_request "${ACK_FILE}" ack
-}
 
 check_cancel() {
   if activation_cancelled; then
@@ -222,53 +149,7 @@ check_cancel() {
   fi
 }
 
-wait_for_ack() {
-  local timeout_sec="${NUWAX_RUNTIME_ACTIVATION_ACK_TIMEOUT_SEC:-10}"
-  local attempts=0
-  attempts="$(/usr/bin/python3 - "${timeout_sec}" <<'PY'
-import math
-import sys
 
-try:
-    value = max(0.1, float(sys.argv[1]))
-except (TypeError, ValueError):
-    value = 10.0
-print(max(1, int(math.ceil(value * 10))))
-PY
-)"
-  for ((attempt = 0; attempt < attempts; attempt++)); do
-    check_cancel
-    if activation_acknowledged; then
-      return 0
-    fi
-    sleep 0.1
-  done
-  return 1
-}
-
-wait_for_gateway_commit() {
-  local timeout_sec="${NUWAX_RUNTIME_ACTIVATION_COMMIT_TIMEOUT_SEC:-10}"
-  local attempts=0
-  attempts="$(/usr/bin/python3 - "${timeout_sec}" <<'PY'
-import math
-import sys
-
-try:
-    value = max(0.1, float(sys.argv[1]))
-except (TypeError, ValueError):
-    value = 10.0
-print(max(1, int(math.ceil(value * 10))))
-PY
-)"
-  for ((attempt = 0; attempt < attempts; attempt++)); do
-    check_cancel
-    if [[ ! -e "${REQUEST_FILE}" ]]; then
-      return 0
-    fi
-    sleep 0.1
-  done
-  return 1
-}
 
 start_unit_if_needed() {
   local unit="$1"
@@ -351,24 +232,9 @@ if [[ "${ACTIVATION_LEVEL}" == "person_follow" ]]; then
   check_cancel
 fi
 
-LAST_STAGE="prepared"
-write_result prepared "requested runtime components are prepared; waiting for Gateway ACK"
-if ! wait_for_ack; then
-  fail_activation_with_message \
-    runtime_activation_ack_timeout \
-    "Gateway ACK timeout; rolling back requested runtime components"
-fi
+# 就绪结果就是本次启动完成；之后请求删除只清理网关记录。
 check_cancel
-
 LAST_STAGE="ready"
-write_result ready "requested runtime components are ready; waiting for Gateway commit"
-if ! wait_for_gateway_commit; then
-  fail_activation_with_message \
-    runtime_activation_commit_timeout \
-    "Gateway commit timeout; rolling back requested runtime components"
-fi
-
+write_result ready "requested runtime components are ready"
+STARTED_UNITS=()
 trap - ERR INT TERM HUP
-cleanup_protocol_files
-LAST_STAGE="committed"
-write_result committed "Gateway commit confirmed; runtime activation transaction completed"

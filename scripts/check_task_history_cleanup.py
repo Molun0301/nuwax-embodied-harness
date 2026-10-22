@@ -208,25 +208,19 @@ class CleanupOwnership(unittest.TestCase):
         else:
             with self.assertRaises(TaskSafetyBarrierError):
                 future.result(timeout=3)
-            self.assertTrue(self.manager._records[task_id].resource_quarantined)
+            self.assertTrue(self.manager.get_task_error_payload(task_id)["details"]["parking_unconfirmed"])
+            self.assertEqual(self.locks.held_resources(task_id), ())
             cursor = self.manager.begin_terminal_receipt_scan()
             self.manager.cleanup_history(retain=0)
-            self.assertIn(task_id, self.manager._records)
-            self.assertIsNone(self.manager.page_terminal_receipts(cursor)[2])
-            self.assertEqual(self.locks.held_resources(task_id), ("synthetic_resource",))
-            correlation = {"ownership_domain": "navigation", "goal_id": "synthetic-goal"}
-            with self.assertRaises(ValueError):
-                self.manager.release_resource_quarantine(task_id, proof={"goal_id": "wrong"}, correlation=correlation)
-            self.assertTrue(self.manager.release_resource_quarantine(task_id, proof=correlation, correlation=correlation))
-            self.manager.cleanup_history(retain=0)
             self.assertNotIn(task_id, self.manager._records)
+            self.assertEqual(self.manager.page_terminal_receipts(cursor)[2], "source_index_replaced")
         self.assertEqual(calls, [1])
 
-    def test_deferred_cancel_acknowledgement_and_quarantine(self):
+    def test_deferred_cancel_acknowledgement_and_parking_failure(self):
         self.check_deferred(False, True)
         self.check_deferred(False, False)
 
-    def test_deferred_timeout_acknowledgement_and_quarantine(self):
+    def test_deferred_timeout_acknowledgement_and_parking_failure(self):
         self.check_deferred(True, True)
         self.check_deferred(True, False)
 

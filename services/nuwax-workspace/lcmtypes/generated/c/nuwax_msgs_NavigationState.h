@@ -44,7 +44,6 @@ struct _nuwax_msgs_NavigationState
      */
     char*      message;
     int64_t    runtime_generation;
-    int64_t    guard_generation;
     int64_t    pose_source_timestamp_ns;
     int64_t    costmap_source_timestamp_ns;
     int8_t     sink_ready;

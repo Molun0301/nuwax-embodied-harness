@@ -3,19 +3,13 @@
 import json
 import sys
 import tempfile
-from unittest.mock import patch
 import unittest
 from pathlib import Path
-from types import SimpleNamespace as NS
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from contracts.navigation import NavigationGoal, NavigationState, NavigationStatus  # noqa: E402
 from contracts.runtime_views import NavigationContext  # noqa: E402
 from core.errors import GatewayError  # noqa: E402
-from core.event_bus import EventBus  # noqa: E402
-from core.resource_lock import ResourceLockManager  # noqa: E402
-from core.task_manager import TaskManager  # noqa: E402
-from gateways.runtime import GatewayRuntime  # noqa: E402
 from gateways.feedback import build_mcp_tool_result  # noqa: E402
 
 
@@ -30,9 +24,7 @@ class NavigationFailureMessageTests(unittest.TestCase):
         runtime = self.runtime
         runtime.event_bus, runtime.task_manager = self.bus, self.manager
         runtime._task_status_last_polled_at = {}
-        runtime._reconcile_navigation_quarantine = lambda: {'pending': False}
         runtime._goal_with_motion_admission = lambda goal, admission: goal
-        runtime._run_with_motion_admission = lambda admission, operation: operation()
         runtime._ensure_motion_runtime_for_backend_call = lambda *args, **kwargs: None
         runtime._capture_task_generation_snapshot = lambda **kwargs: {}
         runtime._record_task_generation_snapshot = lambda *args: None

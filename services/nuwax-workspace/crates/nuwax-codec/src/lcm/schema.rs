@@ -21,9 +21,9 @@ pub const BOOL_FINGERPRINT: [u8; 8] = 0x1ebe_f06a_5095_0e3e_u64.to_be_bytes();
 /// `nav_msgs.Path` fingerprint from `dimos-lcm==0.1.3`.
 pub const PATH_FINGERPRINT: [u8; 8] = 0xc3ae_62ac_b357_93e2_u64.to_be_bytes();
 /// `nuwax_msgs.GoalEnvelope` generated-C recursive fingerprint.
-pub const GOAL_ENVELOPE_FINGERPRINT: [u8; 8] = 0x9bfbb4574658209a_u64.to_be_bytes();
+pub const GOAL_ENVELOPE_FINGERPRINT: [u8; 8] = 0x894973021b295f7e_u64.to_be_bytes();
 /// `nuwax_msgs.PathEnvelope` generated-C recursive fingerprint.
-pub const PATH_ENVELOPE_FINGERPRINT: [u8; 8] = 0x4487ffa270d0b490_u64.to_be_bytes();
+pub const PATH_ENVELOPE_FINGERPRINT: [u8; 8] = 0x80563fb3d7e66c57_u64.to_be_bytes();
 /// `nav_msgs.OccupancyGrid` fingerprint from `dimos-lcm==0.1.3`.
 pub const OCCUPANCY_GRID_FINGERPRINT: [u8; 8] = 0xe7df_d179_cdfc_3b65_u64.to_be_bytes();
 /// `nav_msgs.Odometry` fingerprint from `dimos-lcm==0.1.3`.
@@ -50,7 +50,7 @@ pub const TF_MESSAGE_FINGERPRINT: [u8; 8] = 0xc2b8_a1c3_3a89_23ec_u64.to_be_byte
 /// `geometry_msgs.Transform` fingerprint generated from the repository IDL.
 pub const GEOMETRY_TRANSFORM_FINGERPRINT: [u8; 8] = 0xee5f_f426_47bf_3f91_u64.to_be_bytes();
 /// `nuwax_msgs.NavigationState` generated-C fingerprint.
-pub const NAVIGATION_STATE_FINGERPRINT: [u8; 8] = 0xe5c3f7a4ae8abcb8_u64.to_be_bytes();
+pub const NAVIGATION_STATE_FINGERPRINT: [u8; 8] = 0x9f146a1b54a1b25d_u64.to_be_bytes();
 /// `nuwax_msgs.CancelNavigation` generated-C fingerprint.
 pub const CANCEL_NAVIGATION_FINGERPRINT: [u8; 8] = 0x9704_4b28_e9c5_dd22_u64.to_be_bytes();
 /// `nuwax_msgs.Frontier` generated-C fingerprint.
@@ -60,7 +60,7 @@ pub const FRONTIER_LIST_FINGERPRINT: [u8; 8] = 0x213d_b68f_b817_1f76_u64.to_be_b
 /// The checked-in `FrontierList.lcm` declares a fixed array of this size.
 pub const FRONTIER_LIST_CAPACITY: usize = 256;
 /// Current immutable navigation-envelope schema.
-pub const NAVIGATION_ENVELOPE_SCHEMA_VERSION: i32 = 8;
+pub const NAVIGATION_ENVELOPE_SCHEMA_VERSION: i32 = 9;
 /// A public navigation request owns the goal lease.
 pub const NAVIGATION_OWNER_KIND_PUBLIC_NAV: i32 = 1;
 /// An exploration parent owns the child navigation goal lease.
@@ -172,9 +172,7 @@ pub struct GoalIntent {
     pub boundary_id: String,
     /// 有序边界顶点；闭合边为隐式。
     pub boundary_points: Vec<[f64; 3]>,
-    /// 请求级运动检查准入的 Guard 代次。
-    pub motion_guard_generation: i64,
-    /// 与 `motion_guard_generation` 一起准入的 Guard 启动 nonce。
+    /// 请求准入时读取的守卫启动随机数。
     pub motion_guard_boot_nonce: [u8; 16],
     /// 请求级运动检查观察到的全局停止代次。
     pub motion_stop_generation: i64,
@@ -199,7 +197,7 @@ pub struct GoalEnvelope {
     pub body_to_support_z_m: Option<f64>,
     /// 随目标保留的执行约束。
     pub options: nuwax_types::navigation::GoalOptions,
-    /// 当前线格式版本为8。
+    /// 当前线格式版本为9。
     pub schema_version: i32,
     /// Single public business identifier; API `goal_id` maps here losslessly.
     pub session_id: String,
@@ -237,9 +235,7 @@ pub struct GoalEnvelope {
     pub boundary_frame_id: String,
     /// Optional closed navigation boundary, represented as XYZ points.
     pub boundary_points: Vec<[f64; 3]>,
-    /// Guard generation admitted by the request-level motion check.
-    pub motion_guard_generation: i64,
-    /// Guard boot nonce admitted with `motion_guard_generation`.
+    /// 请求准入时读取的守卫启动随机数。
     pub motion_guard_boot_nonce: [u8; 16],
     /// Global stop generation observed by the request-level motion check.
     pub motion_stop_generation: i64,
@@ -260,51 +256,19 @@ impl GoalEnvelope {
 /// Planner output correlated to exactly one versioned goal.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct PathEnvelope {
-    /// 当前线格式版本为8。
+    /// 当前线格式版本为9。
     pub schema_version: i32,
-    /// Public business identifier copied from the goal envelope.
+    /// 原目标会话。
     pub session_id: String,
-    /// Lease owner copied from the goal envelope.
-    pub owner_kind: i32,
-    /// Parent request copied from the goal envelope.
-    pub parent_request_id: String,
-    /// Goal generation copied from the goal envelope.
+    /// 原目标分配代次。
     pub goal_generation: i64,
-    /// Stable producer name copied from the goal envelope.
-    pub producer: String,
-    /// Producer instance generation copied from the goal envelope.
-    pub producer_epoch: i64,
-    /// Geometry runtime generation copied from the goal envelope.
+    /// 分配目标的几何运行时代次。
     pub producer_runtime_generation: i64,
-    /// Committed mapping session copied from the goal envelope.
-    pub committed_map_session_id: String,
-    /// Committed mapping-session instance generation copied from the goal envelope.
-    pub committed_map_session_generation: i64,
-    /// Committed map revision copied from the goal envelope.
-    pub committed_map_revision: i64,
-    /// Occupancy commit boot domain copied from the actual receipt.
-    pub committed_map_boot_nonce: [u8; 16],
-    /// Actual occupancy commit sequence.
-    pub committed_map_commit_sequence: i64,
-    /// Actual occupancy commit source timestamp, in nanoseconds.
-    pub committed_map_source_timestamp_ns: i64,
-    /// Committed map frame copied from the goal envelope.
-    pub committed_map_frame_id: String,
-    /// Boundary identifier copied from the goal envelope.
-    pub boundary_id: String,
-    /// Guard generation copied from the goal envelope.
-    pub motion_guard_generation: i64,
-    /// Guard boot nonce copied from the goal envelope.
-    pub motion_guard_boot_nonce: [u8; 16],
-    /// Global stop generation copied from the goal envelope.
-    pub motion_stop_generation: i64,
-    /// Planner restart generation that produced the path.
+    /// 产生路径的规划进程代次。
     pub planner_runtime_generation: i64,
-    /// Monotonic path revision within the goal generation.
+    /// 同一目标内单调路径修订。
     pub path_revision: i64,
-    /// Source timestamp in nanoseconds.
-    pub source_timestamp_ns: i64,
-    /// Planner path.
+    /// 真实路径载荷，保留头部和各点原始来源时间。
     pub path: Path,
 }
 
@@ -405,8 +369,6 @@ pub struct NavigationState {
     pub message: String,
     /// Nav-stack telemetry runtime generation.
     pub runtime_generation: i64,
-    /// Motion guard generation that acknowledged the command path.
-    pub guard_generation: i64,
     /// Source timestamp of the latest scheduler-consumed pose.
     pub pose_source_timestamp_ns: i64,
     /// Source timestamp of the latest scheduler-consumed costmap.
@@ -1436,7 +1398,6 @@ fn encode_goal_envelope_prefix(message: &GoalEnvelope, out: &mut Vec<u8>) -> Cod
     for point in &message.boundary_points {
         encode_f64_array(point, out);
     }
-    out.extend_from_slice(&message.motion_guard_generation.to_be_bytes());
     out.extend_from_slice(&message.motion_guard_boot_nonce);
     out.extend_from_slice(&message.motion_stop_generation.to_be_bytes());
     encode_goal_options(&message.options, out);
@@ -1476,7 +1437,6 @@ fn decode_goal_envelope_from(cursor: &mut Cursor<'_>) -> CodecResult<GoalEnvelop
     for _ in 0..boundary_points_length {
         boundary_points.push(cursor.read_f64_array()?);
     }
-    let motion_guard_generation = cursor.read_i64()?;
     let motion_guard_boot_nonce = cursor
         .read_exact(16)?
         .try_into()
@@ -1521,7 +1481,6 @@ fn decode_goal_envelope_from(cursor: &mut Cursor<'_>) -> CodecResult<GoalEnvelop
         boundary_id,
         boundary_frame_id,
         boundary_points,
-        motion_guard_generation,
         motion_guard_boot_nonce,
         motion_stop_generation,
         goal,
@@ -1557,19 +1516,6 @@ fn validate_goal_envelope_semantics(
         message.committed_map_source_timestamp_ns,
         &message.committed_map_frame_id,
     )?;
-    if message.motion_guard_generation <= 0 {
-        return Err("motion_guard_generation must be positive".into());
-    }
-    if message
-        .motion_guard_boot_nonce
-        .iter()
-        .all(|byte| *byte == 0)
-    {
-        return Err("motion_guard_boot_nonce must not be all zero".into());
-    }
-    if message.motion_stop_generation < 0 {
-        return Err("motion_stop_generation must be non-negative".into());
-    }
     validate_navigation_frame_id(&message.goal.header.frame_id, "goal pose")?;
     if message.goal.header.frame_id != message.committed_map_frame_id {
         return Err("goal pose frame_id must match committed map frame_id".into());
@@ -1655,135 +1601,39 @@ pub fn decode_path_envelope_body(encoded: &[u8]) -> CodecResult<PathEnvelope> {
 fn encode_path_envelope_prefix(message: &PathEnvelope, out: &mut Vec<u8>) -> CodecResult<()> {
     out.extend_from_slice(&message.schema_version.to_be_bytes());
     encode_string(&message.session_id, out)?;
-    out.extend_from_slice(&message.owner_kind.to_be_bytes());
-    encode_string(&message.parent_request_id, out)?;
-    out.extend_from_slice(&message.goal_generation.to_be_bytes());
-    encode_string(&message.producer, out)?;
-    out.extend_from_slice(&message.producer_epoch.to_be_bytes());
     out.extend_from_slice(&message.producer_runtime_generation.to_be_bytes());
-    encode_string(&message.committed_map_session_id, out)?;
-    out.extend_from_slice(&message.committed_map_session_generation.to_be_bytes());
-    out.extend_from_slice(&message.committed_map_revision.to_be_bytes());
-    out.extend_from_slice(&message.committed_map_boot_nonce);
-    out.extend_from_slice(&message.committed_map_commit_sequence.to_be_bytes());
-    out.extend_from_slice(&message.committed_map_source_timestamp_ns.to_be_bytes());
-    encode_string(&message.committed_map_frame_id, out)?;
-    encode_string(&message.boundary_id, out)?;
-    out.extend_from_slice(&message.motion_guard_generation.to_be_bytes());
-    out.extend_from_slice(&message.motion_guard_boot_nonce);
-    out.extend_from_slice(&message.motion_stop_generation.to_be_bytes());
+    out.extend_from_slice(&message.goal_generation.to_be_bytes());
     out.extend_from_slice(&message.planner_runtime_generation.to_be_bytes());
     out.extend_from_slice(&message.path_revision.to_be_bytes());
-    out.extend_from_slice(&message.source_timestamp_ns.to_be_bytes());
     Ok(())
 }
 
 fn decode_path_envelope_from(cursor: &mut Cursor<'_>) -> CodecResult<PathEnvelope> {
-    let schema_version = cursor.read_i32()?;
-    let session_id = cursor.read_string()?;
-    let owner_kind = cursor.read_i32()?;
-    let parent_request_id = cursor.read_string()?;
-    let goal_generation = cursor.read_i64()?;
-    let producer = cursor.read_string()?;
-    let producer_epoch = cursor.read_i64()?;
-    let producer_runtime_generation = cursor.read_i64()?;
-    let committed_map_session_id = cursor.read_string()?;
-    let committed_map_session_generation = cursor.read_i64()?;
-    let committed_map_revision = cursor.read_i64()?;
-    let committed_map_boot_nonce = cursor.read_exact(16)?.try_into().expect("16-byte committed map boot nonce");
-    let committed_map_commit_sequence = cursor.read_i64()?;
-    let committed_map_source_timestamp_ns = cursor.read_i64()?;
-    let committed_map_frame_id = cursor.read_string()?;
-    let boundary_id = cursor.read_string()?;
-    let motion_guard_generation = cursor.read_i64()?;
-    let motion_guard_boot_nonce = cursor
-        .read_exact(16)?
-        .try_into()
-        .expect("16-byte motion guard boot nonce");
-    let motion_stop_generation = cursor.read_i64()?;
-    let planner_runtime_generation = cursor.read_i64()?;
-    let path_revision = cursor.read_i64()?;
-    let source_timestamp_ns = cursor.read_i64()?;
-    let path = decode_path_from(cursor)?;
     Ok(PathEnvelope {
-        schema_version,
-        session_id,
-        owner_kind,
-        parent_request_id,
-        goal_generation,
-        producer,
-        producer_epoch,
-        producer_runtime_generation,
-        committed_map_session_id,
-        committed_map_session_generation,
-        committed_map_revision,
-        committed_map_boot_nonce,
-        committed_map_commit_sequence,
-        committed_map_source_timestamp_ns,
-        committed_map_frame_id,
-        boundary_id,
-        motion_guard_generation,
-        motion_guard_boot_nonce,
-        motion_stop_generation,
-        planner_runtime_generation,
-        path_revision,
-        source_timestamp_ns,
-        path,
+        schema_version: cursor.read_i32()?,
+        session_id: cursor.read_string()?,
+        producer_runtime_generation: cursor.read_i64()?,
+        goal_generation: cursor.read_i64()?,
+        planner_runtime_generation: cursor.read_i64()?,
+        path_revision: cursor.read_i64()?,
+        path: decode_path_from(cursor)?,
     })
 }
 
-fn validate_path_envelope_semantics(
-    message: &PathEnvelope,
-) -> Result<(), String> {
-    validate_navigation_identity(
-        message.schema_version,
-        &message.session_id,
-        message.owner_kind,
-        &message.parent_request_id,
-        message.goal_generation,
-        message.source_timestamp_ns,
-    )?;
-    validate_goal_authority_identity(
-        &message.producer,
-        message.producer_epoch,
-        message.producer_runtime_generation,
-        &message.committed_map_session_id,
-        message.committed_map_session_generation,
-        message.committed_map_revision,
-        &message.committed_map_boot_nonce,
-        message.committed_map_commit_sequence,
-        message.committed_map_source_timestamp_ns,
-        &message.committed_map_frame_id,
-    )?;
-    if message.boundary_id.trim() != message.boundary_id {
-        return Err("path boundary identity is invalid".into());
+fn validate_path_envelope_semantics(message: &PathEnvelope) -> Result<(), String> {
+    if message.schema_version != NAVIGATION_ENVELOPE_SCHEMA_VERSION {
+        return Err("unsupported navigation envelope schema version".into());
     }
-    if message.owner_kind == NAVIGATION_OWNER_KIND_PUBLIC_NAV && !message.boundary_id.is_empty() {
-        return Err("PUBLIC_NAV path must not carry a navigation boundary".into());
+    if message.session_id.trim().is_empty() || message.session_id.trim() != message.session_id {
+        return Err("path session_id must be non-empty and canonical".into());
     }
-    if message.motion_guard_generation <= 0 {
-        return Err("motion_guard_generation must be positive".into());
+    if message.producer_runtime_generation <= 0 || message.goal_generation <= 0 {
+        return Err("path goal identity must be positive".into());
     }
-    if message
-        .motion_guard_boot_nonce
-        .iter()
-        .all(|byte| *byte == 0)
-    {
-        return Err("motion_guard_boot_nonce must not be all zero".into());
-    }
-    if message.motion_stop_generation < 0 {
-        return Err("motion_stop_generation must be non-negative".into());
-    }
-    if message.planner_runtime_generation <= 0 {
-        return Err("planner_runtime_generation must be positive".into());
-    }
-    if message.path_revision <= 0 {
-        return Err("path_revision must be positive".into());
+    if message.planner_runtime_generation <= 0 || message.path_revision <= 0 {
+        return Err("path planner generation and revision must be positive".into());
     }
     validate_navigation_frame_id(&message.path.header.frame_id, "path")?;
-    if message.path.header.frame_id != message.committed_map_frame_id {
-        return Err("path frame_id must match committed map frame_id".into());
-    }
     if message.path.poses.is_empty() {
         return Err("path must contain at least one pose".into());
     }
@@ -2277,7 +2127,6 @@ pub fn encode_navigation_state_body(message: &NavigationState) -> CodecResult<Ve
     out.extend_from_slice(&message.progress.to_be_bytes());
     encode_string(&message.message, &mut out)?;
     out.extend_from_slice(&message.runtime_generation.to_be_bytes());
-    out.extend_from_slice(&message.guard_generation.to_be_bytes());
     out.extend_from_slice(&message.pose_source_timestamp_ns.to_be_bytes());
     out.extend_from_slice(&message.costmap_source_timestamp_ns.to_be_bytes());
     out.push(message.sink_ready as u8);
@@ -2329,7 +2178,7 @@ fn decode_navigation_state_from(cursor: &mut Cursor<'_>) -> CodecResult<Navigati
         progress: cursor.read_f64()?,
         message: cursor.read_string()?,
         runtime_generation: cursor.read_i64()?,
-        guard_generation: cursor.read_i64()?,
+
         pose_source_timestamp_ns: cursor.read_i64()?,
         costmap_source_timestamp_ns: cursor.read_i64()?,
         sink_ready: cursor.read_u8()? as i8,
@@ -3622,14 +3471,14 @@ int main(int argc, char **argv) {
     fclose(input);
     if (argc == 4) {
         if (!strcmp(argv[3], "GoalEnvelope")) {
-            ROUNDTRIP(nuwax_msgs_GoalEnvelope, message.schema_version == 8 &&
+            ROUNDTRIP(nuwax_msgs_GoalEnvelope, message.schema_version == 9 &&
                 message.producer_runtime_generation == 7 && message.goal_generation == 2 &&
                 !strcmp(message.body_reference_frame_id, "robot/body") &&
                 message.has_body_to_support_z == 1 && message.body_to_support_z_m == 0.4 &&
                 message.boundary_points_length == 3);
         }
         if (!strcmp(argv[3], "PathEnvelope")) {
-            ROUNDTRIP(nuwax_msgs_PathEnvelope, message.schema_version == 8 &&
+            ROUNDTRIP(nuwax_msgs_PathEnvelope, message.schema_version == 9 &&
                 message.producer_runtime_generation == 7 && message.goal_generation == 2 &&
                 message.planner_runtime_generation == 8 && message.path_revision == 1 &&
                 message.path.poses_length == 1);
@@ -3720,7 +3569,7 @@ raw = Path(sys.argv[2]).read_bytes()
 message = getattr(nuwax_msgs, name).decode(raw)
 assert message.goal_generation == 2 and message.producer_runtime_generation == 7
 if name == "GoalEnvelope":
-    assert message.schema_version == 8
+    assert message.schema_version == 9
     assert message.body_reference_frame_id == "robot/body"
     assert message.has_body_to_support_z == 1 and message.body_to_support_z_m == 0.4
 else:
@@ -3728,7 +3577,7 @@ else:
     if name == "NavigationState":
         assert message.runtime_generation == 99 and message.local_path_count == 1
     else:
-        assert message.schema_version == 8
+        assert message.schema_version == 9
 assert message.encode() == raw
 Path(sys.argv[3]).write_bytes(message.encode())
 "#]).arg(&py_dir).arg(&input).arg(&py_output).arg(name);
@@ -3932,7 +3781,7 @@ mod tests {
             boundary_id,
             boundary_frame_id: frame_id.into(),
             boundary_points,
-            motion_guard_generation: 11,
+
             motion_guard_boot_nonce: [0x5a; 16],
             motion_stop_generation: 4,
             goal: PoseStamped {
@@ -3955,26 +3804,17 @@ mod tests {
         PathEnvelope {
             schema_version: NAVIGATION_ENVELOPE_SCHEMA_VERSION,
             session_id: goal.session_id.clone(),
-            owner_kind: goal.owner_kind,
-            parent_request_id: goal.parent_request_id.clone(),
+
+
             goal_generation: goal.goal_generation,
-            producer: goal.producer.clone(),
-            producer_epoch: goal.producer_epoch,
+
+
             producer_runtime_generation: goal.producer_runtime_generation,
-            committed_map_session_id: goal.committed_map_session_id.clone(),
-            committed_map_session_generation: goal.committed_map_session_generation,
-            committed_map_revision: goal.committed_map_revision,
-            committed_map_boot_nonce: goal.committed_map_boot_nonce,
-            committed_map_commit_sequence: goal.committed_map_commit_sequence,
-            committed_map_source_timestamp_ns: goal.committed_map_source_timestamp_ns,
-            committed_map_frame_id: goal.committed_map_frame_id.clone(),
-            boundary_id: goal.boundary_id.clone(),
-            motion_guard_generation: goal.motion_guard_generation,
-            motion_guard_boot_nonce: goal.motion_guard_boot_nonce,
-            motion_stop_generation: goal.motion_stop_generation,
+
+
             planner_runtime_generation: 8,
             path_revision: 1,
-            source_timestamp_ns: 124_000_000_000,
+
             path: Path {
                 header: Header {
                     frame_id: frame_id.into(),
@@ -4036,21 +3876,16 @@ mod tests {
             |m| m.parent_request_id.clear(),
             |m| m.producer_epoch = 0,
             |m| m.options.position_tolerance_m = f64::NAN,
-            |m| m.motion_stop_generation = -1,
         ] {
             let mut invalid = goal.clone();
             mutate(&mut invalid);
             assert!(encode_goal_envelope(&invalid).is_err());
         }
         for mutate in [
-            (|m: &mut PathEnvelope| m.committed_map_boot_nonce = [0; 16]) as fn(&mut PathEnvelope),
-            |m| m.committed_map_commit_sequence = 0,
-            |m| m.goal_generation = 0,
+            (|m: &mut PathEnvelope| m.goal_generation = 0) as fn(&mut PathEnvelope),
             |m| m.producer_runtime_generation = -1,
             |m| m.planner_runtime_generation = 0,
             |m| m.path_revision = 0,
-            |m| m.owner_kind = 99,
-            |m| m.motion_stop_generation = -1,
         ] {
             let mut invalid = path.clone();
             mutate(&mut invalid);
@@ -4122,8 +3957,8 @@ if name == 'PlanarNavigationMap':
     assert bytes(message.map_boot_nonce) == bytes([0x31] * 16)
     assert message.map_commit_sequence == 29 and message.map_source_timestamp_ns == 0
     assert message.source_timestamp_ns == 1_000_000_001
-else:
-    assert message.schema_version == 8
+elif name == 'GoalEnvelope':
+    assert message.schema_version == 9
     assert bytes(message.committed_map_boot_nonce) == bytes([0x31] * 16)
     assert message.committed_map_commit_sequence == 29
     assert message.committed_map_source_timestamp_ns == 0
@@ -4131,6 +3966,9 @@ else:
     if name == 'GoalEnvelope':
         assert message.body_reference_frame_id == 'robot/body'
         assert message.has_body_to_support_z == 1 and message.body_to_support_z_m == 0.4
+else:
+    assert message.schema_version == 9
+    assert message.path.header.frame_id == 'robot/map'
 assert message.encode() == raw
 sys.stdout.buffer.write(message.encode())
 "#])
@@ -4288,7 +4126,7 @@ sys.stdout.buffer.write(message.encode())
         assert_eq!(decode_goal_envelope(&encode_goal_envelope(&changed).unwrap()).unwrap(), changed);
         let mut missing_proof = original.clone();
         missing_proof.motion_guard_boot_nonce = [0; 16];
-        assert!(validate_goal_envelope(&missing_proof).is_err());
+        assert_eq!(decode_goal_envelope(&encode_goal_envelope(&missing_proof).unwrap()).unwrap().motion_guard_boot_nonce, [0; 16]);
         let mut public_with_boundary = original.clone();
         public_with_boundary.owner_kind = NAVIGATION_OWNER_KIND_PUBLIC_NAV;
         assert!(validate_goal_envelope(&public_with_boundary).is_err());
@@ -4567,7 +4405,7 @@ sys.stdout.buffer.write(message.encode())
             progress: 0.75,
             message: "moving".into(),
             runtime_generation: 7,
-            guard_generation: 11,
+
             pose_source_timestamp_ns: 123_000_000_456,
             costmap_source_timestamp_ns: 122_000_000_000,
             sink_ready: 1,

@@ -18,17 +18,14 @@ from .go2_actuator import ActuatorError
 class MotionControlActuator:
     """现有运动仲裁的通用执行端；仅提供速度和停止两个标准操作。"""
 
-    def __init__(self, control: MotionControl, *, frame_id: str,
-                 actuator_symbols_sha256: str) -> None:
+    def __init__(self, control: MotionControl, *, frame_id: str) -> None:
         if not isinstance(control, MotionControl):
             raise ActuatorError("ACTUATOR_CONFIG_INVALID", "执行器工厂必须返回 MotionControl。")
         self._control = control
         self._frame_id = validate_frame_id(frame_id)
-        # 沿用当前守护实例的旧持久化身份，不要求标准接口另交符号清单。
-        self._manifest_hash = actuator_symbols_sha256
 
     @classmethod
-    def from_environment(cls, *, actuator_symbols_sha256: str) -> "MotionControlActuator":
+    def from_environment(cls) -> "MotionControlActuator":
         reference = runtime_value("NUWAX_MOTION_CONTROL_FACTORY", "").strip()
         module_name, separator, factory_name = reference.partition(":")
         if not separator or not module_name or not factory_name:
@@ -42,22 +39,17 @@ class MotionControlActuator:
             control,
             frame_id=(runtime_value("NUWAX_BASE_FRAME", "").strip()
                       or runtime_value("NUWAX_GEOMETRY_BASE_FRAME", "").strip() or "base_link"),
-            actuator_symbols_sha256=actuator_symbols_sha256,
         )
 
     @property
     def is_configured(self) -> bool:
         return self._control.is_available()
 
-    @property
-    def actuator_symbols_sha256(self) -> str:
-        return self._manifest_hash
-
-    def apply_motion(self, request: pb.SubmitMotionCommandRequest) -> None:
+    def apply_motion(self, request: pb.SubmitMotionCommandRequest) -> bool:
         command = request.WhichOneof("command")
         if command == "stop":
             self.zero()
-            return
+            return False
         if command != "twist":
             raise ActuatorError("UNSUPPORTED_OPERATION", "标准运动接口不支持指令：%s" % command)
         values = (request.twist.linear_x_mps, request.twist.linear_y_mps, request.twist.angular_z_rps)
@@ -75,6 +67,7 @@ class MotionControlActuator:
             raise
         except Exception as exc:
             raise ActuatorError("ACTUATOR_COMMAND_FAILED", str(exc)) from exc
+        return False
 
     @property
     def supports_motion_feedback(self) -> bool:

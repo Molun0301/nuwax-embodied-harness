@@ -26,7 +26,6 @@ PHASE_ORDER: Tuple[str, ...] = (
     "release",
     "config",
     "systemd",
-    "safety_provision",
     "enable_start",
     "verify",
 )
@@ -289,7 +288,7 @@ def capture_installation_inputs(profile: DeploymentProfile, options: DeploymentO
         source = {"kind": "signed-bundle", "manifest": bundle_manifest}
     paths = {name: _path_input_record(getattr(options, name), options, bundle_manifest) for name in (
         "trust_root", "go2_sdk", "go2_sdk_wheel", "clip_source", "clip_wheel",
-        "cyclonedds_source", "cyclonedds_wheel", "actuator_manifest", "bundle_public_key", "legacy_config",
+        "cyclonedds_source", "cyclonedds_wheel", "bundle_public_key", "legacy_config",
     )}
     paths["python"] = _path_input_record(Path(options.python_bin), options, bundle_manifest)
     payload = {
@@ -732,19 +731,6 @@ def build_deployment_plan(
                     "systemd-install",
                     operations.install_systemd,
                     "install systemd identities, tmpfiles, and rendered units",
-                ),
-            ),
-        ),
-        Phase(
-            "safety_provision",
-            "Provision the verified actuator safety manifest",
-            ()
-            if options.no_systemd or options.no_start
-            else (
-                Action.callback(
-                    "safety-provision",
-                    operations.provision_safety,
-                    "provision actuator manifest and durable safety records",
                 ),
             ),
         ),

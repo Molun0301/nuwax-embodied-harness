@@ -113,23 +113,8 @@ impl<M: NavMotionPort, P: NavPlanner> NavScheduler<M, P> {
             .motion
             .acquire(&operation_id, &session.motion_admission)
             .await;
-        let proof = match grant {
-            Ok(proof)
-                if proof.lease_id != 0
-                    && proof.guard_generation == session.motion_admission.guard_generation =>
-            {
-                proof
-            }
-            Ok(_) => {
-                self.lease_active = true;
-                self.arrival_confirmation = None;
-                return Err(self
-                    .fail_closed(
-                        status,
-                        RuntimeError::Motion("停车接续取得的租约不属于原准入代次".into()),
-                    )
-                    .await);
-            }
+        match grant {
+            Ok(_) => {},
             Err(error) => {
                 if error.lease_may_be_active {
                     self.lease_active = true;
@@ -145,12 +130,11 @@ impl<M: NavMotionPort, P: NavPlanner> NavScheduler<M, P> {
             .arrival_confirmation
             .take()
             .expect("接续仍拥有原停车状态");
-        self.status.guard_generation = proof.guard_generation;
         self.status.motion_sink_ready = true;
         self.status.last_zero_ack_id = None;
         self.status.last_fence_monotonic_ns = 0;
         self.status.last_terminal = None;
-        self.local_intent_sequence = 0;
+
         self.planner.set_goal_log_context(&session.session_id);
         if let Err(error) = self
             .planner

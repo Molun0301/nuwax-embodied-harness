@@ -4,7 +4,7 @@ from __future__ import annotations
 import copy
 from datetime import timedelta
 from types import SimpleNamespace as NS
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -37,7 +37,7 @@ def wire(status="UNCONFIRMED", *, goal_id=GOAL, reason=ORIGIN, timestamp=0,
         cancel_phase="ZEROED" if proof else "", cancel_generation=9 if proof else 0,
         actuator_zeroed=proof, zero_ack_id="fixture-exact-zero" if proof else "",
         zero_applied_monotonic_ns=71 if proof else 0,
-        runtime_generation=7, guard_generation=4, sink_ready=True,
+        runtime_generation=7, sink_ready=True,
         planner_map_frame="map", planner_pose_frame="map",
         planned_path=[pb2.Vec3(x=1, y=2, z=0)], local_path=[pb2.Vec3(x=2, y=3, z=0)],
     )
@@ -145,17 +145,16 @@ def service(backend, tmp_path):
 
 
 def cloud_submit(backend):
-    authority = {"committed_occupancy_commit_id": {"boot_nonce": "01" * 16, "sequence": 1},
+    authority = {"activation_receipt_v2": None, "committed_occupancy_commit_id": {"boot_nonce": "01" * 16, "sequence": 1},
         "map_name": "fixture", "map_frame_id": "map", "runtime_generation": 7,
         "mapping_session_id": "mapping", "mapping_session_generation": 1,
         "committed_occupancy_revision": 1, "committed_occupancy_source_timestamp_ns": 1}
     # These tests isolate navigation command ownership, not map activation validation.
-    with patch.object(module, "_mapping_cloud_authority_receipt", return_value=None), \
-         patch.object(module, "_assigned_activation_receipt_proto", return_value=None), \
+    with patch.object(module, "_assigned_activation_receipt_proto", return_value=None), \
          patch.object(module.pb2, "MappingCloudGoalRequest", side_effect=lambda **kw: NS(**kw)):
         return backend.submit_mapping_cloud_goal(query_request_id=GOAL, query_text="fixture",
             authority=authority, georeference_json=b"{}",
-            motion_admission={"guard_generation": 1, "guard_boot_nonce": bytes([1]) * 16, "motion_stop_generation": 0})
+            motion_admission={"guard_boot_nonce": bytes([1]) * 16, "motion_stop_generation": 0})
 
 
 def cloud_reply(navigation=None, status="ADMISSION_UNCONFIRMED", query_request_id=GOAL):
@@ -375,7 +374,7 @@ def test_same_epoch_disconnect_preserves_source_path_origin_and_recovery():
     assert snapshot(backend).status == NavigationStatus.UNCONFIRMED
 
 
-def test_epoch_replacement_keeps_history_but_never_cancels_new_stub():
+def test_epoch_replacement_keeps_history_until_current_stream_rebinds():
     backend = provider()
     submit(backend)
     token, old_stub = backend._nav_active_stream_token, backend._stub
@@ -391,10 +390,12 @@ def test_epoch_replacement_keeps_history_but_never_cancels_new_stub():
     assert state.metadata["goal_generation"] == 0
     assert not backend.cancel_goal(GOAL) and not backend._stub.cancel_calls
     assert not stream(backend, wire("cancelled", timestamp=100, proof=True), token=token, stub=old_stub)
-    assert not stream(backend, wire("running", timestamp=100))
+    assert stream(backend, wire("running", timestamp=100))
     assert not stream(backend, pb2.NavigationState(status="idle"))
-    assert snapshot(backend).metadata["ownership_retained"]
-    assert not backend.set_goal(goal("new-goal")) and not backend._stub.set_calls
+    assert not snapshot(backend).metadata["ownership_retained"]
+    assert snapshot(backend).metadata["authority_current"]
+    assert not backend.set_goal(goal("new-goal"))
+    assert len(backend._stub.set_calls) == 1
 
 
 def test_late_unary_after_epoch_replacement_cannot_adopt_lease():
@@ -528,8 +529,8 @@ def test_service_cross_epoch_cancel_is_explicitly_unavailable(tmp_path):
     backend._stub = Stub()
     with pytest.raises(GatewayError) as caught:
         navigation.cancel_goal(GOAL)
-    assert caught.value.error_code == "navigation_control_authority_unavailable"
-    assert caught.value.details["authority_current"] is False
+    assert caught.value.error_code == "navigation_cancel_rejected"
+    assert snapshot(backend).metadata["authority_current"] is False
     assert not backend._stub.cancel_calls
     assert navigation._current_goal is not None
 
@@ -607,20 +608,20 @@ def test_ordinary_accepted_then_precommit_failed_keeps_old_acceptance_contract()
     assert snapshot(backend).status == NavigationStatus.FAILED
 
 
-def test_cloud_historical_owner_busy_survives_new_epoch_idle():
+def test_current_stream_and_cloud_can_advance_after_historical_owner():
     backend = provider()
     submit(backend)
     backend._transition_navigation_connection(connected=True, message="replacement")
     backend._stub = Stub()
     backend._ensure_nav_state_stream()
-    assert not stream(backend, pb2.NavigationState(status="idle"))
-    generation = backend._nav_command_generation
+    assert stream(backend, pb2.NavigationState(status="idle"))
+    assert snapshot(backend).status == NavigationStatus.IDLE
+    backend._stub.cloud_response = cloud_reply(wire("running", reason="NEW_OWNER", timestamp=200, producer=8), status="SUCCEEDED")
     result = cloud_submit(backend)
-    assert result["status"] == "BUSY"
-    assert backend._nav_command_generation == generation
-    assert not backend._stub.cloud_calls
-    assert not backend.cancel_goal(GOAL)
-    assert not backend._stub.cancel_calls
+    assert result["status"] == "SUCCEEDED"
+    assert len(backend._stub.cloud_calls) == 1
+    assert snapshot(backend).status == NavigationStatus.RUNNING
+    assert snapshot(backend).metadata["producer_runtime_generation"] == 8
 
 
 @pytest.mark.parametrize("new_path,new_planner", [(4, 8), (4, 7), (4, 9)])
@@ -903,7 +904,7 @@ def test_service_connection_change_after_commit_cannot_restore_current_authority
     assert context.navigation_state.metadata["authority_current"] is False
     with pytest.raises(GatewayError) as cancel:
         navigation.cancel_goal(GOAL)
-    assert cancel.value.error_code == "navigation_control_authority_unavailable"
+    assert cancel.value.error_code == "navigation_cancel_rejected"
     assert not backend._stub.cancel_calls
 
 
@@ -1392,3 +1393,22 @@ def test_unleased_rejection_retires_only_the_matching_goal():
     generic.message = "LEASE_NOT_GRANTED: 文本不能代替原生具名结果"
     assert stream(backend, generic)
     assert snapshot(backend).metadata["ownership_retained"]
+
+
+
+def test_current_stream_replaces_historical_display_after_old_unary_is_rejected(tmp_path):
+    backend = provider()
+    navigation, view = service(backend, tmp_path)
+    with pytest.raises(GatewayError):
+        navigation.set_goal(goal())
+    backend._transition_navigation_connection(connected=True, message="replacement")
+    backend._stub = Stub()
+    backend._ensure_nav_state_stream()
+    previous = navigation._ingest_navigation_state(view, snapshot(backend))
+    assert previous.navigation_state.metadata["authority_current"] is False
+    assert stream(backend, wire("running", reason="CURRENT_STREAM", timestamp=200))
+    current = navigation._ingest_navigation_state(view, snapshot(backend))
+    assert current is not previous
+    assert current.navigation_state.status == NavigationStatus.RUNNING
+    assert current.navigation_state.metadata["authority_current"] is True
+    assert "dispatch_obligation" not in current.navigation_state.metadata

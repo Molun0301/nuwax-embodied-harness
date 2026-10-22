@@ -161,7 +161,7 @@ class ActiveIndex(unittest.TestCase):
         future.result(timeout=3)
         self.assert_coherent()
 
-    def test_deferred_cancel_stays_active_until_real_terminal_quarantine(self):
+    def test_deferred_cancel_stays_active_until_real_terminal_failure(self):
         task_id, future, release = self.running(deferred=True)
         self.manager.cancel_task(task_id)
         self.assertEqual(self.manager.get_task_status(task_id).stage, "cancel_requested")
@@ -171,10 +171,10 @@ class ActiveIndex(unittest.TestCase):
         with self.assertRaises(TaskSafetyBarrierError):
             future.result(timeout=3)
         self.assertEqual(self.manager.get_task_status(task_id).state, TaskState.FAILED)
-        self.assertTrue(self.manager._records[task_id].resource_quarantined)
+        self.assertTrue(self.manager.get_task_error_payload(task_id)["details"]["parking_unconfirmed"])
         self.assert_coherent()
         self.assertFalse(self.manager.has_active_tasks())
-        self.assertEqual([status.task_id for status in self.manager.list_quarantined_tasks()], [task_id])
+        self.assertTrue(self.manager._records[task_id].resources_released)
 
     def test_timeout_removes_active_before_late_result(self):
         task_id, future, release = self.running()

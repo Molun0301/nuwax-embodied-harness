@@ -53,22 +53,14 @@ from pathlib import Path
 
 from services.navigation.motion_safety_guard.actor import GuardActor
 from services.navigation.motion_safety_guard.core import MotionGuardCore
-from services.navigation.motion_safety_guard.epoch import (
-    EpochRecord,
-    EpochStore,
-    ProvisionRecord,
-    atomic_write_record,
-)
 from services.navigation.motion_safety_guard.server import MotionGuardUnixServer
 
 root = Path(sys.argv[1])
 socket_path = root / "guard.sock"
 events_path = root / "actuator.events"
-digest = "sha256:" + "4" * 64
 
 class RecordingActuator:
     is_configured = True
-    actuator_symbols_sha256 = digest
 
     def _record(self, value):
         with events_path.open("a", encoding="ascii") as stream:
@@ -82,6 +74,7 @@ class RecordingActuator:
             self._record(f"TWIST {twist.linear_x_mps} {twist.linear_y_mps} {twist.angular_z_rps}")
         else:
             self._record("MOTION")
+        return False
 
     def execute_sport(self, command):
         self._record("SPORT")
@@ -93,25 +86,7 @@ class RecordingActuator:
         self._record("MODE")
         return command.target_mode
 
-provision_path = root / "provision.json"
-epoch_path = root / "epoch.json"
-atomic_write_record(
-    provision_path,
-    ProvisionRecord.create(instance_id=str(uuid.uuid4())).to_document(),
-    mode=0o400,
-)
-atomic_write_record(
-    epoch_path,
-    EpochRecord.initial(actuator_symbols_sha256=digest).to_document(),
-    mode=0o600,
-)
-store = EpochStore(provision_path=provision_path, epoch_path=epoch_path)
-epoch = store.advance_boot()
-core = MotionGuardCore(
-    epoch=epoch,
-    epoch_store=store,
-    actuator=RecordingActuator(),
-)
+core = MotionGuardCore(actuator=RecordingActuator())
 core.initialize_zero_fence()
 server = MotionGuardUnixServer(
     socket_path=socket_path,
@@ -130,15 +105,19 @@ finally:
     server.stop()
 "#;
 
-struct GuardChild {
+pub(crate) struct GuardChild {
     child: Child,
     root: PathBuf,
-    socket_path: PathBuf,
+    pub(crate) socket_path: PathBuf,
     events_path: PathBuf,
 }
 
 impl GuardChild {
     async fn spawn(nonce: &str) -> Self {
+        Self::spawn_with_capabilities(nonce, None).await
+    }
+
+    pub(crate) async fn spawn_with_capabilities(nonce: &str, capabilities: Option<&str>) -> Self {
         let root = std::env::temp_dir().join(format!("nuwax-v2-guard-{nonce}"));
         std::fs::create_dir(&root).expect("create guard canary directory");
         let socket_path = root.join("guard.sock");
@@ -150,7 +129,9 @@ impl GuardChild {
             python.is_file(),
             "Guard canary Python environment is missing"
         );
-        let child = Command::new(python)
+        let mut command = Command::new(python);
+        if let Some(capabilities) = capabilities { command.env("NUWAX_NAV_CAPABILITIES_JSON", capabilities); }
+        let child = command
             .args(["-u", "-c", GUARD_CHILD])
             .arg(&root)
             .current_dir(repository_root)
@@ -186,11 +167,11 @@ impl GuardChild {
         guard
     }
 
-    fn actuator_events(&self) -> String {
+    pub(crate) fn actuator_events(&self) -> String {
         std::fs::read_to_string(&self.events_path).expect("read recording actuator events")
     }
 
-    async fn shutdown(mut self) {
+    pub(crate) async fn shutdown(mut self) {
         let pid = self.child.id().to_string();
         let status = Command::new("kill")
             .args(["-TERM", &pid])
@@ -494,24 +475,9 @@ enum AcceptedPathCandidateMatch {
 
 fn path_matches_active_goal(path: &schema::PathEnvelope, goal: &schema::GoalEnvelope) -> bool {
     path.session_id == goal.session_id
-        && path.owner_kind == goal.owner_kind
-        && path.parent_request_id == goal.parent_request_id
         && path.goal_generation == goal.goal_generation
-        && path.producer == goal.producer
-        && path.producer_epoch == goal.producer_epoch
         && path.producer_runtime_generation == goal.producer_runtime_generation
-        && path.committed_map_session_id == goal.committed_map_session_id
-        && path.committed_map_session_generation == goal.committed_map_session_generation
-        && path.committed_map_revision == goal.committed_map_revision
-        && path.committed_map_boot_nonce == goal.committed_map_boot_nonce
-        && path.committed_map_commit_sequence == goal.committed_map_commit_sequence
-        && path.committed_map_source_timestamp_ns == goal.committed_map_source_timestamp_ns
-        && path.committed_map_frame_id == goal.committed_map_frame_id
-        && path.boundary_id == goal.boundary_id
-        && path.motion_guard_generation == goal.motion_guard_generation
-        && path.motion_guard_boot_nonce == goal.motion_guard_boot_nonce
-        && path.motion_stop_generation == goal.motion_stop_generation
-        && path.producer_runtime_generation == goal.producer_runtime_generation
+        && path.path.header.frame_id == goal.committed_map_frame_id
 }
 
 fn is_canonical_path_candidate(entry: &PathLedgerEntry, goal: &schema::GoalEnvelope) -> bool {
@@ -549,8 +515,6 @@ fn match_accepted_path_candidate(
     for entry in candidates {
         let path = &entry.path;
         let exact = path.session_id == state.session_id
-            && path.owner_kind == state.owner_kind
-            && path.parent_request_id == state.parent_request_id
             && path.goal_generation == state.goal_generation
             && path.producer_runtime_generation == state.producer_runtime_generation
             && path.path_revision == state.path_revision
@@ -1670,36 +1634,11 @@ fn spawn_path_ledger(
             let first = path.path.poses.first().map(|pose| pose.pose.position);
             let last = path.path.poses.last().map(|pose| pose.pose.position);
             eprintln!(
-                "V2 PATH_LEDGER ordinal={} elapsed_ns={} schema={} session={} owner={} parent={} goal_generation={} producer={} producer_epoch={} producer_runtime_generation={} map_session={} map_session_generation={} map_revision={} map_boot_nonce={:02x?} map_commit_sequence={} map_source_timestamp_ns={} map_frame={} boundary_id={} guard_generation={} guard_nonce={:02x?} stop_generation={} planner_generation={} revision={} source_timestamp_ns={} goal_runtime={} planner_runtime={} points={} first={:?} last={:?}",
-                ordinal,
-                elapsed_ns,
-                path.schema_version,
-                path.session_id,
-                path.owner_kind,
-                path.parent_request_id,
-                path.goal_generation,
-                path.producer,
-                path.producer_epoch,
-                path.producer_runtime_generation,
-                path.committed_map_session_id,
-                path.committed_map_session_generation,
-                path.committed_map_revision,
-                path.committed_map_boot_nonce,
-                path.committed_map_commit_sequence,
-                path.committed_map_source_timestamp_ns,
-                path.committed_map_frame_id,
-                path.boundary_id,
-                path.motion_guard_generation,
-                path.motion_guard_boot_nonce,
-                path.motion_stop_generation,
-                path.planner_runtime_generation,
-                path.path_revision,
-                path.source_timestamp_ns,
-                path.producer_runtime_generation,
-                path.planner_runtime_generation,
-                path.path.poses.len(),
-                first,
-                last
+                "V2 PATH_LEDGER ordinal={} elapsed_ns={} schema={} session={} goal_generation={} producer_runtime_generation={} planner_generation={} revision={} frame={} stamp_sec={} stamp_nsec={} points={} first={:?} last={:?}",
+                ordinal, elapsed_ns, path.schema_version, path.session_id, path.goal_generation,
+                path.producer_runtime_generation, path.planner_runtime_generation, path.path_revision,
+                path.path.header.frame_id, path.path.header.stamp_sec, path.path.header.stamp_nsec,
+                path.path.poses.len(), first, last
             );
             match tx.try_send(PathLedgerEntry {
                 ordinal,
@@ -1744,12 +1683,11 @@ fn spawn_nav_state_ledger(
                 .observe_receipt(&state, ordinal, receipt_at);
             send_live_input_ack_wakes(&ack_wake_tx, ack_wake);
             eprintln!(
-                "V2 STATE_LEDGER ordinal={} elapsed_ns={} session={} runtime_generation={} guard_generation={} pose_source_timestamp_ns={} costmap_source_timestamp_ns={} goal_generation={} path_revision={} goal_runtime={} planner_runtime={} state={} message={:?} zero_ack={} zero_ns={}",
+                "V2 STATE_LEDGER ordinal={} elapsed_ns={} session={} runtime_generation={} pose_source_timestamp_ns={} costmap_source_timestamp_ns={} goal_generation={} path_revision={} goal_runtime={} planner_runtime={} state={} message={:?} zero_ack={} zero_ns={}",
                 ordinal,
                 elapsed_ns,
                 state.session_id,
                 state.runtime_generation,
-                state.guard_generation,
                 state.pose_source_timestamp_ns,
                 state.costmap_source_timestamp_ns,
                 state.goal_generation,
@@ -1833,8 +1771,7 @@ fn explore_pre_start_allows_sink_clear(
         && snapshot.exploration_generation == 0
         && snapshot.child_task_id.is_empty()
         && snapshot.child_lease.is_none()
-        && !snapshot.global_stop_reconciliation.eligible
-        && snapshot.ownership_reconciliation_receipt.is_none()
+        && !snapshot.parking_pending
 }
 
 fn explore_stop_allows_sink_clear(
@@ -1845,6 +1782,7 @@ fn explore_stop_allows_sink_clear(
         && stopped.status == crate::explore_runtime::STATUS_CANCELLED
         && stopped.child_task_id.is_empty()
         && stopped.child_lease.is_none()
+        && !stopped.parking_pending
 }
 
 async fn cleanup_v2_canary(
@@ -2329,6 +2267,63 @@ fn canary_nonce_is_fixed_width_lossless_unique_and_fits_typed_patterns() {
     }
 }
 
+pub(crate) const ORDINARY_STOP_TEST_CAPABILITIES: &str = r#"{
+        "schema_version":1,"calibration_id":"b5-simulated-uds-actuator",
+        "motion":{"model":"differential","max_forward_mps":0.3,"max_reverse_mps":0.0,
+        "max_lateral_mps":0.0,"max_angular_rps":0.7,"linear_acceleration_mps2":0.6,
+        "guaranteed_braking_mps2":0.8,"angular_acceleration_rps2":1.4,
+        "guaranteed_angular_braking_rps2":1.4,"reaction_time_sec":0.1,
+        "minimum_turning_radius_m":0.0,"can_rotate_in_place":true}}
+    "#;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ordinary_stop_real_python_guard_rust_client_preserves_deadline_and_successor_admission() {
+    let _env_lock = ENV_LOCK.lock().await;
+    // 明确的本机模拟执行器制动配置，只验证协议与确认等待，不表示实机停稳验收。
+    let nonce = format!("b5-{}-{}", std::process::id(), crate::explore_runtime::now_unix_nanos());
+    let guard = GuardChild::spawn_with_capabilities(&nonce, Some(ORDINARY_STOP_TEST_CAPABILITIES)).await;
+    let mut client = nuwax_motion_safety_guard::MotionGuardClient::connect(&guard.socket_path).await.unwrap();
+    let ready = client.get_readiness().await.unwrap();
+    assert!(ready.ready);
+    let old_admission = nuwax_motion_safety_guard::MotionAdmissionProof {
+        boot_nonce: ready.boot_nonce.try_into().unwrap(), motion_stop_generation: ready.motion_stop_generation,
+    };
+    let lease = client.acquire_lease("b5-acquire", &old_admission).await.unwrap();
+    assert_ne!(lease.lease_tuple.lease_id, 0);
+    client.renew_lease("b5-renew").await.unwrap();
+    let command = nuwax_motion_safety_guard::wire::TwistCommand {
+        linear_x_mps: 0.1, linear_y_mps: 0.0, angular_z_rps: 0.0,
+    };
+    let before = guard.actuator_events();
+    assert!(matches!(client.submit_twist_before("b5-expired", command.clone(),
+        std::time::Instant::now() - Duration::from_millis(1)).await,
+        Err(nuwax_motion_safety_guard::MotionGuardClientError::DispatchExpired { .. })));
+    assert_eq!(guard.actuator_events(), before, "真实截止失败不能发送非零请求");
+    let applied = client.submit_twist("b5-twist", command).await.unwrap();
+    assert!(!applied.limited);
+    let stop = client.stop_all_motion("b5-ordinary-stop", "本机协议组合停车").await.unwrap();
+    assert!(stop.lease_revoked && stop.zero.stationary_confirmed);
+    assert!(stop.zero.applied_monotonic_ns >= applied.applied_monotonic_ns);
+    assert!(client.acquire_lease("b5-stale-stop-generation", &old_admission).await.is_err());
+    let ready = client.get_readiness().await.unwrap();
+    let mut admission = nuwax_motion_safety_guard::MotionAdmissionProof {
+        boot_nonce: ready.boot_nonce.try_into().unwrap(), motion_stop_generation: ready.motion_stop_generation,
+    };
+    let correct_nonce = admission.boot_nonce;
+    admission.boot_nonce[0] ^= 1;
+    assert!(client.acquire_lease("b5-stale-boot", &admission).await.is_err());
+    admission.boot_nonce = correct_nonce;
+    client.acquire_lease("b5-successor", &admission).await.unwrap();
+    let zero = client.revoke_and_zero("b5-successor-zero").await.unwrap();
+    assert!(zero.stationary_confirmed);
+    let next = client.stop_all_motion("b5-next-ordinary-stop", "确认新实际归零票据").await.unwrap();
+    assert!(next.zero.stationary_confirmed);
+    assert_ne!(next.zero.zero_ack_id, stop.zero.zero_ack_id);
+    assert!(next.zero.applied_monotonic_ns > stop.zero.applied_monotonic_ns);
+    drop(client);
+    guard.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn vertical_v2_mapping_exploration_simple_planner_canary() {
     let _env_lock = ENV_LOCK.lock().await;
@@ -2361,9 +2356,7 @@ async fn vertical_v2_mapping_exploration_simple_planner_canary() {
         .expect("read production Motion Guard readiness");
     assert!(guard_readiness.ready);
     assert!(guard_readiness.actuator_configured);
-    assert!(guard_readiness.epoch_durable);
     assert!(guard_readiness.startup_zero_confirmed);
-    assert!(guard_readiness.generation > 0);
     assert_eq!(guard_readiness.boot_nonce.len(), 16);
 
     let publisher = LcmTransport::new_real(&provider).expect("real LCM publisher context");
@@ -3132,7 +3125,6 @@ async fn vertical_v2_mapping_exploration_simple_planner_canary() {
             &parent_request,
             crate::explore_runtime::ExploreStartConfig {
                 motion_admission: crate::nav_runtime::MotionAdmissionProof::try_from_wire(
-                    guard_readiness.generation,
                     &guard_readiness.boot_nonce,
                     guard_readiness.motion_stop_generation,
                 )
@@ -3721,10 +3713,6 @@ async fn vertical_v2_mapping_exploration_simple_planner_canary() {
 
     let terminal_state = terminal_entry.state;
     assert_eq!(terminal_state.session_id, goal.session_id);
-    assert_eq!(
-        terminal_state.guard_generation,
-        guard_readiness.generation as i64
-    );
     assert!(!terminal_state.zero_ack_id.is_empty());
     assert!(terminal_state.zero_applied_monotonic_ns > 0);
     assert_eq!(terminal_state.state, 3);
@@ -3987,7 +3975,7 @@ fn acceptance_test_goal() -> schema::GoalEnvelope {
         committed_map_source_timestamp_ns: 17,
         committed_map_frame_id: "map".to_string(),
         boundary_id: "acceptance-boundary".to_string(),
-        motion_guard_generation: 18,
+
         motion_guard_boot_nonce: [0x19; 16],
         motion_stop_generation: 20,
         body_reference_frame_id: "base_link".into(),
@@ -4003,26 +3991,17 @@ fn acceptance_test_path(
     let path = schema::PathEnvelope {
         schema_version: goal.schema_version,
         session_id: goal.session_id.clone(),
-        owner_kind: goal.owner_kind,
-        parent_request_id: goal.parent_request_id.clone(),
+
+
         goal_generation: goal.goal_generation,
-        producer: goal.producer.clone(),
-        producer_epoch: goal.producer_epoch,
+
+
         producer_runtime_generation: goal.producer_runtime_generation,
-        committed_map_session_id: goal.committed_map_session_id.clone(),
-        committed_map_session_generation: goal.committed_map_session_generation,
-        committed_map_revision: goal.committed_map_revision,
-        committed_map_boot_nonce: goal.committed_map_boot_nonce,
-        committed_map_commit_sequence: goal.committed_map_commit_sequence,
-        committed_map_source_timestamp_ns: goal.committed_map_source_timestamp_ns,
-        committed_map_frame_id: goal.committed_map_frame_id.clone(),
-        boundary_id: goal.boundary_id.clone(),
-        motion_guard_generation: goal.motion_guard_generation,
-        motion_guard_boot_nonce: goal.motion_guard_boot_nonce,
-        motion_stop_generation: goal.motion_stop_generation,
+
+
         planner_runtime_generation: 22,
         path_revision: revision,
-        source_timestamp_ns: 2_000_000_000,
+
 
         path: schema::Path {
             header: schema::Header {
@@ -4049,12 +4028,12 @@ fn acceptance_test_path(
     }
 }
 
-fn acceptance_test_state(path: &schema::PathEnvelope) -> schema::NavigationState {
+fn acceptance_test_state(path: &schema::PathEnvelope, goal: &schema::GoalEnvelope) -> schema::NavigationState {
     schema::NavigationState {
         session_id: path.session_id.clone(),
         state: 2,
-        owner_kind: path.owner_kind,
-        parent_request_id: path.parent_request_id.clone(),
+        owner_kind: goal.owner_kind,
+        parent_request_id: goal.parent_request_id.clone(),
         goal_generation: path.goal_generation,
         path_revision: path.path_revision,
         producer_runtime_generation: path.producer_runtime_generation,
@@ -4063,29 +4042,13 @@ fn acceptance_test_state(path: &schema::PathEnvelope) -> schema::NavigationState
     }
 }
 
-#[test]
-fn canonical_path_candidate_requires_exact_committed_map_receipt() {
-    let goal = acceptance_test_goal();
-    let candidate = acceptance_test_path(&goal, 1, 1);
-    assert!(is_canonical_path_candidate(&candidate, &goal));
-    for field in 0..3 {
-        let mut conflict = candidate.clone();
-        match field {
-            0 => conflict.path.committed_map_boot_nonce[0] ^= 1,
-            1 => conflict.path.committed_map_commit_sequence += 1,
-            _ => conflict.path.committed_map_source_timestamp_ns += 1,
-        }
-        // Reusing an assigned path key cannot repair mismatched map provenance.
-        assert!(!is_canonical_path_candidate(&conflict, &goal));
-    }
-}
 
 #[test]
 fn accepted_path_candidate_matches_later_canonical_revision() {
     let goal = acceptance_test_goal();
     let revision_one = acceptance_test_path(&goal, 1, 1);
     let revision_two = acceptance_test_path(&goal, 2, 2);
-    let state = acceptance_test_state(&revision_two.path);
+    let state = acceptance_test_state(&revision_two.path, &goal);
     let candidates = VecDeque::from([revision_one, revision_two]);
 
     let AcceptedPathCandidateMatch::Matched(matched) =
@@ -4101,7 +4064,7 @@ fn accepted_path_candidate_matches_later_canonical_revision() {
 fn accepted_path_candidate_waits_for_state_before_path_reordering() {
     let goal = acceptance_test_goal();
     let revision_two = acceptance_test_path(&goal, 2, 2);
-    let state = acceptance_test_state(&revision_two.path);
+    let state = acceptance_test_state(&revision_two.path, &goal);
     let mut candidates = VecDeque::new();
 
     assert!(matches!(
@@ -4121,21 +4084,21 @@ fn accepted_path_candidate_rejects_identity_planner_and_revision_conflicts() {
     let revision_two = acceptance_test_path(&goal, 2, 2);
     let candidates = VecDeque::from([revision_two.clone()]);
 
-    let mut wrong_identity = acceptance_test_state(&revision_two.path);
+    let mut wrong_identity = acceptance_test_state(&revision_two.path, &goal);
     wrong_identity.parent_request_id.push_str("-wrong");
     assert!(matches!(
         match_accepted_path_candidate(&wrong_identity, &goal, &candidates),
         AcceptedPathCandidateMatch::Conflict
     ));
 
-    let mut wrong_planner = acceptance_test_state(&revision_two.path);
+    let mut wrong_planner = acceptance_test_state(&revision_two.path, &goal);
     wrong_planner.planner_runtime_generation += 1;
     assert!(matches!(
         match_accepted_path_candidate(&wrong_planner, &goal, &candidates),
         AcceptedPathCandidateMatch::Conflict
     ));
 
-    let mut wrong_revision = acceptance_test_state(&revision_two.path);
+    let mut wrong_revision = acceptance_test_state(&revision_two.path, &goal);
     wrong_revision.path_revision += 1;
     assert!(matches!(
         match_accepted_path_candidate(&wrong_revision, &goal, &candidates),
@@ -4148,8 +4111,8 @@ fn pending_accepted_state_advances_before_late_old_candidate() {
     let goal = acceptance_test_goal();
     let revision_one = acceptance_test_path(&goal, 1, 1);
     let revision_two = acceptance_test_path(&goal, 2, 2);
-    let state_one = acceptance_test_state(&revision_one.path);
-    let state_two = acceptance_test_state(&revision_two.path);
+    let state_one = acceptance_test_state(&revision_one.path, &goal);
+    let state_two = acceptance_test_state(&revision_two.path, &goal);
     let mut pending = state_one;
     let mut candidates = VecDeque::new();
 
@@ -4177,8 +4140,8 @@ fn pending_accepted_state_distinguishes_duplicate_and_revision_rollback() {
     let goal = acceptance_test_goal();
     let revision_one = acceptance_test_path(&goal, 1, 1);
     let revision_two = acceptance_test_path(&goal, 2, 2);
-    let state_one = acceptance_test_state(&revision_one.path);
-    let state_two = acceptance_test_state(&revision_two.path);
+    let state_one = acceptance_test_state(&revision_one.path, &goal);
+    let state_two = acceptance_test_state(&revision_two.path, &goal);
 
     assert_eq!(
         classify_pending_accepted_state_update(&state_two, &state_two, &goal),
@@ -4658,12 +4621,12 @@ async fn initial_readiness_uses_typed_feedback_generation() {
     ) -> Result<InitialReadinessGateOutcome, InitialReadinessGateFailure> {
         let nav = crate::nav_runtime::NavRuntimeState::from_env();
         let handle = canary_readiness_handle(&nav);
-        let heartbeat = |runtime_generation: i64, guard_generation: i64, sink_ready: i8| {
+        let heartbeat = |runtime_generation: i64, sink_ready: i8| {
             schema::encode_navigation_state_body(&schema::NavigationState {
                 stamp_sec: 1,
                 message: "IDLE: guard client heartbeat".to_string(),
                 runtime_generation,
-                guard_generation,
+
                 sink_ready,
                 planner_map_frame: "map".to_string(),
                 planner_pose_frame: "map".to_string(),
@@ -4680,10 +4643,10 @@ async fn initial_readiness_uses_typed_feedback_generation() {
             | GateCase::ReadyDeadlineAfterFinalReadiness
             | GateCase::ReadyGoal
             | GateCase::ReadyPath
-            | GateCase::ReadyTwist => Some(heartbeat(41, 37, 1)),
-            GateCase::PlannerMissing => Some(heartbeat(0, 37, 1)),
-            GateCase::SinkMissing => Some(heartbeat(41, 0, 1)),
-            GateCase::SinkFalse => Some(heartbeat(41, 37, 0)),
+            | GateCase::ReadyTwist => Some(heartbeat(41, 1)),
+            GateCase::PlannerMissing => Some(heartbeat(0, 1)),
+            GateCase::SinkMissing => Some(heartbeat(41, 1)),
+            GateCase::SinkFalse => Some(heartbeat(41, 0)),
             GateCase::NoHeartbeat
             | GateCase::PendingExpiredNavInput
             | GateCase::PendingExpiredGoal
@@ -4712,7 +4675,7 @@ async fn initial_readiness_uses_typed_feedback_generation() {
                         state: schema::NavigationState {
                             message: "IDLE: guard client heartbeat".to_string(),
                             runtime_generation: 41,
-                            guard_generation: 37,
+
                             sink_ready: 1,
                             planner_map_frame: "map".to_string(),
                             planner_pose_frame: "map".to_string(),
@@ -4732,7 +4695,7 @@ async fn initial_readiness_uses_typed_feedback_generation() {
                     state: schema::NavigationState {
                         message: "IDLE: guard client heartbeat".to_string(),
                         runtime_generation: 41,
-                        guard_generation: 37,
+
                         sink_ready: 1,
                         planner_map_frame: "map".to_string(),
                         planner_pose_frame: "map".to_string(),
@@ -4751,7 +4714,7 @@ async fn initial_readiness_uses_typed_feedback_generation() {
                     state: schema::NavigationState {
                         message: "IDLE: guard client heartbeat".to_string(),
                         runtime_generation: 41,
-                        guard_generation: 37,
+
                         sink_ready: 1,
                         planner_map_frame: "map".to_string(),
                         planner_pose_frame: "map".to_string(),
@@ -4910,7 +4873,7 @@ async fn initial_readiness_uses_typed_feedback_generation() {
                 .expect_err("post-compute deadline must prevent release");
             assert!(failure.detail.ready, "{:#?}", failure.detail);
             assert_eq!(failure.detail.planner_generation, 41);
-            assert_eq!(failure.detail.motion_sink_generation, 37);
+            assert_eq!(failure.detail.motion_sink_generation, 41);
         }
         match case {
             GateCase::ReadyCanonicalThenNoncanonical => {
@@ -4964,7 +4927,7 @@ async fn initial_readiness_uses_typed_feedback_generation() {
         .expect("high-generation typed heartbeat must release initial gate");
     assert!(ready.detail.ready, "{:#?}", ready.detail);
     assert_eq!(ready.detail.planner_generation, 41);
-    assert_eq!(ready.detail.motion_sink_generation, 37);
+    assert_eq!(ready.detail.motion_sink_generation, 41);
     assert_eq!(ready.release_count, 1);
     assert_eq!(ready.dispatches, InitialReadinessDispatchLedger::default());
 
@@ -6000,24 +5963,9 @@ async fn cleanup_recognizes_real_pre_start_explore_as_settled() {
     assert!(!explore_pre_start_allows_sink_clear(&retained, false));
     retained.child_lease = None;
 
-    retained.global_stop_reconciliation.eligible = true;
+    retained.parking_pending = true;
     assert!(!explore_pre_start_allows_sink_clear(&retained, false));
-    retained.global_stop_reconciliation.eligible = false;
-
-    retained.ownership_reconciliation_receipt = Some(
-        crate::explore_runtime::ExplorationOwnershipReconciliationReceipt {
-            child_lease: None,
-            cause: "test-residual".to_string(),
-            recovery_correlation: "test-correlation".to_string(),
-            parent_request_id: "retained-parent".to_string(),
-            exploration_generation: 1,
-            child_lease_fingerprint: "test-child-lease".to_string(),
-            cancel_generation: 1,
-            commit_disposition: "test-committed".to_string(),
-        },
-    );
-    assert!(!explore_pre_start_allows_sink_clear(&retained, false));
-    retained.ownership_reconciliation_receipt = None;
+    retained.parking_pending = false;
 
     assert!(!explore_pre_start_allows_sink_clear(&retained, true));
 }

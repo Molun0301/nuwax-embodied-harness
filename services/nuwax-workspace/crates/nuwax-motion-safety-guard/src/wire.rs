@@ -3,7 +3,7 @@
 #![allow(missing_docs)]
 
 /// Version carried by every accepted request and response.
-pub const API_VERSION: u32 = 2;
+pub const API_VERSION: u32 = 3;
 
 include!(concat!(env!("OUT_DIR"), "/nuwax.motion_guard.v2.rs"));
 
@@ -22,15 +22,15 @@ mod tests {
                 SubmitMotionCommandRequest {
                     envelope: Some(RequestEnvelope {
                         tuple: Some(LeaseTuple {
-                            generation: 9,
+
                             boot_nonce: vec![7; 16],
                             lease_id: 42,
                         }),
                         source: GuardSource::Nav as i32,
                         action: GuardAction::Twist as i32,
                         operation_id: "operation-1".to_string(),
-                        payload_sha256: vec![3; 32],
-                        sequence: 8,
+
+
                         issued_monotonic_ns: 1_000_000,
                         deadline_monotonic_ns: 1_300_000,
                         motion_stop_generation: 0,
@@ -102,14 +102,13 @@ mod tests {
                     envelope: Some(GlobalStopEnvelope {
                         source: GuardSource::GatewayManual as i32,
                         operation_id: "operation-stop".to_string(),
-                        payload_sha256: vec![5; 32],
+
                         issued_monotonic_ns: 10,
                         deadline_monotonic_ns: 20,
                     }),
                     reason: "operator requested stop".to_string(),
-                    mode: GlobalStopMode::Ordinary as i32,
-                    recovery_correlation: String::new(),
-                    recovery_fence_token: Vec::new(),
+
+
                 },
             )),
         };
@@ -143,9 +142,9 @@ mod tests {
     }
 
     #[test]
-    fn rust_wire_contract_is_v2_without_retired_gate_operations() {
+    fn rust_wire_contract_is_v3_without_retired_gate_operations() {
         let schema = include_str!("../../../../navigation/proto/motion_guard.proto");
-        assert_eq!(API_VERSION, 2);
+        assert_eq!(API_VERSION, 3);
         assert!(schema.contains("package nuwax.motion_guard.v2;"));
         for retired_declaration in [
             "enum SafetyGate",

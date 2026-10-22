@@ -111,7 +111,11 @@ class OfflineFixture(unittest.TestCase):
         }
         for name, value in patches.items():
             self.stack.enter_context(patch.object(manager, name, value))
-        self.uuid = self.stack.enter_context(patch.object(uuid, "uuid4", side_effect=assigned_uuid))
+        # 只统计安装代次与服务身份，不把公共原子写的临时文件名算作新安装。
+        self.uuid = Mock(side_effect=assigned_uuid)
+        identity_uuids = SimpleNamespace(uuid4=self.uuid)
+        self.stack.enter_context(patch.object(manager, "uuid", identity_uuids))
+        self.stack.enter_context(patch.object(lifecycle, "uuid", identity_uuids))
         return patches
 
     def apply(self, **kwargs):

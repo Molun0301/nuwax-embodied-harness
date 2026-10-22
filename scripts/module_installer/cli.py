@@ -44,9 +44,7 @@ def build_parser() -> argparse.ArgumentParser:
   ./install.sh list                     查看当前安装
   ./install.sh install --dry-run        只查看计划
   ./install.sh start                    启动当前安装（前台运行）
-
-原有生产部署命令 plan/check/deploy/resume/verify/status/rollback/bundle 保持可用。
-使用 ./install.sh deploy --help 查看严格生产部署选项。""",
+""",
     )
     parser.add_argument("command", nargs="?", default="manage", choices=("manage", "install", "add", "remove", "list", "doctor", "start", "stop"), help="安装管理操作")
     parser.add_argument("names", nargs="*", help="add/remove 的模块名称，可使用逗号分隔")

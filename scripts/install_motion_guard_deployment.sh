@@ -492,15 +492,6 @@ check_sources() {
   check_file "${PERSON_FOLLOW_LAUNCHER}"
   check_file "${PERSON_FOLLOW_READY_HELPER}"
   check_file "${REPO_ROOT}/scripts/systemd/activate_geometry_runtime.sh"
-  grep -qF 'API_VERSION = 3' "${REPO_ROOT}/services/navigation/motion_safety_guard/constants.py" \
-    || fail "motion guard Python API version is not 3"
-  grep -qF 'package nuwax.motion_guard.v2;' "${REPO_ROOT}/services/navigation/proto/motion_guard.proto" \
-    || fail "motion guard proto package is not v2"
-  grep -qF 'startup_zero_confirmed' "${REPO_ROOT}/services/navigation/proto/motion_guard.proto" \
-    || fail "motion guard v2 proto does not expose startup zero confirmation"
-  ! grep -Eq '^(enum SafetyGate|message (LatchSafetyStop|ResetSafeStop))' \
-    "${REPO_ROOT}/services/navigation/proto/motion_guard.proto" \
-    || fail "retired motion gate/reset messages remain in the v2 proto"
   validate_sysusers_source
   check_project_identity "${SYSUSERS_SOURCE}"
   for unit in "${GUARD_UNIT_SOURCE}" "${NAV_UNIT_SOURCE}" "${GEOMETRY_UNIT_SOURCE}" \

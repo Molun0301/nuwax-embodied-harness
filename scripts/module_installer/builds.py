@@ -21,7 +21,7 @@ import zipfile
 from pathlib import Path, PurePosixPath
 from typing import Callable, Iterable, Mapping, Optional, Sequence
 
-from scripts.deploy_installer.config import atomic_write
+from scripts.device_manager.common import atomic_write
 
 RUST_VERSION = "1.88.0"
 _NATIVE_ROOT = Path("services/nuwax-workspace/crates/nuwax-lio-backends/native")
@@ -88,7 +88,7 @@ def _read_slots(path: Path, roles: Iterable[str], fields: tuple) -> dict:
 def _save_slots(path: Path, slots: Mapping) -> None:
     # build_modules is serialized by manager.installation_lock. Persist the name
     # before invoking a builder so a failed build retries the same assigned path.
-    atomic_write(path, json.dumps({"version": 1, "slots": slots}, ensure_ascii=False, indent=2) + "\n", mode=0o600)
+    atomic_write(path, (json.dumps({"version": 1, "slots": slots}, ensure_ascii=False, indent=2) + "\n").encode("utf-8"), mode=0o600)
 
 
 def _cache_destination(parent: Path, name: str) -> Path:
@@ -197,7 +197,7 @@ def _rust_target(cache: Path, root: Path, manifest: str) -> Path:
     # before slot publication leaves an unbound directory, never a broken slot.
     target = parent / (role + "-" + uuid.uuid4().hex)
     target.mkdir()
-    atomic_write(target / "neh-target-owner.json", json.dumps(expected, ensure_ascii=False) + "\n", mode=0o600)
+    atomic_write(target / "neh-target-owner.json", (json.dumps(expected, ensure_ascii=False) + "\n").encode("utf-8"), mode=0o600)
     slots[role] = {"manifest": identity, "path": target.name}
     _save_slots(record, slots)
     return target
@@ -392,7 +392,7 @@ def _protocol_compiler(cache: Path) -> dict[str, str]:
         admitted = False
     if not admitted:
         _download(url, archive, trusted_hosts=("github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"))
-        atomic_write(download_record, json.dumps({"source": url, "file": file_state(archive, archive.parent)}) + "\n", mode=0o600)
+        atomic_write(download_record, (json.dumps({"source": url, "file": file_state(archive, archive.parent)}) + "\n").encode("utf-8"), mode=0o600)
 
     temporary = Path(tempfile.mkdtemp(prefix=".protoc-", dir=str(parent)))
     previous = None
@@ -417,7 +417,7 @@ def _protocol_compiler(cache: Path) -> dict[str, str]:
         if not required.issubset(files):
             raise RuntimeError("官方协议编译器缺少程序或协议头文件")
         result(temporary)
-        atomic_write(temporary / marker_name, json.dumps({"source": url, "recipe": 1, "files": files}) + "\n", mode=0o600)
+        atomic_write(temporary / marker_name, (json.dumps({"source": url, "recipe": 1, "files": files}) + "\n").encode("utf-8"), mode=0o600)
         # 完整解压并核对版本后才发布；替换准备完成之前保留已有安装。
         _cache_destination(parent, destination.name)
         if destination.exists():
@@ -541,7 +541,7 @@ def _prepare_livox(source: Path, destination: Path) -> None:
         header.write_text("#include <cstdint>\n" + header.read_text(encoding="utf-8"), encoding="utf-8")
     for cmake in destination.rglob("CMakeLists.txt"):
         cmake.write_text(cmake.read_text(encoding="utf-8").replace("-Werror", ""), encoding="utf-8")
-    atomic_write(marker, json.dumps(prepared) + "\n", mode=0o600)
+    atomic_write(marker, (json.dumps(prepared) + "\n").encode("utf-8"), mode=0o600)
 
 
 def _build_native(root: Path, prefix: Path, cache: Path, name: str, jobs: int,

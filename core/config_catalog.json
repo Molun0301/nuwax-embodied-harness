@@ -74,7 +74,6 @@
     "section_id": "geometry_runtime",
     "target_file": "core_env",
     "consumers": [
-      "scripts/bootstrap.py",
       "scripts/systemd/activate_geometry_runtime.sh",
       "scripts/systemd/start_geometry_runtime.sh",
       "scripts/systemd/wait_for_geometry_runtime_ready.sh",
@@ -162,7 +161,6 @@
     "section_id": "nav_stack",
     "target_file": "core_env",
     "consumers": [
-      "scripts/bootstrap.py",
       "scripts/diagnostics/check_nuwax_runtime.sh",
       "scripts/install_motion_guard_deployment.sh",
       "scripts/start_gateway.sh",
@@ -193,8 +191,6 @@
     "section_id": "shm_uds",
     "target_file": "core_env",
     "consumers": [
-      "scripts/bootstrap.py",
-      "scripts/deploy_installer/operations.py",
       "services/geometry/nuwax_geometry_runtime/src/forbidden_zones.rs",
       "services/geometry/nuwax_geometry_runtime/src/lcm_runtime.rs",
       "services/navigation/forbidden_zones.py"
@@ -787,7 +783,6 @@
     "target_file": "core_env",
     "consumers": [
       "gateways/person_follow.py",
-      "scripts/bootstrap.py",
       "scripts/start_gateway.sh",
       "services/nuwax-workspace/crates/nuwax-nav-visual-servoing/src/bin/nuwax-person-follow.rs"
     ],
@@ -801,7 +796,6 @@
     "section_id": "nav_stack",
     "target_file": "core_env",
     "consumers": [
-      "scripts/bootstrap.py",
       "scripts/start_gateway.sh",
       "services/nuwax-workspace/crates/nuwax-nav-visual-servoing/src/bin/nuwax-person-follow.rs"
     ],
@@ -815,7 +809,6 @@
     "section_id": "nav_stack",
     "target_file": "core_env",
     "consumers": [
-      "scripts/bootstrap.py",
       "scripts/start_gateway.sh",
       "services/nuwax-workspace/crates/nuwax-nav-visual-servoing/src/bin/nuwax-person-follow.rs"
     ],
@@ -830,7 +823,6 @@
     "target_file": "core_env",
     "consumers": [
       "gateways/person_follow.py",
-      "scripts/bootstrap.py",
       "scripts/start_gateway.sh",
       "services/nuwax-workspace/crates/nuwax-nav-visual-servoing/src/bin/nuwax-person-follow.rs"
     ],
@@ -893,7 +885,6 @@
     "target_file": "core_env",
     "consumers": [
       "gateways/motion_guard.py",
-      "scripts/bootstrap.py",
       "scripts/diagnostics/check_nuwax_runtime.sh",
       "scripts/install_motion_guard_deployment.sh",
       "scripts/start_gateway.sh",
@@ -915,7 +906,6 @@
     "section_id": "robot",
     "target_file": "core_env",
     "consumers": [
-      "scripts/bootstrap.py",
       "scripts/start_gateway.sh",
       "scripts/systemd/activate_geometry_runtime.sh",
       "scripts/systemd/wait_for_motion_guard_socket.sh"
@@ -930,7 +920,6 @@
     "section_id": "gateway",
     "target_file": "core_env",
     "consumers": [
-      "scripts/bootstrap.py",
       "scripts/start_gateway.sh"
     ],
     "apply_scope": "重启网关启动脚本后生效",

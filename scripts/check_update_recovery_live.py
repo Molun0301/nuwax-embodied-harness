@@ -57,10 +57,10 @@ def main():
 
     origin, root = base / 'origin', base / 'checkout'
     origin.mkdir()
-    for directory in ('scripts', 'scripts/deploy_installer', 'core'):
+    for directory in ('scripts', 'scripts/device_manager', 'core'):
         (origin / directory).mkdir(exist_ok=True)
     shutil.copytree(source / 'scripts/module_installer', origin / 'scripts/module_installer', ignore=shutil.ignore_patterns('__pycache__'))
-    for path in ('scripts/deploy_installer/config.py', 'core/config_values.py'):
+    for path in ('scripts/device_manager/common.py', 'scripts/device_manager/__init__.py', 'core/config_values.py'):
         shutil.copyfile(source / path, origin / path)
     (origin / '.gitignore').write_text('runtime_data/\n__pycache__/\n')
     gitlog = (base / 'git.log').open('w')

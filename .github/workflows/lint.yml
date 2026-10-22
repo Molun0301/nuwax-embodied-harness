@@ -1,6 +1,6 @@
 name: lint
 
-# 平台分层、设备 Python 兼容与真实部署构建检查。
+# 平台分层、设备 Python 兼容与测试文件入仓范围检查。
 #
 # 平台分层由 scripts/check_layering.sh 检查。
 
@@ -24,7 +24,7 @@ jobs:
       # (c) PEP 604 union ast 检测
       # 只扫本 change 新增 + 顶层 platform 代码；要求兼容实机 Py3.8.10，禁止 X | Y 写法。
       - name: PEP 604 union 检测（实机 Py3.8.10 兼容）
-        run: python3 scripts/ci/check_pep604.py services/geometry/__init__.py services/geometry/runtime.py gateways scripts/deploy_installer install.py
+        run: python3 scripts/ci/check_pep604.py services/geometry/__init__.py services/geometry/runtime.py gateways scripts/device_manager scripts/module_installer scripts/go2_update install.py scripts/update_go2.py
 
       # (d) 仅允许 .gitignore 明确放行的 fixture / mock / integration 回归文件。
       - name: 测试文件入仓范围
@@ -55,18 +55,3 @@ jobs:
               exit "$status"
               ;;
           esac
-
-  deployment-installer:
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.8'
-
-      - name: 安装部署检查工具
-        run: python3 -m pip install 'ruff==0.9.10' 'pydantic==2.10.6'
-
-      - name: 一键部署源码契约
-        run: bash scripts/ci/check_deployment_installer.sh

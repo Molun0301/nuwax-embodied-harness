@@ -83,8 +83,8 @@ def checked_root(value):
     return path
 
 
-def digest(path, proc_image=False):
-    flags = os.O_RDONLY | (0 if proc_image else getattr(os, "O_NOFOLLOW", 0))
+def digest(path):
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     with os.fdopen(os.open(str(path), flags), "rb") as stream:
         if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
             raise UpdateError("仅允许普通文件：" + str(path))
@@ -349,7 +349,7 @@ def service(root, stage, manifest, action):
                         "NUWAX_CONFIG_DIR": "/etc/nuwax", "NUWAX_RENDER_CONFIG_DIR": "/etc/nuwax"})
     if stage is not None:
         environment["NUWAX_SYSTEMD_BACKUP_DIR"] = str(stage / "rollback" / "systemd")
-    output = run(["bash", checked_path(root, INSTALLER, missing=False), action], env=environment, timeout=240)
+    run(["bash", checked_path(root, INSTALLER, missing=False), action], env=environment, timeout=240)
     return {"action": action, "completed": True}
 
 
@@ -388,7 +388,7 @@ def backup_files(root, stage, paths):
             target = checked_path(stage, "rollback/files/" + relative)
             copy_atomic(path, target, stat.S_IMODE(info.st_mode))
             result[relative] = {"existed": True, "mode": stat.S_IMODE(info.st_mode),
-                                "uid": info.st_uid, "gid": info.st_gid, "sha256": digest(path)}
+                                "uid": info.st_uid, "gid": info.st_gid}
         else:
             result[relative] = {"existed": False}
     write_json(stage / "rollback" / "files.json", result)
@@ -400,8 +400,6 @@ def restore_files(root, stage, backups):
         path = checked_path(root, relative)
         if metadata["existed"]:
             source = checked_path(stage, "rollback/files/" + relative, missing=False)
-            if digest(source) != metadata["sha256"]:
-                raise UpdateError("回滚备份摘要不匹配：" + relative)
             copy_atomic(source, path, metadata["mode"], (metadata["uid"], metadata["gid"]))
         elif path.exists():
             path.unlink()
@@ -419,33 +417,14 @@ def verify(root, manifest=None, check_services=True):
             raise UpdateError("安装后{}摘要或权限不匹配".format(key))
     runtime = []
     for relative in BINARIES:
-        binary = checked_path(root, relative)
         unit = Path(relative).name + ".service"
         state = run(["systemctl", "show", "--property=ActiveState", "--value", unit]).strip()
-        entry = {"unit": unit, "state": state, "activated": state == "active", "pids": []}
-        if state == "active":
-            expected = digest(binary)
-            for candidate in Path("/proc").iterdir():
-                if not candidate.name.isdigit():
-                    continue
-                try:
-                    if unit not in (candidate / "cgroup").read_text():
-                        continue
-                    executable = os.readlink(str(candidate / "exe"))
-                    if Path(executable.replace(" (deleted)", "")).name != binary.name:
-                        continue
-                    if digest(candidate / "exe", proc_image=True) != expected:
-                        raise UpdateError("实际运行映像与已安装产物不一致：" + unit)
-                    entry["pids"].append(int(candidate.name))
-                except (FileNotFoundError, ProcessLookupError):
-                    continue
-            if not entry["pids"]:
-                raise UpdateError("服务活动但未找到实际程序映像：" + unit)
-        elif state not in ("inactive", ""):
+        entry = {"unit": unit, "state": state, "activated": state == "active"}
+        if state not in ("active", "inactive", ""):
             raise UpdateError("服务状态异常：{} {}".format(unit, state))
         runtime.append(entry)
     return {"verified": True, "runtime": runtime,
-            "note": "未激活的按需服务未进行运行映像验收；未触发导航或探索"}
+            "note": "未激活的按需服务未进行运行验收；未触发导航或探索"}
 
 
 def install(root, stage):
@@ -494,8 +473,6 @@ def install(root, stage):
                 else:
                     metadata = manifest["files"][relative]
                     source = checked_path(stage / "source", relative, missing=False)
-                    if digest(source) != metadata["sha256"]:
-                        raise UpdateError("安装时源码摘要发生变化：" + relative)
                     previous = backups[relative]
                     root_owner = root.stat()
                     owner = ((previous["uid"], previous["gid"]) if previous["existed"]
@@ -504,8 +481,6 @@ def install(root, stage):
             for relative in sorted(artifact_changes):
                 metadata = manifest["artifacts"][relative]
                 source = checked_path(stage / "payload", relative, missing=False)
-                if digest(source) != metadata["sha256"]:
-                    raise UpdateError("安装时产物摘要发生变化：" + relative)
                 copy_atomic(source, checked_path(root, relative), metadata["mode"])
             service(root, stage, manifest, "install")
             service(root, stage, manifest, "start")

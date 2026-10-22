@@ -35,15 +35,15 @@ jobs:
           python-version: ${{ matrix.python }}
       - name: 检查单命令入口与目标解释器语法
         run: |
-          bash -n get-neh.sh scripts/neh_private_install.sh
-          python3 scripts/ci/check_pep604.py scripts/neh_bootstrap.py scripts/neh_source.py scripts/neh_source_build.py scripts/device_manager scripts/module_installer scripts/product_release
+          bash -n install.sh get-neh.sh scripts/neh_private_install.sh scripts/install_motion_guard_deployment.sh scripts/systemd/check_motion_guard_python.sh
+          python3 scripts/ci/check_pep604.py scripts/neh_bootstrap.py scripts/neh_source.py scripts/neh_source_build.py scripts/device_manager scripts/module_installer scripts/go2_update install.py scripts/update_go2.py
       - name: 仅从源码组装并导入管理程序
         run: |
           python3 - <<'PY'
           import os, pathlib, subprocess, sys
           from scripts.neh_bootstrap import unpack_manager
           from scripts.neh_source import source_version
-          from scripts.product_release.builder import build_manager
+          from scripts.device_manager.source_package import build_manager
           root = pathlib.Path.cwd()
           temporary = pathlib.Path(os.environ['RUNNER_TEMP']) / 'neh-source-entry'
           temporary.mkdir()
@@ -71,3 +71,26 @@ jobs:
           python3 scripts/check_installer_protocol_compiler.py
           python3 scripts/check_installer_naming_identity.py
           python3 scripts/check_build_parallelism.py
+      - name: 模块入口与服务源码检查
+        run: |
+          python3 scripts/check_installation_lifecycle.py
+          python3 install.py --help
+          python3 scripts/update_go2.py --help
+          python3 - <<'PY_MODULE_PLAN'
+          import json, subprocess, sys
+          cases = [
+              (["--modules", "core"], ["core"]),
+              (["--modules", "pointlio"], ["core", "geometry", "pointlio"]),
+              (["--preset", "map2d"], ["core", "geometry", "slam2d"]),
+          ]
+          for arguments, modules in cases:
+              result = subprocess.check_output([sys.executable, "install.py", "install", *arguments, "--robot", "customrobot", "--json"], text=True)
+              plan = json.loads(result)["plan"]
+              assert plan["modules"] == modules
+              assert plan["models"] == []
+              if modules == ["core"]:
+                  assert plan["builds"] == []
+              if "pointlio" in modules:
+                  assert "libgoogle-glog-dev" in plan["system_packages"]
+          PY_MODULE_PLAN
+          bash scripts/install_motion_guard_deployment.sh check-sources

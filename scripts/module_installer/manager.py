@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Optional, Sequence
 
-from scripts.deploy_installer.config import atomic_write, fsync_directory
+from scripts.device_manager.common import atomic_write, fsync_directory
 
 from .builds import build_modules, describe_builds, prune_build_cache
 from .catalog import ROBOT_REQUIREMENTS, module_imports, module_requirements, module_system_packages, resolve_modules
@@ -293,7 +293,7 @@ def _vendor_constraints(python: str, target: Path, names: Sequence[str]) -> None
     environment["PYTHONNOUSERSITE"] = "1"
     code = f"from importlib.metadata import version; print('\\n'.join(n+'=='+version(n) for n in {list(names)!r}))"
     result = subprocess.run([python, "-c", code], capture_output=True, text=True, check=True, timeout=45, env=environment)
-    atomic_write(target, result.stdout, mode=0o600)
+    atomic_write(target, (result.stdout).encode("utf-8"), mode=0o600)
 
 
 def _python_environment(request: InstallRequest, hardware, prefix: Path, seed: str, run) -> None:
@@ -473,7 +473,7 @@ def apply(request: InstallRequest, hardware) -> dict:
                     service_name = "neh-install-" + str(uuid.uuid4()) + ".service"
                 state["deployment"] = deployment_descriptor(request.root, request.home, prefix, request.modules,
                                                             request.robot, mode, service_name=service_name)
-            atomic_write(prefix / "manifest.json", json.dumps(state, ensure_ascii=False, indent=2) + "\n", mode=0o600)
+            atomic_write(prefix / "manifest.json", (json.dumps(state, ensure_ascii=False, indent=2) + "\n").encode("utf-8"), mode=0o600)
             temporary.symlink_to(prefix.relative_to(request.home))
             os.replace(str(temporary), str(request.home / "current"))
             fsync_directory(request.home)

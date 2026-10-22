@@ -519,7 +519,7 @@ def source_manager(args, destination, token):
                              progress=lambda message: print(message, flush=True)) as source:
             archive = destination / "manager.tar.gz"
             print("从固定源码组装管理程序：" + source["version"], flush=True)
-            subprocess.run([sys.executable, "-B", "-m", "scripts.product_release", "manager",
+            subprocess.run([sys.executable, "-B", "-m", "scripts.device_manager.source_package",
                             "--root", str(source["root"]), "--output", str(archive), "--version", source["version"]],
                            cwd=str(source["root"]), env=python_environment(), check=True, timeout=180)
             return archive, {"version": source["version"], "revision": source["revision"]}

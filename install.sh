@@ -1,15 +1,9 @@
 #!/usr/bin/env bash
-# 默认按需管理本机模块；原有生产部署入口保留其独立权限约束。
+# 按需管理本机模块，也可进入设备管理与现行软件更新。
 set -euo pipefail
 umask 022
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-case "${1:-}" in
-  plan|check|deploy|resume|verify|status|rollback|bundle)
-    exec bash "${REPO_ROOT}/scripts/deploy_installer/entrypoint.sh" "$@"
-    ;;
-esac
-
 PYTHON_BIN="${PYTHON_BIN:-/usr/bin/python3}"
 command -v "${PYTHON_BIN}" >/dev/null 2>&1 || {
   echo "未找到 Python（编程语言）解释器；请先安装 python3。" >&2

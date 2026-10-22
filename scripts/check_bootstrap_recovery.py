@@ -24,7 +24,7 @@ sys.path.insert(0, str(ROOT))
 from scripts import neh_bootstrap as bootstrap
 from scripts.device_manager.engine import Engine
 from scripts.device_manager.server import ManagerServer
-from scripts.product_release.builder import build_manager
+from scripts.device_manager.source_package import build_manager
 
 RUN_PROCESS = subprocess.run
 START_PROCESS = subprocess.Popen

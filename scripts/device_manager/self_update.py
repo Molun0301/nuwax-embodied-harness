@@ -52,7 +52,7 @@ def apply_manager(engine, job):
                              cancelled=lambda: engine._cancelled(job["id"]),
                              progress=lambda message: engine._progress(job, "manager_source", 25, message)) as checkout:
             # 使用目标提交自己的打包规则，新增管理依赖不会被旧版本白名单遗漏。
-            run_command([sys.executable, "-B", "-m", "scripts.product_release", "manager", "--root", str(checkout["root"]),
+            run_command([sys.executable, "-B", "-m", "scripts.device_manager.source_package", "--root", str(checkout["root"]),
                          "--output", str(archive), "--version", source["version"]], cwd=checkout["root"],
                         environment=clean_environment(), timeout=180, cancelled=lambda: engine._cancelled(job["id"]))
             manifest = read_json(archive.with_name(archive.name + ".manifest.json"), {})

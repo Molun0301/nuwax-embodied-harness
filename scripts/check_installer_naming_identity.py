@@ -13,7 +13,8 @@ import unittest
 import uuid
 from contextlib import ExitStack
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE_ROOT = Path(os.environ.get("NEH_INSTALLER_SOURCE_ROOT", ROOT))
@@ -96,7 +97,7 @@ class CacheIdentityChecks(unittest.TestCase):
         self.assertRegex(target.name, r"^fastlio2-algorithm-[0-9a-f]{32}$")
         self.assertNotIn(PIN, target.name)
         before = list(self.commands)
-        with patch.object(uuid, "uuid4", side_effect=AssertionError("reallocation")), patch.object(builds.os, "scandir", side_effect=AssertionError("rescan")):
+        with patch.object(builds, "uuid", SimpleNamespace(uuid4=Mock(side_effect=AssertionError("reallocation")))), patch.object(builds.os, "scandir", side_effect=AssertionError("rescan")):
             self.assertEqual(self.checkout(), target)
         self.assertEqual(self.commands, before)
         self.assertEqual(self.source_slots()["fastlio2-algorithm"], {"url": URL, "revision": PIN, "path": target.name})
@@ -104,7 +105,7 @@ class CacheIdentityChecks(unittest.TestCase):
     def test_legacy_path_is_reused_without_renaming(self):
         old = self.legacy()
         before = (old / "fixture-head").read_bytes()
-        with patch.object(uuid, "uuid4", side_effect=AssertionError("allocation")):
+        with patch.object(builds, "uuid", SimpleNamespace(uuid4=Mock(side_effect=AssertionError("allocation")))):
             self.assertEqual(self.checkout(), old)
         self.assertEqual((old / "fixture-head").read_bytes(), before)
         self.assertEqual(self.commands, [])
@@ -196,7 +197,7 @@ class CacheIdentityChecks(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "fake failure"):
             self.checkout(run=lambda *a, **k: (_ for _ in ()).throw(RuntimeError("fake failure")))
         name = self.source_slots()["fastlio2-algorithm"]["path"]
-        with patch.object(uuid, "uuid4", side_effect=AssertionError("reallocation")):
+        with patch.object(builds, "uuid", SimpleNamespace(uuid4=Mock(side_effect=AssertionError("reallocation")))):
             self.assertEqual(self.checkout().name, name)
         self.assertFalse(any(p.name.startswith(".download-") for p in (self.cache / "sources").iterdir()))
 
@@ -215,7 +216,7 @@ class CacheIdentityChecks(unittest.TestCase):
             self.checkout()
         name = self.source_slots()["fastlio2-algorithm"]["path"]
         self.assertEqual(self.commands, [])
-        with patch.object(uuid, "uuid4", side_effect=AssertionError("reallocation")):
+        with patch.object(builds, "uuid", SimpleNamespace(uuid4=Mock(side_effect=AssertionError("reallocation")))):
             self.assertEqual(self.checkout().name, name)
 
     def test_source_directory_publication_failure_reuses_assignment(self):
@@ -223,7 +224,7 @@ class CacheIdentityChecks(unittest.TestCase):
             self.checkout()
         name = self.source_slots()["fastlio2-algorithm"]["path"]
         self.assertFalse((self.cache / "sources" / name).exists())
-        with patch.object(uuid, "uuid4", side_effect=AssertionError("reallocation")):
+        with patch.object(builds, "uuid", SimpleNamespace(uuid4=Mock(side_effect=AssertionError("reallocation")))):
             self.assertEqual(self.checkout().name, name)
 
     def test_source_publication_does_not_replace_arriving_empty_directory(self):
@@ -276,14 +277,14 @@ class CacheIdentityChecks(unittest.TestCase):
             self.checkout(run=run)
         name = self.source_slots()["fastlio2-algorithm"]["path"]
         self.assertFalse((self.cache / "sources" / name).exists())
-        with patch.object(uuid, "uuid4", side_effect=AssertionError("reallocation")):
+        with patch.object(builds, "uuid", SimpleNamespace(uuid4=Mock(side_effect=AssertionError("reallocation")))):
             self.assertEqual(self.checkout().name, name)
 
     def test_missing_bound_source_recreates_same_path(self):
         target = self.checkout()
         (target / "fixture-head").unlink()
         target.rmdir()
-        with patch.object(uuid, "uuid4", side_effect=AssertionError("reallocation")), patch.object(builds.os, "scandir", side_effect=AssertionError("rescan")):
+        with patch.object(builds, "uuid", SimpleNamespace(uuid4=Mock(side_effect=AssertionError("reallocation")))), patch.object(builds.os, "scandir", side_effect=AssertionError("rescan")):
             self.assertEqual(self.checkout(), target)
 
     def test_symlinked_source_is_never_adopted(self):
@@ -309,7 +310,7 @@ class CacheIdentityChecks(unittest.TestCase):
         source = self.checkout()
         target = self.target()
         self.cache = actual
-        with patch.object(uuid, "uuid4", side_effect=AssertionError("linked cache reallocation")):
+        with patch.object(builds, "uuid", SimpleNamespace(uuid4=Mock(side_effect=AssertionError("linked cache reallocation")))):
             self.assertEqual(self.checkout().resolve(), source.resolve())
             self.assertEqual(self.target().resolve(), target.resolve())
 
@@ -326,7 +327,7 @@ class CacheIdentityChecks(unittest.TestCase):
         source, target = self.checkout(), self.target()
         self.assertEqual(source.resolve().parent, source_storage)
         self.assertEqual(target.resolve().parent, target_storage)
-        with patch.object(uuid, "uuid4", side_effect=AssertionError("linked cache reallocation")):
+        with patch.object(builds, "uuid", SimpleNamespace(uuid4=Mock(side_effect=AssertionError("linked cache reallocation")))):
             self.assertEqual(self.checkout(), source)
             self.assertEqual(self.target(), target)
 
@@ -359,7 +360,7 @@ class CacheIdentityChecks(unittest.TestCase):
         self.assertRegex(first.name, r"^nuwax-workspace-[0-9a-f]{32}$")
         second = self.target(builds._RUST_BUILDS["geometry"][0])
         self.assertNotEqual(first, second)
-        with patch.object(uuid, "uuid4", side_effect=AssertionError("reallocation")):
+        with patch.object(builds, "uuid", SimpleNamespace(uuid4=Mock(side_effect=AssertionError("reallocation")))):
             self.assertEqual(self.target(), first)
             self.assertEqual(self.target(builds._RUST_BUILDS["geometry"][0]), second)
         slots = json.loads((self.cache / "build/rust/target-paths-v1.json").read_text())["slots"]
@@ -378,7 +379,7 @@ class CacheIdentityChecks(unittest.TestCase):
         existing = self.cache / "build/rust" / ("nuwax-workspace-" + identity.hex)
         existing.mkdir(parents=True)
         (existing / "foreign-data").write_text("keep")
-        with patch.object(uuid, "uuid4", return_value=identity), self.assertRaises(FileExistsError):
+        with patch.object(builds, "uuid", SimpleNamespace(uuid4=Mock(return_value=identity))), self.assertRaises(FileExistsError):
             self.target()
         self.assertEqual((existing / "foreign-data").read_text(), "keep")
         self.assertFalse((self.cache / "build/rust/target-paths-v1.json").exists())
@@ -409,7 +410,7 @@ class CacheIdentityChecks(unittest.TestCase):
         second = self.target(root=root)
         self.assertNotEqual(first, second)
         self.assertTrue(first.is_dir())
-        with patch.object(uuid, "uuid4", side_effect=AssertionError("reallocation")):
+        with patch.object(builds, "uuid", SimpleNamespace(uuid4=Mock(side_effect=AssertionError("reallocation")))):
             self.assertEqual(self.target(root=root), second)
 
     def test_target_record_failure_cannot_publish_directory(self):
@@ -460,7 +461,7 @@ class CacheIdentityChecks(unittest.TestCase):
         with patch.object(builds, "atomic_write", side_effect=write), self.assertRaises(OSError):
             self.target()
         name = json.loads((self.cache / "build/rust/target-paths-v1.json").read_text())["slots"]["nuwax-workspace"]["path"]
-        with patch.object(uuid, "uuid4", side_effect=AssertionError("reallocation")):
+        with patch.object(builds, "uuid", SimpleNamespace(uuid4=Mock(side_effect=AssertionError("reallocation")))):
             self.assertEqual(self.target().name, name)
 
     def test_target_slot_publication_failure_preserves_old_binding(self):
@@ -504,7 +505,7 @@ class CacheIdentityChecks(unittest.TestCase):
             self.target()
 
     def test_dry_describe_builds_allocates_and_writes_nothing(self):
-        with patch.object(uuid, "uuid4", side_effect=AssertionError("plan allocation")):
+        with patch.object(builds, "uuid", SimpleNamespace(uuid4=Mock(side_effect=AssertionError("plan allocation")))):
             self.assertTrue(builds.describe_builds(("geometry", "navigation")))
         self.assertFalse(self.cache.exists())
 
@@ -605,7 +606,7 @@ class CacheIdentityChecks(unittest.TestCase):
         git_before = [command for command in self.commands if command[0] == "git"]
         self.assertEqual(sum("fetch" in command for command in git_before), 2)
         second = self.root / "generation-2"
-        with patch.object(uuid, "uuid4", side_effect=AssertionError("source reallocation")), patch.object(
+        with patch.object(builds, "uuid", SimpleNamespace(uuid4=Mock(side_effect=AssertionError("source reallocation")))), patch.object(
             builds, "_legacy_source", side_effect=AssertionError("source rescan")
         ):
             self.build_slam_fixture(second)

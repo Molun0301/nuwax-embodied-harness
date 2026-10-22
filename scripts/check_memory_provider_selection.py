@@ -15,7 +15,6 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from scripts import bootstrap
 from scripts.module_installer import runtime
 from services.model_providers import resolve_text_embedding_provider_spec
 
@@ -201,33 +200,9 @@ class GeneratedMemorySettingsChecks(unittest.TestCase):
         self.assertEqual(result[SAVED + TEXT_DIM], "768")
         self.assertEqual(self.settings(result)[TEXT_MODEL], ONLINE)
 
-    def planner(self, *args):
-        parsed = bootstrap.build_parser().parse_args([
-            "check", "--robot", "customrobot", "--root-env-output", str(self.root / "bootstrap.env"), *args,
-        ])
-        return bootstrap.BootstrapPlanner(parsed)
 
-    def test_bootstrap_lite_no_model_uses_lexical_only(self):
-        planner = self.planner("--tier", "lite")
-        result = planner.root_overrides()
-        self.assertEqual(planner.memory_mode, "disabled")
-        self.assertEqual(result[TEXT_MODEL], "lexical-only")
-        self.assertEqual(result[OLD_MODEL], "lexical-only")
-        self.assertEqual(result[IMAGE_MODEL], "disabled")
 
-    def test_bootstrap_full_keeps_cloud_default(self):
-        planner = self.planner("--tier", "full")
-        result = planner.root_overrides()
-        self.assertEqual(planner.memory_mode, "cloud")
-        self.assertEqual(result[TEXT_MODEL], ONLINE)
-        self.assertEqual(result[OLD_MODEL], ONLINE)
-        self.assertEqual(result[IMAGE_MODEL], ONLINE)
 
-    def test_bootstrap_local_keeps_bge_and_clip_defaults(self):
-        result = self.planner("--memory-mode", "local").root_overrides()
-        self.assertEqual(result[TEXT_MODEL], bootstrap.DEFAULT_MEMORY_LOCAL_TEXT_MODEL)
-        self.assertEqual(result[IMAGE_MODEL], bootstrap.DEFAULT_MEMORY_LOCAL_IMAGE_MODEL)
-        self.assertEqual(result[TEXT_DIM], "1024")
 
 
 if __name__ == "__main__":

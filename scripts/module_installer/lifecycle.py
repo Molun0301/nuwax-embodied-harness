@@ -14,7 +14,7 @@ import uuid
 from pathlib import Path
 from typing import Mapping, Optional
 
-from scripts.deploy_installer.config import atomic_write
+from scripts.device_manager.common import atomic_write
 
 from .runtime import effective_settings
 
@@ -170,7 +170,7 @@ def start_current(descriptor: Mapping, *, foreground=False, log=None):
     if mode == "systemd-user":
         unit = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "systemd/user" / name
         unit.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write(unit, render_user_service(current), mode=0o600)
+        atomic_write(unit, (render_user_service(current)).encode("utf-8"), mode=0o600)
         subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
         subprocess.run(["systemctl", "--user", "start", name], check=True)
         return None
